@@ -906,7 +906,10 @@ fn send_daemon_request_blocking_with_timeout(
     use crate::daemon_protocol::KIND_REQ;
     use std::io::Write;
 
-    let path = config::attach_socket_path();
+    // Issue #1121: the client-side resolution, so this best-effort request
+    // reaches the same daemon the TUI attached to when that daemon is an older
+    // build still listening at the pre-#1121 fallback spelling.
+    let path = crate::endpoint_resolve::client_attach_socket_path();
     // Issue #435: `timeout` is a per-operation deadline, and connect is one of
     // the operations. Connecting through the bare `IpcClient::connect` left it
     // outside the budget entirely — on Unix that call blocks uninterruptibly
@@ -931,7 +934,8 @@ fn send_daemon_request_blocking_with_timeout(
 ///
 /// Split out of [`send_daemon_request_blocking_with_timeout`] so the framing
 /// can be exercised against a plain in-memory reader (issue #478) — the send
-/// path itself needs a live socket at [`config::attach_socket_path`].
+/// path itself needs a live socket at
+/// [`crate::endpoint_resolve::client_attach_socket_path`].
 ///
 /// The length prefix is checked against
 /// [`crate::daemon_protocol::MAX_FRAME_LEN`] BEFORE the body is allocated,

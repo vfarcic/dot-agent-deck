@@ -534,6 +534,11 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
         std::fs::remove_file(socket_path)?;
     }
 
+    // Issue #1121: this is a bind site, so it is one of the places that owns
+    // creating the fallback endpoint directory. A no-op for every other
+    // endpoint — an override, an `$XDG_RUNTIME_DIR` path, a test's tempdir
+    // socket, a Windows named pipe — see `ensure_endpoint_dir`.
+    crate::endpoint_resolve::ensure_endpoint_dir(socket_path)?;
     // PRD #42 M2: `IpcListener::bind` performs the umask-before-bind dance and
     // the defense-in-depth 0o600 restate (both folded in from the former
     // `bind_socket` + post-bind `set_permissions`), so the socket inode is
@@ -700,6 +705,10 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
     // caller (production `main`, or a test) treat it as a daemon-start
     // failure.
     let attach_handle = if let Some(path) = daemon.attach_socket_path {
+        // Issue #1121: the attach endpoint's own bind site. Idempotent with the
+        // hook endpoint's call above — in the fallback case both sockets live
+        // in the same per-uid directory.
+        crate::endpoint_resolve::ensure_endpoint_dir(&path)?;
         let listener = crate::daemon_protocol::bind_attach_listener(&path)?;
         info!("Attach protocol listening on {}", path.display());
         let registry = pty_registry.clone();

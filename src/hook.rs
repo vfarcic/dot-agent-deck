@@ -8,7 +8,7 @@ use serde::{Deserialize, Deserializer};
 use serde_json::Value;
 
 use crate::agent_pty::{DOT_AGENT_DECK_AGENT_ID, DOT_AGENT_DECK_PANE_ID};
-use crate::config::socket_path;
+use crate::endpoint_resolve::client_socket_path;
 use crate::event::{AgentEvent, AgentType, EventType};
 
 #[derive(Debug, Deserialize)]
@@ -681,14 +681,14 @@ pub fn send_and_await_spawn_role_reply(json: &str) -> SocketReply {
 }
 
 pub fn send_to_socket(json: &str) -> Option<()> {
-    send_to_socket_at(&socket_path(), json)
+    send_to_socket_at(&client_socket_path(), json)
 }
 
 /// [`send_to_socket`] against an explicit endpoint, rather than one resolved
 /// from the environment. Lets the socket tests exercise "no daemon listening
 /// at this path" by passing a temp-dir path directly, instead of mutating the
 /// process-global `DOT_AGENT_DECK_SOCKET` env var that production
-/// `socket_path()` reads.
+/// `client_socket_path()` reads.
 fn send_to_socket_at(path: &std::path::Path, json: &str) -> Option<()> {
     let mut stream = crate::platform::ipc::IpcClient::connect(path).ok()?;
     let msg = format!("{json}\n");
@@ -712,7 +712,7 @@ fn send_to_socket_at(path: &std::path::Path, json: &str) -> Option<()> {
 /// the readiness gate its fast path and nothing else, so there is no outcome for
 /// a caller on a detached thread to act on.
 pub fn send_to_socket_bounded(json: &str, timeout: std::time::Duration) {
-    let _ = send_to_socket_bounded_at(&socket_path(), json, timeout);
+    let _ = send_to_socket_bounded_at(&client_socket_path(), json, timeout);
 }
 
 /// [`send_to_socket_bounded`] against an explicit endpoint. Same rationale as
@@ -828,17 +828,17 @@ pub enum SocketReply {
 }
 
 fn request_from_socket_inner(json: &str, timeout: Option<std::time::Duration>) -> SocketReply {
-    request_from_socket_at(&socket_path(), json, timeout)
+    request_from_socket_at(&client_socket_path(), json, timeout)
 }
 
 /// [`request_from_socket_inner`] against an explicit endpoint, rather than one
 /// resolved from the environment. Lets the socket tests point a request at a
 /// temp-dir stub-daemon socket without mutating the process-global
 /// `DOT_AGENT_DECK_SOCKET` env var that production `request_from_socket_inner`
-/// reads via `socket_path()` — `set_var`/`get_var` races on that var are
-/// unsound under a multithreaded test binary regardless of the project's own
-/// `STATE_DIR_ENV_LOCK` convention, since production `socket_path()` reads it
-/// without taking that lock.
+/// reads via `client_socket_path()` — `set_var`/`get_var` races on that var
+/// are unsound under a multithreaded test binary regardless of the project's
+/// own `STATE_DIR_ENV_LOCK` convention, since production `client_socket_path()`
+/// reads it without taking that lock.
 fn request_from_socket_at(
     path: &std::path::Path,
     json: &str,

@@ -110,6 +110,17 @@ pub fn with_socket_umask<T>(f: impl FnOnce() -> T) -> T {
 /// component is affected, so a symlinked ancestor — `~/.local/state` itself —
 /// keeps working. The error says which path and why, so the fix is discoverable
 /// from the message.
+///
+/// **The other fail-closed arm says why too** (issue #1121). When the directory
+/// exists and another uid owns it the `set_permissions` below returns `EPERM`,
+/// which unwrapped reads `Operation not permitted` and names neither the path
+/// nor the owner. [`chmod_refusal`] wraps it: which directory, which uid owns
+/// it, which uid we are, and that a `DOT_AGENT_DECK_*` path override is the way
+/// out. The remedy is named generically here on purpose — this function serves
+/// the state dir, the lock root and (via
+/// [`crate::endpoint_resolve::ensure_endpoint_dir`]) the endpoint directory,
+/// and each has a different override — so the caller closest to the operator
+/// names the specific variable.
 pub fn ensure_owner_only_dir(dir: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 
@@ -137,6 +148,59 @@ pub fn ensure_owner_only_dir(dir: &Path) -> std::io::Result<()> {
     builder.recursive(true).mode(0o700);
     builder.create(dir)?;
     std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+        .map_err(|source| chmod_refusal(dir, source))
+}
+
+/// Turn [`ensure_owner_only_dir`]'s `set_permissions` failure into something an
+/// operator can act on (issue #1121).
+///
+/// The reachable case that matters is the one the fail-closed behaviour exists
+/// for: the directory already exists and **another uid owns it**, so
+/// `chmod(2)` returns `EPERM` for us. Unwrapped that reads `Operation not
+/// permitted` with no path, no owner and no remedy — three lookups away from
+/// being actionable. The wrapper stats the directory and, when the owner is
+/// not us, says so and names both uids; anything else keeps the original
+/// wording and only gains the path.
+///
+/// The stat is best-effort and deliberately not fail-closed: it runs only to
+/// *explain* a failure that has already been decided, so a stat that itself
+/// errors falls back to the generic arm rather than inventing a reason.
+fn chmod_refusal(dir: &Path, source: std::io::Error) -> std::io::Error {
+    use std::os::unix::fs::MetadataExt;
+
+    let our_uid = crate::platform::paths::current_uid();
+    let owner_uid = std::fs::metadata(dir).ok().map(|metadata| metadata.uid());
+    match owner_uid {
+        Some(owner_uid) if owner_uid != our_uid => std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            foreign_owner_refusal(dir, owner_uid, our_uid, &source),
+        ),
+        _ => std::io::Error::new(
+            source.kind(),
+            format!("could not set mode 0o700 on {}: {source}", dir.display()),
+        ),
+    }
+}
+
+/// The message [`chmod_refusal`] renders for a directory another uid owns.
+///
+/// Pure data, split out for the same reason as [`endpoint_uid_is_trusted`]: the
+/// arm it describes needs a directory owned by a second account, which a test
+/// process cannot create without one or without root, so the *wording* is what
+/// is testable on any host.
+fn foreign_owner_refusal(
+    dir: &Path,
+    owner_uid: u32,
+    our_uid: u32,
+    source: &std::io::Error,
+) -> String {
+    format!(
+        "refusing to use {}: it is owned by uid {owner_uid} (we are uid {our_uid}), so it cannot \
+         be made owner-only for us and whatever we put inside it would sit in another user's \
+         directory ({source}) — remove or rename it if it is stale, or point the relevant \
+         DOT_AGENT_DECK_* path override at a directory only you can write",
+        dir.display()
+    )
 }
 
 /// Create `dir` (recursively) with mode 0o700, **without** re-applying the mode
@@ -300,6 +364,58 @@ mod tests {
 
     fn chmod(path: &Path, mode: u32) {
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).expect("chmod");
+    }
+
+    /// Issue #1121: the wording [`chmod_refusal`] renders when the directory
+    /// belongs to another uid. Everything an operator needs to act is in one
+    /// line — which directory, who owns it, who we are, and the way out — where
+    /// before there was a bare `Operation not permitted`.
+    ///
+    /// This asserts the **message**, not the branch. Reaching the branch needs
+    /// a directory owned by a second account, which a test process cannot
+    /// create without one or without root; the wording is the part that is
+    /// testable on any host, exactly as for [`endpoint_uid_is_trusted`].
+    #[test]
+    fn the_foreign_owner_refusal_names_the_directory_the_owner_and_the_way_out() {
+        let source = std::io::Error::from_raw_os_error(libc::EPERM);
+        let rendered =
+            foreign_owner_refusal(Path::new("/tmp/dot-agent-deck-4242"), 4242, 1000, &source);
+
+        assert!(rendered.contains("/tmp/dot-agent-deck-4242"), "{rendered}");
+        assert!(rendered.contains("uid 4242"), "{rendered}");
+        assert!(rendered.contains("uid 1000"), "{rendered}");
+        assert!(
+            rendered.contains("DOT_AGENT_DECK_"),
+            "the refusal must name the escape hatch: {rendered}"
+        );
+        assert!(
+            rendered.contains(&source.to_string()),
+            "the underlying errno must survive, so an unexpected cause is still \
+             readable: {rendered}"
+        );
+    }
+
+    /// The other arm of [`chmod_refusal`], and the one that is reachable
+    /// in-test: a `set_permissions` failure with no foreign owner behind it
+    /// keeps the original wording and gains the path.
+    ///
+    /// Driven with a path that does not exist, which is what
+    /// `ensure_owner_only_dir` hands the chmod when its own `mkdir` produced
+    /// nothing — the shape `state_dir`'s empty-override guard records having
+    /// measured as `ENOENT`.
+    #[test]
+    fn a_chmod_failure_with_no_foreign_owner_keeps_its_own_reason_and_gains_the_path() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let absent = root.path().join("absent");
+        let err = chmod_refusal(&absent, std::io::Error::from_raw_os_error(libc::ENOENT));
+
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound, "{err}");
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains(&absent.display().to_string()),
+            "the path is the thing the bare errno was missing: {rendered}"
+        );
+        assert!(rendered.contains("0o700"), "{rendered}");
     }
 
     /// A same-uid attacker plants a symlink at the path the deck is about to use

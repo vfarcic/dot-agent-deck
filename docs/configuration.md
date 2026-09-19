@@ -23,7 +23,8 @@ When `default_command` is **unset or empty**, the new-pane form's Command field 
 
 | Variable | Default | Description |
 |---|---|---|
-| `DOT_AGENT_DECK_SOCKET` | `$XDG_RUNTIME_DIR/dot-agent-deck.sock` or `/tmp/dot-agent-deck-{uid}.sock` | Unix socket path for daemon IPC. `{uid}` in the `/tmp` fallback is the user's POSIX uid, included so two users on the same host get disjoint sockets (the XDG path is already per-user since `XDG_RUNTIME_DIR` typically resolves to `/run/user/{uid}`). |
+| `DOT_AGENT_DECK_SOCKET` | `$XDG_RUNTIME_DIR/dot-agent-deck.sock` or `$TMPDIR/dot-agent-deck-{uid}/hook.sock` | Unix socket path for daemon IPC (hook ingestion). When `XDG_RUNTIME_DIR` is unset the endpoint goes in a per-user directory under the system temp dir (`/tmp` unless `$TMPDIR` says otherwise), where `{uid}` is the user's POSIX uid. The deck creates that directory at mode `0700`, so two users on the same host get disjoint endpoints and neither can create an entry in the other's directory; the XDG path is already per-user, since `XDG_RUNTIME_DIR` typically resolves to `/run/user/{uid}`. |
+| `DOT_AGENT_DECK_ATTACH_SOCKET` | `$XDG_RUNTIME_DIR/dot-agent-deck-attach.sock` or `$TMPDIR/dot-agent-deck-{uid}/attach.sock` | Unix socket path for the streaming attach protocol the TUI and the desktop app connect over. Same directory and the same rules as `DOT_AGENT_DECK_SOCKET`; the two protocols have disjoint wire formats, so they never share one endpoint. |
 | `DOT_AGENT_DECK_CONFIG` | `~/.config/dot-agent-deck/config.toml` | Config file path |
 | `DOT_AGENT_DECK_SESSION` | `~/.config/dot-agent-deck/session.toml` | Session file path |
 | `DOT_AGENT_DECK_LOG` | *(unset)* | When set, enables file-based tracing logs. Empty value or `1` writes to `/tmp/dot-agent-deck.log`; any other value is treated as the target log file path. |

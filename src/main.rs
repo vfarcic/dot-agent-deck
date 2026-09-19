@@ -13,6 +13,7 @@ use dot_agent_deck::daemon::{Daemon, run_daemon_with};
 use dot_agent_deck::daemon_attach::ensure_external_daemon_or_die;
 use dot_agent_deck::daemon_client::{DaemonClient, LocalEndpoint};
 use dot_agent_deck::embedded_pane::EmbeddedPaneController;
+use dot_agent_deck::endpoint_resolve::client_attach_socket_path;
 use dot_agent_deck::hook::handle_hook;
 use dot_agent_deck::pane::PaneController;
 use dot_agent_deck::state::AppState;
@@ -1767,8 +1768,8 @@ async fn run_tui_session() -> ExitCode {
     // PRD #741 M2: the TUI always talks to the daemon on this machine, so it
     // names it as one. `attach_path` stays the same value it always was — the
     // endpoint's address — for the messages and the subscriber below.
-    let endpoint = LocalEndpoint::from_config();
-    let attach_path = endpoint.path().to_path_buf();
+    let mut endpoint = LocalEndpoint::from_config();
+    let mut attach_path = endpoint.path().to_path_buf();
 
     // If the attach socket is missing, `ensure_external_daemon_or_die`
     // fork-execs `dot-agent-deck daemon serve` detached under
@@ -1824,13 +1825,22 @@ async fn run_tui_session() -> ExitCode {
     if matches!(
         handshake_outcome,
         build_version_handshake::HandshakeOutcome::Recovered
-    ) && let Err(e) = ensure_external_daemon_or_die(&endpoint).await
-    {
-        eprintln!(
-            "failed to re-spawn daemon at {} after version-mismatch recovery: {e}",
-            attach_path.display()
-        );
-        return ExitCode::FAILURE;
+    ) {
+        // Issue #1121: re-resolve before re-spawning. The daemon we just
+        // SIGTERM'd may have been an older build reached through the
+        // compatibility read of the pre-#1121 fallback endpoint; nothing
+        // answers there any more, and the daemon about to be spawned binds the
+        // new spelling. Polling the address of the daemon we killed would time
+        // out while a perfectly healthy replacement was already up.
+        endpoint = LocalEndpoint::from_config();
+        attach_path = endpoint.path().to_path_buf();
+        if let Err(e) = ensure_external_daemon_or_die(&endpoint).await {
+            eprintln!(
+                "failed to re-spawn daemon at {} after version-mismatch recovery: {e}",
+                attach_path.display()
+            );
+            return ExitCode::FAILURE;
+        }
     }
     // Test-only escape hatch (PRD #103 M4.2): integration tests in
     // tests/build_version_handshake.rs need to exercise the handshake
@@ -2221,7 +2231,7 @@ async fn run_daemon_status_cli(json: bool) -> ExitCode {
         STATUS_REQUEST_TIMEOUT, StatusDocument, build_status_agents, format_human,
     };
 
-    let client = DaemonClient::new(attach_socket_path());
+    let client = DaemonClient::new(client_attach_socket_path());
     let records = match tokio::time::timeout(STATUS_REQUEST_TIMEOUT, client.list_agents()).await {
         Ok(Ok(records)) => records,
         Ok(Err(e)) => {
@@ -2367,6 +2377,9 @@ async fn run_daemon_serve_cli() -> ExitCode {
     // construction.
     dot_agent_deck::features::init_and_watch(&launch_project_dir());
     let state = Arc::new(RwLock::new(AppState::default()));
+    // Issue #1121: the BIND side, so these are deliberately the pure
+    // resolvers and not `endpoint_resolve`'s client ones — the pre-#1121
+    // fallback spelling is read-only for us and nothing must ever bind it.
     let path = socket_path();
     let attach_path = attach_socket_path();
 
@@ -2395,7 +2408,7 @@ async fn run_schedule_cli(action: ScheduleAction) -> ExitCode {
     match &action {
         ScheduleAction::RunNow { name } => {
             use dot_agent_deck::daemon_client::RunNowOutcome;
-            let client = DaemonClient::new(attach_socket_path());
+            let client = DaemonClient::new(client_attach_socket_path());
             return match client.run_now(name).await {
                 // PRD #127 C5: report skipped distinctly (still exit 0 — the
                 // task is registered and the request succeeded).
@@ -2414,7 +2427,7 @@ async fn run_schedule_cli(action: ScheduleAction) -> ExitCode {
             };
         }
         ScheduleAction::Reload => {
-            let client = DaemonClient::new(attach_socket_path());
+            let client = DaemonClient::new(client_attach_socket_path());
             return match client.reload_schedules().await {
                 Ok(names) => {
                     println!("reloaded; registered: {}", names.join(", "));
@@ -2532,7 +2545,7 @@ async fn run_schedule_cli(action: ScheduleAction) -> ExitCode {
 
     // Trigger a live reload so a running daemon picks the change up. A daemon
     // that isn't running is not an error — the change loads on next serve.
-    let client = DaemonClient::new(attach_socket_path());
+    let client = DaemonClient::new(client_attach_socket_path());
     match client.reload_schedules().await {
         Ok(_) => {}
         Err(e) => {

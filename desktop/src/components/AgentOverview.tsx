@@ -962,9 +962,12 @@ function DeckGroup({ deck, now, columns, fleetSize, overrideError, onOpenDeck, o
    *
    * The socket path used to be on screen, shortened to its last segment — a
    * label whose stated purpose was keeping a uid or a username out of
-   * screenshots, and which on the default socket reads
+   * screenshots, and which on the default socket of the day read
    * `dot-agent-deck-attach-501.sock`, so it leaked the very uid it was meant to
-   * hide and told the reader nothing actionable either way. The path is
+   * hide and told the reader nothing actionable either way. (Issue #1121 later
+   * moved the uid up into the directory — `dot-agent-deck-501/attach.sock` —
+   * which would have made the same label read a bare `attach.sock`: no leak,
+   * and no information at all.) The path is
    * genuinely diagnostic, so it stays here, where it costs no layout;
    * `data-daemon-id` on the section still carries the identity for tests and a
    * future drill-in.

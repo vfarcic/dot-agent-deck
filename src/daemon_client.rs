@@ -376,12 +376,23 @@ pub struct LocalEndpoint {
 }
 
 impl LocalEndpoint {
-    /// This host's configured attach endpoint,
-    /// [`crate::config::attach_socket_path`] — exactly the value every caller
-    /// passed before this type existed, `DOT_AGENT_DECK_ATTACH_SOCKET` override
-    /// included.
+    /// This host's configured attach endpoint, as a **client** should address
+    /// it: [`crate::config::attach_socket_path`], `DOT_AGENT_DECK_ATTACH_SOCKET`
+    /// override included, with issue #1121's read-only compatibility probe of
+    /// the pre-#1121 fallback spelling on top
+    /// ([`crate::endpoint_resolve::client_attach_socket_path`]).
+    ///
+    /// The two differ only on a host where `XDG_RUNTIME_DIR` is unset, no
+    /// override is set, nothing is listening at the new fallback endpoint and
+    /// a daemon from an older build *is* listening at the old one. Everywhere
+    /// else this is exactly the value every caller passed before this type
+    /// existed.
+    ///
+    /// **Not for deciding where to bind.** `daemon serve` resolves
+    /// [`crate::config::attach_socket_path`] directly, so the legacy spelling
+    /// is never created by us.
     pub fn from_config() -> Self {
-        Self::at(crate::config::attach_socket_path())
+        Self::at(crate::endpoint_resolve::client_attach_socket_path())
     }
 
     /// A local daemon at an explicitly chosen address.
@@ -2742,8 +2753,18 @@ mod tests {
     /// `Local` is byte-identical, which is the milestone's other half. Two
     /// things pin it: the connect address is exactly the path handed in (not a
     /// normalised or re-derived one), and `from_config()` is exactly
-    /// `config::attach_socket_path()` — the value every call site passed before
-    /// this type existed, `DOT_AGENT_DECK_ATTACH_SOCKET` override included.
+    /// `endpoint_resolve::client_attach_socket_path()` — which is
+    /// `config::attach_socket_path()`, the value every call site passed before
+    /// this type existed with the `DOT_AGENT_DECK_ATTACH_SOCKET` override
+    /// included, plus issue #1121's compatibility probe.
+    ///
+    /// The second assertion is against the *client* resolver rather than the
+    /// pure one, and that is the honest comparison rather than a weakening:
+    /// the two can legitimately differ on a host in the fallback case with an
+    /// older build's daemon live at the pre-#1121 spelling, so asserting
+    /// equality with the pure resolver would make this test fail on a machine
+    /// where the compatibility read is doing its job.
+    /// `endpoint_resolve`'s own tests pin the resolution order.
     #[test]
     fn a_local_endpoint_still_resolves_to_todays_attach_path() {
         let explicit = Endpoint::Local(LocalEndpoint::at("/tmp/attach.sock"));
@@ -2754,7 +2775,7 @@ mod tests {
 
         assert_eq!(
             LocalEndpoint::from_config().path(),
-            crate::config::attach_socket_path(),
+            crate::endpoint_resolve::client_attach_socket_path(),
             "the configured local endpoint must be exactly the path this crate \
              has always used, or the local case is not byte-identical"
         );
