@@ -534,13 +534,14 @@ pub fn format_teardown_inventory(
                 roles.len()
             );
         }
-        // Greptile P1 on the first draft, and it was right: this branch used to
-        // hand `format_teardown_inventory` an empty slice, so a state lock the
-        // teardown could not read inside its budget printed "destroying 0
-        // orchestration role registration(s)" and dropped the permanence
-        // sentence. The `warn!` beside it said "UNLISTED", but the line a reader
-        // greps said a confident zero — one incident report contradicting
-        // another, with the wrong one louder. An unknown says it is unknown.
+        // Greptile P1 on the first draft, and it was right. There was no `None`
+        // arm: [`log_teardown_inventory`] handed this an empty slice when the
+        // state lock missed its budget, so a teardown that could not find out
+        // printed "destroying 0 orchestration role registration(s)" and dropped
+        // the permanence sentence below. The `warn!` beside it did say
+        // "UNLISTED" — one incident report contradicting another, with the wrong
+        // one louder, in the contended moment the record exists for. An unknown
+        // says it is unknown.
         None => {
             let _ = write!(
                 out,
