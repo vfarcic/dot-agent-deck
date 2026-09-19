@@ -1792,10 +1792,11 @@ mod tunnel {
     /// commonly unset and it may well be running a build older or newer than
     /// this one.
     ///
-    /// The compatibility choice is made by `[ -S … ] && [ -O … ]` rather than
-    /// by guessing, which is the closest a shell snippet gets to the client's
-    /// own connect probe. Where neither candidate qualifies the **new**
-    /// spelling is printed, matching what a fresh daemon over there would bind.
+    /// The compatibility choice is made by `[ -S … ] && [ ! -h … ] && [ -O … ]`
+    /// rather than by guessing, which is the closest a shell snippet gets to
+    /// the client's own connect probe. Where neither candidate qualifies the
+    /// **new** spelling is printed, matching what a fresh daemon over there
+    /// would bind.
     ///
     /// **`-O` — "owned by the effective uid" — is the part issue #1121 round
     /// two added, and it is here because of the ordering rather than because of
@@ -1804,10 +1805,42 @@ mod tunnel {
     /// new is that a candidate at the per-uid directory path outranks the
     /// legacy one, so a foreign uid who wins the directory race on the remote
     /// host could shadow a legitimate legacy daemon merely by creating an entry.
-    /// Requiring ownership removes that, and it does not pretend to be more:
-    /// `-O` follows symlinks and proves nothing whatever about *who is
-    /// listening*, which is a gap this probe has always had and which needs a
-    /// trusted resolver on the far side to close.
+    ///
+    /// **Requiring ownership narrowed that; on its own it did not remove it,
+    /// and this comment said it did.** `-S` and `-O` both **follow symlinks**,
+    /// so a *symlink* planted at `$dad_new` and pointing at any socket the
+    /// invoking user already owns satisfies both and outranks a live legacy
+    /// daemon — the shadowing survives the ownership test by not being tested
+    /// at the entry that was planted. `[ ! -h … ]` is what removes that route,
+    /// on both rungs: the legacy candidate sits in a world-writable sticky
+    /// `/tmp`, where planting a name nothing holds is if anything easier than
+    /// winning the per-uid directory.
+    ///
+    /// **State that at its real width.** It is denial of *discovery*, not a
+    /// hijack: `-O` still constrains the symlink's target to a socket the
+    /// invoking user owns, so a foreign uid cannot put their own listener in
+    /// front of the user this way — they can only steer the tunnel at one of
+    /// the user's own sockets, which is not the daemon, so the remote deck
+    /// reads as unavailable. What none of the three clauses does is prove
+    /// anything about *who is listening* on whatever is selected; that is a
+    /// gap this probe has always had and needs a trusted resolver on the far
+    /// side to close.
+    ///
+    /// It also brings the two ends of the same decision back into step, which
+    /// is what this doc comment is otherwise entirely about: the **local**
+    /// resolver's trust check already refuses a symlink outright, whatever it
+    /// points at — [`crate::platform::fsperm::verify_endpoint_trusted`], pinned
+    /// by `verify_endpoint_trusted_refuses_a_symlink_to_a_trusted_socket`. The
+    /// shell snippet was the one side of the pair that did not.
+    ///
+    /// `-h` rather than `-L`, which is the operator the finding proposed:
+    /// `dash`'s own manual documents `-L` as "retained for compatibility with
+    /// previous versions of this program. Do not rely on its existence; use
+    /// `-h` instead", and `dash` is this repo's `/bin/sh`. `-h` is also the one
+    /// POSIX `test` defines. Measured, on a symlink to a socket this uid owns:
+    /// `dash`, `bash` and `busybox sh` each answer true for all of `-S`, `-O`,
+    /// `-L` and `-h` — which is both the confirmation that `-h` is available
+    /// and the demonstration of the defect.
     ///
     /// `-O` is **not** in POSIX `test`, and that is deliberate rather than
     /// overlooked. Verified by running it: `dash` (this repo's `/bin/sh`) and
@@ -1815,7 +1848,13 @@ mod tunnel {
     /// that does not prints an "unexpected operator" diagnostic and returns
     /// non-zero, which makes the `&&` false, the branch untaken and the snippet
     /// fall through to printing the new spelling — a safe degradation to
-    /// exactly the pre-#1121 answer, still exiting 0.
+    /// exactly the pre-#1121 answer, still exiting 0. The negated clause
+    /// degrades the same way and was measured in its own shape rather than
+    /// assumed to: `[ ! -Q "$f" ]` with an operator no shell knows errors in
+    /// `dash`, `bash` and `busybox sh` alike and the rung is **not** taken, so
+    /// `!` never turns a diagnostic into a selection. Adding `-h` therefore
+    /// narrows the set of shells neither rung works on by nothing at all, since
+    /// each already requires the less portable `-O`.
     ///
     /// `${TMPDIR:-/tmp}` is the remote's temp dir. It does not reproduce
     /// `std::env::temp_dir()` literally — that function honours an **empty**
@@ -1845,8 +1884,10 @@ mod tunnel {
         "dad_uid=$(id -u); ",
         "dad_new=\"${TMPDIR:-/tmp}/dot-agent-deck-$dad_uid/attach.sock\"; ",
         "dad_old=\"/tmp/dot-agent-deck-attach-$dad_uid.sock\"; ",
-        "if [ -S \"$dad_new\" ] && [ -O \"$dad_new\" ]; then printf '%s\\n' \"$dad_new\"; ",
-        "elif [ -S \"$dad_old\" ] && [ -O \"$dad_old\" ]; then printf '%s\\n' \"$dad_old\"; ",
+        "if [ -S \"$dad_new\" ] && [ ! -h \"$dad_new\" ] && [ -O \"$dad_new\" ]; ",
+        "then printf '%s\\n' \"$dad_new\"; ",
+        "elif [ -S \"$dad_old\" ] && [ ! -h \"$dad_old\" ] && [ -O \"$dad_old\" ]; ",
+        "then printf '%s\\n' \"$dad_old\"; ",
         "else printf '%s\\n' \"$dad_new\"; fi; ",
         "fi"
     );
@@ -3043,6 +3084,86 @@ mod tests {
             run_socket_probe(&inverted, &[("TMPDIR", &temp.path().to_string_lossy())]),
             new.to_string_lossy(),
             "a candidate that fails the ownership test must not be selected"
+        );
+    }
+
+    /// A **symlink** at the new per-uid candidate must not outrank a live
+    /// legacy daemon, even when it points at a socket this very uid owns.
+    ///
+    /// `-S` and `-O` both follow symlinks, so before `[ ! -h … ]` this exact
+    /// arrangement made the probe answer `$dad_new` while the only daemon on
+    /// the host was at `$dad_old`. The target is deliberately a socket we own,
+    /// because that is the reachable shape: a foreign uid who wins the per-uid
+    /// directory cannot make `-O` pass for a socket of their own, so the harm
+    /// available to them is denial of discovery rather than a hijack — and a
+    /// test that planted a foreign-owned target would need a second account
+    /// and would prove the weaker thing.
+    #[cfg(unix)]
+    #[test]
+    fn the_probe_passes_over_a_symlinked_candidate() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let uid = probe_uid();
+        let legacy_prefix = format!("{}/legacy-attach-", temp.path().display());
+        let snippet = REMOTE_SOCKET_PROBE.replace("/tmp/dot-agent-deck-attach-", &legacy_prefix);
+        assert_ne!(
+            snippet, REMOTE_SOCKET_PROBE,
+            "the rewrite must actually match, or this test proves nothing"
+        );
+
+        // The legitimate daemon: an older build, at the legacy spelling.
+        let legacy = format!("{legacy_prefix}{uid}.sock");
+        let _legacy_listener =
+            std::os::unix::net::UnixListener::bind(&legacy).expect("bind the legacy endpoint");
+
+        // A real socket this uid owns, standing in for whatever the planted
+        // link would be aimed at. Somewhere else entirely — the point is that
+        // the link's own path is the one that gets ranked.
+        let decoy = temp.path().join("some-other.sock");
+        let _decoy_listener =
+            std::os::unix::net::UnixListener::bind(&decoy).expect("bind the decoy socket");
+
+        // The plant: the per-uid directory exists, and the endpoint name in it
+        // is a symlink rather than a socket.
+        let new_dir = temp.path().join(format!("dot-agent-deck-{uid}"));
+        std::fs::create_dir(&new_dir).expect("the per-uid endpoint directory");
+        let new = new_dir.join("attach.sock");
+        std::os::unix::fs::symlink(&decoy, &new).expect("plant the symlink at the new candidate");
+
+        // Fixture precondition, measured rather than assumed: the two clauses
+        // that were there before this one BOTH pass on the plant. Without this
+        // the test could go green on a link that was simply broken.
+        for clause in ["-S", "-O"] {
+            let probe = format!("if [ {clause} \"$1\" ]; then printf yes; else printf no; fi");
+            let out = std::process::Command::new("/bin/sh")
+                .args(["-c", &probe, "_"])
+                .arg(&new)
+                .output()
+                .expect("run the clause probe");
+            assert_eq!(
+                String::from_utf8_lossy(&out.stdout),
+                "yes",
+                "fixture precondition: `{clause}` must FOLLOW the symlink and pass, or the \
+                 symlink clause is not what this test is measuring"
+            );
+        }
+
+        assert_eq!(
+            run_socket_probe(&snippet, &[("TMPDIR", &temp.path().to_string_lossy())]),
+            legacy,
+            "a symlink at the new candidate must not shadow the live legacy daemon"
+        );
+
+        // And the same plant at the legacy rung falls through to the default
+        // rather than being forwarded to: with nothing bound at either real
+        // candidate, the answer is the new spelling a fresh daemon would bind.
+        drop(_legacy_listener);
+        std::fs::remove_file(&legacy).expect("remove the legacy socket");
+        std::fs::remove_file(&new).expect("remove the new candidate's symlink");
+        std::os::unix::fs::symlink(&decoy, &legacy).expect("plant the symlink at the legacy path");
+        assert_eq!(
+            run_socket_probe(&snippet, &[("TMPDIR", &temp.path().to_string_lossy())]),
+            new.to_string_lossy(),
+            "a symlink at the legacy candidate must not be selected either"
         );
     }
 

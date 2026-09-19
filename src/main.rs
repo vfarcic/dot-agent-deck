@@ -1812,10 +1812,16 @@ async fn run_tui_session() -> ExitCode {
     // probe a moment ago: this process may talk to it, and must not unlink it,
     // lazy-spawn at it, or poll it for a daemon that would bind somewhere else.
     let mut resolved = dot_agent_deck::endpoint_resolve::client_attach_endpoint();
-    // The one window the probe cannot cover: the older daemon exits between
-    // that probe and here. Re-resolving to the primary endpoint is what turns
-    // that into an ordinary cold start instead of a 15-second wait for a
-    // daemon at an address nothing will ever bind.
+    // Closes the window between the resolver's own probe and this point: the
+    // older daemon exits in between. Re-resolving to the primary endpoint is
+    // what turns that into an ordinary cold start instead of a 15-second wait
+    // for a daemon at an address nothing will ever bind.
+    //
+    // It does not close every such window, and an earlier version of this
+    // comment claimed it was "the one" — a *later* one is still open, between
+    // this probe and the handshake's own `connect`, and is recovered at the
+    // handshake call below rather than here. No probe can be the last word:
+    // each one only narrows the gap between the last check and the first use.
     if !resolved.is_primary()
         && !dot_agent_deck::endpoint_resolve::endpoint_is_answering(resolved.path())
     {
@@ -1857,17 +1863,51 @@ async fn run_tui_session() -> ExitCode {
     //     non-zero (the only non-zero-exit path).
     // Errors are already user-visible inside the helper, so we render no
     // further message here.
-    let handshake_outcome =
-        match build_version_handshake::ensure_compatible_daemon_or_die(&endpoint).await {
-            Ok(outcome) => outcome,
-            Err(build_version_handshake::HandshakeError::MismatchAborted) => {
-                return ExitCode::FAILURE;
-            }
-            Err(e) => {
-                eprintln!("{e}");
-                return ExitCode::FAILURE;
-            }
-        };
+    let mut handshake = build_version_handshake::ensure_compatible_daemon_or_die(&endpoint).await;
+    // Issue #1121: the window the probe above leaves open, one step further
+    // along — a legacy daemon that exits between that probe and the
+    // handshake's own `connect`. `Probe` is exactly that shape ("the socket is
+    // there but nothing is answering"), and on a non-primary endpoint the
+    // address can only be the pre-#1121 spelling of a daemon that has now
+    // gone. Left alone it is a hard `ExitCode::FAILURE` on a host whose only
+    // problem is that it has no daemon — the same class as a legacy endpoint
+    // reaching an operation that cannot cope with it, so it gets the same
+    // remedy the `Recovered` branch below uses: re-resolve to the endpoint the
+    // daemon we are about to spawn will actually bind, and cold-start there.
+    //
+    // Deliberately one retry and not a loop. The retried endpoint IS primary,
+    // so a second `Probe` there is a genuinely broken host rather than a
+    // transition artefact, and must still be reported. The handshake is re-run
+    // rather than assumed to match, for the reason the comment above gives: it
+    // is the smoke test of the handshake itself, and a stale daemon of another
+    // build may be sitting on the primary endpoint too — that outcome is
+    // `Recovered` and composes with the branch below.
+    if !endpoint.is_primary()
+        && matches!(
+            handshake,
+            Err(build_version_handshake::HandshakeError::Probe(_))
+        )
+    {
+        endpoint = LocalEndpoint::from_resolved(
+            dot_agent_deck::endpoint_resolve::primary_attach_endpoint(),
+        );
+        attach_path = endpoint.path().to_path_buf();
+        if let Err(message) = bootstrap_primary_daemon(&endpoint).await {
+            eprintln!("after the legacy daemon went away: {message}");
+            return ExitCode::FAILURE;
+        }
+        handshake = build_version_handshake::ensure_compatible_daemon_or_die(&endpoint).await;
+    }
+    let handshake_outcome = match handshake {
+        Ok(outcome) => outcome,
+        Err(build_version_handshake::HandshakeError::MismatchAborted) => {
+            return ExitCode::FAILURE;
+        }
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
     // After a `Recovered` outcome the old daemon was just SIGTERM'd; the
     // next attach lazy-spawns a fresh one. Re-run the bootstrap so the
     // socket is back before any client (DaemonClient::list_agents,

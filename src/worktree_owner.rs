@@ -208,6 +208,48 @@ pub(crate) fn fixture_git(dir: &Path, sandbox_root: &Path) -> Command {
     cmd
 }
 
+/// Test-only: pin the end-of-line conversion of a freshly `init`ed fixture
+/// repository, in the repository's OWN config.
+///
+/// This is the one piece of configuration a fixture must write into a
+/// repository rather than supply by environment, and it is not a relapse into
+/// what [`fixture_git`] removed. Identity and `commit.gpgsign` only ever need
+/// to reach the *fixture's* own `git`, so the environment carries them.
+/// Conversion has to reach **every** `git` that touches the repository, and
+/// some of them are PRODUCTION commands — `create_worktree` runs `git worktree
+/// add` through `run_status`, deliberately un-neutralized because production
+/// operates on the user's real repository with the user's real config. Only
+/// repository-local config outranks system and global for both of them, and a
+/// linked worktree shares `$GIT_COMMON_DIR/config`, so pinning it here covers
+/// the worktrees production creates as well as the repository itself.
+///
+/// Without it the two halves disagree wherever the ambient config sets
+/// `core.autocrlf=true` — which Git for Windows ships in its *system* config,
+/// and which is why `build-windows` alone went red on issue #1121: the fixture
+/// commits `seed\n`, production's `git worktree add` checks it out as
+/// `seed\r\n`, and the fixture's own `git status --porcelain` — converting
+/// nothing — reports ` M README.md`. Measured on Linux by standing an ambient
+/// `core.autocrlf=true` in for the Windows system config: reproduced verbatim
+/// without this pin, clean with it, under each of `autocrlf=true`,
+/// `autocrlf=input`, `eol=crlf` and both together. (`core.eol` alone is inert
+/// here — also measured — because it applies only once the `text` attribute is
+/// set, which needs `autocrlf` or a `.gitattributes` neither side has.)
+///
+/// Only fixtures that COMMIT A FILE need it; the ones in this module commit
+/// with `--allow-empty` and have no blob to convert.
+#[cfg(test)]
+pub(crate) fn pin_fixture_eol(repo: &Path, sandbox_root: &Path) {
+    let out = fixture_git(repo, sandbox_root)
+        .args(["config", "core.autocrlf", "false"])
+        .output()
+        .expect("run git config core.autocrlf");
+    assert!(
+        out.status.success(),
+        "fixture precondition: pinning core.autocrlf failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 /// Run `git rev-parse <flag>` from inside `dir` and return the single path it
 /// answers with, or `None` on any failure at all — `git` missing, `dir` gone,
 /// a non-zero exit, an empty answer.

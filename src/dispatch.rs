@@ -872,6 +872,10 @@ mod tests {
         };
         std::fs::create_dir_all(dir).unwrap();
         run(&["init", "-q", "."]);
+        // Immune today only because `a.txt` holds no newline; pinned anyway so
+        // that adding one stays a content change rather than a Windows-only
+        // failure three modules away (`pin_fixture_eol`).
+        crate::worktree_owner::pin_fixture_eol(dir, sandbox_root);
         std::fs::write(dir.join("a.txt"), "hi").unwrap();
         run(&["add", "."]);
         run(&["commit", "-qm", "init"]);

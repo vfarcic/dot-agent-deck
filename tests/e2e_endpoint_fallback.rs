@@ -401,3 +401,116 @@ fn socket_011_fallback_client_discovers_legacy_daemon_without_lazy_spawn() {
         failures.join("\n")
     );
 }
+
+/// A listener bound at the legacy attach path that accepts a connection and
+/// immediately drops it, without ever speaking the attach protocol.
+///
+/// This is the *client-visible* shape of a legacy daemon that goes away
+/// between the launcher's answering-probe and the handshake's own `connect`:
+/// `verify_endpoint_trusted` passes (uid-equal, exactly `0o600`, a socket),
+/// `IpcClient::connect_timeout` succeeds, so the resolver selects the legacy
+/// endpoint — and then the `Hello` round-trip gets EOF instead of a reply.
+/// Reproducing it this way rather than by racing a real daemon's exit makes
+/// the window deterministic; the window itself is two syscalls wide and
+/// nothing in the code can be asked to sit inside it.
+struct HalfDeadLegacyDaemon {
+    path: PathBuf,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl HalfDeadLegacyDaemon {
+    fn bind(path: &Path) -> Self {
+        let listener =
+            std::os::unix::net::UnixListener::bind(path).expect("bind the half-dead legacy daemon");
+        // Exactly `0o600` or `verify_endpoint_trusted` refuses the endpoint
+        // and the resolver never selects it — which would make this test pass
+        // by never reaching the branch it exists to cover.
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+            .expect("chmod the half-dead legacy endpoint to 0o600");
+        // A BLOCKING accept loop, woken by `shutdown`'s own connect. A
+        // non-blocking listener polled on a timer would be the obvious
+        // spelling and is exactly what Decision 21 forbids — and rightly:
+        // the poll interval would be load-bearing on a busy box, while
+        // blocking here costs nothing and ends deterministically.
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_for_thread = std::sync::Arc::clone(&stop);
+        let thread = std::thread::spawn(move || {
+            while let Ok(_conn) = listener.accept() {
+                // `_conn` is dropped right here: the peer sees the connect
+                // succeed and its first read return EOF, which is the whole
+                // behaviour being staged.
+                if stop_for_thread.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
+            }
+        });
+        Self {
+            path: path.to_path_buf(),
+            stop,
+            thread: Some(thread),
+        }
+    }
+
+    /// Stop answering and remove the inode, so the `daemon stop` the test runs
+    /// afterwards resolves to the primary endpoint rather than to this stub.
+    ///
+    /// The flag is set *before* the wake-up connect, and the connect is what
+    /// unblocks `accept`; ordering it the other way round would race. The
+    /// connect is allowed to fail — if the thread has already exited for its
+    /// own reasons there is nothing to wake, and the `join` below still ends.
+    fn shutdown(&mut self) {
+        let Some(thread) = self.thread.take() else {
+            return;
+        };
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = std::os::unix::net::UnixStream::connect(&self.path);
+        let _ = thread.join();
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+impl Drop for HalfDeadLegacyDaemon {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+/// Scenario: Bind a stub at the isolated legacy attach path that accepts connections but never answers the attach protocol, then launch the real deck with isolated fallback and legacy roots and both endpoint overrides absent. The launcher should select that legacy endpoint, get a failed handshake probe from it, and recover by cold-starting at the new per-uid endpoints instead of exiting — so the dashboard still renders and both new sockets are bound.
+#[spec("error/socket/012")]
+#[test]
+fn socket_012_a_legacy_daemon_that_stops_answering_recovers_to_the_primary() {
+    let literal_legacy = LiteralLegacyEndpoints::capture();
+    let temp = common::harness_tempdir().expect("create fallback TMPDIR");
+    let legacy_temp = common::harness_tempdir().expect("create isolated legacy endpoint root");
+    let legacy = LegacyEndpointPaths::under(legacy_temp.path());
+    let paths = EndpointPaths::under(temp.path());
+    let log = temp.path().join("daemon.log");
+
+    let mut half_dead = HalfDeadLegacyDaemon::bind(&legacy.attach);
+
+    // The whole assertion: without the recovery this launch prints
+    // `build-version handshake probe failed: …` and exits `FAILURE`, so the
+    // dashboard never appears and this wait is what reddens.
+    let deck = launch_fallback_deck(temp.path(), &legacy, &log);
+    deck.wait_for_string(DASHBOARD_EMPTY_STATE);
+
+    // …and it recovered to the PRIMARY endpoint rather than limping along on
+    // the legacy one: the new per-uid pair is bound, which only the cold start
+    // at `primary_attach_endpoint()` can have done.
+    let mut failures = inspect_new_endpoints(&paths, &legacy, false);
+
+    half_dead.shutdown();
+    let home = deck.home_dir().to_path_buf();
+    if let Err(error) = stop_resolved_daemon(temp.path(), &legacy, None, &home) {
+        failures.push(error);
+    }
+    drop(deck);
+
+    literal_legacy.assert_unchanged();
+    assert!(
+        failures.is_empty(),
+        "a legacy endpoint that stopped answering did not recover to the primary:\n{}",
+        failures.join("\n")
+    );
+}

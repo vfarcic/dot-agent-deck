@@ -1574,6 +1574,10 @@ mod tests {
         };
         std::fs::create_dir_all(repo).unwrap();
         run(repo, &["init", "-q", "."]);
+        // Immune today only because `a.txt` holds no newline; pinned anyway so
+        // that adding one stays a content change rather than a Windows-only
+        // failure three modules away (`pin_fixture_eol`).
+        crate::worktree_owner::pin_fixture_eol(repo, sandbox_root);
         std::fs::write(repo.join("a.txt"), "hi").unwrap();
         run(repo, &["add", "."]);
         run(repo, &["commit", "-qm", "init"]);
@@ -2104,6 +2108,11 @@ mod tests {
             );
         };
         git(&["init", "--initial-branch=main", "--quiet"]);
+        // The one config a fixture repository must carry itself, because
+        // production `create_worktree` checks this repository out with the
+        // ambient config while the assertions read it with the neutralized one
+        // — see `pin_fixture_eol`, and issue #1121's `build-windows` red.
+        crate::worktree_owner::pin_fixture_eol(repo, sandbox_root);
         std::fs::write(repo.join("README.md"), "seed\n").expect("write seed file");
         git(&["add", "README.md"]);
         git(&["commit", "--quiet", "-m", "seed"]);

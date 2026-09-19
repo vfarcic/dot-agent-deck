@@ -2695,6 +2695,13 @@ without depending on the config struct API.
 - **Does not assert:** behavior when live daemons answer at both the new and legacy paths; a cross-version build-id mismatch prompt; a foreign-owned legacy entry.
 - **Platform coverage:** mac+linux (Unix-domain sockets and the e2e-only legacy-root seam).
 
+##### error/socket/012 — A legacy daemon that stops answering between the probe and the handshake is recovered, not fatal.
+- **Layer:** L2 (PTY + vt100 against the real TUI, with a stub listener standing in for the half-dead legacy daemon).
+- **Agent:** none.
+- **Asserts:** with a listener bound at `<isolated-legacy-root>/dot-agent-deck-attach-<uid>.sock` that is uid-equal and exactly `0o600` (so `verify_endpoint_trusted` passes and the resolver selects it) but accepts and immediately drops every connection, a fallback launch with isolated fallback and e2e-only legacy roots, `XDG_RUNTIME_DIR` absent and both endpoint overrides absent still renders the dashboard; the new per-uid `hook.sock` and `attach.sock` are bound afterwards, which only the re-resolve to `primary_attach_endpoint()` plus a cold start can have produced. Read-only before/after metadata snapshots assert that both literal `/tmp/dot-agent-deck[-attach]-<uid>.sock` production paths remain exactly as the test found them.
+- **Does not assert:** a real daemon exiting inside that two-syscall window (not reproducible without a seam — the stub reproduces the client-visible shape instead); the `PeerPid` arm, which is a different `HandshakeError` and is not recovered; recovery from a *primary* endpoint that stops answering, which is deliberately still fatal; Windows named-pipe resolution.
+- **Platform coverage:** mac+linux (Unix-domain sockets and the e2e-only legacy-root seam).
+
 #### error/config
 
 ##### error/config/001 — `.dot-agent-deck.toml` with an invalid regex makes the new-pane form refuse the mode and surface a status-line message.

@@ -206,6 +206,13 @@ impl Fixture {
         // the identity by environment, so the fixture never writes to a
         // repository just to configure one.
         git(&repo, &["init", "--initial-branch=main", "--quiet"]);
+        // The exception to that sentence, and the twin of
+        // `worktree_owner::pin_fixture_eol` — see its doc comment for the
+        // measurement. `010`/`011` create worktrees through PRODUCTION
+        // `create_worktree`, whose `git worktree add` reads the ambient config
+        // this fixture's own `git` cannot see, so `core.autocrlf` has to live
+        // where both of them look: in the repository.
+        git(&repo, &["config", "core.autocrlf", "false"]);
         std::fs::write(repo.join("README.md"), "seed\n").expect("write seed file");
         git(&repo, &["add", "README.md"]);
         git(&repo, &["commit", "--quiet", "-m", "seed"]);
