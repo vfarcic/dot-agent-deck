@@ -3682,7 +3682,14 @@ mod hook_ingestion_tests {
             state.read().await.sessions["sess-370"].status.clone()
         };
 
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        // #709-scaled, not flat: the chain this waits on is a BOOT — `/bin/sh`
+        // starting a `python3` interpreter, which forks, `setsid`s and `execv`s
+        // a `sleep`, after which the monitor still has to sample. A flat 3 s was
+        // sized for an idle box and this test failed at 3.076 s under tier load,
+        // i.e. it exhausted exactly this ceiling rather than observing anything
+        // wrong. See `crate::test_budget`.
+        let deadline =
+            tokio::time::Instant::now() + crate::test_budget::load_scaled(Duration::from_secs(3));
         let mut current = status(state.clone()).await;
         while current != crate::state::SessionStatus::Working
             && tokio::time::Instant::now() < deadline
@@ -3697,7 +3704,11 @@ mod hook_ingestion_tests {
              child runs, with zero agent-emitted events involved"
         );
 
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(4);
+        // Scaled for the same reason: the falling edge waits for the detached
+        // child to exit AND the monitor's next sample to miss it, both of which
+        // a contended box defers.
+        let deadline =
+            tokio::time::Instant::now() + crate::test_budget::load_scaled(Duration::from_secs(4));
         let mut current = status(state.clone()).await;
         while current != crate::state::SessionStatus::Idle && tokio::time::Instant::now() < deadline
         {
@@ -3826,7 +3837,10 @@ mod hook_ingestion_tests {
         // EVERY event it publishes — a single unstamped one is enough to mint
         // a phantom card on a reconnected TUI.
         let mut saw_busy = false;
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        // #709-scaled: this test failed at 5.089 s under tier load, exhausting
+        // exactly this ceiling. Same boot chain as its sibling above.
+        let deadline =
+            tokio::time::Instant::now() + crate::test_budget::load_scaled(Duration::from_secs(5));
         while !saw_busy && tokio::time::Instant::now() < deadline {
             let Ok(Ok(BroadcastMsg::Event(event))) =
                 tokio::time::timeout(Duration::from_millis(500), rx.recv()).await

@@ -77,6 +77,41 @@ const LIFETIME_TAG_VAR: &str = "DOT_AGENT_DECK_TEST_LIFETIME_TAG";
 /// comment used to point at).
 const MAX_LIFETIME_CEILING_SECS: u64 = 300;
 
+/// The stand-in script both tests install: record `$var` — or [`UNSET_MARKER`]
+/// when the variable is absent entirely — into the file named by `$record_env`,
+/// then `exec cat` to stay alive and be censused.
+///
+/// **The record is written to a sibling and `mv`d into place, and that is
+/// load-bearing.** Both callers wait on `record.is_file()`. A plain
+/// `> "$RECORD"` makes that predicate true at the shell's `open(2)`, *before*
+/// `printf` has written a byte, so a poll landing in that window reads `""`,
+/// trims it to `""`, and fires the caller's assertion against an empty string —
+/// blaming the product for losing a variable that was in fact never read.
+///
+/// Not hypothetical: `an_unwrapped_agent_spawn_carries_a_lifetime_tag` failed 2
+/// of 14 `cargo test-fast` runs exactly this way, always in ~0.057 s, which is
+/// the tell — its 20 s wait had plainly not elapsed. Reproduced deterministically
+/// by forcing the window (`: > "$RECORD"; sleep 0.3; printf … >> "$RECORD"`),
+/// which reproduces the observed failure exactly: `…TAG=""` at the same
+/// assertion.
+///
+/// The unwrapped caller is the one that loses it because nothing sits in front
+/// of its stand-in; the wrapped sibling has `wrap`'s startup between the spawn
+/// and the redirection, which usually carries the first poll clear of the
+/// window. The race is identical in both, so both write through this helper.
+///
+/// `mv` within one directory is `rename(2)`, which is atomic — so the record is
+/// either absent or complete, and `is_file()` means what the wait reads it to
+/// mean. This makes the *observation* honest rather than making the wait longer
+/// or polling for non-emptiness: the same correction `delegate/034` took in
+/// `364dc860`, for the same reason — a test should wait on a condition that is
+/// really there.
+fn record_var_then_block(var: &str, record_env: &str) -> String {
+    format!(
+        "#!/bin/sh\nprintf '%s\\n' \"${{{var}-{UNSET_MARKER}}}\" > \"${record_env}.part\"\nmv \"${record_env}.part\" \"${record_env}\"\nexec cat\n"
+    )
+}
+
 fn write_executable(path: &std::path::Path, contents: &str) {
     use std::os::unix::fs::PermissionsExt;
 
@@ -109,8 +144,11 @@ fn path_with_built_deck(bin_dir: &std::path::Path) -> String {
 /// Issue #668, the regression guard for the *arming* gap — the half no
 /// behavioural test can catch, because a child that dies of its own hangup dies
 /// whether or not a cap was ever armed. Deliberately an environment assertion
-/// rather than a timing one: it costs milliseconds and cannot flake. Reading the
-/// child's environment is also literally how the gap was diagnosed.
+/// rather than a timing one: it costs milliseconds and does not depend on how
+/// long anything takes. Reading the child's environment is also literally how
+/// the gap was diagnosed. That does not make it immune to *observing* that
+/// environment too early — see [`record_var_then_block`] for the race the
+/// sibling test below used to lose, and which the `mv` closes for both.
 #[test]
 fn in_process_registry_spawn_arms_the_wrapped_child_lifetime_bound() {
     common::init_test_env();
@@ -124,9 +162,7 @@ fn in_process_registry_spawn_arms_the_wrapped_child_lifetime_bound() {
         // `${VAR-<unset>}` (not `:-`) so an empty value is reported as empty
         // rather than silently reading as absent. `exec cat` keeps the stand-in
         // alive and is the exact shape whose orphans #668 censused.
-        &format!(
-            "#!/bin/sh\nprintf '%s\\n' \"${{{MAX_LIFETIME_VAR}-{UNSET_MARKER}}}\" > \"$CAP_RECORD\"\nexec cat\n"
-        ),
+        &record_var_then_block(MAX_LIFETIME_VAR, "CAP_RECORD"),
     );
 
     let cwd = fixture.path().to_string_lossy().into_owned();
@@ -210,8 +246,11 @@ fn in_process_registry_spawn_arms_the_wrapped_child_lifetime_bound() {
 /// entirely.
 ///
 /// Deliberately an environment assertion rather than a timing one, for the same
-/// reason as the test above: it costs milliseconds, it cannot flake, and reading
-/// a child's environment is literally how #861 was diagnosed.
+/// reason as the test above: it costs milliseconds, it does not depend on how
+/// long anything takes, and reading a child's environment is literally how #861
+/// was diagnosed. What it did depend on was the record being *complete* when the
+/// wait first saw it — see [`record_var_then_block`]. This is the test that lost
+/// that race, at 2 of 14 tier runs, before the `mv` made it honest.
 #[test]
 fn an_unwrapped_agent_spawn_carries_a_lifetime_tag() {
     common::init_test_env();
@@ -226,9 +265,7 @@ fn an_unwrapped_agent_spawn_carries_a_lifetime_tag() {
         // than silently reading as absent — an empty tag would build a needle
         // that matches every process on the box, which is the one outcome worse
         // than none.
-        &format!(
-            "#!/bin/sh\nprintf '%s\\n' \"${{{LIFETIME_TAG_VAR}-{UNSET_MARKER}}}\" > \"$TAG_RECORD\"\nexec cat\n"
-        ),
+        &record_var_then_block(LIFETIME_TAG_VAR, "TAG_RECORD"),
     );
 
     let cwd = fixture.path().to_string_lossy().into_owned();

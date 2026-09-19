@@ -5,7 +5,8 @@ use std::sync::{Mutex, MutexGuard};
 use serde_json::{Value, json};
 
 use crate::agent_hook_config::{
-    binary_names_match, executables_match, strip_deck_commands, unquote_if_needed,
+    binary_names_match, executables_match, pin_is_same_named, rule_command_strs,
+    strip_deck_commands, unquote_if_needed,
 };
 // Exercised only by this module's own tests, which drive the platform-convention
 // arithmetic with both hosts' conventions injected (see `binary_names_match_under`).
@@ -384,6 +385,22 @@ struct InstallOutcome {
     /// the deck no longer installs. Never a user-authored command — both
     /// predicates are gated on deck ownership first.
     repaired: usize,
+    /// Issue #1171: live deck rules for the same binary NAME at a different
+    /// path, which this install LEAVES IN PLACE and which therefore each
+    /// deliver the same hook event.
+    ///
+    /// Reported rather than pruned, deliberately.
+    /// `hook_rule_identification_011` pins the opposite policy — two on-disk
+    /// builds sharing a basename are distinct deployments and each keep their
+    /// rule — so collapsing them here would overturn a documented property
+    /// rather than fix a bug. What was actually wrong is that it happened in
+    /// silence: `remote add` on a host that already had the deck installed
+    /// produced two rules per event, and the only hint was `hooks uninstall`
+    /// later reporting twice the expected count.
+    ///
+    /// Sorted and de-duplicated across hook types, so a reader sees each other
+    /// install once rather than ten times.
+    coexisting: std::collections::BTreeSet<String>,
 }
 
 fn install_impl(settings: &mut Value, binary_path: &str) -> InstallOutcome {
@@ -393,6 +410,7 @@ fn install_impl(settings: &mut Value, binary_path: &str) -> InstallOutcome {
     // gone from HOOK_TYPES entirely, so any deck rule there is stale regardless
     // of which binary wrote it — use the generic, binary-agnostic predicate.
     let mut repaired = 0usize;
+    let mut coexisting = std::collections::BTreeSet::new();
     let all_keys: Vec<String> = hooks_obj.keys().cloned().collect();
     for key in all_keys {
         if !HOOK_TYPES.contains(&key.as_str()) {
@@ -443,6 +461,20 @@ fn install_impl(settings: &mut Value, binary_path: &str) -> InstallOutcome {
         // except a LEGACY rule under the historical default name, which always
         // migrates to whichever binary is currently installing.
         let removed = strip_deck_commands(rules, |cmd| command_matches_binary(cmd, binary_path));
+
+        // Issue #1171: whatever deck rules survived that strip and name the
+        // same binary as us are other installs of the deck, alive and at
+        // another path. They are left alone (see `coexisting`), but they are no
+        // longer left unmentioned.
+        for command in rule_command_strs(rules) {
+            if let Some(exe) = owned_command_executable(command)
+                && !executables_match(&exe, binary_path)
+                && pin_is_same_named(&exe, binary_path)
+            {
+                coexisting.insert(exe);
+            }
+        }
+
         rules.push(expected);
 
         if already_current && removed == 1 {
@@ -456,6 +488,7 @@ fn install_impl(settings: &mut Value, binary_path: &str) -> InstallOutcome {
         installed,
         skipped,
         repaired,
+        coexisting,
     }
 }
 
@@ -800,7 +833,10 @@ pub fn install_with(resolve: impl FnOnce() -> Result<String, String>) -> Result<
     let mut settings = load_settings_or_refuse(&path).map_err(|e| e.to_string())?;
 
     let InstallOutcome {
-        installed, skipped, ..
+        installed,
+        skipped,
+        coexisting,
+        ..
     } = install_impl(&mut settings, &binary_path);
 
     write_settings(&path, &settings).map_err(|e| format!("writing {}: {e}", path.display()))?;
@@ -810,6 +846,22 @@ pub fn install_with(resolve: impl FnOnce() -> Result<String, String>) -> Result<
     }
     if !skipped.is_empty() {
         println!("Already installed (skipped): {}", skipped.join(", "));
+    }
+    if !coexisting.is_empty() {
+        let plural = if coexisting.len() == 1 { "" } else { "s" };
+        println!(
+            "Note: {} other dot-agent-deck install{plural} still have hook rules here:",
+            coexisting.len()
+        );
+        for other in &coexisting {
+            println!("  {other}");
+        }
+        println!(
+            "  Every hook event is delivered once per rule, and all of them reach the same \
+             daemon, so the extra deliveries are redundant. To collapse them, run \
+             `dot-agent-deck hooks uninstall` and then `hooks install` from whichever \
+             install you want to keep."
+        );
     }
     println!("Settings file: {}", path.display());
     Ok(())
@@ -1071,6 +1123,76 @@ mod tests {
             &format!("{DEFAULT_BINARY_NAME} hook"),
             &installing
         ));
+    }
+
+    /// Issue #1171: two LIVE deck installs sharing a basename at different
+    /// paths each keep a rule — and the install now says so instead of leaving
+    /// it silent.
+    ///
+    /// The exact shape found in the wild: a Mac with the deck from Homebrew,
+    /// then `remote add` installing a second copy under `~/.local/bin`. Ten
+    /// events ended up with two rules each, every hook was delivered twice, and
+    /// the only hint was a later `hooks uninstall` reporting 20 removals.
+    ///
+    /// Not macOS-specific in the slightest — it fires on any host that already
+    /// has the deck installed by any means (apt, nix, Homebrew, a manual copy).
+    /// It was merely found on a Mac.
+    ///
+    /// Both files are real and executable on purpose: a dead sibling is already
+    /// pruned by `command_is_dead_deck`, so the duplicate only survives when the
+    /// other install is genuinely alive, which is exactly the Homebrew case.
+    /// The rules are deliberately NOT collapsed here — see `InstallOutcome::coexisting`.
+    #[test]
+    fn a_live_same_named_deck_at_another_path_is_reported_not_pruned() {
+        let a_dir = crate::test_temp::tempdir().expect("install a tempdir");
+        let b_dir = crate::test_temp::tempdir().expect("install b tempdir");
+        let a = a_dir.path().join(DEFAULT_BINARY_NAME);
+        let b = b_dir.path().join(DEFAULT_BINARY_NAME);
+        for path in [&a, &b] {
+            std::fs::write(path, b"#!/bin/sh\nexit 0\n").expect("seed binary");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+                    .expect("chmod");
+            }
+        }
+        let (a, b) = (
+            a.to_str().expect("utf-8").to_string(),
+            b.to_str().expect("utf-8").to_string(),
+        );
+
+        let mut settings = serde_json::json!({});
+        let first = install_impl(&mut settings, &a);
+        assert!(
+            first.coexisting.is_empty(),
+            "the first install has nothing to coexist with: {:?}",
+            first.coexisting
+        );
+
+        let second = install_impl(&mut settings, &b);
+        assert_eq!(
+            second.coexisting.iter().cloned().collect::<Vec<_>>(),
+            vec![a.clone()],
+            "installing `{b}` must REPORT the live same-named deck still at `{a}`"
+        );
+
+        // Reported, not pruned: `hook_rule_identification_011` pins that these
+        // stay two distinct deployments, and this must not quietly reverse it.
+        let rules = settings["hooks"]["PreToolUse"]
+            .as_array()
+            .expect("PreToolUse rules");
+        let commands = crate::agent_hook_config::rule_command_strs(rules);
+        assert_eq!(
+            commands.len(),
+            2,
+            "both installs keep their rule; got {commands:?}"
+        );
+        assert!(
+            commands.iter().any(|c| c.starts_with(&a))
+                && commands.iter().any(|c| c.starts_with(&b)),
+            "one rule per install, not one replacing the other: {commands:?}"
+        );
     }
 
     /// The safety property the basename gate exists for, at its own call site

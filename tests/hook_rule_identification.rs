@@ -434,6 +434,16 @@ fn hook_rule_identification_010_symlinked_binary_collapses_to_one_rule() {
 /// not wipe the other's. Unlike `_003`'s fictional paths (where
 /// `canonicalize` always fails), both paths here are real files, so this
 /// exercises the canonicalize-success branch `_003` cannot reach.
+///
+/// **Before you relax this test, read issue #1171.** This is the property that
+/// makes a second install of the deck — Homebrew's alongside `~/.local/bin`'s,
+/// say — keep BOTH rules, so every hook event is delivered once per rule. That
+/// was reported as a bug. It was resolved by making the duplication *loud*
+/// rather than by collapsing the rules here (`hooks install` now names every
+/// live same-named deck at another path — see `InstallOutcome::coexisting`),
+/// precisely because this test says the coexistence is deliberate. Changing it
+/// is therefore a policy decision about two-builds-side-by-side users, not a
+/// bug fix, and it re-opens #1171's question rather than closing it.
 #[test]
 fn hook_rule_identification_011_distinct_builds_sharing_basename_do_not_collapse() {
     let build_a_dir = test_temp::tempdir().expect("build a tempdir");

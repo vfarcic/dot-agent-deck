@@ -38,3 +38,10 @@ site/.docusaurus/
 # or py_compile over them. Regenerated on demand and version-specific.
 __pycache__/
 *.pyc
+
+# devbox's generated per-project shell scripts. `devbox run` / `devbox shell`
+# regenerate these on demand from devbox.json, and each one embeds the absolute
+# path of the checkout it was generated in — so they are machine-specific and
+# differ per worktree. Never belonged in the repo; committed by accident in an
+# agent's `git add -A` after a `devbox run`, which is what prompted this entry.
+.devbox/
