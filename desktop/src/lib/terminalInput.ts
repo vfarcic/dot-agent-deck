@@ -1,5 +1,6 @@
 import { sendResultReason } from "../types";
 import type { AgentSession, SendResult } from "../types";
+import type { ActivityDisplay } from "./displayText";
 
 /**
  * Issue #1042 — whether an agent's terminal will accept what is typed into it,
@@ -183,7 +184,35 @@ export interface NoTerminalState {
    * is the blank rectangle this exists to replace.
    */
   notice: string;
+  /**
+   * The exact instant behind the relative age in {@link notice}, for the
+   * notice's hover — the same pairing {@link ActivityDisplay} established for
+   * every other relativised instant in this app, and absent for the same
+   * reason the clause is: there is no held record, or no age could be
+   * expressed for it (issue #1143).
+   */
+  noticeTitle?: string;
 }
+
+/**
+ * Issue #1143 — whether the agent record a surface is rendering is its deck's
+ * CURRENT answer or the last one that deck gave.
+ *
+ * `"held"` reaches one surface, and `grep recordFreshness desktop/src` is how
+ * to re-check that: `OverviewAgentPane` is the only call site that passes the
+ * prop at all, and it passes `"held"` only for an agent pane whose deck has
+ * stopped answering, where the record is kept so the pane can still be a pane
+ * (see `useHeldAgentRecord`). Every other render of a tile takes the default,
+ * because its record comes from a snapshot that was just built.
+ *
+ * It exists as an attribute on the tile — `data-agent-record`, sibling of
+ * `data-status` — rather than as a second sentence, for the reason
+ * {@link NoTerminalReason} gives for `data-terminal-state`: one state attribute
+ * readable from the DOM plus one `role="status"` sentence is the shape this
+ * feature already uses, and a second vocabulary for the same kind of fact is
+ * how two seams come to disagree.
+ */
+export type AgentRecordFreshness = "live" | "held";
 
 /**
  * The pane's agent is on a deck this app cannot reach, so nothing is attached —
@@ -205,11 +234,32 @@ export interface NoTerminalState {
  * `deckLabel` is `deckName`'s (`lib/displayText.ts`), which is what every other
  * surface in the app calls a deck — the overview's group header the user came
  * from, and the label in the Deck selector.
+ *
+ * # `heldAge` is the staleness affordance, and it is not decoration
+ *
+ * Issue #1143 made this state reachable by keeping the last agent record an
+ * open pane's deck gave, and a held record's status, prompt and tool were true
+ * at some past moment and may be arbitrarily old. Showing them with nothing
+ * saying so would assert a liveness the app has no evidence for, which is
+ * arguably worse than showing nothing at all — so the pane says, in the same
+ * sentence that explains the missing terminal, that everything beside it is a
+ * past report and how old that report is.
+ *
+ * It is the app's own `displayActivity` reading, so the vocabulary is the one
+ * the overview's last-activity column already uses (`just now`, `4m ago`,
+ * `2h ago`) rather than a second set of buckets, and the exact instant rides
+ * along on {@link NoTerminalState.noticeTitle} for the hover.
+ *
+ * Absent means the record is LIVE — this pane's deck is merely unreachable for
+ * a pane that was never held, which is the state the app is in for the frame
+ * between a deck going away and the hold being read back.
  */
-export function unreachableDeckTerminalState(deckLabel: string, reason?: string): NoTerminalState {
+export function unreachableDeckTerminalState(deckLabel: string, reason?: string, heldAge?: ActivityDisplay): NoTerminalState {
   const detail = reason?.trim() ? ` ${reason.trim()}` : "";
+  const held = heldAge ? ` The rest of this pane is what ${deckLabel} last reported ${heldAge.label}, and nothing in it is being updated.` : "";
   return {
     reason: "unreachable-deck",
-    notice: `No terminal here: the desktop has no live connection to ${deckLabel}, so there is nothing to attach to.${detail} The terminal appears on its own once that deck answers again.`,
+    notice: `No terminal here: the desktop has no live connection to ${deckLabel}, so there is nothing to attach to.${detail} The terminal appears on its own once that deck answers again.${held}`,
+    noticeTitle: heldAge?.title,
   };
 }
