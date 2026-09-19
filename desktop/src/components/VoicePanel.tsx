@@ -79,7 +79,6 @@ const TRANSCRIPTION_LABELS: Record<string, string> = {
 
 const INTENT_LABELS: Record<string, string> = {
   claude: "Claude CLI on this machine",
-  opencode: "OpenCode CLI on this machine",
   remote: "Remote API",
 };
 

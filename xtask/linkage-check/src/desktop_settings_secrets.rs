@@ -287,12 +287,19 @@ const ALLOWED_FIELD_TYPES: [(&str, FieldKind, &str); 19] = [
     (
         "IntentBackend",
         FieldKind::Scalar,
-        "a closed enum serialised as one token: `claude`, `opencode` or \
-         `remote` — WHICH backend resolves an utterance, never how it \
-         authenticates. The keyed `remote` one's credential lives in the OS \
-         keychain under SecretId::VoiceIntent and has no field here at all. \
-         Same folding deserializer and same MAX_VOICE_TOKEN_BYTES bound, so no \
-         text is representable",
+        "a closed enum serialised as one token: `claude` or `remote` — WHICH \
+         backend resolves an utterance, never how it authenticates. The set \
+         was `claude | opencode | remote` until PRD #802's landed-work \
+         security audit WITHDREW `opencode`: the agent-CLI backend hands a \
+         general-purpose coding agent a prompt built partly from untrusted \
+         input, so the child has to be containable, and `opencode run` has no \
+         no-tools flag and no no-persistence option (its sessions were \
+         confirmed locally to be resumable and to hold the utterance). \
+         `claude` has a flag for each. The keyed `remote` one's credential \
+         lives in the OS keychain under SecretId::VoiceIntent and has no field \
+         here at all. Same folding deserializer and same MAX_VOICE_TOKEN_BYTES \
+         bound, so no text is representable — and that folding is what makes a \
+         stale `intent = \"opencode\"` load as the default rather than fail",
     ),
     (
         "TranscriptionBackend",

@@ -474,37 +474,52 @@ impl VoiceToken for TranscriptionBackend {
 /// these" answer that is most of the safety. It is also slow (4.5 s wall), and
 /// `Remote` is the same milestone's answer to that.
 ///
-/// The two CLI variants and the remote one are one enum rather than a backend
-/// choice plus a CLI choice, because a separate `agent` field would be
-/// meaningless whenever the backend is remote. Each variant names one adapter.
+/// The CLI variant and the remote one are one enum rather than a backend choice
+/// plus a CLI choice, because a separate `agent` field would be meaningless
+/// whenever the backend is remote. Each variant names one adapter.
+///
+/// # `opencode` was here and was WITHDRAWN, deliberately
+///
+/// PRD #802 M5 shipped an `Opencode` variant driving `opencode run --pure`, and
+/// the landed-work security audit took it out again. The reason is specific and
+/// is not "we did not get round to measuring it": the agent-CLI backend hands a
+/// general-purpose coding agent a prompt built partly from **untrusted** input,
+/// so the child has to be containable — no tools, no hooks, no MCP, no project
+/// configuration, no session written to disk. `claude` has a flag for every one
+/// of those ([`crate::voice::agent_cli`] names them). `opencode run` has no
+/// no-tools equivalent and no no-persistence option, and its `run` was confirmed
+/// locally to write a resumable session containing the utterance. An
+/// uncontainable subprocess executor is not something to ship in a feature that
+/// is on by default, so the variant went rather than being documented as
+/// best-effort.
+///
+/// Dropping it costs a user nothing worse than a re-pick: the deserializer folds
+/// an unknown token to [`Self::Claude`], so an `intent = "opencode"` left in a
+/// document loads as the default and the panel shows the default. That folding
+/// is the whole reason a closed enum was the right shape here.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum IntentBackend {
     /// The `claude` CLI in print mode. No key of the app's own, no download.
     #[default]
     Claude,
-    /// The `opencode` CLI. Best-effort until someone runs it — PRD #802 says so
-    /// rather than claiming parity it has not measured.
-    Opencode,
     /// The keyed remote API, for the latency. Its credential lives in
     /// [`crate::secrets::SecretId::VoiceIntent`].
     Remote,
 }
 
 impl VoiceToken for IntentBackend {
-    const TOKENS: &'static [&'static str] = &["claude", "opencode", "remote"];
+    const TOKENS: &'static [&'static str] = &["claude", "remote"];
     const LABEL: &'static str = "an intent backend";
 
     fn as_str(self) -> &'static str {
         match self {
             Self::Claude => "claude",
-            Self::Opencode => "opencode",
             Self::Remote => "remote",
         }
     }
 
     fn from_str_lossy(raw: &str) -> Self {
         match raw.trim().to_ascii_lowercase().as_str() {
-            "opencode" => Self::Opencode,
             "remote" => Self::Remote,
             _ => Self::default(),
         }
@@ -2941,7 +2956,7 @@ mod tests {
             "version = 1\n\n\
              [voice]\n\
              activation = \"toggle\"\n\
-             intent = \"opencode\"\n\
+             intent = \"remote\"\n\
              transcription = \"remote\"\n",
         )
         .unwrap();
@@ -2949,7 +2964,7 @@ mod tests {
         let loaded = load_from(&path);
         let voice = loaded.voice.clone().expect("the section is present");
         assert_eq!(voice.activation, ActivationMode::Toggle);
-        assert_eq!(voice.intent, IntentBackend::Opencode);
+        assert_eq!(voice.intent, IntentBackend::Remote);
         assert_eq!(voice.transcription, TranscriptionBackend::Remote);
 
         // The JSON the webview receives carries the same tokens, not an index
@@ -2958,7 +2973,7 @@ mod tests {
             serde_json::to_value(&voice).unwrap(),
             serde_json::json!({
                 "activation": "toggle",
-                "intent": "opencode",
+                "intent": "remote",
                 "transcription": "remote",
             })
         );
@@ -3059,6 +3074,47 @@ mod tests {
         assert!(problem.public().contains("line"), "{}", problem.public());
     }
 
+    /// Scenario: a document written by the build that shipped the withdrawn
+    /// `opencode` intent backend loads on this build. The token folds to
+    /// `claude`, the rest of the document survives, and nothing errors.
+    ///
+    /// The migration for [`IntentBackend`]'s withdrawn variant, asserted rather
+    /// than argued: the audit that removed it reasoned that the folding
+    /// deserializer makes dropping a variant cheap, and this is what that costs
+    /// a user who had picked it — one re-pick, not a lost document. The
+    /// user-visible consequence is the same one the general folding test pins:
+    /// the next save writes `claude` back.
+    #[test]
+    fn the_withdrawn_opencode_intent_backend_folds_to_the_default() {
+        let dir = tempdir();
+        let path = dir.path().join(SETTINGS_FILE_NAME);
+        std::fs::write(
+            &path,
+            "version = 1\n\n\
+             [appearance]\n\
+             mode = \"dark\"\n\n\
+             [voice]\n\
+             intent = \"opencode\"\n\
+             transcription = \"remote\"\n",
+        )
+        .unwrap();
+
+        let (loaded, problem) = load_document(&path);
+        assert!(
+            problem.is_none(),
+            "a withdrawn token is not a malformed document"
+        );
+        let voice = loaded.voice.clone().expect("the section is present");
+        assert_eq!(voice.intent, IntentBackend::Claude);
+        // Everything else in the document survives the fold.
+        assert_eq!(voice.transcription, TranscriptionBackend::Remote);
+        assert_eq!(loaded.appearance.mode, AppearanceMode::Dark);
+        assert!(
+            !<IntentBackend as VoiceToken>::TOKENS.contains(&"opencode"),
+            "the variant is withdrawn; see IntentBackend's doc comment for why"
+        );
+    }
+
     /// The `[voice]` tokens are duplicated in `desktop/src/lib/bridge.ts`, so
     /// both copies are pinned value-by-value and each points at the other —
     /// the same arrangement `zoom_ladder_matches_the_frontend_copy` makes, and
@@ -3079,7 +3135,7 @@ mod tests {
         );
         assert_eq!(
             <IntentBackend as VoiceToken>::TOKENS,
-            ["claude", "opencode", "remote"],
+            ["claude", "remote"],
             "keep this identical to VOICE_INTENT_BACKENDS in desktop/src/lib/bridge.ts"
         );
         assert_eq!(

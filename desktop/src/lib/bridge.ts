@@ -455,8 +455,15 @@ export const VOICE_ACTIVATION_MODES = ["toggle"] as const;
  * `claude` is the default because it needs no key and no download — the user
  * already has a pre-authenticated CLI on the box. Keep identical to
  * `IntentBackend::TOKENS` in `src-tauri/src/settings.rs`.
+ *
+ * `opencode` was here and was withdrawn by PRD #802's landed-work security
+ * audit: the agent-CLI backend has to be able to run the child with no tools,
+ * no hooks, no MCP, no project config and no session on disk, and `opencode
+ * run` offers none of those switches. The Rust enum's doc comment has the
+ * reasoning; its folding deserializer is why a stale `opencode` in a settings
+ * document loads as `claude` instead of failing.
  */
-export const VOICE_INTENT_BACKENDS = ["claude", "opencode", "remote"] as const;
+export const VOICE_INTENT_BACKENDS = ["claude", "remote"] as const;
 
 /**
  * Which backend turns speech into text (PRD #802 M7).

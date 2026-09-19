@@ -35,7 +35,12 @@ const MAX_JSON_CANDIDATES: usize = 64;
 /// The answer is a few dozen bytes and arrives at the end of a short reply, so
 /// this is generous by three orders of magnitude while keeping the scan's cost
 /// independent of how much a confused CLI decided to print.
-const MAX_SCAN_BYTES: usize = 64 * 1024;
+///
+/// `pub` so [`super::agent_cli::MAX_STDOUT_BYTES`] can be derived from it
+/// rather than repeated: that one bounds how much output is READ and this one
+/// bounds how much is scanned, and reading more than will ever be scanned is
+/// allocation with nothing on the other end of it.
+pub const MAX_SCAN_BYTES: usize = 64 * 1024;
 
 /// Why an answer could not be recovered from a backend's output.
 ///
@@ -215,12 +220,28 @@ fn agent_state(agent: &DesktopAgent, agents: &[DesktopAgent]) -> Value {
 /// uses [`state`] and the tool schema instead, because it has a better place to
 /// put each piece.
 ///
-/// **The utterance is untrusted text and goes in last, labelled.** It cannot
-/// reach a shell, and what it can do to the *model* is bounded by everything
-/// downstream: the answer is validated against the table, an action outside it
+/// **The utterance is untrusted text and goes in last, labelled — and it is not
+/// the only untrusted span in here.** [`state`] carries agent **labels**, which
+/// come from the daemon, and under [#741] that daemon can be remote. So the
+/// whole prompt is untrusted input to whatever reads it, not merely the part
+/// after `Utterance:`.
+///
+/// **What a successful injection buys is bounded downstream and upstream, and
+/// this comment used to name only the downstream half — which made it false.**
+/// Downstream: the answer is validated against the table, an action outside it
 /// becomes [`super::VoiceOutcome::UnknownAction`], and no free text this
-/// function produces can dispatch anything. A successful injection buys the
-/// attacker one navigation the user could have performed by clicking.
+/// function produces can dispatch anything, so the *answer* is worth at most
+/// one navigation the user could have performed by clicking. What that argument
+/// missed is that the validator sees the answer only after the backend has
+/// finished producing it. For the keyed [`super::remote`] backend there is
+/// nothing in between — it is one HTTPS request to a model with no tools. For
+/// [`super::agent_cli`] there was: a general-purpose coding agent with tools,
+/// hooks, MCP servers and project settings all enabled, every one of which acts
+/// *before* there is anything to validate. That is now closed at the spawn
+/// rather than argued away here — see that module's containment table — and the
+/// bound stated above holds because of those flags, not on its own.
+///
+/// [#741]: https://github.com/vfarcic/dot-agent-deck/issues/741
 pub fn cli_prompt(request: &IntentRequest<'_>) -> String {
     let actions = action_enum(request.commands).join(", ");
     format!(

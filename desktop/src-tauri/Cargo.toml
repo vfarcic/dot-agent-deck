@@ -40,7 +40,7 @@ tauri = { version = "2", features = [] }
 toml_edit = { version = "0.25", features = ["serde"] }
 # PRD #802 M5 added `process` and `rt` to what was `["sync", "time"]`.
 #
-# `process` is the agent-CLI intent backend spawning `claude`/`opencode`
+# `process` is the agent-CLI intent backend spawning `claude`
 # (`voice/agent_cli.rs`). It has to be the ASYNC Command: the resolver runs on
 # the Tauri runtime, and a `std::process` wait of 3-5s there is an app that
 # stops repainting for the length of every utterance. `kill_on_drop` is also
@@ -212,10 +212,31 @@ tempfile = "3"
 # fold tests in `agent_view.rs` have to build one. Tests only — nothing under
 # `src/` names chrono, and the same version the root package resolves.
 chrono = "0.4"
+# PRD #802's landed-work security audit: `voice/http.rs`'s body cap has to be
+# driven with real `reqwest::Response` values, and `From<http::Response<T>> for
+# Response` is the one way to build one WITHOUT opening a socket — which is the
+# rule every test in this feature already follows. Tests only, and the same
+# `http` the lockfile already carries for reqwest, so the `From` impl applies.
+http = "1"
 
-# PRD #803: the settings-path guard rejects a FIFO, and `mkfifo(3)` is the only
-# way to build one to prove it. Tests only — nothing under `src/` uses libc.
-[target.'cfg(unix)'.dev-dependencies]
+# Two callers, both Unix-only.
+#
+# PRD #802's landed-work security audit put the agent-CLI intent backend's child
+# in its own process group (`voice/agent_cli.rs`), so a timeout tears down the
+# whole containment unit rather than the direct child: `tokio`'s
+# `Command::process_group` sets the group up and `libc::killpg` is what takes it
+# down. `kill_on_drop` alone signals one pid, which is how a `sleep` started by
+# a timed-out CLI outlived the twenty-second bound with this app's descriptors
+# still open.
+#
+# PRD #803's settings-path guard rejects a FIFO, and `mkfifo(3)` is the only way
+# to build one to prove it — that caller is a test.
+#
+# Not a new dependency in any sense that costs anything: it was already here as
+# a dev-dependency under this exact spec, the root package's graph carries it on
+# every Unix target (`cpal` -> `alsa-sys` on Linux alone), and the lockfile has
+# exactly one of it.
+[target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 # Issue #845: `tauri::test::MockRuntime`, which the two appearance tests that

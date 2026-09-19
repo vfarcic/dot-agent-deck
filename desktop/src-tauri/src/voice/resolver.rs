@@ -124,7 +124,7 @@ pub trait IntentResolver: Send + Sync {
 
     /// Which backend this is, for the surface to name.
     ///
-    /// One of `claude`, `opencode`, `remote`, `stub`. It travels on every
+    /// One of `claude`, `remote`, `stub`. It travels on every
     /// [`super::VoiceResult`] beside the latency, because the two are only
     /// useful together: *4.2 s* on its own is a complaint, and *claude, 4.2 s*
     /// is a reason to try the keyed backend. It is a `&'static str` and not the
@@ -153,7 +153,6 @@ pub fn resolver_for(
     use crate::settings::IntentBackend;
     match backend {
         IntentBackend::Claude => Box::new(super::agent_cli::AgentCliResolver::claude()),
-        IntentBackend::Opencode => Box::new(super::agent_cli::AgentCliResolver::opencode()),
         IntentBackend::Remote => Box::new(super::remote::RemoteResolver::new(secrets)),
     }
 }
@@ -302,10 +301,6 @@ mod tests {
             "claude"
         );
         assert_eq!(
-            resolver_for(IntentBackend::Opencode, store()).backend_name(),
-            "opencode"
-        );
-        assert_eq!(
             resolver_for(IntentBackend::Remote, store()).backend_name(),
             "remote"
         );
@@ -319,23 +314,19 @@ mod tests {
         // is exhaustive, so the compiler catches it — this asserts the set is
         // the one that was mapped, which the compiler cannot.
         use crate::settings::IntentBackend;
-        let names: Vec<&str> = [
-            IntentBackend::Claude,
-            IntentBackend::Opencode,
-            IntentBackend::Remote,
-        ]
-        .into_iter()
-        .map(|backend| {
-            resolver_for(
-                backend,
-                std::sync::Arc::new(crate::secrets::MemorySecretStore::new()),
-            )
-            .backend_name()
-        })
-        .collect();
-        assert_eq!(names, vec!["claude", "opencode", "remote"]);
+        let names: Vec<&str> = [IntentBackend::Claude, IntentBackend::Remote]
+            .into_iter()
+            .map(|backend| {
+                resolver_for(
+                    backend,
+                    std::sync::Arc::new(crate::secrets::MemorySecretStore::new()),
+                )
+                .backend_name()
+            })
+            .collect();
+        assert_eq!(names, vec!["claude", "remote"]);
         // Every token the settings can hold has an adapter above.
-        assert_eq!(names.len(), 3);
+        assert_eq!(names.len(), 2);
     }
 
     #[test]

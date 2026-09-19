@@ -3,9 +3,9 @@
 //!
 //! This is PRD #802's whole answer to *a feature that needs credentials before
 //! it does anything is a feature most people never try*. The app asks for
-//! nothing: `claude` and `opencode` are already authenticated on the machine,
-//! with whatever the **user** gave them, so the first utterance works on the
-//! day the app is installed.
+//! nothing: `claude` is already authenticated on the machine, with whatever the
+//! **user** gave it, so the first utterance works on the day the app is
+//! installed.
 //!
 //! **"No key" is narrower than it sounds and the narrow version is still the
 //! interesting one.** A credential exists — the CLI's — and it is spent per
@@ -16,18 +16,21 @@
 //! Measured on 2026-09-18 with `claude 2.1.277` and the prompt
 //! [`super::prompt::cli_prompt`] actually sends:
 //!
-//! | | `claude -p --model claude-haiku-4-5` | `opencode run --pure` |
-//! | --- | --- | --- |
-//! | wall clock | 3.08 s, 3.51 s | 4.43 s |
-//! | output | ```` ```json ````-fenced, **both runs** | bare object, no fence |
-//! | answer | `{"action":"open_agent","params":{"agent":"tester"}}` | identical |
+//! | | `claude -p --model claude-haiku-4-5` |
+//! | --- | --- |
+//! | wall clock | 3.08 s, 3.51 s |
+//! | output | ```` ```json ````-fenced, **both runs** |
+//! | answer | `{"action":"open_agent","params":{"agent":"tester"}}` |
 //!
 //! Those are the CLI's own wall clock with a short prompt. **Driven through
 //! the whole pipeline with the shipping prompt — the annotated command list and
-//! the agent labels included — the same backend measured 4.30 s and 6.30 s**,
-//! and the larger figure is the honest one to quote at a user: a bigger prompt
-//! is what this code actually sends. PRD #802's own survey measured 4.49–4.68 s
-//! for `claude` with `--output-format json`, which this does not ask for.
+//! the agent labels included — the same backend measured 4.30 s**, and the
+//! larger figure is the honest one to quote at a user: a bigger prompt is what
+//! this code actually sends. PRD #802's own survey measured 4.49–4.68 s for
+//! `claude` with `--output-format json`, which this does not ask for. Those
+//! numbers predate the containment flags below, which have not been
+//! re-measured; the flags remove work rather than adding it, so they are
+//! unlikely to be slower, but nobody has checked.
 //!
 //! Either way it is **slow**, and the PRD says so rather than pretending
 //! otherwise. The keyed [`super::remote`] backend is the same milestone's
@@ -39,27 +42,93 @@
 //! **every** failure is an `Err`, which [`super::handle_utterance`] renders as
 //! a sentence rather than a hang.
 //!
+//! # Containment: what this child is NOT allowed to do
+//!
+//! PRD #802's landed-work security audit found this backend spawning a
+//! general-purpose coding agent with tools, hooks, MCP servers, skills, project
+//! settings and session persistence all enabled, from the app's own working
+//! directory, on a `PATH` that could name a relative entry. The downstream
+//! action validator constrains only the JSON the CLI prints **after it exits**,
+//! so anything the model did while producing that output had already happened.
+//!
+//! That matters because the prompt is built partly from input this app does not
+//! control. The utterance is the obvious half. The other half is live state:
+//! [`super::prompt::state`] puts agent **labels** in the prompt, and those come
+//! from the daemon — which under [#741] can be a *remote* one. So the whole
+//! prompt is treated as untrusted, and containment is what bounds a successful
+//! injection rather than the validator alone.
+//!
+//! Every flag below was read off `claude --help` on 2026-09-19 with `claude
+//! 2.1.277` and is quoted from it, and the exact argv is pinned by
+//! `voice_agent_cli_contains_the_child`:
+//!
+//! | flag | what the CLI's own help says it does |
+//! | --- | --- |
+//! | `--tools ""` | "Specify the list of available tools from the built-in set. Use `""` to disable all tools" |
+//! | `--safe-mode` | "Start with all customizations (CLAUDE.md, skills, plugins, hooks, MCP servers, custom commands and agents, output styles, workflows, custom themes, keybindings, and more) disabled" |
+//! | `--restricted` | "removes the built-in tools that run commands or code … and ignores user, project and local settings files" |
+//! | `--strict-mcp-config` | "Only use MCP servers from `--mcp-config`, ignoring all other MCP configurations" — and this passes no `--mcp-config`, so: none |
+//! | `--setting-sources ""` | the settings sources to load, named explicitly as the empty set |
+//! | `--permission-prompts none` | "nobody: anything that would prompt is denied automatically" — the fail-closed answer |
+//! | `--no-session-persistence` | "sessions will not be saved to disk and cannot be resumed (only works with `--print`)" |
+//!
+//! Three of those overlap on purpose. `--tools ""` is the one that matters
+//! most, and the other two tool-facing ones (`--restricted`, `--safe-mode`) are
+//! there so a future CLI that reinterprets an empty `--tools` list does not
+//! silently re-arm the child.
+//!
+//! **`--bare` looks like the flag for this job and is NOT used.** Its help says
+//! "Anthropic auth is strictly `ANTHROPIC_API_KEY` or `apiKeyHelper` via
+//! `--settings` (OAuth and keychain are never read)", which would break the one
+//! property this backend exists for: that it works with the credential the user
+//! already gave their CLI.
+//!
+//! Argument **order** is load-bearing and not cosmetic: `--tools` is variadic,
+//! so the token after it has to start with `-` or the variadic would swallow
+//! the prompt. Every containment flag therefore precedes the prompt, and the
+//! prompt is last.
+//!
+//! ## The executable, the working directory and the environment
+//!
+//! - **Pinned.** The program is resolved to an **absolute** path
+//!   ([`resolve_on_path`]) from a `PATH` with empty and relative components
+//!   rejected, and that absolute path is what is executed. `Command::new
+//!   ("claude")` would have accepted a `.` or a checkout-relative entry in an
+//!   inherited or login-shell-derived `PATH` and run a repository-supplied
+//!   `claude`.
+//! - **Rehomed.** The child runs in an app-owned, empty working directory
+//!   ([`app_owned_cwd`]) rather than inheriting the app's, so a project-local
+//!   configuration or hook in whatever directory the app happens to be in
+//!   cannot be picked up. The settings flags above already refuse those; this
+//!   removes the directory as well as the permission.
+//! - **Narrowed.** The environment is an allowlist ([`child_env`]) rather than
+//!   an inheritance, so an unrelated secret in the app's environment is not in
+//!   the child's. What survives is what the CLI needs to find its own
+//!   credentials, reach the API through whatever proxy and CA the machine
+//!   uses, and write a temporary file.
+//!
 //! # The five properties copied from `codex_hooks_manage::list_hooks_in`
 //!
 //! `src/codex_hooks_manage.rs:640` is this repo's one existing non-interactive
 //! agent-CLI spawn, and PRD #802 names it as the shape to copy: a pinned child
 //! environment, stderr discarded, a bounded wait behind a named constant, the
 //! child killed before returning, and every failure mode an `Err`. All five are
-//! here. The one deliberate divergence is the environment: that function pins
-//! `CODEX_HOME` and this one **inherits**, because the CLI's own
-//! authentication is the entire point and clearing it would break the property
-//! this backend exists for. `PATH` is the only variable this touches, and only
-//! when it has to — see [`AgentCliResolver::resolve`].
+//! here. The environment is no longer the divergence it was: that function pins
+//! `CODEX_HOME` and this one used to inherit wholesale; it now allowlists, and
+//! the allowlist is what keeps the CLI's own authentication reachable.
+//!
+//! [#741]: https://github.com/vfarcic/dot-agent-deck/issues/741
 
 use std::ffi::{OsStr, OsString};
-use std::io::ErrorKind;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
+use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tokio::sync::OnceCell;
 
-use super::prompt::{cli_prompt, extract_answer};
+use super::prompt::{MAX_SCAN_BYTES, cli_prompt, extract_answer};
 use super::resolver::{IntentError, IntentRequest, IntentResolver, ResolveFuture};
 
 /// How long a spawned agent CLI gets before the attempt is abandoned.
@@ -76,6 +145,31 @@ use super::resolver::{IntentError, IntentRequest, IntentResolver, ResolveFuture}
 /// a slow-but-working backend is visible rather than merely felt.
 pub const AGENT_CLI_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// How long the containment teardown gets after a timeout, before this gives up
+/// on reaping and returns anyway.
+///
+/// The teardown is a `SIGKILL` to the whole process group, which cannot be
+/// caught — so the only thing that can keep the reap waiting is a child wedged
+/// in uninterruptible kernel I/O. That is not a reason to park the user's
+/// utterance indefinitely on top of the twenty seconds already spent, so the
+/// wait is bounded and the failure sentence goes out either way.
+const TEARDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// How much of the child's stdout is read before the attempt is abandoned.
+///
+/// Derived from [`MAX_SCAN_BYTES`] rather than chosen, because the two bound
+/// the same thing from opposite ends and drifting apart would be silly: the
+/// parser scans at most 64 KiB for the answer, so reading more than 64 KiB can
+/// only grow an allocation that nothing will look at.
+///
+/// **This is the bound the audit asked for, and the point is WHERE it applies.**
+/// `wait_with_output` — what this used to call — drains stdout into a growing
+/// `Vec<u8>` and only then hands it to a parser that stops at 64 KiB, so a
+/// confused or injected CLI could allocate for the whole twenty seconds. The
+/// cap now applies while reading, before any UTF-8 conversion, and crossing it
+/// is a fixed backend error rather than a bigger buffer.
+const MAX_STDOUT_BYTES: usize = MAX_SCAN_BYTES;
+
 /// The model the `claude` adapter pins.
 ///
 /// The cheap fast tier, deliberately: this is short, closed-set, structured
@@ -84,23 +178,24 @@ pub const AGENT_CLI_TIMEOUT: Duration = Duration::from_secs(20);
 /// `docs/develop/config-gen-regeneration.md:49` already documents an
 /// invocation of. Pinning it also stops a user's own default model — which may
 /// be an expensive one — deciding what an utterance costs.
-///
-/// **`opencode` gets no equivalent pin**, and that is not an omission. Its
-/// `-m` flag takes `provider/model`, so a pin would have to name a provider
-/// this app cannot know the user has configured, and naming the wrong one
-/// fails the call outright. Taking the user's own default is the best-effort
-/// PRD #802 describes for that CLI.
 const CLAUDE_MODEL: &str = "claude-haiku-4-5";
 
 /// Which CLI an [`AgentCliResolver`] drives.
+///
+/// **One variant today, and that is the truthful shape rather than an
+/// oversight** — the same answer [`crate::settings::ActivationMode`] gives. PRD
+/// #802 M5 shipped a second, `opencode`, and the landed-work security audit
+/// withdrew it: `opencode run` has no equivalent of any flag in the containment
+/// table above, no no-persistence option, and its sessions were confirmed
+/// locally to be resumable and to hold the utterance. Shipping an uncontainable
+/// subprocess executor in a feature that is visible by default is not a trade
+/// this PRD is willing to make. [`crate::settings::IntentBackend`] carries the
+/// decision where a reader of the settings schema will find it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentCli {
     /// `claude -p`, print mode. The default backend and the reference one for
     /// PRD #802 M9's phrase fixtures.
     Claude,
-    /// `opencode run`. Best-effort — PRD #802 says so rather than claiming a
-    /// parity it has not measured, though the one run above did work.
-    Opencode,
 }
 
 impl AgentCli {
@@ -108,7 +203,6 @@ impl AgentCli {
     pub fn program(self) -> &'static str {
         match self {
             AgentCli::Claude => "claude",
-            AgentCli::Opencode => "opencode",
         }
     }
 
@@ -117,33 +211,121 @@ impl AgentCli {
         self.program()
     }
 
-    /// The argv after the program, with the prompt as ONE element.
+    /// The argv after the program, with the prompt as ONE element and last.
     ///
     /// One element and not several: there is no shell here, so an utterance
     /// containing quotes, `$`, backticks or newlines is passed through by the
     /// kernel verbatim and cannot become syntax. That is a property of
     /// `Command`, not of any escaping this file does — which is why this file
     /// does none.
+    ///
+    /// Last, and after every flag, because `--tools` is variadic: a prompt
+    /// placed between `--tools ""` and the next `-`-prefixed token would be
+    /// read as a tool name rather than as the prompt. The module doc has the
+    /// table of what each flag does.
     fn args(self, prompt: String) -> Vec<OsString> {
         match self {
-            AgentCli::Claude => vec![
-                OsString::from("-p"),
-                OsString::from("--model"),
-                OsString::from(CLAUDE_MODEL),
-                OsString::from(prompt),
-            ],
-            // `--pure` runs without external plugins. A plugin is the most
-            // likely source of the banner noise on stdout that the parser
-            // already tolerates, and a one-shot classification wants none of
-            // what a plugin offers.
-            AgentCli::Opencode => vec![
-                OsString::from("run"),
-                OsString::from("--pure"),
-                OsString::from(prompt),
-            ],
+            AgentCli::Claude => {
+                let mut args: Vec<OsString> = vec![
+                    OsString::from("-p"),
+                    OsString::from("--model"),
+                    OsString::from(CLAUDE_MODEL),
+                ];
+                args.extend(CLAUDE_CONTAINMENT.iter().map(OsString::from));
+                args.push(OsString::from(prompt));
+                args
+            }
         }
     }
 }
+
+/// The flags that make the child safe to hand an untrusted prompt.
+///
+/// A flat slice rather than prose in [`AgentCli::args`] so the test that pins
+/// the argv reads the same list the spawn does. The module doc quotes `claude
+/// --help` for each one; the short version is *no tools, no customisations, no
+/// MCP, no settings files, no permission grants, no session on disk*.
+const CLAUDE_CONTAINMENT: &[&str] = &[
+    "--tools",
+    "",
+    "--safe-mode",
+    "--restricted",
+    "--strict-mcp-config",
+    "--setting-sources",
+    "",
+    "--permission-prompts",
+    "none",
+    "--no-session-persistence",
+];
+
+/// Environment variables the child keeps, by exact name.
+///
+/// The child is spawned with `env_clear`, so this list plus [`KEEP_PREFIX`] is
+/// the whole of its environment (`PATH` excepted — see [`child_env`], which
+/// installs the *sanitised* one rather than the inherited value).
+///
+/// The rule for being on it is **"the CLI cannot authenticate or reach the API
+/// without it"**, not "it seems harmless". The groups, in order: where the CLI
+/// finds its own credentials and configuration; who the user is, which a macOS
+/// keychain read needs; a writable scratch directory; the Windows variables
+/// without which sockets and TLS do not work at all; text handling, so a
+/// non-ASCII utterance is not mangled; and the corporate TLS/proxy settings
+/// that are the difference between reaching the API and not.
+const KEEP_EXACT: &[&str] = &[
+    "HOME",
+    "USERPROFILE",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "XDG_RUNTIME_DIR",
+    "DBUS_SESSION_BUS_ADDRESS",
+    "USER",
+    "LOGNAME",
+    "USERNAME",
+    "TMPDIR",
+    "TEMP",
+    "TMP",
+    "SYSTEMROOT",
+    "SystemRoot",
+    "COMSPEC",
+    "PATHEXT",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    "NODE_EXTRA_CA_CERTS",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "NO_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "no_proxy",
+];
+
+/// Environment variables the child keeps, by prefix.
+///
+/// Prefixes rather than names because each of these families *is* an
+/// authentication mechanism the CLI documents, and enumerating their members
+/// here would go stale against the CLI rather than against this file:
+/// `ANTHROPIC_*` for the direct API, `CLAUDE_*`/`CLAUDE_CODE_*` for the CLI's
+/// own configuration (`CLAUDE_CONFIG_DIR` included), and the three cloud
+/// families for the Bedrock and Vertex routes an enterprise install uses.
+///
+/// This is the deliberately *widest* part of the allowlist and it is worth
+/// being honest about what it lets through: `AWS_SECRET_ACCESS_KEY` is on it.
+/// It is on it because a Bedrock-backed CLI cannot authenticate without it —
+/// that is exactly the "retain only the authentication mechanism required" rule
+/// rather than an exception to it.
+const KEEP_PREFIX: &[&str] = &[
+    "ANTHROPIC_",
+    "CLAUDE_",
+    "AWS_",
+    "GOOGLE_",
+    "GCLOUD_",
+    "CLOUDSDK_",
+];
 
 /// Whether this resolver may go looking for the user's login-shell PATH.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -153,8 +335,8 @@ pub enum PathMode {
     Inherit,
     /// Fall back to the user's login-shell PATH when the program is not found
     /// on the inherited one. The shipping behaviour — see
-    /// [`AgentCliResolver::resolve`] for why it is a fallback and not a
-    /// startup step.
+    /// [`AgentCliResolver::locate`] for why it is a fallback and not a startup
+    /// step.
     LoginShellFallback,
 }
 
@@ -183,8 +365,8 @@ static LOGIN_SHELL_PATH: OnceCell<Option<String>> = OnceCell::const_new();
 ///   process startup, before any runtime or thread exists. A desktop app
 ///   resolves an utterance on a multi-threaded Tauri runtime, long outside that
 ///   window, where the same call would be a `getenv`/`setenv` data race. So
-///   this uses the **capture** half, which mutates nothing, and puts the result
-///   on the child's own environment.
+///   this uses the **capture** half, which mutates nothing, and resolves the
+///   executable against the captured value.
 /// - **The cost is real and wildly variable.** Measured at **0.04 s** for this
 ///   box's `bash`, against the **~6 s** `zsh -ilc` that `CAPTURE_TIMEOUT`'s own
 ///   doc comment records and a **10 s** ceiling. Spending an unknown fraction
@@ -207,10 +389,140 @@ async fn login_shell_path() -> Option<String> {
         .clone()
 }
 
+/// Find `program` on `path`, as an **absolute** path, rejecting every `PATH`
+/// component that is empty or relative.
+///
+/// This is the whole of the executable-pinning fix and it is a pure function so
+/// it can be tested against a hostile `PATH` without touching the process
+/// environment — which a test must not do, since `std::env::set_var` is a data
+/// race against every other test in the binary.
+///
+/// **Why empty and relative components are dropped rather than resolved.** An
+/// empty component means "the current directory" to every PATH implementation,
+/// and a relative one means "relative to whatever the current directory
+/// happens to be" — so either lets a directory the app merely *ran from*
+/// supply the executable. A checkout containing a file called `claude` is not
+/// an exotic scenario; it is a repository with a script in it. Resolving them
+/// against the app-owned cwd instead would be worse, not better: it would make
+/// the answer depend on a directory this module creates.
+///
+/// Returns the first component that yields a file this process can execute.
+/// `None` means "not on this PATH", which the caller turns into
+/// [`IntentError::NotConfigured`] — the one failure whose remedy is an
+/// installation instruction.
+fn resolve_on_path(program: &OsStr, path: &OsStr) -> Option<PathBuf> {
+    std::env::split_paths(path)
+        .filter(|dir| !dir.as_os_str().is_empty() && dir.is_absolute())
+        .find_map(|dir| executable_at(&dir.join(program)))
+}
+
+/// `candidate` if it names something this process can execute, else `None`.
+///
+/// On Unix that is the executable bit; on Windows it is the file's existence
+/// under `candidate` itself and under each `PATHEXT` suffix, because a Windows
+/// `claude` is `claude.cmd` or `claude.exe` and neither carries a mode bit.
+fn executable_at(candidate: &Path) -> Option<PathBuf> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let metadata = std::fs::metadata(candidate).ok()?;
+        (metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+            .then(|| candidate.to_path_buf())
+    }
+    #[cfg(not(unix))]
+    {
+        if candidate.is_file() {
+            return Some(candidate.to_path_buf());
+        }
+        let extensions =
+            std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string());
+        extensions.split(';').find_map(|extension| {
+            let extension = extension.trim();
+            if extension.is_empty() {
+                return None;
+            }
+            let mut name = candidate.as_os_str().to_os_string();
+            name.push(extension);
+            let with_extension = PathBuf::from(name);
+            with_extension.is_file().then_some(with_extension)
+        })
+    }
+}
+
+/// The `PATH` the child is given: the inherited one with every empty and
+/// relative component removed.
+///
+/// The child gets this rather than the raw inherited value for
+/// [`resolve_on_path`]'s reason one level down — the CLI resolves programs of
+/// its own, and handing it a `PATH` containing `.` would reinstate exactly the
+/// substitution this module just closed for its own exec.
+fn sanitised_path(path: &OsStr) -> OsString {
+    let kept: Vec<PathBuf> = std::env::split_paths(path)
+        .filter(|dir| !dir.as_os_str().is_empty() && dir.is_absolute())
+        .collect();
+    std::env::join_paths(kept).unwrap_or_default()
+}
+
+/// An app-owned, empty directory to run the child in.
+///
+/// **Not the app's own working directory**, which is the defect this closes: a
+/// desktop app launched from a terminal inherits that terminal's directory, so
+/// the child would look for project configuration in whatever checkout the user
+/// happened to be in. The containment flags already refuse to load it; this
+/// removes the directory too, so the refusal is not the only thing standing
+/// between an injected prompt and a project-local hook.
+///
+/// `state_dir()` is this app's own per-user state root, so the directory is
+/// owned by the app in the sense that matters: nothing but this function writes
+/// to it, and nothing at all writes *into* it — the child is given it as a cwd
+/// and produces its answer on stdout.
+///
+/// Falls back to the system temp root when the directory cannot be created, and
+/// **never** to the inherited cwd: a temp root is not a project, which is the
+/// property being bought here.
+fn app_owned_cwd() -> PathBuf {
+    let dir = dot_agent_deck::platform::paths::state_dir().join("voice-cli-cwd");
+    match std::fs::create_dir_all(&dir) {
+        Ok(()) => dir,
+        Err(_) => std::env::temp_dir(),
+    }
+}
+
+/// The child's whole environment: [`KEEP_EXACT`] plus [`KEEP_PREFIX`], with
+/// `PATH` replaced by `path`.
+///
+/// A pure function over `(inherited, path)` so the allowlist can be tested
+/// without mutating the process environment. `inherited` is
+/// [`std::env::vars_os`] in production.
+fn child_env(
+    inherited: impl IntoIterator<Item = (OsString, OsString)>,
+    path: &OsStr,
+) -> Vec<(OsString, OsString)> {
+    let mut kept: Vec<(OsString, OsString)> = inherited
+        .into_iter()
+        .filter(|(name, _)| {
+            let Some(name) = name.to_str() else {
+                // A non-UTF-8 variable name cannot be matched against the
+                // allowlist, so it is not on it.
+                return false;
+            };
+            // PATH is installed below from the sanitised value, never inherited.
+            if name.eq_ignore_ascii_case("PATH") {
+                return false;
+            }
+            KEEP_EXACT.iter().any(|allowed| allowed == &name)
+                || KEEP_PREFIX.iter().any(|prefix| name.starts_with(prefix))
+        })
+        .collect();
+    kept.push((OsString::from("PATH"), path.to_os_string()));
+    kept
+}
+
 /// Resolve intent by asking an agent CLI already installed on this machine.
 pub struct AgentCliResolver {
     cli: AgentCli,
-    /// What to spawn. The CLI's own name in production; a stub script under a
+    /// What to spawn. The CLI's own name in production, resolved through
+    /// [`resolve_on_path`]; an absolute path to a stub script under a
     /// `tempfile::tempdir()` in the tests, which is how the timeout, the
     /// fence, the banner and the malformed-output paths are all asserted
     /// without a credential and without spawning a real agent.
@@ -223,11 +535,6 @@ impl AgentCliResolver {
     /// The default backend: `claude -p`, no key of the app's own.
     pub fn claude() -> Self {
         Self::new(AgentCli::Claude)
-    }
-
-    /// The other CLI. Best-effort, per PRD #802.
-    pub fn opencode() -> Self {
-        Self::new(AgentCli::Opencode)
     }
 
     pub fn new(cli: AgentCli) -> Self {
@@ -245,6 +552,10 @@ impl AgentCliResolver {
     /// Both halves are what makes this backend testable: the tests point it at
     /// a script they wrote, and a test must never spend `CAPTURE_TIMEOUT` in
     /// the developer's own shell profile.
+    ///
+    /// The path given **must be absolute** — [`Self::locate`] refuses a
+    /// relative one rather than resolving it against a directory this module
+    /// chose, which would be the substitution hazard back by another door.
     pub fn with_program(mut self, program: impl AsRef<OsStr>) -> Self {
         self.program = program.as_ref().to_os_string();
         self.path_mode = PathMode::Inherit;
@@ -267,33 +578,35 @@ impl AgentCliResolver {
         IntentError::Backend(format!("{} {}", self.cli.program(), detail.as_ref().trim()))
     }
 
-    async fn run(&self, request: IntentRequest<'_>) -> Result<super::IntentAnswer, IntentError> {
-        let prompt = cli_prompt(&request);
-        let output = match self.spawn(&prompt, None).await {
-            Err(error) if error.kind() == ErrorKind::NotFound => {
-                // The Finder case, and the only one that pays for a capture.
-                match self.recovery_path().await {
-                    Some(path) => self.spawn(&prompt, Some(&path)).await,
-                    None => Err(error),
-                }
-            }
-            other => other,
-        };
+    fn not_installed(&self) -> IntentError {
+        IntentError::NotConfigured(format!(
+            "`{}` is not installed, or is not on this app's PATH",
+            self.cli.program()
+        ))
+    }
 
-        let output = match output {
+    async fn run(&self, request: IntentRequest<'_>) -> Result<super::IntentAnswer, IntentError> {
+        let (program, path) = self.locate().await.ok_or_else(|| self.not_installed())?;
+        let prompt = cli_prompt(&request);
+
+        let output = match self.spawn(&program, &path, &prompt).await {
             Ok(output) => output,
-            Err(error) if error.kind() == ErrorKind::NotFound => {
-                return Err(IntentError::NotConfigured(format!(
-                    "`{}` is not installed, or is not on this app's PATH",
-                    self.cli.program()
-                )));
-            }
-            Err(error) if error.kind() == ErrorKind::TimedOut => {
+            Err(SpawnError::TimedOut) => {
                 return Err(
                     self.failed(format!("did not answer within {}s", self.timeout.as_secs()))
                 );
             }
-            Err(error) => return Err(self.failed(format!("could not be run ({error})"))),
+            Err(SpawnError::TooMuchOutput) => {
+                // Fixed wording, and deliberately not the byte count the child
+                // actually reached: what the user can act on is "it flooded",
+                // and the bound is this file's to state.
+                return Err(self.failed(format!(
+                    "printed more than {MAX_STDOUT_BYTES} bytes without an answer"
+                )));
+            }
+            Err(SpawnError::Io(error)) => {
+                return Err(self.failed(format!("could not be run ({error})")));
+            }
         };
 
         // A non-zero exit is reported even when stdout held something
@@ -307,6 +620,42 @@ impl AgentCliResolver {
         extract_answer(&stdout).map_err(|reason| self.failed(reason.reason()))
     }
 
+    /// Where the CLI is, as an absolute path, and the sanitised `PATH` that
+    /// found it.
+    ///
+    /// Both halves come back together because the child is given the same
+    /// `PATH` the executable was resolved on — otherwise the CLI's own
+    /// sub-lookups would run on a list this function had already rejected.
+    ///
+    /// The order is the same fallback [`login_shell_path`] documents: the
+    /// inherited `PATH` first, and only a miss there pays for a login shell.
+    async fn locate(&self) -> Option<(PathBuf, OsString)> {
+        let inherited = std::env::var_os("PATH").unwrap_or_default();
+        let path = sanitised_path(&inherited);
+
+        // An explicit program — a test's stub, and the only way this field is
+        // ever not the CLI's bare name — is used as given, provided it is
+        // absolute and executable. A relative one is refused rather than
+        // resolved, for `resolve_on_path`'s reason.
+        if self.program.as_os_str() != OsStr::new(self.cli.program()) {
+            let explicit = PathBuf::from(&self.program);
+            return explicit
+                .is_absolute()
+                .then(|| executable_at(&explicit))
+                .flatten()
+                .map(|program| (program, path));
+        }
+
+        if let Some(found) = resolve_on_path(&self.program, &path) {
+            return Some((found, path));
+        }
+        // The Finder case, and the only one that pays for a capture.
+        let recovery = self.recovery_path().await?;
+        let recovery = sanitised_path(OsStr::new(&recovery));
+        let found = resolve_on_path(&self.program, &recovery)?;
+        Some((found, recovery))
+    }
+
     /// The login-shell PATH, when this resolver is allowed to go looking.
     async fn recovery_path(&self) -> Option<String> {
         match self.path_mode {
@@ -315,25 +664,28 @@ impl AgentCliResolver {
         }
     }
 
-    /// One bounded, killed-on-every-path spawn.
+    /// One bounded, contained, killed-on-every-path spawn.
     ///
-    /// A timeout is reported as [`ErrorKind::TimedOut`] so the one `match` in
-    /// [`Self::run`] classifies every failure, rather than the timeout being a
-    /// second control-flow shape beside the `io::Error`s.
+    /// **The child is torn down before this returns on the timeout path**, and
+    /// the unit torn down is the whole **process group**, not the direct child.
+    /// `kill_on_drop(true)` is still set — it is what covers every *other* drop
+    /// path, such as the surrounding resolve future being cancelled — but on
+    /// its own it signals one pid, so a tool, hook or shell the CLI started
+    /// would outlive the timeout with the app's descriptors still open. That
+    /// was PRD #802's audit finding, and it is why this returns only after
+    /// [`terminate_group`] has killed the group and the direct child has been
+    /// reaped (or [`TEARDOWN_TIMEOUT`] has elapsed).
     ///
-    /// **The child is killed before this returns on the timeout path**, and by
-    /// the mechanism rather than by a line that could be skipped:
-    /// `kill_on_drop(true)` means dropping the `Child` signals it, and
-    /// `tokio::time::timeout` drops the future it was given — and with it the
-    /// `Child` that future owns — *before* yielding `Err`. Reaping the killed
-    /// process is then tokio's background job, so this returns without waiting
-    /// on it.
+    /// Stdout is read through [`MAX_STDOUT_BYTES`] rather than with
+    /// `wait_with_output`, so the bound applies while reading rather than after
+    /// the whole stream has been allocated.
     async fn spawn(
         &self,
+        program: &Path,
+        path: &OsStr,
         prompt: &str,
-        path: Option<&str>,
-    ) -> Result<std::process::Output, std::io::Error> {
-        let mut command = Command::new(&self.program);
+    ) -> Result<std::process::Output, SpawnError> {
+        let mut command = Command::new(program);
         command
             .args(self.cli.args(prompt.to_string()))
             // Nothing is written to the child, and a CLI that decides to prompt
@@ -344,26 +696,160 @@ impl AgentCliResolver {
             // stderr here is progress chatter and warnings, and the failure
             // wording this backend produces is its own.
             .stderr(Stdio::null())
+            .current_dir(app_owned_cwd())
+            .env_clear()
+            .envs(child_env(std::env::vars_os(), path))
             .kill_on_drop(true);
-        if let Some(path) = path {
-            // The ONE variable this touches. Everything else is inherited,
-            // because the CLI's own authentication — a credentials file under
-            // `$HOME`, a keychain entry, an environment variable the user
-            // exported — is the entire point of this backend.
-            command.env("PATH", path);
-        }
+        // The containment unit. On Unix the child leads its own process group,
+        // so one `killpg` reaches everything it started; on Windows the child
+        // heads its own console process group and teardown walks the tree with
+        // `taskkill /T`. See `terminate_group`.
+        #[cfg(unix)]
+        command.process_group(0);
+        #[cfg(windows)]
+        command.creation_flags(CREATE_NEW_PROCESS_GROUP);
 
-        let child = command.spawn()?;
-        // `wait_with_output` drains stdout while it waits, so a CLI that prints
-        // more than a pipe buffer before exiting cannot deadlock the wait.
-        match tokio::time::timeout(self.timeout, child.wait_with_output()).await {
-            Ok(result) => result,
-            Err(_) => Err(std::io::Error::new(
-                ErrorKind::TimedOut,
-                "the agent CLI did not answer in time",
-            )),
+        let mut child = command.spawn().map_err(SpawnError::Io)?;
+        let leader = child.id();
+        let mut stdout = child.stdout.take().ok_or_else(|| {
+            SpawnError::Io(std::io::Error::other(
+                "the agent CLI produced no stdout pipe",
+            ))
+        })?;
+
+        let collected = tokio::time::timeout(self.timeout, async {
+            let bytes = read_capped(&mut stdout, MAX_STDOUT_BYTES).await?;
+            let status = child.wait().await.map_err(SpawnError::Io)?;
+            Ok::<_, SpawnError>((status, bytes))
+        })
+        .await;
+
+        match collected {
+            Ok(Ok((status, stdout))) => Ok(std::process::Output {
+                status,
+                stdout,
+                stderr: Vec::new(),
+            }),
+            // A flood, or a read that failed: the child is still running and
+            // may have started something, so it gets the same teardown a
+            // timeout gets rather than being left to `kill_on_drop`, which
+            // would signal the direct child alone.
+            Ok(Err(error)) => {
+                terminate_group(&mut child, leader).await;
+                Err(error)
+            }
+            Err(_) => {
+                terminate_group(&mut child, leader).await;
+                Err(SpawnError::TimedOut)
+            }
         }
     }
+}
+
+/// Why one [`AgentCliResolver::spawn`] did not produce output.
+///
+/// Three variants rather than an `io::Error` carrying an `ErrorKind`, because
+/// two of these are this module's own decisions rather than the operating
+/// system's: a timeout is a deadline this file chose, and a flood is a cap this
+/// file set. Encoding them as `std::io::ErrorKind` values worked but meant the
+/// caller classified this file's decisions by pattern-matching on a kind the
+/// operating system can also produce.
+#[derive(Debug)]
+enum SpawnError {
+    Io(std::io::Error),
+    TimedOut,
+    TooMuchOutput,
+}
+
+/// Read at most `cap` bytes, and fail rather than allocate past it.
+///
+/// Exactly `cap` bytes is a success: the cap is what the parser will look at,
+/// so a reply that fills it exactly is still readable. `cap + 1` is
+/// [`SpawnError::TooMuchOutput`], reported before anything converts the bytes
+/// to text.
+async fn read_capped<R: tokio::io::AsyncRead + Unpin>(
+    reader: &mut R,
+    cap: usize,
+) -> Result<Vec<u8>, SpawnError> {
+    let mut collected: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        let read = reader.read(&mut chunk).await.map_err(SpawnError::Io)?;
+        if read == 0 {
+            return Ok(collected);
+        }
+        if collected.len() + read > cap {
+            return Err(SpawnError::TooMuchOutput);
+        }
+        collected.extend_from_slice(&chunk[..read]);
+    }
+}
+
+/// Windows: put the child at the head of its own console process group, so
+/// teardown has a tree to walk rather than one pid.
+#[cfg(windows)]
+const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+
+/// Kill the whole containment unit and wait for the direct child to be reaped.
+///
+/// **Unix** is the strong half: the child was spawned with `process_group(0)`,
+/// so its pid is also its pgid and one `killpg(SIGKILL)` reaches every
+/// descendant that did not deliberately leave the group. `SIGKILL` rather than
+/// a graceful escalation because this path is already twenty seconds past the
+/// point where the answer was useful.
+///
+/// **Windows** is weaker and it is worth saying so plainly rather than implying
+/// parity. The faithful analogue is a Job Object — which this repo already has,
+/// in `dot_agent_deck::platform::proc::AgentProcessGroup` — but its terminate
+/// half is private to that module and shaped around a `portable_pty::Child`,
+/// and the alternative was writing fresh `windows-sys` FFI in this crate that
+/// `build-windows` would compile and nothing in this repository can execute.
+/// So Windows walks the tree with `taskkill /T /F`, which reaps the descendants
+/// that are still parented under the child and misses one that has re-parented
+/// itself. That is a real gap; it is a smaller one than the direct-child-only
+/// kill it replaces.
+///
+/// Either way the reap is bounded by [`TEARDOWN_TIMEOUT`] so a wedged child
+/// cannot hold the utterance open indefinitely.
+async fn terminate_group(child: &mut tokio::process::Child, leader: Option<u32>) {
+    if let Some(leader) = leader {
+        #[cfg(unix)]
+        {
+            // SAFETY: `killpg(2)` takes a pgid and a signal and touches nothing
+            // in this process. The pgid is the child's own pid — it was spawned
+            // with `process_group(0)`, which makes it the group leader — and
+            // `child` has not been reaped yet, so the pid cannot have been
+            // recycled onto another process. A failure (`ESRCH`: the group is
+            // already gone) is the ordinary case and is discarded.
+            unsafe {
+                libc::killpg(leader as libc::pid_t, libc::SIGKILL);
+            }
+        }
+        #[cfg(windows)]
+        {
+            // `taskkill` is resolved under `%SYSTEMROOT%` rather than through
+            // PATH, for `resolve_on_path`'s reason: this is a teardown of a
+            // process that may have been spawned by an injected prompt, and
+            // resolving the killer through an attacker-influenced PATH would
+            // be an odd way to end.
+            let system_root =
+                std::env::var("SYSTEMROOT").unwrap_or_else(|_| r"C:\Windows".to_string());
+            let taskkill = PathBuf::from(system_root).join(r"System32\taskkill.exe");
+            let _ = Command::new(taskkill)
+                .args(["/T", "/F", "/PID", &leader.to_string()])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .kill_on_drop(true)
+                .status()
+                .await;
+        }
+    }
+    // The direct child as well, in case it was never in the group we signalled,
+    // and then the reap. `start_kill` on an already-dead child is not an error
+    // worth reporting here.
+    let _ = child.start_kill();
+    let _ = tokio::time::timeout(TEARDOWN_TIMEOUT, child.wait()).await;
 }
 
 impl IntentResolver for AgentCliResolver {
@@ -397,8 +883,12 @@ mod tests {
 
     impl Stub {
         fn new(body: &str) -> Self {
+            Self::named("stub-cli", body)
+        }
+
+        fn named(name: &str, body: &str) -> Self {
             let dir = tempfile::tempdir().expect("tempdir");
-            let path = dir.path().join("stub-cli");
+            let path = dir.path().join(name);
             std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).expect("write");
             #[cfg(unix)]
             {
@@ -454,7 +944,6 @@ mod tests {
     #[tokio::test]
     #[cfg_attr(not(unix), ignore = "the stub is a /bin/sh script")]
     async fn voice_agent_cli_parses_plain_json() {
-        // The shape `opencode run --pure` produced.
         let stub = Stub::new("printf '{\"action\":\"open_overview\"}'");
         let answer = ask(&stub.resolver(), "show me everything")
             .await
@@ -569,6 +1058,317 @@ mod tests {
         );
     }
 
+    // -- containment: the argv ---------------------------------------------
+
+    /// Every containment flag, in the order the spawn passes them, with the
+    /// prompt LAST.
+    ///
+    /// Pinned as a whole list rather than asserted flag by flag because the
+    /// order is a correctness property and not a style one: `--tools` is
+    /// variadic, so a prompt that ended up between it and the next `-`-prefixed
+    /// token would be read as a tool name. A test that only checked membership
+    /// would pass on an argv that silently disabled nothing.
+    #[test]
+    fn voice_agent_cli_contains_the_child() {
+        let argv = AgentCli::Claude.args("SAID".to_string());
+        assert_eq!(
+            argv,
+            vec![
+                OsString::from("-p"),
+                OsString::from("--model"),
+                OsString::from("claude-haiku-4-5"),
+                OsString::from("--tools"),
+                OsString::from(""),
+                OsString::from("--safe-mode"),
+                OsString::from("--restricted"),
+                OsString::from("--strict-mcp-config"),
+                OsString::from("--setting-sources"),
+                OsString::from(""),
+                OsString::from("--permission-prompts"),
+                OsString::from("none"),
+                OsString::from("--no-session-persistence"),
+                OsString::from("SAID"),
+            ]
+        );
+        // The prompt is last and every flag precedes it: the variadic `--tools`
+        // must never be the option immediately before the prompt.
+        assert_eq!(argv.last(), Some(&OsString::from("SAID")));
+        let tools = argv
+            .iter()
+            .position(|arg| arg == "--tools")
+            .expect("--tools is passed");
+        assert!(
+            argv[tools + 2].to_string_lossy().starts_with('-'),
+            "the token after `--tools \"\"` must start with `-`, or the variadic eats the prompt"
+        );
+        // `--bare` would break the CLI's own authentication — see the module
+        // doc. It must never be on this list.
+        assert!(!argv.iter().any(|arg| arg == "--bare"));
+    }
+
+    /// Scenario: the child is asked to do something a tool would be needed for.
+    /// The stub reports which tool-facing flags it was given; the assertion is
+    /// that they were all present, so nothing the model decided while producing
+    /// its answer could have run.
+    ///
+    /// The honest limit of this test, stated because the name could be read
+    /// wider than it is: a stub cannot prove what the real `claude` does with
+    /// `--tools ""`. What it proves is that the flags reach the child on the
+    /// path a tool-requesting utterance takes, and that the utterance itself
+    /// does not displace them — which is the half this repository owns.
+    #[tokio::test]
+    #[cfg_attr(not(unix), ignore = "the stub is a /bin/sh script")]
+    async fn voice_agent_cli_disables_tools_before_the_model_sees_the_utterance() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let touched = dir.path().join("side-effect");
+        // The stub stands in for a CLI that was talked into running a tool: if
+        // the argv did NOT contain the containment flags it writes the file,
+        // which is the pre-validation side effect the audit described.
+        let stub = Stub::new(&format!(
+            "tools=no; safe=no; persist=no\n\
+             for arg in \"$@\"; do\n\
+             case \"$arg\" in\n\
+             --tools) tools=yes ;;\n\
+             --safe-mode) safe=yes ;;\n\
+             --no-session-persistence) persist=yes ;;\n\
+             esac\n\
+             done\n\
+             if [ \"$tools$safe$persist\" != yesyesyes ]; then : > '{}'; fi\n\
+             printf '{{\"action\":\"open_deck\"}}'",
+            touched.to_string_lossy()
+        ));
+        let answer = ask(&stub.resolver(), "read every file in my home directory")
+            .await
+            .expect("answers");
+        assert_eq!(answer.action, "open_deck");
+        assert!(
+            !touched.exists(),
+            "the child ran without the containment flags"
+        );
+    }
+
+    // -- containment: the executable ---------------------------------------
+
+    /// Scenario: a PATH carrying the hostile entries — an empty component, `.`
+    /// and a checkout-relative directory — alongside one absolute directory
+    /// holding the genuine CLI. Resolution must return the absolute one, and
+    /// must return nothing at all when only the hostile entries are present.
+    ///
+    /// **What this asserts and what it does not.** It asserts the resolution
+    /// RULE — a component that is empty or relative is never consulted,
+    /// whatever it holds, and the answer is always an absolute path. It does
+    /// not stage a working substitution, because staging one means arranging
+    /// the process's current directory to contain a file called `claude`, and a
+    /// test may neither change that directory (it is process-wide, and every
+    /// other test in this binary shares it) nor write into it. The rule is the
+    /// property; a component that is never read cannot substitute anything.
+    ///
+    /// Pure-function rather than `set_var`-driven for the same reason: mutating
+    /// the process environment races every other test in the binary.
+    #[test]
+    #[cfg(unix)]
+    fn voice_agent_cli_refuses_a_relative_path_entry() {
+        let real = Stub::named("claude", "printf '{\"action\":\"none\"}'");
+        let real_dir = real.path.parent().expect("a parent").to_path_buf();
+        // A relative directory that really does hold an executable `claude`:
+        // the hostile entry an app launched from a checkout would see.
+        let hostile = Stub::named("claude", "printf 'pwned'");
+        let hostile_relative = std::path::PathBuf::from(
+            hostile
+                .path
+                .parent()
+                .expect("a parent")
+                .strip_prefix("/")
+                .expect("an absolute tempdir"),
+        );
+        assert!(hostile_relative.is_relative());
+
+        let path = std::env::join_paths([
+            std::path::PathBuf::from(""),
+            std::path::PathBuf::from("."),
+            hostile_relative.clone(),
+            real_dir,
+        ])
+        .expect("a PATH");
+
+        let found = resolve_on_path(OsStr::new("claude"), &path).expect("the real one is found");
+        assert_eq!(
+            found, real.path,
+            "a relative PATH entry substituted the CLI"
+        );
+        assert!(found.is_absolute(), "an exec target must be absolute");
+
+        // With only hostile entries there is no answer at all, rather than a
+        // relative one that `Command::new` would resolve against whatever the
+        // current directory happened to be at exec time.
+        let hostile_only = std::env::join_paths([
+            std::path::PathBuf::from(""),
+            std::path::PathBuf::from("."),
+            hostile_relative,
+        ])
+        .expect("a PATH");
+        assert_eq!(resolve_on_path(OsStr::new("claude"), &hostile_only), None);
+    }
+
+    /// The same rule one level down: the PATH the CHILD is given has the empty
+    /// and relative components removed too, so the CLI's own sub-lookups cannot
+    /// be substituted either.
+    #[test]
+    #[cfg(unix)]
+    fn voice_agent_cli_hands_the_child_a_sanitised_path() {
+        let path = std::env::join_paths([
+            std::path::PathBuf::from(""),
+            std::path::PathBuf::from("."),
+            std::path::PathBuf::from("relative/bin"),
+            std::path::PathBuf::from("/usr/bin"),
+            std::path::PathBuf::from("/bin"),
+        ])
+        .expect("a PATH");
+        let sanitised = sanitised_path(&path);
+        let kept: Vec<_> = std::env::split_paths(&sanitised).collect();
+        assert_eq!(
+            kept,
+            vec![
+                std::path::PathBuf::from("/usr/bin"),
+                std::path::PathBuf::from("/bin")
+            ]
+        );
+    }
+
+    /// Scenario: the child reports the directory it was started in. It must not
+    /// be the directory this process is standing in — which is what a hostile
+    /// project configuration would be sitting in — and the directory it IS
+    /// started in must hold no project configuration.
+    ///
+    /// Asserted through the child's own `pwd` rather than through
+    /// [`app_owned_cwd`]'s return value, which would only assert that a
+    /// function returns what it returns.
+    #[tokio::test]
+    #[cfg_attr(not(unix), ignore = "the stub is a /bin/sh script")]
+    async fn voice_agent_cli_does_not_run_in_the_inherited_working_directory() {
+        // The stub answers with its own working directory in a param, which is
+        // the only thing that establishes where it ran.
+        let stub = Stub::new(
+            "printf '{\"action\":\"open_agent\",\"params\":{\"agent\":\"%s\"}}' \"$(pwd)\"",
+        );
+        let answer = ask(&stub.resolver(), "show me the tester")
+            .await
+            .expect("answers");
+        let child_cwd = std::path::PathBuf::from(
+            answer
+                .params
+                .get("agent")
+                .expect("the stub reported its cwd"),
+        );
+
+        let inherited = std::env::current_dir().expect("a cwd");
+        assert_ne!(
+            child_cwd.canonicalize().unwrap_or(child_cwd.clone()),
+            inherited.canonicalize().unwrap_or(inherited.clone()),
+            "the child inherited this process's working directory"
+        );
+        // And the directory it did run in carries no project configuration for
+        // an injected prompt to reach for.
+        assert!(!child_cwd.join("CLAUDE.md").exists());
+        assert!(!child_cwd.join(".claude").exists());
+        assert!(!child_cwd.join(".mcp.json").exists());
+    }
+
+    /// The environment allowlist: the CLI's own authentication survives,
+    /// everything else does not, and PATH is the sanitised one rather than the
+    /// inherited value.
+    #[test]
+    fn voice_agent_cli_narrows_the_child_environment() {
+        let inherited: Vec<(OsString, OsString)> = [
+            ("HOME", "/home/someone"),
+            ("ANTHROPIC_API_KEY", "sk-ant-kept"),
+            ("CLAUDE_CONFIG_DIR", "/home/someone/.claude"),
+            ("AWS_SECRET_ACCESS_KEY", "bedrock-kept"),
+            ("HTTPS_PROXY", "http://proxy:3128"),
+            ("PATH", "/inherited/and/replaced"),
+            // Not an authentication mechanism of the selected CLI, so not kept.
+            ("GITHUB_TOKEN", "ghp-dropped"),
+            ("OPENAI_API_KEY", "sk-dropped"),
+            ("DOT_AGENT_DECK_SOCKET", "/run/dropped.sock"),
+            ("SSH_AUTH_SOCK", "/run/dropped-agent"),
+        ]
+        .into_iter()
+        .map(|(name, value)| (OsString::from(name), OsString::from(value)))
+        .collect();
+
+        let env = child_env(inherited, OsStr::new("/usr/bin:/bin"));
+        let named = |name: &str| {
+            env.iter()
+                .find(|(key, _)| key == name)
+                .map(|(_, value)| value.to_string_lossy().into_owned())
+        };
+
+        assert_eq!(named("HOME").as_deref(), Some("/home/someone"));
+        assert_eq!(named("ANTHROPIC_API_KEY").as_deref(), Some("sk-ant-kept"));
+        assert_eq!(
+            named("CLAUDE_CONFIG_DIR").as_deref(),
+            Some("/home/someone/.claude")
+        );
+        assert_eq!(
+            named("AWS_SECRET_ACCESS_KEY").as_deref(),
+            Some("bedrock-kept")
+        );
+        assert_eq!(named("HTTPS_PROXY").as_deref(), Some("http://proxy:3128"));
+
+        assert_eq!(named("GITHUB_TOKEN"), None);
+        assert_eq!(named("OPENAI_API_KEY"), None);
+        assert_eq!(named("DOT_AGENT_DECK_SOCKET"), None);
+        assert_eq!(named("SSH_AUTH_SOCK"), None);
+
+        // PATH is present exactly once and is the value passed in, never the
+        // inherited one.
+        let paths: Vec<_> = env.iter().filter(|(key, _)| key == "PATH").collect();
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0].1, OsString::from("/usr/bin:/bin"));
+    }
+
+    // -- the bounded output ------------------------------------------------
+
+    #[tokio::test]
+    async fn voice_agent_cli_reads_exactly_the_cap_and_refuses_one_byte_more() {
+        // Exact limit: readable. The cap is what the parser will scan, so a
+        // reply that fills it exactly is still a reply.
+        let exact = vec![b'x'; MAX_STDOUT_BYTES];
+        let mut reader = exact.as_slice();
+        let read = read_capped(&mut reader, MAX_STDOUT_BYTES)
+            .await
+            .expect("exactly the cap is readable");
+        assert_eq!(read.len(), MAX_STDOUT_BYTES);
+
+        // One byte more: refused, before anything converts it to text.
+        let over = vec![b'x'; MAX_STDOUT_BYTES + 1];
+        let mut reader = over.as_slice();
+        let error = read_capped(&mut reader, MAX_STDOUT_BYTES)
+            .await
+            .expect_err("over the cap is refused");
+        assert!(matches!(error, SpawnError::TooMuchOutput), "got {error:?}");
+    }
+
+    #[tokio::test]
+    #[cfg_attr(not(unix), ignore = "the stub is a /bin/sh script")]
+    async fn voice_agent_cli_refuses_a_flooding_child() {
+        // A CLI that floods stdout is a fixed backend error rather than an
+        // allocation that grows for the whole timeout.
+        let stub = Stub::new(&format!(
+            "i=0\nwhile [ $i -lt {} ]; do printf '%s' \
+             'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'; \
+             i=$((i+1)); done",
+            (MAX_STDOUT_BYTES / 64) + 16
+        ));
+        let error = ask(&stub.resolver(), "show me the tester")
+            .await
+            .expect_err("fails");
+        assert!(
+            matches!(&error, IntentError::Backend(detail) if detail.contains("printed more than")),
+            "got {error:?}"
+        );
+    }
+
     // -- the bounded wait --------------------------------------------------
 
     // `#[cfg(unix)]` and NOT the `cfg_attr(..., ignore)` its siblings carry, and
@@ -579,20 +1379,26 @@ mod tests {
     // — which `build-windows` builds, since it runs `cargo nextest run
     // --workspace`. Caught by PRD #802 M7's own run of that script, whose
     // header says only errors matter; this was one.
+    //
+    // **The name used to overstate itself and now does not.** It checked the
+    // stub shell's own pid and nothing else, so a `sleep 120` GRANDCHILD
+    // survived the timeout with the app's descriptors open and the test still
+    // passed — which is what PRD #802's audit found. The stub now forks a
+    // grandchild that records its own pid, and both are asserted gone.
     #[cfg(unix)]
     #[tokio::test]
-    async fn voice_agent_cli_times_out_and_leaves_no_child_behind() {
-        // The stub writes its own pid, then sleeps far past the timeout. After
-        // the Err, that pid must be gone: `kill_on_drop` fires when `timeout`
-        // drops the future holding the `Child`, which happens before the Err
-        // reaches us.
+    async fn voice_agent_cli_times_out_and_leaves_no_child_or_grandchild_behind() {
         let dir = tempfile::tempdir().expect("tempdir");
         let pidfile = dir.path().join("pid");
+        let grandpidfile = dir.path().join("grandpid");
         let stub = Stub::new(&format!(
-            "echo $$ > '{}'\nsleep 120",
-            pidfile.to_string_lossy()
+            "echo $$ > '{}'\n\
+             sh -c 'echo $$ > \"{}\"; exec sleep 120' &\n\
+             sleep 120",
+            pidfile.to_string_lossy(),
+            grandpidfile.to_string_lossy()
         ));
-        let resolver = stub.resolver().with_timeout(Duration::from_millis(250));
+        let resolver = stub.resolver().with_timeout(Duration::from_millis(1000));
 
         let started = std::time::Instant::now();
         let error = ask(&resolver, "show me the tester")
@@ -608,16 +1414,40 @@ mod tests {
             "got {error:?}"
         );
 
-        let pid: i32 = std::fs::read_to_string(&pidfile)
-            .expect("the stub recorded its pid")
-            .trim()
-            .parse()
-            .expect("a pid");
-        // The reap is tokio's background job, so poll briefly rather than
-        // asserting the corpse is already collected. What is asserted is that
-        // the process is not still RUNNING.
-        let gone = wait_for_exit(pid, Duration::from_secs(5));
-        assert!(gone, "pid {pid} survived the timeout");
+        let pid = read_pid(&pidfile);
+        let grandpid = read_pid(&grandpidfile);
+        assert_ne!(pid, grandpid, "the stub did not fork a real grandchild");
+        assert!(
+            wait_for_exit(pid, Duration::from_secs(5)),
+            "pid {pid} survived the timeout"
+        );
+        // The finding this test exists for: `kill_on_drop` signals the direct
+        // child only, so before the process-group teardown this grandchild ran
+        // on for another two minutes.
+        assert!(
+            wait_for_exit(grandpid, Duration::from_secs(5)),
+            "grandchild {grandpid} survived the timeout"
+        );
+    }
+
+    /// The pid a stub wrote, waiting briefly for the write to land — the
+    /// grandchild's `echo` races the parent's timeout by milliseconds.
+    #[cfg(unix)]
+    fn read_pid(path: &std::path::Path) -> i32 {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Ok(raw) = std::fs::read_to_string(path)
+                && let Ok(pid) = raw.trim().parse::<i32>()
+            {
+                return pid;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the stub never recorded a pid at {}",
+                path.display()
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 
     /// Whether `pid` has stopped running, within `budget`.
@@ -657,33 +1487,19 @@ mod tests {
     #[test]
     fn voice_agent_cli_names_itself_for_the_surface() {
         assert_eq!(AgentCliResolver::claude().backend_name(), "claude");
-        assert_eq!(AgentCliResolver::opencode().backend_name(), "opencode");
     }
 
     #[test]
-    fn voice_agent_cli_pins_the_cheap_fast_tier_for_claude_only() {
-        let claude = AgentCli::Claude.args("SAID".to_string());
+    fn voice_agent_cli_pins_the_cheap_fast_tier() {
+        let argv = AgentCli::Claude.args("SAID".to_string());
         assert_eq!(
-            claude,
+            argv[..3].to_vec(),
             vec![
                 OsString::from("-p"),
                 OsString::from("--model"),
                 OsString::from("claude-haiku-4-5"),
-                OsString::from("SAID"),
             ]
         );
-        // `opencode`'s `-m` takes `provider/model`, and this app cannot know
-        // which providers the user configured — so no pin, deliberately.
-        let opencode = AgentCli::Opencode.args("SAID".to_string());
-        assert_eq!(
-            opencode,
-            vec![
-                OsString::from("run"),
-                OsString::from("--pure"),
-                OsString::from("SAID"),
-            ]
-        );
-        assert!(!opencode.iter().any(|arg| arg == "-m"));
     }
 
     #[test]
@@ -707,7 +1523,7 @@ mod tests {
         // Asserted by the clock: a capture runs `$SHELL -ilc` and is bounded by
         // a 10s CAPTURE_TIMEOUT, so a miss that returns in milliseconds did not
         // make one.
-        let resolver = AgentCliResolver::opencode()
+        let resolver = AgentCliResolver::claude()
             .with_program("/nonexistent/dot-agent-deck-voice-stub-does-not-exist");
         let started = std::time::Instant::now();
         let error = ask(&resolver, "show me the tester")

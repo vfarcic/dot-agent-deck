@@ -240,7 +240,7 @@ pub struct VoiceResult {
     /// before any backend call, and rendering `0 ms` for it would claim a
     /// measurement that was never taken.
     pub resolve_ms: Option<u32>,
-    /// Which backend answered — `claude`, `opencode`, `remote`, `stub`.
+    /// Which backend answered — `claude`, `remote`, `stub`.
     ///
     /// Present even when no call was made, because it names what *would* have
     /// answered, which is what a settings-facing sentence is about.

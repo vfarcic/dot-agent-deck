@@ -125,11 +125,11 @@ describe("VoicePanel", () => {
    */
   it("saves the whole document with only its own section replaced", () => {
     const { onSave } = renderPanel({ appearance: { mode: "dark" } });
-    fireEvent.change(screen.getByLabelText("Commands"), { target: { value: "opencode" } });
+    fireEvent.change(screen.getByLabelText("Commands"), { target: { value: "remote" } });
     expect(onSave).toHaveBeenCalledWith({
       ...DEFAULT_DESKTOP_SETTINGS,
       appearance: { mode: "dark" },
-      voice: { ...DEFAULT_VOICE_SETTINGS, intent: "opencode" },
+      voice: { ...DEFAULT_VOICE_SETTINGS, intent: "remote" },
     });
   });
 
