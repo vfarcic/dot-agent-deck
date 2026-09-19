@@ -196,7 +196,7 @@ Git is the sync layer. Clone the repository on the remote, run agents against it
 ## See also
 
 - [Remote Environments](remote-environments.md) — lifecycle model, stop vs detach, failure modes, hooks behavior.
-- [Remote Recipes](remote-recipes.md) — provisioning snippets for Multipass, a cloud VM, and bare metal.
+- [Remote Recipes](remote-recipes.md) — how to get a Linux or macOS host bootstrapped for `remote add`.
 
 ## What is not required
 

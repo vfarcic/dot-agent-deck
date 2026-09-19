@@ -248,5 +248,5 @@ It is two steps and a second terminal, which is worse than pasting. It works on 
 ## See also
 
 - [Remote Environment Requirements](remote-requirements.md) — what a host must provide before you can register it.
-- [Remote Recipes](remote-recipes.md) — provisioning snippets for common cloud and local-VM hosts.
+- [Remote Recipes](remote-recipes.md) — how to get a Linux or macOS host bootstrapped for `remote add`.
 - [Installation › Recycling the local daemon](installation.md#recycling-the-local-daemon) — `dot-agent-deck daemon stop` is the local counterpart for recycling the daemon on your laptop after a binary upgrade. The remote lifecycle described above (per-attach daemon, ssh session governs cleanup) is independent.
