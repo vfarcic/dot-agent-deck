@@ -1743,6 +1743,43 @@ fn init_logging_from_env() {
     }
 }
 
+/// Prepare the endpoint directory, then lazy-spawn a daemon at `endpoint` if
+/// one is not already there. Returns the message to print on failure.
+///
+/// **Only ever called with a primary endpoint** — see
+/// [`dot_agent_deck::platform::paths::ResolvedEndpoint::is_primary`].
+/// `ensure_daemon_running` refuses a non-primary one itself, so this is the
+/// caller-side half of one property rather than the whole of it.
+///
+/// The preflight is issue #1121 round two, B1. `daemon serve` calls
+/// `ensure_endpoint_dir` at its own bind sites, so the directory gets created
+/// either way — but when it *cannot* be created, because a foreign uid already
+/// owns `<temp dir>/dot-agent-deck-{uid}`, the refusal that names the
+/// directory, both uids and the override goes into the **detached daemon's
+/// log**, where nobody is looking. What the operator saw was the launcher
+/// waiting out `DAEMON_START_POLL_TIMEOUT` and reporting a start timeout.
+/// Running the same idempotent call here first puts the actionable message on
+/// their terminal instead.
+///
+/// **It does not close the wedge, and must not be described as if it does.** A
+/// foreign uid can still take the predictable directory name before this host's
+/// first successful launch, and the deck then refuses to start until that entry
+/// is removed. What changed is that the refusal says so.
+async fn bootstrap_primary_daemon(endpoint: &LocalEndpoint) -> Result<(), String> {
+    if let Err(source) = dot_agent_deck::endpoint_resolve::ensure_endpoint_dir(endpoint.path()) {
+        return Err(format!(
+            "cannot prepare the endpoint directory for {}: {source}",
+            endpoint.path().display()
+        ));
+    }
+    ensure_external_daemon_or_die(endpoint).await.map_err(|e| {
+        format!(
+            "failed to connect to daemon at {}: {e}",
+            endpoint.path().display()
+        )
+    })
+}
+
 /// The TUI body extracted from `run_dashboard` so `connect` can reuse it.
 /// PRD #93 Phase 2: every fresh `dot-agent-deck` invocation lazy-spawns a
 /// per-user daemon on the `attach_socket_path()` Unix socket and
@@ -1768,19 +1805,35 @@ async fn run_tui_session() -> ExitCode {
     // PRD #741 M2: the TUI always talks to the daemon on this machine, so it
     // names it as one. `attach_path` stays the same value it always was — the
     // endpoint's address — for the messages and the subscriber below.
-    let mut endpoint = LocalEndpoint::from_config();
+    //
+    // Issue #1121 round two: resolved with its provenance, because what may be
+    // done to the address depends on which arm produced it. A
+    // `LegacyCompat` one names a daemon from a pre-#1121 build that answered a
+    // probe a moment ago: this process may talk to it, and must not unlink it,
+    // lazy-spawn at it, or poll it for a daemon that would bind somewhere else.
+    let mut resolved = dot_agent_deck::endpoint_resolve::client_attach_endpoint();
+    // The one window the probe cannot cover: the older daemon exits between
+    // that probe and here. Re-resolving to the primary endpoint is what turns
+    // that into an ordinary cold start instead of a 15-second wait for a
+    // daemon at an address nothing will ever bind.
+    if !resolved.is_primary()
+        && !dot_agent_deck::endpoint_resolve::endpoint_is_answering(resolved.path())
+    {
+        resolved = dot_agent_deck::endpoint_resolve::primary_attach_endpoint();
+    }
+    let mut endpoint = LocalEndpoint::from_resolved(resolved);
     let mut attach_path = endpoint.path().to_path_buf();
 
-    // If the attach socket is missing, `ensure_external_daemon_or_die`
-    // fork-execs `dot-agent-deck daemon serve` detached under
-    // flock-serialized contention (so two simultaneous TUIs can't both
-    // win the bind — M1.3) and trust-checks any existing socket
-    // (uid + 0o600 + is-socket) before the TUI's DaemonClient touches it.
-    if let Err(e) = ensure_external_daemon_or_die(&endpoint).await {
-        eprintln!(
-            "failed to connect to daemon at {}: {e}",
-            attach_path.display()
-        );
+    // If the attach socket is missing, `bootstrap_primary_daemon` fork-execs
+    // `dot-agent-deck daemon serve` detached under flock-serialized contention
+    // (so two simultaneous TUIs can't both win the bind — M1.3) and
+    // trust-checks any existing socket (uid + 0o600 + is-socket) before the
+    // TUI's DaemonClient touches it. Skipped outright for a legacy endpoint,
+    // which by construction already has a daemon answering on it.
+    if endpoint.is_primary()
+        && let Err(message) = bootstrap_primary_daemon(&endpoint).await
+    {
+        eprintln!("{message}");
         return ExitCode::FAILURE;
     }
     // PRD #103 Phase 2 / PRD #161 Part A: build-version handshake against
@@ -1826,19 +1879,19 @@ async fn run_tui_session() -> ExitCode {
         handshake_outcome,
         build_version_handshake::HandshakeOutcome::Recovered
     ) {
-        // Issue #1121: re-resolve before re-spawning. The daemon we just
-        // SIGTERM'd may have been an older build reached through the
-        // compatibility read of the pre-#1121 fallback endpoint; nothing
-        // answers there any more, and the daemon about to be spawned binds the
-        // new spelling. Polling the address of the daemon we killed would time
-        // out while a perfectly healthy replacement was already up.
-        endpoint = LocalEndpoint::from_config();
+        // Issue #1121: re-resolve before re-spawning, and to the **primary**
+        // endpoint specifically. The daemon we just SIGTERM'd may have been an
+        // older build reached through the compatibility read of the pre-#1121
+        // fallback endpoint; nothing answers there any more, and the daemon
+        // about to be spawned binds the new spelling. Polling the address of
+        // the daemon we killed would time out while a perfectly healthy
+        // replacement was already up.
+        endpoint = LocalEndpoint::from_resolved(
+            dot_agent_deck::endpoint_resolve::primary_attach_endpoint(),
+        );
         attach_path = endpoint.path().to_path_buf();
-        if let Err(e) = ensure_external_daemon_or_die(&endpoint).await {
-            eprintln!(
-                "failed to re-spawn daemon at {} after version-mismatch recovery: {e}",
-                attach_path.display()
-            );
+        if let Err(message) = bootstrap_primary_daemon(&endpoint).await {
+            eprintln!("after version-mismatch recovery: {message}");
             return ExitCode::FAILURE;
         }
     }
@@ -2223,8 +2276,15 @@ fn run_daemon_hello_cli() -> ExitCode {
 /// unlike `daemon stop`'s idempotent "no daemon running" — but deliberately
 /// never with clap's own exit code 2, so a caller can tell "this build
 /// doesn't understand the request" apart from "the daemon didn't answer".
-/// Never spawns, retries, or otherwise perturbs the daemon it's asking
-/// about: a timeout abandons the query rather than looping.
+/// Never spawns a daemon, never sends a mutation request, and never retries: a
+/// timeout abandons the query rather than looping. "Otherwise perturbs the
+/// daemon" is what this used to claim and is now too strong (issue #1121 round
+/// two, N11) — resolving the endpoint through `client_attach_socket_path` makes
+/// a successful connection of its own before the status connection, so on a
+/// host in the fallback case the daemon sees one extra accept and one extra
+/// client. No protocol byte is written on it, but it is observable in timings
+/// such as idle observation, and a comment that says otherwise is read as a
+/// guarantee.
 #[tokio::main]
 async fn run_daemon_status_cli(json: bool) -> ExitCode {
     use dot_agent_deck::daemon_status::{

@@ -11,7 +11,7 @@
 //! so every bound endpoint ends up owner-only exactly as before.
 
 use std::io;
-use std::os::unix::io::{AsRawFd, FromRawFd};
+use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::path::Path;
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -64,8 +64,15 @@ impl IpcStream {
     /// Connect to a daemon endpoint. Lift of `UnixStream::connect`; preserves
     /// the exact `io::Error` kinds callers match on (`ConnectionRefused` for a
     /// stale inode, `NotFound` for a missing socket file).
+    ///
+    /// Since issue #1121 round two it also refuses a listener owned by another
+    /// uid — see [`refuse_foreign_peer`]. That adds one error kind,
+    /// `PermissionDenied`, and it is the same kind `connect(2)` itself reports
+    /// for a socket we may not talk to.
     pub async fn connect(endpoint: &Path) -> io::Result<Self> {
-        Ok(Self(UnixStream::connect(endpoint).await?))
+        let stream = UnixStream::connect(endpoint).await?;
+        refuse_foreign_peer(stream.as_raw_fd(), endpoint)?;
+        Ok(Self(stream))
     }
 
     /// Split into owned read/write halves via
@@ -190,7 +197,9 @@ impl IpcClient {
     ///
     /// [`connect_timeout`]: Self::connect_timeout
     pub fn connect(endpoint: &Path) -> io::Result<Self> {
-        Ok(Self(std::os::unix::net::UnixStream::connect(endpoint)?))
+        let stream = std::os::unix::net::UnixStream::connect(endpoint)?;
+        refuse_foreign_peer(stream.as_raw_fd(), endpoint)?;
+        Ok(Self(stream))
     }
 
     /// Connect synchronously, bounded by `timeout` (issue #435).
@@ -269,6 +278,7 @@ impl IpcClient {
         }
 
         stream.set_nonblocking(false)?;
+        refuse_foreign_peer(fd, endpoint)?;
         Ok(Self(stream))
     }
 
@@ -308,6 +318,59 @@ impl std::io::Write for IpcClient {
     fn flush(&mut self) -> io::Result<()> {
         self.0.flush()
     }
+}
+
+/// Refuse a connection whose peer is not the uid running this process
+/// (issue #1121 round two).
+///
+/// **This is the clause that makes the endpoint trust check mean what it has
+/// always claimed.** [`crate::platform::fsperm::verify_endpoint_trusted`]'s
+/// doc used to say the descriptor a caller connects with is "anchored to the
+/// inode the kernel resolves during this single call". It is not: the `lstat`
+/// and the `connect(2)` are two separate pathname resolutions, and every
+/// caller that probes and then connects again resolves it a third time. In a
+/// sticky world-writable directory a foreign uid cannot replace a *live*
+/// victim-owned inode — but when an old daemon unlinks its socket during
+/// shutdown the name is free, and a permissive listener bound in that window
+/// passes an `lstat` taken before it and receives whatever the caller sends.
+///
+/// A peer credential is not subject to that, because it is not a name: the
+/// kernel records who is on the other end of *this* connection when it is
+/// established, and `SO_PEERCRED` / `getpeereid` read that record back. It is
+/// welded into all three Unix connect entry points rather than offered as
+/// something a caller may ask for, which is exactly the shape the Windows
+/// backend has always had — `IpcStream::connect` and `IpcClient::connect`
+/// there both compare the pipe server's owner SID with ours, whether or not a
+/// caller asks. Until now `src/platform/fsperm/mod.rs`'s own site table said
+/// so, and recorded Unix's connect as "unguarded".
+///
+/// **Two things it does not do.** It says nothing about who listens on the far
+/// end of an ssh-forwarded socket, because the peer of that connection is the
+/// *local* `ssh` process and is ours by construction. And it is not a
+/// substitute for [`crate::platform::fsperm::verify_endpoint_trusted`], which
+/// runs *before* a connect is attempted and is what keeps the deck from
+/// touching a foreign entry at all; this runs after, on a connection that was
+/// allowed to be made.
+///
+/// Root is outside this, as it is outside every uid check — a process running
+/// as uid 0 can bind wherever it likes. It is not the actor this is written
+/// against.
+fn refuse_foreign_peer(fd: RawFd, endpoint: &Path) -> io::Result<()> {
+    let peer_uid = crate::platform::peercred::peer_uid_raw(fd)?;
+    let our_uid = crate::platform::paths::current_uid();
+    if peer_uid != our_uid {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "refusing the daemon connection at {}: the process listening there runs as \
+                 uid {peer_uid} and we are uid {our_uid}. Another user may have bound this \
+                 endpoint. Set DOT_AGENT_DECK_SOCKET and DOT_AGENT_DECK_ATTACH_SOCKET to \
+                 paths under a directory only you can write.",
+                endpoint.display()
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// A fresh, unconnected `AF_UNIX` stream socket with close-on-exec set.

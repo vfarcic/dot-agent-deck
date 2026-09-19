@@ -373,6 +373,15 @@ impl std::hash::Hasher for StableHasher {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct LocalEndpoint {
     path: PathBuf,
+    /// Issue #1121 round two. `LocalEndpoint` says "a daemon on **this
+    /// machine**", which is what makes `peer_pid` termination, the stale-inode
+    /// unlink and lazy-spawn reachable at all. It did not say *which* address
+    /// on this machine, and one of them — the pre-#1121 compatibility spelling
+    /// — is an address this build reads and never writes. Carrying the
+    /// provenance is what lets [`crate::daemon_attach::ensure_daemon_running`]
+    /// refuse it instead of unlinking our own old socket and then polling an
+    /// address nothing will ever bind.
+    source: crate::platform::paths::EndpointSource,
 }
 
 impl LocalEndpoint {
@@ -392,7 +401,21 @@ impl LocalEndpoint {
     /// [`crate::config::attach_socket_path`] directly, so the legacy spelling
     /// is never created by us.
     pub fn from_config() -> Self {
-        Self::at(crate::endpoint_resolve::client_attach_socket_path())
+        Self::from_resolved(crate::endpoint_resolve::client_attach_endpoint())
+    }
+
+    /// The endpoint a resolution produced, provenance and all.
+    ///
+    /// The route to a **non-primary** `LocalEndpoint`, and the only one:
+    /// [`Self::at`] cannot make one, so an address a caller chose outright is
+    /// always treated as primary. That is the right default — a test's
+    /// scripted listener in a `tempfile::tempdir()` is exactly the kind of
+    /// address lazy-spawn and stale-inode recovery are meant to work on.
+    pub fn from_resolved(resolved: crate::platform::paths::ResolvedEndpoint) -> Self {
+        Self {
+            source: resolved.source(),
+            path: resolved.into_path(),
+        }
     }
 
     /// A local daemon at an explicitly chosen address.
@@ -403,12 +426,27 @@ impl LocalEndpoint {
     /// listener in a `tempfile::tempdir()`. **Never** hand it an address a
     /// remote transport produced — see the type's docs for what that would cost.
     pub fn at(path: impl Into<PathBuf>) -> Self {
-        Self { path: path.into() }
+        Self {
+            path: path.into(),
+            source: crate::platform::paths::EndpointSource::Override,
+        }
     }
 
     /// The address to connect to, bind against, or poll for.
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// May this address be unlinked, bound or lazy-spawned at?
+    ///
+    /// False only for the pre-#1121 compatibility spelling — see
+    /// [`crate::platform::paths::ResolvedEndpoint::is_primary`], which this
+    /// forwards to.
+    pub fn is_primary(&self) -> bool {
+        !matches!(
+            self.source,
+            crate::platform::paths::EndpointSource::LegacyCompat
+        )
     }
 }
 
@@ -2779,6 +2817,23 @@ mod tests {
             "the configured local endpoint must be exactly the path this crate \
              has always used, or the local case is not byte-identical"
         );
+
+        // …and the delegation above is `x == x` on its own, because
+        // `from_config()` literally calls that resolver (round two, S5). This
+        // is the property the comment above actually claims: outside the
+        // compatibility case the client resolver IS the pure one. Stated as an
+        // implication rather than by setting `DOT_AGENT_DECK_ATTACH_SOCKET`,
+        // because that variable is process-global and `cargo test` runs these
+        // as threads in one process.
+        let resolved = crate::endpoint_resolve::client_attach_endpoint();
+        if resolved.source() != crate::platform::paths::EndpointSource::LegacyCompat {
+            assert_eq!(
+                resolved.path(),
+                crate::config::attach_socket_path(),
+                "with no compatibility read in play the client resolver must be \
+                 byte-identical to the pure one"
+            );
+        }
     }
 
     /// The desktop's connection banner renders `describe()`, and for a local

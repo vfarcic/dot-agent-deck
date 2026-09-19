@@ -36,8 +36,16 @@ pub fn config_keys_help() -> String {
 }
 
 /// Hook-ingestion endpoint path. Delegates to [`crate::platform::paths`] (PRD
-/// #42 M1): Unix resolves the `$XDG_RUNTIME_DIR`/per-uid-`/tmp` socket path,
-/// Windows resolves the named-pipe name. `DOT_AGENT_DECK_SOCKET` overrides.
+/// #42 M1): Unix resolves `$XDG_RUNTIME_DIR/dot-agent-deck.sock`, else
+/// `<temp dir>/dot-agent-deck-{uid}/hook.sock` — the sibling of the attach
+/// endpoint's `attach.sock` in that same per-uid directory. Windows resolves
+/// the named-pipe name. `DOT_AGENT_DECK_SOCKET` overrides.
+///
+/// "per-uid-`/tmp` socket path" is what this used to say, and it is now wrong
+/// twice over: the endpoints moved one level down into a directory the deck
+/// owns (issue #1121), and the root is `std::env::temp_dir()` rather than a
+/// literal `/tmp`, so it is not `/tmp` at all wherever `$TMPDIR` points
+/// elsewhere — which on macOS is everywhere.
 pub fn socket_path() -> PathBuf {
     crate::platform::paths::socket_path()
 }

@@ -168,7 +168,10 @@ pub(crate) const SITE_AUDIT: &[PermissionSite] = &[
     PermissionSite {
         function: "verify_endpoint_trusted",
         unix: "lstat: is a socket (never a symlink), owned by our uid, mode 0o600 — out-of-band, \
-               because the connect that follows is unguarded",
+               ahead of the connect. Since issue #1121 the connect itself is guarded too: a \
+               peer-uid refusal (SO_PEERCRED / getpeereid) is welded into all three entry \
+               points (IpcStream::connect, IpcClient::connect, IpcClient::connect_timeout), \
+               which is what covers the replacement window a pathname check cannot",
         windows: WindowsCounterpart::Enforced(
             "GetSecurityInfo on the pipe handle compares the server's owner SID with ours. Also \
              welded into BOTH client entry points (IpcStream::connect and IpcClient::connect), \

@@ -100,6 +100,20 @@ pub enum AttachError {
          $XDG_RUNTIME_DIR or your home directory."
     )]
     SocketUntrusted { path: PathBuf, reason: String },
+    // Issue #1121 round two. Not reachable from any caller in `src/` today —
+    // `run_tui_session` never hands a legacy address to the bootstrap — which
+    // is precisely why the refusal is here as well as there: the property is
+    // "this function never unlinks or polls an address this build does not
+    // bind", and a property enforced only at one call site is one edit away
+    // from being gone with every test still green.
+    #[error(
+        "refusing to lazy-spawn or recover a daemon at {path}: that is the pre-#1121 \
+         compatibility endpoint, which this build reads and never binds. A daemon started \
+         now would bind the current endpoint instead, so unlinking this address and then \
+         polling it would fail after the full start timeout while a healthy daemon was \
+         already running."
+    )]
+    NotAPrimaryEndpoint { path: PathBuf },
 }
 
 /// If `socket_path` doesn't exist, run `spawn_fn` to start a detached
@@ -142,6 +156,19 @@ where
     // particular is safe only because `verify_socket_trusted` just proved the
     // inode is ours. `Endpoint::as_local()` is the only route to this type.
     let socket_path = endpoint.path();
+    // Issue #1121 round two: and not merely a local one — a *primary* one.
+    // Everything below is a write against the address: `remove_file` on a
+    // stale inode, `spawn_fn`, then a poll loop waiting for the spawned daemon
+    // to appear there. A daemon started now binds `paths::attach_socket_path()`
+    // and nothing else, so for the compatibility spelling all three are wrong:
+    // the unlink removes our own old socket, and the poll waits out its whole
+    // budget on an address that will never be bound. See
+    // `endpoint_resolve::client_attach_endpoint`.
+    if !endpoint.is_primary() {
+        return Err(AttachError::NotAPrimaryEndpoint {
+            path: socket_path.to_path_buf(),
+        });
+    }
     // Lock file lives inside the state dir, so we have to make sure the dir
     // exists first. `ensure_owner_only_dir` creates idempotently AND enforces
     // mode 0o700 unconditionally — including repairing a pre-existing dir
@@ -248,10 +275,13 @@ fn endpoint_entry_present(path: &Path) -> bool {
 /// path before the real daemon binds: in that scenario `bind(2)` fails with
 /// `EADDRINUSE` for the daemon and `connect(2)` succeeds for us against the
 /// attacker's socket. Validating ownership and mode out-of-band closes the
-/// gap. Stat is not racy here because we never re-stat after this check —
-/// the FD we then connect to is anchored to the inode the kernel resolves
-/// during this single call (and any swap underneath us produces an obvious
-/// connection error from `UnixStream::connect`).
+/// gap.
+///
+/// This comment carried the same false "anchored … during this single call"
+/// claim its platform counterpart did; the accurate statement, and where the
+/// replacement window is actually closed, is written out once at
+/// [`crate::platform::fsperm::verify_endpoint_trusted`] (issue #1121 round
+/// two).
 ///
 /// PRD #42 M1: the platform check lives in
 /// [`crate::platform::fsperm::verify_endpoint_trusted`]; here we just map its
@@ -388,6 +418,55 @@ mod tests {
              {DAEMON_START_POLL_TIMEOUT:?} but the daemon may spend up to {:?} in the \
              login-shell PATH capture before it even calls bind",
             crate::login_shell::CAPTURE_TIMEOUT,
+        );
+    }
+
+    /// Issue #1121 round two, B6: a non-primary endpoint — the pre-#1121
+    /// compatibility spelling — is refused before anything is unlinked or
+    /// spawned. The planted socket must survive untouched and `spawn_fn` must
+    /// never run; both are the damage the refusal exists to prevent.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_non_primary_endpoint_is_refused_before_anything_is_unlinked_or_spawned() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let legacy = dir.path().join("legacy.sock");
+        // A dead socket: bound, then the listener dropped, so the inode stays
+        // and nothing answers — exactly the state that sends a *primary*
+        // endpoint down the `remove_file` branch.
+        drop(std::os::unix::net::UnixListener::bind(&legacy).expect("bind"));
+        crate::platform::fsperm::set_endpoint_mode_owner_only(&legacy).expect("0o600");
+
+        let endpoint = LocalEndpoint::from_resolved(crate::platform::paths::ResolvedEndpoint::new(
+            legacy.clone(),
+            crate::platform::paths::EndpointSource::LegacyCompat,
+        ));
+        assert!(!endpoint.is_primary());
+
+        let spawned = AtomicBool::new(false);
+        let error = ensure_daemon_running(
+            &endpoint,
+            &dir.path().join("state"),
+            || {
+                spawned.store(true, Ordering::SeqCst);
+                Ok(())
+            },
+            Duration::from_millis(1),
+            Duration::from_millis(10),
+        )
+        .await
+        .expect_err("a legacy address must be refused");
+
+        assert!(
+            matches!(error, AttachError::NotAPrimaryEndpoint { .. }),
+            "{error}"
+        );
+        assert!(!spawned.load(Ordering::SeqCst), "nothing may be spawned");
+        assert!(
+            legacy.exists(),
+            "our own legacy socket must not be unlinked: {}",
+            legacy.display()
         );
     }
 

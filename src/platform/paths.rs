@@ -1235,6 +1235,184 @@ pub(crate) fn native_shell_command_word(path: &str, windows_host: bool) -> Strin
     }
 }
 
+/// How [`resolve_socket_path`] and [`resolve_attach_socket_path`] arrived at
+/// an address, carried alongside it by [`ResolvedEndpoint`].
+///
+/// **Provenance, deliberately not re-derived from the path** (issue #1121
+/// round two). The first cut of that issue decided "is this the fallback
+/// endpoint?" by comparing the resolved path against [`fallback_socket_path`],
+/// and path equality is not provenance: an explicit `DOT_AGENT_DECK_SOCKET` —
+/// or an `$XDG_RUNTIME_DIR` — that happens to spell the same address as the
+/// computed fallback satisfies that comparison while being neither. The
+/// consequence was that an explicit override could send the connect side off
+/// to consult the pre-#1121 spelling and hand back a *different* daemon than
+/// the one the operator named. Every decision that used to read an equality
+/// reads this instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum EndpointSource {
+    /// An explicit `DOT_AGENT_DECK_SOCKET` / `DOT_AGENT_DECK_ATTACH_SOCKET`,
+    /// or an address a caller chose outright ([`crate::daemon_client::LocalEndpoint::at`]).
+    Override,
+    /// The platform default that is not the temp-dir fallback: an
+    /// `$XDG_RUNTIME_DIR` endpoint on Unix, a named pipe on Windows.
+    PlatformDefault,
+    /// The per-uid temp-dir fallback ([`fallback_endpoint_dir`]) — Unix, with
+    /// `XDG_RUNTIME_DIR` unset and no override. The one arm with a directory
+    /// to create and a pre-#1121 spelling to consult.
+    Fallback,
+    /// The pre-#1121 flat temp-dir spelling, selected by
+    /// [`crate::endpoint_resolve`]'s connect-side compatibility read. **Not a
+    /// primary endpoint** — see [`ResolvedEndpoint::is_primary`].
+    LegacyCompat,
+}
+
+/// An endpoint address together with [`EndpointSource`], the arm that produced
+/// it.
+///
+/// Pure: constructing one reads the environment but touches no filesystem, so
+/// it is as safe to call from a hook client in a scrubbed environment as the
+/// bare resolvers it wraps.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedEndpoint {
+    path: PathBuf,
+    source: EndpointSource,
+}
+
+impl ResolvedEndpoint {
+    /// Pair an address with the arm that produced it.
+    pub fn new(path: PathBuf, source: EndpointSource) -> Self {
+        Self { path, source }
+    }
+
+    /// The address itself.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// The address, consuming the provenance — for the many callers that only
+    /// ever wanted a path.
+    pub fn into_path(self) -> PathBuf {
+        self.path
+    }
+
+    /// Which arm produced [`Self::path`].
+    pub fn source(&self) -> EndpointSource {
+        self.source
+    }
+
+    /// Is this an address this build may **bind, create, unlink or lazy-spawn
+    /// at**?
+    ///
+    /// True for every arm but [`EndpointSource::LegacyCompat`]. The pre-#1121
+    /// spelling is read-only for us, and the reason is sharper than tidiness:
+    /// [`crate::daemon_attach::ensure_daemon_running`]'s stale-inode recovery
+    /// `remove_file`s the address it is given, and its poll loop then waits
+    /// for a freshly-spawned daemon to appear *there* — but a fresh daemon
+    /// binds [`socket_path`], never the legacy spelling. Handed a legacy
+    /// address whose daemon had died, it would unlink our own old socket and
+    /// then poll an address nothing will ever bind, for the whole
+    /// [`crate::daemon_attach::DAEMON_START_POLL_TIMEOUT`].
+    pub fn is_primary(&self) -> bool {
+        !matches!(self.source, EndpointSource::LegacyCompat)
+    }
+}
+
+/// The temp directory the Unix endpoint fallback is rooted at:
+/// [`std::env::temp_dir`], except that an **empty** `TMPDIR` resolves to
+/// `/tmp` (issue #1121 round two).
+///
+/// `std::env::temp_dir()` honours an empty `TMPDIR` literally and yields
+/// `PathBuf::from("")`, which makes the fallback endpoint the *relative* path
+/// `dot-agent-deck-{uid}/hook.sock`. That is not merely odd, it is
+/// unresolvable across processes: `bind(2)` accepts a relative pathname
+/// perfectly well, so the daemon would bind one address relative to its own
+/// cwd while a hook client in an agent's cwd computed another — and
+/// [`crate::remote_tunnel::REMOTE_SOCKET_PROBE`], which spells the same rung
+/// `${TMPDIR:-/tmp}`, would answer `/tmp/...` and match neither. Normalising
+/// here is what keeps the two ends in step; the shell keeps its `:-`.
+///
+/// Only the *empty* case is normalised. A non-empty relative `TMPDIR` is left
+/// alone because `${TMPDIR:-/tmp}` leaves it alone too — `:-` substitutes on
+/// unset or null, and on nothing else.
+#[cfg(unix)]
+fn endpoint_temp_dir() -> PathBuf {
+    normalise_temp_dir(std::env::temp_dir())
+}
+
+/// [`endpoint_temp_dir`]'s rule, over an explicit value.
+///
+/// Pure, so the rule is testable without setting `TMPDIR` — which is
+/// process-global and read by several resolvers, the same reason
+/// [`fallback_endpoint_dir_in`] takes its directory as an argument.
+#[cfg(unix)]
+fn normalise_temp_dir(temp_dir: PathBuf) -> PathBuf {
+    if temp_dir.as_os_str().is_empty() {
+        return PathBuf::from(EMPTY_TMPDIR_FALLBACK_ROOT);
+    }
+    temp_dir
+}
+
+/// What [`endpoint_temp_dir`] substitutes for an empty `TMPDIR`, matching the
+/// `${TMPDIR:-/tmp}` in [`crate::remote_tunnel::REMOTE_SOCKET_PROBE`].
+#[cfg(unix)]
+const EMPTY_TMPDIR_FALLBACK_ROOT: &str = "/tmp";
+
+/// The directory pre-#1121 builds hardcoded their endpoints into.
+#[cfg(unix)]
+const LEGACY_ENDPOINT_ROOT: &str = "/tmp";
+
+/// Test-only: the environment variable that relocates
+/// [`legacy_socket_path`] / [`legacy_attach_socket_path`], **only** in a build
+/// carrying the `e2e` Cargo feature.
+///
+/// The three `error/socket/009-011` scenarios drive the real binary through
+/// the compatibility read, and without this they can only do it against the
+/// literal `/tmp/dot-agent-deck[-attach]-{uid}.sock` of the uid running the
+/// suite — the same two addresses a live deck on that host uses. That is the
+/// issue #428 incident class: a test planting, binding and cleaning production
+/// endpoints.
+///
+/// **Gated on the feature, exactly like [`effective_current_exe`]'s seam, and
+/// for the reason recorded there** — an ungated env seam stays
+/// "production-active": present, and consultable, in every build. Under
+/// `cargo build --release` or a plain `cargo test-fast` the read below does
+/// not exist in the artifact at all, so there is no code path for production
+/// to take.
+///
+/// It is an **environment variable** rather than that seam's `OnceLock`
+/// because the thing to redirect lives in another process: these scenarios
+/// launch the deck binary and its detached daemon, and a value set in the test
+/// process cannot reach either. The feature gate is what carries the property;
+/// the mechanism is chosen by where the override has to arrive.
+#[cfg(all(unix, feature = "e2e"))]
+pub const TEST_LEGACY_ENDPOINT_ROOT_ENV: &str = "DOT_AGENT_DECK_TEST_LEGACY_ENDPOINT_ROOT";
+
+/// The directory the legacy resolvers spell their addresses under — a literal
+/// `/tmp`, or the [`TEST_LEGACY_ENDPOINT_ROOT_ENV`] override when one is set.
+#[cfg(all(unix, feature = "e2e"))]
+fn legacy_endpoint_root() -> PathBuf {
+    legacy_endpoint_root_from(std::env::var_os(TEST_LEGACY_ENDPOINT_ROOT_ENV))
+}
+
+/// [`legacy_endpoint_root`]'s rule, over an explicit override value — pure, so
+/// it is testable without setting a process-global variable. An unset **or
+/// empty** override falls through to the literal, matching how every other
+/// override in this module treats an empty value (issue #898).
+#[cfg(all(unix, feature = "e2e"))]
+fn legacy_endpoint_root_from(override_value: Option<std::ffi::OsString>) -> PathBuf {
+    match override_value {
+        Some(root) if !root.is_empty() => PathBuf::from(root),
+        _ => PathBuf::from(LEGACY_ENDPOINT_ROOT),
+    }
+}
+
+/// The directory the legacy resolvers spell their addresses under. A literal
+/// `/tmp`, with no override of any kind in a build without the `e2e` feature.
+#[cfg(all(unix, not(feature = "e2e")))]
+fn legacy_endpoint_root() -> PathBuf {
+    PathBuf::from(LEGACY_ENDPOINT_ROOT)
+}
+
 /// File name of the hook-ingestion endpoint inside [`fallback_endpoint_dir`].
 #[cfg(unix)]
 const FALLBACK_HOOK_ENDPOINT_FILE: &str = "hook.sock";
@@ -1272,7 +1450,7 @@ const FALLBACK_ATTACH_ENDPOINT_FILE: &str = "attach.sock";
 /// `dot-agent-deck-tunnels-{uid}`.
 #[cfg(unix)]
 pub fn fallback_endpoint_dir() -> PathBuf {
-    fallback_endpoint_dir_in(&std::env::temp_dir())
+    fallback_endpoint_dir_in(&endpoint_temp_dir())
 }
 
 /// [`fallback_endpoint_dir`] against an explicit temp dir.
@@ -1316,16 +1494,27 @@ pub fn fallback_attach_socket_path() -> PathBuf {
 /// `/var/folders/…`, so "fixing" this to use it would look for an old daemon
 /// somewhere it has never bound.
 ///
-/// **Read-only for us: never bound, never created, never unlinked.** The only
-/// consumer is [`crate::endpoint_resolve`]'s connect-side discovery, which uses
-/// it to find a daemon from an older build still listening there. That is what
-/// keeps the squatting problem this issue fixes from simply moving here: an
-/// entry another uid planted at this path can at worst fail the probe —
+/// **Read-only for us: never bound and never created, and unlinked by no code
+/// that knows it is looking at this address.** The only consumer is
+/// [`crate::endpoint_resolve`]'s connect-side discovery, which uses it to find
+/// a daemon from an older build still listening there. That is what keeps the
+/// squatting problem this issue fixes from simply moving here: an entry
+/// another uid planted at this path can at worst fail the probe —
 /// [`crate::platform::fsperm::verify_endpoint_trusted`]'s `lstat` refuses it
 /// (issue #1020) — and we fall through to the new path.
+///
+/// The second half of that sentence used to read "never unlinked", and it was
+/// one quantifier too wide. A legacy address chosen by the compatibility read
+/// used to be wrapped in the same [`crate::daemon_client::LocalEndpoint`] that
+/// [`crate::daemon_attach::ensure_daemon_running`]'s stale-inode recovery
+/// takes, so an older daemon dying in the window between the probe and that
+/// function's own re-probe got **our own** dead legacy socket unlinked.
+/// [`ResolvedEndpoint::is_primary`] is what now keeps a legacy address out of
+/// that function; a **foreign** entry was never at risk either way, because
+/// the unlink sits behind the same `lstat` the probe uses.
 #[cfg(unix)]
 pub fn legacy_socket_path() -> PathBuf {
-    PathBuf::from(format!("/tmp/dot-agent-deck-{}.sock", current_uid()))
+    legacy_endpoint_root().join(format!("dot-agent-deck-{}.sock", current_uid()))
 }
 
 /// The attach endpoint spelling builds before issue #1121 hardcoded:
@@ -1333,7 +1522,7 @@ pub fn legacy_socket_path() -> PathBuf {
 /// the same reasons — see [`legacy_socket_path`].
 #[cfg(unix)]
 pub fn legacy_attach_socket_path() -> PathBuf {
-    PathBuf::from(format!("/tmp/dot-agent-deck-attach-{}.sock", current_uid()))
+    legacy_endpoint_root().join(format!("dot-agent-deck-attach-{}.sock", current_uid()))
 }
 
 /// [`socket_path`]'s Unix platform default against an explicit
@@ -1374,8 +1563,14 @@ fn unix_attach_socket_path_in(runtime_dir: Option<&Path>, temp_dir: &Path) -> Pa
 /// to [`crate::endpoint_resolve::ensure_endpoint_dir`], which the side about to
 /// **bind** calls.
 pub fn socket_path() -> PathBuf {
+    resolve_socket_path().into_path()
+}
+
+/// [`socket_path`] with the arm that produced it — see [`EndpointSource`] for
+/// why provenance is carried rather than inferred from the address.
+pub fn resolve_socket_path() -> ResolvedEndpoint {
     if let Ok(path) = std::env::var("DOT_AGENT_DECK_SOCKET") {
-        return PathBuf::from(path);
+        return ResolvedEndpoint::new(PathBuf::from(path), EndpointSource::Override);
     }
 
     #[cfg(unix)]
@@ -1384,14 +1579,31 @@ pub fn socket_path() -> PathBuf {
         // guard included (there is none: an empty value yields the same
         // relative `dot-agent-deck.sock` it always did).
         let runtime_dir = std::env::var("XDG_RUNTIME_DIR").ok();
-        unix_socket_path_in(runtime_dir.as_deref().map(Path::new), &std::env::temp_dir())
+        let runtime_dir = runtime_dir.as_deref().map(Path::new);
+        ResolvedEndpoint::new(
+            unix_socket_path_in(runtime_dir, &endpoint_temp_dir()),
+            unix_endpoint_source(runtime_dir),
+        )
     }
     #[cfg(windows)]
     {
-        PathBuf::from(format!(
-            r"\\.\pipe\dot-agent-deck-{}-hook",
-            endpoint_user_suffix()
-        ))
+        ResolvedEndpoint::new(
+            PathBuf::from(format!(
+                r"\\.\pipe\dot-agent-deck-{}-hook",
+                endpoint_user_suffix()
+            )),
+            EndpointSource::PlatformDefault,
+        )
+    }
+}
+
+/// Which arm a Unix platform default came from: `$XDG_RUNTIME_DIR` when one is
+/// set, otherwise the per-uid temp-dir fallback.
+#[cfg(unix)]
+fn unix_endpoint_source(runtime_dir: Option<&Path>) -> EndpointSource {
+    match runtime_dir {
+        Some(_) => EndpointSource::PlatformDefault,
+        None => EndpointSource::Fallback,
     }
 }
 
@@ -1407,21 +1619,34 @@ pub fn socket_path() -> PathBuf {
 ///
 /// Pure and infallible for the reason [`socket_path`] gives.
 pub fn attach_socket_path() -> PathBuf {
+    resolve_attach_socket_path().into_path()
+}
+
+/// [`attach_socket_path`] with the arm that produced it. [`resolve_socket_path`]'s
+/// sibling.
+pub fn resolve_attach_socket_path() -> ResolvedEndpoint {
     if let Ok(path) = std::env::var("DOT_AGENT_DECK_ATTACH_SOCKET") {
-        return PathBuf::from(path);
+        return ResolvedEndpoint::new(PathBuf::from(path), EndpointSource::Override);
     }
 
     #[cfg(unix)]
     {
         let runtime_dir = std::env::var("XDG_RUNTIME_DIR").ok();
-        unix_attach_socket_path_in(runtime_dir.as_deref().map(Path::new), &std::env::temp_dir())
+        let runtime_dir = runtime_dir.as_deref().map(Path::new);
+        ResolvedEndpoint::new(
+            unix_attach_socket_path_in(runtime_dir, &endpoint_temp_dir()),
+            unix_endpoint_source(runtime_dir),
+        )
     }
     #[cfg(windows)]
     {
-        PathBuf::from(format!(
-            r"\\.\pipe\dot-agent-deck-{}-attach",
-            endpoint_user_suffix()
-        ))
+        ResolvedEndpoint::new(
+            PathBuf::from(format!(
+                r"\\.\pipe\dot-agent-deck-{}-attach",
+                endpoint_user_suffix()
+            )),
+            EndpointSource::PlatformDefault,
+        )
     }
 }
 
@@ -1642,6 +1867,97 @@ mod tests {
             legacy_attach_socket_path(),
             fallback_attach_socket_path(),
             "the compatibility spelling and the one we bind must be different paths"
+        );
+    }
+
+    /// Round two, item 1: an **empty** `TMPDIR` resolves to `/tmp`, matching
+    /// the `${TMPDIR:-/tmp}` the remote discovery probe spells.
+    ///
+    /// `std::env::temp_dir()` honours an empty value literally and hands back
+    /// `PathBuf::from("")`, which would make the fallback endpoint a path
+    /// relative to whatever cwd each process happens to have. The first cut of
+    /// this change left that alone on the reasoning that such an endpoint "the
+    /// daemon cannot bind" — which is simply untrue of `bind(2)`, so the two
+    /// ends would have disagreed about a daemon that was running perfectly
+    /// well. Only the empty case is normalised: `:-` substitutes on unset or
+    /// null and on nothing else, so a non-empty relative value is left alone by
+    /// both ends alike.
+    #[cfg(unix)]
+    #[test]
+    fn an_empty_temp_dir_resolves_to_the_same_root_the_remote_probe_uses() {
+        assert_eq!(normalise_temp_dir(PathBuf::new()), Path::new("/tmp"));
+        assert_eq!(
+            normalise_temp_dir(PathBuf::from("/var/folders/ab/cd")),
+            Path::new("/var/folders/ab/cd"),
+            "a real temp dir is untouched"
+        );
+        assert_eq!(
+            normalise_temp_dir(PathBuf::from("relative-tmp")),
+            Path::new("relative-tmp"),
+            "a non-empty relative value is left alone, because the shell's :- default \
+             leaves it alone too"
+        );
+    }
+
+    /// Round two, item 2: the legacy root is a literal `/tmp` unless the
+    /// `e2e`-only override names another, and an empty override is no override.
+    #[cfg(all(unix, feature = "e2e"))]
+    #[test]
+    fn the_legacy_endpoint_root_is_overridable_only_under_the_e2e_feature() {
+        assert_eq!(legacy_endpoint_root_from(None), Path::new("/tmp"));
+        assert_eq!(
+            legacy_endpoint_root_from(Some(std::ffi::OsString::new())),
+            Path::new("/tmp"),
+            "an empty override is treated as unset, like every other override here"
+        );
+        assert_eq!(
+            legacy_endpoint_root_from(Some(std::ffi::OsString::from("/scratch/legacy"))),
+            Path::new("/scratch/legacy")
+        );
+    }
+
+    /// Round two, item 3: resolution carries the arm that produced it, and a
+    /// path comparison is not a substitute for it. The arm an address came from
+    /// decides whether the connect side consults the pre-#1121 spelling and
+    /// whether anything may be unlinked or lazy-spawned at it, and an explicit
+    /// override can name the very same address the fallback would have.
+    #[cfg(unix)]
+    #[test]
+    fn endpoint_resolution_reports_which_arm_produced_the_address() {
+        assert_eq!(unix_endpoint_source(None), EndpointSource::Fallback);
+        assert_eq!(
+            unix_endpoint_source(Some(Path::new("/run/user/4242"))),
+            EndpointSource::PlatformDefault
+        );
+
+        let fallback = ResolvedEndpoint::new(
+            PathBuf::from("/tmp/x/attach.sock"),
+            EndpointSource::Fallback,
+        );
+        let overridden = ResolvedEndpoint::new(
+            PathBuf::from("/tmp/x/attach.sock"),
+            EndpointSource::Override,
+        );
+        assert_ne!(
+            fallback, overridden,
+            "the same address from two arms must not compare equal, or provenance buys nothing"
+        );
+
+        for primary in [
+            EndpointSource::Override,
+            EndpointSource::PlatformDefault,
+            EndpointSource::Fallback,
+        ] {
+            assert!(
+                ResolvedEndpoint::new(PathBuf::from("/tmp/x.sock"), primary).is_primary(),
+                "{primary:?} names an address this build binds"
+            );
+        }
+        assert!(
+            !ResolvedEndpoint::new(PathBuf::from("/tmp/x.sock"), EndpointSource::LegacyCompat)
+                .is_primary(),
+            "the compatibility spelling is the one address that must never be \
+             unlinked, bound or lazy-spawned at"
         );
     }
 

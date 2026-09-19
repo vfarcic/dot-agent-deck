@@ -1542,19 +1542,38 @@ mod tests {
     /// A real repo with one commit plus a linked worktree at `worktree`, so the
     /// preview's `git status --porcelain` runs against a genuine tree rather
     /// than a stub. Mirrors `dispatch::tests::init_repo`.
-    fn init_repo_with_worktree(repo: &Path, worktree: &Path) {
+    ///
+    /// **Every `git` here goes through [`crate::worktree_owner::fixture_git`]**,
+    /// which switches off the ambient git environment in both of the groups
+    /// issue #834 names: *configuration* (`GIT_CONFIG_GLOBAL`/`SYSTEM` at a
+    /// nonexistent path, `HOME` and `XDG_CONFIG_HOME` inside the sandbox) and
+    /// *location* (the eight discovery variables cleared, plus
+    /// `GIT_CEILING_DIRECTORIES` bounding the upward walk at `sandbox_root`).
+    /// Without it these commands ran with only `.current_dir(dir)`, and git's
+    /// location discovery **outranks** a process's cwd: with an ambient
+    /// `GIT_DIR` — routine under `rebase --exec`, a pre-commit hook or
+    /// `bisect run` — `init`, `commit` and `worktree add` are writes against
+    /// whatever repository that names, which under `cargo test` can be the
+    /// checkout the suite is running in. It also supplies the commit identity
+    /// by environment, so the fixture no longer writes `user.name`/`user.email`
+    /// into a repository to configure one.
+    ///
+    /// Reached here from issue #1121 round two: a sibling test in this module
+    /// went red once in eight plain `cargo test` runs and could not be
+    /// reproduced, and this was the one concrete candidate cause — under
+    /// `cargo test` (threads, one process) it shares its environment with
+    /// `worktree_owner`'s `with_ambient_git_dir_at`, which sets those very
+    /// variables process-globally under a lock this fixture did not take.
+    fn init_repo_with_worktree(sandbox_root: &Path, repo: &Path, worktree: &Path) {
         let run = |dir: &Path, args: &[&str]| {
-            let out = std::process::Command::new("git")
+            let out = crate::worktree_owner::fixture_git(dir, sandbox_root)
                 .args(args)
-                .current_dir(dir)
                 .output()
                 .expect("git available");
             assert!(out.status.success(), "git {args:?} failed: {out:?}");
         };
         std::fs::create_dir_all(repo).unwrap();
         run(repo, &["init", "-q", "."]);
-        run(repo, &["config", "user.email", "t@t.t"]);
-        run(repo, &["config", "user.name", "T"]);
         std::fs::write(repo.join("a.txt"), "hi").unwrap();
         run(repo, &["add", "."]);
         run(repo, &["commit", "-qm", "init"]);
@@ -1585,7 +1604,7 @@ mod tests {
         let tmp = crate::test_temp::tempdir().unwrap();
         let repo = tmp.path().join("repo");
         let wt = tmp.path().join("repo-dispatch-x");
-        init_repo_with_worktree(&repo, &wt);
+        init_repo_with_worktree(tmp.path(), &repo, &wt);
         std::fs::write(wt.join("scratch.txt"), "the user's uncommitted work").unwrap();
 
         let reg = new_worktree_registry();
@@ -1613,7 +1632,7 @@ mod tests {
         let tmp = crate::test_temp::tempdir().unwrap();
         let repo = tmp.path().join("repo");
         let wt = tmp.path().join("repo-dispatch-x");
-        init_repo_with_worktree(&repo, &wt);
+        init_repo_with_worktree(tmp.path(), &repo, &wt);
 
         let reg = new_worktree_registry();
         record_worktree(&reg, &wt, &repo, RemovalPolicy::KeepIfDirty);
@@ -1631,7 +1650,7 @@ mod tests {
         let tmp = crate::test_temp::tempdir().unwrap();
         let repo = tmp.path().join("repo");
         let wt = tmp.path().join("repo-dispatch-x");
-        init_repo_with_worktree(&repo, &wt);
+        init_repo_with_worktree(tmp.path(), &repo, &wt);
         std::fs::write(wt.join("scratch.txt"), "discarded by design").unwrap();
 
         let reg = new_worktree_registry();
@@ -1651,7 +1670,7 @@ mod tests {
         let tmp = crate::test_temp::tempdir().unwrap();
         let repo = tmp.path().join("repo");
         let wt = tmp.path().join("repo-dispatch-x");
-        init_repo_with_worktree(&repo, &wt);
+        init_repo_with_worktree(tmp.path(), &repo, &wt);
         std::fs::write(wt.join("scratch.txt"), "dirty, but nobody dispatched here").unwrap();
 
         // Nothing recorded: this is a pane the user opened themselves, and the
@@ -1674,7 +1693,7 @@ mod tests {
         let tmp = crate::test_temp::tempdir().unwrap();
         let repo = tmp.path().join("repo");
         let wt = tmp.path().join("repo-dispatch-team");
-        init_repo_with_worktree(&repo, &wt);
+        init_repo_with_worktree(tmp.path(), &repo, &wt);
         std::fs::write(wt.join("scratch.txt"), "work from role 2").unwrap();
 
         let reg = new_worktree_registry();
@@ -1715,7 +1734,7 @@ mod tests {
         let tmp = crate::test_temp::tempdir().unwrap();
         let repo = tmp.path().join("repo");
         let wt = tmp.path().join("repo-dispatch-x");
-        init_repo_with_worktree(&repo, &wt);
+        init_repo_with_worktree(tmp.path(), &repo, &wt);
         std::fs::write(wt.join("scratch.txt"), "work").unwrap();
 
         let reg = new_worktree_registry();
@@ -1750,7 +1769,7 @@ mod tests {
 
         // Dirty + KeepIfDirty: kept, and it says so with the path.
         let dirty = tmp.path().join("repo-dispatch-dirty");
-        init_repo_with_worktree(&repo, &dirty);
+        init_repo_with_worktree(tmp.path(), &repo, &dirty);
         std::fs::write(dirty.join("scratch.txt"), "work").unwrap();
         let kept = remove_worktree(&dirty, &repo, RemovalPolicy::KeepIfDirty)
             .await
@@ -1812,7 +1831,7 @@ mod tests {
         let tmp = crate::test_temp::tempdir().unwrap();
         let repo = tmp.path().join("repo");
         let wt = tmp.path().join("repo-dispatch-x");
-        init_repo_with_worktree(&repo, &wt);
+        init_repo_with_worktree(tmp.path(), &repo, &wt);
 
         // `git -C <clone> worktree remove` against a clone that is not a repo
         // fails, which is the shape of every real failure here (locked, busy,
@@ -1835,7 +1854,7 @@ mod tests {
         let tmp = crate::test_temp::tempdir().unwrap();
         let repo = tmp.path().join("repo");
         let wt = tmp.path().join("repo-dispatch-x");
-        init_repo_with_worktree(&repo, &wt);
+        init_repo_with_worktree(tmp.path(), &repo, &wt);
 
         assert_eq!(worktree_is_dirty(&wt).await, Ok(false));
         std::fs::write(wt.join("scratch.txt"), "work").unwrap();

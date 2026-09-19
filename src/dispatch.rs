@@ -854,19 +854,24 @@ mod tests {
 
     /// Build a real git repo with one commit, so the `git worktree` primitives
     /// under test operate on a genuine repo rather than a stubbed one.
-    fn init_repo(dir: &Path) {
+    /// A real repo with one commit.
+    ///
+    /// Every `git` goes through [`crate::worktree_owner::fixture_git`] — see
+    /// the twin fixture in `issue_dispatch_run` for what that switches off and
+    /// why a fixture that runs `git` with only `.current_dir` can write to the
+    /// checkout the suite is running in. `sandbox_root` bounds the upward walk
+    /// and holds the neutralized config; it is the tempdir `dir` lives under,
+    /// not `dir` itself, so `git` cannot discover its way out of it.
+    fn init_repo_in(sandbox_root: &Path, dir: &Path) {
         let run = |args: &[&str]| {
-            let out = std::process::Command::new("git")
+            let out = crate::worktree_owner::fixture_git(dir, sandbox_root)
                 .args(args)
-                .current_dir(dir)
                 .output()
                 .expect("git available");
             assert!(out.status.success(), "git {args:?} failed: {out:?}");
         };
         std::fs::create_dir_all(dir).unwrap();
         run(&["init", "-q", "."]);
-        run(&["config", "user.email", "t@t.t"]);
-        run(&["config", "user.name", "T"]);
         std::fs::write(dir.join("a.txt"), "hi").unwrap();
         run(&["add", "."]);
         run(&["commit", "-qm", "init"]);
@@ -912,7 +917,7 @@ mod tests {
     async fn dispatch_base_names_the_branch_and_commit_it_was_cut_from() {
         let tmp = crate::test_temp::tempdir().unwrap();
         let repo = tmp.path().join("repo");
-        init_repo(&repo);
+        init_repo_in(tmp.path(), &repo);
         git_in(&repo, &["checkout", "-q", "-b", "feature-x"]);
 
         let base = describe_dispatch_base(&repo)
@@ -938,7 +943,7 @@ mod tests {
     async fn dispatch_base_says_detached_rather_than_naming_a_branch_head() {
         let tmp = crate::test_temp::tempdir().unwrap();
         let repo = tmp.path().join("repo");
-        init_repo(&repo);
+        init_repo_in(tmp.path(), &repo);
         git_in(&repo, &["checkout", "-q", "--detach", "HEAD"]);
 
         let base = describe_dispatch_base(&repo)
@@ -1009,7 +1014,7 @@ mod tests {
     async fn second_dispatch_of_a_name_reports_branch_exists_after_cleanup() {
         let tmp = crate::test_temp::tempdir().unwrap();
         let repo = tmp.path().join("repo");
-        init_repo(&repo);
+        init_repo_in(tmp.path(), &repo);
         let paths = derive_dispatch_paths(&repo, "fix-auth");
 
         // First dispatch claims the name.
@@ -1054,7 +1059,7 @@ mod tests {
     async fn deleting_the_leftover_branch_frees_the_name() {
         let tmp = crate::test_temp::tempdir().unwrap();
         let repo = tmp.path().join("repo");
-        init_repo(&repo);
+        init_repo_in(tmp.path(), &repo);
         let paths = derive_dispatch_paths(&repo, "fix-auth");
 
         create_worktree(
@@ -1095,7 +1100,7 @@ mod tests {
     async fn keep_if_dirty_preserves_a_worktree_with_uncommitted_work() {
         let tmp = crate::test_temp::tempdir().unwrap();
         let repo = tmp.path().join("repo");
-        init_repo(&repo);
+        init_repo_in(tmp.path(), &repo);
         let paths = derive_dispatch_paths(&repo, "unit");
         create_worktree(
             &repo,
@@ -1124,7 +1129,7 @@ mod tests {
     async fn force_removes_a_dirty_worktree_so_the_slot_is_reclaimable() {
         let tmp = crate::test_temp::tempdir().unwrap();
         let repo = tmp.path().join("repo");
-        init_repo(&repo);
+        init_repo_in(tmp.path(), &repo);
         let worktree_dir = repo.join(".worktrees").join("issue-7");
         create_worktree(
             &repo,
@@ -1649,7 +1654,7 @@ mod tests {
     async fn an_orchestration_dispatch_writes_the_delegation_protocol_and_the_task() {
         let tmp = crate::test_temp::tempdir().unwrap();
         let repo = tmp.path().join("repo");
-        init_repo(&repo);
+        init_repo_in(tmp.path(), &repo);
         std::fs::write(
             repo.join(".dot-agent-deck.toml"),
             "[[orchestrations]]\nname = \"demo-orch\"\n\n\
@@ -1789,7 +1794,7 @@ mod tests {
     async fn a_dispatch_whose_coordinator_context_cannot_be_published_is_refused_not_degraded() {
         let tmp = crate::test_temp::tempdir().unwrap();
         let repo = tmp.path().join("repo");
-        init_repo(&repo);
+        init_repo_in(tmp.path(), &repo);
         std::fs::write(
             repo.join(".dot-agent-deck.toml"),
             "[[orchestrations]]\nname = \"refused-orch\"\n\n\
@@ -1925,7 +1930,7 @@ mod tests {
     async fn a_partial_orchestration_dispatch_leaves_no_orphans_and_no_deleted_cwd() {
         let tmp = crate::test_temp::tempdir().unwrap();
         let repo = tmp.path().join("repo");
-        init_repo(&repo);
+        init_repo_in(tmp.path(), &repo);
         std::fs::write(
             repo.join(".dot-agent-deck.toml"),
             "[[orchestrations]]\nname = \"partial-orch\"\n\n\
@@ -2047,7 +2052,7 @@ mod tests {
     async fn a_rollback_with_nothing_started_still_reclaims_the_worktree_and_branch() {
         let tmp = crate::test_temp::tempdir().unwrap();
         let repo = tmp.path().join("repo");
-        init_repo(&repo);
+        init_repo_in(tmp.path(), &repo);
         std::fs::write(
             repo.join(".dot-agent-deck.toml"),
             "[[orchestrations]]\nname = \"doomed-orch\"\n\n\
@@ -2126,7 +2131,7 @@ mod tests {
     async fn the_rollback_leaves_a_worktree_that_a_live_agent_is_rooted_in() {
         let tmp = crate::test_temp::tempdir().unwrap();
         let repo = tmp.path().join("repo");
-        init_repo(&repo);
+        init_repo_in(tmp.path(), &repo);
         let worktree_dir = repo.parent().unwrap().join("repo-dispatch-survivor");
         create_worktree(
             &repo,
@@ -2217,7 +2222,7 @@ mod tests {
     async fn an_unknown_orchestration_name_is_refused_without_creating_a_worktree() {
         let tmp = crate::test_temp::tempdir().unwrap();
         let repo = tmp.path().join("repo");
-        init_repo(&repo);
+        init_repo_in(tmp.path(), &repo);
 
         let (event_tx, _rx) = tokio::sync::broadcast::channel(64);
         let ctx = DispatchContext {

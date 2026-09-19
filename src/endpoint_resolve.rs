@@ -21,19 +21,40 @@
 //! handshake fires and the user gets the prompt they get from any other version
 //! skew.
 //!
-//! **The legacy path is read-only for us: never bound, never created, never
-//! unlinked.** That is what stops the squatting problem this issue fixes from
-//! simply moving to the compatibility path. A foreign entry planted there can
-//! at worst fail [`crate::platform::fsperm::verify_endpoint_trusted`]'s `lstat`
-//! (issue #1020), and we fall through to the new path and lazy-spawn there.
+//! **The legacy path is read-only for us: never bound, never created, and
+//! unlinked by no code that knows it is looking at it.** That is what stops the
+//! squatting problem this issue fixes from simply moving to the compatibility
+//! path. A foreign entry planted there can at worst fail
+//! [`crate::platform::fsperm::verify_endpoint_trusted`]'s `lstat` (issue
+//! #1020), and we fall through to the new path and lazy-spawn there.
+//!
+//! The last clause of that sentence used to read "never unlinked" and was one
+//! quantifier too wide. This module never unlinked anything, but the address it
+//! returns used to travel onward as a bare [`std::path::PathBuf`], and
+//! [`crate::daemon_attach::ensure_daemon_running`]'s stale-inode recovery
+//! `remove_file`s whatever address it is handed. A pre-#1121 daemon dying
+//! between our probe and that function's own re-probe therefore got **our own**
+//! dead legacy socket unlinked — and then a fresh daemon bound the *new*
+//! address while the launcher polled the removed legacy one to its full
+//! timeout. Resolution now carries [`crate::platform::paths::EndpointSource`]
+//! alongside the address, and that function refuses anything that is not a
+//! primary endpoint. A **foreign** entry was never at risk either way: the
+//! unlink sits behind the same `lstat` the probe uses.
 //!
 //! The `$XDG_RUNTIME_DIR` and explicit-override spellings are untouched and
-//! cost nothing here: the legacy consultation runs only when the resolved path
-//! *is* the fallback one.
+//! cost nothing here: the legacy consultation runs only on the arm that
+//! resolved to the fallback endpoint. **That is an arm, not a path
+//! comparison**, and the difference is the whole of round two's S7: an explicit
+//! `DOT_AGENT_DECK_*` override that happens to spell the fallback address
+//! satisfies `resolved == fallback` while being an override, and used to send
+//! us off to consult the legacy path and hand back a daemon the operator never
+//! named.
+
+use std::path::{Path, PathBuf};
 
 #[cfg(unix)]
-use std::path::Path;
-use std::path::PathBuf;
+use crate::platform::paths::EndpointSource;
+use crate::platform::paths::ResolvedEndpoint;
 
 /// How long the connect-side liveness probe waits.
 ///
@@ -44,7 +65,6 @@ use std::path::PathBuf;
 /// [`crate::platform::ipc::IpcClient::connect`]). A wedged daemon must not turn
 /// endpoint resolution into a hang, and a quarter second is the same budget
 /// [`crate::ui`]'s interactive daemon hint gives itself.
-#[cfg(unix)]
 const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// Make sure the directory `endpoint` lives in exists and is ours alone, when
@@ -73,21 +93,7 @@ const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250)
 pub fn ensure_endpoint_dir(endpoint: &std::path::Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
-        let dir = crate::platform::paths::fallback_endpoint_dir();
-        if endpoint.parent() != Some(dir.as_path()) {
-            return Ok(());
-        }
-        crate::platform::fsperm::ensure_owner_only_dir(&dir).map_err(|source| {
-            std::io::Error::new(
-                source.kind(),
-                format!(
-                    "{source}\nThis is the endpoint directory the deck falls back to when \
-                     XDG_RUNTIME_DIR is unset. To use a different one, set \
-                     DOT_AGENT_DECK_SOCKET and DOT_AGENT_DECK_ATTACH_SOCKET to socket paths \
-                     under a directory only you can write."
-                ),
-            )
-        })
+        ensure_endpoint_dir_in(endpoint, &crate::platform::paths::fallback_endpoint_dir())
     }
     #[cfg(windows)]
     {
@@ -98,6 +104,43 @@ pub fn ensure_endpoint_dir(endpoint: &std::path::Path) -> std::io::Result<()> {
         let _ = endpoint;
         Ok(())
     }
+}
+
+/// [`ensure_endpoint_dir`] against an explicit fallback directory.
+///
+/// Split out so the test can drive both arms under a `tempfile::tempdir()`
+/// instead of creating and chmodding the operator's **real**
+/// `<temp dir>/dot-agent-deck-{uid}` — shared filesystem state with any live
+/// fallback daemon on the host, which the first cut of this module's test did
+/// (round two, S10). Same reason `fallback_endpoint_dir_in` exists one layer
+/// down in [`crate::platform::paths`].
+///
+/// The decision stays a **parent comparison** rather than an
+/// [`EndpointSource`] test, and that is deliberate rather than an oversight of
+/// the provenance work elsewhere in this module. This runs at a `bind(2)` site,
+/// and what a bind needs is for its parent directory to exist: an operator who
+/// points `DOT_AGENT_DECK_SOCKET` deliberately *into* the fallback directory
+/// still needs it created, and reading the source here would refuse to and turn
+/// a working configuration into a bind failure. The directory it then creates
+/// is the same one, at the same mode, that the same host would get with no
+/// override at all — so there is no surprise to avoid, which is the only thing
+/// provenance would buy here.
+#[cfg(unix)]
+fn ensure_endpoint_dir_in(endpoint: &Path, dir: &Path) -> std::io::Result<()> {
+    if endpoint.parent() != Some(dir) {
+        return Ok(());
+    }
+    crate::platform::fsperm::ensure_owner_only_dir(dir).map_err(|source| {
+        std::io::Error::new(
+            source.kind(),
+            format!(
+                "{source}\nThis is the endpoint directory the deck falls back to when \
+                 XDG_RUNTIME_DIR is unset. To use a different one, set \
+                 DOT_AGENT_DECK_SOCKET and DOT_AGENT_DECK_ATTACH_SOCKET to socket paths \
+                 under a directory only you can write."
+            ),
+        )
+    })
 }
 
 /// The hook-ingestion endpoint a **client** in this process should connect to.
@@ -112,14 +155,16 @@ pub fn ensure_endpoint_dir(endpoint: &std::path::Path) -> std::io::Result<()> {
 /// [`crate::platform::paths::socket_path`] directly, so the new spelling is the
 /// only one anything creates.
 pub fn client_socket_path() -> PathBuf {
-    let primary = crate::platform::paths::socket_path();
+    client_socket_endpoint().into_path()
+}
+
+/// [`client_socket_path`] with its [`EndpointSource`] — see
+/// [`client_attach_endpoint`] for who needs the provenance and why.
+pub fn client_socket_endpoint() -> ResolvedEndpoint {
+    let resolved = crate::platform::paths::resolve_socket_path();
     #[cfg(unix)]
-    let primary = with_legacy_fallback(
-        primary,
-        crate::platform::paths::fallback_socket_path(),
-        crate::platform::paths::legacy_socket_path(),
-    );
-    primary
+    let resolved = with_legacy_fallback(resolved, crate::platform::paths::legacy_socket_path());
+    resolved
 }
 
 /// The streaming-attach endpoint a **client** in this process should connect
@@ -127,34 +172,76 @@ pub fn client_socket_path() -> PathBuf {
 /// [`crate::platform::paths::attach_socket_path`] and
 /// [`crate::platform::paths::legacy_attach_socket_path`].
 pub fn client_attach_socket_path() -> PathBuf {
-    let primary = crate::platform::paths::attach_socket_path();
+    client_attach_endpoint().into_path()
+}
+
+/// [`client_attach_socket_path`] with the [`EndpointSource`] that produced it.
+///
+/// The launcher needs the provenance and a bare path cannot carry it. A
+/// [`EndpointSource::LegacyCompat`] address names a daemon from a pre-#1121
+/// build: it is one this process may talk to and **not** one it may unlink,
+/// lazy-spawn at, or poll for a daemon that will never bind it. See
+/// [`ResolvedEndpoint::is_primary`], which is what
+/// [`crate::daemon_attach::ensure_daemon_running`] refuses on.
+pub fn client_attach_endpoint() -> ResolvedEndpoint {
+    let resolved = crate::platform::paths::resolve_attach_socket_path();
     #[cfg(unix)]
-    let primary = with_legacy_fallback(
-        primary,
-        crate::platform::paths::fallback_attach_socket_path(),
+    let resolved = with_legacy_fallback(
+        resolved,
         crate::platform::paths::legacy_attach_socket_path(),
     );
-    primary
+    resolved
+}
+
+/// The attach endpoint this build **binds**, with no compatibility read at all.
+///
+/// What the launcher falls back to when a legacy daemon it selected has gone
+/// between resolution and use, and what it re-resolves to after a
+/// version-mismatch recovery: in both cases the daemon that is about to exist
+/// binds this address and no other.
+pub fn primary_attach_endpoint() -> ResolvedEndpoint {
+    crate::platform::paths::resolve_attach_socket_path()
+}
+
+/// Is a daemon we are willing to talk to listening at `endpoint` right now?
+/// The public spelling of the probe [`with_legacy_fallback`] resolves with.
+pub fn endpoint_is_answering(endpoint: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        endpoint_answers(endpoint)
+    }
+    #[cfg(windows)]
+    {
+        // A named pipe has no inode to `lstat`; `IpcClient::connect` verifies
+        // the server's owner SID itself, so the connect *is* the trust check.
+        crate::platform::ipc::IpcClient::connect_timeout(endpoint, PROBE_TIMEOUT).is_ok()
+    }
 }
 
 /// The resolution order both client accessors share.
 ///
-/// `primary` is what the pure resolver returned and `fallback` is the fallback
-/// spelling it would have returned had nothing overridden it; they are equal
-/// exactly when we are in the fallback case, which is the only case with a
-/// legacy path to consult. Then: the new path if a daemon answers there,
-/// otherwise the legacy path if one answers there, otherwise the new path —
-/// so a host with no daemon at all lazy-spawns at the new spelling, which is
-/// what makes this a transition rather than a second home.
+/// Only [`EndpointSource::Fallback`] has a legacy spelling to consult; every
+/// other arm returns untouched, without a probe. Then: the new address if a
+/// daemon answers there, otherwise the legacy address if one answers there,
+/// otherwise the new address — so a host with no daemon at all lazy-spawns at
+/// the new spelling, which is what makes this a transition rather than a
+/// second home.
+///
+/// **The arm is read from [`ResolvedEndpoint::source`], not inferred by
+/// comparing the address against the fallback spelling.** That comparison was
+/// round one's shape and it answered `true` for an explicit
+/// `DOT_AGENT_DECK_ATTACH_SOCKET` — or an `$XDG_RUNTIME_DIR` — that happened to
+/// name the same address, which is how an operator who named one daemon could
+/// be handed another.
 #[cfg(unix)]
-fn with_legacy_fallback(primary: PathBuf, fallback: PathBuf, legacy: PathBuf) -> PathBuf {
-    if primary != fallback || endpoint_answers(&primary) {
-        return primary;
+fn with_legacy_fallback(resolved: ResolvedEndpoint, legacy: PathBuf) -> ResolvedEndpoint {
+    if resolved.source() != EndpointSource::Fallback || endpoint_answers(resolved.path()) {
+        return resolved;
     }
     if endpoint_answers(&legacy) {
-        return legacy;
+        return ResolvedEndpoint::new(legacy, EndpointSource::LegacyCompat);
     }
-    primary
+    resolved
 }
 
 /// Is a daemon we are willing to talk to listening at `endpoint` right now?
@@ -166,46 +253,90 @@ fn with_legacy_fallback(primary: PathBuf, fallback: PathBuf, legacy: PathBuf) ->
 /// here without a `connect(2)` being attempted and without the entry being
 /// touched. That is the whole of what makes a squatted legacy path harmless:
 /// it costs one refused probe and we carry on at the new path.
+///
+/// **A trusted endpoint that times out answers `true`** (round two, S3), and
+/// that is not leniency — it is what the errno means here. Per
+/// [`crate::platform::ipc::IpcClient::connect_timeout`]'s own documentation an
+/// `AF_UNIX` connect blocks for exactly one reason: the listener's accept
+/// queue is full. Blowing the budget is therefore positive proof of a **live**
+/// listener, and one we have already trust-checked. Reporting it as absent had
+/// a single, destructive consequence — an older daemon alive at the legacy
+/// address but saturated for longer than [`PROBE_TIMEOUT`], with nothing at the
+/// new one, made both probes answer `false`, so the launcher lazy-spawned a
+/// *second* daemon beside a healthy first and the build-version handshake never
+/// fired, because it runs over a connection that was never made. That is the
+/// silent double-spawn this whole module exists to prevent.
+///
+/// `NotFound`, `ConnectionRefused` and `PermissionDenied` stay `false`: those
+/// are an absent entry, a dead one, and one we may not talk to. The bound is
+/// still worth having — a wedged daemon must not turn resolution into a hang —
+/// and it is not paid in the ordinary cases: an absent endpoint fails the trust
+/// check on `NotFound` before any connect, and a stale inode answers
+/// `ECONNREFUSED` at once.
 #[cfg(unix)]
 fn endpoint_answers(endpoint: &Path) -> bool {
-    crate::platform::fsperm::verify_endpoint_trusted(endpoint).is_ok()
-        && crate::platform::ipc::IpcClient::connect_timeout(endpoint, PROBE_TIMEOUT).is_ok()
+    if crate::platform::fsperm::verify_endpoint_trusted(endpoint).is_err() {
+        return false;
+    }
+    match crate::platform::ipc::IpcClient::connect_timeout(endpoint, PROBE_TIMEOUT) {
+        Ok(_) => true,
+        Err(source) => connect_failure_still_answers(source.kind()),
+    }
+}
+
+/// Does a failed probe connect still prove a live listener?
+///
+/// The pure half of [`endpoint_answers`]'s decision, split out for the reason
+/// [`crate::platform::fsperm`]'s `endpoint_uid_is_trusted` is: the input that
+/// matters — a listener whose accept queue is full for longer than
+/// [`PROBE_TIMEOUT`] — is not something a test process can reliably produce,
+/// while the rule over the error kind is exhaustively testable anywhere.
+#[cfg(unix)]
+fn connect_failure_still_answers(kind: std::io::ErrorKind) -> bool {
+    kind == std::io::ErrorKind::TimedOut
 }
 
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
+    fn fallback(path: &Path) -> ResolvedEndpoint {
+        ResolvedEndpoint::new(path.to_path_buf(), EndpointSource::Fallback)
+    }
+
     /// A live, trusted socket at the primary path is used and the legacy path
     /// is not consulted — the ordinary case on a host that has already been
     /// through one launch on the new build.
     #[test]
     fn a_live_primary_wins_over_a_live_legacy() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = sandbox();
         let primary = dir.path().join("primary.sock");
         let legacy = dir.path().join("legacy.sock");
         let _p = bind_trusted(&primary);
         let _l = bind_trusted(&legacy);
 
-        assert_eq!(
-            with_legacy_fallback(primary.clone(), primary.clone(), legacy),
-            primary
-        );
+        let resolved = with_legacy_fallback(fallback(&primary), legacy);
+        assert_eq!(resolved.path(), primary);
+        assert!(resolved.is_primary());
     }
 
     /// Nothing at the primary and a live daemon at the legacy path: the older
     /// build's daemon is found, which is the entire point of the compatibility
-    /// read.
+    /// read — and the result is marked [`EndpointSource::LegacyCompat`], which
+    /// is what keeps it away from the stale-inode reaper and the lazy spawn.
     #[test]
     fn an_absent_primary_falls_through_to_a_live_legacy() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = sandbox();
         let primary = dir.path().join("primary.sock");
         let legacy = dir.path().join("legacy.sock");
         let _l = bind_trusted(&legacy);
 
-        assert_eq!(
-            with_legacy_fallback(primary.clone(), primary, legacy.clone()),
-            legacy
+        let resolved = with_legacy_fallback(fallback(&primary), legacy.clone());
+        assert_eq!(resolved.path(), legacy);
+        assert_eq!(resolved.source(), EndpointSource::LegacyCompat);
+        assert!(
+            !resolved.is_primary(),
+            "a legacy address must never be handed to a destructive or lazy-spawn path"
         );
     }
 
@@ -214,15 +345,13 @@ mod tests {
     /// new path. The planted entry is left exactly as it was found.
     #[test]
     fn an_untrusted_legacy_entry_is_refused_and_left_alone() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = sandbox();
         let primary = dir.path().join("primary.sock");
         let legacy = dir.path().join("legacy.sock");
         std::fs::write(&legacy, b"squatter").expect("plant a regular file");
 
-        assert_eq!(
-            with_legacy_fallback(primary.clone(), primary.clone(), legacy.clone()),
-            primary
-        );
+        let resolved = with_legacy_fallback(fallback(&primary), legacy.clone());
+        assert_eq!(resolved.path(), primary);
         assert_eq!(
             std::fs::read(&legacy).expect("the planted entry survives"),
             b"squatter"
@@ -230,21 +359,84 @@ mod tests {
     }
 
     /// An override or an `$XDG_RUNTIME_DIR` endpoint never consults the legacy
-    /// path, however live a daemon there is: `primary != fallback` short-
-    /// circuits before any probe.
+    /// path, however live a daemon there is — the arm short-circuits before any
+    /// probe.
     #[test]
     fn a_non_fallback_primary_never_consults_the_legacy_path() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = sandbox();
         let overridden = dir.path().join("overridden.sock");
-        let fallback = dir.path().join("fallback.sock");
         let legacy = dir.path().join("legacy.sock");
         let _l = bind_trusted(&legacy);
 
-        assert_eq!(
-            with_legacy_fallback(overridden.clone(), fallback, legacy),
-            overridden,
-            "an endpoint that is not the fallback one has no older spelling to look for"
+        for source in [EndpointSource::Override, EndpointSource::PlatformDefault] {
+            let resolved = with_legacy_fallback(
+                ResolvedEndpoint::new(overridden.clone(), source),
+                legacy.clone(),
+            );
+            assert_eq!(
+                resolved.path(),
+                overridden,
+                "{source:?} has no older spelling to look for"
+            );
+            assert_eq!(resolved.source(), source);
+        }
+    }
+
+    /// Round two, S7: the arm is read from the provenance, not inferred by
+    /// comparing addresses. An explicit override that happens to spell the very
+    /// same address the fallback would have produced must still be treated as
+    /// an override — under the old equality test this was the one input that
+    /// sent us to a daemon the operator never named.
+    #[test]
+    fn an_override_that_equals_the_fallback_address_is_still_an_override() {
+        let dir = sandbox();
+        let shared = dir.path().join("shared.sock");
+        let legacy = dir.path().join("legacy.sock");
+        let _l = bind_trusted(&legacy);
+
+        let resolved = with_legacy_fallback(
+            ResolvedEndpoint::new(shared.clone(), EndpointSource::Override),
+            legacy,
         );
+        assert_eq!(
+            resolved.path(),
+            shared,
+            "an explicit override must win even when it names the fallback address"
+        );
+    }
+
+    /// Round two, S3: every `connect(2)` failure kind the probe can see, and
+    /// whether it still proves a live listener.
+    ///
+    /// Driven through the pure classifier rather than against a real saturated
+    /// listener, which is this repo's own idiom for a rule whose reachable
+    /// input needs a condition a test process cannot reliably create (compare
+    /// `fsperm::endpoint_uid_is_trusted`). Saturating a Unix accept queue is
+    /// exactly such a condition — measured on this box, a `UnixListener` took
+    /// 1024 pending connections without parking once — and
+    /// `platform::ipc`'s `connect_against_a_saturated_listener_returns_within_the_deadline`
+    /// already pins the other half: that a full queue is what produces
+    /// `TimedOut` here.
+    #[test]
+    fn only_a_timeout_proves_a_live_listener_among_the_connect_failures() {
+        use std::io::ErrorKind;
+
+        assert!(
+            connect_failure_still_answers(ErrorKind::TimedOut),
+            "a full accept queue is proof of a live listener, and reporting it \
+             absent is what made the launcher spawn a second daemon"
+        );
+        for absent in [
+            ErrorKind::NotFound,
+            ErrorKind::ConnectionRefused,
+            ErrorKind::PermissionDenied,
+            ErrorKind::Other,
+        ] {
+            assert!(
+                !connect_failure_still_answers(absent),
+                "{absent:?} is an absent, dead or forbidden endpoint"
+            );
+        }
     }
 
     /// [`ensure_endpoint_dir`] creates nothing for an endpoint outside the
@@ -252,23 +444,35 @@ mod tests {
     /// have been handed an override or a test path.
     #[test]
     fn ensure_endpoint_dir_is_inert_outside_the_fallback_directory() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = sandbox();
         let elsewhere = dir.path().join("nested").join("attach.sock");
-        ensure_endpoint_dir(&elsewhere).expect("a foreign endpoint is a no-op, not an error");
+        ensure_endpoint_dir_in(&elsewhere, &dir.path().join("fallback"))
+            .expect("a foreign endpoint is a no-op, not an error");
         assert!(
             !dir.path().join("nested").exists(),
             "ensure_endpoint_dir must not create a directory it does not own"
+        );
+        assert!(
+            !dir.path().join("fallback").exists(),
+            "and it must not create the fallback directory either"
         );
     }
 
     /// The arm that does act: an endpoint inside the fallback directory gets
     /// that directory created at mode 0o700.
+    ///
+    /// Driven through [`ensure_endpoint_dir_in`] under a `tempfile` root. The
+    /// first cut of this test called the production `fallback_endpoint_dir()`
+    /// and created and chmodded the operator's real
+    /// `<temp dir>/dot-agent-deck-{uid}` — shared state with any live fallback
+    /// daemon on the host (round two, S10).
     #[test]
     fn ensure_endpoint_dir_creates_the_fallback_directory_owner_only() {
         use std::os::unix::fs::PermissionsExt;
 
-        let dir = crate::platform::paths::fallback_endpoint_dir();
-        ensure_endpoint_dir(&crate::platform::paths::fallback_attach_socket_path())
+        let root = sandbox();
+        let dir = root.path().join("dot-agent-deck-4242");
+        ensure_endpoint_dir_in(&dir.join("attach.sock"), &dir)
             .expect("the fallback endpoint directory is ours to create");
         let mode = std::fs::metadata(&dir)
             .expect("the fallback endpoint directory now exists")
@@ -276,6 +480,18 @@ mod tests {
             .mode()
             & 0o777;
         assert_eq!(mode, 0o700, "{} must be owner-only", dir.display());
+    }
+
+    /// A `tempfile::tempdir()` whose mode is restated after creation — see the
+    /// twin helper in [`crate::platform::fsperm`]'s tests for why. This module
+    /// binds sockets inside its temp roots, so a root that came back without a
+    /// search bit fails the bind rather than the assertion.
+    fn sandbox() -> tempfile::TempDir {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().expect("tempdir");
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("chmod the temp root");
+        root
     }
 
     fn bind_trusted(path: &Path) -> std::os::unix::net::UnixListener {
