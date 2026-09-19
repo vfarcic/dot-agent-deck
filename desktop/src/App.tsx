@@ -115,7 +115,7 @@ export default function App() {
  * Owns which top-level surface is mounted. The overview renders *instead of*
  * the deck, so the state belongs above `ControlDeck` rather than as one more
  * boolean inside it — none of the deck's own `useState` booleans is a view, and
- * five of the rail's six buttons are overlay toggles over an always-mounted
+ * five of the rail's seven buttons are overlay toggles over an always-mounted
  * deck. `DeckView` is a discriminated union from the start so PRD #745
  * iteration 3's group and single-agent views arrive as added variants.
  *
