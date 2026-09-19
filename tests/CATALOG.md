@@ -1889,6 +1889,20 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** the Claude, OpenCode or Devin writers (the strip is shared and unit-covered for all four in `agent_hook_config`'s `mod tests`); the trust write, which needs a `codex app-server` the stub does not implement; that a repointed pin would actually have been detected by Codex.
 - **Platform coverage:** linux.
 
+##### hooks/install/007 — A deck run from a SCRATCH COPY of itself pins the install, never the copy (issue #1140).
+- **Layer:** fast real-binary-subprocess integration (the REAL `dot-agent-deck hooks install --agent claude-code` CLI as a subprocess against an isolated `HOME`; no PTY, no daemon, no LLM, no `e2e` feature gate).
+- **Agent:** none (the freshly built binary is the subject, hard-linked — or copied across a device boundary — to a scratch path standing in for the report's `/var/tmp/dad-branch/bin/`; a stub executable at `$HOME/.local/bin/dot-agent-deck` is the install).
+- **Asserts:** run from a path that is outside `target/`, outside `$HOME/.local/bin` and not on the child's (`env_clear`ed) `PATH`, the command succeeds and every deck-owned command in `~/.claude/settings.json` names the seeded install; the scratch directory appears nowhere in the file. This is the **uninjected** `current_exe()` path — the resolver's own tests all inject it, so nothing else in the suite execs a deck that genuinely lives somewhere scratch.
+- **Does not assert:** the Codex, Devin or OpenCode writers (the resolver is shared and unit-covered); the duplication arithmetic in a pre-seeded config (`durable_hook_binary_path.rs`'s install-seam units); that the seeded executable actually runs.
+- **Platform coverage:** mac+linux.
+
+##### hooks/install/008 — The same scratch copy with nothing to fall back to pins ITSELF as a last resort, rather than refusing (issue #1140).
+- **Layer:** as `hooks/install/007`.
+- **Agent:** none (no install seeded).
+- **Asserts:** with no `$HOME/.local/bin/dot-agent-deck` and no deck on the child's `PATH`, the command still succeeds and every deck-owned command in `~/.claude/settings.json` names the running binary. This is the third arm of the resolver's policy and the counterweight to `007`: preferring an install over a scratch copy is #1140's fix, but refusing the scratch copy when there is no install buys no agent hooks at all on a machine whose only deck is that binary — a packaged desktop running its bundled sidecar. A **cargo artifact** still refuses in the same situation, which is what separates "known ephemeral" from "not vouched for" (`hooks/install/005`).
+- **Does not assert:** the `tracing::warn!` the last-resort pin emits (unit-covered in `platform::paths`); the desktop bundle layouts themselves (#1157).
+- **Platform coverage:** mac+linux.
+
 ### Pane / agent lifecycle
 
 #### lifecycle/start
