@@ -42,22 +42,44 @@
 //! Measured with `strace` on the reproduction above: 19,499 `read(0, "", 1024)
 //! = 0` calls in a single 20,000-line window, with no `poll` between them.
 //!
-//! So the deck's event loop is wedged inside library code the moment the
-//! terminal goes away, and no check placed after a `poll`/`read` call can run.
-//! Detection has to happen on **another thread**, which is what this module is.
+//! So the deck's event loop wedges inside library code on the first poll of a
+//! terminal with nothing left to deliver — on an idle deck, immediately. (Not
+//! *instantly* in every case: with bytes still buffered, crossterm parses and
+//! returns those events first, and the wedge is the poll after the buffer
+//! drains. One reproduction in ten ended that way, by a `?` on terminal I/O
+//! that did fail before the loop got there.) Once it has wedged, nothing placed
+//! after a `poll`/`read` call runs, so detection has to happen on **another
+//! thread** — which is what this module is.
 //!
 //! [the mio one]: https://docs.rs/crossterm/0.29.0/src/crossterm/event/source/unix/mio.rs.html
 //!
 //! ## What it does
 //!
-//! One thread blocks in `poll(2)` on the same descriptor crossterm reads, with
-//! an `events` mask of **zero**. That mask is the whole trick: `POLLHUP`,
-//! `POLLERR` and `POLLNVAL` are reported whether or not they were requested,
-//! while `POLLIN` is not — so the watchdog wakes on a hangup and stays asleep
-//! through ordinary typing. It never reads, so it cannot steal a keystroke from
-//! the event loop. Measured on the pseudo-terminal this module's tests build: a
-//! live slave returns `0` (timeout) with `revents == 0`, and one whose master
-//! has closed returns immediately with `POLLERR | POLLHUP`.
+//! One thread blocks in `poll(2)` on the same descriptor crossterm reads, and
+//! classifies a hangup from `POLLHUP | POLLERR | POLLNVAL`. It never reads, so
+//! it cannot steal a keystroke from the event loop.
+//!
+//! **The `events` mask is `POLLIN`, and the reason is a portability bug this
+//! got wrong first.** POSIX says `POLLHUP`, `POLLERR` and `POLLNVAL` are set in
+//! `revents` whether or not they were requested, so an `events` mask of **zero**
+//! looks ideal: it would wake on a hangup and stay asleep through ordinary
+//! typing. On Linux it does exactly that — measured, a live pseudo-terminal
+//! slave returns `0` (timeout) with `revents == 0` and a hung-up one returns at
+//! once with `POLLERR | POLLHUP`. **On macOS it does not.** `build-macos`
+//! measured `Live` against a slave whose master had closed, so with a zero mask
+//! the watchdog would simply never fire there and this would have shipped as a
+//! Linux-only fix — Apple's `poll(2)` is kqueue-backed and famously "does not
+//! support devices" well, and with nothing requested it registers no filter and
+//! so reports no end-of-file. Requesting `POLLIN` makes the hangup observable
+//! on both; it was already the verified-on-Linux spelling, since the original
+//! reproduction of this defect polled with `POLLIN` and read back
+//! `POLLIN | POLLERR | POLLHUP`.
+//!
+//! The cost of that mask is that the probe now also wakes on ordinary unread
+//! input, which would be a spin — the very symptom this module exists to stop —
+//! if the loop went straight back into `poll`. [`iteration_pause`] is the floor
+//! that stops it, and `watch_does_not_spin_on_a_terminal_with_unread_input`
+//! is the regression test.
 //!
 //! The policy on detection lives in [`crate::ui::run_tui`], not here, because
 //! it ends the process and so cannot be unit-tested: set a flag the event loop
@@ -83,7 +105,11 @@ use std::time::Duration;
 ///
 /// This is the watchdog's idle cost and its shutdown latency, nothing else — a
 /// hangup wakes the poll immediately rather than waiting this out.
-const PROBE_INTERVAL: Duration = Duration::from_millis(250);
+///
+/// `pub` alongside the other three, rather than private: [`HangupWatch`]'s
+/// contract is stated in terms of it, and on a non-Unix build nothing reads it,
+/// which a private constant reports as dead code under `-D warnings`.
+pub const PROBE_INTERVAL: Duration = Duration::from_millis(250);
 
 /// How long the watchdog waits for the event loop to **acknowledge** the
 /// hangup before it gives up on it and ends the process.
@@ -107,10 +133,10 @@ pub const UNWIND_GRACE: Duration = Duration::from_secs(2);
 
 /// The status the deck exits with when a hangup ends it.
 ///
-/// 128 + `SIGHUP`, the conventional code for "died of a hangup" — which is
-/// exactly what the shell reports for the *other* shape of this scenario, where
-/// the deck is the session leader and the kernel's SIGHUP ends it. Both shapes
-/// therefore report the same thing.
+/// 128 + `SIGHUP`, the conventional code for "died of a hangup" — and measured
+/// to be what a shell reports for the *other* shape of this scenario, where the
+/// deck is the session leader and the kernel's SIGHUP ends it on the default
+/// disposition. Both shapes therefore report the same thing.
 pub const HANGUP_EXIT_CODE: i32 = 129;
 
 /// What one probe of the terminal found.
@@ -129,10 +155,24 @@ pub enum TtyState {
 /// [`PROBE_INTERVAL`], and making every ordinary quit pay that is a worse trade
 /// than letting a thread with nothing left to do outlive the teardown by a
 /// quarter second. It re-reads the stop flag after the poll returns and before
-/// it would call back, so a hangup racing a clean shutdown does not fire the
-/// callback of a `run_tui` that has already returned.
+/// it would call back, which narrows — but does not close — the window in which
+/// a hangup racing a clean shutdown fires the callback of a `run_tui` that has
+/// already returned. Both outcomes end the process, so what the residual race
+/// costs is the exit status, not the shutdown.
 pub struct HangupWatch {
     stop: Arc<AtomicBool>,
+    probes: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl HangupWatch {
+    /// How many times the watchdog has polled the terminal so far.
+    ///
+    /// Observability, and the only way to assert the thing [`iteration_pause`]
+    /// protects: a watchdog that polls thousands of times a second is spinning,
+    /// whether or not it ever calls back.
+    pub fn probe_count(&self) -> usize {
+        self.probes.load(Ordering::SeqCst)
+    }
 }
 
 impl Drop for HangupWatch {
@@ -159,16 +199,19 @@ pub fn wait_for(flag: &AtomicBool, timeout: Duration) -> bool {
     }
 }
 
-/// Probe `fd` for a hangup, blocking for at most `timeout`.
+/// One `poll(2)` on `fd`, returning its result and the `revents` it produced.
 ///
-/// Non-destructive by construction: the `events` mask is zero, so this consumes
-/// no input and does not even wake on any. See the module docs for why that
-/// matters — the event loop is reading the same descriptor.
+/// Split out from [`probe`] so a failing test can report the numbers the kernel
+/// actually gave it rather than only the classification — which is what a
+/// platform whose `poll` disagrees with this one's assumptions looks like, and
+/// exactly how the macOS behaviour in the module docs was missed the first time.
 #[cfg(unix)]
-pub fn probe(fd: std::os::fd::RawFd, timeout: Duration) -> std::io::Result<TtyState> {
+fn poll_once(fd: std::os::fd::RawFd, timeout: Duration) -> std::io::Result<(i32, libc::c_short)> {
     let mut pollfd = libc::pollfd {
         fd,
-        events: 0,
+        // Not zero — see the module docs. macOS reports no hangup for an
+        // unrequested event on a pseudo-terminal.
+        events: libc::POLLIN,
         revents: 0,
     };
     let millis = i32::try_from(timeout.as_millis()).unwrap_or(i32::MAX);
@@ -178,10 +221,41 @@ pub fn probe(fd: std::os::fd::RawFd, timeout: Duration) -> std::io::Result<TtySt
     if rc < 0 {
         return Err(std::io::Error::last_os_error());
     }
-    if rc > 0 && pollfd.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
-        return Ok(TtyState::HungUp);
+    Ok((rc, pollfd.revents))
+}
+
+/// Whether `revents` from a `poll` that returned `rc` describes a hangup.
+#[cfg(unix)]
+fn classify(rc: i32, revents: libc::c_short) -> TtyState {
+    if rc > 0 && revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
+        TtyState::HungUp
+    } else {
+        TtyState::Live
     }
-    Ok(TtyState::Live)
+}
+
+/// Probe `fd` for a hangup, blocking for at most `timeout`.
+///
+/// Non-destructive: this polls and never reads, so it consumes no input. It
+/// does *wake* on input, which is what [`iteration_pause`] exists to absorb.
+#[cfg(unix)]
+pub fn probe(fd: std::os::fd::RawFd, timeout: Duration) -> std::io::Result<TtyState> {
+    let (rc, revents) = poll_once(fd, timeout)?;
+    Ok(classify(rc, revents))
+}
+
+/// How long a watchdog iteration should pause after a `Live` probe.
+///
+/// With `POLLIN` requested a terminal holding unread input wakes the poll
+/// immediately, so without this floor the loop would spin at full tilt — the
+/// exact symptom issue #1138 is about, reintroduced in the code that fixes it.
+/// A hangup is unaffected: that path calls back and returns rather than pausing.
+///
+/// `pub` for the same reason [`PROBE_INTERVAL`] is: the watchdog loop that calls
+/// it is Unix-only, so a private item here is dead code on a non-Unix build and
+/// `build-windows` lints with `-D warnings`.
+pub fn iteration_pause(elapsed: Duration) -> Duration {
+    PROBE_INTERVAL.saturating_sub(elapsed)
 }
 
 /// The descriptor crossterm's Unix event source reads from.
@@ -233,13 +307,20 @@ where
 {
     let stop = Arc::new(AtomicBool::new(false));
     let thread_stop = Arc::clone(&stop);
+    let probes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let thread_probes = Arc::clone(&probes);
     let spawned = std::thread::Builder::new()
         .name("dad-tty-hangup".to_string())
         .spawn(move || {
             let fd = tty.as_raw_fd();
             while !thread_stop.load(Ordering::SeqCst) {
+                let started = std::time::Instant::now();
+                thread_probes.fetch_add(1, Ordering::SeqCst);
                 match probe(fd, PROBE_INTERVAL) {
-                    Ok(TtyState::Live) => {}
+                    // Including "live with unread input", which the `POLLIN`
+                    // mask wakes on at once. Sleeping out the rest of the
+                    // interval is what keeps that from being a spin.
+                    Ok(TtyState::Live) => std::thread::sleep(iteration_pause(started.elapsed())),
                     Ok(TtyState::HungUp) => {
                         // Re-read the flag: `run_tui` may have returned between
                         // the poll waking and now, in which case there is
@@ -267,7 +348,7 @@ where
     if let Err(e) = spawned {
         tracing::warn!(error = %e, "could not start the terminal hangup watchdog");
     }
-    HangupWatch { stop }
+    HangupWatch { stop, probes }
 }
 
 /// Start the watchdog on the terminal the event loop reads.
@@ -350,14 +431,27 @@ mod tests {
         );
 
         use std::io::Write as _;
-        master.write_all(b"hello").expect("write to the master");
+        // The newline is load-bearing: a pseudo-terminal slave starts in
+        // CANONICAL mode, so bytes written to the master are held by the line
+        // discipline and the slave does not become readable until a line
+        // terminator arrives. Without it this case polls a slave with nothing
+        // to read and proves nothing about readability at all.
+        master.write_all(b"hello\n").expect("write to the master");
         master.flush().expect("flush the master");
+        let (rc, revents) = poll_once(slave.as_raw_fd(), Duration::from_millis(50))
+            .expect("probe a slave with input pending");
         assert_eq!(
-            probe(slave.as_raw_fd(), Duration::from_millis(50))
-                .expect("probe a slave with input pending"),
+            classify(rc, revents),
             TtyState::Live,
-            "pending input is not a hangup — an `events` mask of zero is what \
-             keeps this probe blind to readability"
+            "pending input is not a hangup, and must not be classified as one — \
+             the probe requests POLLIN (see the module docs), so it WAKES on \
+             input and only the error bits may end the deck. \
+             poll rc={rc} revents={revents:#06x} \
+             (POLLIN={:#06x} POLLHUP={:#06x} POLLERR={:#06x} POLLNVAL={:#06x})",
+            libc::POLLIN,
+            libc::POLLHUP,
+            libc::POLLERR,
+            libc::POLLNVAL,
         );
     }
 
@@ -369,9 +463,21 @@ mod tests {
         let (master, slave) = open_pty();
         drop(master);
         let started = std::time::Instant::now();
+        let (rc, revents) =
+            poll_once(slave.as_raw_fd(), Duration::from_secs(5)).expect("probe a hung-up slave");
         assert_eq!(
-            probe(slave.as_raw_fd(), Duration::from_secs(5)).expect("probe a hung-up slave"),
-            TtyState::HungUp
+            classify(rc, revents),
+            TtyState::HungUp,
+            "this platform's `poll` did not report a hangup for a pseudo-terminal \
+             slave whose master has closed, so the watchdog would never fire here \
+             and issue #1138 would be fixed on Linux only. That is not \
+             hypothetical — it is what `build-macos` reported for an `events` \
+             mask of zero. poll rc={rc} revents={revents:#06x} \
+             (POLLIN={:#06x} POLLHUP={:#06x} POLLERR={:#06x} POLLNVAL={:#06x})",
+            libc::POLLIN,
+            libc::POLLHUP,
+            libc::POLLERR,
+            libc::POLLNVAL,
         );
         assert!(
             started.elapsed() < Duration::from_secs(1),
@@ -427,6 +533,62 @@ mod tests {
         assert!(
             wait_for(&flag, Duration::from_secs(10)),
             "a flag set during the wait must be observed"
+        );
+    }
+
+    /// Issue #1138 — a terminal holding unread input must not turn the
+    /// watchdog into a spin. The probe requests `POLLIN`, so such a terminal
+    /// wakes every poll instantly; without [`iteration_pause`] the loop would
+    /// burn a core, which is the symptom this whole module exists to remove.
+    #[test]
+    fn watch_does_not_spin_on_a_terminal_with_unread_input() {
+        use std::io::Write as _;
+
+        let (mut master, slave) = open_pty();
+        // Input that nothing will ever consume: the watchdog never reads, and
+        // there is no event loop here to drain it. The trailing newline is what
+        // makes the slave genuinely READABLE — a pseudo-terminal starts in
+        // canonical mode and holds a partial line, so without it this test
+        // polls an idle terminal and passes whether or not the floor exists.
+        // Measured: it did exactly that before the newline was added.
+        master.write_all(b"unconsumed input\n").expect("write");
+        master.flush().expect("flush");
+
+        let (tx, rx) = mpsc::channel();
+        let watch = spawn_watch(WatchedTty::Owned(slave), move || {
+            let _ = tx.send(());
+        });
+
+        let window = PROBE_INTERVAL * 3;
+        assert!(
+            rx.recv_timeout(window).is_err(),
+            "unread input is not a hangup and must not end the deck"
+        );
+
+        // Generous: the floor allows about one probe per interval, so four over
+        // three intervals is slack for scheduling, while a spin would be in the
+        // hundreds of thousands.
+        let probes = watch.probe_count();
+        assert!(
+            probes <= 4,
+            "the watchdog polled {probes} times in {window:?} — with `POLLIN` \
+             requested, a terminal with unread input wakes every poll at once, \
+             so a missing iteration floor turns this loop into exactly the \
+             100%-of-a-core spin issue #1138 was filed about"
+        );
+    }
+
+    /// Issue #1138 — the iteration floor's arithmetic: a probe that returned
+    /// instantly pauses for the whole interval, one that used the interval up
+    /// pauses for nothing, and an overrun never underflows into a long sleep.
+    #[test]
+    fn iteration_pause_fills_out_the_interval_without_underflowing() {
+        assert_eq!(iteration_pause(Duration::ZERO), PROBE_INTERVAL);
+        assert_eq!(iteration_pause(PROBE_INTERVAL), Duration::ZERO);
+        assert_eq!(iteration_pause(PROBE_INTERVAL * 2), Duration::ZERO);
+        assert_eq!(
+            iteration_pause(PROBE_INTERVAL / 4),
+            PROBE_INTERVAL - PROBE_INTERVAL / 4
         );
     }
 
