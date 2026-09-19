@@ -11,6 +11,7 @@ vi.mock("./TerminalViewport", () => ({
 }));
 
 import { DeckShell } from "../App";
+import { NOTHING_DISPATCHED } from "./VoiceControlPanel";
 
 type VoiceBackend = "claude" | "opencode" | "remote" | "stub";
 
@@ -209,6 +210,15 @@ const DISPATCH = {
   sentence: "Opening the agent overview.",
 };
 
+const OPEN_SETTINGS_DISPATCH = {
+  kind: "dispatch",
+  transcript: "open settings",
+  action: "open_settings",
+  invoke: "openSettings",
+  params: [],
+  sentence: "Opening settings.",
+};
+
 const OUTCOMES: Array<{ name: string; utterance: string; outcome: VoiceOutcome }> = [
   {
     name: "dispatch",
@@ -364,6 +374,63 @@ describe("voice control panel", () => {
 
     expect(within(panel).getByText("Opening the agent overview.")).toBeVisible();
     expect(screen.getByTestId("overview-table-region")).toBeVisible();
+  });
+
+  /**
+   * Scenario: open an agent pane, whose modal fence makes the deck behind it
+   * inert, then open Voice beside that pane. Both the trigger and its dialog
+   * stay outside the inert background while the deck selector remains fenced.
+   */
+  it("keeps the voice surface reachable while an agent pane is open", () => {
+    render(<DeckShell runtime={runtime(resolver(result(DISPATCH)))} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Open Planner agent" }));
+    expect(screen.getByTestId("agent-pane-overlay")).toBeVisible();
+    expect(screen.getByTestId("deck-selector-toggle").closest("[inert]")).not.toBeNull();
+
+    const trigger = screen.getByTestId("voice-trigger");
+    expect(trigger.closest("[inert]")).toBeNull();
+    expect(trigger.closest('[aria-hidden="true"]')).toBeNull();
+    fireEvent.click(trigger);
+
+    const panel = screen.getByTestId("voice-panel");
+    expect(panel.closest("[inert]")).toBeNull();
+    expect(panel.closest('[aria-hidden="true"]')).toBeNull();
+    expect(screen.getByTestId("deck-selector-toggle").closest("[inert]")).not.toBeNull();
+  });
+
+  /**
+   * Scenario: resolve the registry's settings action while the deck is mounted.
+   * The shell-level voice dispatch receives the deck's overlay capability and
+   * opens the same Settings sheet as the deck controls do.
+   */
+  it("opens a deck overlay through the shell voice dispatch", async () => {
+    const resolveVoice = resolver(result(OPEN_SETTINGS_DISPATCH));
+    render(<DeckShell runtime={runtime(resolveVoice)} />);
+
+    const panel = openVoicePanel();
+    await submit(panel, "open settings", resolveVoice);
+
+    expect(await screen.findByTestId("settings-panel")).toBeVisible();
+    expect(within(panel).queryByText(NOTHING_DISPATCHED)).not.toBeInTheDocument();
+  });
+
+  /**
+   * Scenario: attempt that same overlay action from the overview, where the deck
+   * and its overlay state are unmounted. Nothing throws or silently succeeds;
+   * the Voice report explicitly corrects the resolved success sentence.
+   */
+  it("reports an unavailable overlay dispatch from the overview without throwing", async () => {
+    const resolveVoice = resolver(result(OPEN_SETTINGS_DISPATCH));
+    render(<DeckShell runtime={runtime(resolveVoice)} initialView={{ kind: "overview" }} />);
+
+    const panel = openVoicePanel();
+    await submit(panel, "open settings", resolveVoice);
+
+    // This is the surface's existing canonical correction for a dispatch that
+    // resolved successfully but whose host could not run anything.
+    expect(await within(panel).findByText(NOTHING_DISPATCHED)).toBeVisible();
+    expect(screen.queryByTestId("settings-panel")).not.toBeInTheDocument();
   });
 
   /**

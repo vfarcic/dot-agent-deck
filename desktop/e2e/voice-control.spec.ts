@@ -4,7 +4,7 @@ import { expect, test, type Page } from "@playwright/test";
 async function submitVoice(page: Page, utterance: string) {
   const trigger = page.getByRole("button", { name: "Voice", exact: true });
   await expect(trigger, "Voice control trigger is missing from the primary surface").toBeVisible({ timeout: 1_000 });
-  await trigger.click();
+  await trigger.click({ timeout: 1_000 });
   const panel = page.getByRole("dialog", { name: "Voice control" });
   await expect(panel).toBeVisible();
   await panel.getByRole("textbox", { name: "Command" }).fill(utterance);
@@ -42,6 +42,26 @@ test.describe("voice control through the browser fixture", () => {
 
     await expect(panel).toContainText("Opening the agent overview.");
     await expect(page.getByTestId("overview-table-region")).toBeVisible();
+  });
+
+  /**
+   * Scenario: open Planner's agent pane, then reach the peer Voice surface and
+   * ask to close the agent view. The real browser accepts the trigger click,
+   * dispatches close_agent_view, and returns to the deck in both engines.
+   */
+  test("voice stays reachable over an agent pane and closes that view", async ({ page }) => {
+    await page.goto("/?fixture=1&state=connected");
+    await page.getByRole("button", { name: "Open Planner agent" }).click();
+    const pane = page.getByTestId("agent-pane-overlay");
+    await expect(pane).toBeVisible();
+
+    const trigger = page.getByRole("button", { name: "Voice", exact: true });
+    await expect(trigger).toBeVisible();
+    const panel = await submitVoice(page, "close this");
+
+    await expect(panel).toContainText("Closing the agent view.");
+    await expect(pane).toHaveCount(0);
+    await expect(page.getByTestId("agent-tile-planner")).toBeVisible();
   });
 
   /**

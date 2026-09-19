@@ -376,11 +376,17 @@ describe("agent pane identity fence", () => {
   /**
    * Scenario: open Planner's pane from the deck and try to reach the screen
    * behind it. Every control on the base screen — the deck selector above all —
-   * is inert, focus has moved into the pane, and closing gives the screen back
-   * exactly as it was.
-   */
-  it("makes the whole base screen inert while a pane is open, and gives it back on close", () => {
-    const deck = harness();
+   * is inert, while the peer Voice surface remains reachable; focus has moved
+   * into the pane, and closing gives the screen back exactly as it was.
+  */
+  it("makes the base screen inert except for Voice while a pane is open, and gives it back on close", () => {
+    const deck = harness(documentWithFleet(), {
+      resolveVoice: vi.fn(async (utterance: string) => ({
+        outcome: { kind: "no_match", transcript: utterance, sentence: "No matching action." },
+        resolveMs: null,
+        backend: "stub",
+      })),
+    });
     render(<DeckShell runtime={deck.runtime("local")} initialView={{ kind: "deck" }} />);
 
     // The control that makes this a security fix rather than an a11y one: it is
@@ -392,7 +398,10 @@ describe("agent pane identity fence", () => {
     const pane = screen.getByTestId("agent-pane-overlay");
 
     expect(screen.getByTestId("deck-selector-toggle").closest("[inert]")).not.toBeNull();
-    expect(reachableOutside(pane)).toEqual([]);
+    // Voice is a peer dialog, not background. Equality to this one-element set
+    // keeps the containment assertion strict: any other reachable control is a
+    // regression, rather than something an allow-list filter could hide.
+    expect(reachableOutside(pane)).toEqual([screen.getByTestId("voice-trigger")]);
     // And the pane itself is genuinely live, so this is containment rather than
     // a screen that has simply been switched off.
     expect(within(pane).getByRole("button", { name: "Close Planner agent" })).toBeVisible();
