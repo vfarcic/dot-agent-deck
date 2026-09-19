@@ -66,35 +66,41 @@ pub fn home_dir_with_tmp_fallback() -> PathBuf {
     }
 }
 
-/// Rewrite `/` as the platform's own path separator.
+/// Glue the remainder of a `~`-prefixed path onto the home directory, using the
+/// host's own path separator.
 ///
-/// Windows: Win32 accepts `/` as a separator but it is **not** a legal
-/// character in a file name, so rewriting every one of them is lossless. This is
-/// what stops [`crate::config::expand_path`] handing back the mixed-separator
-/// `C:\Users\me/proj` it used to glue together — a string that resolves, but
-/// that is then persisted to `schedules.toml`, shown back to the user and
-/// carried over the protocol as a fire's `working_dir` (issue #1136).
+/// This is issue #1136's first half in one place. The old spelling was a literal
+/// `format!("{home}/{rest}")`: right on Unix, where `/` *is* the separator, and
+/// on Windows it welded a native home directory onto a forward-slash remainder,
+/// so `~/proj` became `C:\Users\me/proj`. That resolves — Win32 accepts `/` —
+/// but it is then persisted to `schedules.toml`, shown back to the user, and
+/// carried over the protocol as a fire's `working_dir`.
 ///
-/// Unix: identity, and deliberately so. `\` is a legal character in a Unix file
-/// name, so there is nothing to normalise and rewriting anything could only
-/// corrupt a real path.
-pub fn normalize_separators(path: String) -> String {
-    if cfg!(windows) {
-        normalize_separators_for(&path, true)
-    } else {
-        path
-    }
+/// The Windows branch is the Unix branch with the separator swapped and nothing
+/// else. `/` inside `rest` is rewritten too, which is lossless because `/` is
+/// never a legal character in a Windows file name; and a `rest` that itself
+/// opens with a separator still yields a doubled one, exactly as it does on
+/// Unix. Deliberately **not** `Path::components`, which would additionally drop
+/// `.` segments and trailing separators — paths this function has always passed
+/// through untouched.
+///
+/// Only the tilde remainder goes through here. A path the user typed with no
+/// `~` is left exactly as typed on both platforms, including a Unix-style
+/// `/work/space` on Windows: rewriting that is not this issue, and several
+/// tests pin it.
+pub fn join_home_and_rest(home: &str, rest: &str) -> String {
+    join_home_and_rest_for(home, rest, cfg!(windows))
 }
 
-/// Pure form of [`normalize_separators`], parameterised on which target's rules
-/// to apply so both branches are exercised on every host — the Windows branch
-/// has no other way to be asserted from Linux CI. Same reason
+/// Pure form of [`join_home_and_rest`], parameterised on which target's rules to
+/// apply so both branches are exercised on every host — the Windows branch has
+/// no other way to be asserted from Linux CI. Same reason
 /// [`is_pipe_name_token`] stays compiled everywhere.
-fn normalize_separators_for(path: &str, windows_rules: bool) -> String {
+fn join_home_and_rest_for(home: &str, rest: &str, windows_rules: bool) -> String {
     if windows_rules {
-        path.replace('/', "\\")
+        format!("{}\\{}", home, rest.replace('/', "\\"))
     } else {
-        path.to_string()
+        format!("{home}/{rest}")
     }
 }
 
@@ -105,8 +111,9 @@ fn normalize_separators_for(path: &str, windows_rules: bool) -> String {
 ///
 /// Windows: `~/` **or** `~\`, since both are path separators there. A Windows
 /// user typing the native `~\proj` previously got no expansion at all — it
-/// missed the `~/` test, then missed the relative-path test, and came back as
-/// `C:\Users\me\~\proj` (issue #1136).
+/// missed the `~/` test, was then judged relative, and so came back joined onto
+/// the home directory as `C:\Users\me\~\proj`, naming a literal `~`
+/// directory (issue #1136).
 ///
 /// A bare `~` is not handled here: it has no remainder to return, and its
 /// expansion is the home directory itself.
@@ -3556,41 +3563,60 @@ mod tests {
         }
     }
 
-    /// Issue #1136, the pure half: the Windows branch of [`normalize_separators`]
-    /// rewrites every `/` and the Unix branch rewrites nothing. Driven through
-    /// the parameterised form so both branches are asserted on every host —
-    /// there is no other way to see the Windows one from Linux CI.
+    /// Issue #1136, the first half: on Windows [`join_home_and_rest`] glues with
+    /// the native separator and rewrites the remainder's forward slashes; on
+    /// Unix it is exactly the `format!("{home}/{rest}")` it replaced. Driven
+    /// through the parameterised form so both branches are asserted on every
+    /// host — there is no other way to see the Windows one from Linux CI.
     #[test]
-    fn normalize_separators_rewrites_only_under_windows_rules() {
-        // The defect's own shape: a native home glued to the rest with `/`.
+    fn join_home_and_rest_uses_the_targets_own_separator() {
+        // The defect's own shape: a native home welded to a `/` remainder.
         assert_eq!(
-            normalize_separators_for(r"C:\Users\me/proj", true),
+            join_home_and_rest_for(r"C:\Users\me", "proj", true),
             r"C:\Users\me\proj"
         );
-        assert_eq!(normalize_separators_for("a/b/c", true), r"a\b\c");
-        // Already native, and the empty string: both are fixed points.
-        assert_eq!(normalize_separators_for(r"C:\a\b", true), r"C:\a\b");
-        assert_eq!(normalize_separators_for("", true), "");
+        assert_eq!(
+            join_home_and_rest_for(r"C:\Users\me", "proj/sub", true),
+            r"C:\Users\me\proj\sub"
+        );
+        // An empty remainder (`~/`) leaves a trailing separator, and a rooted
+        // remainder (`~//foo`) doubles one — both mirroring the Unix branch
+        // rather than quietly diverging from it.
+        assert_eq!(
+            join_home_and_rest_for(r"C:\Users\me", "", true),
+            "C:\\Users\\me\\"
+        );
+        assert_eq!(
+            join_home_and_rest_for(r"C:\Users\me", "/foo", true),
+            r"C:\Users\me\\foo"
+        );
+        assert_eq!(join_home_and_rest_for("/home/me", "", false), "/home/me/");
+        assert_eq!(
+            join_home_and_rest_for("/home/me", "/foo", false),
+            "/home/me//foo"
+        );
 
-        // Unix rules rewrite nothing at all — `\` is a legal character in a
-        // Unix file name, so a path holding one must survive untouched.
-        for path in [r"C:\Users\me/proj", "a/b/c", r"/home/me/odd\name", ""] {
-            assert_eq!(
-                normalize_separators_for(path, false),
-                path,
-                "the Unix branch must be the identity"
-            );
-        }
+        // Unix rules rewrite nothing: `\` is a legal character in a Unix file
+        // name, so a remainder holding one must survive verbatim.
+        assert_eq!(
+            join_home_and_rest_for("/home/me", "proj/sub", false),
+            "/home/me/proj/sub"
+        );
+        assert_eq!(
+            join_home_and_rest_for("/home/me", r"odd\name", false),
+            r"/home/me/odd\name"
+        );
     }
 
     /// The public wrapper dispatches on the host, so its output is the
     /// parameterised form's for this target and nothing else.
     #[test]
-    fn normalize_separators_dispatches_on_the_host() {
-        let sample = r"C:\Users\me/proj".to_string();
+    fn join_home_and_rest_dispatches_on_the_host() {
+        let home = home_dir();
+        let home = home.to_string_lossy();
         assert_eq!(
-            normalize_separators(sample.clone()),
-            normalize_separators_for(&sample, cfg!(windows))
+            join_home_and_rest(&home, "proj/sub"),
+            join_home_and_rest_for(&home, "proj/sub", cfg!(windows))
         );
     }
 
