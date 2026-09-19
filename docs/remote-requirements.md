@@ -5,7 +5,7 @@ title: Remote Environment Requirements
 
 # Remote Environment Requirements
 
-What a host must provide for a `dot-agent-deck` **remote environment** — a per-project, long-running host that runs the deck daemon and owns the project's agents. This is not a provisioning guide and not a daily-use guide; it lists the prerequisites a host must satisfy before the deck can register it as a remote. Everything below is written for Linux, which is the only host validated end to end; `remote add` also installs onto macOS, and [macOS as a remote host](#macos-as-a-remote-host) sets out what is and is not known about that.
+What a host must provide for a `dot-agent-deck` **remote environment** — a per-project, long-running host that runs the deck daemon and owns the project's agents. This is not a provisioning guide and not a daily-use guide; it lists the prerequisites a host must satisfy before the deck can register it as a remote. Throughout, the **host** is that machine and **your laptop** is whatever machine you connect *from* — a split of roles rather than of hardware, since a host may itself be a laptop. Everything below is written for Linux, which is the only host validated end to end; `remote add` also installs onto macOS, and [macOS as a remote host](#macos-as-a-remote-host) sets out what is and is not known about that.
 
 For lifecycle, failure modes, and how connecting works see [Remote Environments](remote-environments.md). For provisioning recipes see [Remote Recipes](remote-recipes.md).
 
@@ -13,7 +13,7 @@ For lifecycle, failure modes, and how connecting works see [Remote Environments]
 
 ## How this page is organized
 
-Requirements are split into two sections. **Required** is the strict minimum for the daemon to launch and an agent to run on a remote at all — confirmed empirically on a fresh Linux VM. **Recommended for persistent and safe use** is what hardens the install and delivers the deck's reason for existing as a remote: persistence across laptop sleep, network drops, and reboots. Without the recommended setup, the daemon will still start, but agents will not survive your laptop disconnecting — which defeats the whole point of running the deck remotely.
+Requirements are split into two sections. **Required** is the strict minimum for the daemon to launch and an agent to run on a remote at all — confirmed empirically on a fresh Linux VM. **Recommended for persistent and safe use** is what hardens the install and delivers the deck's reason for existing as a remote: agents that keep running while your own machine sleeps or loses the network, and that come back after the *host* reboots. Without the recommended setup, the daemon will still start, but agents will not survive you disconnecting — which defeats the whole point of running the deck remotely.
 
 > **Warning — do not stop at Required.** A host that satisfies only the Required section will function, but it runs the daemon as root, accepts default SSH configuration, and places the daemon socket in `/tmp` — none of which are safe defaults on a multi-user host or anything resembling production. Anyone running beyond a personal sandbox should follow the Recommended section.
 

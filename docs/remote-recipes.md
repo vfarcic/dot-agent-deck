@@ -28,7 +28,7 @@ Whatever you do below converges on the same end state:
 
 ## Getting a machine
 
-- **One you already have.** A homelab server, a Raspberry Pi 5, an old laptop, a spare Mac. Nothing to provision — go straight to the bootstrap below.
+- **One you already have.** A homelab server, a Raspberry Pi 5, a spare Mac, an old laptop left plugged in. Nothing to provision — go straight to the bootstrap below. (Elsewhere "your laptop" means the machine you connect *from*; here it is the host.)
 - **A local VM**, for isolation without a cloud account:
 
   ```bash
