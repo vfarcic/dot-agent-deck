@@ -1778,6 +1778,85 @@ async fn desktop_voice_cancel(
     Ok(voice_status(&voice_state.session))
 }
 
+/// The longest utterance this build will resolve, in bytes.
+///
+/// A transcript from the microphone is already bounded — `voice::MAX_UTTERANCE`
+/// caps the audio at 30 seconds — but a typed one is whatever reached the IPC
+/// boundary, and this command trusts that boundary no more than
+/// [`validate_agent_id`] does: an utterance becomes part of a model prompt and,
+/// for the agent-CLI backend, an argument to a child process. 2 KiB is far past
+/// any spoken command — thirty seconds of speech is around 700 characters —
+/// while making a payload-shaped value impossible.
+const MAX_UTTERANCE_BYTES: usize = 2 * 1024;
+
+/// PRD #802 M6: take one utterance to an outcome carrying the sentence to show.
+///
+/// # What it does NOT do
+///
+/// It runs nothing. A [`voice::VoiceOutcome::Dispatch`] names an entry in the
+/// frontend action registry (`desktop/src/lib/voiceActions.ts`) and the webview
+/// dispatches it where a click dispatches one — so this command's whole output
+/// is a classified situation plus the sentence for it, and every refusal is one
+/// of those situations rather than an `Err`. The `Err`s below are the two things
+/// that are not situations: a call that came from somewhere it must not, and an
+/// utterance the boundary refuses to carry.
+///
+/// # The screen is a parameter and the agents are not
+///
+/// An utterance is resolved against the live state the app already holds, and
+/// each piece of that state is read where it already lives. The agent list is
+/// read HERE, from the selected deck's own snapshot, because that is where it
+/// lives and a list arriving from the webview would be a second answer to "what
+/// agents are there" with nothing keeping the two in step. The mounted screen
+/// cannot be read here at all — it is React state — so it is the one piece the
+/// webview states, which is what `DeckBridge.declareVoiceScreen` is.
+///
+/// # One `ListAgents` per utterance
+///
+/// [`get_snapshot`] fetches rather than reading a cache, which is one daemon
+/// round trip per voice command. That is deliberate and it is cheap next to what
+/// follows it: the intent backends measured 0.62 s (keyed) to 6.30 s (agent CLI)
+/// for the call this snapshot is gathered for, and resolving "open the tester"
+/// against a list from a minute ago is how a spoken name resolves to an agent
+/// that has since exited.
+///
+/// The SELECTED deck's agents, not the fleet's. Every other single-deck command
+/// reads the same snapshot, `open_agent` dispatches a pane whose terminal is the
+/// selected deck's, and a fleet-wide list would let a spoken name resolve to an
+/// agent on a machine the user is not looking at.
+#[tauri::command]
+async fn desktop_voice_resolve(
+    webview: Webview,
+    state: State<'_, DesktopState>,
+    utterance: String,
+    screen: voice::Screen,
+) -> Result<voice::VoiceResult, String> {
+    ensure_main_webview(&webview)?;
+    if utterance.len() > MAX_UTTERANCE_BYTES {
+        return Err(format!(
+            "that command is too long to send — {MAX_UTTERANCE_BYTES} bytes at most"
+        ));
+    }
+    // Read per call rather than cached, for `voice_transcription_backend`'s
+    // reason: a user who changes the backend uses it on the next utterance
+    // instead of after a restart.
+    let backend = crate::settings::load_snapshot()
+        .settings
+        .voice
+        .unwrap_or_default()
+        .intent;
+    let resolver = voice::resolver_for(backend, Arc::new(KeychainSecretStore::new()));
+    let snapshot = get_snapshot(&state.daemon).await;
+    Ok(voice::handle_utterance(
+        resolver.as_ref(),
+        voice::table(),
+        screen,
+        &snapshot.agents,
+        voice::Transcript::new(utterance),
+    )
+    .await)
+}
+
 /// Put a saved document's deck selection into force (PRD #741 M7, completed at
 /// M9).
 ///
@@ -2508,6 +2587,7 @@ pub fn run() {
             desktop_voice_stop,
             desktop_voice_status,
             desktop_voice_cancel,
+            desktop_voice_resolve,
         ])
         .build(tauri::generate_context!())
         .expect("failed to build dot-agent-deck desktop application");

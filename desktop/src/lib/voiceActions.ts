@@ -232,3 +232,71 @@ export const VOICE_ACTIONS = {
 
 /** Every action id, as the guard and the command table spell them. */
 export type VoiceActionId = keyof typeof VOICE_ACTIONS;
+
+/**
+ * Everything a voice dispatch can hand an action, in one object.
+ *
+ * ONE shape rather than a per-action argument builder, because a per-action
+ * builder is a second list of the ids — and the acceptance criterion this whole
+ * design exists for is that voice-enabling a capability is a ONE-FILE change to
+ * `commands.toml`. An entry reads the members it declares and ignores the rest,
+ * which is the same latitude every `Pick<VoiceActionContext, …>` above already
+ * takes with the context.
+ *
+ * It is `AgentViewTarget` because that is the widest target any entry takes;
+ * `AgentTarget`'s single member is a subset of it.
+ */
+export type VoiceDispatchTarget = AgentViewTarget;
+
+/**
+ * What a host offers a voice dispatch: `navigate` and `closeAgentView`, which
+ * between them serve every `voice: true` entry today, plus whatever else that
+ * host happens to have.
+ *
+ * # The absent members are a real residual, and rule 13 does NOT bound it
+ *
+ * The guard proves an `invoke` names an entry and that the entry is classified.
+ * It says nothing about whether the HOST can serve the context that entry's `run`
+ * reads — those are different questions, and the second one has no check at all.
+ * A row naming an entry that needs `openOverlay` would pass rule 13 and throw at
+ * the call, because the overlay booleans live in `DeckSurface` and the voice
+ * dispatch is built one level up in `DeckShell`, which is the only component
+ * mounted for every screen.
+ *
+ * **This is the shape of PRD #802 M8's next step and is worth knowing before it
+ * is taken.** `openSettings` carries a `no_voice` reason reading "reserved for
+ * PRD #802 M8" — and its `run` takes `openOverlay`. Giving it a row is a one-file
+ * change that type-checks and then fails at runtime. What it needs first is for
+ * `DeckSurface` to publish its own context upward, so the shell can merge the
+ * deck's members in while the deck is mounted; M6 deliberately did not build that
+ * on speculation, and M8 should not discover it by watching a command throw.
+ */
+export type VoiceDispatchContext = Pick<VoiceActionContext, "navigate" | "closeAgentView"> & Partial<VoiceActionContext>;
+
+/**
+ * Dispatch the action an outcome's `invoke` names (PRD #802 M6).
+ *
+ * **This is voice's whole execution path, and it runs no action of its own.** It
+ * looks `invoke` up in {@link VOICE_ACTIONS} and calls the same `run` the rail
+ * button and the palette item call — which is what makes the pipeline's step 5,
+ * *"hand the resolved action to the existing handler"*, literally true rather
+ * than a description of two implementations that agree.
+ *
+ * Returns `false` for an `invoke` naming no entry. That should be unreachable —
+ * `xtask/linkage-check` rule 13 fails the build on an `invoke` that resolves to
+ * nothing, and the Rust pipeline refuses an action outside the table before it
+ * ever gets here — so the boolean is not a second validation. It is what stops
+ * the residual being *silence*: the surface can say the command did not run,
+ * instead of reporting a success nothing performed.
+ *
+ * The cast is the price of a dynamic key over entries with deliberately
+ * different signatures, and it is confined to this one line rather than spread
+ * across a switch with an arm per id. A switch would type-check and would also
+ * be the second list of ids this design refuses to have.
+ */
+export function dispatchVoiceAction(invoke: string, context: VoiceDispatchContext, target: VoiceDispatchTarget): boolean {
+  const entry: VoiceActionEntry | undefined = (VOICE_ACTIONS as Record<string, VoiceActionEntry>)[invoke];
+  if (!entry) return false;
+  (entry.run as (...args: unknown[]) => void)(context, target);
+  return true;
+}

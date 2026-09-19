@@ -40,6 +40,7 @@ import { DeckSelector } from "./components/DeckSelector";
 import { HandoffRail } from "./components/HandoffRail";
 import { ProfilesPanel, ProjectsPanel, PromptLibraryPanel, WorkflowPanel } from "./components/ConfigurationPanels";
 import { SettingsSheet } from "./components/SettingsSheet";
+import { VoiceControlPanel } from "./components/VoiceControlPanel";
 import { SettingsBridgeProvider } from "./lib/settingsBridge";
 import { DISPLAY_LIMITS, deckName, displayText } from "./lib/displayText";
 import { useAgentProfiles } from "./hooks/useAgentProfiles";
@@ -51,10 +52,11 @@ import { useInertBackground } from "./hooks/useInertBackground";
 import { useShownTerminals } from "./hooks/useShownTerminals";
 import { useZoom } from "./hooks/useZoom";
 import { agentKey } from "./lib/agentKey";
-import { VOICE_ACTIONS, type DeckOverlay, type VoiceActionContext } from "./lib/voiceActions";
+import { VOICE_ACTIONS, dispatchVoiceAction, type DeckOverlay, type VoiceActionContext, type VoiceDispatchContext, type VoiceDispatchTarget } from "./lib/voiceActions";
 import { unreachableDeckTerminalState } from "./lib/terminalInput";
 import { applyAppearance } from "./lib/appearance";
 import { desktopWorkflowPlatformIssue } from "./lib/platform";
+import type { VoiceOutcomeDto } from "./lib/bridge";
 import type { AgentSession, DeckAction, DeckRuntimeState, DeckSnapshot, DeckView, EvidenceItem, PanelTab, WorkflowLaunchConfig } from "./types";
 import { modeScopedKey } from "./lib/bridge";
 
@@ -370,8 +372,62 @@ export function DeckShell({ runtime, workflowPlatformIssue, initialView = { kind
   useEffect(() => {
     if (paneAgentRetired) closeAgent();
   }, [paneAgentRetired, closeAgent]);
-  if (base === "overview") {
-    return (
+  /**
+   * PRD #802 M6 — run one resolved voice command, and answer with how to undo it.
+   *
+   * # It dispatches through the registry, and that is the design's central rule
+   *
+   * `dispatchVoiceAction` looks the outcome's `invoke` up in `VOICE_ACTIONS` and
+   * calls the same `run` the rail button and the palette item call, so the
+   * pipeline's step 5 — *hand the resolved action to the existing handler* — is
+   * literally true. Voice gets no execution path of its own, and there is no
+   * `switch` over action ids here: a switch would be a second list of the ids and
+   * would break the one-file promise, which is that voice-enabling a capability
+   * is a row in `commands.toml` and nothing else.
+   *
+   * # The context is two members, and the absent ones are not an oversight
+   *
+   * `navigate` and `closeAgentView` are what this app's four spoken commands
+   * need, and they are the two the SHELL owns. The overlay togglers, the tile
+   * selection and the fixture stepper belong to `DeckSurface`, which is unmounted
+   * while the overview is up — so a shell-level dispatch cannot offer them
+   * honestly, and every row that would want one carries a written `no_voice`
+   * reason instead.
+   *
+   * # The undo is a view, captured before the command runs
+   *
+   * Every spoken command in this slice is a navigation, so *undo* means "put the
+   * screen back". The destination is read off `view` at dispatch time rather than
+   * popped from a stack, which is the same choice `closeAgent` makes one screen
+   * up, and for the same reason: there is no history to be wrong about.
+   */
+  const dispatchVoice = useCallback((outcome: Extract<VoiceOutcomeDto, { kind: "dispatch" }>) => {
+    const previous = view;
+    /*
+      One target for every entry, built from the outcome's own resolved params —
+      an entry reads the members it declared and ignores the rest. The agent id
+      is the `value` Rust resolved against live state, never the `spoken` word.
+
+      `deckId` falls back to the empty string only where the selected deck has no
+      identity, which is a state no dispatch can reach: an unidentified deck is a
+      deck that answered no `ListAgents`, so it reported no agents, so an
+      `agent_ref` param resolved to nothing and the outcome was `param_unresolved`
+      rather than this.
+    */
+    const target: VoiceDispatchTarget = {
+      deckId: selectedDeckId ?? "",
+      agentId: outcome.params.find((param) => param.kind === "agent_ref")?.value ?? "",
+      from: base === "overview" ? "overview" : "deck",
+    };
+    const context: VoiceDispatchContext = { navigate: setView, closeAgentView: closeAgent };
+    if (!dispatchVoiceAction(outcome.invoke, context, target)) return undefined;
+    return { undo: () => setView(previous) };
+  }, [base, closeAgent, selectedDeckId, view]);
+  /* The COMPOSITE identity, never the bare id. See `deckPaneRetargeted` above
+     and `DeckSurface`'s own promotion condition. */
+  const openAgent = agentView ? { deckId: agentView.deckId, agentId: agentView.agentId } : undefined;
+  const screenNode = base === "overview"
+    ? (
       <>
         <AgentOverview runtime={runtime} settings={settings} onNavigate={setView} />
         {/*
@@ -383,12 +439,33 @@ export function DeckShell({ runtime, workflowPlatformIssue, initialView = { kind
         */}
         {agentView && paneDeck && paneAgent && <OverviewAgentPane runtime={runtime} view={agentView} deck={paneDeck} agent={paneAgent} attached={paneDeckAttachable} onClose={closeAgentView} />}
       </>
-    );
-  }
-  /* The COMPOSITE identity, never the bare id. See `deckPaneRetargeted` above
-     and `DeckSurface`'s own promotion condition. */
-  const openAgent = agentView ? { deckId: agentView.deckId, agentId: agentView.agentId } : undefined;
-  return <DeckSurface runtime={runtime} settings={settings} workflowPlatformIssue={workflowPlatformIssue} onNavigate={setView} openAgent={openAgent} onCloseAgent={closeAgent} />;
+    )
+    : <DeckSurface runtime={runtime} settings={settings} workflowPlatformIssue={workflowPlatformIssue} onNavigate={setView} openAgent={openAgent} onCloseAgent={closeAgent} />;
+  /*
+    PRD #802 M6 — the voice surface is a SIBLING of the screen switch, and this
+    shape is the whole of that decision.
+
+    The two screens replace one another: the deck is unmounted while the overview
+    is up, which is how the zoom keys came to be dead on the overview (see
+    `settings` above). A voice report describes a navigation that has just
+    happened and the Undo beside it reverses one, so a panel mounted inside
+    either screen would be torn down by the very command it was reporting — the
+    sentence and the Undo would go with it, and `open_overview` would be the one
+    command whose report nobody ever sees.
+
+    The two children are POSITIONAL, which is what makes the panel survive: React
+    reconciles by position, so the screen at index 0 may change type freely while
+    index 1 keeps the same fiber and therefore the same panel state. This
+    deliberately returns one fragment on both paths rather than the screen alone
+    on one of them, because a fragment on one path and a `DeckSurface` on the
+    other is a different root type and would remount everything under it.
+  */
+  return (
+    <>
+      {screenNode}
+      <VoiceControlPanel runtime={runtime} screen={view.kind} onDispatch={dispatchVoice} />
+    </>
+  );
 }
 
 /**

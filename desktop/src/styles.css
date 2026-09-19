@@ -1269,3 +1269,35 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
    hover here rather than the row's background, because a failed row's red
    background already wins over `.overview-row:hover` and would show nothing. */
 .overview-row.is-openable { cursor: pointer; }
+
+/* PRD #802 M6 — the voice surface.
+
+   The trigger is a fixed control rather than a rail button, because it is the
+   one control both screens have to carry and the rail is rendered twice: once
+   in `App.tsx` and once in `AgentOverview.tsx`. Fixed beside the rail's right
+   edge and at the bottom, which is clear of the toast's own bottom-right corner
+   (z-index 120) and of the topbar's action group. Below `.dialog-backdrop`
+   (100), because its own dialog belongs on top of it. */
+.voice-trigger { position: fixed; z-index: 90; left: calc(var(--rail-width) + 16px); bottom: 16px; min-height: 34px; padding: 0 12px; display: inline-flex; align-items: center; gap: 6px; border: 1px solid var(--teal-deep); border-radius: 18px; color: var(--on-accent); background: var(--teal); box-shadow: 0 6px 18px rgb(var(--scrim-rgb) / .18); cursor: pointer; font-size: 11px; font-weight: 650; }
+.voice-trigger:hover { background: var(--teal-deep); }
+.voice-panel { width: min(520px, 100%); padding: 15px; display: flex; flex-direction: column; gap: 11px; border: 1px solid var(--line-strong); border-radius: 7px; background: var(--paper-strong); box-shadow: 0 18px 50px rgb(var(--scrim-rgb) / .22); }
+.voice-head { display: flex; align-items: center; justify-content: space-between; }
+.voice-head h2 { margin: 0; font-size: 14px; }
+.voice-entry { display: flex; flex-direction: column; gap: 6px; }
+.voice-entry > label { color: var(--muted); font-size: 8px; font-weight: 650; letter-spacing: .08em; text-transform: uppercase; }
+.voice-entry > input { min-height: 34px; padding: 0 9px; border: 1px solid var(--line-strong); border-radius: 4px; background: var(--paper); color: var(--ink); font-size: 11px; }
+.voice-entry-actions { display: flex; flex-wrap: wrap; gap: 7px; }
+.voice-note { margin: 0; color: var(--muted); font-size: 9px; line-height: 1.5; }
+.voice-listening { display: flex; align-items: center; gap: 7px; color: var(--teal-wash-ink); font-size: 9px; }
+/* No animation: this is a state read, and a pulse that kept painting while the
+   window was in the background would be the one thing on this screen doing so. */
+.voice-pulse { width: 8px; height: 8px; border-radius: 50%; background: var(--red); }
+.voice-capped { padding: 9px; display: flex; flex-direction: column; gap: 7px; border: 1px solid var(--amber-rim); border-radius: 4px; color: var(--amber-ink); background: var(--amber-bright); font-size: 9px; }
+.voice-capped p { margin: 0; }
+.voice-capped > div { display: flex; flex-wrap: wrap; gap: 7px; }
+.voice-report { display: flex; flex-direction: column; gap: 7px; }
+/* One sentence, one element, nothing else inside it: the transcript embedded in
+   it has to reach the DOM exactly as Rust rendered it. */
+.voice-sentence { margin: 0; color: var(--ink); font-size: 11px; line-height: 1.5; }
+.voice-outcome-foot { display: flex; align-items: center; justify-content: space-between; gap: 7px; }
+.voice-cost { color: var(--faint); font-size: 8px; }
