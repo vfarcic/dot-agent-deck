@@ -241,26 +241,19 @@ fn init_remote_with_orch_toml(remote: &Path, orch_toml: Option<&str>) {
             .expect("write fixture .dot-agent-deck.toml");
     }
     run_git(remote, &["add", "-A"]);
-    run_git(
-        remote,
-        &[
-            "-c",
-            "user.email=test@example.com",
-            "-c",
-            "user.name=Test",
-            "-c",
-            "commit.gpgsign=false",
-            "commit",
-            "-q",
-            "-m",
-            "init",
-        ],
-    );
+    run_git(remote, &["commit", "-q", "-m", "init"]);
 }
 
+/// Through `common::fixture_git`, so the ambient git LOCATION variables are
+/// cleared: a bare `git` with only `.current_dir` resolves an ambient `GIT_DIR`
+/// in preference to it, which makes `init`/`add`/`commit` here writes against
+/// whatever that names (issue #834). It also supplies the commit identity by
+/// environment and neutralizes the host's config, which is what replaced the
+/// `-c user.email=… -c user.name=… -c commit.gpgsign=false` this file used to
+/// thread through the one `commit`. `dir` is its own sandbox root — every
+/// caller passes a repository root.
 fn run_git(dir: &Path, args: &[&str]) {
-    let status = std::process::Command::new("git")
-        .current_dir(dir)
+    let status = common::fixture_git(dir, dir)
         .args(args)
         .status()
         .expect("run git");
@@ -351,9 +344,7 @@ fn count_orchestrators(daemon: &common::DaemonProc) -> usize {
 
 /// Whether the clone's `git worktree list` still references `worktree`.
 fn git_worktree_listed(clone: &Path, worktree: &Path) -> bool {
-    let out = std::process::Command::new("git")
-        .arg("-C")
-        .arg(clone)
+    let out = common::fixture_git(clone, clone)
         .args(["worktree", "list", "--porcelain"])
         .output();
     match out {
@@ -368,9 +359,7 @@ fn git_worktree_listed(clone: &Path, worktree: &Path) -> bool {
 
 /// Whether the clone has a local branch named `branch`.
 fn git_branch_exists(clone: &Path, branch: &str) -> bool {
-    let out = std::process::Command::new("git")
-        .arg("-C")
-        .arg(clone)
+    let out = common::fixture_git(clone, clone)
         .args(["branch", "--list", branch])
         .output();
     matches!(out, Ok(o) if !String::from_utf8_lossy(&o.stdout).trim().is_empty())

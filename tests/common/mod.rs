@@ -663,6 +663,84 @@ pub struct TerminalCursorSnapshot {
     pub cell: Option<GridCellStyle>,
 }
 
+// ---------------------------------------------------------------------------
+// Fixture `git` (issue #834, extended to `tests/` by issue #1121)
+// ---------------------------------------------------------------------------
+
+/// Ambient git LOCATION variables, cleared so a fixture command's repository is
+/// the one at its cwd and nothing else. Mirrors `AMBIENT_LOCATION_VARS` in
+/// `src/worktree_owner.rs` and `xtask/linkage-check/src/repo_state.rs`.
+pub const AMBIENT_LOCATION_VARS: [&str; 8] = [
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_COMMON_DIR",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_NAMESPACE",
+    "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+];
+
+/// `git`, to be run from inside `dir`, with the ambient git environment
+/// switched off in both of the groups `xtask/linkage-check`'s `Sandbox`
+/// documents — so no fixture command can read or WRITE any repository outside
+/// `sandbox_root`, including the checkout the suite is running in.
+///
+/// The `tests/` twin of `src/worktree_owner.rs`'s `fixture_git`, which those
+/// two modules cannot share: that one is `#[cfg(test)] pub(crate)`, so it does
+/// not exist in the library an integration test links against.
+///
+/// Two halves, and a fixture needs both.
+///
+/// *Location* is issue #834's: git resolves a repository from `GIT_DIR` and
+/// friends in preference to the process cwd, so a bare `git` with only
+/// `.current_dir(dir)` is a read or a WRITE against whatever those name. A
+/// parent that sets one is routine rather than exotic — mid-`rebase --exec`,
+/// a pre-commit hook, `bisect run` — and under `cargo test` the repository it
+/// names can be the checkout the suite is running in. `GIT_CEILING_DIRECTORIES`
+/// then bounds the upward walk at `sandbox_root`, so a fixture whose own temp
+/// root happens to sit inside a repository still cannot discover its way out.
+///
+/// That ceiling constrains what `sandbox_root` may be, and not in the obvious
+/// way — measured rather than read off the manual: a ceiling equal to the cwd
+/// still permits discovery *at* that directory (`git rev-parse --git-dir`
+/// answers `.git`), because the ceiling is consulted only while ascending.
+/// From a SUBdirectory of that same ceiling it is fatal — `not a git
+/// repository`. So `sandbox_root` must be at or above the repository root
+/// `dir` resolves to; passing `dir` itself is correct exactly when `dir` IS
+/// that root, which is what every call site here does.
+///
+/// *Configuration* keeps a developer's `~/.gitconfig` — an `includeIf`, an
+/// `init.templateDir` hook, `commit.gpgsign` — out of a fixture, and supplies
+/// the commit identity by environment instead. That second part is not a
+/// nicety: with no identity in the environment and none in the fixture repo, a
+/// `git commit` fails outright on a host that has no global one, which is every
+/// CI runner and is not a developer box. Supplying it here rather than with a
+/// per-repo `git config` also means a fixture never WRITES to a repository just
+/// to configure one.
+pub fn fixture_git(dir: &Path, sandbox_root: &Path) -> std::process::Command {
+    // The one bare constructor under `tests/`, because it is the thing every
+    // other call site is required to go through.
+    let mut cmd = std::process::Command::new("git"); // linkage-check:allow-bare-git
+    cmd.current_dir(dir);
+    for var in AMBIENT_LOCATION_VARS {
+        cmd.env_remove(var);
+    }
+    let absent = sandbox_root.join("no-such-gitconfig");
+    cmd.env("GIT_CONFIG_GLOBAL", &absent)
+        .env("GIT_CONFIG_SYSTEM", &absent)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("HOME", sandbox_root)
+        .env("XDG_CONFIG_HOME", sandbox_root)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_AUTHOR_NAME", "T")
+        .env("GIT_AUTHOR_EMAIL", "t@t.t")
+        .env("GIT_COMMITTER_NAME", "T")
+        .env("GIT_COMMITTER_EMAIL", "t@t.t")
+        .env("GIT_CEILING_DIRECTORIES", sandbox_root);
+    cmd
+}
+
 impl TuiDeck {
     /// One-line convenience: build a default deck and launch it.
     pub fn launch_with_fixture(fixture_name: &str) -> Self {
@@ -748,10 +826,14 @@ impl TuiDeck {
         // (some deck paths probe `.git`).
         let fixture_src = locate_fixture(fixture_name);
         copy_dir_recursively(&fixture_src, &work).expect("copy fixture into tempdir");
-        let _ = std::process::Command::new("git")
+        // `git init` is a WRITE, and a bare `git` obeys an ambient `GIT_DIR`
+        // ahead of `.current_dir` — so without this neutralization the harness
+        // re-inits whatever repository that variable names. `work` is both the
+        // fixture repo and its own sandbox root here: nothing above it belongs
+        // to this test.
+        let _ = fixture_git(&work, &work)
             .arg("init")
             .arg("--quiet")
-            .current_dir(&work)
             .status();
 
         let home = work.join("home");

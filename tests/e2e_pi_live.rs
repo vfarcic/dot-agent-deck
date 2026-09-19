@@ -448,10 +448,9 @@ fn pi_live_002_native_seeded_orchestration_delegates_live() {
         .to_string();
     // Some agent paths probe `.git`; a git repo makes the cwd look like a real
     // project. Best-effort — the orchestration does not depend on it.
-    let _ = std::process::Command::new("git")
+    let _ = common::fixture_git(&project_dir, &project_dir)
         .arg("init")
         .arg("--quiet")
-        .current_dir(&project_dir)
         .status();
 
     // The idle role commands — NO CLI-arg prompt on the orchestrator (the whole

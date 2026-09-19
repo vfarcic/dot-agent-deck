@@ -43,16 +43,19 @@ fn path_with_binary_dir() -> String {
 }
 
 fn commit_fixture_repo(dir: &Path) {
+    // Through `common::fixture_git`, which clears the ambient git LOCATION
+    // variables — a bare `git commit` with only `.current_dir` commits into
+    // whatever an ambient `GIT_DIR` names (issue #834) — and supplies the
+    // identity by environment. `dir` is both the fixture repo and its own
+    // sandbox root: it is the harness tempdir, and nothing above it is this
+    // test's. The two `git config` writes this used to make are gone with it.
     let run = |args: &[&str]| {
-        let out = std::process::Command::new("git")
+        let out = common::fixture_git(dir, dir)
             .args(args)
-            .current_dir(dir)
             .output()
             .expect("git available");
         assert!(out.status.success(), "git {args:?} failed: {out:?}");
     };
-    run(&["config", "user.email", "deck-test@example.com"]);
-    run(&["config", "user.name", "Deck Test"]);
     run(&["add", "-A"]);
     run(&["commit", "-qm", "fixture baseline"]);
 }

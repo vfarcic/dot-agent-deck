@@ -127,9 +127,64 @@ struct Fixture {
     ghstub: PathBuf,
 }
 
+/// Ambient git LOCATION variables, cleared so a fixture command's repository is
+/// the one at its cwd and nothing else. Mirrors `AMBIENT_LOCATION_VARS` in
+/// `src/worktree_owner.rs`, `tests/common/mod.rs` and
+/// `xtask/linkage-check/src/repo_state.rs`.
+const AMBIENT_LOCATION_VARS: [&str; 8] = [
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_COMMON_DIR",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_NAMESPACE",
+    "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+];
+
+/// `git` in `dir` with the ambient git environment switched off in both of the
+/// groups issue #834 names — *location*, which git resolves in preference to
+/// the process cwd, so a bare `git` here would `init`, `add` and `commit`
+/// against whatever an ambient `GIT_DIR` names (under `cargo test`, possibly
+/// the checkout the suite is running in); and *configuration*, which supplies
+/// the commit identity by environment rather than by writing `git config` into
+/// the fixture repo.
+///
+/// A file-local copy rather than a shared one, twice over: `src`'s
+/// `worktree_owner::fixture_git` is `#[cfg(test)] pub(crate)` and so does not
+/// exist in the library an integration test links, and `tests/common/mod.rs`
+/// is the PTY harness — this is a fast-tier test, and `mod common;` would drag
+/// that whole harness into it.
+///
+/// `dir` doubles as the ceiling: every call site below is a repository or
+/// linked-worktree ROOT, and a ceiling equal to the cwd still permits
+/// discovery at that directory (measured, including through a linked
+/// worktree's `.git` file) while blocking any ascent above it.
+fn fixture_git(dir: &Path) -> Command {
+    // Same standing as `common::fixture_git`: the single bare constructor
+    // this file's every other `git` goes through.
+    let mut cmd = Command::new("git"); // linkage-check:allow-bare-git
+    cmd.current_dir(dir);
+    for var in AMBIENT_LOCATION_VARS {
+        cmd.env_remove(var);
+    }
+    let absent = dir.join("no-such-gitconfig");
+    cmd.env("GIT_CONFIG_GLOBAL", &absent)
+        .env("GIT_CONFIG_SYSTEM", &absent)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("HOME", dir)
+        .env("XDG_CONFIG_HOME", dir)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_AUTHOR_NAME", "T")
+        .env("GIT_AUTHOR_EMAIL", "t@t.t")
+        .env("GIT_COMMITTER_NAME", "T")
+        .env("GIT_COMMITTER_EMAIL", "t@t.t")
+        .env("GIT_CEILING_DIRECTORIES", dir);
+    cmd
+}
+
 fn git(dir: &Path, args: &[&str]) {
-    let out = Command::new("git")
-        .current_dir(dir)
+    let out = fixture_git(dir)
         .args(args)
         .output()
         .unwrap_or_else(|e| panic!("git {args:?} failed to spawn: {e}"));
@@ -147,9 +202,10 @@ impl Fixture {
         let repo = scratch.path().join("repo");
         std::fs::create_dir_all(&repo).expect("create repo dir");
 
+        // No `git config user.email`/`user.name` here: `fixture_git` supplies
+        // the identity by environment, so the fixture never writes to a
+        // repository just to configure one.
         git(&repo, &["init", "--initial-branch=main", "--quiet"]);
-        git(&repo, &["config", "user.email", "test@example.com"]);
-        git(&repo, &["config", "user.name", "Test"]);
         std::fs::write(repo.join("README.md"), "seed\n").expect("write seed file");
         git(&repo, &["add", "README.md"]);
         git(&repo, &["commit", "--quiet", "-m", "seed"]);
@@ -267,8 +323,7 @@ impl Fixture {
     /// working tree — so it can never make the tree dirty, and it is removed
     /// along with the worktree by `git worktree remove`.
     fn mark_owned(&self, worktree: &Path) {
-        let out = Command::new("git")
-            .current_dir(worktree)
+        let out = fixture_git(worktree)
             .args(["rev-parse", "--git-dir"])
             .output()
             .expect("git rev-parse --git-dir");
@@ -290,8 +345,7 @@ impl Fixture {
     #[cfg(target_os = "linux")]
     fn add_worktree_with_commit_raw(&self, name: &std::ffi::OsStr, branch: &str) -> PathBuf {
         let path = self._scratch.path().join(name);
-        let add = Command::new("git")
-            .current_dir(&self.repo)
+        let add = fixture_git(&self.repo)
             .arg("worktree")
             .arg("add")
             .arg("-b")
@@ -325,8 +379,7 @@ impl Fixture {
     fn mark_owned_raw(&self, worktree: &Path) {
         use std::os::unix::ffi::OsStrExt;
 
-        let out = Command::new("git")
-            .current_dir(worktree)
+        let out = fixture_git(worktree)
             .args(["rev-parse", "--git-dir"])
             .output()
             .expect("git rev-parse --git-dir");
@@ -419,8 +472,7 @@ fn worktree_reclaim_002_squash_merged_clean_owned_is_reclaimed_and_branch_surviv
 
     // Precondition: git ancestry does NOT consider this merged. If this ever
     // stops holding, the test is no longer exercising the squash-merge case.
-    let merged = Command::new("git")
-        .current_dir(&fx.repo)
+    let merged = fixture_git(&fx.repo)
         .args(["branch", "--merged", "main", "--list", "feat/squashed"])
         .output()
         .expect("git branch --merged");
@@ -445,8 +497,7 @@ fn worktree_reclaim_002_squash_merged_clean_owned_is_reclaimed_and_branch_surviv
         combined(&out)
     );
 
-    let branches = Command::new("git")
-        .current_dir(&fx.repo)
+    let branches = fixture_git(&fx.repo)
         .args(["branch", "--list", "feat/squashed"])
         .output()
         .expect("git branch --list");
@@ -524,8 +575,7 @@ fn worktree_reclaim_004_ancestor_branch_without_a_pr_is_never_removed() {
     let wt = fx.add_worktree_at_main("wt-scratch", "chore/scratch");
     fx.mark_owned(&wt); // owned, clean, and an ancestor: only "no PR" protects it
 
-    let merged = Command::new("git")
-        .current_dir(&fx.repo)
+    let merged = fixture_git(&fx.repo)
         .args(["branch", "--merged", "main", "--list", "chore/scratch"])
         .output()
         .expect("git branch --merged");

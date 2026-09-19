@@ -877,15 +877,14 @@ mod tests {
         run(&["commit", "-qm", "init"]);
     }
 
-    fn branch_exists(repo: &Path, branch: &str) -> bool {
-        std::process::Command::new("git")
+    fn branch_exists(sandbox_root: &Path, repo: &Path, branch: &str) -> bool {
+        crate::worktree_owner::fixture_git(repo, sandbox_root)
             .args([
                 "rev-parse",
                 "--verify",
                 "--quiet",
                 &format!("refs/heads/{branch}"),
             ])
-            .current_dir(repo)
             .output()
             .expect("git available")
             .status
@@ -893,10 +892,22 @@ mod tests {
     }
 
     /// Run a git command in `repo`, asserting it succeeded.
-    fn git_in(repo: &Path, args: &[&str]) {
-        let out = std::process::Command::new("git")
+    ///
+    /// Through [`crate::worktree_owner::fixture_git`] for the same reason
+    /// [`init_repo_in`] is, and it is the same `sandbox_root`. Two halves
+    /// matter here and only one of them is visible from the call sites.
+    /// *Location* is the issue #834 one: a bare `git` with only
+    /// `.current_dir` obeys an ambient `GIT_DIR`, so a fixture `commit` run
+    /// under one writes into whatever repository that names rather than into
+    /// `repo`. *Configuration* is why this signature changed at all: the
+    /// identity a commit needs comes from `fixture_git`'s `GIT_AUTHOR_*` /
+    /// `GIT_COMMITTER_*` environment, and `init_repo_in` deliberately no
+    /// longer writes it into the fixture repo with `git config`, so a bare
+    /// `git commit` here fails outright on a machine with no global identity
+    /// — which is a CI runner, and is not this box.
+    fn git_in(sandbox_root: &Path, repo: &Path, args: &[&str]) {
+        let out = crate::worktree_owner::fixture_git(repo, sandbox_root)
             .args(args)
-            .current_dir(repo)
             .output()
             .expect("git available");
         assert!(out.status.success(), "git {args:?} failed: {out:?}");
@@ -918,16 +929,15 @@ mod tests {
         let tmp = crate::test_temp::tempdir().unwrap();
         let repo = tmp.path().join("repo");
         init_repo_in(tmp.path(), &repo);
-        git_in(&repo, &["checkout", "-q", "-b", "feature-x"]);
+        git_in(tmp.path(), &repo, &["checkout", "-q", "-b", "feature-x"]);
 
         let base = describe_dispatch_base(&repo)
             .await
             .expect("a healthy repo must yield a base");
 
         let sha = String::from_utf8(
-            std::process::Command::new("git")
+            crate::worktree_owner::fixture_git(&repo, tmp.path())
                 .args(["rev-parse", "--short", "HEAD"])
-                .current_dir(&repo)
                 .output()
                 .expect("git available")
                 .stdout,
@@ -944,7 +954,7 @@ mod tests {
         let tmp = crate::test_temp::tempdir().unwrap();
         let repo = tmp.path().join("repo");
         init_repo_in(tmp.path(), &repo);
-        git_in(&repo, &["checkout", "-q", "--detach", "HEAD"]);
+        git_in(tmp.path(), &repo, &["checkout", "-q", "--detach", "HEAD"]);
 
         let base = describe_dispatch_base(&repo)
             .await
@@ -1034,7 +1044,7 @@ mod tests {
         remove_worktree(&paths.worktree_dir, &repo, RemovalPolicy::KeepIfDirty).await;
         assert!(!paths.worktree_dir.exists(), "worktree dir should be gone");
         assert!(
-            branch_exists(&repo, &paths.branch),
+            branch_exists(tmp.path(), &repo, &paths.branch),
             "git worktree remove must not delete the branch — the premise of this test"
         );
 
@@ -1072,11 +1082,7 @@ mod tests {
         .await
         .unwrap();
         remove_worktree(&paths.worktree_dir, &repo, RemovalPolicy::KeepIfDirty).await;
-        std::process::Command::new("git")
-            .args(["branch", "-D", &paths.branch])
-            .current_dir(&repo)
-            .output()
-            .expect("git available");
+        git_in(tmp.path(), &repo, &["branch", "-D", &paths.branch]);
 
         assert_eq!(
             create_worktree(
@@ -1664,15 +1670,8 @@ mod tests {
         .unwrap();
         // The config must be COMMITTED: the shape is resolved from the caller's repo,
         // but the worktree the roles run in is a HEAD checkout.
-        let run = |args: &[&str]| {
-            std::process::Command::new("git")
-                .args(args)
-                .current_dir(&repo)
-                .output()
-                .expect("git available");
-        };
-        run(&["add", "-A"]);
-        run(&["commit", "-qm", "add orchestration"]);
+        git_in(tmp.path(), &repo, &["add", "-A"]);
+        git_in(tmp.path(), &repo, &["commit", "-qm", "add orchestration"]);
 
         let (event_tx, _rx) = tokio::sync::broadcast::channel(64);
         let ctx = DispatchContext {
@@ -1811,8 +1810,9 @@ mod tests {
             .expect("plant the symlinked context dir");
         // The shape is resolved from the CALLER's repo, but the roles run in a
         // HEAD checkout, so both the config and the symlink have to be committed.
-        git_in(&repo, &["add", "-A"]);
+        git_in(tmp.path(), &repo, &["add", "-A"]);
         git_in(
+            tmp.path(),
             &repo,
             &[
                 "commit",
@@ -1902,7 +1902,7 @@ mod tests {
             "with nothing live in it, the worktree must be reclaimed"
         );
         assert!(
-            !branch_exists(&repo, "agent/dispatch-refused-unit"),
+            !branch_exists(tmp.path(), &repo, "agent/dispatch-refused-unit"),
             "…and its branch deleted, so the name is not wedged"
         );
     }
@@ -1942,15 +1942,8 @@ mod tests {
         .unwrap();
         // The shape is resolved from the CALLER's repo, but the roles run in a HEAD
         // checkout, so the config has to be committed.
-        let run = |args: &[&str]| {
-            std::process::Command::new("git")
-                .args(args)
-                .current_dir(&repo)
-                .output()
-                .expect("git available");
-        };
-        run(&["add", "-A"]);
-        run(&["commit", "-qm", "add orchestration"]);
+        git_in(tmp.path(), &repo, &["add", "-A"]);
+        git_in(tmp.path(), &repo, &["commit", "-qm", "add orchestration"]);
 
         let (event_tx, _rx) = tokio::sync::broadcast::channel(64);
         let state: crate::state::SharedState =
@@ -2032,7 +2025,7 @@ mod tests {
             "with nothing live in it, the worktree must still be reclaimed"
         );
         assert!(
-            !branch_exists(&repo, "agent/dispatch-partial-unit"),
+            !branch_exists(tmp.path(), &repo, "agent/dispatch-partial-unit"),
             "…and its branch deleted, so the name is not wedged"
         );
     }
@@ -2061,15 +2054,8 @@ mod tests {
              [[orchestrations.roles]]\nname = \"worker\"\ncommand = \"cat\"\n",
         )
         .unwrap();
-        let run = |args: &[&str]| {
-            std::process::Command::new("git")
-                .args(args)
-                .current_dir(&repo)
-                .output()
-                .expect("git available");
-        };
-        run(&["add", "-A"]);
-        run(&["commit", "-qm", "add orchestration"]);
+        git_in(tmp.path(), &repo, &["add", "-A"]);
+        git_in(tmp.path(), &repo, &["commit", "-qm", "add orchestration"]);
 
         let (event_tx, _rx) = tokio::sync::broadcast::channel(64);
         let ctx = DispatchContext {
@@ -2104,7 +2090,7 @@ mod tests {
             result.message
         );
         assert!(
-            !branch_exists(&repo, "agent/dispatch-doomed-unit"),
+            !branch_exists(tmp.path(), &repo, "agent/dispatch-doomed-unit"),
             "…and delete its branch, so the name is reusable"
         );
         assert!(
@@ -2184,7 +2170,7 @@ mod tests {
             "the rollback must not delete the working directory of a live agent"
         );
         assert!(
-            branch_exists(&repo, "agent/dispatch-survivor"),
+            branch_exists(tmp.path(), &repo, "agent/dispatch-survivor"),
             "the branch is checked out in the retained tree, so it stays too"
         );
         // The registry entry is what the surviving agent's eventual tab close
@@ -2212,7 +2198,7 @@ mod tests {
             "with the agent gone the guard must stop firing"
         );
         assert!(!worktree_dir.exists());
-        assert!(!branch_exists(&repo, "agent/dispatch-survivor"));
+        assert!(!branch_exists(tmp.path(), &repo, "agent/dispatch-survivor"));
     }
 
     /// A shape the repo cannot satisfy must be refused BEFORE any git work, so a
@@ -2265,7 +2251,7 @@ mod tests {
             "no worktree may be created for a shape that was refused"
         );
         assert!(
-            !branch_exists(&repo, "agent/dispatch-typo-unit"),
+            !branch_exists(tmp.path(), &repo, "agent/dispatch-typo-unit"),
             "no branch may be left behind either"
         );
     }

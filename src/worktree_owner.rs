@@ -163,7 +163,11 @@ const AMBIENT_LOCATION_VARS: [&str; 8] = [
 /// [`git_dir_of`] — and so the ownership gate and the reclaim path that deletes
 /// directories behind it — immune to the same ambient override.
 pub(crate) fn git_at(dir: &Path) -> Command {
-    let mut cmd = Command::new("git");
+    // This IS the neutralisation, and it is production: the ambient LOCATION
+    // variables are cleared just below, while configuration is deliberately
+    // left alone because production reads the user's own repository with the
+    // user's own config.
+    let mut cmd = Command::new("git"); // linkage-check:allow-bare-git
     cmd.current_dir(dir);
     for var in AMBIENT_LOCATION_VARS {
         cmd.env_remove(var);
@@ -657,8 +661,14 @@ mod tests {
         let scratch = crate::test_temp::tempdir().expect("scratch tempdir");
         let repo = scratch.path().join("repo");
         std::fs::create_dir_all(&repo).expect("create the fixture repo dir");
-        let out = Command::new("git")
-            .current_dir(&repo)
+        // Through [`fixture_git`] like every other fixture here: `init` is a
+        // WRITE, and a bare `git` with only `.current_dir` obeys an ambient
+        // `GIT_DIR` in preference to it (issue #834). This module's own
+        // `with_ambient_git_dir_at` sets exactly those variables
+        // process-globally, and under a plain `cargo test` — one process,
+        // threads — this fixture shares that environment without taking
+        // `ENV_LOCK`.
+        let out = fixture_git(&repo, scratch.path())
             .args(["init", "--quiet"])
             .output()
             .expect("run git init");
@@ -1142,11 +1152,19 @@ mod tests {
         std::fs::create_dir_all(&plain).expect("create a non-repo dir");
 
         // Asserted, not assumed. If the temp root itself sat inside a
-        // repository (or this process carries an ambient `GIT_DIR`), the case
-        // below would not be the one this test claims to cover — fail loudly
-        // rather than pass for the wrong reason.
-        let discovery = Command::new("git")
-            .current_dir(&plain)
+        // repository, the case below would not be the one this test claims to
+        // cover — fail loudly rather than pass for the wrong reason.
+        //
+        // Through [`git_at`] rather than a bare `git`, because the subject —
+        // `main_worktree_of` — goes through `git_at` too, so that is the
+        // discovery this precondition is a precondition FOR. A bare probe
+        // measures a different environment than the assertion below: an
+        // ambient `GIT_DIR` would make it resolve and fire this panic while
+        // `main_worktree_of` stayed correctly `None`, a false red rather than
+        // a loud one. Not hypothetical here — `with_ambient_git_dir_at` in
+        // this same module sets those variables process-globally, and this
+        // test does not take `ENV_LOCK`.
+        let discovery = git_at(&plain)
             .args(["rev-parse", "--git-dir"])
             .output()
             .expect("run git rev-parse");

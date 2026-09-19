@@ -277,10 +277,9 @@ fn idle_worker_012_real_orchestrator_visibly_receives_idle_nudge() {
         .to_str()
         .expect("orchestration project directory is UTF-8")
         .to_string();
-    let _ = std::process::Command::new("git")
+    let _ = common::fixture_git(&project_dir, &project_dir)
         .arg("init")
         .arg("--quiet")
-        .current_dir(&project_dir)
         .status();
 
     let orchestrator_command =
@@ -377,10 +376,9 @@ fn delegate_024_real_orchestrator_acts_on_submitted_silence_notice() {
         .to_str()
         .expect("orchestration project directory is UTF-8")
         .to_string();
-    let _ = std::process::Command::new("git")
+    let _ = common::fixture_git(&project_dir, &project_dir)
         .arg("init")
         .arg("--quiet")
-        .current_dir(&project_dir)
         .status();
 
     let orchestrator_command =
