@@ -253,7 +253,7 @@ export const VOICE_ACTIONS = {
 
   openSettings: {
     label: "Open settings",
-    no_voice: "reserved for PRD #802 M8, which adds the first new command by editing `commands.toml` and its fixtures and nothing else — claiming the row here would spend the one-file proof before it has been made",
+    voice: true,
     needs: ["openOverlay"],
     run: (context: Pick<VoiceActionContext, "openOverlay">) => context.openOverlay("settings"),
   },

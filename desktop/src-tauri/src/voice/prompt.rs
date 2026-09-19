@@ -373,6 +373,7 @@ mod tests {
                 "open_overview".to_string(),
                 "open_deck".to_string(),
                 "close_agent_view".to_string(),
+                "open_settings".to_string(),
                 "none".to_string(),
             ]
         );
@@ -447,7 +448,7 @@ mod tests {
                 { "label": "orchestrator", "status": "running" },
             ])
         );
-        assert_eq!(state["commands"].as_array().expect("array").len(), 4);
+        assert_eq!(state["commands"].as_array().expect("array").len(), 5);
     }
 
     #[test]
@@ -595,7 +596,9 @@ mod tests {
             prompt.ends_with("Utterance: show me the tester"),
             "{prompt}"
         );
-        assert!(prompt.contains("open_agent, open_overview, open_deck, close_agent_view, none"));
+        assert!(prompt.contains(
+            "open_agent, open_overview, open_deck, close_agent_view, open_settings, none"
+        ));
         assert!(prompt.contains("Answer `none`"));
     }
 

@@ -85,3 +85,22 @@ invoke      = "closeAgentView"
 screens     = ["agent"]
 unavailable_hint = "closing an agent view needs one open"
 report      = "Closing the agent view."
+
+# PRD #802 M8 — the one-file proof: the first command added after the plumbing
+# existed. `screens = ["deck"]` rather than `["deck", "overview"]`, and the
+# narrowing is the rule rather than caution: the Settings overlay is reachable
+# only from the DECK rail — the overview's rail holds Deck and Overview and
+# nothing else — so listing `overview` would let voice open a surface no click
+# can reach from that screen, which makes voice a second control surface with
+# capabilities the first lacks. A row does not define behaviour; it exposes
+# behaviour that already exists.
+[[commands]]
+id          = "open_settings"
+description = """Open the app's Settings sheet: appearance, the decks this app connects to, voice,
+and zoom. Use when the user asks for settings, preferences, options, configuration, or asks where
+to change how the app looks, where to add or edit a deck, or where to put an API key. This only
+opens the sheet — it changes no setting by itself."""
+invoke      = "openSettings"
+screens     = ["deck"]
+unavailable_hint = "settings open from the deck"
+report      = "Opening settings."

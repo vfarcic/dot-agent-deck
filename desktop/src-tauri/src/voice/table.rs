@@ -470,6 +470,7 @@ mod tests {
                 ("open_overview", "openOverview", vec!["deck"]),
                 ("open_deck", "openDeck", vec!["overview"]),
                 ("close_agent_view", "closeAgentView", vec!["agent"]),
+                ("open_settings", "openSettings", vec!["deck"]),
             ]
         );
     }
@@ -810,7 +811,13 @@ mod tests {
                 .map(|row| row.id.as_str())
                 .collect::<Vec<_>>()
         };
-        assert_eq!(callable(Screen::Deck), vec!["open_agent", "open_overview"]);
+        // `open_settings` is on the deck and NOT on the overview: the Settings
+        // overlay is reachable only from the deck rail, and a row exposes
+        // behaviour that already exists rather than adding a route of its own.
+        assert_eq!(
+            callable(Screen::Deck),
+            vec!["open_agent", "open_overview", "open_settings"]
+        );
         assert_eq!(callable(Screen::Overview), vec!["open_agent", "open_deck"]);
         assert_eq!(callable(Screen::Agent), vec!["close_agent_view"]);
     }

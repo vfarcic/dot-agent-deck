@@ -433,6 +433,7 @@ mod tests {
                 "open_overview",
                 "open_deck",
                 "close_agent_view",
+                "open_settings",
                 "none"
             ]
         );

@@ -159,6 +159,7 @@ mod tests {
                 "open_overview".to_string(),
                 "open_deck".to_string(),
                 "close_agent_view".to_string(),
+                "open_settings".to_string(),
                 "none".to_string(),
             ]
         );
@@ -210,6 +211,7 @@ mod tests {
                 "open_overview",
                 "open_deck",
                 "close_agent_view",
+                "open_settings",
                 "none"
             ]
         );
@@ -261,6 +263,7 @@ mod tests {
                 ("open_overview".to_string(), true),
                 ("open_deck".to_string(), false),
                 ("close_agent_view".to_string(), false),
+                ("open_settings".to_string(), true),
             ]
         );
         assert_eq!(
@@ -270,6 +273,9 @@ mod tests {
                 ("open_overview".to_string(), false),
                 ("open_deck".to_string(), true),
                 ("close_agent_view".to_string(), false),
+                // PRD #802 M8's ruling in one flag: Settings is reachable only
+                // from the deck rail, so voice must not offer it here either.
+                ("open_settings".to_string(), false),
             ]
         );
         assert_eq!(
@@ -279,6 +285,7 @@ mod tests {
                 ("open_overview".to_string(), false),
                 ("open_deck".to_string(), false),
                 ("close_agent_view".to_string(), true),
+                ("open_settings".to_string(), false),
             ]
         );
     }

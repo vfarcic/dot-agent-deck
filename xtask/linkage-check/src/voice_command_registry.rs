@@ -1094,13 +1094,17 @@ mod tests {
         });
         assert_reports(&unbacked, "`openDeck` claims `voice: true`");
 
+        // Re-pointed from `openSettings` to `openProjects` when PRD #802 M8
+        // gave the former a row: the plant has to name an entry that still
+        // carries a `no_voice` reason, or it exercises the `unbacked` case
+        // above instead of this one.
         let overtaken = planted(|sources| {
             sources.commands_toml = sources.commands_toml.replace(
                 "invoke      = \"openDeck\"",
-                "invoke      = \"openSettings\"",
+                "invoke      = \"openProjects\"",
             );
         });
-        assert_reports(&overtaken, "`openSettings` carries a `no_voice` reason");
+        assert_reports(&overtaken, "`openProjects` carries a `no_voice` reason");
     }
 
     /// Assertion 5, both halves.
