@@ -835,15 +835,26 @@ const FIXTURE_VOICE_MAX_MS = 30_000;
 /**
  * The microphone the browser preview does not have (PRD #802 M7).
  *
- * `available: false` with `backend: "off"` is the same answer a live app reports
- * when `[voice] transcription` is `off`, which is its default — so the preview
- * renders the state a first run renders, and the browser tier gets to drive it
- * with no microphone, no credential and no Tauri runtime anywhere near it.
- * `off` is a product statement rather than a degraded mode: the panel offers
- * typed input and says what to add.
+ * With no overrides this is the same answer a live app reports when `[voice]
+ * transcription` is `off`, which is its default — so the preview renders the
+ * state a first run renders, and the browser tier gets to drive the
+ * *unavailable* path with no microphone, no credential and no Tauri runtime
+ * anywhere near it. `off` is a product statement rather than a degraded mode:
+ * the surface says how to turn voice on rather than looking broken.
+ *
+ * The overrides are what lets the same tier drive the OTHER path — see
+ * {@link fixtureVoiceHeard}.
  */
-export function fixtureVoiceStatus(): VoiceStatusDto {
-  return { state: "idle", capturedMs: 0, maxMs: FIXTURE_VOICE_MAX_MS, capped: false, available: false, backend: "off" };
+export function fixtureVoiceStatus(overrides: Partial<VoiceStatusDto> = {}): VoiceStatusDto {
+  return {
+    state: "idle",
+    capturedMs: 0,
+    maxMs: FIXTURE_VOICE_MAX_MS,
+    capped: false,
+    available: false,
+    backend: "off",
+    ...overrides,
+  };
 }
 
 /**
@@ -864,5 +875,41 @@ export function fixtureVoiceTranscription(): VoiceTranscriptionDto {
     transcribeMs: null,
     backend: "off",
     audioMs: 0,
+  };
+}
+
+/**
+ * The one thing the preview's simulated microphone ever hears.
+ *
+ * A phrase from {@link FIXTURE_VOICE_COMMANDS} rather than a fresh literal, so
+ * a row renamed there changes what the preview hears instead of leaving a
+ * canned utterance that quietly stops resolving.
+ */
+export const FIXTURE_VOICE_UTTERANCE = FIXTURE_VOICE_COMMANDS[0].phrases[0];
+
+/**
+ * One simulated utterance, so the browser tier can drive the WHOLE voice loop
+ * (PRD #802 M6).
+ *
+ * The preview still has no microphone. What it has is a deterministic stand-in
+ * for one: with a transcription backend chosen in its settings, a start is
+ * accepted, the next status poll reports the utterance over, and this is what a
+ * stop returns. That is the segment → transcribe → resolve → execute → listen
+ * again cycle end to end, driven with no credential and no device — which is
+ * what the withdrawn typed path used to be the only way to reach.
+ *
+ * `transcribeMs` is `null` and the backend is `stub` for `resolveFixtureVoice`'s
+ * reason: nothing was transcribed, so there is no measurement to report.
+ */
+export function fixtureVoiceHeard(): VoiceTranscriptionDto {
+  return {
+    outcome: {
+      kind: "heard",
+      transcript: FIXTURE_VOICE_UTTERANCE,
+      sentence: `Heard: “${FIXTURE_VOICE_UTTERANCE}”.`,
+    },
+    transcribeMs: null,
+    backend: "stub",
+    audioMs: 1_200,
   };
 }

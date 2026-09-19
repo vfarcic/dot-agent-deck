@@ -21,6 +21,7 @@ import { DeckShell } from "../App";
 import {
   NOTHING_DISPATCHED,
   SCREEN_MOVED_ON,
+  VOICE_CAP_DISCARDED,
   VOICE_STATUS_POLL_MS,
   VOICE_UNDO_WINDOW_MS,
 } from "./VoiceControlPanel";
@@ -382,18 +383,19 @@ describe("voice control panel", () => {
     expect(voiceButton()).toHaveAttribute("aria-pressed", "false");
   });
 
-  /** Scenario: an utterance hits the capture cap while Voice is on. Its audio is processed and listening resumes. */
-  it("processes a capped utterance and continues listening", async () => {
+  /** Scenario: an utterance hits the capture cap while Voice is on. Its audio is discarded unheard, the report says so, and listening resumes. */
+  it("discards a capped utterance and continues listening", async () => {
     vi.useFakeTimers();
-    const utterance = "show me every agent";
-    const voice = automaticVoice(heard(utterance), true);
+    const voice = automaticVoice(heard("show me every agent"), true);
     const resolveVoice = resolver(result(DISPATCH));
     render(<DeckShell runtime={runtime(resolveVoice, voice)} />);
 
     await turnVoiceOn(voice);
-    await completeAutomaticUtterance(voice);
+    await act(async () => { await vi.advanceTimersByTimeAsync(VOICE_STATUS_POLL_MS); });
 
-    expect(resolveVoice).toHaveBeenCalledWith(utterance);
+    expect(voice.voiceStop).not.toHaveBeenCalled();
+    expect(resolveVoice).not.toHaveBeenCalled();
+    expect(screen.getByText(VOICE_CAP_DISCARDED)).toBeVisible();
     expect(voice.voiceStart).toHaveBeenCalledTimes(2);
     expect(screen.queryByRole("button", { name: "Send the recording" })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Discard it" })).not.toBeInTheDocument();

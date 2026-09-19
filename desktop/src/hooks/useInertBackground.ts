@@ -42,15 +42,25 @@
  * Only elements this hook marked are unmarked on cleanup, so an element that
  * was already inert for some other reason keeps its own state.
  *
- * # The one exemption: the voice surface is a PEER dialog, not background
+ * # The one exemption: the voice surface is a PEER, not background
  *
- * PRD #802's voice trigger and its dialog are siblings of the screen switch in
- * `DeckShell`, so the walk above reaches them and marks them like any other
- * background region — which is what it should do for a region, and wrong for a
- * second dialog. The cost was not cosmetic: `inert` removes an element from hit
- * testing as well as from the tab order, so on the `agent` screen the trigger
- * was unclickable behind the pane, and `close_agent_view` — the one command
- * that screen has — was unreachable by the surface that dispatches it.
+ * PRD #802's voice trigger and the report beside it are siblings of the screen
+ * switch in `DeckShell`, so the walk above reaches them and marks them like any
+ * other background region — which is what it should do for a region, and wrong
+ * for a second surface the user is meant to reach. The cost was not cosmetic:
+ * `inert` removes an element from hit testing as well as from the tab order, so
+ * on the `agent` screen the trigger was unclickable behind the pane, and
+ * `close_agent_view` — the one command that screen has — was unreachable by the
+ * surface that dispatches it. The report carries the marker for the same
+ * reason and not by habit: the Undo inside it is a control, and an Undo that
+ * cannot be clicked is a picture of one.
+ *
+ * **The exempt elements are no longer a dialog, and the exemption did not
+ * widen when they stopped being one.** M6's voice surface was a trigger plus a
+ * modal-looking dialog; it is now a trigger plus a transient report, because
+ * continuous voice control cannot be gated behind something that has to be
+ * dismissed between utterances. What is matched is the marker, not a role, so
+ * the shape change cost nothing here — and the count is still two elements.
  *
  * So elements carrying {@link VOICE_PEER_PROPS} are skipped, and nothing else
  * is. It is an allow-list of one marker rather than a rule about roles or
@@ -64,8 +74,9 @@
  * cannot widen by accident: it is matched on the sibling itself, so a marked
  * element nested inside a background region is still inert with its region.
  *
- * The two surfaces do not fight over `Escape` either: the voice dialog
- * `stopPropagation`s its own, and `DeckShell`'s pane listener is at `window`.
+ * The two surfaces do not fight over `Escape` either: the voice surface binds
+ * no key at all — it is a button and a report, not a dialog — so `DeckShell`'s
+ * window listener for the pane is the only thing that sees one.
  *
  * **`setAttribute` rather than the `inert` IDL property, and that is not
  * style.** Measured against this repo's jsdom (30.x): `"inert" in
@@ -81,7 +92,7 @@ import { useEffect, useRef } from "react";
 
 /**
  * The marker that makes an element a peer of the agent pane rather than
- * background, spread onto the voice trigger and the voice dialog in
+ * background, spread onto the voice trigger and its report in
  * {@link ../components/VoiceControlPanel!VoiceControlPanel}.
  *
  * Exported as props to spread rather than written as a literal attribute at

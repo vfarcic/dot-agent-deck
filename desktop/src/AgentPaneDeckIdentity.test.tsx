@@ -401,9 +401,12 @@ describe("agent pane identity fence", () => {
     const pane = screen.getByTestId("agent-pane-overlay");
 
     expect(screen.getByTestId("deck-selector-toggle").closest("[inert]")).not.toBeNull();
-    // Voice is a peer dialog, not background. Equality to this one-element set
-    // keeps the containment assertion strict: any other reachable control is a
+    // Voice is a peer, not background. Equality to this one-element set keeps
+    // the containment assertion strict: any other reachable control is a
     // regression, rather than something an allow-list filter could hide.
+    // The voice REPORT is exempt too and is mounted here, but it is empty — it
+    // holds a reachable control only while it is showing an Undo, which this
+    // test never opens. Read the equality as covering the trigger alone.
     expect(reachableOutside(pane)).toEqual([screen.getByTestId("voice-trigger")]);
     // And the pane itself is genuinely live, so this is containment rather than
     // a screen that has simply been switched off.

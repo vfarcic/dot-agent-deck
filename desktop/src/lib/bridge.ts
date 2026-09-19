@@ -1,4 +1,4 @@
-import { createFixtureFleet, DEFAULT_PROFILES, fixtureVoiceStatus, fixtureVoiceTranscription, resolveFixtureVoice, type FixtureState } from "../data/fixture";
+import { createFixtureFleet, DEFAULT_PROFILES, fixtureVoiceHeard, fixtureVoiceStatus, fixtureVoiceTranscription, resolveFixtureVoice, type FixtureState } from "../data/fixture";
 import { agentKey } from "./agentKey";
 import { getTerminal } from "./terminalRegistry";
 import { applyHandoffEvent, mapDaemonEvent, MAX_LIVE_EVIDENCE } from "./daemonEvents";
@@ -1783,17 +1783,49 @@ class FixtureDeckBridge implements DeckBridge {
   }
 
   /**
-   * The browser preview has no microphone and does not pretend otherwise.
+   * The preview's simulated microphone (PRD #802 M6).
    *
-   * It reports the same state a live app reports with `[voice] transcription`
-   * set to `off` — its default — so the panel renders typed input alone, offers
-   * no microphone control, and says nothing that reads as broken. A fixture that
-   * simulated a device would make the one state this tier can honestly drive
-   * unreachable.
+   * `recording` is whether a start has been accepted and not yet released;
+   * `spoken` latches once the one canned utterance has been delivered, so the
+   * preview says one thing per activation and is then quiet. A stand-in that
+   * spoke every quarter second would be a loop that overwrote its own report
+   * before anyone could read it — and a person who says one command and stops
+   * is the behaviour being previewed anyway.
+   *
+   * Reset by `voiceCancel`, which is what turning voice off calls, so the next
+   * activation speaks again.
+   */
+  private microphone = { recording: false, spoken: false };
+
+  /**
+   * Whether the preview's settings name a transcription backend.
+   *
+   * Read through `getSettings` rather than from a field, because the browser
+   * tier sets the document in `localStorage` before the page loads and the
+   * bridge may not have been asked for it yet.
+   */
+  private async voiceAvailable(): Promise<boolean> {
+    const { settings } = await this.getSettings();
+    return (settings.voice?.transcription ?? "off") !== "off";
+  }
+
+  /**
+   * What the preview's microphone is doing.
+   *
+   * With no backend chosen it reports exactly what a live app reports when
+   * `[voice] transcription` is `off` — its default — so this tier drives the
+   * *unavailable* path with no device anywhere near it. With one chosen it
+   * drives the other path: the first poll after a start reports the utterance
+   * over, which is the boundary `voice::Vad` produces live.
    */
   async voiceStatus(): Promise<VoiceStatusDto> {
-    await Promise.resolve();
-    return fixtureVoiceStatus();
+    if (!(await this.voiceAvailable())) return fixtureVoiceStatus();
+    const speaking = { available: true, backend: "remote" as const };
+    if (this.microphone.recording && !this.microphone.spoken) {
+      this.microphone.spoken = true;
+      return fixtureVoiceStatus({ ...speaking, state: "done", capturedMs: 1_200 });
+    }
+    return fixtureVoiceStatus({ ...speaking, state: this.microphone.recording ? "recording" : "idle" });
   }
 
   /**
@@ -1801,18 +1833,23 @@ class FixtureDeckBridge implements DeckBridge {
    * the same way when transcription is `off`.
    */
   async voiceStart(): Promise<VoiceStatusDto> {
-    await Promise.resolve();
-    throw new Error("Nothing to listen with — the browser preview has no microphone.");
+    if (!(await this.voiceAvailable())) {
+      throw new Error("Nothing to listen with — the browser preview has no microphone.");
+    }
+    this.microphone.recording = true;
+    return fixtureVoiceStatus({ state: "recording", available: true, backend: "remote" });
   }
 
   async voiceStop(): Promise<VoiceTranscriptionDto> {
-    await Promise.resolve();
-    return fixtureVoiceTranscription();
+    const available = await this.voiceAvailable();
+    this.microphone.recording = false;
+    return available ? fixtureVoiceHeard() : fixtureVoiceTranscription();
   }
 
   /** Idempotent and never refused, for the reason the live one is not. */
   async voiceCancel(): Promise<VoiceStatusDto> {
     await Promise.resolve();
+    this.microphone = { recording: false, spoken: false };
     return fixtureVoiceStatus();
   }
 
