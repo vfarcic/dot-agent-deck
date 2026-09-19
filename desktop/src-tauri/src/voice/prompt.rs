@@ -264,10 +264,15 @@ pub fn cli_prompt(request: &IntentRequest<'_>) -> String {
 /// claude-haiku-4-5` with the prompt above, on 2026-09-18, came back wrapped in
 /// a ```` ```json ```` fence **every time** despite the instruction forbidding
 /// one, and PRD #802's own survey additionally caught a warning about
-/// `ANTHROPIC_API_KEY` printed to stdout *before* the JSON. `opencode run
-/// --pure` returned a bare object with no fence. So neither "stdout is JSON"
-/// nor "stdout is a fenced block" is a property, and this reads output that is
-/// either.
+/// `ANTHROPIC_API_KEY` printed to stdout *before* the JSON. The withdrawn
+/// `opencode` backend returned a bare object with no fence — that backend is
+/// gone (see [`super::agent_cli::AgentCli`]), and the measurement is kept
+/// because it is what establishes that the fence is a HABIT of one CLI rather
+/// than a property of the shape. So neither "stdout is JSON" nor "stdout is a
+/// fenced block" is a property, and this reads output that is either. The
+/// remaining reason the unfenced pass has to stay is the keyed
+/// [`super::remote`] backend, whose answer arrives as JSON with no fence at
+/// all.
 ///
 /// Two passes, in this order:
 ///
