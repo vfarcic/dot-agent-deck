@@ -11,7 +11,7 @@ vi.mock("./TerminalViewport", () => ({
 }));
 
 import { DeckShell } from "../App";
-import { NOTHING_DISPATCHED } from "./VoiceControlPanel";
+import { NOTHING_DISPATCHED, SCREEN_MOVED_ON } from "./VoiceControlPanel";
 
 type VoiceBackend = "claude" | "opencode" | "remote" | "stub";
 
@@ -767,5 +767,98 @@ describe("voice control panel", () => {
       for (const call of setItem.mock.calls) expect(String(call[1])).not.toContain(utterance);
       expect(JSON.stringify(window.localStorage)).not.toContain(utterance);
     }
+  });
+
+  /**
+   * A resolver that answers only when the test tells it to.
+   *
+   * The window this reproduces is the ordinary one rather than a contrived
+   * race: PRD #802 measured the zero-configuration backend at 4.3–6.3 s per
+   * utterance, which is several seconds in which the user can close the dialog
+   * or walk to another screen.
+   */
+  function deferredResolver() {
+    let answer: (result: VoiceResult) => void = () => {};
+    const resolveVoice = vi.fn<(utterance: string) => Promise<VoiceResult>>(
+      () => new Promise<VoiceResult>((resolve) => { answer = resolve; }),
+    );
+    return {
+      resolveVoice,
+      settle: async (value: VoiceResult) => {
+        await act(async () => {
+          answer(value);
+          await Promise.resolve();
+        });
+      },
+    };
+  }
+
+  /**
+   * Scenario: type a command, close the Voice dialog while the resolver is
+   * still working, and only then let the resolver answer. The app stays
+   * exactly where the user left it — a dismissed request navigates nothing.
+   */
+  it("does not dispatch a request the user dismissed", async () => {
+    const { resolveVoice, settle } = deferredResolver();
+    render(<DeckShell runtime={runtime(resolveVoice)} />);
+
+    const panel = openVoicePanel();
+    await submit(panel, "show me every agent", resolveVoice);
+    fireEvent.click(within(panel).getByRole("button", { name: "Close voice control" }));
+    expect(screen.queryByRole("dialog", { name: "Voice control" })).not.toBeInTheDocument();
+
+    await settle(result(DISPATCH));
+
+    expect(screen.queryByTestId("overview-table-region")).not.toBeInTheDocument();
+    expect(screen.getByTestId("agent-tile-planner")).toBeVisible();
+  });
+
+  /**
+   * Scenario: submit "open settings" from the overview, walk to the deck while
+   * the resolver is still working, and only then let it answer. The outcome was
+   * judged against a screen the user has left, so nothing runs on the screen
+   * they are standing on now and the report says so.
+   */
+  it("does not dispatch a request resolved against the screen the user has left", async () => {
+    const { resolveVoice, settle } = deferredResolver();
+    render(<DeckShell runtime={runtime(resolveVoice)} initialView={{ kind: "overview" }} />);
+
+    const panel = openVoicePanel();
+    await submit(panel, "open settings", resolveVoice);
+    fireEvent.click(screen.getByTestId("open-deck"));
+    expect(screen.getByTestId("agent-tile-planner")).toBeVisible();
+
+    await settle(result(OPEN_SETTINGS_DISPATCH));
+
+    expect(screen.queryByTestId("settings-panel")).not.toBeInTheDocument();
+    expect(await within(panel).findByText(SCREEN_MOVED_ON)).toBeVisible();
+  });
+
+  /**
+   * Scenario: open Voice from its trigger with the keyboard and close it again.
+   * The dialog does not claim a modality it deliberately does not enforce — it
+   * inerts nothing, by the peer decision in `useInertBackground` — and the
+   * keyboard position it borrowed goes back to the control that opened it.
+   */
+  it("does not claim modality it does not enforce, and returns focus to its trigger", async () => {
+    render(<DeckShell runtime={runtime(resolver(result(DISPATCH)))} />);
+
+    const trigger = screen.getByTestId("voice-trigger");
+    trigger.focus();
+    await act(async () => {
+      fireEvent.click(trigger);
+      await Promise.resolve();
+    });
+
+    const panel = screen.getByRole("dialog", { name: "Voice control" });
+    expect(panel).not.toHaveAttribute("aria-modal", "true");
+
+    await act(async () => {
+      fireEvent.click(within(panel).getByRole("button", { name: "Close voice control" }));
+      await Promise.resolve();
+    });
+
+    expect(screen.queryByRole("dialog", { name: "Voice control" })).not.toBeInTheDocument();
+    expect(document.activeElement).toBe(trigger);
   });
 });

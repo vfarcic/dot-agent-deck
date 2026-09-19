@@ -16,8 +16,10 @@
  * can phrase it differently from the one beside it, and the table would stop
  * being the single answer to what the app says.
  *
- * The one sentence written here is {@link NOTHING_DISPATCHED}, for a situation
- * Rust structurally cannot know about; see its own note.
+ * The two sentences written here are {@link NOTHING_DISPATCHED} and
+ * {@link SCREEN_MOVED_ON}, both for situations Rust structurally cannot know
+ * about — one about a registry this process owns, the other about a navigation
+ * that happened after the question was asked. See their own notes.
  *
  * # Typed and spoken are ONE path
  *
@@ -88,6 +90,23 @@ export const VOICE_STATUS_POLL_MS = 1_000;
  */
 export const NOTHING_DISPATCHED = "That command is not wired to anything in this build.";
 
+/**
+ * The second sentence this file writes, for the second situation Rust cannot
+ * see: the user moved while the answer was being worked out.
+ *
+ * An outcome is classified against the screen declared immediately before the
+ * resolve, so `unavailable` means *not on that screen*. When the user walks to
+ * another one during the several seconds a backend takes — PRD #802 measured
+ * 4.3–6.3 s for the zero-configuration backend — that classification describes
+ * a screen nobody is standing on, and running it anyway would act on the new
+ * screen with the old screen's permission.
+ *
+ * It is a sentence rather than silence for {@link NOTHING_DISPATCHED}'s reason:
+ * the alternative is *Working out what that means…* vanishing with nothing in
+ * its place, which reads as the surface having lost the command.
+ */
+export const SCREEN_MOVED_ON = "You moved to another screen while that was being worked out, so nothing ran. Say it again here.";
+
 /** The voice half of the runtime, which a runtime may not have at all. */
 type Voice = Pick<DeckRuntimeState, "declareVoiceScreen" | "resolveVoice" | "voiceStart" | "voiceStop" | "voiceStatus" | "voiceCancel">;
 
@@ -155,10 +174,18 @@ function secondsLeft(status: VoiceStatusDto): number {
  */
 export function VoiceControlPanel({ runtime, screen, onDispatch }: VoiceControlPanelProps) {
   const [open, setOpen] = useState(false);
+  /*
+    Where the keyboard came from, so it can go back there. A dialog that takes
+    focus and drops it on `document.body` when it closes leaves a keyboard user
+    with no position at all — the next Tab restarts from the top of the
+    document rather than from the control they pressed.
+  */
+  const trigger = useRef<HTMLButtonElement>(null);
   if (!runtime.resolveVoice) return null;
   return (
     <>
       <button
+        ref={trigger}
         className="voice-trigger"
         data-testid="voice-trigger"
         title="Voice control"
@@ -169,7 +196,11 @@ export function VoiceControlPanel({ runtime, screen, onDispatch }: VoiceControlP
         {...VOICE_PEER_PROPS}
         onClick={() => setOpen(true)}
       ><Mic size={16} /><span>Voice</span></button>
-      {open && <VoiceDialog runtime={runtime} screen={screen} onDispatch={onDispatch} onClose={() => setOpen(false)} />}
+      {/* Focus is restored BEFORE the unmount rather than from a cleanup
+          effect: moving it while the dialog is still mounted means it never
+          passes through `<body>` at all, so nothing else can claim it in
+          between. */}
+      {open && <VoiceDialog runtime={runtime} screen={screen} onDispatch={onDispatch} onClose={() => { trigger.current?.focus(); setOpen(false); }} />}
     </>
   );
 }
@@ -201,6 +232,37 @@ function VoiceDialog({ runtime, screen, onDispatch, onClose }: VoiceControlPanel
    */
   const screenRef = useRef(screen);
   useEffect(() => { screenRef.current = screen; }, [screen]);
+
+  /**
+   * Which in-flight step the surface is still waiting for.
+   *
+   * The same idea as [`SessionInner::opening`][] one layer down, and for the
+   * same finding: an operation that outlives the user's decision to abandon it
+   * must be able to tell that it did. A dialog closed mid-resolve used to be a
+   * closure still holding `onDispatch`, so the app navigated — or opened an
+   * overlay — several seconds after the user dismissed Voice. The window is
+   * the ordinary one rather than a contrived race: PRD #802 measured the
+   * zero-configuration backend at 4.3–6.3 s per utterance.
+   *
+   * A counter rather than a boolean because it also has to order two live
+   * requests: a superseded one must not write its report over the one that
+   * replaced it.
+   *
+   * [`SessionInner::opening`]: the Rust capture session's reservation, in
+   * `desktop/src-tauri/src/voice/capture.rs`.
+   */
+  const request = useRef(0);
+  /** Take the surface, and hand back the question *is it still mine?*. */
+  const claim = useCallback(() => {
+    const mine = ++request.current;
+    return () => request.current === mine;
+  }, []);
+  /** Abandon whatever is in flight without starting anything. */
+  const abandon = useCallback(() => { request.current += 1; }, []);
+  /* The unmount half. `close` abandons on the way out, which covers every
+     route a user takes; this covers the rest — a host that stops offering a
+     runtime, a screen teardown — with one line instead of an audit. */
+  useEffect(() => abandon, [abandon]);
 
   /*
     The status the panel opens with, which is what decides whether a microphone
@@ -264,10 +326,23 @@ function VoiceDialog({ runtime, screen, onDispatch, onClose }: VoiceControlPanel
    */
   const runUtterance = useCallback(async (utterance: string) => {
     if (!resolveVoice) return;
+    const ours = claim();
+    /* The screen this utterance was JUDGED against, held for the round trip.
+       `unavailable` means "not on that screen", so an outcome is only an
+       answer about the screen that was declared with it. */
+    const declared = screenRef.current;
     setPhase("resolving");
     try {
-      declareVoiceScreen?.(screenRef.current);
+      declareVoiceScreen?.(declared);
       const answer = await resolveVoice(utterance);
+      // Abandoned, or replaced by a later utterance. Say nothing and run
+      // nothing: the dialog is gone, or belongs to the request that replaced
+      // this one.
+      if (!ours()) return;
+      if (screenRef.current !== declared) {
+        setProblem(SCREEN_MOVED_ON);
+        return;
+      }
       setResult(answer);
       if (answer.outcome.kind === "dispatch") {
         const dispatched = onDispatch(answer.outcome);
@@ -275,11 +350,12 @@ function VoiceDialog({ runtime, screen, onDispatch, onClose }: VoiceControlPanel
         else if (dispatched.undo) setUndo({ run: dispatched.undo });
       }
     } catch (cause) {
+      if (!ours()) return;
       setProblem(sentenceOf(cause));
     } finally {
-      setPhase("idle");
+      if (ours()) setPhase("idle");
     }
-  }, [declareVoiceScreen, onDispatch, resolveVoice]);
+  }, [claim, declareVoiceScreen, onDispatch, resolveVoice]);
 
   const submitTyped = () => {
     if (!draft.trim() || phase === "resolving") return;
@@ -316,13 +392,20 @@ function VoiceDialog({ runtime, screen, onDispatch, onClose }: VoiceControlPanel
     // stop that is refused must not leave the previous one standing as if it
     // described this one.
     setCapture(undefined);
+    /* Claimed here as well as inside `runUtterance`, because transcription is
+       the FIRST await and a panel closed during it would otherwise reach the
+       resolve through a `runUtterance` that then claims the surface afresh —
+       the abandoned request laundering itself into a live one. */
+    const ours = claim();
     setPhase("transcribing");
     try {
       const transcription = await voiceStop();
+      if (!ours()) return;
       setCapture(transcription.outcome.sentence);
       setPhase("idle");
       if (transcription.outcome.kind === "heard") await runUtterance(transcription.outcome.transcript);
     } catch (cause) {
+      if (!ours()) return;
       setPhase("idle");
       setProblem(sentenceOf(cause));
     }
@@ -341,6 +424,11 @@ function VoiceDialog({ runtime, screen, onDispatch, onClose }: VoiceControlPanel
     microphone would survive.
   */
   const close = () => {
+    /* The webview half of the same cancel. `voiceCancel` releases the DEVICE;
+       this releases the pipeline behind it, which the device has no say over —
+       a transcription or a resolution already handed to a backend arrives
+       whatever the microphone does. */
+    abandon();
     void voiceCancel?.().catch(() => undefined);
     onClose();
   };
@@ -356,7 +444,25 @@ function VoiceDialog({ runtime, screen, onDispatch, onClose }: VoiceControlPanel
       <section
         className="voice-panel"
         role="dialog"
-        aria-modal="true"
+        /* NOT modal, stated rather than left to the default, because the
+           choice is deliberate and the opposite was shipped.
+
+           `aria-modal="true"` tells assistive technology that everything
+           outside the dialog is unavailable. This dialog inerts nothing: it is
+           a PEER of the agent pane by the exemption `useInertBackground`
+           documents, which exists so the `agent` screen's one command,
+           `close_agent_view`, is reachable by the surface that dispatches it.
+           An open agent pane therefore stays interactive beside this, and so
+           does the screen behind it. Claiming modality would describe an
+           interface that is not the one here, and the remedy is to correct the
+           claim rather than to withdraw the exemption — withdrawing it makes
+           the whole voice surface inert whenever a pane is open.
+
+           A non-modal dialog is also not obliged to trap focus, which is why
+           there is none: the input takes focus on open and `Tab` leaves, the
+           way it does out of any non-modal dialog. What closing it owes is the
+           keyboard position back, which the trigger's `ref` above provides. */
+        aria-modal="false"
         aria-label="Voice control"
         data-testid="voice-panel"
         onMouseDown={(event) => event.stopPropagation()}
