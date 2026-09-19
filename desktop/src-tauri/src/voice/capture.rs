@@ -267,11 +267,18 @@ struct SinkState {
 /// One sample as a device delivered it, normalised to `-1.0..=1.0`.
 ///
 /// A trait of this module's own rather than `cpal`'s conversion traits, so
-/// [`PcmSink`] names no `cpal` type at all and every test below drives it with
-/// plain slices. The ranges and origins are the ones `cpal::SampleFormat`
-/// documents: the signed formats sit at zero and the unsigned ones at the
-/// midpoint, which is why 128 in a `u8` stream is silence and not full negative
-/// scale.
+/// [`PcmSink`] names no `cpal` type at all and most of the tests below drive
+/// it with plain slices. The ranges and origins are the ones
+/// `cpal::SampleFormat` documents: the signed formats sit at zero and the
+/// unsigned ones at the midpoint, which is why 128 in a `u8` stream is silence
+/// and not full negative scale.
+///
+/// **The two 24-bit impls are the exception, and they have to be.** There is
+/// no Rust primitive for a 24-bit sample, so `cpal` carries its own
+/// `I24`/`U24` newtypes over `i32`, and a device delivering one hands the
+/// callback a slice of them. Converting through a temporary `Vec` to keep
+/// `cpal` out of this trait would allocate per callback, which is the one
+/// thing [`PcmSink::push`] is written not to do.
 ///
 /// Full scale in a signed format is `-MIN` rather than `MAX`, since two's
 /// complement is asymmetric — `i8::MAX` is 127/128 of full scale, and that is
@@ -329,10 +336,49 @@ impl DeviceSample for u16 {
     }
 }
 
+impl DeviceSample for i64 {
+    #[inline]
+    fn to_unit(self) -> f32 {
+        (self as f64 / -(i64::MIN as f64)) as f32
+    }
+}
+
 impl DeviceSample for u32 {
     #[inline]
     fn to_unit(self) -> f32 {
         ((f64::from(self) - 2_147_483_648.0) / 2_147_483_648.0) as f32
+    }
+}
+
+impl DeviceSample for u64 {
+    #[inline]
+    fn to_unit(self) -> f32 {
+        ((self as f64 - U64_ORIGIN) / U64_ORIGIN) as f32
+    }
+}
+
+/// `1 << 63`, the origin of a `u64` sample stream.
+const U64_ORIGIN: f64 = 9_223_372_036_854_775_808.0;
+
+/// Full scale for a 24-bit sample, `1 << 23`.
+///
+/// Both 24-bit formats share it: it is `-I24::MIN` and it is `U24`'s origin,
+/// which is the same relationship every other signed/unsigned pair here has.
+const SCALE_24: f32 = 8_388_608.0;
+
+impl DeviceSample for cpal::I24 {
+    #[inline]
+    fn to_unit(self) -> f32 {
+        self.inner() as f32 / SCALE_24
+    }
+}
+
+impl DeviceSample for cpal::U24 {
+    #[inline]
+    fn to_unit(self) -> f32 {
+        // `U24` is a 0..=(1 << 24) - 1 value carried in an `i32`, so the
+        // subtraction is what re-centres it; there is no wrapping to guard.
+        (self.inner() as f32 - SCALE_24) / SCALE_24
     }
 }
 
@@ -609,6 +655,11 @@ fn open_device(cap: Duration) -> Result<(cpal::Stream, Arc<PcmSink>), CaptureErr
     })?;
     let format = AudioFormat::new(supported.sample_rate(), supported.channels());
     let sample_format = supported.sample_format();
+    // Refused BEFORE the device is opened, which is the difference between a
+    // sentence a user can act on and a recording that heard nothing.
+    if let Some(refusal) = unsupported_format(sample_format) {
+        return Err(CaptureError::Device(refusal));
+    }
     let sink = Arc::new(PcmSink::new(format, cap));
 
     let filling = Arc::clone(&sink);
@@ -636,35 +687,83 @@ fn open_device(cap: Duration) -> Result<(cpal::Stream, Arc<PcmSink>), CaptureErr
     Ok((stream, sink))
 }
 
+/// `as_slice` answers `None` when the format does not match the type, which
+/// [`conversion_for`] has already decided — so this cannot silently drop a
+/// buffer the routing claimed to handle.
+fn take<S: cpal::SizedSample + DeviceSample>(sink: &PcmSink, data: &cpal::Data) {
+    if let Some(samples) = data.as_slice::<S>() {
+        sink.push(samples);
+    }
+}
+
+/// How one device format reaches the sink, or `None` where it cannot.
+///
+/// **One match with two consumers, and that is the whole point of it being a
+/// function.** [`open_device`] asks it before opening a device and refuses one
+/// it cannot read; [`feed`] asks it per callback and routes the buffer. Two
+/// lists would drift, and the drift is silent in precisely the direction that
+/// matters — a format accepted at open and unhandled in the callback is a
+/// microphone that records nothing and says nothing, which is the defect this
+/// shape replaced: `I24`, `U24`, `I64` and `U64` fell through an empty arm, so
+/// a device whose default input config named one of them recorded an empty
+/// buffer and the user was told the microphone heard nothing.
+///
+/// `cpal::SampleFormat` is `#[non_exhaustive]`, so the fall-through is
+/// load-bearing rather than tidy: a variant a later `cpal` adds is refused at
+/// open rather than dropped per callback.
+///
+/// **The DSD trio is the deliberate `None`.** It is a 1-bit sigma-delta stream
+/// and not PCM at all — turning it into samples needs a decimation filter,
+/// which is a signal-processing project rather than a [`DeviceSample`] impl.
+/// A user with such a device gets a sentence naming their format instead of a
+/// recording that heard nothing.
+fn conversion_for(format: cpal::SampleFormat) -> Option<fn(&PcmSink, &cpal::Data)> {
+    use cpal::SampleFormat as Format;
+
+    Some(match format {
+        Format::F32 => take::<f32>,
+        Format::F64 => take::<f64>,
+        Format::I8 => take::<i8>,
+        Format::I16 => take::<i16>,
+        Format::I24 => take::<cpal::I24>,
+        Format::I32 => take::<i32>,
+        Format::I64 => take::<i64>,
+        Format::U8 => take::<u8>,
+        Format::U16 => take::<u16>,
+        Format::U24 => take::<cpal::U24>,
+        Format::U32 => take::<u32>,
+        Format::U64 => take::<u64>,
+        _ => return None,
+    })
+}
+
+/// The sentence a device this build cannot read is refused with, or `None`
+/// when it can be read.
+///
+/// Actionable rather than apologetic: it names the format, because that is the
+/// one thing the user can take to their system's audio settings. The
+/// alternative it replaced was a device that opened, recorded, and yielded
+/// nothing.
+fn unsupported_format(format: cpal::SampleFormat) -> Option<String> {
+    if conversion_for(format).is_some() {
+        return None;
+    }
+    Some(format!(
+        "this microphone's sample format ({format}) is not one this build can \
+         record from — choose a different input device, or change its format \
+         in the system's audio settings"
+    ))
+}
+
 /// Convert one raw callback buffer into the sink.
 ///
-/// `cpal::SampleFormat` is `#[non_exhaustive]` and carries formats this build
-/// has no conversion for (`I24`, `U24`, `I64`, `U64`, the DSD trio). Those fall
-/// through and contribute nothing, which surfaces as an empty recording and the
-/// sentence the surface already renders for one — not a panic on a real-time
-/// audio thread.
+/// A buffer whose format has no conversion contributes nothing, which
+/// [`open_device`] has already made unreachable by refusing such a device —
+/// this is the second line of defence rather than the first, and it is silence
+/// rather than a panic because this runs on a real-time audio thread.
 fn feed(sink: &PcmSink, data: &cpal::Data) {
-    use cpal::SampleFormat;
-
-    /// `as_slice` answers `None` when the format does not match the type, which
-    /// the arms below have already decided — so this cannot silently drop a
-    /// buffer the match claimed to handle.
-    fn take<S: cpal::SizedSample + DeviceSample>(sink: &PcmSink, data: &cpal::Data) {
-        if let Some(samples) = data.as_slice::<S>() {
-            sink.push(samples);
-        }
-    }
-
-    match data.sample_format() {
-        SampleFormat::F32 => take::<f32>(sink, data),
-        SampleFormat::F64 => take::<f64>(sink, data),
-        SampleFormat::I8 => take::<i8>(sink, data),
-        SampleFormat::I16 => take::<i16>(sink, data),
-        SampleFormat::I32 => take::<i32>(sink, data),
-        SampleFormat::U8 => take::<u8>(sink, data),
-        SampleFormat::U16 => take::<u16>(sink, data),
-        SampleFormat::U32 => take::<u32>(sink, data),
-        _ => {}
+    if let Some(convert) = conversion_for(data.sample_format()) {
+        convert(sink, data);
     }
 }
 
@@ -980,16 +1079,24 @@ impl CaptureSession {
         if inner.state != CaptureState::Recording {
             return Err(CaptureError::Refused(refusal(inner.state, "stop")));
         }
-        let live = inner.live.take().ok_or_else(|| {
+        let Live { stream, sink } = inner.live.take().ok_or_else(|| {
             CaptureError::Device("the recording ended with no device attached".to_string())
         })?;
+        // Moved UNDER the lock, before anything slow happens, so nothing can
+        // start a recording in the window the teardown below opens —
+        // `Transcribing` is a state `accepts_start` refuses.
+        inner.state = CaptureState::Transcribing;
+        // And the lock goes before the device does. `AudioStream::drop` joins
+        // the device thread and is therefore as slow as the platform's own
+        // teardown; holding the session mutex across it parked every
+        // concurrent `status`, `cancel` and `start` behind a driver.
+        drop(inner);
         // Dropped BEFORE the buffer is read: the stream's `Drop` joins the
         // device thread, so no callback can still be writing when `finish`
-        // takes the samples.
-        drop(live.stream);
-        let pcm = live.sink.finish();
-        inner.state = CaptureState::Transcribing;
-        Ok(pcm)
+        // takes the samples. That ordering is what the lock was never needed
+        // for — it is between these two lines, not around them.
+        drop(stream);
+        Ok(sink.finish())
     }
 
     /// Transcribing → Done or Failed.
@@ -1021,11 +1128,15 @@ impl CaptureSession {
     /// generation as well keeps a cap timer for the abandoned utterance inert.
     pub fn cancel(&self) -> CaptureStatus {
         let mut inner = self.inner();
-        inner.live = None;
+        // TAKEN rather than cleared, so the device's teardown runs after the
+        // guard below is dropped — `inner.live = None` would have run it
+        // here, with the lock held. See [`CaptureSession::stop`].
+        let live = inner.live.take();
         inner.state = CaptureState::Idle;
         inner.generation += 1;
         inner.opening = None;
         drop(inner);
+        drop(live);
         self.status()
     }
 
@@ -1038,15 +1149,21 @@ impl CaptureSession {
     /// utterance is still the user's to send or discard, which is why
     /// [`CaptureStatus::capped`] exists.
     pub fn cap_reached(&self, ticket: CaptureTicket) -> CaptureStatus {
+        // The stream the substitution below displaces, carried out of the
+        // lock. `live.stream = Box::new(ClosedStream)` drops what it replaces
+        // AT the assignment — the least visible of this type's three teardowns
+        // and the same defect as the other two. See [`CaptureSession::stop`].
+        let mut released: Option<Box<dyn AudioStream>> = None;
         let mut inner = self.inner();
         if inner.generation == ticket.0
             && inner.state == CaptureState::Recording
             && let Some(live) = inner.live.as_mut()
         {
-            live.stream = Box::new(ClosedStream);
+            released = Some(std::mem::replace(&mut live.stream, Box::new(ClosedStream)));
             live.sink.full.store(true, Ordering::Relaxed);
         }
         drop(inner);
+        drop(released);
         self.status()
     }
 }
@@ -1244,8 +1361,20 @@ mod tests {
         }
     }
 
+    /// Scenario: convert a full-scale buffer in each encoding this build
+    /// accepts, and check where the rails and the origins land.
+    ///
+    /// **The name says "accepts" rather than "a device can deliver", and the
+    /// difference is the whole of PR #1163's finding 2.** It was the wider
+    /// name, while the module handled eight of the twelve PCM formats `cpal`
+    /// declares and dropped the other four — so a test that passed said
+    /// nothing about the formats that were broken. What a device can deliver
+    /// and what this converts are now the same set only because the DSD trio
+    /// is refused at open (see
+    /// `voice_capture_refuses_a_device_format_it_cannot_convert`), and the two
+    /// tests together are what makes the pair complete.
     #[test]
-    fn voice_capture_converts_every_sample_type_a_device_can_deliver() {
+    fn voice_capture_converts_every_sample_type_it_accepts() {
         // Full scale in each encoding lands at full scale in `i16`.
         let format = mono(TARGET_SAMPLE_RATE);
         fn one<S: DeviceSample>(format: AudioFormat, samples: &[S]) -> Vec<i16> {
@@ -1273,12 +1402,128 @@ mod tests {
         near_full(one(format, &[u8::MAX, u8::MAX, u8::MAX])[0]);
         near_full(one(format, &[u16::MAX, u16::MAX, u16::MAX])[0]);
         near_full(one(format, &[u32::MAX, u32::MAX, u32::MAX])[0]);
+        near_full(one(format, &[i64::MAX, i64::MAX, i64::MAX])[0]);
+        near_full(one(format, &[u64::MAX, u64::MAX, u64::MAX])[0]);
+        // The two 24-bit formats, which have no Rust primitive and arrive as
+        // `cpal`'s own newtypes over `i32`.
+        let i24 = |value: i32| cpal::I24::new(value).expect("in range");
+        let u24 = |value: i32| cpal::U24::new(value).expect("in range");
+        near_full(one(format, &[i24(8_388_607); 3])[0]);
+        near_full(one(format, &[u24(16_777_215); 3])[0]);
         // And the negative rail saturates rather than wrapping.
         assert_eq!(one(format, &[i8::MIN, i8::MIN, i8::MIN])[0], -i16::MAX);
         assert_eq!(one(format, &[u8::MIN, u8::MIN, u8::MIN])[0], -i16::MAX);
+        assert_eq!(one(format, &[i24(-8_388_608); 3])[0], -i16::MAX);
+        assert_eq!(one(format, &[u24(0); 3])[0], -i16::MAX);
         // And the unsigned origins are silence, not full negative scale.
         assert!(Pcm16::new(one(format, &[128u8; 8])).is_silent());
         assert!(Pcm16::new(one(format, &[32_768u16; 8])).is_silent());
+        assert!(Pcm16::new(one(format, &[u24(8_388_608); 8])).is_silent());
+        assert!(Pcm16::new(one(format, &[1u64 << 63; 8])).is_silent());
+    }
+
+    /// One callback buffer, built the way a host builds one.
+    ///
+    /// This is what lets the tests reach [`feed`] — the routing seam — rather
+    /// than only [`PcmSink::push`] behind it. The whole of the defect it was
+    /// written for lived in the routing: every conversion was correct and four
+    /// formats never reached one.
+    ///
+    /// `Data::from_parts` is `unsafe` because it cannot check the pointer
+    /// against the format it is told. Here the generic parameter IS the
+    /// format — `S::FORMAT` is written into the `Data` and the pointer comes
+    /// from a `&mut [S]` — so the obligation is discharged by construction.
+    fn callback<S: cpal::SizedSample>(samples: &mut [S]) -> cpal::Data {
+        unsafe { cpal::Data::from_parts(samples.as_mut_ptr().cast(), samples.len(), S::FORMAT) }
+    }
+
+    /// Scenario: hand the callback seam one full-scale buffer in every format
+    /// this build accepts from a device. Each one contributes audible samples.
+    ///
+    /// The regression is the four that did not. `I24`, `U24`, `I64` and `U64`
+    /// fell through an empty match arm, so a device whose default input config
+    /// named one of them opened, recorded, and delivered an empty buffer — the
+    /// user got "the microphone heard nothing" with nothing to act on. 24-bit
+    /// is ordinary on real interfaces, so this was not a corner.
+    #[test]
+    fn voice_capture_delivers_samples_for_every_format_it_accepts() {
+        fn heard<S: cpal::SizedSample>(samples: &mut [S]) {
+            let sink = PcmSink::new(mono(TARGET_SAMPLE_RATE), MAX_UTTERANCE);
+            feed(&sink, &callback(samples));
+            let pcm = sink.finish();
+            assert!(
+                !pcm.is_empty(),
+                "a {} device contributed no samples at all",
+                S::FORMAT
+            );
+            assert!(
+                !pcm.is_silent(),
+                "a {} device contributed silence from a full-scale buffer",
+                S::FORMAT
+            );
+        }
+        heard(&mut [1.0f32; 4]);
+        heard(&mut [1.0f64; 4]);
+        heard(&mut [i8::MAX; 4]);
+        heard(&mut [i16::MAX; 4]);
+        heard(&mut [cpal::I24::new(8_388_607).expect("in range"); 4]);
+        heard(&mut [i32::MAX; 4]);
+        heard(&mut [i64::MAX; 4]);
+        heard(&mut [u8::MAX; 4]);
+        heard(&mut [u16::MAX; 4]);
+        heard(&mut [cpal::U24::new(16_777_215).expect("in range"); 4]);
+        heard(&mut [u32::MAX; 4]);
+        heard(&mut [u64::MAX; 4]);
+    }
+
+    /// Scenario: ask what this build would do with a device whose format it
+    /// cannot convert. It refuses the device by name rather than opening one
+    /// that records nothing.
+    ///
+    /// The DSD trio is the whole of that set today, and it is a deliberate
+    /// refusal rather than an omission: a 1-bit sigma-delta stream is not PCM
+    /// and needs a decimation filter to become samples. What a user must never
+    /// get is a microphone that appears to work and yields an empty buffer, so
+    /// the refusal names the format they can change.
+    #[test]
+    fn voice_capture_refuses_a_device_format_it_cannot_convert() {
+        use cpal::SampleFormat as Format;
+
+        for format in [Format::DsdU8, Format::DsdU16, Format::DsdU32] {
+            let refusal = unsupported_format(format)
+                .unwrap_or_else(|| panic!("a {format} device must not be opened"));
+            assert!(
+                refusal.contains(&format.to_string()),
+                "the refusal does not name the format: {refusal}"
+            );
+            assert!(
+                refusal.contains("audio settings"),
+                "the refusal gives the user nothing to do: {refusal}"
+            );
+        }
+
+        // And nothing convertible is refused, which is the half that would
+        // otherwise turn a recording bug into a device nobody can use.
+        for format in [
+            Format::F32,
+            Format::F64,
+            Format::I8,
+            Format::I16,
+            Format::I24,
+            Format::I32,
+            Format::I64,
+            Format::U8,
+            Format::U16,
+            Format::U24,
+            Format::U32,
+            Format::U64,
+        ] {
+            assert_eq!(
+                unsupported_format(format),
+                None,
+                "{format} is refused although it converts"
+            );
+        }
     }
 
     #[test]
@@ -1686,5 +1931,167 @@ mod tests {
         fn assert_shared<T: Send + Sync>() {}
         assert_shared::<CaptureSession>();
         assert_shared::<Arc<dyn AudioSource>>();
+    }
+
+    // -- teardown off the lock ---------------------------------------------
+
+    /// A stream whose `Drop` blocks, the way a real driver's does.
+    ///
+    /// [`CpalStream::drop`] hangs up a channel and **joins** the device
+    /// thread, and that join is as slow as the platform's own teardown. The
+    /// three tests below are about what else may happen while it runs.
+    struct BlockingStream {
+        entered: std::sync::mpsc::Sender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+    }
+
+    impl AudioStream for BlockingStream {}
+
+    impl Drop for BlockingStream {
+        fn drop(&mut self) {
+            let _ = self.entered.send(());
+            let _ = self.release.recv();
+        }
+    }
+
+    /// Hands out exactly one [`BlockingStream`].
+    struct BlockingSource {
+        entered: std::sync::mpsc::Sender<()>,
+        release: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+    }
+
+    impl AudioSource for BlockingSource {
+        fn start(&self, cap: Duration) -> Result<Capture, CaptureError> {
+            let release = self
+                .release
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take()
+                .expect("this source hands out one stream");
+            Ok(Capture {
+                stream: Box::new(BlockingStream {
+                    entered: self.entered.clone(),
+                    release,
+                }),
+                sink: Arc::new(PcmSink::new(mono(TARGET_SAMPLE_RATE), cap)),
+            })
+        }
+    }
+
+    /// A session recording through a device whose teardown blocks, plus the
+    /// two ends of that block: *it has started* and *let it finish*.
+    fn blocking_teardown() -> (
+        Arc<CaptureSession>,
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let session = Arc::new(CaptureSession::new(Arc::new(BlockingSource {
+            entered: entered_tx,
+            release: Mutex::new(Some(release_rx)),
+        })));
+        session.start().expect("the stub device opens");
+        (session, entered_rx, release_tx)
+    }
+
+    /// Answer [`CaptureSession::status`] from another thread, giving up after
+    /// two seconds rather than hanging the suite.
+    ///
+    /// A hung test is a worse failure than a failed one: it reports nothing
+    /// until a CI timeout kills the whole job.
+    fn status_within(session: &Arc<CaptureSession>, what: &str) -> CaptureStatus {
+        let polling = Arc::clone(session);
+        let (answered, answer) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = answered.send(polling.status());
+        });
+        answer
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap_or_else(|_| {
+                panic!("a status poll blocked behind the device teardown in {what}")
+            })
+    }
+
+    /// Scenario: stop a recording whose device is slow to let go. While the
+    /// teardown runs, a concurrent status poll is still answered.
+    ///
+    /// The finding this is for: `stop` dropped the stream **while holding the
+    /// session mutex**, and that drop joins the device thread. On the async
+    /// side it is worse than a slow call — `desktop_voice_stop` is a runtime
+    /// task, so the join parked a runtime worker and every concurrent
+    /// `status`, `cancel` and `start` queued behind the mutex it was still
+    /// holding.
+    #[test]
+    fn voice_capture_stop_releases_the_lock_before_the_device_teardown() {
+        let (session, entered, release) = blocking_teardown();
+
+        let stopping = Arc::clone(&session);
+        let stopper = std::thread::spawn(move || stopping.stop());
+        entered
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the teardown started");
+
+        let status = status_within(&session, "stop");
+        // The state moved under the lock even though the device has not let
+        // go yet, which is what keeps a start from beginning here.
+        assert_eq!(status.state, CaptureState::Transcribing);
+
+        release.send(()).expect("the teardown is still waiting");
+        stopper
+            .join()
+            .expect("the stopping thread finished")
+            .expect("the stop succeeded");
+    }
+
+    /// Scenario: the same, for the cancel a closing panel makes. A status poll
+    /// arriving during the teardown is answered, and answered `Idle`.
+    #[test]
+    fn voice_capture_cancel_releases_the_lock_before_the_device_teardown() {
+        let (session, entered, release) = blocking_teardown();
+
+        let cancelling = Arc::clone(&session);
+        let canceller = std::thread::spawn(move || cancelling.cancel());
+        entered
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the teardown started");
+
+        assert_eq!(status_within(&session, "cancel").state, CaptureState::Idle);
+
+        release.send(()).expect("the teardown is still waiting");
+        canceller.join().expect("the cancelling thread finished");
+    }
+
+    /// Scenario: the same, for the length cap. It substitutes a closed stream
+    /// for the live one, and the live one's teardown must not run under the
+    /// lock either.
+    ///
+    /// This one is the least obvious of the three because the drop is
+    /// implicit: `live.stream = Box::new(ClosedStream)` drops what it
+    /// replaces, at the assignment, with the guard still in scope.
+    #[test]
+    fn voice_capture_the_cap_releases_the_lock_before_the_device_teardown() {
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let session = Arc::new(CaptureSession::new(Arc::new(BlockingSource {
+            entered: entered_tx,
+            release: Mutex::new(Some(release_rx)),
+        })));
+        let (_, ticket) = session.start().expect("the stub device opens");
+
+        let capping = Arc::clone(&session);
+        let capper = std::thread::spawn(move || capping.cap_reached(ticket));
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the teardown started");
+
+        // Still recording: the cap released the device, not the utterance.
+        assert_eq!(
+            status_within(&session, "cap_reached").state,
+            CaptureState::Recording
+        );
+
+        release_tx.send(()).expect("the teardown is still waiting");
+        capper.join().expect("the capping thread finished");
     }
 }
