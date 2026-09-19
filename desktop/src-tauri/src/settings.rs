@@ -430,15 +430,16 @@ impl<T: VoiceToken> serde::de::Visitor<'_> for VoiceTokenVisitor<T> {
 ///
 /// **`Off` is the default and is not a degraded mode.** PRD #802 says so as a
 /// product statement: transcription is the one stage with no no-key trick, so
-/// with nothing configured the surface still works from typed input through the
-/// identical resolve → validate → execute → report path, and the panel says
-/// what to add. Local whisper is the deferred milestone (D1) that removes the
-/// requirement; it is not a variant here because this build ships no adapter
-/// for it, and a settings value the app cannot honour is a lie in a file the
-/// user can read.
+/// the panel says what to add where the user meets it. Since M6 was rewritten to
+/// voice only there is no typed fallback behind it — the Voice button always
+/// renders, and pressing it with nothing configured names Settings → Voice
+/// rather than turning on. Local whisper is the deferred milestone (D1) that
+/// removes the requirement; it is not a variant here because this build ships
+/// no adapter for it, and a settings value the app cannot honour is a lie in a
+/// file the user can read.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum TranscriptionBackend {
-    /// No microphone path; typed input only.
+    /// No microphone path: pressing Voice names Settings → Voice instead.
     #[default]
     Off,
     /// The keyed remote service M7 ships. Its credential lives in
@@ -2989,8 +2990,8 @@ mod tests {
     ///
     /// The distinction is [`DesktopSettings::voice`]'s whole reason for being
     /// an `Option`, and the defaults it materialises to are the product
-    /// decision: **no transcription** (PRD #802 ships the surface working from
-    /// typed input, which is a statement rather than a degraded mode), the
+    /// decision: **no transcription** (a product statement rather than a
+    /// degraded mode — the Voice button renders and names Settings → Voice), the
     /// **agent CLI** for intent (no key, no download, try-able on day one), and
     /// the one **activation mode** that ships.
     #[test]

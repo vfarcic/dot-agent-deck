@@ -11,8 +11,8 @@
 //! because `wry` grants webview capture on one of the three platforms this app
 //! ships to — and [`transcribe`] owns the seam that turns its PCM into a
 //! [`Transcript`]. `off` is the default there and is a product statement, not a
-//! degraded mode: with it, the panel works from typed input through the
-//! identical path below.
+//! degraded mode: with it the Voice button still renders, and pressing it names
+//! Settings → Voice rather than turning on.
 //!
 //! **M5 brought the real backends.** [`agent_cli`] spawns the pre-authenticated
 //! CLI the user already has — no key of the app's own, no download, and slow;
@@ -76,7 +76,7 @@ pub use transcribe::{
 };
 
 /// What the user said, as text — from the microphone through the `Transcriber`
-/// seam (M7), or typed into the same box.
+/// seam (M7), which since the M6 rewrite is the only thing that produces one.
 ///
 /// **The rule this feature adopts: THIS APP writes no transcript, utterance or
 /// audio buffer to a log or to disk — and where it hands one to a child

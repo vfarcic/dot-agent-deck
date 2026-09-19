@@ -469,10 +469,11 @@ export const VOICE_INTENT_BACKENDS = ["claude", "remote"] as const;
  * Which backend turns speech into text (PRD #802 M7).
  *
  * `off` is the default and is a product statement rather than a degraded mode:
- * transcription is the one stage with no no-key trick, so with nothing
- * configured the surface still works from typed input through the identical
- * resolve → validate → execute → report path. Keep identical to
- * `TranscriptionBackend::TOKENS` in `src-tauri/src/settings.rs`.
+ * transcription is the one stage with no no-key trick, so the surface says what
+ * to add where the user meets it. Since M6 was rewritten to voice only there is
+ * no typed fallback behind it — the Voice button always renders, and pressing it
+ * with nothing configured names Settings → Voice rather than turning on. Keep
+ * identical to `TranscriptionBackend::TOKENS` in `src-tauri/src/settings.rs`.
  */
 export const VOICE_TRANSCRIPTION_BACKENDS = ["off", "remote"] as const;
 
@@ -578,9 +579,11 @@ export type VoiceCaptureState = "idle" | "recording" | "transcribing" | "done" |
  * What the webview is told about the microphone (`lib.rs`'s `VoiceStatus`).
  *
  * `available` is false exactly when `[voice] transcription` is `off`, which is
- * the default and is a product statement rather than a degraded mode: the panel
- * then offers typed input, renders no microphone control, and says nothing that
- * reads as broken.
+ * the default and is a product statement rather than a degraded mode. The panel
+ * renders the Voice button either way — neither hidden nor disabled, because a
+ * control that is not there says nothing and a greyed-out one reads as a fault.
+ * What `false` changes is what the press does: it reports `VOICE_UNAVAILABLE`,
+ * naming Settings → Voice, rather than turning voice on.
  *
  * `capped` is why the panel polls this between a start and a stop. From the
  * user's side the microphone simply stopped, and a surface that did not know
@@ -1081,13 +1084,15 @@ export interface DeckBridge {
    */
   declareVoiceScreen(screen: VoiceScreen): void;
   /**
-   * Take one utterance — typed, or transcribed from the microphone — to an
-   * outcome carrying the sentence to show (PRD #802 M6).
+   * Take one utterance — transcribed from the microphone — to an outcome
+   * carrying the sentence to show (PRD #802 M6).
    *
-   * **The same call for both**, which is what makes the spoken path and the
-   * typed path one path: a transcript from {@link voiceStop} goes in here
-   * exactly as the text of the panel's own box does, so nothing downstream can
-   * treat them differently.
+   * **Plain text in, outcome out, and nothing about a microphone in the
+   * signature.** A transcript from {@link voiceStop} goes in here as a string
+   * like any other, which is what lets the fixture bridge and the vitest suites
+   * drive the whole resolve path with no device anywhere near them. Since the
+   * M6 rewrite {@link voiceStop} is the only producer of one — the panel has no
+   * typed box — but this call does not know that and does not need to.
    *
    * Never rejects for a refusal: an action outside the table, an action this
    * screen cannot run, a param that resolves to nothing — each is a classified

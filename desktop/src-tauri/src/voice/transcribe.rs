@@ -13,8 +13,9 @@
 //! trick — Siri matches declared App Intents rather than handing over a
 //! transcript, `SFSpeechRecognizer` exists on one of three platforms, and local
 //! whisper is deferred to D1 behind a decision to take a C/C++ toolchain into
-//! `cargo test-fast`. So with nothing configured, the panel works from **typed
-//! input** through the identical resolve → validate → execute → report path.
+//! `cargo test-fast`. So with nothing configured there is **no fallback command
+//! path**: the Voice button still renders, and pressing it names Settings →
+//! Voice rather than turning on.
 //!
 //! That is why [`OffTranscriber`] answers [`TranscriptionError::NotConfigured`]
 //! and why [`TranscriptionOutcome`] carries
@@ -160,7 +161,7 @@ pub fn transcriber_for(
 /// The default, and **a first-class variant rather than a degraded mode**: it
 /// answers [`TranscriptionError::NotConfigured`] with a sentence that names
 /// where to fix it, and the surface renders that as an instruction beside a
-/// working typed-input box.
+/// Voice button that is still there to press once the setting is changed.
 pub struct OffTranscriber;
 
 /// What the user is told when nothing is configured.
@@ -168,8 +169,7 @@ pub struct OffTranscriber;
 /// One string rather than one per call site, because it is the sentence that
 /// has to read as an instruction: a second wording somewhere else is how it
 /// drifts into sounding like a failure.
-pub const NOT_CONFIGURED: &str =
-    "no transcription backend is configured — type your command, or choose one in Settings → Voice";
+pub const NOT_CONFIGURED: &str = "no transcription backend is configured — choose one in Settings → Voice, then press Voice again";
 
 impl Transcriber for OffTranscriber {
     fn transcribe<'a>(&'a self, _audio: &'a Pcm16) -> TranscribeFuture<'a> {
@@ -528,8 +528,8 @@ pub enum TranscriptionOutcome {
         transcript: Transcript,
         sentence: String,
     },
-    /// No transcription backend is configured. **Not a failure**: the panel
-    /// works from typed input and the sentence is a settings instruction.
+    /// No transcription backend is configured. **Not a failure**: the sentence
+    /// is a settings instruction naming Settings → Voice rather than an error.
     NotConfigured { detail: String, sentence: String },
     /// Speech could not be turned into text.
     Failed { detail: String, sentence: String },

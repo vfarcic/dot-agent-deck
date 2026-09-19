@@ -1656,10 +1656,12 @@ pub struct VoiceStatus {
     /// Whether a microphone path is offered at all.
     ///
     /// False when `[voice] transcription` is `off`, which is the default and is
-    /// a product statement rather than a degraded mode: the panel works from
-    /// typed input and says what to add. The surface reads this to decide
-    /// whether to render the button, and `desktop_voice_start` refuses anyway —
-    /// a user can change the setting between the two calls.
+    /// a product statement rather than a degraded mode: the surface says what to
+    /// add. The Voice button renders either way — neither hidden nor disabled —
+    /// so what the surface reads this *for*, at the press rather than at mount,
+    /// is whether to turn voice on or to report `VOICE_UNAVAILABLE` naming
+    /// Settings → Voice. `desktop_voice_start` refuses anyway, because a user
+    /// can change the setting between the two calls.
     pub available: bool,
     /// Which transcriber would answer — `off` or `remote`.
     pub backend: &'static str,
@@ -1811,9 +1813,9 @@ async fn desktop_voice_cancel(
 
 /// The longest utterance this build will resolve, in bytes.
 ///
-/// A transcript from the microphone is already bounded — `voice::MAX_UTTERANCE`
-/// caps the audio at 30 seconds — but a typed one is whatever reached the IPC
-/// boundary, and this command trusts that boundary no more than
+/// The panel's own transcripts are bounded — `voice::MAX_UTTERANCE` caps the
+/// audio at 30 seconds — but that cap bounds the *audio*, not what arrives at
+/// the IPC boundary, and this command trusts that boundary no more than
 /// [`validate_agent_id`] does: an utterance becomes part of a model prompt and,
 /// for the agent-CLI backend, an argument to a child process. 2 KiB is far past
 /// any spoken command — thirty seconds of speech is around 700 characters —

@@ -106,9 +106,9 @@ impl AudioFormat {
 pub enum CaptureError {
     /// No microphone path is offered — `[voice] transcription` is `off`.
     ///
-    /// Not a failure. PRD #802 makes `off` a product statement: the panel works
-    /// from typed input through the identical downstream path, and the sentence
-    /// is a settings instruction.
+    /// Not a failure. PRD #802 makes `off` a product statement, and the sentence
+    /// is a settings instruction rather than an error: the Voice button still
+    /// renders, and pressing it names Settings → Voice rather than turning on.
     NotConfigured(String),
     /// The state machine refused the transition — a double start, a stop when
     /// nothing is recording. A caller bug, reported rather than panicked on.
