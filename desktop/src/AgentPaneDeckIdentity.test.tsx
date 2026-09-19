@@ -374,21 +374,53 @@ describe("agent pane identity fence", () => {
   }
 
   /**
-   * Scenario: open Planner's pane from the deck and try to reach the screen
-   * behind it. Every control on the base screen — the deck selector above all —
-   * is inert, while the peer Voice surface remains reachable; focus has moved
-   * into the pane, and closing gives the screen back exactly as it was.
+   * Scenario: ask Voice to open Planner's pane, leaving its navigation Undo
+   * beside the pane. The trigger and Undo remain reachable while every base
+   * control is inert, and closing gives the screen back exactly as it was.
   */
-  it("makes the base screen inert except for Voice while a pane is open, and gives it back on close", () => {
+  it("makes the base screen inert except for Voice and its Undo while a pane is open", async () => {
+    let recording = false;
+    let delivered = false;
+    const microphoneStatus = (state: "idle" | "recording" | "done") => ({
+      state,
+      capturedMs: state === "done" ? 900 : 0,
+      maxMs: 30_000,
+      capped: false,
+      available: true,
+      backend: "remote" as const,
+    });
     const deck = harness(documentWithFleet(), {
       resolveVoice: vi.fn(async (utterance: string) => ({
-        // `as const` and nothing else: without it `kind` widens to `string`,
-        // which is not a `VoiceOutcomeDto` discriminant, and `tsc --noEmit`
-        // refuses the whole runtime. It changes nothing this test asserts.
-        outcome: { kind: "no_match" as const, transcript: utterance, sentence: "No matching action." },
+        outcome: {
+          kind: "dispatch" as const,
+          transcript: utterance,
+          action: "open_agent",
+          invoke: "openAgent",
+          params: [{ name: "agent", kind: "agent_ref", spoken: "Planner", value: "planner", label: "Planner" }],
+          sentence: "Opening Planner.",
+        },
         resolveMs: null,
         backend: "stub",
       })),
+      voiceStart: vi.fn(async () => {
+        recording = true;
+        return microphoneStatus("recording");
+      }),
+      voiceStatus: vi.fn(async () => {
+        if (!recording) return microphoneStatus("idle");
+        if (!delivered) {
+          delivered = true;
+          return microphoneStatus("done");
+        }
+        return microphoneStatus("recording");
+      }),
+      voiceStop: vi.fn(async () => ({
+        outcome: { kind: "heard" as const, transcript: "open Planner", sentence: "Heard: “open Planner”." },
+        transcribeMs: 12,
+        backend: "stub",
+        audioMs: 900,
+      })),
+      voiceCancel: vi.fn(async () => microphoneStatus("idle")),
     });
     render(<DeckShell runtime={deck.runtime("local")} initialView={{ kind: "deck" }} />);
 
@@ -397,17 +429,15 @@ describe("agent pane identity fence", () => {
     expect(screen.getByTestId("deck-selector-toggle")).toBeVisible();
     expect(screen.getByTestId("deck-selector-toggle").closest("[inert]")).toBeNull();
 
-    fireEvent.click(screen.getByRole("button", { name: "Open Planner agent" }));
-    const pane = screen.getByTestId("agent-pane-overlay");
+    fireEvent.click(screen.getByTestId("voice-trigger"));
+    const pane = await screen.findByTestId("agent-pane-overlay");
+    const undo = screen.getByRole("button", { name: "Undo" });
 
     expect(screen.getByTestId("deck-selector-toggle").closest("[inert]")).not.toBeNull();
-    // Voice is a peer, not background. Equality to this one-element set keeps
-    // the containment assertion strict: any other reachable control is a
-    // regression, rather than something an allow-list filter could hide.
-    // The voice REPORT is exempt too and is mounted here, but it is empty — it
-    // holds a reachable control only while it is showing an Undo, which this
-    // test never opens. Read the equality as covering the trigger alone.
-    expect(reachableOutside(pane)).toEqual([screen.getByTestId("voice-trigger")]);
+    // Voice and its report are peers, not background. Equality to this complete
+    // set keeps the containment assertion strict: any other reachable control
+    // is a regression, rather than something an allow-list filter could hide.
+    expect(reachableOutside(pane)).toEqual([screen.getByTestId("voice-trigger"), undo]);
     // And the pane itself is genuinely live, so this is containment rather than
     // a screen that has simply been switched off.
     expect(within(pane).getByRole("button", { name: "Close Planner agent" })).toBeVisible();

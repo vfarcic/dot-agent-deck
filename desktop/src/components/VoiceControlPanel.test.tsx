@@ -23,6 +23,7 @@ import {
   SCREEN_MOVED_ON,
   VOICE_CAP_DISCARDED,
   VOICE_STATUS_POLL_MS,
+  VOICE_UNAVAILABLE,
   VOICE_UNDO_WINDOW_MS,
 } from "./VoiceControlPanel";
 
@@ -335,6 +336,26 @@ describe("voice control panel", () => {
     expect(voice.voiceStart).not.toHaveBeenCalled();
     expect(voiceButton()).toHaveAttribute("aria-pressed", "false");
     expect(screen.queryByRole("dialog", { name: "Voice control" })).not.toBeInTheDocument();
+  });
+
+  /**
+   * Scenario: press Voice in a runtime that can resolve commands but has no
+   * microphone verbs. It reports how to enable capture and remains visibly off.
+   */
+  it("does not latch on when the runtime has no microphone capture verbs", async () => {
+    const withoutCapture: DeckRuntimeState = runtime(resolver(result(DISPATCH)));
+    delete withoutCapture.voiceStart;
+    delete withoutCapture.voiceStop;
+    delete withoutCapture.voiceStatus;
+    delete withoutCapture.voiceCancel;
+    render(<DeckShell runtime={withoutCapture} />);
+
+    await act(async () => { fireEvent.click(voiceButton()); await Promise.resolve(); });
+
+    expect(voiceButton()).toHaveAttribute("aria-pressed", "false");
+    expect(voiceButton()).toHaveTextContent(/voice\s+off/i);
+    expect(await screen.findByText(VOICE_UNAVAILABLE)).toBeVisible();
+    expect(screen.getByTestId("voice-report")).not.toHaveTextContent("Opening the microphone…");
   });
 
   /** Scenario: open an agent pane and activate Voice beside it. The button stays reachable and no dialog covers the pane. */
