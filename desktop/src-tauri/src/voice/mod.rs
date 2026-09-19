@@ -146,20 +146,47 @@ impl From<String> for Transcript {
     }
 }
 
-/// Snapshot-agent fixtures, shared by every test module under `voice`.
+/// Snapshot-agent builders for tests, in the crate's own `src/` so there is ONE
+/// construction site for [`DesktopAgent`]'s sixteen fields rather than one per
+/// test module.
 ///
-/// One construction site for [`DesktopAgent`]'s fifteen fields rather than one
-/// per module: `outcome`, `prompt` and `remote` all need agents to resolve a
-/// spoken reference against, and three literals would be three things to edit
-/// when the DTO gains a field.
-#[cfg(test)]
-pub(crate) mod fixtures {
+/// # Why this is `pub` when nothing in production calls it
+///
+/// `mod dto` is private, so `DesktopTab` and `DesktopActiveTool` are not
+/// nameable from outside this crate — which means an **integration** test
+/// (`tests/voice_phrase_fixtures.rs`, PRD #802 M9) cannot write a `DesktopAgent`
+/// literal at all, however `pub` the struct itself is. The credentialed phrase
+/// fixtures have to plant live state to prove a reference like *"the one that's
+/// stuck"* resolves, and an integration test compiles against the lib with
+/// `cfg(test)` **off**, so the `#[cfg(test)]` module this replaced was invisible
+/// to it.
+///
+/// # How it is kept from becoming a production API
+///
+/// Three things, and the first is the one that matters:
+///
+/// - **nothing under `src/` may call it**, which is a rule rather than a
+///   mechanism — but a cheap one to check (`grep -rn test_support src/`) and one
+///   whose violation is obvious in review, since every caller here would be
+///   building a fake agent in a crate whose whole job is projecting real ones;
+/// - `#[doc(hidden)]`, so it is not offered to anybody reading the crate's docs;
+/// - the name says it, at the call site as well as here.
+///
+/// **Deliberately NOT behind a cargo feature**, which is the tempting way to
+/// keep it out of a normal build. This repository has closed that hole class
+/// three times (#407, #436, #502) and `Cargo.toml`'s `cpal` entry states the
+/// reason at length: code behind a feature nobody's gate enables is type-checked
+/// by nothing and lints clean by compiling nothing. A `pub` module compiles and
+/// lints on every gate, and a builder of five statements costs the binary
+/// nothing worth measuring.
+#[doc(hidden)]
+pub mod test_support {
     use super::DesktopAgent;
-    use crate::dto::DesktopTab;
+    use crate::dto::{DesktopActiveTool, DesktopTab};
 
     /// A snapshot agent. Only the fields a spoken reference can reach are
     /// interesting; the rest are what the daemon would have reported.
-    pub(crate) fn agent(id: &str, display_name: Option<&str>, agent_type: &str) -> DesktopAgent {
+    pub fn agent(id: &str, display_name: Option<&str>, agent_type: &str) -> DesktopAgent {
         DesktopAgent {
             id: id.to_string(),
             pane_id: None,
@@ -182,7 +209,7 @@ pub(crate) mod fixtures {
 
     /// An agent the deck names by its orchestration ROLE, which is how a user
     /// refers to one out loud.
-    pub(crate) fn role_agent(id: &str, role: &str) -> DesktopAgent {
+    pub fn role_agent(id: &str, role: &str) -> DesktopAgent {
         let mut agent = agent(id, None, "claude_code");
         agent.tab = DesktopTab::Orchestration {
             name: "build".to_string(),
@@ -195,7 +222,36 @@ pub(crate) mod fixtures {
         };
         agent
     }
+
+    /// The same agent, in a named live state — what the M9 fixtures plant so a
+    /// spoken reference like *"the one that's stuck"* has something to resolve
+    /// against.
+    ///
+    /// `status` is a string rather than an enum because that is what the DTO
+    /// carries: the daemon owns the vocabulary (`working`, `waiting_for_input`,
+    /// `error`, …) and this crate copies it through. A test that plants a word
+    /// no daemon emits is testing nothing, so pass one of the daemon's.
+    pub fn role_agent_in_state(id: &str, role: &str, status: &str) -> DesktopAgent {
+        let mut agent = role_agent(id, role);
+        agent.status = status.to_string();
+        agent
+    }
+
+    /// An agent with a tool running, for the other half of the live state the
+    /// prompt carries.
+    pub fn with_tool(mut agent: DesktopAgent, name: &str, detail: Option<&str>) -> DesktopAgent {
+        agent.active_tool = Some(DesktopActiveTool {
+            name: name.to_string(),
+            detail: detail.map(str::to_string),
+        });
+        agent
+    }
 }
+
+/// The in-crate spelling of [`test_support`], so the test modules under `voice`
+/// keep the import they had.
+#[cfg(test)]
+pub(crate) use test_support as fixtures;
 
 #[cfg(test)]
 mod tests {

@@ -567,7 +567,12 @@ fn spoken_names(agent: &DesktopAgent) -> Vec<String> {
 /// The role, as `bridge.ts`'s `roleFromAgent` derives it: the orchestration
 /// role when there is one, the agent type otherwise, underscores spelled as
 /// spaces because nobody says "claude underscore code".
-fn role_name(agent: &DesktopAgent) -> Option<String> {
+///
+/// `pub(super)` since M7's follow-up: [`super::prompt::state`] puts the role
+/// beside the label so a model can see the OTHER name the deck shows for an
+/// agent, and deriving it twice is how the name the model is shown and the name
+/// a spoken reference is matched against would come to disagree.
+pub(super) fn role_name(agent: &DesktopAgent) -> Option<String> {
     let value = match &agent.tab {
         DesktopTab::Orchestration { role_name, .. } => role_name.clone(),
         _ => agent.agent_type.replace('_', " "),
@@ -597,6 +602,16 @@ pub(super) fn display_label(agent: &DesktopAgent, agents: &[DesktopAgent]) -> St
         .position(|candidate| candidate.id == agent.id)
         .unwrap_or(0);
     format!("Agent {}", index + 1)
+}
+
+/// Whether two names are the same name to a speaker.
+///
+/// The prompt puts a role or a CLI name beside the label only when it is not
+/// already the label, and "not already" has to mean what [`normalize`] means or
+/// `claude_code` would be listed beside `Claude Code` as if they were two
+/// things to choose between.
+pub(super) fn same_spoken_name(one: &str, other: &str) -> bool {
+    normalize(one) == normalize(other)
 }
 
 /// Lowercase, with `_` and `-` spelled as spaces and runs of whitespace

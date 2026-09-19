@@ -39,7 +39,15 @@ pub const TOOL_INSTRUCTIONS: &str = "Pick the deck action the user asked for. Pi
     Every action is listed whether or not it can run right now: `callable: false` \
     means it exists but the current screen cannot run it, and picking it is the \
     right answer when that is what the user asked for. Answer `none` when the \
-    request does not match any action listed — do not force a pick. Write no prose; \
+    request does not match any action listed — do not force a pick. \
+    `agents_on_screen` carries each agent's LIVE state as the deck holds it: \
+    `status` is the daemon's own word for what it is doing (`working`, `thinking`, \
+    `compacting`, `waiting_for_input`, `idle`, `error`, `unknown`, `running`), and \
+    `tool` is what it is running right now. A user refers to an agent by state as \
+    readily as by name — \"the one that is stuck\", \"whichever is waiting\" — so \
+    resolve such a reference against those fields and answer with that agent's \
+    `label`. For a reference the user made by name, answer with the words the user \
+    used and let the app resolve them. Write no prose; \
     the app writes what the user reads.";
 
 /// One row as the model sees it, with its availability on the screen the
