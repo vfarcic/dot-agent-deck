@@ -467,9 +467,12 @@ export function AgentTile({
                 role="status"
                 /* The exact instant behind the sentence's relative age, the
                    same pairing every other relativised instant in this app
-                   uses (`ActivityDisplay`). Absent where there is no held
-                   record to date. */
-                title={noTerminal.noticeTitle}
+                   uses (`ActivityDisplay`) — and labelled here rather than
+                   left bare, exactly as the overview's activity and uptime
+                   cells label theirs, because an ISO string alone in a tooltip
+                   says nothing about what it is the time OF. Absent where
+                   there is no held record to date. */
+                title={noTerminal.noticeTitle && `Last reported by the deck at: ${noTerminal.noticeTitle}`}
               >
                 <Unplug size={15} aria-hidden="true" />
                 <span>{noTerminal.notice}</span>

@@ -247,7 +247,7 @@ describe("a pane with no terminal", () => {
     //    asserted exactly in `lib/terminalInput.test.ts`, against an injected
     //    age; what this proves is that a REAL instant reached it.
     expect(absent).toHaveTextContent(/last reported (just now|\d+[mhd] ago), and nothing in it is being updated/);
-    expect(absent.getAttribute("title")).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+    expect(absent.getAttribute("title")).toMatch(/^Last reported by the deck at: \d{4}-\d{2}-\d{2}T/);
     // 2. The machine-readable seam, sibling of `data-status`.
     expect(pane.querySelector(".agent-tile")).toHaveAttribute("data-agent-record", "held");
     // 3. The status stops asserting. It is the field that lies hardest — a bare

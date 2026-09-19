@@ -489,6 +489,15 @@ function OverviewAgentPane({ runtime, view, deck, agent, held, attached, onClose
          it names it with `deckName`, which is what the overview's group header
          the user just came from calls it. Reached only where that deck has no
          live link: a merely NON-SELECTED deck attaches like any other. */
+      /* Issue #1143 — the relative age is computed at RENDER and needs no clock
+         of its own, unlike the overview's two relative columns: an unreachable
+         deck's watcher takes `spawn_deck_watcher`'s no-link arm every
+         iteration, emitting a snapshot before it sleeps `WATCH_RETRY_DELAY`
+         (1s), `emit_snapshot` is a bare `app.emit` with no dedupe, and
+         `adoptFleet` rebuilds the fleet on each one — so this re-renders an
+         order of magnitude more often than `OVERVIEW_CLOCK_TICK_MS` would tick
+         it. The `title` needs none of that argument: an absolute instant
+         cannot decay. */
       noTerminal={attached ? undefined : unreachableDeckTerminalState(deckName(deck.connection), deck.connection.message, displayActivity(held?.confirmedAt))}
       /* Issue #1143 — `held` is set only where the live lookup found nothing,
          so its presence IS the claim that what the header shows is older than
