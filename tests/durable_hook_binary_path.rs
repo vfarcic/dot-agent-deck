@@ -338,6 +338,62 @@ fn claude_auto_install_never_writes_the_build_artifact_it_is_running_from() {
     }
 }
 
+/// Issue #1140, and the arithmetic is the assertion: ten entries beside ten.
+///
+/// A copy of the deck pinned somewhere scratch to drive an isolated sandbox is
+/// outside `target/`, so PRD #381's artifact guard passes it, and it used to be
+/// written into the global config *beside* the install's own rules — the
+/// installer normalises only the rules naming the binary currently installing,
+/// so two paths mean two sets. Resolving the scratch copy to the install is
+/// what makes the second pass a no-op rather than a duplicate: it is the string
+/// already in the file.
+///
+/// Both halves matter. A test asserting only "the scratch path is absent" would
+/// also pass if the second pass had wiped the first's rules.
+#[test]
+fn a_scratch_copy_adds_no_second_set_of_rules_beside_the_install() {
+    let fixture = Fixture::new();
+    let home = fixture.home();
+    let durable = fixture.durable();
+    let settings = fixture.settings();
+    let scratch = fixture
+        .path()
+        .join("var")
+        .join("tmp")
+        .join("dad-branch")
+        .join(durable_file_name());
+    write_executable(&scratch);
+
+    // The installed deck writes its own set, exactly as the released one does.
+    fixture.auto_install(&settings, || {
+        durable_binary_path_with(Ok(durable.clone()), &home, None)
+    });
+    let installed_count = deck_commands(&settings, CLAUDE_SUFFIX).len();
+    assert_eq!(
+        installed_count, 10,
+        "one deck rule per hook type is the premise this test counts against"
+    );
+
+    // Then the scratch copy runs against the same config.
+    fixture.auto_install(&settings, || {
+        durable_binary_path_with(Ok(scratch.clone()), &home, None)
+    });
+
+    let commands = deck_commands(&settings, CLAUDE_SUFFIX);
+    assert_eq!(
+        commands.len(),
+        installed_count,
+        "the scratch copy added a second set of rules — issue #1140: {commands:?}"
+    );
+    let expected = format!("{} {CLAUDE_SUFFIX}", durable.display());
+    for command in &commands {
+        assert_eq!(
+            command, &expected,
+            "every surviving rule must still name the install"
+        );
+    }
+}
+
 /// The same property for Codex's `hooks.json`, which is a separate writer with
 /// its own document shape.
 #[test]

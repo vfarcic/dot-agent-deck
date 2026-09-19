@@ -402,11 +402,11 @@ pub fn binary_name() -> String {
 /// Resolution order:
 ///
 /// 1. `current_exe()`, when it is a usable absolute path to an executable file
-///    that is **not** a cargo build artifact ([`is_build_artifact_path`]). An
+///    that is **not** a cargo build artifact ([`is_build_artifact_path`]) and
+///    that sits at an **install location** ([`is_installed_location`]). An
 ///    installed binary performing its own install is the normal, correct case
 ///    and must keep working.
-/// 2. It IS a build artifact — gitignored, deleted by `cargo clean`, and gone
-///    the moment its worktree is pruned, so it must never be persisted:
+/// 2. It is NOT such a path, so it must never be persisted:
 ///    - **2a.** `<home>/.local/bin/dot-agent-deck`, when that exists and is
 ///      executable — the same choice `remote.rs`'s remote install already
 ///      makes ("Use the absolute path consistently");
@@ -425,6 +425,27 @@ pub fn binary_name() -> String {
 ///    file Claude Code hands to `/bin/sh` re-opens the same `$PATH` miss in
 ///    the one place the deck can least afford it, and unlike [`binary_name`]'s
 ///    consumers there is no shell here whose `$PATH` might still save it.
+///
+/// **Step 1 is held to the same standard steps 2a and 2b apply, and issue
+/// #1140 is what happens when it is not.** Until that issue, step 1 asked only
+/// "is this not under `target/{debug,release}`", so a build copied somewhere
+/// scratch to run — the field case was `/var/tmp/dad-branch/bin/dot-agent-deck`,
+/// a branch build pinned there to drive an isolated sandbox daemon — was
+/// treated as durable and written into the **global** config of every supported
+/// agent, *beside* the installed release's own entries rather than replacing
+/// them (the installers normalise only rules naming the same binary, so two
+/// paths mean two rules). The resolver already knew what durable meant: it is
+/// the canonical `~/.local/bin` install target, or a directory on `$PATH`.
+/// Step 1 was simply exempt from its own fallbacks' definition, keeping a path
+/// it would never have *chosen*. It no longer is, so such a build falls through
+/// to 2a and 2b — and where an install is there to be found, what comes back is
+/// the string the config already carries, which is what makes the write add
+/// nothing instead of a second set of rules.
+///
+/// The cost is deliberate and is the point: a deck run from a location that is
+/// neither `~/.local/bin` nor on `$PATH`, with no other deck to fall back to,
+/// refuses instead of pinning itself. That is 2c, whose message says how to
+/// install ([`repair_advice`]), and a refusal writes nothing at all.
 ///
 /// **The 2a candidate is deliberately NOT canonicalized.** On Linux
 /// `current_exe()` reads `/proc/self/exe`, which the kernel resolves fully, so
@@ -498,7 +519,12 @@ pub fn durable_binary_path_with(
     // durable `~/.local/bin` launch into the artifact it points at.
     let absolute = std::path::absolute(&exe).unwrap_or(exe);
 
+    // Issue #1140: `is_installed_location` is what holds step 1 to steps 2a and
+    // 2b's own standard. Without it a scratch copy of the deck — outside
+    // `target/`, so past the artifact check — was persisted into every agent's
+    // global hook config beside the installed release's entries.
     if !is_build_artifact_path(&absolute)
+        && is_installed_location(&absolute, home, path_value)
         && is_executable_file(&absolute)
         && let Some(path) = durable_path_string(&absolute)
     {
@@ -527,18 +553,28 @@ pub fn durable_binary_path_with(
          at `{}` or on `$PATH`, and a hook command pointing at a path that will not exist is \
          worse than no hook at all. {}",
         absolute.display(),
-        rejection_reason(&absolute),
+        rejection_reason(&absolute, home, path_value),
         installed.display(),
         repair_advice(&installed)
     ))
 }
 
 /// Why `exe` was not usable as the written path, for the refusal message.
-fn rejection_reason(exe: &Path) -> String {
+fn rejection_reason(exe: &Path, home: &Path, path_value: Option<&std::ffi::OsStr>) -> String {
     if is_build_artifact_path(exe) {
         "it is a cargo build artifact — gitignored, removed by `cargo clean`, and gone the \
          moment its worktree is pruned"
             .to_string()
+    } else if !is_installed_location(exe, home, path_value) {
+        // Issue #1140. Named separately from the two below because the operator
+        // sees a path that exists, is executable, and looks perfectly fine.
+        format!(
+            "it is not an installed dot-agent-deck — it sits in `{}`, which is neither `{}` nor \
+             an absolute entry on `$PATH`, so nothing here can vouch that it will still be \
+             there when a hook fires",
+            exe.parent().unwrap_or(exe).display(),
+            home.join(".local").join("bin").display(),
+        )
     } else {
         "it is not a usable absolute path to an executable file".to_string()
     }
@@ -613,6 +649,56 @@ pub(crate) fn is_build_artifact_path(path: &Path) -> bool {
         parent = Some(name);
     }
     false
+}
+
+/// Whether `exe` sits where an **installed** `dot-agent-deck` sits: directly in
+/// the canonical `<home>/.local/bin` install target, or directly in a directory
+/// named by an absolute, non-artifact entry of a `$PATH`-shaped value.
+///
+/// This is the definition [`durable_binary_path`]'s steps 2a and 2b already
+/// search by, lifted out so step 1 can be held to it as well (issue #1140). It
+/// asks about the **location only**. It does not re-check the executable bit —
+/// step 1's own conjunction does that — and it deliberately does not check the
+/// write mode, because [`write_mode_is_owner_only`] is scoped to 2a and 2b for
+/// the reason recorded there: applying it to the binary the user is already
+/// running turns a loose mode on a legitimate install prefix into a refusal,
+/// which is issue #732's question and not this one's.
+///
+/// Directories are compared **lexically** — [`std::path::absolute`] on both
+/// sides, never `canonicalize`. Resolving symlinks here would undo the property
+/// step 2a depends on (a `~/.local/bin` name pointing into a worktree is a
+/// durable *name*, which is the whole reason 2a is not canonicalized either).
+/// Lexical comparison errs toward `false`, which is the harmless direction: a
+/// `$PATH` entry spelled through a symlinked directory does not match here, and
+/// the resolver falls through to 2b, which walks `$PATH` for that same name.
+/// Not necessarily to the same answer, note — 2b applies
+/// [`write_mode_is_owner_only`], which step 1 deliberately does not — so what
+/// the fall-through buys is a path resolved under 2b's rules rather than a
+/// guarantee of the same string.
+fn is_installed_location(exe: &Path, home: &Path, path_value: Option<&std::ffi::OsStr>) -> bool {
+    let Some(parent) = exe.parent() else {
+        return false;
+    };
+    let parent = lexical_absolute(parent);
+
+    if lexical_absolute(&home.join(".local").join("bin")) == parent {
+        return true;
+    }
+
+    path_value.is_some_and(|value| {
+        std::env::split_paths(value)
+            .filter(|dir| !is_untrustworthy_path_entry(dir))
+            .any(|dir| !is_build_artifact_path(&dir) && lexical_absolute(&dir) == parent)
+    })
+}
+
+/// `path` made absolute against the process cwd, lexically — the one spelling
+/// [`is_installed_location`] compares directories by, so that a trailing
+/// separator or a `.` component in a `$PATH` entry does not decide the answer.
+/// Falls back to the path as given when even that fails, which keeps the
+/// comparison total rather than introducing a third outcome.
+fn lexical_absolute(path: &Path) -> PathBuf {
+    std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 /// The first `name` reachable through an absolute, non-artifact entry of a
@@ -2951,26 +3037,124 @@ mod tests {
 
     /// Step 1: an installed binary performing its own install keeps working —
     /// `current_exe()` is returned unchanged.
+    ///
+    /// **The `$PATH` argument became load-bearing here in issue #1140, and it is
+    /// the fixture that carries this test's own premise rather than a detail.**
+    /// This used to pass `None`, which made the assertion "any non-`target/`
+    /// path is returned unchanged" — and that pinned contract is exactly the
+    /// defect: a scratch copy of the deck satisfied it. What step 1 is actually
+    /// for is an *installed* deck installing its own hooks, so the fixture now
+    /// says so, by putting the directory it was installed into on `$PATH`.
+    /// `durable_binary_path_refuses_a_current_exe_that_is_not_installed` is the
+    /// other side of the same line.
     #[test]
     fn durable_binary_path_returns_a_non_artifact_current_exe_unchanged() {
         let dir = crate::test_temp::tempdir().expect("resolver tempdir");
-        let installed = dir
-            .path()
-            .join("usr")
-            .join("local")
-            .join("bin")
-            .join(format!(
-                "{DEFAULT_BINARY_NAME}{}",
-                std::env::consts::EXE_SUFFIX
-            ));
+        let install_dir = dir.path().join("usr").join("local").join("bin");
+        let installed = install_dir.join(format!(
+            "{DEFAULT_BINARY_NAME}{}",
+            std::env::consts::EXE_SUFFIX
+        ));
+        write_stub_executable(&installed);
+        let path_value = std::env::join_paths([install_dir]).expect("join synthetic PATH");
+
+        let resolved = durable_binary_path_with(
+            Ok(installed.clone()),
+            dir.path(),
+            Some(path_value.as_os_str()),
+        );
+
+        assert_eq!(
+            assert_durable(&resolved),
+            installed.to_str().expect("candidate path is UTF-8"),
+            "a durable current_exe() must be used as-is, not re-resolved"
+        );
+    }
+
+    /// Step 1's other half, and the same claim without `$PATH`: a deck running
+    /// from the canonical `<home>/.local/bin` install target is installed by
+    /// definition, so it is returned unchanged even with no `$PATH` at all.
+    #[test]
+    fn durable_binary_path_returns_a_current_exe_in_the_home_install_dir_unchanged() {
+        let dir = crate::test_temp::tempdir().expect("resolver tempdir");
+        let installed = dir.path().join(".local").join("bin").join(format!(
+            "{DEFAULT_BINARY_NAME}{}",
+            std::env::consts::EXE_SUFFIX
+        ));
         write_stub_executable(&installed);
 
         let resolved = durable_binary_path_with(Ok(installed.clone()), dir.path(), None);
 
         assert_eq!(
             assert_durable(&resolved),
-            installed.to_str().expect("candidate path is UTF-8"),
-            "a durable current_exe() must be used as-is, not re-resolved"
+            installed.to_str().expect("candidate path is UTF-8")
+        );
+    }
+
+    /// Issue #1140, the field shape: the deck is running from a copy pinned
+    /// somewhere scratch (`/var/tmp/dad-branch/bin/dot-agent-deck` in the
+    /// report) to drive an isolated sandbox, and a real install exists. The
+    /// scratch copy is outside `target/`, so the artifact check passes it — and
+    /// before the fix it was written into every agent's global hook config
+    /// BESIDE the install's own entries. The install must win instead, which is
+    /// what makes the write a no-op rather than a duplicate: it is the string
+    /// already in the file.
+    #[test]
+    fn durable_binary_path_prefers_the_install_over_a_scratch_copy_of_itself() {
+        let dir = crate::test_temp::tempdir().expect("resolver tempdir");
+        let home = dir.path().join("home");
+        let name = format!("{DEFAULT_BINARY_NAME}{}", std::env::consts::EXE_SUFFIX);
+
+        let installed = home.join(".local").join("bin").join(&name);
+        write_stub_executable(&installed);
+        let scratch = dir
+            .path()
+            .join("var")
+            .join("tmp")
+            .join("dad-branch")
+            .join(&name);
+        write_stub_executable(&scratch);
+
+        let resolved = durable_binary_path_with(Ok(scratch.clone()), &home, None);
+
+        assert_eq!(
+            assert_durable(&resolved),
+            installed.to_str().expect("installed path is UTF-8"),
+            "a scratch copy must never be persisted while a real install exists"
+        );
+    }
+
+    /// Issue #1140 with nothing to fall through to: a scratch copy and no
+    /// install anywhere is a refusal (step 2c), not a self-pin. The message has
+    /// to name the actual cause — an operator looking at a path that exists and
+    /// is executable needs to be told it is the LOCATION that disqualifies it.
+    #[test]
+    fn durable_binary_path_refuses_a_current_exe_that_is_not_installed() {
+        let dir = crate::test_temp::tempdir().expect("resolver tempdir");
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(&home).expect("create home");
+        let scratch = dir
+            .path()
+            .join("var")
+            .join("tmp")
+            .join("dad-branch")
+            .join(format!(
+                "{DEFAULT_BINARY_NAME}{}",
+                std::env::consts::EXE_SUFFIX
+            ));
+        write_stub_executable(&scratch);
+
+        let err = durable_binary_path_with(Ok(scratch.clone()), &home, None)
+            .expect_err("a deck installed nowhere must refuse, not pin itself");
+
+        assert!(
+            err.contains("not an installed dot-agent-deck"),
+            "the refusal must name the location as the cause, not leave the operator \
+             staring at a path that plainly exists: {err}"
+        );
+        assert!(
+            err.contains(&home.join(".local").join("bin").display().to_string()),
+            "the refusal must name where an install would count: {err}"
         );
     }
 
@@ -3176,21 +3360,76 @@ mod tests {
 
     /// A near-miss end to end: a deck genuinely installed under a directory
     /// named `target` is returned by step 1, not refused.
+    ///
+    /// "Genuinely installed" is carried by the synthetic `$PATH` since issue
+    /// #1140 — before it, this fixture proved only that the artifact check did
+    /// not misfire, and that is still what it is here for. The `$PATH` entry is
+    /// what keeps it a test about `is_build_artifact_path` rather than one that
+    /// now fails for an unrelated reason.
     #[test]
     fn durable_binary_path_accepts_an_install_under_a_directory_named_target() {
         let dir = crate::test_temp::tempdir().expect("resolver tempdir");
-        let installed = dir
-            .path()
-            .join("target")
-            .join("release-notes")
-            .join(DEFAULT_BINARY_NAME);
+        let install_dir = dir.path().join("target").join("release-notes");
+        let installed = install_dir.join(DEFAULT_BINARY_NAME);
         write_stub_executable(&installed);
+        let path_value = std::env::join_paths([install_dir]).expect("join synthetic PATH");
 
-        let resolved = durable_binary_path_with(Ok(installed.clone()), dir.path(), None);
+        let resolved = durable_binary_path_with(
+            Ok(installed.clone()),
+            dir.path(),
+            Some(path_value.as_os_str()),
+        );
 
         assert_eq!(
             assert_durable(&resolved),
             installed.to_str().expect("installed path is UTF-8")
+        );
+    }
+
+    /// [`is_installed_location`]'s own truth table, at the level where the
+    /// spelling questions live: a trailing separator and a `.` component are
+    /// two spellings of one directory and must both match, while a relative
+    /// entry (which a shell resolves against ITS own cwd — see
+    /// [`is_untrustworthy_path_entry`]) and a `target/{debug,release}` entry
+    /// (routine on a developer's `$PATH`, and the one shape this whole resolver
+    /// refuses) must not.
+    #[test]
+    fn is_installed_location_matches_path_entry_spellings_and_skips_untrustworthy_ones() {
+        let home = Path::new("/home/u");
+        let exe = Path::new("/opt/deck/bin/dot-agent-deck");
+
+        for spelling in ["/opt/deck/bin", "/opt/deck/bin/", "/opt/deck/./bin"] {
+            let value = std::env::join_paths([spelling]).expect("join synthetic PATH");
+            assert!(
+                is_installed_location(exe, home, Some(value.as_os_str())),
+                "`{spelling}` names the directory {} is in",
+                exe.display()
+            );
+        }
+
+        for skipped in ["opt/deck/bin", ""] {
+            let value = std::env::join_paths([skipped]).expect("join synthetic PATH");
+            assert!(
+                !is_installed_location(exe, home, Some(value.as_os_str())),
+                "a relative or empty $PATH entry (`{skipped}`) is resolved against the \
+                 consuming shell's own cwd and cannot vouch for a location"
+            );
+        }
+
+        let artifact_exe = Path::new("/w/target/release/dot-agent-deck");
+        let value = std::env::join_paths(["/w/target/release"]).expect("join synthetic PATH");
+        assert!(
+            !is_installed_location(artifact_exe, home, Some(value.as_os_str())),
+            "a build-artifact directory on $PATH does not make the artifact installed"
+        );
+
+        assert!(
+            is_installed_location(Path::new("/home/u/.local/bin/dot-agent-deck"), home, None),
+            "the canonical install target counts with no $PATH at all"
+        );
+        assert!(
+            !is_installed_location(exe, home, None),
+            "and nothing else does"
         );
     }
 
