@@ -499,6 +499,21 @@ export function VoiceControlPanel({ runtime, screen, onDispatch }: VoiceControlP
     const ours = claim();
     forget();
     setPhase("opening");
+    /*
+      A runtime carrying `resolveVoice` and no capture verbs is representable —
+      every voice member of `DeckRuntimeState` is optional, and a test runtime
+      does exactly this. Without a start and a stop there is no voice control to
+      turn on, so it reports the same instruction an unconfigured backend gets
+      rather than latching ON over a microphone that will never open. The
+      TRIGGER still renders, because `resolveVoice` is what decides that: a
+      button that says how to fix the thing it cannot do is the owner's
+      requirement, and silence is not.
+    */
+    if (!voiceStart || !voiceStop) {
+      setPhase("idle");
+      setProblem(VOICE_UNAVAILABLE);
+      return;
+    }
     if (voiceStatus) {
       let available = true;
       try {
@@ -515,7 +530,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch }: VoiceControlP
     }
     setOn(true);
     await listen(ours);
-  }, [claim, forget, listen, setOn, setPhase, voiceStatus]);
+  }, [claim, forget, listen, setOn, setPhase, voiceStart, voiceStatus, voiceStop]);
 
   /**
    * Turn voice off: abandon the pipeline, then release the device.
