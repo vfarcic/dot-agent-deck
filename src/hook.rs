@@ -262,6 +262,48 @@ fn truncate(s: &str, max: usize) -> String {
     crate::prompt_delivery::truncate_on_char_boundary(s, max)
 }
 
+/// Record a reported prompt as the text the agent actually submitted, with the
+/// producer's paste envelope taken off.
+///
+/// Issue #1182. A producer does not necessarily report a pasted payload
+/// verbatim: Claude Code reports the turn with it wrapped in
+/// `<pasted_content id="…">` … `</pasted_content id="…">`, and the deck writes
+/// every MULTI-LINE payload as a bracketed paste, so that envelope is on the
+/// ordinary path rather than an edge case. Unwrapping it HERE, once, at the
+/// boundary where a producer's report enters the deck, is what makes the
+/// difference visible where it matters:
+///
+/// * the TUI card's `Prmt:` line, the desktop overview and the prompt history
+///   show the prompt instead of `<pasted_content id="239f">You a…`, which is
+///   what the pane rendered for every seeded Claude agent (measured on
+///   `prompt/new-pane/016`);
+/// * the [`crate::prompt_delivery::USER_PROMPT_MAX_LEN`] budget below is spent
+///   on the prompt rather than partly on a wrapper.
+///
+/// **This does not replace [`crate::prompt_delivery`]'s envelope shape and must
+/// not be read as making it unreachable.** The `dot-agent-deck` invoked inside
+/// a pane comes from the agent's own hook configuration and can be OLDER than
+/// the daemon it reports to — `crate::hook_provenance`'s `missing_token`
+/// refusal exists for exactly that population — so a daemon still receives
+/// enveloped reports from binaries that predate this, and the matcher still has
+/// to read them.
+///
+/// Unwrapping is refused for anything but a turn that is wholly one paste (see
+/// [`crate::prompt_delivery::paste_envelope_payload`]): a turn where someone
+/// typed prose AROUND a paste is reported as they composed it.
+fn record_submitted_prompt(prompt: &str) -> String {
+    // The closing delimiter is stripped ONLY when an opening one was found and
+    // accepted. Applying it unconditionally would cut a trailing
+    // `</pasted_content …>` off a turn this deliberately declined to unwrap —
+    // pinned by `a_turn_that_merely_contains_a_paste_is_recorded_unchanged`,
+    // which is what caught it.
+    let recorded = match crate::prompt_delivery::paste_envelope_payload(prompt) {
+        Some((payload, _)) => crate::prompt_delivery::strip_paste_envelope_close(payload),
+        None => prompt,
+    };
+    truncate(recorded, crate::prompt_delivery::USER_PROMPT_MAX_LEN)
+}
+
 /// PRD #20 W1: normalize a Codex `shell` tool's `command` value into a single
 /// human-readable command string. Codex passes an ARGV array
 /// (`["/bin/sh","-lc","touch x"]`); we join with spaces. A plain string is used
@@ -348,7 +390,7 @@ fn build_event_typed(input: ClaudeCodeHookInput, agent_type: AgentType) -> Optio
     }
     let tool_detail = extract_tool_detail(tool_name.as_deref(), tool_input.as_ref());
 
-    let user_prompt = prompt.map(|p| truncate(&p, crate::prompt_delivery::USER_PROMPT_MAX_LEN));
+    let user_prompt = prompt.as_deref().map(record_submitted_prompt);
     let pane_id = std::env::var(DOT_AGENT_DECK_PANE_ID).ok();
     // PRD #92 F9 followup-7: the daemon injects DOT_AGENT_DECK_AGENT_ID
     // on spawn (same pattern as DOT_AGENT_DECK_PANE_ID). Forwarding it
@@ -496,9 +538,7 @@ fn map_opencode_event_type(event: &str, status: Option<&str>) -> Option<EventTyp
 fn build_opencode_event(input: OpenCodeHookInput) -> Option<AgentEvent> {
     let event_type = map_opencode_event_type(&input.event, input.status.as_deref())?;
     let tool_detail = extract_tool_detail(input.tool_name.as_deref(), input.tool_input.as_ref());
-    let user_prompt = input
-        .prompt
-        .map(|p| truncate(&p, crate::prompt_delivery::USER_PROMPT_MAX_LEN));
+    let user_prompt = input.prompt.as_deref().map(record_submitted_prompt);
     let pane_id = std::env::var(DOT_AGENT_DECK_PANE_ID).ok();
     let agent_id = std::env::var(DOT_AGENT_DECK_AGENT_ID).ok();
 
@@ -1157,6 +1197,55 @@ fn is_transient_read_error(err: &std::io::Error, deadline: Option<std::time::Ins
 mod tests {
     use super::*;
     use spec::spec;
+
+    /// Issue #1182: what the pane's card, the desktop overview and the prompt
+    /// history show for a seeded Claude agent. Before this they showed
+    /// `<pasted_content id="239f">You a…` — the producer's wrapper, spending a
+    /// quarter of the recorded budget and hiding the prompt's opening words,
+    /// which is how `prompt/new-pane/016` found it.
+    #[test]
+    fn a_pasted_turn_is_recorded_as_the_prompt_it_wrapped() {
+        let prompt = "You are an ordinary assistant.\nDo the thing.";
+        assert_eq!(
+            record_submitted_prompt(&format!(
+                "\n\n<pasted_content id=\"239f\">\n{prompt}\n</pasted_content id=\"239f\">"
+            )),
+            prompt
+        );
+    }
+
+    /// A turn someone composed AROUND a paste is theirs, not ours, and is
+    /// recorded as they wrote it. Same bound the delivery matcher draws.
+    #[test]
+    fn a_turn_that_merely_contains_a_paste_is_recorded_unchanged() {
+        let turn =
+            "please run this: <pasted_content id=\"239f\">\nstuff\n</pasted_content id=\"239f\">";
+        assert_eq!(record_submitted_prompt(turn), turn);
+    }
+
+    /// Unenveloped prompts are recorded exactly as before, truncation included.
+    #[test]
+    fn an_ordinary_prompt_is_recorded_exactly_as_before() {
+        assert_eq!(record_submitted_prompt("ls -la"), "ls -la");
+        let long = "x".repeat(crate::prompt_delivery::USER_PROMPT_MAX_LEN + 40);
+        assert_eq!(
+            record_submitted_prompt(&long),
+            truncate(&long, crate::prompt_delivery::USER_PROMPT_MAX_LEN)
+        );
+    }
+
+    /// The whole recorded budget goes on the prompt rather than partly on the
+    /// wrapper, so an enveloped long prompt keeps MORE of itself than it would
+    /// have if the envelope had been truncated along with it.
+    #[test]
+    fn unwrapping_spends_the_budget_on_the_prompt() {
+        let long = "y".repeat(crate::prompt_delivery::USER_PROMPT_MAX_LEN * 2);
+        let enveloped = format!("<pasted_content id=\"239f\">\n{long}");
+        assert_eq!(
+            record_submitted_prompt(&enveloped),
+            truncate(&long, crate::prompt_delivery::USER_PROMPT_MAX_LEN)
+        );
+    }
 
     #[test]
     fn map_session_start() {

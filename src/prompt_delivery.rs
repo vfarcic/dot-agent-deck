@@ -657,6 +657,18 @@ impl ConfirmedSubmission {
 /// this pane was given any task at all" on work that had in fact been delivered
 /// and completed, and one extra payload write (`MAX_PAYLOAD_SUBMISSIONS`) into
 /// an agent already acting on the task.
+///
+/// # Why this shape survives `crate::hook`'s normalization
+///
+/// `crate::hook::record_submitted_prompt` takes the envelope off at the
+/// boundary where a producer's report enters the deck, so a report arriving
+/// from THIS build is already unwrapped and lands on shape 1 or 2 above. That
+/// does not make this reachable-in-tests-only: the `dot-agent-deck` a pane
+/// invokes comes from the agent's own hook configuration and can be OLDER than
+/// the daemon it reports to — [`crate::hook_provenance::Refusal::Missing`]'s
+/// caller message names exactly that population — so enveloped reports keep
+/// arriving from binaries that predate the normalization, and confirming them
+/// is this shape's job.
 const PASTE_ENVELOPE_OPEN_HEAD: &str = "<pasted_content id=\"";
 
 /// The rest of the opening delimiter, after the opaque id.
@@ -737,7 +749,7 @@ pub fn paste_envelope_payload(reported: &str) -> Option<(&str, usize)> {
 /// point. A report truncated at [`USER_PROMPT_MAX_LEN`] — which is every
 /// dispatch prompt, since they run well over it — never reaches the closing
 /// delimiter at all, so this is the short-payload path.
-fn strip_paste_envelope_close(payload: &str) -> &str {
+pub fn strip_paste_envelope_close(payload: &str) -> &str {
     let Some(at) = payload.rfind(PASTE_ENVELOPE_CLOSE_HEAD) else {
         return payload;
     };
