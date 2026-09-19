@@ -1,7 +1,14 @@
-import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createFixtureSnapshot } from "../data/fixture";
-import { DEFAULT_DESKTOP_SETTINGS, type DesktopSettingsDto } from "../lib/bridge";
+import {
+  DEFAULT_DESKTOP_SETTINGS,
+  type DesktopSettingsDto,
+  type VoiceResultDto,
+  type VoiceStatusDto,
+  type VoiceTranscriptionDto,
+  type VoiceTranscriptionOutcomeDto,
+} from "../lib/bridge";
 import type { DeckActionResult, DeckRuntimeState } from "../types";
 
 vi.mock("./TerminalViewport", () => ({
@@ -11,58 +18,18 @@ vi.mock("./TerminalViewport", () => ({
 }));
 
 import { DeckShell } from "../App";
-import { NOTHING_DISPATCHED, SCREEN_MOVED_ON } from "./VoiceControlPanel";
+import {
+  NOTHING_DISPATCHED,
+  SCREEN_MOVED_ON,
+  VOICE_STATUS_POLL_MS,
+  VOICE_UNDO_WINDOW_MS,
+} from "./VoiceControlPanel";
 
-type VoiceBackend = "claude" | "opencode" | "remote" | "stub";
-
-type VoiceOutcome = {
-  kind: string;
-  sentence: string;
-  transcript?: string;
-  action?: string;
-  invoke?: string;
-  params?: Array<Record<string, string>>;
-  hint?: string;
-  param?: string;
-  spoken?: string;
-  matches?: string[];
-  detail?: string;
-};
-
-interface VoiceResult {
-  outcome: VoiceOutcome;
-  resolveMs: number | null;
-  backend: VoiceBackend;
-}
-
-type VoiceCaptureState = "idle" | "recording" | "transcribing" | "done" | "failed";
-
-interface VoiceStatus {
-  state: VoiceCaptureState;
-  capturedMs: number;
-  maxMs: number;
-  capped: boolean;
-  available: boolean;
-  backend: "off" | "remote";
-}
-
-type VoiceTranscriptionOutcome =
-  | { kind: "heard"; transcript: string; sentence: string }
-  | { kind: "not_configured"; detail: string; sentence: string }
-  | { kind: "failed"; detail: string; sentence: string };
-
-interface VoiceTranscription {
-  outcome: VoiceTranscriptionOutcome;
-  transcribeMs: number | null;
-  backend: string;
-  audioMs: number;
-}
-
-type ResolveVoice = ReturnType<typeof vi.fn<(utterance: string) => Promise<VoiceResult>>>;
-type VoiceStatusCall = ReturnType<typeof vi.fn<() => Promise<VoiceStatus>>>;
-type VoiceStart = ReturnType<typeof vi.fn<() => Promise<VoiceStatus>>>;
-type VoiceStop = ReturnType<typeof vi.fn<() => Promise<VoiceTranscription>>>;
-type VoiceCancel = ReturnType<typeof vi.fn<() => Promise<VoiceStatus>>>;
+type ResolveVoice = ReturnType<typeof vi.fn<(utterance: string) => Promise<VoiceResultDto>>>;
+type VoiceStatusCall = ReturnType<typeof vi.fn<() => Promise<VoiceStatusDto>>>;
+type VoiceStart = ReturnType<typeof vi.fn<() => Promise<VoiceStatusDto>>>;
+type VoiceStop = ReturnType<typeof vi.fn<() => Promise<VoiceTranscriptionDto>>>;
+type VoiceCancel = ReturnType<typeof vi.fn<() => Promise<VoiceStatusDto>>>;
 
 interface VoiceControls {
   voiceStatus: VoiceStatusCall;
@@ -73,18 +40,7 @@ interface VoiceControls {
 
 type VoiceRuntime = DeckRuntimeState & VoiceControls & { resolveVoice: ResolveVoice };
 
-function settingsStore() {
-  let document: DesktopSettingsDto = { ...DEFAULT_DESKTOP_SETTINGS };
-  return {
-    getSettings: vi.fn(async () => ({ settings: structuredClone(document), path: undefined })),
-    saveSettings: vi.fn(async (next: DesktopSettingsDto) => {
-      document = structuredClone(next);
-      return structuredClone(document);
-    }),
-  };
-}
-
-function voiceStatus(overrides: Partial<VoiceStatus> = {}): VoiceStatus {
+function voiceStatus(overrides: Partial<VoiceStatusDto> = {}): VoiceStatusDto {
   return {
     state: "idle",
     capturedMs: 0,
@@ -96,7 +52,7 @@ function voiceStatus(overrides: Partial<VoiceStatus> = {}): VoiceStatus {
   };
 }
 
-function transcription(outcome: VoiceTranscriptionOutcome): VoiceTranscription {
+function transcription(outcome: VoiceTranscriptionOutcomeDto): VoiceTranscriptionDto {
   return {
     outcome,
     transcribeMs: outcome.kind === "not_configured" ? null : 183,
@@ -116,6 +72,17 @@ function voiceControls(overrides: Partial<VoiceControls> = {}): VoiceControls {
     })),
     voiceCancel: vi.fn(async () => voiceStatus()),
     ...overrides,
+  };
+}
+
+function settingsStore() {
+  let document: DesktopSettingsDto = { ...DEFAULT_DESKTOP_SETTINGS };
+  return {
+    getSettings: vi.fn(async () => ({ settings: structuredClone(document), path: undefined })),
+    saveSettings: vi.fn(async (next: DesktopSettingsDto) => {
+      document = structuredClone(next);
+      return structuredClone(document);
+    }),
   };
 }
 
@@ -158,51 +125,78 @@ function runtime(resolveVoice: ResolveVoice, voice: VoiceControls = voiceControl
   } as VoiceRuntime;
 }
 
-function result(outcome: VoiceOutcome, resolveMs: number | null = 37, backend: VoiceBackend = "stub"): VoiceResult {
+function result(
+  outcome: VoiceResultDto["outcome"],
+  resolveMs: number | null = 37,
+  backend: VoiceResultDto["backend"] = "stub",
+): VoiceResultDto {
   return { outcome, resolveMs, backend };
 }
 
-function resolver(answer: VoiceResult): ResolveVoice {
+function resolver(answer: VoiceResultDto): ResolveVoice {
   return vi.fn(async () => answer);
 }
 
-function openVoicePanel() {
-  const trigger = screen.queryByRole("button", { name: "Voice" });
-  if (!trigger) throw new Error("Voice control trigger is missing from the primary surface.");
-  fireEvent.click(trigger);
-  return screen.getByRole("dialog", { name: "Voice control" });
+function heard(transcript: string): VoiceTranscriptionOutcomeDto {
+  return { kind: "heard", transcript, sentence: `Heard: “${transcript}”.` };
 }
 
-async function submit(panel: HTMLElement, utterance: string, resolveVoice: ResolveVoice) {
-  fireEvent.change(within(panel).getByRole("textbox", { name: "Command" }), {
-    target: { value: utterance },
-  });
+function voiceButton(): HTMLButtonElement {
+  return screen.getByTestId("voice-trigger");
+}
+
+async function flush() {
   await act(async () => {
-    fireEvent.click(within(panel).getByRole("button", { name: "Run command" }));
     await Promise.resolve();
-  });
-  expect(resolveVoice).toHaveBeenCalledTimes(1);
-  expect(resolveVoice.mock.calls[0][0]).toBe(utterance);
-}
-
-async function startListening(panel: HTMLElement) {
-  const control = await within(panel).findByRole("button", { name: "Start listening" });
-  await act(async () => {
-    fireEvent.click(control);
+    await Promise.resolve();
     await Promise.resolve();
   });
 }
 
-async function stopListening(panel: HTMLElement) {
-  const control = await within(panel).findByRole("button", { name: "Stop listening" });
+async function turnVoiceOn(voice: VoiceControls) {
+  await flush();
   await act(async () => {
-    fireEvent.click(control);
+    fireEvent.click(voiceButton());
     await Promise.resolve();
+    await Promise.resolve();
+  });
+  expect(voice.voiceStart).toHaveBeenCalledTimes(1);
+  expect(voiceButton()).toHaveAttribute("aria-pressed", "true");
+  expect(voiceButton()).toHaveTextContent(/voice\s+on/i);
+}
+
+async function completeAutomaticUtterance(voice: VoiceControls) {
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(VOICE_STATUS_POLL_MS);
+  });
+  expect(voice.voiceStop).toHaveBeenCalledTimes(1);
+}
+
+function automaticVoice(outcome: VoiceTranscriptionOutcomeDto, capped = false): VoiceControls {
+  const voiceStart = vi.fn(async () => voiceStatus({ state: "recording", available: true, backend: "remote" }));
+  let delivered = false;
+  return voiceControls({
+    voiceStart,
+    voiceStatus: vi.fn(async () => {
+      if (voiceStart.mock.calls.length === 0) return voiceStatus({ available: true, backend: "remote" });
+      if (!delivered) {
+        delivered = true;
+        return voiceStatus({
+          state: "done",
+          capturedMs: capped ? 30_000 : 1_240,
+          capped,
+          available: true,
+          backend: "remote",
+        });
+      }
+      return voiceStatus({ state: "recording", available: true, backend: "remote" });
+    }),
+    voiceStop: vi.fn(async () => transcription(outcome)),
   });
 }
 
 const DISPATCH = {
-  kind: "dispatch",
+  kind: "dispatch" as const,
   transcript: "show me every agent",
   action: "open_overview",
   invoke: "openOverview",
@@ -211,7 +205,7 @@ const DISPATCH = {
 };
 
 const OPEN_SETTINGS_DISPATCH = {
-  kind: "dispatch",
+  kind: "dispatch" as const,
   transcript: "open settings",
   action: "open_settings",
   invoke: "openSettings",
@@ -219,12 +213,8 @@ const OPEN_SETTINGS_DISPATCH = {
   sentence: "Opening settings.",
 };
 
-const OUTCOMES: Array<{ name: string; utterance: string; outcome: VoiceOutcome }> = [
-  {
-    name: "dispatch",
-    utterance: "show me every agent",
-    outcome: DISPATCH,
-  },
+const OUTCOMES: Array<{ name: string; utterance: string; outcome: VoiceResultDto["outcome"] }> = [
+  { name: "dispatch", utterance: "show me every agent", outcome: DISPATCH },
   {
     name: "unavailable",
     utterance: "show me every agent",
@@ -239,103 +229,49 @@ const OUTCOMES: Array<{ name: string; utterance: string; outcome: VoiceOutcome }
   {
     name: "no-match",
     utterance: "what time is it?",
-    outcome: {
-      kind: "no_match",
-      transcript: "what time is it?",
-      sentence: "Heard: “what time is it?” — no matching action.",
-    },
+    outcome: { kind: "no_match", transcript: "what time is it?", sentence: "Heard: “what time is it?” — no matching action." },
   },
   {
     name: "unknown-action",
     utterance: "launch the missiles",
-    outcome: {
-      kind: "unknown_action",
-      transcript: "launch the missiles",
-      action: "launch_missiles",
-      sentence: "Heard: “launch the missiles” — no matching action.",
-    },
+    outcome: { kind: "unknown_action", transcript: "launch the missiles", action: "launch_missiles", sentence: "Heard: “launch the missiles” — no matching action." },
   },
   {
     name: "missing-param",
     utterance: "open it",
-    outcome: {
-      kind: "param_missing",
-      transcript: "open it",
-      action: "open_agent",
-      param: "agent",
-      sentence: "Heard: “open it” — I could not tell which agent you meant.",
-    },
+    outcome: { kind: "param_missing", transcript: "open it", action: "open_agent", param: "agent", sentence: "Heard: “open it” — I could not tell which agent you meant." },
   },
   {
     name: "unresolvable-param",
     utterance: "open the deployer",
-    outcome: {
-      kind: "param_unresolved",
-      transcript: "open the deployer",
-      action: "open_agent",
-      param: "agent",
-      spoken: "deployer",
-      sentence: "Heard: “open the deployer” — no agent here matches “deployer”.",
-    },
+    outcome: { kind: "param_unresolved", transcript: "open the deployer", action: "open_agent", param: "agent", spoken: "deployer", sentence: "Heard: “open the deployer” — no agent here matches “deployer”." },
   },
   {
     name: "ambiguous-param",
     utterance: "open the tester",
-    outcome: {
-      kind: "param_ambiguous",
-      transcript: "open the tester",
-      action: "open_agent",
-      param: "agent",
-      spoken: "tester",
-      matches: ["tester one", "tester two"],
-      sentence: "Heard: “open the tester” — “tester” matches more than one agent: tester one, tester two.",
-    },
+    outcome: { kind: "param_ambiguous", transcript: "open the tester", action: "open_agent", param: "agent", spoken: "tester", matches: ["tester one", "tester two"], sentence: "Heard: “open the tester” — “tester” matches more than one agent: tester one, tester two." },
   },
   {
     name: "backend-failure",
     utterance: "open the tester",
-    outcome: {
-      kind: "resolution_failed",
-      transcript: "open the tester",
-      detail: "no intent backend is configured",
-      sentence: "Heard: “open the tester” — could not work out what to do (no intent backend is configured).",
-    },
+    outcome: { kind: "resolution_failed", transcript: "open the tester", detail: "no intent backend is configured", sentence: "Heard: “open the tester” — could not work out what to do (no intent backend is configured)." },
   },
   {
     name: "transcription-failure",
     utterance: "use the microphone",
-    outcome: {
-      kind: "transcription_failed",
-      detail: "no transcription backend is configured",
-      sentence: "Could not turn that into text (no transcription backend is configured).",
-    },
+    outcome: { kind: "transcription_failed", detail: "no transcription backend is configured", sentence: "Could not turn that into text (no transcription backend is configured)." },
   },
 ];
 
-const TRANSCRIPTION_OUTCOMES: Array<{ name: string; outcome: VoiceTranscriptionOutcome }> = [
-  {
-    name: "heard",
-    outcome: {
-      kind: "heard",
-      transcript: "show me every agent",
-      sentence: "Heard: “show me every agent”.",
-    },
-  },
+const TRANSCRIPTION_OUTCOMES: Array<{ name: string; outcome: VoiceTranscriptionOutcomeDto }> = [
+  { name: "heard", outcome: heard("show me every agent") },
   {
     name: "not-configured",
-    outcome: {
-      kind: "not_configured",
-      detail: "voice transcription is off",
-      sentence: "Choose a transcription backend in Voice settings to use the microphone.",
-    },
+    outcome: { kind: "not_configured", detail: "voice transcription is off", sentence: "Choose a transcription backend in Settings → Voice to use the microphone." },
   },
   {
     name: "capture-failure",
-    outcome: {
-      kind: "failed",
-      detail: "the microphone did not produce audio",
-      sentence: "Could not turn that recording into text (the microphone did not produce audio).",
-    },
+    outcome: { kind: "failed", detail: "the microphone did not produce audio", sentence: "Could not turn that recording into text (the microphone did not produce audio)." },
   },
 ];
 
@@ -360,505 +296,330 @@ describe("voice control panel", () => {
     vi.unstubAllGlobals();
   });
 
-  /**
-   * Scenario: on a machine with neither a microphone nor a stored credential,
-   * open Voice, type a command and submit it. The typed path calls the resolver
-   * and shows the complete sentence it returned.
-   */
-  it("runs a typed command without a microphone or credential", async () => {
-    const resolveVoice = resolver(result(DISPATCH));
-    render(<DeckShell runtime={runtime(resolveVoice)} />);
+  /** Scenario: Voice begins visibly off, one press turns it on, and the next press turns it off. */
+  it("toggles continuous voice control on and off from the Voice button", async () => {
+    const voice = voiceControls({ voiceStatus: vi.fn(async () => voiceStatus({ available: true, backend: "remote" })) });
+    render(<DeckShell runtime={runtime(resolver(result(DISPATCH)), voice)} />);
 
-    const panel = openVoicePanel();
-    await submit(panel, "show me every agent", resolveVoice);
+    expect(voiceButton()).toHaveAttribute("aria-pressed", "false");
+    expect(voiceButton()).toHaveTextContent(/voice\s+off/i);
+    await turnVoiceOn(voice);
+    await act(async () => { fireEvent.click(voiceButton()); await Promise.resolve(); });
 
-    expect(within(panel).getByText("Opening the agent overview.")).toBeVisible();
-    expect(screen.getByTestId("overview-table-region")).toBeVisible();
+    expect(voice.voiceCancel).toHaveBeenCalledTimes(1);
+    expect(voiceButton()).toHaveAttribute("aria-pressed", "false");
+    expect(voiceButton()).toHaveTextContent(/voice\s+off/i);
   });
 
-  /**
-   * Scenario: open an agent pane, whose modal fence makes the deck behind it
-   * inert, then open Voice beside that pane. Both the trigger and its dialog
-   * stay outside the inert background while the deck selector remains fenced.
-   */
-  it("keeps the voice surface reachable while an agent pane is open", () => {
-    render(<DeckShell runtime={runtime(resolver(result(DISPATCH)))} />);
+  /** Scenario: activate Voice and inspect the whole surface. No dialog, command textbox or typed-submit button exists. */
+  it("offers no text input or intermediate dialog", async () => {
+    const voice = voiceControls({ voiceStatus: vi.fn(async () => voiceStatus({ available: true, backend: "remote" })) });
+    render(<DeckShell runtime={runtime(resolver(result(DISPATCH)), voice)} />);
 
-    fireEvent.click(screen.getByRole("button", { name: "Open Planner agent" }));
-    expect(screen.getByTestId("agent-pane-overlay")).toBeVisible();
-    expect(screen.getByTestId("deck-selector-toggle").closest("[inert]")).not.toBeNull();
+    await turnVoiceOn(voice);
 
-    const trigger = screen.getByTestId("voice-trigger");
-    expect(trigger.closest("[inert]")).toBeNull();
-    expect(trigger.closest('[aria-hidden="true"]')).toBeNull();
-    fireEvent.click(trigger);
-
-    const panel = screen.getByTestId("voice-panel");
-    expect(panel.closest("[inert]")).toBeNull();
-    expect(panel.closest('[aria-hidden="true"]')).toBeNull();
-    expect(screen.getByTestId("deck-selector-toggle").closest("[inert]")).not.toBeNull();
+    expect(screen.queryByRole("dialog", { name: "Voice control" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("textbox", { name: "Command" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Run command" })).not.toBeInTheDocument();
   });
 
-  /**
-   * Scenario: resolve the registry's settings action while the deck is mounted.
-   * The shell-level voice dispatch receives the deck's overlay capability and
-   * opens the same Settings sheet as the deck controls do.
-   */
-  it("opens a deck overlay through the shell voice dispatch", async () => {
-    const resolveVoice = resolver(result(OPEN_SETTINGS_DISPATCH));
-    render(<DeckShell runtime={runtime(resolveVoice)} />);
-
-    const panel = openVoicePanel();
-    await submit(panel, "open settings", resolveVoice);
-
-    expect(await screen.findByTestId("settings-panel")).toBeVisible();
-    expect(within(panel).queryByText(NOTHING_DISPATCHED)).not.toBeInTheDocument();
-  });
-
-  /**
-   * Scenario: attempt that same overlay action from the overview, where the deck
-   * and its overlay state are unmounted. Nothing throws or silently succeeds;
-   * the Voice report explicitly corrects the resolved success sentence.
-   */
-  it("reports an unavailable overlay dispatch from the overview without throwing", async () => {
-    const resolveVoice = resolver(result(OPEN_SETTINGS_DISPATCH));
-    render(<DeckShell runtime={runtime(resolveVoice)} initialView={{ kind: "overview" }} />);
-
-    const panel = openVoicePanel();
-    await submit(panel, "open settings", resolveVoice);
-
-    // This is the surface's existing canonical correction for a dispatch that
-    // resolved successfully but whose host could not run anything.
-    expect(await within(panel).findByText(NOTHING_DISPATCHED)).toBeVisible();
-    expect(screen.queryByTestId("settings-panel")).not.toBeInTheDocument();
-  });
-
-  /**
-   * Scenario: open Voice while transcription is deliberately off. Typed input
-   * remains available, no microphone control is offered, and the panel does not
-   * describe that product choice as a failure or degraded state.
-   */
-  it("offers typed input without a broken-looking microphone when transcription is off", async () => {
+  /** Scenario: press Voice while transcription is off. The report tells the user to visit Settings → Voice. */
+  it("explains how to enable voice when transcription is unavailable", async () => {
     const voice = voiceControls();
     render(<DeckShell runtime={runtime(resolver(result(DISPATCH)), voice)} />);
 
-    const panel = openVoicePanel();
+    await act(async () => { fireEvent.click(voiceButton()); await Promise.resolve(); });
 
-    await waitFor(() => expect(voice.voiceStatus).toHaveBeenCalledWith());
-    expect(within(panel).getByRole("textbox", { name: "Command" })).toBeVisible();
-    expect(within(panel).queryByRole("button", { name: "Start listening" })).not.toBeInTheDocument();
-    expect(panel).not.toHaveTextContent(/not configured|unavailable|failed|error|broken|degraded/i);
-  });
-
-  /**
-   * Scenario: with remote transcription available, press the microphone once
-   * to begin listening and once more to stop. The control toggles state and the
-   * transcription service's complete sentence is rendered.
-   */
-  it("starts and stops listening with two presses", async () => {
-    const heard = {
-      kind: "heard" as const,
-      transcript: "show me every agent",
-      sentence: "Heard: “show me every agent”.",
-    };
-    const voice = voiceControls({
-      voiceStatus: vi.fn(async () => voiceStatus({ available: true, backend: "remote" })),
-      voiceStop: vi.fn(async () => transcription(heard)),
-    });
-    const resolveVoice = vi.fn<(utterance: string) => Promise<VoiceResult>>(() => new Promise(() => {}));
-    render(<DeckShell runtime={runtime(resolveVoice, voice)} />);
-
-    const panel = openVoicePanel();
-    await startListening(panel);
-
-    expect(voice.voiceStart).toHaveBeenCalledWith();
-    expect(within(panel).getByRole("button", { name: "Stop listening" })).toBeVisible();
-
-    await stopListening(panel);
-
-    expect(voice.voiceStop).toHaveBeenCalledWith();
-    expect(await within(panel).findByText(heard.sentence)).toBeVisible();
-  });
-
-  /**
-   * Scenario: start recording, then have a status poll report that the device
-   * reached its cap and is no longer recording. The surface observes that
-   * reply and stops presenting itself as listening without calling stop.
-   */
-  it("stops showing listening when a status poll observes the recording cap", async () => {
-    vi.useFakeTimers();
-    const voice = voiceControls({
-      voiceStatus: vi.fn()
-        .mockResolvedValueOnce(voiceStatus({ available: true, backend: "remote" }))
-        .mockResolvedValue(voiceStatus({
-          state: "done",
-          capturedMs: 30_000,
-          capped: true,
-          available: true,
-          backend: "remote",
-        })),
-    });
-    render(<DeckShell runtime={runtime(resolver(result(DISPATCH)), voice)} />);
-
-    const panel = openVoicePanel();
-    await act(async () => { await Promise.resolve(); });
-    await act(async () => {
-      fireEvent.click(within(panel).getByRole("button", { name: "Start listening" }));
-      await Promise.resolve();
-    });
-    expect(within(panel).getByRole("button", { name: "Stop listening" })).toBeVisible();
-
-    await act(async () => { await vi.advanceTimersByTimeAsync(30_000); });
-
-    expect(voice.voiceStatus.mock.calls.length).toBeGreaterThanOrEqual(2);
-    expect(within(panel).queryByRole("button", { name: "Stop listening" })).not.toBeInTheDocument();
-    expect(within(panel).queryByText("Listening…")).not.toBeInTheDocument();
-    expect(voice.voiceStop).not.toHaveBeenCalled();
-  });
-
-  /**
-   * Scenario: begin listening and close the Voice panel before stopping. The
-   * panel cancels capture as it closes so no hidden microphone remains open.
-   */
-  it("cancels an in-progress recording when the panel closes", async () => {
-    const voice = voiceControls({
-      voiceStatus: vi.fn(async () => voiceStatus({ available: true, backend: "remote" })),
-    });
-    render(<DeckShell runtime={runtime(resolver(result(DISPATCH)), voice)} />);
-
-    const panel = openVoicePanel();
-    await startListening(panel);
-    fireEvent.click(within(panel).getByRole("button", { name: "Close voice control" }));
-
-    await waitFor(() => expect(voice.voiceCancel).toHaveBeenCalledWith());
+    expect(await screen.findByText(/Settings → Voice/i)).toBeVisible();
+    expect(voice.voiceStart).not.toHaveBeenCalled();
+    expect(voiceButton()).toHaveAttribute("aria-pressed", "false");
     expect(screen.queryByRole("dialog", { name: "Voice control" })).not.toBeInTheDocument();
   });
 
-  /**
-   * Scenario: status offered a microphone but the setting changed before the
-   * first press, so start rejects with Rust's not-configured sentence. The
-   * panel renders that sentence and remains usable instead of crashing.
-   */
-  it("renders the not-configured sentence when starting capture is refused", async () => {
-    const sentence = "Choose a transcription backend in Voice settings to use the microphone.";
+  /** Scenario: open an agent pane and activate Voice beside it. The button stays reachable and no dialog covers the pane. */
+  it("keeps the voice control reachable while an agent pane is open", async () => {
+    const voice = voiceControls({ voiceStatus: vi.fn(async () => voiceStatus({ available: true, backend: "remote" })) });
+    render(<DeckShell runtime={runtime(resolver(result(DISPATCH)), voice)} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Open Planner agent" }));
+    expect(screen.getByTestId("agent-pane-overlay")).toBeVisible();
+    expect(voiceButton().closest("[inert]")).toBeNull();
+    await turnVoiceOn(voice);
+
+    expect(screen.queryByRole("dialog", { name: "Voice control" })).not.toBeInTheDocument();
+    expect(screen.getByTestId("agent-pane-overlay")).toBeVisible();
+  });
+
+  /** Scenario: VAD finishes an utterance while Voice is on. It executes and capture starts again without another press. */
+  it("resolves one utterance and remains on for the next", async () => {
+    vi.useFakeTimers();
+    const utterance = "show me every agent";
+    const voice = automaticVoice(heard(utterance));
+    const resolveVoice = resolver(result(DISPATCH));
+    render(<DeckShell runtime={runtime(resolveVoice, voice)} />);
+
+    await turnVoiceOn(voice);
+    await completeAutomaticUtterance(voice);
+
+    expect(resolveVoice).toHaveBeenCalledWith(utterance);
+    expect(screen.getByText(DISPATCH.sentence)).toBeVisible();
+    expect(screen.getByTestId("overview-table-region")).toBeVisible();
+    expect(voice.voiceStart).toHaveBeenCalledTimes(2);
+    expect(voiceButton()).toHaveAttribute("aria-pressed", "true");
+    expect(voiceButton()).toHaveTextContent(/voice\s+on/i);
+  });
+
+  /** Scenario: turn Voice off while it is listening. Capture is cancelled, not transcribed, so no microphone stays open. */
+  it("cancels the microphone when Voice is turned off", async () => {
+    const voice = voiceControls({ voiceStatus: vi.fn(async () => voiceStatus({ available: true, backend: "remote" })) });
+    render(<DeckShell runtime={runtime(resolver(result(DISPATCH)), voice)} />);
+
+    await turnVoiceOn(voice);
+    await act(async () => { fireEvent.click(voiceButton()); await Promise.resolve(); });
+
+    expect(voice.voiceCancel).toHaveBeenCalledTimes(1);
+    expect(voice.voiceStop).not.toHaveBeenCalled();
+    expect(voiceButton()).toHaveAttribute("aria-pressed", "false");
+  });
+
+  /** Scenario: an utterance hits the capture cap while Voice is on. Its audio is processed and listening resumes. */
+  it("processes a capped utterance and continues listening", async () => {
+    vi.useFakeTimers();
+    const utterance = "show me every agent";
+    const voice = automaticVoice(heard(utterance), true);
+    const resolveVoice = resolver(result(DISPATCH));
+    render(<DeckShell runtime={runtime(resolveVoice, voice)} />);
+
+    await turnVoiceOn(voice);
+    await completeAutomaticUtterance(voice);
+
+    expect(resolveVoice).toHaveBeenCalledWith(utterance);
+    expect(voice.voiceStart).toHaveBeenCalledTimes(2);
+    expect(screen.queryByRole("button", { name: "Send the recording" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Discard it" })).not.toBeInTheDocument();
+    expect(voiceButton()).toHaveAttribute("aria-pressed", "true");
+  });
+
+  /** Scenario: capture is refused after status looked available. Its sentence appears and Voice returns visibly off. */
+  it("renders the capture refusal and returns Voice to off", async () => {
+    const sentence = "Choose a transcription backend in Settings → Voice to use the microphone.";
     const voice = voiceControls({
       voiceStatus: vi.fn(async () => voiceStatus({ available: true, backend: "remote" })),
-      // Tauri rejects a Rust `Err(String)` as the string itself, not an Error.
       voiceStart: vi.fn(async () => { throw sentence; }),
     });
     render(<DeckShell runtime={runtime(resolver(result(DISPATCH)), voice)} />);
 
-    const panel = openVoicePanel();
-    await startListening(panel);
+    await act(async () => { fireEvent.click(voiceButton()); await Promise.resolve(); await Promise.resolve(); });
 
-    expect(await within(panel).findByText(sentence)).toBeVisible();
-    expect(within(panel).getByRole("textbox", { name: "Command" })).toBeVisible();
-    expect(within(panel).queryByRole("button", { name: "Stop listening" })).not.toBeInTheDocument();
+    expect(await screen.findByText(sentence)).toBeVisible();
+    expect(voiceButton()).toHaveAttribute("aria-pressed", "false");
+    expect(screen.queryByRole("textbox", { name: "Command" })).not.toBeInTheDocument();
   });
 
-  /**
-   * Scenario: stop one recording for each closed transcription outcome. The
-   * panel renders that outcome's own complete sentence, including a capture
-   * failure distinct from the intent-resolution failure sentence.
-   */
+  /** Scenario: VAD completes one recording for each transcription result. The report renders its app-provided sentence. */
   it.each(TRANSCRIPTION_OUTCOMES)("renders the $name transcription outcome's sentence", async ({ outcome }) => {
-    const voice = voiceControls({
-      voiceStatus: vi.fn(async () => voiceStatus({ available: true, backend: "remote" })),
-      voiceStop: vi.fn(async () => transcription(outcome)),
-    });
+    vi.useFakeTimers();
+    const voice = automaticVoice(outcome);
     const resolveVoice = outcome.kind === "heard"
-      ? vi.fn<(utterance: string) => Promise<VoiceResult>>(() => new Promise(() => {}))
+      ? vi.fn<(utterance: string) => Promise<VoiceResultDto>>(() => new Promise(() => {}))
       : resolver(result(DISPATCH));
     render(<DeckShell runtime={runtime(resolveVoice, voice)} />);
 
-    const panel = openVoicePanel();
-    await startListening(panel);
-    await stopListening(panel);
+    await turnVoiceOn(voice);
+    await completeAutomaticUtterance(voice);
 
-    expect(await within(panel).findByText(outcome.sentence)).toBeVisible();
+    expect(screen.getByText(outcome.sentence)).toBeVisible();
     if (outcome.kind !== "heard") expect(resolveVoice).not.toHaveBeenCalled();
-    if (outcome.kind === "failed") {
-      expect(panel).not.toHaveTextContent("could not work out what to do");
-    }
   });
 
-  /**
-   * Scenario: stopping capture returns a heard transcript that maps to the
-   * overview command. The transcript enters the same resolver used by typed
-   * input, and its resolved sentence and navigation are rendered.
-   */
-  it("sends a heard transcript through the shared resolve path", async () => {
-    const utterance = "show me every agent";
-    const voice = voiceControls({
-      voiceStatus: vi.fn(async () => voiceStatus({ available: true, backend: "remote" })),
-      voiceStop: vi.fn(async () => transcription({
-        kind: "heard",
-        transcript: utterance,
-        sentence: `Heard: “${utterance}”.`,
-      })),
-    });
-    const resolveVoice = resolver(result(DISPATCH));
+  /** Scenario: a spoken utterance resolves to each closed Rust outcome kind. Its sentence is rendered verbatim. */
+  it.each(OUTCOMES)("displays the $name outcome's rendered sentence", async ({ utterance, outcome }) => {
+    vi.useFakeTimers();
+    const voice = automaticVoice(heard(utterance));
+    const resolveVoice = resolver(result(outcome));
     render(<DeckShell runtime={runtime(resolveVoice, voice)} />);
 
-    const panel = openVoicePanel();
-    await startListening(panel);
-    await stopListening(panel);
+    await turnVoiceOn(voice);
+    await completeAutomaticUtterance(voice);
 
-    await waitFor(() => expect(resolveVoice).toHaveBeenCalledWith(utterance));
-    expect(await within(panel).findByText(DISPATCH.sentence)).toBeVisible();
-    expect(screen.getByTestId("overview-table-region")).toBeVisible();
+    expect(screen.getByText(outcome.sentence)).toBeVisible();
+    if (outcome.kind === "dispatch") expect(screen.getByTestId("overview-table-region")).toBeVisible();
+    else expect(screen.getByTestId("agent-tile-planner")).toBeVisible();
   });
 
-  /**
-   * Scenario: submit one typed command for each closed Rust outcome. The panel
-   * displays the outcome's own complete sentence, and only Dispatch changes
-   * the visible screen.
-   */
-  it.each(OUTCOMES)("displays the $name outcome's rendered sentence", async ({ utterance, outcome }) => {
-    const resolveVoice = resolver(result(outcome));
-    render(<DeckShell runtime={runtime(resolveVoice)} />);
-
-    const panel = openVoicePanel();
-    await submit(panel, utterance, resolveVoice);
-
-    expect(within(panel).getByText(outcome.sentence)).toBeVisible();
-    if (outcome.kind === "dispatch") {
-      expect(screen.getByTestId("overview-table-region")).toBeVisible();
-    } else {
-      expect(screen.getByTestId("agent-tile-planner")).toBeVisible();
-    }
-  });
-
-  /**
-   * Scenario: submit a no-match transcript containing punctuation, odd casing
-   * and an inner quote. The report's DOM text preserves the Rust-rendered
-   * transcript byte for byte instead of normalising or sanitising it again.
-   */
+  /** Scenario: speech contains odd casing, punctuation and an inner quote. A no-match report preserves it byte for byte. */
   it("shows the no-match transcript verbatim, including punctuation, casing and an inner quote", async () => {
+    vi.useFakeTimers();
     const utterance = 'Go, BACK to "Deck"?!';
     const sentence = 'Heard: “Go, BACK to "Deck"?!” — no matching action.';
-    const resolveVoice = resolver(result({
-      kind: "no_match",
-      transcript: utterance,
-      sentence,
-    }));
-    render(<DeckShell runtime={runtime(resolveVoice)} />);
+    const voice = automaticVoice(heard(utterance));
+    const resolveVoice = resolver(result({ kind: "no_match", transcript: utterance, sentence }));
+    render(<DeckShell runtime={runtime(resolveVoice, voice)} />);
 
-    const panel = openVoicePanel();
-    await submit(panel, utterance, resolveVoice);
+    await turnVoiceOn(voice);
+    await completeAutomaticUtterance(voice);
 
-    expect(within(panel).getByText(sentence).textContent).toBe(sentence);
+    expect(screen.getByText(sentence).textContent).toBe(sentence);
   });
 
-  /**
-   * Scenario: a slow Claude resolution completes after 4.2 seconds. Its report
-   * presents the backend and latency in one piece of visible metadata, so the
-   * delay identifies the backend that caused it.
-   */
+  /** Scenario: a slow Claude result reports its backend and 4.2-second latency together beside the sentence. */
   it("shows backend and latency together", async () => {
+    vi.useFakeTimers();
+    const utterance = "what time is it?";
+    const voice = automaticVoice(heard(utterance));
     const resolveVoice = resolver(result(
-      { kind: "no_match", transcript: "what time is it?", sentence: "No clock command is available." },
+      { kind: "no_match", transcript: utterance, sentence: "No clock command is available." },
       4_200,
       "claude",
     ));
-    render(<DeckShell runtime={runtime(resolveVoice)} />);
-
-    const panel = openVoicePanel();
-    await submit(panel, "what time is it?", resolveVoice);
-
-    expect(within(panel).getByText("claude, 4.2 s")).toBeVisible();
-  });
-
-  /**
-   * Scenario: a result says no backend call was made. The backend remains
-   * visible, but the report invents neither a zero-millisecond nor zero-second
-   * measurement.
-   */
-  it("shows no timing when resolveMs is null", async () => {
-    const sentence = "Nothing was sent because the utterance was silent.";
-    const resolveVoice = resolver(result(
-      { kind: "transcription_failed", detail: "silence", sentence },
-      null,
-      "stub",
-    ));
-    render(<DeckShell runtime={runtime(resolveVoice)} />);
-
-    const panel = openVoicePanel();
-    await submit(panel, "fixture with no backend call", resolveVoice);
-
-    expect(within(panel).getByText(sentence)).toBeVisible();
-    expect(panel).toHaveTextContent("stub");
-    expect(panel.textContent).not.toMatch(/\b0(?:\.0+)?\s*(?:ms|s)\b/i);
-  });
-
-  /**
-   * Scenario: dispatch navigation from the deck to the overview, then take the
-   * offered Undo action. The deck the user was on returns and the spent undo
-   * affordance disappears.
-   */
-  it("undoes a dispatched navigation back to the previous view", async () => {
-    const resolveVoice = resolver(result(DISPATCH));
-    render(<DeckShell runtime={runtime(resolveVoice)} />);
-
-    const panel = openVoicePanel();
-    await submit(panel, "show me every agent", resolveVoice);
-    expect(screen.getByTestId("overview-table-region")).toBeVisible();
-
-    fireEvent.click(within(panel).getByRole("button", { name: "Undo" }));
-
-    expect(screen.getByTestId("agent-tile-planner")).toBeVisible();
-    expect(within(panel).queryByRole("button", { name: "Undo" })).not.toBeInTheDocument();
-  });
-
-  /**
-   * Scenario: dispatch navigation and leave its Undo action untouched for one
-   * minute. The affordance expires instead of becoming a permanent second
-   * navigation control.
-   */
-  it("expires the navigation undo window", async () => {
-    vi.useFakeTimers();
-    const resolveVoice = resolver(result(DISPATCH));
-    render(<DeckShell runtime={runtime(resolveVoice)} />);
-
-    const panel = openVoicePanel();
-    await submit(panel, "show me every agent", resolveVoice);
-    expect(within(panel).getByRole("button", { name: "Undo" })).toBeVisible();
-
-    act(() => vi.advanceTimersByTime(60_000));
-
-    expect(within(panel).queryByRole("button", { name: "Undo" })).not.toBeInTheDocument();
-  });
-
-  /**
-   * Scenario: resolve uniquely identifiable typed and spoken utterances, then
-   * close the panel after both reports appear. No localStorage write or stored
-   * value contains either transcript after the complete round trips.
-   */
-  it("never persists a typed or spoken transcript", async () => {
-    const typed = 'SENTINEL typed voice transcript, "Mixed CASE"?!';
-    const spoken = 'SENTINEL spoken voice transcript, "Other CASE"?!';
-    const sentenceFor = (utterance: string) => `Heard: “${utterance}” — no matching action.`;
-    const setItem = vi.spyOn(Storage.prototype, "setItem");
-    const resolveVoice = vi.fn(async (utterance: string) => result({
-      kind: "no_match",
-      transcript: utterance,
-      sentence: sentenceFor(utterance),
-    }));
-    const voice = voiceControls({
-      voiceStatus: vi.fn(async () => voiceStatus({ available: true, backend: "remote" })),
-      voiceStop: vi.fn(async () => transcription({
-        kind: "heard",
-        transcript: spoken,
-        sentence: `Heard: “${spoken}”.`,
-      })),
-    });
     render(<DeckShell runtime={runtime(resolveVoice, voice)} />);
 
-    const panel = openVoicePanel();
-    await submit(panel, typed, resolveVoice);
-    expect(within(panel).getByText(sentenceFor(typed))).toBeVisible();
-    await startListening(panel);
-    await stopListening(panel);
-    expect(await within(panel).findByText(sentenceFor(spoken))).toBeVisible();
-    fireEvent.click(within(panel).getByRole("button", { name: "Close voice control" }));
-    expect(screen.queryByRole("dialog", { name: "Voice control" })).not.toBeInTheDocument();
+    await turnVoiceOn(voice);
+    await completeAutomaticUtterance(voice);
 
-    for (const utterance of [typed, spoken]) {
-      for (const call of setItem.mock.calls) expect(String(call[1])).not.toContain(utterance);
-      expect(JSON.stringify(window.localStorage)).not.toContain(utterance);
-    }
+    expect(screen.getByText("claude, 4.2 s")).toBeVisible();
   });
 
-  /**
-   * A resolver that answers only when the test tells it to.
-   *
-   * The window this reproduces is the ordinary one rather than a contrived
-   * race: PRD #802 measured the zero-configuration backend at 4.3–6.3 s per
-   * utterance, which is several seconds in which the user can close the dialog
-   * or walk to another screen.
-   */
+  /** Scenario: no backend call was made. The backend stays visible without an invented zero-duration measurement. */
+  it("shows no timing when resolveMs is null", async () => {
+    vi.useFakeTimers();
+    const utterance = "silence fixture";
+    const sentence = "Nothing was sent because the utterance was silent.";
+    const voice = automaticVoice(heard(utterance));
+    const resolveVoice = resolver(result({ kind: "transcription_failed", detail: "silence", sentence }, null, "stub"));
+    render(<DeckShell runtime={runtime(resolveVoice, voice)} />);
+
+    await turnVoiceOn(voice);
+    await completeAutomaticUtterance(voice);
+
+    const report = screen.getByTestId("voice-report");
+    expect(screen.getByText(sentence)).toBeVisible();
+    expect(report).toHaveTextContent("stub");
+    expect(report.textContent).not.toMatch(/\b0(?:\.0+)?\s*(?:ms|s)\b/i);
+  });
+
+  /** Scenario: a spoken settings command opens the ordinary overlay and its transient report confirms the action. */
+  it("opens a deck overlay through the shell voice dispatch", async () => {
+    vi.useFakeTimers();
+    const voice = automaticVoice(heard("open settings"));
+    const resolveVoice = resolver(result(OPEN_SETTINGS_DISPATCH));
+    render(<DeckShell runtime={runtime(resolveVoice, voice)} />);
+
+    await turnVoiceOn(voice);
+    await completeAutomaticUtterance(voice);
+
+    expect(screen.getByTestId("settings-panel")).toBeVisible();
+    expect(screen.getByText(OPEN_SETTINGS_DISPATCH.sentence)).toBeVisible();
+    expect(screen.queryByText(NOTHING_DISPATCHED)).not.toBeInTheDocument();
+  });
+
+  /** Scenario: the same overlay command resolves where its host is absent. The report corrects it and nothing opens. */
+  it("reports an unavailable overlay dispatch from the overview without throwing", async () => {
+    vi.useFakeTimers();
+    const voice = automaticVoice(heard("open settings"));
+    const resolveVoice = resolver(result(OPEN_SETTINGS_DISPATCH));
+    render(<DeckShell runtime={runtime(resolveVoice, voice)} initialView={{ kind: "overview" }} />);
+
+    await turnVoiceOn(voice);
+    await completeAutomaticUtterance(voice);
+
+    expect(screen.getByText(NOTHING_DISPATCHED)).toBeVisible();
+    expect(screen.queryByTestId("settings-panel")).not.toBeInTheDocument();
+  });
+
+  /** Scenario: a voice command navigates to the overview, then its transient Undo returns to the prior deck view. */
+  it("undoes a dispatched navigation back to the previous view", async () => {
+    vi.useFakeTimers();
+    const voice = automaticVoice(heard("show me every agent"));
+    render(<DeckShell runtime={runtime(resolver(result(DISPATCH)), voice)} />);
+
+    await turnVoiceOn(voice);
+    await completeAutomaticUtterance(voice);
+    expect(screen.getByTestId("overview-table-region")).toBeVisible();
+    fireEvent.click(screen.getByRole("button", { name: "Undo" }));
+
+    expect(screen.getByTestId("agent-tile-planner")).toBeVisible();
+    expect(screen.queryByRole("button", { name: "Undo" })).not.toBeInTheDocument();
+  });
+
+  /** Scenario: leave navigation Undo untouched for its complete window. The transient affordance expires. */
+  it("expires the navigation undo window", async () => {
+    vi.useFakeTimers();
+    const voice = automaticVoice(heard("show me every agent"));
+    render(<DeckShell runtime={runtime(resolver(result(DISPATCH)), voice)} />);
+
+    await turnVoiceOn(voice);
+    await completeAutomaticUtterance(voice);
+    expect(screen.getByRole("button", { name: "Undo" })).toBeVisible();
+    await act(async () => { await vi.advanceTimersByTimeAsync(VOICE_UNDO_WINDOW_MS); });
+
+    expect(screen.queryByRole("button", { name: "Undo" })).not.toBeInTheDocument();
+  });
+
+  /** Scenario: a unique spoken transcript completes and Voice turns off. Storage never receives it, and no typed path exists. */
+  it("never persists a spoken transcript and exposes no typed transcript path", async () => {
+    vi.useFakeTimers();
+    const utterance = 'SENTINEL spoken voice transcript, "Mixed CASE"?!';
+    const sentence = `Heard: “${utterance}” — no matching action.`;
+    const setItem = vi.spyOn(Storage.prototype, "setItem");
+    const voice = automaticVoice(heard(utterance));
+    const resolveVoice = resolver(result({ kind: "no_match", transcript: utterance, sentence }));
+    render(<DeckShell runtime={runtime(resolveVoice, voice)} />);
+
+    await turnVoiceOn(voice);
+    await completeAutomaticUtterance(voice);
+    await act(async () => { fireEvent.click(voiceButton()); await Promise.resolve(); });
+
+    expect(screen.queryByRole("textbox", { name: "Command" })).not.toBeInTheDocument();
+    for (const call of setItem.mock.calls) expect(String(call[1])).not.toContain(utterance);
+    expect(JSON.stringify(window.localStorage)).not.toContain(utterance);
+  });
+
+  /** Return a resolver whose answer the test controls, to exercise the ordinary multi-second backend window. */
   function deferredResolver() {
-    let answer: (result: VoiceResult) => void = () => {};
-    const resolveVoice = vi.fn<(utterance: string) => Promise<VoiceResult>>(
-      () => new Promise<VoiceResult>((resolve) => { answer = resolve; }),
+    let answer: (value: VoiceResultDto) => void = () => {};
+    const resolveVoice = vi.fn<(utterance: string) => Promise<VoiceResultDto>>(
+      () => new Promise<VoiceResultDto>((resolve) => { answer = resolve; }),
     );
     return {
       resolveVoice,
-      settle: async (value: VoiceResult) => {
-        await act(async () => {
-          answer(value);
-          await Promise.resolve();
-        });
+      settle: async (value: VoiceResultDto) => {
+        await act(async () => { answer(value); await Promise.resolve(); });
       },
     };
   }
 
-  /**
-   * Scenario: type a command, close the Voice dialog while the resolver is
-   * still working, and only then let the resolver answer. The app stays
-   * exactly where the user left it — a dismissed request navigates nothing.
-   */
-  it("does not dispatch a request the user dismissed", async () => {
+  /** Scenario: VAD submits a command, then Voice turns off before resolution. The abandoned answer runs nothing. */
+  it("does not dispatch a request after Voice is turned off", async () => {
+    vi.useFakeTimers();
+    const voice = automaticVoice(heard("show me every agent"));
     const { resolveVoice, settle } = deferredResolver();
-    render(<DeckShell runtime={runtime(resolveVoice)} />);
+    render(<DeckShell runtime={runtime(resolveVoice, voice)} />);
 
-    const panel = openVoicePanel();
-    await submit(panel, "show me every agent", resolveVoice);
-    fireEvent.click(within(panel).getByRole("button", { name: "Close voice control" }));
-    expect(screen.queryByRole("dialog", { name: "Voice control" })).not.toBeInTheDocument();
-
+    await turnVoiceOn(voice);
+    await completeAutomaticUtterance(voice);
+    fireEvent.click(voiceButton());
+    expect(voiceButton()).toHaveAttribute("aria-pressed", "false");
     await settle(result(DISPATCH));
 
     expect(screen.queryByTestId("overview-table-region")).not.toBeInTheDocument();
     expect(screen.getByTestId("agent-tile-planner")).toBeVisible();
   });
 
-  /**
-   * Scenario: submit "open settings" from the overview, walk to the deck while
-   * the resolver is still working, and only then let it answer. The outcome was
-   * judged against a screen the user has left, so nothing runs on the screen
-   * they are standing on now and the report says so.
-   */
+  /** Scenario: a spoken command starts on the overview, then the user moves. Nothing runs and the report explains why. */
   it("does not dispatch a request resolved against the screen the user has left", async () => {
+    vi.useFakeTimers();
+    const voice = automaticVoice(heard("open settings"));
     const { resolveVoice, settle } = deferredResolver();
-    render(<DeckShell runtime={runtime(resolveVoice)} initialView={{ kind: "overview" }} />);
+    render(<DeckShell runtime={runtime(resolveVoice, voice)} initialView={{ kind: "overview" }} />);
 
-    const panel = openVoicePanel();
-    await submit(panel, "open settings", resolveVoice);
+    await turnVoiceOn(voice);
+    await completeAutomaticUtterance(voice);
     fireEvent.click(screen.getByTestId("open-deck"));
     expect(screen.getByTestId("agent-tile-planner")).toBeVisible();
-
     await settle(result(OPEN_SETTINGS_DISPATCH));
 
     expect(screen.queryByTestId("settings-panel")).not.toBeInTheDocument();
-    expect(await within(panel).findByText(SCREEN_MOVED_ON)).toBeVisible();
-  });
-
-  /**
-   * Scenario: open Voice from its trigger with the keyboard and close it again.
-   * The dialog does not claim a modality it deliberately does not enforce — it
-   * inerts nothing, by the peer decision in `useInertBackground` — and the
-   * keyboard position it borrowed goes back to the control that opened it.
-   */
-  it("does not claim modality it does not enforce, and returns focus to its trigger", async () => {
-    render(<DeckShell runtime={runtime(resolver(result(DISPATCH)))} />);
-
-    const trigger = screen.getByTestId("voice-trigger");
-    trigger.focus();
-    await act(async () => {
-      fireEvent.click(trigger);
-      await Promise.resolve();
-    });
-
-    const panel = screen.getByRole("dialog", { name: "Voice control" });
-    expect(panel).not.toHaveAttribute("aria-modal", "true");
-
-    await act(async () => {
-      fireEvent.click(within(panel).getByRole("button", { name: "Close voice control" }));
-      await Promise.resolve();
-    });
-
-    expect(screen.queryByRole("dialog", { name: "Voice control" })).not.toBeInTheDocument();
-    expect(document.activeElement).toBe(trigger);
+    expect(screen.getByText(SCREEN_MOVED_ON)).toBeVisible();
   });
 });
