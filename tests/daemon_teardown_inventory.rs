@@ -177,6 +177,7 @@ async fn teardown_inventory_001_unguarded_teardown_names_what_it_destroys() {
         // which teardown path emitted it, so a reader does not have to
         // correlate this line against the one above it by timestamp
         "signal",
+        "role_count=2",
         "terminating 3 managed agent(s)",
         "destroying 2 orchestration role registration(s)",
         ORCHESTRATOR_PANE,
