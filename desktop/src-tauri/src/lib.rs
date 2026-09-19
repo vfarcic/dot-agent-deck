@@ -1669,8 +1669,24 @@ pub struct VoiceStatus {
 ///
 /// Read per call rather than cached, for `voice::resolver_for`'s reason: a user
 /// who changes the setting uses it on the next utterance instead of after a
-/// restart. It costs one small TOML read per button press, which is what
-/// `desktop_get_settings` already costs per settings render.
+/// restart. **That is what makes pressing Voice again after choosing a backend
+/// work without a restart**, which PRD #802 M6's rewrite turned from a nicety
+/// into the documented behaviour of the unavailable path.
+///
+/// **The cost is no longer "one small TOML read per button press".** It was,
+/// while the only status reads were one per press plus one a second inside an
+/// open dialog. Continuous voice control polls `desktop_voice_status` every
+/// `VOICE_STATUS_POLL_MS` — 250 ms — for as long as the microphone is open, so
+/// this is **four small TOML reads a second** in that state and one per call
+/// everywhere else. At a few tens of microseconds each that is not worth
+/// caching away the freshness above.
+///
+/// One consequence is worth naming rather than discovering: `load_snapshot`
+/// logs a malformed document through `log_document_problem`, which is a bare
+/// `eprintln!` with no rate limit. A `desktop.toml` this build cannot parse
+/// therefore writes four stderr lines a second while voice is on, where it
+/// wrote one. It is a misconfiguration either way, and the fix — if it ever
+/// matters — is a log-once latch in `settings.rs` rather than a cache here.
 fn voice_transcription_backend() -> crate::settings::TranscriptionBackend {
     crate::settings::load_snapshot()
         .settings
