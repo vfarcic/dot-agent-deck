@@ -440,7 +440,7 @@ fn normalize_for_match(s: &str) -> &str {
 /// Whether a hook-reported `user_prompt` confirms submission of `expected` —
 /// the prompt text we wrote into the pane.
 ///
-/// Three shapes are accepted, each for a specific mechanical reason:
+/// Four shapes are accepted, each for a specific mechanical reason:
 ///
 /// 1. **The text verbatim.** The ordinary case.
 /// 2. **Its [`USER_PROMPT_MAX_LEN`]-truncated form.** Which one arrives depends
@@ -458,6 +458,18 @@ fn normalize_for_match(s: &str) -> &str {
 ///    length-dependent — a seed longer than [`USER_PROMPT_MAX_LEN`] already
 ///    matched its doubled submission (both truncate to the same prefix) while a
 ///    short one did not, so short and long prompts behaved oppositely.
+/// 4. **Any of the three above, inside the producer's PASTE ENVELOPE**
+///    (issue #1182). A payload the deck writes as bracketed paste — which is
+///    every MULTI-LINE payload, see [`crate::pane_input::encode_pane_payload`]
+///    — does not come back as the text we wrote: Claude Code reports it wrapped
+///    in `<pasted_content id="…">`. So the first three shapes structurally
+///    cannot match a multi-line delivery to such a producer, and every one of
+///    them was retried to [`AUTOMATIC_PROMPT_DEADLINE`] and abandoned on work
+///    the agent had received and acted on. The envelope is a DELIMITED region,
+///    which is what keeps this from meaning "the report contains our prompt
+///    somewhere": the payload is compared as a whole, only blank lines may
+///    precede the delimiter, and the comparison budget shrinks by what the
+///    envelope spent. See [`paste_envelope_payload`].
 ///
 /// Both sides are normalized with [`normalize_for_match`], never `str::trim`.
 ///
@@ -482,28 +494,38 @@ fn normalize_for_match(s: &str) -> &str {
 /// ordinary confirmation of any prompt over 200 bytes, i.e. reinstate issue
 /// #424 for every long dispatch prompt.
 ///
-/// # The three shapes are not equally clean (#685)
+/// # The shapes are not equally clean (#685)
 ///
 /// Two of them mean the agent submitted a turn carrying our prompt more than
 /// once, and this `bool` cannot say which one answered. That is a reporting gap
-/// rather than a delivery one — the accept set here is deliberate and pinned —
-/// so [`classify_prompt_submission`] names the shape for the log and this stays
-/// exactly as wide as it was. See [`ConfirmedSubmission`].
+/// rather than a delivery one, so [`classify_prompt_submission`] names the
+/// shape for the log. See [`ConfirmedSubmission`].
+///
+/// # Shape 4 is the one addition since (#1182)
+///
+/// The accept set was "deliberate and pinned" for three shapes and stayed that
+/// way through #685, which relabelled without widening. #1182 widened it once,
+/// by the fourth shape above, because a producer that REWRITES our payload into
+/// an envelope before reporting it falsifies the premise the other three rest
+/// on — that a submitted prompt comes back as the text we wrote. That is a
+/// widening and is named as one; what it does not do is loosen the other three,
+/// which keep their exact accept set and evaluation order (see
+/// [`classify_reported_text`]).
 pub fn prompt_submission_matches(expected: &str, reported: &str) -> bool {
     classify_prompt_submission(expected, reported).is_some()
 }
 
-/// Issue #685: WHICH of [`prompt_submission_matches`]'s three shapes confirmed a
+/// Issue #685: WHICH of [`prompt_submission_matches`]'s shapes confirmed a
 /// delivery — the fact that tells a clean single-copy turn apart from a
 /// duplicated one in the delivery log.
 ///
 /// Every variant is a confirmation, every variant is terminal for the delivery,
 /// and **no delivery decision reads this**: it exists so the log can say what
-/// happened, and nothing else. The three shapes were never equally clean — two
-/// of them mean the agent is acting on a turn that carries our prompt MORE THAN
-/// ONCE — but all three used to emit the same `info` line, so a duplicated turn
-/// was indistinguishable from an ordinary success in three of the four
-/// repetition shapes issue #685 measured.
+/// happened, and nothing else. The shapes were never equally clean — two of
+/// them mean the agent is acting on a turn that carries our prompt MORE THAN
+/// ONCE — but the three that existed then all emitted the same `info` line, so
+/// a duplicated turn was indistinguishable from an ordinary success in three of
+/// the four repetition shapes issue #685 measured.
 ///
 /// # The knowable / unknowable split
 ///
@@ -550,16 +572,31 @@ pub enum ConfirmedSubmission {
     /// times. **#526's full-prompt digest is what removes the cell**; this
     /// variant only stops it from being reported as a clean single copy.
     TruncatedPrefix,
+    /// Issue #1182 — the report is our payload inside the producer's PASTE
+    /// ENVELOPE: `<pasted_content id="…">` … `</pasted_content id="…">`, which
+    /// is how Claude Code renders a bracketed paste in the turn it reports.
+    /// Reachable only for a MULTI-LINE payload, since those are the only ones
+    /// [`crate::pane_input::encode_pane_payload`] wraps in bracketed paste.
+    ///
+    /// Everything [`Self::TruncatedPrefix`] says about undecidability applies
+    /// here too and for the same reason — the enveloped payload is compared as
+    /// a prefix, shortened by whatever the envelope spent — with one fact on
+    /// top that the plain truncated line cannot carry: the producer rewrote our
+    /// payload into an envelope, which is WHY nothing matched verbatim. An
+    /// operator reading a log full of abandoned deliveries needs that fact, so
+    /// it is a variant rather than a widening of the one above.
+    PasteEnvelope,
 }
 
 impl ConfirmedSubmission {
     /// The stable slug the delivery log carries in its `confirmation` field, so
-    /// the three shapes are greppable without matching on message prose.
+    /// the shapes are greppable without matching on message prose.
     pub fn log_slug(self) -> &'static str {
         match self {
             Self::SingleCopy => "single-copy",
             Self::RepeatedCopies { .. } => "repeated-copies",
             Self::TruncatedPrefix => "truncated-report",
+            Self::PasteEnvelope => "paste-envelope",
         }
     }
 
@@ -569,13 +606,18 @@ impl ConfirmedSubmission {
     ///
     /// Reporting the least notable would hide a duplicate behind a clean line,
     /// so the most notable wins. This orders LOG LINES and nothing else: all
-    /// three shapes are equally `Confirmed`, and the delivery outcome does not
+    /// variants are equally `Confirmed`, and the delivery outcome does not
     /// depend on which one is picked.
     fn notability(self) -> u8 {
         match self {
             Self::SingleCopy => 0,
             Self::TruncatedPrefix => 1,
-            Self::RepeatedCopies { .. } => 2,
+            // Above the plain truncated line because it carries strictly more:
+            // the same undecidability PLUS the reason the verbatim comparisons
+            // could not answer. Below a visible duplicate, which is the only
+            // one of the four an operator has to act on.
+            Self::PasteEnvelope => 2,
+            Self::RepeatedCopies { .. } => 3,
         }
     }
 
@@ -590,19 +632,139 @@ impl ConfirmedSubmission {
     }
 }
 
+/// The opening delimiter a producer wraps a bracketed paste in before reporting
+/// the turn back through `UserPromptSubmit`.
+///
+/// Measured on `scheduler/dispatch/015` (three real interactive Haiku panes,
+/// 2026-09-19): a payload the deck writes as bracketed paste
+/// ([`crate::pane_input::encode_pane_payload`] wraps every MULTI-LINE payload in
+/// `ESC[200~`/`ESC[201~`) does not come back verbatim. Claude Code reports it as
+///
+/// ```text
+/// <pasted_content id="57b9">
+/// …the payload…
+/// </pasted_content id="57b9">
+/// ```
+///
+/// so the plain comparisons above can never match it, and the delivery retries
+/// until [`AUTOMATIC_PROMPT_DEADLINE`] abandons it — the exact silent-failure
+/// shape [`USER_PROMPT_MAX_LEN`]'s doc warns about, arrived at from a different
+/// direction. That is not hypothetical scope: PRD #220 Phase 2 (#1081) appends
+/// the `work-done` completion instruction to EVERY `--single` dispatch prompt,
+/// which made every one of them multi-line, so from that commit on no dispatch
+/// to a Claude Code pane could be confirmed. What the operator saw was a pane
+/// flagged with `DeliveryNotice`'s "it may never have arrived — check whether
+/// this pane was given any task at all" on work that had in fact been delivered
+/// and completed, and one extra payload write (`MAX_PAYLOAD_SUBMISSIONS`) into
+/// an agent already acting on the task.
+const PASTE_ENVELOPE_OPEN_HEAD: &str = "<pasted_content id=\"";
+
+/// The rest of the opening delimiter, after the opaque id.
+const PASTE_ENVELOPE_OPEN_TAIL: &str = "\">";
+
+/// The closing delimiter's stable head. The id is repeated after it, so only the
+/// part that cannot vary is matched.
+const PASTE_ENVELOPE_CLOSE_HEAD: &str = "</pasted_content";
+
+/// How long an envelope id may be before the report is refused as not being one.
+/// Measured ids are four characters (`57b9`, `a833`, `7632`); this is margin,
+/// and it is a BOUND rather than a guess — see [`paste_envelope_payload`] for
+/// why every byte the envelope spends has to be accounted for.
+const MAX_PASTE_ENVELOPE_ID_LEN: usize = 16;
+
+/// How many bytes of blank line may precede the envelope in a report.
+///
+/// They come from the delivery's OWN submit probes: a CR that arrives fused to
+/// an agent TUI that is not yet in submit-aware mode lands as a newline in the
+/// input box (PRD #128), so a turn submitted later carries one per probe ahead
+/// of the payload. `dispatch/015` measured exactly two. The retry schedule
+/// cannot produce more than single digits inside [`AUTOMATIC_PROMPT_DEADLINE`]
+/// — the same fact [`MAX_REPEATED_SUBMISSION_COPIES`] rests on — so this is
+/// margin over that, not a tuning knob.
+///
+/// Bounded rather than "any leading whitespace" for one reason that matters:
+/// every byte in front of the payload is a byte the hook's
+/// [`USER_PROMPT_MAX_LEN`] truncation took OFF the end of it, so an unbounded
+/// prefix would shrink the compared payload without limit and the comparison
+/// would eventually be against nothing at all.
+const MAX_PASTE_ENVELOPE_LEADING_BLANK_BYTES: usize = 16;
+
+/// The payload a producer's paste envelope wraps, and the byte offset it starts
+/// at within `reported`.
+///
+/// That offset is the second half of the answer and not bookkeeping: the hook
+/// truncates the WHOLE reported turn at [`USER_PROMPT_MAX_LEN`], so everything
+/// the envelope and its leading blank lines spend is taken off the end of our
+/// payload. A caller comparing the wrapped payload has to truncate its own copy
+/// to `USER_PROMPT_MAX_LEN - offset`, not to `USER_PROMPT_MAX_LEN`.
+///
+/// `None` for a report that is not enveloped, which is every report from a
+/// single-line payload and from every producer that reports verbatim.
+///
+/// Returned as a slice of `reported` rather than an owned `String` so a caller
+/// can key offsets off it; the leading `\n` a producer puts after the opening
+/// delimiter is consumed, and the closing delimiter is left for
+/// [`strip_paste_envelope_close`] because a truncated report does not reach it.
+pub fn paste_envelope_payload(reported: &str) -> Option<(&str, usize)> {
+    let head_at = reported.find(PASTE_ENVELOPE_OPEN_HEAD)?;
+    let leading = &reported[..head_at];
+    if leading.len() > MAX_PASTE_ENVELOPE_LEADING_BLANK_BYTES
+        || !leading.bytes().all(|b| b == b'\n' || b == b'\r')
+    {
+        return None;
+    }
+    let after_head = &reported[head_at + PASTE_ENVELOPE_OPEN_HEAD.len()..];
+    let id_len = after_head.find(PASTE_ENVELOPE_OPEN_TAIL)?;
+    if id_len == 0 || id_len > MAX_PASTE_ENVELOPE_ID_LEN {
+        return None;
+    }
+    if !after_head[..id_len]
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric())
+    {
+        return None;
+    }
+    let body = &after_head[id_len + PASTE_ENVELOPE_OPEN_TAIL.len()..];
+    let body = body.strip_prefix('\n').unwrap_or(body);
+    Some((body, reported.len() - body.len()))
+}
+
+/// Drop the envelope's closing delimiter from a payload that still carries one.
+///
+/// Only a delimiter that ENDS the report is dropped, and only one that occupies
+/// a single line of its own: a payload whose own text mentions
+/// `</pasted_content` must not be able to cut the comparison short at that
+/// point. A report truncated at [`USER_PROMPT_MAX_LEN`] — which is every
+/// dispatch prompt, since they run well over it — never reaches the closing
+/// delimiter at all, so this is the short-payload path.
+fn strip_paste_envelope_close(payload: &str) -> &str {
+    let Some(at) = payload.rfind(PASTE_ENVELOPE_CLOSE_HEAD) else {
+        return payload;
+    };
+    let close = &payload[at..];
+    if !close.ends_with('>') || close.contains('\n') {
+        return payload;
+    }
+    payload[..at].trim_end_matches('\n')
+}
+
 /// [`prompt_submission_matches`]'s body, reporting WHICH shape matched instead
-/// of a bare `bool`. See that function for the three shapes, the normalization
+/// of a bare `bool`. See that function for the shapes, the normalization
 /// contract and the accepted truncation residual.
 ///
-/// This is a mechanical relabelling of the `true`s, not a new decision: the set
-/// of `(expected, reported)` pairs that confirm a delivery is **exactly** the
-/// one that function has always accepted, in the same evaluation order, and
-/// `prompt_submission_matches` is now `.is_some()` over this. Issue #685 is an
-/// observability change and explicitly not a widening or a narrowing — the two
-/// tests that pin the accept set on both sides
-/// (`repeated_copies_of_the_seed_count_as_delivered` and
+/// Issue #685 was a mechanical relabelling of the `true`s and not a new
+/// decision: it left the set of `(expected, reported)` pairs that confirm a
+/// delivery exactly as it was, in the same evaluation order, with
+/// `prompt_submission_matches` becoming `.is_some()` over this. It was
+/// explicitly not a widening or a narrowing — the two tests that pin the accept
+/// set on both sides (`repeated_copies_of_the_seed_count_as_delivered` and
 /// `bare_concatenation_is_accumulation_and_not_confirmation`) still call the
 /// `bool` API unmodified and are what proves that.
+///
+/// Issue #1182 then DID widen it, by the paste envelope below and by nothing
+/// else. The three shapes #685 relabelled are untouched — they live in
+/// [`classify_reported_text`], which this asks first and unchanged — so those
+/// same two tests still pin them.
 ///
 /// The one non-mechanical detail: the single verbatim check and the single
 /// TRUNCATED check used to be one `||`, and are split apart here because they
@@ -611,6 +773,43 @@ impl ConfirmedSubmission {
 pub fn classify_prompt_submission(expected: &str, reported: &str) -> Option<ConfirmedSubmission> {
     let expected = normalize_for_match(expected);
     let reported = normalize_for_match(reported);
+    if let Some(confirmed) = classify_reported_text(expected, reported, USER_PROMPT_MAX_LEN) {
+        return Some(confirmed);
+    }
+    // Shape 4 (issue #1182), asked only after the three above have said no —
+    // the same discipline `prompt_submission_accumulated` is written under, and
+    // for the same reason: it can only ADD confirmations where the delivery was
+    // previously retried to the deadline and abandoned, and it reclassifies
+    // nothing that already matched.
+    //
+    // The same three shapes are then asked again INSIDE the envelope, rather
+    // than a second grammar being written for it, so "what counts as our
+    // payload" has one definition. The budget shrinks by what the envelope and
+    // the blank lines in front of it spent, because the hook truncated the
+    // whole turn and those bytes came off the end of our payload; see
+    // [`paste_envelope_payload`].
+    let (payload, spent) = paste_envelope_payload(reported)?;
+    classify_reported_text(
+        expected,
+        normalize_for_match(strip_paste_envelope_close(payload)),
+        USER_PROMPT_MAX_LEN.saturating_sub(spent),
+    )
+    .map(|_| ConfirmedSubmission::PasteEnvelope)
+}
+
+/// [`classify_prompt_submission`]'s three verbatim shapes, over text that is
+/// already normalized, against a truncation `budget`.
+///
+/// Split out so the same grammar can be asked of an enveloped payload without
+/// being written twice — and `budget` is a parameter for exactly that: inside an
+/// envelope the hook's [`USER_PROMPT_MAX_LEN`] was spent partly on the envelope
+/// itself. Every caller outside the envelope path passes `USER_PROMPT_MAX_LEN`,
+/// so this is the same function it always was.
+fn classify_reported_text(
+    expected: &str,
+    reported: &str,
+    budget: usize,
+) -> Option<ConfirmedSubmission> {
     if expected.is_empty() {
         // Nothing was written, so nothing can be evidence about it. Guards the
         // repetition loop below against an infinite family of empty candidates.
@@ -619,7 +818,7 @@ pub fn classify_prompt_submission(expected: &str, reported: &str) -> Option<Conf
     if reported == expected {
         return Some(ConfirmedSubmission::SingleCopy);
     }
-    if reported == truncate_on_char_boundary(expected, USER_PROMPT_MAX_LEN) {
+    if reported == truncate_on_char_boundary(expected, budget) {
         // Only reachable past the limit: at or under it `truncate_on_char_boundary`
         // returns the text unchanged, which the check above already settled.
         return Some(ConfirmedSubmission::TruncatedPrefix);
@@ -639,7 +838,7 @@ pub fn classify_prompt_submission(expected: &str, reported: &str) -> Option<Conf
             // exactly why the copy count comes back `None` here rather than as
             // `copies`, which is the first candidate that outgrew the report and
             // not a bound on what was submitted.
-            return (reported == truncate_on_char_boundary(&candidate, USER_PROMPT_MAX_LEN))
+            return (reported == truncate_on_char_boundary(&candidate, budget))
                 .then_some(ConfirmedSubmission::RepeatedCopies { copies: None });
         }
         if reported == candidate {
@@ -1007,8 +1206,8 @@ pub fn log_prompt_accumulated(path: &str, pane_id: &str, delivery_id: &str, atte
 ///
 /// # Issue #685: three lines, two levels, and why
 ///
-/// Before this, all three shapes emitted one `info` line, so a turn that
-/// carried the prompt twice read to an operator exactly like a clean success.
+/// Before this, every shape emitted one `info` line, so a turn that carried
+/// the prompt twice read to an operator exactly like a clean success.
 /// The measured table is in the issue: the separate `warn`
 /// ([`log_prompt_accumulated`]) fired in one of four repetition shapes, and in
 /// **none** of them for a prompt over [`USER_PROMPT_MAX_LEN`] — which a
@@ -1041,9 +1240,9 @@ pub fn log_prompt_accumulated(path: &str, pane_id: &str, delivery_id: &str, atte
 /// `copies="unknown-truncated-report"` says that, where a `0` or a made-up floor
 /// would not.
 ///
-/// **This changes no delivery decision.** All three shapes are `Confirmed`, all
-/// three are terminal, and nothing branches on the classification except the
-/// three arms below.
+/// **This changes no delivery decision.** Every shape is `Confirmed`, every
+/// shape is terminal, and nothing branches on the classification except the
+/// arms below.
 pub fn log_prompt_confirmed(
     path: &str,
     pane_id: &str,
@@ -1085,6 +1284,17 @@ pub fn log_prompt_confirmed(
             "prompt delivery confirmed by the agent's submitted prompt, reported only as a \
              truncated prefix that one copy and any number of copies render identically; \
              whether the turn was duplicated is undecidable from it"
+        ),
+        ConfirmedSubmission::PasteEnvelope => tracing::info!(
+            path,
+            pane_id,
+            delivery_id,
+            attempt,
+            confirmation = shape,
+            "prompt delivery confirmed by the agent's submitted prompt, which the producer \
+             reported wrapped in its paste envelope rather than verbatim; the enveloped \
+             payload matched, and whether the turn was duplicated is as undecidable as for a \
+             truncated report"
         ),
     }
 }
@@ -1427,7 +1637,7 @@ mod tests {
         );
     }
 
-    /// Issue #685: the actual LOG output of the three confirmation shapes,
+    /// Issue #685: the actual LOG output of the confirmation shapes,
     /// captured through a real `tracing` subscriber rather than inferred from
     /// the return value — which is the whole point of the issue, since every
     /// shape returns the same thing.
@@ -1442,7 +1652,7 @@ mod tests {
     ///   silence being fixed — while still being distinguishable from the clean
     ///   line.
     #[test]
-    fn confirmation_log_lines_distinguish_the_three_shapes() {
+    fn confirmation_log_lines_distinguish_every_shape() {
         use std::io::Write;
         use std::sync::{Arc, Mutex};
 
@@ -1544,12 +1754,34 @@ mod tests {
             "undecidable={undecidable:?}"
         );
 
-        // The three lines must be mutually distinguishable, which is the
-        // property the issue is actually about: before this they were one line.
+        // Issue #1182's shape reports the same undecidability AND the reason
+        // the verbatim comparisons could not answer, at the same quiet level
+        // for the same #818 reason: it lands on every multi-line delivery to a
+        // producer that rewrites a paste.
+        let enveloped = capture(ConfirmedSubmission::PasteEnvelope);
         assert!(
-            clean != repeated && repeated != undecidable && clean != undecidable,
-            "clean={clean:?} repeated={repeated:?} undecidable={undecidable:?}"
+            enveloped.contains("INFO") && !enveloped.contains("WARN"),
+            "enveloped={enveloped:?}"
         );
+        assert!(
+            enveloped.contains("paste envelope")
+                && enveloped.contains("undecidable")
+                && !enveloped.contains("states the task more than once"),
+            "enveloped={enveloped:?}"
+        );
+        assert!(
+            enveloped.contains("confirmation=\"paste-envelope\""),
+            "enveloped={enveloped:?}"
+        );
+
+        // The four lines must be mutually distinguishable, which is the
+        // property the issue is actually about: before this they were one line.
+        let lines = [&clean, &repeated, &undecidable, &enveloped];
+        for (at, one) in lines.iter().enumerate() {
+            for other in &lines[at + 1..] {
+                assert_ne!(one, other, "every confirmation shape needs its own line");
+            }
+        }
     }
 
     /// Issue #685: [`ConfirmedSubmission::more_notable`] decides which line one
@@ -1930,6 +2162,166 @@ mod tests {
             !agent_reports_submitted_prompt(&AgentType::None),
             "an unrecognized or future producer has not proved the capability"
         );
+    }
+
+    /// The shape `scheduler/dispatch/015` measured against three real
+    /// interactive Haiku panes on 2026-09-19: the deck writes a multi-line
+    /// payload as bracketed paste, and Claude Code reports the turn with our
+    /// payload inside `<pasted_content id="…">`, preceded by the blank lines
+    /// its own earlier submit probes left in the input box. Nothing above
+    /// matches that, so every `--single` dispatch was retried to the deadline
+    /// and abandoned on work the agent had in fact received and completed.
+    #[test]
+    fn a_paste_envelope_report_confirms_the_payload_it_wraps() {
+        let expected = "Do the thing\n\nWhen this work is finished, report back.";
+        let reported =
+            format!("\n\n<pasted_content id=\"57b9\">\n{expected}\n</pasted_content id=\"57b9\">");
+        assert_eq!(
+            classify_prompt_submission(expected, &reported),
+            Some(ConfirmedSubmission::PasteEnvelope)
+        );
+        assert!(prompt_submission_matches(expected, &reported));
+    }
+
+    /// The case every real dispatch actually lands on: the turn runs well past
+    /// [`USER_PROMPT_MAX_LEN`], so the hook truncates it and the closing
+    /// delimiter is never reported. What survives is a prefix of our payload
+    /// that is SHORTER than the plain truncated form by exactly what the
+    /// envelope and the blank lines in front of it spent — which is why
+    /// [`paste_envelope_payload`] returns that offset and this compares against
+    /// the reduced budget rather than against `USER_PROMPT_MAX_LEN`.
+    #[test]
+    fn a_truncated_paste_envelope_report_confirms_by_the_reduced_prefix() {
+        let expected = "z".repeat(USER_PROMPT_MAX_LEN * 2);
+        let turn =
+            format!("\n\n<pasted_content id=\"a833\">\n{expected}\n</pasted_content id=\"a833\">");
+        let reported = truncate_on_char_boundary(&turn, USER_PROMPT_MAX_LEN);
+        assert!(
+            reported.len() < turn.len(),
+            "the fixture must actually be truncated"
+        );
+        assert_eq!(
+            classify_prompt_submission(&expected, &reported),
+            Some(ConfirmedSubmission::PasteEnvelope)
+        );
+        // The plain truncated form is a DIFFERENT string — 23 bytes longer of
+        // our payload — so the shape above is not reachable through the
+        // `TruncatedPrefix` check and the reduced budget is load-bearing.
+        assert_ne!(
+            reported,
+            truncate_on_char_boundary(&expected, USER_PROMPT_MAX_LEN)
+        );
+    }
+
+    /// The envelope is a DELIMITED region, and that is the whole reason
+    /// accepting it does not amount to "the report contains our prompt
+    /// somewhere". Each of these is refused.
+    #[test]
+    fn the_paste_envelope_is_refused_unless_it_is_really_one() {
+        let expected = "Do the thing\n\nAnd then report back.";
+        let envelope = |body: &str| {
+            format!("<pasted_content id=\"57b9\">\n{body}\n</pasted_content id=\"57b9\">")
+        };
+
+        assert!(
+            !prompt_submission_matches(expected, &envelope("a completely different prompt")),
+            "an envelope wrapping someone else's text is not our delivery"
+        );
+        assert!(
+            !prompt_submission_matches(
+                expected,
+                &format!("please run this for me: {}", envelope(expected))
+            ),
+            "only blank lines may precede the envelope: prose in front of it is a turn \
+             someone composed AROUND our payload, not the payload submitted"
+        );
+        assert!(
+            !prompt_submission_matches(
+                expected,
+                &format!(
+                    "{}{}",
+                    "\n".repeat(MAX_PASTE_ENVELOPE_LEADING_BLANK_BYTES + 1),
+                    envelope(expected)
+                )
+            ),
+            "the blank-line run is bounded because every byte in front of the payload is a \
+             byte the hook's truncation took off the end of it"
+        );
+        assert!(
+            !prompt_submission_matches(
+                expected,
+                &format!(
+                    "<pasted_content id=\"{}\">\n{expected}",
+                    "f".repeat(MAX_PASTE_ENVELOPE_ID_LEN + 1)
+                )
+            ),
+            "an over-long id is not an id"
+        );
+        assert!(
+            !prompt_submission_matches(
+                expected,
+                &format!("<pasted_content id=\"a b\">\n{expected}")
+            ),
+            "an id is alphanumeric; anything else is not the delimiter we measured"
+        );
+        assert!(
+            !prompt_submission_matches(expected, &format!("<pasted_content>\n{expected}")),
+            "the delimiter carries an id, and half of one is not it"
+        );
+    }
+
+    /// A payload whose own text ends with something delimiter-shaped must not
+    /// be able to cut the comparison short there, and a genuine closing
+    /// delimiter must still come off.
+    #[test]
+    fn only_a_real_closing_delimiter_is_stripped() {
+        assert_eq!(
+            strip_paste_envelope_close("body\n</pasted_content id=\"57b9\">"),
+            "body"
+        );
+        assert_eq!(
+            strip_paste_envelope_close("body</pasted_content is what it is called>"),
+            "body"
+        );
+        assert_eq!(
+            strip_paste_envelope_close("talking about </pasted_content> in the middle"),
+            "talking about </pasted_content> in the middle",
+            "a delimiter that does not end the report is payload text"
+        );
+        assert_eq!(
+            strip_paste_envelope_close("body\n</pasted_content\nid>"),
+            "body\n</pasted_content\nid>",
+            "a delimiter spanning lines is payload text"
+        );
+        assert_eq!(
+            strip_paste_envelope_close("no delimiter here"),
+            "no delimiter here"
+        );
+    }
+
+    /// The envelope shape is an ADDITION: every report that confirmed before
+    /// still confirms, with the same classification, and an unenveloped report
+    /// still reaches the three shapes above unchanged.
+    #[test]
+    fn the_paste_envelope_shape_adds_and_never_reclassifies() {
+        let short = "seed alpha";
+        assert_eq!(
+            classify_prompt_submission(short, short),
+            Some(ConfirmedSubmission::SingleCopy)
+        );
+        let long = "q".repeat(USER_PROMPT_MAX_LEN + 10);
+        assert_eq!(
+            classify_prompt_submission(
+                &long,
+                &truncate_on_char_boundary(&long, USER_PROMPT_MAX_LEN)
+            ),
+            Some(ConfirmedSubmission::TruncatedPrefix)
+        );
+        assert_eq!(
+            classify_prompt_submission(short, &format!("{short}\n{short}")),
+            Some(ConfirmedSubmission::RepeatedCopies { copies: Some(2) })
+        );
+        assert_eq!(paste_envelope_payload(short), None);
     }
 
     /// The trap from the tester's finding #2: a prompt longer than the hook's
