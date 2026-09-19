@@ -9,7 +9,7 @@ What a host must provide for a `dot-agent-deck` **remote environment** — a per
 
 For lifecycle, failure modes, and how connecting works see [Remote Environments](remote-environments.md). For provisioning recipes see [Remote Recipes](remote-recipes.md).
 
-> **Status:** v1 requirements. The Required section reflects what was confirmed to work on a fresh Ubuntu 24.04 LTS VM, which has been the reference target throughout; the Recommended section reflects best-practice hardening that has not yet been re-validated end to end on a clean provision. macOS is a third state — `remote add` installs there and the release ships a daemon build for it, but nobody has run the path end to end, so it is documented as what it is rather than as supported or unsupported.
+> **Status:** v1 requirements. The Required section reflects what was confirmed to work on a fresh Ubuntu 24.04 LTS VM, which has been the reference target throughout; the Recommended section reflects best-practice hardening that has not yet been re-validated end to end on a clean provision. macOS was validated end to end on Apple Silicon on 2026-09-19 ([#1158](https://github.com/vfarcic/dot-agent-deck/issues/1158)).
 
 ## How this page is organized
 
@@ -26,7 +26,7 @@ The strict minimum for the daemon to launch and an agent to run.
 | Host OS | Status |
 |---|---|
 | Linux (amd64, arm64) | Validated end to end. The reference target throughout. |
-| macOS (Intel, Apple Silicon) | `remote add` installs and the release ships a daemon build, but the path has not been validated end to end — see [macOS as a remote host](#macos-as-a-remote-host) |
+| macOS | Validated end to end on Apple Silicon — see [macOS as a remote host](#macos-as-a-remote-host) for the two setup steps it needs |
 | Windows | Not supported as a remote host (you can still use it as the local client) |
 
 Windows is out for a concrete reason rather than a policy one: `remote add` does not recognise Windows as a host, so registering one fails before it gets as far as installing anything — and there is no Windows build of the daemon for it to install in any case.
@@ -39,19 +39,27 @@ Other modern systemd-based Linux distributions are likely to work but have not b
 
 ### macOS as a remote host
 
-`dot-agent-deck remote add` accepts a Mac and installs a genuine macOS build onto it, so nothing stops you trying. What nobody has done yet is run the whole thing end to end — install onto a Mac over ssh, start the deck there, run an agent under it, and connect from another machine. So a Mac is neither supported nor known-broken here; it is **untried**, and the rest of this page assumes Linux.
+**macOS works as a remote host.** The whole path was run end to end on 2026-09-19 — `remote add` over ssh, `connect`, a Claude agent working in a pane, a disconnect, and a reconnect with the session intact — on a Mac Studio running macOS 26.6.2 (`Darwin arm64`), with the deck at 0.41.0 on both ends. [#1158](https://github.com/vfarcic/dot-agent-deck/issues/1158) carries the run and its output, and `remote doctor` reports the same thing it does for a working Linux remote. (That was an Apple Silicon Mac. `remote add` installs a `darwin-amd64` build on an Intel one, which nobody has exercised.)
 
-None of the differences below is a known failure. They are where a Mac departs from that assumption, and therefore what to check first if something misbehaves.
+A Mac needs two setup steps a Linux host does not, and differs in two further ways worth knowing about.
 
-**Nothing restarts the deck for you.** The persistence setup under [Recommended](#recommended-for-persistent-and-safe-use) is built around `systemd --user`, which macOS does not have. Your agents still survive you disconnecting — that does not depend on systemd. What you lose is the automatic restart after a reboot or a crash; the deck ships no launchd equivalent, so on a Mac that is yours to arrange.
+**Log Claude Code in once, inside the pane.** Claude Code on macOS keeps its credentials in the login Keychain, and an ssh session cannot read them — ssh authenticates by key, so the login password is never presented to unlock the Keychain, and there is no graphical context in which to prompt for it. The first run therefore prints `Not logged in · Please run /login`. That message is the fix: run `/login` once inside the pane, and Claude Code writes `~/.claude/.credentials.json`, which later sessions authenticate from. This is specific to Claude Code — `codex` and `opencode` keep their credentials in files already (`~/.codex/auth.json`, `~/.local/share/opencode/auth.json`) and need no equivalent step. Setting `ANTHROPIC_API_KEY` in the daemon user's environment works too, but it bills as API usage rather than against a subscription, so treat it as the fallback rather than the first choice.
 
-**The daemon's socket defaults to `/tmp`.** On a typical Linux host the socket lands in a private per-user directory. macOS sets no equivalent by default, so it falls through to `/tmp/dot-agent-deck-{uid}.sock` — the location this page flags as unsafe on a shared host. On a Mac that is the default rather than a last resort, so set `$DOT_AGENT_DECK_SOCKET` to a path inside your home directory, as described under [Daemon socket security](#daemon-socket-security). (Setting `XDG_RUNTIME_DIR` yourself works too — the deck honours it on any host.)
+**Stop the host going to sleep.** A Mac that sleeps suspends its agents along with everything else. *Display* sleep is harmless — it is *system* sleep that suspends processes — so on a desktop Mac:
 
-**Agent credentials may sit in the login Keychain, where an ssh session may not reach them.** Claude Code 2.x on macOS keeps its credentials in the login Keychain rather than in `~/.claude/.credentials.json`, which may not exist at all. The login Keychain unlocks when someone logs in at the machine itself, so a Mac that rebooted unattended leaves it locked. This has not been tested over ssh; if agents fail to authenticate on a Mac remote while the same credentials work fine when you are sitting at it, check this first. Putting the provider's API key in the daemon user's environment, as [Credentials and host scope](#required-software) already recommends, avoids the question entirely.
+```bash
+sudo pmset -a sleep 0          # never system-sleep; this is the load-bearing one
+sudo pmset -a displaysleep 15  # monitors off, machine stays awake
+sudo pmset -a disksleep 0
+```
 
-**Sleep suspends everything.** A Mac that goes to sleep suspends its agents along with the rest of it, where a Linux VM generally never sleeps. If you want a Mac as an always-on remote, configure it not to sleep.
+This is the opposite direction from [Surviving sleep/wake](remote-environments.md#surviving-sleepwake), which is about **your own machine** sleeping — ssh keepalive and automatic reconnection already handle that one. A sleeping **host** has no deck-side mechanism at all, which is why it is a `pmset` matter.
 
-If you do run this path, please [report what happened](https://github.com/vfarcic/dot-agent-deck/issues) — validating it end to end is tracked in [#1158](https://github.com/vfarcic/dot-agent-deck/issues/1158).
+**The daemon socket lands in `/tmp`.** macOS sets no `XDG_RUNTIME_DIR`, so the socket falls through to `/tmp/dot-agent-deck-{uid}.sock` — `/tmp/dot-agent-deck-501.sock` on the validation host. The owner-only mode this page promises does hold there (`srw-------`), so the socket file itself is not readable by other users; what remains is the directory concern described under [Daemon socket security](#daemon-socket-security). Setting `$DOT_AGENT_DECK_SOCKET` to a path inside your home directory should work exactly as it does on Linux, but that override was not exercised on macOS.
+
+**Nothing is set up to restart the deck after a reboot.** The persistence setup under [Recommended](#recommended-for-persistent-and-safe-use) is built around `systemd --user`, which macOS does not have, and the deck installs no launchd equivalent. Agents do survive you disconnecting — that was part of the validated run and does not depend on systemd. What happens across a reboot was not tested, so treat this as a gap in what the deck arranges for you rather than as an observed failure. Shipping a LaunchAgent is tracked in [#1172](https://github.com/vfarcic/dot-agent-deck/issues/1172).
+
+Three things are still open, if you are in a position to check any of them: **reboot behaviour**, the **`$DOT_AGENT_DECK_SOCKET` override** on macOS, and **hook delivery asserted directly** rather than inferred from an agent reaching `Working`. [Report what you find](https://github.com/vfarcic/dot-agent-deck/issues).
 
 ### Hardware
 
@@ -151,7 +159,7 @@ A dedicated non-root Linux user account for the daemon. Running the daemon as ro
 sudo loginctl enable-linger $USER
 ```
 
-Neither of those exists on macOS, and the deck ships no launchd equivalent, so on a Mac the daemon survives your ssh session but not a reboot — see [macOS as a remote host](#macos-as-a-remote-host).
+Neither of those exists on macOS, and the deck ships no launchd equivalent. A Mac's daemon does survive your ssh session ending — that was validated — but the deck installs nothing that would bring it back after a reboot; see [macOS as a remote host](#macos-as-a-remote-host) and [#1172](https://github.com/vfarcic/dot-agent-deck/issues/1172).
 
 ### `~/.local/bin` on PATH
 

@@ -5,7 +5,7 @@ title: Remote Environments
 
 # Remote Environments
 
-A **remote environment** is a per-project host that runs the deck — the agents, and everything supervising them, live on the remote. Linux is the host validated end to end; `remote add` also installs onto macOS, with the caveats in [Remote Environment Requirements](remote-requirements.md#macos-as-a-remote-host). Your laptop is just a terminal: `dot-agent-deck connect` opens an ssh session and runs the deck on the host, so your usual ssh config and keys apply. When you disconnect, the agents on the remote keep running.
+A **remote environment** is a per-project host that runs the deck — the agents, and everything supervising them, live on the remote. Linux and Apple Silicon macOS are both validated end to end; a Mac needs two extra setup steps, listed in [Remote Environment Requirements](remote-requirements.md#macos-as-a-remote-host). Your laptop is just a terminal: `dot-agent-deck connect` opens an ssh session and runs the deck on the host, so your usual ssh config and keys apply. When you disconnect, the agents on the remote keep running.
 
 This page covers how that works in practice: the lifecycle model, the difference between "stop" and "detach", the failure modes you'll see when a connect goes wrong, and how hooks behave on the remote.
 
@@ -117,6 +117,8 @@ The **first** connect gets a retry budget too, of the same size and shape. A pro
 Only a **dropped connection** triggers a reconnect. A clean quit or detach (exit 0), a `Ctrl-C` (exit 130), or a remote-side crash all end the session immediately — `connect` never reconnects into an intentional exit or a crashing TUI, and `last_connected` is recorded only on a clean exit, not on intermediate reconnects.
 
 The connection-check timings and the retry budget are sensible fixed defaults today; exposing them as configuration is a future improvement.
+
+All of this is about **your own machine** sleeping. A remote *host* that goes to sleep suspends its agents, and there is no deck-side mechanism for that — it is a setting on the host. On a Mac, see [macOS as a remote host](remote-requirements.md#macos-as-a-remote-host).
 
 ## Version skew and the upgrade nudge
 
