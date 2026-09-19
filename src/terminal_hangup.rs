@@ -317,10 +317,7 @@ where
                 let started = std::time::Instant::now();
                 thread_probes.fetch_add(1, Ordering::SeqCst);
                 match probe(fd, PROBE_INTERVAL) {
-                    // Including "live with unread input", which the `POLLIN`
-                    // mask wakes on at once. Sleeping out the rest of the
-                    // interval is what keeps that from being a spin.
-                    Ok(TtyState::Live) => std::thread::sleep(iteration_pause(started.elapsed())),
+                    Ok(TtyState::Live) => {}
                     Ok(TtyState::HungUp) => {
                         // Re-read the flag: `run_tui` may have returned between
                         // the poll waking and now, in which case there is
@@ -343,6 +340,13 @@ where
                         return;
                     }
                 }
+                // Every arm that goes round again pauses out the rest of the
+                // interval — not only the `Live` one. With `POLLIN` requested a
+                // terminal holding unread input wakes the poll at once, and an
+                // `EINTR` returns at once by definition, so either would spin
+                // the loop at full tilt without this. The hangup arm never gets
+                // here: it calls back and returns.
+                std::thread::sleep(iteration_pause(started.elapsed()));
             }
         });
     if let Err(e) = spawned {
