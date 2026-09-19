@@ -6,7 +6,7 @@ use tokio::sync::{RwLock, broadcast};
 use tracing::warn;
 
 use crate::agent_pty::{AgentPtyRegistry, GuardedSendDetail};
-use crate::config_validation::sanitize_role_name;
+use crate::config_validation::{escape_id_for_log, sanitize_role_name};
 use crate::event::{
     AgentEvent, AgentType, BroadcastMsg, DISPLAY_NAME_METADATA_KEY, DelegateSignal, EventType,
     LiveTarget, OrchestrationSurface, OrchestrationSurfaceRole, RestartRoleSignal, SpawnRoleSignal,
@@ -6726,7 +6726,21 @@ impl AppState {
         let mut seen_roles: HashSet<&str> = HashSet::new();
         for target_role in to {
             if !seen_roles.insert(target_role.as_str()) {
-                warn!(role = %target_role, "delegate: duplicate target role in one signal; ignored");
+                // Issue #1082: `to` is producer-supplied — it is the `to` array
+                // of a `delegate` message off the hook socket — and these two
+                // warnings are precisely the branches where the name did NOT
+                // resolve to a configured role, so nothing has matched it
+                // against anything the deck minted. That makes them the two
+                // `role = %` sites in this file that are NOT the config-authored
+                // kind: every other one reads the name back out of
+                // `pane_role_map` or an orchestration role config. The issue's
+                // own note treats `signal.to` as already safe because the daemon
+                // logs the whole array with `?`-Debug; that holds for the array
+                // and not for an element interpolated with `%` here.
+                warn!(
+                    role = %escape_id_for_log(target_role),
+                    "delegate: duplicate target role in one signal; ignored"
+                );
                 continue;
             }
             let mut role_panes: Vec<String> = self
@@ -6740,7 +6754,10 @@ impl AppState {
                 .map(|(pane_id, _)| pane_id.clone())
                 .collect();
             if role_panes.is_empty() {
-                warn!(role = %target_role, "delegate: no worker pane found for role");
+                warn!(
+                    role = %escape_id_for_log(target_role),
+                    "delegate: no worker pane found for role"
+                );
                 continue;
             }
             // `pane_role_map` is a `HashMap`, so its iteration order varies
@@ -7002,7 +7019,17 @@ impl AppState {
     /// caller's own response type, or `None` when the caller is authorized.
     fn refuse_unless_orchestrator_caller(&self, pane_id: &str, verb: &str) -> Option<String> {
         if !self.pane_role_map.contains_key(pane_id) {
-            warn!(pane_id = %pane_id, verb, "action from unknown pane");
+            // Issue #1082: the `pane_role_map` lookup just MISSED, so this id
+            // is the producer's own string and has been matched against nothing
+            // the deck minted — the opposite of the `unit_pane_id` site in
+            // `return_dispatch_completion`, which logs bare precisely because
+            // `take_dispatch_return` matched it first. `verb` is a `&'static
+            // str` from `DaemonMessage::verb` and needs nothing.
+            warn!(
+                pane_id = %escape_id_for_log(pane_id),
+                verb,
+                "action from unknown pane"
+            );
             return Some(format!(
                 "the daemon holds no orchestration role for pane {pane_id}, so this action \
                  was routed nowhere. Only a pane spawned as part of an orchestration \
@@ -7665,7 +7692,16 @@ impl AppState {
                 if return_dispatch_completion(&signal, registry).await {
                     return;
                 }
-                warn!(pane_id = %signal.pane_id, "work-done from unknown pane");
+                // Issue #1082: unknown to `pane_role_map` AND unclaimed by any
+                // retained dispatch return, so nothing upstream has matched this
+                // id against a daemon-minted one. The `signal.pane_id` sites
+                // ABOVE this point stay bare for the opposite reason: each is
+                // reachable only when a keyed registry lookup on that same
+                // string hit, which is itself the match.
+                warn!(
+                    pane_id = %escape_id_for_log(&signal.pane_id),
+                    "work-done from unknown pane"
+                );
                 return;
             }
         };
@@ -10617,6 +10653,94 @@ mod tests {
             state.delegate_targets("A_orch", &repeated),
             vec![("coder".to_string(), "A_coder".to_string())],
             "a role named twice in one signal must yield exactly one target"
+        );
+    }
+
+    /// Issue #1082: the two `role = %` sites in `delegate_targets` are the only
+    /// ones in this file that log a PRODUCER-supplied name — `signal.to`'s
+    /// elements, reached precisely when the name resolved to no configured role
+    /// — rather than one read back out of `pane_role_map` or a role config. The
+    /// daemon's socket test (`hooks/ingest/005`) cannot reach them: a delegate
+    /// from an unattested pane is refused one check earlier, at
+    /// `refuse_unless_orchestrator_caller`. So they are pinned here, against the
+    /// real `tracing` output, for the same reason and with the same property.
+    #[test]
+    fn delegate_targets_cannot_be_made_to_forge_a_log_line() {
+        use std::sync::Mutex;
+
+        #[derive(Clone, Default)]
+        struct CapturedLog(Arc<Mutex<Vec<u8>>>);
+
+        impl std::io::Write for CapturedLog {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLog {
+            type Writer = CapturedLog;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        // Same families the daemon-side test uses: a raw LF forges a following
+        // line, a raw CR overwrites this one, ESC + CSI clears the screen of
+        // whatever renders it, U+0085 is a C1 control some terminals still act
+        // on, and U+202E reorders the line without changing a byte.
+        let hostile = "coder\nWARN forged-line\rovershoot\u{1b}[2Jcleared\u{202e}reversed\u{85}c1";
+
+        let captured = CapturedLog::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(captured.clone())
+            .with_max_level(tracing_subscriber::filter::LevelFilter::DEBUG)
+            .with_ansi(false)
+            .finish();
+        let subscriber_guard = tracing::subscriber::set_default(subscriber);
+
+        let state = two_same_name_cwd_tabs(true);
+        // Named twice, so ONE call reaches both warnings: the first pass finds
+        // no worker pane for the role, the second is refused as a duplicate.
+        let targets = state.delegate_targets("A_orch", &[hostile.to_string(), hostile.to_string()]);
+        assert!(
+            targets.is_empty(),
+            "a role no pane holds must route nowhere, got {targets:?}"
+        );
+
+        drop(subscriber_guard);
+        let raw = String::from_utf8(captured.0.lock().unwrap().clone())
+            .expect("captured log must be valid UTF-8");
+        for site in [
+            "delegate: no worker pane found for role",
+            "delegate: duplicate target role in one signal",
+        ] {
+            assert!(
+                raw.contains(site),
+                "the hostile role name never reached {site:?}, so this test does not \
+                 cover that site: {raw:?}"
+            );
+        }
+        let forged: Vec<&str> = raw
+            .split('\n')
+            .filter(|line| {
+                !line.is_empty()
+                    && (line.chars().any(|c| c.is_control())
+                        || line.chars().any(crate::untrusted_text::is_bidi_format_char))
+            })
+            .collect();
+        assert!(
+            forged.is_empty(),
+            "no character a terminal or a line-oriented reader ACTS on may survive into \
+             a log line, but {} did: {forged:#?}",
+            forged.len()
+        );
+        assert!(
+            raw.contains("forged-line") && raw.contains("cleared") && raw.contains("reversed"),
+            "escaping must preserve the evidence rather than drop it: {raw:?}"
         );
     }
 
