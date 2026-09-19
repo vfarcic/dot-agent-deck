@@ -65,8 +65,10 @@ report      = "Opening the agent overview."
 
 [[commands]]
 id          = "open_deck"
-description = """Leave the agent overview and go back to the deck, the screen with the terminals
-on it. Use when the user asks to go back, return to the deck, or see the terminals again."""
+description = """Go back to the deck — the screen with the terminals on it — leaving the agent
+overview. On the agent overview a bare "go back" or "back" means THIS one, because the deck is
+the screen the overview was opened from. Also use for return to the deck, take me back, or show
+the terminals or panes again."""
 invoke      = "openDeck"
 screens     = ["overview"]
 unavailable_hint = "returning to the deck works from the agent overview"
@@ -78,9 +80,10 @@ report      = "Back to the deck."
 # the description says so because the two are one word apart in speech.
 [[commands]]
 id          = "close_agent_view"
-description = """Close the agent view that is open and return to the screen it was opened from.
-Use when the user asks to go back, close this, leave this agent, or stop looking at one agent.
-This only closes the view — it does NOT stop the agent and does NOT close its terminal pane."""
+description = """Close the agent view that is open over the screen and return to the screen it
+was opened from. While one agent's view is open a bare "go back" or "back" means THIS one. Also
+use for close this, close it, leave this agent, or stop looking at one agent. This only closes
+the view — it does NOT stop the agent and does NOT close its terminal pane."""
 invoke      = "closeAgentView"
 screens     = ["agent"]
 unavailable_hint = "closing an agent view needs one open"
