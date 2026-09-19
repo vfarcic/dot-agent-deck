@@ -64,7 +64,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { Mic, MicOff, Undo2 } from "lucide-react";
 import { DISPLAY_LIMITS, displayText } from "../lib/displayText";
 import { VOICE_PEER_PROPS } from "../hooks/useInertBackground";
-import type { VoiceOutcomeDto, VoiceResultDto, VoiceScreen } from "../lib/bridge";
+import type { VoiceOutcomeDto, VoiceResultDto, VoiceScreen, VoiceStatusDto } from "../lib/bridge";
 import type { DeckRuntimeState } from "../types";
 
 /**
@@ -178,6 +178,62 @@ type Voice = Pick<DeckRuntimeState, "declareVoiceScreen" | "resolveVoice" | "voi
  */
 type VoicePhase = "idle" | "opening" | "listening" | "transcribing" | "resolving";
 
+/**
+ * Whether Rust is still holding something for this session.
+ *
+ * `CaptureState::accepts_start` takes idle, done and failed and refuses these
+ * two, and that refusal is what makes a stale session unrecoverable from the
+ * surface rather than merely untidy: the button looks off, and the press that
+ * ought to turn voice on is refused *because* a recording is already running.
+ * `recording` holds the device — or, past the cap, the audio the cap kept when
+ * it released the device — and `transcribing` holds a buffer.
+ */
+function stillHeld(state: VoiceStatusDto["state"]): boolean {
+  return state === "recording" || state === "transcribing";
+}
+
+/**
+ * What the button is allowed to CLAIM, which is not always what `on` says.
+ *
+ * The button is the only indication the microphone is open, so every state in
+ * which that is unknown or not yet settled needs its own word rather than being
+ * rounded to the nearest of two. `checking` is a panel that has not heard back
+ * from Rust yet — a fresh mount, including the replacement one a webview reload
+ * produces — and it renders as something other than *Voice off*, because
+ * *Voice off* over a live device is the one thing this control must never say.
+ */
+type VoiceIndicator = "off" | "on" | "checking";
+
+function indicatorFor(known: boolean, on: boolean): VoiceIndicator {
+  if (on) return "on";
+  return known ? "off" : "checking";
+}
+
+const INDICATOR_LABEL: Record<VoiceIndicator, string> = {
+  off: "Voice off",
+  on: "Voice on",
+  checking: "Voice…",
+};
+
+/**
+ * The state twice over, because the two audiences read different things: the
+ * word is what a sighted user sees on the control, and this is what a screen
+ * reader announces. `mixed` is ARIA's own value for a toggle whose state is not
+ * yet settled, which is exactly what a panel waiting on its first status read
+ * is — `false` there would be the same claim the word avoids.
+ */
+const INDICATOR_PRESSED: Record<VoiceIndicator, "true" | "false" | "mixed"> = {
+  off: "false",
+  on: "true",
+  checking: "mixed",
+};
+
+const INDICATOR_TITLE: Record<VoiceIndicator, string> = {
+  off: "Voice control is off — press to start listening",
+  on: "Voice control is on — press to stop listening",
+  checking: "Checking whether the microphone is open",
+};
+
 interface VoiceControlPanelProps {
   runtime: Voice;
   /** The mounted screen, which is what a command's availability is judged against. */
@@ -221,8 +277,8 @@ export function voiceCost(backend: string, ms: number | null): string {
 }
 
 /** What the report says the surface is doing, while it is doing it. */
-function progressNote(on: boolean, phase: VoicePhase): string | undefined {
-  if (!on) return undefined;
+function progressNote(indicator: VoiceIndicator, phase: VoicePhase): string | undefined {
+  if (indicator !== "on") return undefined;
   if (phase === "transcribing") return "Turning that into text…";
   if (phase === "resolving") return "Working out what that means…";
   if (phase === "opening") return "Opening the microphone…";
@@ -241,6 +297,20 @@ export function VoiceControlPanel({ runtime, screen, onDispatch }: VoiceControlP
 
   const [on, setOnState] = useState(false);
   const [phase, setPhaseState] = useState<VoicePhase>("idle");
+  /**
+   * Whether this panel has heard from the microphone yet.
+   *
+   * `on` starts false on every mount, and a mount is not always the first one:
+   * a hard webview reload, a crashed web-content process or a destroyed and
+   * recreated webview all produce a panel with no memory in front of a Rust
+   * session that may still be recording. Until the reconcile below answers,
+   * this panel knows nothing about the device, and the button says so rather
+   * than rendering the default as if it were an observation.
+   *
+   * A runtime with no `voiceStatus` has nothing to ask, so there is nothing to
+   * wait for and the initial value is already the answer.
+   */
+  const [known, setKnown] = useState(() => voiceStatus === undefined);
   /** A refusal, an instruction, or one of this file's own sentences. */
   const [problem, setProblem] = useState<string>();
   /** The transcription stage's own sentence — what was heard, or why nothing was. */
@@ -318,10 +388,70 @@ export function VoiceControlPanel({ runtime, screen, onDispatch }: VoiceControlP
   */
   const cancelRef = useRef(voiceCancel);
   useEffect(() => { cancelRef.current = voiceCancel; }, [voiceCancel]);
+  const statusRef = useRef(voiceStatus);
+  useEffect(() => { statusRef.current = voiceStatus; }, [voiceStatus]);
   useEffect(() => () => {
     abandon();
     if (onRef.current) void cancelRef.current?.().catch(() => undefined);
   }, [abandon]);
+
+  /*
+    PRD #802's audit blocker — the mount reconcile, and the reason this panel
+    is not the microphone's owner.
+
+    Recording lifetime is Rust's. The unmount cleanup above is a React PASSIVE
+    effect making an asynchronous IPC call, and a webview that is being replaced
+    is not guaranteed to run it, let alone to let it finish: a hard reload, a
+    web-content process crash, a destroyed webview. The replacement panel then
+    initialises `on` to false, and without this it would render `Voice off` over
+    a device Rust is still holding — with no way out, because the press that
+    looks like it turns voice on calls `voiceStart`, which `accepts_start`
+    refuses while a recording is running. At the cap it is worse: the device is
+    released but up to 960 KB of captured speech stays in the session, and
+    nothing on the new panel can reach it.
+
+    So the panel asks once, on mount, and cancels anything Rust is still holding
+    before it claims the device is closed. The Rust-side release in
+    `desktop/src-tauri/src/lib.rs` is what actually guarantees the device is
+    freed on teardown; this is what stops a *surviving* session being invisible
+    to the panel in front of it.
+
+    Everything is reached through refs so the dependency list stays empty — a
+    runtime that rebuilt these function identities must not re-run a reconcile
+    and cancel a live recording nobody asked to stop. The ordinary claim orders
+    it against the user: a press during the round trip supersedes this, and
+    `turnOn` reconciles the same way itself, so the press is never left waiting
+    on it.
+  */
+  useEffect(() => {
+    const ask = statusRef.current;
+    if (!ask) return;
+    const ours = claim();
+    void (async () => {
+      try {
+        const status = await ask();
+        if (ours() && stillHeld(status.state)) await cancelRef.current?.();
+      } catch {
+        // A status read or a release that failed says nothing about the device,
+        // and there is no press to report it against. `turnOn` reconciles again
+        // at the next one.
+      }
+      if (ours()) setKnown(true);
+    })();
+  }, [claim]);
+
+  /*
+    Defence in depth, and explicitly NOT the mechanism. `pagehide` is the one
+    webview-loss path the document itself can see, so it is worth getting there
+    first — but it is an asynchronous IPC call on a document that is going away,
+    which is the same thing that makes the unmount cleanup above insufficient.
+    What guarantees the release is Rust's own teardown.
+  */
+  useEffect(() => {
+    const release = () => { if (onRef.current) void cancelRef.current?.().catch(() => undefined); };
+    window.addEventListener("pagehide", release);
+    return () => window.removeEventListener("pagehide", release);
+  }, []);
 
   useEffect(() => {
     if (!undo) return;
@@ -498,6 +628,9 @@ export function VoiceControlPanel({ runtime, screen, onDispatch }: VoiceControlP
   const turnOn = useCallback(async () => {
     const ours = claim();
     forget();
+    /* This press supersedes the mount reconcile, so nothing is still being
+       waited for: from here the button reports this press's own progress. */
+    setKnown(true);
     setPhase("opening");
     /*
       A runtime carrying `resolveVoice` and no capture verbs is representable —
@@ -515,17 +648,36 @@ export function VoiceControlPanel({ runtime, screen, onDispatch }: VoiceControlP
       return;
     }
     if (voiceStatus) {
-      let available = true;
+      /* `undefined` is the read that FAILED, and it falls through to the start
+         for the reason above — not the same thing as a read that answered. */
+      let status: VoiceStatusDto | undefined;
       try {
-        available = (await voiceStatus()).available;
+        status = await voiceStatus();
       } catch {
-        available = true;
+        status = undefined;
       }
       if (!ours()) return;
-      if (!available) {
+      if (status && !status.available) {
         setPhase("idle");
         setProblem(VOICE_UNAVAILABLE);
         return;
+      }
+      /*
+        The mount reconcile again, on the path that can race it: a session Rust
+        is still holding refuses a start, so without this the press would report
+        "a recording is already running" and leave the button off over a live
+        device. Doing it here as well as at mount means a press that arrives
+        DURING the reconcile — and supersedes it — still gets a microphone.
+      */
+      if (status && stillHeld(status.state)) {
+        try {
+          await cancelRef.current?.();
+        } catch {
+          // Whatever is left, the start below runs into it and reports it with
+          // Rust's own sentence, which is a better answer than one invented
+          // here from a release that failed.
+        }
+        if (!ours()) return;
       }
     }
     setOn(true);
@@ -554,7 +706,8 @@ export function VoiceControlPanel({ runtime, screen, onDispatch }: VoiceControlP
 
   if (!resolveVoice) return null;
 
-  const note = progressNote(on, phase);
+  const indicator = indicatorFor(known, on);
+  const note = progressNote(indicator, phase);
   const reporting = note !== undefined || problem !== undefined || capture !== undefined || result !== undefined;
 
   return (
@@ -566,9 +719,12 @@ export function VoiceControlPanel({ runtime, screen, onDispatch }: VoiceControlP
         /* The state twice over, because the two audiences read different
            things: the word is what a sighted user sees on the control, and
            `aria-pressed` is what a screen reader announces. A toggle that
-           showed one without the other would be on for one of them only. */
-        aria-pressed={on}
-        title={on ? "Voice control is on — press to stop listening" : "Voice control is off — press to start listening"}
+           showed one without the other would be on for one of them only. Four
+           values rather than two — see {@link VoiceIndicator}. */
+        aria-pressed={INDICATOR_PRESSED[indicator]}
+        /* Nothing is settled yet, announced rather than left to the word alone. */
+        aria-busy={indicator === "checking"}
+        title={INDICATOR_TITLE[indicator]}
         /* A peer of the agent pane rather than background, so `useInertBackground`
            leaves it alone while a pane is open — see that hook. Without it the
            `agent` screen's only command, `close_agent_view`, is dispatched by a
@@ -576,8 +732,11 @@ export function VoiceControlPanel({ runtime, screen, onDispatch }: VoiceControlP
         {...VOICE_PEER_PROPS}
         onClick={() => { if (onRef.current) turnOff(); else void turnOn(); }}
       >
-        {on ? <Mic size={16} /> : <MicOff size={16} />}
-        <span>{on ? "Voice on" : "Voice off"}</span>
+        {/* The crossed-out microphone only where the device is known to be
+            closed. Everywhere else — on, or not yet asked — it is the plain
+            one, because an icon is a claim too. */}
+        {indicator === "off" ? <MicOff size={16} /> : <Mic size={16} />}
+        <span>{INDICATOR_LABEL[indicator]}</span>
       </button>
       {/*
         The report lives beside the button rather than in a dialog, which is

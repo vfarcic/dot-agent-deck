@@ -303,6 +303,11 @@ describe("voice control panel", () => {
     const voice = voiceControls({ voiceStatus: vi.fn(async () => voiceStatus({ available: true, backend: "remote" })) });
     render(<DeckShell runtime={runtime(resolver(result(DISPATCH)), voice)} />);
 
+    // The first paint has not heard back from the microphone yet, so it claims
+    // nothing about it. `Voice off` is an observation from here on, not the
+    // default that a replacement panel used to render over a live device.
+    expect(voiceButton()).toHaveAttribute("aria-pressed", "mixed");
+    await flush();
     expect(voiceButton()).toHaveAttribute("aria-pressed", "false");
     expect(voiceButton()).toHaveTextContent(/voice\s+off/i);
     await turnVoiceOn(voice);
@@ -645,4 +650,107 @@ describe("voice control panel", () => {
     expect(screen.queryByTestId("settings-panel")).not.toBeInTheDocument();
     expect(screen.getByText(SCREEN_MOVED_ON)).toBeVisible();
   });
+
+  /**
+   * A microphone that outlives the panel in front of it.
+   *
+   * Every other fake in this file answers from inside the call it is in; this
+   * one keeps the state Rust's `CaptureSession` keeps, so a panel can vanish
+   * while the device is still open. That is what a hard webview reload, a
+   * crashed web-content process or a destroyed window does to a passive-effect
+   * cleanup: the cleanup may not run at all, and if it does its asynchronous
+   * IPC may never reach Rust.
+   *
+   * `voiceStart` refuses the way the live command refuses, because that refusal
+   * is the whole of why a stale session matters — `CaptureState::accepts_start`
+   * takes idle, done and failed and nothing else, so a panel that renders
+   * `Voice off` over a live recording cannot get out of it by pressing the
+   * button.
+   */
+  function survivingMicrophone() {
+    let state: VoiceStatusDto["state"] = "idle";
+    let swallowNextRelease = false;
+    const live = { available: true, backend: "remote" as const };
+    const controls = voiceControls({
+      voiceStatus: vi.fn(async () => voiceStatus({ ...live, state })),
+      voiceStart: vi.fn(async () => {
+        if (state === "recording" || state === "transcribing") {
+          throw "cannot start the microphone: a recording is already running";
+        }
+        state = "recording";
+        return voiceStatus({ ...live, state });
+      }),
+      voiceStop: vi.fn(async () => {
+        state = "done";
+        return transcription(heard("show me every agent"));
+      }),
+      voiceCancel: vi.fn(() => {
+        if (swallowNextRelease) {
+          swallowNextRelease = false;
+          // The webview went away mid-call: Rust never hears it, and the
+          // promise never settles.
+          return new Promise<VoiceStatusDto>(() => {});
+        }
+        state = "idle";
+        return Promise.resolve(voiceStatus({ ...live, state }));
+      }),
+    });
+    return {
+      controls,
+      state: () => state,
+      /** The next release never reaches Rust, the way a lost webview's does not. */
+      loseTheNextRelease: () => { swallowNextRelease = true; },
+    };
+  }
+
+  /**
+   * Scenario: voice is on, the webview is lost so the panel's own release never
+   * completes, and a replacement panel mounts against the microphone Rust is
+   * still holding. The new panel reconciles rather than rendering `Voice off`
+   * over a live device, and the next press opens a microphone instead of being
+   * refused.
+   */
+  it("reconciles a replacement panel against the microphone the lost one left open", async () => {
+    const mic = survivingMicrophone();
+    const first = render(<DeckShell runtime={runtime(resolver(result(DISPATCH)), mic.controls)} />);
+
+    await turnVoiceOn(mic.controls);
+    expect(mic.state()).toBe("recording");
+
+    mic.loseTheNextRelease();
+    first.unmount();
+    await flush();
+    expect(mic.state()).toBe("recording");
+
+    render(<DeckShell runtime={runtime(resolver(result(DISPATCH)), mic.controls)} />);
+    await flush();
+
+    expect(mic.state()).toBe("idle");
+    expect(voiceButton()).toHaveTextContent(/voice\s+off/i);
+    expect(voiceButton()).toHaveAttribute("aria-pressed", "false");
+
+    await act(async () => { fireEvent.click(voiceButton()); await Promise.resolve(); await Promise.resolve(); });
+
+    expect(mic.state()).toBe("recording");
+    expect(voiceButton()).toHaveTextContent(/voice\s+on/i);
+  });
+
+  /**
+   * Scenario: the panel is freshly mounted and the microphone has not answered
+   * yet. The button says it is finding out rather than claiming the device is
+   * closed, and settles to off once the answer arrives.
+   */
+  it("does not claim Voice off before the microphone has answered", async () => {
+    const mic = survivingMicrophone();
+    render(<DeckShell runtime={runtime(resolver(result(DISPATCH)), mic.controls)} />);
+
+    expect(voiceButton()).not.toHaveTextContent(/voice\s+off/i);
+    expect(voiceButton()).toHaveAttribute("aria-pressed", "mixed");
+
+    await flush();
+
+    expect(voiceButton()).toHaveTextContent(/voice\s+off/i);
+    expect(voiceButton()).toHaveAttribute("aria-pressed", "false");
+  });
+
 });

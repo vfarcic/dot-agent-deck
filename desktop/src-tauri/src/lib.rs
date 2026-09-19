@@ -2534,6 +2534,58 @@ fn window_focus(event: &tauri::WindowEvent) -> Option<bool> {
     }
 }
 
+/// PRD #802's audit blocker: release the microphone.
+///
+/// # Why this is Rust's job and not the panel's
+///
+/// The recording's lifetime is owned here — [`voice::CaptureSession`] holds the
+/// device stream and the captured audio, and the webview holds neither. What
+/// used to end a recording on teardown was a React passive-effect cleanup in
+/// `desktop/src/components/VoiceControlPanel.tsx` making an asynchronous IPC
+/// call, and a webview that is going away is not guaranteed to run it, let
+/// alone to let it finish: a hard reload, a crashed web-content process, a
+/// destroyed window. The device then stayed open with nothing left that could
+/// close it, and the replacement panel — which initialises its toggle to *off*
+/// — said `Voice off` over it.
+///
+/// It compounds past the length cap. [`voice::CaptureSession::cap_reached`]
+/// releases the device on purpose but KEEPS the audio and leaves the session
+/// `Recording`, so the utterance stays the user's to send or discard; a webview
+/// lost at that moment left up to 960 KB of captured speech in the session with
+/// nothing able to reach it, and every later start refused because
+/// `accepts_start` takes neither `Recording` nor `Transcribing`.
+///
+/// # What it costs where it is called
+///
+/// `cancel` is idempotent and never refused, so every call site can be
+/// unconditional. It drops the stream, and a real `CpalStream::drop` joins the
+/// device thread — so this is as slow as the platform's own teardown, on
+/// whichever thread calls it. That is accepted deliberately at all three call
+/// sites: they are the window going away, the document being replaced and the
+/// app exiting, and a release that is *scheduled* rather than done is a release
+/// that may not happen before the process does.
+fn release_microphone(voice: &VoiceState) -> voice::CaptureStatus {
+    voice.session.cancel()
+}
+
+/// Whether a window event means the webview holding the Voice button is gone.
+///
+/// `CloseRequested` as well as `Destroyed`, because the two are not one
+/// sequence: a close the app vetoes never reaches `Destroyed`, and a close it
+/// does not veto reaches it after the window is already unusable. Releasing on
+/// both is harmless — [`release_microphone`] is idempotent — and releasing on
+/// only the second would mean the microphone outlived the window whenever the
+/// platform delivered no `Destroyed` at all.
+///
+/// Every other window event — focus, move, resize, theme — says nothing about
+/// whether the webview is still there, and must not release a live recording.
+fn window_ends_capture(event: &tauri::WindowEvent) -> bool {
+    matches!(
+        event,
+        tauri::WindowEvent::CloseRequested { .. } | tauri::WindowEvent::Destroyed
+    )
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let app = tauri::Builder::default()
@@ -2598,7 +2650,63 @@ pub fn run() {
             if let Some(focused) = window_focus(event) {
                 let _ = terminal::window_focus_changed(&window.state::<DesktopState>(), focused);
             }
+            // PRD #802's audit blocker, teardown trigger 1: the window holding
+            // the Voice button is going away, so the microphone goes with it.
+            // See `release_microphone` for why the webview's own cleanup is not
+            // enough, and `window_ends_capture` for which events count.
+            //
+            // `try_state` rather than `state`: the latter panics when nothing is
+            // managed, and this runs on the event loop where a panic takes the
+            // app with it. The voice state IS managed — first line of this
+            // builder — so the `None` arm is unreachable rather than a case.
+            if window.label() == "main"
+                && window_ends_capture(event)
+                && let Some(voice) = window.try_state::<VoiceState>()
+            {
+                release_microphone(&voice);
+            }
         })
+        // PRD #802's audit blocker, teardown trigger 2: the DOCUMENT is being
+        // replaced without the window going anywhere — a hard reload, or a
+        // webview the platform lost and recreated. The panel that was holding
+        // the microphone is gone by the time this fires, and the one about to
+        // mount initialises its toggle to off, so this is the release its own
+        // cleanup could not be relied on to make.
+        //
+        // `Started` rather than `Finished`: the old document is already gone and
+        // the new one has not run any of our JavaScript, which is exactly the
+        // window in which nothing else would close the device. The app's first
+        // load reaches here too and is a no-op, since the session is idle.
+        .on_page_load(|webview, payload| {
+            if webview.label() == "main"
+                && payload.event() == tauri::webview::PageLoadEvent::Started
+                && let Some(voice) = webview.try_state::<VoiceState>()
+            {
+                release_microphone(&voice);
+            }
+        });
+    // PRD #802's audit blocker, teardown trigger 3: the web content PROCESS
+    // died. The chain is broken here rather than continued because this hook
+    // exists only on Apple's platforms — `Builder::on_web_content_process_
+    // terminate` is `#[cfg(any(target_os = "macos", target_os = "ios"))]` in
+    // tauri itself, and a `#[cfg]` cannot be attached to one call in a method
+    // chain.
+    //
+    // **So the crash case is covered on macOS and NOT on Linux**, which is
+    // worth stating rather than leaving to be discovered: Tauri exposes no
+    // equivalent for WebKitGTK, so a Linux web-process crash is released by
+    // whichever of the other two triggers arrives first — the reload that
+    // follows it, or app exit. Nothing here can do better without a hook that
+    // does not exist.
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    let app = app.on_web_content_process_terminate(|webview| {
+        if webview.label() == "main"
+            && let Some(voice) = webview.try_state::<VoiceState>()
+        {
+            release_microphone(&voice);
+        }
+    });
+    let app = app
         .invoke_handler(tauri::generate_handler![
             desktop_get_snapshot,
             desktop_list_projects,
@@ -2630,16 +2738,34 @@ pub fn run() {
             tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit
         ) {
             let state = app_handle.state::<DesktopState>();
-            tauri::async_runtime::block_on(async {
-                terminal::detach_all(&state).await;
-                // PRD #741 M7, teardown trigger 4: every `ssh -N -L` child this
-                // process owns dies with the app. `Drop` on the last lease is
-                // what actually signals the process group; this is what drops
-                // the map's handle so there is a last lease to drop.
-                state.tunnels.close_all().await;
-            });
+            let voice_state = app_handle.state::<VoiceState>();
+            tauri::async_runtime::block_on(release_on_exit(&state, &voice_state));
         }
     });
+}
+
+/// Everything the app lets go of on its way out.
+///
+/// Extracted from the `RunEvent` closure so it can be driven from a test: the
+/// closure itself needs a built `tauri::App` and a real event loop, and what is
+/// worth pinning is the release rather than the plumbing that calls it.
+///
+/// **The microphone goes FIRST**, and the order is the point rather than
+/// housekeeping (PRD #802's audit blocker, teardown trigger 4). This runs on
+/// `ExitRequested` as well as `Exit`, and the two steps after it are the slow
+/// ones — a detach writes a frame over a transport that may be an `ssh` child
+/// on its way out, bounded at 250 ms *per session*, and the tunnels close after
+/// that. Releasing the device behind them would leave a microphone open for the
+/// whole of a teardown that has nothing to do with it, and an exit the platform
+/// does not wait out would leave it open for good.
+async fn release_on_exit(state: &DesktopState, voice: &VoiceState) {
+    release_microphone(voice);
+    terminal::detach_all(state).await;
+    // PRD #741 M7, teardown trigger 4: every `ssh -N -L` child this process
+    // owns dies with the app. `Drop` on the last lease is what actually signals
+    // the process group; this is what drops the map's handle so there is a last
+    // lease to drop.
+    state.tunnels.close_all().await;
 }
 
 #[cfg(test)]
@@ -2659,6 +2785,109 @@ mod tests {
             Some(false)
         );
         assert_eq!(window_focus(&tauri::WindowEvent::Destroyed), None);
+    }
+
+    /// PRD #802's audit blocker: a destroyed window ends capture, and an
+    /// ordinary window event does not.
+    ///
+    /// The half of the classification a test can reach.
+    /// `tauri::WindowEvent::CloseRequested` carries a `CloseRequestApi` that
+    /// nothing outside tauri can construct, so it is covered by the `matches!`
+    /// arm and by review rather than by an assertion here; what this pins is
+    /// the direction that would be a bug in either direction — `Destroyed`
+    /// must release, and a focus change must not, because focus changes arrive
+    /// constantly while a user is dictating.
+    #[test]
+    fn a_destroyed_window_ends_capture_and_a_focus_change_does_not() {
+        assert!(window_ends_capture(&tauri::WindowEvent::Destroyed));
+        assert!(!window_ends_capture(&tauri::WindowEvent::Focused(true)));
+        assert!(!window_ends_capture(&tauri::WindowEvent::Focused(false)));
+    }
+
+    /// A [`VoiceState`] whose device is a stub delivering `seconds` of tone.
+    ///
+    /// The second value is the stub stream's own flag, set by its `Drop` — the
+    /// only way to assert the DEVICE was released rather than merely that the
+    /// state machine says idle.
+    fn stub_voice_state(seconds: f64) -> (VoiceState, Arc<std::sync::atomic::AtomicBool>) {
+        let source = voice::StubSource::tone(
+            voice::AudioFormat::new(voice::TARGET_SAMPLE_RATE, 1),
+            seconds,
+        );
+        let stopped = source.stopped();
+        (
+            VoiceState {
+                session: Arc::new(voice::CaptureSession::new(Arc::new(source))),
+            },
+            stopped,
+        )
+    }
+
+    /// PRD #802 audit blocker: the app exiting releases the microphone.
+    ///
+    /// Recording lifetime is Rust's, and before this the only thing that ended
+    /// a recording on teardown was a React passive-effect cleanup in the
+    /// webview — which a hard reload, a crashed web-content process or a
+    /// destroyed window is not guaranteed to run, let alone to complete its
+    /// asynchronous IPC. This asserts the device is closed and the captured
+    /// audio dropped on the app's own way out, with no webview involved at all.
+    #[tokio::test]
+    async fn app_exit_releases_the_microphone() {
+        let (voice_state, stopped) = stub_voice_state(1.0);
+        let (opened, _ticket) = voice_state.session.start().expect("the stub device opens");
+        assert_eq!(opened.state, voice::CaptureState::Recording);
+        assert!(
+            voice_state.session.status().captured_ms > 0,
+            "the stub delivered its tone, so there is audio to drop"
+        );
+        assert!(!stopped.load(Ordering::Relaxed), "the device is still open");
+
+        release_on_exit(&DesktopState::default(), &voice_state).await;
+
+        let after = voice_state.session.status();
+        assert_eq!(
+            after.state,
+            voice::CaptureState::Idle,
+            "app exit must leave no recording behind"
+        );
+        assert_eq!(
+            after.captured_ms, 0,
+            "app exit must drop the captured audio"
+        );
+        assert!(
+            stopped.load(Ordering::Relaxed),
+            "app exit must close the device stream"
+        );
+    }
+
+    /// The compounding half of the same blocker: a capped recording.
+    ///
+    /// [`voice::CaptureSession::cap_reached`] releases the device but
+    /// deliberately KEEPS the audio and leaves the session `Recording`, so the
+    /// utterance stays the user's to send or discard. Without a Rust-side
+    /// teardown, a webview that vanished at that moment left up to 960 KB of
+    /// captured speech in the session with nothing able to reach it.
+    #[tokio::test]
+    async fn app_exit_drops_the_audio_a_capped_recording_kept() {
+        let (voice_state, _stopped) = stub_voice_state(2.0);
+        let (_, ticket) = voice_state.session.start().expect("the stub device opens");
+        let capped = voice_state.session.cap_reached(ticket);
+        assert!(capped.capped, "the cap released the device");
+        assert_eq!(
+            capped.state,
+            voice::CaptureState::Recording,
+            "the cap keeps the session recording on purpose"
+        );
+        assert!(capped.captured_ms > 0, "and keeps the audio with it");
+
+        release_on_exit(&DesktopState::default(), &voice_state).await;
+
+        let after = voice_state.session.status();
+        assert_eq!(after.state, voice::CaptureState::Idle);
+        assert_eq!(
+            after.captured_ms, 0,
+            "app exit must drop the audio the cap kept"
+        );
     }
 
     /// A settings save that changed no deck must NOT take the switch path
