@@ -86,8 +86,12 @@ screens     = ["agent"]
 unavailable_hint = "closing an agent view needs one open"
 report      = "Closing the agent view."
 
-# PRD #802 M8 — the one-file proof: the first command added after the plumbing
-# existed. `screens = ["deck"]` rather than `["deck", "overview"]`, and the
+# PRD #802 M8 — the cost-of-a-row proof: the first command added after the
+# plumbing existed. It cost SEVEN files, five of them test-only and none of them
+# implementation — the nine tests that pin the shipped row set by value are what
+# the other five are. PRD #802's M8 milestone has the file-by-file accounting.
+#
+# `screens = ["deck"]` rather than `["deck", "overview"]`, and the
 # narrowing is the rule rather than caution: the Settings overlay is reachable
 # only from the DECK rail — the overview's rail holds Deck and Overview and
 # nothing else — so listing `overview` would let voice open a surface no click

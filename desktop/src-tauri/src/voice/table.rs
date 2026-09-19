@@ -111,8 +111,14 @@ pub struct CommandRow {
     pub description: String,
     /// The frontend action registry entry to dispatch (M2). Stringly typed on
     /// purpose, with M3's guard keeping it honest — a typed enum would make
-    /// adding a command a three-file change and the one-file promise is the
-    /// whole design.
+    /// adding a command cost a variant and a match arm, which is *implementation*,
+    /// and "a new command changes no implementation" is the whole design.
+    ///
+    /// **What a new command DOES cost was measured by M8 and is not zero:** seven
+    /// files, five of them test-only, because nine tests in this crate pin the
+    /// shipped row set **by value**. That is this file's own choice — the shape
+    /// of the shipped table is pinned rather than described — so the cost is one
+    /// edit per place the row set is written down, and not plumbing left undone.
     pub invoke: String,
     /// Where the command can run. **Empty means everywhere**, which is what an
     /// absent `screens` key parses to.

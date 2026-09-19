@@ -391,8 +391,10 @@ export function DeckShell({ runtime, workflowPlatformIssue, initialView = { kind
    * pipeline's step 5 — *hand the resolved action to the existing handler* — is
    * literally true. Voice gets no execution path of its own, and there is no
    * `switch` over action ids here: a switch would be a second list of the ids and
-   * would break the one-file promise, which is that voice-enabling a capability
-   * is a row in `commands.toml` and nothing else.
+   * would be *implementation* a new command has to edit — which is what PRD
+   * #802's criterion forbids. Adding a command costs a row in `commands.toml` and
+   * the classification flip in `voiceActions.ts`; the rest of what M8 measured is
+   * test assertions pinning the shipped row set by value.
    *
    * # The context is the deck's members plus the shell's two, and a dispatch the
    * host cannot serve is REFUSED rather than attempted

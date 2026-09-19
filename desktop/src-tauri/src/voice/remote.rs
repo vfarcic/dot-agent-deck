@@ -242,8 +242,12 @@ impl IntentResolver for RemoteResolver {
 /// expressible here. The table is what makes the constrained shape reachable at
 /// all: it declares every param name statically, so
 /// [`super::prompt::param_names`] can enumerate them, and a row that adds a
-/// param adds a property without anyone editing this file. That is the one-file
-/// promise holding on a path that could easily have broken it.
+/// param adds a property without anyone editing **the code in** this file. That
+/// is the no-implementation promise holding on a path that could easily have
+/// broken it — and the emphasis is M8's, which measured the difference: adding
+/// `open_settings` DID edit this file, in one `mod tests` assertion pinning the
+/// request body by value. The generator did not move; the pinning test did,
+/// which is what a pinning test is for.
 ///
 /// Every property is optional — only `action` is `required` — because a
 /// paramless command supplies none, and the model must be able to answer

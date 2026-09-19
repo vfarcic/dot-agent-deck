@@ -335,8 +335,12 @@ void NEEDS_COVERS_RUN;
  *
  * ONE shape rather than a per-action argument builder, because a per-action
  * builder is a second list of the ids — and the acceptance criterion this whole
- * design exists for is that voice-enabling a capability is a ONE-FILE change to
- * `commands.toml`. An entry reads the members it declares and ignores the rest,
+ * design exists for is that adding a command changes no implementation: a row in
+ * `commands.toml` and the `voice: true` flip in this file, plus the tests that pin
+ * the shipped row set by value. (PRD #802 M8 measured it at seven files, five of
+ * them test-only. The criterion was written as "a ONE-FILE change" and that count
+ * was wrong; the substance — no implementation — held.) An entry reads the
+ * members it declares and ignores the rest,
  * which is the same latitude every `Pick<VoiceActionContext, …>` above already
  * takes with the context.
  *

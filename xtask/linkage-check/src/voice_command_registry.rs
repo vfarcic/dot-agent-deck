@@ -58,7 +58,11 @@
 //! declared interface's fields and for `localStorage` key expressions, from
 //! Rust, in a required gate. The alternative — a typed Rust enum the compiler
 //! checks — would mean editing the table, a variant and a match arm for one new
-//! command, and PRD #802's one-file promise is the whole design.
+//! command, and the last two are implementation. "A new command changes no
+//! implementation" is PRD #802's whole design; M8 measured what one does cost
+//! (seven files, five test-only) and this rule's own planted-bad-input tests are
+//! one of the seven, because a plant naming a specific unspoken entry has to move
+//! when that entry starts speaking.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
