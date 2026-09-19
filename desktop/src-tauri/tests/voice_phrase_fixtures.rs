@@ -15,8 +15,9 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use dot_agent_deck_desktop::voice::{
-    AGENT_CLI_TIMEOUT, AgentCliResolver, IntentRequest, IntentResolver, NO_MATCH_ACTION, Screen,
-    Transcript, annotate, table,
+    AGENT_CLI_TIMEOUT, AgentCliResolver, NO_MATCH_ACTION, Screen, Transcript, VoiceOutcome,
+    handle_utterance, table,
+    test_support::{role_agent_in_state, with_tool},
 };
 use serde::Deserialize;
 
@@ -38,6 +39,8 @@ struct PhraseFixture {
     screen: String,
     action: String,
     outcome: OutcomeKind,
+    #[serde(default)]
+    resolved_agent: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
@@ -47,6 +50,11 @@ enum OutcomeKind {
     Unavailable,
     NoMatch,
     UnknownAction,
+    ParamMissing,
+    ParamUnresolved,
+    ParamAmbiguous,
+    ResolutionFailed,
+    TranscriptionFailed,
 }
 
 impl fmt::Display for OutcomeKind {
@@ -56,6 +64,11 @@ impl fmt::Display for OutcomeKind {
             Self::Unavailable => "unavailable",
             Self::NoMatch => "no_match",
             Self::UnknownAction => "unknown_action",
+            Self::ParamMissing => "param_missing",
+            Self::ParamUnresolved => "param_unresolved",
+            Self::ParamAmbiguous => "param_ambiguous",
+            Self::ResolutionFailed => "resolution_failed",
+            Self::TranscriptionFailed => "transcription_failed",
         })
     }
 }
@@ -96,22 +109,65 @@ fn preflight_claude() -> Result<(), String> {
     }
 }
 
-fn classify(action: &str, screen: Screen) -> OutcomeKind {
-    if action == NO_MATCH_ACTION {
-        return OutcomeKind::NoMatch;
-    }
-    match table().row(action) {
-        Some(row) if row.callable_on(screen) => OutcomeKind::Dispatch,
-        Some(_) => OutcomeKind::Unavailable,
-        None => OutcomeKind::UnknownAction,
+fn observed(outcome: &VoiceOutcome) -> (Option<&str>, OutcomeKind, Option<&str>) {
+    match outcome {
+        VoiceOutcome::Dispatch { action, params, .. } => (
+            Some(action),
+            OutcomeKind::Dispatch,
+            params
+                .iter()
+                .find(|param| param.name == "agent")
+                .map(|param| param.value.as_str()),
+        ),
+        VoiceOutcome::Unavailable { action, .. } => (Some(action), OutcomeKind::Unavailable, None),
+        VoiceOutcome::NoMatch { .. } => (Some(NO_MATCH_ACTION), OutcomeKind::NoMatch, None),
+        VoiceOutcome::UnknownAction { action, .. } => {
+            (Some(action), OutcomeKind::UnknownAction, None)
+        }
+        VoiceOutcome::ParamMissing { action, .. } => {
+            (Some(action), OutcomeKind::ParamMissing, None)
+        }
+        VoiceOutcome::ParamUnresolved { action, .. } => {
+            (Some(action), OutcomeKind::ParamUnresolved, None)
+        }
+        VoiceOutcome::ParamAmbiguous { action, .. } => {
+            (Some(action), OutcomeKind::ParamAmbiguous, None)
+        }
+        VoiceOutcome::ResolutionFailed { .. } => (None, OutcomeKind::ResolutionFailed, None),
+        VoiceOutcome::TranscriptionFailed { .. } => (None, OutcomeKind::TranscriptionFailed, None),
     }
 }
 
 /// Scenario: With an explicit local real-agent opt-in, feed every checked-in
-/// phrase to the shipping Claude CLI resolver and verify both the chosen action
-/// and whether that action is callable on the fixture's current screen.
+/// phrase and a live fleet to the shipping Claude CLI resolver. Verify the full
+/// outcome, including the resolved agent id or an intentional ambiguity.
 #[tokio::test]
 async fn voice_phrase_fixtures_match_the_default_backend() {
+    let fixtures = manifest();
+    let agents = vec![
+        role_agent_in_state("agent-tester", "tester", "waiting_for_input"),
+        with_tool(
+            role_agent_in_state("agent-coder-one", "coder one", "working"),
+            "Bash",
+            Some("cargo test-fast"),
+        ),
+        with_tool(
+            role_agent_in_state("agent-coder-two", "coder two", "working"),
+            "Edit",
+            Some("src/lib.rs"),
+        ),
+        role_agent_in_state("agent-reviewer", "reviewer", "idle"),
+    ];
+    for fixture in &fixtures.fixtures {
+        if let Some(expected) = fixture.resolved_agent.as_deref() {
+            assert!(
+                agents.iter().any(|agent| agent.id == expected),
+                "{}: fixture expects unknown agent id `{expected}`",
+                fixture.name
+            );
+        }
+    }
+
     if truthy_env("CI") {
         skip("voice phrase fixtures never reach a real agent in CI");
         return;
@@ -127,7 +183,6 @@ async fn voice_phrase_fixtures_match_the_default_backend() {
     }
 
     let resolver = AgentCliResolver::claude();
-    let fixtures = manifest();
     let suite_started = Instant::now();
     let mut failures = Vec::new();
 
@@ -139,16 +194,11 @@ async fn voice_phrase_fixtures_match_the_default_backend() {
             ));
             continue;
         };
-        let commands = annotate(table(), screen);
         let transcript = Transcript::new(&fixture.utterance);
         let started = Instant::now();
         let resolved = tokio::time::timeout(
             AGENT_CLI_TIMEOUT + PER_FIXTURE_GRACE,
-            resolver.resolve(IntentRequest {
-                transcript: &transcript,
-                commands: &commands,
-                agents: &[],
-            }),
+            handle_utterance(&resolver, table(), screen, &agents, transcript),
         )
         .await;
 
@@ -157,15 +207,20 @@ async fn voice_phrase_fixtures_match_the_default_backend() {
                 "timed out after {:?}",
                 AGENT_CLI_TIMEOUT + PER_FIXTURE_GRACE
             )),
-            Ok(Err(error)) => Err(format!("backend failed: {error}")),
-            Ok(Ok(answer)) => {
-                let actual_outcome = classify(&answer.action, screen);
-                if answer.action == fixture.action && actual_outcome == fixture.outcome {
+            Ok(answer) => {
+                let (actual_action, actual_outcome, actual_agent) = observed(&answer.outcome);
+                let action_matches = actual_action == Some(fixture.action.as_str());
+                let agent_matches = match fixture.resolved_agent.as_deref() {
+                    Some(expected) => actual_agent == Some(expected),
+                    None => true,
+                };
+                if action_matches && actual_outcome == fixture.outcome && agent_matches {
                     Ok(())
                 } else {
                     Err(format!(
-                        "expected action={} outcome={}, got action={} outcome={actual_outcome}",
-                        fixture.action, fixture.outcome, answer.action
+                        "expected action={} outcome={} resolved_agent={:?}, got action={:?} \
+                         outcome={actual_outcome} resolved_agent={actual_agent:?}",
+                        fixture.action, fixture.outcome, fixture.resolved_agent, actual_action
                     ))
                 }
             }

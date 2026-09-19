@@ -11,6 +11,7 @@ utterance = "zoom the tester"
 screen = "deck"
 action = "open_agent"
 outcome = "dispatch"
+resolved_agent = "agent-tester"
 
 [[fixtures]]
 name = "open-agent-isolate"
@@ -18,6 +19,7 @@ utterance = "get rid of everything except the tester"
 screen = "overview"
 action = "open_agent"
 outcome = "dispatch"
+resolved_agent = "agent-tester"
 
 [[fixtures]]
 name = "open-agent-by-state"
@@ -25,6 +27,14 @@ utterance = "show me the one that's stuck"
 screen = "deck"
 action = "open_agent"
 outcome = "dispatch"
+resolved_agent = "agent-tester"
+
+[[fixtures]]
+name = "open-agent-ambiguous-name"
+utterance = "zoom coder"
+screen = "deck"
+action = "open_agent"
+outcome = "param_ambiguous"
 
 [[fixtures]]
 name = "open-agent-unavailable"
