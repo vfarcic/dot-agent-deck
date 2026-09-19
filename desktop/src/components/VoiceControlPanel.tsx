@@ -39,10 +39,11 @@
  * being the single answer to what the app says.
  *
  * The sentences written here are {@link NOTHING_DISPATCHED},
- * {@link SCREEN_MOVED_ON}, {@link VOICE_UNAVAILABLE} and
- * {@link VOICE_CAP_DISCARDED}. The first two are for situations Rust
- * structurally cannot know about; the last two are about the surface's own
- * state machine rather than about an utterance. See their own notes.
+ * {@link SCREEN_MOVED_ON}, {@link VOICE_UNAVAILABLE},
+ * {@link VOICE_CAP_DISCARDED} and {@link VOICE_RELEASE_REFUSED}. The first two
+ * are for situations Rust structurally cannot know about; the last three are
+ * about the surface's own state machine rather than about an utterance. See
+ * their own notes.
  *
  * # Voice gets no execution path of its own
  *
@@ -166,6 +167,26 @@ export const VOICE_UNAVAILABLE = "Voice control has nothing to listen with yet. 
  */
 export const VOICE_CAP_DISCARDED = "That ran to the 30 s limit with no pause in it, so nothing was sent. Say the command on its own.";
 
+/**
+ * What a press gets when Rust refused to let the microphone go.
+ *
+ * The fifth sentence this file writes, and the one it would most like not to
+ * need. `voiceCancel` is idempotent and never refused by the session itself, so
+ * a rejection here is the *call* failing — a blocking join that did not
+ * complete, a command rejected before it reached the session — and what it
+ * leaves behind is the one thing this surface must never guess at: whether the
+ * device is still open. The honest answer is that it may be, so the button goes
+ * on saying so and this says why, and what to do about it.
+ *
+ * Rendered with the rejection's own sentence after it. That is not this file
+ * composing wording out of fields — the doctrine at the top of this file — but
+ * two complete sentences printed one after the other: the surface's, because
+ * only the surface knows a release was attempted, and Rust's, because only Rust
+ * knows what went wrong. `DISPLAY_LIMITS.message` bounds the pair, eliding with
+ * its own marker rather than passing a truncation off as complete.
+ */
+export const VOICE_RELEASE_REFUSED = "The microphone may still be open — releasing it was refused. Press Voice again to retry.";
+
 /** The voice half of the runtime, which a runtime may not have at all. */
 type Voice = Pick<DeckRuntimeState, "declareVoiceScreen" | "resolveVoice" | "voiceStart" | "voiceStop" | "voiceStatus" | "voiceCancel">;
 
@@ -175,8 +196,12 @@ type Voice = Pick<DeckRuntimeState, "declareVoiceScreen" | "resolveVoice" | "voi
  * The two are deliberately separate state: `on` is the user's toggle and the
  * button reflects it alone, so the control never flickers off while an utterance
  * is being transcribed. This says which step of the cycle is in flight.
+ *
+ * The last two are the release rather than the cycle, and they exist because
+ * `on` alone cannot tell the truth about it (PRD #802's audit): `stopping` is a
+ * release Rust has not acknowledged yet, and `unreleased` is one it refused.
  */
-type VoicePhase = "idle" | "opening" | "listening" | "transcribing" | "resolving";
+type VoicePhase = "idle" | "opening" | "listening" | "transcribing" | "resolving" | "stopping" | "unreleased";
 
 /**
  * Whether Rust is still holding something for this session.
@@ -199,12 +224,14 @@ function stillHeld(state: VoiceStatusDto["state"]): boolean {
  * which that is unknown or not yet settled needs its own word rather than being
  * rounded to the nearest of two. `checking` is a panel that has not heard back
  * from Rust yet — a fresh mount, including the replacement one a webview reload
- * produces — and it renders as something other than *Voice off*, because
- * *Voice off* over a live device is the one thing this control must never say.
+ * produces — and `stopping` is a release still in flight. Both render as
+ * something other than *Voice off*, because *Voice off* over a live device is
+ * the one thing this control must never say.
  */
-type VoiceIndicator = "off" | "on" | "checking";
+type VoiceIndicator = "off" | "on" | "stopping" | "checking";
 
-function indicatorFor(known: boolean, on: boolean): VoiceIndicator {
+function indicatorFor(known: boolean, on: boolean, phase: VoicePhase): VoiceIndicator {
+  if (phase === "stopping") return "stopping";
   if (on) return "on";
   return known ? "off" : "checking";
 }
@@ -212,6 +239,7 @@ function indicatorFor(known: boolean, on: boolean): VoiceIndicator {
 const INDICATOR_LABEL: Record<VoiceIndicator, string> = {
   off: "Voice off",
   on: "Voice on",
+  stopping: "Voice stopping…",
   checking: "Voice…",
 };
 
@@ -225,12 +253,14 @@ const INDICATOR_LABEL: Record<VoiceIndicator, string> = {
 const INDICATOR_PRESSED: Record<VoiceIndicator, "true" | "false" | "mixed"> = {
   off: "false",
   on: "true",
+  stopping: "true",
   checking: "mixed",
 };
 
 const INDICATOR_TITLE: Record<VoiceIndicator, string> = {
   off: "Voice control is off — press to start listening",
   on: "Voice control is on — press to stop listening",
+  stopping: "Releasing the microphone — waiting for it to close",
   checking: "Checking whether the microphone is open",
 };
 
@@ -278,10 +308,15 @@ export function voiceCost(backend: string, ms: number | null): string {
 
 /** What the report says the surface is doing, while it is doing it. */
 function progressNote(indicator: VoiceIndicator, phase: VoicePhase): string | undefined {
+  if (indicator === "stopping") return "Releasing the microphone…";
   if (indicator !== "on") return undefined;
   if (phase === "transcribing") return "Turning that into text…";
   if (phase === "resolving") return "Working out what that means…";
   if (phase === "opening") return "Opening the microphone…";
+  // A release Rust refused. `VOICE_RELEASE_REFUSED` and the rejection's own
+  // sentence are already in the report saying what happened; a progress note
+  // over them would claim something is still in flight, and nothing is.
+  if (phase === "unreleased") return undefined;
   return "Listening…";
 }
 
@@ -685,28 +720,79 @@ export function VoiceControlPanel({ runtime, screen, onDispatch }: VoiceControlP
   }, [claim, forget, listen, setOn, setPhase, voiceStart, voiceStatus, voiceStop]);
 
   /**
-   * Turn voice off: abandon the pipeline, then release the device.
+   * After a release Rust refused: is the device gone anyway?
+   *
+   * A rejection says the CALL failed, not what it did — the session's own
+   * `cancel` is idempotent and never refused, so a rejection is a blocking join
+   * that did not complete or a command that never reached the session. Asking
+   * is the only way to tell the two apart, and the unknown answers all resolve
+   * to *not released*: this is the one place where guessing in the direction
+   * that suits the button would put *Voice off* over a live microphone.
+   */
+  const releasedAfterRefusal = useCallback(async () => {
+    if (!voiceStatus) return false;
+    try {
+      return !stillHeld((await voiceStatus()).state);
+    } catch {
+      return false;
+    }
+  }, [voiceStatus]);
+
+  /**
+   * Turn voice off: abandon the pipeline, then release the device — and do not
+   * say it is off until Rust says it is.
    *
    * `voiceCancel` rather than `voiceStop`, always: a user switching voice off
    * did not ask for the half-sentence in the buffer to be transcribed, and
    * charging them a backend call for it would be the opposite of what the press
    * meant. Cancel is idempotent and never refused precisely so this does not
    * have to know which state the device is in.
+   *
+   * **The release is AWAITED, which it was not** (PRD #802's audit). This used
+   * to set the button off and fire `voiceCancel` without waiting, swallowing
+   * any rejection — and that is not a scheduling instant: the command runs the
+   * teardown on a blocking thread and `CpalStream::drop` joins the device
+   * thread, so the sole privacy indicator read *Voice off* while the device was
+   * still closing, and read it permanently if the call failed. So the button
+   * now says `stopping` until the acknowledgement arrives, and says the
+   * microphone may still be open if it never does.
    */
-  const turnOff = useCallback(() => {
+  const turnOff = useCallback(async () => {
     /* The webview half of the same release. `voiceCancel` frees the DEVICE;
        this frees the pipeline behind it, which the device has no say over — a
        transcription or a resolution already handed to a backend arrives
-       whatever the microphone does. */
-    abandon();
+       whatever the microphone does. The claim doubles as the abandon, and is
+       what keeps this from writing state over a panel that has unmounted or
+       over a later press. */
+    const ours = claim();
+    setPhase("stopping");
+    try {
+      await voiceCancel?.();
+    } catch (cause) {
+      if (!ours()) return;
+      if (await releasedAfterRefusal()) {
+        if (!ours()) return;
+        // The call failed and the device is gone regardless, so `off` is the
+        // truthful word — with the rejection still reported rather than
+        // swallowed, because something did go wrong.
+        setOn(false);
+        setPhase("idle");
+        setProblem(sentenceOf(cause));
+        return;
+      }
+      if (!ours()) return;
+      setPhase("unreleased");
+      setProblem(`${VOICE_RELEASE_REFUSED} ${sentenceOf(cause)}`);
+      return;
+    }
+    if (!ours()) return;
     setOn(false);
     setPhase("idle");
-    void voiceCancel?.().catch(() => undefined);
-  }, [abandon, setOn, setPhase, voiceCancel]);
+  }, [claim, releasedAfterRefusal, setOn, setPhase, voiceCancel]);
 
   if (!resolveVoice) return null;
 
-  const indicator = indicatorFor(known, on);
+  const indicator = indicatorFor(known, on, phase);
   const note = progressNote(indicator, phase);
   const reporting = note !== undefined || problem !== undefined || capture !== undefined || result !== undefined;
 
@@ -722,19 +808,30 @@ export function VoiceControlPanel({ runtime, screen, onDispatch }: VoiceControlP
            showed one without the other would be on for one of them only. Four
            values rather than two — see {@link VoiceIndicator}. */
         aria-pressed={INDICATOR_PRESSED[indicator]}
-        /* Nothing is settled yet, announced rather than left to the word alone. */
-        aria-busy={indicator === "checking"}
+        /* Something is in flight and the control is not idle at the state it is
+           showing. It is the announced half of the same honesty the word
+           carries, and of the click below being serialised rather than racing. */
+        aria-busy={indicator === "stopping" || indicator === "checking"}
         title={INDICATOR_TITLE[indicator]}
         /* A peer of the agent pane rather than background, so `useInertBackground`
            leaves it alone while a pane is open — see that hook. Without it the
            `agent` screen's only command, `close_agent_view`, is dispatched by a
            control the browser will not even let the user click. */
         {...VOICE_PEER_PROPS}
-        onClick={() => { if (onRef.current) turnOff(); else void turnOn(); }}
+        /* Serialised rather than raced. While a release is in flight the device
+           is Rust's, and a press that started a new recording over it would be
+           the same lie from the other direction — or, if it landed as a second
+           cancel, would race the first one's answer. Every other state is
+           pressable, `unreleased` included: that press is the retry. */
+        onClick={() => {
+          if (phaseRef.current === "stopping") return;
+          if (onRef.current) void turnOff();
+          else void turnOn();
+        }}
       >
         {/* The crossed-out microphone only where the device is known to be
-            closed. Everywhere else — on, or not yet asked — it is the plain
-            one, because an icon is a claim too. */}
+            closed. Everywhere else — on, stopping, or not yet asked — it is the
+            plain one, because an icon is a claim too. */}
         {indicator === "off" ? <MicOff size={16} /> : <Mic size={16} />}
         <span>{INDICATOR_LABEL[indicator]}</span>
       </button>

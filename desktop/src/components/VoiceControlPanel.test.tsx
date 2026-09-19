@@ -627,6 +627,11 @@ describe("voice control panel", () => {
     await turnVoiceOn(voice);
     await completeAutomaticUtterance(voice);
     fireEvent.click(voiceButton());
+    // The press abandons the pipeline immediately — which is what this test is
+    // about — but the button waits for Rust to acknowledge the release before
+    // it claims the device is closed.
+    expect(voiceButton()).toHaveTextContent(/voice\s+stopping/i);
+    await flush();
     expect(voiceButton()).toHaveAttribute("aria-pressed", "false");
     await settle(result(DISPATCH));
 
@@ -753,4 +758,80 @@ describe("voice control panel", () => {
     expect(voiceButton()).toHaveAttribute("aria-pressed", "false");
   });
 
+  /**
+   * Scenario: turn Voice off and hold the release in flight. The button must
+   * not say `Voice off` until Rust has acknowledged the device is gone, and a
+   * second press meanwhile must not race the release.
+   */
+  it("does not claim Voice off until the release has completed", async () => {
+    let release: (status: VoiceStatusDto) => void = () => {};
+    const voice = voiceControls({
+      voiceStatus: vi.fn(async () => voiceStatus({ available: true, backend: "remote" })),
+      voiceCancel: vi.fn(() => new Promise<VoiceStatusDto>((resolve) => { release = resolve; })),
+    });
+    render(<DeckShell runtime={runtime(resolver(result(DISPATCH)), voice)} />);
+
+    await turnVoiceOn(voice);
+    await act(async () => { fireEvent.click(voiceButton()); await Promise.resolve(); });
+
+    expect(voice.voiceCancel).toHaveBeenCalledTimes(1);
+    expect(voiceButton()).not.toHaveTextContent(/voice\s+off/i);
+    expect(voiceButton()).toHaveAttribute("aria-pressed", "true");
+
+    // Serialised rather than racing: nothing is started over a device Rust has
+    // not let go of, and no second release is fired at it either.
+    await act(async () => { fireEvent.click(voiceButton()); await Promise.resolve(); });
+    expect(voice.voiceStart).toHaveBeenCalledTimes(1);
+    expect(voice.voiceCancel).toHaveBeenCalledTimes(1);
+
+    await act(async () => { release(voiceStatus()); await Promise.resolve(); });
+
+    expect(voiceButton()).toHaveTextContent(/voice\s+off/i);
+    expect(voiceButton()).toHaveAttribute("aria-pressed", "false");
+  });
+
+  /**
+   * Scenario: releasing the microphone is refused. The button keeps saying the
+   * device may still be open, the report carries the refusal and says to press
+   * again, and pressing again releases it.
+   */
+  it("keeps a truthful indication and retries when the release is refused", async () => {
+    const refusal = "the microphone call failed: the device would not let go";
+    let refuse = true;
+    let started = false;
+    const voice = voiceControls({
+      voiceStatus: vi.fn(async () => voiceStatus({
+        state: started ? "recording" : "idle",
+        available: true,
+        backend: "remote",
+      })),
+      voiceStart: vi.fn(async () => {
+        started = true;
+        return voiceStatus({ state: "recording", available: true, backend: "remote" });
+      }),
+      voiceCancel: vi.fn(async () => {
+        if (refuse) throw refusal;
+        started = false;
+        return voiceStatus();
+      }),
+    });
+    render(<DeckShell runtime={runtime(resolver(result(DISPATCH)), voice)} />);
+
+    await turnVoiceOn(voice);
+    await act(async () => { fireEvent.click(voiceButton()); });
+    await flush();
+
+    expect(voiceButton()).not.toHaveTextContent(/voice\s+off/i);
+    expect(voiceButton()).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getByTestId("voice-report")).toHaveTextContent(refusal);
+    expect(screen.getByTestId("voice-report")).toHaveTextContent(/press voice again/i);
+
+    refuse = false;
+    await act(async () => { fireEvent.click(voiceButton()); });
+    await flush();
+
+    expect(started).toBe(false);
+    expect(voiceButton()).toHaveTextContent(/voice\s+off/i);
+    expect(voiceButton()).toHaveAttribute("aria-pressed", "false");
+  });
 });
