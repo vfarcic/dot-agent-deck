@@ -113,7 +113,9 @@ pub const REMOTE_TIMEOUT: Duration = Duration::from_secs(15);
 /// Resolve intent by asking a hosted model with a key of the app's own.
 pub struct RemoteResolver {
     secrets: Arc<dyn SecretStore>,
-    client: reqwest::Client,
+    /// `None` when no client could be built, which this backend reports as a
+    /// failure rather than papering over — see [`super::http::client`].
+    client: Option<reqwest::Client>,
     endpoint: String,
     model: String,
 }
@@ -127,13 +129,20 @@ impl RemoteResolver {
             // client, and rebuilding one per utterance would pay a fresh
             // handshake on the path this backend exists to make fast.
             //
-            // `Client::new()` rather than a configured builder, and the timeout
-            // set per REQUEST instead — because `ClientBuilder::build` is
-            // fallible, and the obvious `.timeout(..).build().unwrap_or_default()`
-            // silently yields a client with NO timeout on the failure path.
-            // That is precisely the bound this backend must not lose, so it is
-            // put somewhere that cannot fail to be applied.
-            client: reqwest::Client::new(),
+            // The TIMEOUT is still set per REQUEST rather than on the builder,
+            // and that reasoning is unchanged: `ClientBuilder::build` is
+            // fallible, and `.timeout(..).build().unwrap_or_default()` silently
+            // yields a client with no timeout on the failure path — precisely
+            // the bound this backend must not lose, so it goes somewhere that
+            // cannot fail to be applied.
+            //
+            // What the builder now carries is the REDIRECT policy, which has no
+            // per-request spelling. PRD #802's audit found `x-api-key` — a
+            // custom header, so not one reqwest strips — being forwarded across
+            // an origin change. `super::http::client` refuses to follow one at
+            // all, and hands back `None` rather than a permissive fallback if
+            // it cannot be built; `run` turns that into a sentence.
+            client: super::http::client(),
             endpoint: DEFAULT_ENDPOINT.to_string(),
             model: DEFAULT_MODEL.to_string(),
         }
@@ -163,9 +172,16 @@ impl RemoteResolver {
             Err(error) => return Err(IntentError::NotConfigured(error.public())),
         };
 
+        let Some(client) = self.client.as_ref() else {
+            // Fail closed: the one thing this must never do is fall back to a
+            // client that follows redirects with the key attached.
+            return Err(IntentError::Backend(
+                "the command backend could not start a secure connection".into(),
+            ));
+        };
+
         let body = request_body(&request, &self.model);
-        let response = self
-            .client
+        let response = client
             .post(&self.endpoint)
             .timeout(REMOTE_TIMEOUT)
             .header("content-type", "application/json")
@@ -177,7 +193,26 @@ impl RemoteResolver {
             .map_err(|error| IntentError::Backend(transport_detail(&error)))?;
 
         let status = response.status();
-        let payload: Value = response.json().await.map_err(|_| {
+        // Bounded BEFORE the bytes become text or JSON. `Response::json` used
+        // to collect the whole body first, so a body streamed fast enough could
+        // exhaust this process inside the timeout — PRD #802's audit. The bound
+        // applies to the non-success path too, because the error detail below
+        // is quoted out of that same body.
+        let body = match super::http::capped_body(response, super::http::MAX_BODY_BYTES).await {
+            Ok(body) => body,
+            Err(super::http::BodyError::TooLarge) => {
+                return Err(IntentError::Backend(format!(
+                    "the command backend answered {status} with more than {} bytes",
+                    super::http::MAX_BODY_BYTES
+                )));
+            }
+            Err(super::http::BodyError::Transport) => {
+                return Err(IntentError::Backend(
+                    "the request to the command backend failed".into(),
+                ));
+            }
+        };
+        let payload: Value = serde_json::from_slice(&body).map_err(|_| {
             IntentError::Backend(format!("the command backend answered {status} unreadably"))
         })?;
         if !status.is_success() {

@@ -31,12 +31,20 @@
 //! add one — a credential in the webview is one `JSON.stringify` from the
 //! `localStorage` half of PRD #803's rule.
 //!
-//! # No utterance is persisted, and that now includes the audio
+//! # No utterance is persisted by this module, and that includes the audio
 //!
 //! PRD #802's Open Question 5. Nothing here writes a buffer or a transcript to
 //! disk, and nothing logs one at any level: the request body is assembled in
 //! memory, sent, and dropped. The error paths quote the API's own message and
 //! the HTTP status and never the audio or the text.
+//!
+//! **Scoped to this module deliberately.** The claim holds without qualification
+//! here — this is an HTTPS request and nothing else — but the feature-wide
+//! version of it does not, because the agent-CLI intent backend hands its prompt
+//! to another program that has storage of its own. [`super::agent_cli`] carries
+//! that half, and [`super::Transcript`] carries the sentence covering both.
+//! What the remote endpoint does with an upload is the endpoint's policy and
+//! not a property this app can assert at all.
 
 use std::fmt;
 use std::future::Future;
@@ -178,7 +186,9 @@ impl Transcriber for OffTranscriber {
 /// Transcribe by uploading the utterance to a hosted speech model.
 pub struct RemoteTranscriber {
     secrets: Arc<dyn SecretStore>,
-    client: reqwest::Client,
+    /// `None` when no client could be built — see [`super::http::client`]. This
+    /// backend reports that rather than falling back to a permissive one.
+    client: Option<reqwest::Client>,
     endpoint: String,
     model: String,
 }
@@ -192,7 +202,15 @@ impl RemoteTranscriber {
             // out why: `ClientBuilder::build` is fallible, and the obvious
             // `.timeout(..).build().unwrap_or_default()` silently yields a
             // client with no timeout on the failure path.
-            client: reqwest::Client::new(),
+            //
+            // The builder carries the REDIRECT policy, which has no per-request
+            // spelling. This backend authenticates with the standard
+            // `Authorization` header, which reqwest DOES strip across an origin
+            // change — so the `x-api-key` leak PRD #802's audit found is not
+            // this one's. What is this one's: a 307 or 308 re-sends the body,
+            // and the body here is the user's voice. Same policy, different
+            // reason.
+            client: super::http::client(),
             endpoint: DEFAULT_ENDPOINT.to_string(),
             model: DEFAULT_MODEL.to_string(),
         }
@@ -232,10 +250,17 @@ impl RemoteTranscriber {
             Err(error) => return Err(TranscriptionError::NotConfigured(error.public())),
         };
 
+        let Some(client) = self.client.as_ref() else {
+            // Fail closed: never a fallback to a client that would re-send the
+            // audio to a redirect target.
+            return Err(TranscriptionError::Backend(
+                "the transcription backend could not start a secure connection".into(),
+            ));
+        };
+
         let boundary = boundary();
         let body = multipart_body(audio, &self.model, &boundary);
-        let response = self
-            .client
+        let response = client
             .post(&self.endpoint)
             .timeout(TRANSCRIBE_TIMEOUT)
             .header("content-type", content_type(&boundary))
@@ -246,7 +271,25 @@ impl RemoteTranscriber {
             .map_err(|error| TranscriptionError::Backend(transport_detail(&error)))?;
 
         let status = response.status();
-        let payload: Value = response.json().await.map_err(|_| {
+        // Bounded BEFORE the bytes become text or JSON, on the success and the
+        // failure path alike — PRD #802's audit. `Response::json` collected the
+        // whole body first, and a request timeout bounds elapsed time rather
+        // than bytes.
+        let body = match super::http::capped_body(response, super::http::MAX_BODY_BYTES).await {
+            Ok(body) => body,
+            Err(super::http::BodyError::TooLarge) => {
+                return Err(TranscriptionError::Backend(format!(
+                    "the transcription backend answered {status} with more than {} bytes",
+                    super::http::MAX_BODY_BYTES
+                )));
+            }
+            Err(super::http::BodyError::Transport) => {
+                return Err(TranscriptionError::Backend(
+                    "the request to the transcription backend failed".into(),
+                ));
+            }
+        };
+        let payload: Value = serde_json::from_slice(&body).map_err(|_| {
             TranscriptionError::Backend(format!(
                 "the transcription backend answered {status} unreadably"
             ))

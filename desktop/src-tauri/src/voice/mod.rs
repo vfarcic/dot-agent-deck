@@ -34,6 +34,7 @@
 
 pub mod agent_cli;
 pub mod capture;
+pub mod http;
 pub mod outcome;
 pub mod prompt;
 pub mod remote;
@@ -77,19 +78,31 @@ pub use transcribe::{
 /// What the user said, as text — from the microphone through the `Transcriber`
 /// seam (M7), or typed into the same box.
 ///
-/// **The rule this feature adopts: no transcript, utterance or audio buffer is
-/// written to a log or to disk.** That covers `eprintln!`, which is how this
-/// crate logs today (`lib.rs` and `settings.rs` between them are its only log
-/// calls, and neither `tracing` nor `log` is a dependency of it), and it covers
-/// whatever replaces it. A transcript lives in memory for the session's UI, and
-/// the one place it is meant to appear is the sentence the app renders back to
-/// the user.
+/// **The rule this feature adopts: THIS APP writes no transcript, utterance or
+/// audio buffer to a log or to disk — and where it hands one to a child
+/// process, it instructs that child not to either.** That covers `eprintln!`,
+/// which is how this crate logs today (`lib.rs` and `settings.rs` between them
+/// are its only log calls, and neither `tracing` nor `log` is a dependency of
+/// it), and it covers whatever replaces it. A transcript lives in memory for
+/// the session's UI, and the one place it is meant to appear is the sentence
+/// the app renders back to the user.
 ///
-/// It is a **rule**, not a property M1 can assert: the code that could break it
-/// — the backends (M5), the surface (M6), the microphone (M7) — is not written
-/// yet. PRD #802's Open Question 5 asks whether any part of an utterance is
-/// persisted; this is the answer being proposed, and M6 owes it to the docs
-/// either way.
+/// **The second clause is not decoration, and the unqualified version of this
+/// sentence was FALSE while it was written here.** PRD #802's landed-work
+/// security audit found the agent-CLI intent backend handing the whole prompt —
+/// the utterance and the agent labels with it — to `claude` in its ordinary
+/// session mode, which writes a resumable session to disk. Our redacted `Debug`
+/// impls do nothing about a child application's own storage. The backend now
+/// passes `--no-session-persistence`
+/// ([`agent_cli`] has the flag table), so the claim is true again — but it is
+/// true *because a flag is passed to another program*, which is a weaker thing
+/// than "this process never writes it" and is why the sentence above says both
+/// halves. The same audit withdrew the `opencode` backend outright, since that
+/// CLI has no equivalent flag.
+///
+/// It is a **rule**, not a property this module can assert. PRD #802's Open
+/// Question 5 asks whether any part of an utterance is persisted; this is the
+/// answer, and `docs/develop/desktop-gui.md` carries it in the same two halves.
 ///
 /// [`fmt::Debug`] is written by hand and prints no content, so a DERIVED
 /// `{:?}` on a type containing a transcript prints none either. That closes the
