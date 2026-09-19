@@ -157,6 +157,9 @@
 # first: the phase it names is the wait that hung, and `force_kill_and_reap_all`
 # still has no deadline of its own.
 
+[test-groups]
+endpoint-fallback = { max-threads = 1 }
+
 [profile.default]
 retries = 0
 slow-timeout = { period = "60s", terminate-after = 3 }
@@ -193,6 +196,14 @@ fail-fast = false
 #     applies to any future job that uploads this file while holding a secret.
 [profile.default.junit]
 path = "junit.xml"
+
+# Issue #1121: these three tests deliberately exercise the literal legacy
+# `/tmp/dot-agent-deck[-attach]-<uid>.sock` pair. Serialize them against each
+# other so one scenario's planted file or legacy daemon cannot become another
+# scenario's input; their new fallback endpoints remain isolated by `TMPDIR`.
+[[profile.default.overrides]]
+filter = 'test(/^socket_0(09|10|11)_/)'
+test-group = 'endpoint-fallback'
 
 # PRD #140 M5.1: `orchestration/route/001` boots SIX interactive Haiku panes
 # across two orchestration tabs and drives two concurrent

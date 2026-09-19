@@ -332,6 +332,7 @@ pub struct TuiDeckBuilder {
     cols: u16,
     rows: u16,
     extra_env: Vec<(String, String)>,
+    suppress_endpoint_overrides: bool,
     continue_session: Option<ContinueSession>,
     credential_imports: Vec<CredentialImport>,
     keybindings_toml: Option<String>,
@@ -347,6 +348,17 @@ impl TuiDeckBuilder {
     /// value than Decision 20's pinned default (e.g. `NO_COLOR=1`).
     pub fn with_env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.extra_env.push((key.into(), value.into()));
+        self
+    }
+
+    /// Omit the harness's default `DOT_AGENT_DECK_SOCKET` and
+    /// `DOT_AGENT_DECK_ATTACH_SOCKET` injection so a test can exercise
+    /// production endpoint resolution. A later [`Self::with_env`] can still
+    /// add either variable. The ordinary harness-local paths returned by the
+    /// deck's socket accessors do not describe a launch using this option;
+    /// callers must assert against the endpoint paths their scenario supplies.
+    pub fn without_endpoint_overrides(mut self) -> Self {
+        self.suppress_endpoint_overrides = true;
         self
     }
 
@@ -667,6 +679,7 @@ impl TuiDeck {
             cols: DEFAULT_COLS,
             rows: DEFAULT_ROWS,
             extra_env: Vec::new(),
+            suppress_endpoint_overrides: false,
             continue_session: None,
             credential_imports: Vec::new(),
             keybindings_toml: None,
@@ -1037,6 +1050,10 @@ impl TuiDeck {
         }
         for (k, v) in pinned {
             final_env.insert((*k).into(), (*v).into());
+        }
+        if builder.suppress_endpoint_overrides {
+            final_env.remove("DOT_AGENT_DECK_SOCKET");
+            final_env.remove("DOT_AGENT_DECK_ATTACH_SOCKET");
         }
         // Point the deck's saved-session reader at our staged file so
         // auto-restore picks up exactly the chain-smoke pane and
@@ -8678,8 +8695,8 @@ pub fn spawn_daemon_serve_with_env(
     // wrapped agents, and `wrap` runs the Codex hook installer.
     seed_durable_binary(&home);
     let state_dir = work.join("state");
-    let hook_socket = work.join("hook.sock");
-    let attach_socket = work.join("attach.sock");
+    let mut hook_socket = work.join("hook.sock");
+    let mut attach_socket = work.join("attach.sock");
     let schedules_path = work.join("schedules.toml");
     if let Some(toml) = initial_schedules_toml {
         std::fs::write(&schedules_path, toml).expect("seed schedules.toml");
@@ -8746,6 +8763,11 @@ pub fn spawn_daemon_serve_with_env(
         "0".into(),
     ));
     for (k, v) in extra_env {
+        match *k {
+            "DOT_AGENT_DECK_SOCKET" => hook_socket = PathBuf::from(v),
+            "DOT_AGENT_DECK_ATTACH_SOCKET" => attach_socket = PathBuf::from(v),
+            _ => {}
+        }
         env.push(((*k).to_string(), (*v).to_string()));
     }
 
