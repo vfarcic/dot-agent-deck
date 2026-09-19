@@ -121,6 +121,32 @@ const ALLOWED_ROOT_MODULES: &[&str] = &[
     "daemon_protocol",
     "daemon_stop",
     "event",
+    // PRD #802 M5, argued rather than added quietly. The agent-CLI intent
+    // backend has to LOCATE `claude` before it can spawn it, so on a Finder or
+    // desktop-launcher start — where PATH is minimal — it has to be able to
+    // find it; `login_shell::capture_login_shell_path` is the mechanism that
+    // already exists for exactly that problem on the daemon's spawn path, and
+    // re-implementing "run the user's interactive login shell and read $PATH
+    // out of its noisy stdout" here would be a second copy of a function whose
+    // whole substance is marker tokens, a pipe-drain thread and a control-byte
+    // refusal.
+    //
+    // It crosses none of the four things this rule looks for, checked rather
+    // than assumed: it resolves no project, reads no project state file (its
+    // production paths touch the filesystem not at all — `std::env::var`, a
+    // subprocess, and a string scan), names no FORBIDDEN_SYMBOL, and contains
+    // zero occurrences of `current_dir`. What it returns is a PATH, which the
+    // desktop RESOLVES an absolute program path against and then puts — with
+    // its empty and relative components removed — on one child `Command`'s
+    // environment. (It used to be handed to `Command::new("claude")` as a bare
+    // name; PRD #802's landed-work security audit closed that, because an
+    // empty or relative PATH component would otherwise let a directory the app
+    // merely ran from supply the executable.)
+    //
+    // Note which half is reached: `capture_login_shell_path`, never
+    // `apply_login_shell_path`. The latter calls `std::env::set_var` and is
+    // sound only in a single-threaded startup window the desktop does not have.
+    "login_shell",
     "platform",
     "prompt_delivery",
     // PRD #741 M6, argued rather than added quietly. The desktop's settings

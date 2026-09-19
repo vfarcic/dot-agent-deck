@@ -1,0 +1,113 @@
+# PRD #802 — the voice command table.
+#
+# ONE file, embedded with `include_str!` (see `table.rs`), read by three
+# consumers: schema generation, validation, and dispatch. A row does NOT define
+# behaviour — it EXPOSES behaviour that already exists, so `invoke` names an
+# entry in the frontend action registry (`desktop/src/lib/voiceActions.ts`,
+# M2) and never a second implementation.
+#
+# Columns:
+#
+#   id               the action the model answers with. Must not be `none`,
+#                    which is reserved for "none of these".
+#   description      a PROMPT, not documentation. The model picks on it, so it
+#                    is written for a model and reviewed as an interface.
+#   invoke           the registry entry to dispatch. M3's guard resolves it.
+#   screens          where the command can run: `deck`, `overview`, `agent` —
+#                    the three `DeckView` kinds (`desktop/src/types.ts`).
+#                    Absent or empty means available everywhere.
+#   unavailable_hint names the PREREQUISITE, for the sentence the app renders
+#                    when the model picks a command the current screen cannot
+#                    run. No leading capital and no trailing period: it is
+#                    rendered into a sentence, not as one.
+#   report           the user-facing sentence for a successful dispatch — the
+#                    pipeline's stage 6. A `{param}` placeholder is replaced
+#                    with what that param resolved to; `table.rs` refuses a
+#                    placeholder naming no declared param.
+#                    NAMED `report` RATHER THAN `confirmation` ON PURPOSE:
+#                    PRD #802 D5 is "destructive commands behind confirmation",
+#                    so rows in this same file will later carry a genuine
+#                    confirm-before-acting flag, and the two are close to
+#                    opposite — this describes an action that HAPPENED, that
+#                    one blocks an action before it does. Do not rename it back.
+#   [[commands.params]]  name + kind, `kind` from the closed resolver set.
+#
+# This slice is NAVIGATION ONLY (PRD #802 Scope). No row here starts an agent,
+# stops one, or answers a permission prompt, which is why none of them needs a
+# confirm-before-acting step. `close_agent_view` closes a VIEW rather than a
+# terminal pane — see the comment above that row, because the two are one word
+# apart in speech.
+
+[[commands]]
+id          = "open_agent"
+description = """Open one agent's pane over the current screen, so the user can watch that one
+agent's terminal. Use when the user asks to focus on, enlarge, zoom, open, show or look at ONE
+named agent. The agent is named the way the deck shows it — a role like "tester" or
+"orchestrator", or a name the user gave it."""
+invoke      = "openAgent"
+screens     = ["deck", "overview"]
+unavailable_hint = "opening an agent works from the deck or the agent overview"
+report      = "Opening {agent}."
+
+  [[commands.params]]
+  name = "agent"
+  kind = "agent_ref"
+
+[[commands]]
+id          = "open_overview"
+description = """Leave the deck and show the agent overview: every agent across every connected
+deck in one list, with each one's status and activity. Use when the user asks to see everything,
+all the agents, the whole fleet, or asks which agents are running or what needs attention."""
+invoke      = "openOverview"
+screens     = ["deck"]
+unavailable_hint = "the agent overview opens from the deck"
+report      = "Opening the agent overview."
+
+[[commands]]
+id          = "open_deck"
+description = """Go back to the deck — the screen with the terminals on it — leaving the agent
+overview. On the agent overview a bare "go back" or "back" means THIS one, because the deck is
+the screen the overview was opened from. Also use for return to the deck, take me back, or show
+the terminals or panes again."""
+invoke      = "openDeck"
+screens     = ["overview"]
+unavailable_hint = "returning to the deck works from the agent overview"
+report      = "Back to the deck."
+
+# NOT the destructive "close a pane" the PRD puts out of scope. This closes the
+# VIEW — `closeAgent` in `desktop/src/App.tsx`, which is `setView({ kind: from })`
+# and nothing else. The agent keeps running, its terminal pane is untouched, and
+# the description says so because the two are one word apart in speech.
+[[commands]]
+id          = "close_agent_view"
+description = """Close the agent view that is open over the screen and return to the screen it
+was opened from. While one agent's view is open a bare "go back" or "back" means THIS one. Also
+use for close this, close it, leave this agent, or stop looking at one agent. This only closes
+the view — it does NOT stop the agent and does NOT close its terminal pane."""
+invoke      = "closeAgentView"
+screens     = ["agent"]
+unavailable_hint = "closing an agent view needs one open"
+report      = "Closing the agent view."
+
+# PRD #802 M8 — the cost-of-a-row proof: the first command added after the
+# plumbing existed. It cost SEVEN files, five of them test-only and none of them
+# implementation — the nine tests that pin the shipped row set by value are what
+# the other five are. PRD #802's M8 milestone has the file-by-file accounting.
+#
+# `screens = ["deck"]` rather than `["deck", "overview"]`, and the
+# narrowing is the rule rather than caution: the Settings overlay is reachable
+# only from the DECK rail — the overview's rail holds Deck and Overview and
+# nothing else — so listing `overview` would let voice open a surface no click
+# can reach from that screen, which makes voice a second control surface with
+# capabilities the first lacks. A row does not define behaviour; it exposes
+# behaviour that already exists.
+[[commands]]
+id          = "open_settings"
+description = """Open the app's Settings sheet: appearance, the decks this app connects to, voice,
+and zoom. Use when the user asks for settings, preferences, options, configuration, or asks where
+to change how the app looks, where to add or edit a deck, or where to put an API key. This only
+opens the sheet — it changes no setting by itself."""
+invoke      = "openSettings"
+screens     = ["deck"]
+unavailable_hint = "settings open from the deck"
+report      = "Opening settings."

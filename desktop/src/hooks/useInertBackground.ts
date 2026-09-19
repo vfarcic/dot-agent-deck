@@ -42,6 +42,31 @@
  * Only elements this hook marked are unmarked on cleanup, so an element that
  * was already inert for some other reason keeps its own state.
  *
+ * # The one exemption: the voice surface is a PEER dialog, not background
+ *
+ * PRD #802's voice trigger and its dialog are siblings of the screen switch in
+ * `DeckShell`, so the walk above reaches them and marks them like any other
+ * background region — which is what it should do for a region, and wrong for a
+ * second dialog. The cost was not cosmetic: `inert` removes an element from hit
+ * testing as well as from the tab order, so on the `agent` screen the trigger
+ * was unclickable behind the pane, and `close_agent_view` — the one command
+ * that screen has — was unreachable by the surface that dispatches it.
+ *
+ * So elements carrying {@link VOICE_PEER_PROPS} are skipped, and nothing else
+ * is. It is an allow-list of one marker rather than a rule about roles or
+ * dialogs: a second peer added later has to be exempted here deliberately,
+ * which is the review this hook's audit asked for.
+ *
+ * **What the hook still guarantees is unchanged for everything else.** Every
+ * element that is not an ancestor of the pane and does not carry that marker is
+ * still inerted on every commit, the `DeckSelector` above all — so the
+ * retargeting attack the audit found stays unreachable, and the exemption
+ * cannot widen by accident: it is matched on the sibling itself, so a marked
+ * element nested inside a background region is still inert with its region.
+ *
+ * The two surfaces do not fight over `Escape` either: the voice dialog
+ * `stopPropagation`s its own, and `DeckShell`'s pane listener is at `window`.
+ *
  * **`setAttribute` rather than the `inert` IDL property, and that is not
  * style.** Measured against this repo's jsdom (30.x): `"inert" in
  * HTMLElement.prototype` is `false`, so `element.inert = true` sets a plain
@@ -53,6 +78,21 @@
  * presence is pinned here.
  */
 import { useEffect, useRef } from "react";
+
+/**
+ * The marker that makes an element a peer of the agent pane rather than
+ * background, spread onto the voice trigger and the voice dialog in
+ * {@link ../components/VoiceControlPanel!VoiceControlPanel}.
+ *
+ * Exported as props to spread rather than written as a literal attribute at
+ * each site, so the two elements and the selector below cannot drift apart
+ * under a rename — a drift that would silently restore the bug, since an
+ * unmarked trigger is simply inert again.
+ */
+export const VOICE_PEER_PROPS = { "data-modal-peer": "voice" } as const;
+
+/** The same marker, as the selector the walk tests each sibling against. */
+const VOICE_PEER_SELECTOR = `[data-modal-peer="${VOICE_PEER_PROPS["data-modal-peer"]}"]`;
 
 export function useInertBackground<T extends HTMLElement>(open: boolean) {
   const ref = useRef<T>(null);
@@ -66,6 +106,8 @@ export function useInertBackground<T extends HTMLElement>(open: boolean) {
     while (parent) {
       for (const sibling of Array.from(parent.children)) {
         if (sibling === child) continue;
+        // The one exemption, and the only one. See the note above.
+        if (sibling.matches(VOICE_PEER_SELECTOR)) continue;
         if (sibling.hasAttribute("inert")) continue;
         sibling.setAttribute("inert", "");
         marked.push(sibling);

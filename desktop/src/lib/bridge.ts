@@ -1,4 +1,4 @@
-import { createFixtureFleet, DEFAULT_PROFILES, type FixtureState } from "../data/fixture";
+import { createFixtureFleet, DEFAULT_PROFILES, fixtureVoiceStatus, fixtureVoiceTranscription, resolveFixtureVoice, type FixtureState } from "../data/fixture";
 import { agentKey } from "./agentKey";
 import { getTerminal } from "./terminalRegistry";
 import { applyHandoffEvent, mapDaemonEvent, MAX_LIVE_EVIDENCE } from "./daemonEvents";
@@ -331,12 +331,45 @@ export interface DesktopSettingsDto {
    */
   endpoints?: EndpointSettingsDto;
   /**
+   * Which backends voice uses, and how it is activated (PRD #802 M4).
+   *
+   * **Optional for `endpoints`' reason rather than a weaker version of it.**
+   * The Rust field is an `Option<VoiceSettings>` and its `None` is what stops a
+   * build whose UI cannot render voice from resetting it: the save merges the
+   * decoded struct over the document on disk, so a section this side fabricated
+   * as `{ activation: "toggle", intent: "claude", transcription: "off" }` would
+   * write those defaults over the user's choices — on a save triggered by
+   * changing the theme. Never default it; round-trip it or omit it.
+   *
+   * No credential here, in any form. PRD #803's rule is that a secret goes in
+   * neither `desktop.toml` nor `localStorage`, and this DTO is written to
+   * `localStorage` verbatim by the fixture bridge. A key lives in the OS
+   * keychain and is reached through `secretStatus` / `storeSecret` /
+   * `forgetSecret` below, none of which can read one back.
+   */
+  voice?: VoiceSettingsDto;
+  /**
    * The window's zoom level as a scale factor, always one of `ZOOM_LEVELS`
    * (PRD #744). A scale factor rather than a percentage because that is the
    * unit `webview.set_zoom` takes, so storage, this wire, the frontend ladder
    * and the platform call are all in one unit.
    */
   zoom: { level: number };
+}
+
+/**
+ * The `[voice]` section: three closed choices and nothing else (PRD #802 M4).
+ *
+ * Every value is one of the token arrays below, which mirror the Rust enums in
+ * `src-tauri/src/settings.rs` — pinned on that side by
+ * `the_voice_tokens_match_the_frontends_copy`, because a token offered here
+ * that Rust does not recognise folds to the default and the user's choice
+ * silently does not stick.
+ */
+export interface VoiceSettingsDto {
+  activation: string;
+  intent: string;
+  transcription: string;
 }
 
 /** The `[endpoints]` section: the remote decks, and which deck is selected. */
@@ -405,6 +438,190 @@ export const ALL_ENDPOINT_SELECTION = "all";
 export const DEFAULT_SSH_PORT = 22;
 
 const APPEARANCE_MODES: readonly AppearanceMode[] = ["system", "light", "dark"];
+
+/**
+ * How the microphone is started and stopped (PRD #802 M7).
+ *
+ * One entry today, and that is the truthful shape: PRD #802 ships press-once-
+ * to-start / press-once-to-stop and defers hold-to-talk and always-on-with-VAD
+ * to D4. Keep identical to `ActivationMode::TOKENS` in
+ * `src-tauri/src/settings.rs`.
+ */
+export const VOICE_ACTIVATION_MODES = ["toggle"] as const;
+
+/**
+ * Which backend resolves an utterance into an action (PRD #802 M5).
+ *
+ * `claude` is the default because it needs no key and no download — the user
+ * already has a pre-authenticated CLI on the box. Keep identical to
+ * `IntentBackend::TOKENS` in `src-tauri/src/settings.rs`.
+ *
+ * `opencode` was here and was withdrawn by PRD #802's landed-work security
+ * audit: the agent-CLI backend has to be able to run the child with no tools,
+ * no hooks, no MCP, no project config and no session on disk, and `opencode
+ * run` offers none of those switches. The Rust enum's doc comment has the
+ * reasoning; its folding deserializer is why a stale `opencode` in a settings
+ * document loads as `claude` instead of failing.
+ */
+export const VOICE_INTENT_BACKENDS = ["claude", "remote"] as const;
+
+/**
+ * Which backend turns speech into text (PRD #802 M7).
+ *
+ * `off` is the default and is a product statement rather than a degraded mode:
+ * transcription is the one stage with no no-key trick, so with nothing
+ * configured the surface still works from typed input through the identical
+ * resolve → validate → execute → report path. Keep identical to
+ * `TranscriptionBackend::TOKENS` in `src-tauri/src/settings.rs`.
+ */
+export const VOICE_TRANSCRIPTION_BACKENDS = ["off", "remote"] as const;
+
+/** Mirrors `VoiceSettings::default()`; what an absent section renders as. */
+export const DEFAULT_VOICE_SETTINGS: VoiceSettingsDto = {
+  activation: "toggle",
+  intent: "claude",
+  transcription: "off",
+};
+
+/**
+ * Which credential the app is being asked about (PRD #802 M4).
+ *
+ * Keep identical to `SecretId::ALL` in `src-tauri/src/secrets.rs`: these are
+ * keychain account names, so a token this side invents names an entry nothing
+ * over there reads.
+ */
+export const VOICE_SECRET_IDS = ["voice-intent", "voice-transcription"] as const;
+
+export type VoiceSecretId = (typeof VOICE_SECRET_IDS)[number];
+
+/**
+ * What the app knows about one stored credential — a boolean, and never the
+ * value (PRD #802 M4).
+ *
+ * `problem` is `Some` when the answer is "I could not find out", which is NOT
+ * the same as "nothing is stored" and must not render as it: a panel that
+ * showed *No key stored* for an unreachable keychain would invite the user to
+ * type their key again into a store that cannot hold it.
+ */
+export interface SecretStatusDto {
+  stored: boolean;
+  problem?: string;
+}
+
+/**
+ * Which top-level surface a voice command would run against (PRD #802 M6).
+ *
+ * The three `DeckView` kinds, and the same closed set `commands.toml`'s
+ * `screens` column draws from — pinned on the Rust side as `voice::Screen` and
+ * by `xtask/linkage-check`'s rule 13, which reads the union in `types.ts` so the
+ * table and the app's own type stay in step without a second list.
+ */
+export type VoiceScreen = "deck" | "overview" | "agent";
+
+/**
+ * One param of a resolved command, as the Rust side resolved it against live
+ * state (`voice::ResolvedParam`).
+ *
+ * `spoken` is what the user called it and `value` is what the action is
+ * dispatched with — an agent id for `agent_ref`. The surface renders neither:
+ * the sentence it shows already names the agent the way the deck does, which is
+ * what `label` was derived for.
+ */
+export interface VoiceResolvedParamDto {
+  name: string;
+  kind: string;
+  spoken: string;
+  value: string;
+  label: string;
+}
+
+/**
+ * The closed set of situations one utterance can end in (`voice::VoiceOutcome`).
+ *
+ * **Every variant carries its own `sentence`, and that sentence is the only
+ * thing the surface prints.** The panel never composes wording from `kind`,
+ * `action`, `param` or `matches`: Rust renders each situation once, from the
+ * table, so two surfaces cannot phrase the same situation differently. The
+ * other fields are here because the shape is the wire's, not because the panel
+ * reads them — `dispatch` is the one variant it does read, for `invoke` and
+ * `params`.
+ */
+export type VoiceOutcomeDto =
+  | { kind: "dispatch"; transcript: string; action: string; invoke: string; params: VoiceResolvedParamDto[]; sentence: string }
+  | { kind: "unavailable"; transcript: string; action: string; hint: string; sentence: string }
+  | { kind: "no_match"; transcript: string; sentence: string }
+  | { kind: "unknown_action"; transcript: string; action: string; sentence: string }
+  | { kind: "param_missing"; transcript: string; action: string; param: string; sentence: string }
+  | { kind: "param_unresolved"; transcript: string; action: string; param: string; spoken: string; sentence: string }
+  | { kind: "param_ambiguous"; transcript: string; action: string; param: string; spoken: string; matches: string[]; sentence: string }
+  | { kind: "resolution_failed"; transcript: string; detail: string; sentence: string }
+  | { kind: "transcription_failed"; detail: string; sentence: string };
+
+/**
+ * One utterance's outcome, plus what it cost (`voice::VoiceResult`).
+ *
+ * `resolveMs` is `null` when no backend was called — silence short-circuits
+ * before the call — and the surface renders **no** timing for it rather than
+ * `0 ms`, which would claim a measurement nobody took. `backend` is present
+ * either way, because it names what *would* have answered.
+ */
+export interface VoiceResultDto {
+  outcome: VoiceOutcomeDto;
+  resolveMs: number | null;
+  backend: string;
+}
+
+/** What the microphone is doing (`voice::CaptureState`). */
+export type VoiceCaptureState = "idle" | "recording" | "transcribing" | "done" | "failed";
+
+/**
+ * What the webview is told about the microphone (`lib.rs`'s `VoiceStatus`).
+ *
+ * `available` is false exactly when `[voice] transcription` is `off`, which is
+ * the default and is a product statement rather than a degraded mode: the panel
+ * then offers typed input, renders no microphone control, and says nothing that
+ * reads as broken.
+ *
+ * `capped` is why the panel polls this between a start and a stop. From the
+ * user's side the microphone simply stopped, and a surface that did not know
+ * why would go on rendering *listening…* over a closed device.
+ */
+export interface VoiceStatusDto {
+  state: VoiceCaptureState;
+  capturedMs: number;
+  maxMs: number;
+  capped: boolean;
+  available: boolean;
+  backend: "off" | "remote";
+}
+
+/**
+ * The closed set of situations transcribing one utterance can end in
+ * (`voice::TranscriptionOutcome`).
+ *
+ * Three rather than two, and the third is the point: `not_configured` is
+ * neither a transcript nor a failure, and rendering it as either is the mistake
+ * calling `off` a product statement exists to avoid.
+ */
+export type VoiceTranscriptionOutcomeDto =
+  | { kind: "heard"; transcript: string; sentence: string }
+  | { kind: "not_configured"; detail: string; sentence: string }
+  | { kind: "failed"; detail: string; sentence: string };
+
+/**
+ * One recording's transcription, plus what it cost
+ * (`voice::VoiceTranscription`).
+ *
+ * The mirror of {@link VoiceResultDto} for the stage in front of it: a user who
+ * waited six seconds is owed the split between transcribing and resolving, so
+ * each stage reports its own number.
+ */
+export interface VoiceTranscriptionDto {
+  outcome: VoiceTranscriptionOutcomeDto;
+  transcribeMs: number | null;
+  backend: string;
+  audioMs: number;
+}
 
 /**
  * Mirrors `DesktopSettings::default()`; used when nothing is stored yet.
@@ -486,7 +703,36 @@ export function normalizeDesktopSettings(value: unknown): DesktopSettingsDto {
     version: typeof record.version === "number" && Number.isFinite(record.version) ? record.version : DEFAULT_DESKTOP_SETTINGS.version,
     appearance: { mode },
     endpoints: normalizeEndpointSettings(record.endpoints),
+    voice: normalizeVoiceSettings(record.voice),
     zoom: { level: clampZoom(zoom.level) },
+  };
+}
+
+/**
+ * Coerce the `[voice]` section, **preserving absence** (PRD #802 M4).
+ *
+ * The same shape as `normalizeEndpointSettings` and for the same reason:
+ * `undefined` in, `undefined` out, because `normalizeDesktopSettings` builds a
+ * fresh object with a fixed key set and a section this function fabricated
+ * would be merged over the user's file by `desktop_set_settings`. A section
+ * that IS present is rebuilt field by field — no spread, which
+ * `xtask/linkage-check` refuses here for the credential reason the parent has
+ * one.
+ *
+ * An unrecognised token falls back to this build's default rather than
+ * propagating, matching the folding deserializers on the Rust side. The cost is
+ * the same one those carry and is worth knowing: a token a NEWER build wrote is
+ * replaced rather than preserved.
+ */
+function normalizeVoiceSettings(value: unknown): VoiceSettingsDto | undefined {
+  if (typeof value !== "object" || value === null) return undefined;
+  const record = value as Record<string, unknown>;
+  const pick = (raw: unknown, allowed: readonly string[], fallback: string): string =>
+    allowed.find((candidate) => candidate === raw) ?? fallback;
+  return {
+    activation: pick(record.activation, VOICE_ACTIVATION_MODES, DEFAULT_VOICE_SETTINGS.activation),
+    intent: pick(record.intent, VOICE_INTENT_BACKENDS, DEFAULT_VOICE_SETTINGS.intent),
+    transcription: pick(record.transcription, VOICE_TRANSCRIPTION_BACKENDS, DEFAULT_VOICE_SETTINGS.transcription),
   };
 }
 
@@ -796,6 +1042,94 @@ export interface DeckBridge {
    * only when the call itself could not be made.
    */
   testEndpoint(settings: DesktopSettingsDto, selection: string): Promise<EndpointTestReportDto>;
+  /**
+   * Whether a credential is stored under `id`, without reading it (PRD #802 M4).
+   *
+   * Never rejects for "I could not find out": that comes back as
+   * `problem`, because it is a different answer from "nothing is stored" and a
+   * panel has to be able to tell them apart.
+   */
+  secretStatus(id: VoiceSecretId): Promise<SecretStatusDto>;
+  /**
+   * Replace the credential stored under `id`, resolving with the new status.
+   *
+   * **Rejects when the store failed.** The outcome PRD #802 designs against is a
+   * user who thinks their key is stored and finds voice broken tomorrow, so a
+   * failure is never a resolved promise carrying `stored: false` — the caller's
+   * `catch` is what shows the sentence.
+   */
+  storeSecret(id: VoiceSecretId, secret: string): Promise<SecretStatusDto>;
+  /** Forget the credential stored under `id`. Rejects when the store failed. */
+  forgetSecret(id: VoiceSecretId): Promise<SecretStatusDto>;
+  /**
+   * State which screen is mounted, so the next {@link resolveVoice} is
+   * validated against it (PRD #802 M6).
+   *
+   * **It is a declaration rather than an argument of `resolveVoice`, and that is
+   * the whole shape of the resolve seam.** An utterance is resolved against the
+   * live state the app already holds, and every piece of that state is read
+   * where it already lives: the agent list Rust-side from the deck's own
+   * snapshot, the command table from the binary it was embedded in. The mounted
+   * screen is the one piece that lives ONLY in the webview — it is React state,
+   * a `useState<DeckView>` in `DeckShell` — so it is the one piece the webview
+   * has to state. `resolveVoice` then takes the utterance and nothing else.
+   *
+   * Synchronous, and called immediately before each resolve rather than from an
+   * effect: a declaration that lagged a navigation would validate the next
+   * utterance against the screen the user just left, which is exactly the
+   * `unavailable` outcome misfiring.
+   */
+  declareVoiceScreen(screen: VoiceScreen): void;
+  /**
+   * Take one utterance — typed, or transcribed from the microphone — to an
+   * outcome carrying the sentence to show (PRD #802 M6).
+   *
+   * **The same call for both**, which is what makes the spoken path and the
+   * typed path one path: a transcript from {@link voiceStop} goes in here
+   * exactly as the text of the panel's own box does, so nothing downstream can
+   * treat them differently.
+   *
+   * Never rejects for a refusal: an action outside the table, an action this
+   * screen cannot run, a param that resolves to nothing — each is a classified
+   * outcome with its own rendered sentence, because each is something the user
+   * has to be told rather than a fault of the call. It rejects only when the
+   * call itself could not be made.
+   */
+  resolveVoice(utterance: string): Promise<VoiceResultDto>;
+  /**
+   * Open the microphone (PRD #802 M7's `desktop_voice_start`).
+   *
+   * **Rejects with the not-configured sentence when transcription is `off`**,
+   * even though {@link voiceStatus} already said so: a user can change the
+   * setting between the two calls, so the refusal is where the guarantee is and
+   * the status is only what decides whether to offer the control.
+   */
+  voiceStart(): Promise<VoiceStatusDto>;
+  /**
+   * Close the microphone and transcribe what it heard
+   * (`desktop_voice_stop`).
+   *
+   * Stop transcribes rather than handing back a buffer, so no audio crosses the
+   * IPC boundary — see the Rust command's own note. What arrives here is a
+   * transcript and nothing else.
+   */
+  voiceStop(): Promise<VoiceTranscriptionDto>;
+  /**
+   * What the microphone is doing, and whether one is offered at all
+   * (`desktop_voice_status`).
+   *
+   * Polled between a start and a stop, because it is the only way the surface
+   * learns the length cap ended the recording on its own.
+   */
+  voiceStatus(): Promise<VoiceStatusDto>;
+  /**
+   * Abandon a recording without transcribing it (`desktop_voice_cancel`).
+   *
+   * Idempotent and never refused, because a closed panel, an escape key and a
+   * failed start can each arrive in any state and a caller that had to know
+   * which one it was in would get it wrong.
+   */
+  voiceCancel(): Promise<VoiceStatusDto>;
   /**
    * States the WHOLE set of agents whose terminal is on screen right now
    * (PRD #745 M7). Attach follows this and nothing else — not `connect()`, not
@@ -1390,6 +1724,96 @@ class FixtureDeckBridge implements DeckBridge {
       clientProtocolVersion: 0,
       clientBuildVersion: "browser-preview",
     };
+  }
+
+  /**
+   * The browser preview has no OS keychain, and it deliberately does not
+   * pretend otherwise (PRD #802 M4).
+   *
+   * There is no in-memory stand-in here, which is the whole point: a preview
+   * that "stored" a key would put a real credential somewhere — this class's
+   * only persistence is `localStorage`, which is the exact half of PRD #803's
+   * rule the settings-secret guard pins. So the preview reports the same
+   * situation a headless Linux box does, the panel renders the same sentence,
+   * and the browser tier gets to drive that state without a keychain anywhere
+   * near it.
+   */
+  async secretStatus(): Promise<SecretStatusDto> {
+    await Promise.resolve();
+    return {
+      stored: false,
+      problem: "Browser preview — it has no OS credential store, so no key can be saved here.",
+    };
+  }
+
+  async storeSecret(): Promise<SecretStatusDto> {
+    await Promise.resolve();
+    throw new Error("Browser preview — it has no OS credential store, so no key can be saved here.");
+  }
+
+  async forgetSecret(): Promise<SecretStatusDto> {
+    await Promise.resolve();
+    throw new Error("Browser preview — it has no OS credential store, so there is nothing to forget.");
+  }
+
+  /**
+   * PRD #802 M6 — the screen the next resolve is validated against.
+   *
+   * Held rather than acted on, exactly as the live bridge holds it: a
+   * declaration is not a request, and the only thing that reads it is the next
+   * `resolveVoice`.
+   */
+  private voiceScreen: VoiceScreen = "deck";
+
+  declareVoiceScreen(screen: VoiceScreen): void {
+    this.voiceScreen = screen;
+  }
+
+  /**
+   * The whole voice backend, deterministically (PRD #802 M6).
+   *
+   * The vocabulary and every sentence it renders live in `data/fixture.ts` with
+   * the snapshots, because in this mode they ARE fixture data — see the note
+   * there for why a panel carrying its own would undo the property the pipeline
+   * is built on.
+   */
+  async resolveVoice(utterance: string): Promise<VoiceResultDto> {
+    await Promise.resolve();
+    return resolveFixtureVoice(utterance, this.voiceScreen);
+  }
+
+  /**
+   * The browser preview has no microphone and does not pretend otherwise.
+   *
+   * It reports the same state a live app reports with `[voice] transcription`
+   * set to `off` — its default — so the panel renders typed input alone, offers
+   * no microphone control, and says nothing that reads as broken. A fixture that
+   * simulated a device would make the one state this tier can honestly drive
+   * unreachable.
+   */
+  async voiceStatus(): Promise<VoiceStatusDto> {
+    await Promise.resolve();
+    return fixtureVoiceStatus();
+  }
+
+  /**
+   * Refused, with the sentence rather than a silence — the live command refuses
+   * the same way when transcription is `off`.
+   */
+  async voiceStart(): Promise<VoiceStatusDto> {
+    await Promise.resolve();
+    throw new Error("Nothing to listen with — the browser preview has no microphone.");
+  }
+
+  async voiceStop(): Promise<VoiceTranscriptionDto> {
+    await Promise.resolve();
+    return fixtureVoiceTranscription();
+  }
+
+  /** Idempotent and never refused, for the reason the live one is not. */
+  async voiceCancel(): Promise<VoiceStatusDto> {
+    await Promise.resolve();
+    return fixtureVoiceStatus();
   }
 
   /**
@@ -2627,6 +3051,77 @@ export class TauriDeckBridge implements DeckBridge {
   async testEndpoint(settings: DesktopSettingsDto, selection: string): Promise<EndpointTestReportDto> {
     const invoke = await this.getInvoke();
     return invoke<EndpointTestReportDto>("desktop_test_endpoint", { settings, selection });
+  }
+
+  /**
+   * The three credential commands (PRD #802 M4), and the one that is absent.
+   *
+   * There is no `loadSecret` and there must not be. The crate exposes no
+   * command that returns a stored credential to this side, because a value
+   * reaching here is one `JSON.stringify` from the `localStorage` half of PRD
+   * #803's rule. `SecretStore::load` exists Rust-side, where M5's and M7's
+   * backends make their network call — which is where the CSP already forces
+   * every network hop, so nothing over here needs the value.
+   *
+   * Nothing is normalised on the way back: `SecretStatusDto` is a boolean plus
+   * a sentence the crate has already scrubbed, and there is no field a
+   * malformed value could reach state or storage through. The panel bounds what
+   * it renders.
+   */
+  async secretStatus(id: VoiceSecretId): Promise<SecretStatusDto> {
+    const invoke = await this.getInvoke();
+    return invoke<SecretStatusDto>("desktop_secret_status", { id });
+  }
+
+  async storeSecret(id: VoiceSecretId, secret: string): Promise<SecretStatusDto> {
+    const invoke = await this.getInvoke();
+    return invoke<SecretStatusDto>("desktop_store_secret", { id, secret });
+  }
+
+  async forgetSecret(id: VoiceSecretId): Promise<SecretStatusDto> {
+    const invoke = await this.getInvoke();
+    return invoke<SecretStatusDto>("desktop_forget_secret", { id });
+  }
+
+  /**
+   * PRD #802 M6 — the screen the webview has stated, held until the next
+   * resolve reads it.
+   *
+   * Held here rather than sent as its own IPC call: a declaration that crossed
+   * the boundary on every navigation would be a message per screen change to
+   * serve one message per utterance, and the Rust command takes the screen as a
+   * parameter anyway. What the seam buys is that `resolveVoice` has one
+   * argument — see `DeckBridge.declareVoiceScreen`.
+   */
+  private voiceScreen: VoiceScreen = "deck";
+
+  declareVoiceScreen(screen: VoiceScreen): void {
+    this.voiceScreen = screen;
+  }
+
+  async resolveVoice(utterance: string): Promise<VoiceResultDto> {
+    const invoke = await this.getInvoke();
+    return invoke<VoiceResultDto>("desktop_voice_resolve", { utterance, screen: this.voiceScreen });
+  }
+
+  async voiceStart(): Promise<VoiceStatusDto> {
+    const invoke = await this.getInvoke();
+    return invoke<VoiceStatusDto>("desktop_voice_start");
+  }
+
+  async voiceStop(): Promise<VoiceTranscriptionDto> {
+    const invoke = await this.getInvoke();
+    return invoke<VoiceTranscriptionDto>("desktop_voice_stop");
+  }
+
+  async voiceStatus(): Promise<VoiceStatusDto> {
+    const invoke = await this.getInvoke();
+    return invoke<VoiceStatusDto>("desktop_voice_status");
+  }
+
+  async voiceCancel(): Promise<VoiceStatusDto> {
+    const invoke = await this.getInvoke();
+    return invoke<VoiceStatusDto>("desktop_voice_cancel");
   }
 
   /**

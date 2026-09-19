@@ -1,3 +1,4 @@
+import type { VoiceResultDto, VoiceScreen, VoiceStatusDto, VoiceTranscriptionDto } from "../lib/bridge";
 import type { AgentProfile, AgentSession, AgentStatus, AgentTab, DeckSnapshot, EvidenceItem, WorkflowStage } from "../types";
 
 /**
@@ -708,5 +709,160 @@ export function createFixtureSnapshot(state: FixtureState = "connected"): DeckSn
     ],
     evidence: state === "empty" ? [] : evidence.map((item) => ({ ...item })),
     profiles: DEFAULT_PROFILES.map((profile) => ({ ...profile })),
+  };
+}
+
+/**
+ * PRD #802 M6 — the deterministic stand-in for the whole voice backend.
+ *
+ * # Why the vocabulary lives HERE and not in the panel
+ *
+ * The browser tier has no Tauri runtime at all — `vite preview` serving static
+ * files — so `FixtureDeckBridge` stands in for every Rust-side stage of the
+ * pipeline: transcribe, resolve, validate, report. That makes this the fixture's
+ * *model plus its command table*, which is fixture data, exactly like the
+ * snapshots above. A panel that carried its own vocabulary would be a second
+ * resolver, and the one property PRD #802 is built on — the app renders every
+ * sentence the user reads, and renders it once — would be gone: the panel would
+ * phrase in fixture mode what Rust phrases in live mode.
+ *
+ * # Exact matching, not substring or fuzzy
+ *
+ * A fixture is one instant held still, and a deterministic preview is worth
+ * having precisely because it cannot surprise anybody. Matching is trim plus
+ * lowercase and then equality, which is also what keeps the no-match path
+ * reachable: `Go, BACK to "Deck"?!` has to resolve to nothing, and any
+ * substring rule would have it matching the deck phrases below.
+ *
+ * # Three commands rather than four
+ *
+ * `open_overview`, `open_deck` and `close_agent_view` take no params, so the
+ * fixture can answer them honestly with no resolver of its own. `open_agent` is
+ * the one left out: it would need a second `agent_ref` resolver here to reach at
+ * all — the real one, and every refusal it produces, is covered in
+ * `voice/outcome.rs` — and inventing a stand-in for it in a browser is the drift
+ * this module's placement is about.
+ *
+ * **`close_agent_view` was the fourth until the voice surface could be reached
+ * on the `agent` screen at all.** It was left out because that screen's whole
+ * background — the voice trigger included — was marked `inert` by the pane's
+ * modal fence, so a fixture row for it answered a question nothing could ask.
+ * `useInertBackground` now exempts the voice surface as a peer dialog, so the
+ * question is askable and the row is here to answer it.
+ */
+const FIXTURE_VOICE_COMMANDS: ReadonlyArray<{
+  readonly phrases: readonly string[];
+  readonly action: string;
+  readonly invoke: string;
+  readonly screens: readonly VoiceScreen[];
+  readonly unavailableHint: string;
+  readonly report: string;
+}> = [
+  {
+    phrases: ["show me every agent", "show me all the agents", "show me everything"],
+    action: "open_overview",
+    invoke: "openOverview",
+    screens: ["deck"],
+    unavailableHint: "the agent overview opens from the deck",
+    report: "Opening the agent overview.",
+  },
+  {
+    phrases: ["go back to the deck", "back to the deck", "show me the terminals"],
+    action: "open_deck",
+    invoke: "openDeck",
+    screens: ["overview"],
+    unavailableHint: "returning to the deck works from the agent overview",
+    report: "Back to the deck.",
+  },
+  {
+    // The VIEW, never the terminal pane — the same line `commands.toml` draws at
+    // this row, because the two are one word apart in speech.
+    phrases: ["close this", "close the agent view", "stop looking at this one"],
+    action: "close_agent_view",
+    invoke: "closeAgentView",
+    screens: ["agent"],
+    unavailableHint: "closing an agent view needs one open",
+    report: "Closing the agent view.",
+  },
+];
+
+/**
+ * `Heard: “<transcript>” — <situation>.`
+ *
+ * The transcript goes in verbatim, exactly as `voice::outcome`'s `heard` does:
+ * seeing what was heard is what turns a mis-transcription into a correction the
+ * user can make, so this is not the seam that bounds or scrubs it. The webview
+ * scrubs its own display copy at the render seam.
+ */
+function fixtureHeard(transcript: string, situation: string): string {
+  return `Heard: “${transcript}” — ${situation}.`;
+}
+
+/**
+ * Resolve one utterance the way the Rust pipeline would, against the screen the
+ * webview has stated.
+ *
+ * `resolveMs` is `null` and the backend is `stub` because **no backend was
+ * called** — there is none in a browser. Reporting a plausible number here
+ * would be the preview inventing a measurement, which is the same fabrication
+ * `resolve_ms: None` exists to refuse on the Rust side.
+ */
+export function resolveFixtureVoice(utterance: string, screen: VoiceScreen): VoiceResultDto {
+  const spoken = utterance.trim().toLowerCase();
+  const command = FIXTURE_VOICE_COMMANDS.find((candidate) => candidate.phrases.includes(spoken));
+  const stub = { resolveMs: null, backend: "stub" } as const;
+  if (!command) {
+    return { ...stub, outcome: { kind: "no_match", transcript: utterance, sentence: fixtureHeard(utterance, "no matching action") } };
+  }
+  if (!command.screens.includes(screen)) {
+    return {
+      ...stub,
+      outcome: { kind: "unavailable", transcript: utterance, action: command.action, hint: command.unavailableHint, sentence: `Not here — ${command.unavailableHint}.` },
+    };
+  }
+  return {
+    ...stub,
+    outcome: { kind: "dispatch", transcript: utterance, action: command.action, invoke: command.invoke, params: [], sentence: command.report },
+  };
+}
+
+/**
+ * The bound a live capture is held to, echoed so the preview reports the same
+ * shape rather than a made-up one. Keep identical to `voice::MAX_UTTERANCE`.
+ */
+const FIXTURE_VOICE_MAX_MS = 30_000;
+
+/**
+ * The microphone the browser preview does not have (PRD #802 M7).
+ *
+ * `available: false` with `backend: "off"` is the same answer a live app reports
+ * when `[voice] transcription` is `off`, which is its default — so the preview
+ * renders the state a first run renders, and the browser tier gets to drive it
+ * with no microphone, no credential and no Tauri runtime anywhere near it.
+ * `off` is a product statement rather than a degraded mode: the panel offers
+ * typed input and says what to add.
+ */
+export function fixtureVoiceStatus(): VoiceStatusDto {
+  return { state: "idle", capturedMs: 0, maxMs: FIXTURE_VOICE_MAX_MS, capped: false, available: false, backend: "off" };
+}
+
+/**
+ * What the preview says when something asks it to listen (PRD #802 M7's
+ * `TranscriptionOutcome::NotConfigured`).
+ *
+ * `not_configured` rather than `failed`, and the distinction is the point: the
+ * preview has no microphone because it is a browser, which is not a fault to
+ * report. `transcribeMs` is `null` for the reason `resolveFixtureVoice`'s is.
+ */
+export function fixtureVoiceTranscription(): VoiceTranscriptionDto {
+  return {
+    outcome: {
+      kind: "not_configured",
+      detail: "the browser preview has no microphone",
+      sentence: "Nothing to listen with — the browser preview has no microphone.",
+    },
+    transcribeMs: null,
+    backend: "off",
+    audioMs: 0,
   };
 }

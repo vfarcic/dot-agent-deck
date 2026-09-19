@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  PRD #802 M7. Merged into the bundle's generated Info.plist on macOS.
+
+  NSMicrophoneUsageDescription is not optional and its absence is not a
+  warning: macOS refuses the microphone outright to a process whose bundle does
+  not carry this key, and the string is what the OS shows in the permission
+  prompt. `desktop/src-tauri/src/voice/capture.rs` is the only thing that opens
+  a device, and it opens one only when the user presses the button.
+
+  Named explicitly from `tauri.bundle.conf.json`'s `bundle.macOS.infoPlist`
+  rather than left to Tauri's implicit lookup for a file of this name beside the
+  config, so a rename cannot silently drop it.
+
+  UNVERIFIED ON A MAC: no macOS host was available when this landed, so what is
+  proven is that the file is well-formed plist and is referenced. PRD #802's
+  Open Question 2 — whether a `tauri dev` window needs the same key, where a
+  denial would be silent — is still open and needs a Mac to close.
+-->
+<plist version="1.0">
+  <dict>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>Agent Deck listens only while you hold the microphone open, to turn a spoken command into an action.</string>
+  </dict>
+</plist>

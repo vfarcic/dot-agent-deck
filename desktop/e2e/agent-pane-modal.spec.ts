@@ -18,12 +18,25 @@ import { expect, test } from "@playwright/test";
  * observable here, against a real engine's tab order. Both engines, because
  * `inert` is a comparatively recent platform feature and WebKit is the half of
  * this pair that ships in the packaged app.
+ *
+ * **PRD #802 narrowed that claim by exactly one control, and narrowing it was
+ * the point rather than a concession.** The voice surface is a peer dialog, not
+ * background, so `useInertBackground` exempts its trigger — and an exempt
+ * control is in the tab order as well as clickable, which is the accessible
+ * half of "reachable" and not something to take back with a `tabindex`. So the
+ * loop below allows the pane OR that one trigger, by identity, and nothing
+ * else: the deck selector, the rail and the other tiles all still fail it. The
+ * vitest tier states the same narrowing the same way, as an equality against
+ * that single element rather than as an allow-list filter. The trigger cannot
+ * retarget the app the way the selector can — voice dispatches against the deck
+ * already selected — which is why this one is a peer and the selector is not.
  */
 test.describe("the agent pane is a real modal", () => {
   /**
    * Scenario: open Planner's pane from the deck, then press Tab twenty times.
-   * Focus never lands outside the pane — not on the deck selector behind it,
-   * not on the rail, not on another tile — and closing gives all of them back.
+   * Focus never lands outside the pane except on the peer Voice trigger — not on
+   * the deck selector behind it, not on the rail, not on another tile — and
+   * closing gives all of them back.
    */
   test("contains Tab inside the pane and gives the screen back on close", async ({ page }) => {
     await page.goto("/?fixture=1&state=fleet");
@@ -42,6 +55,9 @@ test.describe("the agent pane is a real modal", () => {
     // put inside the dialog.
     expect(await overlay.evaluate((node) => node.contains(document.activeElement))).toBe(true);
 
+    const voiceTrigger = page.getByTestId("voice-trigger");
+    await expect(voiceTrigger).toBeVisible();
+
     for (let press = 0; press < 20; press += 1) {
       await page.keyboard.press("Tab");
       const inside = await overlay.evaluate((node) => {
@@ -49,10 +65,17 @@ test.describe("the agent pane is a real modal", () => {
         // `<body>` is where a browser parks focus when it wraps past the last
         // tab stop, and it is not a control — only a real element outside the
         // pane would be an escape.
-        return active === null || active === document.body || node.contains(active);
+        if (active === null || active === document.body || node.contains(active)) return true;
+        // The one peer, by identity rather than by a predicate over roles: any
+        // OTHER element outside the pane is still an escape.
+        return active.getAttribute("data-testid") === "voice-trigger";
       });
-      expect(inside, `Tab #${press + 1} left the agent pane`).toBe(true);
+      expect(inside, `Tab #${press + 1} left the agent pane and the Voice trigger`).toBe(true);
     }
+
+    // And the exemption really is an exemption rather than a hole: the trigger
+    // itself is outside every `inert`, while the selector below is not.
+    expect(await voiceTrigger.evaluate((node) => node.closest("[inert]") !== null)).toBe(false);
 
     // The deck selector is not merely unfocused: it is inert, so a click cannot
     // reach it either.

@@ -944,6 +944,67 @@ export interface DeckRuntimeState {
     selection: string,
   ) => Promise<import("./lib/bridge").EndpointTestReportDto>;
   /**
+   * Whether a credential is stored, without reading it (PRD #802 M4).
+   *
+   * There is deliberately no counterpart that READS one: PRD #803's rule is
+   * that a secret goes in neither `desktop.toml` nor `localStorage`, and a
+   * value reaching this side is one `JSON.stringify` from the second half of
+   * that. The backends that need the value make their call Rust-side, which is
+   * where the CSP already forces every network hop.
+   *
+   * Never rejects for "I could not find out" — that arrives as `problem`,
+   * which is a different answer from "nothing is stored".
+   */
+  secretStatus: (
+    id: import("./lib/bridge").VoiceSecretId,
+  ) => Promise<import("./lib/bridge").SecretStatusDto>;
+  /**
+   * Replace a stored credential, resolving with the new status.
+   *
+   * **Rejects when the store failed**, so a failure can never render as a
+   * saved key — which is the outcome PRD #802 M4 is written against.
+   */
+  storeSecret: (
+    id: import("./lib/bridge").VoiceSecretId,
+    secret: string,
+  ) => Promise<import("./lib/bridge").SecretStatusDto>;
+  /** Forget a stored credential. Rejects when the store failed. */
+  forgetSecret: (
+    id: import("./lib/bridge").VoiceSecretId,
+  ) => Promise<import("./lib/bridge").SecretStatusDto>;
+  /**
+   * Voice control (PRD #802 M6): resolve one utterance into an outcome carrying
+   * the sentence to show, and drive the microphone that can produce one.
+   *
+   * **All six are optional, and absence is a real state rather than an
+   * oversight.** A runtime with no `resolveVoice` cannot run a voice command at
+   * all, so the surface offers no Voice control for it — the same reasoning the
+   * microphone gets one layer down, where `available: false` renders no mic
+   * rather than a broken-looking one. A control that opened onto a panel with
+   * nothing behind it would be worse than its absence, and several of this app's
+   * render-only test runtimes are exactly that shape.
+   *
+   * `declareVoiceScreen` states which screen a command would run against. It is
+   * a declaration rather than a parameter of `resolveVoice` because the mounted
+   * screen is the one piece of live state that exists ONLY in the webview; see
+   * `DeckBridge.declareVoiceScreen` for the whole of that seam.
+   */
+  declareVoiceScreen?: (screen: import("./lib/bridge").VoiceScreen) => void;
+  resolveVoice?: (utterance: string) => Promise<import("./lib/bridge").VoiceResultDto>;
+  /** Open the microphone. Rejects with the not-configured sentence when transcription is off. */
+  voiceStart?: () => Promise<import("./lib/bridge").VoiceStatusDto>;
+  /** Close the microphone and transcribe what it heard. No audio crosses the boundary. */
+  voiceStop?: () => Promise<import("./lib/bridge").VoiceTranscriptionDto>;
+  /**
+   * What the microphone is doing, and whether one is offered at all.
+   *
+   * Polled between a start and a stop, because it is the only way the surface
+   * learns the length cap ended the recording on its own.
+   */
+  voiceStatus?: () => Promise<import("./lib/bridge").VoiceStatusDto>;
+  /** Abandon a recording without transcribing it. Idempotent and never refused. */
+  voiceCancel?: () => Promise<import("./lib/bridge").VoiceStatusDto>;
+  /**
    * Scale the whole window, terminals included (PRD #744).
    *
    * Applying only — the level is persisted through `saveSettings`, behind a

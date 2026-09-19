@@ -38,7 +38,147 @@ tauri = { version = "2", features = [] }
 # comments, inline-array/inline-table spelling, key order and blank-line
 # grouping survive a write. `toml::Table` models DATA, so it could not.
 toml_edit = { version = "0.25", features = ["serde"] }
-tokio = { version = "1", features = ["sync", "time"] }
+# PRD #802 M5 added `process` and `rt` to what was `["sync", "time"]`.
+#
+# `process` is the agent-CLI intent backend spawning `claude`
+# (`voice/agent_cli.rs`). It has to be the ASYNC Command: the resolver runs on
+# the Tauri runtime, and a `std::process` wait of 3-5s there is an app that
+# stops repainting for the length of every utterance. `kill_on_drop` is also
+# what makes "the child is killed before returning" a property of the mechanism
+# rather than of a line that a later edit could skip.
+#
+# `rt` is `spawn_blocking`, and it has exactly one caller: the lazy
+# login-shell PATH capture, which runs an interactive login shell and is
+# bounded by a 10s `CAPTURE_TIMEOUT`. That is blocking by nature and must not
+# be on a runtime thread.
+#
+# Neither adds a dependency or a line of new code to the workspace build: the
+# root package already declares `tokio` with `full`, so both were reachable
+# here by feature unification. Declaring them is the same discipline the
+# dev-dependency block below states — a change over there cannot silently take
+# this crate's backends out.
+tokio = { version = "1", features = ["process", "rt", "sync", "time"] }
+# PRD #802 M5: the keyed remote intent backend's one HTTPS request
+# (`voice/remote.rs`). The CSP leaves no alternative to making it here —
+# `tauri.conf.json`'s `connect-src` names `ipc:` and `http://ipc.localhost` and
+# nothing else, so the webview cannot reach a network origin and read the reply
+# — and the credential is already Rust-side anyway.
+#
+# NOT A NEW DEPENDENCY, in the sense that costs anything: the root package
+# declares reqwest 0.13 with this exact spec, this crate already links the root
+# package, and the lockfile carries exactly one `reqwest`. The version, the
+# `default-features = false` and the two features are copied verbatim from
+# there so cargo resolves one build of it rather than two feature sets of one.
+#
+# `rustls` rather than a native-TLS feature, and no roots feature named, for the
+# root package's stated reason: 0.13 renamed 0.12's `rustls-tls` and brought its
+# own root-certificate source, and 0.13.4 removed the `webpki-roots` /
+# `rustls-native-certs` names 0.13.1 offered — so pinning one breaks on the next
+# patch bump. `rustls` is the one name stable across 0.13.
+reqwest = { version = "0.13", default-features = false, features = [
+  "rustls",
+  "json",
+] }
+# PRD #802 M4: the OS keychain behind `secrets.rs`'s `SecretStore`, which is the
+# seam PRD #803 M5 named and deliberately did not build. Genuinely new — no
+# crate here declares `keyring`, `secret-service`, `security-framework` or
+# `stronghold`, and what exists is credential *detection* in the e2e harness,
+# which reads and never writes — so it is a cost rather than an incidental, and
+# this is the accounting.
+#
+# Narrower than PRD #802's own wording, which says those four are "at zero
+# matches workspace-wide". That holds for what a crate DECLARES and not for the
+# lockfile: `security-framework 3.7.0` is already in it, reaching the graph on
+# macOS through `reqwest` -> `rustls-platform-verifier`. It changes nothing
+# about this being a new dependency; it is worth saying because the Apple
+# backend below is a second consumer of a crate already there rather than a new
+# tree.
+#
+# WHY A DEPENDENCY AT ALL. #803's rule is that a secret never goes in
+# `desktop.toml` and never in `localStorage`, and
+# `xtask/linkage-check`'s ALLOWED_FIELD_TYPES enforces the first half by
+# refusing a `String` in the settings schema. That leaves the credential
+# somewhere else by construction, and the OS keychain is where #803 said it
+# goes. The alternative it named — an owner-only file in the config directory —
+# stays available as a fallback and is not what this PR builds.
+#
+# DEFAULT FEATURES, DELIBERATELY. `default = ["v1"]` selects one store per
+# target and none of them needs a system dev package, which is the property that
+# made this acceptable: `apple-native-keyring-store` (the Security framework) on
+# macOS, `windows-native-keyring-store` (`windows-sys`) on Windows, and
+# `zbus-secret-service-keyring-store` on Linux and the other unixes. Each is
+# target-gated in `keyring`'s own manifest, so Windows never compiles the zbus
+# tree and Linux never compiles the Apple one.
+#
+# How much of that was verified, because the three are not equal: the Linux one
+# BUILT here with nothing added, and the Windows one TYPE-CHECKED through
+# `scripts/windows-cross-check.sh`. The macOS one is read from the manifest and
+# from its dependency `security-framework`, which was already in this
+# workspace's lockfile before this change; `build-macos` is what proves it.
+#
+# The two Linux alternatives were each worse in a stated way: the
+# `dbus-secret-service` backend binds `libdbus` and would need `libdbus-1-dev`
+# in `tauri-deps/flake.nix` and both `apt-get` blocks in `ci.yml` — the
+# three-file shape M7's `alsa-lib` will take — while `linux-keyutils` needs no
+# package and keeps its keys in the kernel, where they do not survive a reboot,
+# which a user experiences as the app forgetting their key overnight.
+#
+# WHAT IT COSTS. 59 new lockfile entries, dominated by zbus and by
+# `secret-service`'s pure-Rust crypto (`aes`, `cbc`, `hkdf`, `hmac`, `sha2`,
+# `num-bigint` for the session key exchange). Measured on this branch, 16 cores:
+# building all 59 from a clean slate took 13.9s wall / 66s CPU and produced
+# 210 MiB of artifacts; warm it is a no-op, and neither `cargo test-fast` nor
+# rule 2's clippy command moved. `crypto-rust` is what `keyring` pins for both
+# secret-service backends, so no `openssl` and no `vendored` C build enters the
+# graph.
+keyring = "4"
+# PRD #802 M7: microphone capture (`voice/capture.rs`). THE one native
+# dependency this PRD takes, and the accounting is the PRD's own.
+#
+# WHY RUST-SIDE AT ALL. The webview cannot do it on the platforms this app
+# ships to. Read from `wry` 0.55.1: WKWebView grants capture unconditionally,
+# WebView2's permission handler is wired only for the clipboard, and the
+# WebKitGTK backend connects no `permission-request` signal and never sets
+# `enable-media-stream` — so a `getUserMedia` path would ship a macOS-only
+# feature. Capturing here also removes the AudioWorklet, the CSP question and
+# the three-engine matrix at once, and the audio has to reach this process
+# anyway because the CSP forces every network hop Rust-side.
+#
+# WHY NOT BEHIND A CARGO FEATURE, which is the tempting way to keep it out of
+# the workspace gate: that reproduces the hole class this repo has closed three
+# times (#407, #436, #502) — code behind a feature nobody's gate enables is
+# type-checked by nothing and lints clean by compiling nothing. Rule 2's clippy
+# command names `e2e,e2e-live` for exactly that reason.
+#
+# DEFAULT FEATURES, which is `default = []` — cpal declares no default feature
+# content at all, so `jack` and `asio` (the two that would drag in a system
+# library or a vendored SDK) stay off. What it resolves to per platform:
+# `alsa` + `libc` + `dasp_sample` on Linux, the `objc2-*`/`coreaudio-rs`
+# CoreAudio tree on Apple, `windows`/`windows-core` on Windows.
+#
+# WHAT IT COSTS ON LINUX, and this is the whole reason M7 is last: `alsa-sys`
+# resolves `alsa` through pkg-config, so the dev headers have to be declared
+# everywhere this repo declares system dependencies — `tauri-deps/flake.nix`
+# (which is what a `devbox shell` reads), both `apt-get` blocks in
+# `.github/workflows/ci.yml`, and the bundle job's block in `release.yml`.
+# macOS needs nothing for CoreAudio and Windows nothing for WASAPI, so the edit
+# is Linux-shaped. No CMake, no bundled C++ tree, no model and no new build
+# toolchain — a Rust binding to a library the platform already has, which is
+# why this dependency is acceptable where an inference engine is not.
+cpal = "0.18"
+# PRD #802 M7: the multipart boundary for one transcription upload
+# (`voice/transcribe.rs`). NOT a new dependency in any sense that costs
+# anything — the root package declares `getrandom = "0.3"` for the hook
+# capability token, this crate already links the root package, and the lockfile
+# carries exactly one of it. Declaring it is the discipline the `tokio` entry
+# above states: a change over there cannot silently take this crate's uploads
+# out.
+#
+# Randomness rather than a counter because the boundary has to be a byte
+# sequence the BODY cannot contain, and the body is a WAV whose samples are
+# arbitrary. Deliberately `getrandom` and not `rand`, for the root package's
+# reason: the whole requirement is "N bytes from the operating system".
+getrandom = "0.3"
 
 [dev-dependencies]
 # The `#[tokio::test]` attribute needs `macros` + `rt`, and the scripted-socket
@@ -72,10 +212,31 @@ tempfile = "3"
 # fold tests in `agent_view.rs` have to build one. Tests only — nothing under
 # `src/` names chrono, and the same version the root package resolves.
 chrono = "0.4"
+# PRD #802's landed-work security audit: `voice/http.rs`'s body cap has to be
+# driven with real `reqwest::Response` values, and `From<http::Response<T>> for
+# Response` is the one way to build one WITHOUT opening a socket — which is the
+# rule every test in this feature already follows. Tests only, and the same
+# `http` the lockfile already carries for reqwest, so the `From` impl applies.
+http = "1"
 
-# PRD #803: the settings-path guard rejects a FIFO, and `mkfifo(3)` is the only
-# way to build one to prove it. Tests only — nothing under `src/` uses libc.
-[target.'cfg(unix)'.dev-dependencies]
+# Two callers, both Unix-only.
+#
+# PRD #802's landed-work security audit put the agent-CLI intent backend's child
+# in its own process group (`voice/agent_cli.rs`), so a timeout tears down the
+# whole containment unit rather than the direct child: `tokio`'s
+# `Command::process_group` sets the group up and `libc::killpg` is what takes it
+# down. `kill_on_drop` alone signals one pid, which is how a `sleep` started by
+# a timed-out CLI outlived the twenty-second bound with this app's descriptors
+# still open.
+#
+# PRD #803's settings-path guard rejects a FIFO, and `mkfifo(3)` is the only way
+# to build one to prove it — that caller is a test.
+#
+# Not a new dependency in any sense that costs anything: it was already here as
+# a dev-dependency under this exact spec, the root package's graph carries it on
+# every Unix target (`cpal` -> `alsa-sys` on Linux alone), and the lockfile has
+# exactly one of it.
+[target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 # Issue #845: `tauri::test::MockRuntime`, which the two appearance tests that

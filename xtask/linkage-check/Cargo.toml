@@ -19,6 +19,13 @@ regex = "1"
 # on top of what the `#[spec]` binding already uses. Pure feature — it pulls no
 # new crate into Cargo.lock.
 syn = { version = "3", features = ["full", "parsing", "visit"] }
+# PRD #802 M3 (check 13) reads `desktop/src-tauri/src/voice/commands.toml`. The
+# same library `voice/table.rs` parses it with, deliberately: two readers of one
+# file is two answers about what the file says, and the lenient one always wins
+# by accepting what the strict one rejected. No new crate in Cargo.lock — the
+# root package and the desktop crate both already declare toml_edit 0.25, and
+# this needs the DOM only, so no feature is turned on.
+toml_edit = "0.25"
 xtask-docs = { path = "../docs" }
 
 # `clean-e2e-tmp` needs two libc calls that have no std equivalent:

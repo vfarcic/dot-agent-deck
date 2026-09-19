@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createFixtureSnapshot } from "../data/fixture";
 import { createDeckBridge, selectRuntimeMode } from "../lib/bridge";
-import type { DesktopSettingsDto } from "../lib/bridge";
+import type { DesktopSettingsDto, VoiceScreen, VoiceSecretId } from "../lib/bridge";
 import { agentKey } from "../lib/agentKey";
 import { applyTerminalChunk } from "../lib/terminalBuffer";
 const EMPTY_TERMINAL_DATA: Record<string, TerminalBuffer> = {};
@@ -316,6 +316,35 @@ export function useDeckRuntime(): DeckRuntimeState {
     [bridge],
   );
 
+  // PRD #802 M4. Not wrapped in the `setError` bookkeeping `runAction` uses,
+  // for `testEndpoint`'s reason: every outcome here is something the settings
+  // panel renders in place, and routing "your keychain is locked" into the
+  // deck's global error toast would present a settings answer as a fault of
+  // the screen behind it.
+  const secretStatus = useCallback((id: VoiceSecretId) => bridge.secretStatus(id), [bridge]);
+  const storeSecret = useCallback((id: VoiceSecretId, secret: string) => bridge.storeSecret(id, secret), [bridge]);
+  const forgetSecret = useCallback((id: VoiceSecretId) => bridge.forgetSecret(id), [bridge]);
+
+  /*
+   * PRD #802 M6: the voice seam. Every one is wrapped so its identity is stable
+   * for the lifetime of the bridge, which is load-bearing rather than tidy here
+   * — `useDeckRuntime` returns a fresh object on every render, and the panel
+   * polls `voiceStatus` from an effect and cancels from another. An identity
+   * that changed per render would restart that poll on every commit.
+   *
+   * Not wrapped in the `setError` bookkeeping `runAction` uses, for
+   * `secretStatus`' reason: every outcome here is a sentence the panel renders
+   * in place — including every refusal, which is what an outcome IS — and
+   * routing "no matching action" into the deck's global error toast would
+   * present a voice answer as a fault of the screen behind it.
+   */
+  const declareVoiceScreen = useCallback((screen: VoiceScreen) => bridge.declareVoiceScreen(screen), [bridge]);
+  const resolveVoice = useCallback((utterance: string) => bridge.resolveVoice(utterance), [bridge]);
+  const voiceStart = useCallback(() => bridge.voiceStart(), [bridge]);
+  const voiceStop = useCallback(() => bridge.voiceStop(), [bridge]);
+  const voiceStatus = useCallback(() => bridge.voiceStatus(), [bridge]);
+  const voiceCancel = useCallback(() => bridge.voiceCancel(), [bridge]);
+
   const sendTerminalInput = useCallback((target: AgentTarget, data: string) => bridge.sendTerminalInput(target, data), [bridge]);
   const resizeTerminal = useCallback((target: AgentTarget, cols: number, rows: number) => bridge.resizeTerminal(target, cols, rows), [bridge]);
   // Stable for the lifetime of the bridge, because the screens declare their
@@ -372,6 +401,15 @@ export function useDeckRuntime(): DeckRuntimeState {
     getSettings,
     saveSettings,
     testEndpoint,
+    secretStatus,
+    storeSecret,
+    forgetSecret,
+    declareVoiceScreen,
+    resolveVoice,
+    voiceStart,
+    voiceStop,
+    voiceStatus,
+    voiceCancel,
     setZoom,
   };
 }
