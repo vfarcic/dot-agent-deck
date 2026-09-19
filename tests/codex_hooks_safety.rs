@@ -1375,10 +1375,10 @@ fn codex_hooks_008_a_surplus_deck_rule_is_dropped_without_moving_the_user() {
     );
 }
 
-/// Scenario: Install over a Codex home holding the deck's command in the legacy flat `{"command": …}` rule shape, in the two arrangements that get opposite answers — the flat rule reached before any nested deck handler, and one reached after it. The first must fall back to the old strip-then-append path, the second must be swept away so the deck's hook cannot fire twice, and neither may leave a second deck command behind.
+/// Scenario: Install over a Codex home holding the deck's command in the legacy flat `{"command": …}` rule shape, in the two arrangements that get opposite answers — the flat rule reached before any nested deck handler, and one reached after it. The first must fall back to the old strip-then-append path and the second must be swept, and neither may leave a second deck command behind.
 #[spec("codex/hooks/009")]
 #[test]
-fn codex_hooks_009_a_legacy_flat_deck_rule_is_swept_rather_than_left_to_fire_twice() {
+fn codex_hooks_009_a_legacy_flat_deck_rule_is_swept_without_disturbing_the_nested_ones() {
     let deck_command = format!("{DECK_BINARY} {DECK_COMMAND_SUFFIX}");
     let flat = json!({ "command": deck_command });
     let nested = json!({ "hooks": [ { "type": "command", "command": deck_command } ] });
@@ -1401,8 +1401,10 @@ fn codex_hooks_009_a_legacy_flat_deck_rule_is_swept_rather_than_left_to_fire_twi
     );
 
     // Arm 2 — the flat rule comes AFTER a nested one, so the nested one is
-    // claimed and refreshed in place and the flat one is surplus. Not claiming
-    // it means falling back; not removing it would mean running it.
+    // claimed and refreshed in place and the flat one is surplus. Removing it
+    // is measurably safe rather than hopefully so: a rule with no `hooks` array
+    // contributes no listed entry at all on 0.149.0, so it holds no trust key
+    // and taking its `command` out moves nothing.
     let home = test_temp::tempdir().expect("create Codex home");
     write_hooks(
         home.path(),
@@ -1412,7 +1414,7 @@ fn codex_hooks_009_a_legacy_flat_deck_rule_is_swept_rather_than_left_to_fire_twi
     assert_eq!(
         deck_commands_for(home.path(), "PreToolUse"),
         vec![expected_hook_command(DECK_BINARY)],
-        "a trailing flat deck rule must be swept, or the deck's hook fires twice"
+        "a trailing flat deck rule must be swept out of a file the deck keeps tidy"
     );
     let rules = read_hooks(home.path())["hooks"]["PreToolUse"]
         .as_array()
@@ -1427,5 +1429,103 @@ fn codex_hooks_009_a_legacy_flat_deck_rule_is_swept_rather_than_left_to_fire_twi
         rules.len(),
         3,
         "the rule the flat command vacated is kept so no later index moves: {rules:?}"
+    );
+}
+
+/// Scenario: Seed one Codex rule holding the deck's command twice with the user's own handler last — the shape where dropping the surplus copy would slide the user's handler down a slot — then install. The user's handler must keep `handler_idx` 2, because Codex keys their trust record to it.
+#[spec("codex/hooks/010")]
+#[test]
+fn codex_hooks_010_a_surplus_handler_is_not_dropped_out_from_under_a_user() {
+    let home = test_temp::tempdir().expect("create Codex home");
+    let deck_command = expected_hook_command(DECK_BINARY);
+    write_hooks(
+        home.path(),
+        &json!({
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": "Bash",
+                    "hooks": [
+                        { "type": "command", "command": deck_command },
+                        { "type": "command", "command": deck_command },
+                        { "type": "command", "command": "/usr/bin/env USER_HOOK=1" },
+                    ]
+                }]
+            }
+        }),
+    );
+    let before = trust_keys_for(home.path(), "pre_tool_use", "PreToolUse");
+
+    install_to(home.path(), DECK_BINARY).expect("install");
+
+    let after = trust_keys_for(home.path(), "pre_tool_use", "PreToolUse");
+    // Greptile's P1 on PR #1166. The first draft of the in-place refresh removed
+    // every surplus copy wherever it sat, which slid this user's handler from
+    // `pre_tool_use:0:2` to `:0:1` — the same re-keying the whole change exists
+    // to stop, one level down from the `group_idx` it had already fixed. The
+    // surplus copy is kept and refreshed instead: the deck's own hook firing
+    // twice is the cheaper side of the trade against losing a user's grant.
+    assert_eq!(
+        after, before,
+        "dropping a surplus deck handler must not slide a user's handler down a slot"
+    );
+    let rules = read_hooks(home.path())["hooks"]["PreToolUse"]
+        .as_array()
+        .expect("PreToolUse array")
+        .clone();
+    assert_eq!(
+        rules[0]["hooks"][2]["command"],
+        json!("/usr/bin/env USER_HOOK=1"),
+        "the user's handler must still be the third: {rules:?}"
+    );
+    // The kept copy is REFRESHED, not merely left: a stale dead pin left in
+    // place is an exec failure on every event, where a duplicate is not.
+    for index in [0usize, 1] {
+        assert_eq!(
+            rules[0]["hooks"][index]["command"],
+            json!(deck_command),
+            "both surviving deck handlers must carry the current command: {rules:?}"
+        );
+    }
+}
+
+/// Scenario: Seed a rule whose trailing handlers are all the deck's own surplus copies, with nothing of the user's after them, then install. Those copies must actually be removed, so the tail rule is a real sweep rather than a blanket refusal to tidy.
+#[spec("codex/hooks/011")]
+#[test]
+fn codex_hooks_011_a_trailing_surplus_handler_is_still_swept() {
+    let home = test_temp::tempdir().expect("create Codex home");
+    let deck_command = expected_hook_command(DECK_BINARY);
+    write_hooks(
+        home.path(),
+        &json!({
+            "hooks": {
+                "PreToolUse": [{
+                    "hooks": [
+                        { "type": "command", "command": deck_command },
+                        { "type": "command", "command": "/usr/bin/env USER_HOOK=1" },
+                        { "type": "command", "command": deck_command },
+                        { "type": "command", "command": deck_command },
+                    ]
+                }]
+            }
+        }),
+    );
+
+    install_to(home.path(), DECK_BINARY).expect("install");
+
+    let rules = read_hooks(home.path())["hooks"]["PreToolUse"]
+        .as_array()
+        .expect("PreToolUse array")
+        .clone();
+    let handlers = rules[0]["hooks"].as_array().expect("handlers").clone();
+    assert_eq!(
+        handlers.len(),
+        2,
+        "both trailing surplus copies must go — nothing of the user's follows them: {rules:?}"
+    );
+    assert_eq!(handlers[0]["command"], json!(deck_command));
+    assert_eq!(
+        handlers[1]["command"],
+        json!("/usr/bin/env USER_HOOK=1"),
+        "the user's handler keeps handler_idx 1: {rules:?}"
     );
 }

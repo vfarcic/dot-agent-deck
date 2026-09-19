@@ -4212,11 +4212,24 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 - **Does not assert:** that duplicates can still be created (this install path creates none); the trust write itself (`codex/trust/002`–`003`). That a kept-but-empty rule really does consume its `group_idx` is measured rather than assumed — probed against codex-cli 0.149.0 in both shapes the sweep can leave, `{"hooks": []}` and a bare `{}`, where the handlers either side reported `pre_tool_use:0:0` and `pre_tool_use:2:0` with no warnings and no errors — but that is a property of Codex, not of this test.
 - **Platform coverage:** mac+linux.
 
-##### codex/hooks/009 — A legacy flat deck rule is swept rather than left to fire twice (issue #1034).
+##### codex/hooks/009 — A legacy flat deck rule is swept without disturbing the nested ones (issue #1034).
 - **Layer:** L1/fast in-process `install_to` against an isolated Codex home.
 - **Agent:** none (`hooks.json` is the subject; no `codex` process is involved).
-- **Asserts:** across the two arrangements the in-place refresh answers differently — the legacy flat `{"command": …}` deck rule reached BEFORE any nested deck handler, and one reached after it — a single install leaves the deck's command present exactly once either way. In the trailing arm, where a nested handler is claimed and refreshed in place, the user's rule additionally keeps its `group_idx` and the rule the flat command vacated is kept so no later index moves.
-- **Does not assert:** that the leading arm preserves positions — it deliberately does not, since an unclaimed array falls back to the pre-#1034 strip-then-append path; how Codex indexes a handler inside a flat rule (unmeasured, which is why that shape claims nothing).
+- **Asserts:** across the two arrangements the in-place refresh answers differently — the legacy flat `{"command": …}` deck rule reached BEFORE any nested deck handler, and one reached after it — a single install leaves the deck's command present exactly once either way. In the trailing arm, where a nested handler is claimed and refreshed in place, the user's rule additionally keeps its `group_idx` and the rule the flat command vacated is kept so no later index moves. Removing a flat `command` is measurably safe: on 0.149.0 a rule carrying no `hooks` array contributes no listed entry at all, so it holds no trust key of its own — which also means it never ran, so the sweep is tidying rather than a duplicate-fire fix.
+- **Does not assert:** that the leading arm preserves positions — it deliberately does not, since an unclaimed array falls back to the pre-#1034 strip-then-append path; how Codex would index a handler inside a flat rule if it ever supported one (it lists none today, which is why that shape claims nothing).
+- **Platform coverage:** mac+linux.
+
+##### codex/hooks/010 — A surplus deck handler is not dropped out from under a user's handler (issue #1034, Greptile P1 on PR #1166).
+- **Layer:** L1/fast in-process `install_to` against an isolated Codex home.
+- **Agent:** none (`hooks.json` is the subject; no `codex` process is involved).
+- **Asserts:** with one rule holding the deck's command twice and the user's own handler last, an install leaves the full position list unchanged — the user keeps `handler_idx` 2 — and both surviving deck handlers carry the refreshed command rather than a stale one. The first draft of the in-place refresh removed every surplus copy wherever it sat, sliding this user from `pre_tool_use:0:2` to `:0:1`, which is the same re-keying the change exists to stop, one level below the `group_idx` it had already fixed.
+- **Does not assert:** that the deck's hook does not then fire twice — it does, and that is the accepted trade against losing a user's grant; the trailing case, where the sweep does remove (`codex/hooks/011`).
+- **Platform coverage:** mac+linux.
+
+##### codex/hooks/011 — A trailing surplus deck handler is still swept (issue #1034).
+- **Layer:** L1/fast in-process `install_to` against an isolated Codex home.
+- **Agent:** none (`hooks.json` is the subject; no `codex` process is involved).
+- **Asserts:** with a rule whose last two handlers are the deck's own surplus copies and nothing of the user's after them, one install removes both and leaves the user's handler at `handler_idx` 1 — so the tail-only rule is a real sweep rather than a blanket refusal to tidy, which is what keeps `codex/hooks/010` from being satisfied by doing nothing at all.
 - **Platform coverage:** mac+linux.
 
 #### codex/live

@@ -272,8 +272,18 @@ fn command_is_replaceable(command: &str, binary_path: &str) -> bool {
 /// What it claims, and the order it looks in, is `strip_deck_commands`'s own
 /// walk order — rules in order, and within a rule its nested `hooks` handlers in
 /// order — so the FIRST replaceable command wins. That the claim is the *first*
-/// match is load-bearing twice over: every surplus match then sits after it, so
-/// removing those can neither move the claim nor empty a rule ahead of it.
+/// match is load-bearing: every surplus match then sits after it, so nothing
+/// done to those can move the claim or empty a rule ahead of it.
+///
+/// **Surplus handlers are removed only from the TAIL of a rule**, and that is
+/// the correction Greptile's P1 on PR #1166 forced. Removing a handler that a
+/// surviving one follows shifts that survivor's `handler_idx` — this very
+/// defect one level down, and the first draft did it to a rule shaped
+/// `[deck-claimed, deck-surplus, user]`, moving the user from `:0:2` to
+/// `:0:1`. An interior surplus is therefore kept and REFRESHED instead, which
+/// costs a second firing of the deck's own hook and buys the user's grant. It
+/// is refreshed rather than merely left alone because a stale dead pin in place
+/// is an exec failure on every event, where a duplicate is not.
 ///
 /// Three deliberate conservatisms:
 ///
@@ -300,10 +310,12 @@ fn command_is_replaceable(command: &str, binary_path: &str) -> bool {
 ///   a handler inside one has not been measured. A flat match reached before
 ///   any nested one therefore returns `false` and hands the whole array back to
 ///   the caller's strip-then-append path — the pre-#1034 behaviour, unchanged —
-///   rather than guessing at a shape no probe covers. A flat match reached *after* the
-///   claim is a different question and gets the opposite answer: it is removed
-///   with the other surplus, because not claiming it means falling back, while
-///   not removing it would mean the deck's hook fires twice.
+///   rather than guessing at a shape no probe covers. A flat match reached
+///   *after* the claim is removed, which is safe for a measured reason rather
+///   than a hopeful one: a rule carrying no `hooks` array contributes no
+///   listed entry at all, so it holds no trust key and taking its `command`
+///   out moves nothing. (It also never ran under Codex, so this is tidying
+///   rather than a duplicate-fire fix.)
 ///
 /// The signature takes `&mut [Value]` rather than `&mut Vec<Value>` on purpose:
 /// this function may edit a rule but may never add or remove one, and that is
@@ -335,29 +347,34 @@ fn refresh_deck_rule_in_place(rules: &mut [Value], command: &str, binary_path: &
         return false;
     };
 
-    // Drop every FURTHER replaceable command, in both shapes. These are
-    // duplicates of this install — a second rule for the same binary, or a dead
-    // pin under its basename — which this function does not itself produce, so
-    // they arrive from a pre-#1034 install or a hand-edit. Leaving one behind
-    // would fire the
-    // deck's hook twice, which is why the flat shape is swept here even though
-    // it is never CLAIMED above: not claiming it means falling back to the old
-    // path, while not sweeping it would mean running it.
-    //
-    // Rules before the claim are never visited — the scan above returns early
-    // on a flat match, so there is nothing replaceable ahead of the claim in
-    // either shape — and a rule left with no handler at all is KEPT so the
-    // `group_idx` of everything after it does not move.
+    // Drop surplus copies of this install — a second handler for the same
+    // binary, or a dead pin under its basename — but ONLY from the TAIL of a
+    // rule's handler list, because removing one that a surviving handler
+    // follows shifts that handler's `handler_idx`. That is this very defect at
+    // handler granularity, and the first draft of this function had it
+    // (Greptile P1 on PR #1166): a rule holding
+    // `[deck-claimed, deck-surplus, user]` moved the user from `:0:2` to
+    // `:0:1`. Rules before the claim are never visited, since the scan above
+    // stops at the first replaceable command in either shape.
     for (rule_idx, rule) in rules.iter_mut().enumerate().skip(claimed_rule) {
         if let Some(handlers) = rule.get_mut("hooks").and_then(Value::as_array_mut) {
-            let mut handler_idx = 0usize;
-            handlers.retain(|handler| {
-                let surplus = (rule_idx, handler_idx) != (claimed_rule, claimed_handler)
-                    && handler.get("command").is_some_and(&replaceable);
-                handler_idx += 1;
-                !surplus
-            });
+            while let Some(last_idx) = handlers.len().checked_sub(1) {
+                if (rule_idx, last_idx) == (claimed_rule, claimed_handler)
+                    || !handlers[last_idx].get("command").is_some_and(&replaceable)
+                {
+                    break;
+                }
+                handlers.pop();
+            }
         }
+        // The legacy flat `command` goes unconditionally: measured on 0.149.0,
+        // a rule carrying no `hooks` array contributes NO listed entry at all —
+        // a `{"type":"command","command":…}` rule placed at index 1 left the
+        // handlers either side reporting `pre_tool_use:0:0` and
+        // `pre_tool_use:2:0` with no warnings — so it holds no trust key of its
+        // own and taking the key out moves nothing. (It also means such a rule
+        // never runs under Codex, so this is tidying, not a duplicate-fire
+        // fix.) The rule OBJECT stays, which is what keeps `group_idx` still.
         if rule.get("command").is_some_and(&replaceable)
             && let Some(object) = rule.as_object_mut()
         {
@@ -365,20 +382,31 @@ fn refresh_deck_rule_in_place(rules: &mut [Value], command: &str, binary_path: &
         }
     }
 
-    // Overwrite the claimed handler's command where it already sits.
-    if let Some(handler) = rules[claimed_rule]
-        .get_mut("hooks")
-        .and_then(Value::as_array_mut)
-        .and_then(|handlers| handlers.get_mut(claimed_handler))
-        .and_then(Value::as_object_mut)
-    {
-        handler.insert("command".into(), Value::String(command.to_string()));
-        // Only when absent: a handler carrying a deck command but no `type` is
-        // one the deck did not write, and Codex needs the discriminant to run
-        // it. An existing value is the user's and is not ours to correct.
-        handler
-            .entry("type")
-            .or_insert_with(|| Value::String("command".into()));
+    // Refresh EVERY replaceable handler still standing, not only the claim.
+    // An interior surplus that the tail rule above could not remove would
+    // otherwise be left carrying a stale command — and if it is a dead pin,
+    // that is an exec failure on every event rather than a harmless duplicate.
+    // Refreshing it costs a second firing of the deck's own hook, which is the
+    // cheaper side of the trade against re-keying a user's grant.
+    for rule in rules.iter_mut().skip(claimed_rule) {
+        let Some(handlers) = rule.get_mut("hooks").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for handler in handlers.iter_mut() {
+            if !handler.get("command").is_some_and(&replaceable) {
+                continue;
+            }
+            let Some(object) = handler.as_object_mut() else {
+                continue;
+            };
+            object.insert("command".into(), Value::String(command.to_string()));
+            // Only when absent: a handler carrying a deck command but no `type`
+            // is one the deck did not write, and Codex needs the discriminant
+            // to run it. An existing value is the user's and not ours to fix.
+            object
+                .entry("type")
+                .or_insert_with(|| Value::String("command".into()));
+        }
     }
     true
 }
