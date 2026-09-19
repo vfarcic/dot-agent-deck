@@ -62,7 +62,47 @@ This is the opposite direction from [Surviving sleep/wake](remote-environments.m
 
 **The daemon socket lands in `/tmp`.** macOS sets no `XDG_RUNTIME_DIR`, so the socket falls through to `/tmp/dot-agent-deck-{uid}.sock` — `/tmp/dot-agent-deck-501.sock` on the validation host. The owner-only mode this page promises does hold there (`srw-------`), so the socket file itself is not readable by other users; what remains is the directory concern described under [Daemon socket security](#daemon-socket-security). Setting `$DOT_AGENT_DECK_SOCKET` to a path inside your home directory should work exactly as it does on Linux, but that override was not exercised on macOS.
 
-**Nothing is set up to restart the deck after a reboot.** The persistence setup under [Recommended](#recommended-for-persistent-and-safe-use) is built around `systemd --user`, which macOS does not have, and the deck installs no launchd equivalent. Agents do survive you disconnecting — that was part of the validated run and does not depend on systemd. What happens across a reboot was not tested, so treat this as a gap in what the deck arranges for you rather than as an observed failure. Shipping a LaunchAgent is tracked in [#1172](https://github.com/vfarcic/dot-agent-deck/issues/1172).
+**Nothing is set up to restart the deck after a reboot — you have to arrange it.** The persistence setup under [Recommended](#recommended-for-persistent-and-safe-use) is built around `systemd --user`, which macOS does not have, and the deck installs no launchd equivalent. Agents do survive you disconnecting — that was part of the validated run and does not depend on systemd. What happens across a reboot was not tested, so what follows is a starting point rather than a verified recipe; whether the deck should ship a plist of its own is [#1172](https://github.com/vfarcic/dot-agent-deck/issues/1172).
+
+The launchd counterpart of a `systemd --user` unit is a **LaunchAgent**. Write `~/Library/LaunchAgents/ai.devopstoolkit.dot-agent-deck.plist`, substituting your own absolute paths — launchd does not expand `~`:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>ai.devopstoolkit.dot-agent-deck</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/YOU/.local/bin/dot-agent-deck</string>
+    <string>daemon</string>
+    <string>serve</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>/Users/YOU/Library/Logs/dot-agent-deck.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/YOU/Library/Logs/dot-agent-deck.log</string>
+</dict>
+</plist>
+```
+
+`RunAtLoad` and `KeepAlive` are the two that matter: they are what `systemd --user` gives you as start-on-login and restart-on-crash. Load it with:
+
+```bash
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/ai.devopstoolkit.dot-agent-deck.plist
+```
+
+Three things are easy to get wrong here, and each costs something different:
+
+- **A LaunchAgent, not a LaunchDaemon.** A LaunchDaemon runs in the system context with no user session, so it forfeits the user's environment and credentials — including the `~/.claude/.credentials.json` that the `/login` step above exists to create. The daemon must run as you.
+- **A LaunchAgent starts at GUI login, not at boot.** So an always-on Mac with nobody sitting at it needs **auto-login** enabled to come back unattended after a reboot, and auto-login interacts with FileVault: a FileVault-encrypted disk requires a password at startup before any login can happen automatically. That is a real security tradeoff, not a checkbox — decide it deliberately.
+- **launchd does not source your shell profile.** The daemon repairs its own `PATH` at startup by capturing it from an interactive login shell, so `~/.local/bin` resolves either way — but nothing else does. Anything your agents need from the environment, an `ANTHROPIC_API_KEY` for instance, has to go in an `EnvironmentVariables` dict in the plist rather than in `~/.zshrc`.
 
 Three things are still open, if you are in a position to check any of them: **reboot behaviour**, the **`$DOT_AGENT_DECK_SOCKET` override** on macOS, and **hook delivery asserted directly** rather than inferred from an agent reaching `Working`. [Report what you find](https://github.com/vfarcic/dot-agent-deck/issues).
 
