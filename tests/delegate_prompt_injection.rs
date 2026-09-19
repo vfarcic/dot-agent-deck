@@ -4052,3 +4052,364 @@ fn delegate_no_event_window_parses_one_whitespace_and_overflow() {
             );
         });
 }
+
+/// Issue #1031: the stub's proof that the fallback write's PAYLOAD survived and
+/// only its submit was lost — the exact shape the issue measured twice, where the
+/// pane rendered `❯ Read .dot-agent-deck/worker-task-auditor.md for your task.`
+/// at its own input and a human had to press Enter.
+#[cfg(unix)]
+const SWALLOW_STUB_READY: &[u8] = b"SWALLOW-STUB-READY";
+#[cfg(unix)]
+const SWALLOW_STUB_SWALLOWED: &[u8] = b"SWALLOW-STUB-SWALLOWED";
+#[cfg(unix)]
+const SWALLOW_STUB_SUBMITTED: &[u8] = b"SWALLOW-STUB-SUBMITTED:";
+
+/// Issue #1031: how long the two negative windows below keep looking for a submit
+/// that must not happen.
+///
+/// It has to clear the recovery's own interval with room, since that is the thing
+/// it is proving did NOT fire: `delegate_readiness_buffer()` is pinned to `0` by
+/// these fixtures, so the interval is the
+/// `prompt_delivery::REARM_READINESS_BUFFER` floor of 500 ms. 2 s is 4x that,
+/// paid in full on every run because nothing can end it early — so it is
+/// deliberately not load-scaled: a contended box would spend the extra seconds
+/// buying no additional confidence, and the *positive* assertion in the same test
+/// is what proves the machinery is alive at all.
+#[cfg(unix)]
+const NO_RECOVERY_WINDOW: Duration = Duration::from_secs(2);
+
+/// Issue #1031: a worker whose FIRST submit is swallowed and whose later ones are
+/// honoured — the deterministic half of "Claude Code fires `SessionStart` early in
+/// its boot sequence, before its TUI input is ready to interpret `\r` as submit".
+///
+/// **No clock in the fixture, on purpose.** A time-based swallow window (what
+/// `write_slow_readiness_stub` needs, because it is measuring an interval) would
+/// make this test race the replacement interpreter's own boot against the
+/// `SessionStart` timeout, and lose it on a loaded box. Counting submits instead
+/// makes the reproduction exact and load-independent: submit #1 is the fallback
+/// write's CR and is dropped, submit #2 is whatever the daemon does next.
+///
+/// It echoes every non-terminator byte, so the delivered pointer is visible in the
+/// pane snapshot exactly as a composer would render it, and on an honoured submit
+/// it reports the accumulated buffer — so the assertion can read WHAT was
+/// submitted rather than merely that a CR arrived.
+///
+/// The file is named `claude` by its caller, and that is load-bearing rather than
+/// decorative: fact S of the recovery's gate is the deck's own frozen launch
+/// identity for the pane, so a stub the deck cannot resolve to an agent type
+/// (`slow-readiness-agent.py`) is refused a recovery no matter what a hook event
+/// claims.
+#[cfg(unix)]
+fn write_swallowed_submit_stub(path: &std::path::Path) {
+    write_executable(
+        path,
+        r#"#!/usr/bin/env python3
+import os
+import sys
+import termios
+
+fd = sys.stdin.fileno()
+old = termios.tcgetattr(fd)
+new = list(old)
+new[0] &= ~(termios.IGNBRK | termios.BRKINT | termios.PARMRK
+            | termios.ISTRIP | termios.INLCR | termios.IGNCR
+            | termios.ICRNL | termios.IXON)
+new[1] &= ~termios.OPOST
+new[3] &= ~(termios.ECHO | termios.ECHONL | termios.ICANON
+            | termios.ISIG | termios.IEXTEN)
+termios.tcsetattr(fd, termios.TCSANOW, new)
+
+os.write(1, b'SWALLOW-STUB-READY')
+buf = bytearray()
+swallowed = False
+while True:
+    data = os.read(fd, 4096)
+    if not data:
+        break
+    for byte in data:
+        if byte in (13, 10):
+            if swallowed:
+                os.write(1, b'SWALLOW-STUB-SUBMITTED:' + bytes(buf))
+                buf.clear()
+            else:
+                swallowed = True
+                os.write(1, b'SWALLOW-STUB-SWALLOWED')
+        else:
+            buf.append(byte)
+            os.write(1, bytes([byte]))
+"#,
+    );
+}
+
+/// Issue #1031: everything one late-readiness run needs, plus the `claude`-named
+/// stub whose basename is what gives the pane a resolvable launch identity.
+#[cfg(unix)]
+struct LateReadinessArm {
+    _cwd: tempfile::TempDir,
+    registry: Arc<AgentPtyRegistry>,
+    event_tx: broadcast::Sender<BroadcastMsg>,
+    /// Kept alive for the whole run so `send` can never fail for want of a
+    /// receiver. Without it these tests fail with a `SendError` the moment the
+    /// daemon's own subscription is the only one — which would make the negative
+    /// arms pass or fail on WHO IS LISTENING rather than on what reached the
+    /// worker's PTY, and would turn the positive arm's regression signal into a
+    /// panic in the fixture instead of an assertion about the pane.
+    _event_rx: broadcast::Receiver<BroadcastMsg>,
+    worker_agent_id: String,
+}
+
+#[cfg(unix)]
+impl LateReadinessArm {
+    /// Delegate to a `clear = true` worker whose command is a stub the deck
+    /// resolves as Claude Code, and return once the replacement has entered raw
+    /// mode — so the pointer write below reaches the stub rather than the line
+    /// discipline.
+    async fn start() -> Self {
+        common::init_test_env();
+        let cwd = common::race_safe_tempdir();
+        // The BASENAME is the fixture: `AgentType::from_command` resolves
+        // `…/claude` to `ClaudeCode`, which is what the respawn freezes as the
+        // pane's `spawn_agent_type` and what `pre_write_believed_agent_type` then
+        // reports as fact S.
+        let stub = cwd.path().join("claude");
+        write_swallowed_submit_stub(&stub);
+        let command = stub.to_string_lossy().into_owned();
+        std::fs::write(
+            cwd.path().join(".dot-agent-deck.toml"),
+            clear_true_config(&command),
+        )
+        .expect("write late-readiness orchestration config");
+        let cwd_str = cwd.path().to_string_lossy().into_owned();
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let old_agent_id = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("cat"),
+                cwd: Some(&cwd_str),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), WORKER_PANE.to_string())],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn initial late-readiness occupant");
+        let (event_tx, event_rx) = broadcast::channel::<BroadcastMsg>(64);
+        let mut state = AppState::default();
+        register_orchestration(&mut state, &cwd_str);
+        state
+            .handle_delegate(
+                DelegateSignal {
+                    pane_id: ORCH_PANE.to_string(),
+                    task: "List the files in the current directory.".to_string(),
+                    to: vec![WORKER_ROLE.to_string()],
+                    timestamp: chrono::Utc::now(),
+                    token: None,
+                },
+                &registry,
+                &event_tx,
+            )
+            .await;
+        let worker_agent_id =
+            wait_for_replacement_agent(&registry, WORKER_PANE, &old_agent_id).await;
+        let ready =
+            common::wait_for_child_first_output(&registry, &worker_agent_id, SWALLOW_STUB_READY)
+                .await;
+        assert!(
+            snapshot_contains(&ready, SWALLOW_STUB_READY),
+            "the replacement swallowed-submit stub never entered raw mode; snapshot = {:?}",
+            String::from_utf8_lossy(&ready)
+        );
+        Self {
+            _cwd: cwd,
+            registry,
+            event_tx,
+            _event_rx: event_rx,
+            worker_agent_id,
+        }
+    }
+
+    fn snapshot(&self) -> Vec<u8> {
+        self.registry
+            .snapshot(&self.worker_agent_id)
+            .unwrap_or_default()
+    }
+
+    async fn wait_for(&self, needle: &[u8], timeout: Duration) -> Vec<u8> {
+        wait_for_snapshot_needle(&self.registry, &self.worker_agent_id, needle, timeout).await
+    }
+
+    /// Wait out a window in which nothing may be submitted, and return the
+    /// snapshot at the end of it.
+    async fn snapshot_after_quiet_window(&self) -> Vec<u8> {
+        tokio::time::sleep(NO_RECOVERY_WINDOW).await;
+        self.snapshot()
+    }
+
+    /// Post a genuine, identity-matching native `SessionStart` for the
+    /// replacement worker — facts G and I of the recovery's gate.
+    fn send_session_start(&self, session_suffix: &str) {
+        let mut event = session_start_event(
+            AgentType::ClaudeCode,
+            WORKER_PANE,
+            &self.worker_agent_id,
+            false,
+        );
+        event.session_id = format!("{}-{session_suffix}", event.session_id);
+        self.event_tx
+            .send(BroadcastMsg::Event(event))
+            .expect("the dispatch subscribed before its write, so a receiver is alive");
+    }
+}
+
+/// Scenario: Delegate to a `clear = true` worker whose replacement stub swallows
+/// its first submit, so the readiness gate times out, writes the task pointer, and
+/// the pointer parks unsubmitted in the worker's input box exactly as issue #1031
+/// measured. Prove nothing submits it for two seconds, then post the genuine
+/// `SessionStart` that arrived 7-11 s late in production and assert the daemon
+/// submits the pointer the worker was already holding, with no human pressing
+/// Enter.
+#[spec("orchestration/delegate/035")]
+#[test]
+#[cfg(unix)]
+fn delegate_035_a_late_session_start_submits_the_parked_task_pointer() {
+    let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let _env = EnvGuard::set(&[
+        (DELEGATE_READINESS_BUFFER_ENV, "0"),
+        (WORKER_RESPONSE_TIMEOUT_ENV, "0"),
+        // Issue #1031: `0` DISABLES the silent-worker report, which is what every
+        // e2e lane in this repository pins (`tests/common/mod.rs`). The recovery
+        // has to work with it off — it is a delivery fix, not a diagnostic — so
+        // pinning it here is an assertion about where the mechanism is armed
+        // rather than mere noise suppression.
+        (DELEGATE_NO_EVENT_WINDOW_ENV, "0"),
+    ]);
+    // `DOT_AGENT_DECK_SESSION_START_WAIT_MS` is deliberately absent: the delegate
+    // path reads the bare `SESSION_START_WAIT_TIMEOUT` constant and only the
+    // SCHEDULER's mirror of the gate takes that override, so setting it here would
+    // imply a shortcut that does not exist. The 30 s is crossed on a paused clock
+    // instead, which is what `orchestration/delegate/011` does for the same reason
+    // — hence a current-thread runtime, since `tokio::time::pause` requires one.
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build late-readiness recovery runtime")
+        .block_on(async {
+            let arm = LateReadinessArm::start().await;
+            tokio::time::pause();
+            advance_and_run(Duration::from_secs(30) + TIMER_TICK_SLACK).await;
+            // Back onto the wall clock before anything is asserted. The recovery's
+            // interval is enforced by `AgentStartRearm` against
+            // `std::time::Instant`, which `tokio::time::pause` does not advance —
+            // so a paused clock would refuse the probe however far it were
+            // advanced, and the test would report the defect it is meant to catch.
+            tokio::time::resume();
+            // The reproduction: the gate expires, the fallback writes the pointer,
+            // and the stub reports that it dropped the submit that followed it.
+            let parked = arm
+                .wait_for(
+                    SWALLOW_STUB_SWALLOWED,
+                    common::load_scaled(Duration::from_secs(10)),
+                )
+                .await;
+            assert!(
+                snapshot_contains(&parked, SWALLOW_STUB_SWALLOWED),
+                "the fallback write never reached the stub, so this run never entered the state \
+                 issue #1031 is about; snapshot = {:?}",
+                String::from_utf8_lossy(&parked)
+            );
+            assert!(
+                snapshot_contains(&parked, POINTER),
+                "the pointer's payload did not survive the swallowed submit, so this fixture is \
+                 reproducing prompt LOSS rather than the unsubmitted-composer arm #1031 \
+                 measured; snapshot = {:?}",
+                String::from_utf8_lossy(&parked)
+            );
+
+            // The control, and the whole of the defect: with no late readiness
+            // signal there is nothing to act on and the pointer stays parked.
+            let quiet = arm.snapshot_after_quiet_window().await;
+            assert!(
+                !snapshot_contains(&quiet, SWALLOW_STUB_SUBMITTED),
+                "something submitted the parked pointer with no readiness evidence behind it, so \
+                 the assertion below would not be attributable to the late SessionStart; \
+                 snapshot = {:?}",
+                String::from_utf8_lossy(&quiet)
+            );
+
+            arm.send_session_start("late");
+            let recovered = arm
+                .wait_for(
+                    SWALLOW_STUB_SUBMITTED,
+                    common::load_scaled(Duration::from_secs(5)),
+                )
+                .await;
+            let text = String::from_utf8_lossy(&recovered);
+            assert!(
+                snapshot_contains(&recovered, SWALLOW_STUB_SUBMITTED),
+                "a SessionStart arriving after the readiness gate gave up was discarded, leaving \
+                 the task pointer for a human to submit — issue #1031 itself; snapshot = {text:?}"
+            );
+            let mut submitted_pointer = SWALLOW_STUB_SUBMITTED.to_vec();
+            submitted_pointer.extend_from_slice(POINTER);
+            assert!(
+                snapshot_contains(&recovered, &submitted_pointer),
+                "the recovery submitted something other than the task pointer the worker was \
+                 holding, which is what a payload REWRITE rather than a submit-only probe would \
+                 produce; snapshot = {text:?}"
+            );
+            arm.registry.shutdown_all();
+        });
+}
+
+/// Scenario: Delegate to the same `clear = true` worker, but release the readiness
+/// gate with a `SessionStart` that arrives INSIDE its wait, so PRD #249's observed
+/// path writes the pointer into a conversation the daemon already knew about. Post
+/// a second genuine `SessionStart` afterwards and assert the daemon submits
+/// nothing: a delivery that was bound to a live generation when it wrote may not
+/// be re-submitted by a later start.
+#[spec("orchestration/delegate/036")]
+#[test]
+#[cfg(unix)]
+fn delegate_036_an_observed_release_earns_no_late_submit_recovery() {
+    let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let _env = EnvGuard::set(&[
+        (DELEGATE_READINESS_BUFFER_ENV, "0"),
+        (WORKER_RESPONSE_TIMEOUT_ENV, "0"),
+        (DELEGATE_NO_EVENT_WINDOW_ENV, "0"),
+    ]);
+    // No paused clock and no wait override here: this arm releases the gate with
+    // an event, so it never reaches the 30 s expiry that `/035` has to cross, and
+    // every interval it measures is a real one.
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .expect("build observed-release recovery runtime")
+        .block_on(async {
+            let arm = LateReadinessArm::start().await;
+            arm.send_session_start("observed");
+            let parked = arm
+                .wait_for(
+                    SWALLOW_STUB_SWALLOWED,
+                    common::load_scaled(Duration::from_secs(5)),
+                )
+                .await;
+            assert!(
+                snapshot_contains(&parked, SWALLOW_STUB_SWALLOWED),
+                "the observed-readiness write never reached the stub, so this run never set up \
+                 the state under test; snapshot = {:?}",
+                String::from_utf8_lossy(&parked)
+            );
+
+            // A second genuine start for the same agent: a new conversation in a
+            // worker that was demonstrably up when the pointer was written. Fact
+            // U refuses it, which is what keeps a worker that has already consumed
+            // and submitted its task from being submitted into twice.
+            arm.send_session_start("second");
+            let quiet = arm.snapshot_after_quiet_window().await;
+            assert!(
+                !snapshot_contains(&quiet, SWALLOW_STUB_SUBMITTED),
+                "a SessionStart after an OBSERVED release earned a submit recovery; the gate's \
+                 own release bound this delivery's generation, so the only thing a later start \
+                 can be is a different conversation; snapshot = {:?}",
+                String::from_utf8_lossy(&quiet)
+            );
+            arm.registry.shutdown_all();
+        });
+}
