@@ -9,7 +9,7 @@ Getting a host into a state where `dot-agent-deck remote add` will succeed. The 
 
 For prerequisites the host must satisfy see [Remote Environment Requirements](remote-requirements.md). For lifecycle and connection semantics see [Remote Environments](remote-environments.md). The Kubernetes-as-host recipe lives in [issue #81](https://github.com/vfarcic/dot-agent-deck/issues/81) and is not yet shipped.
 
-> **Status.** Validated end to end on Ubuntu 24.04 LTS and on macOS (Apple Silicon). **Where the machine comes from does not matter to the deck** — `remote add` connects over ssh, checks what the host is, installs a binary and sets up hooks; nothing in it is specific to any cloud, hypervisor or distribution. So the only thing that varies below is how you obtain a machine, which is your provider's business rather than the deck's.
+> **Status.** Validated end to end on Linux (Ubuntu 24.04 LTS) and on macOS (Apple Silicon). The distribution is not a requirement — see [Which Linux distribution](remote-requirements.md#which-linux-distribution) for the two things that genuinely vary. **Where the machine comes from does not matter to the deck** — `remote add` connects over ssh, checks what the host is, installs a binary and sets up hooks; nothing in it is specific to any cloud, hypervisor or distribution. So the only thing that varies below is how you obtain a machine, which is your provider's business rather than the deck's.
 
 ## What the deck needs
 
@@ -36,7 +36,7 @@ Whatever you do below converges on the same end state:
   multipass shell dad-dev
   ```
 
-- **A cloud VM**, from any provider. Create the smallest instance that meets [the hardware requirements](remote-requirements.md#hardware), running Ubuntu 24.04 LTS or equivalent, with your ssh key installed, and note its address. How you do that is your provider's documentation, not ours — the deck never learns which one you picked.
+- **A cloud VM**, from any provider. Create the smallest instance that meets [the hardware requirements](remote-requirements.md#hardware), running any modern Linux, with your ssh key installed, and note its address. How you do that is your provider's documentation, not ours — the deck never learns which one you picked.
 
 Cloud images commonly log you in as `root`. If yours does, the first bootstrap step is the one that matters.
 
@@ -62,7 +62,7 @@ systemctl restart ssh
 exit
 ```
 
-**Then, as that user, install the agent toolchain:**
+**Then, as that user, install the agent toolchain.** The commands below are Debian/Ubuntu spelling; substitute your distribution's package manager — nothing here is specific to `apt`.
 
 ```bash
 echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
@@ -331,7 +331,7 @@ The most common first-time failures are:
 
 - **Wrong user.** If the image's default user isn't `root`, the install steps above need to run under the right account. Check the image's own documentation.
 - **`~/.local/bin` not on `PATH`.** The remote-side install lands the binary there, but a fresh non-interactive ssh session may not source `~/.bashrc`. The deck handles this — `remote add` invokes the binary by absolute path during install — but later commands assume a login shell with `PATH` set.
-- **Node.js too old.** Ubuntu's `apt` Node.js is sometimes lagging; if your agent's CLI requires a newer version, install via [NodeSource](https://github.com/nodesource/distributions) or `nvm` instead of `apt`.
+- **Node.js too old.** Distribution-packaged Node.js often lags; if your agent's CLI requires a newer version, install via [NodeSource](https://github.com/nodesource/distributions) or `nvm` instead of your package manager.
 
 ## See also
 

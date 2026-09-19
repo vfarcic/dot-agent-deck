@@ -9,11 +9,11 @@ What a host must provide for a `dot-agent-deck` **remote environment** — a per
 
 For lifecycle, failure modes, and how connecting works see [Remote Environments](remote-environments.md). For provisioning recipes see [Remote Recipes](remote-recipes.md).
 
-> **Status:** v1 requirements. The Required section reflects what was confirmed to work on a fresh Ubuntu 24.04 LTS VM, which has been the reference target throughout; the Recommended section reflects best-practice hardening that has not yet been re-validated end to end on a clean provision. macOS was validated end to end on Apple Silicon on 2026-09-19 ([#1158](https://github.com/vfarcic/dot-agent-deck/issues/1158)).
+> **Status:** v1 requirements. The Required section reflects what was confirmed to work on a fresh Linux VM (Ubuntu 24.04 LTS, though nothing here requires it); the Recommended section reflects best-practice hardening that has not yet been re-validated end to end on a clean provision. macOS was validated end to end on Apple Silicon on 2026-09-19 ([#1158](https://github.com/vfarcic/dot-agent-deck/issues/1158)).
 
 ## How this page is organized
 
-Requirements are split into two sections. **Required** is the strict minimum for the daemon to launch and an agent to run on a remote at all — confirmed empirically on a fresh Ubuntu 24.04 LTS VM. **Recommended for persistent and safe use** is what hardens the install and delivers the deck's reason for existing as a remote: persistence across laptop sleep, network drops, and reboots. Without the recommended setup, the daemon will still start, but agents will not survive your laptop disconnecting — which defeats the whole point of running the deck remotely.
+Requirements are split into two sections. **Required** is the strict minimum for the daemon to launch and an agent to run on a remote at all — confirmed empirically on a fresh Linux VM. **Recommended for persistent and safe use** is what hardens the install and delivers the deck's reason for existing as a remote: persistence across laptop sleep, network drops, and reboots. Without the recommended setup, the daemon will still start, but agents will not survive your laptop disconnecting — which defeats the whole point of running the deck remotely.
 
 > **Warning — do not stop at Required.** A host that satisfies only the Required section will function, but it runs the daemon as root, accepts default SSH configuration, and places the daemon socket in `/tmp` — none of which are safe defaults on a multi-user host or anything resembling production. Anyone running beyond a personal sandbox should follow the Recommended section.
 
@@ -25,17 +25,22 @@ The strict minimum for the daemon to launch and an agent to run.
 
 | Host OS | Status |
 |---|---|
-| Linux (amd64, arm64) | Validated end to end. The reference target throughout. |
+| Linux (amd64, arm64) | Validated end to end. Any modern distribution — see [Which Linux distribution](#which-linux-distribution) |
 | macOS | Validated end to end on Apple Silicon — see [macOS as a remote host](#macos-as-a-remote-host) for the two setup steps it needs |
 | Windows | Not supported as a remote host (you can still use it as the local client) |
 
 Windows is out for a concrete reason rather than a policy one: `remote add` does not recognise Windows as a host, so registering one fails before it gets as far as installing anything — and there is no Windows build of the daemon for it to install in any case.
 
-| Linux distribution | Status |
-|---|---|
-| Ubuntu 24.04 LTS | Tested |
+#### Which Linux distribution
 
-Other modern systemd-based Linux distributions are likely to work but have not been exercised. If you'd like a specific distribution validated, [open an issue](https://github.com/vfarcic/dot-agent-deck/issues) and we'll add it to the test matrix.
+**Any modern one.** The deck never checks: `remote add` reads `uname -s -m` and cares only that it says `Linux` and an architecture it has a build for. Ubuntu 24.04 LTS is what the validation runs happened to use, not a requirement, and the `apt` commands in [Remote Recipes](remote-recipes.md) are one distribution's spelling of steps every distribution has.
+
+Two things genuinely do vary, and neither is about which distribution you prefer:
+
+- **glibc.** The published Linux binaries are `x86_64-unknown-linux-gnu` and `aarch64-unknown-linux-gnu` — glibc builds, with no musl variant. On a musl-based distribution such as Alpine, install from source instead; the [Nix flake](installation.md#nix) covers `x86_64-linux` and `aarch64-linux`.
+- **systemd**, and only for the *recommended* setup rather than for the daemon itself. `systemd --user` plus `loginctl enable-linger` is how the daemon survives logout and restarts after a crash, and `XDG_RUNTIME_DIR` — which `logind` sets — is what keeps the socket out of `/tmp`. Without systemd you still get a working remote; what you lose is restart-on-boot, and the socket falls back to `/tmp/dot-agent-deck-{uid}.sock` — [the same position a macOS host is in](#macos-as-a-remote-host), for the same reason.
+
+If you would like a specific distribution added to the test matrix, [open an issue](https://github.com/vfarcic/dot-agent-deck/issues).
 
 ### macOS as a remote host
 
@@ -95,7 +100,7 @@ The host must have:
 
 - `bash`
 - An OpenSSH server (`sshd`)
-- `git` — typically pre-installed on cloud Linux images (Ubuntu 24.04 cloud images ship with it). Only needs an explicit install if it's missing.
+- `git` — typically pre-installed on cloud Linux images. Only needs an explicit install if it's missing.
 - A working PTY layer (standard on every Linux distribution)
 
 **AI agent runtime.** The deck launches AI agents but does not bundle them — the agent and its runtime must already be on the host, otherwise the deck has nothing to spawn. You need:
