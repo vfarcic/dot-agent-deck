@@ -151,6 +151,24 @@ export type VoiceActionContext = {
 export type VoiceActionEntry = {
   /** What the control does, in the app's own words. For humans. */
   label: string;
+  /**
+   * The {@link VoiceActionContext} members this entry's `run` REQUIRES.
+   *
+   * It exists because TypeScript's `Pick<VoiceActionContext, …>` on `run` is
+   * gone at runtime, and {@link dispatchVoiceAction} has to decide whether the
+   * host in front of it can serve this entry BEFORE calling it. Without that
+   * decision the only other answer is a `TypeError` — which is what PRD #802 M6
+   * shipped, and it reached the user as the words *context.openOverlay is not a
+   * function* above the report sentence.
+   *
+   * An OPTIONAL member is deliberately not listed: `openAgent` reads
+   * `selectAgent` through `?.` and works without it, so listing it would refuse
+   * a dispatch the entry is happy to serve. {@link NeedsCoversRun} below is the
+   * compile-time proof that what IS listed covers what `run` requires, so the
+   * dangerous direction — a `run` reading a member nobody declared — is a type
+   * error rather than a runtime throw.
+   */
+  needs: readonly (keyof VoiceActionContext)[];
   run: (...args: never[]) => void;
   /** Set when `commands.toml` carries a row whose `invoke` names this entry. */
   voice?: true;
@@ -164,6 +182,10 @@ export const VOICE_ACTIONS = {
   openAgent: {
     label: "Open one agent's pane over the current screen",
     voice: true,
+    /* `selectAgent` is deliberately not in `needs`: it is read through `?.`, so
+       a host without it (the overview, which has no tile to select) serves this
+       entry perfectly well and must not be refused for lacking it. */
+    needs: ["navigate"],
     /**
      * Opening SELECTS as well, on the deck. That is not decoration: one pane is
      * on screen, so it is the selected one, and it settles the narrow-viewport
@@ -180,18 +202,21 @@ export const VOICE_ACTIONS = {
   openOverview: {
     label: "Show the agent overview",
     voice: true,
+    needs: ["navigate"],
     run: (context: Pick<VoiceActionContext, "navigate">) => context.navigate({ kind: "overview" }),
   },
 
   openDeck: {
     label: "Go back to the deck",
     voice: true,
+    needs: ["navigate"],
     run: (context: Pick<VoiceActionContext, "navigate">) => context.navigate({ kind: "deck" }),
   },
 
   closeAgentView: {
     label: "Close the open agent view",
     voice: true,
+    needs: ["closeAgentView"],
     /** The VIEW, never the pane. The agent keeps running and keeps its terminal. */
     run: (context: Pick<VoiceActionContext, "closeAgentView">) => context.closeAgentView(),
   },
@@ -201,72 +226,109 @@ export const VOICE_ACTIONS = {
   openProjects: {
     label: "Manage projects",
     no_voice: "opens a picker over daemon-supplied project paths, and the table has no resolver kind that can turn a spoken phrase into one — a row could open the panel and then leave the user inside a list voice cannot choose from, which is a worse dead end than having no command",
+    needs: ["openOverlay"],
     run: (context: Pick<VoiceActionContext, "openOverlay">) => context.openOverlay("projects"),
   },
 
   openPromptLibrary: {
     label: "Open the prompt library",
     no_voice: "a browse-and-edit surface: choosing, adding, editing and removing a stored prompt are all beyond this PRD's navigation-only slice, so the command would open a panel and stop",
+    needs: ["openOverlay"],
     run: (context: Pick<VoiceActionContext, "openOverlay">) => context.openOverlay("prompts"),
   },
 
   openAgentProfiles: {
     label: "Open agent profiles",
     no_voice: "opens the form that sets each role's model and permissions — the configuration surface PRD #802 D5 puts behind confirmation, so exposing the door before the confirmation flow exists would invite the misfire D5 is about",
+    needs: ["openOverlay"],
     run: (context: Pick<VoiceActionContext, "openOverlay">) => context.openOverlay("profiles"),
   },
 
   openWorkflowOrder: {
     label: "Edit workflow order",
     no_voice: "the editor it opens enables, skips, reorders and LAUNCHES roles; launching an orchestration starts agents, and nothing in this slice starts anything",
+    needs: ["openOverlay"],
     run: (context: Pick<VoiceActionContext, "openOverlay">) => context.openOverlay("workflow"),
   },
 
   openSettings: {
     label: "Open settings",
     no_voice: "reserved for PRD #802 M8, which adds the first new command by editing `commands.toml` and its fixtures and nothing else — claiming the row here would spend the one-file proof before it has been made",
+    needs: ["openOverlay"],
     run: (context: Pick<VoiceActionContext, "openOverlay">) => context.openOverlay("settings"),
   },
 
   showRuns: {
     label: "Show the running agents",
     no_voice: "clears whichever overlays happen to be open and reveals the deck underneath, so with nothing open it does nothing at all and no honest report sentence can be written for it; `open_deck` is the row that means \"show me the terminals\"",
+    needs: ["closeOverlays"],
     run: (context: Pick<VoiceActionContext, "closeOverlays">) => context.closeOverlays(),
   },
 
   toggleEvidenceDrawer: {
     label: "Show or hide the evidence drawer",
     no_voice: "a toggle, and the table cannot see which way it is pointing — the drawer is a `ControlDeck` boolean rather than a screen — so \"show the evidence\" and \"hide the evidence\" would both flip it and one of the two would be wrong every time",
+    needs: ["toggleEvidence"],
     run: (context: Pick<VoiceActionContext, "toggleEvidence">) => context.toggleEvidence(),
   },
 
   focusAgent: {
     label: "Select one agent's tile",
+    no_voice: "selects a tile without enlarging it, which is a pointer and keyboard affordance rather than something a supervisor says out loud; `open_agent` is the spoken form of \"show me that one\", and offering both would make every such utterance ambiguous for the model",
+    needs: ["selectAgent"],
     /**
      * ONE entry taking the agent as a parameter, exactly as `openAgent` does,
      * rather than one entry per live agent. The palette renders N items and all
      * of them dispatch through here — which is what leaves the guard a fixed
      * key to check, since per-agent entries do not exist at compile time.
      */
-    no_voice: "selects a tile without enlarging it, which is a pointer and keyboard affordance rather than something a supervisor says out loud; `open_agent` is the spoken form of \"show me that one\", and offering both would make every such utterance ambiguous for the model",
     run: (context: Pick<VoiceActionContext, "selectAgent">, target: AgentTarget) => context.selectAgent(target.agentId),
   },
 
   messageCoordinator: {
     label: "Put the caret in the coordinator's terminal",
     no_voice: "moves the caret so the operator can type to the orchestration's start role; dictating INTO an agent is PRD #802 D6, and a command that only moved the caret would promise an input path voice cannot finish",
+    needs: ["focusTerminal"],
     run: (context: Pick<VoiceActionContext, "focusTerminal">, target: AgentTarget) => context.focusTerminal(target.agentId),
   },
 
   advanceFixture: {
     label: "Advance the fixture loop one node",
     no_voice: "a fixture-mode debug affordance: it exists only while the app is driven by `FixtureDeckBridge` and moves a deterministic demo loop, so it is not a capability of a shipped build and has no user to speak to",
+    needs: ["advanceFixture"],
     run: (context: Pick<VoiceActionContext, "advanceFixture">) => context.advanceFixture(),
   },
 } satisfies Record<string, VoiceActionEntry>;
 
 /** Every action id, as the guard and the command table spell them. */
 export type VoiceActionId = keyof typeof VOICE_ACTIONS;
+
+/**
+ * Compile-time proof that each entry's `needs` covers what its `run` requires.
+ *
+ * `needs` is read at runtime and `Pick<VoiceActionContext, …>` is not, so the
+ * two could disagree — and an UNDER-declared `needs` is the dangerous
+ * direction: {@link dispatchVoiceAction} would wave the entry through and the
+ * `run` would throw on a member nobody checked, which is the defect PRD #802 M6
+ * shipped. This maps each entry's `run` against the signature its own `needs`
+ * describes; parameters are contravariant, so a `run` requiring a member the
+ * list omits is not assignable and the line below fails to compile, naming the
+ * entry.
+ *
+ * It does NOT refuse an OVER-declared `needs` — listing a member `run` never
+ * touches makes dispatch stricter than it has to be, which is the conservative
+ * side and is a refusal rather than a throw.
+ */
+type NeedsCoversRun = {
+  [K in VoiceActionId]: (typeof VOICE_ACTIONS)[K]["run"] extends (
+    context: Pick<VoiceActionContext, (typeof VOICE_ACTIONS)[K]["needs"][number]>,
+    ...rest: never[]
+  ) => void
+    ? K
+    : ["this entry's `run` reads a context member its `needs` does not declare", K];
+};
+const NEEDS_COVERS_RUN: { [K in VoiceActionId]: K } = null as unknown as NeedsCoversRun;
+void NEEDS_COVERS_RUN;
 
 /**
  * Everything a voice dispatch can hand an action, in one object.
@@ -284,29 +346,43 @@ export type VoiceActionId = keyof typeof VOICE_ACTIONS;
 export type VoiceDispatchTarget = AgentViewTarget;
 
 /**
- * What a host offers a voice dispatch: `navigate` and `closeAgentView`, which
- * between them serve every `voice: true` entry today, plus whatever else that
- * host happens to have.
+ * What a host offers a voice dispatch: `navigate` and `closeAgentView` always,
+ * plus whatever else that host happens to have.
  *
- * # The absent members are a real residual, and rule 13 does NOT bound it
+ * # The absent members are checked now, and rule 13 still does not check them
  *
  * The guard proves an `invoke` names an entry and that the entry is classified.
  * It says nothing about whether the HOST can serve the context that entry's `run`
- * reads — those are different questions, and the second one has no check at all.
- * A row naming an entry that needs `openOverlay` would pass rule 13 and throw at
- * the call, because the overlay booleans live in `DeckSurface` and the voice
- * dispatch is built one level up in `DeckShell`, which is the only component
- * mounted for every screen.
+ * reads — those are different questions, and rule 13 answers only the first. What
+ * answers the second is {@link VoiceActionEntry.needs}, read by
+ * {@link dispatchVoiceAction} before the call: a host that cannot serve an entry
+ * gets a refusal it can report, rather than a `TypeError` whose message reaches
+ * the user as prose the app never wrote.
  *
- * **This is the shape of PRD #802 M8's next step and is worth knowing before it
- * is taken.** `openSettings` carries a `no_voice` reason reading "reserved for
- * PRD #802 M8" — and its `run` takes `openOverlay`. Giving it a row is a one-file
- * change that type-checks and then fails at runtime. What it needs first is for
- * `DeckSurface` to publish its own context upward, so the shell can merge the
- * deck's members in while the deck is mounted; M6 deliberately did not build that
- * on speculation, and M8 should not discover it by watching a command throw.
+ * **`DeckShell` merges the deck's own context in while the deck is mounted**, so
+ * the answer is "yes" for every member on the deck and "the shell's two" on the
+ * overview — `DeckSurface` publishes upward through a ref, and the shell reads it
+ * at dispatch time. That is what makes `open_settings` a table row rather than a
+ * plumbing project; it does not make the check redundant, because the overview
+ * genuinely cannot open a deck overlay and has to say so.
  */
 export type VoiceDispatchContext = Pick<VoiceActionContext, "navigate" | "closeAgentView"> & Partial<VoiceActionContext>;
+
+/**
+ * How a screen publishes its half of the context up to the host that dispatches
+ * (PRD #802 M7).
+ *
+ * A mutable slot rather than a callback prop, and the shape is the decision. The
+ * context a screen can serve is rebuilt on every render — it closes over that
+ * render's setters and props — so a host holding a *copy* would dispatch through
+ * stale closures. A host reading the slot at DISPATCH time always gets the last
+ * committed one, and gets `undefined` the moment the screen unmounts, which is
+ * exactly the question {@link dispatchVoiceAction} has to answer.
+ *
+ * Deliberately not a React context: the consumer is `DeckShell`, which is the
+ * screen's PARENT, and a context travels the other way.
+ */
+export type VoiceContextChannel = { current: VoiceActionContext | undefined };
 
 /**
  * Dispatch the action an outcome's `invoke` names (PRD #802 M6).
@@ -317,12 +393,25 @@ export type VoiceDispatchContext = Pick<VoiceActionContext, "navigate" | "closeA
  * *"hand the resolved action to the existing handler"*, literally true rather
  * than a description of two implementations that agree.
  *
- * Returns `false` for an `invoke` naming no entry. That should be unreachable —
+ * **It answers `false` for two different situations, and both mean the same
+ * thing to the caller: nothing ran.**
+ *
+ * The first is an `invoke` naming no entry. That should be unreachable —
  * `xtask/linkage-check` rule 13 fails the build on an `invoke` that resolves to
  * nothing, and the Rust pipeline refuses an action outside the table before it
  * ever gets here — so the boolean is not a second validation. It is what stops
  * the residual being *silence*: the surface can say the command did not run,
  * instead of reporting a success nothing performed.
+ *
+ * The second is a host that cannot serve the entry's {@link
+ * VoiceActionEntry.needs}, and it is reachable by ordinary use: the overview
+ * mounts no deck, so no overlay can be opened from it. **Checking before the
+ * call rather than catching after it is the whole point.** M6 did neither, and
+ * an unservable dispatch threw `TypeError: context.openOverlay is not a
+ * function` — a string composed by the JavaScript engine, rendered by the voice
+ * surface, at a user. PRD #802's central property is that the app renders every
+ * sentence it shows; a caught exception message would break it just as a thrown
+ * one does, which is why this is a precondition and not a `try`.
  *
  * The cast is the price of a dynamic key over entries with deliberately
  * different signatures, and it is confined to this one line rather than spread
@@ -332,6 +421,7 @@ export type VoiceDispatchContext = Pick<VoiceActionContext, "navigate" | "closeA
 export function dispatchVoiceAction(invoke: string, context: VoiceDispatchContext, target: VoiceDispatchTarget): boolean {
   const entry: VoiceActionEntry | undefined = (VOICE_ACTIONS as Record<string, VoiceActionEntry>)[invoke];
   if (!entry) return false;
+  if (entry.needs.some((member) => typeof context[member] !== "function")) return false;
   (entry.run as (...args: unknown[]) => void)(context, target);
   return true;
 }

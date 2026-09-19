@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import {
   Activity,
   AlertTriangle,
@@ -52,7 +52,7 @@ import { useInertBackground } from "./hooks/useInertBackground";
 import { useShownTerminals } from "./hooks/useShownTerminals";
 import { useZoom } from "./hooks/useZoom";
 import { agentKey } from "./lib/agentKey";
-import { VOICE_ACTIONS, dispatchVoiceAction, type DeckOverlay, type VoiceActionContext, type VoiceDispatchContext, type VoiceDispatchTarget } from "./lib/voiceActions";
+import { VOICE_ACTIONS, dispatchVoiceAction, type DeckOverlay, type VoiceActionContext, type VoiceContextChannel, type VoiceDispatchContext, type VoiceDispatchTarget } from "./lib/voiceActions";
 import { unreachableDeckTerminalState } from "./lib/terminalInput";
 import { applyAppearance } from "./lib/appearance";
 import { desktopWorkflowPlatformIssue } from "./lib/platform";
@@ -146,6 +146,15 @@ export function DeckShell({ runtime, workflowPlatformIssue, initialView = { kind
    */
   const settings = useDesktopSettings(runtime);
   useZoom(runtime, settings);
+  /**
+   * PRD #802 M7 — where the mounted deck publishes the context it can serve.
+   *
+   * A `useRef` and not state: nothing renders from it, and the only reader is
+   * `dispatchVoice` below, at the moment a command runs. Making it state would
+   * re-render the whole shell on every commit of the deck beneath it, to serve
+   * a value nothing displays.
+   */
+  const deckVoiceContext = useRef<VoiceActionContext | undefined>(undefined);
   const agentView = view.kind === "agent" ? view : undefined;
   /**
    * Back, and the whole of it. The destination is read off the view rather
@@ -385,21 +394,51 @@ export function DeckShell({ runtime, workflowPlatformIssue, initialView = { kind
    * would break the one-file promise, which is that voice-enabling a capability
    * is a row in `commands.toml` and nothing else.
    *
-   * # The context is two members, and the absent ones are not an oversight
+   * # The context is the deck's members plus the shell's two, and a dispatch the
+   * host cannot serve is REFUSED rather than attempted
    *
-   * `navigate` and `closeAgentView` are what this app's four spoken commands
-   * need, and they are the two the SHELL owns. The overlay togglers, the tile
-   * selection and the fixture stepper belong to `DeckSurface`, which is unmounted
-   * while the overview is up — so a shell-level dispatch cannot offer them
-   * honestly, and every row that would want one carries a written `no_voice`
-   * reason instead.
+   * `navigate` and `closeAgentView` are the two the SHELL owns, and they are
+   * always there. The overlay togglers, the tile selection and the fixture
+   * stepper belong to `DeckSurface`, which publishes them up through
+   * `deckVoiceContext` while it is mounted (PRD #802 M7) — so a row naming one of
+   * them is servable on the deck and the overlay rows stopped being a plumbing
+   * project.
    *
-   * # The undo is a view, captured before the command runs
+   * **The shell's two are spread LAST on purpose.** The deck's own `navigate`
+   * and `closeAgentView` forward to the props this component passed it, so they
+   * are the same navigations by a longer route; taking the shell's directly
+   * keeps behaviour identical whether or not a deck happens to be mounted, which
+   * is what stops the overview and the deck disagreeing about what a command
+   * does.
    *
-   * Every spoken command in this slice is a navigation, so *undo* means "put the
-   * screen back". The destination is read off `view` at dispatch time rather than
-   * popped from a stack, which is the same choice `closeAgent` makes one screen
-   * up, and for the same reason: there is no history to be wrong about.
+   * On the overview the slot reads `undefined` and the context is the two alone.
+   * That is not a silent narrowing: `dispatchVoiceAction` checks each entry's
+   * declared `needs` first and answers `false`, which becomes `undefined` here
+   * and `NOTHING_DISPATCHED` in the report. The alternative was what M6 shipped —
+   * `TypeError: context.openOverlay is not a function`, rendered at the user.
+   *
+   * # The undo is a view, captured before the command runs — and OFFERED only
+   * where one moved
+   *
+   * *Undo* here means "put the screen back". The destination is read off `view`
+   * at dispatch time rather than popped from a stack, which is the same choice
+   * `closeAgent` makes one screen up, and for the same reason: there is no
+   * history to be wrong about.
+   *
+   * **Not every command is a navigation any more.** `open_settings` puts an
+   * overlay over the deck and leaves the view exactly where it was, so a
+   * `setView(previous)` for it restores a screen nothing left and the button
+   * would sit there doing visibly nothing — an affordance lying about what it
+   * reverses. So the navigation is OBSERVED rather than declared: the two
+   * view-moving members are wrapped here, and the Undo is offered only if one of
+   * them was actually called. That needs no new list beside the registry, and it
+   * uses a distinction `VoiceControlPanel.onDispatch` already draws — an object
+   * with no `undo` means *it ran and there is nothing to reverse*, which is not
+   * the same answer as `undefined`.
+   *
+   * What an overlay's real undo would be — closing that overlay — is a reverse
+   * for each entry rather than one for the shell, and nothing in this slice
+   * needs it.
    */
   const dispatchVoice = useCallback((outcome: Extract<VoiceOutcomeDto, { kind: "dispatch" }>) => {
     const previous = view;
@@ -419,9 +458,14 @@ export function DeckShell({ runtime, workflowPlatformIssue, initialView = { kind
       agentId: outcome.params.find((param) => param.kind === "agent_ref")?.value ?? "",
       from: base === "overview" ? "overview" : "deck",
     };
-    const context: VoiceDispatchContext = { navigate: setView, closeAgentView: closeAgent };
+    let moved = false;
+    const context: VoiceDispatchContext = {
+      ...deckVoiceContext.current,
+      navigate: (next) => { moved = true; setView(next); },
+      closeAgentView: () => { moved = true; closeAgent(); },
+    };
     if (!dispatchVoiceAction(outcome.invoke, context, target)) return undefined;
-    return { undo: () => setView(previous) };
+    return moved ? { undo: () => setView(previous) } : {};
   }, [base, closeAgent, selectedDeckId, view]);
   /* The COMPOSITE identity, never the bare id. See `deckPaneRetargeted` above
      and `DeckSurface`'s own promotion condition. */
@@ -440,7 +484,7 @@ export function DeckShell({ runtime, workflowPlatformIssue, initialView = { kind
         {agentView && paneDeck && paneAgent && <OverviewAgentPane runtime={runtime} view={agentView} deck={paneDeck} agent={paneAgent} attached={paneDeckAttachable} onClose={closeAgentView} />}
       </>
     )
-    : <DeckSurface runtime={runtime} settings={settings} workflowPlatformIssue={workflowPlatformIssue} onNavigate={setView} openAgent={openAgent} onCloseAgent={closeAgent} />;
+    : <DeckSurface runtime={runtime} settings={settings} workflowPlatformIssue={workflowPlatformIssue} onNavigate={setView} openAgent={openAgent} onCloseAgent={closeAgent} voiceChannel={deckVoiceContext} />;
   /*
     PRD #802 M6 — the voice surface is a SIBLING of the screen switch, and this
     shape is the whole of that decision.
@@ -651,7 +695,7 @@ export function ControlDeck(props: { runtime: DeckRuntimeState; workflowPlatform
   return <DeckSurface {...props} settings={settings} />;
 }
 
-export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktopWorkflowPlatformIssue(), onNavigate, openAgent, onCloseAgent }: { runtime: DeckRuntimeState; settings: DesktopSettingsState; workflowPlatformIssue?: string; onNavigate?: (view: DeckView) => void; openAgent?: { deckId: string; agentId: string }; onCloseAgent?: () => void }) {
+export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktopWorkflowPlatformIssue(), onNavigate, openAgent, onCloseAgent, voiceChannel }: { runtime: DeckRuntimeState; settings: DesktopSettingsState; workflowPlatformIssue?: string; onNavigate?: (view: DeckView) => void; openAgent?: { deckId: string; agentId: string }; onCloseAgent?: () => void; voiceChannel?: VoiceContextChannel }) {
   const { snapshot, mode, setShownTerminals } = runtime;
   /**
    * Which tile is promoted, decided on the FULL `(deckId, agentId)` identity.
@@ -940,6 +984,34 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
     focusTerminal,
     advanceFixture: () => { void perform({ type: "advance_fixture" }); },
   };
+
+  /**
+   * PRD #802 M7 — publish that context UP to {@link DeckShell}.
+   *
+   * The shell is the only component mounted for every screen, so it is where a
+   * voice dispatch has to be built; but five of the registry's entries reach
+   * state that lives here, in this component's `useState` booleans, and the
+   * shell cannot see it. Before this, a row naming one of them type-checked,
+   * passed rule 13, and threw at the call — with `context.openOverlay is not a
+   * function` rendered at the user above the report sentence.
+   *
+   * **No dependency array, on purpose**, for `useInertBackground`'s reason:
+   * `voiceContext` is rebuilt on every render because it closes over this
+   * render's props and setters, so re-publishing on every commit is what keeps
+   * the shell dispatching through live closures rather than the first ones.
+   * Nothing dispatches between a commit and its effects, so the momentary
+   * `undefined` a cleanup leaves is unobservable.
+   *
+   * The cleanup is the load-bearing half: unmounted — which is the whole time
+   * the overview is up — the slot reads `undefined`, the shell offers its own
+   * two members alone, and `dispatchVoiceAction` refuses an entry needing more
+   * instead of calling into a deck that is not there.
+   */
+  useEffect(() => {
+    if (!voiceChannel) return;
+    voiceChannel.current = voiceContext;
+    return () => { voiceChannel.current = undefined; };
+  });
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
