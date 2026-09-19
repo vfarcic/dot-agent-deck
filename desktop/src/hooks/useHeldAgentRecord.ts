@@ -37,12 +37,22 @@
  * # The key guard is load-bearing
  *
  * The held record carries the `(deckId, agentId)` it is FOR, and is read back
- * only on an exact match. Without that, closing a pane on a live deck and
- * opening one on an unreachable deck would render the first agent's record
- * under the second agent's view — the composite-identity confusion PRD #1105's
- * security audit is about, arriving by a new route. Comparing during render
- * rather than clearing in an effect is what makes it hold on the **first**
- * commit of the new pane, which is the commit an effect runs after.
+ * only on an exact match — through {@link agentKey}, whose `NUL` separator is
+ * the one byte neither component can contain, so two identities cannot spell
+ * one key. Without that fence, closing a pane on a live deck and opening one
+ * on an unreachable deck would render the first agent's record under the
+ * second agent's view — the composite-identity confusion PRD #1105's security
+ * audit is about, arriving by a new route.
+ *
+ * Comparing during render rather than clearing in an effect is what makes the
+ * fence hold on the **first** commit of the new pane, which is the commit an
+ * effect runs after. The ref is written during render for the same reason
+ * `useShownTerminals` writes its own (`latest.current = targets`): the value
+ * has to be current *for this render*, not for the one after it. Both writes
+ * are idempotent — re-running this body with the same inputs stores the same
+ * record — so a render React discards or repeats costs nothing, and the only
+ * field that would differ is `confirmedAt`, which is a real instant at which
+ * the deck really had reported that record either way.
  *
  * # How stale may it be — unbounded in time, bounded by the pane
  *
