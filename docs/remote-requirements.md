@@ -9,7 +9,7 @@ What a host must provide for a `dot-agent-deck` **remote environment** — a per
 
 For lifecycle, failure modes, and how connecting works see [Remote Environments](remote-environments.md). For provisioning recipes see [Remote Recipes](remote-recipes.md).
 
-> **Status:** v1 requirements. The Required section reflects what was confirmed to work on a fresh Ubuntu 24.04 LTS UpCloud VM, which has been the reference target throughout; the Recommended section reflects best-practice hardening that has not yet been re-validated end to end on a clean provision. macOS is a third state — `remote add` installs there and the release ships a daemon build for it, but nobody has run the path end to end, so it is documented as what it is rather than as supported or unsupported.
+> **Status:** v1 requirements. The Required section reflects what was confirmed to work on a fresh Ubuntu 24.04 LTS VM, which has been the reference target throughout; the Recommended section reflects best-practice hardening that has not yet been re-validated end to end on a clean provision. macOS is a third state — `remote add` installs there and the release ships a daemon build for it, but nobody has run the path end to end, so it is documented as what it is rather than as supported or unsupported.
 
 ## How this page is organized
 
@@ -188,7 +188,7 @@ Git is the sync layer. Clone the repository on the remote, run agents against it
 ## See also
 
 - [Remote Environments](remote-environments.md) — lifecycle model, stop vs detach, failure modes, hooks behavior.
-- [Remote Recipes](remote-recipes.md) — provisioning snippets for multipass, Hetzner, UpCloud, bare metal.
+- [Remote Recipes](remote-recipes.md) — provisioning snippets for Multipass, a cloud VM, and bare metal.
 
 ## What is not required
 

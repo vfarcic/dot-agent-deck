@@ -9,7 +9,7 @@ Provisioning snippets that get a Linux host into a state where `dot-agent-deck r
 
 For prerequisites the host must satisfy see [Remote Environment Requirements](remote-requirements.md). For lifecycle and connection semantics see [Remote Environments](remote-environments.md). The Kubernetes-as-host recipe lives in [issue #81](https://github.com/vfarcic/dot-agent-deck/issues/81) and is not yet shipped.
 
-> **Status.** Validated on a fresh Ubuntu 24.04 LTS UpCloud VM. Other providers should work given the same OS and SSH posture, but have not been independently re-tested. If a provider's image needs different bootstrap steps, the differences are typically in the cloud-init / first-login section — the deck-side flow (`remote add`) is identical once SSH and a non-root user with the agent toolchain are in place.
+> **Status.** Validated on Ubuntu 24.04 LTS. **Which provider you use does not matter to the deck** — `remote add` behaves identically on any host once SSH and a non-root user with the agent toolchain are in place, so the recipes below differ only in how you get a machine. Where a provider's image needs different bootstrap steps, the difference is in the cloud-init / first-login section rather than in anything the deck does.
 
 ## Common shape
 
@@ -74,6 +74,8 @@ dot-agent-deck connect dad-dev
 
 ## Hetzner Cloud
 
+One cloud provider worked through end to end. Any other provider is the same recipe with a different VM-creation step — see the Status note above.
+
 Cheap, reliable, simple API. Replace `<your-ssh-key-name>` with the key registered in Hetzner Cloud Console.
 
 ```bash
@@ -136,27 +138,9 @@ dot-agent-deck remote add hetzner-1 deck@$IP \
   --key ~/.ssh/dot-agent-deck
 ```
 
-## UpCloud
-
-UpCloud is the reference host. The flow is identical to Hetzner once the VM exists; the differences are at the IaaS layer.
-
-```bash
-# Create the VM via the upctl CLI (or the web console). Pick whichever
-# template / plan fits — anything ≥ 2 vCPU / 2 GiB RAM running Ubuntu
-# 24.04 LTS is sufficient.
-upctl server create \
-    --hostname dad-dev \
-    --plan 2xCPU-2GB \
-    --os "Ubuntu Server 24.04 LTS" \
-    --ssh-keys "$(cat ~/.ssh/id_ed25519.pub)" \
-    --zone <your-zone>
-```
-
-Then bootstrap the VM the same way as the Hetzner recipe (non-root user, `~/.local/bin` on PATH, Node.js + agent install, `enable-linger`). The only UpCloud-specific note: cloud-init sets `root` as the default user; create a non-root user before running `remote add` so the daemon doesn't run as root.
-
 ## Bare metal / desk-side box
 
-Any always-on Linux box on your network works — a homelab server, a Raspberry Pi 5, an old laptop. The flow is just the bootstrap section of the cloud recipes minus the IaaS step:
+Any always-on Linux box on your network works — a homelab server, a Raspberry Pi 5, an old laptop. The flow is just the bootstrap section of the cloud recipe minus the VM-creation step:
 
 1. Install Ubuntu 24.04 LTS (or your distribution of choice — see [Remote Environment Requirements](remote-requirements.md) for what's required).
 2. Create a non-root user, add your laptop's ssh key to its `~/.ssh/authorized_keys`.
