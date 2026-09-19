@@ -41,6 +41,7 @@ use crate::repo_identity;
 use crate::state::{AppState, DashboardStats, SessionState, SessionStatus, SharedState};
 use crate::tab::{OrchestrationRoleStatus, OrchestrationStatus, Tab, TabId, TabManager};
 use crate::tab_layout::fit_tab_labels;
+use crate::terminal_hangup;
 use crate::terminal_widget::TerminalWidget;
 
 // ---------------------------------------------------------------------------
@@ -11776,7 +11777,8 @@ impl Drop for KeyboardEnhancementGuard {
     }
 }
 
-/// The three reporting modes [`run_tui`] turns on, and whether they are on now.
+/// The terminal state [`run_tui`] turns on, and whether it is on now: the three
+/// reporting modes, plus the raw-mode / alternate-screen switch `ratatui` owns.
 ///
 /// Mouse capture and bracketed paste make mouse and paste events reach the
 /// event loop; focus reporting (`?1004h`, PRD #1105 M11) makes a terminal that
@@ -11786,7 +11788,7 @@ impl Drop for KeyboardEnhancementGuard {
 /// `ESC [ O` on every window focus change, and brackets around every paste,
 /// garbling its command line until the terminal is reset.
 ///
-/// **Shared, so each teardown path turns them off exactly once.** A clone is
+/// **Shared, so each teardown path turns it off exactly once.** A clone is
 /// held by the panic hook, and one by the [`TerminalModesGuard`] `run_tui`
 /// keeps for the event loop; [`Self::disable`] is a test-and-clear on the one
 /// flag they share, so the explicit teardown, the guard's `Drop` and the panic
@@ -11795,8 +11797,38 @@ impl Drop for KeyboardEnhancementGuard {
 /// to the terminal — each mode is a flag, not a stack — so this is about not
 /// writing to a terminal that one path has already handed back, rather than
 /// about correctness of the modes themselves.
-#[derive(Clone, Default)]
-struct TerminalModes(Arc<std::sync::atomic::AtomicBool>);
+///
+/// **Issue #1162 — the [`ratatui::restore()`] is inside that same test-and-clear
+/// rather than beside it.** #1141 put the three modes behind this guard and left
+/// the restore at the explicit teardown, which the event loop's `?` returns jump
+/// straight past — so an I/O error dropped the user into a shell still in raw
+/// mode and still on the alternate screen, with their scrollback replaced by the
+/// TUI's last frame and no echo on the prompt. That is a worse end state than
+/// the mode leak #1141 was filed about and it is reached by exactly the same
+/// paths, so it belongs to the same flag: one clear, one restore, whichever
+/// combination of teardown paths runs. The ORDER the explicit teardown
+/// established is preserved inside `disable` — mode disables first, restore
+/// after — and the keyboard-enhancement pop still precedes both, on the error
+/// path because [`KeyboardEnhancementGuard`] is declared later and so drops
+/// first.
+#[derive(Clone)]
+struct TerminalModes {
+    on: Arc<std::sync::atomic::AtomicBool>,
+    /// What "hand the terminal back" means. [`ratatui::restore`] in production;
+    /// the L1 tests substitute a counter, because a unit test must not disable
+    /// raw mode on, or leave the alternate screen of, the terminal running the
+    /// suite — and because counting is how they assert it happens exactly once.
+    restore: Arc<dyn Fn() + Send + Sync>,
+}
+
+impl Default for TerminalModes {
+    fn default() -> Self {
+        Self {
+            on: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            restore: Arc::new(ratatui::restore),
+        }
+    }
+}
 
 impl TerminalModes {
     /// Turn the three modes on, and return the guard that turns them off.
@@ -11806,7 +11838,7 @@ impl TerminalModes {
     /// leaves a guard whose `Drop` writes the disables, rather than returning an
     /// error with some modes on and nothing to turn them off.
     fn enable<W: std::io::Write>(&self, out: W) -> std::io::Result<TerminalModesGuard<W>> {
-        self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.on.store(true, std::sync::atomic::Ordering::SeqCst);
         let mut guard = TerminalModesGuard {
             modes: self.clone(),
             out,
@@ -11822,15 +11854,22 @@ impl TerminalModes {
     }
 
     /// Turn the three modes off by writing their disable sequences to `out`,
-    /// unless another path already has — or they were never turned on.
+    /// then hand the terminal back, unless another path already has — or it was
+    /// never turned on.
+    ///
+    /// Issue #1162: the restore is the second half of this, not a separate step
+    /// a caller may forget. `ratatui::restore()` disables raw mode and leaves
+    /// the alternate screen, and every path that reaches here wants both halves
+    /// in this order.
     fn disable(&self, out: &mut impl std::io::Write) {
-        if self.0.swap(false, std::sync::atomic::Ordering::SeqCst) {
+        if self.on.swap(false, std::sync::atomic::Ordering::SeqCst) {
             let _ = crossterm::execute!(
                 out,
                 crossterm::event::DisableMouseCapture,
                 crossterm::event::DisableBracketedPaste,
                 crossterm::event::DisableFocusChange,
             );
+            (self.restore)();
         }
     }
 }
@@ -11841,9 +11880,14 @@ impl TerminalModes {
 /// skips its explicit teardown. This guard's `Drop` turns the modes off on
 /// those returns, and on an unwinding panic the hook did not already cover.
 ///
-/// The explicit teardown still calls [`Self::disable`] itself, because the
-/// ORDER there is deliberate — after the keyboard-enhancement pop, before
-/// `ratatui::restore()` — and once it has, the `Drop` writes nothing.
+/// The explicit teardown still calls [`TerminalModes::disable`] itself, because
+/// the ORDER there is deliberate — after the keyboard-enhancement pop, and
+/// before issue #576's session-warning flush, which needs the terminal already
+/// handed back. Once it has, the `Drop` writes nothing and restores nothing.
+///
+/// Issue #1162: because `disable` now also restores, this `Drop` is what puts
+/// the user's shell back on the main screen and out of raw mode on the `?`
+/// returns — the half #1141 left outside the guard.
 struct TerminalModesGuard<W: std::io::Write> {
     modes: TerminalModes,
     out: W,
@@ -12228,8 +12272,12 @@ pub fn run_tui(
         // survives the process and corrupts key delivery in the shell the user
         // is dropped back into.
         pop_keyboard_enhancement();
+        // Issue #1162: `disable` restores the terminal as its second half, so
+        // the order here is unchanged — pop, modes, restore — with one call
+        // fewer. A hook that runs after the explicit teardown already did this
+        // writes nothing and restores nothing, which is the same test-and-clear
+        // property the modes always had.
         hook_terminal_modes.disable(&mut std::io::stdout());
-        ratatui::restore();
         original_hook(info);
     }));
 
@@ -12262,6 +12310,51 @@ pub fn run_tui(
     // Bound to a NAMED binding — `let _ = …` would drop it immediately and pop
     // the flag before the event loop ever runs.
     let _keyboard_enhancement = KeyboardEnhancementGuard::push();
+
+    // Issue #1138: notice the terminal hanging up. The event loop cannot do
+    // this for itself — crossterm's Unix event source has no `Ok(0)` break, so
+    // once the terminal is gone `event::poll` never returns at all and the deck
+    // spins at 100% of a core until it is killed by hand
+    // (`crate::terminal_hangup` has the measurements and the upstream code).
+    // The kernel's SIGHUP goes to the session leader alone, so this only
+    // matters when the deck is NOT it — `ssh -t host task run`, a tmux pane
+    // running `task` — which is exactly the reported shape.
+    //
+    // Bound to a NAMED binding, like `_keyboard_enhancement` above: `let _ = …`
+    // would stop the watchdog before the event loop ever ran.
+    let hung_up = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let unwinding = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let _hangup_watch = terminal_hangup::watch_controlling_terminal({
+        let hung_up = Arc::clone(&hung_up);
+        let unwinding = Arc::clone(&unwinding);
+        move || {
+            tracing::warn!("terminal hung up; shutting the deck down");
+            // Ask the event loop to leave by its own quit path, which saves the
+            // session. It takes this only if it is not already wedged — see
+            // `terminal_hangup`'s module docs for the measurement, which is
+            // that on crossterm 0.29 it never is.
+            hung_up.store(true, std::sync::atomic::Ordering::SeqCst);
+            let acknowledged = terminal_hangup::wait_for(&unwinding, terminal_hangup::ACK_WINDOW);
+            if acknowledged {
+                // It is unwinding: give the teardown room to finish, during
+                // which the process normally exits on its own and never
+                // reaches the line below.
+                std::thread::sleep(terminal_hangup::UNWIND_GRACE);
+            }
+            // Nothing here is worth an unwind the wedged thread can never
+            // perform: the terminal is gone, so there is nothing to restore and
+            // nobody to render to, and the agents survive a bare exit by design
+            // — dropping the attach sockets is what the daemon reads as a
+            // detach (PRD #93 Phase 2), and process exit drops them exactly as
+            // the teardown would.
+            tracing::warn!(
+                acknowledged,
+                "terminal hangup: ending the process rather than spinning on a \
+                 terminal that is gone"
+            );
+            std::process::exit(terminal_hangup::HANGUP_EXIT_CODE);
+        }
+    });
 
     let mut tick: u64 = 0;
     let mut ui = UiState::new(config, keybindings);
@@ -13374,6 +13467,29 @@ pub fn run_tui(
     ui.session_focus = tab_manager.capture_focus_snapshot();
 
     'outer: loop {
+        // Issue #1138: the clean half of the hangup response. The watchdog
+        // thread sets this, and leaving by the same `break 'outer` a quit takes
+        // means the session snapshot below is written — so an ssh link dropping
+        // costs the user their terminal but not their pane layout. A `return
+        // Err` here would have skipped that save, which is the whole reason
+        // this is a break and not an error.
+        //
+        // Deliberately the DETACH shape rather than a shutdown: the agents keep
+        // running and the daemon reads the dropped attach sockets as a detach
+        // (PRD #93 Phase 2), which is what a user whose terminal died wants to
+        // come back to.
+        //
+        // Unreachable once the loop is wedged in `crossterm::event::poll`
+        // below, which is why the watchdog also ends the process on its own —
+        // this is the better outcome, not the guaranteed one.
+        if hung_up.load(std::sync::atomic::Ordering::SeqCst) {
+            // Acknowledge before leaving: that is what buys the teardown below
+            // the watchdog's patience instead of its shorter ack window.
+            unwinding.store(true, std::sync::atomic::Ordering::SeqCst);
+            tracing::info!("terminal hung up; detaching cleanly");
+            break 'outer;
+        }
+
         // Expire stale status messages
         if let Some((_, created)) = &ui.status_message
             && created.elapsed() > STATUS_MESSAGE_TTL
@@ -15212,8 +15328,10 @@ pub fn run_tui(
     // PRD #227 M2: undo the enhanced-keyboard push (no-op if it never happened)
     // alongside the mouse-capture / bracketed-paste restores.
     pop_keyboard_enhancement();
+    // Issue #1162: this both writes the mode disables and calls
+    // `ratatui::restore()`, in that order — the restore is no longer a separate
+    // line here, so the `?` returns above cannot skip it.
     terminal_modes.disable();
-    ratatui::restore();
 
     // Flush accumulated session warnings now that the terminal is restored.
     // Sanitised on the way out — see `flush_session_warnings` for why that
@@ -31323,6 +31441,31 @@ mod tests {
             + &ansi(crossterm::event::DisableFocusChange)
     }
 
+    /// A [`TerminalModes`] whose restore counts instead of running.
+    ///
+    /// Issue #1162 put `ratatui::restore()` inside [`TerminalModes::disable`],
+    /// so every test below would otherwise disable raw mode and leave the
+    /// alternate screen of whatever terminal this process can reach —
+    /// crossterm resolves that through `/dev/tty` when stdin is not a terminal,
+    /// which under nextest is the DEVELOPER's terminal, not a captured one.
+    /// Counting is also how these tests assert the restore happens exactly
+    /// once across a combination of teardown paths.
+    fn counting_modes() -> (TerminalModes, Arc<std::sync::atomic::AtomicUsize>) {
+        let restores = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&restores);
+        let modes = TerminalModes {
+            on: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            restore: Arc::new(move || {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }),
+        };
+        (modes, restores)
+    }
+
+    fn restores(counter: &Arc<std::sync::atomic::AtomicUsize>) -> usize {
+        counter.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     /// Stands in for `run_tui`: enable the modes, run an event-loop step that
     /// may fail and is propagated with `?`, and only then reach the explicit
     /// teardown.
@@ -31345,7 +31488,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn terminal_modes_are_turned_off_when_the_event_loop_returns_an_error() {
-        let modes = TerminalModes::default();
+        let (modes, restore_calls) = counting_modes();
         let out = SharedTerminalOutput::default();
         let result = run_with_terminal_modes(&modes, out.clone(), || {
             Err(std::io::Error::other("terminal.draw failed"))
@@ -31362,6 +31505,18 @@ mod tests {
                 .ends_with(&ansi(crossterm::event::DisableFocusChange)),
             "focus reporting, the mode M11 added, is among them"
         );
+        // Issue #1162 — the half #1141 left outside the guard. Without it the
+        // user is dropped into a shell still in raw mode and still on the
+        // alternate screen, which is a worse end state than the mode leak and
+        // reads as the shell being broken rather than as a deck exit.
+        assert_eq!(
+            restores(&restore_calls),
+            1,
+            "an error return must also hand the terminal back: `ratatui::restore()` \
+             disables raw mode and leaves the alternate screen, and skipping it \
+             leaves the prompt without echo, line editing misbehaving, and the \
+             scrollback replaced by the TUI's last frame"
+        );
     }
 
     /// PRD #1105 M11 audit — each teardown path writes the disables at most
@@ -31373,7 +31528,7 @@ mod tests {
     fn terminal_modes_are_turned_off_once_whichever_teardown_paths_run() {
         let on_then_off = terminal_modes_on() + &terminal_modes_off();
 
-        let modes = TerminalModes::default();
+        let (modes, clean_restores) = counting_modes();
         let out = SharedTerminalOutput::default();
         run_with_terminal_modes(&modes, out.clone(), || Ok(())).expect("a clean run");
         assert_eq!(
@@ -31382,8 +31537,15 @@ mod tests {
             "the explicit teardown writes the disables, and the guard dropping after it \
              writes nothing more"
         );
+        assert_eq!(
+            restores(&clean_restores),
+            1,
+            "issue #1162: the explicit teardown restores, and the guard dropping after \
+             it must not restore a second time — a double `?1049l` would leave the \
+             main screen on a terminal that is already back on it"
+        );
 
-        let modes = TerminalModes::default();
+        let (modes, hook_restores) = counting_modes();
         let out = SharedTerminalOutput::default();
         let hook_out = SharedTerminalOutput::default();
         let guard = modes.enable(out.clone()).expect("enable");
@@ -31397,14 +31559,25 @@ mod tests {
             terminal_modes_on(),
             "after the panic hook turned the modes off, the guard's Drop writes nothing"
         );
+        assert_eq!(
+            restores(&hook_restores),
+            1,
+            "issue #1162: the panic hook restored, so the guard's Drop must not"
+        );
 
-        let never_enabled = TerminalModes::default();
+        let (never_enabled, never_restores) = counting_modes();
         let hook_out = SharedTerminalOutput::default();
         never_enabled.disable(&mut hook_out.clone());
         assert_eq!(
             hook_out.text(),
             "",
             "a panic before the modes were turned on writes nothing"
+        );
+        assert_eq!(
+            restores(&never_restores),
+            0,
+            "issue #1162: and restores nothing — there is no alternate screen to leave \
+             and no raw mode to disable before `run_tui` turned them on"
         );
     }
 

@@ -67,6 +67,7 @@ pub mod spawn;
 pub mod state;
 pub mod tab;
 pub mod tab_layout;
+pub mod terminal_hangup;
 pub mod terminal_widget;
 // Issue #322: test-only, and never part of the shipped library. Unit tests in
 // this crate do not link `tests/common/`, so before this they allocated scratch
