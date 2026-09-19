@@ -1198,6 +1198,17 @@ PRD #802 is building voice control for this app, and one piece of it has landed 
 
 **What it does NOT see, said here as well as at the failure itself.** The check proves every registry **entry** is classified. It does **not** prove the registry is **complete**. A control wired with a bare `onClick` that never reaches `VOICE_ACTIONS` is invisible to it, and there were 80 `onClick=` sites in non-test `.tsx` under `desktop/src` when PRD #802 was written, against 7 static palette entries and 7 rail buttons. Most of the ones sampled are chrome — dismiss a toast, close a sheet — and the check could not tell a capability from a close button anyway, so the residue is not claimed to be harmless. Read a green check 13 as "the table and the registry agree", never as "nobody forgot a capability". The one mechanical approximation to the second claim is pinning a count of interactive controls, which that PRD's Open Question 3 recommends against for now with its churn cost named.
 
+
+### What the voice feature does and does not persist
+
+PRD #802's Open Question 5 asked whether any part of an utterance is stored. The answer is in **two halves**, and the unqualified one-half version was written down and was false, which is why it is spelled out here.
+
+**This app persists nothing.** No transcript, utterance or audio buffer is written to a log or to disk by any code in `desktop/src-tauri/src/voice/`. `Transcript` and `Pcm16` both carry hand-written `Debug` impls that print a length and no content, so a derived `{:?}` on a container that holds one prints neither — which closes the careless route; the deliberate route is a rule this crate keeps. The IPC seam carries it one step earlier: `desktop_voice_stop` transcribes Rust-side and returns text, so no audio buffer ever crosses into the webview.
+
+**A child process the app hands the prompt to is a different question, and this is where the first answer was wrong.** The `claude` intent backend passes the whole prompt — the utterance, and the agent labels from the daemon with it — to another application, and that application has storage of its own. It was writing a resumable session containing all of it; a redacted `Debug` impl in Rust does nothing about that. The backend now passes `--no-session-persistence` along with the rest of its containment flags (`voice/agent_cli.rs` has the table and quotes `claude --help` for each). So the honest claim is **"this app writes none, and where it hands one to a child it instructs that child not to"** — which is weaker than the unqualified version and is true. The `opencode` backend was withdrawn in the same change, because it has no equivalent flag.
+
+**A hosted backend's own retention is neither of those halves and is not something this app can assert at all.** The keyed remote intent and transcription backends upload to an endpoint; what that endpoint keeps is its policy.
+
 ## Current milestone limits
 
 - The Tauri crate directly reuses the root library; the standalone protocol-crate extraction remains pending.
