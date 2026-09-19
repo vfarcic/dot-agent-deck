@@ -180,7 +180,7 @@ fn bound_chars(s: &str, max: usize) -> std::borrow::Cow<'_, str> {
 /// deliberately not escaped: nothing parses this output back, and doubling it
 /// would cost real legibility on the messages that quote a Windows path or a
 /// regex.
-fn escape_for_terminal(s: &str) -> std::borrow::Cow<'_, str> {
+pub(crate) fn escape_for_terminal(s: &str) -> std::borrow::Cow<'_, str> {
     if !s.chars().any(needs_escape) {
         return std::borrow::Cow::Borrowed(s);
     }
@@ -210,6 +210,22 @@ fn escape_for_terminal(s: &str) -> std::borrow::Cow<'_, str> {
 /// Clamping first is what stops a field that is not prose from filling the file.
 pub(crate) fn escape_field_for_log(value: &str, max_chars: usize) -> String {
     escape_for_terminal(&bound_chars(value, max_chars)).into_owned()
+}
+
+/// Issue #1082: [`escape_field_for_log`] at [`MAX_QUOTED_VALUE_CHARS`] — the
+/// spelling for the daemon's socket surface, where every field being escaped is
+/// an IDENTIFIER a producer supplied (a pane id, a session id, a role name)
+/// rather than prose.
+///
+/// A shorthand, not a second helper: it is that call with the default bound and
+/// nothing else. It earns a name because that surface has ~20 of them — spelled
+/// out, each costs four wrapped lines inside a `tracing` macro and the bound
+/// stops being the interesting part of the line, while `grep escape_id_for_log`
+/// enumerates the swept class in one command. A site that needs a DIFFERENT
+/// bound calls [`escape_field_for_log`] directly and says why there;
+/// `crate::daemon`'s raw hook line is the one that does.
+pub(crate) fn escape_id_for_log(value: &str) -> String {
+    escape_field_for_log(value, MAX_QUOTED_VALUE_CHARS)
 }
 
 /// The predicate behind [`escape_for_terminal`] — see its doc for why the set is
@@ -1083,6 +1099,29 @@ mod tests {
             "ordinary-unit-name",
             "an ordinary name must pass through untouched, or every log reads worse"
         );
+    }
+
+    /// Issue #1082: the shorthand the daemon's socket sweep spells at ~20 call
+    /// sites must stay exactly [`escape_field_for_log`] at
+    /// [`MAX_QUOTED_VALUE_CHARS`]. A wrapper that quietly drifted would move all
+    /// of them at once and no per-site test would notice, because each of those
+    /// asserts the PROPERTY (nothing a terminal acts on survives) rather than
+    /// the bound.
+    #[test]
+    fn escape_id_for_log_is_the_default_bound_of_escape_field_for_log() {
+        let long = "z".repeat(5_000);
+        for value in [
+            "ordinary-pane-id",
+            "unit\nINFO forged\rovershoot\u{1b}[2Jcleared\u{202e}reversed",
+            "",
+            long.as_str(),
+        ] {
+            assert_eq!(
+                escape_id_for_log(value),
+                escape_field_for_log(value, MAX_QUOTED_VALUE_CHARS),
+                "the shorthand must be the two-argument call and nothing else"
+            );
+        }
     }
 
     /// Issue #308 audit (MEDIUM): the flood backstop covers fields no producer
