@@ -77,6 +77,11 @@ mod test_temp;
 // Unit tests do not link `tests/common/`, so `init_test_env`'s scrub of the deck
 // endpoint variables never ran for them and a fixture that spawned an emitter
 // posted hook events into the developer's live dashboard.
+// Issue #709's load-scaled wait ceilings, for the lib target's own unit tests.
+// `tests/common/mod.rs` has the same helper and the full rationale, but this
+// target does not link that file — the wall `test_isolation` documents.
+#[cfg(test)]
+mod test_budget;
 #[cfg(test)]
 mod test_isolation;
 pub mod ui;
