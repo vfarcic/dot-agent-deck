@@ -413,6 +413,58 @@ describe("a pane with no terminal", () => {
   });
 
   /**
+   * Scenario: a DECK-origin pane is open — build-box is the selected deck and
+   * its Planner is a promoted tile — and build-box stops answering. No pane is
+   * rendered from the held record, and the deck screen's own disconnected
+   * banner, with the Reconnect control on it, is reachable.
+   *
+   * # This is a scope decision, and the reason is measured rather than argued
+   *
+   * Issue #1143's hold is read by the OVERVIEW-origin pane and by nothing else.
+   * The deck path is not an oversight and not an effort question: a promoted
+   * pane marks everything that is not one of its own ancestors `inert`
+   * (`useInertBackground`, whose doc names a connection banner as exactly the
+   * background content it re-marks on every commit). So a held deck-origin pane
+   * would explain that the deck is not answering while putting the one control
+   * that fixes it behind an inert barrier — measured on this very fixture: with
+   * a pane promoted and a banner showing, the banner carries `inert` and its
+   * `Reconnect` button inherits it.
+   *
+   * The two screens are not symmetrical, which is why one answer does not fit
+   * both. The overview goes on listing every other deck's agents normally, so
+   * the missing pane is the only thing that can say what happened, and `Esc`
+   * returns to a screen that is still useful. The deck screen says it in a
+   * banner, in its own words, with the remedy attached — and has no tiles at
+   * all, so there is nothing for a reader to misread as live.
+   *
+   * What the deck path keeps is the guarantee PR #1126 gave it: the view is not
+   * closed, so the pane is back the moment the deck answers.
+   */
+  it("leaves a deck-origin pane's screen to explain itself, with its remedy reachable", async () => {
+    const deckView = { kind: "agent" as const, deckId: REMOTE_DECK_ID, agentId: "planner", from: "deck" as const };
+    const answering = harness("connected");
+    const { rerender } = render(<DeckShell runtime={answering.runtime("remote")} initialView={deckView} />);
+    expect(screen.getByTestId("agent-pane-overlay")).toBeVisible();
+
+    const away = harness("disconnected");
+    await act(async () => { rerender(<DeckShell runtime={away.runtime("remote")} initialView={deckView} />); });
+
+    // No pane, so nothing is inert and the screen speaks for itself.
+    expect(screen.queryByTestId("agent-pane-overlay")).not.toBeInTheDocument();
+    const banner = document.querySelector(".connection-banner");
+    expect(banner).not.toBeNull();
+    expect(banner).not.toHaveAttribute("inert");
+    expect(within(banner as HTMLElement).getByRole("button", { name: /Reconnect/i })).toBeVisible();
+    expect(banner).toHaveTextContent(REMOTE_DECK_FAILURE);
+
+    // The view was KEPT, so the pane is back when the deck is — PR #1126's
+    // guarantee, which this path still has and still needs.
+    const returned = harness("connected");
+    await act(async () => { rerender(<DeckShell runtime={returned.runtime("remote")} initialView={deckView} />); });
+    expect(screen.getByTestId("agent-pane-overlay")).toBeVisible();
+  });
+
+  /**
    * The control for every test above, stated as a fact about the fixture rather
    * than as an argument: both decks run an agent called `planner`, so "the
    * other deck's namesake" names a real, different agent on a real, different

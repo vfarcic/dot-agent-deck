@@ -262,6 +262,19 @@ export function DeckShell({ runtime, workflowPlatformIssue, initialView = { kind
    * which is the distinction `pruneFleet` already *"refuses to cross on its
    * own"* (`lib/bridge.ts`). That case keeps today's behaviour: the view
    * survives and the pane returns if the deck does.
+   *
+   * **The DECK-origin pane is not held either, and that is measured rather than
+   * assumed.** A promoted pane marks everything off its own ancestor path
+   * `inert` ({@link useInertBackground}, whose doc names a connection banner as
+   * exactly the background content it re-marks), so a held deck-origin pane
+   * would explain that the deck is not answering while putting the `Reconnect`
+   * control that fixes it behind an inert barrier — verified on the fixture:
+   * banner `inert`, button inheriting it. The deck screen already says the
+   * thing, in its own banner, with the remedy attached, and shows no tiles a
+   * reader could misread as live; the overview has no such sentence anywhere,
+   * which is what makes the pane the only surface that can speak there. Both
+   * halves are pinned by `leaves a deck-origin pane's screen to explain itself,
+   * with its remedy reachable`.
    */
   const heldPaneAgent = useHeldAgentRecord(agentView, paneAgent);
   /** The record the pane RENDERS: the deck's current answer, else its last one. */
