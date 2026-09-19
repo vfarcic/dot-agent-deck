@@ -1896,11 +1896,11 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** the Codex, Devin or OpenCode writers (the resolver is shared and unit-covered); the duplication arithmetic in a pre-seeded config (`durable_hook_binary_path.rs`'s install-seam units); that the seeded executable actually runs.
 - **Platform coverage:** mac+linux.
 
-##### hooks/install/008 — The same scratch copy with nothing to fall back to refuses, says why, and writes nothing (issue #1140).
+##### hooks/install/008 — The same scratch copy with nothing to fall back to pins ITSELF as a last resort, rather than refusing (issue #1140).
 - **Layer:** as `hooks/install/007`.
 - **Agent:** none (no install seeded).
-- **Asserts:** the command exits non-zero, its output names the *location* as the cause (`not an installed dot-agent-deck`) rather than leaving the operator staring at a binary that plainly exists and runs, and `~/.claude/settings.json` is never created — PRD #381 M6's "resolution first, so a refusal writes nothing at all", now reached through issue #1140's new refusal cause.
-- **Does not assert:** the full wording of the refusal or the repair advice that follows it; the auto-install path's equivalent (silent, `tracing::warn!` only — `hooks/install/005`).
+- **Asserts:** with no `$HOME/.local/bin/dot-agent-deck` and no deck on the child's `PATH`, the command still succeeds and every deck-owned command in `~/.claude/settings.json` names the running binary. This is the third arm of the resolver's policy and the counterweight to `007`: preferring an install over a scratch copy is #1140's fix, but refusing the scratch copy when there is no install buys no agent hooks at all on a machine whose only deck is that binary — a packaged desktop running its bundled sidecar. A **cargo artifact** still refuses in the same situation, which is what separates "known ephemeral" from "not vouched for" (`hooks/install/005`).
+- **Does not assert:** the `tracing::warn!` the last-resort pin emits (unit-covered in `platform::paths`); the desktop bundle layouts themselves (#1157).
 - **Platform coverage:** mac+linux.
 
 ### Pane / agent lifecycle

@@ -21,6 +21,18 @@
 //! Fast tier, not `e2e`: a CLI subprocess against an isolated `HOME`, no PTY,
 //! no daemon, no LLM — the same shape as `tests/worktree_reclaim.rs` and the
 //! `daemon/status/004`–`005` entries.
+//!
+//! **Unix only, and the gate is isolation rather than portability** (Greptile
+//! P1 on PR #1156, confirmed by `build-windows` going red on the first push).
+//! These tests hand the child an `env_clear`ed environment carrying `HOME` and
+//! `PATH`, which isolates it on Unix because `platform::paths::home_dir` reads
+//! `HOME` there. On Windows it reads the known-folder API instead, so the child
+//! would resolve `~/.local/bin` and `~/.claude/settings.json` under the
+//! runner's **real** profile while every assertion here inspects the fixture —
+//! failing, and writing into a profile no test owns. Isolating it properly
+//! needs the Windows profile variables and a Windows executable fixture, which
+//! is more than this regression needs; the catalog entries say `mac+linux`.
+#![cfg(unix)]
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -240,32 +252,37 @@ fn install_007_a_scratch_copy_pins_the_install_not_itself() {
 
 /// Scenario: The same scratch copy, but with no install seeded at
 /// `$HOME/.local/bin` and no `dot-agent-deck` on the child's `PATH`. `hooks
-/// install --agent claude-code` must fail rather than pin the scratch path, say
-/// on stderr that the running binary is not an installed deck, and leave
-/// `~/.claude/settings.json` uncreated.
+/// install --agent claude-code` must still succeed, pinning the running binary
+/// as a last resort rather than refusing, and every command it writes must name
+/// that binary — a machine whose only deck is this one gets hooks, not silence.
 #[spec("hooks/install/008")]
 #[test]
-fn install_008_a_scratch_copy_with_no_install_refuses_and_writes_nothing() {
+fn install_008_a_scratch_copy_with_no_install_pins_itself_as_a_last_resort() {
     let fixture = Fixture::new();
     let scratch = fixture.scratch_deck();
 
     let out = fixture.run(&scratch, &["hooks", "install", "--agent", "claude-code"]);
     let report = combined(&out);
     assert!(
-        !out.status.success(),
-        "`hooks install` reported success with nothing durable to write:\n{report}"
-    );
-    assert!(
-        report.contains("not an installed dot-agent-deck"),
-        "the refusal must name the location as the cause — the operator is looking at a \
-         binary that plainly exists and runs:\n{report}"
+        out.status.success(),
+        "`hooks install` refused where the running binary was the only deck on the \
+         machine — that buys no hooks at all, not caution:\n{report}"
     );
 
     let settings = fixture.settings();
+    let body = std::fs::read_to_string(&settings).expect("read settings.json");
+    let commands = deck_commands(&settings);
     assert!(
-        !settings.exists(),
-        "a refusal must write nothing at all, but {} was created:\n{}",
-        settings.display(),
-        std::fs::read_to_string(&settings).unwrap_or_default()
+        !commands.is_empty(),
+        "no deck-owned rule was written:\n{body}"
     );
+
+    let expected = format!("{} {CLAUDE_SUFFIX}", scratch.display());
+    for command in &commands {
+        let unquoted = command.trim_matches(['\'', '"']).to_string();
+        assert!(
+            unquoted == expected || command == &expected,
+            "hook command `{command}` does not name the running binary `{expected}`"
+        );
+    }
 }

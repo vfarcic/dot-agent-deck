@@ -406,46 +406,60 @@ pub fn binary_name() -> String {
 ///    that sits at an **install location** ([`is_installed_location`]). An
 ///    installed binary performing its own install is the normal, correct case
 ///    and must keep working.
-/// 2. It is NOT such a path, so it must never be persisted:
+/// 2. It is NOT such a path, so an install is looked for instead:
 ///    - **2a.** `<home>/.local/bin/dot-agent-deck`, when that exists and is
 ///      executable — the same choice `remote.rs`'s remote install already
 ///      makes ("Use the absolute path consistently");
 ///    - **2b.** otherwise the first `dot-agent-deck` reachable through an
-///      absolute, non-artifact `$PATH` entry, as its own absolute path;
-///    - **2c.** otherwise **refuse**: return `Err`, and the caller writes
-///      nothing at all.
+///      absolute, non-artifact `$PATH` entry, as its own absolute path.
+/// 3. No install was found, so — as a **last resort** — `current_exe()` again,
+///    on the weaker condition that it is a usable absolute executable file and
+///    not a cargo artifact, with a `tracing::warn!` saying it was pinned
+///    without being vouched for.
+/// 4. Otherwise **refuse**: return `Err`, and the caller writes nothing at all.
 ///
-///    A 2a or 2b candidate must additionally be owner-writable only
-///    ([`write_mode_is_owner_only`]); one the group or the world can rewrite
-///    is skipped and the walk continues. That check is scoped to 2a and 2b,
-///    and deliberately does not extend to owners, ancestor directories or
-///    symlink targets — see issue #732.
-/// 3. `current_exe()` failing outright is also a refusal, **never** a fallback
-///    to [`DEFAULT_BINARY_NAME`] (issue #536). A bare `dot-agent-deck` in a
-///    file Claude Code hands to `/bin/sh` re-opens the same `$PATH` miss in
-///    the one place the deck can least afford it, and unlike [`binary_name`]'s
-///    consumers there is no shell here whose `$PATH` might still save it.
+/// A 2a or 2b candidate must additionally be owner-writable only
+/// ([`write_mode_is_owner_only`]); one the group or the world can rewrite is
+/// skipped and the walk continues. That check is scoped to 2a and 2b, and
+/// deliberately does not extend to owners, ancestor directories or symlink
+/// targets — see issue #732.
 ///
-/// **Step 1 is held to the same standard steps 2a and 2b apply, and issue
-/// #1140 is what happens when it is not.** Until that issue, step 1 asked only
-/// "is this not under `target/{debug,release}`", so a build copied somewhere
-/// scratch to run — the field case was `/var/tmp/dad-branch/bin/dot-agent-deck`,
-/// a branch build pinned there to drive an isolated sandbox daemon — was
-/// treated as durable and written into the **global** config of every supported
-/// agent, *beside* the installed release's own entries rather than replacing
-/// them (the installers normalise only rules naming the same binary, so two
-/// paths mean two rules). The resolver already knew what durable meant: it is
-/// the canonical `~/.local/bin` install target, or a directory on `$PATH`.
-/// Step 1 was simply exempt from its own fallbacks' definition, keeping a path
-/// it would never have *chosen*. It no longer is, so such a build falls through
-/// to 2a and 2b — and where an install is there to be found, what comes back is
-/// the string the config already carries, which is what makes the write add
-/// nothing instead of a second set of rules.
+/// `current_exe()` failing outright is a refusal too, **never** a fallback to
+/// [`DEFAULT_BINARY_NAME`] (issue #536). A bare `dot-agent-deck` in a file
+/// Claude Code hands to `/bin/sh` re-opens the same `$PATH` miss in the one
+/// place the deck can least afford it, and unlike [`binary_name`]'s consumers
+/// there is no shell here whose `$PATH` might still save it.
 ///
-/// The cost is deliberate and is the point: a deck run from a location that is
-/// neither `~/.local/bin` nor on `$PATH`, with no other deck to fall back to,
-/// refuses instead of pinning itself. That is 2c, whose message says how to
-/// install ([`repair_advice`]), and a refusal writes nothing at all.
+/// **Steps 1 and 3 are the same path judged twice, and the gap between them is
+/// issue #1140.** Until that issue there was only step 1, asking "is this not
+/// under `target/{debug,release}`" — so a build copied somewhere scratch to run
+/// (the field case was `/var/tmp/dad-branch/bin/dot-agent-deck`, a branch build
+/// pinned there to drive an isolated sandbox daemon) was treated as exactly as
+/// durable as a real install and written into the **global** config of every
+/// supported agent, *beside* the installed release's own entries rather than
+/// replacing them (the installers normalise only rules naming the same binary,
+/// so two paths mean two rules).
+///
+/// The resolver already knew what durable meant — its own fallbacks search
+/// `~/.local/bin` and `$PATH` and nothing else — and step 1 was exempt from
+/// that definition, keeping a path the resolver would never have *chosen*. It
+/// no longer is. What replaces the old single test is a **three-way** policy,
+/// and the middle case is the one the old code had no room for:
+///
+/// - **known ephemeral** (a cargo artifact) — refused, however little else
+///   there is. Unchanged, and `hooks/install/005` pins it.
+/// - **known durable** (an install) — used, and *preferred*: that is the whole
+///   of #1140's fix, because the string that comes back is then the one the
+///   config already carries, so the write adds nothing instead of a second set
+///   of rules.
+/// - **not vouched for** (anything else) — used only at step 3, once no
+///   install has been found, and logged when it is.
+///
+/// Refusing that third case outright was the first shape of this fix and was
+/// wrong: the machine whose only deck IS that binary is a real configuration —
+/// a packaged desktop running its bundled sidecar with no CLI installed
+/// alongside — and there a refusal means no agent hooks at all rather than
+/// caution. See the comment on step 3 itself.
 ///
 /// **The 2a candidate is deliberately NOT canonicalized.** On Linux
 /// `current_exe()` reads `/proc/self/exe`, which the kernel resolves fully, so
@@ -548,33 +562,60 @@ pub fn durable_binary_path_with(
         return Ok(path);
     }
 
+    // Step 3 — the LAST RESORT, and the third arm of a three-way policy rather
+    // than a hole in a two-way one (issue #1140, Greptile P1 on PR #1156).
+    //
+    // A cargo artifact is KNOWN ephemeral and is refused however little else
+    // there is (PRD #381; `hooks/install/005` pins it). An install is KNOWN
+    // durable and wins above. This arm is for the third case the old code
+    // conflated with the second: a path nothing here can VOUCH for. Preferring
+    // an install over it is the whole of #1140's fix; refusing it outright is
+    // a step further that costs more than it buys, because the machine whose
+    // only deck is this binary is a real configuration — a packaged desktop
+    // starting its bundled sidecar with no CLI installed alongside it (the
+    // sidecar is declared in `desktop/src-tauri/tauri.bundle.conf.json`, and
+    // `daemon_bridge::resolve_daemon_executable` prefers it over `$PATH`).
+    // There, a refusal is not caution: it is no agent hooks at all, forever,
+    // reported only as a `tracing::warn!` nobody reads. A pin the self-heal can
+    // repair once something better exists is the better failure.
+    if !is_build_artifact_path(&absolute)
+        && is_executable_file(&absolute)
+        && let Some(path) = durable_path_string(&absolute)
+    {
+        // Not silent: "silently" is half of what issue #1140 is about, and this
+        // is the one branch that persists a path the resolver cannot vouch for.
+        tracing::warn!(
+            "pinning `{path}` into agent hook config as a last resort: it is not an installed \
+             dot-agent-deck (neither `{}` nor any absolute `$PATH` entry contains one), so it \
+             will stop working if that file is removed. {}",
+            installed.display(),
+            repair_advice(&installed)
+        );
+        return Ok(path);
+    }
+
     Err(format!(
         "refusing to write `{}` into agent hook config: {}. No durable dot-agent-deck was found \
          at `{}` or on `$PATH`, and a hook command pointing at a path that will not exist is \
          worse than no hook at all. {}",
         absolute.display(),
-        rejection_reason(&absolute, home, path_value),
+        rejection_reason(&absolute),
         installed.display(),
         repair_advice(&installed)
     ))
 }
 
 /// Why `exe` was not usable as the written path, for the refusal message.
-fn rejection_reason(exe: &Path, home: &Path, path_value: Option<&std::ffi::OsStr>) -> String {
+///
+/// Deliberately still the two cases it always had, and issue #1140 did not add
+/// a third: "not installed" never reaches here, because step 3 above uses such
+/// a path rather than refusing it. The only ways to arrive are a cargo artifact
+/// and a `current_exe()` that is not a usable absolute executable file at all.
+fn rejection_reason(exe: &Path) -> String {
     if is_build_artifact_path(exe) {
         "it is a cargo build artifact — gitignored, removed by `cargo clean`, and gone the \
          moment its worktree is pruned"
             .to_string()
-    } else if !is_installed_location(exe, home, path_value) {
-        // Issue #1140. Named separately from the two below because the operator
-        // sees a path that exists, is executable, and looks perfectly fine.
-        format!(
-            "it is not an installed dot-agent-deck — it sits in `{}`, which is neither `{}` nor \
-             an absolute entry on `$PATH`, so nothing here can vouch that it will still be \
-             there when a hook fires",
-            exe.parent().unwrap_or(exe).display(),
-            home.join(".local").join("bin").display(),
-        )
     } else {
         "it is not a usable absolute path to an executable file".to_string()
     }
@@ -3045,8 +3086,8 @@ mod tests {
     /// defect: a scratch copy of the deck satisfied it. What step 1 is actually
     /// for is an *installed* deck installing its own hooks, so the fixture now
     /// says so, by putting the directory it was installed into on `$PATH`.
-    /// `durable_binary_path_refuses_a_current_exe_that_is_not_installed` is the
-    /// other side of the same line.
+    /// `durable_binary_path_prefers_the_install_over_a_scratch_copy_of_itself`
+    /// is the other side of the same line.
     #[test]
     fn durable_binary_path_returns_a_non_artifact_current_exe_unchanged() {
         let dir = crate::test_temp::tempdir().expect("resolver tempdir");
@@ -3124,12 +3165,21 @@ mod tests {
         );
     }
 
-    /// Issue #1140 with nothing to fall through to: a scratch copy and no
-    /// install anywhere is a refusal (step 2c), not a self-pin. The message has
-    /// to name the actual cause — an operator looking at a path that exists and
-    /// is executable needs to be told it is the LOCATION that disqualifies it.
+    /// Issue #1140 with nothing to fall through to, which is **step 3** and not
+    /// a refusal — the distinction Greptile's P1 on PR #1156 was about, and the
+    /// first shape of this fix got wrong.
+    ///
+    /// *Preferring* an install over a scratch copy is #1140's fix. *Refusing*
+    /// the scratch copy when there is no install is a further step that costs
+    /// more than it buys: the machine whose only deck IS this binary is a real
+    /// configuration — a packaged desktop running its bundled sidecar with no
+    /// CLI beside it — and there a refusal buys no agent hooks at all rather
+    /// than caution. The **artifact** case still refuses, which is what
+    /// separates "known ephemeral" from "not vouched for";
+    /// [`durable_binary_path_refuses_when_no_durable_candidate_exists`] holds
+    /// that half.
     #[test]
-    fn durable_binary_path_refuses_a_current_exe_that_is_not_installed() {
+    fn durable_binary_path_falls_back_to_a_non_installed_current_exe_as_a_last_resort() {
         let dir = crate::test_temp::tempdir().expect("resolver tempdir");
         let home = dir.path().join("home");
         std::fs::create_dir_all(&home).expect("create home");
@@ -3144,17 +3194,13 @@ mod tests {
             ));
         write_stub_executable(&scratch);
 
-        let err = durable_binary_path_with(Ok(scratch.clone()), &home, None)
-            .expect_err("a deck installed nowhere must refuse, not pin itself");
+        let resolved = durable_binary_path_with(Ok(scratch.clone()), &home, None);
 
-        assert!(
-            err.contains("not an installed dot-agent-deck"),
-            "the refusal must name the location as the cause, not leave the operator \
-             staring at a path that plainly exists: {err}"
-        );
-        assert!(
-            err.contains(&home.join(".local").join("bin").display().to_string()),
-            "the refusal must name where an install would count: {err}"
+        assert_eq!(
+            assert_durable(&resolved),
+            scratch.to_str().expect("scratch path is UTF-8"),
+            "with no install anywhere, the running binary is the best answer available — \
+             writing nothing would mean no hooks at all on a machine that has no other deck"
         );
     }
 

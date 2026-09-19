@@ -394,6 +394,48 @@ fn a_scratch_copy_adds_no_second_set_of_rules_beside_the_install() {
     }
 }
 
+/// The last-resort pin is **logged**, not silent — "silently" is half of what
+/// issue #1140 is about, and step 3 is the one branch that persists a path the
+/// resolver cannot vouch for.
+///
+/// Note what this test is NOT: it is not a claim that the pin is a good one.
+/// It is the claim that an operator who later finds a `/var/tmp/...` path in
+/// their agent config can find out from the log why it is there, which is
+/// exactly what the field report could not do.
+#[test]
+fn a_last_resort_pin_is_logged_rather_than_silent() {
+    let fixture = Fixture::new();
+    let home = fixture.home();
+    let settings = fixture.settings();
+    // Deliberately no `fixture.durable()`: nothing installed anywhere, which is
+    // what takes the resolver past 2a and 2b to step 3.
+    let scratch = fixture
+        .path()
+        .join("var")
+        .join("tmp")
+        .join("dad-branch")
+        .join(durable_file_name());
+    write_executable(&scratch);
+
+    let logs = fixture.auto_install(&settings, || {
+        durable_binary_path_with(Ok(scratch.clone()), &home, None)
+    });
+
+    let commands = deck_commands(&settings, CLAUDE_SUFFIX);
+    assert!(
+        !commands.is_empty(),
+        "step 3 must write rather than refuse when there is no install to prefer"
+    );
+    assert!(
+        logs.contains("last resort"),
+        "the last-resort pin was not logged:\n{logs}"
+    );
+    assert!(
+        logs.contains(scratch.to_str().expect("scratch path is UTF-8")),
+        "the log must name the path it pinned:\n{logs}"
+    );
+}
+
 /// The same property for Codex's `hooks.json`, which is a separate writer with
 /// its own document shape.
 #[test]
