@@ -669,6 +669,23 @@ impl ConfirmedSubmission {
 /// caller message names exactly that population — so enveloped reports keep
 /// arriving from binaries that predate the normalization, and confirming them
 /// is this shape's job.
+///
+/// # Accepted residual: two pastes in one turn
+///
+/// A turn carrying our payload TWICE — the accumulation
+/// [`prompt_submission_accumulated`] is the safety net for, produced when the
+/// bounded replacement write lands before the agent has submitted the first
+/// payload — arrives as two envelopes, and this shape does not read it as a
+/// confirmation. It is not widened to N of them: no report carrying two was
+/// measured, and a repetition grammar over a delimiter the PRODUCER chooses is
+/// the same widening both reviewers rejected for the separator-free shape.
+///
+/// The residual is narrower than it sounds, and only because of the truncation
+/// this module otherwise fights. A payload longer than [`USER_PROMPT_MAX_LEN`]
+/// — which every dispatch prompt is — is cut inside the FIRST copy, so after
+/// `crate::hook`'s normalization the report is exactly shape 2 and confirms.
+/// What is left uncovered is a SHORT multi-line payload submitted twice in one
+/// turn.
 const PASTE_ENVELOPE_OPEN_HEAD: &str = "<pasted_content id=\"";
 
 /// The rest of the opening delimiter, after the opaque id.
