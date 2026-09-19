@@ -277,12 +277,14 @@ If there is **no** marker and a card you expect is still absent, the count in th
 When something goes wrong and the dashboard's status messages aren't enough to diagnose it, set the `DOT_AGENT_DECK_LOG` environment variable to capture tracing output to a file:
 
 ```bash
-# Default — writes to /tmp/dot-agent-deck.log
+# Default — writes to /tmp/dot-agent-deck.log on macOS and Linux
 DOT_AGENT_DECK_LOG=1 dot-agent-deck
 
 # Custom path
 DOT_AGENT_DECK_LOG=/tmp/my-debug.log dot-agent-deck
 ```
+
+On Windows the default is `dot-agent-deck.log` in the system temp directory — the one `%TEMP%` points at, usually `C:\Users\<you>\AppData\Local\Temp`. `/tmp` is not a Windows location, so there would be nothing there to write to.
 
 The log file captures session events, hook activity, mode-tab restoration, and any errors logged by the daemon. Attach the relevant excerpt when filing an issue. See [Configuration › Environment Variables](configuration.md#environment-variables) for the full list of variables.
 

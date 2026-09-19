@@ -1718,10 +1718,16 @@ async fn run_dashboard() -> ExitCode {
 /// soundness invariant the login-shell PATH capture relies on.
 fn init_logging_from_env() {
     if let Ok(log_val) = std::env::var("DOT_AGENT_DECK_LOG") {
+        // Issue #1135: the default is resolved per platform, not spelled as a
+        // Unix literal. `/tmp/...` is rooted but driveless on Windows, so it
+        // resolved against the current drive as `\tmp\dot-agent-deck.log` —
+        // a directory that usually does not exist, and the open below creates
+        // the file but never its parent, so the subscriber was never installed
+        // and nothing was logged. An explicit value is still used verbatim.
         let log_path = if log_val.is_empty() || log_val == "1" {
-            "/tmp/dot-agent-deck.log".to_string()
+            dot_agent_deck::platform::paths::default_debug_log_path()
         } else {
-            log_val
+            std::path::PathBuf::from(log_val)
         };
         match std::fs::OpenOptions::new()
             .create(true)
@@ -1736,7 +1742,10 @@ fn init_logging_from_env() {
                     .init();
             }
             Err(e) => {
-                eprintln!("Warning: failed to open log file {log_path}: {e}");
+                eprintln!(
+                    "Warning: failed to open log file {}: {e}",
+                    log_path.display()
+                );
             }
         }
     }

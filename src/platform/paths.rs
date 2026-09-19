@@ -66,6 +66,66 @@ pub fn home_dir_with_tmp_fallback() -> PathBuf {
     }
 }
 
+/// Rewrite `/` as the platform's own path separator.
+///
+/// Windows: Win32 accepts `/` as a separator but it is **not** a legal
+/// character in a file name, so rewriting every one of them is lossless. This is
+/// what stops [`crate::config::expand_path`] handing back the mixed-separator
+/// `C:\Users\me/proj` it used to glue together — a string that resolves, but
+/// that is then persisted to `schedules.toml`, shown back to the user and
+/// carried over the protocol as a fire's `working_dir` (issue #1136).
+///
+/// Unix: identity, and deliberately so. `\` is a legal character in a Unix file
+/// name, so there is nothing to normalise and rewriting anything could only
+/// corrupt a real path.
+pub fn normalize_separators(path: String) -> String {
+    if cfg!(windows) {
+        normalize_separators_for(&path, true)
+    } else {
+        path
+    }
+}
+
+/// Pure form of [`normalize_separators`], parameterised on which target's rules
+/// to apply so both branches are exercised on every host — the Windows branch
+/// has no other way to be asserted from Linux CI. Same reason
+/// [`is_pipe_name_token`] stays compiled everywhere.
+fn normalize_separators_for(path: &str, windows_rules: bool) -> String {
+    if windows_rules {
+        path.replace('/', "\\")
+    } else {
+        path.to_string()
+    }
+}
+
+/// Strip a leading tilde-plus-separator prefix, returning the rest of the path.
+///
+/// Unix: `~/` only. `\` is a legal character in a Unix file name, so `~\proj`
+/// there names a directory and must not be read as a tilde path.
+///
+/// Windows: `~/` **or** `~\`, since both are path separators there. A Windows
+/// user typing the native `~\proj` previously got no expansion at all — it
+/// missed the `~/` test, then missed the relative-path test, and came back as
+/// `C:\Users\me\~\proj` (issue #1136).
+///
+/// A bare `~` is not handled here: it has no remainder to return, and its
+/// expansion is the home directory itself.
+pub fn strip_tilde_prefix(input: &str) -> Option<&str> {
+    strip_tilde_prefix_for(input, cfg!(windows))
+}
+
+/// Pure form of [`strip_tilde_prefix`], parameterised on which target's rules to
+/// apply so both branches are exercised on every host.
+fn strip_tilde_prefix_for(input: &str, windows_rules: bool) -> Option<&str> {
+    if let Some(rest) = input.strip_prefix("~/") {
+        return Some(rest);
+    }
+    if windows_rules {
+        return input.strip_prefix(r"~\");
+    }
+    None
+}
+
 /// Current real uid, used to namespace the `/tmp` fallback sockets per user.
 /// Wraps `getuid(2)` so the single `unsafe` lives in one place.
 ///
@@ -1351,6 +1411,39 @@ pub fn state_dir() -> PathBuf {
     {
         // `%LOCALAPPDATA%\dot-agent-deck` (already per-user ACL'd by default).
         state_dir_platform_root()
+    }
+}
+
+/// Default target for `DOT_AGENT_DECK_LOG` when it is set to `1` or to the
+/// empty string — the two values `main.rs`'s `init_logging_from_env` treats as
+/// "on, wherever you normally put it". Any other value of that variable is the
+/// path itself and never reaches this function.
+///
+/// Unix: `/tmp/dot-agent-deck.log`, byte-for-byte the literal this replaces.
+///
+/// Windows: `dot-agent-deck.log` inside [`std::env::temp_dir`] — `%TMP%`, else
+/// `%TEMP%`, resolved through `GetTempPath` (issue #1135). The Unix literal is
+/// *rooted but driveless* on Windows, so it resolves against whatever the
+/// current drive happens to be, as `\tmp\dot-agent-deck.log`. Where no `\tmp`
+/// exists on that drive the open fails and **nothing is logged at all**: the
+/// caller creates the file but never its parent directory, and a failed open
+/// installs no subscriber, so the one signal is a warning line on stderr. Where
+/// a `\tmp` does exist the log lands somewhere no documentation names.
+///
+/// `temp_dir()` rather than `%LOCALAPPDATA%\dot-agent-deck` precisely because
+/// the caller does not create directories: the temp directory is the scratch
+/// location Windows itself hands out, whereas `%LOCALAPPDATA%\dot-agent-deck`
+/// need not exist on a first run. It is also the closer analogue of what `/tmp`
+/// means here — a throwaway debug log a user is asked to attach to an issue,
+/// not durable state. The daemon's own `daemon.log` stays under [`state_dir`].
+pub fn default_debug_log_path() -> PathBuf {
+    #[cfg(unix)]
+    {
+        PathBuf::from("/tmp/dot-agent-deck.log")
+    }
+    #[cfg(windows)]
+    {
+        std::env::temp_dir().join("dot-agent-deck.log")
     }
 }
 
@@ -3459,6 +3552,121 @@ mod tests {
             assert!(
                 pin_is_repairable(not_executable.to_str().expect("UTF-8")),
                 "a non-executable file cannot be a hook command"
+            );
+        }
+    }
+
+    /// Issue #1136, the pure half: the Windows branch of [`normalize_separators`]
+    /// rewrites every `/` and the Unix branch rewrites nothing. Driven through
+    /// the parameterised form so both branches are asserted on every host —
+    /// there is no other way to see the Windows one from Linux CI.
+    #[test]
+    fn normalize_separators_rewrites_only_under_windows_rules() {
+        // The defect's own shape: a native home glued to the rest with `/`.
+        assert_eq!(
+            normalize_separators_for(r"C:\Users\me/proj", true),
+            r"C:\Users\me\proj"
+        );
+        assert_eq!(normalize_separators_for("a/b/c", true), r"a\b\c");
+        // Already native, and the empty string: both are fixed points.
+        assert_eq!(normalize_separators_for(r"C:\a\b", true), r"C:\a\b");
+        assert_eq!(normalize_separators_for("", true), "");
+
+        // Unix rules rewrite nothing at all — `\` is a legal character in a
+        // Unix file name, so a path holding one must survive untouched.
+        for path in [r"C:\Users\me/proj", "a/b/c", r"/home/me/odd\name", ""] {
+            assert_eq!(
+                normalize_separators_for(path, false),
+                path,
+                "the Unix branch must be the identity"
+            );
+        }
+    }
+
+    /// The public wrapper dispatches on the host, so its output is the
+    /// parameterised form's for this target and nothing else.
+    #[test]
+    fn normalize_separators_dispatches_on_the_host() {
+        let sample = r"C:\Users\me/proj".to_string();
+        assert_eq!(
+            normalize_separators(sample.clone()),
+            normalize_separators_for(&sample, cfg!(windows))
+        );
+    }
+
+    /// Issue #1136, the other half: `~\proj` is a tilde path on Windows and a
+    /// file name on Unix. Parameterised for the same reason as above.
+    #[test]
+    fn strip_tilde_prefix_accepts_a_backslash_only_under_windows_rules() {
+        for windows_rules in [true, false] {
+            assert_eq!(
+                strip_tilde_prefix_for("~/proj", windows_rules),
+                Some("proj")
+            );
+            assert_eq!(strip_tilde_prefix_for("~/", windows_rules), Some(""));
+            // A bare `~` has no remainder; the caller expands it to the home
+            // directory itself. `~user` is not a form this expands at all, and
+            // a tilde anywhere but the front is just a character.
+            assert_eq!(strip_tilde_prefix_for("~", windows_rules), None);
+            assert_eq!(strip_tilde_prefix_for("~other/proj", windows_rules), None);
+            assert_eq!(strip_tilde_prefix_for("/a/~/b", windows_rules), None);
+            assert_eq!(strip_tilde_prefix_for("", windows_rules), None);
+        }
+
+        assert_eq!(strip_tilde_prefix_for(r"~\proj", true), Some("proj"));
+        assert_eq!(
+            strip_tilde_prefix_for(r"~\proj", false),
+            None,
+            r"on Unix `~\proj` names a directory and must not be expanded"
+        );
+    }
+
+    /// The public wrapper dispatches on the host.
+    #[test]
+    fn strip_tilde_prefix_dispatches_on_the_host() {
+        assert_eq!(
+            strip_tilde_prefix(r"~\proj"),
+            strip_tilde_prefix_for(r"~\proj", cfg!(windows))
+        );
+        assert_eq!(strip_tilde_prefix("~/proj"), Some("proj"));
+    }
+
+    /// Issue #1135: the `DOT_AGENT_DECK_LOG=1` default is a location the host
+    /// actually has. The Unix value is pinned byte-for-byte because this is a
+    /// documented path (`docs/configuration.md`, `docs/troubleshooting.md`);
+    /// the Windows value is pinned to the system temp directory, which is what
+    /// the docs now name and what `\tmp\dot-agent-deck.log` was not.
+    #[test]
+    fn default_debug_log_path_is_platform_appropriate() {
+        let path = default_debug_log_path();
+        assert_eq!(
+            path.file_name().and_then(|n| n.to_str()),
+            Some("dot-agent-deck.log")
+        );
+        assert!(
+            path.is_absolute(),
+            "{} must be absolute for this platform — a relative default would \
+             land wherever the process happens to have been started",
+            path.display()
+        );
+
+        #[cfg(unix)]
+        assert_eq!(path, PathBuf::from("/tmp/dot-agent-deck.log"));
+
+        #[cfg(windows)]
+        {
+            assert_eq!(
+                path.parent(),
+                Some(std::env::temp_dir().as_path()),
+                "the default must sit in the system temp directory"
+            );
+            // The defect itself: the old literal is rooted but driveless, so it
+            // resolved against the current drive as `\tmp\...`.
+            assert_ne!(path, PathBuf::from("/tmp/dot-agent-deck.log"));
+            assert!(
+                !path.to_string_lossy().starts_with(r"\tmp"),
+                "{} must not be the driveless `\\tmp` the docs never named",
+                path.display()
             );
         }
     }
