@@ -16,7 +16,7 @@ For prerequisites the host must satisfy see [Remote Environment Requirements](re
 Whatever you do below converges on the same end state:
 
 1. **A machine reachable over ssh** — a Linux box or a Mac. Whose hardware it is, and where it runs, is irrelevant to the deck.
-2. **A non-root user** with `~/.local/bin` on `PATH` and the agent CLI installed.
+2. **A user account** with `~/.local/bin` on `PATH` and the agent CLI installed. Nothing stops that being `root` — the daemon runs fine as root — but agents run as children of the daemon and inherit its account, so on anything beyond a throwaway sandbox make it a [non-root user](remote-requirements.md#non-root-user-account).
 3. **Outbound HTTPS** to the LLM provider, package registries, and your git remote.
 4. From your laptop:
 
@@ -44,7 +44,7 @@ Cloud images commonly log you in as `root`. If yours does, the first bootstrap s
 
 Once the machine exists and you can ssh to it, the rest is the same everywhere.
 
-**If you land as `root`, create a non-root user and stop using root:**
+**If you land as `root` — most cloud images do — create a non-root user and stop using root.** This is not enforced: the deck will run as root perfectly well. The reason to bother is that agents inherit the daemon's account, so under root every command an agent runs has full system privileges over the host.
 
 ```bash
 adduser --disabled-password --gecos "" deck
