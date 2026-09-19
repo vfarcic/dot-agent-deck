@@ -406,6 +406,15 @@ async fn login_shell_path() -> Option<String> {
 /// against the app-owned cwd instead would be worse, not better: it would make
 /// the answer depend on a directory this module creates.
 ///
+/// **The guard targets empty and relative components specifically, and nothing
+/// else.** An absolute component containing `..` — `/usr/bin/../../tmp` —
+/// satisfies `is_absolute()` and is consulted, deliberately: reaching it means
+/// already controlling the user's `PATH`, which is a stronger primitive than
+/// anything this recovers, and it is not the checkout-relative substitution the
+/// fix targets. Normalising instead would mean canonicalising, which resolves
+/// symlinks and would break the version-manager layouts (`asdf`, `mise`, `nvm`)
+/// that legitimately put one there.
+///
 /// Returns the first component that yields a file this process can execute.
 /// `None` means "not on this PATH", which the caller turns into
 /// [`IntentError::NotConfigured`] — the one failure whose remedy is an
@@ -477,16 +486,50 @@ fn sanitised_path(path: &OsStr) -> OsString {
 /// to it, and nothing at all writes *into* it — the child is given it as a cwd
 /// and produces its answer on stdout.
 ///
-/// Falls back to the system temp root when the directory cannot be created, and
-/// **never** to the inherited cwd: a temp root is not a project, which is the
-/// property being bought here.
+/// **Never** the inherited cwd, and never the shared temp ROOT either. The
+/// fallback used to be `std::env::temp_dir()` itself on the reasoning that "a
+/// temp root is not a project" — which is true of the *directory* and false of
+/// what can be sitting in it: `/tmp` is world-writable, so any local user can
+/// leave a `CLAUDE.md` or a `.claude/` there and the child would be started
+/// standing on it. The containment flags refuse to load project configuration,
+/// so this was defence in depth rather than a hole; it is still the wrong
+/// directory to pick, and a named subdirectory costs three lines.
+///
+/// A named subdirectory of a shared root is **narrower, not exclusive**, and
+/// saying so is the honest version: another local user can create that exact
+/// name first. What it buys is that a plant has to target this path rather than
+/// merely exist in `/tmp`. If even that cannot be created the path is returned
+/// anyway and the spawn fails with the directory missing — the fail-closed end,
+/// and better than running the child somewhere anybody can write.
 fn app_owned_cwd() -> PathBuf {
-    let dir = dot_agent_deck::platform::paths::state_dir().join("voice-cli-cwd");
-    match std::fs::create_dir_all(&dir) {
-        Ok(()) => dir,
-        Err(_) => std::env::temp_dir(),
-    }
+    owned_cwd_in(
+        &dot_agent_deck::platform::paths::state_dir(),
+        &std::env::temp_dir(),
+    )
 }
+
+/// [`app_owned_cwd`]'s choice, pure in its two roots.
+///
+/// Split out so a test can make the preferred root unusable and assert what the
+/// fallback picks, without touching the process environment or this machine's
+/// real state directory.
+fn owned_cwd_in(state_root: &Path, temp_root: &Path) -> PathBuf {
+    let preferred = state_root.join(STATE_CWD_DIR);
+    if std::fs::create_dir_all(&preferred).is_ok() {
+        return preferred;
+    }
+    let fallback = temp_root.join(TEMP_CWD_DIR);
+    let _ = std::fs::create_dir_all(&fallback);
+    fallback
+}
+
+/// The working directory's name under this app's own state root.
+const STATE_CWD_DIR: &str = "voice-cli-cwd";
+
+/// And under the system temp root, when the state root cannot be created. Fully
+/// qualified because that root is shared with every other program on the
+/// machine — see [`app_owned_cwd`].
+const TEMP_CWD_DIR: &str = "dot-agent-deck-voice-cli-cwd";
 
 /// The child's whole environment: [`KEEP_EXACT`] plus [`KEEP_PREFIX`], with
 /// `PATH` replaced by `path`.
@@ -666,15 +709,24 @@ impl AgentCliResolver {
 
     /// One bounded, contained, killed-on-every-path spawn.
     ///
-    /// **The child is torn down before this returns on the timeout path**, and
-    /// the unit torn down is the whole **process group**, not the direct child.
-    /// `kill_on_drop(true)` is still set — it is what covers every *other* drop
-    /// path, such as the surrounding resolve future being cancelled — but on
-    /// its own it signals one pid, so a tool, hook or shell the CLI started
-    /// would outlive the timeout with the app's descriptors still open. That
-    /// was PRD #802's audit finding, and it is why this returns only after
-    /// [`terminate_group`] has killed the group and the direct child has been
-    /// reaped (or [`TEARDOWN_TIMEOUT`] has elapsed).
+    /// **Wherever this tears a child down, the unit is the whole process GROUP
+    /// and not the direct child.** On the timeout and flood paths it returns
+    /// only after [`terminate_group`] has killed the group and the direct child
+    /// has been reaped (or [`TEARDOWN_TIMEOUT`] has elapsed). On every *drop*
+    /// path — the surrounding resolve future dropped at app shutdown or on a
+    /// cancelled utterance — [`ChildGroup`]'s `Drop` does the group half and
+    /// `kill_on_drop(true)` does the direct-child half. That guard is the newer
+    /// half: `kill_on_drop` signals one pid, so before it a tool, hook or shell
+    /// the CLI started outlived a dropped resolve with the app's descriptors
+    /// still open — PRD #802's audit finding on the timeout path, and the same
+    /// leak on the rarer one once that path was fixed.
+    ///
+    /// **A clean exit tears down nothing**, which is the honest bound on the
+    /// sentence above rather than an oversight: the CLI finished and gave its
+    /// answer, so there is no failure to contain and its group is left alone. A
+    /// descendant outliving a *successful* CLI is therefore reached by none of
+    /// this. What keeps that narrow is the containment table — a child with
+    /// `--tools ""` and `--restricted` has nothing to start one with.
     ///
     /// Stdout is read through [`MAX_STDOUT_BYTES`] rather than with
     /// `wait_with_output`, so the bound applies while reading rather than after
@@ -709,9 +761,13 @@ impl AgentCliResolver {
         #[cfg(windows)]
         command.creation_flags(CREATE_NEW_PROCESS_GROUP);
 
-        let mut child = command.spawn().map_err(SpawnError::Io)?;
+        let child = command.spawn().map_err(SpawnError::Io)?;
         let leader = child.id();
-        let mut stdout = child.stdout.take().ok_or_else(|| {
+        // Armed immediately, before anything that can return early: from here
+        // on every exit from this function — including the future being dropped
+        // out from under it — tears the group down.
+        let mut child = ChildGroup::new(child, leader);
+        let mut stdout = child.child.stdout.take().ok_or_else(|| {
             SpawnError::Io(std::io::Error::other(
                 "the agent CLI produced no stdout pipe",
             ))
@@ -732,14 +788,15 @@ impl AgentCliResolver {
             }),
             // A flood, or a read that failed: the child is still running and
             // may have started something, so it gets the same teardown a
-            // timeout gets rather than being left to `kill_on_drop`, which
-            // would signal the direct child alone.
+            // timeout gets — and it is awaited here rather than left to the
+            // guard, because the caller should not get its error back while
+            // the group is still being reaped.
             Ok(Err(error)) => {
-                terminate_group(&mut child, leader).await;
+                child.terminate().await;
                 Err(error)
             }
             Err(_) => {
-                terminate_group(&mut child, leader).await;
+                child.terminate().await;
                 Err(SpawnError::TimedOut)
             }
         }
@@ -767,6 +824,13 @@ enum SpawnError {
 /// so a reply that fills it exactly is still readable. `cap + 1` is
 /// [`SpawnError::TooMuchOutput`], reported before anything converts the bytes
 /// to text.
+///
+/// **An answer inside the first `cap` bytes followed by a flood is rejected as
+/// a flood, and that is the conservative choice on purpose.** Parsing what
+/// arrived first and ignoring the rest would be a behaviour that rewards a
+/// child for talking past its bound; a CLI that floods is one that is not
+/// behaving as this backend assumes, and the failure sentence is the honest
+/// outcome for it.
 async fn read_capped<R: tokio::io::AsyncRead + Unpin>(
     reader: &mut R,
     cap: usize,
@@ -785,10 +849,118 @@ async fn read_capped<R: tokio::io::AsyncRead + Unpin>(
     }
 }
 
-/// Windows: put the child at the head of its own console process group, so
-/// teardown has a tree to walk rather than one pid.
+/// Windows: put the child at the head of its own console process group.
+///
+/// **What this flag does is govern Ctrl-C/Break delivery**, so the child does
+/// not receive a console event aimed at the app. It is *not* what gives
+/// teardown something to walk: `taskkill /T` follows the PPID tree whether or
+/// not the flag is set. The comment here used to claim the causal version, and
+/// [`terminate_group`] would work on Windows without this — it would just also
+/// share the app's console signals.
 #[cfg(windows)]
 const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+
+/// A spawned child and the group teardown it owes, so that EVERY drop path
+/// performs that teardown rather than only the two that call it by name.
+///
+/// **What this closes.** `kill_on_drop(true)` signals the *direct child* on a
+/// drop; it says nothing about the group. So a resolve future dropped mid-spawn
+/// — the app shutting down, an utterance cancelled — left a tool or shell the
+/// CLI had started running, which is exactly the leak PRD #802's audit found on
+/// the timeout path, on a rarer path. The timeout and flood paths already call
+/// [`terminate_group`] explicitly; this makes the other paths do the same thing
+/// with no caller.
+///
+/// **`Drop` can do this because the group kill is synchronous.** [`kill_group`]
+/// is a `killpg(2)` on Unix and a fire-and-forget `taskkill` spawn on Windows,
+/// neither of which awaits, so the destructor does the group half and the inner
+/// child's own `kill_on_drop` does the direct-child half when this struct's
+/// fields are dropped immediately afterwards — in that order, which is the
+/// order that matters: the group must be signalled while the child is still
+/// unreaped.
+///
+/// **`leader` is `None` once the child has been reaped**, and that is the one
+/// invariant this type exists to hold. A reaped pid can be recycled onto an
+/// unrelated process, and `killpg` on a recycled pgid is the one thing this
+/// must never do — so [`ChildGroup::wait`] disarms on success and
+/// [`ChildGroup::terminate`] disarms after it has done the teardown itself.
+struct ChildGroup {
+    child: tokio::process::Child,
+    /// The child's pid, which is also its pgid ([`Command::process_group`]).
+    /// `None` means disarmed: reaped, or already torn down.
+    leader: Option<u32>,
+}
+
+impl ChildGroup {
+    fn new(child: tokio::process::Child, leader: Option<u32>) -> Self {
+        Self { child, leader }
+    }
+
+    /// Wait for the direct child, disarming once it has been reaped.
+    async fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        let status = self.child.wait().await;
+        if status.is_ok() {
+            self.leader = None;
+        }
+        status
+    }
+
+    /// Kill the group and wait for the reap, as the timeout and flood paths do.
+    async fn terminate(&mut self) {
+        terminate_group(&mut self.child, self.leader).await;
+        self.leader = None;
+    }
+}
+
+impl Drop for ChildGroup {
+    fn drop(&mut self) {
+        if let Some(leader) = self.leader {
+            kill_group(leader);
+        }
+        // The direct child is `kill_on_drop(true)`, so `self.child`'s own
+        // `Drop` — which runs as this struct's fields are dropped, immediately
+        // after this body — signals and reaps it. Nothing is awaited here: a
+        // destructor cannot, and the group kill above does not need to.
+    }
+}
+
+/// Signal the whole containment unit. Synchronous, so [`ChildGroup`]'s `Drop`
+/// can call it.
+///
+/// Unix is one `killpg(SIGKILL)`. Windows spawns `taskkill /T /F` and does not
+/// wait for it: the wait that matters is the direct child's reap, which
+/// [`terminate_group`] bounds by [`TEARDOWN_TIMEOUT`], and a destructor has no
+/// way to await this one.
+fn kill_group(leader: u32) {
+    #[cfg(unix)]
+    {
+        // SAFETY: `killpg(2)` takes a pgid and a signal and touches nothing in
+        // this process. The pgid is the child's own pid — it was spawned with
+        // `process_group(0)`, which makes it the group leader — and every
+        // caller holds `leader` only while the child is unreaped, so the pid
+        // cannot have been recycled onto an unrelated process. A failure
+        // (`ESRCH`: the group is already gone) is the ordinary case and is
+        // discarded.
+        unsafe {
+            libc::killpg(leader as libc::pid_t, libc::SIGKILL);
+        }
+    }
+    #[cfg(windows)]
+    {
+        // `taskkill` is resolved under `%SYSTEMROOT%` rather than through PATH,
+        // for `resolve_on_path`'s reason: this is a teardown of a process that
+        // may have been spawned by an injected prompt, and resolving the killer
+        // through an attacker-influenced PATH would be an odd way to end.
+        let system_root = std::env::var("SYSTEMROOT").unwrap_or_else(|_| r"C:\Windows".to_string());
+        let taskkill = PathBuf::from(system_root).join(r"System32\taskkill.exe");
+        let _ = std::process::Command::new(taskkill)
+            .args(["/T", "/F", "/PID", &leader.to_string()])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
+    }
+}
 
 /// Kill the whole containment unit and wait for the direct child to be reaped.
 ///
@@ -807,43 +979,19 @@ const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
 /// So Windows walks the tree with `taskkill /T /F`, which reaps the descendants
 /// that are still parented under the child and misses one that has re-parented
 /// itself. That is a real gap; it is a smaller one than the direct-child-only
-/// kill it replaces.
+/// kill it replaces. **That walk is started, not awaited** — [`kill_group`] is
+/// shared with a destructor, which cannot await — so what this function waits
+/// for is the direct child's reap below, which `taskkill` and `start_kill`
+/// between them make imminent.
 ///
 /// Either way the reap is bounded by [`TEARDOWN_TIMEOUT`] so a wedged child
 /// cannot hold the utterance open indefinitely.
 async fn terminate_group(child: &mut tokio::process::Child, leader: Option<u32>) {
     if let Some(leader) = leader {
-        #[cfg(unix)]
-        {
-            // SAFETY: `killpg(2)` takes a pgid and a signal and touches nothing
-            // in this process. The pgid is the child's own pid — it was spawned
-            // with `process_group(0)`, which makes it the group leader — and
-            // `child` has not been reaped yet, so the pid cannot have been
-            // recycled onto another process. A failure (`ESRCH`: the group is
-            // already gone) is the ordinary case and is discarded.
-            unsafe {
-                libc::killpg(leader as libc::pid_t, libc::SIGKILL);
-            }
-        }
-        #[cfg(windows)]
-        {
-            // `taskkill` is resolved under `%SYSTEMROOT%` rather than through
-            // PATH, for `resolve_on_path`'s reason: this is a teardown of a
-            // process that may have been spawned by an injected prompt, and
-            // resolving the killer through an attacker-influenced PATH would
-            // be an odd way to end.
-            let system_root =
-                std::env::var("SYSTEMROOT").unwrap_or_else(|_| r"C:\Windows".to_string());
-            let taskkill = PathBuf::from(system_root).join(r"System32\taskkill.exe");
-            let _ = Command::new(taskkill)
-                .args(["/T", "/F", "/PID", &leader.to_string()])
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .kill_on_drop(true)
-                .status()
-                .await;
-        }
+        // The signalling half is [`kill_group`], shared with [`ChildGroup`]'s
+        // `Drop` so the two paths cannot drift — one of them being a destructor
+        // is why it is synchronous.
+        kill_group(leader);
     }
     // The direct child as well, in case it was never in the group we signalled,
     // and then the reap. `start_kill` on an already-dead child is not an error
@@ -1428,6 +1576,82 @@ mod tests {
             wait_for_exit(grandpid, Duration::from_secs(5)),
             "grandchild {grandpid} survived the timeout"
         );
+    }
+
+    /// Dropping the resolve mid-flight tears down the GROUP, not just the child.
+    ///
+    /// The residual the timeout fix left: `kill_on_drop(true)` signals one pid,
+    /// so a resolve dropped at app shutdown or on a cancelled utterance left a
+    /// tool or shell the CLI had started running — the audit's own finding, on
+    /// a rarer path. `ChildGroup`'s `Drop` is what closes it, and this is the
+    /// only test that exercises that path: the inner timeout is two minutes, so
+    /// nothing here reaches `spawn`'s own teardown.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn voice_agent_cli_tears_the_group_down_when_the_resolve_is_dropped() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pidfile = dir.path().join("pid");
+        let grandpidfile = dir.path().join("grandpid");
+        let stub = Stub::new(&format!(
+            "echo $$ > '{}'\n\
+             sh -c 'echo $$ > \"{}\"; exec sleep 120' &\n\
+             sleep 120",
+            pidfile.to_string_lossy(),
+            grandpidfile.to_string_lossy()
+        ));
+        let resolver = stub.resolver().with_timeout(Duration::from_secs(120));
+
+        // `timeout` DROPS the future it wraps when it fires, which is the whole
+        // point: this is a cancellation, not `spawn`'s timeout path.
+        let dropped =
+            tokio::time::timeout(Duration::from_secs(3), ask(&resolver, "show me the tester"))
+                .await;
+        assert!(
+            dropped.is_err(),
+            "the stub answered; it should have been sleeping"
+        );
+
+        let pid = read_pid(&pidfile);
+        let grandpid = read_pid(&grandpidfile);
+        assert_ne!(pid, grandpid, "the stub did not fork a real grandchild");
+        assert!(
+            wait_for_exit(pid, Duration::from_secs(5)),
+            "pid {pid} survived the dropped resolve"
+        );
+        assert!(
+            wait_for_exit(grandpid, Duration::from_secs(5)),
+            "grandchild {grandpid} survived the dropped resolve"
+        );
+    }
+
+    /// The fallback working directory is app-owned too, never the shared root.
+    ///
+    /// `std::env::temp_dir()` itself is world-writable, so another local user
+    /// can leave a `CLAUDE.md` or a `.claude/` in it; the child is now started
+    /// in a named subdirectory instead. Both roots are `tempfile::tempdir()`s
+    /// here, so this touches neither the real state directory nor `/tmp`.
+    #[test]
+    fn voice_agent_cli_falls_back_to_an_app_owned_directory_not_the_temp_root() {
+        let temp_root = tempfile::tempdir().expect("tempdir");
+        let unusable = tempfile::tempdir().expect("tempdir");
+        // A FILE where the state root should be, so `create_dir_all` fails.
+        let blocked = unusable.path().join("state");
+        std::fs::write(&blocked, b"not a directory").expect("write");
+
+        let chosen = owned_cwd_in(&blocked, temp_root.path());
+        assert_ne!(
+            chosen,
+            temp_root.path(),
+            "the fallback is the shared temp root itself"
+        );
+        assert_eq!(chosen, temp_root.path().join(TEMP_CWD_DIR));
+        assert!(chosen.is_dir(), "the fallback was not created");
+
+        // And the preferred root still wins when it can be created.
+        let state_root = tempfile::tempdir().expect("tempdir");
+        let preferred = owned_cwd_in(state_root.path(), temp_root.path());
+        assert_eq!(preferred, state_root.path().join(STATE_CWD_DIR));
+        assert!(preferred.is_dir());
     }
 
     /// The pid a stub wrote, waiting briefly for the write to land — the

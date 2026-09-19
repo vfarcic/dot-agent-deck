@@ -904,6 +904,17 @@ impl CaptureSession {
     /// timer rather than this type spawning one — which keeps the session free
     /// of an async runtime and lets a test advance a paused clock instead of
     /// waiting thirty seconds.
+    ///
+    /// **`Ok` does not promise the returned status is `Recording`.** The status
+    /// is read after the lock is released, so a [`CaptureSession::cancel`] that
+    /// lands in that window returns `Ok((Idle, ticket))` with a ticket that is
+    /// already a generation behind. It is benign — the cancel released the
+    /// device and the stale ticket makes [`CaptureSession::cap_reached`] a
+    /// no-op — but a caller that reads `Ok` as *"it is recording"* would be
+    /// wrong, so read the returned [`CaptureStatus::state`] rather than
+    /// inferring it. Not closed by re-reading under the lock: that would return
+    /// a status contradicting the cancel the user just made, which is the worse
+    /// of the two answers.
     pub fn start(&self) -> Result<(CaptureStatus, CaptureTicket), CaptureError> {
         // Reserved UNDER the lock, before the device is touched. See
         // `SessionInner::opening` for why this is a reservation rather than a
