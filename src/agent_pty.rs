@@ -1040,7 +1040,7 @@ const FORCE_REAP_POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// ([`crate::build_version_handshake::TERMINATE_POLL_TIMEOUT`]). Both are 5 s
 /// today; taking the smaller keeps [`FORCE_REAP_DEADLINE`] derived from whichever
 /// is tighter if they ever diverge.
-const DAEMON_STOP_POLL_BUDGET: Duration = {
+pub(crate) const DAEMON_STOP_POLL_BUDGET: Duration = {
     let stop = crate::daemon_stop::STOP_GRACE_TIMEOUT;
     let prompt = crate::build_version_handshake::TERMINATE_POLL_TIMEOUT;
     if stop.as_millis() < prompt.as_millis() {
