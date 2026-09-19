@@ -87,6 +87,56 @@ fn drain(master: &mut std::fs::File, sink: &mut Vec<u8>) {
     }
 }
 
+/// Everything this test started, reaped on every exit path including a panic.
+///
+/// Greptile P2 on PR #1164: the first version cleaned up inline, after the
+/// waits, so an earlier assertion failure left the deck and its session leader
+/// running — and it never reaped the daemon at all. The deck **lazy-spawns its
+/// daemon detached** (its own session, parent PID 1 from birth), so nothing
+/// above it can signal it, and with idle shutdown disabled it would otherwise
+/// sit out the 300s `DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS` backstop — five
+/// minutes of leaked daemon per run. An RAII drop is what makes all three
+/// reliable, because a failed assertion unwinds through it.
+struct Sandbox {
+    bin: &'static str,
+    leader: std::process::Child,
+    deck_pid: Option<i32>,
+    daemon_env: Vec<(&'static str, std::path::PathBuf)>,
+}
+
+impl Drop for Sandbox {
+    fn drop(&mut self) {
+        if let Some(pid) = self.deck_pid
+            && common::process_running(pid)
+        {
+            // SAFETY: best-effort cleanup of a pid this test created. By PID,
+            // never by a `pkill` pattern — a pattern that also matches a
+            // production deck is how nine live panes were stopped on
+            // 2026-09-15 (CLAUDE.md rule 12, issue #428 occurrence #5).
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+            }
+        }
+        let _ = self.leader.kill();
+        let _ = self.leader.wait();
+
+        // Then the detached daemon, through the product's own verb rather than
+        // a signal. It is scoped to THIS sandbox by the socket paths below, so
+        // it cannot reach the developer's own daemon; and it needs no `--force`
+        // because this test spawns no agents for the refusal (issue #770) to
+        // protect.
+        let mut stop = std::process::Command::new(self.bin);
+        stop.arg("daemon").arg("stop").env_clear();
+        for (key, value) in &self.daemon_env {
+            stop.env(key, value);
+        }
+        let _ = stop
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+}
+
 /// Scenario: Launch the real deck on a pseudo-terminal as the CHILD of a `trap
 /// "" HUP` session leader — the `ssh -t host task run` shape, where SIGHUP
 /// reaches the leader and is forwarded to nothing — wait for it to paint its
@@ -174,7 +224,20 @@ fn hangup_001_deck_exits_when_its_terminal_hangs_up() {
             Ok(())
         });
     }
-    let mut leader = cmd.spawn().expect("spawn the session leader");
+    // Adopted by the guard immediately, so every path below — including a
+    // failed assertion — reaps the leader, the deck and the detached daemon.
+    let mut sandbox = Sandbox {
+        bin,
+        leader: cmd.spawn().expect("spawn the session leader"),
+        deck_pid: None,
+        daemon_env: vec![
+            ("HOME", home.clone()),
+            ("DOT_AGENT_DECK_SOCKET", work.join("hook.sock")),
+            ("DOT_AGENT_DECK_ATTACH_SOCKET", work.join("attach.sock")),
+            ("DOT_AGENT_DECK_STATE_DIR", work.join("state")),
+            ("DOT_AGENT_DECK_LOG", work.join("deck.log")),
+        ],
+    };
     // The child holds its own copies; this test must not keep the terminal
     // alive from its side.
     drop(slave);
@@ -201,14 +264,8 @@ fn hangup_001_deck_exits_when_its_terminal_hangs_up() {
             read_pid().is_some() && attach_socket.exists() && painted.borrow().len() > 1024
         },
     );
-    let deck_pid = match read_pid() {
-        Some(pid) => pid,
-        None => {
-            let _ = leader.kill();
-            let _ = leader.wait();
-            panic!("the session leader never recorded the deck's pid");
-        }
-    };
+    let deck_pid = read_pid().expect("the session leader never recorded the deck's pid");
+    sandbox.deck_pid = Some(deck_pid);
     assert!(
         came_up,
         "the deck never came up: attach socket {}, {} bytes painted",
@@ -239,16 +296,8 @@ fn hangup_001_deck_exits_when_its_terminal_hangs_up() {
         !common::process_running(deck_pid)
     });
 
-    // Never leak this test's deck, whatever the outcome.
-    if !gone {
-        // SAFETY: best-effort cleanup of a pid this test created.
-        unsafe {
-            libc::kill(deck_pid, libc::SIGKILL);
-        }
-    }
-    let _ = leader.kill();
-    let _ = leader.wait();
-
+    // No inline cleanup: `Sandbox`'s `Drop` reaps the deck, the leader and the
+    // detached daemon whether this assertion passes or unwinds.
     assert!(
         gone,
         "the deck (pid {deck_pid}) was still running after its terminal hung up \
