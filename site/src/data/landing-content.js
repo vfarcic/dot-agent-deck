@@ -369,13 +369,27 @@ export const desktop = {
  * describes what is IN the frame rather than what the row argues, so a
  * recapture that changes what a frame shows is a one-file correction.
  *
- * `tall` is an OPTIONAL flag on an entry, read by `index.js` and meaning only
- * "this frame is much closer to 4:3 than the 16:9 the other rows carry".
- * `busy-deck-real.webp` is 2554x1936, so at the column's full width it renders
- * about a third taller than rows 01 and 03 and pulls the row out of step with
- * them. The flag caps its width above the two-column breakpoint instead of
- * cropping it -- a crop would cut off the two edges it is here for, the
- * sidebar's cards on one side and the footer's counts on the other.
+ * `tall` and `wide` are OPTIONAL layout flags on an entry, read by `index.js`.
+ * Both say the same thing about a frame -- "this one is far enough from the
+ * others' shape that the row falls out of step with its neighbours" -- and the
+ * measure for both is the same: how tall the frame stands, in multiples of the
+ * figure column's own width, when the story is at its 1120px maximum. Rows 01
+ * and 03 set the house shape at 0.58 and 0.56.
+ *
+ * `tall` means "much closer to 4:3 than the 16:9 the other rows carry".
+ * `busy-deck-real.webp` is 2554x1936, so at the column's full width it stands
+ * 0.76 -- about a third taller than rows 01 and 03. The flag caps its width
+ * above the two-column breakpoint instead of cropping it: a crop would cut off
+ * the two edges it is here for, the sidebar's cards on one side and the
+ * footer's counts on the other.
+ *
+ * `wide` is the same problem in the other direction, and needs the opposite
+ * treatment because no width cap can fix a frame for being too SHORT.
+ * `dispatch.webp` is 1946x482 -- a 4.04 band -- so in the ordinary figure
+ * column it stands 0.25, further below the house shape than the uncapped
+ * `busy-deck-real.webp` stood above it. The flag stacks that row instead: the
+ * text over the frame, and the frame across the whole story measure, which is
+ * 1.81 column-widths and so 0.45 tall.
  *
  * What changed, frame by frame:
  *
@@ -409,15 +423,31 @@ export const desktop = {
  *   claim it was really making here. `home-hero-dashboard.jpg` briefly held
  *   this slot while the new capture was being taken and has gone back to being
  *   `docs/session-management.md`'s Compact-density illustration.
- * - Row 04 is now dispatching, and has NO frame. Nothing in the repository
- *   illustrates a dispatched unit: `docs/dispatcher-mode.md` carries no images
- *   at all. Pointing the row at a filename that does not exist would ship a
- *   broken image, so the row renders as a single centred column until the
- *   capture lands; adding `shot:` to the step turns it back into an ordinary
- *   two-column row with no other change. The capture is commissioned -- a
- *   dispatcher pane mid-conversation, the plain-English ask visible, the reply
- *   naming the unit and its sibling directory, and the new unit's card already
- *   on the deck beside it -- and lands as `/img/dispatch.webp`.
+ * - Row 04 (dispatching) now carries `dispatch.webp`, commissioned for this
+ *   row because nothing in the repository illustrated a dispatched unit --
+ *   `docs/dispatcher-mode.md` carries no images at all -- and shot to the
+ *   specification the row asked for: a dispatcher pane mid-conversation, the
+ *   plain-English ask visible, the reply naming the unit and its sibling
+ *   directory, and the new unit's card already on the deck beside it. The row
+ *   rendered as a single centred column while the filename did not exist,
+ *   rather than shipping a broken image; adding `shot:` was the whole change.
+ *
+ *   Two things the caption is written AROUND, both read off the frame rather
+ *   than off the row's argument. Both cards show `Idle` and `Tools: 0`: the
+ *   unit has been created and has not begun working, so a caption claiming
+ *   visible work would be describing the copy and not the picture. And the
+ *   dispatched unit's own card carries no directory (`Dir: --`) -- the sibling
+ *   path `../storefront-dispatch-login-timeout` is in the reply text beside
+ *   it, not on the card.
+ *
+ *   It carries `wide`. The frame shipped at 1946x1187 and was recropped to
+ *   1946x482 to drop a large empty region below the cards -- content
+ *   unchanged, so the alt and the caption survived it, but the shape did not:
+ *   1.64 became 4.04. See the flag's own note above for the arithmetic. What
+ *   the crop removed is worth knowing before writing to this frame again: the
+ *   deck footer's counts, the `TYPING` indicator and the `Command Mode Ctrl+D`
+ *   hint are all gone from it, so neither the alt nor the caption may reach
+ *   for them.
  * - `reattach.png` leaves the page with the "walk away" row it illustrated.
  *   The maintainer's verdict on that frame was "I'm not sure I understand" it,
  *   and the diagnosis is that the idea has no moment to photograph: detaching
@@ -449,9 +479,9 @@ export const screenshots = {
   },
   newPane: {
     src: '/img/orchestration-new-deck.png',
-    alt: 'The New Agent form — Dir /tmp/storefront, a Mode row offering No mode, schedule and dispatcher, Agent on auto, Name storefront, Command claude, and Submit and Cancel buttons',
+    alt: 'The New Agent form — Dir /tmp/storefront, a Mode row offering No mode, Orch: review-team, schedule and dispatcher, Agent on auto, Name storefront, Command claude, and Submit and Cancel buttons',
     caption:
-      'The form Ctrl+n opens once the directory is picked. The Mode row is where the choice is made — this directory defines no orchestrations of its own, so it offers the built-in options only.',
+      'The form Ctrl+n opens once the directory is picked. The Mode row is where the choice above is made — a plain agent, a scheduled task, a dispatcher, and review-team, which is not a built-in option but the orchestration this directory defines.',
   },
   deck: {
     src: '/img/busy-deck-real.webp',
@@ -465,6 +495,13 @@ export const screenshots = {
     alt: 'Orchestrator delegating to reviewer and auditor in parallel — both cards light up simultaneously',
     caption:
       'One agent delegating to two others at once. Both cards light up together.',
+  },
+  dispatch: {
+    src: '/img/dispatch.webp',
+    wide: true,
+    alt: 'A dispatcher pane mid-conversation — the ask “Start work on the login timeout bug.”, and a reply naming a single-agent unit login-timeout and the sibling directory ../storefront-dispatch-login-timeout — beside a sidebar where a second card, dispatch-login-timeout, has already appeared under the dispatcher’s own; both cards read Idle with a tool count of 0',
+    caption:
+      'One sentence to a dispatcher pane. The reply names the unit — login-timeout — and the sibling directory it gets instead of this checkout, ../storefront-dispatch-login-timeout, and the unit’s card is already on the deck, directly under the card of the pane that asked for it. Both cards still read Idle with no tools run: this is the unit arriving, a moment before it starts.',
   },
 };
 
@@ -488,8 +525,11 @@ export const audience = {
  * `screenshots` is declared above, so a typo here is `undefined` and the first
  * property read fails the build rather than rendering the wrong frame.
  *
- * `shot` is OPTIONAL. A step without one renders as a single centred column --
- * see the note on `screenshots` for why row 04 has none yet.
+ * `shot` is OPTIONAL. A step without one renders as a single centred column
+ * rather than as half a two-column row with the picture missing. Every step
+ * carries one today; the branch is kept for the next row written before its
+ * frame is taken, which is how row 04 shipped while `dispatch.webp` was being
+ * captured.
  *
  * The arc is an escalation, and each rung is a shipped feature rather than a
  * restatement of the one before it: one pane, then many of them visible at
@@ -519,6 +559,7 @@ export const workflow = [
     step: '04',
     title: 'Send work off on its own',
     body: 'Ask a dispatcher pane for something — “work on the search bug” — and it makes a separate copy of your repository and puts an agent, or a whole orchestration, to work inside it. It works in that copy rather than in your working tree, so start as many as you like and carry on with what you were doing. Each unit arrives on the deck as a card or a tab, and reports back when it is done.',
+    shot: screenshots.dispatch,
   },
 ];
 

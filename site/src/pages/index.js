@@ -95,6 +95,23 @@ const doorPages = [
  */
 const COUNT_WORDS = ['No', 'One', 'Two', 'Three', 'Four', 'Five', 'Six'];
 
+/**
+ * Which layout a story row takes, in the order the cases have to be tested.
+ * A step with no frame stands alone; a frame flagged `wide` stacks the text
+ * over a full-width frame and so leaves the alternation; everything else
+ * alternates sides down the page. `landing-content.js` carries why each flag
+ * exists and the arithmetic behind it.
+ */
+function storyRowClass(step, index) {
+  if (!step.shot) {
+    return styles.storyRowSolo;
+  }
+  if (step.shot.wide) {
+    return styles.storyRowWide;
+  }
+  return index % 2 === 0 ? styles.storyRow : styles.storyRowFlip;
+}
+
 function InstallPill({command}) {
   return (
     <div className={styles.installPill}>
@@ -190,15 +207,7 @@ export default function Home() {
               How it works
             </h2>
             {workflow.map((step, i) => (
-              <div
-                key={step.step}
-                className={
-                  step.shot
-                    ? i % 2 === 0
-                      ? styles.storyRow
-                      : styles.storyRowFlip
-                    : styles.storyRowSolo
-                }>
+              <div key={step.step} className={storyRowClass(step, i)}>
                 <div className={styles.storyText}>
                   <span className={styles.storyStep}>{step.step}</span>
                   <h3>{step.title}</h3>
