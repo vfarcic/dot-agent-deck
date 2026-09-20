@@ -835,12 +835,18 @@ const FIXTURE_VOICE_MAX_MS = 30_000;
 /**
  * The microphone the browser preview does not have (PRD #802 M7).
  *
- * With no overrides this is the same answer a live app reports when `[voice]
- * transcription` is `off`, which is its default — so the preview renders the
- * state a first run renders, and the browser tier gets to drive the
- * *unavailable* path with no microphone, no credential and no Tauri runtime
- * anywhere near it. `off` is a product statement rather than a degraded mode:
- * the surface says how to turn voice on rather than looking broken.
+ * With no overrides this reports a runtime that offers no microphone path at
+ * all, which is what the browser preview genuinely is: no Rust side, no
+ * container, and a CSP that leaves the webview unable to reach a network
+ * origin. That lets the browser tier drive the *unavailable* path with no
+ * microphone, no credential and no Tauri runtime anywhere near it — and the
+ * surface says how to turn voice on rather than looking broken.
+ *
+ * It is no longer what a live app reports on its defaults. PRD #802's provider
+ * work gave Speech a keyless container on loopback and deleted `off`, so the
+ * Tauri side now always reports `available: true` and the *not set up* case is
+ * reported where it bites, as a `not_configured` transcription outcome naming
+ * the container to start.
  *
  * The overrides are what lets the same tier drive the OTHER path — see
  * {@link fixtureVoiceHeard}.

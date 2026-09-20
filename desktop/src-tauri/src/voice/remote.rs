@@ -79,17 +79,12 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 
+use crate::model_service::{ModelId, ServiceUrl};
 use crate::secrets::{SecretId, SecretStore, load_off_runtime};
 
 use super::prompt::{action_enum, param_names, state};
 use super::resolver::{IntentAnswer, IntentError, IntentRequest, IntentResolver, ResolveFuture};
 use super::schema::{AnnotatedCommand, TOOL_INSTRUCTIONS, TOOL_NAME};
-
-/// Where the request goes.
-pub const DEFAULT_ENDPOINT: &str = "https://api.anthropic.com/v1/messages";
-
-/// The model this backend asks. See the module docs for the measurement.
-pub const DEFAULT_MODEL: &str = "claude-haiku-4-5";
 
 /// The API version header this request shape was measured against.
 const API_VERSION: &str = "2023-06-01";
@@ -116,12 +111,19 @@ pub struct RemoteResolver {
     /// `None` when no client could be built, which this backend reports as a
     /// failure rather than papering over — see [`super::http::client`].
     client: Option<reqwest::Client>,
-    endpoint: String,
-    model: String,
+    endpoint: ServiceUrl,
+    model: ModelId,
 }
 
 impl RemoteResolver {
-    pub fn new(secrets: Arc<dyn SecretStore>) -> Self {
+    /// Both coordinates are arguments rather than constants, which is the
+    /// change PRD #802's provider work made here: the model used to be a
+    /// `const` with a doc comment explaining that a settings field would offer
+    /// a choice whose only correct value this file knew. That was true of the
+    /// measurement and false of the product — a user cannot know which key to
+    /// paste when the endpoint is a secret of the build's, and cannot use a
+    /// provider this build did not pick.
+    pub fn new(secrets: Arc<dyn SecretStore>, endpoint: ServiceUrl, model: ModelId) -> Self {
         Self {
             secrets,
             // Built once and reused, which is how `reqwest` is meant to be
@@ -143,16 +145,9 @@ impl RemoteResolver {
             // all, and hands back `None` rather than a permissive fallback if
             // it cannot be built; `run` turns that into a sentence.
             client: super::http::client(),
-            endpoint: DEFAULT_ENDPOINT.to_string(),
-            model: DEFAULT_MODEL.to_string(),
+            endpoint,
+            model,
         }
-    }
-
-    /// Send somewhere else. PRD #802 M9's credentialed lane is what this is
-    /// for; nothing in the merge-blocking tier opens a socket at all.
-    pub fn with_endpoint(mut self, endpoint: impl Into<String>) -> Self {
-        self.endpoint = endpoint.into();
-        self
     }
 
     async fn run(&self, request: IntentRequest<'_>) -> Result<IntentAnswer, IntentError> {
@@ -163,10 +158,10 @@ impl RemoteResolver {
         {
             Ok(Some(secret)) => secret,
             Ok(None) => {
-                return Err(IntentError::NotConfigured(
-                    "no key is stored for the remote command backend — add one in Settings → Voice"
-                        .into(),
-                ));
+                return Err(IntentError::NotConfigured(format!(
+                    "no key is stored for {} — add one in Settings → Voice",
+                    self.endpoint.host()
+                )));
             }
             // The keychain itself failed. `SecretError::public` is already a
             // complete sentence naming what did not happen, which is the whole
@@ -183,9 +178,9 @@ impl RemoteResolver {
             ));
         };
 
-        let body = request_body(&request, &self.model);
+        let body = request_body(&request, self.model.as_str());
         let response = client
-            .post(&self.endpoint)
+            .post(self.endpoint.as_str())
             .timeout(REMOTE_TIMEOUT)
             .header("content-type", "application/json")
             .header("anthropic-version", API_VERSION)
@@ -294,9 +289,11 @@ pub fn tool_definition(commands: &[AnnotatedCommand]) -> Value {
 /// `tool_choice` names the tool rather than being `auto`: there is exactly one
 /// tool and exactly one thing to do with this turn, and a model that answered
 /// in prose would be an unreadable answer. (Forced tool choice is rejected by
-/// some newer models and accepted by this one; the pin in [`DEFAULT_MODEL`] is
-/// what makes that a fact rather than a hope, and moving the model means
-/// re-checking it.)
+/// some newer models and accepted by this one; the model is a SETTING since
+/// PRD #802's provider work, so that is a fact about the preset rather than
+/// about every value the field can hold — a user who points this at a model
+/// that refuses a forced tool choice gets an unreadable-answer error, which is
+/// the honest failure for a coordinate they chose.)
 ///
 /// The state goes in `system` and the utterance in the one user turn, which is
 /// the split that keeps the volatile half last: the commands and the agent list
@@ -379,6 +376,7 @@ fn transport_detail(error: &reqwest::Error) -> String {
 mod tests {
     use super::*;
     use crate::secrets::{MemorySecretStore, Secret, SecretErrorKind, ThreadRecordingStore};
+    use crate::settings::HOSTED_COMMAND_MODEL;
     use crate::voice::Transcript;
     use crate::voice::fixtures::role_agent as agent;
     use crate::voice::schema::annotate;
@@ -405,7 +403,17 @@ mod tests {
                 commands: &commands,
                 agents: &agents,
             },
-            DEFAULT_MODEL,
+            HOSTED_COMMAND_MODEL,
+        )
+    }
+
+    /// A keyed resolver pointed somewhere unroutable on purpose: reaching it
+    /// would be a failure of the test's premise, not a flake.
+    fn resolver(secrets: Arc<dyn SecretStore>) -> RemoteResolver {
+        RemoteResolver::new(
+            secrets,
+            ServiceUrl::parse("https://voice-intent.invalid/never").expect("valid"),
+            ModelId::parse(HOSTED_COMMAND_MODEL).expect("valid"),
         )
     }
 
@@ -615,8 +623,7 @@ mod tests {
     async fn voice_remote_without_a_key_is_not_configured_and_opens_no_socket() {
         // The endpoint is unroutable on purpose: reaching it would be a
         // failure of this test's premise, not a flake.
-        let resolver = RemoteResolver::new(Arc::new(MemorySecretStore::new()))
-            .with_endpoint("https://voice-intent.invalid/never");
+        let resolver = resolver(Arc::new(MemorySecretStore::new()));
         let commands = commands();
         let transcript = Transcript::new("show me the tester");
         let error = resolver
@@ -639,8 +646,7 @@ mod tests {
         // render as "nothing stored", or the user retypes their key into a
         // store that cannot hold it.
         let store = MemorySecretStore::failing(SecretErrorKind::Unavailable, "test");
-        let resolver = RemoteResolver::new(Arc::new(store))
-            .with_endpoint("https://voice-intent.invalid/never");
+        let resolver = resolver(Arc::new(store));
         let commands = commands();
         let transcript = Transcript::new("show me the tester");
         let error = resolver
@@ -668,8 +674,7 @@ mod tests {
     #[tokio::test]
     async fn voice_remote_reads_the_keychain_off_the_runtime() {
         let store = Arc::new(ThreadRecordingStore::new());
-        let resolver = RemoteResolver::new(Arc::clone(&store) as Arc<dyn SecretStore>)
-            .with_endpoint("https://voice-intent.invalid/never");
+        let resolver = resolver(Arc::clone(&store) as Arc<dyn SecretStore>);
         let commands = commands();
         let transcript = Transcript::new("show me the tester");
         let error = resolver
@@ -710,7 +715,7 @@ mod tests {
     #[test]
     fn voice_remote_names_itself_for_the_surface() {
         assert_eq!(
-            RemoteResolver::new(Arc::new(MemorySecretStore::new())).backend_name(),
+            resolver(Arc::new(MemorySecretStore::new())).backend_name(),
             "remote"
         );
     }

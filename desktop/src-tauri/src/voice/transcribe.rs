@@ -7,22 +7,30 @@
 //! one `…_for` function that reads the settings at call time, and a stub every
 //! test downstream drives.
 //!
-//! # `Off` is the default, and it is a product statement
+//! # One backend, and the keyless one is the default
 //!
-//! PRD #802 is explicit that transcription is the **one** stage with no no-key
-//! trick — Siri matches declared App Intents rather than handing over a
+//! PRD #802 shipped with transcription as the **one** stage it claimed had no
+//! no-key trick — Siri matches declared App Intents rather than handing over a
 //! transcript, `SFSpeechRecognizer` exists on one of three platforms, and local
-//! whisper is deferred to D1 behind a decision to take a C/C++ toolchain into
-//! `cargo test-fast`. So with nothing configured there is **no fallback command
-//! path**: the Voice button still renders, and pressing it names Settings →
-//! Voice rather than turning on.
+//! whisper was deferred behind a decision to take a C/C++ toolchain into
+//! `cargo test-fast`. The provider-selection work found the route that argument
+//! had missed: **a container on loopback, over the same HTTP this file already
+//! spoke.** Measured — `ghcr.io/speaches-ai/speaches:0.9.0-rc.3-cpu` on
+//! `127.0.0.1:18000`, the same three multipart parts, the same `text` field
+//! back, 0.653 s median warm, and no credential anywhere.
 //!
-//! That is why [`OffTranscriber`] answers [`TranscriptionError::NotConfigured`]
-//! and why [`TranscriptionOutcome`] carries
-//! [`TranscriptionOutcome::NotConfigured`] as its own variant rather than
-//! folding it into a failure: *nothing is set up yet* and *the request timed
-//! out* are different things for the user to do next, and a settings
-//! instruction dressed as an error teaches people the feature is broken.
+//! So there is **no `off` variant and no second implementation**.
+//! [`HttpTranscriber`] is the whole of it, and the difference between local and
+//! hosted is one field: [`HttpTranscriber::keyless`] holds no [`SecretStore`]
+//! and sends no `Authorization` header, [`HttpTranscriber::keyed`] holds one
+//! and does. The keyless path is not a credentialed path whose lookup happens
+//! to return nothing — there is no lookup.
+//!
+//! [`TranscriptionOutcome::NotConfigured`] survives all of that, and earns its
+//! keep on a better case than `off` ever was: **an endpoint nobody is
+//! listening at**. *Start the container* and *the request timed out* are
+//! different things to do next, and a prerequisite dressed as an error teaches
+//! people the feature is broken. [`unreachable_detail`] is the sentence.
 //!
 //! # The credential is read here and never crosses into the webview
 //!
@@ -55,24 +63,12 @@ use std::time::Duration;
 
 use serde_json::Value;
 
+use crate::model_service::{ModelId, ServiceUrl};
 use crate::secrets::{SecretId, SecretStore, load_off_runtime};
+use crate::settings::{LOCAL_SPEECH_IMAGE, TranscriptionBackend, TranscriptionSettings};
 
 use super::Transcript;
 use super::capture::Pcm16;
-
-/// Where the request goes.
-pub const DEFAULT_ENDPOINT: &str = "https://api.openai.com/v1/audio/transcriptions";
-
-/// The model this backend asks.
-///
-/// **Whisper, and the reason is the deferred milestone rather than the price.**
-/// PRD #802's D1 is local whisper, and it is described as the thing that
-/// removes the credential requirement from transcription. Pinning the hosted
-/// backend to the *same model family* is what makes D1 a swap rather than a
-/// behaviour change: the phrases that work today go on working when the
-/// credential goes away. A cheaper or more accurate hosted model would buy a
-/// fraction of a cent an utterance and spend that property.
-pub const DEFAULT_MODEL: &str = "whisper-1";
 
 /// How long the request gets before the attempt is abandoned.
 ///
@@ -87,13 +83,13 @@ pub const TRANSCRIBE_TIMEOUT: Duration = Duration::from_secs(60);
 /// Why a transcriber could not answer.
 ///
 /// Split the way [`super::resolver::IntentError`] is, and for the same reason:
-/// nothing is configured yet (a settings instruction) against a backend that is
-/// configured and failed (an error). **They are not the same sentence and must
-/// not render as one.**
+/// something is not set up yet (an instruction) against a backend that is set
+/// up and failed (an error). **They are not the same sentence and must not
+/// render as one.**
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TranscriptionError {
-    /// No transcription backend is configured, or the configured one has no
-    /// credential.
+    /// The configured backend cannot run yet: nothing is listening at a
+    /// loopback endpoint, or a keyed service has no key stored.
     NotConfigured(String),
     /// The backend ran and did not produce a usable transcript — a timeout, a
     /// non-2xx reply, an unreadable body.
@@ -131,7 +127,7 @@ pub type TranscribeFuture<'a> =
 pub trait Transcriber: Send + Sync {
     fn transcribe<'a>(&'a self, audio: &'a Pcm16) -> TranscribeFuture<'a>;
 
-    /// Which backend this is, for the surface to name — `off`, `remote`,
+    /// Which backend this is, for the surface to name — `local`, `remote`,
     /// `stub`. It travels on every [`VoiceTranscription`] beside the latency,
     /// for [`super::resolver::IntentResolver::backend_name`]'s reason: the
     /// number alone is a complaint and the number with a name is a decision.
@@ -140,61 +136,63 @@ pub trait Transcriber: Send + Sync {
 
 /// Build the backend the settings name.
 ///
-/// `secrets` is taken for every variant even though only
-/// [`TranscriptionBackend::Remote`](crate::settings::TranscriptionBackend::Remote)
-/// reads one — [`super::resolver::resolver_for`]'s reason: passing the store
-/// rather than a credential is what keeps the value Rust-side, read at the
-/// moment it is needed and never handed around.
+/// `secrets` is taken whichever backend is named even though only
+/// [`TranscriptionBackend::Remote`] reads one —
+/// [`super::resolver::resolver_for`]'s reason: passing the store rather than a
+/// credential is what keeps the value Rust-side, read at the moment it is
+/// needed and never handed around. What the keyless branch does with it is
+/// **drop it**, which is the difference between "no key was found" and "no key
+/// was asked for".
 pub fn transcriber_for(
-    backend: crate::settings::TranscriptionBackend,
+    settings: &TranscriptionSettings,
     secrets: Arc<dyn SecretStore>,
 ) -> Box<dyn Transcriber> {
-    use crate::settings::TranscriptionBackend;
-    match backend {
-        TranscriptionBackend::Off => Box::new(OffTranscriber),
-        TranscriptionBackend::Remote => Box::new(RemoteTranscriber::new(secrets)),
+    let endpoint = settings.endpoint.clone();
+    let model = settings.model.clone();
+    match settings.backend {
+        TranscriptionBackend::Local => Box::new(HttpTranscriber::keyless(endpoint, model)),
+        TranscriptionBackend::Remote => Box::new(HttpTranscriber::keyed(secrets, endpoint, model)),
     }
 }
 
-/// No transcription backend.
-///
-/// The default, and **a first-class variant rather than a degraded mode**: it
-/// answers [`TranscriptionError::NotConfigured`] with a sentence that names
-/// where to fix it, and the surface renders that as an instruction beside a
-/// Voice button that is still there to press once the setting is changed.
-pub struct OffTranscriber;
+// -- the one HTTP backend --------------------------------------------------
 
-/// What the user is told when nothing is configured.
-///
-/// One string rather than one per call site, because it is the sentence that
-/// has to read as an instruction: a second wording somewhere else is how it
-/// drifts into sounding like a failure.
-pub const NOT_CONFIGURED: &str = "no transcription backend is configured — choose one in Settings → Voice, then press Voice again";
-
-impl Transcriber for OffTranscriber {
-    fn transcribe<'a>(&'a self, _audio: &'a Pcm16) -> TranscribeFuture<'a> {
-        Box::pin(async { Err(TranscriptionError::NotConfigured(NOT_CONFIGURED.into())) })
-    }
-
-    fn backend_name(&self) -> &'static str {
-        "off"
-    }
-}
-
-// -- the keyed remote backend ----------------------------------------------
-
-/// Transcribe by uploading the utterance to a hosted speech model.
-pub struct RemoteTranscriber {
-    secrets: Arc<dyn SecretStore>,
+/// Transcribe by posting the utterance to a speech service — on this machine or
+/// hosted, which is the same request either way.
+pub struct HttpTranscriber {
+    /// `None` means **this endpoint takes no credential**, and the keychain is
+    /// never consulted. It is not an absent store or a failed lookup: a keyless
+    /// backend sends no `Authorization` header at all, which is what lets the
+    /// local container — which has no notion of a key — be a first-class
+    /// choice rather than a keyed path that happens to tolerate an empty one.
+    secrets: Option<Arc<dyn SecretStore>>,
     /// `None` when no client could be built — see [`super::http::client`]. This
     /// backend reports that rather than falling back to a permissive one.
     client: Option<reqwest::Client>,
-    endpoint: String,
-    model: String,
+    endpoint: ServiceUrl,
+    model: ModelId,
+    /// What the surface names this — `local` or `remote`, from the settings
+    /// token, so one vocabulary spans the document, the panel and the report.
+    name: &'static str,
 }
 
-impl RemoteTranscriber {
-    pub fn new(secrets: Arc<dyn SecretStore>) -> Self {
+impl HttpTranscriber {
+    /// A service that authenticates with a key of the app's own.
+    pub fn keyed(secrets: Arc<dyn SecretStore>, endpoint: ServiceUrl, model: ModelId) -> Self {
+        Self::build(Some(secrets), endpoint, model, "remote")
+    }
+
+    /// A service that takes no credential — the container on loopback.
+    pub fn keyless(endpoint: ServiceUrl, model: ModelId) -> Self {
+        Self::build(None, endpoint, model, "local")
+    }
+
+    fn build(
+        secrets: Option<Arc<dyn SecretStore>>,
+        endpoint: ServiceUrl,
+        model: ModelId,
+        name: &'static str,
+    ) -> Self {
         Self {
             secrets,
             // Built once and reused, and the timeout set per REQUEST rather
@@ -209,18 +207,14 @@ impl RemoteTranscriber {
             // change — so the `x-api-key` leak PRD #802's audit found is not
             // this one's. What is this one's: a 307 or 308 re-sends the body,
             // and the body here is the user's voice. Same policy, different
-            // reason.
+            // reason, and it applies to the keyless path too: a loopback
+            // endpoint that redirects is still an endpoint sending the audio
+            // somewhere the user did not write.
             client: super::http::client(),
-            endpoint: DEFAULT_ENDPOINT.to_string(),
-            model: DEFAULT_MODEL.to_string(),
+            endpoint,
+            model,
+            name,
         }
-    }
-
-    /// Send somewhere else. PRD #802 M9's credentialed lane is what this is
-    /// for; nothing in the merge-blocking tier opens a socket at all.
-    pub fn with_endpoint(mut self, endpoint: impl Into<String>) -> Self {
-        self.endpoint = endpoint.into();
-        self
     }
 
     async fn run(&self, audio: &Pcm16) -> Result<Transcript, TranscriptionError> {
@@ -238,20 +232,28 @@ impl RemoteTranscriber {
         // Read at call time, Rust-side, and dropped with this scope — and on
         // a blocking thread, because a keychain read is entitled to prompt and
         // this is an async fn on a shared runtime.
-        let secret = match load_off_runtime(Arc::clone(&self.secrets), SecretId::VoiceTranscription)
-            .await
-        {
-            Ok(Some(secret)) => secret,
-            Ok(None) => {
-                return Err(TranscriptionError::NotConfigured(
-                    "no key is stored for the remote transcription backend — add one in Settings → Voice"
-                        .into(),
-                ));
+        //
+        // `None` here is the KEYLESS backend, and the whole branch is skipped:
+        // no keychain call, no prompt, no failure mode. That is the shape the
+        // local container needed and the reason this is an `Option<Arc<…>>`
+        // rather than a store that is asked and forgiven for answering nothing.
+        let secret = match &self.secrets {
+            None => None,
+            Some(store) => {
+                match load_off_runtime(Arc::clone(store), SecretId::VoiceTranscription).await {
+                    Ok(Some(secret)) => Some(secret),
+                    Ok(None) => {
+                        return Err(TranscriptionError::NotConfigured(format!(
+                            "no key is stored for {} — add one in Settings → Voice",
+                            self.endpoint.host()
+                        )));
+                    }
+                    // The keychain itself failed. PRD #802 M4's rule: "I could
+                    // not find out" must not render as "nothing stored", or the
+                    // user retypes a key into a store that cannot hold it.
+                    Err(error) => return Err(TranscriptionError::NotConfigured(error.public())),
+                }
             }
-            // The keychain itself failed. PRD #802 M4's rule: "I could not find
-            // out" must not render as "nothing stored", or the user retypes a
-            // key into a store that cannot hold it.
-            Err(error) => return Err(TranscriptionError::NotConfigured(error.public())),
         };
 
         let Some(client) = self.client.as_ref() else {
@@ -263,16 +265,24 @@ impl RemoteTranscriber {
         };
 
         let boundary = boundary();
-        let body = multipart_body(audio, &self.model, &boundary);
-        let response = client
-            .post(&self.endpoint)
+        let body = multipart_body(audio, self.model.as_str(), &boundary);
+        let mut request = client
+            .post(self.endpoint.as_str())
             .timeout(TRANSCRIBE_TIMEOUT)
             .header("content-type", content_type(&boundary))
-            .header("authorization", format!("Bearer {}", secret.expose()))
-            .body(body)
+            .body(body);
+        // Attached only where there is one to attach. The local container
+        // tolerates the header, which is exactly why not sending it has to be
+        // structural rather than incidental: a backend that sends an empty
+        // `Bearer` to a service that ignores it works until the day it meets
+        // one that does not.
+        if let Some(secret) = &secret {
+            request = request.header("authorization", format!("Bearer {}", secret.expose()));
+        }
+        let response = request
             .send()
             .await
-            .map_err(|error| TranscriptionError::Backend(transport_detail(&error)))?;
+            .map_err(|error| self.transport_error(&error))?;
 
         let status = response.status();
         // Bounded BEFORE the bytes become text or JSON, on the success and the
@@ -305,16 +315,59 @@ impl RemoteTranscriber {
         }
         parse_response(&payload)
     }
+
+    /// What a transport failure becomes, which depends on **where the endpoint
+    /// points**.
+    ///
+    /// A connection refused by a hosted service and a connection refused by a
+    /// container that is not running are the same `reqwest` error and entirely
+    /// different situations: one is an outage to wait out, the other is a
+    /// command to run. The product owner asked for this specifically — an
+    /// unreachable endpoint must say what to start, not "transcription failed"
+    /// — so a loopback endpoint that does not answer is classified as
+    /// [`TranscriptionError::NotConfigured`] and carries
+    /// [`unreachable_detail`]'s sentence, which the surface renders as an
+    /// instruction rather than an error.
+    fn transport_error(&self, error: &reqwest::Error) -> TranscriptionError {
+        // Keyless AND loopback, not either alone. A keyed endpoint that happens
+        // to be on this machine is a gateway the user runs their own way, and a
+        // remote endpoint that is down is an outage — neither is fixed by
+        // starting the speech container, and telling somebody to run docker at
+        // an outage is worse than saying nothing.
+        if error.is_connect() && self.secrets.is_none() && self.endpoint.is_loopback() {
+            return TranscriptionError::NotConfigured(unreachable_detail(&self.endpoint));
+        }
+        TranscriptionError::Backend(transport_detail(error))
+    }
 }
 
-impl Transcriber for RemoteTranscriber {
+impl Transcriber for HttpTranscriber {
     fn transcribe<'a>(&'a self, audio: &'a Pcm16) -> TranscribeFuture<'a> {
         Box::pin(self.run(audio))
     }
 
     fn backend_name(&self) -> &'static str {
-        "remote"
+        self.name
     }
+}
+
+/// What a user is told when nothing answers at a speech endpoint on their own
+/// machine.
+///
+/// **Names the command, not the symptom.** The whole point of the keyless
+/// default is that nobody has to paste a credential to try voice; the cost of
+/// that default is a prerequisite the user has to start, so the one place that
+/// cost is met has to carry the fix. The port comes from the endpoint the user
+/// actually configured rather than from the preset, because a person who moved
+/// it is exactly the person a hardcoded `18000` would mislead.
+pub fn unreachable_detail(endpoint: &ServiceUrl) -> String {
+    let published = endpoint.port().unwrap_or(18000);
+    format!(
+        "nothing is listening at {origin} — start the speech service with \
+         `docker run -d -p {published}:8000 {LOCAL_SPEECH_IMAGE}` and press Voice again, \
+         or pick a hosted service under Settings → Voice",
+        origin = endpoint.origin(),
+    )
 }
 
 /// The multipart separator for one request.
@@ -484,8 +537,8 @@ pub struct VoiceTranscription {
     pub outcome: TranscriptionOutcome,
     /// Milliseconds spent in the backend, or `None` when none was called.
     pub transcribe_ms: Option<u32>,
-    /// Which backend answered — `off`, `remote`, `stub`. Present even when no
-    /// call was made, because it names what *would* have answered, which is
+    /// Which backend answered — `local`, `remote`, `stub`. Present even when
+    /// no call was made, because it names what *would* have answered, which is
     /// what a settings-facing sentence is about.
     pub backend: &'static str,
     /// How much audio was captured, in milliseconds.
@@ -509,9 +562,10 @@ impl VoiceTranscription {
 
 /// The closed set of situations transcribing one utterance can end in.
 ///
-/// Three rather than two, and the third is the point: *nothing is configured*
-/// is neither a transcript nor a failure, and rendering it as either is the
-/// mistake PRD #802 names when it calls `off` a product statement.
+/// Three rather than two, and the third is the point: *a prerequisite is not
+/// running* is neither a transcript nor a failure, and rendering it as either
+/// is the mistake — an instruction dressed as an error teaches people the
+/// feature is broken.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 #[serde(
     tag = "kind",
@@ -528,8 +582,9 @@ pub enum TranscriptionOutcome {
         transcript: Transcript,
         sentence: String,
     },
-    /// No transcription backend is configured. **Not a failure**: the sentence
-    /// is a settings instruction naming Settings → Voice rather than an error.
+    /// The configured backend cannot be used yet — nothing is listening at a
+    /// loopback endpoint, or a keyed service has no key. **Not a failure**: the
+    /// sentence is an instruction naming what to start or what to paste.
     NotConfigured { detail: String, sentence: String },
     /// Speech could not be turned into text.
     Failed { detail: String, sentence: String },
@@ -610,7 +665,9 @@ fn millis(duration: Duration) -> u32 {
 mod tests {
     use super::*;
     use crate::secrets::{MemorySecretStore, Secret, SecretErrorKind, ThreadRecordingStore};
-    use crate::settings::TranscriptionBackend;
+    use crate::settings::{
+        HOSTED_SPEECH_MODEL, LOCAL_SPEECH_ENDPOINT, LOCAL_SPEECH_MODEL, TranscriptionBackend,
+    };
     use serde_json::json;
 
     // Every test here is pure: bytes in, a `Value` in, a `Value` or an outcome
@@ -635,14 +692,31 @@ mod tests {
 
     // -- selection ---------------------------------------------------------
 
+    /// A keyed transcriber pointed somewhere unroutable on purpose: reaching
+    /// it would be a failure of the test's premise, not a flake.
+    fn keyed(secrets: Arc<dyn SecretStore>) -> HttpTranscriber {
+        HttpTranscriber::keyed(
+            secrets,
+            ServiceUrl::parse("https://voice-transcription.invalid/never").expect("valid"),
+            ModelId::parse(HOSTED_SPEECH_MODEL).expect("valid"),
+        )
+    }
+
+    fn stage(backend: TranscriptionBackend) -> TranscriptionSettings {
+        TranscriptionSettings {
+            backend,
+            ..TranscriptionSettings::default()
+        }
+    }
+
     #[test]
     fn voice_transcribe_selects_the_backend_the_settings_name() {
         assert_eq!(
-            transcriber_for(TranscriptionBackend::Off, store()).backend_name(),
-            "off"
+            transcriber_for(&stage(TranscriptionBackend::Local), store()).backend_name(),
+            "local"
         );
         assert_eq!(
-            transcriber_for(TranscriptionBackend::Remote, store()).backend_name(),
+            transcriber_for(&stage(TranscriptionBackend::Remote), store()).backend_name(),
             "remote"
         );
     }
@@ -654,11 +728,11 @@ mod tests {
         // docs call a lie in a file the user can read. The `match` is
         // exhaustive so the compiler catches it; this asserts the set that was
         // mapped, which the compiler cannot.
-        let names: Vec<&str> = [TranscriptionBackend::Off, TranscriptionBackend::Remote]
+        let names: Vec<&str> = [TranscriptionBackend::Local, TranscriptionBackend::Remote]
             .into_iter()
-            .map(|backend| transcriber_for(backend, store()).backend_name())
+            .map(|backend| transcriber_for(&stage(backend), store()).backend_name())
             .collect();
-        assert_eq!(names, vec!["off", "remote"]);
+        assert_eq!(names, vec!["local", "remote"]);
         assert_eq!(names.len(), 2);
     }
 
@@ -666,55 +740,126 @@ mod tests {
     fn voice_transcribe_is_object_safe() {
         // The property the settings choice depends on: the backend is picked at
         // call time, so it has to be storable behind a `dyn`.
-        let transcriber: Box<dyn Transcriber> = Box::new(OffTranscriber);
-        assert_eq!(transcriber.backend_name(), "off");
+        let transcriber: Box<dyn Transcriber> =
+            transcriber_for(&stage(TranscriptionBackend::Local), store());
+        assert_eq!(transcriber.backend_name(), "local");
     }
 
-    // -- off ---------------------------------------------------------------
+    // -- the keyless local backend -----------------------------------------
 
+    /// The keyless path is structural, not a lookup that happens to find
+    /// nothing: `transcriber_for` drops the store for a local backend, so this
+    /// records **zero** reads against one that counts them.
+    ///
+    /// It is the difference the module docs claim, asserted rather than argued
+    /// — a backend that asked and forgave an empty answer would pass every
+    /// other test here and still prompt a macOS keychain on every utterance.
     #[tokio::test]
-    async fn voice_transcribe_off_is_not_configured_rather_than_a_failure() {
-        let result = handle_audio(&OffTranscriber, &audio(16)).await;
+    async fn voice_transcribe_local_reads_no_secret_at_all() {
+        let recorder = Arc::new(ThreadRecordingStore::new());
+        let settings = TranscriptionSettings {
+            backend: TranscriptionBackend::Local,
+            endpoint: ServiceUrl::parse("http://127.0.0.1:1/v1/audio/transcriptions")
+                .expect("valid"),
+            ..TranscriptionSettings::default()
+        };
+        let transcriber = transcriber_for(&settings, Arc::clone(&recorder) as Arc<dyn SecretStore>);
+        // The request cannot succeed — nothing is listening on port 1 — but
+        // whether a secret was read is decided before the socket.
+        let _ = transcriber.transcribe(&audio(16)).await;
+        assert_eq!(
+            recorder.read_on(),
+            None,
+            "the keyless backend consulted the keychain"
+        );
+    }
+
+    /// The unreachable **local** endpoint is a prerequisite, not a failure —
+    /// the product owner asked for this specifically: it must say what to
+    /// start.
+    ///
+    /// Driven against a port nothing listens on, which is a connect refused on
+    /// loopback and costs no network. This is the one test here that opens a
+    /// socket, and it opens it to a closed port on this machine.
+    #[tokio::test]
+    async fn voice_transcribe_an_unreachable_local_endpoint_says_what_to_start() {
+        let settings = TranscriptionSettings {
+            backend: TranscriptionBackend::Local,
+            // Port 1 on loopback: privileged, unbound, refused immediately.
+            endpoint: ServiceUrl::parse("http://127.0.0.1:1/v1/audio/transcriptions")
+                .expect("valid"),
+            ..TranscriptionSettings::default()
+        };
+        let result = handle_audio(transcriber_for(&settings, store()).as_ref(), &audio(16)).await;
+
         assert!(
             matches!(&result.outcome, TranscriptionOutcome::NotConfigured { .. }),
+            "an unreachable container rendered as a failure: {:?}",
+            result.outcome
+        );
+        let sentence = result.sentence();
+        assert!(
+            sentence.contains("nothing is listening at http://127.0.0.1:1"),
+            "{sentence}"
+        );
+        assert!(sentence.contains("docker run"), "{sentence}");
+        assert!(sentence.contains(LOCAL_SPEECH_IMAGE), "{sentence}");
+        // The whole point of the classification: it must not read as a break.
+        assert!(
+            !sentence.contains("Could not turn that into text"),
+            "{sentence}"
+        );
+    }
+
+    /// The same sentence, built directly, so the words the owner asked to see
+    /// are pinned rather than inferred — including the PORT coming from the
+    /// user's own endpoint rather than from the preset.
+    #[test]
+    fn voice_transcribe_the_unreachable_sentence_names_the_users_own_port() {
+        let moved =
+            ServiceUrl::parse("http://127.0.0.1:9123/v1/audio/transcriptions").expect("valid");
+        let detail = unreachable_detail(&moved);
+        assert!(
+            detail.contains("nothing is listening at http://127.0.0.1:9123"),
+            "{detail}"
+        );
+        assert!(detail.contains("-p 9123:8000"), "{detail}");
+        assert!(detail.contains("press Voice again"), "{detail}");
+    }
+
+    /// A KEYED endpoint that refuses a connection is an outage or a gateway the
+    /// user runs their own way — never a missing speech container — so it must
+    /// not be told to run docker, even when it is on this machine.
+    ///
+    /// Driven against the same refused loopback port as the test above, so the
+    /// only thing that differs is which backend was chosen.
+    #[tokio::test]
+    async fn voice_transcribe_a_keyed_endpoint_is_never_a_docker_instruction() {
+        let keyed = store();
+        keyed
+            .store(SecretId::VoiceTranscription, &Secret::new("sk-test"))
+            .expect("stores");
+        let settings = TranscriptionSettings {
+            backend: TranscriptionBackend::Remote,
+            endpoint: ServiceUrl::parse("http://127.0.0.1:1/v1/audio/transcriptions")
+                .expect("valid"),
+            ..TranscriptionSettings::default()
+        };
+        let result = handle_audio(
+            transcriber_for(&settings, keyed as Arc<dyn SecretStore>).as_ref(),
+            &audio(16),
+        )
+        .await;
+        assert!(
+            !result.sentence().contains("docker run"),
+            "a keyed endpoint was reported as a missing container: {}",
+            result.sentence()
+        );
+        assert!(
+            matches!(&result.outcome, TranscriptionOutcome::Failed { .. }),
             "{:?}",
             result.outcome
         );
-        assert!(!result.outcome.is_heard());
-        assert_eq!(result.backend, "off");
-        // Distinguishable in the rendered sentence too, not only in the type:
-        // the user reads a sentence, and this one must not sound like a break.
-        assert!(
-            result.sentence().contains("Nothing to listen with"),
-            "{result:?}"
-        );
-        assert!(result.sentence().contains("Settings"), "{result:?}");
-        assert!(
-            !result.sentence().contains("Could not"),
-            "the not-configured sentence read as a failure: {result:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn voice_transcribe_off_claims_no_measurement_it_did_not_take() {
-        let result = handle_audio(&OffTranscriber, &audio(16)).await;
-        assert_eq!(result.transcribe_ms, None);
-    }
-
-    #[tokio::test]
-    async fn voice_transcribe_off_opens_no_socket_and_reads_no_secret() {
-        // `OffTranscriber` holds no store at all, which is the structural
-        // version of this claim; the type is what the assertion is on.
-        let transcriber = transcriber_for(TranscriptionBackend::Off, store());
-        let error = transcriber
-            .transcribe(&audio(16))
-            .await
-            .expect_err("is not configured");
-        assert!(
-            matches!(&error, TranscriptionError::NotConfigured(_)),
-            "{error:?}"
-        );
-        assert_eq!(error.detail(), NOT_CONFIGURED);
     }
 
     // -- the outcome rendering ---------------------------------------------
@@ -774,7 +919,7 @@ mod tests {
         assert_eq!(json["transcript"], "go back");
 
         let off = TranscriptionOutcome::NotConfigured {
-            detail: NOT_CONFIGURED.into(),
+            detail: "nothing is listening".into(),
             sentence: "…".into(),
         };
         assert_eq!(
@@ -806,7 +951,7 @@ mod tests {
     // -- the request shape -------------------------------------------------
 
     fn body(audio: &Pcm16) -> Vec<u8> {
-        multipart_body(audio, DEFAULT_MODEL, "TESTBOUNDARY")
+        multipart_body(audio, HOSTED_SPEECH_MODEL, "TESTBOUNDARY")
     }
 
     fn text_of(body: &[u8]) -> String {
@@ -969,8 +1114,7 @@ mod tests {
     async fn voice_transcribe_without_a_key_is_not_configured_and_opens_no_socket() {
         // The endpoint is unroutable on purpose: reaching it would be a failure
         // of this test's premise, not a flake.
-        let transcriber = RemoteTranscriber::new(store())
-            .with_endpoint("https://voice-transcription.invalid/never");
+        let transcriber = keyed(store());
         let error = transcriber
             .transcribe(&audio(16_000))
             .await
@@ -979,12 +1123,17 @@ mod tests {
             matches!(&error, TranscriptionError::NotConfigured(detail) if detail.contains("no key is stored")),
             "got {error:?}"
         );
+        // Named by its HOST, so a user holding several keys knows which one is
+        // wanted — the old wording said "the remote transcription backend".
+        assert!(
+            error.detail().contains("voice-transcription.invalid"),
+            "{error}"
+        );
     }
 
     #[tokio::test]
     async fn voice_transcribe_no_key_renders_as_an_instruction_not_a_break() {
-        let transcriber = RemoteTranscriber::new(store())
-            .with_endpoint("https://voice-transcription.invalid/never");
+        let transcriber = keyed(store());
         let result = handle_audio(&transcriber, &audio(16_000)).await;
         assert!(
             matches!(&result.outcome, TranscriptionOutcome::NotConfigured { .. }),
@@ -1000,8 +1149,7 @@ mod tests {
         // render as "nothing stored", or the user retypes their key into a
         // store that cannot hold it.
         let store = MemorySecretStore::failing(SecretErrorKind::Unavailable, "test");
-        let transcriber = RemoteTranscriber::new(Arc::new(store))
-            .with_endpoint("https://voice-transcription.invalid/never");
+        let transcriber = keyed(Arc::new(store));
         let error = transcriber
             .transcribe(&audio(16_000))
             .await
@@ -1022,8 +1170,7 @@ mod tests {
     #[tokio::test]
     async fn voice_transcribe_reads_the_keychain_off_the_runtime() {
         let store = Arc::new(ThreadRecordingStore::new());
-        let transcriber = RemoteTranscriber::new(Arc::clone(&store) as Arc<dyn SecretStore>)
-            .with_endpoint("https://voice-transcription.invalid/never");
+        let transcriber = keyed(Arc::clone(&store) as Arc<dyn SecretStore>);
         let error = transcriber
             .transcribe(&audio(16_000))
             .await
@@ -1045,8 +1192,7 @@ mod tests {
         // costs neither a keychain prompt nor a round trip. The store here
         // would panic the assertion below if it were consulted, because a
         // missing key reports a different sentence.
-        let transcriber = RemoteTranscriber::new(store())
-            .with_endpoint("https://voice-transcription.invalid/never");
+        let transcriber = keyed(store());
         let error = transcriber
             .transcribe(&Pcm16::new(vec![0; 16_000]))
             .await
@@ -1062,9 +1208,79 @@ mod tests {
         assert!(error.detail().contains("heard nothing"), "{error}");
     }
 
+    /// Scenario: the built code, on this build's own default settings, posts a
+    /// real utterance to a real speech container on loopback and gets words
+    /// back.
+    ///
+    /// **The one test here that reaches a running service, and it is
+    /// `#[ignore]`d for that reason** — every other test in this module is
+    /// bytes in, bytes out, which is PRD #802 M5's rule and what keeps the
+    /// merge-blocking tier free of sockets. This one exists because a suite of
+    /// stubs passes identically whether or not the local backend can actually
+    /// talk to a container: it asserts the whole seam the settings name, from
+    /// `TranscriptionSettings` through `transcriber_for` to a parsed
+    /// [`Transcript`], with no credential anywhere.
+    ///
+    /// To run it, start the container and hand it an utterance as raw
+    /// 16 kHz mono little-endian i16 — which is exactly what
+    /// [`super::capture`] produces, so no WAV parser is needed here:
+    ///
+    /// ```text
+    /// docker run -d -p 18000:8000 ghcr.io/speaches-ai/speaches:0.9.0-rc.3-cpu
+    /// espeak-ng -v en-us -w say.wav "show me the tester"
+    /// ffmpeg -i say.wav -ac 1 -ar 16000 -f s16le utterance.pcm
+    /// DAD_LOCAL_SPEECH_PCM=$PWD/utterance.pcm \
+    ///   cargo test -p dot-agent-deck-desktop --lib \
+    ///   voice_transcribe_local_container -- --ignored --nocapture
+    /// ```
+    #[tokio::test]
+    #[ignore = "needs a speech container on loopback; the doc comment has the two commands"]
+    async fn voice_transcribe_local_container_transcribes_a_real_utterance() {
+        let path = std::env::var("DAD_LOCAL_SPEECH_PCM").expect(
+            "set DAD_LOCAL_SPEECH_PCM to raw 16 kHz mono LE i16 audio — see the doc comment",
+        );
+        let raw = std::fs::read(&path).unwrap_or_else(|error| panic!("{path}: {error}"));
+        let samples: Vec<i16> = raw
+            .chunks_exact(2)
+            .map(|pair| i16::from_le_bytes([pair[0], pair[1]]))
+            .collect();
+        let audio = Pcm16::new(samples);
+        assert!(
+            !audio.is_silent(),
+            "{path} is silence; nothing would be sent"
+        );
+
+        // This build's own defaults, untouched: the keyless local backend at
+        // the preset loopback endpoint, asking for the preset model.
+        let settings = TranscriptionSettings::default();
+        assert_eq!(settings.backend, TranscriptionBackend::Local);
+        let transcriber = transcriber_for(&settings, store());
+        let result = handle_audio(transcriber.as_ref(), &audio).await;
+
+        println!(
+            "backend={} audio={}ms transcribe={:?}ms outcome={:?}",
+            result.backend, result.audio_ms, result.transcribe_ms, result.outcome
+        );
+        let transcript = result
+            .transcript()
+            .unwrap_or_else(|| panic!("no transcript: {}", result.sentence()));
+        assert!(
+            !transcript.text().trim().is_empty(),
+            "the container answered with no words"
+        );
+        assert_eq!(result.backend, "local");
+    }
+
     #[test]
     fn voice_transcribe_names_itself_for_the_surface() {
-        assert_eq!(RemoteTranscriber::new(store()).backend_name(), "remote");
-        assert_eq!(OffTranscriber.backend_name(), "off");
+        assert_eq!(keyed(store()).backend_name(), "remote");
+        assert_eq!(
+            HttpTranscriber::keyless(
+                ServiceUrl::parse(LOCAL_SPEECH_ENDPOINT).expect("valid"),
+                ModelId::parse(LOCAL_SPEECH_MODEL).expect("valid"),
+            )
+            .backend_name(),
+            "local"
+        );
     }
 }

@@ -10,6 +10,12 @@ mod endpoint_test;
 mod endpoint_field_parity;
 mod endpoint_tunnels;
 mod generation;
+// PRD #802 — the two validating newtypes the `[voice]` stages store their
+// service coordinates in. A module of its own rather than one under `voice`
+// for `secrets`' reason: `ALLOWED_FIELD_TYPES` refuses a `String` in any
+// settings struct, so the next feature that needs to store an endpoint uses
+// these rather than inventing a second answer.
+mod model_service;
 // PRD #802 M4 — the credential seam PRD #803 M5 named, over the OS keychain.
 // Not voice-specific, so it is a module of its own rather than one under
 // `voice`: the rule it serves is #803's and any later feature needing a
@@ -1655,15 +1661,20 @@ pub struct VoiceStatus {
     pub capture: voice::CaptureStatus,
     /// Whether a microphone path is offered at all.
     ///
-    /// False when `[voice] transcription` is `off`, which is the default and is
-    /// a product statement rather than a degraded mode: the surface says what to
-    /// add. The Voice button renders either way — neither hidden nor disabled —
-    /// so what the surface reads this *for*, at the press rather than at mount,
-    /// is whether to turn voice on or to report `VOICE_UNAVAILABLE` naming
-    /// Settings → Voice. `desktop_voice_start` refuses anyway, because a user
-    /// can change the setting between the two calls.
+    /// **Always true from this process since `Speech = off` went**, and that is
+    /// worth stating rather than leaving to be rediscovered: every speech
+    /// backend this build ships can run, so no settings document can turn the
+    /// stage off. What used to be reported here — *nothing is set up* — is now
+    /// reported where it actually happens, as
+    /// [`voice::TranscriptionOutcome::NotConfigured`] naming the container to
+    /// start or the key to paste.
+    ///
+    /// The field stays because the SURFACE still has the question and two other
+    /// answerers: a runtime with no capture verbs at all, and the browser
+    /// fixture, which has no Rust side and therefore nothing to transcribe
+    /// with. Both report `false` and both render `VOICE_UNAVAILABLE`.
     pub available: bool,
-    /// Which transcriber would answer — `off` or `remote`.
+    /// Which transcriber would answer — `local` or `remote`.
     pub backend: &'static str,
 }
 
@@ -1689,7 +1700,7 @@ pub struct VoiceStatus {
 /// therefore writes four stderr lines a second while voice is on, where it
 /// wrote one. It is a misconfiguration either way, and the fix — if it ever
 /// matters — is a log-once latch in `settings.rs` rather than a cache here.
-fn voice_transcription_backend() -> crate::settings::TranscriptionBackend {
+fn voice_speech_settings() -> crate::settings::TranscriptionSettings {
     crate::settings::load_snapshot()
         .settings
         .voice
@@ -1698,11 +1709,13 @@ fn voice_transcription_backend() -> crate::settings::TranscriptionBackend {
 }
 
 fn voice_status(session: &voice::CaptureSession) -> VoiceStatus {
-    let backend = voice_transcription_backend();
     VoiceStatus {
         capture: session.status(),
-        available: backend != crate::settings::TranscriptionBackend::Off,
-        backend: backend.as_token(),
+        // See the field's doc comment: no settings document can turn the stage
+        // off any more, and the not-set-up case is reported at the moment it
+        // bites rather than as a permanent state of the app.
+        available: true,
+        backend: voice_speech_settings().backend.as_token(),
     }
 }
 
@@ -1724,9 +1737,6 @@ async fn desktop_voice_start(
     voice_state: State<'_, VoiceState>,
 ) -> Result<VoiceStatus, String> {
     ensure_main_webview(&webview)?;
-    if voice_transcription_backend() == crate::settings::TranscriptionBackend::Off {
-        return Err(voice::transcribe::NOT_CONFIGURED.to_string());
-    }
     let session = Arc::clone(&voice_state.session);
 
     // Opening an audio device is a round trip to the OS and can prompt, so it
@@ -1772,7 +1782,7 @@ async fn desktop_voice_stop(
         .map_err(|error| safe_message(format!("the microphone call failed: {error}")))?
         .map_err(report_capture_error)?;
     let transcriber = voice::transcriber_for(
-        voice_transcription_backend(),
+        &voice_speech_settings(),
         Arc::new(KeychainSecretStore::new()),
     );
     let result = voice::handle_audio(transcriber.as_ref(), &audio).await;
@@ -1870,15 +1880,15 @@ async fn desktop_voice_resolve(
             "that command is too long to send — {MAX_UTTERANCE_BYTES} bytes at most"
         ));
     }
-    // Read per call rather than cached, for `voice_transcription_backend`'s
-    // reason: a user who changes the backend uses it on the next utterance
-    // instead of after a restart.
-    let backend = crate::settings::load_snapshot()
+    // Read per call rather than cached, for `voice_speech_settings`'s reason: a
+    // user who changes the backend, the endpoint or the model uses it on the
+    // next utterance instead of after a restart.
+    let commands = crate::settings::load_snapshot()
         .settings
         .voice
         .unwrap_or_default()
         .intent;
-    let resolver = voice::resolver_for(backend, Arc::new(KeychainSecretStore::new()));
+    let resolver = voice::resolver_for(&commands, Arc::new(KeychainSecretStore::new()));
     let snapshot = get_snapshot(&state.daemon).await;
     Ok(voice::handle_utterance(
         resolver.as_ref(),

@@ -10,9 +10,10 @@
 //! **M7 brought the microphone.** [`capture`] owns the device — Rust-side,
 //! because `wry` grants webview capture on one of the three platforms this app
 //! ships to — and [`transcribe`] owns the seam that turns its PCM into a
-//! [`Transcript`]. `off` is the default there and is a product statement, not a
-//! degraded mode: with it the Voice button still renders, and pressing it names
-//! Settings → Voice rather than turning on.
+//! [`Transcript`]. Its default is a **keyless container on loopback**, so the
+//! feature works on the day it ships without anyone pasting a credential and
+//! the audio never leaves the machine; `off` was the default and is gone, along
+//! with the second implementation behind it.
 //!
 //! **M5 brought the real backends.** [`agent_cli`] spawns the pre-authenticated
 //! CLI the user already has — no key of the app's own, no download, and slow;
@@ -71,8 +72,8 @@ pub use schema::{
 };
 pub use table::{CommandRow, CommandTable, NO_MATCH_ACTION, ParamKind, ParamSpec, Screen, table};
 pub use transcribe::{
-    OffTranscriber, RemoteTranscriber, StubTranscriber, TRANSCRIBE_TIMEOUT, Transcriber,
-    TranscriptionError, TranscriptionOutcome, VoiceTranscription, handle_audio, transcriber_for,
+    HttpTranscriber, StubTranscriber, TRANSCRIBE_TIMEOUT, Transcriber, TranscriptionError,
+    TranscriptionOutcome, VoiceTranscription, handle_audio, transcriber_for, unreachable_detail,
 };
 
 /// What the user said, as text — from the microphone through the `Transcriber`

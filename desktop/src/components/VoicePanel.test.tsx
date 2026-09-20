@@ -6,6 +6,7 @@ import {
   DEFAULT_VOICE_SETTINGS,
   VOICE_ACTIVATION_MODES,
   VOICE_INTENT_BACKENDS,
+  VOICE_STAGE_PRESETS,
   VOICE_TRANSCRIPTION_BACKENDS,
   type DesktopSettingsDto,
   type SecretStatusDto,
@@ -15,6 +16,10 @@ import type { RuntimeMode } from "../types";
 
 /** A credential-shaped value, so a leak is searchable rather than plausible. */
 const KEY = "sk-not-a-real-key-0123456789";
+
+/** What each key row is called now that the label names the provider. */
+const COMMANDS_KEY = "Key for api.anthropic.com";
+const SPEECH_KEY = "Key for api.openai.com";
 
 function renderPanel(
   overrides: Partial<DesktopSettingsDto> = {},
@@ -49,8 +54,19 @@ function renderPanel(
   return { onSave, bridge };
 }
 
-/** A document whose intent backend is the one that needs a key. */
-const KEYED = { voice: { ...DEFAULT_VOICE_SETTINGS, intent: "remote" } };
+/** A document whose command backend is the one that needs a key. */
+const KEYED = {
+  voice: { ...DEFAULT_VOICE_SETTINGS, intent: VOICE_STAGE_PRESETS.intent.remote },
+};
+
+/** A document where BOTH stages need a key. */
+const BOTH_KEYED = {
+  voice: {
+    activation: "toggle",
+    intent: VOICE_STAGE_PRESETS.intent.remote,
+    transcription: VOICE_STAGE_PRESETS.transcription.remote,
+  },
+};
 
 describe("VoicePanel", () => {
   beforeEach(() => {
@@ -59,49 +75,55 @@ describe("VoicePanel", () => {
 
   it("renders every choice the app actually ships an adapter for", () => {
     renderPanel();
-    expect(screen.getAllByRole("option", { name: /Off — nothing to listen with|Remote service/ })).toHaveLength(
-      VOICE_TRANSCRIPTION_BACKENDS.length,
-    );
+    expect(screen.getByLabelText("Speech")).toHaveValue("local");
     expect(screen.getByLabelText("Commands")).toHaveValue("claude");
-    expect(screen.getByLabelText("Speech")).toHaveValue("off");
     // The lists are the closed sets, so a token the Rust side would fold away
     // cannot be offered here.
+    expect(screen.getByLabelText("Speech").querySelectorAll("option")).toHaveLength(
+      VOICE_TRANSCRIPTION_BACKENDS.length,
+    );
     expect(screen.getByLabelText("Commands").querySelectorAll("option")).toHaveLength(
       VOICE_INTENT_BACKENDS.length,
     );
   });
 
   /**
-   * Activation is STATED, not offered (PRD #802 M5). There is one mode, and a
-   * `<select>` with one option implies a choice the user does not have — it
-   * opens, shows one item, and closing it changes nothing.
+   * The owner's reason for making these selectable at all: a user cannot know
+   * which key to paste while the option is called *Remote service*. Every keyed
+   * option names its provider, and every keyless one says it needs no key.
    */
-  it("states the activation mode rather than offering it as a choice", () => {
+  it("names the provider on every option, and says which ones need a key", () => {
     renderPanel();
-    const row = screen.getByTestId("voice-activation");
-    expect(row).toHaveTextContent("Press to start, press to stop");
-    expect(row.tagName).not.toBe("SELECT");
-    expect(row.querySelector("select")).toBeNull();
-    expect(screen.getByTestId("voice-body").querySelectorAll("select")).toHaveLength(2);
-    // Still named, so a screen reader gets the same row structure as the
-    // chosen ones.
-    expect(row).toHaveAccessibleName("Activation");
-    // The list it will render from once D4 adds the other two modes.
-    expect(VOICE_ACTIVATION_MODES).toEqual(["toggle"]);
+    expect(screen.getByRole("option", { name: /OpenAI — needs an OpenAI API key/ })).toBeInTheDocument();
+    expect(screen.getByRole("option", { name: /Anthropic API — needs an Anthropic API key/ })).toBeInTheDocument();
+    expect(screen.getByRole("option", { name: /On this machine — speech container, no key/ })).toBeInTheDocument();
+    expect(screen.getByRole("option", { name: /Claude CLI on this machine — no key/ })).toBeInTheDocument();
   });
 
   /**
-   * A document written by a newer build can name a mode this one has never
-   * heard of. The Rust side folds it to the default on read; this is the same
-   * tolerance at the render seam, where a stale in-memory value could still
-   * arrive.
+   * The Activation row is GONE (PRD #802's provider work). It stated one mode
+   * nobody could change, which reads as a control and answers nothing. The
+   * stored field stays for D4 — which is what `VOICE_ACTIVATION_MODES` is still
+   * here for — and a save still round-trips it.
    */
-  it("states this build's default for an activation mode it does not know", () => {
-    renderPanel({
+  it("renders no Activation row while there is one mode to state", () => {
+    renderPanel();
+    expect(screen.queryByTestId("voice-activation")).not.toBeInTheDocument();
+    expect(screen.queryByText(/Press to start, press to stop/)).not.toBeInTheDocument();
+    expect(screen.queryByText("Activation")).not.toBeInTheDocument();
+    // The list D4 will render a select from, still exported and still one long.
+    expect(VOICE_ACTIVATION_MODES).toEqual(["toggle"]);
+  });
+
+  it("round-trips the stored activation mode even though nothing renders it", () => {
+    const { onSave } = renderPanel({
       voice: { ...DEFAULT_VOICE_SETTINGS, activation: "hold-to-talk" },
     });
-    expect(screen.getByTestId("voice-activation")).toHaveTextContent(
-      "Press to start, press to stop",
+    fireEvent.change(screen.getByLabelText("Commands"), { target: { value: "remote" } });
+    expect(onSave).toHaveBeenCalledWith(
+      expect.objectContaining({
+        voice: expect.objectContaining({ activation: "hold-to-talk" }),
+      }),
     );
   });
 
@@ -112,9 +134,29 @@ describe("VoicePanel", () => {
    */
   it("shows this build's defaults for a document with no voice section", () => {
     renderPanel({ voice: undefined });
-    expect(screen.getByLabelText("Speech")).toHaveValue(DEFAULT_VOICE_SETTINGS.transcription);
-    expect(screen.getByLabelText("Commands")).toHaveValue(DEFAULT_VOICE_SETTINGS.intent);
-    expect(screen.getByTestId("voice-speech-off")).toBeVisible();
+    expect(screen.getByLabelText("Speech")).toHaveValue(DEFAULT_VOICE_SETTINGS.transcription.backend);
+    expect(screen.getByLabelText("Commands")).toHaveValue(DEFAULT_VOICE_SETTINGS.intent.backend);
+    // The keyless default has a prerequisite, and the panel names the command
+    // that satisfies it rather than leaving it to the first failed utterance.
+    expect(screen.getByTestId("voice-speech-local")).toBeVisible();
+    expect(screen.getByTestId("voice-speech-local")).toHaveTextContent(
+      "docker run -d -p 18000:8000 ghcr.io/speaches-ai/speaches:0.9.0-rc.3-cpu",
+    );
+  });
+
+  /**
+   * The hint's port comes from the endpoint the user actually configured, the
+   * way `voice::transcribe::unreachable_detail` does Rust-side. Two sentences a
+   * user can meet in one session must not disagree about which port to publish.
+   */
+  it("names the port the configured endpoint uses, not the preset's", () => {
+    renderPanel({
+      voice: {
+        ...DEFAULT_VOICE_SETTINGS,
+        transcription: { backend: "local", endpoint: "http://127.0.0.1:9123/v1/audio/transcriptions", model: "Systran/faster-whisper-tiny.en" },
+      },
+    });
+    expect(screen.getByTestId("voice-speech-local")).toHaveTextContent("-p 9123:8000");
   });
 
   /**
@@ -129,7 +171,7 @@ describe("VoicePanel", () => {
     expect(onSave).toHaveBeenCalledWith({
       ...DEFAULT_DESKTOP_SETTINGS,
       appearance: { mode: "dark" },
-      voice: { ...DEFAULT_VOICE_SETTINGS, intent: "remote" },
+      voice: { ...DEFAULT_VOICE_SETTINGS, intent: VOICE_STAGE_PRESETS.intent.remote },
     });
   });
 
@@ -138,23 +180,113 @@ describe("VoicePanel", () => {
     fireEvent.change(screen.getByLabelText("Speech"), { target: { value: "remote" } });
     expect(onSave).toHaveBeenCalledWith(
       expect.objectContaining({
-        voice: { activation: "toggle", intent: "claude", transcription: "remote" },
+        voice: {
+          activation: "toggle",
+          intent: VOICE_STAGE_PRESETS.intent.claude,
+          transcription: VOICE_STAGE_PRESETS.transcription.remote,
+        },
       }),
     );
+  });
+
+  /**
+   * An endpoint belongs to the backend it names. Leaving the loopback URL in
+   * place after a switch to a hosted service is a setting that cannot work and
+   * does not say so, so the switch brings its own coordinates.
+   */
+  it("rewrites the stage's endpoint and model when the backend changes", () => {
+    const { onSave } = renderPanel();
+    fireEvent.change(screen.getByLabelText("Speech"), { target: { value: "remote" } });
+    expect(onSave.mock.calls[0][0].voice.transcription).toEqual({
+      backend: "remote",
+      endpoint: "https://api.openai.com/v1/audio/transcriptions",
+      model: "whisper-1",
+    });
+  });
+
+  /**
+   * The other half of the owner's decision: a user can point a stage at a
+   * provider this build did not pick. Committed on blur, because a URL is
+   * invalid for most of the time it is being typed.
+   */
+  it("saves a hand-typed endpoint on blur rather than on every keystroke", () => {
+    const { onSave } = renderPanel();
+    const field = screen.getByLabelText("Endpoint");
+    fireEvent.change(field, { target: { value: "http://127.0.0.1:9000/v1/audio/transcriptions" } });
+    expect(onSave).not.toHaveBeenCalled();
+    fireEvent.blur(field);
+    expect(onSave.mock.calls[0][0].voice.transcription).toEqual({
+      backend: "local",
+      endpoint: "http://127.0.0.1:9000/v1/audio/transcriptions",
+      model: "Systran/faster-whisper-tiny.en",
+    });
+  });
+
+  it("saves a hand-typed model, and abandons an edit on Escape", () => {
+    const { onSave } = renderPanel();
+    const model = screen.getByLabelText("Model");
+    fireEvent.change(model, { target: { value: "Systran/faster-whisper-base.en" } });
+    fireEvent.keyDown(model, { key: "Enter" });
+    expect(onSave.mock.calls[0][0].voice.transcription.model).toBe("Systran/faster-whisper-base.en");
+
+    onSave.mockClear();
+    fireEvent.change(model, { target: { value: "whatever" } });
+    fireEvent.keyDown(model, { key: "Escape" });
+    fireEvent.blur(model);
+    expect(onSave).not.toHaveBeenCalled();
+  });
+
+  /**
+   * The agent-CLI command backend spawns a process on this machine, so an
+   * endpoint and a model beside it would be two controls that change nothing.
+   * Speech has no such variant — both of its backends are HTTP — so its fields
+   * are always there.
+   */
+  it("offers no endpoint or model beside the command backend that spawns a CLI", () => {
+    renderPanel();
+    // Speech only: the command stage is on the agent CLI, which is reached by
+    // spawning a process rather than by making a request.
+    expect(screen.getAllByLabelText("Endpoint")).toHaveLength(1);
+    expect(screen.getAllByLabelText("Model")).toHaveLength(1);
+    expect(screen.getByLabelText("Endpoint")).toHaveValue(
+      VOICE_STAGE_PRESETS.transcription.local.endpoint,
+    );
+  });
+
+  it("offers endpoint and model for both stages once both are reached over HTTP", () => {
+    renderPanel(BOTH_KEYED);
+    expect(screen.getAllByLabelText("Endpoint")).toHaveLength(2);
+    expect(screen.getAllByLabelText("Model")).toHaveLength(2);
   });
 
   /** No backend needs a key, so the panel does not ask for one. */
   it("asks for no key while no chosen backend uses one", () => {
     renderPanel();
-    expect(screen.queryByLabelText("Commands key")).not.toBeInTheDocument();
-    expect(screen.queryByLabelText("Speech key")).not.toBeInTheDocument();
+    expect(screen.queryByLabelText(COMMANDS_KEY)).not.toBeInTheDocument();
+    expect(screen.queryByLabelText(SPEECH_KEY)).not.toBeInTheDocument();
+    expect(screen.queryByLabelText(/^Key for /)).not.toBeInTheDocument();
   });
 
   it("asks for a key per backend that authenticates with one", async () => {
-    renderPanel({ voice: { activation: "toggle", intent: "remote", transcription: "remote" } });
-    expect(screen.getByLabelText("Commands key")).toBeVisible();
-    expect(screen.getByLabelText("Speech key")).toBeVisible();
+    renderPanel(BOTH_KEYED);
+    expect(screen.getByLabelText(COMMANDS_KEY)).toBeVisible();
+    expect(screen.getByLabelText(SPEECH_KEY)).toBeVisible();
     await waitFor(() => expect(screen.getByTestId("secret-state-voice-intent")).toHaveTextContent("No key stored yet."));
+  });
+
+  /**
+   * The key row is labelled from the ENDPOINT, so it keeps telling the truth
+   * for a user who pointed the stage at a provider this build did not pick.
+   */
+  it("names the key row after wherever the stage actually points", () => {
+    renderPanel({
+      voice: {
+        ...DEFAULT_VOICE_SETTINGS,
+        intent: { backend: "remote", endpoint: "https://gateway.example.com/v1/messages", model: "claude-haiku-4-5" },
+      },
+    });
+    expect(screen.getByLabelText("Key for gateway.example.com")).toBeVisible();
+    expect(screen.queryByLabelText(COMMANDS_KEY)).not.toBeInTheDocument();
   });
 
   /**
@@ -167,7 +299,7 @@ describe("VoicePanel", () => {
     const setItem = vi.spyOn(Storage.prototype, "setItem");
     const { onSave, bridge } = renderPanel(KEYED);
 
-    fireEvent.change(screen.getByLabelText("Commands key"), { target: { value: KEY } });
+    fireEvent.change(screen.getByLabelText(COMMANDS_KEY), { target: { value: KEY } });
     fireEvent.click(screen.getByTestId("save-voice-intent"));
 
     await waitFor(() => expect(bridge.storeSecret).toHaveBeenCalledWith("voice-intent", KEY));
@@ -181,7 +313,33 @@ describe("VoicePanel", () => {
     expect(JSON.stringify(window.localStorage)).not.toContain(KEY);
     // And it is cleared from the field once stored, because nothing reads it
     // back — the panel says a key is stored rather than showing one.
-    await waitFor(() => expect(screen.getByLabelText("Commands key")).toHaveValue(""));
+    await waitFor(() => expect(screen.getByLabelText(COMMANDS_KEY)).toHaveValue(""));
+    setItem.mockRestore();
+  });
+
+  /**
+   * The endpoint and model fields are the new way a value could reach
+   * `localStorage`, so the same rule is asserted over them: typing a
+   * credential-shaped string into one and committing it must be the user's own
+   * doing and nothing the panel invents — and no key row's value ever joins it.
+   */
+  it("puts no key value in localStorage even while both key rows are on screen", async () => {
+    const setItem = vi.spyOn(Storage.prototype, "setItem");
+    renderPanel(BOTH_KEYED);
+
+    fireEvent.change(screen.getByLabelText(COMMANDS_KEY), { target: { value: KEY } });
+    fireEvent.change(screen.getByLabelText(SPEECH_KEY), { target: { value: `${KEY}-speech` } });
+    // A commit on the endpoint field, which is the one control here that DOES
+    // reach the document — it must carry the endpoint and nothing beside it.
+    fireEvent.blur(screen.getAllByLabelText("Endpoint")[0]);
+
+    for (const call of setItem.mock.calls) {
+      expect(String(call[1])).not.toContain(KEY);
+    }
+    expect(JSON.stringify(window.localStorage)).not.toContain(KEY);
+    // What a key row's field holds is deliberately NOT asserted here: it has to
+    // hold what the user typed for a save to be possible at all. The rule is
+    // about where it goes next, which is the keychain and nowhere else.
     setItem.mockRestore();
   });
 
@@ -196,8 +354,8 @@ describe("VoicePanel", () => {
     );
     // A password field, so it is not on screen and a screenshot of the panel
     // does not carry what is being typed.
-    expect(screen.getByLabelText("Commands key")).toHaveAttribute("type", "password");
-    expect(screen.getByLabelText("Commands key")).toHaveValue("");
+    expect(screen.getByLabelText(COMMANDS_KEY)).toHaveAttribute("type", "password");
+    expect(screen.getByLabelText(COMMANDS_KEY)).toHaveValue("");
     expect(document.body.textContent ?? "").not.toContain(KEY);
   });
 
@@ -214,13 +372,13 @@ describe("VoicePanel", () => {
       bridge: { storeSecret: vi.fn(async () => { throw new Error(sentence); }) },
     });
 
-    fireEvent.change(screen.getByLabelText("Commands key"), { target: { value: KEY } });
+    fireEvent.change(screen.getByLabelText(COMMANDS_KEY), { target: { value: KEY } });
     fireEvent.click(screen.getByTestId("save-voice-intent"));
 
     await waitFor(() =>
       expect(screen.getByTestId("secret-problem-voice-intent")).toHaveTextContent(sentence),
     );
-    expect(screen.getByLabelText("Commands key")).toHaveValue(KEY);
+    expect(screen.getByLabelText(COMMANDS_KEY)).toHaveValue(KEY);
     expect(screen.queryByTestId("secret-state-voice-intent")).not.toBeInTheDocument();
   });
 

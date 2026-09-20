@@ -2244,6 +2244,12 @@ describe("desktop settings hold no credential (issue 827)", () => {
       { authorization: `Bearer ${SENTINEL}` },
       { appearance: { mode: "dark", apiKey: SENTINEL } },
       { voice: { api_key: SENTINEL, endpoint: SENTINEL } },
+      // PRD #802's provider work nested the two stages, which is a second
+      // depth a credential-shaped key can arrive at and the normaliser has to
+      // rebuild rather than spread.
+      { voice: { transcription: { backend: "remote", api_key: SENTINEL, authorization: SENTINEL } } },
+      { voice: { intent: { backend: "remote", key: SENTINEL, token: SENTINEL } } },
+      { voice: { transcription: SENTINEL, intent: SENTINEL } },
       { zoom: { level: 1.25, token: SENTINEL } },
       { version: SENTINEL },
       { appearance: { mode: SENTINEL } },
@@ -2274,6 +2280,15 @@ describe("desktop settings hold no credential (issue 827)", () => {
       // proves the value went; this pins the key set it was rebuilt to.
       if (normalized.voice) {
         expect(Object.keys(normalized.voice).sort()).toEqual(["activation", "intent", "transcription"]);
+        // Each stage is rebuilt to its own three declared keys, so a key
+        // smuggled one level down is gone with the rest. `endpoint` and `model`
+        // ARE declared and are carried verbatim — deliberately, because
+        // coercing an endpoint is how a user's own URL silently becomes
+        // somebody else's service, and Rust refuses an invalid one at the
+        // document seam with a diagnostic instead.
+        for (const stage of [normalized.voice.intent, normalized.voice.transcription]) {
+          expect(Object.keys(stage).sort()).toEqual(["backend", "endpoint", "model"]);
+        }
       } else {
         expect(JSON.parse(JSON.stringify(normalized))).not.toHaveProperty("voice");
       }
@@ -2301,7 +2316,7 @@ describe("desktop settings hold no credential (issue 827)", () => {
       zoom: { level: 1.25 },
       // A panel that spread its own state, which is the realistic mistake.
       apiKey: SENTINEL,
-      voice: { api_key: SENTINEL },
+      voice: { api_key: SENTINEL, transcription: { backend: "remote", api_key: SENTINEL } },
     };
     const saved = await bridge.saveSettings(hostile as never);
     expect(JSON.stringify(saved)).not.toContain(SENTINEL);

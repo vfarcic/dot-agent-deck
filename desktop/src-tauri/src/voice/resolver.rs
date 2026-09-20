@@ -146,14 +146,23 @@ pub trait IntentResolver: Send + Sync {
 /// credential is what keeps the value Rust-side: the resolver asks the keychain
 /// itself, at the moment it needs one, and nothing hands a secret around in the
 /// hope that whoever holds it will not serialize it.
+///
+/// The endpoint and the model travel with the settings rather than being
+/// constants in [`super::remote`] — PRD #802's provider work — and the agent-CLI
+/// variant ignores both, which is why [`crate::settings::IntentBackend::is_http`]
+/// exists for the panel to read rather than the panel guessing from the token.
 pub fn resolver_for(
-    backend: crate::settings::IntentBackend,
+    settings: &crate::settings::IntentSettings,
     secrets: std::sync::Arc<dyn crate::secrets::SecretStore>,
 ) -> Box<dyn IntentResolver> {
     use crate::settings::IntentBackend;
-    match backend {
+    match settings.backend {
         IntentBackend::Claude => Box::new(super::agent_cli::AgentCliResolver::claude()),
-        IntentBackend::Remote => Box::new(super::remote::RemoteResolver::new(secrets)),
+        IntentBackend::Remote => Box::new(super::remote::RemoteResolver::new(
+            secrets,
+            settings.endpoint.clone(),
+            settings.model.clone(),
+        )),
     }
 }
 
@@ -217,6 +226,15 @@ mod tests {
     use super::*;
     use crate::voice::schema::annotate;
     use crate::voice::table::{Screen, table};
+
+    /// The command stage with one backend chosen and this build's presets for
+    /// the coordinates — which is what the panel writes when a user picks one.
+    fn stage(backend: crate::settings::IntentBackend) -> crate::settings::IntentSettings {
+        crate::settings::IntentSettings {
+            backend,
+            ..crate::settings::IntentSettings::default()
+        }
+    }
 
     fn request<'a>(
         transcript: &'a Transcript,
@@ -297,11 +315,11 @@ mod tests {
         // asserts the thing a user would see rather than a type the compiler
         // already knows.
         assert_eq!(
-            resolver_for(IntentBackend::Claude, store()).backend_name(),
+            resolver_for(&stage(IntentBackend::Claude), store()).backend_name(),
             "claude"
         );
         assert_eq!(
-            resolver_for(IntentBackend::Remote, store()).backend_name(),
+            resolver_for(&stage(IntentBackend::Remote), store()).backend_name(),
             "remote"
         );
     }
@@ -318,7 +336,7 @@ mod tests {
             .into_iter()
             .map(|backend| {
                 resolver_for(
-                    backend,
+                    &stage(backend),
                     std::sync::Arc::new(crate::secrets::MemorySecretStore::new()),
                 )
                 .backend_name()

@@ -331,15 +331,15 @@ export interface DesktopSettingsDto {
    */
   endpoints?: EndpointSettingsDto;
   /**
-   * Which backends voice uses, and how it is activated (PRD #802 M4).
+   * Which backends voice uses, where they are, and how it is activated
+   * (PRD #802).
    *
    * **Optional for `endpoints`' reason rather than a weaker version of it.**
    * The Rust field is an `Option<VoiceSettings>` and its `None` is what stops a
    * build whose UI cannot render voice from resetting it: the save merges the
    * decoded struct over the document on disk, so a section this side fabricated
-   * as `{ activation: "toggle", intent: "claude", transcription: "off" }` would
-   * write those defaults over the user's choices — on a save triggered by
-   * changing the theme. Never default it; round-trip it or omit it.
+   * from the defaults would write them over the user's choices — on a save
+   * triggered by changing the theme. Never default it; round-trip it or omit it.
    *
    * No credential here, in any form. PRD #803's rule is that a secret goes in
    * neither `desktop.toml` nor `localStorage`, and this DTO is written to
@@ -358,18 +358,40 @@ export interface DesktopSettingsDto {
 }
 
 /**
- * The `[voice]` section: three closed choices and nothing else (PRD #802 M4).
+ * The `[voice]` section: one mode plus the two stages (PRD #802).
  *
- * Every value is one of the token arrays below, which mirror the Rust enums in
+ * `activation` is one of the token arrays below, which mirror the Rust enums in
  * `src-tauri/src/settings.rs` — pinned on that side by
  * `the_voice_tokens_match_the_frontends_copy`, because a token offered here
  * that Rust does not recognise folds to the default and the user's choice
  * silently does not stick.
+ *
+ * The two stages are nested rather than flattened for the reason Rust's
+ * `VoiceSettings` gives: one struct serialises to TOML and to this JSON, so a
+ * flattened `speechEndpoint`/`commandsEndpoint` would be two spellings of the
+ * same value waiting to drift. Same shape for both, so the panel renders them
+ * from one component.
  */
 export interface VoiceSettingsDto {
   activation: string;
-  intent: string;
-  transcription: string;
+  intent: VoiceStageDto;
+  transcription: VoiceStageDto;
+}
+
+/**
+ * One voice stage: which backend, where it is, which model to ask it for
+ * (PRD #802).
+ *
+ * References only, never a credential — `endpoint` is a URL whose Rust
+ * counterpart (`ServiceUrl`) refuses a `user:password@` authority outright, and
+ * `model` is an identifier whose counterpart (`ModelId`) is bounded at 128
+ * bytes over a charset with no whitespace and no control bytes. The key those
+ * endpoints authenticate with is in the OS keychain and has no field here.
+ */
+export interface VoiceStageDto {
+  backend: string;
+  endpoint: string;
+  model: string;
 }
 
 /** The `[endpoints]` section: the remote decks, and which deck is selected. */
@@ -466,22 +488,69 @@ export const VOICE_ACTIVATION_MODES = ["toggle"] as const;
 export const VOICE_INTENT_BACKENDS = ["claude", "remote"] as const;
 
 /**
- * Which backend turns speech into text (PRD #802 M7).
+ * Which backend turns speech into text (PRD #802).
  *
- * `off` is the default and is a product statement rather than a degraded mode:
- * transcription is the one stage with no no-key trick, so the surface says what
- * to add where the user meets it. Since M6 was rewritten to voice only there is
- * no typed fallback behind it — the Voice button always renders, and pressing it
- * with nothing configured names Settings → Voice rather than turning on. Keep
- * identical to `TranscriptionBackend::TOKENS` in `src-tauri/src/settings.rs`.
+ * `local` is the default: a speech container on loopback that takes no key at
+ * all, which is what makes voice try-able on the day it ships and keeps the
+ * audio on the machine. `off` was here and is gone — a setting whose whole
+ * function was to make the feature do nothing, kept only because transcription
+ * was believed to have no keyless route. Keep identical to
+ * `TranscriptionBackend::TOKENS` in `src-tauri/src/settings.rs`.
  */
-export const VOICE_TRANSCRIPTION_BACKENDS = ["off", "remote"] as const;
+export const VOICE_TRANSCRIPTION_BACKENDS = ["local", "remote"] as const;
+
+/**
+ * Where each backend lives and which model it is asked for, by stage.
+ *
+ * Mirrors the `*_ENDPOINT` / `*_MODEL` constants in
+ * `src-tauri/src/settings.rs`, pinned there by
+ * `the_voice_presets_match_the_frontends_copy`. The panel writes a stage's
+ * whole preset when the backend changes, because an endpoint belongs to the
+ * backend it names: leaving a loopback URL behind after a switch to a hosted
+ * service is a setting that cannot work and does not say so.
+ */
+export const VOICE_STAGE_PRESETS: Record<"intent" | "transcription", Record<string, VoiceStageDto>> = {
+  transcription: {
+    local: {
+      backend: "local",
+      endpoint: "http://127.0.0.1:18000/v1/audio/transcriptions",
+      model: "Systran/faster-whisper-tiny.en",
+    },
+    remote: {
+      backend: "remote",
+      endpoint: "https://api.openai.com/v1/audio/transcriptions",
+      model: "whisper-1",
+    },
+  },
+  intent: {
+    claude: {
+      backend: "claude",
+      endpoint: "https://api.anthropic.com/v1/messages",
+      model: "claude-haiku-4-5",
+    },
+    remote: {
+      backend: "remote",
+      endpoint: "https://api.anthropic.com/v1/messages",
+      model: "claude-haiku-4-5",
+    },
+  },
+};
+
+/**
+ * The container the Voice panel tells a user to start for keyless speech.
+ *
+ * Mirrors `LOCAL_SPEECH_IMAGE` in `src-tauri/src/settings.rs`, pinned there by
+ * `the_voice_presets_match_the_frontends_copy`. Pinned to a tag rather than
+ * `latest` for the reason any instruction in a product is pinned: the words
+ * have to keep working after the upstream tag moves.
+ */
+export const LOCAL_SPEECH_IMAGE = "ghcr.io/speaches-ai/speaches:0.9.0-rc.3-cpu";
 
 /** Mirrors `VoiceSettings::default()`; what an absent section renders as. */
 export const DEFAULT_VOICE_SETTINGS: VoiceSettingsDto = {
   activation: "toggle",
-  intent: "claude",
-  transcription: "off",
+  intent: VOICE_STAGE_PRESETS.intent.claude,
+  transcription: VOICE_STAGE_PRESETS.transcription.local,
 };
 
 /**
@@ -578,12 +647,16 @@ export type VoiceCaptureState = "idle" | "recording" | "transcribing" | "done" |
 /**
  * What the webview is told about the microphone (`lib.rs`'s `VoiceStatus`).
  *
- * `available` is false exactly when `[voice] transcription` is `off`, which is
- * the default and is a product statement rather than a degraded mode. The panel
- * renders the Voice button either way — neither hidden nor disabled, because a
- * control that is not there says nothing and a greyed-out one reads as a fault.
- * What `false` changes is what the press does: it reports `VOICE_UNAVAILABLE`,
- * naming Settings → Voice, rather than turning voice on.
+ * `available` is **always true from the Tauri app** since `Speech = off` went:
+ * every speech backend it ships can run, so no settings document can turn the
+ * stage off, and *nothing is set up* is reported where it bites instead — as a
+ * `not_configured` transcription outcome naming the container to start or the
+ * key to paste. Two other runtimes still answer `false`: one with no microphone
+ * verbs at all, and the browser fixture, which has no Rust side to transcribe
+ * with. The panel renders the Voice button either way — neither hidden nor
+ * disabled, because a control that is not there says nothing and a greyed-out
+ * one reads as a fault. What `false` changes is what the press does: it reports
+ * `VOICE_UNAVAILABLE`, naming Settings → Voice, rather than turning voice on.
  *
  * `capped` is why the panel polls this between a start and a stop. From the
  * user's side the microphone simply stopped, and a surface that did not know
@@ -730,12 +803,43 @@ export function normalizeDesktopSettings(value: unknown): DesktopSettingsDto {
 function normalizeVoiceSettings(value: unknown): VoiceSettingsDto | undefined {
   if (typeof value !== "object" || value === null) return undefined;
   const record = value as Record<string, unknown>;
-  const pick = (raw: unknown, allowed: readonly string[], fallback: string): string =>
-    allowed.find((candidate) => candidate === raw) ?? fallback;
+  const activation = VOICE_ACTIVATION_MODES.find((candidate) => candidate === record.activation)
+    ?? DEFAULT_VOICE_SETTINGS.activation;
   return {
-    activation: pick(record.activation, VOICE_ACTIVATION_MODES, DEFAULT_VOICE_SETTINGS.activation),
-    intent: pick(record.intent, VOICE_INTENT_BACKENDS, DEFAULT_VOICE_SETTINGS.intent),
-    transcription: pick(record.transcription, VOICE_TRANSCRIPTION_BACKENDS, DEFAULT_VOICE_SETTINGS.transcription),
+    activation,
+    intent: normalizeVoiceStage(record.intent, VOICE_INTENT_BACKENDS, DEFAULT_VOICE_SETTINGS.intent, VOICE_STAGE_PRESETS.intent),
+    transcription: normalizeVoiceStage(record.transcription, VOICE_TRANSCRIPTION_BACKENDS, DEFAULT_VOICE_SETTINGS.transcription, VOICE_STAGE_PRESETS.transcription),
+  };
+}
+
+/**
+ * One stage, rebuilt key by key — never spread, for the parent's reason.
+ *
+ * An unrecognised backend token falls back to this build's default, matching
+ * the folding deserializer Rust-side. The endpoint and the model do **not**
+ * fold: they are free-form on this side and are carried through as written,
+ * because coercing an endpoint is how a user's own URL silently becomes
+ * somebody else's service. Rust refuses an invalid one at the document seam
+ * with a diagnostic the settings footer shows, which is the version of that
+ * outcome a person can act on.
+ *
+ * A stage that is absent or not an object — which is what a document written
+ * before the stages were nested looks like — becomes the preset for whichever
+ * backend ends up chosen, so an older document upgrades rather than failing.
+ */
+function normalizeVoiceStage(
+  value: unknown,
+  backends: readonly string[],
+  fallback: VoiceStageDto,
+  presets: Record<string, VoiceStageDto>,
+): VoiceStageDto {
+  const record = typeof value === "object" && value !== null ? value as Record<string, unknown> : {};
+  const backend = backends.find((candidate) => candidate === record.backend) ?? fallback.backend;
+  const preset = presets[backend] ?? fallback;
+  return {
+    backend,
+    endpoint: typeof record.endpoint === "string" && record.endpoint ? record.endpoint : preset.endpoint,
+    model: typeof record.model === "string" && record.model ? record.model : preset.model,
   };
 }
 
@@ -1803,7 +1907,15 @@ class FixtureDeckBridge implements DeckBridge {
   private microphone = { recording: false, spoken: false };
 
   /**
-   * Whether the preview's settings name a transcription backend.
+   * Whether the preview offers a microphone path.
+   *
+   * **The preview transcribes nothing, ever** — it has no Rust side, no
+   * container, and `tauri.conf.json`'s CSP leaves the webview unable to reach a
+   * network origin anyway. So this is a preview switch rather than a reading of
+   * the settings, and it says so: a document that names no `[voice]` section is
+   * a fresh install, and drives the unavailable path; one that names a section
+   * drives the other. It used to read `transcription !== "off"`, which was the
+   * same kind of switch over a token that no longer exists.
    *
    * Read through `getSettings` rather than from a field, because the browser
    * tier sets the document in `localStorage` before the page loads and the
@@ -1811,17 +1923,17 @@ class FixtureDeckBridge implements DeckBridge {
    */
   private async voiceAvailable(): Promise<boolean> {
     const { settings } = await this.getSettings();
-    return (settings.voice?.transcription ?? "off") !== "off";
+    return settings.voice !== undefined;
   }
 
   /**
    * What the preview's microphone is doing.
    *
-   * With no backend chosen it reports exactly what a live app reports when
-   * `[voice] transcription` is `off` — its default — so this tier drives the
-   * *unavailable* path with no device anywhere near it. With one chosen it
-   * drives the other path: the first poll after a start reports the utterance
-   * over, which is the boundary `voice::Vad` produces live.
+   * With no `[voice]` section it reports what a runtime with no microphone
+   * reports, so this tier drives the *unavailable* path with no device anywhere
+   * near it. With one it drives the other path: the first poll after a start
+   * reports the utterance over, which is the boundary `voice::Vad` produces
+   * live.
    */
   async voiceStatus(): Promise<VoiceStatusDto> {
     if (!(await this.voiceAvailable())) return fixtureVoiceStatus();
