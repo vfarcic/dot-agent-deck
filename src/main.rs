@@ -424,6 +424,25 @@ enum DaemonCmd {
         #[arg(long)]
         force: bool,
     },
+    /// Print the attach endpoint this host's daemon is listening on, and
+    /// print it **only** when a live daemon answered there.
+    ///
+    /// The remote half of endpoint discovery (issue #1174). The desktop runs
+    /// this over ssh on the far host so that the answer comes from a build of
+    /// this program running as that user, rather than from a shell snippet
+    /// restating the rules from outside — see
+    /// [`dot_agent_deck::remote_tunnel::REMOTE_SOCKET_PROBE`].
+    ///
+    /// Three things have to hold before anything is printed: the path resolves
+    /// the same way the daemon's own `bind(2)` resolves it, it passes
+    /// `verify_endpoint_trusted` (not a symlink, a socket, owned by this uid,
+    /// mode `0o600`), and a bounded attach-protocol `Hello` round trip
+    /// succeeds against it. Otherwise nothing goes to stdout and the exit
+    /// status is non-zero.
+    ///
+    /// Read-only, and it never lazy-spawns: "no daemon here" is the answer, not
+    /// a reason to start one.
+    Endpoint,
     /// Print a read-only snapshot of the daemon's managed agents: pane id,
     /// label, cwd, orchestration role, live status, and active tool. Fork
     /// #47: a CLI consumer of the existing `AttachRequest::ListAgents` — it
@@ -1494,6 +1513,7 @@ fn main() -> ExitCode {
             DaemonCmd::Stop { force } => run_daemon_stop_cli(force),
             DaemonCmd::Restart { force } => run_daemon_restart_cli(force),
             DaemonCmd::Status { json } => run_daemon_status_cli(json),
+            DaemonCmd::Endpoint => run_daemon_endpoint_cli(),
         },
         Some(Commands::Remote { cmd }) => match cmd {
             RemoteCmd::Add {
@@ -2193,6 +2213,122 @@ fn run_daemon_hello_cli() -> ExitCode {
     println!("{json}");
     ExitCode::SUCCESS
 }
+
+/// `dot-agent-deck daemon endpoint` — the remote half of ssh endpoint
+/// discovery (issue #1174).
+///
+/// # What it is for
+///
+/// The desktop forwards a remote deck's attach socket with `ssh -L`, and to do
+/// that it must first learn *where* that socket is: OpenSSH expands neither `~`
+/// nor an environment variable on the remote side of `-L`, and the far host's
+/// `XDG_RUNTIME_DIR` and uid are not knowable from this end. Discovery used to
+/// be a shell snippet ([`dot_agent_deck::remote_tunnel::REMOTE_SOCKET_PROBE`])
+/// that restated [`attach_socket_path`]'s rules in `sh` and picked a candidate
+/// with filesystem tests alone. Two consequences, both of which this command
+/// exists to remove:
+///
+/// 1. **Nothing connected**, so a stale inode left behind by a dead daemon was
+///    selected exactly as a live one was, and the forward then came up against
+///    a socket nobody was listening on.
+/// 2. **The rule had two implementations** — this program's and a shell
+///    restatement of it — under a doc-comment obligation to keep them in step
+///    that nothing enforced.
+///
+/// Running the installed binary over there answers from *inside* the same
+/// implementation instead. The snippet stays as the fallback for a host whose
+/// binary is older than this subcommand or is not installed at all, so
+/// discovery still works against those; that fallback is what keeps this
+/// additive.
+///
+/// # What printing a path asserts, and what it does not
+///
+/// It asserts exactly three things, each checked here:
+///
+/// - the path is the one [`attach_socket_path`] resolves, which is the one this
+///   build's daemon calls `bind(2)` on — the same function, not a copy of it;
+/// - it passes [`dot_agent_deck::platform::fsperm::verify_endpoint_trusted`]:
+///   not a symlink, a socket, owned by this uid, at mode `0o600`. The snippet
+///   tested none of the mode and (before #1121) none of the ownership;
+/// - a live listener completed an attach-protocol `Hello` within
+///   [`ENDPOINT_RESOLVE_TIMEOUT`].
+///
+/// **It does not authenticate the listener**, and no claim here should be read
+/// as saying it does. A `Hello` proves something is listening and speaks this
+/// wire; it does not prove that something is the deck's daemon. Against a
+/// foreign uid the three checks bite — with ordinary permissions on the paths
+/// involved, that uid cannot satisfy the ownership check, cannot write the
+/// install path this rung runs from, and (under an owner-only endpoint
+/// directory) cannot create the entry at all. Against an attacker already
+/// running **as the remote login user** they do not: that actor can bind a
+/// `0o600` socket of
+/// their own at the path, and can replace the binary this very command runs
+/// from. Closing *that* needs the remote end to assert an identity in-band,
+/// which is issue #1189 — see `docs/develop/remote-endpoint-discovery.md`.
+///
+/// # Wire cost: none
+///
+/// The round trip is an existing [`dot_agent_deck::daemon_protocol::AttachRequest::Hello`]
+/// via [`DaemonClient::capabilities`], so this command puts nothing new on the
+/// wire and owes no `PROTOCOL_VERSION` bump — the same reasoning
+/// `daemon status` records (issue #459). An older daemon answers a newer CLI's
+/// `Hello` exactly as it always did.
+#[tokio::main]
+async fn run_daemon_endpoint_cli() -> ExitCode {
+    let path = attach_socket_path();
+    let shown = path.display();
+
+    // The endpoint path can come from `DOT_AGENT_DECK_ATTACH_SOCKET` in the
+    // remote login environment, and the caller reads our stdout line by line.
+    // A control byte in the path would let that environment choose which line
+    // the caller believes, so refuse to print one rather than emit a value
+    // whose framing we do not control. The local `RemoteSocketPath` parser
+    // refuses these too; this is the same refusal one hop earlier, where the
+    // reason can still be reported.
+    if shown.to_string().contains(|c: char| c.is_control()) {
+        eprintln!("daemon endpoint: the endpoint path contains a control character");
+        return ExitCode::FAILURE;
+    }
+
+    if let Err(reason) = dot_agent_deck::platform::fsperm::verify_endpoint_trusted(&path) {
+        eprintln!("daemon endpoint: {shown} is not a trusted endpoint: {reason}");
+        return ExitCode::FAILURE;
+    }
+
+    // A `Hello` over the existing wire. Bounded, because a listener that
+    // accepts and then says nothing would otherwise hold the ssh probe open
+    // until its own 20s deadline killed it, turning "the deck is not running"
+    // into "the host timed out".
+    let client = DaemonClient::new(path.clone());
+    match tokio::time::timeout(ENDPOINT_RESOLVE_TIMEOUT, client.capabilities()).await {
+        Ok(Ok(_capabilities)) => {}
+        Ok(Err(e)) => {
+            eprintln!("daemon endpoint: nothing answered at {shown}: {e}");
+            return ExitCode::FAILURE;
+        }
+        Err(_elapsed) => {
+            eprintln!(
+                "daemon endpoint: the listener at {shown} did not complete a handshake within {}s",
+                ENDPOINT_RESOLVE_TIMEOUT.as_secs()
+            );
+            return ExitCode::FAILURE;
+        }
+    }
+
+    println!("{shown}");
+    ExitCode::SUCCESS
+}
+
+/// How long [`run_daemon_endpoint_cli`] waits for a listener to complete the
+/// `Hello`.
+///
+/// Comfortably inside `remote_tunnel`'s own 20s probe deadline, so a wedged
+/// listener on the far host is reported by *this* command as "no daemon here"
+/// and the snippet's fallback still gets its turn, rather than the whole ssh
+/// probe being killed from the near side with nothing learned. Matches
+/// `daemon_status::STATUS_REQUEST_TIMEOUT`, which bounds the same kind of
+/// single round trip against the same daemon.
+const ENDPOINT_RESOLVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// `dot-agent-deck daemon status [--json]`. Read-only CLI
 /// consumer of the existing `AttachRequest::ListAgents`

@@ -777,6 +777,29 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** exact human status wording or column layout; the exact JSON status string and schema field names (`daemon/status/002`); a literal TUI detach/reconnect (`session/live/012`).
 - **Platform coverage:** mac+linux.
 
+#### daemon/endpoint
+
+##### daemon/endpoint/001 — `dot-agent-deck daemon endpoint` refuses a stale inode no daemon is listening on, and leaves it alone.
+- **Layer:** fast synthetic real-binary-subprocess integration (the REAL `dot-agent-deck daemon endpoint` CLI as a subprocess against a scratch attach-socket path whose listener has been dropped; no in-process daemon, no PTY, no LLM, no `e2e` feature gate).
+- **Agent:** none (synthetic — a Unix socket bound and immediately dropped so only the inode remains, then chmodded to `0o600` so every check but the connect passes; this is what a `SIGKILL`ed daemon leaves behind).
+- **Asserts:** the subprocess does not report success, prints nothing at all on stdout (the caller forwards whatever is there), carries no Rust panic, and fails with neither clap's generic usage code `2` nor a clap `Usage:` banner — ruling out "this build has no such subcommand" as the reason; and the inode still exists afterwards, since unlinking it is the daemon's own recovery and not a read-only resolver's. This is the availability half of issue #1174: `remote_tunnel::REMOTE_SOCKET_PROBE`'s filesystem tests answer about the inode, and a dead daemon's inode is still a socket, so the snippet names it and the forward comes up against nothing.
+- **Does not assert:** the mode refusal (`daemon/endpoint/002`); the accepting path (`daemon/endpoint/003`); anything about *who* is listening when a connect does succeed — nothing here authenticates the listener.
+- **Platform coverage:** mac+linux.
+
+##### daemon/endpoint/002 — `dot-agent-deck daemon endpoint` refuses a LIVE listener whose mode is not owner-only, and names the mode.
+- **Layer:** fast synthetic real-binary-subprocess integration (the REAL `dot-agent-deck daemon endpoint` CLI as a subprocess against a scratch attach socket held open for the whole test; no in-process daemon, no PTY, no LLM, no `e2e` feature gate).
+- **Agent:** none (synthetic — a real `UnixListener` bound and kept, then chmodded `0o666`: the mode the issue's impersonation case names, and one a connect would happily succeed against).
+- **Asserts:** the same four handled-refusal properties as `/001` (no success, empty stdout, no panic, not clap's `2`/`Usage:`), plus that stderr names the refused mode. Load-bearing because the listener is genuinely live, so only the mode clause can refuse it — and a mode clause is exactly what the shell snippet has no portable `test` spelling for, at any of its rungs.
+- **Does not assert:** that `0o600` proves the listener is the deck's daemon — it does not, and a same-uid attacker satisfies every check this command makes.
+- **Platform coverage:** mac+linux.
+
+##### daemon/endpoint/003 — `dot-agent-deck daemon endpoint` prints exactly one line naming the socket a real daemon bound.
+- **Layer:** fast synthetic real-binary-subprocess integration (the REAL `dot-agent-deck daemon endpoint` CLI as a subprocess + an in-process daemon attach socket, `common::spawn_inprocess_daemon`, + a real `AttachRequest::Hello` round trip; no PTY attach, no LLM, no `e2e` feature gate).
+- **Agent:** none (synthetic — the in-process daemon itself is the listener; no pane is spawned).
+- **Asserts:** the subprocess exits successfully; its stdout holds exactly **one** non-empty line; and that line is the attach path the daemon actually bound. The single-line property is what the caller depends on — `endpoint_test::discover_socket` takes the LAST non-empty line, so a second line would silently change which value gets forwarded with `ssh -L`.
+- **Does not assert:** the shell snippet's own rung ordering or its fall-through (`remote_tunnel::tunnel_tests::the_probe_*`, which execute `REMOTE_SOCKET_PROBE` under every `sh` on the machine); anything about a remote host or a real `ssh` hop.
+- **Platform coverage:** mac+linux.
+
 #### worktree/reclaim
 
 ##### worktree/reclaim/001 — `dot-agent-deck worktree list` succeeds in a git repo and names the worktree it examined.
