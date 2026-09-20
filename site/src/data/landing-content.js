@@ -83,8 +83,19 @@
  *    names: Claude Code, OpenCode, Pi, Codex and Devin. `docs/getting-started.md`
  *    already lists all five. Gemini (#211) and Aider (#212) are open PRDs and
  *    are not promised here.
- * 3. Windows. The page linked #42, closed on 2026-07-15. The open work is #164,
- *    which is what `docs/installation.md` already points at.
+ * 3. Windows. The page linked #42, closed on 2026-07-15 -- and that stale link
+ *    is the whole argument against carrying ANY issue number on this page. A
+ *    marketing page is the place least likely to be revisited, so a pointer
+ *    parked here rots quietly: whoever retargets the work updates the issue
+ *    tracker and never thinks about the landing page. The first fix was to
+ *    point at the open work instead (#164); the maintainer's correction is
+ *    that the number does not belong here at all -- "we might change the issue
+ *    and forget to update the site". So the Windows-native row states the
+ *    status and names the path that works today (WSL), and the "Full
+ *    installation guide" link carries anyone who wants the tracking issue to
+ *    `docs/installation.md`, which is now the SINGLE place it lives -- beside
+ *    the rest of the platform detail, where whoever changes installation will
+ *    see it.
  * 4. Linux install. The page hedged with "Homebrew (if available)". The
  *    generated formula in `Taskfile.yml` carries a full `on_linux` block for
  *    both amd64 and arm64, and `docs/installation.md` heads the section
@@ -257,7 +268,12 @@ export const agents = [
 export const agentsNote =
   'Any other command still runs in a pane — it just gets no live status tracking. Adapters for Gemini CLI and Aider are designed and open, not shipped.';
 
-/** Mirrors the Platform Support table in `docs/installation.md`. */
+/**
+ * Mirrors the Platform Support table in `docs/installation.md`, with one
+ * deliberate divergence: that table links the Windows-native tracking issue
+ * and this one does not. See correction 3 at the top of this file before
+ * "restoring parity" by adding the link back.
+ */
 export const platforms = [
   {
     platform: 'macOS',
@@ -280,9 +296,8 @@ export const platforms = [
   {
     platform: 'Windows native',
     detail: 'no .exe in the release artifacts yet',
-    status: 'Not yet — tracked in #164',
+    status: 'Not yet — use WSL today',
     supported: false,
-    href: 'https://github.com/vfarcic/dot-agent-deck/issues/164',
   },
 ];
 
