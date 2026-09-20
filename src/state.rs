@@ -1116,6 +1116,12 @@ pub struct AppState {
     /// `Instance` variant keys on a per-tab token, with the `(name, cwd)`
     /// tuple preserved as the `NameCwd` fallback for clients that predate
     /// the token.
+    ///
+    /// Issue #462: daemon-only in practice. The five TUI-side sites in
+    /// `src/ui.rs` that register the other three maps deliberately leave this
+    /// one empty, because the TUI process never routes; the note on the first
+    /// of them spells out why, and what a TUI-side router would have to
+    /// populate before `delegate_targets` could be trusted there.
     pub pane_orchestration_map: HashMap<String, OrchestrationIdentity>,
     /// PRD #120: orchestrations the daemon spawned WHILE this TUI is attached
     /// (the issue-dispatch path), queued for the TUI event loop to build into
