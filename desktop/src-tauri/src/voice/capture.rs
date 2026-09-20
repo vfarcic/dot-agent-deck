@@ -165,15 +165,73 @@ impl Pcm16 {
 
     /// Whether every sample is below the floor an all-zero buffer would sit at.
     ///
-    /// Used only to skip a backend call that could not produce words — a
-    /// microphone that was muted, or a device that opened and delivered
-    /// nothing. It is **not** voice-activity detection and must not be read as
-    /// one: it looks at the whole buffer after the fact and decides nothing
-    /// about when an utterance ended.
+    /// Detects **one** thing: a device that opened and delivered nothing, or one
+    /// that was muted. It is **not** voice-activity detection and must not be
+    /// read as one — it looks at the whole buffer after the fact and decides
+    /// nothing about when an utterance ended.
+    ///
+    /// **It is also not the question "is this worth transcribing", and reading
+    /// it as that one shipped a defect.** `all()` means a *single* sample over
+    /// the floor makes the whole buffer not-silent, so one keyboard tap, breath
+    /// or chair creak anywhere in thirty seconds cleared it — and a speech model
+    /// handed thirty seconds of room tone does not answer "nothing". Whisper
+    /// models are trained on captioned video and emit their training artefacts
+    /// ("Don't forget to subscribe", "Thanks for watching") when there is no
+    /// speech to transcribe, so the report told the product owner it had heard
+    /// sentences nobody had said. [`Pcm16::has_speech`] is the question that was
+    /// actually being asked.
     pub fn is_silent(&self) -> bool {
         self.samples
             .iter()
             .all(|s| s.unsigned_abs() < SILENCE_FLOOR)
+    }
+
+    /// The longest **unbroken** stretch of speech-level audio in the buffer.
+    ///
+    /// Measured exactly the way [`Vad`] measures the live signal — mean square
+    /// over a [`VAD_FRAME`] against [`SPEECH_FLOOR`] squared — so the two cannot
+    /// disagree about what counts as somebody speaking. A trailing partial frame
+    /// is not judged, for the same reason it is not judged there.
+    ///
+    /// **Unbroken rather than accumulated, and that is the whole discriminating
+    /// power of it.** What this has to separate is a spoken word from a train of
+    /// impulses: a 20 ms RMS window dilutes a keyboard tap to one frame, maybe
+    /// two, while the voiced part of even a one-syllable command is an unbroken
+    /// run several times that. A *total* would let ten keystrokes inside one
+    /// silence hold sum to the same number a word reaches on its own, which is
+    /// precisely the audio that was reaching the backend.
+    pub fn speech_run(&self) -> Duration {
+        let floor = f64::from(SPEECH_FLOOR) * f64::from(SPEECH_FLOOR);
+        let mut longest = 0usize;
+        let mut run = 0usize;
+        for frame in self.samples.chunks_exact(VAD_FRAME) {
+            let energy: f64 = frame
+                .iter()
+                .map(|&sample| {
+                    let value = f64::from(sample);
+                    value * value
+                })
+                .sum();
+            // Mean square against the squared floor: the same comparison as RMS
+            // against the floor, without the square root. See [`Vad::push`].
+            if energy / VAD_FRAME as f64 >= floor {
+                run += VAD_FRAME;
+                longest = longest.max(run);
+            } else {
+                run = 0;
+            }
+        }
+        Duration::from_secs_f64(longest as f64 / f64::from(TARGET_SAMPLE_RATE))
+    }
+
+    /// Whether the buffer holds enough speech to be worth transcribing at all.
+    ///
+    /// The eligibility test in front of every transcription call
+    /// ([`super::handle_audio`]), and a strictly stronger one than
+    /// [`Pcm16::is_silent`]: it subsumes both an empty buffer and an all-silent
+    /// one, because neither contains a [`MIN_SPEECH`] run.
+    pub fn has_speech(&self) -> bool {
+        self.speech_run() >= MIN_SPEECH
     }
 
     /// The buffer as a 16-bit mono WAV, which is what a transcription API
@@ -244,6 +302,36 @@ const SILENCE_FLOOR: u16 = 32;
 /// different questions: that one asks whether a buffer is worth sending at all,
 /// this one asks whether somebody is speaking *now*.
 const SPEECH_FLOOR: u16 = 600;
+
+/// How long an unbroken run of speech-level frames has to be before a buffer is
+/// worth sending to a transcription backend — [`Pcm16::has_speech`]'s threshold.
+///
+/// 120 ms, which is six [`VAD_FRAME`]s. The two things it has to tell apart sit
+/// on either side of it by a wide margin rather than a narrow one:
+///
+/// * an **impulse** — a keyboard tap, a click, a chair creak — is loud for a few
+///   milliseconds, so RMS over a 20 ms window puts it over [`SPEECH_FLOOR`] for
+///   one frame and occasionally two. Six is out of reach for anything that is
+///   not sustained.
+/// * a **spoken word** carries its energy in a voiced nucleus, and the shortest
+///   command this table takes — a bare "back" on the overview — still holds one
+///   for well over 120 ms at a normal speaking level, where [`SPEECH_FLOOR`]
+///   sits some 15 dB below near-field speech.
+///
+/// **Erring low is deliberate here, and it is the opposite direction from
+/// [`SPEECH_FLOOR`]'s**, because these two constants fail differently. Too high
+/// a threshold refuses a command somebody really said, and the user has no way
+/// to tell that from the feature being broken. Too low a one lets a report say
+/// it heard something nobody said — which is what PRD #802's product owner met,
+/// and is recoverable in one glance because the sentence beside it is the audio
+/// it came from. So this is set where a *word* clears it comfortably rather than
+/// where a *tap* only just fails it.
+///
+/// It is a threshold on the AUDIO and not on the transcript: nothing here reads
+/// what a model returned, and no list of known hallucinated phrases exists
+/// anywhere in this module. A blocklist of training artefacts would be endless,
+/// locale-specific and wrong the first time somebody said one of them.
+pub const MIN_SPEECH: Duration = Duration::from_millis(120);
 
 /// How long the quiet has to run before the utterance is over.
 ///
@@ -1483,6 +1571,119 @@ mod tests {
     /// Output samples at exactly the target rate, as a count.
     fn out_samples(millis: u64) -> usize {
         (TARGET_SAMPLE_RATE as usize * millis as usize) / 1_000
+    }
+
+    // -- eligibility to transcribe -----------------------------------------
+
+    /// The buffer PRD #802's product owner was being charged for, and told he
+    /// had said "Don't forget to subscribe" about.
+    ///
+    /// Thirty seconds of a quiet room with one impulse in it — a keyboard tap,
+    /// which is what ends a segment when nobody is speaking.
+    fn room_with_one_tap() -> Pcm16 {
+        let mut samples = vec![0i16; out_samples(30_000)];
+        samples[out_samples(4_000)] = i16::MAX;
+        Pcm16::new(samples)
+    }
+
+    #[test]
+    fn voice_capture_near_silence_with_one_loud_sample_holds_no_speech() {
+        let audio = room_with_one_tap();
+        // The old guard's whole failure, stated: `all()` needs EVERY sample
+        // under the floor, so one tap made thirty seconds of room tone eligible.
+        assert!(
+            !audio.is_silent(),
+            "the fixture must be one `is_silent` passed, or this proves nothing"
+        );
+        assert!(!audio.has_speech(), "{:?}", audio.speech_run());
+        assert!(audio.speech_run() < MIN_SPEECH);
+    }
+
+    #[test]
+    fn voice_capture_an_impulse_train_never_accumulates_into_speech() {
+        // Fifty taps 100 ms apart — a fast typist through a whole segment. A
+        // rule that summed speech-level frames would reach a full second here;
+        // an unbroken run reaches one frame.
+        let mut samples = vec![0i16; out_samples(5_000)];
+        for tap in 0..50 {
+            samples[out_samples(tap * 100) + 1] = i16::MAX;
+        }
+        let audio = Pcm16::new(samples);
+        assert!(!audio.is_silent());
+        assert!(
+            !audio.has_speech(),
+            "an impulse train read as speech: {:?}",
+            audio.speech_run()
+        );
+    }
+
+    #[test]
+    fn voice_capture_an_empty_or_silent_buffer_holds_no_speech() {
+        assert!(!Pcm16::new(Vec::new()).has_speech());
+        assert!(!Pcm16::new(vec![0; out_samples(30_000)]).has_speech());
+        // Room tone under `SPEECH_FLOOR` for the whole buffer, which is the
+        // ordinary case rather than the digital-zero one.
+        let tone: Vec<i16> = (0..out_samples(30_000))
+            .map(|i| if i % 2 == 0 { 180 } else { -180 })
+            .collect();
+        assert!(!Pcm16::new(tone).has_speech());
+    }
+
+    #[test]
+    fn voice_capture_a_spoken_word_is_eligible_to_transcribe() {
+        // 200 ms of speech-level audio in a quiet second — the shape of a bare
+        // "back", which is a real command on the overview and must be sent.
+        let mut samples = vec![0i16; out_samples(400)];
+        samples.extend(speech(out_samples(200)));
+        samples.extend(std::iter::repeat_n(0i16, out_samples(400)));
+        let audio = Pcm16::new(samples);
+        assert!(audio.has_speech(), "{:?}", audio.speech_run());
+        assert!(audio.speech_run() >= Duration::from_millis(200));
+    }
+
+    #[test]
+    fn voice_capture_speech_run_is_the_longest_unbroken_stretch() {
+        // Two runs, the shorter one first, with a gap wider than a frame.
+        let mut samples = speech(out_samples(60));
+        samples.extend(std::iter::repeat_n(0i16, out_samples(200)));
+        samples.extend(speech(out_samples(160)));
+        let audio = Pcm16::new(samples);
+        assert_eq!(audio.speech_run(), Duration::from_millis(160));
+        // Frame-quantised, and it must not count a run the gap broke: 60 + 160
+        // is over the threshold and neither run alone would be if it were not.
+        assert!(audio.has_speech());
+    }
+
+    #[test]
+    fn voice_capture_speech_run_agrees_with_the_vad_on_what_counts() {
+        // A hair under `SPEECH_FLOOR` at every frame boundary is not speech to
+        // either of them; a hair over is speech to both. One threshold, two
+        // readers, and a drift between them would make the live segmentation and
+        // the eligibility gate disagree about the same audio.
+        for (amplitude, speech_expected) in [(599i16, false), (601i16, true)] {
+            let samples: Vec<i16> = (0..out_samples(1_000))
+                .map(|i| if i % 2 == 0 { amplitude } else { -amplitude })
+                .collect();
+            let mut vad = Vad::default();
+            vad.push(&samples);
+            assert_eq!(vad.heard_speech(), speech_expected, "vad at {amplitude}");
+            assert_eq!(
+                Pcm16::new(samples).has_speech(),
+                speech_expected,
+                "buffer at {amplitude}"
+            );
+        }
+    }
+
+    #[test]
+    fn voice_capture_a_trailing_partial_frame_is_not_judged() {
+        // Shorter than one `VAD_FRAME`, however loud: the same rule `Vad::push`
+        // applies to the tail it is still filling.
+        assert!(!Pcm16::new(speech(VAD_FRAME - 1)).has_speech());
+        assert_eq!(
+            Pcm16::new(speech(VAD_FRAME - 1)).speech_run(),
+            Duration::ZERO
+        );
     }
 
     #[test]

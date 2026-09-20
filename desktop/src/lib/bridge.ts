@@ -692,13 +692,23 @@ export interface VoiceStatusDto {
  * The closed set of situations transcribing one utterance can end in
  * (`voice::TranscriptionOutcome`).
  *
- * Three rather than two, and the third is the point: `not_configured` is
- * neither a transcript nor a failure, and rendering it as either is the mistake
- * calling `off` a product statement exists to avoid.
+ * Four rather than two, and the two additions are the point: `not_configured`
+ * is neither a transcript nor a failure, and neither is `silent`. Rendering
+ * either as an error is the mistake calling `off` a product statement exists to
+ * avoid — and `silent` carries no `detail` because there is nothing to
+ * diagnose. A noise ends a segment far more often than a sentence does, and a
+ * whisper-family model handed the quiet room that follows answers with its own
+ * training artefacts; refusing to call one is what stops the report claiming
+ * the user said something they did not.
+ *
+ * Only `heard` continues the pipeline. `VoiceControlPanel` branches on that one
+ * kind and prints `sentence` for every other, so a fifth situation would render
+ * correctly here and cost no resolver call.
  */
 export type VoiceTranscriptionOutcomeDto =
   | { kind: "heard"; transcript: string; sentence: string }
   | { kind: "not_configured"; detail: string; sentence: string }
+  | { kind: "silent"; sentence: string }
   | { kind: "failed"; detail: string; sentence: string };
 
 /**

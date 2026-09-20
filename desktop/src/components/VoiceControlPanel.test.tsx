@@ -55,9 +55,14 @@ function voiceStatus(overrides: Partial<VoiceStatusDto> = {}): VoiceStatusDto {
 }
 
 function transcription(outcome: VoiceTranscriptionOutcomeDto): VoiceTranscriptionDto {
+  // `null` on the two kinds where no backend was called, which is what
+  // `voice::handle_audio` sends: a number there would claim a measurement
+  // nobody took. `silent` still names the backend that WOULD have answered,
+  // because the microphone and the settings are both fine.
+  const called = outcome.kind !== "not_configured" && outcome.kind !== "silent";
   return {
     outcome,
-    transcribeMs: outcome.kind === "not_configured" ? null : 183,
+    transcribeMs: called ? 183 : null,
     backend: outcome.kind === "not_configured" ? "off" : "remote",
     audioMs: 1_240,
   };
@@ -275,6 +280,14 @@ const TRANSCRIPTION_OUTCOMES: Array<{ name: string; outcome: VoiceTranscriptionO
     name: "capture-failure",
     outcome: { kind: "failed", detail: "the microphone did not produce audio", sentence: "Could not turn that recording into text (the microphone did not produce audio)." },
   },
+  // A noise ended a segment and there was nothing in it. Neither a failure nor
+  // an instruction, and no resolver call — the assertion below that
+  // `resolveVoice` was never called is the half that matters here, because a
+  // segment of room tone must cost nothing at all.
+  {
+    name: "silent",
+    outcome: { kind: "silent", sentence: "Nothing was said — still listening." },
+  },
 ];
 
 describe("voice control panel", () => {
@@ -341,6 +354,33 @@ describe("voice control panel", () => {
     expect(voice.voiceStart).not.toHaveBeenCalled();
     expect(voiceButton()).toHaveAttribute("aria-pressed", "false");
     expect(screen.queryByRole("dialog", { name: "Voice control" })).not.toBeInTheDocument();
+  });
+
+  /**
+   * Scenario: a segment of room tone with a noise in it comes back `silent`.
+   * The row says nothing was said, keeps listening, and spends no resolver call
+   * — and it never blames the user's microphone.
+   */
+  it("reports a segment with no speech in it without calling the resolver", async () => {
+    vi.useFakeTimers();
+    const voice = automaticVoice({ kind: "silent", sentence: "Nothing was said — still listening." });
+    const resolveVoice = resolver(result(DISPATCH));
+    render(<DeckShell runtime={runtime(resolveVoice, voice)} />);
+
+    await turnVoiceOn(voice);
+    await completeAutomaticUtterance(voice);
+
+    const report = screen.getByTestId("voice-report");
+    expect(report).toHaveTextContent("Nothing was said");
+    // The two readings the wording exists to avoid: a failure, and a fault in
+    // hardware that is working perfectly.
+    expect(report).not.toHaveTextContent(/could not/i);
+    expect(report).not.toHaveTextContent(/microphone/i);
+    expect(resolveVoice).not.toHaveBeenCalled();
+    // Still on, and the device was reopened for the next utterance, which is
+    // what makes "still listening" true rather than reassuring.
+    expect(voiceButton()).toHaveAttribute("aria-pressed", "true");
+    expect(voice.voiceStart.mock.calls.length).toBeGreaterThan(1);
   });
 
   /**

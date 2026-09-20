@@ -83,6 +83,26 @@ use super::capture::Pcm16;
 /// sentence.
 pub const TRANSCRIBE_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// The detail on the backstop refusal in [`HttpTranscriber::run`].
+///
+/// Worded as a statement about the ROOM and not about the device. What it used
+/// to say was "the microphone heard nothing", which reads as a fault in the
+/// user's hardware and sent PRD #802's product owner looking for one; the
+/// microphone was working perfectly and nobody had spoken into it.
+const NOTHING_WAS_SAID: &str = "nothing was said";
+
+/// The sentence a user sees when a segment held no speech.
+///
+/// Not a failure and not an instruction — the third thing, which is why
+/// [`TranscriptionOutcome::Silent`] exists rather than this being folded into
+/// either of the other two. Nothing is wrong: voice is on, the microphone is
+/// open, a noise ended a segment and there was nothing in it to transcribe. The
+/// second clause is what keeps that from reading as a stop, and it is true at
+/// the moment it is shown — the surface's cycle ends by listening again, and a
+/// user who has turned voice off never sees this because the outcome is
+/// abandoned with the rest of that cycle.
+const NOTHING_WAS_SAID_SENTENCE: &str = "Nothing was said — still listening.";
+
 /// Why a transcriber could not answer.
 ///
 /// Split the way [`super::resolver::IntentError`] is, and for the same reason:
@@ -277,15 +297,19 @@ impl HttpTranscriber {
     }
 
     async fn run(&self, audio: &Pcm16) -> Result<Transcript, TranscriptionError> {
-        // An empty or silent buffer cannot produce words, and sending one costs
-        // a round trip and a fraction of a cent to be told so. Reported as a
-        // BACKEND failure rather than as a not-configured one: the setup is
-        // fine and the microphone heard nothing, which is a different thing to
-        // do next.
-        if audio.is_empty() || audio.is_silent() {
-            return Err(TranscriptionError::Backend(
-                "the microphone heard nothing".into(),
-            ));
+        // A buffer with nothing said in it cannot produce words, and sending one
+        // costs a round trip, a fraction of a cent, and — with a whisper-family
+        // model — a training artefact presented to the user as a sentence they
+        // said. See [`Pcm16::has_speech`].
+        //
+        // **The BACKSTOP rather than the gate**: [`handle_audio`] asks the same
+        // question before it calls any transcriber, so in this app nothing
+        // reaches here. It stays because [`Transcriber::transcribe`] is public
+        // and a caller that went straight to it would otherwise post the audio.
+        // Reported as a BACKEND failure rather than as a not-configured one: the
+        // setup is fine, which is a different thing to do next.
+        if !audio.has_speech() {
+            return Err(TranscriptionError::Backend(NOTHING_WAS_SAID.into()));
         }
 
         // Read at call time, Rust-side, and dropped with this scope — and on
@@ -621,10 +645,11 @@ impl VoiceTranscription {
 
 /// The closed set of situations transcribing one utterance can end in.
 ///
-/// Three rather than two, and the third is the point: *a prerequisite is not
-/// running* is neither a transcript nor a failure, and rendering it as either
-/// is the mistake — an instruction dressed as an error teaches people the
-/// feature is broken.
+/// Four rather than two, and the two additions are the point: *a prerequisite
+/// is not running* is neither a transcript nor a failure, and neither is
+/// *nothing was said*. Rendering either as an error is the mistake — one
+/// dressed as a failure teaches people the feature is broken, and the other
+/// sends them looking for a fault in a microphone that is working.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 #[serde(
     tag = "kind",
@@ -645,6 +670,20 @@ pub enum TranscriptionOutcome {
     /// loopback endpoint, or a keyed service has no key. **Not a failure**: the
     /// sentence is an instruction naming what to start or what to paste.
     NotConfigured { detail: String, sentence: String },
+    /// The segment held no speech, so no backend was called.
+    ///
+    /// **Not a failure either, and the distinction is the whole of the fix PRD
+    /// #802's product owner asked for.** A noise ends a segment
+    /// ([`super::Vad`] flips on one frame over the floor) far more often than a
+    /// sentence does, and what arrives here is then thirty seconds of a quiet
+    /// room. Transcribing it is worse than useless: whisper-family models emit
+    /// their captioned-video training artefacts on near-silence, so the report
+    /// said the app had heard "Don't forget to subscribe".
+    ///
+    /// It carries no `detail`, unlike the two below, because there is nothing
+    /// to diagnose — this is the ordinary outcome of a quiet room and it must
+    /// not be dressed up as a diagnosis of one.
+    Silent { sentence: String },
     /// Speech could not be turned into text.
     Failed { detail: String, sentence: String },
 }
@@ -654,6 +693,7 @@ impl TranscriptionOutcome {
         match self {
             TranscriptionOutcome::Heard { sentence, .. }
             | TranscriptionOutcome::NotConfigured { sentence, .. }
+            | TranscriptionOutcome::Silent { sentence }
             | TranscriptionOutcome::Failed { sentence, .. } => sentence,
         }
     }
@@ -673,6 +713,28 @@ impl TranscriptionOutcome {
 pub async fn handle_audio(transcriber: &dyn Transcriber, audio: &Pcm16) -> VoiceTranscription {
     let backend = transcriber.backend_name();
     let audio_ms = audio.duration().as_millis().min(u128::from(u32::MAX)) as u32;
+
+    // The eligibility gate, in front of EVERY backend rather than inside one of
+    // them. It lives here and not in [`HttpTranscriber::run`] because "was
+    // anything said" is a question about the audio and not about a transport:
+    // a stub, a second HTTP backend or whatever replaces them would each have
+    // had to remember to ask it, and the one that forgot would be the one that
+    // reported a model's hallucination as a sentence the user said.
+    //
+    // `transcribe_ms` is `None` for [`VoiceTranscription::transcribe_ms`]'s own
+    // rule — no call was made, and a number here would claim a measurement
+    // nobody took — while `backend` still names what would have answered.
+    if !audio.has_speech() {
+        return VoiceTranscription {
+            outcome: TranscriptionOutcome::Silent {
+                sentence: NOTHING_WAS_SAID_SENTENCE.to_string(),
+            },
+            transcribe_ms: None,
+            backend,
+            audio_ms,
+        };
+    }
+
     let started = std::time::Instant::now();
     let answered = transcriber.transcribe(audio).await;
     let transcribe_ms = Some(millis(started.elapsed()));
@@ -879,7 +941,7 @@ mod tests {
         let transcriber = transcriber_for(&settings, Arc::clone(&recorder) as Arc<dyn SecretStore>);
         // The request cannot succeed — nothing is listening on port 1 — but
         // whether a secret was read is decided before the socket.
-        let _ = transcriber.transcribe(&audio(16)).await;
+        let _ = transcriber.transcribe(&audio(16_000)).await;
         assert_eq!(
             recorder.read_on(),
             None,
@@ -903,7 +965,8 @@ mod tests {
                 .expect("valid"),
             ..TranscriptionSettings::default()
         };
-        let result = handle_audio(transcriber_for(&settings, store()).as_ref(), &audio(16)).await;
+        let result =
+            handle_audio(transcriber_for(&settings, store()).as_ref(), &audio(16_000)).await;
 
         assert!(
             matches!(&result.outcome, TranscriptionOutcome::NotConfigured { .. }),
@@ -960,7 +1023,7 @@ mod tests {
         };
         let result = handle_audio(
             transcriber_for(&settings, keyed as Arc<dyn SecretStore>).as_ref(),
-            &audio(16),
+            &audio(16_000),
         )
         .await;
         assert!(
@@ -979,15 +1042,18 @@ mod tests {
 
     #[tokio::test]
     async fn voice_transcribe_reports_what_was_heard() {
-        let result =
-            handle_audio(&StubTranscriber::hearing("show me the tester"), &audio(32)).await;
+        let result = handle_audio(
+            &StubTranscriber::hearing("show me the tester"),
+            &audio(16_000),
+        )
+        .await;
         assert!(result.outcome.is_heard());
         assert_eq!(
             result.transcript().map(Transcript::text),
             Some("show me the tester")
         );
         assert_eq!(result.backend, "stub");
-        assert_eq!(result.audio_ms, 2);
+        assert_eq!(result.audio_ms, 1_000);
         assert!(result.transcribe_ms.is_some());
     }
 
@@ -995,7 +1061,7 @@ mod tests {
     async fn voice_transcribe_a_backend_failure_is_its_own_outcome() {
         let result = handle_audio(
             &StubTranscriber::failing(TranscriptionError::Backend("it timed out".into())),
-            &audio(32),
+            &audio(16_000),
         )
         .await;
         assert!(
@@ -1015,7 +1081,7 @@ mod tests {
         // same seam every other free-form string does.
         let result = handle_audio(
             &StubTranscriber::failing(TranscriptionError::Backend("a\u{1b}[2Jb".into())),
-            &audio(32),
+            &audio(16_000),
         )
         .await;
         assert!(!result.sentence().contains('\u{1b}'), "{result:?}");
@@ -1311,14 +1377,113 @@ mod tests {
             .await
             .expect_err("fails");
         assert!(
-            matches!(&error, TranscriptionError::Backend(detail) if detail.contains("heard nothing")),
+            matches!(&error, TranscriptionError::Backend(detail) if detail == NOTHING_WAS_SAID),
             "got {error:?}"
         );
         let error = transcriber
             .transcribe(&Pcm16::new(Vec::new()))
             .await
             .expect_err("fails");
-        assert!(error.detail().contains("heard nothing"), "{error}");
+        assert_eq!(error.detail(), NOTHING_WAS_SAID);
+    }
+
+    /// The defect PRD #802's product owner met: a buffer of room tone with one
+    /// impulse in it reached whisper, which answered with a training artefact.
+    ///
+    /// One sample at full scale clears `Pcm16::is_silent` — `all()` needs every
+    /// sample under the floor — which is why the old guard let this through.
+    #[tokio::test]
+    async fn voice_transcribe_near_silence_with_one_loud_sample_is_never_sent() {
+        let mut samples = vec![0i16; 16_000];
+        samples[8_000] = i16::MAX;
+        let audio = Pcm16::new(samples);
+        assert!(
+            !audio.is_silent(),
+            "the fixture must be one the OLD guard passed, or this proves nothing"
+        );
+
+        let error = keyed(store())
+            .transcribe(&audio)
+            .await
+            .expect_err("a room with one tap in it is not an utterance");
+        assert_eq!(error.detail(), NOTHING_WAS_SAID);
+    }
+
+    /// The same buffer through the gate every backend sits behind: no call, no
+    /// latency claimed, and a sentence that says nothing was said rather than
+    /// that something failed.
+    #[tokio::test]
+    async fn voice_transcribe_a_segment_with_no_speech_in_it_is_its_own_outcome() {
+        let mut samples = vec![0i16; 16_000];
+        samples[8_000] = i16::MAX;
+        // A transcriber that would PANIC the assertions below if it were asked,
+        // because "the tester" is neither the sentence nor the kind expected.
+        let result = handle_audio(
+            &StubTranscriber::hearing("Don't forget to subscribe"),
+            &Pcm16::new(samples),
+        )
+        .await;
+
+        assert!(
+            matches!(&result.outcome, TranscriptionOutcome::Silent { .. }),
+            "{:?}",
+            result.outcome
+        );
+        assert!(
+            !result.outcome.is_heard(),
+            "nothing goes on to the resolver"
+        );
+        assert_eq!(result.transcript(), None);
+        assert_eq!(result.sentence(), "Nothing was said — still listening.");
+        // Not a failure and not a fault in the user's hardware, which is the
+        // whole reason this is a fourth variant rather than a `Failed`.
+        assert!(
+            !result.sentence().contains("Could not"),
+            "{}",
+            result.sentence()
+        );
+        assert!(
+            !result.sentence().contains("microphone"),
+            "{}",
+            result.sentence()
+        );
+        assert_eq!(result.transcribe_ms, None, "no backend was called");
+        assert_eq!(
+            result.backend, "stub",
+            "it still names what would have answered"
+        );
+        assert_eq!(result.audio_ms, 1_000);
+    }
+
+    /// The other direction, which is what stops the guard above being a mute
+    /// button: a buffer with somebody speaking in it still reaches the backend.
+    #[tokio::test]
+    async fn voice_transcribe_real_speech_still_reaches_the_backend() {
+        let result = handle_audio(
+            &StubTranscriber::hearing("go back"),
+            // Loud enough to be speech, and only 200 ms of it (3 200 samples at
+            // 16 kHz) — a bare "back" on the overview is a real command and
+            // must not be refused.
+            &audio(3_200),
+        )
+        .await;
+
+        assert!(result.outcome.is_heard(), "{:?}", result.outcome);
+        assert_eq!(result.transcript().map(Transcript::text), Some("go back"));
+        assert!(result.transcribe_ms.is_some(), "the backend was called");
+    }
+
+    #[test]
+    fn voice_transcribe_silence_serializes_a_kind_the_webview_reads() {
+        let silent = TranscriptionOutcome::Silent {
+            sentence: NOTHING_WAS_SAID_SENTENCE.to_string(),
+        };
+        let json = serde_json::to_value(&silent).expect("serializes");
+        assert_eq!(json["kind"], "silent");
+        assert_eq!(json["sentence"], NOTHING_WAS_SAID_SENTENCE);
+        // No `detail`: there is nothing to diagnose, and a field named for a
+        // diagnosis is how this would drift back into reading as a failure.
+        assert!(json.get("detail").is_none(), "{json}");
     }
 
     /// Scenario: the built code, on this build's own default settings, posts a
