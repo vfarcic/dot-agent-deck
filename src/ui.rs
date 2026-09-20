@@ -5448,10 +5448,9 @@ fn surface_one_orchestration(
                 // `run_daemon_serve_cli` in `src/main.rs`, the latter reachable
                 // only from the `daemon serve` subcommand; the deck's lazy
                 // spawn fork-execs that subcommand rather than serving
-                // in-process). The daemon
-                // registers all four maps together, through
-                // `AppState::register_orchestration_role`. See also the note in
-                // `run_tui`'s render loop recording that
+                // in-process). The daemon registers all four maps together,
+                // through `AppState::register_orchestration_role`. See also the
+                // note in `run_tui`'s render loop recording that
                 // `dispatch_delegate_events` / `feedback_worker_results` moved
                 // daemon-side in PRD #93 round-5.
                 //
