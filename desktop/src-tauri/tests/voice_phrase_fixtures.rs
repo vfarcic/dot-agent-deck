@@ -2,10 +2,17 @@
 //!
 //! These fixtures are authoritative only for the shipping default intent
 //! backend, which is now the **keyed API backend on this build's own preset**
-//! — `test_support::api_preset()`, currently Anthropic Messages on
-//! `claude-haiku-4-5`. A green run with another model, endpoint or protocol
-//! would prove less than it appears to, so this module deliberately offers no
-//! backend switch: it reads the preset rather than taking one.
+//! — `test_support::api_preset()`, currently OpenAI chat-completions on
+//! `gpt-5-mini`. A green run with another model, endpoint or protocol would
+//! prove less than it appears to, so this module deliberately offers no backend
+//! switch: it builds through `resolver_for(&IntentSettings::default())`, which
+//! is the call production makes, and therefore follows the default wherever it
+//! goes rather than naming a protocol of its own.
+//!
+//! **That is why `API_KEY_ENV` moved too.** The variable a developer has to set
+//! is the one the default backend authenticates with, so it tracks the default
+//! rather than being a separate decision — and a run with the wrong vendor's
+//! key is a 401 on the first fixture, not a skip.
 //!
 //! **It used to drive `AgentCliResolver::claude()`, and that backend is gone.**
 //! PRD #802's provider work removed the agent-CLI intent backend outright —
@@ -55,7 +62,13 @@ const REQUIRE_REAL_E2E_ENV: &str = "DOT_AGENT_DECK_REQUIRE_REAL_E2E";
 /// The credential the keyed backend authenticates with, as the developer's own
 /// shell already spells it. Rule 5's lane 2: a developer's key on a developer's
 /// machine, and nothing registered on the repository.
-const API_KEY_ENV: &str = "ANTHROPIC_API_KEY";
+///
+/// **Keep this matched to the default backend.** It is `OPENAI_API_KEY` because
+/// `IntentSettings::default()` is the OpenAI preset; a build whose default went
+/// back to Anthropic would need `ANTHROPIC_API_KEY` here, and nothing
+/// mechanical enforces the pairing — the preflight only knows whether the
+/// variable it was told to read is set.
+const API_KEY_ENV: &str = "OPENAI_API_KEY";
 const MIN_FIXTURE_COUNT: usize = 24;
 const PENDING_OPEN_SETTINGS_ACTION: &str = "open_settings";
 const PER_FIXTURE_GRACE: Duration = Duration::from_secs(15);

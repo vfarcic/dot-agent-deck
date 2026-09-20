@@ -37,10 +37,39 @@ pub const TOOL_NAME: &str = "run_deck_action";
 /// strips the newline **and** the leading whitespace, so the text is one
 /// paragraph. `voice_schema_tool_description_reads_as_prose` asserts that
 /// rather than trusting it.
+///
+/// # The callability tie-break, which is here because a model needed it
+///
+/// **Nothing tells the model which screen the user is on.** The screen is
+/// conveyed only through each row's `callable` flag — and the sentence above it
+/// says, correctly, that picking a `callable: false` action is the right answer
+/// when that is what was asked for. For an utterance that fits exactly one row
+/// those two facts are enough. For a genuinely ambiguous one they are not: a
+/// bare *"go back"* fits `close_agent_view` on the agent screen and `open_deck`
+/// on the overview, and both rows' descriptions say so for their own screen.
+///
+/// `claude-haiku-4-5` read those qualifiers. `gpt-5-mini` — the default since
+/// PRD #802's one-key work — read the instruction literally and answered
+/// `open_deck` on the agent screen in **seven of eight** measured runs, which
+/// the `close-agent-view-back` fixture caught. With the tie-break it failed
+/// once in six, and the Anthropic preset was re-measured across it and did not
+/// move (its own wobble stays `open-agent-by-state`, which this does not
+/// touch).
+///
+/// **Editing the two rows' descriptions to point at each other was tried first
+/// and merely moved the failure** to `open-deck-back` — the same outcome the
+/// PRD's 2026-09-20 prompt-variant sweep recorded for a different fixture,
+/// which is why this is a rule about ties rather than a rewrite of either row.
+/// It is scoped to ties on purpose: the six `unavailable` fixtures are cases
+/// where only one action fits the words, so the tie-break never applies to them
+/// and they stayed green.
 pub const TOOL_INSTRUCTIONS: &str = "Pick the deck action the user asked for. Pick exactly one. \
     Every action is listed whether or not it can run right now: `callable: false` \
     means it exists but the current screen cannot run it, and picking it is the \
-    right answer when that is what the user asked for. Answer `none` when the \
+    right answer when that is what the user asked for. When the user's words fit \
+    MORE THAN ONE action and only one of them is `callable: true`, pick that \
+    one: an ambiguous request means the action that can actually run here. \
+    Answer `none` when the \
     request does not match any action listed — do not force a pick. \
     `agents_on_screen` carries each agent's LIVE state as the deck holds it: \
     `status` is the daemon's own word for what it is doing (`working`, `thinking`, \

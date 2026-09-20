@@ -20,8 +20,10 @@ import type { RuntimeMode } from "../types";
 const KEY = "sk-not-a-real-key-0123456789";
 
 /** What each key row is called now that the label names the provider. */
-const COMMANDS_KEY = "Key for api.anthropic.com";
-const SPEECH_KEY = "Key for api.openai.com";
+const COMMANDS_KEY = "Commands key for api.anthropic.com";
+const SPEECH_KEY = "Speech key for api.openai.com";
+/** What the Commands row is called on the defaults, which are OpenAI's. */
+const DEFAULT_COMMANDS_KEY = "Commands key for api.openai.com";
 
 function renderPanel(
   overrides: Partial<DesktopSettingsDto> = {},
@@ -78,7 +80,7 @@ describe("VoicePanel", () => {
   it("renders every choice the app actually ships an adapter for", () => {
     renderPanel();
     expect(screen.getByLabelText("Speech")).toHaveValue("local");
-    expect(screen.getByLabelText("Commands")).toHaveValue("anthropic");
+    expect(screen.getByLabelText("Commands")).toHaveValue("openai_compatible");
     // The lists are the closed sets, so a token the Rust side would fold away
     // cannot be offered here.
     expect(screen.getByLabelText("Speech").querySelectorAll("option")).toHaveLength(
@@ -187,7 +189,7 @@ describe("VoicePanel", () => {
       expect.objectContaining({
         voice: {
           activation: "toggle",
-          intent: VOICE_STAGE_PRESETS.intent.anthropic,
+          intent: VOICE_STAGE_PRESETS.intent.openai_compatible,
           transcription: VOICE_STAGE_PRESETS.transcription.remote,
         },
       }),
@@ -261,7 +263,7 @@ describe("VoicePanel", () => {
       VOICE_STAGE_PRESETS.transcription.local.endpoint,
     );
     expect(document.getElementById("voice-intent-endpoint")).toHaveValue(
-      VOICE_STAGE_PRESETS.intent.anthropic.endpoint,
+      VOICE_STAGE_PRESETS.intent.openai_compatible.endpoint,
     );
   });
 
@@ -310,12 +312,37 @@ describe("VoicePanel", () => {
    * from the backend token. A panel that asked for two keys before the feature
    * did anything would be the thing PRD #802 set out to avoid; one is what the
    * measurements left.
+   *
+   * **And that one names OpenAI now**, which is the point of the default
+   * moving: the same key the hosted speech backend would want, so a user going
+   * hosted end to end opens one account rather than two.
    */
   it("asks for a key only where the chosen backend needs one", () => {
     renderPanel();
     expect(screen.queryByLabelText(SPEECH_KEY)).not.toBeInTheDocument();
-    expect(screen.getByLabelText(COMMANDS_KEY)).toBeVisible();
-    expect(screen.getAllByLabelText(/^Key for /)).toHaveLength(1);
+    expect(screen.getByLabelText(DEFAULT_COMMANDS_KEY)).toBeVisible();
+    expect(screen.getAllByLabelText(/ key for /)).toHaveLength(1);
+  });
+
+  /**
+   * Scenario: both stages are hosted on the defaults' provider, so both key
+   * rows name the same host. Each still says which stage it belongs to.
+   *
+   * The collision the one-key default creates: `Key for api.openai.com` twice
+   * is not a label, and these are two separate keychain entries under two
+   * `SecretId`s. A user pasting the same key into both is fine; a user unable
+   * to tell which field they are in is not.
+   */
+  it("tells the two key rows apart when both stages point at one provider", () => {
+    renderPanel({
+      voice: {
+        ...DEFAULT_VOICE_SETTINGS,
+        transcription: VOICE_STAGE_PRESETS.transcription.remote,
+      },
+    });
+    expect(screen.getByLabelText(DEFAULT_COMMANDS_KEY)).toBeVisible();
+    expect(screen.getByLabelText(SPEECH_KEY)).toBeVisible();
+    expect(screen.getAllByLabelText(/ key for api\.openai\.com$/)).toHaveLength(2);
   });
 
   it("asks for a key per backend that authenticates with one", async () => {
@@ -336,7 +363,7 @@ describe("VoicePanel", () => {
         intent: { ...DEFAULT_VOICE_SETTINGS.intent, backend: "openai_compatible", endpoint: "https://gateway.example.com/v1/chat/completions", model: "gpt-4.1-mini" },
       },
     });
-    expect(screen.getByLabelText("Key for gateway.example.com")).toBeVisible();
+    expect(screen.getByLabelText("Commands key for gateway.example.com")).toBeVisible();
     expect(screen.queryByLabelText(COMMANDS_KEY)).not.toBeInTheDocument();
   });
 
@@ -360,7 +387,7 @@ describe("VoicePanel", () => {
         intent: { ...DEFAULT_VOICE_SETTINGS.intent, backend: "openai_compatible", endpoint: "http://127.0.0.1:8080/v1/chat/completions", model: "local-model" },
       },
     });
-    expect(screen.queryByLabelText(/^Key for /)).not.toBeInTheDocument();
+    expect(screen.queryByLabelText(/ key for /)).not.toBeInTheDocument();
 
     // And an endpoint this build cannot parse still offers the row, rather
     // than hiding it over a URL nobody has agreed about yet.
@@ -370,7 +397,7 @@ describe("VoicePanel", () => {
         intent: { ...DEFAULT_VOICE_SETTINGS.intent, backend: "openai_compatible", endpoint: "not a url", model: "gpt-4.1-mini" },
       },
     });
-    expect(screen.getAllByLabelText(/^Key for /)).toHaveLength(1);
+    expect(screen.getAllByLabelText(/ key for /)).toHaveLength(1);
   });
 
   /**

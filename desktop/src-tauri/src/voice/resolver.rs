@@ -196,7 +196,13 @@ pub fn resolver_for(
     use crate::settings::IntentBackend;
     let protocol = match settings.backend {
         IntentBackend::Anthropic => Protocol::Anthropic,
-        IntentBackend::OpenaiCompatible => Protocol::OpenAiCompatible,
+        // The dialect's own parameter, decided here from the coordinates rather
+        // than sent unconditionally — `IntentSettings::reasoning_effort` is the
+        // gate and says why an `openai_compatible` endpoint that is not this
+        // build's preset must not receive it.
+        IntentBackend::OpenaiCompatible => Protocol::OpenAiCompatible {
+            reasoning_effort: settings.reasoning_effort(),
+        },
     };
     Box::new(super::remote::RemoteResolver::new(
         protocol,
@@ -271,10 +277,11 @@ mod tests {
     /// The command stage with one backend chosen and this build's presets for
     /// the coordinates — which is what the panel writes when a user picks one.
     fn stage(backend: crate::settings::IntentBackend) -> crate::settings::IntentSettings {
-        crate::settings::IntentSettings {
-            backend,
-            ..crate::settings::IntentSettings::default()
-        }
+        // `for_backend` rather than the default with the backend overwritten:
+        // the coordinates belong to the backend, so the latter would build an
+        // Anthropic stage pointing at the OpenAI preset — a pairing the panel
+        // cannot produce and the deserializer refuses to construct.
+        crate::settings::IntentSettings::for_backend(backend)
     }
 
     fn request<'a>(
@@ -362,6 +369,76 @@ mod tests {
         assert_eq!(
             resolver_for(&stage(IntentBackend::OpenaiCompatible), store()).backend_name(),
             "openai"
+        );
+    }
+
+    /// Scenario: the resolver built from this build's own preset asks for
+    /// minimal reasoning; one built from any coordinate a user could edit asks
+    /// for none.
+    ///
+    /// `reasoning_effort` is an **OpenAI-family** parameter, so a request
+    /// carrying it unconditionally is a 400 waiting on somebody's gateway or
+    /// local server — and on `api.openai.com` itself for a model that does not
+    /// reason. This is the seam where that decision is made, so it is the seam
+    /// where the scoping is pinned: the `Protocol` variant carries the value,
+    /// and `IntentSettings::reasoning_effort` decides it against the endpoint
+    /// and the model together.
+    #[test]
+    fn voice_resolver_sends_the_reasoning_parameter_only_on_this_builds_preset() {
+        use crate::model_service::{ModelId, ServiceUrl};
+        use crate::settings::{IntentBackend, IntentSettings, OPENAI_COMMAND_REASONING_EFFORT};
+
+        let preset = IntentSettings::for_backend(IntentBackend::OpenaiCompatible);
+        assert_eq!(
+            preset.reasoning_effort(),
+            Some(OPENAI_COMMAND_REASONING_EFFORT)
+        );
+        // And the shipping default IS that preset, so a fresh install gets it.
+        assert_eq!(
+            IntentSettings::default().reasoning_effort(),
+            Some(OPENAI_COMMAND_REASONING_EFFORT)
+        );
+
+        // Every edit a user can make takes it off. A gateway in front of
+        // OpenAI, a server on this machine, and the same endpoint with a
+        // different model — the last is the one a per-endpoint rule would
+        // have missed.
+        for endpoint in [
+            "https://gateway.example.com/v1/chat/completions",
+            "http://127.0.0.1:8080/v1/chat/completions",
+            // The preset host with a different path: still not the preset.
+            "https://api.openai.com/v1/responses",
+        ] {
+            let edited = IntentSettings {
+                endpoint: ServiceUrl::parse(endpoint).expect("valid"),
+                ..preset.clone()
+            };
+            assert_eq!(edited.reasoning_effort(), None, "{endpoint}");
+        }
+        for model in ["gpt-4.1-mini", "llama3.1:8b"] {
+            let edited = IntentSettings {
+                model: ModelId::parse(model).expect("valid"),
+                ..preset.clone()
+            };
+            assert_eq!(edited.reasoning_effort(), None, "{model}");
+        }
+        // Raising the ceiling is NOT an edit that takes it off: the parameter
+        // is about what the endpoint accepts, and the ceiling is not.
+        let raised = IntentSettings {
+            max_tokens: crate::model_service::TokenCeiling::parse(8192).expect("in range"),
+            ..preset.clone()
+        };
+        assert_eq!(
+            raised.reasoning_effort(),
+            Some(OPENAI_COMMAND_REASONING_EFFORT)
+        );
+
+        // The other dialect has no such parameter and no way to hold one —
+        // `Protocol::Anthropic` is a unit variant — so this is belt and braces
+        // for a caller that asks anyway.
+        assert_eq!(
+            IntentSettings::for_backend(IntentBackend::Anthropic).reasoning_effort(),
+            None
         );
     }
 

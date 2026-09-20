@@ -506,9 +506,15 @@ export const VOICE_ACTIVATION_MODES = ["toggle"] as const;
  * `opencode run` offers none of those switches. `claude` — the shipped DEFAULT
  * — went with the provider work, because a stage that spends a credential has
  * to let the user choose whose, and a subprocess has no endpoint, model or key
- * to choose. The Rust enum's folding deserializer is why any of the three left
- * in a settings document loads as `anthropic` instead of failing; for `remote`
- * that also happens to be where it pointed.
+ * to choose. The Rust enum's folding deserializer is why `claude` or `opencode`
+ * left in a settings document loads as the default instead of failing;
+ * `remote` is mapped explicitly to `anthropic` instead, because it named that
+ * API and the key stored for it is that vendor's.
+ *
+ * **`openai_compatible` is the default**, so one OpenAI key runs both voice
+ * stages — Speech's hosted option is OpenAI's too. The order here is the order
+ * the select offers, and it is the order the tokens have always had rather
+ * than a ranking.
  */
 export const VOICE_INTENT_BACKENDS = ["anthropic", "openai_compatible"] as const;
 
@@ -578,7 +584,7 @@ export const VOICE_STAGE_PRESETS: {
     openai_compatible: {
       backend: "openai_compatible",
       endpoint: "https://api.openai.com/v1/chat/completions",
-      model: "gpt-4.1-mini",
+      model: "gpt-5-mini",
       max_tokens: DEFAULT_TOKEN_CEILING,
     },
   },
@@ -597,7 +603,7 @@ export const LOCAL_SPEECH_IMAGE = "ghcr.io/speaches-ai/speaches:0.9.0-rc.3-cpu";
 /** Mirrors `VoiceSettings::default()`; what an absent section renders as. */
 export const DEFAULT_VOICE_SETTINGS: VoiceSettingsDto = {
   activation: "toggle",
-  intent: VOICE_STAGE_PRESETS.intent.anthropic,
+  intent: VOICE_STAGE_PRESETS.intent.openai_compatible,
   transcription: VOICE_STAGE_PRESETS.transcription.local,
 };
 

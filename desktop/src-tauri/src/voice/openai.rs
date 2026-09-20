@@ -127,8 +127,25 @@ pub fn response_schema(commands: &[AnnotatedCommand]) -> Value {
 /// checked rather than assumed. The two spellings carry the same
 /// [`TokenCeiling`], which is why the settings field is one number and not one
 /// per dialect.
-pub fn request_body(request: &IntentRequest<'_>, model: &str, max_tokens: TokenCeiling) -> Value {
-    json!({
+///
+/// # `reasoning_effort` is added only when it is handed one
+///
+/// It is an **OpenAI-family** parameter and not part of the
+/// `/v1/chat/completions` shape every server implementing that path accepts, so
+/// an unconditional field here would be a 400 on somebody's gateway or local
+/// server — the `llama.cpp` server probed for PRD #802 wanted
+/// `chat_template_kwargs` instead, and even `api.openai.com` refuses it for
+/// models that do not reason. This function therefore has no opinion about when
+/// to send it: [`crate::settings::IntentSettings::reasoning_effort`] decides,
+/// against the endpoint and the model together, and `None` leaves the key out
+/// of the body entirely rather than sending a null.
+pub fn request_body(
+    request: &IntentRequest<'_>,
+    model: &str,
+    max_tokens: TokenCeiling,
+    reasoning_effort: Option<&str>,
+) -> Value {
+    let mut body = json!({
         "model": model,
         "max_completion_tokens": max_tokens.get(),
         "messages": [
@@ -150,7 +167,14 @@ pub fn request_body(request: &IntentRequest<'_>, model: &str, max_tokens: TokenC
                 "schema": response_schema(request.commands),
             },
         },
-    })
+    });
+    if let Some(effort) = reasoning_effort {
+        // Inserted rather than declared with a null default: a provider that
+        // does not know the field should see a body that does not mention it,
+        // not one that mentions it emptily.
+        body["reasoning_effort"] = Value::String(effort.to_string());
+    }
+    body
 }
 
 /// The answer, out of `choices[0].message.content`.
@@ -198,6 +222,7 @@ pub fn parse_response(
 mod tests {
     use super::*;
     use crate::model_service::{DEFAULT_TOKEN_CEILING, MAX_TOKEN_CEILING, MIN_TOKEN_CEILING};
+    use crate::settings::OPENAI_COMMAND_REASONING_EFFORT;
     use crate::voice::Transcript;
     use crate::voice::fixtures::role_agent as agent;
     use crate::voice::schema::annotate;
@@ -223,6 +248,10 @@ mod tests {
             },
             "a-model",
             TokenCeiling::default(),
+            // The default body carries NO reasoning parameter, which is the
+            // case every assertion below but one is about: the preset decides
+            // to send it, this function never does.
+            None,
         )
     }
 
@@ -366,10 +395,50 @@ mod tests {
         };
         for ceiling in [MIN_TOKEN_CEILING, 1024, MAX_TOKEN_CEILING] {
             let ceiling = TokenCeiling::parse(i64::from(ceiling)).expect("in range");
-            let body = request_body(&request, "a-model", ceiling);
+            let body = request_body(&request, "a-model", ceiling, None);
             assert_eq!(body["max_completion_tokens"], ceiling.get());
             assert!(body["max_tokens"].is_null(), "{body}");
         }
+    }
+
+    /// Scenario: the body carries `reasoning_effort` when the caller hands one
+    /// over, and does not mention the key at all when it does not.
+    ///
+    /// **"Does not mention" is the assertion, not "sends null".** A server that
+    /// has never heard of this field should see a body without it; a `null` is
+    /// still an unknown key to a strict parser, which is the failure this
+    /// scoping exists to avoid. `IntentSettings::reasoning_effort` is what
+    /// decides, and `resolver.rs` pins the deciding.
+    #[test]
+    fn voice_openai_request_carries_the_reasoning_parameter_only_when_handed_one() {
+        let commands = commands();
+        let agents = vec![agent("1", "tester")];
+        let transcript = Transcript::new("show me the tester");
+        let request = IntentRequest {
+            transcript: &transcript,
+            commands: &commands,
+            agents: &agents,
+        };
+
+        let bare = request_body(&request, "a-model", TokenCeiling::default(), None);
+        assert!(
+            !bare
+                .as_object()
+                .expect("an object")
+                .contains_key("reasoning_effort"),
+            "an absent parameter must not appear as a null: {bare}"
+        );
+
+        let effort = request_body(
+            &request,
+            "gpt-5-mini",
+            TokenCeiling::default(),
+            Some(OPENAI_COMMAND_REASONING_EFFORT),
+        );
+        assert_eq!(effort["reasoning_effort"], "minimal");
+        // And it changes nothing else about the body.
+        assert_eq!(effort["response_format"], bare["response_format"]);
+        assert_eq!(effort["messages"], bare["messages"]);
     }
 
     #[test]

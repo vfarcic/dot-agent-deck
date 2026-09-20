@@ -227,7 +227,7 @@ export function VoicePanel({ settings, onSave, saveError }: SettingsPanelProps) 
       <StageFields stage="transcription" value={voice.transcription} onSave={saveStage} />
 
       {needsKey("transcription", voice.transcription) && (
-        <SecretRow id="voice-transcription" endpoint={voice.transcription.endpoint} />
+        <SecretRow id="voice-transcription" stage="transcription" endpoint={voice.transcription.endpoint} />
       )}
 
       <div className="settings-row">
@@ -267,7 +267,7 @@ export function VoicePanel({ settings, onSave, saveError }: SettingsPanelProps) 
           backends do not need is how a feature becomes one most people never
           try — the reason both stages default to a backend that needs none. */}
       {needsKey("intent", voice.intent) && (
-        <SecretRow id="voice-intent" endpoint={voice.intent.endpoint} />
+        <SecretRow id="voice-intent" stage="intent" endpoint={voice.intent.endpoint} />
       )}
 
       {/* Rendered verbatim: `saveError` is a complete sentence composed by
@@ -456,16 +456,23 @@ function NumberRow({
  * Its own state is what the user is typing plus what the store last said. The
  * settings document holds none of it, which is the point.
  *
- * **Labelled from the endpoint rather than from the stage.** `Speech key` named
- * the stage the key was for and not the account it came from, which is the one
- * thing a user with several needs to know. The host is what they recognise:
- * they either typed it or picked the preset that carries it, and it stays true
- * when they point the stage somewhere else — which a hardcoded provider name
- * would not.
+ * **Labelled from the stage AND the endpoint.** `Speech key` named the stage
+ * and not the account the key came from, which is the one thing a user with
+ * several needs to know; the host is what they recognise, because they either
+ * typed it or picked the preset that carries it, and it stays true when they
+ * point the stage somewhere else — which a hardcoded provider name would not.
+ *
+ * **The stage half was dropped for a while and had to come back**, because the
+ * hosts stopped being distinct. Commands now defaults to OpenAI so that one key
+ * runs both stages, and OpenAI is also Speech's hosted option — so a user who
+ * picks hosted speech gets two key rows whose endpoint is the same host. Two
+ * fields labelled `Key for api.openai.com` is not a label, it is a coin toss:
+ * they are separate keychain entries under separate `SecretId`s, and a user has
+ * to be able to tell which one they are filling.
  */
-function SecretRow({ id, endpoint }: { id: VoiceSecretId; endpoint: string }) {
+function SecretRow({ id, stage, endpoint }: { id: VoiceSecretId; stage: Stage; endpoint: string }) {
   const bridge = useSettingsBridge();
-  const label = `Key for ${hostOf(endpoint)}`;
+  const label = `${stage === "intent" ? "Commands" : "Speech"} key for ${hostOf(endpoint)}`;
   const [typed, setTyped] = useState("");
   // Two pieces of state, not one, and the split is load-bearing: `status` is
   // what the store last REPORTED and `failure` is what the last save or forget

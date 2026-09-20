@@ -133,18 +133,31 @@ pub enum Protocol {
     /// OpenAI chat-completions: a nested `json_schema` response format,
     /// `strict: true`, the answer as `choices[0].message.content`.
     /// [`super::openai`] has it, and the shorthand it must not send.
-    OpenAiCompatible,
+    ///
+    /// **`reasoning_effort` rides on the variant rather than on the resolver**,
+    /// which is what makes it structurally unable to reach the other dialect:
+    /// Anthropic Messages has no such field and this enum gives it nowhere to
+    /// put one. The value is `None` for every configuration that is not this
+    /// build's measured OpenAI preset — see
+    /// [`crate::settings::IntentSettings::reasoning_effort`], which is the gate,
+    /// and [`crate::settings::OPENAI_COMMAND_REASONING_EFFORT`] for why an
+    /// unconditional field would be a 400 on somebody's server.
+    OpenAiCompatible {
+        reasoning_effort: Option<&'static str>,
+    },
 }
 
 impl Protocol {
     /// What the surface renders beside the latency.
     ///
     /// The **protocol**, which is what a user can act on — *remote, 0.9 s*
-    /// answers a question nobody asked once every backend is remote.
+    /// answers a question nobody asked once every backend is remote. It names
+    /// the dialect and never the parameters, so a user who edits the model does
+    /// not see the label change under them.
     fn name(self) -> &'static str {
         match self {
             Self::Anthropic => "anthropic",
-            Self::OpenAiCompatible => "openai",
+            Self::OpenAiCompatible { .. } => "openai",
         }
     }
 }
@@ -253,9 +266,12 @@ impl RemoteResolver {
 
         let body = match self.protocol {
             Protocol::Anthropic => request_body(&request, self.model.as_str(), self.max_tokens),
-            Protocol::OpenAiCompatible => {
-                super::openai::request_body(&request, self.model.as_str(), self.max_tokens)
-            }
+            Protocol::OpenAiCompatible { reasoning_effort } => super::openai::request_body(
+                &request,
+                self.model.as_str(),
+                self.max_tokens,
+                reasoning_effort,
+            ),
         };
         let mut post = client
             .post(self.endpoint.as_str())
@@ -268,7 +284,7 @@ impl RemoteResolver {
                 Protocol::Anthropic => post
                     .header("anthropic-version", API_VERSION)
                     .header("x-api-key", secret.expose()),
-                Protocol::OpenAiCompatible => {
+                Protocol::OpenAiCompatible { .. } => {
                     post.header("authorization", format!("Bearer {}", secret.expose()))
                 }
             };
@@ -307,7 +323,9 @@ impl RemoteResolver {
         }
         match self.protocol {
             Protocol::Anthropic => parse_response(&payload, self.max_tokens),
-            Protocol::OpenAiCompatible => super::openai::parse_response(&payload, self.max_tokens),
+            Protocol::OpenAiCompatible { .. } => {
+                super::openai::parse_response(&payload, self.max_tokens)
+            }
         }
     }
 }
@@ -936,7 +954,9 @@ mod tests {
         );
         assert_eq!(
             RemoteResolver::new(
-                Protocol::OpenAiCompatible,
+                Protocol::OpenAiCompatible {
+                    reasoning_effort: None,
+                },
                 Arc::new(MemorySecretStore::new()),
                 ServiceUrl::parse("https://voice-intent.invalid/never").expect("valid"),
                 ModelId::parse(HOSTED_COMMAND_MODEL).expect("valid"),

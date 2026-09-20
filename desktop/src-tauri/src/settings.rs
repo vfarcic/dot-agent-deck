@@ -401,22 +401,62 @@ pub const HOSTED_SPEECH_MODEL: &str = "whisper-1";
 /// [`crate::voice::remote`] speaks. `claude-haiku-4-5` is the measured choice —
 /// a median of 0.91 s against the deleted agent CLI's 3.1–4.7 s, at roughly
 /// $0.0015 an utterance.
+///
+/// **This was the default and is no longer**, which changes nothing about the
+/// measurement: it is still the fastest thing measured here and still 24/24 on
+/// the phrase fixtures. [`IntentBackend`] has why the default moved, and the
+/// reason is not about this model.
 pub const HOSTED_COMMAND_ENDPOINT: &str = "https://api.anthropic.com/v1/messages";
 pub const HOSTED_COMMAND_MODEL: &str = "claude-haiku-4-5";
 
 /// OpenAI's chat-completions endpoint, whose nested `json_schema` envelope
-/// [`crate::voice::openai`] speaks.
+/// [`crate::voice::openai`] speaks. **The default since PRD #802's one-key
+/// work** — see [`IntentBackend`] for why.
 ///
-/// **This preset's provider and model are the one thing about that protocol
-/// nobody has run.** The request shape is verified end to end against a local
-/// `llama.cpp` and against Anthropic's own OpenAI-compatible endpoint — where
-/// the grammar enforcement was probed rather than assumed — and **not** against
-/// `api.openai.com`, because the key available when it was written had no
-/// credits. `gpt-4.1-mini` is a cheap tier that supports strict structured
-/// outputs; it is not a measured choice the way `claude-haiku-4-5` is, and this
-/// comment says so rather than letting the symmetry imply otherwise.
+/// `gpt-5-mini` is now a measured choice rather than a plausible one. Through
+/// the shipped builder and parser against the 24 phrase fixtures, with
+/// [`OPENAI_COMMAND_REASONING_EFFORT`] and the 4096 ceiling:
+///
+/// | configuration | score | median | cost | reasoning tokens |
+/// | --- | ---: | ---: | ---: | ---: |
+/// | `reasoning_effort: "minimal"` | **24/24** | **818 ms** | $0.0073 | 0 |
+/// | provider-default reasoning | 24/24 | 1,778 ms | $0.0161 | 4,416 |
+/// | *`claude-haiku-4-5`, for scale* | *24/24* | *780 ms* | — | — |
+///
+/// So it is level with the Anthropic preset on accuracy, within 40 ms of it on
+/// latency, and reasoning is worth **twice the cost and twice the wall clock**
+/// for no score. `gpt-4.1-mini` was here before the measurement and was never
+/// run against anything; it went rather than being kept as a second untested
+/// coordinate.
 pub const OPENAI_COMMAND_ENDPOINT: &str = "https://api.openai.com/v1/chat/completions";
-pub const OPENAI_COMMAND_MODEL: &str = "gpt-4.1-mini";
+pub const OPENAI_COMMAND_MODEL: &str = "gpt-5-mini";
+
+/// The `reasoning_effort` the OpenAI command preset sends, and **only** that
+/// preset.
+///
+/// A routing decision over a closed enum has no reasoning to do, and the
+/// measurement above says so twice over: `minimal` scored the same 24/24 while
+/// spending **zero** reasoning tokens, at half the latency and half the price.
+/// With it the largest response was 28 completion tokens.
+///
+/// # Why it is scoped to the preset and cannot leak
+///
+/// `reasoning_effort` is an **OpenAI-family** parameter, not part of the
+/// `/v1/chat/completions` shape every server implementing that path supports.
+/// A different one may refuse an unknown field outright — the `llama.cpp`
+/// server probed for PRD #802 wanted `chat_template_kwargs` instead — and even
+/// on `api.openai.com` it is not accepted for every model. So it must not
+/// become a field every `openai_compatible` request carries.
+///
+/// [`IntentSettings::reasoning_effort`] is the gate, and it answers `Some` only
+/// when the endpoint **and** the model are both exactly this build's preset —
+/// which is to say, only for the configuration the table above was measured on.
+/// Every edit a user can make moves off it: another provider, a gateway in
+/// front of OpenAI, a server on loopback, or the same endpoint with a different
+/// model. Each of those then gets provider-default reasoning, which is the safe
+/// direction to be wrong in **because** the ceiling is 4096 — the 24/24 row
+/// above is that configuration.
+pub const OPENAI_COMMAND_REASONING_EFFORT: &str = "minimal";
 
 /// The speech stage: which transcriber, where it is, and which model.
 ///
@@ -641,14 +681,16 @@ impl<'de, B: Default + Deserialize<'de>> serde::de::Visitor<'de> for StageSpecVi
     }
 }
 
-/// The command stage: which resolver, where it is, and which model.
+/// The command stage: which resolver, where it is, which model, and how much
+/// answer.
 ///
-/// Its [`Default`] is the keyed API backend on this build's preset, and that is
-/// the one asymmetry between the two stages: speech has a keyless default
-/// ([`TranscriptionSettings`]) and commands does not, because PRD #802 measured
-/// local intent twice and it was not good enough — [`IntentBackend`] has the
-/// numbers. The endpoint and the model are fields rather than constants so the
-/// key the user pastes is one they chose the provider for.
+/// Its [`Default`] is the **OpenAI** preset, which is the one asymmetry between
+/// the two stages: speech has a keyless default ([`TranscriptionSettings`]) and
+/// commands does not, because PRD #802 measured local intent twice and it was
+/// not good enough — [`IntentBackend`] has the numbers, and has why the default
+/// provider is the one whose key also runs the speech stage. The endpoint and
+/// the model are fields rather than constants so the key the user pastes is one
+/// they chose the provider for.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct IntentSettings {
     pub backend: IntentBackend,
@@ -697,6 +739,35 @@ impl IntentSettings {
             // that stops being right the moment the user edits the model.
             max_tokens: TokenCeiling::default(),
         }
+    }
+}
+
+impl IntentSettings {
+    /// The `reasoning_effort` this build sends with a command request, or
+    /// `None` for every configuration that is not this build's measured OpenAI
+    /// preset.
+    ///
+    /// **This is the whole scope of that parameter**, and the reason it is a
+    /// derived answer rather than a stored field: `reasoning_effort` is an
+    /// OpenAI-family parameter, so sending it to an arbitrary
+    /// `openai_compatible` server is a 400 waiting to happen, and sending it to
+    /// `api.openai.com` with a model that does not take it is the same. What
+    /// makes it safe is that it is keyed on the exact coordinates it was
+    /// measured against: the endpoint AND the model must both still be the
+    /// preset's. A user who changes either — to another provider, to a gateway,
+    /// to a server on loopback, or to a different model at the same endpoint —
+    /// gets `None` and the provider's own default reasoning, which fits under
+    /// the 4096 ceiling (see [`OPENAI_COMMAND_REASONING_EFFORT`]).
+    ///
+    /// The backend is checked too, so this is safe to call on any value: the
+    /// Anthropic dialect has no such parameter and
+    /// [`crate::voice::remote::Protocol`] gives it nowhere to put one.
+    pub fn reasoning_effort(&self) -> Option<&'static str> {
+        let preset = Self::for_backend(IntentBackend::OpenaiCompatible);
+        (self.backend == IntentBackend::OpenaiCompatible
+            && self.endpoint == preset.endpoint
+            && self.model == preset.model)
+            .then_some(OPENAI_COMMAND_REASONING_EFFORT)
     }
 }
 
@@ -848,6 +919,36 @@ impl VoiceToken for TranscriptionBackend {
 
 /// Which `IntentResolver` turns a transcript into an action (PRD #802 M5).
 ///
+/// # The default is OpenAI so that ONE key runs the whole feature
+///
+/// Both stages of voice can be hosted, and Speech's hosted option is OpenAI's
+/// `whisper-1`. While Commands defaulted to Anthropic, going hosted on both
+/// meant two vendors, two accounts and two keys pasted into one panel — for a
+/// feature whose whole pitch is that it works the moment you turn it on.
+/// Defaulting Commands to OpenAI closes that: **one OpenAI key runs both
+/// stages**, or an Anthropic key if the user prefers that provider for
+/// Commands, or no key at all for Speech if they run the local container.
+///
+/// **It cost nothing measurable, which is what made it available.** The switch
+/// waited on `gpt-5-mini` being measured through the shipped builder and parser
+/// against the 24 phrase fixtures: 24/24 at an 818 ms median, against
+/// `claude-haiku-4-5`'s 24/24 at 780 ms — level on accuracy, 38 ms apart on
+/// latency. [`OPENAI_COMMAND_MODEL`] has the table, including what
+/// [`OPENAI_COMMAND_REASONING_EFFORT`] is worth.
+///
+/// **An earlier sweep scored 18/24 and that was OUR defect, not the model's.**
+/// The answer ceiling was a hardwired 256, `max_completion_tokens` counts
+/// reasoning tokens, and all six failures had spent exactly 256 of them
+/// thinking — `finish_reason: "length"`, nothing written. That is fixed
+/// separately ([`IntentSettings::max_tokens`]) because it made the generic
+/// `openai_compatible` path unusable with any reasoning model, whoever ships
+/// it; the default would have been wrong to move on the strength of a number
+/// our own constant produced.
+///
+/// **[`Self::Anthropic`] is not deprecated and did not get worse.** Only the
+/// default moved. A document naming it keeps it, `remote` maps to it
+/// explicitly, and it remains the fastest thing measured here.
+///
 /// **Commands is API-ONLY, and both variants are protocol dialects because of
 /// it.** The enum names a *wire shape* — Anthropic Messages or OpenAI
 /// chat-completions — and never an executor, because the one executor it held
@@ -874,10 +975,16 @@ impl VoiceToken for TranscriptionBackend {
 /// The cost to a user who had picked it is **one re-pick**, the same as the
 /// `opencode` withdrawal cost: [`Self::from_str_lossy`] folds an unknown token
 /// to the default, so `intent = "claude"` left in a document loads as
-/// [`Self::Anthropic`] and the rest of the document survives. That folding is
-/// the whole reason a closed enum was the right shape here, and it is what
-/// makes the pre-provider-work `intent = "remote"` cost nothing at all: that
-/// token named the Anthropic API, so the fold lands where the user already was.
+/// [`Self::OpenaiCompatible`] and the rest of the document survives. That
+/// folding is the whole reason a closed enum was the right shape here.
+///
+/// **The pre-provider-work `intent = "remote"` is the one token that is NOT
+/// folded**, and it used to be the one that needed folding least. It named the
+/// Anthropic API, so while Anthropic was the default the fold landed where the
+/// user already was; with the default on OpenAI it would land somewhere else
+/// entirely, and the user's stored `SecretId::VoiceIntent` is an Anthropic key.
+/// It is mapped explicitly instead — see [`Self::from_str_lossy`] for what that
+/// costs and what it prevents.
 ///
 /// **A local model is reachable and is not a variant.** Both variants are HTTP
 /// to a [`ServiceUrl`], so pointing either at a server on this machine is the
@@ -906,13 +1013,15 @@ impl VoiceToken for TranscriptionBackend {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum IntentBackend {
     /// Anthropic Messages: one forced tool call with `strict: true`, the answer
-    /// in a `tool_use` block. The default, because it is the shape PRD #802
-    /// measured.
-    #[default]
+    /// in a `tool_use` block. The shape PRD #802 measured first, and the
+    /// default until the one-key work; still 24/24 and still the fastest thing
+    /// measured here.
     Anthropic,
     /// OpenAI chat-completions: a nested `json_schema` response format with
     /// `strict: true`. The dialect most other providers — and `llama.cpp`'s
-    /// server — also answer, which is what makes the choice a real one.
+    /// server — also answer, which is what makes the choice a real one, and
+    /// **the default** for the reason above.
+    #[default]
     OpenaiCompatible,
 }
 
@@ -930,11 +1039,23 @@ impl VoiceToken for IntentBackend {
     fn from_str_lossy(raw: &str) -> Self {
         match raw.trim().to_ascii_lowercase().as_str() {
             "openai_compatible" => Self::OpenaiCompatible,
+            "anthropic" => Self::Anthropic,
+            // `remote` is the pre-provider-work spelling of the Anthropic
+            // backend, and it is mapped EXPLICITLY rather than folded. Until
+            // the default moved it folded to Anthropic by luck, and the doc
+            // comment said as much; now the fold would land on OpenAI, and the
+            // cost of that is not a re-pick. A document saying `remote` belongs
+            // to a user whose key under `SecretId::VoiceIntent` is an
+            // **Anthropic** key, so the next utterance would put it in an
+            // `Authorization` header addressed to `api.openai.com`. That is a
+            // credential handed to a third party for a 401, silently, and it
+            // costs one match arm to not do.
+            "remote" => Self::Anthropic,
             // Everything else folds, which is what the withdrawn agent-CLI
-            // tokens (`claude`, `opencode`) and the pre-provider-work `remote`
-            // all land on. `remote` folding to Anthropic is not a coincidence
-            // to be relied on by accident: it WAS the Anthropic backend, so the
-            // fold happens to preserve what the user picked.
+            // tokens (`claude`, `opencode`) land on. Those named a
+            // pre-authenticated CLI and never an app-owned key, so there is no
+            // credential to misdirect and the cost is the one re-pick their
+            // withdrawal always carried.
             _ => Self::default(),
         }
     }
@@ -3865,8 +3986,9 @@ mod tests {
             LOCAL_SPEECH_ENDPOINT
         );
         assert_eq!(defaults.transcription.model.as_str(), LOCAL_SPEECH_MODEL);
-        assert_eq!(defaults.intent.backend, IntentBackend::Anthropic);
-        assert_eq!(defaults.intent.endpoint.as_str(), HOSTED_COMMAND_ENDPOINT);
+        assert_eq!(defaults.intent.backend, IntentBackend::OpenaiCompatible);
+        assert_eq!(defaults.intent.endpoint.as_str(), OPENAI_COMMAND_ENDPOINT);
+        assert_eq!(defaults.intent.model.as_str(), OPENAI_COMMAND_MODEL);
         assert_eq!(defaults.intent.max_tokens.get(), DEFAULT_TOKEN_CEILING);
         assert_eq!(defaults.activation, ActivationMode::Toggle);
         // Speech's default is the keyless one, which is the product decision
@@ -3874,6 +3996,18 @@ mod tests {
         // deliberate: PRD #802 measured local intent twice against the phrase
         // fixtures and it was not good enough — `IntentBackend` has the
         // numbers.
+        //
+        // **Both hosted defaults are the same vendor**, which is the product
+        // decision the one-key work turned on: a user who wants the feature
+        // hosted end to end pastes ONE key, rather than opening accounts with
+        // two companies to turn on one button.
+        assert_eq!(
+            ServiceUrl::parse(HOSTED_SPEECH_ENDPOINT)
+                .expect("valid")
+                .host(),
+            defaults.intent.endpoint.host(),
+            "the two hosted presets must be one vendor, or one key does not run both"
+        );
     }
 
     /// Scenario: the command stage's answer ceiling defaults to 4096, a
@@ -4047,7 +4181,7 @@ mod tests {
         .unwrap();
         let loaded = load_from(&path);
         let voice = loaded.voice.clone().expect("the section is present");
-        assert_eq!(voice.intent.backend, IntentBackend::Anthropic);
+        assert_eq!(voice.intent.backend, IntentBackend::OpenaiCompatible);
         assert_eq!(voice.transcription.backend, TranscriptionBackend::Local);
         // A stage that named only its backend still gets this build's
         // coordinates for the folded choice, rather than an empty endpoint.
@@ -4057,7 +4191,10 @@ mod tests {
         // folded value, so the newer build's choice is gone.
         save_to(&path, &loaded).unwrap();
         let reread = std::fs::read_to_string(&path).unwrap();
-        assert!(reread.contains("backend = \"anthropic\""), "{reread}");
+        assert!(
+            reread.contains("backend = \"openai_compatible\""),
+            "{reread}"
+        );
         assert!(!reread.contains("2027"), "{reread}");
 
         // Over-length is a different answer: the document is malformed, so the
@@ -4082,10 +4219,10 @@ mod tests {
     }
 
     /// Scenario: a document written by a build that shipped one of the two
-    /// withdrawn agent-CLI intent backends — or the pre-provider-work spelling
-    /// of the one that survived — loads on this build. All three tokens fold to
-    /// [`IntentBackend::Anthropic`], the rest of the document survives, and
-    /// nothing errors.
+    /// withdrawn agent-CLI intent backends loads on this build and folds to the
+    /// default; the pre-provider-work `remote` loads as **Anthropic**, which is
+    /// what it named. The rest of the document survives every time and nothing
+    /// errors.
     ///
     /// The migration for [`IntentBackend`]'s withdrawn variants, asserted
     /// rather than argued: the audit that removed `opencode` reasoned that the
@@ -4093,9 +4230,13 @@ mod tests {
     /// provider work then spent that reasoning a second time on `claude` — the
     /// whole agent-CLI backend, which was the DEFAULT. So the case this pins is
     /// no longer a minority re-pick: it is what every existing user's document
-    /// says. What it costs them is one re-pick, not a lost document — and for
-    /// `remote`, which named the Anthropic API before the provider work split
-    /// it into two protocol tokens, not even that.
+    /// says. What it costs them is one re-pick, not a lost document.
+    ///
+    /// **`remote` is the case that stopped being a fold when the default
+    /// moved**, and it is pinned here as a mapping rather than as luck. It
+    /// named the Anthropic API, so its user's `SecretId::VoiceIntent` holds an
+    /// Anthropic key; folding it to today's default would put that key in an
+    /// `Authorization` header addressed to `api.openai.com`.
     #[test]
     fn the_withdrawn_agent_cli_intent_backends_fold_to_the_default() {
         let dir = tempdir();
@@ -4120,7 +4261,7 @@ mod tests {
             "a withdrawn token is not a malformed document"
         );
         let voice = loaded.voice.clone().expect("the section is present");
-        assert_eq!(voice.intent.backend, IntentBackend::Anthropic);
+        assert_eq!(voice.intent.backend, IntentBackend::OpenaiCompatible);
         // Everything else in the document survives the fold.
         assert_eq!(voice.transcription.backend, TranscriptionBackend::Remote);
         assert_eq!(
@@ -4144,7 +4285,7 @@ mod tests {
         );
         assert_eq!(
             loaded.voice.expect("the section is present").intent.backend,
-            IntentBackend::Anthropic
+            IntentBackend::OpenaiCompatible
         );
 
         for withdrawn in ["opencode", "claude"] {
@@ -4155,8 +4296,9 @@ mod tests {
         }
 
         // And the pre-provider-work spelling of the one backend that SURVIVED.
-        // `remote` named the Anthropic API, so folding it to the default keeps
-        // the user pointed where they were rather than merely not failing.
+        // `remote` named the Anthropic API, so it MAPS there rather than
+        // folding: the key its user stored is that vendor's, and the default is
+        // no longer that vendor.
         std::fs::write(
             &path,
             "version = 1\n\n[voice.intent]\nbackend = \"remote\"\n",
@@ -4167,9 +4309,96 @@ mod tests {
             problem.is_none(),
             "an older token is not a malformed document"
         );
+        let intent = loaded.voice.expect("the section is present").intent;
+        assert_eq!(intent.backend, IntentBackend::Anthropic);
+        assert_ne!(
+            intent.backend,
+            IntentBackend::default(),
+            "this assertion is only worth making while `remote` and the default differ"
+        );
+        // And it lands on that backend's coordinates, so the stored key goes
+        // where it was minted for.
+        assert_eq!(intent.endpoint.as_str(), HOSTED_COMMAND_ENDPOINT);
+        assert_eq!(intent.model.as_str(), HOSTED_COMMAND_MODEL);
+        // `remote` is NOT an offered token — it is a migration alias, so the
+        // panel must not list it and the round-trip check must not see it.
+        assert!(!<IntentBackend as VoiceToken>::TOKENS.contains(&"remote"));
+    }
+
+    /// Scenario: a document naming the backend that used to be the default
+    /// loads as that backend, with every other section intact.
+    ///
+    /// The half of the migration that is easy to assume and expensive to get
+    /// wrong. Moving a default is a change to what an ABSENT value means; a
+    /// PRESENT one has to keep meaning what it said, and this is the document
+    /// most existing users have. Both spellings are checked — the stage table
+    /// and the bare token an older schema wrote — because they reach the value
+    /// by different code (`StageSpec`'s two arms).
+    ///
+    /// The "rest of the document" half is a P2 that was already fixed once for
+    /// Speech (`b06d9cac`): `toml_edit::de::from_str` is all-or-nothing, so a
+    /// `[voice]` value this build could not read used to cost the user's decks,
+    /// their appearance and their zoom.
+    #[test]
+    fn a_document_naming_the_former_default_keeps_it_and_keeps_the_document() {
+        let dir = tempdir();
+        let path = dir.path().join(SETTINGS_FILE_NAME);
+        for spelling in [
+            "[voice.intent]\nbackend = \"anthropic\"\n",
+            "[voice]\nintent = \"anthropic\"\n",
+        ] {
+            std::fs::write(
+                &path,
+                format!(
+                    "version = 1\n\n\
+                     [appearance]\n\
+                     mode = \"dark\"\n\n\
+                     [zoom]\n\
+                     level = 1.25\n\n\
+                     {spelling}"
+                ),
+            )
+            .unwrap();
+
+            let (loaded, problem) = load_document(&path);
+            assert!(problem.is_none(), "{spelling}: {problem:?}");
+            let intent = loaded
+                .voice
+                .clone()
+                .unwrap_or_else(|| panic!("{spelling}: the section is present"))
+                .intent;
+            assert_eq!(intent.backend, IntentBackend::Anthropic, "{spelling}");
+            assert_eq!(
+                intent.endpoint.as_str(),
+                HOSTED_COMMAND_ENDPOINT,
+                "{spelling}"
+            );
+            assert_eq!(intent.model.as_str(), HOSTED_COMMAND_MODEL, "{spelling}");
+            // Not the default any more, which is what makes this worth pinning.
+            assert_ne!(intent.backend, IntentBackend::default(), "{spelling}");
+            // And nothing else moved.
+            assert_eq!(loaded.appearance.mode, AppearanceMode::Dark, "{spelling}");
+            assert_eq!(loaded.zoom.level.as_f64(), 1.25, "{spelling}");
+        }
+
+        // The other direction, for completeness: the backend that IS the
+        // default is equally explicit when the document names it, so nobody has
+        // to work out whether a value is stored or inferred.
+        std::fs::write(
+            &path,
+            "version = 1\n\n[voice.intent]\nbackend = \"openai_compatible\"\n",
+        )
+        .unwrap();
+        let (loaded, problem) = load_document(&path);
+        assert!(problem.is_none(), "{problem:?}");
         assert_eq!(
-            loaded.voice.expect("the section is present").intent.backend,
-            IntentBackend::Anthropic
+            loaded
+                .voice
+                .expect("the section is present")
+                .intent
+                .model
+                .as_str(),
+            OPENAI_COMMAND_MODEL
         );
     }
 
@@ -4256,7 +4485,7 @@ mod tests {
                 OPENAI_COMMAND_ENDPOINT,
                 "https://api.openai.com/v1/chat/completions",
             ),
-            (OPENAI_COMMAND_MODEL, "gpt-4.1-mini"),
+            (OPENAI_COMMAND_MODEL, "gpt-5-mini"),
         ] {
             assert_eq!(
                 constant, value,
