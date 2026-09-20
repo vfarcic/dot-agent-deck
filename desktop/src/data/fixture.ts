@@ -858,7 +858,11 @@ export function fixtureVoiceStatus(overrides: Partial<VoiceStatusDto> = {}): Voi
     maxMs: FIXTURE_VOICE_MAX_MS,
     capped: false,
     available: false,
-    backend: "off",
+    // The backend that WOULD answer, which for the preview is the app's own
+    // default — nothing does, and `available: false` is what says so. `off`
+    // stood here until the union was corrected, naming a variant PRD #802's
+    // provider work deleted and the wire has never carried.
+    backend: "local",
     ...overrides,
   };
 }

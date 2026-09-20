@@ -49,7 +49,7 @@ function voiceStatus(overrides: Partial<VoiceStatusDto> = {}): VoiceStatusDto {
     maxMs: 30_000,
     capped: false,
     available: false,
-    backend: "off",
+    backend: "local",
     ...overrides,
   };
 }

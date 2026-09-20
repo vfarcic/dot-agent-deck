@@ -668,7 +668,18 @@ export interface VoiceStatusDto {
   maxMs: number;
   capped: boolean;
   available: boolean;
-  backend: "off" | "remote";
+  /**
+   * Which transcriber would answer — `TranscriptionBackend::as_token`, which
+   * is the same vocabulary the document and the Voice panel use.
+   *
+   * **It was typed `"off" | "remote"`, and `off` has not been on this wire
+   * since PRD #802's provider work deleted the variant** — `voice_status` in
+   * `lib.rs` reads the settings token, and the settings token is `local` or
+   * `remote`. The union therefore named a value nothing could send and omitted
+   * the one that is sent by default, which is worse than a plain `string`:
+   * `backend === "off"` type-checked and could never be true.
+   */
+  backend: "local" | "remote";
 }
 
 /**
