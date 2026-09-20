@@ -5438,16 +5438,17 @@ fn surface_one_orchestration(
                 //
                 // `pane_orchestration_map` is deliberately NOT written
                 // alongside the three below. This is the TUI's `AppState`, and
-                // the TUI does not route: every production caller of
-                // `delegate_targets` / `orchestrator_for_worker` — i.e.
+                // the TUI does not route. The four functions that call
+                // `delegate_targets` / `orchestrator_for_worker` —
                 // `handle_delegate_with_state`, `handle_work_done`,
                 // `handle_restart_role_with_state` and
-                // `handle_spawn_role_with_state` — is invoked only from
-                // `src/daemon.rs`, in a separate PROCESS with its own
-                // `AppState` (`run_tui_session` vs `run_daemon_serve_cli` in
-                // `src/main.rs`, the latter reachable only from the `daemon
-                // serve` subcommand; the deck's lazy spawn fork-execs that
-                // subcommand rather than serving in-process). The daemon
+                // `handle_spawn_role_with_state` — have no production caller
+                // outside `src/daemon.rs`, which runs in a separate PROCESS
+                // with its own `AppState` (`run_tui_session` vs
+                // `run_daemon_serve_cli` in `src/main.rs`, the latter reachable
+                // only from the `daemon serve` subcommand; the deck's lazy
+                // spawn fork-execs that subcommand rather than serving
+                // in-process). The daemon
                 // registers all four maps together, through
                 // `AppState::register_orchestration_role`. See also the note in
                 // `run_tui`'s render loop recording that
