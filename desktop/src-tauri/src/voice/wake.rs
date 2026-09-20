@@ -454,9 +454,10 @@ mod iokit {
     /// `kIOPMAssertPreventUserIdleDisplaySleep` is the one that also keeps the
     /// screen lit, and a user who is talking is not watching.
     ///
-    /// Spelled out rather than read from a constant because the symbol is a
-    /// `CFSTR` macro in the IOKit headers: there is no exported data symbol to
-    /// link against, so the string literal IS the ABI here.
+    /// Spelled out rather than linked against, because `IOPMLib.h` defines it
+    /// as a `CFSTR` macro rather than exporting a data symbol — the string
+    /// value is the interface. Harmless if that ever stops being so: the API
+    /// compares the string, so a literal keeps working either way.
     const ASSERTION_TYPE: &str = "PreventUserIdleSystemSleep";
 
     // Declared by hand rather than taken from a crate. `objc2-core-foundation`
@@ -490,10 +491,12 @@ mod iokit {
 
     /// A `CFStringRef` that releases itself.
     ///
-    /// Both strings this module builds are borrowed by the assertion call and
-    /// not retained by it, so they are released the moment it returns — but an
-    /// early return between the two creations would otherwise leak the first,
-    /// which is what `?` on `CfString::new` would do without this.
+    /// Ownership by the Create Rule and nothing cleverer: this module created
+    /// both strings, so this module releases both, and whether
+    /// `IOPMAssertionCreateWithName` retains a copy of its own is its business
+    /// rather than a thing asserted here. What the wrapper buys over two bare
+    /// `CFRelease` calls is the path `?` takes — an early return between the
+    /// two creations would leak the first.
     struct CfString(CFStringRef);
 
     impl CfString {
