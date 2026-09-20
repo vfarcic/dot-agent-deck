@@ -20,33 +20,24 @@
 //! `cargo test-fast`; set `DOT_AGENT_DECK_REQUIRE_REAL_E2E=1` to opt in and to
 //! turn a missing credential into a failure instead of a green runtime skip.
 //!
-//! # ONE fixture is flaky, measured rather than suspected: `open-agent-ambiguous-name`
+//! # The ambiguous-name fixture shares a role, not a completable label
 //!
-//! *"zoom coder"* against a fleet holding **coder one** and **coder two** must
-//! produce [`VoiceOutcome::ParamAmbiguous`], so the app asks which was meant.
-//! The property depends on the model echoing the user's words rather than
-//! completing them, and it does not always: across **five** full suite runs on
-//! 2026-09-20 against `claude-haiku-4-5`, that fixture passed **2** times and
-//! failed 3, each failure resolving to `agent-coder-one`. Every other fixture
-//! passed 5 of 5.
+//! *"zoom coder"* is heard against two agents both displayed as **Atlas** and
+//! both carrying the visible role `coder`. Returning either model-visible name
+//! therefore matches both agents and produces [`VoiceOutcome::ParamAmbiguous`],
+//! so the app asks which was meant; `coder` offers no distinct full label that
+//! names just one.
 //!
-//! **It is not a regression of the migration to this backend.** The wording is
-//! careful because the first attempt at this claim was not: a *hand-built
-//! replica* of the deleted agent-CLI prompt reproduced the completion 5 times
-//! out of 5 on the same model, which says the behaviour is not peculiar to the
-//! tool-use envelope — and says nothing about what the real CLI, with its own
-//! system prompt, did. Nobody characterised this fixture's rate before the
-//! migration, so "it was flaky before" is a reasonable inference and not a
-//! measurement.
-//!
-//! **No prompt change was shipped for it, and seven were measured.** Every
-//! wording that reliably stopped the completion also degraded
-//! `open-agent-by-state` (*"show me the one that's stuck"*), and the one
-//! wording that left that alone only held the completion 3 times in 5 — which
-//! trades a flake for a different flake. [`super`]'s `TOOL_INSTRUCTIONS` is
-//! reviewed as an interface, and overfitting it to 24 samples against one model
-//! is the thing PRD #802 warns about. The PRD's 2026-09-20 entry has the seven
-//! variants and their numbers.
+//! This replaced the flaky **coder one** / **coder two** fleet. Across five
+//! full suite runs on 2026-09-20 against `claude-haiku-4-5`, that version passed
+//! only **2** times and failed 3, each failure resolving to `agent-coder-one`.
+//! Seven prompt variants did not yield a fix: every wording that reliably
+//! stopped the completion also degraded `open-agent-by-state` (*"show me the
+//! one that's stuck"*). No prompt change shipped. The PRD's 2026-09-20 risk
+//! records the product weakness that remains after making this fixture robust.
+//! The isolated fleet then made this fixture pass 5 of 5 full-suite runs; four
+//! suites were 24/24, while one was 23/24 when the untouched
+//! `close-agent-view-unavailable` returned `none`.
 //!
 //! [`VoiceOutcome::ParamAmbiguous`]: dot_agent_deck_desktop::voice::VoiceOutcome::ParamAmbiguous
 
@@ -209,6 +200,11 @@ async fn voice_phrase_fixtures_match_the_default_backend() {
         ),
         role_agent_in_state("agent-reviewer", "reviewer", "working"),
     ];
+    let mut atlas_one = role_agent_in_state("agent-atlas-one", "coder", "working");
+    atlas_one.display_name = Some("Atlas".to_string());
+    let mut atlas_two = role_agent_in_state("agent-atlas-two", "coder", "working");
+    atlas_two.display_name = Some("Atlas".to_string());
+    let ambiguous_name_agents = vec![atlas_one, atlas_two];
     for fixture in &fixtures.fixtures {
         assert!(
             Screen::parse(&fixture.screen).is_some(),
@@ -290,9 +286,20 @@ async fn voice_phrase_fixtures_match_the_default_backend() {
         };
         let transcript = Transcript::new(&fixture.utterance);
         let started = Instant::now();
+        let fixture_agents = if fixture.name == "open-agent-ambiguous-name" {
+            &ambiguous_name_agents
+        } else {
+            &agents
+        };
         let resolved = tokio::time::timeout(
             REMOTE_TIMEOUT + PER_FIXTURE_GRACE,
-            handle_utterance(resolver.as_ref(), table(), screen, &agents, transcript),
+            handle_utterance(
+                resolver.as_ref(),
+                table(),
+                screen,
+                fixture_agents,
+                transcript,
+            ),
         )
         .await;
 
