@@ -60,9 +60,44 @@ pub const TOOL_NAME: &str = "run_deck_action";
 /// and merely moved the failure** to `open-deck-back` — the same outcome the
 /// PRD's 2026-09-20 prompt-variant sweep recorded for a different fixture,
 /// which is why this is a rule about ties rather than a rewrite of either row.
-/// It is scoped to ties on purpose: the six `unavailable` fixtures are cases
-/// where only one action fits the words, so the tie-break never applies to them
-/// and they stayed green.
+///
+/// # It is a heuristic that is usually right, and it has a counterexample in the tree
+///
+/// Read it as a useful bias, not as a rule that is simply true. This paragraph
+/// used to claim the latter, and to add that the `unavailable` fixtures were
+/// out of its reach because *"only one action fits the words"* — which is false
+/// of one of them, was false when it was written, and undersold how many there
+/// are (**eight**, not six).
+///
+/// `open-settings-deck-collision` is the counterexample. It says *"go back to
+/// settings"* on the **overview**. The right answer is `open_settings`, which
+/// is `callable: false` there; `open_deck` is `callable: true` and its own
+/// description claims *"On the agent overview a bare 'go back' or 'back' means
+/// THIS one"*. Those words fit more than one action and exactly one of the two
+/// is callable, so the tie-break as written points at `open_deck` — the wrong
+/// row. What keeps the fixture green is the word **bare** in that description,
+/// scoping its claim to the unqualified phrase. That word is load-bearing
+/// rather than decorative (`voice_table_the_go_back_claims_stay_scoped_to_the_bare_phrase`
+/// pins it), and a rewrite of either row's prose has to be measured against
+/// this fixture as well as against `close-agent-view-back`.
+///
+/// # The cause was addressed too, was measured, and lost
+///
+/// This patches a symptom. The defect is the first sentence of this section:
+/// nothing tells the model which screen it is on. Naming it — a
+/// `current_screen` key in [`super::prompt::state`], which is a fact rather
+/// than a rule of thumb — was built and measured on the 34-fixture table, four
+/// runs per cell, against a same-session baseline that scored **34/34 five
+/// times out of five** on the OpenAI default and **four out of four** on the
+/// Anthropic preset. It fixed `close-agent-view-back` and cost more than it
+/// bought: each of four wordings moved the failure somewhere else —
+/// `open-agent-isolate` or `close-agent-view-unavailable` on OpenAI,
+/// `open-agent-by-state` on Anthropic — and every cell scored below its
+/// baseline on both presets. It is not shipped, and the tie-break stayed. The
+/// per-run numbers are in `prds/802-desktop-voice-control.md`; this is the
+/// third prompt intervention on this branch to move a failure rather than
+/// remove one, which is the reason to reach for a fixture or a `description`
+/// before reaching for this paragraph.
 pub const TOOL_INSTRUCTIONS: &str = "Pick the deck action the user asked for. Pick exactly one. \
     Every action is listed whether or not it can run right now: `callable: false` \
     means it exists but the current screen cannot run it, and picking it is the \

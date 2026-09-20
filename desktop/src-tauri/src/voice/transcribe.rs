@@ -71,7 +71,7 @@ use crate::settings::{
 };
 
 use super::Transcript;
-use super::capture::Pcm16;
+use super::capture::{MIN_SPEECH, Pcm16, SPEECH_FLOOR, SPEECH_WINDOW, SpeechMeasure};
 
 /// How long the request gets before the attempt is abandoned.
 ///
@@ -83,25 +83,68 @@ use super::capture::Pcm16;
 /// sentence.
 pub const TRANSCRIBE_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// The detail on the backstop refusal in [`HttpTranscriber::run`].
+/// The measurement clause and the sentence for a segment that held no speech.
 ///
-/// Worded as a statement about the ROOM and not about the device. What it used
-/// to say was "the microphone heard nothing", which reads as a fault in the
-/// user's hardware and sent PRD #802's product owner looking for one; the
-/// microphone was working perfectly and nobody had spoken into it.
-const NOTHING_WAS_SAID: &str = "nothing was said";
-
-/// The sentence a user sees when a segment held no speech.
+/// # Two refusals, because there are two things to do about them
 ///
-/// Not a failure and not an instruction — the third thing, which is why
-/// [`TranscriptionOutcome::Silent`] exists rather than this being folded into
-/// either of the other two. Nothing is wrong: voice is on, the microphone is
-/// open, a noise ended a segment and there was nothing in it to transcribe. The
-/// second clause is what keeps that from reading as a stop, and it is true at
-/// the moment it is shown — the surface's cycle ends by listening again, and a
-/// user who has turned voice off never sees this because the outcome is
-/// abandoned with the rest of that cycle.
-const NOTHING_WAS_SAID_SENTENCE: &str = "Nothing was said — still listening.";
+/// This used to be one frozen string — *"Nothing was said — still listening."*
+/// — and PRD #802's product owner met it **with a real microphone, about words
+/// he had said**. Two things were wrong with it and only one of them was the
+/// gate. A sentence that says nothing was said tells the user they imagined
+/// speaking; it names no threshold, no measurement and nothing to do next, so
+/// the three causes it can have — a quiet input, a short utterance, or a bug —
+/// are indistinguishable from outside the app. The owner had no way to tell
+/// which he was looking at, and neither did anyone reading his report.
+///
+/// So the refusal is now a measurement, and [`SpeechMeasure`]'s two fields pick
+/// which of the two it is:
+///
+/// * **nothing ever crossed [`SPEECH_FLOOR`]** — the input is too quiet for
+///   this floor, and the user can act on that in a second by speaking up,
+///   moving closer or raising the device's level. The number is printed
+///   against the floor rather than described, because "quiet" is not
+///   actionable and *"reached 410 where 600 counts as speech"* is.
+/// * **it crossed the floor and there was not enough** — the audio was speech
+///   and the utterance was too short or too sparse. Saying it again, a little
+///   longer, is the fix.
+///
+/// Neither is phrased as a failure or as a fault in the user's hardware, which
+/// is the rule [`TranscriptionOutcome::Silent`] exists to keep: nothing is
+/// broken, voice is still on, and the microphone is still open.
+///
+/// The numbers go to the **user** rather than to a log because the only person
+/// who can answer *"is my microphone quiet?"* is the one holding it — and on
+/// the report this repo actually received, one refusal carrying these two
+/// numbers would have separated the gate's defect from the floor's in one
+/// utterance instead of a round trip.
+fn not_enough_speech(measure: SpeechMeasure) -> (String, String) {
+    if measure.peak_rms < SPEECH_FLOOR {
+        let detail = format!(
+            "too quiet — the loudest moment reached {} where {SPEECH_FLOOR} counts as speech",
+            measure.peak_rms
+        );
+        let sentence = format!(
+            "Too quiet to transcribe — the loudest moment reached {} where {SPEECH_FLOOR} counts \
+             as speech. Move closer or turn the input up; still listening.",
+            measure.peak_rms
+        );
+        return (detail, sentence);
+    }
+    let detail = format!(
+        "only {} ms of speech inside the loudest {} ms, where {} ms is needed",
+        measure.voiced.as_millis(),
+        SPEECH_WINDOW.as_millis(),
+        MIN_SPEECH.as_millis()
+    );
+    let sentence = format!(
+        "I did not hear enough to transcribe — {} ms of speech inside the loudest {} ms, where {} \
+         ms is needed. Say that again; still listening.",
+        measure.voiced.as_millis(),
+        SPEECH_WINDOW.as_millis(),
+        MIN_SPEECH.as_millis()
+    );
+    (detail, sentence)
+}
 
 /// Why a transcriber could not answer.
 ///
@@ -308,8 +351,9 @@ impl HttpTranscriber {
         // and a caller that went straight to it would otherwise post the audio.
         // Reported as a BACKEND failure rather than as a not-configured one: the
         // setup is fine, which is a different thing to do next.
-        if !audio.has_speech() {
-            return Err(TranscriptionError::Backend(NOTHING_WAS_SAID.into()));
+        let measure = audio.measure_speech();
+        if measure.voiced < MIN_SPEECH {
+            return Err(TranscriptionError::Backend(not_enough_speech(measure).0));
         }
 
         // Read at call time, Rust-side, and dropped with this scope — and on
@@ -674,16 +718,23 @@ pub enum TranscriptionOutcome {
     ///
     /// **Not a failure either, and the distinction is the whole of the fix PRD
     /// #802's product owner asked for.** A noise ends a segment
-    /// ([`super::Vad`] flips on one frame over the floor) far more often than a
-    /// sentence does, and what arrives here is then thirty seconds of a quiet
-    /// room. Transcribing it is worse than useless: whisper-family models emit
-    /// their captioned-video training artefacts on near-silence, so the report
-    /// said the app had heard "Don't forget to subscribe".
+    /// ([`super::Vad::heard_speech`] flips on one frame over the floor) far
+    /// more often than a sentence does, and what arrives here is then thirty
+    /// seconds of a quiet room. Transcribing it is worse than useless:
+    /// whisper-family models emit their captioned-video training artefacts on
+    /// near-silence, so the report said the app had heard "Don't forget to
+    /// subscribe".
     ///
-    /// It carries no `detail`, unlike the two below, because there is nothing
-    /// to diagnose — this is the ordinary outcome of a quiet room and it must
-    /// not be dressed up as a diagnosis of one.
-    Silent { sentence: String },
+    /// **It carries a `detail` and it used to carry none**, on the argument
+    /// that "there is nothing to diagnose — this is the ordinary outcome of a
+    /// quiet room". That argument was wrong in the case that matters. This is
+    /// also what a user sees when they *did* speak and the audio did not clear
+    /// the gate, and then it is the only thing standing between them and a
+    /// feature that looks broken for a reason nobody can name. The `detail` is
+    /// the measurement [`not_enough_speech`] renders, and it is a statement
+    /// about the AUDIO — never about the device, which is the rule that has not
+    /// changed.
+    Silent { detail: String, sentence: String },
     /// Speech could not be turned into text.
     Failed { detail: String, sentence: String },
 }
@@ -693,7 +744,7 @@ impl TranscriptionOutcome {
         match self {
             TranscriptionOutcome::Heard { sentence, .. }
             | TranscriptionOutcome::NotConfigured { sentence, .. }
-            | TranscriptionOutcome::Silent { sentence }
+            | TranscriptionOutcome::Silent { sentence, .. }
             | TranscriptionOutcome::Failed { sentence, .. } => sentence,
         }
     }
@@ -724,11 +775,11 @@ pub async fn handle_audio(transcriber: &dyn Transcriber, audio: &Pcm16) -> Voice
     // `transcribe_ms` is `None` for [`VoiceTranscription::transcribe_ms`]'s own
     // rule — no call was made, and a number here would claim a measurement
     // nobody took — while `backend` still names what would have answered.
-    if !audio.has_speech() {
+    let measure = audio.measure_speech();
+    if measure.voiced < MIN_SPEECH {
+        let (detail, sentence) = not_enough_speech(measure);
         return VoiceTranscription {
-            outcome: TranscriptionOutcome::Silent {
-                sentence: NOTHING_WAS_SAID_SENTENCE.to_string(),
-            },
+            outcome: TranscriptionOutcome::Silent { detail, sentence },
             transcribe_ms: None,
             backend,
             audio_ms,
@@ -1376,15 +1427,22 @@ mod tests {
             .transcribe(&Pcm16::new(vec![0; 16_000]))
             .await
             .expect_err("fails");
+        // Digital zero, so the refusal is the LEVEL one and it names the floor
+        // it measured against rather than asserting the room was quiet.
         assert!(
-            matches!(&error, TranscriptionError::Backend(detail) if detail == NOTHING_WAS_SAID),
+            matches!(&error, TranscriptionError::Backend(detail) if detail.contains("too quiet")),
             "got {error:?}"
+        );
+        assert!(
+            error.detail().contains(&SPEECH_FLOOR.to_string()),
+            "the refusal names no floor to compare against: {}",
+            error.detail()
         );
         let error = transcriber
             .transcribe(&Pcm16::new(Vec::new()))
             .await
             .expect_err("fails");
-        assert_eq!(error.detail(), NOTHING_WAS_SAID);
+        assert!(error.detail().contains("too quiet"), "{}", error.detail());
     }
 
     /// The defect PRD #802's product owner met: a buffer of room tone with one
@@ -1406,7 +1464,19 @@ mod tests {
             .transcribe(&audio)
             .await
             .expect_err("a room with one tap in it is not an utterance");
-        assert_eq!(error.detail(), NOTHING_WAS_SAID);
+        // The LENGTH branch, not the level one: a full-scale sample puts its
+        // own frame's RMS well over `SPEECH_FLOOR`, so the honest refusal is
+        // that there was 20 ms of it and not that the room was quiet.
+        assert!(
+            error.detail().contains("of speech inside the loudest"),
+            "got {}",
+            error.detail()
+        );
+        assert!(
+            !error.detail().contains("too quiet"),
+            "a tap at full scale reported as too quiet: {}",
+            error.detail()
+        );
     }
 
     /// The same buffer through the gate every backend sits behind: no call, no
@@ -1434,7 +1504,34 @@ mod tests {
             "nothing goes on to the resolver"
         );
         assert_eq!(result.transcript(), None);
-        assert_eq!(result.sentence(), "Nothing was said — still listening.");
+        // The sentence a user actually reads. It used to be "Nothing was
+        // said", which tells somebody who DID speak that they imagined it; the
+        // measurement is what lets them tell a quiet microphone from a short
+        // utterance from a bug.
+        assert!(
+            result
+                .sentence()
+                .starts_with("I did not hear enough to transcribe"),
+            "{}",
+            result.sentence()
+        );
+        assert!(
+            result.sentence().contains("still listening"),
+            "the refusal must not read as a stop: {}",
+            result.sentence()
+        );
+        assert!(
+            result
+                .sentence()
+                .contains("20 ms of speech inside the loudest 200 ms"),
+            "the refusal carries no measurement: {}",
+            result.sentence()
+        );
+        assert!(
+            !result.sentence().contains("Nothing was said"),
+            "{}",
+            result.sentence()
+        );
         // Not a failure and not a fault in the user's hardware, which is the
         // whole reason this is a fourth variant rather than a `Failed`.
         assert!(
@@ -1475,15 +1572,94 @@ mod tests {
 
     #[test]
     fn voice_transcribe_silence_serializes_a_kind_the_webview_reads() {
-        let silent = TranscriptionOutcome::Silent {
-            sentence: NOTHING_WAS_SAID_SENTENCE.to_string(),
-        };
+        let (detail, sentence) = not_enough_speech(SpeechMeasure {
+            voiced: Duration::from_millis(40),
+            peak_rms: 5_000,
+        });
+        let silent = TranscriptionOutcome::Silent { detail, sentence };
         let json = serde_json::to_value(&silent).expect("serializes");
         assert_eq!(json["kind"], "silent");
-        assert_eq!(json["sentence"], NOTHING_WAS_SAID_SENTENCE);
-        // No `detail`: there is nothing to diagnose, and a field named for a
-        // diagnosis is how this would drift back into reading as a failure.
-        assert!(json.get("detail").is_none(), "{json}");
+        // `detail` is carried and the webview's union declares it. It used to
+        // be absent on the argument that there was nothing to diagnose — see
+        // `TranscriptionOutcome::Silent` for why that stopped being true.
+        assert_eq!(
+            json["detail"],
+            "only 40 ms of speech inside the loudest 200 ms, where 120 ms is needed"
+        );
+        assert!(
+            json["sentence"]
+                .as_str()
+                .expect("a sentence")
+                .starts_with("I did not hear enough"),
+            "{json}"
+        );
+    }
+
+    /// The two refusals, pinned as the two different things a user has to DO.
+    ///
+    /// The branch is on whether anything crossed [`SPEECH_FLOOR`], because that
+    /// is what separates "your input is too quiet for this floor" from "that
+    /// was speech and there was not enough of it" — and PRD #802's product
+    /// owner had neither number.
+    #[test]
+    fn voice_transcribe_the_refusal_names_which_of_the_two_causes_it_was() {
+        let (detail, sentence) = not_enough_speech(SpeechMeasure {
+            voiced: Duration::ZERO,
+            peak_rms: 410,
+        });
+        assert_eq!(
+            detail,
+            "too quiet — the loudest moment reached 410 where 600 counts as speech"
+        );
+        assert!(
+            sentence.contains("Move closer or turn the input up"),
+            "{sentence}"
+        );
+        assert!(sentence.contains("still listening"), "{sentence}");
+
+        let (detail, sentence) = not_enough_speech(SpeechMeasure {
+            voiced: Duration::from_millis(100),
+            peak_rms: 5_000,
+        });
+        assert_eq!(
+            detail,
+            "only 100 ms of speech inside the loudest 200 ms, where 120 ms is needed"
+        );
+        assert!(sentence.contains("Say that again"), "{sentence}");
+
+        // Exactly at the floor is the LENGTH branch, not the level one: a frame
+        // at `SPEECH_FLOOR` counts as speech everywhere else in this module.
+        let (detail, _) = not_enough_speech(SpeechMeasure {
+            voiced: Duration::ZERO,
+            peak_rms: SPEECH_FLOOR,
+        });
+        assert!(detail.starts_with("only 0 ms"), "{detail}");
+    }
+
+    /// Neither refusal blames the user's hardware, whichever branch it took.
+    ///
+    /// The rule `TranscriptionOutcome::Silent` exists to keep: the backstop's
+    /// detail used to read "the microphone heard nothing", which sent PRD
+    /// #802's product owner looking for a fault in a device that was working.
+    #[test]
+    fn voice_transcribe_neither_refusal_blames_the_device() {
+        for measure in [
+            SpeechMeasure {
+                voiced: Duration::ZERO,
+                peak_rms: 0,
+            },
+            SpeechMeasure {
+                voiced: Duration::from_millis(80),
+                peak_rms: 9_000,
+            },
+        ] {
+            let (detail, sentence) = not_enough_speech(measure);
+            for text in [&detail, &sentence] {
+                for banned in ["microphone", "Nothing was said", "failed", "error"] {
+                    assert!(!text.contains(banned), "`{banned}` in: {text}");
+                }
+            }
+        }
     }
 
     /// Scenario: the built code, on this build's own default settings, posts a

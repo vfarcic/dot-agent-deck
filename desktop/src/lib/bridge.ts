@@ -802,11 +802,19 @@ export interface VoiceStatusDto {
 export type VoiceTranscriptionOutcomeDto =
   | { kind: "heard"; transcript: string; sentence: string }
   | { kind: "not_configured"; detail: string; sentence: string }
-  | { kind: "silent"; sentence: string }
+  | { kind: "silent"; detail: string; sentence: string }
   | { kind: "failed"; detail: string; sentence: string };
 
 /**
  * One recording's transcription, plus what it cost
+ * **`silent` carries a `detail` and this comment used to say it carried none,
+ * "because there is nothing to diagnose".** PRD #802's product owner met that
+ * outcome with a real microphone, about words he had said, and its sentence
+ * named no threshold and no measurement — so a quiet input, a short utterance
+ * and a bug were indistinguishable from outside the app. The `detail` is the
+ * measurement behind the sentence (`voice::transcribe::not_enough_speech`) and
+ * is about the AUDIO, never about the device.
+ *
  * (`voice::VoiceTranscription`).
  *
  * The mirror of {@link VoiceResultDto} for the stage in front of it: a user who

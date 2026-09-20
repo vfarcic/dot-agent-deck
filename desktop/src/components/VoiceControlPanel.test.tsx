@@ -286,7 +286,7 @@ const TRANSCRIPTION_OUTCOMES: Array<{ name: string; outcome: VoiceTranscriptionO
   // segment of room tone must cost nothing at all.
   {
     name: "silent",
-    outcome: { kind: "silent", sentence: "Nothing was said — still listening." },
+    outcome: { kind: "silent", detail: "only 40 ms of speech inside the loudest 200 ms, where 120 ms is needed", sentence: "I did not hear enough to transcribe — 40 ms of speech inside the loudest 200 ms, where 120 ms is needed. Say that again; still listening." },
   },
 ];
 
@@ -384,12 +384,12 @@ describe("voice control panel", () => {
 
   /**
    * Scenario: a segment of room tone with a noise in it comes back `silent`.
-   * The row says nothing was said, keeps listening, and spends no resolver call
-   * — and it never blames the user's microphone.
+   * The row prints the measurement behind the refusal, keeps listening, and
+   * spends no resolver call — and it never blames the user's microphone.
    */
   it("reports a segment with no speech in it without calling the resolver", async () => {
     vi.useFakeTimers();
-    const voice = automaticVoice({ kind: "silent", sentence: "Nothing was said — still listening." });
+    const voice = automaticVoice({ kind: "silent", detail: "only 40 ms of speech inside the loudest 200 ms, where 120 ms is needed", sentence: "I did not hear enough to transcribe — 40 ms of speech inside the loudest 200 ms, where 120 ms is needed. Say that again; still listening." });
     const resolveVoice = resolver(result(DISPATCH));
     render(<DeckShell runtime={runtime(resolveVoice, voice)} />);
 
@@ -397,7 +397,13 @@ describe("voice control panel", () => {
     await completeAutomaticUtterance(voice);
 
     const report = screen.getByTestId("voice-report");
-    expect(report).toHaveTextContent("Nothing was said");
+    // The measurement, not "Nothing was said" — a user who DID speak has to be
+    // able to tell a quiet input from a short utterance from a bug, and the
+    // old wording told them they had imagined speaking (PRD #802).
+    expect(report).toHaveTextContent("I did not hear enough to transcribe");
+    expect(report).toHaveTextContent("40 ms of speech inside the loudest 200 ms");
+    expect(report).toHaveTextContent("still listening");
+    expect(report).not.toHaveTextContent(/nothing was said/i);
     // The two readings the wording exists to avoid: a failure, and a fault in
     // hardware that is working perfectly.
     expect(report).not.toHaveTextContent(/could not/i);

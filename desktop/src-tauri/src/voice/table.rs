@@ -844,6 +844,33 @@ mod tests {
     }
 
     #[test]
+    fn voice_table_the_go_back_claims_stay_scoped_to_the_bare_phrase() {
+        // Two rows claim the phrase "go back" for their own screen, and each
+        // scopes its claim to the BARE form with the word `bare`. That word is
+        // what keeps `open-settings-deck-collision` — "go back to settings" on
+        // the overview, where the answer is the NOT-callable `open_settings` —
+        // out of the callability tie-break's reach, since `open_deck` is
+        // callable there and claims the phrase (see `schema::TOOL_INSTRUCTIONS`).
+        //
+        // Pinned here rather than left to the phrase fixtures because those
+        // need a credential and run in no CI, so dropping the word would go
+        // unnoticed until somebody next spent a key on the suite.
+        for id in ["open_deck", "close_agent_view"] {
+            let row = super::table().row(id).expect("a shipped row");
+            assert!(
+                row.description.contains("\"go back\""),
+                "`{id}` stopped claiming the phrase: {}",
+                row.description
+            );
+            assert!(
+                row.description.contains("bare \"go back\""),
+                "`{id}` claims \"go back\" unscoped — the word `bare` is what keeps                  open-settings-deck-collision off the tie-break: {}",
+                row.description
+            );
+        }
+    }
+
+    #[test]
     fn voice_table_callable_per_screen_for_the_shipped_rows() {
         let table = super::table();
         let callable = |screen: Screen| {
