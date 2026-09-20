@@ -371,7 +371,7 @@ export const desktop = {
  *
  * This pass moved two and dropped two:
  *
- * - Row 02 ("Watch every one of them") now carries `busy-deck.png` instead of
+ * - Row 02 ("Watch every one of them") now carries `busy-deck.webp` instead of
  *   `session-management-card.jpg`. The row argues both "every pane gets a
  *   card" and "the cards tighten up rather than make you scroll", and a frame
  *   of ONE card could only ever show the first half of that. The new capture
@@ -417,7 +417,7 @@ export const screenshots = {
       'The form Ctrl+n opens once the directory is picked. The Mode row is where the choice is made — this directory defines no orchestrations of its own, so it offers the built-in options only.',
   },
   deck: {
-    src: '/img/busy-deck.png',
+    src: '/img/busy-deck.webp',
     alt: 'A deck with five tabs open — Dashboard, checkout, web, observability and storefront — and nine agent cards stacked down the sidebar, running Pi, Claude Code, OpenCode and Codex and marked Thinking, Working or Idle, each with its directory, last prompt and current tool, beside the focused coordinator pane tracking eight workstreams',
     caption:
       'Nine agents at once, on four different agent clients, with five tabs open above them. Every card carries its own status, directory, last prompt and current tool, and the footer keeps the count: 9 active, 3 working, 3 thinking, 3 idle.',

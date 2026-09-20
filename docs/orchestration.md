@@ -53,7 +53,7 @@ Delegation signals travel through the daemon: no messages are lost if you detach
 
 ## Quick setup
 
-<img src="./img/orchestration-generate-dialog.png" align="right" width="420" style={{marginLeft: '1.5rem', marginBottom: '1rem'}} alt="The Generate .dot-agent-deck.toml dialog with Yes / No / Never options" />
+<img src="/img/orchestration-generate-dialog.png" align="right" width="420" style={{marginLeft: '1.5rem', marginBottom: '1rem'}} alt="The Generate .dot-agent-deck.toml dialog with Yes / No / Never options" />
 
 The fastest way to get an orchestration config is to let an agent generate it from your project.
 
