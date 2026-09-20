@@ -146,14 +146,26 @@ pub const WAKE_WHY: &str = "Voice control is on";
 /// [`crate::voice::VoiceHold`] exists to arrange.
 pub struct WakeLock {
     inhibitor: Arc<dyn SleepInhibitor>,
-    /// The live hold, or `None` for *not currently holding* — which covers both
-    /// *voice is off* and *the machine refused*, deliberately: nothing
-    /// downstream treats those differently.
-    held: Mutex<Option<Box<dyn SleepInhibit>>>,
+    state: Mutex<LockState>,
     /// Whether a refusal has already been logged by this lock. See the module
     /// docs — `hold` runs once per utterance, so an unlatched line would be one
     /// per sentence spoken on a machine that cannot grant the inhibit.
     reported: AtomicBool,
+}
+
+/// Everything the lock guards, so that acquiring can happen OUTSIDE the guard.
+#[derive(Default)]
+struct LockState {
+    /// The live hold, or `None` for *not currently holding* — which covers both
+    /// *voice is off* and *the machine refused*, deliberately: nothing
+    /// downstream treats those differently.
+    held: Option<Box<dyn SleepInhibit>>,
+    /// Bumped by every release and by the start of every acquisition, so an
+    /// acquisition that finishes **after** a release can tell that it did.
+    generation: u64,
+    /// The generation currently being acquired, if any. Present means *the
+    /// platform is being asked right now*, which is neither held nor free.
+    acquiring: Option<u64>,
 }
 
 impl WakeLock {
@@ -165,13 +177,13 @@ impl WakeLock {
     pub fn new(inhibitor: Arc<dyn SleepInhibitor>) -> Self {
         Self {
             inhibitor,
-            held: Mutex::new(None),
+            state: Mutex::new(LockState::default()),
             reported: AtomicBool::new(false),
         }
     }
 
-    fn held(&self) -> std::sync::MutexGuard<'_, Option<Box<dyn SleepInhibit>>> {
-        self.held
+    fn state(&self) -> std::sync::MutexGuard<'_, LockState> {
+        self.state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
@@ -185,19 +197,72 @@ impl WakeLock {
     /// acquisition would be a second inhibitor registered against this process
     /// for the same reason.
     ///
-    /// The acquisition runs under the lock. That is a D-Bus round trip on Linux
-    /// — a few milliseconds — on a call path that is already opening an audio
-    /// device, and holding the lock across it is what makes two concurrent
-    /// `hold`s impossible to interleave into two inhibits.
+    /// # The platform is asked with the lock NOT held, and that is a fix rather
+    /// than a style
+    ///
+    /// The first version of this asked for the inhibit with the mutex held,
+    /// reasoning that it made two concurrent `hold`s impossible to interleave.
+    /// It also made [`WakeLock::release`] wait on the platform — and the two
+    /// run on different threads by construction, because `hold` is reached
+    /// from `desktop_voice_start`'s `spawn_blocking` and `release` from
+    /// `desktop_voice_cancel`'s. A system bus that accepted the connection and
+    /// then never answered would therefore have wedged the *release* too, and a
+    /// release that cannot run is a **microphone that cannot be closed** — the
+    /// exact defect PRD #802's audit blocker was about, reintroduced by the
+    /// thing meant to sit beside it.
+    ///
+    /// So the acquisition happens outside the guard, and a **reservation**
+    /// orders it against a release instead. It is the same device
+    /// [`crate::voice::CaptureSession`] uses for the same reason — read
+    /// `SessionInner::opening`'s doc comment, which is this one for the
+    /// microphone: an operation that outlives the decision to abandon it must
+    /// be able to tell that it did. A release bumps the generation, so an
+    /// acquisition that lands afterwards finds its own reservation stale and
+    /// **drops the hold it was given** rather than installing it against a
+    /// voice session that is over.
+    ///
+    /// Concurrency is still exact: `acquiring` is neither held nor free, so a
+    /// second `hold` while one is in flight returns without asking the platform
+    /// a second time.
+    ///
+    /// Measured on this project's dev box, warm: **2.3–4.0 ms** to acquire (the
+    /// first call carries the system-bus connection) and **4–42 µs** to
+    /// release, against a call path that is already opening an audio device.
     pub fn hold(&self) {
-        let mut held = self.held();
-        if held.is_some() {
-            return;
-        }
+        let mine = {
+            let mut state = self.state();
+            if state.held.is_some() || state.acquiring.is_some() {
+                return;
+            }
+            state.generation += 1;
+            let mine = state.generation;
+            state.acquiring = Some(mine);
+            mine
+        };
+
         match self.inhibitor.inhibit() {
-            Ok(hold) => *held = Some(hold),
+            Ok(hold) => {
+                let mut state = self.state();
+                if state.generation != mine {
+                    // Voice was switched off while the platform was answering.
+                    // Dropped outside the guard, like every other release here.
+                    drop(state);
+                    drop(hold);
+                    return;
+                }
+                state.acquiring = None;
+                state.held = Some(hold);
+            }
             Err(reason) => {
-                drop(held);
+                {
+                    let mut state = self.state();
+                    // Only if this reservation is still the live one: a release
+                    // has already cleared it otherwise, and a later `hold` may
+                    // have taken a new one.
+                    if state.generation == mine {
+                        state.acquiring = None;
+                    }
+                }
                 // Once per process. See the field's doc comment.
                 if !self.reported.swap(true, Ordering::Relaxed) {
                     eprintln!(
@@ -217,10 +282,20 @@ impl WakeLock {
     /// audio stream: releasing is a platform call — on Windows it joins a
     /// thread — and running it with a mutex held is how an unrelated caller
     /// ends up parked behind the operating system.
+    ///
+    /// **This never waits on an acquisition**, which is the property that keeps
+    /// a wedged system bus from turning into a microphone nobody can close.
+    /// See [`WakeLock::hold`] for the reservation that makes it safe to bump
+    /// the generation and walk away while the platform is still answering.
     pub fn release(&self) {
-        let mut guard = self.held();
-        let hold = guard.take();
-        drop(guard);
+        let hold = {
+            let mut state = self.state();
+            // Ahead of the take, because it is also what tells an acquisition
+            // still in flight that the session it belongs to is over.
+            state.generation += 1;
+            state.acquiring = None;
+            state.held.take()
+        };
         drop(hold);
     }
 
@@ -230,7 +305,7 @@ impl WakeLock {
     /// what makes it the honest answer to *is the machine being kept awake*
     /// rather than to *did we ask*.
     pub fn is_held(&self) -> bool {
-        self.held().is_some()
+        self.state().held.is_some()
     }
 }
 
@@ -260,6 +335,20 @@ mod logind {
     /// window. A delay inhibitor postpones a suspend by seconds; this needs it
     /// not to happen at all while voice is on.
     const MODE: &str = "block";
+
+    /// How long logind gets to answer before this is treated as a refusal.
+    ///
+    /// zbus's own default is **no timeout at all** (`method_timeout` is an
+    /// `Option` and is `None` unless set), and this call is made from the same
+    /// `spawn_blocking` that opened the microphone — so an unbounded one is a
+    /// press that never finishes. Two seconds is roughly **800x** the 2.4 ms
+    /// median measured on this project's dev box, so it cannot be tripped by a
+    /// loaded machine; a bus that has not answered by then is not going to.
+    ///
+    /// It bounds the *method call* and not the connection handshake in front of
+    /// it, which is why [`super::WakeLock::hold`]'s reservation is the real
+    /// containment rather than this.
+    const ANSWER_WITHIN: std::time::Duration = std::time::Duration::from_secs(2);
 
     pub struct Logind;
 
@@ -296,7 +385,9 @@ mod logind {
     /// system-bus connection would be a socket and a reader task held by an app
     /// that otherwise speaks to no bus at all.
     fn acquire() -> zbus::Result<OwnedFd> {
-        let bus = zbus::blocking::Connection::system()?;
+        let bus = zbus::blocking::connection::Builder::system()?
+            .method_timeout(ANSWER_WITHIN)
+            .build()?;
         let reply = bus.call_method(
             Some("org.freedesktop.login1"),
             "/org/freedesktop/login1",
@@ -761,6 +852,67 @@ mod tests {
         // ordinary teardown path, not an error case.
         lock.release();
         assert!(!lock.is_held());
+    }
+
+    /// The ordering guard, and the reason [`WakeLock::hold`] asks the platform
+    /// with the lock NOT held.
+    ///
+    /// A release that lands while the platform is still answering must leave
+    /// the machine free — the hold that arrives afterwards belongs to a voice
+    /// session that is over, and installing it would keep a laptop awake with
+    /// the button reading `Voice off`.
+    ///
+    /// Driven deterministically rather than with threads and sleeps: the
+    /// inhibitor itself performs the release, at exactly the instant the real
+    /// race would — inside the platform call, before the answer comes back.
+    #[test]
+    fn a_release_during_an_acquisition_leaves_the_machine_free() {
+        struct ReleasesMidCall {
+            counts: Arc<WakeCounts>,
+            target: Arc<std::sync::OnceLock<Arc<WakeLock>>>,
+        }
+
+        impl SleepInhibitor for ReleasesMidCall {
+            fn inhibit(&self) -> Result<Box<dyn SleepInhibit>, String> {
+                // Voice switched off while the platform was working.
+                self.target.get().expect("wired before the hold").release();
+                self.counts.acquired.fetch_add(1, Ordering::Relaxed);
+                Ok(Box::new(StubHold(Arc::clone(&self.counts))))
+            }
+
+            fn mechanism(&self) -> &'static str {
+                "stub that races a release"
+            }
+        }
+
+        let counts = Arc::new(WakeCounts::default());
+        let target = Arc::new(std::sync::OnceLock::new());
+        let lock = Arc::new(WakeLock::new(Arc::new(ReleasesMidCall {
+            counts: Arc::clone(&counts),
+            target: Arc::clone(&target),
+        })));
+        target.set(Arc::clone(&lock)).ok();
+
+        lock.hold();
+
+        assert!(
+            !lock.is_held(),
+            "a hold that arrives after its session ended must not be installed"
+        );
+        assert_eq!(
+            counts.outstanding(),
+            0,
+            "and must be given back rather than dropped on the floor"
+        );
+
+        // And the lock is not wedged: the next voice session works.
+        let plain = StubInhibitor::new();
+        let plain_counts = plain.counts();
+        let next = WakeLock::new(Arc::new(plain));
+        next.hold();
+        assert!(next.is_held());
+        assert_eq!(plain_counts.outstanding(), 1);
+        next.release();
     }
 
     /// The leak guard. A `WakeLock` that goes out of scope without a `release`
