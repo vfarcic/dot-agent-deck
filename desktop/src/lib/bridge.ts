@@ -472,22 +472,26 @@ const APPEARANCE_MODES: readonly AppearanceMode[] = ["system", "light", "dark"];
 export const VOICE_ACTIVATION_MODES = ["toggle"] as const;
 
 /**
- * Which backend resolves an utterance into an action (PRD #802 M5).
+ * Which WIRE PROTOCOL the command backend speaks (PRD #802 M5, reshaped by its
+ * provider work).
  *
- * One entry, because Commands is API-only. Keep identical to
+ * Commands is API-only, so these name a dialect rather than a transport: both
+ * are one HTTPS request to whatever endpoint the user gave, and what differs is
+ * the request body and where the answer is read from. Keep identical to
  * `IntentBackend::TOKENS` in `src-tauri/src/settings.rs`.
  *
- * Two agent-CLI backends were here and both were withdrawn. `opencode` went
- * first, in PRD #802's landed-work security audit: the agent-CLI backend had to
- * run its child with no tools, no hooks, no MCP, no project config and no
- * session on disk, and `opencode run` offers none of those switches. `claude`
- * — the shipped DEFAULT — went with the provider work, because a stage that
- * spends a credential has to let the user choose whose, and a subprocess has no
- * endpoint, model or key to choose. The Rust enum's doc comment has the
- * reasoning; its folding deserializer is why either token left in a settings
- * document loads as `remote` instead of failing.
+ * Two agent-CLI backends were here and both were withdrawn, plus the token
+ * `remote` that this pair replaced. `opencode` went first, in PRD #802's
+ * landed-work security audit: the agent-CLI backend had to run its child with
+ * no tools, no hooks, no MCP, no project config and no session on disk, and
+ * `opencode run` offers none of those switches. `claude` — the shipped DEFAULT
+ * — went with the provider work, because a stage that spends a credential has
+ * to let the user choose whose, and a subprocess has no endpoint, model or key
+ * to choose. The Rust enum's folding deserializer is why any of the three left
+ * in a settings document loads as `anthropic` instead of failing; for `remote`
+ * that also happens to be where it pointed.
  */
-export const VOICE_INTENT_BACKENDS = ["remote"] as const;
+export const VOICE_INTENT_BACKENDS = ["anthropic", "openai_compatible"] as const;
 
 /**
  * Which backend turns speech into text (PRD #802).
@@ -525,10 +529,15 @@ export const VOICE_STAGE_PRESETS: Record<"intent" | "transcription", Record<stri
     },
   },
   intent: {
-    remote: {
-      backend: "remote",
+    anthropic: {
+      backend: "anthropic",
       endpoint: "https://api.anthropic.com/v1/messages",
       model: "claude-haiku-4-5",
+    },
+    openai_compatible: {
+      backend: "openai_compatible",
+      endpoint: "https://api.openai.com/v1/chat/completions",
+      model: "gpt-4.1-mini",
     },
   },
 };
@@ -546,7 +555,7 @@ export const LOCAL_SPEECH_IMAGE = "ghcr.io/speaches-ai/speaches:0.9.0-rc.3-cpu";
 /** Mirrors `VoiceSettings::default()`; what an absent section renders as. */
 export const DEFAULT_VOICE_SETTINGS: VoiceSettingsDto = {
   activation: "toggle",
-  intent: VOICE_STAGE_PRESETS.intent.remote,
+  intent: VOICE_STAGE_PRESETS.intent.anthropic,
   transcription: VOICE_STAGE_PRESETS.transcription.local,
 };
 

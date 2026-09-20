@@ -1,5 +1,22 @@
-//! The keyed remote intent backend: one HTTPS request, tool-use, a constrained
-//! enum.
+//! The HTTP intent backend: one request, a constrained enum, two protocols.
+//!
+//! # One transport, two dialects
+//!
+//! PRD #802's provider work left Commands with a single transport and a real
+//! choice on top of it. This file owns the transport — the client, the
+//! credential, the body cap, the error classification — and the **Anthropic
+//! Messages** dialect, whose tool-use envelope the measurements below were made
+//! against. [`super::openai`] owns the **OpenAI-compatible chat-completions**
+//! dialect. [`Protocol`] is what selects one, and
+//! [`crate::settings::IntentBackend`] is where the user does.
+//!
+//! **Named `remote` for the transport it was born with, and the name is now
+//! narrower than the type.** The endpoint is a [`ServiceUrl`], which may be on
+//! this machine — and when it is, no credential is read or sent at all (see
+//! [`RemoteResolver::run`]). Pointing it at a local server is therefore the same
+//! code path as pointing it at a provider; PRD #802 ships no preset for that and
+//! recommends it nowhere, because local intent was measured twice and was not
+//! good enough.
 //!
 //! This was the answer to PRD #802's own risk entry — *the default intent
 //! backend is slow enough to feel broken*. Measured against the same command
@@ -109,8 +126,39 @@ const MAX_TOKENS: u32 = 256;
 /// sentence for a user who has already waited.
 pub const REMOTE_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// Resolve intent by asking a hosted model with a key of the app's own.
+/// Which wire dialect one request speaks.
+///
+/// A **protocol**, not a transport and not a vendor: both go over the same
+/// client to whatever [`ServiceUrl`] the user named, so this says how the
+/// request is shaped and how the reply is read, and nothing about where either
+/// travels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Protocol {
+    /// Anthropic Messages: one forced tool call, `strict: true`, the answer in
+    /// a `tool_use` block. This file's own request and response functions.
+    Anthropic,
+    /// OpenAI chat-completions: a nested `json_schema` response format,
+    /// `strict: true`, the answer as `choices[0].message.content`.
+    /// [`super::openai`] has it, and the shorthand it must not send.
+    OpenAiCompatible,
+}
+
+impl Protocol {
+    /// What the surface renders beside the latency.
+    ///
+    /// The **protocol**, which is what a user can act on — *remote, 0.9 s*
+    /// answers a question nobody asked once every backend is remote.
+    fn name(self) -> &'static str {
+        match self {
+            Self::Anthropic => "anthropic",
+            Self::OpenAiCompatible => "openai",
+        }
+    }
+}
+
+/// Resolve intent by asking a model over HTTP.
 pub struct RemoteResolver {
+    protocol: Protocol,
     secrets: Arc<dyn SecretStore>,
     /// `None` when no client could be built, which this backend reports as a
     /// failure rather than papering over — see [`super::http::client`].
@@ -120,15 +168,22 @@ pub struct RemoteResolver {
 }
 
 impl RemoteResolver {
-    /// Both coordinates are arguments rather than constants, which is the
+    /// All three coordinates are arguments rather than constants, which is the
     /// change PRD #802's provider work made here: the model used to be a
     /// `const` with a doc comment explaining that a settings field would offer
-    /// a choice whose only correct value this file knew. That was true of the
-    /// measurement and false of the product — a user cannot know which key to
-    /// paste when the endpoint is a secret of the build's, and cannot use a
-    /// provider this build did not pick.
-    pub fn new(secrets: Arc<dyn SecretStore>, endpoint: ServiceUrl, model: ModelId) -> Self {
+    /// a choice whose only correct value this file knew, and the protocol was
+    /// not a coordinate at all. That was true of the measurement and false of
+    /// the product — a user cannot know which key to paste when the endpoint is
+    /// a secret of the build's, and cannot use a provider this build did not
+    /// pick.
+    pub fn new(
+        protocol: Protocol,
+        secrets: Arc<dyn SecretStore>,
+        endpoint: ServiceUrl,
+        model: ModelId,
+    ) -> Self {
         Self {
+            protocol,
             secrets,
             // Built once and reused, which is how `reqwest` is meant to be
             // used: the connection pool and the TLS session cache live on the
@@ -155,23 +210,36 @@ impl RemoteResolver {
     }
 
     async fn run(&self, request: IntentRequest<'_>) -> Result<IntentAnswer, IntentError> {
-        // Read at call time, Rust-side, and dropped with this scope — and on
-        // a blocking thread, because a keychain read is entitled to prompt and
-        // this is an async fn on a shared runtime.
-        let secret = match load_off_runtime(Arc::clone(&self.secrets), SecretId::VoiceIntent).await
-        {
-            Ok(Some(secret)) => secret,
-            Ok(None) => {
-                return Err(IntentError::NotConfigured(format!(
-                    "no key is stored for {} — add one in Settings → Voice",
-                    self.endpoint.host()
-                )));
+        // **A loopback endpoint takes no credential, and the keychain is not
+        // consulted at all.** The same rule Speech has, reached by a different
+        // route: there the keyless choice is a backend token and the
+        // deserializer refuses to pair it with an off-machine endpoint, because
+        // the hazard is an upload with no key on it. Here the two choices are a
+        // PROTOCOL choice, so the endpoint is what decides — a server on this
+        // machine is one the user started, it has no notion of a key, and
+        // handing it theirs is a thing to not do rather than a thing to make
+        // work. "No key was asked for" rather than "no key was found", which is
+        // the distinction `HttpTranscriber::keyless` spells out at length.
+        let secret = if self.endpoint.is_loopback() {
+            None
+        } else {
+            // Read at call time, Rust-side, and dropped with this scope — and
+            // on a blocking thread, because a keychain read is entitled to
+            // prompt and this is an async fn on a shared runtime.
+            match load_off_runtime(Arc::clone(&self.secrets), SecretId::VoiceIntent).await {
+                Ok(Some(secret)) => Some(secret),
+                Ok(None) => {
+                    return Err(IntentError::NotConfigured(format!(
+                        "no key is stored for {} — add one in Settings → Voice",
+                        self.endpoint.host()
+                    )));
+                }
+                // The keychain itself failed. `SecretError::public` is already
+                // a complete sentence naming what did not happen, which is the
+                // whole point of PRD #802 M4's refusal to report a failed read
+                // as "nothing stored".
+                Err(error) => return Err(IntentError::NotConfigured(error.public())),
             }
-            // The keychain itself failed. `SecretError::public` is already a
-            // complete sentence naming what did not happen, which is the whole
-            // point of PRD #802 M4's refusal to report a failed read as
-            // "nothing stored".
-            Err(error) => return Err(IntentError::NotConfigured(error.public())),
         };
 
         let Some(client) = self.client.as_ref() else {
@@ -182,13 +250,29 @@ impl RemoteResolver {
             ));
         };
 
-        let body = request_body(&request, self.model.as_str());
-        let response = client
+        let body = match self.protocol {
+            Protocol::Anthropic => request_body(&request, self.model.as_str()),
+            Protocol::OpenAiCompatible => {
+                super::openai::request_body(&request, self.model.as_str())
+            }
+        };
+        let mut post = client
             .post(self.endpoint.as_str())
             .timeout(REMOTE_TIMEOUT)
-            .header("content-type", "application/json")
-            .header("anthropic-version", API_VERSION)
-            .header("x-api-key", secret.expose())
+            .header("content-type", "application/json");
+        // The credential's header is the protocol's, and an absent one is a
+        // loopback endpoint: no header of either shape goes out.
+        if let Some(secret) = &secret {
+            post = match self.protocol {
+                Protocol::Anthropic => post
+                    .header("anthropic-version", API_VERSION)
+                    .header("x-api-key", secret.expose()),
+                Protocol::OpenAiCompatible => {
+                    post.header("authorization", format!("Bearer {}", secret.expose()))
+                }
+            };
+        }
+        let response = post
             .json(&body)
             .send()
             .await
@@ -220,7 +304,10 @@ impl RemoteResolver {
         if !status.is_success() {
             return Err(IntentError::Backend(api_error_detail(status, &payload)));
         }
-        parse_response(&payload)
+        match self.protocol {
+            Protocol::Anthropic => parse_response(&payload),
+            Protocol::OpenAiCompatible => super::openai::parse_response(&payload),
+        }
     }
 }
 
@@ -230,7 +317,7 @@ impl IntentResolver for RemoteResolver {
     }
 
     fn backend_name(&self) -> &'static str {
-        "remote"
+        self.protocol.name()
     }
 }
 
@@ -414,9 +501,14 @@ mod tests {
     /// A keyed resolver pointed somewhere unroutable on purpose: reaching it
     /// would be a failure of the test's premise, not a flake.
     fn resolver(secrets: Arc<dyn SecretStore>) -> RemoteResolver {
+        resolver_at(secrets, "https://voice-intent.invalid/never")
+    }
+
+    fn resolver_at(secrets: Arc<dyn SecretStore>, endpoint: &str) -> RemoteResolver {
         RemoteResolver::new(
+            Protocol::Anthropic,
             secrets,
-            ServiceUrl::parse("https://voice-intent.invalid/never").expect("valid"),
+            ServiceUrl::parse(endpoint).expect("valid"),
             ModelId::parse(HOSTED_COMMAND_MODEL).expect("valid"),
         )
     }
@@ -717,10 +809,61 @@ mod tests {
     }
 
     #[test]
-    fn voice_remote_names_itself_for_the_surface() {
+    fn voice_remote_names_the_protocol_for_the_surface() {
+        // The PROTOCOL, not the transport: it is rendered beside the latency,
+        // and `remote, 0.9 s` says nothing actionable once every backend is
+        // remote.
         assert_eq!(
             resolver(Arc::new(MemorySecretStore::new())).backend_name(),
-            "remote"
+            "anthropic"
+        );
+        assert_eq!(
+            RemoteResolver::new(
+                Protocol::OpenAiCompatible,
+                Arc::new(MemorySecretStore::new()),
+                ServiceUrl::parse("https://voice-intent.invalid/never").expect("valid"),
+                ModelId::parse(HOSTED_COMMAND_MODEL).expect("valid"),
+            )
+            .backend_name(),
+            "openai"
+        );
+    }
+
+    /// Scenario: resolve one utterance against a LOOPBACK endpoint with a
+    /// keychain that records whether it was read. It was not.
+    ///
+    /// A server on this machine is one the user started and has no notion of a
+    /// key, so the rule is *no key is asked for* rather than *no key was
+    /// found* — the same distinction `HttpTranscriber::keyless` draws, reached
+    /// from the endpoint rather than from a backend token. Asserted as an
+    /// identity rather than through the answer, because the observable
+    /// difference is which store call happened.
+    #[tokio::test]
+    async fn voice_remote_asks_for_no_key_when_the_endpoint_is_on_this_machine() {
+        let store = Arc::new(ThreadRecordingStore::new());
+        // Port 1 on loopback: nothing listens there, so this fails in the
+        // transport — AFTER the credential decision, which is the point.
+        let resolver = resolver_at(
+            Arc::clone(&store) as Arc<dyn SecretStore>,
+            "http://127.0.0.1:1/v1/messages",
+        );
+        let commands = commands();
+        let transcript = Transcript::new("show me the tester");
+        let error = resolver
+            .resolve(IntentRequest {
+                transcript: &transcript,
+                commands: &commands,
+                agents: &[],
+            })
+            .await
+            .expect_err("nothing is listening on port 1");
+        assert!(
+            matches!(&error, IntentError::Backend(_)),
+            "a loopback endpoint must reach the transport, not stop at the credential: {error:?}"
+        );
+        assert!(
+            store.read_on().is_none(),
+            "the keychain was consulted for a loopback endpoint"
         );
     }
 

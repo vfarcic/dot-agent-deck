@@ -44,11 +44,43 @@ pub struct IntentRequest<'a> {
 /// The params are **unresolved** on purpose — `"tester"`, not an agent id. The
 /// app owns resolution against live state, so a backend cannot assert that an
 /// agent exists.
+///
+/// # A `null` param is an ABSENT param, and that is forced rather than lenient
+///
+/// OpenAI's strict structured outputs refuse a schema where a declared property
+/// is not in `required`, so [`super::openai::response_schema`] cannot leave a
+/// param optional the way a tool-use schema can: it enumerates every param the
+/// table declares, requires all of them, and types each as `["string", "null"]`
+/// — the documented way to spell *optional* under strict mode. The model is
+/// therefore obliged to name a param the chosen action does not take, and the
+/// only thing it can honestly say about it is `null`.
+///
+/// Dropping those here is what keeps that a detail of one envelope. A `null`
+/// arriving as an empty string would resolve against nothing and render
+/// `no agent here matches ""`; arriving as absent, it is
+/// [`super::VoiceOutcome::ParamMissing`], which is the same sentence the other
+/// protocol produces for the same situation.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct IntentAnswer {
     pub action: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "params_without_nulls")]
     pub params: BTreeMap<String, String>,
+}
+
+/// [`IntentAnswer::params`], with the `null`s a strict schema forces removed.
+///
+/// A non-string, non-null value is still an error — `{"agent": 7}` is a backend
+/// that did not honour the schema, and reading it as absent would turn a
+/// malformed reply into a sentence blaming the user's phrasing.
+fn params_without_nulls<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<BTreeMap<String, String>, D::Error> {
+    Ok(
+        BTreeMap::<String, Option<String>>::deserialize(deserializer)?
+            .into_iter()
+            .filter_map(|(name, value)| value.map(|value| (name, value)))
+            .collect(),
+    )
 }
 
 impl IntentAnswer {
@@ -125,7 +157,8 @@ pub trait IntentResolver: Send + Sync {
 
     /// Which backend this is, for the surface to name.
     ///
-    /// One of `remote`, `stub`. It travels on every [`super::VoiceResult`]
+    /// One of `anthropic`, `openai`, `stub`. It travels on every
+    /// [`super::VoiceResult`]
     /// beside the latency, because the two are only useful together: *4.2 s* on
     /// its own is a complaint, and a name beside it is a reason to change
     /// something. It is a `&'static str` and not the settings enum so a backend
@@ -150,23 +183,27 @@ pub trait IntentResolver: Send + Sync {
 /// constants in [`super::remote`] — PRD #802's provider work, and the reason
 /// every coordinate a user can choose is read here rather than compiled in.
 ///
-/// **One arm today, and the `match` stays.** The agent-CLI variant was the
-/// other one and is gone; writing this as a bare constructor would make adding
-/// the next backend a change to the function's shape rather than a line, and
-/// the exhaustive `match` is what makes a new `IntentBackend` variant with no
-/// adapter a compile error instead of a settings value the app cannot honour.
+/// **The settings token is a PROTOCOL, and this is where that becomes one.**
+/// Both arms build the same resolver over the same transport; what differs is
+/// the dialect it speaks. An exhaustive `match` is what makes a new
+/// `IntentBackend` variant with no adapter a compile error instead of a
+/// settings value the app cannot honour.
 pub fn resolver_for(
     settings: &crate::settings::IntentSettings,
     secrets: std::sync::Arc<dyn crate::secrets::SecretStore>,
 ) -> Box<dyn IntentResolver> {
+    use super::remote::Protocol;
     use crate::settings::IntentBackend;
-    match settings.backend {
-        IntentBackend::Remote => Box::new(super::remote::RemoteResolver::new(
-            secrets,
-            settings.endpoint.clone(),
-            settings.model.clone(),
-        )),
-    }
+    let protocol = match settings.backend {
+        IntentBackend::Anthropic => Protocol::Anthropic,
+        IntentBackend::OpenaiCompatible => Protocol::OpenAiCompatible,
+    };
+    Box::new(super::remote::RemoteResolver::new(
+        protocol,
+        secrets,
+        settings.endpoint.clone(),
+        settings.model.clone(),
+    ))
 }
 
 /// A deterministic stand-in for a model.
@@ -318,8 +355,12 @@ mod tests {
         // asserts the thing a user would see rather than a type the compiler
         // already knows.
         assert_eq!(
-            resolver_for(&stage(IntentBackend::Remote), store()).backend_name(),
-            "remote"
+            resolver_for(&stage(IntentBackend::Anthropic), store()).backend_name(),
+            "anthropic"
+        );
+        assert_eq!(
+            resolver_for(&stage(IntentBackend::OpenaiCompatible), store()).backend_name(),
+            "openai"
         );
     }
 
@@ -331,7 +372,7 @@ mod tests {
         // is exhaustive, so the compiler catches it — this asserts the set is
         // the one that was mapped, which the compiler cannot.
         use crate::settings::IntentBackend;
-        let names: Vec<&str> = [IntentBackend::Remote]
+        let names: Vec<&str> = [IntentBackend::Anthropic, IntentBackend::OpenaiCompatible]
             .into_iter()
             .map(|backend| {
                 resolver_for(
@@ -341,11 +382,13 @@ mod tests {
                 .backend_name()
             })
             .collect();
-        assert_eq!(names, vec!["remote"]);
-        // Every token the settings can hold has an adapter above. The count is
-        // pinned on the settings side by `the_voice_tokens_match_the_frontends_copy`;
-        // this side pins that the mapping covers it.
-        assert_eq!(names.len(), 1);
+        assert_eq!(names, vec!["anthropic", "openai"]);
+        // Every token the settings can hold has an adapter above. The token set
+        // is pinned on the settings side by
+        // `the_voice_tokens_match_the_frontends_copy`; this side pins that the
+        // mapping covers it — and that the two do NOT collapse to one name,
+        // which is what a `Protocol` wired to the wrong arm would look like.
+        assert_eq!(names.len(), 2);
     }
 
     #[test]
@@ -358,6 +401,31 @@ mod tests {
         assert_eq!(answer.params.get("agent"), Some(&"tester".to_string()));
         let back = serde_json::to_value(&answer).expect("serializes");
         assert_eq!(back["action"], "open_agent");
+    }
+
+    #[test]
+    fn voice_resolver_answer_reads_a_null_param_as_absent() {
+        // Forced by `openai`'s strict schema, which has to declare and require
+        // every param name. See `IntentAnswer`'s own docs.
+        let answer: IntentAnswer =
+            serde_json::from_str(r#"{"action":"open_deck","params":{"agent":null}}"#)
+                .expect("parses");
+        assert_eq!(answer.action, "open_deck");
+        assert!(answer.params.is_empty(), "{:?}", answer.params);
+
+        // A mixed object keeps what is there and drops only the nulls.
+        let answer: IntentAnswer = serde_json::from_str(
+            r#"{"action":"open_agent","params":{"agent":"tester","other":null}}"#,
+        )
+        .expect("parses");
+        assert_eq!(answer.params.get("agent"), Some(&"tester".to_string()));
+        assert_eq!(answer.params.len(), 1);
+
+        // A non-string, non-null value is still a malformed answer.
+        assert!(
+            serde_json::from_str::<IntentAnswer>(r#"{"action":"open_agent","params":{"agent":7}}"#)
+                .is_err()
+        );
     }
 
     #[test]

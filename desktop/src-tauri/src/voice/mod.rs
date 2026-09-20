@@ -22,9 +22,11 @@
 //! Commands is API-only. A stage that spends a credential has to let the user
 //! say whose, and a backend that spawns one vendor's general-purpose coding
 //! agent on a prompt built partly from untrusted input could not offer that at
-//! any price worth paying. [`remote`] is what remains, and [`resolver_for`] is
-//! where `VoiceSettings.intent` picks a backend. Every [`VoiceResult`] carries
-//! the latency it cost, because PRD
+//! any price worth paying. [`remote`] is what remains, and it speaks **two
+//! protocols** — Anthropic Messages here and OpenAI-compatible
+//! chat-completions in [`openai`] — so the provider choice a key obliges is a
+//! real one. [`resolver_for`] is where `VoiceSettings.intent` picks one. Every
+//! [`VoiceResult`] carries the latency it cost, because PRD
 //! #802's mitigation for *slow enough to feel broken* is to show the number
 //! rather than hide it.
 //!
@@ -40,6 +42,7 @@
 
 pub mod capture;
 pub mod http;
+pub mod openai;
 pub mod outcome;
 pub mod prompt;
 pub mod remote;
@@ -66,7 +69,7 @@ pub use capture::{
     StubSource, TARGET_SAMPLE_RATE, Vad,
 };
 pub use outcome::{ResolvedParam, VoiceOutcome, VoiceResult, handle_utterance};
-pub use remote::{REMOTE_TIMEOUT, RemoteResolver};
+pub use remote::{Protocol, REMOTE_TIMEOUT, RemoteResolver};
 pub use resolver::{
     IntentAnswer, IntentError, IntentRequest, IntentResolver, StubResolver, resolver_for,
 };
@@ -204,7 +207,13 @@ pub mod test_support {
     use crate::model_service::{ModelId, ServiceUrl};
     use crate::secrets::{Secret, SecretError, SecretId, SecretStatus, SecretStore};
 
-    /// The keyed API intent backend, with a credential the caller already holds.
+    /// The keyed API intent backend on the **Anthropic** protocol, with a
+    /// credential the caller already holds.
+    ///
+    /// The protocol is fixed rather than a parameter, and deliberately: the
+    /// phrase fixtures are authoritative for the shipping default and a green
+    /// run against another one would prove less than it appears to. Adding a
+    /// switch here would invite exactly that.
     ///
     /// # Why an integration test cannot build one itself
     ///
@@ -236,6 +245,7 @@ pub mod test_support {
         let endpoint = ServiceUrl::parse(endpoint).map_err(|error| error.to_string())?;
         let model = ModelId::parse(model).map_err(|error| error.to_string())?;
         Ok(Box::new(super::remote::RemoteResolver::new(
+            super::remote::Protocol::Anthropic,
             Arc::new(OneSecret(Secret::new(key))),
             endpoint,
             model,

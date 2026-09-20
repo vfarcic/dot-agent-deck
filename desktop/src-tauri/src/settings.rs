@@ -394,14 +394,29 @@ pub const LOCAL_SPEECH_IMAGE: &str = "ghcr.io/speaches-ai/speaches:0.9.0-rc.3-cp
 pub const HOSTED_SPEECH_ENDPOINT: &str = "https://api.openai.com/v1/audio/transcriptions";
 pub const HOSTED_SPEECH_MODEL: &str = "whisper-1";
 
-/// Where the keyed command service is, and which model it is asked for.
+/// Where each command protocol's preset provider is, and which model it is
+/// asked for.
 ///
 /// Anthropic's Messages endpoint, whose tool-use envelope
 /// [`crate::voice::remote`] speaks. `claude-haiku-4-5` is the measured choice —
-/// a median of 0.91 s against the agent CLI's 3.1–4.7 s, at roughly $0.0015 an
-/// utterance.
+/// a median of 0.91 s against the deleted agent CLI's 3.1–4.7 s, at roughly
+/// $0.0015 an utterance.
 pub const HOSTED_COMMAND_ENDPOINT: &str = "https://api.anthropic.com/v1/messages";
 pub const HOSTED_COMMAND_MODEL: &str = "claude-haiku-4-5";
+
+/// OpenAI's chat-completions endpoint, whose nested `json_schema` envelope
+/// [`crate::voice::openai`] speaks.
+///
+/// **This preset's provider and model are the one thing about that protocol
+/// nobody has run.** The request shape is verified end to end against a local
+/// `llama.cpp` and against Anthropic's own OpenAI-compatible endpoint — where
+/// the grammar enforcement was probed rather than assumed — and **not** against
+/// `api.openai.com`, because the key available when it was written had no
+/// credits. `gpt-4.1-mini` is a cheap tier that supports strict structured
+/// outputs; it is not a measured choice the way `claude-haiku-4-5` is, and this
+/// comment says so rather than letting the symmetry imply otherwise.
+pub const OPENAI_COMMAND_ENDPOINT: &str = "https://api.openai.com/v1/chat/completions";
+pub const OPENAI_COMMAND_MODEL: &str = "gpt-4.1-mini";
 
 /// The speech stage: which transcriber, where it is, and which model.
 ///
@@ -637,7 +652,8 @@ impl IntentSettings {
     /// at another backend's endpoint.
     pub fn for_backend(backend: IntentBackend) -> Self {
         let (endpoint, model) = match backend {
-            IntentBackend::Remote => (HOSTED_COMMAND_ENDPOINT, HOSTED_COMMAND_MODEL),
+            IntentBackend::Anthropic => (HOSTED_COMMAND_ENDPOINT, HOSTED_COMMAND_MODEL),
+            IntentBackend::OpenaiCompatible => (OPENAI_COMMAND_ENDPOINT, OPENAI_COMMAND_MODEL),
         };
         Self {
             backend,
@@ -845,24 +861,38 @@ impl VoiceToken for TranscriptionBackend {
 /// would have to prove.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum IntentBackend {
-    /// The keyed API, over HTTP. Its credential lives in
-    /// [`crate::secrets::SecretId::VoiceIntent`].
+    /// Anthropic Messages: one forced tool call with `strict: true`, the answer
+    /// in a `tool_use` block. The default, because it is the shape PRD #802
+    /// measured.
     #[default]
-    Remote,
+    Anthropic,
+    /// OpenAI chat-completions: a nested `json_schema` response format with
+    /// `strict: true`. The dialect most other providers — and `llama.cpp`'s
+    /// server — also answer, which is what makes the choice a real one.
+    OpenaiCompatible,
 }
 
 impl VoiceToken for IntentBackend {
-    const TOKENS: &'static [&'static str] = &["remote"];
+    const TOKENS: &'static [&'static str] = &["anthropic", "openai_compatible"];
     const LABEL: &'static str = "an intent backend";
 
     fn as_str(self) -> &'static str {
         match self {
-            Self::Remote => "remote",
+            Self::Anthropic => "anthropic",
+            Self::OpenaiCompatible => "openai_compatible",
         }
     }
 
-    fn from_str_lossy(_raw: &str) -> Self {
-        Self::default()
+    fn from_str_lossy(raw: &str) -> Self {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "openai_compatible" => Self::OpenaiCompatible,
+            // Everything else folds, which is what the withdrawn agent-CLI
+            // tokens (`claude`, `opencode`) and the pre-provider-work `remote`
+            // all land on. `remote` folding to Anthropic is not a coincidence
+            // to be relied on by accident: it WAS the Anthropic backend, so the
+            // fold happens to preserve what the user picked.
+            _ => Self::default(),
+        }
     }
 }
 
@@ -3420,7 +3450,7 @@ mod tests {
              [voice]\n\
              activation = \"toggle\"\n\n\
              [voice.intent]\n\
-             backend = \"remote\"\n\
+             backend = \"anthropic\"\n\
              endpoint = \"https://api.anthropic.com/v1/messages\"\n\
              model = \"claude-haiku-4-5\"\n\n\
              [voice.transcription]\n\
@@ -3433,7 +3463,7 @@ mod tests {
         let loaded = load_from(&path);
         let voice = loaded.voice.clone().expect("the section is present");
         assert_eq!(voice.activation, ActivationMode::Toggle);
-        assert_eq!(voice.intent.backend, IntentBackend::Remote);
+        assert_eq!(voice.intent.backend, IntentBackend::Anthropic);
         assert_eq!(voice.intent.model.as_str(), HOSTED_COMMAND_MODEL);
         assert_eq!(voice.transcription.backend, TranscriptionBackend::Local);
         assert_eq!(
@@ -3450,7 +3480,7 @@ mod tests {
             serde_json::json!({
                 "activation": "toggle",
                 "intent": {
-                    "backend": "remote",
+                    "backend": "anthropic",
                     "endpoint": HOSTED_COMMAND_ENDPOINT,
                     "model": HOSTED_COMMAND_MODEL,
                 },
@@ -3642,7 +3672,7 @@ mod tests {
         assert_eq!(voice.activation, ActivationMode::Toggle);
         // A token names a backend and nothing else, so each one lands on THAT
         // backend's coordinates rather than on the struct's own default.
-        assert_eq!(voice.intent.backend, IntentBackend::Remote);
+        assert_eq!(voice.intent.backend, IntentBackend::Anthropic);
         assert_eq!(voice.intent.endpoint.as_str(), HOSTED_COMMAND_ENDPOINT);
         assert_eq!(voice.transcription.backend, TranscriptionBackend::Local);
         assert_eq!(voice.transcription.endpoint.as_str(), LOCAL_SPEECH_ENDPOINT);
@@ -3732,6 +3762,7 @@ mod tests {
             LOCAL_SPEECH_ENDPOINT,
             HOSTED_SPEECH_ENDPOINT,
             HOSTED_COMMAND_ENDPOINT,
+            OPENAI_COMMAND_ENDPOINT,
         ] {
             ServiceUrl::parse(endpoint).unwrap_or_else(|error| panic!("{endpoint}: {error}"));
         }
@@ -3739,6 +3770,7 @@ mod tests {
             LOCAL_SPEECH_MODEL,
             HOSTED_SPEECH_MODEL,
             HOSTED_COMMAND_MODEL,
+            OPENAI_COMMAND_MODEL,
         ] {
             ModelId::parse(model).unwrap_or_else(|error| panic!("{model}: {error}"));
         }
@@ -3782,7 +3814,7 @@ mod tests {
             LOCAL_SPEECH_ENDPOINT
         );
         assert_eq!(defaults.transcription.model.as_str(), LOCAL_SPEECH_MODEL);
-        assert_eq!(defaults.intent.backend, IntentBackend::Remote);
+        assert_eq!(defaults.intent.backend, IntentBackend::Anthropic);
         assert_eq!(defaults.intent.endpoint.as_str(), HOSTED_COMMAND_ENDPOINT);
         assert_eq!(defaults.activation, ActivationMode::Toggle);
         // Speech's default is the keyless one, which is the product decision
@@ -3829,7 +3861,7 @@ mod tests {
         .unwrap();
         let loaded = load_from(&path);
         let voice = loaded.voice.clone().expect("the section is present");
-        assert_eq!(voice.intent.backend, IntentBackend::Remote);
+        assert_eq!(voice.intent.backend, IntentBackend::Anthropic);
         assert_eq!(voice.transcription.backend, TranscriptionBackend::Local);
         // A stage that named only its backend still gets this build's
         // coordinates for the folded choice, rather than an empty endpoint.
@@ -3839,7 +3871,7 @@ mod tests {
         // folded value, so the newer build's choice is gone.
         save_to(&path, &loaded).unwrap();
         let reread = std::fs::read_to_string(&path).unwrap();
-        assert!(reread.contains("backend = \"remote\""), "{reread}");
+        assert!(reread.contains("backend = \"anthropic\""), "{reread}");
         assert!(!reread.contains("2027"), "{reread}");
 
         // Over-length is a different answer: the document is malformed, so the
@@ -3898,7 +3930,7 @@ mod tests {
             "a withdrawn token is not a malformed document"
         );
         let voice = loaded.voice.clone().expect("the section is present");
-        assert_eq!(voice.intent.backend, IntentBackend::Remote);
+        assert_eq!(voice.intent.backend, IntentBackend::Anthropic);
         // Everything else in the document survives the fold.
         assert_eq!(voice.transcription.backend, TranscriptionBackend::Remote);
         assert_eq!(
@@ -3922,7 +3954,7 @@ mod tests {
         );
         assert_eq!(
             loaded.voice.expect("the section is present").intent.backend,
-            IntentBackend::Remote
+            IntentBackend::Anthropic
         );
 
         for withdrawn in ["opencode", "claude"] {
@@ -3931,6 +3963,24 @@ mod tests {
                 "`{withdrawn}` is withdrawn; see IntentBackend's doc comment for why"
             );
         }
+
+        // And the pre-provider-work spelling of the one backend that SURVIVED.
+        // `remote` named the Anthropic API, so folding it to the default keeps
+        // the user pointed where they were rather than merely not failing.
+        std::fs::write(
+            &path,
+            "version = 1\n\n[voice.intent]\nbackend = \"remote\"\n",
+        )
+        .unwrap();
+        let (loaded, problem) = load_document(&path);
+        assert!(
+            problem.is_none(),
+            "an older token is not a malformed document"
+        );
+        assert_eq!(
+            loaded.voice.expect("the section is present").intent.backend,
+            IntentBackend::Anthropic
+        );
     }
 
     /// The `[voice]` tokens are duplicated in `desktop/src/lib/bridge.ts`, so
@@ -3953,7 +4003,7 @@ mod tests {
         );
         assert_eq!(
             <IntentBackend as VoiceToken>::TOKENS,
-            ["remote"],
+            ["anthropic", "openai_compatible"],
             "keep this identical to VOICE_INTENT_BACKENDS in desktop/src/lib/bridge.ts"
         );
         assert_eq!(
@@ -4012,6 +4062,11 @@ mod tests {
                 "https://api.anthropic.com/v1/messages",
             ),
             (HOSTED_COMMAND_MODEL, "claude-haiku-4-5"),
+            (
+                OPENAI_COMMAND_ENDPOINT,
+                "https://api.openai.com/v1/chat/completions",
+            ),
+            (OPENAI_COMMAND_MODEL, "gpt-4.1-mini"),
         ] {
             assert_eq!(
                 constant, value,
@@ -4067,7 +4122,7 @@ mod tests {
         let reloaded = load_from(&path);
         assert_eq!(reloaded.appearance.mode, AppearanceMode::Dark);
         let voice = reloaded.voice.expect("the section must survive");
-        assert_eq!(voice.intent.backend, IntentBackend::Remote);
+        assert_eq!(voice.intent.backend, IntentBackend::Anthropic);
         assert_eq!(voice.transcription.backend, TranscriptionBackend::Remote);
         assert_eq!(
             voice.transcription.endpoint.as_str(),
@@ -5698,7 +5753,7 @@ forms it is.";
             voice: Some(VoiceSettings {
                 activation: ActivationMode::Toggle,
                 intent: IntentSettings {
-                    backend: IntentBackend::Remote,
+                    backend: IntentBackend::Anthropic,
                     endpoint: ServiceUrl::parse(HOSTED_COMMAND_ENDPOINT).unwrap(),
                     model: ModelId::parse(HOSTED_COMMAND_MODEL).unwrap(),
                 },
@@ -6580,7 +6635,7 @@ user = \"dev\"
 activation = \"toggle\"
 
 [voice.intent]
-backend = \"remote\"
+backend = \"anthropic\"
 endpoint = \"https://api.anthropic.com/v1/messages\"
 model = \"claude-haiku-4-5\"
 

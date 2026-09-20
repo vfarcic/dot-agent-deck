@@ -56,14 +56,14 @@ function renderPanel(
 
 /** A document whose command backend is the one that needs a key. */
 const KEYED = {
-  voice: { ...DEFAULT_VOICE_SETTINGS, intent: VOICE_STAGE_PRESETS.intent.remote },
+  voice: { ...DEFAULT_VOICE_SETTINGS, intent: VOICE_STAGE_PRESETS.intent.anthropic },
 };
 
 /** A document where BOTH stages need a key. */
 const BOTH_KEYED = {
   voice: {
     activation: "toggle",
-    intent: VOICE_STAGE_PRESETS.intent.remote,
+    intent: VOICE_STAGE_PRESETS.intent.anthropic,
     transcription: VOICE_STAGE_PRESETS.transcription.remote,
   },
 };
@@ -76,7 +76,7 @@ describe("VoicePanel", () => {
   it("renders every choice the app actually ships an adapter for", () => {
     renderPanel();
     expect(screen.getByLabelText("Speech")).toHaveValue("local");
-    expect(screen.getByLabelText("Commands")).toHaveValue("remote");
+    expect(screen.getByLabelText("Commands")).toHaveValue("anthropic");
     // The lists are the closed sets, so a token the Rust side would fold away
     // cannot be offered here.
     expect(screen.getByLabelText("Speech").querySelectorAll("option")).toHaveLength(
@@ -96,6 +96,7 @@ describe("VoicePanel", () => {
     renderPanel();
     expect(screen.getByRole("option", { name: /OpenAI — needs an OpenAI API key/ })).toBeInTheDocument();
     expect(screen.getByRole("option", { name: /Anthropic API — needs an Anthropic API key/ })).toBeInTheDocument();
+    expect(screen.getByRole("option", { name: /OpenAI-compatible API — needs that provider's API key/ })).toBeInTheDocument();
     expect(screen.getByRole("option", { name: /On this machine — speech container, no key/ })).toBeInTheDocument();
   });
 
@@ -184,7 +185,7 @@ describe("VoicePanel", () => {
       expect.objectContaining({
         voice: {
           activation: "toggle",
-          intent: VOICE_STAGE_PRESETS.intent.remote,
+          intent: VOICE_STAGE_PRESETS.intent.anthropic,
           transcription: VOICE_STAGE_PRESETS.transcription.remote,
         },
       }),
@@ -258,7 +259,7 @@ describe("VoicePanel", () => {
       VOICE_STAGE_PRESETS.transcription.local.endpoint,
     );
     expect(document.getElementById("voice-intent-endpoint")).toHaveValue(
-      VOICE_STAGE_PRESETS.intent.remote.endpoint,
+      VOICE_STAGE_PRESETS.intent.anthropic.endpoint,
     );
   });
 
@@ -328,11 +329,44 @@ describe("VoicePanel", () => {
     renderPanel({
       voice: {
         ...DEFAULT_VOICE_SETTINGS,
-        intent: { backend: "remote", endpoint: "https://gateway.example.com/v1/messages", model: "claude-haiku-4-5" },
+        intent: { backend: "openai_compatible", endpoint: "https://gateway.example.com/v1/chat/completions", model: "gpt-4.1-mini" },
       },
     });
     expect(screen.getByLabelText("Key for gateway.example.com")).toBeVisible();
     expect(screen.queryByLabelText(COMMANDS_KEY)).not.toBeInTheDocument();
+  });
+
+  /**
+   * **A loopback command endpoint asks for no key**, because Rust will not read
+   * one: `RemoteResolver::run` skips the keychain entirely for a loopback
+   * address, so a key row there would collect a credential nothing reads. It is
+   * the same rule Speech has from the other side — there the keyless choice is
+   * a backend token and the document refuses to pair it with an off-machine
+   * endpoint.
+   *
+   * PRD #802 ships no preset pointing here and recommends it nowhere: local
+   * intent was measured twice against the phrase fixtures and was not good
+   * enough. The panel telling the truth about a URL the user typed is a
+   * different thing from offering it.
+   */
+  it("asks for no command key when the endpoint is on this machine", () => {
+    renderPanel({
+      voice: {
+        ...DEFAULT_VOICE_SETTINGS,
+        intent: { backend: "openai_compatible", endpoint: "http://127.0.0.1:8080/v1/chat/completions", model: "local-model" },
+      },
+    });
+    expect(screen.queryByLabelText(/^Key for /)).not.toBeInTheDocument();
+
+    // And an endpoint this build cannot parse still offers the row, rather
+    // than hiding it over a URL nobody has agreed about yet.
+    renderPanel({
+      voice: {
+        ...DEFAULT_VOICE_SETTINGS,
+        intent: { backend: "openai_compatible", endpoint: "not a url", model: "gpt-4.1-mini" },
+      },
+    });
+    expect(screen.getAllByLabelText(/^Key for /)).toHaveLength(1);
   });
 
   /**

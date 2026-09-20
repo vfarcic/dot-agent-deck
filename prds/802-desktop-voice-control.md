@@ -839,3 +839,22 @@ All three now move the stream out under the lock and drop it after the guard, an
 **What is kept, and why it is not dead.** `prompt::extract_answer` and its fenced/scanning passes survive, with the fence measurement rewritten to say it was a habit of a reader that is gone. Its consumer is the new `openai_compatible` protocol, whose answer arrives as chat-completion `content`: grammar-enforced under the nested envelope, and a fenced-but-correct answer from a server that accepted the envelope without enforcing it is a real shape worth reading rather than failing. `VoiceOutcome::UnknownAction` also stays although every shipping protocol now constrains the enum — "this build trusts the backend" is not a property to acquire by deleting the check, and the endpoint is a coordinate the user chooses.
 
 **The cost to a user who had picked it is one re-pick.** `IntentBackend`'s folding deserializer loads a stale `intent = "claude"` as the default and the rest of the document survives — the same migration the `opencode` withdrawal relied on, spent a second time and now on the value nearly every existing document holds, since `claude` was the default. `the_withdrawn_agent_cli_intent_backends_fold_to_the_default` pins both tokens.
+
+### 2026-09-20 — Commands gets a second protocol: `openai_compatible`
+
+**One transport, two protocols, and the provider choice is real rather than nominal.** With the CLI gone Commands had one implementation — Anthropic Messages — which is the hardwiring the owner objected to. `IntentBackend` is now `anthropic | openai_compatible`, each with its own endpoint and model preset, and the panel labels name the provider so a user knows which key to paste.
+
+**The shape, established against a real server rather than from documentation.**
+
+1. `POST /v1/chat/completions`
+2. `messages` with the stable instructions and the live state in the **system** turn and the transcript as the **user** turn — the same split the Anthropic protocol makes, and for the same reason: the volatile half goes last.
+3. **The nested envelope**: `response_format: { type: "json_schema", json_schema: { name, strict: true, schema } }`. llama.cpp's shorthand `response_format: { type: "json_schema", schema }` returns **HTTP 200 and is silently not enforced**, which is the worst failure shape available — a constraint you believe you have. The nested form is the one that is enforced and the only one this build sends.
+4. The answer is `choices[0].message.content`, read through `prompt::extract_answer`.
+5. No `x-api-key` and no `anthropic-version`; `Authorization: Bearer` when a key is stored.
+6. **No key required when the endpoint is loopback** — the rule Speech already has, and the reason a local server is reachable without pretending to authenticate to it.
+
+**The schema is not the Anthropic one with the envelope changed, and the difference is a real constraint.** OpenAI's strict structured outputs require **every** property to appear in `required`, so `params` cannot simply be optional the way the tool-use schema leaves it. The `openai_compatible` schema therefore requires `action` and `params`, and makes each param a `["string", "null"]` union — the documented way to express an optional field under strict mode. `IntentAnswer` gained a field deserializer that drops null-valued params, so *"the model was forced to name every param and said null for the ones this action does not take"* arrives downstream as an absent param, which is `ParamMissing` exactly as before.
+
+**Verified against two servers, and NOT against the one in the preset.** PRD #802's reconnaissance ran the shape against a local `llama.cpp`. This entry adds Anthropic's own OpenAI-compatible endpoint, where the enforcement was **probed rather than assumed**: a schema whose `action` enum held one bogus token returned that token, over the answer the model plainly wanted to give. It has **not** been run against `api.openai.com`, whose coordinates are the preset — the key on the development box had no credits. So what is unverified is the preset's provider and model, not the protocol, and `docs/develop/desktop-gui.md` says so in its own **what is NOT verified** list rather than leaving a green check to imply otherwise.
+
+**`backend_name` now names the protocol** — `anthropic` or `openai`, not `remote` — because it is rendered beside the latency in the report, and *remote, 0.9 s* answers a question nobody asked once every backend is remote.

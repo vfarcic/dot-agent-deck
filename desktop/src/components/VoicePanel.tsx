@@ -95,11 +95,39 @@ const TRANSCRIPTION_LABELS: Record<string, string> = {
 };
 
 const INTENT_LABELS: Record<string, string> = {
-  remote: "Anthropic API — needs an Anthropic API key",
+  anthropic: "Anthropic API — needs an Anthropic API key",
+  openai_compatible: "OpenAI-compatible API — needs that provider's API key",
 };
 
-/** The token a backend takes when it authenticates with a key of the app's own. */
+/** The token the speech backend takes when it authenticates with a key. */
 const KEYED = "remote";
+
+/**
+ * Whether a stage will actually send a credential, which for Commands is a
+ * question about the ENDPOINT and not about the backend token.
+ *
+ * Both command protocols authenticate when there is somewhere to authenticate
+ * to, and neither does when the endpoint is on this machine —
+ * `RemoteResolver::run` never consults the keychain for a loopback address, so
+ * a key row there would ask for something nothing would read. Speech reaches
+ * the same rule from the other side: its keyless choice is a backend token, and
+ * the document refuses to pair that token with an off-machine endpoint.
+ */
+const needsKey = (stage: Stage, value: VoiceStageDto): boolean =>
+  stage === "transcription" ? value.backend === KEYED : !isLoopback(value.endpoint);
+
+/** Mirrors `ServiceUrl::is_loopback`: a host that cannot leave this machine. */
+const isLoopback = (endpoint: string): boolean => {
+  try {
+    const host = new URL(endpoint).hostname.replace(/^\[|\]$/g, "").toLowerCase();
+    return host === "localhost" || host === "::1" || /^127\./.test(host);
+  } catch {
+    // An endpoint this build cannot parse is one Rust will refuse on save. Not
+    // loopback is the safe answer: it offers the key row rather than hiding it
+    // over a URL nobody has agreed about yet.
+    return false;
+  }
+};
 
 /** The stages, in the order the panel asks about them. */
 type Stage = "transcription" | "intent";
@@ -182,7 +210,7 @@ export function VoicePanel({ settings, onSave, saveError }: SettingsPanelProps) 
 
       <StageFields stage="transcription" value={voice.transcription} onSave={saveStage} />
 
-      {voice.transcription.backend === KEYED && (
+      {needsKey("transcription", voice.transcription) && (
         <SecretRow id="voice-transcription" endpoint={voice.transcription.endpoint} />
       )}
 
@@ -205,7 +233,7 @@ export function VoicePanel({ settings, onSave, saveError }: SettingsPanelProps) 
           own, and none otherwise. Asking for a credential a user's chosen
           backends do not need is how a feature becomes one most people never
           try — the reason both stages default to a backend that needs none. */}
-      {voice.intent.backend === KEYED && (
+      {needsKey("intent", voice.intent) && (
         <SecretRow id="voice-intent" endpoint={voice.intent.endpoint} />
       )}
 
