@@ -116,15 +116,28 @@ const KEYED = "remote";
 const needsKey = (stage: Stage, value: VoiceStageDto): boolean =>
   stage === "transcription" ? value.backend === KEYED : !isLoopback(value.endpoint);
 
-/** Mirrors `ServiceUrl::is_loopback`: a host that cannot leave this machine. */
+/**
+ * A host that cannot leave this machine — `ServiceUrl::is_loopback`'s question,
+ * answered STRICTLY, which is deliberate rather than a near-miss.
+ *
+ * Rust parses the host as an `IpAddr` and asks `is_loopback()`, so it accepts
+ * the whole `127.0.0.0/8` and any spelling of `::1` including the expanded
+ * `0:0:0:0:0:0:0:1`. This accepts `localhost`, `127.*` and the short `::1`, and
+ * that is a narrower set on purpose: the two are not identical and the
+ * divergence only ever runs one way. Saying *not loopback* to something Rust
+ * calls loopback offers a key row nothing will read — a wasted field. Saying
+ * *loopback* to something Rust would authenticate to would hide the row a user
+ * needs, and that is the direction this must never err in. An unparseable
+ * endpoint gets the same treatment for the same reason.
+ *
+ * It is a display decision either way: `RemoteResolver::run` is what actually
+ * decides whether a credential is read, and it reads Rust's answer.
+ */
 const isLoopback = (endpoint: string): boolean => {
   try {
     const host = new URL(endpoint).hostname.replace(/^\[|\]$/g, "").toLowerCase();
     return host === "localhost" || host === "::1" || /^127\./.test(host);
   } catch {
-    // An endpoint this build cannot parse is one Rust will refuse on save. Not
-    // loopback is the safe answer: it offers the key row rather than hiding it
-    // over a URL nobody has agreed about yet.
     return false;
   }
 };
