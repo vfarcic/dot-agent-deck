@@ -4,7 +4,9 @@ Issue [#1174](https://github.com/vfarcic/dot-agent-deck/issues/1174). This page 
 
 ## What it is not
 
-**It does not authenticate the listener, and no forwarded endpoint is self-describing.** The desktop opens the remote path with `ssh -L`, which terminates the connection locally: the peer credential visible at the near end belongs to the local `ssh` client, never to whatever is listening on the far host. So every local defence — `verify_endpoint_trusted`'s `lstat`, and the peer-uid check on the Unix connect path — passes *by construction* for a forwarded socket, correctly and uninformatively.
+**It does not authenticate the listener, and no forwarded endpoint is self-describing.** The desktop opens the remote path with `ssh -L`, which terminates the connection locally: any peer credential readable at the near end describes the local `ssh` client, never whatever is listening on the far host. So the local defence that exists — `verify_endpoint_trusted`'s `lstat` of the endpoint inode, run by `daemon_attach` before connect — passes *by construction* for a forwarded socket, correctly and uninformatively: the inode it checks is the one our own `ssh` created, under our own uid, at our own mode.
+
+Be precise about what that local defence is, because the obvious stronger description is wrong and #1174's own text carries it (PR #1191 review, P2). On `main` the client's connect path performs **no peer-credential check at all**. `platform::peercred` exports `peer_pid` and nothing else, and its caller uses it to identify a process to terminate — a lifecycle concern, not a trust check. A `peer_uid_raw` arrives with [#1121](https://github.com/vfarcic/dot-agent-deck/issues/1121); until that lands, "checked by peer uid after connect" describes no code in this tree.
 
 What the far side can establish is therefore the whole of the boundary, and it stops short of identity. A completed attach-protocol `Hello` proves something is listening and speaks this wire. It does not prove that something is the deck's daemon. An attacker **already running as the remote login user** can bind a `0o600` socket of their own at the resolved path, answer the handshake, and replace the binary the resolver itself runs from. Against that actor nothing here adds a refusal.
 
@@ -34,10 +36,9 @@ The snippet's first rung runs the far host's own binary:
 ```sh
 for dad_cmd in "${HOME:-}/.local/bin/dot-agent-deck" "$(command -v dot-agent-deck 2>/dev/null)"; do
   [ -n "$dad_cmd" ] && [ -x "$dad_cmd" ] || continue
-  dad_answer=$("$dad_cmd" daemon endpoint 2>/dev/null) || continue
-  [ -n "$dad_answer" ] || continue
-  printf '%s\n' "$dad_answer"
-  exit 0
+  dad_answer=$("$dad_cmd" daemon endpoint 2>/dev/null); dad_rc=$?
+  if [ "$dad_rc" = 0 ] && [ -n "$dad_answer" ]; then printf '%s\n' "$dad_answer"; exit 0; fi
+  if [ "$dad_rc" = 1 ]; then exit 0; fi   # a trust refusal binds
 done
 # …the filesystem rungs, unchanged, as the fallback
 ```
@@ -53,6 +54,29 @@ done
 The third row is the only clause in the whole snippet that observes a **process**. The second is the only place a mode is checked at all.
 
 The command is read-only in both directions: it never lazy-spawns a daemon (a missing one is the answer, not a reason to start one) and never unlinks the inode it refused (that is the daemon's own recovery).
+
+### The exit codes, and why a refusal has to bind
+
+The first draft of this change made every failure fall through to the rungs below. A review found what that costs (PR [#1191](https://github.com/vfarcic/dot-agent-deck/pull/1191), P1) and it is worth stating bluntly: **a check whose refusal is overridden by the next rung is not a check.** The resolver would reject a `0666` listener, the rung below would print that same path unchecked, and `discover_socket` would forward it with `ssh -L`. So the codes are split:
+
+| code | meaning | the probe |
+| --- | --- | --- |
+| `0` | a trusted, live endpoint; the path is on stdout | prints it and stops |
+| `1` | something **is** at the path and it failed a trust check | **stops, with no path at all** |
+| `3` | nothing was learned — no inode, nothing answering, a timed-out handshake | falls through to the next candidate, then to the rungs |
+| `2`, `126`, `127`, … | this host could not run the command (clap; a shell) | falls through |
+
+A `1` ends the snippet at exit 0 with empty stdout, which `discover_socket` turns into `NoRemoteSocket` — "this run could not learn a path" — rather than a transport error, because it special-cases an empty captured stderr.
+
+Keeping `3` separate from `1` is not fastidiousness. It is what stops a **dead first candidate hiding a live second one** once there is more than one candidate to try, and what leaves a version-skewed daemon to be classified by the desktop (`HandshakeRefused`, `ProtocolRefused`) instead of being reported as a missing socket.
+
+### What this actually buys today, stated narrowly
+
+Two of the three gains are immediate and one is latent, and an earlier draft of this page claimed all three:
+
+- **An untrusted endpoint is no longer forwarded.** Immediate, and now binding.
+- **One implementation of the rule instead of two.** Immediate.
+- **A stale inode is detected** — but a dead endpoint exits `3`, so the snippet falls through and the rungs below still name the path. The user still gets `DeckNotAnswering`, exactly as before. The detection pays off when the resolver has a *second* candidate to move on to, which is the shape that arrives with #1121. Calling this an availability fix today would be an over-claim.
 
 ### Why it costs nothing on the wire
 
@@ -93,4 +117,5 @@ What would actually bind against a same-uid attacker is a secret that uid cannot
 - **Same-uid impersonation on the remote host**, as above. [#1189](https://github.com/vfarcic/dot-agent-deck/issues/1189).
 - **Hosts running an older build**, which fall through to the filesystem rungs and gain none of the three checks.
 - **The `DOT_AGENT_DECK_ATTACH_SOCKET` and `XDG_RUNTIME_DIR` fallback rungs are still printed with no test at all** when the resolver is unavailable. That is unchanged behaviour, not a new gap, and it is bounded by the same "older build" case above.
+- **The resolver checks one candidate**, the one `attach_socket_path()` resolves. It does not itself try a legacy spelling, so the stale-inode detection above stays latent until it has a second candidate to fall to.
 - **The residuals `remote_tunnel::forced_options` already records** are untouched by any of this and are a different boundary: the user's own ssh config decides which host keys count as trusted (`KnownHostsCommand`, `UserKnownHostsFile`), and their `LocalForward` / `RemoteForward` / `DynamicForward` are inherited for the tunnel's whole life because `ClearAllForwardings` would clear our own `-L`.

@@ -60,14 +60,31 @@ fn run_daemon_endpoint_cli(attach_socket: &Path) -> CliEndpointResult {
     }
 }
 
-/// Assert a refusal is a *handled* one: no panic, and not clap's own exit 2 /
-/// `Usage:` banner, which is what a build lacking the subcommand produces.
+/// The exit code for "something is here and it failed a trust check": the
+/// caller must stop rather than fall through to an unchecked rung.
+#[cfg(unix)]
+const ENDPOINT_UNTRUSTED: i32 = 1;
+
+/// The exit code for "nothing was learned": no inode, nothing answering, or a
+/// timed-out handshake. The caller keeps looking.
+#[cfg(unix)]
+const ENDPOINT_UNDETERMINED: i32 = 3;
+
+/// Assert a refusal is a *handled* one carrying exactly `expected_code`: no
+/// panic, and not clap's own exit 2 / `Usage:` banner, which is what a build
+/// lacking the subcommand produces.
 ///
-/// Without this the two refusal tests would pass on a build where
+/// The code is asserted rather than merely "non-zero" because the probe acts on
+/// the difference — `1` binds and ends discovery, anything else falls through
+/// to a rung that prints the path unchecked. A refusal that drifted from `1` to
+/// `3` would silently make every trust check here advisory again (PR #1191
+/// review, P1), with no test noticing.
+///
+/// Without the clap checks these tests would also pass on a build where
 /// `daemon endpoint` does not exist at all — the same trap
 /// `daemon/status/003` documents.
 #[cfg(unix)]
-fn assert_handled_refusal(result: &CliEndpointResult, what: &str) {
+fn assert_handled_refusal(result: &CliEndpointResult, expected_code: i32, what: &str) {
     assert!(
         !result.status.success(),
         "{what} must not report success; status={:?} stdout={:?} stderr={:?}",
@@ -91,6 +108,15 @@ fn assert_handled_refusal(result: &CliEndpointResult, what: &str) {
         Some(2),
         "exit code 2 is clap's own usage/parse-error code; a refusal that collides with it \
          cannot be told apart from a build that does not have this subcommand; status={:?} \
+         stderr={:?}",
+        result.status,
+        result.stderr
+    );
+    assert_eq!(
+        result.status.code(),
+        Some(expected_code),
+        "{what} must exit exactly {expected_code}; the probe branches on this value, so a \
+         drift here changes whether the refusal binds or is fallen through; status={:?} \
          stderr={:?}",
         result.status,
         result.stderr
@@ -130,7 +156,11 @@ fn daemon_endpoint_001_refuses_a_stale_inode_no_daemon_is_listening_on() {
     );
 
     let result = run_daemon_endpoint_cli(&attach_path);
-    assert_handled_refusal(&result, "a stale inode with no listener");
+    assert_handled_refusal(
+        &result,
+        ENDPOINT_UNDETERMINED,
+        "a stale inode with no listener",
+    );
 
     assert!(
         attach_path.exists(),
@@ -166,7 +196,7 @@ fn daemon_endpoint_002_refuses_a_live_listener_whose_mode_is_not_owner_only() {
         .expect("chmod the endpoint world-writable");
 
     let result = run_daemon_endpoint_cli(&attach_path);
-    assert_handled_refusal(&result, "a live listener at mode 0o666");
+    assert_handled_refusal(&result, ENDPOINT_UNTRUSTED, "a live listener at mode 0o666");
 
     assert!(
         result.stderr.contains("666"),

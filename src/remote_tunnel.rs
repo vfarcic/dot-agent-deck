@@ -1794,15 +1794,26 @@ mod tunnel {
     ///
     /// Two things that buys, stated at their real width:
     ///
-    /// - **A stale inode stops being selected, on a host where this rung
-    ///   runs.** The filesystem tests below cannot tell a socket a dead daemon
-    ///   left behind from a live one, so discovery would name it and the
-    ///   forward would come up against nothing. The `Hello` is the only clause
-    ///   in this snippet that observes a *process*. Where the rung does not
-    ///   run — see below — the old answer is what you still get.
-    /// - **One implementation of the rule instead of two.** A mode check has no
+    /// - **An untrusted endpoint is no longer forwarded.** A mode check has no
     ///   portable `test` spelling, so no rung below has one or can: a socket at
-    ///   `0666` is refused by the resolver and by no clause beneath it.
+    ///   `0666` is refused by the resolver and by no clause beneath it. That
+    ///   refusal **binds** — exit `1` ends the snippet with no path at all,
+    ///   rather than dropping to a rung that would print the same path
+    ///   unchecked. Without that, every check here would be advisory (PR #1191
+    ///   review, P1).
+    /// - **A live process is observed at all.** The `Hello` is the only clause
+    ///   in this snippet that looks at anything but an inode, and an inode
+    ///   outlives the process that bound it.
+    ///
+    ///   **Be exact about what that buys today, because the obvious claim is
+    ///   too strong.** A dead endpoint exits `3`, not `1`, so the snippet falls
+    ///   through and the rungs below still name the path — the user still gets
+    ///   `DeckNotAnswering`, exactly as before. That is deliberate: `3` is what
+    ///   lets a dead *first* candidate yield to a live *second* one, which is
+    ///   the case that arises once there is more than one candidate to try. The
+    ///   stale-inode gain is therefore latent rather than user-visible here.
+    /// - **One implementation of the rule instead of two**, which is the
+    ///   maintenance half and is immediate.
     ///
     /// **It is not authentication, and nothing here should be read as claiming
     /// it is.** A completed `Hello` proves that something is listening and
@@ -1818,14 +1829,18 @@ mod tunnel {
     ///
     /// # Why the fallback stays
     ///
-    /// A remote host whose binary predates this subcommand exits non-zero (clap
+    /// A remote host whose binary predates this subcommand exits `2` (clap
     /// reports an unrecognised subcommand), one that is not installed at all
-    /// fails `[ -x ]`, and either way the `continue` drops through to the rungs
-    /// below — so discovery against those hosts is exactly what it was. That
-    /// fall-through is the whole compatibility story, and it is why this rung
-    /// is additive: a refusal here lands on the same rungs that answered before
-    /// it existed, so the answer this host gives is never worse than the one it
-    /// already gave, and no host has to be upgraded before a desktop can be.
+    /// fails `[ -x ]`, and either way the loop drops through to the rungs below
+    /// — so discovery against those hosts is exactly what it was, and no host
+    /// has to be upgraded before a desktop can be.
+    ///
+    /// **Read the codes rather than "zero or not".** `0` and `1` are the two
+    /// answers, and everything else is "this host could not tell me": `2` from
+    /// clap, `126`/`127` from the shell, and `3` from the command itself when
+    /// it looked and learned nothing. Collapsing `1` into that set is precisely
+    /// the defect the review found — it would let a `0666` listener the
+    /// resolver had just rejected be printed by the rung below and forwarded.
     ///
     /// `[ -x "$dad_cmd" ]` and not `command -v "$dad_cmd"` for the absolute
     /// candidate, because `command -v` on an **absolute** path answers about
@@ -1879,15 +1894,17 @@ mod tunnel {
     /// this side, so there is no quoting decision to get wrong.
     pub const REMOTE_SOCKET_PROBE: &str = concat!(
         // The resolver rung (issue #1174). See the doc comment above: this is
-        // the only clause in the snippet that observes a live process, and the
-        // `continue`s are the compatibility path for a host whose binary is
-        // older than the subcommand or is not installed at all.
+        // the only clause in the snippet that observes a live process. `0` and
+        // `1` are the two answers — a path, or a binding refusal that ends the
+        // snippet — and every other code falls through to the rungs below,
+        // which is the compatibility path for a host whose binary is older than
+        // the subcommand or is not installed at all.
         "for dad_cmd in \"${HOME:-}/.local/bin/dot-agent-deck\" \"$(command -v dot-agent-deck 2>/dev/null)\"; do ",
         "[ -n \"$dad_cmd\" ] && [ -x \"$dad_cmd\" ] || continue; ",
-        "dad_answer=$(\"$dad_cmd\" daemon endpoint 2>/dev/null) || continue; ",
-        "[ -n \"$dad_answer\" ] || continue; ",
-        "printf '%s\\n' \"$dad_answer\"; ",
-        "exit 0; ",
+        "dad_answer=$(\"$dad_cmd\" daemon endpoint 2>/dev/null); dad_rc=$?; ",
+        "if [ \"$dad_rc\" = 0 ] && [ -n \"$dad_answer\" ]; ",
+        "then printf '%s\\n' \"$dad_answer\"; exit 0; fi; ",
+        "if [ \"$dad_rc\" = 1 ]; then exit 0; fi; ",
         "done; ",
         "if [ -n \"${DOT_AGENT_DECK_ATTACH_SOCKET:-}\" ]; then ",
         "printf '%s\\n' \"$DOT_AGENT_DECK_ATTACH_SOCKET\"; ",
@@ -5511,6 +5528,105 @@ mod tunnel_tests {
                 "/run/deck/attach.sock",
                 "a non-executable file must not break discovery ({shell:?})"
             );
+        }
+    }
+
+    /// A resolver that refuses **on trust** ends the snippet with no path at
+    /// all, rather than falling through to a rung that would print the same
+    /// path unchecked.
+    ///
+    /// This is the review finding the exit codes exist for (PR #1191, P1).
+    /// Without it every check the resolver makes is advisory: it rejects a
+    /// `0666` listener, the rung below names that same path anyway, and
+    /// `discover_socket` forwards it with `ssh -L`. The snippet must still exit
+    /// **0** — "this run could not learn a path" is an answer, and
+    /// `discover_socket` turns an empty stdout with empty stderr into
+    /// `NoRemoteSocket` rather than a transport error.
+    #[cfg(unix)]
+    #[test]
+    fn the_probe_stops_when_the_resolver_refuses_on_trust() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let home = temp.path().join("home");
+        install_standin(&home.join(".local/bin"), "#!/bin/sh\nexit 1\n");
+        for shell in probe_shells() {
+            assert_eq!(
+                run_probe_under(
+                    &shell,
+                    REMOTE_SOCKET_PROBE,
+                    &[
+                        ("HOME", &home.to_string_lossy()),
+                        ("DOT_AGENT_DECK_ATTACH_SOCKET", "/srv/untrusted.sock"),
+                        ("XDG_RUNTIME_DIR", "/run/user/1000"),
+                    ]
+                ),
+                "",
+                "a trust refusal must bind, not fall through to an unchecked rung ({shell:?})"
+            );
+        }
+    }
+
+    /// A resolver that reports **undetermined** falls through, because nothing
+    /// was learned.
+    ///
+    /// The counterpart to the test above, and the reason the two codes are
+    /// separate: a path with nothing at it, a stale inode and a timed-out
+    /// handshake all exit `3`, so a dead first candidate cannot hide a live
+    /// second one, and a version-skewed daemon still reaches the desktop to be
+    /// classified there rather than being reported as a missing socket.
+    #[cfg(unix)]
+    #[test]
+    fn the_probe_falls_through_when_the_resolver_cannot_determine() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let home = temp.path().join("home");
+        install_standin(&home.join(".local/bin"), "#!/bin/sh\nexit 3\n");
+        for shell in probe_shells() {
+            assert_eq!(
+                run_probe_under(
+                    &shell,
+                    REMOTE_SOCKET_PROBE,
+                    &[
+                        ("HOME", &home.to_string_lossy()),
+                        ("XDG_RUNTIME_DIR", "/run/user/1000"),
+                    ]
+                ),
+                XDG_FALLBACK_ANSWER,
+                "an undetermined answer must keep looking ({shell:?})"
+            );
+        }
+    }
+
+    /// Every "this host cannot run it" code falls through, and only `1` binds.
+    ///
+    /// Enumerated rather than asserted for the one code the older-build test
+    /// already covers: `2` is clap's, `126` and `127` are a shell's for a file
+    /// that cannot be executed or found, and `101` is a Rust panic. Reading the
+    /// rung as "zero or not" would collapse all of these together with `1`,
+    /// which is exactly the direction that makes a trust refusal unenforceable.
+    #[cfg(unix)]
+    #[test]
+    fn only_the_untrusted_code_binds_and_every_other_failure_falls_through() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        for code in [2, 3, 101, 126, 127] {
+            let home = temp.path().join(format!("home-{code}"));
+            install_standin(
+                &home.join(".local/bin"),
+                &format!("#!/bin/sh\nexit {code}\n"),
+            );
+            for shell in probe_shells() {
+                assert_eq!(
+                    run_probe_under(
+                        &shell,
+                        REMOTE_SOCKET_PROBE,
+                        &[
+                            ("HOME", &home.to_string_lossy()),
+                            ("XDG_RUNTIME_DIR", "/run/user/1000"),
+                        ]
+                    ),
+                    XDG_FALLBACK_ANSWER,
+                    "exit {code} means the host could not answer, so the snippet must keep \
+                     going ({shell:?})"
+                );
+            }
         }
     }
 

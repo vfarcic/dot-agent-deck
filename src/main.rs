@@ -2253,6 +2253,28 @@ fn run_daemon_hello_cli() -> ExitCode {
 /// - a live listener completed an attach-protocol `Hello` within
 ///   [`ENDPOINT_RESOLVE_TIMEOUT`].
 ///
+/// # Three exit codes, because the caller acts on the difference
+///
+/// The probe treats a refusal from *this* command differently from a host that
+/// could not run it, and that distinction is the whole reason the checks above
+/// bind rather than merely advise (PR #1191 review, P1):
+///
+/// - **`0`** — a trusted, live endpoint. The path is on stdout.
+/// - **[`ENDPOINT_UNTRUSTED`] (`1`)** — something is at the path and it failed
+///   a trust check. The probe **stops**: falling through would print the same
+///   path unchecked and forward it, which would make every check here
+///   advisory. This is the code a `0666` listener earns.
+/// - **[`ENDPOINT_UNDETERMINED`] (`3`)** — nothing is at the path, or nothing
+///   answered, or the handshake timed out. Nothing was *learned*, so the probe
+///   falls through to its remaining candidates and then to the shell rungs.
+///   Keeping this separate from `1` is what stops a dead first candidate from
+///   hiding a live second one, and what leaves a version-skewed daemon to be
+///   classified by the desktop rather than reported as a missing socket.
+///
+/// Neither collides with clap's own `2` (an older build that does not know the
+/// subcommand) or a shell's `126`/`127`, which are the "this host cannot run
+/// it" codes the probe must also fall through on.
+///
 /// **It does not authenticate the listener**, and no claim here should be read
 /// as saying it does. A `Hello` proves something is listening and speaks this
 /// wire; it does not prove that something is the deck's daemon. Against a
@@ -2287,12 +2309,25 @@ async fn run_daemon_endpoint_cli() -> ExitCode {
     // reason can still be reported.
     if shown.to_string().contains(|c: char| c.is_control()) {
         eprintln!("daemon endpoint: the endpoint path contains a control character");
-        return ExitCode::FAILURE;
+        return ExitCode::from(ENDPOINT_UNTRUSTED);
+    }
+
+    // Split "there is nothing here" from "there is something here and it is
+    // wrong" BEFORE running the trust check, because the two earn different
+    // exit codes and `verify_endpoint_trusted` folds them into one `String`.
+    // An absent endpoint is ordinary — the deck over there is simply not
+    // running — and must not stop the probe trying its other candidates.
+    match std::fs::symlink_metadata(&path) {
+        Ok(_) => {}
+        Err(source) => {
+            eprintln!("daemon endpoint: nothing at {shown}: {source}");
+            return ExitCode::from(ENDPOINT_UNDETERMINED);
+        }
     }
 
     if let Err(reason) = dot_agent_deck::platform::fsperm::verify_endpoint_trusted(&path) {
         eprintln!("daemon endpoint: {shown} is not a trusted endpoint: {reason}");
-        return ExitCode::FAILURE;
+        return ExitCode::from(ENDPOINT_UNTRUSTED);
     }
 
     // A `Hello` over the existing wire. Bounded, because a listener that
@@ -2302,22 +2337,39 @@ async fn run_daemon_endpoint_cli() -> ExitCode {
     let client = DaemonClient::new(path.clone());
     match tokio::time::timeout(ENDPOINT_RESOLVE_TIMEOUT, client.capabilities()).await {
         Ok(Ok(_capabilities)) => {}
+        // Every handshake failure is UNDETERMINED rather than UNTRUSTED, and
+        // deliberately so. A refused connect is a stale inode or a daemon that
+        // is not running; a refused `Hello` is usually version skew, which the
+        // desktop names far better (`HandshakeRefused`, `ProtocolRefused`) once
+        // the socket is forwarded than this command could. Both are reasons to
+        // keep looking, not grounds to call the endpoint hostile.
         Ok(Err(e)) => {
-            eprintln!("daemon endpoint: nothing answered at {shown}: {e}");
-            return ExitCode::FAILURE;
+            eprintln!("daemon endpoint: nothing usable answered at {shown}: {e}");
+            return ExitCode::from(ENDPOINT_UNDETERMINED);
         }
         Err(_elapsed) => {
             eprintln!(
                 "daemon endpoint: the listener at {shown} did not complete a handshake within {}s",
                 ENDPOINT_RESOLVE_TIMEOUT.as_secs()
             );
-            return ExitCode::FAILURE;
+            return ExitCode::from(ENDPOINT_UNDETERMINED);
         }
     }
 
     println!("{shown}");
     ExitCode::SUCCESS
 }
+
+/// [`run_daemon_endpoint_cli`]: something is at the endpoint path and it failed
+/// a trust check, so the caller must **not** keep looking and must not forward
+/// it. Distinct from clap's `2` so an older build is never mistaken for one.
+const ENDPOINT_UNTRUSTED: u8 = 1;
+
+/// [`run_daemon_endpoint_cli`]: nothing was learned — no inode, nothing
+/// answering, or a handshake that timed out — so the caller should try its
+/// remaining candidates. Deliberately not `2` (clap's) and not `126`/`127` (a
+/// shell's), which mean the same thing for a different reason.
+const ENDPOINT_UNDETERMINED: u8 = 3;
 
 /// How long [`run_daemon_endpoint_cli`] waits for a listener to complete the
 /// `Hello`.
