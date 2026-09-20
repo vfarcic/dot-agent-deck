@@ -177,3 +177,32 @@ utterance = "what time is it?"
 screen = "deck"
 action = "none"
 outcome = "no_match"
+
+# `voice_off` is callable everywhere, so its three fixtures are on three
+# different screens: the availability column has no false case to probe, and
+# what is worth probing instead is that no screen changes the answer.
+#
+# `close-agent-view-stop-looking` above is the collision this row could steal —
+# *"stop looking at this agent"* against *"stop listening"* — and it is left
+# exactly where it was so a wording change that blurs the two goes red there.
+
+[[fixtures]]
+name = "voice-off-plain"
+utterance = "voice off"
+screen = "deck"
+action = "voice_off"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "voice-off-turn-off-the-voice"
+utterance = "turn off the voice"
+screen = "agent"
+action = "voice_off"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "voice-off-stop-listening"
+utterance = "stop listening"
+screen = "overview"
+action = "voice_off"
+outcome = "dispatch"

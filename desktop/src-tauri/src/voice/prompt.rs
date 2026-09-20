@@ -338,6 +338,7 @@ mod tests {
                 "open_deck".to_string(),
                 "close_agent_view".to_string(),
                 "open_settings".to_string(),
+                "voice_off".to_string(),
                 "none".to_string(),
             ]
         );
@@ -412,7 +413,10 @@ mod tests {
                 { "label": "orchestrator", "status": "running" },
             ])
         );
-        assert_eq!(state["commands"].as_array().expect("array").len(), 5);
+        assert_eq!(
+            state["commands"].as_array().expect("array").len(),
+            table().rows().len()
+        );
     }
 
     #[test]

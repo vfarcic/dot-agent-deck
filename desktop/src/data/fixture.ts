@@ -734,14 +734,19 @@ export function createFixtureSnapshot(state: FixtureState = "connected"): DeckSn
  * reachable: `Go, BACK to "Deck"?!` has to resolve to nothing, and any
  * substring rule would have it matching the deck phrases below.
  *
- * # Three commands rather than four
+ * # Every param-free row, and no other
  *
- * `open_overview`, `open_deck` and `close_agent_view` take no params, so the
- * fixture can answer them honestly with no resolver of its own. `open_agent` is
- * the one left out: it would need a second `agent_ref` resolver here to reach at
- * all — the real one, and every refusal it produces, is covered in
- * `voice/outcome.rs` — and inventing a stand-in for it in a browser is the drift
- * this module's placement is about.
+ * `open_overview`, `open_deck`, `close_agent_view` and `voice_off` take no
+ * params, so the fixture can answer them honestly with no resolver of its own.
+ * `open_agent` is the one left out: it would need a second `agent_ref` resolver
+ * here to reach at all — the real one, and every refusal it produces, is
+ * covered in `voice/outcome.rs` — and inventing a stand-in for it in a browser
+ * is the drift this module's placement is about. `dictate_to_agent` is left out
+ * for the same reason, since it takes the same param.
+ *
+ * (This heading counted *three*, and `close_agent_view` had already made that
+ * four before this sentence was rewritten. It names the rule now rather than a
+ * number, so the next row does not have to remember to edit a heading.)
  *
  * **`close_agent_view` was the fourth until the voice surface could be reached
  * on the `agent` screen at all.** It was left out because that screen's whole
@@ -783,6 +788,19 @@ const FIXTURE_VOICE_COMMANDS: ReadonlyArray<{
     screens: ["agent"],
     unavailableHint: "closing an agent view needs one open",
     report: "Closing the agent view.",
+  },
+  {
+    // The only entry listing all three screens, because the real row lists
+    // NONE — an absent `screens` column means "everywhere". The fixture's own
+    // matcher is `screens.includes(screen)`, so an empty array here would mean
+    // the opposite of what an empty column means in `commands.toml`; spelling
+    // the three out is what keeps the preview and the table agreeing.
+    phrases: ["voice off", "turn off the voice", "stop listening"],
+    action: "voice_off",
+    invoke: "stopVoice",
+    screens: ["deck", "overview", "agent"],
+    unavailableHint: "turning voice off works anywhere",
+    report: "Voice control off.",
   },
 ];
 
@@ -889,13 +907,34 @@ export function fixtureVoiceTranscription(): VoiceTranscriptionDto {
 }
 
 /**
- * The one thing the preview's simulated microphone ever hears.
+ * The DEFAULT line the preview's simulated microphone says.
  *
  * A phrase from {@link FIXTURE_VOICE_COMMANDS} rather than a fresh literal, so
  * a row renamed there changes what the preview hears instead of leaving a
  * canned utterance that quietly stops resolving.
+ *
+ * It is not the only one it can say: `?voice=` on the preview URL supplies a
+ * whole script of utterances instead (see {@link fixtureVoiceScript}).
  */
 export const FIXTURE_VOICE_UTTERANCE = FIXTURE_VOICE_COMMANDS[0].phrases[0];
+
+/**
+ * What the preview's microphone will say, in order, read off the URL.
+ *
+ * Repeated `?voice=` parameters rather than one delimited value: an utterance
+ * is a sentence and every delimiter worth choosing occurs inside one. The
+ * browser tier drives a whole session this way — *"type to the tester"*, then
+ * what to type, then *"stop dictation"* — which is what lets a Playwright test
+ * ask about the utterance AFTER the first one, and a stand-in that spoke once
+ * could not be asked that at all.
+ *
+ * With no parameter it is the single canned utterance the preview has always
+ * had, so every existing page and test sees exactly what it saw before.
+ */
+export function fixtureVoiceScript(search: string): string[] {
+  const spoken = new URLSearchParams(search).getAll("voice").filter((phrase) => phrase.trim() !== "");
+  return spoken.length > 0 ? spoken : [FIXTURE_VOICE_UTTERANCE];
+}
 
 /**
  * One simulated utterance, so the browser tier can drive the WHOLE voice loop
@@ -911,12 +950,12 @@ export const FIXTURE_VOICE_UTTERANCE = FIXTURE_VOICE_COMMANDS[0].phrases[0];
  * `transcribeMs` is `null` and the backend is `stub` for `resolveFixtureVoice`'s
  * reason: nothing was transcribed, so there is no measurement to report.
  */
-export function fixtureVoiceHeard(): VoiceTranscriptionDto {
+export function fixtureVoiceHeard(transcript: string = FIXTURE_VOICE_UTTERANCE): VoiceTranscriptionDto {
   return {
     outcome: {
       kind: "heard",
-      transcript: FIXTURE_VOICE_UTTERANCE,
-      sentence: `Heard: “${FIXTURE_VOICE_UTTERANCE}”.`,
+      transcript,
+      sentence: `Heard: “${transcript}”.`,
     },
     transcribeMs: null,
     backend: "stub",

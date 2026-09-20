@@ -74,6 +74,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { Mic, MicOff, Undo2 } from "lucide-react";
 import { DISPLAY_LIMITS, displayText } from "../lib/displayText";
 import { VOICE_PEER_PROPS } from "../hooks/useInertBackground";
+import { VOICE_ACTIONS, type VoicePanelChannel, type VoicePanelContext } from "../lib/voiceActions";
 import type { VoiceOutcomeDto, VoiceResultDto, VoiceScreen, VoiceStatusDto } from "../lib/bridge";
 import type { DeckRuntimeState } from "../types";
 
@@ -304,6 +305,21 @@ interface VoiceControlPanelProps {
    * other is an ordinary command with no Undo beside it.
    */
   onDispatch: (outcome: Extract<VoiceOutcomeDto, { kind: "dispatch" }>) => { undo?: () => void } | undefined;
+  /**
+   * Where this panel publishes the context members only IT can serve
+   * (PRD #802, the `voice_off` row).
+   *
+   * The mirror of `DeckSurface`'s `voiceChannel` and the same mechanism: a
+   * mutable slot read at DISPATCH time, so the host always dispatches through
+   * this render's closures rather than a copy taken when it last rendered. It
+   * points the other way round the screen switch — a screen publishes upward to
+   * the shell, and this publishes sideways to the same shell — which is what
+   * makes a command served from here callable on every screen.
+   *
+   * Optional, because a panel rendered without a host that dispatches still
+   * works as a microphone; the rows naming these members simply cannot run.
+   */
+  channel?: VoicePanelChannel;
 }
 
 /**
@@ -349,7 +365,7 @@ function progressNote(indicator: VoiceIndicator, phase: VoicePhase): string | un
  * real state: a control with nothing behind it would be worse than its absence,
  * and it is the same reasoning the microphone itself gets one layer down.
  */
-export function VoiceControlPanel({ runtime, screen, onDispatch }: VoiceControlPanelProps) {
+export function VoiceControlPanel({ runtime, screen, onDispatch, channel }: VoiceControlPanelProps) {
   const { declareVoiceScreen, resolveVoice, voiceStart, voiceStop, voiceStatus, voiceCancel } = runtime;
 
   const [on, setOnState] = useState(false);
@@ -862,6 +878,39 @@ export function VoiceControlPanel({ runtime, screen, onDispatch }: VoiceControlP
     setKnown(true);
   }, [claim, releasedAfterRefusal, setOn, setPhase, voiceCancel]);
 
+  /**
+   * The Voice button's own action, as the registry sees it.
+   *
+   * Fire-and-forget rather than awaited, because a registry `run` returns
+   * nothing by design — every entry is a control's click handler, and a click
+   * handler does not report back. The truth about the release still reaches the
+   * user: `turnOff` owns the `stopping` / `unreleased` indicator and the
+   * refusal sentence, exactly as it does for a press.
+   */
+  const stopVoice = useCallback(() => { void turnOff(); }, [turnOff]);
+
+  /*
+    PRD #802 — publish the members only this surface can serve, so a row naming
+    one of them is callable on every screen.
+
+    `DeckSurface`'s own publish is the model and the reasoning is the same:
+    **no dependency array on purpose**, because the object closes over this
+    render's callbacks and a host reading the slot at dispatch time must get the
+    last committed ones rather than the first. Nothing dispatches between a
+    commit and its effects, so the momentary `undefined` the cleanup leaves is
+    unobservable.
+
+    Before the early return below, because it is a hook. A runtime with no
+    `resolveVoice` renders nothing and still publishes — harmless, since nothing
+    can dispatch a row without a resolver to produce one.
+  */
+  useEffect(() => {
+    if (!channel) return;
+    const published: VoicePanelContext = { stopVoice };
+    channel.current = published;
+    return () => { channel.current = undefined; };
+  });
+
   if (!resolveVoice) return null;
 
   const indicator = indicatorFor(known, on, phase);
@@ -929,7 +978,12 @@ export function VoiceControlPanel({ runtime, screen, onDispatch }: VoiceControlP
              press that looks like *turn it on* has to be the retry that closes
              it. `voiceStart` would be refused by `accepts_start` anyway, which
              is the fall-through this replaces. */
-          if (onRef.current || phaseRef.current === "unreleased") void turnOff();
+          /* Through the registry entry rather than straight to `turnOff`, the
+             way `DeckShell` routes its own Close through `closeAgentView`: the
+             `voice_off` row names `stopVoice`, and a button that reached the
+             same behaviour by a second route would be exactly the residual
+             PRD #802 D10 records for the five unspoken capabilities. */
+          if (onRef.current || phaseRef.current === "unreleased") VOICE_ACTIONS.stopVoice.run({ stopVoice });
           else void turnOn();
         }}
       >

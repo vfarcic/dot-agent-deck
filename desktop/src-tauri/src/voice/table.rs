@@ -477,6 +477,9 @@ mod tests {
                 ("open_deck", "openDeck", vec!["overview"]),
                 ("close_agent_view", "closeAgentView", vec!["agent"]),
                 ("open_settings", "openSettings", vec!["deck"]),
+                // No screens: callable everywhere. See the row's own comment —
+                // stopping must never be unavailable.
+                ("voice_off", "stopVoice", vec![]),
             ]
         );
     }
@@ -789,18 +792,47 @@ mod tests {
     }
 
     #[test]
-    fn voice_table_each_shipped_row_is_callable_and_not_callable_somewhere() {
-        // Every shipped row names its screens, so each has both a true and a
-        // false case — which is what makes the unavailable hint reachable.
+    fn voice_table_each_shipped_row_is_callable_somewhere() {
+        // A row callable nowhere is a row nothing can ever run, which no column
+        // would report and no test would otherwise catch.
         for row in super::table().rows() {
             assert!(
                 Screen::ALL.iter().any(|&screen| row.callable_on(screen)),
                 "`{}` is callable nowhere",
                 row.id
             );
+        }
+    }
+
+    #[test]
+    fn voice_table_rows_callable_everywhere_are_the_deliberate_set() {
+        // This test used to be the second half of the one above, asserting that
+        // EVERY row also had a screen it could not run on — "so its hint is
+        // unreachable". That was true of a navigation-only table and stopped
+        // being true the moment a row had to be callable everywhere: stopping
+        // must never be unavailable, and neither must the phrase that lists
+        // what can be said.
+        //
+        // The property is therefore pinned rather than asserted universally. A
+        // row in this list carries an `unavailable_hint` nothing renders, which
+        // is the cost of keeping that column unconditional — so the list is
+        // short on purpose and a new entry in it is a decision someone made.
+        let everywhere: Vec<&str> = super::table()
+            .rows()
+            .iter()
+            .filter(|row| Screen::ALL.iter().all(|&screen| row.callable_on(screen)))
+            .map(|row| row.id.as_str())
+            .collect();
+        assert_eq!(everywhere, vec!["voice_off"]);
+        // And every OTHER row still has both cases, which is what keeps the
+        // not-here sentence reachable for the rows that can produce it.
+        for row in super::table().rows() {
+            if everywhere.contains(&row.id.as_str()) {
+                continue;
+            }
             assert!(
                 Screen::ALL.iter().any(|&screen| !row.callable_on(screen)),
-                "`{}` is callable everywhere, so its hint is unreachable",
+                "`{}` is callable everywhere and is not in the pinned set",
                 row.id
             );
         }
@@ -822,10 +854,16 @@ mod tests {
         // behaviour that already exists rather than adding a route of its own.
         assert_eq!(
             callable(Screen::Deck),
-            vec!["open_agent", "open_overview", "open_settings"]
+            vec!["open_agent", "open_overview", "open_settings", "voice_off"]
         );
-        assert_eq!(callable(Screen::Overview), vec!["open_agent", "open_deck"]);
-        assert_eq!(callable(Screen::Agent), vec!["close_agent_view"]);
+        assert_eq!(
+            callable(Screen::Overview),
+            vec!["open_agent", "open_deck", "voice_off"]
+        );
+        assert_eq!(
+            callable(Screen::Agent),
+            vec!["close_agent_view", "voice_off"]
+        );
     }
 
     #[test]

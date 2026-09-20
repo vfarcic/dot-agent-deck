@@ -52,7 +52,7 @@ import { useInertBackground } from "./hooks/useInertBackground";
 import { useShownTerminals } from "./hooks/useShownTerminals";
 import { useZoom } from "./hooks/useZoom";
 import { agentKey } from "./lib/agentKey";
-import { VOICE_ACTIONS, dispatchVoiceAction, type DeckOverlay, type VoiceActionContext, type VoiceContextChannel, type VoiceDispatchContext, type VoiceDispatchTarget } from "./lib/voiceActions";
+import { VOICE_ACTIONS, dispatchVoiceAction, type DeckOverlay, type VoiceContextChannel, type VoiceDispatchContext, type VoiceDispatchTarget, type VoicePanelContext, type VoiceScreenContext } from "./lib/voiceActions";
 import { unreachableDeckTerminalState } from "./lib/terminalInput";
 import { applyAppearance } from "./lib/appearance";
 import { desktopWorkflowPlatformIssue } from "./lib/platform";
@@ -154,7 +154,17 @@ export function DeckShell({ runtime, workflowPlatformIssue, initialView = { kind
    * re-render the whole shell on every commit of the deck beneath it, to serve
    * a value nothing displays.
    */
-  const deckVoiceContext = useRef<VoiceActionContext | undefined>(undefined);
+  const deckVoiceContext = useRef<VoiceScreenContext | undefined>(undefined);
+  /**
+   * PRD #802 — the VOICE SURFACE's own half of the dispatch context.
+   *
+   * The deck publishes upward through `deckVoiceContext` while it is mounted,
+   * which is what makes a deck-only row servable. The voice surface is mounted
+   * on **every** screen — it is this component's second child, beside the screen
+   * switch — so what it publishes here is servable everywhere, which is exactly
+   * what `voice_off` needs and what neither the deck nor this shell can offer.
+   */
+  const panelVoiceContext = useRef<VoicePanelContext | undefined>(undefined);
   const agentView = view.kind === "agent" ? view : undefined;
   /**
    * Back, and the whole of it. The destination is read off the view rather
@@ -463,6 +473,10 @@ export function DeckShell({ runtime, workflowPlatformIssue, initialView = { kind
     let moved = false;
     const context: VoiceDispatchContext = {
       ...deckVoiceContext.current,
+      /* After the deck's, and the two sets are disjoint by construction — see
+         `VoicePanelContext`, which is a narrow `Pick` precisely so a screen and
+         the voice surface can never offer the same member. */
+      ...panelVoiceContext.current,
       navigate: (next) => { moved = true; setView(next); },
       closeAgentView: () => { moved = true; closeAgent(); },
     };
@@ -509,7 +523,7 @@ export function DeckShell({ runtime, workflowPlatformIssue, initialView = { kind
   return (
     <>
       {screenNode}
-      <VoiceControlPanel runtime={runtime} screen={view.kind} onDispatch={dispatchVoice} />
+      <VoiceControlPanel runtime={runtime} screen={view.kind} onDispatch={dispatchVoice} channel={panelVoiceContext} />
     </>
   );
 }
@@ -976,7 +990,7 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
    * entries also have a second `setState` path in this file — `voiceActions.ts`
    * names them, and the narrower claim is the true one.
    */
-  const voiceContext: VoiceActionContext = {
+  const voiceContext: VoiceScreenContext = {
     navigate: (view) => onNavigate?.(view),
     closeAgentView: () => onCloseAgent?.(),
     openOverlay: (overlay) => overlaySetters[overlay](true),

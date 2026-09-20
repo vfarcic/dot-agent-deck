@@ -18,14 +18,19 @@ import type { DeckView } from "../types";
  * there if you need the number, rather than trusting one written here.)
  *
  * So an entry is **not** a description of a control. It IS the control: the rail
- * buttons, the palette items, the agent tile's open/close pair and the
- * overview's row all run through `VOICE_ACTIONS[id].run(...)`. That is the
+ * buttons, the palette items, the agent tile's open/close pair, the overview's
+ * row and — since `stopVoice` — the Voice button itself all run through
+ * `VOICE_ACTIONS[id].run(...)`. That is the
  * property that earns the capability definition M3's guard checks — an entry
  * cannot be deleted without breaking a control, and a control reachable from the
  * rail or the palette cannot exist without an entry. A registry beside the app
  * rather than inside it would be a checked-in list under a better name.
  *
- * # The seam is the RAIL, the PALETTE and the four voice-reachable entries
+ * # The seam is the RAIL, the PALETTE, the VOICE SURFACE and the voice-reachable entries
+ *
+ * (It said *four* voice-reachable entries, and was already wrong by one before
+ * this PR added more. The heading no longer counts them for the reason the
+ * paragraph above gives about numbers in comments.)
  *
  * **Not "one capability, one dispatch path", which is what M2's commit body and
  * an earlier draft of this comment said and is not true.** Five `no_voice`
@@ -138,6 +143,15 @@ export type VoiceActionContext = {
   focusTerminal: (agentId: string) => void;
   /** Move the deterministic fixture loop one node. Fixture mode only. */
   advanceFixture: () => void;
+  /**
+   * Turn voice control off: release the microphone and stop listening.
+   *
+   * **Served by the VOICE SURFACE rather than by a screen**, which is what
+   * makes it servable everywhere — see {@link VoicePanelChannel}. The Voice
+   * button and this are the same control by two routes, exactly as the rail
+   * button and `openOverview` are.
+   */
+  stopVoice: () => void;
 };
 
 /**
@@ -177,7 +191,10 @@ export type VoiceActionEntry = {
 };
 
 export const VOICE_ACTIONS = {
-  // -- the four the command table names today -----------------------------
+  // -- the ones the command table names today -----------------------------
+  //
+  // Deliberately not counted here. A number in a comment is read as a property
+  // and this one has been wrong twice; `grep 'voice: true'` is the count.
 
   openAgent: {
     label: "Open one agent's pane over the current screen",
@@ -219,6 +236,20 @@ export const VOICE_ACTIONS = {
     needs: ["closeAgentView"],
     /** The VIEW, never the pane. The agent keeps running and keeps its terminal. */
     run: (context: Pick<VoiceActionContext, "closeAgentView">) => context.closeAgentView(),
+  },
+
+  stopVoice: {
+    label: "Turn voice control off",
+    voice: true,
+    needs: ["stopVoice"],
+    /**
+     * The Voice button's own action, reached by voice.
+     *
+     * It releases the microphone and nothing else: no screen moves, no view
+     * closes, no agent stops. A row that could only be run by speaking would be
+     * a second control surface, and this one is the first surface's button.
+     */
+    run: (context: Pick<VoiceActionContext, "stopVoice">) => context.stopVoice(),
   },
 
   // -- the rest of the rail and the palette -------------------------------
@@ -373,6 +404,37 @@ export type VoiceDispatchTarget = AgentViewTarget;
 export type VoiceDispatchContext = Pick<VoiceActionContext, "navigate" | "closeAgentView"> & Partial<VoiceActionContext>;
 
 /**
+ * The members the VOICE SURFACE itself serves, and the channel it publishes
+ * them through (PRD #802, the `voice_off` row).
+ *
+ * {@link VoiceContextChannel} below is a screen publishing upward to its
+ * parent; this is the same mechanism pointed the other way round the screen
+ * switch. The voice surface is a sibling of that switch (see `App.tsx`'s
+ * `DeckShell`), so it is mounted on every screen — which is precisely what a
+ * command that must never be unavailable needs, and what neither the deck nor
+ * the shell can offer.
+ *
+ * A narrow `Pick` rather than a `Partial<VoiceActionContext>`, so the split is
+ * legible at both ends and enforced at one: {@link VoiceScreenContext} is this
+ * set's complement, so a screen that tried to serve one of these members would
+ * not type-check, and neither would a panel that left one out.
+ */
+export type VoicePanelContext = Pick<VoiceActionContext, "stopVoice">;
+export type VoicePanelChannel = { current: VoicePanelContext | undefined };
+
+/**
+ * Everything a SCREEN is expected to serve: the context minus the voice
+ * surface's own members.
+ *
+ * `Omit<…, keyof VoicePanelContext>` rather than a second hand-written list —
+ * the two halves are complements by construction, so moving a member from one
+ * to the other is one edit and cannot leave a member served twice or not at
+ * all. Before `stopVoice` existed a screen served the whole context and this
+ * was `VoiceActionContext` itself.
+ */
+export type VoiceScreenContext = Omit<VoiceActionContext, keyof VoicePanelContext>;
+
+/**
  * How a screen publishes its half of the context up to the host that dispatches
  * (PRD #802 M7).
  *
@@ -386,7 +448,7 @@ export type VoiceDispatchContext = Pick<VoiceActionContext, "navigate" | "closeA
  * Deliberately not a React context: the consumer is `DeckShell`, which is the
  * screen's PARENT, and a context travels the other way.
  */
-export type VoiceContextChannel = { current: VoiceActionContext | undefined };
+export type VoiceContextChannel = { current: VoiceScreenContext | undefined };
 
 /**
  * Dispatch the action an outcome's `invoke` names (PRD #802 M6).

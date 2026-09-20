@@ -931,19 +931,31 @@ mod tests {
 
     #[tokio::test]
     async fn voice_outcome_renders_each_rows_hint_on_a_screen_that_cannot_run_it() {
-        // Every shipped row's hint is reachable, so none of them is dead prose.
+        // Every shipped row's hint is reachable on some screen, so it is not
+        // dead prose — EXCEPT for a row that is callable everywhere, which has
+        // no such screen by construction. `voice_table_rows_callable_everywhere_
+        // are_the_deliberate_set` pins which rows are in that position; this
+        // skips exactly those rather than asserting over a `find` that would
+        // panic on them.
+        let mut checked = 0;
         for row in table().rows() {
-            let screen = Screen::ALL
+            let Some(screen) = Screen::ALL
                 .into_iter()
                 .find(|&screen| !row.callable_on(screen))
-                .expect("every row is unavailable somewhere");
+            else {
+                continue;
+            };
             let resolver = StubResolver::new().answering("do it", IntentAnswer::new(&row.id));
             let outcome = run(&resolver, screen, &fleet(), "do it").await;
             assert_eq!(
                 outcome.sentence(),
                 format!("Not here — {}.", row.unavailable_hint)
             );
+            checked += 1;
         }
+        // And the skip is not the whole table: a `continue` that swallowed every
+        // row would leave this test asserting nothing at all.
+        assert!(checked >= 4, "only {checked} rows had a hint to render");
     }
 
     #[tokio::test]

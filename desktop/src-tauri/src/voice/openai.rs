@@ -249,6 +249,7 @@ mod tests {
                 "open_deck",
                 "close_agent_view",
                 "open_settings",
+                "voice_off",
                 "none"
             ]
         );

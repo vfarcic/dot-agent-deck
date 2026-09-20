@@ -32,9 +32,17 @@
 #                    one blocks an action before it does. Do not rename it back.
 #   [[commands.params]]  name + kind, `kind` from the closed resolver set.
 #
-# This slice is NAVIGATION ONLY (PRD #802 Scope). No row here starts an agent,
-# stops one, or answers a permission prompt, which is why none of them needs a
-# confirm-before-acting step. `close_agent_view` closes a VIEW rather than a
+# **This table was NAVIGATION ONLY and is not any more**, which is worth saying
+# in the sentence that used to claim it rather than leaving the claim to rot:
+# `voice_off` stops the microphone, `list_commands` opens an overlay, and
+# `dictate_to_agent` aims the microphone at one agent and types what it hears
+# into that agent's terminal. What still holds is the narrower property the old
+# sentence was really protecting — **no row here starts an agent, stops one, or
+# answers a permission prompt**, which is why none of them needs the
+# confirm-before-acting step PRD #802 D5 is about. `dictate_to_agent` is the one
+# to weigh against that, and it earns its place on two counts: it types into a
+# VISIBLE input the user can edit, and it submits only behind a countdown the
+# user can cancel by speaking. `close_agent_view` closes a VIEW rather than a
 # terminal pane — see the comment above that row, because the two are one word
 # apart in speech.
 
@@ -111,3 +119,31 @@ invoke      = "openSettings"
 screens     = ["deck"]
 unavailable_hint = "settings open from the deck"
 report      = "Opening settings."
+
+# PRD #802 — the first row with NO `screens` key, which means callable
+# everywhere, and that is the requirement rather than an oversight: stopping
+# must never be unavailable. Every other row narrows because the behaviour it
+# exposes is reachable only from some screens; this one exposes the Voice
+# button, which is a peer of the screen switch and is mounted on all three.
+#
+# `unavailable_hint` is still required and is the one column here nothing
+# renders today: `Unavailable` is produced only by a row the current screen
+# cannot run, and this row has no such screen. The column stays required rather
+# than becoming conditional on `screens` — a second rule in the parser for one
+# row shape — and the fragment below is what would render if the row were ever
+# narrowed. `voice_table_rows_callable_everywhere_are_the_deliberate_set` pins
+# which rows are in this position so it stays a decision.
+#
+# It is `stopVoice` and not `toggleVoice`: the table cannot see which way a
+# toggle is pointing (the same reason `toggleEvidenceDrawer` carries a
+# `no_voice`), and "voice on" is a thing nothing could hear anyway.
+[[commands]]
+id          = "voice_off"
+description = """Turn voice control off — close the microphone and stop listening, so nothing
+further is heard until the Voice button is pressed again. Use for voice off, turn off the voice,
+turn voice off, stop listening, stop voice control, stop voice, or any request to stop LISTENING.
+This stops the microphone and nothing else: it changes no screen, closes no view, and stops no
+agent."""
+invoke      = "stopVoice"
+unavailable_hint = "turning voice off works anywhere"
+report      = "Voice control off."

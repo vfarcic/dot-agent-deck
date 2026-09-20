@@ -1,4 +1,4 @@
-import { createFixtureFleet, DEFAULT_PROFILES, fixtureVoiceHeard, fixtureVoiceStatus, fixtureVoiceTranscription, resolveFixtureVoice, type FixtureState } from "../data/fixture";
+import { createFixtureFleet, DEFAULT_PROFILES, fixtureVoiceHeard, fixtureVoiceScript, fixtureVoiceStatus, fixtureVoiceTranscription, resolveFixtureVoice, type FixtureState } from "../data/fixture";
 import { agentKey } from "./agentKey";
 import { getTerminal } from "./terminalRegistry";
 import { applyHandoffEvent, mapDaemonEvent, MAX_LIVE_EVIDENCE } from "./daemonEvents";
@@ -1922,16 +1922,23 @@ class FixtureDeckBridge implements DeckBridge {
    * The preview's simulated microphone (PRD #802 M6).
    *
    * `recording` is whether a start has been accepted and not yet released;
-   * `spoken` latches once the one canned utterance has been delivered, so the
-   * preview says one thing per activation and is then quiet. A stand-in that
-   * spoke every quarter second would be a loop that overwrote its own report
-   * before anyone could read it — and a person who says one command and stops
-   * is the behaviour being previewed anyway.
+   * `delivered` latches once this activation's utterance has been handed over,
+   * so the preview says **one thing per activation** and is then quiet. A
+   * stand-in that spoke every quarter second would be a loop that overwrote its
+   * own report before anyone could read it.
    *
-   * Reset by `voiceCancel`, which is what turning voice off calls, so the next
-   * activation speaks again.
+   * `spoken` counts how far through {@link fixtureVoiceScript} the session has
+   * got, and — unlike `delivered` — it is NOT reset by `voiceCancel`. The
+   * script is the whole session's lines rather than one activation's, so a
+   * preview that rewound on every stop could never be driven past its first
+   * utterance: *"voice off"* would turn voice off, and the next press would say
+   * it again. With no `?voice=` parameter the script is one line, which is the
+   * behaviour this had before the parameter existed.
    */
-  private microphone = { recording: false, spoken: false };
+  private microphone = { recording: false, delivered: false, spoken: 0 };
+
+  /** What this preview's microphone will say, in order. */
+  private readonly voiceScript = fixtureVoiceScript(window.location.search);
 
   /**
    * Whether the preview offers a microphone path.
@@ -1965,8 +1972,9 @@ class FixtureDeckBridge implements DeckBridge {
   async voiceStatus(): Promise<VoiceStatusDto> {
     if (!(await this.voiceAvailable())) return fixtureVoiceStatus();
     const speaking = { available: true, backend: "remote" as const };
-    if (this.microphone.recording && !this.microphone.spoken) {
-      this.microphone.spoken = true;
+    const more = this.microphone.spoken < this.voiceScript.length;
+    if (this.microphone.recording && more && !this.microphone.delivered) {
+      this.microphone.delivered = true;
       return fixtureVoiceStatus({ ...speaking, state: "done", capturedMs: 1_200 });
     }
     return fixtureVoiceStatus({ ...speaking, state: this.microphone.recording ? "recording" : "idle" });
@@ -1987,13 +1995,26 @@ class FixtureDeckBridge implements DeckBridge {
   async voiceStop(): Promise<VoiceTranscriptionDto> {
     const available = await this.voiceAvailable();
     this.microphone.recording = false;
-    return available ? fixtureVoiceHeard() : fixtureVoiceTranscription();
+    // Re-armed for the NEXT activation, which the pipeline opens by itself: the
+    // cycle ends by listening again, so this is what lets the script's second
+    // line be heard without a second press.
+    this.microphone.delivered = false;
+    if (!available) return fixtureVoiceTranscription();
+    const line = this.voiceScript[this.microphone.spoken];
+    // A stop with the script exhausted is not reachable through the surface —
+    // `voiceStatus` reports `done` only while a line is left — so this is the
+    // defensive arm rather than a path. An empty transcript resolves to
+    // no-match, which is the honest answer to a microphone that heard nothing.
+    this.microphone.spoken = Math.min(this.microphone.spoken + 1, this.voiceScript.length);
+    return fixtureVoiceHeard(line ?? "");
   }
 
   /** Idempotent and never refused, for the reason the live one is not. */
   async voiceCancel(): Promise<VoiceStatusDto> {
     await Promise.resolve();
-    this.microphone = { recording: false, spoken: false };
+    // `spoken` survives: see the field's own note. A cancel releases the
+    // device; it does not rewind the session's script.
+    this.microphone = { ...this.microphone, recording: false, delivered: false };
     return fixtureVoiceStatus();
   }
 
