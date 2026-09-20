@@ -76,6 +76,17 @@ pub const REGISTRY_TS: &str = "desktop/src/lib/voiceActions.ts";
 pub const DECK_VIEW_TS: &str = "desktop/src/types.ts";
 /// Where `ParamKind` — the closed resolver set — is declared.
 pub const PARAM_KIND_RS: &str = "desktop/src-tauri/src/voice/table.rs";
+/// The voice surface, which holds the only spoken phrases the table does not
+/// own (PRD #802 D6's dictation mode).
+pub const PANEL_TSX: &str = "desktop/src/components/VoiceControlPanel.tsx";
+
+/// The row whose `description` has to name every phrase [`VOICE_OFF_LIST`]
+/// matches locally.
+const VOICE_OFF_ROW: &str = "voice_off";
+/// The panel's local `voice off` phrase list.
+const VOICE_OFF_LIST: &str = "VOICE_OFF_PHRASES";
+/// The panel's local dictation-exit phrase list.
+const EXIT_LIST: &str = "VOICE_DICTATION_EXIT_PHRASES";
 
 /// The rule sentence, quoted in every failure.
 ///
@@ -84,20 +95,26 @@ pub const PARAM_KIND_RS: &str = "desktop/src-tauri/src/voice/table.rs";
 /// consistent, not that the app's capabilities are all in it.
 pub const VOICE_REGISTRY_RULE: &str = "PRD #802 check 13: `desktop/src-tauri/src/voice/commands.toml` and `VOICE_ACTIONS` \
      (`desktop/src/lib/voiceActions.ts`) must resolve against each other, and every registry entry must carry either \
-     `voice: true` or a written `no_voice` reason. WHAT THIS RULE DOES NOT SEE: a control wired with a bare `onClick` \
+     `voice: true` or a written `no_voice` reason, and the two phrase lists in \
+     `desktop/src/components/VoiceControlPanel.tsx` must stay disjoint and covered by the `voice_off` row's \
+     description. WHAT THIS RULE DOES NOT SEE: a control wired with a bare `onClick` \
      that never reaches the registry — 80 such sites in non-test `.tsx` when this was written — so a green check 13 is \
      NOT evidence that no capability was forgotten";
 
-/// The four texts the rule reads, so the assertions can be driven from planted
-/// input as well as from the tree.
+/// The texts the rule reads, so the assertions can be driven from planted input
+/// as well as from the tree.
+///
+/// (It was *four*, and the count is deliberately no longer in this sentence —
+/// see the note in `voiceActions.ts` about numbers in comments.)
 pub struct Sources {
     pub commands_toml: String,
     pub registry_ts: String,
     pub deck_view_ts: String,
     pub param_kind_rs: String,
+    pub panel_tsx: String,
 }
 
-/// Read the four files and check them. Every read failure is a finding.
+/// Read every file and check them. Every read failure is a finding.
 pub fn run(root: &Path) -> Vec<String> {
     let mut missing = Vec::new();
     let read = |rel: &'static str, missing: &mut Vec<String>| match std::fs::read_to_string(
@@ -117,6 +134,7 @@ pub fn run(root: &Path) -> Vec<String> {
         registry_ts: read(REGISTRY_TS, &mut missing),
         deck_view_ts: read(DECK_VIEW_TS, &mut missing),
         param_kind_rs: read(PARAM_KIND_RS, &mut missing),
+        panel_tsx: read(PANEL_TSX, &mut missing),
     };
     if !missing.is_empty() {
         return missing.into_iter().map(annotate).collect();
@@ -212,7 +230,125 @@ pub fn check(sources: &Sources) -> Vec<String> {
         }
     }
 
+    // Assertions 5 and 6 (PRD #802 D6): the panel's two local phrase lists.
+    //
+    // **These are the only spoken words in the product the command table does
+    // not own**, and they exist for a measured reason: while dictating, running
+    // the intent backend over every sentence would cost a model call each time
+    // and would reintroduce the false positive a distinctive phrase exists to
+    // remove. The trade is a second place where wording lives, and the whole
+    // point of this rule is that a second place does not get to drift.
+    phrase_lists(sources, &rows, &mut findings);
+
     findings.into_iter().map(annotate).collect()
+}
+
+/// Assertions 5 and 6, over the panel's local phrase lists.
+///
+/// **5 — every `voice off` phrase the panel matches is one the model was told
+/// about.** A phrase in the panel's list and not in the row's `description` is
+/// the worst kind of drift here: it stops dictation but is not a command
+/// outside it, so the same words work in one mode and are typed into an agent
+/// in the other, and nothing at run time would say so.
+///
+/// **6 — the two lists are disjoint.** The panel checks `voice off` first and
+/// its comment says the order "decides nothing today" *because* they share no
+/// phrase. That is a claim about the implementation, so it is checked rather
+/// than asserted: a phrase added to both would make the precedence silently
+/// load-bearing, which is exactly the state that comment promises is not
+/// current.
+///
+/// The check runs one way only. A phrasing in the row's `description` that the
+/// panel does not match is a real inconsistency too — it would work as a
+/// command and be typed while dictating — but the description is a PROMPT
+/// rather than a list, so there is nothing to enumerate it from without
+/// reading prose. Stated here because a reader would otherwise infer the
+/// stronger property from a green check.
+fn phrase_lists(sources: &Sources, rows: &[Row], findings: &mut Vec<String>) {
+    let text: Vec<char> = sources.panel_tsx.chars().collect();
+    let masked = mask(&text);
+    let list = |name: &str, findings: &mut Vec<String>| match array_body(&masked, name) {
+        Some(body) => {
+            let found = string_literals(&text, &masked, body);
+            if found.is_empty() {
+                findings.push(format!(
+                    "{PANEL_TSX}: `{name}` yielded no phrases — check 13 cannot compare a list it cannot read, so                      this is a failure rather than a skip"
+                ));
+            }
+            found
+        }
+        None => {
+            findings.push(format!(
+                "{PANEL_TSX}: holds no `{name} = [ … ]` array literal. If the list moved, move this assertion with it                  rather than deleting it — it is the only thing keeping the panel's phrases and the `{VOICE_OFF_ROW}`                  row's description in step"
+            ));
+            BTreeSet::new()
+        }
+    };
+    let off = list(VOICE_OFF_LIST, findings);
+    let exit = list(EXIT_LIST, findings);
+
+    // Assertion 5.
+    match rows.iter().find(|row| row.id == VOICE_OFF_ROW) {
+        Some(row) => {
+            // Whitespace-collapsed before the substring test, because a
+            // `"""…"""` description keeps its newlines: a phrase that happened
+            // to straddle a line break would fail this check while reading
+            // perfectly to the model, so a reflow of the prose would go red for
+            // no reason anyone could act on.
+            let description = row
+                .description
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .to_lowercase();
+            for phrase in &off {
+                if !description.contains(&phrase.to_lowercase()) {
+                    findings.push(format!(
+                        "{PANEL_TSX}: `{VOICE_OFF_LIST}` matches {phrase:?}, which the `{VOICE_OFF_ROW}` row's                          description in {COMMANDS_TOML} does not name. The model is never told about it, so those                          words stop dictation and are NOT a command outside it"
+                    ));
+                }
+            }
+        }
+        None => findings.push(format!(
+            "{COMMANDS_TOML}: holds no `{VOICE_OFF_ROW}` row, so the phrases {PANEL_TSX} matches locally back nothing"
+        )),
+    }
+
+    // Assertion 6.
+    for phrase in off.intersection(&exit) {
+        findings.push(format!(
+            "{PANEL_TSX}: {phrase:?} is in both `{VOICE_OFF_LIST}` and `{EXIT_LIST}`. The panel checks the first              list first and says the order decides nothing BECAUSE they are disjoint; a shared phrase makes that              precedence silently load-bearing"
+        ));
+    }
+}
+
+/// The body of the array literal that `name` is assigned, `[` excluded.
+///
+/// [`literal_body`]'s sibling for `[ … ]` rather than `{ … }`. Separate rather
+/// than parameterised on the bracket, because the two are read by different
+/// assertions and a shared helper taking a delimiter reads worse than two that
+/// say which shape they are for.
+fn array_body(masked: &[char], name: &str) -> Option<Range<usize>> {
+    let at = find(masked, 0, name)?;
+    let equals = masked[at..].iter().position(|c| *c == '=')? + at;
+    let open = skip_space(masked, equals + 1);
+    if open >= masked.len() || masked[open] != '[' {
+        return None;
+    }
+    let mut depth = 0usize;
+    for (offset, character) in masked[open..].iter().enumerate() {
+        match character {
+            '[' => depth += 1,
+            ']' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(open + 1..open + offset);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 fn joined<'a>(values: impl Iterator<Item = &'a str>) -> String {
@@ -235,6 +371,10 @@ struct Row {
     /// `(name, kind)`, so a bad kind can be reported against the param that
     /// declared it rather than against the row alone.
     params: Vec<(String, String)>,
+    /// The model-facing prompt, read by assertion 5 and nothing else. Kept even
+    /// though it is prose, because the panel's local phrase list has to be a
+    /// subset of what the model was told about.
+    description: String,
 }
 
 /// Parse `commands.toml` with the same library `table.rs` parses it with.
@@ -324,6 +464,11 @@ fn command_rows(source: &str, findings: &mut Vec<String>) -> Vec<Row> {
             invoke,
             screens,
             params,
+            // Absent is an empty string rather than a finding: `description` is
+            // required by `table.rs`'s own parser, which fails the build first,
+            // and duplicating that refusal here would report one malformation
+            // twice.
+            description: string_field(table, "description").unwrap_or_default(),
         });
     }
     rows
@@ -920,6 +1065,7 @@ mod tests {
             registry_ts: read(REGISTRY_TS),
             deck_view_ts: read(DECK_VIEW_TS),
             param_kind_rs: read(PARAM_KIND_RS),
+            panel_tsx: read(PANEL_TSX),
         }
     }
 
@@ -1155,6 +1301,68 @@ mod tests {
 
         let no_kinds = planted(|sources| sources.param_kind_rs = "pub enum Other {}".to_string());
         assert_reports(&no_kinds, "yielded no kind literals");
+
+        let no_panel =
+            planted(|sources| sources.panel_tsx = "export const OTHER = [];".to_string());
+        assert_reports(&no_panel, "holds no `VOICE_OFF_PHRASES = [");
+    }
+
+    /// Assertions 5 and 6, the panel's local phrase lists.
+    #[test]
+    fn a_planted_phrase_the_model_was_never_told_about_is_caught() {
+        // A phrase the panel matches and the row's description does not name:
+        // it stops dictation and is NOT a command outside it, and nothing at
+        // run time would say so.
+        let unnamed = planted(|sources| {
+            sources.panel_tsx = sources
+                .panel_tsx
+                .replace("\"stop listening\"]", "\"stop listening\", \"shut up\"]");
+        });
+        assert_reports(&unnamed, "\"shut up\"");
+
+        // A phrase straddling a line break in the `"""…"""` description still
+        // counts: the description is prose the model reads as one paragraph,
+        // and a reflow must not go red.
+        let reflowed = planted(|sources| {
+            sources.commands_toml = sources.commands_toml.replace(
+                "turn voice off, stop listening",
+                "turn voice off,\nstop listening",
+            );
+        });
+        assert!(
+            reflowed.is_empty(),
+            "a reflowed description went red: {}",
+            reflowed.join("\n")
+        );
+
+        // The same drift from the other end: the row is gone, so the phrases
+        // back nothing at all.
+        let no_row = planted(|sources| {
+            sources.commands_toml = sources
+                .commands_toml
+                .replace("id          = \"voice_off\"", "id          = \"voice_of\"");
+        });
+        assert_reports(&no_row, "holds no `voice_off` row");
+
+        // Assertion 6: the panel checks one list before the other and says the
+        // order decides nothing BECAUSE they are disjoint.
+        let shared = planted(|sources| {
+            sources.panel_tsx = sources.panel_tsx.replace(
+                "\"stop dictation\", ",
+                "\"stop dictation\", \"voice off\", ",
+            );
+        });
+        assert_reports(&shared, "is in both");
+
+        // And the lists are genuinely read rather than assumed empty, which is
+        // what would make every assertion above vacuous.
+        let empty = planted(|sources| {
+            sources.panel_tsx = sources.panel_tsx.replace(
+                "export const VOICE_DICTATION_EXIT_PHRASES = [",
+                "export const VOICE_DICTATION_EXIT_PHRASES = [] as const;\nconst UNUSED = [",
+            );
+        });
+        assert_reports(&empty, "yielded no phrases");
     }
 
     /// The masker is what makes every scan above safe, so it is pinned
