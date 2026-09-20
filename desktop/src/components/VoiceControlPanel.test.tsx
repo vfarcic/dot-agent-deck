@@ -773,6 +773,88 @@ describe("voice control panel", () => {
   });
 
   /**
+   * Scenario: the reconcile above could not release the device, and the user
+   * presses Voice. The press must RETRY the release rather than try to start a
+   * recording Rust would refuse, and the button must end at off once it works.
+   *
+   * The recovery half of the case above: a presentation that never resolves is
+   * only half a fix, and the press that looks like *turn it on* is the one the
+   * user has.
+   */
+  it("retries the release when the button is pressed after a failed reconcile", async () => {
+    const mic = survivingMicrophone();
+    const first = render(<DeckShell runtime={runtime(resolver(result(DISPATCH)), mic.controls)} />);
+
+    await turnVoiceOn(mic.controls);
+    mic.loseTheNextRelease();
+    first.unmount();
+    await flush();
+
+    mic.refuseTheNextRelease();
+    render(<DeckShell runtime={runtime(resolver(result(DISPATCH)), mic.controls)} />);
+    await flush();
+    expect(mic.state()).toBe("recording");
+    expect(screen.getByTestId("voice-report")).toHaveTextContent(/press voice again/i);
+
+    await act(async () => { fireEvent.click(voiceButton()); });
+    await flush();
+
+    // The retry released it, and nothing tried to start a second recording
+    // over the one Rust was holding.
+    expect(mic.state()).toBe("idle");
+    expect(mic.controls.voiceStart).toHaveBeenCalledTimes(1);
+    expect(voiceButton()).toHaveTextContent(/voice\s+off/i);
+    expect(voiceButton()).toHaveAttribute("aria-pressed", "false");
+  });
+
+  /**
+   * Scenario: the mount reconcile's status read fails, so the panel settles to
+   * off knowing nothing — and the press that follows finds a session Rust IS
+   * holding and cannot release. The press must not fall through to
+   * `voiceStart`, which `accepts_start` refuses anyway, and must not leave the
+   * button off over a device that is open.
+   *
+   * The sibling of the mount-reconcile case, on the path that HAS a press to
+   * report against — `turnOn` reconciles again for exactly this reason. It used
+   * to end at `off` with an error sentence beside it, which is a better answer
+   * than silence and is still the wrong word on the only indication the
+   * microphone is open.
+   */
+  it("does not claim Voice off when a press cannot release the held microphone", async () => {
+    const refusal = "the microphone call failed: the device would not let go";
+    // Rust is already holding a recording no panel in this test ever started —
+    // a session that outlived the webview that opened it.
+    let firstStatus = true;
+    const voice = voiceControls({
+      voiceStatus: vi.fn(async () => {
+        if (firstStatus) {
+          firstStatus = false;
+          // The mount reconcile learns nothing, so it settles to off: this is
+          // the state the press starts from.
+          throw "the status call failed";
+        }
+        return voiceStatus({ state: "recording", available: true, backend: "local" });
+      }),
+      voiceStart: vi.fn(async () => { throw "cannot start the microphone: a recording is already running"; }),
+      voiceCancel: vi.fn(async () => { throw refusal; }),
+    });
+    render(<DeckShell runtime={runtime(resolver(result(DISPATCH)), voice)} />);
+    await flush();
+    expect(voiceButton()).toHaveTextContent(/voice\s+off/i);
+
+    await act(async () => { fireEvent.click(voiceButton()); });
+    await flush();
+
+    expect(voice.voiceCancel).toHaveBeenCalledTimes(1);
+    expect(voice.voiceStart).not.toHaveBeenCalled();
+    expect(voiceButton()).not.toHaveTextContent(/voice\s+off/i);
+    expect(voiceButton().querySelector("svg.lucide-mic-off")).toBeNull();
+    expect(voiceButton()).not.toHaveAttribute("aria-pressed", "false");
+    expect(screen.getByTestId("voice-report")).toHaveTextContent(refusal);
+    expect(screen.getByTestId("voice-report")).toHaveTextContent(/press voice again/i);
+  });
+
+  /**
    * Scenario: the panel is freshly mounted and the microphone has not answered
    * yet. The button says it is finding out rather than claiming the device is
    * closed, and settles to off once the answer arrives.

@@ -232,6 +232,14 @@ type VoiceIndicator = "off" | "on" | "stopping" | "checking";
 
 function indicatorFor(known: boolean, on: boolean, phase: VoicePhase): VoiceIndicator {
   if (phase === "stopping") return "stopping";
+  /* A release Rust REFUSED, which is a statement about the device rather than
+     about the user's toggle — so it outranks both of them. `turnOff` reaches
+     this with `on` still true and got the same answer by accident; the mount
+     reconcile and `turnOn` reach it with `on` false and `known` either way,
+     and would otherwise render `Voice off` or `Voice…` over a microphone whose
+     release just failed. One presentation for one situation, wherever it
+     happened: the device may still be open, and the press is the retry. */
+  if (phase === "unreleased") return "on";
   if (on) return "on";
   return known ? "off" : "checking";
 }
@@ -425,6 +433,32 @@ export function VoiceControlPanel({ runtime, screen, onDispatch }: VoiceControlP
   useEffect(() => { cancelRef.current = voiceCancel; }, [voiceCancel]);
   const statusRef = useRef(voiceStatus);
   useEffect(() => { statusRef.current = voiceStatus; }, [voiceStatus]);
+
+  /**
+   * After a release Rust refused: is the device gone anyway?
+   *
+   * A rejection says the CALL failed, not what it did — the session's own
+   * `cancel` is idempotent and never refused, so a rejection is a blocking join
+   * that did not complete or a command that never reached the session. Asking
+   * is the only way to tell the two apart, and the unknown answers all resolve
+   * to *not released*: this is the one place where guessing in the direction
+   * that suits the button would put *Voice off* over a live microphone.
+   *
+   * Reached through `statusRef` rather than the prop, and with an empty
+   * dependency list, because all three callers need it: `turnOff`, `turnOn` and
+   * the mount reconcile below — and the reconcile's list has to stay stable or
+   * a runtime that rebuilt its function identities would re-run it and cancel a
+   * live recording nobody asked to stop.
+   */
+  const releasedAfterRefusal = useCallback(async () => {
+    const ask = statusRef.current;
+    if (!ask) return false;
+    try {
+      return !stillHeld((await ask()).state);
+    } catch {
+      return false;
+    }
+  }, []);
   useEffect(() => () => {
     abandon();
     if (onRef.current) void cancelRef.current?.().catch(() => undefined);
@@ -463,17 +497,42 @@ export function VoiceControlPanel({ runtime, screen, onDispatch }: VoiceControlP
     if (!ask) return;
     const ours = claim();
     void (async () => {
+      let status: VoiceStatusDto | undefined;
       try {
-        const status = await ask();
-        if (ours() && stillHeld(status.state)) await cancelRef.current?.();
+        status = await ask();
       } catch {
-        // A status read or a release that failed says nothing about the device,
-        // and there is no press to report it against. `turnOn` reconciles again
-        // at the next one.
+        // A status read that failed says nothing about the device, and there is
+        // no press to report it against. `turnOn` reconciles again at the next
+        // one, and until then the button settles to what this panel knows —
+        // which is that nothing here ever opened the microphone.
       }
-      if (ours()) setKnown(true);
+      if (!ours()) return;
+      if (status && stillHeld(status.state)) {
+        try {
+          await cancelRef.current?.();
+        } catch (cause) {
+          /* The release was REFUSED, and this is the surface with the LEAST
+             information: a fresh panel, no press to report against, and a
+             device the previous panel left open. `setKnown(true)` here used to
+             run anyway, rendering `Voice off` and a crossed-out microphone over
+             exactly that — the same class as the blocker `turnOff` was rewritten
+             for, from the one direction that had no press behind it.
+
+             `releasedAfterRefusal` because a rejection says the CALL failed and
+             not what it did, and every unknown answer resolves to *not
+             released*. */
+          if (!(await releasedAfterRefusal())) {
+            if (!ours()) return;
+            setPhase("unreleased");
+            setProblem(`${VOICE_RELEASE_REFUSED} ${sentenceOf(cause)}`);
+            return;
+          }
+        }
+        if (!ours()) return;
+      }
+      setKnown(true);
     })();
-  }, [claim]);
+  }, [claim, releasedAfterRefusal, setPhase]);
 
   /*
     Defence in depth, and explicitly NOT the mechanism. `pagehide` is the one
@@ -707,36 +766,27 @@ export function VoiceControlPanel({ runtime, screen, onDispatch }: VoiceControlP
       if (status && stillHeld(status.state)) {
         try {
           await cancelRef.current?.();
-        } catch {
-          // Whatever is left, the start below runs into it and reports it with
-          // Rust's own sentence, which is a better answer than one invented
-          // here from a release that failed.
+        } catch (cause) {
+          /* This used to fall through to `voiceStart`, which `accepts_start`
+             refuses while the session is held — so the press ended at `off`
+             with an error sentence beside it, over a device that is still
+             open. An error sentence is better than silence and it is still the
+             wrong word on the button, and it is what made
+             `docs/develop/desktop-gui.md`'s "every unknown resolves to not
+             released" false on this path. */
+          if (!(await releasedAfterRefusal())) {
+            if (!ours()) return;
+            setPhase("unreleased");
+            setProblem(`${VOICE_RELEASE_REFUSED} ${sentenceOf(cause)}`);
+            return;
+          }
         }
         if (!ours()) return;
       }
     }
     setOn(true);
     await listen(ours);
-  }, [claim, forget, listen, setOn, setPhase, voiceStart, voiceStatus, voiceStop]);
-
-  /**
-   * After a release Rust refused: is the device gone anyway?
-   *
-   * A rejection says the CALL failed, not what it did — the session's own
-   * `cancel` is idempotent and never refused, so a rejection is a blocking join
-   * that did not complete or a command that never reached the session. Asking
-   * is the only way to tell the two apart, and the unknown answers all resolve
-   * to *not released*: this is the one place where guessing in the direction
-   * that suits the button would put *Voice off* over a live microphone.
-   */
-  const releasedAfterRefusal = useCallback(async () => {
-    if (!voiceStatus) return false;
-    try {
-      return !stillHeld((await voiceStatus()).state);
-    } catch {
-      return false;
-    }
-  }, [voiceStatus]);
+  }, [claim, forget, listen, releasedAfterRefusal, setOn, setPhase, voiceStart, voiceStatus, voiceStop]);
 
   /**
    * Turn voice off: abandon the pipeline, then release the device — and do not
@@ -777,6 +827,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch }: VoiceControlP
         // swallowed, because something did go wrong.
         setOn(false);
         setPhase("idle");
+        setKnown(true);
         setProblem(sentenceOf(cause));
         return;
       }
@@ -788,6 +839,12 @@ export function VoiceControlPanel({ runtime, screen, onDispatch }: VoiceControlP
     if (!ours()) return;
     setOn(false);
     setPhase("idle");
+    /* Rust answered, so this panel has heard from the microphone whether or not
+       it was ever the one that opened it — `turnOff` is now reachable straight
+       off a mount reconcile that could not release the device (the click
+       handler routes `unreleased` here), and without this the button would fall
+       back to `Voice…` after a release that actually succeeded. */
+    setKnown(true);
   }, [claim, releasedAfterRefusal, setOn, setPhase, voiceCancel]);
 
   if (!resolveVoice) return null;
@@ -825,7 +882,12 @@ export function VoiceControlPanel({ runtime, screen, onDispatch }: VoiceControlP
            pressable, `unreleased` included: that press is the retry. */
         onClick={() => {
           if (phaseRef.current === "stopping") return;
-          if (onRef.current) void turnOff();
+          /* `unreleased` routes to the release rather than to the start, and
+             not only where `on` happens to be true: the device is open, so the
+             press that looks like *turn it on* has to be the retry that closes
+             it. `voiceStart` would be refused by `accepts_start` anyway, which
+             is the fall-through this replaces. */
+          if (onRef.current || phaseRef.current === "unreleased") void turnOff();
           else void turnOn();
         }}
       >
