@@ -81,6 +81,23 @@
 //! yet) and retrying costs a few milliseconds on a path that is already opening
 //! an audio device.
 //!
+//! **The one residual failure, named rather than implied.** The D-Bus *method
+//! call* is bounded (`ANSWER_WITHIN`, two seconds), and the reservation in
+//! [`WakeLock::hold`] keeps a slow platform from wedging a release. What is
+//! **not** bounded is the connection handshake in front of the call: a system
+//! bus that accepts a socket and then never finishes authenticating would park
+//! the `spawn_blocking` that [`crate::voice::VoiceHold::start`] runs on, so the
+//! press sits at *Opening the microphone…* rather than reporting anything. It
+//! is bounded in blast radius and recoverable — pressing Voice again cancels,
+//! which closes the device, because `release` no longer waits on any of this —
+//! and a further press costs one more parked pool thread and nothing else.
+//!
+//! It was left this way deliberately. Making the acquisition asynchronous would
+//! fix it and would cost the thing this module is actually for: `is_held` would
+//! become eventually consistent, so every test of *voice on acquires* would
+//! have to poll for an answer instead of asserting one. A pathological bus
+//! state is not worth weakening the assertions that pin the feature.
+//!
 //! # What is verifiable here and what is not
 //!
 //! The Linux path is real on this project's dev box and in CI's Linux jobs, and
