@@ -1,10 +1,14 @@
 //! The keyed remote intent backend: one HTTPS request, tool-use, a constrained
 //! enum.
 //!
-//! This is the answer to PRD #802's own risk entry — *the default intent
+//! This was the answer to PRD #802's own risk entry — *the default intent
 //! backend is slow enough to feel broken*. Measured against the same command
 //! table on 2026-09-18, this backend answers in a **median of 0.91 s** where
-//! [`super::agent_cli`] takes **3.1–4.7 s**.
+//! the agent-CLI backend it has since replaced took **3.1–4.7 s**. That
+//! backend is gone (PRD #802's provider work; [`crate::settings::IntentBackend`]
+//! has the decision), so this is not the fast one of two any more — it is the
+//! only one, and the numbers below are kept because they are what the choice of
+//! request shape was made against.
 //!
 //! # PRD #802 Open Question 4, answered: tool-use with a constrained enum
 //!
@@ -45,17 +49,18 @@
 //! the workload that tier is for — and it answered all eight measured cases
 //! correctly, including the `none` escape for *"what time is it"*. At the ~1280
 //! input / ~40 output tokens one request measured, an utterance costs about
-//! **$0.0015**, against the agent-CLI backend's $0.0036–$0.0126 (whose price is
-//! that CLI's own session context, not the task).
+//! **$0.0015**, against the deleted agent-CLI backend's $0.0036–$0.0126 (whose
+//! price was that CLI's own session context, not the task).
 //!
 //! No `thinking` parameter is sent: on this model thinking is off unless asked
 //! for, and a routing decision this small does not want it.
 //!
-//! **It is a constant and not a settings field.** PRD #802 M4 deliberately left
-//! `model` out of `[voice]` because Open Question 4 was M5's to answer; having
-//! answered it, a settings field would offer a choice whose only correct value
-//! this file knows. A user who wants another model is asking for something D2
-//! and D8 are about.
+//! **It was a constant and is now the PRESET of a settings field**, which is
+//! the change PRD #802's provider work made. The old reasoning — that having
+//! answered Open Question 4, a field would offer a choice whose only correct
+//! value this file knew — was true of the measurement and false of the product:
+//! a user cannot know which key to paste when the endpoint is a secret of the
+//! build's, and cannot use a provider this build did not pick.
 //!
 //! # Why the request is made here and not in the webview
 //!
@@ -99,8 +104,7 @@ const MAX_TOKENS: u32 = 256;
 /// How long the request gets before the attempt is abandoned.
 ///
 /// Measured at 0.63–1.81 s including the one-time strict-schema compile, so
-/// this is roughly eight times the slowest. Same reasoning as
-/// [`super::agent_cli::AGENT_CLI_TIMEOUT`]: a backstop against a hung
+/// this is roughly eight times the slowest. A backstop against a hung
 /// connection, not a latency budget — a slow answer is better than a failure
 /// sentence for a user who has already waited.
 pub const REMOTE_TIMEOUT: Duration = Duration::from_secs(15);

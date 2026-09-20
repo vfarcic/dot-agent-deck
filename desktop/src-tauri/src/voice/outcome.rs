@@ -107,10 +107,16 @@ pub enum VoiceOutcome {
     ///
     /// Distinct from [`VoiceOutcome::NoMatch`] because the causes are
     /// different — this one is a backend that did not honour the enum, which a
-    /// grammar-constrained backend makes impossible and a print-mode agent CLI
+    /// grammar-constrained backend makes impossible and an unconstrained one
     /// makes merely unlikely — but it renders the **same** sentence, because
     /// from where the user is standing the app did not know how to do what they
     /// asked, which is exactly what a no-match is.
+    ///
+    /// **Every shipping backend constrains the enum today**, since the
+    /// agent-CLI one went: both protocols the keyed backend speaks are
+    /// schema-enforced. The variant stays because "this build trusts the
+    /// backend" is not a property to acquire by deleting the check, and a user
+    /// can point the endpoint at a server that enforces nothing.
     UnknownAction {
         transcript: Transcript,
         action: String,
@@ -1594,58 +1600,5 @@ mod tests {
         assert_eq!(json["outcome"]["invoke"], "openOverview");
         assert_eq!(json["backend"], "stub");
         assert!(json["resolveMs"].is_number(), "{json}");
-    }
-
-    /// An action outside the table, from a REAL backend, becomes
-    /// [`VoiceOutcome::UnknownAction`] rather than dispatching.
-    ///
-    /// The sibling above drives a stub, which proves the branch. This drives
-    /// the agent-CLI backend against a script that answers `launch_missiles` —
-    /// so the whole chain is exercised: a child process, the fence-tolerant
-    /// read, the answer crossing the seam, and the refusal here. It is the case
-    /// PRD #802's original four-outcome list could not express, and the one
-    /// this pipeline's safety rests on when the backend is a print-mode CLI
-    /// that constrains nothing.
-    #[tokio::test]
-    #[cfg_attr(not(unix), ignore = "the stub is a /bin/sh script")]
-    async fn voice_outcome_an_agent_cli_action_outside_the_table_never_dispatches() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let script = dir.path().join("rogue-cli");
-        std::fs::write(
-            &script,
-            "#!/bin/sh\nprintf '```json\\n{\"action\":\"launch_missiles\",\"params\":{\"agent\":\"tester\"}}\\n```'\n",
-        )
-        .expect("write");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
-                .expect("chmod");
-        }
-        let resolver = crate::voice::AgentCliResolver::claude().with_program(&script);
-
-        let result = handle_utterance(
-            &resolver,
-            table(),
-            Screen::Deck,
-            &fleet(),
-            "open the tester".into(),
-        )
-        .await;
-
-        assert!(
-            !result.outcome.is_dispatch(),
-            "an action outside the table dispatched: {:?}",
-            result.outcome
-        );
-        let VoiceOutcome::UnknownAction { action, .. } = &result.outcome else {
-            panic!("expected UnknownAction, got {:?}", result.outcome);
-        };
-        assert_eq!(action, "launch_missiles");
-        assert_eq!(result.backend, "claude");
-        assert_eq!(
-            result.sentence(),
-            "Heard: \u{201c}open the tester\u{201d} — no matching action."
-        );
     }
 }

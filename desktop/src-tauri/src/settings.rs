@@ -531,7 +531,9 @@ impl<B> Default for StageDocument<B> {
 ///
 /// `[voice]` held three scalars before PRD #802's provider work —
 /// `transcription = "off"`, `intent = "claude"`, `activation = "toggle"` — and
-/// two of them became tables. A document written by that build therefore
+/// two of them became tables. (Both of those backend names have since been
+/// deleted as well, which costs the migration nothing: a token names a backend,
+/// and an unknown one folds to the default.) A document written by that build therefore
 /// supplies a **string where a table is expected**, which is a *type* error and
 /// not an unknown token: [`VoiceToken::from_str_lossy`]'s folding never gets a
 /// look in, and `#[serde(default)]` does not fire for a value that is present
@@ -612,10 +614,12 @@ impl<'de, B: Default + Deserialize<'de>> serde::de::Visitor<'de> for StageSpecVi
 
 /// The command stage: which resolver, where it is, and which model.
 ///
-/// Its [`Default`] is the agent CLI, which needs no key of the app's own — so
-/// neither stage asks for a credential before it will work at all. The endpoint
-/// and model carry the hosted preset regardless, because they are what the
-/// panel shows the moment a user switches to the keyed backend.
+/// Its [`Default`] is the keyed API backend on this build's preset, and that is
+/// the one asymmetry between the two stages: speech has a keyless default
+/// ([`TranscriptionSettings`]) and commands does not, because PRD #802 measured
+/// local intent twice and it was not good enough — [`IntentBackend`] has the
+/// numbers. The endpoint and the model are fields rather than constants so the
+/// key the user pastes is one they chose the provider for.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct IntentSettings {
     pub backend: IntentBackend,
@@ -627,15 +631,18 @@ impl IntentSettings {
     /// This build's coordinates for one backend — [`TranscriptionSettings::for_backend`]'s
     /// counterpart.
     ///
-    /// Both variants carry the hosted preset, because the agent-CLI one is
-    /// reached by spawning a process and reads neither. It stores them so that
-    /// switching to the keyed backend lands on something that works rather than
-    /// on an empty field.
+    /// One arm, matched rather than returned unconditionally, for
+    /// [`crate::voice::resolver_for`]'s reason: a variant added without a
+    /// preset should be a compile error, not a backend that comes up pointing
+    /// at another backend's endpoint.
     pub fn for_backend(backend: IntentBackend) -> Self {
+        let (endpoint, model) = match backend {
+            IntentBackend::Remote => (HOSTED_COMMAND_ENDPOINT, HOSTED_COMMAND_MODEL),
+        };
         Self {
             backend,
-            endpoint: ServiceUrl::parse(HOSTED_COMMAND_ENDPOINT).expect("a valid preset endpoint"),
-            model: ModelId::parse(HOSTED_COMMAND_MODEL).expect("a valid preset model"),
+            endpoint: ServiceUrl::parse(endpoint).expect("a valid preset endpoint"),
+            model: ModelId::parse(model).expect("a valid preset model"),
         }
     }
 }
@@ -787,62 +794,75 @@ impl VoiceToken for TranscriptionBackend {
 
 /// Which `IntentResolver` turns a transcript into an action (PRD #802 M5).
 ///
-/// **`Claude` is the default because it needs no key and no download**, which
-/// is what makes the feature try-able on the day it ships: the user already has
-/// a pre-authenticated agent CLI on the box, and a print-mode call to it
-/// resolves a closed-set pick — measured in the PRD, including the "none of
-/// these" answer that is most of the safety. It is also slow (4.5 s wall), and
-/// `Remote` is the same milestone's answer to that.
+/// **Commands is API-ONLY, and the enum has one variant because of it.** M5
+/// shipped two: this one, and an agent-CLI backend that spawned the
+/// pre-authenticated `claude` on the user's machine — no key of the app's own,
+/// no download, and the default precisely because of that. PRD #802's provider
+/// work removed it. Two reasons, and the first is the product one:
 ///
-/// The CLI variant and the remote one are one enum rather than a backend choice
-/// plus a CLI choice, because a separate `agent` field would be meaningless
-/// whenever the backend is remote. Each variant names one adapter.
+/// - **A stage that spends a credential has to let the user say whose.** The
+///   agent CLI is one vendor's, chosen by this build, and an app cannot assume
+///   everyone uses the provider it picked. Once Commands needs a key at all,
+///   the honest shape is an endpoint, a model and a key the user chooses — and
+///   a backend that is a *subprocess* has none of those.
+/// - **It was the most security-expensive code in the feature.** It handed a
+///   general-purpose coding agent a prompt built partly from untrusted input,
+///   so containing it took seven CLI flags, absolute-path resolution, an
+///   app-owned working directory, an allowlisted environment, process-group
+///   teardown and a `Drop` guard — all of which had to keep working against
+///   another program's flag set. `opencode` had already been withdrawn on the
+///   same ground (below); `claude` went with the provider work.
+///
+/// The cost to a user who had picked it is **one re-pick**, the same as the
+/// `opencode` withdrawal cost: [`Self::from_str_lossy`] folds an unknown token
+/// to the default, so `intent = "claude"` left in a document loads as the keyed
+/// backend and the rest of the document survives. That folding is the whole
+/// reason a closed enum was the right shape here.
+///
+/// **A local model is reachable and is not a variant.** The keyed backend is
+/// HTTP to a [`ServiceUrl`], so pointing it at a server on this machine is the
+/// same code path. It ships as no preset and is recommended nowhere, because
+/// PRD #802 measured local intent twice against the 24 phrase fixtures and it
+/// was not good enough: a 1.5B chat model scored 20/24, turning *"what time is
+/// it?"* into `open_agent` — the refusal the PRD calls most of the safety — and
+/// a 34 MB embedding classifier held two false positives no threshold repairs.
 ///
 /// # `opencode` was here and was WITHDRAWN, deliberately
 ///
 /// PRD #802 M5 shipped an `Opencode` variant driving `opencode run --pure`, and
 /// the landed-work security audit took it out again. The reason is specific and
-/// is not "we did not get round to measuring it": the agent-CLI backend hands a
+/// is not "we did not get round to measuring it": the agent-CLI backend handed a
 /// general-purpose coding agent a prompt built partly from **untrusted** input,
-/// so the child has to be containable — no tools, no hooks, no MCP, no project
-/// configuration, no session written to disk. `claude` has a flag for every one
-/// of those ([`crate::voice::agent_cli`] names them). `opencode run` has no
-/// no-tools equivalent and no no-persistence option, and its `run` was confirmed
-/// locally to write a resumable session containing the utterance. An
-/// uncontainable subprocess executor is not something to ship in a feature that
-/// is on by default, so the variant went rather than being documented as
-/// best-effort.
-///
-/// Dropping it costs a user nothing worse than a re-pick: the deserializer folds
-/// an unknown token to [`Self::Claude`], so an `intent = "opencode"` left in a
-/// document loads as the default and the panel shows the default. That folding
-/// is the whole reason a closed enum was the right shape here.
+/// so the child had to be containable — no tools, no hooks, no MCP, no project
+/// configuration, no session written to disk. `claude` had a flag for every one
+/// of those. `opencode run` has no no-tools equivalent and no no-persistence
+/// option, and its `run` was confirmed locally to write a resumable session
+/// containing the utterance. An uncontainable subprocess executor is not
+/// something to ship in a feature that is on by default, so the variant went
+/// rather than being documented as best-effort. The backend both variants drove
+/// is now gone as well, which makes this history rather than policy — and it is
+/// kept because it is the argument that says what a future subprocess backend
+/// would have to prove.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum IntentBackend {
-    /// The `claude` CLI in print mode. No key of the app's own, no download.
-    #[default]
-    Claude,
-    /// The keyed remote API, for the latency. Its credential lives in
+    /// The keyed API, over HTTP. Its credential lives in
     /// [`crate::secrets::SecretId::VoiceIntent`].
+    #[default]
     Remote,
 }
 
 impl VoiceToken for IntentBackend {
-    const TOKENS: &'static [&'static str] = &["claude", "remote"];
+    const TOKENS: &'static [&'static str] = &["remote"];
     const LABEL: &'static str = "an intent backend";
 
     fn as_str(self) -> &'static str {
         match self {
-            Self::Claude => "claude",
             Self::Remote => "remote",
         }
     }
 
-    fn from_str_lossy(raw: &str) -> Self {
-        match raw.trim().to_ascii_lowercase().as_str() {
-            "remote" => Self::Remote,
-            _ => Self::default(),
-        }
+    fn from_str_lossy(_raw: &str) -> Self {
+        Self::default()
     }
 }
 
@@ -3762,12 +3782,14 @@ mod tests {
             LOCAL_SPEECH_ENDPOINT
         );
         assert_eq!(defaults.transcription.model.as_str(), LOCAL_SPEECH_MODEL);
-        assert_eq!(defaults.intent.backend, IntentBackend::Claude);
+        assert_eq!(defaults.intent.backend, IntentBackend::Remote);
         assert_eq!(defaults.intent.endpoint.as_str(), HOSTED_COMMAND_ENDPOINT);
         assert_eq!(defaults.activation, ActivationMode::Toggle);
-        // Both of those backends are the keyless ones, which is the product
-        // decision that replaced `Speech = off`: the feature works on the day
-        // it ships without anyone pasting a credential.
+        // Speech's default is the keyless one, which is the product decision
+        // that replaced `Speech = off`. Commands' is not, and the asymmetry is
+        // deliberate: PRD #802 measured local intent twice against the phrase
+        // fixtures and it was not good enough — `IntentBackend` has the
+        // numbers.
     }
 
     /// Scenario: a document names a `[voice]` backend this build has never
@@ -3807,7 +3829,7 @@ mod tests {
         .unwrap();
         let loaded = load_from(&path);
         let voice = loaded.voice.clone().expect("the section is present");
-        assert_eq!(voice.intent.backend, IntentBackend::Claude);
+        assert_eq!(voice.intent.backend, IntentBackend::Remote);
         assert_eq!(voice.transcription.backend, TranscriptionBackend::Local);
         // A stage that named only its backend still gets this build's
         // coordinates for the folded choice, rather than an empty endpoint.
@@ -3817,7 +3839,7 @@ mod tests {
         // folded value, so the newer build's choice is gone.
         save_to(&path, &loaded).unwrap();
         let reread = std::fs::read_to_string(&path).unwrap();
-        assert!(reread.contains("backend = \"claude\""), "{reread}");
+        assert!(reread.contains("backend = \"remote\""), "{reread}");
         assert!(!reread.contains("2027"), "{reread}");
 
         // Over-length is a different answer: the document is malformed, so the
@@ -3841,18 +3863,19 @@ mod tests {
         assert!(problem.public().contains("line"), "{}", problem.public());
     }
 
-    /// Scenario: a document written by the build that shipped the withdrawn
-    /// `opencode` intent backend loads on this build. The token folds to
-    /// `claude`, the rest of the document survives, and nothing errors.
+    /// Scenario: a document written by a build that shipped one of the two
+    /// withdrawn agent-CLI intent backends loads on this build. Both tokens
+    /// fold to `remote`, the rest of the document survives, and nothing errors.
     ///
-    /// The migration for [`IntentBackend`]'s withdrawn variant, asserted rather
-    /// than argued: the audit that removed it reasoned that the folding
-    /// deserializer makes dropping a variant cheap, and this is what that costs
-    /// a user who had picked it — one re-pick, not a lost document. The
-    /// user-visible consequence is the same one the general folding test pins:
-    /// the next save writes `claude` back.
+    /// The migration for [`IntentBackend`]'s withdrawn variants, asserted
+    /// rather than argued: the audit that removed `opencode` reasoned that the
+    /// folding deserializer makes dropping a variant cheap, and PRD #802's
+    /// provider work then spent that reasoning a second time on `claude` — the
+    /// whole agent-CLI backend, which was the DEFAULT. So the case this pins is
+    /// no longer a minority re-pick: it is what every existing user's document
+    /// says. What it costs them is one re-pick, not a lost document.
     #[test]
-    fn the_withdrawn_opencode_intent_backend_folds_to_the_default() {
+    fn the_withdrawn_agent_cli_intent_backends_fold_to_the_default() {
         let dir = tempdir();
         let path = dir.path().join(SETTINGS_FILE_NAME);
         std::fs::write(
@@ -3875,7 +3898,7 @@ mod tests {
             "a withdrawn token is not a malformed document"
         );
         let voice = loaded.voice.clone().expect("the section is present");
-        assert_eq!(voice.intent.backend, IntentBackend::Claude);
+        assert_eq!(voice.intent.backend, IntentBackend::Remote);
         // Everything else in the document survives the fold.
         assert_eq!(voice.transcription.backend, TranscriptionBackend::Remote);
         assert_eq!(
@@ -3883,10 +3906,31 @@ mod tests {
             HOSTED_SPEECH_ENDPOINT
         );
         assert_eq!(loaded.appearance.mode, AppearanceMode::Dark);
+
+        // The second withdrawn token, and the one that matters more: `claude`
+        // was the shipped DEFAULT, so this is the document nearly every early
+        // user has.
+        std::fs::write(
+            &path,
+            "version = 1\n\n[voice.intent]\nbackend = \"claude\"\n",
+        )
+        .unwrap();
+        let (loaded, problem) = load_document(&path);
         assert!(
-            !<IntentBackend as VoiceToken>::TOKENS.contains(&"opencode"),
-            "the variant is withdrawn; see IntentBackend's doc comment for why"
+            problem.is_none(),
+            "a withdrawn token is not a malformed document"
         );
+        assert_eq!(
+            loaded.voice.expect("the section is present").intent.backend,
+            IntentBackend::Remote
+        );
+
+        for withdrawn in ["opencode", "claude"] {
+            assert!(
+                !<IntentBackend as VoiceToken>::TOKENS.contains(&withdrawn),
+                "`{withdrawn}` is withdrawn; see IntentBackend's doc comment for why"
+            );
+        }
     }
 
     /// The `[voice]` tokens are duplicated in `desktop/src/lib/bridge.ts`, so
@@ -3909,7 +3953,7 @@ mod tests {
         );
         assert_eq!(
             <IntentBackend as VoiceToken>::TOKENS,
-            ["claude", "remote"],
+            ["remote"],
             "keep this identical to VOICE_INTENT_BACKENDS in desktop/src/lib/bridge.ts"
         );
         assert_eq!(

@@ -76,7 +76,7 @@ describe("VoicePanel", () => {
   it("renders every choice the app actually ships an adapter for", () => {
     renderPanel();
     expect(screen.getByLabelText("Speech")).toHaveValue("local");
-    expect(screen.getByLabelText("Commands")).toHaveValue("claude");
+    expect(screen.getByLabelText("Commands")).toHaveValue("remote");
     // The lists are the closed sets, so a token the Rust side would fold away
     // cannot be offered here.
     expect(screen.getByLabelText("Speech").querySelectorAll("option")).toHaveLength(
@@ -97,7 +97,6 @@ describe("VoicePanel", () => {
     expect(screen.getByRole("option", { name: /OpenAI — needs an OpenAI API key/ })).toBeInTheDocument();
     expect(screen.getByRole("option", { name: /Anthropic API — needs an Anthropic API key/ })).toBeInTheDocument();
     expect(screen.getByRole("option", { name: /On this machine — speech container, no key/ })).toBeInTheDocument();
-    expect(screen.getByRole("option", { name: /Claude CLI on this machine — no key/ })).toBeInTheDocument();
   });
 
   /**
@@ -119,7 +118,10 @@ describe("VoicePanel", () => {
     const { onSave } = renderPanel({
       voice: { ...DEFAULT_VOICE_SETTINGS, activation: "hold-to-talk" },
     });
-    fireEvent.change(screen.getByLabelText("Commands"), { target: { value: "remote" } });
+    // Driven from Speech rather than Commands: Commands ships ONE backend
+    // since the agent-CLI one went, so selecting its only option is not a
+    // change and fires nothing.
+    fireEvent.change(screen.getByLabelText("Speech"), { target: { value: "remote" } });
     expect(onSave).toHaveBeenCalledWith(
       expect.objectContaining({
         voice: expect.objectContaining({ activation: "hold-to-talk" }),
@@ -167,11 +169,11 @@ describe("VoicePanel", () => {
    */
   it("saves the whole document with only its own section replaced", () => {
     const { onSave } = renderPanel({ appearance: { mode: "dark" } });
-    fireEvent.change(screen.getByLabelText("Commands"), { target: { value: "remote" } });
+    fireEvent.change(screen.getByLabelText("Speech"), { target: { value: "remote" } });
     expect(onSave).toHaveBeenCalledWith({
       ...DEFAULT_DESKTOP_SETTINGS,
       appearance: { mode: "dark" },
-      voice: { ...DEFAULT_VOICE_SETTINGS, intent: VOICE_STAGE_PRESETS.intent.remote },
+      voice: { ...DEFAULT_VOICE_SETTINGS, transcription: VOICE_STAGE_PRESETS.transcription.remote },
     });
   });
 
@@ -182,7 +184,7 @@ describe("VoicePanel", () => {
       expect.objectContaining({
         voice: {
           activation: "toggle",
-          intent: VOICE_STAGE_PRESETS.intent.claude,
+          intent: VOICE_STAGE_PRESETS.intent.remote,
           transcription: VOICE_STAGE_PRESETS.transcription.remote,
         },
       }),
@@ -211,7 +213,9 @@ describe("VoicePanel", () => {
    */
   it("saves a hand-typed endpoint on blur rather than on every keystroke", () => {
     const { onSave } = renderPanel();
-    const field = screen.getByLabelText("Endpoint");
+    // By id rather than by label: both stages carry an Endpoint row now that
+    // Commands is API-only, so the label alone names two fields.
+    const field = document.getElementById("voice-transcription-endpoint")!;
     fireEvent.change(field, { target: { value: "http://127.0.0.1:9000/v1/audio/transcriptions" } });
     expect(onSave).not.toHaveBeenCalled();
     fireEvent.blur(field);
@@ -224,7 +228,7 @@ describe("VoicePanel", () => {
 
   it("saves a hand-typed model, and abandons an edit on Escape", () => {
     const { onSave } = renderPanel();
-    const model = screen.getByLabelText("Model");
+    const model = document.getElementById("voice-transcription-model")!;
     fireEvent.change(model, { target: { value: "Systran/faster-whisper-base.en" } });
     fireEvent.keyDown(model, { key: "Enter" });
     expect(onSave.mock.calls[0][0].voice.transcription.model).toBe("Systran/faster-whisper-base.en");
@@ -237,19 +241,24 @@ describe("VoicePanel", () => {
   });
 
   /**
-   * The agent-CLI command backend spawns a process on this machine, so an
-   * endpoint and a model beside it would be two controls that change nothing.
-   * Speech has no such variant — both of its backends are HTTP — so its fields
-   * are always there.
+   * **Every backend on this panel is now an endpoint and a model**, on the
+   * defaults as much as on any other choice. This pinned the opposite while
+   * Commands defaulted to the agent CLI, which spawned a process on this
+   * machine and so had no coordinates to offer; PRD #802's provider work
+   * deleted that backend and the `usesEndpoint` predicate with it. What is
+   * asserted here is the same property from the other side — that the rows
+   * belong to their own stage and carry that stage's value, which is what
+   * hiding them made easy to get wrong.
    */
-  it("offers no endpoint or model beside the command backend that spawns a CLI", () => {
+  it("offers endpoint and model for both stages on the defaults", () => {
     renderPanel();
-    // Speech only: the command stage is on the agent CLI, which is reached by
-    // spawning a process rather than by making a request.
-    expect(screen.getAllByLabelText("Endpoint")).toHaveLength(1);
-    expect(screen.getAllByLabelText("Model")).toHaveLength(1);
-    expect(screen.getByLabelText("Endpoint")).toHaveValue(
+    expect(screen.getAllByLabelText("Endpoint")).toHaveLength(2);
+    expect(screen.getAllByLabelText("Model")).toHaveLength(2);
+    expect(document.getElementById("voice-transcription-endpoint")).toHaveValue(
       VOICE_STAGE_PRESETS.transcription.local.endpoint,
+    );
+    expect(document.getElementById("voice-intent-endpoint")).toHaveValue(
+      VOICE_STAGE_PRESETS.intent.remote.endpoint,
     );
   });
 
@@ -268,7 +277,7 @@ describe("VoicePanel", () => {
    */
   it("says the keyless speech endpoint may only be on this machine, and still offers the field", () => {
     renderPanel();
-    expect(screen.getByLabelText("Endpoint")).toHaveValue(
+    expect(document.getElementById("voice-transcription-endpoint")).toHaveValue(
       VOICE_STAGE_PRESETS.transcription.local.endpoint,
     );
     expect(screen.getByTestId("voice-transcription-endpoint-hint")).toHaveTextContent(
@@ -289,12 +298,19 @@ describe("VoicePanel", () => {
     expect(screen.getAllByLabelText("Model")).toHaveLength(2);
   });
 
-  /** No backend needs a key, so the panel does not ask for one. */
-  it("asks for no key while no chosen backend uses one", () => {
+  /**
+   * **One key row on the defaults, not none**, and the asymmetry is the
+   * product decision rather than an oversight: Speech's default is a keyless
+   * container on loopback, and Commands has no keyless backend at all since
+   * the agent-CLI one went. A panel that asked for two keys before the feature
+   * did anything would be the thing PRD #802 set out to avoid; one is what the
+   * measurements left.
+   */
+  it("asks for a key only where the chosen backend needs one", () => {
     renderPanel();
-    expect(screen.queryByLabelText(COMMANDS_KEY)).not.toBeInTheDocument();
     expect(screen.queryByLabelText(SPEECH_KEY)).not.toBeInTheDocument();
-    expect(screen.queryByLabelText(/^Key for /)).not.toBeInTheDocument();
+    expect(screen.getByLabelText(COMMANDS_KEY)).toBeVisible();
+    expect(screen.getAllByLabelText(/^Key for /)).toHaveLength(1);
   });
 
   it("asks for a key per backend that authenticates with one", async () => {

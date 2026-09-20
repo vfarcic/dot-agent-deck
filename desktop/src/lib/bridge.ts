@@ -474,18 +474,20 @@ export const VOICE_ACTIVATION_MODES = ["toggle"] as const;
 /**
  * Which backend resolves an utterance into an action (PRD #802 M5).
  *
- * `claude` is the default because it needs no key and no download — the user
- * already has a pre-authenticated CLI on the box. Keep identical to
+ * One entry, because Commands is API-only. Keep identical to
  * `IntentBackend::TOKENS` in `src-tauri/src/settings.rs`.
  *
- * `opencode` was here and was withdrawn by PRD #802's landed-work security
- * audit: the agent-CLI backend has to be able to run the child with no tools,
- * no hooks, no MCP, no project config and no session on disk, and `opencode
- * run` offers none of those switches. The Rust enum's doc comment has the
- * reasoning; its folding deserializer is why a stale `opencode` in a settings
- * document loads as `claude` instead of failing.
+ * Two agent-CLI backends were here and both were withdrawn. `opencode` went
+ * first, in PRD #802's landed-work security audit: the agent-CLI backend had to
+ * run its child with no tools, no hooks, no MCP, no project config and no
+ * session on disk, and `opencode run` offers none of those switches. `claude`
+ * — the shipped DEFAULT — went with the provider work, because a stage that
+ * spends a credential has to let the user choose whose, and a subprocess has no
+ * endpoint, model or key to choose. The Rust enum's doc comment has the
+ * reasoning; its folding deserializer is why either token left in a settings
+ * document loads as `remote` instead of failing.
  */
-export const VOICE_INTENT_BACKENDS = ["claude", "remote"] as const;
+export const VOICE_INTENT_BACKENDS = ["remote"] as const;
 
 /**
  * Which backend turns speech into text (PRD #802).
@@ -523,11 +525,6 @@ export const VOICE_STAGE_PRESETS: Record<"intent" | "transcription", Record<stri
     },
   },
   intent: {
-    claude: {
-      backend: "claude",
-      endpoint: "https://api.anthropic.com/v1/messages",
-      model: "claude-haiku-4-5",
-    },
     remote: {
       backend: "remote",
       endpoint: "https://api.anthropic.com/v1/messages",
@@ -549,7 +546,7 @@ export const LOCAL_SPEECH_IMAGE = "ghcr.io/speaches-ai/speaches:0.9.0-rc.3-cpu";
 /** Mirrors `VoiceSettings::default()`; what an absent section renders as. */
 export const DEFAULT_VOICE_SETTINGS: VoiceSettingsDto = {
   activation: "toggle",
-  intent: VOICE_STAGE_PRESETS.intent.claude,
+  intent: VOICE_STAGE_PRESETS.intent.remote,
   transcription: VOICE_STAGE_PRESETS.transcription.local,
 };
 

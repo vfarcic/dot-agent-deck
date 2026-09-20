@@ -15,11 +15,16 @@
 //! the audio never leaves the machine; `off` was the default and is gone, along
 //! with the second implementation behind it.
 //!
-//! **M5 brought the real backends.** [`agent_cli`] spawns the pre-authenticated
-//! CLI the user already has — no key of the app's own, no download, and slow;
-//! [`remote`] makes one keyed HTTPS request with a constrained enum, and is
-//! roughly four times faster. [`resolver_for`] is where `VoiceSettings.intent`
-//! picks one. Every [`VoiceResult`] carries the latency it cost, because PRD
+//! **M5 brought the real backends, and PRD #802's provider work took one of
+//! them away.** It shipped two: [`remote`], one keyed HTTPS request with a
+//! constrained enum, and an agent-CLI backend that spawned the
+//! pre-authenticated `claude` already on the machine. The second is **gone** —
+//! Commands is API-only. A stage that spends a credential has to let the user
+//! say whose, and a backend that spawns one vendor's general-purpose coding
+//! agent on a prompt built partly from untrusted input could not offer that at
+//! any price worth paying. [`remote`] is what remains, and [`resolver_for`] is
+//! where `VoiceSettings.intent` picks a backend. Every [`VoiceResult`] carries
+//! the latency it cost, because PRD
 //! #802's mitigation for *slow enough to feel broken* is to show the number
 //! rather than hide it.
 //!
@@ -33,7 +38,6 @@
 //! code. M7 gave part of it one — `lib.rs`'s four `desktop_voice_*` commands
 //! are what the panel will call.
 
-pub mod agent_cli;
 pub mod capture;
 pub mod http;
 pub mod outcome;
@@ -56,7 +60,6 @@ use serde::{Deserialize, Serialize};
 /// there" with nothing keeping the two in step.
 pub use crate::dto::DesktopAgent;
 
-pub use agent_cli::{AGENT_CLI_TIMEOUT, AgentCli, AgentCliResolver};
 pub use capture::{
     AudioFormat, AudioSource, AudioStream, Capture, CaptureError, CaptureSession, CaptureState,
     CaptureStatus, CaptureTicket, CpalSource, MAX_UTTERANCE, Pcm16, PcmSink, SILENCE_HOLD,
@@ -88,18 +91,17 @@ pub use transcribe::{
 /// the session's UI, and the one place it is meant to appear is the sentence
 /// the app renders back to the user.
 ///
-/// **The second clause is not decoration, and the unqualified version of this
-/// sentence was FALSE while it was written here.** PRD #802's landed-work
-/// security audit found the agent-CLI intent backend handing the whole prompt —
-/// the utterance and the agent labels with it — to `claude` in its ordinary
-/// session mode, which writes a resumable session to disk. Our redacted `Debug`
-/// impls do nothing about a child application's own storage. The backend now
-/// passes `--no-session-persistence`
-/// ([`agent_cli`] has the flag table), so the claim is true again — but it is
-/// true *because a flag is passed to another program*, which is a weaker thing
-/// than "this process never writes it" and is why the sentence above says both
-/// halves. The same audit withdrew the `opencode` backend outright, since that
-/// CLI has no equivalent flag.
+/// **The second clause is kept although nothing here hands a prompt to a child
+/// process any more, and that is deliberate.** PRD #802's landed-work security
+/// audit found the agent-CLI intent backend handing the whole prompt — the
+/// utterance and the agent labels with it — to `claude` in its ordinary session
+/// mode, which writes a resumable session to disk; redacted `Debug` impls do
+/// nothing about a child application's own storage. That backend was contained
+/// with `--no-session-persistence` and then **removed outright** by the
+/// provider work, so today every intent backend is one HTTPS request to a model
+/// with no tools and no session, and the first clause carries the whole claim.
+/// The second stays as the rule a future backend inherits rather than has to
+/// rediscover: the last one cost an audit round to notice.
 ///
 /// It is a **rule**, not a property this module can assert. PRD #802's Open
 /// Question 5 asks whether any part of an utterance is persisted; this is the

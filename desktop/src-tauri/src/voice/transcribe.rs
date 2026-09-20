@@ -48,10 +48,11 @@
 //! the HTTP status and never the audio or the text.
 //!
 //! **Scoped to this module deliberately.** The claim holds without qualification
-//! here — this is an HTTPS request and nothing else — but the feature-wide
-//! version of it does not, because the agent-CLI intent backend hands its prompt
-//! to another program that has storage of its own. [`super::agent_cli`] carries
-//! that half, and [`super::Transcript`] carries the sentence covering both.
+//! here — this is an HTTPS request and nothing else. It used to need a second
+//! half: the agent-CLI intent backend handed its prompt to another program that
+//! had storage of its own, and [`super::Transcript`] still carries the sentence
+//! covering both because that is the rule a future backend inherits. That
+//! backend is gone, so today every stage of this feature is an HTTPS request.
 //! What the remote endpoint does with an upload is the endpoint's policy and
 //! not a property this app can assert at all.
 

@@ -7,14 +7,14 @@
 //! would prove less than it appears to, so this module deliberately offers no
 //! backend switch: it reads the preset rather than taking one.
 //!
-//! **It used to drive `AgentCliResolver::claude()`.** PRD #802's provider work
-//! is removing the agent-CLI intent backend outright — Commands becomes
-//! API-only, because a stage that needs a key has to let the user choose whose
-//! key it is — and these fixtures move off it FIRST, so the removal lands with
-//! the feature's only real-model verification intact rather than reconstructed
-//! afterwards. The migration changes the resolver under these fixtures and
-//! **no expectation in them**: the manifest, the planted fleet, the outcome
-//! kinds and the pre-validation below are unchanged.
+//! **It used to drive `AgentCliResolver::claude()`, and that backend is gone.**
+//! PRD #802's provider work removed the agent-CLI intent backend outright —
+//! Commands is API-only, because a stage that needs a key has to let the user
+//! choose whose key it is. These fixtures moved off it one commit ahead of the
+//! removal, so it landed with the feature's only real-model verification intact
+//! rather than reconstructed afterwards. That migration changed the resolver
+//! under them and **no expectation in them**: the manifest, the planted fleet,
+//! the outcome kinds and the pre-validation below are unchanged.
 //!
 //! The test is local-only. It never reaches a model in CI or during an ordinary
 //! `cargo test-fast`; set `DOT_AGENT_DECK_REQUIRE_REAL_E2E=1` to opt in and to

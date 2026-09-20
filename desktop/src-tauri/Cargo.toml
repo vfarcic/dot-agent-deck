@@ -38,26 +38,25 @@ tauri = { version = "2", features = [] }
 # comments, inline-array/inline-table spelling, key order and blank-line
 # grouping survive a write. `toml::Table` models DATA, so it could not.
 toml_edit = { version = "0.25", features = ["serde"] }
-# PRD #802 M5 added `process` and `rt` to what was `["sync", "time"]`.
+# PRD #802 M5 added `process` and `rt` to what was `["sync", "time"]`, and its
+# provider work took `process` back out.
 #
-# `process` is the agent-CLI intent backend spawning `claude`
-# (`voice/agent_cli.rs`). It has to be the ASYNC Command: the resolver runs on
-# the Tauri runtime, and a `std::process` wait of 3-5s there is an app that
-# stops repainting for the length of every utterance. `kill_on_drop` is also
-# what makes "the child is killed before returning" a property of the mechanism
-# rather than of a line that a later edit could skip.
+# `process` was the agent-CLI intent backend spawning `claude`, which is the
+# one thing in this crate that ever launched a child. That backend is deleted
+# — Commands is API-only — and `grep -rn 'tokio::process' desktop/src-tauri/`
+# is now empty, so the feature goes with it rather than sitting here as a
+# capability nothing uses.
 #
-# `rt` is `spawn_blocking`, and it has exactly one caller: the lazy
-# login-shell PATH capture, which runs an interactive login shell and is
-# bounded by a 10s `CAPTURE_TIMEOUT`. That is blocking by nature and must not
-# be on a runtime thread.
+# `rt` is `spawn_blocking`. Three callers, none of them voice: the two endpoint
+# probes in `endpoint_test.rs` and the tunnel open in `endpoint_tunnels.rs`,
+# all of which are blocking by nature and must not run on a runtime thread.
 #
-# Neither adds a dependency or a line of new code to the workspace build: the
-# root package already declares `tokio` with `full`, so both were reachable
-# here by feature unification. Declaring them is the same discipline the
+# It adds no dependency and no line of new code to the workspace build: the
+# root package already declares `tokio` with `full`, so this was reachable here
+# by feature unification. Declaring it is the same discipline the
 # dev-dependency block below states — a change over there cannot silently take
 # this crate's backends out.
-tokio = { version = "1", features = ["process", "rt", "sync", "time"] }
+tokio = { version = "1", features = ["rt", "sync", "time"] }
 # PRD #802 M5: the keyed remote intent backend's one HTTPS request
 # (`voice/remote.rs`). The CSP leaves no alternative to making it here —
 # `tauri.conf.json`'s `connect-src` names `ipc:` and `http://ipc.localhost` and
@@ -219,24 +218,18 @@ chrono = "0.4"
 # `http` the lockfile already carries for reqwest, so the `From` impl applies.
 http = "1"
 
-# Two callers, both Unix-only.
-#
-# PRD #802's landed-work security audit put the agent-CLI intent backend's child
-# in its own process group (`voice/agent_cli.rs`), so a timeout tears down the
-# whole containment unit rather than the direct child: `tokio`'s
-# `Command::process_group` sets the group up and `libc::killpg` is what takes it
-# down. `kill_on_drop` alone signals one pid, which is how a `sleep` started by
-# a timed-out CLI outlived the twenty-second bound with this app's descriptors
-# still open.
+# One caller, Unix-only, and a TEST.
 #
 # PRD #803's settings-path guard rejects a FIFO, and `mkfifo(3)` is the only way
-# to build one to prove it — that caller is a test.
+# to build one to prove it.
 #
-# Not a new dependency in any sense that costs anything: it was already here as
-# a dev-dependency under this exact spec, the root package's graph carries it on
-# every Unix target (`cpal` -> `alsa-sys` on Linux alone), and the lockfile has
-# exactly one of it.
-[target.'cfg(unix)'.dependencies]
+# It was a production dependency between PRD #802's landed-work security audit
+# and its provider work: the agent-CLI intent backend put its child in a process
+# group so a timeout tore down the whole containment unit rather than the direct
+# child, and `libc::killpg` is what took it down. That backend is gone, so this
+# is back where it was — a dev-dependency under the same spec, which is also
+# what it was before the audit.
+[target.'cfg(unix)'.dev-dependencies]
 libc = "0.2"
 
 # Issue #845: `tauri::test::MockRuntime`, which the two appearance tests that

@@ -95,7 +95,6 @@ const TRANSCRIPTION_LABELS: Record<string, string> = {
 };
 
 const INTENT_LABELS: Record<string, string> = {
-  claude: "Claude CLI on this machine — no key",
   remote: "Anthropic API — needs an Anthropic API key",
 };
 
@@ -104,17 +103,6 @@ const KEYED = "remote";
 
 /** The stages, in the order the panel asks about them. */
 type Stage = "transcription" | "intent";
-
-/**
- * Which stages reach their endpoint over HTTP.
- *
- * `intent: "claude"` spawns a CLI on this machine, so its endpoint and model
- * are stored — they are what the user sees the moment they switch to the keyed
- * backend — and offering them beside a subprocess would be two controls that
- * change nothing. Mirrors `IntentBackend::is_http` Rust-side.
- */
-const usesEndpoint = (stage: Stage, backend: string): boolean =>
-  stage === "transcription" || backend === KEYED;
 
 /** The token a speech backend takes when it sends no credential at all. */
 const KEYLESS = "local";
@@ -236,7 +224,13 @@ export function VoicePanel({ settings, onSave, saveError }: SettingsPanelProps) 
 }
 
 /**
- * One stage's endpoint and model, or nothing where the backend uses neither.
+ * One stage's endpoint and model.
+ *
+ * **Both stages always show both**, which they did not before: `intent:
+ * "claude"` spawned a CLI on this machine, so the panel hid two controls that
+ * would have changed nothing while that backend was chosen. Commands is
+ * API-only now, so every backend on this panel is an endpoint, a model and
+ * possibly a key — and the rows are unconditional.
  *
  * **Committed on blur and on Enter, not on every keystroke.** A URL is invalid
  * for most of the time it is being typed, so saving per character would put a
@@ -253,7 +247,6 @@ function StageFields({
   value: VoiceStageDto;
   onSave: (stage: Stage, next: Partial<VoiceStageDto>) => void;
 }) {
-  if (!usesEndpoint(stage, value.backend)) return null;
   return (
     <>
       <TextRow

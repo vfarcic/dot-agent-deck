@@ -5,12 +5,13 @@
 //! situation, not a sentence** — the app renders every word the user reads,
 //! from the table, in [`super::outcome`].
 //!
-//! M5 put the real backends behind this trait: [`super::agent_cli`], which
-//! needs no key and no download, and [`super::remote`], which is keyed and
-//! fast. [`resolver_for`] is where the settings choose. [`StubResolver`] stays,
-//! and is what every test of everything downstream — validation, param
-//! resolution, the rendered sentences — still drives, so none of them needs a
-//! model, a credential or a network hop.
+//! M5 put two real backends behind this trait; PRD #802's provider work
+//! removed one of them. The agent-CLI backend — which spawned the
+//! pre-authenticated `claude` and so needed no key of the app's own — is gone,
+//! and [`super::remote`] is what [`resolver_for`] can now choose.
+//! [`StubResolver`] stays, and is what every test of everything downstream —
+//! validation, param resolution, the rendered sentences — still drives, so none
+//! of them needs a model, a credential or a network hop.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -124,13 +125,12 @@ pub trait IntentResolver: Send + Sync {
 
     /// Which backend this is, for the surface to name.
     ///
-    /// One of `claude`, `remote`, `stub`. It travels on every
-    /// [`super::VoiceResult`] beside the latency, because the two are only
-    /// useful together: *4.2 s* on its own is a complaint, and *claude, 4.2 s*
-    /// is a reason to try the keyed backend. It is a `&'static str` and not the
-    /// settings enum so a backend a later milestone adds can name itself
-    /// without the settings token and the surface's vocabulary having to move
-    /// in lockstep.
+    /// One of `remote`, `stub`. It travels on every [`super::VoiceResult`]
+    /// beside the latency, because the two are only useful together: *4.2 s* on
+    /// its own is a complaint, and a name beside it is a reason to change
+    /// something. It is a `&'static str` and not the settings enum so a backend
+    /// a later milestone adds can name itself without the settings token and
+    /// the surface's vocabulary having to move in lockstep.
     fn backend_name(&self) -> &'static str;
 }
 
@@ -141,24 +141,26 @@ pub trait IntentResolver: Send + Sync {
 /// choice is made at call time rather than at startup so a user who changes the
 /// setting does not restart the app to use it.
 ///
-/// `secrets` is taken for every variant even though only
-/// [`IntentBackend::Remote`] reads one. Passing the store rather than a
-/// credential is what keeps the value Rust-side: the resolver asks the keychain
-/// itself, at the moment it needs one, and nothing hands a secret around in the
-/// hope that whoever holds it will not serialize it.
+/// Passing the store rather than a credential is what keeps the value
+/// Rust-side: the resolver asks the keychain itself, at the moment it needs
+/// one, and nothing hands a secret around in the hope that whoever holds it
+/// will not serialize it.
 ///
 /// The endpoint and the model travel with the settings rather than being
-/// constants in [`super::remote`] — PRD #802's provider work. The agent-CLI
-/// variant ignores both: they are stored so that switching to the keyed backend
-/// lands on something that works, and the panel hides those two rows while this
-/// variant is chosen.
+/// constants in [`super::remote`] — PRD #802's provider work, and the reason
+/// every coordinate a user can choose is read here rather than compiled in.
+///
+/// **One arm today, and the `match` stays.** The agent-CLI variant was the
+/// other one and is gone; writing this as a bare constructor would make adding
+/// the next backend a change to the function's shape rather than a line, and
+/// the exhaustive `match` is what makes a new `IntentBackend` variant with no
+/// adapter a compile error instead of a settings value the app cannot honour.
 pub fn resolver_for(
     settings: &crate::settings::IntentSettings,
     secrets: std::sync::Arc<dyn crate::secrets::SecretStore>,
 ) -> Box<dyn IntentResolver> {
     use crate::settings::IntentBackend;
     match settings.backend {
-        IntentBackend::Claude => Box::new(super::agent_cli::AgentCliResolver::claude()),
         IntentBackend::Remote => Box::new(super::remote::RemoteResolver::new(
             secrets,
             settings.endpoint.clone(),
@@ -316,10 +318,6 @@ mod tests {
         // asserts the thing a user would see rather than a type the compiler
         // already knows.
         assert_eq!(
-            resolver_for(&stage(IntentBackend::Claude), store()).backend_name(),
-            "claude"
-        );
-        assert_eq!(
             resolver_for(&stage(IntentBackend::Remote), store()).backend_name(),
             "remote"
         );
@@ -333,7 +331,7 @@ mod tests {
         // is exhaustive, so the compiler catches it — this asserts the set is
         // the one that was mapped, which the compiler cannot.
         use crate::settings::IntentBackend;
-        let names: Vec<&str> = [IntentBackend::Claude, IntentBackend::Remote]
+        let names: Vec<&str> = [IntentBackend::Remote]
             .into_iter()
             .map(|backend| {
                 resolver_for(
@@ -343,9 +341,11 @@ mod tests {
                 .backend_name()
             })
             .collect();
-        assert_eq!(names, vec!["claude", "remote"]);
-        // Every token the settings can hold has an adapter above.
-        assert_eq!(names.len(), 2);
+        assert_eq!(names, vec!["remote"]);
+        // Every token the settings can hold has an adapter above. The count is
+        // pinned on the settings side by `the_voice_tokens_match_the_frontends_copy`;
+        // this side pins that the mapping covers it.
+        assert_eq!(names.len(), 1);
     }
 
     #[test]
