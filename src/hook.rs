@@ -1424,13 +1424,13 @@ mod tests {
     /// Scenario: A stub daemon accepts one connection, reads the request
     /// line, then deliberately holds the connection open forever without
     /// replying and without closing — simulating a wedged daemon.
-    /// `request_from_socket` relies entirely on the daemon closing the
-    /// connection and has no read/write bound of its own, so against this
-    /// daemon it hangs forever. Run it on a worker thread and bound the wait
-    /// with `recv_timeout` well above the production timeout the fix will add
-    /// (5s), so a still-unbounded `request_from_socket` fails fast with a
-    /// clear panic instead of hanging the CI runner until nextest's own
-    /// timeout.
+    /// `request_from_socket` used to rely entirely on the daemon closing the
+    /// connection, with no read/write bound of its own, so against this
+    /// daemon it hung forever; it now returns `None` within the 5s bound the
+    /// fix added. Run it on a worker thread and bound the wait with
+    /// `recv_timeout` well above that 5s, so an unbounded
+    /// `request_from_socket` would fail fast with a clear panic instead of
+    /// hanging the CI runner until nextest's own timeout.
     #[spec("error/socket/003")]
     #[test]
     #[cfg(unix)]
@@ -1486,14 +1486,14 @@ mod tests {
     }
 
     /// Scenario: A stub daemon accepts the connection, reads the request
-    /// line, waits a short delay well inside the coming timeout bound, then
-    /// writes one JSON reply line. `request_from_socket` must still return
-    /// that line as `Some(...)`. This guards against the specific way the
-    /// idle-timeout fix could make things worse: a bound that fires too
-    /// eagerly would mistake a merely-slow daemon for an absent one and
-    /// silently fall back to PTY injection. This test is a correctness
-    /// control, not a timing measurement, and is expected to pass both before
-    /// and after the fix.
+    /// line, waits a short delay well inside the timeout bound, then writes
+    /// one JSON reply line. `request_from_socket` must still return that
+    /// line as `Some(...)`. This guards against the specific way the
+    /// idle-timeout fix could have made things worse — a bound that fires
+    /// too eagerly would mistake a merely-slow daemon for an absent one and
+    /// silently fall back to PTY injection — so it is a correctness control
+    /// rather than a timing measurement, and it passed both before and after
+    /// that fix landed.
     #[spec("error/socket/004")]
     #[test]
     #[cfg(unix)]
@@ -1567,15 +1567,15 @@ mod tests {
     /// Scenario: A stub daemon accepts the connection, reads the request
     /// line, then dribbles a single non-newline byte at a fixed interval
     /// forever — never sending the newline `read_line` is waiting for. The
-    /// per-read idle timeout added for `error/socket/003` resets on every
-    /// byte received, so each dribbled byte restarts it before it can fire,
-    /// and `request_from_socket` never returns even though the peer never
-    /// goes silent for as long as one read. Run it on a worker thread and
-    /// bound the wait with
-    /// `recv_timeout` at a ceiling generous enough to hold whatever
-    /// operation-level deadline the fix chooses, so a still-unbounded
-    /// `request_from_socket` fails with a clear panic instead of hanging the
-    /// CI runner.
+    /// per-read idle timeout added for `error/socket/003` re-armed on every
+    /// byte received, so each dribbled byte used to restart it before it
+    /// could fire and `request_from_socket` never returned, even though the
+    /// peer never went silent for as long as one read — the total-operation
+    /// deadline the fix added fires anyway, so the call now comes back. Run
+    /// it on a worker thread and bound the wait with `recv_timeout` at a
+    /// ceiling generous enough to hold that deadline, so an unbounded
+    /// `request_from_socket` would fail with a clear panic instead of
+    /// hanging the CI runner.
     #[spec("error/socket/005")]
     #[test]
     #[cfg(unix)]
@@ -1588,7 +1588,8 @@ mod tests {
         // 200ms is ~25x under the 5s per-read SO_RCVTIMEO bound, so every
         // dribbled byte comfortably resets the timer well before it
         // could fire even under CI scheduler jitter — this deterministically
-        // exercises the "resets on every read" gap rather than racing it.
+        // exercises the reset-on-every-byte behaviour that opened the gap,
+        // rather than racing it.
         // The daemon dribbles for DRIP_TOTAL (20s), safely longer than
         // ASSERT_CEILING (15s) below, so the drip is still ongoing for the
         // *entire* assertion wait — the failure can only come from the
@@ -1631,10 +1632,9 @@ mod tests {
         });
 
         // Deliberately generous relative to the 5s per-read timeout so
-        // this does not pin the exact operation-level deadline the fix has
-        // not chosen yet — it only needs to hold whatever sane deadline the
-        // fix picks, while still failing well before it would hang CI's own
-        // per-test timeout.
+        // this does not pin the exact operation-level deadline the fix
+        // settled on — it only needs to hold any sane deadline, while still
+        // failing well before it would hang CI's own per-test timeout.
         const ASSERT_CEILING: std::time::Duration = std::time::Duration::from_secs(15);
         let outcome = rx.recv_timeout(ASSERT_CEILING);
 
