@@ -858,3 +858,35 @@ All three now move the stream out under the lock and drop it after the guard, an
 **Verified against two servers, and NOT against the one in the preset.** PRD #802's reconnaissance ran the shape against a local `llama.cpp`. This entry adds Anthropic's own OpenAI-compatible endpoint, where the enforcement was **probed rather than assumed**: a schema whose `action` enum held one bogus token returned that token, over the answer the model plainly wanted to give. It has **not** been run against `api.openai.com`, whose coordinates are the preset — the key on the development box had no credits. So what is unverified is the preset's provider and model, not the protocol, and `docs/develop/desktop-gui.md` says so in its own **what is NOT verified** list rather than leaving a green check to imply otherwise.
 
 **`backend_name` now names the protocol** — `anthropic` or `openai`, not `remote` — because it is rendered beside the latency in the report, and *remote, 0.9 s* answers a question nobody asked once every backend is remote.
+
+### 2026-09-20 — `open-agent-ambiguous-name` is flaky, measured, and no prompt change was shipped for it
+
+**The fixture.** *"zoom coder"* on the deck, against the planted fleet holding **coder one** and **coder two**, must resolve to `ParamAmbiguous` — the app asking which was meant. The property depends on the model answering with the user's words rather than completing them to a full `label`; `resolve_agent_ref` then finds two loose matches and refuses to pick.
+
+**The measurement.** Five full suite runs on 2026-09-20 against `claude-haiku-4-5` through the shipping keyed backend: that fixture passed **2** and failed **3**, every failure resolving to `agent-coder-one`. The other 23 passed 5 of 5. Suite wall clock 22.0–27.6 s.
+
+**It is not a regression of the migration off the agent CLI, and the first version of that claim was sloppy enough to be worth correcting here.** What was actually measured was a *hand-built replica* of the deleted `cli_prompt` — the same instructions and state in one plain user turn, no tool-use envelope — against the same model: it completed the name **5 times out of 5**. That establishes the behaviour is not peculiar to the tool-use envelope. It establishes nothing about what the real `claude` CLI did, since that binary adds a system prompt of its own. Nobody characterised this fixture's rate before the migration, so *"it was flaky before"* is a reasonable inference and not a measurement, and the commit that moved the fixtures says "6 runs out of 6" about the replica in wording loose enough to read as the real path.
+
+**Seven prompt variants were measured against it and none shipped.** All against `claude-haiku-4-5` through the tool-use envelope, `"zoom coder"` scored on whether the answer was the user's word:
+
+| variant | "zoom coder" echoes the user | side effect |
+| --- | --- | --- |
+| shipped prompt (baseline) | 0/6 | — |
+| `+` "answer with those words even when they match more than one agent…" after the name sentence | 2/3 | none observed |
+| `+` name sentence rewritten hard **and** the params description rewritten | 3/4 | `open-agent-by-state` 3/4 |
+| `+` a per-property `description` on `params.agent` | 3/5 | `open-agent-isolate` **2/5** — the *action* itself went unstable |
+| `+` "Never narrow a name the user gave…" at the **end** of the instructions | **5/5** | `open-agent-by-state` **3/5** |
+| params description with the `label` clause **removed**, instructions untouched | 0/5 | none (others 5/5) |
+| `+` "Never complete a partial name…" scoped after the name sentence | 3/5 | none observed |
+
+Two things fall out of that table. The clause adjacent to the value — *"or the agent's `label`, for a reference the user made by state"* — is **not** the cause: removing it changed nothing (0/5). And **every wording that reliably stops the completion also degrades state resolution**, which is the other half of the same sentence: the model is being asked to resolve one kind of reference and copy another, and pressing on either moves the other.
+
+**So the trade on offer is a flake for a different flake, and it was declined.** `TOOL_INSTRUCTIONS` is a prompt reviewed as an interface (`schema.rs` says so), and tuning it against 24 samples on one model is exactly the overfit this document warns about elsewhere. Rule 4's guidance for a real-agent test whose assertion is LLM-variance-sensitive is to make the *fixture* robust; the task that produced this work explicitly forbade changing an expectation, which is the right call for a coder to be given and leaves the decision where it belongs.
+
+**What an owner has to decide**, with the numbers above rather than from scratch:
+
+1. **Relax the fixture** so it asserts the property without depending on the model's copying discipline — for example planting two agents whose labels do not share a prefix with a word the utterance contains, so any answer the model gives is ambiguous. This keeps `ParamAmbiguous` covered end to end and stops pinning a probabilistic behaviour.
+2. **Keep it and quarantine it** with a named owner and an expiry issue, which is rule 6's costly exception and at least stops a lane that is red 60% of the time from training people to skip it.
+3. **Accept the red**, which is the option rule 6 exists to refuse.
+
+Nothing here argues for (3). The recommendation is (1): the fixture's *purpose* — proving the app asks rather than guesses — survives it intact, and what is lost is a second, unintended assertion about model phrasing that no other fixture makes.

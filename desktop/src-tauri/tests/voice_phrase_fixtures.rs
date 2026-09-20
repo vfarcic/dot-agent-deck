@@ -19,6 +19,36 @@
 //! The test is local-only. It never reaches a model in CI or during an ordinary
 //! `cargo test-fast`; set `DOT_AGENT_DECK_REQUIRE_REAL_E2E=1` to opt in and to
 //! turn a missing credential into a failure instead of a green runtime skip.
+//!
+//! # ONE fixture is flaky, measured rather than suspected: `open-agent-ambiguous-name`
+//!
+//! *"zoom coder"* against a fleet holding **coder one** and **coder two** must
+//! produce [`VoiceOutcome::ParamAmbiguous`], so the app asks which was meant.
+//! The property depends on the model echoing the user's words rather than
+//! completing them, and it does not always: across **five** full suite runs on
+//! 2026-09-20 against `claude-haiku-4-5`, that fixture passed **2** times and
+//! failed 3, each failure resolving to `agent-coder-one`. Every other fixture
+//! passed 5 of 5.
+//!
+//! **It is not a regression of the migration to this backend.** The wording is
+//! careful because the first attempt at this claim was not: a *hand-built
+//! replica* of the deleted agent-CLI prompt reproduced the completion 5 times
+//! out of 5 on the same model, which says the behaviour is not peculiar to the
+//! tool-use envelope — and says nothing about what the real CLI, with its own
+//! system prompt, did. Nobody characterised this fixture's rate before the
+//! migration, so "it was flaky before" is a reasonable inference and not a
+//! measurement.
+//!
+//! **No prompt change was shipped for it, and seven were measured.** Every
+//! wording that reliably stopped the completion also degraded
+//! `open-agent-by-state` (*"show me the one that's stuck"*), and the one
+//! wording that left that alone only held the completion 3 times in 5 — which
+//! trades a flake for a different flake. [`super`]'s `TOOL_INSTRUCTIONS` is
+//! reviewed as an interface, and overfitting it to 24 samples against one model
+//! is the thing PRD #802 warns about. The PRD's 2026-09-20 entry has the seven
+//! variants and their numbers.
+//!
+//! [`VoiceOutcome::ParamAmbiguous`]: dot_agent_deck_desktop::voice::VoiceOutcome::ParamAmbiguous
 
 use std::fmt;
 use std::time::{Duration, Instant};
