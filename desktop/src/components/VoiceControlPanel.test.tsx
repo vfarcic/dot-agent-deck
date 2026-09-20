@@ -675,6 +675,7 @@ describe("voice control panel", () => {
   function survivingMicrophone() {
     let state: VoiceStatusDto["state"] = "idle";
     let swallowNextRelease = false;
+    let rejectNextRelease = false;
     const live = { available: true, backend: "remote" as const };
     const controls = voiceControls({
       voiceStatus: vi.fn(async () => voiceStatus({ ...live, state })),
@@ -696,6 +697,10 @@ describe("voice control panel", () => {
           // promise never settles.
           return new Promise<VoiceStatusDto>(() => {});
         }
+        if (rejectNextRelease) {
+          rejectNextRelease = false;
+          return Promise.reject("the microphone call failed: the device would not let go");
+        }
         state = "idle";
         return Promise.resolve(voiceStatus({ ...live, state }));
       }),
@@ -705,6 +710,8 @@ describe("voice control panel", () => {
       state: () => state,
       /** The next release never reaches Rust, the way a lost webview's does not. */
       loseTheNextRelease: () => { swallowNextRelease = true; },
+      /** The next release is refused while Rust continues holding the session. */
+      refuseTheNextRelease: () => { rejectNextRelease = true; },
     };
   }
 
@@ -738,6 +745,31 @@ describe("voice control panel", () => {
 
     expect(mic.state()).toBe("recording");
     expect(voiceButton()).toHaveTextContent(/voice\s+on/i);
+  });
+
+  /**
+   * Scenario: a replacement panel finds the recording its predecessor left
+   * open, but Rust refuses the reconcile release. The button must keep a
+   * not-released presentation instead of claiming the microphone is off.
+   */
+  it("does not claim Voice off when mount reconciliation cannot release the microphone", async () => {
+    const mic = survivingMicrophone();
+    const first = render(<DeckShell runtime={runtime(resolver(result(DISPATCH)), mic.controls)} />);
+
+    await turnVoiceOn(mic.controls);
+    mic.loseTheNextRelease();
+    first.unmount();
+    await flush();
+    expect(mic.state()).toBe("recording");
+
+    mic.refuseTheNextRelease();
+    render(<DeckShell runtime={runtime(resolver(result(DISPATCH)), mic.controls)} />);
+    await flush();
+
+    expect(mic.state()).toBe("recording");
+    expect(voiceButton()).not.toHaveTextContent(/voice\s+off/i);
+    expect(voiceButton().querySelector("svg.lucide-mic-off")).toBeNull();
+    expect(voiceButton()).not.toHaveAttribute("aria-pressed", "false");
   });
 
   /**
