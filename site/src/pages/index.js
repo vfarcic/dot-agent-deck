@@ -96,18 +96,19 @@ const doorPages = [
 const COUNT_WORDS = ['No', 'One', 'Two', 'Three', 'Four', 'Five', 'Six'];
 
 /**
- * Which layout a story row takes, in the order the cases have to be tested.
- * A step with no frame stands alone; a frame flagged `wide` stacks the text
- * over a full-width frame and so leaves the alternation; everything else
- * alternates sides down the page. `landing-content.js` carries why each flag
- * exists and the arithmetic behind it.
+ * Which layout a story row takes. A step with no frame stands alone;
+ * everything else alternates sides down the page.
+ *
+ * A `wide` flag used to take a third branch here, stacking the text over a
+ * full-measure frame for the old row 04 band. That frame is gone and the flag
+ * went with it, so no row leaves the alternation any more. The surviving
+ * `tall` flag is read below, on the <figure> rather than on the row: it caps
+ * how wide a frame runs inside its own column and does not change which
+ * layout the row takes. `landing-content.js` carries the arithmetic.
  */
 function storyRowClass(step, index) {
   if (!step.shot) {
     return styles.storyRowSolo;
-  }
-  if (step.shot.wide) {
-    return styles.storyRowWide;
   }
   return index % 2 === 0 ? styles.storyRow : styles.storyRowFlip;
 }

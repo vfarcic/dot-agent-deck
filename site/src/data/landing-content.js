@@ -384,27 +384,31 @@ export const desktop = {
  * describes what is IN the frame rather than what the row argues, so a
  * recapture that changes what a frame shows is a one-file correction.
  *
- * `tall` and `wide` are OPTIONAL layout flags on an entry, read by `index.js`.
- * Both say the same thing about a frame -- "this one is far enough from the
- * others' shape that the row falls out of step with its neighbours" -- and the
- * measure for both is the same: how tall the frame stands, in multiples of the
- * figure column's own width, when the story is at its 1120px maximum. Rows 01
- * and 03 set the house shape at 0.58 and 0.56.
+ * `tall` is an OPTIONAL layout flag on an entry, read by `index.js`. It says
+ * "this frame is far enough from the others' shape that the row falls out of
+ * step with its neighbours", and the measure is how tall the frame stands, in
+ * multiples of the figure column's own width, when the story is at its 1120px
+ * maximum. Rows 01 and 03 set the house shape at 0.58 and 0.56.
  *
- * `tall` means "much closer to 4:3 than the 16:9 the other rows carry".
- * `busy-deck-real.webp` is 2554x1936, so at the column's full width it stands
- * 0.76 -- about a third taller than rows 01 and 03. The flag caps its width
- * above the two-column breakpoint instead of cropping it: a crop would cut off
- * the two edges it is here for, the sidebar's cards on one side and the
- * footer's counts on the other.
+ * `tall` means "much closer to 4:3 than the 16:9 the other rows carry", and
+ * TWO rows now carry it. `busy-deck-real.webp` is 2554x1936 and
+ * `dispatch.webp` is 2550x1964, so at the column's full width they stand 0.76
+ * and 0.77 -- about a third taller than rows 01 and 03. The flag caps their
+ * width above the two-column breakpoint instead of cropping them, which brings
+ * them to 0.59 and 0.60. Cropping would cut off exactly the edges each frame
+ * is carried for: row 02's sidebar cards and footer counts, row 04's two
+ * directory paths. `index.module.css` carries the division and the note on
+ * what two capped rows out of four look like together.
  *
- * `wide` is the same problem in the other direction, and needs the opposite
- * treatment because no width cap can fix a frame for being too SHORT.
- * `dispatch.webp` is 1946x482 -- a 4.04 band -- so in the ordinary figure
- * column it stands 0.25, further below the house shape than the uncapped
- * `busy-deck-real.webp` stood above it. The flag stacks that row instead: the
- * text over the frame, and the frame across the whole story measure, which is
- * 1.81 column-widths and so 0.45 tall.
+ * There WAS a `wide` flag, for the opposite deviation, and it left with the
+ * frame that needed it. The old `dispatch.webp` was a 1946x482 band (4.04)
+ * that no width cap could fix -- capping a width only makes a frame shorter,
+ * and that one was already short -- so the flag stacked its row instead, text
+ * over a full-measure frame. The maintainer's own capture replaced it at 1.30
+ * and left nothing flagged `wide`, so the flag, its branch in `index.js` and
+ * `.storyRowWide` went with it rather than sitting in the tree as a dead
+ * option. `.storyRowSolo` stayed: the figure-less case is still genuinely
+ * optional, and its own comment says so.
  *
  * What changed, frame by frame:
  *
@@ -438,31 +442,46 @@ export const desktop = {
  *   claim it was really making here. `home-hero-dashboard.jpg` briefly held
  *   this slot while the new capture was being taken and has gone back to being
  *   `docs/session-management.md`'s Compact-density illustration.
- * - Row 04 (dispatching) now carries `dispatch.webp`, commissioned for this
- *   row because nothing in the repository illustrated a dispatched unit --
- *   `docs/dispatcher-mode.md` carries no images at all -- and shot to the
- *   specification the row asked for: a dispatcher pane mid-conversation, the
- *   plain-English ask visible, the reply naming the unit and its sibling
- *   directory, and the new unit's card already on the deck beside it. The row
- *   rendered as a single centred column while the filename did not exist,
- *   rather than shipping a broken image; adding `shot:` was the whole change.
+ * - Row 04 (dispatching) now carries the MAINTAINER'S OWN capture, at the same
+ *   `dispatch.webp` filename, so nothing else in this file moved to take it.
+ *   It replaces a frame commissioned for the row, which showed one
+ *   single-agent unit reading `Idle` with `Tools: 0` -- the moment after it
+ *   was created. That was the strongest claim that frame could support, and
+ *   its caption had to say so out loud ("a moment before it starts"), because
+ *   a caption claiming visible work would have been describing the copy and
+ *   not the picture.
  *
- *   Two things the caption is written AROUND, both read off the frame rather
- *   than off the row's argument. Both cards show `Idle` and `Tools: 0`: the
- *   unit has been created and has not begun working, so a caption claiming
- *   visible work would be describing the copy and not the picture. And the
- *   dispatched unit's own card carries no directory (`Dir: --`) -- the sibling
- *   path `../storefront-dispatch-login-timeout` is in the reply text beside
- *   it, not on the card.
+ *   The new frame supports the row's WHOLE claim rather than half of it. The
+ *   row says "an agent, or a whole orchestration" and "start as many as you
+ *   like". The frame shows two units up at once -- `voice-control` and
+ *   `product-website`, each a 6-role mixed orchestration, each in its own
+ *   sibling checkout, both cut from `main` at the same commit -- and then an
+ *   ask for three running at a time up to twenty in total, with the reply
+ *   working out that eighteen are left. Both halves are visible now instead of
+ *   asserted, which is why the old caption had to go rather than be trimmed.
  *
- *   It carries `wide`. The frame shipped at 1946x1187 and was recropped to
- *   1946x482 to drop a large empty region below the cards -- content
- *   unchanged, so the alt and the caption survived it, but the shape did not:
- *   1.64 became 4.04. See the flag's own note above for the arithmetic. What
- *   the crop removed is worth knowing before writing to this frame again: the
- *   deck footer's counts, the `TYPING` indicator and the `Command Mode Ctrl+D`
- *   hint are all gone from it, so neither the alt nor the caption may reach
- *   for them.
+ *   Three things the copy is written to deliberately.
+ *
+ *   The maintainer drew a YELLOW ARROW on the frame, pointing down at that
+ *   ask. It is content, not a blemish, so the alt names it and says what it
+ *   points at -- a screen-reader user should not be the one person who cannot
+ *   tell an annotation is there -- and the caption follows where it points
+ *   instead of talking around it.
+ *
+ *   The two directory paths are the maintainer's real ones, under
+ *   `/home/vfarcic/code/`. That is settled, twice over: the project is public
+ *   and the capture is the deck doing real work, the same verdict that carried
+ *   row 02's frame. Do not scrub them, do not hedge around them, and do not
+ *   re-raise it.
+ *
+ *   The sidebar's single card (`Prmt: Why is 450 red?`) and the pane's token
+ *   counter are both incidental to what the row argues, so neither the alt nor
+ *   the caption reaches for them.
+ *
+ *   It carries `tall` where the old frame carried `wide`: 2550x1964 is 1.30, a
+ *   hair squarer than row 02's 1.32, against the old band's 4.04. See the
+ *   flag's own note above for the arithmetic, and `index.module.css` for what
+ *   the cap does to the row.
  * - `reattach.png` leaves the page with the "walk away" row it illustrated.
  *   The maintainer's verdict on that frame was "I'm not sure I understand" it,
  *   and the diagnosis is that the idea has no moment to photograph: detaching
@@ -513,10 +532,10 @@ export const screenshots = {
   },
   dispatch: {
     src: '/img/dispatch.webp',
-    wide: true,
-    alt: 'A dispatcher pane mid-conversation — the ask “Start work on the login timeout bug.”, and a reply naming a single-agent unit login-timeout and the sibling directory ../storefront-dispatch-login-timeout — beside a sidebar where a second card, dispatch-login-timeout, has already appeared under the dispatcher’s own; both cards read Idle with a tool count of 0',
+    tall: true,
+    alt: 'A deck with the Dashboard and three mixed · dot-agent-deck… orchestration tabs along the top, and a dispatcher pane reading “Confirmed — both units are now up:” over voice-control → /home/vfarcic/code/dot-agent-deck-dispatch-voice-control (#802) and product-website → /home/vfarcic/code/dot-agent-deck-dispatch-product-website (#1021), then “Both cut from main at d7bbbd39, each a 6-role mixed orchestration.” A yellow arrow drawn onto the screenshot points down at the request below that, which asks for three dispatched agents or teams at a time and a stop at twenty in total; the reply reads it back as a standing loop with eighteen still to dispatch. The footer counts 17 active agents, 1 working and 1 thinking',
     caption:
-      'One sentence to a dispatcher pane. The reply names the unit — login-timeout — and the sibling directory it gets instead of this checkout, ../storefront-dispatch-login-timeout, and the unit’s card is already on the deck, directly under the card of the pane that asked for it. Both cards still read Idle with no tools run: this is the unit arriving, a moment before it starts.',
+      'Two units up from one dispatcher pane, and neither of them is a single agent — each is a whole 6-role orchestration, in its own copy of the repository, both cut from main at the same commit. The yellow arrow marks the ask that follows: keep three running at a time, start a fresh one whenever a slot frees, stop at twenty — which the pane reads back as eighteen still to go.',
   },
 };
 

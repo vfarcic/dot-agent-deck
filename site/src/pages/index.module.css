@@ -345,42 +345,6 @@
   text-align: center;
 }
 
-/*
- * A frame markedly WIDER than its neighbours, flagged `wide` in
- * `landing-content.js`. Row 04's `dispatch.webp` is 1946x482 (4.04) against
- * 1.74 for row 01 and 1.78 for row 03, so in the ordinary 1.15fr figure column
- * it stands 0.25 column-widths tall where they stand 0.58 and 0.56 — 149px
- * against their 347 and 339. That is a wider deviation than the one
- * `.storyFigureTall` exists to absorb, and it cannot be absorbed the same way:
- * capping a width only makes a frame shorter, and this one is already short.
- *
- * So the row stacks rather than splits — text over frame, the frame across the
- * whole 1088px story measure. Same arithmetic run the other way: 1088 against
- * the column's 602.6 is 1.81 column-widths of width, so 1.81 x 0.248 = 0.45
- * tall, 269px, in reach of row 03's 339 rather than under half of it.
- *
- * The text keeps its own measure instead of running the full width with the
- * frame, which at 1088px would put the body copy near 130 characters to the
- * line. 44rem is the measure `.storyRowSolo` above already picked for a
- * single-column story row.
- */
-.storyRowWide {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr);
-  gap: 1.5rem;
-}
-
-/*
- * The measure, above the breakpoint only. Below it every row is already a
- * single column with a full-width frame, so capping row 04's text there would
- * make it the odd one out rather than keep it in step.
- */
-@media (min-width: 997px) {
-  .storyRowWide .storyText {
-    max-width: 44rem;
-  }
-}
-
 .storyRowFlip .storyText {
   order: 2;
 }
@@ -435,22 +399,34 @@
 
 /*
  * A frame markedly taller than its neighbours, flagged `tall` in
- * `landing-content.js`. Row 02's `busy-deck-real.webp` is 2554x1936 (1.32)
- * against 1.74 for row 01 and 1.78 for row 03, so at the column's full width
- * it stands about a third taller than either and the row reads as out of step
- * with the ones above and below it.
+ * `landing-content.js`. Two of the four rows carry it: row 02's
+ * `busy-deck-real.webp` is 2554x1936 (1.32) and row 04's `dispatch.webp` is
+ * 2550x1964 (1.30), against 1.74 for row 01 and 1.78 for row 03, so at the
+ * column's full width either stands about a third taller than those two and
+ * the row reads as out of step with the ones above and below it.
  *
  * Capping the WIDTH is what absorbs that without touching the image. Every
  * story figure gets the same 1.15fr column (the flipped rows mirror the track
  * sizes, so they are not narrower), which makes the comparison a single
- * division: at 78% the frame stands 0.78/1.32 = 0.59 column-widths tall, a
- * hair over row 01's 1/1.74 = 0.58 and row 03's 1/1.78 = 0.56 -- close enough
- * that the row reads in step with them. The border still hugs the frame,
- * which a `max-height` with `object-fit: contain` would not -- that
- * letterboxes inside the border instead. Cropping to 16:9 was the other
- * option and is worse than either: it would cut off exactly the two edges the
- * frame is carried for, the sidebar's six cards on one side and the footer's
- * counts on the other.
+ * division: at 78% row 02 stands 0.78/1.32 = 0.59 column-widths tall and row
+ * 04 stands 0.78/1.30 = 0.60, against row 01's 1/1.74 = 0.58 and row 03's
+ * 1/1.78 = 0.56 -- close enough that both read in step with them. Against the
+ * column's 602.6px that is 356 and 362 beside 347 and 339. The border still
+ * hugs the frame, which a `max-height` with `object-fit: contain` would not --
+ * that letterboxes inside the border instead. Cropping to 16:9 was the other
+ * option and is worse than either: it would cut off exactly the edges each
+ * frame is carried for, row 02's six sidebar cards and footer counts, row 04's
+ * two directory paths.
+ *
+ * TWO capped rows out of four is worth a note, because it is the point where
+ * a correction starts becoming the house style. The two do not sit adjacent
+ * -- row 03's uncapped 16:9 is between them -- but both land on `.storyRowFlip`
+ * (rows at odd indices flip), so both inset frames sit in the LEFT column with
+ * their own whitespace either side of the image. At 0.59 against 0.60 they are
+ * the same height to the eye, which reads as a pair of matching figures rather
+ * than as two separate compromises. It was left alone deliberately: the
+ * alternative is a different cap for one of the two, which is a design
+ * decision about the house shape and not a tweak to make here.
  *
  * Only above the breakpoint. Once the row collapses to a single column there
  * is nothing left for the frame to be out of step with, and a capped one would
