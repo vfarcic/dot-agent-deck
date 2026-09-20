@@ -396,6 +396,36 @@
   margin-top: 0.6rem;
 }
 
+/*
+ * A frame markedly taller than its neighbours, flagged `tall` in
+ * `landing-content.js`. Row 02's `busy-deck-real.webp` is 2554x1936 (1.32)
+ * against 1.65 for row 01 and 1.78 for row 03, so at the column's full width
+ * it stands about a third taller than either and the row reads as out of step
+ * with the ones above and below it.
+ *
+ * Capping the WIDTH is what absorbs that without touching the image. Every
+ * story figure gets the same 1.15fr column (the flipped rows mirror the track
+ * sizes, so they are not narrower), which makes the comparison a single
+ * division: at 78% the frame stands 0.78/1.32 = 0.59 column-widths tall,
+ * between row 03's 1/1.78 = 0.56 and row 01's 1/1.65 = 0.61. The border still
+ * hugs the frame, which a `max-height` with `object-fit: contain` would not --
+ * that letterboxes inside the border instead. Cropping to 16:9 was the other
+ * option and is worse than either: it would cut off exactly the two edges the
+ * frame is carried for, the sidebar's six cards on one side and the footer's
+ * counts on the other.
+ *
+ * Only above the breakpoint. Once the row collapses to a single column there
+ * is nothing left for the frame to be out of step with, and a capped one would
+ * just be a needlessly small one.
+ */
+@media (min-width: 997px) {
+  .storyFigureTall img {
+    max-width: 78%;
+    margin-left: auto;
+    margin-right: auto;
+  }
+}
+
 /* ---------- audience ---------- */
 
 .audience {

@@ -369,16 +369,42 @@ export const desktop = {
  * describes what is IN the frame rather than what the row argues, so a
  * recapture that changes what a frame shows is a one-file correction.
  *
- * This pass moved two and dropped two:
+ * `tall` is an OPTIONAL flag on an entry, read by `index.js` and meaning only
+ * "this frame is much closer to 4:3 than the 16:9 the other rows carry".
+ * `busy-deck-real.webp` is 2554x1936, so at the column's full width it renders
+ * about a third taller than rows 01 and 03 and pulls the row out of step with
+ * them. The flag caps its width above the two-column breakpoint instead of
+ * cropping it -- a crop would cut off the two edges it is here for, the
+ * sidebar's cards on one side and the footer's counts on the other.
  *
- * - Row 02 ("Watch every one of them") now carries `busy-deck.webp` instead of
- *   `session-management-card.jpg`. The row argues both "every pane gets a
- *   card" and "the cards tighten up rather than make you scroll", and a frame
- *   of ONE card could only ever show the first half of that. The new capture
- *   -- nine cards, five tabs, four different agent clients, a mix of Thinking
- *   / Working / Idle -- shows both at once, which is what the maintainer asked
- *   for ("might benefit from a new screenshot that contains many tabs and
- *   agents"). `session-management-card.jpg` is not orphaned by the move: it is
+ * What changed, frame by frame:
+ *
+ * - Row 02 ("Watch every one of them") now carries `busy-deck-real.webp`
+ *   instead of `session-management-card.jpg`. The row argues both "every pane
+ *   gets a card" and "the cards tighten up rather than make you scroll", and a
+ *   frame of ONE card could only ever show the first half of that.
+ *
+ *   The frame is the MAINTAINER'S OWN capture of a real deck at work, chosen
+ *   by them over a synthetic nine-card alternative in a side-by-side
+ *   comparison. It was declined once, for three reasons -- it shows unreleased
+ *   work in its directory names, a quoted security-audit finding in the
+ *   focused pane, and `experimental: on` in the footer -- and the maintainer
+ *   overruled all three: "It's a screenshot of the deck doing real work. This
+ *   project is public so nothing is a secret." The synthetic frame it replaced
+ *   (`busy-deck.webp`, nine cards, five tabs) is deleted rather than left in
+ *   the tree unused.
+ *
+ *   Write the copy to THIS frame's strength, which is not the synthetic one's.
+ *   Its four tab titles all truncate to near-identical `mixed ·
+ *   dot-agent-deck-dis…` text, so it is weak evidence for "many tabs". What it
+ *   shows instead is FOUR DIFFERENT AGENT CLIENTS running at once, which is
+ *   the page's own claim made visible and which none of the page's other three
+ *   frames carries: the hero and row 03 are `ClaudeCode` on every card, and
+ *   row 01 is a form with no cards at all. So the caption leans there, and
+ *   does not describe the focused pane's contents. The row's density half is
+ *   now carried by the body copy alone.
+ *
+ *   `session-management-card.jpg` is not orphaned by the move: it is
  *   `docs/session-management.md`'s card-anatomy illustration, which is the
  *   claim it was really making here. `home-hero-dashboard.jpg` briefly held
  *   this slot while the new capture was being taken and has gone back to being
@@ -388,15 +414,26 @@ export const desktop = {
  *   at all. Pointing the row at a filename that does not exist would ship a
  *   broken image, so the row renders as a single centred column until the
  *   capture lands; adding `shot:` to the step turns it back into an ordinary
- *   two-column row with no other change.
+ *   two-column row with no other change. The capture is commissioned -- a
+ *   dispatcher pane mid-conversation, the plain-English ask visible, the reply
+ *   naming the unit and its sibling directory, and the new unit's card already
+ *   on the deck beside it -- and lands as `/img/dispatch.webp`.
  * - `reattach.png` leaves the page with the "walk away" row it illustrated.
  *   The maintainer's verdict on that frame was "I'm not sure I understand" it,
  *   and the diagnosis is that the idea has no moment to photograph: detaching
  *   and reattaching is the absence of an event, and the labelled BEFORE/AFTER
  *   pair needed a paragraph of caption to parse, which is the frame failing to
  *   carry it. The claim moves to principle 03, where a sentence makes it
- *   cleanly. The file stays in `site/static/img/` rather than being deleted --
- *   it is an honest capture and `docs/session-management.md` may yet want it.
+ *   cleanly.
+ *
+ * `detach.webp` -- the Quit dialog, supplied and approved by the maintainer
+ * for the old "walk away" row -- has no home on this page either, and for a
+ * reason that now outranks the two it was declined for (it shows the CHOICE
+ * rather than the outcome, and it spells "daemon" on screen in a pass that
+ * removed that vocabulary from the marketing surface): row 04 is dispatching
+ * now, so the row it was meant for does not exist. It is placed in
+ * `docs/session-management.md` instead, beside the detach/resume cycle it
+ * actually illustrates, where "daemon" is ordinary vocabulary.
  *
  * `orchestration-config.png` was deleted from `site/static/img/` in an earlier
  * round -- it published a maintainer's home path and an unrelated project's
@@ -417,10 +454,11 @@ export const screenshots = {
       'The form Ctrl+n opens once the directory is picked. The Mode row is where the choice is made — this directory defines no orchestrations of its own, so it offers the built-in options only.',
   },
   deck: {
-    src: '/img/busy-deck.webp',
-    alt: 'A deck with five tabs open — Dashboard, checkout, web, observability and storefront — and nine agent cards stacked down the sidebar, running Pi, Claude Code, OpenCode and Codex and marked Thinking, Working or Idle, each with its directory, last prompt and current tool, beside the focused coordinator pane tracking eight workstreams',
+    src: '/img/busy-deck-real.webp',
+    tall: true,
+    alt: 'A deck with the Dashboard and four orchestration tabs along the top and six agent cards down the sidebar — ClaudeCode, Pi, OpenCode and Codex filling the orchestrator, coder, reviewer, auditor, tester and release roles, two marked Working and the rest Idle — the cards all laid out the same way, with the directory, the last prompt, the command last run, the time since the last activity and a tool count, over a footer reading 23 active, 2 working, 1 thinking, 20 idle',
     caption:
-      'Nine agents at once, on four different agent clients, with five tabs open above them. Every card carries its own status, directory, last prompt and current tool, and the footer keeps the count: 9 active, 3 working, 3 thinking, 3 idle.',
+      'Four different agent clients — Claude Code, Pi, OpenCode and Codex — running side by side under one orchestrator, and the deck reads all of them the same way: the same card, the same live status, whichever client is behind it. The header counts the six sessions in view out of the deck’s 25; the footer counts every agent it is holding: 23 active, 2 working, 1 thinking, 20 idle.',
   },
   parallel: {
     src: '/img/orchestration-delegation-parallel.png',

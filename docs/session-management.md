@@ -44,7 +44,13 @@ The more agents you run in parallel, the more cards Agent Deck has to fit on the
 
 Agent Deck restores your workspace automatically. There is no flag to pass and no decision to make: every time you launch the TUI — `dot-agent-deck` locally or `dot-agent-deck connect <name>` for a remote machine — your previous panes, names, directories, commands, and tabs come back. If you would rather start from an empty dashboard, see [Starting Fresh](#starting-fresh) below.
 
-What you get back depends on whether your agents are still running:
+What you get back depends on whether your agents are still running — and that is usually settled on the way out. `Ctrl+C` from command mode opens the quit dialog:
+
+![The Quit dialog, headed “Quit dot-agent-deck?”, offering three options: Detach, currently selected, described as “leave agents running on the daemon”; Stop, “shut down agents and daemon”; and Cancel, “return to dashboard”. A clickable row of Detach, Stop and Cancel buttons sits below them, above the hint “Up/Down: navigate, Enter: confirm, Esc: cancel”](/img/detach.webp)
+
+**Detach** is the default, and it is the everyday one: the TUI exits and your agents carry on without it. **Stop** is the deliberate opposite — it shuts the agents down along with the daemon holding them, and asks once more first while any of them are still alive. **Cancel** returns you to the dashboard. See [Dialogs](keyboard-shortcuts.md#dialogs) for the keys.
+
+That leaves two cases when you come back:
 
 - **They're still running.** When you close the TUI or disconnect, your agents keep running in the background (see [How it runs](getting-started.md#how-it-runs)), so coming back brings them up exactly as they were, with their live output. Each card is restored with the agent's *real, current* state as well — its status (Working, Thinking, WaitingForInput, Idle, and so on), its agent label, the tool it is mid-run on, its tool count, and its recent prompts — so the reconnected dashboard matches what you saw before you disconnected. It does **not** reset every card to Idle (or show "No agent") and then wait for each agent to emit its next event to become correct. If you reopen your laptop to an agent that has been quietly waiting for input, its card reads **WaitingForInput** straight away. This is the everyday case.
 - **They're gone.** On a fresh machine, the first launch after a reboot, or after an unexpected shutdown, Agent Deck rebuilds your workspace — panes, names, directories, commands, and tabs — and starts the agents fresh. It restores the *shape* of your workspace, not an agent's in-progress work; each agent picks its own conversation back up through its own command (for example, `claude --continue`).

@@ -205,7 +205,12 @@ export default function Home() {
                   <p>{step.body}</p>
                 </div>
                 {step.shot ? (
-                  <figure className={styles.storyFigure}>
+                  <figure
+                    className={
+                      step.shot.tall
+                        ? `${styles.storyFigure} ${styles.storyFigureTall}`
+                        : styles.storyFigure
+                    }>
                     <img
                       src={step.shot.src}
                       alt={step.shot.alt}
