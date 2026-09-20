@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createFixtureSnapshot } from "../data/fixture";
 import {
   DEFAULT_DESKTOP_SETTINGS,
+  type VoiceCommandDto,
   type DesktopSettingsDto,
   type VoiceResolvedParamDto,
   type VoiceResultDto,
@@ -19,7 +20,7 @@ vi.mock("./TerminalViewport", () => ({
 }));
 
 import { DeckShell } from "../App";
-import { VOICE_STATUS_POLL_MS } from "./VoiceControlPanel";
+import { NOTHING_DISPATCHED, VOICE_STATUS_POLL_MS } from "./VoiceControlPanel";
 
 /**
  * PRD #802 — the rows that are not navigation.
@@ -271,5 +272,132 @@ describe("voice off, as a command", () => {
     await act(async () => { await vi.advanceTimersByTimeAsync(VOICE_STATUS_POLL_MS * 8); });
 
     expect(voice.voiceStart).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("what can I say?", () => {
+  beforeEach(() => {
+    window.localStorage.clear();
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  const VOCABULARY: VoiceCommandDto[] = [
+    { id: "open_overview", description: "Show every agent in one list.", callable: true, unavailable_hint: "the agent overview opens from the deck", params: [] },
+    { id: "voice_off", description: "Stop listening.", callable: true, unavailable_hint: "turning voice off works anywhere", params: [] },
+    { id: "open_deck", description: "Go back to the terminals.", callable: false, unavailable_hint: "returning to the deck works from the agent overview", params: [] },
+  ];
+
+  function listing(voice: VoiceControls, commands = VOCABULARY) {
+    const voiceCommands = vi.fn(async () => commands);
+    const resolveVoice: ResolveVoice = vi.fn(async () => dispatch("list_commands", "showVoiceCommands", "Here is what you can say.", "what can I say?"));
+    return { voiceCommands, runtime: runtime(resolveVoice, voice, { voiceCommands }) };
+  }
+
+  /**
+   * Scenario: ask what can be said. An overlay opens listing every row the
+   * table carries, split by whether this screen can run it — the callable ones
+   * under one heading and the rest under another, both generated from the same
+   * answer rather than from anything written in the panel.
+   */
+  it("opens an overlay generated from the table, split by what is callable here", async () => {
+    const voice = microphone(["what can I say?"]);
+    const { voiceCommands, runtime: deck } = listing(voice);
+    render(<DeckShell runtime={deck} />);
+
+    await turnVoiceOn();
+    await completeUtterance();
+
+    expect(voiceCommands).toHaveBeenCalledWith("deck");
+    const overlay = screen.getByTestId("voice-help");
+    expect(overlay).toHaveTextContent("Show every agent in one list.");
+    const here = overlay.querySelector('[data-where="here"]');
+    const elsewhere = overlay.querySelector('[data-where="elsewhere"]');
+    expect(Array.from(here?.querySelectorAll("[data-command]") ?? []).map((row) => row.getAttribute("data-command")))
+      .toEqual(["open_overview", "voice_off"]);
+    expect(Array.from(elsewhere?.querySelectorAll("[data-command]") ?? []).map((row) => row.getAttribute("data-command")))
+      .toEqual(["open_deck"]);
+  });
+
+  /**
+   * Scenario: the overlay is asked for the screen the user is standing on, not
+   * a screen a stale closure remembered. Asked from the overview, it is the
+   * overview's answer that is requested.
+   */
+  it("asks for the screen the user is on", async () => {
+    const voice = microphone(["what can I say?"]);
+    const { voiceCommands, runtime: deck } = listing(voice);
+    render(<DeckShell runtime={deck} initialView={{ kind: "overview" }} />);
+
+    await turnVoiceOn();
+    await completeUtterance();
+
+    expect(voiceCommands).toHaveBeenCalledWith("overview");
+  });
+
+  /**
+   * Scenario: the overlay has two ways out and neither of them is voice, which
+   * is what a user who opened it by mistake needs. Close dismisses it; so does
+   * Escape.
+   */
+  it("closes from its own button and from Escape", async () => {
+    const voice = microphone(["what can I say?"]);
+    const { runtime: deck } = listing(voice);
+    render(<DeckShell runtime={deck} />);
+
+    await turnVoiceOn();
+    await completeUtterance();
+    expect(screen.getByTestId("voice-help")).toBeInTheDocument();
+
+    await act(async () => { fireEvent.click(screen.getByTestId("voice-help-close")); });
+    expect(screen.queryByTestId("voice-help")).toBeNull();
+
+    // Asked for again rather than reopened by hand: the second opening has to
+    // come down the same path as the first, or this asserts nothing about the
+    // dismissal it just performed.
+    voice.deliver("what can I say?");
+    await completeUtterance();
+    expect(screen.getByTestId("voice-help")).toBeInTheDocument();
+
+    await act(async () => { fireEvent.keyDown(window, { key: "Escape" }); });
+    expect(screen.queryByTestId("voice-help")).toBeNull();
+  });
+
+  /**
+   * Scenario: opening the list does not stop voice control. The overlay is the
+   * one surface this panel puts over the screen and it must not behave like a
+   * dialog that has to be dismissed between utterances — the pipeline goes
+   * straight back to listening underneath it.
+   */
+  it("leaves voice on and listening underneath", async () => {
+    const voice = microphone(["what can I say?"]);
+    const { runtime: deck } = listing(voice);
+    render(<DeckShell runtime={deck} />);
+
+    await turnVoiceOn();
+    await completeUtterance();
+
+    expect(voiceButton()).toHaveAttribute("aria-pressed", "true");
+    expect(voice.voiceStart).toHaveBeenCalledTimes(2);
+  });
+
+  /**
+   * Scenario: a runtime with no vocabulary verb cannot list anything, so the
+   * row is refused before it runs rather than opening an overlay that has to
+   * explain its own emptiness.
+   */
+  it("is refused, not opened empty, when the runtime cannot list", async () => {
+    const voice = microphone(["what can I say?"]);
+    const resolveVoice: ResolveVoice = vi.fn(async () => dispatch("list_commands", "showVoiceCommands", "Here is what you can say.", "what can I say?"));
+    render(<DeckShell runtime={runtime(resolveVoice, voice)} />);
+
+    await turnVoiceOn();
+    await completeUtterance();
+
+    expect(screen.queryByTestId("voice-help")).toBeNull();
+    expect(screen.getByTestId("voice-report")).toHaveTextContent(NOTHING_DISPATCHED);
   });
 });

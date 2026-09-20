@@ -340,6 +340,7 @@ export function useDeckRuntime(): DeckRuntimeState {
    */
   const declareVoiceScreen = useCallback((screen: VoiceScreen) => bridge.declareVoiceScreen(screen), [bridge]);
   const resolveVoice = useCallback((utterance: string) => bridge.resolveVoice(utterance), [bridge]);
+  const voiceCommands = useCallback((screen: VoiceScreen) => bridge.voiceCommands(screen), [bridge]);
   const voiceStart = useCallback(() => bridge.voiceStart(), [bridge]);
   const voiceStop = useCallback(() => bridge.voiceStop(), [bridge]);
   const voiceStatus = useCallback(() => bridge.voiceStatus(), [bridge]);
@@ -406,6 +407,7 @@ export function useDeckRuntime(): DeckRuntimeState {
     forgetSecret,
     declareVoiceScreen,
     resolveVoice,
+    voiceCommands,
     voiceStart,
     voiceStop,
     voiceStatus,

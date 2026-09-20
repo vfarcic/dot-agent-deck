@@ -1903,6 +1903,40 @@ async fn desktop_voice_resolve(
     .await)
 }
 
+/// PRD #802 — what can be said on this screen, for the discovery overlay.
+///
+/// # It is the TABLE, annotated, and deliberately the same shape the model gets
+///
+/// The overlay's requirement is that it be *generated from the table, never a
+/// maintained list*, so this returns exactly what [`voice::annotate`] hands the
+/// intent backend: each row's `id`, its `description` and whether the current
+/// screen can run it. Handing the webview a second, prettier projection would
+/// be the maintained list under a better name — and the first time a row's
+/// wording changed, the overlay and the model would be telling the user and the
+/// model two different things.
+///
+/// **So the `description` a user reads here is a PROMPT**, written for a model
+/// and reviewed as an interface (`commands.toml` says so at the column). That
+/// is a real cost and it is the deliberate side of the trade: a separate
+/// user-facing column would read better and would be a second wording to keep
+/// in step, which is the whole defect class this table exists to close.
+///
+/// # No daemon round trip, no model, no state
+///
+/// Unlike [`desktop_voice_resolve`] this reaches nothing: the table is
+/// `include_str!`d into the binary and the screen arrives as a parameter, so
+/// the answer is a pure function of the two. It costs no `ListAgents`, spends
+/// no credential, and is safe to call every time the overlay opens rather than
+/// being cached into something that can go stale.
+#[tauri::command]
+async fn desktop_voice_commands(
+    webview: Webview,
+    screen: voice::Screen,
+) -> Result<Vec<voice::AnnotatedCommand>, String> {
+    ensure_main_webview(&webview)?;
+    Ok(voice::annotate(voice::table(), screen))
+}
+
 /// Put a saved document's deck selection into force (PRD #741 M7, completed at
 /// M9).
 ///
@@ -2742,6 +2776,7 @@ pub fn run() {
             desktop_voice_status,
             desktop_voice_cancel,
             desktop_voice_resolve,
+            desktop_voice_commands,
         ])
         .build(tauri::generate_context!())
         .expect("failed to build dot-agent-deck desktop application");

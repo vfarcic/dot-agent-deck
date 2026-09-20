@@ -147,3 +147,26 @@ agent."""
 invoke      = "stopVoice"
 unavailable_hint = "turning voice off works anywhere"
 report      = "Voice control off."
+
+# PRD #802 D7 — discovery, and the second row with no `screens` key.
+#
+# The product owner asked the feature what it could do and was told that is not
+# a command. This is the row that answers. It is callable everywhere for the
+# same reason `voice_off` is: a user who does not know what to say cannot be
+# told to go to another screen first.
+#
+# The overlay it opens is GENERATED from this table — every row's id, its
+# description and whether this screen can run it — so a row added below appears
+# in it with no edit anywhere. There is deliberately no user-facing wording
+# column feeding it: the `description` a reader sees there IS this prompt, which
+# reads as one, and that is the accepted cost of not keeping two wordings in
+# step. `desktop_voice_commands` in `lib.rs` has the argument.
+[[commands]]
+id          = "list_commands"
+description = """List everything the user can say right now: an overlay naming every spoken
+command and what each one does. Use when the user asks what they can say, what commands there
+are, what you can do, how this works, for help, for the options, or for a list. This only shows
+the list — it runs none of the commands on it."""
+invoke      = "showVoiceCommands"
+unavailable_hint = "the list of commands opens anywhere"
+report      = "Here is what you can say."

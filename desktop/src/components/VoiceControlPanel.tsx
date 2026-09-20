@@ -71,11 +71,11 @@
  * comment on the returned element has the reasoning and the one it replaced.
  */
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Mic, MicOff, Undo2 } from "lucide-react";
+import { Mic, MicOff, Undo2, X } from "lucide-react";
 import { DISPLAY_LIMITS, displayText } from "../lib/displayText";
 import { VOICE_PEER_PROPS } from "../hooks/useInertBackground";
 import { VOICE_ACTIONS, type VoicePanelChannel, type VoicePanelContext } from "../lib/voiceActions";
-import type { VoiceOutcomeDto, VoiceResultDto, VoiceScreen, VoiceStatusDto } from "../lib/bridge";
+import type { VoiceCommandDto, VoiceOutcomeDto, VoiceResultDto, VoiceScreen, VoiceStatusDto } from "../lib/bridge";
 import type { DeckRuntimeState } from "../types";
 
 /**
@@ -203,7 +203,7 @@ export const VOICE_CAP_DISCARDED = "That ran to the 30 s limit with no pause in 
 export const VOICE_RELEASE_REFUSED = "The microphone may still be open — releasing it was refused. Press Voice again to retry.";
 
 /** The voice half of the runtime, which a runtime may not have at all. */
-type Voice = Pick<DeckRuntimeState, "declareVoiceScreen" | "resolveVoice" | "voiceStart" | "voiceStop" | "voiceStatus" | "voiceCancel">;
+type Voice = Pick<DeckRuntimeState, "declareVoiceScreen" | "resolveVoice" | "voiceCommands" | "voiceStart" | "voiceStop" | "voiceStatus" | "voiceCancel">;
 
 /**
  * What the surface is doing, which is not the same as whether voice is ON.
@@ -366,7 +366,7 @@ function progressNote(indicator: VoiceIndicator, phase: VoicePhase): string | un
  * and it is the same reasoning the microphone itself gets one layer down.
  */
 export function VoiceControlPanel({ runtime, screen, onDispatch, channel }: VoiceControlPanelProps) {
-  const { declareVoiceScreen, resolveVoice, voiceStart, voiceStop, voiceStatus, voiceCancel } = runtime;
+  const { declareVoiceScreen, resolveVoice, voiceCommands, voiceStart, voiceStop, voiceStatus, voiceCancel } = runtime;
 
   const [on, setOnState] = useState(false);
   const [phase, setPhaseState] = useState<VoicePhase>("idle");
@@ -879,6 +879,52 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel }: Voic
   }, [claim, releasedAfterRefusal, setOn, setPhase, voiceCancel]);
 
   /**
+   * What the discovery overlay is showing, or `undefined` for closed
+   * (PRD #802 D7).
+   *
+   * One piece of state for three situations rather than three booleans: an
+   * empty object is *open and still asking*, `commands` is the answer, and
+   * `problem` is the refusal. `undefined` is the only closed value, which is
+   * what makes "is it open" a single question with a single answer.
+   */
+  const [vocabulary, setVocabulary] = useState<{ commands?: VoiceCommandDto[]; problem?: string }>();
+  /*
+    The overlay's own claim counter, deliberately NOT the pipeline's.
+    `claim()` abandons whatever utterance is in flight, and opening a list must
+    not cancel the command the user is in the middle of saying. This orders
+    overlay answers against each other and against a close, and nothing else.
+  */
+  const vocabularyRequest = useRef(0);
+  const closeVocabulary = useCallback(() => {
+    vocabularyRequest.current += 1;
+    setVocabulary(undefined);
+  }, []);
+  const showVoiceCommands = useCallback(() => {
+    const mine = ++vocabularyRequest.current;
+    setVocabulary({});
+    if (!voiceCommands) return;
+    /* `screenRef` rather than the prop: this runs from a dispatch, which is a
+       promise continuation, and the prop captured when the callback was built
+       may be a screen the user has already left. */
+    void voiceCommands(screenRef.current).then(
+      (commands) => { if (vocabularyRequest.current === mine) setVocabulary({ commands }); },
+      (cause) => { if (vocabularyRequest.current === mine) setVocabulary({ problem: sentenceOf(cause) }); },
+    );
+  }, [voiceCommands]);
+
+  /*
+    Escape closes it. The overlay is the one thing this surface puts over the
+    screen, so it is the one thing that needs a dismissal that is not a click —
+    and a user who opened it by saying "what can I say?" has their hands free.
+  */
+  useEffect(() => {
+    if (!vocabulary) return;
+    const onKeyDown = (event: KeyboardEvent) => { if (event.key === "Escape") closeVocabulary(); };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [vocabulary, closeVocabulary]);
+
+  /**
    * The Voice button's own action, as the registry sees it.
    *
    * Fire-and-forget rather than awaited, because a registry `run` returns
@@ -906,7 +952,11 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel }: Voic
   */
   useEffect(() => {
     if (!channel) return;
-    const published: VoicePanelContext = { stopVoice };
+    /* `showVoiceCommands` only where the runtime can actually list something.
+       Publishing it regardless would open an overlay that has to explain its
+       own emptiness — a sentence this file would have to write — where leaving
+       it out gets the refusal the surface already renders. */
+    const published: Partial<VoicePanelContext> = voiceCommands ? { stopVoice, showVoiceCommands } : { stopVoice };
     channel.current = published;
     return () => { channel.current = undefined; };
   });
@@ -1071,6 +1121,102 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel }: Voic
           </div>
         )}
       </div>
+      {/*
+        PRD #802 D7 — the discovery overlay, and why it is a CHILD of the row.
+
+        It cannot be in the row: the row is one line high by contract, and a
+        list of every command is not one line. So it is an overlay, which is
+        what the requirement says. Being a child of `.voice-row` is what keeps
+        it reachable: `useInertBackground` skips the subtree carrying
+        `VOICE_PEER_PROPS`, and that marker is on the row. A sibling would be
+        marked `inert` behind an open agent pane — exactly the defect the peer
+        exemption exists for, reintroduced one element along — and would need a
+        second exemption the hook deliberately asks to be argued for.
+
+        The row's own "overlaps nothing" property is untouched by this, because
+        this is not the report: it is modal, it is transient, and it has two
+        ways out. A report that covered the screen would be a surface the user
+        cannot get rid of; a list they asked for and can dismiss is the
+        opposite.
+
+        `aria-modal` is deliberately absent. Nothing here inerts the background,
+        the Voice button behind it stays live on purpose — "voice off" while the
+        list is up must still work — and claiming modality the DOM does not have
+        is the false claim `useInertBackground`'s own note is about.
+      */}
+      {vocabulary && (
+        <div className="voice-help-backdrop" data-testid="voice-help" onClick={closeVocabulary}>
+          <div
+            className="voice-help"
+            role="dialog"
+            aria-label="What you can say"
+            /* The backdrop closes; the panel must not. Without this every click
+               inside the list — including one that misses a row — dismisses it. */
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div className="voice-help-head">
+              <h2>What you can say</h2>
+              <button type="button" className="button secondary compact" data-testid="voice-help-close" onClick={closeVocabulary}>
+                <X size={13} /> Close
+              </button>
+            </div>
+            {vocabulary.problem && <p className="voice-help-problem">{displayText(vocabulary.problem, DISPLAY_LIMITS.message)}</p>}
+            {vocabulary.commands && <VoiceVocabulary commands={vocabulary.commands} />}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/**
+ * The list itself, generated from the command table and from nothing else
+ * (PRD #802 D7).
+ *
+ * **Two sections rather than one filtered list.** The requirement is a list of
+ * what is callable *right now*, and that is the first section. The second is
+ * the rest — because "the agent overview opens from the deck" is the single
+ * most useful thing discovery can tell somebody, and dropping those rows would
+ * leave a user who asked what they can say unable to learn that a command
+ * exists at all. Both sections come from the same array and the same `callable`
+ * flag, so neither is a maintained list.
+ *
+ * The two headings are this file's own words, and they are labels for a
+ * boolean rather than wording derived from the table. The `unavailable_hint`
+ * column is deliberately NOT rendered into a sentence here: `voice/outcome.rs`
+ * already composes one from it, and a second composer is how two surfaces come
+ * to phrase the same situation differently — which is the property this whole
+ * pipeline is built on. The heading says what the flag means; the hint stays
+ * where it is rendered once.
+ *
+ * `description` is printed as it stands, without `displayText`. That seam is
+ * for free-form text — a transcript, a backend's detail, an agent's name — and
+ * this is prose compiled into the binary from `commands.toml`, which no user
+ * and no model can reach. Passing it through would also clamp it at the
+ * message budget, which is shorter than several of these rows.
+ */
+function VoiceVocabulary({ commands }: { commands: VoiceCommandDto[] }) {
+  const here = commands.filter((command) => command.callable);
+  const elsewhere = commands.filter((command) => !command.callable);
+  const section = (title: string, rows: VoiceCommandDto[], where: "here" | "elsewhere") => (
+    rows.length > 0 && (
+      <section className="voice-help-section" data-where={where}>
+        <h3>{title}</h3>
+        <ul>
+          {rows.map((command) => (
+            <li key={command.id} data-command={command.id}>
+              <code>{command.id}</code>
+              <p>{command.description}</p>
+            </li>
+          ))}
+        </ul>
+      </section>
+    )
+  );
+  return (
+    <div className="voice-help-body">
+      {section("On this screen", here, "here")}
+      {section("On another screen", elsewhere, "elsewhere")}
     </div>
   );
 }

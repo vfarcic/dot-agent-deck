@@ -1,4 +1,4 @@
-import type { VoiceResultDto, VoiceScreen, VoiceStatusDto, VoiceTranscriptionDto } from "../lib/bridge";
+import type { VoiceCommandDto, VoiceResultDto, VoiceScreen, VoiceStatusDto, VoiceTranscriptionDto } from "../lib/bridge";
 import type { AgentProfile, AgentSession, AgentStatus, AgentTab, DeckSnapshot, EvidenceItem, WorkflowStage } from "../types";
 
 /**
@@ -802,7 +802,43 @@ const FIXTURE_VOICE_COMMANDS: ReadonlyArray<{
     unavailableHint: "turning voice off works anywhere",
     report: "Voice control off.",
   },
+  {
+    // Callable everywhere for the same reason, and listing ITSELF in the
+    // overlay it opens — which is correct rather than cute: a user who has
+    // forgotten the phrase is exactly who reads that list.
+    /* Lower case, because the matcher lowercases the utterance before
+       comparing: a phrase with a capital in it here can never be matched. */
+    phrases: ["what can i say?", "what can i say", "what can you do?", "help"],
+    action: "list_commands",
+    invoke: "showVoiceCommands",
+    screens: ["deck", "overview", "agent"],
+    unavailableHint: "the list of commands opens anywhere",
+    report: "Here is what you can say.",
+  },
 ];
+
+/**
+ * The preview's vocabulary, annotated for one screen (PRD #802 D7).
+ *
+ * Derived from {@link FIXTURE_VOICE_COMMANDS} rather than written out, exactly
+ * as the live one is derived from `commands.toml`: the overlay lists what this
+ * bridge can actually resolve, so a row added above appears in it with no edit
+ * here.
+ *
+ * `description` is the one field the preview has to invent, because the fixture
+ * rows carry phrases rather than a prompt. It names the phrases, which is
+ * honest about what this stand-in is — a matcher over a fixed list — and is
+ * what a preview reader most needs to know.
+ */
+export function fixtureVoiceCommands(screen: VoiceScreen): VoiceCommandDto[] {
+  return FIXTURE_VOICE_COMMANDS.map((command) => ({
+    id: command.action,
+    description: `Say ${command.phrases.map((phrase) => `“${phrase}”`).join(", ")}.`,
+    callable: command.screens.includes(screen),
+    unavailable_hint: command.unavailableHint,
+    params: [],
+  }));
+}
 
 /**
  * `Heard: “<transcript>” — <situation>.`

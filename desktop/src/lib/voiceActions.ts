@@ -152,6 +152,14 @@ export type VoiceActionContext = {
    * button and `openOverview` are.
    */
   stopVoice: () => void;
+  /**
+   * Open the overlay listing what can be said on this screen (PRD #802 D7).
+   *
+   * Served by the voice surface for {@link stopVoice}'s reason, and callable
+   * everywhere for a sharper one: a user who does not know what to say cannot
+   * be told to go somewhere else first.
+   */
+  showVoiceCommands: () => void;
 };
 
 /**
@@ -250,6 +258,17 @@ export const VOICE_ACTIONS = {
      * a second control surface, and this one is the first surface's button.
      */
     run: (context: Pick<VoiceActionContext, "stopVoice">) => context.stopVoice(),
+  },
+
+  showVoiceCommands: {
+    label: "List what can be said right now",
+    voice: true,
+    needs: ["showVoiceCommands"],
+    /**
+     * Opens the list and runs nothing on it. The overlay is generated from the
+     * command table, so this entry has no vocabulary of its own to go stale.
+     */
+    run: (context: Pick<VoiceActionContext, "showVoiceCommands">) => context.showVoiceCommands(),
   },
 
   // -- the rest of the rail and the palette -------------------------------
@@ -419,8 +438,18 @@ export type VoiceDispatchContext = Pick<VoiceActionContext, "navigate" | "closeA
  * set's complement, so a screen that tried to serve one of these members would
  * not type-check, and neither would a panel that left one out.
  */
-export type VoicePanelContext = Pick<VoiceActionContext, "stopVoice">;
-export type VoicePanelChannel = { current: VoicePanelContext | undefined };
+export type VoicePanelContext = Pick<VoiceActionContext, "stopVoice" | "showVoiceCommands">;
+/**
+ * `Partial`, because a panel can serve one of these and not another.
+ *
+ * `showVoiceCommands` needs a runtime verb to list anything with, and the voice
+ * members of `DeckRuntimeState` are all optional — so a panel in front of a
+ * runtime that cannot answer publishes the members it CAN serve and leaves the
+ * rest out. `dispatchVoiceAction` then refuses the row against its declared
+ * `needs`, which is the same refusal the overview already gets for a deck
+ * overlay, rather than a call into a verb that is not there.
+ */
+export type VoicePanelChannel = { current: Partial<VoicePanelContext> | undefined };
 
 /**
  * Everything a SCREEN is expected to serve: the context minus the voice

@@ -339,6 +339,7 @@ mod tests {
                 "close_agent_view".to_string(),
                 "open_settings".to_string(),
                 "voice_off".to_string(),
+                "list_commands".to_string(),
                 "none".to_string(),
             ]
         );

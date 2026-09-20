@@ -1369,3 +1369,39 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
    sharing the row's spare space between them. */
 .voice-outcome-foot { flex: 0 0 auto; margin-left: auto; display: flex; align-items: center; gap: 7px; }
 .voice-cost { color: var(--faint); white-space: nowrap; font-size: 8px; }
+
+/* PRD #802 D7 — the discovery overlay.
+
+   A CHILD of `.voice-row` in the DOM and a `position: fixed` box on screen, and
+   the split is deliberate: the parent carries `VOICE_PEER_PROPS`, so being
+   inside it is what keeps this clickable behind an open agent pane, while
+   `fixed` takes it out of the row's one-line flow entirely. A row 40px high
+   cannot hold a list of every command, which is the whole reason the
+   requirement says overlay.
+
+   z-index 96 — one above `.voice-row` so the list covers the report rather than
+   being cut off by it, and still below `.dialog-backdrop` (100), because a real
+   modal claiming the whole window must cover this too. */
+.voice-help-backdrop { position: fixed; z-index: 96; inset: 0; display: flex; align-items: center; justify-content: center; padding: 24px; background: rgb(var(--scrim-rgb) / .42); }
+/* Bounded rather than sized: the list is as tall as it needs to be until it
+   reaches the viewport, and then it scrolls inside itself. `min()` against
+   `vh` is what stops a long table pushing its own Close button off screen. */
+.voice-help { width: min(680px, 100%); max-height: min(560px, 100%); display: flex; flex-direction: column; border: 1px solid var(--dialog-edge); border-radius: 8px; background: var(--paper); box-shadow: 0 18px 50px rgb(var(--scrim-rgb) / .22); }
+.voice-help-head { flex: 0 0 auto; padding: 13px 16px; display: flex; align-items: center; justify-content: space-between; gap: 12px; border-bottom: 1px solid var(--line); }
+.voice-help-head h2 { margin: 0; font-size: 13px; font-weight: 650; }
+.voice-help-problem { margin: 0; padding: 14px 16px; color: var(--ink-soft); font-size: 11px; }
+/* The scroll region is this and not the panel, so the heading and the Close
+   button stay put while the list moves under them. */
+.voice-help-body { flex: 1 1 auto; min-height: 0; overflow-y: auto; padding: 4px 16px 14px; }
+.voice-help-section { margin-top: 12px; }
+.voice-help-section h3 { margin: 0 0 7px; color: var(--muted); font-size: 9px; font-weight: 650; letter-spacing: .08em; text-transform: uppercase; }
+.voice-help-section ul { margin: 0; padding: 0; list-style: none; display: grid; gap: 9px; }
+.voice-help-section li { display: grid; gap: 3px; }
+.voice-help-section code { justify-self: start; padding: 1px 6px; border-radius: 4px; color: var(--teal-wash-ink); background: var(--teal-wash); font-family: "JetBrains Mono", monospace; font-size: 10px; }
+.voice-help-section p { margin: 0; color: var(--ink-soft); font-size: 11px; line-height: 1.45; }
+/* Dimmed rather than hidden. A command the user cannot say here is still worth
+   knowing exists — that is most of what discovery is for — and the contrast
+   step is what says which half of the list they are reading without a second
+   sentence saying so. */
+.voice-help-section[data-where="elsewhere"] code { color: var(--faint); background: var(--paper-sunken); }
+.voice-help-section[data-where="elsewhere"] p { color: var(--muted); }

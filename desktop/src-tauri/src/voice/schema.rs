@@ -163,6 +163,7 @@ mod tests {
                 "close_agent_view".to_string(),
                 "open_settings".to_string(),
                 "voice_off".to_string(),
+                "list_commands".to_string(),
                 "none".to_string(),
             ]
         );
@@ -216,6 +217,7 @@ mod tests {
                 "close_agent_view",
                 "open_settings",
                 "voice_off",
+                "list_commands",
                 "none"
             ]
         );
@@ -269,6 +271,7 @@ mod tests {
                 ("close_agent_view".to_string(), false),
                 ("open_settings".to_string(), true),
                 ("voice_off".to_string(), true),
+                ("list_commands".to_string(), true),
             ]
         );
         assert_eq!(
@@ -281,8 +284,10 @@ mod tests {
                 // PRD #802 M8's ruling in one flag: Settings is reachable only
                 // from the deck rail, so voice must not offer it here either.
                 ("open_settings".to_string(), false),
-                // Callable everywhere: stopping must never be unavailable.
+                // Callable everywhere: stopping must never be unavailable,
+                // and neither must the phrase that lists what can be said.
                 ("voice_off".to_string(), true),
+                ("list_commands".to_string(), true),
             ]
         );
         assert_eq!(
@@ -294,6 +299,7 @@ mod tests {
                 ("close_agent_view".to_string(), true),
                 ("open_settings".to_string(), false),
                 ("voice_off".to_string(), true),
+                ("list_commands".to_string(), true),
             ]
         );
     }

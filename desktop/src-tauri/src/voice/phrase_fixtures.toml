@@ -206,3 +206,37 @@ utterance = "stop listening"
 screen = "overview"
 action = "voice_off"
 outcome = "dispatch"
+
+# `list_commands` is callable everywhere too, so its fixtures are likewise
+# spread across the screens. The last of the four is the collision worth
+# watching: *"what can you do?"* is the phrasing closest to `open_overview`'s
+# *"which agents are running?"*, and it must not be answered by opening a list
+# of screens instead of a list of commands.
+
+[[fixtures]]
+name = "list-commands-what-can-i-say"
+utterance = "what can I say?"
+screen = "deck"
+action = "list_commands"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "list-commands-help"
+utterance = "help"
+screen = "agent"
+action = "list_commands"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "list-commands-what-are-my-options"
+utterance = "what are my options here?"
+screen = "overview"
+action = "list_commands"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "list-commands-what-can-you-do"
+utterance = "what can you do?"
+screen = "deck"
+action = "list_commands"
+outcome = "dispatch"

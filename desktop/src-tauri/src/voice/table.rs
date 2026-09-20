@@ -480,6 +480,7 @@ mod tests {
                 // No screens: callable everywhere. See the row's own comment —
                 // stopping must never be unavailable.
                 ("voice_off", "stopVoice", vec![]),
+                ("list_commands", "showVoiceCommands", vec![]),
             ]
         );
     }
@@ -823,7 +824,7 @@ mod tests {
             .filter(|row| Screen::ALL.iter().all(|&screen| row.callable_on(screen)))
             .map(|row| row.id.as_str())
             .collect();
-        assert_eq!(everywhere, vec!["voice_off"]);
+        assert_eq!(everywhere, vec!["voice_off", "list_commands"]);
         // And every OTHER row still has both cases, which is what keeps the
         // not-here sentence reachable for the rows that can produce it.
         for row in super::table().rows() {
@@ -854,15 +855,21 @@ mod tests {
         // behaviour that already exists rather than adding a route of its own.
         assert_eq!(
             callable(Screen::Deck),
-            vec!["open_agent", "open_overview", "open_settings", "voice_off"]
+            vec![
+                "open_agent",
+                "open_overview",
+                "open_settings",
+                "voice_off",
+                "list_commands"
+            ]
         );
         assert_eq!(
             callable(Screen::Overview),
-            vec!["open_agent", "open_deck", "voice_off"]
+            vec!["open_agent", "open_deck", "voice_off", "list_commands"]
         );
         assert_eq!(
             callable(Screen::Agent),
-            vec!["close_agent_view", "voice_off"]
+            vec!["close_agent_view", "voice_off", "list_commands"]
         );
     }
 

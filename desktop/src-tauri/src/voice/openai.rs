@@ -250,6 +250,7 @@ mod tests {
                 "close_agent_view",
                 "open_settings",
                 "voice_off",
+                "list_commands",
                 "none"
             ]
         );

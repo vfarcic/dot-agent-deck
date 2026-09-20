@@ -75,3 +75,49 @@ test.describe("voice off, said out loud", () => {
     await expect(trigger).toHaveAttribute("aria-pressed", "false");
   });
 });
+
+test.describe("what can I say?", () => {
+  /**
+   * Scenario: ask the preview what can be said. An overlay opens over the deck
+   * listing the rows the browser fixture can actually resolve, split by whether
+   * this screen can run them, and its Close button dismisses it — all of it
+   * generated from the same vocabulary the fixture resolves against.
+   */
+  test("opens a list generated from the fixture's own vocabulary", async ({ page }) => {
+    await openSpeaking(page, ["what can I say?"]);
+
+    await voiceButton(page).click();
+
+    const overlay = page.getByTestId("voice-help");
+    await expect(overlay).toBeVisible();
+    await expect(overlay.locator('[data-where="here"] [data-command="open_overview"]')).toBeVisible();
+    // The deck cannot run `open_deck`, so it is listed under the other heading
+    // rather than left out — knowing a command exists is most of discovery.
+    await expect(overlay.locator('[data-where="elsewhere"] [data-command="open_deck"]')).toBeVisible();
+
+    await page.getByTestId("voice-help-close").click();
+    await expect(overlay).toHaveCount(0);
+  });
+
+  /**
+   * Scenario: open the list while an agent's pane is enlarged over the whole
+   * window. It is reachable and its Close button is genuinely clickable, which
+   * is the `VOICE_PEER_PROPS` exemption doing its job for a second element —
+   * the overlay is a child of the reserved row precisely so that it does.
+   */
+  test("is reachable from behind an enlarged agent pane", async ({ page }) => {
+    await openSpeaking(page, ["what can I say?"]);
+    await page.getByRole("button", { name: "Open Planner agent" }).click();
+    await expect(page.getByTestId("agent-pane-overlay")).toBeVisible();
+
+    await voiceButton(page).click();
+
+    const overlay = page.getByTestId("voice-help");
+    await expect(overlay).toBeVisible();
+    await expect(overlay.locator('[data-where="here"] [data-command="close_agent_view"]')).toBeVisible();
+    // `trial` runs every actionability check — visible, stable, receives
+    // events — and clicks nothing, which is the question an `inert` ancestor
+    // would answer with a failure.
+    await page.getByTestId("voice-help-close").click({ trial: true });
+  });
+});

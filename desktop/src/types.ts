@@ -991,6 +991,20 @@ export interface DeckRuntimeState {
    */
   declareVoiceScreen?: (screen: import("./lib/bridge").VoiceScreen) => void;
   resolveVoice?: (utterance: string) => Promise<import("./lib/bridge").VoiceResultDto>;
+  /**
+   * Every command in the table, annotated for one screen (PRD #802 D7) — what
+   * the discovery overlay lists.
+   *
+   * Optional alongside the rest of the voice members and for the same reason:
+   * a runtime that cannot resolve an utterance has no vocabulary worth showing,
+   * and several render-only test runtimes are exactly that shape. A dispatch of
+   * `list_commands` against such a runtime is refused before it runs, and the
+   * surface says the command is not wired to anything in this build — which is
+   * literally what is true.
+   */
+  voiceCommands?: (
+    screen: import("./lib/bridge").VoiceScreen,
+  ) => Promise<import("./lib/bridge").VoiceCommandDto[]>;
   /** Open the microphone. Rejects with the not-configured sentence when transcription is off. */
   voiceStart?: () => Promise<import("./lib/bridge").VoiceStatusDto>;
   /** Close the microphone and transcribe what it heard. No audio crosses the boundary. */

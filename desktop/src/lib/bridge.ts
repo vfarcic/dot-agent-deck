@@ -1,4 +1,4 @@
-import { createFixtureFleet, DEFAULT_PROFILES, fixtureVoiceHeard, fixtureVoiceScript, fixtureVoiceStatus, fixtureVoiceTranscription, resolveFixtureVoice, type FixtureState } from "../data/fixture";
+import { createFixtureFleet, DEFAULT_PROFILES, fixtureVoiceCommands, fixtureVoiceHeard, fixtureVoiceScript, fixtureVoiceStatus, fixtureVoiceTranscription, resolveFixtureVoice, type FixtureState } from "../data/fixture";
 import { agentKey } from "./agentKey";
 import { getTerminal } from "./terminalRegistry";
 import { applyHandoffEvent, mapDaemonEvent, MAX_LIVE_EVIDENCE } from "./daemonEvents";
@@ -668,6 +668,34 @@ export type VoiceCaptureState = "idle" | "recording" | "transcribing" | "done" |
  * user's side the microphone simply stopped, and a surface that did not know
  * why would go on rendering *listening…* over a closed device.
  */
+/**
+ * One command as the discovery overlay lists it (PRD #802 D7).
+ *
+ * The **same** shape `desktop_voice_commands` hands the intent backend —
+ * `voice::AnnotatedCommand`, field for field — because the overlay's
+ * requirement is that it be generated from the table rather than maintained
+ * beside it. A prettier projection for the webview would be that maintained
+ * list under a better name, and the wordings would part company the first time
+ * a row changed.
+ *
+ * `unavailable_hint` keeps its Rust spelling for the same reason: this struct
+ * carries no `rename_all`, so what arrives is what Rust sends. Renaming it here
+ * would be a translation layer with one member and one job, which is a place
+ * for a mistake to live.
+ *
+ * So `description` is a PROMPT. It is written for a model, and it reads as one;
+ * the trade is stated at `desktop_voice_commands` and at `commands.toml`'s own
+ * column.
+ */
+export interface VoiceCommandDto {
+  id: string;
+  description: string;
+  /** Whether the screen this was asked for can run it. */
+  callable: boolean;
+  unavailable_hint: string;
+  params: { name: string; kind: string }[];
+}
+
 export interface VoiceStatusDto {
   state: VoiceCaptureState;
   capturedMs: number;
@@ -1232,6 +1260,22 @@ export interface DeckBridge {
    * call itself could not be made.
    */
   resolveVoice(utterance: string): Promise<VoiceResultDto>;
+  /**
+   * Every row of the command table, annotated for `screen`
+   * (`desktop_voice_commands`).
+   *
+   * The screen is an ARGUMENT here where {@link resolveVoice} takes it as a
+   * separate declaration, and the difference is deliberate: the declaration
+   * exists so one utterance is judged against exactly the screen it was
+   * declared with, which is a property of a pipeline. This is a query with no
+   * pipeline behind it and no round trip to order against, so the parameter is
+   * simply the honest shape.
+   *
+   * Reaches no daemon, no model and no device: the table is compiled into the
+   * binary. Safe to ask every time the overlay opens, which is what keeps it
+   * from being cached into something that can go stale.
+   */
+  voiceCommands(screen: VoiceScreen): Promise<VoiceCommandDto[]>;
   /**
    * Open the microphone (PRD #802 M7's `desktop_voice_start`).
    *
@@ -1916,6 +1960,19 @@ class FixtureDeckBridge implements DeckBridge {
   async resolveVoice(utterance: string): Promise<VoiceResultDto> {
     await Promise.resolve();
     return resolveFixtureVoice(utterance, this.voiceScreen);
+  }
+
+  /**
+   * The preview's vocabulary, annotated the way Rust annotates the real one.
+   *
+   * Built from the same `FIXTURE_VOICE_COMMANDS` the preview resolves against,
+   * so the overlay in the browser lists exactly what the browser can actually
+   * run — which is fewer rows than a live build has, and saying so is the point
+   * of a preview rather than a shortcoming of one.
+   */
+  async voiceCommands(screen: VoiceScreen): Promise<VoiceCommandDto[]> {
+    await Promise.resolve();
+    return fixtureVoiceCommands(screen);
   }
 
   /**
@@ -3304,6 +3361,21 @@ export class TauriDeckBridge implements DeckBridge {
   async resolveVoice(utterance: string): Promise<VoiceResultDto> {
     const invoke = await this.getInvoke();
     return invoke<VoiceResultDto>("desktop_voice_resolve", { utterance, screen: this.voiceScreen });
+  }
+
+  /**
+   * The screen is passed rather than read off {@link declareVoiceScreen}'s
+   * held value, which is the one place these two verbs differ deliberately.
+   *
+   * The declaration exists to fix which screen ONE utterance is judged against
+   * across a round trip nobody can order from the webview. A list has no such
+   * round trip to be wrong about — the caller knows the screen it is asking for
+   * and wants that one — so borrowing the held value would couple the overlay
+   * to whether an utterance happened to be in flight.
+   */
+  async voiceCommands(screen: VoiceScreen): Promise<VoiceCommandDto[]> {
+    const invoke = await this.getInvoke();
+    return invoke<VoiceCommandDto[]>("desktop_voice_commands", { screen });
   }
 
   async voiceStart(): Promise<VoiceStatusDto> {
