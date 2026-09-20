@@ -1655,6 +1655,27 @@ mod tests {
     }
 
     #[test]
+    fn voice_capture_the_threshold_is_exactly_min_speech_and_one_frame_less_fails() {
+        // The boundary pinned rather than inferred from a comfortable fixture.
+        // `speech_run` divides a sample count by the rate and compares the
+        // resulting `Duration`, so the question is whether exactly `MIN_SPEECH`
+        // of speech lands on or under the threshold — a one-frame drift here
+        // moves the gate for every short command, and it is the kind of drift a
+        // rounding change makes silently.
+        let frames = MIN_SPEECH.as_millis() as usize / 20;
+        assert_eq!(
+            frames, 6,
+            "MIN_SPEECH moved; this test's arithmetic has not"
+        );
+        let exactly = Pcm16::new(speech(frames * VAD_FRAME));
+        assert_eq!(exactly.speech_run(), MIN_SPEECH);
+        assert!(exactly.has_speech(), "exactly MIN_SPEECH must be eligible");
+        let one_frame_short = Pcm16::new(speech((frames - 1) * VAD_FRAME));
+        assert!(one_frame_short.speech_run() < MIN_SPEECH);
+        assert!(!one_frame_short.has_speech());
+    }
+
+    #[test]
     fn voice_capture_speech_run_agrees_with_the_vad_on_what_counts() {
         // A hair under `SPEECH_FLOOR` at every frame boundary is not speech to
         // either of them; a hair over is speech to both. One threshold, two
