@@ -119,9 +119,9 @@ describe("VoicePanel", () => {
     const { onSave } = renderPanel({
       voice: { ...DEFAULT_VOICE_SETTINGS, activation: "hold-to-talk" },
     });
-    // Driven from Speech rather than Commands: Commands ships ONE backend
-    // since the agent-CLI one went, so selecting its only option is not a
-    // change and fires nothing.
+    // Driven from Speech, which is one of two backend rows that would now do:
+    // Commands ships two backends since PRD #802's provider work, so changing
+    // either fires a save. It shipped one when this row was chosen.
     fireEvent.change(screen.getByLabelText("Speech"), { target: { value: "remote" } });
     expect(onSave).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -302,8 +302,10 @@ describe("VoicePanel", () => {
   /**
    * **One key row on the defaults, not none**, and the asymmetry is the
    * product decision rather than an oversight: Speech's default is a keyless
-   * container on loopback, and Commands has no keyless backend at all since
-   * the agent-CLI one went. A panel that asked for two keys before the feature
+   * container on loopback, and neither Commands preset is keyless since the
+   * agent-CLI one went — a Commands stage goes keyless only by pointing its
+   * endpoint at loopback, which `needsKey` reads from the endpoint rather than
+   * from the backend token. A panel that asked for two keys before the feature
    * did anything would be the thing PRD #802 set out to avoid; one is what the
    * measurements left.
    */

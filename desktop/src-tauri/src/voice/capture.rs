@@ -248,9 +248,13 @@ const SPEECH_FLOOR: u16 = 600;
 /// How long the quiet has to run before the utterance is over.
 ///
 /// 800 ms — longer than the pauses inside a spoken phrase, where a comma is
-/// 200-400 ms, and short enough not to be what the user notices: the
-/// transcription and intent calls behind it are several seconds, and PRD #802
-/// measured 4.3-6.3 s for the zero-configuration backend.
+/// 200-400 ms, and short enough to stay a minority of what the user waits for
+/// rather than the term that dominates it: PRD #802 measured a 0.653 s median
+/// for the default speech container and 0.62-1.03 s for commands, so the hold
+/// is one term of a wait a little over a second. **It used to be a far smaller
+/// fraction of that wait**, when the default intent backend was the agent CLI
+/// at 4.3-6.3 s; that backend went and this number did not, which is worth
+/// knowing before anyone quotes the hold as negligible.
 pub const SILENCE_HOLD: Duration = Duration::from_millis(800);
 
 /// The window one RMS is measured over, in output samples: 20 ms at

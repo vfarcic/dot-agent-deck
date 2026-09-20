@@ -24,12 +24,14 @@ pub const TOOL_NAME: &str = "run_deck_action";
 /// What the model is told to do, in one paragraph.
 ///
 /// **A prompt, reviewed as an interface.** It is a `const` rather than a
-/// literal inside [`tool_schema`] because M5 gave it a second consumer: the
-/// keyed remote backend sends it as the tool's `description` and the agent-CLI
-/// backend, which has no tool-use envelope to put it in, sends the same words
-/// in its prompt. One wording, two backends — a copy in each would let the two
-/// drift, and PRD #802's phrase fixtures are authoritative against one backend
-/// only, so nothing would catch the drift.
+/// literal inside [`tool_schema`] because M5 gave it a second consumer, and it
+/// still has one: [`super::remote`] sends it as the Anthropic tool's
+/// `description`, and [`super::openai`] — whose envelope has no tool to put it
+/// on — sends the same words as the system message. One wording, two protocols
+/// (it was two backends before PRD #802's provider work withdrew the agent-CLI
+/// one) — a copy in each would let the two drift, and PRD #802's phrase
+/// fixtures are authoritative against one backend only, so nothing would catch
+/// the drift.
 ///
 /// Written as a `\`-continued literal, which rustfmt indents; the continuation
 /// strips the newline **and** the leading whitespace, so the text is one
@@ -110,11 +112,11 @@ pub fn action_enum(table: &CommandTable) -> Vec<String> {
 /// The whole payload for one request: the tool definition plus the annotated
 /// command list.
 ///
-/// The shape is this app's own. M5's backends adapt it to whatever envelope
-/// their API wants — a tool-use block for a keyed remote backend, a prompt for
-/// the agent-CLI one — which is why the annotated list travels beside the
-/// schema rather than being folded into a description string that no backend
-/// could read structurally.
+/// The shape is this app's own. Each protocol adapts it to whatever envelope
+/// its API wants — a tool-use block for Anthropic, a nested `json_schema`
+/// response format for the OpenAI-compatible one — which is why the annotated
+/// list travels beside the schema rather than being folded into a description
+/// string that no backend could read structurally.
 pub fn tool_schema(table: &CommandTable, screen: Screen) -> Value {
     let commands = annotate(table, screen);
     json!({

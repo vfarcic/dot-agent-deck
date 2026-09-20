@@ -93,10 +93,14 @@ export const VOICE_UNDO_WINDOW_MS = 10_000;
  * at all. It would also be a new IPC verb in each of the three bridges plus a
  * listener seam, for a saving bounded by this interval — so the interval was cut
  * to a quarter second instead, which puts the polling tax at 125 ms of mean
- * added latency against a pipeline PRD #802 measured at 4.3-6.3 s. That is under
- * 3%, and it is an eighth of `voice::SILENCE_HOLD`, which is the term that
- * actually dominates the end of an utterance. The event path stays available if
- * the hold ever gets short enough for this to matter.
+ * added latency. **The pipeline it was weighed against has since got much
+ * faster**: PRD #802 sized this at 4.3-6.3 s, when the default intent backend
+ * was the agent CLI, and that backend is gone — speech measured a 0.653 s
+ * median and commands 0.62-1.03 s, so the tax is nearer a tenth of the wait
+ * than the under-3% it was. It is still a fraction of `voice::SILENCE_HOLD`,
+ * which is 800 ms and remains the term that dominates the end of an utterance.
+ * The event path stays available if the hold ever gets short enough for this to
+ * matter.
  *
  * The cost is four state reads a second while the microphone is open. Each one
  * is an in-memory read of the capture session plus the small settings document,
@@ -122,11 +126,12 @@ export const NOTHING_DISPATCHED = "That command is not wired to anything in this
  * see: the user moved while the answer was being worked out.
  *
  * An outcome is classified against the screen declared immediately before the
- * resolve, so `unavailable` means *not on that screen*. When the user walks to
- * another one during the several seconds a backend takes — PRD #802 measured
- * 4.3-6.3 s for the zero-configuration backend — that classification describes
- * a screen nobody is standing on, and running it anyway would act on the new
- * screen with the old screen's permission.
+ * resolve, so `unavailable` means *not on that screen*. The user can walk to
+ * another one while the answer is being worked out — PRD #802 measured 0.653 s
+ * for speech and 0.62-1.03 s for commands, and 4.3-6.3 s for the whole pipeline
+ * before the agent-CLI intent backend was withdrawn — and that classification
+ * then describes a screen nobody is standing on, so running it anyway would act
+ * on the new screen with the old screen's permission.
  *
  * It is a sentence rather than silence for {@link NOTHING_DISPATCHED}'s reason:
  * the alternative is *Working out what that means…* vanishing with nothing in
@@ -403,9 +408,10 @@ export function VoiceControlPanel({ runtime, screen, onDispatch }: VoiceControlP
    * same finding: an operation that outlives the user's decision to abandon it
    * must be able to tell that it did. Voice turned off mid-resolve used to be a
    * closure still holding `onDispatch`, so the app navigated — or opened an
-   * overlay — several seconds after the user stopped it. The window is the
-   * ordinary one rather than a contrived race: PRD #802 measured the
-   * zero-configuration backend at 4.3-6.3 s per utterance.
+   * overlay — after the user stopped it. The window is the ordinary one rather
+   * than a contrived race: PRD #802 measured over a second of pipeline per
+   * utterance (0.653 s speech plus 0.62-1.03 s commands), and 4.3-6.3 s before
+   * the agent-CLI intent backend was withdrawn.
    *
    * A counter rather than a boolean because it also has to order two live
    * cycles: a superseded one must not write its report over the one that

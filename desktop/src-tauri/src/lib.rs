@@ -1826,10 +1826,12 @@ async fn desktop_voice_cancel(
 /// The panel's own transcripts are bounded — `voice::MAX_UTTERANCE` caps the
 /// audio at 30 seconds — but that cap bounds the *audio*, not what arrives at
 /// the IPC boundary, and this command trusts that boundary no more than
-/// [`validate_agent_id`] does: an utterance becomes part of a model prompt and,
-/// for the agent-CLI backend, an argument to a child process. 2 KiB is far past
-/// any spoken command — thirty seconds of speech is around 700 characters —
-/// while making a payload-shaped value impossible.
+/// [`validate_agent_id`] does: an utterance becomes part of a model prompt. It
+/// was also an argument to a child process while the agent-CLI intent backend
+/// existed, and the bound outlived that backend because the first reason is
+/// enough on its own. 2 KiB is far past any spoken command — thirty seconds of
+/// speech is around 700 characters — while making a payload-shaped value
+/// impossible.
 const MAX_UTTERANCE_BYTES: usize = 2 * 1024;
 
 /// PRD #802 M6: take one utterance to an outcome carrying the sentence to show.
@@ -1858,10 +1860,11 @@ const MAX_UTTERANCE_BYTES: usize = 2 * 1024;
 ///
 /// [`get_snapshot`] fetches rather than reading a cache, which is one daemon
 /// round trip per voice command. That is deliberate and it is cheap next to what
-/// follows it: the intent backends measured 0.62 s (keyed) to 6.30 s (agent CLI)
-/// for the call this snapshot is gathered for, and resolving "open the tester"
-/// against a list from a minute ago is how a spoken name resolves to an agent
-/// that has since exited.
+/// follows it: the intent backend measured **0.62–1.03 s** for the call this
+/// snapshot is gathered for — and 4.30–6.30 s while the agent-CLI backend was
+/// the default, which is the number PRD #802's risk entry was written against.
+/// Resolving "open the tester" against a list from a minute ago is how a spoken
+/// name resolves to an agent that has since exited.
 ///
 /// The SELECTED deck's agents, not the fleet's. Every other single-deck command
 /// reads the same snapshot, `open_agent` dispatches a pane whose terminal is the
