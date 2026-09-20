@@ -187,12 +187,14 @@ impl Pcm16 {
             .all(|s| s.unsigned_abs() < SILENCE_FLOOR)
     }
 
-    /// How much speech is in the buffer, and how loud the loudest moment was.
+    /// How much speech is in the buffer, how loud the loudest moment was, and
+    /// what the room under it measured.
     ///
-    /// Measured exactly the way [`Vad`] measures the live signal — mean square
-    /// over a [`VAD_FRAME`] against [`SPEECH_FLOOR`] squared — so the two cannot
-    /// disagree about what counts as somebody speaking. A trailing partial frame
-    /// is not judged, for the same reason it is not judged there.
+    /// Runs [`SpeechDetector`] — the **one** speech rule in this module — over
+    /// the finished buffer, which is the same object [`Vad`] feeds on the data
+    /// path. The two cannot disagree about what counts as somebody speaking
+    /// because there is no second implementation to disagree with. A trailing
+    /// partial frame is not judged, for the same reason it is not judged there.
     ///
     /// **Density over a window rather than an unbroken run, because speech
     /// contains silence and impulses contain nothing else.** This used to
@@ -214,42 +216,11 @@ impl Pcm16 {
     /// ([`Vad`]'s own doc says a sustained noise is out of scope and bounded by
     /// [`MAX_UTTERANCE`] instead).
     pub fn measure_speech(&self) -> SpeechMeasure {
-        let floor = f64::from(SPEECH_FLOOR) * f64::from(SPEECH_FLOOR);
-        let span = speech_window_frames();
-        let mut window: VecDeque<bool> = VecDeque::with_capacity(span);
-        let mut inside = 0usize;
-        let mut densest = 0usize;
-        let mut peak = 0.0f64;
+        let mut detector = SpeechDetector::default();
         for frame in self.samples.chunks_exact(VAD_FRAME) {
-            let energy: f64 = frame
-                .iter()
-                .map(|&sample| {
-                    let value = f64::from(sample);
-                    value * value
-                })
-                .sum();
-            // Mean square against the squared floor: the same comparison as RMS
-            // against the floor, without the square root. See [`Vad::push`].
-            let mean_square = energy / VAD_FRAME as f64;
-            peak = peak.max(mean_square);
-            if window.len() == span && window.pop_front() == Some(true) {
-                inside -= 1;
-            }
-            let speech = mean_square >= floor;
-            window.push_back(speech);
-            if speech {
-                inside += 1;
-            }
-            densest = densest.max(inside);
+            detector.push_frame(mean_square(frame));
         }
-        SpeechMeasure {
-            voiced: Duration::from_secs_f64(
-                (densest * VAD_FRAME) as f64 / f64::from(TARGET_SAMPLE_RATE),
-            ),
-            // The square root is paid once per buffer rather than once per
-            // frame, which is why the comparison above stays squared.
-            peak_rms: peak.sqrt().round().min(f64::from(u16::MAX)) as u16,
-        }
+        detector.measure()
     }
 
     /// Whether the buffer holds enough speech to be worth transcribing at all.
@@ -294,32 +265,58 @@ impl Pcm16 {
     }
 }
 
-/// What [`Pcm16::measure_speech`] found: the gate's number, and the number that
-/// says whether the gate is even the thing that refused you.
+/// What [`Pcm16::measure_speech`] found: the gate's number, and the two numbers
+/// that say whether the gate is even the thing that refused you.
 ///
-/// **Two fields because there are two ways to be refused and they need
-/// different things done about them**, and before PRD #802's product owner met
-/// this with a real microphone there was no way to tell them apart from
-/// outside. If `peak_rms` never reached [`SPEECH_FLOOR`], nothing in the buffer
-/// counted as speech at all and no gate would have passed it — the input level
-/// is too low, or the floor is too high for this device, and the user has to
-/// speak up or the constant has to move. If it did reach the floor and `voiced`
-/// is still short, the audio was speech and there was not enough of it.
+/// **Three fields because the rule is a comparison and a comparison has two
+/// sides.** `peak_rms` alone was not enough, and PRD #802's product owner
+/// proved it: his refusal reported a voiced duration, he reached the density
+/// branch rather than the level one, and working out that his peak had cleared
+/// the old absolute floor while most of his frames had not cost a round trip to
+/// the person holding the microphone. The rule now measures the loudest moment
+/// **against the room under it**, so both sides of that comparison travel with
+/// the verdict.
 ///
-/// Both numbers are rendered to the user on the refusal
+/// All three are rendered to the user on **both** refusals
 /// ([`super::transcribe::handle_audio`]) rather than logged, because the person
-/// who can answer "is my microphone quiet?" is the one holding it.
+/// who can answer "is my microphone quiet?" is the one holding it — and because
+/// a refusal that names only one side of a ratio cannot be self-diagnosed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SpeechMeasure {
     /// The most speech-level audio found inside any one [`SPEECH_WINDOW`], so
     /// at most [`SPEECH_WINDOW`] itself. [`Pcm16::has_speech`]'s input.
     pub voiced: Duration,
-    /// The loudest frame's RMS, in the same `i16` units as [`SPEECH_FLOOR`].
+    /// The loudest frame's RMS, out of `i16::MAX`.
     ///
     /// A peak rather than an average on purpose: the question it answers is
-    /// *did anything in this buffer ever cross the floor*, and an average over
-    /// a mostly-quiet segment answers a different one.
+    /// *did anything in this buffer ever rise out of the room*, and an average
+    /// over a mostly-quiet segment answers a different one.
     pub peak_rms: u16,
+    /// The room estimate in force **at that loudest frame** — the quietest
+    /// 20 ms in the [`NOISE_WINDOW`] ending there, never taken below
+    /// [`SILENCE_RMS`], in the same units.
+    ///
+    /// Deliberately not the quietest frame in the whole buffer, which would be
+    /// a different number whenever the room changes: this is the bar the peak
+    /// was actually judged against, so `peak_rms` and `room_rms` together
+    /// explain the verdict rather than merely describing the audio. A buffer
+    /// that is silent and then noisy reports the noise as the room, which is
+    /// the honest answer to *why did the loudest moment not count*.
+    pub room_rms: u16,
+}
+
+impl SpeechMeasure {
+    /// The RMS the loudest frame had to reach to count as speech:
+    /// [`SPEECH_MARGIN`] times the room, where the room is already floored at
+    /// [`SILENCE_RMS`] — so this never falls under 192 however silent the
+    /// buffer is.
+    ///
+    /// The third number in every refusal sentence, and the one that makes the
+    /// other two actionable — *"reached 410 against a room at 180, where speech
+    /// has to reach 540"* says what to do; *"reached 410"* does not.
+    pub fn required_rms(&self) -> u16 {
+        (u32::from(self.room_rms) * u32::from(SPEECH_MARGIN)).min(u32::from(u16::MAX)) as u16
+    }
 }
 
 impl fmt::Debug for Pcm16 {
@@ -339,26 +336,95 @@ impl fmt::Debug for Pcm16 {
 /// anything a microphone actually heard sits over it.
 const SILENCE_FLOOR: u16 = 32;
 
-/// The **root-mean-square** amplitude, out of `i16::MAX`, at or above which one
-/// [`VAD_FRAME`] counts as speech rather than as the room.
+/// How many times **the room** one [`VAD_FRAME`] has to be before it counts as
+/// speech rather than as the room.
 ///
-/// About -35 dBFS. Near-field speech sits between -30 and -20 dBFS RMS —
-/// roughly 1 000 to 3 300 in these units — and room tone, a fan and a
-/// converter's own noise floor sit below -45, under 200. This is in the middle
-/// of a wide gap rather than at the edge of a narrow one.
+/// An amplitude ratio of 3, which is a little over 9 dB of signal-to-noise —
+/// the operating point speech detectors are usually set at, and the number this
+/// module's whole threshold now is.
 ///
-/// **Erring high is deliberate, because the two directions do not cost the
-/// same.** A floor set too low never accumulates a silence run in a room with
-/// any noise in it, so no utterance ever ends, every command runs into
-/// [`MAX_UTTERANCE`], and the user loses all of them. A floor set too high can
-/// only end an utterance early — and only after [`SILENCE_HOLD`] of
-/// below-threshold audio, which is a pause somebody took rather than the gap
-/// between two words.
+/// # Why a ratio and not a level, which is the correction PRD #802 bought
 ///
-/// It is an order of magnitude above [`SILENCE_FLOOR`] and they answer
-/// different questions: that one asks whether a buffer is worth sending at all,
-/// this one asks whether somebody is speaking *now*.
-pub const SPEECH_FLOOR: u16 = 600;
+/// This constant replaces `SPEECH_FLOOR`, an **absolute** RMS of 600 (about
+/// -35 dBFS) chosen from where near-field speech and room tone sit on a device
+/// whose gain nobody had measured. It cannot be right: a microphone is a gain
+/// stage, and two devices recording the same voice in the same room deliver
+/// buffers an order of magnitude apart. PRD #802's product owner supplied the
+/// falsification from a real microphone — *"60 ms of speech inside the loudest
+/// 200 ms, where 120 ms is needed"*, which is the **density** refusal, so his
+/// peak did clear 600 while only 30% of his densest window did. In the loudest
+/// part of a word a correctly-set floor sees near-continuous energy; his saw a
+/// third. His speech straddled the constant.
+///
+/// **Lowering the constant was the obvious move and it is the wrong one.** 600
+/// is too high for that microphone and too low for a hotter one, where room
+/// tone alone clears it, every frame reads as speech and the Whisper
+/// hallucinations this gate exists to stop come straight back. Any number
+/// fitted to one report is fitted to one microphone. So the rule is now
+/// **relative to the utterance's own noise floor** and the level cancels: a
+/// quiet input and a loud one produce the same verdict about the same voice.
+/// Nothing is stored per device and there is no setup step — the reference is
+/// in the buffer, because a microphone always delivers its own room.
+///
+/// **Erring high is still deliberate and the direction is unchanged**, but what
+/// it now costs is different. Too small a ratio admits a modulated noise — a
+/// fan whose own peaks sit a few dB over its own minimum — and the utterance
+/// never ends in a noisy room. Too large a one refuses a speaker in a poor
+/// room, and only after [`SILENCE_HOLD`], which is a pause somebody took. 3
+/// sits between them by a wide margin on both sides: stationary noise varies by
+/// well under 1 dB frame to frame over [`NOISE_WINDOW`], while speech modulates
+/// by 20 dB and more.
+pub const SPEECH_MARGIN: u16 = 3;
+
+/// The quietest **the room** is ever taken to be — the floor that stops a
+/// purely relative rule from calling true silence speech.
+///
+/// About -54 dBFS. A buffer of digital zero has a quietest frame, a loudest
+/// frame and a ratio of one between them, so a rule that only ever compared a
+/// frame against its own room would divide by nothing and pass silence. This is
+/// the answer to that and nothing else.
+///
+/// # It floors the ROOM, not the frame, and the difference is load-bearing
+///
+/// [`SpeechDetector`] clamps its noise estimate here and then applies
+/// [`SPEECH_MARGIN`] to the result, so the absolute minimum a frame must reach
+/// works out at `SILENCE_RMS * SPEECH_MARGIN` — 192, about -45 dBFS. Flooring
+/// the *frame* at 64 instead would have been a different and worse rule: a
+/// buffer that holds a stretch of digital zero would then have its room
+/// estimated at zero for a whole [`NOISE_WINDOW`], and ordinary room tone
+/// around 180 would read as speech for that second — a driver's initial
+/// zero-fill is enough to produce one, and the segment it yields is exactly
+/// the near-silence Whisper answers with a training artefact.
+///
+/// It is set far below anything anybody means as speech and stays there: a
+/// converter's own dither sits two orders of magnitude under it, and 192 is
+/// still 10 dB under the quietest level this module's own docs put room tone
+/// at. It is **not** a speech threshold and must not be read as one — raising
+/// it towards speech level reintroduces exactly the device-specific constant
+/// [`SPEECH_MARGIN`] exists to remove.
+///
+/// It is the RMS counterpart of [`SILENCE_FLOOR`], which is per-sample, and the
+/// two answer different questions: that one asks whether a device delivered
+/// anything at all, this one is a clamp inside the speech rule.
+pub const SILENCE_RMS: u16 = 64;
+
+/// How far back **the room** is measured — the span [`SpeechDetector`] takes
+/// its noise estimate as the minimum over.
+///
+/// One second, which is five [`SPEECH_WINDOW`]s. The minimum over a window is
+/// the standard noise estimator and it works because *every* real signal visits
+/// its own floor: speech has closures, inter-word gaps and a lead-in before the
+/// first syllable, while stationary noise simply sits there. So within a second
+/// a spoken phrase always reaches back to the room it is being spoken in.
+///
+/// **Both directions cost something and one second is between them.** Longer
+/// tracks a changing room more slowly, so a fan switched on mid-utterance is
+/// read as speech for longer. Shorter risks taking a **sustained** sound — a
+/// held vowel with no 20 ms dip in it — as the room and refusing the rest of
+/// it. A second is longer than any stop closure (80 ms, the tolerance
+/// [`SPEECH_WINDOW`] names) and than any inter-word gap inside a phrase, and
+/// well short of [`MAX_UTTERANCE`].
+const NOISE_WINDOW: Duration = Duration::from_secs(1);
 
 /// How much speech-level audio one [`SPEECH_WINDOW`] has to hold before a
 /// buffer is worth sending to a transcription backend — [`Pcm16::has_speech`]'s
@@ -368,7 +434,7 @@ pub const SPEECH_FLOOR: u16 = 600;
 /// things it has to tell apart sit on either side of it by a wide margin:
 ///
 /// * an **impulse** — a keyboard tap, a click, a chair creak — is loud for a few
-///   milliseconds, so RMS over a 20 ms window puts it over [`SPEECH_FLOOR`] for
+///   milliseconds, so RMS over a 20 ms window puts it clear of the room for
 ///   one frame and occasionally two. A typist at 100 ms between keystrokes gets
 ///   two frames into a window, which is 40 ms.
 /// * a **spoken word** carries its energy in a voiced nucleus and the
@@ -376,7 +442,7 @@ pub const SPEECH_FLOOR: u16 = 600;
 ///   closure splits it in half.
 ///
 /// **Erring low is deliberate here, and it is the opposite direction from
-/// [`SPEECH_FLOOR`]'s**, because these two constants fail differently. Too high
+/// [`SPEECH_MARGIN`]'s**, because these two constants fail differently. Too high
 /// a threshold refuses a command somebody really said, and the user has no way
 /// to tell that from the feature being broken. Too low a one lets a report say
 /// it heard something nobody said — which is what PRD #802's product owner met,
@@ -405,8 +471,8 @@ pub const MIN_SPEECH: Duration = Duration::from_millis(120);
 /// # This is the rung that was missing, and it is one policy with the other two
 ///
 /// There is a single question — *is this 20 ms frame at speech level?*, which
-/// is [`SPEECH_FLOOR`] and nothing else — and then a ladder of how much quiet
-/// each larger thing tolerates before it is over:
+/// is [`SPEECH_MARGIN`] against the room and nothing else — and then a ladder
+/// of how much quiet each larger thing tolerates before it is over:
 ///
 /// | inside a… | quiet tolerated | which is |
 /// | --- | --- | --- |
@@ -438,6 +504,182 @@ fn speech_window_frames() -> usize {
     (samples / VAD_FRAME).max(1)
 }
 
+/// [`NOISE_WINDOW`] in whole [`VAD_FRAME`]s — fifty, computed the same way and
+/// for the same reason as [`speech_window_frames`].
+fn noise_window_frames() -> usize {
+    let samples = (NOISE_WINDOW.as_secs_f64() * f64::from(TARGET_SAMPLE_RATE)) as usize;
+    (samples / VAD_FRAME).max(1)
+}
+
+/// [`MIN_SPEECH`] in whole [`VAD_FRAME`]s — six.
+fn min_speech_frames() -> usize {
+    ((MIN_SPEECH.as_secs_f64() * f64::from(TARGET_SAMPLE_RATE)) as usize / VAD_FRAME).max(1)
+}
+
+/// One frame's mean square, which is its RMS without the square root.
+///
+/// Every comparison in [`SpeechDetector`] is between two of these, so the root
+/// is paid once per buffer at the reporting seam rather than once per frame.
+fn mean_square(frame: &[i16]) -> f64 {
+    let energy: f64 = frame
+        .iter()
+        .map(|&sample| {
+            let value = f64::from(sample);
+            value * value
+        })
+        .sum();
+    energy / frame.len().max(1) as f64
+}
+
+/// A mean square back to an RMS, clamped into the `u16` the measurement is
+/// reported in.
+fn rms(mean_square: f64) -> u16 {
+    mean_square.sqrt().round().min(f64::from(u16::MAX)) as u16
+}
+
+/// **The** speech rule: one 20 ms frame at a time, judged against the room it
+/// arrived in, and counted for density inside a [`SPEECH_WINDOW`].
+///
+/// # There is one of these and both callers hold it
+///
+/// [`Vad`] feeds it on the data path and [`Pcm16::measure_speech`] feeds it over
+/// a finished buffer. They used to be two implementations of one rule held
+/// together by a test; now the test holds two *callers* of one implementation,
+/// which is a weaker thing to have to prove and cannot drift at all.
+///
+/// # Strictly causal, which is a property and not an accident
+///
+/// The room estimate looks only at frames that have already arrived, because
+/// [`Vad`] runs on a device callback and has no others. A pass over a finished
+/// buffer could do better — it could take the minimum over the whole thing —
+/// and deliberately does not, because the moment it did, the live countdown and
+/// the transcription gate would answer differently about the same audio, which
+/// is the exact defect PRD #802 spent a round on.
+///
+/// The visible consequence: **a buffer that opens with speech and contains no
+/// quiet before it has no room to be measured against**, and its opening frames
+/// do not count. Real audio always has the lead-in — the recording starts when
+/// a key is pressed and the first syllable arrives some hundreds of
+/// milliseconds later, and the segment ends only after [`SILENCE_HOLD`] of
+/// below-threshold audio, so a finished segment holds room tone at both ends by
+/// construction. Synthetic audio does not get that for free, which is why the
+/// fixtures in this module's tests carry room tone rather than being bare tone.
+///
+/// # A uniform buffer is refused, and that is the design rather than a gap
+///
+/// A signal that sits at one level for its whole length has a ratio of one
+/// between its loudest and quietest moments, so no relative rule can tell a
+/// held tone at speech level from a fan at speech level — the information is
+/// not in the buffer. This refuses it. That is the safe direction and the
+/// physical one: speech is modulated at the syllable rate and is never uniform,
+/// [`Vad`]'s own doc already puts sustained noise out of scope and bounds it
+/// with [`MAX_UTTERANCE`], and accepting it instead would mean accepting a
+/// hummed fan, which is the class of buffer the whole gate exists to refuse.
+#[derive(Debug)]
+struct SpeechDetector {
+    /// Frame mean squares over the last [`NOISE_WINDOW`], oldest first. The
+    /// room is the smallest of them.
+    room: VecDeque<f64>,
+    /// The last [`SPEECH_WINDOW`] of verdicts, oldest first — a queue rather
+    /// than a counter because the density rule needs to know *which* frame is
+    /// leaving the window.
+    window: VecDeque<bool>,
+    /// How many of `window` are `true`, kept alongside it so a frame costs one
+    /// increment rather than a pass over ten.
+    voiced: usize,
+    /// The most `voiced` has ever been, which is what both callers read. It is
+    /// a running maximum, so the latch [`Vad::speaking`] needs is free.
+    densest: usize,
+    /// The loudest frame's mean square, and the room in force at that frame.
+    peak: f64,
+    peak_room: f64,
+}
+
+impl Default for SpeechDetector {
+    fn default() -> Self {
+        Self {
+            room: VecDeque::with_capacity(noise_window_frames()),
+            window: VecDeque::with_capacity(speech_window_frames()),
+            voiced: 0,
+            densest: 0,
+            peak: 0.0,
+            // The floor rather than zero, so a buffer with no frame louder
+            // than digital silence still reports the room the rule would have
+            // used and a `required_rms` that is three times it.
+            peak_room: f64::from(SILENCE_RMS) * f64::from(SILENCE_RMS),
+        }
+    }
+}
+
+impl SpeechDetector {
+    /// Judge one whole frame and return whether it counted as speech.
+    ///
+    /// The current frame is part of its own room estimate, so a frame that is
+    /// the quietest in its window is never speech — which is right, and is what
+    /// makes the first frame of a buffer that opens with speech fall outside.
+    fn push_frame(&mut self, mean_square: f64) -> bool {
+        if self.room.len() == noise_window_frames() {
+            self.room.pop_front();
+        }
+        self.room.push_back(mean_square);
+        // Linear in [`NOISE_WINDOW`] rather than a monotonic deque: fifty `f64`
+        // comparisons per 20 ms of audio is not a cost worth buying a second
+        // invariant to avoid, and this one is obviously correct by reading.
+        let quietest = self.room.iter().copied().fold(f64::INFINITY, f64::min);
+        // Clamped at [`SILENCE_RMS`], which is where the absolute floor lives:
+        // a device that delivered nothing has a quietest frame of zero, and
+        // three times nothing is nothing. See [`SILENCE_RMS`] for why the floor
+        // is on the ROOM rather than on the frame.
+        let room = quietest.max(f64::from(SILENCE_RMS) * f64::from(SILENCE_RMS));
+        // Strictly greater, so a plateau reports the room as it stood when the
+        // signal FIRST reached its peak — which for speech is the lead-in, and
+        // is the more diagnostic of the two numbers a user could be shown.
+        if mean_square > self.peak {
+            self.peak = mean_square;
+            self.peak_room = room;
+        }
+        let speech = mean_square >= required_mean_square(room);
+        if self.window.len() == speech_window_frames() && self.window.pop_front() == Some(true) {
+            self.voiced -= 1;
+        }
+        self.window.push_back(speech);
+        if speech {
+            self.voiced += 1;
+        }
+        self.densest = self.densest.max(self.voiced);
+        speech
+    }
+
+    /// Whether [`MIN_SPEECH`] of speech-level audio has been seen inside one
+    /// [`SPEECH_WINDOW`] — the question both callers ask, latched by
+    /// `densest` being a running maximum.
+    fn spoken(&self) -> bool {
+        self.densest >= min_speech_frames()
+    }
+
+    fn measure(&self) -> SpeechMeasure {
+        SpeechMeasure {
+            voiced: Duration::from_secs_f64(
+                (self.densest * VAD_FRAME) as f64 / f64::from(TARGET_SAMPLE_RATE),
+            ),
+            peak_rms: rms(self.peak),
+            room_rms: rms(self.peak_room),
+        }
+    }
+}
+
+/// The bar one frame has to clear, as a mean square, given the room under it.
+///
+/// [`SpeechMeasure::required_rms`] is this same bar in whole RMS units, which
+/// is the form a user reads. The two are the same rule and differ only by the
+/// rounding of the room to an integer before it is multiplied — a unit or two
+/// on a number printed in a sentence, and never the reason a verdict went one
+/// way.
+fn required_mean_square(room: f64) -> f64 {
+    let margin = f64::from(SPEECH_MARGIN);
+    room * margin * margin
+}
+
 /// How long the quiet has to run before the utterance is over.
 ///
 /// 800 ms — longer than the pauses inside a spoken phrase, where a comma is
@@ -458,8 +700,8 @@ pub const SILENCE_HOLD: Duration = Duration::from_millis(800);
 /// 20 ms, which is two orders of magnitude inside the thing it is measuring.
 const VAD_FRAME: usize = TARGET_SAMPLE_RATE as usize / 50;
 
-/// Voice-activity detection: an RMS threshold, and a quiet that has run long
-/// enough to be the end of what somebody said.
+/// Voice-activity detection: [`SpeechDetector`]'s verdict per frame, and a
+/// quiet that has run long enough to be the end of what somebody said.
 ///
 /// This is what [`Pcm16::is_silent`] explicitly is not, and the difference is
 /// the whole reason both exist. That one looks at a finished buffer and decides
@@ -469,67 +711,60 @@ const VAD_FRAME: usize = TARGET_SAMPLE_RATE as usize / 50;
 /// of separate utterances.
 ///
 /// **It is not a speech/noise classifier and does not try to be.** A steady
-/// loud noise reads as speech here and holds the utterance open; what bounds
-/// that is [`MAX_UTTERANCE`], and PRD #802's surface discards a capped segment
-/// rather than paying to transcribe it. A more discriminating detector is a
-/// model, with a model's size, licence and failure modes, and nothing in a
-/// navigation vocabulary of one-to-four-word commands needs one.
+/// loud noise never ends an utterance here, and what bounds it is
+/// [`MAX_UTTERANCE`]; PRD #802's surface discards a capped segment rather than
+/// paying to transcribe it. Since the rule became relative that happens for the
+/// opposite reason to the one this paragraph used to give: a stationary noise
+/// is its own room, so no frame of it counts as speech, [`Vad::heard_speech`]
+/// never arms and the [`SILENCE_HOLD`] clock never starts. Before, every frame
+/// of it counted and the hold could never accumulate. Same outcome, and the new
+/// mechanism is the one that also keeps the noise out of [`Pcm16::has_speech`].
+/// A more discriminating detector is a model, with a model's size, licence and
+/// failure modes, and nothing in a navigation vocabulary of one-to-four-word
+/// commands needs one.
 ///
 /// Silence before the first speech is ignored, so a microphone switched on in a
 /// quiet room does not immediately "end" an utterance nobody started. That is
 /// also why an open microphone nobody speaks into ends at the cap rather than
 /// here.
 pub struct Vad {
-    /// [`SPEECH_FLOOR`] squared, so a frame costs no square root.
-    floor: f64,
+    /// The speech rule, fed frame by frame. The **same** object
+    /// [`Pcm16::measure_speech`] runs over a finished buffer.
+    detector: SpeechDetector,
     /// [`SILENCE_HOLD`] in output samples.
     hold: usize,
     /// Sum of squares of the frame being filled.
     energy: f64,
     /// How much of that frame has arrived.
     filled: usize,
-    /// Whether any frame has been over the floor yet.
+    /// Whether any frame has counted as speech yet.
     heard: bool,
-    /// Output samples of below-floor audio since the last one that was not.
+    /// Output samples of below-threshold audio since the last one that was not.
     quiet: usize,
     /// Latched: an utterance that has ended does not un-end.
     ended: bool,
-    /// [`MIN_SPEECH`] in whole [`VAD_FRAME`]s.
-    min_speech: usize,
-    /// The last [`SPEECH_WINDOW`] of frame verdicts, oldest first — the live
-    /// half of [`Pcm16::measure_speech`]'s sliding window, and the reason this
-    /// is a queue rather than a counter.
-    window: VecDeque<bool>,
-    /// How many of `window` are `true`, kept alongside it so a frame costs one
-    /// increment rather than a pass over ten.
-    voiced: usize,
-    /// Latched: [`MIN_SPEECH`] of speech-level audio has been seen inside one
-    /// [`SPEECH_WINDOW`].
-    speech: bool,
 }
 
 impl Default for Vad {
     fn default() -> Self {
-        Self::new(SPEECH_FLOOR, SILENCE_HOLD)
+        Self::new(SILENCE_HOLD)
     }
 }
 
 impl Vad {
-    pub fn new(speech_floor: u16, hold: Duration) -> Self {
+    /// **The speech threshold is no longer a parameter**, because there is no
+    /// longer a threshold to pass: [`SpeechDetector`] derives its own from the
+    /// room in the signal. The hold remains one because it is a policy about
+    /// how long a pause may be, which no signal can supply.
+    pub fn new(hold: Duration) -> Self {
         Self {
-            floor: f64::from(speech_floor) * f64::from(speech_floor),
+            detector: SpeechDetector::default(),
             hold: (hold.as_secs_f64() * f64::from(TARGET_SAMPLE_RATE)) as usize,
             energy: 0.0,
             filled: 0,
             heard: false,
             quiet: 0,
             ended: false,
-            min_speech: ((MIN_SPEECH.as_secs_f64() * f64::from(TARGET_SAMPLE_RATE)) as usize
-                / VAD_FRAME)
-                .max(1),
-            window: VecDeque::with_capacity(speech_window_frames()),
-            voiced: 0,
-            speech: false,
         }
     }
 
@@ -554,20 +789,13 @@ impl Vad {
             let mean_square = self.energy / VAD_FRAME as f64;
             self.energy = 0.0;
             self.filled = 0;
-            // Compared as mean square against the squared floor: the same
-            // comparison as RMS against the floor, without the square root.
-            let speech = mean_square >= self.floor;
-            // The sliding window, kept identical to the one
-            // [`Pcm16::measure_speech`] runs over the finished buffer: same
-            // floor, same frame alignment, same span. The two answer the same
-            // question at two moments and must not be able to disagree.
-            let span = speech_window_frames();
-            if self.window.len() == span && self.window.pop_front() == Some(true) {
-                self.voiced -= 1;
-            }
-            self.window.push_back(speech);
+            // The one speech rule, incrementally: same detector type, same
+            // frame alignment, same room estimate as the pass
+            // [`Pcm16::measure_speech`] makes over the finished buffer. The two
+            // answer the same question at two moments and cannot disagree,
+            // because there is one implementation of it.
+            let speech = self.detector.push_frame(mean_square);
             if speech {
-                self.voiced += 1;
                 self.heard = true;
                 self.quiet = 0;
             } else if self.heard {
@@ -579,11 +807,8 @@ impl Vad {
             }
             // Quiet before the first speech falls through both arms on purpose:
             // the hold must not be counted there, or a microphone opened in a
-            // quiet room would "end" an utterance nobody started. The window
+            // quiet room would "end" an utterance nobody started. The detector
             // still advances, because a gap is exactly what it is measuring.
-            if self.voiced >= self.min_speech {
-                self.speech = true;
-            }
         }
     }
 
@@ -593,10 +818,10 @@ impl Vad {
         self.ended
     }
 
-    /// Whether anything over the floor has arrived at all.
+    /// Whether any frame has counted as speech at all.
     ///
     /// **Not a claim that anybody spoke, and it is on no rung of
-    /// [`SPEECH_WINDOW`]'s ladder.** One frame over the floor is a keyboard tap
+    /// [`SPEECH_WINDOW`]'s ladder.** One frame out of the room is a keyboard tap
     /// as readily as a syllable. It exists for one job — starting the
     /// [`SILENCE_HOLD`] clock — and it is deliberately the most permissive test
     /// in the module because the alternative costs more: arm on a stricter rule
@@ -634,7 +859,7 @@ impl Vad {
     /// flag that fell back to false during the pause inside a sentence would
     /// answer *no* in the middle of one.
     pub fn speaking(&self) -> bool {
-        self.speech
+        self.detector.spoken()
     }
 }
 
@@ -1774,13 +1999,31 @@ mod tests {
 
     // -- voice-activity detection ------------------------------------------
 
-    /// Output samples of speech, well over [`SPEECH_FLOOR`] at any frame
-    /// boundary: a square wave rather than a sine, so no frame can land on a
+    /// Output samples of speech, far enough over any room in this file to be
+    /// unambiguous: a square wave rather than a sine, so no frame can land on a
     /// quiet part of a cycle and make a test depend on its own arithmetic.
+    ///
+    /// **This is half of a fixture and never a whole one.** The rule is
+    /// relative, so a buffer of nothing but this has no room to be measured
+    /// against and is refused — see [`SpeechDetector`], which documents that as
+    /// the design. Every fixture below wraps it in [`room`], which is what a
+    /// real segment carries at both ends by construction.
     fn speech(samples: usize) -> Vec<i16> {
         (0..samples)
             .map(|i| if i % 2 == 0 { 8_000 } else { -8_000 })
             .collect()
+    }
+
+    /// The room a microphone delivers before and after anything is said — over
+    /// [`SILENCE_FLOOR`], far under anything anybody means as speech, and the
+    /// reference the relative rule takes its threshold from.
+    ///
+    /// 180 is the figure this module's own docs use for room tone. A real
+    /// segment has it at both ends without anybody arranging it: recording
+    /// starts when a key is pressed and the first syllable arrives later, and
+    /// the segment ends only after [`SILENCE_HOLD`] of below-threshold audio.
+    fn room(millis: u64) -> Vec<i16> {
+        at(millis, 180)
     }
 
     /// Output samples at exactly the target rate, as a count.
@@ -1802,15 +2045,16 @@ mod tests {
     ///
     /// The shape that matters is the **closure**: a voiceless stop is a silence
     /// with a burst after it, so a one-syllable command is not one block of
-    /// energy but two or three with real quiet between them. 180 is the room
-    /// tone this module's own docs describe — over [`SILENCE_FLOOR`] and well
-    /// under [`SPEECH_FLOOR`].
+    /// energy but two or three with real quiet between them. The 400 ms of
+    /// [`room`] at each end is the second thing that matters, and it stopped
+    /// being decoration when the rule became relative: it is what the
+    /// threshold is derived from.
     fn word(parts: &[(u64, i16)]) -> Pcm16 {
-        let mut samples = at(400, 180);
+        let mut samples = room(400);
         for &(millis, level) in parts {
             samples.extend(at(millis, level));
         }
-        samples.extend(at(400, 180));
+        samples.extend(room(400));
         Pcm16::new(samples)
     }
 
@@ -1888,18 +2132,19 @@ mod tests {
     fn voice_capture_an_empty_or_silent_buffer_holds_no_speech() {
         assert!(!Pcm16::new(Vec::new()).has_speech());
         assert!(!Pcm16::new(vec![0; out_samples(30_000)]).has_speech());
-        // Room tone under `SPEECH_FLOOR` for the whole buffer, which is the
-        // ordinary case rather than the digital-zero one.
-        let tone: Vec<i16> = (0..out_samples(30_000))
-            .map(|i| if i % 2 == 0 { 180 } else { -180 })
-            .collect();
-        assert!(!Pcm16::new(tone).has_speech());
+        // Room tone and nothing else for thirty seconds, which is the ordinary
+        // case rather than the digital-zero one. It is refused because it IS
+        // its own room: the quietest 20 ms in any window equals the loudest, so
+        // nothing reaches `SPEECH_MARGIN` times it.
+        assert!(!Pcm16::new(room(30_000)).has_speech());
     }
 
     #[test]
     fn voice_capture_a_spoken_word_is_eligible_to_transcribe() {
         // 200 ms of speech-level audio in a quiet second — the shape of a bare
         // "back", which is a real command on the overview and must be sent.
+        // The quiet at both ends is the room the rule measures against, and a
+        // digitally silent one puts the threshold on `SILENCE_RMS`.
         let mut samples = vec![0i16; out_samples(400)];
         samples.extend(speech(out_samples(200)));
         samples.extend(std::iter::repeat_n(0i16, out_samples(400)));
@@ -1963,7 +2208,13 @@ mod tests {
     /// Not production code and deliberately not a method on [`Pcm16`] — there
     /// is one speech rule now and this is the one that was wrong.
     fn longest_unbroken(audio: &Pcm16) -> Duration {
-        let floor = f64::from(SPEECH_FLOOR) * f64::from(SPEECH_FLOOR);
+        // `SPEECH_FLOOR`, the absolute RMS this module used to judge a frame
+        // by, frozen here as a literal because it is history rather than a
+        // constant: PRD #802 replaced it with `SPEECH_MARGIN` against the room.
+        // Both halves of the old rule live in this one helper, which is why it
+        // can still state the premise these fixtures need.
+        const SPEECH_FLOOR: f64 = 600.0;
+        let floor = SPEECH_FLOOR * SPEECH_FLOOR;
         let (mut longest, mut run) = (0usize, 0usize);
         for frame in audio.samples().chunks_exact(VAD_FRAME) {
             let energy: f64 = frame.iter().map(|&s| f64::from(s) * f64::from(s)).sum();
@@ -1984,9 +2235,11 @@ mod tests {
         // the threshold and neither alone is, so a rule with no upper bound on
         // the gap would pass this and the utterance rung (`SILENCE_HOLD`) would
         // have swallowed the word rung.
-        let mut samples = speech(out_samples(60));
+        let mut samples = room(400);
+        samples.extend(speech(out_samples(60)));
         samples.extend(std::iter::repeat_n(0i16, out_samples(200)));
         samples.extend(speech(out_samples(160)));
+        samples.extend(room(400));
         let audio = Pcm16::new(samples);
         assert_eq!(audio.measure_speech().voiced, Duration::from_millis(160));
         // Eligible on the strength of the 160 ms alone, which is the point:
@@ -2005,9 +2258,11 @@ mod tests {
             "the constants moved; this test's prose has not"
         );
         let split = |gap: u64| {
-            let mut samples = speech(out_samples(60));
+            let mut samples = room(400);
+            samples.extend(speech(out_samples(60)));
             samples.extend(at(gap, 180));
             samples.extend(speech(out_samples(60)));
+            samples.extend(room(400));
             Pcm16::new(samples)
         };
         assert!(
@@ -2038,17 +2293,25 @@ mod tests {
             10,
             "SPEECH_WINDOW moved; this test's arithmetic has not"
         );
-        let exactly = Pcm16::new(speech(frames * VAD_FRAME));
+        // In a room, because the threshold is derived from one: a bare tone
+        // with nothing under it is its own room and is refused by design.
+        let spoken = |frames: usize| {
+            let mut samples = room(400);
+            samples.extend(speech(frames * VAD_FRAME));
+            samples.extend(room(400));
+            Pcm16::new(samples)
+        };
+        let exactly = spoken(frames);
         assert_eq!(exactly.measure_speech().voiced, MIN_SPEECH);
         assert!(exactly.has_speech(), "exactly MIN_SPEECH must be eligible");
-        let one_frame_short = Pcm16::new(speech((frames - 1) * VAD_FRAME));
+        let one_frame_short = spoken(frames - 1);
         assert!(one_frame_short.measure_speech().voiced < MIN_SPEECH);
         assert!(!one_frame_short.has_speech());
         // And the same boundary when the frames are SPREAD across a window
         // rather than consecutive, which is the axis that changed: six frames
         // of speech and four of quiet, in the order a word puts them.
         let spread = |voiced: usize| {
-            let mut samples = Vec::new();
+            let mut samples = room(400);
             for i in 0..10 {
                 samples.extend(if i % 10 < voiced {
                     speech(VAD_FRAME)
@@ -2066,43 +2329,63 @@ mod tests {
     }
 
     #[test]
-    fn voice_capture_the_measure_reports_the_loudest_frame_against_the_floor() {
-        // The diagnostic half, and the reason `SpeechMeasure` has two fields:
-        // a buffer refused because nothing ever crossed the floor needs the
+    fn voice_capture_the_measure_reports_the_loudest_frame_against_its_room() {
+        // The diagnostic half, and the reason `SpeechMeasure` has three fields:
+        // a buffer refused because nothing ever rose out of the room needs the
         // user to speak up, and one refused because the speech was too short
-        // does not. Nothing outside this could tell the two apart.
+        // does not. Nothing outside this could tell the two apart — and with
+        // `peak_rms` alone nothing could tell them apart either, which is how
+        // PRD #802's product owner ended up reporting a duration and no level.
         let quiet = word(&[(2_000, 400)]);
-        assert!(!quiet.has_speech(), "400 is under SPEECH_FLOOR");
-        assert_eq!(quiet.measure_speech().voiced, Duration::ZERO);
-        assert_eq!(quiet.measure_speech().peak_rms, 400);
+        let measure = quiet.measure_speech();
+        assert_eq!(measure.peak_rms, 400);
+        assert_eq!(measure.room_rms, 180, "the room `word` puts under it");
+        assert_eq!(measure.required_rms(), 540, "3 x 180");
         assert!(
-            quiet.measure_speech().peak_rms < SPEECH_FLOOR,
+            measure.peak_rms < measure.required_rms(),
             "the fixture must be a LEVEL refusal, or it tests the wrong branch"
         );
+        assert!(!quiet.has_speech());
+        assert_eq!(measure.voiced, Duration::ZERO);
 
         let brief = word(&[(60, 5_000)]);
+        let measure = brief.measure_speech();
         assert!(!brief.has_speech(), "60 ms is under MIN_SPEECH");
-        assert_eq!(brief.measure_speech().peak_rms, 5_000);
+        assert_eq!(measure.peak_rms, 5_000);
         assert!(
-            brief.measure_speech().peak_rms >= SPEECH_FLOOR,
+            measure.peak_rms >= measure.required_rms(),
             "the fixture must be a LENGTH refusal"
         );
+        assert_eq!(measure.voiced, Duration::from_millis(60));
 
-        // Empty is not a division by zero and not a panic.
-        assert_eq!(Pcm16::new(Vec::new()).measure_speech().peak_rms, 0);
-        assert_eq!(
-            Pcm16::new(Vec::new()).measure_speech().voiced,
-            Duration::ZERO
-        );
+        // Empty is not a division by zero and not a panic, and its required
+        // level falls back on the absolute floor rather than on 3 x nothing.
+        let empty = Pcm16::new(Vec::new()).measure_speech();
+        assert_eq!(empty.peak_rms, 0);
+        assert_eq!(empty.room_rms, SILENCE_RMS);
+        assert_eq!(empty.required_rms(), SILENCE_RMS * SPEECH_MARGIN);
+        assert_eq!(empty.voiced, Duration::ZERO);
     }
 
     #[test]
     fn voice_capture_the_live_and_finished_rules_are_one_predicate() {
         // `Vad::speaking` and `Pcm16::has_speech` are the same question asked at
         // two moments, and PRD #802's defect was two rules that differed by 6x.
-        // Nothing but a test can hold them together, because they are two
-        // implementations of one rule — one incremental, one a pass over a
-        // buffer.
+        // They are now two CALLERS of one `SpeechDetector` rather than two
+        // implementations of one rule, so this holds something weaker than it
+        // used to and something that cannot drift: that both feed it the same
+        // frames, in the same alignment, and read the same answer out.
+        //
+        // The last three fixtures are the ones the relative rule added, and the
+        // gain sweep is the reason they are here: a rule that derived its
+        // threshold differently on the two paths would disagree about exactly
+        // these — a quiet voice, a loud room, and a bare tone with no room
+        // under it at all.
+        let mut quiet_voice = at(400, 60);
+        quiet_voice.extend(at(80, 500));
+        quiet_voice.extend(at(40, 120));
+        quiet_voice.extend(at(60, 700));
+        quiet_voice.extend(at(400, 60));
         let fixtures = [
             word(&[(80, 2_000), (40, 200), (60, 1_000)]),
             word(&[(60, 2_000), (20, 400), (60, 2_000)]),
@@ -2111,6 +2394,9 @@ mod tests {
             room_with_one_tap(),
             Pcm16::new(speech(out_samples(300))),
             Pcm16::new(Vec::new()),
+            Pcm16::new(quiet_voice),
+            Pcm16::new(at(3_000, 900)),
+            Pcm16::new(room(3_000)),
         ];
         for audio in fixtures {
             let mut vad = Vad::default();
@@ -2133,14 +2419,18 @@ mod tests {
         // is a keyboard tap, and a tap must not hold a pending send open.
         let frames = MIN_SPEECH.as_millis() as usize / 20;
         let mut tapped = Vad::default();
+        // The room first, in both halves: the live rule is strictly causal, so
+        // a recording that opens on speech has nothing to measure it against.
+        tapped.push(&room(400));
         tapped.push(&speech((frames - 1) * VAD_FRAME));
-        assert!(tapped.heard_speech(), "the floor was not crossed at all");
+        assert!(tapped.heard_speech(), "the room was never risen out of");
         assert!(
             !tapped.speaking(),
             "one frame short of MIN_SPEECH counted as speaking"
         );
 
         let mut spoken = Vad::default();
+        spoken.push(&room(400));
         spoken.push(&speech(frames * VAD_FRAME));
         assert!(spoken.speaking(), "exactly MIN_SPEECH is somebody speaking");
     }
@@ -2179,6 +2469,7 @@ mod tests {
         // in the middle of one — which is when a pending send would fire.
         let frames = MIN_SPEECH.as_millis() as usize / 20;
         let mut vad = Vad::default();
+        vad.push(&room(400));
         vad.push(&speech(frames * VAD_FRAME));
         assert!(vad.speaking());
         vad.push(&vec![0; out_samples(300)]);
@@ -2200,7 +2491,9 @@ mod tests {
         assert!(!status.speech, "a silent room reported somebody speaking");
 
         let format = mono(TARGET_SAMPLE_RATE);
-        let samples: Vec<f32> = speech(out_samples(300))
+        let mut spoken_pcm = room(400);
+        spoken_pcm.extend(speech(out_samples(300)));
+        let samples: Vec<f32> = spoken_pcm
             .into_iter()
             .map(|s| f32::from(s) / f32::from(i16::MAX))
             .collect();
@@ -2220,24 +2513,231 @@ mod tests {
     }
 
     #[test]
-    fn voice_capture_the_speech_floor_agrees_between_the_vad_and_the_buffer() {
-        // A hair under `SPEECH_FLOOR` at every frame boundary is not speech to
-        // either of them; a hair over is speech to both. One threshold, two
-        // readers, and a drift between them would make the live segmentation and
-        // the eligibility gate disagree about the same audio.
-        for (amplitude, speech_expected) in [(599i16, false), (601i16, true)] {
-            let samples: Vec<i16> = (0..out_samples(1_000))
-                .map(|i| if i % 2 == 0 { amplitude } else { -amplitude })
-                .collect();
-            let mut vad = Vad::default();
-            vad.push(&samples);
-            assert_eq!(vad.heard_speech(), speech_expected, "vad at {amplitude}");
+    fn voice_capture_the_speech_threshold_agrees_between_the_vad_and_the_buffer() {
+        // A hair under `SPEECH_MARGIN` times the room is not speech to either
+        // of them; at it and over it is speech to both. One rule, two readers,
+        // and a drift between them would make the live segmentation and the
+        // eligibility gate disagree about the same audio.
+        //
+        // The threshold is no longer a constant to name here — it is derived
+        // from the room this fixture puts under the signal, which is the whole
+        // change: the same three lines at half the level, or at five times it,
+        // return the same two verdicts.
+        assert_eq!(
+            SPEECH_MARGIN, 3,
+            "SPEECH_MARGIN moved; this test's arithmetic has not"
+        );
+        for tone in [180i16, 90, 900] {
+            let required = tone * 3;
+            for (amplitude, speech_expected) in [
+                (required - 1, false),
+                (required, true),
+                (required + 1, true),
+            ] {
+                let mut samples = at(400, tone);
+                samples.extend(at(300, amplitude));
+                samples.extend(at(400, tone));
+                let mut vad = Vad::default();
+                vad.push(&samples);
+                assert_eq!(
+                    vad.speaking(),
+                    speech_expected,
+                    "vad at {amplitude} in a room at {tone}"
+                );
+                let measure = Pcm16::new(samples.clone()).measure_speech();
+                assert_eq!(
+                    Pcm16::new(samples).has_speech(),
+                    speech_expected,
+                    "buffer at {amplitude} in a room at {tone}: {measure:?}"
+                );
+                assert_eq!(measure.room_rms, tone as u16);
+                assert_eq!(measure.required_rms(), required as u16);
+            }
+        }
+    }
+
+    /// The correction PRD #802's product owner forced: the SAME voice on a
+    /// quiet microphone and on a loud one has to get the same verdict, and an
+    /// absolute floor cannot give it one.
+    ///
+    /// A gain stage multiplies the room and the speech together, so every level
+    /// in the fixture scales and the ratio does not. The old `SPEECH_FLOOR` of
+    /// 600 is inside the range swept here on purpose: it passes the middle of
+    /// it and refuses both ends, which is the defect stated as a test.
+    #[test]
+    fn voice_capture_the_same_voice_reads_the_same_at_every_gain() {
+        for gain in [1i32, 3, 10, 30, 100] {
+            // A room 24 dB under the voice, which is an ordinary near-field
+            // recording, at 1/100th of full scale and at half of it alike.
+            let tone = (12 * gain) as i16;
+            let voice = (192 * gain) as i16;
+            let audio = {
+                let mut samples = at(400, tone);
+                samples.extend(at(80, voice));
+                samples.extend(at(40, tone));
+                samples.extend(at(60, voice));
+                samples.extend(at(400, tone));
+                Pcm16::new(samples)
+            };
+            let measure = audio.measure_speech();
+            assert!(
+                audio.has_speech(),
+                "the same voice was refused at gain {gain}: {measure:?}"
+            );
             assert_eq!(
-                Pcm16::new(samples).has_speech(),
-                speech_expected,
-                "buffer at {amplitude}"
+                measure.voiced,
+                Duration::from_millis(140),
+                "gain {gain} changed WHAT was measured, not just the levels"
             );
         }
+    }
+
+    /// The other half of the same correction, and the one a lower absolute
+    /// floor would have made worse rather than better: a loud room is still a
+    /// room.
+    ///
+    /// Stationary noise is its own reference — the quietest 20 ms inside a
+    /// `NOISE_WINDOW` is within a fraction of a dB of the loudest — so nothing
+    /// in it reaches `SPEECH_MARGIN` times it at any gain. The levels swept
+    /// here run from under the old `SPEECH_FLOOR` to fifteen times it, and the
+    /// verdict does not move.
+    #[test]
+    fn voice_capture_steady_noise_is_never_speech_however_loud_it_is() {
+        for level in [180i16, 400, 700, 1_500, 4_000, 9_000] {
+            // Dithered rather than a flat square wave, so the frames genuinely
+            // vary the way a noise source does and the minimum is not the
+            // arithmetic of a constant. The wobble is +/-3%, which is an order
+            // of magnitude more than white noise gives a 320-sample frame.
+            let samples: Vec<i16> = (0..out_samples(5_000))
+                .map(|i| {
+                    let wobble = 1.0 + 0.03 * ((i / VAD_FRAME) % 7) as f64 / 7.0;
+                    let value = (f64::from(level) * wobble) as i16;
+                    if i % 2 == 0 { value } else { -value }
+                })
+                .collect();
+            let audio = Pcm16::new(samples.clone());
+            let measure = audio.measure_speech();
+            assert!(
+                !audio.has_speech(),
+                "steady noise at {level} read as speech: {measure:?}"
+            );
+            assert_eq!(
+                measure.voiced,
+                Duration::ZERO,
+                "not one frame of steady noise may count, at {level}"
+            );
+            // And the live reader agrees, so a noisy room never arms the
+            // dictation countdown either.
+            let mut vad = Vad::default();
+            vad.push(&samples);
+            assert!(
+                !vad.speaking(),
+                "steady noise at {level} armed the countdown"
+            );
+        }
+    }
+
+    /// The old rule, at the absolute floor it used to carry: the most frames
+    /// over `floor` inside any one [`SPEECH_WINDOW`].
+    ///
+    /// Not production code and deliberately not a method on [`Pcm16`] — like
+    /// [`longest_unbroken`] it exists so the two fixtures below can state
+    /// their premise instead of asserting it. `floor` is a parameter rather
+    /// than a constant because the argument against `SPEECH_FLOOR` is that
+    /// **no** value of it works, and a test that could only speak about 600
+    /// could not say that.
+    fn density_over(audio: &Pcm16, floor: u16) -> Duration {
+        let squared = f64::from(floor) * f64::from(floor);
+        let span = speech_window_frames();
+        let mut window: VecDeque<bool> = VecDeque::with_capacity(span);
+        let (mut inside, mut densest) = (0usize, 0usize);
+        for frame in audio.samples().chunks_exact(VAD_FRAME) {
+            if window.len() == span && window.pop_front() == Some(true) {
+                inside -= 1;
+            }
+            let over = mean_square(frame) >= squared;
+            window.push_back(over);
+            if over {
+                inside += 1;
+            }
+            densest = densest.max(inside);
+        }
+        Duration::from_secs_f64((densest * VAD_FRAME) as f64 / f64::from(TARGET_SAMPLE_RATE))
+    }
+
+    /// PRD #802's product owner, on his own microphone, reproduced — and the
+    /// measurement that falsified `SPEECH_FLOOR`.
+    ///
+    /// He was refused with *"60 ms of speech inside the loudest 200 ms, where
+    /// 120 ms is needed"*, which is the DENSITY branch and not the level one,
+    /// so his peak did clear 600 while two thirds of his densest window did
+    /// not. In the loudest part of a word a correctly-set floor sees
+    /// near-continuous energy; his saw a third. His speech straddled the
+    /// constant, which is what a low-gain input does to any constant.
+    #[test]
+    fn voice_capture_a_low_gain_voice_passes_where_the_absolute_floor_refused_it() {
+        // A word on a quiet input: a room at 60, a voiced nucleus at 500, a
+        // closure, and one burst at 700 that clears 600 the way his peak did.
+        let mut samples = at(400, 60);
+        samples.extend(at(80, 500));
+        samples.extend(at(40, 120));
+        samples.extend(at(60, 700));
+        samples.extend(at(400, 60));
+        let audio = Pcm16::new(samples);
+
+        // The premise, stated as his own number rather than as a claim: the
+        // absolute floor saw 60 ms in the densest window and needed 120.
+        assert_eq!(
+            density_over(&audio, 600),
+            Duration::from_millis(60),
+            "the fixture is not the report it is named after"
+        );
+        let measure = audio.measure_speech();
+        assert!(
+            audio.has_speech(),
+            "a word on a quiet microphone was refused: {measure:?}"
+        );
+        assert_eq!(measure.voiced, Duration::from_millis(140));
+        // And the numbers the refusal would have printed are the comparison
+        // that let it through: a room far under the voice.
+        assert_eq!(measure.peak_rms, 700);
+        assert_eq!(measure.room_rms, SILENCE_RMS, "60 is under the floor on it");
+        assert_eq!(measure.required_rms(), 192);
+    }
+
+    /// The other direction, and the reason LOWERING the constant was the wrong
+    /// repair: on a hotter input the room alone clears 600, and every frame of
+    /// it reads as speech.
+    ///
+    /// This is the buffer the whole gate exists to refuse — near-silence that a
+    /// Whisper-family model answers with a training artefact — and an absolute
+    /// floor set low enough for the fixture above admits it. There is no value
+    /// of one constant that gets both, which is the argument in a test.
+    #[test]
+    fn voice_capture_a_loud_room_is_refused_where_the_absolute_floor_admitted_it() {
+        let samples: Vec<i16> = (0..out_samples(5_000))
+            .map(|i| {
+                let wobble = 1.0 + 0.03 * ((i / VAD_FRAME) % 7) as f64 / 7.0;
+                let value = (900.0 * wobble) as i16;
+                if i % 2 == 0 { value } else { -value }
+            })
+            .collect();
+        let noise = Pcm16::new(samples);
+
+        // The premise: the absolute floor passed this whole, at its own value
+        // and at every smaller one.
+        for floor in [600u16, 400, 200] {
+            assert!(
+                density_over(&noise, floor) >= MIN_SPEECH,
+                "the fixture is not one the old rule admitted, at {floor}"
+            );
+        }
+        let measure = noise.measure_speech();
+        assert!(
+            !noise.has_speech(),
+            "a loud quiet room read as speech: {measure:?}"
+        );
+        assert_eq!(measure.voiced, Duration::ZERO);
     }
 
     #[test]
@@ -2263,6 +2763,7 @@ mod tests {
     #[test]
     fn voice_capture_vad_ends_after_the_hold_and_not_before() {
         let mut vad = Vad::default();
+        vad.push(&room(400));
         vad.push(&speech(out_samples(500)));
         assert!(vad.heard_speech());
         // One frame short of the hold.
@@ -2276,6 +2777,7 @@ mod tests {
     fn voice_capture_vad_restarts_the_hold_at_the_next_word() {
         let mut vad = Vad::default();
         // Two pauses that would each end it if they were counted together.
+        vad.push(&room(400));
         vad.push(&speech(out_samples(200)));
         vad.push(&vec![0; out_samples(600)]);
         vad.push(&speech(out_samples(200)));
@@ -2291,7 +2793,9 @@ mod tests {
         // divide by the frame. A detector that dropped the remainder would
         // never accumulate a hold at all.
         let mut vad = Vad::default();
-        for chunk in speech(out_samples(400)).chunks(333) {
+        let mut spoken = room(400);
+        spoken.extend(speech(out_samples(400)));
+        for chunk in spoken.chunks(333) {
             vad.push(chunk);
         }
         for chunk in vec![0i16; out_samples(1_000)].chunks(333) {
@@ -2310,6 +2814,7 @@ mod tests {
         assert!(!Pcm16::new(click.clone()).is_silent());
 
         let mut vad = Vad::default();
+        vad.push(&room(400));
         vad.push(&speech(out_samples(300)));
         for _ in 0..(out_samples(1_000) / VAD_FRAME) {
             vad.push(&click);
@@ -2320,6 +2825,7 @@ mod tests {
     #[test]
     fn voice_capture_vad_ending_is_latched() {
         let mut vad = Vad::default();
+        vad.push(&room(400));
         vad.push(&speech(out_samples(300)));
         vad.push(&vec![0; out_samples(1_000)]);
         assert!(vad.ended());
@@ -2333,7 +2839,9 @@ mod tests {
     fn voice_capture_sink_reports_the_utterance_ending() {
         let format = mono(TARGET_SAMPLE_RATE);
         let sink = PcmSink::new(format, MAX_UTTERANCE);
-        let mut samples: Vec<f32> = speech(out_samples(400))
+        let mut spoken = room(400);
+        spoken.extend(speech(out_samples(400)));
+        let mut samples: Vec<f32> = spoken
             .into_iter()
             .map(|s| f32::from(s) / f32::from(i16::MAX))
             .collect();
@@ -2347,7 +2855,9 @@ mod tests {
     #[test]
     fn voice_capture_status_says_done_when_the_speaking_stops() {
         let format = mono(TARGET_SAMPLE_RATE);
-        let mut samples: Vec<f32> = speech(out_samples(400))
+        let mut spoken = room(400);
+        spoken.extend(speech(out_samples(400)));
+        let mut samples: Vec<f32> = spoken
             .into_iter()
             .map(|s| f32::from(s) / f32::from(i16::MAX))
             .collect();

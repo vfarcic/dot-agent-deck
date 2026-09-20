@@ -71,7 +71,7 @@ use crate::settings::{
 };
 
 use super::Transcript;
-use super::capture::{MIN_SPEECH, Pcm16, SPEECH_FLOOR, SPEECH_WINDOW, SpeechMeasure};
+use super::capture::{MIN_SPEECH, Pcm16, SPEECH_WINDOW, SpeechMeasure};
 
 /// How long the request gets before the attempt is abandoned.
 ///
@@ -99,12 +99,13 @@ pub const TRANSCRIBE_TIMEOUT: Duration = Duration::from_secs(60);
 /// So the refusal is now a measurement, and [`SpeechMeasure`]'s two fields pick
 /// which of the two it is:
 ///
-/// * **nothing ever crossed [`SPEECH_FLOOR`]** — the input is too quiet for
-///   this floor, and the user can act on that in a second by speaking up,
-///   moving closer or raising the device's level. The number is printed
-///   against the floor rather than described, because "quiet" is not
-///   actionable and *"reached 410 where 600 counts as speech"* is.
-/// * **it crossed the floor and there was not enough** — the audio was speech
+/// * **nothing ever rose out of the room** — no frame anywhere in the buffer
+///   counted as speech, so no gate at any length would have passed it. The
+///   user can act on that in a second by speaking up, moving closer or raising
+///   the device's level. The numbers are printed as the comparison the rule
+///   made, because "quiet" is not actionable and *"reached 410 against a room
+///   at 180, where speech has to reach 540"* is.
+/// * **something did and there was not enough of it** — the audio was speech
 ///   and the utterance was too short or too sparse. Saying it again, a little
 ///   longer, is the fix.
 ///
@@ -112,33 +113,47 @@ pub const TRANSCRIBE_TIMEOUT: Duration = Duration::from_secs(60);
 /// is the rule [`TranscriptionOutcome::Silent`] exists to keep: nothing is
 /// broken, voice is still on, and the microphone is still open.
 ///
-/// The numbers go to the **user** rather than to a log because the only person
-/// who can answer *"is my microphone quiet?"* is the one holding it — and on
-/// the report this repo actually received, one refusal carrying these two
-/// numbers would have separated the gate's defect from the floor's in one
-/// utterance instead of a round trip.
+/// # Both branches carry all three numbers, and the second one did not
+///
+/// The density branch used to report a voiced duration and nothing else. PRD
+/// #802's product owner hit exactly that branch — *"60 ms of speech inside the
+/// loudest 200 ms, where 120 ms is needed"* — and the fact that mattered most
+/// was the one it left out: his peak had cleared the old absolute floor while
+/// two thirds of his densest window had not, which is what falsified the
+/// constant. Learning it cost a round trip to the person holding the
+/// microphone. So every refusal now states what the rule measured in the
+/// rule's own terms — the loudest moment, the room it was measured against,
+/// and the bar that produced — and any user can self-diagnose in one utterance
+/// whether the input is quiet, the room is loud, or the gate is strict.
 fn not_enough_speech(measure: SpeechMeasure) -> (String, String) {
-    if measure.peak_rms < SPEECH_FLOOR {
-        let detail = format!(
-            "too quiet — the loudest moment reached {} where {SPEECH_FLOOR} counts as speech",
-            measure.peak_rms
-        );
+    let against = format!(
+        "the loudest moment reached {} against a room at {}, where speech has to reach {}",
+        measure.peak_rms,
+        measure.room_rms,
+        measure.required_rms()
+    );
+    // The branch is on whether ANY frame counted, not on a level comparison:
+    // the bar moves with the room, so a peak that clears the bar printed here
+    // may still have arrived where the room was louder. `voiced` is the rule's
+    // own answer to "did anything count", and it is the only one that cannot
+    // contradict the sentence beside it.
+    if measure.voiced.is_zero() {
+        let detail = format!("too quiet — {against}");
         let sentence = format!(
-            "Too quiet to transcribe — the loudest moment reached {} where {SPEECH_FLOOR} counts \
-             as speech. Move closer or turn the input up; still listening.",
-            measure.peak_rms
+            "Too quiet to transcribe — {against}. Move closer or turn the input up; still \
+             listening."
         );
         return (detail, sentence);
     }
     let detail = format!(
-        "only {} ms of speech inside the loudest {} ms, where {} ms is needed",
+        "only {} ms of speech inside the loudest {} ms, where {} ms is needed — {against}",
         measure.voiced.as_millis(),
         SPEECH_WINDOW.as_millis(),
         MIN_SPEECH.as_millis()
     );
     let sentence = format!(
         "I did not hear enough to transcribe — {} ms of speech inside the loudest {} ms, where {} \
-         ms is needed. Say that again; still listening.",
+         ms is needed; {against}. Say that again; still listening.",
         measure.voiced.as_millis(),
         SPEECH_WINDOW.as_millis(),
         MIN_SPEECH.as_millis()
@@ -840,6 +855,7 @@ mod tests {
     use crate::settings::{
         HOSTED_SPEECH_MODEL, LOCAL_SPEECH_ENDPOINT, LOCAL_SPEECH_MODEL, TranscriptionBackend,
     };
+    use crate::voice::capture::SILENCE_RMS;
     use serde_json::json;
 
     // Every test here is pure: bytes in, a `Value` in, a `Value` or an outcome
@@ -848,12 +864,27 @@ mod tests {
     // form of that is a suite that opens no socket at all rather than one that
     // opens a loopback one.
 
+    /// An utterance: speech with the room a microphone always delivers around
+    /// it, in `samples` output samples exactly — so every duration a caller
+    /// asserts is the one it was written against.
+    ///
+    /// **The room is not decoration.** PRD #802 made the speech rule relative
+    /// to the buffer's own noise floor, so a buffer of nothing but tone has
+    /// nothing to be measured against and is refused by design — see
+    /// `SpeechDetector`. This used to be a bare 9 000-level square wave, which
+    /// is a signal no microphone produces.
     fn audio(samples: usize) -> Pcm16 {
-        // Loud enough not to be mistaken for silence, which the remote backend
-        // short-circuits on.
+        let lead = samples / 8;
         Pcm16::new(
             (0..samples)
-                .map(|i| if i % 2 == 0 { 9_000 } else { -9_000 })
+                .map(|i| {
+                    let level = if i < lead || i + lead >= samples {
+                        180
+                    } else {
+                        9_000
+                    };
+                    if i % 2 == 0 { level } else { -level }
+                })
                 .collect(),
         )
     }
@@ -1427,16 +1458,23 @@ mod tests {
             .transcribe(&Pcm16::new(vec![0; 16_000]))
             .await
             .expect_err("fails");
-        // Digital zero, so the refusal is the LEVEL one and it names the floor
-        // it measured against rather than asserting the room was quiet.
+        // Digital zero, so the refusal is the LEVEL one and it names the bar
+        // it measured against rather than asserting the room was quiet. With
+        // no room at all the rule floors its estimate at `SILENCE_RMS` and the
+        // bar is three times that — the one absolute the relative rule keeps,
+        // and the only thing that stops true silence passing a ratio test.
         assert!(
             matches!(&error, TranscriptionError::Backend(detail) if detail.contains("too quiet")),
             "got {error:?}"
         );
-        assert!(
-            error.detail().contains(&SPEECH_FLOOR.to_string()),
-            "the refusal names no floor to compare against: {}",
-            error.detail()
+        assert_eq!(
+            error.detail(),
+            format!(
+                "too quiet — the loudest moment reached 0 against a room at {SILENCE_RMS}, where \
+                 speech has to reach {}",
+                SILENCE_RMS * 3
+            ),
+            "the refusal does not state the comparison the rule made"
         );
         let error = transcriber
             .transcribe(&Pcm16::new(Vec::new()))
@@ -1575,6 +1613,7 @@ mod tests {
         let (detail, sentence) = not_enough_speech(SpeechMeasure {
             voiced: Duration::from_millis(40),
             peak_rms: 5_000,
+            room_rms: 180,
         });
         let silent = TranscriptionOutcome::Silent { detail, sentence };
         let json = serde_json::to_value(&silent).expect("serializes");
@@ -1584,7 +1623,8 @@ mod tests {
         // `TranscriptionOutcome::Silent` for why that stopped being true.
         assert_eq!(
             json["detail"],
-            "only 40 ms of speech inside the loudest 200 ms, where 120 ms is needed"
+            "only 40 ms of speech inside the loudest 200 ms, where 120 ms is needed — the loudest \
+             moment reached 5000 against a room at 180, where speech has to reach 540"
         );
         assert!(
             json["sentence"]
@@ -1595,45 +1635,77 @@ mod tests {
         );
     }
 
-    /// The two refusals, pinned as the two different things a user has to DO.
+    /// The two refusals, pinned as the two different things a user has to DO —
+    /// and pinned WHOLE, because the numbers are the point of them.
     ///
-    /// The branch is on whether anything crossed [`SPEECH_FLOOR`], because that
-    /// is what separates "your input is too quiet for this floor" from "that
-    /// was speech and there was not enough of it" — and PRD #802's product
-    /// owner had neither number.
+    /// The branch is on whether any frame counted as speech at all, which is
+    /// what separates "nothing you said rose out of your room" from "that was
+    /// speech and there was not enough of it". It is deliberately not a level
+    /// comparison any more: the bar moves with the room, so `peak_rms` against
+    /// the bar printed beside it is not a question with one answer, and
+    /// `voiced` is the rule's own.
+    ///
+    /// **Both sentences carry all three numbers**, which is the correction PRD
+    /// #802's product owner bought with a round trip: his refusal was the
+    /// density one, it reported 60 ms and no level, and the fact that decided
+    /// the redesign — that his peak cleared the old absolute floor while two
+    /// thirds of his densest window did not — was not in it.
     #[test]
     fn voice_transcribe_the_refusal_names_which_of_the_two_causes_it_was() {
         let (detail, sentence) = not_enough_speech(SpeechMeasure {
             voiced: Duration::ZERO,
             peak_rms: 410,
+            room_rms: 180,
         });
         assert_eq!(
             detail,
-            "too quiet — the loudest moment reached 410 where 600 counts as speech"
+            "too quiet — the loudest moment reached 410 against a room at 180, where speech has \
+             to reach 540"
         );
-        assert!(
-            sentence.contains("Move closer or turn the input up"),
-            "{sentence}"
+        assert_eq!(
+            sentence,
+            "Too quiet to transcribe — the loudest moment reached 410 against a room at 180, \
+             where speech has to reach 540. Move closer or turn the input up; still listening."
         );
-        assert!(sentence.contains("still listening"), "{sentence}");
 
+        // PRD #802's own report, as the sentence he would get today.
         let (detail, sentence) = not_enough_speech(SpeechMeasure {
-            voiced: Duration::from_millis(100),
-            peak_rms: 5_000,
+            voiced: Duration::from_millis(60),
+            peak_rms: 820,
+            room_rms: 95,
         });
         assert_eq!(
             detail,
-            "only 100 ms of speech inside the loudest 200 ms, where 120 ms is needed"
+            "only 60 ms of speech inside the loudest 200 ms, where 120 ms is needed — the loudest \
+             moment reached 820 against a room at 95, where speech has to reach 285"
         );
-        assert!(sentence.contains("Say that again"), "{sentence}");
+        assert_eq!(
+            sentence,
+            "I did not hear enough to transcribe — 60 ms of speech inside the loudest 200 ms, \
+             where 120 ms is needed; the loudest moment reached 820 against a room at 95, where \
+             speech has to reach 285. Say that again; still listening."
+        );
 
-        // Exactly at the floor is the LENGTH branch, not the level one: a frame
-        // at `SPEECH_FLOOR` counts as speech everywhere else in this module.
+        // One frame counted, so it is the LENGTH branch however quiet the peak
+        // was: `voiced` is the rule's own answer and the sentence follows it.
+        let (detail, _) = not_enough_speech(SpeechMeasure {
+            voiced: Duration::from_millis(20),
+            peak_rms: 70,
+            room_rms: 0,
+        });
+        assert!(detail.starts_with("only 20 ms"), "{detail}");
+        // A silent buffer reports the floor as its room rather than nothing,
+        // so the bar never reads as three times zero. `SpeechDetector` clamps
+        // there, which is why no `SpeechMeasure` carries a smaller room.
         let (detail, _) = not_enough_speech(SpeechMeasure {
             voiced: Duration::ZERO,
-            peak_rms: SPEECH_FLOOR,
+            peak_rms: 12,
+            room_rms: SILENCE_RMS,
         });
-        assert!(detail.starts_with("only 0 ms"), "{detail}");
+        assert!(
+            detail.ends_with(&format!("has to reach {}", SILENCE_RMS * 3)),
+            "{detail}"
+        );
     }
 
     /// Neither refusal blames the user's hardware, whichever branch it took.
@@ -1647,10 +1719,12 @@ mod tests {
             SpeechMeasure {
                 voiced: Duration::ZERO,
                 peak_rms: 0,
+                room_rms: 0,
             },
             SpeechMeasure {
                 voiced: Duration::from_millis(80),
                 peak_rms: 9_000,
+                room_rms: 1_200,
             },
         ] {
             let (detail, sentence) = not_enough_speech(measure);

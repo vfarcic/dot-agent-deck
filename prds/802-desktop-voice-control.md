@@ -1013,3 +1013,61 @@ Editing the two descriptions to point at each other was tried first and **merely
 **What stays true about Anthropic: only the default moved.** It is not deprecated, it did not get worse, and it remains the fastest thing measured here. A document naming it keeps it, in both spellings, and `remote` maps to it.
 
 **What this closes in the *what is NOT verified* list.** That list carried *"that the `openai_compatible` command protocol works against OpenAI itself"*, because the key on the development box had no credits when the protocol was written. It is now the shipping default, so the credentialed fixtures run against `api.openai.com` on every credentialed run — and `test_support::api_resolver` stopped naming `Protocol::Anthropic` in its own body, building through `resolver_for(&IntentSettings::default())` instead, which is the call production makes. `API_KEY_ENV` moved to `OPENAI_API_KEY` with it. Nothing mechanical keeps those two in step; the constant says so.
+
+## 2026-09-20 — the speech floor was an absolute constant, which cannot work across microphones
+
+**Found the way the last two defects in this feature were found: the product owner drove the real app with his real microphone and sent back a number.** The refusal read *"I did not hear enough to transcribe — **60 ms** of speech inside the loudest 200 ms, where 120 ms is needed."*
+
+**Read what that says.** It is the **density** branch, not the level one, so his peak **did** clear `SPEECH_FLOOR = 600` — only 30% of his densest 200 ms sat above it, where 60% is required. In the loudest part of a word a correctly-set floor sees near-continuous energy. His saw a third. His speech straddled the constant: a low-gain input whose peaks clear 600 while most of its frames do not.
+
+**The obvious repair is to lower the constant, and the owner stopped it before it was briefed:** *"Bear in mind that it's not only about my microphone. It should work for everyone."* That is the whole point and it is correct. A microphone is a gain stage; two devices recording the same voice in the same room deliver buffers an order of magnitude apart. 600 is too high for his and too low for a hotter one, where room tone alone clears it, every frame reads as speech, and the Whisper hallucinations this gate exists to stop come straight back. **Any number fitted to one report is fitted to one microphone.**
+
+### The rule that replaced it, and the two that were rejected
+
+**Speech is now judged relative to the utterance's own noise floor.** `SpeechDetector` — one type, in `voice/capture.rs` — estimates **the room** as the quietest 20 ms frame in the last `NOISE_WINDOW` (1 s), and a frame counts as speech when it reaches `SPEECH_MARGIN` (3x, a little over 9 dB SNR) above it. The level cancels: the same voice on a quiet input and on a loud one produces the same verdict. Nothing is stored per device, there is no setup step and no calibration, because **a microphone always delivers its own room** and the reference is therefore already in the buffer.
+
+The three directions the task named were weighed and two were rejected on what they do to the case that matters:
+
+- **Relative to the utterance's own peak** (count frames within some dB of the buffer's loudest). Rejected: it is symmetric in exactly the wrong way. Thirty seconds of a loud steady room has a peak too, and every frame of it sits within a few dB of that peak, so a peak-relative rule scores stationary noise as *maximally* dense. It fixes the quiet microphone and makes the loud room worse.
+- **Dynamic range as the discriminator** (refuse a buffer whose peak-to-median spread is narrow). Rejected as the *primary* rule, and it is worth saying that it is not actually a third option: the minimum-statistics rule **is** a dynamic-range test, applied per frame and over a bounded window rather than to the buffer as a whole. Taken as a whole-buffer statistic it is strictly worse — it answers one bit about a 30 s recording and cannot say *which* 200 ms was speech, which is the question `MIN_SPEECH` asks.
+- **Relative to an estimated noise floor** — taken. It is what production VADs do, it adapts to the room as well as to the device, and a windowed minimum is the standard estimator. It works because **every real signal visits its own floor**: speech has stop closures, inter-word gaps and a lead-in before the first syllable, while stationary noise simply sits there.
+
+**One absolute survives, as the task required, and it floors the ROOM rather than the frame.** `SILENCE_RMS` (64, about -54 dBFS) is the quietest the room is ever taken to be, so the smallest bar a frame can face is `64 x 3 = 192` (-45 dBFS) — far below anything anybody means as speech, and 10 dB under the level this module's own docs put room tone at. Flooring the *frame* at 64 instead was tried on paper and is a worse rule: a buffer holding a stretch of digital zero — a driver's initial zero-fill is enough — would then have its room estimated at zero for a whole `NOISE_WINDOW`, and ordinary room tone around 180 would read as speech for that second, which is precisely the near-silence a Whisper-family model answers with a training artefact. The `too_quiet` branch is kept and is now *"no frame anywhere counted as speech"*.
+
+### One implementation, not two held together by a test
+
+`Vad::speaking` and `Pcm16::has_speech` used to be two implementations of one rule with `voice_capture_the_live_and_finished_rules_are_one_predicate` holding them together. They are now two **callers** of one `SpeechDetector`, so that test holds something weaker and something that cannot drift at all. The detector is **strictly causal** — the room estimate looks only at frames that have already arrived — because `Vad` runs on a device callback and has no others; a pass over a finished buffer could take the minimum over the whole thing and deliberately does not, since the moment it did the live countdown and the transcription gate would answer differently about the same audio, which is the defect this PRD already spent a round on.
+
+**Two consequences are design decisions rather than gaps, and both are documented at the type.** A buffer that opens with speech and holds no quiet before it has no room to be measured against, so its opening frames do not count — real audio always has the lead-in, because recording starts on a keypress and a segment ends only after `SILENCE_HOLD` of below-threshold audio, so a finished segment carries room tone at both ends by construction. And **a uniform buffer is refused**: a signal at one level for its whole length has a ratio of one between its loudest and quietest moments, so no relative rule can separate a held tone at speech level from a fan at speech level — the information is not in the buffer. Refusing is the safe direction and the physical one, since speech is modulated at the syllable rate and is never uniform, and `Vad`'s own doc already put sustained noise out of scope. The visible cost is that **every fixture in that module now carries room tone** rather than being a bare square wave, which is a signal no microphone produces; no assertion was weakened to achieve it, and the `MIN_SPEECH` boundary is still pinned at exactly six frames and five.
+
+### Both refusals print the numbers, because one of them did not and that cost the round trip
+
+`SpeechMeasure` carries three fields now — `voiced`, `peak_rms`, and `room_rms`, the room in force **at that loudest frame** — plus `required_rms()`. Both branches state the comparison the rule made:
+
+> Too quiet to transcribe — the loudest moment reached 410 against a room at 180, where speech has to reach 540. Move closer or turn the input up; still listening.
+
+> I did not hear enough to transcribe — 60 ms of speech inside the loudest 200 ms, where 120 ms is needed; the loudest moment reached 820 against a room at 95, where speech has to reach 285. Say that again; still listening.
+
+The density branch previously reported the duration and nothing else, which is why learning that the owner's peak had cleared 600 took a round trip to the person holding the microphone. Any user can now self-diagnose in one utterance: a room far under the peak and a peak still short of the bar means raise the input; a room close to the peak means the room is the problem and no input level fixes it.
+
+### What was tested, and across what range
+
+- `voice_capture_a_low_gain_voice_passes_where_the_absolute_floor_refused_it` — the owner's own report reproduced: a room at 60, a nucleus at 500, one burst at 700. It asserts **first** that the old absolute rule scored it at exactly **60 ms in the densest window**, his number, and then that the new rule passes it at 140 ms.
+- `voice_capture_a_loud_room_is_refused_where_the_absolute_floor_admitted_it` — the other direction, and the one a *smaller* constant makes worse: wobbling room noise at 900, which the old rule admitted whole at 600, at 400 and at 200. Not one frame of it counts now.
+- `voice_capture_the_same_voice_reads_the_same_at_every_gain` — the same word, room 24 dB under the voice, swept over gains of **1, 3, 10, 30 and 100** (room 12 to 1 200, voice 192 to 19 200). Same verdict and the same 140 ms at every one.
+- `voice_capture_steady_noise_is_never_speech_however_loud_it_is` — stationary noise at **180, 400, 700, 1 500, 4 000 and 9 000**, from under the old floor to fifteen times it. Refused at all six, by the finished-buffer gate and by the live reader both.
+- `voice_capture_the_speech_threshold_agrees_between_the_vad_and_the_buffer` — the boundary pinned at one under, exactly at, and one over `3 x room`, in rooms at **90, 180 and 900**.
+
+**The hallucination fix does not regress, and these are the tests that say so by name**: `voice_capture_an_impulse_train_never_accumulates_into_speech` (fifty taps 100 ms apart, still exactly 40 ms), `voice_capture_a_faster_impulse_train_is_still_refused` (25 Hz), `voice_capture_near_silence_with_one_loud_sample_holds_no_speech`, `voice_capture_an_empty_or_silent_buffer_holds_no_speech`, `voice_transcribe_a_segment_with_no_speech_in_it_is_its_own_outcome` and `voice_transcribe_near_silence_with_one_loud_sample_is_never_sent`. The density rule is untouched; only the question *is this frame at speech level* changed.
+
+### What remains UNVERIFIED, which is most of what matters
+
+**There is exactly one real-world measurement behind this change and it is a refusal rather than a success.** Nothing here can validate a signal rule against a population of microphones — no tier in this repository opens a device, and `docs/develop/desktop-gui.md`'s *what is NOT verified* list now carries this as its own item — so what follows is reasoned and tested synthetically, and the owner's re-test is the only thing that can falsify it the way his first number falsified the constant.
+
+1. **`SPEECH_MARGIN = 3` is the one number still picked by argument.** 9.5 dB is the usual operating point and stationary noise is nowhere near it, but if the owner's room sits closer under his voice than the fixture assumes he will still be refused — with all three numbers printed this time, which is the point. It is the number to move, and the refusal says which way.
+2. **`NOISE_WINDOW = 1 s` is untested against a real room.** A sound that is sustained for longer than a second with no 20 ms dip in it would be taken as the room.
+3. **A noise ONSET inside a segment looks like a speech onset** to any adaptive estimator, including this one, for as long as the estimate takes to catch up. Real VADs share the property. No synthetic test pins its cost because the cost is a judgement about real rooms.
+4. **The causal-estimator consequence — a recording that opens on speech with no lead-in — is argued from how the segmenter works, not measured.** If a device delivers its first callback mid-syllable, the opening frames do not count.
+5. **A buffer that is uniform at speech level is refused**, and whether any real microphone produces one is unknown.
+
+The loop that produced this is the one to keep: his number, not our reasoning, is what falsified the constant.

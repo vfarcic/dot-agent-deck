@@ -68,7 +68,8 @@ pub use dictation::{DICTATION_OPENERS, SUBMIT_PHRASES};
 pub use capture::{
     AudioFormat, AudioSource, AudioStream, Capture, CaptureError, CaptureSession, CaptureState,
     CaptureStatus, CaptureTicket, CpalSource, MAX_UTTERANCE, MIN_SPEECH, Pcm16, PcmSink,
-    SILENCE_HOLD, SPEECH_FLOOR, SPEECH_WINDOW, SpeechMeasure, StubSource, TARGET_SAMPLE_RATE, Vad,
+    SILENCE_HOLD, SILENCE_RMS, SPEECH_MARGIN, SPEECH_WINDOW, SpeechMeasure, StubSource,
+    TARGET_SAMPLE_RATE, Vad,
 };
 pub use outcome::{ResolvedParam, VoiceOutcome, VoiceResult, handle_utterance};
 pub use remote::{Protocol, REMOTE_TIMEOUT, RemoteResolver};
