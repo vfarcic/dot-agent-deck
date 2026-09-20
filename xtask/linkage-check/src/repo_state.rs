@@ -84,14 +84,16 @@
 //! `--depth` and quietly produce a complete repository for every shallow
 //! assertion to pass vacuously against.
 //!
-//! Issue #567's four tests were held to the same bar. Three injections, one
-//! at a time, all caught: [`drift_remedy`] never emitting an unlock (the
-//! pre-#567 behaviour — reddens all four); the parser dropping the `locked`
-//! line it now keeps (reddens the parser test and the real-git one); and
-//! [`drift_remedy`] emitting an unlock unconditionally, which is what the
-//! three pre-existing `contains(PRUNE_REMEDY)` assertions could not see —
-//! the locked remedy ends in the bare one, so they passed on the wrong
-//! message until they were tightened to `bare_prune_clause`.
+//! Issue #567's tests were held to the same bar. Four injections, one at a
+//! time, all caught: [`drift_remedy`] never emitting an unlock (the
+//! pre-#567 behaviour); the parser dropping the `locked` line it now keeps
+//! (reddens the parser test and the real-git one); [`drift_remedy`]
+//! emitting an unlock unconditionally, which is what the three pre-existing
+//! `contains(PRUNE_REMEDY)` assertions could not see — the locked remedy
+//! ends in the bare one, so they passed on the wrong message until they
+//! were tightened to `bare_prune_clause`; and the remedy rendering its path
+//! with `{:?}` instead of [`shell_quote`], which reddens the metacharacter
+//! test along with the four message tests.
 //!
 //! The two `Sandbox` isolation tests added by issue #834 were held to the
 //! same bar, and their subject is the *fixture harness* rather than the code
@@ -346,6 +348,70 @@ fn parse_worktree_entries(porcelain: &[u8], sep: u8) -> Vec<ParsedWorktree> {
     out
 }
 
+/// The raw bytes behind an [`OsStr`], the inverse of
+/// [`os_string_from_bytes`] and split on the same platform line for the
+/// same reason: a worktree path is not guaranteed to be UTF-8 on Unix, and
+/// a lossy round-trip would change the bytes [`shell_quote`] has to
+/// reproduce exactly.
+fn os_bytes(s: &std::ffi::OsStr) -> Vec<u8> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        s.as_bytes().to_vec()
+    }
+    #[cfg(not(unix))]
+    {
+        s.to_string_lossy().into_owned().into_bytes()
+    }
+}
+
+/// A registered path as a word a contributor can paste into a shell.
+///
+/// **Not `{:?}`** (Greptile P1 on this PR). `Debug` for [`Path`] produces a
+/// string that merely *looks* shell-quoted: it wraps the path in double
+/// quotes and escapes `"`, `\` and control characters, but `$` and a
+/// backtick pass through untouched — so a worktree registered at a path
+/// containing `$(…)` would be command-substituted by the very shell this
+/// message is telling someone to paste into, and the `git worktree unlock`
+/// would then be aimed at a different path and clear nothing. The drift
+/// list above the remedy keeps `{:?}`: that one is for reading.
+///
+/// Ordinary paths get POSIX single quotes, inside which nothing expands at
+/// all, with an embedded `'` closed and reopened the usual way (`'\''`).
+/// A path carrying a control character or a non-UTF-8 byte gets bash/zsh
+/// ANSI-C quoting (`$'…'`) instead, which *escapes* those bytes rather than
+/// emitting them raw — the property `{:?}` was originally chosen for, since
+/// a `\r` or an ANSI escape would otherwise corrupt the terminal or CI log
+/// the message lands in, and a trailing space would be invisible. `$'…'` is
+/// bash/zsh rather than POSIX `sh`, which is the trade: an ordinary path
+/// never reaches that branch, and a path that does could not be printed
+/// verbatim safely anyway.
+fn shell_quote(path: &Path) -> String {
+    let bytes = os_bytes(path.as_os_str());
+    let printable = bytes.iter().all(|b| *b >= 0x20 && *b != 0x7f);
+    if printable && let Ok(text) = std::str::from_utf8(&bytes) {
+        return format!("'{}'", text.replace('\'', r"'\''"));
+    }
+    let mut out = String::from("$'");
+    for &b in &bytes {
+        match b {
+            b'\n' => out.push_str("\\n"),
+            b'\r' => out.push_str("\\r"),
+            b'\t' => out.push_str("\\t"),
+            b'\'' => out.push_str("\\'"),
+            b'\\' => out.push_str("\\\\"),
+            0x20..=0x7e => out.push(b as char),
+            // Everything else — control characters and every non-ASCII
+            // byte in a path this branch was entered for — as `\xNN`, which
+            // `$'…'` reproduces byte for byte, so a non-UTF-8 path survives
+            // the round trip that a `String` could not carry.
+            _ => out.push_str(&format!("\\x{b:02x}")),
+        }
+    }
+    out.push('\'');
+    out
+}
+
 /// The command that will actually clear the drift reported for `missing`,
 /// plus the clause explaining it when it is not the obvious one (issue
 /// #567).
@@ -363,17 +429,14 @@ fn parse_worktree_entries(porcelain: &[u8], sep: u8) -> Vec<ParsedWorktree> {
 ///
 /// So each locked path gets its own `git worktree unlock` in front of the
 /// single prune that then clears them all, and an all-unlocked set is
-/// spelled exactly as before. Paths are rendered with `{:?}` for the same
-/// reason the list above them is: porcelain preserves control characters
-/// verbatim, and `Debug` escapes them instead of letting them corrupt the
-/// terminal or CI log the remedy lands in. That is a rendering for a human
-/// to read and adapt, not a shell-quoting guarantee — a path containing
-/// `$` or a backtick still needs the reader's own quoting.
+/// spelled exactly as before. Paths go through [`shell_quote`] rather than
+/// the `{:?}` the drift list above uses, because this one is meant to be
+/// *run* and that one is meant to be read.
 fn drift_remedy(missing: &[&WorktreeEntry]) -> (String, &'static str) {
     let mut steps: Vec<String> = missing
         .iter()
         .filter(|w| w.locked)
-        .map(|w| format!("{UNLOCK_REMEDY} {:?}", w.path))
+        .map(|w| format!("{UNLOCK_REMEDY} {}", shell_quote(&w.path)))
         .collect();
     let explanation = if steps.is_empty() {
         ""
@@ -935,7 +998,7 @@ mod tests {
         assert_eq!(failures.len(), 1, "{failures:?}");
         assert!(
             failures[0]
-                .contains("Run `git worktree unlock \"/repo/wt-locked\" && git worktree prune`"),
+                .contains("Run `git worktree unlock '/repo/wt-locked' && git worktree prune`"),
             "the remedy must name the unlock that makes the prune land: {}",
             failures[0]
         );
@@ -992,8 +1055,8 @@ mod tests {
         assert_eq!(failures.len(), 1, "{failures:?}");
         assert!(
             failures[0].contains(
-                "Run `git worktree unlock \"/repo/locked-a\" && \
-                 git worktree unlock \"/repo/locked-b\" && git worktree prune`"
+                "Run `git worktree unlock '/repo/locked-a' && \
+                 git worktree unlock '/repo/locked-b' && git worktree prune`"
             ),
             "{}",
             failures[0]
@@ -1028,7 +1091,7 @@ mod tests {
             failures[1]
         );
         assert!(
-            failures[1].contains("Run `git worktree unlock \"/repo/wt\" && git worktree prune`"),
+            failures[1].contains("Run `git worktree unlock '/repo/wt' && git worktree prune`"),
             "{}",
             failures[1]
         );
@@ -1036,6 +1099,68 @@ mod tests {
             !failures[1].contains("/repo/other"),
             "the degenerate message names one worktree, so unlocking a sibling in it is noise: {}",
             failures[1]
+        );
+    }
+
+    /// **Greptile P1 on this PR.** The remedy is a command the message
+    /// tells a human to run, so a path that carries shell metacharacters
+    /// must arrive as an inert word. `{:?}` — what the drift list above the
+    /// remedy uses, and what this originally used — is not that: it wraps
+    /// the path in *double* quotes, inside which `$(…)` and a backtick are
+    /// still expanded by the shell being pasted into, so the `unlock` would
+    /// be aimed somewhere else and clear nothing.
+    #[test]
+    fn a_path_with_shell_metacharacters_is_inert_in_the_remedy() {
+        let s = state(
+            false,
+            vec![locked_entry("/repo/$(touch pwned)/`id`/wt", false)],
+            "/repo/main",
+            false,
+        );
+        let failures = preflight_failures(&s);
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert!(
+            failures[0].contains(
+                "Run `git worktree unlock '/repo/$(touch pwned)/`id`/wt' && git worktree prune`"
+            ),
+            "the path must be single-quoted, where nothing expands: {}",
+            failures[0]
+        );
+        assert!(
+            !failures[0].contains("unlock \"/repo/$(touch pwned)"),
+            "double quotes would leave the substitution live: {}",
+            failures[0]
+        );
+    }
+
+    /// The three shapes [`shell_quote`] has to tell apart, pinned directly
+    /// so the per-message tests above do not have to carry them all.
+    #[test]
+    fn shell_quote_covers_metacharacters_quotes_and_control_bytes() {
+        // Ordinary: POSIX single quotes, nothing escaped inside them.
+        assert_eq!(shell_quote(Path::new("/repo/wt")), "'/repo/wt'");
+        assert_eq!(
+            shell_quote(Path::new("/repo/$HOME `id` \"x\" & wt")),
+            "'/repo/$HOME `id` \"x\" & wt'"
+        );
+        // An embedded single quote closes and reopens: '\''.
+        assert_eq!(
+            shell_quote(Path::new("/repo/it's")),
+            r"'/repo/it'\''s'".to_string()
+        );
+        // A trailing space survives visibly, which bare text would not.
+        assert_eq!(shell_quote(Path::new("/repo/wt ")), "'/repo/wt '");
+        // Non-ASCII is not mangled — it is not a control byte.
+        assert_eq!(shell_quote(Path::new("/repo/wörk")), "'/repo/wörk'");
+        // A control character is ESCAPED rather than emitted raw, so it
+        // cannot corrupt the terminal or CI log the message lands in.
+        assert_eq!(
+            shell_quote(Path::new("/repo/wt\nnewline")),
+            r"$'/repo/wt\nnewline'"
+        );
+        assert_eq!(
+            shell_quote(Path::new("/repo/wt\u{1b}[31m")),
+            r"$'/repo/wt\x1b[31m'"
         );
     }
 
@@ -1071,6 +1196,58 @@ mod tests {
                 "a `locked` line is an attribute, not a path tail: {e:?}"
             );
         }
+    }
+
+    /// **Greptile P2 on this PR**, pinned rather than fixed, and the reason
+    /// is that the ambiguity is the git < 2.36 LF fallback's rather than
+    /// this change's. A path containing a literal newline whose
+    /// continuation happens to read `locked` is, in that record form,
+    /// byte-identical to an ordinary `locked` attribute — nothing in the
+    /// stream can tell them apart. So the entry's path stays truncated and
+    /// it reads locked.
+    ///
+    /// That is not a regression: `is_known_attribute_line` has recognised
+    /// both `locked` spellings since #558, so this shape never raised the
+    /// truncation signal and was already reported as drift under a
+    /// shortened path — with a remedy that could not clear it either, since
+    /// the real worktree is locked and the bare prune spares it. The
+    /// difference #567 makes is that the remedy now names an `unlock`,
+    /// aimed at the truncated path, which fails loudly instead of silently.
+    /// Suppressing drift for the shape instead would let a genuinely stale
+    /// locked worktree go unreported, which is the fail-green direction.
+    ///
+    /// The real fix is the one already in place: [`collect`] asks for `-z`
+    /// first, and with NUL records the same path is unambiguous — asserted
+    /// as the second half here.
+    #[test]
+    fn the_lf_fallback_cannot_tell_a_locked_attribute_from_a_locked_path_tail() {
+        let ambiguous = "worktree /repo/wt\n\
+                          locked\n\
+                          HEAD 9c131d5455485369f6b6b7c9ac8cdd9d5482241d\n";
+        let entries = parse_worktree_entries(ambiguous.as_bytes(), RECORD_LF);
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert_eq!(
+            entries[0].path,
+            PathBuf::from("/repo/wt"),
+            "the LF fallback truncates at the newline, as it does for every other tail"
+        );
+        assert!(
+            entries[0].locked,
+            "and reads the tail as the attribute it is indistinguishable from"
+        );
+
+        // The same bytes with NUL records: one path, no lock, nothing lost.
+        let unambiguous = b"worktree /repo/wt\nlocked\0\
+                            HEAD 9c131d5455485369f6b6b7c9ac8cdd9d5482241d\0\0"
+            as &[u8];
+        let entries = parse_worktree_entries(unambiguous, RECORD_NUL);
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert_eq!(entries[0].path, PathBuf::from("/repo/wt\nlocked"));
+        assert!(
+            !entries[0].locked,
+            "with NUL records the tail is part of the path, not an attribute"
+        );
+        assert!(!entries[0].path_maybe_truncated);
     }
 
     /// A healthy multi-worktree, non-shallow repository passes with no
@@ -1480,6 +1657,17 @@ mod tests {
         let bytes = [b'/', b'r', b'e', b'p', 0xFF, b'o'];
         let os = os_string_from_bytes(&bytes);
         assert_eq!(os.as_bytes(), &bytes[..]);
+    }
+
+    /// And the round trip [`shell_quote`] needs on the same input: a
+    /// non-UTF-8 byte cannot ride through a `String` verbatim, so it takes
+    /// the `$'…'` branch and comes out as `\xNN`, which bash reproduces as
+    /// the original byte.
+    #[cfg(unix)]
+    #[test]
+    fn shell_quote_escapes_a_non_utf8_byte_rather_than_losing_it() {
+        let path = PathBuf::from(os_string_from_bytes(&[b'/', b'r', b'e', b'p', 0xFF, b'o']));
+        assert_eq!(shell_quote(&path), r"$'/rep\xffo'");
     }
 }
 
@@ -2561,7 +2749,10 @@ mod real_git {
 
         let failures = run(&clone);
         assert_eq!(failures.len(), 1, "{failures:?}");
-        let expected = format!("Run `{UNLOCK_REMEDY} {wt:?} && {PRUNE_REMEDY}`");
+        let expected = format!(
+            "Run `{UNLOCK_REMEDY} {} && {PRUNE_REMEDY}`",
+            shell_quote(&wt)
+        );
         assert!(
             failures[0].contains(&expected),
             "expected the unlock-then-prune remedy.\n  wanted: {expected}\n  message: {}",
