@@ -3677,6 +3677,22 @@ mod hook_ingestion_tests {
             let dir = tempfile::tempdir().expect("temp dir for the detached child's pid file");
             let partial = dir.path().join("child.pid.partial");
             let final_path = dir.path().join("child.pid");
+            // Both paths are interpolated into a Python single-quoted string
+            // inside a shell double-quoted word, so a `TMPDIR` carrying any of
+            // these would rewrite the command rather than name a file. The two
+            // file names are ours; only the base can misbehave, and it comes from
+            // `std::env::temp_dir()`. Refusing here rather than escaping for both
+            // quoting layers: an exotic base is a broken environment, not a case
+            // to support, and a named refusal beats hand-rolled double escaping
+            // that nothing in this repo exercises (greptile, PR #1192).
+            for path in [&partial, &final_path] {
+                let text = path.to_string_lossy();
+                assert!(
+                    !text.contains(['\'', '"', '$', '`', '\\', '\n']),
+                    "this test's temp base cannot be embedded in a shell command: {text:?} \
+                     contains one of ' \" $ ` \\ or a newline. Point TMPDIR somewhere plainer."
+                );
+            }
             let command = format!(
                 "python3 -c \"import os; pid = os.fork(); \
                  (os.setsid(), os.execv('/bin/sleep', ['sleep', '{backstop}'])) if pid == 0 \
