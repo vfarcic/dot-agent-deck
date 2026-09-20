@@ -100,14 +100,29 @@
 //!
 //! # What is verifiable here and what is not
 //!
-//! The Linux path is real on this project's dev box and in CI's Linux jobs, and
-//! the tests below drive the seam with a stub on every platform. **The macOS
-//! and Windows calls are compiled by `build-macos` and `build-windows` and
-//! executed by nothing in this repository** — no tier runs a GUI app on either
-//! platform, and no unit test can assert that powerd or the Windows kernel
-//! actually honoured the request. Those two arms are type-checked and reviewed,
-//! not exercised. `scripts/windows-cross-check.sh` type-checks the Windows one
-//! from Linux; the macOS one has no local counterpart at all.
+//! **All three platform calls are EXECUTED in CI, which is more than was first
+//! claimed here.** This module's first draft said the macOS and Windows arms
+//! were "compiled and executed by nothing in this repository", reasoning from
+//! the true fact that no tier runs the GUI app on either. That does not follow:
+//! `build-macos` and `build-windows` each run `cargo nextest run --workspace`,
+//! which links this crate and runs its unit tests on a real Mac and a real
+//! Windows runner. Confirmed in the job logs rather than assumed —
+//! [`tests::the_real_platform_is_asked_for_real_and_lets_go_again`] appears as
+//! `PASS` in both. So `IOPMAssertionCreateWithName` and
+//! `SetThreadExecutionState` are called for real, on every PR, and that test
+//! now **asserts the grant** on those two platforms rather than accepting any
+//! answer.
+//!
+//! What remains unexercised is narrower and worth stating exactly: **nothing
+//! anywhere watches a machine decline to sleep.** The tests prove the call was
+//! made and taken back, not that the operating system then behaved. That half
+//! is the manual walk in `docs/develop/desktop-gui.md`, and on macOS and
+//! Windows it is the only thing that has ever checked it.
+//!
+//! Locally, `scripts/windows-cross-check.sh` type-checks the Windows arm from
+//! Linux; the macOS arm has no local counterpart in the crate, though the
+//! module can be lifted into a throwaway crate and checked against
+//! `aarch64-apple-darwin` with a rustup toolchain.
 
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -969,24 +984,58 @@ mod tests {
         assert!(format!("{lock:?}").contains("held: true"));
     }
 
-    /// The real platform call, exercised for the one thing a unit test can
-    /// assert about it: that asking is safe wherever the tier runs.
+    /// The real platform call, on the real platform — **including macOS and
+    /// Windows**, which `build-macos` and `build-windows` both reach because
+    /// each runs `cargo nextest run --workspace`.
     ///
-    /// **Both answers pass on purpose.** A developer's Linux box grants the
-    /// logind inhibit and a CI container with no system bus refuses it, and
-    /// this tier runs on both — an assertion either way would be a test of the
-    /// machine rather than of the code. What it does catch is the thing that
-    /// actually goes wrong in a hand-rolled platform layer: a panic, an abort,
-    /// a hang, or a release that faults.
+    /// This was first written as *both answers pass, wherever it runs*, on the
+    /// assumption that those two jobs only compiled the code. They do not, and
+    /// the assumption cost the strongest verification this feature can get
+    /// without a GUI. So the claim is now split by what the platform actually
+    /// depends on:
     ///
-    /// **On macOS and Windows this runs nowhere**, because no tier in this
-    /// repository runs `cargo test` on those platforms' GUI app — see the
-    /// module docs. There it is compiled and no more.
+    /// - **macOS and Windows grant it, and a refusal is a DEFECT.**
+    ///   `IOPMAssertionCreateWithName` is a call into IOKit against a powerd
+    ///   that is always running, and `SetThreadExecutionState` is a kernel call
+    ///   that cannot fail on a valid flag word. Neither needs a daemon to be
+    ///   configured, a bus to exist or a session to be present, so there is no
+    ///   environment in which a *correct* implementation is refused — which
+    ///   makes [`assert_granted`] below a real assertion rather than a test of
+    ///   the runner.
+    /// - **Linux may legitimately refuse**, and both answers pass there. A
+    ///   developer's box grants the logind inhibit; a CI container with no
+    ///   system bus has nothing to ask. Asserting either way would be a test of
+    ///   the machine.
+    ///
+    /// What it catches everywhere is what actually goes wrong in a hand-rolled
+    /// platform layer: a panic, an abort, a hang, or a release that faults.
+    ///
+    /// **It is still not the whole story on any platform.** It proves the call
+    /// was made and taken back; it proves nothing about the machine then
+    /// declining to sleep, which no automated tier here can reach. The manual
+    /// walk in `docs/develop/desktop-gui.md` is that half.
     #[test]
-    fn asking_the_real_platform_is_safe_whatever_it_answers() {
+    fn the_real_platform_is_asked_for_real_and_lets_go_again() {
         let lock = WakeLock::platform();
         lock.hold();
+        let granted = lock.is_held();
         lock.release();
         assert!(!lock.is_held(), "a release ends it whether or not it began");
+        assert_granted(granted);
     }
+
+    /// See [`the_real_platform_is_asked_for_real_and_lets_go_again`]: the two
+    /// platforms whose call depends on nothing that can be absent.
+    #[cfg(any(target_os = "macos", windows))]
+    fn assert_granted(granted: bool) {
+        assert!(
+            granted,
+            "this platform's inhibit depends on no daemon, bus or session, so a \
+             refusal here is a defect in the call rather than the machine"
+        );
+    }
+
+    /// Linux's needs a system bus, which a container legitimately may not have.
+    #[cfg(not(any(target_os = "macos", windows)))]
+    fn assert_granted(_granted: bool) {}
 }
