@@ -248,3 +248,42 @@ libc = "0.2"
 [target.'cfg(not(windows))'.dev-dependencies]
 tauri = { version = "2", features = ["test"] }
 
+
+# PRD #802's sleep work: the Linux half of `voice/wake.rs` — one
+# `org.freedesktop.login1.Manager.Inhibit("idle", …, "block")` call on the
+# system bus, whose reply is the file descriptor that IS the inhibit.
+#
+# NOT A NEW DEPENDENCY in any sense that costs a build second or a lockfile
+# entry: `keyring`'s `zbus-secret-service-keyring-store` backend — the one that
+# is already selected on Linux by the `keyring = "4"` entry above — pulls
+# exactly this `zbus` in, and the lockfile carries one of it. Default features,
+# which is `async-io` + `blocking-api`, is what that backend already resolves,
+# so declaring it here adds no feature either. Declaring it at all is the
+# discipline the `tokio` and `getrandom` entries above state: a change over
+# there cannot silently take this crate's sleep inhibit out.
+#
+# `zbus::blocking` rather than the async API because every call site is already
+# on a blocking thread — opening the audio device and asking the machine to
+# stay awake happen in the same `spawn_blocking` closure — and an async D-Bus
+# connection would need a runtime of its own driven from there anyway.
+#
+# Target-gated to Linux because that is where logind is. macOS and Windows get
+# hand-written FFI to a framework and a DLL their target already links (see
+# `voice/wake.rs`), so neither needs a crate, and this one is never compiled
+# for them.
+[target.'cfg(target_os = "linux")'.dependencies]
+zbus = "5"
+
+# PRD #802's sleep work: the Windows half of `voice/wake.rs` —
+# `SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED)`, which is the
+# system-stays-awake request that leaves the display free to blank.
+#
+# NOT A NEW DEPENDENCY, same accounting as `zbus` above: the root package
+# declares `windows-sys = "0.61"` for its named pipes and Job Objects, this
+# crate already links the root package, `keyring`'s Windows backend resolves it
+# too, and the lockfile carries one 0.61. `Win32_System_Power` is the only
+# feature named here and it adds no crate — windows-sys features select which
+# of its own bindings are compiled, and the whole of `Win32_System_Power` is
+# three constants and one `link!`.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_System_Power"] }

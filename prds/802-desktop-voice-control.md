@@ -1071,3 +1071,60 @@ The density branch previously reported the duration and nothing else, which is w
 5. **A buffer that is uniform at speech level is refused**, and whether any real microphone produces one is unknown.
 
 The loop that produced this is the one to keep: his number, not our reasoning, is what falsified the constant.
+
+## 2026-09-20 — the machine falls asleep while you talk to it, and the fix hangs off the release the audit already built
+
+**The complaint, and why it is voice's rather than a general "keep awake" feature.** The owner's framing is the requirement: *"if it's controlled by voice, it would be silly that one needs to move a mouse every once in a while to keep it from going asleep."* Voice control generates **no input events**. Every idle timer the three platforms ship counts mouse movement and keystrokes; none of them counts a microphone. So the one state in which the user is demonstrably *not* idle is the one the operating system reads as *idle*, and it suspends mid-session. That is not a missing nicety — it is the platform's definition of "in use" disagreeing with this feature's.
+
+**Two narrower triggers were offered and the owner's reframing beat both.** *While the window is focused* keeps a machine awake because an app is in the foreground, which nobody asked for; *while agents are running* keeps it awake with nobody in the room. *While voice is on* is exactly the state that produces no events, it is **self-limiting**, it is **already visible** — the Voice button *is* the indicator — and it is under the user's deliberate control. There is no setting, because a preference for it would be a second control over the same state.
+
+### The property, and who holds it
+
+*Every path that releases the microphone also releases the inhibit.*
+
+The tempting arrangement is a convention — call the pairing helper, not the session — and `src/selection_capture.rs` exists in this repository precisely because conventions decay. So it is arranged **structurally** instead. `desktop/src-tauri/src/voice/hold.rs` introduces `VoiceHold`, which owns the `CaptureSession` and the `WakeLock` and keeps the session **private**. `lib.rs` therefore cannot spell `CaptureSession::cancel` at all: the only release it can reach is `VoiceHold::release`, and that one releases both. A teardown trigger that forgot the inhibit does not fail review; **it fails to compile.** The one thing privacy cannot stop — somebody adding a `pub fn cancel` passthrough inside `hold.rs` later — is guarded by a source scan in that module's own tests, in the shape `selection_capture.rs` established.
+
+That matters more for this resource than for the device. The OS shows an open microphone and shows nothing at all for a sleep inhibit, so a stuck one is a laptop that never sleeps again with nothing anywhere to explain why, and the user's remedy is a reboot.
+
+### The two device releases that deliberately KEEP it
+
+`VoiceHold::stop` and `VoiceHold::cap_reached` close the device and leave the inhibit alone, **and the task's own phrasing had to be narrowed to say so.** Voice control is a *cycle*, not one long recording: start → speak → stop → transcribe → resolve → start. The microphone is shut for the whole transcribe-and-resolve leg, which this PRD measured at over a second per utterance. An inhibit that tracked the *device* would therefore lapse in the gap between every pair of sentences — roughly a fifth to a third of the duty cycle for rapid commands — and an idle timer coming due in one of those gaps sleeps the machine mid-session, which is the entire defect this was built to fix. So the inhibit spans the session and the device does not.
+
+The bound is still tight, because the inhibit's lifetime is *contained* by the session's: `VoiceHold::start` is the only thing that takes one, so a process that never opened a microphone can never hold one. One residual case is named rather than left to be discovered — a `start` the session refuses while a recording is already running leaves the inhibit held with the panel reading `Voice off`. That is the **same** state the device is in, by construction, which is the point of pairing them, and the surface already has a name and a remedy for it (`unreleased`, and the mount reconcile).
+
+### The three mechanisms, and what a kill does to each
+
+| platform | call | on process death |
+| --- | --- | --- |
+| Linux | `org.freedesktop.login1.Manager.Inhibit("idle", …, "block")` over D-Bus, via `zbus::blocking` | the **kernel** closes the returned fd and logind drops the inhibitor on EOF |
+| macOS | `IOPMAssertionCreateWithName(kIOPMAssertPreventUserIdleSystemSleep, …)` | **powerd** releases the task's assertions |
+| Windows | `SetThreadExecutionState(ES_CONTINUOUS \| ES_SYSTEM_REQUIRED)` on a **dedicated thread** | the **kernel** clears the per-thread request when the thread exits |
+
+All three are process-scoped, which is the property they were chosen for: `WakeLock::release` makes the release *prompt*, not *certain* — nothing here has to run for a crashed app to stop keeping a machine awake.
+
+**Sleep, not the display**, on all three: each is the system-idle request and each leaves the screen free to blank. On Linux that is also why `what=idle` rather than `what=sleep` — `sleep` blocks the user's own explicit suspend and needs a privileged polkit action, while `idle` simply denies the false premise the automatic suspend was drawn from.
+
+**Windows needs its own thread and it is not ceremony.** `SetThreadExecutionState` sets state on the *calling* thread and the system clears it when that thread exits, so making the call from `spawn_blocking` — where every other platform call in this feature runs — would lapse silently the next time the pool retired an idle worker. The failure mode is a machine that sleeps anyway with everything in the app still reporting *held*.
+
+### No new dependency, verified rather than assumed
+
+`zbus` is already in the graph through `keyring`'s `zbus-secret-service-keyring-store` backend and `windows-sys` through the root package's named pipes; both are declared target-gated on the desktop crate under the accounting the `tokio` and `getrandom` entries already use. macOS is **four hand-written `extern` declarations** against CoreFoundation and IOKit, frameworks the target already links: `objc2-io-kit` is not in the lockfile, so a crate would have been a new tree for four lines. The measured result is that `Cargo.lock`'s only change is **two dependency edges on the desktop package and no new crate** — `git diff Cargo.lock` is six lines.
+
+### Failure is silent and non-fatal
+
+A headless box, a container with no D-Bus, a policy that says no: `WakeLock::hold` swallows the refusal into one log line and returns, and voice control works exactly as it did. The log is **latched to once per process**, because `hold` runs at the top of every utterance and an unlatched line would be one per sentence spoken; the *attempt* is not latched, since a refusal can be transient and a retry costs a few milliseconds on a path already opening an audio device. `VoiceHold::awake_held` then reports `false` — deliberately the answer to *is the machine being held* rather than to *did we ask*. There is no sentence for the user because there is no action they could take from inside the app.
+
+### What was verified, and by what
+
+- **The Linux mechanism end to end, on the dev box.** Held, and `systemd-inhibit --list` showed `dot-agent-deck  1000 vfarcic  <pid>  dot_agent_deck_  idle  Voice control is on  block`; released, and it was gone.
+- **The crash claim, measured rather than believed.** A parked test process holding the inhibit was `kill -9`'d, and the entry left logind's list without anything of ours running. The fd mechanism is what makes that true.
+- **The Windows arm is genuinely type-checked**, by the repository's own methodology: an `E0308` injected into the `execution_state` module was caught by `scripts/windows-cross-check.sh` and the clean run reported nothing.
+- **The macOS arm was type-checked and clippy-linted for `aarch64-apple-darwin`** by extracting the module into a throwaway crate and running the rustup toolchain against that target — the desktop crate itself will not cross-check to Apple here, because `objc2-exception-helper` and `aws-lc-sys` need a working C cross-compile that the Windows script's shims do not cover. That proves the declarations compile and lint. It proves **nothing** about linking or about powerd honouring the assertion.
+- **Eighteen tests**, over a stub inhibitor: acquire/release, idempotence in both directions, one inhibit per session across three utterance cycles, the cap keeping it, a refused acquisition leaving voice fully working, a failed device open holding nothing, `Drop` releasing what was held, the app-exit teardown, and the single teardown call releasing both.
+
+### What remains UNVERIFIED
+
+1. **macOS and Windows have been RUN by nobody.** No tier in this repository runs a GUI app on either, so those two arms are compiled and reviewed and no more. `docs/develop/desktop-gui.md`'s manual walk gains step 7a — `pmset -g assertions` and `powercfg /requests` — and on those platforms it is not the best check available, it is the only one that has ever been run.
+2. **Linux desktops that make their own idle decisions.** A power manager that never consults logind's inhibitors will suspend anyway; the acquisition still succeeds, so a refusal is not the signal for it. Covering those means a second desktop-specific call (`org.gnome.SessionManager.Inhibit` with the suspend flag, and a KDE equivalent), which is worth adding against a real report rather than guessing at now.
+3. **Nothing here has watched a machine fail to sleep.** The Linux verification is that logind accepted and dropped the inhibitor, which is the mechanism's own contract — not a timer left to run down.
+4. **The one test that touches the real platform passes on either answer**, on purpose: it runs on developer boxes that grant the inhibit and CI containers that refuse it, so asserting either way would be a test of the machine. What it catches is a panic, an abort, a hang or a faulting release.

@@ -42,6 +42,7 @@
 
 pub mod capture;
 pub mod dictation;
+pub mod hold;
 pub mod http;
 pub mod openai;
 pub mod outcome;
@@ -51,6 +52,7 @@ pub mod resolver;
 pub mod schema;
 pub mod table;
 pub mod transcribe;
+pub mod wake;
 
 use std::fmt;
 
@@ -71,6 +73,7 @@ pub use capture::{
     SILENCE_HOLD, SILENCE_RMS, SPEECH_MARGIN, SPEECH_WINDOW, SpeechMeasure, StubSource,
     TARGET_SAMPLE_RATE, Vad,
 };
+pub use hold::VoiceHold;
 pub use outcome::{ResolvedParam, VoiceOutcome, VoiceResult, handle_utterance};
 pub use remote::{Protocol, REMOTE_TIMEOUT, RemoteResolver};
 pub use resolver::{
@@ -83,6 +86,10 @@ pub use table::{CommandRow, CommandTable, NO_MATCH_ACTION, ParamKind, ParamSpec,
 pub use transcribe::{
     HttpTranscriber, StubTranscriber, TRANSCRIBE_TIMEOUT, Transcriber, TranscriptionError,
     TranscriptionOutcome, VoiceTranscription, handle_audio, transcriber_for, unreachable_detail,
+};
+pub use wake::{
+    SleepInhibit, SleepInhibitor, StubInhibitor, WAKE_WHO, WAKE_WHY, WakeCounts, WakeLock,
+    platform_inhibitor,
 };
 
 /// What the user said, as text — from the microphone through the `Transcriber`

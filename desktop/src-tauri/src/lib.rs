@@ -1626,12 +1626,19 @@ fn report_secret_error(error: SecretError) -> String {
 /// `…_forget` remain the whole credential surface, and `load` is still
 /// deliberately absent.
 pub(crate) struct VoiceState {
-    /// One session per process: one microphone, one utterance at a time.
+    /// One session per process: one microphone, one utterance at a time — and,
+    /// since PRD #802's sleep work, the machine held awake beside it.
     ///
-    /// An `Arc` because the cap timer is a spawned task that outlives the
-    /// command that started it, and because `AudioSource::start` blocks and so
-    /// runs on a blocking thread.
-    session: Arc<voice::CaptureSession>,
+    /// A [`voice::VoiceHold`] rather than the session on its own, and the
+    /// grouping is load-bearing rather than tidiness: it owns both resources
+    /// voice holds on the user's machine and is the only thing that can end
+    /// either. Its module docs carry the property and how the compiler holds
+    /// it.
+    ///
+    /// Cheap to clone — both halves are `Arc`s — which is what the cap timer
+    /// (a spawned task outliving the command that started it) and every
+    /// `spawn_blocking` below need.
+    hold: voice::VoiceHold,
 }
 
 impl Default for VoiceState {
@@ -1640,10 +1647,9 @@ impl Default for VoiceState {
             // Constructs no host and opens no device — `cpal` is not touched
             // until a `start`. An app on a machine with no audio server starts
             // normally and finds out at the first press, which is where the
-            // sentence for it already is.
-            session: Arc::new(voice::CaptureSession::new(Arc::new(
-                voice::CpalSource::new(),
-            ))),
+            // sentence for it already is. The sleep inhibit is the same: the
+            // platform is not asked for anything until voice is switched on.
+            hold: voice::VoiceHold::new(Arc::new(voice::CpalSource::new())),
         }
     }
 }
@@ -1708,9 +1714,9 @@ fn voice_speech_settings() -> crate::settings::TranscriptionSettings {
         .transcription
 }
 
-fn voice_status(session: &voice::CaptureSession) -> VoiceStatus {
+fn voice_status(hold: &voice::VoiceHold) -> VoiceStatus {
     VoiceStatus {
-        capture: session.status(),
+        capture: hold.status(),
         // See the field's doc comment: no settings document can turn the stage
         // off any more, and the not-set-up case is reported at the moment it
         // bites rather than as a permanent state of the app.
@@ -1737,14 +1743,19 @@ async fn desktop_voice_start(
     voice_state: State<'_, VoiceState>,
 ) -> Result<VoiceStatus, String> {
     ensure_main_webview(&webview)?;
-    let session = Arc::clone(&voice_state.session);
+    let hold = voice_state.hold.clone();
 
     // Opening an audio device is a round trip to the OS and can prompt, so it
     // goes through `spawn_blocking` rather than sitting on the async runtime
     // every other command shares — the same treatment a keychain call gets.
+    //
+    // PRD #802's sleep work rides in the same closure for the same reason:
+    // [`voice::VoiceHold::start`] asks the platform to keep the machine awake
+    // after the device opens, which on Linux is a D-Bus round trip. Both are
+    // blocking calls to the operating system, so both belong off the runtime.
     let started = {
-        let session = Arc::clone(&session);
-        tauri::async_runtime::spawn_blocking(move || session.start())
+        let hold = hold.clone();
+        tauri::async_runtime::spawn_blocking(move || hold.start())
             .await
             .map_err(|error| safe_message(format!("the microphone call failed: {error}")))?
     };
@@ -1759,10 +1770,10 @@ async fn desktop_voice_start(
         tokio::time::sleep(voice::MAX_UTTERANCE).await;
         // Blocking for the reason the open above is: releasing the device
         // joins its thread, which is as slow as the platform's teardown.
-        let _ = tauri::async_runtime::spawn_blocking(move || session.cap_reached(ticket)).await;
+        let _ = tauri::async_runtime::spawn_blocking(move || hold.cap_reached(ticket)).await;
     });
 
-    Ok(voice_status(&voice_state.session))
+    Ok(voice_status(&voice_state.hold))
 }
 
 /// Close the microphone and transcribe what it heard. Recording →
@@ -1776,8 +1787,8 @@ async fn desktop_voice_stop(
     // Blocking, like the open in `desktop_voice_start`: closing the device
     // joins its thread, and a driver that is slow to let go would otherwise
     // park a runtime worker for as long as it takes.
-    let session = Arc::clone(&voice_state.session);
-    let audio = tauri::async_runtime::spawn_blocking(move || session.stop())
+    let hold = voice_state.hold.clone();
+    let audio = tauri::async_runtime::spawn_blocking(move || hold.stop())
         .await
         .map_err(|error| safe_message(format!("the microphone call failed: {error}")))?
         .map_err(report_capture_error)?;
@@ -1786,7 +1797,7 @@ async fn desktop_voice_stop(
         Arc::new(KeychainSecretStore::new()),
     );
     let result = voice::handle_audio(transcriber.as_ref(), &audio).await;
-    voice_state.session.settle(result.outcome.is_heard());
+    voice_state.hold.settle(result.outcome.is_heard());
     Ok(result)
 }
 
@@ -1797,7 +1808,7 @@ async fn desktop_voice_status(
     voice_state: State<'_, VoiceState>,
 ) -> Result<VoiceStatus, String> {
     ensure_main_webview(&webview)?;
-    Ok(voice_status(&voice_state.session))
+    Ok(voice_status(&voice_state.hold))
 }
 
 /// Abandon the recording without transcribing it — a closed panel, an escape
@@ -1814,11 +1825,16 @@ async fn desktop_voice_cancel(
     // Blocking for `desktop_voice_stop`'s reason — a cancel releases the same
     // device, and a closing panel is exactly when several of these arrive at
     // once.
-    let session = Arc::clone(&voice_state.session);
-    tauri::async_runtime::spawn_blocking(move || session.cancel())
+    //
+    // `release` rather than a bare cancel, and it is the ONLY spelling
+    // available: `VoiceHold` keeps the session private precisely so this call
+    // cannot close the microphone without also letting the machine sleep. This
+    // is the press that turns voice off, so it is the one that must.
+    let hold = voice_state.hold.clone();
+    tauri::async_runtime::spawn_blocking(move || hold.release())
         .await
         .map_err(|error| safe_message(format!("the microphone call failed: {error}")))?;
-    Ok(voice_status(&voice_state.session))
+    Ok(voice_status(&voice_state.hold))
 }
 
 /// The longest utterance this build will resolve, in bytes.
@@ -2581,7 +2597,8 @@ fn window_focus(event: &tauri::WindowEvent) -> Option<bool> {
     }
 }
 
-/// PRD #802's audit blocker: release the microphone.
+/// PRD #802's audit blocker: release the microphone — and, since the sleep
+/// work, the machine with it.
 ///
 /// # Why this is Rust's job and not the panel's
 ///
@@ -2602,17 +2619,32 @@ fn window_focus(event: &tauri::WindowEvent) -> Option<bool> {
 /// nothing able to reach it, and every later start refused because
 /// `accepts_start` takes neither `Recording` nor `Transcribing`.
 ///
+/// # It releases the sleep inhibit too, and NOT because this function
+/// remembers to
+///
+/// Voice holds a second invisible resource: a sleep inhibit, taken so a machine
+/// being driven by speech — which generates no input events — is not suspended
+/// by its own idle timer. It leaks the same ways the device does and costs more
+/// when it leaks, since a stuck one keeps a laptop awake indefinitely with
+/// nothing on screen to explain it.
+///
+/// So every teardown trigger below releases both. What makes that true is not
+/// this function and not a convention at the call sites: [`voice::VoiceHold`]
+/// keeps the capture session **private**, so `release` is the only cancel this
+/// file can spell, and `release` does both. See that module's docs.
+///
 /// # What it costs where it is called
 ///
-/// `cancel` is idempotent and never refused, so every call site can be
+/// `release` is idempotent and never refused, so every call site can be
 /// unconditional. It drops the stream, and a real `CpalStream::drop` joins the
 /// device thread — so this is as slow as the platform's own teardown, on
 /// whichever thread calls it. That is accepted deliberately at all three call
 /// sites: they are the window going away, the document being replaced and the
 /// app exiting, and a release that is *scheduled* rather than done is a release
-/// that may not happen before the process does.
+/// that may not happen before the process does. The inhibit goes first and is
+/// the cheap half — it cannot be what makes this slow.
 fn release_microphone(voice: &VoiceState) -> voice::CaptureStatus {
-    voice.session.cancel()
+    voice.hold.release()
 }
 
 /// Whether a window event means the webview holding the Voice button is gone.
@@ -2799,7 +2831,9 @@ pub fn run() {
 /// worth pinning is the release rather than the plumbing that calls it.
 ///
 /// **The microphone goes FIRST**, and the order is the point rather than
-/// housekeeping (PRD #802's audit blocker, teardown trigger 4). This runs on
+/// housekeeping (PRD #802's audit blocker, teardown trigger 4). The sleep
+/// inhibit goes with it, inside the same call — see [`release_microphone`].
+/// This runs on
 /// `ExitRequested` as well as `Exit`, and the two steps after it are the slow
 /// ones — a detach writes a frame over a transport that may be an `ssh` child
 /// on its way out, bounded at 250 ms *per session*, and the tunnels close after
@@ -2852,22 +2886,44 @@ mod tests {
         assert!(!window_ends_capture(&tauri::WindowEvent::Focused(false)));
     }
 
-    /// A [`VoiceState`] whose device is a stub delivering `seconds` of tone.
+    /// A [`VoiceState`] whose device is a stub delivering `seconds` of tone and
+    /// whose machine is a stub that grants every inhibit and counts them.
     ///
     /// The second value is the stub stream's own flag, set by its `Drop` — the
     /// only way to assert the DEVICE was released rather than merely that the
-    /// state machine says idle.
-    fn stub_voice_state(seconds: f64) -> (VoiceState, Arc<std::sync::atomic::AtomicBool>) {
+    /// state machine says idle. The third is the wake counters, which outlive
+    /// every hold made from them and are therefore the only way to assert the
+    /// machine was let go of rather than merely that nothing claims otherwise.
+    ///
+    /// **A stub inhibitor rather than the platform one**, and not only for
+    /// determinism: `cargo test-fast` runs this tier dozens of tests at a time
+    /// on a developer's own machine, and a test that took a real logind
+    /// inhibitor would be a test suite that keeps a laptop awake.
+    /// `voice::wake`'s own tests carry the one case that does touch the
+    /// platform.
+    fn stub_voice_state(
+        seconds: f64,
+    ) -> (
+        VoiceState,
+        Arc<std::sync::atomic::AtomicBool>,
+        Arc<voice::WakeCounts>,
+    ) {
         let source = voice::StubSource::tone(
             voice::AudioFormat::new(voice::TARGET_SAMPLE_RATE, 1),
             seconds,
         );
         let stopped = source.stopped();
+        let inhibitor = voice::StubInhibitor::new();
+        let counts = inhibitor.counts();
         (
             VoiceState {
-                session: Arc::new(voice::CaptureSession::new(Arc::new(source))),
+                hold: voice::VoiceHold::with_parts(
+                    Arc::new(voice::CaptureSession::new(Arc::new(source))),
+                    Arc::new(voice::WakeLock::new(Arc::new(inhibitor))),
+                ),
             },
             stopped,
+            counts,
         )
     }
 
@@ -2881,18 +2937,18 @@ mod tests {
     /// audio dropped on the app's own way out, with no webview involved at all.
     #[tokio::test]
     async fn app_exit_releases_the_microphone() {
-        let (voice_state, stopped) = stub_voice_state(1.0);
-        let (opened, _ticket) = voice_state.session.start().expect("the stub device opens");
+        let (voice_state, stopped, _counts) = stub_voice_state(1.0);
+        let (opened, _ticket) = voice_state.hold.start().expect("the stub device opens");
         assert_eq!(opened.state, voice::CaptureState::Recording);
         assert!(
-            voice_state.session.status().captured_ms > 0,
+            voice_state.hold.status().captured_ms > 0,
             "the stub delivered its tone, so there is audio to drop"
         );
         assert!(!stopped.load(Ordering::Relaxed), "the device is still open");
 
         release_on_exit(&DesktopState::default(), &voice_state).await;
 
-        let after = voice_state.session.status();
+        let after = voice_state.hold.status();
         assert_eq!(
             after.state,
             voice::CaptureState::Idle,
@@ -2917,9 +2973,9 @@ mod tests {
     /// captured speech in the session with nothing able to reach it.
     #[tokio::test]
     async fn app_exit_drops_the_audio_a_capped_recording_kept() {
-        let (voice_state, _stopped) = stub_voice_state(2.0);
-        let (_, ticket) = voice_state.session.start().expect("the stub device opens");
-        let capped = voice_state.session.cap_reached(ticket);
+        let (voice_state, _stopped, _counts) = stub_voice_state(2.0);
+        let (_, ticket) = voice_state.hold.start().expect("the stub device opens");
+        let capped = voice_state.hold.cap_reached(ticket);
         assert!(capped.capped, "the cap released the device");
         assert_eq!(
             capped.state,
@@ -2930,11 +2986,112 @@ mod tests {
 
         release_on_exit(&DesktopState::default(), &voice_state).await;
 
-        let after = voice_state.session.status();
+        let after = voice_state.hold.status();
         assert_eq!(after.state, voice::CaptureState::Idle);
         assert_eq!(
             after.captured_ms, 0,
             "app exit must drop the audio the cap kept"
+        );
+    }
+
+    /// PRD #802's sleep work: the app exiting lets the machine sleep again.
+    ///
+    /// The same blocker as the microphone's, one resource over. An inhibit is
+    /// invisible — there is no indicator for it the way the OS shows a live
+    /// microphone — so a stuck one is a laptop that never sleeps again with
+    /// nothing anywhere to explain why, and the user's remedy is a reboot.
+    ///
+    /// This is teardown trigger 4. The other three — `CloseRequested` and
+    /// `Destroyed`, the document being replaced, and the web-content process
+    /// dying on Apple's platforms — reach the same
+    /// [`release_microphone`], which is what
+    /// [`the_only_teardown_call_releases_both`] pins from the other side.
+    #[tokio::test]
+    async fn app_exit_lets_the_machine_sleep_again() {
+        let (voice_state, _stopped, counts) = stub_voice_state(1.0);
+        voice_state.hold.start().expect("the stub device opens");
+        assert!(
+            voice_state.hold.awake_held(),
+            "voice on holds the machine awake"
+        );
+        assert_eq!(counts.outstanding(), 1);
+
+        release_on_exit(&DesktopState::default(), &voice_state).await;
+
+        assert!(
+            !voice_state.hold.awake_held(),
+            "app exit must let the machine sleep"
+        );
+        assert_eq!(
+            counts.outstanding(),
+            0,
+            "and the inhibit must be given back, not merely forgotten"
+        );
+    }
+
+    /// The other three teardown triggers, at the one function they share.
+    ///
+    /// `on_window_event`, `on_page_load` and `on_web_content_process_terminate`
+    /// each call [`release_microphone`] and nothing else, and none of the three
+    /// can be driven from a unit test — they need a built `tauri::App` and a
+    /// real event loop. So what is pinned here is the thing they all depend on:
+    /// that ONE call releases both the device and the machine.
+    ///
+    /// The property that no *fourth* path could release the device without the
+    /// inhibit is not this test's to make, and it is not made by review either
+    /// — `voice::hold`'s privacy makes `CaptureSession::cancel` unreachable
+    /// from this file, so `release` is the only cancel that compiles here.
+    #[test]
+    fn the_only_teardown_call_releases_both() {
+        let (voice_state, stopped, counts) = stub_voice_state(1.0);
+        voice_state.hold.start().expect("the stub device opens");
+        assert!(voice_state.hold.awake_held());
+
+        let after = release_microphone(&voice_state);
+
+        assert_eq!(after.state, voice::CaptureState::Idle);
+        assert!(stopped.load(Ordering::Relaxed), "the device is closed");
+        assert!(!voice_state.hold.awake_held(), "the machine may sleep");
+        assert_eq!(counts.outstanding(), 0);
+    }
+
+    /// A machine that refuses the inhibit gets voice control anyway.
+    ///
+    /// The failure policy, at the level the app sees it: no error crosses the
+    /// IPC boundary, no state is left half-set, and the recording is real. The
+    /// only observable difference is that `awake_held` says `false` — which is
+    /// the honest answer and is reported to nobody, because there is nothing a
+    /// user could do about it from inside this app.
+    #[test]
+    fn a_refused_inhibit_does_not_take_voice_with_it() {
+        let source =
+            voice::StubSource::tone(voice::AudioFormat::new(voice::TARGET_SAMPLE_RATE, 1), 1.0);
+        let voice_state = VoiceState {
+            hold: voice::VoiceHold::with_parts(
+                Arc::new(voice::CaptureSession::new(Arc::new(source))),
+                Arc::new(voice::WakeLock::new(Arc::new(
+                    voice::StubInhibitor::refusing(),
+                ))),
+            ),
+        };
+
+        let (opened, _ticket) = voice_state
+            .hold
+            .start()
+            .expect("a machine that will not stay awake still has a microphone");
+
+        assert_eq!(opened.state, voice::CaptureState::Recording);
+        assert!(
+            voice_status(&voice_state.hold).capture.captured_ms > 0,
+            "the utterance is genuinely being captured"
+        );
+        assert!(!voice_state.hold.awake_held());
+
+        release_microphone(&voice_state);
+        assert_eq!(
+            voice_state.hold.status().state,
+            voice::CaptureState::Idle,
+            "and the ordinary teardown still runs"
         );
     }
 
