@@ -3581,6 +3581,200 @@ mod hook_ingestion_tests {
         let _ = fixture.handle.await;
     }
 
+    // ── Issue #1159: why the two tests below no longer race a 2-second window ──
+    //
+    // Both of them need the shell-activity monitor to REPORT a real detached
+    // child. They used to type a `sleep 2` into the pane and assert the status
+    // inside 3s (and the broadcast inside 5s), which made the stimulus a
+    // two-second window the signal had to be caught inside.
+    //
+    // That window is shorter than the silence this monitor is DESIGNED to
+    // produce. `SAMPLE_TIMEOUT` lets one tick wait 2s for a sample;
+    // `MAX_TABLE_AGE` discards an answer older than 3s; `SamplingHealth` then
+    // holds the next sample off for up to `BACKOFF_MAX` = 8s. So a SINGLE sample
+    // that overruns its deadline — the outcome
+    // `shell_activity_monitor_leaves_statuses_alone_when_the_sample_times_out`
+    // exists to pin as CORRECT — swallowed the whole window, and both tests then
+    // failed at their full bound having seen no busy edge at all.
+    //
+    // Measured by injecting exactly that one wedge into the real sampler (a
+    // first sample delayed 3.5s, nothing else changed): the first test failed at
+    // 3.10s with the status still `Idle` and one sample started, the second at
+    // 5.18s with no `ShellBusy` — reproducing #1159's reported `3.076s` and
+    // `5.089s` from one cause. That shared cause is also the answer to why they
+    // never failed SEPARATELY: one degraded sampling episode outlasts both
+    // windows at once, and the five siblings in this family inject their own
+    // sampler, so a wedged `ps` cannot reach them.
+    //
+    // So the child now lives until the test KILLS it. The rising edge waits on a
+    // condition that stays true, and the falling edge is made true by
+    // construction rather than by a `sleep` expiring. Same shape as
+    // `shell_activity_004`'s ready-marker gate (PR #390) and as #1148's
+    // `delegate_034` fix: make the state real, do not widen the wait. Nothing
+    // about what these tests assert changed — only whether the thing asserted is
+    // still there to be observed, and the third test below —
+    // `..._reports_a_real_detached_child_after_an_unusable_sample` — pins that
+    // property directly, with the wedge injected rather than waited for.
+
+    /// Issue #1159: the ceiling on how long these tests wait for the
+    /// shell-activity signal to report a detached child that is STILL RUNNING.
+    ///
+    /// **Not a window the child has to be caught inside** — the child outlives
+    /// the wait — so this bounds "the signal never arrived at all" and is paid
+    /// only on the failure path. Derived from the monitor's own constants rather
+    /// than picked: one degraded sampling episode can legitimately swallow
+    /// `MAX_TABLE_AGE` (3s) and then a `SamplingHealth::BACKOFF_MAX` hold-off
+    /// (8s), so ~11s of silence is correct behaviour and any smaller bound
+    /// asserts against the product's own contract. 30s is ~2.7x that and half of
+    /// nextest's 60s slow-timeout period, so a genuinely dead signal still
+    /// reports inside one slow window with its diagnostics intact.
+    const SHELL_ACTIVITY_SIGNAL_BUDGET: Duration = Duration::from_secs(30);
+
+    /// Issue #1159: the detached child's backstop lifetime, for the one path
+    /// that skips [`DetachedPaneChild::end`] — the test process being `SIGKILL`ed.
+    ///
+    /// Every ordinary path ends the child explicitly, including a panic, which
+    /// runs `Drop`. The only wait that needs the child ALIVE is the rising edge,
+    /// bounded by one [`SHELL_ACTIVITY_SIGNAL_BUDGET`] — a child that expired
+    /// mid-wait would resurrect exactly the race this replaces — so 120s leaves
+    /// 4x headroom over the longest such wait, while staying short enough that a
+    /// `SIGKILL`ed run's orphan is gone long before anyone looks for it.
+    const DETACHED_CHILD_BACKSTOP_SECS: &str = "120";
+
+    /// Issue #1159: a `setsid`-detached descendant of a pane's shell, typed into
+    /// the pane's own PTY, which lives until this test ends it.
+    ///
+    /// The topology is PRD #386's and unchanged: an interactive `/bin/sh` has job
+    /// control on and makes each foreground job its own process-group leader, and
+    /// `setsid(2)` fails with `EPERM` for a process that already leads a group —
+    /// so `python3` must detach a *child*, not itself — and the parent's
+    /// `waitpid` keeps the pane occupied for the child's whole life. What #1159
+    /// changed is the child's LIFETIME and the fact that it reports its pid back,
+    /// so the test can end it on purpose instead of waiting out a `sleep`.
+    ///
+    /// The pid arrives through a file written with `os.write` on a raw descriptor
+    /// — unbuffered, so the digits are in the file before the next statement runs
+    /// — and then `os.rename`d into place, so a reader cannot observe the final
+    /// path at `open(2)` before it has content. That TOCTOU is not hypothetical
+    /// in this area: it is the unrelated defect #1159's own report separates
+    /// itself from (`an_unwrapped_agent_spawn_carries_a_lifetime_tag`, #1104).
+    struct DetachedPaneChild {
+        /// The detached child's pid, as its own parent reported it.
+        pid: i32,
+        /// Whether [`Self::end`] has already run, so `Drop` after an explicit
+        /// end sends nothing — one `SIGKILL` per child rather than two.
+        ended: bool,
+        /// Keeps the pid file's directory alive for this value's lifetime.
+        _dir: tempfile::TempDir,
+    }
+
+    impl DetachedPaneChild {
+        /// Type the stimulus into `agent_id`'s PTY and return once the child
+        /// exists and has reported its pid.
+        async fn launch(registry: &Arc<AgentPtyRegistry>, agent_id: &str) -> Self {
+            use std::io::Write as _;
+
+            let dir = tempfile::tempdir().expect("temp dir for the detached child's pid file");
+            let partial = dir.path().join("child.pid.partial");
+            let final_path = dir.path().join("child.pid");
+            let command = format!(
+                "python3 -c \"import os; pid = os.fork(); \
+                 (os.setsid(), os.execv('/bin/sleep', ['sleep', '{backstop}'])) if pid == 0 \
+                 else (os.write(os.open('{partial}', os.O_WRONLY | os.O_CREAT), \
+                 str(pid).encode()), os.rename('{partial}', '{final_path}'), \
+                 os.waitpid(pid, 0))\"\n",
+                backstop = DETACHED_CHILD_BACKSTOP_SECS,
+                partial = partial.display(),
+                final_path = final_path.display(),
+            );
+            {
+                let writer = registry
+                    .agent_writer(agent_id)
+                    .expect("spawned agent must be in the registry");
+                let mut w = writer.lock().await;
+                w.write_all(command.as_bytes())
+                    .expect("write detached-child command");
+                w.flush().expect("flush");
+            }
+
+            // Waiting for the pid file SEPARATELY from the status/broadcast wait
+            // is what makes a failure here legible, and #1159 was filed with no
+            // captured message at all. A shell that never ran the command fails
+            // on THIS assertion, naming the PTY's own output, rather than
+            // consuming the signal's budget and reading like a monitor defect.
+            let deadline = tokio::time::Instant::now() + SHELL_ACTIVITY_SIGNAL_BUDGET;
+            loop {
+                if let Some(pid) = std::fs::read_to_string(&final_path)
+                    .ok()
+                    .and_then(|text| text.trim().parse::<i32>().ok())
+                {
+                    return Self {
+                        pid,
+                        ended: false,
+                        _dir: dir,
+                    };
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the pane's shell never launched the detached child within {:?} — nothing \
+                     readable at {}. The pane's PTY saw: {:?}",
+                    SHELL_ACTIVITY_SIGNAL_BUDGET,
+                    final_path.display(),
+                    registry
+                        .snapshot(agent_id)
+                        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned()),
+                );
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        }
+
+        /// End the child, so a pane with no out-of-session descendant is true by
+        /// construction rather than by a `sleep` having expired.
+        ///
+        /// Goes through the product's own [`crate::platform::proc::force_kill_pid`]
+        /// rather than `libc::kill` directly: it refuses pid 0 and anything that
+        /// would resolve to a non-positive `pid_t`, so this cannot broadcast to a
+        /// process group. The error is discarded because `ESRCH` on a pid that has
+        /// already gone is the expected reading, not a fault.
+        ///
+        /// Aimed at a pid this test's own stimulus created, and reached while that
+        /// pid is still the child's: every wait that runs before this one is
+        /// bounded by [`SHELL_ACTIVITY_SIGNAL_BUDGET`] and the child sleeps for 4x
+        /// that, so it has not exited and its pid has not been reissued. Same
+        /// shape as `shell_activity_004`'s `KillOnDrop`.
+        fn end(&mut self) {
+            if self.ended {
+                return;
+            }
+            self.ended = true;
+            let _ = crate::platform::proc::force_kill_pid(self.pid as u32);
+        }
+    }
+
+    impl Drop for DetachedPaneChild {
+        fn drop(&mut self) {
+            self.end();
+        }
+    }
+
+    /// Issue #1159: wait until `session_id`'s card reports `want`, bounded by
+    /// [`SHELL_ACTIVITY_SIGNAL_BUDGET`], returning the last status observed so
+    /// the caller's own `assert_eq!` prints it.
+    async fn wait_for_session_status(
+        state: &SharedState,
+        session_id: &str,
+        want: crate::state::SessionStatus,
+    ) -> crate::state::SessionStatus {
+        let deadline = tokio::time::Instant::now() + SHELL_ACTIVITY_SIGNAL_BUDGET;
+        loop {
+            let current = state.read().await.sessions[session_id].status.clone();
+            if current == want || tokio::time::Instant::now() >= deadline {
+                return current;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
     /// Scenario: PRD #370's whole point, end to end, **restimulated for PRD
     /// #386 M3**. Spawn a real `/bin/sh` pane, seed it a known session the way
     /// a real hook `SessionStart` would (so `AppState::pane_hook_session_id`
@@ -3603,10 +3797,16 @@ mod hook_ingestion_tests {
     /// the *stimulus* moved to the topology a real Claude Bash-tool call has;
     /// what this test proves — pane → monitor → synthesized event → `AppState`
     /// status — is exactly what it always proved.
+    ///
+    /// **What #1159 changed here, and why the pipeline assertions are again
+    /// unchanged.** The detached child used to be a `sleep 2` and the falling
+    /// edge used to be it expiring, which made the rising edge a 2-second window
+    /// the signal had to be caught inside — shorter than the silence this monitor
+    /// is designed to produce, so one slow sample failed the test. Now the child
+    /// outlives the wait and the test KILLS it to drive the falling edge. See the
+    /// block comment above [`SHELL_ACTIVITY_SIGNAL_BUDGET`] for the measurement.
     #[tokio::test]
     async fn shell_activity_monitor_reflects_a_real_detached_shell_command() {
-        use std::io::Write as _;
-
         let registry = Arc::new(AgentPtyRegistry::new());
         let agent_id = registry
             .spawn_agent(SpawnOptions {
@@ -3654,42 +3854,17 @@ mod hook_ingestion_tests {
         });
 
         // Type the command directly into the pane's PTY — no agent, no hook,
-        // nothing but the raw shell. It `fork`s, `setsid`s the child (detaching
-        // it from the pane's controlling terminal into a session of its own,
-        // exactly as Claude Code's Bash-tool child does) and `execv`s it into a
-        // 2-second `sleep`, then waits for it. The `fork` matters: an
-        // interactive `/bin/sh` has job control on and makes each foreground
-        // job its own process-group leader, and `setsid(2)` fails with EPERM
-        // for a process that already leads a group — so python must detach a
-        // *child*, not itself. The parent's `waitpid` keeps the pane occupied
-        // for the child's whole life, and the child exiting on its own is what
-        // drives the falling edge below.
-        {
-            let writer = registry
-                .agent_writer(&agent_id)
-                .expect("spawned agent must be in the registry");
-            let mut w = writer.lock().await;
-            w.write_all(
-                b"python3 -c \"import os; pid = os.fork(); \
-                  (os.setsid(), os.execv('/bin/sleep', ['sleep', '2'])) if pid == 0 \
-                  else os.waitpid(pid, 0)\"\n",
-            )
-            .expect("write detached-child command");
-            w.flush().expect("flush");
-        }
+        // nothing but the raw shell. `DetachedPaneChild` carries the topology and
+        // why it is the one PRD #386's scan fires on; it returns once the child
+        // genuinely exists, so everything below is asserting about the MONITOR
+        // rather than about whether the shell got round to running anything.
+        let mut child = DetachedPaneChild::launch(&registry, &agent_id).await;
 
-        let status = |state: SharedState| async move {
-            state.read().await.sessions["sess-370"].status.clone()
-        };
-
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
-        let mut current = status(state.clone()).await;
-        while current != crate::state::SessionStatus::Working
-            && tokio::time::Instant::now() < deadline
-        {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            current = status(state.clone()).await;
-        }
+        // Rising edge. The child is still running and stays running until the
+        // `end()` below, so a sample the monitor legitimately discarded or held
+        // off is a slower answer here, never a missed one (issue #1159).
+        let current =
+            wait_for_session_status(&state, "sess-370", crate::state::SessionStatus::Working).await;
         assert_eq!(
             current,
             crate::state::SessionStatus::Working,
@@ -3697,13 +3872,12 @@ mod hook_ingestion_tests {
              child runs, with zero agent-emitted events involved"
         );
 
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(4);
-        let mut current = status(state.clone()).await;
-        while current != crate::state::SessionStatus::Idle && tokio::time::Instant::now() < deadline
-        {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            current = status(state.clone()).await;
-        }
+        // Falling edge, made real by construction: the child is ended here, so
+        // "the pane has no out-of-session descendant left" is a fact this test
+        // established rather than a `sleep` it hoped had expired in time.
+        child.end();
+        let current =
+            wait_for_session_status(&state, "sess-370", crate::state::SessionStatus::Idle).await;
         assert_eq!(
             current,
             crate::state::SessionStatus::Idle,
@@ -3731,10 +3905,13 @@ mod hook_ingestion_tests {
     /// `session_id` AND carry `agent_id: Some("agent-21")` resolved from the
     /// pane's card — an unstamped event cannot be remapped onto a reconnected
     /// TUI's hydrated card and mints a phantom session instead.
+    ///
+    /// **What #1159 changed here.** The detached child outlives the wait for the
+    /// broadcast instead of being a `sleep 2` the `ShellBusy` had to be caught
+    /// inside; the stamped-shape assertions are untouched. The block comment
+    /// above [`SHELL_ACTIVITY_SIGNAL_BUDGET`] has the measurement.
     #[tokio::test]
     async fn shell_activity_monitor_stamps_the_owning_agent_across_a_session_rollover() {
-        use std::io::Write as _;
-
         const PANE: &str = "pane-21";
         const AGENT: &str = "agent-21";
         const GEN1: &str = "sess-21-gen1";
@@ -3800,33 +3977,22 @@ mod hook_ingestion_tests {
 
         // The stimulus is the one PRD #386's descendant scan actually fires on:
         // `fork`, `setsid` the child into a POSIX session of its own (the
-        // topology a real Claude Bash-tool child has), `execv` it into a short
-        // `sleep`, and have the parent `waitpid` for it — see
-        // `shell_activity_monitor_reflects_a_real_detached_shell_command` above
-        // for the full rationale. A plain `sleep 2` typed into the pane's own
+        // topology a real Claude Bash-tool child has), `execv` it into a `sleep`,
+        // and have the parent `waitpid` for it — see `DetachedPaneChild` for the
+        // full rationale. A plain foreground `sleep` typed into the pane's own
         // PTY was busy under #370's `tcgetpgrp` body but is deliberately NOT
         // busy under #386's scan, so it would never produce the `ShellBusy`
-        // this test needs to inspect.
-        {
-            let writer = registry
-                .agent_writer(&spawned)
-                .expect("spawned agent must be in the registry");
-            let mut w = writer.lock().await;
-            w.write_all(
-                b"python3 -c \"import os; pid = os.fork(); \
-                  (os.setsid(), os.execv('/bin/sleep', ['sleep', '2'])) if pid == 0 \
-                  else os.waitpid(pid, 0)\"\n",
-            )
-            .expect("write detached-child command");
-            w.flush().expect("flush");
-        }
+        // this test needs to inspect. The child outlives the wait below, so the
+        // `ShellBusy` is an event this test waits for rather than one it has to
+        // be listening at the right two seconds to hear (issue #1159).
+        let _child = DetachedPaneChild::launch(&registry, &spawned).await;
 
         // Read broadcasts until the busy transition arrives (the monitor also
         // emits the pane's initial idle edge), asserting the stamped shape on
         // EVERY event it publishes — a single unstamped one is enough to mint
         // a phantom card on a reconnected TUI.
         let mut saw_busy = false;
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let deadline = tokio::time::Instant::now() + SHELL_ACTIVITY_SIGNAL_BUDGET;
         while !saw_busy && tokio::time::Instant::now() < deadline {
             let Ok(Ok(BroadcastMsg::Event(event))) =
                 tokio::time::timeout(Duration::from_millis(500), rx.recv()).await
@@ -3854,6 +4020,101 @@ mod hook_ingestion_tests {
             "the monitor must broadcast a ShellBusy while the detached child runs"
         );
 
+        monitor_handle.abort();
+        let _ = monitor_handle.await;
+        registry.shutdown_all();
+    }
+
+    /// Scenario: issue #1159's own mechanism, as a test rather than as a comment.
+    /// Spawn a real `/bin/sh` pane with a seeded hook session, run the real
+    /// monitor but wrap its real process-table sampler so the FIRST sample takes
+    /// 3.5s — long enough to overrun `SAMPLE_TIMEOUT`, and long enough that when
+    /// the retained future finally answers its table is past `MAX_TABLE_AGE` and
+    /// is correctly discarded, which then arms a `SamplingHealth` hold-off. Type
+    /// the same `setsid`-detached child the two tests above use. The session must
+    /// still reach `Working`: a degraded sampling episode may DELAY this signal
+    /// (that is `SamplingHealth`'s whole design) but must not lose it once the
+    /// machine answers again.
+    ///
+    /// This is the failing case #1159 was: with a child that expires after two
+    /// seconds, this exact injection reproduced both reported failures — 3.10s
+    /// with the status still `Idle`, and 5.18s with no `ShellBusy` — against the
+    /// reported 3.076s and 5.089s. The product was right both times, so the test
+    /// that survives it is the deliverable, and this one fails if the recovery
+    /// path it depends on ever stops working.
+    #[tokio::test]
+    async fn shell_activity_monitor_reports_a_real_detached_child_after_an_unusable_sample() {
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let agent_id = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("/bin/sh"),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), "pane-1159".to_string())],
+                agent_type: None,
+                ..SpawnOptions::default()
+            })
+            .expect("spawn shell agent");
+
+        let state: SharedState =
+            Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
+        let (event_tx, _rx) = broadcast::channel(EVENT_BROADCAST_CAPACITY);
+
+        state.write().await.apply_event(AgentEvent {
+            session_id: "sess-1159".to_string(),
+            agent_type: AgentType::ClaudeCode,
+            event_type: crate::event::EventType::SessionStart,
+            tool_name: None,
+            tool_detail: None,
+            cwd: None,
+            timestamp: chrono::Utc::now(),
+            user_prompt: None,
+            metadata: std::collections::HashMap::new(),
+            pane_id: Some("pane-1159".to_string()),
+            agent_id: None,
+            agent_version: None,
+            schema_version: None,
+            live_target: None,
+        });
+
+        // One wedged sample, then honest ones. The sampler is the REAL
+        // `process_table_async` — only its first answer is delayed — so what this
+        // test exercises after the wedge is the production classification path,
+        // not a fixture.
+        let samples = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let monitor_handle = tokio::spawn({
+            let registry = registry.clone();
+            let state = state.clone();
+            let event_tx = event_tx.clone();
+            let samples = samples.clone();
+            async move {
+                run_shell_activity_monitor_with(registry, state, event_tx, move |roots| {
+                    let roots = roots.to_vec();
+                    let nth = samples.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    async move {
+                        if nth == 0 {
+                            tokio::time::sleep(Duration::from_millis(3_500)).await;
+                        }
+                        crate::platform::proc::process_table_async(&roots).await
+                    }
+                })
+                .await
+            }
+        });
+
+        let mut child = DetachedPaneChild::launch(&registry, &agent_id).await;
+        let current =
+            wait_for_session_status(&state, "sess-1159", crate::state::SessionStatus::Working)
+                .await;
+        assert_eq!(
+            current,
+            crate::state::SessionStatus::Working,
+            "a sampling episode that overran SAMPLE_TIMEOUT and then blew \
+             MAX_TABLE_AGE may delay the shell-activity signal, but the monitor \
+             must still report a child that is STILL RUNNING once a usable sample \
+             lands — {} samples were started",
+            samples.load(std::sync::atomic::Ordering::SeqCst)
+        );
+
+        child.end();
         monitor_handle.abort();
         let _ = monitor_handle.await;
         registry.shutdown_all();
