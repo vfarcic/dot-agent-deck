@@ -262,13 +262,7 @@ async fn voice_phrase_fixtures_match_the_default_backend() {
     };
 
     let (endpoint, model) = api_preset();
-    let resolver = match api_resolver(endpoint, model, &key) {
-        Ok(resolver) => resolver,
-        Err(reason) => panic!(
-            "{REQUIRE_REAL_E2E_ENV} is set, so this real-agent test must RUN, not skip: \
-             this build\'s command preset is unusable: {reason}"
-        ),
-    };
+    let resolver = api_resolver(&key);
     eprintln!(
         "backend: {} | {endpoint} | {model}",
         resolver.backend_name()

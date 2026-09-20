@@ -1,5 +1,5 @@
-//! Where a model service is, and which model to ask it for — as two validating
-//! newtypes rather than two `String`s.
+//! Where a model service is, which model to ask it for, and how much answer to
+//! allow — as validating newtypes rather than as `String`s and a bare integer.
 //!
 //! PRD #802 made both voice stages user-selectable, which is the moment the
 //! endpoint and the model stop being `const`s this build picked and become
@@ -28,12 +28,20 @@
 //! drawn from [`MODEL_ID_CHARS`] plus alphanumerics — so no control byte, no
 //! whitespace, no non-ASCII byte, and nothing long enough to be a payload.
 //!
+//! [`TokenCeiling`] is an integer between [`MIN_TOKEN_CEILING`] and
+//! [`MAX_TOKEN_CEILING`], and it is the one of the three whose newtype is **not**
+//! about credentials at all: `u32` is already on `ALLOWED_FIELD_TYPES`, so a
+//! bare integer would have passed that guard and then happily held `0`. What
+//! the type buys is the range — a floor under which no answer can be written
+//! and a cap over which one utterance stops being a routing decision and starts
+//! being a bill.
+//!
 //! # A rejected value is an ERROR, not a fold
 //!
 //! The `[voice]` *token* enums fold an unrecognised value to their default
 //! (`VoiceToken::from_str_lossy`), because a newer build may name a backend this
 //! one has never heard of and losing the whole document over it is worse. These
-//! two deliberately do not, and the reason is not symmetry with
+//! three deliberately do not, and the reason is not symmetry with
 //! `crate::settings::EndpointId` — it is that **folding an endpoint is not a
 //! safe default**. Fold a refused `endpoint` to the preset and a user who wrote
 //! a URL pointing at their own machine has their voice uploaded to a hosted
@@ -378,6 +386,150 @@ impl<'de> Deserialize<'de> for ModelId {
     }
 }
 
+/// The smallest answer ceiling this build will accept.
+///
+/// A ceiling below the shortest answer the feature can produce is a setting
+/// whose only effect is permanent truncation, so the floor is drawn above the
+/// largest *complete* answer PRD #802 has measured: 58 completion tokens on the
+/// Anthropic dialect and 28 on the OpenAI one with reasoning suppressed. 64 is
+/// the next power of two above both. It is **not** a claim that 64 is enough
+/// for every model — a reasoning model that is not told to stop thinking will
+/// spend far more than that before it writes anything — only that nothing below
+/// it can ever work, which is the question a floor answers.
+pub const MIN_TOKEN_CEILING: u32 = 64;
+
+/// The largest answer ceiling this build will accept.
+///
+/// The value bounds what the provider will generate and therefore what one
+/// utterance can cost, so an unbounded field is a way to turn a routing
+/// decision into a runaway bill. The largest response measured for PRD #802 is
+/// **796 completion tokens** — `gpt-5-mini` at provider-default reasoning — so
+/// this is roughly forty times the worst observed case, which leaves room for a
+/// model that thinks harder than any measured here while keeping a typo three
+/// digits short of a surprise.
+pub const MAX_TOKEN_CEILING: u32 = 32_768;
+
+/// The ceiling one command request carries when the document says nothing.
+///
+/// **4096, and the number it replaced was 256** — a constant sized from the
+/// Anthropic preset's 33–58-token answers, which was correct for that model and
+/// wrong for the field it became. `max_completion_tokens` counts **reasoning**
+/// tokens as well as written ones, so any model that reasons without being told
+/// not to spends the whole ceiling before it emits a character and the reply
+/// comes back `finish_reason: "length"`. Measured on `gpt-5-mini` against the
+/// 24 phrase fixtures: at 256 the sweep scored **18/24**, and all six failures
+/// had spent exactly 256 completion tokens, every one of them reasoning.
+///
+/// **A ceiling is not a reservation.** It costs nothing unless it is used, so
+/// the number to pick is one that clears every model a user might point the
+/// generic `openai_compatible` endpoint at, not one sized to this build's own
+/// preset. 1024 was considered and rejected: it clears the 796-token worst case
+/// measured here by 228 tokens, which is a margin from a single sweep rather
+/// than a cross-provider ceiling.
+pub const DEFAULT_TOKEN_CEILING: u32 = 4096;
+
+/// Why a [`TokenCeiling`] was refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TokenCeilingError {
+    /// Below [`MIN_TOKEN_CEILING`], including zero and every negative number a
+    /// hand-edited document can hold.
+    TooSmall,
+    /// Above [`MAX_TOKEN_CEILING`].
+    TooLarge,
+}
+
+impl TokenCeilingError {
+    /// One complete sentence, naming the rule and never the value.
+    pub fn detail(self) -> &'static str {
+        match self {
+            Self::TooSmall => "an answer ceiling is at least 64 tokens",
+            Self::TooLarge => "an answer ceiling is at most 32768 tokens",
+        }
+    }
+}
+
+impl fmt::Display for TokenCeilingError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.detail())
+    }
+}
+
+impl std::error::Error for TokenCeilingError {}
+
+/// How many tokens one answer may cost, reasoning included.
+///
+/// A newtype over `u32` rather than a bare one, and the reason is the **range**
+/// rather than the `ALLOWED_FIELD_TYPES` guard — `u32` is on that list already,
+/// so a raw integer would have passed it. What a raw integer would not have is
+/// a deserializer: `max_tokens = 0` and `max_tokens = 4000000000` are both
+/// perfectly good `u32`s, and the first is a stage that can never answer while
+/// the second is a bill. The bounds are [`MIN_TOKEN_CEILING`] and
+/// [`MAX_TOKEN_CEILING`], checked in the constructor and again in
+/// `Deserialize`, so a hand-edited `desktop.toml` cannot smuggle past what the
+/// settings panel applies.
+///
+/// **Refused rather than clamped**, for [`ServiceUrl`]'s reason: a value
+/// silently moved is a setting the user believes they have. A refusal puts the
+/// `[voice]` section on its defaults with a diagnostic the settings surface
+/// shows, and `crate::settings::sections_this_build_can_read` is what keeps the
+/// rest of the document.
+///
+/// It is one value spelled two ways on the wire — `max_tokens` on the Anthropic
+/// dialect and `max_completion_tokens` on the OpenAI-compatible one — because
+/// it is the same knob and the two protocols disagree only about its name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TokenCeiling(u32);
+
+impl TokenCeiling {
+    /// Validate one ceiling.
+    ///
+    /// Takes an `i64` because that is what both formats hand a deserializer for
+    /// an integer, and because a negative number is a value this type has to
+    /// have a *sentence* about rather than a type error from serde naming a
+    /// Rust primitive the user has never heard of.
+    pub fn parse(raw: i64) -> Result<Self, TokenCeilingError> {
+        if raw < i64::from(MIN_TOKEN_CEILING) {
+            return Err(TokenCeilingError::TooSmall);
+        }
+        if raw > i64::from(MAX_TOKEN_CEILING) {
+            return Err(TokenCeilingError::TooLarge);
+        }
+        Ok(Self(raw as u32))
+    }
+
+    /// The ceiling as the wire carries it.
+    pub fn get(self) -> u32 {
+        self.0
+    }
+}
+
+impl Default for TokenCeiling {
+    fn default() -> Self {
+        Self(DEFAULT_TOKEN_CEILING)
+    }
+}
+
+impl fmt::Display for TokenCeiling {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl Serialize for TokenCeiling {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_u32(self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for TokenCeiling {
+    /// Runs the constructor's own check, so a hand-edited `desktop.toml` cannot
+    /// smuggle past what the settings panel applies.
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = i64::deserialize(deserializer)?;
+        Self::parse(raw).map_err(|error| serde::de::Error::custom(error.detail()))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -683,6 +835,116 @@ mod tests {
         assert!(
             refused.to_string().contains("only letters, digits"),
             "unexpected message: {refused}"
+        );
+    }
+
+    /// Scenario: the answer ceiling accepts every value inside its bounds and
+    /// refuses everything outside them, including the zero and the negative a
+    /// hand-edited document can hold.
+    ///
+    /// The whole reason this is a newtype. `u32` is already on
+    /// `ALLOWED_FIELD_TYPES`, so a bare integer would have satisfied the
+    /// credential guard and then held `0` — a command stage that can never
+    /// answer — or four billion, which is a bill rather than a setting.
+    #[test]
+    fn a_token_ceiling_holds_only_a_usable_range() {
+        for accepted in [
+            i64::from(MIN_TOKEN_CEILING),
+            256,
+            i64::from(DEFAULT_TOKEN_CEILING),
+            i64::from(MAX_TOKEN_CEILING),
+        ] {
+            assert_eq!(
+                TokenCeiling::parse(accepted).map(TokenCeiling::get),
+                Ok(accepted as u32),
+                "should accept {accepted}"
+            );
+        }
+        for (refused, error) in [
+            (0, TokenCeilingError::TooSmall),
+            (-1, TokenCeilingError::TooSmall),
+            (i64::MIN, TokenCeilingError::TooSmall),
+            (
+                i64::from(MIN_TOKEN_CEILING) - 1,
+                TokenCeilingError::TooSmall,
+            ),
+            (
+                i64::from(MAX_TOKEN_CEILING) + 1,
+                TokenCeilingError::TooLarge,
+            ),
+            (4_000_000_000, TokenCeilingError::TooLarge),
+            (i64::MAX, TokenCeilingError::TooLarge),
+        ] {
+            assert_eq!(
+                TokenCeiling::parse(refused),
+                Err(error),
+                "should refuse {refused}"
+            );
+        }
+        // The default is the replacement for the hardwired 256, and it is the
+        // number `DEFAULT_TOKEN_CEILING` documents rather than whichever bound
+        // happens to be nearest.
+        assert_eq!(TokenCeiling::default().get(), DEFAULT_TOKEN_CEILING);
+        assert_eq!(DEFAULT_TOKEN_CEILING, 4096);
+    }
+
+    /// Scenario: a ceiling written into a document is read through the
+    /// constructor's own check, and a refused one reports the rule it broke
+    /// rather than a Rust type name.
+    ///
+    /// Both formats, because the value arrives by both routes — TOML from the
+    /// file a user hand-edits, JSON from the webview — and a check that ran on
+    /// only one of them would be a check the other route walks past.
+    #[test]
+    fn a_token_ceiling_runs_its_check_on_both_wires() {
+        #[derive(Debug, Deserialize, Serialize, PartialEq)]
+        struct Holder {
+            ceiling: TokenCeiling,
+        }
+
+        assert_eq!(
+            toml_edit::de::from_str::<Holder>("ceiling = 8192")
+                .unwrap()
+                .ceiling,
+            TokenCeiling::parse(8192).unwrap()
+        );
+        assert_eq!(
+            serde_json::from_str::<Holder>(r#"{"ceiling":8192}"#)
+                .unwrap()
+                .ceiling,
+            TokenCeiling::parse(8192).unwrap()
+        );
+        // Serialised as a bare number on both, which is what the TypeScript
+        // DTO declares and what TOML's own integer syntax is.
+        let holder = Holder {
+            ceiling: TokenCeiling::parse(8192).unwrap(),
+        };
+        assert_eq!(
+            serde_json::to_string(&holder).unwrap(),
+            r#"{"ceiling":8192}"#
+        );
+
+        for refused in ["ceiling = 0", "ceiling = -1", "ceiling = 32769"] {
+            let error = toml_edit::de::from_str::<Holder>(refused)
+                .expect_err("should refuse")
+                .to_string();
+            assert!(
+                error.contains("an answer ceiling is at"),
+                "{refused} reported `{error}`, which names no rule"
+            );
+        }
+        assert!(
+            serde_json::from_str::<Holder>(r#"{"ceiling":0}"#)
+                .expect_err("should refuse")
+                .to_string()
+                .contains("an answer ceiling is at least 64 tokens")
+        );
+        // And never a byte of the offending value, for `SettingsDocumentProblem`'s
+        // reason — the two error sentences are `&'static str`s, so there is
+        // nothing for one to interpolate.
+        assert!(
+            !TokenCeilingError::TooLarge.detail().contains("32769"),
+            "the message quotes the value it refused"
         );
     }
 }

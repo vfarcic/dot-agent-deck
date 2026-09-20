@@ -8,6 +8,8 @@ import {
   VOICE_INTENT_BACKENDS,
   VOICE_STAGE_PRESETS,
   VOICE_TRANSCRIPTION_BACKENDS,
+  MAX_TOKEN_CEILING,
+  MIN_TOKEN_CEILING,
   type DesktopSettingsDto,
   type SecretStatusDto,
 } from "../lib/bridge";
@@ -331,7 +333,7 @@ describe("VoicePanel", () => {
     renderPanel({
       voice: {
         ...DEFAULT_VOICE_SETTINGS,
-        intent: { backend: "openai_compatible", endpoint: "https://gateway.example.com/v1/chat/completions", model: "gpt-4.1-mini" },
+        intent: { ...DEFAULT_VOICE_SETTINGS.intent, backend: "openai_compatible", endpoint: "https://gateway.example.com/v1/chat/completions", model: "gpt-4.1-mini" },
       },
     });
     expect(screen.getByLabelText("Key for gateway.example.com")).toBeVisible();
@@ -355,7 +357,7 @@ describe("VoicePanel", () => {
     renderPanel({
       voice: {
         ...DEFAULT_VOICE_SETTINGS,
-        intent: { backend: "openai_compatible", endpoint: "http://127.0.0.1:8080/v1/chat/completions", model: "local-model" },
+        intent: { ...DEFAULT_VOICE_SETTINGS.intent, backend: "openai_compatible", endpoint: "http://127.0.0.1:8080/v1/chat/completions", model: "local-model" },
       },
     });
     expect(screen.queryByLabelText(/^Key for /)).not.toBeInTheDocument();
@@ -365,7 +367,7 @@ describe("VoicePanel", () => {
     renderPanel({
       voice: {
         ...DEFAULT_VOICE_SETTINGS,
-        intent: { backend: "openai_compatible", endpoint: "not a url", model: "gpt-4.1-mini" },
+        intent: { ...DEFAULT_VOICE_SETTINGS.intent, backend: "openai_compatible", endpoint: "not a url", model: "gpt-4.1-mini" },
       },
     });
     expect(screen.getAllByLabelText(/^Key for /)).toHaveLength(1);
@@ -488,6 +490,61 @@ describe("VoicePanel", () => {
     await waitFor(() => expect(screen.getByTestId("forget-voice-intent")).toBeVisible());
     fireEvent.click(screen.getByTestId("forget-voice-intent"));
     await waitFor(() => expect(forgetSecret).toHaveBeenCalledWith("voice-intent"));
+  });
+
+  /**
+   * **Commands only.** A transcription is as long as the audio was, so a
+   * ceiling on the Speech stage would bound nothing the user chose — and the
+   * Rust `TranscriptionSettings` has no field to receive one, so a row there
+   * would write a key that is dropped.
+   */
+  it("offers the answer ceiling on Commands and on nothing else", () => {
+    renderPanel();
+    expect(screen.getByLabelText("Max tokens")).toHaveValue(String(DEFAULT_VOICE_SETTINGS.intent.max_tokens));
+    expect(screen.getAllByLabelText("Max tokens")).toHaveLength(1);
+    // The hint is where the user is told it costs nothing unless it is used,
+    // which is the fact that makes a generous default defensible.
+    expect(screen.getByTestId("voice-intent-max-tokens-hint"))
+      .toHaveTextContent("A ceiling, not a reservation");
+  });
+
+  /**
+   * Committed on blur and on Enter, like the two text rows, and restored on
+   * anything the bounds refuse. Rust would reject an out-of-range value at the
+   * document seam and cost the WHOLE `[voice]` section, so declining to send
+   * one is cheaper than showing the user that error.
+   */
+  it("commits a ceiling inside the bounds and restores one outside them", () => {
+    const { onSave } = renderPanel();
+    const field = screen.getByLabelText("Max tokens");
+
+    fireEvent.change(field, { target: { value: "8192" } });
+    fireEvent.blur(field);
+    expect(onSave).toHaveBeenCalledTimes(1);
+    expect(onSave.mock.calls[0][0].voice.intent.max_tokens).toBe(8192);
+
+    for (const refused of [
+      String(MIN_TOKEN_CEILING - 1),
+      String(MAX_TOKEN_CEILING + 1),
+      "0",
+      "-1",
+      "4096.5",
+      "lots",
+      "",
+    ]) {
+      fireEvent.change(field, { target: { value: refused } });
+      fireEvent.blur(field);
+      expect(onSave, `${refused} was committed`).toHaveBeenCalledTimes(1);
+      expect(field).toHaveValue(String(DEFAULT_VOICE_SETTINGS.intent.max_tokens));
+    }
+
+    // Enter commits the same way, and Escape puts the stored value back.
+    fireEvent.change(field, { target: { value: String(MAX_TOKEN_CEILING) } });
+    fireEvent.keyDown(field, { key: "Enter" });
+    expect(onSave.mock.calls[1][0].voice.intent.max_tokens).toBe(MAX_TOKEN_CEILING);
+    fireEvent.change(field, { target: { value: "999" } });
+    fireEvent.keyDown(field, { key: "Escape" });
+    expect(field).toHaveValue(String(DEFAULT_VOICE_SETTINGS.intent.max_tokens));
   });
 
   /*

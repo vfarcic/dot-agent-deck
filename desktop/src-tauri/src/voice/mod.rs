@@ -204,26 +204,32 @@ pub mod test_support {
 
     use super::DesktopAgent;
     use crate::dto::{DesktopActiveTool, DesktopTab};
-    use crate::model_service::{ModelId, ServiceUrl};
     use crate::secrets::{Secret, SecretError, SecretId, SecretStatus, SecretStore};
+    use crate::settings::IntentSettings;
 
-    /// The keyed API intent backend on the **Anthropic** protocol, with a
-    /// credential the caller already holds.
+    /// The command backend a fresh install gets, with a credential the caller
+    /// already holds.
     ///
-    /// The protocol is fixed rather than a parameter, and deliberately: the
-    /// phrase fixtures are authoritative for the shipping default and a green
-    /// run against another one would prove less than it appears to. Adding a
-    /// switch here would invite exactly that.
+    /// **It takes no coordinates and offers no switch**, deliberately: the
+    /// phrase fixtures are authoritative for the shipping default, and a green
+    /// run against another protocol, endpoint or model would prove less than it
+    /// appears to. Everything but the credential comes from
+    /// [`IntentSettings::default`] through [`super::resolver_for`] — the same
+    /// call `crate::lib`'s voice command makes — so what the fixtures exercise
+    /// is the construction path a user gets rather than a reconstruction of it.
+    /// That is how the protocol stopped being hardwired here: this function
+    /// named `Protocol::Anthropic` in its own body, and would have gone on
+    /// naming it after the default moved.
     ///
     /// # Why an integration test cannot build one itself
     ///
-    /// The same reason [`agent`] exists, one layer along: [`RemoteResolver::new`]
-    /// takes a [`ServiceUrl`], a [`ModelId`] and an `Arc<dyn SecretStore>`, and
-    /// all three of those live in **private** modules (`model_service`,
-    /// `secrets`). `pub mod voice` is the crate's only public module, so
-    /// `tests/voice_phrase_fixtures.rs` can name none of them however `pub` the
-    /// items themselves are — and the in-memory store the unit tests drive is
-    /// `#[cfg(test)]`, which an integration test compiles with off.
+    /// The same reason [`agent`] exists, one layer along: `IntentSettings`, the
+    /// newtypes inside it and `SecretStore` all live in **private** modules
+    /// (`settings`, `model_service`, `secrets`). `pub mod voice` is the crate's
+    /// only public module, so `tests/voice_phrase_fixtures.rs` can name none of
+    /// them however `pub` the items themselves are — and the in-memory store
+    /// the unit tests drive is `#[cfg(test)]`, which an integration test
+    /// compiles with off.
     ///
     /// # The key is passed in, never read from the environment here
     ///
@@ -235,33 +241,25 @@ pub mod test_support {
     /// The returned resolver reads that key through the same
     /// [`crate::secrets::load_off_runtime`] path production takes — the store is
     /// the double, and nothing else about the call differs.
-    ///
-    /// [`RemoteResolver::new`]: super::remote::RemoteResolver::new
-    pub fn api_resolver(
-        endpoint: &str,
-        model: &str,
-        key: &str,
-    ) -> Result<Box<dyn super::IntentResolver>, String> {
-        let endpoint = ServiceUrl::parse(endpoint).map_err(|error| error.to_string())?;
-        let model = ModelId::parse(model).map_err(|error| error.to_string())?;
-        Ok(Box::new(super::remote::RemoteResolver::new(
-            super::remote::Protocol::Anthropic,
+    pub fn api_resolver(key: &str) -> Box<dyn super::IntentResolver> {
+        super::resolver_for(
+            &IntentSettings::default(),
             Arc::new(OneSecret(Secret::new(key))),
-            endpoint,
-            model,
-        )))
+        )
     }
 
-    /// This build's shipping coordinates for the keyed API backend, as
+    /// This build's shipping coordinates for the command backend, as
     /// `(endpoint, model)`.
     ///
-    /// Read from `crate::settings` rather than repeated, so the credentialed
-    /// fixtures verify the endpoint and model a user actually gets instead of a
-    /// pair that once matched them.
-    pub fn api_preset() -> (&'static str, &'static str) {
+    /// Read off [`IntentSettings::default`] rather than off a named constant,
+    /// so it reports whichever preset is the default rather than the one that
+    /// was the default when this was written. The fixtures print it; nothing
+    /// asserts on it.
+    pub fn api_preset() -> (String, String) {
+        let preset = IntentSettings::default();
         (
-            crate::settings::HOSTED_COMMAND_ENDPOINT,
-            crate::settings::HOSTED_COMMAND_MODEL,
+            preset.endpoint.as_str().to_string(),
+            preset.model.as_str().to_string(),
         )
     }
 

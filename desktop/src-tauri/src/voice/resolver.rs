@@ -203,6 +203,7 @@ pub fn resolver_for(
         secrets,
         settings.endpoint.clone(),
         settings.model.clone(),
+        settings.max_tokens,
     ))
 }
 

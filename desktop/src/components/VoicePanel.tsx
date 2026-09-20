@@ -69,10 +69,13 @@ import { AlertTriangle } from "lucide-react";
 import {
   DEFAULT_VOICE_SETTINGS,
   LOCAL_SPEECH_IMAGE,
+  MAX_TOKEN_CEILING,
+  MIN_TOKEN_CEILING,
   VOICE_INTENT_BACKENDS,
   VOICE_STAGE_PRESETS,
   VOICE_TRANSCRIPTION_BACKENDS,
   type SecretStatusDto,
+  type VoiceIntentStageDto,
   type VoiceSecretId,
   type VoiceSettingsDto,
   type VoiceStageDto,
@@ -179,7 +182,7 @@ export function VoicePanel({ settings, onSave, saveError }: SettingsPanelProps) 
 
   const saveVoice = (next: VoiceSettingsDto) => onSave({ ...settings, voice: next });
 
-  const saveStage = (stage: Stage, next: Partial<VoiceStageDto>) =>
+  const saveStage = (stage: Stage, next: Partial<VoiceIntentStageDto>) =>
     saveVoice({ ...voice, [stage]: { ...voice[stage], ...next } });
 
   // A backend brings its own coordinates with it — see the file's header. A
@@ -242,6 +245,23 @@ export function VoicePanel({ settings, onSave, saveError }: SettingsPanelProps) 
 
       <StageFields stage="intent" value={voice.intent} onSave={saveStage} />
 
+      {/* Commands only. A transcription is as long as the audio was, so a
+          ceiling on the speech stage would bound nothing the user chose.
+          This one bounds an answer that includes a model's REASONING, which
+          is why it is here at all: the number was hardwired to 256, and any
+          model that thinks before it answers spent all of it thinking and
+          returned nothing. The failure sentence a truncated answer produces
+          names this row. */}
+      <NumberRow
+        id="voice-intent-max-tokens"
+        label="Max tokens"
+        value={voice.intent.max_tokens}
+        min={MIN_TOKEN_CEILING}
+        max={MAX_TOKEN_CEILING}
+        hint={`How much answer one command may cost, reasoning included — ${MIN_TOKEN_CEILING} to ${MAX_TOKEN_CEILING}. A ceiling, not a reservation: it costs nothing unless it is used. Raise it if answers come back cut off.`}
+        onCommit={(max_tokens) => saveStage("intent", { max_tokens })}
+      />
+
       {/* One key row per backend that authenticates with a key of the app's
           own, and none otherwise. Asking for a credential a user's chosen
           backends do not need is how a feature becomes one most people never
@@ -286,7 +306,7 @@ function StageFields({
 }: {
   stage: Stage;
   value: VoiceStageDto;
-  onSave: (stage: Stage, next: Partial<VoiceStageDto>) => void;
+  onSave: (stage: Stage, next: Partial<VoiceIntentStageDto>) => void;
 }) {
   return (
     <>
@@ -349,6 +369,75 @@ function TextRow({
           onKeyDown={(event) => {
             if (event.key === "Enter") commit();
             if (event.key === "Escape") setDraft(value);
+          }}
+        />
+      </div>
+      {hint && <p className="settings-hint" data-testid={`${id}-hint`}>{hint}</p>}
+    </>
+  );
+}
+
+/**
+ * One committed-on-blur integer field, with the rule under it in words.
+ *
+ * `TextRow`'s shape, and separate from it rather than a mode of it: the draft
+ * is text while it is being typed (`4` on the way to `4096` is out of range,
+ * and an empty field is not a number at all), and only a value that parses and
+ * sits inside the bounds is committed. Anything else restores what is stored on
+ * blur, which is the same undo the text fields have — Rust would refuse an
+ * out-of-range value at the document seam and cost the whole `[voice]` section,
+ * so declining to send one is cheaper than showing the user that error.
+ *
+ * `type="number"` is deliberately NOT used: its spinner and its browser-level
+ * coercion fight the commit-on-blur contract, and a field that silently rounds
+ * or blanks what was typed is the surprise this whole panel avoids.
+ */
+function NumberRow({
+  id,
+  label,
+  value,
+  min,
+  max,
+  hint,
+  onCommit,
+}: {
+  id: string;
+  label: string;
+  value: number;
+  min: number;
+  max: number;
+  hint?: string;
+  onCommit: (next: number) => void;
+}) {
+  const [draft, setDraft] = useState(String(value));
+  useEffect(() => { setDraft(String(value)); }, [value]);
+
+  const commit = () => {
+    const next = Number(draft.trim());
+    if (draft.trim() && Number.isInteger(next) && next >= min && next <= max && next !== value) {
+      onCommit(next);
+    } else {
+      setDraft(String(value));
+    }
+  };
+
+  return (
+    <>
+      <div className="settings-row">
+        <label htmlFor={id}>{label}</label>
+        <input
+          id={id}
+          className="settings-input"
+          type="text"
+          inputMode="numeric"
+          spellCheck={false}
+          autoComplete="off"
+          value={draft}
+          onChange={(event) => setDraft(event.target.value)}
+          onBlur={commit}
+          onKeyDown={(event) => {
+            if (event.key === "Enter") commit();
+            if (event.key === "Escape") setDraft(String(value));
           }}
         />
       </div>

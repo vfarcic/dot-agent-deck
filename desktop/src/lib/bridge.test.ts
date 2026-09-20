@@ -2207,6 +2207,69 @@ describe("desktop settings (PRD 803)", () => {
  * hard to defeat quietly, and these are what prove the behaviour a text scan
  * cannot.
  */
+describe("the command stage's answer ceiling (PRD #802)", () => {
+  /**
+   * The ceiling is the one voice coordinate that is a number, and the only one
+   * this side coerces rather than carrying through verbatim. The endpoint and
+   * the model are carried as written because silently moving an endpoint sends
+   * a user's audio somewhere they did not choose; a ceiling has no third party
+   * to point at, and a value Rust would refuse costs the whole `[voice]`
+   * section rather than the one field.
+   */
+  it("defaults to 4096, keeps a value inside the bounds, and folds one outside them", async () => {
+    const { normalizeDesktopSettings, DEFAULT_TOKEN_CEILING, MIN_TOKEN_CEILING, MAX_TOKEN_CEILING } =
+      await import("./bridge");
+
+    const ceilingOf = (intent: unknown) =>
+      normalizeDesktopSettings({ version: 1, voice: { intent } }).voice?.intent.max_tokens;
+
+    // Absent, and the section-was-a-bare-token shape an older document wrote.
+    expect(ceilingOf({ backend: "anthropic" })).toBe(DEFAULT_TOKEN_CEILING);
+    expect(ceilingOf(undefined)).toBe(DEFAULT_TOKEN_CEILING);
+    expect(DEFAULT_TOKEN_CEILING).toBe(4096);
+
+    // Inside the bounds, including both ends of them.
+    for (const kept of [MIN_TOKEN_CEILING, 256, 8192, MAX_TOKEN_CEILING]) {
+      expect(ceilingOf({ backend: "openai_compatible", max_tokens: kept })).toBe(kept);
+    }
+
+    // Outside them, or not an integer at all — the shapes a hand-edited
+    // document and a hostile webview payload can both produce. Each falls back
+    // to the chosen backend's preset rather than propagating.
+    for (const refused of [
+      0,
+      -1,
+      MIN_TOKEN_CEILING - 1,
+      MAX_TOKEN_CEILING + 1,
+      4096.5,
+      Number.NaN,
+      Number.POSITIVE_INFINITY,
+      "4096",
+      null,
+      { valueOf: () => 4096 },
+    ]) {
+      expect(ceilingOf({ backend: "anthropic", max_tokens: refused })).toBe(DEFAULT_TOKEN_CEILING);
+    }
+  });
+
+  /**
+   * The panel writes a whole preset when the backend changes, so a preset that
+   * did not carry a ceiling would write `undefined` into the document. Pinned
+   * against Rust by `the_voice_presets_match_the_frontends_copy`.
+   */
+  it("carries the ceiling on every command preset and on none of the speech ones", async () => {
+    const { VOICE_STAGE_PRESETS, VOICE_INTENT_BACKENDS, DEFAULT_TOKEN_CEILING } = await import("./bridge");
+    for (const backend of VOICE_INTENT_BACKENDS) {
+      expect(VOICE_STAGE_PRESETS.intent[backend].max_tokens).toBe(DEFAULT_TOKEN_CEILING);
+    }
+    for (const preset of Object.values(VOICE_STAGE_PRESETS.transcription)) {
+      // A transcription is as long as the audio was, so a ceiling on it would
+      // bound nothing the user chose — and Rust has no field to receive one.
+      expect(preset).not.toHaveProperty("max_tokens");
+    }
+  });
+});
+
 describe("desktop settings hold no credential (issue 827)", () => {
   /** Credential-shaped and unique, so finding it in any sink is unambiguous. */
   const SENTINEL = "sk-live-827-DO-NOT-STORE-e3b0c44298fc1c149afb";
@@ -2280,15 +2343,17 @@ describe("desktop settings hold no credential (issue 827)", () => {
       // proves the value went; this pins the key set it was rebuilt to.
       if (normalized.voice) {
         expect(Object.keys(normalized.voice).sort()).toEqual(["activation", "intent", "transcription"]);
-        // Each stage is rebuilt to its own three declared keys, so a key
-        // smuggled one level down is gone with the rest. `endpoint` and `model`
-        // ARE declared and are carried verbatim — deliberately, because
-        // coercing an endpoint is how a user's own URL silently becomes
-        // somebody else's service, and Rust refuses an invalid one at the
-        // document seam with a diagnostic instead.
-        for (const stage of [normalized.voice.intent, normalized.voice.transcription]) {
-          expect(Object.keys(stage).sort()).toEqual(["backend", "endpoint", "model"]);
-        }
+        // Each stage is rebuilt to its own declared keys, so a key smuggled
+        // one level down is gone with the rest. `endpoint` and `model` ARE
+        // declared and are carried verbatim — deliberately, because coercing
+        // an endpoint is how a user's own URL silently becomes somebody else's
+        // service, and Rust refuses an invalid one at the document seam with a
+        // diagnostic instead. The command stage declares a fourth, the answer
+        // ceiling, which the speech stage has no counterpart for.
+        expect(Object.keys(normalized.voice.transcription).sort())
+          .toEqual(["backend", "endpoint", "model"]);
+        expect(Object.keys(normalized.voice.intent).sort())
+          .toEqual(["backend", "endpoint", "max_tokens", "model"]);
       } else {
         expect(JSON.parse(JSON.stringify(normalized))).not.toHaveProperty("voice");
       }

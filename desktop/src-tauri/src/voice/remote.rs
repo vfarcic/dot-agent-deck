@@ -101,7 +101,7 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 
-use crate::model_service::{ModelId, ServiceUrl};
+use crate::model_service::{ModelId, ServiceUrl, TokenCeiling};
 use crate::secrets::{SecretId, SecretStore, load_off_runtime};
 
 use super::prompt::{action_enum, param_names, state};
@@ -110,13 +110,6 @@ use super::schema::{AnnotatedCommand, TOOL_INSTRUCTIONS, TOOL_NAME};
 
 /// The API version header this request shape was measured against.
 const API_VERSION: &str = "2023-06-01";
-
-/// A ceiling on the answer, not a budget for it.
-///
-/// The measured replies were 33–58 output tokens. 256 leaves an order of
-/// magnitude of headroom while making a runaway generation impossible — and a
-/// truncated tool call would be an unreadable answer, which is an `Err`.
-const MAX_TOKENS: u32 = 256;
 
 /// How long the request gets before the attempt is abandoned.
 ///
@@ -165,10 +158,11 @@ pub struct RemoteResolver {
     client: Option<reqwest::Client>,
     endpoint: ServiceUrl,
     model: ModelId,
+    max_tokens: TokenCeiling,
 }
 
 impl RemoteResolver {
-    /// All three coordinates are arguments rather than constants, which is the
+    /// Every coordinate is an argument rather than a constant, which is the
     /// change PRD #802's provider work made here: the model used to be a
     /// `const` with a doc comment explaining that a settings field would offer
     /// a choice whose only correct value this file knew, and the protocol was
@@ -176,11 +170,17 @@ impl RemoteResolver {
     /// the product — a user cannot know which key to paste when the endpoint is
     /// a secret of the build's, and cannot use a provider this build did not
     /// pick.
+    ///
+    /// `max_tokens` is the fourth, and it arrived last for the same reason and
+    /// with a sharper edge: a hardwired 256 was sized from one model's answers
+    /// and silently truncates every model that reasons. See
+    /// [`crate::settings::IntentSettings::max_tokens`].
     pub fn new(
         protocol: Protocol,
         secrets: Arc<dyn SecretStore>,
         endpoint: ServiceUrl,
         model: ModelId,
+        max_tokens: TokenCeiling,
     ) -> Self {
         Self {
             protocol,
@@ -206,6 +206,7 @@ impl RemoteResolver {
             client: super::http::client(),
             endpoint,
             model,
+            max_tokens,
         }
     }
 
@@ -251,9 +252,9 @@ impl RemoteResolver {
         };
 
         let body = match self.protocol {
-            Protocol::Anthropic => request_body(&request, self.model.as_str()),
+            Protocol::Anthropic => request_body(&request, self.model.as_str(), self.max_tokens),
             Protocol::OpenAiCompatible => {
-                super::openai::request_body(&request, self.model.as_str())
+                super::openai::request_body(&request, self.model.as_str(), self.max_tokens)
             }
         };
         let mut post = client
@@ -389,10 +390,10 @@ pub fn tool_definition(commands: &[AnnotatedCommand]) -> Value {
 /// The state goes in `system` and the utterance in the one user turn, which is
 /// the split that keeps the volatile half last: the commands and the agent list
 /// are the same across consecutive utterances and the transcript is not.
-pub fn request_body(request: &IntentRequest<'_>, model: &str) -> Value {
+pub fn request_body(request: &IntentRequest<'_>, model: &str, max_tokens: TokenCeiling) -> Value {
     json!({
         "model": model,
-        "max_tokens": MAX_TOKENS,
+        "max_tokens": max_tokens.get(),
         "system": format!(
             "You route ONE spoken utterance to ONE action in a desktop app.\n\nState:\n{}",
             state(request)
@@ -466,6 +467,7 @@ fn transport_detail(error: &reqwest::Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model_service::{DEFAULT_TOKEN_CEILING, MAX_TOKEN_CEILING, MIN_TOKEN_CEILING};
     use crate::secrets::{MemorySecretStore, Secret, SecretErrorKind, ThreadRecordingStore};
     use crate::settings::HOSTED_COMMAND_MODEL;
     use crate::voice::Transcript;
@@ -495,6 +497,7 @@ mod tests {
                 agents: &agents,
             },
             HOSTED_COMMAND_MODEL,
+            TokenCeiling::default(),
         )
     }
 
@@ -510,6 +513,7 @@ mod tests {
             secrets,
             ServiceUrl::parse(endpoint).expect("valid"),
             ModelId::parse(HOSTED_COMMAND_MODEL).expect("valid"),
+            TokenCeiling::default(),
         )
     }
 
@@ -519,10 +523,38 @@ mod tests {
     fn voice_remote_request_pins_the_cheap_fast_tier_and_bounds_the_answer() {
         let body = body("show me the tester");
         assert_eq!(body["model"], "claude-haiku-4-5");
-        assert_eq!(body["max_tokens"], 256);
+        // The ceiling is whatever the settings hold, and the default is 4096 —
+        // not the 256 this was hardwired to. See `TokenCeiling`.
+        assert_eq!(body["max_tokens"], DEFAULT_TOKEN_CEILING);
         // A routing decision this small does not want thinking, and this model
         // does none unless asked.
         assert!(body["thinking"].is_null());
+    }
+
+    /// Scenario: the answer ceiling in the request body is the one the settings
+    /// carry, rather than a constant this file owns.
+    ///
+    /// The whole point of the field. A value the user configured that never
+    /// reaches the wire is the same defect as the hardwired constant it
+    /// replaced, and it would be invisible — the request would simply keep
+    /// truncating at a number nothing displays.
+    #[test]
+    fn voice_remote_request_carries_the_configured_ceiling() {
+        let commands = commands();
+        let agents = vec![agent("1", "tester")];
+        let transcript = Transcript::new("show me the tester");
+        let request = IntentRequest {
+            transcript: &transcript,
+            commands: &commands,
+            agents: &agents,
+        };
+        for ceiling in [MIN_TOKEN_CEILING, 1024, MAX_TOKEN_CEILING] {
+            let ceiling = TokenCeiling::parse(i64::from(ceiling)).expect("in range");
+            assert_eq!(
+                request_body(&request, HOSTED_COMMAND_MODEL, ceiling)["max_tokens"],
+                ceiling.get()
+            );
+        }
     }
 
     #[test]
@@ -826,6 +858,7 @@ mod tests {
                 Arc::new(MemorySecretStore::new()),
                 ServiceUrl::parse("https://voice-intent.invalid/never").expect("valid"),
                 ModelId::parse(HOSTED_COMMAND_MODEL).expect("valid"),
+                TokenCeiling::default(),
             )
             .backend_name(),
             "openai"

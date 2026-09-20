@@ -69,18 +69,11 @@
 
 use serde_json::{Value, json};
 
+use crate::model_service::TokenCeiling;
+
 use super::prompt::{action_enum, param_names, state};
 use super::resolver::{IntentAnswer, IntentError, IntentRequest};
 use super::schema::{AnnotatedCommand, TOOL_INSTRUCTIONS, TOOL_NAME};
-
-/// A ceiling on the answer, not a budget for it — [`super::remote`]'s constant
-/// and its reasoning, spelled `max_completion_tokens`.
-///
-/// **`max_tokens` is the older spelling and is deliberately not sent.** OpenAI
-/// deprecated it for chat completions and its newer models reject it outright,
-/// while every server measured here accepts the current name — including
-/// Anthropic's compatibility endpoint, checked rather than assumed.
-const MAX_COMPLETION_TOKENS: u32 = 256;
 
 /// The `json_schema` the reply is constrained to.
 ///
@@ -125,10 +118,18 @@ pub fn response_schema(commands: &[AnnotatedCommand]) -> Value {
 /// the user turn, which is the split [`super::remote::request_body`] makes and
 /// for the same reason: the commands and the agent list are the same across
 /// consecutive utterances and the transcript is not.
-pub fn request_body(request: &IntentRequest<'_>, model: &str) -> Value {
+///
+/// **`max_tokens` is the older spelling of the ceiling and is deliberately not
+/// sent.** OpenAI deprecated it for chat completions and its newer models
+/// reject it outright, while every server measured here accepts
+/// `max_completion_tokens` — including Anthropic's compatibility endpoint,
+/// checked rather than assumed. The two spellings carry the same
+/// [`TokenCeiling`], which is why the settings field is one number and not one
+/// per dialect.
+pub fn request_body(request: &IntentRequest<'_>, model: &str, max_tokens: TokenCeiling) -> Value {
     json!({
         "model": model,
-        "max_completion_tokens": MAX_COMPLETION_TOKENS,
+        "max_completion_tokens": max_tokens.get(),
         "messages": [
             {
                 "role": "system",
@@ -186,6 +187,7 @@ pub fn parse_response(payload: &Value) -> Result<IntentAnswer, IntentError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model_service::{DEFAULT_TOKEN_CEILING, MAX_TOKEN_CEILING, MIN_TOKEN_CEILING};
     use crate::voice::Transcript;
     use crate::voice::fixtures::role_agent as agent;
     use crate::voice::schema::annotate;
@@ -210,6 +212,7 @@ mod tests {
                 agents: &agents,
             },
             "a-model",
+            TokenCeiling::default(),
         )
     }
 
@@ -329,8 +332,34 @@ mod tests {
     fn voice_openai_request_bounds_the_answer_with_the_current_spelling() {
         // `max_tokens` is the deprecated name and newer models reject it.
         let body = body("show me the tester");
-        assert_eq!(body["max_completion_tokens"], 256);
+        assert_eq!(body["max_completion_tokens"], DEFAULT_TOKEN_CEILING);
         assert!(body["max_tokens"].is_null(), "{body}");
+    }
+
+    /// Scenario: the ceiling in the request body is the one the settings carry,
+    /// and it is spelled `max_completion_tokens` at every value.
+    ///
+    /// The defect this field exists for is specific to this dialect:
+    /// `max_completion_tokens` counts reasoning tokens, so a hardwired 256 made
+    /// every reasoning model return `finish_reason: "length"` with nothing
+    /// written. A configured ceiling that did not reach the wire would leave
+    /// that exactly as it was.
+    #[test]
+    fn voice_openai_request_carries_the_configured_ceiling() {
+        let commands = commands();
+        let agents = vec![agent("1", "tester")];
+        let transcript = Transcript::new("show me the tester");
+        let request = IntentRequest {
+            transcript: &transcript,
+            commands: &commands,
+            agents: &agents,
+        };
+        for ceiling in [MIN_TOKEN_CEILING, 1024, MAX_TOKEN_CEILING] {
+            let ceiling = TokenCeiling::parse(i64::from(ceiling)).expect("in range");
+            let body = request_body(&request, "a-model", ceiling);
+            assert_eq!(body["max_completion_tokens"], ceiling.get());
+            assert!(body["max_tokens"].is_null(), "{body}");
+        }
     }
 
     #[test]

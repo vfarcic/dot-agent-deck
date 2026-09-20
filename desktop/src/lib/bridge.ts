@@ -374,7 +374,7 @@ export interface DesktopSettingsDto {
  */
 export interface VoiceSettingsDto {
   activation: string;
-  intent: VoiceStageDto;
+  intent: VoiceIntentStageDto;
   transcription: VoiceStageDto;
 }
 
@@ -392,6 +392,25 @@ export interface VoiceStageDto {
   backend: string;
   endpoint: string;
   model: string;
+}
+
+/**
+ * The command stage, which is one voice stage plus an answer ceiling.
+ *
+ * `max_tokens` is snake_case because every key on this side is the wire's own
+ * spelling — the Rust struct serialises to both TOML and this JSON and nothing
+ * renames, so a camelCase field here would be a key Rust never reads.
+ *
+ * **Only the command stage has one.** A transcription is as long as the audio
+ * was, so a ceiling on it would bound nothing the user chose; the Rust
+ * `TranscriptionSettings` has no such field, and a shared interface carrying it
+ * would offer a control on the Speech stage that changes nothing. The number is
+ * a ceiling and not a reservation — it costs nothing unless it is used — and
+ * Rust refuses one outside 64..=32768 at the document seam, which the settings
+ * footer shows.
+ */
+export interface VoiceIntentStageDto extends VoiceStageDto {
+  max_tokens: number;
 }
 
 /** The `[endpoints]` section: the remote decks, and which deck is selected. */
@@ -506,6 +525,24 @@ export const VOICE_INTENT_BACKENDS = ["anthropic", "openai_compatible"] as const
 export const VOICE_TRANSCRIPTION_BACKENDS = ["local", "remote"] as const;
 
 /**
+ * The bounds and the default for the command stage's answer ceiling.
+ *
+ * Mirrors `MIN_TOKEN_CEILING`, `MAX_TOKEN_CEILING` and `DEFAULT_TOKEN_CEILING`
+ * in `src-tauri/src/model_service.rs`, pinned there by
+ * `the_voice_presets_match_the_frontends_copy` for the reason the endpoints and
+ * models are: the panel WRITES this value, so a frontend copy that drifted
+ * would put a number into `desktop.toml` that this side then refuses — turning
+ * a number field into a save error.
+ *
+ * The default was 256 and was hardwired, which is the defect the field exists
+ * to fix: `max_completion_tokens` counts reasoning tokens, so any model that
+ * reasons spent the whole ceiling before writing a character.
+ */
+export const MIN_TOKEN_CEILING = 64;
+export const MAX_TOKEN_CEILING = 32768;
+export const DEFAULT_TOKEN_CEILING = 4096;
+
+/**
  * Where each backend lives and which model it is asked for, by stage.
  *
  * Mirrors the `*_ENDPOINT` / `*_MODEL` constants in
@@ -515,7 +552,10 @@ export const VOICE_TRANSCRIPTION_BACKENDS = ["local", "remote"] as const;
  * backend it names: leaving a loopback URL behind after a switch to a hosted
  * service is a setting that cannot work and does not say so.
  */
-export const VOICE_STAGE_PRESETS: Record<"intent" | "transcription", Record<string, VoiceStageDto>> = {
+export const VOICE_STAGE_PRESETS: {
+  intent: Record<string, VoiceIntentStageDto>;
+  transcription: Record<string, VoiceStageDto>;
+} = {
   transcription: {
     local: {
       backend: "local",
@@ -533,11 +573,13 @@ export const VOICE_STAGE_PRESETS: Record<"intent" | "transcription", Record<stri
       backend: "anthropic",
       endpoint: "https://api.anthropic.com/v1/messages",
       model: "claude-haiku-4-5",
+      max_tokens: DEFAULT_TOKEN_CEILING,
     },
     openai_compatible: {
       backend: "openai_compatible",
       endpoint: "https://api.openai.com/v1/chat/completions",
       model: "gpt-4.1-mini",
+      max_tokens: DEFAULT_TOKEN_CEILING,
     },
   },
 };
@@ -880,7 +922,7 @@ function normalizeVoiceSettings(value: unknown): VoiceSettingsDto | undefined {
     ?? DEFAULT_VOICE_SETTINGS.activation;
   return {
     activation,
-    intent: normalizeVoiceStage(record.intent, VOICE_INTENT_BACKENDS, DEFAULT_VOICE_SETTINGS.intent, VOICE_STAGE_PRESETS.intent),
+    intent: normalizeVoiceIntentStage(record.intent),
     transcription: normalizeVoiceStage(record.transcription, VOICE_TRANSCRIPTION_BACKENDS, DEFAULT_VOICE_SETTINGS.transcription, VOICE_STAGE_PRESETS.transcription),
   };
 }
@@ -913,6 +955,42 @@ function normalizeVoiceStage(
     backend,
     endpoint: typeof record.endpoint === "string" && record.endpoint ? record.endpoint : preset.endpoint,
     model: typeof record.model === "string" && record.model ? record.model : preset.model,
+  };
+}
+
+/**
+ * The command stage, which is `normalizeVoiceStage` plus the answer ceiling.
+ *
+ * Rebuilt key by key rather than spread over the base, for the parent's
+ * credential reason: a spread here would carry an undeclared field into the
+ * document exactly as one in the parent would.
+ *
+ * The ceiling is coerced to an integer inside the bounds and otherwise falls
+ * back to the chosen backend's preset. That is the opposite of what the
+ * endpoint and the model do — they are carried through as written, because
+ * coercing an endpoint is how a user's own URL silently becomes somebody
+ * else's service. A number has no such hazard: there is no third party for a
+ * ceiling to point at, and a value Rust would refuse costs the whole `[voice]`
+ * section rather than the one field. Rust is still the boundary; this is the
+ * webview declining to send a number it already knows is out of range.
+ */
+function normalizeVoiceIntentStage(value: unknown): VoiceIntentStageDto {
+  const stage = normalizeVoiceStage(
+    value,
+    VOICE_INTENT_BACKENDS,
+    DEFAULT_VOICE_SETTINGS.intent,
+    VOICE_STAGE_PRESETS.intent,
+  );
+  const preset = VOICE_STAGE_PRESETS.intent[stage.backend] ?? DEFAULT_VOICE_SETTINGS.intent;
+  const record = typeof value === "object" && value !== null ? value as Record<string, unknown> : {};
+  const raw = record.max_tokens;
+  const inRange = typeof raw === "number" && Number.isInteger(raw)
+    && raw >= MIN_TOKEN_CEILING && raw <= MAX_TOKEN_CEILING;
+  return {
+    backend: stage.backend,
+    endpoint: stage.endpoint,
+    model: stage.model,
+    max_tokens: inRange ? raw as number : preset.max_tokens,
   };
 }
 

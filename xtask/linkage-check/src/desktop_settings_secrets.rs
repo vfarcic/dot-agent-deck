@@ -132,7 +132,7 @@ const DESKTOP_SRC: &str = "desktop/src";
 /// layer. That is why `Option<String>` and `Vec<String>` still have no way in —
 /// they resolve to `String`, which is absent — and why there is no row for each
 /// container shape.
-const ALLOWED_FIELD_TYPES: [(&str, FieldKind, &str); 23] = [
+const ALLOWED_FIELD_TYPES: [(&str, FieldKind, &str); 24] = [
     (
         "u32",
         FieldKind::Scalar,
@@ -365,6 +365,20 @@ const ALLOWED_FIELD_TYPES: [(&str, FieldKind, &str); 23] = [
          nothing",
     ),
     (
+        "TokenCeiling",
+        FieldKind::Scalar,
+        "a newtype over u32 in desktop/src-tauri/src/model_service.rs holding \
+         how many tokens one command answer may cost, bounded at 64..=32768 by \
+         a deserializer that runs the constructor's own check. It is an \
+         integer; there is no text for a credential to be, which is `u32`'s \
+         reason and means the guard would have passed a bare integer here. \
+         Read the newtype as being about the RANGE rather than about this \
+         list: `max_tokens = 0` is a stage that can never answer and \
+         `max_tokens = 4000000000` is a bill, and both are perfectly good \
+         `u32`s. It is sent as one field of a request body and authenticates \
+         nothing",
+    ),
+    (
         "VoiceSettings",
         FieldKind::Section,
         "a section struct, whose own fields this check walks. It holds one \
@@ -387,12 +401,14 @@ const ALLOWED_FIELD_TYPES: [(&str, FieldKind, &str); 23] = [
         "IntentSettings",
         FieldKind::Section,
         "a section struct — the command stage — whose own fields this check \
-         walks, in TranscriptionSettings' shape and for its reason. Both of \
-         its backends are HTTP, so the endpoint and the model are live under \
-         either one and the panel shows them always — the backend picks which \
-         preset they default to, not whether they are read. They were ignored \
-         under the withdrawn agent-CLI backend, which spawned a process rather \
-         than making a request; nothing in the enum does that now",
+         walks, in TranscriptionSettings' shape plus one field: the answer \
+         ceiling, which the speech stage has no counterpart for because a \
+         transcription is as long as the audio was. Both of its backends are \
+         HTTP, so the endpoint and the model are live under either one and the \
+         panel shows them always — the backend picks which preset they default \
+         to, not whether they are read. They were ignored under the withdrawn \
+         agent-CLI backend, which spawned a process rather than making a \
+         request; nothing in the enum does that now",
     ),
 ];
 
@@ -462,7 +478,7 @@ const KEYLESS_MEMBERS: [&str; 3] = ["clear", "key", "length"];
 /// name scan on this side would repeat the mistake #827 is about: `endpoint:
 /// string` passes any name check and is a free-text field. A diff here is the
 /// review prompt.
-const PINNED_TS_FIELDS: [(&str, &str, &str); 23] = [
+const PINNED_TS_FIELDS: [(&str, &str, &str); 24] = [
     ("DesktopSettingsDto", "version", "number"),
     (
         "DesktopSettingsDto",
@@ -506,7 +522,7 @@ const PINNED_TS_FIELDS: [(&str, &str, &str); 23] = [
     // boolean plus a sentence, and is the whole of what this side ever learns
     // about one.
     ("VoiceSettingsDto", "activation", "string"),
-    ("VoiceSettingsDto", "intent", "VoiceStageDto"),
+    ("VoiceSettingsDto", "intent", "VoiceIntentStageDto"),
     ("VoiceSettingsDto", "transcription", "VoiceStageDto"),
     // PRD #802's provider work. One interface for both stages, because both
     // hold the same three values and a second copy would be a second place to
@@ -517,6 +533,14 @@ const PINNED_TS_FIELDS: [(&str, &str, &str); 23] = [
     ("VoiceStageDto", "backend", "string"),
     ("VoiceStageDto", "endpoint", "string"),
     ("VoiceStageDto", "model", "string"),
+    // PRD #802's ceiling fix. The command stage is the shared interface plus
+    // one number, so it extends rather than copies — `ts_interface_fields`
+    // reads the declared members of each block, so the three inherited names
+    // are pinned once above and `max_tokens` is pinned here. It is snake_case
+    // because these keys are the wire's own spelling and nothing renames. A
+    // ceiling on the answer is not a credential in any reading: it is an
+    // integer, and the Rust counterpart is a newtype bounded at 64..=32768.
+    ("VoiceIntentStageDto", "max_tokens", "number"),
     (
         "DesktopSettingsSnapshotDto",
         "settings",
@@ -1389,6 +1413,7 @@ pub struct VoiceSettings {
             "RemoteEndpointDto",
             "VoiceSettingsDto",
             "VoiceStageDto",
+            "VoiceIntentStageDto",
             "DesktopSettingsSnapshotDto",
         ] {
             let body = block_after(&source, &format!("export interface {interface} "))
@@ -1441,6 +1466,11 @@ pub struct VoiceSettings {
             // parent, and this document is written to `localStorage` verbatim
             // by the fixture bridge.
             "function normalizeVoiceSettings(value: unknown): VoiceSettingsDto | undefined ",
+            // And the command stage's own normaliser, which builds on
+            // `normalizeVoiceStage` rather than spreading it — the field this
+            // list is about would ride in just as easily through a nested
+            // builder as through the parent.
+            "function normalizeVoiceIntentStage(value: unknown): VoiceIntentStageDto ",
         ] {
             let body = block_after(&source, signature)
                 .unwrap_or_else(|| panic!("no `{signature}` in {BRIDGE_TS}"));

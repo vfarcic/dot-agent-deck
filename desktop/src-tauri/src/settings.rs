@@ -184,7 +184,7 @@ use dot_agent_deck::remote_tunnel::{
 };
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::model_service::{ModelId, ServiceUrl};
+use crate::model_service::{ModelId, ServiceUrl, TokenCeiling};
 
 /// Overrides the whole settings path, mirroring `DOT_AGENT_DECK_CONFIG`
 /// (`src/config.rs`). Also the seam every test uses instead of the real
@@ -527,6 +527,18 @@ struct StageDocument<B> {
     backend: Option<B>,
     endpoint: Option<ServiceUrl>,
     model: Option<ModelId>,
+    /// The answer ceiling, which **only the command stage reads**.
+    ///
+    /// It is declared on the shared document rather than on a second one
+    /// because the two stages differ in this one key and nothing else, and a
+    /// parallel `IntentDocument`/`IntentSpec` pair would be two more places for
+    /// the bare-token migration below to be forgotten. What it costs is that
+    /// `[voice.transcription]` also *parses* the key: an out-of-range value
+    /// there is refused rather than ignored, which is the direction to err in —
+    /// a sentence naming the bound beats silence about a line the user meant to
+    /// have an effect. A well-formed one there is read and dropped, exactly as
+    /// any unknown key is.
+    max_tokens: Option<TokenCeiling>,
 }
 
 impl<B> Default for StageDocument<B> {
@@ -535,6 +547,7 @@ impl<B> Default for StageDocument<B> {
             backend: None,
             endpoint: None,
             model: None,
+            max_tokens: None,
         }
     }
 }
@@ -589,6 +602,7 @@ impl<B> StageSpec<B> {
                 backend: Some(backend),
                 endpoint: None,
                 model: None,
+                max_tokens: None,
             },
             Self::Table(document) => document,
         }
@@ -640,6 +654,23 @@ pub struct IntentSettings {
     pub backend: IntentBackend,
     pub endpoint: ServiceUrl,
     pub model: ModelId,
+    /// How much answer one utterance may cost, reasoning included.
+    ///
+    /// A field rather than a constant because the constant was **wrong for a
+    /// user-chosen endpoint**, which is what the provider work made this. 256
+    /// was sized from the Anthropic preset's 33–58-token answers and is not a
+    /// ceiling any reasoning model can write under: the reasoning is spent
+    /// first and counts against the same budget, so the reply comes back
+    /// truncated with nothing in it. Measured on `gpt-5-mini` at 256 against
+    /// the 24 phrase fixtures — **18/24**, every failure having spent exactly
+    /// 256 completion tokens on reasoning alone. See
+    /// [`crate::model_service::DEFAULT_TOKEN_CEILING`] for why the replacement
+    /// is 4096 and not 1024.
+    ///
+    /// The speech stage has no counterpart: a transcription is as long as the
+    /// audio was, and no bound this side could set would be about anything the
+    /// user chose.
+    pub max_tokens: TokenCeiling,
 }
 
 impl IntentSettings {
@@ -659,6 +690,12 @@ impl IntentSettings {
             backend,
             endpoint: ServiceUrl::parse(endpoint).expect("a valid preset endpoint"),
             model: ModelId::parse(model).expect("a valid preset model"),
+            // One number for both dialects and both presets. It is a CEILING
+            // and not a reservation — an answer that needs 30 tokens costs 30
+            // whatever this says — so there is nothing to gain by tuning it per
+            // preset and something to lose: a per-preset ceiling is a number
+            // that stops being right the moment the user edits the model.
+            max_tokens: TokenCeiling::default(),
         }
     }
 }
@@ -676,6 +713,7 @@ impl<'de> Deserialize<'de> for IntentSettings {
         Ok(Self {
             endpoint: doc.endpoint.unwrap_or(preset.endpoint),
             model: doc.model.unwrap_or(preset.model),
+            max_tokens: doc.max_tokens.unwrap_or(preset.max_tokens),
             backend: preset.backend,
         })
     }
@@ -3256,6 +3294,7 @@ fn unpredictable_suffix() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model_service::{DEFAULT_TOKEN_CEILING, MAX_TOKEN_CEILING, MIN_TOKEN_CEILING};
     use std::sync::Mutex;
 
     /// `settings_path` is the only thing here that reads the environment, and
@@ -3489,6 +3528,10 @@ mod tests {
                     "backend": "anthropic",
                     "endpoint": HOSTED_COMMAND_ENDPOINT,
                     "model": HOSTED_COMMAND_MODEL,
+                    // A NUMBER on both wires, not a string: the webview's
+                    // `VoiceIntentStageDto` declares `max_tokens: number`, and
+                    // a quoted integer here would be a key it silently dropped.
+                    "max_tokens": DEFAULT_TOKEN_CEILING,
                 },
                 "transcription": {
                     "backend": "local",
@@ -3824,12 +3867,147 @@ mod tests {
         assert_eq!(defaults.transcription.model.as_str(), LOCAL_SPEECH_MODEL);
         assert_eq!(defaults.intent.backend, IntentBackend::Anthropic);
         assert_eq!(defaults.intent.endpoint.as_str(), HOSTED_COMMAND_ENDPOINT);
+        assert_eq!(defaults.intent.max_tokens.get(), DEFAULT_TOKEN_CEILING);
         assert_eq!(defaults.activation, ActivationMode::Toggle);
         // Speech's default is the keyless one, which is the product decision
         // that replaced `Speech = off`. Commands' is not, and the asymmetry is
         // deliberate: PRD #802 measured local intent twice against the phrase
         // fixtures and it was not good enough — `IntentBackend` has the
         // numbers.
+    }
+
+    /// Scenario: the command stage's answer ceiling defaults to 4096, a
+    /// document that names one keeps it, and a bare backend token lands on the
+    /// default rather than on nothing.
+    ///
+    /// The field replaced a hardwired 256 that was sized from one model's
+    /// answers. `max_completion_tokens` counts a model's REASONING as well as
+    /// what it writes, so the old constant truncated every reasoning model
+    /// before it emitted a character — measured on `gpt-5-mini` at 18/24
+    /// against the phrase fixtures, every failure having spent exactly 256
+    /// completion tokens.
+    #[test]
+    fn the_command_ceiling_defaults_to_4096_and_a_document_may_change_it() {
+        assert_eq!(
+            IntentSettings::default().max_tokens.get(),
+            DEFAULT_TOKEN_CEILING
+        );
+        assert_eq!(DEFAULT_TOKEN_CEILING, 4096);
+        // Both presets, so a backend switch never re-introduces a per-provider
+        // number somebody has to keep in step.
+        for backend in [IntentBackend::Anthropic, IntentBackend::OpenaiCompatible] {
+            assert_eq!(
+                IntentSettings::for_backend(backend).max_tokens.get(),
+                DEFAULT_TOKEN_CEILING
+            );
+        }
+
+        let dir = tempdir();
+        let path = dir.path().join(SETTINGS_FILE_NAME);
+        std::fs::write(
+            &path,
+            "version = 1\n\n\
+             [voice.intent]\n\
+             backend = \"openai_compatible\"\n\
+             max_tokens = 16384\n",
+        )
+        .unwrap();
+        let (loaded, problem) = load_document(&path);
+        assert!(problem.is_none(), "{problem:?}");
+        let intent = loaded.voice.expect("the section is present").intent;
+        assert_eq!(intent.max_tokens.get(), 16_384);
+        // The coordinates the document did NOT name still come from the backend
+        // it did, which is what `IntentSettings::deserialize` exists for.
+        assert_eq!(intent.endpoint.as_str(), OPENAI_COMMAND_ENDPOINT);
+
+        // The bare-token shape an older document wrote carries no ceiling at
+        // all, so it lands on the default rather than on a missing field.
+        std::fs::write(&path, "version = 1\n\n[voice]\nintent = \"anthropic\"\n").unwrap();
+        let (loaded, problem) = load_document(&path);
+        assert!(problem.is_none(), "{problem:?}");
+        assert_eq!(
+            loaded
+                .voice
+                .expect("the section is present")
+                .intent
+                .max_tokens
+                .get(),
+            DEFAULT_TOKEN_CEILING
+        );
+    }
+
+    /// Scenario: a document holds an answer ceiling outside the accepted range.
+    /// The `[voice]` section is refused with a diagnostic naming the rule, and
+    /// the rest of the document — the user's appearance, their decks — is still
+    /// there.
+    ///
+    /// Both halves matter and the second is the one that was a P2 once already.
+    /// `toml_edit::de::from_str` is all-or-nothing, so a value refused in
+    /// `[voice]` used to cost the whole file;
+    /// [`sections_this_build_can_read`] is what narrows it to the section the
+    /// bad value is in. A new refusing field is a new way to reach that path,
+    /// so it is pinned here rather than assumed to inherit the fix.
+    #[test]
+    fn a_ceiling_outside_the_range_is_refused_and_keeps_the_rest_of_the_document() {
+        let dir = tempdir();
+        let path = dir.path().join(SETTINGS_FILE_NAME);
+        for refused in [
+            i64::from(MIN_TOKEN_CEILING) - 1,
+            0,
+            -1,
+            i64::from(MAX_TOKEN_CEILING) + 1,
+        ] {
+            std::fs::write(
+                &path,
+                format!(
+                    "version = 1\n\n\
+                     [appearance]\n\
+                     mode = \"dark\"\n\n\
+                     [voice.intent]\n\
+                     backend = \"openai_compatible\"\n\
+                     max_tokens = {refused}\n"
+                ),
+            )
+            .unwrap();
+
+            let (loaded, problem) = load_document(&path);
+            let problem =
+                problem.unwrap_or_else(|| panic!("{refused} must be refused with a diagnostic"));
+            assert!(problem.public().contains("line"), "{}", problem.public());
+            assert_eq!(
+                loaded.appearance.mode,
+                AppearanceMode::Dark,
+                "a refused ceiling is not a reason to forget the user's theme"
+            );
+            // The stage itself falls back rather than half-surviving: a
+            // backend left behind beside a dropped coordinate is the shape
+            // `TranscriptionSettings::deserialize` exists to prevent.
+            assert!(
+                loaded.voice.is_none(),
+                "{refused} left a half-read section behind"
+            );
+        }
+
+        // And the boundary values themselves are accepted, so the refusal is a
+        // range rather than a superstition about round numbers.
+        for accepted in [MIN_TOKEN_CEILING, MAX_TOKEN_CEILING] {
+            std::fs::write(
+                &path,
+                format!("version = 1\n\n[voice.intent]\nmax_tokens = {accepted}\n"),
+            )
+            .unwrap();
+            let (loaded, problem) = load_document(&path);
+            assert!(problem.is_none(), "{accepted}: {problem:?}");
+            assert_eq!(
+                loaded
+                    .voice
+                    .expect("the section is present")
+                    .intent
+                    .max_tokens
+                    .get(),
+                accepted
+            );
+        }
     }
 
     /// Scenario: a document names a `[voice]` backend this build has never
@@ -4083,6 +4261,20 @@ mod tests {
             assert_eq!(
                 constant, value,
                 "keep this identical to VOICE_STAGE_PRESETS in desktop/src/lib/bridge.ts"
+            );
+        }
+        // The answer ceiling's bounds and default, which the panel writes and
+        // which `bridge.ts` therefore has to agree about number for number: a
+        // frontend that offered 8 would put a value into `desktop.toml` that
+        // this side refuses, turning a number field into a save error.
+        for (constant, value) in [
+            (MIN_TOKEN_CEILING, 64),
+            (MAX_TOKEN_CEILING, 32768),
+            (DEFAULT_TOKEN_CEILING, 4096),
+        ] {
+            assert_eq!(
+                constant, value,
+                "keep this identical to the ceiling constants in desktop/src/lib/bridge.ts"
             );
         }
         // The image the unreachable-endpoint sentence names, which the panel's
@@ -5557,8 +5749,16 @@ mod tests {
         "passphrase",
     ];
 
-    /// The two shapes a credential-*shaped* key name is allowed to have, and
-    /// the concrete serialised type each one is.
+    /// The shapes a credential-*shaped* key name is allowed to have, and the
+    /// concrete serialised type each one is.
+    ///
+    /// **Two of the three are references to a credential; the third is not
+    /// about credentials at all.** [`Self::Count`] is here because
+    /// [`SECRETISH`] matches substrings and `token` is an ordinary English word
+    /// in a field like `max_tokens`. The list is therefore *paths whose name
+    /// trips the scan for a reason other than holding a credential*, which is
+    /// what it always was — the name `AllowedReference` predates the third
+    /// reason.
     ///
     /// **The type is half the exemption.** An exemption granted for a boolean
     /// "is one stored" would otherwise keep covering that path after someone
@@ -5571,9 +5771,15 @@ mod tests {
         /// A string, whose contents are ours rather than the user's.
         BackendName,
         /// A flag saying a credential is stored. A boolean, which cannot carry
-        /// credential material at all — the strongest of the two shapes, and
-        /// the one to prefer.
+        /// credential material at all — the strongest of the three shapes, and
+        /// the one to prefer where a reference is what is wanted.
         StoredFlag,
+        /// A **count**, whose name contains one of [`SECRETISH`] as a plain
+        /// English word rather than as a credential — `max_tokens`, where the
+        /// tokens are the model's units of output. An integer, which cannot
+        /// carry credential material at all, so this is as strong as
+        /// [`Self::StoredFlag`]; what it is not is a reference to anything.
+        Count,
     }
 
     impl AllowedReference {
@@ -5583,6 +5789,7 @@ mod tests {
             match self {
                 Self::BackendName => "string",
                 Self::StoredFlag => "boolean",
+                Self::Count => "integer",
             }
         }
     }
@@ -5592,17 +5799,31 @@ mod tests {
     /// the credential itself — the one carve-out PRD #803 allows — each paired
     /// with the concrete type that carve-out covers.
     ///
-    /// Empty, because nothing in today's schema needs an exception. It holds
-    /// paths and not bare names deliberately: `secret_backend` as a bare name
-    /// would exempt a field of that name in **every** section, including one
-    /// added later by someone who never read this rule, which is precisely the
-    /// silent-widening this list must not do.
+    /// One entry, and it is not a credential reference at all — see
+    /// [`AllowedReference::Count`]. It holds paths and not bare names
+    /// deliberately: `secret_backend` as a bare name would exempt a field of
+    /// that name in **every** section, including one added later by someone who
+    /// never read this rule, which is precisely the silent-widening this list
+    /// must not do.
     ///
     /// The form to add is one line — `("voice.secret_backend",
     /// AllowedReference::BackendName)` — and the shape is not a label: a path
     /// exempted as a [`AllowedReference::StoredFlag`] whose value is a string
     /// is reported as an offender, with the mismatch named.
-    const SECRETISH_ALLOWED: [(&str, AllowedReference); 0] = [];
+    const SECRETISH_ALLOWED: [(&str, AllowedReference); 1] = [
+        // PRD #802's answer ceiling. `token` is a substring of `max_tokens`,
+        // where it means a model's unit of output and nothing else: the value
+        // is an integer between 64 and 32768, bounded by
+        // `crate::model_service::TokenCeiling`, and it is sent as one field of
+        // a request body. The name is the one both wire dialects use and the
+        // one every LLM API a user has met spells it — renaming it to dodge a
+        // substring scan would cost more clarity than the scan buys here.
+        //
+        // The type is half the exemption, exactly as the enum's doc says: this
+        // covers `max_tokens` **while it is an integer**. Change it to a
+        // `String` and the tripwire fires again, naming the mismatch.
+        ("voice.intent.max_tokens", AllowedReference::Count),
+    ];
 
     const SECRET_RULE: &str = "\
 WHAT THIS CHECK IS: a NAMING TRIPWIRE, not a security boundary. It reads the \
@@ -5768,6 +5989,11 @@ forms it is.";
                     backend: IntentBackend::Anthropic,
                     endpoint: ServiceUrl::parse(HOSTED_COMMAND_ENDPOINT).unwrap(),
                     model: ModelId::parse(HOSTED_COMMAND_MODEL).unwrap(),
+                    // Non-default, like every other field in this fixture: the
+                    // sentinel sweep walks a serialised document, so a field
+                    // left on its default is one it cannot tell apart from an
+                    // absent one.
+                    max_tokens: TokenCeiling::parse(1024).unwrap(),
                 },
                 transcription: TranscriptionSettings {
                     backend: TranscriptionBackend::Remote,
@@ -6650,6 +6876,7 @@ activation = \"toggle\"
 backend = \"anthropic\"
 endpoint = \"https://api.anthropic.com/v1/messages\"
 model = \"claude-haiku-4-5\"
+max_tokens = 1024
 
 [voice.transcription]
 backend = \"remote\"
