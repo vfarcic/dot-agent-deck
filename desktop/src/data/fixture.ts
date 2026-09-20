@@ -1068,10 +1068,10 @@ export const FIXTURE_VOICE_UTTERANCE = FIXTURE_VOICE_COMMANDS[0].phrases[0];
  *
  * Repeated `?voice=` parameters rather than one delimited value: an utterance
  * is a sentence and every delimiter worth choosing occurs inside one. The
- * browser tier drives a whole session this way — *"type to the tester"*, then
- * what to type, then *"stop dictation"* — which is what lets a Playwright test
- * ask about the utterance AFTER the first one, and a stand-in that spoke once
- * could not be asked that at all.
+ * browser tier drives a whole session this way — *"type run the login tests"*,
+ * then *"send it"* — which is what lets a Playwright test ask about the
+ * utterance AFTER the first one, and a stand-in that spoke once could not be
+ * asked that at all.
  *
  * With no parameter it is the single canned utterance the preview has always
  * had, so every existing page and test sees exactly what it saw before.

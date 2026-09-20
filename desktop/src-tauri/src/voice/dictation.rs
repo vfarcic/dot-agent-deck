@@ -87,9 +87,19 @@ pub const DICTATION_OPENERS: [&str; 4] = ["type", "write", "say", "dictate"];
 /// and `voice_off`'s own description claims *"stop listening"*, *"stop voice"*
 /// and *"stop voice control"*. Making a bare *"stop"* press Enter in an agent's
 /// prompt would put the irreversible action on the word most likely to be said
-/// in a panic. *"go ahead"* is absent for a narrower reason: an agent that has
-/// just asked *"shall I proceed?"* makes *"go ahead"* something the user wants
-/// **typed**, not something they want pressed.
+/// in a panic.
+///
+/// **"go ahead" is absent from this list and is still a send phrase**, which is
+/// worth saying because the two halves read like a contradiction.
+/// `submit_prompt`'s own description names it, so a bare *"go ahead"* is
+/// answered by the model rather than here — and the model is told it means
+/// send. This list decides who answers an utterance, never what happens to it,
+/// which is why check 13 runs one way only. The worry that kept it out — an
+/// agent that has just asked *"shall I proceed?"* makes *"go ahead"* an answer
+/// the user wants **typed** — is real, and keeping it out does not serve it:
+/// [`strip_opening`] always strips at least one introducing token, so no
+/// utterance is ever typed whole. *"type go ahead"* is how those words get
+/// typed.
 pub const SUBMIT_PHRASES: [&str; 6] = ["end", "send", "send it", "submit", "enter", "press enter"];
 
 /// One transcript, reduced to the form the phrase lists are compared against.
