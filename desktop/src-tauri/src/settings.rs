@@ -667,17 +667,6 @@ impl VoiceToken for TranscriptionBackend {
     }
 }
 
-impl TranscriptionBackend {
-    /// Whether this backend authenticates with a key of the app's own.
-    ///
-    /// The panel renders a key row from this and the transcriber decides
-    /// whether to read the keychain from it, so the two cannot disagree about
-    /// which stage needs a credential.
-    pub fn needs_key(self) -> bool {
-        matches!(self, Self::Remote)
-    }
-}
-
 /// Which `IntentResolver` turns a transcript into an action (PRD #802 M5).
 ///
 /// **`Claude` is the default because it needs no key and no download**, which
@@ -736,27 +725,6 @@ impl VoiceToken for IntentBackend {
             "remote" => Self::Remote,
             _ => Self::default(),
         }
-    }
-}
-
-impl IntentBackend {
-    /// Whether this backend authenticates with a key of the app's own.
-    ///
-    /// [`TranscriptionBackend::needs_key`]'s counterpart, and the one thing the
-    /// panel and the resolver both read to decide whether a key row belongs on
-    /// screen.
-    pub fn needs_key(self) -> bool {
-        matches!(self, Self::Remote)
-    }
-
-    /// Whether this backend is reached at [`IntentSettings::endpoint`].
-    ///
-    /// False for [`Self::Claude`], which spawns a CLI on this machine: the
-    /// stored endpoint and model are what the panel shows the moment the user
-    /// switches to the keyed backend, and offering them beside a subprocess
-    /// would be two controls that change nothing.
-    pub fn is_http(self) -> bool {
-        matches!(self, Self::Remote)
     }
 }
 
@@ -3414,10 +3382,9 @@ mod tests {
         assert_eq!(defaults.intent.backend, IntentBackend::Claude);
         assert_eq!(defaults.intent.endpoint.as_str(), HOSTED_COMMAND_ENDPOINT);
         assert_eq!(defaults.activation, ActivationMode::Toggle);
-        // Neither default asks for a credential, which is the product decision
-        // that replaced `Speech = off`: the feature works on the day it ships.
-        assert!(!defaults.transcription.backend.needs_key());
-        assert!(!defaults.intent.backend.needs_key());
+        // Both of those backends are the keyless ones, which is the product
+        // decision that replaced `Speech = off`: the feature works on the day
+        // it ships without anyone pasting a credential.
     }
 
     /// Scenario: a document names a `[voice]` backend this build has never
@@ -3629,26 +3596,6 @@ mod tests {
             LOCAL_SPEECH_IMAGE, "ghcr.io/speaches-ai/speaches:0.9.0-rc.3-cpu",
             "keep this identical to the hint in desktop/src/components/VoicePanel.tsx"
         );
-    }
-
-    /// Which backends ask for a key, asserted as the closed set the panel
-    /// renders a key row from.
-    ///
-    /// The panel decides whether to show a credential field from this, and the
-    /// backends decide whether to read the keychain from it — so a variant
-    /// added on one side and not the other is a key row with nothing behind it,
-    /// or a backend that reads a key the user was never asked for.
-    #[test]
-    fn exactly_the_hosted_backends_ask_for_a_key() {
-        assert!(!TranscriptionBackend::Local.needs_key());
-        assert!(TranscriptionBackend::Remote.needs_key());
-        assert!(!IntentBackend::Claude.needs_key());
-        assert!(IntentBackend::Remote.needs_key());
-        // The agent CLI is a subprocess rather than a request, so its endpoint
-        // and model are stored and not used — which is why the panel hides
-        // those two rows for it.
-        assert!(!IntentBackend::Claude.is_http());
-        assert!(IntentBackend::Remote.is_http());
     }
 
     /// Scenario: a document holds a `[voice]` section; a client whose UI cannot

@@ -148,9 +148,10 @@ pub trait IntentResolver: Send + Sync {
 /// hope that whoever holds it will not serialize it.
 ///
 /// The endpoint and the model travel with the settings rather than being
-/// constants in [`super::remote`] — PRD #802's provider work — and the agent-CLI
-/// variant ignores both, which is why [`crate::settings::IntentBackend::is_http`]
-/// exists for the panel to read rather than the panel guessing from the token.
+/// constants in [`super::remote`] — PRD #802's provider work. The agent-CLI
+/// variant ignores both: they are stored so that switching to the keyed backend
+/// lands on something that works, and the panel hides those two rows while this
+/// variant is chosen.
 pub fn resolver_for(
     settings: &crate::settings::IntentSettings,
     secrets: std::sync::Arc<dyn crate::secrets::SecretStore>,
