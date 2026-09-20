@@ -17,9 +17,11 @@
 //! No daemon/protocol involvement: this is a CLI verb that shells out to
 //! `git` and `gh` directly, synchronously — no `PROTOCOL_VERSION` bump.
 //!
-//! Every `git` here is built by [`crate::git_env::git_at`], so the directory
-//! this module chose is the repository git acts on — not whatever an ambient
-//! `GIT_DIR` names (issue #1181).
+//! Every `git` in this module's production code is built by
+//! [`crate::git_env::git_at`], so the directory this module chose is the
+//! repository git acts on — not whatever an ambient `GIT_DIR` names (issue
+//! #1181). `xtask/linkage-check`'s rule 13 keeps that true for the next call
+//! site; `tests::ambient_location` proves it of the ones that exist.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;

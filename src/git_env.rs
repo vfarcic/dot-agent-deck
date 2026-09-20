@@ -23,10 +23,15 @@
 //!
 //! **The list lives here and nowhere else.** A second copy is how a variable
 //! goes missing from one of them, and a missing variable is a silent
-//! data-loss hole rather than a compile error — so every `git` this crate
-//! spawns is built by one of the constructors below, and
-//! `xtask/linkage-check`'s rule 13 fails the build on a raw `git` program
-//! literal anywhere else in `src/`.
+//! data-loss hole rather than a compile error — so every `git` this crate's
+//! PRODUCTION code spawns is built by one of the constructors below, and
+//! `xtask/linkage-check`'s rule 13 fails the build on a `git` program literal
+//! anywhere else in `src/`'s production half.
+//!
+//! Production is the narrow claim on purpose. Rule 13 exempts each file's
+//! trailing `#[cfg(test)] mod tests`, so a fixture that builds its own
+//! repositories is a separate question — [`fixture_git`] below is what those
+//! should use, and issue #1121 is where that half is tracked.
 
 use std::path::Path;
 use std::process::Command;
@@ -84,11 +89,13 @@ pub(crate) const GIT: &str = "git";
 /// `git`, to be run from inside `dir`, with the ambient location environment
 /// switched off so the answer depends on `dir` and nothing else.
 ///
-/// Every synchronous `git` invocation in [`crate::worktree_owner`] and
-/// [`crate::worktree_reclaim`] goes through here, which makes
-/// [`crate::worktree_owner::git_dir_of`] — and so the ownership gate, the
-/// enumeration the reclaim decision is made from, and the removal behind it —
-/// immune to the same ambient override.
+/// Every synchronous `git` invocation in [`crate::worktree_owner`]'s and
+/// [`crate::worktree_reclaim`]'s PRODUCTION code goes through here — checked
+/// by rule 13, not merely intended — which makes
+/// [`crate::worktree_owner::git_dir_of`], and so the ownership gate, the
+/// enumeration the reclaim decision is made from, and the removal behind it,
+/// immune to the same ambient override. Their test fixtures are outside that
+/// claim; see the module header.
 pub(crate) fn git_at(dir: &Path) -> Command {
     let mut cmd = Command::new(GIT);
     cmd.current_dir(dir);
