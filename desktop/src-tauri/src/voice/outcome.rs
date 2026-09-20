@@ -228,19 +228,24 @@ impl VoiceOutcome {
 /// One utterance's outcome, plus what it cost to get it.
 ///
 /// **The latency is produced here rather than left for M6 to invent**, which is
-/// PRD #802's mitigation for its own risk entry: measured through this very
-/// function, the default backend took **4.30 s and 6.30 s** — *"slow enough to
+/// PRD #802's mitigation for its own risk entry, and the number it was
+/// mitigating was a big one: measured through this very function, the
+/// then-default agent-CLI backend took **4.30 s and 6.30 s** — *"slow enough to
 /// feel broken"* for a supervisor who just pressed a button — against the keyed
-/// backend's 0.62–1.03 s. The answer the PRD chose is to surface the number
-/// rather than hide it. A surface that had to guess would guess wrong, and a
-/// surface handed the real number can say *claude, 6.3 s* and let the user
-/// decide whether to switch — which is the whole reason the seam is not
-/// optional.
+/// backend's 0.62–1.03 s. **That backend is gone, so there is no slow default
+/// any more**, which narrows what the seam is for without removing it: both
+/// remaining protocols are an HTTP request to whatever endpoint the settings
+/// name, and a model on this machine and a hosted API are the same code path,
+/// so nothing here can guess what the wait will be. The answer the PRD chose is
+/// to surface the number rather than hide it. A surface that had to guess would
+/// guess wrong, and a surface handed the real number can say *anthropic, 0.9 s*
+/// and let the user decide whether to switch — which is the whole reason the
+/// seam is not optional.
 ///
 /// Measured around [`IntentResolver::resolve`], so it is the wall clock the
-/// user actually waited for — including a lazy PATH capture or a one-time
-/// strict-schema compile, which are real waits that belong in the number rather
-/// than being excused out of it.
+/// user actually waited for — including the one-time strict-schema compile,
+/// which is a real wait that belongs in the number rather than being excused
+/// out of it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VoiceResult {
@@ -251,7 +256,12 @@ pub struct VoiceResult {
     /// before any backend call, and rendering `0 ms` for it would claim a
     /// measurement that was never taken.
     pub resolve_ms: Option<u32>,
-    /// Which backend answered — `claude`, `remote`, `stub`.
+    /// Which backend answered — `anthropic`, `openai`, `stub`.
+    ///
+    /// The **protocol**, not the vendor: it is rendered beside the latency, and
+    /// *remote, 0.9 s* answers a question nobody asked once every backend is
+    /// remote. `Protocol::name` produces the first two and the test stub the
+    /// third.
     ///
     /// Present even when no call was made, because it names what *would* have
     /// answered, which is what a settings-facing sentence is about.
@@ -289,9 +299,9 @@ pub async fn handle_utterance(
         backend,
     };
 
-    // Silence is a no-match without a backend call. The default intent backend
-    // measured 4.3-6.3 s through here and costs money per utterance, and
-    // neither is worth spending on an empty string.
+    // Silence is a no-match without a backend call. Every backend is now an
+    // HTTP request costing a round trip and, off loopback, money per utterance,
+    // and neither is worth spending on an empty string.
     if transcript.is_empty() {
         return finish(VoiceOutcome::no_match(transcript), None);
     }
@@ -322,9 +332,11 @@ pub async fn handle_utterance(
 
     // The case PRD #802's four-outcome list could not express: a backend that
     // named an action outside the table. Impossible under grammar-constrained
-    // decoding, refused by the schema under the keyed backend's `strict: true`,
-    // and merely unlikely under a print-mode agent CLI — so it is refused HERE,
-    // once, for every backend, rather than trusted to any of them.
+    // decoding and refused by the schema under either shipping protocol's
+    // `strict: true`, but merely unlikely under a backend that constrains
+    // nothing — which the withdrawn agent CLI was, and which a server behind a
+    // user-supplied endpoint can still be. So it is refused HERE, once, for
+    // every backend, rather than trusted to any of them.
     let Some(row) = table.row(&answer.action) else {
         return finish(VoiceOutcome::unknown_action(transcript, answer.action));
     };

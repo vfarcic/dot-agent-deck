@@ -287,19 +287,26 @@ const ALLOWED_FIELD_TYPES: [(&str, FieldKind, &str); 23] = [
     (
         "IntentBackend",
         FieldKind::Scalar,
-        "a closed enum serialised as one token: `claude` or `remote` — WHICH \
-         backend resolves an utterance, never how it authenticates. The set \
-         was `claude | opencode | remote` until PRD #802's landed-work \
-         security audit WITHDREW `opencode`: the agent-CLI backend hands a \
-         general-purpose coding agent a prompt built partly from untrusted \
-         input, so the child has to be containable, and `opencode run` has no \
-         no-tools flag and no no-persistence option (its sessions were \
-         confirmed locally to be resumable and to hold the utterance). \
-         `claude` has a flag for each. The keyed `remote` one's credential \
-         lives in the OS keychain under SecretId::VoiceIntent and has no field \
-         here at all. Same folding deserializer and same MAX_VOICE_TOKEN_BYTES \
-         bound, so no text is representable — and that folding is what makes a \
-         stale `intent = \"opencode\"` load as the default rather than fail",
+        "a closed enum serialised as one token: `anthropic` or \
+         `openai_compatible` — WHICH wire protocol resolves an utterance, \
+         never how it authenticates. The set was `claude | opencode | remote`, \
+         and all three of those tokens are now withdrawn. PRD #802's \
+         landed-work security audit took `opencode` first: the agent-CLI \
+         backend hands a general-purpose coding agent a prompt built partly \
+         from untrusted input, so the child has to be containable, and \
+         `opencode run` has no no-tools flag and no no-persistence option (its \
+         sessions were confirmed locally to be resumable and to hold the \
+         utterance). `claude` had a flag for each and survived that audit, \
+         then went with PRD #802's provider work, which removed the \
+         subprocess backend outright — and `remote` went with it, because the \
+         one keyed backend became two protocol dialects and a token naming \
+         neither is not a choice a user can act on. Where a credential is \
+         needed it lives in the OS keychain under SecretId::VoiceIntent and \
+         has no field here at all; a loopback endpoint is asked for none. Same \
+         folding deserializer and same MAX_VOICE_TOKEN_BYTES bound, so no text \
+         is representable — and that folding is what makes a stale \
+         `intent = \"opencode\"`, `\"claude\"` or `\"remote\"` load as the \
+         default rather than fail",
     ),
     (
         "TranscriptionBackend",
@@ -380,10 +387,12 @@ const ALLOWED_FIELD_TYPES: [(&str, FieldKind, &str); 23] = [
         "IntentSettings",
         FieldKind::Section,
         "a section struct — the command stage — whose own fields this check \
-         walks, in TranscriptionSettings' shape and for its reason. Its \
-         endpoint and model are ignored while the backend is the agent CLI, \
-         which spawns a process rather than making a request; they are what \
-         the panel shows the moment a user picks the keyed backend",
+         walks, in TranscriptionSettings' shape and for its reason. Both of \
+         its backends are HTTP, so the endpoint and the model are live under \
+         either one and the panel shows them always — the backend picks which \
+         preset they default to, not whether they are read. They were ignored \
+         under the withdrawn agent-CLI backend, which spawned a process rather \
+         than making a request; nothing in the enum does that now",
     ),
 ];
 

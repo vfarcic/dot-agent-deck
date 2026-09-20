@@ -810,11 +810,15 @@ impl VoiceToken for TranscriptionBackend {
 
 /// Which `IntentResolver` turns a transcript into an action (PRD #802 M5).
 ///
-/// **Commands is API-ONLY, and the enum has one variant because of it.** M5
-/// shipped two: this one, and an agent-CLI backend that spawned the
-/// pre-authenticated `claude` on the user's machine — no key of the app's own,
-/// no download, and the default precisely because of that. PRD #802's provider
-/// work removed it. Two reasons, and the first is the product one:
+/// **Commands is API-ONLY, and both variants are protocol dialects because of
+/// it.** The enum names a *wire shape* — Anthropic Messages or OpenAI
+/// chat-completions — and never an executor, because the one executor it held
+/// is gone. M5 shipped two backends of a different kind: one keyed HTTP
+/// request, and an agent-CLI backend that spawned the pre-authenticated
+/// `claude` on the user's machine — no key of the app's own, no download, and
+/// the default precisely because of that. PRD #802's provider work removed the
+/// subprocess one, and what remained split into the two variants below. Two
+/// reasons it went, and the first is the product one:
 ///
 /// - **A stage that spends a credential has to let the user say whose.** The
 ///   agent CLI is one vendor's, chosen by this build, and an app cannot assume
@@ -831,12 +835,14 @@ impl VoiceToken for TranscriptionBackend {
 ///
 /// The cost to a user who had picked it is **one re-pick**, the same as the
 /// `opencode` withdrawal cost: [`Self::from_str_lossy`] folds an unknown token
-/// to the default, so `intent = "claude"` left in a document loads as the keyed
-/// backend and the rest of the document survives. That folding is the whole
-/// reason a closed enum was the right shape here.
+/// to the default, so `intent = "claude"` left in a document loads as
+/// [`Self::Anthropic`] and the rest of the document survives. That folding is
+/// the whole reason a closed enum was the right shape here, and it is what
+/// makes the pre-provider-work `intent = "remote"` cost nothing at all: that
+/// token named the Anthropic API, so the fold lands where the user already was.
 ///
-/// **A local model is reachable and is not a variant.** The keyed backend is
-/// HTTP to a [`ServiceUrl`], so pointing it at a server on this machine is the
+/// **A local model is reachable and is not a variant.** Both variants are HTTP
+/// to a [`ServiceUrl`], so pointing either at a server on this machine is the
 /// same code path. It ships as no preset and is recommended nowhere, because
 /// PRD #802 measured local intent twice against the 24 phrase fixtures and it
 /// was not good enough: a 1.5B chat model scored 20/24, turning *"what time is
@@ -3795,9 +3801,11 @@ mod tests {
     ///
     /// The distinction is [`DesktopSettings::voice`]'s whole reason for being
     /// an `Option`, and the defaults it materialises to are the product
-    /// decision: a **keyless speech container on loopback**, the **agent CLI**
-    /// for commands (no key, no download, try-able on day one), and the one
-    /// **activation mode** that ships. Neither stage asks for a credential.
+    /// decision: a **keyless speech container on loopback**, the **Anthropic
+    /// API** for commands, and the one **activation mode** that ships. The two
+    /// stages differ on credentials and that asymmetry IS the decision —
+    /// speech asks for none, commands does, because PRD #802 measured local
+    /// intent twice and it was not good enough.
     #[test]
     fn an_absent_voice_section_reads_as_unspecified_with_this_builds_defaults() {
         let dir = tempdir();
@@ -3896,8 +3904,10 @@ mod tests {
     }
 
     /// Scenario: a document written by a build that shipped one of the two
-    /// withdrawn agent-CLI intent backends loads on this build. Both tokens
-    /// fold to `remote`, the rest of the document survives, and nothing errors.
+    /// withdrawn agent-CLI intent backends — or the pre-provider-work spelling
+    /// of the one that survived — loads on this build. All three tokens fold to
+    /// [`IntentBackend::Anthropic`], the rest of the document survives, and
+    /// nothing errors.
     ///
     /// The migration for [`IntentBackend`]'s withdrawn variants, asserted
     /// rather than argued: the audit that removed `opencode` reasoned that the
@@ -3905,7 +3915,9 @@ mod tests {
     /// provider work then spent that reasoning a second time on `claude` — the
     /// whole agent-CLI backend, which was the DEFAULT. So the case this pins is
     /// no longer a minority re-pick: it is what every existing user's document
-    /// says. What it costs them is one re-pick, not a lost document.
+    /// says. What it costs them is one re-pick, not a lost document — and for
+    /// `remote`, which named the Anthropic API before the provider work split
+    /// it into two protocol tokens, not even that.
     #[test]
     fn the_withdrawn_agent_cli_intent_backends_fold_to_the_default() {
         let dir = tempdir();
