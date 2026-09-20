@@ -966,6 +966,32 @@ mod tests {
         /// it is steered there.
         const SHARED_BRANCH: &str = "shared";
 
+        /// The variable names this test expects the neutralization to cover,
+        /// held independently of [`crate::git_env::AMBIENT_LOCATION_VARS`] so
+        /// that list cannot drift silently.
+        ///
+        /// **A deliberate second copy, and the one place a second copy is
+        /// right.** Everywhere else in this change a second list is the
+        /// defect, because production behaviour reads one of them and a
+        /// missing entry is silent. Here nothing reads it but an equality
+        /// assertion, and what it buys is the failure direction the shared
+        /// list cannot give: DELETING an entry makes production stop clearing
+        /// that variable *and* makes this test stop setting it, so the run
+        /// stays green while the hole reopens. Adding one is already caught,
+        /// by [`ambient_value`]'s `panic!` on a name it does not know — so
+        /// with both, a change in either direction has to be made here too, on
+        /// purpose.
+        const EXPECTED_VARS: [&str; 8] = [
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+            "GIT_COMMON_DIR",
+            "GIT_DIR",
+            "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+            "GIT_INDEX_FILE",
+            "GIT_NAMESPACE",
+            "GIT_OBJECT_DIRECTORY",
+            "GIT_WORK_TREE",
+        ];
+
         /// What each variable in [`crate::git_env::AMBIENT_LOCATION_VARS`] is set
         /// to in the child, all aimed at the decoy.
         ///
@@ -1054,6 +1080,24 @@ mod tests {
                 return;
             }
 
+            // Before anything else: the neutralization must still cover the
+            // variables this test was written against. A deletion from
+            // `AMBIENT_LOCATION_VARS` would otherwise take the coverage with
+            // it and leave the run green — see `EXPECTED_VARS`.
+            // Compared as SLICES, not arrays: a removal changes the array's
+            // length, and array `assert_eq!` against a different length is a
+            // type error whose message is rustc's rather than the one below —
+            // which is the message that says what to do about it.
+            let mut covered: Vec<&str> = crate::git_env::AMBIENT_LOCATION_VARS.to_vec();
+            covered.sort_unstable();
+            assert_eq!(
+                covered.as_slice(),
+                EXPECTED_VARS.as_slice(),
+                "AMBIENT_LOCATION_VARS changed. Production neutralizes exactly \
+                 what is in it, and this test stages exactly what is in it, so \
+                 a removal would silently narrow both. Update EXPECTED_VARS and \
+                 `ambient_value` deliberately, or put the variable back"
+            );
             let scratch = crate::test_temp::tempdir().expect("scratch tempdir");
             let sandbox = scratch.path();
             // The victim: the repository the ambient variables name. Nothing the

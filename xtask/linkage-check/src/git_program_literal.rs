@@ -38,11 +38,13 @@
 //!
 //! ## Scope, and what is NOT covered
 //!
-//! Every `.rs` under `src/`, **production half only** — the trailing
-//! `#[cfg(test)] mod tests` block is exempt, because a test fixture that
-//! builds its own repositories is a different question (issue #1121 covers it,
-//! and `git_env::fixture_git` is what it uses). `src/git_env.rs` is exempt
-//! because it is the neutralizer.
+//! Every `.rs` under `src/`, **production code only** — anything gated on
+//! `test` by a `#[cfg]` is exempt however it is spelled, because a test
+//! fixture that builds its own repositories is a different question (issue
+//! #1121 covers it, and `git_env::fixture_git` is what it uses).
+//! [`production_violations`] documents exactly which `cfg` forms exempt and
+//! why the set is narrow. `src/git_env.rs` is exempt because it is the
+//! neutralizer.
 //!
 //! Not covered, so it is not mistaken for covered: `desktop/src-tauri/src/`,
 //! `xtask/` and `tests/`. A wrapper that takes the program name from a
@@ -133,52 +135,46 @@ fn collect_rs(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// The 1-indexed lines of `text`'s PRODUCTION half that hold a `git` string
+/// The 1-indexed lines of `text`'s PRODUCTION code that hold a `git` string
 /// literal.
+///
+/// "Production" is decided **structurally**, by `#[cfg]`, not by a module name.
+/// An item gated on `test` is not compiled into a production build, so its
+/// whole body is exempt however it is spelled: `mod tests`, `daemon.rs`'s
+/// `mod orphan_watchdog_tests`, `platform/proc/mod.rs`'s `pub(crate) mod
+/// test_child`, a bare `#[cfg(test)]` block inside a production function
+/// (`issue_dispatch_run::devbox_program` has one), or a braceless item such as
+/// `#[cfg(test)] mod test_temp;`. An earlier version of this rule matched only
+/// a top-level `#[cfg(test)]` immediately followed by `mod tests`, which
+/// scanned the first two of those as production and would have failed the
+/// build on a test-only `git` fixture added to either.
+///
+/// Exemption is **narrow on purpose**, because the two errors are not
+/// symmetric: scanning something that did not need scanning is a build failure
+/// a human looks at, while exempting something that did is the silent hole
+/// this rule exists to close. So only `cfg(test)` and `cfg(all(test, …))`
+/// exempt. `cfg(any(test, debug_assertions))` — which `build_id.rs` and
+/// `daemon_protocol.rs` use — does NOT, because such an item IS compiled into
+/// a debug production build; neither does `cfg(not(test))`, which is
+/// production-only. Widening this set is a deliberate act.
 pub fn production_violations(text: &str) -> Vec<usize> {
-    let boundary = test_module_line(text);
-    git_literal_lines(text)
-        .into_iter()
-        .filter(|line| boundary.is_none_or(|b| *line < b))
-        .collect()
-}
-
-/// The 1-indexed line of the top-level `#[cfg(test)]` that opens a trailing
-/// `mod tests`, if the file has one. Everything from there down is the test
-/// half.
-///
-/// Matched at column 0 on both lines, deliberately: a `#[cfg(test)]` indented
-/// inside a function body (`issue_dispatch_run`'s `devbox_program` has one) is
-/// production code with a test-only branch, not the test module, and treating
-/// it as the boundary would exempt 1100 lines of production source.
-fn test_module_line(text: &str) -> Option<usize> {
-    let lines: Vec<&str> = text.lines().collect();
-    lines.windows(2).enumerate().find_map(|(i, pair)| {
-        (pair[0] == "#[cfg(test)]" && pair[1].starts_with("mod tests")).then_some(i + 1)
-    })
-}
-
-/// Every 1-indexed line of `text` holding a string literal whose content is
-/// exactly `git`, in CODE position.
-///
-/// A character scan rather than a regex or a token parse. A regex cannot tell
-/// a literal from the same five characters inside a doc comment, and this
-/// file's own rule sentence is such a comment — a rule that trips on prose
-/// about itself gets weakened rather than obeyed. A token parse (`syn`) would
-/// be exact but reports every span as line 0 unless `proc-macro2`'s
-/// `span-locations` feature is switched on for the whole workspace, which
-/// costs every proc-macro expansion in it to locate one string.
-///
-/// Comments (line and nested block), raw strings and char literals are all
-/// recognized so that a `"` inside any of them cannot desynchronize the scan.
-/// Lifetimes are distinguished from char literals by lookahead, which is what
-/// `'a'` and `'a` differ by.
-fn git_literal_lines(text: &str) -> Vec<usize> {
     let chars: Vec<char> = text.chars().collect();
     let mut out = Vec::new();
     let mut i = 0usize;
     let mut line = 1usize;
+    // Brace depth, the depth a `cfg(test)` item's body opened at, and whether
+    // a `cfg(test)` attribute has been read but its item not yet entered (the
+    // attribute itself suppresses, so `#[cfg(test)] const X: &str = "git";`
+    // is exempt as well as `#[cfg(test)] fn f() { … }`).
+    let mut depth = 0usize;
+    let mut suppress_at: Option<usize> = None;
+    let mut pending = false;
+    // `#![cfg(test)]` gates the whole file from wherever it appears.
+    let mut file_suppressed = false;
     let at = |i: usize| chars.get(i).copied();
+    let suppressed = |file_suppressed: bool, suppress_at: Option<usize>, pending: bool| {
+        file_suppressed || suppress_at.is_some() || pending
+    };
 
     while i < chars.len() {
         match chars[i] {
@@ -192,22 +188,106 @@ fn git_literal_lines(text: &str) -> Vec<usize> {
                 }
             }
             '/' if at(i + 1) == Some('*') => {
-                let mut depth = 1usize;
+                let mut nest = 1usize;
                 i += 2;
-                while i < chars.len() && depth > 0 {
+                while i < chars.len() && nest > 0 {
                     if chars[i] == '\n' {
                         line += 1;
                         i += 1;
                     } else if chars[i] == '/' && at(i + 1) == Some('*') {
-                        depth += 1;
+                        nest += 1;
                         i += 2;
                     } else if chars[i] == '*' && at(i + 1) == Some('/') {
-                        depth -= 1;
+                        nest -= 1;
                         i += 2;
                     } else {
                         i += 1;
                     }
                 }
+            }
+            '#' if matches!(at(i + 1), Some('[') | Some('!')) => {
+                let inner = at(i + 1) == Some('!');
+                let mut j = i + 1;
+                if inner {
+                    j += 1;
+                }
+                if at(j) != Some('[') {
+                    i += 1;
+                    continue;
+                }
+                let mut nest = 0usize;
+                let mut body = String::new();
+                while j < chars.len() {
+                    match chars[j] {
+                        // Stepped over rather than read: a `]` inside an
+                        // attribute's own string (`#[doc = "a ] b"]`) would
+                        // otherwise end the attribute early and leave the
+                        // scan resuming mid-attribute.
+                        '"' => {
+                            j += 1;
+                            while j < chars.len() {
+                                match chars[j] {
+                                    '\\' => j += 2,
+                                    '"' => break,
+                                    '\n' => {
+                                        line += 1;
+                                        j += 1;
+                                    }
+                                    _ => j += 1,
+                                }
+                            }
+                        }
+                        '[' => {
+                            nest += 1;
+                            if nest > 1 {
+                                body.push('[');
+                            }
+                        }
+                        ']' => {
+                            nest -= 1;
+                            if nest == 0 {
+                                j += 1;
+                                break;
+                            }
+                            body.push(']');
+                        }
+                        '\n' => {
+                            line += 1;
+                            body.push(' ');
+                        }
+                        c => body.push(c),
+                    }
+                    j += 1;
+                }
+                if is_test_gate(&body) {
+                    if inner {
+                        file_suppressed = true;
+                    } else {
+                        pending = true;
+                    }
+                }
+                i = j;
+            }
+            '{' => {
+                if pending {
+                    suppress_at = Some(depth);
+                    pending = false;
+                }
+                depth += 1;
+                i += 1;
+            }
+            '}' => {
+                depth = depth.saturating_sub(1);
+                if suppress_at == Some(depth) {
+                    suppress_at = None;
+                }
+                i += 1;
+            }
+            ';' => {
+                // A braceless item ends here: `#[cfg(test)] mod test_temp;`,
+                // `#[cfg(test)] use …;`, `#[cfg(test)] const X: &str = "git";`.
+                pending = false;
+                i += 1;
             }
             '\'' => {
                 // `'\n'` (escaped char), `'a'` (plain char), or `'a` (lifetime).
@@ -242,7 +322,7 @@ fn git_literal_lines(text: &str) -> Vec<usize> {
                     content.push(chars[i]);
                     i += 1;
                 }
-                if content == "git" {
+                if content == "git" && !suppressed(file_suppressed, suppress_at, pending) {
                     out.push(start_line);
                 }
             }
@@ -277,7 +357,7 @@ fn git_literal_lines(text: &str) -> Vec<usize> {
                         }
                     }
                 }
-                if content == "git" {
+                if content == "git" && !suppressed(file_suppressed, suppress_at, pending) {
                     out.push(start_line);
                 }
             }
@@ -285,6 +365,33 @@ fn git_literal_lines(text: &str) -> Vec<usize> {
         }
     }
     out
+}
+
+/// Whether an attribute body (the text inside `#[…]`, newlines flattened)
+/// gates its item on `test` in a way that keeps it out of every production
+/// build. See [`production_violations`] for why this is deliberately narrow.
+fn is_test_gate(body: &str) -> bool {
+    let body: String = body.chars().filter(|c| !c.is_whitespace()).collect();
+    if body == "cfg(test)" {
+        return true;
+    }
+    body.starts_with("cfg(all(")
+        && !body.contains("any(")
+        && !body.contains("not(")
+        && has_token(&body, "test")
+}
+
+/// `needle` appearing in `haystack` bounded by non-identifier characters, so
+/// `test` does not match inside `debug_assertions` or `latest`.
+fn has_token(haystack: &str, needle: &str) -> bool {
+    let bytes = haystack.as_bytes();
+    let ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    haystack.match_indices(needle).any(|(at, _)| {
+        let before_ok = at == 0 || !ident(bytes[at - 1]);
+        let end = at + needle.len();
+        let after_ok = end == bytes.len() || !ident(bytes[end]);
+        before_ok && after_ok
+    })
 }
 
 /// If a raw string starts at `i` (`r"`, `r#"`, `br##"`, …), the index just past
@@ -358,11 +465,74 @@ mod tests {
     }
 
     #[test]
-    fn an_indented_cfg_test_inside_production_is_not_the_boundary() {
-        // `issue_dispatch_run::devbox_program` has one. Reading it as the
-        // boundary would exempt every production line below it.
-        let src = "fn p() {\n    #[cfg(test)]\n    {\n        return o();\n    }\n}\nfn q() {\n    Command::new(\"git\");\n}\n";
-        assert_eq!(production_violations(src), vec![8]);
+    fn a_test_module_not_called_tests_is_exempt_too() {
+        // `daemon.rs`'s `mod orphan_watchdog_tests` and
+        // `platform/proc/mod.rs`'s `pub(crate) mod test_child`. Matching the
+        // module NAME rather than the `#[cfg]` scanned both as production.
+        for decl in ["mod orphan_watchdog_tests", "pub(crate) mod test_child"] {
+            let src =
+                format!("fn f() {{}}\n#[cfg(test)]\n{decl} {{\n    Command::new(\"git\");\n}}\n");
+            assert!(
+                production_violations(&src).is_empty(),
+                "`{decl}` is gated on test and must be exempt"
+            );
+        }
+    }
+
+    #[test]
+    fn a_test_gated_item_is_exempt_whatever_shape_it_has() {
+        // A bare block inside a production fn, a braceless item, and a
+        // platform-narrowed test module.
+        let block = "fn p() {\n    #[cfg(test)]\n    {\n        Command::new(\"git\");\n    }\n}\n";
+        let braceless = "#[cfg(test)]\nconst P: &str = \"git\";\n";
+        let narrowed = "#[cfg(all(test, unix))]\nmod tests {\n    Command::new(\"git\");\n}\n";
+        for src in [block, braceless, narrowed] {
+            assert!(production_violations(src).is_empty(), "exempt: {src:?}");
+        }
+    }
+
+    #[test]
+    fn production_after_a_test_gated_item_is_still_scanned() {
+        // The failure mode of a boundary-to-end-of-file rule: everything
+        // below the first `#[cfg(test)]` stops being checked.
+        let src = "#[cfg(test)]\nmod tests {\n    Command::new(\"git\");\n}\nfn q() {\n    Command::new(\"git\");\n}\n";
+        assert_eq!(production_violations(src), vec![6]);
+
+        // `issue_dispatch_run::devbox_program`'s shape specifically.
+        let devbox = "fn p() -> String {\n    #[cfg(test)]\n    {\n        return o();\n    }\n    \"devbox\".to_string()\n}\nfn q() {\n    Command::new(\"git\");\n}\n";
+        assert_eq!(production_violations(devbox), vec![9]);
+    }
+
+    #[test]
+    fn a_cfg_that_still_reaches_a_production_build_is_not_exempt() {
+        // `cfg(any(test, debug_assertions))` — `build_id.rs` and
+        // `daemon_protocol.rs` both use it — compiles in a debug production
+        // build, and `cfg(not(test))` is production-only. Exempting either
+        // would be the silent hole this rule exists to close.
+        let any = "#[cfg(any(test, debug_assertions))]\nfn f() {\n    Command::new(\"git\");\n}\n";
+        let not = "#[cfg(not(test))]\nfn f() {\n    Command::new(\"git\");\n}\n";
+        assert_eq!(production_violations(any), vec![3]);
+        assert_eq!(production_violations(not), vec![3]);
+    }
+
+    #[test]
+    fn a_bracket_inside_an_attribute_string_does_not_end_the_attribute_early() {
+        let src =
+            "#[doc = \"see [1] below\"]\npub struct S;\nfn f() {\n    Command::new(\"git\");\n}\n";
+        assert_eq!(production_violations(src), vec![4]);
+    }
+
+    #[test]
+    fn a_non_cfg_attribute_does_not_exempt_anything() {
+        let src = "#[derive(Debug)]\nstruct S;\nfn f() {\n    Command::new(\"git\");\n}\n";
+        assert_eq!(production_violations(src), vec![4]);
+    }
+
+    #[test]
+    fn has_token_does_not_match_inside_an_identifier() {
+        assert!(has_token("cfg(all(test,unix))", "test"));
+        assert!(!has_token("cfg(all(latest,unix))", "test"));
+        assert!(!has_token("cfg(any(test,debug_assertions))", "nope"));
     }
 
     #[test]

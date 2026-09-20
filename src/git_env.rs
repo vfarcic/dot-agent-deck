@@ -28,10 +28,10 @@
 //! `xtask/linkage-check`'s rule 13 fails the build on a `git` program literal
 //! anywhere else in `src/`'s production half.
 //!
-//! Production is the narrow claim on purpose. Rule 13 exempts each file's
-//! trailing `#[cfg(test)] mod tests`, so a fixture that builds its own
-//! repositories is a separate question — [`fixture_git`] below is what those
-//! should use, and issue #1121 is where that half is tracked.
+//! Production is the narrow claim on purpose. Rule 13 exempts anything gated
+//! on `test` by a `#[cfg]`, so a fixture that builds its own repositories is a
+//! separate question — [`fixture_git`] below is what those should use, and
+//! issue #1121 is where that half is tracked.
 
 use std::path::Path;
 use std::process::Command;

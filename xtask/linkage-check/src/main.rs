@@ -1047,9 +1047,10 @@ fn main() -> ExitCode {
     // Check 13 (issue #1181): no `git` program literal in the root crate's
     // production sources. Read straight off `src/` rather than folded into the
     // scan above, because that scan is line-based and this one has to track
-    // strings, comments and char literals across lines to tell a literal from
-    // prose about one — and because `src/` or `src/git_env.rs` going missing
-    // must be reported rather than quietly emptying the rule.
+    // strings, comments, char literals and `#[cfg(test)]` item bodies across
+    // lines to tell a production literal from prose about one — and because
+    // `src/` or `src/git_env.rs` going missing must be reported rather than
+    // quietly emptying the rule.
     failures.extend(
         git_program_literal::run(&root)
             .into_iter()
