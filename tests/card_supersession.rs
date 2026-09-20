@@ -560,3 +560,208 @@ fn status_supersede_011_a_cross_pane_frame_cannot_refresh_the_card_identity() {
         "a frame from another pane rebuilt the card and reset its start time"
     );
 }
+
+/// Scenario: A Pi card on pane A accumulates a tool tally under the producer's
+/// `{pane_id}-session` key, then a DIFFERENT pane's agent reports under that same key.
+/// The colliding frame must land on a card of its own pane rather than dragging pane A's
+/// card across, leaving each pane with exactly one card carrying its own agent.
+#[spec("status/supersede/012")]
+#[test]
+fn status_supersede_012_a_colliding_frame_gets_its_own_panes_card() {
+    let shared_session_id = format!("{PANE_ID}-session");
+    let first_timestamp = Utc::now();
+
+    let mut state = AppState::default();
+    state.register_pane(PANE_ID.to_string());
+    state.register_pane(OTHER_PANE_ID.to_string());
+
+    state.apply_event(event_on_pane(
+        PANE_ID,
+        &shared_session_id,
+        AgentType::Pi,
+        EventType::Thinking,
+        Some("pi-agent-2"),
+        first_timestamp,
+    ));
+    state.apply_event(event_on_pane(
+        PANE_ID,
+        &shared_session_id,
+        AgentType::Pi,
+        EventType::ToolEnd,
+        Some("pi-agent-2"),
+        first_timestamp + Duration::seconds(1),
+    ));
+
+    assert_eq!(
+        state.sessions[&shared_session_id].tool_count, 1,
+        "precondition: the first pane's agent accumulated history on this card"
+    );
+
+    state.apply_event(event_on_pane(
+        OTHER_PANE_ID,
+        &shared_session_id,
+        AgentType::Pi,
+        EventType::Thinking,
+        Some("pi-agent-9"),
+        first_timestamp + Duration::seconds(2),
+    ));
+
+    let card_on = |pane: &str| {
+        let mut found = state
+            .sessions
+            .values()
+            .filter(|s| s.pane_id.as_deref() == Some(pane));
+        let one = found.next();
+        assert!(
+            found.next().is_none(),
+            "pane {pane} carries more than one card"
+        );
+        one
+    };
+
+    let pane_a = card_on(PANE_ID).expect("pane A lost its card to a frame from another pane");
+    assert_eq!(
+        pane_a.agent_id.as_deref(),
+        Some("pi-agent-2"),
+        "pane A's card no longer belongs to pane A's agent"
+    );
+    assert_eq!(
+        pane_a.tool_count, 1,
+        "pane A's card lost the history it had accumulated"
+    );
+
+    let pane_b = card_on(OTHER_PANE_ID)
+        .expect("the colliding frame produced no card for the pane it actually named");
+    assert_eq!(
+        pane_b.agent_id.as_deref(),
+        Some("pi-agent-9"),
+        "the colliding frame's own agent did not get the card for its pane"
+    );
+}
+
+/// Scenario: Pane A and pane B each hold a live card, and pane B's agent then ends its
+/// conversation under a session key that pane A's card also happens to carry. The
+/// terminal frame must end pane B's own card and leave pane A's card, agent and tally
+/// exactly where they were.
+#[spec("status/supersede/013")]
+#[test]
+fn status_supersede_013_a_colliding_terminal_frame_ends_only_its_own_pane() {
+    let shared_session_id = format!("{PANE_ID}-session");
+    let first_timestamp = Utc::now();
+
+    let mut state = AppState::default();
+    state.register_pane(PANE_ID.to_string());
+    state.register_pane(OTHER_PANE_ID.to_string());
+
+    state.apply_event(event_on_pane(
+        PANE_ID,
+        &shared_session_id,
+        AgentType::Pi,
+        EventType::Thinking,
+        Some("pi-agent-2"),
+        first_timestamp,
+    ));
+    state.apply_event(event_on_pane(
+        PANE_ID,
+        &shared_session_id,
+        AgentType::Pi,
+        EventType::ToolEnd,
+        Some("pi-agent-2"),
+        first_timestamp + Duration::seconds(1),
+    ));
+    state.apply_event(event_on_pane(
+        OTHER_PANE_ID,
+        "other-pane-own-session",
+        AgentType::Pi,
+        EventType::Thinking,
+        Some("pi-agent-9"),
+        first_timestamp + Duration::seconds(2),
+    ));
+
+    assert_eq!(
+        state.sessions.len(),
+        2,
+        "precondition: each pane holds exactly one card of its own"
+    );
+
+    state.apply_event(event_on_pane(
+        OTHER_PANE_ID,
+        &shared_session_id,
+        AgentType::Pi,
+        EventType::SessionEnd,
+        Some("pi-agent-9"),
+        first_timestamp + Duration::seconds(3),
+    ));
+
+    let pane_a = state
+        .sessions
+        .values()
+        .find(|s| s.pane_id.as_deref() == Some(PANE_ID))
+        .expect("another pane's SessionEnd removed pane A's live card");
+    assert_eq!(
+        pane_a.agent_id.as_deref(),
+        Some("pi-agent-2"),
+        "pane A's card no longer belongs to pane A's agent"
+    );
+    assert_eq!(
+        pane_a.tool_count, 1,
+        "pane A's card lost the history it had accumulated"
+    );
+    assert!(
+        !state.sessions.contains_key("other-pane-own-session"),
+        "the terminal frame did not end the card on the pane it actually named"
+    );
+}
+
+/// Scenario: A pane-less event creates a card, the pane it turns out to belong to is
+/// registered, and a later frame from the same agent names that pane. The card must
+/// learn its pane and keep its accumulated history rather than being split in two.
+#[spec("status/supersede/014")]
+#[test]
+fn status_supersede_014_a_pane_less_card_still_learns_its_pane() {
+    let roaming_session_id = "roaming-session";
+    let first_timestamp = Utc::now();
+
+    // No managed panes yet, which is what admits a pane-less event at all.
+    let mut state = AppState::default();
+    let mut paneless = event_on_pane(
+        PANE_ID,
+        roaming_session_id,
+        AgentType::Pi,
+        EventType::Thinking,
+        Some("pi-agent-2"),
+        first_timestamp,
+    );
+    paneless.pane_id = None;
+    state.apply_event(paneless);
+
+    assert_eq!(
+        state.sessions[roaming_session_id].pane_id, None,
+        "precondition: the card was created without a pane"
+    );
+
+    state.register_pane(PANE_ID.to_string());
+    state.apply_event(event_on_pane(
+        PANE_ID,
+        roaming_session_id,
+        AgentType::Pi,
+        EventType::ToolEnd,
+        Some("pi-agent-2"),
+        first_timestamp + Duration::seconds(1),
+    ));
+
+    assert_eq!(
+        state.sessions.len(),
+        1,
+        "the pane-naming frame minted a second card instead of binding the existing one"
+    );
+    assert_eq!(
+        state.sessions[roaming_session_id].pane_id.as_deref(),
+        Some(PANE_ID),
+        "the card never learned the pane its own agent reported from"
+    );
+    assert_eq!(
+        state.sessions[roaming_session_id].tool_count, 1,
+        "the card lost its history on the way to learning its pane"
+    );
+}
