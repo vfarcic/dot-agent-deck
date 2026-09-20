@@ -2393,9 +2393,13 @@ async fn run_hook_loop_with_idle_timeout(
                     // not the thing that grows.
                     let _permit = permit;
                     // PRD #201: split so the read-only `get-seed` verb can write
-                    // a reply back on the same connection. Every other message
-                    // on this socket is fire-and-forget, so the write half is
-                    // only ever used by the `GetSeed` arm below.
+                    // a reply back on the same connection. The write half now
+                    // serves every `DaemonMessage` arm — `delegate` since PR
+                    // #466, `restart_role` / `spawn_role` / `list_targets`
+                    // since #868 and PRD #220, and `work_done` / `dispatch`
+                    // since issue #1129, whose line comes from the provenance
+                    // gate above rather than from an arm. Raw `AgentEvent`
+                    // traffic is still answered by nothing.
                     let (read_half, mut write_half) = tokio::io::split(stream);
                     let mut reader = tokio::io::BufReader::new(read_half);
 
@@ -2524,9 +2528,10 @@ async fn run_hook_loop_with_idle_timeout(
                                          capability token does not attest the pane it \
                                          names; see docs/develop/hook-provenance.md"
                                     );
-                                    if let Some(json) =
-                                        msg.provenance_refusal_reply(&refusal.caller_message())
-                                    {
+                                    if let Some(json) = msg.provenance_refusal_reply(
+                                        refusal.code(),
+                                        &refusal.caller_message(),
+                                    ) {
                                         let line = format!("{json}\n");
                                         let _ = write_half.write_all(line.as_bytes()).await;
                                         let _ = write_half.flush().await;
@@ -2534,6 +2539,23 @@ async fn run_hook_loop_with_idle_timeout(
                                     continue;
                                 }
                                 Ok(()) => {
+                                    // Issue #1129: the two fire-and-forget verbs
+                                    // get their acknowledgement HERE, ahead of
+                                    // the handler, so the caller learns whether
+                                    // the gate admitted it without waiting for
+                                    // work it is not waiting on. `dispatch`'s
+                                    // handler is awaited inline below and spends
+                                    // a whole worktree-create-and-spawn; an ack
+                                    // written after it would park the calling
+                                    // agent for the duration. Every other verb
+                                    // returns `None` here and answers in its own
+                                    // arm, which is what keeps "exactly one line
+                                    // per message" true.
+                                    if let Some(json) = msg.provenance_ack_reply() {
+                                        let line = format!("{json}\n");
+                                        let _ = write_half.write_all(line.as_bytes()).await;
+                                        let _ = write_half.flush().await;
+                                    }
                                     if matches!(
                                         provenance,
                                         crate::hook_provenance::Provenance::Refused(
@@ -4635,6 +4657,7 @@ mod hook_ingestion_tests {
         orchestrator_token: String,
         worker_token: String,
         worker_agent: String,
+        orchestrator_agent: String,
         handle: tokio::task::JoinHandle<Result<(), DaemonError>>,
     }
 
@@ -4712,6 +4735,7 @@ mod hook_ingestion_tests {
                     .expect("orchestrator token"),
                 worker_token: registry.hook_token_of(&worker_agent).expect("worker token"),
                 worker_agent,
+                orchestrator_agent,
                 registry,
                 sock,
                 _cwd: cwd,
@@ -4744,6 +4768,61 @@ mod hook_ingestion_tests {
             serde_json::from_str(buf.trim()).unwrap_or_else(|e| {
                 panic!("delegate reply was not a DelegateResponse ({e}): {buf:?}")
             })
+        }
+
+        /// Send one `work_done` line from the WORKER's pane and read the
+        /// daemon's acknowledgement (issue #1129).
+        ///
+        /// Deliberately reads the connection the same way [`Self::delegate`]
+        /// does — to EOF after a half-close — so "the daemon wrote nothing" is a
+        /// result this helper can return rather than a hang.
+        async fn work_done(
+            &self,
+            claimed_pane: &str,
+            token: Option<&str>,
+            report: &str,
+        ) -> Option<crate::event::SignalAck> {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let msg = crate::event::DaemonMessage::WorkDone(crate::event::WorkDoneSignal {
+                pane_id: claimed_pane.to_string(),
+                task: report.to_string(),
+                done: false,
+                timestamp: chrono::Utc::now(),
+                token: token.map(str::to_string),
+            });
+            let line = format!("{}\n", serde_json::to_string(&msg).unwrap());
+            let mut stream = UnixStream::connect(&self.sock).await.expect("connect");
+            stream.write_all(line.as_bytes()).await.unwrap();
+            stream.flush().await.unwrap();
+            stream.shutdown().await.unwrap();
+            let mut buf = String::new();
+            stream.read_to_string(&mut buf).await.unwrap();
+            if buf.trim().is_empty() {
+                return None;
+            }
+            Some(
+                serde_json::from_str(buf.trim()).unwrap_or_else(|e| {
+                    panic!("work_done reply was not a SignalAck ({e}): {buf:?}")
+                }),
+            )
+        }
+
+        /// Whether the ORCHESTRATOR's PTY has seen `needle` yet, polled for
+        /// `budget`. `handle_work_done` writes its feedback there, so this is
+        /// how a work-done that ran is told from one that was refused.
+        async fn orchestrator_saw(&self, needle: &str, budget: Duration) -> bool {
+            let deadline = tokio::time::Instant::now() + budget;
+            loop {
+                if let Ok(bytes) = self.registry.snapshot(&self.orchestrator_agent)
+                    && String::from_utf8_lossy(&bytes).contains(needle)
+                {
+                    return true;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    return false;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
         }
 
         /// Whether the worker's PTY has seen the delegate pointer yet, polled
@@ -4868,6 +4947,122 @@ mod hook_ingestion_tests {
             "a token from some other daemon must not attest anything here: {resp:?}"
         );
         assert!(!fx.worker_saw_pointer(Duration::from_secs(2)).await);
+        fx.stop().await;
+    }
+
+    /// Scenario: issue #1129 — the worker's own `work-done`, carrying the token
+    /// its spawn was given, is admitted AND is now acknowledged on the
+    /// connection. The verb answered nothing at all before this, so the
+    /// acknowledgement is the whole of what is new; the handler must still run,
+    /// which is what the orchestrator's PTY proves.
+    #[tokio::test]
+    async fn hook_provenance_acknowledges_an_attested_work_done() {
+        let fx = ProvenanceFixture::start().await;
+        let token = fx.worker_token.clone();
+        let ack = fx
+            .work_done(PROV_WORKER_PANE, Some(&token), "WORKDONE-ATTESTED-5a1c")
+            .await
+            .expect("an attested work-done must be acknowledged, not answered with silence");
+        assert!(
+            ack.is_signal_ack(),
+            "the ack must identify itself, or an older CLI would read any line as one: {ack:?}"
+        );
+        assert!(
+            ack.accepted,
+            "an attested work-done must be admitted: {ack:?}"
+        );
+        assert_eq!(ack.error, None, "an admission carries no error: {ack:?}");
+        assert!(
+            fx.orchestrator_saw("WORKDONE-ATTESTED-5a1c", Duration::from_secs(20))
+                .await,
+            "the ack was written but the handler never ran — the report never reached the              orchestrator's PTY"
+        );
+        fx.stop().await;
+    }
+
+    /// Scenario: issue #1129 — the same `work-done`, naming the same worker
+    /// pane, with no token. Before this the daemon refused it and wrote nothing
+    /// back, so the sender exited 0 on a report that was dropped. It must now be
+    /// told, and the report must still not reach the orchestrator.
+    #[tokio::test]
+    async fn hook_provenance_tells_the_sender_a_work_done_was_refused() {
+        let fx = ProvenanceFixture::start().await;
+        let ack = fx
+            .work_done(PROV_WORKER_PANE, None, "WORKDONE-FORGED-2b7e")
+            .await
+            .expect("a refused work-done must be reported to the caller, not dropped silently");
+        assert!(
+            ack.is_signal_ack(),
+            "the refusal must identify itself: {ack:?}"
+        );
+        assert!(
+            !ack.accepted,
+            "a refused work-done must not report acceptance: {ack:?}"
+        );
+        assert_eq!(
+            ack.reason.as_deref(),
+            Some("missing_token"),
+            "the ack must carry the same greppable code the daemon put in its own warn line:              {ack:?}"
+        );
+        let err = ack
+            .error
+            .clone()
+            .expect("a refusal must say why, so an older CLI in the pane is diagnosable");
+        assert!(
+            err.contains("hook capability token"),
+            "the refusal must name the mechanism: {err}"
+        );
+        assert!(
+            !fx.orchestrator_saw("WORKDONE-FORGED-2b7e", Duration::from_secs(2))
+                .await,
+            "the refused work-done still reached the orchestrator's PTY — the caller was told              but the handler ran anyway"
+        );
+        fx.stop().await;
+    }
+
+    /// Scenario: issue #1129 — an OLDER `dot-agent-deck` in a pane writes its
+    /// `work-done` line and closes the connection without ever reading a reply,
+    /// because the binary predates the acknowledgement. The daemon writes the
+    /// ack into a socket nobody is reading and, on a closed peer, into one that
+    /// will error. Neither may wedge the hook loop: the next connection must
+    /// still be served.
+    ///
+    /// This is the half of the cross-version pairing no assertion about the CLI
+    /// can reach, since the point is a sender that is not this build.
+    #[tokio::test]
+    async fn an_ack_nobody_reads_does_not_wedge_the_hook_loop() {
+        use tokio::io::AsyncWriteExt;
+        let fx = ProvenanceFixture::start().await;
+        // Three connections that write and vanish, the way a pre-#1129 CLI
+        // does. One is not enough: a write that merely lands in the socket
+        // buffer proves nothing about a peer that is already gone.
+        for i in 0..3 {
+            let msg = crate::event::DaemonMessage::WorkDone(crate::event::WorkDoneSignal {
+                pane_id: PROV_WORKER_PANE.to_string(),
+                task: format!("WORKDONE-DEAF-{i}"),
+                done: false,
+                timestamp: chrono::Utc::now(),
+                token: None,
+            });
+            let line = format!("{}\n", serde_json::to_string(&msg).unwrap());
+            let mut stream = UnixStream::connect(&fx.sock).await.expect("connect");
+            stream.write_all(line.as_bytes()).await.unwrap();
+            stream.flush().await.unwrap();
+            drop(stream);
+        }
+        // The loop still serves: an attested work-done is acknowledged and acted
+        // on afterwards.
+        let token = fx.worker_token.clone();
+        let ack = fx
+            .work_done(PROV_WORKER_PANE, Some(&token), "WORKDONE-AFTER-DEAF-3c9f")
+            .await
+            .expect("the hook loop stopped answering after writing acks nobody read");
+        assert!(ack.accepted, "{ack:?}");
+        assert!(
+            fx.orchestrator_saw("WORKDONE-AFTER-DEAF-3c9f", Duration::from_secs(20))
+                .await,
+            "the hook loop answered but stopped handling after the unread acks"
+        );
         fx.stop().await;
     }
 

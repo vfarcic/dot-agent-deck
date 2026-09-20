@@ -967,9 +967,13 @@ pub enum DaemonMessage {
     /// PRD #201 native prompt delivery: a READ-ONLY request for the seed the
     /// daemon prepared for a pane, so the pane's extension can deliver it
     /// NATIVELY (`pi.sendUserMessage`) instead of the daemon typing it into the
-    /// PTY. Unlike the two fire-and-forget signals above, this one gets a
-    /// reply: the daemon writes a [`GetSeedResponse`] JSON line back on the
-    /// same connection, then the seed is cleared (delivered exactly once). An
+    /// PTY. The daemon writes a [`GetSeedResponse`] JSON line back on the
+    /// same connection, then the seed is cleared (delivered exactly once).
+    /// (Every verb on this socket now answers something — `work_done` and
+    /// `dispatch` got a [`SignalAck`] in issue #1129 — so this is no longer the
+    /// distinguishing property it was when this was written; what still sets
+    /// those two apart is that their answer comes from the provenance gate
+    /// rather than from a handler.) An
     /// older daemon that doesn't know this variant fails to parse it and sends
     /// no reply — the `get-seed` CLI then reports an empty seed, the extension
     /// no-sends, and the daemon's PTY-injection safety net still delivers. So
@@ -986,8 +990,12 @@ pub enum DaemonMessage {
     Dispatch(DispatchSignal),
     /// PRD #220: read-only request for the spawn targets available to a pane's
     /// repo. Like [`Self::GetSeed`], the daemon writes a
-    /// [`ListTargetsResponse`] JSON line back on the same connection; every other
-    /// message on this socket is fire-and-forget.
+    /// [`ListTargetsResponse`] JSON line back on the same connection once the
+    /// handler has run. (The raw `AgentEvent` traffic this socket also accepts
+    /// is answered by nothing at all; since issue #1129 every
+    /// [`DaemonMessage`] gets a line back, though `work_done`'s and
+    /// `dispatch`'s comes from the provenance gate rather than from a handler —
+    /// see [`SignalAck`].)
     ///
     /// Answered by the DAEMON rather than computed in the CLI so the menu comes
     /// from the same cwd and the same config the dispatch will use — a listing
@@ -1059,16 +1067,23 @@ impl DaemonMessage {
     }
 
     /// The JSON line to write back when this message is refused for want of
-    /// provenance, or `None` for a verb whose caller reads nothing.
+    /// provenance. Every variant answers one, and the exhaustive `match` is what
+    /// keeps that true.
     ///
-    /// The verbs that answer on the same connection must answer a refusal too:
-    /// `delegate`'s whole point since PRD #466 is that a delegation which routed
-    /// nowhere is no longer invisible to the orchestrator that issued it, and a
-    /// refusal is exactly such a case. `work_done` and `dispatch` are
-    /// fire-and-forget and there is nothing to write to — their refusal is a log
-    /// line, which is the same visibility an unknown pane has always had on
-    /// those two.
-    pub fn provenance_refusal_reply(&self, message: &str) -> Option<String> {
+    /// The verbs that already answer on the same connection answer a refusal in
+    /// their own response type: `delegate`'s whole point since PRD #466 is that a
+    /// delegation which routed nowhere is no longer invisible to the orchestrator
+    /// that issued it, and a refusal is exactly such a case.
+    ///
+    /// `work_done` and `dispatch` have nothing of their own to answer in — they
+    /// are fire-and-forget verbs whose handlers produce no response — so they
+    /// answer a [`SignalAck`]. That is issue #1129's half of #1077: before it,
+    /// their refusal was a `warn!` in the daemon log and nothing else, so the
+    /// legitimate sender most likely to trip the gate (a `dot-agent-deck` binary
+    /// in the pane older than the daemon, which forwards no token and is refused
+    /// as `missing_token`) saw a clean exit 0 on a report that was dropped. See
+    /// [`SignalAck`] for what the acknowledgement does and does not claim.
+    pub fn provenance_refusal_reply(&self, reason: &str, message: &str) -> Option<String> {
         let json = match self {
             DaemonMessage::Delegate(_) => serde_json::to_string(&DelegateResponse {
                 error: Some(message.to_string()),
@@ -1095,9 +1110,161 @@ impl DaemonMessage {
             // and would tell a caller that guessed a pane id that the pane
             // exists.
             DaemonMessage::GetSeed(_) => serde_json::to_string(&GetSeedResponse { seed: None }),
-            DaemonMessage::WorkDone(_) | DaemonMessage::Dispatch(_) => return None,
+            DaemonMessage::WorkDone(_) | DaemonMessage::Dispatch(_) => {
+                serde_json::to_string(&SignalAck::refused(reason, message))
+            }
         };
         json.ok()
+    }
+
+    /// The JSON line to write back when this message is **admitted** past the
+    /// provenance gate, or `None` for a verb whose own handler answers on the
+    /// connection.
+    ///
+    /// Only the two fire-and-forget verbs are `Some`, and the exhaustive `match`
+    /// is what enforces the invariant the hook loop depends on: **exactly one
+    /// line per message**. `delegate`, `restart_role`, `spawn_role`,
+    /// `list_targets` and `get_seed` all write their own response after their
+    /// handler runs, so an admission line here would be a second one and the
+    /// caller — which reads exactly one line — would take the ack for the answer.
+    ///
+    /// It is written at the gate, **before** the handler runs, and that is
+    /// deliberate rather than incidental. `dispatch`'s handler is awaited inline
+    /// in the hook loop and does the whole worktree-create-and-spawn, so an
+    /// acknowledgement written after it would park the calling agent for as long
+    /// as the dispatch takes. The price is stated in [`SignalAck::accepted`]: an
+    /// admitted message is one the gate let through, not one whose work
+    /// succeeded.
+    pub fn provenance_ack_reply(&self) -> Option<String> {
+        match self {
+            DaemonMessage::WorkDone(_) | DaemonMessage::Dispatch(_) => {
+                serde_json::to_string(&SignalAck::accepted()).ok()
+            }
+            DaemonMessage::Delegate(_)
+            | DaemonMessage::RestartRole(_)
+            | DaemonMessage::SpawnRole(_)
+            | DaemonMessage::ListTargets(_)
+            | DaemonMessage::GetSeed(_) => None,
+        }
+    }
+}
+
+/// The daemon's acknowledgement of a **fire-and-forget** hook-socket signal —
+/// `work_done` and `dispatch`, the two [`DaemonMessage`] variants whose handlers
+/// produce no response of their own.
+///
+/// Issue #1129. Until this existed, those two verbs were written to the socket
+/// and the CLI exited 0 whatever the daemon then did with them, so a message the
+/// provenance gate (issue #1077, [`crate::hook_provenance`]) refused was
+/// indistinguishable from one it acted on. The refusal was a `warn!` in
+/// `deck.log` and nothing else. The sender that matters here is not the
+/// adversary — who is not owed a diagnostic — but the **legitimate** one: a
+/// `dot-agent-deck` binary invoked inside a pane that is older than the daemon
+/// which spawned it forwards no token, is refused as `missing_token`, and
+/// reported success on a completion report that went nowhere. Issue #1182 is
+/// that failure mode observed in the wild, where it also masked an unrelated bug
+/// underneath by sending readers to the daemon log's refusals instead.
+///
+/// # What it claims, and what it does not
+///
+/// It claims exactly one thing: **this daemon admitted the message past the
+/// provenance gate**. It is written before the handler runs, so it is not a
+/// receipt for the work. In particular these remain invisible to the sender, as
+/// they were before:
+///
+/// - a `dispatch` from a pane the registry holds no record for, which the hook
+///   loop logs as `dispatch from unknown pane` and drops;
+/// - a `work_done` from a pane in no role map and with no retained dispatch
+///   return, logged as `work-done from unknown pane` and dropped;
+/// - every later outcome of either handler — a worktree that could not be
+///   created, an orchestrator pane that has gone away.
+///
+/// Reporting those would mean answering after the handler, which for `dispatch`
+/// means holding the calling agent for the whole spawn. They are a separate
+/// question from this one and are deliberately left where they were.
+///
+/// # Why telling the caller is not a new disclosure
+///
+/// A refusal names why, and `missing_token`'s message says the claimed pane was
+/// issued a token — which tells a caller that guessed a pane id that the pane is
+/// real. That is not new information: pane ids are already published by
+/// `list-agents`, by `daemon status` and in the TUI, and `delegate`,
+/// `restart_role`, `spawn_role` and `list_targets` have answered their refusals
+/// on this same socket since #1077, so any caller able to send one of those
+/// already had the same oracle. [`crate::hook_provenance::Refusal::caller_message`]
+/// is what keeps it no wider than that: it never echoes the presented token and
+/// never names the pane a token actually belongs to.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SignalAck {
+    /// Affirmative discriminator, always [`SIGNAL_ACK_KIND`] on a line this
+    /// daemon wrote.
+    ///
+    /// Same reasoning as [`DelegateResponse::kind`], and it matters more here
+    /// because this type's other two fields are `#[serde(default)]` over a
+    /// `bool`: without the marker, `from_str::<SignalAck>` succeeds on any JSON
+    /// object — `{}`, or another verb's reply — and yields `accepted: false`,
+    /// i.e. a *refusal* manufactured out of a line that is not an ack at all.
+    /// That is the dangerous direction: it would turn a daemon we do not
+    /// understand into a reported failure on a signal that was delivered. A line
+    /// without this marker is therefore treated exactly like
+    /// [`crate::hook::SocketReply::NoReply`] — unverifiable, and reported as
+    /// success.
+    #[serde(default)]
+    pub kind: Option<String>,
+    /// Whether the message was admitted past the provenance gate. **Not** whether
+    /// the work it asked for happened — see this type's docs.
+    #[serde(default)]
+    pub accepted: bool,
+    /// On a refusal, the stable greppable code from
+    /// [`crate::hook_provenance::Refusal::code`] — `missing_token`,
+    /// `unknown_token`, `token_names_another_pane`, `malformed_token`.
+    ///
+    /// Carried as well as `message` so the CLI's stderr and the daemon's own
+    /// `warn!` line share one word an operator can grep for across both, rather
+    /// than leaving them to match a sentence against a log field.
+    #[serde(default)]
+    pub reason: Option<String>,
+    /// On a refusal, the one-sentence explanation from
+    /// [`crate::hook_provenance::Refusal::caller_message`], which names the
+    /// remedy where there is one. `None` on an admission.
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+/// The value [`SignalAck::kind`] carries on every ack this daemon writes.
+///
+/// One value for both verbs rather than one each: the CLI reads this line to
+/// answer a single question — was my signal admitted — and it already knows
+/// which verb it sent. See [`DELEGATE_RESPONSE_KIND`] for why renaming it would
+/// make every older CLI fall back to "delivered, unverifiable".
+pub const SIGNAL_ACK_KIND: &str = "signal_ack";
+
+impl SignalAck {
+    /// The ack for a message the gate admitted.
+    pub fn accepted() -> Self {
+        Self {
+            kind: Some(SIGNAL_ACK_KIND.to_string()),
+            accepted: true,
+            reason: None,
+            error: None,
+        }
+    }
+
+    /// The ack for a message the gate refused, carrying the refusal's code and
+    /// its caller-facing sentence.
+    pub fn refused(reason: &str, message: &str) -> Self {
+        Self {
+            kind: Some(SIGNAL_ACK_KIND.to_string()),
+            accepted: false,
+            reason: Some(reason.to_string()),
+            error: Some(message.to_string()),
+        }
+    }
+
+    /// Whether this parsed line positively identifies itself as an ack this
+    /// daemon wrote. See [`Self::kind`].
+    pub fn is_signal_ack(&self) -> bool {
+        self.kind.as_deref() == Some(SIGNAL_ACK_KIND)
     }
 }
 
@@ -2575,5 +2742,176 @@ mod tests {
             "timestamp": "2026-03-22T10:00:00Z"
         }"#;
         assert!(serde_json::from_str::<DaemonMessage>(json).is_err());
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #1129: the fire-and-forget verbs' acknowledgement.
+    // -----------------------------------------------------------------
+
+    /// Build one message of every variant, so the two reply matrices below are
+    /// exhaustive by construction rather than by a reviewer's memory. A new
+    /// variant makes `DaemonMessage`'s own `match` arms fail to compile, and
+    /// forgetting it here makes the counts below wrong.
+    fn one_of_every_variant() -> Vec<DaemonMessage> {
+        let ts = chrono::Utc::now();
+        vec![
+            DaemonMessage::Delegate(DelegateSignal {
+                pane_id: "p".into(),
+                task: "t".into(),
+                to: vec!["worker".into()],
+                timestamp: ts,
+                token: None,
+            }),
+            DaemonMessage::WorkDone(WorkDoneSignal {
+                pane_id: "p".into(),
+                task: "t".into(),
+                done: false,
+                timestamp: ts,
+                token: None,
+            }),
+            DaemonMessage::GetSeed(GetSeedRequest {
+                pane_id: "p".into(),
+                agent_id: None,
+                token: None,
+            }),
+            DaemonMessage::Dispatch(DispatchSignal {
+                pane_id: "p".into(),
+                name: "unit".into(),
+                task: None,
+                shape: None,
+                timestamp: ts,
+                token: None,
+            }),
+            DaemonMessage::ListTargets(ListTargetsRequest {
+                pane_id: "p".into(),
+                token: None,
+            }),
+            DaemonMessage::RestartRole(RestartRoleSignal {
+                pane_id: "p".into(),
+                role: "worker".into(),
+                force: false,
+                timestamp: ts,
+                token: None,
+            }),
+            DaemonMessage::SpawnRole(SpawnRoleSignal {
+                pane_id: "p".into(),
+                role: "worker".into(),
+                timestamp: ts,
+                token: None,
+            }),
+        ]
+    }
+
+    /// The invariant the hook loop rests on: **exactly one line per message**.
+    /// A verb that answers in its own arm must return `None` from
+    /// `provenance_ack_reply`, or the caller — which reads exactly one line —
+    /// would take the admission for the answer.
+    #[test]
+    fn only_the_fire_and_forget_verbs_are_acknowledged_at_the_gate() {
+        for msg in one_of_every_variant() {
+            let acked = msg.provenance_ack_reply().is_some();
+            let expected = matches!(msg, DaemonMessage::WorkDone(_) | DaemonMessage::Dispatch(_));
+            assert_eq!(
+                acked,
+                expected,
+                "{} must {} be acknowledged at the gate",
+                msg.verb(),
+                if expected { "" } else { "NOT" }
+            );
+        }
+    }
+
+    /// Every verb answers a refusal — that is what makes the gate's refusal
+    /// visible to the sender rather than only to `deck.log`.
+    #[test]
+    fn every_verb_answers_a_provenance_refusal() {
+        for msg in one_of_every_variant() {
+            assert!(
+                msg.provenance_refusal_reply("missing_token", "refused: because")
+                    .is_some(),
+                "{} answers nothing when refused, so its sender is not told",
+                msg.verb()
+            );
+        }
+    }
+
+    /// The two fire-and-forget verbs answer a refusal in a `SignalAck` that
+    /// carries the greppable code as well as the sentence, so the CLI's stderr
+    /// and the daemon's `warn!` share one word.
+    #[test]
+    fn a_refused_fire_and_forget_verb_answers_a_signal_ack() {
+        for msg in one_of_every_variant() {
+            if !matches!(msg, DaemonMessage::WorkDone(_) | DaemonMessage::Dispatch(_)) {
+                continue;
+            }
+            let line = msg
+                .provenance_refusal_reply("missing_token", "refused: because")
+                .expect("a fire-and-forget refusal is answered");
+            let ack: SignalAck = serde_json::from_str(&line).expect("the refusal parses as an ack");
+            assert!(ack.is_signal_ack());
+            assert!(
+                !ack.accepted,
+                "{}: a refusal is not an acceptance",
+                msg.verb()
+            );
+            assert_eq!(ack.reason.as_deref(), Some("missing_token"));
+            assert_eq!(ack.error.as_deref(), Some("refused: because"));
+        }
+    }
+
+    /// The admission is affirmative: it identifies itself and carries no error.
+    #[test]
+    fn an_admitted_fire_and_forget_verb_answers_an_affirmative_ack() {
+        let msg = DaemonMessage::WorkDone(WorkDoneSignal {
+            pane_id: "p".into(),
+            task: "t".into(),
+            done: false,
+            timestamp: chrono::Utc::now(),
+            token: None,
+        });
+        let line = msg
+            .provenance_ack_reply()
+            .expect("work_done is acknowledged");
+        let ack: SignalAck = serde_json::from_str(&line).expect("the ack parses");
+        assert!(ack.is_signal_ack());
+        assert!(ack.accepted);
+        assert_eq!(ack.reason, None);
+        assert_eq!(ack.error, None);
+    }
+
+    /// The marker check, and the direction of its failure. Every field of
+    /// `SignalAck` is `#[serde(default)]` over an `accepted: bool`, so a line
+    /// that is not an ack at all parses into `accepted: false` — a refusal
+    /// manufactured out of another daemon's reply. `is_signal_ack` is what stops
+    /// the CLI turning that into a reported failure on a signal it delivered.
+    #[test]
+    fn a_line_that_is_not_an_ack_is_not_read_as_a_refusal() {
+        for line in [
+            "{}",
+            r#"{"seed":null}"#,
+            r#"{"kind":"delegate","delivered":[]}"#,
+            r#"{"accepted":false}"#,
+        ] {
+            let parsed: SignalAck =
+                serde_json::from_str(line).expect("these all parse, which is the hazard");
+            assert!(
+                !parsed.is_signal_ack(),
+                "{line} was accepted as an ack, so a daemon we do not understand would be                  reported as having refused"
+            );
+        }
+    }
+
+    /// A CLI that predates the ack emits exactly the payload it always did, and
+    /// a daemon that predates it writes nothing back. Neither half is exercised
+    /// here — this pins the third: an ack read by a build that knows the type
+    /// but not a field a later daemon added must not become a refusal.
+    #[test]
+    fn an_ack_with_unknown_fields_still_reads_as_an_acceptance() {
+        let ack: SignalAck = serde_json::from_str(
+            r#"{"kind":"signal_ack","accepted":true,"something_new":{"a":1}}"#,
+        )
+        .expect("unknown keys are ignored");
+        assert!(ack.is_signal_ack());
+        assert!(ack.accepted);
     }
 }

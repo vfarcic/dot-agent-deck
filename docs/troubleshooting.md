@@ -157,6 +157,48 @@ See [Installation › Recycling the local daemon](installation.md#recycling-the-
 
 On every launch, the TUI performs a build-version handshake with the daemon. When the binary versions differ, the resolution depends only on whether managed agents are running. With **no agents running**, the older daemon is restarted **silently** — there is nothing to lose. With **agents running** and an interactive terminal, the TUI prompts you: the prompt **names the live agents** and warns that restarting stops them, then offers a single-keystroke choice — press **S** to restart onto the new version, or any other key to **keep the current daemon** and stay attached to it with your agents intact. Keeping the current daemon is what leaves you on the older shape. When the TUI is not attached to a terminal (CI, pipes) and agents are running, it prints the recovery hint to stderr and exits non-zero instead of prompting.
 
+## `work-done`, `dispatch` or `delegate` fails with "refused: … hook capability token"
+
+An agent reports back and the command fails instead of returning quietly:
+
+```text
+Error: the daemon did not accept this work-done report: refused: this pane was
+issued a hook capability token and the message presented none. The usual cause
+is that the `dot-agent-deck` binary invoked in this pane is older than the
+daemon that spawned it; set DOT_AGENT_DECK_HOOK_PROVENANCE=warn on the daemon
+to accept it anyway. [missing_token]
+```
+
+### Why this happens
+
+The daemon gives each agent it spawns a per-spawn capability token in that pane's environment. Six commands carry it — `work-done`, `dispatch` (including `--list-targets`), `delegate`, `pane restart`, `pane spawn` and `get-seed` — and the daemon refuses one that names a pane it *has* minted a token for without presenting that pane's own token. That is what stops another process on the same machine signalling as your pane after reading its id off `daemon status`.
+
+Two mixed-version situations produce a refusal from a sender that is entirely legitimate:
+
+- **`missing_token`** — the `dot-agent-deck` binary the pane invokes is *older* than the daemon that spawned the pane, so it does not know to forward the token. The usual cause is a daemon started from a different build than the one on `PATH`.
+- **"not one this daemon issued"** — the agent outlived the daemon that started it (a `daemon stop`, a version restart, a crash) and still holds the old daemon's token. Such a pane has lost its orchestration role as well; see the next section.
+
+### Fix
+
+Put the matching binary on the pane's `PATH` — usually by recycling the daemon so both halves come from the same build:
+
+```bash
+dot-agent-deck daemon stop
+dot-agent-deck
+```
+
+If you need to keep a mixed install working for now, tell the **daemon** to accept a message that presents no token at all:
+
+```bash
+DOT_AGENT_DECK_HOOK_PROVENANCE=warn dot-agent-deck daemon serve
+```
+
+That relaxes only the missing-token case, and logs a warning naming the pane each time. It does not accept a token minted for a different pane, or one this daemon never issued.
+
+### Why you are seeing this at all
+
+`work-done` and `dispatch` used to read no reply from the daemon, so a refused report exited 0 and vanished: the only trace was a line in the daemon log. They now read an acknowledgement, which is why a refusal that was already happening has become visible. The acknowledgement says whether the daemon accepted the message, not whether the work behind it succeeded.
+
 ## An orchestration stops being able to delegate: "the daemon holds no orchestration role for pane …"
 
 An orchestrator that has been delegating happily suddenly cannot. Its `dot-agent-deck delegate` fails with:

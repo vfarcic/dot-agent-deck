@@ -640,6 +640,83 @@ fn parse_delegate_reply(line: &str) -> Option<dot_agent_deck::event::DelegateRes
         .filter(|r| r.is_delegate_reply())
 }
 
+/// Parse one line of daemon reply into a [`dot_agent_deck::event::SignalAck`],
+/// or `None` when the line is not an ack this build understands.
+///
+/// Same marker discipline as [`parse_delegate_reply`], and the same direction of
+/// failure matters more here: `SignalAck`'s fields are all `#[serde(default)]`
+/// over an `accepted: bool`, so `{}` and another verb's reply both parse into
+/// `accepted: false` — a refusal invented out of a line that is not an ack.
+/// Filtering on the marker is what keeps an unrecognised daemon reported as
+/// success rather than as a failure the sender did not have.
+fn parse_signal_ack(line: &str) -> Option<dot_agent_deck::event::SignalAck> {
+    serde_json::from_str::<dot_agent_deck::event::SignalAck>(line)
+        .ok()
+        .filter(|a| a.is_signal_ack())
+}
+
+/// Send one fire-and-forget hook-socket signal — `work-done` or `dispatch` —
+/// and turn the daemon's acknowledgement into this process's exit code.
+///
+/// Issue #1129. Before this, both verbs went through
+/// `dot_agent_deck::hook::send_to_socket` and exited 0 on any successful write,
+/// so a message the provenance gate refused looked identical to one the daemon
+/// acted on. The legitimate sender that trips that gate is a `dot-agent-deck`
+/// binary in the pane older than the daemon that spawned it: it forwards no
+/// token, is refused as `missing_token`, and used to report a completion that
+/// went nowhere as a clean success.
+///
+/// `verb` names the signal in the two messages below; `subject` is how a message
+/// refers to it in prose ("work-done report", "dispatch").
+///
+/// The four outcomes, and why only one of them is a failure the caller did not
+/// already have:
+///
+/// * [`SocketReply::Unreachable`] — never sent. Exactly what a `None` from
+///   `send_to_socket` meant, reported the same way.
+/// * [`SocketReply::NoReply`] — a daemon that does not write an ack, i.e. one
+///   predating issue #1129. **Success**, for the reason `delegate`'s own
+///   `NoReply` arm is: the verb was fire-and-forget before the daemon answered
+///   it, so a daemon that does not answer must not become a phantom failure on
+///   every mixed-version pair.
+/// * a line that is not a recognisable ack — treated as `NoReply`, per
+///   [`parse_signal_ack`].
+/// * an ack with `accepted: false` — the one new failure. The daemon refused
+///   the signal and said why.
+///
+/// An `accepted: true` ack says the gate admitted the message, **not** that the
+/// handler behind it succeeded — the daemon writes it before the handler runs.
+/// See `dot_agent_deck::event::SignalAck` for what stays invisible.
+fn send_signal_and_report_ack(json: &str, verb: &str, subject: &str) -> ExitCode {
+    use dot_agent_deck::hook::SocketReply;
+    match dot_agent_deck::hook::send_and_await_signal_ack(json) {
+        SocketReply::Unreachable => {
+            eprintln!("Failed to send {verb} signal to daemon socket.");
+            ExitCode::FAILURE
+        }
+        SocketReply::NoReply => ExitCode::SUCCESS,
+        SocketReply::Line(line) => match parse_signal_ack(&line) {
+            Some(ack) if !ack.accepted => {
+                // The daemon's sentence carries the remedy; the code is the word
+                // it also put in its own `warn!` line, so an operator reading
+                // both has one string to grep for.
+                eprintln!(
+                    "Error: the daemon did not accept this {subject}: {}{}",
+                    ack.error.as_deref().unwrap_or(
+                        "refused, and the daemon gave no reason this build understands."
+                    ),
+                    ack.reason
+                        .as_deref()
+                        .map(|r| format!(" [{r}]"))
+                        .unwrap_or_default()
+                );
+                ExitCode::FAILURE
+            }
+            _ => ExitCode::SUCCESS,
+        },
+    }
+}
+
 /// Decide what `delegate` reports for a daemon reply it does understand.
 ///
 /// Pure, and separate from the `Delegate` arm, so the contract below is pinned
@@ -1054,11 +1131,7 @@ fn main() -> ExitCode {
                         return ExitCode::FAILURE;
                     }
                 };
-                if dot_agent_deck::hook::send_to_socket(&json).is_none() {
-                    eprintln!("Failed to send dispatch signal to daemon socket.");
-                    return ExitCode::FAILURE;
-                }
-                ExitCode::SUCCESS
+                send_signal_and_report_ack(&json, "dispatch", "dispatch")
             }
         }
         Some(Commands::WorkDone {
@@ -1097,11 +1170,7 @@ fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
-            if dot_agent_deck::hook::send_to_socket(&json).is_none() {
-                eprintln!("Failed to send work-done signal to daemon socket.");
-                return ExitCode::FAILURE;
-            }
-            ExitCode::SUCCESS
+            send_signal_and_report_ack(&json, "work-done", "work-done report")
         }
         Some(Commands::AgentEvent { r#type }) => {
             let pane_id = match std::env::var(DOT_AGENT_DECK_PANE_ID) {
