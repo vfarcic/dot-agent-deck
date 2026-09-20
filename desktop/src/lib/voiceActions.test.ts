@@ -131,12 +131,28 @@ describe("VOICE_ACTIONS", () => {
 
   /**
    * Scenario: load the frontend action registry and enumerate it the way the
-   * structural guard will. It is a plain object whose four command-table
-   * actions are callable, and every entry is explicitly classified for voice.
+   * structural guard will. Every entry the command table names is callable, and
+   * every entry at all is explicitly classified for voice.
+   *
+   * The list is by VALUE rather than derived, which is the same choice the Rust
+   * side makes about the shipped row set: a test that read the flags back off
+   * the registry would pass while the registry said something else. Its cost is
+   * one line per new voice-reachable entry, and that is what it is for. (Its
+   * name said *four* while there were five, which is why it no longer counts
+   * them.)
    */
-  it("exports a literal registry with the four command-table actions and total voice classification", async () => {
+  it("exports a literal registry with every command-table action and total voice classification", async () => {
     const { VOICE_ACTIONS } = await vi.importActual<{ VOICE_ACTIONS: Record<string, RegistryEntry> }>("./voiceActions");
-    const voiceActionIds = ["openAgent", "openOverview", "openDeck", "closeAgentView"];
+    const voiceActionIds = [
+      "openAgent",
+      "openOverview",
+      "openDeck",
+      "closeAgentView",
+      "openSettings",
+      "stopVoice",
+      "showVoiceCommands",
+      "dictateToAgent",
+    ];
 
     expect(Array.isArray(VOICE_ACTIONS)).toBe(false);
     expect(Object.getPrototypeOf(VOICE_ACTIONS)).toBe(Object.prototype);
