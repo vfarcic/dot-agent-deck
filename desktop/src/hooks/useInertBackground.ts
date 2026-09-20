@@ -57,10 +57,19 @@
  *
  * **The exempt elements are no longer a dialog, and the exemption did not
  * widen when they stopped being one.** M6's voice surface was a trigger plus a
- * modal-looking dialog; it is now a trigger plus a transient report, because
+ * modal-looking dialog; then a trigger plus a transient report, because
  * continuous voice control cannot be gated behind something that has to be
- * dismissed between utterances. What is matched is the marker, not a role, so
- * the shape change cost nothing here — and the count is still two elements.
+ * dismissed between utterances; and now **one** element — the reserved
+ * `.voice-row` holding both, which is what stopped the report overlapping the
+ * pane it was reporting on. What is matched is the marker, not a role, so each
+ * shape change cost nothing here.
+ *
+ * Read the count going from two to one as the exemption NARROWING rather than
+ * moving: it is one marked sibling containing the same two controls, so what the
+ * walk skips is the same subtree it skipped before. The trigger and the Undo
+ * inside the report are still the complete set of controls reachable outside an
+ * open pane, which `AgentPaneDeckIdentity.test.tsx` asserts by equality rather
+ * than by a filter.
  *
  * So elements carrying {@link VOICE_PEER_PROPS} are skipped, and nothing else
  * is. It is an allow-list of one marker rather than a rule about roles or

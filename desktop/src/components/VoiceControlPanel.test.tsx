@@ -357,6 +357,32 @@ describe("voice control panel", () => {
   });
 
   /**
+   * Scenario: render the deck with voice available and inspect the surface's
+   * shape. The trigger and the report are the two cells of ONE row, and that row
+   * is the single element the agent pane's inert walk is told to skip.
+   */
+  it("renders the trigger and the report as one row carrying one peer marker", () => {
+    render(<DeckShell runtime={runtime(resolver(result(DISPATCH)))} />);
+
+    const row = screen.getByTestId("voice-row");
+    // Both cells inside it: this is what stops the report being a box that
+    // floats over the screen the pane is on. `.voice-row`'s height is what every
+    // other full-height surface subtracts, and a child that escaped the row
+    // would escape the reservation with it.
+    expect(row).toContainElement(screen.getByTestId("voice-trigger"));
+    expect(row).toContainElement(screen.getByTestId("voice-report"));
+    expect(row).toHaveAttribute("data-modal-peer", "voice");
+    // ONE marker, on the row — the exemption narrowed rather than moved. A
+    // marker left on a child as well would be a second exempt sibling wherever
+    // the walk happened to reach it.
+    expect(document.querySelectorAll('[data-modal-peer="voice"]')).toHaveLength(1);
+    // The live region is still its own element inside the row, so a screen
+    // reader is listening before the first sentence lands.
+    expect(screen.getByTestId("voice-report")).toHaveAttribute("aria-live", "polite");
+    expect(screen.getByTestId("voice-report")).toHaveAttribute("role", "status");
+  });
+
+  /**
    * Scenario: a segment of room tone with a noise in it comes back `silent`.
    * The row says nothing was said, keeps listening, and spends no resolver call
    * — and it never blames the user's microphone.

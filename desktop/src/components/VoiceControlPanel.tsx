@@ -60,6 +60,15 @@
  * just happened and the Undo beside it reverses one, so both have to outlive the
  * screen change they are about. Mounted inside either screen, a successful
  * `open_overview` would unmount the surface that was explaining it.
+ *
+ * # It renders one RESERVED ROW, not two floating boxes
+ *
+ * Everything this file renders is inside a single `.voice-row` pinned to the
+ * bottom of the window: the button on the left, and what the microphone heard
+ * plus the outcome on its right. The stylesheet sets that row's height aside on
+ * every surface that would otherwise reach the bottom edge — the agent pane
+ * overlay above all — so the row overlaps nothing and nothing overlaps it. The
+ * comment on the returned element has the reasoning and the one it replaced.
  */
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Mic, MicOff, Undo2 } from "lucide-react";
@@ -860,7 +869,39 @@ export function VoiceControlPanel({ runtime, screen, onDispatch }: VoiceControlP
   const reporting = note !== undefined || problem !== undefined || capture !== undefined || result !== undefined;
 
   return (
-    <>
+    /*
+      One RESERVED ROW at the bottom of the window, and that is the product
+      owner's own shape: *"a dedicated row at the bottom for the button and, if
+      it's turned on, the text that it hears to the right next to it in the same
+      row that does not overlap anything (including the overlay with the agent
+      enlarged)"*.
+
+      **What it replaces, and why the replacement is structural rather than a
+      nicer position.** The trigger and the report used to be two independently
+      fixed boxes floating over the screen — the report stacked *above* the
+      button, growing upward as it filled. Floating means overlapping, and
+      overlapping the agent pane is the case that matters: that pane is where the
+      user is working, and a report describing a navigation was drawn over the
+      terminal they had just enlarged to read. Moving the boxes would have bought
+      a different collision, not no collision, because a floating box's height is
+      its content's and no other element can reserve room for it.
+
+      A row can. `--voice-row-height` in `styles.css` is a constant this row
+      occupies and every surface that would otherwise reach the bottom edge sets
+      aside: the screen content, the agent pane overlay, the reader overlay, the
+      evidence drawer and the toast. The row is above the agent pane in z-order
+      and outside its content box, so neither can cover the other — see the
+      block comment on `.voice-row` for which surfaces reserve it and which
+      deliberately do not.
+
+      The two children are the row's two cells, left and right, and there is one
+      `VOICE_PEER_PROPS` on the ROW rather than one on each of them. That is the
+      same exemption narrowed, not widened: `useInertBackground` matches the
+      marker on the sibling it is about to inert, and this row is that sibling
+      now. The trigger and the Undo inside the report stay reachable behind an
+      open pane, which is what the exemption exists for.
+    */
+    <div className="voice-row" data-testid="voice-row" {...VOICE_PEER_PROPS}>
       <button
         type="button"
         className="voice-trigger"
@@ -876,11 +917,6 @@ export function VoiceControlPanel({ runtime, screen, onDispatch }: VoiceControlP
            carries, and of the click below being serialised rather than racing. */
         aria-busy={indicator === "stopping" || indicator === "checking"}
         title={INDICATOR_TITLE[indicator]}
-        /* A peer of the agent pane rather than background, so `useInertBackground`
-           leaves it alone while a pane is open — see that hook. Without it the
-           `agent` screen's only command, `close_agent_view`, is dispatched by a
-           control the browser will not even let the user click. */
-        {...VOICE_PEER_PROPS}
         /* Serialised rather than raced. While a release is in flight the device
            is Rust's, and a press that started a new recording over it would be
            the same lie from the other direction — or, if it landed as a second
@@ -904,26 +940,36 @@ export function VoiceControlPanel({ runtime, screen, onDispatch }: VoiceControlP
         <span>{INDICATOR_LABEL[indicator]}</span>
       </button>
       {/*
-        The report lives beside the button rather than in a dialog, which is
-        what makes continuous voice possible at all: a dialog would have to be
-        dismissed between utterances, and the press that dismissed it is the
-        press that turns voice off.
+        The report is the row's right-hand cell, beside the button rather than in
+        a dialog — which is what makes continuous voice possible at all: a dialog
+        would have to be dismissed between utterances, and the press that
+        dismissed it is the press that turns voice off.
 
-        Always mounted, and a peer for the trigger's reason — the Undo inside it
-        is a control, and a control behind an open agent pane has to be
-        clickable or the report is a picture of one.
+        Always mounted, inside the row's exemption: the Undo in here is a
+        control, and a control behind an open agent pane has to be clickable or
+        the report is a picture of one.
 
         `role="status"` rather than `alert`: the sentences are the result of
         something the user just did, so they are announced at the next pause
         instead of interrupting. The region is in the DOM before any of them
         arrives, which is what makes the announcement reliable.
+
+        **The last report PERSISTS until the next utterance replaces it, and that
+        is now a decision rather than something inherited.** Floating over the
+        screen it was a box that stayed in the way after it had been read, and
+        nothing here dismissed it. In a reserved row it costs nothing to leave:
+        the space is set aside whether or not it holds anything, so the sentence
+        is simply what the row says until there is something newer to say. It
+        also has to stay — the pipeline goes straight back to listening, so a
+        sentence that faded on a timer would be gone before a user who looked
+        away from the microphone and back. `forget()` at the start of the next
+        cycle is the one thing that clears it.
       */}
       <div
         className="voice-report"
         data-testid="voice-report"
         role="status"
         aria-live="polite"
-        {...VOICE_PEER_PROPS}
       >
         {reporting && (
           <div className="voice-report-card">
@@ -946,12 +992,22 @@ export function VoiceControlPanel({ runtime, screen, onDispatch }: VoiceControlP
               formality: thirty seconds of speech is around 700 characters, so a
               rambling utterance's no-match sentence IS elided here, with the
               clamp's own marker so it never passes itself off as complete.
+
+              `title` carries the same sanitised string, because a row is one
+              line high and CSS elides what does not fit. The bound above is what
+              makes that safe to put in a tooltip: it is already clamped and
+              already scrubbed, and it is the same value the element renders
+              rather than a second copy from somewhere upstream.
             */}
-            {problem && <p className="voice-sentence">{displayText(problem, DISPLAY_LIMITS.message)}</p>}
-            {capture && <p className="voice-sentence">{displayText(capture, DISPLAY_LIMITS.message)}</p>}
+            {problem && <p className="voice-sentence" title={displayText(problem, DISPLAY_LIMITS.message)}>{displayText(problem, DISPLAY_LIMITS.message)}</p>}
+            {capture && <p className="voice-sentence" title={displayText(capture, DISPLAY_LIMITS.message)}>{displayText(capture, DISPLAY_LIMITS.message)}</p>}
             {result && (
               <>
-                <p className="voice-sentence">{displayText(result.outcome.sentence, DISPLAY_LIMITS.message)}</p>
+                <p className="voice-sentence" title={displayText(result.outcome.sentence, DISPLAY_LIMITS.message)}>{displayText(result.outcome.sentence, DISPLAY_LIMITS.message)}</p>
+                {/* Never elided and never squeezed out — `flex: 0 0 auto` in the
+                    stylesheet. The Undo is a real control with a ten-second life,
+                    so a long transcript beside it must lose characters before
+                    this loses the button. */}
                 <div className="voice-outcome-foot">
                   <span className="voice-cost">{voiceCost(result.backend, result.resolveMs)}</span>
                   {undo && <button className="button secondary compact" onClick={() => { undo.run(); setUndo(undefined); }}><Undo2 size={13} /> Undo</button>}
@@ -961,6 +1017,6 @@ export function VoiceControlPanel({ runtime, screen, onDispatch }: VoiceControlP
           </div>
         )}
       </div>
-    </>
+    </div>
   );
 }
