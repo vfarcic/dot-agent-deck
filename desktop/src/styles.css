@@ -1369,6 +1369,10 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
    sharing the row's spare space between them. */
 .voice-outcome-foot { flex: 0 0 auto; margin-left: auto; display: flex; align-items: center; gap: 7px; }
 .voice-cost { color: var(--faint); white-space: nowrap; font-size: 8px; }
+/* PRD #802 — the empty state, in the report cell before the first utterance.
+   Quieter than a sentence and elided the same way, because the row's height is
+   the reservation every other surface made and this must not be what grows it. */
+.voice-hint { flex: 0 1 auto; min-width: 0; margin: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); font-size: 10px; }
 
 /* PRD #802 D7 — the discovery overlay.
 

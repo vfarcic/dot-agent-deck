@@ -401,3 +401,76 @@ describe("what can I say?", () => {
     expect(screen.getByTestId("voice-report")).toHaveTextContent(NOTHING_DISPATCHED);
   });
 });
+
+describe("the empty report row", () => {
+  beforeEach(() => {
+    window.localStorage.clear();
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  /**
+   * Scenario: press Voice and read the row before saying anything. It names
+   * both ways to stop and the phrase that lists everything — which is the only
+   * documentation a user who has just pressed the button will meet.
+   */
+  it("says how to stop and how to find out what to say", async () => {
+    const voice = microphone([]);
+    const resolveVoice: ResolveVoice = vi.fn(async () => dispatch("voice_off", "stopVoice", "Voice control off.", "voice off"));
+    render(<DeckShell runtime={runtime(resolveVoice, voice)} />);
+
+    await turnVoiceOn();
+
+    const hint = screen.getByTestId("voice-hint");
+    expect(hint).toHaveTextContent("what can I say?");
+    expect(hint).toHaveTextContent("voice off");
+    // The non-voice escape, named beside the phrase: if the phrase is misheard
+    // the button is the only way out that does not depend on being heard.
+    expect(hint).toHaveTextContent(/Voice button/);
+  });
+
+  /**
+   * Scenario: the row is empty before the press, because "say voice off" over
+   * a microphone that is not open would be an instruction for a state the user
+   * is not in.
+   */
+  it("is absent while voice is off", async () => {
+    const voice = microphone([]);
+    const resolveVoice: ResolveVoice = vi.fn(async () => dispatch("voice_off", "stopVoice", "Voice control off.", "voice off"));
+    render(<DeckShell runtime={runtime(resolveVoice, voice)} />);
+
+    await flush();
+
+    expect(screen.queryByTestId("voice-hint")).toBeNull();
+  });
+
+  /**
+   * Scenario: the first utterance replaces it, and a fresh activation brings it
+   * back. It is a label for an empty row rather than a first-run tutorial, so
+   * it stands whenever the row has nothing else to say — which after a report
+   * means the next time the row is cleared.
+   */
+  it("gives way to a report, and returns when the row is emptied again", async () => {
+    const voice = microphone(["show me every agent"]);
+    const resolveVoice: ResolveVoice = vi.fn(async () => dispatch("open_overview", "openOverview", "Opening the agent overview.", "show me every agent"));
+    render(<DeckShell runtime={runtime(resolveVoice, voice)} />);
+
+    await turnVoiceOn();
+    expect(screen.getByTestId("voice-hint")).toBeInTheDocument();
+
+    await completeUtterance();
+    expect(screen.queryByTestId("voice-hint")).toBeNull();
+    expect(screen.getByTestId("voice-report")).toHaveTextContent("Opening the agent overview.");
+
+    // Off and on again: `turnOn` clears the row through `forget()`, which is
+    // the user-visible route back to an empty one.
+    await act(async () => { fireEvent.click(voiceButton()); });
+    await act(async () => { fireEvent.click(voiceButton()); });
+    await flush();
+    expect(screen.getByTestId("voice-hint")).toBeInTheDocument();
+    expect(screen.getByTestId("voice-report")).not.toHaveTextContent("Opening the agent overview.");
+  });
+});

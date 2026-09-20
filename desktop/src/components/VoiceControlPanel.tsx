@@ -40,10 +40,16 @@
  *
  * The sentences written here are {@link NOTHING_DISPATCHED},
  * {@link SCREEN_MOVED_ON}, {@link VOICE_UNAVAILABLE},
- * {@link VOICE_CAP_DISCARDED} and {@link VOICE_RELEASE_REFUSED}. The first two
- * are for situations Rust structurally cannot know about; the last three are
- * about the surface's own state machine rather than about an utterance. See
- * their own notes.
+ * {@link VOICE_CAP_DISCARDED}, {@link VOICE_RELEASE_REFUSED} and
+ * {@link VOICE_EMPTY_STATE}. The first two are for situations Rust
+ * structurally cannot know about; the rest are about the surface's own state
+ * — a release it cannot vouch for, a microphone it has nothing to open, a row
+ * with nothing in it yet — rather than about an utterance. See their own
+ * notes.
+ *
+ * The overlay `list_commands` opens writes no sentence of its own: it prints
+ * the table's own `description` column, which is the point of generating it
+ * from the table rather than maintaining a list beside one.
  *
  * # Voice gets no execution path of its own
  *
@@ -201,6 +207,29 @@ export const VOICE_CAP_DISCARDED = "That ran to the 30 s limit with no pause in 
  * its own marker rather than passing a truncation off as complete.
  */
 export const VOICE_RELEASE_REFUSED = "The microphone may still be open — releasing it was refused. Press Voice again to retry.";
+
+/**
+ * What the report row says before the first utterance (PRD #802).
+ *
+ * **The two things a user who has just pressed Voice does not otherwise know:
+ * how to stop, and how to find out what to say.** Between the press and the
+ * first utterance the row holds *Listening…* and nothing else, which is the
+ * moment a new user is most looking at it and least able to act — so this is
+ * the cheapest documentation in the product, and it sits at the point of use
+ * rather than in a page nobody has opened.
+ *
+ * It names BOTH ways out, and the second one is the load-bearing half: the
+ * exit phrase is a thing you have to have been told, while the button is on
+ * screen — and if the phrase is misheard, or transcription has stopped
+ * working, the button is the only way out that does not depend on being heard.
+ *
+ * Static, and one line, because the row is one line by contract. It is a
+ * sixth sentence this file writes and it is about the SURFACE rather than
+ * about an utterance, which is the same class as `VOICE_UNAVAILABLE` and
+ * `VOICE_RELEASE_REFUSED`: nothing in the command table knows a user is
+ * standing here having said nothing yet.
+ */
+export const VOICE_EMPTY_STATE = "Say “what can I say?” for the list, or “voice off” to stop — the Voice button stops it too.";
 
 /** The voice half of the runtime, which a runtime may not have at all. */
 type Voice = Pick<DeckRuntimeState, "declareVoiceScreen" | "resolveVoice" | "voiceCommands" | "voiceStart" | "voiceStop" | "voiceStatus" | "voiceCancel">;
@@ -965,6 +994,17 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel }: Voic
 
   const indicator = indicatorFor(known, on, phase);
   const note = progressNote(indicator, phase);
+  /*
+    The empty state: voice is on and this session has nothing to report yet.
+
+    Keyed on the three report slots rather than on a "have we spoken" flag,
+    because that is exactly the question — the hint is what stands in the row
+    while none of them holds anything, and it goes the moment one does.
+    `forget()` clears all three at the start of each cycle, so it reappears
+    between utterances too, which is right: it is a label for an empty row
+    rather than a first-run tutorial.
+  */
+  const emptyState = indicator === "on" && problem === undefined && capture === undefined && result === undefined;
   const reporting = note !== undefined || problem !== undefined || capture !== undefined || result !== undefined;
 
   return (
@@ -1078,6 +1118,9 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel }: Voic
         {reporting && (
           <div className="voice-report-card">
             {note && <p className="voice-note">{note}</p>}
+            {/* Not through `displayText`: this is a literal in this file, not
+                free-form text from a microphone, a model or a daemon. */}
+            {emptyState && <p className="voice-hint" data-testid="voice-hint">{VOICE_EMPTY_STATE}</p>}
             {/*
               Each sentence is its own element holding nothing else, so the
               transcript inside it survives to the DOM exactly as Rust rendered

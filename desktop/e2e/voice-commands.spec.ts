@@ -121,3 +121,31 @@ test.describe("what can I say?", () => {
     await page.getByTestId("voice-help-close").click({ trial: true });
   });
 });
+
+test.describe("the empty report row", () => {
+  /**
+   * Scenario: press Voice in the preview and read the row before it has heard
+   * anything. It names the phrase that lists everything, the phrase that
+   * stops, and the button — and it fits the reserved row rather than growing
+   * it, which is the one property the row has to keep.
+   */
+  test("names both ways out and does not grow the row", async ({ page }) => {
+    // A script with nothing in it: the fixture then hears nothing at all, which
+    // is the state this row is about. An empty `?voice=` is filtered out, so
+    // this says it with a phrase no fixture row matches — the hint has to
+    // survive until an utterance REPORTS, not merely until one is heard.
+    await openSpeaking(page, ["    "]);
+    const before = await page.locator(".voice-row").boundingBox();
+
+    await voiceButton(page).click();
+
+    const hint = page.getByTestId("voice-hint");
+    await expect(hint).toContainText("what can I say?");
+    await expect(hint).toContainText("voice off");
+    await expect(hint).toContainText("Voice button");
+
+    const after = await page.locator(".voice-row").boundingBox();
+    expect(before, "the voice row has no layout box").not.toBeNull();
+    expect(after!.height, "the empty-state hint grew the reserved row").toBe(before!.height);
+  });
+});
