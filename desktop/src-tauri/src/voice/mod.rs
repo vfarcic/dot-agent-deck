@@ -195,8 +195,92 @@ impl From<String> for Transcript {
 /// nothing worth measuring.
 #[doc(hidden)]
 pub mod test_support {
+    use std::sync::Arc;
+
     use super::DesktopAgent;
     use crate::dto::{DesktopActiveTool, DesktopTab};
+    use crate::model_service::{ModelId, ServiceUrl};
+    use crate::secrets::{Secret, SecretError, SecretId, SecretStatus, SecretStore};
+
+    /// The keyed API intent backend, with a credential the caller already holds.
+    ///
+    /// # Why an integration test cannot build one itself
+    ///
+    /// The same reason [`agent`] exists, one layer along: [`RemoteResolver::new`]
+    /// takes a [`ServiceUrl`], a [`ModelId`] and an `Arc<dyn SecretStore>`, and
+    /// all three of those live in **private** modules (`model_service`,
+    /// `secrets`). `pub mod voice` is the crate's only public module, so
+    /// `tests/voice_phrase_fixtures.rs` can name none of them however `pub` the
+    /// items themselves are — and the in-memory store the unit tests drive is
+    /// `#[cfg(test)]`, which an integration test compiles with off.
+    ///
+    /// # The key is passed in, never read from the environment here
+    ///
+    /// The caller names the variable it wants and reports honestly when it is
+    /// absent. This function taking `key` rather than reading one keeps the
+    /// credential's provenance at the call site, where the test's own
+    /// preflight already is.
+    ///
+    /// The returned resolver reads that key through the same
+    /// [`crate::secrets::load_off_runtime`] path production takes — the store is
+    /// the double, and nothing else about the call differs.
+    ///
+    /// [`RemoteResolver::new`]: super::remote::RemoteResolver::new
+    pub fn api_resolver(
+        endpoint: &str,
+        model: &str,
+        key: &str,
+    ) -> Result<Box<dyn super::IntentResolver>, String> {
+        let endpoint = ServiceUrl::parse(endpoint).map_err(|error| error.to_string())?;
+        let model = ModelId::parse(model).map_err(|error| error.to_string())?;
+        Ok(Box::new(super::remote::RemoteResolver::new(
+            Arc::new(OneSecret(Secret::new(key))),
+            endpoint,
+            model,
+        )))
+    }
+
+    /// This build's shipping coordinates for the keyed API backend, as
+    /// `(endpoint, model)`.
+    ///
+    /// Read from `crate::settings` rather than repeated, so the credentialed
+    /// fixtures verify the endpoint and model a user actually gets instead of a
+    /// pair that once matched them.
+    pub fn api_preset() -> (&'static str, &'static str) {
+        (
+            crate::settings::HOSTED_COMMAND_ENDPOINT,
+            crate::settings::HOSTED_COMMAND_MODEL,
+        )
+    }
+
+    /// A [`SecretStore`] holding exactly one credential, in memory, for
+    /// [`api_resolver`].
+    ///
+    /// Writes are accepted and discarded rather than refused: nothing in the
+    /// resolve path writes, and a store that returned an error for a call it
+    /// never receives would be inventing a failure mode to look thorough.
+    struct OneSecret(Secret);
+
+    impl SecretStore for OneSecret {
+        fn store(&self, _id: SecretId, _secret: &Secret) -> Result<(), SecretError> {
+            Ok(())
+        }
+
+        fn load(&self, _id: SecretId) -> Result<Option<Secret>, SecretError> {
+            Ok(Some(self.0.clone()))
+        }
+
+        fn delete(&self, _id: SecretId) -> Result<(), SecretError> {
+            Ok(())
+        }
+
+        fn status(&self, _id: SecretId) -> SecretStatus {
+            SecretStatus {
+                stored: true,
+                problem: None,
+            }
+        }
+    }
 
     /// A snapshot agent. Only the fields a spoken reference can reach are
     /// interesting; the rest are what the daemon would have reported.

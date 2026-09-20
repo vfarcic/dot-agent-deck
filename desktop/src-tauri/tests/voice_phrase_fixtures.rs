@@ -1,28 +1,40 @@
 //! Credentialed phrase-compatibility fixtures for PRD #802 M9.
 //!
 //! These fixtures are authoritative only for the shipping default intent
-//! backend: `AgentCliResolver::claude()`, currently Claude Haiku through the
-//! pre-authenticated `claude` CLI. A green run with another model or backend
+//! backend, which is now the **keyed API backend on this build's own preset**
+//! — `test_support::api_preset()`, currently Anthropic Messages on
+//! `claude-haiku-4-5`. A green run with another model, endpoint or protocol
 //! would prove less than it appears to, so this module deliberately offers no
-//! backend switch.
+//! backend switch: it reads the preset rather than taking one.
+//!
+//! **It used to drive `AgentCliResolver::claude()`.** PRD #802's provider work
+//! is removing the agent-CLI intent backend outright — Commands becomes
+//! API-only, because a stage that needs a key has to let the user choose whose
+//! key it is — and these fixtures move off it FIRST, so the removal lands with
+//! the feature's only real-model verification intact rather than reconstructed
+//! afterwards. The migration changes the resolver under these fixtures and
+//! **no expectation in them**: the manifest, the planted fleet, the outcome
+//! kinds and the pre-validation below are unchanged.
 //!
 //! The test is local-only. It never reaches a model in CI or during an ordinary
 //! `cargo test-fast`; set `DOT_AGENT_DECK_REQUIRE_REAL_E2E=1` to opt in and to
-//! turn a missing CLI or login into a failure instead of a green runtime skip.
+//! turn a missing credential into a failure instead of a green runtime skip.
 
 use std::fmt;
-use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use dot_agent_deck_desktop::voice::{
-    AGENT_CLI_TIMEOUT, AgentCliResolver, NO_MATCH_ACTION, Screen, Transcript, VoiceOutcome,
-    handle_utterance, table,
-    test_support::{role_agent_in_state, with_tool},
+    NO_MATCH_ACTION, REMOTE_TIMEOUT, Screen, Transcript, VoiceOutcome, handle_utterance, table,
+    test_support::{api_preset, api_resolver, role_agent_in_state, with_tool},
 };
 use serde::Deserialize;
 
 const FIXTURES: &str = include_str!("../src/voice/phrase_fixtures.toml");
 const REQUIRE_REAL_E2E_ENV: &str = "DOT_AGENT_DECK_REQUIRE_REAL_E2E";
+/// The credential the keyed backend authenticates with, as the developer's own
+/// shell already spells it. Rule 5's lane 2: a developer's key on a developer's
+/// machine, and nothing registered on the repository.
+const API_KEY_ENV: &str = "ANTHROPIC_API_KEY";
 const MIN_FIXTURE_COUNT: usize = 24;
 const PENDING_OPEN_SETTINGS_ACTION: &str = "open_settings";
 const PER_FIXTURE_GRACE: Duration = Duration::from_secs(15);
@@ -94,22 +106,20 @@ fn skip(reason: &str) {
     eprintln!("SKIP: [e2e] {reason}");
 }
 
-fn preflight_claude() -> Result<(), String> {
-    let status = Command::new("claude")
-        .args(["auth", "status", "--json"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()
-        .map_err(|error| format!("the default `claude` backend is not available: {error}"))?;
-    if !status.status.success() {
-        return Err("the default `claude` backend is installed but not authenticated".to_string());
-    }
-    let auth: serde_json::Value = serde_json::from_slice(&status.stdout)
-        .map_err(|_| "`claude auth status --json` returned unreadable output".to_string())?;
-    match auth.get("loggedIn").and_then(serde_json::Value::as_bool) {
-        Some(true) => Ok(()),
-        _ => Err("the default `claude` backend is not logged in".to_string()),
+/// The credential this run will spend, or why it cannot run.
+///
+/// The same shape the CLI preflight had — a question asked before any fixture
+/// is dispatched, so "cannot run" is one sentence rather than 24 identical
+/// failures. It reads the variable and checks it is not blank; whether the key
+/// is *valid* is what the first fixture finds out, and an invalid key is a
+/// failure rather than a skip.
+fn preflight_key() -> Result<String, String> {
+    match std::env::var(API_KEY_ENV) {
+        Ok(key) if !key.trim().is_empty() => Ok(key),
+        Ok(_) => Err(format!("{API_KEY_ENV} is set and blank")),
+        Err(_) => Err(format!(
+            "the keyed command backend needs {API_KEY_ENV} in the environment"
+        )),
     }
 }
 
@@ -143,8 +153,9 @@ fn observed(outcome: &VoiceOutcome) -> (Option<&str>, OutcomeKind, Option<&str>)
 }
 
 /// Scenario: Validate every checked-in phrase and the planted fleet before any
-/// live-agent gate. Skip CI unless a real-agent run is explicitly required;
-/// with local opt-in, verify the full outcome through the shipping Claude CLI.
+/// live-model gate. Skip CI unless a real-agent run is explicitly required;
+/// with local opt-in, verify the full outcome through the shipping keyed API
+/// backend on this build's own endpoint and model.
 #[tokio::test]
 async fn voice_phrase_fixtures_match_the_default_backend() {
     let fixtures = manifest();
@@ -217,13 +228,25 @@ async fn voice_phrase_fixtures_match_the_default_backend() {
         skip("set DOT_AGENT_DECK_REQUIRE_REAL_E2E=1 to run the voice phrase fixtures");
         return;
     }
-    if let Err(reason) = preflight_claude() {
-        panic!(
+    let key = match preflight_key() {
+        Ok(key) => key,
+        Err(reason) => panic!(
             "{REQUIRE_REAL_E2E_ENV} is set, so this real-agent test must RUN, not skip: {reason}"
-        );
-    }
+        ),
+    };
 
-    let resolver = AgentCliResolver::claude();
+    let (endpoint, model) = api_preset();
+    let resolver = match api_resolver(endpoint, model, &key) {
+        Ok(resolver) => resolver,
+        Err(reason) => panic!(
+            "{REQUIRE_REAL_E2E_ENV} is set, so this real-agent test must RUN, not skip: \
+             this build\'s command preset is unusable: {reason}"
+        ),
+    };
+    eprintln!(
+        "backend: {} | {endpoint} | {model}",
+        resolver.backend_name()
+    );
     let suite_started = Instant::now();
     let mut failures = Vec::new();
 
@@ -238,15 +261,15 @@ async fn voice_phrase_fixtures_match_the_default_backend() {
         let transcript = Transcript::new(&fixture.utterance);
         let started = Instant::now();
         let resolved = tokio::time::timeout(
-            AGENT_CLI_TIMEOUT + PER_FIXTURE_GRACE,
-            handle_utterance(&resolver, table(), screen, &agents, transcript),
+            REMOTE_TIMEOUT + PER_FIXTURE_GRACE,
+            handle_utterance(resolver.as_ref(), table(), screen, &agents, transcript),
         )
         .await;
 
         let result = match resolved {
             Err(_) => Err(format!(
                 "timed out after {:?}",
-                AGENT_CLI_TIMEOUT + PER_FIXTURE_GRACE
+                REMOTE_TIMEOUT + PER_FIXTURE_GRACE
             )),
             Ok(answer) => {
                 let (actual_action, actual_outcome, actual_agent) = observed(&answer.outcome);
