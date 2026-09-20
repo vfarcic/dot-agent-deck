@@ -306,8 +306,8 @@ impl RemoteResolver {
             return Err(IntentError::Backend(api_error_detail(status, &payload)));
         }
         match self.protocol {
-            Protocol::Anthropic => parse_response(&payload),
-            Protocol::OpenAiCompatible => super::openai::parse_response(&payload),
+            Protocol::Anthropic => parse_response(&payload, self.max_tokens),
+            Protocol::OpenAiCompatible => super::openai::parse_response(&payload, self.max_tokens),
         }
     }
 }
@@ -404,16 +404,52 @@ pub fn request_body(request: &IntentRequest<'_>, model: &str, max_tokens: TokenC
     })
 }
 
+/// What a reply cut off at the answer ceiling becomes, on either dialect.
+///
+/// **It names the number and the row that changes it**, which the sentence it
+/// replaced could not: *"the command backend's answer was cut off before it
+/// finished"* was a fact about the request with no action attached, because the
+/// ceiling was a `const`. It is a settings field now
+/// ([`crate::settings::IntentSettings::max_tokens`]), so the remedy is a row the
+/// user can open — and naming the current value is what tells them whether
+/// raising it is plausible or whether the model is looping.
+///
+/// One function for both protocols because it is one setting: the wire spells
+/// it `max_tokens` here and `max_completion_tokens` in [`super::openai`], and a
+/// user has no reason to meet two different sentences about the same field.
+pub fn truncated_at(max_tokens: TokenCeiling) -> IntentError {
+    IntentError::Backend(format!(
+        "the command backend's answer was cut off at its {max_tokens}-token ceiling — \
+         raise Max tokens under Settings → Voice"
+    ))
+}
+
 /// The answer, out of the one `tool_use` block.
 ///
-/// A `refusal` stop reason is reported as its own failure rather than falling
-/// through to "no tool call": the two have different remedies, and a user whose
-/// utterance was declined should not be told the backend is broken.
-pub fn parse_response(payload: &Value) -> Result<IntentAnswer, IntentError> {
+/// Three replies that are not an answer are told apart, because the remedies
+/// differ. A `refusal` stop reason is reported as its own failure rather than
+/// falling through to "no tool call": the two have different remedies, and a
+/// user whose utterance was declined should not be told the backend is broken.
+///
+/// **`max_tokens` is the third, and it was previously not told apart at all.**
+/// A tool call cut off at the ceiling arrives as a `tool_use` block with a
+/// truncated `input`, so it fell through to *"picked an action this build could
+/// not read"* — which names the wrong culprit and offers no remedy. This
+/// dialect does not count reasoning against the ceiling on the preset model, so
+/// it is reachable by pointing the endpoint at a thinking model or by lowering
+/// the field; both are things the user chose, which is exactly when a sentence
+/// has to say what they chose.
+pub fn parse_response(
+    payload: &Value,
+    max_tokens: TokenCeiling,
+) -> Result<IntentAnswer, IntentError> {
     if payload["stop_reason"] == "refusal" {
         return Err(IntentError::Backend(
             "the command backend declined to answer that".into(),
         ));
+    }
+    if payload["stop_reason"] == "max_tokens" {
+        return Err(truncated_at(max_tokens));
     }
     let block = payload["content"]
         .as_array()
@@ -653,6 +689,14 @@ mod tests {
 
     // -- the response shape ------------------------------------------------
 
+    /// The parse under this build's default ceiling.
+    ///
+    /// Every case below is about the CONTENT of the reply, so the ceiling is a
+    /// constant here; the one test that is about the ceiling passes its own.
+    fn parse(payload: &Value) -> Result<IntentAnswer, IntentError> {
+        parse_response(payload, TokenCeiling::default())
+    }
+
     fn reply(input: Value) -> Value {
         json!({
             "stop_reason": "tool_use",
@@ -667,7 +711,7 @@ mod tests {
 
     #[test]
     fn voice_remote_parses_a_tool_use_answer() {
-        let answer = parse_response(&reply(
+        let answer = parse(&reply(
             json!({"action": "open_agent", "params": {"agent": "tester"}}),
         ))
         .expect("parses");
@@ -677,7 +721,7 @@ mod tests {
 
     #[test]
     fn voice_remote_parses_the_none_escape() {
-        let answer = parse_response(&reply(json!({"action": "none"}))).expect("parses");
+        let answer = parse(&reply(json!({"action": "none"}))).expect("parses");
         assert!(answer.is_no_match());
     }
 
@@ -690,17 +734,14 @@ mod tests {
                 {"type": "tool_use", "name": TOOL_NAME, "input": {"action": "open_deck"}},
             ],
         });
-        assert_eq!(
-            parse_response(&payload).expect("parses").action,
-            "open_deck"
-        );
+        assert_eq!(parse(&payload).expect("parses").action, "open_deck");
     }
 
     #[test]
     fn voice_remote_keeps_an_action_outside_the_table() {
         // Not this function's refusal to make — `handle_utterance` turns it
         // into UnknownAction, which says something different.
-        let answer = parse_response(&reply(json!({"action": "launch_missiles"}))).expect("parses");
+        let answer = parse(&reply(json!({"action": "launch_missiles"}))).expect("parses");
         assert_eq!(answer.action, "launch_missiles");
     }
 
@@ -710,25 +751,66 @@ mod tests {
             "stop_reason": "end_turn",
             "content": [{"type": "text", "text": "I think you want the tester."}],
         });
-        let error = parse_response(&payload).expect_err("fails");
+        let error = parse(&payload).expect_err("fails");
         assert!(
             error.detail().contains("without picking an action"),
             "{error}"
         );
     }
 
+    /// Scenario: the Anthropic reply stops at `max_tokens`. The failure
+    /// sentence is the same one the other dialect produces, naming the ceiling
+    /// and the settings row.
+    ///
+    /// **This case was not told apart at all before the ceiling became a
+    /// field.** A tool call cut off at the ceiling arrives as a `tool_use`
+    /// block with truncated `input`, so it fell through to *"picked an action
+    /// this build could not read"* — a sentence that blames the model for
+    /// something the request did. One sentence for both protocols because it is
+    /// one setting; two wordings for one field would be a distinction the user
+    /// has no way to act on.
+    #[test]
+    fn voice_remote_reports_an_answer_cut_off_at_the_ceiling() {
+        let payload = json!({
+            "stop_reason": "max_tokens",
+            "content": [{
+                "type": "tool_use",
+                "id": "toolu_abc123",
+                "name": TOOL_NAME,
+                "input": { "action": "open_ag" },
+            }],
+        });
+        let error = parse(&payload).expect_err("fails");
+        assert_eq!(
+            error.detail(),
+            format!(
+                "the command backend's answer was cut off at its {DEFAULT_TOKEN_CEILING}-token \
+                 ceiling — raise Max tokens under Settings → Voice"
+            ),
+        );
+        assert_eq!(
+            error.detail(),
+            super::truncated_at(TokenCeiling::default()).detail(),
+            "the two dialects must say the same thing about the same field"
+        );
+
+        let error = parse_response(&payload, TokenCeiling::parse(512).expect("in range"))
+            .expect_err("fails");
+        assert!(error.detail().contains("512-token ceiling"), "{error}");
+    }
+
     #[test]
     fn voice_remote_reports_a_refusal_as_its_own_failure() {
         let payload = json!({"stop_reason": "refusal", "content": []});
-        let error = parse_response(&payload).expect_err("fails");
+        let error = parse(&payload).expect_err("fails");
         assert!(error.detail().contains("declined"), "{error}");
     }
 
     #[test]
     fn voice_remote_reports_an_unreadable_tool_input() {
-        let error = parse_response(&reply(json!({"action": 7}))).expect_err("fails");
+        let error = parse(&reply(json!({"action": 7}))).expect_err("fails");
         assert!(error.detail().contains("could not read"), "{error}");
-        let error = parse_response(&reply(json!({}))).expect_err("fails");
+        let error = parse(&reply(json!({}))).expect_err("fails");
         assert!(error.detail().contains("could not read"), "{error}");
     }
 

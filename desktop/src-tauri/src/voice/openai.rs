@@ -72,6 +72,7 @@ use serde_json::{Value, json};
 use crate::model_service::TokenCeiling;
 
 use super::prompt::{action_enum, param_names, state};
+use super::remote::truncated_at;
 use super::resolver::{IntentAnswer, IntentError, IntentRequest};
 use super::schema::{AnnotatedCommand, TOOL_INSTRUCTIONS, TOOL_NAME};
 
@@ -158,7 +159,18 @@ pub fn request_body(request: &IntentRequest<'_>, model: &str, max_tokens: TokenC
 /// differ: a **refusal** (the model declined, which is not the backend being
 /// broken), a reply cut off at the token ceiling, and a reply with no content at
 /// all.
-pub fn parse_response(payload: &Value) -> Result<IntentAnswer, IntentError> {
+///
+/// The ceiling is passed in so the truncation sentence can **name it**. That
+/// used to read *"the command backend's answer was cut off before it finished"*,
+/// which told the user a fact about the request and nothing they could act on —
+/// honestly so, at the time, because the ceiling was a `const` nobody could
+/// change. Now that it is a settings field, a sentence that does not name the
+/// number or the row that changes it is withholding the whole remedy. See
+/// [`truncated_at`].
+pub fn parse_response(
+    payload: &Value,
+    max_tokens: TokenCeiling,
+) -> Result<IntentAnswer, IntentError> {
     let choice = &payload["choices"][0];
     if let Some(refusal) = choice["message"]["refusal"].as_str()
         && !refusal.trim().is_empty()
@@ -168,9 +180,7 @@ pub fn parse_response(payload: &Value) -> Result<IntentAnswer, IntentError> {
         ));
     }
     if choice["finish_reason"] == "length" {
-        return Err(IntentError::Backend(
-            "the command backend's answer was cut off before it finished".into(),
-        ));
+        return Err(truncated_at(max_tokens));
     }
     let Some(content) = choice["message"]["content"].as_str() else {
         return Err(IntentError::Backend(
@@ -372,6 +382,14 @@ mod tests {
 
     // -- the response shape ------------------------------------------------
 
+    /// The parse under this build's default ceiling.
+    ///
+    /// Every case below is about the CONTENT of the reply, so the ceiling is a
+    /// constant here; the one test that is about the ceiling passes its own.
+    fn parse(payload: &Value) -> Result<IntentAnswer, IntentError> {
+        parse_response(payload, TokenCeiling::default())
+    }
+
     fn reply(content: &str) -> Value {
         json!({
             "choices": [{
@@ -384,7 +402,7 @@ mod tests {
 
     #[test]
     fn voice_openai_parses_a_schema_constrained_answer() {
-        let answer = parse_response(&reply(
+        let answer = parse(&reply(
             r#"{"action":"open_agent","params":{"agent":"tester"}}"#,
         ))
         .expect("parses");
@@ -396,8 +414,8 @@ mod tests {
     fn voice_openai_drops_the_nulls_strict_mode_forces_the_model_to_send() {
         // The whole reason `params` enumerates and requires every name: an
         // action that takes none still has to fill the object.
-        let answer = parse_response(&reply(r#"{"action":"open_deck","params":{"agent":null}}"#))
-            .expect("parses");
+        let answer =
+            parse(&reply(r#"{"action":"open_deck","params":{"agent":null}}"#)).expect("parses");
         assert_eq!(answer.action, "open_deck");
         assert!(
             answer.params.is_empty(),
@@ -408,8 +426,7 @@ mod tests {
 
     #[test]
     fn voice_openai_parses_the_none_escape() {
-        let answer =
-            parse_response(&reply(r#"{"action":"none","params":{"agent":null}}"#)).expect("parses");
+        let answer = parse(&reply(r#"{"action":"none","params":{"agent":null}}"#)).expect("parses");
         assert!(answer.is_no_match());
     }
 
@@ -419,7 +436,7 @@ mod tests {
         // does not arise. It arises on a server that took the envelope and did
         // not enforce it, which is a real shape — and a fenced but correct
         // answer is not a reason to show a failure sentence.
-        let answer = parse_response(&reply(
+        let answer = parse(&reply(
             "```json\n{\"action\":\"open_overview\",\"params\":{\"agent\":null}}\n```",
         ))
         .expect("parses");
@@ -430,8 +447,7 @@ mod tests {
     fn voice_openai_keeps_an_action_outside_the_table() {
         // Not this function's refusal to make — `handle_utterance` turns it
         // into UnknownAction, which says something different.
-        let answer =
-            parse_response(&reply(r#"{"action":"launch_missiles","params":{}}"#)).expect("parses");
+        let answer = parse(&reply(r#"{"action":"launch_missiles","params":{}}"#)).expect("parses");
         assert_eq!(answer.action, "launch_missiles");
     }
 
@@ -443,10 +459,20 @@ mod tests {
                 "message": { "role": "assistant", "content": null, "refusal": "I can't help with that." },
             }],
         });
-        let error = parse_response(&payload).expect_err("fails");
+        let error = parse(&payload).expect_err("fails");
         assert!(error.detail().contains("declined"), "{error}");
     }
 
+    /// Scenario: the reply comes back `finish_reason: "length"`. The failure
+    /// sentence names the ceiling that cut it off and the settings row that
+    /// changes it.
+    ///
+    /// **The sentence used to name neither**, and was honest about it: the
+    /// ceiling was a `const`, so there was nothing to point at. It is a
+    /// settings field now, which makes *"cut off before it finished"* a
+    /// withheld remedy rather than a complete answer. Naming the CURRENT value
+    /// is the half that carries information — it is what tells the user whether
+    /// raising it is plausible or whether the model is looping.
     #[test]
     fn voice_openai_reports_an_answer_cut_off_at_the_ceiling() {
         let payload = json!({
@@ -455,14 +481,27 @@ mod tests {
                 "message": { "role": "assistant", "content": "{\"action\":\"open_ag" },
             }],
         });
-        let error = parse_response(&payload).expect_err("fails");
-        assert!(error.detail().contains("cut off"), "{error}");
+        let error = parse(&payload).expect_err("fails");
+        assert_eq!(
+            error.detail(),
+            format!(
+                "the command backend's answer was cut off at its {DEFAULT_TOKEN_CEILING}-token \
+                 ceiling — raise Max tokens under Settings → Voice"
+            ),
+        );
+
+        // The number is the CONFIGURED one, not a constant this file owns —
+        // which is the whole difference between a remedy and a restatement.
+        let error = parse_response(&payload, TokenCeiling::parse(512).expect("in range"))
+            .expect_err("fails");
+        assert!(error.detail().contains("512-token ceiling"), "{error}");
+        assert!(error.detail().contains("Max tokens"), "{error}");
     }
 
     #[test]
     fn voice_openai_reports_a_reply_with_no_content() {
         let payload = json!({ "choices": [] });
-        let error = parse_response(&payload).expect_err("fails");
+        let error = parse(&payload).expect_err("fails");
         assert!(
             error.detail().contains("without picking an action"),
             "{error}"
@@ -471,9 +510,9 @@ mod tests {
 
     #[test]
     fn voice_openai_reports_unreadable_content() {
-        let error = parse_response(&reply("I think you want the tester.")).expect_err("fails");
+        let error = parse(&reply("I think you want the tester.")).expect_err("fails");
         assert!(error.detail().contains("could not read"), "{error}");
-        let error = parse_response(&reply(r#"{"action":7}"#)).expect_err("fails");
+        let error = parse(&reply(r#"{"action":7}"#)).expect_err("fails");
         assert!(error.detail().contains("could not read"), "{error}");
     }
 }
