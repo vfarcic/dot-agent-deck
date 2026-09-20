@@ -653,6 +653,13 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** a regression. This is the carve-out test for `status/supersede/012`'s guard, which fires only when BOTH sides name a pane and the panes differ — it passes before and after issue #925 by design, and its job is to fail if that guard is ever widened to treat a stored `None` as a wrong pane.
 - **Platform coverage:** mac+linux+windows.
 
+##### status/supersede/015 — A stacked key collision still lands the frame on its own pane's card.
+- **Layer:** L1 (three registered panes, applied through `AppState::apply_event`).
+- **Agent:** none (synthetic Pi generations under three distinct registry agent ids).
+- **Asserts:** with pane A holding a card under key `K` and a third pane already holding one under the exact key that re-keying `K` for pane B derives, a frame naming pane B under `K` leaves both of those cards with their own agent and tally and takes a card of its own — the re-key is applied until the key stops resolving to another pane's session, not once.
+- **Does not assert:** that a producer would ever emit the derived spelling. It cannot be ruled out — session ids arrive verbatim on producer payloads with no reserved format — which is the whole reason the re-key repeats rather than trusting one pass (Greptile P1 on PR #1187).
+- **Platform coverage:** mac+linux+windows.
+
 #### status/shell-activity
 
 ##### status/shell-activity/001 — The process-table primitive finds a real, detached grandchild process as a descendant and reports its no-controlling-tty / session-leader / argv / session-id facts correctly (PRD #386 M1).

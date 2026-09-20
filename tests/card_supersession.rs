@@ -765,3 +765,85 @@ fn status_supersede_014_a_pane_less_card_still_learns_its_pane() {
         "the card lost its history on the way to learning its pane"
     );
 }
+
+/// Scenario: Pane A holds a card under key `K` and a third pane already holds one under
+/// the very key that re-keying `K` for pane B produces. A frame naming pane B under `K`
+/// must still end up on a card of its own, leaving both other panes' cards untouched.
+#[spec("status/supersede/015")]
+#[test]
+fn status_supersede_015_a_stacked_key_collision_still_lands_on_its_own_pane() {
+    const THIRD_PANE_ID: &str = "scheduler-handoff-pane-c";
+    let shared_session_id = format!("{PANE_ID}-session");
+    // Exactly the spelling the re-key derives for `OTHER_PANE_ID`. Nothing stops
+    // a producer emitting it: session ids arrive verbatim on producer payloads.
+    let derived_session_id = format!("{OTHER_PANE_ID}::{shared_session_id}");
+    let first_timestamp = Utc::now();
+
+    let mut state = AppState::default();
+    state.register_pane(PANE_ID.to_string());
+    state.register_pane(OTHER_PANE_ID.to_string());
+    state.register_pane(THIRD_PANE_ID.to_string());
+
+    state.apply_event(event_on_pane(
+        PANE_ID,
+        &shared_session_id,
+        AgentType::Pi,
+        EventType::ToolEnd,
+        Some("pi-agent-2"),
+        first_timestamp,
+    ));
+    state.apply_event(event_on_pane(
+        THIRD_PANE_ID,
+        &derived_session_id,
+        AgentType::Pi,
+        EventType::ToolEnd,
+        Some("pi-agent-3"),
+        first_timestamp + Duration::seconds(1),
+    ));
+
+    assert_eq!(
+        state.sessions.len(),
+        2,
+        "precondition: pane A and the third pane each hold a card of their own"
+    );
+
+    state.apply_event(event_on_pane(
+        OTHER_PANE_ID,
+        &shared_session_id,
+        AgentType::Pi,
+        EventType::Thinking,
+        Some("pi-agent-9"),
+        first_timestamp + Duration::seconds(2),
+    ));
+
+    let card_on = |pane: &str| {
+        let mut found = state
+            .sessions
+            .values()
+            .filter(|s| s.pane_id.as_deref() == Some(pane));
+        let one = found.next();
+        assert!(
+            found.next().is_none(),
+            "pane {pane} carries more than one card"
+        );
+        one
+    };
+
+    for (pane, agent) in [(PANE_ID, "pi-agent-2"), (THIRD_PANE_ID, "pi-agent-3")] {
+        let card = card_on(pane).unwrap_or_else(|| panic!("pane {pane} lost its card"));
+        assert_eq!(
+            card.agent_id.as_deref(),
+            Some(agent),
+            "pane {pane}'s card no longer belongs to its own agent"
+        );
+        assert_eq!(card.tool_count, 1, "pane {pane}'s card lost its history");
+    }
+
+    let pane_b = card_on(OTHER_PANE_ID)
+        .expect("the colliding frame produced no card for the pane it actually named");
+    assert_eq!(
+        pane_b.agent_id.as_deref(),
+        Some("pi-agent-9"),
+        "the colliding frame's own agent did not get the card for its pane"
+    );
+}

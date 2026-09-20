@@ -7979,13 +7979,11 @@ impl AppState {
     /// Deterministic, so every later frame from one collision derives the same
     /// id and lands on the same card instead of minting a new one per frame.
     ///
-    /// It is one pass, not a fixed point. The derived id is known free only of
-    /// the collision it just resolved: if a producer had ALSO planted a session
-    /// under that exact derived string, on a third pane, the caller's single
-    /// check would not see it. A frame naming that third pane is handled — the
-    /// same rule qualifies it by ITS pane — so what is left unhandled is a
-    /// stacked collision on the derived key itself, which needs a producer
-    /// emitting a string this code constructs.
+    /// One application is NOT a fixed point, which is why the caller applies it
+    /// in a bounded loop rather than once: a producer can plant a session under
+    /// this derived spelling too, on a third pane, and a single pass would land
+    /// the frame on THAT card. The caller's comment carries the loop's
+    /// termination proof.
     ///
     /// The derived id can reach the eye: an unnamed card titles itself with the
     /// first 11 characters of its session id (`render_dashboard`, issue #574's
@@ -8217,16 +8215,39 @@ impl AppState {
         // `agent-event` cannot do it — it derives BOTH fields from
         // `DOT_AGENT_DECK_PANE_ID` — even though its `{pane_id}-session`
         // convention is what first put the assumption in doubt.
-        if let Some(ref pane_id) = event.pane_id
-            && self.sessions.get(&event.session_id).is_some_and(|session| {
-                session
-                    .pane_id
-                    .as_deref()
-                    .is_some_and(|stored| stored != pane_id)
-            })
-        {
-            let rekeyed = Self::pane_qualified_session_id(pane_id, &event.session_id);
-            event.session_id = rekeyed;
+        //
+        // Qualifying REPEATS until the key no longer resolves to a foreign
+        // session, because one pass is not enough (Greptile PR #1187, P1): if a
+        // third pane already held a card under the derived string itself, a
+        // single pass would land the frame straight on THAT card and reproduce
+        // this very bug one level down. Session ids come off producer payloads
+        // with no reserved-format constraint, so no spelling of the derived key
+        // can be assumed unused (`status/supersede/015`).
+        //
+        // The bound is the termination proof rather than defensive padding.
+        // Each step prepends `{pane_id}::`, so every key it produces is
+        // strictly longer than the one before and therefore distinct from all
+        // of them; and a step happens only when the key it is replacing IS an
+        // existing foreign session. Each step therefore consumes a distinct
+        // member of a map that is finite and not written inside the loop, so
+        // after at most `self.sessions.len()` steps no foreign session remains
+        // to land on — and the one extra iteration is the check that confirms
+        // it. Nothing here can spin, and no arm exits with the key still
+        // foreign.
+        if let Some(ref pane_id) = event.pane_id {
+            for _ in 0..=self.sessions.len() {
+                let lands_on_another_pane =
+                    self.sessions.get(&event.session_id).is_some_and(|session| {
+                        session
+                            .pane_id
+                            .as_deref()
+                            .is_some_and(|stored| stored != pane_id)
+                    });
+                if !lands_on_another_pane {
+                    break;
+                }
+                event.session_id = Self::pane_qualified_session_id(pane_id, &event.session_id);
+            }
         }
 
         // PRD #110: reuse the existing session card for the same pane
@@ -8588,14 +8609,13 @@ impl AppState {
         //
         // Issue #925 closed that seam from the other end: the cross-pane
         // re-key above qualifies the key of such a frame BEFORE any of this
-        // runs, so the cross-pane input this block was written against no
-        // longer arrives here. That guard is one pass rather than a fixed
-        // point (see [`Self::pane_qualified_session_id`]), so read it as
-        // having removed the reachable case and not as a proof no foreign
-        // session can ever sit under `event.session_id`. This check stays
-        // regardless — it is the narrower statement, it covers the frame the
-        // re-key deliberately lets through, and an identity protection that
-        // depends on an earlier block not being edited is not a protection.
+        // runs, and repeats until the key stops resolving to another pane's
+        // session, so the cross-pane input this block was written against no
+        // longer arrives here. This check stays regardless — it is the
+        // narrower statement, it covers the frames the re-key deliberately
+        // leaves alone (either side naming no pane), and an identity
+        // protection that depends on an earlier block not being edited is not
+        // a protection.
         if claims_generation
             && let Some(incoming_agent_id) = event.agent_id.as_deref()
             && self.sessions.get(&event.session_id).is_some_and(|session| {
