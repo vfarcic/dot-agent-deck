@@ -1,4 +1,4 @@
-import type { VoiceCommandDto, VoiceResultDto, VoiceScreen, VoiceStatusDto, VoiceTranscriptionDto } from "../lib/bridge";
+import type { VoiceCommandDto, VoiceResolvedParamDto, VoiceResultDto, VoiceScreen, VoiceStatusDto, VoiceTranscriptionDto } from "../lib/bridge";
 import type { AgentProfile, AgentSession, AgentStatus, AgentTab, DeckSnapshot, EvidenceItem, WorkflowStage } from "../types";
 
 /**
@@ -762,6 +762,21 @@ const FIXTURE_VOICE_COMMANDS: ReadonlyArray<{
   readonly screens: readonly VoiceScreen[];
   readonly unavailableHint: string;
   readonly report: string;
+  /**
+   * What a dispatch of this row carries, already resolved.
+   *
+   * **This is fixture DATA, not the `agent_ref` resolver the note above refuses
+   * to invent**, and the line between them is worth stating because it is the
+   * whole reason `open_agent` still has none. A resolver takes words nobody
+   * anticipated and finds an agent; this is one canned answer for one canned
+   * phrase, exactly like every sentence in this module. `open_agent`'s entire
+   * interest IS the resolution — the ambiguity, the no-match, the reference by
+   * state — which a canned answer cannot exercise and `voice/outcome.rs`
+   * already covers properly. `dictate_to_agent`'s interest is what happens
+   * AFTER a param resolves, which is precisely what a canned one lets the
+   * browser tier drive.
+   */
+  readonly params?: readonly VoiceResolvedParamDto[];
 }> = [
   {
     phrases: ["show me every agent", "show me all the agents", "show me everything"],
@@ -814,6 +829,24 @@ const FIXTURE_VOICE_COMMANDS: ReadonlyArray<{
     screens: ["deck", "overview", "agent"],
     unavailableHint: "the list of commands opens anywhere",
     report: "Here is what you can say.",
+  },
+  {
+    // Aimed at the CROWDED fleet's `coder`, and the choice is the feature's own
+    // requirement rather than an arbitrary pick: dictation types into a pane,
+    // so the target has to be an agent whose pane accepts typing. Every agent
+    // in the `connected` deck fails that — `planner` and `reviewer` hold a read
+    // lease, `tester` has no live target, and `builder` has finished — while
+    // the crowded fleet's `coder` is running and holds a write lease. The
+    // browser tier's dictation tests load `?state=crowded` for exactly that
+    // reason, and a preview that dictated into a pane the app itself renders as
+    // unwritable would be demonstrating the opposite of the feature.
+    phrases: ["type to the coder", "talk to the coder"],
+    action: "dictate_to_agent",
+    invoke: "dictateToAgent",
+    screens: ["deck", "overview", "agent"],
+    unavailableHint: "typing to an agent works anywhere",
+    report: "Typing to coder. Say “stop dictation” when you are done.",
+    params: [{ name: "agent", kind: "agent_ref", spoken: "coder", value: "2", label: "coder" }],
   },
 ];
 
@@ -876,7 +909,7 @@ export function resolveFixtureVoice(utterance: string, screen: VoiceScreen): Voi
   }
   return {
     ...stub,
-    outcome: { kind: "dispatch", transcript: utterance, action: command.action, invoke: command.invoke, params: [], sentence: command.report },
+    outcome: { kind: "dispatch", transcript: utterance, action: command.action, invoke: command.invoke, params: [...command.params ?? []], sentence: command.report },
   };
 }
 
@@ -911,6 +944,10 @@ export function fixtureVoiceStatus(overrides: Partial<VoiceStatusDto> = {}): Voi
     capturedMs: 0,
     maxMs: FIXTURE_VOICE_MAX_MS,
     capped: false,
+    // The preview has no microphone to hear speech with, so it reports none.
+    // An override is how a test drives the other answer — which is what PRD
+    // #802's dictation countdown is cancelled by.
+    speech: false,
     available: false,
     // The backend that WOULD answer, which for the preview is the app's own
     // default — nothing does, and `available: false` is what says so. `off`

@@ -170,3 +170,42 @@ the list — it runs none of the commands on it."""
 invoke      = "showVoiceCommands"
 unavailable_hint = "the list of commands opens anywhere"
 report      = "Here is what you can say."
+
+# PRD #802 D6 — modal dictation, and the feature's own point in the owner's
+# words: *"see what's going on in any of the agents and interact with any of
+# them."*
+#
+# **The only row here that is not supervision.** What it does is aim the
+# microphone: while it is aimed, an utterance is no longer resolved against
+# this table at all — it is typed into that agent's visible input. That is an
+# interaction MODE rather than a command, which is why D6 was deferred past the
+# navigation slice and why this row costs more than a row (PRD #802 M8's
+# accounting is about commands, and this is the case it does not cover).
+#
+# It opens the agent's pane as well as aiming at it, and the two are one action
+# rather than a convenience: the requirement is that the words land in a
+# VISIBLE input the user can edit, and on the overview no terminal is mounted
+# at all. A command that typed into a terminal nobody could see would be the
+# hidden buffer this feature is defined against.
+#
+# No `screens`, so callable everywhere — including from the `agent` screen,
+# which is where a user most often is when they decide to say something to the
+# agent they are watching. `open_agent` is narrower (`deck`, `overview`) and
+# that difference is deliberate rather than an oversight: that row's whole
+# effect is the navigation, which from the agent screen means swapping one pane
+# for another, while this row's effect is where the microphone points.
+[[commands]]
+id          = "dictate_to_agent"
+description = """Aim the microphone at ONE agent and type what the user says into that agent's
+prompt, instead of treating it as a command. Use when the user asks to type, talk, write, dictate,
+say something or send a message TO a named agent — "type to the tester", "talk to the coder",
+"tell the reviewer that ...". The agent is named the way the deck shows it: a role like "tester"
+or "orchestrator", or a name the user gave it. Do NOT use this for a request to LOOK at an agent
+or open its pane, which is `open_agent`."""
+invoke      = "dictateToAgent"
+unavailable_hint = "typing to an agent works anywhere"
+report      = "Typing to {agent}. Say “stop dictation” when you are done."
+
+  [[commands.params]]
+  name = "agent"
+  kind = "agent_ref"

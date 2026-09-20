@@ -164,6 +164,7 @@ mod tests {
                 "open_settings".to_string(),
                 "voice_off".to_string(),
                 "list_commands".to_string(),
+                "dictate_to_agent".to_string(),
                 "none".to_string(),
             ]
         );
@@ -218,6 +219,7 @@ mod tests {
                 "open_settings",
                 "voice_off",
                 "list_commands",
+                "dictate_to_agent",
                 "none"
             ]
         );
@@ -272,6 +274,7 @@ mod tests {
                 ("open_settings".to_string(), true),
                 ("voice_off".to_string(), true),
                 ("list_commands".to_string(), true),
+                ("dictate_to_agent".to_string(), true),
             ]
         );
         assert_eq!(
@@ -288,6 +291,7 @@ mod tests {
                 // and neither must the phrase that lists what can be said.
                 ("voice_off".to_string(), true),
                 ("list_commands".to_string(), true),
+                ("dictate_to_agent".to_string(), true),
             ]
         );
         assert_eq!(
@@ -300,6 +304,7 @@ mod tests {
                 ("open_settings".to_string(), false),
                 ("voice_off".to_string(), true),
                 ("list_commands".to_string(), true),
+                ("dictate_to_agent".to_string(), true),
             ]
         );
     }

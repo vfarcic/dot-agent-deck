@@ -1409,3 +1409,9 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
    sentence saying so. */
 .voice-help-section[data-where="elsewhere"] code { color: var(--faint); background: var(--paper-sunken); }
 .voice-help-section[data-where="elsewhere"] p { color: var(--muted); }
+/* PRD #802 D6 — where the microphone is aimed, and the countdown to a send.
+   In the reserved row like every other sentence, and elided like them: a
+   countdown that wrapped would grow the row every time it reached a long agent
+   name. `--amber` rather than the muted ink the hint uses, because this is the
+   one line in the row that says something is ABOUT to happen. */
+.voice-dictation { flex: 0 1 auto; min-width: 0; margin: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--amber-ink); font-size: 11px; font-weight: 600; }

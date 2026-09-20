@@ -481,6 +481,7 @@ mod tests {
                 // stopping must never be unavailable.
                 ("voice_off", "stopVoice", vec![]),
                 ("list_commands", "showVoiceCommands", vec![]),
+                ("dictate_to_agent", "dictateToAgent", vec![]),
             ]
         );
     }
@@ -824,7 +825,10 @@ mod tests {
             .filter(|row| Screen::ALL.iter().all(|&screen| row.callable_on(screen)))
             .map(|row| row.id.as_str())
             .collect();
-        assert_eq!(everywhere, vec!["voice_off", "list_commands"]);
+        assert_eq!(
+            everywhere,
+            vec!["voice_off", "list_commands", "dictate_to_agent"]
+        );
         // And every OTHER row still has both cases, which is what keeps the
         // not-here sentence reachable for the rows that can produce it.
         for row in super::table().rows() {
@@ -860,16 +864,28 @@ mod tests {
                 "open_overview",
                 "open_settings",
                 "voice_off",
-                "list_commands"
+                "list_commands",
+                "dictate_to_agent"
             ]
         );
         assert_eq!(
             callable(Screen::Overview),
-            vec!["open_agent", "open_deck", "voice_off", "list_commands"]
+            vec![
+                "open_agent",
+                "open_deck",
+                "voice_off",
+                "list_commands",
+                "dictate_to_agent"
+            ]
         );
         assert_eq!(
             callable(Screen::Agent),
-            vec!["close_agent_view", "voice_off", "list_commands"]
+            vec![
+                "close_agent_view",
+                "voice_off",
+                "list_commands",
+                "dictate_to_agent"
+            ]
         );
     }
 

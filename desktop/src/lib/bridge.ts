@@ -701,6 +701,24 @@ export interface VoiceStatusDto {
   capturedMs: number;
   maxMs: number;
   capped: boolean;
+  /**
+   * Whether anybody has SPOKEN since this recording opened — PRD #802's
+   * dictation countdown, and the only field on this status that can answer it.
+   *
+   * `capturedMs` counts audio rather than speech, so it grows in a silent room;
+   * `state: "done"` arrives only after the silence hold past the end of a
+   * sentence, which for a long one is well after a five-second countdown would
+   * have fired. So a surface waiting to send what it has typed reads THIS to
+   * know the user is still talking.
+   *
+   * **Optional because a producer may not report it, and absence means exactly
+   * that** — not "nobody is speaking". Both shipped bridges send it: the Tauri
+   * one flattens `voice::CaptureStatus`, which carries it, and the browser
+   * fixture sets it. A runtime that omits it is one that does no speech
+   * detection, and dictation against such a runtime falls back to the timer
+   * alone.
+   */
+  speech?: boolean;
   available: boolean;
   /**
    * Which transcriber would answer — `TranscriptionBackend::as_token`, which

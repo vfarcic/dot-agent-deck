@@ -389,6 +389,12 @@ pub struct Vad {
     quiet: usize,
     /// Latched: an utterance that has ended does not un-end.
     ended: bool,
+    /// [`MIN_SPEECH`] in output samples.
+    min_speech: usize,
+    /// Output samples of consecutive above-floor audio.
+    run: usize,
+    /// Latched: an unbroken run of at least [`MIN_SPEECH`] has been heard.
+    speech: bool,
 }
 
 impl Default for Vad {
@@ -407,6 +413,9 @@ impl Vad {
             heard: false,
             quiet: 0,
             ended: false,
+            min_speech: (MIN_SPEECH.as_secs_f64() * f64::from(TARGET_SAMPLE_RATE)) as usize,
+            run: 0,
+            speech: false,
         }
     }
 
@@ -436,12 +445,24 @@ impl Vad {
             if mean_square >= self.floor {
                 self.heard = true;
                 self.quiet = 0;
+                self.run += VAD_FRAME;
+                if self.run >= self.min_speech {
+                    self.speech = true;
+                }
             } else if self.heard {
+                self.run = 0;
                 self.quiet += VAD_FRAME;
                 if self.quiet >= self.hold {
                     self.ended = true;
                     return;
                 }
+            } else {
+                // Quiet before the first speech. The hold is not counted here
+                // (an open microphone in a quiet room must not "end" an
+                // utterance nobody started) but the RUN still has to break, or
+                // a frame over the floor before this one and a frame over it
+                // after would read as one unbroken stretch.
+                self.run = 0;
             }
         }
     }
@@ -455,6 +476,26 @@ impl Vad {
     /// Whether anything over the floor has arrived at all.
     pub fn heard_speech(&self) -> bool {
         self.heard
+    }
+
+    /// Whether somebody has actually SPOKEN in this recording — an unbroken run
+    /// of at least [`MIN_SPEECH`] above the floor (PRD #802's dictation
+    /// countdown).
+    ///
+    /// **Deliberately not [`Vad::heard_speech`]**, which latches on a single
+    /// 20 ms frame and therefore on a keyboard tap or a chair creak. The
+    /// discriminator is the one [`Pcm16::speech_run`] already documents at
+    /// length — unbroken rather than accumulated, because a train of impulses
+    /// sums to a word and never sustains like one — computed here on the data
+    /// path instead of by a pass over the finished buffer, which is what makes
+    /// it answerable WHILE the recording is open.
+    ///
+    /// Latched for the same reason [`Vad::ended`] is: the question a caller
+    /// asks is *has anything been said since this recording started*, and a
+    /// flag that fell back to false during the pause inside a sentence would
+    /// answer *no* in the middle of one.
+    pub fn speaking(&self) -> bool {
+        self.speech
     }
 }
 
@@ -479,6 +520,9 @@ pub struct PcmSink {
     /// Whether [`Vad`] has ended the utterance, mirrored for the same reason
     /// and latched for [`Vad::ended`]'s.
     ended: AtomicBool,
+    /// Whether [`Vad`] has heard somebody speak in this recording, mirrored and
+    /// latched for the same two reasons.
+    speech: AtomicBool,
 }
 
 #[derive(Default)]
@@ -632,6 +676,7 @@ impl PcmSink {
             full: AtomicBool::new(false),
             written: AtomicU64::new(0),
             ended: AtomicBool::new(false),
+            speech: AtomicBool::new(false),
         }
     }
 
@@ -651,6 +696,17 @@ impl PcmSink {
     /// inside [`SinkState`]: a status poll must never queue behind a callback.
     pub fn utterance_ended(&self) -> bool {
         self.ended.load(Ordering::Relaxed)
+    }
+
+    /// Whether [`Vad`] has heard somebody speak in this recording.
+    ///
+    /// An atomic rather than a look inside [`SinkState`] for
+    /// [`PcmSink::utterance_ended`]'s reason: this is read by a status poll
+    /// four times a second while the device thread may be holding the sink
+    /// lock, and a poll that queued behind a callback would be exactly the
+    /// latency the poll interval was cut to avoid.
+    pub fn speech_heard(&self) -> bool {
+        self.speech.load(Ordering::Relaxed)
     }
 
     /// How much audio has been accumulated.
@@ -758,6 +814,9 @@ impl PcmSink {
         }
         if state.vad.ended() {
             self.ended.store(true, Ordering::Relaxed);
+        }
+        if state.vad.speaking() {
+            self.speech.store(true, Ordering::Relaxed);
         }
     }
 }
@@ -1172,6 +1231,21 @@ pub struct CaptureStatus {
     /// against the real bound rather than against a constant of its own that
     /// could drift from this one.
     pub max_ms: u32,
+    /// Whether somebody has spoken since this recording started (PRD #802's
+    /// dictation countdown).
+    ///
+    /// **This is what a pending send is cancelled by, and nothing else here
+    /// could answer it.** [`CaptureStatus::captured_ms`] counts audio, not
+    /// speech, so it grows in a silent room; [`CaptureState::Done`] arrives
+    /// only after [`SILENCE_HOLD`] past the END of a sentence, which for a long
+    /// one is well past the countdown it was supposed to cancel. So the surface
+    /// would have submitted half an instruction to an agent while the user was
+    /// still saying the rest of it — the precise failure the countdown exists
+    /// to prevent.
+    ///
+    /// Latched per recording: it answers *has anything been said since this
+    /// microphone opened*, which resets when the next one does.
+    pub speech: bool,
     /// Whether the cap ended the recording rather than the user.
     ///
     /// The surface needs this: from the user's side the microphone simply
@@ -1257,13 +1331,14 @@ impl CaptureSession {
     /// What the session is doing right now.
     pub fn status(&self) -> CaptureStatus {
         let inner = self.inner();
-        let (captured, capped, ended) = match &inner.live {
+        let (captured, capped, ended, speech) = match &inner.live {
             Some(live) => (
                 live.sink.captured(),
                 live.sink.is_full(),
                 live.sink.utterance_ended(),
+                live.sink.speech_heard(),
             ),
-            None => (Duration::ZERO, false, false),
+            None => (Duration::ZERO, false, false, false),
         };
         CaptureStatus {
             // [`Vad`] has heard the speaking stop: the recording is still open
@@ -1288,6 +1363,7 @@ impl CaptureSession {
             captured_ms: millis(captured),
             max_ms: millis(MAX_UTTERANCE),
             capped,
+            speech,
         }
     }
 
@@ -1673,6 +1749,92 @@ mod tests {
         let one_frame_short = Pcm16::new(speech((frames - 1) * VAD_FRAME));
         assert!(one_frame_short.speech_run() < MIN_SPEECH);
         assert!(!one_frame_short.has_speech());
+    }
+
+    // -- the live speech flag (PRD #802 D6's countdown) ---------------------
+
+    #[test]
+    fn voice_capture_vad_speaking_needs_an_unbroken_min_speech_run() {
+        // The discriminator the DICTATION COUNTDOWN rests on, and the reason
+        // `speaking()` is not `heard_speech()`: a single frame over the floor
+        // is a keyboard tap, and a tap must not hold a pending send open.
+        let frames = MIN_SPEECH.as_millis() as usize / 20;
+        let mut tapped = Vad::default();
+        tapped.push(&speech((frames - 1) * VAD_FRAME));
+        assert!(tapped.heard_speech(), "the floor was not crossed at all");
+        assert!(
+            !tapped.speaking(),
+            "one frame short of MIN_SPEECH counted as speaking"
+        );
+
+        let mut spoken = Vad::default();
+        spoken.push(&speech(frames * VAD_FRAME));
+        assert!(spoken.speaking(), "exactly MIN_SPEECH is somebody speaking");
+    }
+
+    #[test]
+    fn voice_capture_vad_speaking_does_not_accumulate_across_a_gap() {
+        // Unbroken rather than totalled, exactly as `Pcm16::speech_run` is: ten
+        // taps inside one silence hold sum to a word and never sustain like
+        // one, and a countdown held open by typing would never send.
+        let frames = MIN_SPEECH.as_millis() as usize / 20;
+        let mut vad = Vad::default();
+        for _ in 0..4 {
+            vad.push(&speech((frames - 1) * VAD_FRAME));
+            vad.push(&vec![0; 2 * VAD_FRAME]);
+        }
+        assert!(
+            !vad.speaking(),
+            "four sub-threshold runs accumulated into one"
+        );
+    }
+
+    #[test]
+    fn voice_capture_vad_speaking_latches_through_a_pause() {
+        // Latched for `ended()`'s reason. The question a caller asks is *has
+        // anything been said since this recording opened*, and a flag that fell
+        // back to false during the pause inside a sentence would answer `no`
+        // in the middle of one — which is when a pending send would fire.
+        let frames = MIN_SPEECH.as_millis() as usize / 20;
+        let mut vad = Vad::default();
+        vad.push(&speech(frames * VAD_FRAME));
+        assert!(vad.speaking());
+        vad.push(&vec![0; out_samples(300)]);
+        assert!(vad.speaking(), "a pause un-said what had been said");
+        assert!(!vad.ended(), "300 ms is under SILENCE_HOLD");
+    }
+
+    #[test]
+    fn voice_capture_status_reports_speech_only_once_somebody_has_spoken() {
+        // The whole path the surface actually reads: device callback → sink →
+        // status. Nothing else on this status could answer the question —
+        // `captured_ms` grows in a silent room and `Done` arrives only after
+        // the hold past the END of a sentence, which is well past the countdown
+        // it would have to cancel.
+        let quiet = silent_session();
+        quiet.start().expect("idle accepts a start");
+        let status = quiet.status();
+        assert!(status.captured_ms > 0, "no audio reached the sink");
+        assert!(!status.speech, "a silent room reported somebody speaking");
+
+        let format = mono(TARGET_SAMPLE_RATE);
+        let samples: Vec<f32> = speech(out_samples(300))
+            .into_iter()
+            .map(|s| f32::from(s) / f32::from(i16::MAX))
+            .collect();
+        let spoken = CaptureSession::new(Arc::new(StubSource::new(format, samples)));
+        spoken.start().expect("idle accepts a start");
+        assert!(spoken.status().speech, "speech was not reported");
+
+        // Per RECORDING, which is what makes it answer "has anybody spoken
+        // since this microphone opened": a start builds a fresh sink, and a
+        // session with none live answers `false` rather than the last one's
+        // value.
+        spoken.cancel();
+        assert!(
+            !spoken.status().speech,
+            "the flag outlived the recording it was about"
+        );
     }
 
     #[test]

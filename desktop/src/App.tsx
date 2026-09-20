@@ -465,23 +465,51 @@ export function DeckShell({ runtime, workflowPlatformIssue, initialView = { kind
       `agent_ref` param resolved to nothing and the outcome was `param_unresolved`
       rather than this.
     */
+    const agent = outcome.params.find((param) => param.kind === "agent_ref");
     const target: VoiceDispatchTarget = {
       deckId: selectedDeckId ?? "",
-      agentId: outcome.params.find((param) => param.kind === "agent_ref")?.value ?? "",
+      agentId: agent?.value ?? "",
       from: base === "overview" ? "overview" : "deck",
+      /* What the DECK calls it, which is what Rust resolved the spoken words
+         against — never the spoken words themselves. A surface that named the
+         agent the way the user said it would confirm the mishearing rather
+         than expose it. */
+      agentLabel: agent?.label,
     };
     let moved = false;
+    /*
+      PRD #802 D6 — the same OBSERVATION the navigation gets, for the same
+      reason, and it is what decides whether an Undo is offered.
+
+      Aiming the microphone at an agent moves the screen as well, so `moved`
+      alone would put an Undo beside it — and pressing that Undo would restore
+      the previous screen while voice stayed pointed at the agent. That is an
+      affordance lying about what it reverses, which is the argument this
+      component already makes for `open_settings`, in a worse form: here the
+      thing it fails to undo is where the user's words are going.
+
+      So a dispatch that aimed the microphone offers none, and the way out is
+      the one the row's own report sentence names — *say "stop dictation"* —
+      plus the Voice button, which the report row names too.
+    */
+    let aimed = false;
+    const panel = panelVoiceContext.current;
+    const aim = panel?.startDictation;
     const context: VoiceDispatchContext = {
       ...deckVoiceContext.current,
       /* After the deck's, and the two sets are disjoint by construction — see
          `VoicePanelContext`, which is a narrow `Pick` precisely so a screen and
          the voice surface can never offer the same member. */
-      ...panelVoiceContext.current,
+      ...panel,
+      /* Wrapped only when the panel published one, so an absent member stays
+         absent and `dispatchVoiceAction` refuses the row rather than calling
+         a wrapper around nothing. */
+      ...(aim ? { startDictation: (aimed_at: VoiceDispatchTarget) => { aimed = true; aim(aimed_at); } } : {}),
       navigate: (next) => { moved = true; setView(next); },
       closeAgentView: () => { moved = true; closeAgent(); },
     };
     if (!dispatchVoiceAction(outcome.invoke, context, target)) return undefined;
-    return moved ? { undo: () => setView(previous) } : {};
+    return moved && !aimed ? { undo: () => setView(previous) } : {};
   }, [base, closeAgent, selectedDeckId, view]);
   /* The COMPOSITE identity, never the bare id. See `deckPaneRetargeted` above
      and `DeckSurface`'s own promotion condition. */

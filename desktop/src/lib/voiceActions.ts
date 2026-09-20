@@ -160,6 +160,15 @@ export type VoiceActionContext = {
    * be told to go somewhere else first.
    */
   showVoiceCommands: () => void;
+  /**
+   * Aim the microphone at one agent: from here every utterance is typed into
+   * that agent's prompt rather than resolved as a command (PRD #802 D6).
+   *
+   * Served by the voice surface because the microphone is the surface's, and
+   * because the exit — a phrase, a pending send, a countdown — is state no
+   * screen has anywhere to keep.
+   */
+  startDictation: (target: VoiceDispatchTarget) => void;
 };
 
 /**
@@ -220,7 +229,35 @@ export const VOICE_ACTIONS = {
      */
     run: (context: Pick<VoiceActionContext, "navigate"> & Partial<Pick<VoiceActionContext, "selectAgent">>, target: AgentViewTarget) => {
       context.selectAgent?.(target.agentId);
-      context.navigate({ kind: "agent", ...target });
+      /* The three view members named rather than spread. `VoiceDispatchTarget`
+         carries `agentLabel` as well, which belongs to the dictation row and
+         not in a `DeckView` — a spread would put it in the app's view state,
+         where nothing reads it and everything compares it. */
+      context.navigate({ kind: "agent", deckId: target.deckId, agentId: target.agentId, from: target.from });
+    },
+  },
+
+  dictateToAgent: {
+    label: "Aim voice at one agent and type what it hears",
+    voice: true,
+    needs: ["navigate", "startDictation"],
+    /**
+     * Opening the pane is HALF the action, not a convenience beside it.
+     *
+     * The requirement is that dictated words land in a **visible** input the
+     * user can see and edit — never a hidden buffer — and on the overview no
+     * terminal is mounted at all (PRD #745's commitment). So this opens the
+     * agent it is about to type into, and the two together are what makes the
+     * visibility true on every screen rather than only on the deck.
+     *
+     * `selectAgent` is deliberately not read even where a host offers it:
+     * `navigate` to an agent view is what puts the pane on screen, and the
+     * tile selection underneath it is not something dictation has an opinion
+     * about.
+     */
+    run: (context: Pick<VoiceActionContext, "navigate" | "startDictation">, target: VoiceDispatchTarget) => {
+      context.navigate({ kind: "agent", deckId: target.deckId, agentId: target.agentId, from: target.from });
+      context.startDictation(target);
     },
   },
 
@@ -397,7 +434,21 @@ void NEEDS_COVERS_RUN;
  * It is `AgentViewTarget` because that is the widest target any entry takes;
  * `AgentTarget`'s single member is a subset of it.
  */
-export type VoiceDispatchTarget = AgentViewTarget;
+export type VoiceDispatchTarget = AgentViewTarget & {
+  /**
+   * What the deck CALLS the agent, for a surface that has to name it.
+   *
+   * Resolved Rust-side against live state and carried on the dispatch outcome's
+   * param; `App.tsx` copies it here. Optional because it is meaningful only to
+   * a row that declares an `agent_ref` param, and an entry that does not read
+   * it is unaffected by its absence.
+   *
+   * It is the DAEMON's text — a display name a user chose — so a surface that
+   * renders it scrubs and bounds it at the render seam, the way every other
+   * free-form string in this app is treated.
+   */
+  agentLabel?: string;
+};
 
 /**
  * What a host offers a voice dispatch: `navigate` and `closeAgentView` always,
@@ -438,7 +489,7 @@ export type VoiceDispatchContext = Pick<VoiceActionContext, "navigate" | "closeA
  * set's complement, so a screen that tried to serve one of these members would
  * not type-check, and neither would a panel that left one out.
  */
-export type VoicePanelContext = Pick<VoiceActionContext, "stopVoice" | "showVoiceCommands">;
+export type VoicePanelContext = Pick<VoiceActionContext, "stopVoice" | "showVoiceCommands" | "startDictation">;
 /**
  * `Partial`, because a panel can serve one of these and not another.
  *

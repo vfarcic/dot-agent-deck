@@ -3,8 +3,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createFixtureSnapshot } from "../data/fixture";
 import {
   DEFAULT_DESKTOP_SETTINGS,
-  type VoiceCommandDto,
   type DesktopSettingsDto,
+  type VoiceCommandDto,
   type VoiceResolvedParamDto,
   type VoiceResultDto,
   type VoiceStatusDto,
@@ -20,7 +20,14 @@ vi.mock("./TerminalViewport", () => ({
 }));
 
 import { DeckShell } from "../App";
-import { NOTHING_DISPATCHED, VOICE_STATUS_POLL_MS } from "./VoiceControlPanel";
+import {
+  NOTHING_DISPATCHED,
+  VOICE_DICTATION_ENDED,
+  VOICE_DICTATION_SEND_MS,
+  VOICE_DICTATION_SUBMIT,
+  VOICE_DICTATION_TICK_MS,
+  VOICE_STATUS_POLL_MS,
+} from "./VoiceControlPanel";
 
 /**
  * PRD #802 — the rows that are not navigation.
@@ -48,7 +55,7 @@ interface VoiceControls {
 }
 
 function status(overrides: Partial<VoiceStatusDto> = {}): VoiceStatusDto {
-  return { state: "idle", capturedMs: 0, maxMs: 30_000, capped: false, available: true, backend: "remote", ...overrides };
+  return { state: "idle", capturedMs: 0, maxMs: 30_000, capped: false, speech: false, available: true, backend: "remote", ...overrides };
 }
 
 function heard(transcript: string): VoiceTranscriptionDto {
@@ -67,29 +74,36 @@ function heard(transcript: string): VoiceTranscriptionDto {
  * utterance — the dictation cases are about what the utterance after the first
  * one does, and a stand-in that spoke once could not ask that question.
  */
-function microphone(transcripts: string[]): VoiceControls & { deliver: (transcript: string) => void } {
+function microphone(transcripts: string[]): VoiceControls & { deliver: (transcript: string) => void; speak: () => void } {
   const queue = [...transcripts];
   let recording = false;
   let ready = false;
+  /* Somebody is talking into the open microphone and has not finished. This is
+     the state the capture session reports as `speech` WITHOUT `done`, and it is
+     the whole of what a pending send is cancelled by. */
+  let speaking = false;
   const controls = {
     voiceStart: vi.fn(async () => {
       recording = true;
+      speaking = false;
       ready = queue.length > 0;
       return status({ state: "recording" });
     }),
     voiceStatus: vi.fn(async () => {
       if (recording && ready) {
         ready = false;
-        return status({ state: "done", capturedMs: 900 });
+        return status({ state: "done", capturedMs: 900, speech: true });
       }
-      return status({ state: recording ? "recording" : "idle" });
+      return status({ state: recording ? "recording" : "idle", speech: speaking });
     }),
     voiceStop: vi.fn(async () => {
       recording = false;
+      speaking = false;
       return heard(queue.shift() ?? "");
     }),
     voiceCancel: vi.fn(async () => {
       recording = false;
+      speaking = false;
       return status();
     }),
   };
@@ -99,6 +113,8 @@ function microphone(transcripts: string[]): VoiceControls & { deliver: (transcri
       queue.push(transcript);
       ready = recording;
     },
+    /** Start talking, with no utterance boundary yet — a sentence in progress. */
+    speak: () => { speaking = true; },
   };
 }
 
@@ -472,5 +488,256 @@ describe("the empty report row", () => {
     await flush();
     expect(screen.getByTestId("voice-hint")).toBeInTheDocument();
     expect(screen.getByTestId("voice-report")).not.toHaveTextContent("Opening the agent overview.");
+  });
+});
+
+describe("dictating into an agent", () => {
+  beforeEach(() => {
+    window.localStorage.clear();
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  /** The connected fixture's own deck id — the composite identity's first half. */
+  const DECK_ID = createFixtureSnapshot("connected").connection.deckId ?? "";
+
+  const AIM: VoiceResolvedParamDto[] = [
+    { name: "agent", kind: "agent_ref", spoken: "planner", value: "planner", label: "Planner" },
+  ];
+
+  /**
+   * A resolver that answers the dictation row for the aiming phrase and would
+   * answer a navigation for anything else.
+   *
+   * The second half matters: while dictation is on, NOTHING should reach the
+   * resolver at all, so a test can assert that by the call count rather than by
+   * hoping.
+   */
+  function aiming(): ResolveVoice {
+    return vi.fn(async (utterance: string) =>
+      utterance === "type to the planner"
+        ? dispatch("dictate_to_agent", "dictateToAgent", "Typing to Planner. Say “stop dictation” when you are done.", utterance, AIM)
+        : dispatch("open_overview", "openOverview", "Opening the agent overview.", utterance));
+  }
+
+  /**
+   * Scenario: say "type to the planner", then a sentence. The agent's pane
+   * opens, the sentence is typed into that agent's own terminal — the same path
+   * a keystroke takes — and nothing is submitted.
+   */
+  it("types the next utterance into the agent's terminal and submits nothing", async () => {
+    const voice = microphone(["type to the planner"]);
+    const deck = runtime(aiming(), voice);
+    render(<DeckShell runtime={deck} />);
+
+    await turnVoiceOn();
+    await completeUtterance();
+    expect(screen.getByTestId("agent-pane-overlay")).toBeInTheDocument();
+
+    voice.deliver("run the login tests");
+    await completeUtterance();
+
+    expect(deck.sendTerminalInput).toHaveBeenCalledWith({ deckId: DECK_ID, agentId: "planner" }, "run the login tests ");
+    // Typed, never submitted: no carriage return has been sent.
+    expect(deck.sendTerminalInput).toHaveBeenCalledTimes(1);
+  });
+
+  /**
+   * Scenario: while aimed, an utterance is no longer a command. The resolver is
+   * called once — for the phrase that aimed the microphone — and never again,
+   * so a sentence that happens to sound like a command is typed rather than
+   * run.
+   */
+  it("stops resolving utterances as commands while it is aimed", async () => {
+    const voice = microphone(["type to the planner"]);
+    const resolveVoice = aiming();
+    const deck = runtime(resolveVoice, voice);
+    render(<DeckShell runtime={deck} />);
+
+    await turnVoiceOn();
+    await completeUtterance();
+
+    voice.deliver("show me every agent");
+    await completeUtterance();
+
+    expect(resolveVoice).toHaveBeenCalledTimes(1);
+    expect(deck.sendTerminalInput).toHaveBeenCalledWith({ deckId: DECK_ID, agentId: "planner" }, "show me every agent ");
+  });
+
+  /**
+   * Scenario: after a dictated sentence the row shows a countdown naming the
+   * agent, it runs down a second at a time, and at zero it presses Enter in
+   * that agent's prompt. Nothing is sent before the countdown has been on
+   * screen for every one of those seconds.
+   */
+  it("counts down visibly and then submits", async () => {
+    const voice = microphone(["type to the planner"]);
+    const deck = runtime(aiming(), voice);
+    render(<DeckShell runtime={deck} />);
+
+    await turnVoiceOn();
+    await completeUtterance();
+    voice.deliver("run the login tests");
+    await completeUtterance();
+
+    const line = screen.getByTestId("voice-dictation");
+    expect(line).toHaveTextContent("Typing to Planner");
+    expect(line).toHaveTextContent("sending in 5 s");
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(VOICE_DICTATION_TICK_MS * 2); });
+    expect(screen.getByTestId("voice-dictation")).toHaveTextContent("sending in 3 s");
+    expect(deck.sendTerminalInput).toHaveBeenCalledTimes(1);
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(VOICE_DICTATION_SEND_MS); });
+    expect(deck.sendTerminalInput).toHaveBeenLastCalledWith({ deckId: DECK_ID, agentId: "planner" }, VOICE_DICTATION_SUBMIT);
+  });
+
+  /**
+   * Scenario: keep talking and the pending send is called off. The status poll
+   * reports speech while the microphone is open, which is the only signal that
+   * arrives DURING a sentence rather than after it — so a long instruction is
+   * never cut in half.
+   */
+  it("cancels the pending send while the user is still speaking", async () => {
+    const voice = microphone(["type to the planner"]);
+    const deck = runtime(aiming(), voice);
+    render(<DeckShell runtime={deck} />);
+
+    await turnVoiceOn();
+    await completeUtterance();
+    voice.deliver("can you check");
+    await completeUtterance();
+    expect(screen.getByTestId("voice-dictation")).toHaveTextContent("sending in 5 s");
+
+    // The user starts talking again two seconds into the countdown.
+    await act(async () => { await vi.advanceTimersByTimeAsync(VOICE_DICTATION_TICK_MS * 2); });
+    voice.speak();
+    await act(async () => { await vi.advanceTimersByTimeAsync(VOICE_STATUS_POLL_MS); });
+    expect(screen.getByTestId("voice-dictation")).not.toHaveTextContent("sending in");
+
+    // And the rest of the five seconds passes with nothing submitted.
+    await act(async () => { await vi.advanceTimersByTimeAsync(VOICE_DICTATION_SEND_MS * 2); });
+    expect(deck.sendTerminalInput).toHaveBeenCalledTimes(1);
+  });
+
+  /**
+   * Scenario: the exit phrase ends dictation and sends nothing — D6's "never
+   * auto-submits on exit". What is already in the prompt stays there for the
+   * user to send or edit, and the row says so.
+   */
+  it("ends on the exit phrase without submitting what is typed", async () => {
+    const voice = microphone(["type to the planner"]);
+    const resolveVoice = aiming();
+    const deck = runtime(resolveVoice, voice);
+    render(<DeckShell runtime={deck} />);
+
+    await turnVoiceOn();
+    await completeUtterance();
+    voice.deliver("run the login tests");
+    await completeUtterance();
+
+    voice.deliver("Stop dictation.");
+    await completeUtterance();
+
+    expect(screen.queryByTestId("voice-dictation")).toBeNull();
+    expect(screen.getByTestId("voice-report")).toHaveTextContent(VOICE_DICTATION_ENDED);
+    // One call, and it is the text — no carriage return followed it.
+    expect(deck.sendTerminalInput).toHaveBeenCalledTimes(1);
+    // And voice is still on, listening for commands again.
+    expect(voiceButton()).toHaveAttribute("aria-pressed", "true");
+    voice.deliver("show me every agent");
+    await completeUtterance();
+    expect(resolveVoice).toHaveBeenCalledTimes(2);
+  });
+
+  /**
+   * Scenario: the false positive D6 names. An utterance that merely CONTAINS
+   * the exit phrase is typed, not obeyed — only an utterance that is the phrase
+   * ends anything, which is what makes a distinctive phrase worth having.
+   */
+  it("does not exit on an utterance that merely contains the phrase", async () => {
+    const voice = microphone(["type to the planner"]);
+    const deck = runtime(aiming(), voice);
+    render(<DeckShell runtime={deck} />);
+
+    await turnVoiceOn();
+    await completeUtterance();
+
+    voice.deliver("we should stop dictation of the log at some point");
+    await completeUtterance();
+
+    expect(screen.getByTestId("voice-dictation")).toBeInTheDocument();
+    expect(deck.sendTerminalInput).toHaveBeenCalledWith({ deckId: DECK_ID, agentId: "planner" }, "we should stop dictation of the log at some point ");
+  });
+
+  /**
+   * Scenario: "voice off" while dictating ends everything — dictation and the
+   * microphone. That is the precedence this surface chose: the bigger stop
+   * wins, because the failure it avoids is a user who believes the microphone
+   * is off while it is open.
+   */
+  it("ends dictation AND the microphone on voice off", async () => {
+    const voice = microphone(["type to the planner"]);
+    const deck = runtime(aiming(), voice);
+    render(<DeckShell runtime={deck} />);
+
+    await turnVoiceOn();
+    await completeUtterance();
+
+    voice.deliver("voice off");
+    await completeUtterance();
+
+    expect(screen.queryByTestId("voice-dictation")).toBeNull();
+    expect(voice.voiceCancel).toHaveBeenCalled();
+    expect(voiceButton()).toHaveAttribute("aria-pressed", "false");
+  });
+
+  /**
+   * Scenario: the non-voice escape, and the one that works when nothing is
+   * being heard correctly — including after a MISSED exit, where the phrase
+   * went into the agent's prompt instead of ending dictation. Pressing Voice
+   * calls off the pending send, so the mistake is still sitting in an input the
+   * user can edit rather than already sent.
+   */
+  it("the Voice button ends dictation and calls off the pending send", async () => {
+    const voice = microphone(["type to the planner"]);
+    const deck = runtime(aiming(), voice);
+    render(<DeckShell runtime={deck} />);
+
+    await turnVoiceOn();
+    await completeUtterance();
+    // The missed exit: heard as something else, so it is typed.
+    voice.deliver("stop dictating please");
+    await completeUtterance();
+    expect(screen.getByTestId("voice-dictation")).toHaveTextContent("sending in 5 s");
+
+    await act(async () => { fireEvent.click(voiceButton()); });
+    await flush();
+
+    expect(screen.queryByTestId("voice-dictation")).toBeNull();
+    await act(async () => { await vi.advanceTimersByTimeAsync(VOICE_DICTATION_SEND_MS * 2); });
+    expect(deck.sendTerminalInput).toHaveBeenCalledTimes(1);
+  });
+
+  /**
+   * Scenario: a transcript carrying a carriage return would submit the prompt
+   * the moment it was written. Every control character becomes a space, so the
+   * countdown stays the only thing that can press Enter.
+   */
+  it("never lets a transcript submit the prompt by itself", async () => {
+    const voice = microphone(["type to the planner"]);
+    const deck = runtime(aiming(), voice);
+    render(<DeckShell runtime={deck} />);
+
+    await turnVoiceOn();
+    await completeUtterance();
+
+    voice.deliver("run the tests\r\nrm -rf /");
+    await completeUtterance();
+
+    expect(deck.sendTerminalInput).toHaveBeenCalledWith({ deckId: DECK_ID, agentId: "planner" }, "run the tests rm -rf / ");
   });
 });

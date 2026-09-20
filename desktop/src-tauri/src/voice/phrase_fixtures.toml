@@ -240,3 +240,34 @@ utterance = "what can you do?"
 screen = "deck"
 action = "list_commands"
 outcome = "dispatch"
+
+# `dictate_to_agent` is the collision that matters most in this whole manifest,
+# and it runs in BOTH directions: a request to LOOK at an agent must not aim the
+# microphone at it, and a request to talk to one must not merely open its pane.
+# `open-agent-zoom` and `open-agent-by-state` above are the other half of that
+# pair and are deliberately left untouched, so a `description` that blurs the
+# two goes red on one side or the other.
+
+[[fixtures]]
+name = "dictate-type-to"
+utterance = "type to the tester"
+screen = "deck"
+action = "dictate_to_agent"
+outcome = "dispatch"
+resolved_agent = "agent-tester"
+
+[[fixtures]]
+name = "dictate-tell-that"
+utterance = "tell the reviewer that the build is green"
+screen = "overview"
+action = "dictate_to_agent"
+outcome = "dispatch"
+resolved_agent = "agent-reviewer"
+
+[[fixtures]]
+name = "dictate-talk-to-from-agent-screen"
+utterance = "I want to talk to the tester"
+screen = "agent"
+action = "dictate_to_agent"
+outcome = "dispatch"
+resolved_agent = "agent-tester"

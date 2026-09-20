@@ -251,6 +251,7 @@ mod tests {
                 "open_settings",
                 "voice_off",
                 "list_commands",
+                "dictate_to_agent",
                 "none"
             ]
         );

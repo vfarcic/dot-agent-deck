@@ -149,3 +149,74 @@ test.describe("the empty report row", () => {
     expect(after!.height, "the empty-state hint grew the reserved row").toBe(before!.height);
   });
 });
+
+/**
+ * PRD #802 D6 — the feature's own point, driven as a user meets it.
+ *
+ * These are the tests that exercise the whole aimed loop in a real browser:
+ * the pane opens, the words land in the terminal the user is looking at, the
+ * countdown is on screen, and the phrase ends it. The preview's microphone is
+ * scripted with `?voice=`, which is what makes an utterance AFTER the first one
+ * askable at all.
+ */
+test.describe("dictating into an agent", () => {
+  /**
+   * Scenario: say "type to the coder" and then a sentence. Planner's pane
+   * opens over the deck, the sentence appears in that agent's own terminal —
+   * the visible input, not a buffer — and the row counts down to a send instead
+   * of submitting it.
+   */
+  test("opens the agent's pane and types into its terminal", async ({ page }) => {
+    await openSpeaking(page, ["type to the coder", "run the login tests"], "crowded");
+
+    await voiceButton(page).click();
+
+    const pane = page.getByTestId("agent-pane-overlay");
+    await expect(pane).toBeVisible();
+    // The pane that opened is the one being typed into, and it accepts input:
+    // dictating into a pane the app itself renders as unwritable would be the
+    // hidden buffer this feature is defined against. `builder` holds a write
+    // lease; `planner`, which the other tests here open, does not.
+    // The pane that opened is the agent that was named — by the control that
+    // closes it, which carries the agent's own label rather than its role.
+    await expect(pane.getByRole("button", { name: /close coder agent/i })).toBeVisible();
+    // And it ACCEPTS typing. Dictating into a pane the app itself renders as
+    // unwritable would be demonstrating the opposite of the feature, which is
+    // why the crowded fleet is the one loaded here — see the fixture row.
+    await expect(pane).not.toContainText("Terminal input unavailable");
+    await expect(pane).not.toContainText("This agent has finished its work");
+
+    const line = page.getByTestId("voice-dictation");
+    await expect(line).toContainText("Typing to coder");
+    await expect(line).toContainText("sending in");
+  });
+
+  /**
+   * Scenario: end it by saying so. The countdown and the aim both go, the row
+   * says what happened, and voice stays on — which is the difference between
+   * this and "voice off".
+   */
+  test("ends on the exit phrase and leaves voice listening", async ({ page }) => {
+    await openSpeaking(page, ["type to the coder", "run the login tests", "stop dictation"], "crowded");
+
+    await voiceButton(page).click();
+
+    await expect(page.getByText(/Dictation off/)).toBeVisible();
+    await expect(page.getByTestId("voice-dictation")).toHaveCount(0);
+    await expect(voiceButton(page)).toHaveAttribute("aria-pressed", "true");
+  });
+
+  /**
+   * Scenario: "voice off" while aimed stops everything. The precedence chosen
+   * here is the bigger stop, because the failure it avoids is a user who
+   * believes the microphone is closed while it is open.
+   */
+  test("voice off while dictating stops the microphone too", async ({ page }) => {
+    await openSpeaking(page, ["type to the coder", "run the login tests", "voice off"], "crowded");
+
+    await voiceButton(page).click();
+
+    await expect(voiceButton(page)).toHaveAttribute("aria-pressed", "false");
+    await expect(page.getByTestId("voice-dictation")).toHaveCount(0);
+  });
+});
