@@ -2,52 +2,26 @@
  * Landing page (issue #1021) — direction C, bold product marketing.
  *
  * Everything here is scoped under `.page`, which is the landing page's own
- * visual layer: its own colour tokens, its own bands, its own background. The
- * navbar and footer around it stay the docs' own, deliberately (see the note
- * at the top of `index.js`), so the two layers meet rather than collide.
+ * visual layer: its own bands, its own background, its own marketing devices.
+ * The navbar and footer around it stay the docs' own, deliberately (see the
+ * note at the top of `index.js`).
+ *
+ * The `--c-*` COLOUR TOKENS are no longer declared here. They were this page's
+ * alone, which is exactly why `/` and `/docs` read as two different products;
+ * they now live on `:root` / `html[data-theme='dark']` in `src/css/custom.css`,
+ * where the docs consume them too, and this page simply inherits them. Nothing
+ * else moved with them: the type scale, the spacing and the devices below stay
+ * the landing page's own, and no gradient, spotlight or device frame reaches
+ * the docs.
  */
 
 .page {
-  --c-bg: #ffffff;
-  --c-bg-alt: #f5f7f9;
-  --c-ink: #0e1418;
-  --c-dim: #55636e;
-  --c-line: #e2e7eb;
-  --c-teal: #0a7c73;
-  --c-teal-soft: rgba(15, 156, 144, 0.12);
-  --c-violet: #6248d6;
-  --c-violet-soft: rgba(98, 72, 214, 0.1);
-  --c-amber: #8a5200;
-  --c-amber-soft: rgba(224, 165, 49, 0.14);
-  --c-shadow: 0 30px 70px -30px rgba(14, 20, 24, 0.35);
-  --c-cta-from: #0b7d74;
-  --c-cta-to: #5a3fd0;
-  --c-cta-ink: #ffffff;
-
   background: var(--c-bg);
   color: var(--c-ink);
   font-size: 16px;
   line-height: 1.6;
   /* Contains the hero spotlight, which is deliberately wider than the page. */
   overflow-x: hidden;
-}
-
-[data-theme='dark'] .page {
-  --c-bg: #0a0e12;
-  --c-bg-alt: #101720;
-  --c-ink: #edf2f6;
-  --c-dim: #9aa8b4;
-  --c-line: #1e2833;
-  --c-teal: #4ecdc4;
-  --c-teal-soft: rgba(78, 205, 196, 0.14);
-  --c-violet: #9d8bff;
-  --c-violet-soft: rgba(157, 139, 255, 0.14);
-  --c-amber: #e0a531;
-  --c-amber-soft: rgba(224, 165, 49, 0.14);
-  --c-shadow: 0 30px 80px -30px rgba(0, 0, 0, 0.85);
-  --c-cta-from: #4ecdc4;
-  --c-cta-to: #9d8bff;
-  --c-cta-ink: #07121a;
 }
 
 /* ---------- hero ---------- */
@@ -272,12 +246,6 @@
   padding: 0;
 }
 
-.agentStripList li {
-  display: flex;
-  flex-direction: column;
-  gap: 0.15rem;
-}
-
 .agentStripList a {
   color: var(--c-ink);
   text-decoration: none;
@@ -287,12 +255,6 @@
 
 .agentStripList a:hover {
   color: var(--c-teal);
-}
-
-.agentHow {
-  font-size: 0.72rem;
-  letter-spacing: 0.04em;
-  color: var(--c-dim);
 }
 
 .agentStripNote {
@@ -365,6 +327,21 @@
  */
 .storyRowFlip {
   grid-template-columns: minmax(0, 1.15fr) minmax(0, 0.85fr);
+}
+
+/*
+ * A step that carries no frame. Row 04 (dispatching) has none: nothing in
+ * `site/static/img/` illustrates a dispatched unit, and pointing the row at a
+ * filename that does not exist yet would ship a broken image on a live page.
+ * So the row stands on its own — centred, at a readable measure, reading as
+ * the story's closing beat rather than as half of a two-column row with the
+ * picture missing. Adding `shot:` to the step in `landing-content.js` restores
+ * the ordinary two-column row with no change here.
+ */
+.storyRowSolo {
+  max-width: 44rem;
+  margin: 0 auto;
+  text-align: center;
 }
 
 .storyRowFlip .storyText {
@@ -743,12 +720,20 @@
   margin: 0 0 1.5rem;
 }
 
-/* ---------- the door into the docs ---------- */
+/* ---------- the docs index ---------- */
 
 /*
  * The last band before the (shared) Docusaurus footer. It steps the page's own
  * visual layer back down -- flat surface, hairline rules, no gradient -- so the
  * handoff into the docs chrome reads as a step rather than a cut.
+ *
+ * It used to carry a kicker, a metaphor ("The furniture stays. The job
+ * changes.") and a paragraph explaining which parts of the site persist across
+ * the click. All three are gone: a visitor at the bottom of a landing page
+ * wants to know where to click, not how the site is put together, and the
+ * shared palette (see the header of this file) has removed the mismatch the
+ * paragraph existed to apologise for. What is left is a plain heading over the
+ * six pages, so `.doorHead` and `.doorLede` went with it.
  */
 .door {
   border-top: 1px solid var(--c-line);
@@ -761,33 +746,10 @@
   margin: 0 auto;
 }
 
-.doorKicker {
-  font-size: 0.72rem;
-  font-weight: 700;
-  letter-spacing: 0.18em;
-  text-transform: uppercase;
-  color: var(--c-teal);
-  margin: 0 0 0.9rem;
-}
-
-.doorHead {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
-  gap: 2.5rem;
-  align-items: end;
-}
-
 .doorTitle {
   font-size: clamp(1.4rem, 4.5vw, 2rem);
   font-weight: 750;
   letter-spacing: -0.03em;
-  max-width: 20ch;
-  margin: 0;
-}
-
-.doorLede {
-  color: var(--c-dim);
-  font-size: 0.95rem;
   margin: 0;
 }
 
@@ -905,17 +867,8 @@
 
   .desktopGrid,
   .principleGrid,
-  .installCols,
-  .doorHead {
+  .installCols {
     grid-template-columns: minmax(0, 1fr);
-  }
-
-  .doorHead {
-    gap: 1rem;
-  }
-
-  .doorTitle {
-    max-width: none;
   }
 
   .doorGrid {

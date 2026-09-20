@@ -7,10 +7,65 @@
  * are gone and direction C is now `/`, so the exports that only served the
  * losing directions went with them.
  *
- * The prose is lifted from the previous homepage, with seven corrections it
- * never had, every one checked against the repository rather than reasoned
- * about. The first four are the ones the page shipped with; the issue text was
- * wrong about two of them:
+ * ---------------------------------------------------------------------------
+ * WHAT THIS PAGE CLAIMS THE PRODUCT IS
+ * ---------------------------------------------------------------------------
+ *
+ * The page's first two passes inherited their feature framing from the old
+ * homepage, which predates orchestration, dispatching and scheduling. This
+ * pass re-derived the framing from the repository instead -- `docs/`, the
+ * `Commands` enum in `src/main.rs`, and the Mode cycler in `src/ui.rs` -- and
+ * the answer is that FOUR things are the product today:
+ *
+ * 1. Agents as panes, with live per-card status. The floor everything else
+ *    stands on (`docs/session-management.md`).
+ * 2. Orchestration -- one orchestrator delegating to workers in their own
+ *    panes, with `work-done` back and idle-worker detection when one goes
+ *    quiet (`docs/orchestration.md`, `delegate` / `work-done` / `pane`).
+ * 3. Dispatching -- `dot-agent-deck dispatch` and dispatcher mode: a git
+ *    worktree per unit, a single agent or a whole orchestration inside it,
+ *    reporting back to the pane that asked (`docs/dispatcher-mode.md`).
+ * 4. Scheduling -- cron-fired tabs, run by the daemon whether or not the deck
+ *    is open (`docs/scheduled-tasks.md`, `schedule`).
+ *
+ * Remote environments and the desktop app are real but secondary -- they are
+ * about WHERE the deck runs, not what it does -- and they keep the bands they
+ * already had. Workspace modes are being REMOVED (issue #1199), so they are
+ * gone from the marketing surface entirely.
+ *
+ * The four-step story arc was rebuilt on that basis. The old ending, "walk
+ * away", was a PROPERTY of the product rather than a step in the arc, and its
+ * BEFORE/AFTER frame never communicated; it is now principle 03, where a
+ * sentence carries it better than a frame could. Dispatching takes the fourth
+ * step, because it is the genuine escalation the arc was missing: one agent,
+ * then many visible, then one running the others, then whole new lines of work
+ * starting in their own copies of the repo.
+ *
+ * ---------------------------------------------------------------------------
+ * IMPLEMENTATION DETAIL IS NOT A SELLING POINT
+ * ---------------------------------------------------------------------------
+ *
+ * A visitor deciding whether to install this cares what it does for them, not
+ * how it is wired. This pass swept the page for the second kind and removed
+ * it: "written in Rust" from the hero eyebrow, "Rust" from the hero lede, the
+ * four per-agent `IntegrationStrategy` labels under the agent strip (Native
+ * hooks / Plugin / Bundled extension / Stdout wrapper), "embedded PTY",
+ * "hooks installed for you", "per-project TOML", and "daemon"/"sidecar" from
+ * the desktop band.
+ *
+ * Three survive, each because the implementation IS the reason a reader cares:
+ * "a single binary" (nothing else to install), `Rust 1.85 or newer` on the
+ * `cargo build` install route (you cannot take that route without it), and the
+ * `gh attestation verify` command (it is an instruction, not a description).
+ *
+ * ---------------------------------------------------------------------------
+ * CORRECTED FACTS
+ * ---------------------------------------------------------------------------
+ *
+ * The prose is lifted from the previous homepage, with corrections it never
+ * had, every one checked against the repository rather than reasoned about.
+ * The first four are the ones the page shipped with; the issue text was wrong
+ * about two of them:
  *
  * 1. The desktop GUI. Issue #1021 calls the artifacts "signed and notarized".
  *    They are neither. `.github/workflows/release.yml:523` introduces the
@@ -63,6 +118,15 @@
  *    the bundle matrix is `fail-fast: false` with an explicit path where "the
  *    CLI release itself is unaffected and complete" when every leg fails.
  *
+ * This pass adds an eighth, found while sweeping rather than reported:
+ *
+ * 8. The "No buttons" design principle was false. `docs/getting-started.md`
+ *    says the dashboard "is also fully mouse-clickable: a button bar along the
+ *    bottom exposes the main commands (each labelled with its keyboard
+ *    shortcut), and cards, tab headers, dialogs, the directory picker, and
+ *    forms all respond to clicks". The true claim is keyboard-FIRST, not
+ *    keyboard-only, and the principle now says that and names the button bar.
+ *
  * Ordering, not just wording, is corrected too: the unsigned-macOS caveat now
  * says to verify provenance BEFORE following the release notes past Gatekeeper.
  * The exact OS steps stay centralized in the release notes rather than being
@@ -74,30 +138,66 @@ export const product = {
   binary: 'dot-agent-deck',
   owner: 'DevOps Toolkit',
   tagline:
-    'A terminal dashboard for running multiple AI coding agents in parallel',
+    'A terminal dashboard for running, orchestrating and dispatching AI coding agents in parallel',
   shortDefinition:
-    'A single Rust binary that runs your AI coding agents as embedded terminal panes, tracks what each one is doing in real time, and lets one agent delegate work to the others.',
+    'A single binary that runs your AI coding agents as panes in one terminal, tracks what each of them is doing in real time, and starts new work for you — a team under one orchestrator, an isolated unit in its own copy of the repo, or a task that fires on a schedule.',
   license: 'MIT',
   repo: 'https://github.com/vfarcic/dot-agent-deck',
   issues: 'https://github.com/vfarcic/dot-agent-deck/issues',
   releases: 'https://github.com/vfarcic/dot-agent-deck/releases/latest',
 };
 
-/** The "Why Agent Deck" block, verbatim from the previous homepage. */
+/**
+ * The "Why Agent Deck" block. Carried over from the previous homepage, which
+ * is where the page's strongest writing still is -- so this pass corrects only
+ * what is false or dated in it and leaves the voice alone.
+ *
+ * Three corrections, all from the maintainer's review of the live page:
+ *
+ * - "Running five at once" is now "Running many at the same time". Five reads
+ *   as a ceiling, and nothing in the product imposes one.
+ * - "The agents write the code" was too narrow. They also run the tests, watch
+ *   the pipelines and answer the review comments -- which is what an
+ *   orchestration's reviewer, auditor and release roles do in this very repo.
+ *   The sentence's job is to contrast their work with yours, so widening the
+ *   first half without blurring the second is the whole trick: they execute,
+ *   you decide and validate.
+ * - "One dashboard, every agent visible at a glance" was written when a
+ *   dashboard of single agents was all there was. There are now tabs,
+ *   orchestrations and dispatched units, so the sentence says what it was
+ *   always trying to say -- one place holds all of it -- in terms of what the
+ *   product actually holds today. A REMOTE deck is deliberately not in that
+ *   list, though it was in the first draft of this rewrite: the terminal deck
+ *   attaches to one daemon at a time (`Endpoint` in `src/daemon_client.rs` is
+ *   a single `Local`/`Remote` choice, not a map), so "one place holds ... a
+ *   deck running on another machine" would be true only of the desktop app,
+ *   which holds many at once and has its own band further down the page.
+ */
 export const why = {
   heading: 'Why Agent Deck',
   paragraphs: [
-    "Running one AI agent at a time, you're still a software engineer who happens to use AI. Running five at once, you stop being one. You become a project manager supervising a team, a tech lead unblocking them, an architect designing the approach, a product manager deciding what to build.",
-    "The agents write the code. Your job is everything around it — defining the work up front, supervising it in flight, and validating that the right thing got built. None of this is new. It's the same craft people have practiced for decades. The team just looks different.",
-    'Agent Deck is the tool that lets you do that without losing your mind. One dashboard, every agent visible at a glance, keyboard-driven, in the terminal you already use, with the agent client you already know.',
+    "Running one AI agent at a time, you're still a software engineer who happens to use AI. Running many at the same time, you stop being one. You become a project manager supervising a team, a tech lead unblocking them, an architect designing the approach, a product manager deciding what to build.",
+    "The agents do the work — writing the code, running the tests, watching the pipelines, answering the review comments. Your job is everything around it — defining the work up front, supervising it in flight, and validating that the right thing got built. None of this is new. It's the same craft people have practiced for decades. The team just looks different.",
+    'Agent Deck is the tool that lets you do that without losing your mind. One place holds all of it — a lone agent, a team working under an orchestrator, a unit off in its own copy of the repo — and every one of them is a card or a tab you can open, watch and type into. Keyboard-driven, in the terminal you already use, with the agent client you already know.',
   ],
 };
 
+/**
+ * The design decisions the page argues from. "Focus-mode side panes" was the
+ * third of these and is GONE: workspace modes are being removed (issue #1199,
+ * "they do not work well"), and a marketing page should not advertise a
+ * feature on its way out.
+ *
+ * What took the slot is not filler to keep the grid at four -- it is the
+ * "walk away" claim, displaced out of the story's fourth row. It belongs here:
+ * the agents outliving your terminal session is a decision about how the thing
+ * is built, and it is a claim a sentence can make and a screenshot cannot.
+ */
 export const principles = [
   {
     title: 'Runs in your terminal',
     description:
-      'Ghostty, iTerm2, Alacritty, Kitty, WezTerm — whatever you already configured. Agent Deck is a guest, not a replacement.',
+      'Ghostty, iTerm2, Alacritty, Kitty, WezTerm — whatever you already configured. Agent Deck is a guest in it, not a replacement, and there is no multiplexer to set up underneath.',
   },
   {
     title: 'Uses your agent client',
@@ -105,51 +205,51 @@ export const principles = [
       'Claude Code, OpenCode, Pi, Codex or Devin — keep the shortcuts, skills, and configs you already dialed in. No new agent client to learn.',
   },
   {
-    title: 'Focus-mode side panes',
+    title: 'Closing the window does not stop the work',
     description:
-      'Pair an agent with live test runs, log tails, or kubectl watches via per-project TOML config. Deep-diving on one agent doesn’t mean opening a dozen extra terminals.',
+      'Detach the deck and the agents carry on without you; open it again and you rejoin the same sessions, mid-run. The same holds over ssh — a deck running on another machine stays running when you disconnect.',
   },
   {
-    title: 'No buttons',
+    title: 'Keyboard first',
     description:
-      'Every action is one or two keystrokes away. Managing a team of agents has to fit in muscle memory — mouse-clicking breaks flow.',
+      'Every action is one or two keystrokes away, because managing a team of agents has to fit in muscle memory. The mouse still works when you want it: a button bar along the bottom names each command and the key it answers to.',
   },
 ];
 
 /**
- * Shipped agents, from `src/agent_registry.rs`. `integration` is that file's
- * own `IntegrationStrategy` for the agent -- four different mechanisms across
- * five agents, which is why the list is worth showing rather than asserting.
+ * Shipped agents, from `src/agent_registry.rs`.
+ *
+ * Each entry used to carry that file's own `IntegrationStrategy` for the agent
+ * -- Native hooks / Plugin / Bundled extension / Stdout wrapper. All four are
+ * gone. They are implementation detail in the strictest sense: a reader
+ * deciding whether to install this wants to know THAT their client works, and
+ * nothing about the four different mechanisms behind that answer changes what
+ * they should do next.
  */
 export const agents = [
   {
     name: 'Claude Code',
     command: 'claude',
-    integration: 'Native hooks',
     href: 'https://www.anthropic.com/claude-code',
   },
   {
     name: 'OpenCode',
     command: 'opencode',
-    integration: 'Plugin',
     href: 'https://opencode.ai',
   },
   {
     name: 'Pi',
     command: 'pi',
-    integration: 'Bundled extension',
     href: 'https://github.com/earendil-works/pi',
   },
   {
     name: 'Codex',
     command: 'codex',
-    integration: 'Stdout wrapper',
     href: 'https://github.com/openai/codex',
   },
   {
     name: 'Devin',
     command: 'devin',
-    integration: 'Native hooks',
     href: 'https://devin.ai',
   },
 ];
@@ -216,11 +316,16 @@ export const installRoutes = [
  * this file. "Alpha" and "unsigned" are both load-bearing and neither is
  * softened, because a visitor who downloads the .dmg meets a macOS dialog
  * within the minute.
+ *
+ * `intro` and the Windows caveat used to explain themselves in daemon and
+ * sidecar terms. Both now say the same thing in what the reader can see: the
+ * terminal deck shows one machine's agents at a time and the app shows
+ * several, and there is no Windows build of the deck for an app to carry.
  */
 export const desktop = {
   heading: 'There is a desktop app too. It is an alpha.',
   intro:
-    'Where the terminal deck attaches to one daemon at a time, the desktop app is a native window that holds several at once — the agents on your laptop and the ones on a remote box, side by side in the same window. It rides along with a release rather than gating it, so check the assets on the release you open: the CLI ships even when a desktop bundle does not.',
+    'The terminal deck shows you one machine’s agents at a time. The desktop app is a native window that holds several at once — the agents on your laptop and the ones on a remote box, side by side. It rides along with a release rather than gating it, so check the assets on the release you open: the CLI ships even when a desktop bundle does not.',
   artifacts: [
     {
       platform: 'macOS',
@@ -244,7 +349,7 @@ export const desktop = {
     },
     {
       title: 'No Windows bundle',
-      body: 'The app carries the daemon as a sidecar, and no Windows daemon binary is published — so there is nothing to bundle yet.',
+      body: 'There is no native Windows build of Agent Deck itself yet, so there is nothing for a desktop bundle to carry. Windows via WSL runs the terminal deck today.',
     },
   ],
   provenanceNote:
@@ -256,42 +361,44 @@ export const desktop = {
 };
 
 /**
- * The screenshot catalogue. Every entry here is rendered: `orchestration`
- * (orchestration-start.png) once sat here unreferenced and is gone, and
- * `dashboard` / `modes` left for the same reason in this pass.
+ * The screenshot catalogue. Every entry here is rendered -- an unreferenced
+ * entry is removed rather than left to rot, which is how `orchestration`,
+ * `dashboard`, `modes` and now `card` and `reattach` left in turn.
  *
  * Each story row carries the frame its own copy describes, and each caption
- * describes what is IN the frame rather than what the row argues. Two pairings
- * changed once the refreshed captures landed:
+ * describes what is IN the frame rather than what the row argues, so a
+ * recapture that changes what a frame shows is a one-file correction.
  *
- * - Row 01 ("Open a pane. Ctrl+n, pick a directory, name it, and give it the
- *   command that launches your agent") now carries `orchestration-new-deck.png`
- *   -- that sentence word for word. The reviewer's earlier suggestion, re-pair
- *   `orchestration-start.png` onto this row, was declined and stays declined:
- *   it is an ORCHESTRATION frame, tab bar and all, two rows before
- *   orchestration is introduced. The row's real fix was always a capture of the
- *   form `Ctrl+n` opens, and that capture now exists. The recapture is of the
- *   CURRENT form, which the old one predated: it always shows the Mode chips
- *   and the Agent selector now, and the old `Tip:` row is gone. The caption
- *   accounts for both; the row body does not, because the row is about opening
- *   a pane and the dialog merely offers them.
- * - Row 04 ("Walk away ... detach the deck, come back later, reattach") now
- *   carries `reattach.png` and no longer carries `modes.png`, which showed git
- *   status and kubectl panes and illustrated nothing the row claims.
+ * This pass moved two and dropped two:
  *
- * `home-hero-dashboard.jpg` and `modes.png` are both freed by those two moves,
- * and both LEAVE the landing page rather than being re-homed. Nothing on the
- * page wants either one without a slot being invented for it: every story row
- * already carries the frame its own copy describes, `why` is the page's one
- * text-only breather between two image-heavy bands, and `showcase` is a single
- * device frame under the hero. Neither is orphaned -- the dashboard shot is
- * `docs/session-management.md`'s Compact-density illustration, which is the
- * exact claim its caption made here, and the modes shot is used by
- * `docs/getting-started.md` and `docs/workspace-modes.md`. Nor does the page
- * lose "several agents at once": the hero shows a three-card sidebar with live
- * per-card status, and row 03 a five-card one.
+ * - Row 02 ("Watch every one of them") now carries `busy-deck.png` instead of
+ *   `session-management-card.jpg`. The row argues both "every pane gets a
+ *   card" and "the cards tighten up rather than make you scroll", and a frame
+ *   of ONE card could only ever show the first half of that. The new capture
+ *   -- nine cards, five tabs, four different agent clients, a mix of Thinking
+ *   / Working / Idle -- shows both at once, which is what the maintainer asked
+ *   for ("might benefit from a new screenshot that contains many tabs and
+ *   agents"). `session-management-card.jpg` is not orphaned by the move: it is
+ *   `docs/session-management.md`'s card-anatomy illustration, which is the
+ *   claim it was really making here. `home-hero-dashboard.jpg` briefly held
+ *   this slot while the new capture was being taken and has gone back to being
+ *   `docs/session-management.md`'s Compact-density illustration.
+ * - Row 04 is now dispatching, and has NO frame. Nothing in the repository
+ *   illustrates a dispatched unit: `docs/dispatcher-mode.md` carries no images
+ *   at all. Pointing the row at a filename that does not exist would ship a
+ *   broken image, so the row renders as a single centred column until the
+ *   capture lands; adding `shot:` to the step turns it back into an ordinary
+ *   two-column row with no other change.
+ * - `reattach.png` leaves the page with the "walk away" row it illustrated.
+ *   The maintainer's verdict on that frame was "I'm not sure I understand" it,
+ *   and the diagnosis is that the idea has no moment to photograph: detaching
+ *   and reattaching is the absence of an event, and the labelled BEFORE/AFTER
+ *   pair needed a paragraph of caption to parse, which is the frame failing to
+ *   carry it. The claim moves to principle 03, where a sentence makes it
+ *   cleanly. The file stays in `site/static/img/` rather than being deleted --
+ *   it is an honest capture and `docs/session-management.md` may yet want it.
  *
- * `orchestration-config.png` was deleted from `site/static/img/` in the same
+ * `orchestration-config.png` was deleted from `site/static/img/` in an earlier
  * round -- it published a maintainer's home path and an unrelated project's
  * orchestration config. Confirmed after the deletion rather than before it:
  * `grep -rn 'orchestration-config' docs/ site/` returns nothing.
@@ -307,25 +414,19 @@ export const screenshots = {
     src: '/img/orchestration-new-deck.png',
     alt: 'The New Agent form — Dir /tmp/storefront, a Mode row offering No mode, schedule and dispatcher, Agent on auto, Name storefront, Command claude, and Submit and Cancel buttons',
     caption:
-      'The form Ctrl+n opens once the directory is picked: name the pane, give it a command. Mode and Agent are optional — left on auto, the client is read off the command.',
+      'The form Ctrl+n opens once the directory is picked. The Mode row is where the choice is made — this directory defines no orchestrations of its own, so it offers the built-in options only.',
   },
-  card: {
-    src: '/img/session-management-card.jpg',
-    alt: 'One agent card — storefront-checkout, Working — with its directory, its last prompt, three recent tool calls, and Last 3s / Tools 3 on the bottom border',
+  deck: {
+    src: '/img/busy-deck.png',
+    alt: 'A deck with five tabs open — Dashboard, checkout, web, observability and storefront — and nine agent cards stacked down the sidebar, running Pi, Claude Code, OpenCode and Codex and marked Thinking, Working or Idle, each with its directory, last prompt and current tool, beside the focused coordinator pane tracking eight workstreams',
     caption:
-      'One card: status, directory, the last prompt, the recent tool calls, and the last-activity and tool counters on the border.',
+      'Nine agents at once, on four different agent clients, with five tabs open above them. Every card carries its own status, directory, last prompt and current tool, and the footer keeps the count: 9 active, 3 working, 3 thinking, 3 idle.',
   },
   parallel: {
     src: '/img/orchestration-delegation-parallel.png',
     alt: 'Orchestrator delegating to reviewer and auditor in parallel — both cards light up simultaneously',
     caption:
       'One agent delegating to two others at once. Both cards light up together.',
-  },
-  reattach: {
-    src: '/img/reattach.png',
-    alt: 'Two labelled frames of one pane, storefront-release-verification — BEFORE DETACH ending at 22:23:56 with 27 integration tests passed, and AFTER REATTACH opening on that same line and running on to 22:24:12',
-    caption:
-      'Two frames, not one view: the same pane before detaching and after reattaching. The 22:23:56 line that closes the top one opens the bottom — one session, not a restart.',
   },
 };
 
@@ -349,32 +450,37 @@ export const audience = {
  * `screenshots` is declared above, so a typo here is `undefined` and the first
  * property read fails the build rather than rendering the wrong frame.
  *
- * Which frame each row carries, and why, is recorded on `screenshots` above.
+ * `shot` is OPTIONAL. A step without one renders as a single centred column --
+ * see the note on `screenshots` for why row 04 has none yet.
+ *
+ * The arc is an escalation, and each rung is a shipped feature rather than a
+ * restatement of the one before it: one pane, then many of them visible at
+ * once, then one agent running the others, then whole new lines of work
+ * starting in their own copies of the repo without you setting any of it up.
  */
 export const workflow = [
   {
     step: '01',
     title: 'Open a pane',
-    body: 'Ctrl+n, pick a directory, name it, and give it the command that launches your agent. It runs in an embedded PTY — no multiplexer involved.',
+    body: 'Ctrl+n, pick a directory, and choose what starts there. A single agent on the command you give it. A full multi-agent orchestration, in its own tab. A dispatcher you can ask for isolated work. Or a scheduled task, written here and fired later by the deck itself.',
     shot: screenshots.newPane,
   },
   {
     step: '02',
     title: 'Watch every one of them',
-    body: 'Each pane gets a card: status, the tool it is running right now, its working directory, its last prompt. Updated live, from hooks installed for you.',
-    shot: screenshots.card,
+    body: 'Every pane gets a card: what it is doing right now, the tool it is running, its directory, its last prompt. Live, with nothing for you to wire up. The more agents you run, the tighter the cards get — the deck would rather shrink them than make you go looking for one.',
+    shot: screenshots.deck,
   },
   {
     step: '03',
     title: 'Let one agent run the others',
-    body: 'Define roles in per-project TOML — orchestrator, coder, reviewer. The orchestrator delegates, and you watch the work land in the other panes.',
+    body: 'Define the roles your project needs — orchestrator, coder, reviewer, release — and one agent hands each piece of work to the right one. Every worker starts fresh, with only the context it was given, and you watch the hand-offs land in the other panes. If a worker goes quiet, the deck tells the orchestrator, so a stalled run does not sit there unnoticed.',
     shot: screenshots.parallel,
   },
   {
     step: '04',
-    title: 'Walk away',
-    body: 'The agents belong to a daemon, not to your terminal. Detach the deck, come back later, reattach — they kept working.',
-    shot: screenshots.reattach,
+    title: 'Send work off on its own',
+    body: 'Ask a dispatcher pane for something — “work on the search bug” — and it makes a separate copy of your repository and puts an agent, or a whole orchestration, to work inside it. It works in that copy rather than in your working tree, so start as many as you like and carry on with what you were doing. Each unit arrives on the deck as a card or a tab, and reports back when it is done.',
   },
 ];
 
@@ -382,8 +488,8 @@ export const docLinks = {
   gettingStarted: '/docs/getting-started',
   installation: '/docs/installation',
   orchestration: '/docs/orchestration',
+  dispatcher: '/docs/dispatcher-mode',
   configuration: '/docs/configuration',
   keyboard: '/docs/keyboard-shortcuts',
-  modes: '/docs/workspace-modes',
   remote: '/docs/remote-environments',
 };
