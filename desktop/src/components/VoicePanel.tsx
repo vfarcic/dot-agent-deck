@@ -116,6 +116,32 @@ type Stage = "transcription" | "intent";
 const usesEndpoint = (stage: Stage, backend: string): boolean =>
   stage === "transcription" || backend === KEYED;
 
+/** The token a speech backend takes when it sends no credential at all. */
+const KEYLESS = "local";
+
+/**
+ * What the Endpoint field says the rule is, which is not the same rule for
+ * every backend.
+ *
+ * **The keyless speech backend may only reach this machine**, and that is a
+ * Rust rule (`settings::KEYLESS_OFF_MACHINE`) rather than a suggestion: it
+ * sends no `Authorization` header, so an endpoint on another host is a captured
+ * utterance uploaded to a third party with no credential on it. The document
+ * and the IPC seam both refuse the pairing, so typing one here comes back as a
+ * `saveError` — this is the field saying so before that happens.
+ *
+ * **The field stays offered**, which is deliberate rather than an omission the
+ * Rust rule has to cover for. A user who publishes the container on another
+ * port has to be able to say so, and `voice::transcribe::unreachable_detail`
+ * names *their* port in the docker command precisely because moving it is
+ * expected. Removing the field would break that, and would still not be the
+ * boundary — a hand-edited `desktop.toml` never passes through this panel.
+ */
+const endpointHint = (stage: Stage, backend: string): string =>
+  stage === "transcription" && backend === KEYLESS
+    ? "This machine only — http or https to a loopback address. The keyless backend sends no key, so it may not reach another host."
+    : "https to another machine, or http to this one.";
+
 export function VoicePanel({ settings, onSave, saveError }: SettingsPanelProps) {
   // Absence is `undefined`, not an empty section — see `DesktopSettingsDto`.
   // Materialised here for display; a save writes the whole section, which is
@@ -234,7 +260,7 @@ function StageFields({
         id={`voice-${stage}-endpoint`}
         label="Endpoint"
         value={value.endpoint}
-        hint="https to another machine, or http to this one."
+        hint={endpointHint(stage, value.backend)}
         onCommit={(endpoint) => onSave(stage, { endpoint })}
       />
       <TextRow

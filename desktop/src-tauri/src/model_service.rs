@@ -37,9 +37,18 @@
 //! `crate::settings::EndpointId` — it is that **folding an endpoint is not a
 //! safe default**. Fold a refused `endpoint` to the preset and a user who wrote
 //! a URL pointing at their own machine has their voice uploaded to a hosted
-//! service instead, silently. An error puts the document on defaults *with a
-//! diagnostic the settings surface shows*, which is the only version of that
+//! service instead, silently. An error puts *that section* on defaults **with a
+//! diagnostic the settings surface shows**, which is the only version of that
 //! outcome the user can act on.
+//!
+//! **"That section", and it used to say "the document", which was true and was
+//! the defect.** `toml_edit::de::from_str` is all-or-nothing, so one endpoint
+//! refused here took the user's `[endpoints]` — their remote decks — their
+//! appearance and their zoom with it, for a value typed in a section that has
+//! nothing to do with any of them. The cost of erring rather than folding is
+//! meant to be a re-typed endpoint, not a fleet that is not there any more.
+//! `crate::settings::sections_this_build_can_read` is what narrows it to the
+//! section the refused value is in; nothing about the choice above changed.
 //!
 //! Neither error message quotes the offending value, for
 //! `SettingsDocumentProblem`'s reason (issue #827): the messages describe the

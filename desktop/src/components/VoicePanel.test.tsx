@@ -253,6 +253,36 @@ describe("VoicePanel", () => {
     );
   });
 
+  /**
+   * The keyless speech backend sends no credential, so its endpoint may only be
+   * on this machine (`settings::KEYLESS_OFF_MACHINE`) — and the field says so,
+   * rather than letting a user type a hosted URL and meet the refusal as a
+   * save error.
+   *
+   * **The field itself stays**, which is the part worth pinning: a user who
+   * publishes the speech container on another port has to be able to say so,
+   * and `unreachable_detail` names *their* port in the docker command for
+   * exactly that reason. The panel is not the boundary either way — a
+   * hand-edited `desktop.toml` never passes through it — so this is the hint
+   * telling the truth, not the rule being enforced.
+   */
+  it("says the keyless speech endpoint may only be on this machine, and still offers the field", () => {
+    renderPanel();
+    expect(screen.getByLabelText("Endpoint")).toHaveValue(
+      VOICE_STAGE_PRESETS.transcription.local.endpoint,
+    );
+    expect(screen.getByTestId("voice-transcription-endpoint-hint")).toHaveTextContent(
+      /this machine only/i,
+    );
+
+    // The keyed backend reaches another host by design, so it keeps the
+    // general rule.
+    renderPanel({ voice: { ...DEFAULT_VOICE_SETTINGS, transcription: VOICE_STAGE_PRESETS.transcription.remote } });
+    expect(screen.getAllByTestId("voice-transcription-endpoint-hint")[1]).toHaveTextContent(
+      /https to another machine/i,
+    );
+  });
+
   it("offers endpoint and model for both stages once both are reached over HTTP", () => {
     renderPanel(BOTH_KEYED);
     expect(screen.getAllByLabelText("Endpoint")).toHaveLength(2);

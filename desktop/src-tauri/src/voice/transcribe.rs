@@ -65,7 +65,9 @@ use serde_json::Value;
 
 use crate::model_service::{ModelId, ServiceUrl};
 use crate::secrets::{SecretId, SecretStore, load_off_runtime};
-use crate::settings::{LOCAL_SPEECH_IMAGE, TranscriptionBackend, TranscriptionSettings};
+use crate::settings::{
+    KEYLESS_OFF_MACHINE, LOCAL_SPEECH_IMAGE, TranscriptionBackend, TranscriptionSettings,
+};
 
 use super::Transcript;
 use super::capture::Pcm16;
@@ -150,8 +152,49 @@ pub fn transcriber_for(
     let endpoint = settings.endpoint.clone();
     let model = settings.model.clone();
     match settings.backend {
-        TranscriptionBackend::Local => Box::new(HttpTranscriber::keyless(endpoint, model)),
+        // A refusal rather than a fallback, and never the keyed path: a
+        // keyless backend pointed off this machine has no key to send, so
+        // "try it anyway" IS the upload. See [`RefusedTranscriber`].
+        TranscriptionBackend::Local => match HttpTranscriber::keyless(endpoint, model) {
+            Ok(transcriber) => Box::new(transcriber),
+            Err(refusal) => Box::new(RefusedTranscriber::new("local", refusal)),
+        },
         TranscriptionBackend::Remote => Box::new(HttpTranscriber::keyed(secrets, endpoint, model)),
+    }
+}
+
+/// A backend that answers one sentence and makes no request.
+///
+/// The shape a misconfiguration this module refuses to honour comes back as:
+/// [`TranscriptionOutcome::NotConfigured`], which the surface renders as an
+/// instruction rather than as a failure, carrying the rule that was broken.
+///
+/// It exists because the alternatives are both worse. Falling back to the
+/// loopback preset would silently move the endpoint a user wrote, which is the
+/// fold [`crate::settings::KEYLESS_OFF_MACHINE`] argues against; making
+/// [`transcriber_for`] fallible would push the same decision onto its one
+/// caller, which has no better answer available to it than this sentence.
+///
+/// `name` is the settings token rather than a word of its own, so the surface's
+/// vocabulary — the document, the panel, the report — stays the one set.
+struct RefusedTranscriber {
+    name: &'static str,
+    detail: &'static str,
+}
+
+impl RefusedTranscriber {
+    fn new(name: &'static str, detail: &'static str) -> Self {
+        Self { name, detail }
+    }
+}
+
+impl Transcriber for RefusedTranscriber {
+    fn transcribe<'a>(&'a self, _audio: &'a Pcm16) -> TranscribeFuture<'a> {
+        Box::pin(async move { Err(TranscriptionError::NotConfigured(self.detail.to_string())) })
+    }
+
+    fn backend_name(&self) -> &'static str {
+        self.name
     }
 }
 
@@ -183,8 +226,23 @@ impl HttpTranscriber {
     }
 
     /// A service that takes no credential — the container on loopback.
-    pub fn keyless(endpoint: ServiceUrl, model: ModelId) -> Self {
-        Self::build(None, endpoint, model, "local")
+    ///
+    /// **Loopback is a precondition rather than an expectation**, and the
+    /// refusal is why this is fallible where [`Self::keyed`] is not. No
+    /// `Authorization` header is sent on this path, so an endpoint on another
+    /// host is a captured utterance POSTed to a third party with no credential
+    /// and no sign anything was wrong — the module's own invariant, *the audio
+    /// never leaves the machine*, stated as a check instead of as prose.
+    ///
+    /// [`crate::settings::TranscriptionSettings::deserialize`] refuses the same
+    /// pairing at the document and at the IPC seam, which is every route an
+    /// untrusted value arrives by; this is the route Rust arrives by, and the
+    /// two together are what make the invariant hold rather than hold usually.
+    pub fn keyless(endpoint: ServiceUrl, model: ModelId) -> Result<Self, &'static str> {
+        if !endpoint.is_loopback() {
+            return Err(KEYLESS_OFF_MACHINE);
+        }
+        Ok(Self::build(None, endpoint, model, "local"))
     }
 
     fn build(
@@ -745,6 +803,60 @@ mod tests {
         assert_eq!(transcriber.backend_name(), "local");
     }
 
+    /// The module's own invariant, asserted rather than written down: a
+    /// keyless backend pointed off this machine makes **no request at all**.
+    ///
+    /// `TranscriptionBackend::Local` means *no `Authorization` header*, and
+    /// `ServiceUrl` accepts any `https://host` — so the two together are a
+    /// pairing nothing else checks, and the reachable version of it is a user
+    /// picking the keyless backend and then editing the Endpoint field to a
+    /// hosted service. Their captured WAV is then POSTed to a third party with
+    /// no credential on it. `transport_error` gating the docker hint on
+    /// `is_loopback` reads as if it covered this; it runs after the upload.
+    ///
+    /// The store is a recorder for the same reason
+    /// [`voice_transcribe_local_reads_no_secret_at_all`] uses one: the refusal
+    /// must not quietly become the KEYED path, which would send a key to
+    /// somewhere the user picked a keyless backend to avoid.
+    #[tokio::test]
+    async fn voice_transcribe_keyless_refuses_an_endpoint_off_this_machine() {
+        assert!(
+            HttpTranscriber::keyless(
+                ServiceUrl::parse("https://api.openai.com/v1/audio/transcriptions").expect("valid"),
+                ModelId::parse(HOSTED_SPEECH_MODEL).expect("valid"),
+            )
+            .is_err(),
+            "a keyless transcriber may not be built for another host"
+        );
+
+        let recorder = Arc::new(ThreadRecordingStore::new());
+        let settings = TranscriptionSettings {
+            backend: TranscriptionBackend::Local,
+            endpoint: ServiceUrl::parse("https://api.openai.com/v1/audio/transcriptions")
+                .expect("valid"),
+            model: ModelId::parse(HOSTED_SPEECH_MODEL).expect("valid"),
+        };
+        let transcriber = transcriber_for(&settings, Arc::clone(&recorder) as Arc<dyn SecretStore>);
+        // Still `local` to the surface: the vocabulary is the settings token,
+        // so the report names the backend the user chose.
+        assert_eq!(transcriber.backend_name(), "local");
+
+        let error = transcriber
+            .transcribe(&audio(16))
+            .await
+            .expect_err("the pairing is refused");
+        assert!(
+            matches!(error, TranscriptionError::NotConfigured(_)),
+            "a misconfiguration is an instruction, not a failure: {error:?}"
+        );
+        assert_eq!(error.detail(), crate::settings::KEYLESS_OFF_MACHINE);
+        assert_eq!(
+            recorder.read_on(),
+            None,
+            "the refusal must not fall back to the keyed path"
+        );
+    }
+
     // -- the keyless local backend -----------------------------------------
 
     /// The keyless path is structural, not a lookup that happens to find
@@ -1279,6 +1391,7 @@ mod tests {
                 ServiceUrl::parse(LOCAL_SPEECH_ENDPOINT).expect("valid"),
                 ModelId::parse(LOCAL_SPEECH_MODEL).expect("valid"),
             )
+            .expect("the preset endpoint is loopback")
             .backend_name(),
             "local"
         );

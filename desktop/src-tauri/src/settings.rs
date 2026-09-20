@@ -455,15 +455,47 @@ impl Default for TranscriptionSettings {
 
 impl<'de> Deserialize<'de> for TranscriptionSettings {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let doc = StageDocument::deserialize(deserializer)?;
+        let doc = StageSpec::deserialize(deserializer)?.into_document();
         let preset = Self::for_backend(doc.backend.unwrap_or_default());
-        Ok(Self {
+        let stage = Self {
             endpoint: doc.endpoint.unwrap_or(preset.endpoint),
             model: doc.model.unwrap_or(preset.model),
             backend: preset.backend,
-        })
+        };
+        // The pairing the keyless backend IS, enforced where the value is
+        // built rather than where it is used. See [`KEYLESS_OFF_MACHINE`].
+        if stage.backend == TranscriptionBackend::Local && !stage.endpoint.is_loopback() {
+            return Err(serde::de::Error::custom(KEYLESS_OFF_MACHINE));
+        }
+        Ok(stage)
     }
 }
+
+/// What a keyless backend pointed off this machine is refused with.
+///
+/// [`TranscriptionBackend::Local`] means exactly one thing — *no credential is
+/// sent* — and [`ServiceUrl`] will accept any `https://host`, so the two
+/// together are a pairing nothing else checks: a hand-edited document, or a
+/// panel field typed after the backend was picked, would POST the user's
+/// captured audio to a hosted service with no `Authorization` header and no
+/// sign that anything was wrong. `is_loopback` is what makes
+/// [`crate::voice::transcribe::HttpTranscriber::transport_error`] offer the
+/// docker hint, but the upload happens before that runs — so the pairing has to
+/// be refused at the two places the value comes into being: this deserializer,
+/// which is every route from a document or the webview, and
+/// [`crate::voice::transcribe::HttpTranscriber::keyless`], which is every route
+/// from Rust.
+///
+/// **Refused rather than folded to the loopback preset.** Folding is what the
+/// tokens get, because a token is a name; an endpoint is a destination, and
+/// silently moving one is the mistake
+/// [`tests::a_refused_voice_endpoint_or_model_is_an_error_rather_than_a_fold`]
+/// is written against — from the other direction, but for the same reason. The
+/// refusal costs the user nothing they cannot see: the section defaults to the
+/// keyless loopback preset and the settings surface says the document could not
+/// be read.
+pub const KEYLESS_OFF_MACHINE: &str = "the keyless speech backend sends no credential, so its endpoint must be on this machine — \
+     use a loopback address, or pick the hosted backend under Settings → Voice";
 
 /// One stage as the document may spell it: every key optional.
 ///
@@ -489,6 +521,92 @@ impl<B> Default for StageDocument<B> {
             endpoint: None,
             model: None,
         }
+    }
+}
+
+/// One stage as a document may spell it: a table, or the bare token the schema
+/// this one replaced wrote.
+///
+/// # The migration this exists for
+///
+/// `[voice]` held three scalars before PRD #802's provider work —
+/// `transcription = "off"`, `intent = "claude"`, `activation = "toggle"` — and
+/// two of them became tables. A document written by that build therefore
+/// supplies a **string where a table is expected**, which is a *type* error and
+/// not an unknown token: [`VoiceToken::from_str_lossy`]'s folding never gets a
+/// look in, and `#[serde(default)]` does not fire for a value that is present
+/// and wrong. `toml_edit::de::from_str` fails on the WHOLE document, and what
+/// that used to cost was the whole document — the user's `[endpoints]`, their
+/// appearance and their zoom all read as defaults because of a stale voice
+/// token. [`load_document`]'s per-section recovery is the other half of that
+/// fix; this half is what stops the document failing at all.
+///
+/// # A token means "this backend, and say nothing else"
+///
+/// Which is exactly what [`TranscriptionSettings::for_backend`] answers, so the
+/// old value lands on that backend's current coordinates rather than on a
+/// coordinate the old schema never had. `transcription = "off"` names a backend
+/// this build deleted, so it folds to the default — the keyless local container
+/// — through the same [`VoiceToken`] path an unknown token takes, which is the
+/// honest home for it: the stage that used to do nothing now works and needs no
+/// key.
+///
+/// **Not `#[serde(untagged)]`**, which would express the same two shapes in one
+/// attribute. Untagged buffers the input into `serde::__private::de::Content`
+/// before trying either variant, and that buffer has no source span — so a
+/// refused endpoint would report `an unreported position` instead of the line
+/// to open, and the reported error would be *data did not match any variant*
+/// rather than the rule that was broken. [`load_document`]'s locator is the
+/// only thing the settings surface can say about a bad document, so it is not
+/// something to spend on an attribute.
+enum StageSpec<B> {
+    Token(B),
+    Table(StageDocument<B>),
+}
+
+impl<B> StageSpec<B> {
+    /// Both shapes as the one the stages read.
+    fn into_document(self) -> StageDocument<B> {
+        match self {
+            Self::Token(backend) => StageDocument {
+                backend: Some(backend),
+                endpoint: None,
+                model: None,
+            },
+            Self::Table(document) => document,
+        }
+    }
+}
+
+impl<'de, B: Default + Deserialize<'de>> Deserialize<'de> for StageSpec<B> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        // `deserialize_any` rather than a typed hint, because which of the two
+        // shapes arrived is precisely what is not known. Both formats this
+        // document crosses are self-describing — TOML on disk, JSON over the
+        // IPC seam — so there is no format for which this is unsupported.
+        deserializer.deserialize_any(StageSpecVisitor(std::marker::PhantomData))
+    }
+}
+
+struct StageSpecVisitor<B>(std::marker::PhantomData<B>);
+
+impl<'de, B: Default + Deserialize<'de>> serde::de::Visitor<'de> for StageSpecVisitor<B> {
+    type Value = StageSpec<B>;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("a voice stage table, or the bare backend token an older document wrote")
+    }
+
+    fn visit_str<E: serde::de::Error>(self, raw: &str) -> Result<Self::Value, E> {
+        // Through `B`'s own `Deserialize` rather than a parse of its own, so the
+        // token keeps the length bound and the folding
+        // [`VoiceTokenVisitor`] applies everywhere else.
+        B::deserialize(serde::de::value::StrDeserializer::new(raw)).map(StageSpec::Token)
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, map: A) -> Result<Self::Value, A::Error> {
+        StageDocument::deserialize(serde::de::value::MapAccessDeserializer::new(map))
+            .map(StageSpec::Table)
     }
 }
 
@@ -530,7 +648,7 @@ impl Default for IntentSettings {
 
 impl<'de> Deserialize<'de> for IntentSettings {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let doc = StageDocument::deserialize(deserializer)?;
+        let doc = StageSpec::deserialize(deserializer)?.into_document();
         let preset = Self::for_backend(doc.backend.unwrap_or_default());
         Ok(Self {
             endpoint: doc.endpoint.unwrap_or(preset.endpoint),
@@ -2295,12 +2413,116 @@ pub fn load_document(path: &Path) -> (DesktopSettings, Option<SettingsDocumentPr
         Ok(Some(contents)) => match toml_edit::de::from_str(&contents) {
             Ok(settings) => (settings, None),
             Err(error) => (
-                DesktopSettings::default(),
+                sections_this_build_can_read(&contents),
                 Some(unreadable_document_problem(path, &contents, &error)),
             ),
         },
         Err(error) => (DesktopSettings::default(), Some(error.into())),
     }
+}
+
+/// Everything in `contents` this build can read, with the parts it cannot
+/// dropped to their defaults.
+///
+/// # Why a whole-document failure is not a whole-document answer
+///
+/// The document is one TOML file holding several unrelated tenants, and
+/// `toml_edit::de::from_str` is all-or-nothing: one value it refuses and the
+/// *struct* fails, so the app came up with the user's `[endpoints]` — their
+/// remote decks — their appearance and their zoom all reading as defaults.
+/// That is a wide blast radius for a stale `[voice]` token, and it was reached
+/// by two ordinary routes rather than by a corrupted file: a document written
+/// by the build before PRD #802's provider work (see [`StageSpec`], which is
+/// what stops that one failing at all now), and any value a type refuses —
+/// a hand-typed non-loopback `http` endpoint, which [`ServiceUrl`] exists to
+/// reject.
+///
+/// Nothing was ever lost from the file itself: [`save_to`] re-reads and refuses
+/// to publish defaults over a document it cannot parse (issue #1072). What was
+/// lost was the session — the decks were not there to talk to.
+///
+/// # Section granularity, and deliberately no finer
+///
+/// Each top-level key is judged alone, and a section that fails as a whole has
+/// its own children judged the same way; a key that fails at that point takes
+/// its whole subtree with it. The recursion stops there **on purpose**. Pruning
+/// a single refused field would leave its siblings behind, and for a voice
+/// stage that is the one outcome the hand-written
+/// [`TranscriptionSettings::deserialize`] exists to prevent: a surviving
+/// `backend = "remote"` beside a dropped `endpoint` fills the endpoint from the
+/// *hosted* preset, which is a user's audio going somewhere they did not write.
+/// Dropping the stage instead lands on [`TranscriptionSettings::default`] —
+/// keyless, on loopback — which is the safe direction to fail in.
+///
+/// The reported [`SettingsDocumentProblem`] is unchanged either way: the user is
+/// told the document could not be read and where, whatever was salvaged from it.
+fn sections_this_build_can_read(contents: &str) -> DesktopSettings {
+    // A document that does not parse as TOML at all has no sections to keep —
+    // the failure is the syntax, not a value, and there is nothing to walk.
+    let Ok(mut document) = contents.parse::<toml_edit::DocumentMut>() else {
+        return DesktopSettings::default();
+    };
+    for key in document
+        .iter()
+        .map(|(key, _)| key.to_string())
+        .collect::<Vec<_>>()
+    {
+        if document
+            .get(&key)
+            .is_some_and(|item| reads_as_settings(&key, item))
+        {
+            continue;
+        }
+        for child in document
+            .get(&key)
+            .and_then(toml_edit::Item::as_table)
+            .map(|table| table.iter().map(|(child, _)| child.to_string()).collect())
+            .unwrap_or_else(Vec::new)
+        {
+            let readable = document
+                .get(&key)
+                .and_then(toml_edit::Item::as_table)
+                .and_then(|table| table.get(&child))
+                .is_some_and(|value| {
+                    let mut alone = toml_edit::Table::new();
+                    alone.insert(&child, value.clone());
+                    reads_as_settings(&key, &toml_edit::Item::Table(alone))
+                });
+            if !readable
+                && let Some(table) = document
+                    .get_mut(&key)
+                    .and_then(toml_edit::Item::as_table_mut)
+            {
+                table.remove(&child);
+            }
+        }
+        let emptied = document
+            .get(&key)
+            .and_then(toml_edit::Item::as_table)
+            .is_none_or(toml_edit::Table::is_empty);
+        if emptied {
+            document.remove(&key);
+        }
+    }
+    // Pruned in place rather than rebuilt key by key, so what is handed back to
+    // the parser is the user's own bytes minus the refused ones — no cloned
+    // decor, no re-ordered tables, nothing this function had to render itself.
+    // The `unwrap_or_default` is the residual: a failure here means a refusal
+    // that is not attributable to any one top-level key, and defaults are then
+    // the only answer left.
+    toml_edit::de::from_str(&document.to_string()).unwrap_or_default()
+}
+
+/// Whether `key` alone, carrying `item`, reads as a settings document.
+///
+/// Every field of [`DesktopSettings`] is `#[serde(default)]` and there is no
+/// `deny_unknown_fields`, so a one-key document exercises exactly that key's
+/// own types and says nothing about any other — which is what makes judging
+/// them one at a time sound.
+fn reads_as_settings(key: &str, item: &toml_edit::Item) -> bool {
+    let mut probe = toml_edit::DocumentMut::new();
+    probe[key] = item.clone();
+    toml_edit::de::from_str::<DesktopSettings>(&probe.to_string()).is_ok()
 }
 
 /// The one place a document problem reaches the app's own log.
@@ -2758,9 +2980,25 @@ fn merge_tables(
             continue;
         }
 
-        if !same_data(existing, &item) {
-            replace_item(existing, item);
+        // A key whose SHAPE moves from a value to a `[section]` is re-inserted
+        // rather than replaced in place. Only the rendering differs, and only
+        // in one place — a table's header is spelled from the key WITH its
+        // decor, so `intent = "remote"` becoming a table renders as
+        // `[voice.intent ]`, carrying the space that used to sit before the
+        // `=`. Valid TOML that re-reads correctly, and still a stray space in a
+        // file PRD #803 makes a success criterion of a user being able to read.
+        // It is reachable on exactly one ordinary path: the first save after
+        // the `[voice]` scalars became tables (see [`StageSpec`]).
+        let flattened = item.is_table_like() && !existing.is_table_like();
+        if same_data(existing, &item) {
+            continue;
         }
+        if flattened {
+            base.remove(key);
+            base.insert(key, item);
+            continue;
+        }
+        replace_item(existing, item);
     }
 }
 
@@ -3211,17 +3449,25 @@ mod tests {
 
     /// Scenario: a document points a stage somewhere this build refuses — a
     /// plaintext hop to another machine, a URL carrying a credential, a model
-    /// with a space in it. Each is an error rather than a fold.
+    /// with a space in it. Each is an error rather than a fold, the `[voice]`
+    /// section goes to its default, and **every other section survives**.
     ///
-    /// **This is the one place the `[voice]` section does NOT fold**, and the
-    /// asymmetry is deliberate. A token is a name a newer build may have
-    /// invented, so folding it costs a re-pick. An endpoint is a destination:
-    /// folding a refused one to the preset would upload a user's voice to a
-    /// hosted service when they wrote a URL pointing at their own machine, and
-    /// say nothing. The error puts the document on defaults **with a
-    /// diagnostic**, which is the version of that outcome a person can act on.
+    /// **`[voice]` is the one place that does NOT fold**, and the asymmetry is
+    /// deliberate. A token is a name a newer build may have invented, so folding
+    /// it costs a re-pick. An endpoint is a destination: folding a refused one
+    /// to the preset would upload a user's voice to a hosted service when they
+    /// wrote a URL pointing at their own machine, and say nothing. The error
+    /// puts that section on defaults **with a diagnostic**, which is the version
+    /// of that outcome a person can act on.
+    ///
+    /// **What it must NOT put on defaults is the rest of the document.** The
+    /// parse is all-or-nothing and this used to be asserted as
+    /// `settings == DesktopSettings::default()` — which is to say, a user's
+    /// remote decks disappearing because of one endpoint they typed in a
+    /// different section. [`sections_this_build_can_read`] is the recovery, and
+    /// `[endpoints]` and `[appearance]` are here to hold it to it.
     #[test]
-    fn a_refused_voice_endpoint_or_model_is_an_error_rather_than_a_fold() {
+    fn a_refused_voice_value_defaults_that_section_and_keeps_the_others() {
         let dir = tempdir();
         let path = dir.path().join(SETTINGS_FILE_NAME);
         for refused in [
@@ -3234,18 +3480,38 @@ mod tests {
             "[voice.intent]\nendpoint = \"api.anthropic.com/v1/messages\"\n",
             // A model identifier with whitespace in it.
             "[voice.intent]\nmodel = \"claude haiku\"\n",
+            // The keyless backend pointed at somebody else's service — the
+            // pairing `KEYLESS_OFF_MACHINE` refuses, reached the way a user
+            // reaches it: pick the local backend, then edit the endpoint.
+            "[voice.transcription]\nbackend = \"local\"\n\
+             endpoint = \"https://api.openai.com/v1/audio/transcriptions\"\n",
         ] {
             std::fs::write(
                 &path,
-                format!("version = 1\n\n[appearance]\nmode = \"dark\"\n\n{refused}"),
+                format!(
+                    "version = 1\n\n[appearance]\nmode = \"dark\"\n\n\
+                     [endpoints]\nselection = \"deck1\"\n\n\
+                     [[endpoints.remote]]\n\
+                     host = \"build-box.example.com\"\n\
+                     id = \"deck1\"\n\
+                     port = 22\n\n{refused}"
+                ),
             )
             .unwrap();
             let (settings, problem) = load_document(&path);
-            assert_eq!(
-                settings,
-                DesktopSettings::default(),
-                "should have been refused: {refused}"
-            );
+            assert_eq!(settings.voice, None, "should have been refused: {refused}");
+
+            // The whole point: one refused voice value is not a reason to
+            // forget the user's decks, their theme or their schema version.
+            let endpoints = settings
+                .endpoints
+                .as_ref()
+                .unwrap_or_else(|| panic!("the deck list must survive: {refused}"));
+            assert_eq!(endpoints.remote.len(), 1);
+            assert_eq!(endpoints.remote[0].id.as_str(), "deck1");
+            assert_eq!(settings.appearance.mode, AppearanceMode::Dark);
+            assert_eq!(settings.version, 1);
+
             let problem = problem.expect("a refused value must report why");
             assert!(problem.public().contains("line"), "{}", problem.public());
             // Issue #827's rule holds through the new types: a locator, and
@@ -3256,6 +3522,123 @@ mod tests {
                 problem.public()
             );
         }
+    }
+
+    /// Scenario: the webview sends `backend = "local"` paired with a hosted
+    /// endpoint. The IPC seam refuses it, the same way the document does.
+    ///
+    /// **The panel is not the boundary**, which is the point of asserting the
+    /// JSON path separately: the Endpoint field stays offered for the keyless
+    /// backend — a user who publishes the container on another port has to be
+    /// able to say so — so "pick local, then type a hosted URL" is a sequence
+    /// the panel itself permits, and a hand-edited `desktop.toml` bypasses the
+    /// panel entirely. One hand-written [`TranscriptionSettings::deserialize`]
+    /// serves both wires, so refusing there covers both.
+    ///
+    /// The error names the rule and not the endpoint: issue #827's sink list
+    /// includes this message.
+    #[test]
+    fn a_keyless_backend_paired_with_a_hosted_endpoint_is_refused_on_the_ipc_path() {
+        let error = serde_json::from_value::<VoiceSettings>(serde_json::json!({
+            "transcription": {
+                "backend": "local",
+                "endpoint": HOSTED_SPEECH_ENDPOINT,
+                "model": HOSTED_SPEECH_MODEL,
+            },
+        }))
+        .expect_err("a keyless backend may not be pointed off this machine");
+        assert!(
+            error.to_string().contains("must be on this machine"),
+            "the error should name the rule: {error}"
+        );
+
+        // The pairing the panel's own preset writes is of course accepted, and
+        // so is a container a user moved to another loopback port.
+        for endpoint in [
+            LOCAL_SPEECH_ENDPOINT,
+            "http://127.0.0.1:9000/v1/audio/transcriptions",
+            "http://localhost:18000/v1/audio/transcriptions",
+            "http://[::1]:18000/v1/audio/transcriptions",
+        ] {
+            let voice = serde_json::from_value::<VoiceSettings>(serde_json::json!({
+                "transcription": { "backend": "local", "endpoint": endpoint },
+            }))
+            .unwrap_or_else(|error| panic!("{endpoint} must be accepted: {error}"));
+            assert_eq!(voice.transcription.endpoint.as_str(), endpoint);
+        }
+
+        // And the keyed backend is unaffected — a hosted endpoint is the whole
+        // reason it exists, and it sends a credential.
+        let voice = serde_json::from_value::<VoiceSettings>(serde_json::json!({
+            "transcription": { "backend": "remote", "endpoint": HOSTED_SPEECH_ENDPOINT },
+        }))
+        .expect("the keyed backend reaches another host by design");
+        assert_eq!(voice.transcription.backend, TranscriptionBackend::Remote);
+    }
+
+    /// Scenario: a document written by the build before PRD #802's provider
+    /// work — `[voice]` holding three bare tokens rather than two tables. It
+    /// folds onto this build's backends, and touches nothing else.
+    ///
+    /// **A type error, not an unknown token**, which is why this needed
+    /// [`StageSpec`] rather than the folding the token visitor already did:
+    /// `transcription = "off"` is a string where a table is expected, so
+    /// `from_str_lossy` never sees it and `#[serde(default)]` does not fire for
+    /// a value that is present and wrong. The whole document failed, and with it
+    /// went the user's remote decks — for a voice token they had not touched
+    /// since the day the old build wrote it.
+    ///
+    /// `off` is the backend this build deleted, so it folds to the default the
+    /// same way any unknown token does: the keyless local container, which is
+    /// the honest home for it — the stage that used to do nothing now works and
+    /// needs no key.
+    #[test]
+    fn an_old_scalar_voice_section_folds_and_leaves_the_rest_of_the_document_alone() {
+        let dir = tempdir();
+        let path = dir.path().join(SETTINGS_FILE_NAME);
+        std::fs::write(
+            &path,
+            "version = 1\n\n\
+             [endpoints]\nselection = \"deck1\"\n\n\
+             [[endpoints.remote]]\n\
+             host = \"build-box.example.com\"\n\
+             id = \"deck1\"\n\
+             port = 22\n\n\
+             [voice]\n\
+             activation = \"toggle\"\n\
+             intent = \"remote\"\n\
+             transcription = \"off\"\n",
+        )
+        .unwrap();
+
+        let (settings, problem) = load_document(&path);
+        assert!(
+            problem.is_none(),
+            "an old document is not a malformed one: {:?}",
+            problem.map(|problem| problem.public().to_string())
+        );
+
+        let voice = settings.voice.clone().expect("the section is present");
+        assert_eq!(voice.activation, ActivationMode::Toggle);
+        // A token names a backend and nothing else, so each one lands on THAT
+        // backend's coordinates rather than on the struct's own default.
+        assert_eq!(voice.intent.backend, IntentBackend::Remote);
+        assert_eq!(voice.intent.endpoint.as_str(), HOSTED_COMMAND_ENDPOINT);
+        assert_eq!(voice.transcription.backend, TranscriptionBackend::Local);
+        assert_eq!(voice.transcription.endpoint.as_str(), LOCAL_SPEECH_ENDPOINT);
+        assert_eq!(voice.transcription.model.as_str(), LOCAL_SPEECH_MODEL);
+
+        // And the sections the old build's voice token has nothing to do with.
+        let endpoints = settings.endpoints.as_ref().expect("the deck list survives");
+        assert_eq!(endpoints.remote.len(), 1);
+        assert_eq!(endpoints.remote[0].id.as_str(), "deck1");
+
+        // A save then rewrites `[voice]` in the new shape — the migration
+        // completes rather than being re-folded on every load.
+        save_to(&path, &settings).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("[voice.transcription]"), "{raw}");
+        assert_eq!(load_from(&path).voice, settings.voice);
     }
 
     /// Scenario: a document names a stage's backend and nothing else. The
@@ -3404,10 +3787,11 @@ mod tests {
     ///
     /// **An over-length token is an error**, not the fallback: an unrecognised
     /// token is a mode this build has not heard of and a 4 KB one is a
-    /// malformed document. On the disk path that means the whole document falls
-    /// back to defaults, which is the ordinary malformed-document behaviour;
-    /// on the IPC path it fails argument deserialisation before anything
-    /// allocates a normalised copy.
+    /// malformed document. On the disk path that means the `[voice]` section
+    /// falls back to its default **and the sections around it do not** — the
+    /// ordinary malformed-document behaviour since
+    /// [`sections_this_build_can_read`]; on the IPC path it fails argument
+    /// deserialisation before anything allocates a normalised copy.
     #[test]
     fn an_unknown_voice_token_folds_to_the_default_and_an_over_long_one_is_refused() {
         let dir = tempdir();
@@ -3447,11 +3831,11 @@ mod tests {
         )
         .unwrap();
         let (settings, problem) = load_document(&path);
-        assert_eq!(settings, DesktopSettings::default());
+        assert_eq!(settings.voice, None, "the refused section goes to default");
         assert_eq!(
             settings.appearance.mode,
-            AppearanceMode::System,
-            "a malformed document falls back whole, taking the appearance with it"
+            AppearanceMode::Dark,
+            "a refused voice token is not a reason to forget the user's theme"
         );
         let problem = problem.expect("a malformed document must report why");
         assert!(problem.public().contains("line"), "{}", problem.public());
@@ -3748,9 +4132,13 @@ mod tests {
 
     /// The same guarantee for the values that are not numbers at all. A string
     /// or a boolean is a genuinely malformed document, so it falls back the
-    /// ordinary way — the whole document to defaults, logged, never a failed
-    /// launch — and the assertion records that this is the behaviour rather
-    /// than a partial recovery.
+    /// ordinary way — logged, never a failed launch — and since
+    /// [`sections_this_build_can_read`] the ordinary way IS a partial recovery:
+    /// `[zoom]` goes to its default and `[appearance]` beside it does not.
+    /// That sentence used to read "the whole document to defaults", and the
+    /// reason it changed is the one this file is built around — the document
+    /// holds several unrelated tenants, and one refused value is not a reason
+    /// to forget the others.
     #[test]
     fn a_non_numeric_zoom_level_falls_back_the_ordinary_malformed_way() {
         let dir = tempdir();
@@ -3763,7 +4151,7 @@ mod tests {
             .unwrap();
             let loaded = load_from(&path);
             assert_eq!(loaded.zoom.level.as_f64(), DEFAULT_ZOOM_LEVEL, "for {raw}");
-            assert_eq!(loaded.appearance.mode, AppearanceMode::System, "for {raw}");
+            assert_eq!(loaded.appearance.mode, AppearanceMode::Dark, "for {raw}");
         }
     }
 
@@ -4950,7 +5338,10 @@ mod tests {
 
         // The disk path: still never fails a load. An over-length token is a
         // malformed document, not an unknown mode, so the fallback is the whole
-        // document rather than the one field — logged, and not a crash.
+        // SECTION rather than the one field — logged, and not a crash. The
+        // version beside it is untouched, which is
+        // [`sections_this_build_can_read`]: a refused value costs its own
+        // section and nothing else.
         let dir = tempdir();
         let path = dir.path().join(SETTINGS_FILE_NAME);
         std::fs::write(
@@ -4958,7 +5349,9 @@ mod tests {
             format!("version = 9\n[appearance]\nmode = \"{over}\"\n"),
         )
         .unwrap();
-        assert_eq!(load_from(&path), DesktopSettings::default());
+        let loaded = load_from(&path);
+        assert_eq!(loaded.appearance, AppearanceSettings::default());
+        assert_eq!(loaded.version, 9);
 
         // And exactly at the limit is still the ordinary unknown-value
         // fallback, which keeps the rest of the document.
@@ -6740,7 +7133,18 @@ level = 1.0
         let original = "version = 7\n\n[appearance]\nmode = \"light\"\n\n[[endpoints.remote]]\nhost = \"build box\"\nid = \"d\"\n";
         std::fs::write(&path, original).unwrap();
 
-        assert_eq!(load_from(&path), DesktopSettings::default());
+        // The load recovers what it can read and defaults only the section it
+        // cannot ([`sections_this_build_can_read`]) — the refusal below is what
+        // #1072 is about, and it is unchanged by that: a document this build
+        // could not fully read is never published over, whatever was salvaged
+        // from it for the session.
+        let loaded = load_from(&path);
+        assert_eq!(loaded.version, 7);
+        assert_eq!(loaded.appearance.mode, AppearanceMode::Light);
+        assert_eq!(
+            loaded.endpoints, None,
+            "the unreadable row takes its section"
+        );
         save_to(&path, &dark()).expect_err("the document must not be written over");
 
         // Not "the row survived", which was the old and much weaker claim: the
