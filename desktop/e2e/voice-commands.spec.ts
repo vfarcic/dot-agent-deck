@@ -114,7 +114,7 @@ test.describe("what can I say?", () => {
 
     const overlay = page.getByTestId("voice-help");
     await expect(overlay).toBeVisible();
-    await expect(overlay.locator('[data-where="here"] [data-command="close_agent_view"]')).toBeVisible();
+    await expect(overlay.locator('[data-where="here"] [data-command="close"]')).toBeVisible();
     // `trial` runs every actionability check — visible, stable, receives
     // events — and clicks nothing, which is the question an `inert` ancestor
     // would answer with a failure.
@@ -151,72 +151,144 @@ test.describe("the empty report row", () => {
 });
 
 /**
- * PRD #802 D6 — the feature's own point, driven as a user meets it.
+ * PRD #802 D6, rebuilt — the feature's own point, driven as a user meets it.
  *
- * These are the tests that exercise the whole aimed loop in a real browser:
- * the pane opens, the words land in the terminal the user is looking at, the
- * countdown is on screen, and the phrase ends it. The preview's microphone is
+ * These are the tests that exercise the whole loop in a real browser: the pane
+ * is open, the words land in the terminal the user is looking at, the countdown
+ * is on screen, and a spoken phrase sends it. The preview's microphone is
  * scripted with `?voice=`, which is what makes an utterance AFTER the first one
  * askable at all.
+ *
+ * The pane is opened by CLICK rather than by voice, and that is a limitation of
+ * the preview rather than of the feature: the fixture bridge has no `agent_ref`
+ * resolver, deliberately, so `open_agent` is the one row it cannot answer. What
+ * the click buys is the precondition the row actually needs — `screens =
+ * ["agent"]` — after which everything under test is spoken.
  */
-test.describe("dictating into an agent", () => {
+test.describe("typing into the open agent", () => {
   /**
-   * Scenario: say "type to the coder" and then a sentence. Planner's pane
-   * opens over the deck, the sentence appears in that agent's own terminal —
-   * the visible input, not a buffer — and the row counts down to a send instead
-   * of submitting it.
+   * Open the crowded fleet's `coder` pane, which is the one agent in any
+   * fixture whose pane accepts typing — see the fixture row for why that is the
+   * feature's own requirement rather than an arbitrary pick.
    */
-  test("opens the agent's pane and types into its terminal", async ({ page }) => {
-    await openSpeaking(page, ["type to the coder", "run the login tests"], "crowded");
+  async function openCoder(page: Page) {
+    await page.getByRole("button", { name: "Open coder agent" }).click();
+    await expect(page.getByTestId("agent-pane-overlay")).toBeVisible();
+  }
 
-    await voiceButton(page).click();
+  /**
+   * Scenario: with the coder's pane open, say "type run the login tests". The
+   * words appear in that agent's own terminal — the visible input, not a buffer
+   * — and the row counts down to a send instead of submitting it.
+   */
+  test("types into the open pane and counts down instead of sending", async ({ page }) => {
+    await openSpeaking(page, ["type run the login tests"], "crowded");
+    await openCoder(page);
 
     const pane = page.getByTestId("agent-pane-overlay");
-    await expect(pane).toBeVisible();
-    // The pane that opened is the one being typed into, and it accepts input:
-    // dictating into a pane the app itself renders as unwritable would be the
-    // hidden buffer this feature is defined against. `builder` holds a write
-    // lease; `planner`, which the other tests here open, does not.
-    // The pane that opened is the agent that was named — by the control that
-    // closes it, which carries the agent's own label rather than its role.
-    await expect(pane.getByRole("button", { name: /close coder agent/i })).toBeVisible();
-    // And it ACCEPTS typing. Dictating into a pane the app itself renders as
-    // unwritable would be demonstrating the opposite of the feature, which is
-    // why the crowded fleet is the one loaded here — see the fixture row.
+    // It ACCEPTS typing. Dictating into a pane the app itself renders as
+    // unwritable would be demonstrating the opposite of the feature.
     await expect(pane).not.toContainText("Terminal input unavailable");
     await expect(pane).not.toContainText("This agent has finished its work");
 
+    await voiceButton(page).click();
+
+    await expect(page.getByText("Typed: “run the login tests”.")).toBeVisible();
     const line = page.getByTestId("voice-dictation");
-    await expect(line).toContainText("Typing to coder");
+    await expect(line).toContainText("coder");
     await expect(line).toContainText("sending in");
   });
 
   /**
-   * Scenario: end it by saying so. The countdown and the aim both go, the row
-   * says what happened, and voice stays on — which is the difference between
-   * this and "voice off".
+   * Scenario: the same words said on the DECK, with no pane open. Rust's own
+   * not-here sentence names the prerequisite rather than typing into a terminal
+   * nobody can see, which is the whole of the new targeting rule.
    */
-  test("ends on the exit phrase and leaves voice listening", async ({ page }) => {
-    await openSpeaking(page, ["type to the coder", "run the login tests", "stop dictation"], "crowded");
+  test("names the prerequisite when no pane is open", async ({ page }) => {
+    await openSpeaking(page, ["type run the login tests"], "crowded");
 
     await voiceButton(page).click();
 
-    await expect(page.getByText(/Dictation off/)).toBeVisible();
+    await expect(page.getByText(/typing to an agent needs that agent's pane open/)).toBeVisible();
     await expect(page.getByTestId("voice-dictation")).toHaveCount(0);
+  });
+
+  /**
+   * Scenario: say the words, then say "send it". The countdown goes at once
+   * rather than being waited out — the third way to send, beside the timer and
+   * the user's own keyboard.
+   */
+  test("sends at once when the user says so", async ({ page }) => {
+    await openSpeaking(page, ["type run the login tests", "send it"], "crowded");
+    await openCoder(page);
+
+    await voiceButton(page).click();
+
+    await expect(page.getByText("Sent.")).toBeVisible();
+    await expect(page.getByTestId("voice-dictation")).toHaveCount(0);
+    // And voice is still on, listening for the next thing — which is the
+    // difference between this and "voice off".
     await expect(voiceButton(page)).toHaveAttribute("aria-pressed", "true");
   });
 
   /**
-   * Scenario: "voice off" while aimed stops everything. The precedence chosen
-   * here is the bigger stop, because the failure it avoids is a user who
-   * believes the microphone is closed while it is open.
+   * Scenario: an utterance that ENDS in a submit phrase is typed, not obeyed.
+   * This is the false positive the product owner asked about — a trailing rule
+   * would submit *"the meeting is at the"* and deliver half an instruction to
+   * an agent, which is unrecoverable because sending is the last thing that
+   * happens.
    */
-  test("voice off while dictating stops the microphone too", async ({ page }) => {
-    await openSpeaking(page, ["type to the coder", "run the login tests", "voice off"], "crowded");
+  test("types a trailing submit phrase rather than obeying it", async ({ page }) => {
+    await openSpeaking(page, ["type the meeting is at the end"], "crowded");
+    await openCoder(page);
 
     await voiceButton(page).click();
 
-    await expect(voiceButton(page)).toHaveAttribute("aria-pressed", "false");
-    await expect(page.getByTestId("voice-dictation")).toHaveCount(0);
+    await expect(page.getByText("Typed: “the meeting is at the end”.")).toBeVisible();
+    await expect(page.getByTestId("voice-dictation")).toContainText("sending in");
+  });
+});
+
+test.describe("closing what is on top", () => {
+  /**
+   * Scenario: the overlay is opened by voice and closed by voice — the defect
+   * this row was added for. Before it, the list could only be dismissed by a
+   * click or Escape, which breaks the premise of a hands-free surface.
+   */
+  test("dismisses the list of commands", async ({ page }) => {
+    await openSpeaking(page, ["what can I say?", "close this"]);
+
+    await voiceButton(page).click();
+
+    await expect(page.getByTestId("voice-help")).toHaveCount(0);
+    await expect(page.getByText("Closed.")).toBeVisible();
+  });
+
+  /**
+   * Scenario: with no overlay up, the same word closes the agent's pane. The
+   * precedence is decided at dispatch because *"an overlay is open"* is not a
+   * screen, and this is the "otherwise" half of it.
+   */
+  test("closes the agent's pane when no overlay is up", async ({ page }) => {
+    await openSpeaking(page, ["close this"]);
+    await page.getByRole("button", { name: "Open Planner agent" }).click();
+    await expect(page.getByTestId("agent-pane-overlay")).toBeVisible();
+
+    await voiceButton(page).click();
+
+    await expect(page.getByTestId("agent-pane-overlay")).toHaveCount(0);
+  });
+
+  /**
+   * Scenario: nothing is on top, so the surface says so rather than claiming a
+   * close. The row is callable everywhere — the overlay can be up over any
+   * screen — so Rust cannot render a not-here refusal for it.
+   */
+  test("says so when there is nothing to close", async ({ page }) => {
+    await openSpeaking(page, ["close this"]);
+
+    await voiceButton(page).click();
+
+    await expect(page.getByText(/Nothing to close/)).toBeVisible();
   });
 });

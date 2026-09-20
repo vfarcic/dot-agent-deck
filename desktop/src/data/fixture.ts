@@ -736,24 +736,29 @@ export function createFixtureSnapshot(state: FixtureState = "connected"): DeckSn
  *
  * # Every param-free row, and no other
  *
- * `open_overview`, `open_deck`, `close_agent_view` and `voice_off` take no
- * params, so the fixture can answer them honestly with no resolver of its own.
- * `open_agent` is the one left out: it would need a second `agent_ref` resolver
- * here to reach at all — the real one, and every refusal it produces, is
- * covered in `voice/outcome.rs` — and inventing a stand-in for it in a browser
- * is the drift this module's placement is about. `dictate_to_agent` is left out
- * for the same reason, since it takes the same param.
+ * Every param-free row is here, so the fixture can answer it honestly with no
+ * resolver of its own. `open_agent` is the one left out: it would need a second
+ * `agent_ref` resolver here to reach at all — the real one, and every refusal
+ * it produces, is covered in `voice/outcome.rs` — and inventing a stand-in for
+ * it in a browser is the drift this module's placement is about.
  *
- * (This heading counted *three*, and `close_agent_view` had already made that
- * four before this sentence was rewritten. It names the rule now rather than a
+ * (This heading counted *three*, then four. It names the rule now rather than a
  * number, so the next row does not have to remember to edit a heading.)
  *
- * **`close_agent_view` was the fourth until the voice surface could be reached
- * on the `agent` screen at all.** It was left out because that screen's whole
- * background — the voice trigger included — was marked `inert` by the pane's
- * modal fence, so a fixture row for it answered a question nothing could ask.
- * `useInertBackground` now exempts the voice surface as a peer dialog, so the
- * question is askable and the row is here to answer it.
+ * **`dictate_to_agent` used to be left out for `open_agent`'s reason and is
+ * here now, because the param it declares changed shape.** It took an
+ * `agent_ref`; it takes a `spoken_prefix`, which resolves against the
+ * TRANSCRIPT rather than against live state. That is a rule a preview can
+ * reproduce exactly — strip the opener, type the rest — where a resolver over
+ * a live fleet is not. The row below says which half is reproduced and which
+ * half (the model fallback) still is not.
+ *
+ * **`close` was left out until the voice surface could be reached on the
+ * `agent` screen at all.** That screen's whole background — the voice trigger
+ * included — was marked `inert` by the pane's modal fence, so a fixture row for
+ * it answered a question nothing could ask. `useInertBackground` now exempts
+ * the voice surface as a peer dialog, so the question is askable and the row is
+ * here to answer it.
  */
 const FIXTURE_VOICE_COMMANDS: ReadonlyArray<{
   readonly phrases: readonly string[];
@@ -777,6 +782,16 @@ const FIXTURE_VOICE_COMMANDS: ReadonlyArray<{
    * browser tier drive.
    */
   readonly params?: readonly VoiceResolvedParamDto[];
+  /**
+   * Words this row is matched by as a PREFIX rather than by equality, with
+   * everything after them becoming the row's `spoken_prefix` param.
+   *
+   * The one departure from equality matching in this module, and it reproduces
+   * the real fast path's rule rather than inventing one — see the dictation row
+   * below for why that is a different thing from inventing an `agent_ref`
+   * resolver.
+   */
+  readonly openers?: readonly string[];
 }> = [
   {
     phrases: ["show me every agent", "show me all the agents", "show me everything"],
@@ -796,13 +811,15 @@ const FIXTURE_VOICE_COMMANDS: ReadonlyArray<{
   },
   {
     // The VIEW, never the terminal pane — the same line `commands.toml` draws at
-    // this row, because the two are one word apart in speech.
-    phrases: ["close this", "close the agent view", "stop looking at this one"],
-    action: "close_agent_view",
-    invoke: "closeAgentView",
-    screens: ["agent"],
-    unavailableHint: "closing an agent view needs one open",
-    report: "Closing the agent view.",
+    // this row, because the two are one word apart in speech. Callable on all
+    // three screens for `voice_off`'s reason: the real row has no `screens`
+    // column, because the overlay it dismisses can be up over any of them.
+    phrases: ["close this", "close", "close the agent view", "stop looking at this one"],
+    action: "close",
+    invoke: "closeTopmost",
+    screens: ["deck", "overview", "agent"],
+    unavailableHint: "closing what is on top works anywhere",
+    report: "Closed.",
   },
   {
     // The only entry listing all three screens, because the real row lists
@@ -831,22 +848,42 @@ const FIXTURE_VOICE_COMMANDS: ReadonlyArray<{
     report: "Here is what you can say.",
   },
   {
-    // Aimed at the CROWDED fleet's `coder`, and the choice is the feature's own
-    // requirement rather than an arbitrary pick: dictation types into a pane,
-    // so the target has to be an agent whose pane accepts typing. Every agent
-    // in the `connected` deck fails that — `planner` and `reviewer` hold a read
-    // lease, `tester` has no live target, and `builder` has finished — while
-    // the crowded fleet's `coder` is running and holds a write lease. The
-    // browser tier's dictation tests load `?state=crowded` for exactly that
-    // reason, and a preview that dictated into a pane the app itself renders as
-    // unwritable would be demonstrating the opposite of the feature.
-    phrases: ["type to the coder", "talk to the coder"],
+    // **Matched by OPENER rather than by phrase**, which is the one place this
+    // module reproduces a rule instead of canning an answer — and it is
+    // allowed to for the reason `agent_ref` is not: the fast path's rule is
+    // local, deterministic and complete (`voice::dictation::strip_opening`
+    // strips the opener and types the rest), so reproducing it invents
+    // nothing. What a fixture could not stand in for is the MODEL fallback,
+    // which is why the openers here are exactly the four the real fast path
+    // knows and no more.
+    //
+    // `screens: ["agent"]` matches the real row: the target is the pane on
+    // screen, so the preview's dictation tests open one first. The crowded
+    // fleet's `coder` is the pane they open, and that choice is the feature's
+    // own requirement rather than an arbitrary pick — dictation types into a
+    // pane, so the target has to be an agent whose pane accepts typing. Every
+    // agent in the `connected` deck fails that (`planner` and `reviewer` hold a
+    // read lease, `tester` has no live target, `builder` has finished) while
+    // the crowded fleet's `coder` is running and holds a write lease.
+    phrases: [],
+    openers: ["type", "write", "say", "dictate"],
     action: "dictate_to_agent",
     invoke: "dictateToAgent",
-    screens: ["deck", "overview", "agent"],
-    unavailableHint: "typing to an agent works anywhere",
-    report: "Typing to coder. Say “stop dictation” when you are done.",
-    params: [{ name: "agent", kind: "agent_ref", spoken: "coder", value: "2", label: "coder" }],
+    screens: ["agent"],
+    unavailableHint: "typing to an agent needs that agent's pane open — open one first",
+    report: "Typed.",
+  },
+  {
+    // Whole-utterance equality, which is what the phrase matcher already is —
+    // the real fast path draws the same line, and for the reason its own
+    // constant documents at length: a trailing rule would submit "the meeting
+    // is at the" when somebody said "type the meeting is at the end".
+    phrases: ["end", "send", "send it", "submit", "enter", "press enter"],
+    action: "submit_prompt",
+    invoke: "submitAgentPrompt",
+    screens: ["agent"],
+    unavailableHint: "sending a prompt needs an agent's pane open",
+    report: "Sent.",
   },
 ];
 
@@ -896,8 +933,9 @@ function fixtureHeard(transcript: string, situation: string): string {
  */
 export function resolveFixtureVoice(utterance: string, screen: VoiceScreen): VoiceResultDto {
   const spoken = utterance.trim().toLowerCase();
-  const command = FIXTURE_VOICE_COMMANDS.find((candidate) => candidate.phrases.includes(spoken));
   const stub = { resolveMs: null, backend: "stub" } as const;
+  const command = FIXTURE_VOICE_COMMANDS.find((candidate) => candidate.phrases.includes(spoken))
+    ?? FIXTURE_VOICE_COMMANDS.find((candidate) => (candidate.openers ?? []).some((opener) => fixtureOpening(utterance, opener) !== undefined));
   if (!command) {
     return { ...stub, outcome: { kind: "no_match", transcript: utterance, sentence: fixtureHeard(utterance, "no matching action") } };
   }
@@ -907,10 +945,44 @@ export function resolveFixtureVoice(utterance: string, screen: VoiceScreen): Voi
       outcome: { kind: "unavailable", transcript: utterance, action: command.action, hint: command.unavailableHint, sentence: `Not here — ${command.unavailableHint}.` },
     };
   }
+  /* The typed text is a slice of the UTTERANCE, never of anything this module
+     made up — which is the property the real pipeline holds and the preview
+     would be misleading about if it canned a string here. */
+  const opener = (command.openers ?? []).find((candidate) => fixtureOpening(utterance, candidate) !== undefined);
+  const text = opener === undefined ? undefined : fixtureOpening(utterance, opener);
+  const params: VoiceResolvedParamDto[] = text === undefined
+    ? [...command.params ?? []]
+    : [{ name: "prefix", kind: "spoken_prefix", spoken: opener!, value: text, label: text }];
   return {
     ...stub,
-    outcome: { kind: "dispatch", transcript: utterance, action: command.action, invoke: command.invoke, params: [...command.params ?? []], sentence: command.report },
+    outcome: {
+      kind: "dispatch",
+      transcript: utterance,
+      action: command.action,
+      invoke: command.invoke,
+      params,
+      sentence: text === undefined ? command.report : `Typed: “${text}”.`,
+    },
   };
+}
+
+/**
+ * Everything after `opener`, or `undefined` if the utterance does not open with
+ * it — the preview's copy of `voice::dictation::strip_opening`, matched on
+ * whole words so *"typescript is confusing"* does not open with *"type"*.
+ *
+ * A remainder of nothing is `undefined` too: *"type"* alone is not a dictation,
+ * exactly as it is not one in Rust, where it falls through to the model.
+ */
+function fixtureOpening(utterance: string, opener: string): string | undefined {
+  const words = utterance.trim();
+  const lowered = words.toLowerCase();
+  const marked = opener.toLowerCase();
+  if (!lowered.startsWith(marked)) return undefined;
+  const rest = words.slice(marked.length);
+  if (rest !== "" && /[\p{L}\p{N}]/u.test(rest[0])) return undefined;
+  const text = rest.replace(/^[\s:,-]+/u, "");
+  return text === "" ? undefined : text;
 }
 
 /**

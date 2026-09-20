@@ -41,6 +41,7 @@
 //! are what the panel will call.
 
 pub mod capture;
+pub mod dictation;
 pub mod http;
 pub mod openai;
 pub mod outcome;
@@ -62,6 +63,7 @@ use serde::{Deserialize, Serialize};
 /// renders. A parallel shape here would be a second answer to "what agents are
 /// there" with nothing keeping the two in step.
 pub use crate::dto::DesktopAgent;
+pub use dictation::{DICTATION_OPENERS, SUBMIT_PHRASES};
 
 pub use capture::{
     AudioFormat, AudioSource, AudioStream, Capture, CaptureError, CaptureSession, CaptureState,

@@ -224,11 +224,12 @@ mod tests {
                 "open_agent".to_string(),
                 "open_overview".to_string(),
                 "open_deck".to_string(),
-                "close_agent_view".to_string(),
+                "close".to_string(),
                 "open_settings".to_string(),
                 "voice_off".to_string(),
                 "list_commands".to_string(),
                 "dictate_to_agent".to_string(),
+                "submit_prompt".to_string(),
                 "none".to_string(),
             ]
         );
@@ -279,11 +280,12 @@ mod tests {
                 "open_agent",
                 "open_overview",
                 "open_deck",
-                "close_agent_view",
+                "close",
                 "open_settings",
                 "voice_off",
                 "list_commands",
                 "dictate_to_agent",
+                "submit_prompt",
                 "none"
             ]
         );
@@ -334,11 +336,14 @@ mod tests {
                 ("open_agent".to_string(), true),
                 ("open_overview".to_string(), true),
                 ("open_deck".to_string(), false),
-                ("close_agent_view".to_string(), false),
+                ("close".to_string(), true),
                 ("open_settings".to_string(), true),
                 ("voice_off".to_string(), true),
                 ("list_commands".to_string(), true),
-                ("dictate_to_agent".to_string(), true),
+                // The dictation pair is `agent`-only: with no pane on screen
+                // there is no one agent whose prompt "type this" could mean.
+                ("dictate_to_agent".to_string(), false),
+                ("submit_prompt".to_string(), false),
             ]
         );
         assert_eq!(
@@ -347,7 +352,7 @@ mod tests {
                 ("open_agent".to_string(), true),
                 ("open_overview".to_string(), false),
                 ("open_deck".to_string(), true),
-                ("close_agent_view".to_string(), false),
+                ("close".to_string(), true),
                 // PRD #802 M8's ruling in one flag: Settings is reachable only
                 // from the deck rail, so voice must not offer it here either.
                 ("open_settings".to_string(), false),
@@ -355,7 +360,8 @@ mod tests {
                 // and neither must the phrase that lists what can be said.
                 ("voice_off".to_string(), true),
                 ("list_commands".to_string(), true),
-                ("dictate_to_agent".to_string(), true),
+                ("dictate_to_agent".to_string(), false),
+                ("submit_prompt".to_string(), false),
             ]
         );
         assert_eq!(
@@ -364,11 +370,12 @@ mod tests {
                 ("open_agent".to_string(), false),
                 ("open_overview".to_string(), false),
                 ("open_deck".to_string(), false),
-                ("close_agent_view".to_string(), true),
+                ("close".to_string(), true),
                 ("open_settings".to_string(), false),
                 ("voice_off".to_string(), true),
                 ("list_commands".to_string(), true),
                 ("dictate_to_agent".to_string(), true),
+                ("submit_prompt".to_string(), true),
             ]
         );
     }

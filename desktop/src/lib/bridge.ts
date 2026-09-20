@@ -643,13 +643,26 @@ export interface SecretStatusDto {
 export type VoiceScreen = "deck" | "overview" | "agent";
 
 /**
- * One param of a resolved command, as the Rust side resolved it against live
- * state (`voice::ResolvedParam`).
+ * One param of a resolved command, as the Rust side resolved it
+ * (`voice::ResolvedParam`).
  *
- * `spoken` is what the user called it and `value` is what the action is
- * dispatched with — an agent id for `agent_ref`. The surface renders neither:
- * the sentence it shows already names the agent the way the deck does, which is
- * what `label` was derived for.
+ * `spoken` is what the MODEL supplied and `value` is what the action is
+ * dispatched with. The two `kind`s resolve against different things, and the
+ * difference is worth knowing before reading either field:
+ *
+ * * `agent_ref` resolves against **live state** — `spoken` is what the user
+ *   called an agent, `value` is that agent's id, and `label` is the name the
+ *   deck shows for it.
+ * * `spoken_prefix` resolves against **the transcript** — `spoken` is the
+ *   boundary the model marked, the words that introduced a dictation, and
+ *   `value` is what the app resolved that boundary to: the rest of the
+ *   transcript, verbatim. A boundary that is not genuinely the front of the
+ *   transcript never becomes a dispatch at all (`param_unresolved` instead), so
+ *   a `value` of this kind is the user's own words or nothing. The model never
+ *   supplies text that reaches an agent's prompt.
+ *
+ * The surface renders neither `spoken` nor `value` as prose: the sentence it
+ * shows already names what it needs to, which is what `label` was derived for.
  */
 export interface VoiceResolvedParamDto {
   name: string;
@@ -789,11 +802,18 @@ export interface VoiceStatusDto {
  * Four rather than two, and the two additions are the point: `not_configured`
  * is neither a transcript nor a failure, and neither is `silent`. Rendering
  * either as an error is the mistake calling `off` a product statement exists to
- * avoid — and `silent` carries no `detail` because there is nothing to
- * diagnose. A noise ends a segment far more often than a sentence does, and a
+ * avoid. A noise ends a segment far more often than a sentence does, and a
  * whisper-family model handed the quiet room that follows answers with its own
  * training artefacts; refusing to call one is what stops the report claiming
  * the user said something they did not.
+ *
+ * **`silent` carries a `detail` and this comment used to say it carried none,
+ * "because there is nothing to diagnose".** PRD #802's product owner met that
+ * outcome with a real microphone, about words he had said, and its sentence
+ * named no threshold and no measurement — so a quiet input, a short utterance
+ * and a bug were indistinguishable from outside the app. The `detail` is the
+ * measurement behind the sentence (`voice::transcribe::not_enough_speech`) and
+ * is about the AUDIO, never about the device.
  *
  * Only `heard` continues the pipeline. `VoiceControlPanel` branches on that one
  * kind and prints `sentence` for every other, so a fifth situation would render
@@ -807,14 +827,6 @@ export type VoiceTranscriptionOutcomeDto =
 
 /**
  * One recording's transcription, plus what it cost
- * **`silent` carries a `detail` and this comment used to say it carried none,
- * "because there is nothing to diagnose".** PRD #802's product owner met that
- * outcome with a real microphone, about words he had said, and its sentence
- * named no threshold and no measurement — so a quiet input, a short utterance
- * and a bug were indistinguishable from outside the app. The `detail` is the
- * measurement behind the sentence (`voice::transcribe::not_enough_speech`) and
- * is about the AUDIO, never about the device.
- *
  * (`voice::VoiceTranscription`).
  *
  * The mirror of {@link VoiceResultDto} for the stage in front of it: a user who

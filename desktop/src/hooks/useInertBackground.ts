@@ -50,7 +50,7 @@
  * for a second surface the user is meant to reach. The cost was not cosmetic:
  * `inert` removes an element from hit testing as well as from the tab order, so
  * on the `agent` screen the trigger was unclickable behind the pane, and
- * `close_agent_view` — the one command that screen has — was unreachable by the
+ * `close` — the command that dismisses whatever is on top — was unreachable by the
  * surface that dispatches it. The report carries the marker for the same
  * reason and not by habit: the Undo inside it is a control, and an Undo that
  * cannot be clicked is a picture of one.

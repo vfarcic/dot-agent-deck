@@ -161,14 +161,35 @@ export type VoiceActionContext = {
    */
   showVoiceCommands: () => void;
   /**
-   * Aim the microphone at one agent: from here every utterance is typed into
-   * that agent's prompt rather than resolved as a command (PRD #802 D6).
+   * Type one utterance's words into the open agent's prompt (PRD #802 D6,
+   * rebuilt).
    *
-   * Served by the voice surface because the microphone is the surface's, and
-   * because the exit — a phrase, a pending send, a countdown — is state no
-   * screen has anywhere to keep.
+   * **One utterance, not a mode.** What shipped first aimed the microphone at
+   * an agent and typed everything until an exit phrase was heard; this types
+   * what it was given and is finished. The text is on `target.text`, taken
+   * Rust-side from the transcript itself — never from the model's answer.
+   *
+   * Served by the voice surface rather than by a screen, because the countdown
+   * to a send that follows it is state no screen has anywhere to keep.
    */
-  startDictation: (target: VoiceDispatchTarget) => void;
+  typeIntoAgent: (target: VoiceDispatchTarget) => void;
+  /** Press Enter in the open agent's prompt. The voice surface's, for
+   * {@link typeIntoAgent}'s reason — it also cancels the pending countdown,
+   * which only the surface holds. */
+  submitAgentPrompt: (target: VoiceDispatchTarget) => void;
+  /**
+   * Close the voice surface's own overlay.
+   *
+   * **Published only while that overlay is OPEN**, and that is the whole
+   * mechanism: *"an overlay is open"* is not expressible in `screens` — those
+   * booleans are not in `DeckView` — so the fact travels as the presence or
+   * absence of this member, read at dispatch time by {@link closeTopmost}.
+   */
+  dismissVoiceOverlay: () => void;
+  /** Say that there was nothing on top to close. The voice surface owns every
+   * sentence about itself, so the honest answer to `close` with nothing open
+   * is written there and not composed here. */
+  reportNothingToClose: () => void;
 };
 
 /**
@@ -238,26 +259,61 @@ export const VOICE_ACTIONS = {
   },
 
   dictateToAgent: {
-    label: "Aim voice at one agent and type what it hears",
+    label: "Type what was said into the open agent's prompt",
     voice: true,
-    needs: ["navigate", "startDictation"],
+    needs: ["typeIntoAgent"],
     /**
-     * Opening the pane is HALF the action, not a convenience beside it.
+     * **It no longer opens anything, and that is the rebuild in one line.**
      *
-     * The requirement is that dictated words land in a **visible** input the
-     * user can see and edit — never a hidden buffer — and on the overview no
-     * terminal is mounted at all (PRD #745's commitment). So this opens the
-     * agent it is about to type into, and the two together are what makes the
-     * visibility true on every screen rather than only on the deck.
-     *
-     * `selectAgent` is deliberately not read even where a host offers it:
-     * `navigate` to an agent view is what puts the pane on screen, and the
-     * tile selection underneath it is not something dictation has an opinion
-     * about.
+     * The old entry navigated to the agent and then aimed the microphone at
+     * it, because the row carried an `agent` param and could be said from
+     * anywhere. The row is now `screens = ["agent"]`: the target IS the pane on
+     * screen, so the visibility requirement — dictated words land in an input
+     * the user can see and edit, never a hidden buffer — is satisfied by the
+     * precondition rather than by a navigation this entry performs. Rust
+     * renders the table's own hint when no pane is open, which is the same
+     * sentence any other not-here refusal gets.
      */
-    run: (context: Pick<VoiceActionContext, "navigate" | "startDictation">, target: VoiceDispatchTarget) => {
-      context.navigate({ kind: "agent", deckId: target.deckId, agentId: target.agentId, from: target.from });
-      context.startDictation(target);
+    run: (context: Pick<VoiceActionContext, "typeIntoAgent">, target: VoiceDispatchTarget) => context.typeIntoAgent(target),
+  },
+
+  submitAgentPrompt: {
+    label: "Send what is in the open agent's prompt",
+    voice: true,
+    needs: ["submitAgentPrompt"],
+    /** Presses Enter, and nothing else. It types nothing — a request to write
+        something is `dictateToAgent`. */
+    run: (context: Pick<VoiceActionContext, "submitAgentPrompt">, target: VoiceDispatchTarget) => context.submitAgentPrompt(target),
+  },
+
+  closeTopmost: {
+    label: "Close whatever is open over the screen",
+    voice: true,
+    needs: ["closeAgentView", "reportNothingToClose"],
+    /**
+     * PRD #802 — the precedence, decided HERE because it cannot be decided in
+     * the table.
+     *
+     * `screens` draws on `DeckView`, and the voice surface's overlay is a
+     * `useState` boolean that is not in it. So the row is callable everywhere
+     * and the ordering lives at dispatch: the overlay if it is up, otherwise
+     * the agent's pane, otherwise an honest report that there was nothing to
+     * close. That order is the only one that cannot surprise — the overlay is
+     * literally on top of the pane, so closing the pane underneath it would
+     * leave the thing the user was looking at still on screen.
+     *
+     * `dismissVoiceOverlay` is read through its own presence rather than
+     * declared in `needs`: the surface publishes it only while the overlay is
+     * open, so its absence IS the answer to "is anything on top?". Declaring it
+     * would refuse the whole row whenever the overlay was closed.
+     */
+    run: (
+      context: Pick<VoiceActionContext, "closeAgentView" | "reportNothingToClose"> & Partial<Pick<VoiceActionContext, "dismissVoiceOverlay">>,
+      target: VoiceDispatchTarget,
+    ) => {
+      if (context.dismissVoiceOverlay) return context.dismissVoiceOverlay();
+      if (target.agentViewOpen) return context.closeAgentView();
+      context.reportNothingToClose();
     },
   },
 
@@ -277,7 +333,7 @@ export const VOICE_ACTIONS = {
 
   closeAgentView: {
     label: "Close the open agent view",
-    voice: true,
+    no_voice: "the agent tile's own X, and what `closeTopmost` calls once it has decided nothing is on top of the pane — a row naming this one DIRECTLY would close the view out from under an open overlay, which is the precedence `close` exists to get right. It is voice-reachable, through that entry and only through it",
     needs: ["closeAgentView"],
     /** The VIEW, never the pane. The agent keeps running and keeps its terminal. */
     run: (context: Pick<VoiceActionContext, "closeAgentView">) => context.closeAgentView(),
@@ -436,6 +492,27 @@ void NEEDS_COVERS_RUN;
  */
 export type VoiceDispatchTarget = AgentViewTarget & {
   /**
+   * The words to type into the open agent's prompt, for the dictation row
+   * (PRD #802 D6, rebuilt).
+   *
+   * **Resolved Rust-side from the TRANSCRIPT, never supplied by the model.**
+   * It arrives as the `spoken_prefix` param's `value`, which
+   * `voice::dictation::strip_opening` produced by verifying the model's marked
+   * boundary against the app's own transcript and slicing what follows it. A
+   * boundary that did not verify never becomes a dispatch, so an entry reading
+   * this member is reading the user's own words or nothing.
+   */
+  text?: string;
+  /**
+   * Whether an agent's pane is open over the screen.
+   *
+   * Read by {@link closeTopmost} to decide whether there is anything under the
+   * overlay to close. It is a boolean rather than the target's own `agentId`
+   * because that id is the one a row's `agent_ref` param resolved to, which for
+   * a row with no such param is the empty string.
+   */
+  agentViewOpen?: boolean;
+  /**
    * What the deck CALLS the agent, for a surface that has to name it.
    *
    * Resolved Rust-side against live state and carried on the dispatch outcome's
@@ -489,7 +566,7 @@ export type VoiceDispatchContext = Pick<VoiceActionContext, "navigate" | "closeA
  * set's complement, so a screen that tried to serve one of these members would
  * not type-check, and neither would a panel that left one out.
  */
-export type VoicePanelContext = Pick<VoiceActionContext, "stopVoice" | "showVoiceCommands" | "startDictation">;
+export type VoicePanelContext = Pick<VoiceActionContext, "stopVoice" | "showVoiceCommands" | "typeIntoAgent" | "submitAgentPrompt" | "dismissVoiceOverlay" | "reportNothingToClose">;
 /**
  * `Partial`, because a panel can serve one of these and not another.
  *

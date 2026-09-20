@@ -99,33 +99,40 @@ screen = "deck"
 action = "open_deck"
 outcome = "unavailable"
 
+# `close` is callable everywhere — the overlay it dismisses can be up on any
+# screen — so its fixtures are spread across the screens rather than probing an
+# availability column that has no false case. The two that matter are the
+# collisions: a bare "go back" on the AGENT screen must reach this row and not
+# `open_deck` (which claims the same phrase for the overview), and "close this"
+# on the deck must still reach this row rather than falling to `none`.
+
 [[fixtures]]
-name = "close-agent-view-back"
+name = "close-back"
 utterance = "go back"
 screen = "agent"
-action = "close_agent_view"
+action = "close"
 outcome = "dispatch"
 
 [[fixtures]]
-name = "close-agent-view-close"
+name = "close-this"
 utterance = "close this"
 screen = "agent"
-action = "close_agent_view"
+action = "close"
 outcome = "dispatch"
 
 [[fixtures]]
-name = "close-agent-view-stop-looking"
+name = "close-stop-looking"
 utterance = "stop looking at this agent"
 screen = "agent"
-action = "close_agent_view"
+action = "close"
 outcome = "dispatch"
 
 [[fixtures]]
-name = "close-agent-view-unavailable"
+name = "close-from-the-deck"
 utterance = "close this"
 screen = "deck"
-action = "close_agent_view"
-outcome = "unavailable"
+action = "close"
+outcome = "dispatch"
 
 # Settings is exposed only from the deck; overview and agent requests must be unavailable.
 
@@ -182,7 +189,7 @@ outcome = "no_match"
 # different screens: the availability column has no false case to probe, and
 # what is worth probing instead is that no screen changes the answer.
 #
-# `close-agent-view-stop-looking` above is the collision this row could steal —
+# `close-stop-looking` above is the collision this row could steal —
 # *"stop looking at this agent"* against *"stop listening"* — and it is left
 # exactly where it was so a wording change that blurs the two goes red there.
 
@@ -241,33 +248,71 @@ screen = "deck"
 action = "list_commands"
 outcome = "dispatch"
 
-# `dictate_to_agent` is the collision that matters most in this whole manifest,
-# and it runs in BOTH directions: a request to LOOK at an agent must not aim the
-# microphone at it, and a request to talk to one must not merely open its pane.
-# `open-agent-zoom` and `open-agent-by-state` above are the other half of that
-# pair and are deliberately left untouched, so a `description` that blurs the
-# two goes red on one side or the other.
+# The dictation pair, and the collision that matters most in this whole
+# manifest: a request to LOOK at an agent must not type into it, and a request
+# to have something typed must not merely open a pane. `open-agent-zoom` and
+# `open-agent-by-state` above are the other half of that pair and are
+# deliberately left untouched, so a `description` that blurs the two goes red on
+# one side or the other.
+#
+# **Every dictation fixture here uses an opener the LOCAL fast path does not
+# know**, which is the whole point of having them: `type`, `write`, `say` and
+# `dictate` never reach a model at all, so a fixture built on one of them would
+# prove nothing about the row's description. These are the fallback — the model
+# marking a boundary in words no list contains.
+#
+# The `dictate_prefix` column is the app's half of the bargain. It is the
+# introducing words the model must return, and the runner checks the resolved
+# param against it rather than against a free-text content: what gets typed is
+# taken from the transcript by `voice::dictation::strip_opening`, and a model
+# that marked the wrong boundary is a fixture failure rather than a silent
+# paraphrase.
 
 [[fixtures]]
-name = "dictate-type-to"
-utterance = "type to the tester"
-screen = "deck"
-action = "dictate_to_agent"
-outcome = "dispatch"
-resolved_agent = "agent-tester"
-
-[[fixtures]]
-name = "dictate-tell-that"
-utterance = "tell the reviewer that the build is green"
-screen = "overview"
-action = "dictate_to_agent"
-outcome = "dispatch"
-resolved_agent = "agent-reviewer"
-
-[[fixtures]]
-name = "dictate-talk-to-from-agent-screen"
-utterance = "I want to talk to the tester"
+name = "dictate-lets-write-a-prompt"
+utterance = "let's write a prompt run the login tests"
 screen = "agent"
 action = "dictate_to_agent"
 outcome = "dispatch"
-resolved_agent = "agent-tester"
+dictate_prefix = "let's write a prompt"
+
+[[fixtures]]
+name = "dictate-tell-it-to"
+utterance = "tell it to rebase onto main"
+screen = "agent"
+action = "dictate_to_agent"
+outcome = "dispatch"
+dictate_prefix = "tell it to"
+
+[[fixtures]]
+name = "dictate-ask-it-to"
+utterance = "ask it to summarise what it just did"
+screen = "agent"
+action = "dictate_to_agent"
+outcome = "dispatch"
+dictate_prefix = "ask it to"
+
+[[fixtures]]
+name = "dictate-unavailable"
+utterance = "let's write a prompt run the login tests"
+screen = "deck"
+action = "dictate_to_agent"
+outcome = "unavailable"
+
+# `submit_prompt` through the model rather than through the local phrase list,
+# for the reason above: `end`, `send it` and `submit` never reach a backend.
+# This is the phrasing a user reaches for that no whole-utterance list can hold.
+
+[[fixtures]]
+name = "submit-that-is-the-whole-prompt"
+utterance = "okay that's the whole prompt, send it off"
+screen = "agent"
+action = "submit_prompt"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "submit-unavailable"
+utterance = "okay that's the whole prompt, send it off"
+screen = "overview"
+action = "submit_prompt"
+outcome = "unavailable"

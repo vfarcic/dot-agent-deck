@@ -4,8 +4,8 @@
 //! # What it asserts
 //!
 //! Five things, each a cross-file consistency claim that no compiler makes,
-//! because one side is TOML, one is TypeScript and the other two are read out of
-//! a third and fourth file:
+//! because one side is TOML, one is TypeScript and the rest are read out of
+//! three further files:
 //!
 //! 1. every `invoke` in `commands.toml` names a key in `VOICE_ACTIONS`;
 //! 2. every `screens` entry is a known screen — the `kind` literals of
@@ -46,7 +46,7 @@
 //!
 //! # Budget
 //!
-//! The same as its neighbours: it reads four files and does nothing else — no
+//! The same as its neighbours: it reads five files and does nothing else — no
 //! network, no git, no subprocess, no sleep. Every input it cannot read, parse
 //! or find is a **finding**, never a skip: a required check that inspects
 //! nothing and passes reports safety it never established.
@@ -76,17 +76,23 @@ pub const REGISTRY_TS: &str = "desktop/src/lib/voiceActions.ts";
 pub const DECK_VIEW_TS: &str = "desktop/src/types.ts";
 /// Where `ParamKind` — the closed resolver set — is declared.
 pub const PARAM_KIND_RS: &str = "desktop/src-tauri/src/voice/table.rs";
-/// The voice surface, which holds the only spoken phrases the table does not
-/// own (PRD #802 D6's dictation mode).
-pub const PANEL_TSX: &str = "desktop/src/components/VoiceControlPanel.tsx";
+/// Where the only spoken phrases the model is never asked about live.
+///
+/// **It used to be the voice surface** (`VoiceControlPanel.tsx`), because the
+/// dictation MODE matched its exit phrases in the webview. The mode is gone and
+/// the two lists that replaced it sit ahead of the resolver in Rust instead, so
+/// the assertion moved with them rather than being deleted — which is the whole
+/// point of it existing.
+pub const DICTATION_RS: &str = "desktop/src-tauri/src/voice/dictation.rs";
 
-/// The row whose `description` has to name every phrase [`VOICE_OFF_LIST`]
-/// matches locally.
-const VOICE_OFF_ROW: &str = "voice_off";
-/// The panel's local `voice off` phrase list.
-const VOICE_OFF_LIST: &str = "VOICE_OFF_PHRASES";
-/// The panel's local dictation-exit phrase list.
-const EXIT_LIST: &str = "VOICE_DICTATION_EXIT_PHRASES";
+/// The row whose `description` has to name every phrase [`OPENER_LIST`] matches
+/// locally, and the row for [`SUBMIT_LIST`].
+const DICTATE_ROW: &str = "dictate_to_agent";
+const SUBMIT_ROW: &str = "submit_prompt";
+/// The fast path's dictation openers.
+const OPENER_LIST: &str = "DICTATION_OPENERS";
+/// The whole-utterance phrases that press Enter.
+const SUBMIT_LIST: &str = "SUBMIT_PHRASES";
 
 /// The rule sentence, quoted in every failure.
 ///
@@ -95,9 +101,9 @@ const EXIT_LIST: &str = "VOICE_DICTATION_EXIT_PHRASES";
 /// consistent, not that the app's capabilities are all in it.
 pub const VOICE_REGISTRY_RULE: &str = "PRD #802 check 13: `desktop/src-tauri/src/voice/commands.toml` and `VOICE_ACTIONS` \
      (`desktop/src/lib/voiceActions.ts`) must resolve against each other, and every registry entry must carry either \
-     `voice: true` or a written `no_voice` reason, and the two phrase lists in \
-     `desktop/src/components/VoiceControlPanel.tsx` must stay disjoint and covered by the `voice_off` row's \
-     description. WHAT THIS RULE DOES NOT SEE: a control wired with a bare `onClick` \
+     `voice: true` or a written `no_voice` reason, and the two locally-matched phrase lists in \
+     `desktop/src-tauri/src/voice/dictation.rs` must stay disjoint and covered by their own rows' \
+     descriptions. WHAT THIS RULE DOES NOT SEE: a control wired with a bare `onClick` \
      that never reaches the registry — 80 such sites in non-test `.tsx` when this was written — so a green check 13 is \
      NOT evidence that no capability was forgotten";
 
@@ -111,7 +117,7 @@ pub struct Sources {
     pub registry_ts: String,
     pub deck_view_ts: String,
     pub param_kind_rs: String,
-    pub panel_tsx: String,
+    pub dictation_rs: String,
 }
 
 /// Read every file and check them. Every read failure is a finding.
@@ -134,7 +140,7 @@ pub fn run(root: &Path) -> Vec<String> {
         registry_ts: read(REGISTRY_TS, &mut missing),
         deck_view_ts: read(DECK_VIEW_TS, &mut missing),
         param_kind_rs: read(PARAM_KIND_RS, &mut missing),
-        panel_tsx: read(PANEL_TSX, &mut missing),
+        dictation_rs: read(DICTATION_RS, &mut missing),
     };
     if !missing.is_empty() {
         return missing.into_iter().map(annotate).collect();
@@ -230,94 +236,106 @@ pub fn check(sources: &Sources) -> Vec<String> {
         }
     }
 
-    // Assertions 5 and 6 (PRD #802 D6): the panel's two local phrase lists.
+    // Assertions 5 and 6 (PRD #802 D6, rebuilt): the two phrase lists matched
+    // ahead of the resolver.
     //
-    // **These are the only spoken words in the product the command table does
-    // not own**, and they exist for a measured reason: while dictating, running
-    // the intent backend over every sentence would cost a model call each time
-    // and would reintroduce the false positive a distinctive phrase exists to
-    // remove. The trade is a second place where wording lives, and the whole
-    // point of this rule is that a second place does not get to drift.
+    // **These are the only spoken words in the product the model is never asked
+    // about**, and they exist for a stated reason: an utterance that opens with
+    // `type` is a dictation whatever a model would have said about it, and a
+    // whole-utterance `send it` presses Enter without spending a round trip on
+    // the question. The trade is a second place where wording lives, and the
+    // whole point of this rule is that a second place does not get to drift.
     phrase_lists(sources, &rows, &mut findings);
 
     findings.into_iter().map(annotate).collect()
 }
 
-/// Assertions 5 and 6, over the panel's local phrase lists.
+/// Assertions 5 and 6, over the phrase lists matched ahead of the resolver.
 ///
-/// **5 — every `voice off` phrase the panel matches is one the model was told
-/// about.** A phrase in the panel's list and not in the row's `description` is
-/// the worst kind of drift here: it stops dictation but is not a command
-/// outside it, so the same words work in one mode and are typed into an agent
-/// in the other, and nothing at run time would say so.
+/// **5 — every phrase matched locally is one the model was also told about.** A
+/// phrase in a list and not in its row's `description` is the worst kind of
+/// drift here: the fast path answers it and the model would not, so the same
+/// words work one way through one path and are a no-match through the other,
+/// and nothing at run time would say so. It matters in both directions now that
+/// the fast path is only an OPTIMISATION rather than the vocabulary — the
+/// fallback has to be able to reach the same row for the same words.
 ///
-/// **6 — the two lists are disjoint.** The panel checks `voice off` first and
-/// its comment says the order "decides nothing today" *because* they share no
-/// phrase. That is a claim about the implementation, so it is checked rather
-/// than asserted: a phrase added to both would make the precedence silently
-/// load-bearing, which is exactly the state that comment promises is not
-/// current.
+/// **6 — the two lists are disjoint.** The submit phrases are checked FIRST, so
+/// a phrase in both would silently make that order load-bearing: an utterance
+/// that was both an opener and a submit phrase would submit, and the list it
+/// was added to second would look like it had no effect.
 ///
-/// The check runs one way only. A phrasing in the row's `description` that the
-/// panel does not match is a real inconsistency too — it would work as a
-/// command and be typed while dictating — but the description is a PROMPT
-/// rather than a list, so there is nothing to enumerate it from without
-/// reading prose. Stated here because a reader would otherwise infer the
+/// The check runs one way only. A phrasing in a row's `description` that no
+/// list matches is not an inconsistency at all — that is precisely the
+/// fallback's job, and the openers are deliberately a fraction of what the
+/// model will accept. Stated here because the old version of this rule ran the
+/// same direction for a different reason and a reader would otherwise infer the
 /// stronger property from a green check.
 fn phrase_lists(sources: &Sources, rows: &[Row], findings: &mut Vec<String>) {
-    let text: Vec<char> = sources.panel_tsx.chars().collect();
+    let text: Vec<char> = sources.dictation_rs.chars().collect();
     let masked = mask(&text);
     let list = |name: &str, findings: &mut Vec<String>| match array_body(&masked, name) {
         Some(body) => {
             let found = string_literals(&text, &masked, body);
             if found.is_empty() {
                 findings.push(format!(
-                    "{PANEL_TSX}: `{name}` yielded no phrases — check 13 cannot compare a list it cannot read, so                      this is a failure rather than a skip"
+                    "{DICTATION_RS}: `{name}` yielded no phrases — check 13 cannot compare a list it cannot read, so \
+                     this is a failure rather than a skip"
                 ));
             }
             found
         }
         None => {
             findings.push(format!(
-                "{PANEL_TSX}: holds no `{name} = [ … ]` array literal. If the list moved, move this assertion with it                  rather than deleting it — it is the only thing keeping the panel's phrases and the `{VOICE_OFF_ROW}`                  row's description in step"
+                "{DICTATION_RS}: holds no `{name} = [ … ]` array literal. If the list moved, move this assertion with \
+                 it rather than deleting it — it is the only thing keeping the locally-matched phrases and the rows' \
+                 descriptions in step"
             ));
             BTreeSet::new()
         }
     };
-    let off = list(VOICE_OFF_LIST, findings);
-    let exit = list(EXIT_LIST, findings);
+    let openers = list(OPENER_LIST, findings);
+    let submits = list(SUBMIT_LIST, findings);
 
-    // Assertion 5.
-    match rows.iter().find(|row| row.id == VOICE_OFF_ROW) {
-        Some(row) => {
-            // Whitespace-collapsed before the substring test, because a
-            // `"""…"""` description keeps its newlines: a phrase that happened
-            // to straddle a line break would fail this check while reading
-            // perfectly to the model, so a reflow of the prose would go red for
-            // no reason anyone could act on.
-            let description = row
-                .description
-                .split_whitespace()
-                .collect::<Vec<_>>()
-                .join(" ")
-                .to_lowercase();
-            for phrase in &off {
-                if !description.contains(&phrase.to_lowercase()) {
-                    findings.push(format!(
-                        "{PANEL_TSX}: `{VOICE_OFF_LIST}` matches {phrase:?}, which the `{VOICE_OFF_ROW}` row's                          description in {COMMANDS_TOML} does not name. The model is never told about it, so those                          words stop dictation and are NOT a command outside it"
-                    ));
+    // Assertion 5, once per list against its own row.
+    for (list_name, phrases, row_id) in [
+        (OPENER_LIST, &openers, DICTATE_ROW),
+        (SUBMIT_LIST, &submits, SUBMIT_ROW),
+    ] {
+        match rows.iter().find(|row| row.id == row_id) {
+            Some(row) => {
+                // Whitespace-collapsed before the substring test, because a
+                // `"""…"""` description keeps its newlines: a phrase that
+                // happened to straddle a line break would fail this check while
+                // reading perfectly to the model, so a reflow of the prose would
+                // go red for no reason anyone could act on.
+                let description = row
+                    .description
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+                    .to_lowercase();
+                for phrase in phrases {
+                    if !description.contains(&phrase.to_lowercase()) {
+                        findings.push(format!(
+                            "{DICTATION_RS}: `{list_name}` matches {phrase:?}, which the `{row_id}` row's \
+                             description in {COMMANDS_TOML} does not name. The model is never told about it, so \
+                             those words work through the fast path and are a no-match through the model"
+                        ));
+                    }
                 }
             }
+            None => findings.push(format!(
+                "{COMMANDS_TOML}: holds no `{row_id}` row, so the phrases {DICTATION_RS} matches locally back nothing"
+            )),
         }
-        None => findings.push(format!(
-            "{COMMANDS_TOML}: holds no `{VOICE_OFF_ROW}` row, so the phrases {PANEL_TSX} matches locally back nothing"
-        )),
     }
 
     // Assertion 6.
-    for phrase in off.intersection(&exit) {
+    for phrase in openers.intersection(&submits) {
         findings.push(format!(
-            "{PANEL_TSX}: {phrase:?} is in both `{VOICE_OFF_LIST}` and `{EXIT_LIST}`. The panel checks the first              list first and says the order decides nothing BECAUSE they are disjoint; a shared phrase makes that              precedence silently load-bearing"
+            "{DICTATION_RS}: {phrase:?} is in both `{OPENER_LIST}` and `{SUBMIT_LIST}`. The submit list is checked \
+             first, so a shared phrase makes that precedence silently load-bearing"
         ));
     }
 }
@@ -1065,7 +1083,7 @@ mod tests {
             registry_ts: read(REGISTRY_TS),
             deck_view_ts: read(DECK_VIEW_TS),
             param_kind_rs: read(PARAM_KIND_RS),
-            panel_tsx: read(PANEL_TSX),
+            dictation_rs: read(DICTATION_RS),
         }
     }
 
@@ -1104,7 +1122,10 @@ mod tests {
         );
         assert_eq!(
             kinds,
-            ["agent_ref"].into_iter().map(str::to_string).collect()
+            ["agent_ref", "spoken_prefix"]
+                .into_iter()
+                .map(str::to_string)
+                .collect()
         );
         // Every row's `invoke` is classified `voice: true`, which is the state
         // assertion 4 is about.
@@ -1208,7 +1229,11 @@ mod tests {
                 "    unrelated: \"why not\",",
             );
         });
-        assert_reports(&unclassified, "`openProjects` is unclassified");
+        // Re-pointed from `openProjects` to `closeAgentView` when PRD #802's
+        // dictation rebuild folded `close_agent_view` into `close`: this plant
+        // edits the FIRST `no_voice:` in the file, and that entry is now the
+        // one the pane's X still dispatches through.
+        assert_reports(&unclassified, "`closeAgentView` is unclassified");
 
         let empty = planted(|sources| {
             sources.registry_ts =
@@ -1280,7 +1305,7 @@ mod tests {
     }
 
     /// Every input is a finding when it cannot be read, and that has to hold
-    /// for each of the four separately — a rule that goes quiet because one of
+    /// for each of the five separately — a rule that goes quiet because one of
     /// its inputs vanished is the vacuous pass this module exists to avoid.
     #[test]
     fn a_source_this_rule_cannot_read_is_a_finding_rather_than_a_skip() {
@@ -1302,32 +1327,40 @@ mod tests {
         let no_kinds = planted(|sources| sources.param_kind_rs = "pub enum Other {}".to_string());
         assert_reports(&no_kinds, "yielded no kind literals");
 
-        let no_panel =
-            planted(|sources| sources.panel_tsx = "export const OTHER = [];".to_string());
-        assert_reports(&no_panel, "holds no `VOICE_OFF_PHRASES = [");
+        let no_phrases = planted(|sources| {
+            sources.dictation_rs = "pub const OTHER: [&str; 0] = [];".to_string()
+        });
+        assert_reports(&no_phrases, "holds no `DICTATION_OPENERS = [");
     }
 
-    /// Assertions 5 and 6, the panel's local phrase lists.
+    /// Assertions 5 and 6, over the phrase lists matched ahead of the resolver.
     #[test]
     fn a_planted_phrase_the_model_was_never_told_about_is_caught() {
-        // A phrase the panel matches and the row's description does not name:
-        // it stops dictation and is NOT a command outside it, and nothing at
-        // run time would say so.
+        // A phrase the fast path matches and the row's description does not
+        // name: it dictates through one path and is a no-match through the
+        // other, and nothing at run time would say so.
         let unnamed = planted(|sources| {
-            sources.panel_tsx = sources
-                .panel_tsx
-                .replace("\"stop listening\"]", "\"stop listening\", \"shut up\"]");
+            sources.dictation_rs = sources
+                .dictation_rs
+                .replace("\"dictate\"]", "\"dictate\", \"scribble\"]");
         });
-        assert_reports(&unnamed, "\"shut up\"");
+        assert_reports(&unnamed, "\"scribble\"");
+
+        // The same for the submit list, against its own row.
+        let unnamed_submit = planted(|sources| {
+            sources.dictation_rs = sources
+                .dictation_rs
+                .replace("\"press enter\"]", "\"press enter\", \"fire away\"]");
+        });
+        assert_reports(&unnamed_submit, "\"fire away\"");
 
         // A phrase straddling a line break in the `"""…"""` description still
         // counts: the description is prose the model reads as one paragraph,
         // and a reflow must not go red.
         let reflowed = planted(|sources| {
-            sources.commands_toml = sources.commands_toml.replace(
-                "turn voice off, stop listening",
-                "turn voice off,\nstop listening",
-            );
+            sources.commands_toml = sources
+                .commands_toml
+                .replace("send it, submit it", "send it,\nsubmit it")
         });
         assert!(
             reflowed.is_empty(),
@@ -1338,28 +1371,28 @@ mod tests {
         // The same drift from the other end: the row is gone, so the phrases
         // back nothing at all.
         let no_row = planted(|sources| {
-            sources.commands_toml = sources
-                .commands_toml
-                .replace("id          = \"voice_off\"", "id          = \"voice_of\"");
-        });
-        assert_reports(&no_row, "holds no `voice_off` row");
-
-        // Assertion 6: the panel checks one list before the other and says the
-        // order decides nothing BECAUSE they are disjoint.
-        let shared = planted(|sources| {
-            sources.panel_tsx = sources.panel_tsx.replace(
-                "\"stop dictation\", ",
-                "\"stop dictation\", \"voice off\", ",
+            sources.commands_toml = sources.commands_toml.replace(
+                "id          = \"submit_prompt\"",
+                "id          = \"submit_prompts\"",
             );
+        });
+        assert_reports(&no_row, "holds no `submit_prompt` row");
+
+        // Assertion 6: the submit list is checked first, so a shared phrase
+        // makes that precedence silently load-bearing.
+        let shared = planted(|sources| {
+            sources.dictation_rs = sources
+                .dictation_rs
+                .replace("\"dictate\"]", "\"dictate\", \"submit\"]");
         });
         assert_reports(&shared, "is in both");
 
         // And the lists are genuinely read rather than assumed empty, which is
         // what would make every assertion above vacuous.
         let empty = planted(|sources| {
-            sources.panel_tsx = sources.panel_tsx.replace(
-                "export const VOICE_DICTATION_EXIT_PHRASES = [",
-                "export const VOICE_DICTATION_EXIT_PHRASES = [] as const;\nconst UNUSED = [",
+            sources.dictation_rs = sources.dictation_rs.replace(
+                "pub const DICTATION_OPENERS: [&str; 4] = [",
+                "pub const DICTATION_OPENERS: [&str; 0] = [];\nconst UNUSED: [&str; 1] = [",
             );
         });
         assert_reports(&empty, "yielded no phrases");

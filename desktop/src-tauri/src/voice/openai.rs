@@ -289,11 +289,12 @@ mod tests {
                 "open_agent",
                 "open_overview",
                 "open_deck",
-                "close_agent_view",
+                "close",
                 "open_settings",
                 "voice_off",
                 "list_commands",
                 "dictate_to_agent",
+                "submit_prompt",
                 "none"
             ]
         );
@@ -348,7 +349,14 @@ mod tests {
             schema["properties"]["params"]["properties"]["agent"]["type"],
             json!(["string", "null"])
         );
-        assert_eq!(schema["properties"]["params"]["required"], json!(["agent"]));
+        assert_eq!(
+            schema["properties"]["params"]["properties"]["prefix"]["type"],
+            json!(["string", "null"])
+        );
+        assert_eq!(
+            schema["properties"]["params"]["required"],
+            json!(["agent", "prefix"])
+        );
     }
 
     #[test]

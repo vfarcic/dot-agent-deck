@@ -52,7 +52,9 @@ use std::fmt;
 use std::time::{Duration, Instant};
 
 use dot_agent_deck_desktop::voice::{
-    NO_MATCH_ACTION, REMOTE_TIMEOUT, Screen, Transcript, VoiceOutcome, handle_utterance, table,
+    NO_MATCH_ACTION, ParamKind, REMOTE_TIMEOUT, Screen, Transcript, VoiceOutcome,
+    dictation::normalise,
+    handle_utterance, table,
     test_support::{api_preset, api_resolver, role_agent_in_state, with_tool},
 };
 use serde::Deserialize;
@@ -69,7 +71,7 @@ const REQUIRE_REAL_E2E_ENV: &str = "DOT_AGENT_DECK_REQUIRE_REAL_E2E";
 /// mechanical enforces the pairing — the preflight only knows whether the
 /// variable it was told to read is set.
 const API_KEY_ENV: &str = "OPENAI_API_KEY";
-const MIN_FIXTURE_COUNT: usize = 24;
+const MIN_FIXTURE_COUNT: usize = 30;
 const PENDING_OPEN_SETTINGS_ACTION: &str = "open_settings";
 const PER_FIXTURE_GRACE: Duration = Duration::from_secs(15);
 
@@ -89,6 +91,17 @@ struct PhraseFixture {
     outcome: OutcomeKind,
     #[serde(default)]
     resolved_agent: Option<String>,
+    /// The introducing words a dictation fixture expects the model to MARK.
+    ///
+    /// **Not the text to type**, which is the whole design: the app takes that
+    /// from the transcript itself, so there is nothing model-supplied for a
+    /// fixture to assert about it. What a fixture can check — and what this
+    /// column checks — is that the model put the boundary in the right place,
+    /// which is the only thing it is trusted with. Compared through
+    /// `voice::dictation::normalise`, because the model is quoting from prose
+    /// and its casing and punctuation are its own.
+    #[serde(default)]
+    dictate_prefix: Option<String>,
     #[serde(default)]
     pending_action: bool,
 }
@@ -183,6 +196,21 @@ fn observed(outcome: &VoiceOutcome) -> (Option<&str>, OutcomeKind, Option<&str>)
         }
         VoiceOutcome::ResolutionFailed { .. } => (None, OutcomeKind::ResolutionFailed, None),
         VoiceOutcome::TranscriptionFailed { .. } => (None, OutcomeKind::TranscriptionFailed, None),
+    }
+}
+
+/// What the model marked as the introducing words, for a dictation dispatch.
+///
+/// Read off `spoken` rather than `value`: `value` is what the app resolved the
+/// boundary TO — a slice of its own transcript — and asserting on it would
+/// check this test's own arithmetic instead of the model's answer.
+fn marked_prefix(outcome: &VoiceOutcome) -> Option<&str> {
+    match outcome {
+        VoiceOutcome::Dispatch { params, .. } => params
+            .iter()
+            .find(|param| param.kind == ParamKind::SpokenPrefix)
+            .map(|param| param.spoken.as_str()),
+        _ => None,
     }
 }
 
@@ -322,13 +350,28 @@ async fn voice_phrase_fixtures_match_the_default_backend() {
                     Some(expected) => actual_agent == Some(expected),
                     None => true,
                 };
-                if action_matches && actual_outcome == fixture.outcome && agent_matches {
+                let prefix_matches = match fixture.dictate_prefix.as_deref() {
+                    Some(expected) => marked_prefix(&answer.outcome)
+                        .is_some_and(|marked| normalise(marked) == normalise(expected)),
+                    None => true,
+                };
+                if action_matches
+                    && actual_outcome == fixture.outcome
+                    && agent_matches
+                    && prefix_matches
+                {
                     Ok(())
                 } else {
                     Err(format!(
-                        "expected action={} outcome={} resolved_agent={:?}, got action={:?} \
-                         outcome={actual_outcome} resolved_agent={actual_agent:?}",
-                        fixture.action, fixture.outcome, fixture.resolved_agent, actual_action
+                        "expected action={} outcome={} resolved_agent={:?} dictate_prefix={:?}, \
+                         got action={:?} outcome={actual_outcome} resolved_agent={actual_agent:?} \
+                         dictate_prefix={:?}",
+                        fixture.action,
+                        fixture.outcome,
+                        fixture.resolved_agent,
+                        fixture.dictate_prefix,
+                        actual_action,
+                        marked_prefix(&answer.outcome),
                     ))
                 }
             }

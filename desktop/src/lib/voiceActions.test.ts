@@ -147,11 +147,16 @@ describe("VOICE_ACTIONS", () => {
       "openAgent",
       "openOverview",
       "openDeck",
-      "closeAgentView",
+      // `closeAgentView` is deliberately NOT here any more: `close` names
+      // `closeTopmost`, which decides between the overlay and the pane and then
+      // calls the context member. The entry keeps a `no_voice` reason saying
+      // exactly that, and the total-classification loop below is what checks it.
+      "closeTopmost",
       "openSettings",
       "stopVoice",
       "showVoiceCommands",
       "dictateToAgent",
+      "submitAgentPrompt",
     ];
 
     expect(Array.isArray(VOICE_ACTIONS)).toBe(false);
@@ -336,7 +341,10 @@ describe("VOICE_ACTIONS", () => {
   /**
    * Scenario: open Planner's pane from the deck and close it from the pane.
    * The same visible round trip now used by clicks dispatches openAgent and
-   * closeAgentView, the exact ids named by the command table.
+   * closeAgentView. Only the first is named by a command-table row; the second
+   * is the pane's X, which `close` reaches through `closeTopmost` once it has
+   * decided nothing is on top of the pane — so this is the CLICK path, and it
+   * is the reason that entry still exists after the row folded away.
    */
   it("dispatches the agent-pane round trip through the two voice navigation actions", () => {
     renderDeck();

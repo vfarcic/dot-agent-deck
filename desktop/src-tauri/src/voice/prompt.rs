@@ -336,11 +336,12 @@ mod tests {
                 "open_agent".to_string(),
                 "open_overview".to_string(),
                 "open_deck".to_string(),
-                "close_agent_view".to_string(),
+                "close".to_string(),
                 "open_settings".to_string(),
                 "voice_off".to_string(),
                 "list_commands".to_string(),
                 "dictate_to_agent".to_string(),
+                "submit_prompt".to_string(),
                 "none".to_string(),
             ]
         );
@@ -353,7 +354,10 @@ mod tests {
 
     #[test]
     fn voice_prompt_param_names_are_the_union_in_table_order() {
-        assert_eq!(param_names(&commands()), vec!["agent".to_string()]);
+        assert_eq!(
+            param_names(&commands()),
+            vec!["agent".to_string(), "prefix".to_string()]
+        );
     }
 
     #[test]

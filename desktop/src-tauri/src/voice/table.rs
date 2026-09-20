@@ -63,23 +63,44 @@ impl fmt::Display for Screen {
 
 /// The closed set of resolver kinds a param can have.
 ///
-/// One entry today. It is an enum rather than a string because the kind selects
-/// a resolver — `agent_ref` resolves a spoken reference against the live agent
-/// snapshot — so an unknown kind is a row nothing can execute, which is why
+/// It is an enum rather than a string because the kind selects a resolver — so
+/// an unknown kind is a row nothing can execute, which is why
 /// [`TableError::UnknownParamKind`] refuses it at parse time instead of letting
 /// it surface at runtime as nothing happening.
+///
+/// # The two kinds resolve against different things, and that is the point of
+/// the second one
+///
+/// [`ParamKind::AgentRef`] resolves a spoken reference against **live state**:
+/// the agent snapshot decides whether *"the tester"* names one agent, none, or
+/// several. [`ParamKind::SpokenPrefix`] resolves against **the transcript
+/// itself**, and nothing else — it is the words that introduced a dictation,
+/// and what it resolves *to* is the rest of what the user said, taken verbatim
+/// from the transcript this very utterance produced.
+///
+/// **A param that is checked against the transcript is a new shape here and it
+/// is deliberate** (PRD #802 D6, rebuilt). The alternative was a free-text
+/// *content* param, which would mean the model retyping the user's words on
+/// their way into an agent's prompt. Marking a boundary is a job a model can do
+/// and be checked on; supplying the content is a job it would do and could not
+/// be checked on. So the kind exists to make the difference structural rather
+/// than a matter of care: every value of this kind goes through
+/// [`super::dictation::strip_opening`], which either finds the marked words at
+/// the front of our own transcript or refuses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ParamKind {
     AgentRef,
+    SpokenPrefix,
 }
 
 impl ParamKind {
-    pub const ALL: [ParamKind; 1] = [ParamKind::AgentRef];
+    pub const ALL: [ParamKind; 2] = [ParamKind::AgentRef, ParamKind::SpokenPrefix];
 
     pub fn as_str(self) -> &'static str {
         match self {
             ParamKind::AgentRef => "agent_ref",
+            ParamKind::SpokenPrefix => "spoken_prefix",
         }
     }
 
@@ -475,13 +496,21 @@ mod tests {
                 ("open_agent", "openAgent", vec!["deck", "overview"]),
                 ("open_overview", "openOverview", vec!["deck"]),
                 ("open_deck", "openDeck", vec!["overview"]),
-                ("close_agent_view", "closeAgentView", vec!["agent"]),
+                // No screens: callable everywhere. `close` is here because the
+                // voice surface's own overlay can be up on any of the three and
+                // `screens` cannot express "an overlay is open"; the precedence
+                // between that overlay and an agent pane is decided at dispatch.
+                ("close", "closeTopmost", vec![]),
                 ("open_settings", "openSettings", vec!["deck"]),
-                // No screens: callable everywhere. See the row's own comment —
-                // stopping must never be unavailable.
+                // No screens: see the row's own comment — stopping must never
+                // be unavailable.
                 ("voice_off", "stopVoice", vec![]),
                 ("list_commands", "showVoiceCommands", vec![]),
-                ("dictate_to_agent", "dictateToAgent", vec![]),
+                // `agent` and nothing else: the dictation pair's whole
+                // targeting rule is "the pane the user is looking at", so with
+                // no pane open there is no one agent to mean.
+                ("dictate_to_agent", "dictateToAgent", vec!["agent"]),
+                ("submit_prompt", "submitAgentPrompt", vec!["agent"]),
             ]
         );
     }
@@ -825,10 +854,7 @@ mod tests {
             .filter(|row| Screen::ALL.iter().all(|&screen| row.callable_on(screen)))
             .map(|row| row.id.as_str())
             .collect();
-        assert_eq!(
-            everywhere,
-            vec!["voice_off", "list_commands", "dictate_to_agent"]
-        );
+        assert_eq!(everywhere, vec!["close", "voice_off", "list_commands"]);
         // And every OTHER row still has both cases, which is what keeps the
         // not-here sentence reachable for the rows that can produce it.
         for row in super::table().rows() {
@@ -855,7 +881,7 @@ mod tests {
         // Pinned here rather than left to the phrase fixtures because those
         // need a credential and run in no CI, so dropping the word would go
         // unnoticed until somebody next spent a key on the suite.
-        for id in ["open_deck", "close_agent_view"] {
+        for id in ["open_deck", "close"] {
             let row = super::table().row(id).expect("a shipped row");
             assert!(
                 row.description.contains("\"go back\""),
@@ -889,10 +915,10 @@ mod tests {
             vec![
                 "open_agent",
                 "open_overview",
+                "close",
                 "open_settings",
                 "voice_off",
-                "list_commands",
-                "dictate_to_agent"
+                "list_commands"
             ]
         );
         assert_eq!(
@@ -900,18 +926,19 @@ mod tests {
             vec![
                 "open_agent",
                 "open_deck",
+                "close",
                 "voice_off",
-                "list_commands",
-                "dictate_to_agent"
+                "list_commands"
             ]
         );
         assert_eq!(
             callable(Screen::Agent),
             vec![
-                "close_agent_view",
+                "close",
                 "voice_off",
                 "list_commands",
-                "dictate_to_agent"
+                "dictate_to_agent",
+                "submit_prompt"
             ]
         );
     }

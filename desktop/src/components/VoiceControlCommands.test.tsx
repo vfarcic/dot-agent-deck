@@ -22,8 +22,8 @@ vi.mock("./TerminalViewport", () => ({
 import { DeckShell } from "../App";
 import {
   NOTHING_DISPATCHED,
-  VOICE_DICTATION_ENDED,
   VOICE_DICTATION_SEND_MS,
+  VOICE_NOTHING_TO_CLOSE,
   VOICE_DICTATION_SUBMIT,
   VOICE_DICTATION_TICK_MS,
   VOICE_STATUS_POLL_MS,
@@ -491,7 +491,7 @@ describe("the empty report row", () => {
   });
 });
 
-describe("dictating into an agent", () => {
+describe("typing into the open agent", () => {
   beforeEach(() => {
     window.localStorage.clear();
     vi.useFakeTimers();
@@ -504,40 +504,64 @@ describe("dictating into an agent", () => {
   /** The connected fixture's own deck id — the composite identity's first half. */
   const DECK_ID = createFixtureSnapshot("connected").connection.deckId ?? "";
 
-  const AIM: VoiceResolvedParamDto[] = [
+  const PLANNER: VoiceResolvedParamDto[] = [
     { name: "agent", kind: "agent_ref", spoken: "planner", value: "planner", label: "Planner" },
   ];
+  /** What the deck itself calls that agent — read from the fixture, not retyped. */
+  const PLANNER_LABEL = createFixtureSnapshot("connected").agents.find((agent) => agent.id === "planner")?.displayName ?? "";
 
   /**
-   * A resolver that answers the dictation row for the aiming phrase and would
-   * answer a navigation for anything else.
+   * One dictation outcome, shaped the way Rust shapes it.
    *
-   * The second half matters: while dictation is on, NOTHING should reach the
-   * resolver at all, so a test can assert that by the call count rather than by
-   * hoping.
+   * **`value` is the text and `spoken` is the boundary**, which is the whole
+   * bargain the rebuild rests on: the model may say where the user's words
+   * start, and the app takes the words themselves out of its own transcript.
+   * So these fixtures carry a `text` that is genuinely a suffix of the
+   * `transcript` beside it — a fixture that made one up would be testing a
+   * shape the pipeline cannot produce.
    */
-  function aiming(): ResolveVoice {
-    return vi.fn(async (utterance: string) =>
-      utterance === "type to the planner"
-        ? dispatch("dictate_to_agent", "dictateToAgent", "Typing to Planner. Say “stop dictation” when you are done.", utterance, AIM)
-        : dispatch("open_overview", "openOverview", "Opening the agent overview.", utterance));
+  function dictated(transcript: string, prefix: string): VoiceResultDto {
+    const text = transcript.slice(prefix.length).trimStart();
+    return dispatch("dictate_to_agent", "dictateToAgent", `Typed: “${text}”.`, transcript, [
+      { name: "prefix", kind: "spoken_prefix", spoken: prefix, value: text, label: text },
+    ]);
   }
 
   /**
-   * Scenario: say "type to the planner", then a sentence. The agent's pane
-   * opens, the sentence is typed into that agent's own terminal — the same path
-   * a keystroke takes — and nothing is submitted.
+   * A resolver that opens the Planner's pane first and then answers whatever
+   * the test asked for.
+   *
+   * The opening utterance is the shape the product owner asked for — *"open the
+   * tester"*, then say what you want typed — and it is a real dispatch rather
+   * than a test harness shortcut, because `screens = ["agent"]` means a
+   * dictation row cannot be dispatched until a pane is genuinely on screen.
    */
-  it("types the next utterance into the agent's terminal and submits nothing", async () => {
-    const voice = microphone(["type to the planner"]);
-    const deck = runtime(aiming(), voice);
-    render(<DeckShell runtime={deck} />);
+  function speaking(answers: Record<string, VoiceResultDto>): ResolveVoice {
+    return vi.fn(async (utterance: string) =>
+      utterance === "open the planner"
+        ? dispatch("open_agent", "openAgent", "Opening Planner.", utterance, PLANNER)
+        : (answers[utterance] ?? dispatch("open_overview", "openOverview", "Opening the agent overview.", utterance)));
+  }
 
+  async function openPlanner(voice: ReturnType<typeof microphone>) {
     await turnVoiceOn();
     await completeUtterance();
     expect(screen.getByTestId("agent-pane-overlay")).toBeInTheDocument();
+    return voice;
+  }
 
-    voice.deliver("run the login tests");
+  /**
+   * Scenario: open the Planner's pane, then say "type run the login tests". The
+   * words land in that agent's own terminal by the path a keystroke takes, and
+   * nothing is submitted.
+   */
+  it("types the words into the open agent's terminal and submits nothing", async () => {
+    const voice = microphone(["open the planner"]);
+    const deck = runtime(speaking({ "type run the login tests": dictated("type run the login tests", "type") }), voice);
+    render(<DeckShell runtime={deck} />);
+
+    await openPlanner(voice);
+    voice.deliver("type run the login tests");
     await completeUtterance();
 
     expect(deck.sendTerminalInput).toHaveBeenCalledWith({ deckId: DECK_ID, agentId: "planner" }, "run the login tests ");
@@ -546,45 +570,89 @@ describe("dictating into an agent", () => {
   });
 
   /**
-   * Scenario: while aimed, an utterance is no longer a command. The resolver is
-   * called once — for the phrase that aimed the microphone — and never again,
-   * so a sentence that happens to sound like a command is typed rather than
-   * run.
+   * Scenario: an opener no list could hold. The model marked the boundary, the
+   * app verified it against its own transcript, and what is typed is the
+   * remainder and nothing else — no "let's write a prompt" in the agent's
+   * prompt.
    */
-  it("stops resolving utterances as commands while it is aimed", async () => {
-    const voice = microphone(["type to the planner"]);
-    const resolveVoice = aiming();
-    const deck = runtime(resolveVoice, voice);
+  it("types only the remainder for an opener no list contains", async () => {
+    const voice = microphone(["open the planner"]);
+    const said = "let's write a prompt run the tests";
+    const deck = runtime(speaking({ [said]: dictated(said, "let's write a prompt") }), voice);
     render(<DeckShell runtime={deck} />);
 
-    await turnVoiceOn();
+    await openPlanner(voice);
+    voice.deliver(said);
     await completeUtterance();
 
-    voice.deliver("show me every agent");
-    await completeUtterance();
-
-    expect(resolveVoice).toHaveBeenCalledTimes(1);
-    expect(deck.sendTerminalInput).toHaveBeenCalledWith({ deckId: DECK_ID, agentId: "planner" }, "show me every agent ");
+    expect(deck.sendTerminalInput).toHaveBeenCalledWith({ deckId: DECK_ID, agentId: "planner" }, "run the tests ");
   });
 
   /**
-   * Scenario: after a dictated sentence the row shows a countdown naming the
+   * Scenario: the utterance ends in a submit phrase and is typed anyway. This
+   * is the one the product owner asked about — a trailing rule would submit
+   * *"the meeting is at the"* when somebody said *"type the meeting is at the
+   * end"*, and submitting is the last thing that happens to a prompt.
+   */
+  it("types a trailing submit phrase rather than obeying it", async () => {
+    const voice = microphone(["open the planner"]);
+    const said = "type hello end";
+    const deck = runtime(speaking({ [said]: dictated(said, "type") }), voice);
+    render(<DeckShell runtime={deck} />);
+
+    await openPlanner(voice);
+    voice.deliver(said);
+    await completeUtterance();
+
+    expect(deck.sendTerminalInput).toHaveBeenCalledWith({ deckId: DECK_ID, agentId: "planner" }, "hello end ");
+    expect(deck.sendTerminalInput).toHaveBeenCalledTimes(1);
+  });
+
+  /**
+   * Scenario: every utterance still goes through the resolver — there is no
+   * mode holding them back — so a command said after a dictated sentence is a
+   * command. That is the whole of what the rebuild bought: nothing to exit, so
+   * no exit to miss.
+   */
+  it("keeps resolving every utterance as a command", async () => {
+    const voice = microphone(["open the planner"]);
+    const said = "type run the login tests";
+    const resolveVoice = speaking({ [said]: dictated(said, "type") });
+    const deck = runtime(resolveVoice, voice);
+    render(<DeckShell runtime={deck} />);
+
+    await openPlanner(voice);
+    voice.deliver(said);
+    await completeUtterance();
+    voice.deliver("show me every agent");
+    await completeUtterance();
+
+    expect(resolveVoice).toHaveBeenCalledTimes(3);
+    expect(screen.getByTestId("voice-report")).toHaveTextContent("Opening the agent overview.");
+  });
+
+  /**
+   * Scenario: after the words are typed the row shows a countdown naming the
    * agent, it runs down a second at a time, and at zero it presses Enter in
    * that agent's prompt. Nothing is sent before the countdown has been on
    * screen for every one of those seconds.
    */
   it("counts down visibly and then submits", async () => {
-    const voice = microphone(["type to the planner"]);
-    const deck = runtime(aiming(), voice);
+    const voice = microphone(["open the planner"]);
+    const said = "type run the login tests";
+    const deck = runtime(speaking({ [said]: dictated(said, "type") }), voice);
     render(<DeckShell runtime={deck} />);
 
-    await turnVoiceOn();
-    await completeUtterance();
-    voice.deliver("run the login tests");
+    await openPlanner(voice);
+    voice.deliver(said);
     await completeUtterance();
 
     const line = screen.getByTestId("voice-dictation");
-    expect(line).toHaveTextContent("Typing to Planner");
+    /* The agent the way the DECK spells it, which with no `agent_ref` in the
+       outcome is the open pane's own display name rather than its id. A
+       countdown showing an id is where a user would fail to notice they were
+       typing into the wrong agent. */
+    expect(line).toHaveTextContent(PLANNER_LABEL);
     expect(line).toHaveTextContent("sending in 5 s");
 
     await act(async () => { await vi.advanceTimersByTimeAsync(VOICE_DICTATION_TICK_MS * 2); });
@@ -602,13 +670,13 @@ describe("dictating into an agent", () => {
    * never cut in half.
    */
   it("cancels the pending send while the user is still speaking", async () => {
-    const voice = microphone(["type to the planner"]);
-    const deck = runtime(aiming(), voice);
+    const voice = microphone(["open the planner"]);
+    const said = "type can you check";
+    const deck = runtime(speaking({ [said]: dictated(said, "type") }), voice);
     render(<DeckShell runtime={deck} />);
 
-    await turnVoiceOn();
-    await completeUtterance();
-    voice.deliver("can you check");
+    await openPlanner(voice);
+    voice.deliver(said);
     await completeUtterance();
     expect(screen.getByTestId("voice-dictation")).toHaveTextContent("sending in 5 s");
 
@@ -624,93 +692,48 @@ describe("dictating into an agent", () => {
   });
 
   /**
-   * Scenario: the exit phrase ends dictation and sends nothing — D6's "never
-   * auto-submits on exit". What is already in the prompt stays there for the
-   * user to send or edit, and the row says so.
+   * Scenario: a whole-utterance submit phrase presses Enter at once, without
+   * waiting out the countdown — the third way to send, beside the timer and the
+   * user's own keyboard.
    */
-  it("ends on the exit phrase without submitting what is typed", async () => {
-    const voice = microphone(["type to the planner"]);
-    const resolveVoice = aiming();
-    const deck = runtime(resolveVoice, voice);
+  it("submits at once when the user says so", async () => {
+    const voice = microphone(["open the planner"]);
+    const said = "type run the login tests";
+    const deck = runtime(speaking({
+      [said]: dictated(said, "type"),
+      "send it": dispatch("submit_prompt", "submitAgentPrompt", "Sent.", "send it"),
+    }), voice);
     render(<DeckShell runtime={deck} />);
 
-    await turnVoiceOn();
+    await openPlanner(voice);
+    voice.deliver(said);
     await completeUtterance();
-    voice.deliver("run the login tests");
-    await completeUtterance();
-
-    voice.deliver("Stop dictation.");
+    voice.deliver("send it");
     await completeUtterance();
 
+    expect(deck.sendTerminalInput).toHaveBeenLastCalledWith({ deckId: DECK_ID, agentId: "planner" }, VOICE_DICTATION_SUBMIT);
+    expect(deck.sendTerminalInput).toHaveBeenCalledTimes(2);
+    // The countdown is gone, so the timer cannot press Enter a second time
+    // into whatever the agent printed in the meantime.
     expect(screen.queryByTestId("voice-dictation")).toBeNull();
-    expect(screen.getByTestId("voice-report")).toHaveTextContent(VOICE_DICTATION_ENDED);
-    // One call, and it is the text — no carriage return followed it.
-    expect(deck.sendTerminalInput).toHaveBeenCalledTimes(1);
-    // And voice is still on, listening for commands again.
-    expect(voiceButton()).toHaveAttribute("aria-pressed", "true");
-    voice.deliver("show me every agent");
-    await completeUtterance();
-    expect(resolveVoice).toHaveBeenCalledTimes(2);
-  });
-
-  /**
-   * Scenario: the false positive D6 names. An utterance that merely CONTAINS
-   * the exit phrase is typed, not obeyed — only an utterance that is the phrase
-   * ends anything, which is what makes a distinctive phrase worth having.
-   */
-  it("does not exit on an utterance that merely contains the phrase", async () => {
-    const voice = microphone(["type to the planner"]);
-    const deck = runtime(aiming(), voice);
-    render(<DeckShell runtime={deck} />);
-
-    await turnVoiceOn();
-    await completeUtterance();
-
-    voice.deliver("we should stop dictation of the log at some point");
-    await completeUtterance();
-
-    expect(screen.getByTestId("voice-dictation")).toBeInTheDocument();
-    expect(deck.sendTerminalInput).toHaveBeenCalledWith({ deckId: DECK_ID, agentId: "planner" }, "we should stop dictation of the log at some point ");
-  });
-
-  /**
-   * Scenario: "voice off" while dictating ends everything — dictation and the
-   * microphone. That is the precedence this surface chose: the bigger stop
-   * wins, because the failure it avoids is a user who believes the microphone
-   * is off while it is open.
-   */
-  it("ends dictation AND the microphone on voice off", async () => {
-    const voice = microphone(["type to the planner"]);
-    const deck = runtime(aiming(), voice);
-    render(<DeckShell runtime={deck} />);
-
-    await turnVoiceOn();
-    await completeUtterance();
-
-    voice.deliver("voice off");
-    await completeUtterance();
-
-    expect(screen.queryByTestId("voice-dictation")).toBeNull();
-    expect(voice.voiceCancel).toHaveBeenCalled();
-    expect(voiceButton()).toHaveAttribute("aria-pressed", "false");
+    await act(async () => { await vi.advanceTimersByTimeAsync(VOICE_DICTATION_SEND_MS * 2); });
+    expect(deck.sendTerminalInput).toHaveBeenCalledTimes(2);
   });
 
   /**
    * Scenario: the non-voice escape, and the one that works when nothing is
-   * being heard correctly — including after a MISSED exit, where the phrase
-   * went into the agent's prompt instead of ending dictation. Pressing Voice
-   * calls off the pending send, so the mistake is still sitting in an input the
-   * user can edit rather than already sent.
+   * being heard correctly. Pressing Voice calls off the pending send, so a
+   * mis-transcribed sentence is still sitting in an input the user can edit
+   * rather than already sent.
    */
-  it("the Voice button ends dictation and calls off the pending send", async () => {
-    const voice = microphone(["type to the planner"]);
-    const deck = runtime(aiming(), voice);
+  it("the Voice button calls off the pending send", async () => {
+    const voice = microphone(["open the planner"]);
+    const said = "type run the login tests";
+    const deck = runtime(speaking({ [said]: dictated(said, "type") }), voice);
     render(<DeckShell runtime={deck} />);
 
-    await turnVoiceOn();
-    await completeUtterance();
-    // The missed exit: heard as something else, so it is typed.
-    voice.deliver("stop dictating please");
+    await openPlanner(voice);
+    voice.deliver(said);
     await completeUtterance();
     expect(screen.getByTestId("voice-dictation")).toHaveTextContent("sending in 5 s");
 
@@ -726,18 +749,169 @@ describe("dictating into an agent", () => {
    * Scenario: a transcript carrying a carriage return would submit the prompt
    * the moment it was written. Every control character becomes a space, so the
    * countdown stays the only thing that can press Enter.
+   *
+   * **This is the one transformation between the transcript and the agent**,
+   * and the test beside it (`types the words into the open agent's terminal`)
+   * is what pins that it is identity for everything else.
    */
   it("never lets a transcript submit the prompt by itself", async () => {
-    const voice = microphone(["type to the planner"]);
-    const deck = runtime(aiming(), voice);
+    const voice = microphone(["open the planner"]);
+    const said = "type run the tests\r\nrm -rf /";
+    const deck = runtime(speaking({ [said]: dictated(said, "type") }), voice);
+    render(<DeckShell runtime={deck} />);
+
+    await openPlanner(voice);
+    voice.deliver(said);
+    await completeUtterance();
+
+    expect(deck.sendTerminalInput).toHaveBeenCalledWith({ deckId: DECK_ID, agentId: "planner" }, "run the tests rm -rf / ");
+  });
+
+  /**
+   * Scenario: the refusal that protects the user's words. Rust answers
+   * `param_unresolved` when the boundary the model marked is not how the
+   * utterance started — nothing is typed, and the row says so rather than
+   * typing the model's guess.
+   */
+  it("types nothing when the marked boundary did not verify", async () => {
+    const voice = microphone(["open the planner"]);
+    const said = "run the login tests";
+    const refusal: VoiceResultDto = {
+      resolveMs: 21,
+      backend: "stub",
+      outcome: {
+        kind: "param_unresolved",
+        transcript: said,
+        action: "dictate_to_agent",
+        param: "prefix",
+        spoken: "please type",
+        sentence: "Heard: “run the login tests” — “please type” is not how that started, so nothing was typed.",
+      },
+    };
+    const deck = runtime(speaking({ [said]: refusal }), voice);
+    render(<DeckShell runtime={deck} />);
+
+    await openPlanner(voice);
+    voice.deliver(said);
+    await completeUtterance();
+
+    expect(deck.sendTerminalInput).not.toHaveBeenCalled();
+    expect(screen.getByTestId("voice-report")).toHaveTextContent("nothing was typed");
+    expect(screen.queryByTestId("voice-dictation")).toBeNull();
+  });
+});
+
+describe("closing what is on top", () => {
+  beforeEach(() => {
+    window.localStorage.clear();
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  const PLANNER: VoiceResolvedParamDto[] = [
+    { name: "agent", kind: "agent_ref", spoken: "planner", value: "planner", label: "Planner" },
+  ];
+
+  const CLOSE = dispatch("close", "closeTopmost", "Closed.", "close this");
+
+  function closing(): ResolveVoice {
+    return vi.fn(async (utterance: string) => {
+      if (utterance === "open the planner") return dispatch("open_agent", "openAgent", "Opening Planner.", utterance, PLANNER);
+      if (utterance === "what can I say?") return dispatch("list_commands", "showVoiceCommands", "Here is what you can say.", utterance);
+      return CLOSE;
+    });
+  }
+
+  /** A runtime that can actually LIST something, so the overlay opens. */
+  function closingDeck(voice: VoiceControls) {
+    return runtime(closing(), voice, { voiceCommands: vi.fn(async () => []) });
+  }
+
+  /**
+   * Scenario: the overlay is opened by voice and closed by voice — the defect
+   * this row was added for. Before it, the list could only be dismissed by a
+   * click or Escape, which breaks the premise of a hands-free surface.
+   */
+  it("dismisses the discovery overlay", async () => {
+    const voice = microphone(["what can I say?"]);
+    const deck = closingDeck(voice);
+    render(<DeckShell runtime={deck} />);
+
+    await turnVoiceOn();
+    await completeUtterance();
+    expect(screen.getByTestId("voice-help")).toBeInTheDocument();
+
+    voice.deliver("close this");
+    await completeUtterance();
+
+    expect(screen.queryByTestId("voice-help")).toBeNull();
+  });
+
+  /**
+   * Scenario: with no overlay up, the same word closes the agent's pane. The
+   * precedence is decided at dispatch because *"an overlay is open"* is not a
+   * screen — and this is the "otherwise" half of it.
+   */
+  it("closes the agent view when no overlay is up", async () => {
+    const voice = microphone(["open the planner"]);
+    const deck = closingDeck(voice);
+    render(<DeckShell runtime={deck} />);
+
+    await turnVoiceOn();
+    await completeUtterance();
+    expect(screen.getByTestId("agent-pane-overlay")).toBeInTheDocument();
+
+    voice.deliver("close this");
+    await completeUtterance();
+
+    expect(screen.queryByTestId("agent-pane-overlay")).toBeNull();
+  });
+
+  /**
+   * Scenario: the overlay wins over the pane, which is the ordering the whole
+   * row is about — closing the pane underneath an open overlay would leave the
+   * thing the user was looking at still on screen.
+   */
+  it("takes the overlay before the pane, and then the pane", async () => {
+    const voice = microphone(["open the planner"]);
+    const deck = closingDeck(voice);
+    render(<DeckShell runtime={deck} />);
+
+    await turnVoiceOn();
+    await completeUtterance();
+    voice.deliver("what can I say?");
+    await completeUtterance();
+    expect(screen.getByTestId("voice-help")).toBeInTheDocument();
+    expect(screen.getByTestId("agent-pane-overlay")).toBeInTheDocument();
+
+    voice.deliver("close this");
+    await completeUtterance();
+    expect(screen.queryByTestId("voice-help")).toBeNull();
+    expect(screen.getByTestId("agent-pane-overlay")).toBeInTheDocument();
+
+    voice.deliver("close this");
+    await completeUtterance();
+    expect(screen.queryByTestId("agent-pane-overlay")).toBeNull();
+  });
+
+  /**
+   * Scenario: nothing is on top, so the row reports that rather than claiming a
+   * close. The row is callable everywhere — the overlay can be up on any screen
+   * — so Rust cannot render a not-here refusal for it, and the honest answer is
+   * the surface's own sentence.
+   */
+  it("says so when there is nothing to close", async () => {
+    const voice = microphone(["close this"]);
+    const deck = closingDeck(voice);
     render(<DeckShell runtime={deck} />);
 
     await turnVoiceOn();
     await completeUtterance();
 
-    voice.deliver("run the tests\r\nrm -rf /");
-    await completeUtterance();
-
-    expect(deck.sendTerminalInput).toHaveBeenCalledWith({ deckId: DECK_ID, agentId: "planner" }, "run the tests rm -rf / ");
+    expect(screen.getByTestId("voice-report")).toHaveTextContent(VOICE_NOTHING_TO_CLOSE);
+    expect(screen.queryByTestId("agent-pane-overlay")).toBeNull();
   });
 });

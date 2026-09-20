@@ -243,7 +243,9 @@ export const VOICE_EMPTY_STATE = "Say “what can I say?” for the list, or “
  * It is never reached silently. The countdown is on screen for every one of
  * these seconds and any speech at all resets it — see {@link VOICE_DICTATION_
  * TICK_MS} for how that is noticed, which is the part that makes the number
- * safe to tune rather than the number itself.
+ * safe to tune rather than the number itself. It is also not the only way to
+ * send: a whole-utterance submit phrase does it at once, and so does the user
+ * pressing Enter in the prompt they are looking at.
  */
 export const VOICE_DICTATION_SEND_MS = 5_000;
 
@@ -251,74 +253,22 @@ export const VOICE_DICTATION_SEND_MS = 5_000;
 export const VOICE_DICTATION_TICK_MS = 1_000;
 
 /**
- * What ends dictation, said out loud.
- *
- * **Matched EXACTLY, against the whole normalised transcript, and never as a
- * substring** — which is the entire defence against the false positive PRD #802
- * D6 names: *"we should stop dictation of the log"* is a sentence somebody may
- * really want typed, and a substring rule would truncate them mid-thought and
- * silently stop listening to them. Whole-utterance equality means only an
- * utterance that IS the phrase ends anything.
- *
- * **Matched here rather than by the intent backend, and that is a deliberate
- * trade rather than a shortcut.** Running the resolver over every dictated
- * sentence would cost a model call per sentence — 0.62-1.03 s on the measured
- * backends, and money — and would reintroduce the exact failure the phrase's
- * distinctiveness is meant to remove: a model asked *"was that the exit?"* can
- * be wrong, where `===` cannot. The cost of matching here is that these phrases
- * are a list in this file rather than a row in the table, and so are the only
- * spoken words in the product the command table does not own. They are written
- * down in one place, they are tested by value, and the row's own `report`
- * sentence teaches the phrase at the moment dictation starts.
- *
- * Three spellings rather than one, because a transcriber picks among them
- * freely and a user who said the right thing must not be told they did not.
- */
-export const VOICE_DICTATION_EXIT_PHRASES = ["stop dictation", "end dictation", "stop dictating"] as const;
-
-/**
- * What ends EVERYTHING while dictating — the `voice_off` row's phrases, matched
- * the same way and checked first.
- *
- * **The precedence is deliberate and it is the safe direction.** The exit
- * phrase ends dictation and leaves the microphone open; this closes the
- * microphone as well. The two lists share no phrase, so the order decides
- * nothing today — but if one utterance ever satisfied both, treating it as the
- * bigger stop is the only reading that cannot leave a live microphone after a
- * user asked for it to stop. A user who meant the smaller one says four words
- * and presses a button; a user who meant the bigger one and got the smaller has
- * a microphone they believe is off.
- *
- * It is a second copy of wording that also lives in `commands.toml`, and the
- * duplication is the price of the trade above: a dictated sentence must not
- * cost a model call. The row is what answers *"voice off"* when NOT dictating,
- * and the two must be kept saying the same thing — which the phrase fixtures
- * check from one side and this file's tests from the other.
- */
-export const VOICE_OFF_PHRASES = ["voice off", "turn off the voice", "turn voice off", "stop voice", "stop voice control", "stop listening"] as const;
-
-/**
- * One transcript, reduced to the form the phrase lists are compared against.
- *
- * Case, punctuation and spacing are all things a transcriber decides for
- * itself — *"Stop dictation."*, *"stop dictation"* and *"stop, dictation"* are
- * the same four syllables — so comparing raw text would make the exit phrase a
- * lottery on the backend's punctuation model. Everything that is not a letter
- * or a digit becomes a space, runs of space collapse, and the ends are trimmed.
- */
-export function spokenPhrase(transcript: string): string {
-  return transcript.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim();
-}
-
-/**
  * What actually gets typed into the agent, for one utterance.
  *
  * **Every control and format character becomes a space, and a carriage return
- * is the one that matters**: a transcript carrying `\r` or `\n` would SUBMIT
- * the agent's prompt the moment it was written, which is precisely the silent
- * auto-submit this whole countdown exists to prevent. Format characters go with
- * them because a bidi override in a prompt is text that reads as one thing and
- * says another.
+ * is the one that matters**: text carrying `\r` or `\n` would SUBMIT the
+ * agent's prompt the moment it was written, which is precisely the silent
+ * auto-submit the countdown exists to prevent. Format characters go with them
+ * because a bidi override in a prompt is text that reads as one thing and says
+ * another.
+ *
+ * **This is the ONLY transformation between the transcript and the agent, and
+ * it is identity for every transcript a transcriber produces.** The words
+ * arrive already sliced out of the transcript Rust-side
+ * (`voice::dictation::strip_opening`), so what is left to do here is the
+ * terminal-safety scrub and nothing else — no trimming of the user's own
+ * spacing, no case folding, no rewording. A transcript with no control
+ * characters in it reaches the agent byte for byte.
  *
  * A single trailing space so consecutive utterances do not run together — the
  * agent's input is being appended to, not replaced.
@@ -338,20 +288,35 @@ export function dictationText(transcript: string): string {
  */
 export const VOICE_DICTATION_SUBMIT = "\r";
 
-/** What the report says when dictation ended because the user said so. */
-export const VOICE_DICTATION_ENDED = "Dictation off. Anything still in the prompt is yours to send or edit.";
+/**
+ * What the report says when `close` was said and nothing was on top.
+ *
+ * A surface sentence, because only the surface knows the answer: the overlay it
+ * owns is a `useState` boolean that no table column can see, and Rust cannot
+ * render a not-here refusal for a row that is callable everywhere. It says what
+ * was true rather than that something failed — there was nothing to close, and
+ * the screen is where the user left it.
+ */
+export const VOICE_NOTHING_TO_CLOSE = "Nothing to close — this is the screen itself.";
 
 /** The voice half of the runtime, which a runtime may not have at all. */
 type Voice = Pick<DeckRuntimeState, "declareVoiceScreen" | "resolveVoice" | "voiceCommands" | "voiceStart" | "voiceStop" | "voiceStatus" | "voiceCancel" | "sendTerminalInput">;
 
 /**
- * Which agent the microphone is aimed at while dictating (PRD #802 D6).
+ * Whose prompt has words in it that nobody has sent yet (PRD #802 D6, rebuilt).
+ *
+ * **This is not a mode and the difference is the whole rebuild.** The old
+ * `Dictation` meant *the microphone is aimed here and every utterance is
+ * typed*; this means only *these words were typed and a countdown is running*.
+ * Nothing about it changes how the next utterance is judged — it goes through
+ * the resolver like any other — so there is no exit to miss and no false
+ * positive that can truncate somebody mid-sentence.
  *
  * The composite identity, never the bare agent id: ids collide across decks,
  * and typing a user's words into the wrong machine's namesake is the worst
  * version of that collision this app has.
  */
-type Dictation = { deckId: string; agentId: string; label: string };
+type Pending = { deckId: string; agentId: string; label: string };
 
 /**
  * What the surface is doing, which is not the same as whether voice is ON.
@@ -558,18 +523,17 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel }: Voic
   const setPhase = useCallback((next: VoicePhase) => { phaseRef.current = next; setPhaseState(next); }, []);
 
   /**
-   * Which agent the microphone is aimed at, or `undefined` for none
-   * (PRD #802 D6).
+   * Whose prompt is waiting to be sent, or `undefined` for none
+   * (PRD #802 D6, rebuilt).
    *
    * Mirrored into a ref and written through a setter for the reason the two
-   * toggles above are: the cycle reads it BETWEEN its own awaits — after a
-   * transcription comes back, to decide whether this utterance is a command or
-   * something to type — and a `useState` value captured in that closure is
-   * whatever it was when the closure was built.
+   * toggles above are: the poll and the cycle read it BETWEEN their own awaits,
+   * and a `useState` value captured in one of those closures is whatever it was
+   * when the closure was built.
    */
-  const [dictation, setDictationState] = useState<Dictation>();
-  const dictationRef = useRef<Dictation | undefined>(undefined);
-  const setDictation = useCallback((next?: Dictation) => { dictationRef.current = next; setDictationState(next); }, []);
+  const [pending, setPendingState] = useState<Pending>();
+  const pendingRef = useRef<Pending | undefined>(undefined);
+  const setPending = useCallback((next?: Pending) => { pendingRef.current = next; setPendingState(next); }, []);
   /** Seconds left before the typed text is sent, or `undefined` for no pending send. */
   const [sendIn, setSendIn] = useState<number>();
   const sendTimer = useRef<number | undefined>(undefined);
@@ -772,7 +736,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel }: Voic
    * `submit_text`, which types AND submits in one guarded call and would make
    * the text invisible until it was already gone.
    */
-  const submitDictation = useCallback(async (aim: Dictation) => {
+  const submitDictation = useCallback(async (aim: Pending) => {
     try {
       await sendTerminalInput({ deckId: aim.deckId, agentId: aim.agentId }, VOICE_DICTATION_SUBMIT);
     } catch (cause) {
@@ -789,7 +753,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel }: Voic
    * both redraws and decides, so the two cannot disagree about how long is
    * left.
    */
-  const armSend = useCallback((aim: Dictation) => {
+  const armSend = useCallback((aim: Pending) => {
     cancelPendingSend();
     let left = Math.max(1, Math.round(VOICE_DICTATION_SEND_MS / VOICE_DICTATION_TICK_MS));
     setSendIn(left);
@@ -800,9 +764,10 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel }: Voic
         return;
       }
       cancelPendingSend();
+      setPending(undefined);
       void submitDictation(aim);
     }, VOICE_DICTATION_TICK_MS);
-  }, [cancelPendingSend, submitDictation]);
+  }, [cancelPendingSend, setPending, submitDictation]);
 
   /* A pending send must not survive this panel. The timer is a window timer and
      would otherwise keep running with nothing behind it. */
@@ -877,68 +842,6 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel }: Voic
   }, [declareVoiceScreen, onDispatch, resolveVoice, setPhase]);
 
   /**
-   * One transcript, while the microphone is AIMED at an agent (PRD #802 D6).
-   *
-   * Three outcomes, in this order, and the order is the precedence decision:
-   *
-   * 1. **`voice off`** ends everything — dictation and the microphone. Checked
-   *    first because stopping must never be the thing that loses a race; see
-   *    {@link VOICE_OFF_PHRASES}.
-   * 2. **the exit phrase** ends dictation and leaves voice listening for
-   *    commands. It does NOT send what is already typed: *"never auto-submits
-   *    on exit"* is D6's own requirement, so the words stay in the prompt for
-   *    the user to send or edit.
-   * 3. **anything else** is typed into the agent's visible prompt, and the
-   *    countdown to a send is armed — or re-armed, which is what makes a second
-   *    sentence extend the first rather than race it.
-   *
-   * **The missed exit — the transcriber hearing something else, so the phrase
-   * lands in the prompt — is handled by what this does NOT do.** Nothing is
-   * submitted for {@link VOICE_DICTATION_SEND_MS}, the countdown says so, and
-   * the words are in an input the user is looking at. They see *stop dictation*
-   * arrive in the prompt and press the Voice button, which cancels the send and
-   * leaves the text there to fix. That is the whole reason the text goes
-   * somewhere visible instead of into a buffer.
-   */
-  const dictateOne = useCallback(async (transcript: string, aim: Dictation, ours: () => boolean) => {
-    const phrase = spokenPhrase(transcript);
-    if ((VOICE_OFF_PHRASES as readonly string[]).includes(phrase)) {
-      cancelPendingSend();
-      setDictation(undefined);
-      /* Through the registry entry, exactly as the button and the row do.
-         Saying it while dictating must not be a third way to stop. */
-      VOICE_ACTIONS.stopVoice.run({ stopVoice: stopVoiceRef.current });
-      return;
-    }
-    if ((VOICE_DICTATION_EXIT_PHRASES as readonly string[]).includes(phrase)) {
-      cancelPendingSend();
-      setDictation(undefined);
-      setProblem(VOICE_DICTATION_ENDED);
-      return;
-    }
-    const typed = dictationText(transcript);
-    // Nothing to type. The transcription stage already refuses silence, so this
-    // is the residual — a transcript that was nothing but control characters —
-    // and typing an empty string would arm a send for no reason.
-    if (typed === "") return;
-    try {
-      await sendTerminalInput({ deckId: aim.deckId, agentId: aim.agentId }, typed);
-    } catch (cause) {
-      if (!ours()) return;
-      /* The words did not reach the agent. Dictation ends rather than
-         continuing to aim at a pane that is not accepting them — an aimed
-         microphone whose words go nowhere is the silent failure this surface
-         must not have. */
-      cancelPendingSend();
-      setDictation(undefined);
-      setProblem(sentenceOf(cause));
-      return;
-    }
-    if (!ours()) return;
-    armSend(aim);
-  }, [armSend, cancelPendingSend, sendTerminalInput, setDictation]);
-
-  /**
    * One whole utterance: close the device, transcribe, resolve, listen again.
    *
    * Serial on purpose — the microphone is shut while the backends are working
@@ -956,29 +859,29 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel }: Voic
        longer the whole of what the user said. The poll below cancels on SPEECH,
        which covers the sentence still being spoken; this covers the gap between
        that sentence ending and its text being appended, during which the poll
-       returns early because the phase is no longer `listening`. */
-    if (dictationRef.current) cancelPendingSend();
+       returns early because the phase is no longer `listening`.
+
+       Unconditional, where it used to ask whether dictation was on: there is no
+       mode to ask about any more, and a pending send is a pending send whatever
+       the next utterance turns out to be. */
+    cancelPendingSend();
     setPhase("transcribing");
     try {
       const transcription = await voiceStop();
       if (!ours()) return;
       setCapture(transcription.outcome.sentence);
-      if (transcription.outcome.kind === "heard") {
-        /* The fork this whole mode is: aimed at an agent, an utterance is
-           something to type; otherwise it is something to resolve. Read from
-           the ref rather than the state for the reason the ref exists — this
-           is after an await. */
-        const aim = dictationRef.current;
-        if (aim) await dictateOne(transcription.outcome.transcript, aim, ours);
-        else await resolveOne(transcription.outcome.transcript, ours);
-      }
+      /* **One path, where there used to be a fork.** An utterance is resolved,
+         full stop. Whether it ends up typed into an agent is the resolver's
+         answer — `dictate_to_agent` is a row like any other — rather than a
+         mode this surface was holding. */
+      if (transcription.outcome.kind === "heard") await resolveOne(transcription.outcome.transcript, ours);
     } catch (cause) {
       if (!ours()) return;
       setProblem(sentenceOf(cause));
     }
     if (!ours()) return;
     await listen(ours);
-  }, [cancelPendingSend, claim, dictateOne, forget, listen, resolveOne, setPhase, voiceStop]);
+  }, [cancelPendingSend, claim, forget, listen, resolveOne, setPhase, voiceStop]);
 
   /** The capped utterance: thrown away unheard, and said so. See {@link VOICE_CAP_DISCARDED}. */
   const discardCapped = useCallback(async () => {
@@ -1029,7 +932,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel }: Voic
       new utterance is appended, which is the moment there is something new to
       send.
     */
-    if (dictationRef.current && status.speech && sendTimer.current !== undefined) cancelPendingSend();
+    if (pendingRef.current && status.speech && sendTimer.current !== undefined) cancelPendingSend();
     if (status.capped) {
       await discardCapped();
       return;
@@ -1157,11 +1060,11 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel }: Voic
    * microphone may still be open if it never does.
    */
   const turnOff = useCallback(async () => {
-    /* The non-voice escape from dictation, and the one that works when nothing
-       is being heard correctly. Cleared before the release rather than after,
-       so a pending send cannot fire during it. */
+    /* The non-voice escape from a pending send, and the one that works when
+       nothing is being heard correctly. Cleared before the release rather than
+       after, so a pending send cannot fire during it. */
     cancelPendingSend();
-    setDictation(undefined);
+    setPending(undefined);
     /* The webview half of the same release. `voiceCancel` frees the DEVICE;
        this frees the pipeline behind it, which the device has no say over — a
        transcription or a resolution already handed to a backend arrives
@@ -1199,7 +1102,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel }: Voic
        handler routes `unreleased` here), and without this the button would fall
        back to `Voice…` after a release that actually succeeded. */
     setKnown(true);
-  }, [cancelPendingSend, claim, releasedAfterRefusal, setDictation, setOn, setPhase, voiceCancel]);
+  }, [cancelPendingSend, claim, releasedAfterRefusal, setOn, setPending, setPhase, voiceCancel]);
 
   /**
    * What the discovery overlay is showing, or `undefined` for closed
@@ -1257,27 +1160,56 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel }: Voic
    * refusal sentence, exactly as it does for a press.
    */
   const stopVoice = useCallback(() => { void turnOff(); }, [turnOff]);
-  /*
-    `dictateOne` says "voice off" through the registry, and it is defined ABOVE
-    `turnOff` — so it reaches the current `stopVoice` through a ref rather than
-    through a closure it could not have. Written from an effect for the reason
-    `screenRef` is: a ref mutated during render is a write React may discard.
-  */
-  const stopVoiceRef = useRef(stopVoice);
-  useEffect(() => { stopVoiceRef.current = stopVoice; }, [stopVoice]);
-
   /**
-   * Aim the microphone at one agent (PRD #802 D6).
+   * Type one utterance's words into the open agent's prompt, then start the
+   * countdown to a send (PRD #802 D6, rebuilt).
+   *
+   * **The text on the target is the user's own, and this file does not choose
+   * it.** It was sliced out of the transcript by `voice::dictation` after the
+   * marked boundary had been verified against that same transcript, so the only
+   * thing left to do to it here is {@link dictationText}'s terminal-safety
+   * scrub — which is identity for anything a transcriber produces.
    *
    * The label falls back to the agent id, which is what the surface has when a
    * dispatch carried no resolved label. Naming it badly is better than naming
    * it nothing: the countdown line has to say WHOSE prompt is about to be sent
    * to, and an unnamed one is the case where a user most needs to check.
+   *
+   * A failure ends the pending send rather than leaving a countdown over words
+   * that never arrived — an agent's prompt this surface believes it has typed
+   * into and has not is the silent failure it must not have.
    */
-  const startDictation = useCallback((target: VoiceDispatchTarget) => {
+  const typeIntoAgent = useCallback((target: VoiceDispatchTarget) => {
+    const aim: Pending = { deckId: target.deckId, agentId: target.agentId, label: target.agentLabel ?? target.agentId };
+    const typed = dictationText(target.text ?? "");
+    /* Nothing to type. Rust refuses an empty remainder before it ever becomes a
+       dispatch, so this is the residual — text that was nothing but control
+       characters — and arming a send for it would press Enter on a prompt
+       nobody added to. */
+    if (typed === "") return;
     cancelPendingSend();
-    setDictation({ deckId: target.deckId, agentId: target.agentId, label: target.agentLabel ?? target.agentId });
-  }, [cancelPendingSend, setDictation]);
+    void sendTerminalInput({ deckId: aim.deckId, agentId: aim.agentId }, typed).then(
+      () => { setPending(aim); armSend(aim); },
+      (cause) => { setPending(undefined); setProblem(sentenceOf(cause)); },
+    );
+  }, [armSend, cancelPendingSend, sendTerminalInput, setPending]);
+
+  /**
+   * Press Enter in the open agent's prompt, because the user said to.
+   *
+   * The third way to send, beside the countdown and the user's own keyboard.
+   * It cancels the countdown first: a submit that raced its own timer would
+   * press Enter twice, and the second one lands in whatever the agent printed
+   * in between.
+   */
+  const submitAgentPrompt = useCallback((target: VoiceDispatchTarget) => {
+    cancelPendingSend();
+    setPending(undefined);
+    void submitDictation({ deckId: target.deckId, agentId: target.agentId, label: target.agentLabel ?? target.agentId });
+  }, [cancelPendingSend, setPending, submitDictation]);
+
+  /** Say there was nothing on top to close. See {@link VOICE_NOTHING_TO_CLOSE}. */
+  const reportNothingToClose = useCallback(() => setProblem(VOICE_NOTHING_TO_CLOSE), []);
 
   /*
     PRD #802 — publish the members only this surface can serve, so a row naming
@@ -1300,9 +1232,19 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel }: Voic
        Publishing it regardless would open an overlay that has to explain its
        own emptiness — a sentence this file would have to write — where leaving
        it out gets the refusal the surface already renders. */
-    const published: Partial<VoicePanelContext> = voiceCommands
-      ? { stopVoice, showVoiceCommands, startDictation }
-      : { stopVoice, startDictation };
+    const published: Partial<VoicePanelContext> = {
+      stopVoice,
+      typeIntoAgent,
+      submitAgentPrompt,
+      reportNothingToClose,
+      ...(voiceCommands ? { showVoiceCommands } : {}),
+      /* PRD #802 — published only while the overlay is OPEN, and that is how
+         "an overlay is open" reaches a dispatch at all: it is a `useState`
+         boolean here and `screens` draws on `DeckView`, so the fact cannot be a
+         column. `closeTopmost` reads its presence, which is why this must not
+         become an always-published no-op. */
+      ...(vocabulary !== undefined ? { dismissVoiceOverlay: closeVocabulary } : {}),
+    };
     channel.current = published;
     return () => { channel.current = undefined; };
   });
@@ -1321,8 +1263,8 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel }: Voic
     between utterances too, which is right: it is a label for an empty row
     rather than a first-run tutorial.
   */
-  const emptyState = indicator === "on" && dictation === undefined && problem === undefined && capture === undefined && result === undefined;
-  const reporting = note !== undefined || dictation !== undefined || problem !== undefined || capture !== undefined || result !== undefined;
+  const emptyState = indicator === "on" && pending === undefined && problem === undefined && capture === undefined && result === undefined;
+  const reporting = note !== undefined || pending !== undefined || problem !== undefined || capture !== undefined || result !== undefined;
 
   return (
     /*
@@ -1460,13 +1402,14 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel }: Voic
               region: this changes every second, and a polite live region that
               re-announced the whole report each tick would be unusable.
             */}
-            {dictation && (
+            {pending && (
               <p className="voice-dictation" data-testid="voice-dictation" role="timer">
-                {"Typing to "}
-                {displayText(dictation.label, DISPLAY_LIMITS.name)}
+                {"In "}
+                {displayText(pending.label, DISPLAY_LIMITS.name)}
+                {"'s prompt"}
                 {sendIn === undefined
-                  ? " — keep talking."
-                  : ` — sending in ${sendIn} s. Keep talking to cancel.`}
+                  ? " — yours to send or edit."
+                  : ` — sending in ${sendIn} s. Keep talking to cancel, or say “send it”.`}
               </p>
             )}
             {/*

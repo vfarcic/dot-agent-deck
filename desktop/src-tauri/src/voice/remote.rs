@@ -629,11 +629,12 @@ mod tests {
                 "open_agent",
                 "open_overview",
                 "open_deck",
-                "close_agent_view",
+                "close",
                 "open_settings",
                 "voice_off",
                 "list_commands",
                 "dictate_to_agent",
+                "submit_prompt",
                 "none"
             ]
         );

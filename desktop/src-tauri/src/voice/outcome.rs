@@ -42,6 +42,9 @@ use std::collections::BTreeSet;
 
 use serde::Serialize;
 
+use super::dictation::{
+    DICTATION_OPENERS, SUBMIT_PHRASES, opening_with, strip_opening, whole_utterance_is,
+};
 use super::resolver::{IntentError, IntentRequest, IntentResolver};
 use super::schema::annotate;
 use super::table::{CommandRow, CommandTable, ParamKind, Screen};
@@ -50,6 +53,19 @@ use crate::dto::{DesktopTab, safe_message};
 
 /// How many matching agents an ambiguity sentence names before it summarises.
 const AMBIGUITY_NAMES_SHOWN: usize = 3;
+
+/// The row a dictated utterance dispatches, and the one param it declares.
+///
+/// Named here as well as in `commands.toml` because the local fast path builds
+/// the dispatch itself rather than going through the model — and a fast path
+/// that dispatched a row the table does not have, or a param the row does not
+/// declare, would be the second implementation this design exists to avoid.
+/// `voice_outcome_the_fast_path_rows_are_the_table_s_own` is what keeps the two
+/// spellings from drifting.
+const DICTATE_ROW: &str = "dictate_to_agent";
+const DICTATE_PARAM: &str = "prefix";
+/// The row a whole-utterance submit phrase dispatches.
+const SUBMIT_ROW: &str = "submit_prompt";
 
 /// One param, resolved against live state.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -306,6 +322,13 @@ pub async fn handle_utterance(
         return finish(VoiceOutcome::no_match(transcript), None);
     }
 
+    // The local fast paths, ahead of every backend call (PRD #802 D6, rebuilt).
+    // See [`local_intercept`] for what is decided here and — more importantly —
+    // what deliberately is not.
+    if let Some(outcome) = local_intercept(table, screen, &transcript) {
+        return finish(outcome, None);
+    }
+
     let commands = annotate(table, screen);
     let started = std::time::Instant::now();
     let answered = resolver
@@ -367,6 +390,37 @@ pub async fn handle_utterance(
             });
         };
         match spec.kind {
+            // The fidelity guarantee (PRD #802 D6, rebuilt), and it is checked
+            // HERE rather than trusted anywhere: the model marked a boundary in
+            // words it says the user used, and this is where those words are
+            // held against the transcript the transcriber actually produced.
+            // What goes into `value` — which is what the agent's prompt
+            // receives — is a slice of THAT transcript. There is deliberately
+            // no arm that falls back to the model's own string, which is the
+            // whole difference between a model locating content and a model
+            // supplying it.
+            ParamKind::SpokenPrefix => match strip_opening(transcript.text(), spoken) {
+                Some(rest) if !rest.trim().is_empty() => resolved.push(ResolvedParam {
+                    name: spec.name.clone(),
+                    kind: spec.kind,
+                    spoken: spoken.to_string(),
+                    value: rest.to_string(),
+                    label: rest.to_string(),
+                }),
+                // Two situations, one refusal, because the user's position is
+                // the same in both: nothing was typed. Either the marked words
+                // are not how the utterance started, or they are the whole of
+                // it and there is nothing left to type.
+                _ => {
+                    return finish(VoiceOutcome::ParamUnresolved {
+                        sentence: heard(&transcript, &spec.kind.unresolved_phrase(spoken)),
+                        transcript,
+                        action: row.id.clone(),
+                        param: spec.name.clone(),
+                        spoken: spoken.to_string(),
+                    });
+                }
+            },
             ParamKind::AgentRef => match resolve_agent_ref(spoken, agents) {
                 AgentRefMatch::One { id, label } => resolved.push(ResolvedParam {
                     name: spec.name.clone(),
@@ -405,6 +459,94 @@ pub async fn handle_utterance(
         invoke: row.invoke.clone(),
         params: resolved,
     })
+}
+
+/// The two things this app answers without asking a model, and the boundary of
+/// what a fast path is allowed to decide (PRD #802 D6, rebuilt).
+///
+/// # Why there is a fast path at all, and why it is NOT the vocabulary
+///
+/// A closed list of openers is the guess-the-magic-word problem PRD #802 opens
+/// by rejecting: *"let's write a prompt …"*, *"tell it to …"* and *"ask it to
+/// …"* are all things people say and none of them could be in any list worth
+/// maintaining. So the list here decides **who pays for a round trip**, not who
+/// gets understood. Everything it does not recognise goes to the resolver and
+/// is answered by the same two rows through the model — which costs nothing
+/// extra, because the resolver runs on every utterance anyway to decide whether
+/// it is a command at all.
+///
+/// # What it decides
+///
+/// 1. **A submit phrase**, matched by equality against the whole normalised
+///    utterance. Never a prefix or a suffix test — see [`SUBMIT_PHRASES`] for
+///    the false positive that rules out, and why it is unrecoverable.
+/// 2. **A dictation opener**, matched as whole words at the front. What is
+///    typed is the remainder of **the transcript**, taken verbatim; this path
+///    involves no model and therefore has nothing to verify, which is the one
+///    respect in which it is simpler than the fallback rather than merely
+///    cheaper.
+///
+/// # What it deliberately does not decide
+///
+/// A bare *"type"* with nothing after it falls **through** to the resolver
+/// rather than being refused here. It is not a dictation — there is nothing to
+/// dictate — and the honest answer to it is whatever the model makes of it,
+/// which is usually the no-match escape. Deciding it here would mean this
+/// function inventing a refusal for an utterance it has no opinion about.
+///
+/// The screen still decides availability: a fast path that typed into an agent
+/// from the deck would be a second control surface with capabilities the first
+/// one lacks. Both paths go through the row's own `callable_on`, so *"type run
+/// the tests"* on the deck renders the table's hint exactly as the model's
+/// answer would have.
+fn local_intercept(
+    table: &CommandTable,
+    screen: Screen,
+    transcript: &Transcript,
+) -> Option<VoiceOutcome> {
+    let dispatch = |row: &CommandRow, params: Vec<ResolvedParam>| {
+        if !row.callable_on(screen) {
+            return VoiceOutcome::unavailable(transcript.clone(), row);
+        }
+        VoiceOutcome::Dispatch {
+            sentence: report(row, &params),
+            transcript: transcript.clone(),
+            action: row.id.clone(),
+            invoke: row.invoke.clone(),
+            params,
+        }
+    };
+
+    if whole_utterance_is(transcript.text(), &SUBMIT_PHRASES)
+        && let Some(row) = table.row(SUBMIT_ROW)
+    {
+        return Some(dispatch(row, Vec::new()));
+    }
+
+    let opener = opening_with(transcript.text(), &DICTATION_OPENERS)?;
+    let typed = strip_opening(transcript.text(), opener)?;
+    if typed.trim().is_empty() {
+        return None;
+    }
+    let row = table.row(DICTATE_ROW)?;
+    // Looked up on the ROW rather than constructed, so a table whose dictation
+    // row declared a different param — or a different kind — cannot be
+    // dispatched with one it does not have. This is the one place a dispatch is
+    // built without the model, which makes it the one place that could.
+    let spec = row
+        .params
+        .iter()
+        .find(|spec| spec.name == DICTATE_PARAM && spec.kind == ParamKind::SpokenPrefix)?;
+    Some(dispatch(
+        row,
+        vec![ResolvedParam {
+            name: spec.name.clone(),
+            kind: spec.kind,
+            spoken: opener.to_string(),
+            value: typed.to_string(),
+            label: typed.to_string(),
+        }],
+    ))
 }
 
 /// Whole milliseconds, saturating.
@@ -488,6 +630,13 @@ impl ParamKind {
     fn missing_phrase(self) -> &'static str {
         match self {
             ParamKind::AgentRef => "I could not tell which agent you meant",
+            // The model picked dictation and marked no boundary, so there is
+            // no answer to the only question this kind asks: where do the
+            // user's own words start? Nothing is typed, and the sentence says
+            // what would have made it work rather than blaming the utterance.
+            ParamKind::SpokenPrefix => {
+                "I could not tell where your words started, so nothing was typed"
+            }
         }
     }
 
@@ -505,6 +654,16 @@ impl ParamKind {
         let spoken = safe_message(spoken);
         match self {
             ParamKind::AgentRef => format!("no agent here matches \u{201c}{spoken}\u{201d}"),
+            // **The fidelity refusal**, and the one sentence in this file that
+            // reports a disagreement between the app and the model. The words
+            // quoted are the MODEL's — scrubbed like every foreign string — and
+            // the transcript beside them is what was actually heard, so the two
+            // are on screen together and the reader can see which is which.
+            // Nothing was typed, which is the whole point: the alternative to
+            // refusing is typing the model's words into somebody's agent.
+            ParamKind::SpokenPrefix => {
+                format!("\u{201c}{spoken}\u{201d} is not how that started, so nothing was typed")
+            }
         }
     }
 
@@ -535,6 +694,14 @@ impl ParamKind {
             ParamKind::AgentRef => {
                 format!("\u{201c}{spoken}\u{201d} matches more than one agent: {listed}")
             }
+            // Unreachable: a prefix resolves against the transcript, which
+            // either starts with the marked words or does not. Written out
+            // rather than left to a catch-all arm so that a third kind whose
+            // resolver CAN be ambiguous has to say its own sentence here
+            // instead of inheriting one about agents.
+            ParamKind::SpokenPrefix => format!(
+                "\u{201c}{spoken}\u{201d} matches more than one place in what you said: {listed}"
+            ),
         }
     }
 }
@@ -1624,5 +1791,358 @@ mod tests {
         assert_eq!(json["outcome"]["invoke"], "openOverview");
         assert_eq!(json["backend"], "stub");
         assert!(json["resolveMs"].is_number(), "{json}");
+    }
+
+    // -- dictation: the local fast path ------------------------------------
+    //
+    // PRD #802 D6, rebuilt. Two paths reach the same row and both type a slice
+    // of the TRANSCRIPT; what differs is only who finds the boundary. These
+    // pin the half that finds it here.
+
+    /// A resolver that counts, and answers nothing.
+    ///
+    /// The proof that the fast path costs no backend call is a **number**
+    /// rather than an inference from `resolve_ms`: `None` says a call was not
+    /// timed, and this says one was not made. The distinction matters because
+    /// the claim in `commands.toml` is about money and a round trip, not about
+    /// a measurement.
+    #[derive(Default)]
+    struct CountingResolver {
+        calls: std::sync::atomic::AtomicUsize,
+        answer: Option<IntentAnswer>,
+    }
+
+    impl CountingResolver {
+        fn answering(answer: IntentAnswer) -> Self {
+            Self {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                answer: Some(answer),
+            }
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl IntentResolver for CountingResolver {
+        fn resolve<'a>(
+            &'a self,
+            _request: IntentRequest<'a>,
+        ) -> crate::voice::resolver::ResolveFuture<'a> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let answer = self.answer.clone().unwrap_or_else(IntentAnswer::none);
+            Box::pin(async move { Ok(answer) })
+        }
+
+        fn backend_name(&self) -> &'static str {
+            "counting"
+        }
+    }
+
+    fn typed(outcome: &VoiceOutcome) -> &str {
+        let VoiceOutcome::Dispatch { params, .. } = outcome else {
+            panic!("expected a dispatch, got {outcome:?}");
+        };
+        assert_eq!(params.len(), 1, "got {params:?}");
+        assert_eq!(params[0].kind, ParamKind::SpokenPrefix);
+        &params[0].value
+    }
+
+    #[tokio::test]
+    async fn voice_outcome_an_opener_types_the_rest_of_the_transcript_and_calls_nobody() {
+        let resolver = CountingResolver::default();
+        let answer = handle_utterance(
+            &resolver,
+            table(),
+            Screen::Agent,
+            &fleet(),
+            Transcript::new("type run the login tests"),
+        )
+        .await;
+        assert_eq!(typed(&answer.outcome), "run the login tests");
+        assert_eq!(
+            answer.outcome.sentence(),
+            "Typed: \u{201c}run the login tests\u{201d}."
+        );
+        // The two halves of "no round trip": nothing was called, and nothing
+        // was timed.
+        assert_eq!(resolver.calls(), 0);
+        assert_eq!(answer.resolve_ms, None);
+    }
+
+    #[tokio::test]
+    async fn voice_outcome_the_typed_text_is_the_transcript_byte_for_byte() {
+        // The fidelity property, on the path where no model is involved at all.
+        let heard = "write Fix the flake in `orchestration_dispatch_002`, then push.";
+        let resolver = CountingResolver::default();
+        let answer = handle_utterance(
+            &resolver,
+            table(),
+            Screen::Agent,
+            &fleet(),
+            Transcript::new(heard),
+        )
+        .await;
+        let text = typed(&answer.outcome);
+        assert_eq!(
+            text,
+            "Fix the flake in `orchestration_dispatch_002`, then push."
+        );
+        assert_eq!(text, &heard[heard.len() - text.len()..]);
+    }
+
+    #[tokio::test]
+    async fn voice_outcome_a_trailing_submit_phrase_is_typed_and_never_submits() {
+        // The one the product owner asked about. A trailing rule would submit
+        // here and deliver half an instruction to an agent, which is the
+        // unrecoverable direction — see `dictation::SUBMIT_PHRASES`.
+        let resolver = CountingResolver::default();
+        let answer = handle_utterance(
+            &resolver,
+            table(),
+            Screen::Agent,
+            &fleet(),
+            Transcript::new("type hello end"),
+        )
+        .await;
+        let VoiceOutcome::Dispatch { action, .. } = &answer.outcome else {
+            panic!("expected a dispatch, got {:?}", answer.outcome);
+        };
+        assert_eq!(action, "dictate_to_agent");
+        assert_eq!(typed(&answer.outcome), "hello end");
+        assert_eq!(resolver.calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn voice_outcome_a_bare_submit_phrase_submits_and_a_longer_one_types() {
+        let resolver = CountingResolver::default();
+        let submitted = handle_utterance(
+            &resolver,
+            table(),
+            Screen::Agent,
+            &fleet(),
+            Transcript::new("End."),
+        )
+        .await;
+        let VoiceOutcome::Dispatch {
+            action,
+            invoke,
+            params,
+            sentence,
+            ..
+        } = &submitted.outcome
+        else {
+            panic!("expected a dispatch, got {:?}", submitted.outcome);
+        };
+        assert_eq!(action, "submit_prompt");
+        assert_eq!(invoke, "submitAgentPrompt");
+        assert!(params.is_empty(), "got {params:?}");
+        assert_eq!(sentence, "Sent.");
+        assert_eq!(submitted.resolve_ms, None);
+
+        let dictated = handle_utterance(
+            &resolver,
+            table(),
+            Screen::Agent,
+            &fleet(),
+            Transcript::new("type end of file"),
+        )
+        .await;
+        assert_eq!(typed(&dictated.outcome), "end of file");
+        assert_eq!(resolver.calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn voice_outcome_dictating_with_no_pane_open_names_the_prerequisite() {
+        for screen in [Screen::Deck, Screen::Overview] {
+            let resolver = CountingResolver::default();
+            let answer = handle_utterance(
+                &resolver,
+                table(),
+                screen,
+                &fleet(),
+                Transcript::new("type run the login tests"),
+            )
+            .await;
+            let VoiceOutcome::Unavailable { action, hint, .. } = &answer.outcome else {
+                panic!(
+                    "expected `unavailable` on {screen}, got {:?}",
+                    answer.outcome
+                );
+            };
+            assert_eq!(action, "dictate_to_agent");
+            assert_eq!(
+                hint,
+                "typing to an agent needs that agent's pane open — open one first"
+            );
+            // A fast path that typed into an agent from the deck would make
+            // voice a second control surface; the screen still decides.
+            assert_eq!(resolver.calls(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn voice_outcome_an_opener_with_nothing_after_it_falls_through_to_the_model() {
+        // Not a dictation and not a refusal this function has any opinion
+        // about: there is nothing to type, so the model gets its ordinary turn.
+        let resolver = CountingResolver::default();
+        let answer = handle_utterance(
+            &resolver,
+            table(),
+            Screen::Agent,
+            &fleet(),
+            Transcript::new("type"),
+        )
+        .await;
+        assert!(
+            matches!(answer.outcome, VoiceOutcome::NoMatch { .. }),
+            "got {:?}",
+            answer.outcome
+        );
+        assert_eq!(resolver.calls(), 1);
+    }
+
+    // -- dictation: the model fallback -------------------------------------
+
+    #[tokio::test]
+    async fn voice_outcome_an_unusual_opener_is_stripped_by_the_marked_boundary() {
+        // The amendment's own example. No list could hold "let's write a
+        // prompt", which is the whole reason the model is asked.
+        let resolver = CountingResolver::answering(
+            IntentAnswer::new("dictate_to_agent").with_param("prefix", "let's write a prompt"),
+        );
+        let answer = handle_utterance(
+            &resolver,
+            table(),
+            Screen::Agent,
+            &fleet(),
+            Transcript::new("let's write a prompt run the tests"),
+        )
+        .await;
+        assert_eq!(typed(&answer.outcome), "run the tests");
+        // Exactly one call: the one the resolver was always going to make to
+        // decide whether this utterance was a command at all.
+        assert_eq!(resolver.calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn voice_outcome_the_fallback_types_the_transcript_byte_for_byte_too() {
+        let heard = "tell it to Rebase onto main, keeping `--force-with-lease`";
+        let resolver = CountingResolver::answering(
+            IntentAnswer::new("dictate_to_agent").with_param("prefix", "Tell it to"),
+        );
+        let answer = handle_utterance(
+            &resolver,
+            table(),
+            Screen::Agent,
+            &fleet(),
+            Transcript::new(heard),
+        )
+        .await;
+        let text = typed(&answer.outcome);
+        assert_eq!(text, "Rebase onto main, keeping `--force-with-lease`");
+        assert_eq!(text, &heard[heard.len() - text.len()..]);
+        // What the model marked is kept beside what the app resolved it to, so
+        // a surface can show both.
+        let VoiceOutcome::Dispatch { params, .. } = &answer.outcome else {
+            unreachable!()
+        };
+        assert_eq!(params[0].spoken, "Tell it to");
+    }
+
+    #[tokio::test]
+    async fn voice_outcome_a_prefix_nobody_said_types_nothing_and_reports() {
+        // **The fidelity guarantee.** A model that answers with words the user
+        // did not say must not get them typed into an agent — and there is no
+        // arm that falls back to its string, which is what makes "the model
+        // never supplies the text" a property rather than an intention.
+        let resolver = CountingResolver::answering(
+            IntentAnswer::new("dictate_to_agent").with_param("prefix", "please could you type"),
+        );
+        let answer = handle_utterance(
+            &resolver,
+            table(),
+            Screen::Agent,
+            &fleet(),
+            Transcript::new("run the login tests"),
+        )
+        .await;
+        let VoiceOutcome::ParamUnresolved {
+            action,
+            param,
+            spoken,
+            sentence,
+            ..
+        } = &answer.outcome
+        else {
+            panic!("expected `param_unresolved`, got {:?}", answer.outcome);
+        };
+        assert_eq!(action, "dictate_to_agent");
+        assert_eq!(param, "prefix");
+        assert_eq!(spoken, "please could you type");
+        assert_eq!(
+            sentence,
+            "Heard: \u{201c}run the login tests\u{201d} — \u{201c}please could you type\u{201d} \
+             is not how that started, so nothing was typed."
+        );
+        assert!(!answer.outcome.is_dispatch());
+    }
+
+    #[tokio::test]
+    async fn voice_outcome_a_prefix_that_swallows_the_utterance_types_nothing() {
+        let resolver = CountingResolver::answering(
+            IntentAnswer::new("dictate_to_agent").with_param("prefix", "let's write a prompt"),
+        );
+        let answer = handle_utterance(
+            &resolver,
+            table(),
+            Screen::Agent,
+            &fleet(),
+            Transcript::new("let's write a prompt"),
+        )
+        .await;
+        assert!(
+            matches!(answer.outcome, VoiceOutcome::ParamUnresolved { .. }),
+            "got {:?}",
+            answer.outcome
+        );
+    }
+
+    #[tokio::test]
+    async fn voice_outcome_dictation_with_no_boundary_marked_types_nothing() {
+        let resolver = CountingResolver::answering(IntentAnswer::new("dictate_to_agent"));
+        let answer = handle_utterance(
+            &resolver,
+            table(),
+            Screen::Agent,
+            &fleet(),
+            Transcript::new("just write that down somewhere"),
+        )
+        .await;
+        let VoiceOutcome::ParamMissing { sentence, .. } = &answer.outcome else {
+            panic!("expected `param_missing`, got {:?}", answer.outcome);
+        };
+        assert!(
+            sentence.contains("nothing was typed"),
+            "the sentence has to say the words did not land: {sentence}"
+        );
+    }
+
+    #[tokio::test]
+    async fn voice_outcome_the_fast_path_rows_are_the_table_s_own() {
+        // The fast path builds a dispatch without going through the model, so
+        // it is the one place a row could be named that the table does not
+        // have — or a param declared that the row does not.
+        let dictate = table().row(DICTATE_ROW).expect("a shipped row");
+        assert_eq!(dictate.params.len(), 1);
+        assert_eq!(dictate.params[0].name, DICTATE_PARAM);
+        assert_eq!(dictate.params[0].kind, ParamKind::SpokenPrefix);
+        let submit = table().row(SUBMIT_ROW).expect("a shipped row");
+        assert!(submit.params.is_empty(), "got {:?}", submit.params);
+        // Both are `agent`-only, which is what makes the screen check above
+        // reachable rather than decorative.
+        assert_eq!(dictate.screens, vec![Screen::Agent]);
+        assert_eq!(submit.screens, vec![Screen::Agent]);
     }
 }
