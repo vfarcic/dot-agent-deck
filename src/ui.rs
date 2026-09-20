@@ -36757,22 +36757,60 @@ mod tests {
                 .expect("TUI byte-observation snapshot")
         }
 
-        fn type_user_draft(&self, pane_id: &str, draft: &str) {
-            let handle = self
-                .registry
-                .subscribe(&self.agent_id)
-                .expect("attach TUI byte-observation target");
-            self.runtime.block_on(async {
-                use std::io::Write as _;
+        /// Block until `lines` guarded deliveries have finished round-tripping
+        /// on this pane's PTY, and return the buffer as it stood at that
+        /// moment — the snapshot a precondition may be asserted against.
+        ///
+        /// Issue #1132: a delivery writes a payload and a submit CR, so it
+        /// leaves TWO line terminators — the line discipline's echo of the
+        /// completed line and `/bin/cat`'s copy of it. Waiting for both is what
+        /// the fixed sleep here used to guess at, and waiting only for the echo
+        /// would leave the `cat` copy in flight across the assertion that
+        /// follows.
+        fn wait_for_delivered_lines(&self, lines: usize) -> Vec<u8> {
+            self.runtime
+                .block_on(crate::test_pty_wait::wait_for_drained_lines(
+                    &self.registry,
+                    &self.agent_id,
+                    lines,
+                ))
+        }
 
-                let mut writer = handle.writer.lock().await;
-                writer
-                    .write_all(draft.as_bytes())
-                    .expect("write unsent TUI user draft");
-                writer.flush().expect("flush unsent TUI user draft");
-            });
-            self.registry.note_user_input(pane_id);
-            std::thread::sleep(std::time::Duration::from_millis(75));
+        /// Type an unsent user draft at the pane's PTY, returning only once the
+        /// draft is demonstrably on it AND nothing else is still arriving.
+        ///
+        /// Issue #1132: this used to write and then sleep a fixed 75 ms, which
+        /// the caller's "the unsent user draft must physically reach the TUI
+        /// PTY" precondition read as proof that it had. It was a bet on a PTY
+        /// round trip beating a constant, and the fast tier has no retries, so
+        /// losing it reds the required `build` and `build-macos` jobs. Measured:
+        /// with this test's three fixed sleeps at 0 ms it failed 3 of 3 runs,
+        /// every time at exactly that precondition.
+        ///
+        /// `lines_already_written` is the number of input lines this pane has
+        /// completed before the call — one per guarded delivery, each of which
+        /// wrote a payload and a submit CR. Draining them first is the half of
+        /// the fix easiest to mistake for tidiness: `/bin/cat` and the line
+        /// discipline's echo are two independent writers into one PTY output
+        /// queue, so a `cat` copy still pending can land IN THE MIDDLE of this
+        /// write's echo and split the draft permanently (issue #850, measured in
+        /// [`crate::test_pty_wait::type_user_bytes`]'s doc).
+        ///
+        /// It is also what makes the caller's `before_*` baseline QUIESCENT,
+        /// which is what the later `after == before` comparisons actually need:
+        /// the drain settles everything the deliveries owe, the draft itself
+        /// carries no line terminator so `cat` has nothing to copy, and the
+        /// echo wait proves the only bytes still outstanding have landed. After
+        /// this returns, nothing is in flight — so the buffer cannot change
+        /// again unless the code under test writes.
+        fn type_user_draft(&self, pane_id: &str, draft: &str, lines_already_written: usize) {
+            self.runtime.block_on(crate::test_pty_wait::type_user_draft(
+                &self.registry,
+                &self.agent_id,
+                pane_id,
+                draft,
+                lines_already_written,
+            ));
         }
     }
 
@@ -36893,8 +36931,11 @@ mod tests {
             &replacement_pane,
             &replacement_snapshot,
         );
-        std::thread::sleep(std::time::Duration::from_millis(75));
-        let after_initial_delivery = replacement_controller.snapshot();
+        // Issue #1132: attempt 1's payload and submit CR have to be all the way
+        // back before this precondition means anything, and before the draft
+        // below may be typed — waited for by CONTENT (both of the completed
+        // line's terminators) rather than by a 75 ms guess.
+        let after_initial_delivery = replacement_controller.wait_for_delivered_lines(1);
         assert!(
             after_initial_delivery
                 .windows(REPLACEMENT_PROMPT.len())
@@ -36903,7 +36944,7 @@ mod tests {
             String::from_utf8_lossy(&after_initial_delivery)
         );
 
-        replacement_controller.type_user_draft(REPLACEMENT_PANE_ID, REPLACEMENT_DRAFT);
+        replacement_controller.type_user_draft(REPLACEMENT_PANE_ID, REPLACEMENT_DRAFT, 1);
         let before_replacement = replacement_controller.snapshot();
         assert!(
             before_replacement
@@ -36922,6 +36963,19 @@ mod tests {
             &replacement_pane,
             &replacement_snapshot,
         );
+        // A NEGATIVE observation window, and the sleep IS the observation —
+        // `spawn.rs`'s `UserFrameRetryExpectation::WritesNothing` keeps one for
+        // the same reason. The contract is that attempt 2 writes nothing, so
+        // there is no byte whose arrival could end this wait early and nothing
+        // to key it on; kept at the 75 ms it has always had.
+        //
+        // Issue #1132: what changed is that it can no longer make a correct run
+        // RED. `before_replacement` is now quiescent by construction (see
+        // `type_user_draft`), so the buffer is frozen unless the code under test
+        // writes — a window that is too short can only fail to catch a
+        // violation, never manufacture one. Before, a late `cat` copy of the
+        // delivery's own line could land inside this window and read as bytes
+        // attempt 2 had sent.
         std::thread::sleep(std::time::Duration::from_millis(75));
         let after_replacement = replacement_controller.snapshot();
 
@@ -36947,15 +37001,22 @@ mod tests {
             .expect("first write arms replacement attempt")
             .next_attempt_at = std::time::Instant::now();
         process_pending_seed_prompts(&mut ui, &pane, &snapshot);
-        std::thread::sleep(std::time::Duration::from_millis(75));
 
-        controller.type_user_draft(PANE_ID, USER_DRAFT);
+        // Issue #1132: TWO deliveries have written a payload and a submit CR
+        // into this pane, so four line terminators are owed. `type_user_draft`
+        // waits for all of them before it writes — which both keeps `cat`'s
+        // copies from splitting the draft's echo and leaves `before_probe`
+        // quiescent, since the draft carries no terminator of its own and so
+        // adds nothing for `cat` to copy back.
+        controller.type_user_draft(PANE_ID, USER_DRAFT, 2);
         let before_probe = controller.snapshot();
         ui.send_retry_backoff
             .get_mut(PANE_ID)
             .expect("second write arms submit-only probe")
             .next_attempt_at = std::time::Instant::now();
         process_pending_seed_prompts(&mut ui, &pane, &snapshot);
+        // The second negative observation window — see the one above for why it
+        // stays a sleep and why it can now only under-detect.
         std::thread::sleep(std::time::Duration::from_millis(75));
         let after_probe = controller.snapshot();
 
