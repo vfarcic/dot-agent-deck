@@ -65,7 +65,15 @@
 //!      that variable names (issue #1181). A tripwire for the next
 //!      call site, which no runtime test can be. See
 //!      [`git_program_literal`].
-//!  14. No bare `Command::new("git")` in test-support code — all of
+//!  14. The voice command table and the frontend action registry
+//!      resolve against each other — PRD #802 M3. Every `invoke` in
+//!      `commands.toml` names a `VOICE_ACTIONS` key, every `screens`
+//!      entry is a `DeckView` `kind`, every param `kind` is a
+//!      `ParamKind`, every registry entry is classified by a row or a
+//!      written `no_voice` reason, and the registry literal stays
+//!      statically readable. It proves the registry is CONSISTENT, not
+//!      that it is COMPLETE; see [`voice_command_registry`].
+//!  15. No bare `Command::new("git")` in test-support code — all of
 //!      `tests/`, plus the files on [`EXTRA_GIT_COVERED`]. Issues
 //!      #834 / #1121. See [`BARE_GIT_RULE`].
 //!
@@ -224,6 +232,12 @@ mod skill_frontmatter;
 /// only — there is no runtime rule here, the scripts enforce themselves.
 #[cfg(test)]
 mod verify_pr_stream;
+/// PRD #802 M3: the voice command table (`commands.toml`) against the frontend
+/// action registry (`desktop/src/lib/voiceActions.ts`), plus the two closed sets
+/// the table's columns draw from. Like `desktop_project_boundary` this one
+/// carries a live rule — check 13 below — as well as its own planted-bad-input
+/// tests.
+mod voice_command_registry;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -313,7 +327,7 @@ const EXTRA_TEMP_COVERED: &[&str] = &["src/dispatch.rs"];
 /// Opt-out marker for check 8, on the offending line.
 const BARE_TEMPDIR_ALLOW: &str = "linkage-check:allow-bare-tempdir";
 
-/// Check 14 (issues #834, #1121): a fixture must not shell out to `git` with a
+/// Check 15 (issues #834, #1121): a fixture must not shell out to `git` with a
 /// bare [`std::process::Command`].
 ///
 /// Git resolves a repository from `GIT_DIR` and the other discovery variables
@@ -957,7 +971,7 @@ fn main() -> ExitCode {
             }
         }
 
-        // Check 14 (issues #834, #1121): all of `tests/`, plus
+        // Check 15 (issues #834, #1121): all of `tests/`, plus
         // `EXTRA_GIT_COVERED` for the lib target's fixtures. Run against the
         // stripped view so a comment naming the constructor is not a
         // violation, but report the raw line number — same shape as check 8.
@@ -1116,7 +1130,7 @@ fn main() -> ExitCode {
             .map(|v| format!("[8] {v}")),
     );
 
-    failures.extend(bare_git_violations.into_iter().map(|v| format!("[14] {v}")));
+    failures.extend(bare_git_violations.into_iter().map(|v| format!("[15] {v}")));
 
     failures.extend(
         unarmed_spawn_violations
@@ -1163,6 +1177,16 @@ fn main() -> ExitCode {
             .map(|v| format!("[13] {v}")),
     );
 
+    // Check 14 (PRD #802 M3): the voice command table and the frontend action
+    // registry resolve against each other. Read straight off its own four files
+    // for check 12's reason — a different tree, and an input going missing must
+    // be reported rather than quietly emptying the rule.
+    failures.extend(
+        voice_command_registry::run(&root)
+            .into_iter()
+            .map(|v| format!("[14] {v}")),
+    );
+
     // Check 7 (PRD #77 Decision 30 / M4.3): every #[spec] test has
     // a `/// Scenario:` doc comment with a body AND
     // `cargo xtask docs --tests` succeeds against the current source
@@ -1177,7 +1201,7 @@ fn main() -> ExitCode {
 
     if failures.is_empty() {
         println!(
-            "linkage-check: ok ({} catalog ids, {} annotations, {} allowlisted, 14 rules)",
+            "linkage-check: ok ({} catalog ids, {} annotations, {} allowlisted, 15 rules)",
             catalog_ids.len(),
             discovered.len(),
             allowlist.len()

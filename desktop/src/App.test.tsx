@@ -82,6 +82,11 @@ function runtime(overrides: Partial<DeckRuntimeState> = {}): DeckRuntimeState {
       clientProtocolVersion: 0,
       clientBuildVersion: "test",
     })),
+    // PRD #802 M4: no OS keychain is reachable from a test runtime, and the
+    // state that says so is the same one the browser preview reports.
+    secretStatus: vi.fn(async () => ({ stored: false, problem: "No credential store is reachable from this test runtime." })),
+    storeSecret: vi.fn(async () => { throw new Error("No credential store is reachable from this test runtime."); }),
+    forgetSecret: vi.fn(async () => { throw new Error("No credential store is reachable from this test runtime."); }),
     getSettings: settings.getSettings,
     saveSettings: settings.saveSettings,
     ...overrides,
@@ -1405,8 +1410,9 @@ describe("ControlDeck", () => {
     // still that the real registry reaches the real sheet. The column's own two
     // states stay pinned with stub sections in
     // `components/SettingsSheet.test.tsx`, so this does not become their only
-    // coverage. PRD #741's Decks row took it to three.
-    expect(SETTINGS_SECTIONS).toHaveLength(3);
+    // coverage. PRD #741's Decks row took it to three and PRD #802 M4's Voice
+    // row to four.
+    expect(SETTINGS_SECTIONS).toHaveLength(4);
     expect(screen.getByTestId("settings-layout")).not.toHaveClass("is-single");
     expect(screen.getByRole("navigation", { name: "Settings sections" })).toBeVisible();
 

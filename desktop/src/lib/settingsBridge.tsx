@@ -6,8 +6,9 @@
  * the save, the last error, and the runtime mode — the last of which was added
  * as the *general* environmental fact rather than a feature-specific one,
  * because "a prop only one panel could ever use would belong somewhere else".
- * A `testEndpoint` prop would have been exactly that, and #802's model manager
- * would then have wanted a fifth.
+ * A `testEndpoint` prop would have been exactly that, and #802 did in fact want
+ * three more at its M4 — which arrived here rather than as props five, six and
+ * seven, exactly as this file predicted.
  *
  * So the panel contract is unchanged and this is the escape hatch beside it,
  * with a deliberately small shape:
@@ -24,10 +25,10 @@
  *
  * The provider is mounted by the component that already holds the runtime, so
  * the bridge reaches a panel without `SettingsSheet` — a #803-owned rendering
- * component — learning that endpoints exist.
+ * component — learning that endpoints or credentials exist.
  */
 import { createContext, useContext } from "react";
-import type { DesktopSettingsDto, EndpointTestReportDto } from "./bridge";
+import type { DesktopSettingsDto, EndpointTestReportDto, SecretStatusDto, VoiceSecretId } from "./bridge";
 
 export interface SettingsBridge {
   /**
@@ -37,6 +38,24 @@ export interface SettingsBridge {
    * have just typed; the Rust side reads no file for it.
    */
   testEndpoint: (settings: DesktopSettingsDto, selection: string) => Promise<EndpointTestReportDto>;
+  /**
+   * The three credential actions (PRD #802 M4), and the reason they are here
+   * rather than on `SettingsPanelProps`.
+   *
+   * They are **actions, not state** — the rule this context was created with.
+   * A credential is deliberately not part of the settings document, so it
+   * cannot travel the one way the document travels; the panel asks the store
+   * what it holds and tells it what to hold.
+   *
+   * There is no `loadSecret`, and adding one would defeat the seam: PRD #803's
+   * rule is that a secret goes in neither `desktop.toml` nor `localStorage`,
+   * and a value reaching the webview is one `JSON.stringify` from the second
+   * half of that. `storeSecret` and `forgetSecret` **reject** when the store
+   * failed, so a panel cannot render a failure as a saved key.
+   */
+  secretStatus: (id: VoiceSecretId) => Promise<SecretStatusDto>;
+  storeSecret: (id: VoiceSecretId, secret: string) => Promise<SecretStatusDto>;
+  forgetSecret: (id: VoiceSecretId) => Promise<SecretStatusDto>;
 }
 
 const SettingsBridgeContext = createContext<SettingsBridge | undefined>(undefined);

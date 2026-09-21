@@ -92,7 +92,21 @@ function renderPanel(
   );
   const wrap = (element: React.ReactElement) =>
     options.testEndpoint
-      ? <SettingsBridgeProvider value={{ testEndpoint: options.testEndpoint }}>{element}</SettingsBridgeProvider>
+      ? (
+        <SettingsBridgeProvider
+          value={{
+            testEndpoint: options.testEndpoint,
+            // PRD #802 M4 widened `SettingsBridge` with three credential
+            // actions. This panel reaches none of them; they are here because
+            // the context is one value and a partial one would not type-check.
+            secretStatus: vi.fn(async () => ({ stored: false })),
+            storeSecret: vi.fn(async () => ({ stored: true })),
+            forgetSecret: vi.fn(async () => ({ stored: false })),
+          }}
+        >
+          {element}
+        </SettingsBridgeProvider>
+      )
       : element;
   const { rerender } = render(wrap(panel));
   /**

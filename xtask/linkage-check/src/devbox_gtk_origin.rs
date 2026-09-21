@@ -1,5 +1,6 @@
 //! Issue #815: `scripts/devbox-check-gtk.sh` must reject a pkg-config answer
-//! that resolves Tauri's GTK stack outside `/nix/store`.
+//! that resolves the desktop crate's system libraries outside `/nix/store` —
+//! Tauri's GTK stack, and ALSA since PRD #802 M7 put `cpal` in that crate.
 //!
 //! That property is a RUNTIME one — the script either compares the resolved
 //! `libdir` against the store prefix or it does not, and no compile step can

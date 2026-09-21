@@ -65,6 +65,11 @@ function runtime(overrides: Partial<DeckRuntimeState> = {}): DeckRuntimeState {
       clientProtocolVersion: 0,
       clientBuildVersion: "test",
     })),
+    // PRD #802 M4: no OS keychain is reachable from a test runtime, and the
+    // state that says so is the same one the browser preview reports.
+    secretStatus: vi.fn(async () => ({ stored: false, problem: "No credential store is reachable from this test runtime." })),
+    storeSecret: vi.fn(async () => { throw new Error("No credential store is reachable from this test runtime."); }),
+    forgetSecret: vi.fn(async () => { throw new Error("No credential store is reachable from this test runtime."); }),
     getSettings: vi.fn(async () => ({ settings: settingsWith() })),
     saveSettings: vi.fn(async (settings: DesktopSettingsDto) => structuredClone(settings)),
     ...overrides,

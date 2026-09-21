@@ -132,7 +132,7 @@ const DESKTOP_SRC: &str = "desktop/src";
 /// layer. That is why `Option<String>` and `Vec<String>` still have no way in —
 /// they resolve to `String`, which is absent — and why there is no row for each
 /// container shape.
-const ALLOWED_FIELD_TYPES: [(&str, FieldKind, &str); 15] = [
+const ALLOWED_FIELD_TYPES: [(&str, FieldKind, &str); 24] = [
     (
         "u32",
         FieldKind::Scalar,
@@ -259,6 +259,157 @@ const ALLOWED_FIELD_TYPES: [(&str, FieldKind, &str); 15] = [
         FieldKind::Section,
         "a section struct, whose own fields this check walks",
     ),
+    // PRD #802 M4: the `[voice]` section. This is the moment the module docs
+    // above predicted — "the one that will go red when PRD #802 adds a
+    // `String`" — and it went red, at all four of the fields below, which is
+    // the friction working rather than an obstacle. The resolution is the first
+    // of the two honest ones that test names: the values that could have been a
+    // `String` are closed enums instead, and the value that genuinely is a
+    // credential went behind the `SecretStore` seam
+    // (`desktop/src-tauri/src/secrets.rs`) rather than into this document.
+    //
+    // Read the three scalar reasons as the STRONG kind — no text is
+    // representable. Each is a Rust enum whose `Deserialize` folds an
+    // unrecognised token to the default and errors above MAX_VOICE_TOKEN_BYTES,
+    // so the value this crate reads out and writes back is one of the listed
+    // tokens and nothing else. That is `AppearanceMode`'s claim exactly, and it
+    // carries `AppearanceMode`'s caveat exactly: a hand-edited file can hold
+    // any string at one of these keys until the next save, which is why
+    // `settings.rs` follows a sentinel through the load as well.
+    (
+        "ActivationMode",
+        FieldKind::Scalar,
+        "a closed enum serialised as one token — `toggle` today, with \
+         hold-to-talk and always-on deferred to PRD #802 D4. Its deserializer \
+         folds anything else to the default and refuses a token over \
+         MAX_VOICE_TOKEN_BYTES, so no text is representable",
+    ),
+    (
+        "IntentBackend",
+        FieldKind::Scalar,
+        "a closed enum serialised as one token: `anthropic` or \
+         `openai_compatible` — WHICH wire protocol resolves an utterance, \
+         never how it authenticates. The set was `claude | opencode | remote`, \
+         and all three of those tokens are now withdrawn. PRD #802's \
+         landed-work security audit took `opencode` first: the agent-CLI \
+         backend hands a general-purpose coding agent a prompt built partly \
+         from untrusted input, so the child has to be containable, and \
+         `opencode run` has no no-tools flag and no no-persistence option (its \
+         sessions were confirmed locally to be resumable and to hold the \
+         utterance). `claude` had a flag for each and survived that audit, \
+         then went with PRD #802's provider work, which removed the \
+         subprocess backend outright — and `remote` went with it, because the \
+         one keyed backend became two protocol dialects and a token naming \
+         neither is not a choice a user can act on. Where a credential is \
+         needed it lives in the OS keychain under SecretId::VoiceIntent and \
+         has no field here at all; a loopback endpoint is asked for none. Same \
+         folding deserializer and same MAX_VOICE_TOKEN_BYTES bound, so no text \
+         is representable — and that folding is what makes a stale \
+         `intent = \"opencode\"`, `\"claude\"` or `\"remote\"` load as the \
+         default rather than fail",
+    ),
+    (
+        "TranscriptionBackend",
+        FieldKind::Scalar,
+        "a closed enum serialised as one token: `local` or `remote`. Same as \
+         IntentBackend — it names a backend, and the keyed one's credential is \
+         in the OS keychain under SecretId::VoiceTranscription rather than \
+         anywhere in this document. The set was `off | remote` until PRD \
+         #802's provider work measured a keyless speech container on loopback: \
+         `off` was a setting whose whole function was to make the feature do \
+         nothing, so it went and `local` took the default. Same folding \
+         deserializer and same MAX_VOICE_TOKEN_BYTES bound, so no text is \
+         representable",
+    ),
+    // PRD #802's provider work: the two stages stopped being one token each
+    // and became a backend plus the coordinates it is reached at. The endpoint
+    // and the model are the values that COULD have been `String`s — this list
+    // is why they are not, and the two rows below are the written assertion of
+    // what each can hold. Read them as the ssh-argument kind of reason, not the
+    // `u32` kind: each says what this charset and this bound make
+    // unrepresentable, not that the field is proof against every secret anyone
+    // could think of.
+    (
+        "ServiceUrl",
+        FieldKind::Scalar,
+        "a newtype over String in desktop/src-tauri/src/model_service.rs \
+         holding the URL a voice stage's requests go to, bounded at 2048 bytes \
+         and restricted to printable ASCII with no space — so no control byte, \
+         no whitespace, no non-ASCII byte, and nothing multi-line, which rules \
+         out a PEM block and every wrapped token. Its deserializer runs the \
+         constructor's own check, so a hand-edited desktop.toml cannot smuggle \
+         past what the panel applies: it must parse as an absolute http or \
+         https URL naming a host, http ONLY when that host is loopback, and it \
+         REFUSES a user:password@ authority outright — which is the one place \
+         a URL carries a credential and the specific reason this type exists \
+         rather than a `String`. A single-line token would still fit the \
+         charset inside a path segment; what rules that out is that the value \
+         is handed to reqwest as a destination and reaches no authentication \
+         surface as text, the same argument KeyPath makes about `ssh -i`. The \
+         credential these endpoints authenticate with is in the OS keychain \
+         under SecretId::VoiceIntent / SecretId::VoiceTranscription and has no \
+         field here at all",
+    ),
+    (
+        "ModelId",
+        FieldKind::Scalar,
+        "a newtype over String in desktop/src-tauri/src/model_service.rs \
+         naming which model a service is asked for, bounded at 128 bytes and \
+         restricted to ASCII alphanumerics plus '.', '/', '-', '_', ':' and \
+         '+' — the charset the three ecosystems PRD #802 touches actually \
+         publish identifiers in. That refuses every control byte, every \
+         whitespace byte and every non-ASCII byte, so a multi-line or padded \
+         blob is unrepresentable, and 128 bytes is far below anything that \
+         could carry a key. Its deserializer runs the constructor's own check. \
+         It is a label sent as one field of a request body and authenticates \
+         nothing",
+    ),
+    (
+        "TokenCeiling",
+        FieldKind::Scalar,
+        "a newtype over u32 in desktop/src-tauri/src/model_service.rs holding \
+         how many tokens one command answer may cost, bounded at 64..=32768 by \
+         a deserializer that runs the constructor's own check. It is an \
+         integer; there is no text for a credential to be, which is `u32`'s \
+         reason and means the guard would have passed a bare integer here. \
+         Read the newtype as being about the RANGE rather than about this \
+         list: `max_tokens = 0` is a stage that can never answer and \
+         `max_tokens = 4000000000` is a bill, and both are perfectly good \
+         `u32`s. It is sent as one field of a request body and authenticates \
+         nothing",
+    ),
+    (
+        "VoiceSettings",
+        FieldKind::Section,
+        "a section struct, whose own fields this check walks. It holds one \
+         enum and two nested stage sections, and deliberately NOT a boolean \
+         saying whether a key is stored — which PRD #803's rule would have \
+         allowed: the panel asks the SecretStore itself, so the answer cannot \
+         go stale against the keychain, and `bool` stays off this list",
+    ),
+    (
+        "TranscriptionSettings",
+        FieldKind::Section,
+        "a section struct — the speech stage — whose own fields this check \
+         walks: which backend, the ServiceUrl it is reached at, the ModelId it \
+         is asked for. Nested rather than flattened into VoiceSettings because \
+         this struct serialises to both TOML and JSON and every field name has \
+         to stay one snake_case word on both sides; `speech_endpoint` and \
+         `commands_endpoint` would be two spellings waiting to drift",
+    ),
+    (
+        "IntentSettings",
+        FieldKind::Section,
+        "a section struct — the command stage — whose own fields this check \
+         walks, in TranscriptionSettings' shape plus one field: the answer \
+         ceiling, which the speech stage has no counterpart for because a \
+         transcription is as long as the audio was. Both of its backends are \
+         HTTP, so the endpoint and the model are live under either one and the \
+         panel shows them always — the backend picks which preset they default \
+         to, not whether they are read. They were ignored under the withdrawn \
+         agent-CLI backend, which spawned a process rather than making a \
+         request; nothing in the enum does that now",
+    ),
 ];
 
 /// The type an allowlist lookup is really performed on: one `Option<…>` or
@@ -327,7 +478,7 @@ const KEYLESS_MEMBERS: [&str; 3] = ["clear", "key", "length"];
 /// name scan on this side would repeat the mistake #827 is about: `endpoint:
 /// string` passes any name check and is a free-text field. A diff here is the
 /// review prompt.
-const PINNED_TS_FIELDS: [(&str, &str, &str); 16] = [
+const PINNED_TS_FIELDS: [(&str, &str, &str); 24] = [
     ("DesktopSettingsDto", "version", "number"),
     (
         "DesktopSettingsDto",
@@ -340,6 +491,11 @@ const PINNED_TS_FIELDS: [(&str, &str, &str); 16] = [
     // section over a user's decks. A required field here would make the
     // normaliser fabricate one.
     ("DesktopSettingsDto", "endpoints?", "EndpointSettingsDto"),
+    // PRD #802 M4. `?` is load-bearing for the reason `endpoints?` is: the Rust
+    // field is an `Option<VoiceSettings>` whose `None` means *unspecified*, and
+    // a required field here would make the normaliser fabricate a section that
+    // the merge then writes over the user's choices.
+    ("DesktopSettingsDto", "voice?", "VoiceSettingsDto"),
     ("DesktopSettingsDto", "zoom", "{ level: number }"),
     // The two nested interfaces are scanned as well, and that is the point of
     // adding them rather than letting `EndpointSettingsDto` be an opaque name:
@@ -357,6 +513,34 @@ const PINNED_TS_FIELDS: [(&str, &str, &str); 16] = [
     ("RemoteEndpointDto", "port", "number"),
     ("RemoteEndpointDto", "socket?", "string"),
     ("RemoteEndpointDto", "user?", "string"),
+    // Scanned as its own interface rather than left an opaque name, for the
+    // reason the endpoint ones are: a credential riding in through a nested
+    // shape would otherwise be invisible to this pin. `activation` is a token
+    // naming a MODE and the two stages are nested objects, whose own interface
+    // is pinned below. The credential those backends authenticate with is in
+    // the OS keychain and has no field here — `SecretStatusDto` below is a
+    // boolean plus a sentence, and is the whole of what this side ever learns
+    // about one.
+    ("VoiceSettingsDto", "activation", "string"),
+    ("VoiceSettingsDto", "intent", "VoiceIntentStageDto"),
+    ("VoiceSettingsDto", "transcription", "VoiceStageDto"),
+    // PRD #802's provider work. One interface for both stages, because both
+    // hold the same three values and a second copy would be a second place to
+    // forget a field. Every one is a REFERENCE — which backend, where it is,
+    // which model to ask it for — and the Rust counterpart of each is either a
+    // closed enum or a validating newtype on ALLOWED_FIELD_TYPES. There is
+    // still no key field, on either stage, in either direction.
+    ("VoiceStageDto", "backend", "string"),
+    ("VoiceStageDto", "endpoint", "string"),
+    ("VoiceStageDto", "model", "string"),
+    // PRD #802's ceiling fix. The command stage is the shared interface plus
+    // one number, so it extends rather than copies — `ts_interface_fields`
+    // reads the declared members of each block, so the three inherited names
+    // are pinned once above and `max_tokens` is pinned here. It is snake_case
+    // because these keys are the wire's own spelling and nothing renames. A
+    // ceiling on the answer is not a credential in any reading: it is an
+    // integer, and the Rust counterpart is a newtype bounded at 64..=32768.
+    ("VoiceIntentStageDto", "max_tokens", "number"),
     (
         "DesktopSettingsSnapshotDto",
         "settings",
@@ -1227,6 +1411,9 @@ pub struct VoiceSettings {
             "DesktopSettingsDto",
             "EndpointSettingsDto",
             "RemoteEndpointDto",
+            "VoiceSettingsDto",
+            "VoiceStageDto",
+            "VoiceIntentStageDto",
             "DesktopSettingsSnapshotDto",
         ] {
             let body = block_after(&source, &format!("export interface {interface} "))
@@ -1273,6 +1460,17 @@ pub struct VoiceSettings {
             "export function normalizeDesktopSettings(value: unknown): DesktopSettingsDto ",
             "function normalizeEndpointSettings(value: unknown): EndpointSettingsDto | undefined ",
             "function normalizeRemoteEndpoint(value: unknown): RemoteEndpointDto | undefined ",
+            // PRD #802 M4's section normaliser. It is on this list for the same
+            // reason the endpoint ones are: a spread inside it would carry an
+            // undeclared field into the document just as surely as one in the
+            // parent, and this document is written to `localStorage` verbatim
+            // by the fixture bridge.
+            "function normalizeVoiceSettings(value: unknown): VoiceSettingsDto | undefined ",
+            // And the command stage's own normaliser, which builds on
+            // `normalizeVoiceStage` rather than spreading it — the field this
+            // list is about would ride in just as easily through a nested
+            // builder as through the parent.
+            "function normalizeVoiceIntentStage(value: unknown): VoiceIntentStageDto ",
         ] {
             let body = block_after(&source, signature)
                 .unwrap_or_else(|| panic!("no `{signature}` in {BRIDGE_TS}"));
@@ -1301,7 +1499,7 @@ pub struct VoiceSettings {
         keys.sort();
         assert_eq!(
             keys,
-            ["appearance", "endpoints", "version", "zoom"],
+            ["appearance", "endpoints", "version", "voice", "zoom"],
             "unexpected normaliser result shape:\n{returned}"
         );
     }
