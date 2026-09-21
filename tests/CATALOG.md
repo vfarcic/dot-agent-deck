@@ -629,7 +629,35 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Layer:** L1 (two registered panes and one shared producer session id applied through `AppState::apply_event`).
 - **Agent:** none (synthetic Pi generations under two distinct registry agent ids).
 - **Asserts:** after a Pi card on pane A accumulates a tool tally, a frame carrying the same producer session id but pane B's id and a different registry agent id leaves the card's `agent_id`, `tool_count` and `started_at` untouched.
-- **Does not assert:** that the card stays on pane A. The unconditional `session.pane_id` refresh further down `apply_event` still moves a surviving card onto the event's pane; that is a separate seam with its own consumers (untagged adoption depends on it) and is out of scope for issue #321, which is about the identity refresh. Nor does it assert that session ids ARE unique across panes — the point is that the supersession no longer trusts an assumption nothing enforces.
+- **Does not assert:** where each card ends up — that is `status/supersede/012`, which closed the relocation this test deliberately left open (issue #925). Nor does it assert that session ids ARE unique across panes — the point is that the supersession no longer trusts an assumption nothing enforces.
+- **Platform coverage:** mac+linux+windows.
+
+##### status/supersede/012 — A frame whose session key belongs to another pane's card gets a card for the pane it actually named.
+- **Layer:** L1 (two registered panes and one shared producer session id applied through `AppState::apply_event`).
+- **Agent:** none (synthetic Pi generations under two distinct registry agent ids).
+- **Asserts:** after a Pi card on pane A accumulates a tool tally, a frame carrying the same producer session id but pane B's id and a different registry agent id leaves pane A holding its own card, agent id and tally, and produces a separate card on pane B carrying pane B's agent — one card per pane, neither borrowed from the other.
+- **Does not assert:** that a producer cannot reuse a session key across panes. It can: Claude Code's `--resume` / `--continue` reuse the original session id, and the hook builders read `session_id` from the agent's payload while reading `pane_id` from the environment. This pins what the daemon does with such a frame, not whether one arrives. Nor does it assert anything about the rendered card — `build_pane_status` is `pub(crate)` and out of reach from `tests/`.
+- **Platform coverage:** mac+linux+windows.
+
+##### status/supersede/013 — A terminal frame whose session key belongs to another pane's card ends its own pane's card, not that one.
+- **Layer:** L1 (two registered panes each holding a card, and a `SessionEnd` applied through `AppState::apply_event`).
+- **Agent:** none (synthetic Pi generations under two distinct registry agent ids).
+- **Asserts:** a `SessionEnd` naming pane B under a session key pane A's card also carries leaves pane A's card, agent id and tally untouched, and removes pane B's own card instead.
+- **Does not assert:** that the restored placeholder on pane B carries any particular field — `status/supersede/008` and the `SessionEnd` branch's own tests cover the restore. This test is about which pane the terminal frame reaches.
+- **Platform coverage:** mac+linux+windows.
+
+##### status/supersede/014 — A card created by a pane-less event still learns its pane from a later frame.
+- **Layer:** L1 (a pane-less event, a `register_pane`, and a paned frame applied through `AppState::apply_event`).
+- **Agent:** none (one synthetic Pi generation under a single registry agent id).
+- **Asserts:** the card created without a pane is bound to the pane its own agent later reports from, stays a single card, and keeps its tool tally across the transition.
+- **Does not assert:** a regression. This is the carve-out test for `status/supersede/012`'s guard, which fires only when BOTH sides name a pane and the panes differ — it passes before and after issue #925 by design, and its job is to fail if that guard is ever widened to treat a stored `None` as a wrong pane.
+- **Platform coverage:** mac+linux+windows.
+
+##### status/supersede/015 — A stacked key collision still lands the frame on its own pane's card.
+- **Layer:** L1 (three registered panes, applied through `AppState::apply_event`).
+- **Agent:** none (synthetic Pi generations under three distinct registry agent ids).
+- **Asserts:** with pane A holding a card under key `K` and a third pane already holding one under the exact key that re-keying `K` for pane B derives, a frame naming pane B under `K` leaves both of those cards with their own agent and tally and takes a card of its own — the re-key is applied until the key stops resolving to another pane's session, not once.
+- **Does not assert:** that a producer would ever emit the derived spelling. It cannot be ruled out — session ids arrive verbatim on producer payloads with no reserved format — which is the whole reason the re-key repeats rather than trusting one pass (Greptile P1 on PR #1187).
 - **Platform coverage:** mac+linux+windows.
 
 #### status/shell-activity

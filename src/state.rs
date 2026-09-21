@@ -8584,6 +8584,30 @@ impl AppState {
             .or_insert(started_at);
     }
 
+    /// Issue #925: qualify a producer's session key by the pane a frame named,
+    /// for the case where that key already resolves to a session on a DIFFERENT
+    /// pane. The call site in [`Self::apply_event`] carries the reasoning.
+    ///
+    /// Deterministic, so every later frame from one collision derives the same
+    /// id and lands on the same card instead of minting a new one per frame.
+    ///
+    /// One application is NOT a fixed point, which is why the caller applies it
+    /// in a bounded loop rather than once: a producer can plant a session under
+    /// this derived spelling too, on a third pane, and a single pass would land
+    /// the frame on THAT card. The caller's comment carries the loop's
+    /// termination proof.
+    ///
+    /// The derived id can reach the eye: an unnamed card titles itself with the
+    /// first 11 characters of its session id (`render_dashboard`, issue #574's
+    /// char-boundary truncator, so no width here can panic it). That only
+    /// happens where the card is minted rather than adopted — pane B had no
+    /// card of its own — and a prefixed id on a card that would otherwise not
+    /// exist at all is the better of the two, so it is accepted rather than
+    /// worked around.
+    fn pane_qualified_session_id(pane_id: &str, session_id: &str) -> String {
+        format!("{pane_id}::{session_id}")
+    }
+
     pub fn apply_event(&mut self, mut event: AgentEvent) {
         // Issue #833: `tool_name` / `tool_detail` are PRODUCER-supplied — every
         // agent on the deck can post to the hook socket — and both are drawn
@@ -8741,6 +8765,103 @@ impl AppState {
         // the reuse guard for issue #398 — the adoption fallback below needs the
         // same predicate, for a related reason spelled out at its use.
         let claims_generation = event.event_type != EventType::SessionEnd;
+
+        // Issue #925: a producer's session key says nothing about WHICH PANE a
+        // frame came from, and this is the last point before the key is spent.
+        // Every seam from here on that resolves THIS FRAME TO A CARD does so
+        // through `event.session_id` alone: the reuse guard's
+        // `sessions.remove(&old_id)` just below, the same-key identity refresh,
+        // the `SessionEnd` branch's restore-and-remove, and finally the
+        // `sessions.entry(...)` that lands this frame's status on a card. (The
+        // retire loop in between is the exception that proves it — it selects
+        // its victims BY PANE, which is why it could never reach across one.)
+        // So a frame naming pane B under a key held by a session on pane A
+        // reached PANE A's card at all four. The visible outcome was the
+        // unconditional `session.pane_id` refresh further down dragging that
+        // card onto pane B: pane A ended with no card at all, and pane B's card
+        // carried pane A's identity and history under pane B's status
+        // (`status/supersede/012`).
+        //
+        // RE-KEY, do not refuse. The frame is not forged. `owns_pane_event`
+        // above has already confirmed this daemon owns pane B for this
+        // `agent_id`, and its own comment is explicit that owning a pane was
+        // never evidence about which generation a report belongs to — so
+        // dropping the frame would discard pane B's real status. Only the KEY is
+        // ambiguous, so the key is what gets disambiguated.
+        //
+        // Freezing `session.pane_id` instead would have been worse than the
+        // relocation it fixes. That refresh is one of NINE fields the block
+        // below writes unconditionally on the surviving card (`display_name`,
+        // `last_activity`, `agent_type`, `last_user_prompt`, `first_prompts`,
+        // `status`, `active_tool`, `tool_count`, and the `recent_events`
+        // journal), so pinning the pointer alone yields a card CLAIMING pane A
+        // while carrying pane B's status and tools — and `build_pane_status`
+        // keys by `pane_id`, so pane A would then report pane B's status.
+        //
+        // The derived id is usually transient rather than a card of its own: the
+        // reuse guard immediately below adopts pane B's existing session
+        // whenever one carries this `agent_id`, which is the outcome this is
+        // really after. A distinct card is minted only where pane B genuinely
+        // has none — which is what "the frame gets its own pane's card" has to
+        // mean when that pane has no card yet.
+        //
+        // Deliberately narrow, mirroring the pane check issue #321 added to the
+        // identity refresh below: it fires only when BOTH sides name a pane and
+        // the panes differ. A stored `None` is the `None` -> `Some` transition
+        // the refresh exists to serve — a session created by a pane-less event
+        // later learning its pane — and re-keying there would break it.
+        //
+        // This is not issue #398 in reverse: that failure was two cards on ONE
+        // pane. Here the two cards sit on different panes, so one-card-per-pane
+        // is preserved — restored, in fact, since the relocation left pane A
+        // with none.
+        //
+        // The collision is reachable from a real producer, which the issue had
+        // left open. `session_id` and `pane_id` have independent origins on the
+        // hook path: [`crate::hook`]'s builders take the session id from the
+        // AGENT's own payload and read `pane_id` / `agent_id` from the
+        // environment. Claude Code's `--resume` / `--continue` reuse the
+        // original session id (that is what its `--fork-session` flag opts out
+        // of), so resuming pane A's conversation in pane B makes pane B's hooks
+        // report under pane A's key while genuinely owning pane B. Pi's
+        // `agent-event` cannot do it — it derives BOTH fields from
+        // `DOT_AGENT_DECK_PANE_ID` — even though its `{pane_id}-session`
+        // convention is what first put the assumption in doubt.
+        //
+        // Qualifying REPEATS until the key no longer resolves to a foreign
+        // session, because one pass is not enough (Greptile PR #1187, P1): if a
+        // third pane already held a card under the derived string itself, a
+        // single pass would land the frame straight on THAT card and reproduce
+        // this very bug one level down. Session ids come off producer payloads
+        // with no reserved-format constraint, so no spelling of the derived key
+        // can be assumed unused (`status/supersede/015`).
+        //
+        // The bound is the termination proof rather than defensive padding.
+        // Each step prepends `{pane_id}::`, so every key it produces is
+        // strictly longer than the one before and therefore distinct from all
+        // of them; and a step happens only when the key it is replacing IS an
+        // existing foreign session. Each step therefore consumes a distinct
+        // member of a map that is finite and not written inside the loop, so
+        // after at most `self.sessions.len()` steps no foreign session remains
+        // to land on — and the one extra iteration is the check that confirms
+        // it. Nothing here can spin, and no arm exits with the key still
+        // foreign.
+        if let Some(ref pane_id) = event.pane_id {
+            for _ in 0..=self.sessions.len() {
+                let lands_on_another_pane =
+                    self.sessions.get(&event.session_id).is_some_and(|session| {
+                        session
+                            .pane_id
+                            .as_deref()
+                            .is_some_and(|stored| stored != pane_id)
+                    });
+                if !lands_on_another_pane {
+                    break;
+                }
+                event.session_id = Self::pane_qualified_session_id(pane_id, &event.session_id);
+            }
+        }
+
         // PRD #110: reuse the existing session card for the same pane
         // ONLY when the agent_id matches (or both sides are absent for
         // pre-F9 backward-compat). A different agent_id means the agent
@@ -9093,12 +9214,20 @@ impl AppState {
         // comparison that is possible is made; none is invented.
         //
         // What this does NOT close is the unconditional `session.pane_id`
-        // refresh further down, which still moves a surviving card onto the
-        // event's pane. That is a different seam with its own consumers (the
-        // untagged-adoption path depends on it) and is out of scope here — what
-        // this guard protects is the card's IDENTITY and accumulated history,
-        // which is what "refresh a session's identity from the wrong pane"
-        // means.
+        // refresh further down, which moved a surviving card onto the event's
+        // pane. That is a different seam and was out of scope here — what this
+        // guard protects is the card's IDENTITY and accumulated history, which
+        // is what "refresh a session's identity from the wrong pane" means.
+        //
+        // Issue #925 closed that seam from the other end: the cross-pane
+        // re-key above qualifies the key of such a frame BEFORE any of this
+        // runs, and repeats until the key stops resolving to another pane's
+        // session, so the cross-pane input this block was written against no
+        // longer arrives here. This check stays regardless — it is the
+        // narrower statement, it covers the frames the re-key deliberately
+        // leaves alone (either side naming no pane), and an identity
+        // protection that depends on an earlier block not being edited is not
+        // a protection.
         if claims_generation
             && let Some(incoming_agent_id) = event.agent_id.as_deref()
             && self.sessions.get(&event.session_id).is_some_and(|session| {
@@ -9562,6 +9691,13 @@ impl AppState {
             }
         }
 
+        // The `None` -> `Some` case is what this is for: a session created by a
+        // pane-less event later learning the pane its agent reports from
+        // (`status/supersede/014`). It used to also RELOCATE a live card onto a
+        // foreign pane, because a frame naming pane B could resolve to a session
+        // on pane A — issue #925's re-key above is what took that input away,
+        // rather than a condition here. Freezing the pointer here was the
+        // tempting fix and the wrong one; the re-key's own comment says why.
         if event.pane_id.is_some() {
             session.pane_id.clone_from(&event.pane_id);
         }
