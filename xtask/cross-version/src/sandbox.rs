@@ -94,18 +94,7 @@ impl Sandbox {
         if name.is_empty() || name.contains('/') || name.starts_with('.') {
             return Err(format!("refusing sandbox name {name:?}"));
         }
-        let runs_root = std::fs::canonicalize(runs_root)
-            .map_err(|e| format!("canonicalize runs root {}: {e}", runs_root.display()))?;
-        let root = runs_root.join(name);
-        mkdir_private(&root)?;
-        require_private_dir(&root)?;
-        if std::fs::canonicalize(&root).ok().as_deref() != Some(root.as_path()) {
-            return Err(format!(
-                "{} does not canonicalize to itself",
-                root.display()
-            ));
-        }
-        let sb = Self::at(root);
+        let sb = Self::at(create_private_dir("runs root", runs_root, name)?);
         for dir in [
             &sb.home,
             &sb.config,
@@ -186,6 +175,23 @@ impl Sandbox {
     pub fn inner_evidence(&self) -> PathBuf {
         self.artifacts.join("inner-evidence.json")
     }
+}
+
+/// Create `<parent>/<name>` fresh and owner-only, and return its canonical
+/// path. `parent` is canonicalized first (`what` names it in the error); the
+/// leaf is made at `0700` and never over an existing entry, then required to be
+/// a real directory owned by this uid with no group or other bits, at a path
+/// that canonicalizes to itself.
+pub fn create_private_dir(what: &str, parent: &Path, name: &str) -> Result<PathBuf, String> {
+    let parent = std::fs::canonicalize(parent)
+        .map_err(|e| format!("canonicalize {what} {}: {e}", parent.display()))?;
+    let dir = parent.join(name);
+    mkdir_private(&dir)?;
+    require_private_dir(&dir)?;
+    if std::fs::canonicalize(&dir).ok().as_deref() != Some(dir.as_path()) {
+        return Err(format!("{} does not canonicalize to itself", dir.display()));
+    }
+    Ok(dir)
 }
 
 /// `mkdir` at `0700`, failing if anything already exists at `path`.

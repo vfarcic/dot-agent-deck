@@ -812,6 +812,17 @@ impl Tree for DiskTree<'_> {
 }
 
 /// A scratch directory removed when dropped.
+///
+/// The path is the one [`crate::sandbox::create_private_dir`] created and
+/// canonicalized, so `remove_dir_all` is handed the leaf this module made, and
+/// it does not follow a symlink at that leaf or under it: std documents that it
+/// removes a symlink rather than descending through it, and that on Linux it is
+/// protected against one swapped in mid-walk (its Unix implementation opens
+/// each directory with `openat` and `O_NOFOLLOW`). A symlink at the leaf and
+/// one under it are pinned by
+/// `dropping_the_scratch_never_follows_a_symlink_out_of_it`. The leaf being
+/// `0700` keeps anyone but its owner from creating entries in it; replacing the
+/// leaf itself needs write access to the runs root.
 struct Scratch(std::path::PathBuf);
 
 impl Drop for Scratch {
@@ -840,86 +851,230 @@ fn nul_list(bytes: &[u8]) -> BTreeSet<String> {
         .collect()
 }
 
-/// The surface at one merge-base: extract its tree with `git archive` into a
-/// fresh directory under `scratch_parent`, prove the extraction complete
-/// against `git ls-tree`, run `cargo metadata --no-deps` there, and derive.
-fn surface_at(
-    clone: &Path,
-    merge_base: &str,
-    scratch_parent: &Path,
-    git: &dyn Fn(&Path) -> Command,
-    cargo: &dyn Fn(&Path) -> Command,
-) -> Result<Surface, String> {
-    let short: String = merge_base.chars().take(12).collect();
-    let dir = scratch_parent.join(format!(
-        ".xver-merge-base-{short}-{}-{}",
-        crate::epoch_secs(),
-        std::process::id()
-    ));
-    std::fs::create_dir(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
-    let scratch = Scratch(dir);
-    let mut archive = git(clone)
-        .args(["archive", "--format=tar", merge_base])
-        .stdout(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("git archive {merge_base}: {e}"))?;
-    let tar_in = archive.stdout.take().ok_or("git archive: no stdout")?;
-    let tar = Command::new("tar")
-        .arg("-x")
-        .arg("-C")
-        .arg(&scratch.0)
-        .env_clear()
-        .env("PATH", "/usr/bin:/bin")
-        .stdin(tar_in)
-        .output()
-        .map_err(|e| format!("tar -x: {e}"))?;
-    let archived = archive
-        .wait()
-        .map_err(|e| format!("git archive {merge_base}: {e}"))?;
-    if !archived.success() || !tar.status.success() {
-        return Err(format!(
-            "extracting the merge-base {merge_base} failed (git archive {archived}, tar {}): {}",
-            tar.status,
-            String::from_utf8_lossy(&tar.stderr).trim()
-        ));
+/// The git and cargo steps the gate is made of. [`evaluate_with`] is the
+/// decision over their results — which failure refuses, and what the surface
+/// is when none does — so it is tested with a fake in place of git and cargo.
+pub trait Steps {
+    /// `git merge-base --all <base> <head>`'s output.
+    fn merge_bases(&self, base: &str, head: &str) -> Result<Vec<u8>, String>;
+    /// `git diff --name-only --no-renames -z <merge_base> <head>`'s output.
+    fn diff(&self, merge_base: &str, head: &str) -> Result<Vec<u8>, String>;
+    /// Extract `merge_base`'s tree into `dir`, a fresh empty directory.
+    fn extract(&self, merge_base: &str, dir: &Path) -> Result<(), String>;
+    /// `git ls-tree -r -z <merge_base>`'s output.
+    fn ls_tree(&self, merge_base: &str) -> Result<Vec<u8>, String>;
+    /// `cargo metadata --no-deps` run in `dir`: its output.
+    fn metadata(&self, dir: &Path) -> Result<Vec<u8>, String>;
+}
+
+/// [`Steps`] for real: `git` in the build clone, `cargo` in the extraction.
+struct Host<'a> {
+    clone: &'a Path,
+    git: &'a dyn Fn(&Path) -> Command,
+    cargo: &'a dyn Fn(&Path) -> Command,
+}
+
+impl Steps for Host<'_> {
+    fn merge_bases(&self, base: &str, head: &str) -> Result<Vec<u8>, String> {
+        run_ok(
+            (self.git)(self.clone).args(["merge-base", "--all", base, head]),
+            "git merge-base",
+        )
     }
-    // `git archive` honours `export-ignore`; a tree that dropped a file is not
-    // the tree cargo would see, so the extraction must be complete.
-    let listing = run_ok(
-        git(clone).args(["ls-tree", "-r", "-z", merge_base]),
-        "git ls-tree",
-    )?;
-    let mut missing = Vec::new();
+
+    fn diff(&self, merge_base: &str, head: &str) -> Result<Vec<u8>, String> {
+        run_ok(
+            (self.git)(self.clone).args([
+                "diff",
+                "--name-only",
+                "--no-renames",
+                "-z",
+                merge_base,
+                head,
+            ]),
+            "git diff --name-only",
+        )
+    }
+
+    fn extract(&self, merge_base: &str, dir: &Path) -> Result<(), String> {
+        let mut archive = (self.git)(self.clone)
+            .args(["archive", "--format=tar", merge_base])
+            .stdout(Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("git archive {merge_base}: {e}"))?;
+        let tar_in = archive.stdout.take().ok_or("git archive: no stdout")?;
+        let tar = Command::new("tar")
+            .arg("-x")
+            .arg("-C")
+            .arg(dir)
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .stdin(tar_in)
+            .output()
+            .map_err(|e| format!("tar -x: {e}"))?;
+        let archived = archive
+            .wait()
+            .map_err(|e| format!("git archive {merge_base}: {e}"))?;
+        if !archived.success() || !tar.status.success() {
+            return Err(format!(
+                "extracting the merge-base {merge_base} failed (git archive {archived}, tar {}): {}",
+                tar.status,
+                String::from_utf8_lossy(&tar.stderr).trim()
+            ));
+        }
+        Ok(())
+    }
+
+    fn ls_tree(&self, merge_base: &str) -> Result<Vec<u8>, String> {
+        run_ok(
+            (self.git)(self.clone).args(["ls-tree", "-r", "-z", merge_base]),
+            "git ls-tree",
+        )
+    }
+
+    fn metadata(&self, dir: &Path) -> Result<Vec<u8>, String> {
+        run_ok(
+            (self.cargo)(dir).args([
+                "metadata",
+                "--no-deps",
+                "--offline",
+                "--locked",
+                "--format-version",
+                "1",
+            ]),
+            "cargo metadata --no-deps at the merge-base",
+        )
+    }
+}
+
+/// The blob paths a `git ls-tree -r -z` listing names: every file and symlink
+/// in the tree. A submodule's `commit` entry holds no file and is skipped. A
+/// listing that cannot be read exactly — an entry that is not UTF-8, or has no
+/// path — is refused rather than converted lossily or dropped, since either
+/// would take a tracked file out of the comparison.
+pub fn tracked_blobs(listing: &[u8]) -> Result<BTreeSet<String>, String> {
+    let mut out = BTreeSet::new();
     for entry in listing.split(|b| *b == 0).filter(|s| !s.is_empty()) {
-        let entry = String::from_utf8_lossy(entry);
+        let entry = std::str::from_utf8(entry).map_err(|_| {
+            format!(
+                "a `git ls-tree` entry is not UTF-8: {:?}",
+                String::from_utf8_lossy(entry)
+            )
+        })?;
         let Some((meta, path)) = entry.split_once('\t') else {
-            continue;
+            return Err(format!("a `git ls-tree` entry names no path: {entry:?}"));
         };
-        if meta.split_whitespace().nth(1) == Some("blob")
-            && std::fs::symlink_metadata(scratch.0.join(path)).is_err()
-        {
-            missing.push(path.to_string());
+        if meta.split_whitespace().nth(1) == Some("blob") {
+            out.insert(path.to_string());
         }
     }
+    Ok(out)
+}
+
+/// Every non-directory entry under `root` — files and symlinks, which are
+/// listed and never followed — as a `/`-separated path relative to it. A name
+/// that is not UTF-8 is refused, as in [`tracked_blobs`].
+fn extracted_files(root: &Path) -> Result<BTreeSet<String>, String> {
+    let mut out = BTreeSet::new();
+    let mut stack = vec![String::new()];
+    while let Some(rel) = stack.pop() {
+        let dir = root.join(&rel);
+        let entries =
+            std::fs::read_dir(&dir).map_err(|e| format!("read {}: {e}", dir.display()))?;
+        for entry in entries {
+            let entry = entry.map_err(|e| format!("read {}: {e}", dir.display()))?;
+            let name = entry
+                .file_name()
+                .into_string()
+                .map_err(|n| format!("a name in the extraction is not UTF-8: {n:?}"))?;
+            let path = join(&rel, &name);
+            let ty = entry
+                .file_type()
+                .map_err(|e| format!("lstat {path}: {e}"))?;
+            if ty.is_dir() {
+                stack.push(path);
+            } else {
+                out.insert(path);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Whether an extraction of `merge_base` is exactly its tree, by path: every
+/// blob `git ls-tree -r` lists is present, and nothing else is.
+///
+/// A **missing** file is what `git archive` does with an `export-ignore`
+/// attribute, and a surface derived from a tree that lost, say, its
+/// `.cargo/config.toml` has lost the linker that file names. An **extra** file
+/// is refused too: `git archive` of the merge-base writes the listed blobs and
+/// no other file, so an extra one came from something else, and the tree the
+/// derivation and `cargo metadata` would read is not the merge-base's — a
+/// `rust-toolchain.toml` or a `.cargo/config.toml` there changes what that
+/// `cargo` runs. A `tar` that wrote git's pax header out as a file would be
+/// refused here as well, which fails closed.
+///
+/// Directories are not compared: git records none of its own, and `git
+/// archive` writes one for each that holds a file (and for a submodule), so an
+/// extra one is empty. The derivation reads files, and counts an existing
+/// directory as a whole subtree, which adds to the surface.
+pub fn check_extraction(
+    merge_base: &str,
+    tracked: &BTreeSet<String>,
+    extracted: &BTreeSet<String>,
+) -> Result<(), String> {
+    let missing: Vec<&String> = tracked.difference(extracted).collect();
+    let extra: Vec<&String> = extracted.difference(tracked).collect();
+    let mut problems = Vec::new();
     if !missing.is_empty() {
-        return Err(format!(
-            "the extracted merge-base {merge_base} is missing {} tracked file(s) (an \
-             `export-ignore` attribute?), e.g. {:?}",
+        problems.push(format!(
+            "is missing {} tracked file(s) (an `export-ignore` attribute?), e.g. {:?}",
             missing.len(),
             &missing[..missing.len().min(5)]
         ));
     }
-    let meta = run_ok(
-        cargo(&scratch.0).args([
-            "metadata",
-            "--no-deps",
-            "--offline",
-            "--locked",
-            "--format-version",
-            "1",
-        ]),
-        "cargo metadata --no-deps at the merge-base",
-    )?;
+    if !extra.is_empty() {
+        problems.push(format!(
+            "holds {} file(s) its tree does not, e.g. {:?}",
+            extra.len(),
+            &extra[..extra.len().min(5)]
+        ));
+    }
+    if problems.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "the extracted merge-base {merge_base} {}",
+        problems.join(", and ")
+    ))
+}
+
+/// The surface at one merge-base: extract its tree into a fresh owner-only
+/// directory under `scratch_parent`, prove the extraction is exactly the tree
+/// `git ls-tree` lists, and only then run `cargo metadata --no-deps` there and
+/// derive.
+fn surface_at(
+    steps: &dyn Steps,
+    merge_base: &str,
+    scratch_parent: &Path,
+) -> Result<Surface, String> {
+    let short: String = merge_base.chars().take(12).collect();
+    let scratch = Scratch(crate::sandbox::create_private_dir(
+        "the merge-base scratch parent",
+        scratch_parent,
+        &format!(
+            ".xver-merge-base-{short}-{}-{}",
+            crate::epoch_secs(),
+            std::process::id()
+        ),
+    )?);
+    steps.extract(merge_base, &scratch.0)?;
+    // `git archive` honours `export-ignore`; a tree that dropped a file is not
+    // the tree cargo would see, so the extraction must be exactly the tree —
+    // checked before `cargo` runs in it.
+    let tracked = tracked_blobs(&steps.ls_tree(merge_base)?)?;
+    check_extraction(merge_base, &tracked, &extracted_files(&scratch.0)?)?;
+    let meta = steps.metadata(&scratch.0)?;
     let meta: serde_json::Value = serde_json::from_slice(&meta)
         .map_err(|e| format!("parse `cargo metadata` at the merge-base: {e}"))?;
     derive_surface(&meta, &DiskTree(&scratch.0))
@@ -937,17 +1092,34 @@ pub fn evaluate(
     git: &dyn Fn(&Path) -> Command,
     cargo: &dyn Fn(&Path) -> Command,
 ) -> Result<(Comparison, Vec<(String, String)>), String> {
+    evaluate_with(
+        &Host { clone, git, cargo },
+        repo,
+        base_sha,
+        head_sha,
+        scratch_parent,
+    )
+}
+
+/// [`evaluate`] over any [`Steps`]. Every step's failure, and a history with
+/// no merge-base, is a refusal; several merge-bases are each compared, and the
+/// changed paths and the surfaces are unioned across them.
+pub fn evaluate_with(
+    steps: &dyn Steps,
+    repo: &str,
+    base_sha: &str,
+    head_sha: &str,
+    scratch_parent: &Path,
+) -> Result<(Comparison, Vec<(String, String)>), String> {
     let refuse = |e: String| {
         format!(
             "refusing before `cargo build` — nothing was compiled: the build-time comparison \
              with `origin/{BASE_BRANCH}` could not be made ({e})"
         )
     };
-    let mbs = run_ok(
-        git(clone).args(["merge-base", "--all", base_sha, head_sha]),
-        "git merge-base",
-    )
-    .map_err(|e| refuse(format!("no merge-base: {e}")))?;
+    let mbs = steps
+        .merge_bases(base_sha, head_sha)
+        .map_err(|e| refuse(format!("no merge-base: {e}")))?;
     let merge_bases: Vec<String> = String::from_utf8_lossy(&mbs)
         .lines()
         .map(|l| l.trim().to_string())
@@ -961,14 +1133,8 @@ pub fn evaluate(
     let mut changed = BTreeSet::new();
     let mut surface = Surface::default();
     for mb in &merge_bases {
-        changed.extend(nul_list(
-            &run_ok(
-                git(clone).args(["diff", "--name-only", "--no-renames", "-z", mb, head_sha]),
-                "git diff --name-only",
-            )
-            .map_err(refuse)?,
-        ));
-        surface.merge(surface_at(clone, mb, scratch_parent, git, cargo).map_err(refuse)?);
+        changed.extend(nul_list(&steps.diff(mb, head_sha).map_err(refuse)?));
+        surface.merge(surface_at(steps, mb, scratch_parent).map_err(refuse)?);
     }
     let changes = build_time_changes(&changed, &surface);
     Ok((
@@ -985,6 +1151,8 @@ pub fn evaluate(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::{Cell, RefCell};
+    use std::path::PathBuf;
 
     /// An in-memory tree: path → contents; directories are implied.
     struct Mem(BTreeMap<String, String>);
@@ -1402,5 +1570,355 @@ mod tests {
         let got = build_time_changes(&changed, &surface(&["build_version_resolve.rs"], &[]));
         let paths: Vec<&str> = got.iter().map(|(p, _)| p.as_str()).collect();
         assert_eq!(paths, vec!["Cargo.lock", "build_version_resolve.rs"]);
+    }
+
+    fn set(paths: &[&str]) -> BTreeSet<String> {
+        paths.iter().map(|p| p.to_string()).collect()
+    }
+
+    #[test]
+    fn the_tree_listing_is_its_blobs_and_refuses_what_it_cannot_read_exactly() {
+        let listing = b"100644 blob aaaa\tsrc/main.rs\x00120000 blob bbbb\t.agents/skills\x00\
+                        160000 commit cccc\tvendor/sub\x00100755 blob dddd\tscripts/a b.sh\x00";
+        assert_eq!(
+            tracked_blobs(listing).expect("reads"),
+            set(&[".agents/skills", "scripts/a b.sh", "src/main.rs"]),
+            "files and symlinks are blobs; a submodule is not"
+        );
+        let err = tracked_blobs(b"100644 blob aaaa\tsrc/\xffx.rs\0").expect_err("not UTF-8");
+        assert!(err.contains("not UTF-8"), "{err}");
+        let err = tracked_blobs(b"100644 blob aaaa src/main.rs\0").expect_err("no path");
+        assert!(err.contains("names no path"), "{err}");
+    }
+
+    #[test]
+    fn an_extraction_that_is_exactly_the_tree_passes() {
+        let tree = set(&["Cargo.toml", ".cargo/config.toml", "scripts/link-gate.sh"]);
+        check_extraction("m", &tree, &tree.clone()).expect("complete");
+    }
+
+    #[test]
+    fn an_extraction_missing_a_tracked_file_is_refused_as_an_export_ignore() {
+        let tree = set(&["Cargo.toml", ".cargo/config.toml", "scripts/link-gate.sh"]);
+        let err = check_extraction("m", &tree, &set(&["Cargo.toml", "scripts/link-gate.sh"]))
+            .expect_err("incomplete");
+        assert!(err.contains("missing 1 tracked file"), "{err}");
+        assert!(err.contains("export-ignore"), "{err}");
+        assert!(err.contains(".cargo/config.toml"), "{err}");
+    }
+
+    /// Refused, not tolerated: `git archive` writes no file the tree lacks, so
+    /// the extra one came from elsewhere and the tree is not the merge-base's.
+    #[test]
+    fn an_extraction_holding_a_file_the_tree_lacks_is_refused() {
+        let tree = set(&["Cargo.toml"]);
+        let err = check_extraction("m", &tree, &set(&["Cargo.toml", "rust-toolchain.toml"]))
+            .expect_err("not the merge-base's tree");
+        assert!(err.contains("holds 1 file(s) its tree does not"), "{err}");
+        assert!(err.contains("rust-toolchain.toml"), "{err}");
+        let err = check_extraction("m", &tree, &set(&["x"])).expect_err("both at once");
+        assert!(err.contains("missing") && err.contains("holds"), "{err}");
+    }
+
+    const M1: &str = "1111111111111111111111111111111111111111";
+    const M2: &str = "2222222222222222222222222222222222222222";
+
+    const METADATA: &str = r#"{"workspace_root": "/w", "packages": [{
+        "name": "dot-agent-deck", "manifest_path": "/w/Cargo.toml", "dependencies": [],
+        "targets": [
+            {"kind": ["bin"], "name": "dot-agent-deck", "src_path": "/w/src/main.rs"},
+            {"kind": ["custom-build"], "name": "build-script-build", "src_path": "/w/build.rs"}
+        ]}]}"#;
+
+    /// [`Steps`] with no git and no cargo behind it. One tree serves every
+    /// merge-base: `ls-tree` lists it, `extract` writes it — with a symlink to
+    /// a directory in it, and an empty directory for a submodule, as `git
+    /// archive` would.
+    struct Fake {
+        /// The step that fails: `merge-base`, `diff`, `extract`, `ls-tree` or
+        /// `metadata`.
+        fail: Option<&'static str>,
+        /// What `git merge-base --all` prints.
+        bases: &'static str,
+        /// The paths each merge-base's diff with the head names.
+        changed: Vec<(&'static str, Vec<&'static str>)>,
+        tree: Vec<(&'static str, &'static str)>,
+        /// Tracked files `extract` leaves out, as an `export-ignore` would.
+        ignored: Vec<&'static str>,
+        /// Files `extract` writes that the tree does not hold.
+        planted: Vec<&'static str>,
+        /// `cargo metadata`'s output, in place of [`METADATA`].
+        metadata: Option<&'static str>,
+        /// Each directory `extract` was handed, as it found it.
+        extracted_into: RefCell<Vec<(PathBuf, std::fs::Metadata)>>,
+        cargo_ran: Cell<bool>,
+    }
+
+    impl Fake {
+        fn new() -> Self {
+            Fake {
+                fail: None,
+                bases: "1111111111111111111111111111111111111111\n",
+                changed: vec![],
+                tree: vec![
+                    ("Cargo.toml", "[package]\nname = \"dot-agent-deck\"\n"),
+                    ("build.rs", "mod helper;\nfn main() {}\n"),
+                    ("helper.rs", "pub fn version() {}\n"),
+                    ("src/main.rs", "fn main() {}\n"),
+                ],
+                ignored: vec![],
+                planted: vec![],
+                metadata: None,
+                extracted_into: RefCell::new(vec![]),
+                cargo_ran: Cell::new(false),
+            }
+        }
+
+        fn step(&self, name: &str) -> Result<(), String> {
+            match self.fail {
+                Some(f) if f == name => Err(format!("{name} broke")),
+                _ => Ok(()),
+            }
+        }
+    }
+
+    fn write(root: &Path, path: &str, text: &str) {
+        let p = root.join(path);
+        std::fs::create_dir_all(p.parent().expect("a parent")).expect("mkdir");
+        std::fs::write(p, text).expect("write");
+    }
+
+    impl Steps for Fake {
+        fn merge_bases(&self, _: &str, _: &str) -> Result<Vec<u8>, String> {
+            self.step("merge-base")?;
+            Ok(self.bases.as_bytes().to_vec())
+        }
+
+        fn diff(&self, merge_base: &str, _: &str) -> Result<Vec<u8>, String> {
+            self.step("diff")?;
+            let names = self
+                .changed
+                .iter()
+                .find(|(m, _)| *m == merge_base)
+                .map(|(_, p)| p.join("\0"))
+                .unwrap_or_default();
+            Ok(names.into_bytes())
+        }
+
+        fn extract(&self, _: &str, dir: &Path) -> Result<(), String> {
+            let md = std::fs::symlink_metadata(dir).expect("the extraction dir exists");
+            self.extracted_into
+                .borrow_mut()
+                .push((dir.to_path_buf(), md));
+            self.step("extract")?;
+            for (path, text) in &self.tree {
+                if !self.ignored.contains(path) {
+                    write(dir, path, text);
+                }
+            }
+            for path in &self.planted {
+                write(dir, path, "");
+            }
+            std::os::unix::fs::symlink("src", dir.join("src-link")).expect("symlink");
+            std::fs::create_dir_all(dir.join("vendor/sub")).expect("submodule dir");
+            Ok(())
+        }
+
+        fn ls_tree(&self, _: &str) -> Result<Vec<u8>, String> {
+            self.step("ls-tree")?;
+            let mut out = String::new();
+            for (path, _) in &self.tree {
+                out.push_str(&format!("100644 blob {}\t{path}\0", "a".repeat(40)));
+            }
+            out.push_str(&format!("120000 blob {}\tsrc-link\0", "b".repeat(40)));
+            out.push_str(&format!("160000 commit {}\tvendor/sub\0", "c".repeat(40)));
+            Ok(out.into_bytes())
+        }
+
+        fn metadata(&self, _: &Path) -> Result<Vec<u8>, String> {
+            self.cargo_ran.set(true);
+            self.step("metadata")?;
+            Ok(self.metadata.unwrap_or(METADATA).as_bytes().to_vec())
+        }
+    }
+
+    /// A fresh, empty parent for the gate's scratch leaves.
+    fn scratch_parent(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("xver-gate-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch parent");
+        std::fs::canonicalize(dir).expect("canonical")
+    }
+
+    fn leftovers(dir: &Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .expect("read the scratch parent")
+            .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+            .collect()
+    }
+
+    fn gate(fake: &Fake, parent: &Path) -> Result<(Comparison, Vec<(String, String)>), String> {
+        evaluate_with(fake, "vfarcic/dot-agent-deck", M2, M1, parent)
+    }
+
+    /// Every step's failure is a refusal naming it, and whatever scratch leaf
+    /// the run had made goes with it.
+    #[test]
+    fn every_failing_step_refuses_before_cargo_build_and_leaves_no_scratch() {
+        let parent = scratch_parent("fail");
+        let refusal = "refusing before `cargo build` — nothing was compiled";
+        for step in ["merge-base", "diff", "extract", "ls-tree", "metadata"] {
+            let fake = Fake {
+                fail: Some(step),
+                ..Fake::new()
+            };
+            let err = gate(&fake, &parent).expect_err(step);
+            assert!(err.starts_with(refusal), "{step}: {err}");
+            assert!(err.contains(&format!("{step} broke")), "{step}: {err}");
+            assert!(leftovers(&parent).is_empty(), "{step}");
+        }
+        for (why, fake, says) in [
+            (
+                "no merge-base",
+                Fake {
+                    bases: "\n",
+                    ..Fake::new()
+                },
+                "share no history",
+            ),
+            (
+                "unreadable metadata",
+                Fake {
+                    metadata: Some("not json"),
+                    ..Fake::new()
+                },
+                "parse `cargo metadata` at the merge-base",
+            ),
+            (
+                "metadata without the bin",
+                Fake {
+                    metadata: Some(r#"{"workspace_root": "/w", "packages": []}"#),
+                    ..Fake::new()
+                },
+                "has a `bin` target named `dot-agent-deck`",
+            ),
+        ] {
+            let err = gate(&fake, &parent).expect_err(why);
+            assert!(err.starts_with(refusal), "{why}: {err}");
+            assert!(err.contains(says), "{why}: {err}");
+            assert!(leftovers(&parent).is_empty(), "{why}");
+        }
+        let _ = std::fs::remove_dir_all(parent);
+    }
+
+    /// The `export-ignore` case end to end. Without the guard the surface
+    /// would lack `helper.rs`, which `build.rs` pulls in, and a branch changing
+    /// it would pass as changing no build-time code.
+    #[test]
+    fn an_export_ignored_file_refuses_before_cargo_runs_in_the_extraction() {
+        let parent = scratch_parent("ignored");
+        let fake = Fake {
+            ignored: vec!["helper.rs"],
+            changed: vec![(M1, vec!["helper.rs"])],
+            ..Fake::new()
+        };
+        let err = gate(&fake, &parent).expect_err("an incomplete extraction");
+        assert!(err.starts_with("refusing before `cargo build`"), "{err}");
+        assert!(err.contains("missing 1 tracked file"), "{err}");
+        assert!(err.contains("helper.rs"), "{err}");
+        assert!(
+            !fake.cargo_ran.get(),
+            "cargo ran in a tree that is not the merge-base's"
+        );
+        assert!(leftovers(&parent).is_empty());
+        let _ = std::fs::remove_dir_all(parent);
+    }
+
+    #[test]
+    fn a_file_the_tree_lacks_refuses_before_cargo_runs_in_the_extraction() {
+        let parent = scratch_parent("planted");
+        let fake = Fake {
+            planted: vec!["rust-toolchain.toml"],
+            ..Fake::new()
+        };
+        let err = gate(&fake, &parent).expect_err("an extraction with an extra file");
+        assert!(err.contains("holds 1 file(s) its tree does not"), "{err}");
+        assert!(err.contains("rust-toolchain.toml"), "{err}");
+        assert!(
+            !fake.cargo_ran.get(),
+            "cargo ran in a tree that is not the merge-base's"
+        );
+        let _ = std::fs::remove_dir_all(parent);
+    }
+
+    /// Two merge-bases: each is extracted into its own owner-only leaf, which
+    /// is gone afterwards, and the changed paths and surfaces are unioned. The
+    /// tree's symlink to a directory passes as one blob — the walk lists it
+    /// and does not follow it into `src/`.
+    #[test]
+    fn each_merge_base_is_derived_in_an_owner_only_leaf_removed_after() {
+        use std::os::unix::fs::MetadataExt;
+        let parent = scratch_parent("ok");
+        let fake = Fake {
+            bases: "1111111111111111111111111111111111111111\n\
+                    2222222222222222222222222222222222222222\n",
+            changed: vec![
+                (M1, vec!["src/main.rs"]),
+                (M2, vec!["helper.rs", "docs/x.md"]),
+            ],
+            ..Fake::new()
+        };
+        let (cmp, changes) = gate(&fake, &parent).expect("evaluates");
+        assert_eq!(cmp.merge_bases, vec![M1.to_string(), M2.to_string()]);
+        assert!(cmp.surface.contains("`helper.rs`"), "{}", cmp.surface);
+        let paths: Vec<&str> = changes.iter().map(|(p, _)| p.as_str()).collect();
+        assert_eq!(paths, vec!["helper.rs"], "{changes:?}");
+        let dirs = fake.extracted_into.borrow();
+        assert_eq!(dirs.len(), 2, "one extraction per merge-base");
+        for (dir, md) in dirs.iter() {
+            assert_eq!(dir.parent(), Some(parent.as_path()), "{}", dir.display());
+            assert!(md.file_type().is_dir(), "{}", dir.display());
+            assert_eq!(md.uid(), crate::sandbox::current_uid(), "{}", dir.display());
+            assert_eq!(
+                md.mode() & 0o077,
+                0,
+                "{} must be owner-only, is {:o}",
+                dir.display(),
+                md.mode() & 0o777
+            );
+        }
+        assert!(leftovers(&parent).is_empty(), "{:?}", leftovers(&parent));
+        let _ = std::fs::remove_dir_all(parent);
+    }
+
+    #[test]
+    fn dropping_the_scratch_never_follows_a_symlink_out_of_it() {
+        let parent = scratch_parent("drop");
+        let outside = parent.join("outside");
+        write(&outside, "keep.txt", "kept");
+        let under = crate::sandbox::create_private_dir("test", &parent, "under").expect("leaf");
+        std::os::unix::fs::symlink(&outside, under.join("link")).expect("symlink under");
+        drop(Scratch(under.clone()));
+        assert!(
+            std::fs::symlink_metadata(&under).is_err(),
+            "the leaf is removed"
+        );
+        assert!(
+            outside.join("keep.txt").exists(),
+            "a symlink under it is not followed"
+        );
+        let at = crate::sandbox::create_private_dir("test", &parent, "at").expect("leaf");
+        std::fs::remove_dir(&at).expect("rmdir");
+        std::os::unix::fs::symlink(&outside, &at).expect("symlink at the leaf");
+        drop(Scratch(at.clone()));
+        assert!(
+            std::fs::symlink_metadata(&at).is_err(),
+            "the symlink itself is removed"
+        );
+        assert!(
+            outside.join("keep.txt").exists(),
+            "a symlink at the leaf is not followed"
+        );
+        let _ = std::fs::remove_dir_all(parent);
     }
 }
