@@ -4251,14 +4251,15 @@ fn prompt_submission_evidence(
 /// a log has to be able to tell them apart afterwards.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SubmissionEvidence {
-    /// The agent reported submitting our prompt — verbatim, truncated, or as
-    /// newline-separated copies
+    /// The agent reported submitting our prompt — verbatim, truncated, as
+    /// newline-separated copies, or inside the producer's paste envelope
     /// ([`crate::prompt_delivery::prompt_submission_matches`]). The delivery is
     /// real.
     ///
-    /// Issue #685: carries WHICH of those three shapes it was, so the delivery
-    /// log can tell a clean single-copy turn apart from one carrying the prompt
-    /// twice. Observability only — all three finalize the delivery identically.
+    /// Issue #685: carries WHICH of those shapes it was, so the delivery log
+    /// can tell a clean single-copy turn apart from one carrying the prompt
+    /// twice. Observability only — every shape finalizes the delivery
+    /// identically.
     Confirmed(ConfirmedSubmission),
     /// The agent reported our prompt submitted as repeated copies run together
     /// with no separator ([`prompt_submission_accumulated`]). A payload had been

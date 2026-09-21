@@ -32,6 +32,9 @@ pub mod features;
 // PRD #1105 M11: when the TUI claims focus on its daemon (terminal focus-in and
 // throttled input).
 pub mod focus_report;
+// Issue #1181: the ambient git location environment, and the one place this
+// crate switches it off. Every `git` the crate spawns is built here.
+pub(crate) mod git_env;
 pub mod hook;
 pub mod hook_provenance;
 pub mod hooks_manage;
@@ -83,6 +86,11 @@ mod test_temp;
 // Unit tests do not link `tests/common/`, so `init_test_env`'s scrub of the deck
 // endpoint variables never ran for them and a fixture that spawned an emitter
 // posted hook events into the developer's live dashboard.
+// Issue #709's load-scaled wait ceilings, for the lib target's own unit tests.
+// `tests/common/mod.rs` has the same helper and the full rationale, but this
+// target does not link that file — the wall `test_isolation` documents.
+#[cfg(test)]
+mod test_budget;
 #[cfg(test)]
 mod test_isolation;
 // Issue #1132: test-only, and shared for the same reason as the two above —

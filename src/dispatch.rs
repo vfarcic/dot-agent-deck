@@ -5,7 +5,7 @@ use crate::agent_pty::AgentPtyRegistry;
 use crate::event::BroadcastMsg;
 use crate::issue_dispatch_run::{
     RemovalPolicy, WorktreeCreation, WorktreeRegistry, create_worktree, record_worktree,
-    remove_worktree, run_capture_args, run_status,
+    remove_worktree, run_git_capture, run_git_status,
 };
 use crate::scheduler::StderrNotifier;
 use crate::spawn::{SpawnKind, SpawnRequest, SpawnShapeOverride, spawn};
@@ -252,10 +252,10 @@ fn derive_dispatch_paths(working_dir: &Path, name: &str) -> DispatchPaths {
 /// which is the state `git worktree add` will actually resolve.
 async fn describe_dispatch_base(clone_dir: &Path) -> Option<String> {
     let clone = clone_dir.to_string_lossy();
-    let head = run_capture_args("git", &["-C", &clone, "rev-parse", "--abbrev-ref", "HEAD"])
+    let head = run_git_capture(&["-C", &clone, "rev-parse", "--abbrev-ref", "HEAD"])
         .await
         .ok()?;
-    let sha = run_capture_args("git", &["-C", &clone, "rev-parse", "--short", "HEAD"])
+    let sha = run_git_capture(&["-C", &clone, "rev-parse", "--short", "HEAD"])
         .await
         .ok()?;
     let (head, sha) = (head.trim(), sha.trim());
@@ -817,12 +817,10 @@ async fn rollback_dispatched_worktree(
     // Also delete the branch: `git worktree remove` never deletes it, but on this
     // rollback path no agent is running so there is no committed work to protect —
     // leaving the branch would wedge this name for every later dispatch.
-    let branch_cleanup_failed = run_status(
-        "git",
-        &["-C", &clone_dir.to_string_lossy(), "branch", "-D", branch],
-    )
-    .await
-    .is_err();
+    let branch_cleanup_failed =
+        run_git_status(&["-C", &clone_dir.to_string_lossy(), "branch", "-D", branch])
+            .await
+            .is_err();
 
     if branch_cleanup_failed {
         tracing::warn!(
@@ -856,7 +854,7 @@ mod tests {
     /// under test operate on a genuine repo rather than a stubbed one.
     /// A real repo with one commit.
     ///
-    /// Every `git` goes through [`crate::worktree_owner::fixture_git`] — see
+    /// Every `git` goes through [`crate::git_env::fixture_git`] — see
     /// the twin fixture in `issue_dispatch_run` for what that switches off and
     /// why a fixture that runs `git` with only `.current_dir` can write to the
     /// checkout the suite is running in. `sandbox_root` bounds the upward walk
@@ -864,7 +862,7 @@ mod tests {
     /// not `dir` itself, so `git` cannot discover its way out of it.
     fn init_repo_in(sandbox_root: &Path, dir: &Path) {
         let run = |args: &[&str]| {
-            let out = crate::worktree_owner::fixture_git(dir, sandbox_root)
+            let out = crate::git_env::fixture_git(dir, sandbox_root)
                 .args(args)
                 .output()
                 .expect("git available");
@@ -882,7 +880,7 @@ mod tests {
     }
 
     fn branch_exists(sandbox_root: &Path, repo: &Path, branch: &str) -> bool {
-        crate::worktree_owner::fixture_git(repo, sandbox_root)
+        crate::git_env::fixture_git(repo, sandbox_root)
             .args([
                 "rev-parse",
                 "--verify",
@@ -897,7 +895,7 @@ mod tests {
 
     /// Run a git command in `repo`, asserting it succeeded.
     ///
-    /// Through [`crate::worktree_owner::fixture_git`] for the same reason
+    /// Through [`crate::git_env::fixture_git`] for the same reason
     /// [`init_repo_in`] is, and it is the same `sandbox_root`. Two halves
     /// matter here and only one of them is visible from the call sites.
     /// *Location* is the issue #834 one: a bare `git` with only
@@ -910,7 +908,7 @@ mod tests {
     /// `git commit` here fails outright on a machine with no global identity
     /// — which is a CI runner, and is not this box.
     fn git_in(sandbox_root: &Path, repo: &Path, args: &[&str]) {
-        let out = crate::worktree_owner::fixture_git(repo, sandbox_root)
+        let out = crate::git_env::fixture_git(repo, sandbox_root)
             .args(args)
             .output()
             .expect("git available");
@@ -940,7 +938,7 @@ mod tests {
             .expect("a healthy repo must yield a base");
 
         let sha = String::from_utf8(
-            crate::worktree_owner::fixture_git(&repo, tmp.path())
+            crate::git_env::fixture_git(&repo, tmp.path())
                 .args(["rev-parse", "--short", "HEAD"])
                 .output()
                 .expect("git available")

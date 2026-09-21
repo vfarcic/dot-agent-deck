@@ -71,8 +71,23 @@
 //!   correctness property, not a security one, and it is the half that catches
 //!   the *accidental* forgeries, which are the ones that actually happen.
 //!
-//! The same-uid residual is issue #1129. Issues #543 and #401 stay open too:
-//! raw [`crate::event::AgentEvent`] traffic
+//! # The same-uid residual is a DECIDED boundary, not an open item
+//!
+//! Issue #1129 settled it: **the deck's trust boundary is the OS user.** Every
+//! agent the deck runs is inside it and is trusted with respect to every other
+//! agent the deck runs. That is a policy — it holds because it was chosen — and
+//! the argument for it, what a uid-per-agent split would actually cost, and why
+//! an LSM profile is not a substitute are all in
+//! `docs/develop/hook-provenance.md`. Read it before proposing a mechanism to
+//! close the `/proc/<pid>/environ` read; the answer is not that nobody has
+//! thought of one.
+//!
+//! What the boundary does **not** excuse is the accidental half. A stale
+//! `DOT_AGENT_DECK_PANE_ID`, a recycled pane id or an agent that outlived its
+//! daemon are forgeries nobody intended, and they are the ones that actually
+//! happen — which is what the per-spawn binding above keeps closing.
+//!
+//! Issues #543 and #401 do stay open: raw [`crate::event::AgentEvent`] traffic
 //! (the hook scripts installed into each agent's own config, plus the
 //! `agent-event` verb) is deliberately **out of scope** here — see the module
 //! docs on [`classify`] for why, and `docs/develop/hook-provenance.md` for the
@@ -89,12 +104,24 @@
 //!   filesystem already gives and separates nothing inside it.
 //! - **The pid cannot be resolved to a pane in time.** The peer pid *is*
 //!   unforgeable, and in principle a walk up the process tree could say which
-//!   pane's PTY the sender lives under. But `work-done`, `dispatch` and the raw
-//!   event path are fire-and-forget: the CLI connects, writes one line and
-//!   exits. By the time the daemon has the line, the process that sent it is
-//!   routinely **gone**, so the walk has nothing to read. A check that answers
-//!   "cannot tell" for a legitimate sender has to fail open, and a check that
-//!   fails open is not a check — an adversary simply exits first.
+//!   pane's PTY the sender lives under. But a sender that does not wait for an
+//!   answer connects, writes one line and exits, so by the time the daemon has
+//!   the line the process that sent it is **gone** and the walk has nothing to
+//!   read. A check that answers "cannot tell" for a legitimate sender has to
+//!   fail open, and a check that fails open is not a check — an adversary
+//!   simply exits first.
+//!
+//!   That premise is narrower since issue #1129 than it was when this was
+//!   written, and the correction is worth stating rather than leaving the old
+//!   sentence standing. The first-party `work-done` and `dispatch` CLIs now
+//!   block reading the daemon's [`crate::event::SignalAck`], so *those two*
+//!   senders are routinely still alive when the daemon reads their line. It
+//!   changes nothing here, for three reasons that each survive on their own:
+//!   the raw `AgentEvent` path still exits immediately; the population that
+//!   matters — an older CLI, and an adversary — does not wait either, so the
+//!   check would still have to fail open for it; and the walk is defeated by
+//!   `setsid` and by re-parenting, which a same-uid adversary controls. The
+//!   token answers the same question without a process table.
 //! - **Even when it answers, it is weaker than the token.** The walk costs a
 //!   `ps` sample (`crate::platform::proc::process_table`, ~12 ms of fork on this
 //!   box) on every message, is defeated by `setsid` and by re-parenting to init,

@@ -31,8 +31,13 @@
 //! the success test, and why `wire_stop/001` asserts the daemon is still
 //! serving afterwards rather than only that the reply said no.
 //!
-//! Whether `KIND_SHUTDOWN` should itself be narrowed is issue #1109's open
-//! question and is deliberately not answered here.
+//! Whether `KIND_SHUTDOWN` should itself be narrowed was issue #1109's open
+//! question, and the answer is no: it stays unguarded — the `Stop` option is a
+//! user who has already made this decision in front of the pane list — and
+//! gained a DISCLOSURE instead, naming every agent and orchestration role it
+//! takes down. That half is `tests/daemon_teardown_inventory.rs`; the reasoning,
+//! including why the SIGNAL path must not refuse either, is
+//! `docs/develop/daemon-teardown-paths.md`. Nothing about it is asserted here.
 
 // Issue #322: disk-backed scratch dirs resolved through the crate-internal
 // helper rather than a bare `tempfile` constructor, which linkage-check rule 8

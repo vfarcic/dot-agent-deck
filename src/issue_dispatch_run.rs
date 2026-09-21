@@ -199,7 +199,7 @@ pub fn agents_rooted_in_worktree(records: &[AgentRecord], worktree_dir: &Path) -
 /// KEEP, because the fail-safe direction for a deletion gate is to decline.
 pub async fn worktree_is_dirty(worktree_dir: &Path) -> Result<bool, String> {
     let worktree = worktree_dir.to_string_lossy();
-    let output = run_capture_args("git", &["-C", &worktree, "status", "--porcelain"]).await?;
+    let output = run_git_capture(&["-C", &worktree, "status", "--porcelain"]).await?;
     Ok(!output.trim().is_empty())
 }
 
@@ -375,7 +375,7 @@ pub async fn remove_worktree(
     if policy == RemovalPolicy::Force {
         args.push("--force");
     }
-    let res = run_status("git", &args).await;
+    let res = run_git_status(&args).await;
     match res {
         Ok(()) => {
             tracing::info!(
@@ -690,7 +690,7 @@ fn canonical_workspace(working_dir: &str) -> Result<PathBuf, String> {
 async fn provision_repo(workspace: &Path, clone_dir: &Path, repo: &str) -> Result<(), String> {
     if clone_dir.is_dir() {
         let clone = clone_dir.to_string_lossy();
-        let origin = run_capture_args("git", &["-C", &clone, "remote", "get-url", "origin"])
+        let origin = run_git_capture(&["-C", &clone, "remote", "get-url", "origin"])
             .await
             .map_err(|e| {
                 format!(
@@ -783,8 +783,8 @@ fn ensure_worktrees_excluded(clone_dir: &Path) {
 /// S3: refresh an existing clone in place — `git fetch` then `git pull --ff-only`.
 /// The caller treats any failure here as non-fatal (warn + continue).
 async fn refresh_clone(clone: &str) -> Result<(), String> {
-    run_status("git", &["-C", clone, "fetch"]).await?;
-    run_status("git", &["-C", clone, "pull", "--ff-only"]).await
+    run_git_status(&["-C", clone, "fetch"]).await?;
+    run_git_status(&["-C", clone, "pull", "--ff-only"]).await
 }
 
 /// L3: whether an existing clone's `origin` is consistent with the configured
@@ -941,15 +941,12 @@ fn is_worktree_scan_short_read(err: &str) -> bool {
 /// Returns `None` when the directory cannot be resolved (not a git repo) — the
 /// add itself then fails with git's own message, which is the better error.
 async fn worktree_lock_path(clone_dir: &Path) -> Option<PathBuf> {
-    let common = run_capture_args(
-        "git",
-        &[
-            "-C",
-            &clone_dir.to_string_lossy(),
-            "rev-parse",
-            "--git-common-dir",
-        ],
-    )
+    let common = run_git_capture(&[
+        "-C",
+        &clone_dir.to_string_lossy(),
+        "rev-parse",
+        "--git-common-dir",
+    ])
     .await
     .ok()?;
     let common = common.trim();
@@ -1102,17 +1099,14 @@ pub async fn create_worktree(
         // fail with "a branch named … already exists" and turn a transient race
         // into a hard failure — and, with `reuse_existing_branch: false`, into a
         // dispatch name the user has to `git branch -D` by hand.
-        let branch_exists = run_status(
-            "git",
-            &[
-                "-C",
-                &clone,
-                "rev-parse",
-                "--verify",
-                "--quiet",
-                &branch_ref,
-            ],
-        )
+        let branch_exists = run_git_status(&[
+            "-C",
+            &clone,
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &branch_ref,
+        ])
         .await
         .is_ok();
         // Only attempt 1 can report BranchExists. Reaching attempt 2 means the
@@ -1138,9 +1132,9 @@ pub async fn create_worktree(
             return Ok(WorktreeCreation::BranchExists);
         }
         let result = if branch_exists {
-            run_status("git", &["-C", &clone, "worktree", "add", &wt, branch]).await
+            run_git_status(&["-C", &clone, "worktree", "add", &wt, branch]).await
         } else {
-            run_status("git", &["-C", &clone, "worktree", "add", &wt, "-b", branch]).await
+            run_git_status(&["-C", &clone, "worktree", "add", &wt, "-b", branch]).await
         };
         match result {
             Err(e) if attempt < WORKTREE_ADD_ATTEMPTS && is_worktree_scan_short_read(&e) => {
@@ -1450,8 +1444,31 @@ fn parse_issue_numbers(json: &str) -> Result<Vec<u64>, String> {
 
 /// Run a subprocess that must exit zero; on failure return a message carrying
 /// the program, args, exit status, and any stderr.
+///
+/// NOT for `git` — use [`run_git_status`], which neutralizes the ambient git
+/// location environment. `xtask/linkage-check`'s rule 13 fails the build on a
+/// `git` program literal in this module's production half, so that is enforced
+/// rather than asked for.
 pub async fn run_status(program: &str, args: &[&str]) -> Result<(), String> {
-    let output = tokio::process::Command::new(program)
+    status_of(tokio::process::Command::new(program), program, args).await
+}
+
+/// [`run_status`] for `git`, built by [`crate::git_env::git_async`] so an
+/// ambient `GIT_DIR` cannot redirect it away from the `-C <dir>` in its argv
+/// (issue #1181).
+pub(crate) async fn run_git_status(args: &[&str]) -> Result<(), String> {
+    status_of(crate::git_env::git_async(), crate::git_env::GIT, args).await
+}
+
+/// The shared body of [`run_status`] and [`run_git_status`] — one
+/// implementation, two ways of constructing the command, so the neutralized
+/// variant cannot drift from the error text or the exit handling.
+async fn status_of(
+    mut cmd: tokio::process::Command,
+    program: &str,
+    args: &[&str],
+) -> Result<(), String> {
+    let output = cmd
         .args(args)
         .output()
         .await
@@ -1475,10 +1492,30 @@ async fn run_capture(program: &str, args: &[String]) -> Result<String, String> {
     run_capture_args(program, &refs).await
 }
 
-/// Like [`run_capture`] but for `&str` args — the fixed-shape `git` probes
-/// (e.g. `remote get-url origin`) build their argv inline.
+/// Like [`run_capture`] but for `&str` args.
+///
+/// NOT for `git` — use [`run_git_capture`], for the reason [`run_status`]
+/// gives.
 pub(crate) async fn run_capture_args(program: &str, args: &[&str]) -> Result<String, String> {
-    let output = tokio::process::Command::new(program)
+    capture_of(tokio::process::Command::new(program), program, args).await
+}
+
+/// [`run_capture_args`] for `git` — the fixed-shape probes (`remote get-url
+/// origin`, `rev-parse --short HEAD`) build their argv inline, and the command
+/// comes from [`crate::git_env::git_async`] so the `-C <dir>` in that argv is
+/// what decides the repository (issue #1181).
+pub(crate) async fn run_git_capture(args: &[&str]) -> Result<String, String> {
+    capture_of(crate::git_env::git_async(), crate::git_env::GIT, args).await
+}
+
+/// The shared body of [`run_capture_args`] and [`run_git_capture`] — see
+/// [`status_of`] for why it is shared.
+async fn capture_of(
+    mut cmd: tokio::process::Command,
+    program: &str,
+    args: &[&str],
+) -> Result<String, String> {
+    let output = cmd
         .args(args)
         .output()
         .await
@@ -1543,7 +1580,7 @@ mod tests {
     /// preview's `git status --porcelain` runs against a genuine tree rather
     /// than a stub. Mirrors `dispatch::tests::init_repo`.
     ///
-    /// **Every `git` here goes through [`crate::worktree_owner::fixture_git`]**,
+    /// **Every `git` here goes through [`crate::git_env::fixture_git`]**,
     /// which switches off the ambient git environment in both of the groups
     /// issue #834 names: *configuration* (`GIT_CONFIG_GLOBAL`/`SYSTEM` at a
     /// nonexistent path, `HOME` and `XDG_CONFIG_HOME` inside the sandbox) and
@@ -1566,7 +1603,7 @@ mod tests {
     /// variables process-globally under a lock this fixture did not take.
     fn init_repo_with_worktree(sandbox_root: &Path, repo: &Path, worktree: &Path) {
         let run = |dir: &Path, args: &[&str]| {
-            let out = crate::worktree_owner::fixture_git(dir, sandbox_root)
+            let out = crate::git_env::fixture_git(dir, sandbox_root)
                 .args(args)
                 .output()
                 .expect("git available");
@@ -1785,7 +1822,7 @@ mod tests {
         // Clean + KeepIfDirty: removed, and nothing is reported.
         let clean = tmp.path().join("repo-dispatch-clean");
         let run = |args: &[&str]| {
-            let out = crate::worktree_owner::fixture_git(&repo, tmp.path())
+            let out = crate::git_env::fixture_git(&repo, tmp.path())
                 .args(args)
                 .output()
                 .expect("git available");
@@ -2087,7 +2124,7 @@ mod tests {
     /// branch from. Disk-backed (issue #322 / CLAUDE.md rule 14): this fixture
     /// is a git repository plus its worktrees, not a scratch file.
     ///
-    /// Through [`crate::worktree_owner::fixture_git`], for exactly the reasons
+    /// Through [`crate::git_env::fixture_git`], for exactly the reasons
     /// [`init_repo_with_worktree`] spells out — this fixture was the other half
     /// of the same module and was missed when that one was isolated (issue
     /// #1121 round three). The three `git config` writes it used to make are
@@ -2097,7 +2134,7 @@ mod tests {
     fn init_repo_with_commit(sandbox_root: &Path, repo: &Path) {
         std::fs::create_dir_all(repo).expect("create repo dir");
         let git = |args: &[&str]| {
-            let out = crate::worktree_owner::fixture_git(repo, sandbox_root)
+            let out = crate::git_env::fixture_git(repo, sandbox_root)
                 .args(args)
                 .output()
                 .unwrap_or_else(|e| panic!("spawn git {args:?}: {e}"));
@@ -2468,7 +2505,7 @@ mod tests {
             marker.display()
         );
 
-        let status = crate::worktree_owner::fixture_git(&worktree_dir, scratch.path())
+        let status = crate::git_env::fixture_git(&worktree_dir, scratch.path())
             .args(["status", "--porcelain"])
             .output()
             .expect("git status");
@@ -2517,7 +2554,7 @@ mod tests {
         // Somebody else's worktree, on this same repo, at the path our dispatch
         // is about to want: a real linked worktree, so it HAS a git metadata
         // dir a marker could be written into.
-        let add = crate::worktree_owner::fixture_git(&repo, scratch.path())
+        let add = crate::git_env::fixture_git(&repo, scratch.path())
             .args(["worktree", "add", "-b", "someone-elses"])
             .arg(&worktree_dir)
             .output()
@@ -2821,12 +2858,12 @@ mod tests {
         // Committed, so the fresh worktree checks one out and the warm-up's
         // manifest probe sees it — exactly as a real dispatched worktree does.
         std::fs::write(repo.join(DEVBOX_MANIFEST), "{}\n").expect("write devbox.json");
-        let git_add = crate::worktree_owner::fixture_git(&repo, scratch.path())
+        let git_add = crate::git_env::fixture_git(&repo, scratch.path())
             .args(["add", DEVBOX_MANIFEST])
             .output()
             .expect("git add devbox.json");
         assert!(git_add.status.success());
-        let git_commit = crate::worktree_owner::fixture_git(&repo, scratch.path())
+        let git_commit = crate::git_env::fixture_git(&repo, scratch.path())
             .args(["commit", "--quiet", "-m", "devbox"])
             .output()
             .expect("git commit devbox.json");

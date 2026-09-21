@@ -14,6 +14,7 @@ use crate::agent_pty::{
     AgentPtyRegistry, DOT_AGENT_DECK_EXIT_WHEN_ORPHANED, DOT_AGENT_DECK_IDLE_SHUTDOWN_SECS,
     DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS,
 };
+use crate::config_validation::escape_id_for_log;
 use crate::error::DaemonError;
 use crate::event::{AgentEvent, BroadcastMsg, DaemonMessage};
 use crate::scheduler::Scheduler;
@@ -65,9 +66,22 @@ const EXIT_FORCED_BY_SECOND_SIGNAL: i32 = 143;
 /// Logged at `warn!` (not `info!`) for the same reason the give-up warnings in
 /// `embedded_pane` are: losing the daemon terminates every managed agent, so
 /// it is a user-visible outcome that must survive a default log filter.
+///
+/// Issue #1109: the signal path stays UNGUARDED on purpose — it does not run
+/// the [`crate::daemon_stop::stop_refusal`] policy `daemon stop` and the
+/// `StopDaemon` wire verb run, and it never refuses. A SIGTERM is how a service
+/// manager, a container runtime or a session logout asks a daemon to stop, and
+/// one that argues back is escalated to SIGKILL on the sender's clock, losing
+/// both the graceful drain below and any chance to say what it lost. What it
+/// gained instead is DISCLOSURE: `state` is threaded in for
+/// [`crate::daemon_stop::log_teardown_inventory`], which names the agents and
+/// the orchestration roles at stake before the drain empties both. The full
+/// argument, including the two shapes that were rejected, is in
+/// `docs/develop/daemon-teardown-paths.md`.
 fn spawn_termination_signal_watch(
     shutdown: Arc<Notify>,
     registry: Arc<AgentPtyRegistry>,
+    state: SharedState,
 ) -> Option<tokio::task::JoinHandle<()>> {
     #[cfg(unix)]
     {
@@ -99,6 +113,12 @@ fn spawn_termination_signal_watch(
                 "daemon received termination signal; initiating graceful shutdown \
                  (every managed agent will be stopped)"
             );
+            // Issue #1109: say WHICH, before the drain below empties the
+            // registry this reads. Ordered ahead of the drain for that reason
+            // and not merely for tidiness — `agent_records` filters to live
+            // agents, so the same call after `shutdown_all_graceful` reports an
+            // empty deck no matter what was running.
+            crate::daemon_stop::log_teardown_inventory(&state, &registry, "signal").await;
 
             // Drain managed agents with the SAME grace the `KIND_SHUTDOWN`
             // handler gives them, BEFORE releasing the hook loop. Notifying
@@ -159,6 +179,9 @@ fn spawn_termination_signal_watch(
                 "daemon received termination signal; initiating graceful shutdown \
                  (every managed agent will be stopped)"
             );
+            // Issue #1109: same disclosure, same position, as the Unix arm
+            // above; see its comment for why it precedes the drain.
+            crate::daemon_stop::log_teardown_inventory(&state, &registry, "signal").await;
             // Same graceful drain as the Unix arm above; see its comment.
             let draining = registry.clone();
             let _ = tokio::task::spawn_blocking(move || {
@@ -827,7 +850,8 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
     // Production termination watch: route SIGTERM/SIGINT through the same
     // `shutdown` notify. Armed unconditionally — unlike the two backstops
     // below, this is not test-only: `daemon stop` IS a SIGTERM.
-    let signal_handle = spawn_termination_signal_watch(shutdown.clone(), pty_registry.clone());
+    let signal_handle =
+        spawn_termination_signal_watch(shutdown.clone(), pty_registry.clone(), state.clone());
 
     // Test-only orphan watchdog: when `DOT_AGENT_DECK_EXIT_WHEN_ORPHANED` is
     // truthy, gracefully shut down (via the SAME `shutdown` signal the idle
@@ -2591,6 +2615,29 @@ fn clamp_for_log(line: &str) -> std::borrow::Cow<'_, str> {
     std::borrow::Cow::Owned(format!("{}…<truncated>", &line[..end]))
 }
 
+/// Issue #1082: one producer-supplied hook LINE, bounded *and* escaped, ready
+/// for a log sink — the daemon's two raw-line diagnostics both go through here.
+///
+/// Composed from the two halves that already exist rather than respelled:
+/// [`clamp_for_log`] answers "how much of it reaches the log" and
+/// [`crate::config_validation::escape_for_terminal`] answers "which of its
+/// characters a terminal would ACT on". The bound therefore stays issue #903's
+/// [`MALFORMED_LOG_PREFIX_BYTES`] — 512 bytes, with a cut marker — rather than
+/// [`crate::config_validation::MAX_QUOTED_VALUE_CHARS`], which is sized for a
+/// value that is not prose and would leave 120 characters of a JSON hook event:
+/// enough to lose the very `event_type` the `raw_line` warning exists to show.
+/// That is why this calls the escaper directly instead of
+/// [`crate::config_validation::escape_id_for_log`] — bounding is already done,
+/// and doing it twice would be the truncation this exists to avoid.
+///
+/// Escaping AFTER bounding, deliberately: escaping first would spend the budget
+/// on escape expansions rather than on payload. The expansion is still bounded
+/// — 512 bytes of ESC becomes 4096 characters and no more — which is the same
+/// trade [`crate::config_validation::escape_field_for_log`] makes.
+fn hook_line_for_log(line: &str) -> String {
+    crate::config_validation::escape_for_terminal(&clamp_for_log(line)).into_owned()
+}
+
 async fn run_hook_loop(
     listener: IpcListener,
     state: SharedState,
@@ -2669,9 +2716,13 @@ async fn run_hook_loop_with_idle_timeout(
                     // not the thing that grows.
                     let _permit = permit;
                     // PRD #201: split so the read-only `get-seed` verb can write
-                    // a reply back on the same connection. Every other message
-                    // on this socket is fire-and-forget, so the write half is
-                    // only ever used by the `GetSeed` arm below.
+                    // a reply back on the same connection. The write half now
+                    // serves every `DaemonMessage` arm — `delegate` since PR
+                    // #466, `restart_role` / `spawn_role` / `list_targets`
+                    // since #868 and PRD #220, and `work_done` / `dispatch`
+                    // since issue #1129, whose line comes from the provenance
+                    // gate above rather than from an arm. Raw `AgentEvent`
+                    // traffic is still answered by nothing.
                     let (read_half, mut write_half) = tokio::io::split(stream);
                     let mut reader = tokio::io::BufReader::new(read_half);
 
@@ -2792,17 +2843,32 @@ async fn run_hook_loop_with_idle_timeout(
                                     // world-of-the-same-uid readable and is
                                     // exactly the surface this check exists to
                                     // take the token off.
+                                    //
+                                    // Issue #1082: and the pane id it DOES log
+                                    // goes through `escape_id_for_log`, as every
+                                    // producer-supplied id on this socket now
+                                    // does. This is the first line the surface
+                                    // writes about a message and the one most
+                                    // likely to be read under suspicion, so it is
+                                    // the worst place to let a raw LF forge a
+                                    // following line, a CR overwrite this one, or
+                                    // a bidi override reorder it. Turning the
+                                    // subscriber's own ANSI styling off escapes
+                                    // nothing INSIDE a field value and is not a
+                                    // substitute — see
+                                    // `crate::config_validation::escape_field_for_log`.
                                     warn!(
                                         verb = msg.verb(),
-                                        claimed_pane = %msg.claimed_pane(),
+                                        claimed_pane = %escape_id_for_log(msg.claimed_pane()),
                                         reason = refusal.code(),
                                         "hook socket: refused a message whose hook \
                                          capability token does not attest the pane it \
                                          names; see docs/develop/hook-provenance.md"
                                     );
-                                    if let Some(json) =
-                                        msg.provenance_refusal_reply(&refusal.caller_message())
-                                    {
+                                    if let Some(json) = msg.provenance_refusal_reply(
+                                        refusal.code(),
+                                        &refusal.caller_message(),
+                                    ) {
                                         let line = format!("{json}\n");
                                         let _ = write_half.write_all(line.as_bytes()).await;
                                         let _ = write_half.flush().await;
@@ -2810,6 +2876,23 @@ async fn run_hook_loop_with_idle_timeout(
                                     continue;
                                 }
                                 Ok(()) => {
+                                    // Issue #1129: the two fire-and-forget verbs
+                                    // get their acknowledgement HERE, ahead of
+                                    // the handler, so the caller learns whether
+                                    // the gate admitted it without waiting for
+                                    // work it is not waiting on. `dispatch`'s
+                                    // handler is awaited inline below and spends
+                                    // a whole worktree-create-and-spawn; an ack
+                                    // written after it would park the calling
+                                    // agent for the duration. Every other verb
+                                    // returns `None` here and answers in its own
+                                    // arm, which is what keeps "exactly one line
+                                    // per message" true.
+                                    if let Some(json) = msg.provenance_ack_reply() {
+                                        let line = format!("{json}\n");
+                                        let _ = write_half.write_all(line.as_bytes()).await;
+                                        let _ = write_half.flush().await;
+                                    }
                                     if matches!(
                                         provenance,
                                         crate::hook_provenance::Provenance::Refused(
@@ -2826,7 +2909,7 @@ async fn run_hook_loop_with_idle_timeout(
                                         // invokes.
                                         warn!(
                                             verb = msg.verb(),
-                                            claimed_pane = %msg.claimed_pane(),
+                                            claimed_pane = %escape_id_for_log(msg.claimed_pane()),
                                             "hook socket: acting on a message with no hook \
                                              capability token because \
                                              DOT_AGENT_DECK_HOOK_PROVENANCE=warn; this pane's \
@@ -2839,7 +2922,7 @@ async fn run_hook_loop_with_idle_timeout(
                             match msg {
                                 DaemonMessage::Delegate(signal) => {
                                     info!(
-                                        pane_id = %signal.pane_id,
+                                        pane_id = %escape_id_for_log(&signal.pane_id),
                                         targets = ?signal.to,
                                         "Received delegate signal"
                                     );
@@ -2889,8 +2972,8 @@ async fn run_hook_loop_with_idle_timeout(
                                 }
                                 DaemonMessage::RestartRole(signal) => {
                                     info!(
-                                        pane_id = %signal.pane_id,
-                                        role = %signal.role,
+                                        pane_id = %escape_id_for_log(&signal.pane_id),
+                                        role = %escape_id_for_log(&signal.role),
                                         force = signal.force,
                                         "Received restart-role signal"
                                     );
@@ -2921,8 +3004,8 @@ async fn run_hook_loop_with_idle_timeout(
                                 }
                                 DaemonMessage::SpawnRole(signal) => {
                                     info!(
-                                        pane_id = %signal.pane_id,
-                                        role = %signal.role,
+                                        pane_id = %escape_id_for_log(&signal.pane_id),
+                                        role = %escape_id_for_log(&signal.role),
                                         "Received spawn-role signal"
                                     );
                                     // Issue #868: same reply-on-same-connection
@@ -2949,7 +3032,7 @@ async fn run_hook_loop_with_idle_timeout(
                                 }
                                 DaemonMessage::Dispatch(signal) => {
                                     info!(
-                                        pane_id = %signal.pane_id,
+                                        pane_id = %escape_id_for_log(&signal.pane_id),
                                         // The name arrives raw off the hook socket
                                         // — nothing between the producer and this
                                         // line rejects a control or bidi character
@@ -2995,7 +3078,10 @@ async fn run_hook_loop_with_idle_timeout(
                                     let (caller_agent_id, cwd) = match caller {
                                         Some(c) => c,
                                         None => {
-                                            warn!(pane_id = %signal.pane_id, "dispatch from unknown pane");
+                                            warn!(
+                                                pane_id = %escape_id_for_log(&signal.pane_id),
+                                                "dispatch from unknown pane"
+                                            );
                                             continue;
                                         }
                                     };
@@ -3062,7 +3148,7 @@ async fn run_hook_loop_with_idle_timeout(
                                 }
                                 DaemonMessage::WorkDone(signal) => {
                                     info!(
-                                        pane_id = %signal.pane_id,
+                                        pane_id = %escape_id_for_log(&signal.pane_id),
                                         done = signal.done,
                                         "Received work-done signal"
                                     );
@@ -3093,7 +3179,7 @@ async fn run_hook_loop_with_idle_timeout(
                                         req.agent_id.as_deref(),
                                     );
                                     info!(
-                                        pane_id = %req.pane_id,
+                                        pane_id = %escape_id_for_log(&req.pane_id),
                                         agent_id = ?req.agent_id,
                                         has_seed = seed.is_some(),
                                         "Received get-seed request"
@@ -3124,7 +3210,7 @@ async fn run_hook_loop_with_idle_timeout(
                                             .and_then(|r| r.cwd.clone())
                                     };
                                     info!(
-                                        pane_id = %req.pane_id,
+                                        pane_id = %escape_id_for_log(&req.pane_id),
                                         resolved_cwd = ?cwd,
                                         "Received list-targets request"
                                     );
@@ -3155,7 +3241,7 @@ async fn run_hook_loop_with_idle_timeout(
                             // added log volume; the untruncated command remains in
                             // `metadata["bash_command"]` for anyone who needs it.
                             info!(
-                                session_id = %event.session_id,
+                                session_id = %escape_id_for_log(&event.session_id),
                                 event_type = ?event.event_type,
                                 pane_id = ?event.pane_id,
                                 agent_type = ?event.agent_type,
@@ -3176,9 +3262,9 @@ async fn run_hook_loop_with_idle_timeout(
                             // line the unrecognized value came from.
                             if event.event_type == crate::event::EventType::Unknown {
                                 warn!(
-                                    session_id = %event.session_id,
+                                    session_id = %escape_id_for_log(&event.session_id),
                                     pane_id = ?event.pane_id,
-                                    raw_line = %line,
+                                    raw_line = %hook_line_for_log(&line),
                                     "Event carries an unrecognized event_type — decoded as \
                                      Unknown and otherwise ignored; check the hook for a typo"
                                 );
@@ -3215,8 +3301,8 @@ async fn run_hook_loop_with_idle_timeout(
                                     && !pty_registry.has_live_pane(pane_id)
                                 {
                                     warn!(
-                                        pane_id = %pane_id,
-                                        session_id = %event.session_id,
+                                        pane_id = %escape_id_for_log(pane_id),
+                                        session_id = %escape_id_for_log(&event.session_id),
                                         agent_type = ?event.agent_type,
                                         "SessionStart for a pane this daemon did not spawn — \
                                          a foreign agent is posting here (a test run inheriting \
@@ -3259,7 +3345,7 @@ async fn run_hook_loop_with_idle_timeout(
                             warn!(
                                 line_bytes = line.len(),
                                 "Malformed event: {}",
-                                clamp_for_log(&line)
+                                hook_line_for_log(&line)
                             );
                         }
                     }
@@ -3764,6 +3850,71 @@ mod hook_ingestion_tests {
         }
     }
 
+    /// Issue #1082: the bound `hook_line_for_log` keeps is the one judgement in
+    /// that sweep, so it is pinned rather than only argued in a doc comment.
+    ///
+    /// The `raw_line` warning exists to show an operator the typo in an
+    /// `event_type` a hook wrote. An ordinary hook event is already longer than
+    /// [`crate::config_validation::MAX_QUOTED_VALUE_CHARS`], and its keys
+    /// serialize in sorted order, so `event_type` sits past character 120 — the
+    /// value bound would therefore cut away the one field the diagnostic is
+    /// about, turning the fix into a lost diagnostic. Both halves are asserted:
+    /// what this bound keeps, and what the other one would have dropped.
+    #[test]
+    fn hook_line_for_log_keeps_the_event_type_the_value_bound_would_cut() {
+        use crate::config_validation::{MAX_QUOTED_VALUE_CHARS, escape_field_for_log};
+
+        let line = serde_json::json!({
+            "agent_type": "claude_code",
+            "cwd": "/home/dev/code/dot-agent-deck-dispatch-issue-1082/xtask/linkage-check",
+            "event_type": "sessoin_start",
+            "metadata": { "bash_command": "cargo nextest run --workspace" },
+            "pane_id": "pane-7f3c1a9e-4b21-4d8a-9c55-0e6f2b1d3a47",
+            "session_id": "7f3c1a9e-4b21-4d8a-9c55-0e6f2b1d3a47",
+            "timestamp": "2026-09-08T12:00:00Z",
+        })
+        .to_string();
+
+        assert!(
+            hook_line_for_log(&line).contains("sessoin_start"),
+            "the typo this warning exists to surface must survive the bound: {line}"
+        );
+        assert!(
+            !escape_field_for_log(&line, MAX_QUOTED_VALUE_CHARS).contains("sessoin_start"),
+            "if the value bound also kept it, this site would have no reason to differ \
+             from the other twenty and the doc comment above would be wrong: {line}"
+        );
+    }
+
+    /// Issue #1082: and it still escapes. `clamp_for_log` alone bounded the line
+    /// without touching a single byte a terminal acts on, which is the whole
+    /// defect — a CR inside a rejected payload overwrote the line reporting it.
+    #[test]
+    fn hook_line_for_log_escapes_what_a_terminal_would_act_on() {
+        let hostile = "junk\rovershoot\u{1b}[2Jcleared\u{202e}reversed\u{85}c1";
+        let got = hook_line_for_log(hostile);
+
+        assert!(
+            !got.chars().any(|c| c.is_control()),
+            "a raw CR overwrites the line being written: {got:?}"
+        );
+        assert!(
+            !got.chars().any(crate::untrusted_text::is_bidi_format_char),
+            "a bidi override reorders the line in whatever renders it: {got:?}"
+        );
+        assert!(
+            got.contains("overshoot") && got.contains("cleared") && got.contains("reversed"),
+            "escaping preserves the evidence rather than dropping it: {got:?}"
+        );
+        // Bounding stays `clamp_for_log`'s job, and doing it twice is what the
+        // helper's doc says it must not do.
+        let long = "x".repeat(crate::bounded_read::MAX_HOOK_LINE_BYTES);
+        assert!(
+            hook_line_for_log(&long).ends_with("…<truncated>"),
+            "the byte bound and its marker must survive composition"
+        );
+    }
+
     /// Scenario: Open `MAX_CONCURRENT_HOOK_CONNECTIONS` hook connections, each sending one `session_start` and then staying open, then open one more and send an event on it. The extra event must not be applied while every slot is held, and must be applied — not dropped — as soon as one of the held connections closes.
     #[spec("hooks/ingest/002")]
     #[tokio::test]
@@ -3855,6 +4006,230 @@ mod hook_ingestion_tests {
         drop(stalled);
         fixture.handle.abort();
         let _ = fixture.handle.await;
+    }
+
+    /// A producer-supplied string built from every family this sweep is about:
+    /// a raw LF (forges a whole following log line), a raw CR (overwrites the
+    /// line being written), ESC + a CSI sequence (clears the screen of whatever
+    /// renders it), a C1 control (U+0085 NEL, which some terminals still act
+    /// on), and a bidi override (U+202E, which reorders the line without
+    /// changing a byte). The readable words between them are what the evidence
+    /// assertions look for: escaping must PRESERVE the string, not drop it.
+    const FORGING_ID: &str =
+        "p1\nINFO forged-line\rovershoot\u{1b}[2Jcleared\u{202e}reversed\u{85}c1";
+
+    /// Every line the daemon wrote while a subscriber was installed, one entry
+    /// per rendered event with its trailing newline removed.
+    fn captured_log_lines(raw: &str) -> Vec<&str> {
+        raw.split('\n').filter(|l| !l.is_empty()).collect()
+    }
+
+    /// Scenario: Drive the real `run_hook_loop` against a real hook socket and send, on
+    /// one connection, a message of every `DaemonMessage` verb plus a raw `AgentEvent`,
+    /// an event whose `event_type` is a typo, and a line that is not JSON at all —
+    /// every one of them carrying ids built from LF, CR, ESC, a C1 control and a bidi
+    /// override. Capture the daemon's real `tracing` output: no line it writes may
+    /// contain any of those characters, while still naming the evidence and the site.
+    #[spec("hooks/ingest/005")]
+    #[tokio::test]
+    async fn ingest_005_producer_supplied_ids_cannot_forge_a_daemon_log_line() {
+        use std::sync::Mutex;
+
+        #[derive(Clone, Default)]
+        struct CapturedLog(Arc<Mutex<Vec<u8>>>);
+
+        impl std::io::Write for CapturedLog {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLog {
+            type Writer = CapturedLog;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        // `#[tokio::test]` is a current-thread runtime, so the `run_hook_loop`
+        // task below is polled on THIS thread and sees this thread-local
+        // subscriber. `with_ansi(false)` so the only escape bytes that could
+        // appear in the capture are ones the daemon itself wrote.
+        let captured = CapturedLog::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(captured.clone())
+            .with_max_level(tracing_subscriber::filter::LevelFilter::DEBUG)
+            .with_ansi(false)
+            .finish();
+        let subscriber_guard = tracing::subscriber::set_default(subscriber);
+
+        let fixture = HookLoopFixture::start();
+
+        // Every verb on one connection, because the loop reads lines from a
+        // connection SEQUENTIALLY: that makes the sentinel at the end a
+        // happens-after fact for all of them, which separate connections (one
+        // task each) would not give.
+        //
+        // The registry is fresh, so no pane was ever issued a hook token and
+        // `hook_provenance::classify` returns `Unattested` for a claimed pane it
+        // has never heard of — admitted, which is exactly the shape this class
+        // is about: an unattested claim reaches the arms and gets logged. The
+        // first line below is the other half, a malformed token, which is
+        // REFUSED and logged by the provenance gate itself.
+        let ts = "2026-09-08T12:00:00Z";
+        let lines = vec![
+            // Refused by the provenance gate → `claimed_pane` on the refusal.
+            serde_json::json!({
+                "message_type": "work_done", "pane_id": FORGING_ID,
+                "task": "t", "done": false, "token": "not-a-token", "timestamp": ts,
+            }),
+            serde_json::json!({
+                "message_type": "delegate", "pane_id": FORGING_ID,
+                "task": "t", "to": ["coder"], "timestamp": ts,
+            }),
+            serde_json::json!({
+                "message_type": "restart_role", "pane_id": FORGING_ID,
+                "role": FORGING_ID, "force": false, "timestamp": ts,
+            }),
+            serde_json::json!({
+                "message_type": "spawn_role", "pane_id": FORGING_ID,
+                "role": FORGING_ID, "timestamp": ts,
+            }),
+            serde_json::json!({
+                "message_type": "dispatch", "pane_id": FORGING_ID,
+                "name": "unit", "timestamp": ts,
+            }),
+            serde_json::json!({
+                "message_type": "work_done", "pane_id": FORGING_ID,
+                "task": "t", "done": false, "timestamp": ts,
+            }),
+            serde_json::json!({
+                "message_type": "get_seed", "pane_id": FORGING_ID, "timestamp": ts,
+            }),
+            serde_json::json!({
+                "message_type": "list_targets", "pane_id": FORGING_ID, "timestamp": ts,
+            }),
+            // A raw `AgentEvent`: the `Received event` line, and — because this
+            // pane is not one the daemon spawned — the foreign-SessionStart
+            // warning too.
+            serde_json::json!({
+                "session_id": FORGING_ID, "agent_type": "claude_code",
+                "event_type": "session_start", "timestamp": ts,
+                "pane_id": FORGING_ID, "metadata": {},
+            }),
+            // An unrecognized `event_type` → the warning that logs the WHOLE
+            // raw line back.
+            serde_json::json!({
+                "session_id": FORGING_ID, "agent_type": "claude_code",
+                "event_type": "sessoin_start", "timestamp": ts,
+                "pane_id": FORGING_ID, "metadata": {},
+            }),
+        ];
+
+        let mut stream = UnixStream::connect(&fixture.socket)
+            .await
+            .expect("connect hook socket");
+        for line in &lines {
+            stream
+                .write_all(format!("{line}\n").as_bytes())
+                .await
+                .expect("write hook line");
+        }
+        // Not JSON at all → the `Malformed event:` branch, which interpolates
+        // the line into the MESSAGE rather than into a field. A literal LF is
+        // unreachable here (it would end the line), so this one carries the
+        // other four families.
+        stream
+            .write_all("this is not json \r\u{1b}[2Jcleared\u{202e}reversed\u{85}c1\n".as_bytes())
+            .await
+            .expect("write malformed line");
+        // The happens-after fact: an ordinary event on the SAME connection,
+        // after all of the above, whose card proves the loop processed them.
+        stream
+            .write_all(format!("{}\n", padded_session_start("forge-sentinel", 0)).as_bytes())
+            .await
+            .expect("write sentinel");
+        stream.flush().await.unwrap();
+        fixture.wait_for_session("forge-sentinel").await;
+
+        drop(subscriber_guard);
+        fixture.handle.abort();
+        let _ = fixture.handle.await;
+
+        let raw = String::from_utf8(captured.0.lock().unwrap().clone())
+            .expect("captured log must be valid UTF-8");
+        let log_lines = captured_log_lines(&raw);
+        assert!(
+            !log_lines.is_empty(),
+            "the subscriber captured nothing, so this test would pass vacuously"
+        );
+
+        // The property, stated over the REAL output rather than over the helper:
+        // nothing a terminal or a line-oriented reader acts on survives into any
+        // line the daemon wrote.
+        //
+        // Collected rather than asserted per line, deliberately: an `assert!`
+        // inside the loop stops at the FIRST unescaped site and hides however
+        // many others there are, which is the wrong shape of failure for a
+        // sweep. Reverting one call site must name that one call site.
+        let forged: Vec<&&str> = log_lines
+            .iter()
+            .filter(|line| {
+                line.chars().any(|c| c.is_control())
+                    || line.chars().any(crate::untrusted_text::is_bidi_format_char)
+            })
+            .collect();
+        assert!(
+            forged.is_empty(),
+            "a raw LF forges a whole log line, a raw CR overwrites the one being written, \
+             ESC clears the screen of whatever renders it and a bidi override reorders it; \
+             none may survive into a daemon log line, but {} did: {forged:#?}",
+            forged.len()
+        );
+
+        // Escaping preserves the evidence rather than dropping it — a value
+        // that silently loses characters reads as a DIFFERENT value.
+        for needle in ["forged-line", "overshoot", "cleared", "reversed"] {
+            assert!(
+                raw.contains(needle),
+                "escaping must keep the evidence readable; {needle:?} missing from {raw:?}"
+            );
+        }
+        assert!(
+            raw.contains("\\n") && raw.contains("\\r") && raw.contains("\\u{1b}"),
+            "the escaped spellings are what preserve the evidence: {raw:?}"
+        );
+
+        // And the sweep itself: every site this issue escaped must actually have
+        // been reached, or the loop above proves nothing about it. Naming them
+        // here is what makes a site quietly dropped from the sweep fail.
+        for site in [
+            "hook socket: refused a message whose hook",
+            "Received delegate signal",
+            "Received restart-role signal",
+            "Received spawn-role signal",
+            "Received dispatch signal",
+            "dispatch from unknown pane",
+            "Received work-done signal",
+            "work-done from unknown pane",
+            "Received get-seed request",
+            "Received list-targets request",
+            "Received event",
+            "unrecognized event_type",
+            "SessionStart for a pane this daemon did not spawn",
+            "Malformed event:",
+            "action from unknown pane",
+        ] {
+            assert!(
+                raw.contains(site),
+                "the hostile message never reached {site:?}, so this test does not \
+                 cover that site: {raw:?}"
+            );
+        }
     }
 
     // ── Issue #1159: why the two tests below no longer race a 2-second window ──
@@ -5188,6 +5563,7 @@ mod hook_ingestion_tests {
         orchestrator_token: String,
         worker_token: String,
         worker_agent: String,
+        orchestrator_agent: String,
         handle: tokio::task::JoinHandle<Result<(), DaemonError>>,
     }
 
@@ -5265,6 +5641,7 @@ mod hook_ingestion_tests {
                     .expect("orchestrator token"),
                 worker_token: registry.hook_token_of(&worker_agent).expect("worker token"),
                 worker_agent,
+                orchestrator_agent,
                 registry,
                 sock,
                 _cwd: cwd,
@@ -5297,6 +5674,61 @@ mod hook_ingestion_tests {
             serde_json::from_str(buf.trim()).unwrap_or_else(|e| {
                 panic!("delegate reply was not a DelegateResponse ({e}): {buf:?}")
             })
+        }
+
+        /// Send one `work_done` line from the WORKER's pane and read the
+        /// daemon's acknowledgement (issue #1129).
+        ///
+        /// Deliberately reads the connection the same way [`Self::delegate`]
+        /// does — to EOF after a half-close — so "the daemon wrote nothing" is a
+        /// result this helper can return rather than a hang.
+        async fn work_done(
+            &self,
+            claimed_pane: &str,
+            token: Option<&str>,
+            report: &str,
+        ) -> Option<crate::event::SignalAck> {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let msg = crate::event::DaemonMessage::WorkDone(crate::event::WorkDoneSignal {
+                pane_id: claimed_pane.to_string(),
+                task: report.to_string(),
+                done: false,
+                timestamp: chrono::Utc::now(),
+                token: token.map(str::to_string),
+            });
+            let line = format!("{}\n", serde_json::to_string(&msg).unwrap());
+            let mut stream = UnixStream::connect(&self.sock).await.expect("connect");
+            stream.write_all(line.as_bytes()).await.unwrap();
+            stream.flush().await.unwrap();
+            stream.shutdown().await.unwrap();
+            let mut buf = String::new();
+            stream.read_to_string(&mut buf).await.unwrap();
+            if buf.trim().is_empty() {
+                return None;
+            }
+            Some(
+                serde_json::from_str(buf.trim()).unwrap_or_else(|e| {
+                    panic!("work_done reply was not a SignalAck ({e}): {buf:?}")
+                }),
+            )
+        }
+
+        /// Whether the ORCHESTRATOR's PTY has seen `needle` yet, polled for
+        /// `budget`. `handle_work_done` writes its feedback there, so this is
+        /// how a work-done that ran is told from one that was refused.
+        async fn orchestrator_saw(&self, needle: &str, budget: Duration) -> bool {
+            let deadline = tokio::time::Instant::now() + budget;
+            loop {
+                if let Ok(bytes) = self.registry.snapshot(&self.orchestrator_agent)
+                    && String::from_utf8_lossy(&bytes).contains(needle)
+                {
+                    return true;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    return false;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
         }
 
         /// Whether the worker's PTY has seen the delegate pointer yet, polled
@@ -5421,6 +5853,122 @@ mod hook_ingestion_tests {
             "a token from some other daemon must not attest anything here: {resp:?}"
         );
         assert!(!fx.worker_saw_pointer(Duration::from_secs(2)).await);
+        fx.stop().await;
+    }
+
+    /// Scenario: issue #1129 — the worker's own `work-done`, carrying the token
+    /// its spawn was given, is admitted AND is now acknowledged on the
+    /// connection. The verb answered nothing at all before this, so the
+    /// acknowledgement is the whole of what is new; the handler must still run,
+    /// which is what the orchestrator's PTY proves.
+    #[tokio::test]
+    async fn hook_provenance_acknowledges_an_attested_work_done() {
+        let fx = ProvenanceFixture::start().await;
+        let token = fx.worker_token.clone();
+        let ack = fx
+            .work_done(PROV_WORKER_PANE, Some(&token), "WORKDONE-ATTESTED-5a1c")
+            .await
+            .expect("an attested work-done must be acknowledged, not answered with silence");
+        assert!(
+            ack.is_signal_ack(),
+            "the ack must identify itself, or an older CLI would read any line as one: {ack:?}"
+        );
+        assert!(
+            ack.accepted,
+            "an attested work-done must be admitted: {ack:?}"
+        );
+        assert_eq!(ack.error, None, "an admission carries no error: {ack:?}");
+        assert!(
+            fx.orchestrator_saw("WORKDONE-ATTESTED-5a1c", Duration::from_secs(20))
+                .await,
+            "the ack was written but the handler never ran — the report never reached the              orchestrator's PTY"
+        );
+        fx.stop().await;
+    }
+
+    /// Scenario: issue #1129 — the same `work-done`, naming the same worker
+    /// pane, with no token. Before this the daemon refused it and wrote nothing
+    /// back, so the sender exited 0 on a report that was dropped. It must now be
+    /// told, and the report must still not reach the orchestrator.
+    #[tokio::test]
+    async fn hook_provenance_tells_the_sender_a_work_done_was_refused() {
+        let fx = ProvenanceFixture::start().await;
+        let ack = fx
+            .work_done(PROV_WORKER_PANE, None, "WORKDONE-FORGED-2b7e")
+            .await
+            .expect("a refused work-done must be reported to the caller, not dropped silently");
+        assert!(
+            ack.is_signal_ack(),
+            "the refusal must identify itself: {ack:?}"
+        );
+        assert!(
+            !ack.accepted,
+            "a refused work-done must not report acceptance: {ack:?}"
+        );
+        assert_eq!(
+            ack.reason.as_deref(),
+            Some("missing_token"),
+            "the ack must carry the same greppable code the daemon put in its own warn line:              {ack:?}"
+        );
+        let err = ack
+            .error
+            .clone()
+            .expect("a refusal must say why, so an older CLI in the pane is diagnosable");
+        assert!(
+            err.contains("hook capability token"),
+            "the refusal must name the mechanism: {err}"
+        );
+        assert!(
+            !fx.orchestrator_saw("WORKDONE-FORGED-2b7e", Duration::from_secs(2))
+                .await,
+            "the refused work-done still reached the orchestrator's PTY — the caller was told              but the handler ran anyway"
+        );
+        fx.stop().await;
+    }
+
+    /// Scenario: issue #1129 — an OLDER `dot-agent-deck` in a pane writes its
+    /// `work-done` line and closes the connection without ever reading a reply,
+    /// because the binary predates the acknowledgement. The daemon writes the
+    /// ack into a socket nobody is reading and, on a closed peer, into one that
+    /// will error. Neither may wedge the hook loop: the next connection must
+    /// still be served.
+    ///
+    /// This is the half of the cross-version pairing no assertion about the CLI
+    /// can reach, since the point is a sender that is not this build.
+    #[tokio::test]
+    async fn an_ack_nobody_reads_does_not_wedge_the_hook_loop() {
+        use tokio::io::AsyncWriteExt;
+        let fx = ProvenanceFixture::start().await;
+        // Three connections that write and vanish, the way a pre-#1129 CLI
+        // does. One is not enough: a write that merely lands in the socket
+        // buffer proves nothing about a peer that is already gone.
+        for i in 0..3 {
+            let msg = crate::event::DaemonMessage::WorkDone(crate::event::WorkDoneSignal {
+                pane_id: PROV_WORKER_PANE.to_string(),
+                task: format!("WORKDONE-DEAF-{i}"),
+                done: false,
+                timestamp: chrono::Utc::now(),
+                token: None,
+            });
+            let line = format!("{}\n", serde_json::to_string(&msg).unwrap());
+            let mut stream = UnixStream::connect(&fx.sock).await.expect("connect");
+            stream.write_all(line.as_bytes()).await.unwrap();
+            stream.flush().await.unwrap();
+            drop(stream);
+        }
+        // The loop still serves: an attested work-done is acknowledged and acted
+        // on afterwards.
+        let token = fx.worker_token.clone();
+        let ack = fx
+            .work_done(PROV_WORKER_PANE, Some(&token), "WORKDONE-AFTER-DEAF-3c9f")
+            .await
+            .expect("the hook loop stopped answering after writing acks nobody read");
+        assert!(ack.accepted, "{ack:?}");
+        assert!(
+            fx.orchestrator_saw("WORKDONE-AFTER-DEAF-3c9f", Duration::from_secs(20))
+                .await,
+            "the hook loop answered but stopped handling after the unread acks"
+        );
         fx.stop().await;
     }
 
