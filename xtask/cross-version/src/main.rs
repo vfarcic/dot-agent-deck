@@ -142,8 +142,10 @@ struct Opts {
     #[arg(long)]
     releases_dir: Option<PathBuf>,
 
-    /// Where to write the markdown evidence report. Defaults to
-    /// `.dot-agent-deck/xver-evidence/<branch slug>.md` in this checkout.
+    /// Where to write the markdown evidence report, exactly as given. Defaults
+    /// to `.dot-agent-deck/xver-evidence/<branch slug>.md` in this checkout
+    /// (`<branch slug>-reverse.md` in a reverse run). Refused with
+    /// `--direction both`, which writes two files.
     #[arg(long)]
     evidence: Option<PathBuf>,
 
@@ -287,28 +289,40 @@ fn select_probe(arg: ProbeArg, branch: &str, direction: Direction) -> Result<Pro
     }
 }
 
-/// `.dot-agent-deck/xver-evidence/<slug>.md` for a forward run — the path every
-/// earlier run wrote — and `<slug>-reverse.md` for a reverse one, so the two
-/// directions of one branch never overwrite each other. An explicit
-/// `--evidence` gets the same `-reverse` suffix in a reverse run.
+/// An explicit `--evidence` is written exactly where it says, in either
+/// direction. Otherwise `.dot-agent-deck/xver-evidence/<slug>.md` for a forward
+/// run — the path every earlier run wrote — and `<slug>-reverse.md` for a
+/// reverse one, so the two directions of one branch never overwrite each other.
+///
+/// The explicit path used to get the same `-reverse` suffix, which left a
+/// reverse run's evidence somewhere its operator had not named. `--direction
+/// both`, the one invocation where a single path cannot name both files, is
+/// refused up front by [`check_evidence_arg`] instead.
 fn evidence_path(explicit: Option<&Path>, root: &Path, slug: &str, d: Direction) -> PathBuf {
-    let base = explicit.map(Path::to_path_buf).unwrap_or_else(|| {
-        root.join(".dot-agent-deck")
-            .join("xver-evidence")
-            .join(format!("{slug}.md"))
-    });
-    if d == Direction::Forward {
-        return base;
+    if let Some(path) = explicit {
+        return path.to_path_buf();
     }
-    let stem = base
-        .file_stem()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let name = match base.extension() {
-        Some(ext) => format!("{stem}-reverse.{}", ext.to_string_lossy()),
-        None => format!("{stem}-reverse"),
+    let name = match d {
+        Direction::Forward => format!("{slug}.md"),
+        Direction::Reverse => format!("{slug}-reverse.md"),
     };
-    base.with_file_name(name)
+    root.join(".dot-agent-deck")
+        .join("xver-evidence")
+        .join(name)
+}
+
+/// `--evidence` names one file and `--direction both` writes two, so the pair
+/// is refused before anything is built rather than resolved by renaming one.
+fn check_evidence_arg(explicit: Option<&Path>, direction: DirectionArg) -> Result<(), String> {
+    match (explicit, direction) {
+        (Some(path), DirectionArg::Both) => Err(format!(
+            "`--evidence {}` names one file, and `--direction both` writes two (one per \
+             direction) — run each direction with its own `--evidence`, or omit it for the \
+             default `<branch slug>.md` and `<branch slug>-reverse.md`",
+            path.display()
+        )),
+        _ => Ok(()),
+    }
 }
 
 fn main() -> ExitCode {
@@ -704,6 +718,7 @@ fn skip_build_note(head_sha: &str, new_hello: &str) -> String {
 // ---------------------------------------------------------------------------
 
 fn run(opts: &Opts) -> Result<bool, String> {
+    check_evidence_arg(opts.evidence.as_deref(), opts.direction)?;
     let directions = opts.direction.directions();
     // Refuse a probe/direction combination before anything is built. With
     // `both`, an explicit probe belongs to the reverse half and the forward half
@@ -1509,13 +1524,38 @@ mod tests {
             rev,
             Path::new("/repo/.dot-agent-deck/xver-evidence/agent-x-reverse.md")
         );
-        let explicit = evidence_path(
-            Some(Path::new("/out/e.md")),
-            root,
-            "agent-x",
-            Direction::Reverse,
+    }
+
+    #[test]
+    fn an_explicit_evidence_path_is_written_verbatim_in_either_direction() {
+        let root = Path::new("/repo");
+        for d in [Direction::Forward, Direction::Reverse] {
+            for given in [
+                "/out/e.md",
+                "/out/control-main-1121-generic-reverse.md",
+                "/out/e",
+            ] {
+                assert_eq!(
+                    evidence_path(Some(Path::new(given)), root, "agent-x", d),
+                    Path::new(given),
+                    "{d:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_explicit_evidence_path_is_refused_only_with_both_directions() {
+        let given = Some(Path::new("/out/e.md"));
+        assert!(check_evidence_arg(given, DirectionArg::Forward).is_ok());
+        assert!(check_evidence_arg(given, DirectionArg::Reverse).is_ok());
+        let refused = check_evidence_arg(given, DirectionArg::Both).expect_err("both");
+        assert!(
+            refused.contains("`--evidence /out/e.md` names one file"),
+            "{refused}"
         );
-        assert_eq!(explicit, Path::new("/out/e-reverse.md"));
+        // The defaults already give each direction its own file.
+        assert!(check_evidence_arg(None, DirectionArg::Both).is_ok());
     }
 }
 

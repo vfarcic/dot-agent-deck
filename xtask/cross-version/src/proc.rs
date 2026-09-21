@@ -124,6 +124,28 @@ pub fn ppid(pid: i32) -> Option<i32> {
     parse_ppid(&std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?)
 }
 
+/// Fields 5 and 6 (`pgrp`, `session`) out of a `/proc/<pid>/stat` line.
+pub fn parse_pgrp_session(stat: &str) -> Option<(i32, i32)> {
+    let f = stat_fields_after_comm(stat)?;
+    Some((f.get(2)?.parse().ok()?, f.get(3)?.parse().ok()?))
+}
+
+/// Where each of `pid`'s open descriptors points (`socket:[N]`, a path,
+/// `anon_inode:[eventpoll]`, …), from its `/proc/<pid>/fd` links, in no
+/// particular order. `Err` when the table itself cannot be read; a descriptor
+/// closed between the listing and its `readlink` is simply not there.
+pub fn fd_targets(pid: i32) -> Result<Vec<String>, String> {
+    let dir = format!("/proc/{pid}/fd");
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(&dir).map_err(|e| format!("read {dir}: {e}"))? {
+        let Ok(entry) = entry else { continue };
+        if let Ok(target) = std::fs::read_link(entry.path()) {
+            out.push(target.to_string_lossy().into_owned());
+        }
+    }
+    Ok(out)
+}
+
 /// Every visible process whose parent chain reaches `root` (not `root`
 /// itself), with its command line, in pid order. A census, not a signal list:
 /// nothing here is ever signalled by it.
@@ -650,8 +672,32 @@ mod tests {
         assert_eq!(parse_start_time(stat), Some(424242));
         assert_eq!(parse_state(stat), Some('S'));
         assert_eq!(parse_ppid(stat), Some(1));
+        assert_eq!(parse_pgrp_session(stat), Some((1234, 1234)));
         assert_eq!(parse_flags(stat), Some(4194560));
         assert_eq!(4194560 & PF_EXITING, 0, "that sample is a live process");
+    }
+
+    #[test]
+    fn the_process_group_and_session_are_fields_5_and_6() {
+        // A lifetime-cap reaper's shape: pid 311, parent 1, group and session
+        // both its intermediate's (309).
+        let stat = "311 (dot-agent-deck) S 1 309 309 0 -1 4194624 0 0 0 0 0 0 0 0 20 0 1 0 9 0 0";
+        assert_eq!(parse_pgrp_session(stat), Some((309, 309)));
+        let own = std::fs::read_to_string("/proc/self/stat").expect("own stat");
+        // SAFETY: both only read this process's own ids.
+        let want = unsafe { (libc::getpgrp(), libc::getsid(0)) };
+        assert_eq!(parse_pgrp_session(&own), Some(want));
+    }
+
+    #[test]
+    fn this_process_has_a_readable_nonempty_descriptor_table() {
+        // A Rust binary started by `execve` runs with 0/1/2 open — its runtime
+        // reopens `/dev/null` over any that are closed at startup — which is
+        // why an EMPTY table is a lifetime-cap reaper's signature.
+        let me = std::process::id() as i32;
+        let fds = fd_targets(me).expect("own fd table");
+        assert!(!fds.is_empty(), "{fds:?}");
+        assert!(fd_targets(-1).is_err());
     }
 
     #[test]

@@ -1739,9 +1739,13 @@ fn classify_undiscovered(
             }
         }
     }
-    // Forked lifetime-cap reapers inherit the listening descriptors, so the
-    // holder set is a daemon and its forks: the daemon is the one whose parent
-    // is not itself a holder.
+    // The daemon is the holder whose parent is not itself a holder. A holder
+    // besides it is a fork caught before it let go of what it inherited:
+    // `arm_child_group_backstop`'s intermediate, which exits at once, or the
+    // reaper it forks, in the moment before `close_all_descriptors` — a reaper
+    // itself holds no descriptor at all (see `reaper_of`). One caught after
+    // its intermediate exited has init for a parent, so it would be a second
+    // root and abort the run below as unidentified: the safe direction.
     let roots: Vec<i32> = holders
         .iter()
         .copied()
@@ -2071,14 +2075,28 @@ fn classify_undiscovered(
 
 /// One process of the run's PID namespace, as the `role-set` census reads it
 /// from `/proc`.
+///
+/// Every field that can fail to read is an `Option`, and `None` is never
+/// treated as the harmless value: a reaper exemption (see [`reaper_of`]) needs
+/// each of its facts read, not assumed.
 #[derive(Clone, Debug)]
 pub(crate) struct CensusProc {
     pub pid: i32,
+    /// Field 4 of `/proc/<pid>/stat`.
+    pub ppid: Option<i32>,
+    /// Fields 5 and 6 of `/proc/<pid>/stat`: process group and session.
+    pub pgrp_session: Option<(i32, i32)>,
+    /// `/proc/<pid>/exe`.
+    pub exe: Option<PathBuf>,
     pub cmdline: Vec<String>,
+    /// The whole initial environment, `/proc/<pid>/environ`.
+    pub environ: Option<BTreeMap<String, String>>,
     /// `DOT_AGENT_DECK_PANE_ID` from its initial environment: the daemon sets
     /// it on every pane process it spawns, and a process started inside a pane
     /// inherits it.
     pub pane_id: Option<String>,
+    /// Where each open descriptor points, from `/proc/<pid>/fd`.
+    pub fds: Option<Vec<String>>,
     /// Whether its parent chain reaches the daemon under test.
     pub under_daemon: bool,
 }
@@ -2093,8 +2111,218 @@ pub(crate) struct RoleSetInput<'a> {
     pub now: Result<&'a [StatusRow], &'a str>,
     /// Every process of the PID namespace, or why `/proc` could not be read.
     pub census: Result<&'a [CensusProc], &'a str>,
-    pub daemon_pid: i32,
-    pub daemon_cmdline: &'a [String],
+    /// The daemon under test, as recorded at spawn and re-verified before every
+    /// client since: its exe, exact command line and whole initial environment
+    /// are what a reaper, a fork of it, carries too.
+    pub daemon: &'a Identity,
+}
+
+/// The variable `arm_child_group_backstop` (`src/wrap.rs`) reads before it
+/// forks a reaper at all: without a positive whole number of seconds in it, it
+/// returns having forked nothing.
+const MAX_LIFETIME_VAR: &str = "DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS";
+
+/// At most this many descriptor targets are quoted per process in a problem.
+const FDS_QUOTED: usize = 6;
+
+/// Every process in `census` whose parent chain, as the census read it,
+/// passes through `root` (not `root` itself), in census order.
+fn census_descendants(census: &[CensusProc], root: i32) -> Vec<&CensusProc> {
+    let mut found: std::collections::BTreeSet<i32> = std::collections::BTreeSet::new();
+    let mut frontier = vec![root];
+    while let Some(parent) = frontier.pop() {
+        for p in census {
+            if p.ppid == Some(parent) && p.pid != root && found.insert(p.pid) {
+                frontier.push(p.pid);
+            }
+        }
+    }
+    census.iter().filter(|p| found.contains(&p.pid)).collect()
+}
+
+/// Whether `p` — a `daemon serve` process that is not the daemon — is one of
+/// the daemon's per-pane lifetime-cap reapers, decided by what it IS rather
+/// than by where it sits in the tree. `Ok` carries the evidence; `Err` names
+/// every criterion that did not hold, and any one of them keeps `p` a problem.
+///
+/// Where it sits cannot decide it. `arm_child_group_backstop` forks an
+/// intermediate that `setsid`s, forks the reaper and exits at once, so the
+/// reaper is reparented — to the namespace's init here, where nothing sets a
+/// subreaper — and is outside the daemon's tree for the rest of its life.
+/// That is how the #1179 control's three reapers were once reported as three
+/// second daemons.
+///
+/// What it is, each read from `/proc`, never inferred from an unreadable field:
+///
+/// 1. **It holds no socket** — no `socket:[…]` descriptor of any kind,
+///    listening or connected, Unix or not. Stricter than asking whether one is
+///    in `/proc/net/unix`; a deck daemon serves its clients through sockets.
+/// 2. **It is nobody's ancestor.** No process in the census descends from it,
+///    so none carrying a pane id does; the reaper forks nothing. Every census
+///    process's parent must have been read, or that is not established.
+/// 3. **It has a reaper's identity** — the evidence `src/wrap.rs` actually
+///    produces, all of it together:
+///    - the daemon's exe, exact command line and **whole initial
+///      environment**. A `fork` without an `exec` keeps all three, the
+///      environment byte for byte (`/proc/<pid>/environ` reads the block laid
+///      out at the daemon's `execve`, which the fork copies); an exec'd daemon
+///      has whatever environment its spawner passed.
+///    - that environment names a lifetime cap, the only condition under which
+///      a reaper is forked at all (see [`MAX_LIFETIME_VAR`]).
+///    - an **empty** descriptor table. `close_all_descriptors` closes every
+///      inherited descriptor, 0/1/2 included; this binary started by `execve`
+///      runs with 0/1/2 open (Rust's runtime reopens `/dev/null` over any that
+///      are closed at startup), and a serving daemon holds far more. This is
+///      the first of the two discriminators `arm_child_group_backstop`'s own
+///      docs record as measured on a live reaper.
+///    - process group == session != its own pid, the second: both name the
+///      intermediate that `setsid`'d before forking it.
+///
+/// Not used: the parent pid, which says where it sits (init, or whichever
+/// subreaper is nearest) rather than what it is, and is recorded as context
+/// only; and `DOT_AGENT_DECK_TEST_LIFETIME_TAG` (#861), which the reaper holds
+/// only in memory — it is passed through the fork as an argument and set on the
+/// pane's environment, not the reaper's, so nothing of it can be read off one.
+///
+/// A fork caught in the moment before it closes what it inherited still holds
+/// the daemon's sockets and fails criterion 1 — the safe direction.
+fn reaper_of(
+    p: &CensusProc,
+    census: &[CensusProc],
+    daemon: &Identity,
+) -> Result<String, Vec<String>> {
+    let mut failed = Vec::new();
+    let quote = |fds: &[&String]| {
+        let shown: Vec<&str> = fds.iter().take(FDS_QUOTED).map(|s| s.as_str()).collect();
+        if fds.len() > FDS_QUOTED {
+            format!("{shown:?} and {} more", fds.len() - FDS_QUOTED)
+        } else {
+            format!("{shown:?}")
+        }
+    };
+
+    // 1. No socket (and, for criterion 3, no descriptor at all).
+    match &p.fds {
+        None => failed.push("its descriptor table could not be read".to_string()),
+        Some(fds) => {
+            let (sockets, other): (Vec<&String>, Vec<&String>) =
+                fds.iter().partition(|t| t.starts_with("socket:"));
+            if !sockets.is_empty() {
+                failed.push(format!(
+                    "it holds {} socket(s) {}",
+                    sockets.len(),
+                    quote(&sockets)
+                ));
+            }
+            if !other.is_empty() {
+                failed.push(format!(
+                    "it holds {} other descriptor(s) {} — a reaper closes every one it \
+                     inherited, 0/1/2 included",
+                    other.len(),
+                    quote(&other)
+                ));
+            }
+        }
+    }
+
+    // 2. Nobody's ancestor.
+    let unread: Vec<i32> = census
+        .iter()
+        .filter(|q| q.ppid.is_none())
+        .map(|q| q.pid)
+        .collect();
+    if !unread.is_empty() {
+        failed.push(format!(
+            "the parent of pid(s) {unread:?} could not be read, so it is not established that \
+             none of them descends from it"
+        ));
+    }
+    let below = census_descendants(census, p.pid);
+    if !below.is_empty() {
+        let panes = below.iter().filter(|q| q.pane_id.is_some()).count();
+        failed.push(format!(
+            "it is an ancestor of {} process(es) [{}], {panes} of them carrying a pane id",
+            below.len(),
+            below
+                .iter()
+                .map(|q| match &q.pane_id {
+                    Some(pane) => format!("pid {} (pane {pane})", q.pid),
+                    None => format!("pid {}", q.pid),
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+
+    // 3. A reaper's identity.
+    match &p.exe {
+        Some(exe) if *exe == daemon.exe => {}
+        Some(exe) => failed.push(format!(
+            "its exe `{}` is not the daemon's `{}`",
+            exe.display(),
+            daemon.exe.display()
+        )),
+        None => failed.push("its exe could not be read".to_string()),
+    }
+    if p.cmdline != daemon.cmdline {
+        failed.push(format!(
+            "its command line {:?} is not the daemon's exact {:?}",
+            p.cmdline, daemon.cmdline
+        ));
+    }
+    match &p.environ {
+        Some(env) if *env == daemon.environ => {}
+        Some(env) => {
+            // Names only: which entries differ is the evidence, and the values
+            // are nobody's business in a report.
+            let differing: Vec<&str> = env
+                .keys()
+                .chain(daemon.environ.keys())
+                .filter(|k| env.get(*k) != daemon.environ.get(*k))
+                .map(String::as_str)
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect();
+            failed.push(format!(
+                "its initial environment is not the daemon's (entries that differ: {differing:?})"
+            ));
+        }
+        None => failed.push("its initial environment could not be read".to_string()),
+    }
+    let cap = daemon
+        .environ
+        .get(MAX_LIFETIME_VAR)
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|secs| *secs > 0);
+    if cap.is_none() {
+        failed.push(format!(
+            "the daemon's environment names no lifetime cap (`{MAX_LIFETIME_VAR}`), and without \
+             one the daemon forks no reaper"
+        ));
+    }
+    match p.pgrp_session {
+        Some((pgrp, sid)) if pgrp == sid && pgrp != p.pid => {}
+        Some((pgrp, sid)) => failed.push(format!(
+            "its process group {pgrp} and session {sid} are not a reaper's, whose group and \
+             session both name the intermediate that `setsid`'d before forking it and never \
+             its own pid"
+        )),
+        None => failed.push("its process group and session could not be read".to_string()),
+    }
+
+    if !failed.is_empty() {
+        return Err(failed);
+    }
+    let (pgrp, _) = p.pgrp_session.unwrap_or_default();
+    Ok(format!(
+        "pid {}: no descriptor at all, so no socket; nobody's ancestor; the daemon's exe, exact \
+         command line and whole initial environment, which names a lifetime cap of {} s; process \
+         group = session = {pgrp} ≠ {}; parent pid {}",
+        p.pid,
+        cap.unwrap_or_default(),
+        p.pid,
+        p.ppid.map_or_else(|| "?".to_string(), |pp| pp.to_string())
+    ))
 }
 
 /// `<bin> daemon serve`, whatever the binary.
@@ -2124,8 +2352,13 @@ fn rows_for<'r>(rows: &'r [StatusRow], role: &str) -> Vec<&'r StatusRow> {
 /// 2. each listed role pane is backed by a live process under the daemon;
 /// 3. every process carrying a pane id is under the daemon — a pane process
 ///    anywhere else belongs to a role set some other process spawned;
-/// 4. no `daemon serve` process runs besides the daemon and its forks (its
-///    lifetime-cap reapers share its exact command line and are its children).
+/// 4. no `daemon serve` process runs besides the daemon and its per-pane
+///    lifetime-cap reapers — and a reaper is recognised by what it is, each
+///    fact read from `/proc` (see [`reaper_of`]): no socket, nobody's
+///    ancestor, and a fork of the daemon's with a reaper's signature. Not by
+///    its place in the tree, because a reaper is reparented to init as soon as
+///    the intermediate that forked it exits, which it does at once. Anything
+///    that fails one of those is a problem, whatever its command line.
 ///
 /// A listing or census that could not be read is NOT CHECKED, never a pass.
 pub(crate) fn judge_role_set(i: &RoleSetInput<'_>) -> (Verdict, String) {
@@ -2138,15 +2371,15 @@ pub(crate) fn judge_role_set(i: &RoleSetInput<'_>) -> (Verdict, String) {
             );
         }
     };
+    let daemon_pid = i.daemon.pid;
     let census = match i.census {
-        Ok(c) if c.iter().any(|p| p.pid == i.daemon_pid) => c,
+        Ok(c) if c.iter().any(|p| p.pid == daemon_pid) => c,
         Ok(_) => {
             return (
                 Verdict::NotChecked,
                 format!(
-                    "the /proc census did not see the daemon (pid {}), so it is not a census of \
-                     this run",
-                    i.daemon_pid
+                    "the /proc census did not see the daemon (pid {daemon_pid}), so it is not a \
+                     census of this run"
                 ),
             );
         }
@@ -2199,8 +2432,8 @@ pub(crate) fn judge_role_set(i: &RoleSetInput<'_>) -> (Verdict, String) {
                 .collect();
             if procs.is_empty() {
                 problems.push(format!(
-                    "`{role}`'s pane {} has no live process under the daemon (pid {})",
-                    row.pane_id, i.daemon_pid
+                    "`{role}`'s pane {} has no live process under the daemon (pid {daemon_pid})",
+                    row.pane_id
                 ));
             }
             backing.push(format!("pane {} → pid(s) {procs:?}", row.pane_id));
@@ -2224,44 +2457,49 @@ pub(crate) fn judge_role_set(i: &RoleSetInput<'_>) -> (Verdict, String) {
         .collect();
     for p in &stray_panes {
         problems.push(format!(
-            "pid {} ({}) carries pane id {} but is NOT under the daemon (pid {})",
+            "pid {} ({}) carries pane id {} but is NOT under the daemon (pid {daemon_pid})",
             p.pid,
             p.cmdline.join(" "),
             p.pane_id.as_deref().unwrap_or_default(),
-            i.daemon_pid
         ));
     }
-    let other_daemons: Vec<&CensusProc> = census
+    let mut reapers = Vec::new();
+    let mut other_daemons = 0;
+    for p in census
         .iter()
-        .filter(|p| {
-            is_daemon_serve(&p.cmdline)
-                && p.pid != i.daemon_pid
-                && !(p.under_daemon && p.cmdline == i.daemon_cmdline)
-        })
-        .collect();
-    for p in &other_daemons {
-        problems.push(format!(
-            "a `daemon serve` process other than the daemon and its forks: pid {} ({})",
-            p.pid,
-            p.cmdline.join(" ")
-        ));
+        .filter(|p| is_daemon_serve(&p.cmdline) && p.pid != daemon_pid)
+    {
+        match reaper_of(p, census, i.daemon) {
+            Ok(evidence) => reapers.push(evidence),
+            Err(failed) => {
+                other_daemons += 1;
+                problems.push(format!(
+                    "a `daemon serve` process other than the daemon and its lifetime-cap \
+                     reapers: pid {} ({}) — {}",
+                    p.pid,
+                    p.cmdline.join(" "),
+                    failed.join("; ")
+                ));
+            }
+        }
     }
     let pane_procs = census.iter().filter(|p| p.pane_id.is_some()).count();
-    let reapers = census
-        .iter()
-        .filter(|p| p.pid != i.daemon_pid && p.under_daemon && p.cmdline == i.daemon_cmdline)
-        .count();
     let detail = format!(
         "{}\n\
          /proc census of the PID namespace: {} process(es); {pane_procs} carry a pane id, {} of \
-         them outside the daemon's tree; {} `daemon serve` process(es) besides the daemon (pid {}) \
-         and its {reapers} fork(s) sharing its exact command line.\n\
+         them outside the daemon's tree; {other_daemons} `daemon serve` process(es) besides the \
+         daemon (pid {daemon_pid}) and its {} lifetime-cap reaper(s), each recognised by what it \
+         is rather than where it sits{}\n\
          {}",
         lines.join("\n"),
         census.len(),
         stray_panes.len(),
-        other_daemons.len(),
-        i.daemon_pid,
+        reapers.len(),
+        if reapers.is_empty() {
+            ".".to_string()
+        } else {
+            format!(":\n  - {}", reapers.join("\n  - "))
+        },
         if problems.is_empty() {
             "exactly one set of the orchestration's roles, the one brought up before the second \
              TUI attached, under the one daemon"
@@ -2293,10 +2531,19 @@ fn census(daemon_pid: i32) -> Result<Vec<CensusProc>, String> {
         let Some(cmdline) = proc::cmdline(pid) else {
             continue;
         };
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok();
+        let environ = proc::environ(pid);
         out.push(CensusProc {
             pid,
+            ppid: stat.as_deref().and_then(proc::parse_ppid),
+            pgrp_session: stat.as_deref().and_then(proc::parse_pgrp_session),
+            exe: proc::exe_path(pid),
             cmdline,
-            pane_id: proc::environ(pid).and_then(|e| e.get("DOT_AGENT_DECK_PANE_ID").cloned()),
+            pane_id: environ
+                .as_ref()
+                .and_then(|e| e.get("DOT_AGENT_DECK_PANE_ID").cloned()),
+            environ,
+            fds: proc::fd_targets(pid).ok(),
             under_daemon: under.contains(&pid),
         });
     }
@@ -2331,8 +2578,7 @@ fn role_set(
         before,
         now: now.as_deref().map_err(String::as_str),
         census: census.as_deref().map_err(String::as_str),
-        daemon_pid: daemon.pid(),
-        daemon_cmdline: &daemon.identity.cmdline,
+        daemon: &daemon.identity,
     });
     ev.tell(
         "role-set",
@@ -2760,72 +3006,512 @@ mod reverse_tests {
         ]
     }
 
+    // The #1179 attribution control, `--branch main --direction reverse
+    // --probe generic --endpoint-mode resolved --unset-xdg-runtime-dir`: its
+    // sandbox, daemon and the pids its `role-set` detail named. Where that
+    // detail named no value (pid 1's and the old TUI's argv, each reaper's
+    // intermediate), the fixture follows `src/wrap.rs` and is marked so.
+    const RUN: &str = "/home/vfarcic/code/dot-agent-deck-xver-runs/main-rev-1789966436";
     const DAEMON: i32 = 5;
+    /// The pane processes and their reapers: `pane N → pid P`, reaper `R`.
+    const PANES: [(&str, i32, i32); 3] = [("1", 308, 311), ("2", 490, 492), ("3", 537, 539)];
 
-    fn daemon_cmdline() -> Vec<String> {
-        ["/srv/runs/r1/branch/dot-agent-deck", "daemon", "serve"]
-            .map(String::from)
-            .to_vec()
+    fn branch_bin() -> String {
+        format!("{RUN}/branch/dot-agent-deck")
     }
 
-    fn cp(pid: i32, cmdline: &[&str], pane: Option<&str>, under: bool) -> CensusProc {
-        CensusProc {
-            pid,
-            cmdline: cmdline.iter().map(|s| s.to_string()).collect(),
-            pane_id: pane.map(str::to_string),
-            under_daemon: under,
+    fn old_bin() -> String {
+        format!("{RUN}/old/dot-agent-deck-linux-amd64")
+    }
+
+    fn serve(bin: &str) -> Vec<String> {
+        vec![bin.to_string(), "daemon".to_string(), "serve".to_string()]
+    }
+
+    fn env(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    /// Part of the run's allowlisted daemon environment — its marker, a cap,
+    /// the idle knob — enough for an exact comparison to mean something.
+    fn daemon_environ() -> BTreeMap<String, String> {
+        env(&[
+            ("DAD_XVER_SANDBOX", RUN),
+            ("DOT_AGENT_DECK_IDLE_SHUTDOWN_SECS", "0"),
+            ("DOT_AGENT_DECK_LOG", &format!("{RUN}/deck.log")),
+            ("DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS", "1800"),
+            ("HOME", "/home/vfarcic"),
+            ("PATH", &format!("{RUN}/bin:/usr/bin:/bin")),
+        ])
+    }
+
+    fn daemon_identity() -> Identity {
+        Identity {
+            pid: DAEMON,
+            start_time: 134039824,
+            exe: PathBuf::from(branch_bin()),
+            cmdline: serve(&branch_bin()),
+            cwd: PathBuf::from(format!("{RUN}/project")),
+            environ: daemon_environ(),
+            mnt_ns: "mnt:[4026533140]".to_string(),
         }
     }
 
-    /// One daemon, one lifetime-cap reaper (a fork: same command line, the
-    /// daemon's child, no pane id), the three role panes under it, the attached
-    /// TUI and the harness — none of the last two carrying a pane id.
-    fn census_ok() -> Vec<CensusProc> {
-        let d: Vec<&str> = vec!["/srv/runs/r1/branch/dot-agent-deck", "daemon", "serve"];
-        vec![
-            cp(
-                2,
-                &["/srv/runs/r1/xtask-cross-version", "--inner-plan", "p"],
-                None,
-                false,
-            ),
-            cp(DAEMON, &d, None, false),
-            cp(6, &d, None, true),
-            cp(312, &["sh", "-i"], Some("1"), true),
-            cp(332, &["cat"], Some("2"), true),
-            cp(336, &["sh", "-i"], Some("3"), true),
-            cp(
-                400,
-                &["/srv/runs/r1/old/dot-agent-deck-linux-amd64"],
-                None,
-                false,
-            ),
-        ]
+    /// A process started by `execve`: its own group and session, 0/1/2 open,
+    /// an environment of its own.
+    fn exec_d(pid: i32, ppid: i32, cmdline: &[&str]) -> CensusProc {
+        CensusProc {
+            pid,
+            ppid: Some(ppid),
+            pgrp_session: Some((pid, pid)),
+            exe: Some(PathBuf::from(cmdline[0])),
+            cmdline: cmdline.iter().map(|s| s.to_string()).collect(),
+            environ: Some(env(&[("DAD_XVER_SANDBOX", RUN)])),
+            pane_id: None,
+            fds: Some(vec![
+                "/dev/null".into(),
+                "/dev/null".into(),
+                "/dev/null".into(),
+            ]),
+            under_daemon: false,
+        }
     }
 
-    fn judge(before: &[StatusRow], now: &[StatusRow], census: &[CensusProc]) -> (Verdict, String) {
+    /// The daemon itself, holding the flat pair it bound in the control.
+    fn the_daemon() -> CensusProc {
+        CensusProc {
+            environ: Some(daemon_environ()),
+            fds: Some(vec![
+                "/dev/null".into(),
+                format!("{RUN}/deck.log"),
+                format!("{RUN}/deck.log"),
+                "anon_inode:[eventpoll]".into(),
+                "socket:[395028666]".into(),
+                "socket:[395028667]".into(),
+                "/dev/ptmx".into(),
+            ]),
+            ..exec_d(DAEMON, 2, &[&branch_bin(), "daemon", "serve"])
+        }
+    }
+
+    /// A stand-in agent in a pane: `setsid`'d by `portable-pty`, the
+    /// daemon's environment plus its pane id.
+    fn pane(pid: i32, ppid: i32, pane_id: &str) -> CensusProc {
+        let mut environ = daemon_environ();
+        environ.insert("DOT_AGENT_DECK_PANE_ID".into(), pane_id.into());
+        CensusProc {
+            environ: Some(environ),
+            pane_id: Some(pane_id.to_string()),
+            ..exec_d(pid, ppid, &[&format!("{RUN}/bin/claude")])
+        }
+    }
+
+    /// A per-pane lifetime-cap reaper exactly as `arm_child_group_backstop`
+    /// leaves one: a fork of the daemon (its exe, command line and whole
+    /// environment), every descriptor closed, reparented to init, in the
+    /// session its intermediate `setsid`'d — modelled as `pid - 1`.
+    fn reaper(pid: i32) -> CensusProc {
+        CensusProc {
+            pid,
+            ppid: Some(1),
+            pgrp_session: Some((pid - 1, pid - 1)),
+            exe: Some(PathBuf::from(branch_bin())),
+            cmdline: serve(&branch_bin()),
+            environ: Some(daemon_environ()),
+            pane_id: None,
+            fds: Some(Vec::new()),
+            under_daemon: false,
+        }
+    }
+
+    /// `under_daemon` from the fixture's own parent links, as `census()` reads
+    /// it from `/proc`.
+    fn settle(mut census: Vec<CensusProc>) -> Vec<CensusProc> {
+        let under: Vec<i32> = census_descendants(&census, DAEMON)
+            .iter()
+            .map(|p| p.pid)
+            .collect();
+        for p in &mut census {
+            p.under_daemon = under.contains(&p.pid);
+        }
+        census
+    }
+
+    /// The control's end-of-run census, 10 processes: bwrap's init, the inner
+    /// half, the daemon, the old TUI (pid modelled), the three role panes under
+    /// the daemon, and the three reapers — reparented to init, which is where
+    /// the old judge lost them.
+    fn census_ok() -> Vec<CensusProc> {
+        let mut c = vec![
+            exec_d(1, 0, &["bwrap"]),
+            exec_d(
+                2,
+                1,
+                &[
+                    &format!("{RUN}/xtask-cross-version"),
+                    "--inner-plan",
+                    &format!("{RUN}/plan.json"),
+                ],
+            ),
+            the_daemon(),
+            exec_d(470, 2, &[&old_bin()]),
+        ];
+        for (id, pid, reaper_pid) in PANES {
+            c.push(pane(pid, DAEMON, id));
+            c.push(reaper(reaper_pid));
+        }
+        settle(c)
+    }
+
+    fn judge_with(
+        before: &[StatusRow],
+        now: &[StatusRow],
+        census: &[CensusProc],
+        daemon: &Identity,
+    ) -> (Verdict, String) {
         let roles = generic_roles();
-        let cmd = daemon_cmdline();
         judge_role_set(&RoleSetInput {
             roles: &roles,
             before,
             now: Ok(now),
             census: Ok(census),
-            daemon_pid: DAEMON,
-            daemon_cmdline: &cmd,
+            daemon,
         })
     }
 
+    fn judge(before: &[StatusRow], now: &[StatusRow], census: &[CensusProc]) -> (Verdict, String) {
+        judge_with(before, now, census, &daemon_identity())
+    }
+
+    /// The census with one reaper replaced.
+    fn with_reaper(pid: i32, f: impl FnOnce(&mut CensusProc)) -> Vec<CensusProc> {
+        let mut c = census_ok();
+        f(c.iter_mut().find(|p| p.pid == pid).expect("a reaper pid"));
+        settle(c)
+    }
+
+    fn not_a_reaper(detail: &str, pid: i32) -> bool {
+        detail.contains(&format!(
+            "a `daemon serve` process other than the daemon and its lifetime-cap reapers: pid \
+             {pid} "
+        ))
+    }
+
     #[test]
-    fn one_role_set_on_its_original_panes_under_the_one_daemon_is_a_pass() {
-        let (v, detail) = judge(&three(), &three(), &census_ok());
+    fn the_1179_controls_three_reparented_socketless_reapers_are_a_pass() {
+        let census = census_ok();
+        assert_eq!(census.len(), 10, "the control censused 10 processes");
+        for (_, _, r) in PANES {
+            let p = census.iter().find(|p| p.pid == r).expect("reaper");
+            assert!(
+                !p.under_daemon,
+                "reparented: outside the daemon's tree, as measured"
+            );
+        }
+        let (v, detail) = judge(&three(), &three(), &census);
         assert_eq!(v, Verdict::Pass, "{detail}");
         assert!(
             detail.contains(
-                "0 `daemon serve` process(es) besides the daemon (pid 5) and its 1 fork(s)"
+                "10 process(es); 3 carry a pane id, 0 of them outside the daemon's tree; 0 \
+                 `daemon serve` process(es) besides the daemon (pid 5) and its 3 lifetime-cap \
+                 reaper(s)"
             ),
-            "the reaper is a fork, not a second daemon: {detail}"
+            "{detail}"
         );
+        for r in [311, 492, 539] {
+            assert!(
+                detail.contains(&format!(
+                    "pid {r}: no descriptor at all, so no socket; nobody's ancestor; the daemon's \
+                     exe, exact command line and whole initial environment, which names a \
+                     lifetime cap of 1800 s; process group = session = {} ≠ {r}; parent pid 1",
+                    r - 1
+                )),
+                "{detail}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_reparented_reaper_shape_that_holds_a_socket_is_a_fail() {
+        // Listening (the daemon's attach socket) or merely connected — both
+        // are sockets, and criterion 1 does not ask `/proc/net/unix` which.
+        for socket in ["socket:[395028667]", "socket:[777]"] {
+            let census = with_reaper(311, |p| p.fds = Some(vec![socket.to_string()]));
+            let (v, detail) = judge(&three(), &three(), &census);
+            assert_eq!(v, Verdict::Fail, "{detail}");
+            assert!(not_a_reaper(&detail, 311), "{detail}");
+            assert!(
+                detail.contains(&format!("it holds 1 socket(s) [\"{socket}\"]")),
+                "{detail}"
+            );
+            assert!(
+                detail.contains("and its 2 lifetime-cap reaper(s)"),
+                "the other two still are: {detail}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_reparented_reaper_shape_with_a_pane_carrying_descendant_is_a_fail() {
+        let mut census = census_ok();
+        census.push(pane(620, 311, "4"));
+        let census = settle(census);
+        let (v, detail) = judge(&three(), &three(), &census);
+        assert_eq!(v, Verdict::Fail, "{detail}");
+        assert!(not_a_reaper(&detail, 311), "{detail}");
+        assert!(
+            detail.contains(
+                "it is an ancestor of 1 process(es) [pid 620 (pane 4)], 1 of them carrying a \
+                 pane id"
+            ),
+            "{detail}"
+        );
+        // Deeper than a child counts too.
+        let mut census = census_ok();
+        census.push(exec_d(620, 311, &["sh"]));
+        census.push(pane(621, 620, "4"));
+        let (v, detail) = judge(&three(), &three(), &settle(census));
+        assert_eq!(v, Verdict::Fail, "{detail}");
+        assert!(
+            detail.contains(
+                "it is an ancestor of 2 process(es) [pid 620, pid 621 (pane 4)], 1 of them \
+                 carrying a pane id"
+            ),
+            "{detail}"
+        );
+    }
+
+    /// #1179 as the census sees it: the old TUI did not find the daemon,
+    /// lazy-spawned one of its own build — `setsid`'d, holding the listeners
+    /// it bound — and its session restore ran the three roles under THAT
+    /// daemon, outside pid 5's tree, each with a reaper forked from it. The
+    /// daemon under test and its own reapers are untouched.
+    fn census_1179(second_daemon: CensusProc) -> Vec<CensusProc> {
+        let mut c = census_ok();
+        for (id, pid) in [("1", 620), ("2", 624), ("3", 628)] {
+            c.push(pane(pid, 395, id));
+            c.push(CensusProc {
+                exe: second_daemon.exe.clone(),
+                cmdline: second_daemon.cmdline.clone(),
+                environ: second_daemon.environ.clone(),
+                ..reaper(pid + 3)
+            });
+        }
+        c.push(second_daemon);
+        settle(c)
+    }
+
+    fn old_daemon_1179() -> CensusProc {
+        CensusProc {
+            environ: Some(env(&[
+                ("DAD_XVER_SANDBOX", RUN),
+                ("TERM", "xterm-256color"),
+                ("DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS", "1800"),
+            ])),
+            fds: Some(vec![
+                "/dev/null".into(),
+                "socket:[395031001]".into(),
+                "socket:[395031002]".into(),
+            ]),
+            ..exec_d(395, 1, &[&old_bin(), "daemon", "serve"])
+        }
+    }
+
+    #[test]
+    fn the_1179_shape_is_a_fail() {
+        let (v, detail) = judge(&three(), &three(), &census_1179(old_daemon_1179()));
+        assert_eq!(v, Verdict::Fail, "{detail}");
+        // The duplicated role set, outside the daemon's tree.
+        for (id, pid) in [("1", 620), ("2", 624), ("3", 628)] {
+            assert!(
+                detail.contains(&format!(
+                    "pid {pid} ({RUN}/bin/claude) carries pane id {id} but is NOT under the \
+                     daemon (pid 5)"
+                )),
+                "{detail}"
+            );
+        }
+        // The second daemon, which listens.
+        assert!(not_a_reaper(&detail, 395), "{detail}");
+        assert!(
+            detail
+                .contains("it holds 2 socket(s) [\"socket:[395031001]\", \"socket:[395031002]\"]"),
+            "{detail}"
+        );
+        assert!(
+            detail.contains("it is an ancestor of 3 process(es)"),
+            "{detail}"
+        );
+        // The second daemon's own reapers are not the daemon's: its exe.
+        for r in [623, 627, 631] {
+            assert!(not_a_reaper(&detail, r), "{detail}");
+        }
+        assert!(
+            detail.contains("4 `daemon serve` process(es) besides the daemon (pid 5) and its 3"),
+            "the daemon's reapers stay exempt; the second daemon and its reapers do not: {detail}"
+        );
+    }
+
+    #[test]
+    fn the_1179_shape_fails_even_when_the_second_daemon_shares_every_identity_field() {
+        // The worst case for criterion 3: a second daemon of the BRANCH build
+        // with the daemon's exact environment — so exe, command line,
+        // environment and cap all match a reaper's. Holding a socket and
+        // parenting the duplicated roles still keep it a problem.
+        let twin = CensusProc {
+            exe: Some(PathBuf::from(branch_bin())),
+            cmdline: serve(&branch_bin()),
+            environ: Some(daemon_environ()),
+            ..old_daemon_1179()
+        };
+        let (v, detail) = judge(&three(), &three(), &census_1179(twin));
+        assert_eq!(v, Verdict::Fail, "{detail}");
+        assert!(not_a_reaper(&detail, 395), "{detail}");
+        assert!(detail.contains("it holds 2 socket(s)"), "{detail}");
+        assert!(
+            detail.contains(
+                "it is an ancestor of 3 process(es) [pid 620 (pane 1), pid 624 (pane 2), pid 628 \
+                 (pane 3)], 3 of them carrying a pane id"
+            ),
+            "{detail}"
+        );
+    }
+
+    #[test]
+    fn a_second_daemon_is_a_fail_even_with_no_roles_under_it() {
+        let mut census = census_ok();
+        census.push(old_daemon_1179());
+        let (v, detail) = judge(&three(), &three(), &settle(census));
+        assert_eq!(v, Verdict::Fail, "{detail}");
+        assert!(not_a_reaper(&detail, 395), "{detail}");
+        assert!(
+            detail.contains(&format!(
+                "its exe `{}` is not the daemon's `{}`",
+                old_bin(),
+                branch_bin()
+            )),
+            "{detail}"
+        );
+    }
+
+    #[test]
+    fn an_execd_process_with_the_daemons_command_line_is_not_a_reaper() {
+        // Holding nothing but 0/1/2 and no socket at all, with nobody below
+        // it: criteria 1 and 2 hold, and it is still no fork of the daemon —
+        // its descriptors, its session and its environment say it was exec'd.
+        let mut census = census_ok();
+        census.push(exec_d(900, 1, &[&branch_bin(), "daemon", "serve"]));
+        let (v, detail) = judge(&three(), &three(), &settle(census));
+        assert_eq!(v, Verdict::Fail, "{detail}");
+        assert!(not_a_reaper(&detail, 900), "{detail}");
+        assert!(
+            detail.contains("it holds 3 other descriptor(s)"),
+            "{detail}"
+        );
+        assert!(
+            detail.contains("its process group 900 and session 900 are not a reaper's"),
+            "{detail}"
+        );
+        assert!(
+            detail.contains("its initial environment is not the daemon's (entries that differ: ["),
+            "{detail}"
+        );
+        assert!(
+            !detail.contains("socket(s)"),
+            "it holds no socket: {detail}"
+        );
+    }
+
+    #[test]
+    fn each_reaper_signature_is_load_bearing() {
+        type Tweak = fn(&mut CensusProc);
+        let cases: [(&str, Tweak); 7] = [
+            ("its descriptor table could not be read", |p| p.fds = None),
+            ("it holds 1 other descriptor(s) [\"/dev/null\"]", |p| {
+                p.fds = Some(vec!["/dev/null".into()])
+            }),
+            ("its exe could not be read", |p| p.exe = None),
+            ("is not the daemon's exact", |p| {
+                p.cmdline.push("--foreground".into())
+            }),
+            ("entries that differ: [\"DOT_AGENT_DECK_LOG\"]", |p| {
+                if let Some(e) = &mut p.environ {
+                    e.insert("DOT_AGENT_DECK_LOG".into(), "/elsewhere".into());
+                }
+            }),
+            ("its initial environment could not be read", |p| {
+                p.environ = None
+            }),
+            (
+                "its process group 311 and session 311 are not a reaper's",
+                |p| p.pgrp_session = Some((311, 311)),
+            ),
+        ];
+        for (want, tweak) in cases {
+            let (v, detail) = judge(&three(), &three(), &with_reaper(311, tweak));
+            assert_eq!(v, Verdict::Fail, "{want}: {detail}");
+            assert!(not_a_reaper(&detail, 311), "{want}: {detail}");
+            assert!(detail.contains(want), "{want}: {detail}");
+        }
+        let (v, detail) = judge(
+            &three(),
+            &three(),
+            &with_reaper(311, |p| p.pgrp_session = None),
+        );
+        assert_eq!(v, Verdict::Fail, "{detail}");
+        assert!(
+            detail.contains("its process group and session could not be read"),
+            "{detail}"
+        );
+    }
+
+    #[test]
+    fn an_unread_parent_anywhere_blocks_every_exemption() {
+        // Pid 470's parent could not be read, so nothing establishes that it
+        // does not descend from a reaper.
+        let mut census = census_ok();
+        census
+            .iter_mut()
+            .find(|p| p.pid == 470)
+            .expect("old TUI")
+            .ppid = None;
+        let (v, detail) = judge(&three(), &three(), &census);
+        assert_eq!(v, Verdict::Fail, "{detail}");
+        for r in [311, 492, 539] {
+            assert!(not_a_reaper(&detail, r), "{detail}");
+        }
+        assert!(
+            detail.contains("the parent of pid(s) [470] could not be read"),
+            "{detail}"
+        );
+    }
+
+    #[test]
+    fn with_no_lifetime_cap_the_daemon_forks_no_reaper_to_exempt() {
+        for cap in [None, Some("0"), Some("soon")] {
+            let mut daemon = daemon_identity();
+            let mut environ = daemon_environ();
+            match cap {
+                None => environ.remove(MAX_LIFETIME_VAR),
+                Some(v) => environ.insert(MAX_LIFETIME_VAR.into(), v.into()),
+            };
+            daemon.environ = environ.clone();
+            let mut census = census_ok();
+            for p in &mut census {
+                if p.pid == DAEMON || PANES.iter().any(|(_, _, r)| *r == p.pid) {
+                    p.environ = Some(environ.clone());
+                }
+            }
+            let (v, detail) = judge_with(&three(), &three(), &census, &daemon);
+            assert_eq!(v, Verdict::Fail, "{cap:?}: {detail}");
+            assert!(
+                detail.contains("the daemon's environment names no lifetime cap"),
+                "{cap:?}: {detail}"
+            );
+        }
     }
 
     #[test]
@@ -2839,12 +3525,11 @@ mod reverse_tests {
             row("reviewer", "6"),
         ]);
         let mut census = census_ok();
-        census.extend([
-            cp(620, &["sh", "-i"], Some("4"), true),
-            cp(624, &["cat"], Some("5"), true),
-            cp(628, &["sh", "-i"], Some("6"), true),
-        ]);
-        let (v, detail) = judge(&three(), &now, &census);
+        for (id, pid) in [("4", 620), ("5", 624), ("6", 628)] {
+            census.push(pane(pid, DAEMON, id));
+            census.push(reaper(pid + 3));
+        }
+        let (v, detail) = judge(&three(), &now, &settle(census));
         assert_eq!(v, Verdict::Fail, "{detail}");
         assert!(
             detail.contains("`coder` is listed 2 time(s), on pane(s) [2, 5]"),
@@ -2859,76 +3544,18 @@ mod reverse_tests {
             row("coder", "5"),
             row("reviewer", "6"),
         ];
-        let census = vec![
-            cp(DAEMON, &["x", "daemon", "serve"], None, false),
-            cp(620, &["sh", "-i"], Some("4"), true),
-            cp(624, &["cat"], Some("5"), true),
-            cp(628, &["sh", "-i"], Some("6"), true),
-        ];
-        let (v, detail) = judge(&three(), &now, &census);
+        let mut census = vec![the_daemon()];
+        for (id, pid) in [("4", 620), ("5", 624), ("6", 628)] {
+            census.push(pane(pid, DAEMON, id));
+        }
+        let (v, detail) = judge(&three(), &now, &settle(census));
         assert_eq!(v, Verdict::Fail, "{detail}");
         assert!(detail.contains("the role was replaced"), "{detail}");
     }
 
     #[test]
-    fn a_pane_process_outside_the_daemons_tree_is_a_fail() {
-        // #1179's shape as the census sees it: a second role set under a
-        // daemon of the old build, whose processes carry pane ids too.
-        let mut census = census_ok();
-        census.extend([
-            cp(
-                395,
-                &[
-                    "/srv/runs/r1/old/dot-agent-deck-linux-amd64",
-                    "daemon",
-                    "serve",
-                ],
-                None,
-                false,
-            ),
-            cp(620, &["sh", "-i"], Some("1"), false),
-        ]);
-        let (v, detail) = judge(&three(), &three(), &census);
-        assert_eq!(v, Verdict::Fail, "{detail}");
-        assert!(
-            detail.contains("pid 620 (sh -i) carries pane id 1 but is NOT under"),
-            "{detail}"
-        );
-        assert!(
-            detail
-                .contains("a `daemon serve` process other than the daemon and its forks: pid 395"),
-            "{detail}"
-        );
-    }
-
-    #[test]
-    fn a_second_daemon_is_a_fail_even_with_no_roles_under_it() {
-        let mut census = census_ok();
-        census.push(cp(
-            395,
-            &[
-                "/srv/runs/r1/old/dot-agent-deck-linux-amd64",
-                "daemon",
-                "serve",
-            ],
-            None,
-            false,
-        ));
-        assert_eq!(judge(&three(), &three(), &census).0, Verdict::Fail);
-        // The daemon's exact command line OUTSIDE its tree is not a fork of it.
-        let mut census = census_ok();
-        census.push(cp(
-            900,
-            &["/srv/runs/r1/branch/dot-agent-deck", "daemon", "serve"],
-            None,
-            false,
-        ));
-        assert_eq!(judge(&three(), &three(), &census).0, Verdict::Fail);
-    }
-
-    #[test]
     fn a_listed_role_with_no_live_process_under_the_daemon_is_a_fail() {
-        let census: Vec<CensusProc> = census_ok().into_iter().filter(|p| p.pid != 332).collect();
+        let census: Vec<CensusProc> = census_ok().into_iter().filter(|p| p.pid != 490).collect();
         let (v, detail) = judge(&three(), &three(), &census);
         assert_eq!(v, Verdict::Fail, "{detail}");
         assert!(
@@ -2954,7 +3581,7 @@ mod reverse_tests {
     #[test]
     fn a_role_set_that_could_not_be_read_is_never_a_pass() {
         let roles = generic_roles();
-        let cmd = daemon_cmdline();
+        let daemon = daemon_identity();
         let census = census_ok();
         let before = three();
         let unreadable = |now, census| {
@@ -2963,8 +3590,7 @@ mod reverse_tests {
                 before: &before,
                 now,
                 census,
-                daemon_pid: DAEMON,
-                daemon_cmdline: &cmd,
+                daemon: &daemon,
             })
             .0
         };
