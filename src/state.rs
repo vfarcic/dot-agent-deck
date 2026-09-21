@@ -11846,8 +11846,6 @@ mod tests {
     #[spec("scheduler/idle-worker/015")]
     #[tokio::test]
     async fn idle_worker_015_notice_cannot_rearm_a_submit_only_probe() {
-        use std::io::Write as _;
-
         const ORCHESTRATOR_PANE: &str = "notice-launder-orchestrator";
         const WORKER_PANE: &str = "notice-launder-worker";
         const PROMPT: &str = "automatic payload awaiting submit confirmation";
@@ -11877,17 +11875,29 @@ mod tests {
             crate::agent_pty::GuardedSend::Applied
         );
 
-        let handle = registry
-            .subscribe(&orchestrator_agent)
-            .expect("attach orchestrator byte-observation target");
-        let mut writer = handle.writer.lock().await;
-        writer
-            .write_all(USER_DRAFT.as_bytes())
-            .expect("write unsent user draft");
-        writer.flush().expect("flush unsent user draft");
-        drop(writer);
-        registry.note_user_input(ORCHESTRATOR_PANE);
-        tokio::time::sleep(std::time::Duration::from_millis(75)).await;
+        // Issue #1132: the draft used to be written by hand here and followed by
+        // a fixed 75 ms sleep. `type_user_draft` is the same write with the
+        // guess removed — it waits for the automatic payload above to finish
+        // round-tripping BEFORE writing (its `1` argument: one delivery, one
+        // completed line, two terminators), then for the draft's own echo. The
+        // drain is the half that matters under load: `/bin/cat` and the line
+        // discipline's echo are two independent writers into one PTY output
+        // queue, so a `cat` copy still in flight can land IN THE MIDDLE of this
+        // write's echo and split the draft permanently — issue #850's interleave.
+        //
+        // That is the risk this test carried, and it has NOT been reproduced
+        // here: with its two 75 ms sleeps at 0 ms this test passed 3 of 3 runs
+        // on an idle box, where `prompt/pane-input/032` failed 3 of 3. So this
+        // is prophylaxis against a demonstrated shape, not a fix for a
+        // demonstrated failure — the same two calls either way.
+        crate::test_pty_wait::type_user_draft(
+            &registry,
+            &orchestrator_agent,
+            ORCHESTRATOR_PANE,
+            USER_DRAFT,
+            1,
+        )
+        .await;
 
         // Issue #702: driven through `compose_worker_exited_notice` rather than
         // PRD #249's silence notice, because the invariant belongs to the
@@ -11911,10 +11921,23 @@ mod tests {
                 .expect("production worker-exited notice"),
             crate::agent_pty::GuardedSend::Applied
         );
-        tokio::time::sleep(std::time::Duration::from_millis(75)).await;
-        let before_probe = registry
-            .snapshot(&orchestrator_agent)
-            .expect("snapshot after worker-exited notice");
+        // Issue #1132: the notice is payload + LF, so it COMPLETES the line the
+        // draft opened — its echo is followed by `/bin/cat`'s copy of
+        // `<draft><notice>`. Both halves have to be back before `before_probe`
+        // is taken, because the assertion below compares `after_probe` to it by
+        // EXACT EQUALITY and a copy still in flight would land inside that
+        // comparison and read as bytes the probe had sent. The echo wait names
+        // the notice so a failure says what was missing; the drain (two
+        // completed lines, four terminators) is what proves nothing is still
+        // coming.
+        crate::test_pty_wait::wait_for_echo_bytes(
+            &registry,
+            &orchestrator_agent,
+            notice.as_bytes(),
+        )
+        .await;
+        let before_probe =
+            crate::test_pty_wait::wait_for_drained_lines(&registry, &orchestrator_agent, 2).await;
         assert!(
             before_probe
                 .windows(notice.len())
@@ -11929,6 +11952,13 @@ mod tests {
             })
             .await
             .expect("submit-only probe after worker-exited notice");
+        // A NEGATIVE observation window, and the sleep IS the observation — the
+        // same shape `spawn.rs`'s `UserFrameRetryExpectation::WritesNothing`
+        // keeps. The contract is that the probe writes nothing, so there is no
+        // arrival to key this on; kept at the 75 ms it has always had. Issue
+        // #1132: with `before_probe` now taken at a drained instant the buffer
+        // is frozen unless the code under test writes, so too short a window can
+        // only fail to catch a violation — it can no longer manufacture one.
         tokio::time::sleep(std::time::Duration::from_millis(75)).await;
         let after_probe = registry
             .snapshot(&orchestrator_agent)
