@@ -256,6 +256,35 @@ jobs:
         run: |
           chmod +x scripts/assemble-changelog.sh
           scripts/assemble-changelog.sh "$VERSION" > "${RUNNER_TEMP}/release-body.md"
+
+          # RE-RUN PATH. `assemble-changelog.sh` CONSUMES `changelog.d/` and
+          # commits the result to CHANGELOG.md, then exits 0 writing NOTHING
+          # when there are no fragments left. So a second run of this workflow
+          # for the same version -- which is exactly the sanctioned recovery
+          # when the tag landed and `finalize` did not -- would assemble an
+          # empty body and publish a Release with no notes at all, while the
+          # real notes sat in CHANGELOG.md out of reach. Measured on v0.41.1:
+          # `changelog.d/` held only `.gitkeep`, and the script exited 0 with
+          # 0 bytes on stdout.
+          #
+          # So when the assembler yields nothing, recover the already-committed
+          # section for THIS version out of CHANGELOG.md. `awk` between this
+          # version's `## [x.y.z]` heading and the next `## ` heading, which is
+          # the format `assemble-changelog.sh` itself writes. Failing to find
+          # it is fatal: publishing empty notes is worse than not publishing.
+          if [ ! -s "${RUNNER_TEMP}/release-body.md" ]; then
+            echo "::notice::No fragments left; recovering the v$VERSION section from CHANGELOG.md (re-run path)."
+            awk -v v="$VERSION" '
+              $0 ~ ("^## \\[" v "\\]") { found = 1; next }
+              found && /^## / { exit }
+              found { print }
+            ' CHANGELOG.md > "${RUNNER_TEMP}/release-body.md"
+            if [ ! -s "${RUNNER_TEMP}/release-body.md" ]; then
+              echo "::error::No fragments in changelog.d/ AND no '## [$VERSION]' section in CHANGELOG.md. Refusing to publish a Release with empty notes."
+              exit 1
+            fi
+          fi
+
           {
             echo "changelog<<CHANGELOG_EOF"
             cat "${RUNNER_TEMP}/release-body.md"
