@@ -61,9 +61,27 @@ network:
 #
 # Spend is still bounded where bounding is free: by SHA-idempotence (each head is
 # reviewed once), by the eligibility filter, and by max_prs on the caller.
-max-ai-credits: 10000
+#
+# RAISED 2026-09-21 (10000 -> 40000, with timeout-minutes 20 -> 45). PR #1163
+# (PRD #802, desktop voice control) returned INSUFFICIENT at the old budget:
+# 33,173 additions across 66 files, so the agent ranked risk, deep-read only the
+# highest-risk backend files, and correctly declined to claim the whole-diff
+# coverage an APPROVE asserts. That refusal is the behaviour we want; what was
+# wrong was a ceiling that made it the likely outcome for any PRD-sized change.
+#
+# A ceiling is not a spend. Raising it costs nothing on the ordinary PR, which
+# finishes far below either limit; it only draws more where a diff genuinely
+# needs more. `timeout-minutes` is raised with it because credits alone do not
+# help a job that is killed at 20 minutes.
+#
+# This does NOT make INSUFFICIENT impossible, and it is not meant to. The same
+# PR returned APPROVE at the OLD budget on 2026-09-19 and INSUFFICIENT on
+# 2026-09-21, so the verdict is not deterministic at a fixed ceiling. A raise
+# shifts the odds; the procedure for an INSUFFICIENT that stands is a governance
+# question, not a budget one.
+max-ai-credits: 40000
 
-timeout-minutes: 20
+timeout-minutes: 45
 
 # The PR number is in the GROUP, not only in job-discriminator. With a single
 # shared group, GitHub keeps one pending run per group and CANCELS the rest —
