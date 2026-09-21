@@ -177,7 +177,7 @@ cpal = "0.18"
 # sequence the BODY cannot contain, and the body is a WAV whose samples are
 # arbitrary. Deliberately `getrandom` and not `rand`, for the root package's
 # reason: the whole requirement is "N bytes from the operating system".
-getrandom = "0.3"
+getrandom = "0.4"
 
 [dev-dependencies]
 # The `#[tokio::test]` attribute needs `macros` + `rt`, and the scripted-socket
