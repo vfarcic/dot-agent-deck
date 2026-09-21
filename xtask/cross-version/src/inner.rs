@@ -1232,9 +1232,13 @@ fn scenario(
         listeners_at_start,
         kernel_at_start,
         fallback_arm,
+        &after_detach,
     )
 }
 
+/// `roles_before_attach` is the daemon's listing after the detach, before the
+/// second TUI existed: the role set the `role-set` tell compares the end of the
+/// run against.
 #[allow(clippy::too_many_arguments)]
 fn with_attached_tui(
     g: &Guard<'_>,
@@ -1245,6 +1249,7 @@ fn with_attached_tui(
     listeners_at_start: Option<Vec<i32>>,
     kernel_at_start: String,
     fallback_arm: bool,
+    roles_before_attach: &[StatusRow],
 ) -> Result<(), Abort> {
     let plan = g.plan;
     let sb = g.sb;
@@ -1615,6 +1620,35 @@ fn with_attached_tui(
                 .to_string()
         });
     }
+    if fallback_arm && cast.direction == Direction::Reverse {
+        let reached = ev
+            .tells
+            .iter()
+            .filter(|t| t.id == "tell-1" || t.id == "tell-2")
+            .all(|t| t.verdict == Verdict::Pass);
+        ev.isolated(if reached {
+            format!(
+                "fallback arm confirmed, reverse: the {} TUI printed the build-version mismatch \
+                 prompt, and with the matrix above holding before it started, tell 1 (no second \
+                 daemon) and tell 2 (the same listener on `{}` at both ends) passing mean it \
+                 reached the branch daemon through its OWN resolution of the no-XDG, no-override \
+                 fallback, at the address that daemon bound",
+                cast.client_build,
+                attach.display()
+            )
+        } else {
+            format!(
+                "fallback arm NOT confirmed, reverse: tell 1 or tell 2 did not pass, so which \
+                 daemon the {} TUI reached is not established",
+                cast.client_build
+            )
+        });
+    }
+
+    // --- the role set, measured at the end (reverse `generic` only) ----------
+    if cast.direction == Direction::Reverse && plan.probe.asserts_role_set() {
+        role_set(g, daemon, cast, ev, roles_before_attach)?;
+    }
 
     // --- a stimulus that ends the daemon, after tells 1 and 2 ------------------
     if cast.direction == Direction::Reverse {
@@ -1653,7 +1687,9 @@ fn with_attached_tui(
 /// 3. the old client's own daemon runs NONE of those roles. The old TUI restores
 ///    the saved session against an empty daemon, and a restored orchestration
 ///    re-spawns every role under a fresh orchestration id — which would be two
-///    daemons running the same orchestration, not merely two daemons.
+///    daemons running the same orchestration, not merely two daemons. An empty
+///    listing counts only once the old TUI has drawn its main UI, which it does
+///    after its restore decision; before that it is NOT CHECKED.
 fn classify_undiscovered(
     g: &Guard<'_>,
     daemon: &mut SandboxProcess,
@@ -1746,9 +1782,22 @@ fn classify_undiscovered(
         second_id.summary()
     ));
 
-    // What the user saw. Give the old TUI time to settle — a session restore,
-    // if it happens, spawns panes after the first frame.
-    std::thread::sleep(Duration::from_secs(5));
+    // What the user saw — once there is positive evidence the old TUI got past
+    // the point where it restores a session. It makes that decision during
+    // startup, before its event loop draws a frame (see `role_set`), so its
+    // main UI on screen means any restore it was going to do has been issued.
+    // Without that evidence, collateral 3's "its own daemon runs none of the
+    // roles" would also hold for a TUI that simply had not got that far.
+    let reached_main_ui = tui.wait_for_grid(UI_TIMEOUT, main_ui_drawn);
+    ev.step(format!(
+        "the {} TUI {} its main UI (the stats bar every layout draws)",
+        cast.client_side,
+        if reached_main_ui {
+            "has drawn"
+        } else {
+            "has NOT drawn"
+        }
+    ));
     ev.excerpt(
         format!(
             "what the {} TUI showed instead of the prompt",
@@ -1833,9 +1882,11 @@ fn classify_undiscovered(
         },
     );
 
-    // Collateral 3: the old client's own daemon runs none of them. Poll for a
-    // while rather than ask once: a restored orchestration spawns its roles
-    // after the old TUI's first frame.
+    // Collateral 3: the old client's own daemon runs none of them. A restore
+    // spawns its roles before the old TUI's first frame (v0.41.0's `run_tui`
+    // restores at startup and first calls `terminal.draw` in its event loop),
+    // which `reached_main_ui` above establishes; polling for a while rather than
+    // asking once also catches a role that registers or respawns late.
     let client_cli = format!(
         "{} CLI: daemon status (the {} TUI's own daemon)",
         cast.client_side, cast.client_side
@@ -1876,11 +1927,23 @@ fn classify_undiscovered(
                 cast.client_side
             ),
         ),
+        // Finding roles is positive evidence on its own; finding NONE is only
+        // evidence once the TUI is known to be past its restore decision.
+        (_, true) if !reached_main_ui => (
+            Verdict::NotChecked,
+            format!(
+                "the {} TUI's own daemon listed none of the roles for 15 s, but the {} TUI never \
+                 drew its main UI within {UI_TIMEOUT:?}, so it is not established that it had \
+                 reached its session-restore decision — an empty listing measures nothing",
+                cast.client_side, cast.client_side
+            ),
+        ),
         (_, true) => (
             Verdict::Pass,
             format!(
-                "for 15 s, `daemon status --json` asked by the {} binary — which resolves the {} \
-                 daemon's flat address — listed {}",
+                "the {} TUI had drawn its main UI, so it was past its session-restore decision; \
+                 then for 15 s, `daemon status --json` asked by the {} binary — which resolves the \
+                 address its own daemon bound — listed {}",
                 cast.client_side,
                 cast.client_side,
                 if seen.is_empty() {
@@ -2000,6 +2063,311 @@ fn classify_undiscovered(
         tail(&std::fs::read_to_string(&sb.log).unwrap_or_default(), 80),
     );
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// The role set: one orchestration, under one daemon
+// ---------------------------------------------------------------------------
+
+/// One process of the run's PID namespace, as the `role-set` census reads it
+/// from `/proc`.
+#[derive(Clone, Debug)]
+pub(crate) struct CensusProc {
+    pub pid: i32,
+    pub cmdline: Vec<String>,
+    /// `DOT_AGENT_DECK_PANE_ID` from its initial environment: the daemon sets
+    /// it on every pane process it spawns, and a process started inside a pane
+    /// inherits it.
+    pub pane_id: Option<String>,
+    /// Whether its parent chain reaches the daemon under test.
+    pub under_daemon: bool,
+}
+
+/// Everything [`judge_role_set`] decides on.
+pub(crate) struct RoleSetInput<'a> {
+    /// The fixture's roles, in card order.
+    pub roles: &'a [String],
+    /// The daemon's listing after the detach, before the second TUI existed.
+    pub before: &'a [StatusRow],
+    /// The daemon's listing at the end of the run, or why it could not be read.
+    pub now: Result<&'a [StatusRow], &'a str>,
+    /// Every process of the PID namespace, or why `/proc` could not be read.
+    pub census: Result<&'a [CensusProc], &'a str>,
+    pub daemon_pid: i32,
+    pub daemon_cmdline: &'a [String],
+}
+
+/// `<bin> daemon serve`, whatever the binary.
+fn is_daemon_serve(cmdline: &[String]) -> bool {
+    cmdline.len() >= 3 && cmdline[1] == "daemon" && cmdline[2] == "serve"
+}
+
+/// The rows a role is listed under. `contains`, as every other role match in
+/// this harness: the orchestrator's row reads `orchestrator (orchestrator)`, and
+/// no fixture role's name is a substring of another's.
+fn rows_for<'r>(rows: &'r [StatusRow], role: &str) -> Vec<&'r StatusRow> {
+    rows.iter().filter(|r| r.role.contains(role)).collect()
+}
+
+/// Decide the `role-set` tell: at the end of the run exactly ONE set of the
+/// orchestration's roles exists, it is the set the setup TUI brought up, and it
+/// runs under the one listening daemon.
+///
+/// Tell 1 catches a second daemon. It cannot catch the other shape an old
+/// client's session restore can take — a role set spawned INTO the existing
+/// daemon, which leaves one daemon running two orchestrations — and this is the
+/// check that does. Each clause needs positive evidence:
+///
+/// 1. the daemon lists each role exactly once, on the pane it had after the
+///    detach (a restore that duplicated a role lists it twice; one that
+///    replaced the set moves it to another pane);
+/// 2. each listed role pane is backed by a live process under the daemon;
+/// 3. every process carrying a pane id is under the daemon — a pane process
+///    anywhere else belongs to a role set some other process spawned;
+/// 4. no `daemon serve` process runs besides the daemon and its forks (its
+///    lifetime-cap reapers share its exact command line and are its children).
+///
+/// A listing or census that could not be read is NOT CHECKED, never a pass.
+pub(crate) fn judge_role_set(i: &RoleSetInput<'_>) -> (Verdict, String) {
+    let now = match i.now {
+        Ok(rows) => rows,
+        Err(e) => {
+            return (
+                Verdict::NotChecked,
+                format!("the daemon's listing at the end of the run could not be read: {e}"),
+            );
+        }
+    };
+    let census = match i.census {
+        Ok(c) if c.iter().any(|p| p.pid == i.daemon_pid) => c,
+        Ok(_) => {
+            return (
+                Verdict::NotChecked,
+                format!(
+                    "the /proc census did not see the daemon (pid {}), so it is not a census of \
+                     this run",
+                    i.daemon_pid
+                ),
+            );
+        }
+        Err(e) => {
+            return (
+                Verdict::NotChecked,
+                format!("the PID namespace could not be censused: {e}"),
+            );
+        }
+    };
+    let panes = |rows: &[&StatusRow]| {
+        rows.iter()
+            .map(|r| r.pane_id.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let mut problems = Vec::new();
+    let mut lines = Vec::new();
+    for role in i.roles {
+        let listed = rows_for(now, role);
+        let before = rows_for(i.before, role);
+        if listed.len() != 1 {
+            problems.push(format!(
+                "`{role}` is listed {} time(s), on pane(s) [{}] — expected exactly once",
+                listed.len(),
+                panes(&listed)
+            ));
+        }
+        if before.len() != 1 {
+            problems.push(format!(
+                "`{role}` was listed {} time(s) after the detach, before the second TUI existed",
+                before.len()
+            ));
+        }
+        if let ([l], [b]) = (&listed[..], &before[..])
+            && l.pane_id != b.pane_id
+        {
+            problems.push(format!(
+                "`{role}` is on pane {} now but was on pane {} after the detach — the role was \
+                 replaced",
+                l.pane_id, b.pane_id
+            ));
+        }
+        let mut backing = Vec::new();
+        for row in &listed {
+            let procs: Vec<i32> = census
+                .iter()
+                .filter(|p| p.under_daemon && p.pane_id.as_deref() == Some(row.pane_id.as_str()))
+                .map(|p| p.pid)
+                .collect();
+            if procs.is_empty() {
+                problems.push(format!(
+                    "`{role}`'s pane {} has no live process under the daemon (pid {})",
+                    row.pane_id, i.daemon_pid
+                ));
+            }
+            backing.push(format!("pane {} → pid(s) {procs:?}", row.pane_id));
+        }
+        lines.push(format!(
+            "`{role}`: listed {}× now [{}], {}× after the detach [{}]; {}",
+            listed.len(),
+            panes(&listed),
+            before.len(),
+            panes(&before),
+            if backing.is_empty() {
+                "no pane to back".to_string()
+            } else {
+                backing.join("; ")
+            }
+        ));
+    }
+    let stray_panes: Vec<&CensusProc> = census
+        .iter()
+        .filter(|p| p.pane_id.is_some() && !p.under_daemon)
+        .collect();
+    for p in &stray_panes {
+        problems.push(format!(
+            "pid {} ({}) carries pane id {} but is NOT under the daemon (pid {})",
+            p.pid,
+            p.cmdline.join(" "),
+            p.pane_id.as_deref().unwrap_or_default(),
+            i.daemon_pid
+        ));
+    }
+    let other_daemons: Vec<&CensusProc> = census
+        .iter()
+        .filter(|p| {
+            is_daemon_serve(&p.cmdline)
+                && p.pid != i.daemon_pid
+                && !(p.under_daemon && p.cmdline == i.daemon_cmdline)
+        })
+        .collect();
+    for p in &other_daemons {
+        problems.push(format!(
+            "a `daemon serve` process other than the daemon and its forks: pid {} ({})",
+            p.pid,
+            p.cmdline.join(" ")
+        ));
+    }
+    let pane_procs = census.iter().filter(|p| p.pane_id.is_some()).count();
+    let reapers = census
+        .iter()
+        .filter(|p| p.pid != i.daemon_pid && p.under_daemon && p.cmdline == i.daemon_cmdline)
+        .count();
+    let detail = format!(
+        "{}\n\
+         /proc census of the PID namespace: {} process(es); {pane_procs} carry a pane id, {} of \
+         them outside the daemon's tree; {} `daemon serve` process(es) besides the daemon (pid {}) \
+         and its {reapers} fork(s) sharing its exact command line.\n\
+         {}",
+        lines.join("\n"),
+        census.len(),
+        stray_panes.len(),
+        other_daemons.len(),
+        i.daemon_pid,
+        if problems.is_empty() {
+            "exactly one set of the orchestration's roles, the one brought up before the second \
+             TUI attached, under the one daemon"
+                .to_string()
+        } else {
+            format!("PROBLEMS: {}", problems.join("; "))
+        }
+    );
+    (
+        if problems.is_empty() {
+            Verdict::Pass
+        } else {
+            Verdict::Fail
+        },
+        detail,
+    )
+}
+
+/// Every process in the run's PID namespace, for [`judge_role_set`].
+fn census(daemon_pid: i32) -> Result<Vec<CensusProc>, String> {
+    let under: std::collections::BTreeSet<i32> = proc::descendants(daemon_pid)
+        .into_iter()
+        .map(|(p, _)| p)
+        .collect();
+    let mut out = Vec::new();
+    for pid in proc::pids()? {
+        // Gone between the listing and this read: not a process of the run's
+        // end state.
+        let Some(cmdline) = proc::cmdline(pid) else {
+            continue;
+        };
+        out.push(CensusProc {
+            pid,
+            cmdline,
+            pane_id: proc::environ(pid).and_then(|e| e.get("DOT_AGENT_DECK_PANE_ID").cloned()),
+            under_daemon: under.contains(&pid),
+        });
+    }
+    Ok(out)
+}
+
+/// The `role-set` tell (see [`judge_role_set`]), read at the end of the run.
+///
+/// Its timing rests on positive evidence rather than on a pause. The old TUI
+/// makes its session-restore decision synchronously during startup, before its
+/// event loop draws a frame — v0.41.0's `run_tui` hydrates from the daemon
+/// first and applies the saved snapshot only when hydration produced no pane,
+/// spawning each restored role through `open_orchestration_tab` before the loop
+/// starts. By the time this runs, that TUI has drawn its orchestration after
+/// the declined prompt and has been driven through tells 3 and 4, so any role
+/// its restore spawned is already in the listing.
+fn role_set(
+    g: &Guard<'_>,
+    daemon: &mut SandboxProcess,
+    cast: &Cast,
+    ev: &mut Evidence,
+    before: &[StatusRow],
+) -> Result<(), Abort> {
+    let all_roles = roles(g.plan);
+    let label = format!("{} CLI: daemon status (role set)", cast.daemon_side);
+    // Behind the pre-connect assertion, which also re-proves that every
+    // listening socket in the namespace is the daemon's.
+    let now = daemon_status(g, &cast.daemon_bin, &label, ev)?;
+    let census = census(daemon.pid());
+    let (verdict, detail) = judge_role_set(&RoleSetInput {
+        roles: &all_roles,
+        before,
+        now: now.as_deref().map_err(String::as_str),
+        census: census.as_deref().map_err(String::as_str),
+        daemon_pid: daemon.pid(),
+        daemon_cmdline: &daemon.identity.cmdline,
+    });
+    ev.tell(
+        "role-set",
+        format!(
+            "exactly one set of the orchestration's roles, under the one {} daemon",
+            cast.daemon_side
+        ),
+        verdict,
+        format!(
+            "`daemon status --json`, asked by the {} binary behind the pre-connect assertion \
+             (which re-proved every listening socket in the namespace is the daemon's), and a \
+             /proc census, both read after tells 1 and 2. The {} TUI made its session-restore \
+             decision during startup, before its first frame; it had drawn the orchestration \
+             and been driven through tells 3 and 4 before this was read.\n{detail}",
+            cast.daemon_side, cast.client_build
+        ),
+    );
+    Ok(())
+}
+
+/// Whether a deck's screen shows its main UI — the stats bar every layout
+/// draws, ` <n> active` (`render_stats_bar`, "Always show active count", in
+/// v0.41.0 and every branch this sweeps), wherever on its row the layout puts
+/// it: a count of digits, at the start of the row or after a space, then
+/// ` active`. The mismatch prompt and a startup that has not reached the event
+/// loop draw no such text.
+pub(crate) fn main_ui_drawn(grid: &str) -> bool {
+    grid.lines().any(|l| {
+        l.match_indices(" active").any(|(at, _)| {
+            let head = &l[..at];
+            let count = head.len() - head.trim_end_matches(|c: char| c.is_ascii_digit()).len();
+            let before = &head[..head.len() - count];
+            count > 0 && (before.is_empty() || before.ends_with(' '))
+        })
+    })
 }
 
 /// Drive the production new-pane flow to open the fixture's single
@@ -2365,6 +2733,284 @@ mod reverse_tests {
     fn the_decline_key_is_never_the_one_affirmative_key() {
         assert!(!DECLINE_KEY.eq_ignore_ascii_case(b"s"));
         assert_eq!(DECLINE_KEY.len(), 1);
+    }
+
+    fn row(role: &str, pane: &str) -> StatusRow {
+        StatusRow {
+            agent_id: pane.to_string(),
+            pane_id: pane.to_string(),
+            role: role.to_string(),
+            status: String::new(),
+            cwd: "/srv/runs/r1/project".to_string(),
+            tool: String::new(),
+        }
+    }
+
+    fn generic_roles() -> Vec<String> {
+        roles(&plan(Direction::Reverse, crate::probe::Probe::Generic))
+    }
+
+    /// The listing the setup TUI leaves behind: the three fixture roles, on
+    /// panes 1–3, as a branch daemon renders them.
+    fn three() -> Vec<StatusRow> {
+        vec![
+            row("orchestrator (orchestrator)", "1"),
+            row("coder", "2"),
+            row("reviewer", "3"),
+        ]
+    }
+
+    const DAEMON: i32 = 5;
+
+    fn daemon_cmdline() -> Vec<String> {
+        ["/srv/runs/r1/branch/dot-agent-deck", "daemon", "serve"]
+            .map(String::from)
+            .to_vec()
+    }
+
+    fn cp(pid: i32, cmdline: &[&str], pane: Option<&str>, under: bool) -> CensusProc {
+        CensusProc {
+            pid,
+            cmdline: cmdline.iter().map(|s| s.to_string()).collect(),
+            pane_id: pane.map(str::to_string),
+            under_daemon: under,
+        }
+    }
+
+    /// One daemon, one lifetime-cap reaper (a fork: same command line, the
+    /// daemon's child, no pane id), the three role panes under it, the attached
+    /// TUI and the harness — none of the last two carrying a pane id.
+    fn census_ok() -> Vec<CensusProc> {
+        let d: Vec<&str> = vec!["/srv/runs/r1/branch/dot-agent-deck", "daemon", "serve"];
+        vec![
+            cp(
+                2,
+                &["/srv/runs/r1/xtask-cross-version", "--inner-plan", "p"],
+                None,
+                false,
+            ),
+            cp(DAEMON, &d, None, false),
+            cp(6, &d, None, true),
+            cp(312, &["sh", "-i"], Some("1"), true),
+            cp(332, &["cat"], Some("2"), true),
+            cp(336, &["sh", "-i"], Some("3"), true),
+            cp(
+                400,
+                &["/srv/runs/r1/old/dot-agent-deck-linux-amd64"],
+                None,
+                false,
+            ),
+        ]
+    }
+
+    fn judge(before: &[StatusRow], now: &[StatusRow], census: &[CensusProc]) -> (Verdict, String) {
+        let roles = generic_roles();
+        let cmd = daemon_cmdline();
+        judge_role_set(&RoleSetInput {
+            roles: &roles,
+            before,
+            now: Ok(now),
+            census: Ok(census),
+            daemon_pid: DAEMON,
+            daemon_cmdline: &cmd,
+        })
+    }
+
+    #[test]
+    fn one_role_set_on_its_original_panes_under_the_one_daemon_is_a_pass() {
+        let (v, detail) = judge(&three(), &three(), &census_ok());
+        assert_eq!(v, Verdict::Pass, "{detail}");
+        assert!(
+            detail.contains(
+                "0 `daemon serve` process(es) besides the daemon (pid 5) and its 1 fork(s)"
+            ),
+            "the reaper is a fork, not a second daemon: {detail}"
+        );
+    }
+
+    #[test]
+    fn a_role_set_restored_into_the_same_daemon_is_a_fail() {
+        // The shape tell 1 cannot see: ONE daemon, running the orchestration
+        // twice, because the old TUI's restore spawned a second set into it.
+        let mut now = three();
+        now.extend([
+            row("orchestrator (orchestrator)", "4"),
+            row("coder", "5"),
+            row("reviewer", "6"),
+        ]);
+        let mut census = census_ok();
+        census.extend([
+            cp(620, &["sh", "-i"], Some("4"), true),
+            cp(624, &["cat"], Some("5"), true),
+            cp(628, &["sh", "-i"], Some("6"), true),
+        ]);
+        let (v, detail) = judge(&three(), &now, &census);
+        assert_eq!(v, Verdict::Fail, "{detail}");
+        assert!(
+            detail.contains("`coder` is listed 2 time(s), on pane(s) [2, 5]"),
+            "{detail}"
+        );
+    }
+
+    #[test]
+    fn a_role_set_replaced_on_new_panes_is_a_fail() {
+        let now = vec![
+            row("orchestrator (orchestrator)", "4"),
+            row("coder", "5"),
+            row("reviewer", "6"),
+        ];
+        let census = vec![
+            cp(DAEMON, &["x", "daemon", "serve"], None, false),
+            cp(620, &["sh", "-i"], Some("4"), true),
+            cp(624, &["cat"], Some("5"), true),
+            cp(628, &["sh", "-i"], Some("6"), true),
+        ];
+        let (v, detail) = judge(&three(), &now, &census);
+        assert_eq!(v, Verdict::Fail, "{detail}");
+        assert!(detail.contains("the role was replaced"), "{detail}");
+    }
+
+    #[test]
+    fn a_pane_process_outside_the_daemons_tree_is_a_fail() {
+        // #1179's shape as the census sees it: a second role set under a
+        // daemon of the old build, whose processes carry pane ids too.
+        let mut census = census_ok();
+        census.extend([
+            cp(
+                395,
+                &[
+                    "/srv/runs/r1/old/dot-agent-deck-linux-amd64",
+                    "daemon",
+                    "serve",
+                ],
+                None,
+                false,
+            ),
+            cp(620, &["sh", "-i"], Some("1"), false),
+        ]);
+        let (v, detail) = judge(&three(), &three(), &census);
+        assert_eq!(v, Verdict::Fail, "{detail}");
+        assert!(
+            detail.contains("pid 620 (sh -i) carries pane id 1 but is NOT under"),
+            "{detail}"
+        );
+        assert!(
+            detail
+                .contains("a `daemon serve` process other than the daemon and its forks: pid 395"),
+            "{detail}"
+        );
+    }
+
+    #[test]
+    fn a_second_daemon_is_a_fail_even_with_no_roles_under_it() {
+        let mut census = census_ok();
+        census.push(cp(
+            395,
+            &[
+                "/srv/runs/r1/old/dot-agent-deck-linux-amd64",
+                "daemon",
+                "serve",
+            ],
+            None,
+            false,
+        ));
+        assert_eq!(judge(&three(), &three(), &census).0, Verdict::Fail);
+        // The daemon's exact command line OUTSIDE its tree is not a fork of it.
+        let mut census = census_ok();
+        census.push(cp(
+            900,
+            &["/srv/runs/r1/branch/dot-agent-deck", "daemon", "serve"],
+            None,
+            false,
+        ));
+        assert_eq!(judge(&three(), &three(), &census).0, Verdict::Fail);
+    }
+
+    #[test]
+    fn a_listed_role_with_no_live_process_under_the_daemon_is_a_fail() {
+        let census: Vec<CensusProc> = census_ok().into_iter().filter(|p| p.pid != 332).collect();
+        let (v, detail) = judge(&three(), &three(), &census);
+        assert_eq!(v, Verdict::Fail, "{detail}");
+        assert!(
+            detail.contains("`coder`'s pane 2 has no live process"),
+            "{detail}"
+        );
+    }
+
+    #[test]
+    fn a_missing_role_is_a_fail() {
+        let now: Vec<StatusRow> = three()
+            .into_iter()
+            .filter(|r| r.role != "reviewer")
+            .collect();
+        let (v, detail) = judge(&three(), &now, &census_ok());
+        assert_eq!(v, Verdict::Fail, "{detail}");
+        assert!(
+            detail.contains("`reviewer` is listed 0 time(s)"),
+            "{detail}"
+        );
+    }
+
+    #[test]
+    fn a_role_set_that_could_not_be_read_is_never_a_pass() {
+        let roles = generic_roles();
+        let cmd = daemon_cmdline();
+        let census = census_ok();
+        let before = three();
+        let unreadable = |now, census| {
+            judge_role_set(&RoleSetInput {
+                roles: &roles,
+                before: &before,
+                now,
+                census,
+                daemon_pid: DAEMON,
+                daemon_cmdline: &cmd,
+            })
+            .0
+        };
+        assert_eq!(
+            unreadable(Err("exited 1"), Ok(&census[..])),
+            Verdict::NotChecked
+        );
+        assert_eq!(
+            unreadable(Ok(&before[..]), Err("no /proc")),
+            Verdict::NotChecked
+        );
+        // A census that does not contain the daemon is not a census of the run.
+        let foreign: Vec<CensusProc> = census.iter().filter(|p| p.pid != DAEMON).cloned().collect();
+        assert_eq!(
+            unreadable(Ok(&before[..]), Ok(&foreign[..])),
+            Verdict::NotChecked
+        );
+    }
+
+    #[test]
+    fn no_generic_role_name_is_a_substring_of_another() {
+        // `rows_for` matches with `contains`; that only counts each role once
+        // per row while this holds.
+        let roles = generic_roles();
+        for a in &roles {
+            for b in &roles {
+                assert!(a == b || !a.contains(b.as_str()), "{a} contains {b}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_main_ui_is_recognised_by_its_stats_bar_and_the_prompt_is_not() {
+        // The last lines of the old TUI's grid in the #1179 run.
+        let grid = "┗━━ Last: 1m 34s  Tools: 0 ┛│   │\n 0 active  │  0 tools            └──┘\n TYPING   [Command Mode Ctrl+D]";
+        assert!(main_ui_drawn(grid));
+        assert!(main_ui_drawn(" 12 active  │  3 tools"));
+        assert!(
+            main_ui_drawn("│ pane text          │ 2 active  │  0 tools"),
+            "wherever the layout puts the bar on its row"
+        );
+        assert!(!main_ui_drawn("x2 active"), "a count is a whole word");
+        let prompt = "⚠  Daemon version mismatch  (3 agent(s) running)\n   [S] restart daemon and continue   [any other key] keep current daemon";
+        assert!(!main_ui_drawn(prompt));
+        assert!(!main_ui_drawn(""));
+        assert!(!main_ui_drawn(" active"), "a count is required");
     }
 
     #[test]

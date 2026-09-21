@@ -203,9 +203,12 @@ struct Opts {
     /// The branch-specific stimulus a reverse run carries after the four tells.
     ///
     /// `auto` (the default) selects it from the branch's issue number and falls
-    /// back to `generic`, the four tells only. Probes run in the reverse
-    /// direction only; asking for one explicitly with `--direction forward` is
-    /// refused rather than silently ignored.
+    /// back to `generic`: no stimulus, the four tells plus a `role-set` tell,
+    /// in any endpoint mode — which is how the #1179 negative control runs
+    /// (`--branch main --direction reverse --probe generic --endpoint-mode
+    /// resolved --unset-xdg-runtime-dir`). Probes run in the reverse direction
+    /// only; asking for one explicitly with `--direction forward` is refused
+    /// rather than silently ignored.
     #[arg(long, value_enum, default_value_t = ProbeArg::Auto)]
     probe: ProbeArg,
 }

@@ -15,8 +15,9 @@
 //! A probe is selected by the branch name (`agent/dispatch-issue-<n>`) or
 //! explicitly with `--probe`, and ONLY runs in the reverse direction: that is
 //! the pairing that executes a daemon-side change. A branch no probe is known
-//! for gets [`Probe::Generic`] — the four tells and nothing else — and the
-//! evidence file says so rather than implying more was measured.
+//! for gets [`Probe::Generic`] — the four tells plus the `role-set` tell, and
+//! no stimulus — and the evidence file says so rather than implying more was
+//! measured.
 
 use serde::{Deserialize, Serialize};
 
@@ -24,7 +25,8 @@ use crate::sandbox::{EndpointMode, Sandbox};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
 pub enum Probe {
-    /// The four tells only.
+    /// No stimulus: the four tells, plus the `role-set` tell (see
+    /// [`Probe::asserts_role_set`]).
     Generic,
     /// PR #1161 / issue #1109: an old-TUI `Stop` makes the branch daemon log
     /// what the shutdown frame is destroying, before it exits.
@@ -46,6 +48,8 @@ pub enum Probe {
     CrossPaneSessionKey,
     /// PR #1188 / issue #1129: old fire-and-forget `work-done` and `dispatch`
     /// still take effect on a branch daemon that now writes an acknowledgement.
+    /// A COMPATIBILITY check: an old client never reads the acknowledgement, so
+    /// a daemon that writes none passes it too.
     SignalAck,
     /// PR #1190 / issue #1181: an old-CLI dispatch under hostile ambient git
     /// location variables changes only the intended repository.
@@ -101,14 +105,33 @@ impl Probe {
         }
     }
 
-    /// One line for the evidence file.
+    /// One line for the evidence file, which renders it for reverse runs only.
     pub fn describe(self) -> String {
         match (self, self.origin()) {
             (Probe::Generic, _) | (_, None) => {
-                "generic — the four tells only; no branch-specific stimulus".to_string()
+                "generic — the four tells plus `role-set`; no branch-specific stimulus".to_string()
             }
+            (Probe::SignalAck, Some((pr, issue))) => format!(
+                "`{}` — PR #{pr} / issue #{issue}; a COMPATIBILITY check, which a daemon writing \
+                 no acknowledgement passes too",
+                Probe::SignalAck.name()
+            ),
             (p, Some((pr, issue))) => format!("`{}` — PR #{pr} / issue #{issue}", p.name()),
         }
+    }
+
+    /// Whether a reverse run asserts the `role-set` tell (see
+    /// `inner::judge_role_set`): the attached old TUI left exactly one set of
+    /// the orchestration's roles, the one the setup TUI brought up, under the
+    /// one listening daemon.
+    ///
+    /// `Generic` only. It is what separates the #1179 control's expected result
+    /// from #1179's failure on the path where the old TUI DOES find the daemon:
+    /// tell 1 catches a second daemon but not a role set that the old TUI's
+    /// session restore spawned into the existing one. The probes keep the tells
+    /// their evidence was recorded against.
+    pub fn asserts_role_set(self) -> bool {
+        self == Probe::Generic
     }
 
     /// Refuse a probe whose run configuration cannot reach its changed arm.
@@ -116,6 +139,15 @@ impl Probe {
     /// `DiscoveryFallback` is the one with a hard requirement: #1121 moved the
     /// endpoint only in the no-XDG, no-override fallback, so any other
     /// configuration measures an arm it did not touch.
+    ///
+    /// `Generic` has no changed arm to reach, so it accepts every endpoint
+    /// mode. That is what makes the #1179 negative control runnable: the same
+    /// reverse `resolved` / no-XDG run as `discovery-fallback`, against a
+    /// branch whose daemon binds the flat pair, where `discovery-fallback`
+    /// itself refuses (`probes::daemon_layout_precondition`). In that
+    /// configuration the inner half learns which pair the daemon bound, holds
+    /// every other candidate absent, and classifies a missing prompt exactly as
+    /// it does for `discovery-fallback` (`inner::classify_undiscovered`).
     pub fn check_config(self, mode: EndpointMode, keep_xdg: bool) -> Result<(), String> {
         match self {
             Probe::DiscoveryFallback if mode != EndpointMode::Resolved || keep_xdg => Err(
@@ -124,7 +156,7 @@ impl Probe {
                  arm, and any other configuration resolves an arm it did not touch"
                     .to_string(),
             ),
-            Probe::DiscoveryFallback => Ok(()),
+            Probe::DiscoveryFallback | Probe::Generic => Ok(()),
             _ if mode != EndpointMode::SandboxSockets => Err(format!(
                 "the {} probe is written for `--endpoint-mode sandbox-sockets`",
                 self.name()
@@ -352,6 +384,71 @@ mod tests {
             Probe::LogEscaping
                 .check_config(EndpointMode::SandboxSockets, true)
                 .is_ok()
+        );
+    }
+
+    #[test]
+    fn the_generic_probe_runs_in_the_1179_control_configuration_and_every_other() {
+        // `--probe generic --endpoint-mode resolved --unset-xdg-runtime-dir`,
+        // the #1179 negative control, used to be refused here.
+        assert!(
+            Probe::Generic
+                .check_config(EndpointMode::Resolved, false)
+                .is_ok()
+        );
+        for (mode, keep) in [
+            (EndpointMode::Resolved, true),
+            (EndpointMode::SandboxSockets, true),
+            (EndpointMode::SandboxSockets, false),
+        ] {
+            assert!(
+                Probe::Generic.check_config(mode, keep).is_ok(),
+                "{mode:?} keep_xdg={keep}"
+            );
+        }
+        // Only `generic` was widened: every stimulus probe still needs the
+        // sandbox sockets it was written against.
+        for p in [
+            Probe::TeardownInventory,
+            Probe::LateSessionStart,
+            Probe::LogEscaping,
+            Probe::PasteEnvelope,
+            Probe::CrossPaneSessionKey,
+            Probe::SignalAck,
+            Probe::GitEnv,
+        ] {
+            assert!(
+                p.check_config(EndpointMode::Resolved, false).is_err(),
+                "{p:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_the_generic_probe_asserts_the_role_set() {
+        assert!(Probe::Generic.asserts_role_set());
+        for p in [
+            Probe::TeardownInventory,
+            Probe::LateSessionStart,
+            Probe::LogEscaping,
+            Probe::DiscoveryFallback,
+            Probe::PasteEnvelope,
+            Probe::CrossPaneSessionKey,
+            Probe::SignalAck,
+            Probe::GitEnv,
+        ] {
+            assert!(!p.asserts_role_set(), "{p:?}");
+        }
+        assert!(Probe::Generic.describe().contains("role-set"));
+    }
+
+    #[test]
+    fn signal_ack_is_described_as_a_compatibility_check() {
+        let d = Probe::SignalAck.describe();
+        assert!(d.contains("COMPATIBILITY"), "{d}");
+        assert!(
+            d.starts_with("`signal-ack` — PR #1188 / issue #1129"),
+            "{d}"
         );
     }
 

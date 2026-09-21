@@ -237,15 +237,27 @@ impl Evidence {
                 s,
                 "The REVERSE of CLAUDE.md rule 12's pairing, run by `cargo xver --direction reverse` \
                  (`xtask/cross-version`, documented in `docs/develop/cross-version-harness.md`): the \
-                 BRANCH daemon with live agents under it, then the previous release's TUI attached \
-                 to that same daemon over a PTY with the build-version prompt declined, and the \
-                 previous release's CLI issuing every pane command. Rule 12 prescribes the forward \
-                 pairing, which for a daemon-side change runs the previous release's daemon code \
-                 and never executes a changed line; this pairing is the one that does. It asserts \
-                 the same four tells, pinned to the branch daemon, plus the branch-specific probe \
-                 named below. Stand-in agents, not real ones: no AGENT credential is used or \
-                 needed.\n"
+                 BRANCH daemon with live agents under it, then the previous release's TUI started \
+                 against it over a PTY. When that TUI finds the branch daemon, its build-version \
+                 prompt is declined, the previous release's CLI issues every pane command, and the \
+                 run asserts the same four tells, pinned to the branch daemon, plus the \
+                 branch-specific probe named below. Rule 12 prescribes the forward pairing, which \
+                 for a daemon-side change runs the previous release's daemon code and never \
+                 executes a changed line; this pairing is the one that does. Stand-in agents, not \
+                 real ones: no AGENT credential is used or needed.\n"
             );
+            if self.discovery.is_some() {
+                let _ = writeln!(
+                    s,
+                    "**In this run the old TUI did NOT find the branch daemon**, so none of the \
+                     four tells and no probe stimulus was measured, and nothing here says how the \
+                     branch daemon handles an old client's traffic. The verdict rests on the \
+                     Discovery section and the collateral tells alone: that the old TUI, started \
+                     with the run's environment, did not reach the branch daemon, what it started \
+                     instead, and what the collateral tells measured about the branch daemon, its \
+                     roles and the old TUI's own daemon.\n"
+                );
+            }
         } else {
             let _ = writeln!(
                 s,
@@ -571,6 +583,21 @@ mod reverse_tests {
     }
 
     #[test]
+    fn a_discovery_report_does_not_claim_the_four_tells_or_the_probe() {
+        let mut e = reverse();
+        e.tell("collateral-3", "t", Verdict::Fail, "duplicated");
+        e.discovery = Some("the old TUI lazy-spawned its own daemon".into());
+        let out = e.render();
+        assert!(
+            out.contains(
+                "**In this run the old TUI did NOT find the branch daemon**, so none of the four \
+                 tells and no probe stimulus was measured"
+            ),
+            "{out}"
+        );
+    }
+
+    #[test]
     fn damage_from_the_old_clients_fallback_is_a_fail_not_a_disclosed_downgrade() {
         let mut e = reverse();
         e.tell(
@@ -612,6 +639,11 @@ mod reverse_tests {
         );
         assert!(out.contains("| probe | `log-escaping`"), "{out}");
         assert!(out.contains("## Tells"), "{out}");
+        assert!(
+            out.contains("When that TUI finds the branch daemon"),
+            "the four tells are conditional on discovery: {out}"
+        );
+        assert!(!out.contains("did NOT find the branch daemon"), "{out}");
         let fwd = Evidence {
             branch: "agent/x".into(),
             ..Default::default()

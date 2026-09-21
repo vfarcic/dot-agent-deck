@@ -241,6 +241,55 @@ fn verdict(ok: bool) -> Verdict {
     if ok { Verdict::Pass } else { Verdict::Fail }
 }
 
+/// A verdict whose PASS also needs a precondition that makes it evidence: a
+/// failure stands on its own, but a pass without the precondition measured
+/// nothing and is NOT CHECKED.
+fn guarded_verdict(ok: bool, precondition: bool) -> Verdict {
+    match (ok, precondition) {
+        (false, _) => Verdict::Fail,
+        (true, true) => Verdict::Pass,
+        (true, false) => Verdict::NotChecked,
+    }
+}
+
+/// The reviewer's card reads `WaitingForInput`.
+fn reviewer_waiting(rows: &[StatusRow]) -> bool {
+    rows.iter()
+        .any(|r| r.role.contains(ROLE_REVIEWER) && r.status == "WaitingForInput")
+}
+
+/// Read the reviewer's card before a stimulus whose landing is asserted as that
+/// card REACHING `WaitingForInput`. `Ok` (with a note for the evidence) when it
+/// does not read that yet, so reaching it afterwards is the stimulus landing;
+/// `Err` (with why) when it already does, or when it could not be read — then a
+/// wait for it would pass without the stimulus.
+fn reviewer_not_yet_waiting(ctx: &mut Ctx<'_, '_>) -> Result<Result<String, String>, Abort> {
+    let rows = inner::daemon_status(
+        ctx.g,
+        &ctx.cast.client_bin,
+        &client_status_label(ctx.cast),
+        ctx.ev,
+    )?;
+    Ok(match rows {
+        Ok(rows) if reviewer_waiting(&rows) => Err(format!(
+            "the `{ROLE_REVIEWER}` card ALREADY read `WaitingForInput`, so reaching it afterwards \
+             shows nothing landed — NOT CHECKED: {}",
+            render_rows(&rows)
+        )),
+        Ok(rows) => Ok(format!(
+            "the `{ROLE_REVIEWER}` card read `{}`, not `WaitingForInput`",
+            rows.iter()
+                .find(|r| r.role.contains(ROLE_REVIEWER))
+                .map(|r| r.status.as_str())
+                .unwrap_or("<no card>")
+        )),
+        Err(e) => Err(format!(
+            "the `{ROLE_REVIEWER}` card could not be read, so reaching `WaitingForInput` \
+             afterwards is not attributable — NOT CHECKED: {e}"
+        )),
+    })
+}
+
 /// Type an old-CLI `dispatch` from the orchestrator pane and wait for the unit
 /// to appear in the daemon's agent list at its worktree. Returns the unit's
 /// worktree and its status row, if it appeared.
@@ -665,6 +714,9 @@ fn log_escaping(ctx: &mut Ctx<'_, '_>) -> Result<(), Abort> {
         l.lines()
             .any(|x| x.contains("Received event") && x.contains("xver-1082"))
     });
+    // "Later events still land" is asserted as the reviewer's card REACHING
+    // `WaitingForInput`, which is evidence only if it did not read that already.
+    let fresh = reviewer_not_yet_waiting(ctx)?;
     type_hook(
         ctx,
         r#"{"hook_event_name":"Notification","session_id":"xver-1082-ok","message":"ordinary"}"#,
@@ -675,10 +727,7 @@ fn log_escaping(ctx: &mut Ctx<'_, '_>) -> Result<(), Abort> {
         &client_status_label(ctx.cast),
         DAEMON_TIMEOUT,
         ctx.ev,
-        |rows| {
-            rows.iter()
-                .any(|r| r.role.contains(ROLE_REVIEWER) && r.status == "WaitingForInput")
-        },
+        reviewer_waiting,
     )?;
     let log = log_text(sb);
     let escaped = r"session_id=xver-1082\nFORGED-LINE";
@@ -712,7 +761,7 @@ fn log_escaping(ctx: &mut Ctx<'_, '_>) -> Result<(), Abort> {
     ctx.ev.tell(
         "probe-log-escaping",
         "a newline-bearing session id is logged as one escaped record, and later events still land",
-        verdict(ok),
+        guarded_verdict(ok, fresh.is_ok()),
         format!(
             "from inside the `{ROLE_REVIEWER}` pane: `printf '%s' '<UserPromptSubmit, session_id \
              \"xver-1082\\nFORGED-LINE\">' | {cli} hook --agent claude-code`, then an ordinary \
@@ -720,9 +769,12 @@ fn log_escaping(ctx: &mut Ctx<'_, '_>) -> Result<(), Abort> {
              `Received event` records for the hostile id: {n} (expected 1), of which {e} carry the \
              escaped `{escaped}`: {records}\n\
              physical log lines starting `FORGED-LINE`: {f}{forged}\n\
-             the branch daemon is {alive}; after the Notification `daemon status --json` (asked by \
-             the {client} CLI) reports the `{ROLE_REVIEWER}` pane as `{card}`; the {client} TUI's \
-             screen {tui}",
+             the branch daemon is {alive}; before the Notification {fresh}; after it `daemon \
+             status --json` (asked by the {client} CLI) reports the `{ROLE_REVIEWER}` pane as \
+             `{card}`; the {client} TUI's screen {tui}",
+            fresh = match &fresh {
+                Ok(note) | Err(note) => note,
+            },
             cli = ctx.cast.pane_cli,
             n = records.len(),
             e = escaped_records,
@@ -817,18 +869,50 @@ fn cross_pane_session_key(ctx: &mut Ctx<'_, '_>) -> Result<(), Abort> {
         "the old TUI after both panes reported one session id",
         ctx.tui.grid(),
     );
-    // Then beta ends ITS session: alpha must remain.
+    // Then beta ends ITS session: alpha must remain. "Alpha unchanged" is only a
+    // measurement once the SessionEnd has demonstrably been PROCESSED, so this
+    // waits for its effect instead of pausing: beta's card leaving
+    // `WaitingForInput` (a processed SessionEnd drops beta's session and puts a
+    // placeholder card back on its pane), or alpha's card changing. If neither
+    // ever happens, nothing shows the SessionEnd was applied, and the half is
+    // NOT CHECKED rather than passed.
+    let beta_pane = first_rows
+        .iter()
+        .find(|r| r.role == ROLE_BETA)
+        .map(|r| r.pane_id.clone())
+        .unwrap_or_default();
     type_hook(
         ctx,
         r#"{"hook_event_name":"SessionEnd","session_id":"xver-shared","reason":"other"}"#,
     )?;
-    std::thread::sleep(Duration::from_secs(3));
-    let after_end =
-        inner::daemon_status(ctx.g, &ctx.cast.client_bin, &label, ctx.ev)?.unwrap_or_default();
-    let alpha_after: Vec<&StatusRow> = after_end.iter().filter(|r| r.role == ROLE_ALPHA).collect();
-    let alpha_kept = alpha_after.len() == 1
-        && alpha_after[0].status == "Working"
-        && alpha_after[0].tool == "Bash";
+    let ended = inner::wait_for_status(
+        ctx.g,
+        &ctx.cast.client_bin,
+        &label,
+        DAEMON_TIMEOUT,
+        ctx.ev,
+        |rows| after_session_end(rows).is_some(),
+    )?;
+    let after_end = match &ended {
+        Ok(r) => r.clone(),
+        Err(_) => {
+            inner::daemon_status(ctx.g, &ctx.cast.client_bin, &label, ctx.ev)?.unwrap_or_default()
+        }
+    };
+    let outcome = after_session_end(&after_end);
+    // Corroboration, not the verdict: the daemon's own record of RECEIVING it
+    // (`daemon.rs` logs `Received event` at decode, before the state applies
+    // it), from beta's pane.
+    let receipt_needle = format!("pane_id=Some(\"{beta_pane}\")");
+    let received = log_text(ctx.g.sb)
+        .lines()
+        .filter(|l| {
+            l.contains("Received event")
+                && l.contains("event_type=SessionEnd")
+                && !beta_pane.is_empty()
+                && l.contains(&receipt_needle)
+        })
+        .count();
     let focus = |rows: &[StatusRow]| {
         rows.iter()
             .filter(|r| r.role == ROLE_ALPHA || r.role == ROLE_BETA)
@@ -838,7 +922,7 @@ fn cross_pane_session_key(ctx: &mut Ctx<'_, '_>) -> Result<(), Abort> {
     ctx.ev.tell(
         "probe-cross-pane-session-key",
         "one session id from two panes leaves two cards, each with its own status",
-        verdict(first.is_ok() && alpha_kept),
+        cross_pane_verdict(first.is_ok(), outcome),
         format!(
             "from inside `{ROLE_ALPHA}`: `SessionStart` then `PreToolUse(Bash, \"printf alpha\")`; \
              from inside `{ROLE_BETA}`: `SessionStart` then `Notification` — all four with \
@@ -847,26 +931,78 @@ fn cross_pane_session_key(ctx: &mut Ctx<'_, '_>) -> Result<(), Abort> {
              `daemon status --json` (asked by the {client} CLI): {first}\n\
              expected exactly one `{ROLE_ALPHA}` (`Working`, tool `Bash`) and one `{ROLE_BETA}` \
              (`WaitingForInput`) on distinct panes: {sep}\n\
-             after `{ROLE_BETA}` sent `SessionEnd` for the same id: {after} — `{ROLE_ALPHA}` {kept}",
+             then `{ROLE_BETA}` sent `SessionEnd` for the same id: {after} — {processed}\n\
+             the daemon logged {received} `Received event` record(s) for a `SessionEnd` from \
+             `{ROLE_BETA}`'s pane {beta_pane:?} (receipt, which does not by itself show the state \
+             applied it)",
             cli = ctx.cast.pane_cli,
             client = ctx.cast.client_side,
             first = render_rows(&focus(&first_rows)),
-            sep = if first.is_ok() { "held" } else { "did NOT hold" },
-            after = render_rows(&focus(&after_end)),
-            kept = if alpha_kept {
-                "kept its status and tool"
+            sep = if first.is_ok() {
+                "held"
             } else {
-                "did NOT keep its status and tool"
+                "did NOT hold"
+            },
+            after = render_rows(&focus(&after_end)),
+            processed = match outcome {
+                _ if first.is_err() => {
+                    "the first half did not hold, so this half decides nothing".to_string()
+                }
+                Some(AfterEnd::AlphaKept) => format!(
+                    "`{ROLE_BETA}`'s card left `WaitingForInput`, so the daemon applied the \
+                     SessionEnd, and in that same listing `{ROLE_ALPHA}` kept its status and tool"
+                ),
+                Some(AfterEnd::AlphaLost) => {
+                    format!("`{ROLE_ALPHA}` did NOT keep its status and tool")
+                }
+                None => format!(
+                    "within {DAEMON_TIMEOUT:?} neither card changed, so nothing shows the \
+                     SessionEnd was applied: `{ROLE_ALPHA}` still reading `Working` measures \
+                     nothing, and this half is NOT CHECKED"
+                ),
             },
         ),
     );
     Ok(())
 }
 
+/// What a listing read after beta's `SessionEnd` shows, or `None` while it shows
+/// no effect of it yet.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AfterEnd {
+    /// Beta's card changed — the SessionEnd was applied — and alpha still has
+    /// exactly one card, `Working` with tool `Bash`.
+    AlphaKept,
+    /// Alpha no longer has exactly one `Working`/`Bash` card: the one-card-each
+    /// claim is broken whatever else the listing shows.
+    AlphaLost,
+}
+
+fn after_session_end(rows: &[StatusRow]) -> Option<AfterEnd> {
+    let alpha: Vec<&StatusRow> = rows.iter().filter(|r| r.role == ROLE_ALPHA).collect();
+    let beta: Vec<&StatusRow> = rows.iter().filter(|r| r.role == ROLE_BETA).collect();
+    if !matches!(alpha[..], [a] if a.status == "Working" && a.tool == "Bash") {
+        return Some(AfterEnd::AlphaLost);
+    }
+    matches!(beta[..], [b] if b.status != "WaitingForInput").then_some(AfterEnd::AlphaKept)
+}
+
+/// `separated` is the first half: two distinct cards with their own statuses.
+fn cross_pane_verdict(separated: bool, after: Option<AfterEnd>) -> Verdict {
+    match (separated, after) {
+        (false, _) | (true, Some(AfterEnd::AlphaLost)) => Verdict::Fail,
+        (true, Some(AfterEnd::AlphaKept)) => Verdict::Pass,
+        (true, None) => Verdict::NotChecked,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // #1188 / issue #1129 — SignalAck against fire-and-forget clients
 // ---------------------------------------------------------------------------
 
+/// A COMPATIBILITY check, not a discriminator: it passes against a daemon that
+/// writes no acknowledgement too, and says so in its title.
+///
 /// The generic tells already had the old CLI send `work-done` (fire and
 /// forget) to the branch daemon, which now writes an acknowledgement nobody
 /// reads. This adds the other acknowledged verb, `dispatch`, from the
@@ -888,6 +1024,10 @@ fn signal_ack(ctx: &mut Ctx<'_, '_>) -> Result<(), Abort> {
         .excerpt("the orchestrator pane after the dispatch", ctx.tui.grid());
 
     focus_role(ctx.tui, plan, ROLE_REVIEWER)?;
+    // The landing is asserted as the reviewer's card REACHING `WaitingForInput`
+    // (tell 4 left it `running`), which is evidence only if it did not read that
+    // already.
+    let fresh = reviewer_not_yet_waiting(ctx)?;
     ctx.g.preconnect_logged(
         &format!("pane: {} agent-event", ctx.cast.pane_cli_label),
         &plan.env,
@@ -903,24 +1043,32 @@ fn signal_ack(ctx: &mut Ctx<'_, '_>) -> Result<(), Abort> {
         &client_status_label(ctx.cast),
         DAEMON_TIMEOUT,
         ctx.ev,
-        |rows| {
-            rows.iter()
-                .any(|r| r.role.contains(ROLE_REVIEWER) && r.status == "WaitingForInput")
-        },
+        reviewer_waiting,
     )?;
     let ok = unit.is_ok() && in_list && handed && after.is_ok();
+    // A COMPATIBILITY check, and titled as one (CLAUDE.md rule 17): an old
+    // fire-and-forget client never reads the acknowledgement, so a daemon that
+    // writes none passes this too. What it shows is that writing one to a peer
+    // that does not read it breaks neither verb nor the listener.
     ctx.ev.tell(
         "probe-signal-ack",
-        "old fire-and-forget work-done and dispatch take effect on the acknowledging branch daemon",
-        verdict(ok),
+        "compatibility: old fire-and-forget work-done and dispatch still take effect on the \
+         acknowledging branch daemon (does not show the acknowledgement is written)",
+        guarded_verdict(ok, fresh.is_ok()),
         format!(
-            "work-done: tell 4 above — the {client} CLI's fire-and-forget `work-done` reached the \
-             orchestrator through the branch daemon, which writes a `signal_ack` it never reads.\n\
+            "a COMPATIBILITY check, not evidence of the fix: the {client} CLI never reads a \
+             `signal_ack`, so a daemon that writes none passes this too, and nothing here observes \
+             one being written.\n\
+             work-done: tell 4 above — the {client} CLI's fire-and-forget `work-done` reached the \
+             orchestrator through the branch daemon.\n\
              dispatch: `{cli} dispatch xver-1129-rev --single --task '{sentinel}'` from the \
              orchestrator pane. The unit {unit}; `git worktree list` of the project {listed}; the \
              unit {handed} (recorded in `{record}`).\n\
-             listener: afterwards `{cli} agent-event --type waiting` from the `{ROLE_REVIEWER}` \
-             pane {after}.",
+             listener: before it, {fresh}; afterwards `{cli} agent-event --type waiting` from the \
+             `{ROLE_REVIEWER}` pane {after}.",
+            fresh = match &fresh {
+                Ok(note) | Err(note) => note,
+            },
             client = ctx.cast.client_side,
             cli = ctx.cast.pane_cli,
             unit = match &unit {
@@ -1218,8 +1366,12 @@ fn paste_envelope(ctx: &mut Ctx<'_, '_>) -> Result<(), Abort> {
     let confirmed = wait_for_log(sb, Duration::from_secs(90), |l| {
         l.lines().any(|x| x.contains("paste-envelope"))
     });
-    // Through the rest of the confirmation window: a retry or an abandonment
-    // would be logged by now if the confirmation had not stopped the chain.
+    // Not the `send → sleep → assert-unchanged` shape: the confirmation record
+    // above is the positive evidence that the delivery was processed, and this
+    // window is for what a confirmation that did NOT stop the chain would do
+    // next. #1183's branch re-submits an unconfirmed write after 0.5, 1, 2, 4
+    // and 8 s (`unconfirmed_retry_delay`), so a retry falls well inside 20 s;
+    // its 60 s abandonment does not, but is preceded by those retries.
     std::thread::sleep(Duration::from_secs(20));
     let log = log_text(sb);
     let confirmations: Vec<&str> = log
@@ -1343,6 +1495,107 @@ mod tests {
             0,
             "an unknown incarnation matches nothing"
         );
+    }
+
+    fn card(role: &str, pane: &str, status: &str, tool: &str) -> StatusRow {
+        StatusRow {
+            agent_id: pane.to_string(),
+            pane_id: pane.to_string(),
+            role: role.to_string(),
+            status: status.to_string(),
+            cwd: String::new(),
+            tool: tool.to_string(),
+        }
+    }
+
+    #[test]
+    fn beta_still_waiting_is_no_evidence_the_session_end_was_applied() {
+        // The listing right after beta's SessionEnd, before the daemon has
+        // applied it: the old code read this after a 3 s pause and PASSED.
+        let unapplied = [
+            card(ROLE_ALPHA, "4", "Working", "Bash"),
+            card(ROLE_BETA, "5", "WaitingForInput", ""),
+        ];
+        assert_eq!(after_session_end(&unapplied), None, "keep waiting");
+        assert_eq!(
+            cross_pane_verdict(true, after_session_end(&unapplied)),
+            Verdict::NotChecked,
+            "never applied is unmeasured, not a pass"
+        );
+    }
+
+    #[test]
+    fn beta_leaving_waiting_with_alpha_intact_is_the_pass() {
+        // The #925 branch's measured listing after the SessionEnd.
+        let applied = [
+            card(ROLE_ALPHA, "4", "Working", "Bash"),
+            card(ROLE_BETA, "5", "Idle", ""),
+        ];
+        assert_eq!(after_session_end(&applied), Some(AfterEnd::AlphaKept));
+        assert_eq!(
+            cross_pane_verdict(true, Some(AfterEnd::AlphaKept)),
+            Verdict::Pass
+        );
+    }
+
+    #[test]
+    fn alpha_losing_its_card_is_a_fail_whether_or_not_beta_moved() {
+        // `main`'s measured listing: alpha's status is gone.
+        let main = [
+            card(ROLE_ALPHA, "4", "", ""),
+            card(ROLE_BETA, "5", "Idle", ""),
+        ];
+        assert_eq!(after_session_end(&main), Some(AfterEnd::AlphaLost));
+        let beta_untouched = [
+            card(ROLE_ALPHA, "4", "Idle", ""),
+            card(ROLE_BETA, "5", "WaitingForInput", ""),
+        ];
+        assert_eq!(
+            after_session_end(&beta_untouched),
+            Some(AfterEnd::AlphaLost)
+        );
+        let alpha_twice = [
+            card(ROLE_ALPHA, "4", "Working", "Bash"),
+            card(ROLE_ALPHA, "6", "Working", "Bash"),
+            card(ROLE_BETA, "5", "Idle", ""),
+        ];
+        assert_eq!(after_session_end(&alpha_twice), Some(AfterEnd::AlphaLost));
+        assert_eq!(
+            cross_pane_verdict(true, Some(AfterEnd::AlphaLost)),
+            Verdict::Fail
+        );
+    }
+
+    #[test]
+    fn a_failed_first_half_fails_the_probe_whatever_the_second_shows() {
+        for after in [None, Some(AfterEnd::AlphaKept), Some(AfterEnd::AlphaLost)] {
+            assert_eq!(cross_pane_verdict(false, after), Verdict::Fail, "{after:?}");
+        }
+    }
+
+    #[test]
+    fn a_pass_without_its_precondition_is_not_checked_but_a_fail_stands() {
+        assert_eq!(guarded_verdict(true, true), Verdict::Pass);
+        assert_eq!(guarded_verdict(true, false), Verdict::NotChecked);
+        assert_eq!(guarded_verdict(false, true), Verdict::Fail);
+        assert_eq!(guarded_verdict(false, false), Verdict::Fail);
+    }
+
+    #[test]
+    fn the_reviewer_waiting_predicate_reads_only_the_reviewers_card() {
+        assert!(reviewer_waiting(&[card(
+            "reviewer",
+            "3",
+            "WaitingForInput",
+            ""
+        )]));
+        assert!(!reviewer_waiting(&[card("reviewer", "3", "Working", "")]));
+        assert!(!reviewer_waiting(&[card(
+            "coder",
+            "2",
+            "WaitingForInput",
+            ""
+        )]));
     }
 
     #[test]
