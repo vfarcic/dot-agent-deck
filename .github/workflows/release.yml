@@ -285,12 +285,70 @@ jobs:
             fi
           fi
 
+          # GitHub caps a release body at 125,000 CHARACTERS, and enforces it
+          # in two different ways that both bit v0.41.1. `finalize` creating
+          # the release SILENTLY TRUNCATED a 131,299-character body to exactly
+          # 125,000, ending mid-sentence. Then `desktop-publish`, which appends
+          # the unsigned-alpha note afterwards, was rejected outright with
+          # `HTTP 422: body is too long (maximum is 125000 characters)` -- so
+          # the .dmg and .deb shipped with no Gatekeeper instructions and no
+          # `gh attestation verify` command at all.
+          #
+          # So clamp here, deliberately, rather than letting GitHub cut. Two
+          # details matter. CHARACTERS, not bytes: this file is full of em
+          # dashes and arrows, and v0.41.1 was 131,945 bytes but 131,299
+          # characters. And the cut lands on a top-level entry boundary
+          # ("- **"), never mid-sentence, with a pointer to the full text.
+          #
+          # RESERVE is headroom for the note `desktop-publish` appends later.
+          # Without it the clamp passes and that step still fails, which is the
+          # half of v0.41.1 that actually cost users something.
+          python3 - "${RUNNER_TEMP}/release-body.md" <<'CLAMP'
+          import sys
+          LIMIT, RESERVE = 125000, 3000
+          p = sys.argv[1]
+          src = open(p, encoding="utf-8").read()
+          if len(src) <= LIMIT - RESERVE:
+              print(f"release body: {len(src)} chars, under the cap")
+              raise SystemExit
+          pointer = ("\n\n---\n\n*These notes are truncated to fit GitHub's 125,000-character "
+                     "limit on a release body. The complete entry is in "
+                     "[CHANGELOG.md](https://github.com/vfarcic/dot-agent-deck/blob/main/CHANGELOG.md).*\n")
+          budget = LIMIT - RESERVE - len(pointer)
+          # ALWAYS an entry boundary when one exists, however early it falls.
+          # This used to drop to `rfind("\n")` when the last `- **` sat in the
+          # first half of the budget, on the theory that an early boundary
+          # wastes room. That was wrong: an entry spans several physical lines,
+          # so a line cut lands INSIDE one and publishes half an entry -- the
+          # exact mid-sentence truncation this clamp exists to prevent, just
+          # committed by us instead of by GitHub. Keeping less is the cheaper
+          # error. The line fallback survives only for a body with no entry
+          # markers at all, where there is nothing better to cut on.
+          cut = src.rfind("\n- **", 0, budget)
+          if cut == -1:
+              cut = src.rfind("\n", 0, budget)
+          # `rfind` returns -1 when it finds nothing, and `src[:-1]` is not a
+          # clamp -- it drops ONE character and reports success. A 131,299-char
+          # body comes back 131,311 (the pointer is longer than the character
+          # removed), GitHub truncates it silently, and the clamp has caused
+          # precisely the failure it exists to prevent while printing a
+          # reassuring line. Needs a body with no newline at all in the first
+          # ~122,000 characters, which `assemble-changelog.sh` does not produce
+          # -- but the whole point of this step is that the cap is reached by
+          # bodies nobody predicted, and a guard that fails silently is worse
+          # than none. Cut on the character budget instead.
+          if cut <= 0:
+              cut = budget
+          out = src[:cut].rstrip() + pointer
+          open(p, "w", encoding="utf-8").write(out)
+          print(f"release body: {len(src)} chars -> {len(out)} after clamping to the 125,000 cap")
+          CLAMP
+
           {
             echo "changelog<<CHANGELOG_EOF"
             cat "${RUNNER_TEMP}/release-body.md"
             echo "CHANGELOG_EOF"
           } >> "$GITHUB_OUTPUT"
-          echo "release body: $(wc -c < "${RUNNER_TEMP}/release-body.md") bytes"
       - name: Upload the release body
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
