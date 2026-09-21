@@ -10,6 +10,17 @@ mod endpoint_test;
 mod endpoint_field_parity;
 mod endpoint_tunnels;
 mod generation;
+// PRD #802 — the two validating newtypes the `[voice]` stages store their
+// service coordinates in. A module of its own rather than one under `voice`
+// for `secrets`' reason: `ALLOWED_FIELD_TYPES` refuses a `String` in any
+// settings struct, so the next feature that needs to store an endpoint uses
+// these rather than inventing a second answer.
+mod model_service;
+// PRD #802 M4 — the credential seam PRD #803 M5 named, over the OS keychain.
+// Not voice-specific, so it is a module of its own rather than one under
+// `voice`: the rule it serves is #803's and any later feature needing a
+// credential uses the same store.
+mod secrets;
 // Tests only: the counted sweep that keeps `dto::DeckScope` from decaying into
 // a convention (issue #1116). No item outside `#[cfg(test)]`, so it adds
 // nothing to a normal build.
@@ -17,6 +28,13 @@ mod generation;
 mod selection_capture;
 mod settings;
 mod terminal;
+// PRD #802 — the voice command table, its Rust-side consumers, the microphone
+// and the transcription seam.
+//
+// `pub` rather than private because most of it still has no in-crate consumer:
+// M6 owns the surface. M7 gave part of it one — the four `desktop_voice_*`
+// commands below are the IPC seam the panel will drive.
+pub mod voice;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -54,6 +72,9 @@ use crate::dto::{
     WorkflowRoleInput, ensure_desktop_workflow_platform_supported, map_project_listing,
     map_resolved_project, mint_desktop_pane_id, safe_message, selected_endpoint, validate_agent_id,
     validate_pasted_project_path, validate_start_fields, validate_workflow_shape,
+};
+use crate::secrets::{
+    KeychainSecretStore, Secret, SecretError, SecretId, SecretStatus, SecretStore,
 };
 use crate::settings::DesktopSettings;
 use crate::terminal::DesktopState;
@@ -1464,6 +1485,474 @@ async fn desktop_set_settings(
     Ok(settings)
 }
 
+/// The three credential commands (PRD #802 M4), and the one that is missing.
+///
+/// # There is no `desktop_load_secret`, deliberately
+///
+/// The webview may ask whether a credential is stored, replace one and forget
+/// one. It may **not** read one back, and that omission is the point of the
+/// seam rather than an oversight: PRD #803's rule is that a secret goes in
+/// neither `desktop.toml` nor `localStorage`, and a command returning a
+/// credential to the webview would put it one `JSON.stringify` away from the
+/// second half of that. `secrets::SecretStore::load` exists for the Rust side,
+/// where M5's and M7's backends make their network call — which is where the
+/// CSP already forces every network hop to happen, so nothing needs the value
+/// over there.
+///
+/// # Each one answers with the resulting status
+///
+/// So a panel needs no second round trip to know what it is now looking at, and
+/// cannot render a stale answer between the two.
+///
+/// # A failure is an `Err`, never a status saying "nothing stored"
+///
+/// The outcome PRD #802 M4 says to design against is *a user who thinks their
+/// key is stored and finds voice broken tomorrow.* A store that failed
+/// therefore rejects rather than resolving: the webview's `catch` is what shows
+/// the sentence. `secrets::SecretStatus::problem` covers the other direction —
+/// a *read* that could not find out, which is not the same as "nothing is
+/// stored" and must not render as it.
+///
+/// # Blocking
+///
+/// A keychain call is a D-Bus round trip on Linux and can prompt on every
+/// platform, so each one goes through `spawn_blocking` rather than sitting on
+/// the async runtime the other commands share.
+#[tauri::command]
+async fn desktop_secret_status(webview: Webview, id: String) -> Result<SecretStatus, String> {
+    ensure_main_webview(&webview)?;
+    let id = parse_secret_id(&id)?;
+    on_keychain(move |store| store.status(id)).await
+}
+
+#[tauri::command]
+async fn desktop_store_secret(
+    webview: Webview,
+    id: String,
+    secret: String,
+) -> Result<SecretStatus, String> {
+    ensure_main_webview(&webview)?;
+    let id = parse_secret_id(&id)?;
+    // The `Secret` is built here and moved into the closure, so the credential
+    // exists as a plain `String` for exactly as long as it takes serde to hand
+    // it over.
+    let secret = Secret::new(secret);
+    on_keychain(move |store| {
+        store.store(id, &secret)?;
+        Ok::<_, SecretError>(store.status(id))
+    })
+    .await?
+    .map_err(report_secret_error)
+}
+
+#[tauri::command]
+async fn desktop_forget_secret(webview: Webview, id: String) -> Result<SecretStatus, String> {
+    ensure_main_webview(&webview)?;
+    let id = parse_secret_id(&id)?;
+    on_keychain(move |store| {
+        store.delete(id)?;
+        Ok::<_, SecretError>(store.status(id))
+    })
+    .await?
+    .map_err(report_secret_error)
+}
+
+/// The webview names a credential by its token, and an unknown one is refused.
+///
+/// A closed set rather than a free string for `secrets::SecretId`'s reason: a
+/// caller that could pass any name could strand a key under one nothing later
+/// reads.
+fn parse_secret_id(raw: &str) -> Result<SecretId, String> {
+    SecretId::parse(raw).ok_or_else(|| {
+        format!(
+            "unknown credential id; the ids are {}",
+            SecretId::ALL
+                .iter()
+                .map(|id| id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    })
+}
+
+/// Run one blocking keychain operation off the async runtime.
+///
+/// The `Err` is the join failure — a panic inside the closure — and is separate
+/// from whatever the operation itself returned, which is why the two commands
+/// above have two `?`s.
+async fn on_keychain<T: Send + 'static>(
+    work: impl FnOnce(&KeychainSecretStore) -> T + Send + 'static,
+) -> Result<T, String> {
+    tauri::async_runtime::spawn_blocking(move || work(&KeychainSecretStore::new()))
+        .await
+        .map_err(|error| safe_message(format!("the credential store call failed: {error}")))
+}
+
+/// A failed credential operation, split the way a failed settings save is: the
+/// detail names whatever the platform said and belongs in the app's log, the
+/// webview gets the sentence.
+fn report_secret_error(error: SecretError) -> String {
+    eprintln!("{}", error.detail());
+    safe_message(error.public())
+}
+
+/// PRD #802 M7: the microphone, and the four commands the panel drives it with.
+///
+/// # What M6 calls, and in what order
+///
+/// `desktop_voice_status` to decide whether to offer a microphone at all;
+/// `desktop_voice_start` on the first press; `desktop_voice_stop` on the
+/// second, which closes the device, transcribes and answers with the
+/// transcript; `desktop_voice_cancel` when the panel closes or the user escapes.
+/// Between a start and a stop, `desktop_voice_status` is how the surface learns
+/// that the length cap ended the recording on its own — from the user's side the
+/// microphone simply stopped, and a panel that did not know why would go on
+/// rendering *listening…* over a closed device.
+///
+/// # Stop transcribes; it does not hand back a buffer
+///
+/// The alternative shape — a third command that takes the audio and returns
+/// text — would put a `Pcm16` on the IPC boundary, which is a base64 copy of up
+/// to 960 KB of the user's voice crossing into the webview for no reason. PRD
+/// #802's Open Question 5 says no part of an utterance is persisted; keeping
+/// the audio inside this process is the same rule applied one seam earlier. The
+/// webview receives a transcript, which it has to render anyway, and nothing
+/// else.
+///
+/// # There is no `desktop_voice_transcribe` taking a credential either
+///
+/// The key is read Rust-side from the keychain at call time, exactly as PRD
+/// #802 M4 and M5 established. `desktop_secret_status`, `…_store` and
+/// `…_forget` remain the whole credential surface, and `load` is still
+/// deliberately absent.
+pub(crate) struct VoiceState {
+    /// One session per process: one microphone, one utterance at a time — and,
+    /// since PRD #802's sleep work, the machine held awake beside it.
+    ///
+    /// A [`voice::VoiceHold`] rather than the session on its own, and the
+    /// grouping is load-bearing rather than tidiness: it owns both resources
+    /// voice holds on the user's machine and is the only thing that can end
+    /// either. Its module docs carry the property and how the compiler holds
+    /// it.
+    ///
+    /// Cheap to clone — both halves are `Arc`s — which is what the cap timer
+    /// (a spawned task outliving the command that started it) and every
+    /// `spawn_blocking` below need.
+    hold: voice::VoiceHold,
+}
+
+impl Default for VoiceState {
+    fn default() -> Self {
+        Self {
+            // Constructs no host and opens no device — `cpal` is not touched
+            // until a `start`. An app on a machine with no audio server starts
+            // normally and finds out at the first press, which is where the
+            // sentence for it already is. The sleep inhibit is the same: the
+            // platform is not asked for anything until voice is switched on.
+            hold: voice::VoiceHold::new(Arc::new(voice::CpalSource::new())),
+        }
+    }
+}
+
+/// What the webview is told about the microphone.
+///
+/// [`voice::CaptureStatus`]'s four fields, flattened, plus the two that come
+/// from the settings document rather than from the session — which is why this
+/// lives here and not in `voice::capture`, a module that deliberately reads no
+/// settings.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VoiceStatus {
+    #[serde(flatten)]
+    pub capture: voice::CaptureStatus,
+    /// Whether a microphone path is offered at all.
+    ///
+    /// **Always true from this process since `Speech = off` went**, and that is
+    /// worth stating rather than leaving to be rediscovered: every speech
+    /// backend this build ships can run, so no settings document can turn the
+    /// stage off. What used to be reported here — *nothing is set up* — is now
+    /// reported where it actually happens, as
+    /// [`voice::TranscriptionOutcome::NotConfigured`] naming the container to
+    /// start or the key to paste.
+    ///
+    /// The field stays because the SURFACE still has the question and two other
+    /// answerers: a runtime with no capture verbs at all, and the browser
+    /// fixture, which has no Rust side and therefore nothing to transcribe
+    /// with. Both report `false` and both render `VOICE_UNAVAILABLE`.
+    pub available: bool,
+    /// Which transcriber would answer — `local` or `remote`.
+    pub backend: &'static str,
+}
+
+/// The transcription backend the settings document currently names.
+///
+/// Read per call rather than cached, for `voice::resolver_for`'s reason: a user
+/// who changes the setting uses it on the next utterance instead of after a
+/// restart. **That is what makes pressing Voice again after choosing a backend
+/// work without a restart**, which PRD #802 M6's rewrite turned from a nicety
+/// into the documented behaviour of the unavailable path.
+///
+/// **The cost is no longer "one small TOML read per button press".** It was,
+/// while the only status reads were one per press plus one a second inside an
+/// open dialog. Continuous voice control polls `desktop_voice_status` every
+/// `VOICE_STATUS_POLL_MS` — 250 ms — for as long as the microphone is open, so
+/// this is **four small TOML reads a second** in that state and one per call
+/// everywhere else. At a few tens of microseconds each that is not worth
+/// caching away the freshness above.
+///
+/// One consequence is worth naming rather than discovering: `load_snapshot`
+/// logs a malformed document through `log_document_problem`, which is a bare
+/// `eprintln!` with no rate limit. A `desktop.toml` this build cannot parse
+/// therefore writes four stderr lines a second while voice is on, where it
+/// wrote one. It is a misconfiguration either way, and the fix — if it ever
+/// matters — is a log-once latch in `settings.rs` rather than a cache here.
+fn voice_speech_settings() -> crate::settings::TranscriptionSettings {
+    crate::settings::load_snapshot()
+        .settings
+        .voice
+        .unwrap_or_default()
+        .transcription
+}
+
+fn voice_status(hold: &voice::VoiceHold) -> VoiceStatus {
+    VoiceStatus {
+        capture: hold.status(),
+        // See the field's doc comment: no settings document can turn the stage
+        // off any more, and the not-set-up case is reported at the moment it
+        // bites rather than as a permanent state of the app.
+        available: true,
+        backend: voice_speech_settings().backend.as_token(),
+    }
+}
+
+/// A refused or failed capture, split the way a failed credential operation is:
+/// the detail belongs in the app's own log and the webview gets the sentence.
+///
+/// Nothing here prints a transcript or a sample — a capture error names the
+/// device or the state machine and never what was said, which is the rule PRD
+/// #802's Open Question 5 sets and this is the one place it could be broken by
+/// accident.
+fn report_capture_error(error: voice::CaptureError) -> String {
+    safe_message(error.detail())
+}
+
+/// Open the microphone. Idle, done or failed → recording.
+#[tauri::command]
+async fn desktop_voice_start(
+    webview: Webview,
+    voice_state: State<'_, VoiceState>,
+) -> Result<VoiceStatus, String> {
+    ensure_main_webview(&webview)?;
+    let hold = voice_state.hold.clone();
+
+    // Opening an audio device is a round trip to the OS and can prompt, so it
+    // goes through `spawn_blocking` rather than sitting on the async runtime
+    // every other command shares — the same treatment a keychain call gets.
+    //
+    // PRD #802's sleep work rides in the same closure for the same reason:
+    // [`voice::VoiceHold::start`] asks the platform to keep the machine awake
+    // after the device opens, which on Linux is a D-Bus round trip. Both are
+    // blocking calls to the operating system, so both belong off the runtime.
+    let started = {
+        let hold = hold.clone();
+        tauri::async_runtime::spawn_blocking(move || hold.start())
+            .await
+            .map_err(|error| safe_message(format!("the microphone call failed: {error}")))?
+    };
+    let (_, ticket) = started.map_err(report_capture_error)?;
+
+    // The other half of the length cap. `voice::PcmSink` already refuses to
+    // grow past `MAX_UTTERANCE`, which bounds the allocation; this is what
+    // releases the DEVICE, so a forgotten toggle does not leave a microphone
+    // open for the life of the app. The ticket is what stops a timer outliving
+    // its own utterance and closing the next one.
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(voice::MAX_UTTERANCE).await;
+        // Blocking for the reason the open above is: releasing the device
+        // joins its thread, which is as slow as the platform's teardown.
+        let _ = tauri::async_runtime::spawn_blocking(move || hold.cap_reached(ticket)).await;
+    });
+
+    Ok(voice_status(&voice_state.hold))
+}
+
+/// Close the microphone and transcribe what it heard. Recording →
+/// transcribing → done or failed.
+#[tauri::command]
+async fn desktop_voice_stop(
+    webview: Webview,
+    voice_state: State<'_, VoiceState>,
+) -> Result<voice::VoiceTranscription, String> {
+    ensure_main_webview(&webview)?;
+    // Blocking, like the open in `desktop_voice_start`: closing the device
+    // joins its thread, and a driver that is slow to let go would otherwise
+    // park a runtime worker for as long as it takes.
+    let hold = voice_state.hold.clone();
+    let audio = tauri::async_runtime::spawn_blocking(move || hold.stop())
+        .await
+        .map_err(|error| safe_message(format!("the microphone call failed: {error}")))?
+        .map_err(report_capture_error)?;
+    let transcriber = voice::transcriber_for(
+        &voice_speech_settings(),
+        Arc::new(KeychainSecretStore::new()),
+    );
+    let result = voice::handle_audio(transcriber.as_ref(), &audio).await;
+    voice_state.hold.settle(result.outcome.is_heard());
+    Ok(result)
+}
+
+/// What the microphone is doing right now, and whether one is offered at all.
+#[tauri::command]
+async fn desktop_voice_status(
+    webview: Webview,
+    voice_state: State<'_, VoiceState>,
+) -> Result<VoiceStatus, String> {
+    ensure_main_webview(&webview)?;
+    Ok(voice_status(&voice_state.hold))
+}
+
+/// Abandon the recording without transcribing it — a closed panel, an escape
+/// key, a user who changed their mind.
+///
+/// Idempotent and never refused, because each of those can arrive in any state
+/// and a caller that has to know which one it is in would get it wrong.
+#[tauri::command]
+async fn desktop_voice_cancel(
+    webview: Webview,
+    voice_state: State<'_, VoiceState>,
+) -> Result<VoiceStatus, String> {
+    ensure_main_webview(&webview)?;
+    // Blocking for `desktop_voice_stop`'s reason — a cancel releases the same
+    // device, and a closing panel is exactly when several of these arrive at
+    // once.
+    //
+    // `release` rather than a bare cancel, and it is the ONLY spelling
+    // available: `VoiceHold` keeps the session private precisely so this call
+    // cannot close the microphone without also letting the machine sleep. This
+    // is the press that turns voice off, so it is the one that must.
+    let hold = voice_state.hold.clone();
+    tauri::async_runtime::spawn_blocking(move || hold.release())
+        .await
+        .map_err(|error| safe_message(format!("the microphone call failed: {error}")))?;
+    Ok(voice_status(&voice_state.hold))
+}
+
+/// The longest utterance this build will resolve, in bytes.
+///
+/// The panel's own transcripts are bounded — `voice::MAX_UTTERANCE` caps the
+/// audio at 30 seconds — but that cap bounds the *audio*, not what arrives at
+/// the IPC boundary, and this command trusts that boundary no more than
+/// [`validate_agent_id`] does: an utterance becomes part of a model prompt. It
+/// was also an argument to a child process while the agent-CLI intent backend
+/// existed, and the bound outlived that backend because the first reason is
+/// enough on its own. 2 KiB is far past any spoken command — thirty seconds of
+/// speech is around 700 characters — while making a payload-shaped value
+/// impossible.
+const MAX_UTTERANCE_BYTES: usize = 2 * 1024;
+
+/// PRD #802 M6: take one utterance to an outcome carrying the sentence to show.
+///
+/// # What it does NOT do
+///
+/// It runs nothing. A [`voice::VoiceOutcome::Dispatch`] names an entry in the
+/// frontend action registry (`desktop/src/lib/voiceActions.ts`) and the webview
+/// dispatches it where a click dispatches one — so this command's whole output
+/// is a classified situation plus the sentence for it, and every refusal is one
+/// of those situations rather than an `Err`. The `Err`s below are the two things
+/// that are not situations: a call that came from somewhere it must not, and an
+/// utterance the boundary refuses to carry.
+///
+/// # The screen is a parameter and the agents are not
+///
+/// An utterance is resolved against the live state the app already holds, and
+/// each piece of that state is read where it already lives. The agent list is
+/// read HERE, from the selected deck's own snapshot, because that is where it
+/// lives and a list arriving from the webview would be a second answer to "what
+/// agents are there" with nothing keeping the two in step. The mounted screen
+/// cannot be read here at all — it is React state — so it is the one piece the
+/// webview states, which is what `DeckBridge.declareVoiceScreen` is.
+///
+/// # One `ListAgents` per utterance
+///
+/// [`get_snapshot`] fetches rather than reading a cache, which is one daemon
+/// round trip per voice command. That is deliberate and it is cheap next to what
+/// follows it: the intent backend measured **0.62–1.03 s** for the call this
+/// snapshot is gathered for — and 4.30–6.30 s while the agent-CLI backend was
+/// the default, which is the number PRD #802's risk entry was written against.
+/// Resolving "open the tester" against a list from a minute ago is how a spoken
+/// name resolves to an agent that has since exited.
+///
+/// The SELECTED deck's agents, not the fleet's. Every other single-deck command
+/// reads the same snapshot, `open_agent` dispatches a pane whose terminal is the
+/// selected deck's, and a fleet-wide list would let a spoken name resolve to an
+/// agent on a machine the user is not looking at.
+#[tauri::command]
+async fn desktop_voice_resolve(
+    webview: Webview,
+    state: State<'_, DesktopState>,
+    utterance: String,
+    screen: voice::Screen,
+) -> Result<voice::VoiceResult, String> {
+    ensure_main_webview(&webview)?;
+    if utterance.len() > MAX_UTTERANCE_BYTES {
+        return Err(format!(
+            "that command is too long to send — {MAX_UTTERANCE_BYTES} bytes at most"
+        ));
+    }
+    // Read per call rather than cached, for `voice_speech_settings`'s reason: a
+    // user who changes the backend, the endpoint or the model uses it on the
+    // next utterance instead of after a restart.
+    let commands = crate::settings::load_snapshot()
+        .settings
+        .voice
+        .unwrap_or_default()
+        .intent;
+    let resolver = voice::resolver_for(&commands, Arc::new(KeychainSecretStore::new()));
+    let snapshot = get_snapshot(&state.daemon).await;
+    Ok(voice::handle_utterance(
+        resolver.as_ref(),
+        voice::table(),
+        screen,
+        &snapshot.agents,
+        voice::Transcript::new(utterance),
+    )
+    .await)
+}
+
+/// PRD #802 — what can be said on this screen, for the discovery overlay.
+///
+/// # It is the TABLE, annotated, and deliberately the same shape the model gets
+///
+/// The overlay's requirement is that it be *generated from the table, never a
+/// maintained list*, so this returns exactly what [`voice::annotate`] hands the
+/// intent backend: each row's `id`, its `description` and whether the current
+/// screen can run it. Handing the webview a second, prettier projection would
+/// be the maintained list under a better name — and the first time a row's
+/// wording changed, the overlay and the model would be telling the user and the
+/// model two different things.
+///
+/// **So the `description` a user reads here is a PROMPT**, written for a model
+/// and reviewed as an interface (`commands.toml` says so at the column). That
+/// is a real cost and it is the deliberate side of the trade: a separate
+/// user-facing column would read better and would be a second wording to keep
+/// in step, which is the whole defect class this table exists to close.
+///
+/// # No daemon round trip, no model, no state
+///
+/// Unlike [`desktop_voice_resolve`] this reaches nothing: the table is
+/// `include_str!`d into the binary and the screen arrives as a parameter, so
+/// the answer is a pure function of the two. It costs no `ListAgents`, spends
+/// no credential, and is safe to call every time the overlay opens rather than
+/// being cached into something that can go stale.
+#[tauri::command]
+async fn desktop_voice_commands(
+    webview: Webview,
+    screen: voice::Screen,
+) -> Result<Vec<voice::AnnotatedCommand>, String> {
+    ensure_main_webview(&webview)?;
+    Ok(voice::annotate(voice::table(), screen))
+}
+
 /// Put a saved document's deck selection into force (PRD #741 M7, completed at
 /// M9).
 ///
@@ -2108,10 +2597,80 @@ fn window_focus(event: &tauri::WindowEvent) -> Option<bool> {
     }
 }
 
+/// PRD #802's audit blocker: release the microphone — and, since the sleep
+/// work, the machine with it.
+///
+/// # Why this is Rust's job and not the panel's
+///
+/// The recording's lifetime is owned here — [`voice::CaptureSession`] holds the
+/// device stream and the captured audio, and the webview holds neither. What
+/// used to end a recording on teardown was a React passive-effect cleanup in
+/// `desktop/src/components/VoiceControlPanel.tsx` making an asynchronous IPC
+/// call, and a webview that is going away is not guaranteed to run it, let
+/// alone to let it finish: a hard reload, a crashed web-content process, a
+/// destroyed window. The device then stayed open with nothing left that could
+/// close it, and the replacement panel — which initialises its toggle to *off*
+/// — said `Voice off` over it.
+///
+/// It compounds past the length cap. [`voice::CaptureSession::cap_reached`]
+/// releases the device on purpose but KEEPS the audio and leaves the session
+/// `Recording`, so the utterance stays the user's to send or discard; a webview
+/// lost at that moment left up to 960 KB of captured speech in the session with
+/// nothing able to reach it, and every later start refused because
+/// `accepts_start` takes neither `Recording` nor `Transcribing`.
+///
+/// # It releases the sleep inhibit too, and NOT because this function
+/// remembers to
+///
+/// Voice holds a second invisible resource: a sleep inhibit, taken so a machine
+/// being driven by speech — which generates no input events — is not suspended
+/// by its own idle timer. It leaks the same ways the device does and costs more
+/// when it leaks, since a stuck one keeps a laptop awake indefinitely with
+/// nothing on screen to explain it.
+///
+/// So every teardown trigger below releases both. What makes that true is not
+/// this function and not a convention at the call sites: [`voice::VoiceHold`]
+/// keeps the capture session **private**, so `release` is the only cancel this
+/// file can spell, and `release` does both. See that module's docs.
+///
+/// # What it costs where it is called
+///
+/// `release` is idempotent and never refused, so every call site can be
+/// unconditional. It drops the stream, and a real `CpalStream::drop` joins the
+/// device thread — so this is as slow as the platform's own teardown, on
+/// whichever thread calls it. That is accepted deliberately at all three call
+/// sites: they are the window going away, the document being replaced and the
+/// app exiting, and a release that is *scheduled* rather than done is a release
+/// that may not happen before the process does. The inhibit goes first and is
+/// the cheap half — it cannot be what makes this slow.
+fn release_microphone(voice: &VoiceState) -> voice::CaptureStatus {
+    voice.hold.release()
+}
+
+/// Whether a window event means the webview holding the Voice button is gone.
+///
+/// `CloseRequested` as well as `Destroyed`, because the two are not one
+/// sequence: a close the app vetoes never reaches `Destroyed`, and a close it
+/// does not veto reaches it after the window is already unusable. Releasing on
+/// both is harmless — [`release_microphone`] is idempotent — and releasing on
+/// only the second would mean the microphone outlived the window whenever the
+/// platform delivered no `Destroyed` at all.
+///
+/// Every other window event — focus, move, resize, theme — says nothing about
+/// whether the webview is still there, and must not release a live recording.
+fn window_ends_capture(event: &tauri::WindowEvent) -> bool {
+    matches!(
+        event,
+        tauri::WindowEvent::CloseRequested { .. } | tauri::WindowEvent::Destroyed
+    )
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let app = tauri::Builder::default()
         .manage(DesktopState::default())
+        // PRD #802 M7: the capture session. Opens no device until a `start`.
+        .manage(VoiceState::default())
         // Issue #845: the stored Light/Dark choice reaches the document root
         // before the webview parses the document, so the first painted frame is
         // already the one the user chose. Registered before `build()`, which is
@@ -2170,7 +2729,63 @@ pub fn run() {
             if let Some(focused) = window_focus(event) {
                 let _ = terminal::window_focus_changed(&window.state::<DesktopState>(), focused);
             }
+            // PRD #802's audit blocker, teardown trigger 1: the window holding
+            // the Voice button is going away, so the microphone goes with it.
+            // See `release_microphone` for why the webview's own cleanup is not
+            // enough, and `window_ends_capture` for which events count.
+            //
+            // `try_state` rather than `state`: the latter panics when nothing is
+            // managed, and this runs on the event loop where a panic takes the
+            // app with it. The voice state IS managed — first line of this
+            // builder — so the `None` arm is unreachable rather than a case.
+            if window.label() == "main"
+                && window_ends_capture(event)
+                && let Some(voice) = window.try_state::<VoiceState>()
+            {
+                release_microphone(&voice);
+            }
         })
+        // PRD #802's audit blocker, teardown trigger 2: the DOCUMENT is being
+        // replaced without the window going anywhere — a hard reload, or a
+        // webview the platform lost and recreated. The panel that was holding
+        // the microphone is gone by the time this fires, and the one about to
+        // mount initialises its toggle to off, so this is the release its own
+        // cleanup could not be relied on to make.
+        //
+        // `Started` rather than `Finished`: the old document is already gone and
+        // the new one has not run any of our JavaScript, which is exactly the
+        // window in which nothing else would close the device. The app's first
+        // load reaches here too and is a no-op, since the session is idle.
+        .on_page_load(|webview, payload| {
+            if webview.label() == "main"
+                && payload.event() == tauri::webview::PageLoadEvent::Started
+                && let Some(voice) = webview.try_state::<VoiceState>()
+            {
+                release_microphone(&voice);
+            }
+        });
+    // PRD #802's audit blocker, teardown trigger 3: the web content PROCESS
+    // died. The chain is broken here rather than continued because this hook
+    // exists only on Apple's platforms — `Builder::on_web_content_process_
+    // terminate` is `#[cfg(any(target_os = "macos", target_os = "ios"))]` in
+    // tauri itself, and a `#[cfg]` cannot be attached to one call in a method
+    // chain.
+    //
+    // **So the crash case is covered on macOS and NOT on Linux**, which is
+    // worth stating rather than leaving to be discovered: Tauri exposes no
+    // equivalent for WebKitGTK, so a Linux web-process crash is released by
+    // whichever of the other two triggers arrives first — the reload that
+    // follows it, or app exit. Nothing here can do better without a hook that
+    // does not exist.
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    let app = app.on_web_content_process_terminate(|webview| {
+        if webview.label() == "main"
+            && let Some(voice) = webview.try_state::<VoiceState>()
+        {
+            release_microphone(&voice);
+        }
+    });
+    let app = app
         .invoke_handler(tauri::generate_handler![
             desktop_get_snapshot,
             desktop_list_projects,
@@ -2185,6 +2800,15 @@ pub fn run() {
             desktop_test_endpoint,
             desktop_set_zoom,
             desktop_run_action,
+            desktop_secret_status,
+            desktop_store_secret,
+            desktop_forget_secret,
+            desktop_voice_start,
+            desktop_voice_stop,
+            desktop_voice_status,
+            desktop_voice_cancel,
+            desktop_voice_resolve,
+            desktop_voice_commands,
         ])
         .build(tauri::generate_context!())
         .expect("failed to build dot-agent-deck desktop application");
@@ -2194,16 +2818,36 @@ pub fn run() {
             tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit
         ) {
             let state = app_handle.state::<DesktopState>();
-            tauri::async_runtime::block_on(async {
-                terminal::detach_all(&state).await;
-                // PRD #741 M7, teardown trigger 4: every `ssh -N -L` child this
-                // process owns dies with the app. `Drop` on the last lease is
-                // what actually signals the process group; this is what drops
-                // the map's handle so there is a last lease to drop.
-                state.tunnels.close_all().await;
-            });
+            let voice_state = app_handle.state::<VoiceState>();
+            tauri::async_runtime::block_on(release_on_exit(&state, &voice_state));
         }
     });
+}
+
+/// Everything the app lets go of on its way out.
+///
+/// Extracted from the `RunEvent` closure so it can be driven from a test: the
+/// closure itself needs a built `tauri::App` and a real event loop, and what is
+/// worth pinning is the release rather than the plumbing that calls it.
+///
+/// **The microphone goes FIRST**, and the order is the point rather than
+/// housekeeping (PRD #802's audit blocker, teardown trigger 4). The sleep
+/// inhibit goes with it, inside the same call — see [`release_microphone`].
+/// This runs on
+/// `ExitRequested` as well as `Exit`, and the two steps after it are the slow
+/// ones — a detach writes a frame over a transport that may be an `ssh` child
+/// on its way out, bounded at 250 ms *per session*, and the tunnels close after
+/// that. Releasing the device behind them would leave a microphone open for the
+/// whole of a teardown that has nothing to do with it, and an exit the platform
+/// does not wait out would leave it open for good.
+async fn release_on_exit(state: &DesktopState, voice: &VoiceState) {
+    release_microphone(voice);
+    terminal::detach_all(state).await;
+    // PRD #741 M7, teardown trigger 4: every `ssh -N -L` child this process
+    // owns dies with the app. `Drop` on the last lease is what actually signals
+    // the process group; this is what drops the map's handle so there is a last
+    // lease to drop.
+    state.tunnels.close_all().await;
 }
 
 #[cfg(test)]
@@ -2223,6 +2867,232 @@ mod tests {
             Some(false)
         );
         assert_eq!(window_focus(&tauri::WindowEvent::Destroyed), None);
+    }
+
+    /// PRD #802's audit blocker: a destroyed window ends capture, and an
+    /// ordinary window event does not.
+    ///
+    /// The half of the classification a test can reach.
+    /// `tauri::WindowEvent::CloseRequested` carries a `CloseRequestApi` that
+    /// nothing outside tauri can construct, so it is covered by the `matches!`
+    /// arm and by review rather than by an assertion here; what this pins is
+    /// the direction that would be a bug in either direction — `Destroyed`
+    /// must release, and a focus change must not, because focus changes arrive
+    /// constantly while a user is dictating.
+    #[test]
+    fn a_destroyed_window_ends_capture_and_a_focus_change_does_not() {
+        assert!(window_ends_capture(&tauri::WindowEvent::Destroyed));
+        assert!(!window_ends_capture(&tauri::WindowEvent::Focused(true)));
+        assert!(!window_ends_capture(&tauri::WindowEvent::Focused(false)));
+    }
+
+    /// A [`VoiceState`] whose device is a stub delivering `seconds` of tone and
+    /// whose machine is a stub that grants every inhibit and counts them.
+    ///
+    /// The second value is the stub stream's own flag, set by its `Drop` — the
+    /// only way to assert the DEVICE was released rather than merely that the
+    /// state machine says idle. The third is the wake counters, which outlive
+    /// every hold made from them and are therefore the only way to assert the
+    /// machine was let go of rather than merely that nothing claims otherwise.
+    ///
+    /// **A stub inhibitor rather than the platform one**, and not only for
+    /// determinism: `cargo test-fast` runs this tier dozens of tests at a time
+    /// on a developer's own machine, and a test that took a real logind
+    /// inhibitor would be a test suite that keeps a laptop awake.
+    /// `voice::wake`'s own tests carry the one case that does touch the
+    /// platform.
+    fn stub_voice_state(
+        seconds: f64,
+    ) -> (
+        VoiceState,
+        Arc<std::sync::atomic::AtomicBool>,
+        Arc<voice::WakeCounts>,
+    ) {
+        let source = voice::StubSource::tone(
+            voice::AudioFormat::new(voice::TARGET_SAMPLE_RATE, 1),
+            seconds,
+        );
+        let stopped = source.stopped();
+        let inhibitor = voice::StubInhibitor::new();
+        let counts = inhibitor.counts();
+        (
+            VoiceState {
+                hold: voice::VoiceHold::with_parts(
+                    Arc::new(voice::CaptureSession::new(Arc::new(source))),
+                    Arc::new(voice::WakeLock::new(Arc::new(inhibitor))),
+                ),
+            },
+            stopped,
+            counts,
+        )
+    }
+
+    /// PRD #802 audit blocker: the app exiting releases the microphone.
+    ///
+    /// Recording lifetime is Rust's, and before this the only thing that ended
+    /// a recording on teardown was a React passive-effect cleanup in the
+    /// webview — which a hard reload, a crashed web-content process or a
+    /// destroyed window is not guaranteed to run, let alone to complete its
+    /// asynchronous IPC. This asserts the device is closed and the captured
+    /// audio dropped on the app's own way out, with no webview involved at all.
+    #[tokio::test]
+    async fn app_exit_releases_the_microphone() {
+        let (voice_state, stopped, _counts) = stub_voice_state(1.0);
+        let (opened, _ticket) = voice_state.hold.start().expect("the stub device opens");
+        assert_eq!(opened.state, voice::CaptureState::Recording);
+        assert!(
+            voice_state.hold.status().captured_ms > 0,
+            "the stub delivered its tone, so there is audio to drop"
+        );
+        assert!(!stopped.load(Ordering::Relaxed), "the device is still open");
+
+        release_on_exit(&DesktopState::default(), &voice_state).await;
+
+        let after = voice_state.hold.status();
+        assert_eq!(
+            after.state,
+            voice::CaptureState::Idle,
+            "app exit must leave no recording behind"
+        );
+        assert_eq!(
+            after.captured_ms, 0,
+            "app exit must drop the captured audio"
+        );
+        assert!(
+            stopped.load(Ordering::Relaxed),
+            "app exit must close the device stream"
+        );
+    }
+
+    /// The compounding half of the same blocker: a capped recording.
+    ///
+    /// [`voice::CaptureSession::cap_reached`] releases the device but
+    /// deliberately KEEPS the audio and leaves the session `Recording`, so the
+    /// utterance stays the user's to send or discard. Without a Rust-side
+    /// teardown, a webview that vanished at that moment left up to 960 KB of
+    /// captured speech in the session with nothing able to reach it.
+    #[tokio::test]
+    async fn app_exit_drops_the_audio_a_capped_recording_kept() {
+        let (voice_state, _stopped, _counts) = stub_voice_state(2.0);
+        let (_, ticket) = voice_state.hold.start().expect("the stub device opens");
+        let capped = voice_state.hold.cap_reached(ticket);
+        assert!(capped.capped, "the cap released the device");
+        assert_eq!(
+            capped.state,
+            voice::CaptureState::Recording,
+            "the cap keeps the session recording on purpose"
+        );
+        assert!(capped.captured_ms > 0, "and keeps the audio with it");
+
+        release_on_exit(&DesktopState::default(), &voice_state).await;
+
+        let after = voice_state.hold.status();
+        assert_eq!(after.state, voice::CaptureState::Idle);
+        assert_eq!(
+            after.captured_ms, 0,
+            "app exit must drop the audio the cap kept"
+        );
+    }
+
+    /// PRD #802's sleep work: the app exiting lets the machine sleep again.
+    ///
+    /// The same blocker as the microphone's, one resource over. An inhibit is
+    /// invisible — there is no indicator for it the way the OS shows a live
+    /// microphone — so a stuck one is a laptop that never sleeps again with
+    /// nothing anywhere to explain why, and the user's remedy is a reboot.
+    ///
+    /// This is teardown trigger 4. The other three — `CloseRequested` and
+    /// `Destroyed`, the document being replaced, and the web-content process
+    /// dying on Apple's platforms — reach the same
+    /// [`release_microphone`], which is what
+    /// [`the_only_teardown_call_releases_both`] pins from the other side.
+    #[tokio::test]
+    async fn app_exit_lets_the_machine_sleep_again() {
+        let (voice_state, _stopped, counts) = stub_voice_state(1.0);
+        voice_state.hold.start().expect("the stub device opens");
+        assert!(
+            voice_state.hold.awake_held(),
+            "voice on holds the machine awake"
+        );
+        assert_eq!(counts.outstanding(), 1);
+
+        release_on_exit(&DesktopState::default(), &voice_state).await;
+
+        assert!(
+            !voice_state.hold.awake_held(),
+            "app exit must let the machine sleep"
+        );
+        assert_eq!(
+            counts.outstanding(),
+            0,
+            "and the inhibit must be given back, not merely forgotten"
+        );
+    }
+
+    /// The other three teardown triggers, at the one function they share.
+    ///
+    /// `on_window_event`, `on_page_load` and `on_web_content_process_terminate`
+    /// each call [`release_microphone`] and nothing else, and none of the three
+    /// can be driven from a unit test — they need a built `tauri::App` and a
+    /// real event loop. So what is pinned here is the thing they all depend on:
+    /// that ONE call releases both the device and the machine.
+    ///
+    /// The property that no *fourth* path could release the device without the
+    /// inhibit is not this test's to make, and it is not made by review either
+    /// — `voice::hold`'s privacy makes `CaptureSession::cancel` unreachable
+    /// from this file, so `release` is the only cancel that compiles here.
+    #[test]
+    fn the_only_teardown_call_releases_both() {
+        let (voice_state, stopped, counts) = stub_voice_state(1.0);
+        voice_state.hold.start().expect("the stub device opens");
+        assert!(voice_state.hold.awake_held());
+
+        let after = release_microphone(&voice_state);
+
+        assert_eq!(after.state, voice::CaptureState::Idle);
+        assert!(stopped.load(Ordering::Relaxed), "the device is closed");
+        assert!(!voice_state.hold.awake_held(), "the machine may sleep");
+        assert_eq!(counts.outstanding(), 0);
+    }
+
+    /// A machine that refuses the inhibit gets voice control anyway.
+    ///
+    /// The failure policy, at the level the app sees it: no error crosses the
+    /// IPC boundary, no state is left half-set, and the recording is real. The
+    /// only observable difference is that `awake_held` says `false` — which is
+    /// the honest answer and is reported to nobody, because there is nothing a
+    /// user could do about it from inside this app.
+    #[test]
+    fn a_refused_inhibit_does_not_take_voice_with_it() {
+        let source =
+            voice::StubSource::tone(voice::AudioFormat::new(voice::TARGET_SAMPLE_RATE, 1), 1.0);
+        let voice_state = VoiceState {
+            hold: voice::VoiceHold::with_parts(
+                Arc::new(voice::CaptureSession::new(Arc::new(source))),
+                Arc::new(voice::WakeLock::new(Arc::new(
+                    voice::StubInhibitor::refusing(),
+                ))),
+            ),
+        };
+
+        let (opened, _ticket) = voice_state
+            .hold
+            .start()
+            .expect("a machine that will not stay awake still has a microphone");
+
+        assert_eq!(opened.state, voice::CaptureState::Recording);
+        assert!(
+            voice_status(&voice_state.hold).capture.captured_ms > 0,
+            "the utterance is genuinely being captured"
+        );
+        assert!(!voice_state.hold.awake_held());
+
+        release_microphone(&voice_state);
+        assert_eq!(
+            voice_state.hold.status().state,
+            voice::CaptureState::Idle,
+            "and the ordinary teardown still runs"
+        );
     }
 
     /// A settings save that changed no deck must NOT take the switch path

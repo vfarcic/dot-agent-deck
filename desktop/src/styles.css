@@ -115,6 +115,20 @@
   --rail-width: 74px;
   --drawer-width: 358px;
   --radius: 6px;
+
+  /* PRD #802's reserved voice row. Declared HERE rather than beside `.voice-row`
+     at the foot of this file, and that is load-bearing: `--bottom-rail-height`
+     is overridden by a `:root` rule inside `@media (max-width: 680px)`, media
+     queries add no specificity, and a custom property declared later in source
+     order would win over it unconditionally. See `.voice-row` for what each one
+     is and which surfaces subtract it. */
+  --voice-row-height: 40px;
+  /* The rail's height when it is a BOTTOM bar, which it is only under
+     `max-width: 680px`. Zero everywhere else, so the row sits on the window's
+     own bottom edge. */
+  --bottom-rail-height: 0px;
+  /* What a viewport-anchored surface has to leave alone at the bottom. */
+  --voice-reserved: calc(var(--voice-row-height) + var(--bottom-rail-height));
 }
 
 /* Dark values (PRD #743 M3), delivered twice because both paths are required:
@@ -344,7 +358,10 @@ button:disabled { cursor: not-allowed; opacity: .46; }
 code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "JetBrains Mono", "SFMono-Regular", Consolas, monospace; font-variant-numeric: tabular-nums; }
 
 .control-deck { min-height: 100vh; background: var(--canvas); }
-.deck-main { min-height: 100vh; margin-left: var(--rail-width); transition: margin-right .18s ease; }
+/* `padding-bottom` is the voice row (see `.voice-row`): border-box, so the
+   100vh minimum still holds and the CONTENT box is what shrinks. Not a margin,
+   because the narrow-width rule below owns the margin for the bottom rail. */
+.deck-main { min-height: 100vh; margin-left: var(--rail-width); padding-bottom: var(--voice-row-height); transition: margin-right .18s ease; }
 .control-deck.with-evidence .deck-main { margin-right: var(--drawer-width); }
 
 .rail { position: fixed; z-index: 40; inset: 0 auto 0 0; width: var(--rail-width); padding: 14px 10px; display: flex; flex-direction: column; align-items: center; background: var(--shell); color: var(--shell-ink); border-right: 1px solid var(--shell-line-deep); }
@@ -544,7 +561,9 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .reader-open:hover { color: var(--shell-teal-text-strong); background: var(--shell-teal-surface); }
 /* Outrank the .agent-tabs button span {display:none} tab-label rule. */
 .agent-tabs .reader-open span { display: inline; }
-.reader-overlay { position: fixed; inset: 0; z-index: 80; display: flex; justify-content: center; padding: 3vh 3vw; background: rgb(var(--scrim-rgb) / .74); backdrop-filter: blur(2px); }
+/* The bottom padding is 3vh plus the voice row (see `.voice-row`): the scrim
+   still covers the window, and the reader inside it stops above the row. */
+.reader-overlay { position: fixed; inset: 0; z-index: 80; display: flex; justify-content: center; padding: 3vh 3vw calc(3vh + var(--voice-reserved)); background: rgb(var(--scrim-rgb) / .74); backdrop-filter: blur(2px); }
 .reader-panel { position: relative; width: min(1040px, 100%); display: flex; flex-direction: column; overflow: hidden; border: 1px solid var(--shell-line); border-radius: 12px; background: var(--shell-deep); box-shadow: 0 28px 70px rgb(var(--scrim-rgb) / .55); }
 .reader-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 10px 14px; border-bottom: 1px solid var(--shell-line); background: var(--shell-deep); }
 .reader-title { display: flex; align-items: center; gap: 9px; color: var(--shell-ink); }
@@ -577,7 +596,9 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .agent-footer span:nth-child(2) { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: right; }
 .agent-footer strong { color: var(--shell-teal); font-size: 7px; }
 
-.evidence-drawer { width: var(--drawer-width); position: fixed; z-index: 35; inset: 0 0 0 auto; display: grid; grid-template-rows: 72px 38px minmax(160px, 1fr) auto 30px; border-left: 1px solid var(--line-strong); background: var(--paper); }
+/* The bottom inset is the voice row (see `.voice-row`); this drawer is z-index
+   35 and would otherwise have its last grid row drawn over. */
+.evidence-drawer { width: var(--drawer-width); position: fixed; z-index: 35; inset: 0 0 var(--voice-reserved) auto; display: grid; grid-template-rows: 72px 38px minmax(160px, 1fr) auto 30px; border-left: 1px solid var(--line-strong); background: var(--paper); }
 .evidence-drawer > header { padding: 0 12px; display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid var(--line); }
 .evidence-drawer h2 { margin: 2px 0 0; font-size: 13px; }
 .evidence-drawer > header button, .shortcut-dialog header button { width: 28px; height: 28px; display: grid; place-items: center; border: 1px solid var(--line); border-radius: 3px; background: transparent; cursor: pointer; }
@@ -790,6 +811,13 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
    the reason the rule above gives: it lays out identically in both engines and
    keeps the group's accessible name. */
 .settings-row > .settings-row-label { color: var(--ink); font-size: 13px; font-weight: 650; }
+/* A row that STATES a value instead of offering one (PRD #802 M5). Used where
+   a setting has exactly one legal value today and a `<select>` with one option
+   would imply a choice the user does not have. Sized like a select's own text
+   so a stated row and a chosen row sit on the same baseline, and rendered in
+   `--ink` rather than `--muted` because it is the value, not a hint about one.
+   When the setting gains its other values it becomes an ordinary select row. */
+.settings-value { margin: 0; color: var(--ink); font-size: 10px; }
 .settings-row select { min-width: 96px; height: 28px; padding: 0 7px; border: 1px solid var(--line-strong); border-radius: 5px; color: var(--ink); background: var(--paper); font-size: 10px; }
 .settings-row select:disabled { color: var(--faint); background: var(--paper-sunken); cursor: not-allowed; }
 
@@ -813,6 +841,13 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 /* A port is four digits; a full-width box for it reads as a field that wants a
    sentence. */
 .settings-input.is-narrow { width: 96px; }
+
+/* A credential row's control (PRD #802 M4): the field plus its one or two
+   buttons, as ONE grid item, so the row keeps the 132px label column and two
+   children that `e2e/settings-rows.spec.ts` can measure. */
+.voice-secret { width: 100%; display: flex; align-items: center; gap: 7px; }
+.voice-secret .settings-input { flex: 1 1 auto; }
+.voice-secret .button { flex: 0 0 auto; }
 /* What is wrong with a field. Below the row it belongs to and inside the label
    column's gutter, so it reads as attached to the control rather than as a new
    setting. */
@@ -905,7 +940,9 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .confirm-dialog h2 { margin: 0; font-size: 15px; }
 .confirm-dialog p { margin: 7px auto 16px; max-width: 320px; color: var(--muted); font-size: 9.5px; line-height: 1.5; }
 .confirm-dialog > div:last-child { display: flex; justify-content: center; gap: 7px; }
-.toast { max-width: min(470px, calc(100vw - 30px)); min-height: 42px; padding: 8px 9px; position: fixed; z-index: 120; right: 18px; bottom: 16px; display: grid; grid-template-columns: 18px minmax(0, 1fr) 24px; align-items: center; gap: 5px; border: 1px solid var(--amber-rim); border-radius: 5px; color: var(--amber-ink); background: var(--amber-bright); box-shadow: 0 8px 22px rgb(var(--scrim-rgb) / .13); font-size: 9px; }
+/* Lifted clear of the voice row (see `.voice-row`). It is z-index 120 and would
+   otherwise sit on top of the report text, which is the same corner. */
+.toast { max-width: min(470px, calc(100vw - 30px)); min-height: 42px; padding: 8px 9px; position: fixed; z-index: 120; right: 18px; bottom: calc(var(--voice-reserved) + 16px); display: grid; grid-template-columns: 18px minmax(0, 1fr) 24px; align-items: center; gap: 5px; border: 1px solid var(--amber-rim); border-radius: 5px; color: var(--amber-ink); background: var(--amber-bright); box-shadow: 0 8px 22px rgb(var(--scrim-rgb) / .13); font-size: 9px; }
 .toast button { width: 22px; height: 22px; display: grid; place-items: center; border: 0; background: transparent; cursor: pointer; }
 
 @media (min-width: 1450px) {
@@ -936,7 +973,9 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 }
 
 @media (max-width: 680px) {
-  :root { --rail-width: 0px; }
+  /* The rail is a 54px BOTTOM bar here, so the voice row sits on top of it
+     rather than on the window's edge. See `.voice-row`. */
+  :root { --rail-width: 0px; --bottom-rail-height: 54px; }
   .rail { width: 100%; height: 54px; inset: auto 0 0; padding: 4px 8px; flex-direction: row; border: 0; border-top: 1px solid var(--shell-line-deep); }
   .brand-mark, .rail-bottom { display: none; }
   .rail nav { margin: 0; display: flex; justify-content: space-around; }
@@ -960,7 +999,7 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
   .agent-footer { height: 34px; }
   .agent-instruments { min-height: 46px; }
   .agent-assignment { min-height: 58px; }
-  .evidence-drawer { width: 100%; inset: 0; grid-template-rows: 64px 38px 1fr auto 30px; }
+  .evidence-drawer { width: 100%; inset: 0 0 var(--voice-reserved); grid-template-rows: 64px 38px 1fr auto 30px; }
   .config-sheet, .workflow-sheet, .projects-sheet { width: 100%; }
   .projects-layout { display: flex; flex-direction: column; }
   .project-library { max-height: 185px; border-right: 0; border-bottom: 1px solid var(--line); }
@@ -1215,7 +1254,7 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
    report. `inset: 0` with no margin is what makes the box the window, which is
    what the browser tier measures. Between `.reader-overlay` (80) and
    `.dialog-backdrop` (100): a modal dialog still belongs on top of a pane. */
-.agent-pane-overlay { position: fixed; z-index: 90; inset: 0; margin: 0; display: flex; padding: 14px; background: rgb(var(--scrim-rgb) / .74); }
+.agent-pane-overlay { position: fixed; z-index: 90; inset: 0; margin: 0; display: flex; padding: 14px 14px calc(14px + var(--voice-reserved)); background: rgb(var(--scrim-rgb) / .74); }
 /* Every rule below is keyed off `data-presentation`, the seam M1 put on the
    tile, and every one of them exists to outrank something. The compound
    `.agent-tile[data-presentation="overlay"]` is (0,2,0) rather than the (0,1,0)
@@ -1263,3 +1302,124 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
    hover here rather than the row's background, because a failed row's red
    background already wins over `.overview-row:hover` and would show nothing. */
 .overview-row.is-openable { cursor: pointer; }
+
+/* PRD #802 M6 — the voice surface: ONE RESERVED ROW at the bottom.
+
+   The product owner's own shape: *"a dedicated row at the bottom for the button
+   and, if it's turned on, the text that it hears to the right next to it in the
+   same row that does not overlap anything (including the overlay with the agent
+   enlarged)"*.
+
+   **What it replaces.** The trigger and the report were two independently fixed
+   boxes at z-index 90, the report stacked above the button and growing upward as
+   it filled. Floating means overlapping, and the collision that mattered was the
+   agent pane: that pane is where the user is working, and a sentence describing
+   a navigation was drawn over the terminal they had enlarged to read it. Moving
+   the boxes buys a different collision rather than none, because a floating
+   box's height is its content's and no other element can set room aside for it.
+
+   **A row can, and `--voice-row-height` is the contract.** Every surface below
+   that would otherwise reach the bottom edge subtracts it: `.deck-main` (both
+   screens), `.agent-pane-overlay`, `.reader-overlay`, `.evidence-drawer` and
+   `.toast`. Each of those edits is marked `voice row` where it sits, so a later
+   full-height surface can be checked against this list.
+
+   **Two deliberate exclusions, because the unqualified claim would be false.**
+   `.dialog-backdrop` (z-index 100) and `.sheet-backdrop` still cover this row,
+   and that is correct: they are modal, the voice surface is not exempted from
+   `useInertBackground` for them the way it is for the agent pane, and shrinking
+   them would make a control clickable underneath a modal that is claiming the
+   whole window. And `.rail` is not on the list because it never overlaps the row
+   — at desktop widths the row starts at the rail's right edge, and at the narrow
+   width where the rail becomes a bottom bar the row sits on top of it, which is
+   what `--bottom-rail-height` is for.
+
+   **z-index 95** — above `.agent-pane-overlay` (90) and `.reader-overlay` (80),
+   below `.dialog-backdrop` (100) for the reason above. The row is opaque, so it
+   is the pane's scrim that stops at its top edge rather than the pane's box: the
+   overlay still covers the window, which is what a modal scrim should do, and
+   its CONTENT box stops above this row. */
+.voice-row { position: fixed; z-index: 95; left: var(--rail-width); right: 0; bottom: var(--bottom-rail-height); height: var(--voice-row-height); padding: 0 14px; display: flex; align-items: center; gap: 12px; border-top: 1px solid var(--line-strong); background: var(--paper-strong); }
+/* The left cell. No longer positioned — the row places it — and `flex: 0 0 auto`
+   so a long sentence beside it never shrinks the one control that is always
+   there. */
+.voice-trigger { flex: 0 0 auto; min-height: 26px; padding: 0 11px; display: inline-flex; align-items: center; gap: 6px; border: 1px solid var(--teal-deep); border-radius: 13px; color: var(--on-accent); background: var(--teal); cursor: pointer; font-size: 11px; font-weight: 650; }
+.voice-trigger:hover { background: var(--teal-deep); }
+/* Off is the resting state and reads as one: the control is quiet until it is
+   doing something, and the filled teal above is reserved for "listening". */
+.voice-trigger[aria-pressed="false"] { border-color: var(--line-strong); color: var(--ink); background: var(--paper-strong); }
+.voice-trigger[aria-pressed="false"]:hover { background: var(--paper); }
+.voice-note { flex: 0 0 auto; margin: 0; color: var(--muted); white-space: nowrap; font-size: 9px; }
+/* The right cell: what the microphone heard and what came of it, on the button's
+   own line. It is NOT a dialog and takes no focus — continuous voice means the
+   next utterance arrives without anything being dismissed first.
+
+   `min-width: 0` on both this and the card is what lets the sentences inside
+   them elide instead of pushing the row wider than the window: a flex item's
+   automatic minimum size is its content's, and without this the ellipsis below
+   never engages. */
+.voice-report { flex: 1 1 auto; min-width: 0; display: flex; align-items: center; }
+/* The card, not the region: the live region itself is always mounted so a screen
+   reader is listening before the first sentence lands. It carries no border,
+   background or shadow any more — it is a group inside the row rather than a box
+   over the screen. */
+.voice-report-card { flex: 1 1 auto; min-width: 0; display: flex; align-items: center; gap: 10px; }
+/* One sentence, one element, nothing else inside it: the transcript embedded in
+   it has to reach the DOM exactly as Rust rendered it. Elided rather than
+   wrapped, because the row's height is the reservation other surfaces made and a
+   row that grew would be back to overlapping them; the full text is on `title`,
+   already clamped and scrubbed by `displayText`. */
+.voice-sentence { flex: 0 1 auto; min-width: 0; margin: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--ink); font-size: 11px; }
+/* Never elided and never squeezed: the Undo is a real control, so a long
+   transcript loses characters before this loses the button. `margin-left: auto`
+   pins it to the row's right end while the sentences pack against the button —
+   `flex: 0 1 auto` above is what keeps them at their natural width instead of
+   sharing the row's spare space between them. */
+.voice-outcome-foot { flex: 0 0 auto; margin-left: auto; display: flex; align-items: center; gap: 7px; }
+.voice-cost { color: var(--faint); white-space: nowrap; font-size: 8px; }
+/* PRD #802 — the empty state, in the report cell before the first utterance.
+   Quieter than a sentence and elided the same way, because the row's height is
+   the reservation every other surface made and this must not be what grows it. */
+.voice-hint { flex: 0 1 auto; min-width: 0; margin: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); font-size: 10px; }
+
+/* PRD #802 D7 — the discovery overlay.
+
+   A CHILD of `.voice-row` in the DOM and a `position: fixed` box on screen, and
+   the split is deliberate: the parent carries `VOICE_PEER_PROPS`, so being
+   inside it is what keeps this clickable behind an open agent pane, while
+   `fixed` takes it out of the row's one-line flow entirely. A row 40px high
+   cannot hold a list of every command, which is the whole reason the
+   requirement says overlay.
+
+   z-index 96 — one above `.voice-row` so the list covers the report rather than
+   being cut off by it, and still below `.dialog-backdrop` (100), because a real
+   modal claiming the whole window must cover this too. */
+.voice-help-backdrop { position: fixed; z-index: 96; inset: 0; display: flex; align-items: center; justify-content: center; padding: 24px; background: rgb(var(--scrim-rgb) / .42); }
+/* Bounded rather than sized: the list is as tall as it needs to be until it
+   reaches the viewport, and then it scrolls inside itself. `min()` against
+   `vh` is what stops a long table pushing its own Close button off screen. */
+.voice-help { width: min(680px, 100%); max-height: min(560px, 100%); display: flex; flex-direction: column; border: 1px solid var(--dialog-edge); border-radius: 8px; background: var(--paper); box-shadow: 0 18px 50px rgb(var(--scrim-rgb) / .22); }
+.voice-help-head { flex: 0 0 auto; padding: 13px 16px; display: flex; align-items: center; justify-content: space-between; gap: 12px; border-bottom: 1px solid var(--line); }
+.voice-help-head h2 { margin: 0; font-size: 13px; font-weight: 650; }
+.voice-help-problem { margin: 0; padding: 14px 16px; color: var(--ink-soft); font-size: 11px; }
+/* The scroll region is this and not the panel, so the heading and the Close
+   button stay put while the list moves under them. */
+.voice-help-body { flex: 1 1 auto; min-height: 0; overflow-y: auto; padding: 4px 16px 14px; }
+.voice-help-section { margin-top: 12px; }
+.voice-help-section h3 { margin: 0 0 7px; color: var(--muted); font-size: 9px; font-weight: 650; letter-spacing: .08em; text-transform: uppercase; }
+.voice-help-section ul { margin: 0; padding: 0; list-style: none; display: grid; gap: 9px; }
+.voice-help-section li { display: grid; gap: 3px; }
+.voice-help-section code { justify-self: start; padding: 1px 6px; border-radius: 4px; color: var(--teal-wash-ink); background: var(--teal-wash); font-family: "JetBrains Mono", monospace; font-size: 10px; }
+.voice-help-section p { margin: 0; color: var(--ink-soft); font-size: 11px; line-height: 1.45; }
+/* Dimmed rather than hidden. A command the user cannot say here is still worth
+   knowing exists — that is most of what discovery is for — and the contrast
+   step is what says which half of the list they are reading without a second
+   sentence saying so. */
+.voice-help-section[data-where="elsewhere"] code { color: var(--faint); background: var(--paper-sunken); }
+.voice-help-section[data-where="elsewhere"] p { color: var(--muted); }
+/* PRD #802 D6 — where the microphone is aimed, and the countdown to a send.
+   In the reserved row like every other sentence, and elided like them: a
+   countdown that wrapped would grow the row every time it reached a long agent
+   name. `--amber` rather than the muted ink the hint uses, because this is the
+   one line in the row that says something is ABOUT to happen. */
+.voice-dictation { flex: 0 1 auto; min-width: 0; margin: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--amber-ink); font-size: 11px; font-weight: 600; }

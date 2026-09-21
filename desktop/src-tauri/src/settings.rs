@@ -184,6 +184,8 @@ use dot_agent_deck::remote_tunnel::{
 };
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+use crate::model_service::{ModelId, ServiceUrl, TokenCeiling};
+
 /// Overrides the whole settings path, mirroring `DOT_AGENT_DECK_CONFIG`
 /// (`src/config.rs`). Also the seam every test uses instead of the real
 /// config directory.
@@ -322,11 +324,814 @@ pub struct ZoomSettings {
     pub level: ZoomLevel,
 }
 
+/// The `[voice]` section — PRD #802's tenant, stored here.
+///
+/// # One choice plus two stages, and why the stages are nested
+///
+/// The two things voice does — turn speech into text, turn text into an action
+/// — each need three values: **which** backend, **where** it is, and **which**
+/// model to ask it for. Flattening those into `[voice]` would need
+/// `speech_endpoint` and `commands_endpoint`, and this struct serialises to
+/// both TOML and JSON, so a field name here is a JSON key the frontend reads —
+/// single-word `snake_case` or the two spellings drift. Nesting keeps every
+/// name one word on both sides and puts the two stages in the same shape, which
+/// is what lets the panel render them from one component.
+///
+/// # Why the endpoint and the model became fields at all
+///
+/// They were `const`s until PRD #802's provider-selection work, which
+/// hardwired speech to one hosted service and commands to another. A user could
+/// not know which key to paste, could not use a provider this build did not
+/// pick, and — the reason it mattered most — could not point speech at a
+/// container on their own machine and stop paying for it. The values are
+/// [`ServiceUrl`] and [`ModelId`] rather than `String`s: see
+/// [`crate::model_service`] for what each one refuses, and
+/// `ALLOWED_FIELD_TYPES` for why a `String` was never available.
+///
+/// # What is deliberately NOT here
+///
+/// **No credential, in any form** — that is PRD #803's hard rule and
+/// [`crate::secrets`] is where one goes instead. **Not even a boolean saying
+/// one is stored**, which the rule would have allowed: the panel asks
+/// [`crate::secrets::SecretStore::status`] instead, so the answer comes from
+/// the keychain itself and cannot go stale against it. That also keeps `bool`
+/// off `ALLOWED_FIELD_TYPES`, which is a small win worth having.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct VoiceSettings {
+    pub activation: ActivationMode,
+    pub intent: IntentSettings,
+    pub transcription: TranscriptionSettings,
+}
+
+/// The endpoint the keyless local speech container listens on.
+///
+/// PRD #802 measured this one: `ghcr.io/speaches-ai/speaches:0.9.0-rc.3-cpu`
+/// published on `127.0.0.1:18000`, answering a two-word utterance in a median
+/// of **0.653 s** warm. It speaks the same multipart shape the hosted service
+/// does — `model`, `response_format=json`, `file` — and answers with the same
+/// `text` field, which is why one HTTP backend serves both.
+pub const LOCAL_SPEECH_ENDPOINT: &str = "http://127.0.0.1:18000/v1/audio/transcriptions";
+
+/// The model the local container is asked for.
+///
+/// The smallest useful Whisper build — a 78 MB cache and about 480 MB resident
+/// once loaded, which is what makes "run it on your own laptop" an honest
+/// default rather than a suggestion to buy a GPU.
+pub const LOCAL_SPEECH_MODEL: &str = "Systran/faster-whisper-tiny.en";
+
+/// The container image the unreachable-endpoint sentence tells a user to start.
+///
+/// Pinned to a digest-bearing tag rather than `latest` for the reason any
+/// instruction in a product is pinned: the words have to keep working after the
+/// upstream tag moves, and `0.9.0-rc.3-cpu` is the build PRD #802 measured.
+pub const LOCAL_SPEECH_IMAGE: &str = "ghcr.io/speaches-ai/speaches:0.9.0-rc.3-cpu";
+
+/// Where the keyed speech service is, and which model it is asked for.
+///
+/// OpenAI's transcription endpoint. The panel names the provider so a user
+/// knows which key to paste — which the old `Remote service` label did not.
+pub const HOSTED_SPEECH_ENDPOINT: &str = "https://api.openai.com/v1/audio/transcriptions";
+pub const HOSTED_SPEECH_MODEL: &str = "whisper-1";
+
+/// Where each command protocol's preset provider is, and which model it is
+/// asked for.
+///
+/// Anthropic's Messages endpoint, whose tool-use envelope
+/// [`crate::voice::remote`] speaks. `claude-haiku-4-5` is the measured choice —
+/// a median of 0.91 s against the deleted agent CLI's 3.1–4.7 s, at roughly
+/// $0.0015 an utterance.
+///
+/// **This was the default and is no longer**, which changes nothing about the
+/// measurement: it is still the fastest thing measured here and still 24/24 on
+/// the phrase fixtures. [`IntentBackend`] has why the default moved, and the
+/// reason is not about this model.
+pub const HOSTED_COMMAND_ENDPOINT: &str = "https://api.anthropic.com/v1/messages";
+pub const HOSTED_COMMAND_MODEL: &str = "claude-haiku-4-5";
+
+/// OpenAI's chat-completions endpoint, whose nested `json_schema` envelope
+/// [`crate::voice::openai`] speaks. **The default since PRD #802's one-key
+/// work** — see [`IntentBackend`] for why.
+///
+/// `gpt-5-mini` is now a measured choice rather than a plausible one. Through
+/// the shipped builder and parser against the 24 phrase fixtures, with
+/// [`OPENAI_COMMAND_REASONING_EFFORT`] and the 4096 ceiling:
+///
+/// | configuration | score | median | cost | reasoning tokens |
+/// | --- | ---: | ---: | ---: | ---: |
+/// | `reasoning_effort: "minimal"` | **24/24** | **818 ms** | $0.0073 | 0 |
+/// | provider-default reasoning | 24/24 | 1,778 ms | $0.0161 | 4,416 |
+/// | *`claude-haiku-4-5`, for scale* | *24/24* | *780 ms* | — | — |
+///
+/// So it is level with the Anthropic preset on accuracy, within 40 ms of it on
+/// latency, and reasoning is worth **twice the cost and twice the wall clock**
+/// for no score. `gpt-4.1-mini` was here before the measurement and was never
+/// run against anything; it went rather than being kept as a second untested
+/// coordinate.
+pub const OPENAI_COMMAND_ENDPOINT: &str = "https://api.openai.com/v1/chat/completions";
+pub const OPENAI_COMMAND_MODEL: &str = "gpt-5-mini";
+
+/// The `reasoning_effort` the OpenAI command preset sends, and **only** that
+/// preset.
+///
+/// A routing decision over a closed enum has no reasoning to do, and the
+/// measurement above says so twice over: `minimal` scored the same 24/24 while
+/// spending **zero** reasoning tokens, at half the latency and half the price.
+/// With it the largest response was 28 completion tokens.
+///
+/// # Why it is scoped to the preset and cannot leak
+///
+/// `reasoning_effort` is an **OpenAI-family** parameter, not part of the
+/// `/v1/chat/completions` shape every server implementing that path supports.
+/// A different one may refuse an unknown field outright — the `llama.cpp`
+/// server probed for PRD #802 wanted `chat_template_kwargs` instead — and even
+/// on `api.openai.com` it is not accepted for every model. So it must not
+/// become a field every `openai_compatible` request carries.
+///
+/// [`IntentSettings::reasoning_effort`] is the gate, and it answers `Some` only
+/// when the endpoint **and** the model are both exactly this build's preset —
+/// which is to say, only for the configuration the table above was measured on.
+/// Every edit a user can make moves off it: another provider, a gateway in
+/// front of OpenAI, a server on loopback, or the same endpoint with a different
+/// model. Each of those then gets provider-default reasoning, which is the safe
+/// direction to be wrong in **because** the ceiling is 4096 — the 24/24 row
+/// above is that configuration.
+pub const OPENAI_COMMAND_REASONING_EFFORT: &str = "minimal";
+
+/// The speech stage: which transcriber, where it is, and which model.
+///
+/// Its [`Default`] is the **keyless local container**, which is the product
+/// decision PRD #802's provider work turned on: the feature is try-able on the
+/// day it ships without anyone pasting a credential, and the audio never leaves
+/// the machine. `Speech = off` used to be the default and is gone — a stage
+/// that cannot run is not a setting, it is a missing prerequisite, and the
+/// honest version of it is an unreachable endpoint saying what to start.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TranscriptionSettings {
+    pub backend: TranscriptionBackend,
+    pub endpoint: ServiceUrl,
+    pub model: ModelId,
+}
+
+impl TranscriptionSettings {
+    /// This build's coordinates for one backend.
+    ///
+    /// The preset a user gets when they pick a backend and say nothing else —
+    /// and the reason [`Deserialize`] is written by hand rather than derived
+    /// with `#[serde(default)]`. A derived default fills a **missing endpoint
+    /// from the struct's default**, which is the LOCAL one: a hand-written
+    /// `[voice.transcription]\nbackend = "remote"` would then have authenticated
+    /// against the loopback container, sending a key somewhere that has no
+    /// notion of one. Filling from the *chosen backend* is the only answer that
+    /// cannot be wrong, and it is what the frontend's `normalizeVoiceStage`
+    /// already did.
+    pub fn for_backend(backend: TranscriptionBackend) -> Self {
+        // `expect` on `const`s this file owns, pinned by
+        // `the_preset_service_coordinates_are_valid`. A panic here would be a
+        // build whose own default is unrepresentable, which is a bug to fail
+        // loudly on rather than a state to degrade into.
+        let (endpoint, model) = match backend {
+            TranscriptionBackend::Local => (LOCAL_SPEECH_ENDPOINT, LOCAL_SPEECH_MODEL),
+            TranscriptionBackend::Remote => (HOSTED_SPEECH_ENDPOINT, HOSTED_SPEECH_MODEL),
+        };
+        Self {
+            backend,
+            endpoint: ServiceUrl::parse(endpoint).expect("a valid preset endpoint"),
+            model: ModelId::parse(model).expect("a valid preset model"),
+        }
+    }
+}
+
+impl Default for TranscriptionSettings {
+    fn default() -> Self {
+        Self::for_backend(TranscriptionBackend::default())
+    }
+}
+
+impl<'de> Deserialize<'de> for TranscriptionSettings {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let doc = StageSpec::deserialize(deserializer)?.into_document();
+        let preset = Self::for_backend(doc.backend.unwrap_or_default());
+        let stage = Self {
+            endpoint: doc.endpoint.unwrap_or(preset.endpoint),
+            model: doc.model.unwrap_or(preset.model),
+            backend: preset.backend,
+        };
+        // The pairing the keyless backend IS, enforced where the value is
+        // built rather than where it is used. See [`KEYLESS_OFF_MACHINE`].
+        if stage.backend == TranscriptionBackend::Local && !stage.endpoint.is_loopback() {
+            return Err(serde::de::Error::custom(KEYLESS_OFF_MACHINE));
+        }
+        Ok(stage)
+    }
+}
+
+/// What a keyless backend pointed off this machine is refused with.
+///
+/// [`TranscriptionBackend::Local`] means exactly one thing — *no credential is
+/// sent* — and [`ServiceUrl`] will accept any `https://host`, so the two
+/// together are a pairing nothing else checks: a hand-edited document, or a
+/// panel field typed after the backend was picked, would POST the user's
+/// captured audio to a hosted service with no `Authorization` header and no
+/// sign that anything was wrong. `is_loopback` is what makes
+/// [`crate::voice::transcribe::HttpTranscriber::transport_error`] offer the
+/// docker hint, but the upload happens before that runs — so the pairing has to
+/// be refused at the two places the value comes into being: this deserializer,
+/// which is every route from a document or the webview, and
+/// [`crate::voice::transcribe::HttpTranscriber::keyless`], which is every route
+/// from Rust.
+///
+/// **Refused rather than folded to the loopback preset.** Folding is what the
+/// tokens get, because a token is a name; an endpoint is a destination, and
+/// silently moving one is the mistake
+/// [`tests::a_refused_voice_endpoint_or_model_is_an_error_rather_than_a_fold`]
+/// is written against — from the other direction, but for the same reason. The
+/// refusal costs the user nothing they cannot see: the section defaults to the
+/// keyless loopback preset and the settings surface says the document could not
+/// be read.
+pub const KEYLESS_OFF_MACHINE: &str = "the keyless speech backend sends no credential, so its endpoint must be on this machine — \
+     use a loopback address, or pick the hosted backend under Settings → Voice";
+
+/// One stage as the document may spell it: every key optional.
+///
+/// Shared by both stages because both fill a missing coordinate the same way —
+/// from the backend that was named, never from the struct's own default. The
+/// generic parameter is the backend enum, so each stage keeps its own closed
+/// token set and its own folding deserializer.
+///
+/// Unknown keys are ignored, which is this schema's rule everywhere: a document
+/// written by a newer build is not a malformed one.
+#[derive(Deserialize)]
+#[serde(default, bound = "B: Default + Deserialize<'de>")]
+struct StageDocument<B> {
+    backend: Option<B>,
+    endpoint: Option<ServiceUrl>,
+    model: Option<ModelId>,
+    /// The answer ceiling, which **only the command stage reads**.
+    ///
+    /// It is declared on the shared document rather than on a second one
+    /// because the two stages differ in this one key and nothing else, and a
+    /// parallel `IntentDocument`/`IntentSpec` pair would be two more places for
+    /// the bare-token migration below to be forgotten. What it costs is that
+    /// `[voice.transcription]` also *parses* the key: an out-of-range value
+    /// there is refused rather than ignored, which is the direction to err in —
+    /// a sentence naming the bound beats silence about a line the user meant to
+    /// have an effect. A well-formed one there is read and dropped, exactly as
+    /// any unknown key is.
+    max_tokens: Option<TokenCeiling>,
+}
+
+impl<B> Default for StageDocument<B> {
+    fn default() -> Self {
+        Self {
+            backend: None,
+            endpoint: None,
+            model: None,
+            max_tokens: None,
+        }
+    }
+}
+
+/// One stage as a document may spell it: a table, or the bare token the schema
+/// this one replaced wrote.
+///
+/// # The migration this exists for
+///
+/// `[voice]` held three scalars before PRD #802's provider work —
+/// `transcription = "off"`, `intent = "claude"`, `activation = "toggle"` — and
+/// two of them became tables. (Both of those backend names have since been
+/// deleted as well, which costs the migration nothing: a token names a backend,
+/// and an unknown one folds to the default.) A document written by that build therefore
+/// supplies a **string where a table is expected**, which is a *type* error and
+/// not an unknown token: [`VoiceToken::from_str_lossy`]'s folding never gets a
+/// look in, and `#[serde(default)]` does not fire for a value that is present
+/// and wrong. `toml_edit::de::from_str` fails on the WHOLE document, and what
+/// that used to cost was the whole document — the user's `[endpoints]`, their
+/// appearance and their zoom all read as defaults because of a stale voice
+/// token. [`load_document`]'s per-section recovery is the other half of that
+/// fix; this half is what stops the document failing at all.
+///
+/// # A token means "this backend, and say nothing else"
+///
+/// Which is exactly what [`TranscriptionSettings::for_backend`] answers, so the
+/// old value lands on that backend's current coordinates rather than on a
+/// coordinate the old schema never had. `transcription = "off"` names a backend
+/// this build deleted, so it folds to the default — the keyless local container
+/// — through the same [`VoiceToken`] path an unknown token takes, which is the
+/// honest home for it: the stage that used to do nothing now works and needs no
+/// key.
+///
+/// **Not `#[serde(untagged)]`**, which would express the same two shapes in one
+/// attribute. Untagged buffers the input into `serde::__private::de::Content`
+/// before trying either variant, and that buffer has no source span — so a
+/// refused endpoint would report `an unreported position` instead of the line
+/// to open, and the reported error would be *data did not match any variant*
+/// rather than the rule that was broken. [`load_document`]'s locator is the
+/// only thing the settings surface can say about a bad document, so it is not
+/// something to spend on an attribute.
+enum StageSpec<B> {
+    Token(B),
+    Table(StageDocument<B>),
+}
+
+impl<B> StageSpec<B> {
+    /// Both shapes as the one the stages read.
+    fn into_document(self) -> StageDocument<B> {
+        match self {
+            Self::Token(backend) => StageDocument {
+                backend: Some(backend),
+                endpoint: None,
+                model: None,
+                max_tokens: None,
+            },
+            Self::Table(document) => document,
+        }
+    }
+}
+
+impl<'de, B: Default + Deserialize<'de>> Deserialize<'de> for StageSpec<B> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        // `deserialize_any` rather than a typed hint, because which of the two
+        // shapes arrived is precisely what is not known. Both formats this
+        // document crosses are self-describing — TOML on disk, JSON over the
+        // IPC seam — so there is no format for which this is unsupported.
+        deserializer.deserialize_any(StageSpecVisitor(std::marker::PhantomData))
+    }
+}
+
+struct StageSpecVisitor<B>(std::marker::PhantomData<B>);
+
+impl<'de, B: Default + Deserialize<'de>> serde::de::Visitor<'de> for StageSpecVisitor<B> {
+    type Value = StageSpec<B>;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("a voice stage table, or the bare backend token an older document wrote")
+    }
+
+    fn visit_str<E: serde::de::Error>(self, raw: &str) -> Result<Self::Value, E> {
+        // Through `B`'s own `Deserialize` rather than a parse of its own, so the
+        // token keeps the length bound and the folding
+        // [`VoiceTokenVisitor`] applies everywhere else.
+        B::deserialize(serde::de::value::StrDeserializer::new(raw)).map(StageSpec::Token)
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, map: A) -> Result<Self::Value, A::Error> {
+        StageDocument::deserialize(serde::de::value::MapAccessDeserializer::new(map))
+            .map(StageSpec::Table)
+    }
+}
+
+/// The command stage: which resolver, where it is, which model, and how much
+/// answer.
+///
+/// Its [`Default`] is the **OpenAI** preset, which is the one asymmetry between
+/// the two stages: speech has a keyless default ([`TranscriptionSettings`]) and
+/// commands does not, because PRD #802 measured local intent twice and it was
+/// not good enough — [`IntentBackend`] has the numbers, and has why the default
+/// provider is the one whose key also runs the speech stage. The endpoint and
+/// the model are fields rather than constants so the key the user pastes is one
+/// they chose the provider for.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct IntentSettings {
+    pub backend: IntentBackend,
+    pub endpoint: ServiceUrl,
+    pub model: ModelId,
+    /// How much answer one utterance may cost, reasoning included.
+    ///
+    /// A field rather than a constant because the constant was **wrong for a
+    /// user-chosen endpoint**, which is what the provider work made this. 256
+    /// was sized from the Anthropic preset's 33–58-token answers and is not a
+    /// ceiling any reasoning model can write under: the reasoning is spent
+    /// first and counts against the same budget, so the reply comes back
+    /// truncated with nothing in it. Measured on `gpt-5-mini` at 256 against
+    /// the 24 phrase fixtures — **18/24**, every failure having spent exactly
+    /// 256 completion tokens on reasoning alone. See
+    /// [`crate::model_service::DEFAULT_TOKEN_CEILING`] for why the replacement
+    /// is 4096 and not 1024.
+    ///
+    /// The speech stage has no counterpart: a transcription is as long as the
+    /// audio was, and no bound this side could set would be about anything the
+    /// user chose.
+    pub max_tokens: TokenCeiling,
+}
+
+impl IntentSettings {
+    /// This build's coordinates for one backend — [`TranscriptionSettings::for_backend`]'s
+    /// counterpart.
+    ///
+    /// One arm, matched rather than returned unconditionally, for
+    /// [`crate::voice::resolver_for`]'s reason: a variant added without a
+    /// preset should be a compile error, not a backend that comes up pointing
+    /// at another backend's endpoint.
+    pub fn for_backend(backend: IntentBackend) -> Self {
+        let (endpoint, model) = match backend {
+            IntentBackend::Anthropic => (HOSTED_COMMAND_ENDPOINT, HOSTED_COMMAND_MODEL),
+            IntentBackend::OpenaiCompatible => (OPENAI_COMMAND_ENDPOINT, OPENAI_COMMAND_MODEL),
+        };
+        Self {
+            backend,
+            endpoint: ServiceUrl::parse(endpoint).expect("a valid preset endpoint"),
+            model: ModelId::parse(model).expect("a valid preset model"),
+            // One number for both dialects and both presets. It is a CEILING
+            // and not a reservation — an answer that needs 30 tokens costs 30
+            // whatever this says — so there is nothing to gain by tuning it per
+            // preset and something to lose: a per-preset ceiling is a number
+            // that stops being right the moment the user edits the model.
+            max_tokens: TokenCeiling::default(),
+        }
+    }
+}
+
+impl IntentSettings {
+    /// The `reasoning_effort` this build sends with a command request, or
+    /// `None` for every configuration that is not this build's measured OpenAI
+    /// preset.
+    ///
+    /// **This is the whole scope of that parameter**, and the reason it is a
+    /// derived answer rather than a stored field: `reasoning_effort` is an
+    /// OpenAI-family parameter, so sending it to an arbitrary
+    /// `openai_compatible` server is a 400 waiting to happen, and sending it to
+    /// `api.openai.com` with a model that does not take it is the same. What
+    /// makes it safe is that it is keyed on the exact coordinates it was
+    /// measured against: the endpoint AND the model must both still be the
+    /// preset's. A user who changes either — to another provider, to a gateway,
+    /// to a server on loopback, or to a different model at the same endpoint —
+    /// gets `None` and the provider's own default reasoning, which fits under
+    /// the 4096 ceiling (see [`OPENAI_COMMAND_REASONING_EFFORT`]).
+    ///
+    /// The backend is checked too, so this is safe to call on any value: the
+    /// Anthropic dialect has no such parameter and
+    /// [`crate::voice::remote::Protocol`] gives it nowhere to put one.
+    pub fn reasoning_effort(&self) -> Option<&'static str> {
+        let preset = Self::for_backend(IntentBackend::OpenaiCompatible);
+        (self.backend == IntentBackend::OpenaiCompatible
+            && self.endpoint == preset.endpoint
+            && self.model == preset.model)
+            .then_some(OPENAI_COMMAND_REASONING_EFFORT)
+    }
+}
+
+impl Default for IntentSettings {
+    fn default() -> Self {
+        Self::for_backend(IntentBackend::default())
+    }
+}
+
+impl<'de> Deserialize<'de> for IntentSettings {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let doc = StageSpec::deserialize(deserializer)?.into_document();
+        let preset = Self::for_backend(doc.backend.unwrap_or_default());
+        Ok(Self {
+            endpoint: doc.endpoint.unwrap_or(preset.endpoint),
+            model: doc.model.unwrap_or(preset.model),
+            max_tokens: doc.max_tokens.unwrap_or(preset.max_tokens),
+            backend: preset.backend,
+        })
+    }
+}
+
+/// The longest `[voice]` token this build will accept, on either side.
+///
+/// The tokens are at most eight bytes today. 64 leaves room for a backend name
+/// a future build invents while making a payload-shaped value impossible — the
+/// same number and the same reasoning as [`MAX_APPEARANCE_TOKEN_BYTES`], and
+/// the bound is what stops a compromised webview having a megabyte allocated
+/// and lowercased before anything looks at it.
+pub const MAX_VOICE_TOKEN_BYTES: usize = 64;
+
+/// A settings value stored as one lowercase token, folding an unknown token to
+/// the default.
+///
+/// [`AppearanceMode`] established this shape and spells the whole of it out by
+/// hand; three more copies of that visitor would be three more places for the
+/// length bound to be forgotten, so the `[voice]` enums share one. It is
+/// deliberately a trait rather than a macro: the guard in
+/// `xtask/linkage-check/src/desktop_settings_secrets.rs` reads this file as
+/// **text**, one field per line, and a macro that generated settings structs
+/// would be invisible to it. Nothing here generates a struct — only the
+/// serde plumbing for an enum — but keeping to what a text scan can read is a
+/// property of this file worth not spending.
+///
+/// **An unknown token is not an error**, for [`AppearanceMode::from_str_lossy`]'s
+/// reason exactly: a document written by a newer build may name a backend this
+/// one has never heard of, and losing the whole document over one unreadable
+/// field is the opposite of the unknown-key tolerance the rest of the schema is
+/// built for. An **over-length** token is a different thing — a malformed
+/// document rather than an unknown value — and is an error.
+trait VoiceToken: Copy + Default {
+    /// Every token this build knows, for the error message and for the tests.
+    const TOKENS: &'static [&'static str];
+    /// What the deserializer says it expected.
+    const LABEL: &'static str;
+
+    /// The exact token written to TOML and JSON.
+    fn as_str(self) -> &'static str;
+
+    /// Parse a stored token, falling back to the default.
+    fn from_str_lossy(raw: &str) -> Self;
+}
+
+/// [`VoiceToken`]'s visitor: length first, then the folding parse.
+///
+/// The order is the point, and it is [`AppearanceModeVisitor`]'s: `from_str_lossy`
+/// trims and lowercases, which allocates a copy of whatever it was handed, so
+/// the bound has to be judged on the borrowed input before anything allocates.
+struct VoiceTokenVisitor<T>(std::marker::PhantomData<T>);
+
+impl<T: VoiceToken> serde::de::Visitor<'_> for VoiceTokenVisitor<T> {
+    type Value = T;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} of at most {MAX_VOICE_TOKEN_BYTES} bytes, one of {}",
+            T::LABEL,
+            T::TOKENS.join(", ")
+        )
+    }
+
+    fn visit_str<E: serde::de::Error>(self, raw: &str) -> Result<T, E> {
+        if raw.len() > MAX_VOICE_TOKEN_BYTES {
+            return Err(E::custom(format!(
+                "{} is at most {MAX_VOICE_TOKEN_BYTES} bytes; got {}",
+                T::LABEL,
+                raw.len()
+            )));
+        }
+        Ok(T::from_str_lossy(raw))
+    }
+}
+
+/// Which `Transcriber` turns speech into text (PRD #802 M7).
+///
+/// # `Off` was here and is GONE, deliberately
+///
+/// It was the default, and the doc comment under it called that a product
+/// statement: transcription was the one stage with no no-key trick, so the
+/// panel said what to add where the user met it. **The premise stopped being
+/// true.** PRD #802's provider work measured a keyless speech container
+/// answering in 0.653 s on loopback, which is the no-key trick the paragraph
+/// said did not exist — so the honest default is a stage that works, and
+/// `Off` became a setting whose whole function was to make the feature do
+/// nothing. A user who wants that closes the panel.
+///
+/// What replaced its one genuine job — telling somebody what to do when speech
+/// cannot run — is [`crate::voice::transcribe`]'s unreachable-endpoint
+/// sentence, which names the container to start rather than a setting to
+/// change.
+///
+/// # The two variants differ in ONE thing: whether a key is sent
+///
+/// Both are HTTP to a [`ServiceUrl`], both speak the same multipart request,
+/// both read the same `text` field back. [`Self::Local`] sends no
+/// `Authorization` header and reads no keychain; [`Self::Remote`] does both.
+/// That is the whole of it, which is why one backend implementation serves
+/// them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum TranscriptionBackend {
+    /// A speech service on this machine, reached over loopback with no
+    /// credential at all. The default.
+    #[default]
+    Local,
+    /// A hosted speech service. Its credential lives in
+    /// [`crate::secrets::SecretId::VoiceTranscription`].
+    Remote,
+}
+
+impl VoiceToken for TranscriptionBackend {
+    const TOKENS: &'static [&'static str] = &["local", "remote"];
+    const LABEL: &'static str = "a transcription backend";
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Local => "local",
+            Self::Remote => "remote",
+        }
+    }
+
+    fn from_str_lossy(raw: &str) -> Self {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "remote" => Self::Remote,
+            _ => Self::default(),
+        }
+    }
+}
+
+/// Which `IntentResolver` turns a transcript into an action (PRD #802 M5).
+///
+/// # The default is OpenAI so that ONE key runs the whole feature
+///
+/// Both stages of voice can be hosted, and Speech's hosted option is OpenAI's
+/// `whisper-1`. While Commands defaulted to Anthropic, going hosted on both
+/// meant two vendors, two accounts and two keys pasted into one panel — for a
+/// feature whose whole pitch is that it works the moment you turn it on.
+/// Defaulting Commands to OpenAI closes that: **one OpenAI key runs both
+/// stages**, or an Anthropic key if the user prefers that provider for
+/// Commands, or no key at all for Speech if they run the local container.
+///
+/// **It cost nothing measurable, which is what made it available.** The switch
+/// waited on `gpt-5-mini` being measured through the shipped builder and parser
+/// against the 24 phrase fixtures: 24/24 at an 818 ms median, against
+/// `claude-haiku-4-5`'s 24/24 at 780 ms — level on accuracy, 38 ms apart on
+/// latency. [`OPENAI_COMMAND_MODEL`] has the table, including what
+/// [`OPENAI_COMMAND_REASONING_EFFORT`] is worth.
+///
+/// **An earlier sweep scored 18/24 and that was OUR defect, not the model's.**
+/// The answer ceiling was a hardwired 256, `max_completion_tokens` counts
+/// reasoning tokens, and all six failures had spent exactly 256 of them
+/// thinking — `finish_reason: "length"`, nothing written. That is fixed
+/// separately ([`IntentSettings::max_tokens`]) because it made the generic
+/// `openai_compatible` path unusable with any reasoning model, whoever ships
+/// it; the default would have been wrong to move on the strength of a number
+/// our own constant produced.
+///
+/// **[`Self::Anthropic`] is not deprecated and did not get worse.** Only the
+/// default moved. A document naming it keeps it, `remote` maps to it
+/// explicitly, and it remains the fastest thing measured here.
+///
+/// **Commands is API-ONLY, and both variants are protocol dialects because of
+/// it.** The enum names a *wire shape* — Anthropic Messages or OpenAI
+/// chat-completions — and never an executor, because the one executor it held
+/// is gone. M5 shipped two backends of a different kind: one keyed HTTP
+/// request, and an agent-CLI backend that spawned the pre-authenticated
+/// `claude` on the user's machine — no key of the app's own, no download, and
+/// the default precisely because of that. PRD #802's provider work removed the
+/// subprocess one, and what remained split into the two variants below. Two
+/// reasons it went, and the first is the product one:
+///
+/// - **A stage that spends a credential has to let the user say whose.** The
+///   agent CLI is one vendor's, chosen by this build, and an app cannot assume
+///   everyone uses the provider it picked. Once Commands needs a key at all,
+///   the honest shape is an endpoint, a model and a key the user chooses — and
+///   a backend that is a *subprocess* has none of those.
+/// - **It was the most security-expensive code in the feature.** It handed a
+///   general-purpose coding agent a prompt built partly from untrusted input,
+///   so containing it took seven CLI flags, absolute-path resolution, an
+///   app-owned working directory, an allowlisted environment, process-group
+///   teardown and a `Drop` guard — all of which had to keep working against
+///   another program's flag set. `opencode` had already been withdrawn on the
+///   same ground (below); `claude` went with the provider work.
+///
+/// The cost to a user who had picked it is **one re-pick**, the same as the
+/// `opencode` withdrawal cost: [`Self::from_str_lossy`] folds an unknown token
+/// to the default, so `intent = "claude"` left in a document loads as
+/// [`Self::OpenaiCompatible`] and the rest of the document survives. That
+/// folding is the whole reason a closed enum was the right shape here.
+///
+/// **The pre-provider-work `intent = "remote"` is the one token that is NOT
+/// folded**, and it used to be the one that needed folding least. It named the
+/// Anthropic API, so while Anthropic was the default the fold landed where the
+/// user already was; with the default on OpenAI it would land somewhere else
+/// entirely, and the user's stored `SecretId::VoiceIntent` is an Anthropic key.
+/// It is mapped explicitly instead — see [`Self::from_str_lossy`] for what that
+/// costs and what it prevents.
+///
+/// **A local model is reachable and is not a variant.** Both variants are HTTP
+/// to a [`ServiceUrl`], so pointing either at a server on this machine is the
+/// same code path. It ships as no preset and is recommended nowhere, because
+/// PRD #802 measured local intent twice against the 24 phrase fixtures and it
+/// was not good enough: a 1.5B chat model scored 20/24, turning *"what time is
+/// it?"* into `open_agent` — the refusal the PRD calls most of the safety — and
+/// a 34 MB embedding classifier held two false positives no threshold repairs.
+///
+/// # `opencode` was here and was WITHDRAWN, deliberately
+///
+/// PRD #802 M5 shipped an `Opencode` variant driving `opencode run --pure`, and
+/// the landed-work security audit took it out again. The reason is specific and
+/// is not "we did not get round to measuring it": the agent-CLI backend handed a
+/// general-purpose coding agent a prompt built partly from **untrusted** input,
+/// so the child had to be containable — no tools, no hooks, no MCP, no project
+/// configuration, no session written to disk. `claude` had a flag for every one
+/// of those. `opencode run` has no no-tools equivalent and no no-persistence
+/// option, and its `run` was confirmed locally to write a resumable session
+/// containing the utterance. An uncontainable subprocess executor is not
+/// something to ship in a feature that is on by default, so the variant went
+/// rather than being documented as best-effort. The backend both variants drove
+/// is now gone as well, which makes this history rather than policy — and it is
+/// kept because it is the argument that says what a future subprocess backend
+/// would have to prove.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum IntentBackend {
+    /// Anthropic Messages: one forced tool call with `strict: true`, the answer
+    /// in a `tool_use` block. The shape PRD #802 measured first, and the
+    /// default until the one-key work; still 24/24 and still the fastest thing
+    /// measured here.
+    Anthropic,
+    /// OpenAI chat-completions: a nested `json_schema` response format with
+    /// `strict: true`. The dialect most other providers — and `llama.cpp`'s
+    /// server — also answer, which is what makes the choice a real one, and
+    /// **the default** for the reason above.
+    #[default]
+    OpenaiCompatible,
+}
+
+impl VoiceToken for IntentBackend {
+    const TOKENS: &'static [&'static str] = &["anthropic", "openai_compatible"];
+    const LABEL: &'static str = "an intent backend";
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Anthropic => "anthropic",
+            Self::OpenaiCompatible => "openai_compatible",
+        }
+    }
+
+    fn from_str_lossy(raw: &str) -> Self {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "openai_compatible" => Self::OpenaiCompatible,
+            "anthropic" => Self::Anthropic,
+            // `remote` is the pre-provider-work spelling of the Anthropic
+            // backend, and it is mapped EXPLICITLY rather than folded. Until
+            // the default moved it folded to Anthropic by luck, and the doc
+            // comment said as much; now the fold would land on OpenAI, and the
+            // cost of that is not a re-pick. A document saying `remote` belongs
+            // to a user whose key under `SecretId::VoiceIntent` is an
+            // **Anthropic** key, so the next utterance would put it in an
+            // `Authorization` header addressed to `api.openai.com`. That is a
+            // credential handed to a third party for a 401, silently, and it
+            // costs one match arm to not do.
+            "remote" => Self::Anthropic,
+            // Everything else folds, which is what the withdrawn agent-CLI
+            // tokens (`claude`, `opencode`) land on. Those named a
+            // pre-authenticated CLI and never an app-owned key, so there is no
+            // credential to misdirect and the cost is the one re-pick their
+            // withdrawal always carried.
+            _ => Self::default(),
+        }
+    }
+}
+
+/// How the microphone is started and stopped (PRD #802 M7).
+///
+/// **One variant today, and that is the truthful shape rather than an
+/// oversight.** PRD #802 ships one activation mode — press once to start, press
+/// once to stop — and puts hold-to-talk and always-on-with-VAD in D4, waiting
+/// on this one being used enough to say what the other two are worth. Listing
+/// them here before an adapter exists would let a user select a mode the app
+/// cannot honour.
+///
+/// **The panel stopped rendering it, and the field stayed.** A row that states
+/// a single mode nobody can change is a line of settings prose earning its
+/// space back in nothing, so PRD #802's provider work took it out; D4 is what
+/// brings a control here, and it wants the stored value to exist by then. The
+/// document is where the choice belongs and adding a section is the expensive
+/// half — adding a variant to one is a line.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ActivationMode {
+    /// Press once to start listening, press once to stop.
+    #[default]
+    Toggle,
+}
+
+impl VoiceToken for ActivationMode {
+    const TOKENS: &'static [&'static str] = &["toggle"];
+    const LABEL: &'static str = "an activation mode";
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Toggle => "toggle",
+        }
+    }
+
+    fn from_str_lossy(_raw: &str) -> Self {
+        Self::default()
+    }
+}
+
+macro_rules! voice_token_serde {
+    ($($ty:ty),+ $(,)?) => {$(
+        impl $ty {
+            /// The exact token written to TOML and JSON.
+            pub fn as_token(self) -> &'static str {
+                <Self as VoiceToken>::as_str(self)
+            }
+        }
+
+        impl Serialize for $ty {
+            fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                serializer.serialize_str(self.as_token())
+            }
+        }
+
+        impl<'de> Deserialize<'de> for $ty {
+            fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+                deserializer.deserialize_str(VoiceTokenVisitor::<Self>(std::marker::PhantomData))
+            }
+        }
+    )+};
+}
+
+// Three identical serde impls, written once. The macro generates NO struct and
+// NO field — see [`VoiceToken`] for why that boundary matters to the
+// linkage-check scanner that reads this file as text.
+voice_token_serde!(ActivationMode, IntentBackend, TranscriptionBackend);
+
 /// The whole settings document.
 ///
 /// Deliberately carries only the sections that have a tenant. A container that
-/// grows opinions about its contents blocks its dependents, so #802's voice
-/// backends add their own section when they land — it is not pre-created here.
+/// grows opinions about its contents blocks its dependents, which is why
+/// #802's `[voice]` section arrived with #802's own panel rather than being
+/// pre-created here for it.
 ///
 /// **No `Eq`**, and that is [`ZoomLevel`]'s doing rather than an oversight: it
 /// wraps an `f64`, which is `PartialEq` but not `Eq` because `NaN != NaN`.
@@ -341,6 +1146,27 @@ pub struct DesktopSettings {
     /// *empty* — see [`EndpointSettings`] for why that distinction is what
     /// stops a webview deleting decks it cannot render.**
     pub endpoints: Option<EndpointSettings>,
+    /// PRD #802's tenant. **An `Option`, for `endpoints`' reason rather than
+    /// for a weaker version of it.**
+    ///
+    /// `desktop_set_settings` takes the whole document from the webview, and
+    /// [`merged_document`] makes the decoded struct authoritative over the keys
+    /// it owns. So a plain `VoiceSettings` would arrive as the *default* from
+    /// any client that did not send one, and the merge would write that default
+    /// over a choice the user had made. `None` makes "I am not telling you
+    /// about this section" representable, TOML omits it, and the merge leaves
+    /// the file alone.
+    ///
+    /// The section's panel ships in the same commit, so the frontend does
+    /// round-trip it — [`normalizeDesktopSettings`] rebuilds it field by field
+    /// rather than defaulting it — and the `Option` is the belt beside that
+    /// brace. What it costs is that a reader of this type has to materialise
+    /// defaults for display, which for now is the webview's job alone: nothing
+    /// under `src/` reads this section yet, and M5's backends are what will.
+    ///
+    /// [`merged_document`]: fn@merged_document
+    /// [`normalizeDesktopSettings`]: https://github.com/vfarcic/dot-agent-deck/blob/main/desktop/src/lib/bridge.ts
+    pub voice: Option<VoiceSettings>,
     pub zoom: ZoomSettings,
 }
 
@@ -350,6 +1176,7 @@ impl Default for DesktopSettings {
             version: SETTINGS_VERSION,
             appearance: AppearanceSettings::default(),
             endpoints: None,
+            voice: None,
             zoom: ZoomSettings::default(),
         }
     }
@@ -1801,12 +2628,116 @@ pub fn load_document(path: &Path) -> (DesktopSettings, Option<SettingsDocumentPr
         Ok(Some(contents)) => match toml_edit::de::from_str(&contents) {
             Ok(settings) => (settings, None),
             Err(error) => (
-                DesktopSettings::default(),
+                sections_this_build_can_read(&contents),
                 Some(unreadable_document_problem(path, &contents, &error)),
             ),
         },
         Err(error) => (DesktopSettings::default(), Some(error.into())),
     }
+}
+
+/// Everything in `contents` this build can read, with the parts it cannot
+/// dropped to their defaults.
+///
+/// # Why a whole-document failure is not a whole-document answer
+///
+/// The document is one TOML file holding several unrelated tenants, and
+/// `toml_edit::de::from_str` is all-or-nothing: one value it refuses and the
+/// *struct* fails, so the app came up with the user's `[endpoints]` — their
+/// remote decks — their appearance and their zoom all reading as defaults.
+/// That is a wide blast radius for a stale `[voice]` token, and it was reached
+/// by two ordinary routes rather than by a corrupted file: a document written
+/// by the build before PRD #802's provider work (see [`StageSpec`], which is
+/// what stops that one failing at all now), and any value a type refuses —
+/// a hand-typed non-loopback `http` endpoint, which [`ServiceUrl`] exists to
+/// reject.
+///
+/// Nothing was ever lost from the file itself: [`save_to`] re-reads and refuses
+/// to publish defaults over a document it cannot parse (issue #1072). What was
+/// lost was the session — the decks were not there to talk to.
+///
+/// # Section granularity, and deliberately no finer
+///
+/// Each top-level key is judged alone, and a section that fails as a whole has
+/// its own children judged the same way; a key that fails at that point takes
+/// its whole subtree with it. The recursion stops there **on purpose**. Pruning
+/// a single refused field would leave its siblings behind, and for a voice
+/// stage that is the one outcome the hand-written
+/// [`TranscriptionSettings::deserialize`] exists to prevent: a surviving
+/// `backend = "remote"` beside a dropped `endpoint` fills the endpoint from the
+/// *hosted* preset, which is a user's audio going somewhere they did not write.
+/// Dropping the stage instead lands on [`TranscriptionSettings::default`] —
+/// keyless, on loopback — which is the safe direction to fail in.
+///
+/// The reported [`SettingsDocumentProblem`] is unchanged either way: the user is
+/// told the document could not be read and where, whatever was salvaged from it.
+fn sections_this_build_can_read(contents: &str) -> DesktopSettings {
+    // A document that does not parse as TOML at all has no sections to keep —
+    // the failure is the syntax, not a value, and there is nothing to walk.
+    let Ok(mut document) = contents.parse::<toml_edit::DocumentMut>() else {
+        return DesktopSettings::default();
+    };
+    for key in document
+        .iter()
+        .map(|(key, _)| key.to_string())
+        .collect::<Vec<_>>()
+    {
+        if document
+            .get(&key)
+            .is_some_and(|item| reads_as_settings(&key, item))
+        {
+            continue;
+        }
+        for child in document
+            .get(&key)
+            .and_then(toml_edit::Item::as_table)
+            .map(|table| table.iter().map(|(child, _)| child.to_string()).collect())
+            .unwrap_or_else(Vec::new)
+        {
+            let readable = document
+                .get(&key)
+                .and_then(toml_edit::Item::as_table)
+                .and_then(|table| table.get(&child))
+                .is_some_and(|value| {
+                    let mut alone = toml_edit::Table::new();
+                    alone.insert(&child, value.clone());
+                    reads_as_settings(&key, &toml_edit::Item::Table(alone))
+                });
+            if !readable
+                && let Some(table) = document
+                    .get_mut(&key)
+                    .and_then(toml_edit::Item::as_table_mut)
+            {
+                table.remove(&child);
+            }
+        }
+        let emptied = document
+            .get(&key)
+            .and_then(toml_edit::Item::as_table)
+            .is_none_or(toml_edit::Table::is_empty);
+        if emptied {
+            document.remove(&key);
+        }
+    }
+    // Pruned in place rather than rebuilt key by key, so what is handed back to
+    // the parser is the user's own bytes minus the refused ones — no cloned
+    // decor, no re-ordered tables, nothing this function had to render itself.
+    // The `unwrap_or_default` is the residual: a failure here means a refusal
+    // that is not attributable to any one top-level key, and defaults are then
+    // the only answer left.
+    toml_edit::de::from_str(&document.to_string()).unwrap_or_default()
+}
+
+/// Whether `key` alone, carrying `item`, reads as a settings document.
+///
+/// Every field of [`DesktopSettings`] is `#[serde(default)]` and there is no
+/// `deny_unknown_fields`, so a one-key document exercises exactly that key's
+/// own types and says nothing about any other — which is what makes judging
+/// them one at a time sound.
+fn reads_as_settings(key: &str, item: &toml_edit::Item) -> bool {
+    let mut probe = toml_edit::DocumentMut::new();
+    probe[key] = item.clone();
+    toml_edit::de::from_str::<DesktopSettings>(&probe.to_string()).is_ok()
 }
 
 /// The one place a document problem reaches the app's own log.
@@ -2264,9 +3195,25 @@ fn merge_tables(
             continue;
         }
 
-        if !same_data(existing, &item) {
-            replace_item(existing, item);
+        // A key whose SHAPE moves from a value to a `[section]` is re-inserted
+        // rather than replaced in place. Only the rendering differs, and only
+        // in one place — a table's header is spelled from the key WITH its
+        // decor, so `intent = "remote"` becoming a table renders as
+        // `[voice.intent ]`, carrying the space that used to sit before the
+        // `=`. Valid TOML that re-reads correctly, and still a stray space in a
+        // file PRD #803 makes a success criterion of a user being able to read.
+        // It is reachable on exactly one ordinary path: the first save after
+        // the `[voice]` scalars became tables (see [`StageSpec`]).
+        let flattened = item.is_table_like() && !existing.is_table_like();
+        if same_data(existing, &item) {
+            continue;
         }
+        if flattened {
+            base.remove(key);
+            base.insert(key, item);
+            continue;
+        }
+        replace_item(existing, item);
     }
 }
 
@@ -2468,6 +3415,7 @@ fn unpredictable_suffix() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model_service::{DEFAULT_TOKEN_CEILING, MAX_TOKEN_CEILING, MIN_TOKEN_CEILING};
     use std::sync::Mutex;
 
     /// `settings_path` is the only thing here that reads the environment, and
@@ -2642,6 +3590,977 @@ mod tests {
         let loaded = load_from(&path);
         assert_eq!(loaded.appearance.mode, AppearanceMode::Light);
         assert_eq!(loaded.version, 1);
+        // `[voice]` is a section this build DOES own since PRD #802 M4, and
+        // `backend` is not one of its fields — so this line is now covering
+        // "an unknown field inside a known section" rather than "an unknown
+        // section", which is the other half of the same tolerance and is worth
+        // keeping. The unknown-section half is covered by `future_toplevel`
+        // above and by `a_hand_written_comment_survives_an_app_driven_save`.
+        assert_eq!(loaded.voice, Some(VoiceSettings::default()));
+    }
+
+    /// Scenario: a document names every `[voice]` choice; it round-trips
+    /// through TOML and through the JSON the webview receives, with the same
+    /// tokens on both wires.
+    ///
+    /// The section is PRD #802's tenant and both wires are its contract: the
+    /// TOML is what a user hand-edits and the JSON is what the panel renders,
+    /// and every field name is one word so the two agree byte for byte.
+    #[test]
+    fn a_voice_section_round_trips_through_toml_and_json() {
+        let dir = tempdir();
+        let path = dir.path().join(SETTINGS_FILE_NAME);
+        std::fs::write(
+            &path,
+            "version = 1\n\n\
+             [voice]\n\
+             activation = \"toggle\"\n\n\
+             [voice.intent]\n\
+             backend = \"anthropic\"\n\
+             endpoint = \"https://api.anthropic.com/v1/messages\"\n\
+             model = \"claude-haiku-4-5\"\n\n\
+             [voice.transcription]\n\
+             backend = \"local\"\n\
+             endpoint = \"http://127.0.0.1:18000/v1/audio/transcriptions\"\n\
+             model = \"Systran/faster-whisper-tiny.en\"\n",
+        )
+        .unwrap();
+
+        let loaded = load_from(&path);
+        let voice = loaded.voice.clone().expect("the section is present");
+        assert_eq!(voice.activation, ActivationMode::Toggle);
+        assert_eq!(voice.intent.backend, IntentBackend::Anthropic);
+        assert_eq!(voice.intent.model.as_str(), HOSTED_COMMAND_MODEL);
+        assert_eq!(voice.transcription.backend, TranscriptionBackend::Local);
+        assert_eq!(
+            voice.transcription.endpoint.as_str(),
+            LOCAL_SPEECH_ENDPOINT,
+            "the keyless loopback endpoint survives the round trip verbatim"
+        );
+
+        // The JSON the webview receives carries the same tokens and the same
+        // strings, not an index or a tagged enum — one word per field name, so
+        // TOML and JSON agree.
+        assert_eq!(
+            serde_json::to_value(&voice).unwrap(),
+            serde_json::json!({
+                "activation": "toggle",
+                "intent": {
+                    "backend": "anthropic",
+                    "endpoint": HOSTED_COMMAND_ENDPOINT,
+                    "model": HOSTED_COMMAND_MODEL,
+                    // A NUMBER on both wires, not a string: the webview's
+                    // `VoiceIntentStageDto` declares `max_tokens: number`, and
+                    // a quoted integer here would be a key it silently dropped.
+                    "max_tokens": DEFAULT_TOKEN_CEILING,
+                },
+                "transcription": {
+                    "backend": "local",
+                    "endpoint": LOCAL_SPEECH_ENDPOINT,
+                    "model": LOCAL_SPEECH_MODEL,
+                },
+            })
+        );
+
+        // And a save puts back exactly what was read.
+        save_to(&path, &loaded).unwrap();
+        assert_eq!(load_from(&path), loaded);
+    }
+
+    /// Scenario: a document points a stage somewhere this build refuses — a
+    /// plaintext hop to another machine, a URL carrying a credential, a model
+    /// with a space in it. Each is an error rather than a fold, the `[voice]`
+    /// section goes to its default, and **every other section survives**.
+    ///
+    /// **`[voice]` is the one place that does NOT fold**, and the asymmetry is
+    /// deliberate. A token is a name a newer build may have invented, so folding
+    /// it costs a re-pick. An endpoint is a destination: folding a refused one
+    /// to the preset would upload a user's voice to a hosted service when they
+    /// wrote a URL pointing at their own machine, and say nothing. The error
+    /// puts that section on defaults **with a diagnostic**, which is the version
+    /// of that outcome a person can act on.
+    ///
+    /// **What it must NOT put on defaults is the rest of the document.** The
+    /// parse is all-or-nothing and this used to be asserted as
+    /// `settings == DesktopSettings::default()` — which is to say, a user's
+    /// remote decks disappearing because of one endpoint they typed in a
+    /// different section. [`sections_this_build_can_read`] is the recovery, and
+    /// `[endpoints]` and `[appearance]` are here to hold it to it.
+    #[test]
+    fn a_refused_voice_value_defaults_that_section_and_keeps_the_others() {
+        let dir = tempdir();
+        let path = dir.path().join(SETTINGS_FILE_NAME);
+        for refused in [
+            // Plaintext to somewhere that is not this machine.
+            "[voice.transcription]\nendpoint = \"http://speech.example.com/v1\"\n",
+            // A credential in the authority, which is the shape this type
+            // exists to refuse.
+            "[voice.transcription]\nendpoint = \"https://user:sk-secret@api.openai.com/v1\"\n",
+            // Not a URL at all.
+            "[voice.intent]\nendpoint = \"api.anthropic.com/v1/messages\"\n",
+            // A model identifier with whitespace in it.
+            "[voice.intent]\nmodel = \"claude haiku\"\n",
+            // The keyless backend pointed at somebody else's service — the
+            // pairing `KEYLESS_OFF_MACHINE` refuses, reached the way a user
+            // reaches it: pick the local backend, then edit the endpoint.
+            "[voice.transcription]\nbackend = \"local\"\n\
+             endpoint = \"https://api.openai.com/v1/audio/transcriptions\"\n",
+        ] {
+            std::fs::write(
+                &path,
+                format!(
+                    "version = 1\n\n[appearance]\nmode = \"dark\"\n\n\
+                     [endpoints]\nselection = \"deck1\"\n\n\
+                     [[endpoints.remote]]\n\
+                     host = \"build-box.example.com\"\n\
+                     id = \"deck1\"\n\
+                     port = 22\n\n{refused}"
+                ),
+            )
+            .unwrap();
+            let (settings, problem) = load_document(&path);
+            assert_eq!(settings.voice, None, "should have been refused: {refused}");
+
+            // The whole point: one refused voice value is not a reason to
+            // forget the user's decks, their theme or their schema version.
+            let endpoints = settings
+                .endpoints
+                .as_ref()
+                .unwrap_or_else(|| panic!("the deck list must survive: {refused}"));
+            assert_eq!(endpoints.remote.len(), 1);
+            assert_eq!(endpoints.remote[0].id.as_str(), "deck1");
+            assert_eq!(settings.appearance.mode, AppearanceMode::Dark);
+            assert_eq!(settings.version, 1);
+
+            let problem = problem.expect("a refused value must report why");
+            assert!(problem.public().contains("line"), "{}", problem.public());
+            // Issue #827's rule holds through the new types: a locator, and
+            // never a byte of the document.
+            assert!(
+                !problem.public().contains("sk-secret"),
+                "{}",
+                problem.public()
+            );
+        }
+    }
+
+    /// Scenario: the webview sends `backend = "local"` paired with a hosted
+    /// endpoint. The IPC seam refuses it, the same way the document does.
+    ///
+    /// **The panel is not the boundary**, which is the point of asserting the
+    /// JSON path separately: the Endpoint field stays offered for the keyless
+    /// backend — a user who publishes the container on another port has to be
+    /// able to say so — so "pick local, then type a hosted URL" is a sequence
+    /// the panel itself permits, and a hand-edited `desktop.toml` bypasses the
+    /// panel entirely. One hand-written [`TranscriptionSettings::deserialize`]
+    /// serves both wires, so refusing there covers both.
+    ///
+    /// The error names the rule and not the endpoint: issue #827's sink list
+    /// includes this message.
+    #[test]
+    fn a_keyless_backend_paired_with_a_hosted_endpoint_is_refused_on_the_ipc_path() {
+        let error = serde_json::from_value::<VoiceSettings>(serde_json::json!({
+            "transcription": {
+                "backend": "local",
+                "endpoint": HOSTED_SPEECH_ENDPOINT,
+                "model": HOSTED_SPEECH_MODEL,
+            },
+        }))
+        .expect_err("a keyless backend may not be pointed off this machine");
+        assert!(
+            error.to_string().contains("must be on this machine"),
+            "the error should name the rule: {error}"
+        );
+
+        // The pairing the panel's own preset writes is of course accepted, and
+        // so is a container a user moved to another loopback port.
+        for endpoint in [
+            LOCAL_SPEECH_ENDPOINT,
+            "http://127.0.0.1:9000/v1/audio/transcriptions",
+            "http://localhost:18000/v1/audio/transcriptions",
+            "http://[::1]:18000/v1/audio/transcriptions",
+        ] {
+            let voice = serde_json::from_value::<VoiceSettings>(serde_json::json!({
+                "transcription": { "backend": "local", "endpoint": endpoint },
+            }))
+            .unwrap_or_else(|error| panic!("{endpoint} must be accepted: {error}"));
+            assert_eq!(voice.transcription.endpoint.as_str(), endpoint);
+        }
+
+        // And the keyed backend is unaffected — a hosted endpoint is the whole
+        // reason it exists, and it sends a credential.
+        let voice = serde_json::from_value::<VoiceSettings>(serde_json::json!({
+            "transcription": { "backend": "remote", "endpoint": HOSTED_SPEECH_ENDPOINT },
+        }))
+        .expect("the keyed backend reaches another host by design");
+        assert_eq!(voice.transcription.backend, TranscriptionBackend::Remote);
+    }
+
+    /// Scenario: a document written by the build before PRD #802's provider
+    /// work — `[voice]` holding three bare tokens rather than two tables. It
+    /// folds onto this build's backends, and touches nothing else.
+    ///
+    /// **A type error, not an unknown token**, which is why this needed
+    /// [`StageSpec`] rather than the folding the token visitor already did:
+    /// `transcription = "off"` is a string where a table is expected, so
+    /// `from_str_lossy` never sees it and `#[serde(default)]` does not fire for
+    /// a value that is present and wrong. The whole document failed, and with it
+    /// went the user's remote decks — for a voice token they had not touched
+    /// since the day the old build wrote it.
+    ///
+    /// `off` is the backend this build deleted, so it folds to the default the
+    /// same way any unknown token does: the keyless local container, which is
+    /// the honest home for it — the stage that used to do nothing now works and
+    /// needs no key.
+    #[test]
+    fn an_old_scalar_voice_section_folds_and_leaves_the_rest_of_the_document_alone() {
+        let dir = tempdir();
+        let path = dir.path().join(SETTINGS_FILE_NAME);
+        std::fs::write(
+            &path,
+            "version = 1\n\n\
+             [endpoints]\nselection = \"deck1\"\n\n\
+             [[endpoints.remote]]\n\
+             host = \"build-box.example.com\"\n\
+             id = \"deck1\"\n\
+             port = 22\n\n\
+             [voice]\n\
+             activation = \"toggle\"\n\
+             intent = \"remote\"\n\
+             transcription = \"off\"\n",
+        )
+        .unwrap();
+
+        let (settings, problem) = load_document(&path);
+        assert!(
+            problem.is_none(),
+            "an old document is not a malformed one: {:?}",
+            problem.map(|problem| problem.public().to_string())
+        );
+
+        let voice = settings.voice.clone().expect("the section is present");
+        assert_eq!(voice.activation, ActivationMode::Toggle);
+        // A token names a backend and nothing else, so each one lands on THAT
+        // backend's coordinates rather than on the struct's own default.
+        assert_eq!(voice.intent.backend, IntentBackend::Anthropic);
+        assert_eq!(voice.intent.endpoint.as_str(), HOSTED_COMMAND_ENDPOINT);
+        assert_eq!(voice.transcription.backend, TranscriptionBackend::Local);
+        assert_eq!(voice.transcription.endpoint.as_str(), LOCAL_SPEECH_ENDPOINT);
+        assert_eq!(voice.transcription.model.as_str(), LOCAL_SPEECH_MODEL);
+
+        // And the sections the old build's voice token has nothing to do with.
+        let endpoints = settings.endpoints.as_ref().expect("the deck list survives");
+        assert_eq!(endpoints.remote.len(), 1);
+        assert_eq!(endpoints.remote[0].id.as_str(), "deck1");
+
+        // A save then rewrites `[voice]` in the new shape — the migration
+        // completes rather than being re-folded on every load.
+        save_to(&path, &settings).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("[voice.transcription]"), "{raw}");
+        assert_eq!(load_from(&path).voice, settings.voice);
+    }
+
+    /// Scenario: a document names a stage's backend and nothing else. The
+    /// missing endpoint and model come from **that backend's** preset, not from
+    /// the struct's own default.
+    ///
+    /// The distinction is the whole reason `Deserialize` is hand-written here.
+    /// `#[serde(default)]` fills a missing field from `Default::default()`,
+    /// which is the LOCAL speech preset — so `backend = "remote"` with no
+    /// endpoint would have authenticated against the loopback container,
+    /// sending the user's OpenAI key to a service that has no notion of one and
+    /// their audio somewhere they did not choose. Filling from the backend that
+    /// was actually named is the only answer that cannot be wrong.
+    #[test]
+    fn a_stage_that_names_only_its_backend_gets_that_backends_coordinates() {
+        let dir = tempdir();
+        let path = dir.path().join(SETTINGS_FILE_NAME);
+        std::fs::write(
+            &path,
+            "version = 1\n\n[voice.transcription]\nbackend = \"remote\"\n",
+        )
+        .unwrap();
+        let voice = load_from(&path).voice.expect("the section is present");
+        assert_eq!(voice.transcription.backend, TranscriptionBackend::Remote);
+        assert_eq!(
+            voice.transcription.endpoint.as_str(),
+            HOSTED_SPEECH_ENDPOINT
+        );
+        assert_eq!(voice.transcription.model.as_str(), HOSTED_SPEECH_MODEL);
+        assert!(
+            !voice.transcription.endpoint.is_loopback(),
+            "a keyed backend was pointed at the keyless container"
+        );
+
+        // The other direction, so this is not a one-sided assertion: naming the
+        // local backend gets the loopback coordinates.
+        std::fs::write(
+            &path,
+            "version = 1\n\n[voice.transcription]\nbackend = \"local\"\n",
+        )
+        .unwrap();
+        let voice = load_from(&path).voice.expect("the section is present");
+        assert_eq!(voice.transcription.endpoint.as_str(), LOCAL_SPEECH_ENDPOINT);
+
+        // And a coordinate the document DOES name is kept, so the preset is a
+        // fallback rather than an override.
+        std::fs::write(
+            &path,
+            "version = 1\n\n[voice.transcription]\nbackend = \"remote\"\n\
+             model = \"gpt-4o-transcribe\"\n",
+        )
+        .unwrap();
+        let voice = load_from(&path).voice.expect("the section is present");
+        assert_eq!(voice.transcription.model.as_str(), "gpt-4o-transcribe");
+        assert_eq!(
+            voice.transcription.endpoint.as_str(),
+            HOSTED_SPEECH_ENDPOINT
+        );
+    }
+
+    /// Scenario: the endpoints and models this build ships as presets are all
+    /// values its own newtypes accept.
+    ///
+    /// `TranscriptionSettings::default` and `IntentSettings::default` `expect`
+    /// on these, so a typo in one of them would be a panic on the first settings
+    /// load rather than a compile error. This is what makes that `expect`
+    /// honest.
+    #[test]
+    fn the_preset_service_coordinates_are_valid() {
+        for endpoint in [
+            LOCAL_SPEECH_ENDPOINT,
+            HOSTED_SPEECH_ENDPOINT,
+            HOSTED_COMMAND_ENDPOINT,
+            OPENAI_COMMAND_ENDPOINT,
+        ] {
+            ServiceUrl::parse(endpoint).unwrap_or_else(|error| panic!("{endpoint}: {error}"));
+        }
+        for model in [
+            LOCAL_SPEECH_MODEL,
+            HOSTED_SPEECH_MODEL,
+            HOSTED_COMMAND_MODEL,
+            OPENAI_COMMAND_MODEL,
+        ] {
+            ModelId::parse(model).unwrap_or_else(|error| panic!("{model}: {error}"));
+        }
+        // The keyless default is on this machine, which is what lets
+        // `voice::transcribe` tell a user to start a container rather than
+        // reporting an outage.
+        assert!(
+            ServiceUrl::parse(LOCAL_SPEECH_ENDPOINT)
+                .expect("valid")
+                .is_loopback()
+        );
+        assert!(
+            !ServiceUrl::parse(HOSTED_SPEECH_ENDPOINT)
+                .expect("valid")
+                .is_loopback()
+        );
+    }
+
+    /// Scenario: a document with no `[voice]` section at all — every document
+    /// on disk today — loads, and the section reads as *unspecified* rather
+    /// than as empty.
+    ///
+    /// The distinction is [`DesktopSettings::voice`]'s whole reason for being
+    /// an `Option`, and the defaults it materialises to are the product
+    /// decision: a **keyless speech container on loopback**, the **Anthropic
+    /// API** for commands, and the one **activation mode** that ships. The two
+    /// stages differ on credentials and that asymmetry IS the decision —
+    /// speech asks for none, commands does, because PRD #802 measured local
+    /// intent twice and it was not good enough.
+    #[test]
+    fn an_absent_voice_section_reads_as_unspecified_with_this_builds_defaults() {
+        let dir = tempdir();
+        let path = dir.path().join(SETTINGS_FILE_NAME);
+        std::fs::write(&path, "version = 1\n\n[appearance]\nmode = \"dark\"\n").unwrap();
+
+        let loaded = load_from(&path);
+        assert_eq!(loaded.voice, None, "absence must survive the load");
+
+        let defaults = VoiceSettings::default();
+        assert_eq!(defaults.transcription.backend, TranscriptionBackend::Local);
+        assert_eq!(
+            defaults.transcription.endpoint.as_str(),
+            LOCAL_SPEECH_ENDPOINT
+        );
+        assert_eq!(defaults.transcription.model.as_str(), LOCAL_SPEECH_MODEL);
+        assert_eq!(defaults.intent.backend, IntentBackend::OpenaiCompatible);
+        assert_eq!(defaults.intent.endpoint.as_str(), OPENAI_COMMAND_ENDPOINT);
+        assert_eq!(defaults.intent.model.as_str(), OPENAI_COMMAND_MODEL);
+        assert_eq!(defaults.intent.max_tokens.get(), DEFAULT_TOKEN_CEILING);
+        assert_eq!(defaults.activation, ActivationMode::Toggle);
+        // Speech's default is the keyless one, which is the product decision
+        // that replaced `Speech = off`. Commands' is not, and the asymmetry is
+        // deliberate: PRD #802 measured local intent twice against the phrase
+        // fixtures and it was not good enough — `IntentBackend` has the
+        // numbers.
+        //
+        // **Both hosted defaults are the same vendor**, which is the product
+        // decision the one-key work turned on: a user who wants the feature
+        // hosted end to end pastes ONE key, rather than opening accounts with
+        // two companies to turn on one button.
+        assert_eq!(
+            ServiceUrl::parse(HOSTED_SPEECH_ENDPOINT)
+                .expect("valid")
+                .host(),
+            defaults.intent.endpoint.host(),
+            "the two hosted presets must be one vendor, or one key does not run both"
+        );
+    }
+
+    /// Scenario: the command stage's answer ceiling defaults to 4096, a
+    /// document that names one keeps it, and a bare backend token lands on the
+    /// default rather than on nothing.
+    ///
+    /// The field replaced a hardwired 256 that was sized from one model's
+    /// answers. `max_completion_tokens` counts a model's REASONING as well as
+    /// what it writes, so the old constant truncated every reasoning model
+    /// before it emitted a character — measured on `gpt-5-mini` at 18/24
+    /// against the phrase fixtures, every failure having spent exactly 256
+    /// completion tokens.
+    #[test]
+    fn the_command_ceiling_defaults_to_4096_and_a_document_may_change_it() {
+        assert_eq!(
+            IntentSettings::default().max_tokens.get(),
+            DEFAULT_TOKEN_CEILING
+        );
+        assert_eq!(DEFAULT_TOKEN_CEILING, 4096);
+        // Both presets, so a backend switch never re-introduces a per-provider
+        // number somebody has to keep in step.
+        for backend in [IntentBackend::Anthropic, IntentBackend::OpenaiCompatible] {
+            assert_eq!(
+                IntentSettings::for_backend(backend).max_tokens.get(),
+                DEFAULT_TOKEN_CEILING
+            );
+        }
+
+        let dir = tempdir();
+        let path = dir.path().join(SETTINGS_FILE_NAME);
+        std::fs::write(
+            &path,
+            "version = 1\n\n\
+             [voice.intent]\n\
+             backend = \"openai_compatible\"\n\
+             max_tokens = 16384\n",
+        )
+        .unwrap();
+        let (loaded, problem) = load_document(&path);
+        assert!(problem.is_none(), "{problem:?}");
+        let intent = loaded.voice.expect("the section is present").intent;
+        assert_eq!(intent.max_tokens.get(), 16_384);
+        // The coordinates the document did NOT name still come from the backend
+        // it did, which is what `IntentSettings::deserialize` exists for.
+        assert_eq!(intent.endpoint.as_str(), OPENAI_COMMAND_ENDPOINT);
+
+        // The bare-token shape an older document wrote carries no ceiling at
+        // all, so it lands on the default rather than on a missing field.
+        std::fs::write(&path, "version = 1\n\n[voice]\nintent = \"anthropic\"\n").unwrap();
+        let (loaded, problem) = load_document(&path);
+        assert!(problem.is_none(), "{problem:?}");
+        assert_eq!(
+            loaded
+                .voice
+                .expect("the section is present")
+                .intent
+                .max_tokens
+                .get(),
+            DEFAULT_TOKEN_CEILING
+        );
+    }
+
+    /// Scenario: a document holds an answer ceiling outside the accepted range.
+    /// The `[voice]` section is refused with a diagnostic naming the rule, and
+    /// the rest of the document — the user's appearance, their decks — is still
+    /// there.
+    ///
+    /// Both halves matter and the second is the one that was a P2 once already.
+    /// `toml_edit::de::from_str` is all-or-nothing, so a value refused in
+    /// `[voice]` used to cost the whole file;
+    /// [`sections_this_build_can_read`] is what narrows it to the section the
+    /// bad value is in. A new refusing field is a new way to reach that path,
+    /// so it is pinned here rather than assumed to inherit the fix.
+    #[test]
+    fn a_ceiling_outside_the_range_is_refused_and_keeps_the_rest_of_the_document() {
+        let dir = tempdir();
+        let path = dir.path().join(SETTINGS_FILE_NAME);
+        for refused in [
+            i64::from(MIN_TOKEN_CEILING) - 1,
+            0,
+            -1,
+            i64::from(MAX_TOKEN_CEILING) + 1,
+        ] {
+            std::fs::write(
+                &path,
+                format!(
+                    "version = 1\n\n\
+                     [appearance]\n\
+                     mode = \"dark\"\n\n\
+                     [voice.intent]\n\
+                     backend = \"openai_compatible\"\n\
+                     max_tokens = {refused}\n"
+                ),
+            )
+            .unwrap();
+
+            let (loaded, problem) = load_document(&path);
+            let problem =
+                problem.unwrap_or_else(|| panic!("{refused} must be refused with a diagnostic"));
+            assert!(problem.public().contains("line"), "{}", problem.public());
+            assert_eq!(
+                loaded.appearance.mode,
+                AppearanceMode::Dark,
+                "a refused ceiling is not a reason to forget the user's theme"
+            );
+            // The stage itself falls back rather than half-surviving: a
+            // backend left behind beside a dropped coordinate is the shape
+            // `TranscriptionSettings::deserialize` exists to prevent.
+            assert!(
+                loaded.voice.is_none(),
+                "{refused} left a half-read section behind"
+            );
+        }
+
+        // And the boundary values themselves are accepted, so the refusal is a
+        // range rather than a superstition about round numbers.
+        for accepted in [MIN_TOKEN_CEILING, MAX_TOKEN_CEILING] {
+            std::fs::write(
+                &path,
+                format!("version = 1\n\n[voice.intent]\nmax_tokens = {accepted}\n"),
+            )
+            .unwrap();
+            let (loaded, problem) = load_document(&path);
+            assert!(problem.is_none(), "{accepted}: {problem:?}");
+            assert_eq!(
+                loaded
+                    .voice
+                    .expect("the section is present")
+                    .intent
+                    .max_tokens
+                    .get(),
+                accepted
+            );
+        }
+    }
+
+    /// Scenario: a document names a `[voice]` backend this build has never
+    /// heard of, and one that is absurdly long. The first is tolerated and the
+    /// second is refused, which are deliberately different answers.
+    ///
+    /// **An unrecognised token folds to the default** — PRD #802 asks for
+    /// exactly this, "closed enums with folding deserializers in the
+    /// `AppearanceMode` idiom" — so a document written by a newer build with
+    /// more backends still loads, and the rest of the user's settings are not
+    /// lost over one unreadable field. What it costs is stated rather than
+    /// hidden: the folded value is what the **next save writes back**, so an
+    /// older build opened against a newer build's document replaces that
+    /// choice. `AppearanceMode` makes the same trade;
+    /// [`Selection`] is the type that does not, because an unknown selection is
+    /// stored as the [`EndpointId`] it was and written back unchanged.
+    ///
+    /// **An over-length token is an error**, not the fallback: an unrecognised
+    /// token is a mode this build has not heard of and a 4 KB one is a
+    /// malformed document. On the disk path that means the `[voice]` section
+    /// falls back to its default **and the sections around it do not** — the
+    /// ordinary malformed-document behaviour since
+    /// [`sections_this_build_can_read`]; on the IPC path it fails argument
+    /// deserialisation before anything allocates a normalised copy.
+    #[test]
+    fn an_unknown_voice_token_folds_to_the_default_and_an_over_long_one_is_refused() {
+        let dir = tempdir();
+        let path = dir.path().join(SETTINGS_FILE_NAME);
+        std::fs::write(
+            &path,
+            "version = 1\n\n\
+             [voice.intent]\n\
+             backend = \"a-backend-from-2027\"\n\n\
+             [voice.transcription]\n\
+             backend = \"on-device-neural\"\n",
+        )
+        .unwrap();
+        let loaded = load_from(&path);
+        let voice = loaded.voice.clone().expect("the section is present");
+        assert_eq!(voice.intent.backend, IntentBackend::OpenaiCompatible);
+        assert_eq!(voice.transcription.backend, TranscriptionBackend::Local);
+        // A stage that named only its backend still gets this build's
+        // coordinates for the folded choice, rather than an empty endpoint.
+        assert_eq!(voice.transcription.endpoint.as_str(), LOCAL_SPEECH_ENDPOINT);
+
+        // The cost, pinned rather than left implicit: the next save writes the
+        // folded value, so the newer build's choice is gone.
+        save_to(&path, &loaded).unwrap();
+        let reread = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            reread.contains("backend = \"openai_compatible\""),
+            "{reread}"
+        );
+        assert!(!reread.contains("2027"), "{reread}");
+
+        // Over-length is a different answer: the document is malformed, so the
+        // load falls back to defaults entirely rather than folding one field.
+        let long = "x".repeat(MAX_VOICE_TOKEN_BYTES + 1);
+        std::fs::write(
+            &path,
+            format!(
+                "version = 1\n\n[appearance]\nmode = \"dark\"\n\n[voice.intent]\nbackend = \"{long}\"\n"
+            ),
+        )
+        .unwrap();
+        let (settings, problem) = load_document(&path);
+        assert_eq!(settings.voice, None, "the refused section goes to default");
+        assert_eq!(
+            settings.appearance.mode,
+            AppearanceMode::Dark,
+            "a refused voice token is not a reason to forget the user's theme"
+        );
+        let problem = problem.expect("a malformed document must report why");
+        assert!(problem.public().contains("line"), "{}", problem.public());
+    }
+
+    /// Scenario: a document written by a build that shipped one of the two
+    /// withdrawn agent-CLI intent backends loads on this build and folds to the
+    /// default; the pre-provider-work `remote` loads as **Anthropic**, which is
+    /// what it named. The rest of the document survives every time and nothing
+    /// errors.
+    ///
+    /// The migration for [`IntentBackend`]'s withdrawn variants, asserted
+    /// rather than argued: the audit that removed `opencode` reasoned that the
+    /// folding deserializer makes dropping a variant cheap, and PRD #802's
+    /// provider work then spent that reasoning a second time on `claude` — the
+    /// whole agent-CLI backend, which was the DEFAULT. So the case this pins is
+    /// no longer a minority re-pick: it is what every existing user's document
+    /// says. What it costs them is one re-pick, not a lost document.
+    ///
+    /// **`remote` is the case that stopped being a fold when the default
+    /// moved**, and it is pinned here as a mapping rather than as luck. It
+    /// named the Anthropic API, so its user's `SecretId::VoiceIntent` holds an
+    /// Anthropic key; folding it to today's default would put that key in an
+    /// `Authorization` header addressed to `api.openai.com`.
+    #[test]
+    fn the_withdrawn_agent_cli_intent_backends_fold_to_the_default() {
+        let dir = tempdir();
+        let path = dir.path().join(SETTINGS_FILE_NAME);
+        std::fs::write(
+            &path,
+            "version = 1\n\n\
+             [appearance]\n\
+             mode = \"dark\"\n\n\
+             [voice.intent]\n\
+             backend = \"opencode\"\n\n\
+             [voice.transcription]\n\
+             backend = \"remote\"\n\
+             endpoint = \"https://api.openai.com/v1/audio/transcriptions\"\n\
+             model = \"whisper-1\"\n",
+        )
+        .unwrap();
+
+        let (loaded, problem) = load_document(&path);
+        assert!(
+            problem.is_none(),
+            "a withdrawn token is not a malformed document"
+        );
+        let voice = loaded.voice.clone().expect("the section is present");
+        assert_eq!(voice.intent.backend, IntentBackend::OpenaiCompatible);
+        // Everything else in the document survives the fold.
+        assert_eq!(voice.transcription.backend, TranscriptionBackend::Remote);
+        assert_eq!(
+            voice.transcription.endpoint.as_str(),
+            HOSTED_SPEECH_ENDPOINT
+        );
+        assert_eq!(loaded.appearance.mode, AppearanceMode::Dark);
+
+        // The second withdrawn token, and the one that matters more: `claude`
+        // was the shipped DEFAULT, so this is the document nearly every early
+        // user has.
+        std::fs::write(
+            &path,
+            "version = 1\n\n[voice.intent]\nbackend = \"claude\"\n",
+        )
+        .unwrap();
+        let (loaded, problem) = load_document(&path);
+        assert!(
+            problem.is_none(),
+            "a withdrawn token is not a malformed document"
+        );
+        assert_eq!(
+            loaded.voice.expect("the section is present").intent.backend,
+            IntentBackend::OpenaiCompatible
+        );
+
+        for withdrawn in ["opencode", "claude"] {
+            assert!(
+                !<IntentBackend as VoiceToken>::TOKENS.contains(&withdrawn),
+                "`{withdrawn}` is withdrawn; see IntentBackend's doc comment for why"
+            );
+        }
+
+        // And the pre-provider-work spelling of the one backend that SURVIVED.
+        // `remote` named the Anthropic API, so it MAPS there rather than
+        // folding: the key its user stored is that vendor's, and the default is
+        // no longer that vendor.
+        std::fs::write(
+            &path,
+            "version = 1\n\n[voice.intent]\nbackend = \"remote\"\n",
+        )
+        .unwrap();
+        let (loaded, problem) = load_document(&path);
+        assert!(
+            problem.is_none(),
+            "an older token is not a malformed document"
+        );
+        let intent = loaded.voice.expect("the section is present").intent;
+        assert_eq!(intent.backend, IntentBackend::Anthropic);
+        assert_ne!(
+            intent.backend,
+            IntentBackend::default(),
+            "this assertion is only worth making while `remote` and the default differ"
+        );
+        // And it lands on that backend's coordinates, so the stored key goes
+        // where it was minted for.
+        assert_eq!(intent.endpoint.as_str(), HOSTED_COMMAND_ENDPOINT);
+        assert_eq!(intent.model.as_str(), HOSTED_COMMAND_MODEL);
+        // `remote` is NOT an offered token — it is a migration alias, so the
+        // panel must not list it and the round-trip check must not see it.
+        assert!(!<IntentBackend as VoiceToken>::TOKENS.contains(&"remote"));
+    }
+
+    /// Scenario: a document naming the backend that used to be the default
+    /// loads as that backend, with every other section intact.
+    ///
+    /// The half of the migration that is easy to assume and expensive to get
+    /// wrong. Moving a default is a change to what an ABSENT value means; a
+    /// PRESENT one has to keep meaning what it said, and this is the document
+    /// most existing users have. Both spellings are checked — the stage table
+    /// and the bare token an older schema wrote — because they reach the value
+    /// by different code (`StageSpec`'s two arms).
+    ///
+    /// The "rest of the document" half is a P2 that was already fixed once for
+    /// Speech (`b06d9cac`): `toml_edit::de::from_str` is all-or-nothing, so a
+    /// `[voice]` value this build could not read used to cost the user's decks,
+    /// their appearance and their zoom.
+    #[test]
+    fn a_document_naming_the_former_default_keeps_it_and_keeps_the_document() {
+        let dir = tempdir();
+        let path = dir.path().join(SETTINGS_FILE_NAME);
+        for spelling in [
+            "[voice.intent]\nbackend = \"anthropic\"\n",
+            "[voice]\nintent = \"anthropic\"\n",
+        ] {
+            std::fs::write(
+                &path,
+                format!(
+                    "version = 1\n\n\
+                     [appearance]\n\
+                     mode = \"dark\"\n\n\
+                     [zoom]\n\
+                     level = 1.25\n\n\
+                     {spelling}"
+                ),
+            )
+            .unwrap();
+
+            let (loaded, problem) = load_document(&path);
+            assert!(problem.is_none(), "{spelling}: {problem:?}");
+            let intent = loaded
+                .voice
+                .clone()
+                .unwrap_or_else(|| panic!("{spelling}: the section is present"))
+                .intent;
+            assert_eq!(intent.backend, IntentBackend::Anthropic, "{spelling}");
+            assert_eq!(
+                intent.endpoint.as_str(),
+                HOSTED_COMMAND_ENDPOINT,
+                "{spelling}"
+            );
+            assert_eq!(intent.model.as_str(), HOSTED_COMMAND_MODEL, "{spelling}");
+            // Not the default any more, which is what makes this worth pinning.
+            assert_ne!(intent.backend, IntentBackend::default(), "{spelling}");
+            // And nothing else moved.
+            assert_eq!(loaded.appearance.mode, AppearanceMode::Dark, "{spelling}");
+            assert_eq!(loaded.zoom.level.as_f64(), 1.25, "{spelling}");
+        }
+
+        // The other direction, for completeness: the backend that IS the
+        // default is equally explicit when the document names it, so nobody has
+        // to work out whether a value is stored or inferred.
+        std::fs::write(
+            &path,
+            "version = 1\n\n[voice.intent]\nbackend = \"openai_compatible\"\n",
+        )
+        .unwrap();
+        let (loaded, problem) = load_document(&path);
+        assert!(problem.is_none(), "{problem:?}");
+        assert_eq!(
+            loaded
+                .voice
+                .expect("the section is present")
+                .intent
+                .model
+                .as_str(),
+            OPENAI_COMMAND_MODEL
+        );
+    }
+
+    /// The `[voice]` tokens are duplicated in `desktop/src/lib/bridge.ts`, so
+    /// both copies are pinned value-by-value and each points at the other —
+    /// the same arrangement `zoom_ladder_matches_the_frontend_copy` makes, and
+    /// for the same reason: if they drift, the panel offers a token this side
+    /// folds away, and the user's choice silently does not stick.
+    ///
+    /// The round-trip half is the one that matters most under a **folding**
+    /// deserializer, and it is the hazard that design carries: a token listed
+    /// here but missing an arm in `from_str_lossy` would not fail to parse — it
+    /// would quietly become the default, so the panel would offer a choice that
+    /// never takes.
+    #[test]
+    fn the_voice_tokens_match_the_frontends_copy() {
+        assert_eq!(
+            <ActivationMode as VoiceToken>::TOKENS,
+            ["toggle"],
+            "keep this identical to VOICE_ACTIVATION_MODES in desktop/src/lib/bridge.ts"
+        );
+        assert_eq!(
+            <IntentBackend as VoiceToken>::TOKENS,
+            ["anthropic", "openai_compatible"],
+            "keep this identical to VOICE_INTENT_BACKENDS in desktop/src/lib/bridge.ts"
+        );
+        assert_eq!(
+            <TranscriptionBackend as VoiceToken>::TOKENS,
+            ["local", "remote"],
+            "keep this identical to VOICE_TRANSCRIPTION_BACKENDS in desktop/src/lib/bridge.ts"
+        );
+
+        fn round_trips<T: VoiceToken + std::fmt::Debug + PartialEq>() {
+            for token in T::TOKENS {
+                assert_eq!(
+                    T::from_str_lossy(token).as_str(),
+                    *token,
+                    "`{token}` is offered but does not parse back to itself, so choosing \
+                     it would silently store the default"
+                );
+            }
+            assert!(
+                T::TOKENS.contains(&T::default().as_str()),
+                "the default is not one of the offered tokens"
+            );
+            // Case and surrounding whitespace are forgiven, because the
+            // document is hand-editable.
+            for token in T::TOKENS {
+                assert_eq!(T::from_str_lossy(&format!("  {token}  ")).as_str(), *token);
+                assert_eq!(T::from_str_lossy(&token.to_uppercase()).as_str(), *token);
+            }
+        }
+        round_trips::<ActivationMode>();
+        round_trips::<IntentBackend>();
+        round_trips::<TranscriptionBackend>();
+    }
+
+    /// The preset endpoints and models are duplicated in
+    /// `desktop/src/lib/bridge.ts` as `VOICE_STAGE_PRESETS`, so both copies are
+    /// pinned value-by-value for `the_voice_tokens_match_the_frontends_copy`'s
+    /// reason with a sharper edge: the panel WRITES a preset into the document
+    /// whenever the backend changes, so a frontend copy that drifted would put
+    /// a value into `desktop.toml` that this side then refuses — turning a
+    /// select into a save error.
+    #[test]
+    fn the_voice_presets_match_the_frontends_copy() {
+        for (constant, value) in [
+            (
+                LOCAL_SPEECH_ENDPOINT,
+                "http://127.0.0.1:18000/v1/audio/transcriptions",
+            ),
+            (LOCAL_SPEECH_MODEL, "Systran/faster-whisper-tiny.en"),
+            (
+                HOSTED_SPEECH_ENDPOINT,
+                "https://api.openai.com/v1/audio/transcriptions",
+            ),
+            (HOSTED_SPEECH_MODEL, "whisper-1"),
+            (
+                HOSTED_COMMAND_ENDPOINT,
+                "https://api.anthropic.com/v1/messages",
+            ),
+            (HOSTED_COMMAND_MODEL, "claude-haiku-4-5"),
+            (
+                OPENAI_COMMAND_ENDPOINT,
+                "https://api.openai.com/v1/chat/completions",
+            ),
+            (OPENAI_COMMAND_MODEL, "gpt-5-mini"),
+        ] {
+            assert_eq!(
+                constant, value,
+                "keep this identical to VOICE_STAGE_PRESETS in desktop/src/lib/bridge.ts"
+            );
+        }
+        // The answer ceiling's bounds and default, which the panel writes and
+        // which `bridge.ts` therefore has to agree about number for number: a
+        // frontend that offered 8 would put a value into `desktop.toml` that
+        // this side refuses, turning a number field into a save error.
+        for (constant, value) in [
+            (MIN_TOKEN_CEILING, 64),
+            (MAX_TOKEN_CEILING, 32768),
+            (DEFAULT_TOKEN_CEILING, 4096),
+        ] {
+            assert_eq!(
+                constant, value,
+                "keep this identical to the ceiling constants in desktop/src/lib/bridge.ts"
+            );
+        }
+        // The image the unreachable-endpoint sentence names, which the panel's
+        // own hint repeats to the user before they ever meet that sentence.
+        assert_eq!(
+            LOCAL_SPEECH_IMAGE, "ghcr.io/speaches-ai/speaches:0.9.0-rc.3-cpu",
+            "keep this identical to the hint in desktop/src/components/VoicePanel.tsx"
+        );
+    }
+
+    /// Scenario: a document holds a `[voice]` section; a client whose UI cannot
+    /// render voice saves an appearance change over it. The section must still
+    /// be there.
+    ///
+    /// The property [`DesktopSettings::voice`] is an `Option` for, and the
+    /// twin of `a_client_that_cannot_render_endpoints_cannot_delete_them`. If
+    /// it were a plain section the webview's fixed-key-set normaliser would
+    /// send the default, and the merge would write that over the user's
+    /// choices — silently, on a save triggered by changing the theme.
+    #[test]
+    fn a_client_that_cannot_render_voice_cannot_delete_it() {
+        let dir = tempdir();
+        let path = dir.path().join(SETTINGS_FILE_NAME);
+        std::fs::write(
+            &path,
+            "version = 1\n\n\
+             [appearance]\n\
+             mode = \"light\"\n\n\
+             [voice.intent]\n\
+             backend = \"remote\"\n\n\
+             [voice.transcription]\n\
+             backend = \"remote\"\n\
+             endpoint = \"https://api.openai.com/v1/audio/transcriptions\"\n\
+             model = \"whisper-1\"\n",
+        )
+        .unwrap();
+
+        // A document from a build with no voice UI: `None`, not an empty
+        // section.
+        let blind = DesktopSettings {
+            appearance: AppearanceSettings {
+                mode: AppearanceMode::Dark,
+            },
+            voice: None,
+            ..DesktopSettings::default()
+        };
+        save_to(&path, &blind).unwrap();
+
+        let reloaded = load_from(&path);
+        assert_eq!(reloaded.appearance.mode, AppearanceMode::Dark);
+        let voice = reloaded.voice.expect("the section must survive");
+        assert_eq!(voice.intent.backend, IntentBackend::Anthropic);
+        assert_eq!(voice.transcription.backend, TranscriptionBackend::Remote);
+        assert_eq!(
+            voice.transcription.endpoint.as_str(),
+            HOSTED_SPEECH_ENDPOINT
+        );
     }
 
     /// The zoom ladder is duplicated in `desktop/src/lib/zoom.ts`, so both
@@ -2745,9 +4664,13 @@ mod tests {
 
     /// The same guarantee for the values that are not numbers at all. A string
     /// or a boolean is a genuinely malformed document, so it falls back the
-    /// ordinary way — the whole document to defaults, logged, never a failed
-    /// launch — and the assertion records that this is the behaviour rather
-    /// than a partial recovery.
+    /// ordinary way — logged, never a failed launch — and since
+    /// [`sections_this_build_can_read`] the ordinary way IS a partial recovery:
+    /// `[zoom]` goes to its default and `[appearance]` beside it does not.
+    /// That sentence used to read "the whole document to defaults", and the
+    /// reason it changed is the one this file is built around — the document
+    /// holds several unrelated tenants, and one refused value is not a reason
+    /// to forget the others.
     #[test]
     fn a_non_numeric_zoom_level_falls_back_the_ordinary_malformed_way() {
         let dir = tempdir();
@@ -2760,7 +4683,7 @@ mod tests {
             .unwrap();
             let loaded = load_from(&path);
             assert_eq!(loaded.zoom.level.as_f64(), DEFAULT_ZOOM_LEVEL, "for {raw}");
-            assert_eq!(loaded.appearance.mode, AppearanceMode::System, "for {raw}");
+            assert_eq!(loaded.appearance.mode, AppearanceMode::Dark, "for {raw}");
         }
     }
 
@@ -2895,6 +4818,14 @@ mod tests {
     /// naive format-preserving merge still drops: the comment lives in the
     /// value's decor, so replacing the value takes it unless the decor is
     /// carried across (see [`replace_item`]).
+    ///
+    /// The unknown section in the fixture was `[voice]` until PRD #802 M4 took
+    /// that name, which is the mechanism this test covers demonstrating itself:
+    /// once a build owns a section the merge writes the keys the struct owns
+    /// into it, so it stopped being a stand-in for a section nobody owns. The
+    /// stand-in moved rather than the assertion being relaxed — what is being
+    /// proven is that an app-driven save leaves a section this build knows
+    /// nothing about exactly as the user wrote it.
     #[test]
     fn a_hand_written_comment_survives_an_app_driven_save() {
         let dir = tempdir();
@@ -2908,9 +4839,9 @@ mod tests {
              mode = \"light\"  # flip this to \"dark\" at night\n\n\
              [zoom]\n\
              level = 1.0\n\n\
-             # everything below is for #802, not written by the app\n\
-             [voice]\n\
-             stages = [\"stt\", \"intent\"]\n",
+             # a section no build of this app owns\n\
+             [experiments]\n\
+             flags = [\"a\", \"b\"]\n",
         )
         .unwrap();
 
@@ -2929,9 +4860,9 @@ mod tests {
              mode = \"dark\"  # flip this to \"dark\" at night\n\n\
              [zoom]\n\
              level = 1.0\n\n\
-             # everything below is for #802, not written by the app\n\
-             [voice]\n\
-             stages = [\"stt\", \"intent\"]\n",
+             # a section no build of this app owns\n\
+             [experiments]\n\
+             flags = [\"a\", \"b\"]\n",
             "a hand-written annotation did not survive the save"
         );
     }
@@ -3939,7 +5870,10 @@ mod tests {
 
         // The disk path: still never fails a load. An over-length token is a
         // malformed document, not an unknown mode, so the fallback is the whole
-        // document rather than the one field — logged, and not a crash.
+        // SECTION rather than the one field — logged, and not a crash. The
+        // version beside it is untouched, which is
+        // [`sections_this_build_can_read`]: a refused value costs its own
+        // section and nothing else.
         let dir = tempdir();
         let path = dir.path().join(SETTINGS_FILE_NAME);
         std::fs::write(
@@ -3947,7 +5881,9 @@ mod tests {
             format!("version = 9\n[appearance]\nmode = \"{over}\"\n"),
         )
         .unwrap();
-        assert_eq!(load_from(&path), DesktopSettings::default());
+        let loaded = load_from(&path);
+        assert_eq!(loaded.appearance, AppearanceSettings::default());
+        assert_eq!(loaded.version, 9);
 
         // And exactly at the limit is still the ordinary unknown-value
         // fallback, which keeps the rest of the document.
@@ -3982,6 +5918,13 @@ mod tests {
         // endpoints unable to delete them (see `EndpointSettings`). The JSON
         // half below *does* change, to `"endpoints": null`, and that null is
         // the same statement on the IPC wire: "unspecified", not "empty".
+        //
+        // PRD #802 M4's `[voice]` is the second section to arrive this way and
+        // the reasoning is `endpoints`' rather than a weaker echo of it: a
+        // plain `VoiceSettings` would arrive as the default from any client
+        // that did not send one, and the merge would then write that default
+        // over a choice the user had made. So the TOML below is unchanged for
+        // a second time, and the JSON gains `"voice": null`.
         const FRESH: &str =
             "version = 1\n\n[appearance]\nmode = \"system\"\n\n[zoom]\nlevel = 1.0\n";
         let rendered = toml_edit::ser::to_string_pretty(&DesktopSettings::default()).unwrap();
@@ -4005,6 +5948,7 @@ mod tests {
                 "version": 1,
                 "appearance": { "mode": "system" },
                 "endpoints": null,
+                "voice": null,
                 "zoom": { "level": 1.0 },
             })
         );
@@ -4034,8 +5978,16 @@ mod tests {
         "passphrase",
     ];
 
-    /// The two shapes a credential-*shaped* key name is allowed to have, and
-    /// the concrete serialised type each one is.
+    /// The shapes a credential-*shaped* key name is allowed to have, and the
+    /// concrete serialised type each one is.
+    ///
+    /// **Two of the three are references to a credential; the third is not
+    /// about credentials at all.** [`Self::Count`] is here because
+    /// [`SECRETISH`] matches substrings and `token` is an ordinary English word
+    /// in a field like `max_tokens`. The list is therefore *paths whose name
+    /// trips the scan for a reason other than holding a credential*, which is
+    /// what it always was — the name `AllowedReference` predates the third
+    /// reason.
     ///
     /// **The type is half the exemption.** An exemption granted for a boolean
     /// "is one stored" would otherwise keep covering that path after someone
@@ -4048,9 +6000,15 @@ mod tests {
         /// A string, whose contents are ours rather than the user's.
         BackendName,
         /// A flag saying a credential is stored. A boolean, which cannot carry
-        /// credential material at all — the strongest of the two shapes, and
-        /// the one to prefer.
+        /// credential material at all — the strongest of the three shapes, and
+        /// the one to prefer where a reference is what is wanted.
         StoredFlag,
+        /// A **count**, whose name contains one of [`SECRETISH`] as a plain
+        /// English word rather than as a credential — `max_tokens`, where the
+        /// tokens are the model's units of output. An integer, which cannot
+        /// carry credential material at all, so this is as strong as
+        /// [`Self::StoredFlag`]; what it is not is a reference to anything.
+        Count,
     }
 
     impl AllowedReference {
@@ -4060,6 +6018,7 @@ mod tests {
             match self {
                 Self::BackendName => "string",
                 Self::StoredFlag => "boolean",
+                Self::Count => "integer",
             }
         }
     }
@@ -4069,17 +6028,31 @@ mod tests {
     /// the credential itself — the one carve-out PRD #803 allows — each paired
     /// with the concrete type that carve-out covers.
     ///
-    /// Empty, because nothing in today's schema needs an exception. It holds
-    /// paths and not bare names deliberately: `secret_backend` as a bare name
-    /// would exempt a field of that name in **every** section, including one
-    /// added later by someone who never read this rule, which is precisely the
-    /// silent-widening this list must not do.
+    /// One entry, and it is not a credential reference at all — see
+    /// [`AllowedReference::Count`]. It holds paths and not bare names
+    /// deliberately: `secret_backend` as a bare name would exempt a field of
+    /// that name in **every** section, including one added later by someone who
+    /// never read this rule, which is precisely the silent-widening this list
+    /// must not do.
     ///
     /// The form to add is one line — `("voice.secret_backend",
     /// AllowedReference::BackendName)` — and the shape is not a label: a path
     /// exempted as a [`AllowedReference::StoredFlag`] whose value is a string
     /// is reported as an offender, with the mismatch named.
-    const SECRETISH_ALLOWED: [(&str, AllowedReference); 0] = [];
+    const SECRETISH_ALLOWED: [(&str, AllowedReference); 1] = [
+        // PRD #802's answer ceiling. `token` is a substring of `max_tokens`,
+        // where it means a model's unit of output and nothing else: the value
+        // is an integer between 64 and 32768, bounded by
+        // `crate::model_service::TokenCeiling`, and it is sent as one field of
+        // a request body. The name is the one both wire dialects use and the
+        // one every LLM API a user has met spells it — renaming it to dodge a
+        // substring scan would cost more clarity than the scan buys here.
+        //
+        // The type is half the exemption, exactly as the enum's doc says: this
+        // covers `max_tokens` **while it is an integer**. Change it to a
+        // `String` and the tripwire fires again, naming the mismatch.
+        ("voice.intent.max_tokens", AllowedReference::Count),
+    ];
 
     const SECRET_RULE: &str = "\
 WHAT THIS CHECK IS: a NAMING TRIPWIRE, not a security boundary. It reads the \
@@ -4233,6 +6206,29 @@ forms it is.";
                     user: Some(SshUser::parse("dev").unwrap()),
                 }],
                 selection: Selection::One(EndpointId::parse("deck1").unwrap()),
+            }),
+            // PRD #802 M4. Present, and with a non-default value in every
+            // field: the tripwire and the sentinel sweep are both derived from
+            // a serialised document, so a section left `None` here would be a
+            // section neither of them walks — which is exactly the gap this
+            // function's own doc comment exists to close.
+            voice: Some(VoiceSettings {
+                activation: ActivationMode::Toggle,
+                intent: IntentSettings {
+                    backend: IntentBackend::Anthropic,
+                    endpoint: ServiceUrl::parse(HOSTED_COMMAND_ENDPOINT).unwrap(),
+                    model: ModelId::parse(HOSTED_COMMAND_MODEL).unwrap(),
+                    // Non-default, like every other field in this fixture: the
+                    // sentinel sweep walks a serialised document, so a field
+                    // left on its default is one it cannot tell apart from an
+                    // absent one.
+                    max_tokens: TokenCeiling::parse(1024).unwrap(),
+                },
+                transcription: TranscriptionSettings {
+                    backend: TranscriptionBackend::Remote,
+                    endpoint: ServiceUrl::parse(HOSTED_SPEECH_ENDPOINT).unwrap(),
+                    model: ModelId::parse(HOSTED_SPEECH_MODEL).unwrap(),
+                },
             }),
             ..DesktopSettings::default()
         }
@@ -5067,10 +7063,21 @@ forms it is.";
     // PRD #741 M6 — endpoint storage
     // ---------------------------------------------------------------------
 
-    /// Scenario: serialise a document holding one fully-specified remote deck,
-    /// save it, read it back, and pin the exact bytes. This is the shape a user
-    /// hand-edits and the shape M7's panel writes, so it is pinned the way the
-    /// default document is — a diff here is the review prompt.
+    /// Scenario: serialise a document holding one fully-specified remote deck
+    /// and a `[voice]` section, save it, read it back, and pin the exact bytes.
+    /// This is the shape a user hand-edits and the shape the panels write, so
+    /// it is pinned the way the default document is — a diff here is the review
+    /// prompt.
+    ///
+    /// It is also where the `[voice]` section is pinned as it appears ON DISK,
+    /// which is the half a user reads and hand-edits. PRD #802 M4 added the
+    /// section and its provider work nested the two stages under it; the
+    /// frontend's own copies are pinned against this crate by
+    /// `the_voice_tokens_match_the_frontends_copy` and
+    /// `the_voice_presets_match_the_frontends_copy`. Note the shape the nesting
+    /// produces: `activation` is a scalar and has to stay above both
+    /// sub-tables, because TOML puts every key of a table before the tables
+    /// that follow it.
     #[test]
     fn a_populated_endpoint_document_is_pinned_and_round_trips() {
         const STORED: &str = "\
@@ -5090,6 +7097,20 @@ jump = \"bastion\"
 port = 2222
 socket = \"/run/user/1000/dot-agent-deck-attach.sock\"
 user = \"dev\"
+
+[voice]
+activation = \"toggle\"
+
+[voice.intent]
+backend = \"anthropic\"
+endpoint = \"https://api.anthropic.com/v1/messages\"
+model = \"claude-haiku-4-5\"
+max_tokens = 1024
+
+[voice.transcription]
+backend = \"remote\"
+endpoint = \"https://api.openai.com/v1/audio/transcriptions\"
+model = \"whisper-1\"
 
 [zoom]
 level = 1.0
@@ -5679,7 +7700,18 @@ level = 1.0
         let original = "version = 7\n\n[appearance]\nmode = \"light\"\n\n[[endpoints.remote]]\nhost = \"build box\"\nid = \"d\"\n";
         std::fs::write(&path, original).unwrap();
 
-        assert_eq!(load_from(&path), DesktopSettings::default());
+        // The load recovers what it can read and defaults only the section it
+        // cannot ([`sections_this_build_can_read`]) — the refusal below is what
+        // #1072 is about, and it is unchanged by that: a document this build
+        // could not fully read is never published over, whatever was salvaged
+        // from it for the session.
+        let loaded = load_from(&path);
+        assert_eq!(loaded.version, 7);
+        assert_eq!(loaded.appearance.mode, AppearanceMode::Light);
+        assert_eq!(
+            loaded.endpoints, None,
+            "the unreadable row takes its section"
+        );
         save_to(&path, &dark()).expect_err("the document must not be written over");
 
         // Not "the row survived", which was the old and much weaker claim: the

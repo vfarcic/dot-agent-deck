@@ -374,13 +374,54 @@ describe("agent pane identity fence", () => {
   }
 
   /**
-   * Scenario: open Planner's pane from the deck and try to reach the screen
-   * behind it. Every control on the base screen — the deck selector above all —
-   * is inert, focus has moved into the pane, and closing gives the screen back
-   * exactly as it was.
-   */
-  it("makes the whole base screen inert while a pane is open, and gives it back on close", () => {
-    const deck = harness();
+   * Scenario: ask Voice to open Planner's pane, leaving its navigation Undo
+   * beside the pane. The trigger and Undo remain reachable while every base
+   * control is inert, and closing gives the screen back exactly as it was.
+  */
+  it("makes the base screen inert except for Voice and its Undo while a pane is open", async () => {
+    let recording = false;
+    let delivered = false;
+    const microphoneStatus = (state: "idle" | "recording" | "done") => ({
+      state,
+      capturedMs: state === "done" ? 900 : 0,
+      maxMs: 30_000,
+      capped: false,
+      available: true,
+      backend: "remote" as const,
+    });
+    const deck = harness(documentWithFleet(), {
+      resolveVoice: vi.fn(async (utterance: string) => ({
+        outcome: {
+          kind: "dispatch" as const,
+          transcript: utterance,
+          action: "open_agent",
+          invoke: "openAgent",
+          params: [{ name: "agent", kind: "agent_ref", spoken: "Planner", value: "planner", label: "Planner" }],
+          sentence: "Opening Planner.",
+        },
+        resolveMs: null,
+        backend: "stub",
+      })),
+      voiceStart: vi.fn(async () => {
+        recording = true;
+        return microphoneStatus("recording");
+      }),
+      voiceStatus: vi.fn(async () => {
+        if (!recording) return microphoneStatus("idle");
+        if (!delivered) {
+          delivered = true;
+          return microphoneStatus("done");
+        }
+        return microphoneStatus("recording");
+      }),
+      voiceStop: vi.fn(async () => ({
+        outcome: { kind: "heard" as const, transcript: "open Planner", sentence: "Heard: “open Planner”." },
+        transcribeMs: 12,
+        backend: "stub",
+        audioMs: 900,
+      })),
+      voiceCancel: vi.fn(async () => microphoneStatus("idle")),
+    });
     render(<DeckShell runtime={deck.runtime("local")} initialView={{ kind: "deck" }} />);
 
     // The control that makes this a security fix rather than an a11y one: it is
@@ -388,11 +429,15 @@ describe("agent pane identity fence", () => {
     expect(screen.getByTestId("deck-selector-toggle")).toBeVisible();
     expect(screen.getByTestId("deck-selector-toggle").closest("[inert]")).toBeNull();
 
-    fireEvent.click(screen.getByRole("button", { name: "Open Planner agent" }));
-    const pane = screen.getByTestId("agent-pane-overlay");
+    fireEvent.click(screen.getByTestId("voice-trigger"));
+    const pane = await screen.findByTestId("agent-pane-overlay");
+    const undo = screen.getByRole("button", { name: "Undo" });
 
     expect(screen.getByTestId("deck-selector-toggle").closest("[inert]")).not.toBeNull();
-    expect(reachableOutside(pane)).toEqual([]);
+    // Voice and its report are peers, not background. Equality to this complete
+    // set keeps the containment assertion strict: any other reachable control
+    // is a regression, rather than something an allow-list filter could hide.
+    expect(reachableOutside(pane)).toEqual([screen.getByTestId("voice-trigger"), undo]);
     // And the pane itself is genuinely live, so this is containment rather than
     // a screen that has simply been switched off.
     expect(within(pane).getByRole("button", { name: "Close Planner agent" })).toBeVisible();

@@ -9,6 +9,11 @@
   # GTK 3, WebKitGTK and glib. `devbox.json` provided none of them, so both
   # gates failed inside a `devbox shell` on Linux.
   #
+  # It is no longer only Tauri's stack: PRD #802 M7 put `cpal` in that crate for
+  # microphone capture, and `alsa-lib` is here for the same reason and with the
+  # same consequence. The description above says "Tauri needs" because that is
+  # what the flake was built for; read it as "the desktop crate needs".
+  #
   # WHY A FLAKE RATHER THAN PLAIN devbox.json ENTRIES
   #
   # Two reasons, both measured rather than assumed:
@@ -102,6 +107,18 @@
           #   libayatana-appindicator3-dev -> libayatana-appindicator
           #   librsvg2-dev                 -> librsvg
           #   libxdo-dev                   -> xdotool        (ships libxdo)
+          #
+          # PRD #802 M7 adds one more, and it is NOT Tauri's:
+          #
+          #   libasound2-dev               -> alsa-lib
+          #
+          # `cpal` is the desktop crate's microphone capture, and on Linux its
+          # `alsa-sys` build script resolves `alsa` through pkg-config. Without
+          # it the crate does not build at all in a devbox shell, which is both
+          # gates CLAUDE.md rule 2 and rule 5 mandate — the same failure shape
+          # issue #771 recorded for GTK, arriving by a different crate. macOS
+          # (CoreAudio) and Windows (WASAPI) need no dev package, so this is
+          # Linux-shaped like everything else here.
           deps = with pkgs; [
             glib
             gtk3
@@ -111,6 +128,7 @@
             librsvg
             xdotool
             dbus
+            alsa-lib
           ];
 
           # Freeze the PKG_CONFIG_PATH that Nix's own pkg-config setup hook

@@ -1,3 +1,4 @@
+import type { VoiceCommandDto, VoiceResolvedParamDto, VoiceResultDto, VoiceScreen, VoiceStatusDto, VoiceTranscriptionDto } from "../lib/bridge";
 import type { AgentProfile, AgentSession, AgentStatus, AgentTab, DeckSnapshot, EvidenceItem, WorkflowStage } from "../types";
 
 /**
@@ -708,5 +709,401 @@ export function createFixtureSnapshot(state: FixtureState = "connected"): DeckSn
     ],
     evidence: state === "empty" ? [] : evidence.map((item) => ({ ...item })),
     profiles: DEFAULT_PROFILES.map((profile) => ({ ...profile })),
+  };
+}
+
+/**
+ * PRD #802 M6 — the deterministic stand-in for the whole voice backend.
+ *
+ * # Why the vocabulary lives HERE and not in the panel
+ *
+ * The browser tier has no Tauri runtime at all — `vite preview` serving static
+ * files — so `FixtureDeckBridge` stands in for every Rust-side stage of the
+ * pipeline: transcribe, resolve, validate, report. That makes this the fixture's
+ * *model plus its command table*, which is fixture data, exactly like the
+ * snapshots above. A panel that carried its own vocabulary would be a second
+ * resolver, and the one property PRD #802 is built on — the app renders every
+ * sentence the user reads, and renders it once — would be gone: the panel would
+ * phrase in fixture mode what Rust phrases in live mode.
+ *
+ * # Exact matching, not substring or fuzzy
+ *
+ * A fixture is one instant held still, and a deterministic preview is worth
+ * having precisely because it cannot surprise anybody. Matching is trim plus
+ * lowercase and then equality, which is also what keeps the no-match path
+ * reachable: `Go, BACK to "Deck"?!` has to resolve to nothing, and any
+ * substring rule would have it matching the deck phrases below.
+ *
+ * # Every param-free row, and no other
+ *
+ * Every param-free row is here, so the fixture can answer it honestly with no
+ * resolver of its own. `open_agent` is the one left out: it would need a second
+ * `agent_ref` resolver here to reach at all — the real one, and every refusal
+ * it produces, is covered in `voice/outcome.rs` — and inventing a stand-in for
+ * it in a browser is the drift this module's placement is about.
+ *
+ * (This heading counted *three*, then four. It names the rule now rather than a
+ * number, so the next row does not have to remember to edit a heading.)
+ *
+ * **`dictate_to_agent` used to be left out for `open_agent`'s reason and is
+ * here now, because the param it declares changed shape.** It took an
+ * `agent_ref`; it takes a `spoken_prefix`, which resolves against the
+ * TRANSCRIPT rather than against live state. That is a rule a preview can
+ * reproduce exactly — strip the opener, type the rest — where a resolver over
+ * a live fleet is not. The row below says which half is reproduced and which
+ * half (the model fallback) still is not.
+ *
+ * **`close` was left out until the voice surface could be reached on the
+ * `agent` screen at all.** That screen's whole background — the voice trigger
+ * included — was marked `inert` by the pane's modal fence, so a fixture row for
+ * it answered a question nothing could ask. `useInertBackground` now exempts
+ * the voice surface as a peer dialog, so the question is askable and the row is
+ * here to answer it.
+ */
+const FIXTURE_VOICE_COMMANDS: ReadonlyArray<{
+  readonly phrases: readonly string[];
+  readonly action: string;
+  readonly invoke: string;
+  readonly screens: readonly VoiceScreen[];
+  readonly unavailableHint: string;
+  readonly report: string;
+  /**
+   * What a dispatch of this row carries, already resolved.
+   *
+   * **This is fixture DATA, not the `agent_ref` resolver the note above refuses
+   * to invent**, and the line between them is worth stating because it is the
+   * whole reason `open_agent` still has none. A resolver takes words nobody
+   * anticipated and finds an agent; this is one canned answer for one canned
+   * phrase, exactly like every sentence in this module. `open_agent`'s entire
+   * interest IS the resolution — the ambiguity, the no-match, the reference by
+   * state — which a canned answer cannot exercise and `voice/outcome.rs`
+   * already covers properly. `dictate_to_agent`'s interest is what happens
+   * AFTER a param resolves, which is precisely what a canned one lets the
+   * browser tier drive.
+   */
+  readonly params?: readonly VoiceResolvedParamDto[];
+  /**
+   * Words this row is matched by as a PREFIX rather than by equality, with
+   * everything after them becoming the row's `spoken_prefix` param.
+   *
+   * The one departure from equality matching in this module, and it reproduces
+   * the real fast path's rule rather than inventing one — see the dictation row
+   * below for why that is a different thing from inventing an `agent_ref`
+   * resolver.
+   */
+  readonly openers?: readonly string[];
+}> = [
+  {
+    phrases: ["show me every agent", "show me all the agents", "show me everything"],
+    action: "open_overview",
+    invoke: "openOverview",
+    screens: ["deck"],
+    unavailableHint: "the agent overview opens from the deck",
+    report: "Opening the agent overview.",
+  },
+  {
+    phrases: ["go back to the deck", "back to the deck", "show me the terminals"],
+    action: "open_deck",
+    invoke: "openDeck",
+    screens: ["overview"],
+    unavailableHint: "returning to the deck works from the agent overview",
+    report: "Back to the deck.",
+  },
+  {
+    // The VIEW, never the terminal pane — the same line `commands.toml` draws at
+    // this row, because the two are one word apart in speech. Callable on all
+    // three screens for `voice_off`'s reason: the real row has no `screens`
+    // column, because the overlay it dismisses can be up over any of them.
+    phrases: ["close this", "close", "close the agent view", "stop looking at this one"],
+    action: "close",
+    invoke: "closeTopmost",
+    screens: ["deck", "overview", "agent"],
+    unavailableHint: "closing what is on top works anywhere",
+    report: "Closed.",
+  },
+  {
+    // The only entry listing all three screens, because the real row lists
+    // NONE — an absent `screens` column means "everywhere". The fixture's own
+    // matcher is `screens.includes(screen)`, so an empty array here would mean
+    // the opposite of what an empty column means in `commands.toml`; spelling
+    // the three out is what keeps the preview and the table agreeing.
+    phrases: ["voice off", "turn off the voice", "stop listening"],
+    action: "voice_off",
+    invoke: "stopVoice",
+    screens: ["deck", "overview", "agent"],
+    unavailableHint: "turning voice off works anywhere",
+    report: "Voice control off.",
+  },
+  {
+    // Callable everywhere for the same reason, and listing ITSELF in the
+    // overlay it opens — which is correct rather than cute: a user who has
+    // forgotten the phrase is exactly who reads that list.
+    /* Lower case, because the matcher lowercases the utterance before
+       comparing: a phrase with a capital in it here can never be matched. */
+    phrases: ["what can i say?", "what can i say", "what can you do?", "help"],
+    action: "list_commands",
+    invoke: "showVoiceCommands",
+    screens: ["deck", "overview", "agent"],
+    unavailableHint: "the list of commands opens anywhere",
+    report: "Here is what you can say.",
+  },
+  {
+    // **Matched by OPENER rather than by phrase**, which is the one place this
+    // module reproduces a rule instead of canning an answer — and it is
+    // allowed to for the reason `agent_ref` is not: the fast path's rule is
+    // local, deterministic and complete (`voice::dictation::strip_opening`
+    // strips the opener and types the rest), so reproducing it invents
+    // nothing. What a fixture could not stand in for is the MODEL fallback,
+    // which is why the openers here are exactly the four the real fast path
+    // knows and no more.
+    //
+    // `screens: ["agent"]` matches the real row: the target is the pane on
+    // screen, so the preview's dictation tests open one first. The crowded
+    // fleet's `coder` is the pane they open, and that choice is the feature's
+    // own requirement rather than an arbitrary pick — dictation types into a
+    // pane, so the target has to be an agent whose pane accepts typing. Every
+    // agent in the `connected` deck fails that (`planner` and `reviewer` hold a
+    // read lease, `tester` has no live target, `builder` has finished) while
+    // the crowded fleet's `coder` is running and holds a write lease.
+    phrases: [],
+    openers: ["type", "write", "say", "dictate"],
+    action: "dictate_to_agent",
+    invoke: "dictateToAgent",
+    screens: ["agent"],
+    unavailableHint: "typing to an agent needs that agent's pane open — open one first",
+    report: "Typed.",
+  },
+  {
+    // Whole-utterance equality, which is what the phrase matcher already is —
+    // the real fast path draws the same line, and for the reason its own
+    // constant documents at length: a trailing rule would submit "the meeting
+    // is at the" when somebody said "type the meeting is at the end".
+    phrases: ["end", "send", "send it", "submit", "enter", "press enter"],
+    action: "submit_prompt",
+    invoke: "submitAgentPrompt",
+    screens: ["agent"],
+    unavailableHint: "sending a prompt needs an agent's pane open",
+    report: "Sent.",
+  },
+];
+
+/**
+ * The preview's vocabulary, annotated for one screen (PRD #802 D7).
+ *
+ * Derived from {@link FIXTURE_VOICE_COMMANDS} rather than written out, exactly
+ * as the live one is derived from `commands.toml`: the overlay lists what this
+ * bridge can actually resolve, so a row added above appears in it with no edit
+ * here.
+ *
+ * `description` is the one field the preview has to invent, because the fixture
+ * rows carry phrases rather than a prompt. It names the phrases, which is
+ * honest about what this stand-in is — a matcher over a fixed list — and is
+ * what a preview reader most needs to know.
+ */
+export function fixtureVoiceCommands(screen: VoiceScreen): VoiceCommandDto[] {
+  return FIXTURE_VOICE_COMMANDS.map((command) => ({
+    id: command.action,
+    description: `Say ${command.phrases.map((phrase) => `“${phrase}”`).join(", ")}.`,
+    callable: command.screens.includes(screen),
+    unavailable_hint: command.unavailableHint,
+    params: [],
+  }));
+}
+
+/**
+ * `Heard: “<transcript>” — <situation>.`
+ *
+ * The transcript goes in verbatim, exactly as `voice::outcome`'s `heard` does:
+ * seeing what was heard is what turns a mis-transcription into a correction the
+ * user can make, so this is not the seam that bounds or scrubs it. The webview
+ * scrubs its own display copy at the render seam.
+ */
+function fixtureHeard(transcript: string, situation: string): string {
+  return `Heard: “${transcript}” — ${situation}.`;
+}
+
+/**
+ * Resolve one utterance the way the Rust pipeline would, against the screen the
+ * webview has stated.
+ *
+ * `resolveMs` is `null` and the backend is `stub` because **no backend was
+ * called** — there is none in a browser. Reporting a plausible number here
+ * would be the preview inventing a measurement, which is the same fabrication
+ * `resolve_ms: None` exists to refuse on the Rust side.
+ */
+export function resolveFixtureVoice(utterance: string, screen: VoiceScreen): VoiceResultDto {
+  const spoken = utterance.trim().toLowerCase();
+  const stub = { resolveMs: null, backend: "stub" } as const;
+  const command = FIXTURE_VOICE_COMMANDS.find((candidate) => candidate.phrases.includes(spoken))
+    ?? FIXTURE_VOICE_COMMANDS.find((candidate) => (candidate.openers ?? []).some((opener) => fixtureOpening(utterance, opener) !== undefined));
+  if (!command) {
+    return { ...stub, outcome: { kind: "no_match", transcript: utterance, sentence: fixtureHeard(utterance, "no matching action") } };
+  }
+  if (!command.screens.includes(screen)) {
+    return {
+      ...stub,
+      outcome: { kind: "unavailable", transcript: utterance, action: command.action, hint: command.unavailableHint, sentence: `Not here — ${command.unavailableHint}.` },
+    };
+  }
+  /* The typed text is a slice of the UTTERANCE, never of anything this module
+     made up — which is the property the real pipeline holds and the preview
+     would be misleading about if it canned a string here. */
+  const opener = (command.openers ?? []).find((candidate) => fixtureOpening(utterance, candidate) !== undefined);
+  const text = opener === undefined ? undefined : fixtureOpening(utterance, opener);
+  const params: VoiceResolvedParamDto[] = text === undefined
+    ? [...command.params ?? []]
+    : [{ name: "prefix", kind: "spoken_prefix", spoken: opener!, value: text, label: text }];
+  return {
+    ...stub,
+    outcome: {
+      kind: "dispatch",
+      transcript: utterance,
+      action: command.action,
+      invoke: command.invoke,
+      params,
+      sentence: text === undefined ? command.report : `Typed: “${text}”.`,
+    },
+  };
+}
+
+/**
+ * Everything after `opener`, or `undefined` if the utterance does not open with
+ * it — the preview's copy of `voice::dictation::strip_opening`, matched on
+ * whole words so *"typescript is confusing"* does not open with *"type"*.
+ *
+ * A remainder of nothing is `undefined` too: *"type"* alone is not a dictation,
+ * exactly as it is not one in Rust, where it falls through to the model.
+ */
+function fixtureOpening(utterance: string, opener: string): string | undefined {
+  const words = utterance.trim();
+  const lowered = words.toLowerCase();
+  const marked = opener.toLowerCase();
+  if (!lowered.startsWith(marked)) return undefined;
+  const rest = words.slice(marked.length);
+  if (rest !== "" && /[\p{L}\p{N}]/u.test(rest[0])) return undefined;
+  const text = rest.replace(/^[\s:,-]+/u, "");
+  return text === "" ? undefined : text;
+}
+
+/**
+ * The bound a live capture is held to, echoed so the preview reports the same
+ * shape rather than a made-up one. Keep identical to `voice::MAX_UTTERANCE`.
+ */
+const FIXTURE_VOICE_MAX_MS = 30_000;
+
+/**
+ * The microphone the browser preview does not have (PRD #802 M7).
+ *
+ * With no overrides this reports a runtime that offers no microphone path at
+ * all, which is what the browser preview genuinely is: no Rust side, no
+ * container, and a CSP that leaves the webview unable to reach a network
+ * origin. That lets the browser tier drive the *unavailable* path with no
+ * microphone, no credential and no Tauri runtime anywhere near it — and the
+ * surface says how to turn voice on rather than looking broken.
+ *
+ * It is no longer what a live app reports on its defaults. PRD #802's provider
+ * work gave Speech a keyless container on loopback and deleted `off`, so the
+ * Tauri side now always reports `available: true` and the *not set up* case is
+ * reported where it bites, as a `not_configured` transcription outcome naming
+ * the container to start.
+ *
+ * The overrides are what lets the same tier drive the OTHER path — see
+ * {@link fixtureVoiceHeard}.
+ */
+export function fixtureVoiceStatus(overrides: Partial<VoiceStatusDto> = {}): VoiceStatusDto {
+  return {
+    state: "idle",
+    capturedMs: 0,
+    maxMs: FIXTURE_VOICE_MAX_MS,
+    capped: false,
+    // The preview has no microphone to hear speech with, so it reports none.
+    // An override is how a test drives the other answer — which is what PRD
+    // #802's dictation countdown is cancelled by.
+    speech: false,
+    available: false,
+    // The backend that WOULD answer, which for the preview is the app's own
+    // default — nothing does, and `available: false` is what says so. `off`
+    // stood here until the union was corrected, naming a variant PRD #802's
+    // provider work deleted and the wire has never carried.
+    backend: "local",
+    ...overrides,
+  };
+}
+
+/**
+ * What the preview says when something asks it to listen (PRD #802 M7's
+ * `TranscriptionOutcome::NotConfigured`).
+ *
+ * `not_configured` rather than `failed`, and the distinction is the point: the
+ * preview has no microphone because it is a browser, which is not a fault to
+ * report. `transcribeMs` is `null` for the reason `resolveFixtureVoice`'s is.
+ */
+export function fixtureVoiceTranscription(): VoiceTranscriptionDto {
+  return {
+    outcome: {
+      kind: "not_configured",
+      detail: "the browser preview has no microphone",
+      sentence: "Nothing to listen with — the browser preview has no microphone.",
+    },
+    transcribeMs: null,
+    backend: "off",
+    audioMs: 0,
+  };
+}
+
+/**
+ * The DEFAULT line the preview's simulated microphone says.
+ *
+ * A phrase from {@link FIXTURE_VOICE_COMMANDS} rather than a fresh literal, so
+ * a row renamed there changes what the preview hears instead of leaving a
+ * canned utterance that quietly stops resolving.
+ *
+ * It is not the only one it can say: `?voice=` on the preview URL supplies a
+ * whole script of utterances instead (see {@link fixtureVoiceScript}).
+ */
+export const FIXTURE_VOICE_UTTERANCE = FIXTURE_VOICE_COMMANDS[0].phrases[0];
+
+/**
+ * What the preview's microphone will say, in order, read off the URL.
+ *
+ * Repeated `?voice=` parameters rather than one delimited value: an utterance
+ * is a sentence and every delimiter worth choosing occurs inside one. The
+ * browser tier drives a whole session this way — *"type run the login tests"*,
+ * then *"send it"* — which is what lets a Playwright test ask about the
+ * utterance AFTER the first one, and a stand-in that spoke once could not be
+ * asked that at all.
+ *
+ * With no parameter it is the single canned utterance the preview has always
+ * had, so every existing page and test sees exactly what it saw before.
+ */
+export function fixtureVoiceScript(search: string): string[] {
+  const spoken = new URLSearchParams(search).getAll("voice").filter((phrase) => phrase.trim() !== "");
+  return spoken.length > 0 ? spoken : [FIXTURE_VOICE_UTTERANCE];
+}
+
+/**
+ * One simulated utterance, so the browser tier can drive the WHOLE voice loop
+ * (PRD #802 M6).
+ *
+ * The preview still has no microphone. What it has is a deterministic stand-in
+ * for one: with a transcription backend chosen in its settings, a start is
+ * accepted, the next status poll reports the utterance over, and this is what a
+ * stop returns. That is the segment → transcribe → resolve → execute → listen
+ * again cycle end to end, driven with no credential and no device — which is
+ * what the withdrawn typed path used to be the only way to reach.
+ *
+ * `transcribeMs` is `null` and the backend is `stub` for `resolveFixtureVoice`'s
+ * reason: nothing was transcribed, so there is no measurement to report.
+ */
+export function fixtureVoiceHeard(transcript: string = FIXTURE_VOICE_UTTERANCE): VoiceTranscriptionDto {
+  return {
+    outcome: {
+      kind: "heard",
+      transcript,
+      sentence: `Heard: “${transcript}”.`,
+    },
+    transcribeMs: null,
+    backend: "stub",
+    audioMs: 1_200,
   };
 }

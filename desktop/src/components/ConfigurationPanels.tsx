@@ -149,7 +149,7 @@ export function PromptLibraryPanel({ open, prompts, selectedId, onSelect, onClos
           <div><span className="eyebrow">PROMPT LIBRARY</span><h2 id="prompts-title">Saved prompts</h2><p>Reusable text for the launch task prompt and for messaging a running agent.</p></div>
           <button className="icon-button" aria-label="Close prompt library" onClick={onClose}><X size={18} /></button>
         </header>
-        <div className="local-only-notice project-notice"><BookMarked size={15} /><span><strong>Local library</strong> — prompts are stored on this Mac only. Nothing is written to the project's <code>.dot-agent-deck.toml</code>.</span></div>
+        <div className="local-only-notice project-notice"><BookMarked size={15} /><span><strong>Local library</strong> — prompts are stored on this device only. Nothing is written to the project's <code>.dot-agent-deck.toml</code>.</span></div>
 
         <div className="projects-layout">
           <aside className="project-library">

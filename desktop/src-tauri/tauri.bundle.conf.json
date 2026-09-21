@@ -4,6 +4,9 @@
   },
   "bundle": {
     "active": true,
-    "externalBin": ["binaries/dot-agent-deck"]
+    "externalBin": ["binaries/dot-agent-deck"],
+    "macOS": {
+      "infoPlist": "Info.plist"
+    }
   }
 }
