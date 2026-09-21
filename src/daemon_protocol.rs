@@ -1514,8 +1514,12 @@ pub enum AttachRequest {
     /// caller that cannot see the pane list can still present the choice.
     /// `KIND_SHUTDOWN` is deliberately left alone (the TUI's `Stop` button is a
     /// user who has already made this exact decision, in front of the pane list,
-    /// on the same machine); whether that path should be narrowed is issue
-    /// #1109's open question, not this verb's to answer.
+    /// on the same machine). Issue #1109 settled that it stays that way: it
+    /// gained a DISCLOSURE rather than a guard — its handler now calls
+    /// [`crate::daemon_stop::log_teardown_inventory`], naming the agents and
+    /// orchestration roles it is taking down — while the refusal stays here, on
+    /// the verbs whose caller can act on one. The argument, and the shapes that
+    /// were rejected, are in `docs/develop/daemon-teardown-paths.md`.
     ///
     /// **Who may ask** is unchanged by this, and deliberately so. The attach
     /// socket authenticates no peer: on Unix the trust story is mode `0o600`
@@ -2782,6 +2786,16 @@ async fn handle_connection(
         if let Err(e) = write_frame(&mut stream, KIND_SHUTDOWN_ACK, &[]).await {
             warn!(error = %e, "failed to write KIND_SHUTDOWN_ACK before shutdown — proceeding anyway");
         }
+        // Issue #1109: this frame carries no guard — it is the TUI's `Stop`
+        // button, a user who has already made this decision in front of the
+        // pane list — but it named nothing it destroyed, exactly as the signal
+        // path did. It gets the same disclosure, and for the same reason: the
+        // in-memory orchestration role maps die with this process and no later
+        // reader can reconstruct what they held. Before the drain, because
+        // `agent_records` filters to live agents and the drain empties the map.
+        // Ordered after the ack deliberately — the client waits 1 s for that
+        // frame, and this read is bounded but not free.
+        crate::daemon_stop::log_teardown_inventory(&state, &registry, "shutdown-frame").await;
         // Drop the registry's children with a 3-second grace window for
         // SIGTERM to take effect; survivors get SIGKILL via the existing
         // teardown.

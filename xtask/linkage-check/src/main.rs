@@ -56,7 +56,16 @@
 //!      with an innocuous name bypasses it, and only issue #176
 //!      M1.1 makes the invariant compiler-checked. See
 //!      [`desktop_project_boundary`].
-//!  13. The voice command table and the frontend action registry
+//!  13. No `git` program literal in the root crate's PRODUCTION
+//!      sources outside `src/git_env.rs`, which is the one place
+//!      the ambient git LOCATION environment is switched off. An
+//!      ambient `GIT_DIR` outranks both `-C <dir>` and
+//!      `current_dir`, so an un-neutralized `git` creates,
+//!      enumerates and DELETES worktrees in whatever repository
+//!      that variable names (issue #1181). A tripwire for the next
+//!      call site, which no runtime test can be. See
+//!      [`git_program_literal`].
+//!  14. The voice command table and the frontend action registry
 //!      resolve against each other — PRD #802 M3. Every `invoke` in
 //!      `commands.toml` names a `VOICE_ACTIONS` key, every `screens`
 //!      entry is a `DeckView` `kind`, every param `kind` is a
@@ -137,6 +146,10 @@ mod devbox_gtk_origin;
 /// only — the remedy is `gh aw compile`, not a hand-edit.
 #[cfg(test)]
 mod gh_aw_lock_consistency;
+/// Issue #1181: no `git` program literal in the root crate's production
+/// sources. Like `desktop_project_boundary` this carries a live rule — check
+/// 13 below — as well as its own tests.
+mod git_program_literal;
 /// Issue #603: the adaptive issue labeler's post-agent memory validator. Tests
 /// only — the rule lives in the agentic workflow, and these drive the real
 /// script under `node`.
@@ -1045,14 +1058,27 @@ fn main() -> ExitCode {
             .map(|v| format!("[12] {v}")),
     );
 
-    // Check 13 (PRD #802 M3): the voice command table and the frontend action
+    // Check 13 (issue #1181): no `git` program literal in the root crate's
+    // production sources. Read straight off `src/` rather than folded into the
+    // scan above, because that scan is line-based and this one has to track
+    // strings, comments, char literals and `#[cfg(test)]` item bodies across
+    // lines to tell a production literal from prose about one — and because
+    // `src/` or `src/git_env.rs` going missing must be reported rather than
+    // quietly emptying the rule.
+    failures.extend(
+        git_program_literal::run(&root)
+            .into_iter()
+            .map(|v| format!("[13] {v}")),
+    );
+
+    // Check 14 (PRD #802 M3): the voice command table and the frontend action
     // registry resolve against each other. Read straight off its own four files
     // for check 12's reason — a different tree, and an input going missing must
     // be reported rather than quietly emptying the rule.
     failures.extend(
         voice_command_registry::run(&root)
             .into_iter()
-            .map(|v| format!("[13] {v}")),
+            .map(|v| format!("[14] {v}")),
     );
 
     // Check 7 (PRD #77 Decision 30 / M4.3): every #[spec] test has
@@ -1069,7 +1095,7 @@ fn main() -> ExitCode {
 
     if failures.is_empty() {
         println!(
-            "linkage-check: ok ({} catalog ids, {} annotations, {} allowlisted, 13 rules)",
+            "linkage-check: ok ({} catalog ids, {} annotations, {} allowlisted, 14 rules)",
             catalog_ids.len(),
             discovered.len(),
             allowlist.len()

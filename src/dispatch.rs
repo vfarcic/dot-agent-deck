@@ -5,7 +5,7 @@ use crate::agent_pty::AgentPtyRegistry;
 use crate::event::BroadcastMsg;
 use crate::issue_dispatch_run::{
     RemovalPolicy, WorktreeCreation, WorktreeRegistry, create_worktree, record_worktree,
-    remove_worktree, run_capture_args, run_status,
+    remove_worktree, run_git_capture, run_git_status,
 };
 use crate::scheduler::StderrNotifier;
 use crate::spawn::{SpawnKind, SpawnRequest, SpawnShapeOverride, spawn};
@@ -252,10 +252,10 @@ fn derive_dispatch_paths(working_dir: &Path, name: &str) -> DispatchPaths {
 /// which is the state `git worktree add` will actually resolve.
 async fn describe_dispatch_base(clone_dir: &Path) -> Option<String> {
     let clone = clone_dir.to_string_lossy();
-    let head = run_capture_args("git", &["-C", &clone, "rev-parse", "--abbrev-ref", "HEAD"])
+    let head = run_git_capture(&["-C", &clone, "rev-parse", "--abbrev-ref", "HEAD"])
         .await
         .ok()?;
-    let sha = run_capture_args("git", &["-C", &clone, "rev-parse", "--short", "HEAD"])
+    let sha = run_git_capture(&["-C", &clone, "rev-parse", "--short", "HEAD"])
         .await
         .ok()?;
     let (head, sha) = (head.trim(), sha.trim());
@@ -817,12 +817,10 @@ async fn rollback_dispatched_worktree(
     // Also delete the branch: `git worktree remove` never deletes it, but on this
     // rollback path no agent is running so there is no committed work to protect —
     // leaving the branch would wedge this name for every later dispatch.
-    let branch_cleanup_failed = run_status(
-        "git",
-        &["-C", &clone_dir.to_string_lossy(), "branch", "-D", branch],
-    )
-    .await
-    .is_err();
+    let branch_cleanup_failed =
+        run_git_status(&["-C", &clone_dir.to_string_lossy(), "branch", "-D", branch])
+            .await
+            .is_err();
 
     if branch_cleanup_failed {
         tracing::warn!(

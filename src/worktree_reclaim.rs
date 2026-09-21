@@ -16,12 +16,19 @@
 //!
 //! No daemon/protocol involvement: this is a CLI verb that shells out to
 //! `git` and `gh` directly, synchronously — no `PROTOCOL_VERSION` bump.
+//!
+//! Every `git` in this module's production code is built by
+//! [`crate::git_env::git_at`], so the directory this module chose is the
+//! repository git acts on — not whatever an ambient `GIT_DIR` names (issue
+//! #1181). `xtask/linkage-check`'s rule 13 keeps that true for the next call
+//! site; `tests::ambient_location` proves it of the ones that exist.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use serde::Serialize;
 
+use crate::git_env::git_at;
 use crate::worktree_owner::{is_marked, path_from_bytes};
 
 /// Version of the `--json` document shape. Bump on a field removal or a
@@ -244,8 +251,7 @@ fn parse_worktree_porcelain(bytes: &[u8]) -> Vec<RawWorktree> {
 /// Enumerate linked worktrees (excludes the main working tree) for the repo
 /// rooted at or above `repo_dir`.
 fn list_linked_worktrees(repo_dir: &Path) -> Result<Vec<RawWorktree>, String> {
-    let out = Command::new("git")
-        .current_dir(repo_dir)
+    let out = git_at(repo_dir)
         .args(["worktree", "list", "--porcelain", "-z"])
         .output()
         .map_err(|e| format!("failed to spawn `git worktree list`: {e}"))?;
@@ -275,8 +281,7 @@ pub enum Cleanliness {
 }
 
 fn check_cleanliness(worktree_path: &Path) -> Cleanliness {
-    let out = Command::new("git")
-        .current_dir(worktree_path)
+    let out = git_at(worktree_path)
         .args(["status", "--porcelain"])
         .output();
     match out {
@@ -330,8 +335,7 @@ fn ownership_of(worktree_path: &Path) -> Ownership {
 /// (`gh` only ever talks to GitHub, so a non-GitHub remote must never resolve
 /// to a slug `gh` would misinterpret rather than reject).
 fn derive_repo_slug(repo_dir: &Path) -> Option<String> {
-    let out = Command::new("git")
-        .current_dir(repo_dir)
+    let out = git_at(repo_dir)
         .args(["remote", "get-url", "origin"])
         .output()
         .ok()?;
@@ -547,9 +551,15 @@ pub fn format_list_human(reports: &[WorktreeReport]) -> String {
 /// `--force`, since [`examine_worktrees`] already gated on cleanliness; git's
 /// own refusal on an unexpectedly dirty tree is a second line of defense
 /// rather than something to override.
+///
+/// Both of those defenses are only worth what the repository they resolve is
+/// worth, which is why this goes through [`git_at`] (issue #1181): with an
+/// ambient `GIT_DIR` set, the `-z` enumeration above, the cleanliness gate and
+/// this removal each resolved whatever repository that variable named, so the
+/// gate protected one repository while the removal deleted a worktree from
+/// another — measured, and git reported success.
 fn remove_worktree_dir(repo_dir: &Path, worktree_path: &Path) -> Result<(), String> {
-    let out = Command::new("git")
-        .current_dir(repo_dir)
+    let out = git_at(repo_dir)
         .args(["worktree", "remove"])
         .arg(worktree_path)
         .output()
@@ -916,5 +926,415 @@ mod tests {
             rendered.contains("/home/me/code/repo-feature"),
             "an all-ASCII path must appear verbatim inside its rendering; got {rendered:?}"
         );
+    }
+
+    /// Issue #1181: the ambient git *location* environment must not be able to
+    /// steer this module's removals, or the dispatch paths' creations, into a
+    /// repository the code never chose.
+    ///
+    /// Unix-gated, like `xtask/linkage-check`'s `mod real_git` and this crate's
+    /// other real-fixture suites. **The defect is not Unix-specific and neither is
+    /// the fix** — [`crate::git_env`] carries no `cfg` — but the fixture is: it
+    /// re-execs the test binary and drives `git worktree add`/`remove` against
+    /// paths it then asserts are gone from disk, and neither of those has been
+    /// exercised on Windows here. `build-windows` still type-checks and lints
+    /// every module this touches.
+    #[cfg(unix)]
+    mod ambient_location {
+        use std::path::{Path, PathBuf};
+
+        use crate::git_env::fixture_git;
+        use crate::worktree_reclaim::{
+            Cleanliness, check_cleanliness, list_linked_worktrees, remove_worktree_dir,
+        };
+
+        /// Marker in the child's environment: this process is the re-exec'd half
+        /// of [`reclaim_and_dispatch_git_ignore_the_ambient_location_env`].
+        const AMBIENT_CHILD: &str = "DOT_AGENT_DECK_AMBIENT_GIT_CHILD";
+
+        /// Where the parent built the two repositories, handed to the child.
+        const AMBIENT_SANDBOX: &str = "DOT_AGENT_DECK_AMBIENT_GIT_SANDBOX";
+
+        /// That test's own name, used as the child's libtest filter. A rename
+        /// that misses this makes the child match zero tests — which libtest
+        /// exits 0 for, so the parent asserts on `1 passed` rather than on the
+        /// status alone.
+        const AMBIENT_TEST: &str = "reclaim_and_dispatch_git_ignore_the_ambient_location_env";
+
+        /// A branch name that exists in BOTH repositories, so the `branch -D` the
+        /// child runs against the clone has something to destroy in the decoy if
+        /// it is steered there.
+        const SHARED_BRANCH: &str = "shared";
+
+        /// The variable names this test expects the neutralization to cover,
+        /// held independently of [`crate::git_env::AMBIENT_LOCATION_VARS`] so
+        /// that list cannot drift silently.
+        ///
+        /// **A deliberate second copy, and the one place a second copy is
+        /// right.** Everywhere else in this change a second list is the
+        /// defect, because production behaviour reads one of them and a
+        /// missing entry is silent. Here nothing reads it but an equality
+        /// assertion, and what it buys is the failure direction the shared
+        /// list cannot give: DELETING an entry makes production stop clearing
+        /// that variable *and* makes this test stop setting it, so the run
+        /// stays green while the hole reopens. Adding one is already caught,
+        /// by [`ambient_value`]'s `panic!` on a name it does not know — so
+        /// with both, a change in either direction has to be made here too, on
+        /// purpose.
+        const EXPECTED_VARS: [&str; 8] = [
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+            "GIT_COMMON_DIR",
+            "GIT_DIR",
+            "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+            "GIT_INDEX_FILE",
+            "GIT_NAMESPACE",
+            "GIT_OBJECT_DIRECTORY",
+            "GIT_WORK_TREE",
+        ];
+
+        /// What each variable in [`crate::git_env::AMBIENT_LOCATION_VARS`] is set
+        /// to in the child, all aimed at the decoy.
+        ///
+        /// Derived from that list rather than written out beside it, and
+        /// panicking on a name it does not know: adding a variable to the
+        /// neutralization without staging it here fails loudly instead of leaving
+        /// this test silently not covering it.
+        fn ambient_value(var: &str, decoy: &Path) -> std::ffi::OsString {
+            match var {
+                "GIT_DIR" | "GIT_COMMON_DIR" => decoy.join(".git").into_os_string(),
+                "GIT_WORK_TREE" => decoy.as_os_str().to_os_string(),
+                "GIT_INDEX_FILE" => decoy.join(".git").join("index").into_os_string(),
+                "GIT_OBJECT_DIRECTORY" | "GIT_ALTERNATE_OBJECT_DIRECTORIES" => {
+                    decoy.join(".git").join("objects").into_os_string()
+                }
+                "GIT_NAMESPACE" => "escape".into(),
+                "GIT_DISCOVERY_ACROSS_FILESYSTEM" => "1".into(),
+                other => panic!(
+                    "{other} was added to AMBIENT_LOCATION_VARS without being \
+                 staged here, so this test would silently stop covering it"
+                ),
+            }
+        }
+
+        /// A repository with one empty commit on `main`, built by
+        /// [`fixture_git`] so no developer `~/.gitconfig` and no ambient git
+        /// environment reaches it.
+        fn init_repo(sandbox: &Path, name: &str) -> PathBuf {
+            let repo = sandbox.join(name);
+            std::fs::create_dir_all(&repo).expect("create the fixture repo dir");
+            run_fixture(sandbox, &repo, &["init", "--quiet", "-b", "main"]);
+            run_fixture(
+                sandbox,
+                &repo,
+                &["commit", "--quiet", "--allow-empty", "-m", "base"],
+            );
+            repo
+        }
+
+        fn run_fixture(sandbox: &Path, repo: &Path, args: &[&str]) {
+            fixture_stdout(sandbox, repo, args);
+        }
+
+        fn fixture_stdout(sandbox: &Path, repo: &Path, args: &[&str]) -> String {
+            let out = fixture_git(repo, sandbox)
+                .args(args)
+                .output()
+                .expect("run a fixture git");
+            assert!(
+                out.status.success(),
+                "fixture precondition: `git {}` failed: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        }
+
+        /// The production-side twin of `xtask/linkage-check`'s
+        /// `sandbox_git_ignores_ambient_location_env` (issue #834), against the
+        /// paths issue #1181 measured: `git`'s location discovery is steerable
+        /// from the environment, and `GIT_DIR` and its siblings outrank both the
+        /// `current_dir` this module passes and the `-C <dir>`
+        /// `issue_dispatch_run` and `dispatch` pass.
+        ///
+        /// Real `git` and real repositories rather than a stub, for the reason
+        /// CLAUDE.md rule 5 records for that file's `mod real_git` and rule 14
+        /// records for `clean_tmp.rs`: what is being asserted is which repository
+        /// a deletion lands in, and no fixture short of a real one can answer
+        /// that. Two empty-commit repositories in a `test_temp::tempdir()`, no
+        /// network, no sleeps, ~1s wall.
+        ///
+        /// **The re-exec is what keeps it honest.** The variables have to be in
+        /// the environment *before* the process starts to reproduce the real
+        /// condition — a daemon lazy-spawned from inside a `rebase --exec`, a
+        /// pre-commit hook or a `bisect run` — and setting them in-process would
+        /// be `unsafe` and would race every other test sharing the process under
+        /// a threaded runner.
+        ///
+        /// **The child's control is what stops it passing vacuously.** An
+        /// un-neutralized `git` from inside the clone must resolve the DECOY, or
+        /// the staging failed and every assertion after it proves nothing.
+        #[tokio::test]
+        async fn reclaim_and_dispatch_git_ignore_the_ambient_location_env() {
+            if std::env::var_os(AMBIENT_CHILD).is_some() {
+                ambient_location_child().await;
+                return;
+            }
+
+            // Before anything else: the neutralization must still cover the
+            // variables this test was written against. A deletion from
+            // `AMBIENT_LOCATION_VARS` would otherwise take the coverage with
+            // it and leave the run green — see `EXPECTED_VARS`.
+            // Compared as SLICES, not arrays: a removal changes the array's
+            // length, and array `assert_eq!` against a different length is a
+            // type error whose message is rustc's rather than the one below —
+            // which is the message that says what to do about it.
+            let mut covered: Vec<&str> = crate::git_env::AMBIENT_LOCATION_VARS.to_vec();
+            covered.sort_unstable();
+            assert_eq!(
+                covered.as_slice(),
+                EXPECTED_VARS.as_slice(),
+                "AMBIENT_LOCATION_VARS changed. Production neutralizes exactly \
+                 what is in it, and this test stages exactly what is in it, so \
+                 a removal would silently narrow both. Update EXPECTED_VARS and \
+                 `ambient_value` deliberately, or put the variable back"
+            );
+            let scratch = crate::test_temp::tempdir().expect("scratch tempdir");
+            let sandbox = scratch.path();
+            // The victim: the repository the ambient variables name. Nothing the
+            // child runs is ever pointed at it.
+            let decoy = init_repo(sandbox, "decoy");
+            let clone = init_repo(sandbox, "clone");
+            // A branch of the same name in BOTH, so the `branch -D` the child runs
+            // against the clone has something to destroy here if it is steered.
+            for repo in [&decoy, &clone] {
+                run_fixture(sandbox, repo, &["branch", SHARED_BRANCH]);
+            }
+            // A linked worktree of the decoy's own, so the enumeration the removal
+            // decision is made from has a wrong answer available to give.
+            let decoy_wt = sandbox.join("decoy-wt");
+            run_fixture(
+                sandbox,
+                &decoy,
+                &[
+                    "worktree",
+                    "add",
+                    &decoy_wt.to_string_lossy(),
+                    "-b",
+                    "decoy/own",
+                ],
+            );
+            // …and make the decoy dirty, so the cleanliness gate — the check that
+            // protects an unexpectedly dirty tree from removal — has a wrong
+            // answer available too.
+            std::fs::write(decoy.join("untracked"), b"x").expect("dirty the decoy");
+
+            let head_before = fixture_stdout(sandbox, &decoy, &["rev-parse", "HEAD"]);
+            let branches_before = fixture_stdout(
+                sandbox,
+                &decoy,
+                &["branch", "--list", "--format=%(refname:short)"],
+            );
+            let worktrees_before =
+                fixture_stdout(sandbox, &decoy, &["worktree", "list", "--porcelain"]);
+
+            let exe = std::env::current_exe().expect("current_exe: this is a test binary");
+            let mut child = std::process::Command::new(&exe);
+            child
+                .args([AMBIENT_TEST, "--nocapture", "--test-threads=1"])
+                .env(AMBIENT_CHILD, "1")
+                .env(AMBIENT_SANDBOX, sandbox)
+                // Configuration, not location: keeps a developer's `~/.gitconfig`
+                // out of the child without touching the thing under test.
+                .env("GIT_CONFIG_GLOBAL", sandbox.join("no-such-gitconfig"))
+                .env("GIT_CONFIG_SYSTEM", sandbox.join("no-such-gitconfig"))
+                .env("GIT_CONFIG_NOSYSTEM", "1");
+            for var in crate::git_env::AMBIENT_LOCATION_VARS {
+                child.env(var, ambient_value(var, &decoy));
+            }
+            let out = child.output().expect("re-exec this test binary");
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+
+            // The write half, which is where the data loss is, and it is
+            // checked BEFORE the child's own verdict: a write that landed here
+            // must be reported as that, rather than masked by whichever
+            // assertion the child happened to trip over first. Unfixed, the
+            // child's `create_worktree` registers its branch and its worktree
+            // HERE, its `branch -D` deletes this repository's branch, and its
+            // `worktree remove` deletes a directory out of this repository.
+            assert_eq!(
+                fixture_stdout(sandbox, &decoy, &["rev-parse", "HEAD"]),
+                head_before,
+                "the child moved the decoy's HEAD"
+            );
+            assert_eq!(
+                fixture_stdout(
+                    sandbox,
+                    &decoy,
+                    &["branch", "--list", "--format=%(refname:short)"]
+                ),
+                branches_before,
+                "the decoy's branches changed: the child either created one here \
+             (`worktree add`) or deleted one here (`branch -D`) — issue #1181"
+            );
+            assert_eq!(
+                fixture_stdout(sandbox, &decoy, &["worktree", "list", "--porcelain"]),
+                worktrees_before,
+                "the decoy's worktree registry changed — a `worktree add` or a \
+             `worktree remove` landed in the repository the ambient `GIT_DIR` \
+             named rather than the one the code chose"
+            );
+            assert!(
+                decoy_wt.is_dir(),
+                "the decoy's own worktree was DELETED FROM DISK by a removal aimed \
+             at the clone — the outcome issue #1181 measured"
+            );
+
+            // …and only then the child's own verdict, which covers the other
+            // half: that the calls still did what they were asked to do, against
+            // the clone.
+            assert!(
+                out.status.success(),
+                "the production git calls must ignore every ambient location \
+             variable\n--- child stdout ---\n{stdout}\n--- child stderr ---\n{stderr}"
+            );
+            assert!(
+                stdout.contains("1 passed"),
+                "the child must have run exactly the test named by AMBIENT_TEST \
+             ({AMBIENT_TEST}); zero matches exit 0 too, which is the \
+             fail-green this asserts away\n{stdout}"
+            );
+        }
+
+        /// The re-exec'd half: every variable in
+        /// [`crate::git_env::AMBIENT_LOCATION_VARS`] is set in this process's own
+        /// environment, aimed at the decoy, and every call below is made against
+        /// the clone.
+        async fn ambient_location_child() {
+            // Vacuity guard first: if the parent failed to hand these down, every
+            // assertion below passes while proving nothing.
+            for var in crate::git_env::AMBIENT_LOCATION_VARS {
+                assert!(
+                    std::env::var_os(var).is_some(),
+                    "the parent must set {var} in this child, or this test proves \
+                 nothing at all"
+                );
+            }
+            let sandbox = PathBuf::from(
+                std::env::var_os(AMBIENT_SANDBOX).expect("the parent must name its sandbox"),
+            );
+            let clone = sandbox.join("clone");
+            let decoy = sandbox.join("decoy");
+
+            // The control. An un-neutralized `git` from inside the clone must
+            // resolve the DECOY — otherwise the ambient environment is not
+            // actually in force here and nothing below is a test.
+            let raw = std::process::Command::new("git")
+                .current_dir(&clone)
+                .args(["rev-parse", "--absolute-git-dir"])
+                .output()
+                .expect("run git rev-parse");
+            assert!(
+                raw.status.success(),
+                "control: `git rev-parse` must succeed"
+            );
+            let raw_git_dir =
+                PathBuf::from(String::from_utf8_lossy(&raw.stdout).trim().to_string());
+            assert_eq!(
+                std::fs::canonicalize(&raw_git_dir).expect("canonicalize the control's answer"),
+                std::fs::canonicalize(decoy.join(".git")).expect("canonicalize the decoy"),
+                "control: an un-neutralized `git` run from inside the clone must \
+             resolve the DECOY, or this test stages nothing"
+            );
+
+            // 1. CREATE — `issue_dispatch_run::create_worktree`, the only `git
+            //    worktree add` in `src/`.
+            let wt = sandbox.join("wt");
+            let created = crate::issue_dispatch_run::create_worktree(
+                &clone,
+                &wt,
+                "agent/ambient-probe",
+                false,
+                crate::worktree_owner::Creator::dispatch("ambient"),
+            )
+            .await
+            .expect("create_worktree must succeed against the clone");
+            assert_eq!(
+                created,
+                crate::issue_dispatch_run::WorktreeCreation::Created,
+                "the worktree must have been created, not claimed or refused"
+            );
+            assert!(wt.is_dir(), "the worktree directory must exist");
+
+            // 2. READ — the enumeration `examine_worktrees` makes its removal
+            //    decision from. The decoy has a linked worktree of its own, so a
+            //    steered answer is available and wrong.
+            let listed = list_linked_worktrees(&clone).expect("list the clone's linked worktrees");
+            let paths: Vec<PathBuf> = listed
+                .iter()
+                .map(|w| std::fs::canonicalize(&w.path).unwrap_or_else(|_| w.path.clone()))
+                .collect();
+            assert_eq!(
+                paths,
+                vec![std::fs::canonicalize(&wt).expect("canonicalize the worktree")],
+                "the enumeration must list the CLONE's worktrees; listing the \
+             decoy's steers every removal decision made from it"
+            );
+
+            // 3. The cleanliness gate, on the same steering. The decoy is dirty
+            //    and the clone's worktree is clean, so a steered probe reports
+            //    `Dirty` for a tree that is not.
+            assert_eq!(
+                check_cleanliness(&wt),
+                Cleanliness::Clean,
+                "the cleanliness gate must probe the worktree it was handed"
+            );
+
+            // 4. DELETE a branch — `dispatch.rs`'s rollback shape, through the
+            //    helper it now goes through. `SHARED_BRANCH` exists in both
+            //    repositories; the parent asserts the decoy's survived.
+            crate::issue_dispatch_run::run_git_status(&[
+                "-C",
+                &clone.to_string_lossy(),
+                "branch",
+                "-D",
+                SHARED_BRANCH,
+            ])
+            .await
+            .expect("deleting the clone's own branch must succeed");
+
+            // 5. DELETE a worktree — `worktree_reclaim`'s own removal, the one
+            //    that runs unattended once the three gates hold.
+            remove_worktree_dir(&clone, &wt).expect("removing the clone's worktree must succeed");
+            assert!(!wt.exists(), "the clone's worktree must be gone from disk");
+
+            // 6. DELETE a worktree — `issue_dispatch_run::remove_worktree`, the
+            //    tab-close and rollback path, which is a different call site.
+            let wt2 = sandbox.join("wt2");
+            let created2 = crate::issue_dispatch_run::create_worktree(
+                &clone,
+                &wt2,
+                "agent/ambient-probe-2",
+                false,
+                crate::worktree_owner::Creator::dispatch("ambient"),
+            )
+            .await
+            .expect("create_worktree must succeed the second time too");
+            assert_eq!(
+                created2,
+                crate::issue_dispatch_run::WorktreeCreation::Created
+            );
+            let kept = crate::issue_dispatch_run::remove_worktree(
+                &wt2,
+                &clone,
+                crate::issue_dispatch_run::RemovalPolicy::Force,
+            )
+            .await;
+            assert!(
+                kept.is_none(),
+                "the removal must report nothing left behind: {kept:?}"
+            );
+            assert!(!wt2.exists(), "the second worktree must be gone from disk");
+        }
     }
 }

@@ -5,7 +5,9 @@ title: Remote Environments
 
 # Remote Environments
 
-A **remote environment** is a per-project Linux host that runs the deck — both the daemon and the TUI live on the remote. Your laptop is just a terminal: `dot-agent-deck connect` is an `ssh -t` wrapper that runs the TUI on the remote, and the local terminal forwards keystrokes in and renders the bytes that come back. When the ssh session ends, the daemon and agents on the remote keep running.
+A **remote environment** is a per-project host that runs the deck — the agents, and everything supervising them, live on the remote. Linux and Apple Silicon macOS are both validated end to end; a Mac needs two extra setup steps, listed in [Remote Environment Requirements](remote-requirements.md#macos-as-a-remote-host). Your laptop is just a terminal: `dot-agent-deck connect` opens an ssh session and runs the deck on the host, so your usual ssh config and keys apply. When you disconnect, the agents on the remote keep running.
+
+Two words carry the whole page, so they are worth pinning down. **Your laptop** is whatever machine you run `dot-agent-deck connect` from; the **host** (or **remote**) is the machine running the deck and the agents. That is a split of *roles*, not of hardware — a host can perfectly well be a laptop itself, and an old one left plugged in at home is a supported setup. Wherever this page says "your laptop", it means the machine you are connecting from, never the one the agents are running on.
 
 This page covers how that works in practice: the lifecycle model, the difference between "stop" and "detach", the failure modes you'll see when a connect goes wrong, and how hooks behave on the remote.
 
@@ -21,7 +23,7 @@ dot-agent-deck remote add my-vm user@host
 dot-agent-deck connect my-vm
 ```
 
-`remote add` ssh's into the host, installs the `dot-agent-deck` binary into `~/.local/bin/dot-agent-deck`, runs `hooks install`, and writes a registry entry to `~/.config/dot-agent-deck/remotes.toml`. `connect` runs `ssh -t` to the remote and execs `dot-agent-deck` there with `DOT_AGENT_DECK_VIA_DAEMON=1`, so the TUI runs on the remote and attaches to a local-on-remote daemon over a Unix socket. The laptop process blocks until ssh exits and propagates the remote exit code.
+`remote add` connects over ssh, installs `dot-agent-deck` to `~/.local/bin/dot-agent-deck` on the host, sets up the agent hooks, and records the remote in `~/.config/dot-agent-deck/remotes.toml`. `connect` then opens an ssh session and runs the deck there. Your local command stays in the foreground for as long as the session lasts and exits with the remote's exit code, so it behaves predictably in a script.
 
 Other registry commands:
 
@@ -54,26 +56,26 @@ dot-agent-deck remote add my-vm deck@198.51.100.10 \
 
 ## Lifecycle model
 
-Everything except the terminal lives on the remote: the daemon owns the agent PTYs, the TUI attaches to the daemon over a Unix socket, and `ssh -t` carries terminal bytes between the laptop and the remote shell.
+Everything except the terminal lives on the remote — the agents run there, and so does the part of the deck that supervises them and outlives your session. ssh carries the terminal back and forth and nothing else.
 
 ```
 laptop                       remote host
-+-----------+   ssh -t      +-----------------------------------+
-| terminal  | <-----------> | dot-agent-deck TUI                |
-| (xterm,   |  stdin/stdout |    ^                              |
-|  iTerm…)  |               |    | unix socket (attach proto)   |
++-----------+    ssh        +-----------------------------------+
+| terminal  | <-----------> | dot-agent-deck (what you see)     |
+| (xterm,   |               |    ^                              |
+|  iTerm…)  |               |    | stays on the host            |
 +-----------+               |    v                              |
                             | dot-agent-deck daemon             |
                             |    |                              |
-                            |    +-- PTY --> agent #1           |
-                            |    +-- PTY --> agent #2           |
+                            |    +--> agent #1                  |
+                            |    +--> agent #2                  |
                             +-----------------------------------+
 ```
 
 Three properties follow from this shape:
 
-1. **Agents survive your laptop.** Close the lid, lose Wi-Fi, kill the ssh session — the remote TUI process dies with its terminal, but the daemon and agents are separate processes and keep running. Reconnect later from the same laptop or a different one. A sleep or network drop reconnects on its own without closing the tab (see [Surviving sleep/wake](#surviving-sleepwake)); an explicit `connect` is only needed after you deliberately quit or move to another machine. The one and only thing that stops your remote agents is **you choosing to upgrade-and-restart** the remote daemon — never a detach, sleep, network drop, or machine switch. Upgrading the remote binary swaps the file on disk but leaves the running daemon (and its agents) alone; the daemon is recycled only when you consent to it on the next attach (see [Version skew and the upgrade nudge](#version-skew-and-the-upgrade-nudge)).
-2. **Hooks never cross the network.** Agents run on the remote and so does the daemon; hook events travel over a Unix socket on the remote. Network drops do not lose hook events.
+1. **Agents outlive your connection, not the host.** Shut the lid of the machine you connected *from*, lose its Wi-Fi, kill the ssh session — the TUI running on the host dies with its terminal, but the daemon and agents are separate processes on the host and keep running. Reconnect later from the same laptop or a different one. A sleep or network drop reconnects on its own without closing the tab (see [Surviving sleep/wake](#surviving-sleepwake)); an explicit `connect` is only needed after you deliberately quit or move to another machine. The only thing **on your side** that stops your remote agents is choosing to upgrade-and-restart the remote daemon — never a detach, your machine sleeping, a network drop, or a switch to another machine. On the host's side, anything that stops the host stops its agents with it: a reboot, a shutdown, or the machine going to sleep, which is why a Mac host needs [`pmset`](remote-requirements.md#macos-as-a-remote-host) and why nothing restarts the daemon after a reboot unless you arrange it. Upgrading the remote binary swaps the file on disk but leaves the running daemon (and its agents) alone; the daemon is recycled only when you consent to it on the next attach (see [Version skew and the upgrade nudge](#version-skew-and-the-upgrade-nudge)).
+2. **Hooks never cross the network.** The agents and the daemon are both on the remote, so the events agents emit never leave the host. A network drop cannot lose them.
 3. **One environment per project.** A remote is registered to a single project's working tree on the host. Running multiple projects on one host is supported (one directory per project under `~/projects/`), but each project should still be one registered remote.
 
 ## Stop vs detach
@@ -84,7 +86,7 @@ Two distinct user actions; very different consequences.
 |---|---|---|
 | **Stop** (`Ctrl+W` from command mode, then **Close**) | Stops the agent on the remote and removes its card. If the agent had already exited, the card is removed anyway rather than wedging on an error you can never clear. | You're done with the agent; want it gone. |
 | **Detach** (Ctrl+C in dashboard, then "Detach" in the dialog) | The TUI tells the daemon you are leaving deliberately, then exits. The daemon records a clean detach and keeps the agents running. The ssh session ends when the TUI exits. | You want to step away and come back later, and want the daemon's logs to show a voluntary detach. |
-| **Quit** (Ctrl+C in dashboard, then "Quit") | The TUI exits without sending a detach frame. The daemon observes EOF on its socket and treats it the same as detach — agents stay alive. The ssh session ends when the TUI exits. | You're done for the day; don't need the explicit signal. |
+| **Quit** (Ctrl+C in dashboard, then "Quit") | The deck exits without announcing that you meant to leave. The daemon sees the connection close and treats it exactly like a detach — agents stay alive. The ssh session ends when the TUI exits. | You're done for the day; don't need the explicit signal. |
 | **Sleep / network drop** (no action) | SSH keepalive detects the dead connection within ~45s and ssh exits; `connect` then re-probes and **reconnects automatically** to the still-running agents, so the session resumes in place. The daemon and agents never stopped. See [Surviving sleep/wake](#surviving-sleepwake). | Implicit; happens automatically when the laptop sleeps or the network drops. |
 
 The TUI reflects this split in its quit dialog. Pressing `Ctrl+C` in the dashboard opens a three-option prompt:
@@ -99,7 +101,7 @@ Quit and Detach both leave agents running. The only difference is that Detach se
 
 ## Reattaching
 
-Run `connect` again. That re-runs `ssh -t` to the remote and launches a fresh TUI, which asks the still-running daemon what is going on and rebuilds one pane per agent — with the names and working directories you left, so the dashboard looks the way you remember it. Each pane then replays what the agent printed while you were away, so you can see what happened in your absence.
+Run `connect` again. That opens a fresh ssh session and starts a new TUI, which asks the still-running daemon what is going on and rebuilds one pane per agent — with the names and working directories you left, so the dashboard looks the way you remember it. Each pane then replays what the agent printed while you were away, so you can see what happened in your absence.
 
 Each agent's replay buffer holds 1 MiB: if an agent produced more than that since you last attached, the oldest output is dropped. This is not a feature ceiling — long-running agent transcripts are best read from the agent's own log file, not the deck's scrollback buffer.
 
@@ -107,20 +109,22 @@ Each agent's replay buffer holds 1 MiB: if an agent produced more than that sinc
 
 A long-lived `connect` session survives the laptop sleeping or the network dropping out from under it — you don't have to close the tab and start over. Reopen the laptop and the session reconnects to the same running agents on its own. Two mechanisms cooperate:
 
-1. **SSH keepalive detects the dead connection.** When the laptop sleeps, the TCP connection dies silently — the sleeping endpoint never sends a FIN/RST, so on wake ssh is parked on a dead socket it can't tell is dead, and the TUI freezes. To prevent that, the live session probes the remote over the encrypted channel every 15 seconds (`ServerAliveInterval=15`) and aborts after 3 consecutive unanswered probes (`ServerAliveCountMax=3`). So a connection killed by sleep is noticed and torn down within roughly **45 seconds** of wake instead of hanging forever. Probing over the encrypted channel works through NAT and firewalls, unlike TCP-level keepalive.
-2. **`connect` reconnects automatically.** When ssh exits because the transport dropped (its exit code 255), `connect` prints `connection to <name> lost — reconnecting…` to stderr, re-runs its version/protocol probe to confirm the host is reachable again, and re-launches the TUI. Because the daemon and agents on the remote never stopped (see [Reattaching](#reattaching)), the fresh session re-attaches to the **same running agents** — you see your session resume, not a blank dashboard.
+1. **The dead connection gets noticed.** A sleeping laptop's connection dies silently — nothing tells the other end it has gone — so left alone the session would sit there looking frozen after you wake up. Instead it checks every 15 seconds that the remote is still answering and gives up after three unanswered checks, so a connection killed by sleep is torn down within roughly **45 seconds** of waking rather than hanging indefinitely. These timings are fixed today.
+2. **`connect` reconnects automatically.** When the connection drops rather than ending cleanly, `connect` prints `connection to <name> lost — reconnecting…` to stderr, re-checks that the host is reachable again, and re-launches the TUI. Because the daemon and agents on the remote never stopped (see [Reattaching](#reattaching)), the fresh session re-attaches to the **same running agents** — you see your session resume, not a blank dashboard.
 
 Reconnection is **bounded**, so a genuinely-gone remote surfaces an error instead of looping forever: `connect` retries up to four times after the initial drop, with a short backoff between attempts. If the host is still unreachable when the budget is exhausted, `connect` prints a clear "giving up" message, restores your local terminal to a sane state (a session interrupted mid-stream may otherwise leave the terminal in raw mode), and exits.
 
 The **first** connect gets a retry budget too, of the same size and shape. A probe that cannot reach the host prints `'<name>' not reachable yet — retrying…` to stderr and tries again after a backoff, up to five attempts — so a link that needs a moment to wake (a cold VM, a VPN still coming up, a laptop whose Wi-Fi has just associated) connects on its own instead of failing and leaving you to run the command a second time. The two budgets are **separate**: attempts spent getting connected are not taken out of the reconnects above, so a session that only came up on the last attempt still gets its full four if it later drops. It does not make a first-attempt failure impossible either: when the host really is unreachable, the retries are spent and you get the [Host unreachable](#host-unreachable) error below.
 
-Only a **dropped transport** triggers a reconnect. A clean quit or detach (exit 0), a `Ctrl-C` (exit 130), or a remote-side crash all end the session immediately — `connect` never reconnects into an intentional exit or a crashing TUI, and `last_connected` is recorded only on a clean exit, not on intermediate reconnects.
+Only a **dropped connection** triggers a reconnect. A clean quit or detach (exit 0), a `Ctrl-C` (exit 130), or a remote-side crash all end the session immediately — `connect` never reconnects into an intentional exit or a crashing TUI, and `last_connected` is recorded only on a clean exit, not on intermediate reconnects.
 
-The keepalive interval/count and retry budget are sensible fixed defaults today; exposing them as configuration is a future improvement.
+The connection-check timings and the retry budget are sensible fixed defaults today; exposing them as configuration is a future improvement.
+
+All of this is about **your own machine** sleeping. A remote *host* that goes to sleep suspends its agents, and there is no deck-side mechanism for that — it is a setting on the host. On a Mac, see [macOS as a remote host](remote-requirements.md#macos-as-a-remote-host).
 
 ## Version skew and the upgrade nudge
 
-A difference between the remote's `dot-agent-deck` version and your laptop's never blocks a connect. Your laptop is only ssh plus a terminal — the remote runs both its own TUI and its own daemon and they share one binary on the host — so the laptop's version has no bearing on whether the remote session is correct. A remote you simply haven't upgraded connects exactly as before, with its matched TUI and daemon and all its agents intact.
+A difference between the remote's `dot-agent-deck` version and your laptop's never blocks a connect. Your laptop only supplies ssh and a terminal — the remote runs its own copy of the deck end to end — so the laptop's version has no bearing on whether the remote session is correct. A remote you simply haven't upgraded connects exactly as before, with its matched TUI and daemon and all its agents intact.
 
 The one case where `connect` offers to do something is when your **laptop is strictly newer** than the remote. Then, just before handing over to ssh, it shows a single optional prompt:
 
@@ -140,16 +144,16 @@ The `(N running agents)` note appears when the count is known, so you can see th
 
 ### What `y` actually does to the remote daemon
 
-`remote upgrade` swaps the binary on disk **only** — it does not touch the running daemon or its agents. The daemon is recycled, if at all, by the same TUI↔daemon handshake that runs locally, on the remote's own machine, when the freshly-installed TUI attaches:
+`remote upgrade` swaps the binary on disk **only** — it does not touch the running daemon or its agents. The daemon is recycled, if at all, by the same version check that runs locally — this time on the remote, when the newly-installed deck starts up there:
 
 - **No agents running on the remote** — the daemon restarts **silently** onto the new version. You land in the dashboard with nothing lost.
 - **Agents running on the remote** — you get the restart prompt (rendered over your ssh session). It **names the live remote agents** and warns that restarting stops them. Press **S** to restart onto the new version (those agents stop), or any other key to **keep the current daemon** and stay attached with your agents intact.
 
-This is the same shared handshake described under [Installation › Upgrading](installation.md#upgrading); the remote case differs only in that the binary swap happened over ssh first. Either way, declining always lands you on a working session — upgrading a remote can never strand you from your running agents.
+This is the same check described under [Installation › Upgrading](installation.md#upgrading); the remote case differs only in that the binary was replaced over ssh first. Either way, declining always lands you on a working session — upgrading a remote can never strand you from your running agents.
 
 ## Failure modes
 
-Before exec'ing `ssh -t`, `connect` runs a short version probe (`<install_path> --version` over ssh) so it can classify reachability failures up front and give you an actionable message instead of dropping a half-broken TUI on you. While a probe is in flight the terminal shows what it is waiting on — `Connecting to 'my-vm'… checking the remote deck`, then `…waiting for the handshake` — and the line is erased before the session takes over the screen. It is drawn only when you are at a terminal: piped or redirected, `connect` writes nothing extra. A version *difference* between the remote binary and the laptop client is **not** a failure — it never blocks the connect. An un-upgraded older remote connects normally, and when your laptop happens to be newer you get an optional one-step upgrade offer (see [Version skew and the upgrade nudge](#version-skew-and-the-upgrade-nudge)).
+Before starting the session, `connect` checks that the remote answers and reports a usable version, so it can tell you what is wrong up front instead of dropping a half-broken screen on you. While a probe is in flight the terminal shows what it is waiting on — `Connecting to 'my-vm'… checking the remote deck`, then `…waiting for the handshake` — and the line is erased before the session takes over the screen. It is drawn only when you are at a terminal: piped or redirected, `connect` writes nothing extra. A version *difference* between the remote binary and the laptop client is **not** a failure — it never blocks the connect. An un-upgraded older remote connects normally, and when your laptop happens to be newer you get an optional one-step upgrade offer (see [Version skew and the upgrade nudge](#version-skew-and-the-upgrade-nudge)).
 
 ### Host unreachable
 
@@ -196,9 +200,11 @@ What to do:
 
 Not a failure, but worth calling out: a freshly-added remote has no agents yet, so the first `connect` drops you into an empty dashboard. Press `Ctrl+N` inside the TUI to start your first agent, and it will be there the next time you reconnect.
 
+**On a macOS host, that first Claude Code agent will report `Not logged in · Please run /login`.** That is expected rather than broken — Claude Code keeps its credentials in the login Keychain, which an ssh session cannot read. Run `/login` once in the pane and every later session authenticates from the file it writes. `codex` and `opencode` need no equivalent step. See [macOS as a remote host](remote-requirements.md#macos-as-a-remote-host).
+
 ## Hooks on the remote
 
-Agents emit hook events (delegate, work-done, etc.) by piping JSON to `dot-agent-deck hook`. On the remote, this resolves to the local socket the daemon serves — there is no network round-trip for hooks, and laptop disconnections do not lose events.
+Agents report events (delegate, work-done, and so on) to the deck as they work. On a remote that exchange happens entirely on the host — there is no network round trip, so disconnecting your laptop cannot lose events.
 
 `dot-agent-deck hooks install` is run automatically by `remote add` and writes the agent-side hook configuration. If you provision agents on the remote out-of-band (manually editing `~/.claude/settings.json`, for example), run `hooks install` over ssh after the agent is installed so its hook payloads reach the daemon.
 
@@ -246,5 +252,5 @@ It is two steps and a second terminal, which is worse than pasting. It works on 
 ## See also
 
 - [Remote Environment Requirements](remote-requirements.md) — what a host must provide before you can register it.
-- [Remote Recipes](remote-recipes.md) — provisioning snippets for common cloud and local-VM hosts.
+- [Remote Recipes](remote-recipes.md) — how to get a Linux or macOS host bootstrapped for `remote add`.
 - [Installation › Recycling the local daemon](installation.md#recycling-the-local-daemon) — `dot-agent-deck daemon stop` is the local counterpart for recycling the daemon on your laptop after a binary upgrade. The remote lifecycle described above (per-attach daemon, ssh session governs cleanup) is independent.

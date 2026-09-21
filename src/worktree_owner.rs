@@ -62,9 +62,14 @@
 //! module's first paragraph is already about.
 
 use std::path::{Path, PathBuf};
+#[cfg(test)]
 use std::process::Command;
 
 use serde::Serialize;
+
+#[cfg(test)]
+use crate::git_env::fixture_git;
+use crate::git_env::git_at;
 
 /// The name of the marker file that proves the deck created a worktree. Lives
 /// in the worktree's OWN git metadata dir — see the module docs for why it is
@@ -118,90 +123,6 @@ fn trim_trailing_newline(bytes: &[u8]) -> &[u8] {
 /// the same path for a worktree whose name is not valid UTF-8.
 pub fn git_dir_of(worktree_path: &Path) -> Option<PathBuf> {
     rev_parse_path(worktree_path, "--git-dir")
-}
-
-/// The environment variables through which git's *location* discovery can be
-/// steered from outside this process (issue #834). Every one of them outranks
-/// the `current_dir` a command passes — measured in
-/// `xtask/linkage-check/src/repo_state.rs`, where an ambient `GIT_DIR` made
-/// `git -C <fixture> log` report a different repository's history entirely.
-///
-/// That matters more here than it does for a fixture, because the answer is
-/// interpolated into the prompt an agent is started with: a daemon lazy-spawned
-/// from inside a `rebase --exec`, a pre-commit hook or a `bisect run` carries
-/// one of these, and without the scrub every pane it starts would be told to
-/// write its durable report into whatever repository that variable named,
-/// however unrelated to the pane's own cwd. That is the one outcome this
-/// module's fail-closed posture exists to prevent, and it is not a failure a
-/// consumer could detect — the variable would be set, and confidently wrong.
-///
-/// Cleared rather than overridden, because for each of these "unset" *is* git's
-/// default. The list mirrors that file's `AMBIENT_LOCATION_VARS`, including
-/// `GIT_DISCOVERY_ACROSS_FILESYSTEM` for the same reason it gives.
-///
-/// `GIT_CEILING_DIRECTORIES` is deliberately NOT cleared, for a different
-/// reason than that file's: it can only *narrow* the upward walk, so an
-/// ambient one can make this return `None` but can never make it return a
-/// different repository — the fail-closed direction. Honouring it also leaves
-/// an operator's guard against walking a slow network mount in place, on a
-/// path that runs at every pane spawn.
-const AMBIENT_LOCATION_VARS: [&str; 8] = [
-    "GIT_DIR",
-    "GIT_WORK_TREE",
-    "GIT_COMMON_DIR",
-    "GIT_INDEX_FILE",
-    "GIT_OBJECT_DIRECTORY",
-    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-    "GIT_NAMESPACE",
-    "GIT_DISCOVERY_ACROSS_FILESYSTEM",
-];
-
-/// `git`, to be run from inside `dir`, with the ambient location environment
-/// switched off so the answer depends on `dir` and nothing else.
-///
-/// Every `git` invocation in this module goes through here, which also makes
-/// [`git_dir_of`] — and so the ownership gate and the reclaim path that deletes
-/// directories behind it — immune to the same ambient override.
-pub(crate) fn git_at(dir: &Path) -> Command {
-    let mut cmd = Command::new("git");
-    cmd.current_dir(dir);
-    for var in AMBIENT_LOCATION_VARS {
-        cmd.env_remove(var);
-    }
-    cmd
-}
-
-/// Test-only: `git`, to be run from inside `dir`, with the ambient git
-/// environment switched off in all three of the groups
-/// `xtask/linkage-check/src/repo_state.rs`'s `Sandbox` documents — so no
-/// fixture command can read or WRITE any repository outside `sandbox_root`,
-/// including the checkout the tests are running inside.
-///
-/// Location comes from [`git_at`], plus `GIT_CEILING_DIRECTORIES` bounding the
-/// upward walk at the sandbox root — production deliberately leaves that
-/// unset, a fixture deliberately sets it. Configuration is neutralized so no
-/// developer `~/.gitconfig` (or `includeIf`, or `init.templateDir` hook) reaches
-/// a fixture, and the commit identity is supplied by environment rather than by
-/// `git config`, so a fixture never writes into a repository to configure one.
-///
-/// Lives here rather than in either test module because both need it and they
-/// cannot share a `#[cfg(test)] mod tests` item — and because a second copy is
-/// exactly how the neutralization drifts out of step with [`git_at`].
-#[cfg(test)]
-pub(crate) fn fixture_git(dir: &Path, sandbox_root: &Path) -> Command {
-    let mut cmd = git_at(dir);
-    let absent = sandbox_root.join("no-such-gitconfig");
-    cmd.env("GIT_CONFIG_GLOBAL", &absent)
-        .env("GIT_CONFIG_SYSTEM", &absent)
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("HOME", sandbox_root)
-        .env("XDG_CONFIG_HOME", sandbox_root)
-        .env("GIT_AUTHOR_NAME", "T")
-        .env("GIT_AUTHOR_EMAIL", "t@t.t")
-        .env("GIT_COMMITTER_NAME", "T")
-        .env("GIT_COMMITTER_EMAIL", "t@t.t")
-        .env("GIT_CEILING_DIRECTORIES", sandbox_root);
-    cmd
 }
 
 /// Run `git rev-parse <flag>` from inside `dir` and return the single path it

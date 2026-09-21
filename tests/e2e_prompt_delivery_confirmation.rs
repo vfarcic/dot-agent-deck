@@ -139,6 +139,56 @@ fn confirmed_prompt(deck: &TuiDeck, name: &str) -> Option<String> {
         .and_then(|live| live.last_user_prompt)
 }
 
+/// The opening words of the completion instruction PRD #220 Phase 2 (#1081)
+/// appends to every `--single` dispatch prompt (`dispatch::dispatch_prompt`),
+/// pinned here so [`confirms_dispatch_seed`] says "the caller's task, then the
+/// daemon's OWN block" rather than "the caller's task, then anything".
+const COMPLETION_INSTRUCTION_OPENING: &str = "When this work is finished";
+
+/// Whether `reported` — a pane's last `UserPromptSubmit`, as the hook recorded
+/// it — is the dispatch payload built around `seed`.
+///
+/// This used to be `== Some(seed)`, and that was right for exactly as long as a
+/// `--single` dispatch's payload WAS the caller's task. #1081 appends the
+/// `work-done` completion instruction to it, deliberately after the task
+/// ("appended rather than prepended so the caller's own task stays the first
+/// thing the agent reads"), and `dot_agent_deck::hook` records only the first
+/// [`dot_agent_deck::prompt_delivery::USER_PROMPT_MAX_LEN`] bytes of what the
+/// agent submitted, with a `…` where it cut. So exact equality against the seed
+/// cannot hold for ANY dispatch any more, and the question it was really asking
+/// is a prefix one: did this pane submit THIS caller's task, at the head of the
+/// block the daemon composed around it?
+///
+/// Deliberately not `starts_with(seed)` alone: that would also accept a pane
+/// that submitted the seed followed by anything at all, including the
+/// accumulation shape `prompt_delivery::prompt_submission_accumulated` exists
+/// to refuse. The daemon's own matcher stays the authority on whether a
+/// delivery confirmed — the `logged` / `none_abandoned` assertions in both
+/// tests read its verdict out of the delivery log — and this answers the
+/// separate, user-altitude question the tests are named for.
+fn confirms_dispatch_seed(reported: &str, seed: &str) -> bool {
+    // Issue #1182's other half: a real Claude Code pane reports a multi-line
+    // payload wrapped in its paste envelope rather than verbatim, so unwrap it
+    // with the PRODUCT's own helper — one definition of that envelope's shape,
+    // shared by the matcher this test exercises and by the test.
+    let reported = dot_agent_deck::prompt_delivery::paste_envelope_payload(reported)
+        .map_or(reported, |(payload, _)| payload);
+    match reported.strip_prefix(seed) {
+        // The payload is the task alone: nothing appended, which is what an
+        // orchestration dispatch still submits.
+        Some(rest) if rest.trim().is_empty() => true,
+        Some(rest) => rest
+            .trim_start()
+            .starts_with(COMPLETION_INSTRUCTION_OPENING),
+        None => false,
+    }
+}
+
+/// Whether the pane dispatched as `name` has confirmed the seed `prompt`.
+fn seed_is_confirmed(deck: &TuiDeck, name: &str, prompt: &str) -> bool {
+    confirmed_prompt(deck, name).is_some_and(|reported| confirms_dispatch_seed(&reported, prompt))
+}
+
 fn prompt_attempt_log(deck: &TuiDeck, name: &str) -> String {
     std::fs::read_to_string(dispatch_worktree_of(deck, name).join("prompt-attempts.log"))
         .unwrap_or_else(|_| "<no attempt log>".to_string())
@@ -190,7 +240,7 @@ fn delivery_diagnostics(deck: &TuiDeck, cases: &[(&str, &str)]) -> String {
             .lines()
             .any(|line| line == format!("swallowed|{prompt}"));
         out.push_str(&format!(
-            "\n{name}: expected={prompt:?}, confirmed_exact={:?}, first_submission_swallowed={first_submission_swallowed}, attempt_log={attempts:?}",
+            "\n{name}: expected={prompt:?}, confirmed_reported={:?}, first_submission_swallowed={first_submission_swallowed}, attempt_log={attempts:?}",
             confirmed_prompt(deck, name)
         ));
     }
@@ -268,6 +318,68 @@ const READINESS_GATE_MS: u64 = 3_000;
 /// past [`READINESS_GATE_MS`] so the claim is unambiguously post-write.
 const LATE_CLAIM_SESSION_START_DELAY_SECS: u64 = 6;
 
+/// The POSIX-sh prelude every stand-in in this file opens with.
+///
+/// `read_submission` reads ONE WHOLE pane submission into `$submission` and
+/// returns 1 at EOF — which is what an agent TUI does, and what reading one
+/// LINE at a time only accidentally was. [`dot_agent_deck::pane_input`]'s
+/// encoder wraps any MULTI-LINE payload in `ESC[200~`/`ESC[201~`, and the deck
+/// submits it with a separate CR that the pane's line discipline delivers as
+/// the final line's terminator — so a paste is one input however many lines it
+/// spans. Every dispatch payload WAS single-line until PRD #220 Phase 2
+/// (#1081) appended the `work-done` completion instruction to every `--single`
+/// dispatch; from then on a line-at-a-time stand-in shredded one payload into
+/// eight "submissions", none of them the text the daemon wrote and none of
+/// them able to confirm it. That is issue #1182: both tests here spent their
+/// whole retry budget and were abandoned at the deadline, on a product that
+/// was delivering correctly.
+///
+/// `json_escape` renders `$1` as the body of a JSON string. A dispatch payload
+/// legitimately carries `"`, `\` and newlines — the appended instruction has
+/// all three — and an unescaped one is invalid JSON the hook would drop. The
+/// trailing `\n` that the final `s/$/\\n/` leaves on the last line is exactly
+/// what the daemon's `normalize_for_match` strips off a reported prompt before
+/// comparing, so it cannot make a genuine submission fail to confirm.
+const STAND_IN_SH_PRELUDE: &str = r#"
+PASTE_OPEN=$(printf '\033[200~')
+PASTE_CLOSE=$(printf '\033[201~')
+
+read_submission() {
+  submission=''
+  pasting=0
+  first=1
+  while IFS= read -r chunk; do
+    if [ "$first" -eq 1 ]; then
+      first=0
+      case "$chunk" in
+        "$PASTE_OPEN"*)
+          pasting=1
+          chunk=${chunk#"$PASTE_OPEN"}
+          ;;
+      esac
+      submission=$chunk
+    else
+      submission="$submission
+$chunk"
+    fi
+    if [ "$pasting" -eq 0 ]; then
+      return 0
+    fi
+    case "$submission" in
+      *"$PASTE_CLOSE")
+        submission=${submission%"$PASTE_CLOSE"}
+        return 0
+        ;;
+    esac
+  done
+  return 1
+}
+
+json_escape() {
+  printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/$/\\n/' | tr -d '\n'
+}
+"#;
+
 /// The stand-in is named `claude` on purpose: the deck resolves
 /// [`AgentType::from_command`] over the command IT chose to exec, so this is
 /// the ordinary production shape (`default_command = "claude …"`) rather than
@@ -280,24 +392,24 @@ fn write_swallowing_agent(workdir: &Path) -> PathBuf {
     let stage_two = workdir.join("claude-stage-two");
     let bin = shell_quote(env!("CARGO_BIN_EXE_dot-agent-deck"));
     let stage_two_body = format!(
-        "#!/bin/sh\n\
+        "#!/bin/sh\n{STAND_IN_SH_PRELUDE}\
          printf '{{\"hook_event_name\":\"SessionStart\",\"session_id\":\"seed-%s\"}}' \"$DOT_AGENT_DECK_PANE_ID\" | {bin} hook --agent claude-code >/dev/null 2>&1 || exit 97\n\
-         while IFS= read -r submitted; do\n\
-           printf 'confirmed|%s\\n' \"$submitted\" >> prompt-attempts.log\n\
-           printf '{{\"hook_event_name\":\"UserPromptSubmit\",\"session_id\":\"seed-%s\",\"prompt\":\"%s\"}}' \"$DOT_AGENT_DECK_PANE_ID\" \"$submitted\" | {bin} hook --agent claude-code >/dev/null 2>&1 || exit 98\n\
+         while read_submission; do\n\
+           printf 'confirmed|%s\\n' \"$submission\" >> prompt-attempts.log\n\
+           printf '{{\"hook_event_name\":\"UserPromptSubmit\",\"session_id\":\"seed-%s\",\"prompt\":\"%s\"}}' \"$DOT_AGENT_DECK_PANE_ID\" \"$(json_escape \"$submission\")\" | {bin} hook --agent claude-code >/dev/null 2>&1 || exit 98\n\
          done\n"
     );
     std::fs::write(&stage_two, stage_two_body).expect("write second-stage stand-in");
     let body = format!(
-        "#!/bin/sh\n\
+        "#!/bin/sh\n{STAND_IN_SH_PRELUDE}\
          case \"$DOT_AGENT_DECK_PANE_ID\" in\n\
            *two-write-flush*)\n\
              printf '{{\"hook_event_name\":\"SessionStart\",\"session_id\":\"launcher-%s\",\"metadata\":{{\"{SESSION_START_ORIGIN_METADATA_KEY}\":\"{WRAPPER_FORK_SESSION_START_ORIGIN}\"}}}}' \"$DOT_AGENT_DECK_PANE_ID\" | {bin} hook --agent claude-code >/dev/null 2>&1 || exit 96\n\
-             IFS= read -r swallowed || exit 0\n\
-             printf 'swallowed|%s\\n' \"$swallowed\" >> prompt-attempts.log\n\
+             read_submission || exit 0\n\
+             printf 'swallowed|%s\\n' \"$submission\" >> prompt-attempts.log\n\
              printf '{{\"hook_event_name\":\"PreToolUse\",\"session_id\":\"launcher-%s\",\"tool_name\":\"Bootstrap\"}}' \"$DOT_AGENT_DECK_PANE_ID\" | {bin} hook --agent claude-code >/dev/null 2>&1 || exit 99\n\
-             IFS= read -r swallowed || exit 0\n\
-             printf 'swallowed|%s\\n' \"$swallowed\" >> prompt-attempts.log\n\
+             read_submission || exit 0\n\
+             printf 'swallowed|%s\\n' \"$submission\" >> prompt-attempts.log\n\
              exec {stage_two}\n\
              ;;\n\
          esac\n\
@@ -306,11 +418,11 @@ fn write_swallowing_agent(workdir: &Path) -> PathBuf {
          esac\n\
          printf '{{\"hook_event_name\":\"SessionStart\",\"session_id\":\"seed-%s\"}}' \"$DOT_AGENT_DECK_PANE_ID\" | {bin} hook --agent claude-code >/dev/null 2>&1 || exit 97\n\
          sleep 1\n\
-         IFS= read -r swallowed || exit 0\n\
-         printf 'swallowed|%s\\n' \"$swallowed\" >> prompt-attempts.log\n\
-         while IFS= read -r submitted; do\n\
-           printf 'confirmed|%s\\n' \"$submitted\" >> prompt-attempts.log\n\
-           printf '{{\"hook_event_name\":\"UserPromptSubmit\",\"session_id\":\"seed-%s\",\"prompt\":\"%s\"}}' \"$DOT_AGENT_DECK_PANE_ID\" \"$submitted\" | {bin} hook --agent claude-code >/dev/null 2>&1 || exit 98\n\
+         read_submission || exit 0\n\
+         printf 'swallowed|%s\\n' \"$submission\" >> prompt-attempts.log\n\
+         while read_submission; do\n\
+           printf 'confirmed|%s\\n' \"$submission\" >> prompt-attempts.log\n\
+           printf '{{\"hook_event_name\":\"UserPromptSubmit\",\"session_id\":\"seed-%s\",\"prompt\":\"%s\"}}' \"$DOT_AGENT_DECK_PANE_ID\" \"$(json_escape \"$submission\")\" | {bin} hook --agent claude-code >/dev/null 2>&1 || exit 98\n\
          done\n",
         stage_two = shell_quote(&stage_two.to_string_lossy()),
     );
@@ -334,7 +446,7 @@ fn write_default_command_config(command: &str) -> tempfile::TempDir {
     dir
 }
 
-/// Scenario: Launch five concurrent single-agent dispatches through hook-emitting stand-ins: four swallow one seed, while a two-stage launcher declares a wrapper handoff, destroys both payload writes, then starts a genuine Claude-shaped reader. Every pane must durably confirm its exact seed; the two-stage pane must record two swallowed copies, receive the payload on attempt 3 exactly once, and never be abandoned.
+/// Scenario: Launch five concurrent single-agent dispatches through hook-emitting stand-ins: four swallow one seed, while a two-stage launcher declares a wrapper handoff, destroys both payload writes, then starts a genuine Claude-shaped reader. Every pane must durably confirm the dispatch payload built around its own seed — the caller's task at its head, then the daemon's appended completion instruction; the two-stage pane must record two swallowed copies, receive the payload on attempt 3 exactly once, and never be abandoned.
 #[spec("scheduler/dispatch/014")]
 #[test]
 fn dispatch_014_concurrent_swallowed_seeds_retry_until_confirmed() {
@@ -356,6 +468,17 @@ fn dispatch_014_concurrent_swallowed_seeds_retry_until_confirmed() {
             "DOT_AGENT_DECK_SESSION_START_WAIT_MS",
             READINESS_GATE_MS.to_string(),
         )
+        // Issue #1077: `start_dispatch` runs the real `dispatch` CLI from the
+        // TEST process while naming the caller's pane, so it carries no
+        // per-spawn hook capability token and the daemon refuses the message.
+        // That refusal is SILENT to the caller — `Dispatch` is one of the two
+        // fire-and-forget verbs `provenance_refusal_reply` deliberately answers
+        // nothing for — so the CLI still exits 0 and the units simply never
+        // spawn. The gate is working; the test process is not that pane. #1077
+        // added this opt-in for exactly this harness pattern and applied it to
+        // the files it knew about, and missed this one because nothing runs
+        // lane 2 (CLAUDE.md rule 5).
+        .impersonating_pane_signals()
         .launch_with_fixture("minimal");
     deck.wait_for_string("No active sessions");
     commit_fixture_repo(deck.workdir());
@@ -394,7 +517,7 @@ fn dispatch_014_concurrent_swallowed_seeds_retry_until_confirmed() {
     let confirmed = common::wait_until(Duration::from_secs(75), || {
         cases
             .iter()
-            .all(|(name, prompt)| confirmed_prompt(&deck, name).as_deref() == Some(*prompt))
+            .all(|(name, prompt)| seed_is_confirmed(&deck, name, prompt))
     });
     let retried = cases.iter().all(|(name, prompt)| {
         let attempts =
@@ -432,7 +555,7 @@ fn dispatch_014_concurrent_swallowed_seeds_retry_until_confirmed() {
             .filter(|line| *line == format!("confirmed|{two_stage_prompt}"))
             .count()
             == 1
-        && confirmed_prompt(&deck, two_stage_name).as_deref() == Some(two_stage_prompt)
+        && seed_is_confirmed(&deck, two_stage_name, two_stage_prompt)
         && two_stage_written_on_attempt_three
         && !two_stage_abandoned;
 
@@ -488,13 +611,13 @@ fn write_bootstrap_swallowing_real_claude(workdir: &Path) -> PathBuf {
     let wrapper = workdir.join("bootstrap-swallowing-real-claude.sh");
     let binary = shell_quote(env!("CARGO_BIN_EXE_dot-agent-deck"));
     let body = format!(
-        "#!/bin/sh\n\
+        "#!/bin/sh\n{STAND_IN_SH_PRELUDE}\
          printf '{{\"hook_event_name\":\"SessionStart\",\"session_id\":\"bootstrap-%s\",\"metadata\":{{\"{SESSION_START_ORIGIN_METADATA_KEY}\":\"{WRAPPER_FORK_SESSION_START_ORIGIN}\"}}}}' \"$DOT_AGENT_DECK_PANE_ID\" | {binary} hook --agent claude-code >/dev/null 2>&1 || exit 97\n\
-         IFS= read -r swallowed || exit 98\n\
-         printf 'swallowed|%s\\n' \"$swallowed\" >> prompt-attempts.log\n\
+         read_submission || exit 98\n\
+         printf 'swallowed|%s\\n' \"$submission\" >> prompt-attempts.log\n\
          printf '{{\"hook_event_name\":\"PreToolUse\",\"session_id\":\"bootstrap-%s\",\"tool_name\":\"Bootstrap\"}}' \"$DOT_AGENT_DECK_PANE_ID\" | {binary} hook --agent claude-code >/dev/null 2>&1 || exit 99\n\
-         IFS= read -r swallowed || exit 100\n\
-         printf 'swallowed|%s\\n' \"$swallowed\" >> prompt-attempts.log\n\
+         read_submission || exit 100\n\
+         printf 'swallowed|%s\\n' \"$submission\" >> prompt-attempts.log\n\
          exec {REAL_AGENT_COMMAND}\n"
     );
     std::fs::write(&wrapper, body).expect("write real-Claude bootstrap launcher");
@@ -504,7 +627,7 @@ fn write_bootstrap_swallowing_real_claude(workdir: &Path) -> PathBuf {
     wrapper
 }
 
-/// Scenario: Launch three real interactive Haiku dispatches through bootstrap launchers that declare a wrapper handoff, consume both payload attempts, then exec Claude. After each native Claude start, a later attempt must recover the exact sentinel-bearing seed, confirm it through UserPromptSubmit, and avoid deadline abandonment; failures print per-pane attempt and delivery evidence.
+/// Scenario: Launch three real interactive Haiku dispatches through bootstrap launchers that declare a wrapper handoff, consume both payload attempts, then exec Claude. After each native Claude start, a later attempt must recover the sentinel-bearing seed and have Claude confirm it through UserPromptSubmit — which reports a pasted payload inside its `<pasted_content id="…">` envelope rather than verbatim — without deadline abandonment; failures print per-pane attempt and delivery evidence.
 #[spec("scheduler/dispatch/015")]
 #[test]
 fn dispatch_015_three_real_claude_seeds_are_genuinely_confirmed() {
@@ -543,6 +666,10 @@ fn dispatch_015_three_real_claude_seeds_are_genuinely_confirmed() {
             READINESS_GATE_MS.to_string(),
         )
         .with_env("PATH", path_with_binary_dir())
+        // Issue #1077, same reason as `dispatch/014` above: the `dispatch` CLI
+        // is invoked from the test process naming the caller's pane, so it
+        // holds no hook capability token and the daemon refuses it silently.
+        .impersonating_pane_signals()
         .with_imported_claude_credentials()
         .launch_with_fixture("minimal");
     deck.wait_for_string("No active sessions");
@@ -609,7 +736,7 @@ fn dispatch_015_three_real_claude_seeds_are_genuinely_confirmed() {
     let all_confirmed = common::wait_until(Duration::from_secs(150), || {
         cases
             .iter()
-            .all(|(name, prompt)| confirmed_prompt(&deck, name).as_deref() == Some(*prompt))
+            .all(|(name, prompt)| seed_is_confirmed(&deck, name, prompt))
     });
     let all_two_payload_attempts_swallowed = cases
         .iter()

@@ -7046,6 +7046,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "xtask-cross-version"
+version = "0.0.0"
+dependencies = [
+ "clap",
+ "libc",
+ "portable-pty",
+ "serde",
+ "serde_json",
+ "toml 1.1.6+spec-1.1.0",
+ "vt100",
+]
+
+[[package]]
 name = "xtask-docs"
 version = "0.0.0"
 dependencies = [

@@ -35,8 +35,9 @@
 use std::io;
 use std::time::Duration;
 
-use tracing::debug;
+use tracing::{debug, warn};
 
+use crate::agent_pty::{AgentPtyRegistry, AgentRecord};
 use crate::build_version_handshake::{HandshakeError, TerminateOutcome, terminate_daemon_graceful};
 use crate::daemon_client::{LocalEndpoint, issue_command};
 use crate::daemon_protocol::{
@@ -44,7 +45,7 @@ use crate::daemon_protocol::{
 };
 use crate::platform::ipc::IpcStream;
 use crate::platform::peercred::peer_pid;
-use crate::state::OrchestrationRoleRecord;
+use crate::state::{OrchestrationRoleRecord, SharedState};
 
 /// SIGTERM grace before reporting "daemon did not exit cleanly". PRD #103
 /// M3.2: 5 s.
@@ -420,21 +421,7 @@ pub fn format_live_orchestrations_refusal(roles: &[OrchestrationRoleRecord]) -> 
         n = roles.len()
     );
     for role in roles {
-        let marker = if role.is_orchestrator {
-            " (orchestrator)"
-        } else {
-            ""
-        };
-        let orchestration = if role.orchestration.is_empty() {
-            String::new()
-        } else {
-            format!(" [{}]", role.orchestration)
-        };
-        let _ = writeln!(
-            out,
-            "  {} {}{marker}{orchestration}",
-            role.pane_id, role.role
-        );
+        let _ = writeln!(out, "  {}", orchestration_role_line(role));
     }
     let _ = writeln!(
         out,
@@ -444,6 +431,260 @@ pub fn format_live_orchestrations_refusal(roles: &[OrchestrationRoleRecord]) -> 
     );
     let _ = writeln!(out, "pass --force to stop anyway");
     out
+}
+
+/// Render ONE orchestration-role registration as a human-readable line, shared
+/// by [`format_live_orchestrations_refusal`] and
+/// [`format_teardown_inventory`] (issue #1109).
+///
+/// Shared rather than spelled twice because the two describe the SAME
+/// registration from opposite sides of one decision — the refusal says what a
+/// guarded stop would destroy, the inventory says what an unguarded one just
+/// did — and an operator correlating a refusal they read on Monday with a log
+/// line they grep on Friday should not have to notice that the two renderings
+/// drifted. The same reasoning already shapes `wire_stop_refusal`, which
+/// delegates to the formatters rather than re-deriving a second wording.
+///
+/// No leading indent: the refusal adds its own two spaces, the inventory packs
+/// these into a bracketed list on one line.
+fn orchestration_role_line(role: &OrchestrationRoleRecord) -> String {
+    let marker = if role.is_orchestrator {
+        " (orchestrator)"
+    } else {
+        ""
+    };
+    let orchestration = if role.orchestration.is_empty() {
+        String::new()
+    } else {
+        format!(" [{}]", role.orchestration)
+    };
+    format!("{} {}{marker}{orchestration}", role.pane_id, role.role)
+}
+
+/// Render ONE live agent as a human-readable entry for
+/// [`format_teardown_inventory`].
+///
+/// `id` is the registry's own agent id — the handle every other daemon log line
+/// about this agent carries — and `pane` is the key the role maps are indexed
+/// by, so the two together let a reader join this line to both. `label` and
+/// `cwd` are what say *whose work* was running; `cwd` in particular is the only
+/// field here that distinguishes two panes of different dispatched units when
+/// neither holds an orchestration role.
+fn teardown_agent_line(agent: &AgentRecord) -> String {
+    let dash = |v: Option<&str>| v.filter(|s| !s.is_empty()).unwrap_or("-").to_string();
+    format!(
+        "{} pane={} label={} cwd={}",
+        agent.id,
+        dash(agent.pane_id_env.as_deref()),
+        dash(agent.display_name.as_deref()),
+        dash(agent.cwd.as_deref()),
+    )
+}
+
+/// Issue #1109: render what an UNGUARDED teardown is destroying, for the
+/// daemon's own log. `None` when there is nothing to name.
+///
+/// # Why this exists beside a refusal rather than as one
+///
+/// Three paths tear this daemon down. `dot-agent-deck daemon stop` and the
+/// [`crate::daemon_protocol::AttachRequest::StopDaemon`] wire verb are guarded
+/// — they run [`stop_refusal`] and refuse without `--force`. The other two are
+/// not: a termination SIGNAL (issue #1109) and the header-only
+/// [`crate::daemon_protocol::KIND_SHUTDOWN`] frame both drain the registry
+/// unconditionally.
+///
+/// Issue #1109 asked whether those two should refuse as well, and the answer
+/// recorded in `docs/develop/daemon-teardown-paths.md` is no: a SIGTERM is how
+/// a service manager, a container runtime or a session logout asks a daemon to
+/// stop, and a daemon that argues back is escalated to SIGKILL on the
+/// supervisor's clock — which loses the graceful drain AND the disclosure, so it
+/// is strictly worse than obeying. What those paths can do instead is SAY what
+/// they are taking down, which is the half the guarded path was really
+/// providing: #428's occurrence #5 needed log archaeology to establish that a
+/// stray `pkill -f "daemon serve"` had stopped nine panes across three
+/// dispatched units, because the shutdown line named none of them.
+///
+/// # Shape
+///
+/// One line, because it is read by `grep` after the fact rather than by a human
+/// watching a terminal — the guarded path's refusal is the multi-line one, and
+/// it is read live. The list is bounded by the number of live panes one deck
+/// holds, and is deliberately uncapped for the same reason
+/// [`format_live_orchestrations_refusal`] is: a truncated forensic list is the
+/// one thing worse than no list.
+///
+/// `roles` is an `Option` rather than a slice so that "could not find out" and
+/// "there were none" stay distinguishable. They read identically as an empty
+/// slice, and the difference is the whole point of the line.
+pub fn format_teardown_inventory(
+    roles: Option<&[OrchestrationRoleRecord]>,
+    agents: &[AgentRecord],
+) -> Option<String> {
+    if agents.is_empty() && roles.is_some_and(<[OrchestrationRoleRecord]>::is_empty) {
+        return None;
+    }
+    use std::fmt::Write;
+    let mut out = String::new();
+    let _ = write!(out, "terminating {} managed agent(s) and ", agents.len());
+    match roles {
+        Some(roles) => {
+            let _ = write!(
+                out,
+                "destroying {} orchestration role registration(s)",
+                roles.len()
+            );
+        }
+        // Greptile P1 on the first draft, and it was right. There was no `None`
+        // arm: [`log_teardown_inventory`] handed this an empty slice when the
+        // state lock missed its budget, so a teardown that could not find out
+        // printed "destroying 0 orchestration role registration(s)" and dropped
+        // the permanence sentence below. The `warn!` beside it did say
+        // "UNLISTED" — one incident report contradicting another, with the wrong
+        // one louder, in the contended moment the record exists for. An unknown
+        // says it is unknown.
+        None => {
+            let _ = write!(
+                out,
+                "destroying an UNKNOWN number of orchestration role registration(s) \
+                 (the daemon's state could not be read in time — see the line above)"
+            );
+        }
+    }
+    if !agents.is_empty() {
+        let list: Vec<String> = agents.iter().map(teardown_agent_line).collect();
+        let _ = write!(out, "; agents: [{}]", list.join(", "));
+    }
+    if let Some(roles) = roles
+        && !roles.is_empty()
+    {
+        let list: Vec<String> = roles.iter().map(orchestration_role_line).collect();
+        let _ = write!(out, "; roles: [{}]", list.join(", "));
+    }
+    // The same permanence sentence `format_live_orchestrations_refusal` ends on.
+    // It is the part that is NOT obvious from the agent list: the processes are
+    // merely stopped, while these registrations have no persistence path of any
+    // kind and are gone with this process. Carried whenever roles were held OR
+    // could not be read — withheld only on a confirmed empty set, where it would
+    // be a false claim about what this teardown cost.
+    if roles.is_none_or(|roles| !roles.is_empty()) {
+        let _ = write!(
+            out,
+            "; role registrations are held in memory only, so any agent that survives this \
+             teardown keeps running but can never delegate again"
+        );
+    }
+    Some(out)
+}
+
+/// The budget [`log_teardown_inventory`] gives the state lock before giving up
+/// on naming the orchestration roles.
+///
+/// The disclosure is diagnostic, so it must not be able to delay the teardown it
+/// describes. Two clocks bound it, and the tighter one is ours rather than the
+/// operating system's:
+///
+/// - **An external sender's.** On the signal path the sender is frequently a
+///   service manager running its own `TimeoutStopSec`, and spending that budget
+///   waiting for a lock trades a graceful drain for a `SIGKILL`. Those windows
+///   are measured in tens of seconds, so they are not what sets this number.
+/// - **Our own stop clients'**, which is what does. `daemon stop` sends the very
+///   SIGTERM this fires on and then polls
+///   [`crate::agent_pty::DAEMON_STOP_POLL_BUDGET`] for the daemon to go away,
+///   and the teardown that follows this call can already spend
+///   [`crate::agent_pty::AGENT_TERMINATE_GRACE`] plus
+///   [`crate::agent_pty::FORCE_REAP_DEADLINE`] of it. This is charged to the
+///   same window, ahead of both, so it comes out of the headroom that pays for
+///   unwinding, dropping the registry, exiting, and a client that samples only
+///   every 100 ms.
+///
+/// 200 ms is twice that sampling interval and far above any contention this
+/// lock sees in practice — every other holder takes it for one snapshot — while
+/// leaving the great majority of the headroom alone. The assertion below pins
+/// the relationship rather than leaving it to this comment, exactly as
+/// `FORCE_REAP_DEADLINE`'s own assertions do.
+const TEARDOWN_INVENTORY_LOCK_BUDGET: Duration = Duration::from_millis(200);
+
+// The arithmetic above is load-bearing, not stylistic: a disclosure that pushes
+// the teardown past what `daemon stop` waits for turns a clean stop into a
+// `TimedOut` (or, with `--force`, a SIGKILL mid-teardown) — and it would do it
+// on the exact path the disclosure exists to serve.
+const _: () = assert!(
+    TEARDOWN_INVENTORY_LOCK_BUDGET.as_millis()
+        + crate::agent_pty::AGENT_TERMINATE_GRACE.as_millis()
+        + crate::agent_pty::FORCE_REAP_DEADLINE.as_millis()
+        < crate::agent_pty::DAEMON_STOP_POLL_BUDGET.as_millis(),
+    "the teardown disclosure plus the SIGTERM grace plus the reap must finish strictly inside \
+     the window a stop client polls for, or naming what was destroyed is what destroyed the \
+     clean stop"
+);
+
+/// Issue #1109: log what this teardown is destroying, on the paths that do not
+/// refuse.
+///
+/// Call this BEFORE draining the registry. `AgentPtyRegistry::agent_records`
+/// filters to live agents and `shutdown_all_graceful` drains the map, so after
+/// the drain both halves of this inventory read empty and the disclosure is a
+/// line saying nothing was lost.
+///
+/// `path` names which teardown produced the line (`"signal"`,
+/// `"shutdown-frame"`) so a reader does not have to correlate it against the
+/// line above by timestamp.
+///
+/// Best-effort by construction, in two ways that are named here rather than
+/// left for a reader to discover in an incident.
+///
+/// **A state lock it cannot take inside [`TEARDOWN_INVENTORY_LOCK_BUDGET`] costs
+/// the ROLE half**, and that is reported as UNKNOWN in both the `warn!` below
+/// and the inventory itself — never as a zero. The agent half comes off the
+/// registry's own mutex and does not depend on that read.
+///
+/// **The two halves are two snapshots, not one** (Greptile P1). They come from
+/// different locks, and the daemon is still serving when this runs: spawn
+/// admission closes only when the drain that follows latches
+/// `AgentPtyRegistry::shutting_down`, so a `StartAgent` accepted in between can
+/// land in one list and not the other. It is not closed, for two reasons. An
+/// atomic snapshot would mean holding the state lock and the registry mutex
+/// together on the teardown path, introducing a lock ordering where there is
+/// none today, for a log line. And pre-latching `shutting_down` to close
+/// admission first — the obvious alternative — would make the drain that
+/// follows return *immediately without draining anything*, because
+/// [`AgentPtyRegistry::shutdown_all_graceful`] early-returns on exactly that
+/// latch: it would trade a cosmetic inconsistency in a record for every managed
+/// agent losing its SIGTERM grace.
+///
+/// What is done instead is to order the reads so the window is as small as it
+/// can be: the SLOW read (the state lock, up to the budget) goes first and the
+/// fast registry read immediately after, so the gap between the two snapshots is
+/// one mutex acquisition rather than the whole lock wait.
+pub async fn log_teardown_inventory(
+    state: &SharedState,
+    registry: &AgentPtyRegistry,
+    path: &'static str,
+) {
+    let roles = match tokio::time::timeout(TEARDOWN_INVENTORY_LOCK_BUDGET, state.read()).await {
+        Ok(guard) => Some(guard.live_orchestration_roles(registry)),
+        Err(_) => {
+            warn!(
+                path,
+                budget_ms = TEARDOWN_INVENTORY_LOCK_BUDGET.as_millis() as u64,
+                "could not read daemon state within the budget; this teardown's orchestration \
+                 roles are UNLISTED, which is not the same as none being at stake"
+            );
+            None
+        }
+    };
+    let agents = registry.agent_records();
+    if let Some(inventory) = format_teardown_inventory(roles.as_deref(), &agents) {
+        warn!(
+            path,
+            agent_count = agents.len(),
+            // `None` rather than `0` when the read timed out: a structured
+            // consumer must be able to tell the two apart for the same reason
+            // the message must.
+            role_count = roles.as_ref().map(Vec::len),
+            "{inventory}"
+        );
+    }
 }
 
 /// Issue #1049: the wire form of [`stop_refusal`], for
@@ -797,6 +1038,181 @@ mod tests {
             orchestration: "issue-work".to_string(),
             is_orchestrator,
         }
+    }
+
+    /// A live `AgentRecord` as [`AgentPtyRegistry::agent_records`] yields one,
+    /// with only the four fields [`teardown_agent_line`] reads carrying values.
+    /// Built exhaustively rather than through serde so a new field forces a
+    /// deliberate look at whether the teardown inventory should name it.
+    fn agent(id: &str, pane: Option<&str>, label: Option<&str>, cwd: Option<&str>) -> AgentRecord {
+        AgentRecord {
+            id: id.to_string(),
+            pane_id_env: pane.map(str::to_string),
+            display_name: label.map(str::to_string),
+            cwd: cwd.map(str::to_string),
+            tab_membership: None,
+            agent_type: None,
+            rows: 24,
+            cols: 80,
+            live: None,
+            spawned_at_ms: None,
+            cli_name: None,
+            crashed: None,
+        }
+    }
+
+    /// Issue #1109: the disclosure the UNGUARDED teardown paths emit. It is the
+    /// whole deliverable of that issue — the signal path and `KIND_SHUTDOWN`
+    /// keep destroying what they destroy, and what changed is that they now say
+    /// what it was — so it must name every pane, every role, and the permanence.
+    #[test]
+    fn teardown_inventory_names_every_agent_every_role_and_the_permanence() {
+        let roles = vec![
+            role("sched-issue-work-1-r0", "orchestrator", true),
+            role("sched-issue-work-1-r1", "coder", false),
+        ];
+        let agents = vec![
+            agent(
+                "12",
+                Some("sched-issue-work-1-r0"),
+                Some("orchestrator"),
+                Some("/home/u/code/repo"),
+            ),
+            agent(
+                "13",
+                Some("sched-issue-work-1-r1"),
+                Some("coder"),
+                Some("/home/u/code/repo-worker"),
+            ),
+        ];
+        let msg = format_teardown_inventory(Some(&roles), &agents)
+            .expect("a daemon with live agents and roles has something to disclose");
+        for expected in [
+            "terminating 2 managed agent(s)",
+            "destroying 2 orchestration role registration(s)",
+            "12",
+            "13",
+            "sched-issue-work-1-r0",
+            "sched-issue-work-1-r1",
+            "label=orchestrator",
+            "label=coder",
+            "/home/u/code/repo-worker",
+            "(orchestrator)",
+            "[issue-work]",
+        ] {
+            assert!(
+                msg.contains(expected),
+                "inventory must name {expected:?}, got: {msg:?}"
+            );
+        }
+        assert!(
+            msg.contains("can never delegate again"),
+            "the inventory must carry the same permanence sentence the #770 \
+             refusal carries — the processes are merely stopped, the role \
+             registrations are gone for good; got: {msg:?}"
+        );
+        assert!(
+            !msg.contains('\n'),
+            "the inventory is grepped out of a log after the fact, so it must be \
+             ONE line; got: {msg:?}"
+        );
+    }
+
+    /// The inventory and the #770 refusal describe the same registration, and a
+    /// reader correlating a refusal with a log line should not have to notice a
+    /// drift. Pinned by rendering both from one role set and requiring the
+    /// refusal's own per-role rendering to appear verbatim inside the inventory.
+    #[test]
+    fn teardown_inventory_renders_roles_exactly_as_the_refusal_does() {
+        let roles = vec![role("sched-issue-work-1-r0", "orchestrator", true)];
+        let line = orchestration_role_line(&roles[0]);
+        assert!(
+            format_live_orchestrations_refusal(&roles).contains(&line),
+            "the refusal must render the role through the shared helper"
+        );
+        assert!(
+            format_teardown_inventory(Some(&roles), &[])
+                .expect("roles alone are worth disclosing")
+                .contains(&line),
+            "the inventory must render the role through the same helper"
+        );
+    }
+
+    /// An idle daemon discloses nothing: a teardown that destroys no agent and
+    /// no registration has nothing to say, and a line saying so on every clean
+    /// `daemon stop` is noise that trains readers to skip the one that matters.
+    #[test]
+    fn teardown_inventory_is_absent_when_nothing_is_at_stake() {
+        assert!(format_teardown_inventory(Some(&[]), &[]).is_none());
+    }
+
+    /// Greptile P1 on PR #1161: a state read that misses its budget must report
+    /// the role inventory as UNKNOWN, never as zero. The first draft handed this
+    /// an empty slice, so a contended lock printed "destroying 0 orchestration
+    /// role registration(s)" and dropped the permanence sentence — a confident
+    /// zero over an unknown, in the one record an incident has to rely on.
+    #[test]
+    fn teardown_inventory_reports_an_unreadable_role_map_as_unknown_not_zero() {
+        let agents = vec![agent("12", Some("sched-issue-work-1-r0"), None, None)];
+        let msg = format_teardown_inventory(None, &agents)
+            .expect("an unreadable role map is precisely when the record matters");
+        assert!(
+            msg.contains("UNKNOWN number of orchestration role registration(s)"),
+            "an unread role map must say so, got: {msg:?}"
+        );
+        assert!(
+            !msg.contains("destroying 0 "),
+            "reporting an unknown as a zero is the defect this test exists for, got: {msg:?}"
+        );
+        assert!(
+            msg.contains("can never delegate again"),
+            "the permanence sentence is carried when roles MIGHT have been held — \
+             withholding it here would understate an unknown, got: {msg:?}"
+        );
+    }
+
+    /// The other side of the same rule: a role map that WAS read and was empty
+    /// must not carry the permanence sentence, or every clean single-agent stop
+    /// claims a loss it did not cause.
+    #[test]
+    fn teardown_inventory_distinguishes_an_unknown_role_map_from_an_empty_one() {
+        let agents = vec![agent("12", Some("pane-12"), None, None)];
+        let unknown = format_teardown_inventory(None, &agents).expect("unknown discloses");
+        let empty = format_teardown_inventory(Some(&[]), &agents).expect("empty discloses");
+        assert_ne!(
+            unknown, empty,
+            "\"could not find out\" and \"there were none\" must not render the same"
+        );
+        assert!(empty.contains("destroying 0 orchestration role registration(s)"));
+        assert!(!empty.contains("can never delegate again"));
+    }
+
+    /// The half that is reachable on its own: `live_orchestration_roles`
+    /// filters to panes with a live agent, so roles imply agents — but agents
+    /// do NOT imply roles. An ordinary single-agent deck must still be named,
+    /// and must NOT be told its registrations are gone for good when it held
+    /// none.
+    #[test]
+    fn teardown_inventory_without_roles_names_the_agents_and_claims_no_role_loss() {
+        let agents = vec![agent("7", Some("pane-7"), None, None)];
+        let msg =
+            format_teardown_inventory(Some(&[]), &agents).expect("a live agent is worth naming");
+        assert!(
+            msg.contains("terminating 1 managed agent(s)")
+                && msg.contains("destroying 0 orchestration role registration(s)")
+                && msg.contains("pane=pane-7"),
+            "got: {msg:?}"
+        );
+        assert!(
+            !msg.contains("can never delegate again"),
+            "the permanence sentence is about role registrations; with none held \
+             it would be a false claim about what this teardown cost, got: {msg:?}"
+        );
+        assert!(
+            msg.contains("label=-") && msg.contains("cwd=-"),
+            "an unlabelled agent must still render a total entry rather than a \
+             ragged one, got: {msg:?}"
+        );
     }
 
     /// Issue #770: the force matrix, over the pure policy so no socket (and no
