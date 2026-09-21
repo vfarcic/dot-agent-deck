@@ -2736,6 +2736,15 @@ without depending on the config struct API.
 - **Does not assert:** how long the failure takes to surface.
 - **Platform coverage:** mac+linux.
 
+#### error/hangup
+
+##### error/hangup/001 — The deck exits when its terminal hangs up, instead of spinning at 100% of a core on a terminal it can neither read from nor write to.
+- **Layer:** L2 (PTY-attached; the real binary under a `trap '' HUP` session leader, whose master this test then closes).
+- **Agent:** none — no pane is spawned at all, because the hangup is a property of the event loop rather than of anything running under it. Lane 1: no credential.
+- **Asserts:** the deck paints its dashboard and binds its daemon's attach socket; it is STILL running 1.5s later while the terminal is attached (the control — a watchdog that fired on an idle or input-pending terminal would pass the main assertion without fixing anything); and once the pseudo-terminal master is closed, the deck process is gone within 20s. Measured at ~0.5s, which is `terminal_hangup::ACK_WINDOW`; the bound is headroom for a loaded host, not an expected duration.
+- **Does not assert:** the exit status (the watchdog's own path reports 129, but a hangup that the event loop happens to acknowledge leaves by the ordinary detach path and reports 0 — both are correct and the test is about the process ending); that the session snapshot was written (the acknowledged path writes one, and it is the path that measurably does not win on crossterm 0.29 — see `src/terminal_hangup.rs`); the CPU burned during the bounded window before the exit; **macOS at all** — this is a lane-1 e2e test and `e2e-deterministic` is a Linux job, so nothing runs it there, and #1138 was never reproduced on macOS either. What macOS *does* run is the L1 half in `src/terminal_hangup.rs`, through `build-macos`'s `cargo nextest run --workspace`, and that half earned its place immediately: it failed on the first push because Apple's `poll` reports no hangup for an unrequested event, which would have shipped this fix as Linux-only.
+- **Platform coverage:** linux (reproduced and exercised). Not mac: the file is not `cfg`'d off, but no macOS job enables the `e2e` feature, so a macOS regression in the real-binary path would surface only on a developer's own machine.
+
 ### Orchestration delegation
 
 #### orchestration/delegate
