@@ -84,6 +84,17 @@
 //! `--depth` and quietly produce a complete repository for every shallow
 //! assertion to pass vacuously against.
 //!
+//! Issue #567's tests were held to the same bar. Four injections, one at a
+//! time, all caught: [`drift_remedy`] never emitting an unlock (the
+//! pre-#567 behaviour); the parser dropping the `locked` line it now keeps
+//! (reddens the parser test and the real-git one); [`drift_remedy`]
+//! emitting an unlock unconditionally, which is what the three pre-existing
+//! `contains(PRUNE_REMEDY)` assertions could not see — the locked remedy
+//! ends in the bare one, so they passed on the wrong message until they
+//! were tightened to `bare_prune_clause`; and the remedy rendering its path
+//! with `{:?}` instead of [`shell_quote`], which reddens the metacharacter
+//! test along with the four message tests.
+//!
 //! The two `Sandbox` isolation tests added by issue #834 were held to the
 //! same bar, and their subject is the *fixture harness* rather than the code
 //! under test — so the injections are into [`Sandbox`] itself. Four, one at a
@@ -111,18 +122,35 @@ const UNSHALLOW_REMEDY: &str = "git fetch --unshallow <remote>";
 /// (i.e. the tip is parentless) when the history has been truncated.
 const SHALLOW_PROBE: &str = "git rev-list --max-parents=0 <ref>";
 
-/// Named verbatim in both worktree-drift failure messages.
+/// Named verbatim in both worktree-drift failure messages — on its own for
+/// an unlocked entry, and after [`UNLOCK_REMEDY`] for a locked one (see
+/// [`drift_remedy`]).
 const PRUNE_REMEDY: &str = "git worktree prune";
 
+/// Prefixed to [`PRUNE_REMEDY`] for a locked entry (issue #567): `git
+/// worktree prune` removes no locked entry, so the bare remedy exits 0 and
+/// changes nothing there. Takes the registered path as its argument.
+const UNLOCK_REMEDY: &str = "git worktree unlock";
+
+/// Appended to a drift message whose remedy had to grow an unlock, so the
+/// reader knows why the obvious command is not the one named.
+const LOCKED_EXPLANATION: &str = " (git prunes no locked entry, so `git worktree prune` on its \
+                                  own exits 0 and leaves the registry unchanged)";
+
 /// One `git worktree list --porcelain` entry: the registered path, whether
-/// it still exists on disk, and git's own `prunable` reason when it already
-/// told us (see [`parse_worktree_entries`]). The existence check is done by
-/// the caller ([`collect`]) rather than inside the pure verdict functions
-/// below, so drift can be pinned by a test without touching the filesystem.
+/// it still exists on disk, whether git reported it `locked`, and git's own
+/// `prunable` reason when it already told us (see
+/// [`parse_worktree_entries`]). The existence check is done by the caller
+/// ([`collect`]) rather than inside the pure verdict functions below, so
+/// drift can be pinned by a test without touching the filesystem.
 #[derive(Debug)]
 struct WorktreeEntry {
     path: PathBuf,
     exists: bool,
+    /// True when `git worktree list --porcelain` reported this entry
+    /// `locked` (with or without a reason). Carried only to pick the
+    /// remedy: see [`drift_remedy`].
+    locked: bool,
     /// `Some(reason)` when `git worktree list --porcelain` already reported
     /// this entry `prunable <reason>` (git ≥ 2.36) — folded into the drift
     /// message instead of composing our own explanation. `None` means
@@ -218,6 +246,7 @@ const RECORD_LF: u8 = b'\n';
 #[derive(Debug)]
 struct ParsedWorktree {
     path: PathBuf,
+    locked: bool,
     prunable_reason: Option<String>,
     /// True when a line inside this entry's block matched none of the
     /// attributes git emits — the signature of a path containing a literal
@@ -249,9 +278,11 @@ fn is_known_attribute_line(line: &[u8]) -> bool {
 
 /// Parse `git worktree list --porcelain` output into per-entry records, in
 /// the order git reports them. Every block starts with a `worktree <path>`
-/// line; `HEAD`, `branch`, `bare`, `detached` and `locked` lines are
-/// ignored, and a `prunable <reason>` line (git ≥ 2.36) attaches to the
-/// block it appears in — preferred over re-deriving drift with
+/// line; `HEAD`, `branch`, `bare` and `detached` lines are ignored, a
+/// `locked` line (bare or `locked <reason>`) sets that block's `locked`
+/// flag — which is all [`drift_remedy`] needs, so the reason itself is
+/// still discarded — and a `prunable <reason>` line (git ≥ 2.36) attaches
+/// to the block it appears in — preferred over re-deriving drift with
 /// `Path::exists()`/`try_exists()` in [`collect`] because it survives a
 /// corrupted `path` field: git accepts a literal newline inside a worktree
 /// path and porcelain emits it unescaped, splitting one entry's block
@@ -278,6 +309,7 @@ fn parse_worktree_entries(porcelain: &[u8], sep: u8) -> Vec<ParsedWorktree> {
             }
             current = Some(ParsedWorktree {
                 path: PathBuf::from(os_string_from_bytes(rest)),
+                locked: false,
                 prunable_reason: None,
                 path_maybe_truncated: false,
             });
@@ -285,6 +317,17 @@ fn parse_worktree_entries(porcelain: &[u8], sep: u8) -> Vec<ParsedWorktree> {
             && let Some(entry) = current.as_mut()
         {
             entry.prunable_reason = Some(String::from_utf8_lossy(rest).into_owned());
+        } else if (line == b"locked" || line.starts_with(b"locked "))
+            && let Some(entry) = current.as_mut()
+        {
+            // Both spellings, because `git worktree lock` takes an optional
+            // `--reason`: the bare line and the `locked <reason>` form are
+            // the same fact for the remedy. `is_known_attribute_line`
+            // already recognises both — it decides only whether a line is a
+            // truncated path's tail — so this branch changes what is
+            // *kept*, not what is recognised, and a `locked` line reaching
+            // the truncation branch instead would still be ignored there.
+            entry.locked = true;
         } else if !is_known_attribute_line(line)
             && let Some(entry) = current.as_mut()
         {
@@ -303,6 +346,105 @@ fn parse_worktree_entries(porcelain: &[u8], sep: u8) -> Vec<ParsedWorktree> {
         out.push(entry);
     }
     out
+}
+
+/// The raw bytes behind an [`OsStr`], the inverse of
+/// [`os_string_from_bytes`] and split on the same platform line for the
+/// same reason: a worktree path is not guaranteed to be UTF-8 on Unix, and
+/// a lossy round-trip would change the bytes [`shell_quote`] has to
+/// reproduce exactly.
+fn os_bytes(s: &std::ffi::OsStr) -> Vec<u8> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        s.as_bytes().to_vec()
+    }
+    #[cfg(not(unix))]
+    {
+        s.to_string_lossy().into_owned().into_bytes()
+    }
+}
+
+/// A registered path as a word a contributor can paste into a shell.
+///
+/// **Not `{:?}`** (Greptile P1 on this PR). `Debug` for [`Path`] produces a
+/// string that merely *looks* shell-quoted: it wraps the path in double
+/// quotes and escapes `"`, `\` and control characters, but `$` and a
+/// backtick pass through untouched — so a worktree registered at a path
+/// containing `$(…)` would be command-substituted by the very shell this
+/// message is telling someone to paste into, and the `git worktree unlock`
+/// would then be aimed at a different path and clear nothing. The drift
+/// list above the remedy keeps `{:?}`: that one is for reading.
+///
+/// Ordinary paths get POSIX single quotes, inside which nothing expands at
+/// all, with an embedded `'` closed and reopened the usual way (`'\''`).
+/// A path carrying a control character or a non-UTF-8 byte gets bash/zsh
+/// ANSI-C quoting (`$'…'`) instead, which *escapes* those bytes rather than
+/// emitting them raw — the property `{:?}` was originally chosen for, since
+/// a `\r` or an ANSI escape would otherwise corrupt the terminal or CI log
+/// the message lands in, and a trailing space would be invisible. `$'…'` is
+/// bash/zsh rather than POSIX `sh`, which is the trade: an ordinary path
+/// never reaches that branch, and a path that does could not be printed
+/// verbatim safely anyway.
+fn shell_quote(path: &Path) -> String {
+    let bytes = os_bytes(path.as_os_str());
+    let printable = bytes.iter().all(|b| *b >= 0x20 && *b != 0x7f);
+    if printable && let Ok(text) = std::str::from_utf8(&bytes) {
+        return format!("'{}'", text.replace('\'', r"'\''"));
+    }
+    let mut out = String::from("$'");
+    for &b in &bytes {
+        match b {
+            b'\n' => out.push_str("\\n"),
+            b'\r' => out.push_str("\\r"),
+            b'\t' => out.push_str("\\t"),
+            b'\'' => out.push_str("\\'"),
+            b'\\' => out.push_str("\\\\"),
+            0x20..=0x7e => out.push(b as char),
+            // Everything else — control characters and every non-ASCII
+            // byte in a path this branch was entered for — as `\xNN`, which
+            // `$'…'` reproduces byte for byte, so a non-UTF-8 path survives
+            // the round trip that a `String` could not carry.
+            _ => out.push_str(&format!("\\x{b:02x}")),
+        }
+    }
+    out.push('\'');
+    out
+}
+
+/// The command that will actually clear the drift reported for `missing`,
+/// plus the clause explaining it when it is not the obvious one (issue
+/// #567).
+///
+/// **`git worktree prune` does not remove a locked entry** — sparing one is
+/// the documented purpose of `git worktree lock`, not a version quirk, and
+/// it was measured here on git 2.34.1 and in issue #567 on 2.55.0. It exits
+/// 0, prints nothing and leaves the registry exactly as it was, so a
+/// contributor who followed the old unconditional remedy verbatim got the
+/// identical failure on the next run with no path forward. That also
+/// reproduces the failure shape issue #557 exists to prevent — a command
+/// that appears to succeed while the real state is untouched — inside the
+/// fix for it. `a_locked_worktree_that_was_removed_needs_an_unlock_before_the_prune`
+/// asserts it against real git rather than trusting this paragraph.
+///
+/// So each locked path gets its own `git worktree unlock` in front of the
+/// single prune that then clears them all, and an all-unlocked set is
+/// spelled exactly as before. Paths go through [`shell_quote`] rather than
+/// the `{:?}` the drift list above uses, because this one is meant to be
+/// *run* and that one is meant to be read.
+fn drift_remedy(missing: &[&WorktreeEntry]) -> (String, &'static str) {
+    let mut steps: Vec<String> = missing
+        .iter()
+        .filter(|w| w.locked)
+        .map(|w| format!("{UNLOCK_REMEDY} {}", shell_quote(&w.path)))
+        .collect();
+    let explanation = if steps.is_empty() {
+        ""
+    } else {
+        LOCKED_EXPLANATION
+    };
+    steps.push(PRUNE_REMEDY.to_string());
+    (steps.join(" && "), explanation)
 }
 
 /// The pure verdict: every failure found against an already-collected
@@ -340,16 +482,21 @@ fn preflight_failures(state: &RepoState) -> Vec<String> {
         } else {
             ("do", "are")
         };
+        let (remedy, explanation) = drift_remedy(&missing);
         failures.push(format!(
             "worktree registry drift: {list} {does} no longer exist on disk but {is} still \
-             registered — a worktree was removed without pruning. Run `{PRUNE_REMEDY}`."
+             registered — a worktree was removed without pruning. Run `{remedy}`{explanation}."
         ));
 
-        if missing.iter().any(|w| w.path == state.current_worktree) {
+        if let Some(current) = missing.iter().find(|w| w.path == state.current_worktree) {
+            // Scoped to this one entry rather than reusing the remedy
+            // above: this message names a single worktree, so unlocking a
+            // sibling in it would be noise.
+            let (remedy, explanation) = drift_remedy(std::slice::from_ref(current));
             failures.push(format!(
                 "this checkout's own worktree, {:?}, is registered but no longer exists on disk \
                  — whatever runs next will fail with a confusing `no such file or directory` \
-                 instead. Run `{PRUNE_REMEDY}`.",
+                 instead. Run `{remedy}`{explanation}.",
                 state.current_worktree
             ));
         }
@@ -555,6 +702,7 @@ where
             WorktreeEntry {
                 path: entry.path,
                 exists,
+                locked: entry.locked,
                 prunable_reason: entry.prunable_reason,
             }
         })
@@ -641,6 +789,20 @@ pub(crate) fn run(root: &Path) -> Vec<String> {
     failures_from(collect(root))
 }
 
+/// The remedy clause an **unlocked** drift message must end with, shared by
+/// all three test modules below (issue #567).
+///
+/// Spelled out in full rather than asserted as `contains(PRUNE_REMEDY)`,
+/// because the locked form *contains* [`PRUNE_REMEDY`] as a substring —
+/// `… && git worktree prune` — so the looser assertion would pass on the
+/// wrong remedy. This one cannot: the locked form has `git worktree unlock`
+/// immediately after ``Run ` ``, and its closing backtick is followed by a
+/// space rather than the full stop.
+#[cfg(test)]
+fn bare_prune_clause() -> String {
+    format!("Run `{PRUNE_REMEDY}`.")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -649,7 +811,17 @@ mod tests {
         WorktreeEntry {
             path: PathBuf::from(path),
             exists,
+            locked: false,
             prunable_reason: None,
+        }
+    }
+
+    /// The same, for an entry `git worktree lock` was pointed at (issue
+    /// #567).
+    fn locked_entry(path: &str, exists: bool) -> WorktreeEntry {
+        WorktreeEntry {
+            locked: true,
+            ..entry(path, exists)
         }
     }
 
@@ -736,8 +908,8 @@ mod tests {
         assert_eq!(failures.len(), 1, "{failures:?}");
         assert!(failures[0].contains("/repo/gone"), "{}", failures[0]);
         assert!(
-            failures[0].contains("git worktree prune"),
-            "{}",
+            failures[0].contains(&bare_prune_clause()),
+            "an unlocked entry must keep the bare prune remedy: {}",
             failures[0]
         );
         // The current worktree is fine, so the degenerate-case message must
@@ -761,8 +933,8 @@ mod tests {
         assert_eq!(failures.len(), 2, "{failures:?}");
         assert!(failures[0].contains("/repo/wt"), "{}", failures[0]);
         assert!(
-            failures[0].contains("git worktree prune"),
-            "{}",
+            failures[0].contains(&bare_prune_clause()),
+            "an unlocked entry must keep the bare prune remedy: {}",
             failures[0]
         );
         assert!(
@@ -772,8 +944,8 @@ mod tests {
         );
         assert!(failures[1].contains("/repo/wt"), "{}", failures[1]);
         assert!(
-            failures[1].contains("git worktree prune"),
-            "{}",
+            failures[1].contains(&bare_prune_clause()),
+            "an unlocked entry must keep the bare prune remedy: {}",
             failures[1]
         );
     }
@@ -787,6 +959,7 @@ mod tests {
             vec![WorktreeEntry {
                 path: PathBuf::from("/repo/gone"),
                 exists: false,
+                locked: false,
                 prunable_reason: Some("gitdir file points to non-existent location".to_string()),
             }],
             "/repo/main",
@@ -799,6 +972,282 @@ mod tests {
             "{}",
             failures[0]
         );
+    }
+
+    /// **Issue #567, both arms.** A drifted entry that git reported
+    /// `locked` cannot be cleared by `git worktree prune` — it exits 0 and
+    /// leaves the registry untouched — so the remedy names the unlock that
+    /// makes the prune land, while an unlocked entry's message is
+    /// byte-identical to what it was before.
+    ///
+    /// Asserted as the whole ``Run `…`.`` clause rather than as
+    /// `contains(PRUNE_REMEDY)`: the locked remedy ends in the bare one, so
+    /// the loose form passes on either message and pins nothing.
+    #[test]
+    fn a_locked_drifted_entry_gets_the_unlock_then_prune_remedy() {
+        let locked = state(
+            false,
+            vec![
+                entry("/repo/main", true),
+                locked_entry("/repo/wt-locked", false),
+            ],
+            "/repo/main",
+            false,
+        );
+        let failures = preflight_failures(&locked);
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert!(
+            failures[0]
+                .contains("Run `git worktree unlock '/repo/wt-locked' && git worktree prune`"),
+            "the remedy must name the unlock that makes the prune land: {}",
+            failures[0]
+        );
+        assert!(
+            !failures[0].contains(&bare_prune_clause()),
+            "the bare prune cannot clear a locked entry, so it must not be what is named: {}",
+            failures[0]
+        );
+        assert!(
+            failures[0].contains("git prunes no locked entry"),
+            "the reader has to be told why the obvious command is not the one named: {}",
+            failures[0]
+        );
+
+        // The other arm: same drift, unlocked, and the message is what it
+        // has always been.
+        let unlocked = state(
+            false,
+            vec![entry("/repo/main", true), entry("/repo/wt-gone", false)],
+            "/repo/main",
+            false,
+        );
+        let failures = preflight_failures(&unlocked);
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert!(
+            failures[0].contains(&bare_prune_clause()),
+            "an unlocked entry's remedy must be unchanged: {}",
+            failures[0]
+        );
+        assert!(
+            !failures[0].contains(UNLOCK_REMEDY),
+            "nothing to unlock here, so nothing about unlocking: {}",
+            failures[0]
+        );
+    }
+
+    /// One prune clears every entry at once, so a mixed set grows one
+    /// `unlock` per locked path and still ends in a single prune — and a
+    /// healthy locked worktree contributes nothing, since it is not drift.
+    #[test]
+    fn a_mixed_set_unlocks_each_locked_path_before_one_prune() {
+        let s = state(
+            false,
+            vec![
+                locked_entry("/repo/live-locked", true),
+                entry("/repo/plain-gone", false),
+                locked_entry("/repo/locked-a", false),
+                locked_entry("/repo/locked-b", false),
+            ],
+            "/repo/main",
+            false,
+        );
+        let failures = preflight_failures(&s);
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert!(
+            failures[0].contains(
+                "Run `git worktree unlock '/repo/locked-a' && \
+                 git worktree unlock '/repo/locked-b' && git worktree prune`"
+            ),
+            "{}",
+            failures[0]
+        );
+        assert!(
+            !failures[0].contains("live-locked"),
+            "a locked worktree that is still on disk is not drift: {}",
+            failures[0]
+        );
+    }
+
+    /// The degenerate case with the lock on it: this checkout's own entry
+    /// is the missing one AND it is locked, so its own message needs the
+    /// unlock too — and names only itself, not the drifted sibling the
+    /// general message above it already covers.
+    #[test]
+    fn a_locked_current_worktree_gets_the_unlock_in_its_own_message() {
+        let s = state(
+            false,
+            vec![
+                locked_entry("/repo/wt", false),
+                locked_entry("/repo/other", false),
+            ],
+            "/repo/wt",
+            true,
+        );
+        let failures = preflight_failures(&s);
+        assert_eq!(failures.len(), 2, "{failures:?}");
+        assert!(
+            failures[1].contains("this checkout's own worktree"),
+            "{}",
+            failures[1]
+        );
+        assert!(
+            failures[1].contains("Run `git worktree unlock '/repo/wt' && git worktree prune`"),
+            "{}",
+            failures[1]
+        );
+        assert!(
+            !failures[1].contains("/repo/other"),
+            "the degenerate message names one worktree, so unlocking a sibling in it is noise: {}",
+            failures[1]
+        );
+    }
+
+    /// **Greptile P1 on this PR.** The remedy is a command the message
+    /// tells a human to run, so a path that carries shell metacharacters
+    /// must arrive as an inert word. `{:?}` — what the drift list above the
+    /// remedy uses, and what this originally used — is not that: it wraps
+    /// the path in *double* quotes, inside which `$(…)` and a backtick are
+    /// still expanded by the shell being pasted into, so the `unlock` would
+    /// be aimed somewhere else and clear nothing.
+    #[test]
+    fn a_path_with_shell_metacharacters_is_inert_in_the_remedy() {
+        let s = state(
+            false,
+            vec![locked_entry("/repo/$(touch pwned)/`id`/wt", false)],
+            "/repo/main",
+            false,
+        );
+        let failures = preflight_failures(&s);
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert!(
+            failures[0].contains(
+                "Run `git worktree unlock '/repo/$(touch pwned)/`id`/wt' && git worktree prune`"
+            ),
+            "the path must be single-quoted, where nothing expands: {}",
+            failures[0]
+        );
+        assert!(
+            !failures[0].contains("unlock \"/repo/$(touch pwned)"),
+            "double quotes would leave the substitution live: {}",
+            failures[0]
+        );
+    }
+
+    /// The three shapes [`shell_quote`] has to tell apart, pinned directly
+    /// so the per-message tests above do not have to carry them all.
+    #[test]
+    fn shell_quote_covers_metacharacters_quotes_and_control_bytes() {
+        // Ordinary: POSIX single quotes, nothing escaped inside them.
+        assert_eq!(shell_quote(Path::new("/repo/wt")), "'/repo/wt'");
+        assert_eq!(
+            shell_quote(Path::new("/repo/$HOME `id` \"x\" & wt")),
+            "'/repo/$HOME `id` \"x\" & wt'"
+        );
+        // An embedded single quote closes and reopens: '\''.
+        assert_eq!(
+            shell_quote(Path::new("/repo/it's")),
+            r"'/repo/it'\''s'".to_string()
+        );
+        // A trailing space survives visibly, which bare text would not.
+        assert_eq!(shell_quote(Path::new("/repo/wt ")), "'/repo/wt '");
+        // Non-ASCII is not mangled — it is not a control byte.
+        assert_eq!(shell_quote(Path::new("/repo/wörk")), "'/repo/wörk'");
+        // A control character is ESCAPED rather than emitted raw, so it
+        // cannot corrupt the terminal or CI log the message lands in.
+        assert_eq!(
+            shell_quote(Path::new("/repo/wt\nnewline")),
+            r"$'/repo/wt\nnewline'"
+        );
+        assert_eq!(
+            shell_quote(Path::new("/repo/wt\u{1b}[31m")),
+            r"$'/repo/wt\x1b[31m'"
+        );
+    }
+
+    /// The field the remedy is picked from has to survive the parser.
+    /// `git worktree lock` takes an optional `--reason`, so porcelain emits
+    /// either a bare `locked` or `locked <reason>`; both are the same fact
+    /// here, and neither may be mistaken for the tail of a newline-split
+    /// path. Byte-for-byte the layout real `git worktree list --porcelain`
+    /// produced for a locked worktree on git 2.34.1.
+    #[test]
+    fn parse_worktree_entries_records_a_locked_entry() {
+        let porcelain = "worktree /repo/main\n\
+                          HEAD 9c131d5455485369f6b6b7c9ac8cdd9d5482241d\n\
+                          branch refs/heads/main\n\
+                          \n\
+                          worktree /repo/bare-lock\n\
+                          HEAD 4e402c166433f702351f18e6e26c51205e19df1e\n\
+                          branch refs/heads/wtb\n\
+                          locked\n\
+                          \n\
+                          worktree /repo/lock-with-reason\n\
+                          HEAD 4e402c166433f702351f18e6e26c51205e19df1e\n\
+                          branch refs/heads/wtc\n\
+                          locked on a removable drive\n";
+        let entries = parse_worktree_entries(porcelain.as_bytes(), RECORD_LF);
+        assert_eq!(entries.len(), 3, "{entries:?}");
+        assert!(!entries[0].locked);
+        assert!(entries[1].locked, "a bare `locked` line must be kept");
+        assert!(entries[2].locked, "`locked <reason>` must be kept too");
+        for e in &entries {
+            assert!(
+                !e.path_maybe_truncated,
+                "a `locked` line is an attribute, not a path tail: {e:?}"
+            );
+        }
+    }
+
+    /// **Greptile P2 on this PR**, pinned rather than fixed, and the reason
+    /// is that the ambiguity is the git < 2.36 LF fallback's rather than
+    /// this change's. A path containing a literal newline whose
+    /// continuation happens to read `locked` is, in that record form,
+    /// byte-identical to an ordinary `locked` attribute — nothing in the
+    /// stream can tell them apart. So the entry's path stays truncated and
+    /// it reads locked.
+    ///
+    /// That is not a regression: `is_known_attribute_line` has recognised
+    /// both `locked` spellings since #558, so this shape never raised the
+    /// truncation signal and was already reported as drift under a
+    /// shortened path — with a remedy that could not clear it either, since
+    /// the real worktree is locked and the bare prune spares it. The
+    /// difference #567 makes is that the remedy now names an `unlock`,
+    /// aimed at the truncated path, which fails loudly instead of silently.
+    /// Suppressing drift for the shape instead would let a genuinely stale
+    /// locked worktree go unreported, which is the fail-green direction.
+    ///
+    /// The real fix is the one already in place: [`collect`] asks for `-z`
+    /// first, and with NUL records the same path is unambiguous — asserted
+    /// as the second half here.
+    #[test]
+    fn the_lf_fallback_cannot_tell_a_locked_attribute_from_a_locked_path_tail() {
+        let ambiguous = "worktree /repo/wt\n\
+                          locked\n\
+                          HEAD 9c131d5455485369f6b6b7c9ac8cdd9d5482241d\n";
+        let entries = parse_worktree_entries(ambiguous.as_bytes(), RECORD_LF);
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert_eq!(
+            entries[0].path,
+            PathBuf::from("/repo/wt"),
+            "the LF fallback truncates at the newline, as it does for every other tail"
+        );
+        assert!(
+            entries[0].locked,
+            "and reads the tail as the attribute it is indistinguishable from"
+        );
+
+        // The same bytes with NUL records: one path, no lock, nothing lost.
+        let unambiguous = b"worktree /repo/wt\nlocked\0\
+                            HEAD 9c131d5455485369f6b6b7c9ac8cdd9d5482241d\0\0"
+            as &[u8];
+        let entries = parse_worktree_entries(unambiguous, RECORD_NUL);
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert_eq!(entries[0].path, PathBuf::from("/repo/wt\nlocked"));
+        assert!(
+            !entries[0].locked,
+            "with NUL records the tail is part of the path, not an attribute"
+        );
+        assert!(!entries[0].path_maybe_truncated);
     }
 
     /// A healthy multi-worktree, non-shallow repository passes with no
@@ -1209,6 +1658,17 @@ mod tests {
         let os = os_string_from_bytes(&bytes);
         assert_eq!(os.as_bytes(), &bytes[..]);
     }
+
+    /// And the round trip [`shell_quote`] needs on the same input: a
+    /// non-UTF-8 byte cannot ride through a `String` verbatim, so it takes
+    /// the `$'…'` branch and comes out as `\xNN`, which bash reproduces as
+    /// the original byte.
+    #[cfg(unix)]
+    #[test]
+    fn shell_quote_escapes_a_non_utf8_byte_rather_than_losing_it() {
+        let path = PathBuf::from(os_string_from_bytes(&[b'/', b'r', b'e', b'p', 0xFF, b'o']));
+        assert_eq!(shell_quote(&path), r"$'/rep\xffo'");
+    }
 }
 
 /// [`collect_with`] driven by a recording stub, for the decisions it makes
@@ -1454,7 +1914,11 @@ mod fake_git {
             "the still-present but dead worktree must be named: {}",
             failures[0]
         );
-        assert!(failures[0].contains(PRUNE_REMEDY), "{}", failures[0]);
+        assert!(
+            failures[0].contains(&bare_prune_clause()),
+            "an unlocked entry must keep the bare prune remedy: {}",
+            failures[0]
+        );
     }
 
     /// The other side of the `exists` mapping: a path the parser could not
@@ -2221,7 +2685,11 @@ mod real_git {
             "{}",
             failures[0]
         );
-        assert!(failures[0].contains(PRUNE_REMEDY), "{}", failures[0]);
+        assert!(
+            failures[0].contains(&bare_prune_clause()),
+            "an unlocked entry must keep the bare prune remedy: {}",
+            failures[0]
+        );
         if git_version() >= GIT_WITH_Z_AND_PRUNABLE {
             // Read the reason out of git rather than typing it (Greptile P2 on
             // PR #583): the porcelain `prunable` text is a translated string
@@ -2241,6 +2709,75 @@ mod real_git {
                 failures[0]
             );
         }
+    }
+
+    /// **Issue #567, against real git.** The same drift as above, except the
+    /// worktree was `git worktree lock`-ed before its directory went away.
+    /// git prunes no locked entry at any version, so the old unconditional
+    /// ``Run `git worktree prune` `` ran clean, changed nothing, and handed
+    /// the contributor the identical failure on the next run.
+    ///
+    /// Asserted as a loop rather than as a string: the bare prune is run
+    /// here and the failure is required to survive it, then the remedy the
+    /// message actually names is run and the preflight is required to go
+    /// clean. That is the property — "this command clears the failure" —
+    /// rather than a copy of the message.
+    ///
+    /// No version gate, unlike its `prunable` neighbours: a locked entry is
+    /// reported with no `prunable` attribute on both versions measured
+    /// (2.34.1 and 2.55.0), so it reaches the `try_exists()` branch either
+    /// way and there is no 2.36 boundary to gate on. And should some later
+    /// git start pruning locked entries after all, the precondition below
+    /// is what says so rather than this comment.
+    #[test]
+    fn a_locked_worktree_that_was_removed_needs_an_unlock_before_the_prune() {
+        let sb = Sandbox::new();
+        let origin = sb.origin();
+        let clone = sb.full_clone(&origin, "clone");
+        let wt = sb.add_worktree(&clone, "wt", "wt");
+        sb.git(
+            &clone,
+            &[
+                "worktree",
+                "lock",
+                "--reason",
+                "testing",
+                &wt.to_string_lossy(),
+            ],
+        );
+        fs::remove_dir_all(&wt).expect("remove the worktree without pruning");
+
+        let failures = run(&clone);
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        let expected = format!(
+            "Run `{UNLOCK_REMEDY} {} && {PRUNE_REMEDY}`",
+            shell_quote(&wt)
+        );
+        assert!(
+            failures[0].contains(&expected),
+            "expected the unlock-then-prune remedy.\n  wanted: {expected}\n  message: {}",
+            failures[0]
+        );
+
+        // The old remedy, run verbatim: exits 0, says nothing, and the
+        // failure is still there. This is the loop issue #567 reports.
+        sb.git(&clone, &["worktree", "prune"]);
+        assert_eq!(
+            run(&clone).len(),
+            1,
+            "fixture precondition: the bare prune must NOT clear a locked entry — if git ever \
+             starts pruning these, this whole remedy branch is obsolete rather than merely \
+             untested"
+        );
+
+        // The remedy the message names, run verbatim: clears it.
+        sb.git(&clone, &["worktree", "unlock", &wt.to_string_lossy()]);
+        sb.git(&clone, &["worktree", "prune"]);
+        assert!(
+            run(&clone).is_empty(),
+            "the named remedy must actually clear the failure: {:?}",
+            run(&clone)
+        );
     }
 
     /// **The `try_exists()` fail-green.** The worktree's directory is still
@@ -2281,7 +2818,11 @@ mod real_git {
             "{}",
             failures[0]
         );
-        assert!(failures[0].contains(PRUNE_REMEDY), "{}", failures[0]);
+        assert!(
+            failures[0].contains(&bare_prune_clause()),
+            "an unlocked entry must keep the bare prune remedy: {}",
+            failures[0]
+        );
     }
 
     /// **Greptile P1, against a real repository.** A shallow, single-worktree
