@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 
 use crate::inner::{
     self, Abort, Cast, DAEMON_GRACE, DAEMON_TIMEOUT, Guard, ROLE_ORCHESTRATOR, ROLE_REVIEWER,
-    STEP_TIMEOUT, StatusRow, focus_role, type_into_pane,
+    STEP_TIMEOUT, StatusRow, UI_TIMEOUT, focus_role, type_into_pane,
 };
 use crate::isolation::Plan;
 use crate::probe::{self, Probe, ROLE_ALPHA, ROLE_BETA, ROLE_LATEBOOT};
@@ -336,7 +336,7 @@ fn teardown_inventory(ctx: &mut Ctx<'_, '_>) -> Result<(), Abort> {
     ctx.tui.send(b"\x03");
     if !ctx
         .tui
-        .wait_for_grid_string("Quit dot-agent-deck?", STEP_TIMEOUT)
+        .wait_for_grid_string("Quit dot-agent-deck?", UI_TIMEOUT)
     {
         return Err(Abort::Scenario(format!(
             "Ctrl+D then Ctrl+C never opened the quit dialog in the old TUI.\n=== grid ===\n{}",
@@ -344,11 +344,19 @@ fn teardown_inventory(ctx: &mut Ctx<'_, '_>) -> Result<(), Abort> {
         )));
     }
     ctx.tui.send(b"\x1b[B"); // Down -> Stop (index 1)
-    std::thread::sleep(inner::SETTLE);
+    // Enter takes whichever option is selected, so it goes only once the
+    // dialog marks Stop selected (`> Stop`, `render_quit_confirm`) rather than
+    // after a fixed pause that assumes the Down has taken effect.
+    if !ctx.tui.wait_for_grid_string("> Stop", STEP_TIMEOUT) {
+        return Err(Abort::Scenario(format!(
+            "Down never moved the old TUI's quit dialog to Stop.\n=== grid ===\n{}",
+            ctx.tui.grid()
+        )));
+    }
     ctx.tui.send(b"\r");
     // Only the unclipped head of the line: v0.41.0 draws this dialog 68 columns
     // wide, which cuts "…and the daemon will shut down" short on screen.
-    if !ctx.tui.wait_for_grid(STEP_TIMEOUT, |g| {
+    if !ctx.tui.wait_for_grid(UI_TIMEOUT, |g| {
         g.contains("will be terminated and the daemon") && g.contains("Continue?")
     }) {
         return Err(Abort::Scenario(format!(

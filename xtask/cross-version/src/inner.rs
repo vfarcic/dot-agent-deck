@@ -22,8 +22,11 @@ use crate::sandbox::{self, Direction, EndpointMatrix, EndpointMode, Sandbox};
 use crate::{ctl, epoch_secs, probes};
 
 /// How long to wait for the deck to paint its first frame, for the mismatch
-/// prompt, and for an orchestration to come up. Generous because this box is
-/// shared and a run competing with three dispatched units is the normal case.
+/// prompt, for a modal's first paint (the directory picker, the new-pane form,
+/// the quit dialog), and for an orchestration to come up. Generous because this
+/// box is shared and a run competing with three dispatched units is the normal
+/// case. A wait returns as soon as its state appears, so the margin costs a
+/// passing run nothing.
 pub(crate) const UI_TIMEOUT: Duration = Duration::from_secs(90);
 /// How long to wait for a single keystroke's consequence.
 pub(crate) const STEP_TIMEOUT: Duration = Duration::from_secs(30);
@@ -1116,14 +1119,26 @@ fn scenario(
     setup_tui.send(b"\x04"); // Ctrl+D — leave PaneInput. Without this Ctrl+C goes
     std::thread::sleep(SETTLE); // to the focused PANE and kills a role.
     setup_tui.send(b"\x03"); // Ctrl+C — the quit dialog
-    if !setup_tui.wait_for_grid_string("Quit dot-agent-deck?", STEP_TIMEOUT) {
+    if !setup_tui.wait_for_grid_string("Quit dot-agent-deck?", UI_TIMEOUT) {
         return Err(Abort::Scenario(format!(
             "Ctrl+D then Ctrl+C never opened the quit dialog in the {} TUI.\n=== grid ===\n{}",
             cast.daemon_side,
             setup_tui.grid()
         )));
     }
-    setup_tui.send(b"\r"); // Enter on the default option, which is Detach (index 0).
+    // Enter takes whichever option is selected, so the selection is read off
+    // the screen rather than assumed to be the default: the dialog marks it
+    // `> Detach` (`render_quit_confirm`, the same in v0.41.0 and every branch
+    // this sweeps).
+    if !setup_tui.wait_for_grid_string("> Detach", STEP_TIMEOUT) {
+        return Err(Abort::Scenario(format!(
+            "the quit dialog in the {} TUI did not have Detach selected — refusing to press \
+             Enter on anything else.\n=== grid ===\n{}",
+            cast.daemon_side,
+            setup_tui.grid()
+        )));
+    }
+    setup_tui.send(b"\r"); // Enter on Detach (index 0, the default).
     if setup_tui.wait_for_exit(STEP_TIMEOUT).is_none() {
         return Err(Abort::Scenario(format!(
             "the {} TUI did not exit after choosing Detach.\n=== grid ===\n{}",
@@ -1527,16 +1542,22 @@ fn with_attached_tui(
                 .to_string(),
         ),
     };
+    // What this tell measures is the process: the pid, the executable behind it
+    // and who holds the endpoint. It does not re-read a build id at the end,
+    // so its title does not claim one (CLAUDE.md rule 17).
     ev.tell(
         "tell-2",
-        "the same daemon pid and the same build id served the run end to end",
+        "the same daemon process (pid and exe) held the attach endpoint end to end; its build \
+         id is established indirectly",
         verdict,
         format!(
             "pid {} was alive at the start and {} at the end (pids are the run's private PID \
              namespace's).\n\
              /proc/{}/exe -> {:?} (the {} binary is {})\n\
-             the mismatch prompt the {} TUI printed reported the daemon's build id and its \
-             own, so both sides' build ids were observed over the wire — see the excerpt.\n\
+             the build id is NOT re-read at the end. It rests on two earlier observations: the \
+             executable above is the staged binary whose `daemon hello` build id is recorded \
+             at the top of this file, and the mismatch prompt the {} TUI printed reported the \
+             running daemon's build id and its own over the wire — see the excerpt.\n\
              `ss -xlp` on {}, inside the run's network namespace: {listener_note}\n\
              at the start, {kernel_at_start}\n\
              at the end, {kernel_at_end}",
@@ -1985,28 +2006,59 @@ fn classify_undiscovered(
 /// orchestration against the deck's current directory.
 ///
 /// With no `[[modes]]` in the fixture the mode-chip row is
-/// `[No mode] [Orch: xver] [schedule]`, so ONE Right selects the orchestration;
-/// selecting one hides the Command field, so the second Enter submits.
+/// `[No mode] [Orch: xver] [schedule] …`, so ONE Right selects the
+/// orchestration; selecting one hides the Command field, so the second Enter
+/// submits.
+///
+/// Every key is sent only once the screen shows the state that key is meant
+/// for, never after a fixed pause that assumes the previous key has taken
+/// effect — on a loaded box no pause is long enough to be sure of that. Each
+/// marker below is text the state it confirms draws and the state before it
+/// does not, in `src/ui.rs` of v0.41.0 and of every branch this sweeps: the
+/// setup TUI is the old build forward and the branch in reverse.
 fn open_orchestration(deck: &pty::PtyDeck) -> Result<(), String> {
     deck.send(b"\x0e"); // Ctrl+N -> directory picker
-    std::thread::sleep(SETTLE);
+    // The picker's own footer (`render_dir_picker`); the dashboard draws none
+    // of it.
+    if !deck.wait_for_grid_string("Space: select", UI_TIMEOUT) {
+        return Err(format!(
+            "Ctrl+N never opened the directory picker.\n=== grid ===\n{}",
+            deck.grid()
+        ));
+    }
     deck.send(b" "); // Space -> confirm the current dir -> new-pane form
-    if !deck.wait_for_grid_string("No mode", STEP_TIMEOUT) {
+    if !deck.wait_for_grid_string("No mode", UI_TIMEOUT) {
         return Err(format!(
             "the new-pane form never appeared.\n=== grid ===\n{}",
             deck.grid()
         ));
     }
     deck.send(b"\x1b[C"); // Right -> [Orch: xver]
-    if !deck.wait_for_grid_string("xver", STEP_TIMEOUT) {
+    // Selecting an orchestration hides the Command field
+    // (`command_visible` is `selected_orchestration().is_none()`), and that
+    // is the selection's only change in the grid's text: the chip row names
+    // `[Orch: xver]` whichever chip is selected, and the form's `Dir:` line
+    // carries the sandbox path, which contains `xver` too.
+    if !deck.wait_for_grid(STEP_TIMEOUT, |g| {
+        g.contains("No mode") && !g.contains("Command:")
+    }) {
         return Err(format!(
-            "the orchestration chip never became selected.\n=== grid ===\n{}",
+            "the orchestration chip never became selected (the Command field is still \
+             shown).\n=== grid ===\n{}",
             deck.grid()
         ));
     }
-    std::thread::sleep(SETTLE);
     deck.send(b"\r"); // Mode -> Name
-    std::thread::sleep(SETTLE);
+    // Focus on Name with the Command field hidden is the one state whose footer
+    // offers `Enter: submit` (`new_pane_form_footer_hint`); on Mode it reads
+    // `Enter: next`.
+    if !deck.wait_for_grid_string("Enter: submit", STEP_TIMEOUT) {
+        return Err(format!(
+            "Enter never moved focus from Mode to Name, or the form refuses to submit \
+             (its footer does not offer `Enter: submit`).\n=== grid ===\n{}",
+            deck.grid()
+        ));
+    }
     deck.send(b"\r"); // submit
     Ok(())
 }

@@ -94,6 +94,10 @@ pub struct Evidence {
     /// [`RunVerdict::OldClientCannotDiscover`].
     pub discovery: Option<String>,
     pub head_sha: String,
+    /// Set when `--skip-build` reused whatever binary was already in the
+    /// target dir: what is known about which commit that binary was built
+    /// from. `None` means this run built the branch at `head_sha` itself.
+    pub skip_build: Option<String>,
     pub started_at: String,
     pub mode: String,
     /// What the run's deck processes executed inside.
@@ -222,6 +226,12 @@ impl Evidence {
             if reverse { " (reverse)" } else { "" }
         );
         let _ = writeln!(s, "**Verdict: {verdict}**\n");
+        if let Some(note) = &self.skip_build {
+            let _ = writeln!(
+                s,
+                "**The branch binary was NOT rebuilt for this run (`--skip-build`).** {note}\n"
+            );
+        }
         if reverse {
             let _ = writeln!(
                 s,
@@ -253,7 +263,16 @@ impl Evidence {
         let _ = writeln!(s, "| | |");
         let _ = writeln!(s, "| --- | --- |");
         let _ = writeln!(s, "| branch under test | `{}` |", self.branch);
-        let _ = writeln!(s, "| branch HEAD | `{}` |", self.head_sha);
+        if self.skip_build.is_some() {
+            let _ = writeln!(
+                s,
+                "| branch HEAD | `{}` — checked out, but the binary under test was NOT built from \
+                 it by this run (`--skip-build`, see above) |",
+                self.head_sha
+            );
+        } else {
+            let _ = writeln!(s, "| branch HEAD | `{}` |", self.head_sha);
+        }
         let _ = writeln!(s, "| previous release | `{}` |", self.previous);
         let _ = writeln!(
             s,
@@ -477,6 +496,34 @@ mod tests {
         assert_eq!(back.tells[0].id, "tell-2");
         assert_eq!(back.tells[0].verdict, Verdict::NotChecked);
         assert_eq!(back.isolation, vec!["x".to_string()]);
+    }
+
+    #[test]
+    fn a_skipped_build_is_stated_under_the_verdict_and_qualifies_the_head_row() {
+        let mut e = ev();
+        e.head_sha = "e2bbb205".into();
+        e.tell("tell-1", "t", Verdict::Pass, "1");
+        e.skip_build = Some("**STALE:** its build id names commit `66995314`".into());
+        let out = e.render();
+        assert!(
+            out.contains(
+                "**The branch binary was NOT rebuilt for this run (`--skip-build`).** **STALE:**"
+            ),
+            "{out}"
+        );
+        assert!(
+            out.contains("| branch HEAD | `e2bbb205` — checked out, but the binary under test"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn a_built_run_says_nothing_about_skip_build() {
+        let mut e = ev();
+        e.head_sha = "e2bbb205".into();
+        let out = e.render();
+        assert!(!out.contains("--skip-build"), "{out}");
+        assert!(out.contains("| branch HEAD | `e2bbb205` |"), "{out}");
     }
 
     #[test]

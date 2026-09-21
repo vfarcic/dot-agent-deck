@@ -166,7 +166,8 @@ struct Opts {
     experimental: bool,
 
     /// Skip `cargo build` and use whatever is already at the target dir. For
-    /// iterating on the harness itself.
+    /// iterating on the harness itself. The evidence file then says the binary
+    /// was not rebuilt, and which commit its own build id names, if any.
     #[arg(long)]
     skip_build: bool,
 
@@ -607,7 +608,80 @@ fn new_binary(
     if !bin.exists() {
         return Err(format!("no branch binary at {}", bin.display()));
     }
+    if opts.skip_build {
+        ev.preflight.push(format!(
+            "`--skip-build`: `cargo build` was NOT run, so `{}` is whatever was last built there — \
+             not necessarily a build of {sha}",
+            bin.display()
+        ));
+    }
     Ok((bin, sha))
+}
+
+/// What `--skip-build` means for the evidence: the binary under test is
+/// whatever was already in the target dir, and the checked-out HEAD says
+/// nothing about it.
+///
+/// The one source for which commit it was built from is the binary's own
+/// build id, `<version>-g<short-sha>[-dirty]` (`build.rs`), read from its
+/// `daemon hello`. That is the binary's claim about itself — the branch's
+/// `build.rs` stamped it from `git` when it last ran, unless the build
+/// environment injected a `DAD_BUILD_ID` — so the note reports it as that
+/// rather than as a measurement, and says so plainly when there is none.
+fn skip_build_note(head_sha: &str, new_hello: &str) -> String {
+    let build_id = serde_json::from_str::<serde_json::Value>(new_hello.trim())
+        .ok()
+        .and_then(|v| {
+            v.get("build_version")
+                .and_then(|b| b.as_str())
+                .map(str::to_string)
+        });
+    let Some(build_id) = build_id else {
+        return format!(
+            "The branch binary's `daemon hello` was not recorded, so which commit it was built \
+             from is NOT knowable from this run. Do not read this run as a test of the branch \
+             HEAD `{head_sha}`."
+        );
+    };
+    let (stem, dirty) = match build_id.strip_suffix("-dirty") {
+        Some(stem) => (stem, true),
+        None => (build_id.as_str(), false),
+    };
+    let short = stem
+        .rsplit_once("-g")
+        .map(|(_, sha)| sha)
+        .filter(|sha| sha.len() >= 4 && sha.chars().all(|c| c.is_ascii_hexdigit()));
+    let Some(short) = short else {
+        return format!(
+            "Its build id `{build_id}` names no commit (no `-g<sha>` component), so which commit \
+             it was built from is NOT knowable. Do not read this run as a test of the branch \
+             HEAD `{head_sha}`."
+        );
+    };
+    let provenance = "The build id is the binary's own stamp — what the branch's `build.rs` read \
+                      from `git` when it last ran, or an injected `DAD_BUILD_ID` — not an \
+                      independent measurement.";
+    if !head_sha
+        .to_ascii_lowercase()
+        .starts_with(&short.to_ascii_lowercase())
+    {
+        return format!(
+            "**STALE:** its build id `{build_id}` names commit `{short}`, NOT the branch HEAD \
+             `{head_sha}`. This run tested another build, and its tells say nothing about that \
+             HEAD. {provenance}"
+        );
+    }
+    if dirty {
+        return format!(
+            "Its build id `{build_id}` names the branch HEAD `{head_sha}` with `-dirty`: it was \
+             built from that commit PLUS uncommitted changes in the build clone, which is not \
+             the commit under test. {provenance}"
+        );
+    }
+    format!(
+        "Its build id `{build_id}` names commit `{short}`, the branch HEAD `{head_sha}`, so by \
+         the binary's own stamp it is a build of the commit under test. {provenance}"
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -874,15 +948,12 @@ fn run_one(opts: &Opts, direction: Direction, probe: Probe) -> Result<bool, Stri
         Ok(())
     })();
     if let Err(e) = &outcome {
-        ev.step(format!("RUN ABORTED outside the namespace: {e}"));
-        if ev.tells.is_empty() {
-            ev.tell(
-                "aborted",
-                "the run did not complete",
-                report::Verdict::Fail,
-                e.clone(),
-            );
-        }
+        record_outer_abort(&mut ev, e);
+    }
+    if opts.skip_build {
+        let note = skip_build_note(&ev.head_sha, &ev.new_hello);
+        println!("xver ({}): --skip-build: {note}", direction.name());
+        ev.skip_build = Some(note);
     }
 
     println!("xver ({}): postconditions", direction.name());
@@ -896,7 +967,7 @@ fn run_one(opts: &Opts, direction: Direction, probe: Probe) -> Result<bool, Stri
     );
 
     let verdict = ev.verdict();
-    let passed = verdict == RunVerdict::Pass && outcome.is_ok() && clean;
+    let passed = run_passed(&verdict, outcome.is_ok(), clean);
     let disposal = if passed && !opts.keep_sandbox {
         match remove_sandbox(&sb, &runs_root) {
             Ok(()) => format!(
@@ -921,6 +992,29 @@ fn run_one(opts: &Opts, direction: Direction, probe: Probe) -> Result<bool, Stri
     );
     println!("xver ({}): {}", direction.name(), verdict.label());
     Ok(passed)
+}
+
+/// Record an error the outer half hit before or around the namespace. With no
+/// tell measured yet it becomes a failing `aborted` tell, so the run cannot
+/// read as INCOMPLETE-for-want-of-tells when it actually broke down.
+fn record_outer_abort(ev: &mut Evidence, e: &str) {
+    ev.step(format!("RUN ABORTED outside the namespace: {e}"));
+    if ev.tells.is_empty() {
+        ev.tell(
+            "aborted",
+            "the run did not complete",
+            report::Verdict::Fail,
+            e.to_string(),
+        );
+    }
+}
+
+/// Whether a run counts as a clean pass: the exit status, and whether the
+/// sandbox may be removed. Only a PASS verdict qualifies — FAIL, INCOMPLETE
+/// and a measured non-discovery all exit non-zero — and only when the outer
+/// half itself completed and every postcondition held.
+fn run_passed(verdict: &RunVerdict, outer_completed: bool, postconditions_clean: bool) -> bool {
+    *verdict == RunVerdict::Pass && outer_completed && postconditions_clean
 }
 
 /// Write a file only its owner can read.
@@ -1132,18 +1226,78 @@ fn postconditions(
     log_mark: Option<&isolation::LogMark>,
     inner_pid_ns: Option<&str>,
 ) -> bool {
+    let checks = PostChecks::gather(sb, host, log_mark, inner_pid_ns);
+    judge_postconditions(ev, checks, &sb.root, host, deck_baseline, inner_pid_ns)
+}
+
+/// What the operator's real log gained during the run: its byte count, and
+/// the lines mentioning the sandbox.
+type LogGrowth = Result<(u64, Vec<String>), String>;
+
+/// What each postcondition check returned, gathered before any of them is
+/// judged, so the judging — which decides whether the run was clean — is a
+/// pure function a unit test can drive. `Err` is a check that could not run.
+struct PostChecks {
+    /// Processes that still refer to the sandbox.
+    leaks: Result<Vec<String>, String>,
+    /// The host's endpoint candidates against the baseline.
+    host: Result<(), String>,
+    /// Host listeners under the sandbox.
+    host_listeners: Result<Vec<proc::UnixListener>, String>,
+    /// The host's deck processes now.
+    decks: Result<Vec<isolation::DeckProcess>, String>,
+    /// The operator's real log and what it gained during the run; `None` when
+    /// it did not exist at baseline.
+    log: Option<(PathBuf, LogGrowth)>,
+}
+
+impl PostChecks {
+    /// Run every check, in the order they are judged.
+    fn gather(
+        sb: &Sandbox,
+        host: &[isolation::HostEndpoint],
+        log_mark: Option<&isolation::LogMark>,
+        inner_pid_ns: Option<&str>,
+    ) -> Self {
+        PostChecks {
+            leaks: isolation::processes_touching(&sb.root, inner_pid_ns),
+            host: isolation::verify_host(host),
+            host_listeners: isolation::host_listeners_under(&sb.root),
+            decks: isolation::deck_census(),
+            log: log_mark.map(|mark| {
+                (
+                    mark.path.clone(),
+                    isolation::log_mentions_since(mark, &sb.root.display().to_string()),
+                )
+            }),
+        }
+    }
+}
+
+/// Record every postcondition in the evidence and return whether all of them
+/// held. A check that FAILED and a check that COULD NOT RUN are treated alike:
+/// each makes the run unclean and is recorded as an isolation failure, which
+/// makes the verdict INCOMPLETE — an unmeasured postcondition is not a met one.
+fn judge_postconditions(
+    ev: &mut Evidence,
+    checks: PostChecks,
+    sandbox_root: &Path,
+    host: &[isolation::HostEndpoint],
+    deck_baseline: &[isolation::DeckProcess],
+    inner_pid_ns: Option<&str>,
+) -> bool {
     let mut clean = true;
     let mut fail = |ev: &mut Evidence, msg: String| {
         clean = false;
         ev.postconditions.push(format!("**FAILED:** {msg}"));
         ev.isolation_failed(msg);
     };
-    match isolation::processes_touching(&sb.root, inner_pid_ns) {
+    match checks.leaks {
         Ok(hits) if hits.is_empty() => ev.postconditions.push(format!(
             "no process is left in the run's PID namespace ({}), and none refers to `{}` by cwd, \
              root, exe, open file or the run's marker",
             inner_pid_ns.unwrap_or("never reported"),
-            sb.root.display()
+            sandbox_root.display()
         )),
         Ok(hits) => fail(
             ev,
@@ -1155,7 +1309,7 @@ fn postconditions(
         ),
         Err(e) => fail(ev, format!("the leak census could not run: {e}")),
     }
-    match isolation::verify_host(host) {
+    match checks.host {
         Ok(()) => {
             for line in isolation::describe_host(host) {
                 ev.postconditions
@@ -1164,14 +1318,14 @@ fn postconditions(
         }
         Err(e) => fail(ev, e),
     }
-    match isolation::host_listeners_under(&sb.root) {
+    match checks.host_listeners {
         Ok(v) if v.is_empty() => ev
             .postconditions
             .push("the host's Unix socket table has no listener under the sandbox".to_string()),
         Ok(v) => fail(ev, format!("host listeners under the sandbox: {v:?}")),
         Err(e) => fail(ev, e),
     }
-    match isolation::deck_census() {
+    match checks.decks {
         Ok(now) => {
             let gone: Vec<&isolation::DeckProcess> = deck_baseline
                 .iter()
@@ -1201,18 +1355,18 @@ fn postconditions(
         }
         Err(e) => fail(ev, format!("the deck census could not run: {e}")),
     }
-    match log_mark {
-        Some(mark) => match isolation::log_mentions_since(mark, &sb.root.display().to_string()) {
+    match checks.log {
+        Some((path, result)) => match result {
             Ok((n, hits)) if hits.is_empty() => ev.postconditions.push(format!(
                 "the operator's real log `{}` gained {n} byte(s) from other writers during the \
                  run; none of them mention the sandbox",
-                mark.path.display()
+                path.display()
             )),
             Ok((_, hits)) => fail(
                 ev,
                 format!(
                     "the operator's real log `{}` mentions the sandbox: {hits:?}",
-                    mark.path.display()
+                    path.display()
                 ),
             ),
             Err(e) => fail(ev, e),
@@ -1317,5 +1471,340 @@ mod tests {
             Direction::Reverse,
         );
         assert_eq!(explicit, Path::new("/out/e-reverse.md"));
+    }
+}
+
+/// The outer half's verdict glue: `run_passed`, `record_outer_abort` and the
+/// postcondition judging decide the exit status and whether the run was clean,
+/// so they are covered here rather than trusted.
+#[cfg(test)]
+mod verdict_tests {
+    use super::*;
+    use report::Verdict;
+
+    fn with_tells(verdicts: &[Verdict]) -> Evidence {
+        let mut ev = Evidence::default();
+        for (i, v) in verdicts.iter().enumerate() {
+            ev.tell(&format!("tell-{}", i + 1), "t", *v, "measured");
+        }
+        ev
+    }
+
+    fn all_held() -> PostChecks {
+        PostChecks {
+            leaks: Ok(Vec::new()),
+            host: Ok(()),
+            host_listeners: Ok(Vec::new()),
+            decks: Ok(Vec::new()),
+            log: None,
+        }
+    }
+
+    fn judge(ev: &mut Evidence, checks: PostChecks, baseline: &[isolation::DeckProcess]) -> bool {
+        judge_postconditions(
+            ev,
+            checks,
+            Path::new("/runs/agent-x-1"),
+            &[],
+            baseline,
+            Some("pid:[4026532000]"),
+        )
+    }
+
+    #[test]
+    fn only_a_pass_with_the_outer_half_complete_and_every_postcondition_met_is_clean() {
+        let v = with_tells(&[Verdict::Pass; 4]).verdict();
+        assert_eq!(v, RunVerdict::Pass);
+        assert!(run_passed(&v, true, true));
+        assert!(!run_passed(&v, false, true), "the outer half aborted");
+        assert!(!run_passed(&v, true, false), "a postcondition did not hold");
+    }
+
+    #[test]
+    fn an_isolation_failure_dominates_even_a_failing_tell_and_is_incomplete() {
+        let mut ev = with_tells(&[Verdict::Pass, Verdict::Fail]);
+        ev.isolation_failed("host endpoint changed");
+        let v = ev.verdict();
+        assert!(
+            matches!(v, RunVerdict::Incomplete(ref why) if why.contains("host endpoint changed")),
+            "{v:?}"
+        );
+        assert!(!run_passed(&v, true, true));
+    }
+
+    #[test]
+    fn any_failing_tell_is_a_fail_even_beside_an_unmeasured_one() {
+        let v = with_tells(&[Verdict::Pass, Verdict::NotChecked, Verdict::Fail]).verdict();
+        assert_eq!(v, RunVerdict::Fail);
+        assert!(!run_passed(&v, true, true));
+    }
+
+    #[test]
+    fn an_unmeasured_tell_is_incomplete_and_never_a_clean_pass() {
+        let v = with_tells(&[Verdict::Pass, Verdict::Pass, Verdict::NotChecked]).verdict();
+        assert!(matches!(v, RunVerdict::Incomplete(_)), "{v:?}");
+        assert!(!run_passed(&v, true, true));
+    }
+
+    #[test]
+    fn a_measured_non_discovery_exits_non_zero() {
+        let mut ev = with_tells(&[Verdict::Pass; 3]);
+        ev.discovery = Some("the old TUI lazy-spawned its own daemon".into());
+        let v = ev.verdict();
+        assert!(matches!(v, RunVerdict::OldClientCannotDiscover(_)), "{v:?}");
+        assert!(!run_passed(&v, true, true));
+    }
+
+    #[test]
+    fn an_outer_abort_before_any_tell_is_a_fail_not_an_incomplete() {
+        let mut ev = Evidence::default();
+        record_outer_abort(&mut ev, "start bwrap: No such file or directory");
+        assert_eq!(ev.verdict(), RunVerdict::Fail);
+        assert_eq!(ev.tells.len(), 1);
+        assert_eq!(ev.tells[0].id, "aborted");
+        assert!(!run_passed(&ev.verdict(), false, true));
+    }
+
+    #[test]
+    fn an_outer_abort_after_passing_tells_adds_none_but_still_is_not_clean() {
+        let mut ev = with_tells(&[Verdict::Pass; 4]);
+        record_outer_abort(&mut ev, "the inner half left no evidence");
+        assert_eq!(
+            ev.tells.len(),
+            4,
+            "no tell is invented on top of measured ones"
+        );
+        let v = ev.verdict();
+        assert_eq!(v, RunVerdict::Pass);
+        assert!(
+            !run_passed(&v, false, true),
+            "the abort alone keeps it from being a clean pass"
+        );
+    }
+
+    #[test]
+    fn every_postcondition_held_is_clean_and_leaves_the_verdict_alone() {
+        let mut ev = with_tells(&[Verdict::Pass; 4]);
+        assert!(judge(&mut ev, all_held(), &[]));
+        assert!(ev.isolation_failure.is_none());
+        assert_eq!(ev.verdict(), RunVerdict::Pass);
+        assert!(
+            !ev.postconditions.iter().any(|p| p.contains("FAILED")),
+            "{:?}",
+            ev.postconditions
+        );
+        assert!(
+            ev.postconditions
+                .iter()
+                .any(|p| p.contains("does not exist, so there was nothing to escape into")),
+            "an absent real log is reported, not failed: {:?}",
+            ev.postconditions
+        );
+    }
+
+    #[test]
+    fn a_postcondition_that_could_not_run_is_unclean_and_voids_the_run() {
+        let cases: Vec<(&str, PostChecks)> = vec![
+            (
+                "leak census",
+                PostChecks {
+                    leaks: Err("cannot list /proc".into()),
+                    ..all_held()
+                },
+            ),
+            (
+                "host endpoints",
+                PostChecks {
+                    host: Err("cannot stat /tmp/dot-agent-deck.sock".into()),
+                    ..all_held()
+                },
+            ),
+            (
+                "host listeners",
+                PostChecks {
+                    host_listeners: Err("cannot read /proc/net/unix".into()),
+                    ..all_held()
+                },
+            ),
+            (
+                "deck census",
+                PostChecks {
+                    decks: Err("cannot list /proc".into()),
+                    ..all_held()
+                },
+            ),
+            (
+                "real log",
+                PostChecks {
+                    log: Some((
+                        PathBuf::from("/home/op/.local/state/dot-agent-deck/deck.log"),
+                        Err("stat: permission denied".into()),
+                    )),
+                    ..all_held()
+                },
+            ),
+        ];
+        for (name, checks) in cases {
+            let mut ev = with_tells(&[Verdict::Pass; 4]);
+            let clean = judge(&mut ev, checks, &[]);
+            assert!(
+                !clean,
+                "{name}: a check that could not run is not a met one"
+            );
+            assert!(
+                matches!(ev.verdict(), RunVerdict::Incomplete(_)),
+                "{name}: {:?}",
+                ev.verdict()
+            );
+            assert!(!run_passed(&ev.verdict(), true, clean), "{name}");
+            assert!(
+                ev.postconditions
+                    .iter()
+                    .any(|p| p.starts_with("**FAILED:**")),
+                "{name}: {:?}",
+                ev.postconditions
+            );
+        }
+    }
+
+    #[test]
+    fn a_postcondition_that_failed_is_unclean_and_voids_the_run() {
+        let cases: Vec<(&str, PostChecks)> = vec![
+            (
+                "a leaked process",
+                PostChecks {
+                    leaks: Ok(vec!["pid 7 (cwd /runs/agent-x-1/project)".into()]),
+                    ..all_held()
+                },
+            ),
+            (
+                "a host listener under the sandbox",
+                PostChecks {
+                    host_listeners: Ok(vec![proc::UnixListener {
+                        inode: 9,
+                        path: "/runs/agent-x-1/attach.sock".into(),
+                    }]),
+                    ..all_held()
+                },
+            ),
+            (
+                "the real log mentions the sandbox",
+                PostChecks {
+                    log: Some((
+                        PathBuf::from("/home/op/deck.log"),
+                        Ok((120, vec!["… /runs/agent-x-1 …".into()])),
+                    )),
+                    ..all_held()
+                },
+            ),
+        ];
+        for (name, checks) in cases {
+            let mut ev = with_tells(&[Verdict::Pass; 4]);
+            assert!(!judge(&mut ev, checks, &[]), "{name}");
+            assert!(
+                matches!(ev.verdict(), RunVerdict::Incomplete(_)),
+                "{name}: {:?}",
+                ev.verdict()
+            );
+        }
+    }
+
+    #[test]
+    fn a_baseline_deck_process_that_exited_during_the_run_is_reported_not_failed() {
+        let baseline = vec![
+            isolation::DeckProcess {
+                pid: 42,
+                start_time: 7,
+                exe: PathBuf::from("/usr/bin/dot-agent-deck"),
+            },
+            isolation::DeckProcess {
+                pid: 43,
+                start_time: 8,
+                exe: PathBuf::from("/usr/bin/dot-agent-deck"),
+            },
+        ];
+        // pid 43 is still there but with another start time: a different
+        // process under a reused pid, so it counts as gone too.
+        let now = vec![isolation::DeckProcess {
+            pid: 43,
+            start_time: 99,
+            exe: PathBuf::from("/usr/bin/dot-agent-deck"),
+        }];
+        let mut ev = with_tells(&[Verdict::Pass; 4]);
+        let clean = judge(
+            &mut ev,
+            PostChecks {
+                decks: Ok(now),
+                ..all_held()
+            },
+            &baseline,
+        );
+        assert!(
+            clean,
+            "the harness signals no host process; this is a report"
+        );
+        let line = ev
+            .postconditions
+            .iter()
+            .find(|p| p.contains("baseline deck process"))
+            .expect("the census line");
+        assert!(line.starts_with("0 of 2"), "{line}");
+        assert!(line.contains("pid 42") && line.contains("pid 43"), "{line}");
+    }
+}
+
+#[cfg(test)]
+mod skip_build_tests {
+    use super::*;
+
+    const HEAD: &str = "e2bbb2050f00ba5eba11c0ffee00000000000000";
+
+    fn hello(build_version: &str) -> String {
+        format!(r#"{{"ok":true,"server_version":10,"build_version":"{build_version}"}}"#)
+    }
+
+    #[test]
+    fn a_build_id_naming_the_head_is_reported_as_the_binarys_own_claim() {
+        let note = skip_build_note(HEAD, &hello("0.41.0-ge2bbb205"));
+        assert!(note.contains("build of the commit under test"), "{note}");
+        assert!(note.contains("not an independent measurement"), "{note}");
+        assert!(!note.contains("STALE"), "{note}");
+    }
+
+    #[test]
+    fn a_build_id_naming_another_commit_is_called_stale() {
+        let note = skip_build_note(HEAD, &hello("0.41.0-g66995314"));
+        assert!(note.starts_with("**STALE:**"), "{note}");
+        assert!(note.contains("`66995314`") && note.contains(HEAD), "{note}");
+    }
+
+    #[test]
+    fn a_dirty_build_of_the_head_is_not_the_commit_under_test() {
+        let note = skip_build_note(HEAD, &hello("0.41.0-ge2bbb205-dirty"));
+        assert!(note.contains("-dirty"), "{note}");
+        assert!(note.contains("not the commit under test"), "{note}");
+    }
+
+    #[test]
+    fn a_build_id_with_no_commit_says_the_commit_is_not_knowable() {
+        for id in ["0.41.0-unknown", "0.25.0-gamma.1-unknown", "custom"] {
+            let note = skip_build_note(HEAD, &hello(id));
+            assert!(note.contains("NOT knowable"), "{id}: {note}");
+            assert!(note.contains(HEAD), "{id}: {note}");
+        }
+    }
+
+    #[test]
+    fn a_prerelease_version_does_not_hide_the_commit() {
+        let note = skip_build_note(HEAD, &hello("0.25.0-gamma.1-ge2bbb205"));
+        assert!(note.contains("build of the commit under test"), "{note}");
+    }
+
+    #[test]
+    fn a_missing_hello_says_the_commit_is_not_knowable() {
+        for raw in ["", "not json", r#"{"ok":true}"#] {
+            let note = skip_build_note(HEAD, raw);
+            assert!(note.contains("NOT knowable"), "{raw:?}: {note}");
+        }
     }
 }
