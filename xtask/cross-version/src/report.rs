@@ -85,6 +85,10 @@ impl RunVerdict {
 pub struct Evidence {
     pub branch: String,
     pub previous: String,
+    /// Where `previous` came from — typed with `--previous`, or resolved from
+    /// the release listing, and when. The outer half sets it; `merge_inner`
+    /// does not copy it from the inner half, which leaves it empty.
+    pub previous_source: String,
     /// Which build served the daemon.
     pub direction: Direction,
     /// The reverse probe the run carried, as one line.
@@ -285,7 +289,15 @@ impl Evidence {
         } else {
             let _ = writeln!(s, "| branch HEAD | `{}` |", self.head_sha);
         }
-        let _ = writeln!(s, "| previous release | `{}` |", self.previous);
+        if self.previous_source.is_empty() {
+            let _ = writeln!(s, "| previous release | `{}` |", self.previous);
+        } else {
+            let _ = writeln!(
+                s,
+                "| previous release | `{}` — {} |",
+                self.previous, self.previous_source
+            );
+        }
         let _ = writeln!(
             s,
             "| direction | {} |",
@@ -486,6 +498,20 @@ mod tests {
         assert!(
             !out.contains("a consequence"),
             "the first failure is the cause: {out}"
+        );
+    }
+
+    #[test]
+    fn the_previous_release_row_says_where_the_tag_came_from() {
+        let mut e = ev();
+        e.previous = "v0.41.0".into();
+        e.previous_source = "resolved, not given: from `gh release list`".into();
+        let out = e.render();
+        assert!(
+            out.contains(
+                "| previous release | `v0.41.0` — resolved, not given: from `gh release list` |"
+            ),
+            "{out}"
         );
     }
 

@@ -51,6 +51,7 @@
 mod ctl;
 mod inner;
 mod isolation;
+mod previous;
 mod probe;
 mod probes;
 mod proc;
@@ -102,8 +103,15 @@ struct Opts {
 
     /// The previous release — the "old" side. Its published Linux binary is
     /// downloaded with `gh release download` and cached.
-    #[arg(long, default_value = "v0.41.0")]
-    previous: String,
+    ///
+    /// When omitted it is resolved, never defaulted: the highest
+    /// `vMAJOR.MINOR.PATCH` release of `--repo` that is neither a draft nor a
+    /// prerelease, which must also be the one GitHub marks Latest. A run that
+    /// cannot resolve it stops and asks for this flag (`previous.rs`), and the
+    /// evidence file records which of the two a run used. Required with
+    /// `--old-binary`.
+    #[arg(long)]
+    previous: Option<String>,
 
     /// `owner/repo` the release asset and the branch come from.
     #[arg(long, default_value = "vfarcic/dot-agent-deck")]
@@ -401,11 +409,16 @@ fn repo_root() -> Result<PathBuf, String> {
 
 /// Fetch (or reuse) the previous release's published Linux binary, assert it
 /// reports exactly that version, and record its SHA-256.
-fn old_binary(opts: &Opts, releases: &Path, ev: &mut Evidence) -> Result<PathBuf, String> {
+fn old_binary(
+    opts: &Opts,
+    previous: &str,
+    releases: &Path,
+    ev: &mut Evidence,
+) -> Result<PathBuf, String> {
     let bin = if let Some(explicit) = &opts.old_binary {
         explicit.clone()
     } else {
-        let dir = releases.join(&opts.previous);
+        let dir = releases.join(previous);
         std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
         let bin = dir.join("dot-agent-deck-linux-amd64");
         if !bin.exists() {
@@ -413,7 +426,7 @@ fn old_binary(opts: &Opts, releases: &Path, ev: &mut Evidence) -> Result<PathBuf
                 Command::new("gh").args([
                     "release",
                     "download",
-                    &opts.previous,
+                    previous,
                     "--repo",
                     &opts.repo,
                     "-p",
@@ -421,7 +434,7 @@ fn old_binary(opts: &Opts, releases: &Path, ev: &mut Evidence) -> Result<PathBuf
                     "-D",
                     &dir.to_string_lossy(),
                 ]),
-                &format!("gh release download {}", opts.previous),
+                &format!("gh release download {previous}"),
             )?;
         }
         use std::os::unix::fs::PermissionsExt;
@@ -435,12 +448,11 @@ fn old_binary(opts: &Opts, releases: &Path, ev: &mut Evidence) -> Result<PathBuf
         Command::new(&bin).arg("--version").env_clear(),
         "old binary --version",
     )?;
-    let want = format!("dot-agent-deck {}", opts.previous.trim_start_matches('v'));
+    let want = format!("dot-agent-deck {}", previous.trim_start_matches('v'));
     if opts.old_binary.is_none() && reported.trim() != want {
         return Err(format!(
-            "the downloaded {} binary reports {:?}, not exactly {want:?} — refusing to run a \
-             cross-version check against an unknown build",
-            opts.previous,
+            "the downloaded {previous} binary reports {:?}, not exactly {want:?} — refusing to run \
+             a cross-version check against an unknown build",
             reported.trim()
         ));
     }
@@ -715,10 +727,23 @@ fn run(opts: &Opts) -> Result<bool, String> {
         }
         probes.push(probe);
     }
+    // Resolved once, before anything is built, so `both` runs its two halves
+    // against the same release even if one is published in between.
+    let previous = previous::resolve(
+        opts.previous.as_deref(),
+        opts.old_binary.is_some(),
+        &opts.repo,
+        utc_now,
+    )?;
+    println!(
+        "xver: previous release `{}` — {}",
+        previous.tag,
+        previous.describe()
+    );
     let mut all_passed = true;
     let mut first_err = None;
     for (d, probe) in directions.into_iter().zip(probes) {
-        match run_one(opts, d, probe) {
+        match run_one(opts, &previous, d, probe) {
             Ok(passed) => all_passed &= passed,
             Err(e) => {
                 eprintln!("\nxver ({}): {e}", d.name());
@@ -735,7 +760,12 @@ fn run(opts: &Opts) -> Result<bool, String> {
 
 /// One run in one direction: its own preflight, sandbox, namespace, evidence
 /// file and postconditions.
-fn run_one(opts: &Opts, direction: Direction, probe: Probe) -> Result<bool, String> {
+fn run_one(
+    opts: &Opts,
+    previous: &previous::Previous,
+    direction: Direction,
+    probe: Probe,
+) -> Result<bool, String> {
     let root = repo_root()?;
     let parent = root
         .parent()
@@ -773,7 +803,8 @@ fn run_one(opts: &Opts, direction: Direction, probe: Probe) -> Result<bool, Stri
 
     let mut ev = Evidence {
         branch: opts.branch.clone(),
-        previous: opts.previous.clone(),
+        previous: previous.tag.clone(),
+        previous_source: previous.describe(),
         direction,
         probe: probe.describe(),
         started_at: utc_now(),
@@ -846,7 +877,7 @@ fn run_one(opts: &Opts, direction: Direction, probe: Probe) -> Result<bool, Stri
     let log_mark = real_log.as_deref().and_then(isolation::mark_log);
 
     println!("xver ({}): inputs", direction.name());
-    let old_src = old_binary(opts, &releases, &mut ev)?;
+    let old_src = old_binary(opts, &previous.tag, &releases, &mut ev)?;
     let (new_src, head_sha) = new_binary(opts, &clone, &target_dir, &mut ev)?;
     ev.head_sha = head_sha;
 
@@ -911,7 +942,7 @@ fn run_one(opts: &Opts, direction: Direction, probe: Probe) -> Result<bool, Stri
             keep_xdg_runtime_dir: spec.keep_xdg_runtime_dir,
             experimental: opts.experimental,
             max_lifetime_secs: opts.max_agent_lifetime_secs,
-            previous: opts.previous.clone(),
+            previous: previous.tag.clone(),
             direction,
             probe,
             fixture,
@@ -1412,6 +1443,17 @@ mod tests {
             Ok(Probe::Generic),
             "an existing invocation keeps its meaning: rule 12's four tells"
         );
+    }
+
+    #[test]
+    fn previous_has_no_hardcoded_default_and_an_explicit_one_is_kept_verbatim() {
+        let opts = Opts::parse_from(["xver", "--branch", "b"]);
+        assert_eq!(
+            opts.previous, None,
+            "an omitted --previous is resolved (previous.rs), never defaulted to a tag"
+        );
+        let opts = Opts::parse_from(["xver", "--branch", "b", "--previous", "v0.40.2"]);
+        assert_eq!(opts.previous.as_deref(), Some("v0.40.2"));
     }
 
     #[test]
