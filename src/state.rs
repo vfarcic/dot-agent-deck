@@ -3131,6 +3131,480 @@ fn arm_delegate_silence_watch(
     });
 }
 
+/// Issue #1031 (Greptile P1 on PR #1168): may a late-readiness submit recovery be
+/// armed over the bytes this write outcome left in the worker's input box?
+///
+/// **Only `Applied`, and the distinction from `dispatch_one_owned`'s `delivered`
+/// flag is the whole content of this function.** `delivered` is `true` for
+/// `Ambiguous` too, deliberately, because it answers "may the worker have got
+/// this?" — the question the commission ledger and the silence watch ask, where a
+/// partial write has to stay owed. The recovery asks whether the COMPLETE pointer
+/// is in that box, because its whole effect is a blind CR that submits whatever
+/// is. `Ambiguous` means the payload started and the sequence did not finish, so
+/// the box may hold a prefix (`Read .dot-agent-deck/worker-ta`) and a probe would
+/// submit that as a turn.
+///
+/// The operator-input guard under the write cannot cover this — it refuses once
+/// the OPERATOR has typed since our write, and a truncated pointer is the
+/// daemon's own bytes — so the outcome has to.
+///
+/// Named and exhaustively tested rather than inlined as a `matches!`, because it
+/// is a two-value decision whose SECOND value is a security-shaped one: a future
+/// variant must be classified deliberately instead of falling into whichever side
+/// a `!=` happened to put it on.
+fn outcome_leaves_the_whole_pointer_for_a_later_submit(
+    outcome: Option<crate::agent_pty::GuardedSend>,
+) -> bool {
+    match outcome {
+        // The payload AND its submit CR were written to the authorized target.
+        // That the agent may not have INTERPRETED the CR as submit is the whole of
+        // issue #1031, and is what leaves the complete pointer recoverable.
+        Some(crate::agent_pty::GuardedSend::Applied) => true,
+        // A partial write: the box may hold a prefix of the pointer. See above.
+        Some(crate::agent_pty::GuardedSend::Ambiguous) => false,
+        // Nothing was written at all, so there is nothing to submit.
+        Some(crate::agent_pty::GuardedSend::WrongSession)
+        | Some(crate::agent_pty::GuardedSend::Stale)
+        | Some(crate::agent_pty::GuardedSend::NoLiveTarget) => false,
+        // The write itself errored, or was never attempted because no worker
+        // identity resolved. Either way the box's contents are unknown to us.
+        None => false,
+    }
+}
+
+/// Issue #1031: act on a `SessionStart` that arrives AFTER the readiness gate
+/// gave up, instead of discarding the one piece of positive evidence the daemon
+/// gets that it wrote too early.
+///
+/// # The gap this closes
+///
+/// PRD #249's gate handles a respawned `clear = true` worker that announces
+/// itself INSIDE [`SESSION_START_WAIT_TIMEOUT`]. When the wait expires the
+/// fallback writes the pointer anyway — correctly, because an agent that emits no
+/// hooks at all still has to be delegated to — and `observed = false` is the
+/// daemon recording that it does not know the agent is up. #1031 measured what
+/// happens next, twice in two minutes on one pane: a genuine `SessionStart` for
+/// the new agent landed 7.1 s and 11.1 s later, the pointer sat UNSUBMITTED at
+/// the worker's own composer, a human had to press Enter, and the orchestrator
+/// was handed a silent-worker report. The daemon had proof it had written too
+/// early and threw it away.
+///
+/// # Why a SUBMIT and not a rewrite
+///
+/// The recovery is a submit-only probe — an empty payload whose whole effect is
+/// the delayed CR ([`crate::prompt_delivery::attempt_writes_payload`] has the
+/// primitive; `crate::spawn`'s confirmation loop is its other user). It is NOT a
+/// second write of the pointer, and the reason is #1031's own evidence rather
+/// than caution: the pane rendered `❯ Read .dot-agent-deck/worker-task-…` at its
+/// input, so the payload bytes had SURVIVED and only the submit was lost. Typing
+/// the pointer in again there appends a second copy and the worker submits both
+/// as one turn — the `seedseed` corruption issue #424 D5 measured on the
+/// scheduler path.
+///
+/// So the two candidate recoveries are not symmetric, and this picks the one that
+/// is safe in both worlds rather than the one that is curative in both:
+///
+/// | the bytes were | a probe does | a rewrite does |
+/// |---|---|---|
+/// | in the composer, CR swallowed (#1031, measured twice) | submits them — the delegation completes | doubles the pointer |
+/// | flushed by the TUI's raw-mode transition (#199) | nothing useful — there are no bytes of the task left to submit | delivers them |
+///
+/// **So the second row is NOT fixed by this, and that is a deliberate scope line
+/// rather than an oversight.** A worker whose pointer was destroyed still ends at
+/// the silent-worker report, exactly as before. Note what the second row does and
+/// does not claim: the CR still REACHES the agent, and nobody has measured what
+/// each agent's composer does with a bare Enter on an empty box. What is claimed
+/// is only that the delegated task is not among the bytes it could submit, which
+/// is a fact about the pane rather than about the agent — and the pane is also
+/// where the `user_typed_since_automatic_write` gate below makes the one
+/// consequence that would matter (submitting somebody's draft) unreachable. Issue #666 does authorize a
+/// payload rewrite on this same arming evidence, and its own
+/// [`crate::prompt_delivery::AgentStartRearm`] is reused here for the fact gate —
+/// but there the rewrite is reached only after TWO payload writes have failed to
+/// confirm, and #1031 is a direct counter-example to reading a late Claude
+/// `SessionStart` as proof on its own that the box is empty.
+///
+/// # What authorizes it
+///
+/// Every one of [`crate::prompt_delivery::AgentStartRearm`]'s six facts, unchanged
+/// — S and T and U inside the value, G and I and W enforced by the loop below, the
+/// same division of labour `crate::spawn::confirm_prompt_delivery` uses. Two of
+/// them are worth naming for what they buy HERE:
+///
+/// * **U excludes a delivery that wrote into a conversation it already knew
+///   about**, with no flag saying so: a gate released by a genuine `SessionStart`
+///   returns that start's generation, so a later start cannot earn a probe. That
+///   is what keeps a worker which received and submitted its pointer, and then
+///   `/clear`ed, from being submitted into twice. **It is NOT the same as "the
+///   timeout fallback", and writing that would overstate it** — both of the
+///   wrapper's interface events, and the declared-no-signal skip, also contribute
+///   no generation (see [`SessionStartWait::generation`]), so U admits them too.
+/// * **T scopes it to producers whose start is a STARTUP fact.** Only Claude Code
+///   answers yes today, which is exactly the population #1031 reports; Codex's and
+///   OpenCode's starts arrive once a prompt has been ACCEPTED, so for them a
+///   post-write start is a consequence of our own delivery and probing on it would
+///   be circular.
+///
+/// **Together** they land on the timeout fallback and nothing else, but by
+/// conjunction rather than by either one: Claude Code has no wrapper-interface
+/// path and no declared-no-signal skip, so the only way a Claude delivery reaches a
+/// payload write with no bound generation is the gate having expired. Add a
+/// wrapper-hosted Claude, or measure Devin's start into
+/// [`crate::prompt_delivery::agent_start_precedes_first_prompt`], and that
+/// coincidence stops holding — which is a reason to read the two facts rather than
+/// the sentence.
+///
+/// The one-shot is enforced twice over: [`crate::prompt_delivery::AgentStartRearm::spend`]
+/// and the `probed` flag below, plus `observe_agent_start`'s own latch refusing a
+/// second observation.
+///
+/// # Bounds, and what stops it
+///
+/// Bounded by [`crate::prompt_delivery::AUTOMATIC_PROMPT_DEADLINE`], the same
+/// ceiling every other retry chain in the daemon is held to, so "how long do we
+/// keep trying" cannot drift between the four delivery paths. Measured from this
+/// watch's first poll rather than from the write itself — a scheduling hop later,
+/// which is the same slack `crate::spawn`'s own `watch_started_at` carries. It
+/// also stops early on each of: proof that a turn began
+/// ([`worker_event_proves_delivery`] — the pointer landed, nothing to recover), a
+/// `SessionEnd` for the bound agent (the conversation we wrote into is over, so a
+/// CR would submit into a different one), the worker pane beginning to close, the
+/// bound agent exiting, and a lagged or closed event stream — where the evidence
+/// is gone and a blind CR is not a recovery, the same rule
+/// `crate::spawn::drain_pre_write_events` applies.
+///
+/// It is deliberately NOT cancelled by `work-done`: a completion proves the
+/// pointer landed, which means a turn began, which means the proof arm above
+/// already returned. A `work-done` from a worker that emitted nothing at all
+/// leaves a probe over a box that holds no task of ours.
+///
+/// **It is armed only over a write whose outcome was `Applied`**, never over the
+/// broader "may the worker have got this?" the commission ledger and the silence
+/// watch use — see [`outcome_leaves_the_whole_pointer_for_a_later_submit`], which
+/// is where that distinction and its cost live.
+///
+/// **The stale-event hazard #1031 names second needs no new machinery, and
+/// claiming otherwise would be inventing work.** Attempt 2's log shows the
+/// PREVIOUS session's `SessionEnd` arriving 3.5 s into the new wait; that event
+/// carries the OLD agent's id (each agent is told its own via
+/// `DOT_AGENT_DECK_AGENT_ID` at spawn), and fact I here — and in
+/// [`wait_for_session_start`] before it — is an exact `agent_id` match, so it is
+/// already filtered. What it genuinely cost was WALL CLOCK: the successor had
+/// less than the full window to announce. Nothing below shortens a teardown.
+fn arm_delegate_late_readiness_recovery(
+    registry: Arc<AgentPtyRegistry>,
+    mut event_rx: broadcast::Receiver<BroadcastMsg>,
+    mut rearm: crate::prompt_delivery::AgentStartRearm,
+    worker_pane_id: String,
+    worker_agent_id: String,
+    role: String,
+    orchestration: Option<OrchestrationIdentity>,
+) {
+    tokio::spawn(async move {
+        let closing = registry.pane_close_signal(&worker_pane_id);
+        let exited = registry.agent_exit_signal(&worker_agent_id);
+        // `biased` so a close or a corpse always beats an event that raced it,
+        // the same ordering `arm_delegate_silence_watch` and the readiness
+        // buffer's own wait use.
+        tokio::select! {
+            biased;
+            // Neither line says WHICH stage the watch was at, because this
+            // `select!` is polled on every wake and so can also fire after a probe
+            // has already gone out. "before any late readiness signal" would be an
+            // absolute the arm cannot check.
+            _ = closing => tracing::debug!(
+                pane_id = %worker_pane_id,
+                role = %role,
+                "delegate: the worker pane began closing; abandoning the late-readiness submit \
+                 recovery"
+            ),
+            _ = exited => tracing::debug!(
+                pane_id = %worker_pane_id,
+                role = %role,
+                worker_agent_id = %worker_agent_id,
+                "delegate: the worker agent exited; abandoning the late-readiness submit recovery"
+            ),
+            _ = run_delegate_late_readiness_recovery(
+                &registry,
+                &mut event_rx,
+                &mut rearm,
+                &worker_pane_id,
+                &worker_agent_id,
+                &role,
+                orchestration,
+            ) => {}
+        }
+    });
+}
+
+/// The body of [`arm_delegate_late_readiness_recovery`]'s watch, split out so the
+/// cancellation arms above read as one `select!` rather than as a loop with two
+/// extra branches on every iteration.
+async fn run_delegate_late_readiness_recovery(
+    registry: &Arc<AgentPtyRegistry>,
+    event_rx: &mut broadcast::Receiver<BroadcastMsg>,
+    rearm: &mut crate::prompt_delivery::AgentStartRearm,
+    worker_pane_id: &str,
+    worker_agent_id: &str,
+    role: &str,
+    orchestration: Option<OrchestrationIdentity>,
+) {
+    let deadline = tokio::time::Instant::now() + crate::prompt_delivery::AUTOMATIC_PROMPT_DEADLINE;
+    // When the observed start's readiness interval is up and the probe may go.
+    // Held as a separate deadline rather than slept through, so the loop keeps
+    // reading the worker's events across the interval: a worker that consumes the
+    // pointer on its own inside it ends the watch instead of being probed.
+    //
+    // Same shape as [`wait_for_session_start`]'s upgrade window — take the MIN so
+    // an interval can never extend the watch past its ceiling.
+    let mut probe_at: Option<tokio::time::Instant> = None;
+    let mut probed = false;
+    loop {
+        let effective = probe_at.map_or(deadline, |probe| probe.min(deadline));
+        let Some(remaining) = effective.checked_duration_since(tokio::time::Instant::now()) else {
+            // WHICH deadline expired, and the comparison rather than merely "an
+            // interval was pending". A start arriving late enough — reachable with
+            // an operator-pinned buffer, which clamps at 30 s against this 60 s
+            // ceiling — puts its interval PAST the ceiling, and `min` above then
+            // makes the ceiling the one that expires. Probing on that would write
+            // past the bound every other delivery path in the daemon is held to.
+            if !probed
+                && let Some(probe) = probe_at.take()
+                && probe <= deadline
+            {
+                probed = true;
+                probe_delegate_submit(
+                    registry,
+                    rearm,
+                    worker_pane_id,
+                    worker_agent_id,
+                    role,
+                    orchestration.clone(),
+                )
+                .await;
+                continue;
+            }
+            tracing::debug!(
+                pane_id = %worker_pane_id,
+                role = %role,
+                worker_agent_id = %worker_agent_id,
+                probed,
+                "delegate: the late-readiness submit recovery window closed"
+            );
+            return;
+        };
+        match tokio::time::timeout(remaining, event_rx.recv()).await {
+            Ok(Ok(BroadcastMsg::Event(event))) => {
+                // Fact I: BOTH ids, exact, non-optional — the same discriminator
+                // `wait_for_session_start` and `wait_for_worker_event` apply, and
+                // for the same reason (`src/daemon.rs` broadcasts before
+                // `apply_event` validates, and a pane id is a recycled handle).
+                if event.pane_id.as_deref() != Some(worker_pane_id)
+                    || event.agent_id.as_deref() != Some(worker_agent_id)
+                {
+                    continue;
+                }
+                if worker_event_proves_delivery(&event) {
+                    tracing::debug!(
+                        pane_id = %worker_pane_id,
+                        role = %role,
+                        event_type = ?event.event_type,
+                        probed,
+                        "delegate: the worker began a turn, so its task pointer landed; no \
+                         further submit recovery is owed"
+                    );
+                    return;
+                }
+                if event.event_type == EventType::SessionEnd {
+                    tracing::debug!(
+                        pane_id = %worker_pane_id,
+                        role = %role,
+                        probed,
+                        "delegate: the worker's session ended; a submit now would land in a \
+                         different conversation, so the recovery stops here"
+                    );
+                    return;
+                }
+                // Fact G: a genuine start, never one carrying the wrapper's own
+                // fork-time or interface-watch provenance — those name the
+                // WRAPPER's session and are the deck observing a child paint,
+                // not an agent announcing a conversation.
+                //
+                // Only the FIRST start arms the interval, the same latch
+                // [`wait_for_session_start`] puts on its upgrade window and for the
+                // same reason: `observe_agent_start` already refuses a second
+                // observation, so without this a repeated start would leave the
+                // rearm alone while walking `probe_at` forward until the ceiling
+                // and denying the recovery outright.
+                if probed
+                    || probe_at.is_some()
+                    || event.event_type != EventType::SessionStart
+                    || event.is_wrapper_session_start()
+                {
+                    continue;
+                }
+                rearm.observe_agent_start(std::time::Instant::now(), &event.agent_type);
+                // The interval between the arming start and the probe. The seam's
+                // OWN measured value ([`DELEGATE_READINESS_BUFFER`]) rather than
+                // the rearm's, because this is the same question that constant was
+                // tuned for on this exact path — how long after a genuine
+                // `SessionStart` a cold `clear = true` respawn interprets `\r` as
+                // submit — and because it carries the operator override that
+                // measurement's own doc comment insists on.
+                //
+                // Floored at [`crate::prompt_delivery::REARM_READINESS_BUFFER`]
+                // because `is_available` enforces that floor itself, so an
+                // operator (or the e2e harness) pinning the seam's knob to `0`
+                // would otherwise reach the probe before the rearm would authorize
+                // it and silently get no recovery at all.
+                let interval =
+                    delegate_readiness_buffer().max(crate::prompt_delivery::REARM_READINESS_BUFFER);
+                probe_at = Some(tokio::time::Instant::now() + interval);
+                tracing::debug!(
+                    pane_id = %worker_pane_id,
+                    role = %role,
+                    worker_agent_id = %worker_agent_id,
+                    agent_type = ?event.agent_type,
+                    interval_ms = interval.as_millis(),
+                    "delegate: a SessionStart arrived after this delivery wrote with no bound \
+                     conversation, which is evidence the task pointer went into an agent that had \
+                     not booted; holding for the readiness interval and then submitting what the \
+                     worker's input box is holding, IF the six-fact gate authorizes it (see #1031)"
+                );
+            }
+            // Issue #717 / PRD #741 M8: none of these is evidence about this
+            // pane. Listed rather than wildcarded so a future variant fails the
+            // match and gets considered on its merits.
+            Ok(Ok(
+                BroadcastMsg::OrchestrationSurface(_)
+                | BroadcastMsg::WorktreeKept(_)
+                | BroadcastMsg::Unknown,
+            )) => {
+                continue;
+            }
+            // Issue #424 D2's rule, at a third drain: once frames have been
+            // dropped, "the worker has not begun a turn" is UNKNOWABLE — the
+            // proof event may have been among them — and a blind CR on missing
+            // evidence is not a recovery. Terminal, like `Closed`.
+            Ok(Err(broadcast::error::RecvError::Lagged(dropped))) => {
+                tracing::debug!(
+                    pane_id = %worker_pane_id,
+                    role = %role,
+                    dropped,
+                    probed,
+                    "delegate: the late-readiness submit recovery fell behind the event bus; \
+                     stopping rather than submitting on evidence that may have been dropped"
+                );
+                return;
+            }
+            Ok(Err(broadcast::error::RecvError::Closed)) => return,
+            // The ordinary expiry of `remaining`; the top of the loop decides
+            // whether that was the probe interval or the ceiling.
+            Err(_) => continue,
+        }
+    }
+}
+
+/// Issue #1031: the recovery itself — one guarded, identity-bound submit-only
+/// probe into the delegated worker.
+///
+/// An EMPTY payload, so the encoder emits no bytes and the target receives just
+/// the delayed submit CR: whatever the worker's input box is holding is submitted
+/// and nothing is appended to it. Everything else is the delegate write's own
+/// treatment, deliberately — bound to `worker_agent_id` so a pane that changed
+/// hands yields `WrongSession` and zero bytes, and re-validated under the held
+/// writer against the pane's closing state and its live orchestration membership,
+/// so a pane mid-teardown or one re-homed into a different orchestration is
+/// refused too.
+///
+/// The registry's own `user_typed_since_automatic_write` gate sits under this, and
+/// what it makes safe is precisely the hazard a blind CR carries: if the operator
+/// has typed into the worker's pane since the daemon's last automatic write —
+/// including pressing the Enter #1031 says a human has to press — the probe is
+/// refused before a byte rather than submitting their unsent draft. It says
+/// nothing about what the box HOLDS, which no write-side check can, and that
+/// residual is issue #544's accepted limitation rather than something this adds.
+///
+/// One attempt, never retried. An `Ambiguous` outcome means the CR itself did not
+/// complete, and a second CR is as likely to submit whatever the operator has
+/// typed since as to finish the job; the silent-worker report is the surface that
+/// still covers a worker that never speaks.
+async fn probe_delegate_submit(
+    registry: &Arc<AgentPtyRegistry>,
+    rearm: &mut crate::prompt_delivery::AgentStartRearm,
+    worker_pane_id: &str,
+    worker_agent_id: &str,
+    role: &str,
+    orchestration: Option<OrchestrationIdentity>,
+) {
+    // The six-fact gate decides, not the caller's bookkeeping: `probe_at` only
+    // says the interval is up. On a PAUSED Tokio clock this refuses — the rearm
+    // measures its floor on the wall clock, which `tokio::time::pause` does not
+    // advance — so the fixtures for this path run on real time.
+    if !rearm.is_available(std::time::Instant::now()) {
+        tracing::debug!(
+            pane_id = %worker_pane_id,
+            role = %role,
+            worker_agent_id = %worker_agent_id,
+            "delegate: the late SessionStart did not authorize a submit recovery for this pane \
+             (see AgentStartRearm's six facts); nothing submitted"
+        );
+        return;
+    }
+    rearm.spend();
+    let revalidate_registry = Arc::clone(registry);
+    let revalidate_pane = worker_pane_id.to_string();
+    let outcome = registry
+        .write_and_submit_guarded_detailed(worker_pane_id, "", worker_agent_id, || async move {
+            if revalidate_registry.is_pane_closing(&revalidate_pane) {
+                return false;
+            }
+            orchestration_still_matches(
+                orchestration.as_ref(),
+                revalidate_registry
+                    .pane_orchestration(&revalidate_pane)
+                    .as_ref(),
+            )
+        })
+        .await;
+    // No payload record to settle: `note_automatic_write` advances the pane's
+    // submit clock for an empty payload and records no bytes, precisely because a
+    // probe leaves the box holding whatever the last payload write put there.
+    match outcome {
+        Ok(crate::agent_pty::GuardedSendDetail::Outcome(
+            crate::agent_pty::GuardedSend::Applied,
+        )) => {
+            tracing::info!(
+                pane_id = %worker_pane_id,
+                role = %role,
+                worker_agent_id = %worker_agent_id,
+                "delegate: submitted whatever the worker's input box was holding, after a \
+                 SessionStart said its session began only AFTER the fallback write — so the task \
+                 pointer was most likely parked there unsubmitted (see #1031)"
+            );
+        }
+        Ok(crate::agent_pty::GuardedSendDetail::RefusedUserInput) => tracing::debug!(
+            pane_id = %worker_pane_id,
+            role = %role,
+            "delegate: the worker's pane has been typed into since the daemon's last automatic \
+             write, so the submit recovery was refused rather than submitting that draft"
+        ),
+        Ok(other) => tracing::debug!(
+            pane_id = %worker_pane_id,
+            role = %role,
+            worker_agent_id = %worker_agent_id,
+            outcome = ?other,
+            "delegate: the submit recovery was not applied"
+        ),
+        Err(e) => warn!(
+            pane_id = %worker_pane_id,
+            role = %role,
+            error = %e,
+            "delegate: the submit recovery failed to reach the worker pane"
+        ),
+    }
+}
+
 /// Issue #424 S3 / PR #713 review / issue #715: release the payload record a
 /// ONE-SHOT automatic write left on a pane — but only for the outcome that says
 /// the pane's input box is empty again.
@@ -4670,6 +5144,15 @@ async fn dispatch_one_owned(
     // write is not safe here.
     let mut expected_worker_agent_id: Option<String> = None;
 
+    // Issue #1031: the ONE submit recovery a `clear = true` fallback write may
+    // earn, or `None` where no late readiness signal could authorize one.
+    //
+    // `Some` only on the respawn path, because only there did the deck write into
+    // a pane whose agent may not have existed yet. Fact U inside the value does
+    // the rest of the discrimination — see
+    // [`arm_delegate_late_readiness_recovery`].
+    let mut late_readiness_rearm: Option<crate::prompt_delivery::AgentStartRearm> = None;
+
     // Issue #687: the silent-worker watch a `clear = true` respawn arms for its
     // fresh generation the moment that generation takes the pane, rather than
     // ~30 s later immediately before the pointer write. `Some` only on the
@@ -5358,6 +5841,33 @@ async fn dispatch_one_owned(
                         _ = tokio::time::sleep(buffer) => {}
                     }
                 }
+                // Issue #1031: the standing for a late-readiness submit recovery,
+                // resolved HERE because both of its inputs are facts about the
+                // write that is about to happen and neither is recoverable
+                // afterwards.
+                //
+                // Fact S is the deck's own pre-write belief about this pane
+                // (`pre_write_believed_agent_type`: the frozen launch identity the
+                // respawn just exec'd, else a launcher declaration made before our
+                // bytes). Fact U is whether this delivery had a bound hook
+                // generation when it wrote — and `wait.generation` is exactly that,
+                // so no second flag has to be kept in step with it. A gate released
+                // by a genuine `SessionStart` returns `Some(generation)`, so U is
+                // false and no later start can authorize a second submit into a
+                // conversation that was already live when we wrote. A gate that
+                // timed out returns `None`, which is the arm #1031 reports — though
+                // not the only arm U admits, and the recovery's own doc comment has
+                // the other two and why T then excludes them anyway.
+                //
+                // The value can still refuse on facts T (the producer's start must
+                // precede its first prompt) and S — see
+                // [`crate::prompt_delivery::AgentStartRearm`] — so this is
+                // standing to be considered, never a decision.
+                let mut rearm = crate::prompt_delivery::AgentStartRearm::new(
+                    registry.pre_write_believed_agent_type(&new_agent_id),
+                );
+                rearm.note_payload_write(wait.generation.is_none());
+                late_readiness_rearm = Some(rearm);
                 // PRD #249 review (finding B1): the identity the pointer is now
                 // bound to. Captured from the respawn rather than re-read after
                 // the wait on purpose — re-reading would hand the payload to
@@ -5556,6 +6066,23 @@ async fn dispatch_one_owned(
             None
         }
     };
+    // Issue #1031: subscribed BEFORE the write, for the same reason the silence
+    // watch above is — a `broadcast::Receiver` attaches to future sends only, so
+    // subscribing after the write would miss a start that arrived while the
+    // guarded send was acquiring the writer.
+    //
+    // **What this is NOT is an exact pre-write watermark, and the honest claim is
+    // the narrower one.** `crate::spawn`'s confirmation loop establishes one by
+    // DRAINING everything already queued (`drain_pre_write_events`); there is
+    // nothing to drain here, because this receiver is created microseconds before
+    // the write and a broadcast receiver starts empty. What remains is the sliver
+    // between this line and the write itself: a `SessionStart` sent inside it is
+    // read as post-write when it is not. That costs nothing, and the reason is
+    // worth stating rather than waving at — a start that truly preceded the write
+    // means the pointer went into a live conversation, so the write's own submit
+    // CR began a turn, so the loop sees proof of delivery and returns before it
+    // ever probes.
+    let late_readiness_rx = late_readiness_rearm.as_ref().map(|_| event_tx.subscribe());
     // Legacy PTY injection for every non-pi-native path: claude / opencode
     // workers, and `clear = false` pi workers (which get no fresh
     // `session_start` for the extension to pull on). The pi-native `clear =
@@ -5774,6 +6301,55 @@ async fn dispatch_one_owned(
             &pane_id,
             &target_role,
             "the identity gate refused the task pointer",
+        );
+    }
+    // Issue #1031: armed HERE, above the `silence` destructuring, and that
+    // position is the whole point rather than tidiness. The silent-worker report
+    // is switchable on its own knob
+    // ([`DOT_AGENT_DECK_DELEGATE_NO_EVENT_WINDOW_MS`]) and the e2e harness pins it
+    // to `0`, so `silence` is `None` for every test in this repository and for
+    // every project that turned the diagnostic off. Arming the recovery below that
+    // `else { return; }` would have made a DELIVERY FIX inherit a DIAGNOSTIC's
+    // switch — the exact coupling that knob's own doc comment exists to forbid —
+    // and would have left the mechanism unexercised by every e2e lane.
+    //
+    // Gated on `Applied`, and NOT on `delivered` — Greptile P1 on PR #1168, and the
+    // two disagree on exactly the outcome that makes a blind CR dangerous.
+    //
+    // `delivered` is deliberately `true` for `Ambiguous` as well, because that
+    // answers "may the worker have got this?" — the question the commission and
+    // the silence watch are asking, where a partial write has to stay owed. This
+    // recovery asks a different one: "is the COMPLETE pointer sitting in that
+    // input box?", and only `Applied` answers yes. An `Ambiguous` write started
+    // the payload and did not finish the sequence, so the box may hold a PREFIX —
+    // `Read .dot-agent-deck/worker-ta` — and a probe would submit that truncated
+    // text as a turn. Issue #876's drain erases a recoverable partial write back
+    // out, which makes the box clean rather than the claim safe: what reaches here
+    // is precisely the residual it could not undo, above all a PTY whose slave has
+    // gone, and that is the case where the stranded prefix really is still there.
+    //
+    // The user-input guard cannot cover this, which is why the outcome has to: it
+    // refuses a probe once the OPERATOR has typed since our write, and these bytes
+    // are the daemon's own.
+    //
+    // A refusal (`Stale`, `WrongSession`, `NoLiveTarget`, `RefusedUserInput`) wrote
+    // nothing at all, so there is likewise nothing a later submit could submit, and
+    // the commission has already been released above.
+    if outcome_leaves_the_whole_pointer_for_a_later_submit(submit_outcome)
+        && let (Some(rearm), Some(rx), Some(worker_agent_id)) = (
+            late_readiness_rearm,
+            late_readiness_rx,
+            expected_worker_agent_id.as_deref(),
+        )
+    {
+        arm_delegate_late_readiness_recovery(
+            Arc::clone(&registry),
+            rx,
+            rearm,
+            pane_id.clone(),
+            worker_agent_id.to_string(),
+            target_role.clone(),
+            orchestration.clone(),
         );
     }
     let Some((watch, armed, rx)) = silence else {
@@ -11302,6 +11878,50 @@ mod tests {
 
     /// PRD #249 M3: with no override set, the no-event window still follows the
     /// idle detector's knob — `0` means "report nothing" — but is capped, because
+    /// Issue #1031 (Greptile P1 on PR #1168): the late-readiness submit recovery is
+    /// armed over `Applied` and over NOTHING else, enumerated so a future
+    /// [`crate::agent_pty::GuardedSend`] variant has to be classified rather than
+    /// inheriting a side.
+    ///
+    /// `Ambiguous` is the one that matters and the one an `if delivered` got wrong:
+    /// `dispatch_one_owned` deliberately counts it as delivered, because the worker
+    /// MAY have got the pointer and the commission has to stay owed — but a partial
+    /// write can leave a PREFIX in the input box, and this recovery's whole effect
+    /// is a blind CR that would submit that prefix as a turn.
+    #[test]
+    fn late_readiness_recovery_is_armed_only_over_a_complete_written_pointer() {
+        use crate::agent_pty::GuardedSend;
+
+        assert!(
+            outcome_leaves_the_whole_pointer_for_a_later_submit(Some(GuardedSend::Applied)),
+            "`Applied` wrote the payload AND its submit CR to the authorized target; that the \
+             booting agent swallowed the CR is issue #1031 itself, and it is the one outcome \
+             that leaves the complete pointer recoverable"
+        );
+        assert!(
+            !outcome_leaves_the_whole_pointer_for_a_later_submit(Some(GuardedSend::Ambiguous)),
+            "a partial write may have left only a PREFIX of the pointer in the worker's input \
+             box, and a blind CR would submit that truncated text as a turn — this is the one \
+             outcome on which the recovery's question and `delivered`'s disagree"
+        );
+        for refused in [
+            GuardedSend::WrongSession,
+            GuardedSend::Stale,
+            GuardedSend::NoLiveTarget,
+        ] {
+            assert!(
+                !outcome_leaves_the_whole_pointer_for_a_later_submit(Some(refused)),
+                "{refused:?} wrote no bytes at all, so there is nothing for a later submit to \
+                 submit"
+            );
+        }
+        assert!(
+            !outcome_leaves_the_whole_pointer_for_a_later_submit(None),
+            "the write errored or was never attempted for want of a resolved worker identity; \
+             either way the box's contents are unknown and a blind CR is not a recovery"
+        );
+    }
+
     /// "this worker has emitted nothing at all" is a diagnosis that is useless two
     /// hours late.
     #[test]
