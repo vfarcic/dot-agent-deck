@@ -208,6 +208,16 @@ impl Probe {
     ///   decoy repository, for the daemon and everything it spawns. The
     ///   harness's own git commands never see them (`sandbox::sandbox_git`
     ///   starts from an empty environment).
+    ///
+    /// **These are trusted, hardcoded values, and their confinement is this
+    /// function's job.** `sandbox::check_env` admits each extra by exact name
+    /// and exact value, refuses a base-allowlist or credential-shaped name, and
+    /// nothing more: it does NOT check that a path-valued extra stays under
+    /// `$S`. So a path-valued extra must be built from the sandbox here, as the
+    /// `GitEnv` values are from [`decoy_repo`]. If extras ever become
+    /// data-driven or caller-selectable, add a per-variable validator —
+    /// canonical containment under `$S` for a path or a path list — before
+    /// admitting them; the exact-value check alone would admit a host path.
     pub fn extra_env(self, sb: &Sandbox) -> Vec<(String, String)> {
         let kv = |k: &str, v: String| (k.to_string(), v);
         match self {

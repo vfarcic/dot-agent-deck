@@ -78,6 +78,12 @@ pub struct Plan {
     pub experimental: bool,
     pub max_lifetime_secs: u64,
     pub previous: String,
+    /// The exact line the old binary's `--version` must print, checked by the
+    /// inner half before any daemon starts — inside the namespace, where the
+    /// old check's host-side run of an unauthenticated download no longer
+    /// happens. `None` for `--old-binary`, whose version is recorded and not
+    /// enforced.
+    pub old_version: Option<String>,
     /// Which build serves the daemon.
     pub direction: Direction,
     /// The reverse probe the run carries ([`Probe::Generic`] in a forward run).
@@ -87,7 +93,8 @@ pub struct Plan {
     /// The probe's additions to the environment, each admitted by name and
     /// exact value (see `sandbox::check_env`).
     pub extra_env: Vec<(String, String)>,
-    /// The exact environment every process in the run gets.
+    /// The exact environment every process of the runtime scenario gets — not
+    /// the outer half's `git`, `gh` and `cargo`, which run on the host.
     pub env: Vec<(String, String)>,
     /// Every endpoint matrix the daemon may legitimately bind; the inner half
     /// selects one from the kernel's table once the daemon is up (see
@@ -316,11 +323,99 @@ pub fn check_namespace(plan: &Plan, recorded_mnt: &str) -> Result<Vec<String>, S
             if entries.len() == 1 { "y" } else { "ies" }
         ));
     }
+    if plan.masked_home.is_none() {
+        notes.push(
+            "**no home was masked**: the password database names no home that is a directory \
+             other than `/` (`home_to_mask`), so nothing under a home is hidden inside the \
+             namespace"
+                .to_string(),
+        );
+    }
+    match std::fs::read_to_string("/proc/self/mountinfo") {
+        Ok(info) => {
+            let residual = residual_rw_mounts(&info, plan);
+            notes.push(if residual.is_empty() {
+                "no residual `rw` submount: every mount point outside the run's own is read-only"
+                    .to_string()
+            } else {
+                format!(
+                    "**exposure, not a failure**: {} residual `rw` submount(s) the read-only root \
+                     did not remount, counted as writable because root ownership of a mount \
+                     point does not prove otherwise (mode bits, ACLs, group access and FUSE all \
+                     decide beneath it): {}",
+                    residual.len(),
+                    residual
+                        .iter()
+                        .map(|m| format!("`{m}`"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            });
+        }
+        Err(e) => notes.push(format!(
+            "**residual `rw` submounts unknown**: /proc/self/mountinfo could not be read ({e})"
+        )),
+    }
     for (kind, label) in [("pid", "PID"), ("net", "network"), ("user", "user")] {
         let id = proc::namespace("self", kind).ok_or_else(|| format!("cannot read ns/{kind}"))?;
         notes.push(format!("{label} namespace {id}"));
     }
     Ok(notes)
+}
+
+/// A `/proc/self/mountinfo` path field with its octal escapes decoded.
+fn unescape_mount_path(field: &str) -> String {
+    let mut out = String::new();
+    let mut rest = field;
+    while let Some(i) = rest.find('\\') {
+        out.push_str(&rest[..i]);
+        let esc = rest
+            .get(i + 1..i + 4)
+            .and_then(|o| u8::from_str_radix(o, 8).ok());
+        match esc {
+            Some(b) => {
+                out.push(b as char);
+                rest = &rest[i + 4..];
+            }
+            None => {
+                out.push('\\');
+                rest = &rest[i + 1..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// The mount points in `mountinfo` still mounted `rw` that are not the run's
+/// own: `$S` and what is under it, the masks, the masked home's tmpfs, the
+/// private `/proc` and the `/dev` bwrap builds. What remains is what the
+/// read-only `/` did not reach — reported, not proven unwritable.
+pub fn residual_rw_mounts(mountinfo: &str, plan: &Plan) -> Vec<String> {
+    let own = |mp: &Path| {
+        mp.starts_with(&plan.root)
+            || plan.masks.iter().any(|m| mp == m.target)
+            || plan.masked_home.as_deref() == Some(mp)
+            || mp == Path::new("/proc")
+            || mp.starts_with("/dev")
+    };
+    let mut out = Vec::new();
+    for line in mountinfo.lines() {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        let (Some(mp), Some(opts)) = (fields.get(4), fields.get(5)) else {
+            continue;
+        };
+        if !opts.split(',').any(|o| o == "rw") {
+            continue;
+        }
+        let mp = unescape_mount_path(mp);
+        if !own(Path::new(&mp)) {
+            out.push(mp);
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
 }
 
 /// The kernel-level answer to "who is listening at `path`": the listening
@@ -653,6 +748,7 @@ mod tests {
             experimental: false,
             max_lifetime_secs: 1800,
             previous: "v0.41.0".into(),
+            old_version: Some("dot-agent-deck 0.41.0".into()),
             direction: Direction::Forward,
             probe: Probe::Generic,
             fixture: sandbox::FIXTURE_TOML.to_string(),
@@ -674,6 +770,34 @@ mod tests {
             masked_home: Some("/home/op".into()),
             outer_mnt_ns: "mnt:[1]".into(),
         }
+    }
+
+    #[test]
+    fn residual_rw_mounts_are_what_the_read_only_root_did_not_reach() {
+        let info = "\
+1 0 252:0 / / ro,relatime - ext4 /dev/root rw
+2 1 0:30 / /home/op rw,nosuid,nodev - tmpfs tmpfs rw
+3 2 252:0 /home/op/code/runs/r1 /home/op/code/runs/r1 rw,relatime - ext4 /dev/root rw
+4 1 252:0 /home/op/code/runs/r1/fallback-tmp /tmp rw,relatime - ext4 /dev/root rw
+5 1 252:0 /home/op/code/runs/r1/run-user /run/user/1000 rw,relatime - ext4 /dev/root rw
+6 1 0:5 / /proc rw,nosuid,nodev,noexec - proc proc rw
+7 1 0:6 / /dev rw,nosuid - tmpfs tmpfs rw
+8 7 0:7 / /dev/pts rw,nosuid,noexec - devpts devpts rw
+9 1 0:40 / /run/docker/netns/abc rw - nsfs nsfs rw
+10 6 0:41 / /proc/sys/fs/binfmt_misc rw,relatime - autofs systemd-1 rw
+11 1 0:42 / /var/lib/docker/rootfs/overlayfs/x rw,relatime - overlay overlay rw
+12 1 0:43 / /mnt/with\\040space rw - ext4 /dev/sdb rw
+13 1 0:44 / /srv/ro ro,relatime - ext4 /dev/sdc rw
+";
+        assert_eq!(
+            residual_rw_mounts(info, &plan()),
+            vec![
+                "/mnt/with space",
+                "/proc/sys/fs/binfmt_misc",
+                "/run/docker/netns/abc",
+                "/var/lib/docker/rootfs/overlayfs/x",
+            ]
+        );
     }
 
     fn pos(args: &[String], needle: &[&str]) -> usize {

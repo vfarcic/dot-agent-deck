@@ -41,13 +41,21 @@
 //! (`--inner-plan`). The daemon, both TUIs and every deck CLI call are started
 //! by the INNER half (`inner.rs`), inside that namespace, and each client only
 //! after a pre-connect assertion whose host-side part this half answers over
-//! `ctl.rs`. The one deck binary this half runs itself is the old release's
-//! `--version`, a static print, with an empty environment. `isolation.rs` says
-//! what the namespace masks and why.
+//! `ctl.rs`. This half executes no deck binary: it checks the downloaded old
+//! release against the release's published `checksums.txt`, and the inner half
+//! runs its `--version`. `isolation.rs` says what the namespace masks and why.
+//!
+//! **What this half does run is outside the namespace, on the host, as the
+//! operator**: `git` and `gh` to acquire the inputs, and `cargo build` — with
+//! whatever build scripts, proc macros and cargo-config linker that executes.
+//! The namespace contains the runtime scenario, not the command. `buildgate.rs`
+//! refuses, before anything is built, a branch that changes build-time code
+//! relative to its merge-base with `main`, unless `--allow-build-changes`.
 //!
 //! `docs/develop/cross-version-harness.md` is the operational page: how to run
 //! it, what it isolates, and what it does not cover.
 
+mod buildgate;
 mod ctl;
 mod inner;
 mod isolation;
@@ -88,11 +96,29 @@ const GIT_LOCATION_VARS: &[&str] = &[
     "GIT_PREFIX",
 ];
 
+/// The trust-boundary warning `--help` and `-h` print after the options, for
+/// whoever never opens the harness doc.
+const TRUST_BOUNDARY: &str = "\
+TRUST BOUNDARY - read this before running it on code you have not reviewed.
+`cargo xver` contains its daemon/TUI/CLI runtime scenario in a private
+bubblewrap namespace and masks the current resolver's standard endpoint roots.
+It is NOT an untrusted-code sandbox: the branch build (`cargo build`, with the
+build scripts, proc macros and cargo-config linker it executes) and input
+acquisition (`git`, `gh`) run on this host, as you, with your files,
+processes, sockets and network; and the runtime namespace can still read most
+host files and connect to pathname sockets outside the masks. A branch that
+changes build-time code relative to its merge-base with `main` is refused
+before anything is built unless you pass --allow-build-changes after
+reviewing those changes; the merge-base's own build-time code runs on every
+build. Run unreviewed or external code only in a disposable VM or as a
+dedicated user holding no credentials. See docs/develop/cross-version-harness.md.";
+
 /// CLAUDE.md rule 12's cross-version contract check, as a scripted PTY driver.
 #[derive(Parser, Debug)]
 #[command(
     name = "xtask-cross-version",
-    about = "Reproduce and verify CLAUDE.md rule 12's cross-version manual test for a branch"
+    about = "Reproduce and verify CLAUDE.md rule 12's cross-version manual test for a branch",
+    after_help = TRUST_BOUNDARY
 )]
 struct Opts {
     /// The branch under test — the "new" side. Fetched from `origin` into the
@@ -159,7 +185,7 @@ struct Opts {
     #[arg(long, value_enum, default_value_t = ModeArg::SandboxSockets)]
     endpoint_mode: ModeArg,
 
-    /// Unset `XDG_RUNTIME_DIR` for every process in the run.
+    /// Unset `XDG_RUNTIME_DIR` for every process of the runtime scenario.
     ///
     /// This is a whole failure mode of its own for a change that moves the
     /// endpoint path in the FALLBACK case only (issue #1121): with
@@ -174,6 +200,17 @@ struct Opts {
     /// always pinned explicitly.
     #[arg(long)]
     experimental: bool,
+
+    /// Build a branch that changes build-time code relative to its merge-base
+    /// with `main` of `--repo`.
+    ///
+    /// Without it such a branch is refused before `cargo build` runs, naming
+    /// the changed build-time files. `cargo build` runs on the host, outside
+    /// the namespace, so the branch's build scripts, proc macros and cargo
+    /// configuration would execute as you. Review those files first; the
+    /// evidence file records that you opted in and which files changed.
+    #[arg(long)]
+    allow_build_changes: bool,
 
     /// Skip `cargo build` and use whatever is already at the target dir. For
     /// iterating on the harness itself. The evidence file then says the binary
@@ -421,75 +458,189 @@ fn repo_root() -> Result<PathBuf, String> {
     Ok(PathBuf::from(out.trim()))
 }
 
-/// Fetch (or reuse) the previous release's published Linux binary, assert it
-/// reports exactly that version, and record its SHA-256.
+/// The release asset the old side is fetched as.
+const RELEASE_ASSET: &str = "dot-agent-deck-linux-amd64";
+
+/// The SHA-256 a release's `checksums.txt` publishes for `asset`.
+///
+/// The file is `task checksums`' `shasum -a 256` output: one `<hex>  <name>`
+/// line per asset (`*<name>` in binary mode). Exactly one line must name the
+/// asset, with a 64-digit hex digest; anything else is refused rather than
+/// guessed at, because this is what authorises executing the file.
+fn published_sha256(checksums: &str, asset: &str) -> Result<String, String> {
+    let mut found = Vec::new();
+    for line in checksums.lines() {
+        let Some((digest, name)) = line.trim_end().split_once(char::is_whitespace) else {
+            continue;
+        };
+        let name = name.trim_start();
+        let name = name.strip_prefix('*').unwrap_or(name);
+        if name == asset {
+            found.push(digest.to_ascii_lowercase());
+        }
+    }
+    match found.as_slice() {
+        [one] if one.len() == 64 && one.chars().all(|c| c.is_ascii_hexdigit()) => Ok(one.clone()),
+        [one] => Err(format!(
+            "the release's `checksums.txt` names `{asset}` with {one:?}, which is not a SHA-256"
+        )),
+        [] => Err(format!(
+            "the release's `checksums.txt` has no entry for `{asset}`"
+        )),
+        _ => Err(format!(
+            "the release's `checksums.txt` names `{asset}` {} times",
+            found.len()
+        )),
+    }
+}
+
+/// A file's SHA-256, by `sha256sum` with an empty environment.
+fn sha256_of(path: &Path) -> Result<String, String> {
+    let sum = must_run(
+        Command::new("sha256sum")
+            .arg(path)
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin"),
+        "sha256sum",
+    )?;
+    let sha = sum
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if sha.len() != 64 || !sha.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(format!(
+            "could not read a SHA-256 for {}: {sum:?}",
+            path.display()
+        ));
+    }
+    Ok(sha)
+}
+
+/// Fetch (or reuse) the previous release's published Linux binary and require
+/// its SHA-256 to be the one the release's own `checksums.txt` publishes.
+///
+/// Nothing here executes it. Its `--version` is checked by the inner half,
+/// inside the namespace, against [`isolation::Plan::old_version`] — the old
+/// check ran it here, on the host, before anything had authenticated it.
+///
+/// `checksums.txt` is downloaded again on every run rather than cached beside
+/// the binary, so a cached binary is always compared with what the release
+/// publishes now, not with a copy that sits in the same writable directory.
+/// What a match establishes is that the file is the asset the release in
+/// `--repo` published; it says nothing about whether that repository is one to
+/// trust. `--old-binary` has no published checksum at all and is recorded as
+/// not checksum-verified.
 fn old_binary(
     opts: &Opts,
     previous: &str,
     releases: &Path,
     ev: &mut Evidence,
 ) -> Result<PathBuf, String> {
-    let bin = if let Some(explicit) = &opts.old_binary {
-        explicit.clone()
-    } else {
-        let dir = releases.join(previous);
-        std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
-        let bin = dir.join("dot-agent-deck-linux-amd64");
-        if !bin.exists() {
-            must_run(
-                Command::new("gh").args([
-                    "release",
-                    "download",
-                    previous,
-                    "--repo",
-                    &opts.repo,
-                    "-p",
-                    "dot-agent-deck-linux-amd64",
-                    "-D",
-                    &dir.to_string_lossy(),
-                ]),
-                &format!("gh release download {previous}"),
-            )?;
-        }
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755))
-            .map_err(|e| format!("chmod {}: {e}", bin.display()))?;
-        bin
-    };
-    let bin = std::fs::canonicalize(&bin).map_err(|e| format!("{}: {e}", bin.display()))?;
-    // Both are static prints; they still get an empty environment.
-    let reported = must_run(
-        Command::new(&bin).arg("--version").env_clear(),
-        "old binary --version",
-    )?;
-    let want = format!("dot-agent-deck {}", previous.trim_start_matches('v'));
-    if opts.old_binary.is_none() && reported.trim() != want {
-        return Err(format!(
-            "the downloaded {previous} binary reports {:?}, not exactly {want:?} — refusing to run \
-             a cross-version check against an unknown build",
-            reported.trim()
-        ));
-    }
-    let sum = must_run(
-        Command::new("sha256sum")
-            .arg(&bin)
-            .env_clear()
-            .env("PATH", "/usr/bin:/bin"),
-        "sha256sum of the old binary",
-    )?;
-    let sha = sum.split_whitespace().next().unwrap_or("").to_string();
-    if sha.len() != 64 {
-        return Err(format!(
-            "could not read a SHA-256 for {}: {sum:?}",
+    if let Some(explicit) = &opts.old_binary {
+        let bin =
+            std::fs::canonicalize(explicit).map_err(|e| format!("{}: {e}", explicit.display()))?;
+        let sha = sha256_of(&bin)?;
+        ev.preflight.push(format!(
+            "old binary `{}` is caller-supplied (`--old-binary`): **NOT checksum-verified** — no \
+             release publishes a checksum for it; SHA-256 `{sha}`, recorded rather than checked. \
+             Its `--version` is recorded inside the namespace and not enforced",
             bin.display()
         ));
+        return Ok(bin);
     }
+    let dir = releases.join(previous);
+    std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+    let bin = dir.join(RELEASE_ASSET);
+    let cached = bin.exists();
+    if !cached {
+        must_run(
+            Command::new("gh").args([
+                "release",
+                "download",
+                previous,
+                "--repo",
+                &opts.repo,
+                "-p",
+                RELEASE_ASSET,
+                "-D",
+                &dir.to_string_lossy(),
+            ]),
+            &format!("gh release download {previous} {RELEASE_ASSET}"),
+        )?;
+    }
+    must_run(
+        Command::new("gh").args([
+            "release",
+            "download",
+            previous,
+            "--repo",
+            &opts.repo,
+            "-p",
+            "checksums.txt",
+            "-D",
+            &dir.to_string_lossy(),
+            "--clobber",
+        ]),
+        &format!("gh release download {previous} checksums.txt"),
+    )?;
+    let checksums_file = dir.join("checksums.txt");
+    let checksums = std::fs::read_to_string(&checksums_file)
+        .map_err(|e| format!("read {}: {e}", checksums_file.display()))?;
+    let published = published_sha256(&checksums, RELEASE_ASSET)
+        .map_err(|e| format!("{previous} of {}: {e} — refusing to run it", opts.repo))?;
+    let bin = std::fs::canonicalize(&bin).map_err(|e| format!("{}: {e}", bin.display()))?;
+    let sha = sha256_of(&bin)?;
+    if sha != published {
+        return Err(format!(
+            "`{}` has SHA-256 `{sha}`, but release {previous} of {} publishes `{published}` for \
+             `{RELEASE_ASSET}` in its `checksums.txt` — refusing to run it. {}",
+            bin.display(),
+            opts.repo,
+            if cached {
+                "The cached copy is not the published asset; delete it and re-run to download it \
+                 again, after finding out what changed it."
+            } else {
+                "The download is not the published asset."
+            }
+        ));
+    }
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755))
+        .map_err(|e| format!("chmod {}: {e}", bin.display()))?;
     ev.preflight.push(format!(
-        "old binary `{}` reports `{}`; SHA-256 `{sha}`",
+        "old binary `{}` ({}) matched release {previous}'s published checksum: SHA-256 `{sha}` \
+         is the `{RELEASE_ASSET}` entry of that release's `checksums.txt` in `{}`, downloaded \
+         for this run. Not executed outside the namespace; its `--version` is checked inside",
         bin.display(),
-        reported.trim()
+        if cached {
+            "cached from an earlier run"
+        } else {
+            "downloaded by this run"
+        },
+        opts.repo
     ));
     Ok(bin)
+}
+
+/// `cargo`, run in `dir` on the host with the caller's toolchain environment —
+/// the devbox/nix compiler wrappers need dozens of variables — minus anything
+/// credential-shaped, the deck's own pane variables and the git location
+/// variables. A denylist, so narrower than the run's own allowlist, and not a
+/// security boundary: whatever cargo executes runs as the operator.
+fn host_cargo(dir: &Path) -> Command {
+    let mut cmd = Command::new("cargo");
+    cmd.current_dir(dir);
+    for (k, _) in std::env::vars_os() {
+        let name = k.to_string_lossy();
+        if sandbox::credential_like(&name)
+            || name.starts_with("DOT_AGENT_DECK_")
+            || GIT_LOCATION_VARS.contains(&name.as_ref())
+        {
+            cmd.env_remove(&k);
+        }
+    }
+    cmd
 }
 
 /// Point the standalone build clone at `origin/<branch>` and build it.
@@ -506,10 +657,18 @@ fn old_binary(
 ///
 /// Detached, always: the branches this sweeps are being verified, not changed,
 /// and a detached HEAD cannot commit to one by accident.
+///
+/// Between the checkout and the build sits the build-time gate
+/// (`buildgate.rs`): `main` of `--repo` is fetched too, and a branch whose diff
+/// from their merge-base touches build-time code is refused here, before
+/// `cargo build` runs, unless `--allow-build-changes`. A gate that could not be
+/// evaluated refuses too. `scratch` is where the merge-base's tree is extracted
+/// for `cargo metadata`, and removed again.
 fn new_binary(
     opts: &Opts,
     clone: &Path,
     target_dir: &Path,
+    scratch: &Path,
     ev: &mut Evidence,
 ) -> Result<(PathBuf, String), String> {
     let url = format!("https://github.com/{}.git", opts.repo);
@@ -584,6 +743,16 @@ fn new_binary(
         dirty("before checkout")?;
     }
     must_run(
+        git(clone).args(["fetch", "--quiet", &url, buildgate::BASE_BRANCH]),
+        "git fetch main (the build-time gate's base)",
+    )?;
+    let base_sha = must_run(
+        git(clone).args(["rev-parse", "FETCH_HEAD"]),
+        "git rev-parse FETCH_HEAD (main)",
+    )?
+    .trim()
+    .to_string();
+    must_run(
         git(clone).args(["fetch", "--quiet", &url, &opts.branch]),
         "git fetch <branch>",
     )?;
@@ -607,30 +776,48 @@ fn new_binary(
     }
     dirty("after checkout")?;
     ev.preflight.push(format!(
-        "branch source: standalone clone {} (its own `.git`; nothing written into the operator's \
-         repository), detached at {sha}",
+        "branch source: standalone clone {} (its own `.git`, not a linked worktree), detached at \
+         {sha}",
         clone.display()
     ));
 
+    println!(
+        "xver: build-time gate — comparing `{}` with its merge-base with `origin/{}`",
+        opts.branch,
+        buildgate::BASE_BRANCH
+    );
+    let (cmp, changes) = buildgate::evaluate(
+        clone,
+        &opts.repo,
+        &base_sha,
+        &sha,
+        scratch,
+        &git,
+        &host_cargo,
+    )?;
+    let gate = buildgate::decide(
+        &opts.branch,
+        &changes,
+        &cmp,
+        opts.allow_build_changes,
+        opts.skip_build,
+    )?;
+    println!("xver: {gate}");
+    ev.build_time = gate.clone();
+    ev.preflight.push(gate);
+
     if !opts.skip_build {
-        // The branch's build scripts run here, outside the namespace. They get
-        // the caller's toolchain environment — the devbox/nix compiler wrappers
-        // need dozens of variables — minus anything credential-shaped and the
-        // deck's own pane variables. A denylist, so narrower than the run's own
-        // allowlist; the harness doc says so.
-        let mut cmd = Command::new("cargo");
-        cmd.current_dir(clone)
-            .env("CARGO_TARGET_DIR", target_dir)
-            .args(["build", "--locked", "--bin", "dot-agent-deck"]);
-        for (k, _) in std::env::vars_os() {
-            let name = k.to_string_lossy();
-            if sandbox::credential_like(&name)
-                || name.starts_with("DOT_AGENT_DECK_")
-                || GIT_LOCATION_VARS.contains(&name.as_ref())
-            {
-                cmd.env_remove(&k);
-            }
-        }
+        // The branch's build scripts, proc macros and cargo-config linker run
+        // here, outside the namespace, as the operator (`host_cargo`). The gate
+        // above is what stands between a branch's own build-time code and this
+        // line; mainline's runs regardless.
+        let mut cmd = host_cargo(clone);
+        cmd.env("CARGO_TARGET_DIR", target_dir).args([
+            "build",
+            "--locked",
+            "--bin",
+            "dot-agent-deck",
+        ]);
         must_run(&mut cmd, "cargo build --locked --bin dot-agent-deck")?;
     }
     let bin = target_dir.join("debug").join("dot-agent-deck");
@@ -832,14 +1019,15 @@ fn run_one(
                     .into()
             }
         },
-        namespace: "one private bubblewrap namespace for every deck process of the run — \
+        namespace: "one private bubblewrap namespace for every deck process of the runtime \
+                    scenario (the build and input acquisition ran on the host) — \
                     private mount, PID, network, IPC, UTS and user namespaces; BOTH endpoint \
                     roots masked (`/tmp` and `/run/user/<uid>` are sandbox directories), \
                     `/var/tmp` masked, the operator's home an empty tmpfs, the rest of `/` \
                     bound read-only; see the Isolation section for what was measured"
             .into(),
         xdg_runtime_dir: if opts.unset_xdg_runtime_dir {
-            "UNSET for every process in the run".into()
+            "UNSET for every process of the runtime scenario".into()
         } else {
             format!(
                 "`{}` — the host's spelling, which inside the namespace is the sandbox's `run-user`",
@@ -893,7 +1081,7 @@ fn run_one(
 
     println!("xver ({}): inputs", direction.name());
     let old_src = old_binary(opts, &previous.tag, &releases, &mut ev)?;
-    let (new_src, head_sha) = new_binary(opts, &clone, &target_dir, &mut ev)?;
+    let (new_src, head_sha) = new_binary(opts, &clone, &target_dir, &runs_root, &mut ev)?;
     ev.head_sha = head_sha;
 
     let slug: String = opts
@@ -964,6 +1152,10 @@ fn run_one(
             extra_env,
             env,
             matrices,
+            old_version: opts
+                .old_binary
+                .is_none()
+                .then(|| format!("dot-agent-deck {}", previous.tag.trim_start_matches('v'))),
             masks: isolation::masks_for(&sb, uid)?,
             masked_home: isolation::home_to_mask(),
             outer_mnt_ns: outer_mnt.clone(),
@@ -1541,6 +1733,62 @@ mod tests {
                     "{d:?}"
                 );
             }
+        }
+    }
+
+    const CHECKSUMS: &str = "\
+6e0d67bea338fac639a66ce4c1cf2e31ef458c55bfc568d51a76a6aa3aaa307f  dot-agent-deck-darwin-amd64
+86ea39485067afc2b58bf0c53bb19fdae9ccf43288bac8c6cc3ef5707c6def87  dot-agent-deck-linux-amd64
+5ad0d21594739a56f7040dd55ddad30a994f7a0f7c29df6754608bc6656c5829  dot-agent-deck-linux-arm64
+";
+
+    #[test]
+    fn the_published_checksum_is_the_one_line_naming_the_asset_exactly() {
+        assert_eq!(
+            published_sha256(CHECKSUMS, RELEASE_ASSET).as_deref(),
+            Ok("86ea39485067afc2b58bf0c53bb19fdae9ccf43288bac8c6cc3ef5707c6def87"),
+            "not the arm64 line beside it"
+        );
+        let binary_mode = "86EA39485067AFC2B58BF0C53BB19FDAE9CCF43288BAC8C6CC3EF5707C6DEF87 *dot-agent-deck-linux-amd64\n";
+        assert_eq!(
+            published_sha256(binary_mode, RELEASE_ASSET).as_deref(),
+            Ok("86ea39485067afc2b58bf0c53bb19fdae9ccf43288bac8c6cc3ef5707c6def87"),
+            "`shasum -b`'s `*name` and an upper-case digest"
+        );
+    }
+
+    #[test]
+    fn a_missing_duplicated_or_malformed_checksum_entry_is_refused() {
+        let missing = "6e0d67bea338fac639a66ce4c1cf2e31ef458c55bfc568d51a76a6aa3aaa307f  dot-agent-deck-linux-amd64.sig\n";
+        let err = published_sha256(missing, RELEASE_ASSET).expect_err("no exact entry");
+        assert!(err.contains("no entry"), "{err}");
+        let twice = format!("{CHECKSUMS}{CHECKSUMS}");
+        let err = published_sha256(&twice, RELEASE_ASSET).expect_err("ambiguous");
+        assert!(err.contains("2 times"), "{err}");
+        let short = "86ea3948  dot-agent-deck-linux-amd64\n";
+        let err = published_sha256(short, RELEASE_ASSET).expect_err("not a digest");
+        assert!(err.contains("not a SHA-256"), "{err}");
+        assert!(published_sha256("", RELEASE_ASSET).is_err());
+    }
+
+    #[test]
+    fn build_changes_are_refused_by_default_and_the_help_carries_the_trust_boundary() {
+        let opts = Opts::parse_from(["xver", "--branch", "b"]);
+        assert!(!opts.allow_build_changes, "the opt-in is off unless given");
+        let opts = Opts::parse_from(["xver", "--branch", "b", "--allow-build-changes"]);
+        assert!(opts.allow_build_changes);
+        use clap::CommandFactory;
+        let help = Opts::command().render_help().to_string();
+        for needle in [
+            "TRUST BOUNDARY",
+            "NOT an untrusted-code sandbox",
+            "--allow-build-changes",
+            "disposable VM",
+        ] {
+            assert!(
+                help.contains(needle),
+                "{needle:?} missing from --help:\n{help}"
+            );
         }
     }
 

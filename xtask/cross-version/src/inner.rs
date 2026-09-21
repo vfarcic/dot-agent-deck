@@ -183,6 +183,34 @@ fn body(plan: &Plan, sb: &Sandbox, ctl: &mut ctl::Client, ev: &mut Evidence) -> 
 
     let old_bin = sb.old_bin();
     let new_bin = sb.new_bin(plan.direction);
+    // The old binary's first execution anywhere in the run, and it is here:
+    // the outer half only compared its SHA-256 with the release's published
+    // `checksums.txt`. Running it inside means that even an asset that matched
+    // a hostile release's checksum does its first thing in this namespace.
+    let reported = output_ok(
+        deck(&old_bin, &plan.env, &sb.project, &["--version"])?,
+        "old binary --version",
+    )?;
+    let reported = reported.trim();
+    match &plan.old_version {
+        Some(want) if reported != want => {
+            return Err(Abort::Scenario(format!(
+                "the {} binary reports {reported:?} from `--version`, not exactly {want:?} — \
+                 refusing to run a cross-version check against an unknown build",
+                plan.previous
+            )));
+        }
+        Some(_) => ev.preflight.push(format!(
+            "old binary `--version` ran INSIDE the namespace (PID namespace {pid_ns}, the run's \
+             allowlisted environment) and reported `{reported}`, exactly release {}'s version",
+            plan.previous
+        )),
+        None => ev.preflight.push(format!(
+            "old binary `--version` ran INSIDE the namespace (PID namespace {pid_ns}, the run's \
+             allowlisted environment) and reported `{reported}`; `--old-binary`, so recorded and \
+             not enforced"
+        )),
+    }
     // `daemon hello` is a static print that connects to nothing; it still runs
     // here, with the run's environment, so no deck process in a run ever sees
     // the caller's.

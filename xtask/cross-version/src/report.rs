@@ -102,6 +102,10 @@ pub struct Evidence {
     /// target dir: what is known about which commit that binary was built
     /// from. `None` means this run built the branch at `head_sha` itself.
     pub skip_build: Option<String>,
+    /// The build-time gate's answer (`buildgate.rs`): identical to the
+    /// merge-base, or which build-time files the branch changes and why the run
+    /// went ahead anyway. The outer half sets it; `merge_inner` leaves it.
+    pub build_time: String,
     pub started_at: String,
     pub mode: String,
     /// What the run's deck processes executed inside.
@@ -248,7 +252,9 @@ impl Evidence {
                  branch-specific probe named below. Rule 12 prescribes the forward pairing, which \
                  for a daemon-side change runs the previous release's daemon code and never \
                  executes a changed line; this pairing is the one that does. Stand-in agents, not \
-                 real ones: no AGENT credential is used or needed.\n"
+                 real ones: the runtime scenario is given no AGENT credential and invokes no \
+                 agent. The branch build ran on the host, outside the namespace — the \
+                 build-time code row below says whether the branch changed any of it.\n"
             );
             if self.discovery.is_some() {
                 let _ = writeln!(
@@ -270,8 +276,10 @@ impl Evidence {
                  reproduces the scenario the rule describes — a previous-release daemon with live \
                  agents under it, then the branch TUI attached to that same daemon over a PTY with \
                  the build-version prompt declined — and asserts the four tells below. Stand-in \
-                 agents, not real ones: this check is about the TUI↔daemon wire, so no AGENT \
-                 credential is used or needed.\n"
+                 agents, not real ones: this check is about the TUI↔daemon wire, so the runtime \
+                 scenario is given no AGENT credential and invokes no agent. The branch build ran \
+                 on the host, outside the namespace — the build-time code row below says whether \
+                 the branch changed any of it.\n"
             );
         }
 
@@ -288,6 +296,9 @@ impl Evidence {
             );
         } else {
             let _ = writeln!(s, "| branch HEAD | `{}` |", self.head_sha);
+        }
+        if !self.build_time.is_empty() {
+            let _ = writeln!(s, "| build-time code | {} |", self.build_time);
         }
         if self.previous_source.is_empty() {
             let _ = writeln!(s, "| previous release | `{}` |", self.previous);

@@ -25,6 +25,10 @@ serde_json = "1"
 # namespace — hand the plan and the evidence to each other as JSON.
 serde = { version = "1", features = ["derive"] }
 clap = { version = "4", features = ["derive"] }
+# Already a root dependency. The build-time gate (`buildgate.rs`) reads the
+# merge-base's `.cargo/config.toml` and root `Cargo.toml` to find the repository
+# paths they name — the linker script cargo executes, a `[patch]` path.
+toml = "1.0"
 
 # `kill(pid, 0)` for liveness, `kill(pid, SIGTERM)` for the identity-gated
 # teardown, `statvfs` and `getpwuid_r`. Already a workspace dependency.
