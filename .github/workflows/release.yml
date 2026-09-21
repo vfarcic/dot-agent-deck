@@ -285,12 +285,49 @@ jobs:
             fi
           fi
 
+          # GitHub caps a release body at 125,000 CHARACTERS, and enforces it
+          # in two different ways that both bit v0.41.1. `finalize` creating
+          # the release SILENTLY TRUNCATED a 131,299-character body to exactly
+          # 125,000, ending mid-sentence. Then `desktop-publish`, which appends
+          # the unsigned-alpha note afterwards, was rejected outright with
+          # `HTTP 422: body is too long (maximum is 125000 characters)` -- so
+          # the .dmg and .deb shipped with no Gatekeeper instructions and no
+          # `gh attestation verify` command at all.
+          #
+          # So clamp here, deliberately, rather than letting GitHub cut. Two
+          # details matter. CHARACTERS, not bytes: this file is full of em
+          # dashes and arrows, and v0.41.1 was 131,945 bytes but 131,299
+          # characters. And the cut lands on a top-level entry boundary
+          # ("- **"), never mid-sentence, with a pointer to the full text.
+          #
+          # RESERVE is headroom for the note `desktop-publish` appends later.
+          # Without it the clamp passes and that step still fails, which is the
+          # half of v0.41.1 that actually cost users something.
+          python3 - "${RUNNER_TEMP}/release-body.md" <<'CLAMP'
+          import sys
+          LIMIT, RESERVE = 125000, 3000
+          p = sys.argv[1]
+          src = open(p, encoding="utf-8").read()
+          if len(src) <= LIMIT - RESERVE:
+              print(f"release body: {len(src)} chars, under the cap")
+              raise SystemExit
+          pointer = ("\n\n---\n\n*These notes are truncated to fit GitHub's 125,000-character "
+                     "limit on a release body. The complete entry is in "
+                     "[CHANGELOG.md](https://github.com/vfarcic/dot-agent-deck/blob/main/CHANGELOG.md).*\n")
+          budget = LIMIT - RESERVE - len(pointer)
+          cut = src.rfind("\n- **", 0, budget)
+          if cut < budget // 2:            # sparse entries: fall back to a whole line
+              cut = src.rfind("\n", 0, budget)
+          out = src[:cut].rstrip() + pointer
+          open(p, "w", encoding="utf-8").write(out)
+          print(f"release body: {len(src)} chars -> {len(out)} after clamping to the 125,000 cap")
+          CLAMP
+
           {
             echo "changelog<<CHANGELOG_EOF"
             cat "${RUNNER_TEMP}/release-body.md"
             echo "CHANGELOG_EOF"
           } >> "$GITHUB_OUTPUT"
-          echo "release body: $(wc -c < "${RUNNER_TEMP}/release-body.md") bytes"
       - name: Upload the release body
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
