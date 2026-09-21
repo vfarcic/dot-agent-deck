@@ -5439,6 +5439,39 @@ fn surface_one_orchestration(
                     None,
                     agent_id,
                 );
+                // Issue #462 — the reference note for all five TUI-side
+                // registrations of these maps; the other four cite it.
+                //
+                // `pane_orchestration_map` is deliberately NOT written
+                // alongside the three below. This is the TUI's `AppState`, and
+                // the TUI does not route. The four functions that call
+                // `delegate_targets` / `orchestrator_for_worker` —
+                // `handle_delegate_with_state`, `handle_work_done`,
+                // `handle_restart_role_with_state` and
+                // `handle_spawn_role_with_state` — have no production caller
+                // outside `src/daemon.rs`, which runs in a separate PROCESS
+                // with its own `AppState` (`run_tui_session` vs
+                // `run_daemon_serve_cli` in `src/main.rs`, the latter reachable
+                // only from the `daemon serve` subcommand; the deck's lazy
+                // spawn fork-execs that subcommand rather than serving
+                // in-process). The daemon registers all four maps together,
+                // through `AppState::register_orchestration_role`. See also the
+                // note in `run_tui`'s render loop recording that
+                // `dispatch_delegate_events` / `feedback_worker_results` moved
+                // daemon-side in PRD #93 round-5.
+                //
+                // Anything that moves routing back TUI-side MUST populate
+                // `pane_orchestration_map` first, and the failure mode if it
+                // does not is SILENT. `delegate_targets` scopes each candidate
+                // with `self.pane_orchestration_map.get(pane_id.as_str()) ==
+                // orchestration`; with every pane absent from the map both
+                // sides are `None`, so the comparison degenerates to
+                // `None == None` — true for EVERY pane. One delegate would fan
+                // out across every orchestration tab at once, and
+                // `orchestrator_for_worker` would resolve by `HashSet`
+                // iteration order. That is the cross-delivery class PRD #140
+                // closed, reintroduced from the other direction, and it would
+                // pass any test that exercises a single orchestration.
                 st.pane_role_map
                     .insert(role.pane_id.clone(), role.role_name.clone());
                 st.pane_cwd_map
@@ -5618,6 +5651,12 @@ fn surface_one_orchestration(
             // Register live role panes + wire the per-pane maps exactly as the
             // reconnect-hydration path does (pane_role_map / pane_cwd_map /
             // orchestrator_pane_ids).
+            //
+            // Issue #462: and, like that path, deliberately NOT
+            // `pane_orchestration_map` — this `AppState` never routes. The full
+            // reasoning, including the `None == None` degeneracy in
+            // `delegate_targets` that a TUI-side router would silently hit, is
+            // on the grow-existing-tab registration earlier in this function.
             for (i, role) in orch_config.roles.iter().enumerate() {
                 if let Some(Some(pane_id)) = role_pane_ids.get(i)
                     && !is_dead_slot_pane_id(pane_id)
@@ -10586,7 +10625,25 @@ fn dispatch_action(
                                         agent_id.clone(),
                                     );
                                 }
-                                // Register pane-to-role and pane-to-cwd mappings for work-done resolution.
+                                // Register pane-to-role and pane-to-cwd
+                                // mappings. This line used to end "for
+                                // work-done resolution" — a leftover from the
+                                // pre-PRD-#93 model, when the TUI drained
+                                // `work_done_events` and resolved them itself.
+                                // The resolution is the DAEMON's now:
+                                // `AppState::handle_work_done` (and
+                                // `handle_delegate`), called from
+                                // `src/daemon.rs` against the daemon's own
+                                // `AppState`.
+                                //
+                                // Issue #462: `pane_orchestration_map` is
+                                // deliberately omitted for exactly that reason
+                                // — this `AppState` never routes. The full
+                                // reasoning, including the `None == None`
+                                // degeneracy in `delegate_targets` that a
+                                // TUI-side router would silently hit, is on the
+                                // first of these registrations in
+                                // `surface_one_orchestration`.
                                 for (i, role) in orch_config.roles.iter().enumerate() {
                                     st.pane_role_map
                                         .insert(role_pane_ids[i].clone(), role.name.clone());
@@ -12760,6 +12817,13 @@ pub fn run_tui(
                             None,
                         );
                     }
+                    // Issue #462: `pane_orchestration_map` is deliberately not
+                    // written beside the three maps below — the reconnect
+                    // rebuild runs in the TUI process, which never routes. The
+                    // full reasoning, including the `None == None` degeneracy
+                    // in `delegate_targets` that a TUI-side router would
+                    // silently hit, is on the first of these registrations in
+                    // `surface_one_orchestration`.
                     for (i, role) in orch_config.roles.iter().enumerate() {
                         if let Some(Some(pane_id)) = role_pane_ids.get(i) {
                             // Symptom 2 fix
@@ -12944,6 +13008,15 @@ pub fn run_tui(
                                             agent_id.clone(),
                                         );
                                     }
+                                    // Issue #462: `pane_orchestration_map` is
+                                    // deliberately omitted here too — the
+                                    // daemon-empty snapshot restore runs in the
+                                    // TUI process, which never routes. The full
+                                    // reasoning, including the `None == None`
+                                    // degeneracy in `delegate_targets` that a
+                                    // TUI-side router would silently hit, is on
+                                    // the first of these registrations in
+                                    // `surface_one_orchestration`.
                                     for (i, role) in orch_config.roles.iter().enumerate() {
                                         st.pane_role_map
                                             .insert(role_pane_ids[i].clone(), role.name.clone());
