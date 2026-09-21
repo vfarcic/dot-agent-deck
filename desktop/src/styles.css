@@ -486,6 +486,14 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .status-label.status-passed { color: var(--green); background: var(--green-soft); }
 .status-label.status-failed { color: var(--red); background: var(--red-soft); }
 .status-label.status-waiting, .status-label.status-queued { color: var(--amber); background: var(--amber-soft); }
+/*
+  Issue #1143 — a HELD record's status is a past reading, so it is drawn as one:
+  the live colour goes and the mark hollows out. Written after the per-status
+  rules above so it wins on source order at equal specificity, which is what
+  lets one selector neutralise all five of them rather than restating each.
+*/
+.status-label.is-held { color: var(--faint); background: var(--paper-sunken-strong); }
+.agent-state-mark.is-held { color: var(--faint); background: transparent; }
 .agent-attempt { width: 38px; height: 33px; display: grid; grid-template-columns: 1fr; place-items: center; border-left: 1px solid var(--line); }
 .agent-attempt span { color: var(--faint); font-size: 7px; letter-spacing: .08em; }
 .agent-attempt strong { font-family: "JetBrains Mono", monospace; font-size: 11px; }
