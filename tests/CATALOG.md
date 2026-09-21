@@ -2085,7 +2085,7 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Layer:** L1/synthetic (a real attach socket served by the production `serve_attach_with_counter` over a caller-owned `AppState`, with real stand-in children under `AgentPtyRegistry`).
 - **Agent:** none (two `sleep 30` stand-ins occupying the role panes).
 - **Asserts:** the reply is `ok = false` carrying a structured `stop_refusal`; its `reason` is `live-orchestrations`; both live roles cross with the orchestrator flagged and a stable order; the managed agent ids cross too; the multi-line `message` names the panes, says the loss is PERMANENT rather than a termination, points at `--force` and ends in a newline; the one-line `summary` is newline-free, still points at `--force`, and is byte-identical to `error` so a client reading only `error` sees the same sentence. Then the safety property itself: the registry is UNDRAINED afterwards and the daemon still serves, refusing the same way on a second ask — a reply that says no is worth nothing if the daemon tore itself down while saying it.
-- **Does not assert:** the `--force` override (`lifecycle/wire-stop/004`); that the refusal policy matches the CLI's (`daemon_stop::tests::wire_stop_refusal_agrees_with_the_cli_refusal`, which drives the force matrix without a socket); anything about the unguarded `KIND_SHUTDOWN` frame, whose narrowing is issue #1109's open question.
+- **Does not assert:** the `--force` override (`lifecycle/wire-stop/004`); that the refusal policy matches the CLI's (`daemon_stop::tests::wire_stop_refusal_agrees_with_the_cli_refusal`, which drives the force matrix without a socket); anything about the unguarded `KIND_SHUTDOWN` frame, which issue #1109 settled stays unguarded and gained a disclosure instead (`lifecycle/teardown-inventory/001`).
 - **Platform coverage:** linux+mac (`#![cfg(unix)]` — the attach socket is Unix-domain; Windows port tracked by #164).
 
 ##### lifecycle/wire-stop/002 — With no roles registered, `StopDaemon` refuses as the managed-AGENTS guard and does not claim an orchestration is at stake (issue #1049).
@@ -2196,6 +2196,31 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** the exact exit status (`143`), since a shutdown fast enough to finish before the second signal exits `0` and both outcomes satisfy "the daemon does not linger".
 - **Regression origin:** installing a handler replaces the default disposition process-wide, so once the first signal is consumed every later SIGTERM would be absorbed by a stream nobody reads — removing the `pkill` escape hatch that the pre-handler behaviour always provided.
 - **Platform coverage:** linux+mac (Unix signals).
+
+##### lifecycle/sigterm/003 — A signal shutdown names the agents and orchestration roles it is destroying (issue #1109).
+- **Layer:** L2 (a real `daemon serve` with file logging; one agent started over the real attach socket with an orchestration `TabMembership`, so the production `StartAgent` handler registers a real role; a plain `kill(pid, SIGTERM)`).
+- **Agent:** none (a `sleep 60` stand-in — the disclosure reads the registry and the role maps, neither of which cares what the child is).
+- **Asserts:** after the SIGTERM, `DOT_AGENT_DECK_LOG` contains the counts, the pane id, the role name, the orchestration name and the permanence sentence ("can never delegate again").
+- **Does not assert:** that the daemon REFUSES — it deliberately does not (`docs/develop/daemon-teardown-paths.md`); that the agent process is reaped (`lifecycle/stop/003`); the `KIND_SHUTDOWN` half of the same disclosure, which `lifecycle/teardown-inventory/001` covers without a subprocess.
+- **Regression origin:** #428's occurrence #5 — nine panes across three dispatched units stopped by a stray `pkill -f "daemon serve"`, with the shutdown line naming none of them.
+- **Platform coverage:** linux+mac (Unix signals).
+
+#### lifecycle/teardown-inventory
+
+##### lifecycle/teardown-inventory/001 — An UNGUARDED daemon teardown names every agent and every orchestration role it is destroying (issue #1109).
+- **Layer:** L1/synthetic (a real `AgentPtyRegistry` holding three live `sleep 30` stand-ins plus a real `AppState` carrying role registrations made through the production `register_orchestration_role`; the daemon's own `tracing` output is captured through a thread-local subscriber and asserted).
+- **Agent:** none (stand-ins — the disclosure reads the registry and the role maps, neither of which cares what the child is).
+- **Asserts:** `daemon_stop::log_teardown_inventory` logs one line naming the teardown path, the count of agents and of role registrations, every pane id (role-holding and not), the role names, which pane is the orchestrator, the orchestration name, and that the registrations are held in memory only so a survivor "can never delegate again".
+- **Does not assert:** that a teardown REFUSES — issue #1109 settled that the signal path and `KIND_SHUTDOWN` deliberately do not (`docs/develop/daemon-teardown-paths.md`), and the refusal the guarded paths do carry is `orchestration/orphan/003` and `lifecycle/wire-stop/001`; the exact wording of the per-role rendering (`daemon_stop::tests::teardown_inventory_renders_roles_exactly_as_the_refusal_does` pins that it is the refusal's own); that the production signal handler and `KIND_SHUTDOWN` handler call it, which is a single visible call site in each and whose signal half `lifecycle/sigterm/001` already proves logs at all.
+- **Regression origin:** #428's occurrence #5 — a stray `pkill -f "daemon serve"` stopped nine panes across three dispatched units and the shutdown line named none of them, so establishing what was lost took log archaeology.
+- **Platform coverage:** linux+mac (the stand-in is a Unix command; the file is `#![cfg(unix)]`).
+
+##### lifecycle/teardown-inventory/002 — The disclosure is emitted BEFORE the drain, because a drained registry reports nothing at stake.
+- **Layer:** L1/synthetic (same fixture, with `shutdown_all` run first).
+- **Agent:** none.
+- **Asserts:** after the registry is drained, the same call logs nothing naming the pane — `agent_records` filters to live agents and `live_orchestration_roles` filters roles by `has_live_pane`, so an inventory taken after the drain reports a destructive teardown as harmless.
+- **Does not assert:** the production call ordering itself (a read of the two call sites); anything about the drain's own behaviour (`agent_pty::tests::shutdown_all_graceful_*`).
+- **Platform coverage:** linux+mac.
 
 #### lifecycle/version
 
