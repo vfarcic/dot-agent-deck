@@ -240,13 +240,15 @@ struct Opts {
 
     /// The branch-specific stimulus a reverse run carries after the four tells.
     ///
-    /// `auto` (the default) selects it from the branch's issue number and falls
-    /// back to `generic`: no stimulus, the four tells plus a `role-set` tell,
-    /// in any endpoint mode — which is how the #1179 negative control runs
-    /// (`--branch main --direction reverse --probe generic --endpoint-mode
-    /// resolved --unset-xdg-runtime-dir`). Probes run in the reverse direction
-    /// only; asking for one explicitly with `--direction forward` is refused
-    /// rather than silently ignored.
+    /// `auto` (the default) selects it from the branch's `dispatch-issue-<n>`
+    /// path component, and refuses the run when it cannot tie the branch to
+    /// exactly one probe — it never falls back. `generic` asks for no stimulus
+    /// on purpose: the four tells plus a `role-set` tell, in any endpoint mode,
+    /// which is how the #1179 negative control runs (`--branch main --direction
+    /// reverse --probe generic --endpoint-mode resolved
+    /// --unset-xdg-runtime-dir`). Probes run in the reverse direction only;
+    /// asking for one explicitly with `--direction forward` is refused rather
+    /// than silently ignored.
     #[arg(long, value_enum, default_value_t = ProbeArg::Auto)]
     probe: ProbeArg,
 }
@@ -288,11 +290,17 @@ enum ProbeArg {
     GitEnv,
 }
 
-/// The probe a run in `direction` carries. Forward runs carry none — they are
-/// rule 12's pairing, whose tells are the four — and an explicit probe there is
-/// refused rather than dropped, so nobody reads a forward evidence file as
-/// having measured one.
-fn select_probe(arg: ProbeArg, branch: &str, direction: Direction) -> Result<Probe, String> {
+/// The probe a run in `direction` carries, and how it was chosen, for the
+/// output and the evidence file. Forward runs carry none — they are rule 12's
+/// pairing, whose tells are the four — and an explicit probe there is refused
+/// rather than dropped, so nobody reads a forward evidence file as having
+/// measured one. In reverse, `auto` either ties the branch to one probe or
+/// refuses ([`Probe::for_branch`]).
+fn select_probe(
+    arg: ProbeArg,
+    branch: &str,
+    direction: Direction,
+) -> Result<(Probe, String), String> {
     let explicit = match arg {
         ProbeArg::Auto => None,
         ProbeArg::Generic => Some(Probe::Generic),
@@ -306,14 +314,26 @@ fn select_probe(arg: ProbeArg, branch: &str, direction: Direction) -> Result<Pro
         ProbeArg::GitEnv => Some(Probe::GitEnv),
     };
     match (direction, explicit) {
-        (Direction::Forward, None | Some(Probe::Generic)) => Ok(Probe::Generic),
+        (Direction::Forward, None | Some(Probe::Generic)) => Ok((
+            Probe::Generic,
+            "forward — rule 12's four tells, no probe".to_string(),
+        )),
         (Direction::Forward, Some(p)) => Err(format!(
             "the {} probe runs in the reverse direction only — pass `--direction reverse` (or \
              `both`); a forward run is rule 12's pairing and asserts the four tells",
             p.name()
         )),
-        (Direction::Reverse, Some(p)) => Ok(p),
-        (Direction::Reverse, None) => Ok(Probe::for_branch(branch)),
+        (Direction::Reverse, Some(p)) => Ok((p, format!("named with `--probe {}`", p.name()))),
+        (Direction::Reverse, None) => {
+            let (p, issue) = Probe::for_branch(branch)?;
+            Ok((
+                p,
+                format!(
+                    "selected by `--probe auto` from the branch's `dispatch-issue-{issue}` \
+                     component"
+                ),
+            ))
+        }
     }
 }
 
@@ -908,8 +928,9 @@ fn run(opts: &Opts) -> Result<bool, String> {
         } else {
             opts.probe
         };
-        let probe = select_probe(arg, &opts.branch, *d)?;
+        let (probe, how) = select_probe(arg, &opts.branch, *d)?;
         if *d == Direction::Reverse {
+            println!("xver: reverse probe `{}` — {how}", probe.name());
             probe.check_config(
                 match opts.endpoint_mode {
                     ModeArg::SandboxSockets => EndpointMode::SandboxSockets,
@@ -918,7 +939,7 @@ fn run(opts: &Opts) -> Result<bool, String> {
                 !opts.unset_xdg_runtime_dir,
             )?;
         }
-        probes.push(probe);
+        probes.push((probe, how));
     }
     // Resolved once, before anything is built, so `both` runs its two halves
     // against the same release even if one is published in between.
@@ -935,8 +956,8 @@ fn run(opts: &Opts) -> Result<bool, String> {
     );
     let mut all_passed = true;
     let mut first_err = None;
-    for (d, probe) in directions.into_iter().zip(probes) {
-        match run_one(opts, &previous, d, probe) {
+    for (d, (probe, how)) in directions.into_iter().zip(probes) {
+        match run_one(opts, &previous, d, probe, how) {
             Ok(passed) => all_passed &= passed,
             Err(e) => {
                 eprintln!("\nxver ({}): {e}", d.name());
@@ -958,6 +979,7 @@ fn run_one(
     previous: &previous::Previous,
     direction: Direction,
     probe: Probe,
+    probe_selection: String,
 ) -> Result<bool, String> {
     let root = repo_root()?;
     let parent = root
@@ -1000,6 +1022,7 @@ fn run_one(
         previous_source: previous.describe(),
         direction,
         probe,
+        probe_selection,
         started_at: utc_now(),
         mode: match mode {
             EndpointMode::SandboxSockets => {
@@ -1637,7 +1660,7 @@ mod tests {
         assert_eq!(opts.direction, DirectionArg::Forward);
         assert_eq!(opts.direction.directions(), vec![Direction::Forward]);
         assert_eq!(
-            select_probe(opts.probe, &opts.branch, Direction::Forward),
+            select_probe(opts.probe, &opts.branch, Direction::Forward).map(|(p, _)| p),
             Ok(Probe::Generic),
             "an existing invocation keeps its meaning: rule 12's four tells"
         );
@@ -1655,18 +1678,18 @@ mod tests {
     }
 
     #[test]
-    fn a_reverse_run_selects_its_probe_from_the_branch() {
+    fn a_reverse_run_selects_its_probe_from_the_branch_and_says_how() {
         assert_eq!(
             select_probe(
                 ProbeArg::Auto,
                 "agent/dispatch-issue-1109",
                 Direction::Reverse
             ),
-            Ok(Probe::TeardownInventory)
-        );
-        assert_eq!(
-            select_probe(ProbeArg::Auto, "some/other-branch", Direction::Reverse),
-            Ok(Probe::Generic)
+            Ok((
+                Probe::TeardownInventory,
+                "selected by `--probe auto` from the branch's `dispatch-issue-1109` component"
+                    .to_string()
+            ))
         );
         assert_eq!(
             select_probe(
@@ -1674,8 +1697,27 @@ mod tests {
                 "agent/dispatch-issue-1109",
                 Direction::Reverse
             ),
-            Ok(Probe::Generic),
+            Ok((Probe::Generic, "named with `--probe generic`".to_string())),
             "an explicit `generic` downgrades on purpose, never silently"
+        );
+    }
+
+    #[test]
+    fn auto_refuses_a_reverse_run_it_cannot_tie_to_one_probe() {
+        for branch in [
+            "some/other-branch",
+            "agent/dispatch-issue-1181-v2",
+            "agent/dispatch-issue-1109-1121",
+            "agent/dispatch-issue-1",
+        ] {
+            let err = select_probe(ProbeArg::Auto, branch, Direction::Reverse)
+                .expect_err("no silent fallback to generic");
+            assert!(err.contains("--probe generic"), "{branch}: {err}");
+        }
+        assert_eq!(
+            select_probe(ProbeArg::Auto, "some/other-branch", Direction::Forward).map(|(p, _)| p),
+            Ok(Probe::Generic),
+            "forward never consults the branch, so `both`'s forward half is unaffected"
         );
     }
 

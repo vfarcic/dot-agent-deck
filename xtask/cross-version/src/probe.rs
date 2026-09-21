@@ -12,13 +12,19 @@
 //! stimulus would have needed to leave the namespace or the environment
 //! allowlist — the stimulus moves, the isolation does not.
 //!
-//! A probe is selected by the branch name (`agent/dispatch-issue-<n>`) or
-//! explicitly with `--probe`, and ONLY runs in the reverse direction: that is
-//! the pairing that executes a daemon-side change. A branch no probe is known
-//! for gets [`Probe::Generic`] — the four tells plus the `role-set` tell, and
-//! no stimulus — and the evidence file says so rather than implying more was
+//! A probe is named with `--probe`, or selected by `--probe auto` from the
+//! branch's `dispatch-issue-<n>` path component ([`Probe::for_branch`]), and
+//! ONLY runs in the reverse direction: that is the pairing that executes a
+//! daemon-side change. Auto never falls back: a branch it cannot tie to one
+//! probe — no such component, more than one, or an issue no probe was written
+//! for — is refused, and `--probe generic` (the four tells plus the `role-set`
+//! tell, and no stimulus) is how to ask for that run on purpose. The evidence
+//! file names the probe and how it was chosen, so it never implies more was
 //! measured.
 
+use std::collections::BTreeSet;
+
+use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 
 use crate::sandbox::{EndpointMode, Sandbox};
@@ -57,24 +63,80 @@ pub enum Probe {
     GitEnv,
 }
 
+/// The path component a dispatched branch carries its issue number in, as
+/// `dispatch-issue-<n>` (`agent/dispatch-issue-1181`).
+const ISSUE_COMPONENT: &str = "dispatch-issue-";
+
+/// The issue number in one path component, when the WHOLE component is
+/// `dispatch-issue-<digits>` — so `dispatch-issue-1181-v2` and
+/// `dispatch-issue-1109-1121` name none.
+fn component_issue(component: &str) -> Option<u32> {
+    let digits = component.strip_prefix(ISSUE_COMPONENT)?;
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok()
+}
+
 impl Probe {
-    /// The probe the branch's issue number selects.
-    pub fn for_branch(branch: &str) -> Probe {
-        let issue = branch
-            .rsplit(|c: char| !c.is_ascii_digit())
-            .next()
-            .and_then(|n| n.parse::<u32>().ok());
-        match issue {
-            Some(1109) => Probe::TeardownInventory,
-            Some(1031) => Probe::LateSessionStart,
-            Some(1082) => Probe::LogEscaping,
-            Some(1121) => Probe::DiscoveryFallback,
-            Some(1182) => Probe::PasteEnvelope,
-            Some(925) => Probe::CrossPaneSessionKey,
-            Some(1129) => Probe::SignalAck,
-            Some(1181) => Probe::GitEnv,
-            _ => Probe::Generic,
-        }
+    /// The probe written for `issue` ([`Probe::origin`]), if any.
+    pub fn for_issue(issue: u32) -> Option<Probe> {
+        Probe::value_variants()
+            .iter()
+            .copied()
+            .find(|p| p.origin().is_some_and(|(_, i)| i == issue))
+    }
+
+    /// The probe `--probe auto` selects for a reverse run of `branch`, with
+    /// the issue it was selected by — or why auto cannot select one, for the
+    /// caller to refuse the run with.
+    ///
+    /// The issue is read from exactly one path component that is exactly
+    /// `dispatch-issue-<n>`, never from wherever digits happen to appear:
+    /// taking the last run of digits selected `generic` for
+    /// `agent/dispatch-issue-1181-v2` and #1121's probe for
+    /// `agent/dispatch-issue-1109-1121` (Greptile, PR #1210). Anything short
+    /// of one component naming an issue a probe was written for is refused
+    /// rather than run as `generic`, because in reverse the branch-specific
+    /// probe is the point: a silent downgrade would produce an evidence file
+    /// that measured nothing the branch changed. Every refusal names each
+    /// issue with a probe whose number the branch name contains anywhere, as a
+    /// hint, never as a selection.
+    pub fn for_branch(branch: &str) -> Result<(Probe, u32), String> {
+        const ASK: &str = "Pass `--probe <name>` for the probe written for this branch's change, \
+                           or `--probe generic` for the four tells plus `role-set` and no \
+                           branch-specific stimulus.";
+        let issues: BTreeSet<u32> = branch.split('/').filter_map(component_issue).collect();
+        let issue = match issues.iter().copied().collect::<Vec<_>>()[..] {
+            [issue] => issue,
+            [] => {
+                return Err(format!(
+                    "`--probe auto` cannot identify the probe for `{branch}`: no path component \
+                     of it is exactly `{ISSUE_COMPONENT}<n>`, the form a dispatched branch carries \
+                     its issue number in.{} {ASK}",
+                    mentioned(branch)
+                ));
+            }
+            ref several => {
+                return Err(format!(
+                    "`--probe auto` cannot identify the probe for `{branch}`: it has more than \
+                     one `{ISSUE_COMPONENT}<n>` component (issues {}).{} {ASK}",
+                    several
+                        .iter()
+                        .map(|i| format!("#{i}"))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    mentioned(branch)
+                ));
+            }
+        };
+        Probe::for_issue(issue).map(|p| (p, issue)).ok_or_else(|| {
+            format!(
+                "`--probe auto` found issue #{issue} in `{branch}`, and no probe was written for \
+                 it.{} {ASK}",
+                mentioned(branch)
+            )
+        })
     }
 
     pub fn name(self) -> &'static str {
@@ -310,6 +372,27 @@ impl Probe {
     }
 }
 
+/// A refusal's hint: each issue with a probe whose number `branch` contains as
+/// a whole run of digits, anywhere. Empty when there is none.
+fn mentioned(branch: &str) -> String {
+    let named: BTreeSet<u32> = branch
+        .split(|c: char| !c.is_ascii_digit())
+        .filter_map(|run| run.parse().ok())
+        .collect();
+    let hints: Vec<String> = named
+        .into_iter()
+        .filter_map(|i| Probe::for_issue(i).map(|p| format!("#{i} (`{}`)", p.name())))
+        .collect();
+    if hints.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " Its name mentions {}: if one is this branch's issue, pass its probe.",
+            hints.join(" and ")
+        )
+    }
+}
+
 pub const ROLE_ALPHA: &str = "alpha";
 pub const ROLE_BETA: &str = "beta";
 pub const ROLE_LATEBOOT: &str = "lateboot";
@@ -374,20 +457,105 @@ mod tests {
 
     #[test]
     fn each_swept_branch_selects_its_own_probe() {
-        for (branch, want) in [
-            ("agent/dispatch-issue-1109", Probe::TeardownInventory),
-            ("agent/dispatch-issue-1031", Probe::LateSessionStart),
-            ("agent/dispatch-issue-1082", Probe::LogEscaping),
-            ("agent/dispatch-issue-1121", Probe::DiscoveryFallback),
-            ("agent/dispatch-issue-1182", Probe::PasteEnvelope),
-            ("agent/dispatch-issue-925", Probe::CrossPaneSessionKey),
-            ("agent/dispatch-issue-1129", Probe::SignalAck),
-            ("agent/dispatch-issue-1181", Probe::GitEnv),
-            ("agent/dispatch-issue-1", Probe::Generic),
-            ("main", Probe::Generic),
+        for (branch, want, issue) in [
+            ("agent/dispatch-issue-1109", Probe::TeardownInventory, 1109),
+            ("agent/dispatch-issue-1031", Probe::LateSessionStart, 1031),
+            ("agent/dispatch-issue-1082", Probe::LogEscaping, 1082),
+            ("agent/dispatch-issue-1121", Probe::DiscoveryFallback, 1121),
+            ("agent/dispatch-issue-1182", Probe::PasteEnvelope, 1182),
+            ("agent/dispatch-issue-925", Probe::CrossPaneSessionKey, 925),
+            ("agent/dispatch-issue-1129", Probe::SignalAck, 1129),
+            ("agent/dispatch-issue-1181", Probe::GitEnv, 1181),
         ] {
-            assert_eq!(Probe::for_branch(branch), want, "{branch}");
+            assert_eq!(Probe::for_branch(branch), Ok((want, issue)), "{branch}");
         }
+    }
+
+    #[test]
+    fn every_probe_with_a_stimulus_or_an_attach_is_reachable_by_its_issue() {
+        for &probe in Probe::value_variants() {
+            match probe.origin() {
+                None => assert_eq!(probe, Probe::Generic),
+                Some((_, issue)) => {
+                    assert_eq!(Probe::for_issue(issue), Some(probe), "{}", probe.name());
+                    assert_eq!(
+                        Probe::for_branch(&format!("agent/dispatch-issue-{issue}")),
+                        Ok((probe, issue))
+                    );
+                }
+            }
+        }
+    }
+
+    /// Greptile's finding on PR #1210: the last run of digits selected
+    /// `generic` here, silently.
+    #[test]
+    fn a_suffixed_branch_is_refused_not_downgraded_to_generic() {
+        let err =
+            Probe::for_branch("agent/dispatch-issue-1181-v2").expect_err("no exact component");
+        assert!(err.contains("exactly `dispatch-issue-<n>`"), "{err}");
+        assert!(
+            err.contains("#1181 (`git-env`)"),
+            "names the likely probe: {err}"
+        );
+        assert!(err.contains("--probe generic"), "{err}");
+    }
+
+    /// Greptile's finding on PR #1210: the last run of digits selected #1121's
+    /// probe here, for what is at least as likely a #1109 branch.
+    #[test]
+    fn a_branch_naming_two_issues_is_refused_not_resolved_to_the_last() {
+        let err = Probe::for_branch("agent/dispatch-issue-1109-1121").expect_err("ambiguous");
+        assert!(
+            err.contains("#1109 (`teardown-inventory`) and #1121 (`discovery-fallback`)"),
+            "{err}"
+        );
+        let err = Probe::for_branch("dispatch-issue-1109/dispatch-issue-1121")
+            .expect_err("two components");
+        assert!(
+            err.contains("more than one") && err.contains("#1109, #1121"),
+            "{err}"
+        );
+        assert!(err.contains("#1109 (`teardown-inventory`)"), "{err}");
+    }
+
+    #[test]
+    fn the_component_is_matched_whole_and_anywhere_in_the_path() {
+        assert_eq!(
+            Probe::for_branch("feature/dispatch-issue-1181/retry"),
+            Ok((Probe::GitEnv, 1181)),
+            "one exact component, whatever surrounds it"
+        );
+        for branch in [
+            "agent/xdispatch-issue-1181",
+            "agent/dispatch-issue-",
+            "agent/dispatch-issue-11a81",
+            "agent/issue-1181",
+        ] {
+            assert!(Probe::for_branch(branch).is_err(), "{branch}");
+        }
+    }
+
+    #[test]
+    fn a_branch_with_no_issue_or_an_issue_without_a_probe_is_refused() {
+        let err = Probe::for_branch("main").expect_err("no issue");
+        assert!(err.contains("no path component"), "{err}");
+        assert!(!err.contains("mentions"), "no hint to give: {err}");
+        let err = Probe::for_branch("agent/dispatch-issue-1").expect_err("no probe for #1");
+        assert!(
+            err.contains("found issue #1") && err.contains("no probe"),
+            "{err}"
+        );
+        assert!(
+            !err.contains("mentions"),
+            "no issue with a probe to hint at: {err}"
+        );
+        let err =
+            Probe::for_branch("agent/dispatch-issue-1/after-1181").expect_err("#1 has no probe");
+        assert!(
+            err.contains("found issue #1") && err.contains("#1181 (`git-env`)"),
+            "{err}"
+        );
     }
 
     #[test]

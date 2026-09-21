@@ -108,6 +108,10 @@ pub struct Evidence {
     /// decides which tells the run must have recorded
     /// ([`expected_tells`](Self::expected_tells)).
     pub probe: Probe,
+    /// How [`probe`](Self::probe) was chosen — named with `--probe`, or
+    /// selected by `--probe auto` from which branch component. Rendered with
+    /// it, for reverse runs only.
+    pub probe_selection: String,
     /// Set, in a reverse run, when the old client was measured unable to find
     /// the branch daemon: what it did instead. See
     /// [`RunVerdict::OldClientCannotDiscover`].
@@ -384,7 +388,16 @@ impl Evidence {
             }
         );
         if reverse {
-            let _ = writeln!(s, "| probe | {} |", self.probe.describe());
+            if self.probe_selection.is_empty() {
+                let _ = writeln!(s, "| probe | {} |", self.probe.describe());
+            } else {
+                let _ = writeln!(
+                    s,
+                    "| probe | {} — {} |",
+                    self.probe.describe(),
+                    self.probe_selection
+                );
+            }
         }
         let _ = writeln!(s, "| started (UTC) | {} |", self.started_at);
         let _ = writeln!(s, "| endpoint mode | {} |", self.mode);
@@ -816,6 +829,16 @@ mod reverse_tests {
             "{out}"
         );
         assert!(out.contains("| probe | `log-escaping`"), "{out}");
+        e.probe_selection =
+            "selected by `--probe auto` from the branch's `dispatch-issue-1082` component".into();
+        let out = e.render();
+        assert!(
+            out.contains(
+                "| probe | `log-escaping` — PR #1169 / issue #1082 — selected by `--probe auto` \
+                 from the branch's `dispatch-issue-1082` component |"
+            ),
+            "the evidence says how the probe was chosen: {out}"
+        );
         assert!(out.contains("## Tells"), "{out}");
         assert!(
             out.contains("When that TUI finds the branch daemon"),
