@@ -2,6 +2,7 @@
 members = [
     ".",
     "desktop/src-tauri",
+    "xtask/cross-version",
     "xtask/docs",
     "xtask/linkage-check",
     "xtask/spec",

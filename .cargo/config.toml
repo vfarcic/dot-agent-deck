@@ -51,6 +51,19 @@ test-e2e-live = "nextest run --workspace --features e2e,e2e-live"
 # linkage. Args after the alias pass through to the binary.
 xtask = "run --quiet --package xtask-linkage-check --"
 
+# CLAUDE.md rule 12's cross-version contract check, scripted
+# (`xtask/cross-version`, operational page `docs/develop/cross-version-harness.md`).
+# `cargo xver -- --branch <branch>` builds that branch in a reusable disk-backed
+# worktree, stands a previous-release daemon up in an isolated sandbox with an
+# orchestration under it, drives the branch TUI against that same daemon over a
+# PTY, and writes a markdown evidence file.
+#
+# Its own binary rather than another arm of the `xtask` multiplexer: it needs
+# `portable-pty` and `vt100`, and putting those in `xtask-linkage-check` would
+# make every `cargo xtask linkage-check` build a terminal emulator it never
+# uses.
+xver = "run --quiet --package xtask-cross-version --"
+
 # Issue #863 — the machine-wide link gate. Concurrent workspace builds from
 # separate dispatch worktrees saturated the shared dev box: `io full avg300=65.95`
 # (for two-thirds of a five-minute window EVERY runnable task was blocked on

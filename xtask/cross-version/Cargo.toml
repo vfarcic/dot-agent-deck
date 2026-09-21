@@ -1,0 +1,29 @@
+[package]
+name = "xtask-cross-version"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# CLAUDE.md rule 12's cross-version contract check, as a scripted PTY driver.
+# Invoked as `cargo xver -- --branch <branch>` (alias in `.cargo/config.toml`).
+# See `docs/develop/cross-version-harness.md`.
+
+[[bin]]
+name = "xtask-cross-version"
+path = "src/main.rs"
+
+[dependencies]
+# Both already root-package dependencies at these versions, so this member
+# pulls no new crate into Cargo.lock. They are the same PTY + terminal-emulator
+# pair the L2 e2e harness (`tests/common/mod.rs`) drives the real binary with.
+portable-pty = "=0.8.1"
+vt100 = "0.16"
+# Already a root dependency. `daemon status --json` and `daemon hello` are the
+# two machine-readable surfaces this harness reads.
+serde_json = "1"
+clap = { version = "4", features = ["derive"] }
+
+# `kill(pid, 0)` for liveness and `kill(pid, SIGTERM)` for the pid-scoped
+# teardown. Already a workspace dependency at this version and gating.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
