@@ -1,4 +1,4 @@
-//! The two pieces of endpoint **I/O** that issue #1121 needed, kept out of
+//! The pieces of endpoint **I/O** that issue #1121 needed, kept out of
 //! [`crate::platform::paths`] so that module's resolvers stay pure.
 //!
 //! - [`ensure_endpoint_dir`] — create the owner-only fallback directory. Called
@@ -6,6 +6,11 @@
 //! - [`client_socket_path`] / [`client_attach_socket_path`] — the **connect**
 //!   side's resolution, which additionally consults the pre-#1121 endpoint
 //!   spelling so a newer build still finds an older build's running daemon.
+//! - [`legacy_hook_alias`] / [`legacy_attach_alias`], [`prepare_legacy_alias`]
+//!   and [`LegacyAlias`] — the **bind** side's mirror image of that read
+//!   (issue #1211): `daemon serve` also binds the pre-#1121 spelling,
+//!   best-effort, so an older build's client still finds a newer build's
+//!   daemon. See [Why the daemon also binds the old spelling](#why-the-daemon-also-binds-the-old-spelling).
 //!
 //! # Why the connect side looks in two places
 //!
@@ -21,16 +26,20 @@
 //! handshake fires and the user gets the prompt they get from any other version
 //! skew.
 //!
-//! **The legacy path is read-only for us: never bound, never created, and
-//! unlinked by no code that knows it is looking at it.** That is what stops the
-//! squatting problem this issue fixes from simply moving to the compatibility
-//! path. A foreign entry planted there can at worst fail
+//! **The connect side treats the legacy path as read-only: it never creates
+//! it, and never unlinks or lazy-spawns at an address it chose by the
+//! compatibility read.** That is what stops the squatting problem this issue
+//! fixes from simply moving to the compatibility path. A foreign entry planted
+//! there can at worst fail
 //! [`crate::platform::fsperm::verify_endpoint_trusted`]'s `lstat` (issue
-//! #1020), and we fall through to the new path and lazy-spawn there.
+//! #1020), and we fall through to the new path and lazy-spawn there. (Until
+//! issue #1211 this paragraph said "never bound" of the whole deck; the daemon
+//! now binds the old spelling as a best-effort alias, and the section below
+//! says why that does not reopen the wedge.)
 //!
-//! The last clause of that sentence used to read "never unlinked" and was one
-//! quantifier too wide. This module never unlinked anything, but the address it
-//! returns used to travel onward as a bare [`std::path::PathBuf`], and
+//! The unlink clause used to read "never unlinked" and was one quantifier too
+//! wide. This module's resolvers never unlinked anything, but the address they
+//! returned used to travel onward as a bare [`std::path::PathBuf`], and
 //! [`crate::daemon_attach::ensure_daemon_running`]'s stale-inode recovery
 //! `remove_file`s whatever address it is handed. A pre-#1121 daemon dying
 //! between our probe and that function's own re-probe therefore got **our own**
@@ -49,6 +58,44 @@
 //! satisfies `resolved == fallback` while being an override, and used to send
 //! us off to consult the legacy path and hand back a daemon the operator never
 //! named.
+//!
+//! # Why the daemon also binds the old spelling
+//!
+//! The compatibility read above covers one pairing: a newer client, an older
+//! daemon. The other pairing is a release that already shipped and cannot be
+//! changed — an older client looks **only** at the flat spelling. Against a
+//! daemon that bound only the per-uid directory it found nothing, concluded no
+//! deck was running, lazy-spawned a daemon of its own, and PRD #89's
+//! auto-restore then rebuilt the saved session under it: a second orchestrator
+//! and a second copy of every worker, in the same project, while the originals
+//! kept running under the newer daemon. Silently — the build-version handshake
+//! runs over a connection, and none was ever made. Measured by the `cargo xver`
+//! harness and reported as issue #1211.
+//!
+//! The daemon is the only side still under our control, so it puts a socket
+//! where that client looks: [`legacy_hook_alias`] and [`legacy_attach_alias`]
+//! name the flat spelling **only on the fallback arm** (the one arm whose
+//! spelling #1121 moved), and `daemon serve` binds each one beside its primary
+//! endpoint. The older client then connects, the handshake runs, and the
+//! existing mismatch prompt decides — exactly what happened before #1121.
+//!
+//! **This does not reintroduce the wedge #1121 removed, and the reason is what
+//! the bind is allowed to do when it fails.** The wedge was that the deck's
+//! *only* endpoint lived at a name a foreign uid could occupy, so an occupied
+//! name meant a deck that could not start. The primary endpoint is still the
+//! per-uid `0o700` directory and is still the only address this build's own
+//! clients prefer. The alias is bound after it, and every way the alias can
+//! fail — an entry the deck does not trust at the path, another daemon already
+//! answering there, a bind or unlink error, a busy lock — is a warning and
+//! nothing else: the daemon carries on serving the primary. So a squatter at
+//! the flat spelling can deny discovery to *obsolete* clients, which they could
+//! always do; they cannot make the deck unusable, which is the property #1121
+//! bought. [`prepare_legacy_alias`] never unlinks an entry it did not verify as
+//! this uid's own stale socket, so a planted entry is left exactly as found.
+//!
+//! **It is a deprecation shim with an end date.** It exists for clients built
+//! before #1121, and issue #1213 removes it no earlier than two minor releases
+//! after the release that first ships it — deleted then, not extended.
 
 use std::path::{Path, PathBuf};
 
@@ -152,8 +199,9 @@ fn ensure_endpoint_dir_in(endpoint: &Path, dir: &Path) -> std::io::Result<()> {
 /// module docs for why, and for what "read-only" means here.
 ///
 /// **Never use this to decide where to bind** — `daemon serve` resolves
-/// [`crate::platform::paths::socket_path`] directly, so the new spelling is the
-/// only one anything creates.
+/// [`crate::platform::paths::socket_path`] directly for its primary endpoint,
+/// and reaches the old spelling only through [`legacy_hook_alias`], as a
+/// best-effort alias beside that primary rather than instead of it.
 pub fn client_socket_path() -> PathBuf {
     client_socket_endpoint().into_path()
 }
@@ -193,7 +241,8 @@ pub fn client_attach_endpoint() -> ResolvedEndpoint {
     resolved
 }
 
-/// The attach endpoint this build **binds**, with no compatibility read at all.
+/// The attach endpoint this build **binds** as its primary, with no
+/// compatibility read at all.
 ///
 /// What the launcher falls back to when a legacy daemon it selected has gone
 /// between resolution and use, and what it re-resolves to after a
@@ -294,6 +343,220 @@ fn endpoint_answers(endpoint: &Path) -> bool {
 #[cfg(unix)]
 fn connect_failure_still_answers(kind: std::io::ErrorKind) -> bool {
     kind == std::io::ErrorKind::TimedOut
+}
+
+// ---------------------------------------------------------------------------
+// The daemon's legacy aliases (issue #1211)
+// ---------------------------------------------------------------------------
+
+/// The pre-#1121 hook spelling `daemon serve` should **also** bind, as a
+/// best-effort alias for clients too old to know the new one — or `None` when
+/// there is none to bind.
+///
+/// Only the fallback arm has one. An explicit `DOT_AGENT_DECK_SOCKET` and an
+/// `$XDG_RUNTIME_DIR` endpoint resolve byte-identically in every build, so an
+/// older client already finds a newer daemon there; the alias exists for the
+/// one arm issue #1121 moved. Decided from [`ResolvedEndpoint::source`] for the
+/// reason [`with_legacy_fallback`] is: an override that happens to spell the
+/// fallback address is still an override.
+///
+/// See the module docs for why binding it does not reopen #1121's wedge.
+pub fn legacy_hook_alias() -> Option<PathBuf> {
+    #[cfg(unix)]
+    {
+        legacy_alias_for(
+            &crate::platform::paths::resolve_socket_path(),
+            crate::platform::paths::legacy_socket_path(),
+        )
+    }
+    #[cfg(windows)]
+    {
+        // Named pipes; no build ever spelled a Windows endpoint any other way.
+        None
+    }
+}
+
+/// [`legacy_hook_alias`]'s sibling for the streaming-attach endpoint — the one
+/// an older TUI actually probes before it decides to lazy-spawn, and so the one
+/// whose absence produced issue #1211's duplicated orchestration.
+pub fn legacy_attach_alias() -> Option<PathBuf> {
+    #[cfg(unix)]
+    {
+        legacy_alias_for(
+            &crate::platform::paths::resolve_attach_socket_path(),
+            crate::platform::paths::legacy_attach_socket_path(),
+        )
+    }
+    #[cfg(windows)]
+    {
+        None
+    }
+}
+
+/// The pure rule behind [`legacy_hook_alias`] / [`legacy_attach_alias`].
+#[cfg(unix)]
+fn legacy_alias_for(primary: &ResolvedEndpoint, legacy: PathBuf) -> Option<PathBuf> {
+    (primary.source() == EndpointSource::Fallback && primary.path() != legacy).then_some(legacy)
+}
+
+/// Why a legacy alias was not bound.
+///
+/// Every variant is a reason to **log and carry on**, never a reason for the
+/// daemon to fail: the alias is a courtesy to obsolete clients, and the primary
+/// endpoint is already bound by the time it is attempted.
+#[derive(Debug)]
+pub enum LegacyAliasSkip {
+    /// An entry the deck does not trust occupies the path — a symlink, a
+    /// regular file, a directory, a socket another uid owns or one at a loose
+    /// mode. This is #1121's squatter, and the entry is left exactly as found.
+    Untrusted(String),
+    /// A daemon already answers at the path — in practice an older build's,
+    /// still running. It keeps the address; this daemon does not compete.
+    Occupied,
+    /// Probing, clearing or binding the path failed — a read-only or missing
+    /// `/tmp`, a lost race for the name, and the like.
+    Io(std::io::Error),
+}
+
+impl std::fmt::Display for LegacyAliasSkip {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Untrusted(reason) => write!(
+                f,
+                "the entry already there is not one the deck trusts ({reason}); it is left as found"
+            ),
+            Self::Occupied => write!(
+                f,
+                "another daemon is already listening there, and it keeps the address"
+            ),
+            Self::Io(source) => write!(f, "{source}"),
+        }
+    }
+}
+
+/// Get `path` ready for a legacy-alias bind: `Ok` when nothing is there, or
+/// when what is there is this uid's own **stale** socket, which this unlinks.
+///
+/// The order is the point. Trust first —
+/// [`crate::platform::fsperm::verify_endpoint_trusted`]'s `lstat`, so a planted
+/// symlink, file, directory or foreign-owned socket is refused before anything
+/// connects to it and is never touched. Then liveness, with the bounded probe
+/// [`endpoint_answers`] uses, and with its reading of a timeout as a live
+/// listener. Only an entry that is trusted **and** refuses the connection is
+/// unlinked, which is the stale-inode recovery every daemon start already does
+/// at its primary address.
+///
+/// In a sticky `/tmp` that unlink cannot reach a stranger's entry even by a
+/// race: the entry verified here is ours, a foreign uid cannot remove it, so
+/// it is still ours when `remove_file` runs.
+///
+/// Blocking (the probe is a bounded synchronous connect), so the daemon runs it
+/// on the blocking pool.
+#[cfg(unix)]
+pub fn prepare_legacy_alias(path: &Path) -> Result<(), LegacyAliasSkip> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => {}
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(source) => return Err(LegacyAliasSkip::Io(source)),
+    }
+    crate::platform::fsperm::verify_endpoint_trusted(path).map_err(LegacyAliasSkip::Untrusted)?;
+    match crate::platform::ipc::IpcClient::connect_timeout(path, PROBE_TIMEOUT) {
+        Ok(_) => Err(LegacyAliasSkip::Occupied),
+        Err(source) if connect_failure_still_answers(source.kind()) => {
+            Err(LegacyAliasSkip::Occupied)
+        }
+        Err(source) if source.kind() == std::io::ErrorKind::ConnectionRefused => {
+            std::fs::remove_file(path).map_err(LegacyAliasSkip::Io)
+        }
+        Err(source) => Err(LegacyAliasSkip::Io(source)),
+    }
+}
+
+/// Windows has no legacy spelling ([`legacy_hook_alias`] is always `None`
+/// there), so there is nothing to prepare.
+#[cfg(windows)]
+pub fn prepare_legacy_alias(_path: &Path) -> Result<(), LegacyAliasSkip> {
+    Err(LegacyAliasSkip::Io(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "Windows endpoints are named pipes and have no pre-#1121 spelling",
+    )))
+}
+
+/// A socket the daemon bound at a pre-#1121 spelling, **unlinked again when
+/// this is dropped** — provided the inode at the path is still the one bound.
+///
+/// The daemon leaves its *primary* sockets on disk at exit, for the next
+/// start's stale-inode recovery to clear. The alias is removed instead, because
+/// nothing guarantees a next start will bind it: a later build without this
+/// shim, or a start whose alias bind is skipped, would leave an older client
+/// probing a dead inode.
+///
+/// The identity check is what keeps the removal from reaching someone else's
+/// socket. An older daemon's startup unlinks whatever sits at its attach path
+/// before binding (v0.41.0's `bind_attach_listener`), so the name can change
+/// hands while this daemon still holds the listener; removing it by name alone
+/// would then delete the older daemon's live endpoint.
+pub struct LegacyAlias {
+    path: PathBuf,
+    /// `(st_dev, st_ino)` of the socket as bound; `None` when it could not be
+    /// read, in which case nothing is removed.
+    #[cfg(unix)]
+    identity: Option<(u64, u64)>,
+}
+
+impl LegacyAlias {
+    /// Record the inode now at `path`, which the caller has **just** bound.
+    pub fn adopt(path: PathBuf) -> Self {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let identity = match std::fs::symlink_metadata(&path) {
+                Ok(md) => Some((md.dev(), md.ino())),
+                Err(source) => {
+                    tracing::warn!(
+                        "legacy endpoint alias {} was bound but could not be read back ({source}); \
+                         it will be left on disk at exit",
+                        path.display()
+                    );
+                    None
+                }
+            };
+            Self { path, identity }
+        }
+        #[cfg(windows)]
+        {
+            Self { path }
+        }
+    }
+
+    /// The address this alias occupies.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for LegacyAlias {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let Some(identity) = self.identity else {
+                return;
+            };
+            match std::fs::symlink_metadata(&self.path) {
+                Ok(md) if (md.dev(), md.ino()) == identity => {
+                    if let Err(source) = std::fs::remove_file(&self.path) {
+                        tracing::warn!(
+                            "could not remove legacy endpoint alias {}: {source}",
+                            self.path.display()
+                        );
+                    }
+                }
+                // Gone already, or now another inode — not ours to remove.
+                _ => {}
+            }
+        }
+    }
 }
 
 #[cfg(all(test, unix))]
@@ -480,6 +743,173 @@ mod tests {
             .mode()
             & 0o777;
         assert_eq!(mode, 0o700, "{} must be owner-only", dir.display());
+    }
+
+    /// Issue #1211: the daemon aliases the old spelling on the fallback arm and
+    /// on no other. An override or an `$XDG_RUNTIME_DIR` endpoint resolves
+    /// byte-identically in every build, so there is no older client to serve —
+    /// and an override that happens to spell the fallback address is still an
+    /// override, for the reason S7 gives above.
+    #[test]
+    fn only_the_fallback_arm_has_a_legacy_alias() {
+        let primary = PathBuf::from("/scratch/dot-agent-deck-4242/attach.sock");
+        let legacy = PathBuf::from("/scratch/dot-agent-deck-attach-4242.sock");
+        assert_eq!(
+            legacy_alias_for(&fallback(&primary), legacy.clone()),
+            Some(legacy.clone())
+        );
+        for source in [EndpointSource::Override, EndpointSource::PlatformDefault] {
+            assert_eq!(
+                legacy_alias_for(
+                    &ResolvedEndpoint::new(primary.clone(), source),
+                    legacy.clone()
+                ),
+                None,
+                "{source:?} resolves identically in older builds and needs no alias"
+            );
+        }
+        assert_eq!(
+            legacy_alias_for(&fallback(&legacy), legacy.clone()),
+            None,
+            "an alias that IS the primary would bind one address twice"
+        );
+    }
+
+    /// Nothing at the path: ready to bind, and nothing is created by the
+    /// preparation itself.
+    #[test]
+    fn an_absent_legacy_path_is_ready_and_left_absent() {
+        let dir = sandbox();
+        let legacy = dir.path().join("legacy.sock");
+        prepare_legacy_alias(&legacy).expect("an absent path is ready");
+        assert!(std::fs::symlink_metadata(&legacy).is_err());
+    }
+
+    /// Our own stale socket — a daemon that died without unlinking, which is
+    /// what every daemon exit leaves at its primary — is cleared, exactly the
+    /// recovery a daemon start does at its primary address.
+    #[test]
+    fn our_own_stale_socket_at_the_legacy_path_is_cleared() {
+        let dir = sandbox();
+        let legacy = dir.path().join("legacy.sock");
+        drop(bind_trusted(&legacy));
+        assert!(
+            std::fs::symlink_metadata(&legacy).is_ok(),
+            "precondition: dropping a std listener leaves its inode"
+        );
+        prepare_legacy_alias(&legacy).expect("a stale socket of ours is ready");
+        assert!(
+            std::fs::symlink_metadata(&legacy).is_err(),
+            "the stale inode is unlinked so the alias can bind"
+        );
+    }
+
+    /// A daemon already answering at the old spelling — in practice an older
+    /// build's — keeps it. Nothing is unlinked.
+    #[test]
+    fn an_answering_daemon_at_the_legacy_path_keeps_it() {
+        let dir = sandbox();
+        let legacy = dir.path().join("legacy.sock");
+        let _live = bind_trusted(&legacy);
+        assert!(matches!(
+            prepare_legacy_alias(&legacy),
+            Err(LegacyAliasSkip::Occupied)
+        ));
+        assert!(
+            endpoint_answers(&legacy),
+            "the live daemon's socket must survive the alias attempt"
+        );
+    }
+
+    /// Issue #1211 property 2, at the level of one path: every squatter shape
+    /// an unprivileged process can plant is refused by the trust check and left
+    /// exactly as found — nothing is connected to, nothing is unlinked.
+    ///
+    /// The symlink is aimed at a LIVE socket of ours on purpose: following it
+    /// would find a daemon that answers, and the refusal has to come from the
+    /// `lstat` first. The foreign-uid shape cannot be planted without a second
+    /// uid; it reaches the same trust check, whose uid clause is pinned by
+    /// `fsperm`'s `endpoint_uid_trust_refuses_a_foreign_uid`, and the daemon
+    /// level of it is `daemon::legacy_alias_tests`.
+    #[test]
+    fn every_squatter_shape_at_the_legacy_path_is_refused_and_left_alone() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = sandbox();
+        let live = dir.path().join("live.sock");
+        let _live = bind_trusted(&live);
+
+        let file = dir.path().join("file.sock");
+        std::fs::write(&file, b"squatter").expect("plant a regular file");
+        let link = dir.path().join("link.sock");
+        std::os::unix::fs::symlink(&live, &link).expect("plant a symlink");
+        let directory = dir.path().join("dir.sock");
+        std::fs::create_dir(&directory).expect("plant a directory");
+        let loose = dir.path().join("loose.sock");
+        drop(std::os::unix::net::UnixListener::bind(&loose).expect("bind a loose socket"));
+        std::fs::set_permissions(&loose, std::fs::Permissions::from_mode(0o666))
+            .expect("loosen its mode");
+
+        for squatted in [&file, &link, &directory, &loose] {
+            let before = std::fs::symlink_metadata(squatted).expect("lstat the squatter");
+            match prepare_legacy_alias(squatted) {
+                Err(LegacyAliasSkip::Untrusted(_)) => {}
+                other => panic!(
+                    "{} must be refused as untrusted, got {other:?}",
+                    squatted.display()
+                ),
+            }
+            let after = std::fs::symlink_metadata(squatted)
+                .unwrap_or_else(|e| panic!("{} was removed: {e}", squatted.display()));
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(
+                (before.ino(), before.mode()),
+                (after.ino(), after.mode()),
+                "{} must be left exactly as found",
+                squatted.display()
+            );
+        }
+        assert_eq!(
+            std::fs::read(&file).expect("read the planted file"),
+            b"squatter"
+        );
+    }
+
+    /// The alias guard removes the socket it bound when dropped…
+    #[test]
+    fn a_legacy_alias_unlinks_its_own_socket_on_drop() {
+        let dir = sandbox();
+        let legacy = dir.path().join("legacy.sock");
+        let listener = bind_trusted(&legacy);
+        let alias = LegacyAlias::adopt(legacy.clone());
+        drop(alias);
+        assert!(
+            std::fs::symlink_metadata(&legacy).is_err(),
+            "the alias must not outlive the daemon that bound it"
+        );
+        drop(listener);
+    }
+
+    /// …and never a socket that has since taken the name. An older daemon's
+    /// startup unlinks whatever sits at its attach path before binding, so the
+    /// name can change hands while this daemon still holds its listener;
+    /// removing by name alone would delete the other daemon's live endpoint.
+    #[test]
+    fn a_legacy_alias_never_unlinks_a_socket_that_replaced_it() {
+        let dir = sandbox();
+        let legacy = dir.path().join("legacy.sock");
+        let ours = bind_trusted(&legacy);
+        let alias = LegacyAlias::adopt(legacy.clone());
+
+        std::fs::remove_file(&legacy).expect("the other daemon unlinks our inode");
+        let _theirs = bind_trusted(&legacy);
+        drop(alias);
+
+        assert!(
+            endpoint_answers(&legacy),
+            "the replacement daemon's socket must survive our shutdown"
+        );
+        drop(ours);
     }
 
     /// A `tempfile::tempdir()` whose mode is restated after creation — see the

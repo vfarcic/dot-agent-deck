@@ -108,10 +108,10 @@ pub enum AttachError {
     // from being gone with every test still green.
     #[error(
         "refusing to lazy-spawn or recover a daemon at {path}: that is the pre-#1121 \
-         compatibility endpoint, which this build reads and never binds. A daemon started \
-         now would bind the current endpoint instead, so unlinking this address and then \
-         polling it would fail after the full start timeout while a healthy daemon was \
-         already running."
+         compatibility endpoint, which this build binds only as a best-effort alias beside \
+         its own. A daemon started now binds the current endpoint first and may not bind \
+         this one at all, so unlinking this address and then polling it could wait out the \
+         full start timeout while a healthy daemon was already running."
     )]
     NotAPrimaryEndpoint { path: PathBuf },
 }

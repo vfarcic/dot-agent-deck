@@ -22,8 +22,9 @@ pub mod dispatch;
 pub mod dispatch_return;
 pub mod embedded_pane;
 // Issue #1121: the endpoint I/O that `platform::paths`' pure resolvers must not
-// do — creating the owner-only fallback directory, and the connect side's
-// read-only probe of the pre-#1121 endpoint spelling.
+// do — creating the owner-only fallback directory, the connect side's
+// read-only probe of the pre-#1121 endpoint spelling, and (issue #1211) the
+// daemon's best-effort alias bind of that same spelling.
 pub mod endpoint_resolve;
 pub mod error;
 pub mod event;

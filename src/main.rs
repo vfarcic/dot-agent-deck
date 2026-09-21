@@ -2675,12 +2675,19 @@ async fn run_daemon_serve_cli() -> ExitCode {
     dot_agent_deck::features::init_and_watch(&launch_project_dir());
     let state = Arc::new(RwLock::new(AppState::default()));
     // Issue #1121: the BIND side, so these are deliberately the pure
-    // resolvers and not `endpoint_resolve`'s client ones — the pre-#1121
-    // fallback spelling is read-only for us and nothing must ever bind it.
+    // resolvers and not `endpoint_resolve`'s client ones — the primary
+    // endpoint is the new spelling, never one the compatibility read chose.
     let path = socket_path();
     let attach_path = attach_socket_path();
 
-    let daemon = Daemon::with_attach(state, attach_path.clone());
+    // Issue #1211: and beside it, best-effort, the pre-#1121 spelling on the
+    // fallback arm, so a client from before #1121 still finds this daemon and
+    // gets the mismatch prompt instead of silently spawning a second one. A
+    // failure to bind it is a warning, never a failure to start.
+    let daemon = Daemon::with_attach(state, attach_path.clone()).with_legacy_aliases(
+        dot_agent_deck::endpoint_resolve::legacy_hook_alias(),
+        dot_agent_deck::endpoint_resolve::legacy_attach_alias(),
+    );
     if let Err(e) = run_daemon_with(&path, daemon).await {
         eprintln!("Daemon error: {e}");
         return ExitCode::FAILURE;

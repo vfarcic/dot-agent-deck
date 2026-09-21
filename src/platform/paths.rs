@@ -1494,18 +1494,21 @@ impl ResolvedEndpoint {
         self.source
     }
 
-    /// Is this an address this build may **bind, create, unlink or lazy-spawn
-    /// at**?
+    /// Is this an address a client of this build may treat as the deck's own
+    /// — **create, unlink, lazy-spawn at, or wait for a daemon to bind**?
     ///
-    /// True for every arm but [`EndpointSource::LegacyCompat`]. The pre-#1121
-    /// spelling is read-only for us, and the reason is sharper than tidiness:
-    /// [`crate::daemon_attach::ensure_daemon_running`]'s stale-inode recovery
-    /// `remove_file`s the address it is given, and its poll loop then waits
-    /// for a freshly-spawned daemon to appear *there* — but a fresh daemon
-    /// binds [`socket_path`], never the legacy spelling. Handed a legacy
+    /// True for every arm but [`EndpointSource::LegacyCompat`]. A client does
+    /// none of those at the pre-#1121 spelling, and the reason is sharper than
+    /// tidiness: [`crate::daemon_attach::ensure_daemon_running`]'s stale-inode
+    /// recovery `remove_file`s the address it is given, and its poll loop then
+    /// waits for a freshly-spawned daemon to appear *there* — but a fresh
+    /// daemon binds [`socket_path`] first and the legacy spelling only as a
+    /// best-effort alias it is allowed to skip (issue #1211). Handed a legacy
     /// address whose daemon had died, it would unlink our own old socket and
-    /// then poll an address nothing will ever bind, for the whole
-    /// [`crate::daemon_attach::DAEMON_START_POLL_TIMEOUT`].
+    /// then poll an address nothing is obliged to bind, for the whole
+    /// [`crate::daemon_attach::DAEMON_START_POLL_TIMEOUT`]. (The daemon's own
+    /// alias bind never goes through a [`ResolvedEndpoint`]; see
+    /// [`crate::endpoint_resolve::prepare_legacy_alias`].)
     pub fn is_primary(&self) -> bool {
         !matches!(self.source, EndpointSource::LegacyCompat)
     }
@@ -1688,17 +1691,23 @@ pub fn fallback_attach_socket_path() -> PathBuf {
 /// `/var/folders/…`, so "fixing" this to use it would look for an old daemon
 /// somewhere it has never bound.
 ///
-/// **Read-only for us: never bound and never created, and unlinked by no code
-/// that knows it is looking at this address.** The only consumer is
-/// [`crate::endpoint_resolve`]'s connect-side discovery, which uses it to find
-/// a daemon from an older build still listening there. That is what keeps the
+/// **Two consumers, and neither can be wedged by what sits here.**
+/// [`crate::endpoint_resolve`]'s connect-side discovery reads it, to find a
+/// daemon from an older build still listening there; and since issue #1211
+/// `daemon serve` also **binds** it, as a best-effort alias beside its primary
+/// endpoint, so an older build's client finds a newer daemon
+/// ([`crate::endpoint_resolve::legacy_hook_alias`]). That is what keeps the
 /// squatting problem this issue fixes from simply moving here: an entry
 /// another uid planted at this path can at worst fail the probe —
 /// [`crate::platform::fsperm::verify_endpoint_trusted`]'s `lstat` refuses it
-/// (issue #1020) — and we fall through to the new path.
+/// (issue #1020) — and we fall through to the new path; and the same entry
+/// costs the daemon its alias and nothing else, because the alias bind is
+/// allowed to fail. The daemon unlinks only a stale socket of this uid's own
+/// here, and at exit only the inode it bound.
 ///
-/// The second half of that sentence used to read "never unlinked", and it was
-/// one quantifier too wide. A legacy address chosen by the compatibility read
+/// Until #1211 the bolded sentence called this path read-only — "never bound
+/// and never created" — and before that it also said "never unlinked", which
+/// was one quantifier too wide. A legacy address chosen by the compatibility read
 /// used to be wrapped in the same [`crate::daemon_client::LocalEndpoint`] that
 /// [`crate::daemon_attach::ensure_daemon_running`]'s stale-inode recovery
 /// takes, so an older daemon dying in the window between the probe and that
@@ -1712,8 +1721,9 @@ pub fn legacy_socket_path() -> PathBuf {
 }
 
 /// The attach endpoint spelling builds before issue #1121 hardcoded:
-/// `/tmp/dot-agent-deck-attach-{uid}.sock`. Literal `/tmp` and read-only for
-/// the same reasons — see [`legacy_socket_path`].
+/// `/tmp/dot-agent-deck-attach-{uid}.sock`. Literal `/tmp`, read by the
+/// connect side and aliased by `daemon serve`, for the same reasons — see
+/// [`legacy_socket_path`].
 #[cfg(unix)]
 pub fn legacy_attach_socket_path() -> PathBuf {
     legacy_endpoint_root().join(format!("dot-agent-deck-attach-{}.sock", current_uid()))
