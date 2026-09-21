@@ -17,7 +17,7 @@
 //! # The scenario, and why each step is in it
 //!
 //! 1. Start the **previous release's** daemon in an isolated sandbox, capturing
-//!    its pid.
+//!    its identity.
 //! 2. Attach the **previous release's** TUI and bring an orchestration up under
 //!    it. *Without live agents the branch TUI silently SIGTERMs the old daemon
 //!    and lazy-spawns its own — the build-version handshake behaving as designed
@@ -32,39 +32,56 @@
 //!    `agent-event --type running` before the delegate check makes the daemon
 //!    classify that pane's agent type as `Pi`, which routes prompt delivery
 //!    differently and makes a delivered delegate briefly look undelivered.*
-//! 6. Tear down **by pid**.
+//! 6. Tear down by **verified identity**, never by name.
+//!
+//! # Two halves
+//!
+//! This file is the OUTER half: it builds the inputs, creates the sandbox and
+//! starts one `bwrap` namespace with this same binary inside it
+//! (`--inner-plan`). The daemon, both TUIs and every deck CLI call are started
+//! by the INNER half (`inner.rs`), inside that namespace, and each client only
+//! after a pre-connect assertion whose host-side part this half answers over
+//! `ctl.rs`. The one deck binary this half runs itself is the old release's
+//! `--version`, a static print, with an empty environment. `isolation.rs` says
+//! what the namespace masks and why.
 //!
 //! `docs/develop/cross-version-harness.md` is the operational page: how to run
-//! it, what it covers, and what it does not.
+//! it, what it isolates, and what it does not cover.
 
+mod ctl;
+mod inner;
+mod isolation;
 mod proc;
 mod pty;
 mod report;
 mod sandbox;
 
+use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode, Output};
-use std::time::Duration;
+use std::process::{Command, ExitCode, Stdio};
+use std::time::{Duration, Instant};
 
 use clap::Parser;
-use report::{Evidence, Verdict};
-use sandbox::{EndpointMode, Sandbox};
+use report::{Evidence, RunVerdict};
+use sandbox::{EndpointMatrix, EndpointMode, EnvSpec, Sandbox};
 
-/// How long to wait for the deck to paint its first frame, for the mismatch
-/// prompt, and for an orchestration to come up. Generous because this box is
-/// shared and a run competing with three dispatched units is the normal case.
-const UI_TIMEOUT: Duration = Duration::from_secs(90);
-/// How long to wait for a single keystroke's consequence.
-const STEP_TIMEOUT: Duration = Duration::from_secs(30);
-/// How long to wait for the daemon's own state to catch up with a CLI call.
-const DAEMON_TIMEOUT: Duration = Duration::from_secs(45);
-/// Settle pause between a key and the next one, where the deck has to redraw in
-/// between and there is nothing specific to poll for.
-const SETTLE: Duration = Duration::from_millis(400);
+/// The hidden flag the outer half passes to the copy of this binary it starts
+/// inside the namespace.
+const INNER_FLAG: &str = "--inner-plan";
 
-const ROLE_ORCHESTRATOR: &str = "orchestrator";
-const ROLE_CODER: &str = "coder";
-const ROLE_REVIEWER: &str = "reviewer";
+/// The eight variables that tell git where a repository is. An ambient one
+/// outranks the `current_dir` a command is given (issue #834), so every git
+/// command this half runs has them removed.
+const GIT_LOCATION_VARS: &[&str] = &[
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_COMMON_DIR",
+    "GIT_NAMESPACE",
+    "GIT_PREFIX",
+];
 
 /// CLAUDE.md rule 12's cross-version contract check, as a scripted PTY driver.
 #[derive(Parser, Debug)]
@@ -73,9 +90,9 @@ const ROLE_REVIEWER: &str = "reviewer";
     about = "Reproduce and verify CLAUDE.md rule 12's cross-version manual test for a branch"
 )]
 struct Opts {
-    /// The branch under test — the "new" side. Taken from `origin/<branch>` and
-    /// checked out DETACHED, so nothing in the reusable worktree can commit,
-    /// amend, rebase or push to it.
+    /// The branch under test — the "new" side. Fetched from `origin` into the
+    /// standalone build clone and checked out DETACHED, so nothing there can
+    /// commit, amend, rebase or push to it.
     #[arg(long)]
     branch: String,
 
@@ -84,7 +101,7 @@ struct Opts {
     #[arg(long, default_value = "v0.41.0")]
     previous: String,
 
-    /// `owner/repo` the release asset comes from.
+    /// `owner/repo` the release asset and the branch come from.
     #[arg(long, default_value = "vfarcic/dot-agent-deck")]
     repo: String,
 
@@ -92,13 +109,14 @@ struct Opts {
     #[arg(long)]
     old_binary: Option<PathBuf>,
 
-    /// The reusable, disk-backed worktree the branch is built in. Defaults to
-    /// `<repo parent>/dot-agent-deck-xver`.
+    /// The standalone clone the branch is built in — its own `.git`, never a
+    /// linked worktree of the operator's repository. Created on first use and
+    /// reused across branches. Defaults to `<repo parent>/dot-agent-deck-xver-src`.
     #[arg(long)]
-    worktree: Option<PathBuf>,
+    source_clone: Option<PathBuf>,
 
-    /// `CARGO_TARGET_DIR` for that worktree, reused across branches so the
-    /// cargo cache survives. Defaults to `<repo parent>/dot-agent-deck-xver-target`.
+    /// `CARGO_TARGET_DIR` for that clone, reused across branches so the cargo
+    /// cache survives. Defaults to `<repo parent>/dot-agent-deck-xver-target`.
     #[arg(long)]
     target_dir: Option<PathBuf>,
 
@@ -121,27 +139,25 @@ struct Opts {
     ///
     /// `sandbox-sockets` (the default) pins both socket overrides inside the
     /// sandbox. `resolved` sets neither, so both builds resolve their endpoint
-    /// the way they would on a real host — required when the change under test
-    /// IS endpoint resolution, because those overrides short-circuit it. Read
-    /// the harness doc before using `resolved`: it touches process-global paths
-    /// and two such runs cannot execute concurrently.
+    /// the way they would on a real host — into the run's private `/tmp` and
+    /// `/run/user/<uid>`. Required when the change under test IS endpoint
+    /// resolution, because those overrides short-circuit it.
     #[arg(long, value_enum, default_value_t = ModeArg::SandboxSockets)]
     endpoint_mode: ModeArg,
 
     /// Unset `XDG_RUNTIME_DIR` for every process in the run.
     ///
     /// This is a whole failure mode of its own for a change that moves the
-    /// endpoint path in the FALLBACK case only (issue #1121): on a normal
-    /// desktop session `XDG_RUNTIME_DIR` is set, both builds resolve
-    /// byte-identical endpoints, and the run exercises the arm the change did
-    /// not touch. An option rather than a hardcode, because for every other
-    /// kind of change the ordinary desktop configuration is the faithful one.
+    /// endpoint path in the FALLBACK case only (issue #1121): with
+    /// `XDG_RUNTIME_DIR` set, both builds resolve byte-identical endpoints, and
+    /// the run exercises the arm the change did not touch. When it is kept, it
+    /// is pinned to the host's spelling `/run/user/<uid>`, which inside the
+    /// namespace is a sandbox directory.
     #[arg(long)]
     unset_xdg_runtime_dir: bool,
 
     /// Turn the experimental feature flag ON for the run. Off by default and
-    /// always pinned explicitly, because project-config discovery walks up from
-    /// CWD and would otherwise read the operator's real `.dot-agent-deck.toml`.
+    /// always pinned explicitly.
     #[arg(long)]
     experimental: bool,
 
@@ -150,8 +166,8 @@ struct Opts {
     #[arg(long)]
     skip_build: bool,
 
-    /// Keep the sandbox directory after the run. It is kept automatically on a
-    /// failure.
+    /// Keep the sandbox directory after the run. It is kept automatically on
+    /// anything but a clean pass.
     #[arg(long)]
     keep_sandbox: bool,
 
@@ -160,10 +176,14 @@ struct Opts {
     #[arg(long, default_value_t = 100)]
     min_free_gib: u64,
 
-    /// Cap every stand-in agent's lifetime, so one that escapes its process
-    /// group self-exits rather than leaking to PID 1.
+    /// Cap every stand-in agent's lifetime. The namespace's exit is the first
+    /// backstop; this is the second.
     #[arg(long, default_value_t = 1800)]
     max_agent_lifetime_secs: u64,
+
+    /// Kill the whole namespace if the inner half has not finished by then.
+    #[arg(long, default_value_t = 1200)]
+    run_timeout_secs: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
@@ -173,15 +193,25 @@ enum ModeArg {
 }
 
 fn main() -> ExitCode {
-    let opts = Opts::parse();
+    let mut args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    if args.get(1).is_some_and(|a| a == INNER_FLAG) {
+        let Some(plan) = args.get(2) else {
+            eprintln!("xver: {INNER_FLAG} needs a path");
+            return ExitCode::FAILURE;
+        };
+        return inner::main(Path::new(plan));
+    }
+    // The `xver` alias already ends in `--`, so `cargo xver -- --branch x`
+    // arrives here as `-- --branch x`, and clap reads everything after a `--`
+    // as positional. That spelling was the documented one before this was
+    // tolerated, so accept it rather than break every copy of it.
+    if args.get(1).is_some_and(|a| a == "--") {
+        args.remove(1);
+    }
+    let opts = Opts::parse_from(args);
     match run(&opts) {
-        Ok(passed) => {
-            if passed {
-                ExitCode::SUCCESS
-            } else {
-                ExitCode::FAILURE
-            }
-        }
+        Ok(true) => ExitCode::SUCCESS,
+        Ok(false) => ExitCode::FAILURE,
         Err(e) => {
             eprintln!("\nxver: {e}");
             ExitCode::FAILURE
@@ -203,7 +233,7 @@ fn utc_now() -> String {
         .unwrap_or_else(|| "<unknown>".to_string())
 }
 
-fn epoch_secs() -> u64 {
+pub(crate) fn epoch_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -224,112 +254,16 @@ fn must_run(cmd: &mut Command, what: &str) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-/// Invoke one of the two deck binaries with the run's environment.
-fn deck(bin: &Path, env: &[(String, String)], cwd: &Path, args: &[&str]) -> Result<Output, String> {
-    let mut cmd = Command::new(bin);
-    cmd.args(args).current_dir(cwd).env_clear();
-    for (k, v) in env {
-        cmd.env(k, v);
+/// A `git` command rooted at `dir`, with every ambient location variable
+/// removed and no interactive credential prompt.
+fn git(dir: &Path) -> Command {
+    let mut c = Command::new("git");
+    c.current_dir(dir).env("GIT_TERMINAL_PROMPT", "0");
+    for v in GIT_LOCATION_VARS {
+        c.env_remove(v);
     }
-    cmd.output()
-        .map_err(|e| format!("run {} {args:?}: {e}", bin.display()))
-}
-
-/// One row of `daemon status --json`.
-#[derive(Debug, Clone)]
-struct StatusRow {
-    pane_id: String,
-    role: String,
-    status: String,
-}
-
-/// `daemon status --json`, projected to what this harness asserts on.
-///
-/// Reads the daemon over `AttachRequest::ListAgents` and never lazily spawns
-/// one, so an unreachable daemon is an `Err` here rather than a freshly-minted
-/// empty daemon nobody asked for.
-fn daemon_status(
-    bin: &Path,
-    env: &[(String, String)],
-    cwd: &Path,
-) -> Result<Vec<StatusRow>, String> {
-    let out = deck(bin, env, cwd, &["daemon", "status", "--json"])?;
-    if !out.status.success() {
-        return Err(format!(
-            "daemon status --json exited {}: {}",
-            out.status,
-            String::from_utf8_lossy(&out.stderr).trim()
-        ));
-    }
-    let doc: serde_json::Value = serde_json::from_slice(&out.stdout)
-        .map_err(|e| format!("daemon status --json is not JSON: {e}"))?;
-    let agents = doc
-        .get("agents")
-        .and_then(|a| a.as_array())
-        .ok_or_else(|| "daemon status --json has no `agents` array".to_string())?;
-    Ok(agents
-        .iter()
-        .map(|a| StatusRow {
-            pane_id: a
-                .get("pane_id")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string(),
-            role: a
-                .get("role")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string(),
-            status: a
-                .get("status")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string(),
-        })
-        .collect())
-}
-
-/// Poll `daemon status` until `pred` holds over its rows.
-fn wait_for_status(
-    bin: &Path,
-    env: &[(String, String)],
-    cwd: &Path,
-    timeout: Duration,
-    pred: impl Fn(&[StatusRow]) -> bool,
-) -> Result<Vec<StatusRow>, String> {
-    let deadline = std::time::Instant::now() + timeout;
-    loop {
-        let last = daemon_status(bin, env, cwd);
-        if let Ok(rows) = &last
-            && pred(rows)
-        {
-            return Ok(rows.clone());
-        }
-        if std::time::Instant::now() >= deadline {
-            return match last {
-                Ok(rows) => Err(format!(
-                    "daemon status never satisfied the condition within {timeout:?}; last rows: {rows:?}"
-                )),
-                Err(e) => Err(format!(
-                    "daemon status kept failing within {timeout:?}: {e}"
-                )),
-            };
-        }
-        std::thread::sleep(Duration::from_millis(500));
-    }
-}
-
-fn count_in_file(path: &Path, needle: &str) -> usize {
-    std::fs::read_to_string(path)
-        .map(|s| s.matches(needle).count())
-        .unwrap_or(0)
-}
-
-/// The last `n` lines of `s` — what a failure message should quote rather than
-/// the whole scrollback.
-fn tail(s: &str, n: usize) -> String {
-    let lines: Vec<&str> = s.lines().collect();
-    lines[lines.len().saturating_sub(n)..].join("\n")
+    c.env_remove("GIT_CEILING_DIRECTORIES");
+    c
 }
 
 // ---------------------------------------------------------------------------
@@ -338,198 +272,226 @@ fn tail(s: &str, n: usize) -> String {
 
 fn repo_root() -> Result<PathBuf, String> {
     let out = must_run(
-        Command::new("git").args(["rev-parse", "--show-toplevel"]),
+        git(&std::env::current_dir().map_err(|e| format!("cwd: {e}"))?)
+            .args(["rev-parse", "--show-toplevel"]),
         "git rev-parse --show-toplevel",
     )?;
     Ok(PathBuf::from(out.trim()))
 }
 
-/// Fetch (or reuse) the previous release's published Linux binary, and assert
-/// it really reports that version.
-fn old_binary(opts: &Opts, releases: &Path) -> Result<PathBuf, String> {
-    if let Some(explicit) = &opts.old_binary {
-        return Ok(explicit.clone());
-    }
-    let dir = releases.join(&opts.previous);
-    std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
-    let bin = dir.join("dot-agent-deck-linux-amd64");
-    if !bin.exists() {
-        must_run(
-            Command::new("gh").args([
-                "release",
-                "download",
-                &opts.previous,
-                "--repo",
-                &opts.repo,
-                "-p",
-                "dot-agent-deck-linux-amd64",
-                "-D",
-                &dir.to_string_lossy(),
-            ]),
-            &format!("gh release download {}", opts.previous),
-        )?;
-    }
-    #[cfg(unix)]
-    {
+/// Fetch (or reuse) the previous release's published Linux binary, assert it
+/// reports exactly that version, and record its SHA-256.
+fn old_binary(opts: &Opts, releases: &Path, ev: &mut Evidence) -> Result<PathBuf, String> {
+    let bin = if let Some(explicit) = &opts.old_binary {
+        explicit.clone()
+    } else {
+        let dir = releases.join(&opts.previous);
+        std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+        let bin = dir.join("dot-agent-deck-linux-amd64");
+        if !bin.exists() {
+            must_run(
+                Command::new("gh").args([
+                    "release",
+                    "download",
+                    &opts.previous,
+                    "--repo",
+                    &opts.repo,
+                    "-p",
+                    "dot-agent-deck-linux-amd64",
+                    "-D",
+                    &dir.to_string_lossy(),
+                ]),
+                &format!("gh release download {}", opts.previous),
+            )?;
+        }
         use std::os::unix::fs::PermissionsExt;
-        let mut perms = std::fs::metadata(&bin)
-            .map_err(|e| format!("stat {}: {e}", bin.display()))?
-            .permissions();
-        perms.set_mode(0o755);
-        let _ = std::fs::set_permissions(&bin, perms);
-    }
-    let reported = must_run(Command::new(&bin).arg("--version"), "old binary --version")?;
-    let want = opts.previous.trim_start_matches('v');
-    if !reported.contains(want) {
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755))
+            .map_err(|e| format!("chmod {}: {e}", bin.display()))?;
+        bin
+    };
+    let bin = std::fs::canonicalize(&bin).map_err(|e| format!("{}: {e}", bin.display()))?;
+    // Both are static prints; they still get an empty environment.
+    let reported = must_run(
+        Command::new(&bin).arg("--version").env_clear(),
+        "old binary --version",
+    )?;
+    let want = format!("dot-agent-deck {}", opts.previous.trim_start_matches('v'));
+    if opts.old_binary.is_none() && reported.trim() != want {
         return Err(format!(
-            "the downloaded {} binary reports {reported:?}, which does not contain {want:?} — \
-             refusing to run a cross-version check against an unknown build",
-            opts.previous
+            "the downloaded {} binary reports {:?}, not exactly {want:?} — refusing to run a \
+             cross-version check against an unknown build",
+            opts.previous,
+            reported.trim()
         ));
     }
+    let sum = must_run(
+        Command::new("sha256sum")
+            .arg(&bin)
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin"),
+        "sha256sum of the old binary",
+    )?;
+    let sha = sum.split_whitespace().next().unwrap_or("").to_string();
+    if sha.len() != 64 {
+        return Err(format!(
+            "could not read a SHA-256 for {}: {sum:?}",
+            bin.display()
+        ));
+    }
+    ev.preflight.push(format!(
+        "old binary `{}` reports `{}`; SHA-256 `{sha}`",
+        bin.display(),
+        reported.trim()
+    ));
     Ok(bin)
 }
 
-/// Point the reusable worktree at `origin/<branch>` and build it.
+/// Point the standalone build clone at `origin/<branch>` and build it.
 ///
-/// Detached, always: the eight branches this sweeps are being verified, not
-/// changed, and a detached HEAD cannot commit to one by accident. It also side-
-/// steps the case where the branch is already checked out in another worktree.
+/// A standalone clone rather than a linked worktree of the operator's
+/// repository, which is what the first version of this harness used: a linked
+/// worktree writes its registration, HEAD, index and reflogs into the source
+/// repository's common `.git`, outside anything the run owns, where another
+/// session's `git worktree prune` can reach it. This clone has its own `.git`,
+/// so building a branch writes nothing into the operator's repository. It stays
+/// at a fixed path outside the per-run sandbox so the cargo cache in the
+/// target dir survives across branches; the run itself executes a staged copy
+/// of the binary from inside `$S`.
+///
+/// Detached, always: the branches this sweeps are being verified, not changed,
+/// and a detached HEAD cannot commit to one by accident.
 fn new_binary(
     opts: &Opts,
-    worktree: &Path,
+    clone: &Path,
     target_dir: &Path,
+    ev: &mut Evidence,
 ) -> Result<(PathBuf, String), String> {
-    if !worktree.join(".git").exists() {
+    let url = format!("https://github.com/{}.git", opts.repo);
+    let fresh = std::fs::symlink_metadata(clone).is_err();
+    if fresh {
+        let parent = clone
+            .parent()
+            .ok_or_else(|| format!("{} has no parent", clone.display()))?;
+        std::fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
         must_run(
-            Command::new("git").args([
-                "worktree",
-                "add",
-                "--detach",
-                &worktree.to_string_lossy(),
-                &format!("origin/{}", opts.branch),
+            git(parent).args([
+                "clone",
+                "--quiet",
+                "--no-checkout",
+                &url,
+                &clone.to_string_lossy(),
             ]),
-            "git worktree add",
+            "git clone (standalone build clone)",
         )?;
+        ev.preflight.push(format!(
+            "created the standalone build clone {} from {url}",
+            clone.display()
+        ));
+    }
+    let dotgit = clone.join(".git");
+    let md = std::fs::symlink_metadata(&dotgit)
+        .map_err(|e| format!("{}: {e} — not a git clone", dotgit.display()))?;
+    if md.file_type().is_file() {
+        return Err(format!(
+            "{} is a `.git` FILE, so {} is a linked worktree whose metadata lives in another \
+             repository. Refusing: pass --source-clone at a standalone clone, or remove this one \
+             and let the harness create one",
+            dotgit.display(),
+            clone.display()
+        ));
+    }
+    if !md.file_type().is_dir() {
+        return Err(format!("{} is not a directory", dotgit.display()));
+    }
+    let canon_dotgit = std::fs::canonicalize(&dotgit).map_err(|e| format!("{e}"))?;
+    for (flag, what) in [
+        ("--absolute-git-dir", "git dir"),
+        ("--git-common-dir", "common dir"),
+    ] {
+        let mut cmd = git(clone);
+        cmd.args(["rev-parse", "--path-format=absolute", flag]);
+        let got = must_run(&mut cmd, &format!("git rev-parse {flag}"))?;
+        let got = std::fs::canonicalize(got.trim()).map_err(|e| format!("{e}"))?;
+        if got != canon_dotgit {
+            return Err(format!(
+                "the build clone's {what} is {}, not its own {} — it is not standalone",
+                got.display(),
+                canon_dotgit.display()
+            ));
+        }
+    }
+    let dirty = |when: &str| -> Result<(), String> {
+        let st = must_run(
+            git(clone).args(["status", "--porcelain", "--untracked-files=no"]),
+            "git status",
+        )?;
+        if !st.trim().is_empty() {
+            return Err(format!(
+                "the build clone {} has tracked modifications {when} — something other than this \
+                 harness edited it; refusing to build a branch on top of them:\n{st}",
+                clone.display()
+            ));
+        }
+        Ok(())
+    };
+    if !fresh {
+        dirty("before checkout")?;
     }
     must_run(
-        Command::new("git")
-            .current_dir(worktree)
-            .args(["fetch", "origin", &opts.branch]),
-        "git fetch origin <branch>",
+        git(clone).args(["fetch", "--quiet", &url, &opts.branch]),
+        "git fetch <branch>",
     )?;
     must_run(
-        Command::new("git")
-            .current_dir(worktree)
-            .args(["checkout", "--detach", "FETCH_HEAD"]),
+        git(clone).args(["checkout", "--quiet", "--detach", "FETCH_HEAD"]),
         "git checkout --detach FETCH_HEAD",
     )?;
-    let sha = must_run(
-        Command::new("git")
-            .current_dir(worktree)
-            .args(["rev-parse", "HEAD"]),
-        "git rev-parse HEAD",
+    let sha = must_run(git(clone).args(["rev-parse", "HEAD"]), "git rev-parse HEAD")?
+        .trim()
+        .to_string();
+    let fetched = must_run(
+        git(clone).args(["rev-parse", "FETCH_HEAD"]),
+        "git rev-parse FETCH_HEAD",
     )?
     .trim()
     .to_string();
+    if sha != fetched {
+        return Err(format!(
+            "HEAD {sha} is not FETCH_HEAD {fetched} after checkout"
+        ));
+    }
+    dirty("after checkout")?;
+    ev.preflight.push(format!(
+        "branch source: standalone clone {} (its own `.git`; nothing written into the operator's \
+         repository), detached at {sha}",
+        clone.display()
+    ));
 
     if !opts.skip_build {
-        must_run(
-            Command::new("cargo")
-                .current_dir(worktree)
-                .env("CARGO_TARGET_DIR", target_dir)
-                .args(["build", "--locked", "--bin", "dot-agent-deck"]),
-            "cargo build --locked --bin dot-agent-deck",
-        )?;
+        // The branch's build scripts run here, outside the namespace. They get
+        // the caller's toolchain environment — the devbox/nix compiler wrappers
+        // need dozens of variables — minus anything credential-shaped and the
+        // deck's own pane variables. A denylist, so narrower than the run's own
+        // allowlist; the harness doc says so.
+        let mut cmd = Command::new("cargo");
+        cmd.current_dir(clone)
+            .env("CARGO_TARGET_DIR", target_dir)
+            .args(["build", "--locked", "--bin", "dot-agent-deck"]);
+        for (k, _) in std::env::vars_os() {
+            let name = k.to_string_lossy();
+            if sandbox::credential_like(&name)
+                || name.starts_with("DOT_AGENT_DECK_")
+                || GIT_LOCATION_VARS.contains(&name.as_ref())
+            {
+                cmd.env_remove(&k);
+            }
+        }
+        must_run(&mut cmd, "cargo build --locked --bin dot-agent-deck")?;
     }
     let bin = target_dir.join("debug").join("dot-agent-deck");
     if !bin.exists() {
         return Err(format!("no branch binary at {}", bin.display()));
     }
     Ok((bin, sha))
-}
-
-/// One field of a `daemon hello` document.
-fn hello_field<'a>(doc: &'a serde_json::Value, key: &str) -> &'a str {
-    doc.get(key).and_then(|v| v.as_str()).unwrap_or("<absent>")
-}
-
-/// Compare the two builds' self-reported contracts before a single process is
-/// started, and refuse the one comparison that makes the whole run vacuous.
-///
-/// The build ids being EQUAL is that case: the build-version handshake then
-/// matches, no mismatch prompt is printed, the branch TUI attaches to a daemon
-/// of its own build, and every later tell passes against a same-version run.
-/// Catching it here rather than at the 90-second prompt wait is the difference
-/// between a one-line refusal and a run that looks like it broke down.
-///
-/// A differing `server_version` is reported, not refused: that is a hard
-/// protocol floor, so the pairing would be rejected at the handshake instead of
-/// exercising semantics behind a stable wire. It is a legitimate thing to want
-/// to observe, and the evidence file should say which of the two happened.
-fn compare_hellos(old_raw: &str, new_raw: &str) -> Result<Vec<String>, String> {
-    let old: serde_json::Value =
-        serde_json::from_str(old_raw.trim()).map_err(|e| format!("old `daemon hello`: {e}"))?;
-    let new: serde_json::Value =
-        serde_json::from_str(new_raw.trim()).map_err(|e| format!("branch `daemon hello`: {e}"))?;
-    let (ob, nb) = (
-        hello_field(&old, "build_version"),
-        hello_field(&new, "build_version"),
-    );
-    if ob == nb {
-        return Err(format!(
-            "both sides report build id {ob:?}, so the build-version handshake would MATCH and \
-             no mismatch prompt would be printed. That is a same-version run wearing this \
-             harness's clothes — refusing before anything is started. Check that --branch really \
-             differs from --previous, and that the branch binary was rebuilt."
-        ));
-    }
-    let mut notes = vec![format!(
-        "build ids differ: old {ob}, branch {nb} — the handshake will take the mismatch path"
-    )];
-    let (op, np) = (
-        old.get("server_version").cloned(),
-        new.get("server_version").cloned(),
-    );
-    notes.push(if op == np {
-        format!(
-            "PROTOCOL_VERSION matches on both sides ({}), so this run exercises SEMANTICS behind \
-             a stable wire — which is what rule 12 is for",
-            op.map(|v| v.to_string())
-                .unwrap_or_else(|| "<absent>".into())
-        )
-    } else {
-        format!(
-            "PROTOCOL_VERSION DIFFERS (old {:?}, branch {:?}). That is a hard floor, so the two \
-             builds refuse each other at the handshake rather than interoperating; read a failure \
-             below as that refusal rather than as a semantic break",
-            op, np
-        )
-    });
-    let breaks = |v: &serde_json::Value| {
-        v.get("contract_breaks")
-            .and_then(|b| b.as_array())
-            .map(|a| {
-                a.iter()
-                    .filter_map(|x| x.as_str().map(str::to_string))
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default()
-    };
-    let (obr, nbr) = (breaks(&old), breaks(&new));
-    notes.push(if obr == nbr {
-        format!(
-            "CONTRACT_BREAKS identical on both sides ({} entries)",
-            obr.len()
-        )
-    } else {
-        format!(
-            "CONTRACT_BREAKS differ: old {obr:?}, branch {nbr:?}. The desktop's \
-             `classify_handshake` refuses across any difference in that list, so a new app would \
-             refuse this older daemon outright — a surface this harness does not exercise"
-        )
-    });
-    Ok(notes)
 }
 
 // ---------------------------------------------------------------------------
@@ -542,10 +504,10 @@ fn run(opts: &Opts) -> Result<bool, String> {
         .parent()
         .ok_or_else(|| "the repository root has no parent".to_string())?
         .to_path_buf();
-    let worktree = opts
-        .worktree
+    let clone = opts
+        .source_clone
         .clone()
-        .unwrap_or_else(|| parent.join("dot-agent-deck-xver"));
+        .unwrap_or_else(|| parent.join("dot-agent-deck-xver-src"));
     let target_dir = opts
         .target_dir
         .clone()
@@ -558,27 +520,46 @@ fn run(opts: &Opts) -> Result<bool, String> {
         .releases_dir
         .clone()
         .unwrap_or_else(|| parent.join("dot-agent-deck-xver-releases"));
+    let uid = sandbox::current_uid();
+    let (user, _) = sandbox::passwd_entry().ok_or("this uid has no password-database entry")?;
+    let mode = match opts.endpoint_mode {
+        ModeArg::SandboxSockets => EndpointMode::SandboxSockets,
+        ModeArg::Resolved => EndpointMode::Resolved,
+    };
+    let spec = EnvSpec {
+        mode,
+        keep_xdg_runtime_dir: !opts.unset_xdg_runtime_dir,
+        experimental: opts.experimental,
+        max_lifetime_secs: opts.max_agent_lifetime_secs,
+        uid,
+    };
 
     let mut ev = Evidence {
         branch: opts.branch.clone(),
         previous: opts.previous.clone(),
         started_at: utc_now(),
-        mode: match opts.endpoint_mode {
-            ModeArg::SandboxSockets => {
-                "sandbox-sockets (both socket overrides pinned inside the sandbox)".into()
+        mode: match mode {
+            EndpointMode::SandboxSockets => {
+                "sandbox-sockets (both socket overrides pinned inside the sandbox), inside a private namespace".into()
             }
-            ModeArg::Resolved => {
-                "resolved (neither socket override set — both builds resolve their own endpoint)"
+            EndpointMode::Resolved => {
+                "resolved (neither socket override set — both builds resolve their own endpoint, into the namespace's private `/tmp` and `/run/user/<uid>`)"
                     .into()
             }
         },
+        namespace: "one private bubblewrap namespace for every deck process of the run — \
+                    private mount, PID, network, IPC, UTS and user namespaces; BOTH endpoint \
+                    roots masked (`/tmp` and `/run/user/<uid>` are sandbox directories), \
+                    `/var/tmp` masked, the operator's home an empty tmpfs, the rest of `/` \
+                    bound read-only; see the Isolation section for what was measured"
+            .into(),
         xdg_runtime_dir: if opts.unset_xdg_runtime_dir {
             "UNSET for every process in the run".into()
         } else {
-            match std::env::var("XDG_RUNTIME_DIR") {
-                Ok(v) => format!("inherited from the host: `{v}`"),
-                Err(_) => "not set on the host either".into(),
-            }
+            format!(
+                "`{}` — the host's spelling, which inside the namespace is the sandbox's `run-user`",
+                sandbox::runtime_dir(uid).display()
+            )
         },
         ..Default::default()
     };
@@ -592,803 +573,490 @@ fn run(opts: &Opts) -> Result<bool, String> {
         "cargo target dir: {}",
         sandbox::require_disk_backed("cargo target dir", &target_dir, opts.min_free_gib)?
     ));
-    let mode = match opts.endpoint_mode {
-        ModeArg::SandboxSockets => EndpointMode::SandboxSockets,
-        ModeArg::Resolved => EndpointMode::Resolved,
-    };
+    let smoke = isolation::bwrap_smoke()?;
+    let outer_mnt = proc::namespace("self", "mnt").ok_or("cannot read /proc/self/ns/mnt")?;
+    let outer_net = proc::namespace("self", "net").ok_or("cannot read /proc/self/ns/net")?;
+    let outer_pid = proc::namespace("self", "pid").ok_or("cannot read /proc/self/ns/pid")?;
+    let host = isolation::capture_host(uid)?;
     if mode == EndpointMode::Resolved {
-        for note in sandbox::preflight_resolved_endpoints()? {
-            ev.preflight.push(note);
+        // With the namespace these cannot be reached from inside the run anyway;
+        // requiring them absent keeps the before/after comparison unambiguous.
+        // The SOCKETS, not the per-uid directory: an empty directory a deck left
+        // behind is common and harmless, and the snapshot still requires it
+        // unchanged for the length of the run.
+        for e in host.iter().filter(|e| {
+            sandbox::flat_endpoints(uid).contains(&e.path)
+                || sandbox::per_uid_endpoints(uid).contains(&e.path)
+        }) {
+            if e.file.is_some() {
+                return Err(format!(
+                    "host {} exists. Something on this host is running in the fallback case; \
+                     find out what before starting a resolved-mode run (`ss -xlp` names the \
+                     owner). Nothing was started and nothing was touched.",
+                    e.path.display()
+                ));
+            }
         }
     }
+    let deck_baseline = isolation::deck_census()?;
+    let real_log = std::env::var_os("DOT_AGENT_DECK_LOG")
+        .map(PathBuf::from)
+        .or_else(|| {
+            sandbox::passwd_entry().map(|(_, h)| h.join(".local/state/dot-agent-deck/deck.log"))
+        });
+    let log_mark = real_log.as_deref().and_then(isolation::mark_log);
 
     println!("xver: inputs");
-    let old_bin = old_binary(opts, &releases)?;
-    let (new_bin, head_sha) = new_binary(opts, &worktree, &target_dir)?;
-    ev.old_binary = old_bin.clone();
-    ev.new_binary = new_bin.clone();
+    let old_src = old_binary(opts, &releases, &mut ev)?;
+    let (new_src, head_sha) = new_binary(opts, &clone, &target_dir, &mut ev)?;
     ev.head_sha = head_sha;
-    ev.old_hello = must_run(
-        Command::new(&old_bin).args(["daemon", "hello"]),
-        "old daemon hello",
-    )?;
-    ev.new_hello = must_run(
-        Command::new(&new_bin).args(["daemon", "hello"]),
-        "new daemon hello",
-    )?;
-    println!("  · old {}", ev.old_hello.trim());
-    println!("  · new {}", ev.new_hello.trim());
-    for note in compare_hellos(&ev.old_hello, &ev.new_hello)? {
-        ev.preflight.push(note);
-    }
 
     let slug: String = opts
         .branch
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
         .collect();
-    let sandbox_root = runs_root.join(format!("{slug}-{}", epoch_secs()));
-    let sb = Sandbox::create(sandbox_root.clone())?;
-    sandbox::write_project(&sb)?;
-    ev.sandbox_root = sandbox_root.clone();
+    let sb = Sandbox::create(&runs_root, &format!("{slug}-{}", epoch_secs()))?;
+    let runs_root = std::fs::canonicalize(&runs_root).map_err(|e| format!("{e}"))?;
+    ev.sandbox_root = sb.root.clone();
 
-    let new_bin_dir = new_bin
-        .parent()
-        .ok_or_else(|| "the branch binary has no parent dir".to_string())?
-        .to_path_buf();
-    let env = sandbox::run_env(
-        &sb,
-        &new_bin_dir,
-        mode,
-        !opts.unset_xdg_runtime_dir,
-        opts.experimental,
-        opts.max_agent_lifetime_secs,
-    );
-
-    // Where the old daemon will listen, computed by the OLD build's own
-    // resolution rule, so `ss` can be asked who owns it.
-    let attach_endpoint = match mode {
-        EndpointMode::SandboxSockets => sb.attach_socket(),
-        EndpointMode::Resolved => match env.iter().find(|(k, _)| k == "XDG_RUNTIME_DIR") {
-            Some((_, dir)) => PathBuf::from(dir).join("dot-agent-deck-attach.sock"),
-            None => sandbox::legacy_endpoints()[1].clone(),
-        },
-    };
-    ev.daemon_endpoint = attach_endpoint.display().to_string();
-
-    let outcome = drive(
-        opts,
-        mode,
-        &sb,
-        &env,
-        &old_bin,
-        &new_bin,
-        &attach_endpoint,
-        &mut ev,
-    );
-
-    // Evidence is written whatever happened — a run that broke down partway is
-    // a useful result and the file is where it is legible.
+    // From here on the evidence file is written whatever happens.
     let evidence_path = opts.evidence.clone().unwrap_or_else(|| {
         root.join(".dot-agent-deck")
             .join("xver-evidence")
             .join(format!("{slug}.md"))
     });
-    if let Err(e) = &outcome {
-        ev.step(format!("RUN ABORTED: {e}"));
-        ev.tell(
-            "aborted",
-            "the run did not complete",
-            Verdict::Fail,
-            e.clone(),
-        );
-    }
-    ev.write_to(&evidence_path)?;
+    let mut inner_pid_ns: Option<String> = None;
+    let outcome = (|| -> Result<(), String> {
+        sandbox::write_project(&sb)?;
+        for (src, dst) in [
+            (old_src.as_path(), sb.old_bin()),
+            (new_src.as_path(), sb.new_bin()),
+            (
+                std::env::current_exe()
+                    .map_err(|e| format!("current_exe: {e}"))?
+                    .as_path(),
+                sb.harness_bin(),
+            ),
+        ] {
+            ev.preflight.push(sandbox::stage_binary(src, &dst)?);
+        }
+        ev.old_binary = sb.old_bin();
+        ev.new_binary = sb.new_bin();
 
-    let passed = ev.passed() && ev.complete() && outcome.is_ok();
-    if passed && !opts.keep_sandbox {
-        let _ = std::fs::remove_dir_all(&sandbox_root);
-        println!("xver: sandbox removed ({})", sandbox_root.display());
-    } else {
-        println!("xver: sandbox kept at {}", sandbox_root.display());
+        let env = sandbox::run_env(&sb, spec, &user);
+        sandbox::check_env(&env, &sb, spec)?;
+        let matrix = EndpointMatrix::for_run(&sb, mode, spec.keep_xdg_runtime_dir, uid);
+        sandbox::check_socket_path_lengths(&matrix)?;
+        let plan = isolation::Plan {
+            root: sb.root.clone(),
+            uid,
+            user: user.clone(),
+            mode,
+            keep_xdg_runtime_dir: spec.keep_xdg_runtime_dir,
+            experimental: opts.experimental,
+            max_lifetime_secs: opts.max_agent_lifetime_secs,
+            previous: opts.previous.clone(),
+            env,
+            matrix,
+            masks: isolation::masks_for(&sb, uid)?,
+            masked_home: isolation::home_to_mask(),
+            outer_mnt_ns: outer_mnt.clone(),
+        };
+        write_private(
+            &sb.plan_file(),
+            &serde_json::to_string_pretty(&plan).map_err(|e| format!("{e}"))?,
+        )?;
+
+        ev.isolated(format!("namespace: {smoke}"));
+        ev.isolated(format!(
+            "outer half: mount namespace {outer_mnt}, network namespace {outer_net}, PID namespace {outer_pid}"
+        ));
+        for line in isolation::describe_host(&host) {
+            ev.isolated(format!("baseline, {line}"));
+        }
+        ev.isolated(format!(
+            "baseline: {} deck process(es) on the host, recorded by pid, start time and exe",
+            deck_baseline.len()
+        ));
+
+        let sup = supervise(opts, &sb, &plan, &host, &outer_mnt, &outer_net, &outer_pid)?;
+        inner_pid_ns = sup.inner_pid_ns.clone();
+        merge_inner(&mut ev, &sb)?;
+        for line in sup.notes {
+            ev.isolated(line);
+        }
+        if let Some(f) = sup.failure {
+            ev.isolation_failed(f);
+        }
+        Ok(())
+    })();
+    if let Err(e) = &outcome {
+        ev.step(format!("RUN ABORTED outside the namespace: {e}"));
+        if ev.tells.is_empty() {
+            ev.tell(
+                "aborted",
+                "the run did not complete",
+                report::Verdict::Fail,
+                e.clone(),
+            );
+        }
     }
+
+    println!("xver: postconditions");
+    let clean = postconditions(
+        &mut ev,
+        &sb,
+        &host,
+        &deck_baseline,
+        log_mark.as_ref(),
+        inner_pid_ns.as_deref(),
+    );
+
+    let verdict = ev.verdict();
+    let passed = verdict == RunVerdict::Pass && outcome.is_ok() && clean;
+    let disposal = if passed && !opts.keep_sandbox {
+        match remove_sandbox(&sb, &runs_root) {
+            Ok(()) => format!(
+                "the sandbox `{}` was removed after the clean pass",
+                sb.root.display()
+            ),
+            Err(e) => format!("the sandbox `{}` was kept: {e}", sb.root.display()),
+        }
+    } else {
+        format!(
+            "the sandbox `{}` was kept (not a clean pass, or --keep-sandbox)",
+            sb.root.display()
+        )
+    };
+    println!("xver: {disposal}");
+    ev.postconditions.push(disposal);
+    ev.write_to(&evidence_path)?;
     println!("xver: evidence written to {}", evidence_path.display());
     println!(
         "xver: {}",
-        if passed {
-            "PASS"
-        } else if ev.passed() {
-            "INCOMPLETE — a tell could not be measured"
-        } else {
-            "FAIL"
+        match &verdict {
+            RunVerdict::Pass => "PASS".to_string(),
+            RunVerdict::Fail => "FAIL".to_string(),
+            RunVerdict::Incomplete(why) => format!("INCOMPLETE — {why}"),
         }
     );
     Ok(passed)
 }
 
-/// Everything between "the sandbox exists" and "the sandbox daemon is gone".
-///
-/// Split out so the caller can write the evidence file on every path, including
-/// the one where a step breaks down and returns `Err`.
-#[allow(clippy::too_many_arguments)]
-fn drive(
-    opts: &Opts,
-    mode: EndpointMode,
-    sb: &Sandbox,
-    env: &[(String, String)],
-    old_bin: &Path,
-    new_bin: &Path,
-    attach_endpoint: &Path,
-    ev: &mut Evidence,
-) -> Result<(), String> {
-    println!("xver: step 1 — start the previous release's daemon");
-    let mut daemon_cmd = Command::new(old_bin);
-    daemon_cmd
-        .args(["daemon", "serve"])
-        .current_dir(&sb.project)
-        .env_clear();
-    for (k, v) in env {
-        daemon_cmd.env(k, v);
-    }
-    let daemon_out = std::fs::File::create(sb.artifacts.join("old-daemon.log"))
-        .map_err(|e| format!("create old-daemon.log: {e}"))?;
-    let daemon_err = daemon_out
-        .try_clone()
-        .map_err(|e| format!("clone old-daemon.log handle: {e}"))?;
-    daemon_cmd.stdout(daemon_out).stderr(daemon_err);
-    let child = daemon_cmd
-        .spawn()
-        .map_err(|e| format!("spawn the sandbox daemon: {e}"))?;
-    let mut daemon = proc::SandboxProcess::adopt(
-        child,
-        old_bin.display().to_string(),
-        "sandbox daemon".to_string(),
-    );
-    ev.daemon_pid = daemon.pid;
-    ev.step(format!(
-        "started the {} daemon as pid {} (cmdline gate: `{}`)",
-        opts.previous,
-        daemon.pid,
-        old_bin.display()
-    ));
-
-    // Everything below can fail; the teardown must still happen, and must still
-    // be pid-scoped. Run the body and keep its result.
-    let body = drive_inner(
-        opts,
-        mode,
-        sb,
-        env,
-        old_bin,
-        new_bin,
-        attach_endpoint,
-        ev,
-        &daemon,
-    );
-
-    println!("xver: teardown");
-    // Which of the process-global legacy addresses THIS run's daemon is
-    // listening on — asked before it is signalled, because afterwards there is
-    // no listener to attribute. The alternative, deleting both paths because the
-    // preflight found them absent, would remove a stranger's socket in the one
-    // case that matters: this run's daemon never bound them and something else
-    // has since.
-    let owned_legacy: Vec<PathBuf> = if mode == EndpointMode::Resolved {
-        sandbox::legacy_endpoints()
-            .into_iter()
-            .filter(|p| proc::listeners_on(p).is_some_and(|pids| pids.contains(&daemon.pid)))
-            .collect()
-    } else {
-        Vec::new()
-    };
-    let label = daemon.label.clone();
-    match daemon.terminate(Duration::from_secs(20)) {
-        Ok(()) => ev.step(format!(
-            "SIGTERMed the {label} by pid {} after verifying its command line still contained \
-             the sandbox binary path; never a pattern match",
-            daemon.pid
-        )),
-        Err(proc::SignalRefusal::Gone) => {
-            ev.step(format!("{label} pid {} was already gone", daemon.pid))
-        }
-        Err(proc::SignalRefusal::NotOurs { cmdline }) => ev.step(format!(
-            "REFUSED to signal pid {} ({label}): its command line is now `{cmdline}`, which does \
-             not contain `{}`. The pid was recycled; nothing was signalled.",
-            daemon.pid,
-            old_bin.display()
-        )),
-    }
-    if mode == EndpointMode::Resolved {
-        let mut removed = Vec::new();
-        let mut left = Vec::new();
-        for path in sandbox::legacy_endpoints() {
-            if !path.exists() {
-                continue;
-            }
-            if owned_legacy.contains(&path) {
-                let _ = std::fs::remove_file(&path);
-                removed.push(path.display().to_string());
-            } else {
-                left.push(path.display().to_string());
-            }
-        }
-        ev.step(format!(
-            "legacy /tmp endpoints: removed {:?} (this run's daemon was the listener); left {:?} \
-             alone (not attributable to this run's pid — a later run's preflight will refuse \
-             until someone looks)",
-            removed, left
-        ));
-    }
-    body
+/// Write a file only its owner can read.
+fn write_private(path: &Path, body: &str) -> Result<(), String> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(|e| format!("create {}: {e}", path.display()))?;
+    f.write_all(body.as_bytes())
+        .map_err(|e| format!("write {}: {e}", path.display()))
 }
 
-#[allow(clippy::too_many_arguments)]
-fn drive_inner(
+/// What the outer half learned while the namespace ran.
+struct Supervision {
+    inner_pid_ns: Option<String>,
+    notes: Vec<String>,
+    failure: Option<String>,
+}
+
+/// Start the namespace and answer the inner half until it exits.
+fn supervise(
     opts: &Opts,
-    mode: EndpointMode,
     sb: &Sandbox,
-    env: &[(String, String)],
-    old_bin: &Path,
-    new_bin: &Path,
-    attach_endpoint: &Path,
-    ev: &mut Evidence,
-    daemon: &proc::SandboxProcess,
-) -> Result<(), String> {
-    let three_roles = |rows: &[StatusRow]| {
-        [ROLE_ORCHESTRATOR, ROLE_CODER, ROLE_REVIEWER]
-            .iter()
-            .all(|r| rows.iter().any(|row| row.role.contains(*r)))
+    plan: &isolation::Plan,
+    host: &[isolation::HostEndpoint],
+    outer_mnt: &str,
+    outer_net: &str,
+    outer_pid: &str,
+) -> Result<Supervision, String> {
+    println!("xver: entering the namespace");
+    let mut child = Command::new("bwrap")
+        .args(isolation::bwrap_args(plan))
+        .arg("--")
+        .arg(sb.harness_bin())
+        .arg(INNER_FLAG)
+        .arg(sb.plan_file())
+        .env_clear()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .map_err(|e| format!("start bwrap: {e}"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or("no stdout pipe to the namespace")?;
+    let mut stdin = child.stdin.take().ok_or("no stdin pipe to the namespace")?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in std::io::BufReader::new(stdout).lines() {
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+
+    let mut sup = Supervision {
+        inner_pid_ns: None,
+        notes: Vec::new(),
+        failure: None,
     };
-
-    // The old binary asking its own daemon is the version-correct way to find
-    // out whether it is up, in both endpoint modes.
-    wait_for_status(old_bin, env, &sb.project, DAEMON_TIMEOUT, |_| true)
-        .map_err(|e| format!("the sandbox daemon never answered `daemon status`: {e}"))?;
-    ev.step("the sandbox daemon answered `daemon status`");
-    let listeners_at_start = proc::listeners_on(attach_endpoint);
-
-    println!("xver: step 2 — bring an orchestration up under it, with the OLD TUI");
-    let mut old_tui = pty::PtyDeck::spawn(pty::PtySpec {
-        label: "old-tui",
-        bin: old_bin,
-        args: &[],
-        cwd: &sb.project,
-        env,
-        cols: 200,
-        rows: 55,
-        stream_log: sb.artifacts.join("old-tui.stream.txt"),
-    })?;
-    if !old_tui.wait_for_grid_string("No active sessions", UI_TIMEOUT) {
-        return Err(format!(
-            "{}: never reached an empty dashboard.\n=== grid ===\n{}",
-            old_tui.label,
-            old_tui.grid()
-        ));
+    let mut preconnects = 0usize;
+    let deadline = Instant::now() + Duration::from_secs(opts.run_timeout_secs);
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        match rx.recv_timeout(left) {
+            Ok(Ok(line)) => {
+                let Some(req) = line.strip_prefix(ctl::PREFIX) else {
+                    println!("{line}");
+                    continue;
+                };
+                let reply = match answer(req, &sup, sb, host, outer_mnt, outer_net, outer_pid) {
+                    Ok(Some(ns)) => {
+                        sup.notes.push(format!(
+                            "the inner half reported mount/PID/network namespaces {ns}; each \
+                             differs from the outer half's"
+                        ));
+                        sup.inner_pid_ns = ns.split_whitespace().nth(1).map(str::to_string);
+                        "ok".to_string()
+                    }
+                    Ok(None) => {
+                        preconnects += 1;
+                        "ok".to_string()
+                    }
+                    Err(e) => {
+                        if sup.failure.is_none() {
+                            sup.failure = Some(format!("outer half: {e}"));
+                        }
+                        ctl::fail_reply(&e)
+                    }
+                };
+                if writeln!(stdin, "{reply}")
+                    .and_then(|_| stdin.flush())
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            Ok(Err(e)) => {
+                eprintln!("xver: reading the namespace's output: {e}");
+                break;
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                // The child handle is not reaped, so this reaches bwrap and no
+                // one else; `--die-with-parent` and the PID namespace take every
+                // process inside down with it.
+                let _ = child.kill();
+                sup.failure = Some(format!(
+                    "the inner half did not finish within {}s; the namespace was killed as a whole",
+                    opts.run_timeout_secs
+                ));
+                break;
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        }
     }
-    open_orchestration(&old_tui)?;
-    let rows = wait_for_status(old_bin, env, &sb.project, UI_TIMEOUT, three_roles).map_err(|e| {
-        format!(
-            "the three role panes never came up under the sandbox daemon: {e}\n=== old TUI grid ===\n{}",
-            old_tui.grid()
-        )
-    })?;
-    ev.step(format!(
-        "the old TUI brought up {} role panes under the old daemon: {}",
-        rows.len(),
-        rows.iter()
-            .map(|r| format!("{} ({})", r.role, r.pane_id))
-            .collect::<Vec<_>>()
-            .join(", ")
+    drop(stdin);
+    let status = child.wait().map_err(|e| format!("wait for bwrap: {e}"))?;
+    sup.notes.push(format!(
+        "outer half: answered {preconnects} pre-connect host check(s), every one of them against \
+         the baseline; the namespace exited ({status})"
     ));
+    Ok(sup)
+}
 
-    println!("xver: step 3 — Ctrl+D, Ctrl+C, Detach (never Stop)");
-    old_tui.send(b"\x04"); // Ctrl+D — leave PaneInput. Without this Ctrl+C goes
-    std::thread::sleep(SETTLE); // to the focused PANE and kills a role.
-    old_tui.send(b"\x03"); // Ctrl+C — the quit dialog
-    if !old_tui.wait_for_grid_string("Quit dot-agent-deck?", STEP_TIMEOUT) {
-        return Err(format!(
-            "Ctrl+D then Ctrl+C never opened the quit dialog in the old TUI.\n=== grid ===\n{}",
-            old_tui.grid()
-        ));
+/// Answer one control request. `Ok(Some(ns))` for the namespace report,
+/// `Ok(None)` for a passed pre-connect check.
+fn answer(
+    req: &str,
+    sup: &Supervision,
+    sb: &Sandbox,
+    host: &[isolation::HostEndpoint],
+    outer_mnt: &str,
+    outer_net: &str,
+    outer_pid: &str,
+) -> Result<Option<String>, String> {
+    if let Some(rest) = req.strip_prefix("ns ") {
+        let parts: Vec<&str> = rest.split_whitespace().collect();
+        let [mnt, pid, net] = parts[..] else {
+            return Err(format!("malformed namespace report {rest:?}"));
+        };
+        for (inner, outer, what) in [
+            (mnt, outer_mnt, "mount"),
+            (pid, outer_pid, "PID"),
+            (net, outer_net, "network"),
+        ] {
+            if inner == outer {
+                return Err(format!(
+                    "the inner half shares the outer half's {what} namespace ({inner})"
+                ));
+            }
+        }
+        return Ok(Some(rest.to_string()));
     }
-    old_tui.send(b"\r"); // Enter on the default option, which is Detach (index 0).
-    match old_tui.wait_for_exit(STEP_TIMEOUT) {
-        Some(_) => {}
-        None => {
+    if let Some(label) = req.strip_prefix("preconnect ") {
+        if sup.inner_pid_ns.is_none() {
+            return Err(format!("{label}: the namespace was never reported"));
+        }
+        isolation::verify_host(host).map_err(|e| format!("{label}: {e}"))?;
+        let under =
+            isolation::host_listeners_under(&sb.root).map_err(|e| format!("{label}: {e}"))?;
+        if !under.is_empty() {
             return Err(format!(
-                "the old TUI did not exit after choosing Detach.\n=== grid ===\n{}",
-                old_tui.grid()
+                "{label}: the HOST network namespace has listeners under the sandbox: {under:?}"
             ));
         }
+        return Ok(None);
     }
-    old_tui.shutdown();
-    drop(old_tui);
+    Err(format!("unknown control request {req:?}"))
+}
 
-    let after_detach = wait_for_status(old_bin, env, &sb.project, DAEMON_TIMEOUT, three_roles)
-        .map_err(|e| {
-            format!(
-                "after the detach the daemon no longer lists all three roles — the Ctrl+C trap \
-                 (it goes to the PANE in PaneInput mode) or a `Stop` instead of `Detach`: {e}"
-            )
-        })?;
-    if !proc::is_alive(daemon.pid) {
-        return Err(format!(
-            "the sandbox daemon (pid {}) died during the detach — `Detach` must leave it running",
-            daemon.pid
-        ));
-    }
-    ev.step(format!(
-        "after Detach the daemon (pid {}) is still alive and still lists {} role panes",
-        daemon.pid,
-        after_detach.len()
-    ));
-
-    println!("xver: step 4 — attach the BRANCH TUI and decline the mismatch prompt");
-    let new_tui = pty::PtyDeck::spawn(pty::PtySpec {
-        label: "new-tui",
-        bin: new_bin,
-        args: &[],
-        cwd: &sb.project,
-        env,
-        cols: 200,
-        rows: 55,
-        stream_log: sb.artifacts.join("new-tui.stream.txt"),
+/// Fold the inner half's evidence into this half's.
+fn merge_inner(ev: &mut Evidence, sb: &Sandbox) -> Result<(), String> {
+    let raw = std::fs::read_to_string(sb.inner_evidence()).map_err(|e| {
+        format!(
+            "the inner half left no evidence at {}: {e}",
+            sb.inner_evidence().display()
+        )
     })?;
-    let saw_prompt = new_tui.wait_for_stream_string("Daemon version mismatch", UI_TIMEOUT);
-    let prompt_excerpt = extract_prompt(&new_tui.stream_text());
-    if !saw_prompt {
-        ev.excerpt(
-            "branch TUI stream (no mismatch prompt)",
-            tail(&new_tui.stream_text(), 60),
-        );
-        return Err(format!(
-            "the branch TUI never printed the build-version mismatch prompt within {UI_TIMEOUT:?}. \
-             That prompt appearing IS the proof the scenario was reached: either the branch TUI \
-             did not find the old daemon at all (and has lazy-spawned its own — check the \
-             `Attach protocol listening` count below), or the two builds report the same build \
-             id. old={} new={}",
-            ev.old_hello.trim(),
-            ev.new_hello.trim()
-        ));
+    let inner: Evidence =
+        serde_json::from_str(&raw).map_err(|e| format!("parse the inner half's evidence: {e}"))?;
+    ev.old_hello = inner.old_hello;
+    ev.new_hello = inner.new_hello;
+    ev.daemon_pid = inner.daemon_pid;
+    ev.daemon_endpoint = inner.daemon_endpoint;
+    ev.preflight.extend(inner.preflight);
+    ev.steps.extend(inner.steps);
+    ev.tells.extend(inner.tells);
+    ev.excerpts.extend(inner.excerpts);
+    ev.isolation.extend(inner.isolation);
+    // Already printed by the inner half; keep the first cause, silently.
+    if ev.isolation_failure.is_none() {
+        ev.isolation_failure = inner.isolation_failure;
     }
-    ev.excerpt(
-        "build-version mismatch prompt, as the branch TUI printed it",
-        prompt_excerpt.clone(),
-    );
-    let named_roles: Vec<&str> = [ROLE_ORCHESTRATOR, ROLE_CODER, ROLE_REVIEWER]
-        .into_iter()
-        .filter(|r| prompt_excerpt.contains(r))
-        .collect();
-    ev.step(format!(
-        "the branch TUI printed the build-version mismatch prompt naming {} of the live roles ({})",
-        named_roles.len(),
-        named_roles.join(", ")
-    ));
-    // Any key other than `s`/`S` declines and keeps the existing daemon.
-    // Accepting would SIGTERM the old daemon and replace it, which destroys the
-    // entire point of the run.
-    new_tui.send(b"n");
-    if !new_tui.wait_for_grid(UI_TIMEOUT, |g| {
-        g.contains("XVER_") || g.contains(ROLE_ORCHESTRATOR)
-    }) {
-        return Err(format!(
-            "{}: after declining the prompt it never rendered the orchestration.\n=== grid ===\n{}",
-            new_tui.label,
-            new_tui.grid()
-        ));
+    Ok(())
+}
+
+/// The outer half's checks after the namespace has exited. Returns whether the
+/// sandbox may be removed.
+fn postconditions(
+    ev: &mut Evidence,
+    sb: &Sandbox,
+    host: &[isolation::HostEndpoint],
+    deck_baseline: &[isolation::DeckProcess],
+    log_mark: Option<&isolation::LogMark>,
+    inner_pid_ns: Option<&str>,
+) -> bool {
+    let mut clean = true;
+    let mut fail = |ev: &mut Evidence, msg: String| {
+        clean = false;
+        ev.postconditions.push(format!("**FAILED:** {msg}"));
+        ev.isolation_failed(msg);
+    };
+    match isolation::processes_touching(&sb.root, inner_pid_ns) {
+        Ok(hits) if hits.is_empty() => ev.postconditions.push(format!(
+            "no process is left in the run's PID namespace ({}), and none refers to `{}` by cwd, \
+             root, exe, open file or the run's marker",
+            inner_pid_ns.unwrap_or("never reported"),
+            sb.root.display()
+        )),
+        Ok(hits) => fail(
+            ev,
+            format!(
+                "processes still refer to the sandbox after the namespace exited (NOT signalled — \
+                 the outer half signals nothing but its own bwrap child): {}",
+                hits.join("; ")
+            ),
+        ),
+        Err(e) => fail(ev, format!("the leak census could not run: {e}")),
     }
-    ev.step("declined the prompt (`n`); the branch TUI attached to the OLD daemon unchanged");
-
-    println!("xver: step 5 — delegate first, hooks last");
-    focus_role(&new_tui, ROLE_ORCHESTRATOR)?;
-    let nonce = epoch_secs();
-    let delegate_sentinel = format!("XVER-DELEGATE-{nonce}");
-    type_into_pane(
-        &new_tui,
-        &format!(
-            "dot-agent-deck delegate --to {ROLE_CODER} --to {ROLE_REVIEWER} --task \"{delegate_sentinel} list the files in this directory\""
-        ),
-    );
-
-    // Delivery is asserted on the PAYLOAD, in the target pane, not on the CLI's
-    // exit code. `coder` is `cat`, so whatever the daemon wrote into its PTY is
-    // echoed straight back onto the screen.
-    focus_role(&new_tui, ROLE_CODER)?;
-    let pointer = format!("worker-task-{ROLE_CODER}.md");
-    let delivered = new_tui.wait_for_grid(UI_TIMEOUT, |g| {
-        g.contains(&pointer) || g.contains(&delegate_sentinel)
-    });
-    let coder_grid = new_tui.grid();
-    ev.excerpt("`coder` role pane after the delegate", coder_grid.clone());
-    let task_file = sb
-        .project
-        .join(".dot-agent-deck")
-        .join(format!("worker-task-{ROLE_CODER}.md"));
-    let task_file_note = match std::fs::read_to_string(&task_file) {
-        Ok(body) if body.contains(&delegate_sentinel) => {
-            format!("{} carries the sentinel", task_file.display())
-        }
-        Ok(_) => format!(
-            "{} exists but does NOT carry the sentinel",
-            task_file.display()
-        ),
-        Err(e) => format!("{} unreadable: {e}", task_file.display()),
-    };
-    ev.tell(
-        "tell-3",
-        "a delegate still routed",
-        if delivered {
-            Verdict::Pass
-        } else {
-            Verdict::Fail
-        },
-        format!(
-            "delegated `{delegate_sentinel}` from the orchestrator pane to `{ROLE_CODER}` and \
-             `{ROLE_REVIEWER}`, typed into the orchestrator's own PTY through the BRANCH TUI's \
-             pane-input path to the OLD daemon.\n\
-             looked for `{pointer}` or `{delegate_sentinel}` on the `{ROLE_CODER}` pane: {}\n\
-             {task_file_note}",
-            if delivered { "found" } else { "NOT FOUND" }
-        ),
-    );
-
-    // Hooks. `work-done` first, `agent-event` last: a bare `AgentEvent` makes
-    // the daemon classify that pane's agent type as `Pi`, which routes prompt
-    // delivery differently and makes a delivered delegate briefly look
-    // undelivered.
-    focus_role(&new_tui, ROLE_REVIEWER)?;
-    let work_done_sentinel = format!("XVER-WORKDONE-{nonce}");
-    type_into_pane(
-        &new_tui,
-        &format!("dot-agent-deck work-done --task \"{work_done_sentinel}\""),
-    );
-    focus_role(&new_tui, ROLE_ORCHESTRATOR)?;
-    let feedback = format!("Worker {ROLE_REVIEWER} has completed their task");
-    let work_done_arrived = new_tui.wait_for_grid(UI_TIMEOUT, |g| g.contains(&feedback));
-    ev.excerpt(
-        "orchestrator role pane after the worker's `work-done`",
-        new_tui.grid(),
-    );
-
-    focus_role(&new_tui, ROLE_REVIEWER)?;
-    type_into_pane(&new_tui, "dot-agent-deck agent-event --type running");
-    let status_rows = wait_for_status(new_bin, env, &sb.project, DAEMON_TIMEOUT, |rows| {
-        rows.iter()
-            .any(|r| r.role.contains(ROLE_REVIEWER) && !r.status.is_empty() && r.status != "Idle")
-    });
-    let (status_ok, status_note) = match &status_rows {
-        Ok(rows) => {
-            let row = rows.iter().find(|r| r.role.contains(ROLE_REVIEWER));
-            (
-                true,
-                format!(
-                    "`daemon status --json`, asked by the BRANCH binary of the OLD daemon, reports \
-                     the `{ROLE_REVIEWER}` pane as `{}`",
-                    row.map(|r| r.status.clone()).unwrap_or_default()
-                ),
-            )
-        }
-        Err(e) => (false, format!("the status never changed: {e}")),
-    };
-    ev.tell(
-        "tell-4",
-        "hooks (work-done, status) still arrived",
-        if work_done_arrived && status_ok {
-            Verdict::Pass
-        } else {
-            Verdict::Fail
-        },
-        format!(
-            "work-done: issued `dot-agent-deck work-done --task \"{work_done_sentinel}\"` from \
-             inside the `{ROLE_REVIEWER}` pane; the daemon's feedback line \"{feedback}\" {} in \
-             the orchestrator's pane.\n\
-             status: issued `dot-agent-deck agent-event --type running` from inside the \
-             `{ROLE_REVIEWER}` pane, LAST as rule 12 requires. {status_note}",
-            if work_done_arrived {
-                "appeared"
-            } else {
-                "did NOT appear"
+    match isolation::verify_host(host) {
+        Ok(()) => {
+            for line in isolation::describe_host(host) {
+                ev.postconditions
+                    .push(format!("unchanged since baseline, {line}"));
             }
-        ),
-    );
-
-    // --- tells 1 and 2, measured last so they cover the whole run ------------
-    let listening = count_in_file(&sb.log, "Attach protocol listening");
-    ev.tell(
-        "tell-1",
-        "exactly one `Attach protocol listening` line for the whole run",
-        if listening == 1 {
-            Verdict::Pass
-        } else {
-            Verdict::Fail
+        }
+        Err(e) => fail(ev, e),
+    }
+    match isolation::host_listeners_under(&sb.root) {
+        Ok(v) if v.is_empty() => ev
+            .postconditions
+            .push("the host's Unix socket table has no listener under the sandbox".to_string()),
+        Ok(v) => fail(ev, format!("host listeners under the sandbox: {v:?}")),
+        Err(e) => fail(ev, e),
+    }
+    match isolation::deck_census() {
+        Ok(now) => {
+            let gone: Vec<&isolation::DeckProcess> = deck_baseline
+                .iter()
+                .filter(|b| {
+                    !now.iter()
+                        .any(|n| n.pid == b.pid && n.start_time == b.start_time)
+                })
+                .collect();
+            ev.postconditions.push(format!(
+                "{} of {} baseline deck process(es) are still the same process (pid and start \
+                 time){}",
+                deck_baseline.len() - gone.len(),
+                deck_baseline.len(),
+                if gone.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        "; exited during the run, from outside it — this harness signals no host \
+                         process: {}",
+                        gone.iter()
+                            .map(|g| format!("pid {} `{}`", g.pid, g.exe.display()))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                }
+            ));
+        }
+        Err(e) => fail(ev, format!("the deck census could not run: {e}")),
+    }
+    match log_mark {
+        Some(mark) => match isolation::log_mentions_since(mark, &sb.root.display().to_string()) {
+            Ok((n, hits)) if hits.is_empty() => ev.postconditions.push(format!(
+                "the operator's real log `{}` gained {n} byte(s) from other writers during the \
+                 run; none of them mention the sandbox",
+                mark.path.display()
+            )),
+            Ok((_, hits)) => fail(
+                ev,
+                format!(
+                    "the operator's real log `{}` mentions the sandbox: {hits:?}",
+                    mark.path.display()
+                ),
+            ),
+            Err(e) => fail(ev, e),
         },
-        format!(
-            "{} matched in {}. Two would mean the branch TUI lazy-spawned its own daemon and this \
-             was a meaningless same-version test — the tell for BOTH the no-agents cause and the \
-             30-second idle-window cause.",
-            match listening {
-                1 => "1 line".to_string(),
-                n => format!("{n} lines"),
-            },
-            sb.log.display()
-        ),
-    );
-
-    let listeners_at_end = proc::listeners_on(attach_endpoint);
-    let exe_now = proc::exe_path(daemon.pid);
-    let same_exe = exe_now.as_deref() == Some(old_bin);
-    let listener_verdict = match (&listeners_at_start, &listeners_at_end) {
-        (Some(a), Some(b)) => Some(a == b && a.contains(&daemon.pid)),
-        _ => None,
-    };
-    let (verdict, listener_note) = match listener_verdict {
-        Some(true) if same_exe => (Verdict::Pass, "matched at both ends".to_string()),
-        Some(false) => (
-            Verdict::Fail,
-            format!(
-                "CHANGED: {listeners_at_start:?} at the start, {listeners_at_end:?} at the end"
-            ),
-        ),
-        Some(true) => (
-            Verdict::Fail,
-            format!(
-                "the listener pid matched but /proc/{}/exe is now {:?}, not the old binary",
-                daemon.pid, exe_now
-            ),
-        ),
-        None => (
-            Verdict::NotChecked,
-            "`ss -xlp` was unavailable or unparseable on this host, so who owns the endpoint was \
-             not measured"
+        None => ev.postconditions.push(
+            "the operator's real deck log does not exist, so there was nothing to escape into"
                 .to_string(),
         ),
-    };
-    ev.tell(
-        "tell-2",
-        "the same daemon pid and the same build id served the run end to end",
-        verdict,
-        format!(
-            "pid {} was alive at the start and {} at the end.\n\
-             /proc/{}/exe -> {:?} (the {} binary is {})\n\
-             the mismatch prompt the branch TUI printed reported the daemon's build id and its \
-             own, so both sides' build ids were observed over the wire — see the excerpt.\n\
-             `ss -xlp` on {}: {listener_note}",
-            daemon.pid,
-            if proc::is_alive(daemon.pid) {
-                "alive"
-            } else {
-                "GONE"
-            },
-            daemon.pid,
-            exe_now,
-            opts.previous,
-            old_bin.display(),
-            attach_endpoint.display(),
-        ),
-    );
-
-    if mode == EndpointMode::Resolved {
-        // The change that makes `resolved` mode necessary (issue #1121) claims
-        // its compatibility read is READ-ONLY: a branch build that found the old
-        // daemon at the legacy address must never bind, create or unlink
-        // anything at its own spelling. Recorded as an observation rather than
-        // as a fifth tell — it is specific to one change's claim, where the four
-        // tells are what rule 12 asks of every change.
-        let own_dir = sandbox::fallback_endpoint_dir(&sb.tmp);
-        ev.step(format!(
-            "the branch build's own endpoint directory {} {} while it was attached to the old \
-             daemon at the legacy address",
-            own_dir.display(),
-            if own_dir.exists() {
-                "EXISTS — the branch build created its own spelling"
-            } else {
-                "does not exist — the compatibility read stayed read-only"
-            }
-        ));
     }
-
-    ev.excerpt(
-        "sandbox deck.log (tail)",
-        tail(&std::fs::read_to_string(&sb.log).unwrap_or_default(), 80),
-    );
-    Ok(())
+    clean
 }
 
-/// Drive the production new-pane flow to open the fixture's single
-/// orchestration against the deck's current directory.
-///
-/// With no `[[modes]]` in the fixture the mode-chip row is
-/// `[No mode] [Orch: xver] [schedule]`, so ONE Right selects the orchestration;
-/// selecting one hides the Command field, so the second Enter submits.
-fn open_orchestration(deck: &pty::PtyDeck) -> Result<(), String> {
-    deck.send(b"\x0e"); // Ctrl+N -> directory picker
-    std::thread::sleep(SETTLE);
-    deck.send(b" "); // Space -> confirm the current dir -> new-pane form
-    if !deck.wait_for_grid_string("No mode", STEP_TIMEOUT) {
+/// Remove a finished sandbox — only the canonical `$S` of this run, only after
+/// the leak census found nothing, and only if it is still the private directory
+/// this run created directly under the runs root.
+fn remove_sandbox(sb: &Sandbox, runs_root: &Path) -> Result<(), String> {
+    let canon = std::fs::canonicalize(&sb.root).map_err(|e| format!("{e}"))?;
+    if canon != sb.root || canon.parent() != Some(runs_root) {
         return Err(format!(
-            "the new-pane form never appeared.\n=== grid ===\n{}",
-            deck.grid()
+            "{} is not directly under {}; not removing it",
+            canon.display(),
+            runs_root.display()
         ));
     }
-    deck.send(b"\x1b[C"); // Right -> [Orch: xver]
-    if !deck.wait_for_grid_string("xver", STEP_TIMEOUT) {
-        return Err(format!(
-            "the orchestration chip never became selected.\n=== grid ===\n{}",
-            deck.grid()
-        ));
-    }
-    std::thread::sleep(SETTLE);
-    deck.send(b"\r"); // Mode -> Name
-    std::thread::sleep(SETTLE);
-    deck.send(b"\r"); // submit
-    Ok(())
-}
-
-/// Give keyboard focus to `role`'s pane and leave the deck in `PaneInput` mode
-/// on it.
-///
-/// `Ctrl+D` returns to Normal mode, a digit jumps to that role's card, and
-/// `focus_deck` re-enters `PaneInput` on success — so one digit both selects the
-/// pane and makes it the one keystrokes reach. `PaneLayout::Stacked` draws only
-/// the focused role's pane and fuses its title into the box corner as
-/// `┌<role>`, so that string on the settled grid is what confirms the jump
-/// landed.
-///
-/// Cycles tabs first when the deck is not on the orchestration tab: after a
-/// reattach the deck lands wherever the previous session left it, and a digit on
-/// the Dashboard tab means something else.
-fn focus_role(deck: &pty::PtyDeck, role: &str) -> Result<(), String> {
-    let digit: u8 = match role {
-        ROLE_ORCHESTRATOR => b'1',
-        ROLE_CODER => b'2',
-        ROLE_REVIEWER => b'3',
-        other => return Err(format!("no card index known for role {other}")),
-    };
-    let expanded = format!("┌{role}");
-    for attempt in 0..6 {
-        deck.send(b"\x04"); // Ctrl+D -> Normal mode
-        std::thread::sleep(SETTLE);
-        deck.send(&[digit]);
-        if deck.wait_for_grid_string(&expanded, STEP_TIMEOUT) {
-            return Ok(());
-        }
-        // Not on the orchestration tab (or not yet rebuilt): step right one tab
-        // and try again.
-        deck.send(b"\x04");
-        std::thread::sleep(SETTLE);
-        deck.send(b"\x1b[C");
-        std::thread::sleep(SETTLE);
-        if attempt == 5 {
-            return Err(format!(
-                "could not focus the `{role}` role pane (looked for {expanded:?}).\n=== grid ===\n{}",
-                deck.grid()
-            ));
-        }
-    }
-    unreachable!("the loop returns or errors on its last iteration")
-}
-
-/// Type `text` into the focused pane and submit it.
-///
-/// The submit CR is a separate write after a pause: a CR fused to the preceding
-/// text is treated as newline-in-input by agent TUIs, and the deck's own
-/// `SUBMIT_DELAY` exists for the same reason.
-fn type_into_pane(deck: &pty::PtyDeck, text: &str) {
-    deck.send(text.as_bytes());
-    std::thread::sleep(Duration::from_millis(300));
-    deck.send(b"\r");
-    std::thread::sleep(SETTLE);
-}
-
-/// Pull the build-version mismatch prompt out of a deck's byte history.
-///
-/// The prompt is printed in raw mode before the deck takes the alternate
-/// screen, so it exists only in the stream — by the time a frame has been
-/// painted the grid no longer holds it.
-fn extract_prompt(stream: &str) -> String {
-    let Some(start) = stream.find("Daemon version mismatch") else {
-        return String::new();
-    };
-    let rest = &stream[start..];
-    let end = rest
-        .find("keep current daemon")
-        .map(|i| i + "keep current daemon".len())
-        .unwrap_or(rest.len().min(600));
-    rest[..end].replace('\r', "")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn extract_prompt_takes_the_whole_prompt_and_drops_the_carriage_returns() {
-        let stream = "junk before\r\n\
-             ⚠  Daemon version mismatch  (2 agent(s) running)\r\n\
-             \x20  running daemon:  0.41.0-gc19c7d7\r\n\
-             \x20  this binary:     0.41.0-g19385813\r\n\
-             \x20  [S] restart daemon and continue   [any other key] keep current daemon\r\n\
-             junk after";
-        let got = extract_prompt(stream);
-        assert!(got.starts_with("Daemon version mismatch"), "{got}");
-        assert!(got.ends_with("keep current daemon"), "{got}");
-        assert!(!got.contains('\r'));
-        assert!(got.contains("0.41.0-gc19c7d7") && got.contains("0.41.0-g19385813"));
-    }
-
-    #[test]
-    fn extract_prompt_is_empty_when_no_prompt_was_printed() {
-        assert!(extract_prompt("no prompt here").is_empty());
-    }
-
-    const OLD_HELLO: &str = r#"{"ok":true,"server_version":10,"build_version":"0.41.0-gaaaaaaa","contract_breaks":["x"]}"#;
-
-    #[test]
-    fn identical_build_ids_are_refused_before_anything_is_started() {
-        let err = compare_hellos(OLD_HELLO, OLD_HELLO).expect_err("a same-version pairing");
-        assert!(err.contains("same-version run"), "{err}");
-    }
-
-    #[test]
-    fn a_matching_protocol_version_is_reported_as_semantics_behind_a_stable_wire() {
-        let new = OLD_HELLO.replace("gaaaaaaa", "gbbbbbbb");
-        let notes = compare_hellos(OLD_HELLO, &new).expect("differing build ids");
-        assert!(
-            notes
-                .iter()
-                .any(|n| n.contains("SEMANTICS behind a stable wire")),
-            "{notes:?}"
-        );
-        assert!(
-            notes
-                .iter()
-                .any(|n| n.contains("CONTRACT_BREAKS identical")),
-            "{notes:?}"
-        );
-    }
-
-    #[test]
-    fn a_differing_protocol_version_is_reported_rather_than_refused() {
-        let new = OLD_HELLO
-            .replace("gaaaaaaa", "gbbbbbbb")
-            .replace("\"server_version\":10", "\"server_version\":11");
-        let notes = compare_hellos(OLD_HELLO, &new).expect("a protocol difference is not fatal");
-        assert!(
-            notes.iter().any(|n| n.contains("PROTOCOL_VERSION DIFFERS")),
-            "{notes:?}"
-        );
-    }
-
-    #[test]
-    fn a_differing_contract_break_list_names_the_desktop_surface_this_does_not_cover() {
-        let new = OLD_HELLO
-            .replace("gaaaaaaa", "gbbbbbbb")
-            .replace(r#"["x"]"#, r#"["x","y"]"#);
-        let notes = compare_hellos(OLD_HELLO, &new).expect("differing build ids");
-        assert!(
-            notes.iter().any(|n| n.contains("classify_handshake")),
-            "{notes:?}"
-        );
-    }
-
-    #[test]
-    fn tail_keeps_the_last_lines() {
-        assert_eq!(tail("a\nb\nc\nd", 2), "c\nd");
-        assert_eq!(tail("only", 5), "only");
-    }
-
-    #[test]
-    fn count_in_file_counts_occurrences_and_tolerates_a_missing_file() {
-        let dir = std::env::temp_dir().join(format!("xver-count-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("tempdir");
-        let f = dir.join("log");
-        std::fs::write(
-            &f,
-            "Attach protocol listening on a\nnoise\nAttach protocol listening on b\n",
-        )
-        .expect("write");
-        assert_eq!(count_in_file(&f, "Attach protocol listening"), 2);
-        assert_eq!(count_in_file(&dir.join("absent"), "x"), 0);
-        let _ = std::fs::remove_dir_all(dir);
-    }
+    sandbox::require_private_dir(&canon)?;
+    std::fs::remove_dir_all(&canon).map_err(|e| format!("remove {}: {e}", canon.display()))
 }

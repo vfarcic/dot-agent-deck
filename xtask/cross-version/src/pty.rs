@@ -18,6 +18,8 @@ use std::time::{Duration, Instant};
 
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 
+use crate::proc;
+
 /// How often a `wait_for_*` re-reads the screen. Short enough that a settled
 /// frame is noticed promptly, long enough that a whole run costs a few thousand
 /// wakeups rather than a core.
@@ -90,8 +92,12 @@ pub struct PtyDeck {
     parser: Arc<Mutex<vt100::Parser>>,
     history: Arc<Mutex<Vec<u8>>>,
     child: Box<dyn Child + Send + Sync>,
+    /// Captured right after spawn; re-verified before the one signal this
+    /// struct ever sends.
+    pub identity: proc::Identity,
     stop: Arc<AtomicBool>,
     reader: Option<std::thread::JoinHandle<()>>,
+    shut_down: bool,
 }
 
 /// What to launch under a PTY.
@@ -144,11 +150,26 @@ impl PtyDeck {
             cmd.env(k, v);
         }
 
-        let child = pair
+        let mut child = pair
             .slave
             .spawn_command(cmd)
             .map_err(|e| format!("spawn {} for {label}: {e}", bin.display()))?;
         drop(pair.slave);
+        // Fail closed: a client whose identity cannot be recorded is one that
+        // could not later be signalled safely, so it is not left running.
+        let identity = match child
+            .process_id()
+            .ok_or_else(|| format!("{label}: the PTY child reported no pid"))
+            .and_then(|pid| proc::Identity::capture_spawned(pid as i32, bin))
+        {
+            Ok(id) => id,
+            Err(e) => {
+                // Still un-reaped, so this handle cannot reach a recycled pid.
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("{label}: could not record its identity: {e}"));
+            }
+        };
 
         let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, 0)));
         let history = Arc::new(Mutex::new(Vec::<u8>::new()));
@@ -205,8 +226,10 @@ impl PtyDeck {
             parser,
             history,
             child,
+            identity,
             stop,
             reader: Some(handle),
+            shut_down: false,
         })
     }
 
@@ -287,29 +310,64 @@ impl PtyDeck {
         }
     }
 
-    /// Persist the raw stream, then stop the reader thread and kill the child if
-    /// it is still running.
+    /// Persist the raw stream, then stop the child if it is still running and
+    /// stop the reader thread. Returns what happened, for the run log.
     ///
-    /// Killing here is scoped to the one child this struct spawned — never a
-    /// pattern match. See `docs/develop/cross-version-harness.md`'s teardown
-    /// section for why that distinction is load-bearing.
-    pub fn shutdown(&mut self) {
+    /// The one signal here goes to the one child this struct spawned, through
+    /// its still-un-reaped handle, and only after its whole recorded identity
+    /// has been re-read and matched — never a pattern match. See
+    /// `docs/develop/cross-version-harness.md`'s teardown section for why that
+    /// distinction is load-bearing. Idempotent.
+    pub fn shutdown(&mut self) -> String {
+        if self.shut_down {
+            return format!("{}: already shut down", self.label);
+        }
+        self.shut_down = true;
         if let Some(parent) = self.stream_log.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
         let _ = std::fs::write(&self.stream_log, self.stream().as_bytes());
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        let note = match self.child.try_wait() {
+            Ok(Some(status)) => format!("{} had already exited ({status:?})", self.label),
+            _ => match self.identity.verify() {
+                Ok(()) => {
+                    let _ = self.child.kill();
+                    let _ = self.child.wait();
+                    format!(
+                        "{} (pid {}) stopped through its un-reaped child handle after its full \
+                         identity was re-verified",
+                        self.label, self.identity.pid
+                    )
+                }
+                Err(proc::Mismatch::Gone) => {
+                    let _ = self.child.wait();
+                    format!(
+                        "{} (pid {}) was already gone",
+                        self.label, self.identity.pid
+                    )
+                }
+                Err(m) => {
+                    // Refused. Do not join the reader either: with the child
+                    // still holding the PTY it would block forever. The
+                    // namespace's exit reaps whatever this was.
+                    return format!(
+                        "REFUSED to signal {} (pid {}): {m}",
+                        self.label, self.identity.pid
+                    );
+                }
+            },
+        };
         self.stop.store(true, Ordering::Relaxed);
         if let Some(h) = self.reader.take() {
             let _ = h.join();
         }
+        note
     }
 }
 
 impl Drop for PtyDeck {
     fn drop(&mut self) {
-        self.shutdown();
+        let _ = self.shutdown();
     }
 }
 

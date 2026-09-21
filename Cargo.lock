@@ -6316,6 +6316,7 @@ dependencies = [
  "clap",
  "libc",
  "portable-pty",
+ "serde",
  "serde_json",
  "vt100",
 ]

@@ -3,8 +3,10 @@
 CLAUDE.md rule 12 requires, for any change touching the daemon, the TUI↔daemon protocol, orchestration or hooks, a **cross-version manual test**: build the branch, start a daemon from the previous release with an agent under it, run the branch TUI against that older daemon, and confirm a delegate still routes and hooks still arrive. `cargo xver` does that, scripted.
 
 ```sh
-cargo xver -- --branch agent/dispatch-issue-1121
+cargo xver --branch agent/dispatch-issue-1121
 ```
+
+`cargo xver -- --branch …` is accepted too. The alias already ends in `--`, so that spelling used to reach clap as a positional argument and fail; the binary now drops one leading `--`.
 
 ## Why this exists
 
@@ -14,16 +16,17 @@ Rule 12's procedure is written in keystrokes because a person was always going t
 
 ## What a run does
 
-1. Builds the branch in a **reusable, disk-backed worktree** at `../dot-agent-deck-xver`, with a `CARGO_TARGET_DIR` at `../dot-agent-deck-xver-target` that is reused across branches so the cargo cache survives. The checkout is **detached at `FETCH_HEAD`**, so nothing in that worktree can commit, amend, rebase or push to the branch it is verifying — and a branch already checked out in somebody else's worktree still works.
-2. Downloads the previous release's published `dot-agent-deck-linux-amd64` with `gh release download`, caches it under `../dot-agent-deck-xver-releases/<tag>/`, and asserts it really reports that version before trusting it.
-3. Creates a fresh sandbox under `../dot-agent-deck-xver-runs/<branch slug>-<epoch>/` and writes a three-role `.dot-agent-deck.toml` into it.
-4. Starts the **old** daemon there, capturing its pid.
-5. Attaches the **old** TUI over a PTY and opens the orchestration through the production `Ctrl+N` flow, then confirms through `daemon status --json` that all three role panes and their processes are genuinely live.
-6. Closes that TUI with `Ctrl+D`, `Ctrl+C`, **Detach** — then re-checks that the daemon pid is alive and still lists three roles.
-7. Attaches the **branch** TUI over a PTY, waits for the build-version mismatch prompt, records it, and **declines** it with `n`.
-8. Delegates from inside the orchestrator pane, then issues `work-done` and — last — `agent-event --type running` from inside a worker pane.
-9. Tears the sandbox daemon down **by pid**.
-10. Writes a markdown evidence file to `.dot-agent-deck/xver-evidence/<branch slug>.md`.
+A run has two halves. The **outer** half is the command you type; the **inner** half is the same binary, started by the outer half inside one private [bubblewrap](https://github.com/containers/bubblewrap) namespace. The daemon, both TUIs and every deck CLI call are started by the inner half, inside that namespace. The one deck binary the outer half runs itself is the old binary's `--version` — a static print, run with an empty environment, to verify the download.
+
+1. **Outer, preflight.** Refuses a tmpfs or short-of-space runs root or target dir (`--min-free-gib`, default 100), proves an unprivileged `bwrap --unshare-all --disable-userns` namespace starts on this host, snapshots every host endpoint candidate (file identity, listening socket inodes, and the owning pid and start time of each listener), censuses the host's deck processes — by executable name, as far as this uid can read them — by pid, start time and exe, and marks how far the operator's real deck log reached. In `resolved` mode it also requires the host's flat endpoints and per-uid endpoint sockets absent.
+2. **Outer, inputs.** Downloads the previous release's `dot-agent-deck-linux-amd64` with `gh release download` into `../dot-agent-deck-xver-releases/<tag>/`, requires `--version` to print exactly `dot-agent-deck <version>`, and records its SHA-256. Fetches the branch into a **standalone build clone** at `../dot-agent-deck-xver-src`, detached at `FETCH_HEAD`, and builds it with a `CARGO_TARGET_DIR` at `../dot-agent-deck-xver-target` reused across branches (see [The build clone](#the-build-clone)).
+3. **Outer, sandbox.** Creates a fresh, owner-only (`0700`) sandbox `$S` under `../dot-agent-deck-xver-runs/<branch slug>-<epoch>/`, refusing to reuse any existing entry. Writes the three-role fixture into `$S/project/.dot-agent-deck.toml` and makes `$S/project` a standalone `git init` repository. Hard-links (or copies, across filesystems) the old binary, the branch binary and the harness itself into `$S`, so every deck binary the namespace runs, and the harness itself, has a path under `$S`.
+4. **Outer, namespace.** Starts `bwrap` with the harness inside it and answers the inner half over its stdio (see [The pre-connect assertion](#the-pre-connect-assertion)).
+5. **Inner, proof.** Reports its mount, PID and network namespaces to the outer half, which refuses any it shares; proves each mask by `dev:ino` and the operator's home empty; requires its own environment to be exactly the plan's allowlisted entries; and requires the fixture to be what stops the deck's project-config walk. Runs both builds' `daemon hello` and refuses a same-build-id pairing before any daemon starts.
+6. **Inner, scenario.** Starts the **old** daemon and records its full identity; waits, by reading the kernel's socket table rather than by starting a client, until it listens where the endpoint matrix says it must; attaches the **old** TUI over a PTY and opens the orchestration through the production `Ctrl+N` flow; confirms through `daemon status --json` that all three roles are live; closes that TUI with `Ctrl+D`, `Ctrl+C`, **Detach** and re-checks; attaches the **branch** TUI, records the build-version mismatch prompt and **declines** it with `n`; delegates from inside the orchestrator pane, then issues `work-done` and — last — `agent-event --type running` from inside a worker pane. The pre-connect assertion runs before every one of those clients.
+7. **Inner, teardown.** Stops the branch TUI and then the daemon, each by verified identity (see [Teardown](#teardown-is-by-verified-identity)), then censuses the PID namespace for survivors.
+8. **Outer, postconditions.** After the namespace has exited: requires no process left in the run's PID namespace and none referring to `$S`, the host's endpoint candidates unchanged since baseline, no host listener under `$S`, and no line mentioning `$S` among the bytes appended to the operator's real deck log; reports which baseline deck processes are still the same process.
+9. Writes a markdown evidence file to `.dot-agent-deck/xver-evidence/<branch slug>.md` and removes `$S` only after a clean pass with all postconditions met.
 
 ## The four tells
 
@@ -36,69 +39,124 @@ A run asserts these and prints each one with the value it was decided on, becaus
 | a delegate still routed | the payload really landed in the target pane |
 | hooks (work-done, status) still arrived | the daemon's feedback really reached the orchestrator's pane, and the status change really reached its own state |
 
-A tell the harness could not measure is reported as **not checked** and the run is **INCOMPLETE**, not a pass. Tell 2's ownership half is the one branch that reaches that today: on a host where `ss -xlp` is absent or unparseable, who owns the endpoint is not measured, and the harness says so rather than counting it either way.
+Tell 2's `ss -xlp` runs inside the namespace, so the pids it names are the run's private PID namespace's; the evidence also records the kernel table's own answer (listening inode and holders) at both ends. A tell the harness could not measure is reported as **not checked** and the run is **INCOMPLETE**, not a pass.
 
 ## The five false greens, and where each one is handled
 
 Rule 12 documents four ways this procedure silently measures nothing; PR #1179 added a fifth. A false green here is worse than not running the check at all, because it clears a gate with nothing behind it.
 
-1. **No agents under the old daemon.** With zero agents the branch TUI takes `MismatchAction::SilentRestart` — it SIGTERMs the old daemon and lazy-spawns its own, with no prompt and no output. Step 5 above is what avoids it, and the missing mismatch prompt is what catches it: the harness treats "no prompt" as a hard failure of the run rather than as a pass, because the prompt appearing *is* the proof the scenario was reached.
-2. **The 30-second idle window.** `DEFAULT_IDLE_SHUTDOWN_SECS` is 30, so more than 30 s between `daemon serve` and the first attach and the daemon exits and gets replaced. Every process in the run carries `DOT_AGENT_DECK_IDLE_SHUTDOWN_SECS=0`, which is the documented "always on" production value rather than a test hook.
+1. **No agents under the old daemon.** With zero agents the branch TUI takes `MismatchAction::SilentRestart` — it SIGTERMs the old daemon and lazy-spawns its own, with no prompt and no output. The scenario's orchestration step is what avoids it, and the missing mismatch prompt is what catches it: the harness treats "no prompt" as a hard failure of the run rather than as a pass, because the prompt appearing *is* the proof the scenario was reached.
+2. **The 30-second idle window.** `DEFAULT_IDLE_SHUTDOWN_SECS` is 30, so more than 30 s between `daemon serve` and the first attach and the daemon exits and gets replaced. Every process the harness starts carries `DOT_AGENT_DECK_IDLE_SHUTDOWN_SECS=0`, which is the documented "always on" production value rather than a test hook.
 3. **`Ctrl+C` in `PaneInput` mode goes to the pane.** With a role pane focused it kills that role's process and the orchestration comes back one role short. The harness sends `Ctrl+D` first, takes the default `Detach` (never `Stop`), and then re-asserts the three-role list — this one fails loudly rather than silently, and the re-assert is what makes it loud here.
-4. **Teardown by an unscoped `pkill`.** See [Teardown](#teardown-is-by-pid-and-refuses-a-recycled-one) below.
+4. **Teardown by an unscoped `pkill`.** See [Teardown](#teardown-is-by-verified-identity) below.
 5. **`XDG_RUNTIME_DIR` being set, for a change that moves the endpoint path in the fallback case only.** On a normal desktop session it is set, both builds resolve byte-identical endpoints, and the run exercises the arm such a change did not touch. `--unset-xdg-runtime-dir` is the lever, and it is an option rather than a hardcode because for every other kind of change the ordinary desktop configuration is the faithful one.
+
+## Isolation: what a run guarantees
+
+The first version of this harness isolated a run with environment variables alone, and in `resolved` mode that bound **real host addresses**: a run's published-v0.41.0 daemon, with `TMPDIR` pointing inside its sandbox, owned the host's `/tmp/dot-agent-deck-1000.sock` and `/tmp/dot-agent-deck-attach-1000.sock`, so for the length of that run any production client resolving the flat fallback would have reached a sandbox daemon. `TMPDIR` moves only a post-#1121 build's new primary fallback; the branch's compatibility root and every published build before it spell a literal `/tmp`. An independent safety audit then found the environment incomplete in every mode, the pre-connect check unable to tell who owned a socket, and a cmdline substring standing in for teardown identity. What follows is what replaced each of those, stated as narrowly as it was measured.
+
+### The namespace
+
+The daemon, both TUIs and every deck CLI call of a run execute inside one `bwrap` namespace, started with `--unshare-all --unshare-user --disable-userns --die-with-parent --new-session`, in which:
+
+- `/tmp` is `$S/fallback-tmp` and `/run/user/<uid>` is `$S/run-user`. **Both** endpoint roots are masked because masking `/tmp` alone is not enough: under a read-only view of `/`, the production XDG sockets stay connectable — a read-only mount does not stop `connect(2)` on a Unix socket.
+- `/var/tmp` is `$S/var-tmp`. No deck resolution rule names `/var/tmp`; other sandboxes park sockets there, and this keeps them out of reach as defence in depth.
+- The operator's home is an empty tmpfs with only `$S` bound back into it, so `~/.local/bin` (where the production deck lives on the box this was written on), `~/.config/dot-agent-deck`, `~/.dot-agent-deck.toml` and every neighbouring sandbox under the home are not visible inside.
+- The rest of `/` is bound read-only. **Not every submount honours that**: measured on the box this was written on, the submounts bwrap cannot remount stay `rw` — Docker's per-container `nsfs` and overlay mounts under `/run/docker/netns` and `/var/lib/docker/rootfs`, and `/proc/sys/fs/binfmt_misc` — all root-owned, so the run's uid has no write permission there. `awk '$6 ~ /(^|,)rw(,|$)/ {print $5}' /proc/self/mountinfo` run inside the same `bwrap` invocation lists them on another host.
+- The PID, network, IPC, UTS and user namespaces are private, and creating a nested user namespace is disabled.
+
+Inside it a run resolves endpoints the way a real host does: with `XDG_RUNTIME_DIR` unset and `TMPDIR=/tmp`, a v0.41.0 daemon binds `/tmp/dot-agent-deck[-attach]-<uid>.sock` and a post-#1121 build looks first in `/tmp/dot-agent-deck-<uid>/` and then at those legacy paths — the same spelling as on the host, landing in `$S/fallback-tmp`. With `XDG_RUNTIME_DIR` kept, it is pinned to the host's spelling `/run/user/<uid>`, which inside is `$S/run-user`.
+
+### The environment
+
+Every process the harness starts gets an environment built from an allowlist — `env -i`, not an overlay on the caller's. Processes the daemon starts — the panes — inherit the daemon's, plus the deck's own pane variables. The allowlist is `sandbox::ALLOWED_ENV`; the inner half requires its own environment to be exactly the plan's entries (which proves `--clearenv` held), the daemon's `/proc/<pid>/environ` is checked against the same map and recorded in the evidence, and a credential-shaped name is refused even if someone adds it to the allowlist.
+
+| variable | why |
+| --- | --- |
+| `PATH` = `$S/bin:/usr/local/bin:/usr/bin:/bin` | the staged branch build first, so a pane that shells a bare `dot-agent-deck` reaches the **branch** binary while the daemon in memory is still the old one — which models the upgrade this test is about. The operator's `~/.local/bin` is deliberately absent |
+| `HOME`, `TMPDIR=/tmp`, `TERM`, `LC_ALL`, `COLORTERM`, `SHELL`, `USER`, `LOGNAME` | ordinary settings; `USER`/`LOGNAME` come from the password database, not from the caller |
+| `XDG_CONFIG_HOME`, `XDG_STATE_HOME`, `XDG_DATA_HOME`, `XDG_CACHE_HOME` | `HOME` alone does not cover them: `schedules_path()` consults an inherited `XDG_CONFIG_HOME` before `HOME`, so a sandbox daemon could otherwise read the operator's real schedules and fire them |
+| `DOT_AGENT_DECK_CONFIG`, `_SESSION`, `_SCHEDULES` | pinned to files under `$S/config` that are never created — an absent schedules file is "no schedules" |
+| `DOT_AGENT_DECK_STATE_DIR`, `_LOCK_DIR` | per-user state and the per-endpoint lock |
+| `DOT_AGENT_DECK_LOG` | **resolved separately from the state dir.** Without it an otherwise-isolated daemon appends into the operator's real `~/.local/state/dot-agent-deck/deck.log` |
+| `DOT_AGENT_DECK_EXPERIMENTAL` | pinned explicitly (off by default, `--experimental` to turn it on) rather than inherited |
+| `DOT_AGENT_DECK_IDLE_SHUTDOWN_SECS=0` | false green 2 above |
+| `DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS` | a second backstop for a stand-in that escapes its process group; the PID namespace is the first |
+| `GIT_CONFIG_NOSYSTEM=1` | git inside the run reads no system config |
+| `DAD_XVER_SANDBOX=$S` | the run's unique marker: part of every sandbox process's identity, and what the post-run census looks for |
+| `XDG_RUNTIME_DIR` | `/run/user/<uid>` (private inside) or, with `--unset-xdg-runtime-dir`, **absent** |
+| `DOT_AGENT_DECK_SOCKET`, `_ATTACH_SOCKET` | `$S/hook.sock` / `$S/attach.sock` in `sandbox-sockets` mode; **absent** in `resolved` mode |
+
+The fixture `$S/project/.dot-agent-deck.toml` is created fresh, must be a regular file owned by the run's uid, and is re-verified before launch: the deck's project-config discovery walks up from **cwd** and stops at the first such file, so this is what keeps the walk from reaching the operator's own config. The masked home makes that doubly true, since nothing above `$S` is visible to walk into.
+
+### The pre-connect assertion
+
+Immediately before every client process — each TUI, each `daemon status` poll — and before every deck command typed into a pane, the inner half re-proves, and aborts before the client exists if any of it fails or cannot be evaluated. The harness's own clients are spawned directly, with no shell between the last check and their `execve`. A command typed into a pane is started by that pane's stand-in shell instead, with the environment the daemon gave the pane — the daemon's own, verified against the plan as part of its identity, plus the deck's pane variables — so check 2 covers a pane command only through the daemon's environment.
+
+1. its mount namespace is the one it recorded at startup and not the outer half's, and each mask's `dev:ino` still matches;
+2. the client's environment is exactly the plan's and passes the allowlist policy;
+3. the daemon still matches its recorded identity (below);
+4. each endpoint the matrix says the daemon owns is listening **in the kernel's table**, every listening inode there is held in `/proc/<daemon pid>/fd`, and the path is an owner-only socket of the run's uid;
+5. each candidate the matrix says must be absent has no file and no listener;
+6. every listening Unix socket in the run's network namespace is held by the daemon — which is what rules out a second daemon, because only a listening one is reachable. A command-line count could not: with a lifetime cap set, the daemon forks (not execs) a reaper per pane that keeps its exe, command line and environment and never listens;
+7. the outer half confirms the host's endpoint candidates are exactly as at baseline — same file identity or still absent, same listening inodes, every baseline owner still the same process holding its socket — and that no host listener lies under `$S`.
+
+The endpoint matrix for `resolved` with `XDG_RUNTIME_DIR` unset — the #1121 configuration — is: the old daemon owns the flat `/tmp/dot-agent-deck[-attach]-<uid>.sock`; the per-uid `/tmp/dot-agent-deck-<uid>/{hook,attach}.sock` and the XDG pair must be absent. That absent half is what proves a run reached the **fallback arm** rather than one #1121 did not touch: of the endpoint candidates a branch client resolves, the only one that answers is the legacy flat one, reached through the compatibility read. The evidence records that proof before the branch TUI starts, and confirms it afterwards from tells 1 and 2.
+
+**What the assertion does not have to win is the race.** Between the last check and the client's `connect`, the expected socket could vanish. A client that then resolves onward can only land on another path inside `/tmp` or `/run/user/<uid>` — both private — because its environment names no host path. There it would lazy-spawn a daemon inside the namespace, which tell 1's count and the next pre-connect's second-listener check both catch. So the TOCTOU window can turn a run into a FAIL; it cannot reach a host endpoint.
+
+### Teardown is by verified identity
+
+On 2026-09-15 an agent finishing with a cross-version sandbox ran `pkill -f "daemon serve"`. That pattern also matches the **production** daemon's own command line, which took the SIGTERM 1.42 s later and gracefully stopped nine panes across three dispatched units ([#428 occurrence #5](https://github.com/vfarcic/dot-agent-deck/issues/428#issuecomment-5688814518)). `pkill` sends SIGTERM, so it goes *around* issue #770's `daemon stop` refusal rather than having to defeat it.
+
+Nothing in this harness signals by name, and a cmdline substring no longer counts as identity. Each process the inner half spawns has, captured right after spawn and re-read immediately before any signal: its start time (field 22 of `/proc/<pid>/stat`), `/proc/<pid>/exe`, its exact NUL-separated command line, its cwd, its **whole** environment (which carries `DAD_XVER_SANDBOX`), and its mount namespace. A single difference refuses the signal and is recorded. The daemon gets exactly **one** SIGTERM — a second one force-exits it past its graceful teardown — then 20 s, well past its 3 s agent grace, and SIGKILL only after a second full re-verification. Two structural properties sit underneath the checks rather than replacing them: the process is inside the run's private PID namespace, where no host process has a pid at all; and its `Child` handle stays un-reaped until after the last signal, so the kernel cannot give its pid to anyone else in between. The TUIs are stopped through their own un-reaped handles after the same re-verification.
+
+After the daemon, the inner half censuses the PID namespace: each survivor that carries the run's marker is signalled individually after its identity is recorded; one that does not is left alone. When the inner half exits, bwrap's init exits with it and the kernel kills every process left in the PID namespace, `setsid`'d or not; the outer half's census then requires that namespace empty. The outer half itself signals nothing but its own `bwrap` child, and only when `--run-timeout-secs` (default 1200) expires — through that child's un-reaped handle, which takes the whole namespace down with it.
+
+### What the isolation does not cover
+
+- **The build runs outside the namespace.** The branch's build scripts execute under `cargo build` in the build clone with the caller's toolchain environment — the devbox/nix compiler wrappers need dozens of variables — minus credential-shaped names and the deck's own pane variables. That is a **denylist**, narrower than the run's allowlist, and a build script can still read any file the operator can.
+- **`git clone`/`git fetch` and `gh release download` run with the operator's environment**, because they may need its credentials. They are not deck processes and do not run in the namespace.
+- **Reads are not confined to `$S`.** Inside the namespace the rest of `/` is readable (read-only), apart from the masked home, `/tmp`, `/run/user/<uid>` and `/var/tmp`. Pathname sockets elsewhere under `/run` — the system D-Bus socket, for one — stay connectable; no deck resolution rule names any of them.
+- **The sandbox's own sockets are reachable from the host.** A pathname socket under `$S` is a file on the host's filesystem, and pathname sockets do not respect network namespaces. A host process that deliberately connects to `$S/…` reaches the sandbox daemon; no host deck resolves an endpoint under `$S`.
+- **The host checks cover the endpoint candidates and the host network namespace.** They prove the candidate paths and their listeners unchanged and no host listener under `$S`. They do not diff the rest of the host's filesystem; the read-only root and masked home are what keep writes out of it, subject to the `rw` submounts listed above.
+- **The deck census is an observation.** A baseline deck process that exits during a run is reported, not attributed — other units share the box. The production endpoints' owners are the exception: an owner that changes fails the run (INCOMPLETE), because that is exactly what an escape would look like.
+- **The real-log check reads one file**: `DOT_AGENT_DECK_LOG` if the caller has it set, otherwise `~/.local/state/dot-agent-deck/deck.log`.
+- **It needs bubblewrap and unprivileged user namespaces.** On a host where the smoke test fails the run refuses before building anything; there is no un-isolated fallback.
 
 ## The two endpoint modes
 
-`--endpoint-mode sandbox-sockets` (the default) pins `DOT_AGENT_DECK_SOCKET` and `DOT_AGENT_DECK_ATTACH_SOCKET` inside the sandbox. This is the strongest isolation available and the right choice for any change that does not touch endpoint resolution. Runs in this mode have their own socket paths, their own sandbox and their own log, so several can execute at once.
+`--endpoint-mode sandbox-sockets` (the default) pins `DOT_AGENT_DECK_SOCKET` and `DOT_AGENT_DECK_ATTACH_SOCKET` to `$S/hook.sock` and `$S/attach.sock`. This is the right choice for any change that does not touch endpoint resolution. The matrix then requires every resolved candidate — flat, per-uid and XDG, all private — absent.
 
-`--endpoint-mode resolved` sets neither override, so both builds resolve their endpoint the way they would on a real host. **Use it only when the change under test *is* endpoint resolution** — those overrides short-circuit resolution before the logic under test runs, so a run that sets them measures the wrong thing. Two things follow and both are the caller's to respect:
-
-- A pre-#1121 build hardcodes `/tmp/dot-agent-deck-{uid}.sock` and `/tmp/dot-agent-deck-attach-{uid}.sock` and ignores `TMPDIR`, so in this mode the old daemon binds **process-global** paths in the real `/tmp`. The harness refuses to start when either already exists. On teardown it asks `ss -xlp` which of them **this run's daemon pid** is the listener on, *before* signalling it, and removes only those — a socket it cannot attribute to its own pid is left alone and named in the run log, because deleting both on the strength of the preflight would remove a stranger's entry in exactly the case that matters.
-- **Two `resolved` runs cannot execute concurrently**, and neither can a `resolved` run and anything else on the host already using the fallback case. A `sandbox-sockets` run is unaffected either way.
+`--endpoint-mode resolved` sets neither override, so both builds resolve their endpoint the way they would on a real host — into the namespace's private `/tmp` and `/run/user/<uid>`. **Use it only when the change under test *is* endpoint resolution**: those overrides short-circuit resolution before the logic under test runs. Its deck processes can no longer bind a host endpoint, so a `resolved` run is no longer exclusive for the host; the outer preflight still refuses to start one while the host's flat or per-uid endpoint sockets exist, which keeps the before/after comparison unambiguous.
 
 For issue #1121 the invocation is both levers together:
 
 ```sh
-cargo xver -- --branch agent/dispatch-issue-1121 --endpoint-mode resolved --unset-xdg-runtime-dir
+cargo xver --branch agent/dispatch-issue-1121 --endpoint-mode resolved --unset-xdg-runtime-dir
 ```
 
-In that mode a run also records, in its log, whether the branch build created an endpoint directory of its own (`$TMPDIR/dot-agent-deck-{uid}`) while it was attached to the old daemon at the legacy address. That is an observation rather than a fifth tell: it checks one change's claim about itself — that its compatibility read is read-only — where the four tells are what rule 12 asks of every change.
+In that mode a run also records whether the branch build created an endpoint directory of its own (`/tmp/dot-agent-deck-<uid>` inside, `$S/fallback-tmp/dot-agent-deck-<uid>` outside) while it was attached to the old daemon at the legacy address. That is an observation rather than a fifth tell: it checks one change's claim about itself — that its compatibility read is read-only — where the four tells are what rule 12 asks of every change.
+
+## The build clone
+
+The branch is built in a **standalone clone** — its own `.git`, cloned from `https://github.com/<--repo>.git` on first use — not in a linked worktree of the operator's repository. The first version used a linked worktree, and a linked worktree writes its registration, HEAD, index and reflogs into the source repository's common `.git`, outside anything the run owns, where another session's `git worktree prune` can reach it; its stash is shared with every other worktree too. The harness refuses a `--source-clone` whose `.git` is a file, requires `git rev-parse --absolute-git-dir` and `--git-common-dir` to both be the clone's own `.git`, refuses to build over tracked modifications, and runs every git command with the eight location variables removed (issue #834's shape).
+
+It stays at a fixed path **outside** `$S`, which is a deliberate trade: a per-run clone under `$S` would give each run a fresh workspace path, and cargo would rebuild the whole workspace crate into the shared target dir every time — or, with a per-run target dir, compile everything from cold, fourteen times over on a box whose I/O has already saturated under concurrent builds (issue #863). At its default path the clone is under the masked home, so nothing inside the namespace can see it (a `--source-clone` outside the home would be visible, read-only); the run executes the staged copy of the binary in `$S`. The runtime repository the run does touch, `$S/project`, is a standalone `git init` under `$S`.
+
+What it does to git is bounded: a `git clone --no-checkout` once, then per run `git fetch <url> <branch>` (which writes `FETCH_HEAD` and objects in the clone and nothing else) and `git checkout --detach FETCH_HEAD`. It never commits, amends, rebases, stashes or pushes, it writes nothing into the operator's repository, and it posts nothing to GitHub.
 
 ## Running several at once
 
-Each run mints its own sandbox directory, so the sandbox is never the thing that collides. Two other resources are shared by default and are what to override:
+Each run mints its own sandbox, namespace and endpoints, so neither mode collides with another run at the endpoint level. What two concurrent runs do share by default is the **build clone and the target dir** — two runs would check out different commits into the same clone and build into the same target at once. Give each concurrent run its own `--source-clone` and `--target-dir`; a fixed set of lanes (`-xver-src-a`, `-xver-target-a`, …) reused across branches keeps the cache benefit. The release cache (`--releases-dir`) is read-mostly once populated; pre-warm it with one run rather than racing the first download.
 
-- **The worktree and the cargo target dir.** Two runs would check out different commits into `../dot-agent-deck-xver` and build into `../dot-agent-deck-xver-target` at the same time. Give each concurrent run its own `--worktree` and `--target-dir`. The cache benefit is per-target-dir, so a fixed set of lanes (`-xver-a`, `-xver-b`, …) reused across branches keeps it.
-- **The release cache.** `--releases-dir` is read-mostly once populated, and a run reuses an existing binary rather than re-downloading. Two runs racing the *first* download of the same tag would both write into that directory; pre-warm it with one run, or give each lane its own.
+## Reading the evidence file
 
-And the mode decides the rest: any number of `sandbox-sockets` runs can execute together, while a `resolved` run is exclusive for the whole host — its addresses are in the real `/tmp` and are not per-run.
+`.dot-agent-deck/xver-evidence/<branch slug>.md` (override with `--evidence`) carries: both builds' `daemon hello` output verbatim, the sandbox and staged binary paths, the daemon pid, each tell with the measured value it was decided on, an **Isolation** section listing every isolation check that was measured and held (namespace ids, mask identities, the daemon's recorded identity, the first pre-connect assertion per client kind with its kernel listener map, the fallback-arm proof in `resolved` mode, the survivor census), a **Postconditions** section with the outer half's post-run checks, a numbered run log, and raw excerpts — the daemon's environment read back from `/proc`, the mismatch prompt as printed, the target pane's screen after the delegate, the orchestrator's screen after the hook, and the tail of the sandbox log. It is written on **every** path once the sandbox exists, including a run that broke down partway.
 
-## What the sandbox isolates, and why each variable is on the list
+The verdict is **PASS**, **FAIL** (a tell failed or the scenario broke down — the branch and the previous release did not interoperate, or the scenario could not be stood up, which the run log says), or **INCOMPLETE** (a tell could not be measured, or an isolation check failed or could not be evaluated — so the run measured nothing either way). An isolation failure dominates: a tell measured inside a namespace that did not hold is not a measurement of the branch.
 
-Every process in a run — the daemon, both TUIs and every CLI call — gets a complete environment built from scratch rather than overlaid on the caller's, because two of the things a run has to pin are *absences* and an absence cannot be expressed by adding a variable.
-
-| variable | why |
-| --- | --- |
-| `HOME`, `XDG_CONFIG_HOME`, `TMPDIR` | ordinary isolation |
-| `DOT_AGENT_DECK_STATE_DIR`, `DOT_AGENT_DECK_LOCK_DIR` | per-user state and the per-endpoint lock |
-| `DOT_AGENT_DECK_LOG` | **resolved separately from the state dir.** Without it an otherwise-isolated daemon appends into your real `~/.local/state/dot-agent-deck/deck.log`, and two interleaved daemons in one file are genuinely hard to attribute afterwards |
-| `DOT_AGENT_DECK_SESSION` | otherwise the sandbox deck restores your real saved session |
-| `DOT_AGENT_DECK_SCHEDULES` | otherwise the sandbox daemon fires **your real scheduled tasks** a second time at startup, and a registered schedule also keeps it from ever idling out |
-| `DOT_AGENT_DECK_EXPERIMENTAL` | project-config discovery walks up from **cwd**, not from `$HOME`, so a sandbox at a sibling path still reads your real `.dot-agent-deck.toml` feature flags. Pinned explicitly (off by default, `--experimental` to turn it on) rather than inherited |
-| `DOT_AGENT_DECK_IDLE_SHUTDOWN_SECS=0` | false green 2 above |
-| `DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS` | a stand-in agent that escapes its process group self-exits rather than leaking to PID 1 |
-| `PATH` | the branch build's directory first, so a pane that shells a bare `dot-agent-deck` reaches the **branch** binary while the daemon in memory is still the old one. That models the upgrade this test is about rather than being a convenience |
-
-The sandbox root and the cargo target dir are both checked against `/proc/mounts` and refused if they are on a tmpfs, and refused below a free-space floor (`--min-free-gib`, default 100). CLAUDE.md rule 14 is why: a build on a tmpfs dies at link time with a misleading `error: linking with 'cc' failed`, or gets its `rustc` OOM-killed, and nothing in either message points at the filesystem.
-
-## Teardown is by pid, and refuses a recycled one
-
-On 2026-09-15 an agent finishing with a cross-version sandbox ran `pkill -f "daemon serve"`. That pattern also matches the **production** daemon's own command line, which took the SIGTERM 1.42 s later and gracefully stopped nine panes across three dispatched units ([#428 occurrence #5](https://github.com/vfarcic/dot-agent-deck/issues/428#issuecomment-5688814518)). `pkill` sends SIGTERM, so it goes *around* issue #770's `daemon stop` refusal rather than having to defeat it: a compliant daemon shuts its agents down cleanly and names none of them.
-
-Nothing in this harness takes a name. It signals only a pid it spawned itself, captured at spawn; and immediately before signalling it re-reads `/proc/<pid>/cmdline` and requires it to still contain the path of the binary it launched. A pid that no longer passes that check is **not signalled** — it is recorded in the evidence file as refused — which is what stands between a pid recycled since the capture and somebody else's process.
-
-One thing to know if you pass `--old-binary`: that path becomes the string the re-check looks for. Point it at a build you own rather than at an installed one, so the check stays as specific as it is with the cached release binary.
+The sandbox is removed after a clean pass and kept after anything else; `--keep-sandbox` keeps it either way. Its `artifacts/` holds both PTY streams verbatim, the old daemon's stdio and the inner half's evidence JSON.
 
 ## What it covers, and what it does not
 
@@ -110,31 +168,24 @@ It does not cover:
 - **The reverse direction.** An *older* TUI against a *newer* daemon is a downgrade, and this harness does not stand one up.
 - **The desktop GUI.** `classify_handshake` compares `PROTOCOL_VERSION` and `CONTRACT_BREAKS` and is a different code path from the TUI's build-version handshake; nothing here exercises it.
 - **More than one previous release per run.** `--previous` takes one tag.
-- **Anything that is not Linux.** `/proc`, `ss(8)` and `statvfs` are all assumed, and only the `linux-amd64` release asset is fetched.
+- **Anything that is not Linux.** `/proc`, bubblewrap, `ss(8)` and `statvfs` are all assumed, and only the `linux-amd64` release asset is fetched.
 - **Flows other than the two rule 12 names.** A delegate and the two hook kinds are what a run drives; a contract break that touches neither would not be seen.
-
-What it does to git is bounded and worth stating exactly, because the branches it runs against are being verified rather than changed: it runs `git worktree add --detach` once for the reusable worktree, `git fetch origin <branch>` (which moves remote-tracking refs and nothing else), and `git checkout --detach FETCH_HEAD`. It never commits, amends, rebases or pushes, and it posts nothing to GitHub.
-
-## Reading the evidence file
-
-`.dot-agent-deck/xver-evidence/<branch slug>.md` (override with `--evidence`) carries: both builds' `daemon hello` output verbatim, the sandbox and binary paths, the daemon pid, each tell with the measured value it was decided on, a numbered run log, and raw excerpts — the mismatch prompt as printed, the target pane's screen after the delegate, the orchestrator's screen after the hook, and the tail of the sandbox log. It is written on **every** path, including a run that broke down partway, because a run that broke down is a useful result and the file is where it is legible.
-
-The sandbox directory is removed after a pass and kept after anything else; `--keep-sandbox` keeps it either way. Its `artifacts/` holds both PTY streams verbatim and the old daemon's stdio.
 
 ## Options worth knowing
 
 | flag | |
 | --- | --- |
-| `--branch` | required; the branch under test, taken from `origin/<branch>` |
+| `--branch` | required; the branch under test, fetched from `--repo` |
 | `--previous` | the previous release tag (default `v0.41.0`) |
-| `--old-binary` | use a binary already on disk instead of downloading a release |
+| `--old-binary` | use a binary already on disk instead of downloading a release (its version is recorded, not enforced) |
 | `--endpoint-mode` | `sandbox-sockets` (default) or `resolved` |
 | `--unset-xdg-runtime-dir` | false green 5 |
 | `--experimental` | turn the experimental feature flag on for the run |
 | `--skip-build` | reuse whatever is already in the target dir; for iterating on the harness itself |
 | `--keep-sandbox` | keep the sandbox even on a pass |
 | `--min-free-gib` | the free-space floor (default 100) |
-| `--worktree`, `--target-dir`, `--runs-root`, `--releases-dir`, `--evidence` | override the default paths |
+| `--run-timeout-secs` | kill the whole namespace if the inner half has not finished (default 1200) |
+| `--source-clone`, `--target-dir`, `--runs-root`, `--releases-dir`, `--evidence` | override the default paths |
 
 ## When a run finds a real break
 

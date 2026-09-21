@@ -53,10 +53,12 @@ xtask = "run --quiet --package xtask-linkage-check --"
 
 # CLAUDE.md rule 12's cross-version contract check, scripted
 # (`xtask/cross-version`, operational page `docs/develop/cross-version-harness.md`).
-# `cargo xver -- --branch <branch>` builds that branch in a reusable disk-backed
-# worktree, stands a previous-release daemon up in an isolated sandbox with an
-# orchestration under it, drives the branch TUI against that same daemon over a
-# PTY, and writes a markdown evidence file.
+# `cargo xver --branch <branch>` builds that branch in a standalone disk-backed
+# clone, stands a previous-release daemon up with an orchestration under it
+# inside a private bubblewrap namespace (both endpoint roots masked), drives the
+# branch TUI against that same daemon over a PTY, and writes a markdown evidence
+# file. `cargo xver -- --branch <branch>` works too: this alias already ends in
+# `--`, and the binary drops the second one.
 #
 # Its own binary rather than another arm of the `xtask` multiplexer: it needs
 # `portable-pty` and `vt100`, and putting those in `xtask-linkage-check` would
