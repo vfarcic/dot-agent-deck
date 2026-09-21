@@ -483,6 +483,51 @@ fn the_alpha_note_does_not_leave_a_user_with_only_a_terminal_command() {
     );
 }
 
+/// The note has to establish that a download is genuine BEFORE it tells anyone
+/// how to get past Gatekeeper, because the bundles are unsigned and provenance
+/// is the only thing that says where the file came from. Read top-down, the
+/// note used to hand over both override routes first, so a reader had
+/// bypassed the protection before reaching the check that would justify it
+/// (#1153). Nothing about the text changes when the order does, which is why
+/// a presence check cannot hold this.
+///
+/// The command also has to prove what the note says it proves. `--repo` pins
+/// the repository but not the workflow, so an attestation from ANY workflow
+/// in it passes; only `--signer-workflow` makes "produced by this repository's
+/// release workflow" true. Measured on v0.41.0's `.dmg` and `.deb`: exit 0
+/// naming `release.yml`, exit 1 naming `ci.yml`.
+#[test]
+fn the_alpha_note_verifies_provenance_before_it_overrides_gatekeeper() {
+    let all = jobs(&workflow());
+    let code = note_step(job(&all, "desktop-publish"));
+
+    let verify = code.find("gh attestation verify").unwrap_or_else(|| {
+        panic!("the release note no longer carries a `gh attestation verify` command:\n{code}")
+    });
+    // Up to the `printf` escape that ends the rendered line, so a flag
+    // elsewhere in the same format string cannot satisfy the check.
+    let command = code[verify..].split("\\n").next().unwrap_or_default();
+    assert!(
+        command.contains("--signer-workflow") && command.contains("/.github/workflows/release.yml"),
+        "the release note's verify command does not pin the signing workflow: \
+         `{command}`. `--repo` alone accepts an attestation from any workflow in \
+         the repository, while the note tells the user it proves the file came \
+         from the release workflow. #1153."
+    );
+    for route in ["System Settings", "com.apple.quarantine"] {
+        if let Some(at) = code.find(route) {
+            assert!(
+                verify < at,
+                "the release note offers the `{route}` Gatekeeper override before \
+                 the `gh attestation verify` command. The bundles are unsigned, so \
+                 verifying provenance is the prerequisite for overriding the \
+                 warning, and a reader following the note top-down must reach it \
+                 first. #1153."
+            );
+        }
+    }
+}
+
 /// The code portion of `line` -- everything before an unquoted `#` that opens a
 /// trailing shell comment. A whole-line comment reduces to its indentation.
 ///
