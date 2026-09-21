@@ -21,7 +21,7 @@
 
 mod common;
 
-use std::io::BufRead;
+use std::io::{BufRead, Write};
 use std::os::unix::net::UnixListener;
 
 /// Run the real CLI against a stub listener that captures one line, and return
@@ -123,4 +123,138 @@ fn a_blank_hook_token_is_treated_as_absent() {
         !line.contains("token"),
         "a blank DOT_AGENT_DECK_PANE_CAPABILITY must be omitted, not presented: {line}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Issue #1129: the acknowledgement half.
+//
+// `work-done` and `dispatch` used to write their line and exit 0 whatever the
+// daemon then did with it, so a message the provenance gate refused was
+// indistinguishable from one it acted on. The daemon now answers both verbs with
+// a `SignalAck` at the gate. These tests own the CLI end of that exchange — what
+// the binary does with the four lines it can get back — against a stub, which is
+// the only way to drive a refusal without also building the daemon state that
+// produces one.
+// ---------------------------------------------------------------------------
+
+/// Run the real CLI against a stub that reads one line and then writes `reply`
+/// (nothing at all when `reply` is `None`, which is a daemon predating the ack).
+/// Returns the process output.
+fn cli_against_stub_reply(args: &[&str], reply: Option<&str>) -> std::process::Output {
+    let dir = common::harness_tempdir().expect("create temp dir for the stub hook socket");
+    let socket_path = dir.path().join("hook.sock");
+    let listener = UnixListener::bind(&socket_path).expect("bind stub hook socket");
+    let reply = reply.map(str::to_string);
+
+    let stub = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().expect("accept");
+        let mut reader = std::io::BufReader::new(stream);
+        let mut line = String::new();
+        let _ = reader.read_line(&mut line);
+        if let Some(reply) = reply {
+            let mut stream = reader.into_inner();
+            let _ = stream.write_all(format!("{reply}\n").as_bytes());
+            let _ = stream.flush();
+        }
+    });
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"))
+        .args(args)
+        .env("DOT_AGENT_DECK_SOCKET", &socket_path)
+        .env("DOT_AGENT_DECK_PANE_ID", "cli-pane")
+        .env_remove("DOT_AGENT_DECK_PANE_CAPABILITY")
+        .output()
+        .expect("run the real CLI");
+    stub.join().expect("stub thread");
+    output
+}
+
+/// The refusal line the daemon writes for a `work-done` or `dispatch` it would
+/// not admit — the `missing_token` case, which is the one a LEGITIMATE sender
+/// reaches (a `dot-agent-deck` in the pane older than the daemon).
+const REFUSAL: &str = r#"{"kind":"signal_ack","accepted":false,"reason":"missing_token","error":"refused: this pane was issued a hook capability token and the message presented none."}"#;
+
+/// The verbs under test, with the arguments that make each one send its signal.
+fn fire_and_forget_invocations() -> Vec<Vec<&'static str>> {
+    vec![
+        vec!["work-done", "--task", "done"],
+        vec!["dispatch", "unit", "--task", "do it"],
+    ]
+}
+
+/// The point of the whole change: a refused signal is no longer a clean exit 0.
+#[test]
+fn a_refused_signal_is_reported_to_the_sender() {
+    for args in fire_and_forget_invocations() {
+        let out = cli_against_stub_reply(&args, Some(REFUSAL));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !out.status.success(),
+            "{args:?} exited 0 on a signal the daemon refused, which is issue #1129 exactly;              stderr: {stderr}"
+        );
+        assert!(
+            stderr.contains("hook capability token"),
+            "{args:?} failed without passing on the daemon's reason: {stderr}"
+        );
+        assert!(
+            stderr.contains("missing_token"),
+            "{args:?} dropped the greppable code the daemon also put in its own warn line, so              an operator cannot match the two: {stderr}"
+        );
+    }
+}
+
+/// The admission is a success and says nothing — an agent running `work-done`
+/// at the end of every task must not have its output decorated on the happy
+/// path.
+#[test]
+fn an_admitted_signal_exits_zero_and_is_silent() {
+    for args in fire_and_forget_invocations() {
+        let out = cli_against_stub_reply(&args, Some(r#"{"kind":"signal_ack","accepted":true}"#));
+        assert!(
+            out.status.success(),
+            "{args:?} failed on an admitted signal; stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            out.stderr.is_empty(),
+            "{args:?} wrote to stderr on the happy path: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
+/// The cross-version half, and the one that decides whether this change is safe
+/// to ship: a daemon that predates the ack writes nothing back, and that must
+/// stay a success. `delegate` made the same call for the same reason — the verb
+/// was fire-and-forget before the daemon answered it, so a daemon that does not
+/// answer must not become a phantom failure on every mixed-version pair.
+#[test]
+fn a_daemon_that_writes_no_ack_is_still_a_success() {
+    for args in fire_and_forget_invocations() {
+        let out = cli_against_stub_reply(&args, None);
+        assert!(
+            out.status.success(),
+            "{args:?} failed against a daemon that predates the acknowledgement; stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
+/// And the direction that would be easy to get wrong. Every field of `SignalAck`
+/// is `#[serde(default)]` over an `accepted: bool`, so a line that is not an ack
+/// parses into `accepted: false`. Without the affirmative-marker check that
+/// would turn a daemon we do not understand — or another verb's reply arriving
+/// on this connection — into a reported failure on a signal that was delivered.
+#[test]
+fn a_reply_that_is_not_an_ack_is_not_read_as_a_refusal() {
+    for line in ["{}", r#"{"seed":null}"#, "not json at all", ""] {
+        for args in fire_and_forget_invocations() {
+            let out = cli_against_stub_reply(&args, Some(line));
+            assert!(
+                out.status.success(),
+                "{args:?} treated {line:?} as a refusal; stderr: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+    }
 }

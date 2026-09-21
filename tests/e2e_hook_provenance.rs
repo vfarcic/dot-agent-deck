@@ -21,7 +21,9 @@
 //!    deck's hook socket path and nothing else. That is precisely the shape
 //!    issue #1077 describes: a same-uid process that learned a pane id (here
 //!    handed to it; in the wild, read off `daemon status`) and signals as that
-//!    pane. It must reach the orchestrator's pane with nothing.
+//!    pane. It must reach the orchestrator's pane with nothing — and, since
+//!    issue #1129, must be TOLD it was refused rather than exiting 0 on a report
+//!    that went nowhere.
 //! 2. **Legitimate** — the same binary, same verb, run by the worker's OWN
 //!    pane, so the daemon's spawn gave it the capability token. It must reach
 //!    the orchestrator's pane exactly as it always did.
@@ -139,7 +141,7 @@ fn release_and_await(deck: &TuiDeck, trigger: &str, sentinel: &str, orchestrator
     );
 }
 
-/// Scenario: Launch the real TUI and its lazy daemon under the DEFAULT hook-provenance policy and open the two-role `hook-provenance` fixture. Let the worker report once from inside its own pane so the legitimate path is proven live, then run the REAL `dot-agent-deck work-done` binary from the test process carrying only the worker's `DOT_AGENT_DECK_PANE_ID` — the same-uid forgery of issue #1077 — then let the worker report a second time. The orchestrator's pane must carry both of the worker's own reports and must never carry the forged one.
+/// Scenario: Launch the real TUI and its lazy daemon under the DEFAULT hook-provenance policy and open the two-role `hook-provenance` fixture. Let the worker report once from inside its own pane so the legitimate path is proven live, then run the REAL `dot-agent-deck work-done` binary from the test process carrying only the worker's `DOT_AGENT_DECK_PANE_ID` — the same-uid forgery of issue #1077 — then let the worker report a second time. The orchestrator's pane must carry both of the worker's own reports and must never carry the forged one, and the forged invocation must now exit non-zero naming the daemon's refusal (issue #1129).
 #[spec("orchestration/provenance/001")]
 #[test]
 fn provenance_001_a_forged_work_done_is_refused_while_the_pane_s_own_still_lands() {
@@ -185,16 +187,30 @@ fn provenance_001_a_forged_work_done_is_refused_while_the_pane_s_own_still_lands
         .current_dir(deck.workdir())
         .output()
         .expect("run the real `dot-agent-deck work-done` CLI as a forgery");
-    // `work-done` is fire-and-forget on the wire, so the CLI exits 0 whether or
-    // not the daemon acted on it — asserted rather than glossed over, because it
-    // is the honest cost of the refusal: the sender is not told. The refusal is
-    // a `warn!` in the daemon's log and the absence below.
+    // Issue #1129: the daemon now acknowledges this verb at the provenance gate,
+    // so a refusal is reported to whoever sent it. Until then `work-done` read
+    // no reply and exited 0 whatever the daemon did — and this assertion is the
+    // inverse of the one that used to stand here, which recorded that silence as
+    // the honest cost of the refusal.
+    //
+    // Being told is for the LEGITIMATE sender that trips the gate — a
+    // `dot-agent-deck` in the pane older than the daemon, refused as
+    // `missing_token` — not for this forgery, which is simply the only way to
+    // drive a refusal through the real binary. It discloses nothing new either:
+    // pane ids are published by `daemon status` and `list-agents`, and `delegate`
+    // has answered its refusals on this same socket since #1077.
+    let forged_stderr = String::from_utf8_lossy(&forged.stderr).into_owned();
     assert!(
-        forged.status.success(),
-        "the forged `work-done` should still exit 0 — the verb reads no reply, so a daemon-side \
-         refusal is invisible to it; stdout={} stderr={}",
-        String::from_utf8_lossy(&forged.stdout),
-        String::from_utf8_lossy(&forged.stderr)
+        !forged.status.success(),
+        "the forged `work-done` exited 0, so a refused report is still silent to its sender \
+         (issue #1129); stdout={} stderr={forged_stderr}",
+        String::from_utf8_lossy(&forged.stdout)
+    );
+    assert!(
+        forged_stderr.contains("hook capability token"),
+        "the CLI failed without passing on the daemon's reason, so the one legitimate cause \
+         (an older binary in the pane) is undiagnosable from the caller's side: \
+         {forged_stderr}"
     );
 
     // ---- 3. A LATER LEGITIMATE SIGNAL COMPLETES THE ROUND TRIP ----------

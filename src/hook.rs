@@ -720,6 +720,42 @@ pub fn send_and_await_spawn_role_reply(json: &str) -> SocketReply {
     request_from_socket_inner(json, Some(SPAWN_ROLE_REPLY_TIMEOUT))
 }
 
+/// Issue #1129: the budget for a fire-and-forget signal's acknowledgement —
+/// `work-done` and `dispatch`.
+///
+/// The same 5s [`DELEGATE_REPLY_TIMEOUT`] gives `delegate`, and deliberately
+/// not a smaller number even though this reply is cheaper to produce. Cheaper
+/// because the daemon writes it at the provenance gate, **before** the handler
+/// runs (`DaemonMessage::provenance_ack_reply`), so it costs one registry lookup
+/// and a socket write — where `delegate`'s reply is written after
+/// `handle_delegate` has run under the `state` read lock that the 5s exists to
+/// cover. So a budget sized for the more expensive of the two is generous here
+/// by construction, and the margin is spent only when the daemon cannot answer
+/// promptly — wedged, overloaded, or with a full accept queue — which is exactly
+/// when a *smaller* budget would convert a slow-but-delivered signal into a
+/// reported failure.
+///
+/// It is also the first deadline these two verbs have ever had. They went
+/// through [`send_to_socket`], whose connect and write are unbounded, so a
+/// wedged daemon hung the calling agent indefinitely; now it fails in 5s. That
+/// is a liveness improvement and a reclassification at once —
+/// [`SocketReply::Unreachable`] on a connect that blows the budget — and the
+/// CLI reports it exactly as it already reported a failed `send_to_socket`.
+pub const SIGNAL_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Send a fire-and-forget hook-socket signal and await the daemon's
+/// [`crate::event::SignalAck`], bounded by [`SIGNAL_ACK_TIMEOUT`].
+///
+/// [`send_and_await_reply`]'s classification is what this needs and why it is
+/// reused rather than re-rolled: [`SocketReply::NoReply`] is a daemon that
+/// predates the ack, which must stay a success or every `work-done` against an
+/// older daemon starts reporting a phantom failure, while
+/// [`SocketReply::Unreachable`] is the one case the caller may report as "not
+/// delivered".
+pub fn send_and_await_signal_ack(json: &str) -> SocketReply {
+    request_from_socket_inner(json, Some(SIGNAL_ACK_TIMEOUT))
+}
+
 pub fn send_to_socket(json: &str) -> Option<()> {
     send_to_socket_at(&socket_path(), json)
 }
@@ -798,9 +834,13 @@ fn send_to_socket_bounded_at(
 const GET_SEED_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// PRD #201: send a line to the daemon hook socket and read ONE line of reply
-/// back on the same connection. Used by the read-only `get-seed` verb, the one
-/// hook-socket message that expects a response (the delegate / work-done /
-/// agent-event senders are fire-and-forget). Returns `None` if the socket is
+/// back on the same connection. Used by the read-only `get-seed` verb, for
+/// which every failure to get an answer means the same thing. (It was the one
+/// hook-socket message expecting a response when this was written; `delegate`
+/// joined it in PR #466 and `work-done` / `dispatch` in issue #1129, each
+/// through a helper that classifies rather than collapsing — see
+/// [`send_and_await_reply`] and [`send_and_await_signal_ack`]. Raw
+/// `agent-event` traffic is still answered by nothing.) Returns `None` if the socket is
 /// absent/unreadable, or if the daemon goes completely silent — or keeps
 /// dribbling bytes without ever finishing a reply line — for longer than
 /// [`GET_SEED_REQUEST_TIMEOUT`]. The caller (get-seed) treats all of these
