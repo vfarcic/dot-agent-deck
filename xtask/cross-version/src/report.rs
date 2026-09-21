@@ -10,6 +10,8 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::sandbox::Direction;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Verdict {
     Pass,
@@ -51,6 +53,27 @@ pub enum RunVerdict {
     /// measured, or an isolation check failed or could not be evaluated, so the
     /// run's measurements cannot be trusted either way.
     Incomplete(String),
+    /// Reverse only: the previous release's client could not find the branch
+    /// daemon at all — MEASURED, with the branch daemon and its roles proven
+    /// untouched by what the old client did instead. Distinct from `Fail`,
+    /// which means the two builds reached each other and then did not
+    /// interoperate (or the old client's fallback damaged something), and from
+    /// `Incomplete`, which means the harness could not tell.
+    OldClientCannotDiscover(String),
+}
+
+impl RunVerdict {
+    /// The one-line status a run prints and a report table carries.
+    pub fn label(&self) -> String {
+        match self {
+            RunVerdict::Pass => "PASS".to_string(),
+            RunVerdict::Fail => "FAIL".to_string(),
+            RunVerdict::Incomplete(why) => format!("INCOMPLETE — {why}"),
+            RunVerdict::OldClientCannotDiscover(why) => {
+                format!("OLD CLIENT CANNOT DISCOVER THE BRANCH DAEMON — {why}")
+            }
+        }
+    }
 }
 
 /// Everything a run learned, in the order it learned it.
@@ -62,6 +85,14 @@ pub enum RunVerdict {
 pub struct Evidence {
     pub branch: String,
     pub previous: String,
+    /// Which build served the daemon.
+    pub direction: Direction,
+    /// The reverse probe the run carried, as one line.
+    pub probe: String,
+    /// Set, in a reverse run, when the old client was measured unable to find
+    /// the branch daemon: what it did instead. See
+    /// [`RunVerdict::OldClientCannotDiscover`].
+    pub discovery: Option<String>,
     pub head_sha: String,
     pub started_at: String,
     pub mode: String,
@@ -151,6 +182,13 @@ impl Evidence {
     /// The run's result. An isolation failure dominates everything: a tell
     /// measured inside a namespace that did not hold is not a measurement of
     /// the branch.
+    ///
+    /// The order is the argument. A failed tell outranks a measured
+    /// non-discovery, because a failed collateral check there means the old
+    /// client's fallback DID damage something — which is a finding, not the
+    /// disclosed downgrade. An unmeasured tell outranks it too: "the old client
+    /// could not find the daemon and nothing else happened" is only a claim when
+    /// the "nothing else" was measured.
     pub fn verdict(&self) -> RunVerdict {
         if let Some(why) = &self.isolation_failure {
             return RunVerdict::Incomplete(format!("an isolation check failed — {why}"));
@@ -164,28 +202,52 @@ impl Evidence {
         if !self.complete() {
             return RunVerdict::Incomplete("a tell could not be measured".to_string());
         }
+        if let Some(what) = &self.discovery {
+            return RunVerdict::OldClientCannotDiscover(what.clone());
+        }
         RunVerdict::Pass
     }
 
     pub fn render(&self) -> String {
         let mut s = String::new();
         let verdict = match self.verdict() {
-            RunVerdict::Pass => "PASS".to_string(),
-            RunVerdict::Fail => "FAIL".to_string(),
             RunVerdict::Incomplete(why) => format!("INCOMPLETE — {why}, so this is not a pass"),
+            v => v.label(),
         };
-        let _ = writeln!(s, "# Cross-version contract check — `{}`\n", self.branch);
-        let _ = writeln!(s, "**Verdict: {verdict}**\n");
+        let reverse = self.direction == Direction::Reverse;
         let _ = writeln!(
             s,
-            "CLAUDE.md rule 12's cross-version manual test, run by `cargo xver` \
-             (`xtask/cross-version`, documented in `docs/develop/cross-version-harness.md`). It \
-             reproduces the scenario the rule describes — a previous-release daemon with live \
-             agents under it, then the branch TUI attached to that same daemon over a PTY with \
-             the build-version prompt declined — and asserts the four tells below. Stand-in \
-             agents, not real ones: this check is about the TUI↔daemon wire, so no AGENT \
-             credential is used or needed.\n"
+            "# Cross-version contract check — `{}`{}\n",
+            self.branch,
+            if reverse { " (reverse)" } else { "" }
         );
+        let _ = writeln!(s, "**Verdict: {verdict}**\n");
+        if reverse {
+            let _ = writeln!(
+                s,
+                "The REVERSE of CLAUDE.md rule 12's pairing, run by `cargo xver --direction reverse` \
+                 (`xtask/cross-version`, documented in `docs/develop/cross-version-harness.md`): the \
+                 BRANCH daemon with live agents under it, then the previous release's TUI attached \
+                 to that same daemon over a PTY with the build-version prompt declined, and the \
+                 previous release's CLI issuing every pane command. Rule 12 prescribes the forward \
+                 pairing, which for a daemon-side change runs the previous release's daemon code \
+                 and never executes a changed line; this pairing is the one that does. It asserts \
+                 the same four tells, pinned to the branch daemon, plus the branch-specific probe \
+                 named below. Stand-in agents, not real ones: no AGENT credential is used or \
+                 needed.\n"
+            );
+        } else {
+            let _ = writeln!(
+                s,
+                "CLAUDE.md rule 12's cross-version manual test, run by `cargo xver` \
+                 (`xtask/cross-version`, documented in `docs/develop/cross-version-harness.md`). It \
+                 reproduces the scenario the rule describes — a previous-release daemon with live \
+                 agents under it, then the branch TUI attached to that same daemon over a PTY with \
+                 the build-version prompt declined — and asserts the four tells below. Stand-in \
+                 agents, not real ones: this check is about the TUI↔daemon wire, so no AGENT \
+                 credential is used or needed.\n"
+            );
+        }
 
         let _ = writeln!(s, "## What was run\n");
         let _ = writeln!(s, "| | |");
@@ -193,6 +255,18 @@ impl Evidence {
         let _ = writeln!(s, "| branch under test | `{}` |", self.branch);
         let _ = writeln!(s, "| branch HEAD | `{}` |", self.head_sha);
         let _ = writeln!(s, "| previous release | `{}` |", self.previous);
+        let _ = writeln!(
+            s,
+            "| direction | {} |",
+            if reverse {
+                "reverse — BRANCH daemon, previous-release TUI and CLI"
+            } else {
+                "forward — previous-release daemon, branch TUI and CLI (rule 12's pairing)"
+            }
+        );
+        if reverse {
+            let _ = writeln!(s, "| probe | {} |", self.probe);
+        }
         let _ = writeln!(s, "| started (UTC) | {} |", self.started_at);
         let _ = writeln!(s, "| endpoint mode | {} |", self.mode);
         let _ = writeln!(s, "| namespace | {} |", self.namespace);
@@ -214,7 +288,26 @@ impl Evidence {
             self.new_hello.trim()
         );
 
-        let _ = writeln!(s, "## The four tells\n");
+        if let Some(what) = &self.discovery {
+            let _ = writeln!(
+                s,
+                "## Discovery: the old client did not find the branch daemon\n"
+            );
+            for line in what.lines() {
+                let _ = writeln!(s, "> {line}");
+            }
+            let _ = writeln!(s);
+        }
+
+        let _ = writeln!(
+            s,
+            "{}",
+            if reverse {
+                "## Tells\n"
+            } else {
+                "## The four tells\n"
+            }
+        );
         for t in &self.tells {
             let _ = writeln!(s, "### {} — {} · {}\n", t.id, t.title, t.verdict.marker());
             for line in t.detail.lines() {
@@ -397,5 +490,86 @@ mod tests {
         });
         let out = e.render();
         assert!(out.contains("> first\n> second"), "{out}");
+    }
+}
+
+#[cfg(test)]
+mod reverse_tests {
+    use super::*;
+
+    fn reverse() -> Evidence {
+        Evidence {
+            branch: "agent/x".into(),
+            direction: Direction::Reverse,
+            probe: "`log-escaping` — PR #1169 / issue #1082".into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_measured_non_discovery_is_its_own_verdict() {
+        let mut e = reverse();
+        e.tell("collateral-1", "t", Verdict::Pass, "x");
+        e.discovery = Some("the old TUI lazy-spawned its own daemon".into());
+        assert!(matches!(
+            e.verdict(),
+            RunVerdict::OldClientCannotDiscover(_)
+        ));
+        let out = e.render();
+        assert!(
+            out.contains("**Verdict: OLD CLIENT CANNOT DISCOVER THE BRANCH DAEMON"),
+            "{out}"
+        );
+        assert!(out.contains("## Discovery"), "{out}");
+    }
+
+    #[test]
+    fn damage_from_the_old_clients_fallback_is_a_fail_not_a_disclosed_downgrade() {
+        let mut e = reverse();
+        e.tell(
+            "collateral-3",
+            "t",
+            Verdict::Fail,
+            "two daemons, one orchestration",
+        );
+        e.discovery = Some("x".into());
+        assert_eq!(e.verdict(), RunVerdict::Fail);
+    }
+
+    #[test]
+    fn an_unmeasured_collateral_check_leaves_the_run_incomplete() {
+        let mut e = reverse();
+        e.tell("collateral-3", "t", Verdict::NotChecked, "could not ask");
+        e.discovery = Some("x".into());
+        assert!(matches!(e.verdict(), RunVerdict::Incomplete(_)));
+    }
+
+    #[test]
+    fn an_isolation_failure_still_dominates_a_reverse_run() {
+        let mut e = reverse();
+        e.tell("collateral-1", "t", Verdict::Pass, "x");
+        e.discovery = Some("x".into());
+        e.isolation_failed("host endpoint changed");
+        assert!(matches!(e.verdict(), RunVerdict::Incomplete(ref w) if w.contains("host")));
+    }
+
+    #[test]
+    fn a_reverse_report_says_so_and_names_its_probe() {
+        let mut e = reverse();
+        e.tell("tell-1", "t", Verdict::Pass, "1");
+        let out = e.render();
+        assert!(out.starts_with("# Cross-version contract check — `agent/x` (reverse)"));
+        assert!(
+            out.contains("BRANCH daemon, previous-release TUI and CLI"),
+            "{out}"
+        );
+        assert!(out.contains("| probe | `log-escaping`"), "{out}");
+        assert!(out.contains("## Tells"), "{out}");
+        let fwd = Evidence {
+            branch: "agent/x".into(),
+            ..Default::default()
+        };
+        let out = fwd.render();
+        assert!(out.contains("## The four tells") && !out.contains("| probe |"));
     }
 }

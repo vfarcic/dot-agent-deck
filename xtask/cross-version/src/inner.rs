@@ -18,27 +18,27 @@ use crate::isolation::{self, Plan};
 use crate::proc::{self, Identity, Mismatch, SandboxProcess, Terminated};
 use crate::pty;
 use crate::report::{Evidence, RunVerdict, Verdict};
-use crate::sandbox::{self, EndpointMode, Sandbox};
-use crate::{ctl, epoch_secs};
+use crate::sandbox::{self, Direction, EndpointMatrix, EndpointMode, Sandbox};
+use crate::{ctl, epoch_secs, probes};
 
 /// How long to wait for the deck to paint its first frame, for the mismatch
 /// prompt, and for an orchestration to come up. Generous because this box is
 /// shared and a run competing with three dispatched units is the normal case.
-const UI_TIMEOUT: Duration = Duration::from_secs(90);
+pub(crate) const UI_TIMEOUT: Duration = Duration::from_secs(90);
 /// How long to wait for a single keystroke's consequence.
-const STEP_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const STEP_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long to wait for the daemon's own state to catch up with a CLI call.
-const DAEMON_TIMEOUT: Duration = Duration::from_secs(45);
+pub(crate) const DAEMON_TIMEOUT: Duration = Duration::from_secs(45);
 /// Settle pause between a key and the next one, where the deck has to redraw in
 /// between and there is nothing specific to poll for.
-const SETTLE: Duration = Duration::from_millis(400);
+pub(crate) const SETTLE: Duration = Duration::from_millis(400);
 /// How long the daemon gets after its one SIGTERM. Well past its 3 s agent
 /// grace (`AGENT_TERMINATE_GRACE`).
-const DAEMON_GRACE: Duration = Duration::from_secs(20);
+pub(crate) const DAEMON_GRACE: Duration = Duration::from_secs(20);
 
-const ROLE_ORCHESTRATOR: &str = "orchestrator";
-const ROLE_CODER: &str = "coder";
-const ROLE_REVIEWER: &str = "reviewer";
+pub(crate) const ROLE_ORCHESTRATOR: &str = "orchestrator";
+pub(crate) const ROLE_CODER: &str = "coder";
+pub(crate) const ROLE_REVIEWER: &str = "reviewer";
 
 /// Why the inner half stopped early. The distinction decides the verdict: a
 /// scenario that broke down is a FAIL (the branch and the release did not
@@ -47,7 +47,7 @@ const ROLE_REVIEWER: &str = "reviewer";
 /// the run as INCOMPLETE, because nothing measured inside a namespace that did
 /// not hold is a measurement of the branch.
 #[derive(Debug)]
-pub enum Abort {
+pub(crate) enum Abort {
     Scenario(String),
     Isolation(String),
 }
@@ -64,7 +64,7 @@ impl From<&str> for Abort {
     }
 }
 
-fn iso(msg: impl Into<String>) -> Abort {
+pub(crate) fn iso(msg: impl Into<String>) -> Abort {
     Abort::Isolation(msg.into())
 }
 
@@ -161,23 +161,25 @@ fn body(plan: &Plan, sb: &Sandbox, ctl: &mut ctl::Client, ev: &mut Evidence) -> 
              {missing:?} (values are not printed)"
         )));
     }
-    sandbox::check_env(&plan.env, sb, plan.env_spec()).map_err(iso)?;
+    sandbox::check_env(&plan.env, sb, plan.env_spec(), &plan.extra_env).map_err(iso)?;
     ev.isolated(format!(
         "the inner half's own environment is exactly the plan's {} allowlisted entries — \
          `--clearenv` held, and nothing of the caller's environment reached inside",
         plan.env.len()
     ));
-    sandbox::verify_project(sb).map_err(iso)?;
+    sandbox::verify_project(sb, &plan.fixture).map_err(iso)?;
     ev.isolated(format!(
         "`{}` is a regular file owned by this uid, so the deck's cwd-ancestor config walk stops \
          at the sandbox; `{}` is a directory, so the project is a standalone repository",
         sandbox::project_config(sb).display(),
         sb.project.join(".git").display()
     ));
-    sandbox::check_socket_path_lengths(&plan.matrix)?;
+    for m in &plan.matrices {
+        sandbox::check_socket_path_lengths(m)?;
+    }
 
     let old_bin = sb.old_bin();
-    let new_bin = sb.new_bin();
+    let new_bin = sb.new_bin(plan.direction);
     // `daemon hello` is a static print that connects to nothing; it still runs
     // here, with the run's environment, so no deck process in a run ever sees
     // the caller's.
@@ -195,7 +197,8 @@ fn body(plan: &Plan, sb: &Sandbox, ctl: &mut ctl::Client, ev: &mut Evidence) -> 
         ev.preflight.push(note);
     }
 
-    drive(plan, sb, ctl, &mnt, &old_bin, &new_bin, ev)
+    let cast = Cast::for_plan(plan, sb);
+    drive(plan, sb, ctl, &mnt, &cast, ev)
 }
 
 fn output_ok(out: Output, what: &str) -> Result<String, Abort> {
@@ -213,13 +216,29 @@ fn output_ok(out: Output, what: &str) -> Result<String, Abort> {
 // The pre-connect assertion
 // ---------------------------------------------------------------------------
 
+/// A daemon this run did not start but has measured and identified: in a
+/// reverse run, the one the previous release's client lazy-spawns when it
+/// cannot find the branch daemon. Recorded so the pre-connect assertion can
+/// account for its listeners by identity rather than refuse every later client,
+/// and so teardown can stop it by that identity.
+#[derive(Clone, Debug)]
+pub struct SecondDaemon {
+    pub identity: Identity,
+    /// The endpoints its listeners are bound to.
+    pub paths: Vec<PathBuf>,
+}
+
 /// Everything the pre-connect assertion needs, and the tally of how often it
 /// held.
-struct Guard<'a> {
-    plan: &'a Plan,
-    sb: &'a Sandbox,
+pub(crate) struct Guard<'a> {
+    pub plan: &'a Plan,
+    pub sb: &'a Sandbox,
     recorded_mnt: String,
-    daemon: Identity,
+    pub daemon: Identity,
+    /// The endpoint matrix selected once the daemon was up (see
+    /// [`EndpointMatrix::candidates`]).
+    pub matrix: EndpointMatrix,
+    pub second: RefCell<Option<SecondDaemon>>,
     ctl: RefCell<&'a mut ctl::Client>,
     counts: RefCell<BTreeMap<String, usize>>,
 }
@@ -244,7 +263,12 @@ impl Guard<'_> {
     /// sandbox address. There it would lazy-spawn a daemon of its own inside
     /// the namespace, which tell 1's `Attach protocol listening` count and the
     /// next pre-connect's second-listener check both catch.
-    fn preconnect(
+    ///
+    /// A [`SecondDaemon`] the run has already measured and identified is the
+    /// one exception to "every listener is the daemon's": its listeners are
+    /// accepted only at the paths it was recorded on, and only while its own
+    /// full identity still verifies.
+    pub(crate) fn preconnect(
         &self,
         label: &str,
         client_env: &[(String, String)],
@@ -256,7 +280,7 @@ impl Guard<'_> {
                 "{label}: the client environment is not the plan's"
             )));
         }
-        sandbox::check_env(client_env, self.sb, plan.env_spec())
+        sandbox::check_env(client_env, self.sb, plan.env_spec(), &plan.extra_env)
             .map_err(|e| iso(format!("{label}: {e}")))?;
 
         match self.daemon.verify() {
@@ -277,8 +301,22 @@ impl Guard<'_> {
         let listeners = proc::unix_listeners().map_err(|e| iso(format!("{label}: {e}")))?;
         let held =
             proc::socket_inodes(self.daemon.pid).map_err(|e| iso(format!("{label}: {e}")))?;
+        let second = self.second.borrow().clone();
+        let second_held = match &second {
+            Some(s) => {
+                s.identity.verify().map_err(|m| {
+                    iso(format!(
+                        "{label}: the recorded second daemon (pid {}) no longer matches its \
+                         identity: {m}",
+                        s.identity.pid
+                    ))
+                })?;
+                proc::socket_inodes(s.identity.pid).map_err(|e| iso(format!("{label}: {e}")))?
+            }
+            None => Default::default(),
+        };
         let mut details = Vec::new();
-        for path in &plan.matrix.owned {
+        for path in &self.matrix.owned {
             let inodes = isolation::listening_inodes(&listeners, path);
             if inodes.is_empty() {
                 return Err(Abort::Scenario(format!(
@@ -319,7 +357,14 @@ impl Guard<'_> {
                 md.mode() & 0o7777
             ));
         }
-        for path in &plan.matrix.absent {
+        let second_paths: Vec<PathBuf> =
+            second.as_ref().map(|s| s.paths.clone()).unwrap_or_default();
+        for path in self
+            .matrix
+            .absent
+            .iter()
+            .filter(|p| !second_paths.contains(p))
+        {
             let on_disk = std::fs::symlink_metadata(path).is_ok();
             let listening = !isolation::listening_inodes(&listeners, path).is_empty();
             if on_disk || listening {
@@ -336,20 +381,32 @@ impl Guard<'_> {
         }
         details.push(format!(
             "absent, as required (no file, no listener): {}",
-            plan.matrix
+            self.matrix
                 .absent
                 .iter()
+                .filter(|p| !second_paths.contains(p))
                 .map(|p| format!("`{}`", p.display()))
                 .collect::<Vec<_>>()
                 .join(", ")
         ));
-        if let Some(stray) = listeners.iter().find(|l| !held.contains(&l.inode)) {
+        if let Some(stray) = listeners.iter().find(|l| {
+            !held.contains(&l.inode)
+                && !(second_held.contains(&l.inode)
+                    && second_paths.iter().any(|p| p.to_string_lossy() == l.path))
+        }) {
             let owners = proc::owners_of(stray.inode).unwrap_or_default();
             return Err(Abort::Scenario(format!(
                 "{label}: a listener this run did not start: `{}` (inode {}), held by {owners:?} — \
                  a second daemon inside the namespace",
                 stray.path, stray.inode
             )));
+        }
+        if let Some(s) = &second {
+            details.push(format!(
+                "the recorded second daemon (pid {}) still verifies and its listeners are only at \
+                 {:?}",
+                s.identity.pid, s.paths
+            ));
         }
         // A second daemon is only reachable if it LISTENS, and every listener
         // was just proven to be the daemon's — so that check, not a command
@@ -366,10 +423,15 @@ impl Guard<'_> {
             .collect();
         details.push(format!(
             "every listening Unix socket in the run's network namespace ({}) is held by the \
-             sandbox daemon, so no second daemon is reachable; {} other process(es) share its \
+             sandbox daemon{}, so no other daemon is reachable; {} other process(es) share its \
              command line {forks:?}, which is what its per-pane lifetime-cap reapers look like \
              (forked, not exec'd) and none of them holds a listener the daemon does not",
             listeners.len(),
+            if second.is_some() {
+                " or by the recorded second daemon at its recorded paths"
+            } else {
+                ""
+            },
             forks.len()
         ));
 
@@ -392,7 +454,7 @@ impl Guard<'_> {
 
     /// The first time a label passes, its details go into the evidence; after
     /// that only the count does, or a polling loop would flood the file.
-    fn preconnect_logged(
+    pub(crate) fn preconnect_logged(
         &self,
         label: &str,
         client_env: &[(String, String)],
@@ -438,12 +500,17 @@ fn deck(bin: &Path, env: &[(String, String)], cwd: &Path, args: &[&str]) -> Resu
         .map_err(|e| format!("run {} {args:?}: {e}", bin.display()))
 }
 
-/// One row of `daemon status --json`.
+/// One row of `daemon status --json`, in the shape every build since
+/// `schema_version` 2 prints: absent keys read as empty strings.
 #[derive(Debug, Clone)]
-struct StatusRow {
-    pane_id: String,
-    role: String,
-    status: String,
+pub(crate) struct StatusRow {
+    pub agent_id: String,
+    pub pane_id: String,
+    pub role: String,
+    pub status: String,
+    pub cwd: String,
+    /// `active_tool.name`.
+    pub tool: String,
 }
 
 /// `daemon status --json`, projected to what this harness asserts on, behind
@@ -452,7 +519,7 @@ struct StatusRow {
 /// Reads the daemon over `AttachRequest::ListAgents` and never lazily spawns
 /// one, so an unreachable daemon is an `Err` here rather than a freshly-minted
 /// empty daemon nobody asked for.
-fn daemon_status(
+pub(crate) fn daemon_status(
     g: &Guard<'_>,
     bin: &Path,
     label: &str,
@@ -485,16 +552,24 @@ fn daemon_status(
     Ok(Ok(agents
         .iter()
         .map(|a| StatusRow {
+            agent_id: field(a, "agent_id"),
             pane_id: field(a, "pane_id"),
             role: field(a, "role"),
             status: field(a, "status"),
+            cwd: field(a, "cwd"),
+            tool: a
+                .get("active_tool")
+                .and_then(|t| t.get("name"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
         })
         .collect()))
 }
 
 /// Poll `daemon status` until `pred` holds over its rows. Every poll is a client
 /// and passes the pre-connect assertion first.
-fn wait_for_status(
+pub(crate) fn wait_for_status(
     g: &Guard<'_>,
     bin: &Path,
     label: &str,
@@ -524,7 +599,7 @@ fn wait_for_status(
     }
 }
 
-fn count_in_file(path: &Path, needle: &str) -> usize {
+pub(crate) fn count_in_file(path: &Path, needle: &str) -> usize {
     std::fs::read_to_string(path)
         .map(|s| s.matches(needle).count())
         .unwrap_or(0)
@@ -532,37 +607,50 @@ fn count_in_file(path: &Path, needle: &str) -> usize {
 
 /// The last `n` lines of `s` — what a failure message should quote rather than
 /// the whole scrollback.
-fn tail(s: &str, n: usize) -> String {
+pub(crate) fn tail(s: &str, n: usize) -> String {
     let lines: Vec<&str> = s.lines().collect();
     lines[lines.len().saturating_sub(n)..].join("\n")
 }
 
-/// Wait for the daemon to bind every endpoint the matrix says it owns, reading
-/// the kernel's table rather than starting a client to ask — a client started
-/// before the daemon is listening is exactly the one that lazy-spawns.
-fn wait_for_listeners(daemon: &mut SandboxProcess, owned: &[PathBuf]) -> Result<(), Abort> {
+/// Wait for the daemon to bind every endpoint one of the candidate matrices
+/// says it owns, reading the kernel's table rather than starting a client to
+/// ask — a client started before the daemon is listening is exactly the one
+/// that lazy-spawns. Returns the candidate the daemon bound.
+///
+/// With one candidate this is "wait for the predicted pair". With two (a
+/// reverse `resolved` run, see [`EndpointMatrix::candidates`]) it is "wait for
+/// either pair", and the other pair is then held ABSENT by every pre-connect
+/// assertion from here on, exactly as a predicted matrix would hold it.
+fn wait_for_listeners(
+    daemon: &mut SandboxProcess,
+    candidates: &[EndpointMatrix],
+    log_name: &str,
+) -> Result<EndpointMatrix, Abort> {
     let deadline = Instant::now() + DAEMON_TIMEOUT;
     loop {
         if daemon.has_exited() {
             return Err(Abort::Scenario(format!(
                 "the sandbox daemon (pid {}) exited before it bound its endpoints — see \
-                 artifacts/old-daemon.log",
+                 artifacts/{log_name}",
                 daemon.pid()
             )));
         }
         let listeners = proc::unix_listeners().map_err(iso)?;
         let held = proc::socket_inodes(daemon.pid()).unwrap_or_default();
-        let bound = owned.iter().all(|p| {
-            let inodes = isolation::listening_inodes(&listeners, p);
-            !inodes.is_empty() && inodes.iter().all(|i| held.contains(i))
+        let bound = candidates.iter().find(|m| {
+            m.owned.iter().all(|p| {
+                let inodes = isolation::listening_inodes(&listeners, p);
+                !inodes.is_empty() && inodes.iter().all(|i| held.contains(i))
+            })
         });
-        if bound {
-            return Ok(());
+        if let Some(m) = bound {
+            return Ok(m.clone());
         }
         if Instant::now() >= deadline {
             return Err(Abort::Scenario(format!(
-                "the sandbox daemon never bound {owned:?} within {DAEMON_TIMEOUT:?}; the \
-                 namespace's listeners were {listeners:?}"
+                "the sandbox daemon never bound any of {:?} within {DAEMON_TIMEOUT:?}; the \
+                 namespace's listeners were {listeners:?}",
+                candidates.iter().map(|m| &m.owned).collect::<Vec<_>>()
             )));
         }
         std::thread::sleep(Duration::from_millis(100));
@@ -571,7 +659,7 @@ fn wait_for_listeners(daemon: &mut SandboxProcess, owned: &[PathBuf]) -> Result<
 
 /// One line of `ss`-style evidence for the attach endpoint, from the kernel's
 /// table: which inodes listen there and which pids hold them.
-fn kernel_owner_line(path: &Path) -> String {
+pub(crate) fn kernel_owner_line(path: &Path) -> String {
     match proc::unix_listeners() {
         Ok(ls) => {
             let inodes = isolation::listening_inodes(&ls, path);
@@ -589,21 +677,118 @@ fn kernel_owner_line(path: &Path) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Who plays which part
+// ---------------------------------------------------------------------------
+
+/// Which build plays which part in a run.
+///
+/// Forward is rule 12's pairing: the previous release serves the daemon and
+/// stands the orchestration up under it; the branch attaches second, declines
+/// the prompt, and is the CLI every pane command and the final status query
+/// use. Reverse swaps the two builds and changes nothing else about the
+/// scenario — which is the point: the same steps and the same tells, with the
+/// branch's own daemon code now the code under test.
+pub(crate) struct Cast {
+    pub direction: Direction,
+    /// Serves the daemon, and is the TUI and CLI that stand the orchestration
+    /// up under it.
+    pub daemon_bin: PathBuf,
+    /// `old` or `branch`, for labels.
+    pub daemon_side: &'static str,
+    /// `v0.41.0` or `branch`, for prose.
+    pub daemon_build: String,
+    /// The TUI that attaches second and declines the prompt, and the CLI every
+    /// pane command and the final status query use.
+    pub client_bin: PathBuf,
+    pub client_side: &'static str,
+    pub client_build: String,
+    /// What is typed into a pane to run the client CLI. Forward: the bare name,
+    /// which `PATH` resolves to the staged branch build. Reverse: the old
+    /// build's absolute path, so the evidence names exactly which binary sent
+    /// each stimulus (a bare name there would reach the same build, staged on
+    /// `PATH`, under a second path).
+    pub pane_cli: String,
+    pub pane_cli_label: &'static str,
+}
+
+impl Cast {
+    pub fn for_plan(plan: &Plan, sb: &Sandbox) -> Self {
+        match plan.direction {
+            Direction::Forward => Cast {
+                direction: Direction::Forward,
+                daemon_bin: sb.old_bin(),
+                daemon_side: "old",
+                daemon_build: plan.previous.clone(),
+                client_bin: sb.new_bin(Direction::Forward),
+                client_side: "branch",
+                client_build: "branch".to_string(),
+                pane_cli: "dot-agent-deck".to_string(),
+                pane_cli_label: "dot-agent-deck",
+            },
+            Direction::Reverse => Cast {
+                direction: Direction::Reverse,
+                daemon_bin: sb.new_bin(Direction::Reverse),
+                daemon_side: "branch",
+                daemon_build: "branch".to_string(),
+                client_bin: sb.old_bin(),
+                client_side: "old",
+                client_build: plan.previous.clone(),
+                pane_cli: sb.old_bin().display().to_string(),
+                pane_cli_label: "old dot-agent-deck",
+            },
+        }
+    }
+
+    /// The PTY label a side's TUI gets — also its stream file's name.
+    fn tui_label(side: &str) -> &'static str {
+        if side == "old" { "old-tui" } else { "new-tui" }
+    }
+}
+
+/// The key that declines the build-version mismatch prompt.
+///
+/// Established per build rather than assumed symmetric, because the reverse
+/// run puts the OLD build's prompt in front of it. Both sides render the same
+/// prompt — `src/build_version_handshake.rs` is byte-identical between v0.41.0
+/// and every branch this sweeps, and the published v0.41.0 binary's strings
+/// carry `[S] restart daemon and continue   [any other key] keep current
+/// daemon` — and both implement it in `interactive_prompt`: `s`/`S` without
+/// Ctrl is the ONLY affirmative key and every other key declines. The run
+/// itself is the behavioural check: the prompt is recorded as the client
+/// printed it, and tells 1 and 2 then prove the client stayed attached to the
+/// same daemon rather than restarting it.
+const DECLINE_KEY: &[u8] = b"n";
+
+/// Every role the run's fixture defines, in card order.
+pub(crate) fn roles(plan: &Plan) -> Vec<String> {
+    let mut v: Vec<String> = [ROLE_ORCHESTRATOR, ROLE_CODER, ROLE_REVIEWER]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let sb = plan.sandbox();
+    v.extend(plan.probe.extra_roles(&sb).into_iter().map(|r| r.name));
+    v
+}
+
+// ---------------------------------------------------------------------------
 // The run
 // ---------------------------------------------------------------------------
 
-#[allow(clippy::too_many_arguments)]
 fn drive(
     plan: &Plan,
     sb: &Sandbox,
     ctl: &mut ctl::Client,
     mnt: &str,
-    old_bin: &Path,
-    new_bin: &Path,
+    cast: &Cast,
     ev: &mut Evidence,
 ) -> Result<(), Abort> {
-    println!("xver (inner): step 1 — start the previous release's daemon");
-    let mut daemon_cmd = Command::new(old_bin);
+    println!(
+        "xver (inner): step 1 — start the {} daemon",
+        cast.daemon_build
+    );
+    probes::before_daemon(plan, sb).map_err(Abort::Scenario)?;
+    let log_name = format!("{}-daemon.log", cast.daemon_side);
+    let mut daemon_cmd = Command::new(&cast.daemon_bin);
     daemon_cmd
         .args(["daemon", "serve"])
         .current_dir(&sb.project)
@@ -611,31 +796,30 @@ fn drive(
     for (k, v) in &plan.env {
         daemon_cmd.env(k, v);
     }
-    let daemon_out = std::fs::File::create(sb.artifacts.join("old-daemon.log"))
-        .map_err(|e| format!("create old-daemon.log: {e}"))?;
+    let daemon_out = std::fs::File::create(sb.artifacts.join(&log_name))
+        .map_err(|e| format!("create {log_name}: {e}"))?;
     let daemon_err = daemon_out
         .try_clone()
-        .map_err(|e| format!("clone old-daemon.log handle: {e}"))?;
+        .map_err(|e| format!("clone {log_name} handle: {e}"))?;
     daemon_cmd.stdout(daemon_out).stderr(daemon_err);
     let child = daemon_cmd
         .spawn()
         .map_err(|e| format!("spawn the sandbox daemon: {e}"))?;
-    let mut daemon =
-        SandboxProcess::adopt(child, old_bin, "sandbox daemon".to_string()).map_err(iso)?;
+    let mut daemon = SandboxProcess::adopt(child, &cast.daemon_bin, "sandbox daemon".to_string())
+        .map_err(iso)?;
     ev.daemon_pid = daemon.pid();
-    ev.daemon_endpoint = plan.matrix.attach().display().to_string();
 
     // The recorded identity must be exactly what was launched, or it is not an
     // identity worth gating a signal on.
     let id = daemon.identity.clone();
     let want_cmdline = vec![
-        old_bin.display().to_string(),
+        cast.daemon_bin.display().to_string(),
         "daemon".to_string(),
         "serve".to_string(),
     ];
     let want_env: BTreeMap<String, String> = plan.env.iter().cloned().collect();
     let problems: Vec<String> = [
-        (id.exe != old_bin).then(|| format!("exe {:?}", id.exe)),
+        (id.exe != cast.daemon_bin).then(|| format!("exe {:?}", id.exe)),
         (id.cmdline != want_cmdline).then(|| format!("cmdline {:?}", id.cmdline)),
         (id.cwd != sb.project).then(|| format!("cwd {:?}", id.cwd)),
         (id.environ != want_env).then(|| "environment differs from the plan".to_string()),
@@ -649,11 +833,11 @@ fn drive(
             "the sandbox daemon's recorded identity is not what was launched: {}",
             problems.join("; ")
         )));
-        return teardown(daemon, None, sb, ev, body);
+        return teardown(daemon, None, None, sb, ev, body);
     }
     ev.step(format!(
         "started the {} daemon as pid {} inside the namespace",
-        plan.previous,
+        cast.daemon_build,
         daemon.pid()
     ));
     ev.isolated(format!(
@@ -666,38 +850,85 @@ fn drive(
         isolation::render_env(&id.environ),
     );
 
-    if let Err(e) = wait_for_listeners(&mut daemon, &plan.matrix.owned) {
-        return teardown(daemon, None, sb, ev, Err(e));
+    let matrix = match wait_for_listeners(&mut daemon, &plan.matrices, &log_name) {
+        Ok(m) => m,
+        Err(e) => return teardown(daemon, None, None, sb, ev, Err(e)),
+    };
+    ev.daemon_endpoint = matrix.attach().display().to_string();
+    if plan.matrices.len() > 1 {
+        ev.isolated(format!(
+            "the {} daemon bound `{}` and `{}` — {} — out of {} candidate layouts; from here on \
+             every other candidate ({}) must be absent before any client connects",
+            cast.daemon_build,
+            matrix.owned[0].display(),
+            matrix.owned[1].display(),
+            if matrix.owns_per_uid(plan.uid) {
+                "the post-#1121 per-uid directory"
+            } else {
+                "the pre-#1121 flat fallback"
+            },
+            plan.matrices.len(),
+            matrix
+                .absent
+                .iter()
+                .map(|p| format!("`{}`", p.display()))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
     }
     let guard = Guard {
         plan,
         sb,
         recorded_mnt: mnt.to_string(),
         daemon: id,
+        matrix,
+        second: RefCell::new(None),
         ctl: RefCell::new(ctl),
         counts: RefCell::new(BTreeMap::new()),
     };
-    let mut new_tui = None;
-    let body = scenario(&guard, &mut daemon, old_bin, new_bin, ev, &mut new_tui);
+    let mut attach_slot = None;
+    let body = scenario(&guard, &mut daemon, cast, ev, &mut attach_slot);
     let summary = guard.summary();
+    let second = guard.second.borrow().clone();
     drop(guard);
     ev.isolated(summary);
-    teardown(daemon, new_tui, sb, ev, body)
+    teardown(daemon, attach_slot, second, sb, ev, body)
 }
 
-/// Stop the branch TUI, then the daemon, then anything left in the namespace —
-/// each by verified identity — and return `body` unchanged unless teardown
-/// itself found an isolation problem.
+/// Stop the attached TUI, then any second daemon the run measured, then the
+/// daemon, then anything left in the namespace — each by verified identity —
+/// and return `body` unchanged unless teardown itself found an isolation
+/// problem.
 fn teardown(
     mut daemon: SandboxProcess,
-    new_tui: Option<pty::PtyDeck>,
+    attach_tui: Option<pty::PtyDeck>,
+    second: Option<SecondDaemon>,
     sb: &Sandbox,
     ev: &mut Evidence,
     body: Result<(), Abort>,
 ) -> Result<(), Abort> {
     println!("xver (inner): teardown");
-    if let Some(mut tui) = new_tui {
+    if let Some(mut tui) = attach_tui {
         ev.step(tui.shutdown());
+    }
+    if let Some(s) = second {
+        let pid = s.identity.pid;
+        match proc::terminate_identity(&s.identity, DAEMON_GRACE) {
+            Ok(Terminated::Graceful) => ev.step(format!(
+                "sent ONE SIGTERM to the second daemon (pid {pid}) — the one the old client \
+                 lazy-spawned — after re-verifying its start time, exe, exact cmdline, cwd, full \
+                 environment and mount namespace; it exited within {DAEMON_GRACE:?}"
+            )),
+            Ok(Terminated::Killed) => ev.step(format!(
+                "the second daemon (pid {pid}) outlived its SIGTERM by {DAEMON_GRACE:?}; its \
+                 identity was re-verified and it got SIGKILL"
+            )),
+            Err(Mismatch::Gone) => ev.step(format!("second daemon pid {pid} was already gone")),
+            Err(m) => ev.step(format!(
+                "REFUSED to signal the second daemon (pid {pid}): {m}. Nothing was signalled; \
+                 the namespace's exit reaps it."
+            )),
+        }
     }
     let label = daemon.label.clone();
     let pid = daemon.pid();
@@ -792,76 +1023,89 @@ fn sweep_survivors(sb: &Sandbox, ev: &mut Evidence) -> Result<(), Abort> {
     Ok(())
 }
 
-/// Steps 2–5 and the four tells. The branch TUI is parked in `new_tui_slot` as
-/// soon as it exists, so teardown can stop it by identity on success and on
-/// failure alike rather than leaving it to a destructor.
+/// Steps 2–5 and the four tells, in either direction. The attached TUI is
+/// parked in `attach_slot` as soon as it exists, so teardown can stop it by
+/// identity on success and on failure alike rather than leaving it to a
+/// destructor.
 fn scenario(
     g: &Guard<'_>,
     daemon: &mut SandboxProcess,
-    old_bin: &Path,
-    new_bin: &Path,
+    cast: &Cast,
     ev: &mut Evidence,
-    new_tui_slot: &mut Option<pty::PtyDeck>,
+    attach_slot: &mut Option<pty::PtyDeck>,
 ) -> Result<(), Abort> {
     let plan = g.plan;
     let sb = g.sb;
-    let fail = |e: Abort| e;
-    let three_roles = |rows: &[StatusRow]| {
-        [ROLE_ORCHESTRATOR, ROLE_CODER, ROLE_REVIEWER]
+    let all_roles = roles(plan);
+    let every_role = |rows: &[StatusRow]| {
+        all_roles
             .iter()
-            .all(|r| rows.iter().any(|row| row.role.contains(*r)))
+            .all(|r| rows.iter().any(|row| row.role.contains(r.as_str())))
     };
+    let daemon_cli = format!("{} CLI: daemon status", cast.daemon_side);
 
-    // The old binary asking its own daemon is the version-correct way to find
-    // out whether it is up, in every endpoint mode.
-    daemon_status(g, old_bin, "old CLI: daemon status", ev)
-        .map_err(fail)?
-        .map_err(|e| {
-            fail(format!("the sandbox daemon never answered `daemon status`: {e}").into())
-        })?;
+    if let Some(blocked) = probes::daemon_layout_precondition(plan, &g.matrix) {
+        // The probe cannot reach the arm it was written for with the daemon
+        // this branch builds; say so rather than run something else.
+        ev.tell(
+            "probe",
+            "the probe's precondition",
+            Verdict::NotChecked,
+            blocked,
+        );
+        return Ok(());
+    }
+
+    // The daemon's own build asking its own daemon is the version-correct way to
+    // find out whether it is up, in every endpoint mode.
+    daemon_status(g, &cast.daemon_bin, &daemon_cli, ev)?.map_err(|e| {
+        Abort::Scenario(format!(
+            "the sandbox daemon never answered `daemon status`: {e}"
+        ))
+    })?;
     ev.step("the sandbox daemon answered `daemon status`");
-    let listeners_at_start = proc::listeners_on(plan.matrix.attach());
-    let kernel_at_start = kernel_owner_line(plan.matrix.attach());
+    let listeners_at_start = proc::listeners_on(g.matrix.attach());
+    let kernel_at_start = kernel_owner_line(g.matrix.attach());
 
-    println!("xver (inner): step 2 — bring an orchestration up under it, with the OLD TUI");
-    g.preconnect_logged("old TUI", &plan.env, ev)
-        .map_err(fail)?;
-    let mut old_tui = pty::PtyDeck::spawn(pty::PtySpec {
-        label: "old-tui",
-        bin: old_bin,
+    println!(
+        "xver (inner): step 2 — bring an orchestration up under it, with the {} TUI",
+        cast.daemon_side.to_uppercase()
+    );
+    g.preconnect_logged(&format!("{} TUI", cast.daemon_side), &plan.env, ev)?;
+    let setup_label = Cast::tui_label(cast.daemon_side);
+    let mut setup_tui = pty::PtyDeck::spawn(pty::PtySpec {
+        label: setup_label,
+        bin: &cast.daemon_bin,
         args: &[],
         cwd: &sb.project,
         env: &plan.env,
         cols: 200,
         rows: 55,
-        stream_log: sb.artifacts.join("old-tui.stream.txt"),
-    })
-    .map_err(|e| fail(e.into()))?;
-    if !old_tui.wait_for_grid_string("No active sessions", UI_TIMEOUT) {
-        return Err(fail(
-            format!(
-                "{}: never reached an empty dashboard.\n=== grid ===\n{}",
-                old_tui.label,
-                old_tui.grid()
-            )
-            .into(),
-        ));
+        stream_log: sb.artifacts.join(format!("{setup_label}.stream.txt")),
+    })?;
+    if !setup_tui.wait_for_grid_string("No active sessions", UI_TIMEOUT) {
+        return Err(Abort::Scenario(format!(
+            "{}: never reached an empty dashboard.\n=== grid ===\n{}",
+            setup_tui.label,
+            setup_tui.grid()
+        )));
     }
-    open_orchestration(&old_tui).map_err(|e| fail(e.into()))?;
-    let rows = wait_for_status(g, old_bin, "old CLI: daemon status", UI_TIMEOUT, ev, three_roles)
-        .map_err(fail)?
+    open_orchestration(&setup_tui)?;
+    let rows = wait_for_status(g, &cast.daemon_bin, &daemon_cli, UI_TIMEOUT, ev, every_role)?
         .map_err(|e| {
-            fail(
-                format!(
-                    "the three role panes never came up under the sandbox daemon: {e}\n=== old TUI grid ===\n{}",
-                    old_tui.grid()
-                )
-                .into(),
-            )
+            Abort::Scenario(format!(
+                "the {} role panes never came up under the sandbox daemon: {e}\n=== {} TUI grid \
+                 ===\n{}",
+                all_roles.len(),
+                cast.daemon_side,
+                setup_tui.grid()
+            ))
         })?;
     ev.step(format!(
-        "the old TUI brought up {} role panes under the old daemon: {}",
+        "the {} TUI brought up {} role panes under the {} daemon: {}",
+        cast.daemon_side,
         rows.len(),
+        cast.daemon_side,
         rows.iter()
             .map(|r| format!("{} ({})", r.role, r.pane_id))
             .collect::<Vec<_>>()
@@ -869,57 +1113,46 @@ fn scenario(
     ));
 
     println!("xver (inner): step 3 — Ctrl+D, Ctrl+C, Detach (never Stop)");
-    old_tui.send(b"\x04"); // Ctrl+D — leave PaneInput. Without this Ctrl+C goes
+    setup_tui.send(b"\x04"); // Ctrl+D — leave PaneInput. Without this Ctrl+C goes
     std::thread::sleep(SETTLE); // to the focused PANE and kills a role.
-    old_tui.send(b"\x03"); // Ctrl+C — the quit dialog
-    if !old_tui.wait_for_grid_string("Quit dot-agent-deck?", STEP_TIMEOUT) {
-        return Err(fail(
-            format!(
-                "Ctrl+D then Ctrl+C never opened the quit dialog in the old TUI.\n=== grid ===\n{}",
-                old_tui.grid()
-            )
-            .into(),
-        ));
+    setup_tui.send(b"\x03"); // Ctrl+C — the quit dialog
+    if !setup_tui.wait_for_grid_string("Quit dot-agent-deck?", STEP_TIMEOUT) {
+        return Err(Abort::Scenario(format!(
+            "Ctrl+D then Ctrl+C never opened the quit dialog in the {} TUI.\n=== grid ===\n{}",
+            cast.daemon_side,
+            setup_tui.grid()
+        )));
     }
-    old_tui.send(b"\r"); // Enter on the default option, which is Detach (index 0).
-    if old_tui.wait_for_exit(STEP_TIMEOUT).is_none() {
-        return Err(fail(
-            format!(
-                "the old TUI did not exit after choosing Detach.\n=== grid ===\n{}",
-                old_tui.grid()
-            )
-            .into(),
-        ));
+    setup_tui.send(b"\r"); // Enter on the default option, which is Detach (index 0).
+    if setup_tui.wait_for_exit(STEP_TIMEOUT).is_none() {
+        return Err(Abort::Scenario(format!(
+            "the {} TUI did not exit after choosing Detach.\n=== grid ===\n{}",
+            cast.daemon_side,
+            setup_tui.grid()
+        )));
     }
-    ev.step(old_tui.shutdown());
-    drop(old_tui);
+    ev.step(setup_tui.shutdown());
+    drop(setup_tui);
 
     let after_detach = wait_for_status(
         g,
-        old_bin,
-        "old CLI: daemon status",
+        &cast.daemon_bin,
+        &daemon_cli,
         DAEMON_TIMEOUT,
         ev,
-        three_roles,
-    )
-    .map_err(fail)?
+        every_role,
+    )?
     .map_err(|e| {
-        fail(
-            format!(
-                "after the detach the daemon no longer lists all three roles — the Ctrl+C trap \
-                     (it goes to the PANE in PaneInput mode) or a `Stop` instead of `Detach`: {e}"
-            )
-            .into(),
-        )
+        Abort::Scenario(format!(
+            "after the detach the daemon no longer lists every role — the Ctrl+C trap (it \
+                 goes to the PANE in PaneInput mode) or a `Stop` instead of `Detach`: {e}"
+        ))
     })?;
     if daemon.has_exited() {
-        return Err(fail(
-            format!(
-                "the sandbox daemon (pid {}) died during the detach — `Detach` must leave it running",
-                daemon.pid()
-            )
-            .into(),
-        ));
+        return Err(Abort::Scenario(format!(
+            "the sandbox daemon (pid {}) died during the detach — `Detach` must leave it running",
+            daemon.pid()
+        )));
     }
     ev.step(format!(
         "after Detach the daemon (pid {}) is still alive and still lists {} role panes",
@@ -927,11 +1160,13 @@ fn scenario(
         after_detach.len()
     ));
 
-    println!("xver (inner): step 4 — attach the BRANCH TUI and decline the mismatch prompt");
-    g.preconnect_logged("branch TUI", &plan.env, ev)
-        .map_err(fail)?;
+    println!(
+        "xver (inner): step 4 — attach the {} TUI and decline the mismatch prompt",
+        cast.client_side.to_uppercase()
+    );
+    g.preconnect_logged(&format!("{} TUI", cast.client_side), &plan.env, ev)?;
     let fallback_arm = plan.mode == EndpointMode::Resolved && !plan.keep_xdg_runtime_dir;
-    if fallback_arm {
+    if fallback_arm && cast.direction == Direction::Forward {
         ev.isolated(format!(
             "fallback arm: the branch TUI starts with no `XDG_RUNTIME_DIR` and no socket override \
              in its environment, its own primary fallback `{}` is absent (no file, no listener), \
@@ -940,29 +1175,44 @@ fn scenario(
              compatibility read of the literal `/tmp` — the fallback arm issue #1121 changed.",
             sandbox::per_uid_dir(plan.uid).display(),
             plan.previous,
-            plan.matrix.owned[0].display(),
-            plan.matrix.owned[1].display()
+            g.matrix.owned[0].display(),
+            g.matrix.owned[1].display()
         ));
     }
-    let new_tui = new_tui_slot.insert(
-        pty::PtyDeck::spawn(pty::PtySpec {
-            label: "new-tui",
-            bin: new_bin,
-            args: &[],
-            cwd: &sb.project,
-            env: &plan.env,
-            cols: 200,
-            rows: 55,
-            stream_log: sb.artifacts.join("new-tui.stream.txt"),
-        })
-        .map_err(|e| fail(e.into()))?,
-    );
-    with_branch_tui(
+    if fallback_arm && cast.direction == Direction::Reverse {
+        ev.isolated(format!(
+            "fallback arm, reverse: the {} TUI starts with no `XDG_RUNTIME_DIR` and no socket \
+             override in its environment. The branch daemon listens at `{}` and `{}`; every \
+             other candidate — {} — is absent (no file, no listener). Whatever the old TUI \
+             reaches next is decided by its own resolution of the no-XDG, no-override fallback \
+             and nothing else.",
+            cast.client_build,
+            g.matrix.owned[0].display(),
+            g.matrix.owned[1].display(),
+            g.matrix
+                .absent
+                .iter()
+                .map(|p| format!("`{}`", p.display()))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    let attach_label = Cast::tui_label(cast.client_side);
+    let attach_tui = attach_slot.insert(pty::PtyDeck::spawn(pty::PtySpec {
+        label: attach_label,
+        bin: &cast.client_bin,
+        args: &[],
+        cwd: &sb.project,
+        env: &plan.env,
+        cols: 200,
+        rows: 55,
+        stream_log: sb.artifacts.join(format!("{attach_label}.stream.txt")),
+    })?);
+    with_attached_tui(
         g,
         daemon,
-        new_tui,
-        old_bin,
-        new_bin,
+        cast,
+        attach_tui,
         ev,
         listeners_at_start,
         kernel_at_start,
@@ -971,12 +1221,11 @@ fn scenario(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn with_branch_tui(
+fn with_attached_tui(
     g: &Guard<'_>,
     daemon: &mut SandboxProcess,
-    new_tui: &pty::PtyDeck,
-    old_bin: &Path,
-    new_bin: &Path,
+    cast: &Cast,
+    tui: &mut pty::PtyDeck,
     ev: &mut Evidence,
     listeners_at_start: Option<Vec<i32>>,
     kernel_at_start: String,
@@ -984,73 +1233,96 @@ fn with_branch_tui(
 ) -> Result<(), Abort> {
     let plan = g.plan;
     let sb = g.sb;
-    let saw_prompt = new_tui.wait_for_stream_string("Daemon version mismatch", UI_TIMEOUT);
-    let prompt_excerpt = extract_prompt(&new_tui.stream_text());
+    let all_roles = roles(plan);
+    let saw_prompt = tui.wait_for_stream_string("Daemon version mismatch", UI_TIMEOUT);
+    let prompt_excerpt = extract_prompt(&tui.stream_text());
     if !saw_prompt {
         ev.excerpt(
-            "branch TUI stream (no mismatch prompt)",
-            tail(&new_tui.stream_text(), 60),
+            format!("{} TUI stream (no mismatch prompt)", cast.client_side),
+            tail(&tui.stream_text(), 60),
         );
+        if cast.direction == Direction::Reverse {
+            // In reverse, a client that never prints the prompt may simply
+            // not have FOUND the branch daemon. That is a measurable outcome
+            // with its own status, not a harness error — so measure it.
+            return classify_undiscovered(g, daemon, cast, tui, ev);
+        }
         return Err(Abort::Scenario(format!(
-            "the branch TUI never printed the build-version mismatch prompt within {UI_TIMEOUT:?}. \
-             That prompt appearing IS the proof the scenario was reached: either the branch TUI \
-             did not find the old daemon at all (and has lazy-spawned its own — check the \
-             `Attach protocol listening` count below), or the two builds report the same build \
-             id. old={} new={}",
+            "the {} TUI never printed the build-version mismatch prompt within {UI_TIMEOUT:?}. \
+             That prompt appearing IS the proof the scenario was reached: either it did not find \
+             the {} daemon at all (and has lazy-spawned its own — check the `Attach protocol \
+             listening` count below), or the two builds report the same build id. old={} new={}",
+            cast.client_side,
+            cast.daemon_side,
             ev.old_hello.trim(),
             ev.new_hello.trim()
         )));
     }
     ev.excerpt(
-        "build-version mismatch prompt, as the branch TUI printed it",
+        format!(
+            "build-version mismatch prompt, as the {} TUI printed it",
+            cast.client_side
+        ),
         prompt_excerpt.clone(),
     );
-    let named_roles: Vec<&str> = [ROLE_ORCHESTRATOR, ROLE_CODER, ROLE_REVIEWER]
-        .into_iter()
+    let named_roles: Vec<&str> = all_roles
+        .iter()
+        .map(String::as_str)
         .filter(|r| prompt_excerpt.contains(r))
         .collect();
     ev.step(format!(
-        "the branch TUI printed the build-version mismatch prompt naming {} of the live roles ({})",
+        "the {} TUI printed the build-version mismatch prompt naming {} of the live roles ({})",
+        cast.client_side,
         named_roles.len(),
         named_roles.join(", ")
     ));
-    // Any key other than `s`/`S` declines and keeps the existing daemon.
-    // Accepting would SIGTERM the old daemon and replace it, which destroys the
-    // entire point of the run.
-    new_tui.send(b"n");
-    if !new_tui.wait_for_grid(UI_TIMEOUT, |g| {
+    // Any key other than `s`/`S` declines and keeps the existing daemon (see
+    // DECLINE_KEY). Accepting would SIGTERM the daemon under test and replace
+    // it, which destroys the entire point of the run.
+    tui.send(DECLINE_KEY);
+    if !tui.wait_for_grid(UI_TIMEOUT, |g| {
         g.contains("XVER_") || g.contains(ROLE_ORCHESTRATOR)
     }) {
         return Err(Abort::Scenario(format!(
             "{}: after declining the prompt it never rendered the orchestration.\n=== grid ===\n{}",
-            new_tui.label,
-            new_tui.grid()
+            tui.label,
+            tui.grid()
         )));
     }
-    ev.step("declined the prompt (`n`); the branch TUI attached to the OLD daemon unchanged");
+    ev.step(format!(
+        "declined the prompt (`{}`); the {} TUI attached to the {} daemon unchanged",
+        String::from_utf8_lossy(DECLINE_KEY),
+        cast.client_side,
+        cast.daemon_side.to_uppercase()
+    ));
 
     println!("xver (inner): step 5 — delegate first, hooks last");
-    focus_role(new_tui, ROLE_ORCHESTRATOR)?;
+    focus_role(tui, plan, ROLE_ORCHESTRATOR)?;
     let nonce = epoch_secs();
     let delegate_sentinel = format!("XVER-DELEGATE-{nonce}");
-    // The pane's shell is about to start the branch CLI, which is a client.
-    g.preconnect_logged("pane: dot-agent-deck delegate", &plan.env, ev)?;
+    // The pane's shell is about to start the client CLI, which is a client.
+    g.preconnect_logged(
+        &format!("pane: {} delegate", cast.pane_cli_label),
+        &plan.env,
+        ev,
+    )?;
     type_into_pane(
-        new_tui,
+        tui,
         &format!(
-            "dot-agent-deck delegate --to {ROLE_CODER} --to {ROLE_REVIEWER} --task \"{delegate_sentinel} list the files in this directory\""
+            "{} delegate --to {ROLE_CODER} --to {ROLE_REVIEWER} --task \"{delegate_sentinel} list the files in this directory\"",
+            cast.pane_cli
         ),
     );
 
     // Delivery is asserted on the PAYLOAD, in the target pane, not on the CLI's
     // exit code. `coder` is `cat`, so whatever the daemon wrote into its PTY is
     // echoed straight back onto the screen.
-    focus_role(new_tui, ROLE_CODER)?;
+    focus_role(tui, plan, ROLE_CODER)?;
     let pointer = format!("worker-task-{ROLE_CODER}.md");
-    let delivered = new_tui.wait_for_grid(UI_TIMEOUT, |g| {
+    let delivered = tui.wait_for_grid(UI_TIMEOUT, |g| {
         g.contains(&pointer) || g.contains(&delegate_sentinel)
     });
-    ev.excerpt("`coder` role pane after the delegate", new_tui.grid());
+    ev.excerpt("`coder` role pane after the delegate", tui.grid());
     let task_file = sb
         .project
         .join(".dot-agent-deck")
@@ -1075,10 +1347,14 @@ fn with_branch_tui(
         },
         format!(
             "delegated `{delegate_sentinel}` from the orchestrator pane to `{ROLE_CODER}` and \
-             `{ROLE_REVIEWER}`, typed into the orchestrator's own PTY through the BRANCH TUI's \
-             pane-input path to the OLD daemon.\n\
+             `{ROLE_REVIEWER}` with the {} CLI (`{}`), typed into the orchestrator's own PTY \
+             through the {} TUI's pane-input path to the {} daemon.\n\
              looked for `{pointer}` or `{delegate_sentinel}` on the `{ROLE_CODER}` pane: {}\n\
              {task_file_note}",
+            cast.client_build,
+            cast.pane_cli,
+            cast.client_side.to_uppercase(),
+            cast.daemon_side.to_uppercase(),
             if delivered { "found" } else { "NOT FOUND" }
         ),
     );
@@ -1087,28 +1363,43 @@ fn with_branch_tui(
     // the daemon classify that pane's agent type as `Pi`, which routes prompt
     // delivery differently and makes a delivered delegate briefly look
     // undelivered.
-    focus_role(new_tui, ROLE_REVIEWER)?;
+    focus_role(tui, plan, ROLE_REVIEWER)?;
     let work_done_sentinel = format!("XVER-WORKDONE-{nonce}");
-    g.preconnect_logged("pane: dot-agent-deck work-done", &plan.env, ev)?;
+    g.preconnect_logged(
+        &format!("pane: {} work-done", cast.pane_cli_label),
+        &plan.env,
+        ev,
+    )?;
     type_into_pane(
-        new_tui,
-        &format!("dot-agent-deck work-done --task \"{work_done_sentinel}\""),
+        tui,
+        &format!(
+            "{} work-done --task \"{work_done_sentinel}\"",
+            cast.pane_cli
+        ),
     );
-    focus_role(new_tui, ROLE_ORCHESTRATOR)?;
+    focus_role(tui, plan, ROLE_ORCHESTRATOR)?;
     let feedback = format!("Worker {ROLE_REVIEWER} has completed their task");
-    let work_done_arrived = new_tui.wait_for_grid(UI_TIMEOUT, |g| g.contains(&feedback));
+    let work_done_arrived = tui.wait_for_grid(UI_TIMEOUT, |g| g.contains(&feedback));
     ev.excerpt(
         "orchestrator role pane after the worker's `work-done`",
-        new_tui.grid(),
+        tui.grid(),
     );
 
-    focus_role(new_tui, ROLE_REVIEWER)?;
-    g.preconnect_logged("pane: dot-agent-deck agent-event", &plan.env, ev)?;
-    type_into_pane(new_tui, "dot-agent-deck agent-event --type running");
+    focus_role(tui, plan, ROLE_REVIEWER)?;
+    g.preconnect_logged(
+        &format!("pane: {} agent-event", cast.pane_cli_label),
+        &plan.env,
+        ev,
+    )?;
+    type_into_pane(
+        tui,
+        &format!("{} agent-event --type running", cast.pane_cli),
+    );
+    let client_cli = format!("{} CLI: daemon status", cast.client_side);
     let status_rows = wait_for_status(
         g,
-        new_bin,
-        "branch CLI: daemon status",
+        &cast.client_bin,
+        &client_cli,
         DAEMON_TIMEOUT,
         ev,
         |rows| {
@@ -1123,8 +1414,10 @@ fn with_branch_tui(
             (
                 true,
                 format!(
-                    "`daemon status --json`, asked by the BRANCH binary of the OLD daemon, reports \
-                     the `{ROLE_REVIEWER}` pane as `{}`",
+                    "`daemon status --json`, asked by the {} binary of the {} daemon, reports the \
+                     `{ROLE_REVIEWER}` pane as `{}`",
+                    cast.client_side.to_uppercase(),
+                    cast.daemon_side.to_uppercase(),
                     row.map(|r| r.status.clone()).unwrap_or_default()
                 ),
             )
@@ -1140,18 +1433,32 @@ fn with_branch_tui(
             Verdict::Fail
         },
         format!(
-            "work-done: issued `dot-agent-deck work-done --task \"{work_done_sentinel}\"` from \
-             inside the `{ROLE_REVIEWER}` pane; the daemon's feedback line \"{feedback}\" {} in \
-             the orchestrator's pane.\n\
-             status: issued `dot-agent-deck agent-event --type running` from inside the \
-             `{ROLE_REVIEWER}` pane, LAST as rule 12 requires. {status_note}",
+            "work-done: issued `{} work-done --task \"{work_done_sentinel}\"` from inside the \
+             `{ROLE_REVIEWER}` pane; the daemon's feedback line \"{feedback}\" {} in the \
+             orchestrator's pane.\n\
+             status: issued `{} agent-event --type running` from inside the `{ROLE_REVIEWER}` \
+             pane, LAST as rule 12 requires. {status_note}",
+            cast.pane_cli,
             if work_done_arrived {
                 "appeared"
             } else {
                 "did NOT appear"
-            }
+            },
+            cast.pane_cli
         ),
     );
+
+    // --- the branch-specific stimulus, reverse only --------------------------
+    if cast.direction == Direction::Reverse {
+        probes::run(&mut probes::Ctx {
+            g,
+            daemon: &mut *daemon,
+            cast,
+            tui: &mut *tui,
+            ev: &mut *ev,
+            phase: probes::Phase::BeforeTells,
+        })?;
+    }
 
     // --- tells 1 and 2, measured last so they cover the whole run ------------
     let listening = count_in_file(&sb.log, "Attach protocol listening");
@@ -1164,22 +1471,31 @@ fn with_branch_tui(
             Verdict::Fail
         },
         format!(
-            "{} matched in {}. Two would mean the branch TUI lazy-spawned its own daemon and this \
-             was a meaningless same-version test — the tell for BOTH the no-agents cause and the \
-             30-second idle-window cause.",
+            "{} matched in {}. {}",
             match listening {
                 1 => "1 line".to_string(),
                 n => format!("{n} lines"),
             },
-            sb.log.display()
+            sb.log.display(),
+            match cast.direction {
+                Direction::Forward =>
+                    "Two would mean the branch TUI lazy-spawned its own daemon and this was a \
+                     meaningless same-version test — the tell for BOTH the no-agents cause and \
+                     the 30-second idle-window cause.",
+                Direction::Reverse =>
+                    "Two would mean a daemon other than the branch's started: the old client \
+                     lazy-spawned its own (it did not find the branch daemon, or a 30-second idle \
+                     window swallowed it), and every tell after that point was measured against \
+                     a daemon of the old build.",
+            }
         ),
     );
 
-    let attach = plan.matrix.attach();
+    let attach = g.matrix.attach();
     let listeners_at_end = proc::listeners_on(attach);
     let kernel_at_end = kernel_owner_line(attach);
     let exe_now = proc::exe_path(daemon.pid());
-    let same_exe = exe_now.as_deref() == Some(old_bin);
+    let same_exe = exe_now.as_deref() == Some(cast.daemon_bin.as_path());
     let alive = !daemon.has_exited();
     let listener_verdict = match (&listeners_at_start, &listeners_at_end) {
         (Some(a), Some(b)) => Some(a == b && a.contains(&daemon.pid())),
@@ -1197,10 +1513,11 @@ fn with_branch_tui(
             Verdict::Fail,
             format!(
                 "the listener pid matched but the daemon is {} and /proc/{}/exe is {:?}, not the \
-                 old binary",
+                 {} binary",
                 if alive { "alive" } else { "GONE" },
                 daemon.pid(),
-                exe_now
+                exe_now,
+                cast.daemon_build
             ),
         ),
         None => (
@@ -1218,7 +1535,7 @@ fn with_branch_tui(
             "pid {} was alive at the start and {} at the end (pids are the run's private PID \
              namespace's).\n\
              /proc/{}/exe -> {:?} (the {} binary is {})\n\
-             the mismatch prompt the branch TUI printed reported the daemon's build id and its \
+             the mismatch prompt the {} TUI printed reported the daemon's build id and its \
              own, so both sides' build ids were observed over the wire — see the excerpt.\n\
              `ss -xlp` on {}, inside the run's network namespace: {listener_note}\n\
              at the start, {kernel_at_start}\n\
@@ -1227,13 +1544,14 @@ fn with_branch_tui(
             if alive { "alive" } else { "GONE" },
             daemon.pid(),
             exe_now,
-            plan.previous,
-            old_bin.display(),
+            cast.daemon_build,
+            cast.daemon_bin.display(),
+            cast.client_side,
             attach.display(),
         ),
     );
 
-    if plan.mode == EndpointMode::Resolved {
+    if plan.mode == EndpointMode::Resolved && cast.direction == Direction::Forward {
         // The change that makes `resolved` mode necessary (issue #1121) claims
         // its compatibility read is READ-ONLY: a branch build that found the old
         // daemon at the legacy address must never bind, create or unlink
@@ -1255,7 +1573,7 @@ fn with_branch_tui(
             }
         ));
     }
-    if fallback_arm {
+    if fallback_arm && cast.direction == Direction::Forward {
         let reached = ev
             .tells
             .iter()
@@ -1277,6 +1595,385 @@ fn with_branch_tui(
         });
     }
 
+    // --- a stimulus that ends the daemon, after tells 1 and 2 ------------------
+    if cast.direction == Direction::Reverse {
+        probes::run(&mut probes::Ctx {
+            g,
+            daemon: &mut *daemon,
+            cast,
+            tui: &mut *tui,
+            ev: &mut *ev,
+            phase: probes::Phase::AfterTells,
+        })?;
+    }
+
+    ev.excerpt(
+        "sandbox deck.log (tail)",
+        tail(&std::fs::read_to_string(&sb.log).unwrap_or_default(), 80),
+    );
+    Ok(())
+}
+
+/// The reverse run's attached client never printed the mismatch prompt:
+/// establish, by measurement, whether that is because it did not FIND the
+/// branch daemon — and whether its fallback damaged anything.
+///
+/// Positive evidence is required for the classification. The old client must
+/// have left a listener of its own in the namespace (the daemon it lazy-spawned),
+/// whose holder is identified by its full identity as the old build running
+/// `daemon serve` with this run's marker; without that, a missing prompt is an
+/// unexplained scenario failure, not a discovery result. Then three collateral
+/// checks, each a tell, decide between "the old client cannot discover the
+/// branch daemon — and nothing else happened" and a FAIL:
+///
+/// 1. the branch daemon is untouched — same identity, still holding every
+///    endpoint the matrix says it owns;
+/// 2. it still runs every role of the orchestration;
+/// 3. the old client's own daemon runs NONE of those roles. The old TUI restores
+///    the saved session against an empty daemon, and a restored orchestration
+///    re-spawns every role under a fresh orchestration id — which would be two
+///    daemons running the same orchestration, not merely two daemons.
+fn classify_undiscovered(
+    g: &Guard<'_>,
+    daemon: &mut SandboxProcess,
+    cast: &Cast,
+    tui: &mut pty::PtyDeck,
+    ev: &mut Evidence,
+) -> Result<(), Abort> {
+    let plan = g.plan;
+    let sb = g.sb;
+    let all_roles = roles(plan);
+    println!(
+        "xver (inner): the {} TUI printed no mismatch prompt — measuring what it reached instead",
+        cast.client_side
+    );
+    ev.step(format!(
+        "the {} TUI printed NO build-version mismatch prompt within {UI_TIMEOUT:?}: it did not \
+         reach the {} daemon, which holds {} live role(s). Measuring what it reached instead.",
+        cast.client_side,
+        cast.daemon_side,
+        all_roles.len()
+    ));
+
+    // Who listens now, besides the daemon under test?
+    let listeners = proc::unix_listeners().map_err(iso)?;
+    let held = proc::socket_inodes(daemon.pid()).map_err(iso)?;
+    let strays: Vec<proc::UnixListener> = listeners
+        .iter()
+        .filter(|l| !held.contains(&l.inode))
+        .cloned()
+        .collect();
+    if strays.is_empty() {
+        return Err(Abort::Scenario(format!(
+            "the {} TUI printed no mismatch prompt and started no daemon of its own: nothing in \
+             the namespace listens except the {} daemon, so the missing prompt is unexplained.\n\
+             === {} TUI grid ===\n{}",
+            cast.client_side,
+            cast.daemon_side,
+            cast.client_side,
+            tui.grid()
+        )));
+    }
+    let mut holders: Vec<i32> = Vec::new();
+    for l in &strays {
+        for pid in proc::owners_of(l.inode).map_err(iso)? {
+            if !holders.contains(&pid) {
+                holders.push(pid);
+            }
+        }
+    }
+    // Forked lifetime-cap reapers inherit the listening descriptors, so the
+    // holder set is a daemon and its forks: the daemon is the one whose parent
+    // is not itself a holder.
+    let roots: Vec<i32> = holders
+        .iter()
+        .copied()
+        .filter(|p| proc::ppid(*p).is_none_or(|pp| !holders.contains(&pp)))
+        .collect();
+    let [root] = roots[..] else {
+        return Err(iso(format!(
+            "listeners the run did not start ({strays:?}) are held by {holders:?}, which is not \
+             one daemon and its forks (roots {roots:?})"
+        )));
+    };
+    let second_id = Identity::capture(root)
+        .map_err(|e| iso(format!("the second listener's holder pid {root}: {e}")))?;
+    let want_cmdline = vec![
+        cast.client_bin.display().to_string(),
+        "daemon".to_string(),
+        "serve".to_string(),
+    ];
+    let marker_ok =
+        second_id.environ.get("DAD_XVER_SANDBOX") == Some(&sb.root.display().to_string());
+    if second_id.exe != cast.client_bin || second_id.cmdline != want_cmdline || !marker_ok {
+        return Err(iso(format!(
+            "a listener the run did not start is held by an unidentified process: {}",
+            second_id.summary()
+        )));
+    }
+    let second_paths: Vec<PathBuf> = strays.iter().map(|l| PathBuf::from(&l.path)).collect();
+    *g.second.borrow_mut() = Some(SecondDaemon {
+        identity: second_id.clone(),
+        paths: second_paths.clone(),
+    });
+    ev.isolated(format!(
+        "second daemon recorded by its full identity — the {} build running `daemon serve` with \
+         this run's marker, lazy-spawned by the {} TUI — listening at {:?}: {}",
+        cast.client_build,
+        cast.client_side,
+        second_paths,
+        second_id.summary()
+    ));
+
+    // What the user saw. Give the old TUI time to settle — a session restore,
+    // if it happens, spawns panes after the first frame.
+    std::thread::sleep(Duration::from_secs(5));
+    ev.excerpt(
+        format!(
+            "what the {} TUI showed instead of the prompt",
+            cast.client_side
+        ),
+        tui.grid(),
+    );
+
+    // Collateral 1: the daemon under test is untouched.
+    let untouched = match daemon.identity.verify() {
+        Ok(()) if !daemon.has_exited() => {
+            let now = proc::unix_listeners().map_err(iso)?;
+            let held_now = proc::socket_inodes(daemon.pid()).map_err(iso)?;
+            g.matrix.owned.iter().all(|p| {
+                let inodes = isolation::listening_inodes(&now, p);
+                !inodes.is_empty() && inodes.iter().all(|i| held_now.contains(i))
+            })
+        }
+        _ => false,
+    };
+    ev.tell(
+        "collateral-1",
+        format!("the {} daemon is untouched by the old client's fallback", cast.daemon_side),
+        if untouched { Verdict::Pass } else { Verdict::Fail },
+        format!(
+            "pid {} {}; its recorded identity {}; it {} every endpoint the matrix says it owns ({})",
+            daemon.pid(),
+            if daemon.has_exited() { "has EXITED" } else { "is alive" },
+            if daemon.identity.verify().is_ok() { "still verifies" } else { "NO LONGER verifies" },
+            if untouched { "still holds" } else { "does NOT hold" },
+            g.matrix
+                .owned
+                .iter()
+                .map(|p| format!("`{}`", p.display()))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    );
+
+    // Collateral 2: its roles survived.
+    let every_role = |rows: &[StatusRow]| {
+        all_roles
+            .iter()
+            .all(|r| rows.iter().any(|row| row.role.contains(r.as_str())))
+    };
+    let daemon_cli = format!(
+        "{} CLI: daemon status (after the old client's fallback)",
+        cast.daemon_side
+    );
+    let own = if untouched {
+        wait_for_status(
+            g,
+            &cast.daemon_bin,
+            &daemon_cli,
+            STEP_TIMEOUT,
+            ev,
+            every_role,
+        )?
+    } else {
+        Err("the daemon under test is not intact, so it was not asked".to_string())
+    };
+    ev.tell(
+        "collateral-2",
+        format!("the {} daemon still runs every role", cast.daemon_side),
+        if own.is_ok() {
+            Verdict::Pass
+        } else {
+            Verdict::Fail
+        },
+        match &own {
+            Ok(rows) => format!(
+                "`daemon status --json`, asked by the {} binary (which resolves the {} daemon's \
+                 own endpoint), lists {}",
+                cast.daemon_side,
+                cast.daemon_side,
+                rows.iter()
+                    .map(|r| format!("{} ({}, {})", r.role, r.pane_id, r.status))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            Err(e) => e.clone(),
+        },
+    );
+
+    // Collateral 3: the old client's own daemon runs none of them. Poll for a
+    // while rather than ask once: a restored orchestration spawns its roles
+    // after the old TUI's first frame.
+    let client_cli = format!(
+        "{} CLI: daemon status (the {} TUI's own daemon)",
+        cast.client_side, cast.client_side
+    );
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut seen: Vec<StatusRow> = Vec::new();
+    // The LAST poll's error, if the last poll failed.
+    let mut last_err: Option<String>;
+    loop {
+        match daemon_status(g, &cast.client_bin, &client_cli, ev)? {
+            Ok(rows) => {
+                for r in rows {
+                    if !seen
+                        .iter()
+                        .any(|s| s.agent_id == r.agent_id && s.pane_id == r.pane_id)
+                    {
+                        seen.push(r);
+                    }
+                }
+                last_err = None;
+            }
+            Err(e) => last_err = Some(e),
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1000));
+    }
+    let duplicated: Vec<&StatusRow> = seen
+        .iter()
+        .filter(|r| all_roles.iter().any(|role| r.role.contains(role.as_str())))
+        .collect();
+    let (verdict3, detail3) = match (&last_err, duplicated.is_empty()) {
+        (Some(e), _) if seen.is_empty() => (
+            Verdict::NotChecked,
+            format!(
+                "the {} CLI could not ask its own daemon what it runs: {e}",
+                cast.client_side
+            ),
+        ),
+        (_, true) => (
+            Verdict::Pass,
+            format!(
+                "for 15 s, `daemon status --json` asked by the {} binary — which resolves the {} \
+                 daemon's flat address — listed {}",
+                cast.client_side,
+                cast.client_side,
+                if seen.is_empty() {
+                    "no agents at all".to_string()
+                } else {
+                    seen.iter()
+                        .map(|r| format!("{} ({}, role `{}`)", r.agent_id, r.pane_id, r.role))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                }
+            ),
+        ),
+        (_, false) => (
+            Verdict::Fail,
+            format!(
+                "the {} TUI's OWN daemon now runs {} of the {} daemon's roles: {}. The {} TUI \
+                 restored the saved session against its fresh, empty daemon and re-spawned the \
+                 orchestration there — so two daemons now run the same orchestration's roles, \
+                 not merely two daemons on one host",
+                cast.client_build,
+                duplicated.len(),
+                cast.daemon_side,
+                duplicated
+                    .iter()
+                    .map(|r| format!(
+                        "{} ({}, role `{}`, {})",
+                        r.agent_id, r.pane_id, r.role, r.status
+                    ))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                cast.client_side
+            ),
+        ),
+    };
+    ev.tell(
+        "collateral-3",
+        format!(
+            "the {} TUI's own daemon runs none of the {} daemon's roles",
+            cast.client_side, cast.daemon_side
+        ),
+        verdict3,
+        detail3,
+    );
+    ev.excerpt(
+        format!("the {} TUI after 15 s", cast.client_side),
+        tui.grid(),
+    );
+    // The process tree under each daemon, read from /proc rather than from
+    // either daemon's own report: separate role processes under the second
+    // daemon are what "two daemons run the same orchestration" means, and a
+    // reader should not have to take a status reply's word for it.
+    let tree = |pid: i32| {
+        let d = proc::descendants(pid);
+        let lines: Vec<String> = d
+            .iter()
+            .map(|(p, c)| format!("  pid {p}: {}", c.join(" ")))
+            .collect();
+        (d.len(), lines.join("\n"))
+    };
+    let (n_daemon, t_daemon) = tree(daemon.pid());
+    let (n_second, t_second) = tree(second_id.pid);
+    ev.excerpt(
+        "process tree under each daemon, from /proc (a census; nothing here is signalled by it)",
+        format!(
+            "the {} daemon, pid {} — {n_daemon} descendant(s):\n{t_daemon}\n\nthe second \
+             daemon ({} build), pid {} — {n_second} descendant(s):\n{t_second}",
+            cast.daemon_build,
+            daemon.pid(),
+            cast.client_build,
+            second_id.pid
+        ),
+    );
+
+    let attach_lines: Vec<String> = std::fs::read_to_string(&sb.log)
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| l.contains("Attach protocol listening"))
+        .map(str::to_string)
+        .collect();
+    ev.discovery = Some(format!(
+        "The {client} TUI (`{client_bin}`), started with the same environment as every other \
+         client of the run, printed no build-version mismatch prompt and never reached the \
+         {daemon} daemon (pid {dpid}) listening at {owned}.\n\
+         Instead it lazy-spawned a daemon of its own build — pid {spid}, `{sexe}` \
+         `daemon serve`, identified by its full identity — which bound {spaths}. The old TUI's \
+         screen, recorded in the excerpts below, carries no warning about any of it.\n\
+         `Attach protocol listening` lines in the run's log: {n} — {lines}\n\
+         The collateral tells below decide whether that fallback left the {daemon} daemon and \
+         its orchestration alone.",
+        client = cast.client_build,
+        client_bin = cast.client_bin.display(),
+        daemon = cast.daemon_build,
+        dpid = daemon.pid(),
+        owned = g
+            .matrix
+            .owned
+            .iter()
+            .map(|p| format!("`{}`", p.display()))
+            .collect::<Vec<_>>()
+            .join(" and "),
+        spid = second_id.pid,
+        sexe = second_id.exe.display(),
+        spaths = second_paths
+            .iter()
+            .map(|p| format!("`{}`", p.display()))
+            .collect::<Vec<_>>()
+            .join(" and "),
+        n = attach_lines.len(),
+        lines = attach_lines
+            .iter()
+            .map(|l| format!("`{}`", l.trim()))
+            .collect::<Vec<_>>()
+            .join("; "),
+    ));
     ev.excerpt(
         "sandbox deck.log (tail)",
         tail(&std::fs::read_to_string(&sb.log).unwrap_or_default(), 80),
@@ -1322,18 +2019,23 @@ fn open_orchestration(deck: &pty::PtyDeck) -> Result<(), String> {
 /// pane and makes it the one keystrokes reach. `PaneLayout::Stacked` draws only
 /// the focused role's pane and fuses its title into the box corner as
 /// `┌<role>`, so that string on the settled grid is what confirms the jump
-/// landed.
+/// landed. The digit is the role's position in the fixture, which is the card
+/// order; none of those keys is written to any pane's PTY — they are the deck's
+/// own shortcuts — so focusing a pane is not "typing into" it.
 ///
 /// Cycles tabs first when the deck is not on the orchestration tab: after a
 /// reattach the deck lands wherever the previous session left it, and a digit on
 /// the Dashboard tab means something else.
-fn focus_role(deck: &pty::PtyDeck, role: &str) -> Result<(), String> {
-    let digit: u8 = match role {
-        ROLE_ORCHESTRATOR => b'1',
-        ROLE_CODER => b'2',
-        ROLE_REVIEWER => b'3',
-        other => return Err(format!("no card index known for role {other}")),
-    };
+pub(crate) fn focus_role(deck: &pty::PtyDeck, plan: &Plan, role: &str) -> Result<(), String> {
+    let index = roles(plan)
+        .iter()
+        .position(|r| r == role)
+        .ok_or_else(|| format!("no card index known for role {role}"))?;
+    let digit = u8::try_from(index + 1)
+        .ok()
+        .filter(|d| *d <= 9)
+        .map(|d| b'0' + d)
+        .ok_or_else(|| format!("role {role} is card {} — past the digit keys", index + 1))?;
     let expanded = format!("┌{role}");
     for attempt in 0..6 {
         deck.send(b"\x04"); // Ctrl+D -> Normal mode
@@ -1363,7 +2065,7 @@ fn focus_role(deck: &pty::PtyDeck, role: &str) -> Result<(), String> {
 /// The submit CR is a separate write after a pause: a CR fused to the preceding
 /// text is treated as newline-in-input by agent TUIs, and the deck's own
 /// `SUBMIT_DELAY` exists for the same reason.
-fn type_into_pane(deck: &pty::PtyDeck, text: &str) {
+pub(crate) fn type_into_pane(deck: &pty::PtyDeck, text: &str) {
     deck.send(text.as_bytes());
     std::thread::sleep(Duration::from_millis(300));
     deck.send(b"\r");
@@ -1570,5 +2272,59 @@ mod tests {
     fn a_plain_string_error_is_a_scenario_abort_not_an_isolation_one() {
         assert!(matches!(Abort::from("x".to_string()), Abort::Scenario(_)));
         assert!(matches!(iso("y"), Abort::Isolation(_)));
+    }
+}
+
+#[cfg(test)]
+mod reverse_tests {
+    use super::*;
+
+    fn plan(direction: Direction, probe: crate::probe::Probe) -> Plan {
+        serde_json::from_value(serde_json::json!({
+            "root": "/srv/runs/r1", "uid": 1000, "user": "op",
+            "mode": "SandboxSockets", "keep_xdg_runtime_dir": true, "experimental": false,
+            "max_lifetime_secs": 1, "previous": "v0.41.0", "direction": direction,
+            "probe": probe, "fixture": "", "extra_env": [], "env": [],
+            "matrices": [], "masks": [], "masked_home": null, "outer_mnt_ns": "mnt:[1]"
+        }))
+        .expect("plan")
+    }
+
+    #[test]
+    fn the_cast_swaps_every_part_in_reverse() {
+        let sb = Sandbox::at(PathBuf::from("/srv/runs/r1"));
+        let fwd = Cast::for_plan(&plan(Direction::Forward, crate::probe::Probe::Generic), &sb);
+        assert_eq!(fwd.daemon_bin, sb.old_bin());
+        assert_eq!(fwd.client_bin, sb.new_bin(Direction::Forward));
+        assert_eq!(
+            fwd.pane_cli, "dot-agent-deck",
+            "forward types the bare name, as it always did"
+        );
+        let rev = Cast::for_plan(&plan(Direction::Reverse, crate::probe::Probe::Generic), &sb);
+        assert_eq!(rev.daemon_bin, sb.new_bin(Direction::Reverse));
+        assert_eq!(rev.client_bin, sb.old_bin());
+        assert_eq!(rev.pane_cli, sb.old_bin().display().to_string());
+        assert_eq!((rev.daemon_side, rev.client_side), ("branch", "old"));
+        assert_eq!(Cast::tui_label("old"), "old-tui");
+        assert_eq!(Cast::tui_label("branch"), "new-tui");
+    }
+
+    #[test]
+    fn the_decline_key_is_never_the_one_affirmative_key() {
+        assert!(!DECLINE_KEY.eq_ignore_ascii_case(b"s"));
+        assert_eq!(DECLINE_KEY.len(), 1);
+    }
+
+    #[test]
+    fn a_probe_role_gets_the_next_card_after_the_fixtures_three() {
+        let p = plan(Direction::Reverse, crate::probe::Probe::CrossPaneSessionKey);
+        assert_eq!(
+            roles(&p),
+            vec!["orchestrator", "coder", "reviewer", "alpha", "beta"]
+        );
+        assert_eq!(
+            roles(&plan(Direction::Forward, crate::probe::Probe::Generic)).len(),
+            3
+        );
     }
 }

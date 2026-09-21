@@ -47,6 +47,13 @@ pub struct Sandbox {
     pub bin: PathBuf,
     /// The previous release's binary, staged. Deliberately NOT on `PATH`.
     pub old: PathBuf,
+    /// Where the branch build is staged in a REVERSE run, where `bin` holds the
+    /// previous release instead (see [`Direction`]). Empty in a forward run.
+    pub branch: PathBuf,
+    /// Synthetic agents some reverse probes need — a hard link of this harness
+    /// named `claude`, which is what makes the deck type it as Claude Code.
+    /// Empty unless a probe stages one.
+    pub stub: PathBuf,
     /// This harness's own binary, staged so the namespace can run it.
     pub harness: PathBuf,
 }
@@ -70,6 +77,8 @@ impl Sandbox {
             artifacts: root.join("artifacts"),
             bin: root.join("bin"),
             old: root.join("old"),
+            branch: root.join("branch"),
+            stub: root.join("stub"),
             harness: root.join("harness"),
             root,
         }
@@ -112,6 +121,8 @@ impl Sandbox {
             &sb.artifacts,
             &sb.bin,
             &sb.old,
+            &sb.branch,
+            &sb.stub,
             &sb.harness,
         ] {
             mkdir_private(dir)?;
@@ -139,12 +150,29 @@ impl Sandbox {
         self.config.join("schedules.toml")
     }
 
-    pub fn new_bin(&self) -> PathBuf {
+    /// The branch build, where `direction` stages it: first on `PATH` in a
+    /// forward run, beside it in a reverse one.
+    pub fn new_bin(&self, direction: Direction) -> PathBuf {
+        match direction {
+            Direction::Forward => self.path_bin(),
+            Direction::Reverse => self.branch.join("dot-agent-deck"),
+        }
+    }
+
+    /// What a pane that shells a bare `dot-agent-deck` reaches: the CLIENT
+    /// side's build — the branch in a forward run, the previous release in a
+    /// reverse one.
+    pub fn path_bin(&self) -> PathBuf {
         self.bin.join("dot-agent-deck")
     }
 
     pub fn old_bin(&self) -> PathBuf {
         self.old.join("dot-agent-deck-linux-amd64")
+    }
+
+    /// The synthetic Claude Code stand-in (see [`Sandbox::stub`]).
+    pub fn stub_claude(&self) -> PathBuf {
+        self.stub.join("claude")
     }
 
     pub fn harness_bin(&self) -> PathBuf {
@@ -249,6 +277,33 @@ pub enum EndpointMode {
     Resolved,
 }
 
+/// Which build serves the daemon and which one attaches to it.
+///
+/// Rule 12 prescribes exactly one pairing, `Forward`. For a change that lives in
+/// the DAEMON — most of what rule 12's trigger list names — that pairing runs the
+/// previous release's daemon code and never executes a changed line: it proves
+/// the branch client can drive an old daemon, which is real and is what the rule
+/// asks, and says nothing about the branch's own daemon. `Reverse` is the pairing
+/// that does: the branch daemon, with the previous release's TUI and CLI attached
+/// to it — the downgrade, or a stale binary left on disk beside a new daemon.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Direction {
+    /// Previous-release daemon, branch TUI and CLI. Rule 12's pairing.
+    #[default]
+    Forward,
+    /// Branch daemon, previous-release TUI and CLI.
+    Reverse,
+}
+
+impl Direction {
+    pub fn name(self) -> &'static str {
+        match self {
+            Direction::Forward => "forward",
+            Direction::Reverse => "reverse",
+        }
+    }
+}
+
 /// The real host's spelling of `/run/user/<uid>` — which, inside the run's
 /// mount namespace, is [`Sandbox::run_user`].
 pub fn runtime_dir(uid: u32) -> PathBuf {
@@ -326,6 +381,48 @@ impl EndpointMatrix {
             },
         }
     }
+
+    /// Every matrix the run's DAEMON may legitimately bind, one of which the
+    /// inner half selects by reading the kernel's table once the daemon is up.
+    ///
+    /// One candidate, except in a reverse `resolved` run with `XDG_RUNTIME_DIR`
+    /// unset. There the daemon is a branch build, and which fallback it binds is
+    /// the branch's own behaviour rather than something this harness can know in
+    /// advance: a post-#1121 build binds the per-uid pair, every build before it
+    /// the flat one. So both are candidates, each with the OTHER pair and the XDG
+    /// pair absent, and the selected one is held to exactly the same assertion a
+    /// predicted one would be — one pair owned by the daemon, every other
+    /// candidate absent. The run records which one it was.
+    pub fn candidates(
+        sb: &Sandbox,
+        mode: EndpointMode,
+        keep_xdg: bool,
+        uid: u32,
+        direction: Direction,
+    ) -> Vec<Self> {
+        let predicted = Self::for_run(sb, mode, keep_xdg, uid);
+        if direction == Direction::Forward || mode != EndpointMode::Resolved || keep_xdg {
+            return vec![predicted];
+        }
+        let [flat_h, flat_a] = flat_endpoints(uid);
+        let [uid_h, uid_a] = per_uid_endpoints(uid);
+        let [xdg_h, xdg_a] = xdg_endpoints(uid);
+        vec![
+            Self {
+                owned: [uid_h.clone(), uid_a.clone()],
+                absent: vec![flat_h.clone(), flat_a.clone(), xdg_h.clone(), xdg_a.clone()],
+            },
+            Self {
+                owned: [flat_h, flat_a],
+                absent: vec![uid_h, uid_a, xdg_h, xdg_a],
+            },
+        ]
+    }
+
+    /// Whether this matrix's owned pair is the post-#1121 per-uid directory.
+    pub fn owns_per_uid(&self, uid: u32) -> bool {
+        self.owned == per_uid_endpoints(uid)
+    }
 }
 
 /// Variable names the run environment may carry. Anything else in a sandbox
@@ -387,7 +484,17 @@ pub struct EnvSpec {
 /// `XDG_RUNTIME_DIR`, which keep the host's spelling (`/tmp`,
 /// `/run/user/<uid>`) because inside the run's mount namespace both of those
 /// ARE sandbox directories — see [`check_env`].
-pub fn run_env(sb: &Sandbox, spec: EnvSpec, user: &str) -> Vec<(String, String)> {
+///
+/// `extra` is a reverse probe's own additions (a timer knob, or #1190's hostile
+/// git location variables): names that are NOT on [`ALLOWED_ENV`], each with an
+/// exact value, which [`check_env`] then admits by name AND value and nothing
+/// else. It cannot replace a base entry.
+pub fn run_env(
+    sb: &Sandbox,
+    spec: EnvSpec,
+    user: &str,
+    extra: &[(String, String)],
+) -> Vec<(String, String)> {
     let mut env: BTreeMap<String, String> = BTreeMap::new();
     let mut set = |k: &str, v: String| {
         env.insert(k.to_string(), v);
@@ -459,6 +566,12 @@ pub fn run_env(sb: &Sandbox, spec: EnvSpec, user: &str) -> Vec<(String, String)>
         set("DOT_AGENT_DECK_SOCKET", path_of(&sb.hook_socket()));
         set("DOT_AGENT_DECK_ATTACH_SOCKET", path_of(&sb.attach_socket()));
     }
+    for (k, v) in extra {
+        // A base entry is never replaced: `check_env` refuses an extra name that
+        // is on the allowlist, so a collision here is a harness bug, and the
+        // base value wins rather than the probe's.
+        env.entry(k.clone()).or_insert_with(|| v.clone());
+    }
 
     env.into_iter().collect()
 }
@@ -491,13 +604,38 @@ pub fn credential_like(name: &str) -> bool {
 /// Check an environment a sandbox process is about to receive — or, inside the
 /// namespace, the harness's own — against the allowlist policy. Fails closed:
 /// an unknown key is a failure, not a warning.
-pub fn check_env(env: &[(String, String)], sb: &Sandbox, spec: EnvSpec) -> Result<(), String> {
+///
+/// `extra` is the run's probe additions (see [`run_env`]). Each is admitted
+/// only with its exact value, only if it is NOT a base allowlist name, and never
+/// if it looks like a credential — so a probe widens the allowlist by exactly
+/// the entries it names and cannot loosen a base check.
+pub fn check_env(
+    env: &[(String, String)],
+    sb: &Sandbox,
+    spec: EnvSpec,
+    extra: &[(String, String)],
+) -> Result<(), String> {
     let map: BTreeMap<&str, &str> = env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
     if map.len() != env.len() {
         return Err("the environment names a variable twice".to_string());
     }
+    for (k, v) in extra {
+        if ALLOWED_ENV.contains(&k.as_str()) {
+            return Err(format!(
+                "the probe's `{k}` would replace a base allowlist entry"
+            ));
+        }
+        if credential_like(k) {
+            return Err(format!("the probe's `{k}` looks like a credential"));
+        }
+        match map.get(k.as_str()) {
+            Some(got) if got == v => {}
+            Some(_) => return Err(format!("the probe's `{k}` does not have its fixed value")),
+            None => return Err(format!("the probe's `{k}` is missing")),
+        }
+    }
     for key in map.keys() {
-        if !ALLOWED_ENV.contains(key) {
+        if !ALLOWED_ENV.contains(key) && !extra.iter().any(|(k, _)| k == key) {
             return Err(format!("`{key}` is not on the run environment's allowlist"));
         }
         if credential_like(key) {
@@ -736,7 +874,12 @@ pub fn project_config(sb: &Sandbox) -> PathBuf {
 /// process gets an empty environment plus exactly what it needs, which rules out
 /// issue #834's shape by construction: an ambient `GIT_DIR` outranks the
 /// `current_dir` a command is given, and there is none to inherit.
-pub fn write_project(sb: &Sandbox) -> Result<(), String> {
+///
+/// `fixture` is [`FIXTURE_TOML`] plus whatever a reverse probe adds. `commit`
+/// also records one commit of it — a dispatch needs a `HEAD` to branch a
+/// worktree from — with an author identity given on the command line rather
+/// than through any configuration file.
+pub fn write_project(sb: &Sandbox, fixture: &str, commit: bool) -> Result<(), String> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
     let path = project_config(sb);
@@ -746,25 +889,52 @@ pub fn write_project(sb: &Sandbox) -> Result<(), String> {
         .mode(0o600)
         .open(&path)
         .map_err(|e| format!("create {}: {e}", path.display()))?;
-    f.write_all(FIXTURE_TOML.as_bytes())
+    f.write_all(fixture.as_bytes())
         .map_err(|e| format!("write fixture: {e}"))?;
     drop(f);
-    let status = std::process::Command::new("/usr/bin/git")
-        .args(["init", "--quiet"])
-        .current_dir(&sb.project)
+    let mut steps: Vec<Vec<&str>> = vec![vec!["init", "--quiet"]];
+    if commit {
+        steps.push(vec!["add", ".dot-agent-deck.toml"]);
+        steps.push(vec![
+            "-c",
+            "user.name=xver",
+            "-c",
+            "user.email=xver@invalid.example",
+            "commit",
+            "--quiet",
+            "-m",
+            "xver fixture",
+        ]);
+    }
+    for args in steps {
+        let status = sandbox_git(sb, &sb.project)
+            .args(&args)
+            .status()
+            .map_err(|e| format!("git {args:?}: {e}"))?;
+        if !status.success() {
+            return Err(format!(
+                "git {args:?} in the sandbox project failed: {status}"
+            ));
+        }
+    }
+    verify_project(sb, fixture)
+}
+
+/// A `git` command for a repository under `$S`: an empty environment plus
+/// exactly what git needs, so no ambient location variable (issue #834's shape)
+/// and no operator configuration can reach it, and discovery cannot walk above
+/// the sandbox.
+pub fn sandbox_git(sb: &Sandbox, dir: &Path) -> std::process::Command {
+    let mut c = std::process::Command::new("/usr/bin/git");
+    c.current_dir(dir)
         .env_clear()
         .env("PATH", SYSTEM_PATH.join(":"))
         .env("HOME", &sb.home)
         .env("XDG_CONFIG_HOME", &sb.config)
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_CONFIG_GLOBAL", sb.root.join("no-such-gitconfig"))
-        .env("GIT_CEILING_DIRECTORIES", &sb.root)
-        .status()
-        .map_err(|e| format!("git init: {e}"))?;
-    if !status.success() {
-        return Err(format!("git init in the sandbox project failed: {status}"));
-    }
-    verify_project(sb)
+        .env("GIT_CEILING_DIRECTORIES", &sb.root);
+    c
 }
 
 /// Require the fixture to be what stops the deck's project-config walk.
@@ -775,7 +945,7 @@ pub fn write_project(sb: &Sandbox) -> Result<(), String> {
 /// uid — or the walk continues past `$S` towards the operator's own config. And
 /// the project's `.git` must be a directory: a `.git` FILE would make it a
 /// linked worktree whose metadata lives outside `$S`.
-pub fn verify_project(sb: &Sandbox) -> Result<(), String> {
+pub fn verify_project(sb: &Sandbox, fixture: &str) -> Result<(), String> {
     use std::os::unix::fs::MetadataExt;
     let path = project_config(sb);
     let md =
@@ -795,7 +965,7 @@ pub fn verify_project(sb: &Sandbox) -> Result<(), String> {
     }
     let body =
         std::fs::read_to_string(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
-    if body != FIXTURE_TOML {
+    if body != fixture {
         return Err(format!(
             "{} is not the fixture this harness wrote",
             path.display()
@@ -880,19 +1050,19 @@ mod tests {
     fn resolved_mode_pins_both_socket_overrides_and_the_runtime_dir_absent() {
         let sb = Sandbox::at(PathBuf::from("/srv/runs/r1"));
         let s = spec(EndpointMode::Resolved, false);
-        let env = run_env(&sb, s, "someone");
+        let env = run_env(&sb, s, "someone", &[]);
         let keys: Vec<&str> = env.iter().map(|(k, _)| k.as_str()).collect();
         assert!(!keys.contains(&"DOT_AGENT_DECK_SOCKET"));
         assert!(!keys.contains(&"DOT_AGENT_DECK_ATTACH_SOCKET"));
         assert!(!keys.contains(&"XDG_RUNTIME_DIR"));
-        check_env(&env, &sb, s).expect("the harness's own env passes its own policy");
+        check_env(&env, &sb, s, &[]).expect("the harness's own env passes its own policy");
     }
 
     #[test]
     fn sandbox_mode_sets_both_socket_overrides_inside_the_sandbox() {
         let sb = Sandbox::at(PathBuf::from("/srv/runs/r1"));
         let s = spec(EndpointMode::SandboxSockets, true);
-        let env = run_env(&sb, s, "someone");
+        let env = run_env(&sb, s, "someone", &[]);
         let map: BTreeMap<_, _> = env.clone().into_iter().collect();
         assert_eq!(
             map.get("DOT_AGENT_DECK_ATTACH_SOCKET"),
@@ -911,29 +1081,37 @@ mod tests {
             map.get("XDG_CONFIG_HOME"),
             Some(&sb.config.display().to_string())
         );
-        check_env(&env, &sb, s).expect("the harness's own env passes its own policy");
+        check_env(&env, &sb, s, &[]).expect("the harness's own env passes its own policy");
     }
 
     #[test]
     fn the_env_policy_refuses_anything_off_the_allowlist() {
         let sb = Sandbox::at(PathBuf::from("/srv/runs/r1"));
         let s = spec(EndpointMode::Resolved, false);
-        let base = run_env(&sb, s, "someone");
+        let base = run_env(&sb, s, "someone", &[]);
 
         let mut extra = base.clone();
         extra.push(("ANTHROPIC_API_KEY".into(), "x".into()));
-        assert!(check_env(&extra, &sb, s).unwrap_err().contains("allowlist"));
+        assert!(
+            check_env(&extra, &sb, s, &[])
+                .unwrap_err()
+                .contains("allowlist")
+        );
 
         let mut xdg = base.clone();
         xdg.push(("XDG_RUNTIME_DIR".into(), "/run/user/1000".into()));
-        assert!(check_env(&xdg, &sb, s).unwrap_err().contains("ABSENT"));
+        assert!(check_env(&xdg, &sb, s, &[]).unwrap_err().contains("ABSENT"));
 
         let mut sock = base.clone();
         sock.push((
             "DOT_AGENT_DECK_SOCKET".into(),
             "/srv/runs/r1/hook.sock".into(),
         ));
-        assert!(check_env(&sock, &sb, s).unwrap_err().contains("ABSENT"));
+        assert!(
+            check_env(&sock, &sb, s, &[])
+                .unwrap_err()
+                .contains("ABSENT")
+        );
 
         let escaped: Vec<_> = base
             .iter()
@@ -949,7 +1127,7 @@ mod tests {
             })
             .collect();
         assert!(
-            check_env(&escaped, &sb, s)
+            check_env(&escaped, &sb, s, &[])
                 .unwrap_err()
                 .contains("outside the sandbox")
         );
@@ -964,7 +1142,7 @@ mod tests {
                 }
             })
             .collect();
-        assert!(check_env(&path, &sb, s).unwrap_err().contains("PATH"));
+        assert!(check_env(&path, &sb, s, &[]).unwrap_err().contains("PATH"));
     }
 
     #[test]
@@ -1036,17 +1214,168 @@ mod tests {
     fn the_fixture_is_verified_as_what_stops_the_config_walk() {
         let runs = scratch("project");
         let sb = Sandbox::create(&runs, "run-1").expect("sandbox");
-        write_project(&sb).expect("fixture");
-        verify_project(&sb).expect("verified");
+        write_project(&sb, FIXTURE_TOML, false).expect("fixture");
+        verify_project(&sb, FIXTURE_TOML).expect("verified");
         // A symlink in its place would not stop the walk at `$S`.
         let cfg = project_config(&sb);
         std::fs::remove_file(&cfg).expect("rm");
         std::os::unix::fs::symlink("/etc/hostname", &cfg).expect("symlink");
         assert!(
-            verify_project(&sb)
+            verify_project(&sb, FIXTURE_TOML)
                 .unwrap_err()
                 .contains("not a regular file")
         );
         let _ = std::fs::remove_dir_all(runs);
+    }
+}
+
+#[cfg(test)]
+mod reverse_tests {
+    use super::*;
+
+    fn spec(mode: EndpointMode, keep_xdg: bool) -> EnvSpec {
+        EnvSpec {
+            mode,
+            keep_xdg_runtime_dir: keep_xdg,
+            experimental: false,
+            max_lifetime_secs: 1800,
+            uid: 1000,
+        }
+    }
+
+    #[test]
+    fn a_reverse_run_puts_the_previous_release_on_path_and_the_branch_beside_it() {
+        let sb = Sandbox::at(PathBuf::from("/srv/runs/r1"));
+        assert_eq!(sb.new_bin(Direction::Forward), sb.path_bin());
+        assert_eq!(
+            sb.new_bin(Direction::Reverse),
+            Path::new("/srv/runs/r1/branch/dot-agent-deck")
+        );
+        assert_ne!(sb.new_bin(Direction::Reverse), sb.path_bin());
+        assert_eq!(sb.stub_claude().file_name().unwrap(), "claude");
+    }
+
+    #[test]
+    fn a_reverse_resolved_no_xdg_run_learns_which_fallback_the_branch_daemon_binds() {
+        let sb = Sandbox::at(PathBuf::from("/srv/runs/r1"));
+        let fwd = EndpointMatrix::candidates(
+            &sb,
+            EndpointMode::Resolved,
+            false,
+            1000,
+            Direction::Forward,
+        );
+        assert_eq!(
+            fwd,
+            vec![EndpointMatrix::for_run(
+                &sb,
+                EndpointMode::Resolved,
+                false,
+                1000
+            )],
+            "forward keeps its one predicted matrix"
+        );
+        let rev = EndpointMatrix::candidates(
+            &sb,
+            EndpointMode::Resolved,
+            false,
+            1000,
+            Direction::Reverse,
+        );
+        assert_eq!(rev.len(), 2);
+        assert!(rev[0].owns_per_uid(1000) && !rev[1].owns_per_uid(1000));
+        for m in &rev {
+            // Whichever pair the daemon binds, the other pair and XDG must be
+            // absent — the same strength as a predicted matrix.
+            let mut all: Vec<PathBuf> = m.owned.to_vec();
+            all.extend(m.absent.iter().cloned());
+            all.sort();
+            let mut every: Vec<PathBuf> = flat_endpoints(1000)
+                .into_iter()
+                .chain(per_uid_endpoints(1000))
+                .chain(xdg_endpoints(1000))
+                .collect();
+            every.sort();
+            assert_eq!(all, every, "{m:?}");
+        }
+        for (mode, keep) in [
+            (EndpointMode::SandboxSockets, false),
+            (EndpointMode::Resolved, true),
+        ] {
+            assert_eq!(
+                EndpointMatrix::candidates(&sb, mode, keep, 1000, Direction::Reverse).len(),
+                1,
+                "{mode:?} keep_xdg={keep}: every build resolves the same address"
+            );
+        }
+    }
+
+    #[test]
+    fn probe_env_is_admitted_by_exact_name_and_value_only() {
+        let sb = Sandbox::at(PathBuf::from("/srv/runs/r1"));
+        let s = spec(EndpointMode::SandboxSockets, true);
+        let extra = vec![("RUST_LOG".to_string(), "dot_agent_deck=debug".to_string())];
+        let env = run_env(&sb, s, "someone", &extra);
+        check_env(&env, &sb, s, &extra).expect("the probe's own entry passes");
+        assert!(
+            check_env(&env, &sb, s, &[])
+                .unwrap_err()
+                .contains("allowlist"),
+            "without the probe it is off the allowlist"
+        );
+        let wrong = vec![("RUST_LOG".to_string(), "trace".to_string())];
+        assert!(
+            check_env(&env, &sb, s, &wrong)
+                .unwrap_err()
+                .contains("fixed value")
+        );
+        let missing = vec![("RUST_BACKTRACE".to_string(), "1".to_string())];
+        assert!(
+            check_env(&env, &sb, s, &missing)
+                .unwrap_err()
+                .contains("missing")
+        );
+        let base = vec![("HOME".to_string(), "/elsewhere".to_string())];
+        assert!(
+            check_env(&env, &sb, s, &base)
+                .unwrap_err()
+                .contains("replace a base")
+        );
+        let secret = vec![("SOME_TOKEN".to_string(), "x".to_string())];
+        let env = run_env(&sb, s, "someone", &secret);
+        assert!(
+            check_env(&env, &sb, s, &secret)
+                .unwrap_err()
+                .contains("credential")
+        );
+    }
+
+    #[test]
+    fn a_probe_entry_never_replaces_a_base_one() {
+        let sb = Sandbox::at(PathBuf::from("/srv/runs/r1"));
+        let s = spec(EndpointMode::SandboxSockets, true);
+        let env = run_env(
+            &sb,
+            s,
+            "someone",
+            &[("HOME".to_string(), "/elsewhere".to_string())],
+        );
+        let map: BTreeMap<_, _> = env.into_iter().collect();
+        assert_eq!(map.get("HOME"), Some(&sb.home.display().to_string()));
+    }
+
+    #[test]
+    fn a_dispatch_fixture_is_committed_by_a_git_that_sees_no_ambient_location() {
+        let dir = std::env::temp_dir().join(format!("xver-commit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        let sb = Sandbox::create(&dir, "run-1").expect("sandbox");
+        write_project(&sb, FIXTURE_TOML, true).expect("fixture + commit");
+        let head = sandbox_git(&sb, &sb.project)
+            .args(["log", "--format=%s", "-1"])
+            .output()
+            .expect("git log");
+        assert_eq!(String::from_utf8_lossy(&head.stdout).trim(), "xver fixture");
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

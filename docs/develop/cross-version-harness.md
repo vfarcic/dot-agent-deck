@@ -8,6 +8,8 @@ cargo xver --branch agent/dispatch-issue-1121
 
 `cargo xver -- --branch …` is accepted too. The alias already ends in `--`, so that spelling used to reach clap as a positional argument and fail; the binary now drops one leading `--`.
 
+That is the **forward** direction, and it is the default. `--direction reverse` runs the opposite pairing — the branch daemon with the previous release's TUI and CLI — and `--direction both` runs one after the other, each in its own sandbox with its own evidence file. [The reverse direction](#the-reverse-direction) says why rule 12's pairing alone leaves a gap and what reverse does and does not close.
+
 ## Why this exists
 
 Rule 12's procedure is written in keystrokes because a person was always going to run it, and four of its paragraphs are about ways a person silently gets it wrong. That had a consequence nobody intended: a dispatched agent reading rule 12 concludes it cannot type into two full-screen TUIs, declines the check, and leaves the review thread open. Eight green, mergeable pull requests were blocked on exactly that one thread at the time this was written.
@@ -23,10 +25,10 @@ A run has two halves. The **outer** half is the command you type; the **inner** 
 3. **Outer, sandbox.** Creates a fresh, owner-only (`0700`) sandbox `$S` under `../dot-agent-deck-xver-runs/<branch slug>-<epoch>/`, refusing to reuse any existing entry. Writes the three-role fixture into `$S/project/.dot-agent-deck.toml` and makes `$S/project` a standalone `git init` repository. Hard-links (or copies, across filesystems) the old binary, the branch binary and the harness itself into `$S`, so every deck binary the namespace runs, and the harness itself, has a path under `$S`.
 4. **Outer, namespace.** Starts `bwrap` with the harness inside it and answers the inner half over its stdio (see [The pre-connect assertion](#the-pre-connect-assertion)).
 5. **Inner, proof.** Reports its mount, PID and network namespaces to the outer half, which refuses any it shares; proves each mask by `dev:ino` and the operator's home empty; requires its own environment to be exactly the plan's allowlisted entries; and requires the fixture to be what stops the deck's project-config walk. Runs both builds' `daemon hello` and refuses a same-build-id pairing before any daemon starts.
-6. **Inner, scenario.** Starts the **old** daemon and records its full identity; waits, by reading the kernel's socket table rather than by starting a client, until it listens where the endpoint matrix says it must; attaches the **old** TUI over a PTY and opens the orchestration through the production `Ctrl+N` flow; confirms through `daemon status --json` that all three roles are live; closes that TUI with `Ctrl+D`, `Ctrl+C`, **Detach** and re-checks; attaches the **branch** TUI, records the build-version mismatch prompt and **declines** it with `n`; delegates from inside the orchestrator pane, then issues `work-done` and — last — `agent-event --type running` from inside a worker pane. The pre-connect assertion runs before every one of those clients.
+6. **Inner, scenario.** (Forward; [reverse](#the-reverse-direction) swaps which build plays each part and changes nothing else.) Starts the **old** daemon and records its full identity; waits, by reading the kernel's socket table rather than by starting a client, until it listens where the endpoint matrix says it must; attaches the **old** TUI over a PTY and opens the orchestration through the production `Ctrl+N` flow; confirms through `daemon status --json` that all three roles are live; closes that TUI with `Ctrl+D`, `Ctrl+C`, **Detach** and re-checks; attaches the **branch** TUI, records the build-version mismatch prompt and **declines** it with `n`; delegates from inside the orchestrator pane, then issues `work-done` and — last — `agent-event --type running` from inside a worker pane. The pre-connect assertion runs before every one of those clients.
 7. **Inner, teardown.** Stops the branch TUI and then the daemon, each by verified identity (see [Teardown](#teardown-is-by-verified-identity)), then censuses the PID namespace for survivors.
 8. **Outer, postconditions.** After the namespace has exited: requires no process left in the run's PID namespace and none referring to `$S`, the host's endpoint candidates unchanged since baseline, no host listener under `$S`, and no line mentioning `$S` among the bytes appended to the operator's real deck log; reports which baseline deck processes are still the same process.
-9. Writes a markdown evidence file to `.dot-agent-deck/xver-evidence/<branch slug>.md` and removes `$S` only after a clean pass with all postconditions met.
+9. Writes a markdown evidence file to `.dot-agent-deck/xver-evidence/<branch slug>.md` — `<branch slug>-reverse.md` for a reverse run, so the two directions of one branch never overwrite each other — and removes `$S` only after a clean pass with all postconditions met.
 
 ## The four tells
 
@@ -39,7 +41,7 @@ A run asserts these and prints each one with the value it was decided on, becaus
 | a delegate still routed | the payload really landed in the target pane |
 | hooks (work-done, status) still arrived | the daemon's feedback really reached the orchestrator's pane, and the status change really reached its own state |
 
-Tell 2's `ss -xlp` runs inside the namespace, so the pids it names are the run's private PID namespace's; the evidence also records the kernel table's own answer (listening inode and holders) at both ends. A tell the harness could not measure is reported as **not checked** and the run is **INCOMPLETE**, not a pass.
+Tell 2's `ss -xlp` runs inside the namespace, so the pids it names are the run's private PID namespace's; the evidence also records the kernel table's own answer (listening inode and holders) at both ends. A tell the harness could not measure is reported as **not checked** and the run is **INCOMPLETE**, not a pass. The table is written for forward; in reverse the same four tells pin the **branch** daemon and binary, and [The reverse direction](#the-reverse-direction) says what a second `Attach protocol listening` line means there.
 
 ## The five false greens, and where each one is handled
 
@@ -50,6 +52,73 @@ Rule 12 documents four ways this procedure silently measures nothing; PR #1179 a
 3. **`Ctrl+C` in `PaneInput` mode goes to the pane.** With a role pane focused it kills that role's process and the orchestration comes back one role short. The harness sends `Ctrl+D` first, takes the default `Detach` (never `Stop`), and then re-asserts the three-role list — this one fails loudly rather than silently, and the re-assert is what makes it loud here.
 4. **Teardown by an unscoped `pkill`.** See [Teardown](#teardown-is-by-verified-identity) below.
 5. **`XDG_RUNTIME_DIR` being set, for a change that moves the endpoint path in the fallback case only.** On a normal desktop session it is set, both builds resolve byte-identical endpoints, and the run exercises the arm such a change did not touch. `--unset-xdg-runtime-dir` is the lever, and it is an option rather than a hardcode because for every other kind of change the ordinary desktop configuration is the faithful one.
+
+## The reverse direction
+
+### The gap in rule 12's pairing
+
+Rule 12 prescribes exactly one pairing: a **previous-release daemon** with the **branch TUI**. That proves the branch client can drive an old daemon, which is a real property and the one the rule asks for. But most of what rule 12's trigger list names — daemon, orchestration, hooks — is code that runs **in the daemon**, and in the forward pairing the daemon is the previous release. For a daemon-side change the forward run therefore executes **none of the changed lines**: it passes against the old daemon's code and says nothing about the new. This is a gap in the rule as written, not in any one run.
+
+`--direction reverse` is the pairing that does execute them: the **branch daemon**, with the orchestration stood up under it by the branch's own TUI, then the **previous release's TUI** attached with the mismatch prompt declined, and the **previous release's CLI** issuing every pane command. It models a downgrade, or a stale binary left on disk beside a newer daemon. Everything else about a run is unchanged: the same namespace, environment allowlist, pre-connect assertion before every client, teardown by verified identity and postconditions, in both directions.
+
+For the eight branches this was first run on, the direction that executes the changed code was established from their diffs:
+
+| PR | issue | changed code runs in | direction that executes it |
+| --- | --- | --- | --- |
+| #1161 | #1109 | the daemon's teardown paths | reverse |
+| #1168 | #1031 | the daemon's delegate delivery | reverse |
+| #1169 | #1082 | the daemon's logging, after decode | reverse |
+| #1179 | #1121 | the client's resolver, and the daemon's bind | both |
+| #1183 | #1182 | the hook CLI's normaliser, and the daemon's matcher | both |
+| #1187 | #925 | the daemon's `AppState::apply_event` | reverse |
+| #1188 | #1129 | the CLI's acknowledgement wait, and the daemon's acknowledgement write | both |
+| #1190 | #1181 | git children the daemon spawns | reverse |
+
+Reverse does not replace forward. Rule 12 asks for the forward run for every one of them; reverse is the additional run that reaches the daemon half.
+
+### What is genuinely different in reverse
+
+- **The prompt and its decline key are the OLD build's.** Both are established from that build rather than assumed: `src/build_version_handshake.rs` is byte-identical between v0.41.0 and every branch this was written against, the published v0.41.0 binary carries the prompt's strings, and in both builds `s`/`S` without Ctrl is the only affirmative key and every other key declines. The run sends `n`, records the prompt exactly as the old TUI printed it, and tells 1 and 2 then prove the old TUI stayed on the same daemon rather than restarting it.
+- **The old client may not find the branch daemon at all.** That is a measured outcome with its own verdict, `OLD CLIENT CANNOT DISCOVER THE BRANCH DAEMON`, distinct from `FAIL` (the two builds reached each other and did not interoperate) and from `INCOMPLETE` (the harness could not tell). It needs positive evidence: a listener the run did not start, held by a process whose full identity is the old build running `daemon serve` with the run's marker — the daemon the old client lazy-spawned. The run records that second daemon by identity, lets the pre-connect assertion account for its listeners at exactly the paths it bound, and then asserts three collateral tells: the branch daemon is untouched, it still runs every role, and the old client's own daemon runs **none** of those roles. A collateral failure makes the run `FAIL`, because it means the fallback damaged something beyond not finding the daemon; an unmeasured one makes it `INCOMPLETE`. Inside the namespace an old client that lazy-spawns does so into the private `/tmp`, so this is measurable without risk to the host. The second daemon is stopped by verified identity before the branch daemon, through `proc::terminate_identity` — it is not the harness's child, so there is no un-reaped handle, and the start-time field and the private PID namespace stand in for one.
+- **Tell 2 pins to the branch daemon.** Same pid, and `/proc/<pid>/exe` the staged **branch** binary, at both ends.
+- **Tell 1 still means "one daemon".** Exactly one `Attach protocol listening` line is the branch daemon's. Two in reverse mean a daemon of another build started: the old client lazy-spawned its own (it did not find the branch daemon), or an idle window swallowed the branch daemon and a client replaced it. In the cannot-discover outcome the count is recorded as part of the discovery evidence, where two is the expected consequence rather than a tell.
+- **The endpoint matrix is learned, not predicted, in one configuration.** With `--endpoint-mode resolved --unset-xdg-runtime-dir` the daemon is a branch build, and whether it binds the flat fallback (every build before #1121) or the per-uid directory (#1121) is that branch's own behaviour. Both are candidates; the run waits until the daemon holds one pair and from then on requires every other candidate absent before every client — the same strength as a predicted matrix. The evidence says which pair it was. Every other mode has one candidate.
+- **Teardown identity matters more, not less.** The daemon is a branch build whose command line looks even more like a production deck's. Every identity check is kept: start time, exe, exact cmdline, cwd, whole environment and mount namespace, re-read before its one SIGTERM and again before any SIGKILL.
+- **`PATH` models the downgrade.** In reverse `$S/bin/dot-agent-deck` — first on `PATH` — is the previous release, and the branch build is staged at `$S/branch/dot-agent-deck`. Pane commands in reverse are typed with the old build's absolute path, so the evidence names exactly which binary sent each stimulus.
+
+### Branch-specific probes
+
+The four tells are rule 12's and reverse asserts them. They are not enough on their own, because a delegate and two hooks never reach, say, the line that escapes a hostile id in a log record. A reverse run therefore also carries a **probe**: the minimal stimulus that reaches the branch's changed arm, with an assertion on what the branch daemon then did. It is selected by the branch name's issue number (`--probe auto`, the default), or named with `--probe`; `--probe generic` runs the four tells only, and a branch no probe is known for gets `generic`. The evidence file says which. Probes run only in reverse, and an explicit probe with `--direction forward` is refused rather than dropped.
+
+Every stimulus is issued by the previous release's CLI from **inside** a pane the branch daemon spawned, so it carries that pane's genuine identity and capability rather than one the harness copied, and each is preceded by the pre-connect assertion. No probe needs an agent credential: where a real agent's producer behaviour matters, the exact payload is injected through `dot-agent-deck hook` on stdin, or produced by a synthetic stand-in.
+
+| probe | branch | stimulus | pass requires |
+| --- | --- | --- | --- |
+| `teardown-inventory` | #1161 | old-TUI `Stop` (`Ctrl+D`, `Ctrl+C`, `Down`, `Enter`, `y`), sending `KIND_SHUTDOWN`; only after the pre-connect assertion re-proves the daemon, and after tells 1 and 2 because it ends the daemon | exactly one `shutdown-frame` inventory record naming the agent and role counts and every captured pane, role and agent, and no `signal` record, before the daemon's exit |
+| `late-session-start` | #1168 | old-CLI `delegate` to `lateboot`, a `clear = true` worker whose command is the synthetic `claude` stand-in; it swallows the first submit CR, and after a 2 s quiet control runs the old `hook` CLI with a late `SessionStart` from its own process | exactly one submission afterwards, of the complete, unmodified pointer |
+| `log-escaping` | #1169 | old `hook` CLI from the reviewer pane with a `UserPromptSubmit` whose session id decodes to contain a newline, then an ordinary `Notification` | one physical `Received event` record with the escaped id, no physical line starting `FORGED-LINE`, the daemon alive, and the reviewer's card `WaitingForInput` |
+| `discovery-fallback` | #1179 | none beyond the attach: the old TUI started with no XDG and no override against a branch daemon in the per-uid directory | the cannot-discover classification above; refused (`INCOMPLETE`) if the branch daemon bound the flat pair |
+| `paste-envelope` | #1183 | old-CLI `dispatch --single` to a Claude-typed stand-in, which reports the exact pasted payload through the old `hook` CLI inside `<pasted_content id="57b9">` | one `confirmation="paste-envelope"` record, one paste and one report, and no retry, probe, abandonment or unconfirmable record through 20 s past it |
+| `cross-pane-session-key` | #1187 | old `hook` CLI from two extra shells, `alpha` and `beta`, under one session id: alpha `SessionStart` + `PreToolUse(Bash)`, beta `SessionStart` + `Notification`, then beta `SessionEnd` | one `alpha` card `Working` with tool `Bash` and one `beta` card `WaitingForInput`, on distinct panes, and alpha unchanged after beta's `SessionEnd` |
+| `signal-ack` | #1188 | tell 4's old `work-done`, plus an old-CLI `dispatch --single`, then an old `agent-event --type waiting` | the unit up in a listed worktree holding the task, and the status event landing afterwards |
+| `git-env` | #1190 | every process carries #1181's eight git location variables pointed at a decoy repository; old-CLI `dispatch --single` | raw `git` resolving the decoy first (the control), then the unit's worktree rooted in the intended repository and the decoy byte-for-byte unchanged |
+
+Where a probe's own precondition does not hold — the pointer never parked, the hostile variables not live, the branch daemon not in the per-uid layout — its tell is **not checked** and the run is `INCOMPLETE`, because a pass there would have measured nothing.
+
+A probe is evidence of a fix only if it would fail without it. `teardown-inventory`, `late-session-start` and `paste-envelope` assert on a log record only the fixed build writes, and `log-escaping` on the escaped form of one. `cross-pane-session-key` and `git-env` assert on state a pre-fix daemon also produces, so they were run once against `main`, which carries neither fix, with `--branch main --probe <name>`: both FAILED there, `main`'s daemon losing alpha's status and cutting the dispatch's worktree from the decoy. Re-run that control after changing either probe.
+
+Three probes change the run's inputs, each narrowly, and the evidence file names each change. `late-session-start` adds `RUST_LOG=dot_agent_deck=debug` and the three delegate timer knobs set to `0`; `git-env` adds the eight location variables. Those are admitted by `sandbox::check_env` by exact name **and** value, never as a base allowlist entry, never with a credential-shaped name, and never replacing a base entry. The dispatch probes (`paste-envelope`, `signal-ack`, `git-env`) create `$S/config/config.toml` holding one key, `default_command` — what `dispatch --single` runs — and commit the fixture so a worktree has a `HEAD` to branch from. `git-env` also creates the decoy, a second standalone repository under `$S`, with an empty environment before any hostile variable exists.
+
+### What reverse covers, and what it does not
+
+It covers the branch daemon's handling of **the stimuli it sends**: the same rule-12 flows, and each probe's one stimulus, from a v0.41.0 client, with the assertions above. Stated narrowly:
+
+- **Each probe covers one stimulus, not the changed surface.** `log-escaping` sends one control character in one field; `cross-pane-session-key` one two-pane collision; `git-env` one dispatch under one coherent set of hostile variables; `late-session-start` one swallowed CR. The probe spec's per-branch residual-risk notes list what each leaves out.
+- **Stand-ins model one producer behaviour each.** The synthetic `claude` reproduces #1031's swallowed CR and #1182's envelope exactly as those issues measured them. It says nothing about when a real Claude boots or which envelope id it picks; the branches' own lane-2 tests are where a real agent is measured.
+- **One previous release.** A client older or newer than `--previous` is not exercised.
+- **The desktop GUI's handshake** (`classify_handshake`) is not exercised in either direction.
+- **The three dispatch probes use `dispatch --single`'s defaults** — a `default_command` from the global config, a worktree beside the project — and do not cover an orchestration dispatch.
+- **`signal-ack` does not discriminate the fix, by design.** An old fire-and-forget client never reads the acknowledgement, so a daemon that writes none passes it too; it asserts that the acknowledgement's write to a closed peer does not break the verbs or wedge the listener, which is the reverse half of #1129's compatibility argument, not proof the write happens (nothing logs it).
 
 ## Isolation: what a run guarantees
 
@@ -73,10 +142,10 @@ Every process the harness starts gets an environment built from an allowlist —
 
 | variable | why |
 | --- | --- |
-| `PATH` = `$S/bin:/usr/local/bin:/usr/bin:/bin` | the staged branch build first, so a pane that shells a bare `dot-agent-deck` reaches the **branch** binary while the daemon in memory is still the old one — which models the upgrade this test is about. The operator's `~/.local/bin` is deliberately absent |
+| `PATH` = `$S/bin:/usr/local/bin:/usr/bin:/bin` | the staged **client-side** build first: in forward the branch build, so a pane that shells a bare `dot-agent-deck` reaches the branch binary while the daemon in memory is still the old one — the upgrade this test is about; in reverse the previous release — the downgrade. The operator's `~/.local/bin` is deliberately absent. (The daemon then applies a login shell's `PATH` to what it spawns, which is why a probe's stand-in is always named by absolute path) |
 | `HOME`, `TMPDIR=/tmp`, `TERM`, `LC_ALL`, `COLORTERM`, `SHELL`, `USER`, `LOGNAME` | ordinary settings; `USER`/`LOGNAME` come from the password database, not from the caller |
 | `XDG_CONFIG_HOME`, `XDG_STATE_HOME`, `XDG_DATA_HOME`, `XDG_CACHE_HOME` | `HOME` alone does not cover them: `schedules_path()` consults an inherited `XDG_CONFIG_HOME` before `HOME`, so a sandbox daemon could otherwise read the operator's real schedules and fire them |
-| `DOT_AGENT_DECK_CONFIG`, `_SESSION`, `_SCHEDULES` | pinned to files under `$S/config` that are never created — an absent schedules file is "no schedules" |
+| `DOT_AGENT_DECK_CONFIG`, `_SESSION`, `_SCHEDULES` | pinned to files under `$S/config`. The harness creates none of them except `config.toml` for a dispatch probe (one key, `default_command`; see [Branch-specific probes](#branch-specific-probes)); an absent schedules file is "no schedules". A TUI writes `session.toml` itself as it runs |
 | `DOT_AGENT_DECK_STATE_DIR`, `_LOCK_DIR` | per-user state and the per-endpoint lock |
 | `DOT_AGENT_DECK_LOG` | **resolved separately from the state dir.** Without it an otherwise-isolated daemon appends into the operator's real `~/.local/state/dot-agent-deck/deck.log` |
 | `DOT_AGENT_DECK_EXPERIMENTAL` | pinned explicitly (off by default, `--experimental` to turn it on) rather than inherited |
@@ -84,6 +153,7 @@ Every process the harness starts gets an environment built from an allowlist —
 | `DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS` | a second backstop for a stand-in that escapes its process group; the PID namespace is the first |
 | `GIT_CONFIG_NOSYSTEM=1` | git inside the run reads no system config |
 | `DAD_XVER_SANDBOX=$S` | the run's unique marker: part of every sandbox process's identity, and what the post-run census looks for |
+| a probe's additions | `RUST_LOG` and three delegate timers (`late-session-start`), #1181's eight git location variables (`git-env`) — each admitted by exact name and value, never replacing a base entry and never credential-shaped; see [Branch-specific probes](#branch-specific-probes) |
 | `XDG_RUNTIME_DIR` | `/run/user/<uid>` (private inside) or, with `--unset-xdg-runtime-dir`, **absent** |
 | `DOT_AGENT_DECK_SOCKET`, `_ATTACH_SOCKET` | `$S/hook.sock` / `$S/attach.sock` in `sandbox-sockets` mode; **absent** in `resolved` mode |
 
@@ -148,28 +218,28 @@ What it does to git is bounded: a `git clone --no-checkout` once, then per run `
 
 ## Running several at once
 
-Each run mints its own sandbox, namespace and endpoints, so neither mode collides with another run at the endpoint level. What two concurrent runs do share by default is the **build clone and the target dir** — two runs would check out different commits into the same clone and build into the same target at once. Give each concurrent run its own `--source-clone` and `--target-dir`; a fixed set of lanes (`-xver-src-a`, `-xver-target-a`, …) reused across branches keeps the cache benefit. The release cache (`--releases-dir`) is read-mostly once populated; pre-warm it with one run rather than racing the first download.
+Each run mints its own sandbox, namespace and endpoints, so neither mode and neither direction collides with another run at the endpoint level. What two concurrent runs do share by default is the **build clone and the target dir** — two runs would check out different commits into the same clone and build into the same target at once. Give each concurrent run its own `--source-clone` and `--target-dir`; a fixed set of lanes (`-xver-src-a`, `-xver-target-a`, …) reused across branches keeps the cache benefit. The release cache (`--releases-dir`) is read-mostly once populated; pre-warm it with one run rather than racing the first download.
 
 ## Reading the evidence file
 
 `.dot-agent-deck/xver-evidence/<branch slug>.md` (override with `--evidence`) carries: both builds' `daemon hello` output verbatim, the sandbox and staged binary paths, the daemon pid, each tell with the measured value it was decided on, an **Isolation** section listing every isolation check that was measured and held (namespace ids, mask identities, the daemon's recorded identity, the first pre-connect assertion per client kind with its kernel listener map, the fallback-arm proof in `resolved` mode, the survivor census), a **Postconditions** section with the outer half's post-run checks, a numbered run log, and raw excerpts — the daemon's environment read back from `/proc`, the mismatch prompt as printed, the target pane's screen after the delegate, the orchestrator's screen after the hook, and the tail of the sandbox log. It is written on **every** path once the sandbox exists, including a run that broke down partway.
 
-The verdict is **PASS**, **FAIL** (a tell failed or the scenario broke down — the branch and the previous release did not interoperate, or the scenario could not be stood up, which the run log says), or **INCOMPLETE** (a tell could not be measured, or an isolation check failed or could not be evaluated — so the run measured nothing either way). An isolation failure dominates: a tell measured inside a namespace that did not hold is not a measurement of the branch.
+The verdict is **PASS**, **FAIL** (a tell failed or the scenario broke down — the branch and the previous release did not interoperate, or the scenario could not be stood up, which the run log says), **INCOMPLETE** (a tell could not be measured, or an isolation check failed or could not be evaluated — so the run measured nothing either way), or, in reverse only, **OLD CLIENT CANNOT DISCOVER THE BRANCH DAEMON** (measured: the old client started a daemon of its own instead of finding the branch's, and the collateral tells proved nothing else happened). An isolation failure dominates: a tell measured inside a namespace that did not hold is not a measurement of the branch. A failed tell outranks a measured non-discovery, and an unmeasured one does too — "nothing else happened" is only a claim when it was measured. A reverse evidence file carries a **Discovery** section when that outcome occurred, the probe it ran, and each probe tell.
 
 The sandbox is removed after a clean pass and kept after anything else; `--keep-sandbox` keeps it either way. Its `artifacts/` holds both PTY streams verbatim, the old daemon's stdio and the inner half's evidence JSON.
 
 ## What it covers, and what it does not
 
-It covers the pairing rule 12 and [`versioning.md`](versioning.md) exist for: a **newer TUI against an older daemon**, over the real attach protocol, with real orchestration state in the old daemon's memory, asserting on payloads rather than on exit codes.
+Forward covers the pairing rule 12 and [`versioning.md`](versioning.md) exist for: a **newer TUI against an older daemon**, over the real attach protocol, with real orchestration state in the old daemon's memory, asserting on payloads rather than on exit codes. Reverse covers the opposite pairing for the same flows plus one branch-specific stimulus each; [What reverse covers, and what it does not](#what-reverse-covers-and-what-it-does-not) states that narrowly.
 
 It does not cover:
 
 - **A real agent.** Every role is a stand-in (`sh`, `cat`), deliberately: this check is about the TUI↔daemon wire, so no *agent* credential is used or needed. (`gh release download` uses your GitHub credential, and `--old-binary` avoids even that.) It therefore says nothing about how a real agent behaves across the version boundary, and it is not a substitute for the lane-2 real-agent tests CLAUDE.md rule 4 asks for.
-- **The reverse direction.** An *older* TUI against a *newer* daemon is a downgrade, and this harness does not stand one up.
+- **A daemon-side change, in the forward direction.** Forward runs the previous release's daemon, so a change that lives in the daemon executes nowhere in a forward run; `--direction reverse` is the pairing that runs it.
 - **The desktop GUI.** `classify_handshake` compares `PROTOCOL_VERSION` and `CONTRACT_BREAKS` and is a different code path from the TUI's build-version handshake; nothing here exercises it.
 - **More than one previous release per run.** `--previous` takes one tag.
 - **Anything that is not Linux.** `/proc`, bubblewrap, `ss(8)` and `statvfs` are all assumed, and only the `linux-amd64` release asset is fetched.
-- **Flows other than the two rule 12 names.** A delegate and the two hook kinds are what a run drives; a contract break that touches neither would not be seen.
+- **Flows other than the two rule 12 names, in forward.** A delegate and the two hook kinds are what a forward run drives; a contract break that touches neither would not be seen. A reverse run adds its probe's one stimulus and nothing more.
 
 ## Options worth knowing
 
@@ -181,6 +251,8 @@ It does not cover:
 | `--endpoint-mode` | `sandbox-sockets` (default) or `resolved` |
 | `--unset-xdg-runtime-dir` | false green 5 |
 | `--experimental` | turn the experimental feature flag on for the run |
+| `--direction` | `forward` (default, rule 12's pairing), `reverse` (branch daemon, previous-release TUI and CLI) or `both` |
+| `--probe` | the reverse run's branch-specific stimulus: `auto` (default, from the branch's issue number), `generic` (the four tells only), or a probe's name |
 | `--skip-build` | reuse whatever is already in the target dir; for iterating on the harness itself |
 | `--keep-sandbox` | keep the sandbox even on a pass |
 | `--min-free-gib` | the free-space floor (default 100) |

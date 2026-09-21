@@ -51,10 +51,13 @@
 mod ctl;
 mod inner;
 mod isolation;
+mod probe;
+mod probes;
 mod proc;
 mod pty;
 mod report;
 mod sandbox;
+mod stub;
 
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
@@ -62,8 +65,9 @@ use std::process::{Command, ExitCode, Stdio};
 use std::time::{Duration, Instant};
 
 use clap::Parser;
+use probe::Probe;
 use report::{Evidence, RunVerdict};
-use sandbox::{EndpointMatrix, EndpointMode, EnvSpec, Sandbox};
+use sandbox::{Direction, EndpointMatrix, EndpointMode, EnvSpec, Sandbox};
 
 /// The hidden flag the outer half passes to the copy of this binary it starts
 /// inside the namespace.
@@ -184,6 +188,25 @@ struct Opts {
     /// Kill the whole namespace if the inner half has not finished by then.
     #[arg(long, default_value_t = 1200)]
     run_timeout_secs: u64,
+
+    /// Which pairing to run.
+    ///
+    /// `forward` (the default, and rule 12's pairing): the previous release's
+    /// daemon with the branch TUI and CLI. `reverse`: the BRANCH daemon with the
+    /// previous release's TUI and CLI — the only pairing that executes a
+    /// daemon-side change. `both`: forward, then reverse, each in its own
+    /// sandbox and namespace, each with its own evidence file.
+    #[arg(long, value_enum, default_value_t = DirectionArg::Forward)]
+    direction: DirectionArg,
+
+    /// The branch-specific stimulus a reverse run carries after the four tells.
+    ///
+    /// `auto` (the default) selects it from the branch's issue number and falls
+    /// back to `generic`, the four tells only. Probes run in the reverse
+    /// direction only; asking for one explicitly with `--direction forward` is
+    /// refused rather than silently ignored.
+    #[arg(long, value_enum, default_value_t = ProbeArg::Auto)]
+    probe: ProbeArg,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
@@ -192,8 +215,101 @@ enum ModeArg {
     Resolved,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum DirectionArg {
+    Forward,
+    Reverse,
+    Both,
+}
+
+impl DirectionArg {
+    fn directions(self) -> Vec<Direction> {
+        match self {
+            DirectionArg::Forward => vec![Direction::Forward],
+            DirectionArg::Reverse => vec![Direction::Reverse],
+            DirectionArg::Both => vec![Direction::Forward, Direction::Reverse],
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum ProbeArg {
+    Auto,
+    Generic,
+    TeardownInventory,
+    LateSessionStart,
+    LogEscaping,
+    DiscoveryFallback,
+    PasteEnvelope,
+    CrossPaneSessionKey,
+    SignalAck,
+    GitEnv,
+}
+
+/// The probe a run in `direction` carries. Forward runs carry none — they are
+/// rule 12's pairing, whose tells are the four — and an explicit probe there is
+/// refused rather than dropped, so nobody reads a forward evidence file as
+/// having measured one.
+fn select_probe(arg: ProbeArg, branch: &str, direction: Direction) -> Result<Probe, String> {
+    let explicit = match arg {
+        ProbeArg::Auto => None,
+        ProbeArg::Generic => Some(Probe::Generic),
+        ProbeArg::TeardownInventory => Some(Probe::TeardownInventory),
+        ProbeArg::LateSessionStart => Some(Probe::LateSessionStart),
+        ProbeArg::LogEscaping => Some(Probe::LogEscaping),
+        ProbeArg::DiscoveryFallback => Some(Probe::DiscoveryFallback),
+        ProbeArg::PasteEnvelope => Some(Probe::PasteEnvelope),
+        ProbeArg::CrossPaneSessionKey => Some(Probe::CrossPaneSessionKey),
+        ProbeArg::SignalAck => Some(Probe::SignalAck),
+        ProbeArg::GitEnv => Some(Probe::GitEnv),
+    };
+    match (direction, explicit) {
+        (Direction::Forward, None | Some(Probe::Generic)) => Ok(Probe::Generic),
+        (Direction::Forward, Some(p)) => Err(format!(
+            "the {} probe runs in the reverse direction only — pass `--direction reverse` (or \
+             `both`); a forward run is rule 12's pairing and asserts the four tells",
+            p.name()
+        )),
+        (Direction::Reverse, Some(p)) => Ok(p),
+        (Direction::Reverse, None) => Ok(Probe::for_branch(branch)),
+    }
+}
+
+/// `.dot-agent-deck/xver-evidence/<slug>.md` for a forward run — the path every
+/// earlier run wrote — and `<slug>-reverse.md` for a reverse one, so the two
+/// directions of one branch never overwrite each other. An explicit
+/// `--evidence` gets the same `-reverse` suffix in a reverse run.
+fn evidence_path(explicit: Option<&Path>, root: &Path, slug: &str, d: Direction) -> PathBuf {
+    let base = explicit.map(Path::to_path_buf).unwrap_or_else(|| {
+        root.join(".dot-agent-deck")
+            .join("xver-evidence")
+            .join(format!("{slug}.md"))
+    });
+    if d == Direction::Forward {
+        return base;
+    }
+    let stem = base
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let name = match base.extension() {
+        Some(ext) => format!("{stem}-reverse.{}", ext.to_string_lossy()),
+        None => format!("{stem}-reverse"),
+    };
+    base.with_file_name(name)
+}
+
 fn main() -> ExitCode {
     let mut args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    // Hard-linked into a reverse run's sandbox as `claude`, this binary is the
+    // synthetic Claude Code stand-in (`stub.rs`), never the harness.
+    if args
+        .first()
+        .and_then(|a| Path::new(a).file_name())
+        .is_some_and(|n| n == "claude")
+    {
+        return stub::main();
+    }
     if args.get(1).is_some_and(|a| a == INNER_FLAG) {
         let Some(plan) = args.get(2) else {
             eprintln!("xver: {INNER_FLAG} needs a path");
@@ -499,6 +615,50 @@ fn new_binary(
 // ---------------------------------------------------------------------------
 
 fn run(opts: &Opts) -> Result<bool, String> {
+    let directions = opts.direction.directions();
+    // Refuse a probe/direction combination before anything is built. With
+    // `both`, an explicit probe belongs to the reverse half and the forward half
+    // stays rule 12's four tells.
+    let mut probes = Vec::new();
+    for d in &directions {
+        let arg = if *d == Direction::Forward && opts.direction == DirectionArg::Both {
+            ProbeArg::Auto
+        } else {
+            opts.probe
+        };
+        let probe = select_probe(arg, &opts.branch, *d)?;
+        if *d == Direction::Reverse {
+            probe.check_config(
+                match opts.endpoint_mode {
+                    ModeArg::SandboxSockets => EndpointMode::SandboxSockets,
+                    ModeArg::Resolved => EndpointMode::Resolved,
+                },
+                !opts.unset_xdg_runtime_dir,
+            )?;
+        }
+        probes.push(probe);
+    }
+    let mut all_passed = true;
+    let mut first_err = None;
+    for (d, probe) in directions.into_iter().zip(probes) {
+        match run_one(opts, d, probe) {
+            Ok(passed) => all_passed &= passed,
+            Err(e) => {
+                eprintln!("\nxver ({}): {e}", d.name());
+                all_passed = false;
+                first_err.get_or_insert(e);
+            }
+        }
+    }
+    match first_err {
+        Some(e) => Err(e),
+        None => Ok(all_passed),
+    }
+}
+
+/// One run in one direction: its own preflight, sandbox, namespace, evidence
+/// file and postconditions.
+fn run_one(opts: &Opts, direction: Direction, probe: Probe) -> Result<bool, String> {
     let root = repo_root()?;
     let parent = root
         .parent()
@@ -537,6 +697,8 @@ fn run(opts: &Opts) -> Result<bool, String> {
     let mut ev = Evidence {
         branch: opts.branch.clone(),
         previous: opts.previous.clone(),
+        direction,
+        probe: probe.describe(),
         started_at: utc_now(),
         mode: match mode {
             EndpointMode::SandboxSockets => {
@@ -564,7 +726,7 @@ fn run(opts: &Opts) -> Result<bool, String> {
         ..Default::default()
     };
 
-    println!("xver: preflight");
+    println!("xver ({}): preflight", direction.name());
     ev.preflight.push(format!(
         "runs root: {}",
         sandbox::require_disk_backed("runs root", &runs_root, opts.min_free_gib)?
@@ -606,7 +768,7 @@ fn run(opts: &Opts) -> Result<bool, String> {
         });
     let log_mark = real_log.as_deref().and_then(isolation::mark_log);
 
-    println!("xver: inputs");
+    println!("xver ({}): inputs", direction.name());
     let old_src = old_binary(opts, &releases, &mut ev)?;
     let (new_src, head_sha) = new_binary(opts, &clone, &target_dir, &mut ev)?;
     ev.head_sha = head_sha;
@@ -616,38 +778,54 @@ fn run(opts: &Opts) -> Result<bool, String> {
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
         .collect();
-    let sb = Sandbox::create(&runs_root, &format!("{slug}-{}", epoch_secs()))?;
+    let sb_name = match direction {
+        Direction::Forward => format!("{slug}-{}", epoch_secs()),
+        Direction::Reverse => format!("{slug}-rev-{}", epoch_secs()),
+    };
+    let sb = Sandbox::create(&runs_root, &sb_name)?;
     let runs_root = std::fs::canonicalize(&runs_root).map_err(|e| format!("{e}"))?;
     ev.sandbox_root = sb.root.clone();
 
     // From here on the evidence file is written whatever happens.
-    let evidence_path = opts.evidence.clone().unwrap_or_else(|| {
-        root.join(".dot-agent-deck")
-            .join("xver-evidence")
-            .join(format!("{slug}.md"))
-    });
+    let evidence_path = evidence_path(opts.evidence.as_deref(), &root, &slug, direction);
     let mut inner_pid_ns: Option<String> = None;
     let outcome = (|| -> Result<(), String> {
-        sandbox::write_project(&sb)?;
-        for (src, dst) in [
-            (old_src.as_path(), sb.old_bin()),
-            (new_src.as_path(), sb.new_bin()),
-            (
-                std::env::current_exe()
-                    .map_err(|e| format!("current_exe: {e}"))?
-                    .as_path(),
-                sb.harness_bin(),
-            ),
-        ] {
+        let fixture = probe::fixture(&sb, probe);
+        sandbox::write_project(&sb, &fixture, probe.needs_commit())?;
+        let harness_src = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
+        // Forward: the branch build is the one on `PATH` (the upgrade: new
+        // binary on disk, old daemon in memory). Reverse: the previous release
+        // is (the downgrade: old binary on disk, branch daemon in memory), and
+        // the branch build is staged beside it.
+        let mut staging: Vec<(&Path, PathBuf)> = vec![(old_src.as_path(), sb.old_bin())];
+        match direction {
+            Direction::Forward => staging.push((new_src.as_path(), sb.new_bin(direction))),
+            Direction::Reverse => {
+                staging.push((new_src.as_path(), sb.new_bin(direction)));
+                staging.push((old_src.as_path(), sb.path_bin()));
+            }
+        }
+        staging.push((harness_src.as_path(), sb.harness_bin()));
+        if probe.needs_stub() {
+            staging.push((harness_src.as_path(), sb.stub_claude()));
+        }
+        for (src, dst) in staging {
             ev.preflight.push(sandbox::stage_binary(src, &dst)?);
         }
         ev.old_binary = sb.old_bin();
-        ev.new_binary = sb.new_bin();
+        ev.new_binary = sb.new_bin(direction);
+        for note in probes::prepare_outer(&sb, probe)? {
+            ev.preflight.push(note);
+        }
 
-        let env = sandbox::run_env(&sb, spec, &user);
-        sandbox::check_env(&env, &sb, spec)?;
-        let matrix = EndpointMatrix::for_run(&sb, mode, spec.keep_xdg_runtime_dir, uid);
-        sandbox::check_socket_path_lengths(&matrix)?;
+        let extra_env = probe.extra_env(&sb);
+        let env = sandbox::run_env(&sb, spec, &user, &extra_env);
+        sandbox::check_env(&env, &sb, spec, &extra_env)?;
+        let matrices =
+            EndpointMatrix::candidates(&sb, mode, spec.keep_xdg_runtime_dir, uid, direction);
+        for m in &matrices {
+            sandbox::check_socket_path_lengths(m)?;
+        }
         let plan = isolation::Plan {
             root: sb.root.clone(),
             uid,
@@ -657,8 +835,12 @@ fn run(opts: &Opts) -> Result<bool, String> {
             experimental: opts.experimental,
             max_lifetime_secs: opts.max_agent_lifetime_secs,
             previous: opts.previous.clone(),
+            direction,
+            probe,
+            fixture,
+            extra_env,
             env,
-            matrix,
+            matrices,
             masks: isolation::masks_for(&sb, uid)?,
             masked_home: isolation::home_to_mask(),
             outer_mnt_ns: outer_mnt.clone(),
@@ -703,7 +885,7 @@ fn run(opts: &Opts) -> Result<bool, String> {
         }
     }
 
-    println!("xver: postconditions");
+    println!("xver ({}): postconditions", direction.name());
     let clean = postconditions(
         &mut ev,
         &sb,
@@ -729,18 +911,15 @@ fn run(opts: &Opts) -> Result<bool, String> {
             sb.root.display()
         )
     };
-    println!("xver: {disposal}");
+    println!("xver ({}): {disposal}", direction.name());
     ev.postconditions.push(disposal);
     ev.write_to(&evidence_path)?;
-    println!("xver: evidence written to {}", evidence_path.display());
     println!(
-        "xver: {}",
-        match &verdict {
-            RunVerdict::Pass => "PASS".to_string(),
-            RunVerdict::Fail => "FAIL".to_string(),
-            RunVerdict::Incomplete(why) => format!("INCOMPLETE — {why}"),
-        }
+        "xver ({}): evidence written to {}",
+        direction.name(),
+        evidence_path.display()
     );
+    println!("xver ({}): {}", direction.name(), verdict.label());
     Ok(passed)
 }
 
@@ -930,6 +1109,7 @@ fn merge_inner(ev: &mut Evidence, sb: &Sandbox) -> Result<(), String> {
     ev.new_hello = inner.new_hello;
     ev.daemon_pid = inner.daemon_pid;
     ev.daemon_endpoint = inner.daemon_endpoint;
+    ev.discovery = inner.discovery;
     ev.preflight.extend(inner.preflight);
     ev.steps.extend(inner.steps);
     ev.tells.extend(inner.tells);
@@ -1059,4 +1239,83 @@ fn remove_sandbox(sb: &Sandbox, runs_root: &Path) -> Result<(), String> {
     }
     sandbox::require_private_dir(&canon)?;
     std::fs::remove_dir_all(&canon).map_err(|e| format!("remove {}: {e}", canon.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn forward_is_the_default_and_carries_no_probe() {
+        let opts = Opts::parse_from(["xver", "--branch", "agent/dispatch-issue-1109"]);
+        assert_eq!(opts.direction, DirectionArg::Forward);
+        assert_eq!(opts.direction.directions(), vec![Direction::Forward]);
+        assert_eq!(
+            select_probe(opts.probe, &opts.branch, Direction::Forward),
+            Ok(Probe::Generic),
+            "an existing invocation keeps its meaning: rule 12's four tells"
+        );
+    }
+
+    #[test]
+    fn a_reverse_run_selects_its_probe_from_the_branch() {
+        assert_eq!(
+            select_probe(
+                ProbeArg::Auto,
+                "agent/dispatch-issue-1109",
+                Direction::Reverse
+            ),
+            Ok(Probe::TeardownInventory)
+        );
+        assert_eq!(
+            select_probe(ProbeArg::Auto, "some/other-branch", Direction::Reverse),
+            Ok(Probe::Generic)
+        );
+        assert_eq!(
+            select_probe(
+                ProbeArg::Generic,
+                "agent/dispatch-issue-1109",
+                Direction::Reverse
+            ),
+            Ok(Probe::Generic),
+            "an explicit `generic` downgrades on purpose, never silently"
+        );
+    }
+
+    #[test]
+    fn an_explicit_probe_is_refused_in_the_forward_direction_rather_than_dropped() {
+        let err = select_probe(ProbeArg::LogEscaping, "x", Direction::Forward)
+            .expect_err("a forward run carries no probe");
+        assert!(err.contains("reverse direction only"), "{err}");
+    }
+
+    #[test]
+    fn both_runs_forward_then_reverse() {
+        assert_eq!(
+            DirectionArg::Both.directions(),
+            vec![Direction::Forward, Direction::Reverse]
+        );
+    }
+
+    #[test]
+    fn a_reverse_run_never_overwrites_the_forward_evidence_file() {
+        let root = Path::new("/repo");
+        let fwd = evidence_path(None, root, "agent-x", Direction::Forward);
+        let rev = evidence_path(None, root, "agent-x", Direction::Reverse);
+        assert_eq!(
+            fwd,
+            Path::new("/repo/.dot-agent-deck/xver-evidence/agent-x.md")
+        );
+        assert_eq!(
+            rev,
+            Path::new("/repo/.dot-agent-deck/xver-evidence/agent-x-reverse.md")
+        );
+        let explicit = evidence_path(
+            Some(Path::new("/out/e.md")),
+            root,
+            "agent-x",
+            Direction::Reverse,
+        );
+        assert_eq!(explicit, Path::new("/out/e-reverse.md"));
+    }
 }

@@ -42,8 +42,9 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::probe::Probe;
 use crate::proc;
-use crate::sandbox::{self, EndpointMatrix, EndpointMode, EnvSpec, Sandbox};
+use crate::sandbox::{self, Direction, EndpointMatrix, EndpointMode, EnvSpec, Sandbox};
 
 /// `(st_dev, st_ino)` — what makes two paths the same directory, which is how a
 /// bind mount is proven from the inside.
@@ -77,9 +78,21 @@ pub struct Plan {
     pub experimental: bool,
     pub max_lifetime_secs: u64,
     pub previous: String,
+    /// Which build serves the daemon.
+    pub direction: Direction,
+    /// The reverse probe the run carries ([`Probe::Generic`] in a forward run).
+    pub probe: Probe,
+    /// The exact `.dot-agent-deck.toml` the run wrote, re-verified inside.
+    pub fixture: String,
+    /// The probe's additions to the environment, each admitted by name and
+    /// exact value (see `sandbox::check_env`).
+    pub extra_env: Vec<(String, String)>,
     /// The exact environment every process in the run gets.
     pub env: Vec<(String, String)>,
-    pub matrix: EndpointMatrix,
+    /// Every endpoint matrix the daemon may legitimately bind; the inner half
+    /// selects one from the kernel's table once the daemon is up (see
+    /// [`EndpointMatrix::candidates`]). Exactly one in a forward run.
+    pub matrices: Vec<EndpointMatrix>,
     pub masks: Vec<Mask>,
     /// The operator's real home, masked by an empty tmpfs; `None` when it does
     /// not exist on this host.
@@ -640,8 +653,12 @@ mod tests {
             experimental: false,
             max_lifetime_secs: 1800,
             previous: "v0.41.0".into(),
-            env: sandbox::run_env(&sb, spec, "op"),
-            matrix: EndpointMatrix::for_run(&sb, spec.mode, false, 1000),
+            direction: Direction::Forward,
+            probe: Probe::Generic,
+            fixture: sandbox::FIXTURE_TOML.to_string(),
+            extra_env: Vec::new(),
+            env: sandbox::run_env(&sb, spec, "op", &[]),
+            matrices: vec![EndpointMatrix::for_run(&sb, spec.mode, false, 1000)],
             masks: vec![
                 Mask {
                     target: "/tmp".into(),

@@ -92,6 +92,64 @@ pub fn parse_state(stat: &str) -> Option<char> {
     stat_fields_after_comm(stat)?.first()?.chars().next()
 }
 
+/// `PF_EXITING` in field 9 (`flags`) of `/proc/<pid>/stat`: the process is
+/// inside `do_exit` — past handling any signal, its memory possibly already
+/// released (which is what makes `/proc/<pid>/exe` unreadable) — but not yet a
+/// zombie.
+const PF_EXITING: u64 = 0x0000_0004;
+
+/// Field 9 (`flags`) out of a `/proc/<pid>/stat` line.
+pub fn parse_flags(stat: &str) -> Option<u64> {
+    stat_fields_after_comm(stat)?.get(6)?.parse().ok()
+}
+
+/// Whether `pid` is gone, a zombie, or inside `do_exit`.
+pub fn exiting_or_gone(pid: i32) -> bool {
+    match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(stat) => {
+            parse_state(&stat) == Some('Z')
+                || parse_state(&stat) == Some('X')
+                || parse_flags(&stat).is_some_and(|f| f & PF_EXITING != 0)
+        }
+        Err(_) => !is_alive(pid),
+    }
+}
+
+/// Field 4 (`ppid`) out of a `/proc/<pid>/stat` line.
+pub fn parse_ppid(stat: &str) -> Option<i32> {
+    stat_fields_after_comm(stat)?.get(1)?.parse().ok()
+}
+
+pub fn ppid(pid: i32) -> Option<i32> {
+    parse_ppid(&std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?)
+}
+
+/// Every visible process whose parent chain reaches `root` (not `root`
+/// itself), with its command line, in pid order. A census, not a signal list:
+/// nothing here is ever signalled by it.
+pub fn descendants(root: i32) -> Vec<(i32, Vec<String>)> {
+    let Ok(all) = pids() else {
+        return Vec::new();
+    };
+    let parents: BTreeMap<i32, i32> = all.iter().filter_map(|p| Some((*p, ppid(*p)?))).collect();
+    all.into_iter()
+        .filter(|p| {
+            let mut cur = *p;
+            // Bounded walk: a pid namespace is small, and a cycle is impossible
+            // but must not hang a run if /proc is read mid-reparent.
+            for _ in 0..64 {
+                match parents.get(&cur) {
+                    Some(&pp) if pp == root => return *p != root,
+                    Some(&pp) if pp > 1 && pp != cur => cur = pp,
+                    _ => return false,
+                }
+            }
+            false
+        })
+        .map(|p| (p, cmdline(p).unwrap_or_default()))
+        .collect()
+}
+
 pub fn start_time(pid: i32) -> Option<u64> {
     parse_start_time(&std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?)
 }
@@ -233,7 +291,21 @@ impl Identity {
     }
 
     /// Re-read every field and require each one unchanged.
+    ///
+    /// A process that exits while its fields are being read makes a later read
+    /// fail — `/proc/<pid>/exe` unreadable is how it first showed up — which is
+    /// its EXIT, not a changed identity. So a mismatch is re-classified as
+    /// [`Mismatch::Gone`] when, by the time it is reported, the pid is gone, a
+    /// zombie, or flagged `PF_EXITING` by the kernel; a pid that has been
+    /// recycled is none of those, and stays a mismatch.
     pub fn verify(&self) -> Result<(), Mismatch> {
+        match self.verify_fields() {
+            Err(Mismatch::Changed { .. }) if exiting_or_gone(self.pid) => Err(Mismatch::Gone),
+            other => other,
+        }
+    }
+
+    fn verify_fields(&self) -> Result<(), Mismatch> {
         let pid = self.pid;
         if !is_alive(pid) || state(pid) == Some('Z') {
             return Err(Mismatch::Gone);
@@ -389,6 +461,36 @@ impl SandboxProcess {
         }
         Ok(Terminated::Killed)
     }
+}
+
+/// Stop a process this harness did NOT spawn — so holds no `Child` handle for —
+/// by its recorded identity alone: the daemon an old client lazy-spawned when it
+/// could not find the one under test.
+///
+/// The same gate as [`SandboxProcess::terminate`], minus the un-reaped handle:
+/// every identity field re-verified immediately before the one SIGTERM, and
+/// again before any SIGKILL. What stands in for the missing handle is the
+/// start-time field, which is what tells a recycled pid from the process that
+/// used to hold the number, and the run's private PID namespace, where no host
+/// process has a pid at all. Its exit is observed through `verify` reporting it
+/// gone: once reparented, the namespace's init reaps it.
+pub fn terminate_identity(id: &Identity, grace: Duration) -> Result<Terminated, Mismatch> {
+    id.verify()?;
+    // SAFETY: a positive pid whose every identity field was re-read and matched
+    // one syscall ago, inside the run's private PID namespace.
+    unsafe { libc::kill(id.pid, libc::SIGTERM) };
+    let deadline = Instant::now() + grace;
+    while Instant::now() < deadline {
+        match id.verify() {
+            Err(Mismatch::Gone) => return Ok(Terminated::Graceful),
+            Err(m) => return Err(m),
+            Ok(()) => std::thread::sleep(Duration::from_millis(100)),
+        }
+    }
+    id.verify()?;
+    // SAFETY: re-verified immediately above.
+    unsafe { libc::kill(id.pid, libc::SIGKILL) };
+    Ok(Terminated::Killed)
 }
 
 impl Drop for SandboxProcess {
@@ -547,6 +649,65 @@ mod tests {
             "1234 (a b) (c)) S 1 1234 1234 0 -1 4194560 100 0 0 0 1 2 0 0 20 0 1 0 424242 1000 10";
         assert_eq!(parse_start_time(stat), Some(424242));
         assert_eq!(parse_state(stat), Some('S'));
+        assert_eq!(parse_ppid(stat), Some(1));
+        assert_eq!(parse_flags(stat), Some(4194560));
+        assert_eq!(4194560 & PF_EXITING, 0, "that sample is a live process");
+    }
+
+    #[test]
+    fn a_child_is_counted_among_its_parents_descendants() {
+        let bin = std::fs::canonicalize("/bin/sleep").expect("sleep(1)");
+        let mut child = std::process::Command::new(&bin)
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+        let me = std::process::id() as i32;
+        let found = descendants(me).iter().any(|(p, _)| *p == child.id() as i32);
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(found, "a direct child is a descendant");
+        assert!(
+            descendants(me).iter().all(|(p, _)| *p != me),
+            "the root is not its own descendant"
+        );
+    }
+
+    #[test]
+    fn a_process_the_harness_did_not_spawn_is_stopped_only_through_its_identity() {
+        // A child of this test stands in for a daemon the harness did not
+        // spawn: `terminate_identity` never touches the handle, only the pid.
+        let bin = std::fs::canonicalize("/bin/sleep").expect("sleep(1)");
+        let mut child = std::process::Command::new(&bin)
+            .arg("30")
+            .env_clear()
+            .env("XVER_PROBE", "2")
+            .spawn()
+            .expect("spawn sleep");
+        let id = Identity::capture_spawned(child.id() as i32, &bin).expect("capture");
+        // A single differing field refuses the signal and leaves it running.
+        let mut wrong = id.clone();
+        wrong.cmdline.push("extra".into());
+        assert!(matches!(
+            terminate_identity(&wrong, Duration::from_secs(1)),
+            Err(Mismatch::Changed {
+                field: "cmdline",
+                ..
+            })
+        ));
+        assert!(
+            matches!(child.try_wait(), Ok(None)),
+            "refused means not signalled"
+        );
+        // Reap concurrently, the way a namespace init would, so `verify` sees
+        // the process go rather than linger as this test's zombie.
+        let reaper = std::thread::spawn(move || child.wait());
+        assert_eq!(
+            terminate_identity(&id, Duration::from_secs(10)),
+            Ok(Terminated::Graceful)
+        );
+        let status = reaper.join().expect("reaper").expect("wait");
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(status.signal(), Some(libc::SIGTERM));
     }
 
     #[test]
