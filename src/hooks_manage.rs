@@ -848,9 +848,13 @@ pub fn install_with(resolve: impl FnOnce() -> Result<String, String>) -> Result<
         println!("Already installed (skipped): {}", skipped.join(", "));
     }
     if !coexisting.is_empty() {
-        let plural = if coexisting.len() == 1 { "" } else { "s" };
+        let (plural, verb) = if coexisting.len() == 1 {
+            ("", "has")
+        } else {
+            ("s", "have")
+        };
         println!(
-            "Note: {} other dot-agent-deck install{plural} still have hook rules here:",
+            "Note: {} other dot-agent-deck install{plural} still {verb} hook rules here:",
             coexisting.len()
         );
         for other in &coexisting {
