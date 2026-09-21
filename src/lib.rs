@@ -27,6 +27,9 @@ pub mod features;
 // PRD #1105 M11: when the TUI claims focus on its daemon (terminal focus-in and
 // throttled input).
 pub mod focus_report;
+// Issue #1181: the ambient git location environment, and the one place this
+// crate switches it off. Every `git` the crate spawns is built here.
+pub(crate) mod git_env;
 pub mod hook;
 pub mod hook_provenance;
 pub mod hooks_manage;
