@@ -78,7 +78,7 @@ cron = "0.17.0"
 # what a security-relevant use of it requires. Deliberately `getrandom` and not
 # `rand`: the whole requirement is "N bytes from the operating system", and a
 # userspace PRNG adds seeding and generator surface for nothing.
-getrandom = "0.3"
+getrandom = "0.4"
 
 # Issue #250: `build.rs` validates an injected `DAD_VERSION` with the EXACT
 # parser `src/version.rs` uses (`semver::Version::parse`), so the set of
