@@ -2,7 +2,8 @@ import { describe, expect, it } from "vitest";
 import { createFixtureSnapshot } from "../data/fixture";
 import { sendResultReason } from "../types";
 import type { AgentSession, SendResult } from "../types";
-import { agentStatusInputReason, terminalInputState } from "./terminalInput";
+import { agentStatusInputReason, terminalInputState, unreachableDeckTerminalState } from "./terminalInput";
+import { displayActivity } from "./displayText";
 
 /** A real fixture agent with only the two fields this derivation reads moved. */
 function pane(writeLease: AgentSession["writeLease"], status: AgentSession["status"] = "running"): AgentSession {
@@ -122,5 +123,79 @@ describe("terminalInputState", () => {
    */
   it.each(["running", "waiting", "failed"] satisfies AgentSession["status"][])("leaves a %s agent's input open", (status) => {
     expect(terminalInputState(pane("write", status))).toMatchObject({ readOnly: false });
+  });
+});
+
+/**
+ * PRD #1105's no-terminal sentence, and issue #1143's staleness clause on the
+ * end of it.
+ *
+ * # Why the clause is asserted here rather than only through the pane
+ *
+ * `AgentPaneNoTerminal.test.tsx` drives the real pane and proves a real instant
+ * reaches this function — it reads the ISO hover off the DOM — but it cannot
+ * pin the WORDING to an exact age without freezing the clock around a render,
+ * which is a second thing to keep true for no gain. The age is injected here
+ * instead, so the sentence is asserted verbatim at three ages and once with no
+ * held record at all.
+ */
+describe("unreachableDeckTerminalState", () => {
+  const DECK = "dev@build-box";
+
+  /**
+   * Scenario: the pane's deck has no live link and nothing is being held for
+   * it — the app has never had a record for this agent. The sentence names the
+   * deck, repeats that deck's own account of the failure, and says what would
+   * change it. It claims nothing about a record, because there is none.
+   */
+  it("names the deck and repeats its own failure, with no staleness clause", () => {
+    const state = unreachableDeckTerminalState(DECK, "No deck is listening on the configured socket.");
+
+    expect(state.reason).toBe("unreachable-deck");
+    expect(state.notice).toBe(
+      "No terminal here: the desktop has no live connection to dev@build-box, so there is nothing to attach to. " +
+        "No deck is listening on the configured socket. The terminal appears on its own once that deck answers again.",
+    );
+    // No age to date, so no hover either: a `title` with nothing behind it is a
+    // hover that opens on an empty tooltip.
+    expect(state.noticeTitle).toBeUndefined();
+    expect(state.notice).not.toMatch(/last reported/);
+  });
+
+  /**
+   * Scenario: the deck reported nothing at all about why it is not answering.
+   * The sentence drops the detail rather than leaving a dangling gap, and the
+   * rest is unchanged.
+   */
+  it("drops the deck's detail when it gave none", () => {
+    expect(unreachableDeckTerminalState(DECK).notice).toBe(
+      "No terminal here: the desktop has no live connection to dev@build-box, so there is nothing to attach to. " +
+        "The terminal appears on its own once that deck answers again.",
+    );
+  });
+
+  /**
+   * Scenario: the pane is rendering a record the deck gave at three different
+   * distances in the past. Each reads as a past report in the app's own
+   * relative vocabulary — the same buckets the overview's last-activity column
+   * uses, rather than a second set — and carries the exact instant for the
+   * hover.
+   *
+   * `just now` is in the table on purpose: it is the reading a deck that has
+   * only this second stopped answering produces, and the sentence has to parse
+   * for it as well as for `2h ago`.
+   */
+  it.each([
+    [0, "just now"],
+    [4 * 60_000, "4m ago"],
+    [2 * 60 * 60_000, "2h ago"],
+  ])("dates a held record reported %dms ago as %s", (elapsed, label) => {
+    const now = 1_700_000_000_000;
+    const state = unreachableDeckTerminalState(DECK, "Deck stopped answering.", displayActivity(now - elapsed, now));
+
+    expect(state.notice).toContain(
+      `The rest of this pane is what dev@build-box last reported ${label}, and nothing in it is being updated.`,
+    );
+    expect(state.noticeTitle).toBe(new Date(now - elapsed).toISOString());
   });
 });

@@ -53,17 +53,15 @@ Delegation signals travel through the daemon: no messages are lost if you detach
 
 ## Quick setup
 
-<img src="./img/orchestration-generate-dialog.png" align="right" width="420" style={{marginLeft: '1.5rem', marginBottom: '1rem'}} alt="The Generate .dot-agent-deck.toml dialog with Yes / No / Never options" />
-
 The fastest way to get an orchestration config is to let an agent generate it from your project.
+
+![The Generate .dot-agent-deck.toml dialog with Yes / No / Never options](./img/orchestration-generate-dialog.png)
 
 1. Launch `dot-agent-deck` and open a pane on your project directory.
 2. Press `Ctrl+d` to enter command mode, then press `g` on the agent's dashboard card.
 3. Choose **Yes** in the prompt. The deck sends a structured prompt asking the agent to analyze your project, pick roles from the [built-in role library](#role-library), wire up the commands it finds (devbox scripts, Makefile targets, bare `claude`/`opencode`/`pi`/`codex`/`devin`, etc.), and propose the config.
 4. Review the proposal. The agent will list each role and explain why it chose it.
 5. Tell the agent what to drop or change — or confirm as-is — and it writes `.dot-agent-deck.toml` to your project root.
-
-<div style={{clear: 'both'}}></div>
 
 The generated file includes both `[[modes]]` and `[[orchestrations]]`. You can remove either section if you only need one.
 
