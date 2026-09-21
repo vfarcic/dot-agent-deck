@@ -229,18 +229,45 @@ jobs:
             exit 1
           fi
           echo "flake.nix pins '$FLAKE_VERSION', which matches the release, and hands it to the build as DAD_VERSION."
+      # The assembled notes travel to `finalize` as an ARTIFACT, not as a job
+      # output, and the reason is a hard kernel limit rather than a preference.
+      #
+      # A job output reaches its consumer through `${{ }}` interpolation, and
+      # `finalize` fed it to `body:`, which GitHub Actions turns into a single
+      # environment variable. Linux caps one argument-or-environment string at
+      # MAX_ARG_STRLEN -- 32 pages, 131072 bytes -- which is NOT the 2MB ARG_MAX
+      # that comes to mind first. v0.41.1's notes were 131,970 bytes, 900 over,
+      # and the step failed with `Argument list too long` BEFORE the action ran:
+      # tag pushed, changelog committed to `main`, all six build legs green, and
+      # no GitHub Release at all. Binary-searched on this runner class, the
+      # largest env var that will start a process is 131,069 bytes.
+      #
+      # Moving it to a `run:` step's own `env:` would have failed identically --
+      # it is the same environment. A file is the only thing that does not go
+      # through argv or the environment, and `finalize` reads it with
+      # `body_path`. The `changelog` job output is kept, but nothing consumes
+      # it any more: it costs nothing, sits well under the 1MB job-output cap,
+      # and stays visible in the run for debugging. What must not come back is
+      # a consumer that interpolates it into `env:` or `with:`.
       - name: Assemble changelog
         id: changelog
         env:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
           chmod +x scripts/assemble-changelog.sh
-          CHANGELOG=$(scripts/assemble-changelog.sh "$VERSION")
+          scripts/assemble-changelog.sh "$VERSION" > "${RUNNER_TEMP}/release-body.md"
           {
             echo "changelog<<CHANGELOG_EOF"
-            echo "$CHANGELOG"
+            cat "${RUNNER_TEMP}/release-body.md"
             echo "CHANGELOG_EOF"
           } >> "$GITHUB_OUTPUT"
+          echo "release body: $(wc -c < "${RUNNER_TEMP}/release-body.md") bytes"
+      - name: Upload the release body
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: release-body
+          path: ${{ runner.temp }}/release-body.md
+          retention-days: 1
       - name: Commit changelog updates
         env:
           VERSION: ${{ steps.version.outputs.version }}
@@ -482,12 +509,17 @@ jobs:
             echo "name=dot-agent-deck" >> "$GITHUB_OUTPUT"
             echo "prerelease=false" >> "$GITHUB_OUTPUT"
           fi
+      - name: Download the release body
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: release-body
+          path: ${{ runner.temp }}/release-body
       - name: Create GitHub Release
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
         with:
           tag_name: v${{ needs.prepare.outputs.version }}
           name: v${{ needs.prepare.outputs.version }}
-          body: ${{ needs.prepare.outputs.changelog }}
+          body_path: ${{ runner.temp }}/release-body/release-body.md
           prerelease: ${{ steps.channel.outputs.prerelease }}
           files: |
             dist/dot-agent-deck-*
