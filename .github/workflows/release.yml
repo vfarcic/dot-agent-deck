@@ -327,6 +327,18 @@ jobs:
           cut = src.rfind("\n- **", 0, budget)
           if cut == -1:
               cut = src.rfind("\n", 0, budget)
+          # `rfind` returns -1 when it finds nothing, and `src[:-1]` is not a
+          # clamp -- it drops ONE character and reports success. A 131,299-char
+          # body comes back 131,311 (the pointer is longer than the character
+          # removed), GitHub truncates it silently, and the clamp has caused
+          # precisely the failure it exists to prevent while printing a
+          # reassuring line. Needs a body with no newline at all in the first
+          # ~122,000 characters, which `assemble-changelog.sh` does not produce
+          # -- but the whole point of this step is that the cap is reached by
+          # bodies nobody predicted, and a guard that fails silently is worse
+          # than none. Cut on the character budget instead.
+          if cut <= 0:
+              cut = budget
           out = src[:cut].rstrip() + pointer
           open(p, "w", encoding="utf-8").write(out)
           print(f"release body: {len(src)} chars -> {len(out)} after clamping to the 125,000 cap")

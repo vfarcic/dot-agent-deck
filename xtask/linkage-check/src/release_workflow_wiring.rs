@@ -1018,3 +1018,38 @@ fn a_sparse_body_is_cut_at_the_early_boundary_not_at_a_line() {
     );
     assert!(opened > 0, "the clamp kept no entries at all");
 }
+
+/// A body with no newline at all still gets clamped, rather than losing one
+/// character and being published over the cap.
+///
+/// `rfind` returns -1 on no match, and `src[:-1]` is not a clamp: it drops a
+/// single character and reports success. Measured on the unguarded version, a
+/// 131,299-character body came back **131,311** -- longer than it started,
+/// because the appended pointer outweighs the removed character -- whereupon
+/// GitHub truncates it silently and the clamp has caused the exact failure it
+/// exists to prevent, having printed a reassuring line on the way.
+///
+/// `assemble-changelog.sh` does not produce such a body. That is not the
+/// point: this whole step exists because the cap was reached by a release
+/// nobody predicted, and a guard whose own failure mode is silent is worse
+/// than no guard.
+#[test]
+fn a_body_with_no_line_breaks_is_still_clamped() {
+    let (limit, reserve) = clamp_limits();
+    let body = "x".repeat(limit + 6_000);
+    let Some(out) = run_clamp(&body) else {
+        eprintln!("SKIP: the release-body clamp test needs `python3` on PATH");
+        return;
+    };
+    assert!(
+        out.chars().count() <= limit - reserve,
+        "a body with no newline came back {} chars, over the {} budget -- the \
+         `rfind` miss fell through to a negative index instead of clamping",
+        out.chars().count(),
+        limit - reserve
+    );
+    assert!(
+        out.chars().count() < body.chars().count(),
+        "the clamp returned a body no shorter than it received"
+    );
+}
