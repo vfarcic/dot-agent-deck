@@ -706,3 +706,292 @@ fn gh_calls_in_checkoutless_jobs_name_their_repository() {
          it feeds has become a no-op that passes on nothing."
     );
 }
+
+// ---------------------------------------------------------------------------
+// Issue #1219: the release body is clamped to GitHub's 125,000-character cap.
+// ---------------------------------------------------------------------------
+//
+// v0.41.1 shipped 131,299 characters of notes. GitHub silently truncated the
+// body to exactly 125,000, ending mid-sentence, and then rejected
+// `desktop-publish`'s append with `HTTP 422: body is too long` -- so the .dmg
+// and .deb went out with no Gatekeeper instructions and no provenance command.
+// `prepare` now clamps the body itself, on an entry boundary, reserving room
+// for the note that job appends afterwards.
+//
+// Nothing else covers this. `release.yml` fires only on a tag, so the clamp
+// runs in no PR and its first execution is a real release -- the same argument
+// this module's header makes for the wiring assertions, and the reason
+// Greptile asked for coverage on PR #1221. These tests close that by lifting
+// the heredoc out of the workflow and running it, which is exactly what
+// `junit_strip` does with `scripts/junit-strip-output.py` (CLAUDE.md rule 5
+// names it as an accepted exception, on the same ground: the safety property
+// is a runtime assertion and nothing else).
+
+/// The Python source inside `prepare`'s `<<'CLAMP'` heredoc, dedented so it
+/// can be fed to an interpreter.
+///
+/// Extracted rather than duplicated. A copy of the script in this file would
+/// pass forever while the workflow's own copy rotted, which is the failure
+/// mode a linkage check exists to prevent.
+fn clamp_script() -> String {
+    let text = workflow();
+    let mut lines = text.lines().skip_while(|l| !l.contains("<<'CLAMP'"));
+    assert!(
+        lines.next().is_some(),
+        "`prepare` no longer contains a `<<'CLAMP'` heredoc. If the clamp moved \
+         or was replaced, move these tests with it -- do not delete them: the \
+         125,000-character cap is still there and still silent."
+    );
+    let body: Vec<&str> = lines.take_while(|l| l.trim() != "CLAMP").collect();
+    assert!(!body.is_empty(), "the CLAMP heredoc is empty");
+    let indent = body
+        .iter()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| l.len() - l.trim_start().len())
+        .min()
+        .expect("the heredoc has at least one non-blank line");
+    body.iter()
+        .map(|l| if l.len() >= indent { &l[indent..] } else { "" })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Run the extracted clamp over `body`, returning what it left on disk.
+///
+/// `None` means `python3` is absent and the caller should print `SKIP:` and
+/// return, matching `junit_strip`.
+fn run_clamp(body: &str) -> Option<String> {
+    use std::process::Command;
+    Command::new("python3").arg("--version").output().ok()?;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("release-body.md");
+    fs::write(&path, body).expect("write body");
+    let script = dir.path().join("clamp.py");
+    fs::write(&script, clamp_script()).expect("write script");
+    let out = Command::new("python3")
+        .arg(&script)
+        .arg(&path)
+        .output()
+        .expect("run the clamp");
+    assert!(
+        out.status.success(),
+        "the clamp exited {}: {}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    Some(fs::read_to_string(&path).expect("read back"))
+}
+
+/// The two constants the clamp is parameterised by, read from its own source
+/// so a test can never assert against a number the workflow has since changed.
+fn clamp_limits() -> (usize, usize) {
+    let script = clamp_script();
+    let line = script
+        .lines()
+        .find(|l| l.starts_with("LIMIT, RESERVE ="))
+        .expect("the clamp declares `LIMIT, RESERVE = ...`");
+    let mut nums = line
+        .split('=')
+        .nth(1)
+        .expect("an assignment")
+        .split(',')
+        .map(|n| n.trim().parse::<usize>().expect("an integer"));
+    (nums.next().unwrap(), nums.next().unwrap())
+}
+
+/// A body of `entries` changelog entries, each spanning several physical
+/// lines, in the shape `assemble-changelog.sh` actually produces.
+///
+/// The multi-line entry is the whole point: a clamp that cut on `\n` would
+/// land *inside* one of these and publish half of it, which is the defect
+/// [`an_oversized_body_is_cut_between_entries_never_inside_one`] exists to
+/// catch. CLAUDE.md rule 10 means real entries are long unwrapped single
+/// lines with continuations, so this mirrors that rather than a wrapped
+/// paragraph.
+fn synthetic_body(entries: usize) -> String {
+    let mut s = String::from("## What's changed\n\n");
+    for i in 0..entries {
+        s.push_str(&format!(
+            "- **entry-{i:04}-open** {}\n  continuation one for entry {i:04}\n  \
+             continuation two for entry {i:04} entry-{i:04}-close\n",
+            "padding ".repeat(60)
+        ));
+    }
+    s
+}
+
+/// A body whose entry boundaries are SPARSE: three ordinary entries, then one
+/// enormous entry whose continuation lines run past the budget on their own.
+///
+/// This is the shape that exposes the bug, and a dense fixture does not --
+/// found by mutation-testing this very file. With entries packed every few
+/// hundred characters, `rfind("\n- **")` always lands close to the budget, so
+/// the sparse branch is never taken and a test built on that fixture passes
+/// against the broken clamp as happily as against the fixed one. Here the last
+/// boundary sits a few hundred characters into a ~130,000-character body, which
+/// is precisely when the old code abandoned it for `rfind("\n")` and cut
+/// through the middle of the giant entry.
+///
+/// Not a contrived shape, either: one release note carrying a long rationale --
+/// which CLAUDE.md rule 10 writes as a single unwrapped line -- produces it.
+fn synthetic_sparse_body(limit: usize) -> String {
+    let mut s = String::from("## What's changed\n\n");
+    for i in 0..3 {
+        s.push_str(&format!(
+            "- **entry-{i:04}-open** short one\n  continuation entry-{i:04}-close\n"
+        ));
+    }
+    s.push_str("- **entry-9999-open** the entry that dwarfs the budget\n");
+    while s.chars().count() < limit + 5_000 {
+        s.push_str("  a continuation line inside the giant entry, nowhere near its end\n");
+    }
+    s.push_str("  entry-9999-close\n");
+    s
+}
+
+/// Every `- **` entry the clamp keeps must be kept WHOLE.
+///
+/// This is the finding Greptile raised on PR #1221, and it was real: the first
+/// implementation dropped to `rfind("\n")` whenever the last entry boundary
+/// fell in the first half of the budget, on the theory that an early boundary
+/// wasted room. An entry spans several lines, so that cut landed inside one --
+/// reintroducing the mid-sentence truncation the clamp was written to prevent,
+/// committed by us rather than by GitHub.
+///
+/// The assertion is over the *pairing*: an entry contributes an `-open` marker
+/// and, three lines later, a `-close` one. Counting them separately is what
+/// makes a split detectable at all -- a length check passes just as happily on
+/// a body cut through the middle of an entry.
+#[test]
+fn an_oversized_body_is_cut_between_entries_never_inside_one() {
+    let (limit, reserve) = clamp_limits();
+    // Sized so the cut lands mid-entry unless the clamp seeks a boundary.
+    let body = synthetic_body(400);
+    assert!(
+        body.chars().count() > limit,
+        "the fixture must exceed the cap to exercise the clamp"
+    );
+    let Some(out) = run_clamp(&body) else {
+        eprintln!("SKIP: the release-body clamp test needs `python3` on PATH");
+        return;
+    };
+
+    assert!(
+        out.chars().count() <= limit - reserve,
+        "clamped body is {} chars, over the {} budget",
+        out.chars().count(),
+        limit - reserve
+    );
+    let opened = out.matches("-open**").count();
+    let closed = out.matches("-close").count();
+    assert_eq!(
+        opened, closed,
+        "the clamp cut INSIDE an entry: {opened} entries start in the output \
+         but {closed} finish. The cut must land on a `\\n- **` boundary, so \
+         that every entry published is published whole."
+    );
+    assert!(opened > 0, "the clamp kept no entries at all");
+    assert!(
+        out.contains("CHANGELOG.md"),
+        "a truncated body must point at the full text"
+    );
+}
+
+/// A body that already fits is left byte-identical.
+///
+/// The clamp runs on every release, almost all of which are far under the cap,
+/// so the common path is the one where it must do nothing -- no pointer
+/// appended, no trailing whitespace stripped, no entry dropped.
+#[test]
+fn a_body_under_the_cap_is_left_exactly_as_it_was() {
+    let body = synthetic_body(3);
+    let Some(out) = run_clamp(&body) else {
+        eprintln!("SKIP: the release-body clamp test needs `python3` on PATH");
+        return;
+    };
+    assert_eq!(
+        out, body,
+        "the clamp modified a body that was already under the cap"
+    );
+}
+
+/// `RESERVE` must cover the note `desktop-publish` appends after the release
+/// exists.
+///
+/// This is the half of v0.41.1 that actually cost users something: the body
+/// was already at the cap, so the append was rejected with `HTTP 422` and the
+/// desktop bundles shipped with no install instructions and no
+/// `gh attestation verify` command. Clamping to the cap alone would not have
+/// prevented that -- only clamping to the cap *minus room for this note* does.
+///
+/// The two live in different jobs with nothing between them, which is exactly
+/// the shape this module exists to guard: the note is prose and will be edited
+/// again, and there is no reason its author would think to look at a Python
+/// constant in `prepare`.
+///
+/// Measured over the raw `printf` arguments, which OVERSTATES the rendered
+/// length (`\n` is two characters here and one on the wire, `\`` is two and
+/// one), so the check errs toward demanding more headroom than is strictly
+/// needed. It is a floor, not an equality.
+#[test]
+fn the_reserve_covers_the_note_desktop_publish_appends() {
+    let all = jobs(&workflow());
+    let note = note_step(job(&all, "desktop-publish"));
+    let printed: usize = note
+        .lines()
+        .map(str::trim)
+        .filter(|l| l.starts_with("printf"))
+        .map(str::len)
+        .sum();
+    assert!(
+        printed > 0,
+        "found no `printf` lines in the alpha-note step"
+    );
+
+    let (_, reserve) = clamp_limits();
+    assert!(
+        reserve >= printed,
+        "`desktop-publish`'s alpha note is ~{printed} characters but `prepare` \
+         reserves only {reserve} for it. A clamped release body would be \
+         accepted and the note that follows it rejected with `HTTP 422: body \
+         is too long` -- the v0.41.1 failure exactly. Raise RESERVE in the \
+         CLAMP heredoc in `.github/workflows/release.yml`."
+    );
+}
+
+/// The sparse case, which is the one Greptile actually reported.
+///
+/// When no entry boundary falls in the latter part of the budget, the clamp
+/// must still cut at the boundary it *did* find, however early -- keeping less
+/// rather than publishing a fragment. The old code preferred a whole physical
+/// line here, which is not a unit of anything: entries span several lines, so
+/// that cut landed inside one.
+///
+/// [`an_oversized_body_is_cut_between_entries_never_inside_one`] does NOT
+/// cover this. Its fixture is dense, so the branch below is never reached and
+/// the broken clamp passes it. Keep both.
+#[test]
+fn a_sparse_body_is_cut_at_the_early_boundary_not_at_a_line() {
+    let (limit, _) = clamp_limits();
+    let body = synthetic_sparse_body(limit);
+    let Some(out) = run_clamp(&body) else {
+        eprintln!("SKIP: the release-body clamp test needs `python3` on PATH");
+        return;
+    };
+
+    let opened = out.matches("-open**").count();
+    let closed = out.matches("-close").count();
+    assert_eq!(
+        opened, closed,
+        "the clamp cut INSIDE an entry when boundaries were sparse: {opened} \
+         entries start in the output but {closed} finish. Cutting at the last \
+         `\\n- **` however early it falls keeps less text; cutting at an \
+         arbitrary `\\n` publishes half an entry. Keep less."
+    );
+    assert!(
+        !out.contains("entry-9999-open"),
+        "the giant entry was opened but cannot be finished -- it must be \
+         dropped whole, not truncated"
+    );
+    assert!(opened > 0, "the clamp kept no entries at all");
+}

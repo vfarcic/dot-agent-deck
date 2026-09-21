@@ -315,8 +315,17 @@ jobs:
                      "limit on a release body. The complete entry is in "
                      "[CHANGELOG.md](https://github.com/vfarcic/dot-agent-deck/blob/main/CHANGELOG.md).*\n")
           budget = LIMIT - RESERVE - len(pointer)
+          # ALWAYS an entry boundary when one exists, however early it falls.
+          # This used to drop to `rfind("\n")` when the last `- **` sat in the
+          # first half of the budget, on the theory that an early boundary
+          # wastes room. That was wrong: an entry spans several physical lines,
+          # so a line cut lands INSIDE one and publishes half an entry -- the
+          # exact mid-sentence truncation this clamp exists to prevent, just
+          # committed by us instead of by GitHub. Keeping less is the cheaper
+          # error. The line fallback survives only for a body with no entry
+          # markers at all, where there is nothing better to cut on.
           cut = src.rfind("\n- **", 0, budget)
-          if cut < budget // 2:            # sparse entries: fall back to a whole line
+          if cut == -1:
               cut = src.rfind("\n", 0, budget)
           out = src[:cut].rstrip() + pointer
           open(p, "w", encoding="utf-8").write(out)
