@@ -169,16 +169,19 @@ fn path_with_binary_dir() -> String {
 /// dispatch in such a repo fails on worktree creation, so without this the
 /// dispatch path is unreachable no matter what the agent does.
 fn commit_fixture_repo(dir: &Path) {
+    // Through `common::fixture_git`, which clears the ambient git LOCATION
+    // variables — a bare `git commit` with only `.current_dir` commits into
+    // whatever an ambient `GIT_DIR` names (issue #834) — and supplies the
+    // identity by environment. `dir` is both the fixture repo and its own
+    // sandbox root: it is the harness tempdir, and nothing above it is this
+    // test's. The two `git config` writes this used to make are gone with it.
     let run = |args: &[&str]| {
-        let out = std::process::Command::new("git")
+        let out = common::fixture_git(dir, dir)
             .args(args)
-            .current_dir(dir)
             .output()
             .expect("git available");
         assert!(out.status.success(), "git {args:?} failed: {out:?}");
     };
-    run(&["config", "user.email", "deck-test@example.com"]);
-    run(&["config", "user.name", "Deck Test"]);
     run(&["add", "-A"]);
     run(&["commit", "-qm", "fixture baseline"]);
 }
@@ -2151,8 +2154,8 @@ fn dispatch_close_002_a_kept_dirty_worktree_is_announced_before_and_after_the_cl
 /// `git status --porcelain` in `dir`, as the test's own independent reading of
 /// what the deck is about to decide from.
 fn porcelain(dir: &Path) -> String {
-    let out = std::process::Command::new("git")
-        .args(["-C", &dir.to_string_lossy(), "status", "--porcelain"])
+    let out = common::fixture_git(dir, dir)
+        .args(["status", "--porcelain"])
         .output()
         .expect("git available");
     String::from_utf8_lossy(&out.stdout).trim().to_string()

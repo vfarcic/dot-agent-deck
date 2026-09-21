@@ -406,6 +406,16 @@ pub struct Daemon {
     /// between the scheduler callback factory and the attach server; wiped on
     /// restart (the worktree-exists idempotency signal reclaims entries).
     pub worktree_registry: crate::issue_dispatch_run::WorktreeRegistry,
+    /// Issue #1211: the pre-#1121 hook spelling to ALSO bind, best-effort,
+    /// beside the primary hook endpoint — see
+    /// [`crate::endpoint_resolve::legacy_hook_alias`]. `None` (every
+    /// constructor's default, and every test's) binds nothing extra; only
+    /// `daemon serve` sets it, through [`Self::with_legacy_aliases`].
+    pub legacy_socket_path: Option<PathBuf>,
+    /// Issue #1211: [`Self::legacy_socket_path`]'s sibling for the attach
+    /// endpoint. Ignored when [`Self::attach_socket_path`] is `None` — a daemon
+    /// that serves no attach protocol has nothing to alias.
+    pub legacy_attach_socket_path: Option<PathBuf>,
 }
 
 impl Daemon {
@@ -428,6 +438,8 @@ impl Daemon {
             scheduler: Arc::new(Scheduler::with_stderr_notifier()),
             reuse_registry: crate::spawn::new_reuse_registry(),
             worktree_registry: crate::issue_dispatch_run::new_worktree_registry(),
+            legacy_socket_path: None,
+            legacy_attach_socket_path: None,
         }
     }
 
@@ -453,6 +465,8 @@ impl Daemon {
             scheduler: Arc::new(Scheduler::with_stderr_notifier()),
             reuse_registry: crate::spawn::new_reuse_registry(),
             worktree_registry: crate::issue_dispatch_run::new_worktree_registry(),
+            legacy_socket_path: None,
+            legacy_attach_socket_path: None,
         }
     }
 
@@ -475,6 +489,165 @@ impl Daemon {
         self.lock_dir_override = dir;
         self
     }
+
+    /// Issue #1211: ALSO bind these pre-#1121 spellings, best-effort, beside
+    /// the primary endpoints — `hook` beside the hook socket, `attach` beside
+    /// the attach socket. `daemon serve` passes
+    /// [`crate::endpoint_resolve::legacy_hook_alias`] /
+    /// [`crate::endpoint_resolve::legacy_attach_alias`]; a test passes paths
+    /// under its own tempdir. A failure to bind either is a warning, never a
+    /// daemon-start failure — see [`run_daemon_with`].
+    pub fn with_legacy_aliases(mut self, hook: Option<PathBuf>, attach: Option<PathBuf>) -> Self {
+        self.legacy_socket_path = hook;
+        self.legacy_attach_socket_path = attach;
+        self
+    }
+}
+
+/// How long the legacy-alias bind waits for the per-socket start lock before
+/// giving the alias up. The lock is held by a starting daemon only across its
+/// own probe → unlink → bind, so a wait longer than this means something is
+/// wrong with the holder — and the alias is not worth delaying the daemon's
+/// primary attach endpoint for.
+const LEGACY_ALIAS_LOCK_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// The legacy aliases a daemon ended up holding: the listeners to serve and the
+/// guards that unlink each alias again when dropped.
+#[derive(Default)]
+struct LegacyListeners {
+    hook: Option<IpcListener>,
+    attach: Option<IpcListener>,
+    aliases: Vec<crate::endpoint_resolve::LegacyAlias>,
+}
+
+/// Issue #1211: bind the pre-#1121 spellings beside this daemon's primary
+/// endpoints, so a client from before #1121 — which looks nowhere else — finds
+/// this daemon, runs the build-version handshake over the connection, and gets
+/// the mismatch prompt instead of silently lazy-spawning a second daemon that
+/// then restores the saved orchestration a second time.
+///
+/// **Best-effort by construction: this function cannot fail.** Every problem is
+/// logged and costs only the alias, because the primary endpoint is already
+/// bound and is what this build's own clients use. That is the property that
+/// keeps the alias from reopening #1121's wedge — a foreign entry squatting the
+/// old spelling now denies discovery to obsolete clients and nothing more. See
+/// [`crate::endpoint_resolve`]'s module docs.
+///
+/// The two paths are treated as one daemon's **pair**: if another daemon
+/// already answers at either, neither is bound, so an older build's still-live
+/// daemon keeps both of its addresses and old clients are not split between two
+/// daemons.
+///
+/// Serialised on the per-socket `flock` a starting daemon takes for its hook
+/// path, keyed on the old hook spelling — which is the path a pre-#1121 daemon
+/// on the fallback arm locks. [`lock_path_for`] and [`lock_root`] are
+/// byte-identical in v0.41.0, so a v0.41.0 daemon starting at the same moment
+/// cannot interleave its own probe → unlink → bind with this one. That is
+/// checked for v0.41.0 only, and it also rests on the two builds'
+/// `DefaultHasher` agreeing on the lock file's name. Where either does not
+/// hold the two do not serialise, and two starts in the same instant can race
+/// for the old spelling exactly as two pre-#1121 daemons always could.
+async fn bind_legacy_aliases(
+    hook: Option<PathBuf>,
+    attach: Option<PathBuf>,
+    lock_override: Option<&Path>,
+) -> LegacyListeners {
+    let wanted: Vec<(&'static str, PathBuf)> = [("hook", hook), ("attach", attach)]
+        .into_iter()
+        .filter_map(|(kind, path)| path.map(|path| (kind, path)))
+        .collect();
+    let Some((_, lock_key)) = wanted.first() else {
+        return LegacyListeners::default();
+    };
+
+    let lock_path = lock_path_for(lock_key, lock_override);
+    let _lock = match tokio::time::timeout(
+        LEGACY_ALIAS_LOCK_TIMEOUT,
+        crate::platform::lock::acquire_spawn_lock(&lock_path),
+    )
+    .await
+    {
+        Ok(Ok(lock)) => lock,
+        Ok(Err(source)) => {
+            warn!(
+                "not binding the pre-#1121 endpoint aliases: could not take their start lock {}: \
+                 {source}. Clients from before #1121 will not find this daemon; newer clients are \
+                 unaffected.",
+                lock_path.display()
+            );
+            return LegacyListeners::default();
+        }
+        Err(_elapsed) => {
+            warn!(
+                "not binding the pre-#1121 endpoint aliases: their start lock {} was still held \
+                 after {LEGACY_ALIAS_LOCK_TIMEOUT:?}. Clients from before #1121 will not find this \
+                 daemon; newer clients are unaffected.",
+                lock_path.display()
+            );
+            return LegacyListeners::default();
+        }
+    };
+
+    // Pass 1: clear each path, before binding either, so an occupied one can
+    // veto the pair.
+    let mut ready = Vec::new();
+    for (kind, path) in wanted {
+        let probe_path = path.clone();
+        let prepared = tokio::task::spawn_blocking(move || {
+            crate::endpoint_resolve::prepare_legacy_alias(&probe_path)
+        })
+        .await
+        .unwrap_or_else(|join| {
+            Err(crate::endpoint_resolve::LegacyAliasSkip::Io(
+                io::Error::other(join),
+            ))
+        });
+        match prepared {
+            Ok(()) => ready.push((kind, path)),
+            Err(crate::endpoint_resolve::LegacyAliasSkip::Occupied) => {
+                warn!(
+                    "not binding the pre-#1121 endpoint aliases: another daemon already answers \
+                     at {} and keeps both of its addresses",
+                    path.display()
+                );
+                return LegacyListeners::default();
+            }
+            Err(skip) => warn!(
+                "not binding the pre-#1121 {kind} endpoint alias at {}: {skip}. Clients from \
+                 before #1121 will not find this daemon there; newer clients are unaffected.",
+                path.display()
+            ),
+        }
+    }
+
+    // Pass 2: bind what was cleared.
+    let mut bound = LegacyListeners::default();
+    for (kind, path) in ready {
+        match IpcListener::bind(&path) {
+            Ok(listener) => {
+                // Deliberately NOT the primary's "Attach protocol listening"
+                // wording: that line is how operators and the cross-version
+                // harness count daemons, and an alias is not a second daemon.
+                info!(
+                    "Also listening at the pre-#1121 {kind} endpoint {} for older clients",
+                    path.display()
+                );
+                bound
+                    .aliases
+                    .push(crate::endpoint_resolve::LegacyAlias::adopt(path));
+                match kind {
+                    "hook" => bound.hook = Some(listener),
+                    _ => bound.attach = Some(listener),
+                }
+            }
+            Err(source) => warn!(
+                "not binding the pre-#1121 {kind} endpoint alias at {}: {source}. Clients from \
+                 before #1121 will not find this daemon there; newer clients are unaffected.",
+                path.display()
+            ),
+        }
+    }
+    bound
 }
 
 pub async fn run_daemon(socket_path: &Path, state: SharedState) -> Result<(), DaemonError> {
@@ -557,6 +730,11 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
         std::fs::remove_file(socket_path)?;
     }
 
+    // Issue #1121: this is a bind site, so it is one of the places that owns
+    // creating the fallback endpoint directory. A no-op for every other
+    // endpoint — an override, an `$XDG_RUNTIME_DIR` path, a test's tempdir
+    // socket, a Windows named pipe — see `ensure_endpoint_dir`.
+    crate::endpoint_resolve::ensure_endpoint_dir(socket_path)?;
     // PRD #42 M2: `IpcListener::bind` performs the umask-before-bind dance and
     // the defense-in-depth 0o600 restate (both folded in from the former
     // `bind_socket` + post-bind `set_permissions`), so the socket inode is
@@ -569,6 +747,28 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
     // next start).
     drop(_start_lock);
     info!("Daemon listening on {}", socket_path.display());
+
+    // Issue #1211: the pre-#1121 spellings, bound best-effort beside the
+    // primary — after the primary hook endpoint, so a failure here can never
+    // cost the deck its own endpoint, and before the primary attach endpoint,
+    // so a client that lazy-spawned this daemon and is polling for that attach
+    // socket sees the daemon whole when it appears. Served further down, once
+    // the primary attach server is up; `legacy` is dropped at the very end,
+    // which is what unlinks each alias (early returns included).
+    let legacy = bind_legacy_aliases(
+        daemon.legacy_socket_path.clone(),
+        daemon
+            .legacy_attach_socket_path
+            .clone()
+            .filter(|_| daemon.attach_socket_path.is_some()),
+        daemon.lock_dir_override.as_deref(),
+    )
+    .await;
+    let LegacyListeners {
+        hook: legacy_hook_listener,
+        attach: legacy_attach_listener,
+        aliases: legacy_aliases,
+    } = legacy;
 
     // Hold the registry for the lifetime of the loop so its Drop fires
     // (killing any owned agents) when this future is dropped/aborted.
@@ -724,6 +924,10 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
     // caller (production `main`, or a test) treat it as a daemon-start
     // failure.
     let attach_handle = if let Some(path) = daemon.attach_socket_path {
+        // Issue #1121: the attach endpoint's own bind site. Idempotent with the
+        // hook endpoint's call above — in the fallback case both sockets live
+        // in the same per-uid directory.
+        crate::endpoint_resolve::ensure_endpoint_dir(&path)?;
         let listener = crate::daemon_protocol::bind_attach_listener(&path)?;
         info!("Attach protocol listening on {}", path.display());
         let registry = pty_registry.clone();
@@ -759,6 +963,67 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
     } else {
         None
     };
+
+    // Issue #1211: serve the legacy aliases with exactly the state the primary
+    // endpoints serve, so an older client that found this daemon at the old
+    // spelling reaches the same registry, the same orchestration maps and the
+    // same attached-client count (it keeps the daemon from idling out like any
+    // other attached client).
+    //
+    // The alias hook loop gets a `Notify` of its OWN, never notified, and is
+    // aborted below instead. `shutdown` is signalled with `notify_one`, which
+    // wakes exactly one waiter: a second hook loop waiting on it could take the
+    // signal meant for the primary loop, and the daemon would then never exit.
+    // The attach alias shares `shutdown` safely — the attach server only ever
+    // NOTIFIES it (a `KIND_SHUTDOWN` from an older client's `Stop` must still
+    // stop this daemon), and never waits on it.
+    let legacy_hook_handle = legacy_hook_listener.map(|listener| {
+        let state = state.clone();
+        let event_tx = event_tx.clone();
+        let registry = pty_registry.clone();
+        let worktrees = worktree_registry.clone();
+        tokio::spawn(async move {
+            if let Err(e) = run_hook_loop(
+                listener,
+                state,
+                event_tx,
+                registry,
+                Arc::new(Notify::new()),
+                worktrees,
+            )
+            .await
+            {
+                warn!("pre-#1121 hook endpoint alias stopped serving: {e}");
+            }
+        })
+    });
+    let legacy_attach_handle = legacy_attach_listener.map(|listener| {
+        let registry = pty_registry.clone();
+        let attach_event_tx = event_tx.clone();
+        let attach_counter = client_count.clone();
+        let attach_state = state.clone();
+        let attach_shutdown = shutdown.clone();
+        let attach_scheduler = scheduler.clone();
+        let attach_reuse = reuse_registry.clone();
+        let attach_worktrees = worktree_registry.clone();
+        tokio::spawn(async move {
+            if let Err(e) = crate::daemon_protocol::serve_attach_with_counter(
+                listener,
+                registry,
+                attach_event_tx,
+                attach_counter,
+                attach_state,
+                Some(attach_shutdown),
+                attach_scheduler,
+                attach_reuse,
+                attach_worktrees,
+            )
+            .await
+            {
+                warn!("pre-#1121 attach endpoint alias stopped serving: {e}");
+            }
+        })
+    });
 
     // PRD #93 M1.2 idle monitor — edge-triggered via the registry's
     // `change_notify` so transitions on both sides (attach counter via
@@ -810,6 +1075,17 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
     if let Some(h) = attach_handle {
         h.abort();
     }
+    if let Some(h) = legacy_hook_handle {
+        h.abort();
+    }
+    if let Some(h) = legacy_attach_handle {
+        h.abort();
+    }
+    // Issue #1211: unlink the aliases now rather than leave them for a next
+    // start that may never bind them — see `LegacyAlias`. Explicit so the
+    // ordering is read here, not inferred from where a binding goes out of
+    // scope.
+    drop(legacy_aliases);
     if let Some(h) = idle_handle {
         h.abort();
     }
@@ -5976,5 +6252,196 @@ mod idle_monitor_tests {
              shut down; instead it stayed up for four more windows with no \
              clients, no agents and no pending schedules"
         );
+    }
+}
+
+/// Issue #1211: the daemon's best-effort binds of the pre-#1121 endpoint
+/// spellings, driven through [`bind_legacy_aliases`] against paths under a
+/// tempdir — never the literal `/tmp` spellings a live deck on the host uses.
+///
+/// Deliberately not through [`run_daemon_with`]: that loads the operator's
+/// global `schedules.toml` and installs process signal handlers, neither of
+/// which a lib unit test should do. What `run_daemon_with` adds on top — the
+/// aliases served by the same daemon, and removed at its exit — is covered by
+/// the real binary in `tests/e2e_endpoint_fallback.rs` (`error/socket/009`
+/// and `/010`).
+#[cfg(all(test, unix))]
+mod legacy_alias_tests {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+
+    use super::*;
+
+    struct Paths {
+        _root: tempfile::TempDir,
+        hook: PathBuf,
+        attach: PathBuf,
+        locks: PathBuf,
+    }
+
+    /// A tempdir restated to `0o700` after creation (the umask race every
+    /// socket-binding test in this crate guards against), with a lock root
+    /// inside it, as `run_daemon_with` would have created before this runs.
+    fn paths() -> Paths {
+        let root = tempfile::tempdir().expect("tempdir");
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("chmod the temp root");
+        let locks = root.path().join("locks");
+        crate::platform::fsperm::ensure_owner_only_dir(&locks).expect("lock root");
+        Paths {
+            hook: root.path().join("dot-agent-deck-4242.sock"),
+            attach: root.path().join("dot-agent-deck-attach-4242.sock"),
+            locks,
+            _root: root,
+        }
+    }
+
+    fn is_owner_only_socket(path: &Path) -> bool {
+        std::fs::symlink_metadata(path)
+            .map(|md| md.file_type().is_socket() && md.mode() & 0o777 == 0o600)
+            .unwrap_or(false)
+    }
+
+    /// Both aliases bind as owner-only sockets a client can connect to, and
+    /// both are unlinked when the daemon lets go of them.
+    #[tokio::test]
+    async fn both_aliases_bind_and_are_unlinked_when_released() {
+        let p = paths();
+        let bound =
+            bind_legacy_aliases(Some(p.hook.clone()), Some(p.attach.clone()), Some(&p.locks)).await;
+        assert!(bound.hook.is_some() && bound.attach.is_some());
+        for path in [&p.hook, &p.attach] {
+            assert!(
+                is_owner_only_socket(path),
+                "{} is bound 0o600",
+                path.display()
+            );
+            assert!(
+                crate::endpoint_resolve::endpoint_is_answering(path),
+                "an older client connecting to {} must reach a listener",
+                path.display()
+            );
+        }
+
+        drop(bound);
+        for path in [&p.hook, &p.attach] {
+            assert!(
+                std::fs::symlink_metadata(path).is_err(),
+                "{} must not be left behind for an older client to probe",
+                path.display()
+            );
+        }
+    }
+
+    /// Issue #1211 property 2: a squatted old spelling costs its OWN alias and
+    /// nothing else. The function cannot fail — it returns listeners, not a
+    /// `Result` — so "the daemon still starts" is a type-level fact; what this
+    /// pins at runtime is that the other alias still binds, the squatter is
+    /// left exactly as found, and releasing the aliases does not touch it.
+    ///
+    /// The last shape is an entry owned by ANOTHER uid that nobody can unlink
+    /// or bind over: the root directory, root-owned on every Unix host. It is
+    /// #1121's wedge shape — `bind(2)` there is `EADDRINUSE` and `unlink(2)`
+    /// fails — without needing a second uid in the test, and it has the
+    /// property that a bug that tried either would fail rather than pass.
+    /// (Running as root it is not foreign, but it is still refused, as a
+    /// directory, and still cannot be removed.)
+    #[tokio::test]
+    async fn a_squatted_legacy_path_costs_only_its_own_alias() {
+        let p = paths();
+        let live = p.locks.parent().expect("root").join("live.sock");
+        let _live = std::os::unix::net::UnixListener::bind(&live).expect("bind live");
+        std::fs::set_permissions(&live, std::fs::Permissions::from_mode(0o600)).expect("0o600");
+
+        let file = p.attach.with_extension("file");
+        std::fs::write(&file, b"squatter").expect("plant a file");
+        let link = p.attach.with_extension("link");
+        std::os::unix::fs::symlink(&live, &link).expect("plant a symlink");
+        let directory = p.attach.with_extension("dir");
+        std::fs::create_dir(&directory).expect("plant a directory");
+
+        for squatted in [file, link, directory, PathBuf::from("/")] {
+            let before = std::fs::symlink_metadata(&squatted).expect("lstat the squatter");
+            let bound =
+                bind_legacy_aliases(Some(p.hook.clone()), Some(squatted.clone()), Some(&p.locks))
+                    .await;
+            assert!(
+                bound.attach.is_none(),
+                "{} must not be bound over",
+                squatted.display()
+            );
+            assert!(
+                bound.hook.is_some() && is_owner_only_socket(&p.hook),
+                "the unsquatted alias still binds beside {}",
+                squatted.display()
+            );
+            drop(bound);
+            let after = std::fs::symlink_metadata(&squatted)
+                .unwrap_or_else(|e| panic!("{} was removed: {e}", squatted.display()));
+            assert_eq!(
+                (before.dev(), before.ino(), before.mode()),
+                (after.dev(), after.ino(), after.mode()),
+                "{} must be left exactly as found, through bind and release",
+                squatted.display()
+            );
+            assert!(
+                std::fs::symlink_metadata(&p.hook).is_err(),
+                "the hook alias is still released normally"
+            );
+        }
+    }
+
+    /// Another daemon already answering at either old spelling — an older
+    /// build's, still running — keeps BOTH of its addresses: this daemon binds
+    /// neither, so older clients are never split between two daemons.
+    #[tokio::test]
+    async fn an_answering_daemon_at_either_path_keeps_both() {
+        let p = paths();
+        let _older = std::os::unix::net::UnixListener::bind(&p.attach).expect("older daemon");
+        std::fs::set_permissions(&p.attach, std::fs::Permissions::from_mode(0o600)).expect("0o600");
+
+        let bound =
+            bind_legacy_aliases(Some(p.hook.clone()), Some(p.attach.clone()), Some(&p.locks)).await;
+        assert!(bound.hook.is_none() && bound.attach.is_none());
+        assert!(
+            std::fs::symlink_metadata(&p.hook).is_err(),
+            "the free hook spelling must not be taken either"
+        );
+        assert!(crate::endpoint_resolve::endpoint_is_answering(&p.attach));
+        drop(bound);
+        assert!(
+            crate::endpoint_resolve::endpoint_is_answering(&p.attach),
+            "releasing nothing must not unlink the older daemon's socket"
+        );
+    }
+
+    /// A start lock someone else holds — the older daemon mid-bind, or a
+    /// wedged process — costs the aliases and returns within the bound,
+    /// rather than holding up the daemon's primary attach endpoint.
+    #[tokio::test]
+    async fn a_held_start_lock_costs_the_aliases_not_the_start() {
+        let p = paths();
+        let _held =
+            crate::platform::lock::acquire_spawn_lock(&lock_path_for(&p.hook, Some(&p.locks)))
+                .await
+                .expect("hold the legacy start lock");
+
+        let started = std::time::Instant::now();
+        let bound =
+            bind_legacy_aliases(Some(p.hook.clone()), Some(p.attach.clone()), Some(&p.locks)).await;
+        assert!(bound.hook.is_none() && bound.attach.is_none());
+        assert!(
+            started.elapsed() < LEGACY_ALIAS_LOCK_TIMEOUT * 3,
+            "gave up after {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// No alias asked for, nothing touched — every test daemon and every
+    /// non-fallback production daemon.
+    #[tokio::test]
+    async fn no_alias_requested_binds_nothing() {
+        let p = paths();
+        let bound = bind_legacy_aliases(None, None, Some(&p.locks)).await;
+        assert!(bound.hook.is_none() && bound.attach.is_none() && bound.aliases.is_empty());
     }
 }

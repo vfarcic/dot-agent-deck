@@ -13,6 +13,7 @@ use dot_agent_deck::daemon::{Daemon, run_daemon_with};
 use dot_agent_deck::daemon_attach::ensure_external_daemon_or_die;
 use dot_agent_deck::daemon_client::{DaemonClient, LocalEndpoint};
 use dot_agent_deck::embedded_pane::EmbeddedPaneController;
+use dot_agent_deck::endpoint_resolve::client_attach_socket_path;
 use dot_agent_deck::hook::handle_hook;
 use dot_agent_deck::pane::PaneController;
 use dot_agent_deck::state::AppState;
@@ -1840,6 +1841,43 @@ fn init_logging_from_env() {
     }
 }
 
+/// Prepare the endpoint directory, then lazy-spawn a daemon at `endpoint` if
+/// one is not already there. Returns the message to print on failure.
+///
+/// **Only ever called with a primary endpoint** — see
+/// [`dot_agent_deck::platform::paths::ResolvedEndpoint::is_primary`].
+/// `ensure_daemon_running` refuses a non-primary one itself, so this is the
+/// caller-side half of one property rather than the whole of it.
+///
+/// The preflight is issue #1121 round two, B1. `daemon serve` calls
+/// `ensure_endpoint_dir` at its own bind sites, so the directory gets created
+/// either way — but when it *cannot* be created, because a foreign uid already
+/// owns `<temp dir>/dot-agent-deck-{uid}`, the refusal that names the
+/// directory, both uids and the override goes into the **detached daemon's
+/// log**, where nobody is looking. What the operator saw was the launcher
+/// waiting out `DAEMON_START_POLL_TIMEOUT` and reporting a start timeout.
+/// Running the same idempotent call here first puts the actionable message on
+/// their terminal instead.
+///
+/// **It does not close the wedge, and must not be described as if it does.** A
+/// foreign uid can still take the predictable directory name before this host's
+/// first successful launch, and the deck then refuses to start until that entry
+/// is removed. What changed is that the refusal says so.
+async fn bootstrap_primary_daemon(endpoint: &LocalEndpoint) -> Result<(), String> {
+    if let Err(source) = dot_agent_deck::endpoint_resolve::ensure_endpoint_dir(endpoint.path()) {
+        return Err(format!(
+            "cannot prepare the endpoint directory for {}: {source}",
+            endpoint.path().display()
+        ));
+    }
+    ensure_external_daemon_or_die(endpoint).await.map_err(|e| {
+        format!(
+            "failed to connect to daemon at {}: {e}",
+            endpoint.path().display()
+        )
+    })
+}
+
 /// The TUI body extracted from `run_dashboard` so `connect` can reuse it.
 /// PRD #93 Phase 2: every fresh `dot-agent-deck` invocation lazy-spawns a
 /// per-user daemon on the `attach_socket_path()` Unix socket and
@@ -1865,19 +1903,41 @@ async fn run_tui_session() -> ExitCode {
     // PRD #741 M2: the TUI always talks to the daemon on this machine, so it
     // names it as one. `attach_path` stays the same value it always was — the
     // endpoint's address — for the messages and the subscriber below.
-    let endpoint = LocalEndpoint::from_config();
-    let attach_path = endpoint.path().to_path_buf();
+    //
+    // Issue #1121 round two: resolved with its provenance, because what may be
+    // done to the address depends on which arm produced it. A
+    // `LegacyCompat` one names a daemon from a pre-#1121 build that answered a
+    // probe a moment ago: this process may talk to it, and must not unlink it,
+    // lazy-spawn at it, or poll it for a daemon that would bind somewhere else.
+    let mut resolved = dot_agent_deck::endpoint_resolve::client_attach_endpoint();
+    // Closes the window between the resolver's own probe and this point: the
+    // older daemon exits in between. Re-resolving to the primary endpoint is
+    // what turns that into an ordinary cold start instead of a 15-second wait
+    // for a daemon at an address nothing will ever bind.
+    //
+    // It does not close every such window, and an earlier version of this
+    // comment claimed it was "the one" — a *later* one is still open, between
+    // this probe and the handshake's own `connect`, and is recovered at the
+    // handshake call below rather than here. No probe can be the last word:
+    // each one only narrows the gap between the last check and the first use.
+    if !resolved.is_primary()
+        && !dot_agent_deck::endpoint_resolve::endpoint_is_answering(resolved.path())
+    {
+        resolved = dot_agent_deck::endpoint_resolve::primary_attach_endpoint();
+    }
+    let mut endpoint = LocalEndpoint::from_resolved(resolved);
+    let mut attach_path = endpoint.path().to_path_buf();
 
-    // If the attach socket is missing, `ensure_external_daemon_or_die`
-    // fork-execs `dot-agent-deck daemon serve` detached under
-    // flock-serialized contention (so two simultaneous TUIs can't both
-    // win the bind — M1.3) and trust-checks any existing socket
-    // (uid + 0o600 + is-socket) before the TUI's DaemonClient touches it.
-    if let Err(e) = ensure_external_daemon_or_die(&endpoint).await {
-        eprintln!(
-            "failed to connect to daemon at {}: {e}",
-            attach_path.display()
-        );
+    // If the attach socket is missing, `bootstrap_primary_daemon` fork-execs
+    // `dot-agent-deck daemon serve` detached under flock-serialized contention
+    // (so two simultaneous TUIs can't both win the bind — M1.3) and
+    // trust-checks any existing socket (uid + 0o600 + is-socket) before the
+    // TUI's DaemonClient touches it. Skipped outright for a legacy endpoint,
+    // which by construction already has a daemon answering on it.
+    if endpoint.is_primary()
+        && let Err(message) = bootstrap_primary_daemon(&endpoint).await
+    {
+        eprintln!("{message}");
         return ExitCode::FAILURE;
     }
     // PRD #103 Phase 2 / PRD #161 Part A: build-version handshake against
@@ -1901,17 +1961,51 @@ async fn run_tui_session() -> ExitCode {
     //     non-zero (the only non-zero-exit path).
     // Errors are already user-visible inside the helper, so we render no
     // further message here.
-    let handshake_outcome =
-        match build_version_handshake::ensure_compatible_daemon_or_die(&endpoint).await {
-            Ok(outcome) => outcome,
-            Err(build_version_handshake::HandshakeError::MismatchAborted) => {
-                return ExitCode::FAILURE;
-            }
-            Err(e) => {
-                eprintln!("{e}");
-                return ExitCode::FAILURE;
-            }
-        };
+    let mut handshake = build_version_handshake::ensure_compatible_daemon_or_die(&endpoint).await;
+    // Issue #1121: the window the probe above leaves open, one step further
+    // along — a legacy daemon that exits between that probe and the
+    // handshake's own `connect`. `Probe` is exactly that shape ("the socket is
+    // there but nothing is answering"), and on a non-primary endpoint the
+    // address can only be the pre-#1121 spelling of a daemon that has now
+    // gone. Left alone it is a hard `ExitCode::FAILURE` on a host whose only
+    // problem is that it has no daemon — the same class as a legacy endpoint
+    // reaching an operation that cannot cope with it, so it gets the same
+    // remedy the `Recovered` branch below uses: re-resolve to the endpoint the
+    // daemon we are about to spawn will actually bind, and cold-start there.
+    //
+    // Deliberately one retry and not a loop. The retried endpoint IS primary,
+    // so a second `Probe` there is a genuinely broken host rather than a
+    // transition artefact, and must still be reported. The handshake is re-run
+    // rather than assumed to match, for the reason the comment above gives: it
+    // is the smoke test of the handshake itself, and a stale daemon of another
+    // build may be sitting on the primary endpoint too — that outcome is
+    // `Recovered` and composes with the branch below.
+    if !endpoint.is_primary()
+        && matches!(
+            handshake,
+            Err(build_version_handshake::HandshakeError::Probe(_))
+        )
+    {
+        endpoint = LocalEndpoint::from_resolved(
+            dot_agent_deck::endpoint_resolve::primary_attach_endpoint(),
+        );
+        attach_path = endpoint.path().to_path_buf();
+        if let Err(message) = bootstrap_primary_daemon(&endpoint).await {
+            eprintln!("after the legacy daemon went away: {message}");
+            return ExitCode::FAILURE;
+        }
+        handshake = build_version_handshake::ensure_compatible_daemon_or_die(&endpoint).await;
+    }
+    let handshake_outcome = match handshake {
+        Ok(outcome) => outcome,
+        Err(build_version_handshake::HandshakeError::MismatchAborted) => {
+            return ExitCode::FAILURE;
+        }
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
     // After a `Recovered` outcome the old daemon was just SIGTERM'd; the
     // next attach lazy-spawns a fresh one. Re-run the bootstrap so the
     // socket is back before any client (DaemonClient::list_agents,
@@ -1922,13 +2016,22 @@ async fn run_tui_session() -> ExitCode {
     if matches!(
         handshake_outcome,
         build_version_handshake::HandshakeOutcome::Recovered
-    ) && let Err(e) = ensure_external_daemon_or_die(&endpoint).await
-    {
-        eprintln!(
-            "failed to re-spawn daemon at {} after version-mismatch recovery: {e}",
-            attach_path.display()
+    ) {
+        // Issue #1121: re-resolve before re-spawning, and to the **primary**
+        // endpoint specifically. The daemon we just SIGTERM'd may have been an
+        // older build reached through the compatibility read of the pre-#1121
+        // fallback endpoint; nothing answers there any more, and the daemon
+        // about to be spawned binds the new spelling. Polling the address of
+        // the daemon we killed would time out while a perfectly healthy
+        // replacement was already up.
+        endpoint = LocalEndpoint::from_resolved(
+            dot_agent_deck::endpoint_resolve::primary_attach_endpoint(),
         );
-        return ExitCode::FAILURE;
+        attach_path = endpoint.path().to_path_buf();
+        if let Err(message) = bootstrap_primary_daemon(&endpoint).await {
+            eprintln!("after version-mismatch recovery: {message}");
+            return ExitCode::FAILURE;
+        }
     }
     // Test-only escape hatch (PRD #103 M4.2): integration tests in
     // tests/build_version_handshake.rs need to exercise the handshake
@@ -2479,15 +2582,22 @@ const ENDPOINT_RESOLVE_TIMEOUT: std::time::Duration = std::time::Duration::from_
 /// unlike `daemon stop`'s idempotent "no daemon running" — but deliberately
 /// never with clap's own exit code 2, so a caller can tell "this build
 /// doesn't understand the request" apart from "the daemon didn't answer".
-/// Never spawns, retries, or otherwise perturbs the daemon it's asking
-/// about: a timeout abandons the query rather than looping.
+/// Never spawns a daemon, never sends a mutation request, and never retries: a
+/// timeout abandons the query rather than looping. "Otherwise perturbs the
+/// daemon" is what this used to claim and is now too strong (issue #1121 round
+/// two, N11) — resolving the endpoint through `client_attach_socket_path` makes
+/// a successful connection of its own before the status connection, so on a
+/// host in the fallback case the daemon sees one extra accept and one extra
+/// client. No protocol byte is written on it, but it is observable in timings
+/// such as idle observation, and a comment that says otherwise is read as a
+/// guarantee.
 #[tokio::main]
 async fn run_daemon_status_cli(json: bool) -> ExitCode {
     use dot_agent_deck::daemon_status::{
         STATUS_REQUEST_TIMEOUT, StatusDocument, build_status_agents, format_human,
     };
 
-    let client = DaemonClient::new(attach_socket_path());
+    let client = DaemonClient::new(client_attach_socket_path());
     let records = match tokio::time::timeout(STATUS_REQUEST_TIMEOUT, client.list_agents()).await {
         Ok(Ok(records)) => records,
         Ok(Err(e)) => {
@@ -2633,10 +2743,20 @@ async fn run_daemon_serve_cli() -> ExitCode {
     // construction.
     dot_agent_deck::features::init_and_watch(&launch_project_dir());
     let state = Arc::new(RwLock::new(AppState::default()));
+    // Issue #1121: the BIND side, so these are deliberately the pure
+    // resolvers and not `endpoint_resolve`'s client ones — the primary
+    // endpoint is the new spelling, never one the compatibility read chose.
     let path = socket_path();
     let attach_path = attach_socket_path();
 
-    let daemon = Daemon::with_attach(state, attach_path.clone());
+    // Issue #1211: and beside it, best-effort, the pre-#1121 spelling on the
+    // fallback arm, so a client from before #1121 still finds this daemon and
+    // gets the mismatch prompt instead of silently spawning a second one. A
+    // failure to bind it is a warning, never a failure to start.
+    let daemon = Daemon::with_attach(state, attach_path.clone()).with_legacy_aliases(
+        dot_agent_deck::endpoint_resolve::legacy_hook_alias(),
+        dot_agent_deck::endpoint_resolve::legacy_attach_alias(),
+    );
     if let Err(e) = run_daemon_with(&path, daemon).await {
         eprintln!("Daemon error: {e}");
         return ExitCode::FAILURE;
@@ -2661,7 +2781,7 @@ async fn run_schedule_cli(action: ScheduleAction) -> ExitCode {
     match &action {
         ScheduleAction::RunNow { name } => {
             use dot_agent_deck::daemon_client::RunNowOutcome;
-            let client = DaemonClient::new(attach_socket_path());
+            let client = DaemonClient::new(client_attach_socket_path());
             return match client.run_now(name).await {
                 // PRD #127 C5: report skipped distinctly (still exit 0 — the
                 // task is registered and the request succeeded).
@@ -2680,7 +2800,7 @@ async fn run_schedule_cli(action: ScheduleAction) -> ExitCode {
             };
         }
         ScheduleAction::Reload => {
-            let client = DaemonClient::new(attach_socket_path());
+            let client = DaemonClient::new(client_attach_socket_path());
             return match client.reload_schedules().await {
                 Ok(names) => {
                     println!("reloaded; registered: {}", names.join(", "));
@@ -2798,7 +2918,7 @@ async fn run_schedule_cli(action: ScheduleAction) -> ExitCode {
 
     // Trigger a live reload so a running daemon picks the change up. A daemon
     // that isn't running is not an error — the change loads on next serve.
-    let client = DaemonClient::new(attach_socket_path());
+    let client = DaemonClient::new(client_attach_socket_path());
     match client.reload_schedules().await {
         Ok(_) => {}
         Err(e) => {

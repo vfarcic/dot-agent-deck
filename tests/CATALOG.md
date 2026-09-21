@@ -2771,6 +2771,34 @@ without depending on the config struct API.
 - **Does not assert:** anything on Linux, where `setsockopt` has no shutdown rule and the re-arm simply succeeds — this test passes before and after the fix there, and only bites on macOS (issue #642 is the macOS-only evidence it was written from); which of `read_reply_line`'s callers reach this state; the partial-line-then-close case (`error/socket/006` owns the EOF boundary); the `Unreachable` classification of a `set_timeouts` failure in `request_from_socket_at_detailed`'s prelude, which is unchanged.
 - **Platform coverage:** mac+linux (Unix-domain socket) — asserted on both, meaningful on macOS.
 
+##### error/socket/009 — The fallback hook and attach endpoints live in an owner-only per-uid directory.
+- **Layer:** L2 (PTY + vt100 against the real TUI and its lazy-spawned daemon).
+- **Agent:** none.
+- **Asserts:** with isolated fallback and e2e-only legacy roots, `XDG_RUNTIME_DIR` absent and both endpoint overrides absent, the dashboard renders; `<TMPDIR>/dot-agent-deck-<uid>` is a directory at mode `0o700`; `hook.sock` and `attach.sock` inside it are Unix sockets; the old attach spelling under `TMPDIR` is not created. Issue #1211: the same daemon also holds the redirected pre-#1121 hook and attach spellings as owner-only (`0o600`) sockets, a real `ListAgents` probe over the attach alias succeeds, and the log still holds exactly one `Attach protocol listening` line — so the aliases are that daemon's, not a second one; after `daemon stop` both aliases are gone. A second real-binary launch with `XDG_RUNTIME_DIR` set asserts the established `dot-agent-deck.sock` and `dot-agent-deck-attach.sock` spellings remain Unix sockets directly under that directory and that no alias is bound on that arm. Read-only before/after metadata snapshots assert that both literal `/tmp/dot-agent-deck[-attach]-<uid>.sock` production paths remain exactly as the test found them.
+- **Does not assert:** the operator-facing error when the per-uid directory is untrusted; an older client's own handshake over the alias (that is the `cargo xver` reverse run); Windows named-pipe resolution.
+- **Platform coverage:** mac+linux (Unix-domain sockets and Unix permission bits).
+
+##### error/socket/010 — An entry squatting the legacy attach path no longer wedges fallback startup.
+- **Layer:** L2 (PTY + vt100 against the real TUI and its lazy-spawned daemon).
+- **Agent:** none.
+- **Asserts:** with a regular file pre-planted at `<isolated-legacy-root>/dot-agent-deck-attach-<uid>.sock`, an isolated `TMPDIR`, `XDG_RUNTIME_DIR` absent and both endpoint overrides absent, the dashboard renders and both sockets bind inside the new per-uid directory; the planted file remains byte-identical while the daemon runs, proving neither the compatibility probe nor the daemon's legacy-alias bind (issue #1211) unlinked it. The unsquatted legacy hook alias is still bound as an owner-only socket, so the squatter cost only its own alias; after `daemon stop` the hook alias is gone and the planted file is still byte-identical, so the alias release did not reach it either. Read-only before/after metadata snapshots assert that both literal `/tmp/dot-agent-deck[-attach]-<uid>.sock` production paths remain exactly as the test found them.
+- **Does not assert:** the foreign-uid squatter arm, because the test has no second uid (the unit tests `daemon::legacy_alias_tests` add a root-owned entry nobody can unlink, and `fsperm`'s pure uid tests pin the uid clause); the exact diagnostic for an untrusted new per-uid directory; Windows named-pipe behavior.
+- **Platform coverage:** mac+linux (Unix-domain sockets and the e2e-only legacy-root seam).
+
+##### error/socket/011 — A daemon listening at the legacy path is discovered without a second lazy-spawn.
+- **Layer:** L2 (PTY + vt100 client against a real headless daemon process bound through explicit endpoint overrides at isolated legacy paths).
+- **Agent:** none.
+- **Asserts:** a fallback client with isolated fallback and e2e-only legacy roots, `XDG_RUNTIME_DIR` absent and both endpoint overrides absent renders the dashboard through the daemon already listening at the redirected legacy path; a real `ListAgents` probe succeeds there; the new endpoint pair remains absent during that attach; the log shared by the pre-bound daemon and fallback deck contains exactly one `Attach protocol listening` line, making the no-second-spawn assertion non-vacuous. After that daemon stops, a fresh fallback launch binds the new primary endpoint pair in the owner-only per-uid directory despite the stale isolated legacy inode, so the same test distinguishes legacy compatibility from continuing to use the legacy path as primary. Read-only before/after metadata snapshots assert that both literal `/tmp/dot-agent-deck[-attach]-<uid>.sock` production paths remain exactly as the test found them.
+- **Does not assert:** behavior when live daemons answer at both the new and legacy paths; a cross-version build-id mismatch prompt; a foreign-owned legacy entry.
+- **Platform coverage:** mac+linux (Unix-domain sockets and the e2e-only legacy-root seam).
+
+##### error/socket/012 — A legacy daemon that stops answering between the probe and the handshake is recovered, not fatal.
+- **Layer:** L2 (PTY + vt100 against the real TUI, with a stub listener standing in for the half-dead legacy daemon).
+- **Agent:** none.
+- **Asserts:** with a listener bound at `<isolated-legacy-root>/dot-agent-deck-attach-<uid>.sock` that is uid-equal and exactly `0o600` (so `verify_endpoint_trusted` passes and the resolver selects it) but accepts and immediately drops every connection, a fallback launch with isolated fallback and e2e-only legacy roots, `XDG_RUNTIME_DIR` absent and both endpoint overrides absent still renders the dashboard; the new per-uid `hook.sock` and `attach.sock` are bound afterwards, which only the re-resolve to `primary_attach_endpoint()` plus a cold start can have produced. Read-only before/after metadata snapshots assert that both literal `/tmp/dot-agent-deck[-attach]-<uid>.sock` production paths remain exactly as the test found them.
+- **Does not assert:** a real daemon exiting inside that two-syscall window (not reproducible without a seam — the stub reproduces the client-visible shape instead); the `PeerPid` arm, which is a different `HandshakeError` and is not recovered; recovery from a *primary* endpoint that stops answering, which is deliberately still fatal; Windows named-pipe resolution.
+- **Platform coverage:** mac+linux (Unix-domain sockets and the e2e-only legacy-root seam).
+
 #### error/config
 
 ##### error/config/001 — `.dot-agent-deck.toml` with an invalid regex makes the new-pane form refuse the mode and surface a status-line message.

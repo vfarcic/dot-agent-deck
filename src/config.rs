@@ -36,8 +36,16 @@ pub fn config_keys_help() -> String {
 }
 
 /// Hook-ingestion endpoint path. Delegates to [`crate::platform::paths`] (PRD
-/// #42 M1): Unix resolves the `$XDG_RUNTIME_DIR`/per-uid-`/tmp` socket path,
-/// Windows resolves the named-pipe name. `DOT_AGENT_DECK_SOCKET` overrides.
+/// #42 M1): Unix resolves `$XDG_RUNTIME_DIR/dot-agent-deck.sock`, else
+/// `<temp dir>/dot-agent-deck-{uid}/hook.sock` — the sibling of the attach
+/// endpoint's `attach.sock` in that same per-uid directory. Windows resolves
+/// the named-pipe name. `DOT_AGENT_DECK_SOCKET` overrides.
+///
+/// "per-uid-`/tmp` socket path" is what this used to say, and it is now wrong
+/// twice over: the endpoints moved one level down into a directory the deck
+/// owns (issue #1121), and the root is `std::env::temp_dir()` rather than a
+/// literal `/tmp`, so it is not `/tmp` at all wherever `$TMPDIR` points
+/// elsewhere — which on macOS is everywhere.
 pub fn socket_path() -> PathBuf {
     crate::platform::paths::socket_path()
 }
@@ -2187,16 +2195,21 @@ timeout_secs = 600
         assert!(!dc.auto_config_prompt);
     }
 
-    // PRD #42 M2: asserts the Unix `/tmp` + per-uid fallback specifically
+    // PRD #42 M2: asserts the Unix temp-dir + per-uid fallback specifically
     // (`current_uid()` is Unix-only and the path shape is POSIX), so it is
     // gated to Unix. The Windows endpoint is a per-user named pipe with no
-    // `/tmp`/uid analogue — covered separately under PRD #163/#164.
+    // temp-dir/uid analogue — covered separately under PRD #163/#164.
+    //
+    // Issue #1121 moved where the per-uid component sits — from a suffix on
+    // each socket's own name to the directory holding both — so this reads it
+    // off the directory now. The property being pinned is the one it always
+    // was and the reason is unchanged.
     #[cfg(unix)]
     #[test]
     fn attach_socket_fallback_is_per_user() {
         // PRD #93 round-2 reviewer REV-2: when XDG_RUNTIME_DIR is unset
-        // *and* DOT_AGENT_DECK_ATTACH_SOCKET is unset, the fallback under
-        // /tmp must include the uid so two users on the same host don't
+        // *and* DOT_AGENT_DECK_ATTACH_SOCKET is unset, the temp-dir fallback
+        // must include the uid so two users on the same host don't
         // collide. The old `/tmp/dot-agent-deck-attach.sock` would
         // sandwich two daemons onto one path and let the first binder
         // arbitrarily lock the rest of the host out.
@@ -2212,21 +2225,36 @@ timeout_secs = 600
         }
 
         let uid = crate::platform::paths::current_uid();
+        let dir = crate::platform::paths::fallback_endpoint_dir();
         let attach = attach_socket_path();
         let hook = socket_path();
-        let attach_str = attach.to_string_lossy();
-        let hook_str = hook.to_string_lossy();
-        assert!(
-            attach_str.contains(&format!("-{uid}.sock")),
-            "attach fallback must embed uid: got {attach_str}"
+        assert_eq!(
+            dir.file_name().and_then(|name| name.to_str()),
+            Some(format!("dot-agent-deck-{uid}").as_str()),
+            "the fallback endpoint directory must embed the uid: got {}",
+            dir.display()
         );
-        assert!(
-            hook_str.contains(&format!("-{uid}.sock")),
-            "hook fallback must embed uid: got {hook_str}"
+        assert_eq!(
+            attach.parent(),
+            Some(dir.as_path()),
+            "attach fallback must live in the per-uid directory: got {}",
+            attach.display()
         );
-        assert!(
-            attach_str.starts_with("/tmp/"),
-            "attach fallback should live under /tmp when XDG is unset: got {attach_str}"
+        assert_eq!(
+            hook.parent(),
+            Some(dir.as_path()),
+            "hook fallback must live in the per-uid directory: got {}",
+            hook.display()
+        );
+        assert_ne!(
+            attach, hook,
+            "the two protocols must not share one endpoint"
+        );
+        assert_eq!(
+            dir.parent(),
+            Some(std::env::temp_dir().as_path()),
+            "the fallback directory sits directly under the temp dir: got {}",
+            dir.display()
         );
 
         // SAFETY: same lock; restoring previous values.

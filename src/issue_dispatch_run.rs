@@ -1579,19 +1579,42 @@ mod tests {
     /// A real repo with one commit plus a linked worktree at `worktree`, so the
     /// preview's `git status --porcelain` runs against a genuine tree rather
     /// than a stub. Mirrors `dispatch::tests::init_repo`.
-    fn init_repo_with_worktree(repo: &Path, worktree: &Path) {
+    ///
+    /// **Every `git` here goes through [`crate::git_env::fixture_git`]**,
+    /// which switches off the ambient git environment in both of the groups
+    /// issue #834 names: *configuration* (`GIT_CONFIG_GLOBAL`/`SYSTEM` at a
+    /// nonexistent path, `HOME` and `XDG_CONFIG_HOME` inside the sandbox) and
+    /// *location* (the eight discovery variables cleared, plus
+    /// `GIT_CEILING_DIRECTORIES` bounding the upward walk at `sandbox_root`).
+    /// Without it these commands ran with only `.current_dir(dir)`, and git's
+    /// location discovery **outranks** a process's cwd: with an ambient
+    /// `GIT_DIR` — routine under `rebase --exec`, a pre-commit hook or
+    /// `bisect run` — `init`, `commit` and `worktree add` are writes against
+    /// whatever repository that names, which under `cargo test` can be the
+    /// checkout the suite is running in. It also supplies the commit identity
+    /// by environment, so the fixture no longer writes `user.name`/`user.email`
+    /// into a repository to configure one.
+    ///
+    /// Reached here from issue #1121 round two: a sibling test in this module
+    /// went red once in eight plain `cargo test` runs and could not be
+    /// reproduced, and this was the one concrete candidate cause — under
+    /// `cargo test` (threads, one process) it shares its environment with
+    /// `worktree_owner`'s `with_ambient_git_dir_at`, which sets those very
+    /// variables process-globally under a lock this fixture did not take.
+    fn init_repo_with_worktree(sandbox_root: &Path, repo: &Path, worktree: &Path) {
         let run = |dir: &Path, args: &[&str]| {
-            let out = std::process::Command::new("git")
+            let out = crate::git_env::fixture_git(dir, sandbox_root)
                 .args(args)
-                .current_dir(dir)
                 .output()
                 .expect("git available");
             assert!(out.status.success(), "git {args:?} failed: {out:?}");
         };
         std::fs::create_dir_all(repo).unwrap();
         run(repo, &["init", "-q", "."]);
-        run(repo, &["config", "user.email", "t@t.t"]);
-        run(repo, &["config", "user.name", "T"]);
+        // Immune today only because `a.txt` holds no newline; pinned anyway so
+        // that adding one stays a content change rather than a Windows-only
+        // failure three modules away (`pin_fixture_eol`).
+        crate::worktree_owner::pin_fixture_eol(repo, sandbox_root);
         std::fs::write(repo.join("a.txt"), "hi").unwrap();
         run(repo, &["add", "."]);
         run(repo, &["commit", "-qm", "init"]);
@@ -1622,7 +1645,7 @@ mod tests {
         let tmp = crate::test_temp::tempdir().unwrap();
         let repo = tmp.path().join("repo");
         let wt = tmp.path().join("repo-dispatch-x");
-        init_repo_with_worktree(&repo, &wt);
+        init_repo_with_worktree(tmp.path(), &repo, &wt);
         std::fs::write(wt.join("scratch.txt"), "the user's uncommitted work").unwrap();
 
         let reg = new_worktree_registry();
@@ -1650,7 +1673,7 @@ mod tests {
         let tmp = crate::test_temp::tempdir().unwrap();
         let repo = tmp.path().join("repo");
         let wt = tmp.path().join("repo-dispatch-x");
-        init_repo_with_worktree(&repo, &wt);
+        init_repo_with_worktree(tmp.path(), &repo, &wt);
 
         let reg = new_worktree_registry();
         record_worktree(&reg, &wt, &repo, RemovalPolicy::KeepIfDirty);
@@ -1668,7 +1691,7 @@ mod tests {
         let tmp = crate::test_temp::tempdir().unwrap();
         let repo = tmp.path().join("repo");
         let wt = tmp.path().join("repo-dispatch-x");
-        init_repo_with_worktree(&repo, &wt);
+        init_repo_with_worktree(tmp.path(), &repo, &wt);
         std::fs::write(wt.join("scratch.txt"), "discarded by design").unwrap();
 
         let reg = new_worktree_registry();
@@ -1688,7 +1711,7 @@ mod tests {
         let tmp = crate::test_temp::tempdir().unwrap();
         let repo = tmp.path().join("repo");
         let wt = tmp.path().join("repo-dispatch-x");
-        init_repo_with_worktree(&repo, &wt);
+        init_repo_with_worktree(tmp.path(), &repo, &wt);
         std::fs::write(wt.join("scratch.txt"), "dirty, but nobody dispatched here").unwrap();
 
         // Nothing recorded: this is a pane the user opened themselves, and the
@@ -1711,7 +1734,7 @@ mod tests {
         let tmp = crate::test_temp::tempdir().unwrap();
         let repo = tmp.path().join("repo");
         let wt = tmp.path().join("repo-dispatch-team");
-        init_repo_with_worktree(&repo, &wt);
+        init_repo_with_worktree(tmp.path(), &repo, &wt);
         std::fs::write(wt.join("scratch.txt"), "work from role 2").unwrap();
 
         let reg = new_worktree_registry();
@@ -1752,7 +1775,7 @@ mod tests {
         let tmp = crate::test_temp::tempdir().unwrap();
         let repo = tmp.path().join("repo");
         let wt = tmp.path().join("repo-dispatch-x");
-        init_repo_with_worktree(&repo, &wt);
+        init_repo_with_worktree(tmp.path(), &repo, &wt);
         std::fs::write(wt.join("scratch.txt"), "work").unwrap();
 
         let reg = new_worktree_registry();
@@ -1787,7 +1810,7 @@ mod tests {
 
         // Dirty + KeepIfDirty: kept, and it says so with the path.
         let dirty = tmp.path().join("repo-dispatch-dirty");
-        init_repo_with_worktree(&repo, &dirty);
+        init_repo_with_worktree(tmp.path(), &repo, &dirty);
         std::fs::write(dirty.join("scratch.txt"), "work").unwrap();
         let kept = remove_worktree(&dirty, &repo, RemovalPolicy::KeepIfDirty)
             .await
@@ -1799,9 +1822,8 @@ mod tests {
         // Clean + KeepIfDirty: removed, and nothing is reported.
         let clean = tmp.path().join("repo-dispatch-clean");
         let run = |args: &[&str]| {
-            let out = std::process::Command::new("git")
+            let out = crate::git_env::fixture_git(&repo, tmp.path())
                 .args(args)
-                .current_dir(&repo)
                 .output()
                 .expect("git available");
             assert!(out.status.success(), "git {args:?} failed: {out:?}");
@@ -1849,7 +1871,7 @@ mod tests {
         let tmp = crate::test_temp::tempdir().unwrap();
         let repo = tmp.path().join("repo");
         let wt = tmp.path().join("repo-dispatch-x");
-        init_repo_with_worktree(&repo, &wt);
+        init_repo_with_worktree(tmp.path(), &repo, &wt);
 
         // `git -C <clone> worktree remove` against a clone that is not a repo
         // fails, which is the shape of every real failure here (locked, busy,
@@ -1872,7 +1894,7 @@ mod tests {
         let tmp = crate::test_temp::tempdir().unwrap();
         let repo = tmp.path().join("repo");
         let wt = tmp.path().join("repo-dispatch-x");
-        init_repo_with_worktree(&repo, &wt);
+        init_repo_with_worktree(tmp.path(), &repo, &wt);
 
         assert_eq!(worktree_is_dirty(&wt).await, Ok(false));
         std::fs::write(wt.join("scratch.txt"), "work").unwrap();
@@ -2101,12 +2123,18 @@ mod tests {
     /// A real git repo with one commit — `git worktree add` needs a commit to
     /// branch from. Disk-backed (issue #322 / CLAUDE.md rule 14): this fixture
     /// is a git repository plus its worktrees, not a scratch file.
-    fn init_repo_with_commit(repo: &Path) {
+    ///
+    /// Through [`crate::git_env::fixture_git`], for exactly the reasons
+    /// [`init_repo_with_worktree`] spells out — this fixture was the other half
+    /// of the same module and was missed when that one was isolated (issue
+    /// #1121 round three). The three `git config` writes it used to make are
+    /// gone with it: the identity now arrives as `GIT_AUTHOR_*`/`GIT_COMMITTER_*`
+    /// in the environment, and `commit.gpgsign` no longer needs neutralizing
+    /// per-repo because no global or system config reaches the fixture at all.
+    fn init_repo_with_commit(sandbox_root: &Path, repo: &Path) {
         std::fs::create_dir_all(repo).expect("create repo dir");
         let git = |args: &[&str]| {
-            let out = std::process::Command::new("git")
-                .arg("-C")
-                .arg(repo)
+            let out = crate::git_env::fixture_git(repo, sandbox_root)
                 .args(args)
                 .output()
                 .unwrap_or_else(|e| panic!("spawn git {args:?}: {e}"));
@@ -2117,11 +2145,11 @@ mod tests {
             );
         };
         git(&["init", "--initial-branch=main", "--quiet"]);
-        git(&["config", "user.email", "test@example.com"]);
-        git(&["config", "user.name", "Test"]);
-        // The dev box may have `commit.gpgsign` on globally; the fixture must
-        // not depend on a signing key being present.
-        git(&["config", "commit.gpgsign", "false"]);
+        // The one config a fixture repository must carry itself, because
+        // production `create_worktree` checks this repository out with the
+        // ambient config while the assertions read it with the neutralized one
+        // — see `pin_fixture_eol`, and issue #1121's `build-windows` red.
+        crate::worktree_owner::pin_fixture_eol(repo, sandbox_root);
         std::fs::write(repo.join("README.md"), "seed\n").expect("write seed file");
         git(&["add", "README.md"]);
         git(&["commit", "--quiet", "-m", "seed"]);
@@ -2188,7 +2216,7 @@ mod tests {
     async fn create_worktree_survives_a_concurrent_adds_half_created_entry() {
         let scratch = crate::test_temp::tempdir().expect("scratch tempdir");
         let repo = scratch.path().join("repo");
-        init_repo_with_commit(&repo);
+        init_repo_with_commit(scratch.path(), &repo);
         let entry = begin_half_created_entry(&repo, "concurrent-add");
 
         // Closes while the three dispatches are in flight. Not a timing race:
@@ -2261,7 +2289,7 @@ mod tests {
     async fn create_worktree_surfaces_a_half_created_entry_that_never_completes() {
         let scratch = crate::test_temp::tempdir().expect("scratch tempdir");
         let repo = scratch.path().join("repo");
-        init_repo_with_commit(&repo);
+        init_repo_with_commit(scratch.path(), &repo);
         let _entry = begin_half_created_entry(&repo, "abandoned-add");
         let worktree_dir = scratch.path().join("repo-dispatch-stuck");
 
@@ -2300,7 +2328,7 @@ mod tests {
     async fn create_worktree_serializes_per_repository_across_processes() {
         let scratch = crate::test_temp::tempdir().expect("scratch tempdir");
         let repo = scratch.path().join("repo");
-        init_repo_with_commit(&repo);
+        init_repo_with_commit(scratch.path(), &repo);
 
         let lock_path = worktree_lock_path(&repo)
             .await
@@ -2366,7 +2394,7 @@ mod tests {
     async fn create_worktree_reports_a_live_claim_not_a_leftover_branch() {
         let scratch = crate::test_temp::tempdir().expect("scratch tempdir");
         let repo = scratch.path().join("repo");
-        init_repo_with_commit(&repo);
+        init_repo_with_commit(scratch.path(), &repo);
         let worktree_dir = scratch.path().join("repo-dispatch-claimed");
 
         assert_eq!(
@@ -2448,7 +2476,7 @@ mod tests {
     async fn create_worktree_marks_the_worktree_as_deck_owned_without_dirtying_it() {
         let scratch = crate::test_temp::tempdir().expect("scratch tempdir");
         let repo = scratch.path().join("repo");
-        init_repo_with_commit(&repo);
+        init_repo_with_commit(scratch.path(), &repo);
         let worktree_dir = scratch.path().join("repo-dispatch-marked");
 
         assert_eq!(
@@ -2477,8 +2505,7 @@ mod tests {
             marker.display()
         );
 
-        let status = std::process::Command::new("git")
-            .current_dir(&worktree_dir)
+        let status = crate::git_env::fixture_git(&worktree_dir, scratch.path())
             .args(["status", "--porcelain"])
             .output()
             .expect("git status");
@@ -2521,15 +2548,13 @@ mod tests {
     async fn create_worktree_never_marks_a_worktree_it_did_not_create() {
         let scratch = crate::test_temp::tempdir().expect("scratch tempdir");
         let repo = scratch.path().join("repo");
-        init_repo_with_commit(&repo);
+        init_repo_with_commit(scratch.path(), &repo);
         let worktree_dir = scratch.path().join("repo-dispatch-foreign");
 
         // Somebody else's worktree, on this same repo, at the path our dispatch
         // is about to want: a real linked worktree, so it HAS a git metadata
         // dir a marker could be written into.
-        let add = std::process::Command::new("git")
-            .arg("-C")
-            .arg(&repo)
+        let add = crate::git_env::fixture_git(&repo, scratch.path())
             .args(["worktree", "add", "-b", "someone-elses"])
             .arg(&worktree_dir)
             .output()
@@ -2829,20 +2854,16 @@ mod tests {
     async fn create_worktree_warms_the_environment_before_it_reports_created() {
         let scratch = crate::test_temp::tempdir().expect("scratch tempdir");
         let repo = scratch.path().join("repo");
-        init_repo_with_commit(&repo);
+        init_repo_with_commit(scratch.path(), &repo);
         // Committed, so the fresh worktree checks one out and the warm-up's
         // manifest probe sees it — exactly as a real dispatched worktree does.
         std::fs::write(repo.join(DEVBOX_MANIFEST), "{}\n").expect("write devbox.json");
-        let git_add = std::process::Command::new("git")
-            .arg("-C")
-            .arg(&repo)
+        let git_add = crate::git_env::fixture_git(&repo, scratch.path())
             .args(["add", DEVBOX_MANIFEST])
             .output()
             .expect("git add devbox.json");
         assert!(git_add.status.success());
-        let git_commit = std::process::Command::new("git")
-            .arg("-C")
-            .arg(&repo)
+        let git_commit = crate::git_env::fixture_git(&repo, scratch.path())
             .args(["commit", "--quiet", "-m", "devbox"])
             .output()
             .expect("git commit devbox.json");

@@ -84,59 +84,270 @@ pub fn with_socket_umask<T>(f: impl FnOnce() -> T) -> T {
 /// 0o700. The `lstat` refusal turns that into a named error and leaves the
 /// target untouched.
 ///
-/// **This narrows the window; it does not close it.** A residual TOCTOU remains
-/// between the `symlink_metadata` here and the `mkdir`/`chmod` that follow — an
-/// attacker who wins that race still redirects the chmod. Closing it properly
-/// needs a race-free idiom (open the created directory `O_NOFOLLOW|O_DIRECTORY`
-/// and `fchmod` the descriptor, so no second name resolution exists to
-/// redirect), which is deliberately not done here: a read-open is strictly more
-/// privileged than `chmod(2)` by path, so it would refuse to repair a
-/// pre-existing 0o000 directory that today it fixes. Treat this as a narrowed
-/// window with a known remaining gap, not as an eliminated race.
+/// **The `lstat` is the cheap guard; the descriptor below is the real one**
+/// (issue #1121 round two). This comment used to say the race-free idiom was
+/// deliberately not used, because a read-open is more privileged than
+/// `chmod(2)` by path and would refuse to repair a pre-existing `0o000`
+/// directory. Both halves of that were true and the conclusion was still
+/// wrong: the idiom is used now, and the `0o000` case is handled by falling
+/// back to the path chmod **only** on `EACCES`, which a planted symlink cannot
+/// produce (`O_NOFOLLOW` answers one with `ELOOP`).
+///
+/// What the function does on Unix, in order: refuse a symlink by `lstat`;
+/// create the parents recursively at `0o700`; create the final component with
+/// **one non-recursive** `mkdir(2)`, which does not follow a link at that
+/// component; then open the result `O_RDONLY|O_DIRECTORY|O_NOFOLLOW`, `fstat`
+/// it and `fchmod` **the descriptor**. There is no second pathname resolution
+/// for an attacker to redirect, so the window the old comment described — plant
+/// a symlink after the `lstat`, have `create_dir_all` follow it and the
+/// path-based `set_permissions` chmod the target — is gone. That matters more
+/// after this issue than before it: [`crate::endpoint_resolve::ensure_endpoint_dir`]
+/// now calls this at a **world-writable-parent** boundary (`/tmp`), where the
+/// racing uid is a *foreign* one rather than the same-uid attacker the rest of
+/// this comment is written against.
+///
+/// **The residual, stated at its real width.** The `EACCES` repair arm does
+/// chmod by path, after a fresh `lstat`, so a directory swapped in between
+/// those two calls is chmodded to `0o700`. It buys an attacker very little:
+/// `chmod(2)` refuses a directory the calling uid does not own, so the only
+/// thing reachable that way is tightening a directory the invoking user
+/// already owns — and reaching the arm at all requires first presenting
+/// something that answers `EACCES` rather than `ELOOP`. The arm is re-checked
+/// by descriptor afterwards, so nothing proceeds on a directory the `fstat`
+/// does not vouch for.
 ///
 /// Nothing here defends against a symlink at an *ancestor* of `dir`; the guard
 /// is scoped to the final component, which is the one this function creates and
-/// chmods. (Compare `platform::detach::spawn_daemon_serve_detached_with_exe`,
+/// chmods. An ancestor a foreign uid controls is therefore still outside what
+/// this can promise — for the endpoint directory that ancestor is the system
+/// temp dir, which is `0o1777` and root-owned, so it is not the reachable case
+/// there. (Compare `platform::detach::spawn_daemon_serve_detached_with_exe`,
 /// which already opens `daemon.log` with `O_NOFOLLOW` — the same discipline one
 /// level down, applied to a file the deck opens rather than a dir it chmods.)
 ///
-/// **The refusal is unconditional, and that has a cost.** The threat model is a
-/// *same-uid* attacker, so nothing about the link or its target distinguishes
-/// one they planted from one the operator made on purpose — an ownership or
-/// mode check on the target would discriminate between nothing. So a deliberate
+/// **The refusal is unconditional, and that has a cost — unchanged by the
+/// descriptor work above.** For the same-uid attacker this function was first
+/// written against, nothing about the link or its target distinguishes one they
+/// planted from one the operator made on purpose — an ownership or mode check
+/// on the target would discriminate between nothing. So a deliberate
 /// `~/.local/state/dot-agent-deck` → other-disk symlink is refused along with
 /// the attack, and the operator has to point `DOT_AGENT_DECK_STATE_DIR` (or
 /// `DOT_AGENT_DECK_LOCK_DIR`) at the real path instead. Only the *final*
 /// component is affected, so a symlinked ancestor — `~/.local/state` itself —
 /// keeps working. The error says which path and why, so the fix is discoverable
-/// from the message.
+/// from the message, and the `O_NOFOLLOW` arm renders the identical message so
+/// a deliberate link planted a moment before the call reads no differently.
+///
+/// **The other fail-closed arm says why too** (issue #1121). When the directory
+/// exists and another uid owns it the `set_permissions` below returns `EPERM`,
+/// which unwrapped reads `Operation not permitted` and names neither the path
+/// nor the owner. [`chmod_refusal`] wraps it: which directory, which uid owns
+/// it, which uid we are, and that a `DOT_AGENT_DECK_*` path override is the way
+/// out. The remedy is named generically here on purpose — this function serves
+/// the state dir, the lock root and (via
+/// [`crate::endpoint_resolve::ensure_endpoint_dir`]) the endpoint directory,
+/// and each has a different override — so the caller closest to the operator
+/// names the specific variable.
 pub fn ensure_owner_only_dir(dir: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 
     // Fail closed: a symlink is refused, and so is any `lstat` error other than
     // "nothing is there yet" — if we cannot vouch for what sits at the path we
-    // do not chmod it.
-    match std::fs::symlink_metadata(dir) {
-        Ok(metadata) if metadata.file_type().is_symlink() => {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!(
-                    "refusing to use {}: it is a symlink, and creating or chmodding it would \
-                     follow the link and tighten permissions on another directory — point the \
-                     path at the real directory instead of a symlink",
-                    dir.display()
-                ),
-            ));
-        }
-        Ok(_) => {}
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
+    // do not chmod it. The descriptor dance below is what makes the refusal
+    // race-free; this is the arm that produces the *readable* error for the
+    // overwhelmingly common non-racing case.
+    refuse_symlink_at(dir)?;
+
+    // Parents first, recursively and at the mode the whole call used to use, so
+    // an intermediate directory this creates lands exactly where it always did.
+    // Splitting them off leaves the final component — the one a foreign uid can
+    // race in a world-writable parent — as the only one created by a call that
+    // cannot follow a link.
+    if let Some(parent) = dir.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(parent)?;
+    }
+
+    // One non-recursive `mkdir(2)`. It does not follow a symlink at the final
+    // component — a planted link answers `EEXIST`, it does not create through
+    // the link — so every "something was already there" case, hostile or not,
+    // falls into the descriptor path below rather than into a path-based chmod.
+    match std::fs::DirBuilder::new().mode(0o700).create(dir) {
+        Ok(()) => {}
+        Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => {}
         Err(source) => return Err(source),
     }
 
-    let mut builder = std::fs::DirBuilder::new();
-    builder.recursive(true).mode(0o700);
-    builder.create(dir)?;
-    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+    let handle = open_dir_nofollow(dir)?;
+    // `File::set_permissions` is `fchmod(2)`: it acts on the inode this
+    // descriptor already holds, so there is no name for anything to swap.
+    handle
+        .set_permissions(std::fs::Permissions::from_mode(0o700))
+        .map_err(|source| chmod_refusal(dir, source))
+}
+
+/// [`ensure_owner_only_dir`]'s `lstat` guard: refuse a symlink at `dir`, and
+/// refuse any `lstat` error other than "nothing is there yet".
+fn refuse_symlink_at(dir: &Path) -> std::io::Result<()> {
+    match std::fs::symlink_metadata(dir) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(symlink_refusal(dir)),
+        Ok(_) => Ok(()),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(source),
+    }
+}
+
+/// The refusal [`refuse_symlink_at`] and [`open_dir_nofollow`] share, so a link
+/// caught by the `lstat` and one caught by `O_NOFOLLOW` read identically to an
+/// operator — the difference between them is only *when* it was planted.
+fn symlink_refusal(dir: &Path) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        format!(
+            "refusing to use {}: it is a symlink, and creating or chmodding it would \
+             follow the link and tighten permissions on another directory — point the \
+             path at the real directory instead of a symlink",
+            dir.display()
+        ),
+    )
+}
+
+/// Open `dir` as a directory without following a link at its final component.
+///
+/// The descriptor this returns is what [`ensure_owner_only_dir`] `fchmod`s, so
+/// this is the seam the whole race-free claim rests on. A link planted after
+/// the `lstat` is refused in the same words the `lstat` would have used, and
+/// anything else that is not a directory gets a refusal naming that instead.
+///
+/// **The two are not distinguishable from the errno**, which is why there is an
+/// `lstat` in the classifier and not just a match. `open(2)` documents `ELOOP`
+/// for `O_NOFOLLOW` on a symlink, but Linux answers `ENOTDIR` when `O_DIRECTORY`
+/// is set as well — measured here, not read: the first version of this function
+/// matched `ELOOP` alone and reported a symlink-to-directory as "not a
+/// directory". Both errnos therefore go to the same classifier, which `lstat`s
+/// the path to choose the wording. That `lstat` decides nothing but the words:
+/// either way the call is refused, so a race on it cannot change an outcome.
+///
+/// `EACCES` is the one arm that goes back to a pathname: a directory we own at
+/// a mode with no read bit cannot be opened even by its owner, while `chmod(2)`
+/// by path still works on it — that is the pre-existing `0o000` repair the old
+/// comment on [`ensure_owner_only_dir`] cited as the reason not to use
+/// descriptors at all. It is guarded by a fresh `lstat` and re-verified by
+/// re-opening, and [`ensure_owner_only_dir`]'s doc states the residual.
+fn open_dir_nofollow(dir: &Path) -> std::io::Result<std::fs::File> {
+    match open_dir_nofollow_once(dir) {
+        Ok(handle) => Ok(handle),
+        Err(source) if is_link_or_not_a_directory(&source) => Err(not_a_usable_directory(dir)),
+        Err(source) if source.kind() == std::io::ErrorKind::PermissionDenied => {
+            use std::os::unix::fs::PermissionsExt;
+            refuse_symlink_at(dir)?;
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+                .map_err(|source| chmod_refusal(dir, source))?;
+            open_dir_nofollow_once(dir).map_err(|source| {
+                if is_link_or_not_a_directory(&source) {
+                    not_a_usable_directory(dir)
+                } else {
+                    source
+                }
+            })
+        }
+        Err(source) => Err(source),
+    }
+}
+
+/// The two errnos an `O_NOFOLLOW|O_DIRECTORY` open reports for "the entry is
+/// there but it is not a directory we will follow into". See
+/// [`open_dir_nofollow`] for why they are one case and not two.
+fn is_link_or_not_a_directory(source: &std::io::Error) -> bool {
+    matches!(
+        source.raw_os_error(),
+        Some(libc::ELOOP) | Some(libc::ENOTDIR)
+    )
+}
+
+/// The refusal for an entry [`open_dir_nofollow`] would not open: a symlink
+/// gets [`symlink_refusal`]'s wording, anything else gets its own.
+fn not_a_usable_directory(dir: &Path) -> std::io::Error {
+    let is_symlink = std::fs::symlink_metadata(dir)
+        .map(|metadata| metadata.file_type().is_symlink())
+        .unwrap_or(false);
+    if is_symlink {
+        return symlink_refusal(dir);
+    }
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        format!(
+            "refusing to use {}: it exists and is not a directory — remove or rename it \
+             if it is stale, or point the relevant DOT_AGENT_DECK_* path override \
+             somewhere else",
+            dir.display()
+        ),
+    )
+}
+
+/// The raw open [`open_dir_nofollow`] classifies the failures of.
+fn open_dir_nofollow_once(dir: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
+        .open(dir)
+}
+
+/// Turn [`ensure_owner_only_dir`]'s `set_permissions` failure into something an
+/// operator can act on (issue #1121).
+///
+/// The reachable case that matters is the one the fail-closed behaviour exists
+/// for: the directory already exists and **another uid owns it**, so
+/// `chmod(2)` returns `EPERM` for us. Unwrapped that reads `Operation not
+/// permitted` with no path, no owner and no remedy — three lookups away from
+/// being actionable. The wrapper stats the directory and, when the owner is
+/// not us, says so and names both uids; anything else keeps the original
+/// wording and only gains the path.
+///
+/// The stat is best-effort and deliberately not fail-closed: it runs only to
+/// *explain* a failure that has already been decided, so a stat that itself
+/// errors falls back to the generic arm rather than inventing a reason.
+fn chmod_refusal(dir: &Path, source: std::io::Error) -> std::io::Error {
+    use std::os::unix::fs::MetadataExt;
+
+    let our_uid = crate::platform::paths::current_uid();
+    let owner_uid = std::fs::metadata(dir).ok().map(|metadata| metadata.uid());
+    match owner_uid {
+        Some(owner_uid) if owner_uid != our_uid => std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            foreign_owner_refusal(dir, owner_uid, our_uid, &source),
+        ),
+        _ => std::io::Error::new(
+            source.kind(),
+            format!("could not set mode 0o700 on {}: {source}", dir.display()),
+        ),
+    }
+}
+
+/// The message [`chmod_refusal`] renders for a directory another uid owns.
+///
+/// Pure data, split out for the same reason as [`endpoint_uid_is_trusted`]: the
+/// arm it describes needs a directory owned by a second account, which a test
+/// process cannot create without one or without root, so the *wording* is what
+/// is testable on any host.
+fn foreign_owner_refusal(
+    dir: &Path,
+    owner_uid: u32,
+    our_uid: u32,
+    source: &std::io::Error,
+) -> String {
+    format!(
+        "refusing to use {}: it is owned by uid {owner_uid} (we are uid {our_uid}), so it cannot \
+         be made owner-only for us and whatever we put inside it would sit in another user's \
+         directory ({source}) — remove or rename it if it is stale, or point the relevant \
+         DOT_AGENT_DECK_* path override at a directory only you can write",
+        dir.display()
+    )
 }
 
 /// Create `dir` (recursively) with mode 0o700, **without** re-applying the mode
@@ -228,10 +439,31 @@ fn endpoint_uid_is_trusted(owner_uid: u32, our_uid: u32) -> Result<(), String> {
 /// before the real daemon binds: in that scenario `bind(2)` fails with
 /// `EADDRINUSE` for the daemon and `connect(2)` succeeds for us against the
 /// attacker's socket. Validating ownership and mode out-of-band closes the gap.
-/// Stat is not racy here because we never re-stat after this check — the FD we
-/// then connect to is anchored to the inode the kernel resolves during this
-/// single call (and any swap underneath us produces an obvious connection error
-/// from `UnixStream::connect`).
+///
+/// **The stat is NOT an anchor, and this comment used to say it was** (issue
+/// #1121 round two). The wording was "the FD we then connect to is anchored to
+/// the inode the kernel resolves during this single call", and that is false:
+/// the `lstat` here and the `connect(2)` a caller makes afterwards are two
+/// separate pathname resolutions, and a probe that connects and drops its
+/// stream before the real connect makes a third. What is actually true is
+/// narrower, and still worth having:
+///
+/// - A **stable** foreign entry — a socket, link or file another uid planted
+///   and left there — is refused, and refused without a `connect(2)` being
+///   attempted or the entry being touched.
+/// - In a **sticky** directory a foreign uid cannot replace a *live*
+///   victim-owned inode, because only the entry's owner may unlink it. The
+///   reachable replacement window is the one where the name is genuinely
+///   free: an old daemon unlinks its socket during shutdown, and a foreign
+///   process binds a permissive listener before the next check.
+///
+/// That window is closed one layer down rather than here, by the peer-uid
+/// refusal welded into every Unix connect entry point
+/// ([`crate::platform::ipc`]'s `refuse_foreign_peer`) — a credential the
+/// kernel records for the connection itself, which no amount of care with a
+/// pathname can substitute for. This check still runs first and still earns
+/// its place: it is what keeps the deck from connecting to a foreign entry at
+/// all, rather than connecting and then dropping the stream.
 ///
 /// **The stat is an `lstat`, so a symlink at the endpoint path is refused on its
 /// own account and its target decides nothing** (issue #1020). It used to be
@@ -302,13 +534,86 @@ mod tests {
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).expect("chmod");
     }
 
+    /// A `tempfile::tempdir()` whose mode is restated after creation.
+    ///
+    /// [`with_socket_umask`] raises the **process** mask to `0o177` for the
+    /// duration of a bind, and its own doc records what that costs a
+    /// concurrent thread: a `tempfile::tempdir()` created in that window comes
+    /// out at `0o600`, with no search bit, and every later write inside it
+    /// fails `EACCES`. `cargo test` runs this module's tests as threads in one
+    /// process and this module is where the mask is raised, so the two meet
+    /// here more than anywhere else — measured while round two of issue #1121
+    /// was adding three tests to it, as `ensure_owner_only_dir_still_creates_and_repairs_real_dirs`
+    /// failing with `Permission denied` roughly one run in three.
+    ///
+    /// Restating the mode is the cheap, local fix. It is not a fix for the
+    /// window itself, which cannot be closed from this side: nothing makes an
+    /// unrelated thread's directory creation take [`UMASK_LOCK`].
+    fn sandbox() -> tempfile::TempDir {
+        let root = tempfile::tempdir().expect("tempdir");
+        chmod(root.path(), 0o700);
+        root
+    }
+
+    /// Issue #1121: the wording [`chmod_refusal`] renders when the directory
+    /// belongs to another uid. Everything an operator needs to act is in one
+    /// line — which directory, who owns it, who we are, and the way out — where
+    /// before there was a bare `Operation not permitted`.
+    ///
+    /// This asserts the **message**, not the branch. Reaching the branch needs
+    /// a directory owned by a second account, which a test process cannot
+    /// create without one or without root; the wording is the part that is
+    /// testable on any host, exactly as for [`endpoint_uid_is_trusted`].
+    #[test]
+    fn the_foreign_owner_refusal_names_the_directory_the_owner_and_the_way_out() {
+        let source = std::io::Error::from_raw_os_error(libc::EPERM);
+        let rendered =
+            foreign_owner_refusal(Path::new("/tmp/dot-agent-deck-4242"), 4242, 1000, &source);
+
+        assert!(rendered.contains("/tmp/dot-agent-deck-4242"), "{rendered}");
+        assert!(rendered.contains("uid 4242"), "{rendered}");
+        assert!(rendered.contains("uid 1000"), "{rendered}");
+        assert!(
+            rendered.contains("DOT_AGENT_DECK_"),
+            "the refusal must name the escape hatch: {rendered}"
+        );
+        assert!(
+            rendered.contains(&source.to_string()),
+            "the underlying errno must survive, so an unexpected cause is still \
+             readable: {rendered}"
+        );
+    }
+
+    /// The other arm of [`chmod_refusal`], and the one that is reachable
+    /// in-test: a `set_permissions` failure with no foreign owner behind it
+    /// keeps the original wording and gains the path.
+    ///
+    /// Driven with a path that does not exist, which is what
+    /// `ensure_owner_only_dir` hands the chmod when its own `mkdir` produced
+    /// nothing — the shape `state_dir`'s empty-override guard records having
+    /// measured as `ENOENT`.
+    #[test]
+    fn a_chmod_failure_with_no_foreign_owner_keeps_its_own_reason_and_gains_the_path() {
+        let root = sandbox();
+        let absent = root.path().join("absent");
+        let err = chmod_refusal(&absent, std::io::Error::from_raw_os_error(libc::ENOENT));
+
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound, "{err}");
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains(&absent.display().to_string()),
+            "the path is the thing the bare errno was missing: {rendered}"
+        );
+        assert!(rendered.contains("0o700"), "{rendered}");
+    }
+
     /// A same-uid attacker plants a symlink at the path the deck is about to use
     /// for its state dir / lock root, pointing at a directory of their choosing.
     /// `ensure_owner_only_dir` must refuse the path outright rather than follow
     /// it and chmod 0o700 onto the attacker's target.
     #[test]
     fn ensure_owner_only_dir_refuses_a_symlinked_target() {
-        let root = tempfile::tempdir().expect("tempdir");
+        let root = sandbox();
         let victim = root.path().join("victim");
         std::fs::create_dir(&victim).expect("create the victim directory");
         chmod(&victim, 0o755);
@@ -342,7 +647,7 @@ mod tests {
     /// neither the path nor the reason.
     #[test]
     fn ensure_owner_only_dir_refuses_a_dangling_symlink() {
-        let root = tempfile::tempdir().expect("tempdir");
+        let root = sandbox();
         let planted = root.path().join("state");
         std::os::unix::fs::symlink(root.path().join("nowhere"), &planted)
             .expect("plant the dangling symlink");
@@ -358,7 +663,7 @@ mod tests {
     /// refused *everything* would look like a fix.
     #[test]
     fn ensure_owner_only_dir_still_creates_and_repairs_real_dirs() {
-        let root = tempfile::tempdir().expect("tempdir");
+        let root = sandbox();
 
         let fresh = root.path().join("a").join("b");
         ensure_owner_only_dir(&fresh).expect("create a fresh nested directory");
@@ -379,6 +684,79 @@ mod tests {
         assert_eq!(mode_of(&loose), 0o700);
     }
 
+    /// Issue #1121 round two: the symlink a foreign uid plants *after* the
+    /// `lstat` guard has run. That window cannot be opened from a test — the
+    /// point is that there is no longer a second pathname resolution to race —
+    /// so this drives [`open_dir_nofollow`], the seam the whole claim rests on,
+    /// against a link directly. `O_NOFOLLOW` must answer `ELOOP`, the refusal
+    /// must read like the `lstat` one, and the target must keep its mode.
+    #[test]
+    fn the_descriptor_open_refuses_a_symlink_and_leaves_its_target_alone() {
+        let root = sandbox();
+        let victim = root.path().join("victim");
+        std::fs::create_dir(&victim).expect("create the victim directory");
+        chmod(&victim, 0o755);
+
+        let planted = root.path().join("endpoints");
+        std::os::unix::fs::symlink(&victim, &planted).expect("plant the symlink");
+
+        let err = open_dir_nofollow(&planted).expect_err("O_NOFOLLOW must refuse a symlink");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{err}");
+        assert!(err.to_string().contains("symlink"), "{err}");
+        assert_eq!(
+            mode_of(&victim),
+            0o755,
+            "nothing may be chmodded through the link"
+        );
+    }
+
+    /// The `0o000` repair the old comment cited as the reason not to use a
+    /// descriptor at all. A directory we own with no read bit cannot be opened
+    /// even by its owner, so the `EACCES` arm falls back to a path chmod and
+    /// then re-opens — and the outcome the caller sees must be the same `0o700`
+    /// it always was.
+    #[test]
+    fn ensure_owner_only_dir_still_repairs_a_directory_it_cannot_open() {
+        let root = sandbox();
+        let unreadable = root.path().join("unreadable");
+        std::fs::create_dir(&unreadable).expect("create the directory");
+        chmod(&unreadable, 0o000);
+        assert!(
+            std::fs::read_dir(&unreadable).is_err(),
+            "the premise of this test is a directory its owner cannot open"
+        );
+
+        ensure_owner_only_dir(&unreadable).expect("repair an unreadable directory");
+        assert_eq!(mode_of(&unreadable), 0o700);
+    }
+
+    /// A regular file sitting at the directory's name. Before the descriptor
+    /// work this reached a path-based `chmod` and turned that file owner-only;
+    /// now `O_DIRECTORY` answers `ENOTDIR` and the refusal names the path.
+    #[test]
+    fn ensure_owner_only_dir_refuses_a_regular_file_at_the_path() {
+        let root = sandbox();
+        let planted = root.path().join("endpoints");
+        std::fs::write(&planted, b"not a directory").expect("plant a regular file");
+        chmod(&planted, 0o644);
+
+        let err = ensure_owner_only_dir(&planted).expect_err("a regular file must be refused");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{err}");
+        assert!(
+            err.to_string().contains(&planted.display().to_string()),
+            "the refusal must name the path: {err}"
+        );
+        assert_eq!(
+            mode_of(&planted),
+            0o644,
+            "the planted file must not be chmodded"
+        );
+        assert_eq!(
+            std::fs::read(&planted).expect("the planted file survives"),
+            b"not a directory"
+        );
+    }
+
     /// Issue #669's scope note, mechanized: the sibling `create_owner_only_dir`
     /// does **not** share the permission-tightening exposure, because it never
     /// chmods — `DirBuilder`'s mode applies only to a directory the call itself
@@ -387,7 +765,7 @@ mod tests {
     /// the call returns, the attacker's target keeps its mode.
     #[test]
     fn create_owner_only_dir_never_tightens_through_a_symlink() {
-        let root = tempfile::tempdir().expect("tempdir");
+        let root = sandbox();
         let victim = root.path().join("victim");
         std::fs::create_dir(&victim).expect("create the victim directory");
         chmod(&victim, 0o755);
@@ -432,7 +810,7 @@ mod tests {
     /// inverting that comparison refuses our own socket here.
     #[test]
     fn verify_endpoint_trusted_accepts_our_own_0o600_socket() {
-        let root = tempfile::tempdir().expect("tempdir");
+        let root = sandbox();
         let endpoint = root.path().join("attach.sock");
         let _listener = bind_trusted_socket(&endpoint);
 
@@ -451,7 +829,7 @@ mod tests {
     /// silently pass a test that only exercised the loose direction.
     #[test]
     fn verify_endpoint_trusted_refuses_every_mode_but_exactly_0o600() {
-        let root = tempfile::tempdir().expect("tempdir");
+        let root = sandbox();
         let endpoint = root.path().join("attach.sock");
         let _listener = bind_trusted_socket(&endpoint);
 
@@ -487,7 +865,7 @@ mod tests {
     fn verify_endpoint_trusted_refuses_a_path_that_is_not_a_socket() {
         use std::os::unix::ffi::OsStrExt;
 
-        let root = tempfile::tempdir().expect("tempdir");
+        let root = sandbox();
 
         // A regular file at exactly the mode a socket would be accepted at, so
         // the refusal can only be coming from the file-type clause.
@@ -540,7 +918,7 @@ mod tests {
     /// the path".
     #[test]
     fn verify_endpoint_trusted_refuses_a_path_with_nothing_at_it() {
-        let root = tempfile::tempdir().expect("tempdir");
+        let root = sandbox();
 
         let missing = root.path().join("never-bound.sock");
         let err = verify_endpoint_trusted(&missing).expect_err("an absent endpoint is refused");
@@ -579,7 +957,7 @@ mod tests {
     /// socket would be a regression wearing a fix's clothes.
     #[test]
     fn verify_endpoint_trusted_refuses_a_symlink_to_a_trusted_socket() {
-        let root = tempfile::tempdir().expect("tempdir");
+        let root = sandbox();
         let real = root.path().join("real.sock");
         let _listener = bind_trusted_socket(&real);
 
@@ -615,7 +993,7 @@ mod tests {
     /// target's business for three of these four cases.
     #[test]
     fn verify_endpoint_trusted_refuses_a_symlink_whatever_it_points_at() {
-        let root = tempfile::tempdir().expect("tempdir");
+        let root = sandbox();
 
         let socket = root.path().join("real.sock");
         let _listener = bind_trusted_socket(&socket);
@@ -659,7 +1037,7 @@ mod tests {
     /// the endpoint itself.
     #[test]
     fn verify_endpoint_trusted_accepts_a_socket_under_a_symlinked_ancestor() {
-        let root = tempfile::tempdir().expect("tempdir");
+        let root = sandbox();
         let real_dir = root.path().join("real-dir");
         std::fs::create_dir(&real_dir).expect("create the real directory");
         let endpoint = real_dir.join("attach.sock");

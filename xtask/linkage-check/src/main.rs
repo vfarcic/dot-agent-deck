@@ -73,6 +73,9 @@
 //!      written `no_voice` reason, and the registry literal stays
 //!      statically readable. It proves the registry is CONSISTENT, not
 //!      that it is COMPLETE; see [`voice_command_registry`].
+//!  15. No bare `Command::new("git")` in test-support code — all of
+//!      `tests/`, plus the files on [`EXTRA_GIT_COVERED`]. Issues
+//!      #834 / #1121. See [`BARE_GIT_RULE`].
 //!
 //!   The numbers are stable identifiers in the failure output, so a
 //!   new rule takes the next one rather than renumbering the others.
@@ -323,6 +326,88 @@ const EXTRA_TEMP_COVERED: &[&str] = &["src/dispatch.rs"];
 
 /// Opt-out marker for check 8, on the offending line.
 const BARE_TEMPDIR_ALLOW: &str = "linkage-check:allow-bare-tempdir";
+
+/// Check 15 (issues #834, #1121): a fixture must not shell out to `git` with a
+/// bare [`std::process::Command`].
+///
+/// Git resolves a repository from `GIT_DIR` and the other discovery variables
+/// in PREFERENCE to the process cwd, so `Command::new("git").current_dir(dir)`
+/// is not scoped to `dir` at all: under an ambient `GIT_DIR` — routine
+/// mid-`rebase --exec`, in a pre-commit hook, under `bisect run` — a fixture's
+/// `init`, `add`, `commit` and `worktree add` are WRITES against whatever that
+/// variable names, which under `cargo test` can be the checkout the suite is
+/// running in. The configuration half matters in the other direction: a
+/// fixture that inherits a developer's `~/.gitconfig` passes on a box that has
+/// a commit identity and fails on one that does not, which is every CI runner.
+///
+/// **This rule is here because enumerating the call sites has now failed
+/// twice.** Issue #834 fixed `xtask/linkage-check`'s `mod real_git`. Issue
+/// #1121 round two fixed two named fixtures in `src/` and stopped, leaving
+/// `dispatch::tests::git_in` — which round three then had to find from a red
+/// CI job, because the identity it needed came from the developer's own global
+/// config and nothing local could see the difference. A list that has to be
+/// re-derived by hand each time is the defect; this makes the next omission
+/// fail the build instead.
+const BARE_GIT_RULE: &str = "bare `Command::new(\"git\")` in test-support code — go through a \
+     fixture helper (`worktree_owner::fixture_git` in `src/`, `common::fixture_git` \
+     under `tests/`) so an ambient `GIT_DIR` cannot redirect the command and the \
+     commit identity does not come from the developer's own config (issues #834, \
+     #1121)";
+
+/// Opt-out marker for check 13, on the offending line.
+///
+/// Taken by the fixture helpers themselves — each one IS the single bare
+/// `Command::new("git")` that the neutralisation is then applied to — and by
+/// `worktree_owner::git_at`, which is production.
+const BARE_GIT_ALLOW: &str = "linkage-check:allow-bare-git";
+
+/// Files outside `tests/` that check 13 covers.
+///
+/// The three `src/` modules whose unit tests build real git repositories and
+/// worktrees. Their PRODUCTION git calls do not go through
+/// `Command::new("git")` at all — `dispatch.rs` and `issue_dispatch_run.rs`
+/// spawn git through `run_status` / `run_capture_args`, and
+/// `worktree_owner.rs`'s one production site is `git_at`, which carries
+/// [`BARE_GIT_ALLOW`] — so the rule reaches their fixtures without reaching
+/// their production paths.
+///
+/// `src/worktree_reclaim.rs` is deliberately absent: its four bare sites are
+/// production, operating on the user's real repository, where reading the
+/// user's own config is the point. Whether production should also neutralise
+/// the LOCATION half is a live question and a behaviour change — measured
+/// under an ambient `GIT_DIR`, `create_worktree` adds worktrees and branches
+/// to whatever repository it names — but it is not this rule's business.
+///
+/// Paths are repo-relative and compared with the platform separator
+/// normalised, so this works on Windows too.
+const EXTRA_GIT_COVERED: &[&str] = &[
+    "src/dispatch.rs",
+    "src/issue_dispatch_run.rs",
+    "src/worktree_owner.rs",
+];
+
+/// `Command::new("git")`, however it is spelled — `std::process::`-qualified,
+/// imported, or with whitespace inside the call.
+///
+/// Deliberately narrow: it matches the PROGRAM being `git` and nothing else.
+/// `run_status("git", …)` and friends are not matched, because those are the
+/// production helpers and production is out of this rule's scope; a `git`
+/// resolved through a variable is not matched either, which is the usual limit
+/// of a textual guard and the reason [`BARE_GIT_RULE`] calls itself a guard
+/// rather than a proof.
+fn bare_git_ctor_re() -> Regex {
+    Regex::new(r#"Command::new\s*\(\s*"git"\s*\)"#).expect("bare git constructor regex compiles")
+}
+
+/// Whether check 13 applies to `file`.
+fn git_ctor_rule_covers(file: &Path, root: &Path, tests_dir: &Path) -> bool {
+    if file.starts_with(tests_dir) {
+        return true;
+    }
+    EXTRA_GIT_COVERED
+        .iter()
+        .any(|rel| file == root.join(rel).as_path())
+}
 
 /// The `tempfile` constructors that allocate in the **default** temp dir.
 ///
@@ -823,7 +908,9 @@ fn main() -> ExitCode {
     let polling_re =
         Regex::new(r"for\s+_\s+in\s+0\.\.\s*\d+\s*\{").expect("polling regex compiles");
     let bare_tempdir_re = bare_temp_ctor_re();
+    let bare_git_re = bare_git_ctor_re();
     let mut bare_tempdir_violations: Vec<String> = Vec::new();
+    let mut bare_git_violations: Vec<String> = Vec::new();
     let mut unarmed_spawn_violations: Vec<String> = Vec::new();
     let mut overlong_cap_violations: Vec<String> = Vec::new();
 
@@ -877,6 +964,23 @@ fn main() -> ExitCode {
                 if bare_tempdir_re.is_match(stripped_line) && !raw.contains(BARE_TEMPDIR_ALLOW) {
                     bare_tempdir_violations.push(format!(
                         "{}:{}: {BARE_TEMPDIR_RULE}",
+                        file.display(),
+                        idx + 1
+                    ));
+                }
+            }
+        }
+
+        // Check 15 (issues #834, #1121): all of `tests/`, plus
+        // `EXTRA_GIT_COVERED` for the lib target's fixtures. Run against the
+        // stripped view so a comment naming the constructor is not a
+        // violation, but report the raw line number — same shape as check 8.
+        if git_ctor_rule_covers(file, &root, &tests_dir) {
+            for (idx, raw) in raw_lines.iter().enumerate() {
+                let stripped_line = stripped_lines.get(idx).copied().unwrap_or("");
+                if bare_git_re.is_match(stripped_line) && !raw.contains(BARE_GIT_ALLOW) {
+                    bare_git_violations.push(format!(
+                        "{}:{}: {BARE_GIT_RULE}",
                         file.display(),
                         idx + 1
                     ));
@@ -1026,6 +1130,8 @@ fn main() -> ExitCode {
             .map(|v| format!("[8] {v}")),
     );
 
+    failures.extend(bare_git_violations.into_iter().map(|v| format!("[15] {v}")));
+
     failures.extend(
         unarmed_spawn_violations
             .into_iter()
@@ -1095,7 +1201,7 @@ fn main() -> ExitCode {
 
     if failures.is_empty() {
         println!(
-            "linkage-check: ok ({} catalog ids, {} annotations, {} allowlisted, 14 rules)",
+            "linkage-check: ok ({} catalog ids, {} annotations, {} allowlisted, 15 rules)",
             catalog_ids.len(),
             discovered.len(),
             allowlist.len()
@@ -1808,6 +1914,67 @@ mod tests {
         ] {
             assert!(re.is_match(line), "should be a violation: {line}");
         }
+    }
+
+    // --- check 13: bare `Command::new("git")` in test-support code ---
+
+    #[test]
+    fn bare_git_ctor_re_matches_every_spelling_of_the_constructor() {
+        let re = bare_git_ctor_re();
+        for line in [
+            r#"        let out = std::process::Command::new("git")"#,
+            r#"    let out = Command::new("git")"#,
+            r#"    let mut cmd = Command::new( "git" );"#,
+            r#"    let s = Command::new("git").args(["status"]).status();"#,
+        ] {
+            assert!(re.is_match(line), "should be a violation: {line}");
+        }
+    }
+
+    /// The rule is about the PROGRAM being `git`, not about the word appearing.
+    /// Production spawns git through `run_status` / `run_capture_args`, and a
+    /// fixture that already goes through a helper must not be flagged — nor
+    /// must a `git` STUB the harness writes onto `PATH` for the binary under
+    /// test, which is a file being created rather than a command being run.
+    #[test]
+    fn bare_git_ctor_re_leaves_helpers_and_stubs_alone() {
+        let re = bare_git_ctor_re();
+        for line in [
+            r#"        let out = fixture_git(&repo, sandbox_root).args(args).output();"#,
+            r#"    let out = common::fixture_git(dir, dir).args(args).output();"#,
+            r#"    run_status("git", &["-C", clone, "fetch"]).await?;"#,
+            r#"    let head = run_capture_args("git", &["-C", &clone, "rev-parse"]).await;"#,
+            r#"    let git = bindir.join("git");"#,
+            r#"    let out = Command::new("gh").args(["pr", "list"]).output();"#,
+            r#"    let out = Command::new(git_bin).args(args).output();"#,
+        ] {
+            assert!(!re.is_match(line), "should NOT be a violation: {line}");
+        }
+    }
+
+    /// Scope: **all** of `tests/`, plus the three `src/` modules whose unit
+    /// tests build real repositories. `src/worktree_reclaim.rs` stays out
+    /// deliberately — its bare sites are production, operating on the user's
+    /// own repository.
+    #[test]
+    fn git_ctor_rule_covers_the_documented_scope() {
+        let root = Path::new("/repo");
+        let tests_dir = root.join("tests");
+        let covers = |rel: &str| git_ctor_rule_covers(&root.join(rel), root, &tests_dir);
+
+        assert!(covers("tests/e2e_issue_dispatch.rs"));
+        assert!(covers("tests/common/mod.rs"));
+        assert!(covers("tests/worktree_reclaim.rs"));
+        // A directory rule, so a file that does not exist yet inherits it.
+        assert!(covers("tests/some_future_suite.rs"));
+
+        assert!(covers("src/dispatch.rs"));
+        assert!(covers("src/issue_dispatch_run.rs"));
+        assert!(covers("src/worktree_owner.rs"));
+
+        // Production, and out of scope on purpose.
+        assert!(!covers("src/worktree_reclaim.rs"));
+        assert!(!covers("src/config.rs"));
     }
 
     /// Scope: **all** of `tests/` — the e2e tier, the harness, and the fast-tier

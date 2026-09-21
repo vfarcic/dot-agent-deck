@@ -1772,13 +1772,17 @@ mod tunnel {
 
     /// The shell snippet the discovery probe runs on the far host.
     ///
-    /// It is the remote half of [`crate::platform::paths::attach_socket_path`],
-    /// in the order that function resolves: the explicit override, then
-    /// `$XDG_RUNTIME_DIR`, then the uid-suffixed `/tmp` fallback. **It has to be
-    /// re-stated rather than derived**, because OpenSSH expands neither `~` nor
-    /// an environment variable on the remote side of `-L` and the far host's
-    /// `XDG_RUNTIME_DIR` and uid are not knowable from here — which is the whole
-    /// reason [`crate::remote_tunnel::RemoteSocketPath`] is stored rather than
+    /// It is the remote half of [`crate::platform::paths::attach_socket_path`]
+    /// and of [`crate::endpoint_resolve::client_attach_socket_path`], in the
+    /// order those resolve: the explicit override, then `$XDG_RUNTIME_DIR`,
+    /// then the per-uid temp-dir fallback — and in that last case the new
+    /// `dot-agent-deck-{uid}/attach.sock` spelling first, with issue #1121's
+    /// pre-#1121 `dot-agent-deck-attach-{uid}.sock` consulted only if nothing
+    /// is at the new one. **It has to be re-stated rather than derived**,
+    /// because OpenSSH expands neither `~` nor an environment variable on the
+    /// remote side of `-L` and the far host's `XDG_RUNTIME_DIR` and uid are not
+    /// knowable from here — which is the whole reason
+    /// [`crate::remote_tunnel::RemoteSocketPath`] is stored rather than
     /// computed.
     ///
     /// # The first rung is not a filesystem test at all (issue #1174)
@@ -1882,7 +1886,95 @@ mod tunnel {
     /// `the_probe_prefers_a_resolver_that_answers` and its neighbours, each of
     /// which runs it under every `sh` the machine has.
     ///
-    /// Keep the fallback in step with that function. The two ends drifting
+    /// # What the fallback's own clauses do (issue #1121)
+    ///
+    /// Keep it in step with those functions. The two ends drifting shows up as
+    /// a discovered path that never forwards, which reads to the user as a deck
+    /// that is not running — and the fallback branch is where that bites
+    /// hardest, because the far host is exactly where `XDG_RUNTIME_DIR` is
+    /// commonly unset and it may well be running a build older or newer than
+    /// this one.
+    ///
+    /// The compatibility choice is made by `[ -S … ] && [ ! -h … ] && [ -O … ]`
+    /// rather than by guessing, which is the closest a shell snippet gets to
+    /// the client's own connect probe. Where neither candidate qualifies the
+    /// **new** spelling is printed, matching what a fresh daemon over there
+    /// would bind.
+    ///
+    /// **`-O` — "owned by the effective uid" — is the part issue #1121 round
+    /// two added, and it is here because of the ordering rather than because of
+    /// `-S`.** The legacy rung was printed with no test at all before this
+    /// change, so the ability to plant something at it is not new; what *is*
+    /// new is that a candidate at the per-uid directory path outranks the
+    /// legacy one, so a foreign uid who wins the directory race on the remote
+    /// host could shadow a legitimate legacy daemon merely by creating an entry.
+    ///
+    /// **Requiring ownership narrowed that; on its own it did not remove it,
+    /// and this comment said it did.** `-S` and `-O` both **follow symlinks**,
+    /// so a *symlink* planted at `$dad_new` and pointing at any socket the
+    /// invoking user already owns satisfies both and outranks a live legacy
+    /// daemon — the shadowing survives the ownership test by not being tested
+    /// at the entry that was planted. `[ ! -h … ]` is what removes that route,
+    /// on both rungs: the legacy candidate sits in a world-writable sticky
+    /// `/tmp`, where planting a name nothing holds is if anything easier than
+    /// winning the per-uid directory.
+    ///
+    /// **State that at its real width.** It is denial of *discovery*, not a
+    /// hijack: `-O` still constrains the symlink's target to a socket the
+    /// invoking user owns, so a foreign uid cannot put their own listener in
+    /// front of the user this way — they can only steer the tunnel at one of
+    /// the user's own sockets, which is not the daemon, so the remote deck
+    /// reads as unavailable. What none of the three clauses does is prove
+    /// anything about *who is listening* on whatever is selected; that is a
+    /// gap this probe has always had and needs a trusted resolver on the far
+    /// side to close.
+    ///
+    /// It also brings the two ends of the same decision back into step, which
+    /// is what this doc comment is otherwise entirely about: the **local**
+    /// resolver's trust check already refuses a symlink outright, whatever it
+    /// points at — [`crate::platform::fsperm::verify_endpoint_trusted`], pinned
+    /// by `verify_endpoint_trusted_refuses_a_symlink_to_a_trusted_socket`. The
+    /// shell snippet was the one side of the pair that did not.
+    ///
+    /// `-h` rather than `-L`, which is the operator the finding proposed:
+    /// `dash`'s own manual documents `-L` as "retained for compatibility with
+    /// previous versions of this program. Do not rely on its existence; use
+    /// `-h` instead", and `dash` is this repo's `/bin/sh`. `-h` is also the one
+    /// POSIX `test` defines. Measured, on a symlink to a socket this uid owns:
+    /// `dash`, `bash` and `busybox sh` each answer true for all of `-S`, `-O`,
+    /// `-L` and `-h` — which is both the confirmation that `-h` is available
+    /// and the demonstration of the defect.
+    ///
+    /// `-O` is **not** in POSIX `test`, and that is deliberate rather than
+    /// overlooked. Verified by running it: `dash` (this repo's `/bin/sh`) and
+    /// `busybox sh` both implement it, as do `bash`, `ksh` and `zsh`. A shell
+    /// that does not prints an "unexpected operator" diagnostic and returns
+    /// non-zero, which makes the `&&` false, the branch untaken and the snippet
+    /// fall through to printing the new spelling — a safe degradation to
+    /// exactly the pre-#1121 answer, still exiting 0. The negated clause
+    /// degrades the same way and was measured in its own shape rather than
+    /// assumed to: `[ ! -Q "$f" ]` with an operator no shell knows errors in
+    /// `dash`, `bash` and `busybox sh` alike and the rung is **not** taken, so
+    /// `!` never turns a diagnostic into a selection. Adding `-h` therefore
+    /// narrows the set of shells neither rung works on by nothing at all, since
+    /// each already requires the less portable `-O`.
+    ///
+    /// `${TMPDIR:-/tmp}` is the remote's temp dir. It does not reproduce
+    /// `std::env::temp_dir()` literally — that function honours an **empty**
+    /// `TMPDIR` and yields a relative path — and the two are kept in step from
+    /// the *other* end: [`crate::platform::paths::fallback_endpoint_dir`]
+    /// normalises an empty `TMPDIR` to `/tmp` so that both sides answer the
+    /// same thing. This comment used to claim the divergence was harmless
+    /// because a relative endpoint "the daemon cannot bind" meant there was no
+    /// live daemon to find. That was wrong: `bind(2)` accepts a relative
+    /// pathname perfectly well, so the daemon really would have bound one
+    /// relative to its own cwd while this probe answered `/tmp/...` and
+    /// discovery reported a running remote deck as unavailable. The legacy
+    /// candidate keeps its literal `/tmp` for the reason
+    /// [`crate::platform::paths::legacy_attach_socket_path`] records: that is
+    /// what older builds hardcoded, with no `$TMPDIR` consultation at all.
+    ///
+    /// Keep the fallback in step with those functions. The two ends drifting
     /// shows up as a discovered path that never forwards, which reads to the
     /// user as a deck that is not running. The resolver rung is what shrinks
     /// that standing obligation — it cannot drift, because it *is* the
@@ -1911,7 +2003,14 @@ mod tunnel {
         "elif [ -n \"${XDG_RUNTIME_DIR:-}\" ]; then ",
         "printf '%s/dot-agent-deck-attach.sock\\n' \"$XDG_RUNTIME_DIR\"; ",
         "else ",
-        "printf '/tmp/dot-agent-deck-attach-%s.sock\\n' \"$(id -u)\"; ",
+        "dad_uid=$(id -u); ",
+        "dad_new=\"${TMPDIR:-/tmp}/dot-agent-deck-$dad_uid/attach.sock\"; ",
+        "dad_old=\"/tmp/dot-agent-deck-attach-$dad_uid.sock\"; ",
+        "if [ -S \"$dad_new\" ] && [ ! -h \"$dad_new\" ] && [ -O \"$dad_new\" ]; ",
+        "then printf '%s\\n' \"$dad_new\"; ",
+        "elif [ -S \"$dad_old\" ] && [ ! -h \"$dad_old\" ] && [ -O \"$dad_old\" ]; ",
+        "then printf '%s\\n' \"$dad_old\"; ",
+        "else printf '%s\\n' \"$dad_new\"; fi; ",
         "fi"
     );
 
@@ -2356,9 +2455,12 @@ mod tunnel {
     ///
     /// `$XDG_RUNTIME_DIR` when it is set — a per-user, mode-0700,
     /// wiped-on-logout directory, which is the correct home for a socket — and
-    /// a uid-suffixed directory under the system temp dir otherwise. The `/tmp`
-    /// fallback mirrors [`crate::platform::paths::attach_socket_path`]'s, uid
-    /// included, and is created through
+    /// a uid-suffixed directory under the system temp dir otherwise. The
+    /// temp-dir fallback mirrors
+    /// [`crate::platform::paths::fallback_endpoint_dir`]'s, uid included —
+    /// issue #1121 copied this shape over there, so the two are now the same
+    /// pattern rather than a reference and an exception — and is created
+    /// through
     /// [`crate::platform::fsperm::ensure_owner_only_dir`], which refuses a
     /// symlink and fails closed when it cannot set 0o700 — which is what it
     /// does when another user got there first.
@@ -2866,6 +2968,326 @@ pub use tunnel::{
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -- the remote discovery probe ----------------------------------------
+
+    /// Run [`REMOTE_SOCKET_PROBE`] (or a variant of it) under `/bin/sh` with a
+    /// controlled environment and return the single line it prints.
+    ///
+    /// Executing the snippet rather than matching substrings of it is the
+    /// point: this constant is a *program*, its whole job is to answer with a
+    /// path, and a string assertion would pass over a syntax error or an
+    /// inverted `-S` test alike.
+    #[cfg(unix)]
+    fn run_socket_probe(snippet: &str, env: &[(&str, &str)]) -> String {
+        let output = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(snippet)
+            .env_remove("DOT_AGENT_DECK_ATTACH_SOCKET")
+            .env_remove("XDG_RUNTIME_DIR")
+            .env_remove("TMPDIR")
+            .envs(env.iter().copied())
+            .output()
+            .expect("run the discovery probe under /bin/sh");
+        assert!(
+            output.status.success(),
+            "the probe must exit 0; stderr:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    #[cfg(unix)]
+    fn probe_uid() -> u32 {
+        crate::platform::paths::current_uid()
+    }
+
+    /// The first two rungs are untouched by issue #1121 and must stay so: an
+    /// explicit `DOT_AGENT_DECK_ATTACH_SOCKET` wins outright, and
+    /// `$XDG_RUNTIME_DIR` keeps the spelling it has always had. Those are the
+    /// two cases a remote host in the field is most likely to be in, and the
+    /// compatibility work below must not have disturbed either.
+    #[cfg(unix)]
+    #[test]
+    fn the_probe_still_prefers_the_override_then_xdg_runtime_dir() {
+        assert_eq!(
+            run_socket_probe(
+                REMOTE_SOCKET_PROBE,
+                &[("DOT_AGENT_DECK_ATTACH_SOCKET", "/srv/deck/attach.sock")]
+            ),
+            "/srv/deck/attach.sock"
+        );
+        assert_eq!(
+            run_socket_probe(
+                REMOTE_SOCKET_PROBE,
+                &[("XDG_RUNTIME_DIR", "/run/user/1000")]
+            ),
+            "/run/user/1000/dot-agent-deck-attach.sock",
+            "the XDG spelling does not move (issue #1121 DECISION 1)"
+        );
+        assert_eq!(
+            run_socket_probe(
+                REMOTE_SOCKET_PROBE,
+                &[
+                    ("DOT_AGENT_DECK_ATTACH_SOCKET", "/srv/deck/attach.sock"),
+                    ("XDG_RUNTIME_DIR", "/run/user/1000"),
+                ]
+            ),
+            "/srv/deck/attach.sock",
+            "the override outranks XDG"
+        );
+    }
+
+    /// With neither variable set the probe names the post-#1121 spelling —
+    /// `${TMPDIR:-/tmp}/dot-agent-deck-{uid}/attach.sock` — whether or not
+    /// anything is listening there. A host with no daemon at all must be told
+    /// about the path a fresh one over there would bind, not about the legacy
+    /// one.
+    #[cfg(unix)]
+    #[test]
+    fn the_probe_names_the_new_fallback_spelling_by_default() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let uid = probe_uid();
+        let expected = format!("{}/dot-agent-deck-{uid}/attach.sock", temp.path().display());
+
+        assert_eq!(
+            run_socket_probe(
+                REMOTE_SOCKET_PROBE,
+                &[("TMPDIR", &temp.path().to_string_lossy())]
+            ),
+            expected,
+            "nothing bound anywhere: name the path a fresh daemon would bind"
+        );
+
+        std::fs::create_dir(temp.path().join(format!("dot-agent-deck-{uid}")))
+            .expect("the per-uid endpoint directory");
+        let _listener =
+            std::os::unix::net::UnixListener::bind(&expected).expect("bind the new endpoint");
+        assert_eq!(
+            run_socket_probe(
+                REMOTE_SOCKET_PROBE,
+                &[("TMPDIR", &temp.path().to_string_lossy())]
+            ),
+            expected,
+            "a live new-spelling endpoint is the answer"
+        );
+    }
+
+    /// The compatibility branch: nothing at the new spelling, a socket at the
+    /// legacy one, so the legacy one is named — which is what lets a newer
+    /// desktop discover a remote host still running a pre-#1121 build instead
+    /// of reporting a deck that is not there.
+    ///
+    /// The snippet under test has its legacy prefix rewritten into the
+    /// tempdir, because the real one is a literal `/tmp/dot-agent-deck-attach-`
+    /// and a unit test has no business binding a socket at the path a live
+    /// deck on this machine would use.
+    /// [`the_probe_keeps_the_literal_tmp_legacy_prefix`] pins the literal
+    /// itself; this pins the order the two candidates are tried in.
+    #[cfg(unix)]
+    #[test]
+    fn the_probe_falls_back_to_the_legacy_spelling_when_only_it_is_bound() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let uid = probe_uid();
+        let legacy_prefix = format!("{}/legacy-attach-", temp.path().display());
+        let snippet = REMOTE_SOCKET_PROBE.replace("/tmp/dot-agent-deck-attach-", &legacy_prefix);
+        assert_ne!(
+            snippet, REMOTE_SOCKET_PROBE,
+            "the rewrite must actually match, or this test proves nothing"
+        );
+
+        let legacy = format!("{legacy_prefix}{uid}.sock");
+        let _listener =
+            std::os::unix::net::UnixListener::bind(&legacy).expect("bind the legacy endpoint");
+        assert_eq!(
+            run_socket_probe(&snippet, &[("TMPDIR", &temp.path().to_string_lossy())]),
+            legacy,
+            "an older build's daemon must still be discoverable"
+        );
+
+        // …and the moment the new spelling is bound too, it wins again.
+        let new_dir = temp.path().join(format!("dot-agent-deck-{uid}"));
+        std::fs::create_dir(&new_dir).expect("the per-uid endpoint directory");
+        let new = new_dir.join("attach.sock");
+        let _new_listener =
+            std::os::unix::net::UnixListener::bind(&new).expect("bind the new endpoint");
+        assert_eq!(
+            run_socket_probe(&snippet, &[("TMPDIR", &temp.path().to_string_lossy())]),
+            new.to_string_lossy(),
+            "the new spelling outranks the legacy one whenever both are live"
+        );
+    }
+
+    /// The legacy candidate is spelled with a **literal** `/tmp` and must stay
+    /// that way: a pre-#1121 build hardcoded `/tmp` with no `$TMPDIR`
+    /// consultation, so on a macOS remote — where `$TMPDIR` is a per-user
+    /// directory under `/var/folders/…` — deriving it from `TMPDIR` would look
+    /// for the old daemon somewhere it has never bound. The new candidate, by
+    /// contrast, must honour `$TMPDIR`, because
+    /// [`crate::platform::paths::fallback_endpoint_dir`] uses
+    /// `std::env::temp_dir()`.
+    #[cfg(unix)]
+    #[test]
+    fn the_probe_keeps_the_literal_tmp_legacy_prefix() {
+        // Derived from the Rust resolvers rather than retyped (round two, N1).
+        // The literals used to be spelled out here, so renaming the endpoint
+        // file or the directory format on the Rust side left every shell test
+        // green while the two ends silently drifted — and a drifted probe reads
+        // to the user as a remote deck that is not running.
+        let uid = probe_uid().to_string();
+        let shell_uid = |path: &std::path::Path| {
+            let rendered = path.to_string_lossy().into_owned();
+            assert_eq!(
+                rendered.matches(&uid).count(),
+                1,
+                "this derivation only works while the uid appears once in {rendered}"
+            );
+            rendered.replace(&uid, "$dad_uid")
+        };
+
+        let fallback = crate::platform::paths::fallback_attach_socket_path();
+        let tail = fallback
+            .strip_prefix(std::env::temp_dir())
+            .expect("the fallback endpoint lives under the temp dir");
+        assert!(
+            REMOTE_SOCKET_PROBE.contains(&format!("${{TMPDIR:-/tmp}}/{}", shell_uid(tail))),
+            "the new candidate must honour the remote's TMPDIR and match \
+             fallback_attach_socket_path: {REMOTE_SOCKET_PROBE}"
+        );
+
+        let legacy = shell_uid(&crate::platform::paths::legacy_attach_socket_path());
+        assert!(
+            legacy.starts_with("/tmp/"),
+            "the legacy candidate must stay a literal /tmp path, not {legacy}"
+        );
+        assert!(
+            REMOTE_SOCKET_PROBE.contains(&format!("\"{legacy}\"")),
+            "the legacy candidate must match legacy_attach_socket_path: {REMOTE_SOCKET_PROBE}"
+        );
+
+        assert!(
+            !REMOTE_SOCKET_PROBE.contains("$UID"),
+            "$UID is not POSIX and dash leaves it unset: {REMOTE_SOCKET_PROBE}"
+        );
+    }
+
+    /// Round two, B3 (partial): a candidate another uid owns must not be
+    /// preferred. Planting one owned by a *different* uid needs a second
+    /// account, so this drives the `-O` clause the way it is actually reachable
+    /// from a test — by rewriting it to its inverse (`! -O`) and confirming the
+    /// candidate we own is then passed over. A snippet with no ownership clause
+    /// at all would pass over nothing and fail here.
+    #[cfg(unix)]
+    #[test]
+    fn the_probe_passes_over_a_candidate_it_does_not_own() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let uid = probe_uid();
+        let new_dir = temp.path().join(format!("dot-agent-deck-{uid}"));
+        std::fs::create_dir(&new_dir).expect("the per-uid endpoint directory");
+        let new = new_dir.join("attach.sock");
+        let _listener =
+            std::os::unix::net::UnixListener::bind(&new).expect("bind the new endpoint");
+
+        let legacy_prefix = format!("{}/legacy-attach-", temp.path().display());
+        let inverted = REMOTE_SOCKET_PROBE
+            .replace("/tmp/dot-agent-deck-attach-", &legacy_prefix)
+            .replace("[ -O ", "! [ -O ");
+        assert_ne!(
+            inverted, REMOTE_SOCKET_PROBE,
+            "the rewrite must actually match, or this test proves nothing"
+        );
+
+        // Both candidates now read as foreign-owned, so neither may be
+        // preferred and the answer falls through to the new spelling.
+        let legacy = format!("{legacy_prefix}{uid}.sock");
+        let _legacy_listener =
+            std::os::unix::net::UnixListener::bind(&legacy).expect("bind the legacy endpoint");
+        assert_eq!(
+            run_socket_probe(&inverted, &[("TMPDIR", &temp.path().to_string_lossy())]),
+            new.to_string_lossy(),
+            "a candidate that fails the ownership test must not be selected"
+        );
+    }
+
+    /// A **symlink** at the new per-uid candidate must not outrank a live
+    /// legacy daemon, even when it points at a socket this very uid owns.
+    ///
+    /// `-S` and `-O` both follow symlinks, so before `[ ! -h … ]` this exact
+    /// arrangement made the probe answer `$dad_new` while the only daemon on
+    /// the host was at `$dad_old`. The target is deliberately a socket we own,
+    /// because that is the reachable shape: a foreign uid who wins the per-uid
+    /// directory cannot make `-O` pass for a socket of their own, so the harm
+    /// available to them is denial of discovery rather than a hijack — and a
+    /// test that planted a foreign-owned target would need a second account
+    /// and would prove the weaker thing.
+    #[cfg(unix)]
+    #[test]
+    fn the_probe_passes_over_a_symlinked_candidate() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let uid = probe_uid();
+        let legacy_prefix = format!("{}/legacy-attach-", temp.path().display());
+        let snippet = REMOTE_SOCKET_PROBE.replace("/tmp/dot-agent-deck-attach-", &legacy_prefix);
+        assert_ne!(
+            snippet, REMOTE_SOCKET_PROBE,
+            "the rewrite must actually match, or this test proves nothing"
+        );
+
+        // The legitimate daemon: an older build, at the legacy spelling.
+        let legacy = format!("{legacy_prefix}{uid}.sock");
+        let _legacy_listener =
+            std::os::unix::net::UnixListener::bind(&legacy).expect("bind the legacy endpoint");
+
+        // A real socket this uid owns, standing in for whatever the planted
+        // link would be aimed at. Somewhere else entirely — the point is that
+        // the link's own path is the one that gets ranked.
+        let decoy = temp.path().join("some-other.sock");
+        let _decoy_listener =
+            std::os::unix::net::UnixListener::bind(&decoy).expect("bind the decoy socket");
+
+        // The plant: the per-uid directory exists, and the endpoint name in it
+        // is a symlink rather than a socket.
+        let new_dir = temp.path().join(format!("dot-agent-deck-{uid}"));
+        std::fs::create_dir(&new_dir).expect("the per-uid endpoint directory");
+        let new = new_dir.join("attach.sock");
+        std::os::unix::fs::symlink(&decoy, &new).expect("plant the symlink at the new candidate");
+
+        // Fixture precondition, measured rather than assumed: the two clauses
+        // that were there before this one BOTH pass on the plant. Without this
+        // the test could go green on a link that was simply broken.
+        for clause in ["-S", "-O"] {
+            let probe = format!("if [ {clause} \"$1\" ]; then printf yes; else printf no; fi");
+            let out = std::process::Command::new("/bin/sh")
+                .args(["-c", &probe, "_"])
+                .arg(&new)
+                .output()
+                .expect("run the clause probe");
+            assert_eq!(
+                String::from_utf8_lossy(&out.stdout),
+                "yes",
+                "fixture precondition: `{clause}` must FOLLOW the symlink and pass, or the \
+                 symlink clause is not what this test is measuring"
+            );
+        }
+
+        assert_eq!(
+            run_socket_probe(&snippet, &[("TMPDIR", &temp.path().to_string_lossy())]),
+            legacy,
+            "a symlink at the new candidate must not shadow the live legacy daemon"
+        );
+
+        // And the same plant at the legacy rung falls through to the default
+        // rather than being forwarded to: with nothing bound at either real
+        // candidate, the answer is the new spelling a fresh daemon would bind.
+        drop(_legacy_listener);
+        std::fs::remove_file(&legacy).expect("remove the legacy socket");
+        std::fs::remove_file(&new).expect("remove the new candidate's symlink");
+        std::os::unix::fs::symlink(&decoy, &legacy).expect("plant the symlink at the legacy path");
+        assert_eq!(
+            run_socket_probe(&snippet, &[("TMPDIR", &temp.path().to_string_lossy())]),
+            new.to_string_lossy(),
+            "a symlink at the legacy candidate must not be selected either"
+        );
+    }
 
     // -- validated ssh arguments -------------------------------------------
 
