@@ -223,6 +223,194 @@ fn command_is_replaceable(command: &str, binary_path: &str) -> bool {
     command_is_this_binary(command, binary_path) || command_is_dead_deck(command, binary_path)
 }
 
+/// Refresh this install's command hook inside ONE event array **without moving
+/// any rule or handler that is already there**, returning whether it found a
+/// position to claim.
+///
+/// **Why position is a correctness property here and nowhere else in the deck**
+/// (issue #1034). Codex addresses a trust grant by a FILE-POSITIONAL key —
+/// `<sourcePath>:<event_snake>:<group_idx>:<handler_idx>`, where `group_idx` is
+/// the rule's index in the event array and `handler_idx` the handler's index
+/// inside that rule. `<CODEX_HOME>/hooks.json` is the **user's own** user-scope
+/// hooks file (`source: "user"`); the deck shares it and does not own it. So
+/// moving a rule the deck did not write re-keys the user's grant: the record
+/// they trusted stops binding to their handler — left behind under the old key,
+/// or overwritten outright when the deck's own rule lands on that very key (see
+/// below) — and Codex refuses to run the handler until they re-review it
+/// (`1 hook needs review before it can run`). The deck never touched their
+/// rule — it relocated it, and the relocation is what broke the binding.
+///
+/// **Measured against real codex-cli 0.149.0**, driven through the shipped
+/// `hooks install --agent codex` with the deck's rule at index 0 and a user's
+/// `/usr/bin/env USER_HOOK=1` appended at index 1, both carrying the
+/// `[hooks.state]` record Codex itself writes. Before a re-install the user's
+/// entry reports `pre_tool_use:1:0 trustStatus: trusted`. After the old
+/// strip-then-append it reports `pre_tool_use:0:0 trustStatus: modified` — it
+/// was moved onto the deck's own stale `:0:0` record, whose hash does not match
+/// it. Through this function, even with the deck's command CHANGED so it is a
+/// real refresh rather than a no-op, the user stays at `:1:0 trusted`.
+///
+/// **And the user's record was not merely orphaned — it was OVERWRITTEN**,
+/// which is worse than issue #1034 states and is the sharpest reason to fix
+/// this at the position rather than by migrating records afterwards. The deck's
+/// rule landed on `:1:0`, the key the user's handler had been occupying, and
+/// [`upsert_trust_record`] updates whatever row is already at a key. Measured on
+/// the same run: `[hooks.state]` afterwards holds the deck's hash at BOTH
+/// `:0:0` and `:1:0`, and the user's hash is gone from the table entirely. So
+/// re-trusting in `/hooks` is the way back: what is lost is the user's grant
+/// itself, not a hash that could be recomputed from their definition.
+///
+/// (With only the user's record present — the deck's own hooks left untrusted —
+/// the same move reads `untrusted` at `:0:0` rather than `modified`. Same
+/// outcome for the user, different wording from Codex, so do not pin either
+/// spelling as the symptom.)
+///
+/// So: **only removal shifts**. Appending at the end of the array moves nothing,
+/// which is why the caller's fallback is safe; overwriting in place moves
+/// nothing, which is what this does.
+///
+/// What it claims, and the order it looks in, is `strip_deck_commands`'s own
+/// walk order — rules in order, and within a rule its nested `hooks` handlers in
+/// order — so the FIRST replaceable command wins. That the claim is the *first*
+/// match is load-bearing: every surplus match then sits after it, so nothing
+/// done to those can move the claim or empty a rule ahead of it.
+///
+/// **Surplus handlers are removed only from the TAIL of a rule**, and that is
+/// the correction Greptile's P1 on PR #1166 forced. Removing a handler that a
+/// surviving one follows shifts that survivor's `handler_idx` — this very
+/// defect one level down, and the first draft did it to a rule shaped
+/// `[deck-claimed, deck-surplus, user]`, moving the user from `:0:2` to
+/// `:0:1`. An interior surplus is therefore kept and REFRESHED instead, which
+/// costs a second firing of the deck's own hook and buys the user's grant. It
+/// is refreshed rather than merely left alone because a stale dead pin in place
+/// is an exec failure on every event, where a duplicate is not.
+///
+/// Three deliberate conservatisms:
+///
+/// - **Only the `command` string is overwritten.** Every other key on the
+///   handler object — `async`, `timeoutSec`, anything a user hand-added — and
+///   the rule's own `matcher` are left exactly as they were. That is the
+///   "never rewrite more of a third-party file than the deck put there" rule
+///   this module already follows, and it also keeps Codex's `currentHash`
+///   stable across a steady-state install: the hash is a SHA-256 over command +
+///   `matcher` + `async`, so an unchanged command under preserved siblings
+///   leaves the deck's own grant valid instead of churning it.
+/// - **A rule emptied by the surplus sweep is kept, not dropped.** Measured on
+///   0.149.0 in both shapes this sweep can leave — `{"hooks": []}` and a bare
+///   `{}` — placed at index 1: the handlers either side reported
+///   `pre_tool_use:0:0` and `pre_tool_use:2:0`, with `warnings` and `errors`
+///   both empty. So an emptied rule contributes no trust key of its own, draws
+///   no complaint, and still consumes its `group_idx` — which is exactly what
+///   makes keeping it preserve the indices of everything after it.
+///   Dropping it would re-introduce the defect this function exists to remove,
+///   in exchange for tidiness in a file the deck does not own.
+/// - **The legacy flat rule shape (`{"command": …}`) claims nothing, but is
+///   still swept.** This adapter's writer emits only the nested shape, so a
+///   flat deck-owned rule here came from somewhere else, and how Codex indexes
+///   a handler inside one has not been measured. A flat match reached before
+///   any nested one therefore returns `false` and hands the whole array back to
+///   the caller's strip-then-append path — the pre-#1034 behaviour, unchanged —
+///   rather than guessing at a shape no probe covers. A flat match reached
+///   *after* the claim is removed, which is safe for a measured reason rather
+///   than a hopeful one: a rule carrying no `hooks` array contributes no
+///   listed entry at all, so it holds no trust key and taking its `command`
+///   out moves nothing. (It also never ran under Codex, so this is tidying
+///   rather than a duplicate-fire fix.)
+///
+/// The signature takes `&mut [Value]` rather than `&mut Vec<Value>` on purpose:
+/// this function may edit a rule but may never add or remove one, and that is
+/// the whole property, so the type says it.
+fn refresh_deck_rule_in_place(rules: &mut [Value], command: &str, binary_path: &str) -> bool {
+    let replaceable = |value: &Value| {
+        value
+            .as_str()
+            .is_some_and(|cmd| command_is_replaceable(cmd, binary_path))
+    };
+
+    // Locate the first replaceable command, in `strip_deck_commands`'s walk
+    // order. A flat rule reached before any nested handler abandons the claim.
+    let mut claim = None;
+    'scan: for (rule_idx, rule) in rules.iter().enumerate() {
+        if let Some(handlers) = rule.get("hooks").and_then(Value::as_array) {
+            for (handler_idx, handler) in handlers.iter().enumerate() {
+                if handler.get("command").is_some_and(&replaceable) {
+                    claim = Some((rule_idx, handler_idx));
+                    break 'scan;
+                }
+            }
+        }
+        if rule.get("command").is_some_and(&replaceable) {
+            return false;
+        }
+    }
+    let Some((claimed_rule, claimed_handler)) = claim else {
+        return false;
+    };
+
+    // Drop surplus copies of this install — a second handler for the same
+    // binary, or a dead pin under its basename — but ONLY from the TAIL of a
+    // rule's handler list, because removing one that a surviving handler
+    // follows shifts that handler's `handler_idx`. That is this very defect at
+    // handler granularity, and the first draft of this function had it
+    // (Greptile P1 on PR #1166): a rule holding
+    // `[deck-claimed, deck-surplus, user]` moved the user from `:0:2` to
+    // `:0:1`. Rules before the claim are never visited, since the scan above
+    // stops at the first replaceable command in either shape.
+    for (rule_idx, rule) in rules.iter_mut().enumerate().skip(claimed_rule) {
+        if let Some(handlers) = rule.get_mut("hooks").and_then(Value::as_array_mut) {
+            while let Some(last_idx) = handlers.len().checked_sub(1) {
+                if (rule_idx, last_idx) == (claimed_rule, claimed_handler)
+                    || !handlers[last_idx].get("command").is_some_and(&replaceable)
+                {
+                    break;
+                }
+                handlers.pop();
+            }
+        }
+        // The legacy flat `command` goes unconditionally: measured on 0.149.0,
+        // a rule carrying no `hooks` array contributes NO listed entry at all —
+        // a `{"type":"command","command":…}` rule placed at index 1 left the
+        // handlers either side reporting `pre_tool_use:0:0` and
+        // `pre_tool_use:2:0` with no warnings — so it holds no trust key of its
+        // own and taking the key out moves nothing. (It also means such a rule
+        // never runs under Codex, so this is tidying, not a duplicate-fire
+        // fix.) The rule OBJECT stays, which is what keeps `group_idx` still.
+        if rule.get("command").is_some_and(&replaceable)
+            && let Some(object) = rule.as_object_mut()
+        {
+            object.remove("command");
+        }
+    }
+
+    // Refresh EVERY replaceable handler still standing, not only the claim.
+    // An interior surplus that the tail rule above could not remove would
+    // otherwise be left carrying a stale command — and if it is a dead pin,
+    // that is an exec failure on every event rather than a harmless duplicate.
+    // Refreshing it costs a second firing of the deck's own hook, which is the
+    // cheaper side of the trade against re-keying a user's grant.
+    for rule in rules.iter_mut().skip(claimed_rule) {
+        let Some(handlers) = rule.get_mut("hooks").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for handler in handlers.iter_mut() {
+            if !handler.get("command").is_some_and(&replaceable) {
+                continue;
+            }
+            let Some(object) = handler.as_object_mut() else {
+                continue;
+            };
+            object.insert("command".into(), Value::String(command.to_string()));
+            // Only when absent: a handler carrying a deck command but no `type`
+            // is one the deck did not write, and Codex needs the discriminant
+            // to run it. An existing value is the user's and not ours to fix.
+            object
+                .entry("type")
+                .or_insert_with(|| Value::String("command".into()));
+        }
+    }
+    true
+}
+
 /// Merge the deck's command hooks for `command` — the command built for
 /// `binary_path` — into an existing `hooks.json` value (or `{}`), preserving any
 /// user-authored hooks and refreshing (not duplicating) this binary's own prior
@@ -231,6 +419,14 @@ fn command_is_replaceable(command: &str, binary_path: &str) -> bool {
 /// `binary_path` is passed alongside the already-built `command` because the two
 /// answer different questions: `command` is what gets WRITTEN, `binary_path` is
 /// what decides which existing deck commands may be overwritten.
+///
+/// **Preserving a user hook's POSITION is part of preserving it** (issue
+/// #1034). Codex keys a trust grant by a rule's index in the event array, so
+/// leaving a user's rule untouched while moving it still breaks their grant.
+/// Under the events this installs, the refresh is therefore in place — see
+/// [`refresh_deck_rule_in_place`], which carries the measurement. The one place
+/// an index can still move is the retired-event sweep below, because removing a
+/// rule is what that sweep IS.
 fn install_impl(root: &mut Value, command: &str, binary_path: &str) {
     use crate::agent_hook_config::strip_deck_commands;
 
@@ -290,15 +486,35 @@ fn install_impl(root: &mut Value, command: &str, binary_path: &str) {
             *arr = json!([]);
         }
         let arr = arr.as_array_mut().expect("hook event value is an array");
-        // Normalize down to a single fresh rule, but only for THIS binary —
-        // plus any deck pin sharing its basename that the deck would not
-        // itself write (missing, bare or relative, non-executable, or a
-        // build-artifact path), the shape N worktree builds actually take. A
-        // deck rule belonging to a genuinely different, still-valid install is
-        // left in place and the new rule is added ALONGSIDE it (issue #730),
-        // which is what Claude's `install_impl` has always done.
-        strip_deck_commands(arr, |cmd| command_is_replaceable(cmd, binary_path));
-        arr.push(entry.clone());
+        // Normalize down to a single rule, but only for THIS binary — plus any
+        // deck pin sharing its basename that the deck would not itself write
+        // (missing, bare or relative, non-executable, or a build-artifact
+        // path), the shape N worktree builds actually take. A deck rule
+        // belonging to a genuinely different, still-valid install is left in
+        // place and the new rule is added ALONGSIDE it (issue #730), which is
+        // what Claude's `install_impl` has always done.
+        //
+        // REFRESH IN PLACE FIRST (issue #1034). Codex's trust keys are
+        // file-positional, so removing this install's rule and appending a
+        // fresh one re-keyed every user rule that happened to sit after it and
+        // silently untrusted the user's own hook. Overwriting the command where
+        // it already sits moves nothing at all;
+        // `refresh_deck_rule_in_place` has the measurement and the three
+        // conservatisms. Only when it finds nothing of ours to claim does the
+        // old path run — and then the strip removes nothing (there was no
+        // replaceable command to remove) and the push lands at the END of the
+        // array, which shifts no existing index either.
+        //
+        // The one shift this does NOT remove is the retired-event sweep above:
+        // taking a deck rule out of an event the deck no longer installs is a
+        // removal, and a removal cannot help but move what follows it. That
+        // path fires only when `CODEX_HOOK_EVENTS` shrinks, and there is
+        // nothing to overwrite it with, so it is left as it is rather than
+        // papered over with a tombstone rule.
+        if !refresh_deck_rule_in_place(arr, command, binary_path) {
+            strip_deck_commands(arr, |cmd| command_is_replaceable(cmd, binary_path));
+            arr.push(entry.clone());
+        }
     }
 }
 

@@ -1785,6 +1785,109 @@ mod tunnel {
     /// [`crate::remote_tunnel::RemoteSocketPath`] is stored rather than
     /// computed.
     ///
+    /// # The first rung is not a filesystem test at all (issue #1174)
+    ///
+    /// Everything below the `for` loop is the **fallback**, and the paragraph
+    /// above describes it. The snippet's first move is to run the far host's
+    /// own `dot-agent-deck daemon endpoint`, which answers from inside this
+    /// program rather than from a shell restatement of it: it resolves the path
+    /// with [`crate::platform::paths::attach_socket_path`] itself, runs
+    /// [`crate::platform::fsperm::verify_endpoint_trusted`] on it, completes a
+    /// bounded attach-protocol `Hello` against whatever is listening, and
+    /// prints nothing unless all three hold.
+    ///
+    /// Two things that buys, stated at their real width:
+    ///
+    /// - **An untrusted endpoint is no longer forwarded.** A mode check has no
+    ///   portable `test` spelling, so no rung below has one or can: a socket at
+    ///   `0666` is refused by the resolver and by no clause beneath it. That
+    ///   refusal **binds** — exit `1` ends the snippet with no path at all,
+    ///   rather than dropping to a rung that would print the same path
+    ///   unchecked. Without that, every check here would be advisory (PR #1191
+    ///   review, P1).
+    /// - **A live process is observed at all.** The `Hello` is the only clause
+    ///   in this snippet that looks at anything but an inode, and an inode
+    ///   outlives the process that bound it.
+    ///
+    ///   **Be exact about what that buys today, because the obvious claim is
+    ///   too strong.** A dead endpoint exits `3`, not `1`, so the snippet falls
+    ///   through and the rungs below still name the path — the user still gets
+    ///   `DeckNotAnswering`, exactly as before. That is deliberate: `3` is what
+    ///   lets a dead *first* candidate yield to a live *second* one, which is
+    ///   the case that arises once there is more than one candidate to try. The
+    ///   stale-inode gain is therefore latent rather than user-visible here.
+    /// - **One implementation of the rule instead of two**, which is the
+    ///   maintenance half and is immediate.
+    ///
+    /// **It is not authentication, and nothing here should be read as claiming
+    /// it is.** A completed `Hello` proves that something is listening and
+    /// speaks this wire; it does not prove that something is the deck's daemon.
+    /// An attacker who is already running **as the remote login user** can bind
+    /// a `0o600` socket of their own at the path and can replace the very
+    /// binary this rung invokes, so against that actor the resolver adds no
+    /// refusal. What it closes is the foreign-uid and the stale-inode cases.
+    /// Making a forwarded endpoint self-describing needs the remote end to
+    /// assert an identity **in-band** — issue #1189, and
+    /// `docs/develop/remote-endpoint-discovery.md` for why that is a different
+    /// kind of change rather than a bigger one.
+    ///
+    /// # Why the fallback stays
+    ///
+    /// A remote host whose binary predates this subcommand exits `2` (clap
+    /// reports an unrecognised subcommand), one that is not installed at all
+    /// fails `[ -x ]`, and either way the loop drops through to the rungs below
+    /// — so discovery against those hosts is exactly what it was, and no host
+    /// has to be upgraded before a desktop can be.
+    ///
+    /// **Read the codes rather than "zero or not".** `0` and `1` are the two
+    /// answers, and everything else is "this host could not tell me": `2` from
+    /// clap, `126`/`127` from the shell, and `3` from the command itself when
+    /// it looked and learned nothing. Collapsing `1` into that set is precisely
+    /// the defect the review found — it would let a `0666` listener the
+    /// resolver had just rejected be printed by the rung below and forwarded.
+    ///
+    /// `[ -x "$dad_cmd" ]` and not `command -v "$dad_cmd"` for the absolute
+    /// candidate, because `command -v` on an **absolute** path answers about
+    /// existence rather than executability in `dash` and `busybox sh`: measured,
+    /// `command -v /etc/hostname` exits 0 in both, and 1 in `bash`. `command -v`
+    /// is the right tool for the *PATH* candidate, where the lookup does test
+    /// executability, and the wrong question for the absolute one.
+    ///
+    /// **That is a clarity choice and not a defence, which is worth saying
+    /// because the obvious stronger claim is false.** Writing the absolute
+    /// candidate with `command -v` produces the same answer in every case
+    /// tested: a non-executable file passes the predicate, the invocation then
+    /// fails to exec, and `|| continue` catches that — measured at rc `126`
+    /// under `dash`, `bash` and `busybox sh` alike. The mutation was run, and
+    /// none of the tests below distinguishes the two spellings. So `[ -x ]` is
+    /// here because it asks what this line means to ask, not because something
+    /// gets through without it.
+    ///
+    /// Both candidates are tried, in that order, because `~/.local/bin` — the
+    /// path [`crate::remote`]'s installer writes — is often absent from the
+    /// `PATH` of a non-interactive `ssh` command, while a host whose deck came
+    /// from a package manager has only the PATH one.
+    ///
+    /// `2>/dev/null` on the invocation, for one narrow reason rather than
+    /// tidiness. An older remote build's clap diagnostic would otherwise land
+    /// in the probe's captured stderr, and `discover_socket` reads that stream
+    /// on its failure path to decide between two *states*: it reports
+    /// `NoRemoteSocket` — "this run could not learn a path" — only when the
+    /// captured stderr is **empty**, and `TransportFailed` otherwise. So a
+    /// diagnostic we expect and have already handled would downgrade an honest
+    /// answer into a transport error the user cannot act on. Note how narrow
+    /// that is: on the ordinary older-build path the snippet exits 0 with a
+    /// path from the rungs below that parses, `discover_socket` returns before
+    /// it reaches the classification, and the captured stderr is not read.
+    ///
+    /// Measured under `dash` (this repo's `/bin/sh`), `bash` and `busybox sh`,
+    /// which agree on every one of the cases above. The snippet is executed as
+    /// a program rather than string-matched by `tunnel_tests`'
+    /// `the_probe_prefers_a_resolver_that_answers` and its neighbours, each of
+    /// which runs it under every `sh` the machine has.
+    ///
+    /// # What the fallback's own clauses do (issue #1121)
+    ///
     /// Keep it in step with those functions. The two ends drifting shows up as
     /// a discovered path that never forwards, which reads to the user as a deck
     /// that is not running — and the fallback branch is where that bites
@@ -1871,11 +1974,30 @@ mod tunnel {
     /// [`crate::platform::paths::legacy_attach_socket_path`] records: that is
     /// what older builds hardcoded, with no `$TMPDIR` consultation at all.
     ///
+    /// Keep the fallback in step with those functions. The two ends drifting
+    /// shows up as a discovered path that never forwards, which reads to the
+    /// user as a deck that is not running. The resolver rung is what shrinks
+    /// that standing obligation — it cannot drift, because it *is* the
+    /// function — but it does not retire it while the fallback exists.
+    ///
     /// `id -u` rather than `$UID` because `$UID` is not POSIX and a `dash`
     /// login shell leaves it unset. `printf` rather than `echo` for the reason
     /// every portable script uses it. Nothing here interpolates a value from
     /// this side, so there is no quoting decision to get wrong.
     pub const REMOTE_SOCKET_PROBE: &str = concat!(
+        // The resolver rung (issue #1174). See the doc comment above: this is
+        // the only clause in the snippet that observes a live process. `0` and
+        // `1` are the two answers — a path, or a binding refusal that ends the
+        // snippet — and every other code falls through to the rungs below,
+        // which is the compatibility path for a host whose binary is older than
+        // the subcommand or is not installed at all.
+        "for dad_cmd in \"${HOME:-}/.local/bin/dot-agent-deck\" \"$(command -v dot-agent-deck 2>/dev/null)\"; do ",
+        "[ -n \"$dad_cmd\" ] && [ -x \"$dad_cmd\" ] || continue; ",
+        "dad_answer=$(\"$dad_cmd\" daemon endpoint 2>/dev/null); dad_rc=$?; ",
+        "if [ \"$dad_rc\" = 0 ] && [ -n \"$dad_answer\" ]; ",
+        "then printf '%s\\n' \"$dad_answer\"; exit 0; fi; ",
+        "if [ \"$dad_rc\" = 1 ]; then exit 0; fi; ",
+        "done; ",
         "if [ -n \"${DOT_AGENT_DECK_ATTACH_SOCKET:-}\" ]; then ",
         "printf '%s\\n' \"$DOT_AGENT_DECK_ATTACH_SOCKET\"; ",
         "elif [ -n \"${XDG_RUNTIME_DIR:-}\" ]; then ",
@@ -5529,5 +5651,423 @@ mod tunnel_tests {
         let connection = EndpointConnection::Remote(Box::new(tunnel));
         let address: &Path = connection.connect_address();
         assert_eq!(address, socket.as_path());
+    }
+
+    // -- the resolver rung of the discovery probe (issue #1174) -------------
+    //
+    // These run [`REMOTE_SOCKET_PROBE`] as a *program*, under every `sh` this
+    // machine has, against a stand-in `dot-agent-deck`. Executing it is the
+    // point: the constant's whole job is to answer with a path, and a
+    // substring assertion over its text would pass over a syntax error, an
+    // inverted test or a `continue` that never fires.
+
+    /// Every `sh` on this machine worth running the snippet under.
+    ///
+    /// `/bin/sh` is what `ssh host 'command'` actually reaches and is always
+    /// first. `bash` and `busybox sh` are added when present because the far
+    /// host is not this machine: `busybox` is what a container image usually
+    /// has, and the three disagree about `command -v` on an absolute path,
+    /// which is exactly the disagreement the snippet had to be written around.
+    /// A machine with only one of them still runs every case below; it just
+    /// proves less, which is why the list is not asserted to be long.
+    #[cfg(unix)]
+    fn probe_shells() -> Vec<Vec<String>> {
+        let mut shells = vec![vec!["/bin/sh".to_string()]];
+        for candidate in ["/bin/bash", "/bin/dash"] {
+            if std::path::Path::new(candidate).exists() {
+                shells.push(vec![candidate.to_string()]);
+            }
+        }
+        for busybox in ["/usr/bin/busybox", "/bin/busybox"] {
+            if std::path::Path::new(busybox).exists() {
+                shells.push(vec![busybox.to_string(), "sh".to_string()]);
+                break;
+            }
+        }
+        shells
+    }
+
+    /// Run `snippet` under one shell with a fully controlled environment and
+    /// return the single line it printed.
+    ///
+    /// `env_clear` rather than `env_remove` of the three variables the snippet
+    /// reads: `HOME` and `PATH` are what select the resolver, so a leaked
+    /// ambient one would let this machine's own installed deck answer and the
+    /// test would pass while proving nothing about the snippet.
+    #[cfg(unix)]
+    fn run_probe_under(shell: &[String], snippet: &str, env: &[(&str, &str)]) -> String {
+        let mut command = std::process::Command::new(&shell[0]);
+        command.args(&shell[1..]);
+        command.arg("-c").arg(snippet);
+        command.env_clear();
+        // The fallback rungs call `id -u`, so the child needs a PATH even
+        // when the test is about there being no deck on it.
+        command.env("PATH", "/usr/bin:/bin");
+        command.envs(env.iter().copied());
+        let output = command.output().expect("run the discovery probe");
+        assert!(
+            output.status.success(),
+            "the probe must exit 0 under {shell:?}; stderr:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    /// Write an executable stand-in `dot-agent-deck` into `dir` and return the
+    /// directory, creating it first.
+    #[cfg(unix)]
+    fn install_standin(dir: &Path, script: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::create_dir_all(dir).expect("create the stand-in directory");
+        let bin = dir.join("dot-agent-deck");
+        std::fs::write(&bin, script).expect("write the stand-in");
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755))
+            .expect("make the stand-in executable");
+        dir.to_path_buf()
+    }
+
+    /// A stand-in that answers `daemon endpoint` with `path` and refuses
+    /// anything else, the way the real subcommand does.
+    #[cfg(unix)]
+    fn answering_standin(path: &str) -> String {
+        format!(
+            "#!/bin/sh\n\
+             [ \"$1\" = daemon ] && [ \"$2\" = endpoint ] || {{ echo 'unexpected argv' >&2; exit 2; }}\n\
+             printf '%s\\n' '{path}'\n"
+        )
+    }
+
+    /// A stand-in for a remote build **older** than the subcommand: clap exits
+    /// 2 with an unrecognised-subcommand diagnostic on stderr.
+    #[cfg(unix)]
+    const OLDER_BUILD_STANDIN: &str = "#!/bin/sh\n\
+                                       echo \"error: unrecognized subcommand 'endpoint'\" >&2\n\
+                                       exit 2\n";
+
+    /// The answer the fallback rungs give for a given `XDG_RUNTIME_DIR`, which
+    /// is what every fall-through case below must land on.
+    #[cfg(unix)]
+    const XDG_FALLBACK_ANSWER: &str = "/run/user/1000/dot-agent-deck-attach.sock";
+
+    /// A resolver that answers wins outright — ahead of every rung below it,
+    /// including an explicit `DOT_AGENT_DECK_ATTACH_SOCKET`.
+    ///
+    /// That ordering is the fix for issue #1174: the rungs below name a path
+    /// without ever observing a process, so a stale inode left by a dead daemon
+    /// is named exactly as a live one is. Only the resolver connects.
+    #[cfg(unix)]
+    #[test]
+    fn the_probe_prefers_a_resolver_that_answers() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let home = temp.path().join("home");
+        install_standin(
+            &home.join(".local/bin"),
+            &answering_standin("/run/deck/attach.sock"),
+        );
+        for shell in probe_shells() {
+            assert_eq!(
+                run_probe_under(
+                    &shell,
+                    REMOTE_SOCKET_PROBE,
+                    &[
+                        ("HOME", &home.to_string_lossy()),
+                        ("DOT_AGENT_DECK_ATTACH_SOCKET", "/srv/stale.sock"),
+                        ("XDG_RUNTIME_DIR", "/run/user/1000"),
+                    ]
+                ),
+                "/run/deck/attach.sock",
+                "the resolver's answer must outrank every filesystem rung ({shell:?})"
+            );
+        }
+    }
+
+    /// With no deck installed on the far host at all, the snippet answers
+    /// exactly what it answered before issue #1174. This is the compatibility
+    /// property the whole rung rests on: the `continue` path is the common one
+    /// during a rollout, not an error case.
+    #[cfg(unix)]
+    #[test]
+    fn the_probe_falls_through_when_no_resolver_is_installed() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let empty_home = temp.path().join("empty-home");
+        std::fs::create_dir_all(&empty_home).expect("create the home");
+        for shell in probe_shells() {
+            assert_eq!(
+                run_probe_under(
+                    &shell,
+                    REMOTE_SOCKET_PROBE,
+                    &[
+                        ("HOME", &empty_home.to_string_lossy()),
+                        ("XDG_RUNTIME_DIR", "/run/user/1000"),
+                    ]
+                ),
+                XDG_FALLBACK_ANSWER,
+                "no deck installed must answer exactly as it did before ({shell:?})"
+            );
+            assert_eq!(
+                run_probe_under(
+                    &shell,
+                    REMOTE_SOCKET_PROBE,
+                    &[
+                        ("HOME", &empty_home.to_string_lossy()),
+                        ("DOT_AGENT_DECK_ATTACH_SOCKET", "/srv/deck/attach.sock"),
+                    ]
+                ),
+                "/srv/deck/attach.sock",
+                "the override rung is untouched ({shell:?})"
+            );
+        }
+    }
+
+    /// A remote build older than the subcommand exits non-zero, and the snippet
+    /// drops through rather than reporting nothing.
+    ///
+    /// This is the case a rollout spends most of its time in — a desktop
+    /// updated before the hosts it talks to — so getting it wrong would read to
+    /// the user as every remote deck going dark at once.
+    #[cfg(unix)]
+    #[test]
+    fn the_probe_falls_through_when_the_remote_build_is_older_than_the_subcommand() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let home = temp.path().join("home");
+        install_standin(&home.join(".local/bin"), OLDER_BUILD_STANDIN);
+        for shell in probe_shells() {
+            assert_eq!(
+                run_probe_under(
+                    &shell,
+                    REMOTE_SOCKET_PROBE,
+                    &[
+                        ("HOME", &home.to_string_lossy()),
+                        ("XDG_RUNTIME_DIR", "/run/user/1000"),
+                    ]
+                ),
+                XDG_FALLBACK_ANSWER,
+                "an older remote build must not blank the answer ({shell:?})"
+            );
+        }
+    }
+
+    /// The resolver exiting **0** with nothing on stdout is the shape a refusal
+    /// takes when it is the last candidate's turn, and it must fall through
+    /// too — `|| continue` catches the non-zero exit, and the emptiness test
+    /// catches this one. Without the second test the snippet would print a
+    /// blank line and the caller would take the line above it.
+    #[cfg(unix)]
+    #[test]
+    fn the_probe_falls_through_when_the_resolver_prints_nothing() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let home = temp.path().join("home");
+        install_standin(&home.join(".local/bin"), "#!/bin/sh\nexit 0\n");
+        for shell in probe_shells() {
+            assert_eq!(
+                run_probe_under(
+                    &shell,
+                    REMOTE_SOCKET_PROBE,
+                    &[
+                        ("HOME", &home.to_string_lossy()),
+                        ("XDG_RUNTIME_DIR", "/run/user/1000"),
+                    ]
+                ),
+                XDG_FALLBACK_ANSWER,
+                "an empty answer is a refusal, not a path ({shell:?})"
+            );
+        }
+    }
+
+    /// Both install locations are tried, in order: an older build at
+    /// `~/.local/bin` does not hide a newer one on `PATH`.
+    ///
+    /// Not hypothetical — `~/.local/bin` is where [`crate::remote`]'s installer
+    /// writes, so a host that was once set up by the deck and later got a
+    /// packaged build has exactly this layout, and the stale copy is the one
+    /// with the higher precedence.
+    #[cfg(unix)]
+    #[test]
+    fn the_probe_tries_the_path_candidate_when_the_install_path_holds_an_older_build() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let home = temp.path().join("home");
+        install_standin(&home.join(".local/bin"), OLDER_BUILD_STANDIN);
+        let on_path = install_standin(
+            &temp.path().join("usr-bin"),
+            &answering_standin("/run/deck/attach.sock"),
+        );
+        let path = format!("{}:/usr/bin:/bin", on_path.display());
+        for shell in probe_shells() {
+            assert_eq!(
+                run_probe_under(
+                    &shell,
+                    REMOTE_SOCKET_PROBE,
+                    &[
+                        ("HOME", &home.to_string_lossy()),
+                        ("PATH", &path),
+                        ("XDG_RUNTIME_DIR", "/run/user/1000"),
+                    ]
+                ),
+                "/run/deck/attach.sock",
+                "the PATH candidate must still get its turn ({shell:?})"
+            );
+        }
+    }
+
+    /// A **non-executable** file at the install path does not break discovery:
+    /// the PATH candidate still answers. A half-finished download at
+    /// `~/.local/bin/dot-agent-deck` is the ordinary way to get one.
+    ///
+    /// **What this does not pin is the `[ -x ]` clause**, and the distinction
+    /// was measured rather than assumed. Replacing `[ -x "$dad_cmd" ]` with
+    /// `command -v "$dad_cmd"` — the spelling that is wrong for an absolute
+    /// path in `dash` and `busybox sh`, where it answers about existence — left
+    /// all seven of these tests green, because the failed exec that follows
+    /// exits `126` and the invocation's own `|| continue` catches it. So this
+    /// test guards the *outcome*, and the predicate is chosen for saying what
+    /// it means. Anyone tempted to write a test that does distinguish them
+    /// should know there is no behavioural difference to assert on.
+    #[cfg(unix)]
+    #[test]
+    fn a_non_executable_file_at_the_install_path_does_not_break_discovery() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let home = temp.path().join("home");
+        let install = home.join(".local/bin");
+        std::fs::create_dir_all(&install).expect("create the install directory");
+        std::fs::write(install.join("dot-agent-deck"), "a half-finished download\n")
+            .expect("write the non-executable file");
+        let on_path = install_standin(
+            &temp.path().join("usr-bin"),
+            &answering_standin("/run/deck/attach.sock"),
+        );
+        let path = format!("{}:/usr/bin:/bin", on_path.display());
+        for shell in probe_shells() {
+            assert_eq!(
+                run_probe_under(
+                    &shell,
+                    REMOTE_SOCKET_PROBE,
+                    &[
+                        ("HOME", &home.to_string_lossy()),
+                        ("PATH", &path),
+                        ("XDG_RUNTIME_DIR", "/run/user/1000"),
+                    ]
+                ),
+                "/run/deck/attach.sock",
+                "a non-executable file must not break discovery ({shell:?})"
+            );
+        }
+    }
+
+    /// A resolver that refuses **on trust** ends the snippet with no path at
+    /// all, rather than falling through to a rung that would print the same
+    /// path unchecked.
+    ///
+    /// This is the review finding the exit codes exist for (PR #1191, P1).
+    /// Without it every check the resolver makes is advisory: it rejects a
+    /// `0666` listener, the rung below names that same path anyway, and
+    /// `discover_socket` forwards it with `ssh -L`. The snippet must still exit
+    /// **0** — "this run could not learn a path" is an answer, and
+    /// `discover_socket` turns an empty stdout with empty stderr into
+    /// `NoRemoteSocket` rather than a transport error.
+    #[cfg(unix)]
+    #[test]
+    fn the_probe_stops_when_the_resolver_refuses_on_trust() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let home = temp.path().join("home");
+        install_standin(&home.join(".local/bin"), "#!/bin/sh\nexit 1\n");
+        for shell in probe_shells() {
+            assert_eq!(
+                run_probe_under(
+                    &shell,
+                    REMOTE_SOCKET_PROBE,
+                    &[
+                        ("HOME", &home.to_string_lossy()),
+                        ("DOT_AGENT_DECK_ATTACH_SOCKET", "/srv/untrusted.sock"),
+                        ("XDG_RUNTIME_DIR", "/run/user/1000"),
+                    ]
+                ),
+                "",
+                "a trust refusal must bind, not fall through to an unchecked rung ({shell:?})"
+            );
+        }
+    }
+
+    /// A resolver that reports **undetermined** falls through, because nothing
+    /// was learned.
+    ///
+    /// The counterpart to the test above, and the reason the two codes are
+    /// separate: a path with nothing at it, a stale inode and a timed-out
+    /// handshake all exit `3`, so a dead first candidate cannot hide a live
+    /// second one, and a version-skewed daemon still reaches the desktop to be
+    /// classified there rather than being reported as a missing socket.
+    #[cfg(unix)]
+    #[test]
+    fn the_probe_falls_through_when_the_resolver_cannot_determine() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let home = temp.path().join("home");
+        install_standin(&home.join(".local/bin"), "#!/bin/sh\nexit 3\n");
+        for shell in probe_shells() {
+            assert_eq!(
+                run_probe_under(
+                    &shell,
+                    REMOTE_SOCKET_PROBE,
+                    &[
+                        ("HOME", &home.to_string_lossy()),
+                        ("XDG_RUNTIME_DIR", "/run/user/1000"),
+                    ]
+                ),
+                XDG_FALLBACK_ANSWER,
+                "an undetermined answer must keep looking ({shell:?})"
+            );
+        }
+    }
+
+    /// Every "this host cannot run it" code falls through, and only `1` binds.
+    ///
+    /// Enumerated rather than asserted for the one code the older-build test
+    /// already covers: `2` is clap's, `126` and `127` are a shell's for a file
+    /// that cannot be executed or found, and `101` is a Rust panic. Reading the
+    /// rung as "zero or not" would collapse all of these together with `1`,
+    /// which is exactly the direction that makes a trust refusal unenforceable.
+    #[cfg(unix)]
+    #[test]
+    fn only_the_untrusted_code_binds_and_every_other_failure_falls_through() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        for code in [2, 3, 101, 126, 127] {
+            let home = temp.path().join(format!("home-{code}"));
+            install_standin(
+                &home.join(".local/bin"),
+                &format!("#!/bin/sh\nexit {code}\n"),
+            );
+            for shell in probe_shells() {
+                assert_eq!(
+                    run_probe_under(
+                        &shell,
+                        REMOTE_SOCKET_PROBE,
+                        &[
+                            ("HOME", &home.to_string_lossy()),
+                            ("XDG_RUNTIME_DIR", "/run/user/1000"),
+                        ]
+                    ),
+                    XDG_FALLBACK_ANSWER,
+                    "exit {code} means the host could not answer, so the snippet must keep \
+                     going ({shell:?})"
+                );
+            }
+        }
+    }
+
+    /// `HOME` unset is an ordinary `ssh host 'command'` condition on some
+    /// setups, and the snippet must survive it rather than expanding to a bare
+    /// `/.local/bin/...` it then tries to run.
+    #[cfg(unix)]
+    #[test]
+    fn the_probe_survives_an_unset_home() {
+        for shell in probe_shells() {
+            assert_eq!(
+                run_probe_under(
+                    &shell,
+                    REMOTE_SOCKET_PROBE,
+                    &[("XDG_RUNTIME_DIR", "/run/user/1000")]
+                ),
+                XDG_FALLBACK_ANSWER,
+                "an unset HOME must fall through cleanly ({shell:?})"
+            );
+        }
     }
 }

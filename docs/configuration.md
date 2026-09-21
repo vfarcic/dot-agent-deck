@@ -27,7 +27,7 @@ When `default_command` is **unset or empty**, the new-pane form's Command field 
 | `DOT_AGENT_DECK_ATTACH_SOCKET` | `$XDG_RUNTIME_DIR/dot-agent-deck-attach.sock` or `$TMPDIR/dot-agent-deck-{uid}/attach.sock` | Unix socket path for the streaming attach protocol the TUI and the desktop app connect over. Same directory and the same rules as `DOT_AGENT_DECK_SOCKET`; the two protocols have disjoint wire formats, so they never share one endpoint. |
 | `DOT_AGENT_DECK_CONFIG` | `~/.config/dot-agent-deck/config.toml` | Config file path |
 | `DOT_AGENT_DECK_SESSION` | `~/.config/dot-agent-deck/session.toml` | Session file path |
-| `DOT_AGENT_DECK_LOG` | *(unset)* | When set, enables file-based tracing logs. Empty value or `1` writes to `/tmp/dot-agent-deck.log`; any other value is treated as the target log file path. |
+| `DOT_AGENT_DECK_LOG` | *(unset)* | When set, enables file-based tracing logs. Empty value or `1` writes to `/tmp/dot-agent-deck.log` on macOS and Linux, and to `dot-agent-deck.log` in the system temp directory (`%TEMP%`) on Windows; any other value is treated as the target log file path. |
 | `RUST_LOG` | `error,dot_agent_deck=info` | Verbosity of the `DOT_AGENT_DECK_LOG` file, in [`tracing` filter syntax](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html). Layered on top of the default, so `RUST_LOG=dot_agent_deck=debug` raises the deck to debug while an unrelated directive leaves it at `info`. No effect unless `DOT_AGENT_DECK_LOG` is also set. |
 
 ## Project Configuration

@@ -971,14 +971,36 @@ fn expand_task(mut task: ScheduledTask) -> ScheduledTask {
 /// Expand `~` and `$VAR` / `${VAR}` in a path, then resolve a relative result
 /// against `$HOME` (NOT any agent cwd — the authoring agent's cwd is
 /// irrelevant for a global daemon). PRD #127 Open Q7.
+///
+/// The `~` expansion uses the host's own separator (issue #1136). On Windows
+/// the home directory is native (`C:\Users\me`), so gluing the remainder onto
+/// it with a literal `/` produced the mixed-separator `C:\Users\me/proj`. That
+/// string resolves — Win32 accepts `/` — but it does not stay in memory: it is
+/// persisted to `schedules.toml` by `schedule add`/`update`, applied to every
+/// loaded task's `working_dir`, shown back to the user, and carried over the
+/// protocol as a fire's `working_dir` or an orchestration cwd. So what it cost
+/// was inconsistent stored and displayed text, not a failed spawn.
+///
+/// **Only the tilde expansion changes.** A path the user typed without a `~` is
+/// passed through exactly as typed on both platforms, and the relative-vs-
+/// absolute test stays the leading-`/` one rather than becoming
+/// `Path::is_absolute`. On Windows those differ — `/work/space` is rooted on
+/// whichever drive is current, so `is_absolute` is false and it would be
+/// re-anchored as `C:\work\space` — but that is a change to text the user
+/// wrote, not to text this function welded together, and several tests pin the
+/// current behaviour. Whether a driveless rooted path should be anchored at all
+/// belongs with native Windows support (#164), not here.
 pub fn expand_path(input: &str) -> String {
+    use crate::platform::paths::{join_home_and_rest, strip_tilde_prefix};
+
     let home = dirs_home();
 
-    // `~` / `~/...` → home.
+    // `~` / `~/...` → home. `~\...` counts too on Windows, where `\` is a path
+    // separator; on Unix it names a directory and is left alone.
     let after_tilde = if input == "~" {
         return home.to_string_lossy().into_owned();
-    } else if let Some(rest) = input.strip_prefix("~/") {
-        format!("{}/{}", home.to_string_lossy(), rest)
+    } else if let Some(rest) = strip_tilde_prefix(input) {
+        join_home_and_rest(&home.to_string_lossy(), rest)
     } else {
         input.to_string()
     };
@@ -2560,7 +2582,10 @@ prompt = "hi"
         {
             let home = crate::platform::paths::home_dir();
             assert!(minimal.working_dir.starts_with(&*home.to_string_lossy()));
-            assert!(minimal.working_dir.ends_with("scheduled/morning"));
+            // Issue #1136: the remainder is now spelled with the host's own
+            // separator. The `scheduled/morning` this used to assert IS the
+            // mixed-separator text the issue is about — `C:\Users\me/scheduled/morning`.
+            assert!(minimal.working_dir.ends_with(r"scheduled\morning"));
             assert!(!minimal.working_dir.contains('~'));
         }
 
@@ -2997,6 +3022,84 @@ label = "-rf"
             match prev_var {
                 Some(v) => std::env::set_var("DAD_BRACE", v),
                 None => std::env::remove_var("DAD_BRACE"),
+            }
+        }
+    }
+
+    /// Issue #1136: `expand_path` must hand back a path spelled with the host's
+    /// own separator, and must recognise the host's own tilde forms.
+    ///
+    /// On Windows the home directory is native (`C:\Users\me`), so the old
+    /// `format!("{home}/{rest}")` glue produced `C:\Users\me/proj` — it
+    /// resolves, but it is persisted to `schedules.toml`, displayed, and sent
+    /// over the protocol as a fire's `working_dir`. And `~\proj`, the form a
+    /// Windows user actually types, missed the `~/` test entirely and came back
+    /// as `C:\Users\me\~\proj`.
+    ///
+    /// The Unix half is a preservation assertion: `\` is a legal character in a
+    /// Unix file name, so `~\proj` there is a directory name and nothing about
+    /// this platform's output moves.
+    #[test]
+    fn expand_path_uses_the_host_separator_and_tilde_forms() {
+        let _guard = STATE_DIR_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev_home = std::env::var("HOME").ok();
+        // SAFETY: env-var lock held; restored below.
+        unsafe {
+            std::env::set_var("HOME", "/home/tester");
+        }
+
+        #[cfg(unix)]
+        {
+            assert_eq!(expand_path("~/proj"), "/home/tester/proj");
+            assert_eq!(expand_path("~/proj/sub"), "/home/tester/proj/sub");
+            // NOT a tilde path here, and deliberately unchanged by #1136.
+            assert_eq!(expand_path(r"~\proj"), r"/home/tester/~\proj");
+            // An absolute path is returned as it was typed, a relative one is
+            // anchored at $HOME, and a backslash inside a name survives both.
+            assert_eq!(expand_path("/abs/path"), "/abs/path");
+            assert_eq!(expand_path("rel/path"), "/home/tester/rel/path");
+            assert_eq!(expand_path(r"odd\name"), r"/home/tester/odd\name");
+        }
+
+        #[cfg(windows)]
+        {
+            let home = crate::platform::paths::home_dir();
+            let expected = home.join("proj");
+
+            // Exact text, derived from the resolver rather than hardcoded: the
+            // username varies per machine, and asserting the *text* is the
+            // whole point — the path equality below would hold for the
+            // mixed-separator spelling too, since both parse to the same
+            // components.
+            let expected_text = format!("{}\\proj", home.to_string_lossy());
+            for input in ["~/proj", r"~\proj"] {
+                let got = expand_path(input);
+                assert_eq!(
+                    got, expected_text,
+                    "{input} must expand to the `proj` directory under the home \
+                     directory, spelled with the host's own separator"
+                );
+                assert_eq!(Path::new(&got), expected.as_path());
+            }
+
+            // Untouched by #1136, and asserted so the narrowing stays pinned:
+            // a non-tilde path is passed through exactly as typed. A relative
+            // one still anchors at the home directory; a drive-absolute one and
+            // a Unix-style rooted one both come back verbatim, forward slashes
+            // and all.
+            assert_eq!(
+                Path::new(&expand_path("rel/path")),
+                home.join("rel").join("path").as_path()
+            );
+            assert_eq!(expand_path(r"D:\work"), r"D:\work");
+            assert_eq!(expand_path("/work/space"), "/work/space");
+        }
+
+        // SAFETY: same lock held; restore the previous value.
+        unsafe {
+            match prev_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
             }
         }
     }
