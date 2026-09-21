@@ -910,11 +910,14 @@ impl Steps for Host<'_> {
             .env_clear()
             .env("PATH", "/usr/bin:/bin")
             .stdin(tar_in)
-            .output()
-            .map_err(|e| format!("tar -x: {e}"))?;
-        let archived = archive
-            .wait()
-            .map_err(|e| format!("git archive {merge_base}: {e}"))?;
+            .output();
+        // Reaped whether or not `tar` started. The `Command` holding the pipe's
+        // read end is dropped with the statement above, so a `git archive`
+        // left with no reader dies on its next write instead of blocking this
+        // wait — which it would if the wait sat in a `match` on `output()`.
+        let archived = archive.wait();
+        let tar = tar.map_err(|e| format!("tar -x: {e}"))?;
+        let archived = archived.map_err(|e| format!("git archive {merge_base}: {e}"))?;
         if !archived.success() || !tar.status.success() {
             return Err(format!(
                 "extracting the merge-base {merge_base} failed (git archive {archived}, tar {}): {}",
