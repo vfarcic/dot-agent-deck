@@ -1,3 +1,4 @@
+import {Fragment} from 'react';
 import Layout from '@theme/Layout';
 import Link from '@docusaurus/Link';
 import {
@@ -113,13 +114,27 @@ function storyRowClass(step, index) {
   return index % 2 === 0 ? styles.storyRow : styles.storyRowFlip;
 }
 
+/*
+ * The command is emitted one word per inline-block rather than as one string,
+ * so that a wrapped command can only ever break at a space. `index.module.css`
+ * carries the reasoning and the measurements; the split lives here because it
+ * is the only part of it CSS cannot do. The spaces stay real text nodes, so
+ * selecting the pill still copies the command exactly.
+ */
 function InstallPill({command}) {
   return (
     <div className={styles.installPill}>
       <span className={styles.installSigil} aria-hidden="true">
         $
       </span>
-      <code>{command}</code>
+      <code>
+        {command.split(' ').map((word, i) => (
+          <Fragment key={i}>
+            {i > 0 ? ' ' : null}
+            <span className={styles.installWord}>{word}</span>
+          </Fragment>
+        ))}
+      </code>
     </div>
   );
 }

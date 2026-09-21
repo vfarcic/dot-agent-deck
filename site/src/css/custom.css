@@ -190,9 +190,16 @@ html[data-theme='dark'] {
 
   /*
    * `--c-teal` is `#4ecdc4` here, which is what the dark theme already used.
-   * The light value would be 3.39:1 on this background -- trading one AA
-   * failure for another -- which is why the token flips rather than the
-   * variable being set once on `:root`.
+   * The light value `#0a7c73` would be 3.82:1 on `--c-bg` and 3.56:1 on
+   * `--c-bg-alt` -- both under 4.5:1, trading one AA failure for another --
+   * which is why the token flips rather than the variable being set once on
+   * `:root`.
+   *
+   * An earlier version of this comment said 3.39:1. That is `#0a7c73` on
+   * Infima's own dark background `#1b1b1d`: the figure was measured before
+   * this palette moved the dark docs onto `#0a0e12`, and went stale with that
+   * move rather than being mistyped. It is a ratio against a token, so it
+   * needs re-measuring whenever the token does.
    */
   --ifm-link-color: var(--c-teal);
   --ifm-menu-color-active: var(--c-teal);

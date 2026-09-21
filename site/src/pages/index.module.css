@@ -140,9 +140,37 @@
   border-color: var(--c-teal);
 }
 
+/*
+ * The pill WRAPS at every width instead of scrolling sideways. It used to wrap
+ * only at 560px and below and scroll above it, which was fine for the hero's
+ * `brew tap ...` (471px in the box at every desktop width) and wrong for the
+ * desktop section's `gh attestation verify ...`: 1105px of content in a 932px
+ * box from 1120px up, so it rendered cut at "/.github/wo" and the rest was
+ * reachable only by scrolling inside the pill. That is the command this page
+ * gives a reader for checking a binary it has just told them is unsigned, so
+ * the whole of it has to be ON the page.
+ *
+ * Each word is its own inline-block (`InstallPill` in `index.js` does the
+ * split), so a line ends at a space wherever the words fit. Letting the text
+ * wrap directly was the simpler change and it breaks after hyphens too --
+ * measured: `--signer-` / `workflow` at 768px, `vfarcic/dot-agent-` /
+ * `deck/...` at 1120px and up -- which leaves a line ending meaning a space in
+ * some places and nothing in others. That is not something a reader retyping a
+ * verification command should have to work out. A word WIDER than the pill
+ * still breaks inside itself, and `overflow-wrap` stays for exactly that: the
+ * 52-character signer-workflow path does it at 300-552px and again at
+ * 561-576px, where the alternative is overflow rather than a tidier break.
+ * (Those two bands are split by the 560px block below, which trades the
+ * section's desktop padding for phone padding and hands the pill 23px back.)
+ *
+ * `align-items: baseline` sits the `$` on the first line's baseline rather
+ * than centring it against a two-line block, and the sigil's `line-height: 1`
+ * keeps its taller line box from pushing the command down: 9.8px above the
+ * first line and 9.8px below the last, at every width from 300 to 1440.
+ */
 .installPill {
   display: inline-flex;
-  align-items: center;
+  align-items: baseline;
   gap: 0.6rem;
   margin: 1.6rem auto 0;
   padding: 0.55rem 1rem;
@@ -150,12 +178,12 @@
   border-radius: 8px;
   background: var(--c-bg-alt);
   max-width: 100%;
-  overflow-x: auto;
 }
 
 .installSigil {
   color: var(--c-teal);
   font-weight: 700;
+  line-height: 1;
 }
 
 .installPill code {
@@ -163,8 +191,14 @@
   border: none;
   color: var(--c-ink);
   font-size: 0.85rem;
-  white-space: pre;
+  white-space: normal;
+  overflow-wrap: anywhere;
   padding: 0;
+}
+
+.installWord {
+  display: inline-block;
+  max-width: 100%;
 }
 
 /* ---------- showcase ---------- */
@@ -431,6 +465,16 @@
  * Only above the breakpoint. Once the row collapses to a single column there
  * is nothing left for the frame to be out of step with, and a capped one would
  * just be a needlessly small one.
+ *
+ * The cap is on the IMG and not on the figure, so above the breakpoint these
+ * two captions run the full 602.6px column while their frame is inset 66.3px
+ * on each side -- the caption starts to the LEFT of the image it describes,
+ * where rows 01 and 03 have the two flush. That was measured and KEPT rather
+ * than missed: carrying the same 78% onto `.storyFigureTall` (or onto its
+ * `figcaption`) aligns them, and costs captions of 6-7 lines instead of five,
+ * under the shorter of the two frames. Neither reading is clearly better, so
+ * this is the one left in place; do not "fix" it without weighing the caption
+ * length it buys.
  */
 @media (min-width: 997px) {
   .storyFigureTall img {
@@ -937,16 +981,6 @@
   .ctaGhost {
     width: 100%;
     text-align: center;
-  }
-
-  /* Wrap rather than scroll sideways at phone width. */
-  .installPill {
-    align-items: flex-start;
-  }
-
-  .installPill code {
-    white-space: normal;
-    overflow-wrap: anywhere;
   }
 
   .doorGrid {
