@@ -9,20 +9,13 @@ title: Troubleshooting
 
 Inside an embedded agent pane, **Shift+Enter** inserts a newline into the agent's draft and plain **Enter** submits it — the same behavior you get running the agent directly. This works with **no terminal configuration** on any terminal that implements the enhanced ("kitty") keyboard protocol, which the deck negotiates for you at startup.
 
-### What Used to Cause This
-
-The break was never in your terminal emulator. It was two dot-agent-deck defects that compounded, both now fixed:
-
-- The deck never asked the terminal for the enhanced keyboard protocol, so a terminal that *could* encode Shift+Enter distinctly stayed in legacy mode and delivered a bare carriage return — the SHIFT modifier was gone before any deck code ran.
-- The deck's pane-input encoder dropped the SHIFT modifier even when it did arrive, mapping Enter to `\r` unconditionally. Shift+Enter and plain Enter were literally the same byte on the wire, so every agent read both as "submit".
-
-Earlier versions of this page blamed Ghostty for intercepting the keystroke and prescribed adding `keybind = shift+enter=csi:13;2u` to the Ghostty config. That attribution was wrong, and the keybind could not have been the fix on its own — it made the modifier arrive, and the deck then discarded it. If you already have that line in `~/Library/Application Support/com.mitchellh.ghostty/config`, you can leave it: it still works and does no harm, it is simply no longer necessary.
+If you already have `keybind = shift+enter=csi:13;2u` in `~/Library/Application Support/com.mitchellh.ghostty/config`, you can leave it — it still works and does no harm, and it is not needed.
 
 ### If It Still Submits
 
 - **You are running the deck inside tmux.** tmux reports no keyboard-enhancement support, so the deck skips the negotiation there and Shift+Enter falls back to its previous behavior. Either run the deck outside tmux, or have tmux pass extended keys through with `set -s extended-keys always` and `set -s extended-keys-format csi-u`.
 - **Your terminal does not implement the enhanced keyboard protocol.** Bind the keystroke to the CSI u encoding yourself if your terminal supports custom keybinds — in Ghostty that is the `keybind = shift+enter=csi:13;2u` line above. The deck forwards the modifier faithfully either way.
-- **You are on an older dot-agent-deck.** Upgrade; no configuration change is needed after that.
+- **Your deck is out of date.** Upgrade; no configuration change is needed after that.
 
 ## Hooks
 
@@ -37,17 +30,23 @@ Auto-install is idempotent and best-effort — if an agent directory is missing 
 
 ### A hook fails with `not found` and names a path you never typed
 
-If an agent reports something like `Stop hook error: /bin/sh: 1: /home/you/code/dot-agent-deck-pr-356/target/release/dot-agent-deck: not found`, the hook command in your agent's config points at a **build directory** rather than at your installed deck. Build directories are not durable: `cargo clean` removes them and they disappear entirely when a git worktree is deleted. Older versions of the deck wrote whichever binary was installing the hooks into config, so running the deck once from a checkout was enough to leave every hook pointing at a path that would stop existing later. The install also runs silently on every dashboard launch, which is why the failure tends to surface days after the run that caused it.
+If an agent reports something like `Stop hook error: /bin/sh: 1: /home/you/code/dot-agent-deck-pr-356/target/release/dot-agent-deck: not found`, the hook command in your agent's config names a deck binary that is no longer there. A **build directory** is the usual culprit: `cargo clean` removes one, and it disappears entirely when a git worktree is deleted. The install runs silently on every dashboard launch, so the failure tends to surface days after the launch that wrote the entry.
 
-Recent versions do not write such a path. A deck running from a checkout resolves your installed deck instead (`~/.local/bin/dot-agent-deck`, or `dot-agent-deck` on your `PATH`), and if it cannot find one, `hooks install` fails with a message telling you what to install and writes nothing rather than leaving a broken command behind. They also repair themselves: on the next launch, a deck-owned hook whose binary is confirmed missing is rewritten to the durable path, for Claude Code's `settings.json`, Codex's `hooks.json`, Devin's `config.json` and the OpenCode plugin alike. A hook whose path still **works** is deliberately left alone even if it differs from what the deck would write — your own wrapper, or a second checkout you are deliberately using, is not something a startup should quietly repoint. That now holds for all four. Codex and Devin used to re-pin their own rules to the resolved durable path on every launch, which was not a harmless one-time correction if you launched the deck from more than one install: two checkouts, or an installed deck and a checkout, resolve *different* durable paths, so the pin never settled — it **flapped** between them, following whichever install you launched last ([#730](https://github.com/vfarcic/dot-agent-deck/issues/730) closed that). What "left alone" means in practice is worth knowing, because it is not "adopted": the still-valid rule stays exactly where it is and the launching deck's rule is added **beside** it, so that agent fires two deck hooks per event — one per install — until you remove whichever one you no longer want. A hook of your own that merely mentions `dot-agent-deck` is never touched, on any of the four; and a handler of your own sharing one rule object with a deck command is no longer taken with it — install and uninstall remove the deck's command alone and leave yours, with its matcher, in place.
+What gets written is an **installed** deck in preference to whatever is running — `~/.local/bin/dot-agent-deck`, or a `dot-agent-deck` in a directory on your `PATH`. So a deck launched from a build directory, or from a copy parked somewhere scratch such as a branch build under `/var/tmp`, resolves your install and writes that rather than pinning itself. With no install anywhere to find, a build directory is refused outright — `hooks install` fails with a message telling you what to install, and writes nothing rather than leaving a command that will break — while any other path is pinned as a last resort, with a warning in the log saying it was pinned without being vouched for. That last case is what keeps hooks working on a machine whose only deck is the one running, such as a desktop app starting its bundled daemon.
+
+Hooks also repair themselves: on the next launch, a deck-owned hook whose binary is confirmed missing is rewritten to the resolved path — for Claude Code's `settings.json`, Codex's `hooks.json`, Devin's `config.json` and the OpenCode plugin alike.
+
+A hook whose path still **works** is left alone even when it differs from what the deck would write. Your own wrapper, or a second checkout you are deliberately using, is not something a startup should quietly repoint. Note what "left alone" means, because it is not "adopted": the still-valid rule stays where it is and the launching deck's rule is added **beside** it, so that agent fires two deck hooks per event — one per install — until you remove whichever you no longer want. Two genuine installs do this deliberately; a copy parked somewhere scratch is not one, and adds nothing. A hook of your own that merely mentions `dot-agent-deck` is never touched, on any of the four, and a handler of your own sharing a rule object with a deck command stays put — install and uninstall remove the deck's command alone and leave yours, with its matcher, in place.
 
 To fix it now:
 
-1. **Upgrade the deck**, then start the dashboard once. That is usually the whole fix — the broken entries are repaired on startup.
+1. **Start the dashboard once.** That is usually the whole fix — a deck-owned entry whose binary is missing is repaired on startup.
 2. **Or repair explicitly**, per agent: `dot-agent-deck hooks install`, adding `--agent codex`, `--agent opencode` or `--agent devin` for the others.
 3. **If the install refuses**, it is telling you there is no durable deck on the machine to point at. Install one — `cargo install --path .` from a checkout, or put the release binary on your `PATH` — and run the install again.
 
 You can confirm the result by looking for the path in the config: `grep -o '[^"]*dot-agent-deck' ~/.claude/settings.json | sort -u`. It should name your installed binary, never a `target/debug` or `target/release` directory.
+
+If the listing shows a second path pointing at a copy of the deck you parked somewhere, nothing will remove it while that copy is still on disk — a hook command that still *works* is left alone by design (above). Delete the copy and start the dashboard once: the self-heal then finds a deck-owned rule whose binary is missing and rewrites it. Editing the entry out by hand does just as well.
 
 ### Codex events not showing
 
@@ -277,12 +276,14 @@ If there is **no** marker and a card you expect is still absent, the count in th
 When something goes wrong and the dashboard's status messages aren't enough to diagnose it, set the `DOT_AGENT_DECK_LOG` environment variable to capture tracing output to a file:
 
 ```bash
-# Default — writes to /tmp/dot-agent-deck.log
+# Default — writes to /tmp/dot-agent-deck.log on macOS and Linux
 DOT_AGENT_DECK_LOG=1 dot-agent-deck
 
 # Custom path
 DOT_AGENT_DECK_LOG=/tmp/my-debug.log dot-agent-deck
 ```
+
+On Windows the default is `dot-agent-deck.log` in the system temp directory — the one `%TEMP%` points at, usually `C:\Users\<you>\AppData\Local\Temp`. `/tmp` is not a Windows location, so there would be nothing there to write to.
 
 The log file captures session events, hook activity, mode-tab restoration, and any errors logged by the daemon. Attach the relevant excerpt when filing an issue. See [Configuration › Environment Variables](configuration.md#environment-variables) for the full list of variables.
 

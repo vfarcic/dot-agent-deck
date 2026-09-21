@@ -414,7 +414,7 @@ fn codex_hooks_install_006_write_is_atomic_replacement() {
     );
 }
 
-/// Scenario: Seed a Codex hooks.json whose single PreToolUse rule object carries both a deck command and the user's own audit handler under one matcher, then reinstall from that same deck path. The user's handler and the rule's matcher must survive with only the deck's command taken out of it, and the refreshed deck rule added beside it.
+/// Scenario: Seed a Codex hooks.json whose single PreToolUse rule object carries both a deck command and the user's own audit handler under one matcher, then reinstall from that same deck path. The user's handler and the rule's matcher must survive, and the deck's command must be refreshed where it already sat so the user's handler keeps the index Codex keys its trust record to.
 #[test]
 fn codex_hooks_install_007_a_mixed_rule_keeps_the_users_sibling_handler() {
     let home = test_temp::tempdir().expect("create Codex home");
@@ -447,15 +447,33 @@ fn codex_hooks_install_007_a_mixed_rule_keeps_the_users_sibling_handler() {
         .unwrap_or_else(|| {
             panic!("the rule object the user shared with the deck was deleted: {rules:?}")
         });
+    // Issue #1034 INVERTED this assertion, and the inversion is the fix rather
+    // than a relaxation. Until then the deck's command was taken out of the
+    // shared rule and re-added as a rule of its own, which left the user's
+    // handler alone but MOVED it from `…:0:1` to `…:0:0` — and Codex keys a
+    // trust grant by exactly that index, so the user's trusted handler came
+    // back untrusted. The deck's command is now refreshed where it already sat,
+    // so the rule still carries both handlers in the order it always did.
     assert_eq!(
         shared["hooks"].as_array().map(Vec::len),
-        Some(1),
-        "only the deck's own command may be removed from a shared rule: {shared:?}"
+        Some(2),
+        "the shared rule must still carry both handlers, refreshed in place: {shared:?}"
     );
     assert_eq!(
         shared["hooks"][0]["command"],
+        json!(deck_command),
+        "the deck's command must be refreshed at the index it already occupied: {shared:?}"
+    );
+    assert_eq!(
+        shared["hooks"][1]["command"],
         json!(user_command),
-        "the user's sibling handler must survive the reinstall: {shared:?}"
+        "the user's sibling handler must survive at the index its trust record is keyed to: \
+         {shared:?}"
+    );
+    assert_eq!(
+        rules.len(),
+        1,
+        "no second deck rule may be appended beside the refreshed one: {rules:?}"
     );
     assert_eq!(
         deck_commands_for(home.path(), "PreToolUse"),
@@ -1203,5 +1221,311 @@ fn codex_hooks_006_unreachable_trust_is_reported_on_both_arms() {
         vec![deck_key],
         "the trust record the uninstall could not reach is left behind, which is exactly what \
          the warning tells the user"
+    );
+}
+
+/// The trust key Codex 0.149.0 addresses a grant by, reproduced here rather
+/// than imported: `<sourcePath>:<event_snake>:<group_idx>:<handler_idx>`, where
+/// `group_idx` is the rule's index in the event array and `handler_idx` the
+/// handler's index inside that rule. Spelled out in the test so an assertion
+/// about positions reads as the thing Codex actually keys on (issue #1034).
+fn trust_keys_for(home: &std::path::Path, event_snake: &str, event: &str) -> Vec<String> {
+    let root = read_hooks(home);
+    let mut keys = Vec::new();
+    let Some(rules) = root["hooks"][event].as_array() else {
+        return keys;
+    };
+    for (group_idx, rule) in rules.iter().enumerate() {
+        let Some(handlers) = rule["hooks"].as_array() else {
+            continue;
+        };
+        for (handler_idx, handler) in handlers.iter().enumerate() {
+            let command = handler["command"].as_str().unwrap_or("<no string command>");
+            keys.push(format!(
+                "{}/hooks.json:{event_snake}:{group_idx}:{handler_idx} -> {command}",
+                home.display()
+            ));
+        }
+    }
+    keys
+}
+
+/// Scenario: Seed a Codex home the way a user's own file really looks — the deck's rule first and the user's own hook appended after it, both in the same shared `hooks.json` — then run the deck's install over it twice. Every position the user's handler occupies must be byte-identical before and after, because Codex addresses a trust grant by that position and moving it silently untrusts their hook.
+#[spec("codex/hooks/007")]
+#[test]
+fn codex_hooks_007_install_leaves_a_users_hook_at_its_trust_key() {
+    let home = test_temp::tempdir().expect("create Codex home");
+
+    // The shape the defect needs, and the shape a real file takes: the deck
+    // installs first, the user appends their own hook afterwards. Two of them,
+    // in the two arrangements Codex indexes differently — a rule of their own
+    // (a `group_idx` after the deck's) and a handler sharing the deck's rule
+    // object (a `handler_idx` after the deck's), which is what a user editing
+    // `hooks.json` by hand naturally produces.
+    write_hooks(
+        home.path(),
+        &json!({
+            "hooks": {
+                "PreToolUse": [
+                    { "hooks": [
+                        // Seeded as the command this install would itself write,
+                        // so the refresh is a genuine no-op on the string and
+                        // the comparison below is about POSITION alone. Seeding
+                        // a hand-spelled equivalent would make the test pass
+                        // only while `build_command` happens not to quote.
+                        { "type": "command", "command": expected_hook_command(DECK_BINARY) },
+                        { "type": "command", "command": "/usr/local/bin/my-audit.sh" },
+                    ] },
+                    { "matcher": "Bash", "hooks": [
+                        { "type": "command", "command": "/usr/bin/env USER_HOOK=1" },
+                    ] },
+                ],
+            }
+        }),
+    );
+    let before = trust_keys_for(home.path(), "pre_tool_use", "PreToolUse");
+
+    install_to(home.path(), DECK_BINARY).expect("first install");
+    let after_one = trust_keys_for(home.path(), "pre_tool_use", "PreToolUse");
+    install_to(home.path(), DECK_BINARY).expect("second install");
+    let after_two = trust_keys_for(home.path(), "pre_tool_use", "PreToolUse");
+
+    // Measured against real codex-cli 0.149.0 before this fix: the user's
+    // `/usr/bin/env USER_HOOK=1` went from `pre_tool_use:1:0 trustStatus:
+    // trusted` to `pre_tool_use:0:0 trustStatus: modified` after ONE install,
+    // having been moved onto the deck's own stale record at the key it landed
+    // on. Their own record did not survive as an orphan either: the deck's rule
+    // took over `:1:0`, and the trust write updates whatever row is already at
+    // a key, so the user's hash was gone from `[hooks.state]` entirely.
+    assert_eq!(
+        after_one, before,
+        "install moved a hook to a different Codex trust key, so the grant the user made no \
+         longer binds to their handler (issue #1034)"
+    );
+    assert_eq!(
+        after_two, after_one,
+        "the second install moved something the first did not — the property has to hold on \
+         every launch, not just converge after one"
+    );
+    // Non-vacuity: the fixture really does hold the two positions the defect
+    // needs, so the equality above is not comparing two empty vectors.
+    assert_eq!(
+        before.len(),
+        3,
+        "fixture must carry the deck's handler plus a user handler AFTER it in the same rule and \
+         a user rule AFTER the deck's: {before:?}"
+    );
+    assert!(
+        before[1].ends_with("/usr/local/bin/my-audit.sh")
+            && before[2].ends_with("/usr/bin/env USER_HOOK=1"),
+        "fixture must place both user handlers after the deck's: {before:?}"
+    );
+    // And the install still did its job: exactly one deck command, refreshed
+    // where it already sat rather than appended beside the old one.
+    assert_eq!(
+        deck_commands_for(home.path(), "PreToolUse"),
+        vec![expected_hook_command(DECK_BINARY)],
+        "the deck's own command must be present exactly once, refreshed in place"
+    );
+}
+
+/// Scenario: Seed a Codex home holding two of this binary's own deck rules — the duplicate shape only a pre-fix install could leave behind — with a user's hook sitting between them, then install once. The surplus deck rule must go while the user's handler keeps the exact `group_idx` it started with.
+#[spec("codex/hooks/008")]
+#[test]
+fn codex_hooks_008_a_surplus_deck_rule_is_dropped_without_moving_the_user() {
+    let home = test_temp::tempdir().expect("create Codex home");
+    let deck_command = format!("{DECK_BINARY} {DECK_COMMAND_SUFFIX}");
+    write_hooks(
+        home.path(),
+        &json!({
+            "hooks": {
+                "PreToolUse": [
+                    { "hooks": [ { "type": "command", "command": deck_command } ] },
+                    { "hooks": [ { "type": "command", "command": "/usr/bin/env USER_HOOK=1" } ] },
+                    { "hooks": [ { "type": "command", "command": deck_command } ] },
+                ],
+            }
+        }),
+    );
+
+    install_to(home.path(), DECK_BINARY).expect("install");
+
+    let root = read_hooks(home.path());
+    let rules = root["hooks"]["PreToolUse"]
+        .as_array()
+        .expect("PreToolUse array");
+    assert_eq!(
+        deck_commands_for(home.path(), "PreToolUse"),
+        vec![expected_hook_command(DECK_BINARY)],
+        "the surplus copy of this binary's own rule must be removed"
+    );
+    // The point of the test: the user was at `group_idx` 1 and is still at
+    // `group_idx` 1. The emptied rule at index 2 is KEPT rather than dropped —
+    // it carries no handler so it contributes no trust key of its own, but it
+    // still consumes its index, which is what would move anything after it.
+    assert_eq!(
+        rules[1]["hooks"][0]["command"],
+        json!("/usr/bin/env USER_HOOK=1"),
+        "the user's rule must keep the group_idx Codex keyed their trust record to: {rules:?}"
+    );
+    assert_eq!(
+        rules[2]["hooks"].as_array().map(Vec::len),
+        Some(0),
+        "the rule the surplus handler vacated is kept, empty, so no later index moves: {rules:?}"
+    );
+}
+
+/// Scenario: Install over a Codex home holding the deck's command in the legacy flat `{"command": …}` rule shape, in the two arrangements that get opposite answers — the flat rule reached before any nested deck handler, and one reached after it. The first must fall back to the old strip-then-append path and the second must be swept, and neither may leave a second deck command behind.
+#[spec("codex/hooks/009")]
+#[test]
+fn codex_hooks_009_a_legacy_flat_deck_rule_is_swept_without_disturbing_the_nested_ones() {
+    let deck_command = format!("{DECK_BINARY} {DECK_COMMAND_SUFFIX}");
+    let flat = json!({ "command": deck_command });
+    let nested = json!({ "hooks": [ { "type": "command", "command": deck_command } ] });
+    let user = json!({ "hooks": [ { "type": "command", "command": "/usr/bin/env USER_HOOK=1" } ] });
+
+    // Arm 1 — the flat rule comes FIRST, so no position is claimed and the whole
+    // array goes back to the pre-#1034 path. The user's index is not preserved
+    // here and that is the documented trade: the Codex adapter never writes a
+    // flat rule, so this shape is a hand-edit no probe covers.
+    let home = test_temp::tempdir().expect("create Codex home");
+    write_hooks(
+        home.path(),
+        &json!({ "hooks": { "PreToolUse": [flat.clone(), user.clone(), nested.clone()] } }),
+    );
+    install_to(home.path(), DECK_BINARY).expect("install over a leading flat rule");
+    assert_eq!(
+        deck_commands_for(home.path(), "PreToolUse"),
+        vec![expected_hook_command(DECK_BINARY)],
+        "a leading flat deck rule must not survive beside the refreshed one"
+    );
+
+    // Arm 2 — the flat rule comes AFTER a nested one, so the nested one is
+    // claimed and refreshed in place and the flat one is surplus. Removing it
+    // is measurably safe rather than hopefully so: a rule with no `hooks` array
+    // contributes no listed entry at all on 0.149.0, so it holds no trust key
+    // and taking its `command` out moves nothing.
+    let home = test_temp::tempdir().expect("create Codex home");
+    write_hooks(
+        home.path(),
+        &json!({ "hooks": { "PreToolUse": [nested, user, flat] } }),
+    );
+    install_to(home.path(), DECK_BINARY).expect("install over a trailing flat rule");
+    assert_eq!(
+        deck_commands_for(home.path(), "PreToolUse"),
+        vec![expected_hook_command(DECK_BINARY)],
+        "a trailing flat deck rule must be swept out of a file the deck keeps tidy"
+    );
+    let rules = read_hooks(home.path())["hooks"]["PreToolUse"]
+        .as_array()
+        .expect("PreToolUse array")
+        .clone();
+    assert_eq!(
+        rules[1]["hooks"][0]["command"],
+        json!("/usr/bin/env USER_HOOK=1"),
+        "the user keeps the group_idx their trust record is keyed to: {rules:?}"
+    );
+    assert_eq!(
+        rules.len(),
+        3,
+        "the rule the flat command vacated is kept so no later index moves: {rules:?}"
+    );
+}
+
+/// Scenario: Seed one Codex rule holding the deck's command twice with the user's own handler last — the shape where dropping the surplus copy would slide the user's handler down a slot — then install. The user's handler must keep `handler_idx` 2, because Codex keys their trust record to it.
+#[spec("codex/hooks/010")]
+#[test]
+fn codex_hooks_010_a_surplus_handler_is_not_dropped_out_from_under_a_user() {
+    let home = test_temp::tempdir().expect("create Codex home");
+    let deck_command = expected_hook_command(DECK_BINARY);
+    write_hooks(
+        home.path(),
+        &json!({
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": "Bash",
+                    "hooks": [
+                        { "type": "command", "command": deck_command },
+                        { "type": "command", "command": deck_command },
+                        { "type": "command", "command": "/usr/bin/env USER_HOOK=1" },
+                    ]
+                }]
+            }
+        }),
+    );
+    let before = trust_keys_for(home.path(), "pre_tool_use", "PreToolUse");
+
+    install_to(home.path(), DECK_BINARY).expect("install");
+
+    let after = trust_keys_for(home.path(), "pre_tool_use", "PreToolUse");
+    // Greptile's P1 on PR #1166. The first draft of the in-place refresh removed
+    // every surplus copy wherever it sat, which slid this user's handler from
+    // `pre_tool_use:0:2` to `:0:1` — the same re-keying the whole change exists
+    // to stop, one level down from the `group_idx` it had already fixed. The
+    // surplus copy is kept and refreshed instead: the deck's own hook firing
+    // twice is the cheaper side of the trade against losing a user's grant.
+    assert_eq!(
+        after, before,
+        "dropping a surplus deck handler must not slide a user's handler down a slot"
+    );
+    let rules = read_hooks(home.path())["hooks"]["PreToolUse"]
+        .as_array()
+        .expect("PreToolUse array")
+        .clone();
+    assert_eq!(
+        rules[0]["hooks"][2]["command"],
+        json!("/usr/bin/env USER_HOOK=1"),
+        "the user's handler must still be the third: {rules:?}"
+    );
+    // The kept copy is REFRESHED, not merely left: a stale dead pin left in
+    // place is an exec failure on every event, where a duplicate is not.
+    for index in [0usize, 1] {
+        assert_eq!(
+            rules[0]["hooks"][index]["command"],
+            json!(deck_command),
+            "both surviving deck handlers must carry the current command: {rules:?}"
+        );
+    }
+}
+
+/// Scenario: Seed a rule whose trailing handlers are all the deck's own surplus copies, with nothing of the user's after them, then install. Those copies must actually be removed, so the tail rule is a real sweep rather than a blanket refusal to tidy.
+#[spec("codex/hooks/011")]
+#[test]
+fn codex_hooks_011_a_trailing_surplus_handler_is_still_swept() {
+    let home = test_temp::tempdir().expect("create Codex home");
+    let deck_command = expected_hook_command(DECK_BINARY);
+    write_hooks(
+        home.path(),
+        &json!({
+            "hooks": {
+                "PreToolUse": [{
+                    "hooks": [
+                        { "type": "command", "command": deck_command },
+                        { "type": "command", "command": "/usr/bin/env USER_HOOK=1" },
+                        { "type": "command", "command": deck_command },
+                        { "type": "command", "command": deck_command },
+                    ]
+                }]
+            }
+        }),
+    );
+
+    install_to(home.path(), DECK_BINARY).expect("install");
+
+    let rules = read_hooks(home.path())["hooks"]["PreToolUse"]
+        .as_array()
+        .expect("PreToolUse array")
+        .clone();
+    let handlers = rules[0]["hooks"].as_array().expect("handlers").clone();
+    assert_eq!(
+        handlers.len(),
+        2,
+        "both trailing surplus copies must go — nothing of the user's follows them: {rules:?}"
+    );
+    assert_eq!(handlers[0]["command"], json!(deck_command));
+    assert_eq!(
+        handlers[1]["command"],
+        json!("/usr/bin/env USER_HOOK=1"),
+        "the user's handler keeps handler_idx 1: {rules:?}"
     );
 }

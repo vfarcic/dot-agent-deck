@@ -777,6 +777,29 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** exact human status wording or column layout; the exact JSON status string and schema field names (`daemon/status/002`); a literal TUI detach/reconnect (`session/live/012`).
 - **Platform coverage:** mac+linux.
 
+#### daemon/endpoint
+
+##### daemon/endpoint/001 — `dot-agent-deck daemon endpoint` refuses a stale inode no daemon is listening on, and leaves it alone.
+- **Layer:** fast synthetic real-binary-subprocess integration (the REAL `dot-agent-deck daemon endpoint` CLI as a subprocess against a scratch attach-socket path whose listener has been dropped; no in-process daemon, no PTY, no LLM, no `e2e` feature gate).
+- **Agent:** none (synthetic — a Unix socket bound and immediately dropped so only the inode remains, then chmodded to `0o600` so every check but the connect passes; this is what a `SIGKILL`ed daemon leaves behind).
+- **Asserts:** the subprocess does not report success, prints nothing at all on stdout (the caller forwards whatever is there), carries no Rust panic, fails with neither clap's generic usage code `2` nor a clap `Usage:` banner — ruling out "this build has no such subcommand" as the reason — and exits **exactly 3** (`ENDPOINT_UNDETERMINED`, "nothing was learned") rather than 1, because the probe branches on that value and a dead endpoint must let the remaining candidates have their turn instead of ending discovery. Also that the inode still exists afterwards and that nothing is listening at it, since unlinking is the daemon's own recovery and a read-only query must not bring a daemon into existence. This is the stale-inode half of issue #1174: the snippet's filesystem tests answer about the inode, and a dead daemon's inode is still a socket.
+- **Does not assert:** the mode refusal (`daemon/endpoint/002`); the accepting path (`daemon/endpoint/003`); anything about *who* is listening when a connect does succeed — nothing here authenticates the listener.
+- **Platform coverage:** mac+linux.
+
+##### daemon/endpoint/002 — `dot-agent-deck daemon endpoint` refuses a LIVE listener whose mode is not owner-only, and names the mode.
+- **Layer:** fast synthetic real-binary-subprocess integration (the REAL `dot-agent-deck daemon endpoint` CLI as a subprocess against a scratch attach socket held open for the whole test; no in-process daemon, no PTY, no LLM, no `e2e` feature gate).
+- **Agent:** none (synthetic — a real `UnixListener` bound and kept, then chmodded `0o666`: the mode the issue's impersonation case names, and one a connect would happily succeed against).
+- **Asserts:** the same handled-refusal properties as `/001` (no success, empty stdout, no panic, not clap's `2`/`Usage:`), that stderr names the refused mode, and that it exits **exactly 1** (`ENDPOINT_UNTRUSTED`). The code is the load-bearing part: `1` is the only value the probe treats as binding, so a drift to 3 would silently make every trust check advisory again — the snippet would fall through and the rung below would print the same path for `ssh -L` to forward (PR #1191 review, P1). Otherwise load-bearing because the listener is genuinely live, so only the mode clause can refuse it — and a mode clause is exactly what the shell snippet has no portable `test` spelling for, at any of its rungs.
+- **Does not assert:** that `0o600` proves the listener is the deck's daemon — it does not, and a same-uid attacker satisfies every check this command makes.
+- **Platform coverage:** mac+linux.
+
+##### daemon/endpoint/003 — `dot-agent-deck daemon endpoint` prints exactly one line naming the socket a real daemon bound.
+- **Layer:** fast synthetic real-binary-subprocess integration (the REAL `dot-agent-deck daemon endpoint` CLI as a subprocess + an in-process daemon attach socket, `common::spawn_inprocess_daemon`, + a real `AttachRequest::Hello` round trip; no PTY attach, no LLM, no `e2e` feature gate).
+- **Agent:** none (synthetic — the in-process daemon itself is the listener; no pane is spawned).
+- **Asserts:** the subprocess exits successfully; its stdout holds exactly **one** non-empty line; and that line is the attach path the daemon actually bound. The single-line property is what the caller depends on — `endpoint_test::discover_socket` takes the LAST non-empty line, so a second line would silently change which value gets forwarded with `ssh -L`.
+- **Does not assert:** the shell snippet's own rung ordering or its fall-through (`remote_tunnel::tunnel_tests::the_probe_*`, which execute `REMOTE_SOCKET_PROBE` under every `sh` on the machine); anything about a remote host or a real `ssh` hop.
+- **Platform coverage:** mac+linux.
+
 #### worktree/reclaim
 
 ##### worktree/reclaim/001 — `dot-agent-deck worktree list` succeeds in a git repo and names the worktree it examined.
@@ -1885,9 +1908,23 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 ##### hooks/install/006 — The unattended startup install leaves a user's sibling handler, their `matcher`, and a still-valid foreign deck pin exactly as it found them.
 - **Layer:** L2.
 - **Agent:** none (a stub `codex` on `PATH` makes the Codex installer fire; two stub executables stand in for the launching install and a second one).
-- **Asserts:** with `~/.codex/hooks.json` seeded BEFORE launch so the real binary's startup install is what rewrites it, under both an installed event (`PreToolUse`) and one the deck does not install (`SessionEnd`, which reaches `install_impl`'s retired-event sweep): a rule holding the deck's own command next to a user handler carrying no string `command` keeps both that handler and its `matcher`, with the deck's stale command refreshed out into its own rule; and a deck-owned rule pinning a different, absolute, executable, non-`target/` `dot-agent-deck` is left byte-identical rather than repointed. The retired event gains no fresh deck rule. Issue #730, plus the Greptile P1 on PR #1029 — the emptiness test that dropped a rule whose only survivor carried no string `command`.
+- **Asserts:** with `~/.codex/hooks.json` seeded BEFORE launch so the real binary's startup install is what rewrites it, under both an installed event (`PreToolUse`) and one the deck does not install (`SessionEnd`, which reaches `install_impl`'s retired-event sweep): a rule holding the deck's own command next to a user handler carrying no string `command` keeps both that handler and its `matcher`; and a deck-owned rule pinning a different, absolute, executable, non-`target/` `dot-agent-deck` is left byte-identical rather than repointed. The two events diverge on WHERE the deck's command ends up, which is issue #1034 — under the installed event it is refreshed at the index it already occupied, the array gains no rule, and the user's handler stays at `…:0:1`; under the retired event, where there is nothing to refresh it with, it is swept out of the user's rule as before and that event gains no fresh deck rule. Issue #730, plus the Greptile P1 on PR #1029 — the emptiness test that dropped a rule whose only survivor carried no string `command`.
 - **Does not assert:** the Claude, OpenCode or Devin writers (the strip is shared and unit-covered for all four in `agent_hook_config`'s `mod tests`); the trust write, which needs a `codex app-server` the stub does not implement; that a repointed pin would actually have been detected by Codex.
 - **Platform coverage:** linux.
+
+##### hooks/install/007 — A deck run from a SCRATCH COPY of itself pins the install, never the copy (issue #1140).
+- **Layer:** fast real-binary-subprocess integration (the REAL `dot-agent-deck hooks install --agent claude-code` CLI as a subprocess against an isolated `HOME`; no PTY, no daemon, no LLM, no `e2e` feature gate).
+- **Agent:** none (the freshly built binary is the subject, hard-linked — or copied across a device boundary — to a scratch path standing in for the report's `/var/tmp/dad-branch/bin/`; a stub executable at `$HOME/.local/bin/dot-agent-deck` is the install).
+- **Asserts:** run from a path that is outside `target/`, outside `$HOME/.local/bin` and not on the child's (`env_clear`ed) `PATH`, the command succeeds and every deck-owned command in `~/.claude/settings.json` names the seeded install; the scratch directory appears nowhere in the file. This is the **uninjected** `current_exe()` path — the resolver's own tests all inject it, so nothing else in the suite execs a deck that genuinely lives somewhere scratch.
+- **Does not assert:** the Codex, Devin or OpenCode writers (the resolver is shared and unit-covered); the duplication arithmetic in a pre-seeded config (`durable_hook_binary_path.rs`'s install-seam units); that the seeded executable actually runs.
+- **Platform coverage:** mac+linux.
+
+##### hooks/install/008 — The same scratch copy with nothing to fall back to pins ITSELF as a last resort, rather than refusing (issue #1140).
+- **Layer:** as `hooks/install/007`.
+- **Agent:** none (no install seeded).
+- **Asserts:** with no `$HOME/.local/bin/dot-agent-deck` and no deck on the child's `PATH`, the command still succeeds and every deck-owned command in `~/.claude/settings.json` names the running binary. This is the third arm of the resolver's policy and the counterweight to `007`: preferring an install over a scratch copy is #1140's fix, but refusing the scratch copy when there is no install buys no agent hooks at all on a machine whose only deck is that binary — a packaged desktop running its bundled sidecar. A **cargo artifact** still refuses in the same situation, which is what separates "known ephemeral" from "not vouched for" (`hooks/install/005`).
+- **Does not assert:** the `tracing::warn!` the last-resort pin emits (unit-covered in `platform::paths`); the desktop bundle layouts themselves (#1157).
+- **Platform coverage:** mac+linux.
 
 ### Pane / agent lifecycle
 
@@ -2698,6 +2735,15 @@ without depending on the config struct API.
 - **Asserts:** card appears; badge reads Error; card text contains the binary name.
 - **Does not assert:** how long the failure takes to surface.
 - **Platform coverage:** mac+linux.
+
+#### error/hangup
+
+##### error/hangup/001 — The deck exits when its terminal hangs up, instead of spinning at 100% of a core on a terminal it can neither read from nor write to.
+- **Layer:** L2 (PTY-attached; the real binary under a `trap '' HUP` session leader, whose master this test then closes).
+- **Agent:** none — no pane is spawned at all, because the hangup is a property of the event loop rather than of anything running under it. Lane 1: no credential.
+- **Asserts:** the deck paints its dashboard and binds its daemon's attach socket; it is STILL running 1.5s later while the terminal is attached (the control — a watchdog that fired on an idle or input-pending terminal would pass the main assertion without fixing anything); and once the pseudo-terminal master is closed, the deck process is gone within 20s. Measured at ~0.5s, which is `terminal_hangup::ACK_WINDOW`; the bound is headroom for a loaded host, not an expected duration.
+- **Does not assert:** the exit status (the watchdog's own path reports 129, but a hangup that the event loop happens to acknowledge leaves by the ordinary detach path and reports 0 — both are correct and the test is about the process ending); that the session snapshot was written (the acknowledged path writes one, and it is the path that measurably does not win on crossterm 0.29 — see `src/terminal_hangup.rs`); the CPU burned during the bounded window before the exit; **macOS at all** — this is a lane-1 e2e test and `e2e-deterministic` is a Linux job, so nothing runs it there, and #1138 was never reproduced on macOS either. What macOS *does* run is the L1 half in `src/terminal_hangup.rs`, through `build-macos`'s `cargo nextest run --workspace`, and that half earned its place immediately: it failed on the first push because Apple's `poll` reports no hangup for an unrequested event, which would have shipped this fix as Linux-only.
+- **Platform coverage:** linux (reproduced and exercised). Not mac: the file is not `cfg`'d off, but no macOS job enables the `e2e` feature, so a macOS regression in the real-binary path would surface only on a developer's own machine.
 
 ### Orchestration delegation
 
@@ -4196,6 +4242,40 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 - **Agent:** synthetic Codex installation environment, then a `PATH` with no `codex` on it at all so the trust step fails with `NotFound`.
 - **Asserts:** after a seeding install leaves exactly one scoped trust record, a re-install with no reachable `codex` exits 0, says on stderr that scoped hook trust could not be recorded, and prints no trust line on stdout; an uninstall under the same conditions exits 0, says on stderr that scoped hook trust could not be dropped, still removes every deck hook definition from `hooks.json`, and leaves the unreachable trust record behind — the orphan the warning names.
 - **Does not assert:** that the orphan record is ever collected (it is not today — issue #1027 item 1), or the three non-error trust outcomes (`codex/hooks/005`).
+- **Platform coverage:** mac+linux.
+
+##### codex/hooks/007 — A deck install leaves a user's hook at the Codex trust key it was already at (issue #1034).
+- **Layer:** L1/fast in-process `install_to` against an isolated Codex home.
+- **Agent:** none (`hooks.json` is the subject; no `codex` process is involved).
+- **Asserts:** with a `hooks.json` holding the deck's handler first and two user handlers after it — one sharing the deck's rule object (a later `handler_idx`) and one in a rule of its own (a later `group_idx`), the two arrangements Codex indexes differently — the full list of `<sourcePath>:<event>:<group_idx>:<handler_idx>` positions is byte-identical before the install, after one install, and after a second, while the deck's own command is still present exactly once. Codex addresses a trust grant by that position, so a move breaks the binding — the user's record is left behind under the old key, or overwritten outright when the deck's own rule lands on it, which is what was measured for this issue.
+- **Does not assert:** that Codex really keys grants this way (measured directly against codex-cli 0.149.0 on this issue, not re-derived here — the test reproduces the key format rather than asking Codex for it); the retired-event sweep, whose removal necessarily shifts and is left as it is; the trust write itself (`codex/trust/002`–`003`).
+- **Platform coverage:** mac+linux.
+
+##### codex/hooks/008 — A surplus copy of this binary's own deck rule is dropped without moving the user (issue #1034).
+- **Layer:** L1/fast in-process `install_to` against an isolated Codex home.
+- **Agent:** none (`hooks.json` is the subject; no `codex` process is involved).
+- **Asserts:** given a duplicate shape a pre-#1034 install could leave behind — two of this binary's own deck rules with a user's rule between them — one install removes the surplus deck command, leaves the user's rule at the `group_idx` it started at, and keeps the vacated rule object in place as an empty one so no later index moves.
+- **Does not assert:** that duplicates can still be created (this install path creates none); the trust write itself (`codex/trust/002`–`003`). That a kept-but-empty rule really does consume its `group_idx` is measured rather than assumed — probed against codex-cli 0.149.0 in both shapes the sweep can leave, `{"hooks": []}` and a bare `{}`, where the handlers either side reported `pre_tool_use:0:0` and `pre_tool_use:2:0` with no warnings and no errors — but that is a property of Codex, not of this test.
+- **Platform coverage:** mac+linux.
+
+##### codex/hooks/009 — A legacy flat deck rule is swept without disturbing the nested ones (issue #1034).
+- **Layer:** L1/fast in-process `install_to` against an isolated Codex home.
+- **Agent:** none (`hooks.json` is the subject; no `codex` process is involved).
+- **Asserts:** across the two arrangements the in-place refresh answers differently — the legacy flat `{"command": …}` deck rule reached BEFORE any nested deck handler, and one reached after it — a single install leaves the deck's command present exactly once either way. In the trailing arm, where a nested handler is claimed and refreshed in place, the user's rule additionally keeps its `group_idx` and the rule the flat command vacated is kept so no later index moves. Removing a flat `command` is measurably safe: on 0.149.0 a rule carrying no `hooks` array contributes no listed entry at all, so it holds no trust key of its own — which also means it never ran, so the sweep is tidying rather than a duplicate-fire fix.
+- **Does not assert:** that the leading arm preserves positions — it deliberately does not, since an unclaimed array falls back to the pre-#1034 strip-then-append path; how Codex would index a handler inside a flat rule if it ever supported one (it lists none today, which is why that shape claims nothing).
+- **Platform coverage:** mac+linux.
+
+##### codex/hooks/010 — A surplus deck handler is not dropped out from under a user's handler (issue #1034, Greptile P1 on PR #1166).
+- **Layer:** L1/fast in-process `install_to` against an isolated Codex home.
+- **Agent:** none (`hooks.json` is the subject; no `codex` process is involved).
+- **Asserts:** with one rule holding the deck's command twice and the user's own handler last, an install leaves the full position list unchanged — the user keeps `handler_idx` 2 — and both surviving deck handlers carry the refreshed command rather than a stale one. The first draft of the in-place refresh removed every surplus copy wherever it sat, sliding this user from `pre_tool_use:0:2` to `:0:1`, which is the same re-keying the change exists to stop, one level below the `group_idx` it had already fixed.
+- **Does not assert:** that the deck's hook does not then fire twice — it does, and that is the accepted trade against losing a user's grant; the trailing case, where the sweep does remove (`codex/hooks/011`).
+- **Platform coverage:** mac+linux.
+
+##### codex/hooks/011 — A trailing surplus deck handler is still swept (issue #1034).
+- **Layer:** L1/fast in-process `install_to` against an isolated Codex home.
+- **Agent:** none (`hooks.json` is the subject; no `codex` process is involved).
+- **Asserts:** with a rule whose last two handlers are the deck's own surplus copies and nothing of the user's after them, one install removes both and leaves the user's handler at `handler_idx` 1 — so the tail-only rule is a real sweep rather than a blanket refusal to tidy, which is what keeps `codex/hooks/010` from being satisfied by doing nothing at all.
 - **Platform coverage:** mac+linux.
 
 #### codex/live

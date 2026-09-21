@@ -435,8 +435,9 @@ fn read_json(path: &Path) -> Value {
 /// user's `matcher`, plus a second deck-owned rule pinning a different, still
 /// valid, seeded `dot-agent-deck`. Launch the real deck so its unattended
 /// startup install runs, and the user's handler, their `matcher` and the foreign
-/// valid pin must all survive unchanged while the deck refreshes only its own
-/// command.
+/// valid pin must all survive unchanged — under the installed event with their
+/// POSITIONS unchanged too, since the deck refreshes its own command where it
+/// already sits.
 #[spec("hooks/install/006")]
 #[test]
 fn install_006_startup_install_keeps_sibling_handlers_and_valid_foreign_pins() {
@@ -520,13 +521,18 @@ fn install_006_startup_install_keeps_sibling_handlers_and_valid_foreign_pins() {
              so the startup install did not run and this test proves nothing\n{doc:#}"
         ));
     }
-    // And it must have ADDED its refreshed rule beside the two seeded ones
-    // rather than replacing the array: two survivors plus one fresh rule.
+    // And it must have refreshed its command IN PLACE rather than appending a
+    // rule beside the two seeded ones: the two survivors and nothing else.
+    // Before issue #1034 this expected three, because the install removed its
+    // own command from the shared rule and re-added it at the end — which is
+    // precisely what re-keyed the user's handler from `…:0:1` to `…:0:0` and
+    // silently untrusted it.
     let installed = event_rules(&doc, "PreToolUse");
-    if installed.len() != 3 {
+    if installed.len() != 2 {
         problems.push(format!(
-            "PreToolUse: expected the user's rule, the foreign pin's rule and one fresh deck \
-             rule, got {}\n{installed:#?}",
+            "PreToolUse: expected exactly the user's rule and the foreign pin's rule, with the \
+             deck's command refreshed inside the first rather than appended beside it, got \
+             {}\n{installed:#?}",
             installed.len()
         ));
     }
@@ -557,13 +563,36 @@ fn install_006_startup_install_keeps_sibling_handlers_and_valid_foreign_pins() {
                          rule: {rule:#}"
                     ));
                 }
-                if handlers
+                // Issue #1034 splits the two events here, and the split is the
+                // point rather than an exemption. Under an INSTALLED event the
+                // deck refreshes its command where it already sits, so it is
+                // still in the user's rule, at the index it always had, and the
+                // user's handler still follows it at `…:0:1`. Under a RETIRED
+                // event there is nothing to refresh it with — the sweep's job is
+                // removal — so the old expectation stands unchanged there.
+                let deck_handler_index = handlers
                     .iter()
-                    .any(|h| h.get("command").and_then(Value::as_str) == Some(ours.as_str()))
-                {
+                    .position(|h| h.get("command").and_then(Value::as_str) == Some(ours.as_str()));
+                let sibling_index = handlers.iter().position(|h| h == &sibling);
+                if event == "PreToolUse" {
+                    if deck_handler_index != Some(0) {
+                        problems.push(format!(
+                            "{event}: the deck's command must be refreshed at the index it \
+                             already occupied, not moved out of the user's rule — moving it \
+                             re-keys every handler after it and untrusts them \
+                             (got {deck_handler_index:?}): {rule:#}"
+                        ));
+                    }
+                    if sibling_index != Some(1) {
+                        problems.push(format!(
+                            "{event}: the user's handler must keep the index Codex keyed its \
+                             trust record to (got {sibling_index:?}): {rule:#}"
+                        ));
+                    }
+                } else if deck_handler_index.is_some() {
                     problems.push(format!(
-                        "{event}: the deck's stale command was left inside the user's rule \
-                         rather than refreshed into its own: {rule:#}"
+                        "{event}: this event is no longer installed, so the deck's stale \
+                         command must be swept out of the user's rule: {rule:#}"
                     ));
                 }
             }
