@@ -1,102 +1,1000 @@
-.heroBanner {
-  padding: 4rem 0;
-  text-align: center;
+/*
+ * Landing page (issue #1021) — direction C, bold product marketing.
+ *
+ * Everything here is scoped under `.page`, which is the landing page's own
+ * visual layer: its own bands, its own background, its own marketing devices.
+ * The navbar and footer around it stay the docs' own, deliberately (see the
+ * note at the top of `index.js`).
+ *
+ * The `--c-*` COLOUR TOKENS are no longer declared here. They were this page's
+ * alone, which is exactly why `/` and `/docs` read as two different products;
+ * they now live on `:root` / `html[data-theme='dark']` in `src/css/custom.css`,
+ * where the docs consume them too, and this page simply inherits them. Nothing
+ * else moved with them: the type scale, the spacing and the devices below stay
+ * the landing page's own, and no gradient, spotlight or device frame reaches
+ * the docs.
+ */
+
+.page {
+  background: var(--c-bg);
+  color: var(--c-ink);
+  font-size: 16px;
+  line-height: 1.6;
+  /* Contains the hero spotlight, which is deliberately wider than the page. */
+  overflow-x: hidden;
+}
+
+/* ---------- hero ---------- */
+
+.hero {
   position: relative;
+  padding: 5rem 1rem 3rem;
+  text-align: center;
   overflow: hidden;
 }
 
-.brandName {
-  font-size: 0.9rem;
-  text-transform: uppercase;
-  letter-spacing: 0.15em;
-  opacity: 0.8;
-  margin-bottom: 0.25rem;
+.spotlight {
+  position: absolute;
+  inset: -40% 50% auto;
+  width: 120vw;
+  height: 90vh;
+  transform: translateX(-50%);
+  background:
+    radial-gradient(closest-side, var(--c-teal-soft), transparent 72%),
+    radial-gradient(closest-side at 65% 40%, var(--c-violet-soft), transparent 70%);
+  pointer-events: none;
 }
 
-.buttons {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 1rem;
-  margin-top: 1.5rem;
-}
-
-.features {
-  display: flex;
-  align-items: center;
-  padding: 2rem 0;
-  width: 100%;
-}
-
-.screenshot {
-  padding: 2rem 0;
-}
-
-.screenshotImage {
-  display: block;
-  max-width: 100%;
+.heroInner {
+  position: relative;
+  max-width: 820px;
   margin: 0 auto;
-  border-radius: 8px;
-  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.25);
 }
+
+.eyebrow {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: 0.78rem;
+  letter-spacing: 0.06em;
+  color: var(--c-dim);
+  border: 1px solid var(--c-line);
+  border-radius: 999px;
+  padding: 0.3rem 0.9rem;
+  margin: 0 0 1.75rem;
+  background: var(--c-bg);
+}
+
+.dot {
+  width: 0.45rem;
+  height: 0.45rem;
+  border-radius: 50%;
+  background: var(--c-teal);
+}
+
+.heroTitle {
+  font-size: clamp(2.25rem, 8vw, 4.1rem);
+  font-weight: 800;
+  letter-spacing: -0.04em;
+  line-height: 1.04;
+  margin: 0;
+}
+
+.heroTitleAccent {
+  background: linear-gradient(100deg, var(--c-teal), var(--c-violet));
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+
+.heroLede {
+  font-size: clamp(1rem, 3.2vw, 1.22rem);
+  color: var(--c-dim);
+  max-width: 44rem;
+  margin: 1.4rem auto 0;
+}
+
+.ctaRow {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 0.75rem;
+  margin: 2.1rem 0 0;
+}
+
+.ctaPrimary,
+.ctaGhost {
+  display: inline-block;
+  padding: 0.8rem 1.6rem;
+  border-radius: 8px;
+  font-weight: 650;
+  font-size: 1rem;
+  text-decoration: none;
+  transition: transform 0.12s ease, filter 0.12s ease;
+}
+
+.ctaPrimary {
+  background: linear-gradient(100deg, var(--c-cta-from), var(--c-cta-to));
+  color: var(--c-cta-ink);
+  box-shadow: 0 10px 24px -12px var(--c-violet);
+}
+
+.ctaPrimary:hover,
+.ctaPrimary:focus-visible {
+  color: var(--c-cta-ink);
+  text-decoration: none;
+  transform: translateY(-1px);
+  filter: brightness(1.06);
+}
+
+.ctaGhost {
+  border: 1px solid var(--c-line);
+  color: var(--c-ink);
+  background: var(--c-bg);
+}
+
+.ctaGhost:hover,
+.ctaGhost:focus-visible {
+  color: var(--c-ink);
+  text-decoration: none;
+  border-color: var(--c-teal);
+}
+
+/*
+ * The pill WRAPS at every width instead of scrolling sideways. It used to wrap
+ * only at 560px and below and scroll above it, which was fine for the hero's
+ * `brew tap ...` (471px in the box at every desktop width) and wrong for the
+ * desktop section's `gh attestation verify ...`: 1105px of content in a 932px
+ * box from 1120px up, so it rendered cut at "/.github/wo" and the rest was
+ * reachable only by scrolling inside the pill. That is the command this page
+ * gives a reader for checking a binary it has just told them is unsigned, so
+ * the whole of it has to be ON the page.
+ *
+ * Each word is its own inline-block (`InstallPill` in `index.js` does the
+ * split), so a line ends at a space wherever the words fit. Letting the text
+ * wrap directly was the simpler change and it breaks after hyphens too --
+ * measured: `--signer-` / `workflow` at 768px, `vfarcic/dot-agent-` /
+ * `deck/...` at 1120px and up -- which leaves a line ending meaning a space in
+ * some places and nothing in others. That is not something a reader retyping a
+ * verification command should have to work out. A word WIDER than the pill
+ * still breaks inside itself, and `overflow-wrap` stays for exactly that: the
+ * 52-character signer-workflow path does it at 300-552px and again at
+ * 561-576px, where the alternative is overflow rather than a tidier break.
+ * (Those two bands are split by the 560px block below, which trades the
+ * section's desktop padding for phone padding and hands the pill 23px back.)
+ *
+ * `align-items: baseline` sits the `$` on the first line's baseline rather
+ * than centring it against a two-line block, and the sigil's `line-height: 1`
+ * keeps its taller line box from pushing the command down: 9.8px above the
+ * first line and 9.8px below the last, at every width from 300 to 1440.
+ */
+.installPill {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 0.6rem;
+  margin: 1.6rem auto 0;
+  padding: 0.55rem 1rem;
+  border: 1px solid var(--c-line);
+  border-radius: 8px;
+  background: var(--c-bg-alt);
+  max-width: 100%;
+}
+
+.installSigil {
+  color: var(--c-teal);
+  font-weight: 700;
+  line-height: 1;
+}
+
+.installPill code {
+  background: transparent;
+  border: none;
+  color: var(--c-ink);
+  font-size: 0.85rem;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  padding: 0;
+}
+
+.installWord {
+  display: inline-block;
+  max-width: 100%;
+}
+
+/* ---------- showcase ---------- */
+
+.showcase {
+  padding: 1rem 1rem 3.5rem;
+}
+
+.device {
+  max-width: 1180px;
+  margin: 0 auto;
+  border: 1px solid var(--c-line);
+  border-radius: 12px;
+  overflow: hidden;
+  background: var(--c-bg-alt);
+  box-shadow: var(--c-shadow);
+}
+
+.deviceBar {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.6rem 0.9rem;
+  border-bottom: 1px solid var(--c-line);
+}
+
+.light {
+  width: 0.65rem;
+  height: 0.65rem;
+  border-radius: 50%;
+  background: var(--c-line);
+}
+
+.deviceTitle {
+  margin-left: 0.75rem;
+  font-size: 0.75rem;
+  color: var(--c-dim);
+}
+
+.deviceImage {
+  display: block;
+  width: 100%;
+  height: auto;
+}
+
+.showcaseCaption {
+  text-align: center;
+  color: var(--c-dim);
+  font-size: 0.85rem;
+  margin: 1rem auto 0;
+  max-width: 44rem;
+}
+
+/* ---------- agent strip ---------- */
+
+.agentStrip {
+  border-top: 1px solid var(--c-line);
+  border-bottom: 1px solid var(--c-line);
+  padding: 1.75rem 1rem;
+  text-align: center;
+  background: var(--c-bg-alt);
+}
+
+.agentStripLabel {
+  font-size: 0.72rem;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: var(--c-dim);
+  margin: 0 0 1.1rem;
+}
+
+.agentStripList {
+  list-style: none;
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 1.1rem 2.25rem;
+  margin: 0;
+  padding: 0;
+}
+
+.agentStripList a {
+  color: var(--c-ink);
+  text-decoration: none;
+  font-size: 1.05rem;
+  font-weight: 650;
+}
+
+.agentStripList a:hover {
+  color: var(--c-teal);
+}
+
+.agentStripNote {
+  max-width: 54rem;
+  margin: 1.4rem auto 0;
+  font-size: 0.82rem;
+  color: var(--c-dim);
+}
+
+/* ---------- section basics ---------- */
+
+.sectionTitle {
+  font-size: clamp(1.5rem, 5vw, 2.1rem);
+  font-weight: 750;
+  letter-spacing: -0.03em;
+  margin: 0 0 1.25rem;
+}
+
+/* ---------- why ---------- */
 
 .why {
-  padding: 3rem 0 1rem;
-}
-
-.whyContent {
-  max-width: 760px;
+  max-width: 860px;
   margin: 0 auto;
-  font-size: 1.05rem;
-  line-height: 1.7;
+  padding: 4.5rem 1rem 3rem;
+  text-align: center;
 }
 
-.whyContent p {
+.pullQuote {
+  font-size: clamp(1.15rem, 4vw, 1.6rem);
+  line-height: 1.45;
+  font-weight: 500;
+  letter-spacing: -0.02em;
+  margin: 0 0 2rem;
+  padding: 0 0 0 1.25rem;
+  border-left: 3px solid var(--c-teal);
+  text-align: left;
+}
+
+.whyRest {
+  text-align: left;
+  color: var(--c-dim);
+}
+
+.whyRest p {
+  margin: 0 0 1rem;
+}
+
+/* ---------- scroll story ---------- */
+
+.story {
+  max-width: 1120px;
+  margin: 0 auto;
+  padding: 1rem 1rem 3rem;
+  display: flex;
+  flex-direction: column;
+  gap: 4.5rem;
+}
+
+.storyRow,
+.storyRowFlip {
+  display: grid;
+  grid-template-columns: minmax(0, 0.85fr) minmax(0, 1.15fr);
+  gap: 2.5rem;
+  align-items: center;
+}
+
+/*
+ * `order` alone would hand the figure the NARROW column, so the flipped rows
+ * showed a visibly smaller screenshot. Mirror the track sizes too.
+ */
+.storyRowFlip {
+  grid-template-columns: minmax(0, 1.15fr) minmax(0, 0.85fr);
+}
+
+/*
+ * A step that carries no frame. No step uses this today — row 04 (dispatching)
+ * did until `dispatch.webp` landed — and it is kept because `shot` stays
+ * optional in `landing-content.js`: a row written before its capture is taken
+ * points at no filename rather than shipping a broken image on a live page,
+ * and stands on its own — centred, at a readable measure, reading as a beat
+ * of the story rather than as half of a two-column row with the picture
+ * missing. Adding `shot:` to the step restores the ordinary two-column row
+ * with no change here.
+ */
+.storyRowSolo {
+  max-width: 44rem;
+  margin: 0 auto;
+  text-align: center;
+}
+
+.storyRowFlip .storyText {
+  order: 2;
+}
+
+.storyRowFlip .storyFigure {
+  order: 1;
+}
+
+.storyStep {
+  display: inline-block;
+  font-size: 0.75rem;
+  font-weight: 700;
+  letter-spacing: 0.16em;
+  color: var(--c-violet);
+  background: var(--c-violet-soft);
+  border-radius: 999px;
+  padding: 0.15rem 0.7rem;
+  margin-bottom: 0.9rem;
+}
+
+.storyText h3 {
+  font-size: clamp(1.25rem, 4vw, 1.65rem);
+  font-weight: 700;
+  letter-spacing: -0.025em;
+  margin: 0 0 0.6rem;
+}
+
+.storyText p {
+  color: var(--c-dim);
+  margin: 0;
+}
+
+.storyFigure {
+  margin: 0;
+  min-width: 0;
+}
+
+.storyFigure img {
+  display: block;
+  width: 100%;
+  height: auto;
+  border: 1px solid var(--c-line);
+  border-radius: 10px;
+  box-shadow: var(--c-shadow);
+}
+
+.storyFigure figcaption {
+  font-size: 0.8rem;
+  color: var(--c-dim);
+  margin-top: 0.6rem;
+}
+
+/*
+ * A frame markedly taller than its neighbours, flagged `tall` in
+ * `landing-content.js`. Two of the four rows carry it: row 02's
+ * `busy-deck-real.webp` is 2554x1936 (1.32) and row 04's `dispatch.webp` is
+ * 2550x1964 (1.30), against 1.74 for row 01 and 1.78 for row 03, so at the
+ * column's full width either stands about a third taller than those two and
+ * the row reads as out of step with the ones above and below it.
+ *
+ * Capping the WIDTH is what absorbs that without touching the image. Every
+ * story figure gets the same 1.15fr column (the flipped rows mirror the track
+ * sizes, so they are not narrower), which makes the comparison a single
+ * division: at 78% row 02 stands 0.78/1.32 = 0.59 column-widths tall and row
+ * 04 stands 0.78/1.30 = 0.60, against row 01's 1/1.74 = 0.58 and row 03's
+ * 1/1.78 = 0.56 -- close enough that both read in step with them. Against the
+ * column's 602.6px that is 356 and 362 beside 347 and 339. The border still
+ * hugs the frame, which a `max-height` with `object-fit: contain` would not --
+ * that letterboxes inside the border instead. Cropping to 16:9 was the other
+ * option and is worse than either: it would cut off exactly the edges each
+ * frame is carried for, row 02's six sidebar cards and footer counts, row 04's
+ * two directory paths.
+ *
+ * TWO capped rows out of four is worth a note, because it is the point where
+ * a correction starts becoming the house style. The two do not sit adjacent
+ * -- row 03's uncapped 16:9 is between them -- but both land on `.storyRowFlip`
+ * (rows at odd indices flip), so both inset frames sit in the LEFT column with
+ * their own whitespace either side of the image. At 0.59 against 0.60 they are
+ * the same height to the eye, which reads as a pair of matching figures rather
+ * than as two separate compromises. It was left alone deliberately: the
+ * alternative is a different cap for one of the two, which is a design
+ * decision about the house shape and not a tweak to make here.
+ *
+ * Only above the breakpoint. Once the row collapses to a single column there
+ * is nothing left for the frame to be out of step with, and a capped one would
+ * just be a needlessly small one.
+ *
+ * The cap is on the IMG and not on the figure, so above the breakpoint these
+ * two captions run the full 602.6px column while their frame is inset 66.3px
+ * on each side -- the caption starts to the LEFT of the image it describes,
+ * where rows 01 and 03 have the two flush. That was measured and KEPT rather
+ * than missed: carrying the same 78% onto `.storyFigureTall` (or onto its
+ * `figcaption`) aligns them, and costs captions of 6-7 lines instead of five,
+ * under the shorter of the two frames. Neither reading is clearly better, so
+ * this is the one left in place; do not "fix" it without weighing the caption
+ * length it buys.
+ */
+@media (min-width: 997px) {
+  .storyFigureTall img {
+    max-width: 78%;
+    margin-left: auto;
+    margin-right: auto;
+  }
+}
+
+/* ---------- audience ---------- */
+
+.audience {
+  background: var(--c-bg-alt);
+  border-top: 1px solid var(--c-line);
+  border-bottom: 1px solid var(--c-line);
+  padding: 4rem 1rem;
+}
+
+.audienceInner {
+  max-width: 780px;
+  margin: 0 auto;
+}
+
+.audienceList {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+
+.audienceList li {
+  display: flex;
+  gap: 0.85rem;
+  align-items: flex-start;
+  font-size: 1.05rem;
+}
+
+.check {
+  flex: 0 0 1.6rem;
+  height: 1.6rem;
+  border-radius: 50%;
+  background: var(--c-teal-soft);
+  color: var(--c-teal);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 0.85rem;
+  font-weight: 700;
+  margin-top: 0.15rem;
+}
+
+.audienceNot {
+  margin: 2rem 0 0;
+  padding: 1rem 1.25rem;
+  border-left: 3px solid var(--c-line);
+  color: var(--c-dim);
+  font-size: 0.95rem;
+}
+
+/* ---------- principles ---------- */
+
+.principles {
+  max-width: 1120px;
+  margin: 0 auto;
+  padding: 4rem 1rem 2rem;
+}
+
+.principleGrid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 1.25rem;
+}
+
+.principleCard {
+  border: 1px solid var(--c-line);
+  border-radius: 12px;
+  padding: 1.5rem 1.6rem;
+  background: var(--c-bg-alt);
+}
+
+.principleNum {
+  font-size: 0.8rem;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  color: var(--c-teal);
+}
+
+.principleCard h3 {
+  font-size: 1.15rem;
+  font-weight: 700;
+  margin: 0.5rem 0 0.5rem;
+  letter-spacing: -0.02em;
+}
+
+.principleCard p {
+  color: var(--c-dim);
+  margin: 0;
+  font-size: 0.95rem;
+}
+
+/* ---------- desktop ---------- */
+
+.desktop {
+  padding: 4rem 1rem;
+}
+
+.desktopInner {
+  max-width: 1000px;
+  margin: 0 auto;
+  border: 1px solid var(--c-line);
+  border-radius: 16px;
+  padding: 2.5rem 2rem;
+  background:
+    radial-gradient(circle at 15% 0%, var(--c-amber-soft), transparent 60%),
+    var(--c-bg-alt);
+}
+
+.alphaBadge {
+  display: inline-block;
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--c-amber);
+  border: 1px solid var(--c-amber);
+  border-radius: 999px;
+  padding: 0.15rem 0.7rem;
   margin-bottom: 1rem;
 }
 
-.principles {
-  padding: 2rem 0;
+.desktopLede {
+  color: var(--c-dim);
+  max-width: 60ch;
+  margin: 0 0 2rem;
 }
 
-.quickStart {
-  padding: 2rem 0 4rem;
+.desktopGrid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 1.5rem;
 }
 
-.tabsWrapper {
-  max-width: 700px;
-  margin: 1rem auto 0;
+.desktopCaveat h3 {
+  font-size: 0.98rem;
+  font-weight: 700;
+  margin: 0 0 0.4rem;
 }
 
-.tabsWrapper pre {
-  border-radius: 8px;
-  padding: 1.5rem;
-  text-align: left;
+.desktopCaveat p {
+  font-size: 0.88rem;
+  color: var(--c-dim);
+  margin: 0;
 }
 
-.tabNote {
-  font-size: 0.95rem;
-  opacity: 0.85;
-  margin-top: 0.75rem;
+.desktopFiles {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  margin: 2rem 0 1.5rem;
 }
 
-.installCallout {
-  max-width: 700px;
-  margin: 1.5rem auto 0;
-  padding: 1rem 1.25rem;
-  border-left: 3px solid var(--ifm-color-primary);
-  background: var(--ifm-color-emphasis-100);
+.desktopFiles code {
+  font-size: 0.72rem;
+  background: var(--c-bg);
+  border: 1px solid var(--c-line);
+  border-radius: 5px;
+  padding: 0.2rem 0.5rem;
+  word-break: break-all;
+}
+
+.desktopProvenance {
+  font-size: 0.88rem;
+  color: var(--c-dim);
+  max-width: 62ch;
+  margin: 0;
+}
+
+/*
+ * The scope caveat sits UNDER the command, not above it: it says what the line
+ * the reader just met does not reach (the two checksums manifests), which only
+ * means anything once they have seen the command.
+ */
+.desktopProvenanceScope {
+  font-size: 0.82rem;
+  color: var(--c-dim);
+  max-width: 62ch;
+  margin: 0.75rem 0 0;
+}
+
+.desktopLink {
+  margin: 1.5rem 0 0;
+  font-weight: 600;
+}
+
+/* ---------- platforms and install routes ---------- */
+
+.install {
+  background: var(--c-bg-alt);
+  border-top: 1px solid var(--c-line);
+  border-bottom: 1px solid var(--c-line);
+  padding: 4rem 1rem;
+}
+
+.installInner {
+  max-width: 1000px;
+  margin: 0 auto;
+}
+
+.installCols {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 2.5rem;
+}
+
+.installCol {
+  min-width: 0;
+}
+
+.installHeading {
+  font-size: 0.72rem;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: var(--c-dim);
+  margin: 0 0 1rem;
+}
+
+.platformList,
+.routeList {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.platformList li {
+  display: flex;
+  align-items: baseline;
+  gap: 0.75rem;
+  padding: 0.7rem 0;
+  border-bottom: 1px solid var(--c-line);
+}
+
+.markOk,
+.markNot {
+  flex: 0 0 1rem;
+  font-weight: 700;
+  font-size: 0.85rem;
+}
+
+.markOk {
+  color: var(--c-teal);
+}
+
+.markNot {
+  color: var(--c-dim);
+}
+
+.platformName {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-weight: 600;
+}
+
+.platformDetail {
+  display: block;
+  font-weight: 400;
+  font-size: 0.82rem;
+  color: var(--c-dim);
+}
+
+.platformStatus {
+  flex: 0 0 auto;
+  font-size: 0.82rem;
+  color: var(--c-dim);
+  text-align: right;
+}
+
+.routeList li {
+  padding: 0.7rem 0;
+  border-bottom: 1px solid var(--c-line);
+}
+
+.routeName {
+  font-weight: 600;
+}
+
+.routeDetail {
+  display: block;
+  font-size: 0.82rem;
+  color: var(--c-dim);
+}
+
+.routeCode {
+  display: inline-block;
+  margin-top: 0.45rem;
+  font-size: 0.72rem;
+  background: var(--c-bg);
+  border: 1px solid var(--c-line);
+  border-radius: 5px;
+  padding: 0.2rem 0.5rem;
+  overflow-wrap: anywhere;
+}
+
+.installMore {
+  margin: 1.25rem 0 0;
+  font-weight: 600;
+}
+
+/* ---------- close ---------- */
+
+.close {
+  padding: 4.5rem 1rem 4rem;
+  text-align: center;
+  background: radial-gradient(
+    ellipse at 50% 120%,
+    var(--c-teal-soft),
+    transparent 65%
+  );
+}
+
+.closeInner {
+  max-width: 680px;
+  margin: 0 auto;
+}
+
+.closeTitle {
+  font-size: clamp(1.6rem, 6vw, 2.6rem);
+  font-weight: 800;
+  letter-spacing: -0.035em;
+  margin: 0 0 1.5rem;
+}
+
+/* ---------- the docs index ---------- */
+
+/*
+ * The last band before the (shared) Docusaurus footer. It steps the page's own
+ * visual layer back down -- flat surface, hairline rules, no gradient -- so the
+ * handoff into the docs chrome reads as a step rather than a cut.
+ *
+ * It used to carry a kicker, a metaphor ("The furniture stays. The job
+ * changes.") and a paragraph explaining which parts of the site persist across
+ * the click. All three are gone: a visitor at the bottom of a landing page
+ * wants to know where to click, not how the site is put together, and the
+ * shared palette (see the header of this file) has removed the mismatch the
+ * paragraph existed to apologise for. What is left is a plain heading over the
+ * six pages, so `.doorHead` and `.doorLede` went with it.
+ */
+.door {
+  border-top: 1px solid var(--c-line);
+  background: var(--c-bg-alt);
+  padding: 3.5rem 1rem 4rem;
+}
+
+.doorInner {
+  max-width: 1080px;
+  margin: 0 auto;
+}
+
+.doorTitle {
+  font-size: clamp(1.4rem, 4.5vw, 2rem);
+  font-weight: 750;
+  letter-spacing: -0.03em;
+  margin: 0;
+}
+
+.doorGrid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 1rem;
+  margin-top: 2.25rem;
+}
+
+.doorCard {
+  position: relative;
+  display: block;
+  padding: 1.1rem 2.6rem 1.1rem 1.2rem;
+  border: 1px solid var(--c-line);
+  border-radius: 10px;
+  background: var(--c-bg);
+  text-decoration: none;
+  color: var(--c-ink);
+  transition: border-color 0.12s ease, transform 0.12s ease;
+}
+
+.doorCard:hover,
+.doorCard:focus-visible {
+  text-decoration: none;
+  color: var(--c-ink);
+  border-color: var(--c-teal);
+  transform: translateY(-1px);
+}
+
+.doorCardTitle {
+  display: block;
+  font-weight: 650;
+  margin-bottom: 0.25rem;
+}
+
+.doorCardBody {
+  display: block;
+  font-size: 0.85rem;
+  color: var(--c-dim);
+}
+
+.doorArrow {
+  position: absolute;
+  top: 1.1rem;
+  right: 1.2rem;
+  color: var(--c-teal);
+}
+
+/* ---------- links that would otherwise inherit Infima's link colour ---------- */
+
+.platformStatus a,
+.installMore a,
+.desktopLink a {
+  color: var(--c-teal);
+}
+
+.platformStatus a:hover,
+.installMore a:hover,
+.desktopLink a:hover {
+  color: var(--c-teal);
+  text-decoration: underline;
+}
+
+/* ---------- focus ---------- */
+
+/*
+ * One focus ring for every link on the page. `.ctaPrimary`, `.ctaGhost` and
+ * `.doorCard` carried their own `:focus-visible` rules while the agent-strip
+ * links and the three colour-override links fell back to the browser default,
+ * so keyboard focus looked different in four places and was close to invisible
+ * in two of them. Those rules stay -- they are the hover affordance repeated --
+ * and this adds the indicator they were standing in for.
+ *
+ * `--c-teal` is #0a7c73 on the light background (5.07:1) and #4ecdc4 on the
+ * dark one (10.01:1), so the ring clears WCAG's 3:1 for non-text in both.
+ */
+.page a:focus-visible {
+  outline: 2px solid var(--c-teal);
+  outline-offset: 3px;
   border-radius: 4px;
-  font-size: 0.95rem;
 }
 
-.codeBlock {
-  max-width: 700px;
-  margin: 1rem auto 0;
+/* ---------- utilities ---------- */
+
+/*
+ * Present to a screen reader, absent to the eye. Used for the story section's
+ * <h2>, which exists so the four <h3> steps do not hang off nothing.
+ */
+.visuallyHidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
 }
 
-.codeBlock pre {
-  border-radius: 8px;
-  padding: 1.5rem;
-  text-align: left;
+/* ---------- narrow ---------- */
+
+@media (max-width: 996px) {
+  .storyRow,
+  .storyRowFlip {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 1.5rem;
+  }
+
+  .storyRowFlip .storyText,
+  .storyRowFlip .storyFigure {
+    order: initial;
+  }
+
+  .desktopGrid,
+  .principleGrid,
+  .installCols {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .doorGrid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .story {
+    gap: 3rem;
+  }
+}
+
+@media (max-width: 560px) {
+  .hero {
+    padding-top: 3rem;
+  }
+
+  .desktopInner {
+    padding: 1.75rem 1.25rem;
+  }
+
+  .ctaPrimary,
+  .ctaGhost {
+    width: 100%;
+    text-align: center;
+  }
+
+  .doorGrid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  /* The status column needs its own line before it starts squeezing the name. */
+  .platformList li {
+    flex-wrap: wrap;
+  }
+
+  .platformStatus {
+    flex: 1 0 100%;
+    padding-left: 1.75rem;
+    text-align: left;
+  }
 }
