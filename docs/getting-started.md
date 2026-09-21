@@ -18,22 +18,29 @@ brew tap vfarcic/tap && brew install dot-agent-deck
 dot-agent-deck
 ```
 
+No Homebrew? Download the binary instead — `dot-agent-deck-darwin-arm64` for Apple Silicon, `dot-agent-deck-darwin-amd64` for Intel. See [Download Binary](installation.md#download-binary).
+
 ### Linux
 
 ```bash
-# 1. Install via Homebrew (if available)
-brew tap vfarcic/tap && brew install dot-agent-deck
+# 1. Download the binary. Swap `amd64` for `arm64` on ARM machines.
+mkdir -p ~/.local/bin
+curl -fsSL -o ~/.local/bin/dot-agent-deck \
+  https://github.com/vfarcic/dot-agent-deck/releases/latest/download/dot-agent-deck-linux-amd64
+chmod +x ~/.local/bin/dot-agent-deck
 
 # 2. Launch the dashboard (hooks are auto-installed for detected agents)
 # Your previous workspace is restored automatically
 dot-agent-deck
 ```
 
+If `dot-agent-deck` comes back "command not found", `~/.local/bin` is not on your `PATH` — add `export PATH="$HOME/.local/bin:$PATH"` to your shell rc. [Homebrew](installation.md#homebrew-macos--linux) and [Nix](installation.md#nix) work on Linux too if you already use either.
+
 ### Windows
 
 Native Windows is [not supported yet](https://github.com/vfarcic/dot-agent-deck/issues/164). For now, install [WSL](https://learn.microsoft.com/en-us/windows/wsl/install) and follow the Linux instructions inside your WSL shell.
 
-> **Tip:** Prebuilt binaries and source builds are also available for macOS and Linux. See [all install options](installation.md).
+> **Tip:** [Installation](installation.md) has every option side by side — Homebrew, a downloaded binary, Nix, and building from source — with what each one suits.
 
 Once the dashboard is running, press `?` inside the app to see all shortcuts. The dashboard is also fully mouse-clickable: a button bar along the bottom exposes the main commands (each labelled with its keyboard shortcut), and cards, tab headers, dialogs, the directory picker, and forms all respond to clicks. See [Keyboard Shortcuts → Mouse](keyboard-shortcuts.md#mouse).
 

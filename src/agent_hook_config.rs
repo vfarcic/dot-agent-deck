@@ -629,19 +629,33 @@ pub(crate) fn executables_match(existing: &str, installing: &str) -> bool {
 /// what keep that case rare rather than impossible; nothing at this layer makes
 /// it impossible.
 pub(crate) fn pin_is_dead_sibling(exe: &str, binary_path: &str) -> bool {
+    pin_is_same_named(exe, binary_path) && crate::platform::paths::pin_is_repairable(exe)
+}
+
+/// Whether `exe` names the same program as `binary_path`, wherever either sits
+/// on disk — the basename half of [`pin_is_dead_sibling`], without its liveness
+/// half.
+///
+/// Split out for issue #1171. The install path needs to notice a deck rule for
+/// the same binary NAME at a different path that is very much alive: two
+/// installs of the deck (Homebrew's and `~/.local/bin`'s, say) each keep a rule,
+/// every hook event is then delivered twice, and nothing said so. That rule is
+/// not dead, so [`pin_is_dead_sibling`] cannot see it.
+///
+/// The fail-safe is the same and is deliberate: an installing path with no
+/// usable basename (empty, `..`-terminated, or non-UTF-8) matches nothing,
+/// because the one direction that costs a user their rule is a false match.
+pub(crate) fn pin_is_same_named(exe: &str, binary_path: &str) -> bool {
     let Some(installing) = Path::new(binary_path)
         .file_name()
         .and_then(|name| name.to_str())
     else {
-        // No basename to compare against (an empty or `..`-terminated
-        // installing path, or a non-UTF-8 one). Fail safe: prune nothing.
         return false;
     };
     Path::new(exe)
         .file_name()
         .and_then(|name| name.to_str())
         .is_some_and(|existing| binary_names_match(existing, installing))
-        && crate::platform::paths::pin_is_repairable(exe)
 }
 
 /// Every command string a rule carries, from either JSON shape: the current
@@ -725,6 +739,29 @@ fn rule_retains_a_handler(rule: &Value) -> bool {
 ///   `matcher`.
 ///
 /// Returns the number of individual commands removed.
+/// Every command string in `rules`, across both shapes
+/// [`strip_deck_commands`] walks — the current
+/// `{"hooks": [{"command": …}]}` and the legacy flat `{"command": …}`.
+///
+/// Read-only twin of that traversal, kept beside it so the two cannot drift on
+/// which shapes they understand.
+pub(crate) fn rule_command_strs(rules: &[Value]) -> Vec<&str> {
+    let mut out = Vec::new();
+    for rule in rules {
+        if let Some(hooks) = rule.get("hooks").and_then(Value::as_array) {
+            out.extend(
+                hooks
+                    .iter()
+                    .filter_map(|hook| hook.get("command").and_then(Value::as_str)),
+            );
+        }
+        if let Some(command) = rule.get("command").and_then(Value::as_str) {
+            out.push(command);
+        }
+    }
+    out
+}
+
 pub(crate) fn strip_deck_commands(
     rules: &mut Vec<Value>,
     mut is_target: impl FnMut(&str) -> bool,
