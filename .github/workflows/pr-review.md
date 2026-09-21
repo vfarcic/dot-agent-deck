@@ -62,24 +62,31 @@ network:
 # Spend is still bounded where bounding is free: by SHA-idempotence (each head is
 # reviewed once), by the eligibility filter, and by max_prs on the caller.
 #
-# RAISED 2026-09-21 (10000 -> 40000, with timeout-minutes 20 -> 45). PR #1163
-# (PRD #802, desktop voice control) returned INSUFFICIENT at the old budget:
-# 33,173 additions across 66 files, so the agent ranked risk, deep-read only the
-# highest-risk backend files, and correctly declined to claim the whole-diff
-# coverage an APPROVE asserts. That refusal is the behaviour we want; what was
-# wrong was a ceiling that made it the likely outcome for any PRD-sized change.
+# TIMEOUT RAISED 2026-09-21 (timeout-minutes 20 -> 45). CREDITS DELIBERATELY
+# LEFT AT 10000, and that is the more interesting half.
 #
-# A ceiling is not a spend. Raising it costs nothing on the ordinary PR, which
-# finishes far below either limit; it only draws more where a diff genuinely
-# needs more. `timeout-minutes` is raised with it because credits alone do not
-# help a job that is killed at 20 minutes.
+# PR #1163 (PRD #802) returned INSUFFICIENT at this budget: 33,173 additions
+# across 66 files, so the agent ranked risk, deep-read only the highest-risk
+# files, and declined to claim the whole-diff coverage an APPROVE asserts. That
+# refusal is the behaviour we want. The obvious response is to raise the credit
+# ceiling -- and the claim a few lines above says AWF clamps anything over
+# 10000, which would make that inert.
 #
-# This does NOT make INSUFFICIENT impossible, and it is not meant to. The same
-# PR returned APPROVE at the OLD budget on 2026-09-19 and INSUFFICIENT on
-# 2026-09-21, so the verdict is not deterministic at a fixed ceiling. A raise
-# shifts the odds; the procedure for an INSUFFICIENT that stands is a governance
-# question, not a budget one.
-max-ai-credits: 40000
+# THAT CLAIM IS UNVERIFIED. It arrived with #1058 asserted rather than measured,
+# and could not be checked from here: no local awf schema, `gh aw forecast`
+# reports zero runs of history, and no run log prints a credit total. Issue
+# #1217 exists to settle it.
+#
+# Until it is settled the ceiling stays where it is, because the failure is
+# ASYMMETRIC. Telling the agent it has more credits than are enforced makes it
+# plan a deeper pass, hit `403 Maximum AI credits exceeded`, and emit NOTHING --
+# and the prompt below is explicit that no verdict is strictly worse than a
+# shallow one. Telling it less than it has only wastes headroom. So the number
+# in the prompt must never exceed what is certainly enforced.
+#
+# `timeout-minutes` is raised because it is a GitHub Actions timeout: enforced
+# by the runner, subject to no clamp, and verifiable from the workflow file.
+max-ai-credits: 10000
 
 timeout-minutes: 45
 
@@ -153,7 +160,7 @@ Post exactly one comment on #${{ inputs.pr_number }}: your summary, then a singl
 
 ## Your budget, and what running out costs
 
-You have **10000 AI credits** for this run, and a 20-minute wall clock. Both are hard: the API proxy returns `403 Maximum AI credits exceeded` on the request that crosses the line, and everything after it fails.
+You have **10000 AI credits** for this run, and a 45-minute wall clock. Both are hard: the API proxy returns `403 Maximum AI credits exceeded` on the request that crosses the line, and everything after it fails.
 
 **Overrunning produces NO verdict at all — not a shallow one, nothing.** The comment is the only artefact of this run, so an overrun before you write it means the pull request is treated as unreviewed and nobody is told why. A shallow verdict always beats silence. This is not hypothetical: on 2026-09-13 a review of a 70-file pull request died at 1011 credits having written nothing.
 
