@@ -12,7 +12,10 @@ publish = false
 name = "xtask-cross-version"
 path = "src/main.rs"
 
-[dependencies]
+# Every dependency is Linux-only, like every module (see `src/main.rs`): on any
+# other target this crate is a stub `main` that says `cargo xver` runs on Linux
+# only, and builds nothing else.
+[target.'cfg(target_os = "linux")'.dependencies]
 # Both already root-package dependencies at these versions, so this member
 # pulls no new crate into Cargo.lock. They are the same PTY + terminal-emulator
 # pair the L2 e2e harness (`tests/common/mod.rs`) drives the real binary with.
@@ -32,5 +35,4 @@ toml = "1.0"
 
 # `kill(pid, 0)` for liveness, `kill(pid, SIGTERM)` for the identity-gated
 # teardown, `statvfs` and `getpwuid_r`. Already a workspace dependency.
-[target.'cfg(unix)'.dependencies]
 libc = "0.2"

@@ -2,7 +2,7 @@
 //! and every deck CLI call are started from here, each client only after the
 //! pre-connect assertion has held.
 //!
-//! The outer half (`main.rs`) builds the inputs, creates the sandbox, starts
+//! The outer half (`outer.rs`) builds the inputs, creates the sandbox, starts
 //! `bwrap` with this binary as its command and answers the host-side half of
 //! each pre-connect check over [`crate::ctl`]. This half proves its own
 //! namespace, drives rule 12's scenario, tears it down by verified identity,
@@ -15,11 +15,12 @@ use std::process::{Command, ExitCode, Output};
 use std::time::{Duration, Instant};
 
 use crate::isolation::{self, Plan};
+use crate::outer::epoch_secs;
 use crate::proc::{self, Identity, Mismatch, SandboxProcess, Terminated};
 use crate::pty;
 use crate::report::{Evidence, RunVerdict, Verdict};
 use crate::sandbox::{self, Direction, EndpointMatrix, EndpointMode, Sandbox};
-use crate::{ctl, epoch_secs, probes};
+use crate::{ctl, probes};
 
 /// How long to wait for the deck to paint its first frame, for the mismatch
 /// prompt, for a modal's first paint (the directory picker, the new-pane form,

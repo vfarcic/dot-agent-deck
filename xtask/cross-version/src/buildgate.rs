@@ -1067,7 +1067,7 @@ fn surface_at(
         scratch_parent,
         &format!(
             ".xver-merge-base-{short}-{}-{}",
-            crate::epoch_secs(),
+            crate::outer::epoch_secs(),
             std::process::id()
         ),
     )?);

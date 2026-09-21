@@ -4,7 +4,7 @@
 //! `$S/stub/claude`: the deck types an agent as Claude Code from its command's
 //! basename (`AgentType::from_command`), and two changed arms — #1031's
 //! late-readiness recovery and #1182's paste-envelope matcher — are only
-//! reachable for a Claude-typed pane. `main.rs` dispatches here when `argv[0]`'s
+//! reachable for a Claude-typed pane. `outer.rs` dispatches here when `argv[0]`'s
 //! basename is `claude`.
 //!
 //! It is deterministic where the real agent is not, and deliberately models only
