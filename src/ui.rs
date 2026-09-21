@@ -9216,22 +9216,28 @@ fn scope_command_entry_lock(
 /// means "no global command and nothing to forward", i.e. the key belongs to
 /// that mode's own handler.
 ///
-/// The `ToggleOrchestrationLock` and `ToggleZoom` passes below apply
-/// [`scope_command_entry_lock`]'s and [`scope_zoom`]'s MODE term only, with
-/// `is_orchestration_tab: true`. Mode is this helper's whole subject and is
-/// knowable here, so leaving it out would make the helper over-report `Ctrl+E`
-/// (and, worse, a plain `z`) as claimed in `PaneInput` — the exact thing the
-/// scoping exists to stop. Tab kind is not knowable here and is applied at the
-/// live call site, so this helper answers for the most permissive tab.
+/// The `ToggleOrchestrationLock`, `ToggleOrchestrationSplit` and `ToggleZoom`
+/// passes below apply [`scope_command_entry_lock`]'s,
+/// [`scope_orchestration_split`]'s and [`scope_zoom`]'s MODE term only, with
+/// `is_orchestration_tab: true`, in the order the live call site applies them.
+/// Mode is this helper's whole subject and is knowable here, so leaving any of
+/// them out would make the helper over-report `Ctrl+E`, `Ctrl+L` or `Ctrl+Z` as
+/// claimed in `PaneInput` — the exact thing the scoping exists to stop. Tab kind
+/// is not knowable here and is applied at the live call site, so this helper
+/// answers for the most permissive tab.
 pub fn key_action_for_mode(kb: &KeybindingConfig, mode: UiMode, key: &KeyEvent) -> Option<Action> {
     let resolved = global_action_for_mode(kb, mode, key);
     let resolved = scope_command_entry_lock(resolved, true, mode);
-    // PRD #313: the same MODE-only pass for the zoom toggle, with
-    // `is_orchestration_tab: true`. Leaving it out would make this helper report
-    // a plain `z` as claimed in `PaneInput`, when the live loop un-resolves it
-    // there and forwards the byte to the agent — the exact over-report the
-    // `ToggleOrchestrationLock` line above exists to avoid, and a louder one,
-    // since this binding is an ordinary character.
+    // PRD #336 (issue #439): the same MODE-only pass for the split toggle, in
+    // the position the live call site gives it — after the lock, before the
+    // zoom. Leaving it out made this helper report `Ctrl+L` as claimed in
+    // `PaneInput`, when the live loop un-resolves it there and forwards `0x0c`
+    // to the agent as readline's clear-screen.
+    let resolved = scope_orchestration_split(resolved, true, mode);
+    // PRD #313: and the same pass for the zoom toggle. Leaving it out would
+    // make this helper report `Ctrl+Z` as claimed in `PaneInput`, when the live
+    // loop un-resolves it there and forwards `0x1a` to the agent — the tty's
+    // SUSP character, so the over-report would be claiming job control.
     let resolved = scope_zoom(resolved, true, mode);
     if let Some(action) = resolved {
         return Some(action);
@@ -24504,16 +24510,30 @@ mod tests {
     }
 
     /// Scenario: PRD #336 — `scope_orchestration_split` is the guard that keeps
-    /// `Ctrl+l` from being swallowed anywhere it cannot act. It must claim
-    /// `ToggleOrchestrationSplit` ONLY on an orchestration tab in command mode,
-    /// and un-resolve it to `None` (so the key falls through to the pane-input
-    /// forwarding path) on any other tab and in any other mode — the
-    /// `close_pane` precedent from PRD #241 M1. Every other action must pass
-    /// through untouched for every tab/mode pair.
+    /// `Ctrl+l` from being swallowed anywhere it cannot act. Press `Ctrl+l` in
+    /// command mode and the deck must resolve `Action::ToggleOrchestrationSplit`;
+    /// press it while typing at a pane and the deck must NOT claim it, so the
+    /// byte still reaches the agent as `0x0c`, readline's clear-screen. Resolves
+    /// a simulated `Ctrl+l` `KeyEvent` through `key_action_for_mode` in both
+    /// modes, then drives `scope_orchestration_split` across every tab/mode pair
+    /// and confirms every other action passes through untouched.
     #[spec("orchestration/layout/005")]
     #[test]
     fn orchestration_layout_005_scope_orchestration_split_only_claims_ctrl_l_on_orchestration_tabs()
     {
+        // The default binding resolves to the split toggle SPECIFICALLY — not
+        // merely to "some action", which would still pass if the ACTIONS entry
+        // were wired to the wrong variant. (`Action` derives no `PartialEq`,
+        // hence `matches!` rather than `assert_eq!`.)
+        let kb = KeybindingConfig::default();
+        let ctrl_l = KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL);
+        let resolved = key_action_for_mode(&kb, UiMode::Normal, &ctrl_l);
+        assert!(
+            matches!(resolved, Some(Action::ToggleOrchestrationSplit)),
+            "default `Ctrl+l` must resolve to Action::ToggleOrchestrationSplit \
+             in command mode, got {resolved:?}"
+        );
+
         let split = || Some(Action::ToggleOrchestrationSplit);
 
         // The ONLY combination that resolves: orchestration tab + command mode.
@@ -24550,6 +24570,31 @@ mod tests {
                  it so the keystroke is not swallowed"
             );
         }
+
+        // And the payoff, end to end through the same public seam the live loop
+        // funnels a key down (issue #439): in `PaneInput` the chord must NOT
+        // come back as the split toggle — it must fall through to the
+        // pane-input forwarding path and reach the PTY as `0x0c`, readline's
+        // clear-screen. `key_action_for_mode` applied only two of the three
+        // scoping passes before this, so it answered `ToggleOrchestrationSplit`
+        // here while the live call site un-resolved it — every test reasoning
+        // about `Ctrl+l` through this seam was reasoning about behaviour the
+        // deck does not have. Same shape `orchestration/layout/007` asserts for
+        // `Ctrl+Z` and `0x1a`.
+        let pane_input = key_action_for_mode(&kb, UiMode::PaneInput, &ctrl_l);
+        assert!(
+            !matches!(pane_input, Some(Action::ToggleOrchestrationSplit)),
+            "`Ctrl+l` in PaneInput must not be claimed as the split toggle, \
+             got {pane_input:?}"
+        );
+        assert!(
+            matches!(
+                pane_input,
+                Some(Action::ForwardToPane(ref bytes)) if bytes.as_slice() == [0x0c]
+            ),
+            "`Ctrl+l` in PaneInput must still forward `0x0c` to the pane's PTY, \
+             got {pane_input:?}"
+        );
 
         // Unrelated actions pass through untouched for every tab/mode pair —
         // the guard must be surgical, not a general-purpose filter.
