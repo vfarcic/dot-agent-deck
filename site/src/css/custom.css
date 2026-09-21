@@ -1,4 +1,136 @@
+/*
+ * One palette for the whole site (issue #1021).
+ *
+ * `/` and `/docs` used to read as two different products. The landing page
+ * declared its own colour tokens on `.page` in `pages/index.module.css` and
+ * the docs kept Infima's defaults, so clicking "Get started" took a visitor
+ * from a near-black `#0a0e12` page to Docusaurus's `#1b1b1d`, and from the
+ * landing page's blue-grey hairlines to Infima's neutral greys. The chrome
+ * around the two was already shared -- same navbar, same footer -- which made
+ * the colour change underneath it read as a seam rather than a step.
+ *
+ * So the `--c-*` tokens now live HERE, on `:root` and `html[data-theme='dark']`,
+ * and both halves consume them: the Infima variables below are pointed at the
+ * same set, and `.page` no longer declares any of its own.
+ *
+ * The scope is deliberately COLOURS ONLY. No type scale moves, no layout
+ * moves, and none of the landing page's marketing devices -- the gradients,
+ * the hero spotlight, the device frame -- reach the docs. Those stay scoped
+ * under `.page`.
+ *
+ * `html[data-theme='dark']` rather than `[data-theme='dark']` is load-bearing.
+ * Infima declares its own dark block on `html[data-theme='dark']`, specificity
+ * (0,1,1); a bare attribute selector is (0,1,0) and LOSES to it however late it
+ * appears in the stylesheet. Matching the selector and coming later in source
+ * order is what makes these win. The `--ifm-link-color` / `--ifm-color-primary`
+ * pair below is the one place that could get away with the shorter form -- the
+ * Infima dark block sets neither -- and it uses the same selector anyway so the
+ * rule here is "match Infima" rather than "check each variable".
+ */
+
 :root {
+  /* ---- shared palette: light ---- */
+  --c-bg: #ffffff;
+  --c-bg-alt: #f5f7f9;
+  --c-ink: #0e1418;
+  --c-dim: #55636e;
+  --c-line: #e2e7eb;
+  --c-teal: #0a7c73;
+
+  /*
+   * Accent and device tokens. The docs consume none of these -- they are the
+   * landing page's alone -- but they live beside the palette they are tuned
+   * against, so the two halves of a theme cannot drift apart in two files.
+   */
+  --c-teal-soft: rgba(15, 156, 144, 0.12);
+  --c-violet: #6248d6;
+  --c-violet-soft: rgba(98, 72, 214, 0.1);
+  --c-amber: #8a5200;
+  --c-amber-soft: rgba(224, 165, 49, 0.14);
+  --c-shadow: 0 30px 70px -30px rgba(14, 20, 24, 0.35);
+  --c-cta-from: #0b7d74;
+  --c-cta-to: #5a3fd0;
+  --c-cta-ink: #ffffff;
+
+  /* ---- Infima, pointed at the palette ---- */
+
+  /*
+   * The emphasis ramp is where most of Infima's chrome gets its colour:
+   * table and blockquote borders (300), rules (500), sidebar and footer link
+   * text (700), blockquote text (800), body text (900). Replacing the whole
+   * ramp rather than picking off individual components is what keeps the docs
+   * internally consistent -- a half-replaced ramp puts a neutral grey border
+   * next to a blue-grey one. Anchored on the palette at 0/100/300/700/900 and
+   * interpolated between.
+   */
+  --ifm-color-emphasis-0: var(--c-bg);
+  --ifm-color-emphasis-100: var(--c-bg-alt);
+  --ifm-color-emphasis-200: #eceff3;
+  --ifm-color-emphasis-300: var(--c-line);
+  --ifm-color-emphasis-400: #d2d9e0;
+  --ifm-color-emphasis-500: #bcc5ce;
+  --ifm-color-emphasis-600: #8b97a3;
+  --ifm-color-emphasis-700: var(--c-dim);
+  --ifm-color-emphasis-800: #3a4650;
+  --ifm-color-emphasis-900: var(--c-ink);
+  --ifm-color-emphasis-1000: #05090c;
+
+  --ifm-background-color: var(--c-bg);
+  --ifm-background-surface-color: var(--c-bg-alt);
+  --ifm-font-color-base: var(--c-ink);
+  --ifm-toc-border-color: var(--c-line);
+
+  /*
+   * Link contrast. Infima defaults `--ifm-link-color` to
+   * `var(--ifm-color-primary)`, and `#4ecdc4` on the light background measures
+   * 1.93:1 -- a WCAG AA failure on every docs page, not only on `/`. The
+   * palette's own light teal is 5.07:1 on `--c-bg` and 4.72:1 on `--c-bg-alt`.
+   * The primary ramp cannot do this job: even `--ifm-color-primary-darkest`
+   * `#279f95` is 3.24:1, still failing for normal text -- which is why the
+   * fix points at `--c-teal` instead of moving the ramp, leaving buttons,
+   * admonition accents and the navbar hover on the brand teal.
+   *
+   * The previous pass moved `--ifm-link-color` alone and left "the active
+   * sidebar item and the navbar hover" on the brand teal deliberately, to
+   * avoid restyling pages. Sharing a palette is that restyle, so the rest of
+   * the coloured TEXT in the docs chrome comes along now -- measured in light
+   * mode, each against the surface it actually sits on:
+   *
+   *   selected sidebar item   1.73:1 -> 4.53:1  (--ifm-menu-color-active)
+   *   active navbar item      1.80:1 -> 4.72:1  (--ifm-navbar-link-hover-color)
+   *   active breadcrumb       1.73:1 -> 4.53:1  (--ifm-breadcrumb-color-active)
+   *   active TOC entry        1.93:1 -> 5.07:1  (the rule below)
+   *
+   * The sidebar item and the breadcrumb sit on `#f2f2f2` rather than on the
+   * page, because both carry `--ifm-hover-overlay` (5% black) behind them; the
+   * navbar item sits on the navbar's own surface, and the TOC entry on the
+   * page. Each ratio above is against the surface named here, not against
+   * `--c-bg` for all four.
+   *
+   * All four were already failing before the palette moved -- the light
+   * background did not change -- and all four are fixed by pointing at the
+   * palette's own light teal rather than by moving `--ifm-color-primary`,
+   * which stays on the brand `#4ecdc4` so every FILL (buttons, the dot on a
+   * focused control, admonition accents) is untouched. In dark mode `--c-teal`
+   * IS `#4ecdc4`, so nothing there changes at all.
+   */
+  --ifm-link-color: var(--c-teal);
+  --ifm-menu-color-active: var(--c-teal);
+  --ifm-navbar-link-hover-color: var(--c-teal);
+  --ifm-breadcrumb-color-active: var(--c-teal);
+  --ifm-tabs-color-active: var(--c-teal);
+  --ifm-pagination-nav-color-hover: var(--c-teal);
+
+  /*
+   * Secondary text: TOC entries, pagination sublabels, inactive tabs. Infima
+   * pins this to a literal grey per theme rather than to the emphasis ramp --
+   * `#525860` in light, and pure WHITE in dark, which is why the dark table of
+   * contents reads as loud as the body copy. The palette's dim token is
+   * 6.18:1 in light and 7.96:1 in dark, so this recedes correctly in both
+   * without dropping below AA.
+   */
+  --ifm-color-content-secondary: var(--c-dim);
+
   --ifm-color-primary: #4ecdc4;
   --ifm-color-primary-dark: #38c5bb;
   --ifm-color-primary-darker: #2fc0b5;
@@ -10,7 +142,73 @@
   --docusaurus-highlighted-code-line-bg: rgba(0, 0, 0, 0.1);
 }
 
-[data-theme='dark'] {
+html[data-theme='dark'] {
+  /* ---- shared palette: dark ---- */
+  --c-bg: #0a0e12;
+  --c-bg-alt: #101720;
+  --c-ink: #edf2f6;
+  --c-dim: #9aa8b4;
+  --c-line: #1e2833;
+  --c-teal: #4ecdc4;
+
+  --c-teal-soft: rgba(78, 205, 196, 0.14);
+  --c-violet: #9d8bff;
+  --c-violet-soft: rgba(157, 139, 255, 0.14);
+  --c-amber: #e0a531;
+  --c-amber-soft: rgba(224, 165, 49, 0.14);
+  --c-shadow: 0 30px 80px -30px rgba(0, 0, 0, 0.85);
+  --c-cta-from: #4ecdc4;
+  --c-cta-to: #9d8bff;
+  --c-cta-ink: #07121a;
+
+  /* ---- Infima, pointed at the palette ---- */
+
+  /* The ramp inverts, exactly as Infima's own dark block inverts it. */
+  --ifm-color-emphasis-0: var(--c-bg);
+  --ifm-color-emphasis-100: var(--c-bg-alt);
+  --ifm-color-emphasis-200: var(--c-line);
+  --ifm-color-emphasis-300: #2a3745;
+  --ifm-color-emphasis-400: #3c4b5c;
+  --ifm-color-emphasis-500: #5a6b7c;
+  --ifm-color-emphasis-600: #7c8b99;
+  --ifm-color-emphasis-700: var(--c-dim);
+  --ifm-color-emphasis-800: #c6d0d9;
+  --ifm-color-emphasis-900: var(--c-ink);
+  --ifm-color-emphasis-1000: #ffffff;
+
+  --ifm-background-color: var(--c-bg);
+  --ifm-background-surface-color: var(--c-bg-alt);
+  --ifm-toc-border-color: var(--c-line);
+
+  /*
+   * `--ifm-font-color-base` derives from `--ifm-color-content`, which Infima's
+   * dark block sets to a literal `#e3e3e3` rather than to the emphasis ramp.
+   * Both are set here, so replacing the ramp is not silently ignored.
+   */
+  --ifm-color-content: var(--c-ink);
+  --ifm-font-color-base: var(--c-ink);
+
+  /*
+   * `--c-teal` is `#4ecdc4` here, which is what the dark theme already used.
+   * The light value `#0a7c73` would be 3.82:1 on `--c-bg` and 3.56:1 on
+   * `--c-bg-alt` -- both under 4.5:1, trading one AA failure for another --
+   * which is why the token flips rather than the variable being set once on
+   * `:root`.
+   *
+   * An earlier version of this comment said 3.39:1. That is `#0a7c73` on
+   * Infima's own dark background `#1b1b1d`: the figure was measured before
+   * this palette moved the dark docs onto `#0a0e12`, and went stale with that
+   * move rather than being mistyped. It is a ratio against a token, so it
+   * needs re-measuring whenever the token does.
+   */
+  --ifm-link-color: var(--c-teal);
+  --ifm-menu-color-active: var(--c-teal);
+  --ifm-navbar-link-hover-color: var(--c-teal);
+  --ifm-breadcrumb-color-active: var(--c-teal);
+  --ifm-tabs-color-active: var(--c-teal);
+  --ifm-pagination-nav-color-hover: var(--c-teal);
+  --ifm-color-content-secondary: var(--c-dim);
+
   --ifm-color-primary: #4ecdc4;
   --ifm-color-primary-dark: #38c5bb;
   --ifm-color-primary-darker: #2fc0b5;
@@ -19,4 +217,19 @@
   --ifm-color-primary-lighter: #6dd8d1;
   --ifm-color-primary-lightest: #8de2dc;
   --docusaurus-highlighted-code-line-bg: rgba(0, 0, 0, 0.3);
+}
+
+/*
+ * The active entry in the table of contents is the one piece of coloured text
+ * in the docs chrome with no variable behind it: Docusaurus's own rule pins it
+ * to `--ifm-color-primary`, which is 1.93:1 on the light background. This is
+ * the same fix as the tokens above, applied where a token cannot reach, and it
+ * is a colour and nothing else -- weight, size and spacing are untouched.
+ * In dark mode `--c-teal` is `--ifm-color-primary`, so it is a no-op there.
+ */
+.table-of-contents__link--active,
+.table-of-contents__link--active code,
+.table-of-contents__link:hover,
+.table-of-contents__link:hover code {
+  color: var(--c-teal);
 }

@@ -67,6 +67,7 @@ pub mod spawn;
 pub mod state;
 pub mod tab;
 pub mod tab_layout;
+pub mod terminal_hangup;
 pub mod terminal_widget;
 // Issue #322: test-only, and never part of the shipped library. Unit tests in
 // this crate do not link `tests/common/`, so before this they allocated scratch
@@ -84,6 +85,12 @@ mod test_temp;
 mod test_budget;
 #[cfg(test)]
 mod test_isolation;
+// Issue #1132: test-only, and shared for the same reason as the two above —
+// unit tests in `spawn.rs`, `ui.rs` and `state.rs` all drive the same `/bin/cat`
+// PTY byte target, and the content-keyed waits that make their assertions
+// deterministic were private to one of them.
+#[cfg(test)]
+mod test_pty_wait;
 pub mod ui;
 // Issue #670: the one implementation of the control-character / Unicode-bidi
 // filter applied to producer-supplied strings before they reach a terminal.
