@@ -999,7 +999,7 @@ fn run_one(
         previous: previous.tag.clone(),
         previous_source: previous.describe(),
         direction,
-        probe: probe.describe(),
+        probe,
         started_at: utc_now(),
         mode: match mode {
             EndpointMode::SandboxSockets => {
@@ -1865,14 +1865,26 @@ mod verdict_tests {
 
     #[test]
     fn an_unmeasured_tell_is_incomplete_and_never_a_clean_pass() {
-        let v = with_tells(&[Verdict::Pass, Verdict::Pass, Verdict::NotChecked]).verdict();
+        let v = with_tells(&[
+            Verdict::Pass,
+            Verdict::Pass,
+            Verdict::NotChecked,
+            Verdict::Pass,
+        ])
+        .verdict();
         assert!(matches!(v, RunVerdict::Incomplete(_)), "{v:?}");
         assert!(!run_passed(&v, true, true));
     }
 
     #[test]
     fn a_measured_non_discovery_exits_non_zero() {
-        let mut ev = with_tells(&[Verdict::Pass; 3]);
+        let mut ev = Evidence {
+            direction: Direction::Reverse,
+            ..Default::default()
+        };
+        for id in report::COLLATERAL_TELLS {
+            ev.tell(id, "t", Verdict::Pass, "measured");
+        }
         ev.discovery = Some("the old TUI lazy-spawned its own daemon".into());
         let v = ev.verdict();
         assert!(matches!(v, RunVerdict::OldClientCannotDiscover(_)), "{v:?}");

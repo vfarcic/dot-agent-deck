@@ -23,10 +23,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::sandbox::{EndpointMode, Sandbox};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
 pub enum Probe {
     /// No stimulus: the four tells, plus the `role-set` tell (see
     /// [`Probe::asserts_role_set`]).
+    #[default]
     Generic,
     /// PR #1161 / issue #1109: an old-TUI `Stop` makes the branch daemon log
     /// what the shutdown frame is destroying, before it exits.
@@ -117,6 +118,26 @@ impl Probe {
                 Probe::SignalAck.name()
             ),
             (p, Some((pr, issue))) => format!("`{}` — PR #{pr} / issue #{issue}", p.name()),
+        }
+    }
+
+    /// The id of the tell this probe's own stimulus records (`probes.rs`), or
+    /// `None` for a probe with no stimulus: `Generic`, and `DiscoveryFallback`,
+    /// whose measurement is the attach itself.
+    ///
+    /// A reverse run that found the daemon is not complete without it
+    /// (`report::Evidence::expected_tells`), so a probe whose stimulus never
+    /// ran cannot aggregate to a PASS on the four tells alone.
+    pub fn tell_id(self) -> Option<&'static str> {
+        match self {
+            Probe::Generic | Probe::DiscoveryFallback => None,
+            Probe::TeardownInventory => Some("probe-teardown-inventory"),
+            Probe::LateSessionStart => Some("probe-late-session-start"),
+            Probe::LogEscaping => Some("probe-log-escaping"),
+            Probe::PasteEnvelope => Some("probe-paste-envelope"),
+            Probe::CrossPaneSessionKey => Some("probe-cross-pane-session-key"),
+            Probe::SignalAck => Some("probe-signal-ack"),
+            Probe::GitEnv => Some("probe-git-env"),
         }
     }
 

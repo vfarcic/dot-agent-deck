@@ -10,7 +10,20 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::probe::Probe;
 use crate::sandbox::Direction;
+
+/// Rule 12's four tells. A run that reached the scenario and found the daemon
+/// records every one of them, in either direction.
+pub const CONTRACT_TELLS: [&str; 4] = ["tell-1", "tell-2", "tell-3", "tell-4"];
+
+/// What a reverse run records INSTEAD of the four when the old client did not
+/// find the branch daemon (`inner::classify_undiscovered`).
+pub const COLLATERAL_TELLS: [&str; 3] = ["collateral-1", "collateral-2", "collateral-3"];
+
+/// The tell a reverse run records when its probe asserts it
+/// ([`Probe::asserts_role_set`]).
+pub const ROLE_SET_TELL: &str = "role-set";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Verdict {
@@ -91,8 +104,10 @@ pub struct Evidence {
     pub previous_source: String,
     /// Which build served the daemon.
     pub direction: Direction,
-    /// The reverse probe the run carried, as one line.
-    pub probe: String,
+    /// The reverse probe the run carried. Forward runs carry `Generic`. It
+    /// decides which tells the run must have recorded
+    /// ([`expected_tells`](Self::expected_tells)).
+    pub probe: Probe,
     /// Set, in a reverse run, when the old client was measured unable to find
     /// the branch daemon: what it did instead. See
     /// [`RunVerdict::OldClientCannotDiscover`].
@@ -182,13 +197,55 @@ impl Evidence {
         !self.tells.iter().any(|t| t.verdict == Verdict::Fail)
     }
 
-    /// Whether every one of the four required tells was actually measured.
+    /// The tells this run must have recorded, by id: the COMPLETE set for its
+    /// direction and probe, never merely the ones that happen to be present.
+    ///
+    /// * Found the daemon — rule 12's four ([`CONTRACT_TELLS`]); in reverse
+    ///   also [`ROLE_SET_TELL`] where the probe asserts it and the probe's own
+    ///   tell where it has a stimulus ([`Probe::tell_id`]).
+    /// * Reverse, the old client did not find the branch daemon
+    ///   ([`discovery`](Self::discovery) set) — the three [`COLLATERAL_TELLS`].
+    ///   That path never reaches the four or the probe's stimulus, and the
+    ///   verdict it earns says so rather than claiming them.
+    ///
+    /// Each set mirrors what the scenario records on that path: `inner.rs`
+    /// records the four, the collateral tells and `role-set`, `probes.rs` each
+    /// probe's own. The `expected_set_tests` below pin every id here to a
+    /// literal one of them passes to `tell`.
+    pub fn expected_tells(&self) -> Vec<&'static str> {
+        if self.discovery.is_some() {
+            return COLLATERAL_TELLS.to_vec();
+        }
+        let mut ids = CONTRACT_TELLS.to_vec();
+        if self.direction == Direction::Reverse {
+            if self.probe.asserts_role_set() {
+                ids.push(ROLE_SET_TELL);
+            }
+            ids.extend(self.probe.tell_id());
+        }
+        ids
+    }
+
+    /// The [`expected_tells`](Self::expected_tells) this run never recorded.
+    pub fn missing_tells(&self) -> Vec<&'static str> {
+        self.expected_tells()
+            .into_iter()
+            .filter(|id| !self.tells.iter().any(|t| t.id == *id))
+            .collect()
+    }
+
+    /// Whether every expected tell was recorded AND every recorded tell was
+    /// actually measured.
     ///
     /// Separate from [`passed`](Self::passed) on purpose: a run in which a tell
-    /// could not be measured is not a pass, and reporting it as one is the
-    /// false green this whole harness exists to prevent.
+    /// could not be measured, or in which an expected tell was never recorded
+    /// at all, is not a pass, and reporting it as one is the false green this
+    /// whole harness exists to prevent. Checking only the tells present would
+    /// let a scenario that stopped recording early aggregate to a PASS on
+    /// whatever it did record.
     pub fn complete(&self) -> bool {
-        self.tells.iter().all(|t| t.verdict != Verdict::NotChecked)
+        self.missing_tells().is_empty()
+            && self.tells.iter().all(|t| t.verdict != Verdict::NotChecked)
     }
 
     /// The run's result. An isolation failure dominates everything: a tell
@@ -212,7 +269,15 @@ impl Evidence {
             return RunVerdict::Incomplete("no tell was measured".to_string());
         }
         if !self.complete() {
-            return RunVerdict::Incomplete("a tell could not be measured".to_string());
+            let missing = self.missing_tells();
+            return RunVerdict::Incomplete(if missing.is_empty() {
+                "a tell could not be measured".to_string()
+            } else {
+                format!(
+                    "an expected tell was never recorded ({})",
+                    missing.join(", ")
+                )
+            });
         }
         if let Some(what) = &self.discovery {
             return RunVerdict::OldClientCannotDiscover(what.clone());
@@ -319,7 +384,7 @@ impl Evidence {
             }
         );
         if reverse {
-            let _ = writeln!(s, "| probe | {} |", self.probe);
+            let _ = writeln!(s, "| probe | {} |", self.probe.describe());
         }
         let _ = writeln!(s, "| started (UTC) | {} |", self.started_at);
         let _ = writeln!(s, "| endpoint mode | {} |", self.mode);
@@ -368,6 +433,19 @@ impl Evidence {
                 let _ = writeln!(s, "> {line}");
             }
             let _ = writeln!(s);
+        }
+        let missing = self.missing_tells();
+        if !missing.is_empty() {
+            let _ = writeln!(
+                s,
+                "**Never recorded:** {} — expected for this direction and probe, and absent, so \
+                 this run is not a pass.\n",
+                missing
+                    .iter()
+                    .map(|id| format!("`{id}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
         }
 
         let _ = writeln!(s, "## Isolation\n");
@@ -453,28 +531,69 @@ mod tests {
         }
     }
 
+    fn record(e: &mut Evidence, ids: &[&str]) {
+        for id in ids {
+            e.tell(id, "t", Verdict::Pass, "measured");
+        }
+    }
+
     #[test]
-    fn a_run_with_no_failures_and_nothing_unmeasured_is_a_pass() {
+    fn a_forward_run_with_all_four_tells_measured_is_a_pass() {
         let mut e = ev();
-        e.tells.push(Tell {
-            id: "tell-1".into(),
-            title: "t".into(),
-            verdict: Verdict::Pass,
-            detail: "1".into(),
-        });
+        record(&mut e, &CONTRACT_TELLS);
         assert!(e.passed() && e.complete());
-        assert!(e.render().contains("**Verdict: PASS**"));
+        assert_eq!(e.verdict(), RunVerdict::Pass);
+        let out = e.render();
+        assert!(out.contains("**Verdict: PASS**"), "{out}");
+        assert!(!out.contains("Never recorded"), "{out}");
+    }
+
+    /// Greptile's finding on PR #1210: `complete()` used to check only that
+    /// the tells PRESENT were measured, so one passing `tell-1` was a PASS.
+    #[test]
+    fn a_forward_run_missing_any_contract_tell_is_incomplete_never_a_pass() {
+        let mut e = ev();
+        record(&mut e, &["tell-1"]);
+        assert!(e.passed(), "nothing failed");
+        assert!(!e.complete(), "but three of the four were never recorded");
+        assert_eq!(
+            e.verdict(),
+            RunVerdict::Incomplete(
+                "an expected tell was never recorded (tell-2, tell-3, tell-4)".into()
+            )
+        );
+        let out = e.render();
+        assert!(out.contains("**Verdict: INCOMPLETE"), "{out}");
+        assert!(
+            out.contains("**Never recorded:** `tell-2`, `tell-3`, `tell-4`"),
+            "{out}"
+        );
+        for absent in CONTRACT_TELLS {
+            let mut e = ev();
+            let present: Vec<&str> = CONTRACT_TELLS
+                .into_iter()
+                .filter(|id| *id != absent)
+                .collect();
+            record(&mut e, &present);
+            assert!(
+                matches!(e.verdict(), RunVerdict::Incomplete(ref w) if w.contains(absent)),
+                "without {absent}: {:?}",
+                e.verdict()
+            );
+        }
     }
 
     #[test]
     fn an_unmeasured_tell_is_not_reported_as_a_pass() {
         let mut e = ev();
+        record(&mut e, &["tell-1", "tell-3", "tell-4"]);
         e.tells.push(Tell {
-            id: "tell-1".into(),
+            id: "tell-2".into(),
             title: "t".into(),
             verdict: Verdict::NotChecked,
             detail: "no ss(8) on this host".into(),
         });
+        assert!(e.missing_tells().is_empty(), "every tell was recorded");
         assert!(e.passed(), "nothing failed");
         assert!(!e.complete(), "but something was not measured");
         assert!(e.render().contains("INCOMPLETE"));
@@ -496,7 +615,7 @@ mod tests {
     #[test]
     fn an_isolation_failure_voids_even_an_all_pass_run() {
         let mut e = ev();
-        e.tell("tell-1", "t", Verdict::Pass, "1");
+        record(&mut e, &CONTRACT_TELLS);
         e.isolated("mount namespace mnt:[2]");
         e.isolation_failed("host /tmp/dot-agent-deck-1000.sock changed");
         e.isolation_failed("a consequence");
@@ -597,7 +716,7 @@ mod reverse_tests {
         Evidence {
             branch: "agent/x".into(),
             direction: Direction::Reverse,
-            probe: "`log-escaping` — PR #1169 / issue #1082".into(),
+            probe: Probe::LogEscaping,
             ..Default::default()
         }
     }
@@ -605,8 +724,14 @@ mod reverse_tests {
     #[test]
     fn a_measured_non_discovery_is_its_own_verdict() {
         let mut e = reverse();
-        e.tell("collateral-1", "t", Verdict::Pass, "x");
+        for id in COLLATERAL_TELLS {
+            e.tell(id, "t", Verdict::Pass, "x");
+        }
         e.discovery = Some("the old TUI lazy-spawned its own daemon".into());
+        assert!(
+            e.missing_tells().is_empty(),
+            "neither the four nor the probe's tell is expected on this path"
+        );
         assert!(matches!(
             e.verdict(),
             RunVerdict::OldClientCannotDiscover(_)
@@ -645,6 +770,22 @@ mod reverse_tests {
         );
         e.discovery = Some("x".into());
         assert_eq!(e.verdict(), RunVerdict::Fail);
+    }
+
+    #[test]
+    fn a_non_discovery_missing_a_collateral_tell_is_incomplete_not_its_own_verdict() {
+        for absent in COLLATERAL_TELLS {
+            let mut e = reverse();
+            for id in COLLATERAL_TELLS.into_iter().filter(|id| *id != absent) {
+                e.tell(id, "t", Verdict::Pass, "x");
+            }
+            e.discovery = Some("the old TUI lazy-spawned its own daemon".into());
+            assert!(
+                matches!(e.verdict(), RunVerdict::Incomplete(ref w) if w.contains(absent)),
+                "without {absent}: {:?}",
+                e.verdict()
+            );
+        }
     }
 
     #[test]
@@ -687,5 +828,171 @@ mod reverse_tests {
         };
         let out = fwd.render();
         assert!(out.contains("## The four tells") && !out.contains("| probe |"));
+    }
+}
+
+/// The complete expected set, per direction and probe (Greptile's finding on
+/// PR #1210), and the guard that keeps it in step with the scenario.
+#[cfg(test)]
+mod expected_set_tests {
+    use std::collections::BTreeSet;
+
+    use clap::ValueEnum;
+
+    use super::*;
+
+    fn run(direction: Direction, probe: Probe, ids: &[&str]) -> Evidence {
+        let mut e = Evidence {
+            branch: "agent/x".into(),
+            direction,
+            probe,
+            ..Default::default()
+        };
+        for id in ids {
+            e.tell(id, "t", Verdict::Pass, "measured");
+        }
+        e
+    }
+
+    fn plus(extra: &[&'static str]) -> Vec<&'static str> {
+        CONTRACT_TELLS.iter().chain(extra).copied().collect()
+    }
+
+    fn assert_incomplete_naming(e: &Evidence, absent: &str) {
+        assert!(
+            matches!(e.verdict(), RunVerdict::Incomplete(ref w) if w.contains(absent)),
+            "{} / {:?} without {absent}: {:?}",
+            e.probe.name(),
+            e.direction,
+            e.verdict()
+        );
+        assert_eq!(e.missing_tells(), vec![absent]);
+    }
+
+    #[test]
+    fn forward_expects_the_four_and_nothing_else() {
+        let e = run(Direction::Forward, Probe::Generic, &CONTRACT_TELLS);
+        assert_eq!(e.expected_tells(), CONTRACT_TELLS.to_vec());
+        assert_eq!(e.verdict(), RunVerdict::Pass, "no role-set in forward");
+    }
+
+    #[test]
+    fn reverse_generic_is_not_complete_without_role_set() {
+        let e = run(Direction::Reverse, Probe::Generic, &CONTRACT_TELLS);
+        assert_incomplete_naming(&e, ROLE_SET_TELL);
+        let e = run(Direction::Reverse, Probe::Generic, &plus(&[ROLE_SET_TELL]));
+        assert_eq!(e.verdict(), RunVerdict::Pass);
+    }
+
+    #[test]
+    fn reverse_with_a_stimulus_is_not_complete_without_the_probes_own_tell() {
+        let mut stimulus_probes = 0;
+        for &probe in Probe::value_variants() {
+            let Some(own) = probe.tell_id() else {
+                continue;
+            };
+            stimulus_probes += 1;
+            assert!(!probe.asserts_role_set(), "{}", probe.name());
+            let e = run(Direction::Reverse, probe, &CONTRACT_TELLS);
+            assert_incomplete_naming(&e, own);
+            let e = run(Direction::Reverse, probe, &plus(&[own]));
+            assert_eq!(e.verdict(), RunVerdict::Pass, "{}", probe.name());
+            for absent in CONTRACT_TELLS {
+                let ids: Vec<&str> = plus(&[own])
+                    .into_iter()
+                    .filter(|id| *id != absent)
+                    .collect();
+                assert_incomplete_naming(&run(Direction::Reverse, probe, &ids), absent);
+            }
+        }
+        assert_eq!(
+            stimulus_probes, 7,
+            "every probe but generic and discovery-fallback"
+        );
+    }
+
+    #[test]
+    fn reverse_discovery_fallback_that_found_the_daemon_expects_the_four() {
+        let e = run(
+            Direction::Reverse,
+            Probe::DiscoveryFallback,
+            &CONTRACT_TELLS,
+        );
+        assert_eq!(e.expected_tells(), CONTRACT_TELLS.to_vec());
+        assert_eq!(e.verdict(), RunVerdict::Pass);
+    }
+
+    #[test]
+    fn a_blocked_probe_precondition_alone_is_incomplete() {
+        // `inner::scenario`'s early return: one not-checked `probe` tell and
+        // nothing else recorded.
+        let mut e = run(Direction::Reverse, Probe::DiscoveryFallback, &[]);
+        e.tell(
+            "probe",
+            "the probe's precondition",
+            Verdict::NotChecked,
+            "flat pair",
+        );
+        assert!(
+            matches!(e.verdict(), RunVerdict::Incomplete(_)),
+            "{:?}",
+            e.verdict()
+        );
+    }
+
+    /// Every id passed to `tell` as a string literal in `src`.
+    fn literal_tell_ids(src: &str) -> BTreeSet<String> {
+        let mut ids = BTreeSet::new();
+        let mut rest = src;
+        while let Some(i) = rest.find(".tell(") {
+            rest = &rest[i + ".tell(".len()..];
+            if let Some(lit) = rest.trim_start().strip_prefix('"')
+                && let Some(end) = lit.find('"')
+            {
+                ids.insert(lit[..end].to_string());
+            }
+        }
+        ids
+    }
+
+    /// The expected set is written here, and the tells are recorded in
+    /// `inner.rs` and `probes.rs`; a renamed tell on either side would turn
+    /// every run INCOMPLETE, or a new one would go unrequired. So every id any
+    /// expected set names must be one the scenario records, and every id the
+    /// scenario records must be in some expected set — except `aborted`, which
+    /// is always a FAIL, and `probe`, which is always not checked.
+    #[test]
+    fn every_expected_id_is_one_the_scenario_records_and_vice_versa() {
+        let recorded: BTreeSet<String> = literal_tell_ids(include_str!("inner.rs"))
+            .into_iter()
+            .chain(literal_tell_ids(include_str!("probes.rs")))
+            .collect();
+        let mut expected: BTreeSet<String> = BTreeSet::new();
+        for direction in [Direction::Forward, Direction::Reverse] {
+            for &probe in Probe::value_variants() {
+                for discovery in [None, Some("x".to_string())] {
+                    let e = Evidence {
+                        direction,
+                        probe,
+                        discovery,
+                        ..Default::default()
+                    };
+                    expected.extend(e.expected_tells().into_iter().map(str::to_string));
+                }
+            }
+        }
+        let unrecorded: Vec<&String> = expected.difference(&recorded).collect();
+        assert!(
+            unrecorded.is_empty(),
+            "expected but never recorded: {unrecorded:?}"
+        );
+        let unexpected: Vec<&String> = recorded
+            .difference(&expected)
+            .filter(|id| *id != "aborted" && *id != "probe")
+            .collect();
+        assert!(
+            unexpected.is_empty(),
+            "recorded but never required: {unexpected:?}"
+        );
     }
 }
