@@ -779,7 +779,30 @@ fn run_clamp(body: &str) -> Option<String> {
         out.status,
         String::from_utf8_lossy(&out.stderr)
     );
-    Some(fs::read_to_string(&path).expect("read back"))
+    // Normalize CRLF, because on Windows we would otherwise be measuring the
+    // TEST HARNESS rather than the clamp. Python's text mode translates each
+    // `\n` it writes into `\r\n` there, so the readback carries one extra
+    // character per line -- 562 of them on the dense fixture, which is what
+    // turned `build-windows` red on the first push of this PR with
+    // `clamped body is 122562 chars, over the 122000 budget`.
+    //
+    // The clamp itself was correct and the number it enforces is the right
+    // one: `prepare` runs on `ubuntu-latest`, Python writes LF there with no
+    // translation, and the artifact travels to `finalize` byte for byte -- so
+    // the length GitHub applies its 125,000-character cap to is the LF length,
+    // which is exactly what the clamp counted. Measuring the CRLF form would
+    // assert against a body that is never published.
+    //
+    // Normalizing rather than gating the test on `cfg(unix)`: every other
+    // assertion here (entries kept whole, the giant entry dropped, the pointer
+    // appended) is platform-independent and worth running everywhere. This
+    // crate already treats CRLF as a known Windows hazard rather than a reason
+    // to skip -- see `skill_frontmatter`'s `a_crlf_checkout_parses_the_same_as_lf`.
+    Some(
+        fs::read_to_string(&path)
+            .expect("read back")
+            .replace("\r\n", "\n"),
+    )
 }
 
 /// The two constants the clamp is parameterised by, read from its own source
