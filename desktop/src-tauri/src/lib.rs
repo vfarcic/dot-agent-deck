@@ -3109,9 +3109,17 @@ async fn start_orchestration_action(
     // pool, and dropping this future cannot stop that: a preparation reported
     // here as timed out would still publish afterwards, possibly over a
     // retry's context once the retry's last prepared-role check has passed.
-    // The role starts and rollback stops below stay bounded, because those
-    // are reconciled against what the deck lists; a preparation has nothing
-    // to reconcile against, so it is waited out instead.
+    // The role starts and rollback stops below stay bounded, and for two
+    // different reasons (audit W6 — this comment used to give the start's
+    // reason for both). A start that elapses is reported as INDETERMINATE and
+    // goes through the pane-and-orchestration reconciliation, so one that
+    // landed anyway is found and stopped. A stop that elapses is reconciled
+    // against nothing at all: `rollback_workflow_agents` records it as an
+    // unconfirmed stop and the launch's error names the role, which is a
+    // report to the user rather than a remedy — but it does bound what the
+    // rollback costs and lets it reach the roles behind a wedged stop. A
+    // preparation has neither: dropping it neither finds out what happened nor
+    // says anything useful, so it is waited out instead.
     let prepared = daemon
         .client
         .prepare_workflow(&path, &orchestration, "", config_revision.as_deref())
@@ -5153,6 +5161,9 @@ mod tests {
         /// resolved type), and the ids it was asked about.
         launched_type: Mutex<Option<AgentType>>,
         launched_type_queries: Mutex<Vec<String>>,
+        /// PRD #1223 audit W6: how long the deck takes to answer a
+        /// preparation. `None` is the ordinary immediate answer.
+        prepare_delay: Mutex<Option<Duration>>,
         /// PRD #1223 audit F4: the starts (by position, from 0) the deck
         /// records — the spawn happened — and then never answers.
         start_hangs: Mutex<HashSet<usize>>,
@@ -5195,6 +5206,7 @@ mod tests {
                 configured_unsupported: AtomicBool::new(false),
                 launched_type: Mutex::new(None),
                 launched_type_queries: Mutex::new(Vec::new()),
+                prepare_delay: Mutex::new(None),
                 start_hangs: Mutex::new(HashSet::new()),
                 stop_attempts: Mutex::new(Vec::new()),
                 stop_hangs: Mutex::new(HashSet::new()),
@@ -5224,6 +5236,12 @@ mod tests {
                 task: task.to_string(),
                 config_revision: config_revision.map(str::to_string),
             });
+            // Read and released before the await: the guard is not `Send`, and
+            // holding it across one would make this future unspawnable.
+            let delay = *self.prepare_delay.lock().unwrap();
+            if let Some(delay) = delay {
+                tokio::time::sleep(delay).await;
+            }
             self.prepare_results
                 .lock()
                 .unwrap()
@@ -5782,6 +5800,46 @@ command = "configured-planner"
             .is_ok()
         );
         assert!(ensure_daemon_can_prepare(Some(&advertising(&["something-else"]))).is_ok());
+    }
+
+    /// PRD #1223 audit V1, guarded (audit W6): the preparation is under NO
+    /// client-side deadline, and nothing else in the suite would notice if one
+    /// were put back.
+    ///
+    /// Every other deck call a launch makes is bounded at
+    /// [`WORKFLOW_ROLE_START_TIMEOUT`], and the reason this one is not is
+    /// integrity rather than patience: the deck resolves, composes, issues the
+    /// token and publishes `orchestrator-context.md` on its blocking pool, and
+    /// dropping the client's future stops none of that — so a preparation
+    /// reported here as timed out could still publish afterwards, over a
+    /// retry's context once the retry's last prepared-role check had passed.
+    ///
+    /// The clock is paused, so a deck that takes four times the role-start
+    /// bound to answer costs the test nothing and would trip any `timeout`
+    /// wrapped around this call.
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_preparation_is_waited_out_rather_than_timed_out() {
+        let daemon = FakeWorkflowDaemon::new(
+            Ok(Some("unused-session")),
+            std::iter::empty(),
+            Ok(SendResult::Applied),
+        );
+        *daemon.prepare_delay.lock().unwrap() = Some(WORKFLOW_ROLE_START_TIMEOUT * 4);
+
+        let (roles, prepared) = prepare_workflow_launch(
+            &daemon,
+            "loop",
+            "/home/dev/repo",
+            "Build it.",
+            &launch_roles("claude"),
+            None,
+        )
+        .await
+        .expect("a preparation the deck answers late must still be accepted");
+
+        assert!(!prepared.path.is_empty());
+        assert!(!roles.is_empty());
+        assert_eq!(daemon.prepare_requests.lock().unwrap().len(), 1);
     }
 
     /// A refused preparation starts nothing — not even a subscription. The

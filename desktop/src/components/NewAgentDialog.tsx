@@ -222,10 +222,23 @@ export function NewAgentDialog({ runtime, initialDeckId, onClose, onAppeared, on
    * Every way out of the dialog — Cancel, the header's close button, Esc, a
    * backdrop click and the directory step's `q` — and none of them works while
    * a start is in flight (PRD #1223 audit F5). Closing then would unmount the
-   * one place a failure is explained, while the action itself carries on; the
-   * wait is bounded instead, because every deck call a start makes is (audit
-   * F4). Once the deck has answered — the "waiting for the fleet" phase
-   * included — closing works as before.
+   * one place a failure is explained, while the action itself carries on.
+   *
+   * The wait is bounded instead, with ONE exception (audit W6 — this comment
+   * said "every deck call a start makes is bounded", which audit V1 had
+   * deliberately made false): each role start, each rollback stop, and the two
+   * reads an orchestration launch makes before it prepares anything get
+   * `DECK_REPLY_TIMEOUT`, but `PrepareWorkflow` gets no client-side deadline at
+   * all, because dropping that future cannot stop the publish the deck has
+   * already begun. So a deck that takes the connection and never answers a
+   * PREPARATION does hold this dialog open — which is the trade audit V1 made,
+   * against a preparation reported as timed out that publishes afterwards over
+   * a retry's context. A failure that lands after the dialog is gone for some
+   * other reason is reported on the runtime's global toast, which both screens
+   * render (audit W2).
+   *
+   * Once the deck has answered — the "waiting for the fleet" phase included —
+   * closing works as before.
    */
   const starting = phase === "starting";
   const requestClose = () => {
