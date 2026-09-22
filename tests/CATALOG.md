@@ -5881,6 +5881,22 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Does not assert:** U+2029 PARAGRAPH SEPARATOR at the direct authoring-start boundary (covered through the shared listing predicate by `newagent/browse/003`); other C0/C1 controls; U+061C, U+200E, U+200F, U+202A–U+202D, or U+2066–U+2069 bidi formatting characters; exact refusal prose; seed delivery after the valid authoring control (owned by `newagent/authoring/001`–`002`); desktop validation or error rendering; real-agent interpretation.
 - **Platform coverage:** mac+linux (`#![cfg(all(feature = "e2e", unix))]` — the fixture requires a Unix filename containing LF and the daemon uses Unix-domain sockets and Unix PTYs).
 
+#### newagent/visibility
+
+##### newagent/visibility/001 — A desktop-started plain agent surfaces without selection on fresh and live TUI attachment.
+- **Layer:** L2 lane 1, PTY-attached (a headless real daemon receives the desktop-shaped `StartAgent`, then a real TUI attaches through `TuiDeck`; the control starts the same named command through the TUI's own new-agent form).
+- **Agent:** none (both paths run a `sleep 600` stand-in; no credential).
+- **Asserts:** the TUI-native control visibly renders the named plain pane; the desktop-shaped request carries cwd, command, display name, a minted `DOT_AGENT_DECK_PANE_ID`, 24×80 dimensions, no tab membership, and the agent type inferred from its command. Starting before attachment hydrates the named card without input; starting against an already-attached TUI must surface the same card without a keypress, selection, reconnect, or hook from the hookless stand-in. RED on the live half: the daemon registers the pane but direct `StartAgent` publishes no card-surface event, so the grid remains `No active sessions`.
+- **Does not assert:** the Tauri form itself (there is no `tauri-driver` tier); agent work or hook delivery; exact card layout beyond the visible display name.
+- **Platform coverage:** mac+linux (`#![cfg(all(feature = "e2e", unix))]` — `DaemonProc` binds Unix-domain sockets and `TuiDeck` uses a PTY).
+
+##### newagent/visibility/002 — A desktop-prepared orchestration surfaces as its own TUI tab with every role.
+- **Layer:** L2 lane 1, PTY-attached (a headless real daemon receives empty-task `PrepareWorkflow` plus one configured `StartPreparedAgent` per role, then a real TUI attaches; the control launches the same three-role fixture through the TUI's own form and role loop).
+- **Agent:** none (three `printf …; sleep 600` role stand-ins declared as Claude Code coordinator, OpenCode builder and Pi reviewer; no credential). The live case injects one ordinary `SessionStart` per role through the real hook socket so hookless stand-ins cannot hide whether the tab was built.
+- **Asserts:** the TUI-native control creates a separate orchestration tab containing `coordinator`, `builder`, and `reviewer`; the desktop-shaped path uses the desktop's 32×120 defaults, shares one orchestration id, and preserves role index/name/start-role/cwd/display-title membership, declared agent type and pane id across all prepared starts. Starting before attachment rebuilds the titled tab with all roles. Starting while the TUI is attached, then announcing all three roles, must group the three visible cards into that same titled tab. RED on the live half: all roles appear as flat dashboard cards but no orchestration tab is created.
+- **Does not assert:** the Tauri form itself; coordinator prompt delivery; agent work; role-pane body contents beyond role cards and the tab strip. The reported “two roles missing” does not reproduce once all three ordinary `SessionStart` hooks are delivered; the test reports every role's metadata if that changes.
+- **Platform coverage:** mac+linux (`#![cfg(all(feature = "e2e", unix))]` — the daemon/harness uses Unix-domain sockets and PTYs).
+
 #### newagent/live
 
 ##### newagent/live/001 — A REAL interactive Haiku agent visibly reports a unique sentinel from the ordinary directory selected through the desktop new-agent daemon sequence (PRD #1223, CLAUDE.md rule 4). [reel]

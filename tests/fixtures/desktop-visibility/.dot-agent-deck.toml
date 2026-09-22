@@ -1,0 +1,21 @@
+# Synthetic three-role orchestration for the desktop-to-TUI visibility
+# reproduction. Distinct declared agent types make a missing role attributable
+# to its start/worker position and configured agent without running an LLM.
+[[orchestrations]]
+name = "desktop-visibility-team"
+
+[[orchestrations.roles]]
+name = "coordinator"
+command = "printf 'COORDINATOR_SENTINEL\\n'; sleep 600"
+agent = "claude"
+start = true
+
+[[orchestrations.roles]]
+name = "builder"
+command = "printf 'BUILDER_SENTINEL\\n'; sleep 600"
+agent = "opencode"
+
+[[orchestrations.roles]]
+name = "reviewer"
+command = "printf 'REVIEWER_SENTINEL\\n'; sleep 600"
+agent = "pi"
