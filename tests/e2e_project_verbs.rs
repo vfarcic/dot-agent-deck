@@ -40,7 +40,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use common::DaemonProc;
-use dot_agent_deck::daemon_protocol::{AttachRequest, PROJECT_ERR_UNIMPLEMENTED};
+use dot_agent_deck::daemon_protocol::{AttachRequest, PROJECT_ERR_UNIMPLEMENTED, TabMembership};
 use spec::spec;
 
 /// A project whose single orchestration is NAMED, so nothing about it depends
@@ -638,5 +638,175 @@ fn project_launch_002_the_canonical_path_resolve_returns_is_the_string_the_launc
         expected_context.is_file(),
         "the coordinator context must exist at {}",
         expected_context.display()
+    );
+}
+
+/// Scenario: Prepare the same two-role workflow first with an empty task and
+/// then with a real task, checking that only the latter publishes the complete
+/// task section. Start both roles from the empty-task preparation with one run
+/// title and verify each daemon record preserves that title in its membership.
+#[spec("project/launch/004")]
+#[test]
+fn project_launch_004_empty_task_omits_the_task_section_and_preserves_the_run_title() {
+    const RUN_TITLE: &str = "Desktop named run";
+    const CONTROL_TASK: &str = "Carry the non-empty control task.";
+
+    let daemon = common::spawn_daemon_serve_with_env(None, "0", &[]);
+    let workspace = common::harness_tempdir().expect("mint the project sandbox");
+    let project = canonical(&make_dir(
+        workspace.path(),
+        "empty-task-project",
+        Some(NAMED_PROJECT_TOML),
+    ));
+    let project_wire = wire_path(&project);
+
+    let empty_response = daemon
+        .send_attach_request(&AttachRequest::PrepareWorkflow {
+            path: project_wire.clone(),
+            orchestration: "loop".into(),
+            task: String::new(),
+            config_revision: None,
+        })
+        .expect("empty-task PrepareWorkflow over the attach socket");
+    assert!(
+        empty_response.ok,
+        "PrepareWorkflow must accept an empty task; it refused instead: {:?}",
+        empty_response.error
+    );
+    let empty_prepared = empty_response
+        .workflow_prepared
+        .expect("a successful empty-task preparation must carry a PreparedWorkflow");
+    let context_path = PathBuf::from(&empty_prepared.context_path);
+    let empty_context = std::fs::read_to_string(&context_path)
+        .unwrap_or_else(|e| panic!("read {}: {e}", context_path.display()));
+
+    for needle in [
+        "Coordinate through the configured team.",
+        "**builder**: Implements the requested change",
+        "## Delegation protocol",
+    ] {
+        assert!(
+            empty_context.contains(needle),
+            "an empty task must not erase the rest of the coordinator context; missing \
+             {needle:?} from {} bytes at {}",
+            empty_context.len(),
+            context_path.display()
+        );
+    }
+    for forbidden in [
+        "\n## Your task\n",
+        "\n## Task precedence\n",
+        "Everything from `## Your task` to the end of this file is the task",
+    ] {
+        assert!(
+            !empty_context.contains(forbidden),
+            "an empty task must omit the whole task section and its boilerplate, but \
+             {forbidden:?} appeared in the published context at {}",
+            context_path.display()
+        );
+    }
+    assert!(
+        !empty_prepared.prompt.contains("## Your task")
+            && empty_prepared.prompt.contains("wait for instructions"),
+        "the daemon-composed pointer for an empty task must use the no-task wording; got {:?}",
+        empty_prepared.prompt
+    );
+
+    let orchestration_id = "project-launch-004-run";
+    let mut started = Vec::new();
+    for (role_index, role) in empty_prepared.roles.iter().enumerate() {
+        let pane_id = format!("project-launch-004-{}", role.name);
+        let response = daemon
+            .send_attach_request(&AttachRequest::StartPreparedAgent {
+                prep_token: empty_prepared.token.clone(),
+                command: Some("cat".into()),
+                cwd: Some(project_wire.clone()),
+                rows: 24,
+                cols: 80,
+                env: vec![("DOT_AGENT_DECK_PANE_ID".into(), pane_id)],
+                display_name: Some(role.name.clone()),
+                tab_membership: Some(TabMembership::Orchestration {
+                    name: "loop".into(),
+                    role_index,
+                    role_name: role.name.clone(),
+                    is_start_role: role.start,
+                    orchestration_cwd: Some(project_wire.clone()),
+                    display_title: Some(RUN_TITLE.into()),
+                    orchestration_id: Some(orchestration_id.into()),
+                }),
+                agent_type: None,
+                seed: None,
+            })
+            .expect("StartPreparedAgent over the attach socket");
+        assert!(
+            response.ok,
+            "starting prepared role {:?} must succeed; response error: {:?}",
+            role.name, response.error
+        );
+        started.push(
+            response
+                .id
+                .unwrap_or_else(|| panic!("prepared role {:?} returned no agent id", role.name)),
+        );
+    }
+
+    let records = daemon.wait_for_agent_count(empty_prepared.roles.len(), Duration::from_secs(10));
+    for role in &empty_prepared.roles {
+        let record = records
+            .iter()
+            .find(|record| {
+                started.contains(&record.id)
+                    && record.display_name.as_deref() == Some(role.name.as_str())
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "started role {:?} must appear in the daemon records; records: {records:?}",
+                    role.name
+                )
+            });
+        assert!(
+            matches!(
+                record.tab_membership.as_ref(),
+                Some(TabMembership::Orchestration {
+                    display_title: Some(title),
+                    ..
+                }) if title == RUN_TITLE
+            ),
+            "started role {:?} must report the user-supplied run title {:?}; membership: {:?}",
+            role.name,
+            RUN_TITLE,
+            record.tab_membership
+        );
+    }
+
+    let control_response = daemon
+        .send_attach_request(&AttachRequest::PrepareWorkflow {
+            path: project_wire,
+            orchestration: "loop".into(),
+            task: CONTROL_TASK.into(),
+            config_revision: None,
+        })
+        .expect("non-empty control PrepareWorkflow over the attach socket");
+    assert!(
+        control_response.ok,
+        "the non-empty control preparation must still succeed; error: {:?}",
+        control_response.error
+    );
+    let control_prepared = control_response
+        .workflow_prepared
+        .expect("the non-empty control must carry a PreparedWorkflow");
+    let control_context = std::fs::read_to_string(&control_prepared.context_path)
+        .unwrap_or_else(|e| panic!("read {}: {e}", control_prepared.context_path));
+    for needle in ["\n## Your task\n", "\n## Task precedence\n", CONTROL_TASK] {
+        assert!(
+            control_context.contains(needle),
+            "the non-empty control must retain the task section; missing {needle:?} from {}",
+            control_prepared.context_path
+        );
+    }
+    assert!(
+        control_prepared.prompt.contains("## Your task"),
+        "the non-empty control pointer must direct the coordinator to its task; got {:?}",
+        control_prepared.prompt
     );
 }

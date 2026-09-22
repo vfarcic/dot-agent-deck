@@ -5750,6 +5750,13 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Does not assert:** the publish contract itself — path, reply shape, the failed-preparation case (`project/launch/001`); canonical-spelling propagation as a property (`project/launch/002`); the wire shape or boundary refusals (`tests/project_projection.rs`, `tests/daemon_protocol.rs`); the `prep_token`, which rides on the separate `start-prepared-agent` verb and is not presented here; delegation or work-done routing (`orchestration/route/001`, `scheduler/dispatch/013`); the desktop GUI half, for which no harness exists (PRD #819 *Testing: what rule 4 means here*); the sentinel reaching the deck's own vt100 stream, which is logged best-effort because a claude TUI can hard-wrap a filename across a row boundary.
 - **Platform coverage:** mac+linux (`#![cfg(all(feature = "e2e", feature = "e2e-live", unix))]` — the pane/attach helpers it drives are Unix-domain-socket only).
 
+##### project/launch/004 — An empty-task `PrepareWorkflow` publishes no task section while prepared starts preserve the run title.
+- **Layer:** L2 lane 1 (one headless `daemon serve` driven over the attach socket; both `PrepareWorkflow` and `StartPreparedAgent` use their typed production wire shapes).
+- **Agent:** none (the two prepared roles run `cat` stand-ins; no credential).
+- **Asserts:** an empty `task` succeeds and publishes the configured role material plus delegation protocol while omitting the `## Your task` heading, `## Task precedence`, and the task-extent boilerplate; its daemon-composed pointer uses the no-task wording. Both prepared roles start with one user-supplied `display_title` nested in their orchestration membership and report that title through `ListAgents`. A non-empty control preparation still publishes the heading, precedence section, task text, and task-carrying pointer.
+- **Does not assert:** desktop form rendering, duplicate-title refusal, role launch ordering, coordinator prompt delivery, or a new top-level `display_title` field — the existing `StartPreparedAgent.tab_membership` wire already carries `TabMembership::Orchestration.display_title`.
+- **Platform coverage:** mac+linux (`#![cfg(all(feature = "e2e", unix))]` — `DaemonProc` binds Unix-domain sockets).
+
 
 ### Experimental feature flag (PRD #139)
 
@@ -5809,6 +5816,58 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Asserts:** the `Endpoint::Remote` arm end to end — `EndpointConnection::open` spawns a real `ssh` child, the child binds a forwarded Unix socket **inside the test's own `XDG_RUNTIME_DIR`** (so `reap_orphaned_tunnels`' sweep cannot reach the operator's), and `DaemonClient::for_connection` completes the handshake and lists that daemon's own agent over it, at a path that is not the daemon's own inode; the connection reports `EndpointPresence::Elsewhere`, so nothing may read a `stat` of the forwarded socket as the daemon's health; the **fourth local-only gate** — `Endpoint::as_local()` returns `None` for a remote deck, which is what stops `daemon_bridge::establish` running `verify_endpoint_trusted` against the forwarded socket, and the same predicate run by hand on that inode *passes*, because every fact it checks is a fact about our own `ssh` client and none is a fact about the far end; the tunnelled deck and a local deck mint different `wire_id()`s, carry one agent each and share none, while the two registries mint the same first agent id; and dropping the connection kills and reaps the `ssh` child and removes the socket it bound, leaving the local deck answering unchanged.
 - **Does not assert:** that a client which resolves paths locally would be caught — loopback shares one filesystem, so both sides agree on every path whichever resolved it; that is `project/resolve/002`'s job. Nor anything about a **hostile** far end: the host key is one the test generated, so the forced `StrictHostKeyChecking=yes` runs and passes, and a check that passes tests nothing it would refuse (that it really runs was verified by pointing `known_hosts` at a decoy key and watching the preflight refuse the login). Nor `EndpointTunnels`' map and per-deck gate, which are `pub(crate)` to `dot-agent-deck-desktop` and cannot be reached from this tier. Nor the inherited-config disclosure, reconnect/backoff, or a jump host. **Nor that CI ran it at all:** `e2e-deterministic` runs on `ubuntu-latest` without `DOT_AGENT_DECK_REQUIRE_REAL_E2E`, so this test's CI coverage depends on the runner image providing an `sshd` at one of `SSHD_CANDIDATES`, and where one is missing it skips rather than fails — green, with nothing asserted. GitHub's ubuntu images ship `openssh-server` so it almost certainly runs today, but that is an inherited property of someone else's image rather than something this repository asserts. Setting the flag on the job is **not** the remedy: it would promote every legitimate skip in the whole tier to a failure.
 - **Platform coverage:** linux+mac (the file is `unix`-gated; a host with no `sshd`, no `ssh` at a `SSH_PROGRAM_CANDIDATES` path, or a temp root too deep for `sun_path` prints `SKIP: [e2e]` and returns, which `DOT_AGENT_DECK_REQUIRE_REAL_E2E=1` turns into a failure).
+
+### Desktop new-agent flow (PRD #1223)
+
+#### newagent/browse
+
+##### newagent/browse/001 — `ListDirectories` returns one canonical, sorted level from the daemon's filesystem.
+- **Layer:** L2 lane 1 (one headless `daemon serve` driven over its attach socket; raw JSON pins the desktop-facing wire independently of the typed client helper).
+- **Agent:** none. No credential.
+- **Asserts:** an omitted path lists the daemon process's canonical HOME; listing a fixture directory returns that directory's canonical path, its canonical parent, `truncated: false`, and exactly its immediate visible real-directory children sorted by name with canonical paths and correct `.dot-agent-deck.toml` project markers. A hidden child, a directory symlink, a plain file and a grandchild are absent; explicitly requesting a symlinked spelling canonicalizes to its target.
+- **Does not assert:** entry-cap or time-budget truncation and invalid-path refusals (`newagent/browse/002`); the desktop directory-step rendering or keyboard controls; project resolution after a marked entry is chosen; non-UTF-8 paths, which cannot be represented by this JSON wire.
+- **Platform coverage:** mac+linux (`#![cfg(all(feature = "e2e", unix))]` — `DaemonProc` and the symlink fixtures use Unix-only facilities).
+
+##### newagent/browse/002 — `ListDirectories` is capped and refuses targets outside its absolute-directory contract.
+- **Layer:** L2 lane 1 (one headless `daemon serve` driven over its attach socket against test-owned filesystem fixtures).
+- **Agent:** none. No credential.
+- **Asserts:** a directory holding 1,005 visible subdirectories returns exactly the 1,000-entry production cap and `truncated: true`; `relative/path`, `./x`, a nonexistent absolute path and an absolute regular-file path each return the ordinary `{ ok: false, error: <non-empty> }` reply with no listing payload.
+- **Does not assert:** which entries survive when the cap truncates a larger set; a forced time-budget truncation, because the production budget has no injectable clock and deliberately small local fixtures do not reliably exhaust it; unreadable-directory behaviour, whose outcome depends on the account running the test; client-side error wording.
+- **Platform coverage:** mac+linux (`#![cfg(all(feature = "e2e", unix))]` — the attach harness binds Unix-domain sockets).
+
+#### newagent/options
+
+##### newagent/options/001 — `NewAgentOptions` reports daemon-host configuration, registry order, feature state and capabilities.
+- **Layer:** L2 lane 1 (two headless `daemon serve` processes driven over their attach sockets, one with `DOT_AGENT_DECK_EXPERIMENTAL=1` and one without; no PTY or TUI surface).
+- **Agent:** none. The reply projects the compiled registry as data but starts no agent and spends no credential.
+- **Asserts:** both daemons read a distinctive `DashboardConfig.default_command` from a test-owned file selected through `DOT_AGENT_DECK_CONFIG`; `agents` is non-empty and exactly projects `agent_registry::ALL` in registry order as `{ id, display_name, default_command }`, including `claude` with command `claude`; `experimental` is false when the launch variable is absent and true when it is `1`; `authoring_kinds` is present as an array whose entries are strings; the live `Hello` capability set includes `list-directories` and `new-agent-options`.
+- **Does not assert:** the contents of `authoring_kinds`, which `newagent/authoring/001` pins when M7 makes the three authoring kinds available; authoring seed delivery (`newagent/authoring/001`–`002`); desktop fallback behaviour against a daemon missing either capability; any agent binary's availability on PATH; the desktop form's rendering and selection rules.
+- **Platform coverage:** mac+linux (`#![cfg(all(feature = "e2e", unix))]` — `DaemonProc` binds Unix-domain sockets).
+
+#### newagent/authoring
+
+##### newagent/authoring/001 — Every authoring kind delivers the TUI's seed text once and is capability-advertised.
+- **Layer:** L2 lane 1 (one headless `daemon serve` driven over its attach and hook sockets; raw JSON pins `authoring_kind`'s desktop-facing wire independently of the typed client helper).
+- **Agent:** synthetic `claude` stand-ins that emit genuine `SessionStart` hooks and report each bracketed paste as one `UserPromptSubmit` through the production CLI; no credential.
+- **Asserts:** `StartAgent` with each of `schedule`, `schedule-issues`, and `dispatcher` waits for that pane's readiness announcement, then delivers exactly one seed byte-for-byte equal to `AuthoringKind::compose_seed` for the selected working directory. `NewAgentOptions.authoring_kinds` lists all three values in order, and `Hello.capabilities` contains `authoring-kind`.
+- **Does not assert:** desktop chip rendering or experimental filtering; real-agent interpretation of the seed (`newagent/live/001` owns that later lane-2 surface).
+- **Platform coverage:** mac+linux (`#![cfg(all(feature = "e2e", unix))]` — the daemon, hook and PTY harness uses Unix-domain sockets and Unix PTYs).
+
+##### newagent/authoring/002 — A late readiness announcement gates one seed and a plain start receives none.
+- **Layer:** L2 lane 1 (one headless `daemon serve`; the synthetic authoring pane withholds its genuine `SessionStart` for three seconds while inspecting its own PTY input queue).
+- **Agent:** two synthetic `claude` stand-ins, one authoring and one plain control; the authoring stand-in reports a bracketed paste as one submitted turn, matching the real Claude shape without spending a credential.
+- **Asserts:** no authoring bytes are queued before the deliberately late readiness announcement; after it, the exact schedule seed from `AuthoringKind::compose_seed` arrives once and no second copy follows. A `StartAgent` with no `authoring_kind` reaches readiness but receives no daemon-owned input.
+- **Does not assert:** delivery-time latency after readiness, the native Pi `get-seed` path, any TUI or desktop surface, or the real agent's semantic interpretation of the seed.
+- **Platform coverage:** mac+linux (`#![cfg(all(feature = "e2e", unix))]` — the daemon, hook and PTY harness uses Unix-domain sockets and Unix PTYs).
+
+#### newagent/live
+
+##### newagent/live/001 — A REAL interactive Haiku agent visibly reports a unique sentinel from the ordinary directory selected through the desktop new-agent daemon sequence (PRD #1223, CLAUDE.md rule 4). [reel]
+- **Layer:** L2 lane 2, PTY-attached (the REAL `dot-agent-deck` binary rendered through the vt100 `TuiDeck` harness while raw attach frames drive the desktop's `ListDirectories` → `NewAgentOptions` → `StartAgent` sequence; records a `full-stream.cast`).
+- **Agent:** real interactive Claude Code on `claude-haiku-4-5-20251001`, with imported developer credentials, the daemon-returned canonical working directory pre-trusted in the isolated HOME, and `--allowedTools Bash`; spends one cheap list-directory turn and runtime-skips when the CLI or credential preflight is unavailable.
+- **Asserts:** an absent-path listing starts at the daemon's HOME; a child path copied verbatim from that reply browses into a fixture with no `.dot-agent-deck.toml` and `is_project: false`; the Claude registry entry's returned `default_command` forms the start command; `StartAgent` uses the second listing's canonical path; after readiness-gated prompt delivery, the unique on-disk filename omitted from the prompt appears in the real agent pane and on the attached TUI's rendered vt100 grid.
+- **Does not assert:** the real Tauri window or its form controls (no `tauri-driver` tier, #953); alternate agents or models; authoring and orchestration modes; desktop fallback against missing capabilities; model prose beyond the literal sentinel filename.
+- **Platform coverage:** mac+linux, developer machine only (`#![cfg(all(feature = "e2e", feature = "e2e-live", unix))]` — lane 2 needs a developer's Claude credential and the harness uses Unix-domain sockets and Unix PTYs).
 
 ### Docs cross-reference skips
 
