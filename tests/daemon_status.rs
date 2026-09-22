@@ -967,7 +967,17 @@ fn daemon_status_006_wedged_peer_times_out_instead_of_hanging() {
 async fn daemon_status_006_wedged_peer_times_out_instead_of_hanging_inner() {
     common::init_test_env();
     let scratch = common::race_safe_tempdir();
-    let attach_path = scratch.path().join("wedged-attach.sock");
+    // `attach.sock` exactly, not a descriptive name: this socket is BOUND, so
+    // it is charged against `HARNESS_SOCKET_OVERHEAD`, whose 48 bytes budget
+    // 12 for the longest bound socket name and leave `MAX_TEMP_BASE_LEN` at
+    // 55. A 55-byte base plus the harness's per-process and per-test segments
+    // plus `/attach.sock` comes to exactly 103 — `sun_path`'s usable limit on
+    // macOS — so any longer name here overruns it and `bind(2)` fails with
+    // `AF_UNIX path too long` before the deadline is ever reached. The scratch
+    // dir is already unique, so the plain name is unambiguous anyway.
+    // (`daemon/status/003`'s longer `never-bound-attach.sock` is fine under
+    // the same rule precisely because nothing ever binds it.)
+    let attach_path = scratch.path().join("attach.sock");
     let peer = WedgedPeer::bind(attach_path.clone()).await;
 
     // Both modes concurrently against the one stub: each pays the same ~3s
