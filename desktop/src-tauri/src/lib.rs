@@ -6308,7 +6308,7 @@ command = "configured-planner"
             "{error}"
         );
         assert!(
-            error.contains("cleanup uncertainty: the deck did not answer the role's start"),
+            error.contains("cleanup uncertainty: the role's start was not answered"),
             "{error}"
         );
         assert!(
