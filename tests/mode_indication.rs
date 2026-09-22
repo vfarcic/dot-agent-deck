@@ -1195,9 +1195,9 @@ fn mode_scroll_007_wheel_is_routed_by_pointer_and_never_clamped() {
     // the very `UiState` fields the live mouse arm hit-tests. "Over the card
     // list" below therefore means cells the deck really painted cards into.
     let geometry = observe_dashboard_geometry(120, 40, 6);
-    let pane_rect = geometry
-        .focused_pane_rect
-        .expect("precondition: the dashboard frame must draw a focused agent pane: {geometry:?}");
+    let pane_rect = geometry.focused_pane_rect.unwrap_or_else(|| {
+        panic!("precondition: the dashboard frame must draw a focused agent pane: {geometry:?}")
+    });
     assert!(
         !geometry.card_rects.is_empty(),
         "precondition: the dashboard frame must paint deck cards, or the card-list \
@@ -1324,9 +1324,10 @@ fn mode_scroll_007_wheel_is_routed_by_pointer_and_never_clamped() {
     // was precisely that an unconsidered region reached the child: sampling
     // would have to guess which region, and guessing is what missed it.
     //
-    // A smaller frame keeps the sweep exhaustive and quick; the geometry above
-    // already established that the production layout puts cards, chrome and the
-    // pane where this sweep addresses them.
+    // A smaller frame keeps the sweep exhaustive and quick, and it needs no
+    // knowledge of what the layout put where: it addresses every cell there is,
+    // so the card list, the stats bar, the bottom bar, the pane's border and the
+    // pane's content are all covered by construction rather than by aim.
     let swept = observe_dashboard_geometry(60, 20, 4);
     let swept_pane = swept
         .focused_pane_rect
@@ -1413,8 +1414,10 @@ fn rects_disjoint(a: Rect, b: Rect) -> bool {
 /// The corners and the centre of `rect` — the points most likely to expose an
 /// off-by-one in a hit test, without paying for every cell of every card.
 fn interesting_points(rect: Rect) -> Vec<(u16, u16)> {
-    let right = rect.x + rect.width - 1;
-    let bottom = rect.y + rect.height - 1;
+    // Saturating: a zero-sized rect would otherwise underflow here and report a
+    // panic where the real finding is that the layout painted nothing.
+    let right = rect.x + rect.width.saturating_sub(1);
+    let bottom = rect.y + rect.height.saturating_sub(1);
     vec![
         (rect.x, rect.y),
         (right, rect.y),
