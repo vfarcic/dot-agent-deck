@@ -30,6 +30,18 @@
 //!   canonicalised here, and every path in the reply is canonical — a typed
 //!   symlinked spelling lists its target and the reply names the target.
 //!
+//! # A point-in-time snapshot
+//!
+//! The reply describes the directory as this request saw it, not as it stays.
+//! Each kept name is re-checked with `lstat` when the reply is built (audit A3),
+//! so a child swapped for a symlink — or removed — between the scan and that
+//! check is dropped rather than reported as a real directory. A change after
+//! that check, or racing it, is not prevented: nothing here holds the directory
+//! open against mutation or resolves children relative to a descriptor, and a
+//! path in the reply can name a symlink by the time a client sends it back.
+//! That is the same position every consumer of a listed path is already in —
+//! `StartAgent` takes its `cwd` as a string, not a handle.
+//!
 //! # Refusals
 //!
 //! A refusal reuses the project verbs' codes and their disclosure rule rather
@@ -109,7 +121,8 @@ pub struct DirectoryListing {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent: Option<String>,
     /// The immediate, visible, non-symlink subdirectories of [`Self::path`],
-    /// sorted by name.
+    /// sorted by name — as they were when the reply was built (see the module
+    /// doc's point-in-time note).
     #[serde(default)]
     pub entries: Vec<DirectoryEntry>,
     /// `true` when [`MAX_DIRECTORY_ENTRIES`] or [`DIRECTORY_LISTING_BUDGET`] cut
@@ -179,6 +192,20 @@ pub fn list_directories(path: Option<&str>) -> Result<DirectoryListing, String> 
 /// maps it onto its own refusal sentence. A failure on one *entry* is not an
 /// error — that entry is skipped, as the TUI's picker skips it.
 fn list_canonical_dir(dir: &Path, cap: usize, deadline: Instant) -> Result<DirectoryListing, ()> {
+    list_canonical_dir_between(dir, cap, deadline, || {})
+}
+
+/// [`list_canonical_dir`] with `between_passes` run after the scan has chosen
+/// its names and before the reply is built from them — `|| {}` in production.
+/// It exists so a test can change the tree inside that window (swap a kept
+/// directory for a symlink, remove it) and observe what the reply does, which
+/// no fixture built beforehand can reach.
+fn list_canonical_dir_between(
+    dir: &Path,
+    cap: usize,
+    deadline: Instant,
+    between_passes: impl FnOnce(),
+) -> Result<DirectoryListing, ()> {
     let read_dir = std::fs::read_dir(dir).map_err(|_| ())?;
     let mut truncated = false;
     // A max-heap of the names kept so far, so the largest is the one displaced
@@ -214,21 +241,31 @@ fn list_canonical_dir(dir: &Path, cap: usize, deadline: Instant) -> Result<Direc
         }
     }
 
+    between_passes();
+
     let mut entries = Vec::with_capacity(kept.len());
     for name in kept.into_sorted_vec() {
-        // The marker probe is a `stat` per entry, so the budget bounds it too.
-        // Stopping here keeps a sorted prefix whose every marker is accurate,
-        // rather than a full set with markers that silently stopped being
-        // checked.
+        // The re-check and the marker probe are an `lstat` each per entry, so
+        // the budget bounds them too. Stopping here keeps a sorted prefix whose
+        // every entry was checked, rather than a full set whose tail silently
+        // stopped being checked.
         if Instant::now() >= deadline {
             truncated = true;
             break;
         }
-        // Canonical without a per-entry `realpath`: `dir` is canonical, the
-        // entry is a real directory rather than a symlink, and a `readdir` name
-        // is one component that is never `.` or `..` — so the join introduces
-        // nothing to resolve.
         let child = dir.join(&name);
+        // Audit A3: the scan saw a real directory under this name, but the tree
+        // can change between that `readdir` and this reply. Look again, without
+        // following a link, and drop a name that is now a symlink, a file or
+        // gone. That narrows the window to this `lstat` and the reply; it does
+        // not close it — see the module doc's point-in-time note.
+        if !std::fs::symlink_metadata(&child).is_ok_and(|meta| meta.file_type().is_dir()) {
+            continue;
+        }
+        // Canonical without a per-entry `realpath`: `dir` is canonical, the
+        // entry was a real directory rather than a symlink when just re-checked,
+        // and a `readdir` name is one component that is never `.` or `..` — so
+        // the join introduces nothing to resolve.
         let Some(path) = child.to_str().map(str::to_owned) else {
             continue;
         };
@@ -478,6 +515,38 @@ mod tests {
             "a directory holding exactly the cap is not truncated"
         );
         assert_eq!(exact.entries.len(), 5);
+    }
+
+    /// Audit A3: a kept child that stops being a real directory between the
+    /// scan and the reply — swapped for a symlink, replaced by a file, or
+    /// removed — is dropped rather than reported as a directory.
+    #[cfg(unix)]
+    #[test]
+    fn a_child_changed_between_the_scan_and_the_reply_is_rechecked() {
+        let (_guard, root) = scratch();
+        for name in ["alpha", "bravo", "charlie", "delta"] {
+            std::fs::create_dir(root.join(name)).unwrap();
+        }
+        let outside = root.join("alpha");
+
+        let listing =
+            list_canonical_dir_between(&root, MAX_DIRECTORY_ENTRIES, far_deadline(), || {
+                std::fs::remove_dir(root.join("bravo")).unwrap();
+                std::os::unix::fs::symlink(&outside, root.join("bravo")).unwrap();
+                std::fs::remove_dir(root.join("charlie")).unwrap();
+                std::fs::write(root.join("charlie"), "now a file").unwrap();
+                std::fs::remove_dir(root.join("delta")).unwrap();
+            })
+            .unwrap();
+        assert_eq!(
+            names(&listing),
+            vec!["alpha"],
+            "only the child that is still a real directory is reported"
+        );
+        assert!(
+            !listing.truncated,
+            "a dropped child is not a sign that more subdirectories exist"
+        );
     }
 
     #[test]
