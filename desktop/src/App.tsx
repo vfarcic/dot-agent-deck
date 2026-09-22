@@ -533,6 +533,10 @@ export function DeckShell({ runtime, workflowPlatformIssue, initialView = { kind
        model marked, and `value` is what this app resolved that boundary to in
        its own transcript. The model's string never reaches a terminal. */
     const dictated = outcome.params.find((param) => param.kind === "spoken_prefix");
+    /* PRD #1223 — the deck a `deck_ref` resolved to, against the observed
+       fleet, Rust-side. Its own member rather than `deckId`, which falls back
+       to the selected deck below and so cannot say "the user named none". */
+    const namedDeck = outcome.params.find((param) => param.kind === "deck_ref");
     const target: VoiceDispatchTarget = {
       /* The dictation pair targets the pane on SCREEN — its row declares no
          agent param and is `screens = ["agent"]`, so `agentView` is defined
@@ -552,6 +556,7 @@ export function DeckShell({ runtime, workflowPlatformIssue, initialView = { kind
       agentLabel: agent?.label ?? paneAgent?.displayName,
       text: dictated?.value,
       agentViewOpen: agentView !== undefined,
+      ...(namedDeck ? { preselectDeckId: namedDeck.value } : {}),
     };
     let moved = false;
     const context: VoiceDispatchContext = {

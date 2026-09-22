@@ -810,17 +810,6 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
   const [newAgent, setNewAgent] = useState<{ deckId?: string }>();
   /** The open dialog's own close — every route it has, blocked while a start is in flight — published by the dialog (PRD #1223 U5). */
   const newAgentClose = useRef<(() => string | undefined) | undefined>(undefined);
-  /*
-    PRD #1223 U5 — publish `closeNewAgent` only while the dialog is open, so
-    `closeTopmost` can read its presence the way it reads the voice overlay's.
-    No dependency array, for the voice surface's reason: the slot must hold the
-    last committed closure, and the cleanup clears it on unmount.
-  */
-  useEffect(() => {
-    if (!voiceChannel) return;
-    voiceChannel.current = newAgent ? { closeNewAgent: () => newAgentClose.current?.() } : {};
-    return () => { voiceChannel.current = undefined; };
-  });
   /** What the flow could not finish on screen: an agent the deck accepted and has not listed. */
   const [newAgentNotice, setNewAgentNotice] = useState<string>();
   const newAgentAvailable = newAgentRuntime !== undefined;
@@ -829,6 +818,23 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
     setNewAgentNotice(undefined);
     setNewAgent({ deckId });
   }, [newAgentAvailable]);
+  /*
+    PRD #1223 U5 — publish `closeNewAgent` only while the dialog is open, so
+    `closeTopmost` can read its presence the way it reads the voice overlay's.
+    And `openNewAgent` — the `open_new_agent` row — only while it is CLOSED and
+    this runtime can serve the flow at all, the same two conditions the
+    `Ctrl+N` shortcut stands down on: a dispatch the overview cannot serve is
+    then refused against the entry's `needs` rather than reopening a dialog
+    mid-form. No dependency array, for the voice surface's reason: the slot
+    must hold the last committed closure, and the cleanup clears it on unmount.
+  */
+  useEffect(() => {
+    if (!voiceChannel) return;
+    voiceChannel.current = newAgent
+      ? { closeNewAgent: () => newAgentClose.current?.() }
+      : newAgentAvailable ? { openNewAgent } : {};
+    return () => { voiceChannel.current = undefined; };
+  });
   const voiceContext = useMemo(() => ({ navigate: onNavigate, openNewAgent }), [onNavigate, openNewAgent]);
   const openDeck = () => VOICE_ACTIONS.openDeck.run(voiceContext);
   /**
@@ -1041,7 +1047,7 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
               onReconnect={() => void runtime.reconnect()}
               overrideError={deck.snapshot.connection.deckId === connection.deckId ? overrideError : undefined}
               onConnectAnyway={mode === "live" && deck.snapshot.connection.buildStampMismatchOnly ? requestConnectAnyway : undefined}
-              onNewAgent={newAgentAvailable && deck.connected && deck.snapshot.connection.deckId !== undefined && deckUnavailableReason(deck.snapshot.connection) === undefined ? () => VOICE_ACTIONS.openNewAgent.run(voiceContext, { deckId: deck.snapshot.connection.deckId }) : undefined}
+              onNewAgent={newAgentAvailable && deck.connected && deck.snapshot.connection.deckId !== undefined && deckUnavailableReason(deck.snapshot.connection) === undefined ? () => VOICE_ACTIONS.openNewAgent.run(voiceContext, { preselectDeckId: deck.snapshot.connection.deckId }) : undefined}
             />
           ))}
         </section>

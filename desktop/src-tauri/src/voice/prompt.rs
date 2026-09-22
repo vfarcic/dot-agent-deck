@@ -172,6 +172,13 @@ pub fn param_names(commands: &[AnnotatedCommand]) -> Vec<String> {
 /// meaningless without a clock the model does not have, and none of them is how
 /// anybody refers to an agent out loud.
 ///
+/// # Decks are LABELS and nothing else (PRD #1223)
+///
+/// `decks` names each observed deck the way the overview does — "Local deck",
+/// or `user@host[:port]` — so a model can tell that "the build box" is a deck
+/// rather than an agent, and answer a `deck_ref` param with the user's own
+/// words. No id, for the agents' reason: the app resolves, the model refers.
+///
 /// Nothing here is a transcript, an utterance or an audio buffer, so PRD #802's
 /// Open Question 5 is untouched — and this function still writes nothing
 /// anywhere. It builds a value and hands it to a backend.
@@ -182,6 +189,11 @@ pub fn state(request: &IntentRequest<'_>) -> Value {
             .agents
             .iter()
             .map(|agent| agent_state(agent, request.agents))
+            .collect::<Vec<_>>(),
+        "decks": request
+            .decks
+            .iter()
+            .map(|deck| deck.label.clone())
             .collect::<Vec<_>>(),
     })
 }
@@ -342,6 +354,7 @@ mod tests {
                 "list_commands".to_string(),
                 "dictate_to_agent".to_string(),
                 "submit_prompt".to_string(),
+                "open_new_agent".to_string(),
                 "none".to_string(),
             ]
         );
@@ -356,7 +369,11 @@ mod tests {
     fn voice_prompt_param_names_are_the_union_in_table_order() {
         assert_eq!(
             param_names(&commands()),
-            vec!["agent".to_string(), "prefix".to_string()]
+            vec![
+                "agent".to_string(),
+                "prefix".to_string(),
+                "deck".to_string()
+            ]
         );
     }
 
@@ -403,7 +420,34 @@ mod tests {
             transcript,
             commands,
             agents,
+            decks: &[],
         }
+    }
+
+    #[test]
+    fn voice_prompt_state_names_decks_by_label_and_never_by_id() {
+        let commands = commands();
+        let transcript = Transcript::new("new agent on the build box");
+        let decks = [
+            crate::voice::VoiceDeck {
+                id: "deck-0000000000000001".to_string(),
+                label: "Local deck".to_string(),
+                local: true,
+            },
+            crate::voice::VoiceDeck {
+                id: "deck-0000000000000002".to_string(),
+                label: "deploy@build-box".to_string(),
+                local: false,
+            },
+        ];
+        let rendered = state(&IntentRequest {
+            transcript: &transcript,
+            commands: &commands,
+            agents: &[],
+            decks: &decks,
+        });
+        assert_eq!(rendered["decks"], json!(["Local deck", "deploy@build-box"]));
+        assert!(!rendered.to_string().contains("deck-000"));
     }
 
     #[test]

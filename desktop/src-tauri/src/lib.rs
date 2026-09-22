@@ -2742,14 +2742,45 @@ async fn desktop_voice_resolve(
         .intent;
     let resolver = voice::resolver_for(&commands, Arc::new(KeychainSecretStore::new()));
     let snapshot = get_snapshot(&state.daemon).await;
+    let decks = voice_decks(&snapshot.observed);
     Ok(voice::handle_utterance(
         resolver.as_ref(),
         voice::table(),
         screen,
         &snapshot.agents,
+        &decks,
         voice::Transcript::new(utterance),
     )
     .await)
+}
+
+/// The decks a spoken `deck_ref` resolves against (PRD #1223): the snapshot's
+/// own `observed` list — every deck the app connects to, named the way the
+/// overview names it — rather than anything the webview sends.
+///
+/// **The whole fleet, unlike the agents above**, which are the selected deck's.
+/// An agent reference means "one I can see", so it stays on the deck in view; a
+/// deck reference exists to name a deck OTHER than the one in view.
+///
+/// The label is `deckName`'s (`desktop/src/lib/displayText.ts`): "Local deck"
+/// for the local endpoint, the `user@host[:port]` label for a remote one — so a
+/// report or an ambiguity sentence names a deck the way the screen does.
+fn voice_decks(observed: &[crate::dto::ObservedDeckDto]) -> Vec<voice::VoiceDeck> {
+    observed
+        .iter()
+        .map(|deck| {
+            let local = deck.deck_kind != "remote";
+            voice::VoiceDeck {
+                id: deck.deck_id.clone(),
+                label: if local || deck.label.trim().is_empty() {
+                    if local { "Local deck" } else { "Remote deck" }.to_string()
+                } else {
+                    deck.label.clone()
+                },
+                local,
+            }
+        })
+        .collect()
 }
 
 /// PRD #802 — what can be said on this screen, for the discovery overlay.

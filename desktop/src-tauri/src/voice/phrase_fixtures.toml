@@ -316,3 +316,37 @@ utterance = "okay that's the whole prompt, send it off"
 screen = "overview"
 action = "submit_prompt"
 outcome = "unavailable"
+
+# PRD #1223 — `open_new_agent`, the first row with a `deck_ref` and the first
+# optional param. The bare phrase must dispatch with no deck; a named deck must
+# resolve against the planted fleet; and the deck screen must say where the
+# dialog lives rather than guess.
+[[fixtures]]
+name = "open-new-agent-bare"
+utterance = "start a new agent"
+screen = "overview"
+action = "open_new_agent"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "open-new-agent-on-deck"
+utterance = "new agent on the build box"
+screen = "overview"
+action = "open_new_agent"
+outcome = "dispatch"
+resolved_deck = "deck-build-box"
+
+[[fixtures]]
+name = "open-new-agent-on-local"
+utterance = "spin up an agent on local"
+screen = "overview"
+action = "open_new_agent"
+outcome = "dispatch"
+resolved_deck = "deck-local"
+
+[[fixtures]]
+name = "open-new-agent-unavailable"
+utterance = "start a new agent"
+screen = "deck"
+action = "open_new_agent"
+outcome = "unavailable"

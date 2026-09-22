@@ -20,8 +20,8 @@ use std::pin::Pin;
 
 use serde::{Deserialize, Serialize};
 
-use super::Transcript;
 use super::schema::AnnotatedCommand;
+use super::{Transcript, VoiceDeck};
 use crate::dto::DesktopAgent;
 
 /// Everything a backend is given for one utterance.
@@ -36,6 +36,11 @@ pub struct IntentRequest<'a> {
     /// reference like "the tester". Read-only here; a backend names an agent
     /// the way the user did and the app resolves it.
     pub agents: &'a [DesktopAgent],
+    /// The decks the app observes, for resolving a spoken deck reference like
+    /// "the build box" (PRD #1223). The whole observed fleet, not only the
+    /// selected deck — naming a deck other than the one on screen is what a
+    /// deck reference is for. Read-only here for `agents`' reason.
+    pub decks: &'a [VoiceDeck],
 }
 
 /// What a backend answers with: an action id and the params as the user
@@ -292,6 +297,7 @@ mod tests {
             transcript,
             commands,
             agents: &[],
+            decks: &[],
         }
     }
 

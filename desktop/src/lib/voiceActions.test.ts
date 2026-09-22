@@ -157,6 +157,8 @@ describe("VOICE_ACTIONS", () => {
       "showVoiceCommands",
       "dictateToAgent",
       "submitAgentPrompt",
+      // PRD #1223: the `open_new_agent` row.
+      "openNewAgent",
     ];
 
     expect(Array.isArray(VOICE_ACTIONS)).toBe(false);

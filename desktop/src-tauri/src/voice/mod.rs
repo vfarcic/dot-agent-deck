@@ -65,6 +65,26 @@ use serde::{Deserialize, Serialize};
 /// renders. A parallel shape here would be a second answer to "what agents are
 /// there" with nothing keeping the two in step.
 pub use crate::dto::DesktopAgent;
+
+/// One deck a spoken [`ParamKind::DeckRef`] can name (PRD #1223).
+///
+/// Built from the fleet the desktop already observes
+/// (`dto::observed_fleet_decks`), never from the webview, for
+/// [`DesktopAgent`]'s reason: a list arriving from the page would be a second
+/// answer to "which decks are there". Three fields because resolution needs no
+/// more — the key the frontend dispatches with, the name the screen shows, and
+/// whether the deck is this machine's, which is what makes the literal *"local"*
+/// name it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VoiceDeck {
+    /// `EndpointIdentity::wire_id()` — the same `deckId` the overview keys its
+    /// groups on and `openNewAgent` preselects.
+    pub id: String,
+    /// What the overview calls it: "Local deck", or `user@host[:port]`.
+    pub label: String,
+    /// Whether it is the local endpoint.
+    pub local: bool,
+}
 pub use dictation::{DICTATION_OPENERS, SUBMIT_PHRASES};
 
 pub use capture::{
@@ -74,7 +94,9 @@ pub use capture::{
     TARGET_SAMPLE_RATE, Vad,
 };
 pub use hold::VoiceHold;
-pub use outcome::{ResolvedParam, VoiceOutcome, VoiceResult, handle_utterance};
+pub use outcome::{
+    DeckRefMatch, ResolvedParam, VoiceOutcome, VoiceResult, handle_utterance, resolve_deck_ref,
+};
 pub use remote::{Protocol, REMOTE_TIMEOUT, RemoteResolver};
 pub use resolver::{
     IntentAnswer, IntentError, IntentRequest, IntentResolver, StubResolver, resolver_for,

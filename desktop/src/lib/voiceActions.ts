@@ -208,7 +208,7 @@ export type VoiceActionContext = {
    * {@link dismissVoiceOverlay}'s reason: *"the dialog is open"* is a
    * `useState` in the overview, not a `DeckView`, so {@link closeTopmost}
    * reads it as this member's presence. It is NOT a way to open or drive the
-   * dialog — `openNewAgent` stays `no_voice`.
+   * dialog — that is `openNewAgent`, the `open_new_agent` row.
    */
   closeNewAgent: () => string | undefined;
   /**
@@ -218,7 +218,8 @@ export type VoiceActionContext = {
    * **Served by the OVERVIEW alone**, the screen the flow lives on and the one
    * whose fleet the deck step lists; see {@link VoiceOverviewContext}. The deck
    * screen does not offer it, so a dispatch there is refused against `needs`
-   * rather than attempted.
+   * rather than attempted. The overview publishes it only while the dialog is
+   * closed, for the same reason `Ctrl+N` stands down while it is open.
    */
   openNewAgent: (deckId?: string) => void;
 };
@@ -490,15 +491,20 @@ export const VOICE_ACTIONS = {
 
   openNewAgent: {
     label: "Start a new agent on a chosen deck",
-    no_voice: "opens a multi-step interactive dialog — choose a deck, browse that deck's directories, then fill a form — and the table has no resolver kind that can turn a spoken phrase into a deck or a directory, so a row could open the dialog and then leave the user inside steps voice cannot finish; a voice entry is deferred to PRD #1195's widening of the voice command set",
+    /* The `open_new_agent` row (PRD #1223). It OPENS the dialog and starts
+       nothing — the dialog's own Start is still the only thing that does — so
+       it is outside PRD #802 D5's confirmation set. A spoken deck arrives as
+       the row's `deck_ref` param, resolved Rust-side against the observed
+       fleet, and `App.tsx` carries its value in as `deckId`. */
+    voice: true,
     needs: ["openNewAgent"],
     /**
      * The top bar's New agent button, the keyboard shortcut and the first-run
      * note open it with no deck; a deck group's header passes its own, which
-     * the deck step preselects. An empty id — what a dispatch target carries
-     * where it has no deck — preselects nothing.
+     * the deck step preselects, and so does a spoken "new agent on <deck>"
+     * (the `open_new_agent` row's `deck_ref`). An empty id preselects nothing.
      */
-    run: (context: Pick<VoiceActionContext, "openNewAgent">, target?: { deckId?: string }) => context.openNewAgent(target?.deckId || undefined),
+    run: (context: Pick<VoiceActionContext, "openNewAgent">, target?: { preselectDeckId?: string }) => context.openNewAgent(target?.preselectDeckId || undefined),
   },
 } satisfies Record<string, VoiceActionEntry>;
 
@@ -550,6 +556,17 @@ void NEEDS_COVERS_RUN;
  * `AgentTarget`'s single member is a subset of it.
  */
 export type VoiceDispatchTarget = AgentViewTarget & {
+  /**
+   * The deck to PRESELECT — what a row's `deck_ref` param resolved to (PRD
+   * #1223), and absent when the user named none.
+   *
+   * Deliberately not `deckId` above. That member is the deck an AGENT lives
+   * on, and `App.tsx` fills it for every dispatch, falling back to the
+   * selected deck — so an entry reading it could not tell "the user said the
+   * build box" from "the user said nothing and the build box is selected", and
+   * the bare "new agent" would preselect whatever deck happened to be in view.
+   */
+  preselectDeckId?: string;
   /**
    * The words to type into the open agent's prompt, for the dictation row
    * (PRD #802 D6, rebuilt).
@@ -662,10 +679,10 @@ export type VoiceScreenContext = Omit<VoiceActionContext, keyof VoicePanelContex
 export type VoiceOverviewContext = Pick<VoiceActionContext, "openNewAgent" | "closeNewAgent">;
 
 /**
- * How the overview publishes what a voice dispatch may need from it — today
- * `closeNewAgent`, and only while the dialog is open — to the shell that
- * dispatches, the way {@link VoiceContextChannel} carries the deck's.
- * `openNewAgent` is `no_voice` and is not published.
+ * How the overview publishes what a voice dispatch may need from it —
+ * `closeNewAgent` while the dialog is open, `openNewAgent` while it is closed —
+ * to the shell that dispatches, the way {@link VoiceContextChannel} carries
+ * the deck's.
  */
 export type VoiceOverviewChannel = { current: Partial<VoiceOverviewContext> | undefined };
 

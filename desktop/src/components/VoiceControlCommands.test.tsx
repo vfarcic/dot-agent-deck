@@ -1,6 +1,6 @@
 import { act, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { createFixtureSnapshot } from "../data/fixture";
+import { createFixtureFleet, createFixtureSnapshot, FIXTURE_REMOTE_DAEMON_ID } from "../data/fixture";
 import {
   DEFAULT_DESKTOP_SETTINGS,
   type DesktopSettingsDto,
@@ -984,5 +984,74 @@ describe("closing what is on top", () => {
 
     expect(screen.getByTestId("voice-report")).toHaveTextContent(VOICE_NOTHING_TO_CLOSE);
     expect(screen.queryByTestId("agent-pane-overlay")).toBeNull();
+  });
+});
+
+describe("opening the New agent dialog, as a command (PRD #1223)", () => {
+  beforeEach(() => {
+    window.localStorage.clear();
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  /* What Rust resolved "the build box" to, against the observed fleet: the
+     remote deck's `deckId`, labelled the way the overview labels it. */
+  const BUILD_BOX: VoiceResolvedParamDto[] = [
+    { name: "deck", kind: "deck_ref", spoken: "the build box", value: FIXTURE_REMOTE_DAEMON_ID, label: "deploy@build-box" },
+  ];
+
+  function newAgentFleet(voice: VoiceControls) {
+    const fleet = createFixtureFleet("fleet");
+    const resolveVoice: ResolveVoice = vi.fn(async (utterance: string) => utterance === "new agent on the build box"
+      ? dispatch("open_new_agent", "openNewAgent", "Opening the New agent dialog.", utterance, BUILD_BOX)
+      : dispatch("open_new_agent", "openNewAgent", "Opening the New agent dialog.", utterance));
+    return runtime(resolveVoice, voice, {
+      snapshot: fleet[0],
+      fleet,
+      listDirectories: vi.fn(async () => ({ kind: "listing" as const, path: "/home/dev", displayPath: "/home/dev", entries: [], truncated: false })),
+      newAgentOptions: vi.fn(async () => ({ kind: "deck" as const, agents: [], experimental: false, authoringKinds: [] })),
+    });
+  }
+
+  const highlightedDeck = () => screen.getByTestId("new-agent-deck-list").querySelector("[aria-selected='true']")?.getAttribute("data-deck-id");
+
+  /**
+   * Scenario: on the overview, say "new agent on the build box". The New
+   * agent dialog opens with that deck already chosen — the same state its
+   * group header's own New agent button produces — and starts nothing.
+   */
+  it("opens the dialog with the named deck preselected", async () => {
+    const voice = microphone(["new agent on the build box"]);
+    const deck = newAgentFleet(voice);
+    render(<DeckShell runtime={deck} initialView={{ kind: "overview" }} />);
+
+    await turnVoiceOn();
+    await completeUtterance();
+
+    expect(screen.getByTestId("new-agent-dialog")).toBeInTheDocument();
+    expect(highlightedDeck()).toBe(FIXTURE_REMOTE_DAEMON_ID);
+    expect(screen.getByTestId("voice-report")).toHaveTextContent("Opening the New agent dialog.");
+    expect(deck.runAction).not.toHaveBeenCalled();
+  });
+
+  /**
+   * Scenario: say just "new agent". The dialog opens on its deck step with
+   * nothing preselected — NOT on whichever deck happens to be selected, which
+   * is what a dispatch target's fallback `deckId` would have chosen.
+   */
+  it("preselects nothing when no deck was named", async () => {
+    const voice = microphone(["new agent"]);
+    const deck = newAgentFleet(voice);
+    render(<DeckShell runtime={deck} initialView={{ kind: "overview" }} />);
+
+    await turnVoiceOn();
+    await completeUtterance();
+
+    expect(screen.getByTestId("new-agent-dialog")).toBeInTheDocument();
+    expect(highlightedDeck()).toBeUndefined();
+    expect(deck.runAction).not.toHaveBeenCalled();
   });
 });

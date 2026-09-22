@@ -30,7 +30,11 @@
 #                    confirm-before-acting flag, and the two are close to
 #                    opposite — this describes an action that HAPPENED, that
 #                    one blocks an action before it does. Do not rename it back.
-#   [[commands.params]]  name + kind, `kind` from the closed resolver set.
+#   [[commands.params]]  name + kind, `kind` from the closed resolver set
+#                    (`agent_ref`, `deck_ref`, `spoken_prefix`). `optional =
+#                    true` lets the row dispatch when the model supplies no
+#                    value; a value that resolves to nothing is still refused,
+#                    and a report may not interpolate an optional param.
 #
 # **This table was NAVIGATION ONLY and is not any more**, which is worth saying
 # in the sentence that used to claim it rather than leaving the claim to rot:
@@ -286,3 +290,38 @@ invoke      = "submitAgentPrompt"
 screens     = ["agent"]
 unavailable_hint = "sending a prompt needs an agent's pane open"
 report      = "Sent."
+
+# PRD #1223 — open the New agent dialog, and the first row with a `deck_ref`.
+#
+# It OPENS A DIALOG AND STARTS NOTHING, which is why it sits outside PRD #802
+# D5's confirm-before-acting set with every other row here: the dialog's own
+# Start button is still the only thing that starts an agent, and the user
+# presses it with the form in front of them. "close" dismisses it (U5).
+#
+# The `deck` param is OPTIONAL — the first one in the table. "new agent" alone
+# is a complete command (the dialog opens on its deck step, exactly as the top
+# bar's button opens it), and "new agent on the build box" preselects that deck,
+# which is what a deck group's own header button does. A deck the fleet does not
+# have is still refused rather than dropped: the user named one, and opening the
+# dialog as though they had not would lose what they asked for.
+#
+# `screens = ["overview"]`: the dialog lives on the overview, whose fleet its
+# deck step lists (`VoiceOverviewContext` in `voiceActions.ts`), and a row
+# exposes behaviour that already exists rather than adding a route of its own.
+[[commands]]
+id          = "open_new_agent"
+description = """Open the New agent dialog, where the user picks a deck, a directory and an agent to
+start. Use for new agent, start a new agent, create an agent, launch an agent, add an agent, or
+spin one up. When the user names the deck it should go on — "new agent on the build box", "start
+an agent on local" — set `deck` to the words they used for it; otherwise leave `deck` out. This
+only OPENS the dialog: it starts nothing, and the user still presses Start. It is not
+`open_agent`, which shows an agent that already exists."""
+invoke      = "openNewAgent"
+screens     = ["overview"]
+unavailable_hint = "starting a new agent works from the agent overview"
+report      = "Opening the New agent dialog."
+
+  [[commands.params]]
+  name     = "deck"
+  kind     = "deck_ref"
+  optional = true

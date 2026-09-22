@@ -91,6 +91,10 @@ struct PhraseFixture {
     outcome: OutcomeKind,
     #[serde(default)]
     resolved_agent: Option<String>,
+    /// The deck id a `deck_ref` param must resolve to (PRD #1223), checked
+    /// against the planted fleet the way `resolved_agent` is against agents.
+    #[serde(default)]
+    resolved_deck: Option<String>,
     /// The introducing words a dictation fixture expects the model to MARK.
     ///
     /// **Not the text to type**, which is the whole design: the app takes that
@@ -199,6 +203,17 @@ fn observed(outcome: &VoiceOutcome) -> (Option<&str>, OutcomeKind, Option<&str>)
     }
 }
 
+/// The deck a dispatch's `deck_ref` param resolved to, if it carried one.
+fn resolved_deck(outcome: &VoiceOutcome) -> Option<&str> {
+    match outcome {
+        VoiceOutcome::Dispatch { params, .. } => params
+            .iter()
+            .find(|param| param.kind == ParamKind::DeckRef)
+            .map(|param| param.value.as_str()),
+        _ => None,
+    }
+}
+
 /// What the model marked as the introducing words, for a dictation dispatch.
 ///
 /// Read off `spoken` rather than `value`: `value` is what the app resolved the
@@ -246,6 +261,20 @@ async fn voice_phrase_fixtures_match_the_default_backend() {
     let mut atlas_two = role_agent_in_state("agent-atlas-two", "coder", "working");
     atlas_two.display_name = Some("Atlas".to_string());
     let ambiguous_name_agents = vec![atlas_one, atlas_two];
+    // PRD #1223 — the fleet a `deck_ref` resolves against: this machine's deck
+    // and one remote, labelled the way the overview labels them.
+    let decks = vec![
+        dot_agent_deck_desktop::voice::VoiceDeck {
+            id: "deck-local".to_string(),
+            label: "Local deck".to_string(),
+            local: true,
+        },
+        dot_agent_deck_desktop::voice::VoiceDeck {
+            id: "deck-build-box".to_string(),
+            label: "deploy@build-box".to_string(),
+            local: false,
+        },
+    ];
     for fixture in &fixtures.fixtures {
         assert!(
             Screen::parse(&fixture.screen).is_some(),
@@ -277,6 +306,13 @@ async fn voice_phrase_fixtures_match_the_default_backend() {
             assert!(
                 agents.iter().any(|agent| agent.id == expected),
                 "{}: fixture expects unknown agent id `{expected}`",
+                fixture.name
+            );
+        }
+        if let Some(expected) = fixture.resolved_deck.as_deref() {
+            assert!(
+                decks.iter().any(|deck| deck.id == expected),
+                "{}: fixture expects unknown deck id `{expected}`",
                 fixture.name
             );
         }
@@ -333,6 +369,7 @@ async fn voice_phrase_fixtures_match_the_default_backend() {
                 table(),
                 screen,
                 fixture_agents,
+                &decks,
                 transcript,
             ),
         )
@@ -350,6 +387,10 @@ async fn voice_phrase_fixtures_match_the_default_backend() {
                     Some(expected) => actual_agent == Some(expected),
                     None => true,
                 };
+                let deck_matches = match fixture.resolved_deck.as_deref() {
+                    Some(expected) => resolved_deck(&answer.outcome) == Some(expected),
+                    None => true,
+                };
                 let prefix_matches = match fixture.dictate_prefix.as_deref() {
                     Some(expected) => marked_prefix(&answer.outcome)
                         .is_some_and(|marked| normalise(marked) == normalise(expected)),
@@ -358,19 +399,22 @@ async fn voice_phrase_fixtures_match_the_default_backend() {
                 if action_matches
                     && actual_outcome == fixture.outcome
                     && agent_matches
+                    && deck_matches
                     && prefix_matches
                 {
                     Ok(())
                 } else {
                     Err(format!(
-                        "expected action={} outcome={} resolved_agent={:?} dictate_prefix={:?}, \
-                         got action={:?} outcome={actual_outcome} resolved_agent={actual_agent:?} \
-                         dictate_prefix={:?}",
+                        "expected action={} outcome={} resolved_agent={:?} resolved_deck={:?} \
+                         dictate_prefix={:?}, got action={:?} outcome={actual_outcome} \
+                         resolved_agent={actual_agent:?} resolved_deck={:?} dictate_prefix={:?}",
                         fixture.action,
                         fixture.outcome,
                         fixture.resolved_agent,
+                        fixture.resolved_deck,
                         fixture.dictate_prefix,
                         actual_action,
+                        resolved_deck(&answer.outcome),
                         marked_prefix(&answer.outcome),
                     ))
                 }

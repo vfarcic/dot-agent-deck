@@ -656,12 +656,15 @@ export type VoiceScreen = "deck" | "overview" | "agent";
  * (`voice::ResolvedParam`).
  *
  * `spoken` is what the MODEL supplied and `value` is what the action is
- * dispatched with. The two `kind`s resolve against different things, and the
+ * dispatched with. The `kind`s resolve against different things, and the
  * difference is worth knowing before reading either field:
  *
  * * `agent_ref` resolves against **live state** — `spoken` is what the user
  *   called an agent, `value` is that agent's id, and `label` is the name the
  *   deck shows for it.
+ * * `deck_ref` resolves against **the observed fleet** (PRD #1223) — `spoken`
+ *   is what the user called a deck, `value` is that deck's `deckId`, and
+ *   `label` is what the overview calls it ("Local deck", or `user@host`).
  * * `spoken_prefix` resolves against **the transcript** — `spoken` is the
  *   boundary the model marked, the words that introduced a dictation, and
  *   `value` is what the app resolved that boundary to: the rest of the

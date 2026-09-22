@@ -68,12 +68,16 @@ impl fmt::Display for Screen {
 /// [`TableError::UnknownParamKind`] refuses it at parse time instead of letting
 /// it surface at runtime as nothing happening.
 ///
-/// # The two kinds resolve against different things, and that is the point of
-/// the second one
+/// # The kinds resolve against different things, and that is the point of
+/// `spoken_prefix`
 ///
 /// [`ParamKind::AgentRef`] resolves a spoken reference against **live state**:
 /// the agent snapshot decides whether *"the tester"* names one agent, none, or
-/// several. [`ParamKind::SpokenPrefix`] resolves against **the transcript
+/// several. [`ParamKind::DeckRef`] is the same shape one level up (PRD #1223):
+/// the fleet the desktop observes decides whether *"the build box"* names one
+/// deck, none, or several — and it is a kind of its own rather than a
+/// dialog's private parser because issue #1195's "switch deck" needs exactly
+/// the same resolution. [`ParamKind::SpokenPrefix`] resolves against **the transcript
 /// itself**, and nothing else — it is the words that introduced a dictation,
 /// and what it resolves *to* is the rest of what the user said, taken verbatim
 /// from the transcript this very utterance produced.
@@ -91,15 +95,21 @@ impl fmt::Display for Screen {
 #[serde(rename_all = "snake_case")]
 pub enum ParamKind {
     AgentRef,
+    DeckRef,
     SpokenPrefix,
 }
 
 impl ParamKind {
-    pub const ALL: [ParamKind; 2] = [ParamKind::AgentRef, ParamKind::SpokenPrefix];
+    pub const ALL: [ParamKind; 3] = [
+        ParamKind::AgentRef,
+        ParamKind::DeckRef,
+        ParamKind::SpokenPrefix,
+    ];
 
     pub fn as_str(self) -> &'static str {
         match self {
             ParamKind::AgentRef => "agent_ref",
+            ParamKind::DeckRef => "deck_ref",
             ParamKind::SpokenPrefix => "spoken_prefix",
         }
     }
@@ -120,6 +130,20 @@ impl fmt::Display for ParamKind {
 pub struct ParamSpec {
     pub name: String,
     pub kind: ParamKind,
+    /// Whether the row still dispatches when the model supplies no value
+    /// (`optional = true` in the TOML; absent means required).
+    ///
+    /// **Absence is not a refusal for an optional param, and a value that
+    /// fails to resolve still is.** *"new agent"* with no deck named opens the
+    /// dialog with nothing preselected, which is a complete command; *"new
+    /// agent on the ghost box"* names a deck the fleet does not have, and
+    /// dispatching as though it had not been said would silently drop what the
+    /// user asked for. So only the missing case changes.
+    ///
+    /// A report may not interpolate an optional param
+    /// ([`TableError::OptionalPlaceholder`]): with nothing supplied there is
+    /// nothing to put in the sentence.
+    pub optional: bool,
 }
 
 /// One row: a command the model may pick and the app may dispatch.
@@ -238,7 +262,15 @@ impl CommandTable {
                         param: name,
                     });
                 }
-                params.push(ParamSpec { name, kind });
+                // The placeholder check below needs this, so a report that
+                // interpolates an optional param is refused before it can
+                // render with a hole in it.
+                let optional = param.optional.unwrap_or(false);
+                params.push(ParamSpec {
+                    name,
+                    kind,
+                    optional,
+                });
             }
 
             // The report is the one column with a stringly reference INSIDE
@@ -246,11 +278,20 @@ impl CommandTable {
             // a placeholder naming no declared param is refused here rather
             // than rendering as a literal `{agent}` to the user.
             for placeholder in placeholders(&report, &id)? {
-                if !params.iter().any(|param| param.name == placeholder) {
-                    return Err(TableError::UnknownPlaceholder {
-                        id: id.clone(),
-                        placeholder,
-                    });
+                match params.iter().find(|param| param.name == placeholder) {
+                    None => {
+                        return Err(TableError::UnknownPlaceholder {
+                            id: id.clone(),
+                            placeholder,
+                        });
+                    }
+                    Some(param) if param.optional => {
+                        return Err(TableError::OptionalPlaceholder {
+                            id: id.clone(),
+                            placeholder,
+                        });
+                    }
+                    Some(_) => {}
                 }
             }
 
@@ -353,6 +394,9 @@ pub enum TableError {
     DuplicateParam { id: String, param: String },
     /// A `report` placeholder naming no declared param.
     UnknownPlaceholder { id: String, placeholder: String },
+    /// A `report` placeholder naming an OPTIONAL param, which would render
+    /// as a literal `{name}` whenever the user named nothing.
+    OptionalPlaceholder { id: String, placeholder: String },
     /// A `report` whose braces do not pair up.
     MalformedReport { id: String, detail: String },
 }
@@ -399,6 +443,10 @@ impl fmt::Display for TableError {
             TableError::UnknownPlaceholder { id, placeholder } => write!(
                 f,
                 "command `{id}`'s report names `{{{placeholder}}}`, which is not one of its params"
+            ),
+            TableError::OptionalPlaceholder { id, placeholder } => write!(
+                f,
+                "command `{id}`'s report names `{{{placeholder}}}`, which is optional and so may have nothing to say"
             ),
             TableError::MalformedReport { id, detail } => {
                 write!(f, "command `{id}`'s report has {detail}")
@@ -511,6 +559,8 @@ mod tests {
                 // no pane open there is no one agent to mean.
                 ("dictate_to_agent", "dictateToAgent", vec!["agent"]),
                 ("submit_prompt", "submitAgentPrompt", vec!["agent"]),
+                // `overview` alone: the dialog lives there (PRD #1223).
+                ("open_new_agent", "openNewAgent", vec!["overview"]),
             ]
         );
     }
@@ -528,6 +578,7 @@ mod tests {
             vec![ParamSpec {
                 name: "agent".to_string(),
                 kind: ParamKind::AgentRef,
+                optional: false,
             }]
         );
     }
@@ -688,17 +739,86 @@ mod tests {
 
     #[test]
     fn voice_table_rejects_an_unknown_param_kind() {
-        let source = one_row().replace("kind = \"agent_ref\"", "kind = \"deck_ref\"");
+        // `deck_ref` used to be this fixture, back when the set was two; it is
+        // a real kind now (PRD #1223), so the negative case is one no resolver
+        // will ever claim.
+        let source = one_row().replace("kind = \"agent_ref\"", "kind = \"project_ref\"");
         let error = CommandTable::parse(&source).expect_err("refused");
         assert_eq!(
             error,
             TableError::UnknownParamKind {
                 id: "open_agent".to_string(),
                 param: "agent".to_string(),
-                kind: "deck_ref".to_string(),
+                kind: "project_ref".to_string(),
             }
         );
-        assert!(error.to_string().contains("`agent_ref`"));
+        let message = error.to_string();
+        assert!(
+            message.contains("`agent_ref`, `deck_ref`, `spoken_prefix`"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn voice_table_open_new_agent_takes_one_optional_deck_ref() {
+        // PRD #1223: the first row with a `deck_ref`, and the first optional
+        // param. Pinned by value because both halves are load-bearing — a
+        // required `deck` would refuse the bare "new agent", and an
+        // `agent_ref` would resolve the deck's name against the wrong list.
+        let row = super::table()
+            .row("open_new_agent")
+            .expect("open_new_agent is in the table");
+        assert_eq!(row.invoke, "openNewAgent");
+        assert_eq!(row.screens, vec![Screen::Overview]);
+        assert_eq!(
+            row.params,
+            vec![ParamSpec {
+                name: "deck".to_string(),
+                kind: ParamKind::DeckRef,
+                optional: true,
+            }]
+        );
+        assert_eq!(row.report, "Opening the New agent dialog.");
+    }
+
+    #[test]
+    fn voice_table_params_are_required_unless_marked_optional() {
+        let required = CommandTable::parse(&one_row()).expect("parses");
+        assert!(!required.rows()[0].params[0].optional);
+
+        let source = one_row()
+            .replace("report = \"Opening {agent}.\"", "report = \"Opening.\"")
+            .replace(
+                "kind = \"agent_ref\"",
+                "kind = \"deck_ref\"\noptional = true",
+            );
+        let optional = CommandTable::parse(&source).expect("parses");
+        assert_eq!(
+            optional.rows()[0].params[0],
+            ParamSpec {
+                name: "agent".to_string(),
+                kind: ParamKind::DeckRef,
+                optional: true,
+            }
+        );
+    }
+
+    #[test]
+    fn voice_table_rejects_a_report_placeholder_naming_an_optional_param() {
+        // With nothing supplied there is nothing to interpolate, so the
+        // sentence would reach the user as a literal `{agent}`.
+        let source = one_row().replace(
+            "kind = \"agent_ref\"",
+            "kind = \"agent_ref\"\noptional = true",
+        );
+        let error = CommandTable::parse(&source).expect_err("refused");
+        assert_eq!(
+            error,
+            TableError::OptionalPlaceholder {
+                id: "open_agent".to_string(),
+                placeholder: "agent".to_string(),
+            }
+        );
     }
 
     #[test]
@@ -928,7 +1048,8 @@ mod tests {
                 "open_deck",
                 "close",
                 "voice_off",
-                "list_commands"
+                "list_commands",
+                "open_new_agent"
             ]
         );
         assert_eq!(
@@ -957,7 +1078,9 @@ mod tests {
         for kind in ParamKind::ALL {
             assert_eq!(ParamKind::parse(kind.as_str()), Some(kind));
         }
+        assert_eq!(ParamKind::parse("deck_ref"), Some(ParamKind::DeckRef));
         assert_eq!(ParamKind::parse("agentRef"), None);
+        assert_eq!(ParamKind::parse("deckRef"), None);
     }
 
     #[test]
@@ -1002,4 +1125,5 @@ struct RawCommand {
 struct RawParam {
     name: Option<String>,
     kind: Option<String>,
+    optional: Option<bool>,
 }

@@ -48,7 +48,7 @@ use super::dictation::{
 use super::resolver::{IntentError, IntentRequest, IntentResolver};
 use super::schema::annotate;
 use super::table::{CommandRow, CommandTable, ParamKind, Screen};
-use super::{DesktopAgent, Transcript};
+use super::{DesktopAgent, Transcript, VoiceDeck};
 use crate::dto::{DesktopTab, safe_message};
 
 /// How many matching agents an ambiguity sentence names before it summarises.
@@ -76,7 +76,8 @@ pub struct ResolvedParam {
     /// What the user called it — kept so the surface can show what it matched.
     pub spoken: String,
     /// What it resolved to, and what the frontend dispatches with: an agent id
-    /// for [`ParamKind::AgentRef`].
+    /// for [`ParamKind::AgentRef`], a deck id (`deckId`) for
+    /// [`ParamKind::DeckRef`].
     pub value: String,
     /// The name the deck shows for it, which is what the report sentence
     /// says. Derived the same way the webview derives it, so the sentence names
@@ -300,12 +301,16 @@ impl VoiceResult {
 /// refusal is its own outcome carrying its own sentence.
 ///
 /// `table` is a parameter rather than [`super::table::table()`] so a test can
-/// drive a fixture table; M6 passes the embedded one.
+/// drive a fixture table; M6 passes the embedded one. `decks` is the observed
+/// fleet a [`ParamKind::DeckRef`] resolves against (PRD #1223) — the whole
+/// fleet rather than the selected deck, because naming a deck OTHER than the
+/// one on screen is the point of saying its name.
 pub async fn handle_utterance(
     resolver: &dyn IntentResolver,
     table: &CommandTable,
     screen: Screen,
     agents: &[DesktopAgent],
+    decks: &[VoiceDeck],
     transcript: Transcript,
 ) -> VoiceResult {
     let backend = resolver.backend_name();
@@ -336,6 +341,7 @@ pub async fn handle_utterance(
             transcript: &transcript,
             commands: &commands,
             agents,
+            decks,
         })
         .await;
     // Taken before anything is rendered: what the user waited for is the
@@ -382,6 +388,13 @@ pub async fn handle_utterance(
             .map(|value| value.trim())
             .filter(|value| !value.is_empty())
         else {
+            // An optional param the model left out is simply not dispatched
+            // (PRD #1223's "new agent" with no deck named). Only ABSENCE is
+            // forgiven: a value that resolves to nothing is refused below
+            // exactly as a required one is.
+            if spec.optional {
+                continue;
+            }
             return finish(VoiceOutcome::ParamMissing {
                 sentence: heard(&transcript, spec.kind.missing_phrase()),
                 transcript,
@@ -439,6 +452,38 @@ pub async fn handle_utterance(
                     });
                 }
                 AgentRefMatch::Ambiguous(labels) => {
+                    return finish(VoiceOutcome::ParamAmbiguous {
+                        sentence: heard(&transcript, &spec.kind.ambiguous_phrase(spoken, &labels)),
+                        transcript,
+                        action: row.id.clone(),
+                        param: spec.name.clone(),
+                        spoken: spoken.to_string(),
+                        matches: labels,
+                    });
+                }
+            },
+            // PRD #1223 — the same three answers as an agent reference, against
+            // the observed fleet, and the same two refusals: no new outcome
+            // variant, because from where the user stands "no deck matches" and
+            // "no agent matches" are the same situation about different things.
+            ParamKind::DeckRef => match resolve_deck_ref(spoken, decks) {
+                DeckRefMatch::One { id, label } => resolved.push(ResolvedParam {
+                    name: spec.name.clone(),
+                    kind: spec.kind,
+                    spoken: spoken.to_string(),
+                    value: id,
+                    label,
+                }),
+                DeckRefMatch::None => {
+                    return finish(VoiceOutcome::ParamUnresolved {
+                        sentence: heard(&transcript, &spec.kind.unresolved_phrase(spoken)),
+                        transcript,
+                        action: row.id.clone(),
+                        param: spec.name.clone(),
+                        spoken: spoken.to_string(),
+                    });
+                }
+                DeckRefMatch::Ambiguous(labels) => {
                     return finish(VoiceOutcome::ParamAmbiguous {
                         sentence: heard(&transcript, &spec.kind.ambiguous_phrase(spoken, &labels)),
                         transcript,
@@ -630,6 +675,7 @@ impl ParamKind {
     fn missing_phrase(self) -> &'static str {
         match self {
             ParamKind::AgentRef => "I could not tell which agent you meant",
+            ParamKind::DeckRef => "I could not tell which deck you meant",
             // The model picked dictation and marked no boundary, so there is
             // no answer to the only question this kind asks: where do the
             // user's own words start? Nothing is typed, and the sentence says
@@ -654,6 +700,7 @@ impl ParamKind {
         let spoken = safe_message(spoken);
         match self {
             ParamKind::AgentRef => format!("no agent here matches \u{201c}{spoken}\u{201d}"),
+            ParamKind::DeckRef => format!("no deck matches \u{201c}{spoken}\u{201d}"),
             // **The fidelity refusal**, and the one sentence in this file that
             // reports a disagreement between the app and the model. The words
             // quoted are the MODEL's — scrubbed like every foreign string — and
@@ -693,6 +740,9 @@ impl ParamKind {
         match self {
             ParamKind::AgentRef => {
                 format!("\u{201c}{spoken}\u{201d} matches more than one agent: {listed}")
+            }
+            ParamKind::DeckRef => {
+                format!("\u{201c}{spoken}\u{201d} matches more than one deck: {listed}")
             }
             // Unreachable: a prefix resolves against the transcript, which
             // either starts with the marked words or does not. Written out
@@ -762,6 +812,88 @@ pub fn resolve_agent_ref(spoken: &str, agents: &[DesktopAgent]) -> AgentRefMatch
                 .collect(),
         ),
     }
+}
+
+/// What a spoken deck reference resolved to — [`AgentRefMatch`]'s shape, one
+/// level up.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeckRefMatch {
+    One { id: String, label: String },
+    None,
+    Ambiguous(Vec<String>),
+}
+
+/// Resolve a spoken reference against the observed fleet (PRD #1223).
+///
+/// [`resolve_agent_ref`]'s two passes in the same order and for the same
+/// reason — an exact hit has to win over a loose one — over the names a deck
+/// answers to, which are what the overview SHOWS for it:
+///
+/// - its **label**: "Local deck", or `user@host[:port]` for a remote one;
+/// - for a remote deck, its **host** on its own and the host's first dotted
+///   component, because nobody reads `deploy@build-box.example.com:2222` aloud —
+///   they say "the build box", which the word-subset pass then reaches;
+/// - for the local deck, the literal **"local"**, plus "this machine".
+///
+/// **The label is what a sentence says, never the id.** The id is a
+/// `deck-<16 hex>` hash minted for keying, so it is neither sayable nor shown.
+pub fn resolve_deck_ref(spoken: &str, decks: &[VoiceDeck]) -> DeckRefMatch {
+    let reference = normalize(spoken);
+    if reference.is_empty() {
+        return DeckRefMatch::None;
+    }
+    let reference_words = words(&reference);
+
+    let mut exact: Vec<&VoiceDeck> = Vec::new();
+    let mut loose: Vec<&VoiceDeck> = Vec::new();
+    for deck in decks {
+        let names = deck_spoken_names(deck);
+        if names.iter().any(|name| normalize(name) == reference) {
+            exact.push(deck);
+        } else if names.iter().any(|name| word_subset(&reference_words, name)) {
+            loose.push(deck);
+        }
+    }
+
+    let hits = if exact.is_empty() { loose } else { exact };
+    match hits.len() {
+        0 => DeckRefMatch::None,
+        1 => DeckRefMatch::One {
+            id: hits[0].id.clone(),
+            label: hits[0].label.clone(),
+        },
+        _ => DeckRefMatch::Ambiguous(hits.iter().map(|deck| deck.label.clone()).collect()),
+    }
+}
+
+/// Every name this deck answers to. See [`resolve_deck_ref`] for the rule.
+fn deck_spoken_names(deck: &VoiceDeck) -> Vec<String> {
+    let mut names = vec![deck.label.clone()];
+    if deck.local {
+        names.push("local".to_string());
+        names.push("this machine".to_string());
+        return names;
+    }
+    // `user@host[:port]` → `host`. The label is `RemoteEndpoint::describe()`,
+    // whose shape this undoes; a label that is not in that shape yields no
+    // extra name rather than a wrong one.
+    let without_user = deck.label.rsplit('@').next().unwrap_or(&deck.label);
+    let host = without_user
+        .split(':')
+        .next()
+        .unwrap_or(without_user)
+        .trim();
+    if !host.is_empty() && host != deck.label {
+        names.push(host.to_string());
+    }
+    if let Some(first) = host
+        .split('.')
+        .next()
+        .filter(|first| !first.is_empty() && *first != host)
+    {
+        names.push(first.to_string());
+    }
+    names
 }
 
 /// Every name this agent answers to.
@@ -900,6 +1032,225 @@ mod tests {
         vec![role_agent("1", "tester"), role_agent("2", "orchestrator")]
     }
 
+    fn deck(id: &str, label: &str, local: bool) -> VoiceDeck {
+        VoiceDeck {
+            id: id.to_string(),
+            label: label.to_string(),
+            local,
+        }
+    }
+
+    /// The observed fleet: this machine's deck and two remotes on one host
+    /// family, so "build" is ambiguous and "build box" is not.
+    fn decks() -> Vec<VoiceDeck> {
+        vec![
+            deck("deck-local", "Local deck", true),
+            deck("deck-build", "deploy@build-box.example.com:2222", false),
+            deck("deck-build-two", "ci@build-farm", false),
+        ]
+    }
+
+    // -- deck_ref (PRD #1223) ---------------------------------------------
+
+    #[test]
+    fn voice_outcome_deck_ref_resolves_one_deck_by_host_label_or_local() {
+        for said in [
+            "build box",
+            "the build box",
+            "Build-Box",
+            "deploy@build-box.example.com:2222",
+        ] {
+            assert_eq!(
+                resolve_deck_ref(said, &decks()),
+                DeckRefMatch::One {
+                    id: "deck-build".to_string(),
+                    label: "deploy@build-box.example.com:2222".to_string(),
+                },
+                "{said}"
+            );
+        }
+        for said in [
+            "local",
+            "Local",
+            "local deck",
+            "the local deck",
+            "this machine",
+        ] {
+            assert_eq!(
+                resolve_deck_ref(said, &decks()),
+                DeckRefMatch::One {
+                    id: "deck-local".to_string(),
+                    label: "Local deck".to_string(),
+                },
+                "{said}"
+            );
+        }
+    }
+
+    #[test]
+    fn voice_outcome_deck_ref_is_none_for_a_deck_the_fleet_does_not_have() {
+        assert_eq!(
+            resolve_deck_ref("the ghost box", &decks()),
+            DeckRefMatch::None
+        );
+        assert_eq!(resolve_deck_ref("local", &[]), DeckRefMatch::None);
+        assert_eq!(resolve_deck_ref("   ", &decks()), DeckRefMatch::None);
+    }
+
+    #[test]
+    fn voice_outcome_deck_ref_is_ambiguous_when_two_decks_match() {
+        assert_eq!(
+            resolve_deck_ref("build", &decks()),
+            DeckRefMatch::Ambiguous(vec![
+                "deploy@build-box.example.com:2222".to_string(),
+                "ci@build-farm".to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn voice_outcome_deck_ref_exact_beats_loose() {
+        // "build farm" is exactly one deck's host, and loosely a subset of
+        // nothing else — but "build" alone must not make it ambiguous with a
+        // deck literally named "build".
+        let fleet = vec![
+            deck("deck-a", "ops@build", false),
+            deck("deck-b", "ops@build-farm", false),
+        ];
+        assert_eq!(
+            resolve_deck_ref("build", &fleet),
+            DeckRefMatch::One {
+                id: "deck-a".to_string(),
+                label: "ops@build".to_string(),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn voice_outcome_open_new_agent_with_no_deck_dispatches_with_no_param() {
+        let resolver =
+            StubResolver::new().answering("new agent", IntentAnswer::new("open_new_agent"));
+        let outcome = run(&resolver, Screen::Overview, &fleet(), "new agent").await;
+        assert_eq!(
+            outcome,
+            VoiceOutcome::Dispatch {
+                transcript: Transcript::new("new agent"),
+                action: "open_new_agent".to_string(),
+                invoke: "openNewAgent".to_string(),
+                params: Vec::new(),
+                sentence: "Opening the New agent dialog.".to_string(),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn voice_outcome_open_new_agent_on_a_deck_dispatches_its_id() {
+        let resolver = StubResolver::new().answering(
+            "new agent on the build box",
+            IntentAnswer::new("open_new_agent").with_param("deck", "the build box"),
+        );
+        let outcome = run(
+            &resolver,
+            Screen::Overview,
+            &fleet(),
+            "new agent on the build box",
+        )
+        .await;
+        let VoiceOutcome::Dispatch { params, invoke, .. } = outcome else {
+            panic!("expected a dispatch, got {outcome:?}");
+        };
+        assert_eq!(invoke, "openNewAgent");
+        assert_eq!(
+            params,
+            vec![ResolvedParam {
+                name: "deck".to_string(),
+                kind: ParamKind::DeckRef,
+                spoken: "the build box".to_string(),
+                value: "deck-build".to_string(),
+                label: "deploy@build-box.example.com:2222".to_string(),
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn voice_outcome_open_new_agent_refuses_a_deck_that_matches_nothing() {
+        // Optional forgives ABSENCE only: a deck the user named and the fleet
+        // does not have is refused, not silently dropped.
+        let resolver = StubResolver::new().answering(
+            "new agent on the ghost box",
+            IntentAnswer::new("open_new_agent").with_param("deck", "ghost box"),
+        );
+        let outcome = run(
+            &resolver,
+            Screen::Overview,
+            &fleet(),
+            "new agent on the ghost box",
+        )
+        .await;
+        assert_eq!(
+            outcome,
+            VoiceOutcome::ParamUnresolved {
+                transcript: Transcript::new("new agent on the ghost box"),
+                action: "open_new_agent".to_string(),
+                param: "deck".to_string(),
+                spoken: "ghost box".to_string(),
+                sentence: "Heard: \u{201c}new agent on the ghost box\u{201d} — no deck matches \u{201c}ghost box\u{201d}.".to_string(),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn voice_outcome_open_new_agent_names_the_candidates_of_an_ambiguous_deck() {
+        let resolver = StubResolver::new().answering(
+            "new agent on build",
+            IntentAnswer::new("open_new_agent").with_param("deck", "build"),
+        );
+        let outcome = run(&resolver, Screen::Overview, &fleet(), "new agent on build").await;
+        let VoiceOutcome::ParamAmbiguous {
+            matches, sentence, ..
+        } = outcome
+        else {
+            panic!("expected an ambiguity, got {outcome:?}");
+        };
+        assert_eq!(
+            matches,
+            vec![
+                "deploy@build-box.example.com:2222".to_string(),
+                "ci@build-farm".to_string()
+            ]
+        );
+        assert!(
+            sentence.contains("matches more than one deck"),
+            "{sentence}"
+        );
+    }
+
+    #[tokio::test]
+    async fn voice_outcome_open_new_agent_is_unavailable_off_the_overview() {
+        let resolver =
+            StubResolver::new().answering("new agent", IntentAnswer::new("open_new_agent"));
+        for screen in [Screen::Deck, Screen::Agent] {
+            let outcome = run(&resolver, screen, &fleet(), "new agent").await;
+            assert_eq!(
+                outcome.sentence(),
+                "Not here — starting a new agent works from the agent overview.",
+                "{screen}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn voice_outcome_a_required_param_is_still_refused_when_absent() {
+        // The optional branch must not have widened: `open_agent`'s `agent`
+        // is required and its absence is still `ParamMissing`.
+        let resolver = StubResolver::new().answering("open it", IntentAnswer::new("open_agent"));
+        let outcome = run(&resolver, Screen::Deck, &fleet(), "open it").await;
+        assert!(
+            matches!(outcome, VoiceOutcome::ParamMissing { .. }),
+            "{outcome:?}"
+        );
+    }
+
     async fn run(
         resolver: &StubResolver,
         screen: Screen,
@@ -916,7 +1267,15 @@ mod tests {
         agents: &[DesktopAgent],
         said: &str,
     ) -> VoiceResult {
-        handle_utterance(resolver, table(), screen, agents, Transcript::new(said)).await
+        handle_utterance(
+            resolver,
+            table(),
+            screen,
+            agents,
+            &decks(),
+            Transcript::new(said),
+        )
+        .await
     }
 
     // -- dispatch ----------------------------------------------------------
@@ -1472,6 +1831,7 @@ mod tests {
                 &parsed,
                 Screen::Deck,
                 &fleet(),
+                &[],
                 Transcript::new("open the tester"),
             )
             .await
@@ -1745,6 +2105,7 @@ mod tests {
             table(),
             Screen::Deck,
             &fleet(),
+            &[],
             "show everything".into(),
         )
         .await;
@@ -1857,6 +2218,7 @@ mod tests {
             table(),
             Screen::Agent,
             &fleet(),
+            &[],
             Transcript::new("type run the login tests"),
         )
         .await;
@@ -1881,6 +2243,7 @@ mod tests {
             table(),
             Screen::Agent,
             &fleet(),
+            &[],
             Transcript::new(heard),
         )
         .await;
@@ -1903,6 +2266,7 @@ mod tests {
             table(),
             Screen::Agent,
             &fleet(),
+            &[],
             Transcript::new("type hello end"),
         )
         .await;
@@ -1922,6 +2286,7 @@ mod tests {
             table(),
             Screen::Agent,
             &fleet(),
+            &[],
             Transcript::new("End."),
         )
         .await;
@@ -1946,6 +2311,7 @@ mod tests {
             table(),
             Screen::Agent,
             &fleet(),
+            &[],
             Transcript::new("type end of file"),
         )
         .await;
@@ -1962,6 +2328,7 @@ mod tests {
                 table(),
                 screen,
                 &fleet(),
+                &[],
                 Transcript::new("type run the login tests"),
             )
             .await;
@@ -1992,6 +2359,7 @@ mod tests {
             table(),
             Screen::Agent,
             &fleet(),
+            &[],
             Transcript::new("type"),
         )
         .await;
@@ -2017,6 +2385,7 @@ mod tests {
             table(),
             Screen::Agent,
             &fleet(),
+            &[],
             Transcript::new("let's write a prompt run the tests"),
         )
         .await;
@@ -2037,6 +2406,7 @@ mod tests {
             table(),
             Screen::Agent,
             &fleet(),
+            &[],
             Transcript::new(heard),
         )
         .await;
@@ -2065,6 +2435,7 @@ mod tests {
             table(),
             Screen::Agent,
             &fleet(),
+            &[],
             Transcript::new("run the login tests"),
         )
         .await;
@@ -2099,6 +2470,7 @@ mod tests {
             table(),
             Screen::Agent,
             &fleet(),
+            &[],
             Transcript::new("let's write a prompt"),
         )
         .await;
@@ -2117,6 +2489,7 @@ mod tests {
             table(),
             Screen::Agent,
             &fleet(),
+            &[],
             Transcript::new("just write that down somewhere"),
         )
         .await;

@@ -113,7 +113,11 @@ pub const TOOL_INSTRUCTIONS: &str = "Pick the deck action the user asked for. Pi
     readily as by name — \"the one that is stuck\", \"whichever is waiting\" — so \
     resolve such a reference against those fields and answer with that agent's \
     `label`. For a reference the user made by name, answer with the words the user \
-    used and let the app resolve them. Write no prose; \
+    used and let the app resolve them. `decks` lists every deck the app can \
+    reach, named the way the screen names it; a `deck_ref` param is a reference \
+    to one of those decks — \"local\" means this machine's — and is answered \
+    with the words the user used for it, never with an agent. A param marked \
+    `optional` is left out when the user named nothing for it. Write no prose; \
     the app writes what the user reads.";
 
 /// One row as the model sees it, with its availability on the screen the
@@ -135,6 +139,11 @@ pub struct AnnotatedCommand {
 pub struct AnnotatedParam {
     pub name: String,
     pub kind: ParamKind,
+    /// Sent only when true, so every row that has always been required reads
+    /// exactly as it did before PRD #1223 gave the table its first optional
+    /// param.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub optional: bool,
 }
 
 /// The full table annotated for one screen — every row, in table order.
@@ -153,6 +162,7 @@ pub fn annotate(table: &CommandTable, screen: Screen) -> Vec<AnnotatedCommand> {
                 .map(|param| AnnotatedParam {
                     name: param.name.clone(),
                     kind: param.kind,
+                    optional: param.optional,
                 })
                 .collect(),
         })
@@ -230,6 +240,7 @@ mod tests {
                 "list_commands".to_string(),
                 "dictate_to_agent".to_string(),
                 "submit_prompt".to_string(),
+                "open_new_agent".to_string(),
                 "none".to_string(),
             ]
         );
@@ -286,6 +297,7 @@ mod tests {
                 "list_commands",
                 "dictate_to_agent",
                 "submit_prompt",
+                "open_new_agent",
                 "none"
             ]
         );
@@ -344,6 +356,7 @@ mod tests {
                 // there is no one agent whose prompt "type this" could mean.
                 ("dictate_to_agent".to_string(), false),
                 ("submit_prompt".to_string(), false),
+                ("open_new_agent".to_string(), false),
             ]
         );
         assert_eq!(
@@ -362,6 +375,7 @@ mod tests {
                 ("list_commands".to_string(), true),
                 ("dictate_to_agent".to_string(), false),
                 ("submit_prompt".to_string(), false),
+                ("open_new_agent".to_string(), true),
             ]
         );
         assert_eq!(
@@ -376,6 +390,7 @@ mod tests {
                 ("list_commands".to_string(), true),
                 ("dictate_to_agent".to_string(), true),
                 ("submit_prompt".to_string(), true),
+                ("open_new_agent".to_string(), false),
             ]
         );
     }
@@ -415,6 +430,7 @@ mod tests {
             vec![AnnotatedParam {
                 name: "agent".to_string(),
                 kind: ParamKind::AgentRef,
+                optional: false,
             }]
         );
     }
@@ -431,9 +447,39 @@ mod tests {
         let json = serde_json::to_value(AnnotatedParam {
             name: "agent".to_string(),
             kind: ParamKind::AgentRef,
+            optional: false,
         })
         .expect("serializes");
         assert_eq!(json["kind"], "agent_ref");
+        // A required param says nothing about optionality, so the rows that
+        // predate `optional` render exactly as they always did.
+        assert!(json.get("optional").is_none());
+    }
+
+    #[test]
+    fn voice_schema_serializes_a_deck_ref_in_its_toml_spelling_and_marks_it_optional() {
+        let commands = annotate(table(), Screen::Overview);
+        let row = commands
+            .iter()
+            .find(|command| command.id == "open_new_agent")
+            .expect("present");
+        assert!(row.callable);
+        let json = serde_json::to_value(&row.params).expect("serializes");
+        assert_eq!(
+            json,
+            serde_json::json!([{ "name": "deck", "kind": "deck_ref", "optional": true }])
+        );
+    }
+
+    #[test]
+    fn voice_schema_instructions_say_what_a_deck_reference_is() {
+        // The model is shown `deck_ref` as a kind, and a kind it has never
+        // been told about is a param it will fill with an agent's name.
+        assert!(
+            TOOL_INSTRUCTIONS.contains("`deck_ref` param is a reference to one of those decks")
+        );
+        assert!(TOOL_INSTRUCTIONS.contains("\"local\" means this machine's"));
+        assert!(TOOL_INSTRUCTIONS.contains("`optional` is left out"));
     }
 
     #[test]
