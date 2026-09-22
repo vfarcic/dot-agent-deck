@@ -9514,6 +9514,45 @@ fn point_in_rect(rect: &Rect, col: u16, row: u16) -> bool {
         && row < rect.y.saturating_add(rect.height)
 }
 
+/// A pane's **content** area: its outer `rect` minus the one-cell border
+/// [`TerminalWidget`] draws around it.
+///
+/// This is the rect every pointer affordance that addresses pane *content*
+/// hit-tests against — the click paths (selection, Ctrl+click hyperlinks) and,
+/// since issue #362, the wheel. The outer rect is the wrong one for that
+/// question: a border cell is inside the pane but has no content coordinate, so
+/// admitting it would mean inventing one.
+fn pane_inner_rect(rect: Rect) -> Rect {
+    Rect {
+        x: rect.x.saturating_add(1),
+        y: rect.y.saturating_add(1),
+        width: rect.width.saturating_sub(2),
+        height: rect.height.saturating_sub(2),
+    }
+}
+
+/// Issue #362 — screen coordinates translated into `rect`'s content area, or
+/// `None` when the pointer is not in it.
+///
+/// The `None` is the whole point, and is why this returns an `Option` where the
+/// deleted `pane_relative_coords` returned a bare pair: a pointer outside the
+/// pane has no pane-relative position, and saturating it to the nearest edge
+/// manufactures one that looks plausible and is not where the pointer is. A
+/// child app that acts on wheel *position* — an editor, a pager, a full-screen
+/// TUI — then acts on a lie. Every caller decides what to do with `None`
+/// instead of being handed a fiction.
+///
+/// The subtraction cannot underflow: [`point_in_rect`] has already established
+/// both coordinates are at or past the inner origin. A pane too small to have a
+/// content area (width or height below 2) yields an empty rect that
+/// [`point_in_rect`] rejects for every point, so there is no degenerate case
+/// that reaches the subtraction.
+fn pane_inner_coords(rect: Rect, screen_col: u16, screen_row: u16) -> Option<(u16, u16)> {
+    let inner = pane_inner_rect(rect);
+    point_in_rect(&inner, screen_col, screen_row)
+        .then(|| (screen_col - inner.x, screen_row - inner.y))
+}
+
 /// PRD #80 M3: hit-test a click against the tab `[×]` close rects, returning a
 /// [`Action::CloseTab`] for the first match. Checked AFTER `button_rects` but
 /// BEFORE the header rects so the `[×]` beats the surrounding tab header.
@@ -15041,22 +15080,23 @@ pub fn run_tui(
                         // the event reaches the child is the ONE decision
                         // `scroll_focused_agent_pane` owns; it is command mode's
                         // job never to.
+                        //
+                        // Issue #362: *whether this pane is the target at all* is
+                        // the separate decision `wheel_over_focused_pane` owns, and
+                        // it is made from the pointer — matching the side panes
+                        // above and every other pointer affordance in the deck.
                         crossterm::event::MouseEventKind::ScrollUp
                         | crossterm::event::MouseEventKind::ScrollDown => {
                             let up =
                                 matches!(mouse.kind, crossterm::event::MouseEventKind::ScrollUp);
-                            let (col, row) = pane_relative_coords(
-                                mouse.column,
-                                mouse.row,
-                                &ui.focused_pane_rect,
-                            );
-                            scroll_focused_agent_pane(
+                            wheel_over_focused_pane(
                                 embedded,
                                 &pane_id,
                                 ui.mode,
                                 up,
-                                col,
-                                row,
+                                ui.focused_pane_rect,
+                                mouse.column,
+                                mouse.row,
                                 std::time::Instant::now(),
                             );
                         }
@@ -15068,51 +15108,37 @@ pub fn run_tui(
                                 .modifiers
                                 .contains(crossterm::event::KeyModifiers::CONTROL);
                             if has_modifier {
-                                if let Some(rect) = ui.focused_pane_rect {
-                                    let inner_x = rect.x + 1;
-                                    let inner_y = rect.y + 1;
-                                    let inner_w = rect.width.saturating_sub(2);
-                                    let inner_h = rect.height.saturating_sub(2);
-                                    if mouse.column >= inner_x
-                                        && mouse.column < inner_x + inner_w
-                                        && mouse.row >= inner_y
-                                        && mouse.row < inner_y + inner_h
-                                    {
-                                        let row = mouse.row - inner_y;
-                                        if let Some(hmap_arc) = embedded.get_hyperlinks(&pane_id)
-                                            && let Ok(hmap) = hmap_arc.lock()
-                                            && let Some(screen_arc) = embedded.get_screen(&pane_id)
-                                            && let Ok(parser) = screen_arc.lock()
-                                        {
-                                            let offset = screen_row_offset(parser.screen(), rect);
-                                            let screen_row = row + offset;
-                                            if let Some(url) = hmap.get_row(screen_row) {
-                                                let url = url.to_string();
-                                                drop(parser);
-                                                drop(hmap);
-                                                if open::that(&url).is_ok() {
-                                                    ui.status_message = Some((
-                                                        opened_link_status(&url),
-                                                        std::time::Instant::now(),
-                                                    ));
-                                                }
-                                            }
+                                // Issue #362: the same content-area hit test the
+                                // wheel arm above now uses.
+                                if let Some(rect) = ui.focused_pane_rect
+                                    && let Some((_, row)) =
+                                        pane_inner_coords(rect, mouse.column, mouse.row)
+                                    && let Some(hmap_arc) = embedded.get_hyperlinks(&pane_id)
+                                    && let Ok(hmap) = hmap_arc.lock()
+                                    && let Some(screen_arc) = embedded.get_screen(&pane_id)
+                                    && let Ok(parser) = screen_arc.lock()
+                                {
+                                    let offset = screen_row_offset(parser.screen(), rect);
+                                    let screen_row = row + offset;
+                                    if let Some(url) = hmap.get_row(screen_row) {
+                                        let url = url.to_string();
+                                        drop(parser);
+                                        drop(hmap);
+                                        if open::that(&url).is_ok() {
+                                            ui.status_message = Some((
+                                                opened_link_status(&url),
+                                                std::time::Instant::now(),
+                                            ));
                                         }
                                     }
                                 }
                             } else if let Some(rect) = ui.focused_pane_rect {
-                                let inner_x = rect.x + 1;
-                                let inner_y = rect.y + 1;
-                                let inner_w = rect.width.saturating_sub(2);
-                                let inner_h = rect.height.saturating_sub(2);
-                                if mouse.column >= inner_x
-                                    && mouse.column < inner_x + inner_w
-                                    && mouse.row >= inner_y
-                                    && mouse.row < inner_y + inner_h
+                                // Issue #362: same content-area hit test as above.
+                                let inner = pane_inner_rect(rect);
+                                let (inner_w, inner_h) = (inner.width, inner.height);
+                                if let Some((col, row)) =
+                                    pane_inner_coords(rect, mouse.column, mouse.row)
                                 {
-                                    let col = mouse.column - inner_x;
-                                    let row = mouse.row - inner_y;
-
                                     // Detect multi-click (double/triple).
                                     // Require same row and nearby column (within 3 cells)
                                     // to handle slight mouse movement between clicks, AND
@@ -20489,8 +20515,11 @@ fn pane_has_nothing_to_scroll(embedded: &EmbeddedPaneController, pane_id: &str) 
 ///
 /// Extracted out of the event loop so the live mouse arm and the L1 seam
 /// ([`observe_focused_agent_mouse_scroll`]) exercise the same code rather than two
-/// agreeing copies. `pane_col` / `pane_row` are already pane-relative (the caller
-/// applies [`pane_relative_coords`]).
+/// agreeing copies. `pane_col` / `pane_row` are already pane-relative, and since
+/// issue #362 they are only ever *real* — [`wheel_over_focused_pane`] establishes
+/// that the pointer is inside the pane's content area before this is called at
+/// all, so there is no longer a route by which a clamped coordinate reaches
+/// `forward_mouse_scroll` below.
 ///
 /// Forwarding is a `PaneInput`-only behaviour — it is how you drive the *agent's*
 /// pager while typing to it. In command mode the wheel must always drive our
@@ -20516,6 +20545,67 @@ fn scroll_focused_agent_pane(
     } else {
         scroll_focused_pane_scrollback(embedded, pane_id, up, now);
     }
+}
+
+/// Issue #362 — the ONE place a wheel event's **target** is decided, from the
+/// pointer and nothing else. Returns the content-area coordinates the pane was
+/// given, or `None` when the wheel was dropped.
+///
+/// ## The rule
+///
+/// A wheel event reaches the focused agent pane only while the pointer is inside
+/// that pane's content area ([`pane_inner_coords`]). **Of everything that reaches
+/// this function, anything else — the deck's card list, the stats bar, the tab
+/// bar, the bottom button bar, a pane's border, a non-focused pane — is
+/// dropped**, exactly as a click that lands on no hit-testable rect is dropped.
+///
+/// Two earlier layers in the same arm keep their own precedence and are not
+/// affected: the Scheduled Tasks manager takes the wheel for its own list and
+/// [`overlay_blocks_mouse`] swallows it behind every other modal, both before
+/// this is reached; and the mode-tab side panes hit-test their own rects through
+/// the `side_scrolled` short-circuit, so "the pane under the pointer" holds there
+/// too.
+///
+/// ## Why route by pointer and not by focus
+///
+/// Both models are defensible on their own — scroll-by-focus lets you scroll
+/// without moving the pointer — but only one of them can be reconciled with the
+/// *coordinates*. Forwarding needs a position, and the only honest position for a
+/// pointer outside the pane is "there isn't one". The previous arm answered that
+/// by saturating to the nearest edge, so a full-screen child acting on wheel
+/// position acted on a coordinate the pointer had never been at. Dropping the
+/// event is the only answer that is not a fabrication, and once the forwarding
+/// branch is hit-tested, leaving the scrollback branch un-hit-tested would make
+/// one wheel event mean two different things depending on the child's mouse mode.
+/// So both branches take the same test, and the deck matches every other pointer
+/// affordance it has.
+///
+/// ## Why "dropped" rather than "scrolls the card list"
+///
+/// Because scrolling the card list is not a behaviour that exists to route to.
+/// `UiState::scroll_offset` is written only inside [`render_card_grid`] — by the
+/// keep-selection-visible clamp and by [`clamp_scroll_offset`] — plus the
+/// `#[doc(hidden)]` seam that drives that same renderer. No input path writes it
+/// at all, so the grid scrolls purely as a consequence of moving the selection,
+/// and a wheel-driven write would be re-clamped by the next frame. A wheel over
+/// the deck's cards was a no-op for the deck before this change too — the focused
+/// pane moved, not the grid — so nothing is taken away; giving the card grid its
+/// own scroll model is a feature, and belongs to whoever wants it rather than to
+/// this fix.
+#[allow(clippy::too_many_arguments)]
+fn wheel_over_focused_pane(
+    embedded: &EmbeddedPaneController,
+    pane_id: &str,
+    mode: UiMode,
+    up: bool,
+    focused_pane_rect: Option<Rect>,
+    screen_col: u16,
+    screen_row: u16,
+    now: std::time::Instant,
+) -> Option<(u16, u16)> {
+    let (pane_col, pane_row) = pane_inner_coords(focused_pane_rect?, screen_col, screen_row)?;
+    scroll_focused_agent_pane(embedded, pane_id, mode, up, pane_col, pane_row, now);
+    Some((pane_col, pane_row))
 }
 
 /// PRD #341 M5 — the keyboard door to the focused-pane scroll operation. Returns
@@ -20556,18 +20646,6 @@ fn handle_focused_pane_scroll_key(
         scroll_focused_pane_scrollback(embedded, &pane_id, up, now);
     }
     true
-}
-
-/// Convert screen-absolute mouse coordinates to pane-relative coordinates.
-/// Returns (col, row) relative to the pane's inner area (inside border).
-fn pane_relative_coords(screen_col: u16, screen_row: u16, pane_rect: &Option<Rect>) -> (u16, u16) {
-    if let Some(rect) = pane_rect {
-        let col = screen_col.saturating_sub(rect.x + 1); // +1 for border
-        let row = screen_row.saturating_sub(rect.y + 1);
-        (col, row)
-    } else {
-        (screen_col, screen_row)
-    }
 }
 
 /// Issue #442 — the *glyph and emphasis* half of how a deck card's border
@@ -22273,7 +22351,9 @@ fn focused_scroll_observation(
 /// calls, and the only place the forward-or-scroll decision is made — so the four
 /// `(mode, mouse_mode_enabled)` cells this seam sweeps are the four the running app
 /// takes. `pane_col` / `pane_row` are pane-relative, as they are at the live call
-/// site (which applies [`pane_relative_coords`] first).
+/// site (which resolves them through [`wheel_over_focused_pane`] first). This seam
+/// starts *after* the targeting decision, so it says nothing about which pointer
+/// positions get here — that is [`observe_wheel_routing`]'s question.
 #[doc(hidden)]
 pub fn observe_focused_agent_mouse_scroll(
     mode: UiMode,
@@ -22306,6 +22386,208 @@ pub fn observe_focused_agent_mouse_scroll(
         scrollback_before,
         now,
     )
+}
+
+/// Issue #362 — where ONE wheel event at a screen position went.
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct WheelRoutingObservation {
+    /// The pane-content coordinates the focused pane was handed, or `None` when
+    /// the wheel was dropped because the pointer was not over that pane's
+    /// content area. The exact value matters as much as its presence: a
+    /// clamped coordinate is still a `Some`.
+    pub delivered_coords: Option<(u16, u16)>,
+    /// Every byte the pane queued for the child, flattened in order. Empty means
+    /// the agent saw nothing at all.
+    pub forwarded_bytes: Vec<u8>,
+    /// The deck's own vt100 scrollback offset before the wheel (0 = live output).
+    pub scrollback_before: usize,
+    /// The same offset afterwards. Equal to `scrollback_before` means the deck's
+    /// view did not move either.
+    pub scrollback_after: usize,
+    /// The retained-line depth the fixture actually has, so a test can tell
+    /// "the scroll was refused" apart from "there was nothing to scroll".
+    pub scrollback_depth: usize,
+}
+
+/// Issue #362 L1 seam: send ONE wheel event at a **screen** position against a
+/// focused pane occupying `focused_pane_rect`, and report both where it went and
+/// what the child received.
+///
+/// Drives [`wheel_over_focused_pane`] — the exact function the live mouse arm
+/// calls, and the only place the targeting decision is made — so a pointer
+/// position that is dropped here is dropped in the running app.
+///
+/// This is the seam that starts one step *before*
+/// [`observe_focused_agent_mouse_scroll`]: that one is handed pane-relative
+/// coordinates and asks what the pane does with them; this one is handed the
+/// pointer and asks whether the pane should hear about it at all.
+///
+/// The pane's vt100 parser is built at `focused_pane_rect`'s **content** size,
+/// as `resize_panes_to_layout` sizes a live one, and pre-loaded with enough
+/// newline-terminated history that a delivered deck-owned scroll genuinely
+/// moves. Without that, "the deck's view did not move" would be true of every
+/// case and the dropped-wheel assertions would be vacuous —
+/// [`WheelRoutingObservation::scrollback_depth`] is reported so a test can pin
+/// that rather than assume it.
+#[doc(hidden)]
+pub fn observe_wheel_routing(
+    mode: UiMode,
+    mouse_mode_enabled: bool,
+    up: bool,
+    focused_pane_rect: Option<Rect>,
+    screen_col: u16,
+    screen_row: u16,
+) -> WheelRoutingObservation {
+    // A `None` rect (no pane drawn this frame) still needs a parser to exist for
+    // the observation to be readable; its size is irrelevant because nothing can
+    // be routed to a pane that has no rect.
+    let inner = focused_pane_rect.map(pane_inner_rect).unwrap_or(Rect::new(
+        0,
+        0,
+        SCROLL_SEAM_COLS,
+        SCROLL_SEAM_ROWS,
+    ));
+    let (cols, rows) = (inner.width.max(2), inner.height.max(2));
+    let history = synthetic_scrollable_history_stream(rows, cols);
+    let (ctrl, mut child_input, scrollback_before) =
+        scroll_seam_pane_with_size(mouse_mode_enabled, 0, &history, rows, cols);
+
+    let delivered_coords = wheel_over_focused_pane(
+        &ctrl,
+        SCROLL_SEAM_PANE_ID,
+        mode,
+        up,
+        focused_pane_rect,
+        screen_col,
+        screen_row,
+        std::time::Instant::now(),
+    );
+
+    WheelRoutingObservation {
+        delivered_coords,
+        forwarded_bytes: child_input.drain_bytes(),
+        scrollback_before,
+        scrollback_after: scroll_seam_scrollback(&ctrl, SCROLL_SEAM_PANE_ID),
+        scrollback_depth: scroll_seam_scrollback_depth(&ctrl, SCROLL_SEAM_PANE_ID),
+    }
+}
+
+/// Issue #362 — the production geometry one dashboard frame produced, read back
+/// from the very `UiState` fields the live mouse arm hit-tests against.
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct DashboardGeometry {
+    /// The frame the deck was laid out into.
+    pub frame: Rect,
+    /// `UiState::focused_pane_rect` — the focused agent pane's OUTER rect.
+    pub focused_pane_rect: Option<Rect>,
+    /// `UiState::card_rects` in flat selection order — the deck cards' rects.
+    pub card_rects: Vec<Rect>,
+}
+
+/// Issue #362 L1 seam: lay out and render a real Dashboard frame carrying
+/// `card_count` session cards beside one focused agent pane, and hand back the
+/// rects it recorded.
+///
+/// The point is that the card rects and the pane rect come from the SAME
+/// production pass — `bottom_bar_rows` → [`compute_frame_layout`] →
+/// [`resize_panes_to_layout`] → [`render_frame`], the main loop's own sequence —
+/// so "over the card list" in a test means the cells the deck actually painted
+/// cards into, not a coordinate somebody guessed was to the left of the pane.
+#[doc(hidden)]
+pub fn observe_dashboard_geometry(width: u16, height: u16, card_count: usize) -> DashboardGeometry {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let (width, height) = clamp_render_seam_dims(width, height);
+    let card_count = card_count.min(RENDER_SEAM_ROLES_MAX);
+
+    let pane_id = SCROLL_SEAM_PANE_ID.to_string();
+    let (ctrl, _child_input) = EmbeddedPaneController::for_scroll_seam_with_focused_pane(
+        &pane_id,
+        SCROLL_SEAM_ROWS,
+        SCROLL_SEAM_COLS,
+        b"",
+        false,
+    );
+
+    let mut ui = UiState::new(DashboardConfig::default(), KeybindingConfig::default());
+    let mut state = AppState::default();
+    // Two hours back for the same reason the orchestration frame seam uses it:
+    // `format_elapsed` renders into the card, and a fresh timestamp changes
+    // string width within a second of the render.
+    let last_activity = Utc::now() - chrono::Duration::hours(2);
+    for i in 0..card_count {
+        let session_id = format!("seam-session-{i}");
+        state.sessions.insert(
+            session_id.clone(),
+            SessionState {
+                session_id: session_id.clone(),
+                agent_type: AgentType::ClaudeCode,
+                cwd: None,
+                status: SessionStatus::Idle,
+                active_tool: None,
+                started_at: last_activity,
+                last_activity,
+                recent_events: std::collections::VecDeque::new(),
+                tool_count: 0,
+                last_user_prompt: None,
+                first_prompts: Vec::new(),
+                pane_id: None,
+                agent_id: None,
+                display_name: None,
+                shell_synthetic_working: false,
+                orchestration_orphaned: false,
+            },
+        );
+    }
+
+    let tab_view = ActiveTabView::Dashboard {
+        exclude_pane_ids: vec![],
+        zoomed: false,
+    };
+    let tab_bar = TabBarInfo {
+        show: false,
+        labels: vec!["Dashboard".into()],
+        active_index: 0,
+        orchestration_statuses: vec![],
+    };
+    let frame_area = Rect {
+        x: 0,
+        y: 0,
+        width,
+        height,
+    };
+    let pane_ids = vec![pane_id.clone()];
+    let bar_rows = bottom_bar_rows(&ui, width, height, &tab_view);
+    let layout = compute_frame_layout(
+        frame_area,
+        &tab_view,
+        &tab_bar,
+        &pane_ids,
+        PaneLayout::Stacked,
+        Some(pane_id.as_str()),
+        bar_rows,
+    );
+    resize_panes_to_layout(&layout, &ctrl);
+
+    let filtered = filter_sessions(&state, &ui);
+    let backend = TestBackend::new(width, height);
+    let mut terminal = Terminal::new(backend).expect("TestBackend should construct");
+    terminal
+        .draw(|frame| {
+            render_frame(
+                frame, &state, &mut ui, &filtered, 0, true, &ctrl, &tab_view, &tab_bar, &layout,
+            );
+        })
+        .expect("TestBackend draw should succeed");
+
+    DashboardGeometry {
+        frame: frame_area,
+        focused_pane_rect: ui.focused_pane_rect,
+        card_rects: ui.card_rects.iter().map(|(_, rect)| *rect).collect(),
+    }
 }
 
 /// PRD #341 M5 L1 seam: press ONE key against the focused agent pane and report
