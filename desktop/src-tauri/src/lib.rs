@@ -622,30 +622,138 @@ struct WorkflowLaunchResult {
     agent_ids: Vec<String>,
 }
 
-async fn rollback_workflow_agents<D: WorkflowDaemon + Sync>(
-    daemon: &D,
-    started: &[String],
-) -> String {
-    let mut cleanup_errors = Vec::new();
-    for agent_id in started.iter().rev() {
-        if let Err(error) = daemon.stop_workflow_agent(agent_id).await {
-            cleanup_errors.push(format!(
-                "{} ({})",
-                safe_message(agent_id),
-                safe_message(error)
-            ));
+/// PRD #1223 audit F4: how long one role's start may take — the whole
+/// operation, which for a configured role is `start_prepared_role`'s fresh
+/// handshake AND its start reply — before the launch stops waiting for it and
+/// treats the role as failed.
+///
+/// [`crate::daemon_bridge::DECK_REPLY_TIMEOUT`], for that constant's reason: a
+/// responsive deck answers a start in milliseconds (the spawn is synchronous,
+/// and the prepared-start check runs in the deck's bounded blocking pool), so
+/// this is headroom, not a tuned value. Without it a deck that took the
+/// connection and never answered left the roles already started running for as
+/// long as the peer held the socket, with the rollback that would stop them
+/// queued behind the wait.
+const WORKFLOW_ROLE_START_TIMEOUT: Duration = crate::daemon_bridge::DECK_REPLY_TIMEOUT;
+
+/// PRD #1223 audit F4: how long ONE rollback stop may take. Each stop is
+/// bounded on its own, so a stop the deck never answers costs this and the
+/// rollback moves on to the next role instead of waiting behind it.
+const WORKFLOW_ROLE_STOP_TIMEOUT: Duration = crate::daemon_bridge::DECK_REPLY_TIMEOUT;
+
+/// A role a launch started (or found started by reconciliation), which a
+/// rollback must stop.
+#[derive(Debug, Clone)]
+struct StartedRole {
+    agent_id: String,
+    role: String,
+}
+
+/// A role a rollback could not confirm is stopped, and why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UnconfirmedStop {
+    role: String,
+    reason: String,
+}
+
+/// What [`rollback_workflow_agents`] did: how many roles it was asked to stop,
+/// and EVERY one whose stop it could not confirm.
+#[derive(Debug)]
+struct RollbackOutcome {
+    attempted: usize,
+    unconfirmed: Vec<UnconfirmedStop>,
+}
+
+impl RollbackOutcome {
+    /// The sentence a launch error ends with.
+    fn describe(&self) -> String {
+        if self.unconfirmed.is_empty() {
+            return format!("stopped {} already-started role(s)", self.attempted);
         }
-    }
-    if cleanup_errors.is_empty() {
-        format!("stopped {} already-started role(s)", started.len())
-    } else {
         format!(
             "cleanup could not confirm stop for {} of {} already-started role(s): {}",
-            cleanup_errors.len(),
-            started.len(),
-            cleanup_errors.join(", ")
+            self.unconfirmed.len(),
+            self.attempted,
+            self.unconfirmed
+                .iter()
+                .map(|stop| format!("{} ({})", safe_message(&stop.role), stop.reason))
+                .collect::<Vec<_>>()
+                .join(", ")
         )
     }
+}
+
+/// Stop every started role, newest first.
+///
+/// Each stop is bounded by [`WORKFLOW_ROLE_STOP_TIMEOUT`] on its own (PRD #1223
+/// audit F4), and a stop that fails or times out is recorded and the rollback
+/// CONTINUES — the roles behind a wedged stop are still stopped, and the
+/// outcome names every role whose stop was not confirmed rather than the first.
+async fn rollback_workflow_agents<D: WorkflowDaemon + Sync>(
+    daemon: &D,
+    started: &[StartedRole],
+) -> RollbackOutcome {
+    let mut unconfirmed = Vec::new();
+    for started_role in started.iter().rev() {
+        let reason = match tokio::time::timeout(
+            WORKFLOW_ROLE_STOP_TIMEOUT,
+            daemon.stop_workflow_agent(&started_role.agent_id),
+        )
+        .await
+        {
+            Ok(Ok(())) => continue,
+            Ok(Err(error)) => format!(
+                "{}: {}",
+                safe_message(&started_role.agent_id),
+                safe_message(error)
+            ),
+            Err(_) => format!(
+                "{}: the deck did not answer the stop within {}s",
+                safe_message(&started_role.agent_id),
+                WORKFLOW_ROLE_STOP_TIMEOUT.as_secs()
+            ),
+        };
+        unconfirmed.push(UnconfirmedStop {
+            role: started_role.role.clone(),
+            reason,
+        });
+    }
+    RollbackOutcome {
+        attempted: started.len(),
+        unconfirmed,
+    }
+}
+
+/// One role's start under [`WORKFLOW_ROLE_START_TIMEOUT`], with the elapsed
+/// case reported as an ordinary start failure — which is what sends it through
+/// the caller's reconciliation, so a start that landed although its reply never
+/// arrived is found and stopped with the rest.
+async fn bounded_role_start<T>(
+    start: impl std::future::Future<Output = Result<T, String>>,
+) -> Result<T, RoleStartFailure> {
+    match tokio::time::timeout(WORKFLOW_ROLE_START_TIMEOUT, start).await {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(error)) => Err(RoleStartFailure {
+            message: error,
+            timed_out: false,
+        }),
+        Err(_) => Err(RoleStartFailure {
+            message: format!(
+                "the deck did not answer the start within {}s",
+                WORKFLOW_ROLE_START_TIMEOUT.as_secs()
+            ),
+            timed_out: true,
+        }),
+    }
+}
+
+/// Why one role's start failed. `timed_out` matters to the reconciliation that
+/// follows: a deck that did not answer may still spawn the role after the
+/// reconciliation looked, so a timed-out start the deck does not list is a
+/// start whose outcome is unknown, not one that did not happen.
+struct RoleStartFailure {
+    message: String,
+    timed_out: bool,
 }
 
 async fn deliver_coordinator_prompt<D: WorkflowDaemon + Sync>(
@@ -788,50 +896,49 @@ async fn launch_workflow<D: WorkflowDaemon + Sync>(
             rows,
             cols,
         );
-        match daemon.start_workflow_agent(options, prep_token).await {
+        // PRD #1223 audit F4: bounded, as the New agent flow's configured
+        // starts are — the rollback below is shared, and a wedged start would
+        // otherwise hold every role already started running behind it.
+        match bounded_role_start(daemon.start_workflow_agent(options, prep_token)).await {
             Ok(agent_id) => {
                 if role.start {
                     start_target = Some((pane_id, agent_id.clone()));
                 }
-                started.push(agent_id);
+                started.push(StartedRole {
+                    agent_id,
+                    role: role.role.clone(),
+                });
             }
-            Err(error) => {
+            Err(failure) => {
                 // StartAgent can spawn/register successfully and then lose its
                 // response. Reconcile the already-known pane + orchestration
                 // identity before rollback so that just-spawned role is not
                 // leaked merely because its id never reached this client.
-                let reconciliation_note = match daemon
-                    .reconcile_workflow_agent(
-                        &pane_id,
-                        orchestration_id,
-                        COORDINATOR_DELIVERY_RPC_TIMEOUT,
-                    )
-                    .await
+                let reconciliation_note = match reconcile_failed_start(
+                    daemon,
+                    &mut started,
+                    &pane_id,
+                    orchestration_id,
+                    &role.role,
+                    failure.timed_out,
+                )
+                .await
                 {
-                    Ok(Some(agent_id)) => {
-                        if !started.contains(&agent_id) {
-                            started.push(agent_id);
-                        }
-                        String::new()
-                    }
-                    Ok(None) => String::new(),
-                    Err(reconciliation_error) => format!(
-                        "; cleanup uncertainty: could not reconcile the failed role by pane and orchestration identity: {}",
-                        safe_message(reconciliation_error)
-                    ),
+                    Some(uncertainty) => format!("; cleanup uncertainty: {}", uncertainty.reason),
+                    None => String::new(),
                 };
-                let cleanup_status = rollback_workflow_agents(daemon, &started).await;
+                let cleanup_status = rollback_workflow_agents(daemon, &started).await.describe();
                 return Err(format!(
                     "failed to start workflow role {}: {}; {cleanup_status}{reconciliation_note}",
                     safe_message(&role.role),
-                    safe_message(error)
+                    safe_message(failure.message)
                 ));
             }
         }
     }
 
     let Some((start_pane_id, start_agent_id)) = start_target else {
-        let cleanup_status = rollback_workflow_agents(daemon, &started).await;
+        let cleanup_status = rollback_workflow_agents(daemon, &started).await.describe();
         return Err(format!(
             "validated workflow did not start a coordinator; {cleanup_status}"
         ));
@@ -846,7 +953,7 @@ async fn launch_workflow<D: WorkflowDaemon + Sync>(
     )
     .await
     {
-        let cleanup_status = rollback_workflow_agents(daemon, &started).await;
+        let cleanup_status = rollback_workflow_agents(daemon, &started).await.describe();
         return Err(format!(
             "workflow coordinator context delivery failed: {}; {cleanup_status}",
             safe_message(error)
@@ -855,8 +962,55 @@ async fn launch_workflow<D: WorkflowDaemon + Sync>(
 
     Ok(WorkflowLaunchResult {
         start_agent_id,
-        agent_ids: started,
+        agent_ids: started.into_iter().map(|role| role.agent_id).collect(),
     })
+}
+
+/// After a role's start failed: look the role up by the pane and orchestration
+/// identity the start carried, so a spawn that landed although its reply was
+/// lost — or never arrived, because the start timed out — is added to
+/// `started` and stopped by the rollback like the others.
+///
+/// `Some` is a role this launch cannot vouch for: the lookup itself failed, or
+/// (after a timeout) found nothing although the deck may still spawn the role
+/// once whatever held its reply clears. Either way the rollback will not stop
+/// it, so the caller reports it as cleanup it could not confirm.
+async fn reconcile_failed_start<D: WorkflowDaemon + Sync>(
+    daemon: &D,
+    started: &mut Vec<StartedRole>,
+    pane_id: &str,
+    orchestration_id: &str,
+    role: &str,
+    timed_out: bool,
+) -> Option<UnconfirmedStop> {
+    match daemon
+        .reconcile_workflow_agent(pane_id, orchestration_id, COORDINATOR_DELIVERY_RPC_TIMEOUT)
+        .await
+    {
+        Ok(Some(agent_id)) => {
+            if !started.iter().any(|known| known.agent_id == agent_id) {
+                started.push(StartedRole {
+                    agent_id,
+                    role: role.to_string(),
+                });
+            }
+            None
+        }
+        Ok(None) if !timed_out => None,
+        Ok(None) => Some(UnconfirmedStop {
+            role: role.to_string(),
+            reason: "the deck did not answer the role's start and did not list it afterwards; \
+                     if it starts late it will not be stopped"
+                .to_string(),
+        }),
+        Err(reconciliation_error) => Some(UnconfirmedStop {
+            role: role.to_string(),
+            reason: format!(
+                "could not reconcile the failed role by pane and orchestration identity: {}",
+                safe_message(reconciliation_error)
+            ),
+        }),
+    }
 }
 
 /// What an orchestration launch aimed at a deck that cannot start a role with
@@ -955,8 +1109,7 @@ async fn launch_configured_orchestration<D: WorkflowDaemon + Sync>(
     // Subscribed before the first spawn, for `launch_workflow`'s reason: a fast
     // SessionStart must not be lost between the spawn and the wait.
     let mut readiness = daemon.begin_coordinator_readiness().await?;
-    let mut started: Vec<String> = Vec::with_capacity(prepared.roles.len());
-    let mut started_roles: Vec<&str> = Vec::with_capacity(prepared.roles.len());
+    let mut started: Vec<StartedRole> = Vec::with_capacity(prepared.roles.len());
     let mut start_target = None;
 
     for (role_index, role) in prepared.roles.iter().enumerate() {
@@ -972,69 +1125,74 @@ async fn launch_configured_orchestration<D: WorkflowDaemon + Sync>(
             rows,
             cols,
         );
-        let failure = match daemon.start_configured_role(options, &prepared.token).await {
-            Ok(GatedQuery::Answered(agent_id)) => {
-                if role.start {
-                    start_target = Some((pane_id, agent_id.clone()));
-                }
-                started.push(agent_id);
-                started_roles.push(role.name.as_str());
-                continue;
-            }
-            // Withheld by the client library: nothing reached the deck for this
-            // role, so there is nothing to reconcile.
-            Ok(GatedQuery::Unsupported) => (
-                CONFIGURED_ROLE_COMMAND_UNSUPPORTED.to_string(),
-                String::new(),
-            ),
-            Err(error) => {
-                // A spawn can succeed and lose its reply; reconcile by pane and
-                // orchestration identity so that role is stopped too.
-                let note = match daemon
-                    .reconcile_workflow_agent(
-                        &pane_id,
-                        orchestration_id,
-                        COORDINATOR_DELIVERY_RPC_TIMEOUT,
-                    )
-                    .await
-                {
-                    Ok(Some(agent_id)) => {
-                        if !started.contains(&agent_id) {
-                            started.push(agent_id);
-                        }
-                        String::new()
-                    }
-                    Ok(None) => String::new(),
-                    Err(reconciliation_error) => format!(
-                        "; cleanup uncertainty: could not reconcile the failed role by pane and orchestration identity: {}",
-                        safe_message(reconciliation_error)
-                    ),
-                };
-                (safe_message(error), note)
-            }
-        };
-        let (error, reconciliation_note) = failure;
-        let already = if started_roles.is_empty() {
+        // Every role that had started before this one — named in the error
+        // whatever the rollback then manages, because it is what the user has
+        // to know was touched. Taken before any reconciliation adds the failed
+        // role itself.
+        let already = if started.is_empty() {
             "no role had started".to_string()
         } else {
             format!(
                 "roles already started: {}",
-                started_roles
+                started
                     .iter()
-                    .map(safe_message)
+                    .map(|known| safe_message(&known.role))
                     .collect::<Vec<_>>()
                     .join(", ")
             )
         };
-        let cleanup_status = rollback_workflow_agents(daemon, &started).await;
+        // PRD #1223 audit F4: the whole configured start — the client
+        // library's fresh handshake and the start reply — is one bounded
+        // operation, so a deck that never answers role N cannot hold roles
+        // 1..N-1 running behind it.
+        let (error, uncertain) = match bounded_role_start(
+            daemon.start_configured_role(options, &prepared.token),
+        )
+        .await
+        {
+            Ok(GatedQuery::Answered(agent_id)) => {
+                if role.start {
+                    start_target = Some((pane_id, agent_id.clone()));
+                }
+                started.push(StartedRole {
+                    agent_id,
+                    role: role.name.clone(),
+                });
+                continue;
+            }
+            // Withheld by the client library: nothing reached the deck for this
+            // role, so there is nothing to reconcile.
+            Ok(GatedQuery::Unsupported) => (CONFIGURED_ROLE_COMMAND_UNSUPPORTED.to_string(), None),
+            // A spawn can succeed and lose its reply — or, when the start timed
+            // out, still be pending on the deck; reconcile by pane and
+            // orchestration identity so a role that landed is stopped too.
+            Err(failure) => {
+                let uncertain = reconcile_failed_start(
+                    daemon,
+                    &mut started,
+                    &pane_id,
+                    orchestration_id,
+                    &role.name,
+                    failure.timed_out,
+                )
+                .await;
+                (safe_message(failure.message), uncertain)
+            }
+        };
+        let rollback = rollback_workflow_agents(daemon, &started).await;
+        let reconciliation_note = uncertain
+            .as_ref()
+            .map(|stop| format!("; cleanup uncertainty: {}", stop.reason))
+            .unwrap_or_default();
         return Err(format!(
-            "failed to start orchestration role {}: {error}; {already}; {cleanup_status}{reconciliation_note}",
+            "failed to start orchestration role {}: {error}; {already}; {}{reconciliation_note}",
             safe_message(&role.name),
+            rollback.describe(),
         ));
     }
 
     let Some((start_pane_id, start_agent_id)) = start_target else {
-        let cleanup_status = rollback_workflow_agents(daemon, &started).await;
+        let cleanup_status = rollback_workflow_agents(daemon, &started).await.describe();
         return Err(format!(
             "the orchestration started no coordinator; {cleanup_status}"
         ));
@@ -1042,7 +1200,7 @@ async fn launch_configured_orchestration<D: WorkflowDaemon + Sync>(
     let delivered_by_deck = match daemon.launched_agent_type(&start_agent_id).await {
         Ok(agent_type) => agent_type == Some(AgentType::Pi),
         Err(error) => {
-            let cleanup_status = rollback_workflow_agents(daemon, &started).await;
+            let cleanup_status = rollback_workflow_agents(daemon, &started).await.describe();
             return Err(format!(
                 "could not tell how the coordinator receives its context: {}; {cleanup_status}",
                 safe_message(error)
@@ -1060,7 +1218,7 @@ async fn launch_configured_orchestration<D: WorkflowDaemon + Sync>(
         )
         .await
     {
-        let cleanup_status = rollback_workflow_agents(daemon, &started).await;
+        let cleanup_status = rollback_workflow_agents(daemon, &started).await.describe();
         return Err(format!(
             "orchestration coordinator context delivery failed: {}; {cleanup_status}",
             safe_message(error)
@@ -1069,7 +1227,7 @@ async fn launch_configured_orchestration<D: WorkflowDaemon + Sync>(
 
     Ok(WorkflowLaunchResult {
         start_agent_id,
-        agent_ids: started,
+        agent_ids: started.into_iter().map(|role| role.agent_id).collect(),
     })
 }
 
@@ -1775,11 +1933,14 @@ async fn orchestration_launch_unavailable(
     if let Some(reason) = daemon.connection().project_actions_reason {
         return Ok(Some(reason));
     }
-    let capabilities = daemon
-        .client
-        .capabilities()
-        .await
-        .map_err(|error| safe_message(error.to_string()))?;
+    // Bounded (PRD #1223 audit F4): a handle whose cached set was invalidated
+    // handshakes again here, and the launch that asks cannot be closed while
+    // it waits.
+    let capabilities = crate::daemon_bridge::bounded_reply(
+        "the capability handshake",
+        daemon.client.capabilities(),
+    )
+    .await?;
     Ok(
         (!capabilities.supports(dot_agent_deck::daemon_protocol::CAP_PREPARED_ROLE_COMMAND))
             .then(|| CONFIGURED_ROLE_COMMAND_UNSUPPORTED.to_string()),
@@ -2704,19 +2865,39 @@ async fn start_agent_action(
     };
     let daemon = state.daemon.trusted(scope.endpoint()).await?;
     daemon.require_compatible()?;
+    // PRD #1223 audit F4: bounded like every role start, so the New agent
+    // dialog — which cannot be closed while a start is in flight (audit F5) —
+    // always gets an answer.
     let agent_id = match authoring_kind {
-        None => daemon.client.start_agent(options).await,
-        Some(kind) => match daemon.client.start_authoring_agent(options, kind).await {
-            Ok(GatedQuery::Answered(agent_id)) => Ok(agent_id),
-            Ok(GatedQuery::Unsupported) => return Err(authoring_unsupported_message(kind)),
-            Err(error) => Err(error),
-        },
-    }
-    .map_err(|error| safe_message(error.to_string()))?;
+        None => bounded_plain_start(daemon.client.start_agent(options)).await?,
+        Some(kind) => {
+            match bounded_plain_start(daemon.client.start_authoring_agent(options, kind)).await? {
+                GatedQuery::Answered(agent_id) => agent_id,
+                GatedQuery::Unsupported => return Err(authoring_unsupported_message(kind)),
+            }
+        }
+    };
     if let Some(command) = requested_command.as_deref() {
         state.remember_last_command(&scope.identity(), command);
     }
     Ok(StartedAgent { agent_id, scope })
+}
+
+/// One plain or authoring start under [`WORKFLOW_ROLE_START_TIMEOUT`] (PRD #1223
+/// audit F4). The elapsed case says what it is: the deck may still start the
+/// agent, so the user is told to look before starting a second one.
+async fn bounded_plain_start<T, E: std::fmt::Display>(
+    start: impl std::future::Future<Output = Result<T, E>>,
+) -> Result<T, String> {
+    match tokio::time::timeout(WORKFLOW_ROLE_START_TIMEOUT, start).await {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(error)) => Err(safe_message(error.to_string())),
+        Err(_) => Err(format!(
+            "the deck did not answer the start within {}s; the agent may still appear, so check \
+             the deck before starting it again",
+            WORKFLOW_ROLE_START_TIMEOUT.as_secs()
+        )),
+    }
 }
 
 /// The fields of [`DesktopAction::StartOrchestration`] after its deck id.
@@ -2799,11 +2980,15 @@ async fn start_orchestration_action(
     if let Some(reason) = orchestration_launch_unavailable(&daemon).await? {
         return Err(reason);
     }
-    let prepared = daemon
-        .client
-        .prepare_workflow(&path, &orchestration, "", config_revision.as_deref())
-        .await
-        .map_err(|error| safe_message(error.to_string()))?;
+    // Bounded (PRD #1223 audit F4) for `bounded_plain_start`'s reason: the
+    // dialog waiting on this launch cannot be closed while it is in flight.
+    let prepared = crate::daemon_bridge::bounded_reply(
+        "PrepareWorkflow",
+        daemon
+            .client
+            .prepare_workflow(&path, &orchestration, "", config_revision.as_deref()),
+    )
+    .await?;
     // Both are `#[serde(default)]` on the reply, and neither may be invented
     // here — see `prepare_workflow_launch`.
     if prepared.path.is_empty() {
@@ -4754,6 +4939,15 @@ mod tests {
         /// resolved type), and the ids it was asked about.
         launched_type: Mutex<Option<AgentType>>,
         launched_type_queries: Mutex<Vec<String>>,
+        /// PRD #1223 audit F4: the starts (by position, from 0) the deck
+        /// records — the spawn happened — and then never answers.
+        start_hangs: Mutex<HashSet<usize>>,
+        /// Every stop asked for, answered or not; `stopped` is only the ones
+        /// that were confirmed.
+        stop_attempts: Mutex<Vec<String>>,
+        /// Stops the deck never answers, and stops it refuses, by agent id.
+        stop_hangs: Mutex<HashSet<String>>,
+        stop_errors: Mutex<HashMap<String, String>>,
     }
 
     impl FakeWorkflowDaemon {
@@ -4787,6 +4981,10 @@ mod tests {
                 configured_unsupported: AtomicBool::new(false),
                 launched_type: Mutex::new(None),
                 launched_type_queries: Mutex::new(Vec::new()),
+                start_hangs: Mutex::new(HashSet::new()),
+                stop_attempts: Mutex::new(Vec::new()),
+                stop_hangs: Mutex::new(HashSet::new()),
+                stop_errors: Mutex::new(HashMap::new()),
             }
         }
 
@@ -4832,9 +5030,16 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(prep_token.map(str::to_string));
-            let mut started = self.started.lock().unwrap();
-            let agent_id = format!("agent-{}", started.len());
-            started.push(options);
+            let (index, agent_id) = {
+                let mut started = self.started.lock().unwrap();
+                let index = started.len();
+                started.push(options);
+                (index, format!("agent-{index}"))
+            };
+            let hangs = self.start_hangs.lock().unwrap().contains(&index);
+            if hangs {
+                std::future::pending::<()>().await;
+            }
             self.start_results
                 .lock()
                 .unwrap()
@@ -4864,6 +5069,18 @@ mod tests {
         }
 
         async fn stop_workflow_agent(&self, agent_id: &str) -> Result<(), String> {
+            self.stop_attempts
+                .lock()
+                .unwrap()
+                .push(agent_id.to_string());
+            let hangs = self.stop_hangs.lock().unwrap().contains(agent_id);
+            if hangs {
+                std::future::pending::<()>().await;
+            }
+            let refusal = self.stop_errors.lock().unwrap().get(agent_id).cloned();
+            if let Some(refusal) = refusal {
+                return Err(refusal);
+            }
             self.stopped.lock().unwrap().push(agent_id.to_string());
             Ok(())
         }
@@ -5781,6 +5998,207 @@ command = "configured-planner"
         assert!(daemon.started.lock().unwrap().is_empty());
         assert!(daemon.stopped.lock().unwrap().is_empty());
         assert!(daemon.submissions.lock().unwrap().is_empty());
+    }
+
+    /// A preparation with `names.len()` roles, the first the start role.
+    fn prepared_with_roles(names: &[&str]) -> PreparedWorkflow {
+        PreparedWorkflow {
+            roles: names
+                .iter()
+                .enumerate()
+                .map(|(index, name)| config_role(name, index == 0))
+                .collect(),
+            ..prepared_workflow()
+        }
+    }
+
+    /// Scenario (PRD #1223 audit F4): the deck spawns the second role and then
+    /// never answers its start. The launch stops waiting at the start bound —
+    /// on tokio's paused clock, so the fifteen seconds cost none of the test's
+    /// wall clock — reconciles the pane, finds the role that landed, and stops
+    /// it along with the one already running.
+    #[tokio::test(start_paused = true)]
+    async fn a_configured_launch_bounds_a_start_the_deck_never_answers_and_stops_what_landed() {
+        let daemon = FakeWorkflowDaemon::new(Ok(None), [], Ok(SendResult::Applied));
+        daemon.start_hangs.lock().unwrap().insert(1);
+        daemon
+            .reconciliation_results
+            .lock()
+            .unwrap()
+            .push_back(Ok(Some("agent-1".to_string())));
+        let began = tokio::time::Instant::now();
+
+        let error = launch_configured_orchestration(
+            &daemon,
+            "loop",
+            Some("run"),
+            &prepared_workflow(),
+            32,
+            120,
+            "orchestration-wedged-start",
+        )
+        .await
+        .expect_err("a start the deck never answers fails the launch");
+
+        assert_eq!(
+            began.elapsed(),
+            WORKFLOW_ROLE_START_TIMEOUT,
+            "the start bound is what ended the wait"
+        );
+        assert!(
+            error.contains("failed to start orchestration role builder: the deck did not answer the start within 15s"),
+            "{error}"
+        );
+        assert!(error.contains("roles already started: planner"), "{error}");
+        assert!(
+            error.contains("stopped 2 already-started role(s)"),
+            "{error}"
+        );
+        assert!(!error.contains("cleanup uncertainty"), "{error}");
+        assert_eq!(
+            *daemon.stopped.lock().unwrap(),
+            ["agent-1", "agent-0"],
+            "the role that landed without a reply is stopped too, newest first"
+        );
+        assert_eq!(daemon.reconciliation_requests.lock().unwrap().len(), 1);
+        assert!(daemon.submissions.lock().unwrap().is_empty());
+    }
+
+    /// Scenario (PRD #1223 audit F4): the same wedged start, but the deck does
+    /// not list the role afterwards. It may still spawn it once whatever held
+    /// the reply clears, so the launch says it cannot vouch for that role
+    /// rather than reporting a clean rollback.
+    #[tokio::test(start_paused = true)]
+    async fn a_configured_launch_reports_a_timed_out_start_it_cannot_find() {
+        let daemon = FakeWorkflowDaemon::new(Ok(None), [], Ok(SendResult::Applied));
+        daemon.start_hangs.lock().unwrap().insert(1);
+
+        let error = launch_configured_orchestration(
+            &daemon,
+            "loop",
+            Some("run"),
+            &prepared_workflow(),
+            32,
+            120,
+            "orchestration-unlisted",
+        )
+        .await
+        .expect_err("a start the deck never answers fails the launch");
+
+        assert!(
+            error.contains("stopped 1 already-started role(s)"),
+            "{error}"
+        );
+        assert!(
+            error.contains("cleanup uncertainty: the deck did not answer the role's start"),
+            "{error}"
+        );
+        assert!(
+            error.contains("if it starts late it will not be stopped"),
+            "{error}"
+        );
+        assert_eq!(*daemon.stopped.lock().unwrap(), ["agent-0"]);
+    }
+
+    /// Scenario (PRD #1223 audit F4): the fourth role is refused, and of the
+    /// three rollback stops the newest is never answered, the middle one is
+    /// confirmed and the oldest is refused. Each stop is bounded on its own,
+    /// so the rollback reaches all three instead of waiting behind the first,
+    /// and the error names EVERY role whose stop it could not confirm.
+    #[tokio::test(start_paused = true)]
+    async fn a_rollback_bounds_each_stop_and_names_every_role_it_could_not_confirm() {
+        let daemon = FakeWorkflowDaemon::new(Ok(None), [], Ok(SendResult::Applied));
+        daemon.start_results.lock().unwrap().extend([
+            Ok("agent-0".to_string()),
+            Ok("agent-1".to_string()),
+            Ok("agent-2".to_string()),
+            Err("tester refused".to_string()),
+        ]);
+        daemon
+            .stop_hangs
+            .lock()
+            .unwrap()
+            .insert("agent-2".to_string());
+        daemon
+            .stop_errors
+            .lock()
+            .unwrap()
+            .insert("agent-0".to_string(), "stop refused".to_string());
+        let began = tokio::time::Instant::now();
+
+        let error = launch_configured_orchestration(
+            &daemon,
+            "loop",
+            Some("run"),
+            &prepared_with_roles(&["planner", "builder", "reviewer", "tester"]),
+            32,
+            120,
+            "orchestration-wedged-stop",
+        )
+        .await
+        .expect_err("a refused role fails the launch");
+
+        assert_eq!(
+            *daemon.stop_attempts.lock().unwrap(),
+            ["agent-2", "agent-1", "agent-0"],
+            "every started role is asked to stop, newest first, past the wedged one"
+        );
+        assert_eq!(*daemon.stopped.lock().unwrap(), ["agent-1"]);
+        assert_eq!(
+            began.elapsed(),
+            WORKFLOW_ROLE_STOP_TIMEOUT,
+            "one wedged stop costs one stop bound, not the rollback"
+        );
+        assert!(
+            error.contains("cleanup could not confirm stop for 2 of 3 already-started role(s)"),
+            "{error}"
+        );
+        assert!(
+            error.contains("reviewer (agent-2: the deck did not answer the stop within 15s)"),
+            "{error}"
+        );
+        assert!(error.contains("planner (agent-0: stop refused)"), "{error}");
+    }
+
+    /// Scenario (PRD #1223 audit F4): the Runs launch shares the rollback, and
+    /// its starts are bounded the same way — a second role the deck never
+    /// answers ends the launch at the start bound and the first is stopped.
+    #[tokio::test(start_paused = true)]
+    async fn a_runs_launch_bounds_a_start_the_deck_never_answers() {
+        let daemon = FakeWorkflowDaemon::new(
+            Ok(Some("unused-session")),
+            std::iter::empty(),
+            Ok(SendResult::Applied),
+        );
+        daemon.start_hangs.lock().unwrap().insert(1);
+
+        let error = launch_workflow(
+            &daemon,
+            "loop",
+            "/tmp/project",
+            &launch_roles("claude"),
+            32,
+            120,
+            "orchestration-1",
+            "coordinator prompt",
+            Some("prep-token-1"),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            error.contains("failed to start workflow role builder: the deck did not answer the start within 15s"),
+            "{error}"
+        );
+        assert!(
+            error.contains("stopped 1 already-started role(s)"),
+            "{error}"
+        );
+        assert!(
+            error.contains("if it starts late it will not be stopped"),
+            "{error}"
+        );
+        assert_eq!(*daemon.stopped.lock().unwrap(), ["agent-0"]);
     }
 
     #[test]
