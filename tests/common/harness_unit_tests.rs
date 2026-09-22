@@ -4931,8 +4931,8 @@ fn the_returned_column_counts_characters_not_bytes() {
 /// alone, not multiply it by [`MAX_LOAD_FACTOR`].
 ///
 /// This is the whole reason `load_factor` is split out of `load_scaled`. On
-/// Linux `machine_load_per_cpu` never returns `None`, so the branch that every
-/// macOS and Windows run takes is unreachable through the public entry point
+/// Linux and macOS `machine_load_per_cpu` does not return `None` in practice, so
+/// the branch that every Windows run takes is unreachable through the public entry point
 /// here — the case has to be driven directly or it is not covered at all,
 /// which is how a 6x-on-every-macOS-run regression sat unnoticed.
 #[test]
@@ -4950,6 +4950,22 @@ fn unmeasurable_load_leaves_the_base_unscaled() {
         base,
         "an unmeasurable load must return the base identically, so a macOS \
          contributor's 30s wait stays 30s rather than becoming 180s"
+    );
+}
+
+/// PR #1238: on the two platforms that publish a load average cheaply, the
+/// measurement must actually come back. macOS used to return `None` here on the
+/// false belief that `libc` did not expose `getloadavg`, which silently left
+/// every #709 ceiling unscaled on `build-macos` until `idle_worker_010` starved
+/// against a flat 8 s. `build-macos` runs this, so a regression is red there
+/// rather than a flake.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn load_is_measurable_on_linux_and_macos() {
+    let load = machine_load_per_cpu();
+    assert!(
+        load.is_some_and(|l| l.is_finite() && l >= 0.0),
+        "machine_load_per_cpu() must measure the load on this platform, got {load:?}"
     );
 }
 
