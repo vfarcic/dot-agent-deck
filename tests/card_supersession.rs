@@ -1153,3 +1153,52 @@ fn status_supersede_017_the_reconnect_overlay_changes_no_newest_wins_pick() {
         tui.sessions[&seeded_key()].last_activity
     );
 }
+
+/// Scenario: A TUI reconnects to a daemon whose agent reported a stamp an hour in the future, and seeds its card from that snapshot. A different agent then takes the pane and reports a minute after the reconnect. The card must not import the future stamp, so that honest successor still retires it; imported, the stamp would pin the stale card against every successor until the wall clock caught up, because the daemon's registry-ownership ground has no counterpart in a client.
+#[spec("status/supersede/018")]
+#[test]
+fn status_supersede_018_a_future_stamped_snapshot_cannot_pin_the_reconnected_card() {
+    let future = whole_ms(Duration::hours(1));
+    let snapshot = SessionSnapshot {
+        status: SessionStatus::Working,
+        agent_type: Some(AgentType::Pi),
+        active_tool: None,
+        tool_count: 7,
+        first_prompts: Vec::new(),
+        last_user_prompt: None,
+        live_target: Some(history_only()),
+        last_activity_ms: Some(future.timestamp_millis()),
+    };
+    let mut tui = AppState::default();
+    let before_seed = Utc::now();
+    reconnect(&mut tui, Some(&snapshot));
+    let after_seed = Utc::now();
+
+    let seeded = tui.sessions[&seeded_key()].last_activity;
+    assert!(
+        seeded >= before_seed && seeded <= after_seed,
+        "a snapshot stamped in the future must leave the freshly minted value, got {seeded}"
+    );
+
+    tui.apply_event(event(
+        "successor-session",
+        AgentType::Pi,
+        EventType::Thinking,
+        Some("successor-agent"),
+        after_seed + Duration::minutes(1),
+    ));
+    assert!(
+        !tui.sessions.contains_key(&seeded_key()),
+        "an honest successor's frame must still retire the reconnected card"
+    );
+    assert_eq!(
+        owner_of(&tui, tui.pane_session_id(PANE_ID)).as_deref(),
+        Some("successor-agent"),
+        "pane_session_id must follow the successor, not a card pinned by a future stamp"
+    );
+    assert_eq!(
+        tui.pane_writable(PANE_ID),
+        Writable::Live,
+        "pane_writable must follow the successor, not the pinned history-only card"
+    );
+}

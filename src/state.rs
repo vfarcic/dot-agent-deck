@@ -7013,35 +7013,44 @@ impl AppState {
     /// overwrites it. The placeholder's own `Utc::now()` is not on that list.
     /// Nothing observed it, and comparing against it would make the overlay a
     /// no-op, since a snapshot of past activity is never newer than the present.
-    /// The snapshot's instant is taken only when BOTH it and the freshly minted
-    /// value are strictly newer than all of that evidence. Otherwise the minted
-    /// value stands, which is exactly what this function did before #804. What
-    /// the rule buys, each by construction:
+    /// The snapshot's instant is taken only when it is strictly newer than all
+    /// of that evidence AND no later than the freshly minted value. Otherwise
+    /// the minted value stands, which is exactly what this function did before
+    /// #804. What the rule buys, each by construction:
     ///
     /// - **No newest-wins pick changes.** The overlay applies only where the
-    ///   minted card already beat every competitor, and it keeps the card
-    ///   strictly above them. So each pick that chose this card still does, and
-    ///   no new tie arises for hash order or the join's `session_id` tiebreak to
+    ///   snapshot's instant beats every competitor, and so does the minted value
+    ///   it may not exceed. So each pick that chose this card still does, and no
+    ///   new tie arises for hash order or the join's `session_id` tiebreak to
     ///   settle. A competitor with a future stamp that already beat the minted
     ///   card keeps beating it (`status/supersede/017`).
+    /// - **A future stamp is never imported.** The value is producer-supplied
+    ///   and unclamped (see [`SessionSnapshot::last_activity_ms`]), so the daemon
+    ///   can hold one no honest successor's frame will exceed. The daemon can
+    ///   afford to: its registry ground ([`Self::generation_disowned`]) retires
+    ///   a disowned generation whatever the stamps say. A client state has no
+    ///   registry to consult, so an imported future stamp would pin this card
+    ///   against every successor until the wall clock caught up
+    ///   (`status/supersede/018`). The minted value is kept instead, which also
+    ///   renders the same `Last:` readout, since `format_elapsed` shows `0s` for
+    ///   both.
     /// - **The card's evidence never moves backward.** A re-seed from a snapshot
     ///   older than a frame the card has since seen keeps the newer value. That
     ///   is the high-water mark [`Self::apply_event`] maintains (PRD #284,
     ///   `status/supersede/004`).
     /// - **Later supersession is weighed against the daemon's own bar.** In a
-    ///   state that holds nothing else for this pane or agent, the card carries
-    ///   the daemon's high-water mark. So `supersedes_generation`'s timestamp
-    ///   ground reaches the same verdict on a frame here as on the daemon
-    ///   (`status/supersede/016`), where a minted `now` protected the card from
-    ///   every frame stamped before the reconnect. Its registry ground
-    ///   ([`Self::generation_disowned`]) needs an ownership oracle, which a
-    ///   client state does not have, and is untouched by this. The desktop
-    ///   builds a fresh fold per reply (`AgentView::install`). The TUI seeds a
-    ///   fresh state too, unless an event for this pane or agent reached it
-    ///   first, which can happen because its event subscriber starts before
-    ///   hydration. The match holds to the millisecond the wire carries: a
-    ///   frame stamped within the same millisecond as, but before, the daemon's
-    ///   instant is judged against the truncated value here.
+    ///   state that holds nothing else for this pane or agent, and for a stamp
+    ///   that is not in the future, the card carries the daemon's high-water
+    ///   mark. So `supersedes_generation`'s timestamp ground reaches the same
+    ///   verdict on a frame here as on the daemon (`status/supersede/016`),
+    ///   where a minted `now` protected the card from every frame stamped
+    ///   before the reconnect. The desktop builds a fresh fold per reply
+    ///   (`AgentView::install`). The TUI seeds a fresh state too, unless an
+    ///   event for this pane or agent reached it first, which can happen
+    ///   because its event subscriber starts before hydration. The match holds
+    ///   to the millisecond the wire carries: a frame stamped within the same
+    ///   millisecond as, but before, the daemon's instant is judged against the
+    ///   truncated value here.
     ///
     /// An absent value (an older daemon predating PRD #745 M9), or one no
     /// `DateTime` can hold, keeps the minted value. That is the pre-#804
@@ -7098,8 +7107,8 @@ impl AppState {
                 if let Some(observed) = snap
                     .last_activity_ms
                     .and_then(DateTime::<Utc>::from_timestamp_millis)
-                    && held_evidence
-                        .is_none_or(|held| observed > held && session.last_activity > held)
+                    && observed <= session.last_activity
+                    && held_evidence.is_none_or(|held| observed > held)
                 {
                     session.last_activity = observed;
                 }
