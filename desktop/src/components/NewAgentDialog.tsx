@@ -3,6 +3,7 @@ import { ArrowLeft, ArrowUp, Check, Folder, FolderGit2, Loader2, Plus, X } from 
 import { LaunchCleanupError } from "../lib/actionError";
 import { CleanupWarning } from "./CleanupWarning";
 import { DISPLAY_LIMITS, displayText } from "../lib/displayText";
+import { useInertBackground } from "../hooks/useInertBackground";
 import {
   ambiguousOrchestrationReason,
   AUTHORING_MODES,
@@ -577,6 +578,36 @@ export function NewAgentDialog({ runtime, initialDeckId, onClose, onAppeared, on
     return () => window.clearTimeout(timer);
   }, [appearTimeoutMs, awaiting]);
 
+  /**
+   * `aria-modal="true"` below made true, the way the agent pane makes it true.
+   *
+   * The attribute says the rest of the interface is unavailable; without this
+   * it was not. The overview stays mounted behind the backdrop, so Tab walked
+   * straight out of the dialog and into it — the deck groups, the column
+   * picker, Refresh, and the New agent button that opened this — and nothing
+   * gave focus back to that button on the way out. `useInertBackground` is
+   * PRD #1105's answer to exactly that on the agent pane, so this reuses it
+   * rather than forking a second, keyboard-only trap beside it: it marks every
+   * element that is not an ancestor of this dialog `inert`, which takes the
+   * background out of the tab order AND out of hit testing, moves focus inside,
+   * and restores it to the opener on close. See that hook for why it walks
+   * siblings, and for the one exemption — the voice surface is a peer of a
+   * dialog rather than background, and stays reachable here as it does over a
+   * pane.
+   *
+   * The literal `true`: this component is mounted only while the flow is open
+   * (`AgentOverview` renders it behind `newAgent &&`), so "open" is its whole
+   * lifetime and closing is an unmount. The hook's restore runs from the
+   * effect cleanup, which an unmount runs too.
+   *
+   * Declared BEFORE the per-step focus effects below on purpose. Effects run in
+   * declaration order, and the hook captures the opener in the first of its
+   * own: called after these, it would capture whichever control the step had
+   * just focused and hand focus back to an element of this dialog's that is
+   * about to be unmounted.
+   */
+  const dialogRef = useInertBackground<HTMLElement>(true);
+
   // -- focus: each step opens with its main control focused -------------------
   useEffect(() => {
     if (step === "deck") deckListRef.current?.focus();
@@ -962,7 +993,17 @@ export function NewAgentDialog({ runtime, initialDeckId, onClose, onAppeared, on
             <p>{displayText(formError, DISPLAY_LIMITS.detail)}</p>
           </details>
         )}
-        {starting && <p className="new-agent-hint" data-testid="new-agent-starting"><Loader2 className="spin" size={12} /> {STARTING_CLOSE_BLOCKED}</p>}
+        {/*
+            `role="status"`, because in this one phase there is nothing left to
+            read it off. Audit F5 blocks every close route while a start is in
+            flight by DISABLING the controls — Cancel, the header's close
+            button, Back, Start and the fields all at once — and a disabled
+            button is neither focusable nor announced, so Cancel's `title`
+            explaining the block is invisible to a screen reader. Focus falls
+            back to the dialog itself (see `tabIndex` below), and this is what
+            tells a listener why nothing answers.
+        */}
+        {starting && <p className="new-agent-hint" role="status" data-testid="new-agent-starting"><Loader2 className="spin" size={12} /> {STARTING_CLOSE_BLOCKED}</p>}
         {phase === "waiting" && <p className="new-agent-hint" data-testid="new-agent-waiting"><Loader2 className="spin" size={12} /> Started. Waiting for the deck to list it…</p>}
       </form>
     );
@@ -980,12 +1021,19 @@ export function NewAgentDialog({ runtime, initialDeckId, onClose, onAppeared, on
   return (
     <div className="dialog-backdrop" role="presentation" data-testid="new-agent-backdrop" onMouseDown={requestClose}>
       <section
+        ref={dialogRef}
         className="new-agent-dialog"
         role="dialog"
         aria-modal="true"
         aria-labelledby={titleId}
         data-testid="new-agent-dialog"
         data-step={step}
+        /* A focus TARGET, never a tab stop, as on the agent pane: the hook puts
+           focus here when it opens over a control that had it, and Tab then
+           proceeds into the dialog's own controls. It is also where focus lands
+           while a start is in flight, when every control inside is disabled and
+           there is nothing else for it to hold. */
+        tabIndex={-1}
         onMouseDown={(event) => event.stopPropagation()}
         onKeyDown={onDialogKeyDown}
       >

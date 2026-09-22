@@ -275,4 +275,74 @@ test.describe("the New agent flow", () => {
     await page.keyboard.press("Enter");
     await expect(page.getByTestId("new-agent-dir")).toHaveText("/srv/checkouts/repo");
   });
+
+  /**
+   * `aria-modal="true"` made true for this dialog, in the only tier that can
+   * tell — the sibling of `agent-pane-modal.spec.ts`, which says the same for
+   * the pane and explains why the claim is a security one there.
+   *
+   * Greptile's review of PR #1235 found the dialog declaring itself modal while
+   * Tab still walked into the overview behind it, and nothing giving focus back
+   * to the button that opened it. The fix reuses `useInertBackground` rather
+   * than adding a keyboard-only trap, so the vitest tier can assert that the
+   * marking happens and can assert nothing about what `inert` DOES: jsdom
+   * implements no focus semantics for it. Both directions are pressed here,
+   * because a trap that contains Tab and leaks Shift+Tab is still a leak.
+   *
+   * The Voice trigger is allowed by identity for the pane spec's reason: it is
+   * a peer surface rather than background, so the hook exempts it, and the
+   * exemption is inherited here rather than re-decided.
+   *
+   * Scenario: open New agent from the overview's top bar, then press Tab
+   * fifteen times and Shift+Tab fifteen times. Focus never lands on a control
+   * outside the dialog except that one trigger — not the column picker, not
+   * Refresh, not a deck group's own New agent — the overview behind is inert
+   * rather than merely unfocused, and Esc gives the screen back and returns
+   * focus to the button that opened the dialog.
+   */
+  test("contains Tab inside the dialog and gives focus back to its opener", async ({ page }) => {
+    await openOverview(page, "fleet");
+
+    const opener = page.getByTestId("overview-new-agent");
+    const refresh = page.getByTestId("overview-refresh");
+    await expect(refresh).toBeVisible();
+    expect(await refresh.evaluate((node) => node.closest("[inert]") !== null)).toBe(false);
+
+    await opener.click();
+    const flow = page.getByTestId("new-agent-dialog");
+    await expect(flow).toBeVisible();
+    expect(await flow.evaluate((node) => node.contains(document.activeElement))).toBe(true);
+
+    const voiceTrigger = page.getByTestId("voice-trigger");
+    await expect(voiceTrigger).toBeVisible();
+
+    const escaped = async () => flow.evaluate((node) => {
+      const active = document.activeElement;
+      // `<body>` is where a browser parks focus when it wraps past the last tab
+      // stop, and it is not a control — only a real element outside the dialog
+      // would be an escape.
+      if (active === null || active === document.body || node.contains(active)) return null;
+      if (active.getAttribute("data-testid") === "voice-trigger") return null;
+      return active.getAttribute("data-testid") ?? active.tagName;
+    });
+
+    for (let press = 0; press < 15; press += 1) {
+      await page.keyboard.press("Tab");
+      expect(await escaped(), `Tab #${press + 1} left the dialog`).toBeNull();
+    }
+    for (let press = 0; press < 15; press += 1) {
+      await page.keyboard.press("Shift+Tab");
+      expect(await escaped(), `Shift+Tab #${press + 1} left the dialog`).toBeNull();
+    }
+
+    // Not merely unfocused: inert takes the background out of hit testing too,
+    // so the overview cannot be clicked through the backdrop either.
+    expect(await refresh.evaluate((node) => node.closest("[inert]") !== null)).toBe(true);
+    expect(await voiceTrigger.evaluate((node) => node.closest("[inert]") !== null)).toBe(false);
+
+    await page.keyboard.press("Escape");
+    await expect(flow).toHaveCount(0);
+    expect(await refresh.evaluate((node) => node.closest("[inert]") !== null)).toBe(false);
+    await expect(opener).toBeFocused();
+  });
 });

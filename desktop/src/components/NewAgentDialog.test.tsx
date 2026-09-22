@@ -640,6 +640,48 @@ describe("New agent dialog — a start in flight (PRD #1223 audit F5)", () => {
   });
 
   /**
+   * Scenario (Greptile's review of PR #1235): press Start and let the deck hold
+   * its answer. Every control in the dialog is disabled at once, so no tab stop
+   * is left inside it and none outside either — the background is inert — and
+   * the dialog itself is the focus target that is left. The sentence explaining
+   * why nothing answers is a live region, which is the only way a screen reader
+   * learns it: a disabled Cancel announces neither itself nor the `title` that
+   * carries the same explanation for a sighted user.
+   *
+   * **What this tier proves is the markup, not the focus outcome.** Measured by
+   * disabling the hook: this test still passes without it, because jsdom does
+   * not blur an element that becomes disabled, so focus simply stays on the
+   * Start button that was pressed. In a real engine that button is blurred and
+   * `useInertBackground` — which re-marks on every commit and moves focus back
+   * inside when it has left — is what stops focus landing on `<body>` behind an
+   * inert screen. The assertion below is therefore that focus is still in the
+   * dialog, which holds in both, and the fence itself is pinned where it is
+   * observable: `AgentOverviewNewAgent.test.tsx` for the marking, and
+   * `desktop/e2e/new-agent.spec.ts` for what the marking does.
+   */
+  it("keeps focus and an announcement in the dialog while every control is disabled", async () => {
+    const held = heldStart();
+    const runtime = fakeRuntime({ runAction: held.runAction });
+    renderDialog(runtime);
+    await reachForm();
+
+    fireEvent.click(screen.getByTestId("new-agent-start"));
+    const starting = await screen.findByTestId("new-agent-starting");
+    expect(starting).toHaveAttribute("role", "status");
+
+    const flow = screen.getByTestId("new-agent-dialog");
+    const focusable = Array.from(flow.querySelectorAll<HTMLElement>("button, input, select, textarea"));
+    expect(focusable.length).toBeGreaterThan(0);
+    expect(focusable.every((control) => control.hasAttribute("disabled"))).toBe(true);
+    expect(flow).toHaveAttribute("tabindex", "-1");
+    expect(flow.contains(document.activeElement)).toBe(true);
+
+    await act(async () => held.settle().reject(new Error("the deck did not answer the start within 15s")));
+    await screen.findByTestId("new-agent-error");
+    expect(screen.getByTestId("new-agent-cancel")).toBeEnabled();
+  });
+
+  /**
    * Scenario: the overview drops the dialog for its own reasons while an
    * orchestration launch is in flight, and the launch then fails with roles
    * it could not confirm stopped. The runtime has already filed that failure

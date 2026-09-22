@@ -132,6 +132,47 @@ describe("the overview's New agent entry points (PRD #1223 M4)", () => {
 
     expect(highlightedDeck()).toBe(FIXTURE_DAEMON_ID);
   });
+
+  /** Everything focusable that is neither inside the dialog nor under an `inert`. */
+  function reachableOutside(flow: HTMLElement): Element[] {
+    const candidates = document.querySelectorAll("button, a[href], input, select, textarea, [tabindex]");
+    return Array.from(candidates).filter((element) => !flow.contains(element) && !element.closest("[inert]"));
+  }
+
+  /**
+   * Scenario (Greptile's review of PR #1235): open the flow from the top bar
+   * with that button focused. Every control of the overview behind it is inert
+   * — so Tab cannot walk out into the deck groups or the column picker the way
+   * it could — focus is inside the dialog, and closing with Esc gives the
+   * screen back and puts focus on the button that opened it.
+   *
+   * This tier can assert that the marking happens and that focus moves; what
+   * the `inert` attribute DOES to a tab order is unobservable here, because
+   * jsdom implements no focus semantics for it (see `useInertBackground`). That
+   * half is pinned in `desktop/e2e/new-agent.spec.ts`, against a real engine.
+   */
+  it("fences the overview behind the flow and gives focus back to the opener", () => {
+    render(<AgentOverview runtime={runtime()} onNavigate={vi.fn()} />);
+    const opener = screen.getByTestId("overview-new-agent");
+    expect(opener.closest("[inert]")).toBeNull();
+    // A real click focuses the button it presses; `fireEvent.click` does not,
+    // and the opener is the thing under test here.
+    opener.focus();
+    fireEvent.click(opener);
+
+    const flow = screen.getByTestId("new-agent-dialog");
+    expect(opener.closest("[inert]")).not.toBeNull();
+    // Equality to the empty set rather than a spot check: any control left
+    // reachable behind a dialog that calls itself modal is the regression.
+    expect(reachableOutside(flow)).toEqual([]);
+    expect(flow.contains(document.activeElement)).toBe(true);
+
+    fireEvent.keyDown(flow, { key: "Escape" });
+
+    expect(dialog()).toBeNull();
+    expect(document.querySelectorAll("[inert]")).toHaveLength(0);
+    expect(document.activeElement).toBe(opener);
+  });
 });
 
 describe("the overview after a New agent start (PRD #1223 M5)", () => {
