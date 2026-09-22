@@ -863,6 +863,169 @@ pub(crate) fn map_resolved_project(project: ResolvedProject) -> DesktopResolvedP
     }
 }
 
+// ---------------------------------------------------------------------------
+// PRD #1223 M4 — the New agent dialog's two deck-targeted queries.
+//
+// Both answer about ONE named deck, and both can be answered "this deck cannot"
+// — a deck that predates the verb — which is a state the dialog degrades on
+// rather than an error, so it is a variant here rather than an `Err`. The
+// shapes follow the project DTOs above: every path is carried **verbatim**,
+// because it is what goes back to the daemon, and has a scrubbed display twin
+// beside it where it is rendered.
+// ---------------------------------------------------------------------------
+
+/// One directory of a deck's filesystem as that deck listed it, or the deck's
+/// answer that it has no listing verb.
+#[derive(Debug, Clone, Serialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
+pub enum DesktopDirectoryListing {
+    Listing {
+        /// The daemon's canonical spelling of the directory, **byte for
+        /// byte** — for a typed path, what the flow carries from here on.
+        path: String,
+        /// `path` made safe to render. Never sent anywhere.
+        display_path: String,
+        /// The parent's canonical path as the daemon computed it, which is
+        /// what "up" sends. The webview never derives one by trimming `path`.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        parent: Option<String>,
+        entries: Vec<DesktopDirectoryEntry>,
+        /// The daemon's entry cap or time budget cut the listing short.
+        truncated: bool,
+    },
+    /// The deck does not advertise `list-directories` — a deck older than PRD
+    /// #1223. The dialog falls back to a typed path.
+    Unsupported,
+}
+
+/// One subdirectory in a [`DesktopDirectoryListing`].
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DesktopDirectoryEntry {
+    /// The canonical path the daemon joined, **verbatim**: the string entering
+    /// this directory sends back.
+    pub path: String,
+    /// The entry's name, made safe to render. Display-only.
+    pub display_name: String,
+    /// It holds a `.dot-agent-deck.toml` the daemon's project reader would open.
+    pub is_project: bool,
+}
+
+impl DesktopDirectoryListing {
+    /// The listing variant, built from the daemon reply's parts.
+    ///
+    /// Takes parts rather than the root crate's reply type because the desktop
+    /// may not name that module: `xtask/linkage-check`'s check 12 bounds which
+    /// root modules the production desktop reaches across, and the module that
+    /// owns the reply also owns a filesystem listing a client must never run.
+    pub(crate) fn listing(
+        path: String,
+        parent: Option<String>,
+        entries: impl IntoIterator<Item = (String, String, bool)>,
+        truncated: bool,
+    ) -> Self {
+        Self::Listing {
+            display_path: display_only(&path),
+            path,
+            parent,
+            entries: entries
+                .into_iter()
+                .map(|(name, path, is_project)| DesktopDirectoryEntry {
+                    path,
+                    display_name: display_only(&name),
+                    is_project,
+                })
+                .collect(),
+            truncated,
+        }
+    }
+}
+
+/// What the New agent form needs to know about one deck, or the deck's answer
+/// that it cannot say.
+#[derive(Debug, Clone, Serialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
+pub enum DesktopNewAgentOptions {
+    /// The deck answered `new-agent-options` about itself.
+    Deck {
+        /// The deck host's configured `default_command`, **verbatim** — it is
+        /// the Command field's first prefill and goes back on the start.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        default_command: Option<String>,
+        /// The agent registry the DECK was built with, in its order.
+        agents: Vec<DesktopAgentOption>,
+        /// The deck's own experimental flag.
+        experimental: bool,
+        /// The authoring kinds the deck can compose a seed for.
+        authoring_kinds: Vec<String>,
+        /// The command this app last started a plain agent with on this deck.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        last_command: Option<String>,
+    },
+    /// The deck does not advertise `new-agent-options` — a deck older than PRD
+    /// #1223 — so nothing here comes from it.
+    Unsupported {
+        /// The agent registry compiled into THIS app, which is the only one
+        /// left to offer and is labelled as such by the form.
+        desktop_agents: Vec<DesktopAgentOption>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        last_command: Option<String>,
+    },
+}
+
+/// One entry of an agent registry, for the form's Agent picker.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DesktopAgentOption {
+    /// The registry's stable key (`claude`, `opencode`, …), verbatim.
+    pub id: String,
+    /// The registry's label, made safe to render.
+    pub display_name: String,
+    /// What choosing this agent writes into Command, **verbatim**.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_command: Option<String>,
+}
+
+impl DesktopAgentOption {
+    pub(crate) fn new(id: String, display_name: &str, default_command: Option<String>) -> Self {
+        Self {
+            id,
+            display_name: display_only(display_name),
+            default_command,
+        }
+    }
+}
+
+/// The agent registry compiled into this app, projected the way a deck
+/// projects its own for `new-agent-options`: each entry's first
+/// `detect_basenames` value as the id, its label, its default command, in
+/// registry order — and an entry with no basename left out rather than given an
+/// invented id.
+///
+/// This is the older-deck fallback's list and nothing else. A deck that answers
+/// the query supplies its own, because the agents a spawn can use are the ones
+/// the DECK's build knows.
+pub(crate) fn desktop_agent_registry() -> Vec<DesktopAgentOption> {
+    dot_agent_deck::agent_registry::ALL
+        .iter()
+        .filter_map(|spec| {
+            Some(DesktopAgentOption::new(
+                (*spec.detect_basenames.first()?).to_string(),
+                spec.label,
+                spec.default_command.map(str::to_string),
+            ))
+        })
+        .collect()
+}
+
 /// The STRING-SHAPE check the desktop may make on a path the **user** typed,
 /// before spending a daemon round trip on it.
 ///

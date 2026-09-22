@@ -43,7 +43,9 @@ use std::time::Duration;
 use dot_agent_deck::agent_pty::{
     DOT_AGENT_DECK_PANE_ID, TabMembership, is_valid_display_name, mint_orchestration_id,
 };
-use dot_agent_deck::daemon_client::{DaemonClient, Endpoint, EventSubscription, StartAgentOptions};
+use dot_agent_deck::daemon_client::{
+    DaemonClient, Endpoint, EventSubscription, GatedQuery, StartAgentOptions,
+};
 use dot_agent_deck::daemon_stop::{StopOutcome, run_daemon_stop};
 use dot_agent_deck::event::{
     AgentType, BroadcastMsg, EventType, PreparedWorkflow, ProjectRole, SendResult,
@@ -68,8 +70,9 @@ use crate::daemon_bridge::{
 };
 use crate::dto::{
     BootstrapOptions, COMMAND_MAX_BYTES, ConnectionStatus, DesktopAction, DesktopActionResult,
-    DesktopProjectListing, DesktopResolvedProject, DesktopSnapshot, TerminalAttachResult,
-    WorkflowRoleInput, ensure_desktop_workflow_platform_supported, map_project_listing,
+    DesktopAgentOption, DesktopDirectoryListing, DesktopNewAgentOptions, DesktopProjectListing,
+    DesktopResolvedProject, DesktopSnapshot, TerminalAttachResult, WorkflowRoleInput,
+    desktop_agent_registry, ensure_desktop_workflow_platform_supported, map_project_listing,
     map_resolved_project, mint_desktop_pane_id, safe_message, selected_endpoint, validate_agent_id,
     validate_pasted_project_path, validate_start_fields, validate_workflow_shape,
 };
@@ -1361,6 +1364,125 @@ async fn desktop_resolve_project(
     Ok(map_resolved_project(project))
 }
 
+/// PRD #1223 M4: one directory of the deck `deck_id` names, for the New agent
+/// dialog's directory step.
+///
+/// `path` is one the daemon listed (a listing's `path`, `parent` or an entry's
+/// `path`) or one the user typed, and it goes to the daemon **verbatim**; the
+/// reply's canonical spelling is what the dialog carries from then on. `None`
+/// asks for the daemon user's home directory. Nothing here derives a path —
+/// not a parent by trimming, not a child by joining.
+///
+/// A deck that predates the verb answers [`DesktopDirectoryListing::Unsupported`]
+/// rather than an error, and the dialog falls back to a typed path.
+#[tauri::command]
+async fn desktop_list_directories(
+    webview: Webview,
+    state: State<'_, DesktopState>,
+    deck_id: String,
+    path: Option<String>,
+) -> Result<DesktopDirectoryListing, String> {
+    ensure_main_webview(&webview)?;
+    list_directories_on(&state, &deck_id, path).await
+}
+
+/// PRD #1223 M4: what the New agent form needs to know about the deck
+/// `deck_id` names — its default command, its agent registry, its experimental
+/// flag, the authoring kinds it can compose — plus the command this app last
+/// started a plain agent with there.
+///
+/// A deck that predates the query answers
+/// [`DesktopNewAgentOptions::Unsupported`], carrying this app's own compiled
+/// registry for the form to offer instead, labelled as such.
+#[tauri::command]
+async fn desktop_new_agent_options(
+    webview: Webview,
+    state: State<'_, DesktopState>,
+    deck_id: String,
+) -> Result<DesktopNewAgentOptions, String> {
+    ensure_main_webview(&webview)?;
+    new_agent_options_on(&state, &deck_id).await
+}
+
+/// [`desktop_list_directories`] minus the webview, so a test can drive it
+/// against real daemons.
+///
+/// # The deck comes from the request, never from the selection
+///
+/// For [`start_agent_action`]'s reason, and it is the same function doing it:
+/// [`crate::dto::DeckScope::resolve`] matches the id against the observed set,
+/// so a deck that left the fleet mid-flow is refused with that function's
+/// error — which the dialog reads as "go back to the deck step" — and nothing
+/// is ever asked of whichever deck happens to be selected.
+///
+/// A typed path gets the same string-shape check `desktop_resolve_project`
+/// applies before spending a round trip on it; it touches no filesystem.
+async fn list_directories_on(
+    state: &DesktopState,
+    deck_id: &str,
+    path: Option<String>,
+) -> Result<DesktopDirectoryListing, String> {
+    if let Some(path) = path.as_deref() {
+        validate_pasted_project_path(path)?;
+    }
+    let scope = crate::dto::DeckScope::resolve(Some(deck_id))?;
+    let daemon = state.daemon.trusted(scope.endpoint()).await?;
+    daemon.require_compatible()?;
+    let answer = daemon
+        .client
+        .list_directories(path.as_deref())
+        .await
+        .map_err(|error| safe_message(error.to_string()))?;
+    Ok(match answer {
+        GatedQuery::Answered(listing) => DesktopDirectoryListing::listing(
+            listing.path,
+            listing.parent,
+            listing
+                .entries
+                .into_iter()
+                .map(|entry| (entry.name, entry.path, entry.is_project)),
+            listing.truncated,
+        ),
+        GatedQuery::Unsupported => DesktopDirectoryListing::Unsupported,
+    })
+}
+
+/// [`desktop_new_agent_options`] minus the webview. Resolves its deck exactly
+/// as [`list_directories_on`] does.
+async fn new_agent_options_on(
+    state: &DesktopState,
+    deck_id: &str,
+) -> Result<DesktopNewAgentOptions, String> {
+    let scope = crate::dto::DeckScope::resolve(Some(deck_id))?;
+    let daemon = state.daemon.trusted(scope.endpoint()).await?;
+    daemon.require_compatible()?;
+    let answer = daemon
+        .client
+        .new_agent_options()
+        .await
+        .map_err(|error| safe_message(error.to_string()))?;
+    let last_command = state.last_command(&scope.identity());
+    Ok(match answer {
+        GatedQuery::Answered(options) => DesktopNewAgentOptions::Deck {
+            default_command: options.default_command,
+            agents: options
+                .agents
+                .into_iter()
+                .map(|agent| {
+                    DesktopAgentOption::new(agent.id, &agent.display_name, agent.default_command)
+                })
+                .collect(),
+            experimental: options.experimental,
+            authoring_kinds: options.authoring_kinds,
+            last_command,
+        },
+        GatedQuery::Unsupported => DesktopNewAgentOptions::Unsupported {
+            desktop_agents: desktop_agent_registry(),
+            last_command,
+        },
+    })
+}
+
 #[tauri::command]
 async fn desktop_bootstrap(
     app: AppHandle,
@@ -2169,6 +2291,9 @@ async fn start_agent_action(
     let scope = crate::dto::DeckScope::resolve(Some(deck_id))?;
     let agent_type = AgentType::from_command(command.as_deref());
     let pane_id = mint_desktop_pane_id();
+    // Kept for the per-deck last command (PRD #1223 M4), recorded only once the
+    // deck has accepted the start — a refused start leaves the value it had.
+    let requested_command = command.clone();
     let daemon = state.daemon.trusted(scope.endpoint()).await?;
     daemon.require_compatible()?;
     let agent_id = daemon
@@ -2185,6 +2310,9 @@ async fn start_agent_action(
         })
         .await
         .map_err(|error| safe_message(error.to_string()))?;
+    if let Some(command) = requested_command.as_deref() {
+        state.remember_last_command(&scope.identity(), command);
+    }
     Ok(StartedAgent { agent_id, scope })
 }
 
@@ -2928,6 +3056,8 @@ pub fn run() {
             desktop_get_snapshot,
             desktop_list_projects,
             desktop_resolve_project,
+            desktop_list_directories,
+            desktop_new_agent_options,
             desktop_bootstrap,
             desktop_terminal_attach,
             desktop_terminal_write,

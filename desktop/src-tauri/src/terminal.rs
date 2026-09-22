@@ -279,6 +279,26 @@ pub(crate) struct DesktopState {
     /// while the watcher is between subscriptions is still seen. Entries go
     /// with their deck in [`Self::retain_watchers`].
     refetch: Mutex<HashMap<EndpointIdentity, tokio::sync::watch::Sender<u64>>>,
+    /// PRD #1223 M4: the command each deck last started a plain agent with from
+    /// this app, which the New agent form prefills when the deck configures no
+    /// `default_command` — the TUI's `last_command`, kept **per deck** because
+    /// one deck's command means nothing on another.
+    ///
+    /// # In memory, and deliberately not in `desktop.toml`
+    ///
+    /// A command line is free text, and it is exactly where a user puts a
+    /// credential (`OPENAI_API_KEY=… codex`). The settings document's rule is
+    /// that nothing in it is free text — `desktop_settings_secrets`'
+    /// `ALLOWED_FIELD_TYPES` refuses `String` and every map, in a required gate —
+    /// so persisting this there would mean writing a reason why a command
+    /// cannot hold a secret, and no true one exists. So it lives for the life
+    /// of the process: it survives a webview reload and a deck reconnect, and
+    /// not a restart of the app.
+    ///
+    /// Entries are not pruned when a deck leaves the fleet: the key is the
+    /// deck's identity, so a deck that returns is the same deck and its last
+    /// command still applies to it.
+    last_commands: Mutex<HashMap<EndpointIdentity, String>>,
     /// PRD #1105 M11 step 4: whether the app window holds focus, as Tauri last
     /// reported it through [`window_focus_changed`], and the generation of that
     /// report.
@@ -342,6 +362,7 @@ impl Default for DesktopState {
             tunnels: daemon.tunnels(),
             selection: tokio::sync::watch::Sender::new(0),
             refetch: Mutex::new(HashMap::new()),
+            last_commands: Mutex::new(HashMap::new()),
             window_focus: Arc::new(Mutex::new(WindowFocus::default())),
         }
     }
@@ -519,6 +540,31 @@ impl DesktopState {
         if let Some(sender) = self.refetch_senders().get(deck) {
             sender.send_modify(|generation| *generation += 1);
         }
+    }
+
+    /// Record the command a plain agent was just started with on `deck` (PRD
+    /// #1223 M4). A blank command is not recorded, so it never overwrites a
+    /// real one — the TUI's `record_candidate` rule: an empty Command means the
+    /// deck's default shell, which is not a command worth offering back.
+    pub(crate) fn remember_last_command(&self, deck: &EndpointIdentity, command: &str) {
+        if command.trim().is_empty() {
+            return;
+        }
+        self.last_commands()
+            .insert(deck.clone(), command.to_string());
+    }
+
+    /// The command `deck` last started a plain agent with from this app, if any.
+    pub(crate) fn last_command(&self, deck: &EndpointIdentity) -> Option<String> {
+        self.last_commands().get(deck).cloned()
+    }
+
+    /// Poison-tolerant for the reason [`Self::refetch_senders`] is: a map of
+    /// deck keys to strings has nothing a panic could leave half-written.
+    fn last_commands(&self) -> MutexGuard<'_, HashMap<EndpointIdentity, String>> {
+        self.last_commands
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Which decks currently have a watcher.
@@ -1650,6 +1696,40 @@ mod tests {
         assert!(
             !watcher_b.has_changed().unwrap(),
             "the deck that stayed keeps its"
+        );
+    }
+
+    /// PRD #1223 M4 — the New agent form's per-deck last command.
+    ///
+    /// Scenario: a plain agent is started on deck A with `claude`, then with a
+    /// blank command (the deck's default shell). A still offers `claude` — a
+    /// blank start never overwrites it — and deck B, where nothing was started,
+    /// offers nothing: the memory is per deck, never global. A later non-blank
+    /// start on A replaces the value, and a deck that leaves the fleet keeps it.
+    #[cfg(unix)]
+    #[test]
+    fn the_last_command_is_remembered_per_deck_and_a_blank_one_is_not() {
+        let state = DesktopState::default();
+        let deck_a = fixture_deck("/tmp/dot-agent-deck-last-a.sock").identity();
+        let deck_b = fixture_deck("/tmp/dot-agent-deck-last-b.sock").identity();
+
+        state.remember_last_command(&deck_a, "claude");
+        state.remember_last_command(&deck_a, "   ");
+        state.remember_last_command(&deck_a, "");
+        assert_eq!(state.last_command(&deck_a).as_deref(), Some("claude"));
+        assert_eq!(state.last_command(&deck_b), None, "never global");
+
+        state.remember_last_command(&deck_a, "codex --model gpt-5.6-sol");
+        assert_eq!(
+            state.last_command(&deck_a).as_deref(),
+            Some("codex --model gpt-5.6-sol")
+        );
+
+        state.retain_watchers(&[deck_b.clone()].into_iter().collect());
+        assert_eq!(
+            state.last_command(&deck_a).as_deref(),
+            Some("codex --model gpt-5.6-sol"),
+            "keyed by identity, so a deck that returns is offered its own command again"
         );
     }
 
