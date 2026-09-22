@@ -1511,6 +1511,14 @@ impl DaemonClient {
     /// that to a daemon replaced between two back-to-back round trips. It does
     /// not close it: nothing a client can do before the write does.
     ///
+    /// The decision is taken from THIS call's own `Hello` reply
+    /// ([`Self::fresh_capabilities`]), never from the shared cache. Invalidating
+    /// the cache and then reading it back through [`Self::capabilities`] was not
+    /// the same thing: the cache is shared by every clone of this handle, so a
+    /// clone whose handshake began against the newer daemon could store its
+    /// stale set between the invalidation and the read, and this call would
+    /// then decide from a reply it never received.
+    ///
     /// `opts` is an ordinary start, and the daemon gives `command` its ordinary
     /// meaning — `None` is its default shell, not an agent — so resolve a blank
     /// command before calling, as the TUI does. `opts.cwd` and a valid
@@ -1522,9 +1530,8 @@ impl DaemonClient {
         opts: StartAgentOptions,
         kind: crate::authoring_seeds::AuthoringKind,
     ) -> Result<GatedQuery<String>, ClientError> {
-        self.invalidate_capabilities();
         if !self
-            .capabilities()
+            .fresh_capabilities()
             .await?
             .supports(crate::daemon_protocol::CAP_AUTHORING_KIND)
         {
@@ -1732,6 +1739,23 @@ impl DaemonClient {
         if let Some(hit) = self.cached_capabilities() {
             return Ok(hit);
         }
+        self.fresh_capabilities().await
+    }
+
+    /// PRD #1223 — one `Hello` exchange, answered from THAT exchange's reply and
+    /// never from the cache, for a caller whose decision must not be taken from a
+    /// set some other handshake captured ([`Self::start_authoring_agent`]).
+    ///
+    /// It stores what it learned afterwards, so later [`Self::capabilities`]
+    /// reads benefit, but the value it returns is computed from its own reply
+    /// before that store and is never read back: a clone's concurrent store —
+    /// which may carry a set captured from a daemon that no longer holds this
+    /// endpoint — can overwrite the cache at any moment without reaching the
+    /// value returned here.
+    ///
+    /// A transport failure or an `ok: false` handshake is `Err`, exactly as for
+    /// [`Self::capabilities`], and stores nothing.
+    async fn fresh_capabilities(&self) -> Result<DaemonCapabilities, ClientError> {
         let (mut rd, mut wr) = self.connect().await?;
         let resp = issue_command(
             &mut rd,
@@ -3908,6 +3932,204 @@ mod tests {
 
         drop(client);
         server.await.unwrap();
+        drop(dir);
+    }
+
+    /// PRD #1223 audit A1 — the authoring start decides from ITS OWN handshake,
+    /// not from the cache every clone of the handle shares.
+    ///
+    /// A clone's ordinary `capabilities()` fetch began against the daemon that
+    /// held the endpoint before (`stale` is what that daemon advertised) and is
+    /// held at the server; the authoring call then starts, and its own `Hello` is
+    /// held at the server too. Only once both are in flight is the clone's reply
+    /// released — so the stale set is stored into the shared cache WHILE the
+    /// authoring call's refresh is in flight, and is still there when that
+    /// call's own reply (`fresh`) arrives. The decision must follow `fresh` in
+    /// both directions: a stale `authoring-kind` must not license a start, and a
+    /// stale absence must not withhold one.
+    ///
+    /// What this cannot do is reproduce the pre-fix window itself —
+    /// `invalidate_capabilities()` then `capabilities()`'s cache read were two
+    /// consecutive lock acquisitions with no `.await` between them, and no
+    /// barrier outside the client can land a store there. The fix removes the
+    /// read rather than narrowing the window, and this pins the property it
+    /// establishes: nothing the cache holds, before or during the call, decides.
+    #[cfg(unix)]
+    #[test]
+    fn authoring_start_decides_from_its_own_handshake_not_a_concurrent_store() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("build concurrent-store runtime");
+        let older: &'static [&'static str] = &[
+            CAP_LIST_PROJECTS,
+            CAP_RESOLVE_PROJECT,
+            CAP_PREPARE_WORKFLOW,
+            crate::daemon_protocol::CAP_LIST_DIRECTORIES,
+            crate::daemon_protocol::CAP_NEW_AGENT_OPTIONS,
+        ];
+        runtime.block_on(async {
+            // The stale fetch saw `authoring-kind`; the daemon now holding the
+            // endpoint does not advertise it.
+            authoring_decision_ignores_a_concurrent_store_inner(DAEMON_CAPABILITIES, older).await;
+            // And the reverse: the stale fetch saw an older daemon; the daemon now
+            // holding the endpoint advertises it.
+            authoring_decision_ignores_a_concurrent_store_inner(older, DAEMON_CAPABILITIES).await;
+        });
+    }
+
+    #[cfg(unix)]
+    async fn authoring_decision_ignores_a_concurrent_store_inner(
+        stale: &'static [&'static str],
+        fresh: &'static [&'static str],
+    ) {
+        use crate::daemon_protocol::CAP_AUTHORING_KIND;
+        use crate::platform::ipc::IpcStream;
+
+        let (dir, path, listener) = {
+            let _g = BIND_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("replaced-daemon.sock");
+            let listener = bind_attach_listener(&path).expect("bind the replaced daemon");
+            (dir, path, listener)
+        };
+        // Every request is handed to the test with its connection still open, so
+        // the test — not the server — decides when (and whether) each is answered.
+        let (held_tx, mut held) =
+            tokio::sync::mpsc::unbounded_channel::<(IpcStream, serde_json::Value)>();
+        let server = tokio::spawn(async move {
+            while let Ok(mut stream) = listener.accept().await {
+                let held_tx = held_tx.clone();
+                tokio::spawn(async move {
+                    let Some((KIND_REQ, payload)) = read_frame(&mut stream)
+                        .await
+                        .expect("read a held request frame")
+                    else {
+                        return;
+                    };
+                    let request: serde_json::Value =
+                        serde_json::from_slice(&payload).expect("decode a held request");
+                    let _ = held_tx.send((stream, request));
+                });
+            }
+        });
+        async fn next_held(
+            held: &mut tokio::sync::mpsc::UnboundedReceiver<(IpcStream, serde_json::Value)>,
+        ) -> (IpcStream, serde_json::Value) {
+            tokio::time::timeout(std::time::Duration::from_secs(10), held.recv())
+                .await
+                .expect("a request reaches the server")
+                .expect("the server is still accepting")
+        }
+        let op = |request: &serde_json::Value| {
+            request
+                .get("op")
+                .and_then(|op| op.as_str())
+                .unwrap_or_default()
+                .to_string()
+        };
+
+        let client = DaemonClient::new(path);
+
+        // 1. Another clone's ordinary fetch, begun first and held.
+        let clone = client.clone();
+        let stale_fetch = tokio::spawn(async move { clone.capabilities().await });
+        let (mut stale_stream, request) = next_held(&mut held).await;
+        assert_eq!(op(&request), "hello", "the clone's fetch is a handshake");
+
+        // 2. The authoring call starts while that fetch is in flight.
+        let authoring = client.clone();
+        let start = tokio::spawn(async move {
+            authoring
+                .start_authoring_agent(
+                    StartAgentOptions {
+                        command: Some("claude".into()),
+                        cwd: Some("/tmp".into()),
+                        env: vec![(
+                            crate::agent_pty::DOT_AGENT_DECK_PANE_ID.into(),
+                            "authoring-pane".into(),
+                        )],
+                        ..StartAgentOptions::default()
+                    },
+                    crate::authoring_seeds::AuthoringKind::Dispatcher,
+                )
+                .await
+        });
+        let (mut fresh_stream, request) = next_held(&mut held).await;
+        assert_eq!(
+            op(&request),
+            "hello",
+            "stale {stale:?}: the authoring call handshakes before it decides"
+        );
+
+        // 3. The stale fetch lands in the shared cache mid-refresh.
+        crate::daemon_protocol::write_resp(&mut stale_stream, &hello_advertising(stale))
+            .await
+            .expect("answer the stale fetch");
+        stale_fetch
+            .await
+            .unwrap()
+            .expect("the stale fetch completes");
+        assert_eq!(
+            client
+                .cached_capabilities()
+                .map(|caps| caps.supports(CAP_AUTHORING_KIND)),
+            Some(stale.contains(&CAP_AUTHORING_KIND)),
+            "the stale set is in the shared cache before the authoring call's reply arrives"
+        );
+
+        // 4. The authoring call's own reply.
+        crate::daemon_protocol::write_resp(&mut fresh_stream, &hello_advertising(fresh))
+            .await
+            .expect("answer the authoring call's handshake");
+        let outcome = if fresh.contains(&CAP_AUTHORING_KIND) {
+            let (mut start_stream, request) = next_held(&mut held).await;
+            assert_eq!(
+                op(&request),
+                "start-agent",
+                "fresh {fresh:?}: the handshake that answered it licenses the start"
+            );
+            assert_eq!(
+                request.get("authoring_kind").and_then(|k| k.as_str()),
+                Some("dispatcher")
+            );
+            crate::daemon_protocol::write_resp(
+                &mut start_stream,
+                &AttachResponse::with_id("authoring-agent".into()),
+            )
+            .await
+            .expect("answer the start");
+            GatedQuery::Answered("authoring-agent".to_string())
+        } else {
+            GatedQuery::Unsupported
+        };
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(10), start)
+                .await
+                .unwrap_or_else(|_| panic!(
+                    "stale {stale:?} / fresh {fresh:?}: the authoring call is waiting on a \
+                     reply the test never sends — it sent a start its own handshake withheld"
+                ))
+                .unwrap()
+                .expect("the authoring call completes"),
+            outcome,
+            "stale {stale:?} / fresh {fresh:?}: the decision follows the call's own handshake"
+        );
+        assert!(
+            held.try_recv().is_err(),
+            "stale {stale:?} / fresh {fresh:?}: nothing else reached the server"
+        );
+        assert_eq!(
+            client
+                .cached_capabilities()
+                .map(|caps| caps.supports(CAP_AUTHORING_KIND)),
+            Some(fresh.contains(&CAP_AUTHORING_KIND)),
+            "the refresh leaves the cache describing the daemon that answered it"
+        );
+
+        server.abort();
+        drop(client);
         drop(dir);
     }
 
