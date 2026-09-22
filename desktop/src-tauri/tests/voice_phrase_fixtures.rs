@@ -52,7 +52,8 @@ use std::fmt;
 use std::time::{Duration, Instant};
 
 use dot_agent_deck_desktop::voice::{
-    NO_MATCH_ACTION, ParamKind, REMOTE_TIMEOUT, Screen, Transcript, VoiceOutcome,
+    NO_MATCH_ACTION, ParamKind, REMOTE_TIMEOUT, Screen, Transcript, VoiceDirectories,
+    VoiceDirectoryEntry, VoiceOutcome,
     dictation::normalise,
     handle_utterance, table,
     test_support::{api_preset, api_resolver, role_agent_in_state, with_tool},
@@ -95,6 +96,15 @@ struct PhraseFixture {
     /// against the planted fleet the way `resolved_agent` is against agents.
     #[serde(default)]
     resolved_deck: Option<String>,
+    /// Whether the New agent dialog's directory browser is showing the
+    /// planted listing for this fixture (PRD #1223). Absent means the dialog
+    /// is closed, which is every fixture that predates the directory rows.
+    #[serde(default)]
+    listing: bool,
+    /// The deck path a `dir_ref` param must resolve to, checked against the
+    /// planted listing the way `resolved_deck` is against the fleet.
+    #[serde(default)]
+    resolved_dir: Option<String>,
     /// The introducing words a dictation fixture expects the model to MARK.
     ///
     /// **Not the text to type**, which is the whole design: the app takes that
@@ -214,6 +224,17 @@ fn resolved_deck(outcome: &VoiceOutcome) -> Option<&str> {
     }
 }
 
+/// The directory a dispatch's `dir_ref` param resolved to, if it carried one.
+fn resolved_dir(outcome: &VoiceOutcome) -> Option<&str> {
+    match outcome {
+        VoiceOutcome::Dispatch { params, .. } => params
+            .iter()
+            .find(|param| param.kind == ParamKind::DirRef)
+            .map(|param| param.value.as_str()),
+        _ => None,
+    }
+}
+
 /// What the model marked as the introducing words, for a dictation dispatch.
 ///
 /// Read off `spoken` rather than `value`: `value` is what the app resolved the
@@ -275,6 +296,21 @@ async fn voice_phrase_fixtures_match_the_default_backend() {
             local: false,
         },
     ];
+    // PRD #1223 — what the New agent dialog's browser shows when a fixture says
+    // `listing = true`: one level of the local deck, with a parent, named the
+    // way a real checkout's children are.
+    let directories = VoiceDirectories {
+        deck_id: "deck-local".to_string(),
+        path: "/home/dev/code".to_string(),
+        has_parent: true,
+        entries: ["billing-service", "docs", "dot-agent-deck", "infra"]
+            .into_iter()
+            .map(|name| VoiceDirectoryEntry {
+                name: name.to_string(),
+                path: format!("/home/dev/code/{name}"),
+            })
+            .collect(),
+    };
     for fixture in &fixtures.fixtures {
         assert!(
             Screen::parse(&fixture.screen).is_some(),
@@ -313,6 +349,21 @@ async fn voice_phrase_fixtures_match_the_default_backend() {
             assert!(
                 decks.iter().any(|deck| deck.id == expected),
                 "{}: fixture expects unknown deck id `{expected}`",
+                fixture.name
+            );
+        }
+        if let Some(expected) = fixture.resolved_dir.as_deref() {
+            assert!(
+                fixture.listing,
+                "{}: a `resolved_dir` needs `listing = true` to resolve against",
+                fixture.name
+            );
+            assert!(
+                directories
+                    .entries
+                    .iter()
+                    .any(|entry| entry.path == expected),
+                "{}: fixture expects unknown directory `{expected}`",
                 fixture.name
             );
         }
@@ -362,6 +413,7 @@ async fn voice_phrase_fixtures_match_the_default_backend() {
         } else {
             &agents
         };
+        let fixture_directories = fixture.listing.then_some(&directories);
         let resolved = tokio::time::timeout(
             REMOTE_TIMEOUT + PER_FIXTURE_GRACE,
             handle_utterance(
@@ -370,6 +422,7 @@ async fn voice_phrase_fixtures_match_the_default_backend() {
                 screen,
                 fixture_agents,
                 &decks,
+                fixture_directories,
                 transcript,
             ),
         )
@@ -391,6 +444,10 @@ async fn voice_phrase_fixtures_match_the_default_backend() {
                     Some(expected) => resolved_deck(&answer.outcome) == Some(expected),
                     None => true,
                 };
+                let dir_matches = match fixture.resolved_dir.as_deref() {
+                    Some(expected) => resolved_dir(&answer.outcome) == Some(expected),
+                    None => true,
+                };
                 let prefix_matches = match fixture.dictate_prefix.as_deref() {
                     Some(expected) => marked_prefix(&answer.outcome)
                         .is_some_and(|marked| normalise(marked) == normalise(expected)),
@@ -400,21 +457,25 @@ async fn voice_phrase_fixtures_match_the_default_backend() {
                     && actual_outcome == fixture.outcome
                     && agent_matches
                     && deck_matches
+                    && dir_matches
                     && prefix_matches
                 {
                     Ok(())
                 } else {
                     Err(format!(
                         "expected action={} outcome={} resolved_agent={:?} resolved_deck={:?} \
-                         dictate_prefix={:?}, got action={:?} outcome={actual_outcome} \
-                         resolved_agent={actual_agent:?} resolved_deck={:?} dictate_prefix={:?}",
+                         resolved_dir={:?} dictate_prefix={:?}, got action={:?} \
+                         outcome={actual_outcome} resolved_agent={actual_agent:?} \
+                         resolved_deck={:?} resolved_dir={:?} dictate_prefix={:?}",
                         fixture.action,
                         fixture.outcome,
                         fixture.resolved_agent,
                         fixture.resolved_deck,
+                        fixture.resolved_dir,
                         fixture.dictate_prefix,
                         actual_action,
                         resolved_deck(&answer.outcome),
+                        resolved_dir(&answer.outcome),
                         marked_prefix(&answer.outcome),
                     ))
                 }

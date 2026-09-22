@@ -179,11 +179,22 @@ pub fn param_names(commands: &[AnnotatedCommand]) -> Vec<String> {
 /// rather than an agent, and answer a `deck_ref` param with the user's own
 /// words. No id, for the agents' reason: the app resolves, the model refers.
 ///
+/// # Directories are NAMES, only while the browser shows them (PRD #1223)
+///
+/// `directories` is present only when the New agent dialog declared a listing,
+/// and carries the `displayName`s on screen — capped at
+/// [`DIRECTORY_NAMES_SHOWN`], because a deck lists up to a thousand and the
+/// model needs to see what a directory is called, not the whole of a large one
+/// — plus whether `..` is there. No path: a path names where on the deck's
+/// filesystem the user is, which no reference needs and which is more than a
+/// hosted backend should be handed to pick a command. The resolver matches
+/// against every declared entry, not only the ones shown here.
+///
 /// Nothing here is a transcript, an utterance or an audio buffer, so PRD #802's
 /// Open Question 5 is untouched — and this function still writes nothing
 /// anywhere. It builds a value and hands it to a backend.
 pub fn state(request: &IntentRequest<'_>) -> Value {
-    json!({
+    let mut state = json!({
         "commands": request.commands,
         "agents_on_screen": request
             .agents
@@ -195,8 +206,23 @@ pub fn state(request: &IntentRequest<'_>) -> Value {
             .iter()
             .map(|deck| deck.label.clone())
             .collect::<Vec<_>>(),
-    })
+    });
+    if let Some(directories) = request.directories {
+        state["directories"] = json!({
+            "entries": directories
+                .entries
+                .iter()
+                .take(DIRECTORY_NAMES_SHOWN)
+                .map(|entry| entry.name.clone())
+                .collect::<Vec<_>>(),
+            "has_parent": directories.has_parent,
+        });
+    }
+    state
 }
+
+/// How many on-screen directory names [`state`] hands the model.
+pub const DIRECTORY_NAMES_SHOWN: usize = 200;
 
 /// One agent, as [`state`] describes it. See that function for the rule.
 fn agent_state(agent: &DesktopAgent, agents: &[DesktopAgent]) -> Value {
@@ -355,6 +381,9 @@ mod tests {
                 "dictate_to_agent".to_string(),
                 "submit_prompt".to_string(),
                 "open_new_agent".to_string(),
+                "open_dir".to_string(),
+                "go_to_parent".to_string(),
+                "use_this_directory".to_string(),
                 "none".to_string(),
             ]
         );
@@ -372,7 +401,8 @@ mod tests {
             vec![
                 "agent".to_string(),
                 "prefix".to_string(),
-                "deck".to_string()
+                "deck".to_string(),
+                "dir".to_string()
             ]
         );
     }
@@ -421,6 +451,7 @@ mod tests {
             commands,
             agents,
             decks: &[],
+            directories: None,
         }
     }
 
@@ -445,9 +476,50 @@ mod tests {
             commands: &commands,
             agents: &[],
             decks: &decks,
+            directories: None,
         });
         assert_eq!(rendered["decks"], json!(["Local deck", "deploy@build-box"]));
         assert!(!rendered.to_string().contains("deck-000"));
+    }
+
+    #[test]
+    fn voice_prompt_state_names_directories_only_while_the_browser_shows_them() {
+        let commands = commands();
+        let transcript = Transcript::new("open dir billing");
+        let request = |directories| IntentRequest {
+            transcript: &transcript,
+            commands: &commands,
+            agents: &[],
+            decks: &[],
+            directories,
+        };
+        // Dialog closed: no key at all, rather than an empty list that reads
+        // as "a listing with nothing in it".
+        assert!(state(&request(None)).get("directories").is_none());
+
+        let listing = crate::voice::VoiceDirectories {
+            deck_id: "deck-0000000000000001".to_string(),
+            path: "/home/secret-user/code".to_string(),
+            has_parent: true,
+            entries: (0..DIRECTORY_NAMES_SHOWN + 5)
+                .map(|index| crate::voice::VoiceDirectoryEntry {
+                    name: format!("dir-{index:03}"),
+                    path: format!("/home/secret-user/code/dir-{index:03}"),
+                })
+                .collect(),
+        };
+        let rendered = state(&request(Some(&listing)));
+        let entries = rendered["directories"]["entries"]
+            .as_array()
+            .expect("a list");
+        assert_eq!(entries.len(), DIRECTORY_NAMES_SHOWN);
+        assert_eq!(entries[0], json!("dir-000"));
+        assert_eq!(rendered["directories"]["has_parent"], json!(true));
+        // Names, never paths or the deck id: where on the filesystem the user
+        // is, is not what a reference needs.
+        let text = rendered.to_string();
+        assert!(!text.contains("secret-user"), "{text}");
+        assert!(!text.contains("deck-000"), "{text}");
     }
 
     #[test]

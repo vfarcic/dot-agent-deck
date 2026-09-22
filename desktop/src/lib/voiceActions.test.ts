@@ -159,6 +159,10 @@ describe("VOICE_ACTIONS", () => {
       "submitAgentPrompt",
       // PRD #1223: the `open_new_agent` row.
       "openNewAgent",
+      // PRD #1223: the directory browser's rows.
+      "openDirectory",
+      "goToParentDirectory",
+      "useThisDirectory",
     ];
 
     expect(Array.isArray(VOICE_ACTIONS)).toBe(false);

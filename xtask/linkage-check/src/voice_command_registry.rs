@@ -1122,7 +1122,7 @@ mod tests {
         );
         assert_eq!(
             kinds,
-            ["agent_ref", "deck_ref", "spoken_prefix"]
+            ["agent_ref", "deck_ref", "dir_ref", "spoken_prefix"]
                 .into_iter()
                 .map(str::to_string)
                 .collect()

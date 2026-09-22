@@ -16,6 +16,7 @@
 use serde::Serialize;
 use serde_json::{Value, json};
 
+use super::VoiceDirectories;
 use super::table::{CommandTable, NO_MATCH_ACTION, ParamKind, Screen};
 
 /// The one tool the model is given.
@@ -117,7 +118,10 @@ pub const TOOL_INSTRUCTIONS: &str = "Pick the deck action the user asked for. Pi
     reach, named the way the screen names it; a `deck_ref` param is a reference \
     to one of those decks — \"local\" means this machine's — and is answered \
     with the words the user used for it, never with an agent. A param marked \
-    `optional` is left out when the user named nothing for it. Write no prose; \
+    `optional` is left out when the user named nothing for it. `directories`, \
+    when present, is the New agent dialog's directory browser: `entries` are the \
+    directories on screen, and a `dir_ref` param names one of THOSE, answered with \
+    the words the user used for it. Write no prose; \
     the app writes what the user reads.";
 
 /// One row as the model sees it, with its availability on the screen the
@@ -126,8 +130,9 @@ pub const TOOL_INSTRUCTIONS: &str = "Pick the deck action the user asked for. Pi
 pub struct AnnotatedCommand {
     pub id: String,
     pub description: String,
-    /// Whether this command can run on the current screen. Computed from the
-    /// row's `screens`; an empty list is available everywhere.
+    /// Whether this command can run right now. Computed from the row's
+    /// `screens` — an empty list is available everywhere — and its `requires`,
+    /// against what the webview declared (PRD #1223).
     pub callable: bool,
     /// The prerequisite, so the model has the reason rather than inventing one.
     /// The app still renders the sentence — this is never echoed back as prose.
@@ -146,15 +151,26 @@ pub struct AnnotatedParam {
     pub optional: bool,
 }
 
-/// The full table annotated for one screen — every row, in table order.
+/// The full table annotated for one screen with nothing else declared — every
+/// row, in table order. A `requires`-gated row is `callable: false` here.
 pub fn annotate(table: &CommandTable, screen: Screen) -> Vec<AnnotatedCommand> {
+    annotate_with(table, screen, None)
+}
+
+/// The full table annotated for one screen and what the webview declared with
+/// it (PRD #1223's directory browser), every row in table order.
+pub fn annotate_with(
+    table: &CommandTable,
+    screen: Screen,
+    directories: Option<&VoiceDirectories>,
+) -> Vec<AnnotatedCommand> {
     table
         .rows()
         .iter()
         .map(|row| AnnotatedCommand {
             id: row.id.clone(),
             description: row.description.clone(),
-            callable: row.callable_on(screen),
+            callable: row.callable(screen, directories),
             unavailable_hint: row.unavailable_hint.clone(),
             params: row
                 .params
@@ -241,6 +257,9 @@ mod tests {
                 "dictate_to_agent".to_string(),
                 "submit_prompt".to_string(),
                 "open_new_agent".to_string(),
+                "open_dir".to_string(),
+                "go_to_parent".to_string(),
+                "use_this_directory".to_string(),
                 "none".to_string(),
             ]
         );
@@ -298,6 +317,9 @@ mod tests {
                 "dictate_to_agent",
                 "submit_prompt",
                 "open_new_agent",
+                "open_dir",
+                "go_to_parent",
+                "use_this_directory",
                 "none"
             ]
         );
@@ -323,6 +345,96 @@ mod tests {
         // The escape has to be spelled out, or the model has no reason to use it.
         assert!(description.contains("Answer `none`"));
         assert!(description.contains("do not force a pick"));
+    }
+
+    fn listing(has_parent: bool) -> VoiceDirectories {
+        VoiceDirectories {
+            deck_id: "deck-local".to_string(),
+            path: "/home/dev".to_string(),
+            has_parent,
+            entries: Vec::new(),
+        }
+    }
+
+    /// The directory rows' flags with a listing declared (PRD #1223): callable
+    /// on the overview, where the dialog lives, and `go_to_parent` only when
+    /// the listing has a `..`. Off the overview a declaration buys nothing —
+    /// `requires` narrows `screens`, it never widens it.
+    #[test]
+    fn voice_schema_directory_rows_are_callable_only_with_a_listing_declared() {
+        let flags = |screen: Screen, directories: Option<&VoiceDirectories>| {
+            annotate_with(table(), screen, directories)
+                .into_iter()
+                .filter(|command| {
+                    ["open_dir", "go_to_parent", "use_this_directory"]
+                        .contains(&command.id.as_str())
+                })
+                .map(|command| (command.id, command.callable))
+                .collect::<Vec<_>>()
+        };
+        let with_parent = listing(true);
+        let at_root = listing(false);
+        assert_eq!(
+            flags(Screen::Overview, Some(&with_parent)),
+            vec![
+                ("open_dir".to_string(), true),
+                ("go_to_parent".to_string(), true),
+                ("use_this_directory".to_string(), true),
+            ]
+        );
+        assert_eq!(
+            flags(Screen::Overview, Some(&at_root)),
+            vec![
+                ("open_dir".to_string(), true),
+                ("go_to_parent".to_string(), false),
+                ("use_this_directory".to_string(), true),
+            ]
+        );
+        for screen in [Screen::Deck, Screen::Agent] {
+            assert!(
+                flags(screen, Some(&with_parent))
+                    .iter()
+                    .all(|(_, callable)| !callable),
+                "{screen}"
+            );
+        }
+        // And the declaration changes NOTHING else: every other row's flag is
+        // the undeclared one.
+        let others = |directories: Option<&VoiceDirectories>| {
+            annotate_with(table(), Screen::Overview, directories)
+                .into_iter()
+                .filter(|command| {
+                    !["open_dir", "go_to_parent", "use_this_directory"]
+                        .contains(&command.id.as_str())
+                })
+                .map(|command| (command.id, command.callable))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(others(Some(&with_parent)), others(None));
+    }
+
+    #[test]
+    fn voice_schema_serializes_a_dir_ref_in_its_toml_spelling() {
+        let commands = annotate(table(), Screen::Overview);
+        let row = commands
+            .iter()
+            .find(|command| command.id == "open_dir")
+            .expect("present");
+        let json = serde_json::to_value(&row.params).expect("serializes");
+        assert_eq!(
+            json,
+            serde_json::json!([{ "name": "dir", "kind": "dir_ref" }])
+        );
+    }
+
+    #[test]
+    fn voice_schema_instructions_say_what_a_directory_reference_is() {
+        assert!(
+            TOOL_INSTRUCTIONS.contains(
+                "`directories`, when present, is the New agent dialog's directory browser"
+            )
+        );
+        assert!(TOOL_INSTRUCTIONS.contains("a `dir_ref` param names one of THOSE"));
     }
 
     #[test]
@@ -357,6 +469,10 @@ mod tests {
                 ("dictate_to_agent".to_string(), false),
                 ("submit_prompt".to_string(), false),
                 ("open_new_agent".to_string(), false),
+                // `requires` a listing, and nothing is declared here (PRD #1223).
+                ("open_dir".to_string(), false),
+                ("go_to_parent".to_string(), false),
+                ("use_this_directory".to_string(), false),
             ]
         );
         assert_eq!(
@@ -376,6 +492,10 @@ mod tests {
                 ("dictate_to_agent".to_string(), false),
                 ("submit_prompt".to_string(), false),
                 ("open_new_agent".to_string(), true),
+                // `requires` a listing, and nothing is declared here (PRD #1223).
+                ("open_dir".to_string(), false),
+                ("go_to_parent".to_string(), false),
+                ("use_this_directory".to_string(), false),
             ]
         );
         assert_eq!(
@@ -391,6 +511,10 @@ mod tests {
                 ("dictate_to_agent".to_string(), true),
                 ("submit_prompt".to_string(), true),
                 ("open_new_agent".to_string(), false),
+                // `requires` a listing, and nothing is declared here (PRD #1223).
+                ("open_dir".to_string(), false),
+                ("go_to_parent".to_string(), false),
+                ("use_this_directory".to_string(), false),
             ]
         );
     }

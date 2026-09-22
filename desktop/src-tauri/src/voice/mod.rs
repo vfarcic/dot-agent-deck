@@ -85,6 +85,52 @@ pub struct VoiceDeck {
     /// Whether it is the local endpoint.
     pub local: bool,
 }
+
+/// What the New agent dialog's directory browser is showing, as the webview
+/// DECLARED it for one utterance (PRD #1223) — the set a spoken
+/// [`ParamKind::DirRef`] resolves against.
+///
+/// # It comes from the webview, unlike [`VoiceDeck`], and that is not a lapse
+///
+/// [`VoiceDeck`] and [`DesktopAgent`] are read Rust-side because that is where
+/// they live, and a list from the page would be a second answer to a question
+/// the snapshot already answers. The browser's listing has no Rust-side home at
+/// all: it is `NewAgentDialog`'s component state — which deck the flow chose,
+/// which directory it is looking at, and which of that directory's children the
+/// filter leaves on screen — and the daemon lists one level per request and
+/// remembers none of them. So it is exactly the kind of state the mounted
+/// SCREEN is, and it travels the way the screen does: stated by the webview
+/// immediately before the resolve (`DeckBridge.declareVoiceScreen`). Absent
+/// means the dialog is closed, no deck is chosen, no listing has landed, or a
+/// start is in flight — every case where there is nothing on screen to name —
+/// and each `requires`-gated row is then `callable: false`.
+///
+/// Every path in it is one the deck returned (the dialog builds none), so a
+/// dispatch sends back a path that came from the deck, by way of the page.
+/// `lib.rs` bounds the declaration before it is used.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct VoiceDirectories {
+    /// The flow's chosen deck — the wire `deckId` its listing came from.
+    pub deck_id: String,
+    /// The listing's own `path`: the directory on screen.
+    pub path: String,
+    /// Whether the listing has a parent, i.e. whether `..` is on screen.
+    pub has_parent: bool,
+    /// The children on screen, in the order the browser shows them — after
+    /// the filter, because a spoken name means one the user can see.
+    pub entries: Vec<VoiceDirectoryEntry>,
+}
+
+/// One child directory on screen.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct VoiceDirectoryEntry {
+    /// The `displayName` the browser renders, which is what a user says.
+    pub name: String,
+    /// The deck's own path for it — what `open_dir` dispatches with.
+    pub path: String,
+}
 pub use dictation::{DICTATION_OPENERS, SUBMIT_PHRASES};
 
 pub use capture::{
@@ -95,16 +141,20 @@ pub use capture::{
 };
 pub use hold::VoiceHold;
 pub use outcome::{
-    DeckRefMatch, ResolvedParam, VoiceOutcome, VoiceResult, handle_utterance, resolve_deck_ref,
+    DeckRefMatch, DirRefMatch, ResolvedParam, VoiceOutcome, VoiceResult, handle_utterance,
+    resolve_deck_ref, resolve_dir_ref,
 };
 pub use remote::{Protocol, REMOTE_TIMEOUT, RemoteResolver};
 pub use resolver::{
     IntentAnswer, IntentError, IntentRequest, IntentResolver, StubResolver, resolver_for,
 };
 pub use schema::{
-    AnnotatedCommand, AnnotatedParam, TOOL_INSTRUCTIONS, TOOL_NAME, annotate, tool_schema,
+    AnnotatedCommand, AnnotatedParam, TOOL_INSTRUCTIONS, TOOL_NAME, annotate, annotate_with,
+    tool_schema,
 };
-pub use table::{CommandRow, CommandTable, NO_MATCH_ACTION, ParamKind, ParamSpec, Screen, table};
+pub use table::{
+    CommandRow, CommandTable, NO_MATCH_ACTION, ParamKind, ParamSpec, Requirement, Screen, table,
+};
 pub use transcribe::{
     HttpTranscriber, StubTranscriber, TRANSCRIBE_TIMEOUT, Transcriber, TranscriptionError,
     TranscriptionOutcome, VoiceTranscription, handle_audio, transcriber_for, unreachable_detail,

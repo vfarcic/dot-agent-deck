@@ -46,9 +46,9 @@ use super::dictation::{
     DICTATION_OPENERS, SUBMIT_PHRASES, opening_with, strip_opening, whole_utterance_is,
 };
 use super::resolver::{IntentError, IntentRequest, IntentResolver};
-use super::schema::annotate;
+use super::schema::annotate_with;
 use super::table::{CommandRow, CommandTable, ParamKind, Screen};
-use super::{DesktopAgent, Transcript, VoiceDeck};
+use super::{DesktopAgent, Transcript, VoiceDeck, VoiceDirectories};
 use crate::dto::{DesktopTab, safe_message};
 
 /// How many matching agents an ambiguity sentence names before it summarises.
@@ -77,7 +77,8 @@ pub struct ResolvedParam {
     pub spoken: String,
     /// What it resolved to, and what the frontend dispatches with: an agent id
     /// for [`ParamKind::AgentRef`], a deck id (`deckId`) for
-    /// [`ParamKind::DeckRef`].
+    /// [`ParamKind::DeckRef`], and the deck's own path for the child directory
+    /// a [`ParamKind::DirRef`] named.
     pub value: String,
     /// The name the deck shows for it, which is what the report sentence
     /// says. Derived the same way the webview derives it, so the sentence names
@@ -304,13 +305,18 @@ impl VoiceResult {
 /// drive a fixture table; M6 passes the embedded one. `decks` is the observed
 /// fleet a [`ParamKind::DeckRef`] resolves against (PRD #1223) — the whole
 /// fleet rather than the selected deck, because naming a deck OTHER than the
-/// one on screen is the point of saying its name.
+/// one on screen is the point of saying its name. `directories` is what the New
+/// agent dialog's directory browser was DECLARED to be showing with this
+/// utterance, or `None` when it is showing nothing (PRD #1223); it decides both
+/// whether a `requires`-gated row is callable and what a
+/// [`ParamKind::DirRef`] resolves against.
 pub async fn handle_utterance(
     resolver: &dyn IntentResolver,
     table: &CommandTable,
     screen: Screen,
     agents: &[DesktopAgent],
     decks: &[VoiceDeck],
+    directories: Option<&VoiceDirectories>,
     transcript: Transcript,
 ) -> VoiceResult {
     let backend = resolver.backend_name();
@@ -334,7 +340,7 @@ pub async fn handle_utterance(
         return finish(outcome, None);
     }
 
-    let commands = annotate(table, screen);
+    let commands = annotate_with(table, screen, directories);
     let started = std::time::Instant::now();
     let answered = resolver
         .resolve(IntentRequest {
@@ -342,6 +348,7 @@ pub async fn handle_utterance(
             commands: &commands,
             agents,
             decks,
+            directories,
         })
         .await;
     // Taken before anything is rendered: what the user waited for is the
@@ -370,7 +377,11 @@ pub async fn handle_utterance(
         return finish(VoiceOutcome::unknown_action(transcript, answer.action));
     };
 
-    if !row.callable_on(screen) {
+    // The screen AND the row's `requires` (PRD #1223): a directory row picked
+    // with the dialog closed, or `go_to_parent` at a root, is refused here with
+    // the row's own hint rather than dispatched into a dialog that cannot take
+    // it.
+    if !row.callable(screen, directories) {
         return finish(VoiceOutcome::unavailable(transcript, row));
     }
 
@@ -491,6 +502,40 @@ pub async fn handle_utterance(
                         param: spec.name.clone(),
                         spoken: spoken.to_string(),
                         matches: labels,
+                    });
+                }
+            },
+            // PRD #1223 — the browser's children on screen, and the same two
+            // refusals once more. `directories` is `Some` here whenever the row
+            // got past `callable` above, since every `dir_ref` row requires a
+            // listing; the `None` arm of the resolver answers no match rather
+            // than trusting that, so a future row that forgot the requirement
+            // refuses instead of resolving against nothing.
+            ParamKind::DirRef => match resolve_dir_ref(spoken, directories) {
+                DirRefMatch::One { path, name } => resolved.push(ResolvedParam {
+                    name: spec.name.clone(),
+                    kind: spec.kind,
+                    spoken: spoken.to_string(),
+                    value: path,
+                    label: name,
+                }),
+                DirRefMatch::None => {
+                    return finish(VoiceOutcome::ParamUnresolved {
+                        sentence: heard(&transcript, &spec.kind.unresolved_phrase(spoken)),
+                        transcript,
+                        action: row.id.clone(),
+                        param: spec.name.clone(),
+                        spoken: spoken.to_string(),
+                    });
+                }
+                DirRefMatch::Ambiguous(names) => {
+                    return finish(VoiceOutcome::ParamAmbiguous {
+                        sentence: heard(&transcript, &spec.kind.ambiguous_phrase(spoken, &names)),
+                        transcript,
+                        action: row.id.clone(),
+                        param: spec.name.clone(),
+                        spoken: spoken.to_string(),
+                        matches: names,
                     });
                 }
             },
@@ -676,6 +721,7 @@ impl ParamKind {
         match self {
             ParamKind::AgentRef => "I could not tell which agent you meant",
             ParamKind::DeckRef => "I could not tell which deck you meant",
+            ParamKind::DirRef => "I could not tell which directory you meant",
             // The model picked dictation and marked no boundary, so there is
             // no answer to the only question this kind asks: where do the
             // user's own words start? Nothing is typed, and the sentence says
@@ -701,6 +747,12 @@ impl ParamKind {
         match self {
             ParamKind::AgentRef => format!("no agent here matches \u{201c}{spoken}\u{201d}"),
             ParamKind::DeckRef => format!("no deck matches \u{201c}{spoken}\u{201d}"),
+            // "on screen", because that is the whole of the claim: a directory
+            // by that name may well exist elsewhere on the deck, and this app
+            // deliberately cannot look (no search verb — see `commands.toml`).
+            ParamKind::DirRef => {
+                format!("no directory on screen matches \u{201c}{spoken}\u{201d}")
+            }
             // **The fidelity refusal**, and the one sentence in this file that
             // reports a disagreement between the app and the model. The words
             // quoted are the MODEL's — scrubbed like every foreign string — and
@@ -743,6 +795,9 @@ impl ParamKind {
             }
             ParamKind::DeckRef => {
                 format!("\u{201c}{spoken}\u{201d} matches more than one deck: {listed}")
+            }
+            ParamKind::DirRef => {
+                format!("\u{201c}{spoken}\u{201d} matches more than one directory: {listed}")
             }
             // Unreachable: a prefix resolves against the transcript, which
             // either starts with the marked words or does not. Written out
@@ -863,6 +918,93 @@ pub fn resolve_deck_ref(spoken: &str, decks: &[VoiceDeck]) -> DeckRefMatch {
             label: hits[0].label.clone(),
         },
         _ => DeckRefMatch::Ambiguous(hits.iter().map(|deck| deck.label.clone()).collect()),
+    }
+}
+
+/// What a spoken directory reference resolved to — [`DeckRefMatch`]'s shape
+/// over the browser's children on screen.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DirRefMatch {
+    /// `path` is the deck's own path for it; `name` is what the browser shows.
+    One {
+        path: String,
+        name: String,
+    },
+    None,
+    Ambiguous(Vec<String>),
+}
+
+/// Resolve a spoken reference against the directories the New agent dialog's
+/// browser is showing (PRD #1223).
+///
+/// [`resolve_agent_ref`]'s two passes, exact before loose — with the loose pass
+/// narrowed to its most specific hits (see the body) — over the names a
+/// child answers to: its `displayName`, and — when it has dots in it — the same
+/// name with each `.` spoken as a space, because nobody says "billing dot api"
+/// and a transcriber will not write `.config`. That second spelling is also why
+/// `.config` beside `config` is AMBIGUOUS for "config": both are exact under a
+/// name each answers to, and the honest answer names the two of them.
+///
+/// **Only what is on screen, and never a search.** With nothing declared —
+/// dialog closed, no deck chosen, no listing loaded — there is nothing to
+/// resolve against and the answer is [`DirRefMatch::None`], never the entries of
+/// a listing the user has since left.
+pub fn resolve_dir_ref(spoken: &str, directories: Option<&VoiceDirectories>) -> DirRefMatch {
+    let Some(directories) = directories else {
+        return DirRefMatch::None;
+    };
+    let reference = normalize(spoken);
+    if reference.is_empty() {
+        return DirRefMatch::None;
+    }
+    let reference_words = words(&reference);
+
+    let mut exact = Vec::new();
+    let mut loose = Vec::new();
+    for entry in &directories.entries {
+        let mut names = vec![entry.name.clone()];
+        if entry.name.contains('.') {
+            names.push(entry.name.replace('.', " "));
+        }
+        if names.iter().any(|name| normalize(name) == reference) {
+            exact.push(entry);
+        } else if names.iter().any(|name| word_subset(&reference_words, name)) {
+            // How many of the spoken words this child's best name shares.
+            let shared = names
+                .iter()
+                .map(|name| {
+                    words(&normalize(name))
+                        .intersection(&reference_words)
+                        .count()
+                })
+                .max()
+                .unwrap_or(0);
+            loose.push((entry, shared));
+        }
+    }
+
+    // The loose pass keeps only the MOST specific children, which is the one
+    // way this differs from the agent and deck resolvers, and it is here
+    // because directories share prefixes far more than agents or decks do:
+    // "the billing api folder" is a word-superset of both `billing` and
+    // `billing-api`, and calling that ambiguous would refuse the one the user
+    // plainly meant. `billing-api` shares two of the words and `billing` one,
+    // so `billing-api` wins; "docs" beside `docs-site` and `docs-api` shares
+    // one word with each and stays ambiguous, which is the honest answer.
+    let most = loose.iter().map(|(_, shared)| *shared).max().unwrap_or(0);
+    let loose: Vec<_> = loose
+        .into_iter()
+        .filter(|(_, shared)| *shared == most)
+        .map(|(entry, _)| entry)
+        .collect();
+    let hits = if exact.is_empty() { loose } else { exact };
+    match hits.len() {
+        0 => DirRefMatch::None,
+        1 => DirRefMatch::One {
+            path: hits[0].path.clone(),
+            name: hits[0].name.clone(),
+        },
+        _ => DirRefMatch::Ambiguous(hits.iter().map(|entry| entry.name.clone()).collect()),
     }
 }
 
@@ -1251,6 +1393,341 @@ mod tests {
         );
     }
 
+    // -- dir_ref (PRD #1223) ----------------------------------------------
+
+    fn entry(name: &str) -> crate::voice::VoiceDirectoryEntry {
+        crate::voice::VoiceDirectoryEntry {
+            name: name.to_string(),
+            path: format!("/home/dev/code/{name}"),
+        }
+    }
+
+    /// One level of the local deck as the browser shows it: `billing` and
+    /// `billing-api` so "billing" is exact and "api" is not ambiguous, and
+    /// `docs` / `docs-site` so the loose pass has two candidates for "docs
+    /// site stuff".
+    fn listing(names: &[&str], has_parent: bool) -> VoiceDirectories {
+        VoiceDirectories {
+            deck_id: "deck-local".to_string(),
+            path: "/home/dev/code".to_string(),
+            has_parent,
+            entries: names.iter().map(|name| entry(name)).collect(),
+        }
+    }
+
+    fn code_dir() -> VoiceDirectories {
+        listing(
+            &[
+                "billing",
+                "billing-api",
+                "docs",
+                "infra.config",
+                "web-frontend",
+            ],
+            true,
+        )
+    }
+
+    #[test]
+    fn voice_outcome_dir_ref_resolves_one_directory_on_screen() {
+        let code = code_dir();
+        for (said, name) in [
+            ("billing", "billing"),
+            ("Billing", "billing"),
+            ("billing api", "billing-api"),
+            // Most specific wins in the loose pass: both `billing` and
+            // `billing-api` are word-subsets of these, and `billing-api`
+            // shares more of the words.
+            ("the billing-api folder", "billing-api"),
+            ("the billing api", "billing-api"),
+            ("web frontend", "web-frontend"),
+            ("frontend", "web-frontend"),
+            // Dots are spoken as spaces: nobody says "infra dot config".
+            ("infra config", "infra.config"),
+            ("infra.config", "infra.config"),
+        ] {
+            assert_eq!(
+                resolve_dir_ref(said, Some(&code)),
+                DirRefMatch::One {
+                    path: format!("/home/dev/code/{name}"),
+                    name: name.to_string(),
+                },
+                "{said}"
+            );
+        }
+    }
+
+    #[test]
+    fn voice_outcome_dir_ref_is_none_for_a_name_not_on_screen() {
+        let code = code_dir();
+        assert_eq!(resolve_dir_ref("payments", Some(&code)), DirRefMatch::None);
+        assert_eq!(resolve_dir_ref("   ", Some(&code)), DirRefMatch::None);
+        // An empty level has nothing to name.
+        assert_eq!(
+            resolve_dir_ref("billing", Some(&listing(&[], true))),
+            DirRefMatch::None
+        );
+    }
+
+    #[test]
+    fn voice_outcome_dir_ref_is_ambiguous_when_two_directories_match() {
+        let level = listing(&["docs-site", "docs-api", "src"], true);
+        assert_eq!(
+            resolve_dir_ref("docs", Some(&level)),
+            DirRefMatch::Ambiguous(vec!["docs-site".to_string(), "docs-api".to_string()])
+        );
+        // `.config` and `config` are both EXACT for "config" — each answers to
+        // it — so the honest answer names both rather than picking one.
+        let dotted = listing(&[".config", "config"], true);
+        assert_eq!(
+            resolve_dir_ref("config", Some(&dotted)),
+            DirRefMatch::Ambiguous(vec![".config".to_string(), "config".to_string()])
+        );
+    }
+
+    #[test]
+    fn voice_outcome_dir_ref_exact_beats_loose() {
+        // "billing" is exactly one child and loosely the other; the exact one
+        // wins rather than the pair being called ambiguous.
+        assert_eq!(
+            resolve_dir_ref("billing", Some(&code_dir())),
+            DirRefMatch::One {
+                path: "/home/dev/code/billing".to_string(),
+                name: "billing".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn voice_outcome_dir_ref_resolves_nothing_when_nothing_is_declared() {
+        // Dialog closed, no deck chosen, no listing loaded: the webview
+        // declares nothing, and nothing is resolved — never a stale listing.
+        assert_eq!(resolve_dir_ref("billing", None), DirRefMatch::None);
+    }
+
+    async fn run_with(
+        resolver: &StubResolver,
+        screen: Screen,
+        directories: Option<&VoiceDirectories>,
+        said: &str,
+    ) -> VoiceOutcome {
+        handle_utterance(
+            resolver,
+            table(),
+            screen,
+            &fleet(),
+            &decks(),
+            directories,
+            Transcript::new(said),
+        )
+        .await
+        .outcome
+    }
+
+    #[tokio::test]
+    async fn voice_outcome_open_dir_dispatches_the_deck_path_of_the_named_child() {
+        let resolver = StubResolver::new().answering(
+            "open dir billing api",
+            IntentAnswer::new("open_dir").with_param("dir", "billing api"),
+        );
+        let code = code_dir();
+        let outcome = run_with(
+            &resolver,
+            Screen::Overview,
+            Some(&code),
+            "open dir billing api",
+        )
+        .await;
+        assert_eq!(
+            outcome,
+            VoiceOutcome::Dispatch {
+                transcript: Transcript::new("open dir billing api"),
+                action: "open_dir".to_string(),
+                invoke: "openDirectory".to_string(),
+                params: vec![ResolvedParam {
+                    name: "dir".to_string(),
+                    kind: ParamKind::DirRef,
+                    spoken: "billing api".to_string(),
+                    value: "/home/dev/code/billing-api".to_string(),
+                    label: "billing-api".to_string(),
+                }],
+                sentence: "Opening billing-api.".to_string(),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn voice_outcome_open_dir_refuses_a_name_not_on_screen() {
+        let resolver = StubResolver::new().answering(
+            "open dir payments",
+            IntentAnswer::new("open_dir").with_param("dir", "payments"),
+        );
+        let code = code_dir();
+        let outcome = run_with(
+            &resolver,
+            Screen::Overview,
+            Some(&code),
+            "open dir payments",
+        )
+        .await;
+        assert_eq!(
+            outcome,
+            VoiceOutcome::ParamUnresolved {
+                transcript: Transcript::new("open dir payments"),
+                action: "open_dir".to_string(),
+                param: "dir".to_string(),
+                spoken: "payments".to_string(),
+                sentence: "Heard: \u{201c}open dir payments\u{201d} — no directory on screen matches \u{201c}payments\u{201d}.".to_string(),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn voice_outcome_open_dir_names_the_candidates_of_an_ambiguous_name() {
+        let resolver = StubResolver::new().answering(
+            "open the docs one",
+            IntentAnswer::new("open_dir").with_param("dir", "docs"),
+        );
+        let level = listing(&["docs-site", "docs-api", "src"], true);
+        let outcome = run_with(
+            &resolver,
+            Screen::Overview,
+            Some(&level),
+            "open the docs one",
+        )
+        .await;
+        let VoiceOutcome::ParamAmbiguous {
+            matches, sentence, ..
+        } = outcome
+        else {
+            panic!("expected an ambiguity, got {outcome:?}");
+        };
+        assert_eq!(
+            matches,
+            vec!["docs-site".to_string(), "docs-api".to_string()]
+        );
+        assert_eq!(
+            sentence,
+            "Heard: \u{201c}open the docs one\u{201d} — \u{201c}docs\u{201d} matches more than one directory: docs-site, docs-api."
+        );
+    }
+
+    #[tokio::test]
+    async fn voice_outcome_open_dir_without_a_dir_is_param_missing() {
+        let resolver = StubResolver::new().answering("open a dir", IntentAnswer::new("open_dir"));
+        let code = code_dir();
+        let outcome = run_with(&resolver, Screen::Overview, Some(&code), "open a dir").await;
+        assert!(
+            matches!(&outcome, VoiceOutcome::ParamMissing { param, .. } if param == "dir"),
+            "{outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn voice_outcome_go_to_parent_and_use_this_directory_dispatch_with_a_listing() {
+        let code = code_dir();
+        for (said, action, invoke, sentence) in [
+            (
+                "go to parent dir",
+                "go_to_parent",
+                "goToParentDirectory",
+                "Going up.",
+            ),
+            (
+                "use this directory",
+                "use_this_directory",
+                "useThisDirectory",
+                "Using this directory.",
+            ),
+        ] {
+            let resolver = StubResolver::new().answering(said, IntentAnswer::new(action));
+            let outcome = run_with(&resolver, Screen::Overview, Some(&code), said).await;
+            assert_eq!(
+                outcome,
+                VoiceOutcome::Dispatch {
+                    transcript: Transcript::new(said),
+                    action: action.to_string(),
+                    invoke: invoke.to_string(),
+                    params: Vec::new(),
+                    sentence: sentence.to_string(),
+                }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn voice_outcome_directory_rows_are_unavailable_with_the_dialog_closed() {
+        // On the overview itself — the right screen — but with nothing
+        // declared, which is how a closed dialog (or one with no deck chosen or
+        // no listing yet) reaches Rust. Each is refused with its own hint
+        // rather than dispatched into a dialog that is not there.
+        for (said, action, hint) in [
+            (
+                "open dir billing",
+                "open_dir",
+                "opening a directory works while the New agent dialog is showing a directory listing",
+            ),
+            (
+                "go to parent dir",
+                "go_to_parent",
+                "going up works while the New agent dialog is showing a directory that has a parent",
+            ),
+            (
+                "use this directory",
+                "use_this_directory",
+                "choosing a directory works while the New agent dialog is showing a directory listing",
+            ),
+        ] {
+            let answer = if action == "open_dir" {
+                IntentAnswer::new(action).with_param("dir", "billing")
+            } else {
+                IntentAnswer::new(action)
+            };
+            let resolver = StubResolver::new().answering(said, answer);
+            let outcome = run_with(&resolver, Screen::Overview, None, said).await;
+            assert_eq!(
+                outcome,
+                VoiceOutcome::Unavailable {
+                    transcript: Transcript::new(said),
+                    action: action.to_string(),
+                    hint: hint.to_string(),
+                    sentence: format!("Not here — {hint}."),
+                },
+                "{said}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn voice_outcome_directory_rows_are_unavailable_off_the_overview() {
+        // Even with a declaration: `requires` narrows `screens`, it never
+        // widens it, so a listing that somehow arrived with the deck screen
+        // declared buys nothing.
+        let code = code_dir();
+        for screen in [Screen::Deck, Screen::Agent] {
+            let resolver = StubResolver::new().answering(
+                "use this directory",
+                IntentAnswer::new("use_this_directory"),
+            );
+            let outcome = run_with(&resolver, screen, Some(&code), "use this directory").await;
+            assert!(
+                matches!(outcome, VoiceOutcome::Unavailable { .. }),
+                "{screen}: {outcome:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn voice_outcome_go_to_parent_is_unavailable_at_a_root() {
+        let root = listing(&["home", "srv"], false);
+        let resolver = StubResolver::new().answering("go up", IntentAnswer::new("go_to_parent"));
+        let outcome = run_with(&resolver, Screen::Overview, Some(&root), "go up").await;
+        assert_eq!(
+            outcome.sentence(),
+            "Not here — going up works while the New agent dialog is showing a directory that has a parent."
+        );
+    }
+
     async fn run(
         resolver: &StubResolver,
         screen: Screen,
@@ -1273,6 +1750,7 @@ mod tests {
             screen,
             agents,
             &decks(),
+            None,
             Transcript::new(said),
         )
         .await
@@ -1727,6 +2205,7 @@ mod tests {
             description: "d".to_string(),
             invoke: "twoParams".to_string(),
             screens: vec![Screen::Deck],
+            requires: Vec::new(),
             unavailable_hint: "h".to_string(),
             report: "{first} then {second}.".to_string(),
             params: Vec::new(),
@@ -1785,6 +2264,7 @@ mod tests {
             description: "d".to_string(),
             invoke: "spaced".to_string(),
             screens: vec![Screen::Deck],
+            requires: Vec::new(),
             unavailable_hint: "h".to_string(),
             report: "Opening { agent }.".to_string(),
             params: Vec::new(),
@@ -1832,6 +2312,7 @@ mod tests {
                 Screen::Deck,
                 &fleet(),
                 &[],
+                None,
                 Transcript::new("open the tester"),
             )
             .await
@@ -2106,6 +2587,7 @@ mod tests {
             Screen::Deck,
             &fleet(),
             &[],
+            None,
             "show everything".into(),
         )
         .await;
@@ -2219,6 +2701,7 @@ mod tests {
             Screen::Agent,
             &fleet(),
             &[],
+            None,
             Transcript::new("type run the login tests"),
         )
         .await;
@@ -2244,6 +2727,7 @@ mod tests {
             Screen::Agent,
             &fleet(),
             &[],
+            None,
             Transcript::new(heard),
         )
         .await;
@@ -2267,6 +2751,7 @@ mod tests {
             Screen::Agent,
             &fleet(),
             &[],
+            None,
             Transcript::new("type hello end"),
         )
         .await;
@@ -2287,6 +2772,7 @@ mod tests {
             Screen::Agent,
             &fleet(),
             &[],
+            None,
             Transcript::new("End."),
         )
         .await;
@@ -2312,6 +2798,7 @@ mod tests {
             Screen::Agent,
             &fleet(),
             &[],
+            None,
             Transcript::new("type end of file"),
         )
         .await;
@@ -2329,6 +2816,7 @@ mod tests {
                 screen,
                 &fleet(),
                 &[],
+                None,
                 Transcript::new("type run the login tests"),
             )
             .await;
@@ -2360,6 +2848,7 @@ mod tests {
             Screen::Agent,
             &fleet(),
             &[],
+            None,
             Transcript::new("type"),
         )
         .await;
@@ -2386,6 +2875,7 @@ mod tests {
             Screen::Agent,
             &fleet(),
             &[],
+            None,
             Transcript::new("let's write a prompt run the tests"),
         )
         .await;
@@ -2407,6 +2897,7 @@ mod tests {
             Screen::Agent,
             &fleet(),
             &[],
+            None,
             Transcript::new(heard),
         )
         .await;
@@ -2436,6 +2927,7 @@ mod tests {
             Screen::Agent,
             &fleet(),
             &[],
+            None,
             Transcript::new("run the login tests"),
         )
         .await;
@@ -2471,6 +2963,7 @@ mod tests {
             Screen::Agent,
             &fleet(),
             &[],
+            None,
             Transcript::new("let's write a prompt"),
         )
         .await;
@@ -2490,6 +2983,7 @@ mod tests {
             Screen::Agent,
             &fleet(),
             &[],
+            None,
             Transcript::new("just write that down somewhere"),
         )
         .await;

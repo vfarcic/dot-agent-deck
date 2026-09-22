@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createFixtureSnapshot } from "../data/fixture";
 import { createDeckBridge, selectRuntimeMode } from "../lib/bridge";
-import type { DesktopSettingsDto, VoiceScreen, VoiceSecretId } from "../lib/bridge";
+import type { DesktopSettingsDto, VoiceDirectoriesDto, VoiceScreen, VoiceSecretId } from "../lib/bridge";
 import { agentKey } from "../lib/agentKey";
 import { LaunchCleanupError } from "../lib/actionError";
 import { applyTerminalChunk } from "../lib/terminalBuffer";
@@ -364,9 +364,9 @@ export function useDeckRuntime(): DeckRuntimeState {
    * routing "no matching action" into the deck's global error toast would
    * present a voice answer as a fault of the screen behind it.
    */
-  const declareVoiceScreen = useCallback((screen: VoiceScreen) => bridge.declareVoiceScreen(screen), [bridge]);
+  const declareVoiceScreen = useCallback((screen: VoiceScreen, directories?: VoiceDirectoriesDto) => bridge.declareVoiceScreen(screen, directories), [bridge]);
   const resolveVoice = useCallback((utterance: string) => bridge.resolveVoice(utterance), [bridge]);
-  const voiceCommands = useCallback((screen: VoiceScreen) => bridge.voiceCommands(screen), [bridge]);
+  const voiceCommands = useCallback((screen: VoiceScreen, directories?: VoiceDirectoriesDto) => bridge.voiceCommands(screen, directories), [bridge]);
   const voiceStart = useCallback(() => bridge.voiceStart(), [bridge]);
   const voiceStop = useCallback(() => bridge.voiceStop(), [bridge]);
   const voiceStatus = useCallback(() => bridge.voiceStatus(), [bridge]);

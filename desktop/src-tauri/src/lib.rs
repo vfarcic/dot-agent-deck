@@ -2684,6 +2684,49 @@ async fn desktop_voice_cancel(
 /// impossible.
 const MAX_UTTERANCE_BYTES: usize = 2 * 1024;
 
+/// The bounds on what the webview may declare its directory browser to be
+/// showing (PRD #1223), checked by [`validate_voice_directories`] before any of
+/// it reaches a model prompt or a resolver.
+///
+/// The entry count is the deck's own listing cap (`MAX_DIRECTORY_ENTRIES` in the
+/// root crate's `directory_listing`, 1,000): a real declaration is a filtered
+/// subset of one listing, so it can never exceed that. Written out rather than
+/// imported, because this crate reaches into no root module about the deck's
+/// filesystem (linkage-check rule 12, PRD #819); a deck that raised its cap would
+/// make a full listing refused here, which fails loudly rather than silently.
+/// The byte bounds are wide of any real filesystem — a component is 255 bytes on
+/// every filesystem this app ships to, a path at most `PATH_MAX` — and narrow of
+/// a payload.
+const MAX_VOICE_DIRECTORY_ENTRIES: usize = 1_000;
+const MAX_VOICE_DIRECTORY_NAME_BYTES: usize = 1024;
+const MAX_VOICE_DIRECTORY_PATH_BYTES: usize = 4096;
+const MAX_VOICE_DECK_ID_BYTES: usize = 256;
+
+/// Refuse a directory declaration no real browser could have produced.
+///
+/// A refusal is an `Err` for the whole command rather than a declaration
+/// quietly dropped: dropping it would make the directory rows `callable: false`
+/// and render a hint telling the user to open a dialog that IS open, which is a
+/// wrong sentence rather than an honest failure. Only a misbehaving page can
+/// reach it.
+fn validate_voice_directories(directories: &voice::VoiceDirectories) -> Result<(), String> {
+    let too_long = |value: &str, limit: usize| value.len() > limit;
+    if directories.entries.len() > MAX_VOICE_DIRECTORY_ENTRIES
+        || too_long(&directories.deck_id, MAX_VOICE_DECK_ID_BYTES)
+        || too_long(&directories.path, MAX_VOICE_DIRECTORY_PATH_BYTES)
+        || directories.entries.iter().any(|entry| {
+            too_long(&entry.name, MAX_VOICE_DIRECTORY_NAME_BYTES)
+                || too_long(&entry.path, MAX_VOICE_DIRECTORY_PATH_BYTES)
+        })
+    {
+        return Err(
+            "the directory listing sent with that command is larger than any deck lists"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 /// PRD #802 M6: take one utterance to an outcome carrying the sentence to show.
 ///
 /// # What it does NOT do
@@ -2706,6 +2749,13 @@ const MAX_UTTERANCE_BYTES: usize = 2 * 1024;
 /// cannot be read here at all — it is React state — so it is the one piece the
 /// webview states, which is what `DeckBridge.declareVoiceScreen` is.
 ///
+/// **`directories` is the second such piece** (PRD #1223): what the New agent
+/// dialog's directory browser is showing, which is that component's state and
+/// nobody else's — the daemon lists one level per request and keeps none of
+/// them. It is declared in the same call, for the same reason, and bounded by
+/// [`validate_voice_directories`]. It is an IPC argument between this app's own
+/// webview and its own Rust half; nothing about it reaches the daemon.
+///
 /// # One `ListAgents` per utterance
 ///
 /// [`get_snapshot`] fetches rather than reading a cache, which is one daemon
@@ -2726,12 +2776,16 @@ async fn desktop_voice_resolve(
     state: State<'_, DesktopState>,
     utterance: String,
     screen: voice::Screen,
+    directories: Option<voice::VoiceDirectories>,
 ) -> Result<voice::VoiceResult, String> {
     ensure_main_webview(&webview)?;
     if utterance.len() > MAX_UTTERANCE_BYTES {
         return Err(format!(
             "that command is too long to send — {MAX_UTTERANCE_BYTES} bytes at most"
         ));
+    }
+    if let Some(directories) = &directories {
+        validate_voice_directories(directories)?;
     }
     // Read per call rather than cached, for `voice_speech_settings`'s reason: a
     // user who changes the backend, the endpoint or the model uses it on the
@@ -2750,6 +2804,7 @@ async fn desktop_voice_resolve(
         screen,
         &snapshot.agents,
         &decks,
+        directories.as_ref(),
         voice::Transcript::new(utterance),
     )
     .await)
@@ -2813,9 +2868,17 @@ fn voice_decks(observed: &[crate::dto::ObservedDeckDto]) -> Vec<voice::VoiceDeck
 async fn desktop_voice_commands(
     webview: Webview,
     screen: voice::Screen,
+    directories: Option<voice::VoiceDirectories>,
 ) -> Result<Vec<voice::AnnotatedCommand>, String> {
     ensure_main_webview(&webview)?;
-    Ok(voice::annotate(voice::table(), screen))
+    if let Some(directories) = &directories {
+        validate_voice_directories(directories)?;
+    }
+    Ok(voice::annotate_with(
+        voice::table(),
+        screen,
+        directories.as_ref(),
+    ))
 }
 
 /// Put a saved document's deck selection into force (PRD #741 M7, completed at
@@ -4287,6 +4350,73 @@ mod tests {
     use std::collections::VecDeque;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    fn voice_listing(entries: usize) -> voice::VoiceDirectories {
+        voice::VoiceDirectories {
+            deck_id: "deck-0000000000000001".to_string(),
+            path: "/home/dev".to_string(),
+            has_parent: true,
+            entries: (0..entries)
+                .map(|index| voice::VoiceDirectoryEntry {
+                    name: format!("dir-{index}"),
+                    path: format!("/home/dev/dir-{index}"),
+                })
+                .collect(),
+        }
+    }
+
+    /// PRD #1223: a directory declaration as large as a deck can list is
+    /// accepted, and one no real browser could have produced is refused.
+    #[test]
+    fn voice_directory_declarations_are_bounded() {
+        assert!(validate_voice_directories(&voice_listing(0)).is_ok());
+        assert!(validate_voice_directories(&voice_listing(MAX_VOICE_DIRECTORY_ENTRIES)).is_ok());
+        assert!(
+            validate_voice_directories(&voice_listing(MAX_VOICE_DIRECTORY_ENTRIES + 1)).is_err()
+        );
+
+        let mut long_name = voice_listing(1);
+        long_name.entries[0].name = "x".repeat(MAX_VOICE_DIRECTORY_NAME_BYTES + 1);
+        assert!(validate_voice_directories(&long_name).is_err());
+
+        let mut long_path = voice_listing(1);
+        long_path.path = "/".repeat(MAX_VOICE_DIRECTORY_PATH_BYTES + 1);
+        assert!(validate_voice_directories(&long_path).is_err());
+
+        let mut long_entry_path = voice_listing(1);
+        long_entry_path.entries[0].path = "/".repeat(MAX_VOICE_DIRECTORY_PATH_BYTES + 1);
+        assert!(validate_voice_directories(&long_entry_path).is_err());
+
+        let mut long_deck = voice_listing(1);
+        long_deck.deck_id = "d".repeat(MAX_VOICE_DECK_ID_BYTES + 1);
+        assert!(validate_voice_directories(&long_deck).is_err());
+    }
+
+    /// The declaration's wire shape is the webview's: camelCase, and nothing
+    /// it does not name.
+    #[test]
+    fn voice_directory_declarations_deserialize_from_the_webview_shape() {
+        let parsed: voice::VoiceDirectories = serde_json::from_value(serde_json::json!({
+            "deckId": "deck-1",
+            "path": "/home/dev",
+            "hasParent": false,
+            "entries": [{ "name": "billing", "path": "/home/dev/billing" }],
+        }))
+        .expect("parses");
+        assert_eq!(parsed.deck_id, "deck-1");
+        assert!(!parsed.has_parent);
+        assert_eq!(parsed.entries[0].name, "billing");
+        assert!(
+            serde_json::from_value::<voice::VoiceDirectories>(serde_json::json!({
+                "deckId": "deck-1",
+                "path": "/home/dev",
+                "hasParent": false,
+                "entries": [],
+                "cursor": 3,
+            }))
+            .is_err()
+        );
+    }
 
     /// PRD #1105 M11 step 4: only a window's `Focused` event carries its focus
     /// state, in both directions; any other window event is not a focus change.

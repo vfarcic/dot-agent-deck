@@ -21,7 +21,7 @@ use std::pin::Pin;
 use serde::{Deserialize, Serialize};
 
 use super::schema::AnnotatedCommand;
-use super::{Transcript, VoiceDeck};
+use super::{Transcript, VoiceDeck, VoiceDirectories};
 use crate::dto::DesktopAgent;
 
 /// Everything a backend is given for one utterance.
@@ -41,6 +41,12 @@ pub struct IntentRequest<'a> {
     /// selected deck — naming a deck other than the one on screen is what a
     /// deck reference is for. Read-only here for `agents`' reason.
     pub decks: &'a [VoiceDeck],
+    /// What the New agent dialog's directory browser is showing, when it is
+    /// showing a listing (PRD #1223) — the set a spoken `dir_ref` like
+    /// "billing" resolves against. `None` whenever there is nothing on screen
+    /// to name; see [`VoiceDirectories`] for why this one piece is declared by
+    /// the webview rather than read Rust-side.
+    pub directories: Option<&'a VoiceDirectories>,
 }
 
 /// What a backend answers with: an action id and the params as the user
@@ -298,6 +304,7 @@ mod tests {
             commands,
             agents: &[],
             decks: &[],
+            directories: None,
         }
     }
 

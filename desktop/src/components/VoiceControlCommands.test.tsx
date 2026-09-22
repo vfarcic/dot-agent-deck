@@ -5,6 +5,7 @@ import {
   DEFAULT_DESKTOP_SETTINGS,
   type DesktopSettingsDto,
   type VoiceCommandDto,
+  type VoiceDirectoriesDto,
   type VoiceResolvedParamDto,
   type VoiceResultDto,
   type VoiceStatusDto,
@@ -20,7 +21,7 @@ vi.mock("./TerminalViewport", () => ({
 }));
 
 import { DeckShell } from "../App";
-import { STARTING_CLOSE_BLOCKED } from "./NewAgentDialog";
+import { DIRECTORY_MOVED_ON, NO_DIRECTORY_BROWSER, NO_PARENT_DIRECTORY, STARTING_CLOSE_BLOCKED } from "./NewAgentDialog";
 import {
   NOTHING_DISPATCHED,
   VOICE_DICTATION_SEND_MS,
@@ -328,7 +329,8 @@ describe("what can I say?", () => {
     await turnVoiceOn();
     await completeUtterance();
 
-    expect(voiceCommands).toHaveBeenCalledWith("deck");
+    // No directory browser is declared off the New agent dialog (PRD #1223).
+    expect(voiceCommands).toHaveBeenCalledWith("deck", undefined);
     const overlay = screen.getByTestId("voice-help");
     expect(overlay).toHaveTextContent("Show every agent in one list.");
     const here = overlay.querySelector('[data-where="here"]');
@@ -352,7 +354,7 @@ describe("what can I say?", () => {
     await turnVoiceOn();
     await completeUtterance();
 
-    expect(voiceCommands).toHaveBeenCalledWith("overview");
+    expect(voiceCommands).toHaveBeenCalledWith("overview", undefined);
   });
 
   /**
@@ -1053,5 +1055,323 @@ describe("opening the New agent dialog, as a command (PRD #1223)", () => {
     expect(screen.getByTestId("new-agent-dialog")).toBeInTheDocument();
     expect(highlightedDeck()).toBeUndefined();
     expect(deck.runAction).not.toHaveBeenCalled();
+  });
+});
+
+describe("the New agent directory browser, by voice (PRD #1223)", () => {
+  beforeEach(() => {
+    window.localStorage.clear();
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  /* The deck's filesystem, one level per request, as `listDirectories`
+     answers it: home has a parent and two children; `billing` has none; the
+     filesystem root has no parent. */
+  const LEVELS: Record<string, { parent?: string; children: string[] }> = {
+    "/home/dev": { parent: "/home", children: ["billing", "docs"] },
+    "/home/dev/billing": { parent: "/home/dev", children: [] },
+    "/home": { parent: "/", children: ["dev"] },
+    "/": { children: ["home"] },
+  };
+  function listing(path: string) {
+    const level = LEVELS[path];
+    return {
+      kind: "listing" as const,
+      path,
+      displayPath: path,
+      ...(level.parent === undefined ? {} : { parent: level.parent }),
+      entries: level.children.map((name) => ({ path: path === "/" ? `/${name}` : `${path}/${name}`, displayName: name, isProject: false })),
+      truncated: false,
+    };
+  }
+
+  /**
+   * A resolver that does what Rust does with the declaration, and nothing
+   * more: a directory row is `unavailable` with no browser declared, `open dir
+   * <name>` resolves `<name>` against the declared entries, and `go to parent`
+   * needs a declared `..`. `forced` answers a dispatch regardless, for the
+   * cases where the browser moves AFTER Rust judged the utterance.
+   */
+  function browserVoice(declared: () => VoiceDirectoriesDto | undefined, options: { forced?: boolean; during?: () => Promise<void> } = {}): ResolveVoice {
+    return vi.fn(async (utterance: string) => {
+      const directories = declared();
+      await options.during?.();
+      const unavailable = (action: string, hint: string): VoiceResultDto => ({ resolveMs: 21, backend: "stub", outcome: { kind: "unavailable", transcript: utterance, action, hint, sentence: `Not here — ${hint}.` } });
+      if (utterance.startsWith("open dir ")) {
+        const name = utterance.slice("open dir ".length);
+        if (!directories && !options.forced) return unavailable("open_dir", "opening a directory works while the New agent dialog is showing a directory listing");
+        const entry = directories?.entries.find((candidate) => candidate.name === name) ?? { name, path: `/home/dev/${name}` };
+        return dispatch("open_dir", "openDirectory", `Opening ${entry.name}.`, utterance, [{ name: "dir", kind: "dir_ref", spoken: name, value: entry.path, label: entry.name }]);
+      }
+      if (utterance === "go to parent") {
+        if (!directories?.hasParent && !options.forced) return unavailable("go_to_parent", "going up works while the New agent dialog is showing a directory that has a parent");
+        return dispatch("go_to_parent", "goToParentDirectory", "Going up.", utterance);
+      }
+      if (utterance === "use this directory") {
+        if (!directories && !options.forced) return unavailable("use_this_directory", "choosing a directory works while the New agent dialog is showing a directory listing");
+        return dispatch("use_this_directory", "useThisDirectory", "Using this directory.", utterance);
+      }
+      return dispatch("close", "closeTopmost", "Closed.", utterance);
+    });
+  }
+
+  /** A runtime over the one-deck fixture that can run the New agent flow and records every declaration. */
+  function browsingDeck(voice: VoiceControls, options: { forced?: boolean; during?: () => Promise<void>; startAt?: string; holdStart?: boolean } = {}) {
+    const declarations: (VoiceDirectoriesDto | undefined)[] = [];
+    const declareVoiceScreen = vi.fn((_screen: string, directories?: VoiceDirectoriesDto) => { declarations.push(directories); });
+    const listDirectories = vi.fn(async (_deckId: string, path?: string) => listing(path ?? options.startAt ?? "/home/dev"));
+    const runAction = vi.fn((action: { type: string }) => action.type === "start_agent" && options.holdStart
+      ? new Promise<DeckActionResult>(() => {})
+      : Promise.resolve({ ok: true } as DeckActionResult));
+    const deck = runtime(browserVoice(() => declarations.at(-1), options), voice, {
+      declareVoiceScreen,
+      runAction,
+      listDirectories,
+      newAgentOptions: vi.fn(async () => ({ kind: "deck" as const, agents: [], experimental: false, authoringKinds: [] })),
+    } as Partial<DeckRuntimeState>);
+    return { deck, declarations, listDirectories };
+  }
+
+  /** Open the dialog on the one deck, whose preselection chooses it and lists its home. */
+  async function openBrowser() {
+    fireEvent.click(screen.getByTestId("overview-new-agent"));
+    await flush();
+    await flush();
+    expect(screen.getByTestId("new-agent-directory-list")).toBeInTheDocument();
+  }
+
+  const currentPath = () => screen.getByTestId("new-agent-current-path").textContent;
+
+  /**
+   * Scenario: open the New agent dialog, then say "open dir billing". The
+   * utterance is declared with the browser's children on screen, and the
+   * browser goes into `billing` exactly as a click on that row would.
+   */
+  it("opens a directory named on screen", async () => {
+    const voice = microphone([]);
+    const { deck, declarations, listDirectories } = browsingDeck(voice);
+    render(<DeckShell runtime={deck} initialView={{ kind: "overview" }} />);
+    await turnVoiceOn();
+    await openBrowser();
+    const deckId = listDirectories.mock.calls[0][0];
+
+    voice.deliver("open dir billing");
+    await completeUtterance();
+    await flush();
+
+    expect(declarations.at(-1)).toEqual({
+      deckId,
+      path: "/home/dev",
+      hasParent: true,
+      entries: [{ name: "billing", path: "/home/dev/billing" }, { name: "docs", path: "/home/dev/docs" }],
+    });
+    expect(listDirectories).toHaveBeenLastCalledWith(deckId, "/home/dev/billing");
+    expect(currentPath()).toBe("/home/dev/billing");
+    expect(screen.getByTestId("voice-report")).toHaveTextContent("Opening billing.");
+  });
+
+  /**
+   * Scenario: say "go to parent". The browser goes up to `..` — the same move
+   * as `h` or the `..` row — and lands with the cursor on the directory it
+   * left.
+   */
+  it("goes up to the parent", async () => {
+    const voice = microphone([]);
+    const { deck, listDirectories } = browsingDeck(voice);
+    render(<DeckShell runtime={deck} initialView={{ kind: "overview" }} />);
+    await turnVoiceOn();
+    await openBrowser();
+
+    voice.deliver("go to parent");
+    await completeUtterance();
+    await flush();
+
+    expect(listDirectories).toHaveBeenLastCalledWith(expect.any(String), "/home");
+    expect(currentPath()).toBe("/home");
+    expect(screen.getByTestId("new-agent-directory-list").querySelector("[aria-selected='true']")?.getAttribute("data-path")).toBe("/home/dev");
+  });
+
+  /**
+   * Scenario: say "use this directory". The directory on screen becomes the
+   * one the agent starts in and the form unlocks — Space's move — and nothing
+   * is started.
+   */
+  it("uses the directory on screen, which unlocks the form", async () => {
+    const voice = microphone([]);
+    const { deck } = browsingDeck(voice);
+    render(<DeckShell runtime={deck} initialView={{ kind: "overview" }} />);
+    await turnVoiceOn();
+    await openBrowser();
+    expect(screen.getByTestId("new-agent-name")).toBeDisabled();
+
+    voice.deliver("use this directory");
+    await completeUtterance();
+
+    expect(screen.getByTestId("new-agent-dir")).toHaveTextContent("/home/dev");
+    expect(screen.getByTestId("new-agent-name")).toBeEnabled();
+    expect(screen.getByTestId("new-agent-start")).toBeEnabled();
+    expect(deck.runAction).not.toHaveBeenCalled();
+  });
+
+  /**
+   * Scenario: with a filter typed, only the rows the filter leaves on screen
+   * are declared — a spoken name means a directory the user can SEE.
+   */
+  it("declares only the children the filter leaves on screen", async () => {
+    const voice = microphone([]);
+    const { deck, declarations } = browsingDeck(voice);
+    render(<DeckShell runtime={deck} initialView={{ kind: "overview" }} />);
+    await turnVoiceOn();
+    await openBrowser();
+    fireEvent.change(screen.getByTestId("new-agent-filter"), { target: { value: "doc" } });
+
+    voice.deliver("use this directory");
+    await completeUtterance();
+
+    expect(declarations.at(-1)?.entries).toEqual([{ name: "docs", path: "/home/dev/docs" }]);
+  });
+
+  /**
+   * Scenario: with the dialog closed, nothing is declared, so each directory
+   * row is refused with its own hint and nothing is listed.
+   */
+  it("declares nothing with the dialog closed, so each row is refused", async () => {
+    const voice = microphone(["open dir billing"]);
+    const { deck, declarations, listDirectories } = browsingDeck(voice);
+    render(<DeckShell runtime={deck} initialView={{ kind: "overview" }} />);
+    await turnVoiceOn();
+    await completeUtterance();
+
+    expect(declarations).toEqual([undefined]);
+    expect(screen.getByTestId("voice-report")).toHaveTextContent("Not here — opening a directory works while the New agent dialog is showing a directory listing.");
+    expect(listDirectories).not.toHaveBeenCalled();
+    expect(screen.queryByTestId("new-agent-dialog")).toBeNull();
+  });
+
+  /**
+   * Scenario: a directory dispatch that reaches the overview with no dialog
+   * to take it — the dialog closed during the round trip — says so in the
+   * dialog's words rather than reporting a move that did not happen.
+   */
+  it("refuses a directory move that arrives with the dialog closed", async () => {
+    const voice = microphone(["use this directory"]);
+    const { deck } = browsingDeck(voice, { forced: true });
+    render(<DeckShell runtime={deck} initialView={{ kind: "overview" }} />);
+    await turnVoiceOn();
+    await completeUtterance();
+
+    expect(screen.getByTestId("voice-report")).toHaveTextContent(NO_DIRECTORY_BROWSER);
+    expect(screen.queryByTestId("new-agent-dialog")).toBeNull();
+  });
+
+  /**
+   * Scenario: the user clicks into another directory while "open dir docs" is
+   * being resolved. The answer was about the listing they left, so the browser
+   * is left where the click put it and the report says why.
+   */
+  it("refuses a move judged against a listing the browser has since left", async () => {
+    const voice = microphone([]);
+    /* The resolve waits on a gate, so the click below — and its listing
+       landing — happen during the round trip and commit on their own, as they
+       do in the app, where the answer takes hundreds of milliseconds. */
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const { deck, listDirectories } = browsingDeck(voice, { during: () => gate });
+    render(<DeckShell runtime={deck} initialView={{ kind: "overview" }} />);
+    await turnVoiceOn();
+    await openBrowser();
+
+    voice.deliver("open dir docs");
+    await completeUtterance();
+    fireEvent.click(screen.getByTestId("new-agent-directory-list").querySelector("[data-path='/home/dev/billing']")!);
+    await flush();
+    expect(currentPath()).toBe("/home/dev/billing");
+
+    release();
+    await flush();
+    await flush();
+
+    expect(currentPath()).toBe("/home/dev/billing");
+    expect(listDirectories).not.toHaveBeenCalledWith(expect.any(String), "/home/dev/docs");
+    expect(screen.getByTestId("voice-report")).toHaveTextContent(DIRECTORY_MOVED_ON);
+  });
+
+  /**
+   * Scenario: at the filesystem root there is no `..`. The declaration says
+   * so, "go to parent" is refused with its hint, and a dispatch that arrives
+   * anyway is refused by the dialog.
+   */
+  it("refuses to go up from a root", async () => {
+    const voice = microphone([]);
+    const { deck, declarations, listDirectories } = browsingDeck(voice, { startAt: "/" });
+    render(<DeckShell runtime={deck} initialView={{ kind: "overview" }} />);
+    await turnVoiceOn();
+    await openBrowser();
+
+    voice.deliver("go to parent");
+    await completeUtterance();
+    expect(declarations.at(-1)?.hasParent).toBe(false);
+    expect(screen.getByTestId("voice-report")).toHaveTextContent("Not here — going up works while the New agent dialog is showing a directory that has a parent.");
+    expect(listDirectories).toHaveBeenCalledTimes(1);
+    expect(currentPath()).toBe("/");
+  });
+
+  /**
+   * Scenario: at a root, a go-up that reaches the dialog anyway is refused in
+   * the dialog's own sentence and lists nothing.
+   */
+  it("refuses a forced go-up at a root in the dialog's own words", async () => {
+    const voice = microphone([]);
+    const { deck, listDirectories } = browsingDeck(voice, { startAt: "/", forced: true });
+    render(<DeckShell runtime={deck} initialView={{ kind: "overview" }} />);
+    await turnVoiceOn();
+    await openBrowser();
+
+    voice.deliver("go to parent");
+    await completeUtterance();
+    expect(screen.getByTestId("voice-report")).toHaveTextContent(NO_PARENT_DIRECTORY);
+    expect(listDirectories).toHaveBeenCalledTimes(1);
+  });
+
+  /**
+   * Scenario: with a start in flight every browser control is disabled, so
+   * nothing is declared and a directory move that arrives is refused.
+   */
+  it("declares nothing and moves nothing while a start is in flight", async () => {
+    const voice = microphone([]);
+    const { deck, declarations } = browsingDeck(voice, { forced: true, holdStart: true });
+    render(<DeckShell runtime={deck} initialView={{ kind: "overview" }} />);
+    await turnVoiceOn();
+    await openBrowser();
+    fireEvent.keyDown(screen.getByTestId("new-agent-directory-list"), { key: " " });
+    await flush();
+    fireEvent.click(screen.getByTestId("new-agent-start"));
+    await flush();
+    expect(screen.getByTestId("new-agent-starting")).toBeInTheDocument();
+
+    voice.deliver("open dir billing");
+    await completeUtterance();
+    expect(declarations.at(-1)).toBeUndefined();
+    expect(screen.getByTestId("voice-report")).toHaveTextContent(NO_DIRECTORY_BROWSER);
+    expect(currentPath()).toBe("/home/dev");
+  });
+
+  /**
+   * Scenario: off the overview the dialog is not mounted, nothing is declared,
+   * and a directory dispatch finds no one to serve it.
+   */
+  it("is not served off the overview", async () => {
+    const voice = microphone(["use this directory"]);
+    const { deck, declarations } = browsingDeck(voice, { forced: true });
+    render(<DeckShell runtime={deck} />);
+    await turnVoiceOn();
+    await completeUtterance();
+
+    expect(declarations).toEqual([undefined]);
+    expect(screen.getByTestId("voice-report")).toHaveTextContent(NOTHING_DISPATCHED);
   });
 });

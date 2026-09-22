@@ -10,6 +10,8 @@ use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
 
+use super::VoiceDirectories;
+
 /// The table's source, compiled in.
 pub const TABLE_SOURCE: &str = include_str!("commands.toml");
 
@@ -77,7 +79,13 @@ impl fmt::Display for Screen {
 /// the fleet the desktop observes decides whether *"the build box"* names one
 /// deck, none, or several — and it is a kind of its own rather than a
 /// dialog's private parser because issue #1195's "switch deck" needs exactly
-/// the same resolution. [`ParamKind::SpokenPrefix`] resolves against **the transcript
+/// the same resolution. [`ParamKind::DirRef`] is that shape again, against the
+/// one thing in this app that is a set of names on screen and is NOT in any
+/// snapshot: the children the New agent dialog's directory browser is showing
+/// (PRD #1223, [`super::VoiceDirectories`]). It never searches — "open dir
+/// billing" means the child called billing in the level on screen, and a
+/// directory anywhere else on the deck is out of its reach by construction.
+/// [`ParamKind::SpokenPrefix`] resolves against **the transcript
 /// itself**, and nothing else — it is the words that introduced a dictation,
 /// and what it resolves *to* is the rest of what the user said, taken verbatim
 /// from the transcript this very utterance produced.
@@ -96,13 +104,15 @@ impl fmt::Display for Screen {
 pub enum ParamKind {
     AgentRef,
     DeckRef,
+    DirRef,
     SpokenPrefix,
 }
 
 impl ParamKind {
-    pub const ALL: [ParamKind; 3] = [
+    pub const ALL: [ParamKind; 4] = [
         ParamKind::AgentRef,
         ParamKind::DeckRef,
+        ParamKind::DirRef,
         ParamKind::SpokenPrefix,
     ];
 
@@ -110,6 +120,7 @@ impl ParamKind {
         match self {
             ParamKind::AgentRef => "agent_ref",
             ParamKind::DeckRef => "deck_ref",
+            ParamKind::DirRef => "dir_ref",
             ParamKind::SpokenPrefix => "spoken_prefix",
         }
     }
@@ -120,6 +131,64 @@ impl ParamKind {
 }
 
 impl fmt::Display for ParamKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// What a row needs besides a screen — the closed set the `requires` column
+/// draws from (PRD #1223).
+///
+/// # Why this is a column and not a fourth `Screen`
+///
+/// [`Screen`] is `DeckView`, and a dialog is not a view: the New agent dialog
+/// is a `useState` in the overview, mounted over it. Its directory browser is
+/// the first thing the table addresses INSIDE a mounted dialog rather than at
+/// app level, and the facts a row there depends on — is a listing on screen,
+/// does it have a parent — are not screens at all. A pseudo-screen would have
+/// made `overview` stop meaning "the overview", so every `screens =
+/// ["overview"]` row would silently stop being callable while the dialog was
+/// up. A second column leaves the first one meaning what it says.
+///
+/// Each one is answered by what the webview DECLARED with the utterance
+/// ([`super::VoiceDirectories`]), never by a guess: absent declaration, every
+/// requirement is unmet and the row is `callable: false`, which is what
+/// "dispatching into a closed dialog" is refused as.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Requirement {
+    /// The dialog is showing a directory listing: open, a deck chosen, a
+    /// listing landed, and no start in flight.
+    DirectoryListing,
+    /// That listing has a parent — `..` is on screen. Implies
+    /// [`Requirement::DirectoryListing`].
+    ParentDirectory,
+}
+
+impl Requirement {
+    pub const ALL: [Requirement; 2] = [Requirement::DirectoryListing, Requirement::ParentDirectory];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Requirement::DirectoryListing => "directory_listing",
+            Requirement::ParentDirectory => "parent_directory",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|kind| kind.as_str() == value)
+    }
+
+    /// Whether what the webview declared meets this requirement.
+    pub fn met_by(self, directories: Option<&VoiceDirectories>) -> bool {
+        match self {
+            Requirement::DirectoryListing => directories.is_some(),
+            Requirement::ParentDirectory => directories.is_some_and(|listing| listing.has_parent),
+        }
+    }
+}
+
+impl fmt::Display for Requirement {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
     }
@@ -168,6 +237,10 @@ pub struct CommandRow {
     /// Where the command can run. **Empty means everywhere**, which is what an
     /// absent `screens` key parses to.
     pub screens: Vec<Screen>,
+    /// What else must hold for the row to run (PRD #1223). **Empty means
+    /// nothing**, which is what an absent `requires` key parses to — every row
+    /// that predates the column reads exactly as it did.
+    pub requires: Vec<Requirement>,
     pub unavailable_hint: String,
     /// The sentence a successful dispatch shows — the pipeline's stage 6.
     ///
@@ -187,6 +260,18 @@ impl CommandRow {
     /// nowhere", so an absent column is the permissive default.
     pub fn callable_on(&self, screen: Screen) -> bool {
         self.screens.is_empty() || self.screens.contains(&screen)
+    }
+
+    /// Whether this row can run on `screen` with `directories` declared: the
+    /// screen rule AND every [`CommandRow::requires`] entry. One refusal for
+    /// both halves — the row's `unavailable_hint` — because from where the user
+    /// stands both are "not here".
+    pub fn callable(&self, screen: Screen, directories: Option<&VoiceDirectories>) -> bool {
+        self.callable_on(screen)
+            && self
+                .requires
+                .iter()
+                .all(|requirement| requirement.met_by(directories))
     }
 }
 
@@ -237,6 +322,19 @@ impl CommandTable {
                 })?;
                 if !screens.contains(&parsed) {
                     screens.push(parsed);
+                }
+            }
+
+            let mut requires = Vec::new();
+            for requirement in row.requires.unwrap_or_default() {
+                let parsed = Requirement::parse(&requirement).ok_or_else(|| {
+                    TableError::UnknownRequirement {
+                        id: id.clone(),
+                        requirement: requirement.clone(),
+                    }
+                })?;
+                if !requires.contains(&parsed) {
+                    requires.push(parsed);
                 }
             }
 
@@ -300,6 +398,7 @@ impl CommandTable {
                 description,
                 invoke,
                 screens,
+                requires,
                 unavailable_hint,
                 report,
                 params,
@@ -382,6 +481,8 @@ pub enum TableError {
     MissingField { id: String, field: &'static str },
     /// A `screens` entry that is not one of the three `DeckView` kinds.
     UnknownScreen { id: String, screen: String },
+    /// A `requires` entry outside the closed [`Requirement`] set.
+    UnknownRequirement { id: String, requirement: String },
     /// A param `kind` outside the closed resolver set.
     UnknownParamKind {
         id: String,
@@ -428,6 +529,15 @@ impl fmt::Display for TableError {
                 f,
                 "command `{id}` names the unknown screen `{screen}`; the screens are {}",
                 joined(Screen::ALL.iter().map(|screen| screen.as_str()))
+            ),
+            TableError::UnknownRequirement { id, requirement } => write!(
+                f,
+                "command `{id}` requires the unknown `{requirement}`; the requirements are {}",
+                joined(
+                    Requirement::ALL
+                        .iter()
+                        .map(|requirement| requirement.as_str())
+                )
             ),
             TableError::UnknownParamKind { id, param, kind } => write!(
                 f,
@@ -561,6 +671,11 @@ mod tests {
                 ("submit_prompt", "submitAgentPrompt", vec!["agent"]),
                 // `overview` alone: the dialog lives there (PRD #1223).
                 ("open_new_agent", "openNewAgent", vec!["overview"]),
+                // The directory browser inside that dialog — `overview`, plus
+                // a `requires` the next test pins (PRD #1223).
+                ("open_dir", "openDirectory", vec!["overview"]),
+                ("go_to_parent", "goToParentDirectory", vec!["overview"]),
+                ("use_this_directory", "useThisDirectory", vec!["overview"]),
             ]
         );
     }
@@ -754,7 +869,7 @@ mod tests {
         );
         let message = error.to_string();
         assert!(
-            message.contains("`agent_ref`, `deck_ref`, `spoken_prefix`"),
+            message.contains("`agent_ref`, `deck_ref`, `dir_ref`, `spoken_prefix`"),
             "{message}"
         );
     }
@@ -1019,11 +1134,14 @@ mod tests {
     #[test]
     fn voice_table_callable_per_screen_for_the_shipped_rows() {
         let table = super::table();
+        // With nothing declared: the directory rows `requires` a listing, so
+        // they are callable on no screen until the dialog shows one (PRD
+        // #1223, `voice_table_directory_rows_are_gated_by_requires`).
         let callable = |screen: Screen| {
             table
                 .rows()
                 .iter()
-                .filter(|row| row.callable_on(screen))
+                .filter(|row| row.callable(screen, None))
                 .map(|row| row.id.as_str())
                 .collect::<Vec<_>>()
         };
@@ -1079,8 +1197,157 @@ mod tests {
             assert_eq!(ParamKind::parse(kind.as_str()), Some(kind));
         }
         assert_eq!(ParamKind::parse("deck_ref"), Some(ParamKind::DeckRef));
+        assert_eq!(ParamKind::parse("dir_ref"), Some(ParamKind::DirRef));
         assert_eq!(ParamKind::parse("agentRef"), None);
         assert_eq!(ParamKind::parse("deckRef"), None);
+        assert_eq!(ParamKind::parse("dirRef"), None);
+    }
+
+    #[test]
+    fn voice_table_requirement_round_trips_its_spelling() {
+        for requirement in Requirement::ALL {
+            assert_eq!(Requirement::parse(requirement.as_str()), Some(requirement));
+        }
+        assert_eq!(
+            Requirement::parse("directory_listing"),
+            Some(Requirement::DirectoryListing)
+        );
+        assert_eq!(
+            Requirement::parse("parent_directory"),
+            Some(Requirement::ParentDirectory)
+        );
+        assert_eq!(Requirement::parse("dialog_open"), None);
+    }
+
+    fn listing(has_parent: bool) -> VoiceDirectories {
+        VoiceDirectories {
+            deck_id: "deck-local".to_string(),
+            path: "/home/dev".to_string(),
+            has_parent,
+            entries: Vec::new(),
+        }
+    }
+
+    /// PRD #1223: each directory row pinned by value — invoke, screens,
+    /// requires, params, report. `requires` is the load-bearing half: without
+    /// it a row would be callable on the overview with the dialog closed and
+    /// dispatch into nothing.
+    #[test]
+    fn voice_table_directory_rows_are_pinned_by_value() {
+        let table = super::table();
+        let open_dir = table.row("open_dir").expect("open_dir is in the table");
+        assert_eq!(open_dir.invoke, "openDirectory");
+        assert_eq!(open_dir.screens, vec![Screen::Overview]);
+        assert_eq!(open_dir.requires, vec![Requirement::DirectoryListing]);
+        assert_eq!(
+            open_dir.params,
+            vec![ParamSpec {
+                name: "dir".to_string(),
+                kind: ParamKind::DirRef,
+                optional: false,
+            }]
+        );
+        assert_eq!(open_dir.report, "Opening {dir}.");
+
+        let parent = table
+            .row("go_to_parent")
+            .expect("go_to_parent is in the table");
+        assert_eq!(parent.invoke, "goToParentDirectory");
+        assert_eq!(parent.screens, vec![Screen::Overview]);
+        assert_eq!(parent.requires, vec![Requirement::ParentDirectory]);
+        assert!(parent.params.is_empty());
+        assert_eq!(parent.report, "Going up.");
+
+        let confirm = table
+            .row("use_this_directory")
+            .expect("use_this_directory is in the table");
+        assert_eq!(confirm.invoke, "useThisDirectory");
+        assert_eq!(confirm.screens, vec![Screen::Overview]);
+        assert_eq!(confirm.requires, vec![Requirement::DirectoryListing]);
+        assert!(confirm.params.is_empty());
+        assert_eq!(confirm.report, "Using this directory.");
+
+        // And they are the only rows that require anything.
+        let gated: Vec<&str> = table
+            .rows()
+            .iter()
+            .filter(|row| !row.requires.is_empty())
+            .map(|row| row.id.as_str())
+            .collect();
+        assert_eq!(
+            gated,
+            vec!["open_dir", "go_to_parent", "use_this_directory"]
+        );
+    }
+
+    #[test]
+    fn voice_table_directory_rows_are_gated_by_requires() {
+        let table = super::table();
+        let with_parent = listing(true);
+        let at_root = listing(false);
+        let row = |id: &str| table.row(id).expect("present");
+        for id in ["open_dir", "use_this_directory"] {
+            assert!(
+                !row(id).callable(Screen::Overview, None),
+                "{id}: dialog closed"
+            );
+            assert!(
+                row(id).callable(Screen::Overview, Some(&with_parent)),
+                "{id}"
+            );
+            assert!(row(id).callable(Screen::Overview, Some(&at_root)), "{id}");
+            assert!(
+                !row(id).callable(Screen::Deck, Some(&with_parent)),
+                "{id}: off the overview"
+            );
+        }
+        assert!(!row("go_to_parent").callable(Screen::Overview, None));
+        assert!(row("go_to_parent").callable(Screen::Overview, Some(&with_parent)));
+        assert!(
+            !row("go_to_parent").callable(Screen::Overview, Some(&at_root)),
+            "a root has no `..` to go to"
+        );
+        assert!(!row("go_to_parent").callable(Screen::Agent, Some(&with_parent)));
+    }
+
+    #[test]
+    fn voice_table_absent_requires_needs_nothing() {
+        let parsed = CommandTable::parse(&one_row()).expect("parses");
+        let row = &parsed.rows()[0];
+        assert!(row.requires.is_empty());
+        assert!(row.callable(Screen::Deck, None));
+    }
+
+    #[test]
+    fn voice_table_parses_requires_and_rejects_an_unknown_requirement() {
+        let source = one_row().replace(
+            "screens = [\"deck\"]",
+            "screens = [\"deck\"]\nrequires = [\"parent_directory\", \"parent_directory\"]",
+        );
+        let parsed = CommandTable::parse(&source).expect("parses");
+        // A repeat is folded, as a repeated screen is.
+        assert_eq!(
+            parsed.rows()[0].requires,
+            vec![Requirement::ParentDirectory]
+        );
+
+        let source = one_row().replace(
+            "screens = [\"deck\"]",
+            "screens = [\"deck\"]\nrequires = [\"dialog_open\"]",
+        );
+        let error = CommandTable::parse(&source).expect_err("refused");
+        assert_eq!(
+            error,
+            TableError::UnknownRequirement {
+                id: "open_agent".to_string(),
+                requirement: "dialog_open".to_string(),
+            }
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains("`directory_listing`, `parent_directory`"),
+            "{message}"
+        );
     }
 
     #[test]
@@ -1114,6 +1381,7 @@ struct RawCommand {
     description: Option<String>,
     invoke: Option<String>,
     screens: Option<Vec<String>>,
+    requires: Option<Vec<String>>,
     unavailable_hint: Option<String>,
     report: Option<String>,
     #[serde(default)]

@@ -2,10 +2,10 @@ import { createContext, useCallback, useContext, useEffect, useId, useMemo, useR
 import { Blocks, Boxes, CircleStop, Columns3, LayoutList, Layers, Maximize2, Network, Plus, RefreshCw, RotateCcw, ShieldAlert, Sparkles, SquareTerminal, Wrench, X } from "lucide-react";
 import type { AgentSession, AgentStatus, ConnectionView, DeckRuntimeState, DeckView } from "../types";
 import { modeScopedKey } from "../lib/bridge";
-import { VOICE_ACTIONS, type VoiceOverviewChannel } from "../lib/voiceActions";
+import { VOICE_ACTIONS, type NewAgentVoice, type NewAgentVoiceChannel, type VoiceDispatchTarget, type VoiceOverviewChannel } from "../lib/voiceActions";
 import { DECK_STATE_FALLBACK, deckUnavailableReason, isNewAgentShortcut } from "../lib/newAgent";
 import { ConfirmDialog, type ConfirmState } from "./ConfirmDialog";
-import { NewAgentDialog, type NewAgentRuntime } from "./NewAgentDialog";
+import { NewAgentDialog, NO_DIRECTORY_BROWSER, type NewAgentRuntime } from "./NewAgentDialog";
 import { DeckSelector } from "./DeckSelector";
 import type { DesktopSettingsState } from "../hooks/useDesktopSettings";
 import { DISPLAY_LIMITS, deckName, displayActivity, displayIdentity, displayPath, displayText, displayTitle, displayUptime, domIdentity, rendersBlank } from "../lib/displayText";
@@ -664,7 +664,7 @@ export function stopTargetName(agent: OverviewAgent): string {
  * passes it to whichever view is mounted; a caller that renders this screen
  * standalone gets everything except the control that needs a document.
  */
-export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = false, voiceChannel }: {
+export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = false, voiceChannel, newAgentVoice }: {
   runtime: DeckRuntimeState;
   settings?: DesktopSettingsState;
   onNavigate: (view: DeckView) => void;
@@ -680,6 +680,12 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
    * where nothing dispatches voice (a standalone render).
    */
   voiceChannel?: VoiceOverviewChannel;
+  /**
+   * PRD #1223 — the New agent dialog's voice slot, handed straight to it: the
+   * dialog writes what its directory browser shows and its three moves, the
+   * voice surface reads the first and this screen serves the second.
+   */
+  newAgentVoice?: NewAgentVoiceChannel;
 }) {
   const { fleet, snapshot, mode } = runtime;
   /*
@@ -830,9 +836,23 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
   */
   useEffect(() => {
     if (!voiceChannel) return;
+    /* PRD #1223 — the directory browser's three moves, served ALWAYS on this
+       screen and resolved against the dialog's slot at call time. Rust has
+       already refused them when no browser was declared; what reaches here is
+       a dispatch whose browser may have gone during the round trip, and that
+       is a sentence, not a `needs` miss. */
+    const move = (pick: (slot: NewAgentVoice) => string | undefined) => {
+      const slot = newAgentVoice?.current;
+      return slot ? pick(slot) : NO_DIRECTORY_BROWSER;
+    };
+    const directoryMoves = {
+      openDirectory: (target: VoiceDispatchTarget) => move((slot) => slot.openDirectory(target)),
+      goToParentDirectory: (target: VoiceDispatchTarget) => move((slot) => slot.goToParentDirectory(target)),
+      useThisDirectory: (target: VoiceDispatchTarget) => move((slot) => slot.useThisDirectory(target)),
+    };
     voiceChannel.current = newAgent
-      ? { closeNewAgent: () => newAgentClose.current?.() }
-      : newAgentAvailable ? { openNewAgent } : {};
+      ? { closeNewAgent: () => newAgentClose.current?.(), ...directoryMoves }
+      : newAgentAvailable ? { openNewAgent, ...directoryMoves } : directoryMoves;
     return () => { voiceChannel.current = undefined; };
   });
   const voiceContext = useMemo(() => ({ navigate: onNavigate, openNewAgent }), [onNavigate, openNewAgent]);
@@ -1058,6 +1078,7 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
           runtime={newAgentRuntime}
           initialDeckId={newAgent.deckId}
           closeRequest={newAgentClose}
+          voice={newAgentVoice}
           onClose={() => setNewAgent(undefined)}
           onAppeared={(target) => {
             setNewAgent(undefined);

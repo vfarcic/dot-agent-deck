@@ -81,7 +81,7 @@ import { Mic, MicOff, Undo2, X } from "lucide-react";
 import { DISPLAY_LIMITS, displayText } from "../lib/displayText";
 import { VOICE_PEER_PROPS } from "../hooks/useInertBackground";
 import { VOICE_ACTIONS, type VoiceDispatchTarget, type VoicePanelChannel, type VoicePanelContext } from "../lib/voiceActions";
-import type { VoiceCommandDto, VoiceOutcomeDto, VoiceResultDto, VoiceScreen, VoiceStatusDto } from "../lib/bridge";
+import type { VoiceCommandDto, VoiceDirectoriesDto, VoiceOutcomeDto, VoiceResultDto, VoiceScreen, VoiceStatusDto } from "../lib/bridge";
 import type { DeckRuntimeState } from "../types";
 
 /**
@@ -417,7 +417,18 @@ interface VoiceControlPanelProps {
    * cases stay distinguishable: one is a report the surface must correct, the
    * other is an ordinary command with no Undo beside it.
    */
-  onDispatch: (outcome: Extract<VoiceOutcomeDto, { kind: "dispatch" }>) => { undo?: () => void } | undefined;
+  onDispatch: (outcome: Extract<VoiceOutcomeDto, { kind: "dispatch" }>, declaredDirectories?: VoiceDirectoriesDto) => { undo?: () => void } | undefined;
+  /**
+   * What the New agent dialog's directory browser is showing right now, or
+   * `undefined` when it is showing nothing (PRD #1223).
+   *
+   * A getter rather than a value, read immediately before each resolve for the
+   * screen's reason: a declaration that lagged the browser would judge the
+   * utterance against a listing the user has left. The same declaration is
+   * handed back to `onDispatch`, so the directory members can tell whether the
+   * browser moved during the round trip.
+   */
+  directories?: () => VoiceDirectoriesDto | undefined;
   /**
    * Where this panel publishes the context members only IT can serve
    * (PRD #802, the `voice_off` row).
@@ -478,7 +489,11 @@ function progressNote(indicator: VoiceIndicator, phase: VoicePhase): string | un
  * real state: a control with nothing behind it would be worse than its absence,
  * and it is the same reasoning the microphone itself gets one layer down.
  */
-export function VoiceControlPanel({ runtime, screen, onDispatch, channel }: VoiceControlPanelProps) {
+export function VoiceControlPanel({ runtime, screen, onDispatch, channel, directories }: VoiceControlPanelProps) {
+  /* Held in a ref so the resolve and the overlay read the host's latest getter
+     without either callback being rebuilt when the host re-renders. */
+  const directoriesRef = useRef(directories);
+  directoriesRef.current = directories;
   const { declareVoiceScreen, resolveVoice, voiceCommands, voiceStart, voiceStop, voiceStatus, voiceCancel, sendTerminalInput } = runtime;
 
   const [on, setOnState] = useState(false);
@@ -819,9 +834,11 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel }: Voic
        `unavailable` means "not on that screen", so an outcome is only an
        answer about the screen that was declared with it. */
     const declared = screenRef.current;
+    /* PRD #1223 — and the directory browser as it stands, declared with it. */
+    const declaredDirectories = directoriesRef.current?.();
     setPhase("resolving");
     try {
-      declareVoiceScreen?.(declared);
+      declareVoiceScreen?.(declared, declaredDirectories);
       const answer = await resolveVoice(utterance);
       // Abandoned, or replaced by a later utterance. Say nothing and run
       // nothing: voice is off, or this belongs to the cycle that replaced it.
@@ -832,7 +849,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel }: Voic
       }
       setResult(answer);
       if (answer.outcome.kind === "dispatch") {
-        const dispatched = onDispatch(answer.outcome);
+        const dispatched = onDispatch(answer.outcome, declaredDirectories);
         if (!dispatched) setProblem(NOTHING_DISPATCHED);
         else if (dispatched.undo) setUndo({ run: dispatched.undo });
       }
@@ -1132,7 +1149,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel }: Voic
     /* `screenRef` rather than the prop: this runs from a dispatch, which is a
        promise continuation, and the prop captured when the callback was built
        may be a screen the user has already left. */
-    void voiceCommands(screenRef.current).then(
+    void voiceCommands(screenRef.current, directoriesRef.current?.()).then(
       (commands) => { if (vocabularyRequest.current === mine) setVocabulary({ commands }); },
       (cause) => { if (vocabularyRequest.current === mine) setVocabulary({ problem: sentenceOf(cause) }); },
     );
@@ -1210,8 +1227,8 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel }: Voic
 
   /** Say there was nothing on top to close. See {@link VOICE_NOTHING_TO_CLOSE}. */
   const reportNothingToClose = useCallback(() => setProblem(VOICE_NOTHING_TO_CLOSE), []);
-  /** Say that what is on top refused to close, in its own sentence (PRD #1223 U5). */
-  const reportCloseRefused = useCallback((reason: string) => setProblem(reason), []);
+  /** Say that what a dispatch reached refused, in its own sentence (PRD #1223). */
+  const reportRefused = useCallback((reason: string) => setProblem(reason), []);
 
   /*
     PRD #802 — publish the members only this surface can serve, so a row naming
@@ -1239,7 +1256,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel }: Voic
       typeIntoAgent,
       submitAgentPrompt,
       reportNothingToClose,
-      reportCloseRefused,
+      reportRefused,
       ...(voiceCommands ? { showVoiceCommands } : {}),
       /* PRD #802 — published only while the overlay is OPEN, and that is how
          "an overlay is open" reaches a dispatch at all: it is a `useState`

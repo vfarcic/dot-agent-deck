@@ -28,6 +28,7 @@ import {
   type DeckChoice,
 } from "../lib/newAgent";
 import type { AuthoringKind, DaemonOrchestration, DeckDirectoryEntry, DeckDirectoryListing, DeckRuntimeState, NewAgentOption, NewAgentOptions, NewAgentOrchestrations } from "../types";
+import type { NewAgentVoiceChannel, VoiceDispatchTarget } from "../lib/voiceActions";
 
 /**
  * What the dialog needs from the runtime. The two queries are REQUIRED here
@@ -54,6 +55,12 @@ export interface NewAgentDialogProps {
    * closes nothing and answers the sentence the X's `title` carries.
    */
   closeRequest?: { current: (() => string | undefined) | undefined };
+  /**
+   * PRD #1223 — where the dialog publishes its directory browser for voice:
+   * what it shows (the declaration a spoken `dir_ref` resolves against) and
+   * its three moves. Written every render while mounted, cleared on unmount.
+   */
+  voice?: NewAgentVoiceChannel;
 }
 
 type Listing = Extract<DeckDirectoryListing, { kind: "listing" }>;
@@ -75,6 +82,20 @@ const AUTO_AGENT = "auto";
 
 /** Why the dialog cannot be closed during a start (PRD #1223 audit F5). */
 export const STARTING_CLOSE_BLOCKED = "Waiting for the deck to answer the start. The dialog can be closed once it has.";
+
+/*
+  PRD #1223 — the directory browser's refusals by voice, in the dialog's own
+  words. Rust already refuses a directory row when no browser was declared, so
+  each of these answers a browser that changed during the round trip.
+*/
+/** No browser to move: the dialog is closed, has no listing, or is starting. */
+export const NO_DIRECTORY_BROWSER = "The New agent dialog is not showing a directory listing, so nothing was changed.";
+/** The browser moved between the utterance and its answer. */
+export const DIRECTORY_MOVED_ON = "The directory browser moved on while that was being worked out, so nothing was changed. Say it again.";
+/** The named child is no longer in the listing on screen. */
+export const DIRECTORY_NOT_LISTED = "That directory is not in the listing any more, so nothing was opened.";
+/** `..` is not on screen. */
+export const NO_PARENT_DIRECTORY = "This directory has no parent to go up to.";
 
 function messageOf(cause: unknown): string {
   return cause instanceof Error ? cause.message : String(cause);
@@ -141,7 +162,7 @@ function messageOf(cause: unknown): string {
  * until the target deck's fleet entry lists `(deckId, agentId)`, bounded by
  * {@link NEW_AGENT_APPEAR_TIMEOUT_MS}, and hands the identity to `onAppeared`.
  */
-export function NewAgentDialog({ runtime, initialDeckId, onClose, onAppeared, onNotAppeared, appearTimeoutMs = NEW_AGENT_APPEAR_TIMEOUT_MS, closeRequest }: NewAgentDialogProps) {
+export function NewAgentDialog({ runtime, initialDeckId, onClose, onAppeared, onNotAppeared, appearTimeoutMs = NEW_AGENT_APPEAR_TIMEOUT_MS, closeRequest, voice }: NewAgentDialogProps) {
   const titleId = useId();
   const choices = useMemo(() => deckChoices(runtime.fleet), [runtime.fleet]);
   /** The deck field's cursor — moved by `j`/`k`, and not a choice until Enter or a click. */
@@ -498,6 +519,76 @@ export function NewAgentDialog({ runtime, initialDeckId, onClose, onAppeared, on
   const goUp = () => {
     if (deck && listing?.parent !== undefined) void loadListing(deck.deckId, listing.parent, listing.path);
   };
+
+  /**
+   * PRD #1223 — the directory browser by voice. Each move calls the function
+   * the browser's own control calls (a click on a row, the `..` row / `h`, the
+   * Use this directory button / Space) and nothing else, so voice and the
+   * keyboard cannot come to disagree about what a move does.
+   *
+   * **The browser can move during the round trip**, so each first re-checks
+   * that it is still showing what the utterance was judged against — the deck
+   * and the listing `path` in `target.declaredDirectories` — and refuses in
+   * the dialog's own words when it is not, rather than acting on a listing the
+   * user has since left. A start in flight refuses too, exactly as every
+   * control inside the dialog is disabled then.
+   */
+  const browserMovedOn = (target: VoiceDispatchTarget): string | undefined => {
+    if (!deck || !listing || phase !== "idle") return NO_DIRECTORY_BROWSER;
+    const declared = target.declaredDirectories;
+    if (!declared || declared.deckId !== deck.deckId || declared.path !== listing.path) return DIRECTORY_MOVED_ON;
+    return undefined;
+  };
+  const voiceOpenDirectory = (target: VoiceDispatchTarget): string | undefined => {
+    const refused = browserMovedOn(target);
+    if (refused !== undefined || !deck || !listing) return refused;
+    const entry = listing.entries.find((candidate) => candidate.path === target.directoryPath);
+    if (!entry) return DIRECTORY_NOT_LISTED;
+    // A click on the row: the cursor lands on it (when the filter shows it),
+    // then the deck lists it.
+    const index = rows.findIndex((row) => row.kind === "entry" && row.entry.path === entry.path);
+    if (index >= 0) setCursor(index);
+    void loadListing(deck.deckId, entry.path);
+    return undefined;
+  };
+  const voiceGoToParent = (target: VoiceDispatchTarget): string | undefined => {
+    const refused = browserMovedOn(target);
+    if (refused !== undefined) return refused;
+    if (listing?.parent === undefined) return NO_PARENT_DIRECTORY;
+    goUp();
+    return undefined;
+  };
+  const voiceUseThisDirectory = (target: VoiceDispatchTarget): string | undefined => {
+    const refused = browserMovedOn(target);
+    if (refused !== undefined) return refused;
+    confirmCurrent();
+    return undefined;
+  };
+  /*
+    The slot, rewritten every render — no dependency array, for `closeRequest`'s
+    reason: the moves close over this render's listing and phase. The
+    declaration is present only while there is something on screen to name: a
+    deck chosen, a listing landed, and no start in flight (every control in the
+    browser is disabled then). Its entries are the ROWS on screen, after the
+    filter, because a spoken name means one the user can see.
+  */
+  useEffect(() => {
+    if (!voice) return;
+    voice.current = {
+      directories: deck && listing && phase === "idle"
+        ? {
+          deckId: deck.deckId,
+          path: listing.path,
+          hasParent: listing.parent !== undefined,
+          entries: rows.flatMap((row) => (row.kind === "entry" ? [{ name: row.entry.displayName, path: row.entry.path }] : [])),
+        }
+        : undefined,
+      openDirectory: voiceOpenDirectory,
+      goToParentDirectory: voiceGoToParent,
+      useThisDirectory: voiceUseThisDirectory,
+    };
+    return () => { voice.current = undefined; };
+  });
 
   /** The TUI picker's Enter / `l` / Right: a directory with no subdirectories is confirmed, otherwise the row under the cursor is entered. */
   const openRow = () => {

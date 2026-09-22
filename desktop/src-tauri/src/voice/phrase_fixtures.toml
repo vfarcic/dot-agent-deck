@@ -350,3 +350,65 @@ utterance = "start a new agent"
 screen = "deck"
 action = "open_new_agent"
 outcome = "unavailable"
+
+# PRD #1223 — the directory browser by voice. `listing = true` plants one level
+# of the local deck in the New agent dialog's browser (`/home/dev/code`, with a
+# parent, children billing-service, docs, dot-agent-deck and infra); without it
+# the dialog is closed. A name resolves only against what is on screen, so the
+# closed-dialog fixture must say where the command works rather than guess.
+[[fixtures]]
+name = "open-dir-by-name"
+utterance = "open dir billing service"
+screen = "overview"
+listing = true
+action = "open_dir"
+outcome = "dispatch"
+resolved_dir = "/home/dev/code/billing-service"
+
+[[fixtures]]
+name = "open-dir-natural"
+utterance = "go into the docs folder"
+screen = "overview"
+listing = true
+action = "open_dir"
+outcome = "dispatch"
+resolved_dir = "/home/dev/code/docs"
+
+[[fixtures]]
+name = "go-to-parent"
+utterance = "go to parent dir"
+screen = "overview"
+listing = true
+action = "go_to_parent"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "go-to-parent-up-one-level"
+utterance = "go up one level"
+screen = "overview"
+listing = true
+action = "go_to_parent"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "use-this-directory"
+utterance = "use this directory"
+screen = "overview"
+listing = true
+action = "use_this_directory"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "use-this-directory-natural"
+utterance = "okay this is the one, pick this folder"
+screen = "overview"
+listing = true
+action = "use_this_directory"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "open-dir-dialog-closed"
+utterance = "open dir billing"
+screen = "overview"
+action = "open_dir"
+outcome = "unavailable"

@@ -16,6 +16,11 @@
 #   screens          where the command can run: `deck`, `overview`, `agent` —
 #                    the three `DeckView` kinds (`desktop/src/types.ts`).
 #                    Absent or empty means available everywhere.
+#   requires         what else must hold, from the closed set in `table.rs`'s
+#                    `Requirement`: `directory_listing` (the New agent dialog
+#                    is showing a listing) and `parent_directory` (that listing
+#                    has a `..`). Answered by what the webview declared with the
+#                    utterance. Absent or empty means nothing more is needed.
 #   unavailable_hint names the PREREQUISITE, for the sentence the app renders
 #                    when the model picks a command the current screen cannot
 #                    run. No leading capital and no trailing period: it is
@@ -31,7 +36,7 @@
 #                    opposite — this describes an action that HAPPENED, that
 #                    one blocks an action before it does. Do not rename it back.
 #   [[commands.params]]  name + kind, `kind` from the closed resolver set
-#                    (`agent_ref`, `deck_ref`, `spoken_prefix`). `optional =
+#                    (`agent_ref`, `deck_ref`, `dir_ref`, `spoken_prefix`). `optional =
 #                    true` lets the row dispatch when the model supplies no
 #                    value; a value that resolves to nothing is still refused,
 #                    and a report may not interpolate an optional param.
@@ -325,3 +330,71 @@ report      = "Opening the New agent dialog."
   name     = "deck"
   kind     = "deck_ref"
   optional = true
+
+# PRD #1223 — the directory browser by voice: the first rows that address a
+# control INSIDE a mounted dialog rather than app-level state.
+#
+# **Why a name resolves at all.** The daemon lists one level per request, so
+# there is no flat set of the deck's directories to match a spoken name against
+# — and the verb that would make one, a directory search, was declined (#819,
+# and again in this PRD) because it needs its own bounds, capability and threat
+# model. But at any moment the browser HAS a finite, visible set of named
+# children on screen, and "open dir billing" means the child called billing in
+# the level the user is looking at. That set is what a `dir_ref` resolves
+# against, exactly as `agent_ref` resolves against the live agent list. Each
+# utterance stays independent: the dialog holds the cursor and the resolver
+# needs no memory. **None of this can find a directory anywhere else on the
+# deck** — that is still the declined search verb, and it stays declined.
+#
+# **Availability is the `requires` column, not `screens`**, because a dialog is
+# not a `DeckView`. The webview declares what the browser shows with each
+# utterance (`VoiceDirectories`); with no declaration — dialog closed, no deck
+# chosen, no listing yet, a start in flight — every row below is `callable:
+# false` and a pick of one renders the hint rather than dispatching into a
+# closed dialog.
+#
+# **None of these starts anything**, so none is in PRD #802 D5's confirmation
+# set: navigating a listing and choosing a directory change what the FORM will
+# say, and the dialog's own Start is still the only thing that starts an agent.
+# The manual paths — the `..` row, `h`/Left/Backspace, Enter/`l`/Right, Space,
+# the filter, `q` — are untouched; each row calls the function its key calls.
+[[commands]]
+id          = "open_dir"
+description = """In the New agent dialog's directory browser, open one of the directories listed
+on screen — go down into it. Use for open dir billing, open the billing folder, go into src, enter
+docs, cd into api. Set `dir` to the words the user used for the directory; it must be one of
+`directories.entries`, the directories on screen right now. This only moves the browser: it
+starts nothing and does not choose the directory for the agent (that is `use_this_directory`).
+Not for going up (`go_to_parent`), and never for an agent or a deck."""
+invoke      = "openDirectory"
+screens     = ["overview"]
+requires    = ["directory_listing"]
+unavailable_hint = "opening a directory works while the New agent dialog is showing a directory listing"
+report      = "Opening {dir}."
+
+  [[commands.params]]
+  name = "dir"
+  kind = "dir_ref"
+
+[[commands]]
+id          = "go_to_parent"
+description = """In the New agent dialog's directory browser, go up one level to the parent
+directory — the `..` row. Use for go to parent, go to the parent dir, go up, up one level, one
+level up, parent directory, or cd dot dot. It moves the browser only and starts nothing."""
+invoke      = "goToParentDirectory"
+screens     = ["overview"]
+requires    = ["parent_directory"]
+unavailable_hint = "going up works while the New agent dialog is showing a directory that has a parent"
+report      = "Going up."
+
+[[commands]]
+id          = "use_this_directory"
+description = """In the New agent dialog's directory browser, choose the directory on screen as the
+one the new agent starts in, which unlocks the rest of the form. Use for use this directory, use
+this folder, pick this one, choose this directory, this is the one, or select this directory.
+It chooses the directory and starts nothing — the user still presses Start."""
+invoke      = "useThisDirectory"
+screens     = ["overview"]
+requires    = ["directory_listing"]
+unavailable_hint = "choosing a directory works while the New agent dialog is showing a directory listing"
+report      = "Using this directory."

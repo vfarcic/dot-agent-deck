@@ -1171,7 +1171,7 @@ export interface DeckRuntimeState {
    * screen is the one piece of live state that exists ONLY in the webview; see
    * `DeckBridge.declareVoiceScreen` for the whole of that seam.
    */
-  declareVoiceScreen?: (screen: import("./lib/bridge").VoiceScreen) => void;
+  declareVoiceScreen?: (screen: import("./lib/bridge").VoiceScreen, directories?: import("./lib/bridge").VoiceDirectoriesDto) => void;
   resolveVoice?: (utterance: string) => Promise<import("./lib/bridge").VoiceResultDto>;
   /**
    * Every command in the table, annotated for one screen (PRD #802 D7) — what
@@ -1186,6 +1186,7 @@ export interface DeckRuntimeState {
    */
   voiceCommands?: (
     screen: import("./lib/bridge").VoiceScreen,
+    directories?: import("./lib/bridge").VoiceDirectoriesDto,
   ) => Promise<import("./lib/bridge").VoiceCommandDto[]>;
   /** Open the microphone. Rejects with the not-configured sentence when transcription is off. */
   voiceStart?: () => Promise<import("./lib/bridge").VoiceStatusDto>;

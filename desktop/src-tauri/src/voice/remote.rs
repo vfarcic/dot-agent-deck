@@ -550,6 +550,7 @@ mod tests {
                 commands: &commands,
                 agents: &agents,
                 decks: &[],
+                directories: None,
             },
             HOSTED_COMMAND_MODEL,
             TokenCeiling::default(),
@@ -603,6 +604,7 @@ mod tests {
             commands: &commands,
             agents: &agents,
             decks: &[],
+            directories: None,
         };
         for ceiling in [MIN_TOKEN_CEILING, 1024, MAX_TOKEN_CEILING] {
             let ceiling = TokenCeiling::parse(i64::from(ceiling)).expect("in range");
@@ -638,6 +640,9 @@ mod tests {
                 "dictate_to_agent",
                 "submit_prompt",
                 "open_new_agent",
+                "open_dir",
+                "go_to_parent",
+                "use_this_directory",
                 "none"
             ]
         );
@@ -867,6 +872,7 @@ mod tests {
                 commands: &commands,
                 agents: &[],
                 decks: &[],
+                directories: None,
             })
             .await
             .expect_err("fails");
@@ -891,6 +897,7 @@ mod tests {
                 commands: &commands,
                 agents: &[],
                 decks: &[],
+                directories: None,
             })
             .await
             .expect_err("fails");
@@ -920,6 +927,7 @@ mod tests {
                 commands: &commands,
                 agents: &[],
                 decks: &[],
+                directories: None,
             })
             .await
             .expect_err("no key is stored");
@@ -1000,6 +1008,7 @@ mod tests {
                 commands: &commands,
                 agents: &[],
                 decks: &[],
+                directories: None,
             })
             .await
             .expect_err("nothing is listening on port 1");

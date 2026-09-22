@@ -246,6 +246,7 @@ mod tests {
                 commands: &commands,
                 agents: &agents,
                 decks: &[],
+                directories: None,
             },
             "a-model",
             TokenCeiling::default(),
@@ -297,6 +298,9 @@ mod tests {
                 "dictate_to_agent",
                 "submit_prompt",
                 "open_new_agent",
+                "open_dir",
+                "go_to_parent",
+                "use_this_directory",
                 "none"
             ]
         );
@@ -360,8 +364,12 @@ mod tests {
             json!(["string", "null"])
         );
         assert_eq!(
+            schema["properties"]["params"]["properties"]["dir"]["type"],
+            json!(["string", "null"])
+        );
+        assert_eq!(
             schema["properties"]["params"]["required"],
-            json!(["agent", "prefix", "deck"])
+            json!(["agent", "prefix", "deck", "dir"])
         );
     }
 
@@ -407,6 +415,7 @@ mod tests {
             commands: &commands,
             agents: &agents,
             decks: &[],
+            directories: None,
         };
         for ceiling in [MIN_TOKEN_CEILING, 1024, MAX_TOKEN_CEILING] {
             let ceiling = TokenCeiling::parse(i64::from(ceiling)).expect("in range");
@@ -434,6 +443,7 @@ mod tests {
             commands: &commands,
             agents: &agents,
             decks: &[],
+            directories: None,
         };
 
         let bare = request_body(&request, "a-model", TokenCeiling::default(), None);

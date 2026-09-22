@@ -191,12 +191,14 @@ export type VoiceActionContext = {
    * is written there and not composed here. */
   reportNothingToClose: () => void;
   /**
-   * Say that `close` found something on top that may not be closed yet, in
-   * that thing's own words (PRD #1223 U5). The voice surface renders it where
-   * it renders {@link reportNothingToClose}'s sentence; the sentence itself
-   * belongs to whatever refused.
+   * Say that a dispatch reached something that would not do it, in that
+   * thing's own words: `close` finding a dialog that may not be closed yet
+   * (PRD #1223 U5), or a directory row finding that the browser has moved on
+   * since the utterance was declared (PRD #1223). The voice surface renders it
+   * where it renders {@link reportNothingToClose}'s sentence; the sentence
+   * itself belongs to whatever refused.
    */
-  reportCloseRefused: (reason: string) => void;
+  reportRefused: (reason: string) => void;
   /**
    * Close the New agent dialog (PRD #1223 U5) — every close route the dialog
    * has, reached by voice. Answers `undefined` when it closed, or the dialog's
@@ -222,6 +224,25 @@ export type VoiceActionContext = {
    * closed, for the same reason `Ctrl+N` stands down while it is open.
    */
   openNewAgent: (deckId?: string) => void;
+  /**
+   * PRD #1223 — the New agent dialog's directory browser, by voice: go into
+   * the child a `dir_ref` resolved to (`target.directoryPath`), go up to `..`,
+   * or choose the directory on screen. Each calls the function the browser's
+   * own key calls, and each answers `undefined` when it acted or the dialog's
+   * sentence when it would not — see {@link VoiceDispatchTarget.declaredDirectories}.
+   *
+   * **The first members that reach INSIDE a mounted dialog**, which is the new
+   * shape and the reason they refuse rather than merely run: the row was judged
+   * callable against what the webview DECLARED with the utterance, and the
+   * browser can move during the round trip (a click, a key, a listing landing).
+   * So each re-checks the declaration against the live browser and refuses
+   * when the two differ, instead of acting on a listing the user has left.
+   *
+   * Served by the overview, which owns the dialog; see {@link VoiceOverviewContext}.
+   */
+  openDirectory: (target: VoiceDispatchTarget) => string | undefined;
+  goToParentDirectory: (target: VoiceDispatchTarget) => string | undefined;
+  useThisDirectory: (target: VoiceDispatchTarget) => string | undefined;
 };
 
 /**
@@ -321,7 +342,7 @@ export const VOICE_ACTIONS = {
   closeTopmost: {
     label: "Close whatever is open over the screen",
     voice: true,
-    needs: ["closeAgentView", "reportNothingToClose", "reportCloseRefused"],
+    needs: ["closeAgentView", "reportNothingToClose", "reportRefused"],
     /**
      * PRD #802 — the precedence, decided HERE because it cannot be decided in
      * the table.
@@ -348,13 +369,13 @@ export const VOICE_ACTIONS = {
      * dialog is open.
      */
     run: (
-      context: Pick<VoiceActionContext, "closeAgentView" | "reportNothingToClose" | "reportCloseRefused"> & Partial<Pick<VoiceActionContext, "dismissVoiceOverlay" | "closeNewAgent">>,
+      context: Pick<VoiceActionContext, "closeAgentView" | "reportNothingToClose" | "reportRefused"> & Partial<Pick<VoiceActionContext, "dismissVoiceOverlay" | "closeNewAgent">>,
       target: VoiceDispatchTarget,
     ) => {
       if (context.dismissVoiceOverlay) return context.dismissVoiceOverlay();
       if (context.closeNewAgent) {
         const refused = context.closeNewAgent();
-        if (refused !== undefined) context.reportCloseRefused(refused);
+        if (refused !== undefined) context.reportRefused(refused);
         return;
       }
       if (target.agentViewOpen) return context.closeAgentView();
@@ -506,6 +527,41 @@ export const VOICE_ACTIONS = {
      */
     run: (context: Pick<VoiceActionContext, "openNewAgent">, target?: { preselectDeckId?: string }) => context.openNewAgent(target?.preselectDeckId || undefined),
   },
+
+  /* PRD #1223 — the three `requires`-gated rows: the New agent dialog's
+     directory browser. None starts anything — the dialog's Start is still the
+     only thing that does — so none is in PRD #802 D5's confirmation set. The
+     manual paths (the `..` row, the keys, the Use this directory button) call
+     the same dialog functions directly and are unchanged. */
+  openDirectory: {
+    label: "Open a directory listed in the New agent browser",
+    voice: true,
+    needs: ["openDirectory", "reportRefused"],
+    run: (context: Pick<VoiceActionContext, "openDirectory" | "reportRefused">, target: VoiceDispatchTarget) => {
+      const refused = context.openDirectory(target);
+      if (refused !== undefined) context.reportRefused(refused);
+    },
+  },
+
+  goToParentDirectory: {
+    label: "Go up to the parent directory in the New agent browser",
+    voice: true,
+    needs: ["goToParentDirectory", "reportRefused"],
+    run: (context: Pick<VoiceActionContext, "goToParentDirectory" | "reportRefused">, target: VoiceDispatchTarget) => {
+      const refused = context.goToParentDirectory(target);
+      if (refused !== undefined) context.reportRefused(refused);
+    },
+  },
+
+  useThisDirectory: {
+    label: "Use the directory on screen for the new agent",
+    voice: true,
+    needs: ["useThisDirectory", "reportRefused"],
+    run: (context: Pick<VoiceActionContext, "useThisDirectory" | "reportRefused">, target: VoiceDispatchTarget) => {
+      const refused = context.useThisDirectory(target);
+      if (refused !== undefined) context.reportRefused(refused);
+    },
+  },
 } satisfies Record<string, VoiceActionEntry>;
 
 /** Every action id, as the guard and the command table spell them. */
@@ -567,6 +623,23 @@ export type VoiceDispatchTarget = AgentViewTarget & {
    * the bare "new agent" would preselect whatever deck happened to be in view.
    */
   preselectDeckId?: string;
+  /**
+   * The child directory to open — the deck's own path a row's `dir_ref` param
+   * resolved to, against the browser's children on screen (PRD #1223).
+   */
+  directoryPath?: string;
+  /**
+   * The directory browser the utterance was JUDGED against: the deck and the
+   * listing `path` the webview declared with it (PRD #1223), or absent when it
+   * declared none.
+   *
+   * The screen gets `SCREEN_MOVED_ON` in the voice surface for the same
+   * hazard, but a browser that moved is not a reason to refuse every command —
+   * "close" is still right after a listing lands — so the check lives in the
+   * three directory members, which compare this against the live browser and
+   * refuse when the two differ.
+   */
+  declaredDirectories?: { deckId: string; path: string };
   /**
    * The words to type into the open agent's prompt, for the dictation row
    * (PRD #802 D6, rebuilt).
@@ -642,7 +715,7 @@ export type VoiceDispatchContext = Pick<VoiceActionContext, "navigate" | "closeA
  * set's complement, so a screen that tried to serve one of these members would
  * not type-check, and neither would a panel that left one out.
  */
-export type VoicePanelContext = Pick<VoiceActionContext, "stopVoice" | "showVoiceCommands" | "typeIntoAgent" | "submitAgentPrompt" | "dismissVoiceOverlay" | "reportNothingToClose" | "reportCloseRefused">;
+export type VoicePanelContext = Pick<VoiceActionContext, "stopVoice" | "showVoiceCommands" | "typeIntoAgent" | "submitAgentPrompt" | "dismissVoiceOverlay" | "reportNothingToClose" | "reportRefused">;
 /**
  * `Partial`, because a panel can serve one of these and not another.
  *
@@ -676,13 +749,34 @@ export type VoiceScreenContext = Omit<VoiceActionContext, keyof VoicePanelContex
  * dialog for; a dispatch of `openNewAgent` there is refused against its
  * `needs`, the way the overview refuses a deck overlay.
  */
-export type VoiceOverviewContext = Pick<VoiceActionContext, "openNewAgent" | "closeNewAgent">;
+export type VoiceOverviewContext = Pick<VoiceActionContext, "openNewAgent" | "closeNewAgent" | "openDirectory" | "goToParentDirectory" | "useThisDirectory">;
+
+/**
+ * What the New agent dialog publishes about its directory browser (PRD #1223),
+ * and the one slot through which the INSIDE of a mounted dialog reaches voice.
+ *
+ * `directories` is the declaration — what the browser shows, or `undefined`
+ * when it shows nothing to name — which the voice surface sends with each
+ * utterance. The three functions are the browser's own moves, each refusing
+ * in the dialog's words when it cannot apply.
+ *
+ * Written by the dialog on every render and cleared on unmount, so a reader at
+ * resolve or dispatch time sees the last committed browser or nothing. The
+ * overview serves the three context members by reading this slot at call time
+ * (see `AgentOverview`), which is what keeps "the dialog closed during the
+ * round trip" a refusal with a sentence rather than a `needs` miss.
+ */
+export type NewAgentVoice = Pick<VoiceActionContext, "openDirectory" | "goToParentDirectory" | "useThisDirectory"> & {
+  directories: import("./bridge").VoiceDirectoriesDto | undefined;
+};
+export type NewAgentVoiceChannel = { current: NewAgentVoice | undefined };
 
 /**
  * How the overview publishes what a voice dispatch may need from it —
- * `closeNewAgent` while the dialog is open, `openNewAgent` while it is closed —
- * to the shell that dispatches, the way {@link VoiceContextChannel} carries
- * the deck's.
+ * `closeNewAgent` while the dialog is open, `openNewAgent` while it is closed,
+ * and the three directory members always, each refusing in words when there
+ * is no browser to move — to the shell that dispatches, the way
+ * {@link VoiceContextChannel} carries the deck's.
  */
 export type VoiceOverviewChannel = { current: Partial<VoiceOverviewContext> | undefined };
 
