@@ -150,6 +150,44 @@ test.describe("the New agent flow", () => {
   });
 
   /**
+   * Scenario (PRD #1223 audit F2): on the fleet, open New agent on the remote
+   * deck and browse into `scratch/twin-project`, whose config defines
+   * `twin-loop` twice and `solo-loop` once. The Mode row shows both
+   * `twin-loop` chips disabled after `solo-loop`, with a line saying to rename
+   * one; the arrow keys go from No mode to `solo-loop` and past the namesakes.
+   */
+  test("shows a project's namesake orchestrations disabled with the reason", async ({ page }) => {
+    await openOverview(page, "fleet");
+
+    await page.getByTestId("overview-new-agent").click();
+    const dialog = page.getByTestId("new-agent-dialog");
+    await page.getByTestId("new-agent-deck-list").locator(`[data-deck-id="${REMOTE_DECK}"]`).click();
+    await expect(page.getByTestId("new-agent-current-path")).toHaveText("/home/build");
+    const directories = page.getByTestId("new-agent-directory-list");
+    await expect(directories).toBeFocused();
+    await page.keyboard.press("j");
+    await page.keyboard.press("Enter");
+    await expect(page.getByTestId("new-agent-current-path")).toHaveText("/home/build/scratch");
+    await page.keyboard.press("j");
+    await expect(directories.locator("[aria-selected='true']")).toHaveAttribute("data-path", "/home/build/scratch/twin-project");
+    await page.keyboard.press("Enter");
+    await expect(page.getByTestId("new-agent-current-path")).toHaveText("/home/build/scratch/twin-project");
+    await page.keyboard.press(" ");
+
+    await expect(dialog).toHaveAttribute("data-step", "form");
+    const modes = page.getByTestId("new-agent-modes").getByRole("button");
+    await expect(modes).toHaveText(["No mode", "Orch: solo-loop", "Orch: twin-loop", "Orch: twin-loop", "schedule", "schedule: issues", "dispatcher"]);
+    await expect(page.getByTestId("new-agent-mode-ambiguous-0")).toBeDisabled();
+    await expect(page.getByTestId("new-agent-mode-ambiguous-1")).toBeDisabled();
+    await expect(page.getByTestId("new-agent-orchestration-ambiguous")).toHaveText("This project defines more than one orchestration named twin-loop; rename one to launch it here.");
+    await page.getByTestId("new-agent-mode-none").focus();
+    await page.keyboard.press("ArrowRight");
+    await expect(page.getByTestId("new-agent-mode-orch:solo-loop")).toHaveAttribute("aria-pressed", "true");
+    await page.keyboard.press("ArrowRight");
+    await expect(page.getByTestId("new-agent-mode-schedule")).toHaveAttribute("aria-pressed", "true");
+  });
+
+  /**
    * Scenario (PRD #1223 M6): with the remote deck playing a deck from before
    * PRD #1223, open the flow from its header and type the project's path. The
    * deck cannot start a role with its configured command, so no orchestration

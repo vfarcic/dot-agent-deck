@@ -1,8 +1,9 @@
-import { useCallback, useEffect, useId, useMemo, useRef, useState, type KeyboardEvent, type ReactNode } from "react";
+import { Fragment, useCallback, useEffect, useId, useMemo, useRef, useState, type KeyboardEvent, type ReactNode } from "react";
 import { ArrowLeft, ArrowUp, Check, Folder, FolderGit2, Loader2, Plus, X } from "lucide-react";
 import { LaunchCleanupError } from "../lib/actionError";
 import { DISPLAY_LIMITS, displayText } from "../lib/displayText";
 import {
+  ambiguousOrchestrationReason,
   AUTHORING_MODES,
   authoringModes,
   cleanupWarning,
@@ -415,6 +416,20 @@ export function NewAgentDialog({ runtime, initialDeckId, onClose, onAppeared, on
     ...orchestrationChips.map(({ id, label }) => ({ id, label })),
     ...authoring.offered.map((mode) => ({ id: mode.kind, label: mode.label })),
   ];
+  /**
+   * PRD #1223 audit F2 — the project's namesake orchestrations, shown after
+   * the ones that can be chosen and disabled with the reason. They are not in
+   * `modes`, so neither a click nor the arrow keys can select one, and no
+   * ambiguous name can reach the launch. One reason line per shared name.
+   */
+  const ambiguousChips = (orchestrationOffer.ambiguous ?? []).map((orchestration, index) => ({
+    key: `ambiguous-${index}`,
+    label: `Orch: ${displayText(orchestration.displayName, DISPLAY_LIMITS.name)}`,
+    reason: ambiguousOrchestrationReason(orchestration.displayName),
+  }));
+  const ambiguousReasons = [...new Set(ambiguousChips.map((chip) => chip.reason))];
+  /** Where the disabled namesakes sit in the Mode row: after the orchestrations that can be chosen. */
+  const orchestrationEnd = 1 + orchestrationChips.length;
   /** The chip in force — `No mode` whenever the chosen one is not (or no longer) offered. */
   const mode: ModeId = modes.some((candidate) => candidate.id === modeChoice) ? modeChoice : NO_MODE.id;
   const selectedOrchestration: DaemonOrchestration | undefined = orchestrationChips.find((chip) => chip.id === mode)?.orchestration;
@@ -671,6 +686,11 @@ export function NewAgentDialog({ runtime, initialDeckId, onClose, onAppeared, on
   };
 
   const busy = phase !== "idle";
+  const ambiguousChipButtons = ambiguousChips.map((chip) => (
+    <button type="button" key={chip.key} className="new-agent-chip is-disabled" disabled title={chip.reason} data-testid={`new-agent-mode-${chip.key}`}>
+      {chip.label}
+    </button>
+  ));
   const unsupportedOptions = options?.kind === "unsupported";
 
   let body: ReactNode;
@@ -839,22 +859,26 @@ export function NewAgentDialog({ runtime, initialDeckId, onClose, onAppeared, on
         <div className="new-agent-field">
           <span id={`${titleId}-mode`}>Mode</span>
           <div className="new-agent-chips" role="group" aria-labelledby={`${titleId}-mode`} data-testid="new-agent-modes" onKeyDown={onModeKeyDown}>
-            {modes.map((candidate) => (
-              <button
-                type="button"
-                key={candidate.id}
-                className={`new-agent-chip${candidate.id === mode ? " is-active" : ""}`}
-                aria-pressed={candidate.id === mode}
-                data-mode={candidate.id}
-                data-testid={`new-agent-mode-${candidate.id}`}
-                disabled={busy}
-                onClick={() => selectMode(candidate.id)}
-              >
-                {candidate.label}
-              </button>
+            {modes.map((candidate, index) => (
+              <Fragment key={candidate.id}>
+                {index === orchestrationEnd && ambiguousChipButtons}
+                <button
+                  type="button"
+                  className={`new-agent-chip${candidate.id === mode ? " is-active" : ""}`}
+                  aria-pressed={candidate.id === mode}
+                  data-mode={candidate.id}
+                  data-testid={`new-agent-mode-${candidate.id}`}
+                  disabled={busy}
+                  onClick={() => selectMode(candidate.id)}
+                >
+                  {candidate.label}
+                </button>
+              </Fragment>
             ))}
+            {orchestrationEnd >= modes.length && ambiguousChipButtons}
           </div>
         </div>
+        {ambiguousReasons.map((reason) => <p key={reason} className="new-agent-hint" data-testid="new-agent-orchestration-ambiguous">{reason}</p>)}
         {orchestrationOffer.withheld && <p className="new-agent-hint" data-testid="new-agent-orchestrations-withheld">{displayText(orchestrationOffer.withheld, DISPLAY_LIMITS.message)}</p>}
         {orchestrationsError && <p className="new-agent-error" data-testid="new-agent-orchestrations-error">{displayText(orchestrationsError, DISPLAY_LIMITS.message)}</p>}
         {authoring.withheld && <p className="new-agent-hint" data-testid="new-agent-authoring-withheld">{authoring.withheld}</p>}

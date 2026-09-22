@@ -516,8 +516,9 @@ export function fixtureDirectoryTree(home: string): Map<string, FixtureDirectory
     { path: "/home", parent: "/", entries: [entry(`/home/${user}`)] },
     { path: home, parent: "/home", entries: [entry(`${home}/demo-project`, true), entry(`${home}/scratch`)] },
     { path: `${home}/demo-project`, parent: home, entries: [] },
-    { path: `${home}/scratch`, parent: home, entries: [entry(`${home}/scratch/notes`)] },
+    { path: `${home}/scratch`, parent: home, entries: [entry(`${home}/scratch/notes`), entry(`${home}/scratch/twin-project`, true)] },
     { path: `${home}/scratch/notes`, parent: `${home}/scratch`, entries: [] },
+    { path: `${home}/scratch/twin-project`, parent: `${home}/scratch`, entries: [] },
   ];
   return new Map(tree.map((directory) => [directory.path, directory]));
 }
@@ -525,10 +526,19 @@ export function fixtureDirectoryTree(home: string): Map<string, FixtureDirectory
 /**
  * PRD #1223 M6 — the orchestrations a fixture deck's `demo-project` defines, as
  * that deck's `ResolveProject` answers them: one, `demo-loop`, whose
- * `planner` starts the run and whose `builder` works for it. Every other
- * directory in {@link fixtureDirectoryTree} is an ordinary one.
+ * `planner` starts the run and whose `builder` works for it.
+ *
+ * `scratch/twin-project` is the audit F2 case: it defines `twin-loop` TWICE —
+ * which a real config may, since validation only warns — and `solo-loop` once,
+ * so the preview shows namesakes disabled beside an orchestration that can be
+ * chosen. Every other directory in {@link fixtureDirectoryTree} is an ordinary
+ * one.
  */
 export function fixtureProjectOrchestrations(home: string, path: string): DaemonOrchestration[] | undefined {
+  if (path === `${home}/scratch/twin-project`) {
+    const single = (name: string, role: string): DaemonOrchestration => ({ name, displayName: name, default: false, roles: [{ name: role, displayName: role, start: true }] });
+    return [single("twin-loop", "planner"), single("solo-loop", "planner"), single("twin-loop", "builder")];
+  }
   if (path !== `${home}/demo-project`) return undefined;
   return [
     {

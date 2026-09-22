@@ -982,6 +982,7 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .new-agent-chips { display: flex; flex-wrap: wrap; gap: 5px; }
 .new-agent-chip { min-height: 26px; padding: 0 9px; border: 1px solid var(--line-strong); border-radius: 13px; color: var(--ink); background: var(--paper); cursor: pointer; font-size: 10px; font-weight: 650; }
 .new-agent-chip.is-active { border-color: var(--teal-deep); color: var(--on-accent); background: var(--teal); }
+.new-agent-chip.is-disabled { border-style: dashed; color: var(--faint); cursor: not-allowed; }
 /* The overview's own line for what the New agent flow could not finish on
    screen — an agent that started and has not been listed yet. */
 .overview-banner { padding: 8px 10px; display: flex; align-items: center; gap: 8px; border: 1px solid var(--amber-rim); border-radius: 5px; color: var(--amber-ink); background: var(--amber-bright); font-size: 10px; }

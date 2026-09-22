@@ -1053,6 +1053,49 @@ describe("New agent dialog — orchestrations (PRD #1223 M6)", () => {
   });
 
   /**
+   * Scenario (PRD #1223 audit F2): the project defines `loop` twice and
+   * `solo` once. The two `loop` chips are shown disabled, with a reason that
+   * says to rename one, and neither a click nor the arrow keys can select
+   * one; `solo` can be chosen and is what the launch sends. No
+   * `start_orchestration` ever names `loop`.
+   */
+  it("shows namesake orchestrations disabled with the reason and never launches one", async () => {
+    const orchestration = (name: string, start: string) => ({ name, displayName: name, default: false, roles: [{ name: start, displayName: start, start: true }] });
+    const runtime = fakeRuntime({
+      newAgentOrchestrations: orchestrationsOf({ ...PROJECT_ORCHESTRATIONS, orchestrations: [orchestration("loop", "planner"), orchestration("solo", "worker"), orchestration("loop", "reviewer")] }),
+      runAction: vi.fn(async () => ({ ok: true, agentId: "21" })),
+    });
+    renderDialog(runtime);
+    await reachProjectForm();
+
+    const namesakes = await screen.findAllByTestId(/^new-agent-mode-ambiguous-/);
+    expect(namesakes).toHaveLength(2);
+    for (const namesake of namesakes) {
+      expect(namesake).toBeDisabled();
+      expect(namesake).toHaveTextContent("Orch: loop");
+      expect(namesake).toHaveAttribute("title", "This project defines more than one orchestration named loop; rename one to launch it here.");
+      fireEvent.click(namesake);
+    }
+    expect(screen.getAllByTestId("new-agent-orchestration-ambiguous")).toHaveLength(1);
+    expect(screen.getByTestId("new-agent-orchestration-ambiguous")).toHaveTextContent("rename one to launch it here");
+    expect(screen.queryByTestId("new-agent-mode-orch:loop")).toBeNull();
+    expect(screen.getByTestId("new-agent-mode-none")).toHaveAttribute("aria-pressed", "true");
+
+    // Right from `No mode` lands on `solo` — the arrow keys skip the namesakes — and a second Right wraps back.
+    fireEvent.keyDown(screen.getByTestId("new-agent-modes"), { key: "ArrowRight" });
+    expect(screen.getByTestId("new-agent-mode-orch:solo")).toHaveAttribute("aria-pressed", "true");
+    fireEvent.keyDown(screen.getByTestId("new-agent-modes"), { key: "ArrowRight" });
+    expect(screen.getByTestId("new-agent-mode-none")).toHaveAttribute("aria-pressed", "true");
+    fireEvent.keyDown(screen.getByTestId("new-agent-modes"), { key: "ArrowRight" });
+
+    fireEvent.click(screen.getByTestId("new-agent-start"));
+
+    await screen.findByTestId("new-agent-waiting");
+    expect(runtime.runAction).toHaveBeenCalledTimes(1);
+    expect(runtime.runAction).toHaveBeenCalledWith(expect.objectContaining({ type: "start_orchestration", orchestration: "solo" }));
+  });
+
+  /**
    * Scenario (PRD #1223 audit F6): a launch of roles with 128-character names
    * fails, and its rollback could not confirm two of them stopped. The crate's
    * sentence names every started role before it gets to the cleanup, so the

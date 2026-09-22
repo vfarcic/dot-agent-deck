@@ -199,11 +199,32 @@ export function resolveAuthoringCommand(command: string, defaultCommand: string 
  * none is offered. Nothing is offered while the answer is loading or for an
  * ordinary directory, and a deck that cannot launch one from this flow gives
  * its reason instead.
+ *
+ * # Namesakes are shown, never offered (PRD #1223 audit F2)
+ *
+ * A project may define two orchestrations with one name — config validation
+ * only warns — and `ResolveProject` lists both. But the launch identifies an
+ * orchestration by its name alone, and the deck's `PrepareWorkflow` takes the
+ * FIRST definition with that name: choosing the second would run the first's
+ * roles and commands. So every orchestration whose name another one in the
+ * project shares is returned under `ambiguous`, in the project's order, for the
+ * dialog to show disabled with {@link ambiguousOrchestrationReason}; only a
+ * uniquely named one is in `offered`, and so only one can ever be submitted.
+ * Names compare exactly, as the deck's lookup does.
  */
-export function orchestrationModes(answer: NewAgentOrchestrations | undefined): { offered: DaemonOrchestration[]; withheld?: string } {
+export function orchestrationModes(answer: NewAgentOrchestrations | undefined): { offered: DaemonOrchestration[]; ambiguous?: DaemonOrchestration[]; withheld?: string } {
   if (answer === undefined || answer.kind === "not_project") return { offered: [] };
   if (answer.kind === "unsupported") return { offered: [], withheld: answer.reason };
-  return { offered: answer.orchestrations };
+  const uses = new Map<string, number>();
+  for (const orchestration of answer.orchestrations) uses.set(orchestration.name, (uses.get(orchestration.name) ?? 0) + 1);
+  const offered = answer.orchestrations.filter((orchestration) => uses.get(orchestration.name) === 1);
+  const ambiguous = answer.orchestrations.filter((orchestration) => uses.get(orchestration.name) !== 1);
+  return ambiguous.length === 0 ? { offered } : { offered, ambiguous };
+}
+
+/** Why a namesake orchestration's chip is disabled (PRD #1223 audit F2). */
+export function ambiguousOrchestrationReason(displayName: string): string {
+  return `This project defines more than one orchestration named ${displayText(displayName, DISPLAY_LIMITS.name)}; rename one to launch it here.`;
 }
 
 /** The Mode chip id of an orchestration — distinct from every authoring kind and from `none`. */

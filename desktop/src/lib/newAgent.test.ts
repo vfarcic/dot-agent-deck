@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { createFixtureFleet, createFixtureSnapshot, createFixtureStartedAgent, FIXTURE_DAEMON_ID, FIXTURE_PENDING_DAEMON_ID, FIXTURE_REMOTE_DAEMON_ID, FIXTURE_UNREACHABLE_DAEMON_ID } from "../data/fixture";
 import type { AgentSession, ConnectionView, DeckFleet, NewAgentOptions } from "../types";
 import {
+  ambiguousOrchestrationReason,
   AUTHORING_WITHHELD,
   authoringModes,
   cleanupWarning,
@@ -271,6 +272,25 @@ describe("New agent orchestration rules (PRD #1223 M6)", () => {
     expect(orchestrationModes({ kind: "unsupported", reason: "too old" })).toEqual({ offered: [], withheld: "too old" });
     expect(orchestrationModes({ kind: "project", path: "/p", displayPath: "/p", displayName: "p", orchestrations: [loop] })).toEqual({ offered: [loop] });
     expect(orchestrationModeId("loop")).toBe("orch:loop");
+  });
+
+  /**
+   * Scenario (PRD #1223 audit F2): a project defines `loop` twice and `solo`
+   * once. The launch identifies an orchestration by name and the deck takes
+   * the first definition, so only `solo` is offered; both `loop`s come back as
+   * ambiguous, in the project's order, with a reason that says what to do.
+   * Names compare exactly — `Loop` is not a namesake of `loop`.
+   */
+  it("offers only uniquely named orchestrations and returns every namesake as ambiguous", () => {
+    const orchestration = (name: string, roles: string[]) => ({ name, displayName: name, default: false, roles: roles.map((role, index) => ({ name: role, displayName: role, start: index === 0 })) });
+    const first = orchestration("loop", ["planner"]);
+    const solo = orchestration("solo", ["worker"]);
+    const second = orchestration("loop", ["reviewer"]);
+    const cased = orchestration("Loop", ["other"]);
+
+    expect(orchestrationModes({ kind: "project", path: "/p", displayPath: "/p", displayName: "p", orchestrations: [first, solo, second, cased] })).toEqual({ offered: [solo, cased], ambiguous: [first, second] });
+    expect(ambiguousOrchestrationReason("loop")).toBe("This project defines more than one orchestration named loop; rename one to launch it here.");
+    expect(ambiguousOrchestrationReason("lo\u202Eop")).toContain("named loop;");
   });
 });
 
