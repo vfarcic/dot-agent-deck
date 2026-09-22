@@ -1298,9 +1298,30 @@ impl SubjectsRun {
 /// accepted by both Win32 and every POSIX-emulation layer MSYS ships, so
 /// normalising removes a possible source of trouble without removing anything
 /// Unix relies on.
+///
+/// The presence check requires `--version` to EXIT SUCCESSFULLY, not merely to
+/// spawn -- `.output().ok()` alone only catches "no such program", and on a
+/// native Windows runner there IS a program named `bash` on PATH even with no
+/// usable shell behind it: `C:\Windows\System32\bash.exe`, the WSL launcher
+/// stub, which spawns fine and then exits nonzero printing "Windows Subsystem
+/// for Linux has no installed distributions." Measured on `build-windows` in
+/// PR #1227: that is exactly what every one of this module's `run_subjects`
+/// calls hit, because the runner's PATH puts System32 ahead of Git for
+/// Windows' `bash.exe`. `verify_pr_stream`'s `tool_present` helper already
+/// checks `.status.success()` for this reason, which is why ITS bash-invoking
+/// tests reported PASS on the same runner -- they detected the same broken
+/// `bash` and skipped, silently and correctly, while this module's weaker
+/// check let three tests attempt to run a shell that cannot run anything.
 fn run_subjects(files: &[&str], desktop_result: &str) -> Option<SubjectsRun> {
     use std::process::Command;
-    Command::new("bash").arg("--version").output().ok()?;
+    let usable = Command::new("bash")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !usable {
+        return None;
+    }
 
     let dir = tempfile::tempdir().expect("tempdir");
     for sub in ["dist", "dist-desktop"] {
