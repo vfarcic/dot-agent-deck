@@ -1104,8 +1104,11 @@ impl VoiceToken for ActivationMode {
 /// Whether each command request carries the LABELS the app observed — agent
 /// names and live status, deck labels, the directory names on screen, the New
 /// agent form's Mode chips and Agent picker entries, orchestration titles and
-/// roles — or only the transcript and the command table (PRD #1223, audit
-/// finding A1).
+/// roles — or none of them (PRD #1223, audit finding A1). Either way the
+/// request also carries what every command does: the transcript, the fixed
+/// instructions and response schema, the command table, the model name and
+/// token ceiling, and — off this machine — the stored key in its
+/// authentication header (`VoicePanel.tsx`'s `INTENT_DISCLOSURE`).
 ///
 /// **Shared by default**, because without them a model cannot tell that "the
 /// build box" is a deck or "billing" a directory, and cannot serve "the one
@@ -1128,7 +1131,7 @@ pub enum LabelSharing {
     /// Send the observed labels, in a data turn marked untrusted.
     #[default]
     Shared,
-    /// Send the transcript and the command table only.
+    /// Send none of the observed labels: no data turn at all.
     Withheld,
 }
 

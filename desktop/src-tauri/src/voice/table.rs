@@ -315,6 +315,35 @@ pub struct CommandRow {
     /// blocks an action before it does. `commands.toml` says so at the column.
     pub report: String,
     pub params: Vec<ParamSpec>,
+    /// What in a transcript counts as the user having asked for THIS action
+    /// (PRD #1223, closing audit F1). See [`ActionGrounding`].
+    pub grounding: ActionGrounding,
+}
+
+/// How a row's ACTION is held against the transcript before it dispatches
+/// (PRD #1223, closing audit F1) — the `heard_as` / `ungrounded` columns.
+///
+/// **Why the action and not only its references.** The model is shown names
+/// from repositories, configuration files and remote machines, and a name can
+/// be written to steer it. Grounding a row's *references* (`outcome::grounding`)
+/// stops a steered model from naming a thing the user did not name, but a row
+/// with no reference — `submit_prompt`, which presses Enter in the open agent's
+/// prompt, `go_to_parent`, `use_this_directory`, `close`, `voice_off` — had
+/// nothing to hold against the transcript at all. So every row now also says
+/// which words ask for it, and a pick whose words the user did not say is
+/// refused (`VoiceOutcome::ActionUngrounded`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ActionGrounding {
+    /// The row is asked for when the transcript contains at least one of these
+    /// words or phrases. Each is drawn from the row's own `id` or `description`
+    /// — the parser refuses one that is not ([`TableError::ForeignHeardAs`]) —
+    /// so the vocabulary is the one the model is already picking on, curated
+    /// rather than scraped, and reviewable beside the row.
+    HeardAs(Vec<String>),
+    /// The row cannot be grounded by words, and this is why. Enumerated per
+    /// row, like a `no_voice` reason, rather than being an implicit exemption;
+    /// `voice_table_no_row_is_exempt_from_action_grounding` pins the set.
+    Exempt(String),
 }
 
 impl CommandRow {
@@ -463,6 +492,40 @@ impl CommandTable {
                 }
             }
 
+            let grounding = match (row.heard_as, row.ungrounded) {
+                (Some(_), Some(_)) => {
+                    return Err(TableError::ConflictingGrounding { id: id.clone() });
+                }
+                (None, None) => return Err(TableError::MissingGrounding { id: id.clone() }),
+                (None, Some(reason)) => {
+                    if reason.trim().is_empty() {
+                        return Err(TableError::MissingGrounding { id: id.clone() });
+                    }
+                    ActionGrounding::Exempt(reason)
+                }
+                (Some(phrases), None) => {
+                    if phrases.is_empty() {
+                        return Err(TableError::MissingGrounding { id: id.clone() });
+                    }
+                    // Drawn from the row's own words, so a vocabulary cannot
+                    // quietly grow a word the model is never told the row
+                    // answers to.
+                    let own = spoken_words(&format!("{id} {description}"));
+                    for phrase in &phrases {
+                        let words = spoken_words(phrase);
+                        if words.is_empty()
+                            || !own.windows(words.len()).any(|window| window == words)
+                        {
+                            return Err(TableError::ForeignHeardAs {
+                                id: id.clone(),
+                                phrase: phrase.clone(),
+                            });
+                        }
+                    }
+                    ActionGrounding::HeardAs(phrases)
+                }
+            };
+
             commands.push(CommandRow {
                 id,
                 description,
@@ -472,6 +535,7 @@ impl CommandTable {
                 unavailable_hint,
                 report,
                 params,
+                grounding,
             });
         }
 
@@ -498,6 +562,21 @@ fn required(value: Option<String>, id: &str, field: &'static str) -> Result<Stri
             id: id.to_string(),
             field,
         })
+}
+
+/// A text's words, lowercased, with every non-alphanumeric character spoken as
+/// a space — so `billing.api`, `billing-api` and `schedule: issues` are the
+/// words a transcriber writes for them. The one tokenisation every grounding
+/// check uses: the parser's `heard_as` check here, and `outcome`'s transcript
+/// checks.
+pub(crate) fn spoken_words(text: &str) -> Vec<String> {
+    text.chars()
+        .map(|c| if c.is_alphanumeric() { c } else { ' ' })
+        .collect::<String>()
+        .to_lowercase()
+        .split_whitespace()
+        .map(str::to_string)
+        .collect()
 }
 
 /// The `{name}` placeholders in a report, in order.
@@ -570,6 +649,14 @@ pub enum TableError {
     OptionalPlaceholder { id: String, placeholder: String },
     /// A `report` whose braces do not pair up.
     MalformedReport { id: String, detail: String },
+    /// A row with neither a non-empty `heard_as` nor an `ungrounded` reason:
+    /// nothing would say whether the user asked for it.
+    MissingGrounding { id: String },
+    /// A row with both `heard_as` and `ungrounded`.
+    ConflictingGrounding { id: String },
+    /// A `heard_as` entry that is not words of the row's own `id` or
+    /// `description`.
+    ForeignHeardAs { id: String, phrase: String },
 }
 
 impl fmt::Display for TableError {
@@ -631,6 +718,18 @@ impl fmt::Display for TableError {
             TableError::MalformedReport { id, detail } => {
                 write!(f, "command `{id}`'s report has {detail}")
             }
+            TableError::MissingGrounding { id } => write!(
+                f,
+                "command `{id}` has neither `heard_as` (the words that ask for it) nor an `ungrounded` reason"
+            ),
+            TableError::ConflictingGrounding { id } => write!(
+                f,
+                "command `{id}` has both `heard_as` and `ungrounded`; it is one or the other"
+            ),
+            TableError::ForeignHeardAs { id, phrase } => write!(
+                f,
+                "command `{id}`'s `heard_as` entry `{phrase}` is not words of its own id or description"
+            ),
         }
     }
 }
@@ -684,6 +783,7 @@ mod tests {
             "screens = [\"deck\"]",
             "unavailable_hint = \"it works from the deck\"",
             "report = \"Opening {agent}.\"",
+            "heard_as = [\"open\"]",
             "",
             "[[commands.params]]",
             "name = \"agent\"",
@@ -1102,6 +1202,102 @@ mod tests {
             matches!(error, TableError::MalformedReport { .. }),
             "got {error:?}"
         );
+    }
+
+    // -- action grounding (PRD #1223, closing audit F1) --------------------
+
+    #[test]
+    fn voice_table_rejects_a_row_that_says_nothing_about_grounding() {
+        let source = one_row().replace("heard_as = [\"open\"]\n", "");
+        let error = CommandTable::parse(&source).expect_err("refused");
+        assert_eq!(
+            error,
+            TableError::MissingGrounding {
+                id: "open_agent".to_string()
+            }
+        );
+        for empty in ["heard_as = []", "ungrounded = \"  \""] {
+            let source = one_row().replace("heard_as = [\"open\"]", empty);
+            let error = CommandTable::parse(&source).expect_err("refused");
+            assert!(
+                matches!(error, TableError::MissingGrounding { .. }),
+                "{empty}: {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn voice_table_rejects_a_row_both_grounded_and_exempt() {
+        let source = one_row().replace(
+            "heard_as = [\"open\"]",
+            "heard_as = [\"open\"]\nungrounded = \"because\"",
+        );
+        let error = CommandTable::parse(&source).expect_err("refused");
+        assert_eq!(
+            error,
+            TableError::ConflictingGrounding {
+                id: "open_agent".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn voice_table_rejects_a_heard_as_entry_not_in_the_rows_own_words() {
+        // "Open one agent." is the description, so `open agent` (the id's
+        // words) and `one agent` are its own; `send` and `agent one` are not.
+        for good in ["open", "one agent", "open agent", "OPEN"] {
+            let source =
+                one_row().replace("heard_as = [\"open\"]", &format!("heard_as = [\"{good}\"]"));
+            assert!(CommandTable::parse(&source).is_ok(), "{good}");
+        }
+        for foreign in ["send", "agent one", "", "  "] {
+            let source = one_row().replace(
+                "heard_as = [\"open\"]",
+                &format!("heard_as = [\"{foreign}\"]"),
+            );
+            let error = CommandTable::parse(&source).expect_err("refused");
+            assert_eq!(
+                error,
+                TableError::ForeignHeardAs {
+                    id: "open_agent".to_string(),
+                    phrase: foreign.to_string()
+                },
+                "{foreign:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn voice_table_accepts_an_exempt_row_with_its_reason() {
+        let source = one_row().replace(
+            "heard_as = [\"open\"]",
+            "ungrounded = \"a reason someone can disagree with\"",
+        );
+        let table = CommandTable::parse(&source).expect("parses");
+        assert_eq!(
+            table.rows()[0].grounding,
+            ActionGrounding::Exempt("a reason someone can disagree with".to_string())
+        );
+    }
+
+    /// Every shipped row is grounded by its own words, and the set of rows
+    /// exempt from that is pinned — empty today — so an exemption is a
+    /// decision someone makes in review rather than an omission.
+    #[test]
+    fn voice_table_no_row_is_exempt_from_action_grounding() {
+        let exempt: Vec<&str> = super::table()
+            .rows()
+            .iter()
+            .filter(|row| matches!(row.grounding, ActionGrounding::Exempt(_)))
+            .map(|row| row.id.as_str())
+            .collect();
+        assert_eq!(exempt, Vec::<&str>::new());
+        for row in super::table().rows() {
+            let ActionGrounding::HeardAs(phrases) = &row.grounding else {
+                continue;
+            };
+            assert!(!phrases.is_empty(), "{}", row.id);
+        }
     }
 
     #[test]
@@ -1664,6 +1860,8 @@ struct RawCommand {
     requires: Option<Vec<String>>,
     unavailable_hint: Option<String>,
     report: Option<String>,
+    heard_as: Option<Vec<String>>,
+    ungrounded: Option<String>,
     #[serde(default)]
     params: Vec<RawParam>,
 }

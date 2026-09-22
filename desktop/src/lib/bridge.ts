@@ -770,6 +770,7 @@ export type VoiceOutcomeDto =
   | { kind: "unavailable"; transcript: string; action: string; hint: string; sentence: string }
   | { kind: "no_match"; transcript: string; sentence: string }
   | { kind: "unknown_action"; transcript: string; action: string; sentence: string }
+  | { kind: "action_ungrounded"; transcript: string; action: string; sentence: string }
   | { kind: "param_missing"; transcript: string; action: string; param: string; sentence: string }
   | { kind: "param_unresolved"; transcript: string; action: string; param: string; spoken: string; sentence: string }
   | { kind: "param_ambiguous"; transcript: string; action: string; param: string; spoken: string; matches: string[]; sentence: string }

@@ -620,6 +620,7 @@ mod tests {
             "invoke = \"anywhere\"",
             "unavailable_hint = \"unreachable\"",
             "report = \"Done.\"",
+            "heard_as = [\"anywhere\"]",
         ]
         .join("\n");
         let parsed = CommandTable::parse(&source).expect("parses");

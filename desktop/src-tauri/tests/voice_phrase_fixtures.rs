@@ -150,6 +150,7 @@ enum OutcomeKind {
     Unavailable,
     NoMatch,
     UnknownAction,
+    ActionUngrounded,
     ParamMissing,
     ParamUnresolved,
     ParamAmbiguous,
@@ -164,6 +165,7 @@ impl fmt::Display for OutcomeKind {
             Self::Unavailable => "unavailable",
             Self::NoMatch => "no_match",
             Self::UnknownAction => "unknown_action",
+            Self::ActionUngrounded => "action_ungrounded",
             Self::ParamMissing => "param_missing",
             Self::ParamUnresolved => "param_unresolved",
             Self::ParamAmbiguous => "param_ambiguous",
@@ -221,6 +223,9 @@ fn observed(outcome: &VoiceOutcome) -> (Option<&str>, OutcomeKind, Option<&str>)
         VoiceOutcome::NoMatch { .. } => (Some(NO_MATCH_ACTION), OutcomeKind::NoMatch, None),
         VoiceOutcome::UnknownAction { action, .. } => {
             (Some(action), OutcomeKind::UnknownAction, None)
+        }
+        VoiceOutcome::ActionUngrounded { action, .. } => {
+            (Some(action), OutcomeKind::ActionUngrounded, None)
         }
         VoiceOutcome::ParamMissing { action, .. } => {
             (Some(action), OutcomeKind::ParamMissing, None)

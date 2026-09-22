@@ -113,23 +113,29 @@ const LABEL_SHARING_LABELS: Record<string, string> = {
 };
 
 /**
- * What every command sends, whatever the Names row says. Verified against the
- * code rather than summarised from it: the transcript is `IntentRequest`'s
- * `transcript`; the command list is `prompt::commands_state` — each row's id,
- * description, params and `callable` flag plus its unavailable hint; and the
- * two local fast paths are `outcome::local_intercept`.
+ * What every command sends, whatever the Names row says (PRD #1223, closing
+ * audit F3). Verified against the code rather than summarised from it: the
+ * transcript is `IntentRequest`'s `transcript`; the instructions and answer
+ * format are `schema::TOOL_INSTRUCTIONS` and the response schema both request
+ * builders attach; the model name and token limit are the settings' `model`
+ * and `max_tokens`; the command list is `prompt::commands_state` — each row's
+ * id, description, params (name and kind), `callable` flag and unavailable
+ * hint; the key is `RemoteResolver::run`'s `x-api-key` / `Authorization`
+ * header, never read for a loopback endpoint; and the two local fast paths are
+ * `outcome::local_intercept`. A change to any of those owes this text an
+ * update.
  */
-export const INTENT_DISCLOSURE = "Each command sends the Commands endpoint the words heard and this app's command list — every command's name, description and parameters, and whether it can run on the screen you are on. A dictation that starts with a recognised opener (\u201ctype \u2026\u201d) and a bare submit phrase are decided on this machine and send nothing.";
+export const INTENT_DISCLOSURE = "Each command sends the Commands endpoint the words heard, this app's fixed instructions and answer format, the model name and token limit, and this app's command list: every command's id, description, parameter names and kinds, whether it can run on the screen you are on, and the hint shown when it cannot. When the endpoint is not on this machine, the request also carries your Commands API key in its authentication header. A dictation that starts with a recognised opener (\u201ctype \u2026\u201d) and a bare submit phrase are decided on this machine and send nothing.";
 
 /**
- * What Names = Shared adds — `prompt::state`, field by field. Not sent in
- * either mode: any path, deck or agent id, the deck's default directory, file
- * metadata, a prompt typed into an agent, or a running tool's arguments.
+ * What Names = Shared adds — `prompt::state`, field by field. The narrow fact
+ * it closes on is the one to keep true: `prompt::state` carries labels and
+ * names only, never an entry's `path`, a deck's `id` or an agent's `id`.
  */
-export const INTENT_DISCLOSURE_SHARED = "With Names shared it also sends the names on screen: each agent on the selected deck with its role, CLI name, live status and the tool it is running; every deck's label, which for a remote deck is its SSH user, host and any non-default port; while the New agent dialog shows a directory, up to 200 directory names from it and whether it has a parent; the dialog's Mode chips (including the project's orchestration names) and Agent picker entries; and each orchestration's title and roles. Never a path, an id, a prompt you typed or a tool's arguments.";
+export const INTENT_DISCLOSURE_SHARED = "With Names shared it also sends the names on screen: each agent on the selected deck with its role, CLI name, live status and the tool it is running; every deck's label, which for a remote deck is its SSH user, host and any non-default port; while the New agent dialog shows a directory, up to 200 directory names from it and whether it has a parent; the dialog's Mode chips (including the project's orchestration names) and Agent picker entries; and each orchestration's title and roles. It sends no filesystem path, no deck or agent id, no prompt you typed and no tool's arguments.";
 
 /** What Names = Withheld leaves out, and what it costs. */
-export const INTENT_DISCLOSURE_WITHHELD = "With Names withheld it sends nothing else, so the commands that name an agent, deck, directory, mode, agent type or orchestration are unavailable.";
+export const INTENT_DISCLOSURE_WITHHELD = "With Names withheld it sends none of the names on screen, so the commands that name an agent, deck, directory, mode, agent type or orchestration are unavailable.";
 
 /** The token the speech backend takes when it authenticates with a key. */
 const KEYED = "remote";

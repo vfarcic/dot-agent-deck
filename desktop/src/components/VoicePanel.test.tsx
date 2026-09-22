@@ -210,6 +210,14 @@ describe("VoicePanel", () => {
     expect(disclosure).toHaveTextContent(INTENT_DISCLOSURE_SHARED);
     expect(disclosure).toHaveTextContent("SSH user, host and any non-default port");
     expect(disclosure).toHaveTextContent("up to 200 directory names");
+    // PRD #1223, closing audit F3: the always-sent components are named, and
+    // the narrow fact Shared keeps is stated as exactly that.
+    expect(disclosure).toHaveTextContent("every command's id, description, parameter names and kinds");
+    expect(disclosure).toHaveTextContent("the hint shown when it cannot");
+    expect(disclosure).toHaveTextContent("the model name and token limit");
+    expect(disclosure).toHaveTextContent("your Commands API key in its authentication header");
+    expect(disclosure).toHaveTextContent("It sends no filesystem path, no deck or agent id");
+    expect(disclosure).not.toHaveTextContent("Never a path, an id");
     const names = screen.getByRole("radiogroup", { name: "Names" });
     expect(within(names).getByLabelText("Shared")).toBeChecked();
 
@@ -224,6 +232,9 @@ describe("VoicePanel", () => {
     const disclosure = screen.getByTestId("voice-intent-disclosure");
     expect(disclosure).toHaveTextContent(INTENT_DISCLOSURE_WITHHELD);
     expect(disclosure).not.toHaveTextContent(INTENT_DISCLOSURE_SHARED);
+    // It withholds the names, not the request: the always-sent part stays.
+    expect(disclosure).toHaveTextContent(INTENT_DISCLOSURE);
+    expect(disclosure).not.toHaveTextContent("sends nothing else");
     expect(within(screen.getByRole("radiogroup", { name: "Names" })).getByLabelText("Withheld")).toBeChecked();
   });
 

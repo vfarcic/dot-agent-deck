@@ -37,6 +37,25 @@
 #                    confirm-before-acting flag, and the two are close to
 #                    opposite — this describes an action that HAPPENED, that
 #                    one blocks an action before it does. Do not rename it back.
+#   heard_as         the words that ASK for this action (PRD #1223, closing
+#                    audit F1). A pick is dispatched only when the transcript
+#                    contains at least one entry — a word (heard with or
+#                    without a trailing `s`, or split across two or three
+#                    adjacent words) or a phrase (its words adjacent, in
+#                    order). Otherwise the app refuses with "nothing in that
+#                    asks for …". Every entry must be words of the row's own
+#                    `id` or `description`, which `table.rs` checks, so the
+#                    vocabulary is the one the model picks on. It exists
+#                    because observed names (directories, agent labels,
+#                    orchestration titles) can be written to steer the model,
+#                    and a row with no reference to ground — `submit_prompt`
+#                    presses Enter in an agent's prompt — had nothing else
+#                    between a steered pick and a dispatch. Tune a too-narrow
+#                    vocabulary here; do not loosen the rule.
+#   ungrounded       instead of `heard_as`: why this row CANNOT be grounded by
+#                    words. Every row carries exactly one of the two, so no
+#                    row is exempt by omission. No shipped row uses it
+#                    (`voice_table_no_row_is_exempt_from_action_grounding`).
 #   [[commands.params]]  name + kind, `kind` from the closed resolver set
 #                    (`agent_ref`, `deck_ref`, `dir_ref`, `mode_ref`,
 #                    `agent_type_ref`, `orchestration_ref`, `spoken_prefix`).
@@ -70,13 +89,14 @@
 [[commands]]
 id          = "open_agent"
 description = """Open one agent's pane over the current screen, so the user can watch that one
-agent's terminal. Use when the user asks to focus on, enlarge, zoom, open, show or look at ONE
-named agent. The agent is named the way the deck shows it — a role like "tester" or
+agent's terminal. Use when the user asks to focus on, enlarge, zoom, open, show, see or look at ONE
+named agent, or to see only that one ("everything except the tester"). The agent is named the way the deck shows it — a role like "tester" or
 "orchestrator", or a name the user gave it."""
 invoke      = "openAgent"
 screens     = ["deck", "overview"]
 unavailable_hint = "opening an agent works from the deck or the agent overview"
 report      = "Opening {agent}."
+heard_as    = ["open", "show", "see", "focus", "enlarge", "zoom", "look", "watch", "except"]
 
   [[commands.params]]
   name = "agent"
@@ -91,6 +111,7 @@ invoke      = "openOverview"
 screens     = ["deck"]
 unavailable_hint = "the agent overview opens from the deck"
 report      = "Opening the agent overview."
+heard_as    = ["overview", "everything", "all", "fleet", "running", "attention"]
 
 [[commands]]
 id          = "open_deck"
@@ -102,6 +123,7 @@ invoke      = "openDeck"
 screens     = ["overview"]
 unavailable_hint = "returning to the deck works from the agent overview"
 report      = "Back to the deck."
+heard_as    = ["deck", "back", "return", "terminals", "panes"]
 
 # PRD #802 — "close" means the thing on TOP, and this row replaced
 # `close_agent_view` rather than sitting beside it.
@@ -137,13 +159,14 @@ id          = "close"
 description = """Close whatever is open OVER the current screen and go back to what was
 underneath. That is the list of spoken commands if it is showing, and otherwise one agent's open
 pane. Use for close, close this, close it, dismiss this, hide this, get rid of this, I'm done
-with this, or leave this agent. A bare "go back" or "back" means THIS one ONLY when `open_deck`
+with this, stop looking at this, or leave this agent. A bare "go back" or "back" means THIS one ONLY when `open_deck`
 is not callable — a callable `open_deck` means the deck itself is what "back" leads to, and that
 one wins. This only closes what is on top: it does NOT stop any agent, does NOT close an agent's
 terminal pane, and does NOT turn voice off."""
 invoke      = "closeTopmost"
 unavailable_hint = "closing what is on top works anywhere"
 report      = "Closed."
+heard_as    = ["close", "dismiss", "hide", "get rid", "done", "leave", "stop looking", "back"]
 
 # PRD #802 M8 — the cost-of-a-row proof: the first command added after the
 # plumbing existed. It cost SEVEN files, five of them test-only and none of them
@@ -167,6 +190,7 @@ invoke      = "openSettings"
 screens     = ["deck"]
 unavailable_hint = "settings open from the deck"
 report      = "Opening settings."
+heard_as    = ["settings", "preferences", "options", "configuration", "api key"]
 
 # PRD #802 — the first row with NO `screens` key, which means callable
 # everywhere, and that is the requirement rather than an oversight: stopping
@@ -189,12 +213,14 @@ report      = "Opening settings."
 id          = "voice_off"
 description = """Turn voice control off — close the microphone and stop listening, so nothing
 further is heard until the Voice button is pressed again. Use for voice off, turn off the voice,
-turn voice off, stop listening, stop voice control, stop voice, or any request to stop LISTENING.
+turn voice off, stop listening, stop voice control, stop voice, mute, mic off, or any request to stop
+LISTENING.
 This stops the microphone and nothing else: it changes no screen, closes no view, and stops no
 agent."""
 invoke      = "stopVoice"
 unavailable_hint = "turning voice off works anywhere"
 report      = "Voice control off."
+heard_as    = ["voice", "listening", "microphone", "mic", "mute"]
 
 # PRD #802 D7 — discovery, and the second row with no `screens` key.
 #
@@ -213,11 +239,12 @@ report      = "Voice control off."
 id          = "list_commands"
 description = """List everything the user can say right now: an overlay naming every spoken
 command and what each one does. Use when the user asks what they can say, what commands there
-are, what you can do, how this works, for help, for the options, or for a list. This only shows
+are, "what can you do", how this works, for help, for the options, or for a list. This only shows
 the list — it runs none of the commands on it."""
 invoke      = "showVoiceCommands"
 unavailable_hint = "the list of commands opens anywhere"
 report      = "Here is what you can say."
+heard_as    = ["say", "commands", "help", "options", "list", "what can", "how"]
 
 # PRD #802 D6, REBUILT — dictation without a mode, and the feature's own point
 # in the product owner's words: *"see what's going on in any of the agents and
@@ -273,6 +300,7 @@ invoke      = "dictateToAgent"
 screens     = ["agent"]
 unavailable_hint = "typing to an agent needs that agent's pane open — open one first"
 report      = "Typed: “{prefix}”."
+heard_as    = ["type", "write", "say", "dictate", "tell", "ask", "want", "prompt", "note"]
 
   [[commands.params]]
   name = "prefix"
@@ -307,6 +335,7 @@ invoke      = "submitAgentPrompt"
 screens     = ["agent"]
 unavailable_hint = "sending a prompt needs an agent's pane open"
 report      = "Sent."
+heard_as    = ["send", "submit", "enter", "go ahead", "end", "finished"]
 
 # PRD #1223 — open the New agent dialog, and the first row with a `deck_ref`.
 #
@@ -337,6 +366,7 @@ invoke      = "openNewAgent"
 screens     = ["overview"]
 unavailable_hint = "starting a new agent works from the agent overview"
 report      = "Opening the New agent dialog."
+heard_as    = ["new", "create", "launch", "add", "spin", "start"]
 
   [[commands.params]]
   name     = "deck"
@@ -383,6 +413,7 @@ screens     = ["overview"]
 requires    = ["directory_listing"]
 unavailable_hint = "opening a directory works while the New agent dialog is showing a directory listing"
 report      = "Opening {dir}."
+heard_as    = ["open", "into", "enter", "cd", "go down"]
 
   [[commands.params]]
   name = "dir"
@@ -398,6 +429,7 @@ screens     = ["overview"]
 requires    = ["parent_directory"]
 unavailable_hint = "going up works while the New agent dialog is showing a directory that has a parent"
 report      = "Going up."
+heard_as    = ["parent", "up", "dot dot"]
 
 [[commands]]
 id          = "use_this_directory"
@@ -410,6 +442,7 @@ screens     = ["overview"]
 requires    = ["directory_listing"]
 unavailable_hint = "choosing a directory works while the New agent dialog is showing a directory listing"
 report      = "Using this directory."
+heard_as    = ["use", "pick", "choose", "select", "this is the one", "this one"]
 
 # PRD #1223 — the rest of the New agent form by voice: Mode, Agent and Name.
 #
@@ -457,6 +490,7 @@ screens     = ["overview"]
 requires    = ["new_agent_form"]
 unavailable_hint = "choosing a mode works while the New agent form has a deck and a directory chosen"
 report      = "Mode: {mode}."
+heard_as    = ["mode", "schedule", "dispatcher", "orchestration", "orch", "plain", "make it", "use", "choose", "set"]
 
   [[commands.params]]
   name = "mode"
@@ -476,6 +510,7 @@ screens     = ["overview"]
 requires    = ["new_agent_form"]
 unavailable_hint = "choosing an agent works while the New agent form has a deck and a directory chosen"
 report      = "Agent: {agent_type}."
+heard_as    = ["agent", "use", "pick", "choose", "make it", "set", "claude", "opencode", "pi", "codex", "auto"]
 
   [[commands.params]]
   name = "agent_type"
@@ -503,6 +538,7 @@ screens     = ["overview"]
 requires    = ["new_agent_form"]
 unavailable_hint = "naming the new agent works while the New agent form has a deck and a directory chosen"
 report      = "Name set."
+heard_as    = ["name", "call"]
 
   [[commands.params]]
   name = "prefix"
@@ -543,6 +579,7 @@ screens     = ["overview"]
 requires    = ["new_agent_dialog"]
 unavailable_hint = "starting a new agent works while the New agent dialog is open"
 report      = "Confirm the start in the dialog — nothing has started yet."
+heard_as    = ["start", "launch", "create", "spin", "run", "go ahead"]
 
 [[commands]]
 id          = "stop_agent"
@@ -557,6 +594,7 @@ invoke      = "confirmStopAgent"
 screens     = ["overview"]
 unavailable_hint = "stopping an agent works from the agent overview"
 report      = "Confirm stopping {agent} — nothing has been stopped yet."
+heard_as    = ["stop", "kill", "shut down", "end", "terminate"]
 
   [[commands.params]]
   name = "agent"
@@ -575,6 +613,7 @@ invoke      = "confirmCloseOrchestration"
 screens     = ["overview"]
 unavailable_hint = "closing an orchestration works from the agent overview"
 report      = "Confirm closing {orchestration} — nothing has been stopped yet."
+heard_as    = ["close", "stop", "shut down", "end"]
 
   [[commands.params]]
   name = "orchestration"
