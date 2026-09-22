@@ -43,6 +43,7 @@ use std::time::Duration;
 use dot_agent_deck::agent_pty::{
     DOT_AGENT_DECK_PANE_ID, TabMembership, is_valid_display_name, mint_orchestration_id,
 };
+use dot_agent_deck::authoring_seeds::AuthoringKind;
 use dot_agent_deck::daemon_client::{
     DaemonClient, Endpoint, EventSubscription, GatedQuery, StartAgentOptions,
 };
@@ -2236,6 +2237,21 @@ struct StartAgentRequest {
     display_name: Option<String>,
     rows: Option<u16>,
     cols: Option<u16>,
+    /// PRD #1223 M7: `Some` starts an authoring agent — see
+    /// [`start_agent_action`]'s authoring section.
+    authoring_kind: Option<AuthoringKind>,
+}
+
+/// What an authoring start aimed at a deck without the `authoring-kind`
+/// capability answers (PRD #1223 M7). An `Err`, so the dialog shows it inline
+/// and stays open: the deck is fine, it simply cannot compose the seed.
+fn authoring_unsupported_message(kind: AuthoringKind) -> String {
+    format!(
+        "This deck cannot start a `{}` agent: it predates daemon-composed authoring seeds, and \
+         would start a plain agent with no seed. Nothing was started. Start it from the TUI on \
+         that deck's host, or upgrade the deck.",
+        kind.as_str()
+    )
 }
 
 /// A start the target deck accepted.
@@ -2268,6 +2284,23 @@ struct StartedAgent {
 ///
 /// Everything here is testable and the emit around it is not, so a test can
 /// drive it against two real daemons with the selection on All Decks.
+///
+/// # An authoring agent (PRD #1223 M7)
+///
+/// With `authoring_kind` set, the start goes through
+/// [`DaemonClient::start_authoring_agent`], which withholds the field from a
+/// deck that does not advertise it — an older deck would drop it and start a
+/// plain agent with no seed — so such a deck answers
+/// [`authoring_unsupported_message`] and nothing is sent. Every other part of
+/// the start is the plain one: the same deck capture, the same minted
+/// `DOT_AGENT_DECK_PANE_ID` (which the deck requires here, because the seed is
+/// delivered to that pane), and the same last-command record.
+///
+/// The command must already be resolved. A blank one means the deck's default
+/// shell, which cannot act on a seed, so the dialog resolves it the way the
+/// TUI's `resolve_authoring_command` does and this refuses one that arrives
+/// blank rather than resolving it a second, divergent way. A `cwd` is required
+/// for the deck's reason: the seed names the directory the agent works in.
 async fn start_agent_action(
     state: &DesktopState,
     deck_id: &str,
@@ -2279,6 +2312,7 @@ async fn start_agent_action(
         display_name,
         rows,
         cols,
+        authoring_kind,
     } = request;
     let (rows, cols) = validate_start_fields(
         command.as_deref(),
@@ -2287,29 +2321,50 @@ async fn start_agent_action(
         rows.unwrap_or(24),
         cols.unwrap_or(80),
     )?;
+    if let Some(kind) = authoring_kind {
+        if command.is_none() {
+            return Err(format!(
+                "a `{}` agent needs a command that starts an agent; an empty one would start the deck's default shell",
+                kind.as_str()
+            ));
+        }
+        if cwd.is_none() {
+            return Err(format!(
+                "a `{}` agent needs a directory for its seed to name",
+                kind.as_str()
+            ));
+        }
+    }
     // ONE capture, before the first await (issue #1116).
     let scope = crate::dto::DeckScope::resolve(Some(deck_id))?;
     let agent_type = AgentType::from_command(command.as_deref());
     let pane_id = mint_desktop_pane_id();
     // Kept for the per-deck last command (PRD #1223 M4), recorded only once the
     // deck has accepted the start — a refused start leaves the value it had.
+    // An authoring start records too, as the TUI's `record_candidate` does for
+    // every form-submitted command.
     let requested_command = command.clone();
+    let options = StartAgentOptions {
+        command,
+        cwd,
+        display_name,
+        rows,
+        cols,
+        env: vec![(DOT_AGENT_DECK_PANE_ID.into(), pane_id)],
+        agent_type,
+        ..Default::default()
+    };
     let daemon = state.daemon.trusted(scope.endpoint()).await?;
     daemon.require_compatible()?;
-    let agent_id = daemon
-        .client
-        .start_agent(StartAgentOptions {
-            command,
-            cwd,
-            display_name,
-            rows,
-            cols,
-            env: vec![(DOT_AGENT_DECK_PANE_ID.into(), pane_id)],
-            agent_type,
-            ..Default::default()
-        })
-        .await
-        .map_err(|error| safe_message(error.to_string()))?;
+    let agent_id = match authoring_kind {
+        None => daemon.client.start_agent(options).await,
+        Some(kind) => match daemon.client.start_authoring_agent(options, kind).await {
+            Ok(GatedQuery::Answered(agent_id)) => Ok(agent_id),
+            Ok(GatedQuery::Unsupported) => return Err(authoring_unsupported_message(kind)),
+            Err(error) => Err(error),
+        },
+    }
+    .map_err(|error| safe_message(error.to_string()))?;
     if let Some(command) = requested_command.as_deref() {
         state.remember_last_command(&scope.identity(), command);
     }
@@ -2585,6 +2640,7 @@ async fn desktop_run_action(
             display_name,
             rows,
             cols,
+            authoring_kind,
         } => {
             let started = start_agent_action(
                 &state,
@@ -2595,6 +2651,7 @@ async fn desktop_run_action(
                     display_name,
                     rows,
                     cols,
+                    authoring_kind,
                 },
             )
             .await?;

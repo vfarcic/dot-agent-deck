@@ -4573,6 +4573,7 @@ mod tests {
             display_name: Some(name.into()),
             rows: Some(24),
             cols: Some(80),
+            authoring_kind: None,
         }
     }
 
@@ -4753,6 +4754,10 @@ mod tests {
     /// daemon's decoder does. It counts what it refused, so a test can assert
     /// the desktop never sent a query the deck did not advertise.
     ///
+    /// [`Self::withholding`] names a different set to leave out — M7's
+    /// `authoring-kind`, for a deck that lists directories and answers options
+    /// but cannot compose a seed.
+    ///
     /// A plain `UnixListener` for `scripted_daemon`'s reason, and reached as a
     /// REMOTE row: a local deck's inode must pass the owner-only trust check,
     /// which a plain bind does not arrange, and a remote row's transport is the
@@ -4768,9 +4773,13 @@ mod tests {
     #[cfg(unix)]
     impl OlderDeck {
         fn start(tag: &str) -> Self {
+            use dot_agent_deck::daemon_protocol::{CAP_LIST_DIRECTORIES, CAP_NEW_AGENT_OPTIONS};
+            Self::withholding(tag, &[CAP_LIST_DIRECTORIES, CAP_NEW_AGENT_OPTIONS])
+        }
+
+        fn withholding(tag: &str, withheld: &'static [&'static str]) -> Self {
             use dot_agent_deck::daemon_protocol::{
-                CAP_LIST_DIRECTORIES, CAP_NEW_AGENT_OPTIONS, DAEMON_CAPABILITIES, KIND_REQ,
-                KIND_RESP, read_frame, write_frame,
+                DAEMON_CAPABILITIES, KIND_REQ, KIND_RESP, read_frame, write_frame,
             };
             let (dir, socket) = scratch_socket(tag);
             let listener = tokio::net::UnixListener::bind(&socket).expect("bind the older deck");
@@ -4791,10 +4800,7 @@ mod tests {
                             reply.capabilities = Some(
                                 DAEMON_CAPABILITIES
                                     .iter()
-                                    .filter(|cap| {
-                                        **cap != CAP_LIST_DIRECTORIES
-                                            && **cap != CAP_NEW_AGENT_OPTIONS
-                                    })
+                                    .filter(|cap| !withheld.contains(cap))
                                     .map(|cap| (*cap).to_string())
                                     .collect(),
                             );
@@ -5066,5 +5072,209 @@ mod tests {
             }
             other => panic!("the local deck supports the query, got {other:?}"),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // PRD #1223 M7 — a deck-targeted AUTHORING start, against the same two-deck
+    // All Decks fleet.
+    // -----------------------------------------------------------------------
+
+    /// An authoring start of `kind` in `cwd`, named `name`, running `cat` — a
+    /// resolved command, as the dialog sends one.
+    #[cfg(unix)]
+    fn authoring_start(
+        name: &str,
+        kind: dot_agent_deck::authoring_seeds::AuthoringKind,
+        cwd: &std::path::Path,
+    ) -> crate::StartAgentRequest {
+        crate::StartAgentRequest {
+            cwd: Some(cwd.to_str().expect("a UTF-8 fixture path").to_string()),
+            authoring_kind: Some(kind),
+            ..plain_start(name)
+        }
+    }
+
+    /// Scenario: two real daemons under **All Decks** — the local deck, which
+    /// the selection resolves to, and a remote row routed to the second. A
+    /// `schedule` authoring start aimed at the remote row's wire id lands on
+    /// that deck: its registry lists the agent under the returned id, with the
+    /// requested name, the directory the seed names, and a valid
+    /// `DOT_AGENT_DECK_PANE_ID` of the desktop's minting — the pane the deck
+    /// delivers the seed to. The local deck gains nothing, and the remote
+    /// deck's options now carry the command as its last one.
+    ///
+    /// **What it fails against.** A start that read the selection would land
+    /// on `local`, a real daemon here; one that sent no pane id would be
+    /// refused by the deck, which requires one for an authoring start.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_authoring_start_aimed_at_another_deck_under_all_decks_lands_there_with_a_pane_id() {
+        use dot_agent_deck::agent_pty::{DOT_AGENT_DECK_PANE_ID, is_valid_pane_id_env};
+        use dot_agent_deck::authoring_seeds::AuthoringKind;
+        let _selection = crate::dto::SELECTION_LOCK.lock().await;
+        let local = RealDeck::start("m7-land-local");
+        let remote = RealDeck::start("m7-land-remote");
+        let workdir = listing_tree(&remote.dir);
+        let (settings, remote_endpoint) = all_decks_with_one_remote_row("build-box.example.com");
+        apply_all_decks_over(&local, &settings);
+        let state = crate::terminal::DesktopState::default();
+        state
+            .tunnels
+            .insert_route(
+                &remote_endpoint,
+                remote.endpoint.as_local().expect("local socket").path(),
+            )
+            .await;
+        let remote_wire = deck_wire_id(&remote_endpoint);
+
+        let started = crate::start_agent_action(
+            &state,
+            &remote_wire,
+            authoring_start("m7-schedule", AuthoringKind::Schedule, &workdir),
+        )
+        .await;
+        let options = crate::new_agent_options_on(&state, &remote_wire).await;
+
+        let on_local = named_records(&local);
+        let on_remote = remote.registry.agent_records();
+        local.shutdown();
+        remote.shutdown();
+
+        let started = started.expect("the targeted deck accepts the authoring start");
+        assert_eq!(started.scope.identity(), remote_endpoint.identity());
+        let record = on_remote
+            .iter()
+            .find(|record| record.id == started.agent_id)
+            .unwrap_or_else(|| panic!("the targeted deck lists agent {}", started.agent_id));
+        assert_eq!(record.display_name.as_deref(), Some("m7-schedule"));
+        assert_eq!(
+            record.cwd.as_deref(),
+            workdir.to_str(),
+            "the directory the seed names"
+        );
+        let pane_id = record
+            .pane_id_env
+            .as_deref()
+            .expect("an authoring agent carries the pane its seed is delivered to");
+        assert!(
+            is_valid_pane_id_env(pane_id) && pane_id.starts_with("desktop-"),
+            "{DOT_AGENT_DECK_PANE_ID} is the one the desktop minted: {pane_id}"
+        );
+        assert!(
+            on_local.is_empty(),
+            "the local deck — the one All Decks resolves to — gains nothing: {on_local:?}"
+        );
+        match options.expect("the remote deck answers its options") {
+            crate::dto::DesktopNewAgentOptions::Deck { last_command, .. } => {
+                assert_eq!(
+                    last_command.as_deref(),
+                    Some("cat"),
+                    "an authoring start records its command, as the TUI's does"
+                );
+            }
+            other => panic!("the deck supports the query, got {other:?}"),
+        }
+    }
+
+    /// Scenario: under **All Decks**, the remote row is a deck that lists
+    /// directories and answers options but predates daemon-composed authoring
+    /// seeds, and the local deck is a current real daemon. An authoring start
+    /// aimed at the older deck is refused with the unsupported sentence and the
+    /// deck receives nothing it did not advertise. An authoring start with no
+    /// command, and one with no directory, are refused before any deck is
+    /// asked; and one aimed at a deck the app is not observing is refused with
+    /// `DeckScope::resolve`'s error. The local deck gains no agent throughout.
+    ///
+    /// **What it fails against.** A start that sent the field anyway — the
+    /// older deck would count the request — or that fell back to the
+    /// selection, which would put an agent on `local`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_authoring_start_the_deck_cannot_serve_is_refused_and_sends_nothing() {
+        use dot_agent_deck::authoring_seeds::AuthoringKind;
+        use dot_agent_deck::daemon_protocol::CAP_AUTHORING_KIND;
+        let _selection = crate::dto::SELECTION_LOCK.lock().await;
+        let local = RealDeck::start("m7-old-local");
+        let older = OlderDeck::withholding("m7-old-remote", &[CAP_AUTHORING_KIND]);
+        let workdir = listing_tree(&local.dir);
+        let (settings, remote_endpoint) = all_decks_with_one_remote_row("old-box.example.com");
+        apply_all_decks_over(&local, &settings);
+        let state = crate::terminal::DesktopState::default();
+        state
+            .tunnels
+            .insert_route(&remote_endpoint, &older.socket)
+            .await;
+        let older_wire = deck_wire_id(&remote_endpoint);
+        let local_wire = deck_wire_id(&local.endpoint);
+
+        let on_older = crate::start_agent_action(
+            &state,
+            &older_wire,
+            authoring_start("m7-older", AuthoringKind::Dispatcher, &workdir),
+        )
+        .await;
+        let no_command = crate::start_agent_action(
+            &state,
+            &local_wire,
+            crate::StartAgentRequest {
+                command: None,
+                ..authoring_start("m7-blank", AuthoringKind::Schedule, &workdir)
+            },
+        )
+        .await;
+        let no_cwd = crate::start_agent_action(
+            &state,
+            &local_wire,
+            crate::StartAgentRequest {
+                cwd: None,
+                ..authoring_start("m7-nowhere", AuthoringKind::Schedule, &workdir)
+            },
+        )
+        .await;
+        let unobserved = crate::start_agent_action(
+            &state,
+            "deck-ffffffffffffffff",
+            authoring_start("m7-unknown", AuthoringKind::Schedule, &workdir),
+        )
+        .await;
+        let refused = older.refused.load(Ordering::SeqCst);
+        let on_local = named_records(&local);
+
+        local.shutdown();
+        older.shutdown();
+
+        let unsupported = match on_older {
+            Ok(started) => panic!(
+                "the older deck cannot compose a seed, yet {} started",
+                started.agent_id
+            ),
+            Err(error) => error,
+        };
+        assert!(
+            unsupported.contains("cannot start a `dispatcher` agent"),
+            "the unsupported outcome, named for the kind: {unsupported}"
+        );
+        assert_eq!(
+            refused, 0,
+            "nothing but the handshakes reached a deck that does not advertise `{CAP_AUTHORING_KIND}`"
+        );
+        for (case, outcome, expected) in [
+            ("no command", no_command, "default shell"),
+            ("no directory", no_cwd, "directory"),
+            (
+                "an unobserved deck",
+                unobserved,
+                "that deck is not one this app is observing",
+            ),
+        ] {
+            match outcome {
+                Ok(started) => panic!("{case}: must be refused, yet {} started", started.agent_id),
+                Err(error) => assert!(error.contains(expected), "{case}: got {error}"),
+            }
+        }
+        assert!(
+            on_local.is_empty(),
+            "nothing reached the local deck: {on_local:?}"
+        );
     }
 }

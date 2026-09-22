@@ -1,7 +1,9 @@
 import { describe, expect, it } from "vitest";
 import { createFixtureFleet, createFixtureSnapshot, createFixtureStartedAgent, FIXTURE_DAEMON_ID, FIXTURE_PENDING_DAEMON_ID, FIXTURE_REMOTE_DAEMON_ID, FIXTURE_UNREACHABLE_DAEMON_ID } from "../data/fixture";
-import type { ConnectionView, DeckFleet } from "../types";
+import type { ConnectionView, DeckFleet, NewAgentOptions } from "../types";
 import {
+  AUTHORING_WITHHELD,
+  authoringModes,
   DECK_STATE_FALLBACK,
   deckChoices,
   deckUnavailableReason,
@@ -12,6 +14,7 @@ import {
   isNewAgentShortcut,
   NEW_AGENT_APPEAR_TIMEOUT_MS,
   preselectedDeck,
+  resolveAuthoringCommand,
   seedCommand,
 } from "./newAgent";
 
@@ -144,5 +147,52 @@ describe("New agent rules (PRD #1223 M4)", () => {
    */
   it("waits comfortably longer than the five-second reconcile", () => {
     expect(NEW_AGENT_APPEAR_TIMEOUT_MS).toBeGreaterThanOrEqual(2 * 5_000);
+  });
+});
+
+describe("New agent rules — authoring agents (PRD #1223 M7)", () => {
+  const deckOptions = (authoringKinds: string[], experimental: boolean): NewAgentOptions => ({ kind: "deck", agents: [], experimental, authoringKinds });
+  const kinds = (options: NewAgentOptions | undefined) => authoringModes(options).offered.map((mode) => mode.kind);
+
+  /**
+   * Scenario: the chips a deck's options offer. Nothing while the options are
+   * loading; the kinds the deck lists, in the TUI's order whatever order it
+   * lists them in; `schedule-issues` only under the deck's experimental flag;
+   * and a kind this app does not know is ignored rather than offered.
+   */
+  it("offers the kinds the deck lists, in the TUI's order, schedule-issues only under its flag", () => {
+    expect(authoringModes(undefined)).toEqual({ offered: [] });
+    expect(kinds(deckOptions(["dispatcher", "schedule-issues", "schedule"], false))).toEqual(["schedule", "dispatcher"]);
+    expect(kinds(deckOptions(["dispatcher", "schedule-issues", "schedule"], true))).toEqual(["schedule", "schedule-issues", "dispatcher"]);
+    expect(kinds(deckOptions(["dispatcher", "future-kind"], true))).toEqual(["dispatcher"]);
+    expect(authoringModes(deckOptions(["schedule"], false)).offered).toEqual([{ kind: "schedule", label: "schedule" }]);
+  });
+
+  /**
+   * Scenario: the decks that offer no authoring chip say why — an older deck
+   * that has no options query, and a deck that lists no kind this app knows,
+   * each in its own words. A deck that lists only `schedule-issues` with its
+   * flag off offers nothing and gives no reason, because it can compose one.
+   */
+  it("gives an older deck and a deck that composes nothing their reason", () => {
+    expect(authoringModes({ kind: "unsupported", desktopAgents: [] })).toEqual({ offered: [], withheld: AUTHORING_WITHHELD.unsupported });
+    expect(authoringModes(deckOptions([], true))).toEqual({ offered: [], withheld: AUTHORING_WITHHELD.none });
+    expect(authoringModes(deckOptions(["future-kind"], true))).toEqual({ offered: [], withheld: AUTHORING_WITHHELD.none });
+    expect(authoringModes(deckOptions(["schedule-issues"], false))).toEqual({ offered: [] });
+  });
+
+  /**
+   * Scenario: the TUI's `resolve_authoring_command`. A typed command is used
+   * as it stands; a blank or whitespace one resolves to the deck host's
+   * default command, trimmed, then to the deck's own `claude` registry entry,
+   * then to `claude` itself.
+   */
+  it("resolves a blank authoring Command the way the TUI does", () => {
+    const registry = [{ id: "claude", displayName: "ClaudeCode", defaultCommand: "claude-code-wrapper" }];
+    expect(resolveAuthoringCommand(" codex --full-auto ", "opencode", registry)).toBe(" codex --full-auto ");
+    expect(resolveAuthoringCommand("   ", "  opencode --model mini ", registry)).toBe("opencode --model mini");
+    expect(resolveAuthoringCommand("", "   ", registry)).toBe("claude-code-wrapper");
+    expect(resolveAuthoringCommand("", undefined, [])).toBe("claude");
+    expect(resolveAuthoringCommand("", undefined, [{ id: "claude", displayName: "ClaudeCode" }])).toBe("claude");
   });
 });

@@ -389,6 +389,24 @@ describe("TauriDeckBridge", () => {
   });
 
   /**
+   * Scenario (PRD #1223 M7): start a `schedule` authoring agent through the
+   * live bridge. `authoringKind` reaches `desktop_run_action` exactly as sent,
+   * beside the deck, the directory and the resolved command.
+   */
+  it("forwards an authoring start_agent with its kind untouched", async () => {
+    const { TauriDeckBridge } = await import("./bridge");
+    const bridge = new TauriDeckBridge();
+    invoke.mockResolvedValueOnce({ ok: true, agentId: "3", snapshot: {} });
+
+    const action = { type: "start_agent", deckId: "deck-00000000000b0x01", command: "claude", cwd: "/srv/repo", displayName: "repo", authoringKind: "schedule" } as const;
+    const result = await bridge.runAction(action);
+
+    expect(invoke).toHaveBeenCalledWith("desktop_run_action", { action });
+    expect(result).toEqual({ ok: true, agentId: "3" });
+    await bridge.dispose();
+  });
+
+  /**
    * Scenario: the crate refuses a start because its deck is not one the app
    * observes. The bridge surfaces that refusal as a rejection and sends
    * nothing else — no second attempt, and no deck filled in from the
@@ -1068,6 +1086,36 @@ describe("FixtureDeckBridge scenarios", () => {
     expect(await every.listDirectories(FIXTURE_DAEMON_ID)).toEqual({ kind: "unsupported" });
     expect((await every.newAgentOptions(FIXTURE_DAEMON_ID)).kind).toBe("unsupported");
     await every.dispose();
+  });
+
+  /**
+   * Scenario (PRD #1223 M7): the fleet preview's remote deck has its own
+   * experimental flag on and the local deck's is off, and both list the three
+   * authoring kinds. An authoring start on the remote deck adds the agent and
+   * records its command; played as an older deck, the same start is refused
+   * in the crate's own words and adds nothing.
+   */
+  it("answers each fixture deck's own flag and refuses an authoring start on an older one", async () => {
+    const { FIXTURE_DAEMON_ID, FIXTURE_REMOTE_DAEMON_ID } = await import("../data/fixture");
+    window.history.replaceState({}, "", "/?fixture=1&state=fleet");
+    const { createDeckBridge } = await import("./bridge");
+    const bridge = createDeckBridge("fixture");
+    await bridge.connect();
+    expect(await bridge.newAgentOptions(FIXTURE_REMOTE_DAEMON_ID)).toMatchObject({ experimental: true, authoringKinds: ["schedule", "schedule-issues", "dispatcher"] });
+    expect(await bridge.newAgentOptions(FIXTURE_DAEMON_ID)).toMatchObject({ experimental: false });
+    const started = await bridge.runAction({ type: "start_agent", deckId: FIXTURE_REMOTE_DAEMON_ID, command: "claude", cwd: "/home/build/scratch", displayName: "scratch", authoringKind: "dispatcher" });
+    expect(started.agentId).toBeDefined();
+    expect(await bridge.newAgentOptions(FIXTURE_REMOTE_DAEMON_ID)).toMatchObject({ lastCommand: "claude" });
+    await bridge.dispose();
+
+    window.history.replaceState({}, "", `/?fixture=1&state=fleet&older=${encodeURIComponent(FIXTURE_REMOTE_DAEMON_ID)}`);
+    const older = createDeckBridge("fixture");
+    const before = (await older.connect()).find((deck) => deck.connection.deckId === FIXTURE_REMOTE_DAEMON_ID)?.agents.length;
+    await expect(older.runAction({ type: "start_agent", deckId: FIXTURE_REMOTE_DAEMON_ID, command: "claude", cwd: "/home/build/scratch", authoringKind: "schedule" }))
+      .rejects.toThrow("cannot start a `schedule` agent");
+    const after = (await older.connect()).find((deck) => deck.connection.deckId === FIXTURE_REMOTE_DAEMON_ID)?.agents.length;
+    expect(after).toBe(before);
+    await older.dispose();
   });
 
   it("falls back to the four-agent scenario for an unknown ?state=", async () => {

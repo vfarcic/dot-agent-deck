@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import { createFixtureSnapshot, createFixtureStartedAgent } from "../data/fixture";
 import type { AgentSession, ConnectionView, DeckDirectoryListing, DeckSnapshot, NewAgentOptions } from "../types";
@@ -517,3 +517,170 @@ describe("New agent dialog — after the start (PRD #1223 M5)", () => {
     expect(onAppeared).not.toHaveBeenCalled();
   });
 });
+
+describe("New agent dialog — authoring agents (PRD #1223 M7)", () => {
+  const AUTHORING: NewAgentOptions = { ...DECK_OPTIONS, authoringKinds: ["schedule", "schedule-issues", "dispatcher"] };
+  const optionsOf = (patch: Partial<Extract<NewAgentOptions, { kind: "deck" }>> = {}) => vi.fn(async (): Promise<NewAgentOptions> => ({ ...structuredClone(AUTHORING), ...patch } as NewAgentOptions));
+  const modeLabels = () => within(screen.getByTestId("new-agent-modes")).getAllByRole("button").map((chip) => chip.textContent);
+
+  /**
+   * Scenario: reach the form on a deck that lists all three authoring kinds
+   * with its experimental flag off. The Mode row offers No mode, schedule and
+   * dispatcher — not `schedule: issues`, which the TUI shows only with the
+   * flag. With the flag on, it is offered between the other two.
+   */
+  it.each([
+    ["off", false, ["No mode", "schedule", "dispatcher"]],
+    ["on", true, ["No mode", "schedule", "schedule: issues", "dispatcher"]],
+  ])("offers the authoring chips the deck lists, schedule: issues only with the deck's flag %s", async (_flag, experimental, expected) => {
+    renderDialog(fakeRuntime({ newAgentOptions: optionsOf({ experimental }) }));
+    await reachForm();
+
+    await waitFor(() => expect(modeLabels()).toEqual(expected));
+    expect(screen.getByTestId("new-agent-mode-none")).toHaveAttribute("aria-pressed", "true");
+    expect(screen.queryByTestId("new-agent-authoring-withheld")).toBeNull();
+  });
+
+  /**
+   * Scenario: two decks that cannot compose a seed. One predates the options
+   * query altogether, the other answers it but lists no authoring kind. On
+   * both the Mode row offers No mode alone, and the form says why the
+   * authoring agents are missing.
+   */
+  it.each([
+    ["an older deck", vi.fn(async (): Promise<NewAgentOptions> => ({ kind: "unsupported", desktopAgents: DECK_OPTIONS.kind === "deck" ? DECK_OPTIONS.agents : [] })), "does not report which authoring agents"],
+    ["a deck that composes no seed", optionsOf({ authoringKinds: [], experimental: true }), "cannot compose authoring seeds"],
+  ])("withholds every authoring chip on %s and says why", async (_case, newAgentOptions, reason) => {
+    renderDialog(fakeRuntime({ newAgentOptions }));
+    await reachForm();
+
+    expect(await screen.findByTestId("new-agent-authoring-withheld")).toHaveTextContent(reason);
+    expect(modeLabels()).toEqual(["No mode"]);
+  });
+
+  /**
+   * Scenario: on a deck with no configured default command, choose schedule
+   * and leave Command blank. The start carries the authoring kind and
+   * resolves the blank Command to `claude` — the TUI's fallback — rather than
+   * sending none, which would start the deck's default shell. The Command
+   * field still shows what the user left there.
+   */
+  it("resolves a blank Command to claude for an authoring agent", async () => {
+    const runtime = fakeRuntime({ newAgentOptions: optionsOf() });
+    renderDialog(runtime);
+    await reachForm();
+    fireEvent.click(await screen.findByTestId("new-agent-mode-schedule"));
+    expect(screen.getByTestId("new-agent-mode-schedule")).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getByTestId("new-agent-command")).toHaveAttribute("placeholder", "Empty starts claude");
+
+    fireEvent.click(screen.getByTestId("new-agent-start"));
+
+    await waitFor(() => expect(runtime.runAction).toHaveBeenCalledTimes(1));
+    expect(runtime.runAction).toHaveBeenCalledWith({ type: "start_agent", deckId: LOCAL, cwd: "/home/dev/beta/leaf", command: "claude", displayName: "leaf", authoringKind: "schedule" });
+    expect(screen.getByTestId("new-agent-command")).toHaveValue("");
+  });
+
+  /**
+   * Scenario: on a deck whose host configures `default_command`, clear the
+   * prefilled Command, move to dispatcher with the Right arrow and start. The
+   * blank Command resolves to the configured command, trimmed; a typed
+   * command, by contrast, is sent as it stands.
+   */
+  it("resolves a blank Command to the deck's default command, and sends a typed one as it is", async () => {
+    const runtime = fakeRuntime({ newAgentOptions: optionsOf({ defaultCommand: "  opencode --model mini  " }) });
+    renderDialog(runtime);
+    await reachForm();
+    await waitFor(() => expect(screen.getByTestId("new-agent-command")).toHaveValue("  opencode --model mini  "));
+    fireEvent.change(screen.getByTestId("new-agent-command"), { target: { value: "" } });
+    const none = await screen.findByTestId("new-agent-mode-none");
+    fireEvent.keyDown(none, { key: "ArrowRight" });
+    fireEvent.keyDown(screen.getByTestId("new-agent-mode-schedule"), { key: "ArrowRight" });
+    expect(screen.getByTestId("new-agent-mode-dispatcher")).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getByTestId("new-agent-mode-dispatcher")).toHaveFocus();
+
+    fireEvent.click(screen.getByTestId("new-agent-start"));
+    await waitFor(() => expect(runtime.runAction).toHaveBeenCalledTimes(1));
+    expect(runtime.runAction).toHaveBeenLastCalledWith(expect.objectContaining({ command: "opencode --model mini", authoringKind: "dispatcher" }));
+
+    // Left wraps back past No mode onto the last chip; a typed command is sent verbatim.
+    const typed = fakeRuntime({ newAgentOptions: optionsOf({ experimental: true }) });
+    cleanupAndRender(typed);
+    await reachForm();
+    fireEvent.keyDown(await screen.findByTestId("new-agent-mode-none"), { key: "ArrowLeft" });
+    expect(screen.getByTestId("new-agent-mode-dispatcher")).toHaveAttribute("aria-pressed", "true");
+    fireEvent.keyDown(screen.getByTestId("new-agent-mode-dispatcher"), { key: "ArrowLeft" });
+    expect(screen.getByTestId("new-agent-mode-schedule-issues")).toHaveAttribute("aria-pressed", "true");
+    fireEvent.change(screen.getByTestId("new-agent-command"), { target: { value: "codex --full-auto" } });
+    fireEvent.click(screen.getByTestId("new-agent-start"));
+    await waitFor(() => expect(typed.runAction).toHaveBeenCalledTimes(1));
+    expect(typed.runAction).toHaveBeenCalledWith(expect.objectContaining({ command: "codex --full-auto", authoringKind: "schedule-issues" }));
+  });
+
+  /**
+   * Scenario: the deck refuses the authoring start — here as an older deck
+   * that cannot compose the seed would. The dialog stays open on the form with
+   * the refusal inline, and the Mode, Name and Command are all as they were,
+   * so Start can be pressed again.
+   */
+  it("keeps the dialog open with the refusal inline and every value kept", async () => {
+    const runtime = fakeRuntime({
+      newAgentOptions: optionsOf(),
+      runAction: vi.fn(async () => { throw new Error("This deck cannot start a `schedule` agent: it predates daemon-composed authoring seeds. Nothing was started."); }),
+    });
+    const { onClose } = renderDialog(runtime);
+    await reachForm();
+    fireEvent.click(await screen.findByTestId("new-agent-mode-schedule"));
+    fireEvent.change(screen.getByTestId("new-agent-name"), { target: { value: "nightly" } });
+    fireEvent.change(screen.getByTestId("new-agent-command"), { target: { value: "claude --model haiku" } });
+
+    fireEvent.click(screen.getByTestId("new-agent-start"));
+
+    expect(await screen.findByTestId("new-agent-error")).toHaveTextContent("cannot start a `schedule` agent");
+    expect(screen.getByTestId("new-agent-mode-schedule")).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getByTestId("new-agent-name")).toHaveValue("nightly");
+    expect(screen.getByTestId("new-agent-command")).toHaveValue("claude --model haiku");
+    expect(screen.getByTestId("new-agent-start")).toBeEnabled();
+    expect(onClose).not.toHaveBeenCalled();
+  });
+
+  /**
+   * Scenario: an authoring start the deck accepts. The pane opens only once
+   * the target deck's fleet entry lists the new agent — the same wait a plain
+   * agent gets.
+   */
+  it("opens the authoring agent's pane once the deck lists it", async () => {
+    const runtime = fakeRuntime({ newAgentOptions: optionsOf() });
+    const { onAppeared, rerenderWith } = renderDialog(runtime);
+    await reachForm();
+    fireEvent.click(await screen.findByTestId("new-agent-mode-dispatcher"));
+    fireEvent.click(screen.getByTestId("new-agent-start"));
+    expect(await screen.findByTestId("new-agent-waiting")).toBeVisible();
+
+    rerenderWith({ ...runtime, fleet: [deck(LOCAL, { deckKind: "local" }, [createFixtureStartedAgent({ id: "7", daemonId: LOCAL })]), runtime.fleet[1]] });
+
+    await waitFor(() => expect(onAppeared).toHaveBeenCalledWith({ deckId: LOCAL, agentId: "7" }));
+  });
+
+  /**
+   * Scenario: choose schedule, go back to the directory step and confirm a
+   * directory again. The form it opens starts on No mode, as every fresh TUI
+   * form does.
+   */
+  it("opens every confirmed directory's form on No mode", async () => {
+    renderDialog(fakeRuntime({ newAgentOptions: optionsOf() }));
+    await reachForm();
+    fireEvent.click(await screen.findByTestId("new-agent-mode-schedule"));
+
+    fireEvent.click(screen.getByRole("button", { name: /Back/ }));
+    fireEvent.click(await screen.findByTestId("new-agent-use-directory"));
+
+    await waitFor(() => expect(screen.getByTestId("new-agent-mode-none")).toHaveAttribute("aria-pressed", "true"));
+    expect(screen.getByTestId("new-agent-mode-schedule")).toHaveAttribute("aria-pressed", "false");
+  });
+});
+
+/** Unmount whatever is rendered and render the dialog afresh over `runtime`. */
+function cleanupAndRender(runtime: FakeRuntime) {
+  cleanup();
+  return renderDialog(runtime);
+}

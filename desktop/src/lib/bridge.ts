@@ -1,4 +1,4 @@
-import { createFixtureFleet, createFixtureStartedAgent, DEFAULT_PROFILES, FIXTURE_DEFAULT_COMMANDS, FIXTURE_HOMES, fixtureAgentRegistry, fixtureDirectoryTree, fixtureVoiceCommands, nextFixtureAgentId, fixtureVoiceHeard, fixtureVoiceScript, fixtureVoiceStatus, fixtureVoiceTranscription, resolveFixtureVoice, type FixtureState } from "../data/fixture";
+import { createFixtureFleet, createFixtureStartedAgent, DEFAULT_PROFILES, FIXTURE_DEFAULT_COMMANDS, FIXTURE_EXPERIMENTAL_DECKS, FIXTURE_HOMES, fixtureAgentRegistry, fixtureDirectoryTree, fixtureVoiceCommands, nextFixtureAgentId, fixtureVoiceHeard, fixtureVoiceScript, fixtureVoiceStatus, fixtureVoiceTranscription, resolveFixtureVoice, type FixtureState } from "../data/fixture";
 import { agentKey } from "./agentKey";
 import { getTerminal } from "./terminalRegistry";
 import { applyHandoffEvent, mapDaemonEvent, MAX_LIVE_EVIDENCE } from "./daemonEvents";
@@ -1208,7 +1208,7 @@ export interface DesktopTerminalStateDto {
 export type DesktopRunActionDto =
   | { type: "refresh" }
   | { type: "bootstrap"; startIfMissing?: boolean }
-  | { type: "start_agent"; deckId: string; command?: string; cwd?: string; displayName?: string; rows?: number; cols?: number }
+  | { type: "start_agent"; deckId: string; command?: string; cwd?: string; displayName?: string; rows?: number; cols?: number; authoringKind?: "schedule" | "schedule-issues" | "dispatcher" }
   | { type: "stop_agent"; agentId: string }
   | { type: "rename_agent"; agentId: string; displayName: string }
   | { type: "attach_terminal"; agentId: string; onOutput: import("@tauri-apps/api/core").Channel<ArrayBuffer> }
@@ -2005,6 +2005,12 @@ class FixtureDeckBridge implements DeckBridge {
    */
   private startAgent(action: Extract<DeckAction, { type: "start_agent" }>): DeckActionResult {
     const deck = this.connectedDeck(action.deckId);
+    // PRD #1223 M7: a deck this preview plays as older cannot compose a seed,
+    // and refuses an authoring start the way the live crate does — before
+    // anything is started, in the crate's own sentence.
+    if (action.authoringKind && this.isOlderDeck(action.deckId)) {
+      throw new Error(`This deck cannot start a \`${action.authoringKind}\` agent: it predates daemon-composed authoring seeds, and would start a plain agent with no seed. Nothing was started. Start it from the TUI on that deck's host, or upgrade the deck.`);
+    }
     const agentId = nextFixtureAgentId(deck.agents);
     deck.agents = [
       ...deck.agents,
@@ -2019,7 +2025,8 @@ class FixtureDeckBridge implements DeckBridge {
       }),
     ];
     // PRD #1223 M4: the live crate's rule — recorded once the deck accepted the
-    // start, and a blank command (the default shell) never overwrites one.
+    // start, and a blank command (the default shell) never overwrites one. An
+    // authoring start records its (resolved) command too.
     if (action.command?.trim()) this.lastCommands.set(action.deckId, action.command);
     this.emitSnapshot();
     return { ok: true, agentId };
@@ -2371,7 +2378,7 @@ class FixtureDeckBridge implements DeckBridge {
       kind: "deck",
       ...(defaultCommand === undefined ? {} : { defaultCommand }),
       agents: fixtureAgentRegistry(),
-      experimental: false,
+      experimental: FIXTURE_EXPERIMENTAL_DECKS.has(deckId),
       authoringKinds: ["schedule", "schedule-issues", "dispatcher"],
       ...remembered,
     };

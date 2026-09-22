@@ -68,6 +68,60 @@ test.describe("the New agent flow", () => {
   });
 
   /**
+   * Scenario (PRD #1223 M7): on the fleet, open New agent and choose the
+   * remote deck, whose own experimental flag is on. Use its home directory
+   * with Space. The Mode row offers the three authoring agents; move to
+   * `schedule: issues` with the arrow keys, clear the prefilled Command and
+   * Start. The blank Command resolves to `claude` rather than the deck's
+   * default shell, and the new authoring agent's pane opens over the overview.
+   */
+  test("starts an authoring agent with its blank Command resolved and opens its pane", async ({ page }) => {
+    await openOverview(page, "fleet");
+
+    await page.getByTestId("overview-new-agent").click();
+    const dialog = page.getByTestId("new-agent-dialog");
+    await page.getByTestId("new-agent-deck-list").locator(`[data-deck-id="${REMOTE_DECK}"]`).click();
+    await expect(page.getByTestId("new-agent-current-path")).toHaveText("/home/build");
+    await expect(page.getByTestId("new-agent-directory-list")).toBeFocused();
+    await page.keyboard.press(" ");
+
+    await expect(dialog).toHaveAttribute("data-step", "form");
+    const modes = page.getByTestId("new-agent-modes").getByRole("button");
+    await expect(modes).toHaveText(["No mode", "schedule", "schedule: issues", "dispatcher"]);
+    await page.getByTestId("new-agent-mode-none").focus();
+    await page.keyboard.press("ArrowRight");
+    await page.keyboard.press("ArrowRight");
+    await expect(page.getByTestId("new-agent-mode-schedule-issues")).toHaveAttribute("aria-pressed", "true");
+    await expect(page.getByTestId("new-agent-mode-schedule-issues")).toBeFocused();
+    await page.getByTestId("new-agent-command").fill("");
+    await expect(page.getByTestId("new-agent-command")).toHaveAttribute("placeholder", "Empty starts claude");
+    await page.getByTestId("new-agent-start").click();
+
+    const overlay = page.getByTestId("agent-pane-overlay");
+    await expect(overlay).toBeVisible();
+    await expect(overlay).toHaveAttribute("aria-label", "Claude agent");
+    await expect(dialog).toHaveCount(0);
+  });
+
+  /**
+   * Scenario (PRD #1223 M7): with the remote deck playing a deck from before
+   * PRD #1223, open the flow from its header and type a path. The form offers
+   * No mode alone and says why the authoring agents are missing.
+   */
+  test("withholds the authoring agents on a deck that cannot compose their seeds", async ({ page }) => {
+    await page.goto(`/?fixture=1&state=fleet&older=${encodeURIComponent(REMOTE_DECK)}`);
+    await page.getByTestId("open-overview").click();
+    await page.locator(`[data-testid="daemon-group"][data-daemon-id="${REMOTE_DECK}"]`).getByTestId("daemon-new-agent").click();
+    await page.keyboard.press("Enter");
+    await expect(page.getByTestId("new-agent-path")).toBeFocused();
+    await page.keyboard.type("/srv/checkouts/repo");
+    await page.keyboard.press("Enter");
+
+    await expect(page.getByTestId("new-agent-authoring-withheld")).toBeVisible();
+    await expect(page.getByTestId("new-agent-modes").getByRole("button")).toHaveText(["No mode"]);
+  });
+
+  /**
    * Scenario: with the remote deck playing a deck from before PRD #1223, open
    * the flow from that deck's own header. It is preselected and one Enter
    * confirms it; there is no listing, so type the directory's path and use it.

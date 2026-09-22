@@ -300,6 +300,14 @@ export interface NewAgentOption {
 }
 
 /**
+ * The authoring agents a deck can start (PRD #1223 M7) — the TUI's
+ * `schedule`, `schedule: issues` and `dispatcher` Mode options, spelled as the
+ * wire spells them. A closed set: the crate refuses any other value rather
+ * than starting a plain agent with no seed.
+ */
+export type AuthoringKind = "schedule" | "schedule-issues" | "dispatcher";
+
+/**
  * What the New agent form needs to know about one deck (PRD #1223 M4).
  *
  * `deck` is the deck's own answer. `unsupported` is a deck older than the PRD:
@@ -737,8 +745,14 @@ export type DeckAction =
    * the wrong answer on the overview. A deck the app is not observing is
    * refused and nothing starts anywhere. The new agent's id comes back as
    * `DeckActionResult.agentId`.
+   *
+   * `authoringKind` (PRD #1223 M7) starts an authoring agent instead, whose
+   * seed the deck composes and delivers once the agent is ready. It needs a
+   * `cwd` and a resolved `command` — a blank one would start the deck's
+   * default shell, which cannot act on a seed — and a deck that cannot compose
+   * the seed refuses it and starts nothing.
    */
-  | { type: "start_agent"; deckId: string; command?: string; cwd?: string; displayName?: string; rows?: number; cols?: number }
+  | { type: "start_agent"; deckId: string; command?: string; cwd?: string; displayName?: string; rows?: number; cols?: number; authoringKind?: AuthoringKind }
   | { type: "retry_stage"; stageId: string }
   | { type: "stop_agent"; agentId: string }
   | { type: "rename_agent"; agentId: string; displayName: string }

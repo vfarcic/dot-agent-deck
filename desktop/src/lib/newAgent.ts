@@ -1,4 +1,4 @@
-import type { ConnectionView, DeckDirectoryEntry, DeckFleet } from "../types";
+import type { AuthoringKind, ConnectionView, DeckDirectoryEntry, DeckFleet, NewAgentOption, NewAgentOptions } from "../types";
 import { DISPLAY_LIMITS, deckName, displayText } from "./displayText";
 
 /**
@@ -118,6 +118,57 @@ export function seedCommand(defaultCommand?: string, lastCommand?: string): stri
   if (defaultCommand) return defaultCommand;
   if (lastCommand?.trim()) return lastCommand;
   return "";
+}
+
+/**
+ * The authoring Mode chips (PRD #1223 M7), in the TUI cycler's order and with
+ * its labels — `schedule`, `schedule: issues`, `dispatcher`.
+ */
+export const AUTHORING_MODES: readonly { kind: AuthoringKind; label: string }[] = [
+  { kind: "schedule", label: "schedule" },
+  { kind: "schedule-issues", label: "schedule: issues" },
+  { kind: "dispatcher", label: "dispatcher" },
+];
+
+/** Why no authoring chip is offered, for a deck that cannot say which ones it can start. */
+export const AUTHORING_WITHHELD = {
+  unsupported: "This deck does not report which authoring agents it can start, so schedule and dispatcher are not offered.",
+  none: "This deck cannot compose authoring seeds, so schedule and dispatcher are not offered.",
+} as const;
+
+/**
+ * The authoring chips a deck's options offer, or why none are.
+ *
+ * A chip is offered only when the deck lists its kind in `authoringKinds` —
+ * which the deck does exactly when it can compose that seed — and
+ * `schedule: issues` only when the deck's experimental flag is on, as the TUI
+ * shows that option only with the flag. Nothing is offered while the options
+ * are still loading, and a deck older than the options query, or one that
+ * lists no kind this app knows, is given the reason instead.
+ */
+export function authoringModes(options: NewAgentOptions | undefined): { offered: { kind: AuthoringKind; label: string }[]; withheld?: string } {
+  if (options === undefined) return { offered: [] };
+  if (options.kind === "unsupported") return { offered: [], withheld: AUTHORING_WITHHELD.unsupported };
+  const composable = AUTHORING_MODES.filter((mode) => options.authoringKinds.includes(mode.kind));
+  if (composable.length === 0) return { offered: [], withheld: AUTHORING_WITHHELD.none };
+  return { offered: composable.filter((mode) => mode.kind !== "schedule-issues" || options.experimental) };
+}
+
+/**
+ * The command an authoring agent starts with — the TUI's
+ * `resolve_authoring_command`, applied where the TUI applies it.
+ *
+ * A typed command is used as it is. A blank one would start the deck's default
+ * shell, which cannot act on a seed, so it resolves to the deck host's
+ * configured `default_command` (trimmed), and failing that to the default
+ * command of the deck's own `claude` registry entry — `claude` when the deck
+ * reports none.
+ */
+export function resolveAuthoringCommand(command: string, defaultCommand: string | undefined, agents: readonly NewAgentOption[]): string {
+  if (command.trim()) return command;
+  const configured = defaultCommand?.trim();
+  if (configured) return configured;
+  return agents.find((agent) => agent.id === "claude")?.defaultCommand?.trim() || "claude";
 }
 
 /**

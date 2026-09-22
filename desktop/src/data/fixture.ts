@@ -548,6 +548,14 @@ export const FIXTURE_DEFAULT_COMMANDS: Readonly<Record<string, string>> = {
   [FIXTURE_REMOTE_DAEMON_ID]: "claude",
 };
 
+/**
+ * The fixture decks whose own experimental flag is on (PRD #1223 M7). The
+ * remote deck's is and the local deck's is not, so the preview shows the
+ * `schedule: issues` chip on one deck and withholds it on the other — the flag
+ * is the deck's, not this app's.
+ */
+export const FIXTURE_EXPERIMENTAL_DECKS: ReadonlySet<string> = new Set([FIXTURE_REMOTE_DAEMON_ID]);
+
 function orchestrationTab(orchestrationId: string, name: string, displayTitle: string, roleName: string, roleIndex: number, isStartRole = false, cwd?: string): AgentTab {
   return { kind: "orchestration", orchestrationId, name, displayTitle, roleName, roleIndex, isStartRole, cwd };
 }

@@ -7,6 +7,7 @@ use dot_agent_deck::agent_pty::{
     AgentRecord, TabMembership, clamp_pty_dims, is_valid_cwd, is_valid_display_name,
     is_valid_orchestration_cwd, is_valid_pane_id_env,
 };
+use dot_agent_deck::authoring_seeds::AuthoringKind;
 use dot_agent_deck::daemon_client::Endpoint;
 use dot_agent_deck::daemon_protocol::PROTOCOL_VERSION;
 use dot_agent_deck::event::{
@@ -520,6 +521,17 @@ pub enum DesktopAction {
         display_name: Option<String>,
         rows: Option<u16>,
         cols: Option<u16>,
+        /// PRD #1223 M7: start an AUTHORING agent — the TUI's `schedule`,
+        /// `schedule: issues` or `dispatcher` option — whose seed the deck
+        /// composes and delivers once the agent is ready. Absent is a plain
+        /// agent, byte for byte what this action sent before.
+        ///
+        /// The crate's own closed enum rather than a string, so a kind this
+        /// build does not know fails the decode instead of reaching a deck as a
+        /// plain start with no seed — the failure the deck's capability gate
+        /// exists to prevent, one hop earlier.
+        #[serde(default)]
+        authoring_kind: Option<AuthoringKind>,
     },
     StartWorkflow {
         /// The orchestration name, as offered by the daemon's
@@ -2835,6 +2847,48 @@ mod tests {
         assert!(
             error.contains("deckId"),
             "the refusal names the field: {error}"
+        );
+    }
+
+    /// Scenario: the webview sends `start_agent` with an `authoringKind` (PRD
+    /// #1223 M7). Each of the three kinds decodes to the crate's own enum, an
+    /// absent one decodes as a plain start, and a kind this build does not know
+    /// fails the decode rather than reaching a deck as a plain start with no
+    /// seed.
+    #[test]
+    fn a_start_agent_action_carries_a_closed_authoring_kind() {
+        let decode = |kind: Option<&str>| {
+            let mut action = serde_json::json!({
+                "type": "start_agent",
+                "deckId": "deck-000000000000dec1",
+                "command": "claude",
+                "cwd": "/srv/repo",
+            });
+            if let Some(kind) = kind {
+                action["authoringKind"] = kind.into();
+            }
+            serde_json::from_value::<DesktopAction>(action)
+        };
+        for kind in AuthoringKind::ALL {
+            assert!(
+                matches!(
+                    decode(Some(kind.as_str())),
+                    Ok(DesktopAction::StartAgent { authoring_kind: Some(decoded), .. }) if decoded == kind
+                ),
+                "{} decodes",
+                kind.as_str()
+            );
+        }
+        assert!(matches!(
+            decode(None),
+            Ok(DesktopAction::StartAgent {
+                authoring_kind: None,
+                ..
+            })
+        ));
+        assert!(
+            decode(Some("orchestration")).is_err(),
+            "an unknown kind is refused at decode"
         );
     }
 

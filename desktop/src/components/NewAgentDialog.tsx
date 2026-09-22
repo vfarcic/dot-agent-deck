@@ -2,6 +2,7 @@ import { useCallback, useEffect, useId, useMemo, useRef, useState, type Keyboard
 import { ArrowLeft, ArrowUp, Check, Folder, FolderGit2, Loader2, Plus, X } from "lucide-react";
 import { DISPLAY_LIMITS, displayText } from "../lib/displayText";
 import {
+  authoringModes,
   deckChoices,
   directoryLabel,
   filterDirectoryEntries,
@@ -9,10 +10,11 @@ import {
   isDeckGoneError,
   NEW_AGENT_APPEAR_TIMEOUT_MS,
   preselectedDeck,
+  resolveAuthoringCommand,
   seedCommand,
   type DeckChoice,
 } from "../lib/newAgent";
-import type { DeckDirectoryEntry, DeckDirectoryListing, DeckRuntimeState, NewAgentOption, NewAgentOptions } from "../types";
+import type { AuthoringKind, DeckDirectoryEntry, DeckDirectoryListing, DeckRuntimeState, NewAgentOption, NewAgentOptions } from "../types";
 
 /**
  * What the dialog needs from the runtime. The two queries are REQUIRED here
@@ -40,11 +42,12 @@ type Listing = Extract<DeckDirectoryListing, { kind: "listing" }>;
 type DirectoryRow = { kind: "up"; path: string } | { kind: "entry"; entry: DeckDirectoryEntry };
 
 /**
- * The Mode row's chips. One today; PRD #1223 M6 and M7 add one per
- * orchestration the directory defines and the three authoring kinds, which is
- * why this is a list rather than a label.
+ * The Mode row's first chip — a plain agent. The rest are the authoring kinds
+ * the deck can start (PRD #1223 M7), from {@link authoringModes}.
  */
-const MODES = [{ id: "none", label: "No mode" }] as const;
+const NO_MODE = { id: "none", label: "No mode" } as const;
+
+type ModeId = typeof NO_MODE.id | AuthoringKind;
 
 const AUTO_AGENT = "auto";
 
@@ -62,6 +65,10 @@ function messageOf(cause: unknown): string {
  *    the TUI picker's keys, plus a typed path — the only mode on a deck without
  *    the listing verb.
  * 3. **Form** — Mode, Agent, Name and Command, prefilled in the TUI's order.
+ *    Mode offers a plain agent and, on a deck that can compose their seeds,
+ *    the TUI's `schedule`, `schedule: issues` and `dispatcher` authoring
+ *    agents (PRD #1223 M7) — whose blank Command resolves the way the TUI's
+ *    does, because a blank one would start the deck's default shell.
  *
  * # The deck is captured once
  *
@@ -111,6 +118,7 @@ export function NewAgentDialog({ runtime, initialDeckId, onClose, onAppeared, on
   const [options, setOptions] = useState<NewAgentOptions>();
   const [optionsError, setOptionsError] = useState<string>();
   const [agentChoice, setAgentChoice] = useState<string>(AUTO_AGENT);
+  const [modeChoice, setModeChoice] = useState<ModeId>(NO_MODE.id);
   const [name, setName] = useState("");
   const [command, setCommand] = useState("");
   const commandTouched = useRef(false);
@@ -204,6 +212,7 @@ export function NewAgentDialog({ runtime, initialDeckId, onClose, onAppeared, on
     setCommand("");
     commandTouched.current = false;
     setAgentChoice(AUTO_AGENT);
+    setModeChoice(NO_MODE.id);
     setOptions(undefined);
     setOptionsError(undefined);
     setFormError(undefined);
@@ -262,6 +271,12 @@ export function NewAgentDialog({ runtime, initialDeckId, onClose, onAppeared, on
   };
 
   const agents: NewAgentOption[] = options?.kind === "deck" ? options.agents : options?.kind === "unsupported" ? options.desktopAgents : [];
+  const authoring = authoringModes(options);
+  const modes: { id: ModeId; label: string }[] = [NO_MODE, ...authoring.offered.map((mode) => ({ id: mode.kind, label: mode.label }))];
+  /** The chip in force — `No mode` whenever the chosen one is not (or no longer) offered. */
+  const mode: ModeId = modes.some((candidate) => candidate.id === modeChoice) ? modeChoice : NO_MODE.id;
+  const authoringKind: AuthoringKind | undefined = mode === NO_MODE.id ? undefined : mode;
+  const defaultCommand = options?.kind === "deck" ? options.defaultCommand : undefined;
 
   const chooseAgent = (id: string) => {
     setAgentChoice(id);
@@ -279,13 +294,17 @@ export function NewAgentDialog({ runtime, initialDeckId, onClose, onAppeared, on
     setFormError(undefined);
     setPhase("starting");
     const agentName = name.trim() ? name : "";
+    // An authoring agent's blank Command resolves here, where the TUI resolves
+    // it, and the field keeps what the user typed.
+    const startCommand = authoringKind ? resolveAuthoringCommand(command, defaultCommand, agents) : command;
     try {
       const result = await runtime.runAction({
         type: "start_agent",
         deckId: deck.deckId,
         cwd: target.path,
-        ...(command.trim() ? { command } : {}),
+        ...(startCommand.trim() ? { command: startCommand } : {}),
         ...(agentName ? { displayName: agentName } : {}),
+        ...(authoringKind ? { authoringKind } : {}),
       });
       if (result.agentId === undefined) {
         onNotAppeared({ deckName: deck.name, agentName });
@@ -436,6 +455,16 @@ export function NewAgentDialog({ runtime, initialDeckId, onClose, onAppeared, on
       event.preventDefault();
       directoryListRef.current?.focus();
     }
+  };
+
+  /** The TUI form's Left / Right on the Mode row: move to the previous or next chip, wrapping. */
+  const onModeKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
+    if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
+    event.preventDefault();
+    const index = modes.findIndex((candidate) => candidate.id === mode);
+    const next = modes[(index + (event.key === "ArrowRight" ? 1 : modes.length - 1)) % modes.length];
+    setModeChoice(next.id);
+    event.currentTarget.querySelector<HTMLButtonElement>(`[data-mode="${next.id}"]`)?.focus();
   };
 
   const onDialogKeyDown = (event: KeyboardEvent<HTMLElement>) => {
@@ -613,10 +642,24 @@ export function NewAgentDialog({ runtime, initialDeckId, onClose, onAppeared, on
         </div>
         <div className="new-agent-field">
           <span id={`${titleId}-mode`}>Mode</span>
-          <div className="new-agent-chips" role="group" aria-labelledby={`${titleId}-mode`}>
-            {MODES.map((mode) => <button type="button" key={mode.id} className="new-agent-chip is-active" aria-pressed="true" disabled={busy}>{mode.label}</button>)}
+          <div className="new-agent-chips" role="group" aria-labelledby={`${titleId}-mode`} data-testid="new-agent-modes" onKeyDown={onModeKeyDown}>
+            {modes.map((candidate) => (
+              <button
+                type="button"
+                key={candidate.id}
+                className={`new-agent-chip${candidate.id === mode ? " is-active" : ""}`}
+                aria-pressed={candidate.id === mode}
+                data-mode={candidate.id}
+                data-testid={`new-agent-mode-${candidate.id}`}
+                disabled={busy}
+                onClick={() => setModeChoice(candidate.id)}
+              >
+                {candidate.label}
+              </button>
+            ))}
           </div>
         </div>
+        {authoring.withheld && <p className="new-agent-hint" data-testid="new-agent-authoring-withheld">{authoring.withheld}</p>}
         <label className="new-agent-field">
           <span>Agent</span>
           <select data-testid="new-agent-agent" value={agentChoice} disabled={busy} onChange={(event) => chooseAgent(event.target.value)}>
@@ -651,7 +694,7 @@ export function NewAgentDialog({ runtime, initialDeckId, onClose, onAppeared, on
             data-testid="new-agent-command"
             value={command}
             disabled={busy}
-            placeholder="Empty starts the deck's default shell"
+            placeholder={authoringKind ? `Empty starts ${resolveAuthoringCommand("", defaultCommand, agents)}` : "Empty starts the deck's default shell"}
             spellCheck={false}
             autoCapitalize="off"
             autoCorrect="off"

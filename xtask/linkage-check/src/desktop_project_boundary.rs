@@ -114,6 +114,22 @@ pub const DESKTOP_BOUNDARY_RULE: &str = "client-side project resolution in the d
 const ALLOWED_ROOT_MODULES: &[&str] = &[
     "agent_pty",
     "agent_registry",
+    // PRD #1223 M7, argued rather than added quietly. The desktop names ONE
+    // item here, `AuthoringKind` — the closed wire enum `StartAgent`'s
+    // `authoring_kind` carries — because `DaemonClient::start_authoring_agent`
+    // takes it, and because decoding the webview's kind straight into it is
+    // what makes an unknown kind a decode error rather than a plain start with
+    // no seed. A desktop-side copy of the enum would be a second list to keep
+    // in step with the daemon's.
+    //
+    // The module's seed text and `compose_*_seed` functions are NOT something
+    // the desktop calls: the daemon composes and delivers the seed (PRD #1223's
+    // "the seeds move to the daemon"), so a desktop call to them would be the
+    // drift #1043 describes even though it crosses none of this rule's lines.
+    // Checked against those lines: the module resolves no project, reads no
+    // file at all, names no FORBIDDEN_SYMBOL or project-state literal, and
+    // contains no `std::env::current_dir` — all zero for it.
+    "authoring_seeds",
     "build_id",
     "config",
     "daemon_attach",
