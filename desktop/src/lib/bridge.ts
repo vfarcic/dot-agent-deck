@@ -671,6 +671,26 @@ export interface VoiceDirectoriesDto {
 }
 
 /**
+ * What the New agent dialog shows BESIDES its browser, declared with an
+ * utterance while the dialog is open (PRD #1223) — `voice::VoiceNewAgent`.
+ *
+ * `form` is present only while the form's fields are live — a deck and a
+ * directory chosen, no start in flight, and no start confirmation open — and
+ * carries the Mode chips and Agent picker entries AS OFFERED: they vary by the
+ * deck's capabilities, its experimental flag and whether the directory is a
+ * project, and a spoken `mode_ref` or `agent_type_ref` resolves against these
+ * and nothing else.
+ */
+export interface VoiceNewAgentDto {
+  form?: {
+    deckId: string;
+    path: string;
+    modes: { id: string; label: string }[];
+    agentTypes: { id: string; label: string }[];
+  };
+}
+
+/**
  * One param of a resolved command, as the Rust side resolved it
  * (`voice::ResolvedParam`).
  *
@@ -687,6 +707,9 @@ export interface VoiceDirectoriesDto {
  * * `dir_ref` resolves against **the directory browser's children on screen**
  *   ({@link VoiceDirectoriesDto}, PRD #1223) — `spoken` is what the user called
  *   one, `value` is the deck's own path for it, and `label` its `displayName`.
+ * * `mode_ref` and `agent_type_ref` resolve against **the New agent form's
+ *   Mode chips and Agent picker as offered** ({@link VoiceNewAgentDto}, PRD
+ *   #1223) — `value` is the chip's or entry's id, `label` what it shows.
  * * `spoken_prefix` resolves against **the transcript** — `spoken` is the
  *   boundary the model marked, the words that introduced a dictation, and
  *   `value` is what the app resolved that boundary to: the rest of the
@@ -1403,8 +1426,10 @@ export interface DeckBridge {
    * #1223): what the New agent dialog's directory browser is showing, or
    * `undefined` when it is showing nothing. It rides the same declaration for
    * the same reason, and is what makes the directory rows callable at all.
+   * `newAgent` is the third: the New agent dialog's form, present while the
+   * dialog is open ({@link VoiceNewAgentDto}).
    */
-  declareVoiceScreen(screen: VoiceScreen, directories?: VoiceDirectoriesDto): void;
+  declareVoiceScreen(screen: VoiceScreen, directories?: VoiceDirectoriesDto, newAgent?: VoiceNewAgentDto): void;
   /**
    * Take one utterance — transcribed from the microphone — to an outcome
    * carrying the sentence to show (PRD #802 M6).
@@ -1440,9 +1465,9 @@ export interface DeckBridge {
    *
    * `directories` is what the directory browser shows, when it shows anything
    * (PRD #1223), so the overlay flags the directory rows exactly as a resolve
-   * right now would.
+   * right now would — and `newAgent` likewise for the form rows.
    */
-  voiceCommands(screen: VoiceScreen, directories?: VoiceDirectoriesDto): Promise<VoiceCommandDto[]>;
+  voiceCommands(screen: VoiceScreen, directories?: VoiceDirectoriesDto, newAgent?: VoiceNewAgentDto): Promise<VoiceCommandDto[]>;
   /**
    * Open the microphone (PRD #802 M7's `desktop_voice_start`).
    *
@@ -3825,15 +3850,18 @@ export class TauriDeckBridge implements DeckBridge {
   private voiceScreen: VoiceScreen = "deck";
   /** PRD #1223 — the directory browser declared with that screen, if any. */
   private voiceDirectories: VoiceDirectoriesDto | undefined;
+  /** PRD #1223 — the New agent dialog declared with it, while it is open. */
+  private voiceNewAgent: VoiceNewAgentDto | undefined;
 
-  declareVoiceScreen(screen: VoiceScreen, directories?: VoiceDirectoriesDto): void {
+  declareVoiceScreen(screen: VoiceScreen, directories?: VoiceDirectoriesDto, newAgent?: VoiceNewAgentDto): void {
     this.voiceScreen = screen;
     this.voiceDirectories = directories;
+    this.voiceNewAgent = newAgent;
   }
 
   async resolveVoice(utterance: string): Promise<VoiceResultDto> {
     const invoke = await this.getInvoke();
-    return invoke<VoiceResultDto>("desktop_voice_resolve", { utterance, screen: this.voiceScreen, directories: this.voiceDirectories ?? null });
+    return invoke<VoiceResultDto>("desktop_voice_resolve", { utterance, screen: this.voiceScreen, directories: this.voiceDirectories ?? null, newAgent: this.voiceNewAgent ?? null });
   }
 
   /**
@@ -3846,9 +3874,9 @@ export class TauriDeckBridge implements DeckBridge {
    * and wants that one — so borrowing the held value would couple the overlay
    * to whether an utterance happened to be in flight.
    */
-  async voiceCommands(screen: VoiceScreen, directories?: VoiceDirectoriesDto): Promise<VoiceCommandDto[]> {
+  async voiceCommands(screen: VoiceScreen, directories?: VoiceDirectoriesDto, newAgent?: VoiceNewAgentDto): Promise<VoiceCommandDto[]> {
     const invoke = await this.getInvoke();
-    return invoke<VoiceCommandDto[]>("desktop_voice_commands", { screen, directories: directories ?? null });
+    return invoke<VoiceCommandDto[]>("desktop_voice_commands", { screen, directories: directories ?? null, newAgent: newAgent ?? null });
   }
 
   async voiceStart(): Promise<VoiceStatusDto> {

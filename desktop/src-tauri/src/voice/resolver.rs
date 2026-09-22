@@ -21,7 +21,7 @@ use std::pin::Pin;
 use serde::{Deserialize, Serialize};
 
 use super::schema::AnnotatedCommand;
-use super::{Transcript, VoiceDeck, VoiceDirectories};
+use super::{Transcript, VoiceDeck, VoiceDirectories, VoiceNewAgent};
 use crate::dto::DesktopAgent;
 
 /// Everything a backend is given for one utterance.
@@ -47,6 +47,11 @@ pub struct IntentRequest<'a> {
     /// to name; see [`VoiceDirectories`] for why this one piece is declared by
     /// the webview rather than read Rust-side.
     pub directories: Option<&'a VoiceDirectories>,
+    /// What the New agent dialog shows besides its browser, while it is open
+    /// (PRD #1223) — the Mode chips and Agent picker entries a spoken
+    /// `mode_ref` or `agent_type_ref` resolves against. `None` while the
+    /// dialog is closed; see [`VoiceNewAgent`].
+    pub new_agent: Option<&'a VoiceNewAgent>,
 }
 
 /// What a backend answers with: an action id and the params as the user
@@ -305,6 +310,7 @@ mod tests {
             agents: &[],
             decks: &[],
             directories: None,
+            new_agent: None,
         }
     }
 

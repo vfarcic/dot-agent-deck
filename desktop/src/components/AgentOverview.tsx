@@ -5,7 +5,7 @@ import { modeScopedKey } from "../lib/bridge";
 import { VOICE_ACTIONS, type NewAgentVoice, type NewAgentVoiceChannel, type VoiceDispatchTarget, type VoiceOverviewChannel } from "../lib/voiceActions";
 import { DECK_STATE_FALLBACK, deckUnavailableReason, isNewAgentShortcut } from "../lib/newAgent";
 import { ConfirmDialog, type ConfirmState } from "./ConfirmDialog";
-import { NewAgentDialog, NO_DIRECTORY_BROWSER, type NewAgentRuntime } from "./NewAgentDialog";
+import { NewAgentDialog, NO_DIRECTORY_BROWSER, NO_NEW_AGENT_FORM, type NewAgentRuntime } from "./NewAgentDialog";
 import { DeckSelector } from "./DeckSelector";
 import type { DesktopSettingsState } from "../hooks/useDesktopSettings";
 import { DISPLAY_LIMITS, deckName, displayActivity, displayIdentity, displayPath, displayText, displayTitle, displayUptime, domIdentity, rendersBlank } from "../lib/displayText";
@@ -845,10 +845,19 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
       const slot = newAgentVoice?.current;
       return slot ? pick(slot) : NO_DIRECTORY_BROWSER;
     };
+    /* The form's three fills, the same way: served always, resolved against
+       the dialog's slot at call time, refusing in words when it has gone. */
+    const fill = (pick: (slot: NewAgentVoice) => string | undefined) => {
+      const slot = newAgentVoice?.current;
+      return slot ? pick(slot) : NO_NEW_AGENT_FORM;
+    };
     const directoryMoves = {
       openDirectory: (target: VoiceDispatchTarget) => move((slot) => slot.openDirectory(target)),
       goToParentDirectory: (target: VoiceDispatchTarget) => move((slot) => slot.goToParentDirectory(target)),
       useThisDirectory: (target: VoiceDispatchTarget) => move((slot) => slot.useThisDirectory(target)),
+      chooseNewAgentMode: (target: VoiceDispatchTarget) => fill((slot) => slot.chooseNewAgentMode(target)),
+      chooseNewAgentType: (target: VoiceDispatchTarget) => fill((slot) => slot.chooseNewAgentType(target)),
+      nameNewAgent: (target: VoiceDispatchTarget) => fill((slot) => slot.nameNewAgent(target)),
     };
     voiceChannel.current = newAgent
       ? { closeNewAgent: () => newAgentClose.current?.(), ...directoryMoves }

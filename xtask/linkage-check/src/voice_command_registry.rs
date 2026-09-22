@@ -1122,10 +1122,17 @@ mod tests {
         );
         assert_eq!(
             kinds,
-            ["agent_ref", "deck_ref", "dir_ref", "spoken_prefix"]
-                .into_iter()
-                .map(str::to_string)
-                .collect()
+            [
+                "agent_ref",
+                "agent_type_ref",
+                "deck_ref",
+                "dir_ref",
+                "mode_ref",
+                "spoken_prefix",
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect()
         );
         // Every row's `invoke` is classified `voice: true`, which is the state
         // assertion 4 is about.

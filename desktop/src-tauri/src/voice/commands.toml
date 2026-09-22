@@ -18,8 +18,9 @@
 #                    Absent or empty means available everywhere.
 #   requires         what else must hold, from the closed set in `table.rs`'s
 #                    `Requirement`: `directory_listing` (the New agent dialog
-#                    is showing a listing) and `parent_directory` (that listing
-#                    has a `..`). Answered by what the webview declared with the
+#                    is showing a listing), `parent_directory` (that listing
+#                    has a `..`) and `new_agent_form` (the dialog's fields are
+#                    live). Answered by what the webview declared with the
 #                    utterance. Absent or empty means nothing more is needed.
 #   unavailable_hint names the PREREQUISITE, for the sentence the app renders
 #                    when the model picks a command the current screen cannot
@@ -36,7 +37,8 @@
 #                    opposite — this describes an action that HAPPENED, that
 #                    one blocks an action before it does. Do not rename it back.
 #   [[commands.params]]  name + kind, `kind` from the closed resolver set
-#                    (`agent_ref`, `deck_ref`, `dir_ref`, `spoken_prefix`). `optional =
+#                    (`agent_ref`, `deck_ref`, `dir_ref`, `mode_ref`,
+#                    `agent_type_ref`, `spoken_prefix`). `optional =
 #                    true` lets the row dispatch when the model supplies no
 #                    value; a value that resolves to nothing is still refused,
 #                    and a report may not interpolate an optional param.
@@ -398,3 +400,98 @@ screens     = ["overview"]
 requires    = ["directory_listing"]
 unavailable_hint = "choosing a directory works while the New agent dialog is showing a directory listing"
 report      = "Using this directory."
+
+# PRD #1223 — the rest of the New agent form by voice: Mode, Agent and Name.
+#
+# **Each resolves against what the form OFFERS, as the dialog declared it**
+# (`VoiceNewAgentForm`), never against a list this table knows. The Mode row
+# varies by the deck's capabilities (the authoring chips need `authoring-kind`,
+# orchestration chips need `prepare-workflow`), the deck's experimental flag
+# (`schedule: issues`) and whether the directory is a project; the Agent picker
+# is the deck's own registry, or the desktop's labelled fallback. So "mode
+# schedule issues" on a deck whose flag is off is refused as a chip that is not
+# offered — the same `ParamUnresolved` a directory not on screen gets — rather
+# than resolved against a chip nobody can see.
+#
+# **Availability is `requires = ["new_agent_form"]`**: the fields are live only
+# with a deck and a directory chosen, no start in flight and no start
+# confirmation open — exactly when a click on them would take. Each row calls the
+# function its click calls (`selectMode`, `chooseAgent`, the Name input's own
+# setter), so choosing an agent overwrites Command with its default exactly as
+# the picker does, and a spoken Name counts as an edit exactly as a typed one.
+#
+# **Command has NO row, deliberately.** It is the one field that executes: what
+# is in it runs as the deck's user in the chosen directory. Dictating a shell
+# command is the most error-prone thing a transcriber can be asked to do —
+# flags, quotes, paths and punctuation are precisely what it normalises away —
+# and a mis-dictated command is the one mistake in this dialog with
+# consequences beyond the form. Choosing an agent already fills it with that
+# agent's default command, which covers the common case, and the field stays
+# typed by hand. `choose_mode`'s and `name_new_agent`'s descriptions say so, so
+# "set the command to …" is not coerced into either.
+#
+# **None of these starts anything**, so none is in PRD #802 D5's set: they
+# change what the form will say, and a start is still a separate, confirmed
+# act (`start_new_agent`, below, and the dialog's own Start).
+[[commands]]
+id          = "choose_mode"
+description = """In the New agent form, choose one of the Mode chips it offers: No mode (a plain
+agent), an orchestration (`Orch: <name>`), schedule, schedule: issues, or dispatcher. Use for
+mode schedule, make it a dispatcher, use the billing orchestration, orchestration build, plain
+agent, no mode. Set `mode` to the words the user used for the chip; it must be one of
+`new_agent_form.modes`, the chips on screen right now. This only changes the Mode field: it starts
+nothing. Never for the command line, which is typed by hand."""
+invoke      = "chooseNewAgentMode"
+screens     = ["overview"]
+requires    = ["new_agent_form"]
+unavailable_hint = "choosing a mode works while the New agent form has a deck and a directory chosen"
+report      = "Mode: {mode}."
+
+  [[commands.params]]
+  name = "mode"
+  kind = "mode_ref"
+
+[[commands]]
+id          = "choose_agent_type"
+description = """In the New agent form, choose which agent to start from its Agent picker — Claude
+Code, OpenCode, Pi, Codex, or auto — which also fills the Command field with that agent's default
+command. Use for use claude, pick opencode, agent codex, make it a pi agent, set the agent to
+auto. Set `agent_type` to the words the user used; it must be one of
+`new_agent_form.agent_types`, the entries on screen right now. This is a KIND of agent for the new
+one, never an existing agent (that is `open_agent`), and it starts nothing."""
+invoke      = "chooseNewAgentType"
+screens     = ["overview"]
+requires    = ["new_agent_form"]
+unavailable_hint = "choosing an agent works while the New agent form has a deck and a directory chosen"
+report      = "Agent: {agent_type}."
+
+  [[commands.params]]
+  name = "agent_type"
+  kind = "agent_type_ref"
+
+# The `spoken_prefix` kind, reused rather than a new free-text kind: the model
+# marks where the introducing words end ("name it", "call it") and the app takes
+# the name from its own transcript after them — the dictation row's fidelity
+# rule, for the same reason. The dialog trims the trailing full stop a
+# transcriber adds to a sentence; nothing else about the words is changed.
+#
+# The report names no value on purpose: the field itself is on screen beside it,
+# and a sentence repeating the transcript would disagree with the field by
+# exactly that trimmed full stop.
+[[commands]]
+id          = "name_new_agent"
+description = """In the New agent form, set the Name field to what the user says. Use for name it
+billing worker, call it the api reviewer, set the name to docs bot. Answer with `prefix` set to
+the exact introducing words and NOTHING else — "name it", "call it", "set the name to" — copied
+from the user's own sentence; the app takes the name from the words after them. Never answer with
+the name itself. Only the Name field: never the command line, which is typed by hand, and it
+starts nothing."""
+invoke      = "nameNewAgent"
+screens     = ["overview"]
+requires    = ["new_agent_form"]
+unavailable_hint = "naming the new agent works while the New agent form has a deck and a directory chosen"
+report      = "Name set."
+
+  [[commands.params]]
+  name = "prefix"
+  kind = "spoken_prefix"

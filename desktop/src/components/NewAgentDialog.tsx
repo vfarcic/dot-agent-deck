@@ -96,6 +96,31 @@ export const DIRECTORY_MOVED_ON = "The directory browser moved on while that was
 export const DIRECTORY_NOT_LISTED = "That directory is not in the listing any more, so nothing was opened.";
 /** `..` is not on screen. */
 export const NO_PARENT_DIRECTORY = "This directory has no parent to go up to.";
+/*
+  PRD #1223 — the form's refusals by voice. Rust refuses a fill row when no
+  live form was declared, so each of these answers a form that changed during
+  the round trip.
+*/
+/** No live form: the dialog is closed, has no deck or directory chosen, or is starting. */
+export const NO_NEW_AGENT_FORM = "The New agent form has no deck and directory chosen yet, so nothing was changed.";
+/** The form moved to another deck or directory between the utterance and its answer. */
+export const FORM_MOVED_ON = "The New agent form moved on while that was being worked out, so nothing was changed. Say it again.";
+/** The chip is not in the Mode row any more. */
+export const MODE_NOT_OFFERED = "That mode is not offered on this form any more, so the mode was not changed.";
+/** The entry is not in the Agent picker any more. */
+export const AGENT_TYPE_NOT_OFFERED = "That agent is not in this form's picker any more, so the agent was not changed.";
+/** The words after "name it" were only punctuation. */
+export const NO_NAME_HEARD = "No name was heard after that, so the Name was not changed.";
+
+/**
+ * A spoken Name as the Name field takes it: the words after the marked
+ * boundary, with the whitespace around them and the sentence punctuation a
+ * transcriber ends an utterance with ("billing worker.") taken off. Nothing
+ * inside the name is changed.
+ */
+export function spokenName(text: string | undefined): string {
+  return (text ?? "").trim().replace(/[\s.,!?;:]+$/u, "").trim();
+}
 
 function messageOf(cause: unknown): string {
   return cause instanceof Error ? cause.message : String(cause);
@@ -564,6 +589,53 @@ export function NewAgentDialog({ runtime, initialDeckId, onClose, onAppeared, on
     confirmCurrent();
     return undefined;
   };
+  /**
+   * PRD #1223 — the rest of the form by voice: Mode, Agent and Name. Each calls
+   * what the control's own click or keystroke calls (`selectMode`,
+   * `chooseAgent`, the Name input's setter) and nothing else, so a spoken
+   * choice of agent overwrites Command exactly as the picker does, and a spoken
+   * Name is an edit exactly as a typed one is.
+   *
+   * Each first re-checks that the form is still the one the utterance was
+   * judged against — its deck and its chosen directory — for the browser's
+   * reason, and refuses in the dialog's words when it is not.
+   *
+   * Command has no move: it is the field that executes, and it stays typed.
+   */
+  const formMovedOn = (dispatch: VoiceDispatchTarget): string | undefined => {
+    if (!deck || !target || phase !== "idle") return NO_NEW_AGENT_FORM;
+    const declared = dispatch.declaredForm;
+    if (!declared || declared.deckId !== deck.deckId || declared.path !== target.path) return FORM_MOVED_ON;
+    return undefined;
+  };
+  const voiceChooseMode = (dispatch: VoiceDispatchTarget): string | undefined => {
+    const refused = formMovedOn(dispatch);
+    if (refused !== undefined) return refused;
+    const chip = modes.find((candidate) => candidate.id === dispatch.modeId);
+    if (!chip) return MODE_NOT_OFFERED;
+    selectMode(chip.id);
+    return undefined;
+  };
+  const voiceChooseAgentType = (dispatch: VoiceDispatchTarget): string | undefined => {
+    const refused = formMovedOn(dispatch);
+    if (refused !== undefined) return refused;
+    const id = dispatch.agentTypeId;
+    if (id !== AUTO_AGENT && !agents.some((candidate) => candidate.id === id)) return AGENT_TYPE_NOT_OFFERED;
+    chooseAgent(id ?? AUTO_AGENT);
+    return undefined;
+  };
+  const voiceNameNewAgent = (dispatch: VoiceDispatchTarget): string | undefined => {
+    const refused = formMovedOn(dispatch);
+    if (refused !== undefined) return refused;
+    const spoken = spokenName(dispatch.text);
+    if (!spoken) return NO_NAME_HEARD;
+    nameTouched.current = true;
+    setName(spoken);
+    return undefined;
+  };
+  /** Whether the form's fields are live — what a click on one of them needs. */
+  const formLive = deck !== undefined && target !== undefined && phase === "idle";
+
   /*
     The slot, rewritten every render — no dependency array, for `closeRequest`'s
     reason: the moves close over this render's listing and phase. The
@@ -586,6 +658,23 @@ export function NewAgentDialog({ runtime, initialDeckId, onClose, onAppeared, on
       openDirectory: voiceOpenDirectory,
       goToParentDirectory: voiceGoToParent,
       useThisDirectory: voiceUseThisDirectory,
+      /* PRD #1223 — present while mounted; its `form` only while the fields
+         are live, carrying the chips and picker entries AS OFFERED on this
+         render — a disabled namesake orchestration chip is not among them,
+         since a click cannot choose one either. */
+      newAgent: {
+        form: formLive && deck && target
+          ? {
+            deckId: deck.deckId,
+            path: target.path,
+            modes: modes.map(({ id, label }) => ({ id, label })),
+            agentTypes: [{ id: AUTO_AGENT, label: AUTO_AGENT }, ...agents.map((agent) => ({ id: agent.id, label: agent.displayName }))],
+          }
+          : undefined,
+      },
+      chooseNewAgentMode: voiceChooseMode,
+      chooseNewAgentType: voiceChooseAgentType,
+      nameNewAgent: voiceNameNewAgent,
     };
     return () => { voice.current = undefined; };
   });

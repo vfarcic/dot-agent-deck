@@ -52,8 +52,8 @@ use std::fmt;
 use std::time::{Duration, Instant};
 
 use dot_agent_deck_desktop::voice::{
-    NO_MATCH_ACTION, ParamKind, REMOTE_TIMEOUT, Screen, Transcript, VoiceDirectories,
-    VoiceDirectoryEntry, VoiceOutcome,
+    NO_MATCH_ACTION, ParamKind, REMOTE_TIMEOUT, Screen, Transcript, VoiceChoice, VoiceDirectories,
+    VoiceDirectoryEntry, VoiceNewAgent, VoiceNewAgentForm, VoiceOutcome,
     dictation::normalise,
     handle_utterance, table,
     test_support::{api_preset, api_resolver, role_agent_in_state, with_tool},
@@ -105,6 +105,16 @@ struct PhraseFixture {
     /// planted listing the way `resolved_deck` is against the fleet.
     #[serde(default)]
     resolved_dir: Option<String>,
+    /// Whether the New agent dialog's form is live for this fixture (PRD
+    /// #1223): the planted chips and picker below. Implies the dialog is open.
+    #[serde(default)]
+    form: bool,
+    /// The chip id a `mode_ref` param must resolve to.
+    #[serde(default)]
+    resolved_mode: Option<String>,
+    /// The registry id an `agent_type_ref` param must resolve to.
+    #[serde(default)]
+    resolved_agent_type: Option<String>,
     /// The introducing words a dictation fixture expects the model to MARK.
     ///
     /// **Not the text to type**, which is the whole design: the app takes that
@@ -235,6 +245,17 @@ fn resolved_dir(outcome: &VoiceOutcome) -> Option<&str> {
     }
 }
 
+/// The value a dispatch's param of `kind` resolved to, if it carried one.
+fn resolved_of(outcome: &VoiceOutcome, kind: ParamKind) -> Option<&str> {
+    match outcome {
+        VoiceOutcome::Dispatch { params, .. } => params
+            .iter()
+            .find(|param| param.kind == kind)
+            .map(|param| param.value.as_str()),
+        _ => None,
+    }
+}
+
 /// What the model marked as the introducing words, for a dictation dispatch.
 ///
 /// Read off `spoken` rather than `value`: `value` is what the app resolved the
@@ -311,7 +332,53 @@ async fn voice_phrase_fixtures_match_the_default_backend() {
             })
             .collect(),
     };
+    // PRD #1223 — the New agent form a fixture with `form = true` sees: a
+    // project directory on a deck whose experimental flag is OFF, so the Mode
+    // row has no `schedule: issues` chip — which is what the not-offered
+    // fixture leans on — and the deck's own registry in the picker.
+    let choice = |id: &str, label: &str| VoiceChoice {
+        id: id.to_string(),
+        label: label.to_string(),
+    };
+    let new_agent_form = VoiceNewAgent {
+        form: Some(VoiceNewAgentForm {
+            deck_id: "deck-local".to_string(),
+            path: "/home/dev/code/billing-service".to_string(),
+            modes: vec![
+                choice("none", "No mode"),
+                choice("orchestration:billing-run", "Orch: billing-run"),
+                choice("schedule", "schedule"),
+                choice("dispatcher", "dispatcher"),
+            ],
+            agent_types: vec![
+                choice("auto", "auto"),
+                choice("claude", "Claude Code"),
+                choice("opencode", "OpenCode"),
+                choice("pi", "Pi"),
+                choice("codex", "Codex"),
+            ],
+        }),
+    };
+    let form_choices = new_agent_form.form.as_ref().expect("planted");
     for fixture in &fixtures.fixtures {
+        if let Some(expected) = fixture.resolved_mode.as_deref() {
+            assert!(
+                fixture.form && form_choices.modes.iter().any(|mode| mode.id == expected),
+                "{}: `resolved_mode = {expected:?}` needs `form = true` and a planted chip",
+                fixture.name
+            );
+        }
+        if let Some(expected) = fixture.resolved_agent_type.as_deref() {
+            assert!(
+                fixture.form
+                    && form_choices
+                        .agent_types
+                        .iter()
+                        .any(|agent_type| agent_type.id == expected),
+                "{}: `resolved_agent_type = {expected:?}` needs `form = true` and a planted entry",
+                fixture.name
+            );
+        }
         assert!(
             Screen::parse(&fixture.screen).is_some(),
             "{}: fixture names unknown screen `{}`",
@@ -414,6 +481,7 @@ async fn voice_phrase_fixtures_match_the_default_backend() {
             &agents
         };
         let fixture_directories = fixture.listing.then_some(&directories);
+        let fixture_new_agent = fixture.form.then_some(&new_agent_form);
         let resolved = tokio::time::timeout(
             REMOTE_TIMEOUT + PER_FIXTURE_GRACE,
             handle_utterance(
@@ -423,6 +491,7 @@ async fn voice_phrase_fixtures_match_the_default_backend() {
                 fixture_agents,
                 &decks,
                 fixture_directories,
+                fixture_new_agent,
                 transcript,
             ),
         )
@@ -448,6 +517,18 @@ async fn voice_phrase_fixtures_match_the_default_backend() {
                     Some(expected) => resolved_dir(&answer.outcome) == Some(expected),
                     None => true,
                 };
+                let mode_matches = match fixture.resolved_mode.as_deref() {
+                    Some(expected) => {
+                        resolved_of(&answer.outcome, ParamKind::ModeRef) == Some(expected)
+                    }
+                    None => true,
+                };
+                let agent_type_matches = match fixture.resolved_agent_type.as_deref() {
+                    Some(expected) => {
+                        resolved_of(&answer.outcome, ParamKind::AgentTypeRef) == Some(expected)
+                    }
+                    None => true,
+                };
                 let prefix_matches = match fixture.dictate_prefix.as_deref() {
                     Some(expected) => marked_prefix(&answer.outcome)
                         .is_some_and(|marked| normalise(marked) == normalise(expected)),
@@ -458,24 +539,32 @@ async fn voice_phrase_fixtures_match_the_default_backend() {
                     && agent_matches
                     && deck_matches
                     && dir_matches
+                    && mode_matches
+                    && agent_type_matches
                     && prefix_matches
                 {
                     Ok(())
                 } else {
                     Err(format!(
                         "expected action={} outcome={} resolved_agent={:?} resolved_deck={:?} \
-                         resolved_dir={:?} dictate_prefix={:?}, got action={:?} \
+                         resolved_dir={:?} resolved_mode={:?} resolved_agent_type={:?} \
+                         dictate_prefix={:?}, got action={:?} \
                          outcome={actual_outcome} resolved_agent={actual_agent:?} \
-                         resolved_deck={:?} resolved_dir={:?} dictate_prefix={:?}",
+                         resolved_deck={:?} resolved_dir={:?} resolved_mode={:?} \
+                         resolved_agent_type={:?} dictate_prefix={:?}",
                         fixture.action,
                         fixture.outcome,
                         fixture.resolved_agent,
                         fixture.resolved_deck,
                         fixture.resolved_dir,
+                        fixture.resolved_mode,
+                        fixture.resolved_agent_type,
                         fixture.dictate_prefix,
                         actual_action,
                         resolved_deck(&answer.outcome),
                         resolved_dir(&answer.outcome),
+                        resolved_of(&answer.outcome, ParamKind::ModeRef),
+                        resolved_of(&answer.outcome, ParamKind::AgentTypeRef),
                         marked_prefix(&answer.outcome),
                     ))
                 }

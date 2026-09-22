@@ -16,8 +16,8 @@
 use serde::Serialize;
 use serde_json::{Value, json};
 
-use super::VoiceDirectories;
 use super::table::{CommandTable, NO_MATCH_ACTION, ParamKind, Screen};
+use super::{VoiceDirectories, VoiceNewAgent};
 
 /// The one tool the model is given.
 pub const TOOL_NAME: &str = "run_deck_action";
@@ -121,7 +121,10 @@ pub const TOOL_INSTRUCTIONS: &str = "Pick the deck action the user asked for. Pi
     `optional` is left out when the user named nothing for it. `directories`, \
     when present, is the New agent dialog's directory browser: `entries` are the \
     directories on screen, and a `dir_ref` param names one of THOSE, answered with \
-    the words the user used for it. Write no prose; \
+    the words the user used for it. `new_agent_form`, when present, is the New \
+    agent dialog's form: `modes` are the Mode chips it offers and `agent_types` \
+    the entries of its Agent picker, and a `mode_ref` or `agent_type_ref` param \
+    names one of THOSE, answered with the words the user used for it. Write no prose; \
     the app writes what the user reads.";
 
 /// One row as the model sees it, with its availability on the screen the
@@ -154,15 +157,17 @@ pub struct AnnotatedParam {
 /// The full table annotated for one screen with nothing else declared — every
 /// row, in table order. A `requires`-gated row is `callable: false` here.
 pub fn annotate(table: &CommandTable, screen: Screen) -> Vec<AnnotatedCommand> {
-    annotate_with(table, screen, None)
+    annotate_with(table, screen, None, None)
 }
 
 /// The full table annotated for one screen and what the webview declared with
-/// it (PRD #1223's directory browser), every row in table order.
+/// it (PRD #1223's directory browser and New agent form), every row in table
+/// order.
 pub fn annotate_with(
     table: &CommandTable,
     screen: Screen,
     directories: Option<&VoiceDirectories>,
+    new_agent: Option<&VoiceNewAgent>,
 ) -> Vec<AnnotatedCommand> {
     table
         .rows()
@@ -170,7 +175,7 @@ pub fn annotate_with(
         .map(|row| AnnotatedCommand {
             id: row.id.clone(),
             description: row.description.clone(),
-            callable: row.callable(screen, directories),
+            callable: row.callable(screen, directories, new_agent),
             unavailable_hint: row.unavailable_hint.clone(),
             params: row
                 .params
@@ -260,6 +265,9 @@ mod tests {
                 "open_dir".to_string(),
                 "go_to_parent".to_string(),
                 "use_this_directory".to_string(),
+                "choose_mode".to_string(),
+                "choose_agent_type".to_string(),
+                "name_new_agent".to_string(),
                 "none".to_string(),
             ]
         );
@@ -320,6 +328,9 @@ mod tests {
                 "open_dir",
                 "go_to_parent",
                 "use_this_directory",
+                "choose_mode",
+                "choose_agent_type",
+                "name_new_agent",
                 "none"
             ]
         );
@@ -363,7 +374,7 @@ mod tests {
     #[test]
     fn voice_schema_directory_rows_are_callable_only_with_a_listing_declared() {
         let flags = |screen: Screen, directories: Option<&VoiceDirectories>| {
-            annotate_with(table(), screen, directories)
+            annotate_with(table(), screen, directories, None)
                 .into_iter()
                 .filter(|command| {
                     ["open_dir", "go_to_parent", "use_this_directory"]
@@ -401,7 +412,7 @@ mod tests {
         // And the declaration changes NOTHING else: every other row's flag is
         // the undeclared one.
         let others = |directories: Option<&VoiceDirectories>| {
-            annotate_with(table(), Screen::Overview, directories)
+            annotate_with(table(), Screen::Overview, directories, None)
                 .into_iter()
                 .filter(|command| {
                     !["open_dir", "go_to_parent", "use_this_directory"]
@@ -435,6 +446,9 @@ mod tests {
             )
         );
         assert!(TOOL_INSTRUCTIONS.contains("a `dir_ref` param names one of THOSE"));
+        assert!(
+            TOOL_INSTRUCTIONS.contains("a `mode_ref` or `agent_type_ref` param names one of THOSE")
+        );
     }
 
     #[test]
@@ -473,6 +487,10 @@ mod tests {
                 ("open_dir".to_string(), false),
                 ("go_to_parent".to_string(), false),
                 ("use_this_directory".to_string(), false),
+                // `requires` a live New agent form, and none is declared here.
+                ("choose_mode".to_string(), false),
+                ("choose_agent_type".to_string(), false),
+                ("name_new_agent".to_string(), false),
             ]
         );
         assert_eq!(
@@ -496,6 +514,10 @@ mod tests {
                 ("open_dir".to_string(), false),
                 ("go_to_parent".to_string(), false),
                 ("use_this_directory".to_string(), false),
+                // `requires` a live New agent form, and none is declared here.
+                ("choose_mode".to_string(), false),
+                ("choose_agent_type".to_string(), false),
+                ("name_new_agent".to_string(), false),
             ]
         );
         assert_eq!(
@@ -515,6 +537,10 @@ mod tests {
                 ("open_dir".to_string(), false),
                 ("go_to_parent".to_string(), false),
                 ("use_this_directory".to_string(), false),
+                // `requires` a live New agent form, and none is declared here.
+                ("choose_mode".to_string(), false),
+                ("choose_agent_type".to_string(), false),
+                ("name_new_agent".to_string(), false),
             ]
         );
     }

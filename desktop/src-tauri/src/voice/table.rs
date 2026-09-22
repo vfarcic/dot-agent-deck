@@ -10,7 +10,7 @@ use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
 
-use super::VoiceDirectories;
+use super::{VoiceDirectories, VoiceNewAgent};
 
 /// The table's source, compiled in.
 pub const TABLE_SOURCE: &str = include_str!("commands.toml");
@@ -85,6 +85,12 @@ impl fmt::Display for Screen {
 /// (PRD #1223, [`super::VoiceDirectories`]). It never searches — "open dir
 /// billing" means the child called billing in the level on screen, and a
 /// directory anywhere else on the deck is out of its reach by construction.
+/// [`ParamKind::ModeRef`] and [`ParamKind::AgentTypeRef`] are the same shape
+/// once more, against the New agent form's two closed sets as they are ON
+/// SCREEN ([`super::VoiceNewAgentForm`]): the Mode chips the dialog offers and
+/// the Agent picker's entries. Two kinds rather than one "choice" kind with the
+/// param name picking the set, because the kind is what selects a resolver, and
+/// a refusal has to say which of the two had no match.
 /// [`ParamKind::SpokenPrefix`] resolves against **the transcript
 /// itself**, and nothing else — it is the words that introduced a dictation,
 /// and what it resolves *to* is the rest of what the user said, taken verbatim
@@ -105,14 +111,18 @@ pub enum ParamKind {
     AgentRef,
     DeckRef,
     DirRef,
+    ModeRef,
+    AgentTypeRef,
     SpokenPrefix,
 }
 
 impl ParamKind {
-    pub const ALL: [ParamKind; 4] = [
+    pub const ALL: [ParamKind; 6] = [
         ParamKind::AgentRef,
         ParamKind::DeckRef,
         ParamKind::DirRef,
+        ParamKind::ModeRef,
+        ParamKind::AgentTypeRef,
         ParamKind::SpokenPrefix,
     ];
 
@@ -121,6 +131,8 @@ impl ParamKind {
             ParamKind::AgentRef => "agent_ref",
             ParamKind::DeckRef => "deck_ref",
             ParamKind::DirRef => "dir_ref",
+            ParamKind::ModeRef => "mode_ref",
+            ParamKind::AgentTypeRef => "agent_type_ref",
             ParamKind::SpokenPrefix => "spoken_prefix",
         }
     }
@@ -163,15 +175,24 @@ pub enum Requirement {
     /// That listing has a parent — `..` is on screen. Implies
     /// [`Requirement::DirectoryListing`].
     ParentDirectory,
+    /// The New agent form's fields are live: the dialog is open with a deck
+    /// and a directory chosen, no start in flight, and no start confirmation
+    /// showing — the state in which a click on a chip or the picker would take.
+    NewAgentForm,
 }
 
 impl Requirement {
-    pub const ALL: [Requirement; 2] = [Requirement::DirectoryListing, Requirement::ParentDirectory];
+    pub const ALL: [Requirement; 3] = [
+        Requirement::DirectoryListing,
+        Requirement::ParentDirectory,
+        Requirement::NewAgentForm,
+    ];
 
     pub fn as_str(self) -> &'static str {
         match self {
             Requirement::DirectoryListing => "directory_listing",
             Requirement::ParentDirectory => "parent_directory",
+            Requirement::NewAgentForm => "new_agent_form",
         }
     }
 
@@ -180,10 +201,15 @@ impl Requirement {
     }
 
     /// Whether what the webview declared meets this requirement.
-    pub fn met_by(self, directories: Option<&VoiceDirectories>) -> bool {
+    pub fn met_by(
+        self,
+        directories: Option<&VoiceDirectories>,
+        new_agent: Option<&VoiceNewAgent>,
+    ) -> bool {
         match self {
             Requirement::DirectoryListing => directories.is_some(),
             Requirement::ParentDirectory => directories.is_some_and(|listing| listing.has_parent),
+            Requirement::NewAgentForm => new_agent.is_some_and(|dialog| dialog.form.is_some()),
         }
     }
 }
@@ -262,16 +288,22 @@ impl CommandRow {
         self.screens.is_empty() || self.screens.contains(&screen)
     }
 
-    /// Whether this row can run on `screen` with `directories` declared: the
-    /// screen rule AND every [`CommandRow::requires`] entry. One refusal for
-    /// both halves — the row's `unavailable_hint` — because from where the user
-    /// stands both are "not here".
-    pub fn callable(&self, screen: Screen, directories: Option<&VoiceDirectories>) -> bool {
+    /// Whether this row can run on `screen` with `directories` and
+    /// `new_agent` declared: the screen rule AND every
+    /// [`CommandRow::requires`] entry. One refusal for both halves — the row's
+    /// `unavailable_hint` — because from where the user stands both are "not
+    /// here".
+    pub fn callable(
+        &self,
+        screen: Screen,
+        directories: Option<&VoiceDirectories>,
+        new_agent: Option<&VoiceNewAgent>,
+    ) -> bool {
         self.callable_on(screen)
             && self
                 .requires
                 .iter()
-                .all(|requirement| requirement.met_by(directories))
+                .all(|requirement| requirement.met_by(directories, new_agent))
     }
 }
 
@@ -676,6 +708,11 @@ mod tests {
                 ("open_dir", "openDirectory", vec!["overview"]),
                 ("go_to_parent", "goToParentDirectory", vec!["overview"]),
                 ("use_this_directory", "useThisDirectory", vec!["overview"]),
+                // The rest of the New agent form — `overview`, plus
+                // `requires = ["new_agent_form"]` (PRD #1223).
+                ("choose_mode", "chooseNewAgentMode", vec!["overview"]),
+                ("choose_agent_type", "chooseNewAgentType", vec!["overview"]),
+                ("name_new_agent", "nameNewAgent", vec!["overview"]),
             ]
         );
     }
@@ -869,7 +906,9 @@ mod tests {
         );
         let message = error.to_string();
         assert!(
-            message.contains("`agent_ref`, `deck_ref`, `dir_ref`, `spoken_prefix`"),
+            message.contains(
+                "`agent_ref`, `deck_ref`, `dir_ref`, `mode_ref`, `agent_type_ref`, `spoken_prefix`"
+            ),
             "{message}"
         );
     }
@@ -1141,7 +1180,7 @@ mod tests {
             table
                 .rows()
                 .iter()
-                .filter(|row| row.callable(screen, None))
+                .filter(|row| row.callable(screen, None, None))
                 .map(|row| row.id.as_str())
                 .collect::<Vec<_>>()
         };
@@ -1198,6 +1237,11 @@ mod tests {
         }
         assert_eq!(ParamKind::parse("deck_ref"), Some(ParamKind::DeckRef));
         assert_eq!(ParamKind::parse("dir_ref"), Some(ParamKind::DirRef));
+        assert_eq!(ParamKind::parse("mode_ref"), Some(ParamKind::ModeRef));
+        assert_eq!(
+            ParamKind::parse("agent_type_ref"),
+            Some(ParamKind::AgentTypeRef)
+        );
         assert_eq!(ParamKind::parse("agentRef"), None);
         assert_eq!(ParamKind::parse("deckRef"), None);
         assert_eq!(ParamKind::parse("dirRef"), None);
@@ -1215,6 +1259,10 @@ mod tests {
         assert_eq!(
             Requirement::parse("parent_directory"),
             Some(Requirement::ParentDirectory)
+        );
+        assert_eq!(
+            Requirement::parse("new_agent_form"),
+            Some(Requirement::NewAgentForm)
         );
         assert_eq!(Requirement::parse("dialog_open"), None);
     }
@@ -1267,16 +1315,129 @@ mod tests {
         assert!(confirm.params.is_empty());
         assert_eq!(confirm.report, "Using this directory.");
 
-        // And they are the only rows that require anything.
-        let gated: Vec<&str> = table
+        // The directory rows require the browser, and nothing else in the
+        // table does.
+        let needs_browser: Vec<&str> = table
             .rows()
             .iter()
-            .filter(|row| !row.requires.is_empty())
+            .filter(|row| {
+                row.requires.iter().any(|requirement| {
+                    matches!(
+                        requirement,
+                        Requirement::DirectoryListing | Requirement::ParentDirectory
+                    )
+                })
+            })
             .map(|row| row.id.as_str())
             .collect();
         assert_eq!(
-            gated,
+            needs_browser,
             vec!["open_dir", "go_to_parent", "use_this_directory"]
+        );
+    }
+
+    fn form() -> VoiceNewAgent {
+        VoiceNewAgent {
+            form: Some(super::super::VoiceNewAgentForm {
+                deck_id: "deck-local".to_string(),
+                path: "/home/dev/code".to_string(),
+                modes: Vec::new(),
+                agent_types: Vec::new(),
+            }),
+        }
+    }
+
+    /// PRD #1223: the three fill rows pinned by value. Command has no row —
+    /// `voice_table_no_row_fills_the_command` says so as a property.
+    #[test]
+    fn voice_table_form_rows_are_pinned_by_value() {
+        let table = super::table();
+        let pinned = |id: &str, invoke: &str, param: &str, kind: ParamKind, report: &str| {
+            let row = table
+                .row(id)
+                .unwrap_or_else(|| panic!("{id} is in the table"));
+            assert_eq!(row.invoke, invoke, "{id}");
+            assert_eq!(row.screens, vec![Screen::Overview], "{id}");
+            assert_eq!(row.requires, vec![Requirement::NewAgentForm], "{id}");
+            assert_eq!(
+                row.params,
+                vec![ParamSpec {
+                    name: param.to_string(),
+                    kind,
+                    optional: false,
+                }],
+                "{id}"
+            );
+            assert_eq!(row.report, report, "{id}");
+        };
+        pinned(
+            "choose_mode",
+            "chooseNewAgentMode",
+            "mode",
+            ParamKind::ModeRef,
+            "Mode: {mode}.",
+        );
+        pinned(
+            "choose_agent_type",
+            "chooseNewAgentType",
+            "agent_type",
+            ParamKind::AgentTypeRef,
+            "Agent: {agent_type}.",
+        );
+        pinned(
+            "name_new_agent",
+            "nameNewAgent",
+            "prefix",
+            ParamKind::SpokenPrefix,
+            "Name set.",
+        );
+    }
+
+    /// The form rows run only while the form is live, and only on the
+    /// overview: a closed dialog, a dialog with no form, and another screen
+    /// each refuse.
+    #[test]
+    fn voice_table_form_rows_are_gated_by_the_declared_form() {
+        let table = super::table();
+        let live = form();
+        let no_form = VoiceNewAgent { form: None };
+        for id in ["choose_mode", "choose_agent_type", "name_new_agent"] {
+            let row = table.row(id).expect("present");
+            assert!(!row.callable(Screen::Overview, None, None), "{id}");
+            assert!(
+                !row.callable(Screen::Overview, None, Some(&no_form)),
+                "{id}"
+            );
+            assert!(row.callable(Screen::Overview, None, Some(&live)), "{id}");
+            assert!(!row.callable(Screen::Deck, None, Some(&live)), "{id}");
+            assert!(!row.callable(Screen::Agent, None, Some(&live)), "{id}");
+        }
+    }
+
+    /// The Command decision, as a property: no row's description offers to
+    /// fill the command line, and every fill row says so. It is the one field
+    /// that executes, so it stays typed by hand (see `commands.toml`).
+    #[test]
+    fn voice_table_no_row_fills_the_command() {
+        let table = super::table();
+        for id in ["choose_mode", "name_new_agent"] {
+            let row = table.row(id).expect("present");
+            assert!(
+                row.description.contains("typed by hand"),
+                "{id} must keep the command line out of reach: {}",
+                row.description
+            );
+        }
+        let form_rows: Vec<&str> = table
+            .rows()
+            .iter()
+            .filter(|row| row.requires.contains(&Requirement::NewAgentForm))
+            .map(|row| row.id.as_str())
+            .collect();
+        assert_eq!(
+            form_rows,
+            vec!["choose_mode", "choose_agent_type", "name_new_agent"],
+            "a new form row is a decision about the Command field too — see commands.toml"
         );
     }
 
@@ -1288,26 +1449,29 @@ mod tests {
         let row = |id: &str| table.row(id).expect("present");
         for id in ["open_dir", "use_this_directory"] {
             assert!(
-                !row(id).callable(Screen::Overview, None),
+                !row(id).callable(Screen::Overview, None, None),
                 "{id}: dialog closed"
             );
             assert!(
-                row(id).callable(Screen::Overview, Some(&with_parent)),
+                row(id).callable(Screen::Overview, Some(&with_parent), None),
                 "{id}"
             );
-            assert!(row(id).callable(Screen::Overview, Some(&at_root)), "{id}");
             assert!(
-                !row(id).callable(Screen::Deck, Some(&with_parent)),
+                row(id).callable(Screen::Overview, Some(&at_root), None),
+                "{id}"
+            );
+            assert!(
+                !row(id).callable(Screen::Deck, Some(&with_parent), None),
                 "{id}: off the overview"
             );
         }
-        assert!(!row("go_to_parent").callable(Screen::Overview, None));
-        assert!(row("go_to_parent").callable(Screen::Overview, Some(&with_parent)));
+        assert!(!row("go_to_parent").callable(Screen::Overview, None, None));
+        assert!(row("go_to_parent").callable(Screen::Overview, Some(&with_parent), None));
         assert!(
-            !row("go_to_parent").callable(Screen::Overview, Some(&at_root)),
+            !row("go_to_parent").callable(Screen::Overview, Some(&at_root), None),
             "a root has no `..` to go to"
         );
-        assert!(!row("go_to_parent").callable(Screen::Agent, Some(&with_parent)));
+        assert!(!row("go_to_parent").callable(Screen::Agent, Some(&with_parent), None));
     }
 
     #[test]
@@ -1315,7 +1479,7 @@ mod tests {
         let parsed = CommandTable::parse(&one_row()).expect("parses");
         let row = &parsed.rows()[0];
         assert!(row.requires.is_empty());
-        assert!(row.callable(Screen::Deck, None));
+        assert!(row.callable(Screen::Deck, None, None));
     }
 
     #[test]

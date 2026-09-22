@@ -6,6 +6,7 @@ import {
   type DesktopSettingsDto,
   type VoiceCommandDto,
   type VoiceDirectoriesDto,
+  type VoiceNewAgentDto,
   type VoiceResolvedParamDto,
   type VoiceResultDto,
   type VoiceStatusDto,
@@ -21,7 +22,7 @@ vi.mock("./TerminalViewport", () => ({
 }));
 
 import { DeckShell } from "../App";
-import { DIRECTORY_MOVED_ON, NO_DIRECTORY_BROWSER, NO_PARENT_DIRECTORY, STARTING_CLOSE_BLOCKED } from "./NewAgentDialog";
+import { DIRECTORY_MOVED_ON, FORM_MOVED_ON, MODE_NOT_OFFERED, NO_DIRECTORY_BROWSER, NO_NEW_AGENT_FORM, NO_PARENT_DIRECTORY, spokenName, STARTING_CLOSE_BLOCKED } from "./NewAgentDialog";
 import {
   NOTHING_DISPATCHED,
   VOICE_DICTATION_SEND_MS,
@@ -330,7 +331,7 @@ describe("what can I say?", () => {
     await completeUtterance();
 
     // No directory browser is declared off the New agent dialog (PRD #1223).
-    expect(voiceCommands).toHaveBeenCalledWith("deck", undefined);
+    expect(voiceCommands).toHaveBeenCalledWith("deck", undefined, undefined);
     const overlay = screen.getByTestId("voice-help");
     expect(overlay).toHaveTextContent("Show every agent in one list.");
     const here = overlay.querySelector('[data-where="here"]');
@@ -354,7 +355,7 @@ describe("what can I say?", () => {
     await turnVoiceOn();
     await completeUtterance();
 
-    expect(voiceCommands).toHaveBeenCalledWith("overview", undefined);
+    expect(voiceCommands).toHaveBeenCalledWith("overview", undefined, undefined);
   });
 
   /**
@@ -1373,5 +1374,342 @@ describe("the New agent directory browser, by voice (PRD #1223)", () => {
 
     expect(declarations).toEqual([undefined]);
     expect(screen.getByTestId("voice-report")).toHaveTextContent(NOTHING_DISPATCHED);
+  });
+});
+
+describe("the rest of the New agent form, by voice (PRD #1223)", () => {
+  beforeEach(() => {
+    window.localStorage.clear();
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  const HOME = {
+    kind: "listing" as const,
+    path: "/home/dev",
+    displayPath: "/home/dev",
+    parent: "/home",
+    entries: [{ path: "/home/dev/billing", displayName: "billing", isProject: true }],
+    truncated: false,
+  };
+  const BILLING = { ...HOME, path: "/home/dev/billing", displayPath: "/home/dev/billing", parent: "/home/dev", entries: [] };
+  const AGENTS = [
+    { id: "claude", displayName: "Claude Code", defaultCommand: "claude --model haiku" },
+    { id: "opencode", displayName: "OpenCode", defaultCommand: "opencode" },
+  ];
+
+  /**
+   * A resolver that does what Rust does with the form declaration: a fill row
+   * is `unavailable` with no live form declared, and a spoken mode or agent
+   * type resolves against the chips and entries AS DECLARED — so a chip the
+   * form does not offer is `param_unresolved`. `forced` dispatches regardless,
+   * for a form that moves after Rust judged the utterance.
+   */
+  function formVoice(declared: () => VoiceNewAgentDto | undefined, options: { forced?: boolean; during?: () => Promise<void> } = {}): ResolveVoice {
+    return vi.fn(async (utterance: string) => {
+      const form = declared()?.form;
+      await options.during?.();
+      const unavailable = (action: string, hint: string): VoiceResultDto => ({ resolveMs: 21, backend: "stub", outcome: { kind: "unavailable", transcript: utterance, action, hint, sentence: `Not here — ${hint}.` } });
+      const unresolved = (action: string, param: string, spoken: string, sentence: string): VoiceResultDto => ({ resolveMs: 21, backend: "stub", outcome: { kind: "param_unresolved", transcript: utterance, action, param, spoken, sentence } });
+      if (utterance.startsWith("mode ")) {
+        const spoken = utterance.slice("mode ".length);
+        if (!form && !options.forced) return unavailable("choose_mode", "choosing a mode works while the New agent form has a deck and a directory chosen");
+        const chip = form?.modes.find((candidate) => candidate.label.toLowerCase() === spoken) ?? (options.forced ? { id: spoken, label: spoken } : undefined);
+        if (!chip) return unresolved("choose_mode", "mode", spoken, `Heard: “${utterance}” — no mode the New agent form offers matches “${spoken}”.`);
+        return dispatch("choose_mode", "chooseNewAgentMode", `Mode: ${chip.label}.`, utterance, [{ name: "mode", kind: "mode_ref", spoken, value: chip.id, label: chip.label }]);
+      }
+      if (utterance.startsWith("use ")) {
+        const spoken = utterance.slice("use ".length);
+        if (!form && !options.forced) return unavailable("choose_agent_type", "choosing an agent works while the New agent form has a deck and a directory chosen");
+        const entry = form?.agentTypes.find((candidate) => candidate.id === spoken || candidate.label.toLowerCase() === spoken);
+        if (!entry) return unresolved("choose_agent_type", "agent_type", spoken, `Heard: “${utterance}” — no agent type in the New agent form's picker matches “${spoken}”.`);
+        return dispatch("choose_agent_type", "chooseNewAgentType", `Agent: ${entry.label}.`, utterance, [{ name: "agent_type", kind: "agent_type_ref", spoken, value: entry.id, label: entry.label }]);
+      }
+      if (utterance.startsWith("call it ")) {
+        if (!form && !options.forced) return unavailable("name_new_agent", "naming the new agent works while the New agent form has a deck and a directory chosen");
+        const rest = utterance.slice("call it ".length);
+        return dispatch("name_new_agent", "nameNewAgent", "Name set.", utterance, [{ name: "prefix", kind: "spoken_prefix", spoken: "call it", value: rest, label: rest }]);
+      }
+      /* No row fills Command: the model's escape, which renders "no matching action". */
+      return { resolveMs: 21, backend: "stub", outcome: { kind: "no_match", transcript: utterance, sentence: `Heard: “${utterance}” — no matching action.` } };
+    });
+  }
+
+  /** A deck whose options, listing and orchestrations the flow can load, recording each declaration. */
+  function formDeck(voice: VoiceControls, options: { forced?: boolean; during?: () => Promise<void>; experimental?: boolean } = {}) {
+    const declarations: (VoiceNewAgentDto | undefined)[] = [];
+    const declareVoiceScreen = vi.fn((_screen: string, _directories?: VoiceDirectoriesDto, newAgent?: VoiceNewAgentDto) => { declarations.push(newAgent); });
+    const deck = runtime(formVoice(() => declarations.at(-1), options), voice, {
+      declareVoiceScreen,
+      runAction: vi.fn(async () => ({ ok: true }) as DeckActionResult),
+      listDirectories: vi.fn(async (_deckId: string, path?: string) => (path === "/home/dev/billing" ? BILLING : HOME)),
+      newAgentOptions: vi.fn(async () => ({ kind: "deck" as const, defaultCommand: "bash", agents: AGENTS, experimental: options.experimental ?? false, authoringKinds: ["schedule", "schedule-issues", "dispatcher"] })),
+      newAgentOrchestrations: vi.fn(async (_deckId: string, path: string) => ({
+        kind: "project" as const,
+        path,
+        displayPath: path,
+        displayName: "billing",
+        orchestrations: [{ name: "review", displayName: "review", default: true, roles: [{ name: "lead", displayName: "lead", start: true }, { name: "critic", displayName: "critic", start: false }] }],
+      })),
+    } as Partial<DeckRuntimeState>);
+    return { deck, declarations };
+  }
+
+  /** Open the dialog and choose `billing`, a project, so the form is live with its orchestration chip. */
+  async function openForm() {
+    fireEvent.click(screen.getByTestId("overview-new-agent"));
+    await flush();
+    await flush();
+    fireEvent.click(screen.getByTestId("new-agent-directory-list").querySelector("[data-path='/home/dev/billing']")!);
+    await flush();
+    fireEvent.click(screen.getByTestId("new-agent-use-directory"));
+    await flush();
+    await flush();
+    expect(screen.getByTestId("new-agent-name")).toBeEnabled();
+  }
+
+  const pressedMode = () => screen.getByTestId("new-agent-modes").querySelector("[aria-pressed='true']")?.getAttribute("data-mode");
+
+  /**
+   * Scenario: with the form live, say "mode dispatcher". The declaration
+   * carries the chips as offered, and the Dispatcher chip is pressed exactly as
+   * a click presses it; nothing is started.
+   */
+  it("chooses a Mode chip the form offers", async () => {
+    const voice = microphone([]);
+    const { deck, declarations } = formDeck(voice);
+    render(<DeckShell runtime={deck} initialView={{ kind: "overview" }} />);
+    await turnVoiceOn();
+    await openForm();
+
+    voice.deliver("mode dispatcher");
+    await completeUtterance();
+
+    expect(declarations.at(-1)?.form?.modes.map((mode) => mode.label)).toEqual(["No mode", "Orch: review", "schedule", "dispatcher"]);
+    expect(pressedMode()).toBe("dispatcher");
+    expect(screen.getByTestId("voice-report")).toHaveTextContent("Mode: dispatcher.");
+    expect(deck.runAction).not.toHaveBeenCalled();
+  });
+
+  /**
+   * Scenario: say "mode orch: review". The orchestration chip is chosen, and —
+   * as a click does — Command is hidden and the Name follows the TUI's
+   * orchestration suggestion.
+   */
+  it("chooses an orchestration chip, with the click's own side effects", async () => {
+    const voice = microphone([]);
+    const { deck } = formDeck(voice);
+    render(<DeckShell runtime={deck} initialView={{ kind: "overview" }} />);
+    await turnVoiceOn();
+    await openForm();
+
+    voice.deliver("mode orch: review");
+    await completeUtterance();
+
+    expect(pressedMode()).toBe("orch:review");
+    expect(screen.queryByTestId("new-agent-command")).toBeNull();
+    expect(screen.getByTestId("new-agent-name")).toHaveValue("billing-orchestrator-1");
+  });
+
+  /**
+   * Scenario: on a deck whose experimental flag is off, `schedule: issues` is
+   * not a chip at all. It is absent from the declaration, so "mode schedule:
+   * issues" is refused as not offered and the Mode is left alone.
+   */
+  it("refuses a chip the form does not offer", async () => {
+    const voice = microphone([]);
+    const { deck, declarations } = formDeck(voice, { experimental: false });
+    render(<DeckShell runtime={deck} initialView={{ kind: "overview" }} />);
+    await turnVoiceOn();
+    await openForm();
+
+    voice.deliver("mode schedule: issues");
+    await completeUtterance();
+
+    expect(declarations.at(-1)?.form?.modes.some((mode) => mode.id === "schedule-issues")).toBe(false);
+    expect(screen.getByTestId("voice-report")).toHaveTextContent("no mode the New agent form offers matches “schedule: issues”");
+    expect(pressedMode()).toBe("none");
+  });
+
+  /** Scenario: with the flag ON, the same chip IS declared, and choosing it works. */
+  it("offers schedule: issues when the deck's flag is on", async () => {
+    const voice = microphone([]);
+    const { deck } = formDeck(voice, { experimental: true });
+    render(<DeckShell runtime={deck} initialView={{ kind: "overview" }} />);
+    await turnVoiceOn();
+    await openForm();
+
+    voice.deliver("mode schedule: issues");
+    await completeUtterance();
+
+    expect(pressedMode()).toBe("schedule-issues");
+  });
+
+  /**
+   * Scenario: a mode dispatch that arrives for a chip the dialog no longer
+   * shows is refused in the dialog's words, not applied.
+   */
+  it("refuses a forced chip the dialog does not show", async () => {
+    const voice = microphone([]);
+    const { deck } = formDeck(voice, { forced: true });
+    render(<DeckShell runtime={deck} initialView={{ kind: "overview" }} />);
+    await turnVoiceOn();
+    await openForm();
+
+    voice.deliver("mode workspace");
+    await completeUtterance();
+
+    expect(screen.getByTestId("voice-report")).toHaveTextContent(MODE_NOT_OFFERED);
+    expect(pressedMode()).toBe("none");
+  });
+
+  /**
+   * Scenario: say "use claude". The picker moves to Claude Code and Command is
+   * overwritten with its default command — the picker's own behaviour. The
+   * declaration lists `auto` first, then the deck's registry.
+   */
+  it("chooses an agent type, which fills Command the way the picker does", async () => {
+    const voice = microphone([]);
+    const { deck, declarations } = formDeck(voice);
+    render(<DeckShell runtime={deck} initialView={{ kind: "overview" }} />);
+    await turnVoiceOn();
+    await openForm();
+    expect(screen.getByTestId("new-agent-command")).toHaveValue("bash");
+
+    voice.deliver("use claude");
+    await completeUtterance();
+
+    expect(declarations.at(-1)?.form?.agentTypes).toEqual([{ id: "auto", label: "auto" }, { id: "claude", label: "Claude Code" }, { id: "opencode", label: "OpenCode" }]);
+    expect(screen.getByTestId("new-agent-agent")).toHaveValue("claude");
+    expect(screen.getByTestId("new-agent-command")).toHaveValue("claude --model haiku");
+    expect(screen.getByTestId("voice-report")).toHaveTextContent("Agent: Claude Code.");
+  });
+
+  /** Scenario: an agent the deck's picker does not list is refused, and the picker is left alone. */
+  it("refuses an agent type the picker does not list", async () => {
+    const voice = microphone([]);
+    const { deck } = formDeck(voice);
+    render(<DeckShell runtime={deck} initialView={{ kind: "overview" }} />);
+    await turnVoiceOn();
+    await openForm();
+
+    voice.deliver("use codex");
+    await completeUtterance();
+
+    expect(screen.getByTestId("voice-report")).toHaveTextContent("no agent type in the New agent form's picker matches “codex”");
+    expect(screen.getByTestId("new-agent-agent")).toHaveValue("auto");
+  });
+
+  /**
+   * Scenario: say "call it billing worker." The Name field takes the words
+   * after the boundary with the transcriber's full stop trimmed, and counts as
+   * an edit — a later orchestration chip no longer replaces it.
+   */
+  it("names the agent from the words after the boundary", async () => {
+    const voice = microphone([]);
+    const { deck } = formDeck(voice);
+    render(<DeckShell runtime={deck} initialView={{ kind: "overview" }} />);
+    await turnVoiceOn();
+    await openForm();
+
+    voice.deliver("call it billing worker.");
+    await completeUtterance();
+    expect(screen.getByTestId("new-agent-name")).toHaveValue("billing worker");
+    expect(screen.getByTestId("voice-report")).toHaveTextContent("Name set.");
+
+    fireEvent.click(screen.getByTestId("new-agent-mode-orch:review"));
+    await flush();
+    expect(screen.getByTestId("new-agent-name")).toHaveValue("billing worker");
+  });
+
+  it("trims only the sentence punctuation around a spoken name", () => {
+    expect(spokenName(" billing worker. ")).toBe("billing worker");
+    expect(spokenName("api-v2!?")).toBe("api-v2");
+    expect(spokenName("docs.site")).toBe("docs.site");
+    expect(spokenName(" . ")).toBe("");
+    expect(spokenName(undefined)).toBe("");
+  });
+
+  /**
+   * Scenario: Command has no voice row. Saying something about the command
+   * reaches no fill member, and the Command field keeps what it had.
+   */
+  it("leaves Command manual", async () => {
+    const voice = microphone([]);
+    const { deck } = formDeck(voice);
+    render(<DeckShell runtime={deck} initialView={{ kind: "overview" }} />);
+    await turnVoiceOn();
+    await openForm();
+
+    voice.deliver("set the command to rm -rf");
+    await completeUtterance();
+
+    expect(screen.getByTestId("voice-report")).toHaveTextContent("no matching action");
+    expect(screen.getByTestId("new-agent-command")).toHaveValue("bash");
+  });
+
+  /**
+   * Scenario: before a directory is chosen the form is not live, so no form is
+   * declared and each fill row is refused with its hint.
+   */
+  it("declares no form until a directory is chosen, so each fill row is refused", async () => {
+    const voice = microphone([]);
+    const { deck, declarations } = formDeck(voice);
+    render(<DeckShell runtime={deck} initialView={{ kind: "overview" }} />);
+    await turnVoiceOn();
+    fireEvent.click(screen.getByTestId("overview-new-agent"));
+    await flush();
+    await flush();
+
+    voice.deliver("mode dispatcher");
+    await completeUtterance();
+
+    expect(declarations.at(-1)).toEqual({ form: undefined });
+    expect(screen.getByTestId("voice-report")).toHaveTextContent("Not here — choosing a mode works while the New agent form has a deck and a directory chosen.");
+  });
+
+  /** Scenario: with the dialog closed nothing is declared, and a forced fill finds no form. */
+  it("refuses a fill that arrives with the dialog closed", async () => {
+    const voice = microphone(["mode dispatcher"]);
+    const { deck, declarations } = formDeck(voice, { forced: true });
+    render(<DeckShell runtime={deck} initialView={{ kind: "overview" }} />);
+    await turnVoiceOn();
+    await completeUtterance();
+
+    expect(declarations).toEqual([undefined]);
+    expect(screen.getByTestId("voice-report")).toHaveTextContent(NO_NEW_AGENT_FORM);
+  });
+
+  /**
+   * Scenario: the user chooses a different directory while "mode dispatcher"
+   * is being resolved. The answer was about the form they left, so the Mode is
+   * not changed and the report says why.
+   */
+  it("refuses a fill judged against a form that has since moved on", async () => {
+    const voice = microphone([]);
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const { deck } = formDeck(voice, { during: () => gate });
+    render(<DeckShell runtime={deck} initialView={{ kind: "overview" }} />);
+    await turnVoiceOn();
+    await openForm();
+
+    voice.deliver("mode dispatcher");
+    await completeUtterance();
+    fireEvent.click(screen.getByTestId("new-agent-directory-list").querySelector("[data-path='/home/dev']")!);
+    await flush();
+    fireEvent.click(screen.getByTestId("new-agent-use-directory"));
+    await flush();
+    expect(screen.getByTestId("new-agent-dir")).toHaveTextContent("/home/dev");
+
+    release();
+    await flush();
+    await flush();
+
+    expect(screen.getByTestId("voice-report")).toHaveTextContent(FORM_MOVED_ON);
+    expect(pressedMode()).toBe("none");
   });
 });

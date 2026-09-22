@@ -131,6 +131,58 @@ pub struct VoiceDirectoryEntry {
     /// The deck's own path for it — what `open_dir` dispatches with.
     pub path: String,
 }
+
+/// What the New agent dialog is showing BESIDES its directory browser, as the
+/// webview declared it for one utterance (PRD #1223) — present exactly while the
+/// dialog is mounted.
+///
+/// Declared by the webview for [`VoiceDirectories`]' reason, and separately
+/// from it because the two are present at different times: the browser can be
+/// empty (no deck chosen, no listing, a deck that cannot list) while the dialog
+/// is open, and a spoken "start it" must be able to say THAT rather than be
+/// refused as though no dialog were there.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct VoiceNewAgent {
+    /// The form's live fields, present only while they can be changed: a deck
+    /// and a directory chosen, no start in flight, and no start confirmation
+    /// open. Absent, every fill row is `callable: false`.
+    #[serde(default)]
+    pub form: Option<VoiceNewAgentForm>,
+}
+
+/// The New agent form's closed sets, as they are ON SCREEN (PRD #1223).
+///
+/// **The chips and the picker entries are the ones the dialog actually
+/// offers**, never a list this crate knows: the Mode row varies by the deck's
+/// capabilities, the deck's experimental flag, and whether the chosen
+/// directory is a project with orchestrations; the Agent picker is the deck's
+/// own registry, or the desktop's labelled fallback for a deck that does not
+/// report one. A spoken mode or agent type resolves against these and nothing
+/// else, so a chip that is not offered is refused rather than guessed.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct VoiceNewAgentForm {
+    /// The deck the form is about — the wire `deckId` the flow captured.
+    pub deck_id: String,
+    /// The chosen directory, as the deck spelled it.
+    pub path: String,
+    /// The Mode chips offered, in the order the row shows them. A disabled
+    /// namesake orchestration chip is NOT here: it cannot be chosen by a click
+    /// either.
+    pub modes: Vec<VoiceChoice>,
+    /// The Agent picker's entries, `auto` first, as the select shows them.
+    pub agent_types: Vec<VoiceChoice>,
+}
+
+/// One entry of a closed set on screen: the id the dialog selects by, and the
+/// label it renders — which is what a user says.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct VoiceChoice {
+    pub id: String,
+    pub label: String,
+}
 pub use dictation::{DICTATION_OPENERS, SUBMIT_PHRASES};
 
 pub use capture::{
@@ -141,8 +193,8 @@ pub use capture::{
 };
 pub use hold::VoiceHold;
 pub use outcome::{
-    DeckRefMatch, DirRefMatch, ResolvedParam, VoiceOutcome, VoiceResult, handle_utterance,
-    resolve_deck_ref, resolve_dir_ref,
+    ChoiceMatch, DeckRefMatch, DirRefMatch, ResolvedParam, VoiceOutcome, VoiceResult,
+    handle_utterance, resolve_agent_type_ref, resolve_deck_ref, resolve_dir_ref, resolve_mode_ref,
 };
 pub use remote::{Protocol, REMOTE_TIMEOUT, RemoteResolver};
 pub use resolver::{

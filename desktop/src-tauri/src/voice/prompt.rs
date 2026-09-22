@@ -190,6 +190,14 @@ pub fn param_names(commands: &[AnnotatedCommand]) -> Vec<String> {
 /// hosted backend should be handed to pick a command. The resolver matches
 /// against every declared entry, not only the ones shown here.
 ///
+/// # The New agent form is LABELS, only while its fields are live (PRD #1223)
+///
+/// `new_agent_form` is present only when the dialog declared a live form, and
+/// carries the Mode chips and the Agent picker's entries as their labels — the
+/// words on the chips — so a model can tell "schedule issues" is a mode and
+/// "opencode" an agent type, and see that a chip the user named is not
+/// offered. No deck id and no path, for the directories' reason.
+///
 /// Nothing here is a transcript, an utterance or an audio buffer, so PRD #802's
 /// Open Question 5 is untouched — and this function still writes nothing
 /// anywhere. It builds a value and hands it to a backend.
@@ -216,6 +224,18 @@ pub fn state(request: &IntentRequest<'_>) -> Value {
                 .map(|entry| entry.name.clone())
                 .collect::<Vec<_>>(),
             "has_parent": directories.has_parent,
+        });
+    }
+    if let Some(form) = request.new_agent.and_then(|dialog| dialog.form.as_ref()) {
+        let labels = |choices: &[super::VoiceChoice]| {
+            choices
+                .iter()
+                .map(|choice| choice.label.clone())
+                .collect::<Vec<_>>()
+        };
+        state["new_agent_form"] = json!({
+            "modes": labels(&form.modes),
+            "agent_types": labels(&form.agent_types),
         });
     }
     state
@@ -384,6 +404,9 @@ mod tests {
                 "open_dir".to_string(),
                 "go_to_parent".to_string(),
                 "use_this_directory".to_string(),
+                "choose_mode".to_string(),
+                "choose_agent_type".to_string(),
+                "name_new_agent".to_string(),
                 "none".to_string(),
             ]
         );
@@ -402,7 +425,9 @@ mod tests {
                 "agent".to_string(),
                 "prefix".to_string(),
                 "deck".to_string(),
-                "dir".to_string()
+                "dir".to_string(),
+                "mode".to_string(),
+                "agent_type".to_string(),
             ]
         );
     }
@@ -452,6 +477,7 @@ mod tests {
             agents,
             decks: &[],
             directories: None,
+            new_agent: None,
         }
     }
 
@@ -477,9 +503,52 @@ mod tests {
             agents: &[],
             decks: &decks,
             directories: None,
+            new_agent: None,
         });
         assert_eq!(rendered["decks"], json!(["Local deck", "deploy@build-box"]));
         assert!(!rendered.to_string().contains("deck-000"));
+    }
+
+    #[test]
+    fn voice_prompt_state_names_the_form_s_chips_only_while_it_is_live() {
+        let commands = commands();
+        let transcript = Transcript::new("use claude");
+        let choice = |id: &str, label: &str| crate::voice::VoiceChoice {
+            id: id.to_string(),
+            label: label.to_string(),
+        };
+        let live = crate::voice::VoiceNewAgent {
+            form: Some(crate::voice::VoiceNewAgentForm {
+                deck_id: "deck-0000000000000001".to_string(),
+                path: "/home/secret-user/code".to_string(),
+                modes: vec![choice("none", "No mode"), choice("schedule", "schedule")],
+                agent_types: vec![choice("auto", "auto"), choice("claude", "Claude Code")],
+            }),
+        };
+        let closed_form = crate::voice::VoiceNewAgent { form: None };
+        let request = |new_agent| IntentRequest {
+            transcript: &transcript,
+            commands: &commands,
+            agents: &[],
+            decks: &[],
+            directories: None,
+            new_agent,
+        };
+        assert!(state(&request(None)).get("new_agent_form").is_none());
+        assert!(
+            state(&request(Some(&closed_form)))
+                .get("new_agent_form")
+                .is_none()
+        );
+        let rendered = state(&request(Some(&live)));
+        assert_eq!(
+            rendered["new_agent_form"],
+            json!({ "modes": ["No mode", "schedule"], "agent_types": ["auto", "Claude Code"] })
+        );
+        // Labels only: never the deck id or where on its filesystem the form is.
+        let text = rendered.to_string();
+        assert!(!text.contains("deck-000"), "{text}");
+        assert!(!text.contains("secret-user"), "{text}");
     }
 
     #[test]
@@ -492,6 +561,7 @@ mod tests {
             agents: &[],
             decks: &[],
             directories,
+            new_agent: None,
         };
         // Dialog closed: no key at all, rather than an empty list that reads
         // as "a listing with nothing in it".

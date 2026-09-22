@@ -243,6 +243,22 @@ export type VoiceActionContext = {
   openDirectory: (target: VoiceDispatchTarget) => string | undefined;
   goToParentDirectory: (target: VoiceDispatchTarget) => string | undefined;
   useThisDirectory: (target: VoiceDispatchTarget) => string | undefined;
+  /**
+   * PRD #1223 — the rest of the New agent form by voice: choose the Mode chip
+   * a `mode_ref` resolved to (`target.modeId`), the Agent picker entry an
+   * `agent_type_ref` resolved to (`target.agentTypeId`), or set Name to the
+   * words after the marked boundary (`target.text`). Each calls the function
+   * the control's own click or keystroke calls, and each answers `undefined`
+   * when it acted or the dialog's sentence when it would not — the form can
+   * move during the round trip exactly as the browser can, so each re-checks
+   * {@link VoiceDispatchTarget.declaredForm} against the live form first.
+   *
+   * There is deliberately no member for Command: it is the field that
+   * executes, and it stays typed by hand (`commands.toml` has the argument).
+   */
+  chooseNewAgentMode: (target: VoiceDispatchTarget) => string | undefined;
+  chooseNewAgentType: (target: VoiceDispatchTarget) => string | undefined;
+  nameNewAgent: (target: VoiceDispatchTarget) => string | undefined;
 };
 
 /**
@@ -562,6 +578,40 @@ export const VOICE_ACTIONS = {
       if (refused !== undefined) context.reportRefused(refused);
     },
   },
+
+  /* PRD #1223 — the three `new_agent_form` rows: Mode, Agent and Name. None
+     starts anything, so none is in PRD #802 D5's confirmation set; the manual
+     chips, picker and Name input are unchanged and call the same functions.
+     Command has no entry here on purpose. */
+  chooseNewAgentMode: {
+    label: "Choose a Mode chip in the New agent form",
+    voice: true,
+    needs: ["chooseNewAgentMode", "reportRefused"],
+    run: (context: Pick<VoiceActionContext, "chooseNewAgentMode" | "reportRefused">, target: VoiceDispatchTarget) => {
+      const refused = context.chooseNewAgentMode(target);
+      if (refused !== undefined) context.reportRefused(refused);
+    },
+  },
+
+  chooseNewAgentType: {
+    label: "Choose the agent in the New agent form's picker",
+    voice: true,
+    needs: ["chooseNewAgentType", "reportRefused"],
+    run: (context: Pick<VoiceActionContext, "chooseNewAgentType" | "reportRefused">, target: VoiceDispatchTarget) => {
+      const refused = context.chooseNewAgentType(target);
+      if (refused !== undefined) context.reportRefused(refused);
+    },
+  },
+
+  nameNewAgent: {
+    label: "Set the New agent form's Name",
+    voice: true,
+    needs: ["nameNewAgent", "reportRefused"],
+    run: (context: Pick<VoiceActionContext, "nameNewAgent" | "reportRefused">, target: VoiceDispatchTarget) => {
+      const refused = context.nameNewAgent(target);
+      if (refused !== undefined) context.reportRefused(refused);
+    },
+  },
 } satisfies Record<string, VoiceActionEntry>;
 
 /** Every action id, as the guard and the command table spell them. */
@@ -640,6 +690,20 @@ export type VoiceDispatchTarget = AgentViewTarget & {
    * refuse when the two differ.
    */
   declaredDirectories?: { deckId: string; path: string };
+  /**
+   * The Mode chip a `mode_ref` resolved to — its id in the form as declared
+   * (PRD #1223).
+   */
+  modeId?: string;
+  /** The Agent picker entry an `agent_type_ref` resolved to — its registry id, or `auto`. */
+  agentTypeId?: string;
+  /**
+   * The New agent form the utterance was JUDGED against — its deck and chosen
+   * directory as declared — or absent when no live form was declared. The
+   * form members refuse when the live form differs, for
+   * {@link declaredDirectories}' reason.
+   */
+  declaredForm?: { deckId: string; path: string };
   /**
    * The words to type into the open agent's prompt, for the dictation row
    * (PRD #802 D6, rebuilt).
@@ -749,7 +813,10 @@ export type VoiceScreenContext = Omit<VoiceActionContext, keyof VoicePanelContex
  * dialog for; a dispatch of `openNewAgent` there is refused against its
  * `needs`, the way the overview refuses a deck overlay.
  */
-export type VoiceOverviewContext = Pick<VoiceActionContext, "openNewAgent" | "closeNewAgent" | "openDirectory" | "goToParentDirectory" | "useThisDirectory">;
+export type VoiceOverviewContext = Pick<VoiceActionContext, "openNewAgent" | "closeNewAgent" | "openDirectory" | "goToParentDirectory" | "useThisDirectory" | NewAgentFormMember>;
+
+/** The New agent form's members, served — like the browser's — from the dialog's slot. */
+export type NewAgentFormMember = "chooseNewAgentMode" | "chooseNewAgentType" | "nameNewAgent";
 
 /**
  * What the New agent dialog publishes about its directory browser (PRD #1223),
@@ -766,8 +833,13 @@ export type VoiceOverviewContext = Pick<VoiceActionContext, "openNewAgent" | "cl
  * (see `AgentOverview`), which is what keeps "the dialog closed during the
  * round trip" a refusal with a sentence rather than a `needs` miss.
  */
-export type NewAgentVoice = Pick<VoiceActionContext, "openDirectory" | "goToParentDirectory" | "useThisDirectory"> & {
+export type NewAgentVoice = Pick<VoiceActionContext, "openDirectory" | "goToParentDirectory" | "useThisDirectory" | NewAgentFormMember> & {
   directories: import("./bridge").VoiceDirectoriesDto | undefined;
+  /**
+   * The dialog's own declaration — present for as long as it is mounted, with
+   * a `form` only while the form's fields are live. See `VoiceNewAgentDto`.
+   */
+  newAgent: import("./bridge").VoiceNewAgentDto;
 };
 export type NewAgentVoiceChannel = { current: NewAgentVoice | undefined };
 

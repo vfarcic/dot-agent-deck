@@ -59,7 +59,7 @@ import { applyAppearance } from "./lib/appearance";
 import { desktopWorkflowPlatformIssue } from "./lib/platform";
 import { LaunchCleanupError } from "./lib/actionError";
 import { CleanupWarning } from "./components/CleanupWarning";
-import type { VoiceDirectoriesDto, VoiceOutcomeDto } from "./lib/bridge";
+import type { VoiceDirectoriesDto, VoiceNewAgentDto, VoiceOutcomeDto } from "./lib/bridge";
 import type { AgentSession, DeckAction, DeckRuntimeState, DeckSnapshot, DeckView, EvidenceItem, PanelTab, WorkflowLaunchConfig } from "./types";
 import { modeScopedKey } from "./lib/bridge";
 
@@ -523,7 +523,7 @@ export function DeckShell({ runtime, workflowPlatformIssue, initialView = { kind
    * aimed: it types one utterance into the pane that is already open, so there
    * is no navigation to observe and nothing for the flag to suppress.
    */
-  const dispatchVoice = useCallback((outcome: Extract<VoiceOutcomeDto, { kind: "dispatch" }>, declaredDirectories?: VoiceDirectoriesDto) => {
+  const dispatchVoice = useCallback((outcome: Extract<VoiceOutcomeDto, { kind: "dispatch" }>, declaredDirectories?: VoiceDirectoriesDto, declaredNewAgent?: VoiceNewAgentDto) => {
     const previous = view;
     /*
       One target for every entry, built from the outcome's own resolved params —
@@ -549,6 +549,12 @@ export function DeckShell({ runtime, workflowPlatformIssue, initialView = { kind
     /* PRD #1223 — the child a `dir_ref` resolved to, against the browser's
        children on screen: its `value` is the deck's own path for it. */
     const namedDirectory = outcome.params.find((param) => param.kind === "dir_ref");
+    /* PRD #1223 — the Mode chip and the Agent picker entry a `mode_ref` and an
+       `agent_type_ref` resolved to, against the form AS DECLARED: `value` is
+       the id the dialog selects by. */
+    const namedMode = outcome.params.find((param) => param.kind === "mode_ref");
+    const namedAgentType = outcome.params.find((param) => param.kind === "agent_type_ref");
+    const declaredForm = declaredNewAgent?.form;
     const target: VoiceDispatchTarget = {
       /* The dictation pair targets the pane on SCREEN — its row declares no
          agent param and is `screens = ["agent"]`, so `agentView` is defined
@@ -573,6 +579,9 @@ export function DeckShell({ runtime, workflowPlatformIssue, initialView = { kind
       /* What the utterance was judged against, so a directory move can refuse
          a browser that has moved on since (see the member's own comment). */
       ...(declaredDirectories ? { declaredDirectories: { deckId: declaredDirectories.deckId, path: declaredDirectories.path } } : {}),
+      ...(namedMode ? { modeId: namedMode.value } : {}),
+      ...(namedAgentType ? { agentTypeId: namedAgentType.value } : {}),
+      ...(declaredForm ? { declaredForm: { deckId: declaredForm.deckId, path: declaredForm.path } } : {}),
     };
     let moved = false;
     const context: VoiceDispatchContext = {
@@ -592,6 +601,8 @@ export function DeckShell({ runtime, workflowPlatformIssue, initialView = { kind
   }, [agentView, base, closeAgent, paneAgent, selectedDeckId, view]);
   /** PRD #1223 — what the directory browser shows, read at declaration time. */
   const readDirectories = useCallback(() => newAgentVoice.current?.directories, []);
+  /** PRD #1223 — what the New agent dialog shows besides its browser, while it is open. */
+  const readNewAgent = useCallback(() => newAgentVoice.current?.newAgent, []);
   /* The COMPOSITE identity, never the bare id. See `deckPaneRetargeted` above
      and `DeckSurface`'s own promotion condition. */
   const openAgent = agentView ? { deckId: agentView.deckId, agentId: agentView.agentId } : undefined;
@@ -648,7 +659,7 @@ export function DeckShell({ runtime, workflowPlatformIssue, initialView = { kind
   return (
     <>
       {screenNode}
-      <VoiceControlPanel runtime={runtime} screen={view.kind} onDispatch={dispatchVoice} channel={panelVoiceContext} directories={readDirectories} />
+      <VoiceControlPanel runtime={runtime} screen={view.kind} onDispatch={dispatchVoice} channel={panelVoiceContext} directories={readDirectories} newAgent={readNewAgent} />
     </>
   );
 }

@@ -48,7 +48,7 @@ use super::dictation::{
 use super::resolver::{IntentError, IntentRequest, IntentResolver};
 use super::schema::annotate_with;
 use super::table::{CommandRow, CommandTable, ParamKind, Screen};
-use super::{DesktopAgent, Transcript, VoiceDeck, VoiceDirectories};
+use super::{DesktopAgent, Transcript, VoiceChoice, VoiceDeck, VoiceDirectories, VoiceNewAgent};
 use crate::dto::{DesktopTab, safe_message};
 
 /// How many matching agents an ambiguity sentence names before it summarises.
@@ -309,7 +309,13 @@ impl VoiceResult {
 /// agent dialog's directory browser was DECLARED to be showing with this
 /// utterance, or `None` when it is showing nothing (PRD #1223); it decides both
 /// whether a `requires`-gated row is callable and what a
-/// [`ParamKind::DirRef`] resolves against.
+/// [`ParamKind::DirRef`] resolves against. `new_agent` is what the rest of that
+/// dialog was declared to be showing, or `None` while it is closed — the form a
+/// [`ParamKind::ModeRef`] or [`ParamKind::AgentTypeRef`] resolves against.
+// Eight, because each is live state from a different owner — the backend, the
+// table, the screen and the two dialog declarations from the webview, the agents
+// and decks from the daemon — and bundling them would only rename the list.
+#[allow(clippy::too_many_arguments)]
 pub async fn handle_utterance(
     resolver: &dyn IntentResolver,
     table: &CommandTable,
@@ -317,6 +323,7 @@ pub async fn handle_utterance(
     agents: &[DesktopAgent],
     decks: &[VoiceDeck],
     directories: Option<&VoiceDirectories>,
+    new_agent: Option<&VoiceNewAgent>,
     transcript: Transcript,
 ) -> VoiceResult {
     let backend = resolver.backend_name();
@@ -340,7 +347,7 @@ pub async fn handle_utterance(
         return finish(outcome, None);
     }
 
-    let commands = annotate_with(table, screen, directories);
+    let commands = annotate_with(table, screen, directories, new_agent);
     let started = std::time::Instant::now();
     let answered = resolver
         .resolve(IntentRequest {
@@ -349,6 +356,7 @@ pub async fn handle_utterance(
             agents,
             decks,
             directories,
+            new_agent,
         })
         .await;
     // Taken before anything is rendered: what the user waited for is the
@@ -381,7 +389,7 @@ pub async fn handle_utterance(
     // with the dialog closed, or `go_to_parent` at a root, is refused here with
     // the row's own hint rather than dispatched into a dialog that cannot take
     // it.
-    if !row.callable(screen, directories) {
+    if !row.callable(screen, directories, new_agent) {
         return finish(VoiceOutcome::unavailable(transcript, row));
     }
 
@@ -539,6 +547,55 @@ pub async fn handle_utterance(
                     });
                 }
             },
+            // PRD #1223 — the New agent form's two closed sets, as the dialog
+            // declared them ON SCREEN, and the same two refusals. `new_agent`
+            // carries a form whenever a row requiring one got past `callable`;
+            // the resolver answers no match without one rather than trusting
+            // that, for the `dir_ref` arm's reason.
+            ParamKind::ModeRef | ParamKind::AgentTypeRef => {
+                let form = new_agent.and_then(|dialog| dialog.form.as_ref());
+                let choices = match (spec.kind, form) {
+                    (ParamKind::ModeRef, Some(form)) => form.modes.as_slice(),
+                    (_, Some(form)) => form.agent_types.as_slice(),
+                    (_, None) => &[],
+                };
+                let resolved_choice = if spec.kind == ParamKind::ModeRef {
+                    resolve_mode_ref(spoken, choices)
+                } else {
+                    resolve_agent_type_ref(spoken, choices)
+                };
+                match resolved_choice {
+                    ChoiceMatch::One { id, label } => resolved.push(ResolvedParam {
+                        name: spec.name.clone(),
+                        kind: spec.kind,
+                        spoken: spoken.to_string(),
+                        value: id,
+                        label,
+                    }),
+                    ChoiceMatch::None => {
+                        return finish(VoiceOutcome::ParamUnresolved {
+                            sentence: heard(&transcript, &spec.kind.unresolved_phrase(spoken)),
+                            transcript,
+                            action: row.id.clone(),
+                            param: spec.name.clone(),
+                            spoken: spoken.to_string(),
+                        });
+                    }
+                    ChoiceMatch::Ambiguous(labels) => {
+                        return finish(VoiceOutcome::ParamAmbiguous {
+                            sentence: heard(
+                                &transcript,
+                                &spec.kind.ambiguous_phrase(spoken, &labels),
+                            ),
+                            transcript,
+                            action: row.id.clone(),
+                            param: spec.name.clone(),
+                            spoken: spoken.to_string(),
+                            matches: labels,
+                        });
+                    }
+                }
+            }
         }
     }
 
@@ -722,6 +779,8 @@ impl ParamKind {
             ParamKind::AgentRef => "I could not tell which agent you meant",
             ParamKind::DeckRef => "I could not tell which deck you meant",
             ParamKind::DirRef => "I could not tell which directory you meant",
+            ParamKind::ModeRef => "I could not tell which mode you meant",
+            ParamKind::AgentTypeRef => "I could not tell which agent type you meant",
             // The model picked dictation and marked no boundary, so there is
             // no answer to the only question this kind asks: where do the
             // user's own words start? Nothing is typed, and the sentence says
@@ -753,6 +812,15 @@ impl ParamKind {
             ParamKind::DirRef => {
                 format!("no directory on screen matches \u{201c}{spoken}\u{201d}")
             }
+            // "offered", because that is the claim: the Mode row varies by
+            // deck, flag and directory, so a chip the user has seen elsewhere
+            // may simply not be on this form.
+            ParamKind::ModeRef => {
+                format!("no mode the New agent form offers matches \u{201c}{spoken}\u{201d}")
+            }
+            ParamKind::AgentTypeRef => format!(
+                "no agent type in the New agent form's picker matches \u{201c}{spoken}\u{201d}"
+            ),
             // **The fidelity refusal**, and the one sentence in this file that
             // reports a disagreement between the app and the model. The words
             // quoted are the MODEL's — scrubbed like every foreign string — and
@@ -798,6 +866,12 @@ impl ParamKind {
             }
             ParamKind::DirRef => {
                 format!("\u{201c}{spoken}\u{201d} matches more than one directory: {listed}")
+            }
+            ParamKind::ModeRef => {
+                format!("\u{201c}{spoken}\u{201d} matches more than one mode: {listed}")
+            }
+            ParamKind::AgentTypeRef => {
+                format!("\u{201c}{spoken}\u{201d} matches more than one agent type: {listed}")
             }
             // Unreachable: a prefix resolves against the transcript, which
             // either starts with the marked words or does not. Written out
@@ -1006,6 +1080,160 @@ pub fn resolve_dir_ref(spoken: &str, directories: Option<&VoiceDirectories>) -> 
         },
         _ => DirRefMatch::Ambiguous(hits.iter().map(|entry| entry.name.clone()).collect()),
     }
+}
+
+/// What a spoken reference to one entry of a closed set on screen resolved to
+/// — a Mode chip or an Agent picker entry (PRD #1223).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChoiceMatch {
+    /// `id` is what the dialog selects by; `label` is what it shows.
+    One {
+        id: String,
+        label: String,
+    },
+    None,
+    Ambiguous(Vec<String>),
+}
+
+/// Resolve a spoken mode against the Mode chips the New agent form OFFERS
+/// (PRD #1223) — never a list of modes this crate knows, because the row varies
+/// by the deck's capabilities, its experimental flag and whether the directory
+/// is a project, and a chip that is not offered must be refused.
+///
+/// A chip answers to its label with the punctuation spoken as a space
+/// (`schedule: issues` is "schedule issues"); an `Orch: <name>` chip also to
+/// its bare name and to "<name> orchestration", because nobody says "orch
+/// colon"; and `No mode` also to "plain agent", which is what it starts.
+pub fn resolve_mode_ref(spoken: &str, modes: &[VoiceChoice]) -> ChoiceMatch {
+    resolve_choice(spoken, modes, |choice| {
+        let mut names = vec![choice.label.clone()];
+        if let Some(name) = choice.label.strip_prefix("Orch:").map(str::trim) {
+            names.push(name.to_string());
+            names.push(format!("{name} orchestration"));
+            names.push(format!("orchestration {name}"));
+        }
+        if choice.id == "none" {
+            names.push("plain agent".to_string());
+            names.push("plain".to_string());
+        }
+        names
+    })
+}
+
+/// Resolve a spoken agent type against the New agent form's Agent picker as it
+/// is on screen (PRD #1223): the deck's own registry, or the desktop's labelled
+/// fallback, plus `auto`. An entry answers to its label and to its registry id
+/// (`claude` beside "Claude Code"), which is the binary a user names.
+pub fn resolve_agent_type_ref(spoken: &str, agent_types: &[VoiceChoice]) -> ChoiceMatch {
+    resolve_choice(spoken, agent_types, |choice| {
+        let mut names = vec![choice.label.clone()];
+        if choice.id != choice.label {
+            names.push(choice.id.clone());
+        }
+        if choice.id == "auto" {
+            names.push("automatic".to_string());
+        }
+        names
+    })
+}
+
+/// The words a user puts AROUND a chip's name without meaning anything else by
+/// them — "the dispatcher mode", "an opencode agent".
+const CHOICE_FILLER: [&str; 10] = [
+    "the", "a", "an", "mode", "agent", "type", "chip", "one", "please", "it",
+];
+
+/// [`resolve_dir_ref`]'s rule over a closed set, exact before loose with the
+/// loose pass narrowed to its most specific hits — and ONE difference, which is
+/// the reason this is not that function.
+///
+/// # A chip's name inside a longer reference counts only when the rest is filler
+///
+/// The general word-subset rule accepts a name whose words are all in the
+/// reference, so "the tester" reaches `tester`. Over a closed set that varies
+/// by deck that rule is wrong in exactly the case that matters: on a deck whose
+/// experimental flag is off there is no `schedule: issues` chip, and "schedule
+/// issues" is a word-superset of the `schedule` chip that IS there — so the
+/// user who asked for the one chip that is not offered would silently get the
+/// other one. So the reference may exceed a name only by [`CHOICE_FILLER`]
+/// words: "the schedule mode" is `schedule`, and "schedule issues" matches
+/// nothing and is refused as not offered. The other direction — a reference
+/// that is PART of a name, "issues" for `schedule: issues` — is unchanged.
+///
+/// Punctuation other than `_` and `-` (which [`normalize`] already spaces) is
+/// spoken as a space.
+fn resolve_choice(
+    spoken: &str,
+    choices: &[VoiceChoice],
+    names_of: impl Fn(&VoiceChoice) -> Vec<String>,
+) -> ChoiceMatch {
+    let spaced = |text: &str| {
+        normalize(
+            &text
+                .chars()
+                .map(|c| if c.is_alphanumeric() { c } else { ' ' })
+                .collect::<String>(),
+        )
+    };
+    let reference = spaced(spoken);
+    if reference.is_empty() {
+        return ChoiceMatch::None;
+    }
+    let reference_words = words(&reference);
+
+    // "open code" for OpenCode: a product name written as one word is spoken
+    // as two, so an exact hit also ignores where the spaces fall.
+    let compact = |text: &str| text.replace(' ', "");
+    let mut exact = Vec::new();
+    let mut loose = Vec::new();
+    for choice in choices {
+        let names: Vec<String> = names_of(choice).iter().map(|name| spaced(name)).collect();
+        if names
+            .iter()
+            .any(|name| *name == reference || compact(name) == compact(&reference))
+        {
+            exact.push(choice);
+        } else if names
+            .iter()
+            .any(|name| choice_subset(&reference_words, name))
+        {
+            let shared = names
+                .iter()
+                .map(|name| words(name).intersection(&reference_words).count())
+                .max()
+                .unwrap_or(0);
+            loose.push((choice, shared));
+        }
+    }
+    let most = loose.iter().map(|(_, shared)| *shared).max().unwrap_or(0);
+    let loose: Vec<_> = loose
+        .into_iter()
+        .filter(|(_, shared)| *shared == most)
+        .map(|(choice, _)| choice)
+        .collect();
+    let hits = if exact.is_empty() { loose } else { exact };
+    match hits.len() {
+        0 => ChoiceMatch::None,
+        1 => ChoiceMatch::One {
+            id: hits[0].id.clone(),
+            label: hits[0].label.clone(),
+        },
+        _ => ChoiceMatch::Ambiguous(hits.iter().map(|choice| choice.label.clone()).collect()),
+    }
+}
+
+/// [`word_subset`] for a closed set: see [`resolve_choice`] for why a name
+/// inside a longer reference needs the rest to be filler.
+fn choice_subset(reference_words: &BTreeSet<String>, name: &str) -> bool {
+    let name_words = words(name);
+    if name_words.is_empty() || reference_words.is_empty() {
+        return false;
+    }
+    reference_words.is_subset(&name_words)
+        || (name_words.is_subset(reference_words)
+            && reference_words
+                .difference(&name_words)
+                .all(|word| CHOICE_FILLER.contains(&word.as_str())))
 }
 
 /// Every name this deck answers to. See [`resolve_deck_ref`] for the rule.
@@ -1518,6 +1746,7 @@ mod tests {
             &fleet(),
             &decks(),
             directories,
+            None,
             Transcript::new(said),
         )
         .await
@@ -1728,6 +1957,344 @@ mod tests {
         );
     }
 
+    // -- the New agent form: mode_ref, agent_type_ref, name (PRD #1223) ----
+
+    fn choice(id: &str, label: &str) -> VoiceChoice {
+        VoiceChoice {
+            id: id.to_string(),
+            label: label.to_string(),
+        }
+    }
+
+    /// A form on a project directory of a deck whose flag is off: no
+    /// `schedule: issues` chip, one orchestration, and the deck's registry.
+    fn new_agent_form() -> VoiceNewAgent {
+        VoiceNewAgent {
+            form: Some(crate::voice::VoiceNewAgentForm {
+                deck_id: "deck-local".to_string(),
+                path: "/home/dev/code/billing".to_string(),
+                modes: vec![
+                    choice("none", "No mode"),
+                    choice("orchestration:billing-run", "Orch: billing-run"),
+                    choice("schedule", "schedule"),
+                    choice("dispatcher", "dispatcher"),
+                ],
+                agent_types: vec![
+                    choice("auto", "auto"),
+                    choice("claude", "Claude Code"),
+                    choice("opencode", "OpenCode"),
+                    choice("pi", "Pi"),
+                ],
+            }),
+        }
+    }
+
+    #[test]
+    fn voice_outcome_mode_ref_resolves_the_chips_on_screen() {
+        let form = new_agent_form();
+        let modes = &form.form.as_ref().expect("a form").modes;
+        let one = |said: &str| match resolve_mode_ref(said, modes) {
+            ChoiceMatch::One { id, .. } => id,
+            other => panic!("{said:?}: {other:?}"),
+        };
+        assert_eq!(one("schedule"), "schedule");
+        assert_eq!(one("the dispatcher"), "dispatcher");
+        assert_eq!(one("no mode"), "none");
+        assert_eq!(one("plain agent"), "none");
+        // An orchestration chip answers to its bare name and to "<name>
+        // orchestration", never only to "orch colon".
+        assert_eq!(one("billing run"), "orchestration:billing-run");
+        assert_eq!(
+            one("the billing run orchestration"),
+            "orchestration:billing-run"
+        );
+        assert_eq!(one("Orch: billing-run"), "orchestration:billing-run");
+        // A mode this form does not offer is refused, never approximated.
+        assert_eq!(resolve_mode_ref("workspace", modes), ChoiceMatch::None);
+        assert_eq!(resolve_mode_ref("", modes), ChoiceMatch::None);
+        // The case the filler rule exists for: `schedule: issues` is not
+        // offered on this deck, and "schedule issues" must NOT quietly become
+        // the `schedule` chip that is.
+        assert_eq!(
+            resolve_mode_ref("schedule issues", modes),
+            ChoiceMatch::None
+        );
+        assert_eq!(
+            resolve_mode_ref("schedule: issues", modes),
+            ChoiceMatch::None
+        );
+        assert_eq!(one("the schedule mode"), "schedule");
+    }
+
+    #[test]
+    fn voice_outcome_mode_ref_prefers_the_more_specific_chip() {
+        let modes = vec![
+            choice("none", "No mode"),
+            choice("schedule", "schedule"),
+            choice("schedule_issues", "schedule: issues"),
+        ];
+        let one = |said: &str| match resolve_mode_ref(said, &modes) {
+            ChoiceMatch::One { id, .. } => id,
+            other => panic!("{said:?}: {other:?}"),
+        };
+        assert_eq!(one("schedule issues"), "schedule_issues");
+        assert_eq!(one("the schedule issues mode"), "schedule_issues");
+        assert_eq!(one("schedule"), "schedule");
+        assert_eq!(one("issues"), "schedule_issues");
+    }
+
+    #[test]
+    fn voice_outcome_agent_type_ref_resolves_by_label_or_registry_id() {
+        let form = new_agent_form();
+        let agent_types = &form.form.as_ref().expect("a form").agent_types;
+        let one = |said: &str| match resolve_agent_type_ref(said, agent_types) {
+            ChoiceMatch::One { id, label } => (id, label),
+            other => panic!("{said:?}: {other:?}"),
+        };
+        assert_eq!(
+            one("claude"),
+            ("claude".to_string(), "Claude Code".to_string())
+        );
+        assert_eq!(
+            one("claude code"),
+            ("claude".to_string(), "Claude Code".to_string())
+        );
+        assert_eq!(
+            one("open code"),
+            ("opencode".to_string(), "OpenCode".to_string())
+        );
+        assert_eq!(
+            one("opencode"),
+            ("opencode".to_string(), "OpenCode".to_string())
+        );
+        assert_eq!(one("auto"), ("auto".to_string(), "auto".to_string()));
+        assert_eq!(one("automatic"), ("auto".to_string(), "auto".to_string()));
+        // Codex is in the desktop's own registry but not in THIS deck's picker,
+        // so it is refused rather than guessed.
+        assert_eq!(
+            resolve_agent_type_ref("codex", agent_types),
+            ChoiceMatch::None
+        );
+        assert_eq!(resolve_agent_type_ref("", agent_types), ChoiceMatch::None);
+    }
+
+    #[test]
+    fn voice_outcome_choice_refs_are_ambiguous_when_two_entries_match() {
+        let agent_types = vec![
+            choice("claude-code", "Claude Code"),
+            choice("claude-next", "Claude Next"),
+        ];
+        assert_eq!(
+            resolve_agent_type_ref("claude", &agent_types),
+            ChoiceMatch::Ambiguous(vec!["Claude Code".to_string(), "Claude Next".to_string()])
+        );
+    }
+
+    async fn run_form(
+        resolver: &StubResolver,
+        screen: Screen,
+        new_agent: Option<&VoiceNewAgent>,
+        said: &str,
+    ) -> VoiceOutcome {
+        handle_utterance(
+            resolver,
+            table(),
+            screen,
+            &fleet(),
+            &decks(),
+            None,
+            new_agent,
+            Transcript::new(said),
+        )
+        .await
+        .outcome
+    }
+
+    #[tokio::test]
+    async fn voice_outcome_choose_mode_dispatches_the_chip_id() {
+        let resolver = StubResolver::new().answering(
+            "make it a dispatcher",
+            IntentAnswer::new("choose_mode").with_param("mode", "dispatcher"),
+        );
+        let form = new_agent_form();
+        let outcome = run_form(
+            &resolver,
+            Screen::Overview,
+            Some(&form),
+            "make it a dispatcher",
+        )
+        .await;
+        assert_eq!(
+            outcome,
+            VoiceOutcome::Dispatch {
+                transcript: Transcript::new("make it a dispatcher"),
+                action: "choose_mode".to_string(),
+                invoke: "chooseNewAgentMode".to_string(),
+                params: vec![ResolvedParam {
+                    name: "mode".to_string(),
+                    kind: ParamKind::ModeRef,
+                    spoken: "dispatcher".to_string(),
+                    value: "dispatcher".to_string(),
+                    label: "dispatcher".to_string(),
+                }],
+                sentence: "Mode: dispatcher.".to_string(),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn voice_outcome_choose_mode_refuses_a_chip_the_form_does_not_offer() {
+        // `schedule: issues` is shown only when the deck's experimental flag
+        // is on; this form's deck has it off, so the chip is not there.
+        let resolver = StubResolver::new().answering(
+            "mode schedule issues",
+            IntentAnswer::new("choose_mode").with_param("mode", "schedule issues"),
+        );
+        let form = new_agent_form();
+        let outcome = run_form(
+            &resolver,
+            Screen::Overview,
+            Some(&form),
+            "mode schedule issues",
+        )
+        .await;
+        assert_eq!(
+            outcome.sentence(),
+            "Heard: \u{201c}mode schedule issues\u{201d} — no mode the New agent form offers matches \u{201c}schedule issues\u{201d}."
+        );
+        assert!(matches!(outcome, VoiceOutcome::ParamUnresolved { .. }));
+    }
+
+    #[tokio::test]
+    async fn voice_outcome_choose_agent_type_dispatches_the_registry_id() {
+        let resolver = StubResolver::new().answering(
+            "use claude",
+            IntentAnswer::new("choose_agent_type").with_param("agent_type", "claude"),
+        );
+        let form = new_agent_form();
+        let outcome = run_form(&resolver, Screen::Overview, Some(&form), "use claude").await;
+        let VoiceOutcome::Dispatch {
+            invoke,
+            params,
+            sentence,
+            ..
+        } = outcome
+        else {
+            panic!("a dispatch");
+        };
+        assert_eq!(invoke, "chooseNewAgentType");
+        assert_eq!(params[0].value, "claude");
+        assert_eq!(params[0].kind, ParamKind::AgentTypeRef);
+        assert_eq!(sentence, "Agent: Claude Code.");
+    }
+
+    #[tokio::test]
+    async fn voice_outcome_choose_agent_type_refuses_one_not_in_the_picker() {
+        let resolver = StubResolver::new().answering(
+            "use codex",
+            IntentAnswer::new("choose_agent_type").with_param("agent_type", "codex"),
+        );
+        let form = new_agent_form();
+        let outcome = run_form(&resolver, Screen::Overview, Some(&form), "use codex").await;
+        assert_eq!(
+            outcome.sentence(),
+            "Heard: \u{201c}use codex\u{201d} — no agent type in the New agent form's picker matches \u{201c}codex\u{201d}."
+        );
+    }
+
+    #[tokio::test]
+    async fn voice_outcome_name_new_agent_takes_the_name_from_the_transcript() {
+        // The model marks the boundary; what reaches the form is the rest of
+        // the TRANSCRIPT, never a string the model supplied.
+        let resolver = StubResolver::new().answering(
+            "call it billing worker",
+            IntentAnswer::new("name_new_agent").with_param("prefix", "call it"),
+        );
+        let form = new_agent_form();
+        let outcome = run_form(
+            &resolver,
+            Screen::Overview,
+            Some(&form),
+            "call it billing worker",
+        )
+        .await;
+        let VoiceOutcome::Dispatch {
+            invoke,
+            params,
+            sentence,
+            ..
+        } = outcome
+        else {
+            panic!("a dispatch");
+        };
+        assert_eq!(invoke, "nameNewAgent");
+        assert_eq!(params[0].kind, ParamKind::SpokenPrefix);
+        assert_eq!(params[0].value, "billing worker");
+        assert_eq!(sentence, "Name set.");
+
+        // A boundary that is not how the utterance began names nothing.
+        let lying = StubResolver::new().answering(
+            "call it billing worker",
+            IntentAnswer::new("name_new_agent").with_param("prefix", "rename it"),
+        );
+        let refused = run_form(
+            &lying,
+            Screen::Overview,
+            Some(&form),
+            "call it billing worker",
+        )
+        .await;
+        assert!(
+            matches!(refused, VoiceOutcome::ParamUnresolved { .. }),
+            "{refused:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn voice_outcome_form_rows_are_unavailable_without_a_live_form() {
+        let no_form = VoiceNewAgent { form: None };
+        let form = new_agent_form();
+        for (said, action, param, value, hint) in [
+            (
+                "mode schedule",
+                "choose_mode",
+                "mode",
+                "schedule",
+                "choosing a mode works while the New agent form has a deck and a directory chosen",
+            ),
+            (
+                "use claude",
+                "choose_agent_type",
+                "agent_type",
+                "claude",
+                "choosing an agent works while the New agent form has a deck and a directory chosen",
+            ),
+            (
+                "name it docs",
+                "name_new_agent",
+                "prefix",
+                "name it",
+                "naming the new agent works while the New agent form has a deck and a directory chosen",
+            ),
+        ] {
+            let resolver = StubResolver::new()
+                .answering(said, IntentAnswer::new(action).with_param(param, value));
+            for (screen, declared) in [
+                (Screen::Overview, None),
+                (Screen::Overview, Some(&no_form)),
+                (Screen::Deck, Some(&form)),
+                (Screen::Agent, Some(&form)),
+            ] {
+                let outcome = run_form(&resolver, screen, declared, said).await;
+                assert_eq!(
+                    outcome.sentence(),
+                    format!("Not here — {hint}."),
+                    "{action} on {screen}"
+                );
+            }
+        }
+    }
+
     async fn run(
         resolver: &StubResolver,
         screen: Screen,
@@ -1750,6 +2317,7 @@ mod tests {
             screen,
             agents,
             &decks(),
+            None,
             None,
             Transcript::new(said),
         )
@@ -2313,6 +2881,7 @@ mod tests {
                 &fleet(),
                 &[],
                 None,
+                None,
                 Transcript::new("open the tester"),
             )
             .await
@@ -2588,6 +3157,7 @@ mod tests {
             &fleet(),
             &[],
             None,
+            None,
             "show everything".into(),
         )
         .await;
@@ -2702,6 +3272,7 @@ mod tests {
             &fleet(),
             &[],
             None,
+            None,
             Transcript::new("type run the login tests"),
         )
         .await;
@@ -2728,6 +3299,7 @@ mod tests {
             &fleet(),
             &[],
             None,
+            None,
             Transcript::new(heard),
         )
         .await;
@@ -2752,6 +3324,7 @@ mod tests {
             &fleet(),
             &[],
             None,
+            None,
             Transcript::new("type hello end"),
         )
         .await;
@@ -2772,6 +3345,7 @@ mod tests {
             Screen::Agent,
             &fleet(),
             &[],
+            None,
             None,
             Transcript::new("End."),
         )
@@ -2799,6 +3373,7 @@ mod tests {
             &fleet(),
             &[],
             None,
+            None,
             Transcript::new("type end of file"),
         )
         .await;
@@ -2816,6 +3391,7 @@ mod tests {
                 screen,
                 &fleet(),
                 &[],
+                None,
                 None,
                 Transcript::new("type run the login tests"),
             )
@@ -2849,6 +3425,7 @@ mod tests {
             &fleet(),
             &[],
             None,
+            None,
             Transcript::new("type"),
         )
         .await;
@@ -2876,6 +3453,7 @@ mod tests {
             &fleet(),
             &[],
             None,
+            None,
             Transcript::new("let's write a prompt run the tests"),
         )
         .await;
@@ -2897,6 +3475,7 @@ mod tests {
             Screen::Agent,
             &fleet(),
             &[],
+            None,
             None,
             Transcript::new(heard),
         )
@@ -2927,6 +3506,7 @@ mod tests {
             Screen::Agent,
             &fleet(),
             &[],
+            None,
             None,
             Transcript::new("run the login tests"),
         )
@@ -2964,6 +3544,7 @@ mod tests {
             &fleet(),
             &[],
             None,
+            None,
             Transcript::new("let's write a prompt"),
         )
         .await;
@@ -2983,6 +3564,7 @@ mod tests {
             Screen::Agent,
             &fleet(),
             &[],
+            None,
             None,
             Transcript::new("just write that down somewhere"),
         )

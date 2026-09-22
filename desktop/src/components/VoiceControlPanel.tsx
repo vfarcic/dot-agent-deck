@@ -81,7 +81,7 @@ import { Mic, MicOff, Undo2, X } from "lucide-react";
 import { DISPLAY_LIMITS, displayText } from "../lib/displayText";
 import { VOICE_PEER_PROPS } from "../hooks/useInertBackground";
 import { VOICE_ACTIONS, type VoiceDispatchTarget, type VoicePanelChannel, type VoicePanelContext } from "../lib/voiceActions";
-import type { VoiceCommandDto, VoiceDirectoriesDto, VoiceOutcomeDto, VoiceResultDto, VoiceScreen, VoiceStatusDto } from "../lib/bridge";
+import type { VoiceCommandDto, VoiceDirectoriesDto, VoiceNewAgentDto, VoiceOutcomeDto, VoiceResultDto, VoiceScreen, VoiceStatusDto } from "../lib/bridge";
 import type { DeckRuntimeState } from "../types";
 
 /**
@@ -417,7 +417,7 @@ interface VoiceControlPanelProps {
    * cases stay distinguishable: one is a report the surface must correct, the
    * other is an ordinary command with no Undo beside it.
    */
-  onDispatch: (outcome: Extract<VoiceOutcomeDto, { kind: "dispatch" }>, declaredDirectories?: VoiceDirectoriesDto) => { undo?: () => void } | undefined;
+  onDispatch: (outcome: Extract<VoiceOutcomeDto, { kind: "dispatch" }>, declaredDirectories?: VoiceDirectoriesDto, declaredNewAgent?: VoiceNewAgentDto) => { undo?: () => void } | undefined;
   /**
    * What the New agent dialog's directory browser is showing right now, or
    * `undefined` when it is showing nothing (PRD #1223).
@@ -429,6 +429,13 @@ interface VoiceControlPanelProps {
    * browser moved during the round trip.
    */
   directories?: () => VoiceDirectoriesDto | undefined;
+  /**
+   * What the New agent dialog shows besides its browser, or `undefined` while
+   * it is closed (PRD #1223) — read and handed back exactly as `directories`
+   * is, so the form rows can tell whether the form moved during the round
+   * trip.
+   */
+  newAgent?: () => VoiceNewAgentDto | undefined;
   /**
    * Where this panel publishes the context members only IT can serve
    * (PRD #802, the `voice_off` row).
@@ -489,11 +496,13 @@ function progressNote(indicator: VoiceIndicator, phase: VoicePhase): string | un
  * real state: a control with nothing behind it would be worse than its absence,
  * and it is the same reasoning the microphone itself gets one layer down.
  */
-export function VoiceControlPanel({ runtime, screen, onDispatch, channel, directories }: VoiceControlPanelProps) {
+export function VoiceControlPanel({ runtime, screen, onDispatch, channel, directories, newAgent }: VoiceControlPanelProps) {
   /* Held in a ref so the resolve and the overlay read the host's latest getter
      without either callback being rebuilt when the host re-renders. */
   const directoriesRef = useRef(directories);
   directoriesRef.current = directories;
+  const newAgentRef = useRef(newAgent);
+  newAgentRef.current = newAgent;
   const { declareVoiceScreen, resolveVoice, voiceCommands, voiceStart, voiceStop, voiceStatus, voiceCancel, sendTerminalInput } = runtime;
 
   const [on, setOnState] = useState(false);
@@ -836,9 +845,10 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
     const declared = screenRef.current;
     /* PRD #1223 — and the directory browser as it stands, declared with it. */
     const declaredDirectories = directoriesRef.current?.();
+    const declaredNewAgent = newAgentRef.current?.();
     setPhase("resolving");
     try {
-      declareVoiceScreen?.(declared, declaredDirectories);
+      declareVoiceScreen?.(declared, declaredDirectories, declaredNewAgent);
       const answer = await resolveVoice(utterance);
       // Abandoned, or replaced by a later utterance. Say nothing and run
       // nothing: voice is off, or this belongs to the cycle that replaced it.
@@ -849,7 +859,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
       }
       setResult(answer);
       if (answer.outcome.kind === "dispatch") {
-        const dispatched = onDispatch(answer.outcome, declaredDirectories);
+        const dispatched = onDispatch(answer.outcome, declaredDirectories, declaredNewAgent);
         if (!dispatched) setProblem(NOTHING_DISPATCHED);
         else if (dispatched.undo) setUndo({ run: dispatched.undo });
       }
@@ -1149,7 +1159,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
     /* `screenRef` rather than the prop: this runs from a dispatch, which is a
        promise continuation, and the prop captured when the callback was built
        may be a screen the user has already left. */
-    void voiceCommands(screenRef.current, directoriesRef.current?.()).then(
+    void voiceCommands(screenRef.current, directoriesRef.current?.(), newAgentRef.current?.()).then(
       (commands) => { if (vocabularyRequest.current === mine) setVocabulary({ commands }); },
       (cause) => { if (vocabularyRequest.current === mine) setVocabulary({ problem: sentenceOf(cause) }); },
     );

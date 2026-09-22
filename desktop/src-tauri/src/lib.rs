@@ -2727,6 +2727,41 @@ fn validate_voice_directories(directories: &voice::VoiceDirectories) -> Result<(
     Ok(())
 }
 
+/// The bounds on the New agent form a webview may declare (PRD #1223), checked
+/// by [`validate_voice_new_agent`] for [`validate_voice_directories`]' reason.
+///
+/// Both lists are small closed sets on a real form: the Mode row is `No mode`,
+/// one chip per orchestration a project defines, and three authoring kinds; the
+/// Agent picker is a deck's registry plus `auto`. The caps are far above either
+/// and far below a payload.
+const MAX_VOICE_FORM_CHOICES: usize = 256;
+const MAX_VOICE_FORM_CHOICE_BYTES: usize = 1024;
+
+/// Refuse a New agent declaration no real dialog could have produced.
+fn validate_voice_new_agent(new_agent: &voice::VoiceNewAgent) -> Result<(), String> {
+    let Some(form) = &new_agent.form else {
+        return Ok(());
+    };
+    let too_long = |value: &str, limit: usize| value.len() > limit;
+    let oversized = |choices: &[voice::VoiceChoice]| {
+        choices.len() > MAX_VOICE_FORM_CHOICES
+            || choices.iter().any(|choice| {
+                too_long(&choice.id, MAX_VOICE_FORM_CHOICE_BYTES)
+                    || too_long(&choice.label, MAX_VOICE_FORM_CHOICE_BYTES)
+            })
+    };
+    if too_long(&form.deck_id, MAX_VOICE_DECK_ID_BYTES)
+        || too_long(&form.path, MAX_VOICE_DIRECTORY_PATH_BYTES)
+        || oversized(&form.modes)
+        || oversized(&form.agent_types)
+    {
+        return Err(
+            "the New agent form sent with that command is larger than any form shows".to_string(),
+        );
+    }
+    Ok(())
+}
+
 /// PRD #802 M6: take one utterance to an outcome carrying the sentence to show.
 ///
 /// # What it does NOT do
@@ -2756,6 +2791,11 @@ fn validate_voice_directories(directories: &voice::VoiceDirectories) -> Result<(
 /// [`validate_voice_directories`]. It is an IPC argument between this app's own
 /// webview and its own Rust half; nothing about it reaches the daemon.
 ///
+/// **`new_agent` is the third** (PRD #1223): the New agent form's Mode chips
+/// and Agent picker entries as they are on screen, present while the dialog is
+/// open. Same route, same reason, bounded by [`validate_voice_new_agent`], and
+/// likewise never sent to the daemon.
+///
 /// # One `ListAgents` per utterance
 ///
 /// [`get_snapshot`] fetches rather than reading a cache, which is one daemon
@@ -2777,6 +2817,7 @@ async fn desktop_voice_resolve(
     utterance: String,
     screen: voice::Screen,
     directories: Option<voice::VoiceDirectories>,
+    new_agent: Option<voice::VoiceNewAgent>,
 ) -> Result<voice::VoiceResult, String> {
     ensure_main_webview(&webview)?;
     if utterance.len() > MAX_UTTERANCE_BYTES {
@@ -2786,6 +2827,9 @@ async fn desktop_voice_resolve(
     }
     if let Some(directories) = &directories {
         validate_voice_directories(directories)?;
+    }
+    if let Some(new_agent) = &new_agent {
+        validate_voice_new_agent(new_agent)?;
     }
     // Read per call rather than cached, for `voice_speech_settings`'s reason: a
     // user who changes the backend, the endpoint or the model uses it on the
@@ -2805,6 +2849,7 @@ async fn desktop_voice_resolve(
         &snapshot.agents,
         &decks,
         directories.as_ref(),
+        new_agent.as_ref(),
         voice::Transcript::new(utterance),
     )
     .await)
@@ -2869,15 +2914,20 @@ async fn desktop_voice_commands(
     webview: Webview,
     screen: voice::Screen,
     directories: Option<voice::VoiceDirectories>,
+    new_agent: Option<voice::VoiceNewAgent>,
 ) -> Result<Vec<voice::AnnotatedCommand>, String> {
     ensure_main_webview(&webview)?;
     if let Some(directories) = &directories {
         validate_voice_directories(directories)?;
     }
+    if let Some(new_agent) = &new_agent {
+        validate_voice_new_agent(new_agent)?;
+    }
     Ok(voice::annotate_with(
         voice::table(),
         screen,
         directories.as_ref(),
+        new_agent.as_ref(),
     ))
 }
 
@@ -4390,6 +4440,50 @@ mod tests {
         let mut long_deck = voice_listing(1);
         long_deck.deck_id = "d".repeat(MAX_VOICE_DECK_ID_BYTES + 1);
         assert!(validate_voice_directories(&long_deck).is_err());
+    }
+
+    /// PRD #1223: a New agent form declaration is bounded like a listing —
+    /// a real form's closed sets are accepted, a payload is refused.
+    #[test]
+    fn voice_new_agent_declarations_are_bounded_and_webview_shaped() {
+        let parsed: voice::VoiceNewAgent = serde_json::from_value(serde_json::json!({
+            "form": {
+                "deckId": "deck-1",
+                "path": "/home/dev/code",
+                "modes": [{ "id": "none", "label": "No mode" }],
+                "agentTypes": [{ "id": "auto", "label": "auto" }],
+            },
+        }))
+        .expect("parses");
+        assert!(validate_voice_new_agent(&parsed).is_ok());
+        let open_without_form: voice::VoiceNewAgent =
+            serde_json::from_value(serde_json::json!({})).expect("a dialog with no live form");
+        assert!(open_without_form.form.is_none());
+        assert!(
+            serde_json::from_value::<voice::VoiceNewAgent>(serde_json::json!({ "command": "rm" }))
+                .is_err(),
+            "nothing the declaration does not name"
+        );
+
+        let mut many = parsed.clone();
+        let form = many.form.as_mut().expect("a form");
+        form.modes = (0..=MAX_VOICE_FORM_CHOICES)
+            .map(|index| voice::VoiceChoice {
+                id: format!("mode-{index}"),
+                label: format!("mode {index}"),
+            })
+            .collect();
+        assert!(validate_voice_new_agent(&many).is_err());
+
+        let mut long = parsed.clone();
+        long.form.as_mut().expect("a form").agent_types[0].label =
+            "x".repeat(MAX_VOICE_FORM_CHOICE_BYTES + 1);
+        assert!(validate_voice_new_agent(&long).is_err());
+
+        let mut long_path = parsed;
+        long_path.form.as_mut().expect("a form").path =
+            "/".repeat(MAX_VOICE_DIRECTORY_PATH_BYTES + 1);
+        assert!(validate_voice_new_agent(&long_path).is_err());
     }
 
     /// The declaration's wire shape is the webview's: camelCase, and nothing

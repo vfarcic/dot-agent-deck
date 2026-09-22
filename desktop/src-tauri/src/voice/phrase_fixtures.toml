@@ -412,3 +412,78 @@ utterance = "open dir billing"
 screen = "overview"
 action = "open_dir"
 outcome = "unavailable"
+
+# PRD #1223 — the rest of the New agent form by voice. `form = true` plants a
+# live form (it implies the dialog is open): Mode chips No mode, Orch:
+# billing-run, schedule and dispatcher — NO `schedule: issues`, because the
+# planted deck's experimental flag is off — and the picker auto, Claude Code,
+# OpenCode, Pi, Codex. Without it the form is not live, and each fill row must
+# say where it works rather than guess.
+[[fixtures]]
+name = "choose-mode-schedule"
+utterance = "make it a schedule"
+screen = "overview"
+form = true
+action = "choose_mode"
+outcome = "dispatch"
+resolved_mode = "schedule"
+
+[[fixtures]]
+name = "choose-mode-orchestration"
+utterance = "use the billing run orchestration"
+screen = "overview"
+form = true
+action = "choose_mode"
+outcome = "dispatch"
+resolved_mode = "orchestration:billing-run"
+
+[[fixtures]]
+name = "choose-mode-plain"
+utterance = "no mode, just a plain agent"
+screen = "overview"
+form = true
+action = "choose_mode"
+outcome = "dispatch"
+resolved_mode = "none"
+
+[[fixtures]]
+name = "choose-mode-not-offered"
+utterance = "set the mode to schedule issues"
+screen = "overview"
+form = true
+action = "choose_mode"
+outcome = "param_unresolved"
+
+[[fixtures]]
+name = "choose-agent-type-claude"
+utterance = "use claude"
+screen = "overview"
+form = true
+action = "choose_agent_type"
+outcome = "dispatch"
+resolved_agent_type = "claude"
+
+[[fixtures]]
+name = "choose-agent-type-natural"
+utterance = "make it an opencode agent"
+screen = "overview"
+form = true
+action = "choose_agent_type"
+outcome = "dispatch"
+resolved_agent_type = "opencode"
+
+[[fixtures]]
+name = "name-new-agent"
+utterance = "call it billing worker"
+screen = "overview"
+form = true
+action = "name_new_agent"
+outcome = "dispatch"
+dictate_prefix = "call it"
+
+[[fixtures]]
+name = "choose-mode-form-not-live"
+utterance = "make it a dispatcher"
+screen = "overview"
+action = "choose_mode"
+outcome = "unavailable"
