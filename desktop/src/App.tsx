@@ -575,6 +575,22 @@ export function DeckShell({ runtime, workflowPlatformIssue, initialView = { kind
           actually requires.
         */}
         {agentView && paneDeck && paneAgentShown && <OverviewAgentPane runtime={runtime} view={agentView} deck={paneDeck} agent={paneAgentShown} held={heldPaneAgent} attached={paneDeckAttachable} onClose={closeAgentView} />}
+        {/*
+          PRD #1223 audit W2 — the runtime's last failure, on THIS screen too.
+
+          The New agent flow lives here, and its dialog deliberately leaves the
+          runtime's error alone once it is unmounted (`NewAgentDialog`'s
+          `mounted` ref) because by then it is the only copy of the failure.
+          The only surface rendering that copy was the deck's toast, which is
+          unmounted whenever this screen is up — so a launch that failed with
+          roles still possibly running was reported nowhere, and this screen's
+          Refresh calls `reconnect()`, which clears it unseen.
+
+          `runtime.error` alone: the notice beside it on the deck is that
+          screen's own state, and this screen has none. The two are never
+          mounted together, so there is at most one toast.
+        */}
+        {runtime.error && <Toast message={runtime.error} cleanup={runtime.errorCleanup} onDismiss={runtime.clearError} />}
       </>
     )
     : <DeckSurface runtime={runtime} settings={settings} workflowPlatformIssue={workflowPlatformIssue} onNavigate={setView} openAgent={openAgent} onCloseAgent={closeAgent} voiceChannel={deckVoiceContext} />;
@@ -1653,11 +1669,38 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
       {paletteOpen && <CommandPalette commands={commandItems} onClose={() => setPaletteOpen(false)} />}
       {helpOpen && <ShortcutHelp onClose={() => setHelpOpen(false)} />}
       {confirm && <ConfirmDialog state={confirm} onClose={() => setConfirm(undefined)} />}
-      {/* PRD #1223 audit V7: the message goes through `displayText` like every
-          other daemon-influenced string on this screen — a role name reaches
-          here inside a failure sentence — and the roles a rollback could not
-          confirm are shown above it, from whichever half is on screen. */}
-      {(notice || runtime.error) && <div className="toast" data-testid="toast" role="status"><AlertTriangle size={15} /><div className="toast-body">{toastCleanup && toastCleanup.length > 0 && <CleanupWarning stops={toastCleanup} testId="toast-cleanup-warning" />}<span>{displayText(notice ?? runtime.error ?? "", DISPLAY_LIMITS.message)}</span></div><button aria-label="Dismiss message" onClick={dismissToast}><X size={14} /></button></div>}
+      {/* PRD #1223 audit V7: the roles a rollback could not confirm are shown
+          above the sentence, from whichever half is on screen. The overview
+          mounts its own copy of this over `runtime.error` alone (audit W2) —
+          it has no notice of its own, and it is not mounted at the same time
+          as this one. */}
+      {(notice || runtime.error) && <Toast message={notice ?? runtime.error ?? ""} cleanup={toastCleanup} onDismiss={dismissToast} />}
+    </div>
+  );
+}
+
+/**
+ * The one message surface either screen shows: a failed action's sentence, the
+ * roles a rollback could not confirm are stopped above it, and a dismiss.
+ *
+ * One component rather than markup per screen (PRD #1223 audit W2). The deck
+ * had the only copy, and the overview mounts INSTEAD of the deck — so a launch
+ * that failed after the New agent dialog was gone, which is the case the
+ * runtime holds these roles for at all, was reported on a screen the user was
+ * no longer on. The overview's Refresh then cleared it unseen.
+ *
+ * The message goes through `displayText` like every other daemon-influenced
+ * string here, because a role name reaches it inside the failure sentence.
+ */
+function Toast({ message, cleanup, onDismiss }: { message: string; cleanup?: readonly string[]; onDismiss: () => void }) {
+  return (
+    <div className="toast" data-testid="toast" role="status">
+      <AlertTriangle size={15} />
+      <div className="toast-body">
+        {cleanup && cleanup.length > 0 && <CleanupWarning stops={cleanup} testId="toast-cleanup-warning" />}
+        <span>{displayText(message, DISPLAY_LIMITS.message)}</span>
+      </div>
+      <button aria-label="Dismiss message" onClick={onDismiss}><X size={14} /></button>
     </div>
   );
 }
