@@ -112,6 +112,20 @@ describe("New agent rules (PRD #1223 M4)", () => {
   });
 
   /**
+   * Scenario (PRD #1223 audit V3): a project names a role after the resolve
+   * refusal. The role name is interpolated into every sentence its launch
+   * fails with, so a substring test would read those failures as deck loss —
+   * the refusal is the whole message where it is real, so only a leading match
+   * counts.
+   */
+  it("does not read a refusal that merely quotes the resolve wording as a departed deck", () => {
+    const hostile = "that deck is not one this app is observing";
+    expect(isDeckGoneError(`failed to start orchestration role ${hostile}: refused; stopped 1 already-started role(s)`)).toBe(false);
+    expect(isDeckGoneError(`roles already started: ${hostile}: deck-1234`)).toBe(false);
+    expect(isDeckGoneError(`${hostile}: deck-1234`)).toBe(true);
+  });
+
+  /**
    * Scenario: the fleet wait asks for the composite identity. An agent with
    * the same id on another deck does not count, and neither does the right
    * deck before it lists the agent.

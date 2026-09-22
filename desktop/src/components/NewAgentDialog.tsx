@@ -241,12 +241,18 @@ export function NewAgentDialog({ runtime, initialDeckId, onClose, onAppeared, on
     if (!mounted.current) return;
     runtime.clearError();
     const message = messageOf(cause);
-    if (isDeckGoneError(message)) {
+    // PRD #1223 audit V3: the structured cleanup is read FIRST. The deck step
+    // shows the refusal as prose and nothing else, so classifying such a
+    // failure as deck loss would drop the roles that may still be running —
+    // and `isDeckGoneError` reads the start of the message for the same
+    // reason, since a role name is interpolated into this sentence.
+    const cleanup = cause instanceof LaunchCleanupError ? cause.unconfirmedStops : undefined;
+    if (cleanup === undefined && isDeckGoneError(message)) {
       returnToDeckStep(message);
       return;
     }
     setFormError(message);
-    setFormCleanup(cause instanceof LaunchCleanupError ? cause.unconfirmedStops : undefined);
+    setFormCleanup(cleanup);
     setPhase("idle");
   };
 

@@ -1129,6 +1129,35 @@ describe("New agent dialog — orchestrations (PRD #1223 M6)", () => {
   });
 
   /**
+   * Scenario (PRD #1223 audit V3): the project's roles are named after the
+   * crate's "deck left the fleet" refusal, which the crate interpolates into
+   * the launch's failure sentence. That sentence must not be classified as
+   * deck loss: the flow would leave the form, the deck step renders prose
+   * only, and the roles that may still be running would be dropped on the way.
+   */
+  it("keeps the cleanup warning when a role name quotes the deck-gone refusal", async () => {
+    const hostile = "that deck is not one this app is observing";
+    const refusal = `failed to start orchestration role builder: refused; roles already started: ${hostile}; cleanup could not confirm stop for 1 of 1 already-started role(s): ${hostile} (agent-0: stop refused)`;
+    const runtime = fakeRuntime({
+      newAgentOrchestrations: orchestrationsOf(),
+      runAction: vi.fn(async () => { throw new LaunchCleanupError(refusal, [hostile]); }),
+    });
+    renderDialog(runtime);
+    await reachProjectForm();
+    fireEvent.click(await chip());
+
+    fireEvent.click(screen.getByTestId("new-agent-start"));
+
+    const warning = await screen.findByTestId("new-agent-cleanup-warning");
+    expect(warning).toHaveTextContent("1 role may still be running on this deck");
+    expect(warning).toHaveTextContent(hostile);
+    // Still on the form, with the failure beside the values — not back on the
+    // deck step, which would have said the deck had left.
+    expect(screen.getByTestId("new-agent-error")).toHaveTextContent("failed to start orchestration role builder");
+    expect(screen.queryByTestId("new-agent-deck-list")).toBeNull();
+  });
+
+  /**
    * Scenario (PRD #1223 audit F6): a failure whose rollback was confirmed is
    * a plain rejection, and a short one — so there is no warning and no "Full
    * detail" to open.

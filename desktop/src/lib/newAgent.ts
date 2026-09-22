@@ -308,12 +308,26 @@ export function cleanupWarning(unconfirmedStops: readonly string[]): string {
 }
 
 /**
- * Whether a refusal means the chosen deck has left the fleet — the crate's
- * `DeckScope::resolve` wording, which the fixture bridge repeats. The flow
- * returns to the deck step on it rather than retargeting another deck.
+ * The crate's `DeckScope::resolve` refusal for a deck this app no longer
+ * observes (`src-tauri/src/dto.rs`), which the fixture bridge repeats verbatim.
+ * It is the WHOLE message on every path that raises it — the resolve runs
+ * before anything else and nothing wraps its error — so it is matched at the
+ * start of the message and nowhere else.
+ */
+const DECK_GONE_PREFIX = "that deck is not one this app is observing:";
+
+/**
+ * Whether a refusal means the chosen deck has left the fleet. The flow returns
+ * to the deck step on it rather than retargeting another deck.
+ *
+ * A LEADING match, not a substring one (PRD #1223 audit V3). Failure sentences
+ * interpolate project-controlled names — an orchestration's roles above all —
+ * so a project whose role is named after this refusal could otherwise make any
+ * failure of its own launch read as deck loss, which drops the structured
+ * cleanup warning and sends the flow back to the deck step.
  */
 export function isDeckGoneError(message: string): boolean {
-  return message.includes("that deck is not one this app is observing");
+  return message.startsWith(DECK_GONE_PREFIX);
 }
 
 /** Whether `deckId`'s fleet entry lists `agentId` — the composite identity, never the bare id. */
