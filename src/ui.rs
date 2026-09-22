@@ -20554,12 +20554,17 @@ fn scroll_focused_agent_pane(
 /// ## The rule
 ///
 /// A wheel event reaches the focused agent pane only while the pointer is inside
-/// that pane's content area ([`pane_inner_coords`]). **Anywhere else — the deck's
-/// card list, the stats bar, the tab bar, the bottom button bar, a pane's border,
-/// a non-focused pane — the wheel is dropped**, exactly as a click that lands on
-/// no hit-testable rect is dropped. The mode-tab side panes keep their own
-/// hit-test and run first in the event loop (its `side_scrolled` short-circuit),
-/// so "the pane under the pointer" remains true there too.
+/// that pane's content area ([`pane_inner_coords`]). **Of everything that reaches
+/// this function, anything else — the deck's card list, the stats bar, the tab
+/// bar, the bottom button bar, a pane's border, a non-focused pane — is
+/// dropped**, exactly as a click that lands on no hit-testable rect is dropped.
+///
+/// Two earlier layers in the same arm keep their own precedence and are not
+/// affected: the Scheduled Tasks manager takes the wheel for its own list and
+/// [`overlay_blocks_mouse`] swallows it behind every other modal, both before
+/// this is reached; and the mode-tab side panes hit-test their own rects through
+/// the `side_scrolled` short-circuit, so "the pane under the pointer" holds there
+/// too.
 ///
 /// ## Why route by pointer and not by focus
 ///
