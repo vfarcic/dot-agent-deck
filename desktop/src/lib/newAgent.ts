@@ -311,7 +311,10 @@ export type CleanupWarning = {
 
 /**
  * PRD #1223 audit F6 — the alert a failed launch shows, on its own and before
- * the error sentence, when its rollback could not confirm every role stopped.
+ * the error sentence, when its rollback could not confirm every role stopped —
+ * and, since U4, the alert an orchestration close shows for the same reason.
+ * The summary says "could not be confirmed" rather than naming a rollback, so
+ * one sentence is true of both.
  *
  * Structured rather than one sentence (audit V7): the names were joined and the
  * whole thing clamped to `DISPLAY_LIMITS.message`, so a rollback of several
@@ -329,8 +332,9 @@ export function cleanupWarning(unconfirmedStops: readonly string[]): CleanupWarn
   const count = unconfirmedStops.length;
   const subject = count === 1 ? "1 role" : `${count} roles`;
   const it = count === 1 ? "it" : "them";
+  const stops = count === 1 ? "its stop" : "their stops";
   return {
-    summary: displayText(`${subject} may still be running on this deck: the rollback could not confirm ${it} stopped. Check the deck and stop ${it} there.`, DISPLAY_LIMITS.message),
+    summary: displayText(`${subject} may still be running on this deck: ${stops} could not be confirmed. Check the deck and stop ${it} there.`, DISPLAY_LIMITS.message),
     names: unconfirmedStops.slice(0, CLEANUP_WARNING_MAX_NAMES).map((role) => displayIdentity(role, DISPLAY_LIMITS.name, UNNAMED_CLEANUP_ROLE)),
     overflow: Math.max(0, count - CLEANUP_WARNING_MAX_NAMES),
   };

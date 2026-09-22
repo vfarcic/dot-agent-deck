@@ -4834,6 +4834,162 @@ mod tests {
         );
     }
 
+    /// The ids a real registry still lists as live.
+    #[cfg(unix)]
+    fn live_ids(deck: &RealDeck) -> Vec<String> {
+        deck.registry
+            .agent_records()
+            .into_iter()
+            .map(|record| record.id)
+            .collect()
+    }
+
+    /// Scenario (PRD #1223 U4): two real daemons under **All Decks**, each
+    /// running one agent — and, because each registry mints from its own
+    /// counter, both agents are id `1`. A stop aimed at the remote row's wire
+    /// id stops the REMOTE deck's agent and leaves the local deck's namesake
+    /// running. A stop aimed at a deck id the app has never observed is refused
+    /// with `DeckScope::resolve`'s error and stops nothing on either deck.
+    ///
+    /// **What it fails against.** `StopAgent` resolved `DeckScope::selected()`,
+    /// and All Decks resolves to the local deck (#1083) — so the local `1`
+    /// was stopped instead, and the agent the user started on the other deck
+    /// from the overview could not be stopped at all without switching.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_stop_aimed_at_another_deck_under_all_decks_stops_that_decks_agent() {
+        let _selection = crate::dto::SELECTION_LOCK.lock().await;
+        let local = RealDeck::start("u4-stop-local");
+        let remote = RealDeck::start("u4-stop-remote");
+        let local_agent = local.spawn_agent("pane-local");
+        let remote_agent = remote.spawn_agent("pane-remote");
+        assert_eq!(
+            local_agent, remote_agent,
+            "the two registries mint the same first id"
+        );
+        let (settings, remote_endpoint) = all_decks_with_one_remote_row("build-box.example.com");
+        apply_all_decks_over(&local, &settings);
+        let state = crate::terminal::DesktopState::default();
+        state
+            .tunnels
+            .insert_route(
+                &remote_endpoint,
+                remote.endpoint.as_local().expect("local socket").path(),
+            )
+            .await;
+        let remote_wire = deck_wire_id(&remote_endpoint);
+
+        let unknown =
+            crate::stop_agent_action(&state, "deck-ffffffffffffffff", &remote_agent).await;
+        let after_unknown = (live_ids(&local), live_ids(&remote));
+        let stopped = crate::stop_agent_action(&state, &remote_wire, &remote_agent).await;
+        let on_local = live_ids(&local);
+        let on_remote = live_ids(&remote);
+        local.shutdown();
+        remote.shutdown();
+
+        let error = unknown.expect_err("an unobserved deck id is refused");
+        assert!(
+            error.contains("that deck is not one this app is observing"),
+            "refused with DeckScope::resolve's error, got: {error}"
+        );
+        assert_eq!(
+            after_unknown,
+            (vec![local_agent.clone()], vec![remote_agent.clone()]),
+            "the refused stop stopped nothing on either deck"
+        );
+        let scope = stopped.expect("the targeted deck accepts the stop");
+        assert_eq!(scope.identity(), remote_endpoint.identity());
+        assert!(
+            on_remote.is_empty(),
+            "the remote deck's agent is stopped: {on_remote:?}"
+        );
+        assert_eq!(
+            on_local,
+            vec![local_agent],
+            "the local deck's namesake — the one All Decks resolves to — keeps running"
+        );
+    }
+
+    /// Scenario (PRD #1223 U4): the remote deck runs two roles of one
+    /// orchestration and one unrelated agent, and the local deck one agent.
+    /// Closing the orchestration from the overview under **All Decks** stops
+    /// both roles on the remote deck, reports nothing unconfirmed, and leaves
+    /// the unrelated agent and the local deck alone. The same close aimed at
+    /// an unobserved deck id is refused with the resolve error and stops
+    /// nothing.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn closing_an_orchestration_stops_every_listed_role_on_its_deck() {
+        let _selection = crate::dto::SELECTION_LOCK.lock().await;
+        let local = RealDeck::start("u4-close-local");
+        let remote = RealDeck::start("u4-close-remote");
+        let local_agent = local.spawn_agent("pane-local");
+        let planner = remote.spawn_agent("pane-planner");
+        let builder = remote.spawn_agent("pane-builder");
+        let bystander = remote.spawn_agent("pane-bystander");
+        let (settings, remote_endpoint) = all_decks_with_one_remote_row("build-box.example.com");
+        apply_all_decks_over(&local, &settings);
+        let state = crate::terminal::DesktopState::default();
+        state
+            .tunnels
+            .insert_route(
+                &remote_endpoint,
+                remote.endpoint.as_local().expect("local socket").path(),
+            )
+            .await;
+        let remote_wire = deck_wire_id(&remote_endpoint);
+        let roles = vec![
+            crate::dto::StopOrchestrationRole {
+                agent_id: planner.clone(),
+                name: "planner".into(),
+            },
+            crate::dto::StopOrchestrationRole {
+                agent_id: builder.clone(),
+                name: "builder".into(),
+            },
+        ];
+
+        let (unknown_scope, unknown) =
+            crate::stop_orchestration_action(&state, "deck-ffffffffffffffff", &roles).await;
+        let after_unknown = live_ids(&remote).len();
+        let (scope, closed) = crate::stop_orchestration_action(&state, &remote_wire, &roles).await;
+        let on_local = live_ids(&local);
+        let on_remote = live_ids(&remote);
+        local.shutdown();
+        remote.shutdown();
+
+        assert!(unknown_scope.is_none());
+        let failure = unknown.expect_err("an unobserved deck id is refused");
+        assert!(
+            failure
+                .message
+                .contains("that deck is not one this app is observing"),
+            "{}",
+            failure.message
+        );
+        assert!(
+            failure.unconfirmed_stops.is_empty(),
+            "nothing was asked, so nothing is unconfirmed"
+        );
+        assert_eq!(after_unknown, 3, "the refused close stopped nothing");
+        closed.expect("every role's stop is confirmed");
+        assert_eq!(
+            scope.expect("the deck resolved").identity(),
+            remote_endpoint.identity()
+        );
+        assert_eq!(
+            on_remote,
+            vec![bystander],
+            "both roles stopped, the unrelated agent did not"
+        );
+        assert_eq!(
+            on_local,
+            vec![local_agent],
+            "and the local deck is untouched"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // PRD #1223 M4 — the New agent dialog's two deck-targeted queries, against
     // the same two-deck All Decks fleet the M3 start tests use.

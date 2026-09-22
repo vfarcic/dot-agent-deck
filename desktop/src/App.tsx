@@ -1231,7 +1231,7 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
       body: `This sends a stop request to ${selectedAgent.displayName}. Unsaved terminal work may be interrupted.`,
       label: "Stop agent",
       busyLabel: "Stopping…",
-      action: async () => { await perform({ type: "stop_agent", agentId: selectedAgent.id }, `${selectedAgent.role} stop requested.`); },
+      action: async () => { await perform({ type: "stop_agent", deckId: snapshot.connection.deckId ?? "", agentId: selectedAgent.id }, `${selectedAgent.role} stop requested.`); },
     });
   };
 

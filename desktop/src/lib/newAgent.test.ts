@@ -317,13 +317,13 @@ describe("New agent rules — cleanup the launch could not confirm (PRD #1223 au
     const long = (prefix: string) => `${prefix}${"r".repeat(128 - prefix.length)}`;
     const warning = cleanupWarning([long("reviewer-"), long("planner-")]);
 
-    expect(warning.summary).toBe("2 roles may still be running on this deck: the rollback could not confirm them stopped. Check the deck and stop them there.");
+    expect(warning.summary).toBe("2 roles may still be running on this deck: their stops could not be confirmed. Check the deck and stop them there.");
     expect(Array.from(warning.summary).length).toBeLessThanOrEqual(240);
     expect(warning.names).toEqual([long("reviewer-"), long("planner-")]);
     expect(warning.names.every((name) => Array.from(name).length <= 128)).toBe(true);
     expect(warning.overflow).toBe(0);
     expect(cleanupWarning(["builder"])).toEqual({
-      summary: "1 role may still be running on this deck: the rollback could not confirm it stopped. Check the deck and stop it there.",
+      summary: "1 role may still be running on this deck: its stop could not be confirmed. Check the deck and stop it there.",
       names: ["builder"],
       overflow: 0,
     });

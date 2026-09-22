@@ -1,5 +1,5 @@
 import { createFixtureFleet, createFixtureStartedAgent, DEFAULT_PROFILES, FIXTURE_DEFAULT_COMMANDS, FIXTURE_EXPERIMENTAL_DECKS, FIXTURE_HOMES, fixtureAgentRegistry, fixtureDirectoryTree, fixtureProjectOrchestrations, FIXTURE_ROLE_COMMANDS, fixtureVoiceCommands, nextFixtureAgentId, fixtureVoiceHeard, fixtureVoiceScript, fixtureVoiceStatus, fixtureVoiceTranscription, resolveFixtureVoice, type FixtureState } from "../data/fixture";
-import { actionErrorFrom } from "./actionError";
+import { actionErrorFrom, LaunchCleanupError } from "./actionError";
 import { agentKey } from "./agentKey";
 import { getTerminal } from "./terminalRegistry";
 import { applyHandoffEvent, mapDaemonEvent, MAX_LIVE_EVIDENCE } from "./daemonEvents";
@@ -1215,7 +1215,8 @@ export type DesktopRunActionDto =
   | { type: "bootstrap"; startIfMissing?: boolean }
   | { type: "start_agent"; deckId: string; command?: string; cwd?: string; displayName?: string; rows?: number; cols?: number; authoringKind?: "schedule" | "schedule-issues" | "dispatcher" }
   | { type: "start_orchestration"; deckId: string; path: string; orchestration: string; displayTitle?: string; configRevision?: string; rows?: number; cols?: number }
-  | { type: "stop_agent"; agentId: string }
+  | { type: "stop_agent"; deckId: string; agentId: string }
+  | { type: "stop_orchestration"; deckId: string; roles: { agentId: string; name: string }[] }
   | { type: "rename_agent"; agentId: string; displayName: string }
   | { type: "attach_terminal"; agentId: string; onOutput: import("@tauri-apps/api/core").Channel<ArrayBuffer> }
   | { type: "detach_terminal"; sessionId: string }
@@ -2012,6 +2013,8 @@ class FixtureDeckBridge implements DeckBridge {
       return this.startAgent(action);
     }
     if (action.type === "start_orchestration") return this.startOrchestration(action);
+    if (action.type === "stop_agent") return this.stopAgents(action.deckId, [{ agentId: action.agentId, name: action.agentId }]);
+    if (action.type === "stop_orchestration") return this.stopAgents(action.deckId, action.roles);
     if (action.type === "pause_run" || action.type === "resume_run") {
       this.snapshot.paused = action.type === "pause_run";
     } else if (action.type === "approve_run") {
@@ -2022,8 +2025,6 @@ class FixtureDeckBridge implements DeckBridge {
       // count keeps none. Every fixture stage has one; live mode has no retry
       // action at all (PRD #745 M8).
       this.snapshot.stages = this.snapshot.stages.map((stage) => stage.id === action.stageId ? { ...stage, status: "active", attempt: stage.attempt === undefined ? undefined : stage.attempt + 1 } : stage);
-    } else if (action.type === "stop_agent") {
-      this.snapshot.agents = this.snapshot.agents.map((agent) => agent.id === action.agentId ? { ...agent, status: "stopped" } : agent);
     } else if (action.type === "rename_agent") {
       this.snapshot.agents = this.snapshot.agents.map((agent) => agent.id === action.agentId ? { ...agent, displayName: action.displayName } : agent);
     } else if (action.type === "submit_text") {
@@ -2099,6 +2100,29 @@ class FixtureDeckBridge implements DeckBridge {
    * the START role's id comes back, so a spec can wait for it and open its
    * pane exactly as the live flow will.
    */
+  /**
+   * PRD #1223 U4 — the fixture half of the deck-targeted stop and of the
+   * orchestration close. The named deck is resolved as for {@link startAgent};
+   * each listed agent leaves THAT deck's fleet entry, as a stopped agent leaves
+   * a live deck's agent list. An id the deck does not list is refused, and a
+   * close with any refusal rejects as a {@link LaunchCleanupError} naming those
+   * roles — the crate's shape — after the rest have stopped.
+   */
+  private stopAgents(deckId: string, roles: readonly { agentId: string; name: string }[]): DeckActionResult {
+    const deck = this.connectedDeck(deckId);
+    const listed = new Set(deck.agents.map((agent) => agent.id));
+    const refused = roles.filter((role) => !listed.has(role.agentId));
+    const stopping = new Set(roles.map((role) => role.agentId));
+    deck.agents = deck.agents.filter((agent) => !stopping.has(agent.id));
+    this.emitSnapshot();
+    if (refused.length > 0) {
+      const reasons = refused.map((role) => `${role.name} (${role.agentId}: no such agent)`).join(", ");
+      if (roles.length === 1) throw new Error(`daemon returned error: no such agent: ${refused[0].agentId}`);
+      throw new LaunchCleanupError(`could not confirm stop for ${refused.length} of ${roles.length} role(s): ${reasons}`, refused.map((role) => role.name));
+    }
+    return { ok: true, agentId: roles.length === 1 ? roles[0].agentId : undefined };
+  }
+
   private startOrchestration(action: Extract<DeckAction, { type: "start_orchestration" }>): DeckActionResult {
     const deck = this.connectedDeck(action.deckId);
     if (this.withholdsConfiguredRoles(action.deckId)) throw new Error(FIXTURE_CONFIGURED_ROLES_UNSUPPORTED);
@@ -3588,12 +3612,13 @@ export class TauriDeckBridge implements DeckBridge {
 
   async runAction(action: DeckAction): Promise<DeckActionResult> {
     const invoke = await this.getInvoke();
-    if (action.type === "start_agent" || action.type === "start_orchestration" || action.type === "stop_agent" || action.type === "rename_agent" || action.type === "submit_text" || action.type === "start_workflow" || action.type === "stop_daemon" || action.type === "restart_daemon" || action.type === "allow_build_mismatch") {
+    if (action.type === "start_agent" || action.type === "start_orchestration" || action.type === "stop_agent" || action.type === "stop_orchestration" || action.type === "rename_agent" || action.type === "submit_text" || action.type === "start_workflow" || action.type === "stop_daemon" || action.type === "restart_daemon" || action.type === "allow_build_mismatch") {
       // `desktop_run_action` resolves with `ok: false` for a non-delivered
       // send rather than raising, so the result must be returned, not dropped.
       //
       // `start_agent` carries its target `deckId` through untouched (PRD #1223
-      // M3): the crate resolves it against the decks this app observes and
+      // M3), and so do `stop_agent` and `stop_orchestration` (U4): the crate
+      // resolves it against the decks this app observes and
       // refuses anything else, so nothing here may fill it in from the
       // selection.
       //

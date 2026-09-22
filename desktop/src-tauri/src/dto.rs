@@ -591,7 +591,25 @@ pub enum DesktopAction {
         config_revision: Option<String>,
     },
     StopAgent {
+        /// The deck the agent runs on — `connection.deckId`, resolved with
+        /// [`DeckScope::resolve`] exactly as the start actions resolve theirs
+        /// (PRD #1223 U4). This arm read the applied selection until then, so
+        /// under **All Decks**, which resolves to the local deck (#1083), an
+        /// agent started on another deck from the overview could not be
+        /// stopped without switching the selection first. Required, for
+        /// [`Self::StartAgent`]'s reason: a stop with no deck is refused at
+        /// decode rather than defaulted.
+        deck_id: String,
         agent_id: String,
+    },
+    /// PRD #1223 U4 — close a whole orchestration: stop every role the
+    /// webview's fleet entry lists for it, on the deck `deck_id` names,
+    /// concurrently. The TUI's Ctrl+W does the same over its tab's panes
+    /// (`close_panes_concurrently`); there is no orchestration-wide daemon
+    /// verb, and this adds none — it is `StopAgent` fanned out.
+    StopOrchestration {
+        deck_id: String,
+        roles: Vec<StopOrchestrationRole>,
     },
     StopDaemon {
         #[serde(default)]
@@ -620,6 +638,17 @@ pub enum DesktopAction {
         agent_id: String,
         text: String,
     },
+}
+
+/// One role a [`DesktopAction::StopOrchestration`] stops: the deck's agent id,
+/// and the name the confirmation showed — which is what a role whose stop could
+/// not be confirmed is reported as. The name is display text only; nothing is
+/// resolved by it.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StopOrchestrationRole {
+    pub agent_id: String,
+    pub name: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]

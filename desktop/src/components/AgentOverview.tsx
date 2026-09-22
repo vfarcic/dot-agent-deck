@@ -1,5 +1,5 @@
 import { createContext, useCallback, useContext, useEffect, useId, useMemo, useRef, useState, type CSSProperties, type MouseEvent, type ReactNode } from "react";
-import { Blocks, Boxes, Columns3, LayoutList, Layers, Maximize2, Network, Plus, RefreshCw, RotateCcw, ShieldAlert, Sparkles, SquareTerminal, Wrench, X } from "lucide-react";
+import { Blocks, Boxes, CircleStop, Columns3, LayoutList, Layers, Maximize2, Network, Plus, RefreshCw, RotateCcw, ShieldAlert, Sparkles, SquareTerminal, Wrench, X } from "lucide-react";
 import type { AgentSession, AgentStatus, ConnectionView, DeckRuntimeState, DeckView } from "../types";
 import { modeScopedKey } from "../lib/bridge";
 import { VOICE_ACTIONS } from "../lib/voiceActions";
@@ -610,6 +610,35 @@ const WRITE_LEASE_TITLE: Record<"read" | "write" | "none", string> = {
 const OpenAgentContext = createContext<((agent: OverviewAgent) => void) | undefined>(undefined);
 
 /**
+ * PRD #1223 U4 — closing what the New agent flow creates, from the screen it
+ * creates it on: one agent from its row, a whole orchestration from its card.
+ *
+ * Each asks the same {@link ConfirmDialog} the deck screen's stop asks, then
+ * sends a deck-scoped action — `stop_agent`, or `stop_orchestration` over every
+ * role the card lists — to the deck the agent is ON, never the selected one.
+ * A failure is filed by the runtime under its global error, which the overview's
+ * toast shows with the cleanup warning for any role whose stop the deck could
+ * not confirm.
+ *
+ * No control is disabled for its deck's state: rows and cards render only for
+ * a connected deck (`DaemonBody`), and a deck that drops between render and
+ * confirmation refuses the action, which the toast reports. While a stop is in
+ * flight the confirmation's own busy latch is what stops a second one.
+ */
+interface OverviewStopControls {
+  stopAgent: (agent: OverviewAgent) => void;
+  closeOrchestration: (group: OverviewGroup) => void;
+}
+
+const StopControlsContext = createContext<OverviewStopControls | undefined>(undefined);
+
+/** What a stop or close confirmation calls one agent — the sanitised identity its row shows, or, in an orchestration, its role. */
+export function stopTargetName(agent: OverviewAgent): string {
+  const raw = agent.tab.kind === "orchestration" && agent.tab.roleName ? agent.tab.roleName : agent.displayName;
+  return displayIdentity(raw, DISPLAY_LIMITS.name, unnamedAgentLabel(agent));
+}
+
+/**
  * The fleet at a glance: every agent the desktop can see, grouped the way the
  * daemon groups them, described only by things that are actually true — and
  * with no terminal anywhere on it. "Shows no output" and "opens no PTY" are
@@ -827,6 +856,51 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
   const [confirm, setConfirm] = useState<ConfirmState>();
   const [overrideError, setOverrideError] = useState<string>();
   /**
+   * PRD #1223 U4 — see {@link StopControlsContext}. The deck an agent is on is
+   * `daemonId`, the wire id every deck-targeted action names; the connection
+   * is read from the fleet as it is NOW, not from a copy the row captured.
+   */
+  const stopControls = useMemo<OverviewStopControls>(() => {
+    const deckOf = (deckId: string) => fleet.find((deck) => deck.connection.deckId === deckId);
+    const run = async (action: Parameters<DeckRuntimeState["runAction"]>[0]) => {
+      try {
+        await runtime.runAction(action);
+      } catch {
+        // Filed by the runtime under its global error — with the roles it
+        // could not confirm beside it — which the overview's toast renders.
+      }
+    };
+    return {
+      stopAgent: (agent) => {
+        const deck = deckOf(agent.daemonId);
+        if (!deck) return;
+        const name = stopTargetName(agent);
+        setConfirm({
+          title: `Stop ${name}?`,
+          body: `This sends a stop request to ${name} on ${deckName(deck.connection)}. Unsaved terminal work may be interrupted.`,
+          label: "Stop agent",
+          busyLabel: "Stopping…",
+          action: () => run({ type: "stop_agent", deckId: agent.daemonId, agentId: agent.id }),
+        });
+      },
+      closeOrchestration: (group) => {
+        const deckId = group.agents[0]?.daemonId;
+        const deck = deckId === undefined ? undefined : deckOf(deckId);
+        if (deckId === undefined || !deck) return;
+        const roles = group.agents.map((agent) => ({ agentId: agent.id, name: stopTargetName(agent) }));
+        const title = displayIdentity(group.title, DISPLAY_LIMITS.name, unnamedGroupLabel(group));
+        const count = roles.length === 1 ? "its 1 role" : `all ${roles.length} of its roles`;
+        setConfirm({
+          title: `Close ${title}?`,
+          body: `This stops every role of this orchestration on ${deckName(deck.connection)} — ${count}: ${roles.map((role) => role.name).join(", ")}. Unsaved terminal work in any of them may be interrupted.`,
+          label: roles.length === 1 ? "Stop 1 role" : `Stop all ${roles.length} roles`,
+          busyLabel: "Stopping…",
+          action: () => run({ type: "stop_orchestration", deckId, roles }),
+        });
+      },
+    };
+  }, [fleet, runtime]);
+  /**
    * Issue #801. Daemon LIFECYCLE actions still live on the deck — this starts,
    * stops and replaces nothing. It relaxes this app's own build-stamp
    * comparison for this session, which is a judgement about what the user is
@@ -973,7 +1047,7 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
       )}
     </div>
   );
-  return <OpenAgentContext.Provider value={openAgent}>{overviewScreen}</OpenAgentContext.Provider>;
+  return <OpenAgentContext.Provider value={openAgent}><StopControlsContext.Provider value={stopControls}>{overviewScreen}</StopControlsContext.Provider></OpenAgentContext.Provider>;
 }
 
 /** One deck of the fleet, as {@link AgentOverview} prepares it for rendering. */
@@ -1484,6 +1558,8 @@ function OverviewGroupCard({ group, now, columns }: { group: OverviewGroup; now:
   // Shown only when it says something: a subtitle that renders to nothing is an
   // empty `<code>` chip next to the heading, which reads as a rendering fault.
   const subtitle = group.subtitle ? displayText(group.subtitle, DISPLAY_LIMITS.name) : undefined;
+  const stopControls = useContext(StopControlsContext);
+  const groupName = displayIdentity(group.title, DISPLAY_LIMITS.name, unnamedGroupLabel(group));
   return (
     <article
       className="overview-group"
@@ -1520,6 +1596,17 @@ function OverviewGroupCard({ group, now, columns }: { group: OverviewGroup; now:
         <div className="overview-group-pips">{counts.map((entry) => (
           <span className={`status-label status-${entry.status}`} key={entry.status}>{entry.count} {entry.status}</span>
         ))}</div>
+        {/* PRD #1223 U4: the TUI's Ctrl+W on this orchestration's tab — every role, after a confirmation that names them. */}
+        {stopControls && group.kind === "orchestration" && (
+          <button
+            type="button"
+            className="button secondary compact overview-close-orchestration"
+            data-testid="overview-close-orchestration"
+            aria-label={`Close ${groupName} orchestration`}
+            title="Stop every role of this orchestration"
+            onClick={() => stopControls.closeOrchestration(group)}
+          ><X size={12} /><span>Close</span></button>
+        )}
       </header>
       {/*
         A real `<table>`, because this screen IS a table and `<th scope="col">`
@@ -1603,6 +1690,7 @@ function OverviewRow({ agent, hoistedCwd, now, columns }: { agent: OverviewAgent
     [#1073](https://github.com/vfarcic/dot-agent-deck/issues/1073).
   */
   const openAgent = useContext(OpenAgentContext);
+  const stopControls = useContext(StopControlsContext);
   // ONE instant for the whole screen, ticked by `useOverviewClock` so these two
   // cells keep counting between daemon events. Passed down rather than read
   // here so every row on a repaint is relative to the same moment rather than
@@ -1654,6 +1742,22 @@ function OverviewRow({ agent, hoistedCwd, now, columns }: { agent: OverviewAgent
                 title={`Open ${name} in a full-window pane`}
                 onClick={() => openAgent(agent)}
               ><Maximize2 size={12} /></button>
+            )}
+            {/*
+              PRD #1223 U4 — stop this one agent, on the deck it is on. On the
+              ROW rather than in the pane overlay: the row is where the overview
+              already puts an agent's one action, it is reachable without
+              opening anything, and stopping from inside the pane would close
+              the pane under the reader the moment the deck stopped listing it.
+            */}
+            {stopControls && (
+              <button
+                className="overview-stop-agent"
+                data-testid="overview-stop-agent"
+                aria-label={`Stop ${name} agent`}
+                title={`Stop ${name}`}
+                onClick={() => stopControls.stopAgent(agent)}
+              ><CircleStop size={12} /></button>
             )}
           </td>
         );

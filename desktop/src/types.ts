@@ -792,7 +792,21 @@ export type DeckAction =
    */
   | { type: "start_orchestration"; deckId: string; path: string; orchestration: string; displayTitle?: string; configRevision?: string; rows?: number; cols?: number }
   | { type: "retry_stage"; stageId: string }
-  | { type: "stop_agent"; agentId: string }
+  /**
+   * PRD #1223 U4 — stop one agent on the deck `deckId` names, which the crate
+   * resolves as it resolves a start's: never from the selection, so an agent on
+   * another deck can be stopped from the overview under All Decks.
+   */
+  | { type: "stop_agent"; deckId: string; agentId: string }
+  /**
+   * PRD #1223 U4 — close a whole orchestration: stop every one of `roles` on the
+   * deck `deckId` names, concurrently. There is no orchestration-wide daemon
+   * verb; this is `stop_agent` fanned out, as the TUI's Ctrl+W closes a tab's
+   * panes. A role whose stop the deck refused or did not answer is named in the
+   * rejection, which arrives as a `LaunchCleanupError`; `name` is what it is
+   * named as.
+   */
+  | { type: "stop_orchestration"; deckId: string; roles: { agentId: string; name: string }[] }
   | { type: "rename_agent"; agentId: string; displayName: string }
   | { type: "submit_text"; agentId: string; text: string };
 

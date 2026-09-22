@@ -1554,7 +1554,8 @@ describe("AgentOverview", () => {
 
   /**
    * Scenario: list every interactive element in every row of three fixtures,
-   * which is the open control and nothing else; then put one of each kind of
+   * which is the open control and the stop control (PRD #1223 U4) and nothing
+   * else; then put one of each kind of
    * control into a row and click it. Each control gets its own click and none
    * of them opens the pane.
    */
@@ -1576,7 +1577,7 @@ describe("AgentOverview", () => {
       const { container, unmount } = render(<AgentOverview runtime={runtime(overrides)} onNavigate={vi.fn()} />);
       for (const row of container.querySelectorAll(".overview-row")) {
         const controls = [...row.querySelectorAll(INTERACTIVE)];
-        expect(controls.map((control) => control.className)).toEqual(["overview-open-agent"]);
+        expect(controls.map((control) => control.className)).toEqual(["overview-open-agent", "overview-stop-agent"]);
         rowsSeen += 1;
       }
       unmount();

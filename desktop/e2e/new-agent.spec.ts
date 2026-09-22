@@ -68,6 +68,77 @@ test.describe("the New agent flow", () => {
   });
 
   /**
+   * Scenario (PRD #1223 U4): start an agent in `scratch` on the remote deck and
+   * close its pane. On the overview, press Stop on its row: a confirmation
+   * names the agent and the deck. Confirm it, and the agent leaves that deck's
+   * group — the fixture deck drops it the way a live deck's agent list does.
+   */
+  test("stops an agent it started from the overview, and the agent leaves the fleet", async ({ page }) => {
+    await openOverview(page, "fleet");
+
+    await page.getByTestId("overview-new-agent").click();
+    await page.getByTestId("new-agent-deck-list").locator(`[data-deck-id="${REMOTE_DECK}"]`).click();
+    const directories = page.getByTestId("new-agent-directory-list");
+    await expect(directories).toBeFocused();
+    await page.keyboard.press("j");
+    await page.keyboard.press("Enter");
+    await expect(page.getByTestId("new-agent-current-path")).toHaveText("/home/build/scratch");
+    await page.keyboard.press(" ");
+    await page.getByTestId("new-agent-start").click();
+    const overlay = page.getByTestId("agent-pane-overlay");
+    await expect(overlay).toBeVisible();
+    await page.keyboard.press("Escape");
+    await expect(overlay).toHaveCount(0);
+
+    const remoteGroup = page.locator(`[data-testid="daemon-group"][data-daemon-id="${REMOTE_DECK}"]`);
+    await expect(remoteGroup.getByRole("button", { name: "Open scratch agent", exact: true })).toBeVisible();
+    await remoteGroup.getByRole("button", { name: "Stop scratch agent", exact: true }).click();
+    const confirm = page.getByRole("alertdialog");
+    await expect(confirm).toContainText("Stop scratch?");
+    await expect(confirm).toContainText(REMOTE_DECK);
+    await confirm.getByRole("button", { name: "Stop agent" }).click();
+
+    await expect(confirm).toHaveCount(0);
+    await expect(remoteGroup.getByRole("button", { name: "Open scratch agent", exact: true })).toHaveCount(0);
+  });
+
+  /**
+   * Scenario (PRD #1223 U4): launch `demo-loop` in `demo-project` on the remote
+   * deck and close the start role's pane. On the overview, press Close on the
+   * orchestration's card: the confirmation says it stops every role and names
+   * planner and builder. Confirm it, and both roles leave that deck's group.
+   */
+  test("closes an orchestration it launched, and every role leaves the fleet", async ({ page }) => {
+    await openOverview(page, "fleet");
+
+    await page.getByTestId("overview-new-agent").click();
+    await page.getByTestId("new-agent-deck-list").locator(`[data-deck-id="${REMOTE_DECK}"]`).click();
+    await expect(page.getByTestId("new-agent-directory-list")).toBeFocused();
+    await page.keyboard.press("Enter");
+    await expect(page.getByTestId("new-agent-current-path")).toHaveText("/home/build/demo-project");
+    await page.keyboard.press(" ");
+    await page.getByTestId("new-agent-mode-orch:demo-loop").click();
+    await expect(page.getByTestId("new-agent-name")).toHaveValue("demo-project-orchestrator-1");
+    await page.getByTestId("new-agent-start").click();
+    const overlay = page.getByTestId("agent-pane-overlay");
+    await expect(overlay).toBeVisible();
+    await page.keyboard.press("Escape");
+    await expect(overlay).toHaveCount(0);
+
+    const remoteGroup = page.locator(`[data-testid="daemon-group"][data-daemon-id="${REMOTE_DECK}"]`);
+    await expect(remoteGroup.getByRole("button", { name: "Open planner agent", exact: true })).toBeVisible();
+    await remoteGroup.getByRole("button", { name: "Close demo-project-orchestrator-1 orchestration" }).click();
+    const confirm = page.getByRole("alertdialog");
+    await expect(confirm).toContainText("This stops every role of this orchestration");
+    await expect(confirm).toContainText("planner, builder");
+    await confirm.getByRole("button", { name: "Stop all 2 roles" }).click();
+
+    await expect(confirm).toHaveCount(0);
+    await expect(remoteGroup.getByRole("button", { name: "Open planner agent", exact: true })).toHaveCount(0);
+    await expect(remoteGroup.getByRole("button", { name: "Open builder agent", exact: true })).toHaveCount(0);
+  });
+
+  /**
    * Scenario (PRD #1223 M7): on the fleet, open New agent and choose the
    * remote deck, whose own experimental flag is on. Use its home directory
    * with Space. The Mode row offers the three authoring agents; move to

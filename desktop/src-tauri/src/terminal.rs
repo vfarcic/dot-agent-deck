@@ -2214,7 +2214,11 @@ mod tests {
         // `join!` rather than `spawn`: the action borrows `state`, and the two
         // halves have to interleave inside one task anyway — the whole
         // condition is "the selection moves while the stop is in flight".
-        let stopping = crate::stop_agent_action(&state, "planner");
+        // The stop names deck A, as the webview does since PRD #1223 U4; the
+        // selection move below is then doubly irrelevant to which deck is
+        // stopped, and this test still pins which deck's session is detached.
+        let wire_a = crate::dto::deck_wire_id(&deck_a);
+        let stopping = crate::stop_agent_action(&state, &wire_a, "planner");
         let moving = async {
             stop_arrived_rx
                 .await
@@ -2234,7 +2238,12 @@ mod tests {
             let _ = release_stop_tx.send(());
         };
         let (stopped, ()) = tokio::join!(stopping, moving);
-        stopped.expect("the scripted deck accepted the stop");
+        let scope = stopped.expect("the scripted deck accepted the stop");
+        assert_eq!(
+            scope.identity(),
+            deck_a.identity(),
+            "the stop captured the deck it named"
+        );
 
         let request = deck.await.expect("the scripted deck must finish");
         let request: serde_json::Value =

@@ -1347,6 +1347,9 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
    clamped by its own `text-overflow` and the control never moves. */
 .overview-open-agent { flex: 0 0 auto; margin-left: auto; width: 20px; height: 20px; display: grid; place-items: center; border: 1px solid transparent; border-radius: 4px; color: var(--faint); background: transparent; cursor: pointer; }
 .overview-open-agent:hover, .overview-open-agent:focus-visible, .overview-row.is-openable:hover .overview-open-agent { color: var(--teal); border-color: var(--teal-focus); background: var(--teal-soft); }
+.overview-stop-agent { flex: 0 0 auto; width: 20px; height: 20px; display: grid; place-items: center; border: 1px solid transparent; border-radius: 4px; color: var(--faint); background: transparent; cursor: pointer; }
+.overview-stop-agent:hover, .overview-stop-agent:focus-visible { color: var(--red); border-color: currentColor; }
+.overview-close-orchestration { margin-left: 6px; }
 /* A click anywhere on the row opens the pane too, so the row reads as one
    target: a pointer over all of it, and while it is hovered the control lights
    exactly as it does under the pointer itself. The control is what carries the

@@ -695,33 +695,93 @@ async fn rollback_workflow_agents<D: WorkflowDaemon + Sync>(
 ) -> RollbackOutcome {
     let mut unconfirmed = Vec::new();
     for started_role in started.iter().rev() {
-        let reason = match tokio::time::timeout(
-            WORKFLOW_ROLE_STOP_TIMEOUT,
-            daemon.stop_workflow_agent(&started_role.agent_id),
-        )
-        .await
-        {
-            Ok(Ok(())) => continue,
-            Ok(Err(error)) => format!(
-                "{}: {}",
-                safe_message(&started_role.agent_id),
-                safe_message(error)
-            ),
-            Err(_) => format!(
-                "{}: the deck did not answer the stop within {}s",
-                safe_message(&started_role.agent_id),
-                WORKFLOW_ROLE_STOP_TIMEOUT.as_secs()
-            ),
-        };
-        unconfirmed.push(UnconfirmedStop {
-            role: started_role.role.clone(),
-            reason,
-        });
+        if let Some(stop) = bounded_role_stop(daemon, started_role).await {
+            unconfirmed.push(stop);
+        }
     }
     RollbackOutcome {
         attempted: started.len(),
         unconfirmed,
     }
+}
+
+/// One role's stop under [`WORKFLOW_ROLE_STOP_TIMEOUT`]: `None` when the deck
+/// confirmed it, otherwise the role and why it is not confirmed — refused, or
+/// not answered within the bound. Shared by the rollback, which stops roles
+/// one after another, and by [`stop_roles_concurrently`].
+async fn bounded_role_stop<D: WorkflowDaemon + Sync>(
+    daemon: &D,
+    role: &StartedRole,
+) -> Option<UnconfirmedStop> {
+    let reason = match tokio::time::timeout(
+        WORKFLOW_ROLE_STOP_TIMEOUT,
+        daemon.stop_workflow_agent(&role.agent_id),
+    )
+    .await
+    {
+        Ok(Ok(())) => return None,
+        Ok(Err(error)) => format!("{}: {}", safe_message(&role.agent_id), safe_message(error)),
+        Err(_) => format!(
+            "{}: the deck did not answer the stop within {}s",
+            safe_message(&role.agent_id),
+            WORKFLOW_ROLE_STOP_TIMEOUT.as_secs()
+        ),
+    };
+    Some(UnconfirmedStop {
+        role: role.role.clone(),
+        reason,
+    })
+}
+
+/// PRD #1223 U4 — stop every one of `roles` at once, each under its own
+/// [`WORKFLOW_ROLE_STOP_TIMEOUT`], and return one outcome per role, aligned
+/// with `roles`: `None` for a confirmed stop, otherwise why it is not.
+///
+/// Concurrent, as the TUI's Ctrl+W closes a tab's panes
+/// (`close_panes_concurrently`): the stops are independent, so a wedged one
+/// costs one bound for the whole close rather than one per role behind it.
+async fn stop_roles_concurrently<D: WorkflowDaemon + Sync>(
+    daemon: &D,
+    roles: &[StartedRole],
+) -> Vec<Option<UnconfirmedStop>> {
+    join_ordered(
+        roles
+            .iter()
+            .map(|role| bounded_role_stop(daemon, role))
+            .collect(),
+    )
+    .await
+}
+
+/// Drive every future in `futures` concurrently on this task and return their
+/// outputs in the order given. The crate's one join-all, kept here rather than
+/// taking a `futures` dependency for it; each future is polled only until it
+/// completes.
+async fn join_ordered<F: std::future::Future>(futures: Vec<F>) -> Vec<F::Output> {
+    let mut futures: Vec<std::pin::Pin<Box<F>>> = futures.into_iter().map(Box::pin).collect();
+    let mut outputs: Vec<Option<F::Output>> = futures.iter().map(|_| None).collect();
+    std::future::poll_fn(|cx| {
+        let mut pending = false;
+        for (future, output) in futures.iter_mut().zip(outputs.iter_mut()) {
+            if output.is_some() {
+                continue;
+            }
+            match future.as_mut().poll(cx) {
+                std::task::Poll::Ready(value) => *output = Some(value),
+                std::task::Poll::Pending => pending = true,
+            }
+        }
+        if pending {
+            std::task::Poll::Pending
+        } else {
+            std::task::Poll::Ready(())
+        }
+    })
+    .await;
+    outputs
+        .into_iter()
+        .map(|output| output.expect("every future completed"))
+        .collect()
 }
 
 /// One role's start under [`WORKFLOW_ROLE_START_TIMEOUT`], with the elapsed
@@ -2826,16 +2886,42 @@ async fn apply_selection(app: &AppHandle, state: &DesktopState, settings: &Deskt
 /// what lets a test drive the *caller* against a scripted daemon with the
 /// selection moved underneath it, rather than pinning `detach_agent_on` in
 /// isolation and proving nothing about who calls it.
-async fn stop_agent_action(state: &DesktopState, agent_id: &str) -> Result<(), String> {
+///
+/// # The deck comes from the request (PRD #1223 U4)
+///
+/// `deck_id` is resolved with [`crate::dto::DeckScope::resolve`], as the start
+/// actions resolve theirs, and never from the selection — so an agent started
+/// on another deck from the overview under **All Decks** is stopped on THAT
+/// deck. An id the app no longer observes is refused with the resolve error,
+/// before anything is asked of any deck.
+///
+/// The stop is bounded by [`WORKFLOW_ROLE_STOP_TIMEOUT`], so a deck that takes
+/// the connection and never answers ends the action with a sentence rather
+/// than holding the confirmation open.
+async fn stop_agent_action(
+    state: &DesktopState,
+    deck_id: &str,
+    agent_id: &str,
+) -> Result<crate::dto::DeckScope, String> {
     validate_agent_id(agent_id)?;
-    let scope = crate::dto::DeckScope::selected();
+    let scope = crate::dto::DeckScope::resolve(Some(deck_id))?;
     let daemon = state.daemon.trusted(scope.endpoint()).await?;
     daemon.require_compatible()?;
-    daemon
-        .client
-        .stop_agent(agent_id)
-        .await
-        .map_err(|error| safe_message(error.to_string()))?;
+    match tokio::time::timeout(
+        WORKFLOW_ROLE_STOP_TIMEOUT,
+        daemon.client.stop_agent(agent_id),
+    )
+    .await
+    {
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) => return Err(safe_message(error.to_string())),
+        Err(_) => {
+            return Err(format!(
+                "the deck did not answer the stop within {}s",
+                WORKFLOW_ROLE_STOP_TIMEOUT.as_secs()
+            ));
+        }
+    }
     // Preserve a working attachment when stop fails: this line is after the `?`
     // above, so a refused stop leaves the terminal alone. Once the daemon
     // confirms, remove the registry entry promptly; the stream reader will also
@@ -2845,7 +2931,87 @@ async fn stop_agent_action(state: &DesktopState, agent_id: &str) -> Result<(), S
     // The deck is the SCOPE's — the one this operation authenticated against
     // and stopped the agent on — and never a fresh read of the selection.
     terminal::detach_agent_on(state, &scope.identity(), agent_id).await;
-    Ok(())
+    Ok(scope)
+}
+
+/// PRD #1223 U4 — close a whole orchestration on the deck `deck_id` names:
+/// [`stop_roles_concurrently`] over every role the webview listed, then detach
+/// each confirmed role's terminal.
+///
+/// The deck is resolved once, as [`stop_agent_action`] resolves it, and
+/// returned beside the outcome whenever it resolved — including when a stop
+/// was not confirmed — so the caller can refresh THAT deck either way: some
+/// roles may have stopped.
+///
+/// A role whose stop was refused or not answered within the bound is named, as
+/// data, in the [`LaunchFailure`] — the same shape a launch's rollback reports,
+/// so the webview shows it with the same cleanup warning.
+async fn stop_orchestration_action(
+    state: &DesktopState,
+    deck_id: &str,
+    roles: &[crate::dto::StopOrchestrationRole],
+) -> (Option<crate::dto::DeckScope>, Result<(), LaunchFailure>) {
+    if roles.is_empty() {
+        return (
+            None,
+            Err("an orchestration close names no role to stop"
+                .to_string()
+                .into()),
+        );
+    }
+    for role in roles {
+        if let Err(error) = validate_agent_id(&role.agent_id) {
+            return (None, Err(error.into()));
+        }
+    }
+    let scope = match crate::dto::DeckScope::resolve(Some(deck_id)) {
+        Ok(scope) => scope,
+        Err(error) => return (None, Err(error.into())),
+    };
+    let daemon = match state.daemon.trusted(scope.endpoint()).await {
+        Ok(daemon) => daemon,
+        Err(error) => return (Some(scope), Err(error.into())),
+    };
+    if let Err(error) = daemon.require_compatible() {
+        return (Some(scope), Err(error.into()));
+    }
+    let started: Vec<StartedRole> = roles
+        .iter()
+        .map(|role| StartedRole {
+            agent_id: role.agent_id.clone(),
+            role: role.name.clone(),
+        })
+        .collect();
+    let outcomes = stop_roles_concurrently(&*daemon.client, &started).await;
+    let mut unconfirmed = Vec::new();
+    for (role, outcome) in started.iter().zip(outcomes) {
+        match outcome {
+            // A refused or unanswered stop leaves its terminal alone, as
+            // `stop_agent_action` does: the agent may still be running.
+            Some(stop) => unconfirmed.push(stop),
+            None => terminal::detach_agent_on(state, &scope.identity(), &role.agent_id).await,
+        }
+    }
+    if unconfirmed.is_empty() {
+        return (Some(scope), Ok(()));
+    }
+    let message = format!(
+        "could not confirm stop for {} of {} role(s): {}",
+        unconfirmed.len(),
+        started.len(),
+        unconfirmed
+            .iter()
+            .map(|stop| format!("{} ({})", safe_message(&stop.role), stop.reason))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    (
+        Some(scope),
+        Err(LaunchFailure {
+            message,
+            unconfirmed_stops: unconfirmed.into_iter().map(|stop| stop.role).collect(),
+        }),
+    )
 }
 
 /// What the webview asked a [`DesktopAction::StartAgent`] to spawn, minus the
@@ -3611,9 +3777,30 @@ async fn desktop_run_action(
                     .into(),
             );
         }
-        DesktopAction::StopAgent { agent_id } => {
-            stop_agent_action(&state, &agent_id).await?;
+        DesktopAction::StopAgent { deck_id, agent_id } => {
+            let scope = stop_agent_action(&state, &deck_id, &agent_id).await?;
+            // PRD #1223 U4: the TARGET deck, directly, for the StartAgent
+            // arm's reason — the tail below refreshes only the selected one.
+            if let Some(snapshot) = target_deck_snapshot(&state.daemon, &scope).await {
+                emit_snapshot(&app, &snapshot);
+            }
+            state.request_refetch(&scope.identity());
             result_agent_id = Some(agent_id);
+        }
+        DesktopAction::StopOrchestration { deck_id, roles } => {
+            let (scope, outcome) = stop_orchestration_action(&state, &deck_id, &roles).await;
+            // Refreshed whatever the outcome: a close that could not confirm
+            // every stop has still stopped the rest.
+            if let Some(scope) = &scope {
+                if let Some(snapshot) = target_deck_snapshot(&state.daemon, scope).await {
+                    emit_snapshot(&app, &snapshot);
+                }
+                state.request_refetch(&scope.identity());
+            }
+            outcome.map_err(|failure| {
+                DesktopActionError::launch(failure.message, failure.unconfirmed_stops)
+            })?;
+            result_agent_ids = roles.into_iter().map(|role| role.agent_id).collect();
         }
         DesktopAction::StopDaemon { force } => {
             // PRD #741 M2: `run_daemon_stop` takes a `LocalEndpoint`, so this
@@ -6454,6 +6641,92 @@ command = "configured-planner"
             ["reviewer", "planner"],
             "every role whose stop was not confirmed is carried as data, newest first (audit F6)"
         );
+    }
+
+    /// Scenario (PRD #1223 U4): an orchestration close over four roles, where
+    /// the deck confirms two, refuses one and never answers one. The stops run
+    /// CONCURRENTLY — every role is asked, and the whole close costs one stop
+    /// bound rather than one per role behind the wedged stop — and the
+    /// outcomes line up with the roles: the refused and the unanswered role are
+    /// named as unconfirmed with their reasons, and the two confirmed ones are
+    /// not.
+    #[tokio::test(start_paused = true)]
+    async fn closing_an_orchestration_stops_every_role_at_once_and_names_the_unconfirmed() {
+        let daemon = FakeWorkflowDaemon::new(Ok(None), [], Ok(SendResult::Applied));
+        daemon
+            .stop_hangs
+            .lock()
+            .unwrap()
+            .insert("agent-1".to_string());
+        daemon
+            .stop_errors
+            .lock()
+            .unwrap()
+            .insert("agent-2".to_string(), "stop refused".to_string());
+        let roles: Vec<StartedRole> = ["planner", "builder", "reviewer", "tester"]
+            .iter()
+            .enumerate()
+            .map(|(index, role)| StartedRole {
+                agent_id: format!("agent-{index}"),
+                role: role.to_string(),
+            })
+            .collect();
+        let began = tokio::time::Instant::now();
+
+        let outcomes = stop_roles_concurrently(&daemon, &roles).await;
+
+        let mut attempts = daemon.stop_attempts.lock().unwrap().clone();
+        attempts.sort();
+        assert_eq!(
+            attempts,
+            ["agent-0", "agent-1", "agent-2", "agent-3"],
+            "every role is asked"
+        );
+        let mut stopped = daemon.stopped.lock().unwrap().clone();
+        stopped.sort();
+        assert_eq!(stopped, ["agent-0", "agent-3"]);
+        assert_eq!(
+            began.elapsed(),
+            WORKFLOW_ROLE_STOP_TIMEOUT,
+            "concurrent: one wedged stop costs one bound for the whole close"
+        );
+        assert_eq!(outcomes.len(), 4, "one outcome per role, aligned");
+        assert!(outcomes[0].is_none());
+        assert_eq!(
+            outcomes[1],
+            Some(UnconfirmedStop {
+                role: "builder".into(),
+                reason: "agent-1: the deck did not answer the stop within 15s".into(),
+            })
+        );
+        assert_eq!(
+            outcomes[2],
+            Some(UnconfirmedStop {
+                role: "reviewer".into(),
+                reason: "agent-2: stop refused".into(),
+            })
+        );
+        assert!(outcomes[3].is_none());
+    }
+
+    /// Scenario (PRD #1223 U4): the webview sends a `stop_agent` or a
+    /// `stop_orchestration` that names no deck. Both fail to decode, for
+    /// `start_agent`'s reason — a stop must never fall back to the selection.
+    #[test]
+    fn a_stop_without_a_deck_does_not_decode() {
+        for action in [
+            serde_json::json!({"type": "stop_agent", "agentId": "7"}),
+            serde_json::json!({"type": "stop_orchestration", "roles": [{"agentId": "7", "name": "planner"}]}),
+        ] {
+            assert!(
+                serde_json::from_value::<DesktopAction>(action.clone()).is_err(),
+                "{action} must not decode"
+            );
+        }
+        assert!(matches!(
+            serde_json::from_value::<DesktopAction>(serde_json::json!({"type": "stop_agent", "deckId": "deck-000000000000dec1", "agentId": "7"})),
+            Ok(DesktopAction::StopAgent { deck_id, agent_id }) if deck_id == "deck-000000000000dec1" && agent_id == "7"
+        ));
     }
 
     /// Scenario (PRD #1223 audit F4): the Runs launch shares the rollback, and
