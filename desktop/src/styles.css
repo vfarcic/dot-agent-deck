@@ -94,16 +94,19 @@
      63.9%): 4.76:1 on the light --shell and 5.25:1 on the dark one.
 
      What that costs is recorded rather than hidden. `.connection-lamp
-     .connection-error` uses this token as a FILL, and three of its four call
-     sites — `.topbar`, the deck selector, `.daemon-group-header` — are LIGHT
-     chrome in light mode. No value can be light enough for 4.5:1 as text on
-     --shell and still 3:1 as a fill on --paper; the two windows do not overlap,
-     at any value, so the fill/--topbar figure was going below 3:1 the moment the
-     text case was fixed at all (it is 2.86:1, from 3.33:1). The lamp keeps its
-     WCAG 1.4.11 standing from the 2px --shell-line ring the base `.connection-lamp`
-     rule gives it: the ring is what identifies the component against the page,
-     and the fill only has to be told apart from the ring, which it clears at
-     4.37:1. */
+     .connection-error` uses this token as a FILL, at four JSX call sites, and
+     they split evenly rather than mostly-dark: `App.tsx` and `AgentOverview.tsx`
+     each put one in `.rail-bottom`, which is DARK (`.rail`'s own `--shell`
+     background) — and the other two are LIGHT, `.topbar` (the deck selector's
+     lamp, which inherits the topbar's background because `.deck-selector-trigger`
+     declares none of its own) and `.daemon-group-header`. No value can be light
+     enough for 4.5:1 as text on --shell and still 3:1 as a fill on --paper; the
+     two windows do not overlap, at any value, so the fill/--topbar figure was
+     going below 3:1 the moment the text case was fixed at all (it is 2.86:1,
+     from 3.33:1). The lamp keeps its WCAG 1.4.11 standing from the 2px
+     --shell-line ring the base `.connection-lamp` rule gives it: the ring is
+     what identifies the component against the page, and the fill only has to be
+     told apart from the ring, which it clears at 4.37:1. */
   --status-ok: #6db58b;
   --status-warn: #c69a4e;
   --status-error: #d57971;
@@ -243,11 +246,11 @@
     /* Live status. Identical to the light block by decision: these were picked to */
     /* read against the dark instrument chrome, which is where the terminal */
     /* input-state notices and the check rows are. NOT every call site, though -- */
-    /* `.connection-lamp` also sits in `.topbar`, the deck selector and */
-    /* `.daemon-group-header`, which are LIGHT chrome in light mode; issue #822's */
-    /* note in the light block has what that constrains and what it cost. */
-    /* --status-error moved from #d0685f for #822 and moved in all three blocks, */
-    /* keeping the family identical across appearances. */
+    /* `.connection-lamp` also sits in `.topbar` (via the deck selector, whose own */
+    /* background is none) and in `.daemon-group-header`, both LIGHT chrome in */
+    /* light mode; issue #822's note in the light block has what that constrains */
+    /* and what it cost. --status-error moved from #d0685f for #822 and moved in */
+    /* all three blocks, keeping the family identical across appearances. */
     --status-ok: #6db58b;
     --status-warn: #c69a4e;
     --status-error: #d57971;
@@ -352,11 +355,11 @@
   /* Live status. Identical to the light block by decision: these were picked to */
   /* read against the dark instrument chrome, which is where the terminal */
   /* input-state notices and the check rows are. NOT every call site, though -- */
-  /* `.connection-lamp` also sits in `.topbar`, the deck selector and */
-  /* `.daemon-group-header`, which are LIGHT chrome in light mode; issue #822's */
-  /* note in the light block has what that constrains and what it cost. */
-  /* --status-error moved from #d0685f for #822 and moved in all three blocks, */
-  /* keeping the family identical across appearances. */
+  /* `.connection-lamp` also sits in `.topbar` (via the deck selector, whose own */
+  /* background is none) and in `.daemon-group-header`, both LIGHT chrome in */
+  /* light mode; issue #822's note in the light block has what that constrains */
+  /* and what it cost. --status-error moved from #d0685f for #822 and moved in */
+  /* all three blocks, keeping the family identical across appearances. */
   --status-ok: #6db58b;
   --status-warn: #c69a4e;
   --status-error: #d57971;
