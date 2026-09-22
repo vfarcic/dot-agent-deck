@@ -760,6 +760,29 @@ describe("ControlDeck", () => {
   });
 
   /**
+   * Scenario (PRD #1223 audit V7): a launch failed with roles its rollback
+   * could not confirm stopped, and the dialog that would have shown them is
+   * gone — the runtime's global error is the only copy left. The toast must
+   * show those roles as their own alert rather than only the sentence that
+   * names them last, and must render the sentence through `displayText`: a
+   * role name reaches it inside that sentence, so a bidi override in one could
+   * otherwise reorder what the user reads.
+   */
+  it("shows the runtime's unconfirmed roles on the toast, with the sentence sanitised", () => {
+    const hostile = "plan\u202Ener";
+    render(<ControlDeck runtime={runtime({
+      error: `failed to start orchestration role ${hostile}: refused; cleanup could not confirm stop for 1 of 1 already-started role(s)`,
+      errorCleanup: [hostile],
+    })} />);
+
+    const toast = screen.getByTestId("toast");
+    expect(within(toast).getByTestId("toast-cleanup-warning")).toHaveTextContent("1 role may still be running on this deck");
+    expect(within(toast).getByTestId("toast-cleanup-warning")).toHaveTextContent("planner");
+    expect(toast).toHaveTextContent("failed to start orchestration role");
+    expect(toast.textContent).not.toContain("\u202E");
+  });
+
+  /**
    * PRD #1223 audit V2: a stale-preparation refusal of a LATER role, after an
    * earlier one had started, whose rollback stop the deck then refused. The
    * sentence carries `stale-preparation:`, which the case above translates

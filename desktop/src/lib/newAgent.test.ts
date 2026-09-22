@@ -6,6 +6,7 @@ import {
   AUTHORING_WITHHELD,
   authoringModes,
   cleanupWarning,
+  CLEANUP_WARNING_MAX_NAMES,
   DECK_STATE_FALLBACK,
   deckChoices,
   deckUnavailableReason,
@@ -311,18 +312,39 @@ describe("New agent orchestration rules (PRD #1223 M6)", () => {
 describe("New agent rules — cleanup the launch could not confirm (PRD #1223 audit F6)", () => {
   /**
    * Scenario: a failed launch could not confirm two roles stopped, each with
-   * a 128-character name. The alert still leads with the count and what to
-   * do, fits the message budget, and a name is never longer than a name's
-   * budget allows — however long the list, the part that matters survives.
+   * a 128-character name. The summary leads with the count and what to do and
+   * fits the message budget, and each name is carried on its own — a joined
+   * list clamped as one sentence lost the later identities silently (audit V7).
    */
-  it("keeps the count and the instruction ahead of long role names within the message budget", () => {
+  it("keeps the count and the instruction ahead of long role names, each name on its own", () => {
     const long = (prefix: string) => `${prefix}${"r".repeat(128 - prefix.length)}`;
     const warning = cleanupWarning([long("reviewer-"), long("planner-")]);
 
-    expect(warning.startsWith("2 roles may still be running on this deck: the rollback could not confirm them stopped. Check the deck and stop them there")).toBe(true);
-    expect(Array.from(warning).length).toBeLessThanOrEqual(241);
-    expect(warning).toContain("reviewer-");
-    expect(cleanupWarning(["builder"])).toBe("1 role may still be running on this deck: the rollback could not confirm it stopped. Check the deck and stop it there — builder");
-    expect(cleanupWarning(["plan\u202Ener"])).toContain("planner");
+    expect(warning.summary).toBe("2 roles may still be running on this deck: the rollback could not confirm them stopped. Check the deck and stop them there.");
+    expect(Array.from(warning.summary).length).toBeLessThanOrEqual(240);
+    expect(warning.names).toEqual([long("reviewer-"), long("planner-")]);
+    expect(warning.names.every((name) => Array.from(name).length <= 128)).toBe(true);
+    expect(warning.overflow).toBe(0);
+    expect(cleanupWarning(["builder"])).toEqual({
+      summary: "1 role may still be running on this deck: the rollback could not confirm it stopped. Check the deck and stop it there.",
+      names: ["builder"],
+      overflow: 0,
+    });
+    expect(cleanupWarning(["plan\u202Ener"]).names).toEqual(["planner"]);
+  });
+
+  /**
+   * Scenario (PRD #1223 audit V7): a rollback of a large orchestration could
+   * not confirm more roles than one alert should list. The count is the truth
+   * the reader needs, so it is in the summary and again as the honest remainder
+   * — no name is dropped without being counted.
+   */
+  it("counts the roles past the cap instead of dropping them", () => {
+    const stops = Array.from({ length: CLEANUP_WARNING_MAX_NAMES + 5 }, (_, index) => `role-${index}`);
+    const warning = cleanupWarning(stops);
+
+    expect(warning.summary).toContain(`${stops.length} roles may still be running`);
+    expect(warning.names).toEqual(stops.slice(0, CLEANUP_WARNING_MAX_NAMES));
+    expect(warning.overflow).toBe(5);
   });
 });

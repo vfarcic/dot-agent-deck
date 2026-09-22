@@ -58,7 +58,7 @@ import { unreachableDeckTerminalState } from "./lib/terminalInput";
 import { applyAppearance } from "./lib/appearance";
 import { desktopWorkflowPlatformIssue } from "./lib/platform";
 import { LaunchCleanupError } from "./lib/actionError";
-import { cleanupWarning } from "./lib/newAgent";
+import { CleanupWarning } from "./components/CleanupWarning";
 import type { VoiceOutcomeDto } from "./lib/bridge";
 import type { AgentSession, DeckAction, DeckRuntimeState, DeckSnapshot, DeckView, EvidenceItem, PanelTab, WorkflowLaunchConfig } from "./types";
 import { modeScopedKey } from "./lib/bridge";
@@ -843,7 +843,19 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [helpOpen, setHelpOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
-  const [notice, setNotice] = useState<string>();
+  const [noticeState, setNoticeState] = useState<string>();
+  /**
+   * PRD #1223 audit V7 — the roles a failed launch could not confirm are
+   * stopped, shown above whichever message the toast is carrying. Held beside
+   * the notice rather than folded into it so a later notice cannot inherit an
+   * older failure's roles: {@link setNotice} replaces both at once.
+   */
+  const [noticeCleanup, setNoticeCleanup] = useState<readonly string[]>();
+  const notice = noticeState;
+  const setNotice = useCallback((message?: string, cleanup?: readonly string[]) => {
+    setNoticeState(message);
+    setNoticeCleanup(message === undefined ? undefined : cleanup);
+  }, []);
   const [confirm, setConfirm] = useState<ConfirmState>();
   // Memoised so the context value is stable across renders; `runtime.testEndpoint`
   // is itself stable for the lifetime of the bridge.
@@ -1304,7 +1316,7 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
            * dismissed.
            */
           if (cause instanceof LaunchCleanupError) {
-            setNotice(cleanupWarning(cause.unconfirmedStops));
+            setNotice(cause.message, cause.unconfirmedStops);
             return;
           }
           const message = cause instanceof Error ? cause.message : String(cause);
@@ -1385,6 +1397,9 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
    * friendlier words, and when an error arrives while an older notice is still
    * up — nothing expires a notice.
    */
+  /** The cleanup roles belonging to whichever copy of a failure the toast shows. */
+  const toastCleanup = notice === undefined ? runtime.errorCleanup : noticeCleanup;
+
   const dismissToast = () => {
     if (notice === undefined || notice === runtime.error) runtime.clearError();
     setNotice(undefined);
@@ -1638,7 +1653,11 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
       {paletteOpen && <CommandPalette commands={commandItems} onClose={() => setPaletteOpen(false)} />}
       {helpOpen && <ShortcutHelp onClose={() => setHelpOpen(false)} />}
       {confirm && <ConfirmDialog state={confirm} onClose={() => setConfirm(undefined)} />}
-      {(notice || runtime.error) && <div className="toast" data-testid="toast" role="status"><AlertTriangle size={15} /><span>{notice ?? runtime.error}</span><button aria-label="Dismiss message" onClick={dismissToast}><X size={14} /></button></div>}
+      {/* PRD #1223 audit V7: the message goes through `displayText` like every
+          other daemon-influenced string on this screen — a role name reaches
+          here inside a failure sentence — and the roles a rollback could not
+          confirm are shown above it, from whichever half is on screen. */}
+      {(notice || runtime.error) && <div className="toast" data-testid="toast" role="status"><AlertTriangle size={15} /><div className="toast-body">{toastCleanup && toastCleanup.length > 0 && <CleanupWarning stops={toastCleanup} testId="toast-cleanup-warning" />}<span>{displayText(notice ?? runtime.error ?? "", DISPLAY_LIMITS.message)}</span></div><button aria-label="Dismiss message" onClick={dismissToast}><X size={14} /></button></div>}
     </div>
   );
 }

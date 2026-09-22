@@ -1101,7 +1101,7 @@ describe("New agent dialog — orchestrations (PRD #1223 M6)", () => {
    * sentence names every started role before it gets to the cleanup, so the
    * 240-character copy cuts that part off; the dialog shows the warning on its
    * own, ABOVE the clamped sentence, from the roles the crate sent as data —
-   * and the whole sentence stays readable behind "Full detail".
+   * and more of the sentence stays readable behind "Detail".
    */
   it("shows a cleanup warning ahead of the clamped error, and the full sentence on demand", async () => {
     const long = (prefix: string) => `${prefix}${"x".repeat(128 - prefix.length)}`;
@@ -1155,6 +1155,31 @@ describe("New agent dialog — orchestrations (PRD #1223 M6)", () => {
     // deck step, which would have said the deck had left.
     expect(screen.getByTestId("new-agent-error")).toHaveTextContent("failed to start orchestration role builder");
     expect(screen.queryByTestId("new-agent-deck-list")).toBeNull();
+  });
+
+  /**
+   * Scenario (PRD #1223 audit V7): a launch of a large orchestration fails and
+   * its rollback cannot confirm twelve roles stopped. The alert names the first
+   * eight, each as its own list entry, and COUNTS the rest — the joined,
+   * once-clamped sentence it replaced dropped the later identities with nothing
+   * saying it had.
+   */
+  it("lists the unconfirmed roles and counts the ones past the cap", async () => {
+    const stops = Array.from({ length: 12 }, (_, index) => `role-${index}`);
+    const runtime = fakeRuntime({
+      newAgentOrchestrations: orchestrationsOf(),
+      runAction: vi.fn(async () => { throw new LaunchCleanupError("failed to start orchestration role tester: refused", stops); }),
+    });
+    renderDialog(runtime);
+    await reachProjectForm();
+    fireEvent.click(await chip());
+
+    fireEvent.click(screen.getByTestId("new-agent-start"));
+
+    const warning = await screen.findByTestId("new-agent-cleanup-warning");
+    expect(warning).toHaveTextContent("12 roles may still be running on this deck");
+    expect(within(warning).getAllByRole("listitem").map((item) => item.textContent)).toEqual(stops.slice(0, 8));
+    expect(screen.getByTestId("new-agent-cleanup-warning-overflow")).toHaveTextContent("…and 4 more");
   });
 
   /**

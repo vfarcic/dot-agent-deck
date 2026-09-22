@@ -1,12 +1,12 @@
 import { Fragment, useCallback, useEffect, useId, useMemo, useRef, useState, type KeyboardEvent, type ReactNode } from "react";
 import { ArrowLeft, ArrowUp, Check, Folder, FolderGit2, Loader2, Plus, X } from "lucide-react";
 import { LaunchCleanupError } from "../lib/actionError";
+import { CleanupWarning } from "./CleanupWarning";
 import { DISPLAY_LIMITS, displayText } from "../lib/displayText";
 import {
   ambiguousOrchestrationReason,
   AUTHORING_MODES,
   authoringModes,
-  cleanupWarning,
   deckChoices,
   directoryLabel,
   filterDirectoryEntries,
@@ -938,11 +938,14 @@ export function NewAgentDialog({ runtime, initialDeckId, onClose, onAppeared, on
             }}
           />
         </label>}
-        {formCleanup && formCleanup.length > 0 && <p className="new-agent-error new-agent-cleanup" role="alert" data-testid="new-agent-cleanup-warning">{cleanupWarning(formCleanup)}</p>}
+        {formCleanup && formCleanup.length > 0 && <CleanupWarning stops={formCleanup} testId="new-agent-cleanup-warning" className="new-agent-error new-agent-cleanup" />}
         {formError && <p className="new-agent-error" role="alert" data-testid="new-agent-error">{displayText(formError, DISPLAY_LIMITS.message)}</p>}
         {formError && displayText(formError, DISPLAY_LIMITS.detail) !== displayText(formError, DISPLAY_LIMITS.message) && (
           <details className="new-agent-detail" data-testid="new-agent-error-detail">
-            <summary>Full detail</summary>
+            {/* "Detail", not "Full detail" (PRD #1223 audit V7): this copy is
+                itself clamped at `DISPLAY_LIMITS.detail`, so a longer sentence
+                is not shown in full here either. */}
+            <summary>Detail</summary>
             <p>{displayText(formError, DISPLAY_LIMITS.detail)}</p>
           </details>
         )}

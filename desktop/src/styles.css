@@ -971,6 +971,8 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .new-agent-keys { color: var(--faint); }
 .new-agent-error { margin: 0; color: var(--red); font-size: 10px; line-height: 1.4; overflow-wrap: anywhere; }
 .new-agent-cleanup { font-weight: 650; }
+.cleanup-warning p { margin: 0; }
+.cleanup-warning ul { margin: 2px 0 0; padding-left: 15px; max-height: 96px; overflow: auto; overflow-wrap: anywhere; }
 .new-agent-detail { color: var(--muted); font-size: 9.5px; line-height: 1.4; }
 .new-agent-detail summary { cursor: pointer; }
 .new-agent-detail p { margin: 4px 0 0; max-height: 120px; overflow: auto; overflow-wrap: anywhere; white-space: pre-wrap; }
@@ -993,6 +995,7 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 /* Lifted clear of the voice row (see `.voice-row`). It is z-index 120 and would
    otherwise sit on top of the report text, which is the same corner. */
 .toast { max-width: min(470px, calc(100vw - 30px)); min-height: 42px; padding: 8px 9px; position: fixed; z-index: 120; right: 18px; bottom: calc(var(--voice-reserved) + 16px); display: grid; grid-template-columns: 18px minmax(0, 1fr) 24px; align-items: center; gap: 5px; border: 1px solid var(--amber-rim); border-radius: 5px; color: var(--amber-ink); background: var(--amber-bright); box-shadow: 0 8px 22px rgb(var(--scrim-rgb) / .13); font-size: 9px; }
+.toast-body { display: grid; gap: 3px; min-width: 0; }
 .toast button { width: 22px; height: 22px; display: grid; place-items: center; border: 0; background: transparent; cursor: pointer; }
 
 @media (min-width: 1450px) {

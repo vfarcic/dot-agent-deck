@@ -294,17 +294,42 @@ export const ORCHESTRATION_TITLE_TAKEN = "This name is already in use by a live 
 export const SAME_DIRECTORY_ORCHESTRATION = "This directory already runs an orchestration on this deck. Both share its .dot-agent-deck role files and one working tree.";
 
 /**
+ * How many unconfirmed roles a cleanup warning names before it counts the rest
+ * (PRD #1223 audit V7). A rollback of a 64-role orchestration can leave more
+ * names than any one alert should carry; what the reader needs on screen is the
+ * count, the instruction, and enough names to start with.
+ */
+export const CLEANUP_WARNING_MAX_NAMES = 8;
+
+/** The parts of the alert a failed launch shows — see {@link cleanupWarning}. */
+export type CleanupWarning = {
+  /** The count and what to do about it. Never clamped away. */
+  summary: string;
+  /** The first {@link CLEANUP_WARNING_MAX_NAMES} roles, each clamped as a name. */
+  names: string[];
+  /** How many roles are not in `names`; `0` when they all are. */
+  overflow: number;
+};
+
+/**
  * PRD #1223 audit F6 — the alert a failed launch shows, on its own and before
  * the error sentence, when its rollback could not confirm every role stopped.
  *
- * Built so the part that matters survives the `message` clamp: the count and
- * what to do come first, and the role names — each clamped as a name — last.
+ * Structured rather than one sentence (audit V7): the names were joined and the
+ * whole thing clamped to `DISPLAY_LIMITS.message`, so a rollback of several
+ * long-named roles lost the later identities with nothing saying so. Each name
+ * is now clamped on its own and rendered as a list item, and the ones past the
+ * cap are COUNTED rather than dropped silently.
  */
-export function cleanupWarning(unconfirmedStops: readonly string[]): string {
+export function cleanupWarning(unconfirmedStops: readonly string[]): CleanupWarning {
   const count = unconfirmedStops.length;
   const subject = count === 1 ? "1 role" : `${count} roles`;
-  const names = unconfirmedStops.map((role) => displayText(role, DISPLAY_LIMITS.name)).join(", ");
-  return displayText(`${subject} may still be running on this deck: the rollback could not confirm ${count === 1 ? "it" : "them"} stopped. Check the deck and stop ${count === 1 ? "it" : "them"} there — ${names}`, DISPLAY_LIMITS.message);
+  const it = count === 1 ? "it" : "them";
+  return {
+    summary: displayText(`${subject} may still be running on this deck: the rollback could not confirm ${it} stopped. Check the deck and stop ${it} there.`, DISPLAY_LIMITS.message),
+    names: unconfirmedStops.slice(0, CLEANUP_WARNING_MAX_NAMES).map((role) => displayText(role, DISPLAY_LIMITS.name)),
+    overflow: Math.max(0, count - CLEANUP_WARNING_MAX_NAMES),
+  };
 }
 
 /**

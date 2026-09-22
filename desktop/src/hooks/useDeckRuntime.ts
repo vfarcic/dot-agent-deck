@@ -3,6 +3,7 @@ import { createFixtureSnapshot } from "../data/fixture";
 import { createDeckBridge, selectRuntimeMode } from "../lib/bridge";
 import type { DesktopSettingsDto, VoiceScreen, VoiceSecretId } from "../lib/bridge";
 import { agentKey } from "../lib/agentKey";
+import { LaunchCleanupError } from "../lib/actionError";
 import { applyTerminalChunk } from "../lib/terminalBuffer";
 const EMPTY_TERMINAL_DATA: Record<string, TerminalBuffer> = {};
 import { isDelivered } from "../types";
@@ -86,6 +87,18 @@ export function useDeckRuntime(): DeckRuntimeState {
    * carrying an identical sentence sets it again and shows.
    */
   const [error, setError] = useState<string>();
+  /**
+   * PRD #1223 audit V7 — the roles a failed launch could not confirm are
+   * stopped, kept beside the sentence they came with.
+   *
+   * The structured rejection (`LaunchCleanupError`) used to survive only inside
+   * the New agent dialog, so a failure that arrived after the overview had
+   * dropped that dialog left the global toast with the prose alone — where the
+   * cleanup clause is the LAST thing said and the first thing a display clamp
+   * cuts. Held here, it is rendered with whichever copy of the failure is on
+   * screen.
+   */
+  const [errorCleanup, setErrorCleanup] = useState<readonly string[]>();
   // PTY bytes deliberately bypass React state. Routing every output chunk
   // through setState re-rendered the whole deck per chunk per agent — with six
   // streaming agents the main thread spent its time reconciling instead of
@@ -219,6 +232,7 @@ export function useDeckRuntime(): DeckRuntimeState {
 
   const reconnect = useCallback(async () => {
     setError(undefined);
+    setErrorCleanup(undefined);
     updateSelected((current) => ({ ...current, connection: { ...current.connection, status: "loading", message: "Reconnecting…" } }));
     try {
       const connected = await bridge.connect();
@@ -267,6 +281,7 @@ export function useDeckRuntime(): DeckRuntimeState {
 
   const runAction = useCallback(async (action: DeckAction) => {
     setError(undefined);
+    setErrorCleanup(undefined);
     const sentToDeckId = selectedDeckIdRef.current;
     try {
       const result = await bridge.runAction(action);
@@ -285,6 +300,8 @@ export function useDeckRuntime(): DeckRuntimeState {
     } catch (cause) {
       const message = cause instanceof Error ? cause.message : String(cause);
       setError(message);
+      // Audit V7: the roles as data, not only the sentence that names them last.
+      if (cause instanceof LaunchCleanupError) setErrorCleanup(cause.unconfirmedStops);
       throw cause;
     }
   }, [bridge, noteTerminalInputResult]);
@@ -298,7 +315,10 @@ export function useDeckRuntime(): DeckRuntimeState {
    * clear it at the start of each attempt, and what a failed connection leaves
    * behind for the banner is `snapshot.connection`, which this does not touch.
    */
-  const clearError = useCallback(() => setError(undefined), []);
+  const clearError = useCallback(() => {
+    setError(undefined);
+    setErrorCleanup(undefined);
+  }, []);
 
   const getSettings = useCallback(() => bridge.getSettings(), [bridge]);
   // Stable for the lifetime of the bridge: `useZoom` holds it across a
@@ -396,6 +416,7 @@ export function useDeckRuntime(): DeckRuntimeState {
     terminalData: EMPTY_TERMINAL_DATA,
     terminalFeed,
     error,
+    errorCleanup,
     clearError,
     runAction,
     terminalInputResults,

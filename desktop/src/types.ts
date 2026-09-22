@@ -978,7 +978,13 @@ export interface DeckRuntimeState {
   terminalFeed?: TerminalFeed;
   error?: string;
   /**
-   * Drop the last action's error (issue #1046).
+   * PRD #1223 audit V7 — the roles a failed launch could not confirm are
+   * stopped, for the copy of the failure `error` carries. Absent unless the
+   * last action rejected with a `LaunchCleanupError`.
+   */
+  errorCleanup?: readonly string[];
+  /**
+   * Drop the last action's error and the cleanup roles with it (issue #1046).
    *
    * Required rather than optional: the toast in `App.tsx` renders on
    * `notice || error`, so a runtime that cannot clear `error` produces a toast
