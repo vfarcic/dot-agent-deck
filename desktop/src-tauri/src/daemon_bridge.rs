@@ -4540,6 +4540,30 @@ mod tests {
         (settings, remote)
     }
 
+    /// Add a second remote row, `host`, to settings built by
+    /// [`all_decks_with_one_remote_row`], and return its endpoint.
+    #[cfg(unix)]
+    fn add_remote_row(settings: &mut crate::settings::DesktopSettings, host: &str) -> Endpoint {
+        use crate::settings::{EndpointId, RemoteEndpointSettings};
+        use dot_agent_deck::remote_tunnel::{Hostname, RemoteSocketPath};
+        let mut row = RemoteEndpointSettings::new(
+            EndpointId::parse("deck000000000002").expect("a valid id"),
+            Hostname::parse(host).expect("a valid host"),
+        );
+        row.socket = Some(RemoteSocketPath::parse("/run/deck.sock").expect("a path"));
+        settings
+            .endpoints
+            .as_mut()
+            .expect("built by all_decks_with_one_remote_row")
+            .remote
+            .push(row);
+        settings
+            .connectable_endpoints()
+            .into_iter()
+            .nth(2)
+            .expect("the second row is connectable")
+    }
+
     /// Make `local` the app's local deck and apply `settings`, asserting the
     /// fixture really selects All Decks with the local deck in force — the
     /// state under which the old arm went to the wrong deck.
@@ -5271,6 +5295,334 @@ mod tests {
                 Ok(started) => panic!("{case}: must be refused, yet {} started", started.agent_id),
                 Err(error) => assert!(error.contains(expected), "{case}: got {error}"),
             }
+        }
+        assert!(
+            on_local.is_empty(),
+            "nothing reached the local deck: {on_local:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // PRD #1223 M6 — orchestrations from the New agent dialog
+    // -----------------------------------------------------------------------
+
+    /// A project under `root` whose one orchestration, `m6`, has a Pi start
+    /// role and an OpenCode worker — both DECLARED on `sh` stand-ins, so the
+    /// deck's use of the declaration is observable — and whose commands each
+    /// append a distinct line to `configured.log` in the project and then stay
+    /// alive. Returns the canonical project path.
+    #[cfg(unix)]
+    fn configured_orchestration_project(root: &std::path::Path) -> std::path::PathBuf {
+        let project = root.join("m6-project");
+        std::fs::create_dir_all(&project).expect("create the project");
+        std::fs::write(
+            project.join(".dot-agent-deck.toml"),
+            r#"
+[[orchestrations]]
+name = "m6"
+
+[[orchestrations.roles]]
+name = "planner"
+command = "sh -c 'echo planner-configured >> configured.log; sleep 600'"
+agent = "pi"
+start = true
+
+[[orchestrations.roles]]
+name = "builder"
+command = "sh -c 'echo builder-configured >> configured.log; sleep 600'"
+agent = "opencode"
+"#,
+        )
+        .expect("write the project config");
+        std::fs::canonicalize(&project).expect("canonicalize the project")
+    }
+
+    #[cfg(unix)]
+    fn orchestration_start(
+        path: &str,
+        title: Option<&str>,
+        config_revision: Option<String>,
+    ) -> crate::StartOrchestrationRequest {
+        crate::StartOrchestrationRequest {
+            path: path.to_string(),
+            orchestration: "m6".into(),
+            display_title: title.map(str::to_string),
+            config_revision,
+            rows: Some(24),
+            cols: Some(80),
+        }
+    }
+
+    /// Scenario: two real daemons under **All Decks** — the local deck, which
+    /// the selection resolves to, and a remote row routed to the second, whose
+    /// filesystem holds a project with a two-role orchestration. The dialog's
+    /// orchestrations query aimed at the remote row answers that project's
+    /// orchestration (and an ordinary directory beside it is "not a project",
+    /// not an error); launching it there with a run title starts both roles ON
+    /// THAT DECK with the commands its config gives them — observed as the
+    /// lines they write — under the title, one shared orchestration id and
+    /// the declared agent types, and names the planner as the start role. The
+    /// Pi start role holds the preparation's coordinator prompt as its native
+    /// seed, which is how the TUI delivers to one. The local deck gains nothing.
+    ///
+    /// **What it fails against.** A launch that read the selection would land
+    /// on `local`; one that sent no `use_configured_command` would start the
+    /// deck's default shell, so neither line would appear; one that delivered
+    /// the prompt itself as well would leave nothing for the Pi pane to pull.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_orchestration_aimed_at_another_deck_under_all_decks_lands_there_with_its_configured_commands()
+     {
+        use dot_agent_deck::agent_pty::TabMembership;
+        use dot_agent_deck::event::AgentType;
+        let _selection = crate::dto::SELECTION_LOCK.lock().await;
+        let local = RealDeck::start("m6-land-local");
+        let remote = RealDeck::start("m6-land-remote");
+        let project = configured_orchestration_project(&remote.dir);
+        let ordinary = listing_tree(&remote.dir).join("alpha");
+        let (settings, remote_endpoint) = all_decks_with_one_remote_row("build-box.example.com");
+        apply_all_decks_over(&local, &settings);
+        let state = crate::terminal::DesktopState::default();
+        state
+            .tunnels
+            .insert_route(
+                &remote_endpoint,
+                remote.endpoint.as_local().expect("local socket").path(),
+            )
+            .await;
+        let remote_wire = deck_wire_id(&remote_endpoint);
+        let project_wire = project.to_str().expect("a UTF-8 path").to_string();
+
+        let offered = crate::new_agent_orchestrations_on(&state, &remote_wire, &project_wire).await;
+        let not_project = crate::new_agent_orchestrations_on(
+            &state,
+            &remote_wire,
+            ordinary.to_str().expect("a UTF-8 path"),
+        )
+        .await;
+        let revision = match &offered {
+            Ok(crate::dto::DesktopNewAgentOrchestrations::Project(project)) => {
+                project.config_revision.clone()
+            }
+            _ => None,
+        };
+        let started = crate::start_orchestration_action(
+            &state,
+            &remote_wire,
+            orchestration_start(&project_wire, Some("m6-project-orchestrator-1"), revision),
+        )
+        .await;
+        let log = project.join("configured.log");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::fs::read_to_string(&log)
+            .unwrap_or_default()
+            .lines()
+            .count()
+            < 2
+            && std::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let lines = std::fs::read_to_string(&log).unwrap_or_default();
+        let on_local = named_records(&local);
+        let on_remote = remote.registry.agent_records();
+        let planner_seed = started.as_ref().ok().and_then(|started| {
+            let pane = on_remote
+                .iter()
+                .find(|record| record.id == started.start_agent_id)?
+                .pane_id_env
+                .clone()?;
+            remote
+                .registry
+                .take_pending_seed_native_for(&pane, Some(&started.start_agent_id))
+        });
+        local.shutdown();
+        remote.shutdown();
+
+        match offered.expect("the remote deck answers the orchestrations query") {
+            crate::dto::DesktopNewAgentOrchestrations::Project(resolved) => {
+                assert_eq!(resolved.path, project_wire);
+                let names: Vec<&str> = resolved
+                    .orchestrations
+                    .iter()
+                    .map(|orchestration| orchestration.name.as_str())
+                    .collect();
+                assert_eq!(names, ["m6"]);
+            }
+            other => panic!("the project resolves on its deck, got {other:?}"),
+        }
+        assert!(
+            matches!(
+                not_project,
+                Ok(crate::dto::DesktopNewAgentOrchestrations::NotProject)
+            ),
+            "an ordinary directory is an answer, not an error: {not_project:?}"
+        );
+        let started = started.expect("the targeted deck launches the orchestration");
+        assert_eq!(started.scope.identity(), remote_endpoint.identity());
+        assert_eq!(started.agent_ids.len(), 2);
+        assert!(
+            lines.lines().any(|line| line == "planner-configured")
+                && lines.lines().any(|line| line == "builder-configured"),
+            "both roles ran the commands their config gives them: {lines:?}"
+        );
+        let mut orchestration_ids = std::collections::HashSet::new();
+        for (role, agent_type, is_start) in [
+            ("planner", AgentType::Pi, true),
+            ("builder", AgentType::OpenCode, false),
+        ] {
+            let record = on_remote
+                .iter()
+                .find(|record| record.display_name.as_deref() == Some(role))
+                .unwrap_or_else(|| panic!("the targeted deck lists {role}: {on_remote:?}"));
+            assert!(started.agent_ids.contains(&record.id));
+            assert_eq!(
+                record.agent_type,
+                Some(agent_type),
+                "{role}: declared agent"
+            );
+            assert_eq!(record.id == started.start_agent_id, is_start, "{role}");
+            match record.tab_membership.as_ref() {
+                Some(TabMembership::Orchestration {
+                    name,
+                    role_name,
+                    is_start_role,
+                    display_title,
+                    orchestration_id,
+                    ..
+                }) => {
+                    assert_eq!(name, "m6");
+                    assert_eq!(role_name, role);
+                    assert_eq!(*is_start_role, is_start);
+                    assert_eq!(display_title.as_deref(), Some("m6-project-orchestrator-1"));
+                    orchestration_ids.insert(orchestration_id.clone());
+                }
+                other => panic!("{role}: an orchestration membership, got {other:?}"),
+            }
+        }
+        assert_eq!(
+            orchestration_ids.len(),
+            1,
+            "one orchestration id for the run"
+        );
+        assert!(
+            planner_seed
+                .as_deref()
+                .is_some_and(|seed| seed.contains("orchestrator-context")),
+            "the Pi start role holds the deck-composed coordinator prompt: {planner_seed:?}"
+        );
+        assert!(
+            on_local.is_empty(),
+            "the local deck — the one All Decks resolves to — gains nothing: {on_local:?}"
+        );
+    }
+
+    /// Scenario: under **All Decks**, one remote row is a deck that offers the
+    /// project verbs but predates `prepared-role-command`, and a second offers
+    /// no `prepare-workflow` at all; the local deck is a current real daemon.
+    /// The orchestrations query answers each older deck `unsupported` with its
+    /// reason — the missing configured-command start, and the connection's own
+    /// `projectActionsReason` — and a launch aimed at the first is refused with
+    /// the same sentence. Neither deck receives a single request beyond the
+    /// handshake: no `ResolveProject`, and no `PrepareWorkflow` publishing a
+    /// context nothing could read. A query and a launch aimed at a deck the
+    /// app is not observing are refused with `DeckScope::resolve`'s error, and
+    /// the local deck gains nothing throughout.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_orchestration_the_deck_cannot_start_is_withheld_and_sends_nothing() {
+        use dot_agent_deck::daemon_protocol::{
+            CAP_PREPARE_WORKFLOW, CAP_PREPARED_ROLE_COMMAND, CAP_START_PREPARED_AGENT,
+        };
+        let _selection = crate::dto::SELECTION_LOCK.lock().await;
+        let local = RealDeck::start("m6-old-local");
+        let older = OlderDeck::withholding("m6-old-remote", &[CAP_PREPARED_ROLE_COMMAND]);
+        let oldest = OlderDeck::withholding(
+            "m6-oldest-remote",
+            &[
+                CAP_PREPARE_WORKFLOW,
+                CAP_START_PREPARED_AGENT,
+                CAP_PREPARED_ROLE_COMMAND,
+            ],
+        );
+        let project = configured_orchestration_project(&local.dir);
+        let project_wire = project.to_str().expect("a UTF-8 path").to_string();
+        let (mut settings, older_endpoint) = all_decks_with_one_remote_row("old-box.example.com");
+        let oldest_endpoint = add_remote_row(&mut settings, "oldest-box.example.com");
+        apply_all_decks_over(&local, &settings);
+        let state = crate::terminal::DesktopState::default();
+        state
+            .tunnels
+            .insert_route(&older_endpoint, &older.socket)
+            .await;
+        state
+            .tunnels
+            .insert_route(&oldest_endpoint, &oldest.socket)
+            .await;
+        let older_wire = deck_wire_id(&older_endpoint);
+        let oldest_wire = deck_wire_id(&oldest_endpoint);
+
+        let older_query =
+            crate::new_agent_orchestrations_on(&state, &older_wire, &project_wire).await;
+        let oldest_query =
+            crate::new_agent_orchestrations_on(&state, &oldest_wire, &project_wire).await;
+        let older_launch = crate::start_orchestration_action(
+            &state,
+            &older_wire,
+            orchestration_start(&project_wire, Some("run"), None),
+        )
+        .await;
+        let unobserved_query =
+            crate::new_agent_orchestrations_on(&state, "deck-ffffffffffffffff", &project_wire)
+                .await;
+        let unobserved_launch = crate::start_orchestration_action(
+            &state,
+            "deck-ffffffffffffffff",
+            orchestration_start(&project_wire, Some("run"), None),
+        )
+        .await;
+        let refused = older.refused.load(Ordering::SeqCst) + oldest.refused.load(Ordering::SeqCst);
+        let on_local = named_records(&local);
+        local.shutdown();
+        older.shutdown();
+        oldest.shutdown();
+
+        match older_query.expect("an older deck answers, it does not fail") {
+            crate::dto::DesktopNewAgentOrchestrations::Unsupported { reason } => {
+                assert_eq!(reason, crate::CONFIGURED_ROLE_COMMAND_UNSUPPORTED);
+            }
+            other => panic!("the deck cannot start configured roles, got {other:?}"),
+        }
+        match oldest_query.expect("an older deck answers, it does not fail") {
+            crate::dto::DesktopNewAgentOrchestrations::Unsupported { reason } => {
+                assert!(
+                    reason.contains("does not advertise") && reason.contains(CAP_PREPARE_WORKFLOW),
+                    "the connection's projectActionsReason: {reason}"
+                );
+            }
+            other => panic!("the deck has no project verbs, got {other:?}"),
+        }
+        match older_launch {
+            Ok(started) => panic!(
+                "the older deck cannot start configured roles, yet {} started",
+                started.start_agent_id
+            ),
+            Err(error) => assert_eq!(error, crate::CONFIGURED_ROLE_COMMAND_UNSUPPORTED),
+        }
+        assert_eq!(
+            refused, 0,
+            "nothing but handshakes reached a deck that cannot launch from this flow"
+        );
+        for (case, error) in [
+            ("query", unobserved_query.err()),
+            ("launch", unobserved_launch.err()),
+        ] {
+            assert!(
+                error.as_deref().is_some_and(
+                    |error| error.contains("that deck is not one this app is observing")
+                ),
+                "{case}: an unobserved deck is refused with the resolve error: {error:?}"
+            );
         }
         assert!(
             on_local.is_empty(),

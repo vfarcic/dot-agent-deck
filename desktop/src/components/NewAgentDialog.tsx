@@ -2,26 +2,35 @@ import { useCallback, useEffect, useId, useMemo, useRef, useState, type Keyboard
 import { ArrowLeft, ArrowUp, Check, Folder, FolderGit2, Loader2, Plus, X } from "lucide-react";
 import { DISPLAY_LIMITS, displayText } from "../lib/displayText";
 import {
+  AUTHORING_MODES,
   authoringModes,
   deckChoices,
   directoryLabel,
   filterDirectoryEntries,
   fleetLists,
   isDeckGoneError,
+  liveOrchestrationDirectories,
+  liveOrchestrationTitles,
   NEW_AGENT_APPEAR_TIMEOUT_MS,
+  ORCHESTRATION_TITLE_TAKEN,
+  orchestrationModeId,
+  orchestrationModes,
+  orchestrationRunTitle,
   preselectedDeck,
   resolveAuthoringCommand,
+  SAME_DIRECTORY_ORCHESTRATION,
   seedCommand,
+  suggestOrchestrationName,
   type DeckChoice,
 } from "../lib/newAgent";
-import type { AuthoringKind, DeckDirectoryEntry, DeckDirectoryListing, DeckRuntimeState, NewAgentOption, NewAgentOptions } from "../types";
+import type { AuthoringKind, DaemonOrchestration, DeckDirectoryEntry, DeckDirectoryListing, DeckRuntimeState, NewAgentOption, NewAgentOptions, NewAgentOrchestrations } from "../types";
 
 /**
  * What the dialog needs from the runtime. The two queries are REQUIRED here
  * although they are optional on `DeckRuntimeState`: the overview renders no
  * entry point into this dialog for a runtime without them.
  */
-export type NewAgentRuntime = Pick<DeckRuntimeState, "fleet" | "runAction" | "clearError"> & Required<Pick<DeckRuntimeState, "listDirectories" | "newAgentOptions">>;
+export type NewAgentRuntime = Pick<DeckRuntimeState, "fleet" | "runAction" | "clearError"> & Required<Pick<DeckRuntimeState, "listDirectories" | "newAgentOptions">> & Pick<DeckRuntimeState, "newAgentOrchestrations">;
 
 export interface NewAgentDialogProps {
   runtime: NewAgentRuntime;
@@ -42,12 +51,14 @@ type Listing = Extract<DeckDirectoryListing, { kind: "listing" }>;
 type DirectoryRow = { kind: "up"; path: string } | { kind: "entry"; entry: DeckDirectoryEntry };
 
 /**
- * The Mode row's first chip — a plain agent. The rest are the authoring kinds
- * the deck can start (PRD #1223 M7), from {@link authoringModes}.
+ * The Mode row's first chip — a plain agent. Then, in the TUI cycler's order,
+ * one chip per orchestration the directory's project defines on the deck (PRD
+ * #1223 M6, from {@link orchestrationModes}), then the authoring kinds the deck
+ * can start (PRD #1223 M7, from {@link authoringModes}).
  */
 const NO_MODE = { id: "none", label: "No mode" } as const;
 
-type ModeId = typeof NO_MODE.id | AuthoringKind;
+type ModeId = typeof NO_MODE.id | AuthoringKind | ReturnType<typeof orchestrationModeId>;
 
 const AUTO_AGENT = "auto";
 
@@ -65,10 +76,22 @@ function messageOf(cause: unknown): string {
  *    the TUI picker's keys, plus a typed path — the only mode on a deck without
  *    the listing verb.
  * 3. **Form** — Mode, Agent, Name and Command, prefilled in the TUI's order.
- *    Mode offers a plain agent and, on a deck that can compose their seeds,
- *    the TUI's `schedule`, `schedule: issues` and `dispatcher` authoring
- *    agents (PRD #1223 M7) — whose blank Command resolves the way the TUI's
- *    does, because a blank one would start the deck's default shell.
+ *    Mode offers a plain agent; one `Orch: <name>` chip per orchestration the
+ *    directory's project defines on that deck (PRD #1223 M6); and, on a deck
+ *    that can compose their seeds, the TUI's `schedule`, `schedule: issues` and
+ *    `dispatcher` authoring agents (PRD #1223 M7) — whose blank Command
+ *    resolves the way the TUI's does, because a blank one would start the
+ *    deck's default shell.
+ *
+ * # An orchestration (PRD #1223 M6)
+ *
+ * The TUI's rules, against the chosen deck. While one is selected and the Name
+ * is untouched, the Name is the next free `<basename>-orchestrator-N` over the
+ * titles live on that deck; a Name equal to one of those titles refuses the
+ * start; and Command is hidden, because each role runs the command its config
+ * gives it — on the deck, which reads that config. The launch prepares with no
+ * task and starts every role there, and the START role's pane is the one
+ * opened afterwards, as the TUI focuses it.
  *
  * # The deck is captured once
  *
@@ -125,6 +148,21 @@ export function NewAgentDialog({ runtime, initialDeckId, onClose, onAppeared, on
   /** Drops an options reply for a directory the user has since left. */
   const optionsSeq = useRef(0);
   const [formError, setFormError] = useState<string>();
+  /** The deck's orchestrations for the chosen directory (PRD #1223 M6). */
+  const [orchestrations, setOrchestrations] = useState<NewAgentOrchestrations>();
+  const [orchestrationsError, setOrchestrationsError] = useState<string>();
+  /** Drops an orchestrations reply for a directory the user has since left. */
+  const orchestrationsSeq = useRef(0);
+  /** A human edited Name — a generated default may replace a generated default, never an edit. */
+  const nameTouched = useRef(false);
+  /**
+   * Whether each path the deck listed holds a project, from the listings seen
+   * so far — the marker that decides whether the deck is asked for
+   * orchestrations at all. A directory reached another way (typed, or by going
+   * up) has no entry here and is asked, and the deck's `not_project` answer
+   * covers it.
+   */
+  const projectMarks = useRef(new Map<string, boolean>());
   const [phase, setPhase] = useState<"idle" | "starting" | "waiting">("idle");
   const [awaiting, setAwaiting] = useState<{ deckId: string; agentId: string; deckName: string; agentName: string }>();
 
@@ -173,6 +211,7 @@ export function NewAgentDialog({ runtime, initialDeckId, onClose, onAppeared, on
         setListingState("unsupported");
         return;
       }
+      for (const entry of reply.entries) projectMarks.current.set(entry.path, entry.isProject);
       setListing(reply);
       setListingState("ready");
       setFilter("");
@@ -209,14 +248,36 @@ export function NewAgentDialog({ runtime, initialDeckId, onClose, onAppeared, on
     const deckId = deck.deckId;
     setTarget({ path, displayPath });
     setName(directoryLabel(path));
+    nameTouched.current = false;
     setCommand("");
     commandTouched.current = false;
     setAgentChoice(AUTO_AGENT);
     setModeChoice(NO_MODE.id);
     setOptions(undefined);
     setOptionsError(undefined);
+    setOrchestrations(undefined);
+    setOrchestrationsError(undefined);
     setFormError(undefined);
     setStep("form");
+    // PRD #1223 M6: the deck's orchestrations for this directory — asked unless
+    // a listing already marked it as no project. The deck answers `not_project`
+    // for an ordinary directory, so asking about an unmarked one is safe.
+    const orchestrationsSeqNow = ++orchestrationsSeq.current;
+    const queryOrchestrations = runtime.newAgentOrchestrations;
+    if (queryOrchestrations && projectMarks.current.get(path) !== false) {
+      void (async () => {
+        try {
+          const answer = await queryOrchestrations(deckId, path);
+          if (orchestrationsSeqNow !== orchestrationsSeq.current) return;
+          setOrchestrations(answer);
+        } catch (cause) {
+          if (orchestrationsSeqNow !== orchestrationsSeq.current) return;
+          const message = messageOf(cause);
+          if (isDeckGoneError(message)) returnToDeckStep(message);
+          else setOrchestrationsError(message);
+        }
+      })();
+    }
     const seq = ++optionsSeq.current;
     void (async () => {
       try {
@@ -272,11 +333,43 @@ export function NewAgentDialog({ runtime, initialDeckId, onClose, onAppeared, on
 
   const agents: NewAgentOption[] = options?.kind === "deck" ? options.agents : options?.kind === "unsupported" ? options.desktopAgents : [];
   const authoring = authoringModes(options);
-  const modes: { id: ModeId; label: string }[] = [NO_MODE, ...authoring.offered.map((mode) => ({ id: mode.kind, label: mode.label }))];
+  const orchestrationOffer = orchestrationModes(orchestrations);
+  const orchestrationChips = orchestrationOffer.offered.map((orchestration) => ({
+    id: orchestrationModeId(orchestration.name),
+    label: `Orch: ${displayText(orchestration.displayName, DISPLAY_LIMITS.name)}`,
+    orchestration,
+  }));
+  const modes: { id: ModeId; label: string }[] = [
+    NO_MODE,
+    ...orchestrationChips.map(({ id, label }) => ({ id, label })),
+    ...authoring.offered.map((mode) => ({ id: mode.kind, label: mode.label })),
+  ];
   /** The chip in force — `No mode` whenever the chosen one is not (or no longer) offered. */
   const mode: ModeId = modes.some((candidate) => candidate.id === modeChoice) ? modeChoice : NO_MODE.id;
-  const authoringKind: AuthoringKind | undefined = mode === NO_MODE.id ? undefined : mode;
+  const selectedOrchestration: DaemonOrchestration | undefined = orchestrationChips.find((chip) => chip.id === mode)?.orchestration;
+  const authoringKind: AuthoringKind | undefined = AUTHORING_MODES.find((candidate) => candidate.kind === mode)?.kind;
   const defaultCommand = options?.kind === "deck" ? options.defaultCommand : undefined;
+
+  // PRD #1223 M6 — the TUI's Name rules, against the CHOSEN deck's own fleet
+  // entry: never another deck's orchestrations, and never the selected deck's.
+  const liveTitles = useMemo(() => (deck ? liveOrchestrationTitles(runtime.fleet, deck.deckId) : []), [deck, runtime.fleet]);
+  const liveDirectories = useMemo(() => (deck ? liveOrchestrationDirectories(runtime.fleet, deck.deckId) : []), [deck, runtime.fleet]);
+  const runTitle = selectedOrchestration ? orchestrationRunTitle(name, selectedOrchestration.name) : undefined;
+  const titleTaken = runTitle !== undefined && liveTitles.includes(runTitle);
+  const sameDirectory = selectedOrchestration !== undefined && orchestrations?.kind === "project" && liveDirectories.includes(orchestrations.path);
+
+  /**
+   * The TUI's `resuggest_name_for_selection`: landing on an orchestration
+   * suggests the next free `<basename>-orchestrator-N`, and landing anywhere
+   * else restores the directory's basename — both only while the Name is
+   * untouched.
+   */
+  const selectMode = (id: ModeId) => {
+    setModeChoice(id);
+    if (nameTouched.current || !target) return;
+    const basename = directoryLabel(target.path);
+    setName(orchestrationChips.some((chip) => chip.id === id) ? suggestOrchestrationName(basename, liveTitles) : basename);
+  };
 
   const chooseAgent = (id: string) => {
     setAgentChoice(id);
@@ -289,8 +382,50 @@ export function NewAgentDialog({ runtime, initialDeckId, onClose, onAppeared, on
     }
   };
 
+  /**
+   * PRD #1223 M6 — launch the selected orchestration on the chosen deck. The
+   * project path and the orchestration name are the deck's own spellings from
+   * its answer; the Name is the run's title, sent only when it is not empty,
+   * as the TUI sends it. The reply's `agentId` is the START role's.
+   */
+  const submitOrchestration = async (orchestration: DaemonOrchestration) => {
+    if (!deck || orchestrations?.kind !== "project" || titleTaken) return;
+    setFormError(undefined);
+    setPhase("starting");
+    const title = orchestrationRunTitle(name, orchestration.name);
+    try {
+      const result = await runtime.runAction({
+        type: "start_orchestration",
+        deckId: deck.deckId,
+        path: orchestrations.path,
+        orchestration: orchestration.name,
+        ...(name !== "" ? { displayTitle: name } : {}),
+        ...(orchestrations.configRevision ? { configRevision: orchestrations.configRevision } : {}),
+      });
+      if (result.agentId === undefined) {
+        onNotAppeared({ deckName: deck.name, agentName: title });
+        return;
+      }
+      setPhase("waiting");
+      setAwaiting({ deckId: deck.deckId, agentId: result.agentId, deckName: deck.name, agentName: title });
+    } catch (cause) {
+      runtime.clearError();
+      const message = messageOf(cause);
+      if (isDeckGoneError(message)) {
+        returnToDeckStep(message);
+        return;
+      }
+      setFormError(message);
+      setPhase("idle");
+    }
+  };
+
   const submit = async () => {
     if (!deck || !target || phase !== "idle") return;
+    if (selectedOrchestration) {
+      await submitOrchestration(selectedOrchestration);
+      return;
+    }
     setFormError(undefined);
     setPhase("starting");
     const agentName = name.trim() ? name : "";
@@ -463,7 +598,7 @@ export function NewAgentDialog({ runtime, initialDeckId, onClose, onAppeared, on
     event.preventDefault();
     const index = modes.findIndex((candidate) => candidate.id === mode);
     const next = modes[(index + (event.key === "ArrowRight" ? 1 : modes.length - 1)) % modes.length];
-    setModeChoice(next.id);
+    selectMode(next.id);
     event.currentTarget.querySelector<HTMLButtonElement>(`[data-mode="${next.id}"]`)?.focus();
   };
 
@@ -652,13 +787,15 @@ export function NewAgentDialog({ runtime, initialDeckId, onClose, onAppeared, on
                 data-mode={candidate.id}
                 data-testid={`new-agent-mode-${candidate.id}`}
                 disabled={busy}
-                onClick={() => setModeChoice(candidate.id)}
+                onClick={() => selectMode(candidate.id)}
               >
                 {candidate.label}
               </button>
             ))}
           </div>
         </div>
+        {orchestrationOffer.withheld && <p className="new-agent-hint" data-testid="new-agent-orchestrations-withheld">{displayText(orchestrationOffer.withheld, DISPLAY_LIMITS.message)}</p>}
+        {orchestrationsError && <p className="new-agent-error" data-testid="new-agent-orchestrations-error">{displayText(orchestrationsError, DISPLAY_LIMITS.message)}</p>}
         {authoring.withheld && <p className="new-agent-hint" data-testid="new-agent-authoring-withheld">{authoring.withheld}</p>}
         <label className="new-agent-field">
           <span>Agent</span>
@@ -677,17 +814,23 @@ export function NewAgentDialog({ runtime, initialDeckId, onClose, onAppeared, on
             value={name}
             disabled={busy}
             spellCheck={false}
-            onChange={(event) => setName(event.target.value)}
+            onChange={(event) => {
+              nameTouched.current = true;
+              setName(event.target.value);
+            }}
             onKeyDown={(event) => {
-              // The TUI form's Enter on Name: move to Command, which submits.
-              if (event.key === "Enter") {
+              // The TUI form's Enter on Name: move to Command, which submits —
+              // or, with Command hidden for an orchestration, submit.
+              if (event.key === "Enter" && !selectedOrchestration) {
                 event.preventDefault();
                 commandRef.current?.focus();
               }
             }}
           />
         </label>
-        <label className="new-agent-field">
+        {titleTaken && <p className="new-agent-error" role="alert" data-testid="new-agent-title-taken">{ORCHESTRATION_TITLE_TAKEN}</p>}
+        {!titleTaken && sameDirectory && <p className="new-agent-hint" data-testid="new-agent-same-directory">{SAME_DIRECTORY_ORCHESTRATION}</p>}
+        {!selectedOrchestration && <label className="new-agent-field">
           <span>Command</span>
           <input
             ref={commandRef}
@@ -703,7 +846,7 @@ export function NewAgentDialog({ runtime, initialDeckId, onClose, onAppeared, on
               setCommand(event.target.value);
             }}
           />
-        </label>
+        </label>}
         {formError && <p className="new-agent-error" role="alert" data-testid="new-agent-error">{displayText(formError, DISPLAY_LIMITS.message)}</p>}
         {phase === "waiting" && <p className="new-agent-hint" data-testid="new-agent-waiting"><Loader2 className="spin" size={12} /> Started. Waiting for the deck to list it…</p>}
       </form>
@@ -712,8 +855,8 @@ export function NewAgentDialog({ runtime, initialDeckId, onClose, onAppeared, on
       <>
         <button type="button" className="button secondary" disabled={busy} onClick={() => setStep("directory")}><ArrowLeft size={14} /> Back</button>
         <button type="button" className="button secondary" onClick={onClose}>Cancel</button>
-        <button type="submit" form={`${titleId}-form`} className="button primary" data-testid="new-agent-start" disabled={busy}>
-          {phase === "idle" ? <><Plus size={14} /> Start agent</> : phase === "starting" ? "Starting…" : "Opening…"}
+        <button type="submit" form={`${titleId}-form`} className="button primary" data-testid="new-agent-start" disabled={busy || titleTaken}>
+          {phase === "idle" ? <><Plus size={14} /> {selectedOrchestration ? "Start orchestration" : "Start agent"}</> : phase === "starting" ? "Starting…" : "Opening…"}
         </button>
       </>
     );

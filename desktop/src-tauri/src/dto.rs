@@ -533,6 +533,35 @@ pub enum DesktopAction {
         #[serde(default)]
         authoring_kind: Option<AuthoringKind>,
     },
+    /// Start one of a project's orchestrations on the deck `deck_id` names,
+    /// the way the TUI's `Ctrl+n` does (PRD #1223 M6): no task prompt, the
+    /// form's Name as the run's title, and every role run with the command its
+    /// project config gives it — on the deck, which reads the config there.
+    ///
+    /// Not [`Self::StartWorkflow`], which is the Runs screen's launch and keeps
+    /// its own form rules (a required task, desktop profile commands, no Pi
+    /// coordinator). The two share the daemon verbs and the bridge's rollback
+    /// and coordinator-delivery machinery, and none of those form rules.
+    StartOrchestration {
+        /// The target deck's wire id, required for [`Self::StartAgent`]'s
+        /// reason.
+        deck_id: String,
+        /// The daemon-canonical project path the dialog's `ResolveProject`
+        /// answered with, **verbatim**.
+        path: String,
+        /// The orchestration name as that reply offered it, verbatim.
+        orchestration: String,
+        /// The run's title — the form's Name. Absent when the Name is empty,
+        /// which is the TUI's rule: the tab then takes the orchestration's name.
+        #[serde(default)]
+        display_title: Option<String>,
+        /// The `configRevision` the dialog resolved against, echoed to
+        /// `prepare-workflow` as the Runs launch echoes it.
+        #[serde(default)]
+        config_revision: Option<String>,
+        rows: Option<u16>,
+        cols: Option<u16>,
+    },
     StartWorkflow {
         /// The orchestration name, as offered by the daemon's
         /// `resolve-project` reply for `cwd`.
@@ -955,6 +984,29 @@ impl DesktopDirectoryListing {
             truncated,
         }
     }
+}
+
+/// The orchestrations the New agent form can offer for one directory on one
+/// deck (PRD #1223 M6) — the deck's `ResolveProject` answer, or why there is
+/// nothing to offer.
+#[derive(Debug, Clone, Serialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
+pub enum DesktopNewAgentOrchestrations {
+    /// The directory is a project on that deck. Its `path` is the deck's
+    /// canonical spelling, which is what the launch sends.
+    Project(DesktopResolvedProject),
+    /// The deck refused it with `ResolveProject`'s generic `unresolved` code —
+    /// an ordinary directory, which is a normal answer here and not an error.
+    NotProject,
+    /// The deck cannot launch an orchestration from this flow, and `reason`
+    /// says why: it lacks the project verbs (the connection's
+    /// `projectActionsReason`) or cannot start a role with its configured
+    /// command. The form withholds its orchestration chips and shows this.
+    Unsupported { reason: String },
 }
 
 /// What the New agent form needs to know about one deck, or the deck's answer
@@ -2889,6 +2941,60 @@ mod tests {
         assert!(
             decode(Some("orchestration")).is_err(),
             "an unknown kind is refused at decode"
+        );
+    }
+
+    /// Scenario: the webview sends `start_orchestration` (PRD #1223 M6). The
+    /// deck, path and orchestration are required — a launch with no deck is
+    /// refused at decode rather than defaulted to the selection — and the run
+    /// title and config revision are optional and carried verbatim.
+    #[test]
+    fn a_start_orchestration_action_names_its_deck_and_carries_its_title() {
+        let decoded = serde_json::from_value::<DesktopAction>(serde_json::json!({
+            "type": "start_orchestration",
+            "deckId": "deck-000000000000dec1",
+            "path": "/srv/repo",
+            "orchestration": "loop",
+            "displayTitle": "repo-orchestrator-2",
+            "configRevision": "fnv1a128-00",
+        }));
+        assert!(matches!(
+            decoded,
+            Ok(DesktopAction::StartOrchestration {
+                ref deck_id,
+                ref path,
+                ref orchestration,
+                display_title: Some(ref title),
+                config_revision: Some(ref revision),
+                rows: None,
+                cols: None,
+            }) if deck_id == "deck-000000000000dec1"
+                && path == "/srv/repo"
+                && orchestration == "loop"
+                && title == "repo-orchestrator-2"
+                && revision == "fnv1a128-00"
+        ));
+        assert!(matches!(
+            serde_json::from_value::<DesktopAction>(serde_json::json!({
+                "type": "start_orchestration",
+                "deckId": "deck-000000000000dec1",
+                "path": "/srv/repo",
+                "orchestration": "loop",
+            })),
+            Ok(DesktopAction::StartOrchestration {
+                display_title: None,
+                config_revision: None,
+                ..
+            })
+        ));
+        assert!(
+            serde_json::from_value::<DesktopAction>(serde_json::json!({
+                "type": "start_orchestration",
+                "path": "/srv/repo",
+                "orchestration": "loop",
+            }))
+            .is_err(),
+            "a launch with no deck is refused at decode"
         );
     }
 

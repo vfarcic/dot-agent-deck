@@ -1,4 +1,4 @@
-import { createFixtureFleet, createFixtureStartedAgent, DEFAULT_PROFILES, FIXTURE_DEFAULT_COMMANDS, FIXTURE_EXPERIMENTAL_DECKS, FIXTURE_HOMES, fixtureAgentRegistry, fixtureDirectoryTree, fixtureVoiceCommands, nextFixtureAgentId, fixtureVoiceHeard, fixtureVoiceScript, fixtureVoiceStatus, fixtureVoiceTranscription, resolveFixtureVoice, type FixtureState } from "../data/fixture";
+import { createFixtureFleet, createFixtureStartedAgent, DEFAULT_PROFILES, FIXTURE_DEFAULT_COMMANDS, FIXTURE_EXPERIMENTAL_DECKS, FIXTURE_HOMES, fixtureAgentRegistry, fixtureDirectoryTree, fixtureProjectOrchestrations, FIXTURE_ROLE_COMMANDS, fixtureVoiceCommands, nextFixtureAgentId, fixtureVoiceHeard, fixtureVoiceScript, fixtureVoiceStatus, fixtureVoiceTranscription, resolveFixtureVoice, type FixtureState } from "../data/fixture";
 import { agentKey } from "./agentKey";
 import { getTerminal } from "./terminalRegistry";
 import { applyHandoffEvent, mapDaemonEvent, MAX_LIVE_EVIDENCE } from "./daemonEvents";
@@ -20,6 +20,7 @@ import type { HandoffEdge,
   DeckSnapshot,
   EvidenceItem,
   NewAgentOptions,
+  NewAgentOrchestrations,
   RuntimeMode,
   TerminalChunk,
   WorkflowStage,
@@ -1209,6 +1210,7 @@ export type DesktopRunActionDto =
   | { type: "refresh" }
   | { type: "bootstrap"; startIfMissing?: boolean }
   | { type: "start_agent"; deckId: string; command?: string; cwd?: string; displayName?: string; rows?: number; cols?: number; authoringKind?: "schedule" | "schedule-issues" | "dispatcher" }
+  | { type: "start_orchestration"; deckId: string; path: string; orchestration: string; displayTitle?: string; configRevision?: string; rows?: number; cols?: number }
   | { type: "stop_agent"; agentId: string }
   | { type: "rename_agent"; agentId: string; displayName: string }
   | { type: "attach_terminal"; agentId: string; onOutput: import("@tauri-apps/api/core").Channel<ArrayBuffer> }
@@ -1489,6 +1491,13 @@ export interface DeckBridge {
    * rejects exactly as {@link listDirectories} does.
    */
   newAgentOptions(deckId: string): Promise<NewAgentOptions>;
+  /**
+   * PRD #1223 M6 — the orchestrations the New agent form can offer for `path`
+   * on the deck `deckId` names: the project's, `not_project` for an ordinary
+   * directory, or `unsupported` with the reason for a deck that cannot launch
+   * one from this flow. Rejects exactly as {@link listDirectories} does.
+   */
+  newAgentOrchestrations(deckId: string, path: string): Promise<NewAgentOrchestrations>;
   dispose(): Promise<void>;
 }
 
@@ -1500,6 +1509,9 @@ export interface DeckBridge {
 const TYPED_PATH_SHAPE_REFUSAL = "enter an absolute directory path, without control characters, that the deck can see";
 
 /** What a fixture deck says about a path that names no directory it has, in the daemon's own `unresolved` wording. */
+/** The live crate's `CONFIGURED_ROLE_COMMAND_UNSUPPORTED`, repeated by the fixture's older decks (PRD #1223 M6). */
+const FIXTURE_CONFIGURED_ROLES_UNSUPPORTED = "This deck cannot start orchestration roles with their configured commands, so its orchestrations are not offered here. Nothing was started. Launch them from the TUI on that deck's host, or upgrade the deck.";
+
 const FIXTURE_UNRESOLVED_REFUSAL = "daemon returned error: unresolved: that path did not resolve to a readable directory on this daemon";
 
 /**
@@ -1959,6 +1971,7 @@ class FixtureDeckBridge implements DeckBridge {
       // lands on the deck the user picked whichever deck is selected.
       return this.startAgent(action);
     }
+    if (action.type === "start_orchestration") return this.startOrchestration(action);
     if (action.type === "pause_run" || action.type === "resume_run") {
       this.snapshot.paused = action.type === "pause_run";
     } else if (action.type === "approve_run") {
@@ -2030,6 +2043,41 @@ class FixtureDeckBridge implements DeckBridge {
     if (action.command?.trim()) this.lastCommands.set(action.deckId, action.command);
     this.emitSnapshot();
     return { ok: true, agentId };
+  }
+
+  /**
+   * PRD #1223 M6 — the fixture half of the deck-targeted orchestration launch.
+   * The named deck is resolved as for {@link startAgent}; a deck this preview
+   * plays as older refuses in the crate's own sentence, as does a path that is
+   * not one of its projects. Otherwise every role of the orchestration joins
+   * THAT deck's fleet entry under one orchestration id and the run's title —
+   * the orchestration's name when none was given, as the TUI's tab does — and
+   * the START role's id comes back, so a spec can wait for it and open its
+   * pane exactly as the live flow will.
+   */
+  private startOrchestration(action: Extract<DeckAction, { type: "start_orchestration" }>): DeckActionResult {
+    const deck = this.connectedDeck(action.deckId);
+    if (this.isOlderDeck(action.deckId)) throw new Error(FIXTURE_CONFIGURED_ROLES_UNSUPPORTED);
+    const home = FIXTURE_HOMES[action.deckId] ?? "/home/dev";
+    const orchestration = fixtureProjectOrchestrations(home, action.path)?.find((candidate) => candidate.name === action.orchestration);
+    if (!orchestration) throw new Error(FIXTURE_UNRESOLVED_REFUSAL);
+    const orchestrationId = `fixture-orchestration-${nextFixtureAgentId(deck.agents)}`;
+    let startAgentId: string | undefined;
+    orchestration.roles.forEach((role, roleIndex) => {
+      const agentId = nextFixtureAgentId(deck.agents);
+      if (role.start) startAgentId = agentId;
+      deck.agents = [
+        ...deck.agents,
+        {
+          ...createFixtureStartedAgent({ id: agentId, daemonId: action.deckId, displayName: role.name, command: FIXTURE_ROLE_COMMANDS[role.name], cwd: action.path, rows: action.rows, cols: action.cols }),
+          tab: { kind: "orchestration", orchestrationId, name: orchestration.name, displayTitle: action.displayTitle, roleName: role.name, roleIndex, isStartRole: role.start, cwd: action.path },
+          inOrchestration: true,
+          isStartRole: role.start,
+        },
+      ];
+    });
+    this.emitSnapshot();
+    return { ok: true, agentId: startAgentId };
   }
 
   /**
@@ -2382,6 +2430,22 @@ class FixtureDeckBridge implements DeckBridge {
       authoringKinds: ["schedule", "schedule-issues", "dispatcher"],
       ...remembered,
     };
+  }
+
+  /**
+   * PRD #1223 M6 — the named fixture deck's answer for `path`: `demo-project`'s
+   * orchestration ({@link fixtureProjectOrchestrations}), `not_project` for any
+   * other path — the live deck's generic `unresolved` refusal, read the same
+   * way — and `unsupported` for a deck this preview plays as older.
+   */
+  async newAgentOrchestrations(deckId: string, path: string): Promise<NewAgentOrchestrations> {
+    await Promise.resolve();
+    this.connectedDeck(deckId);
+    if (this.isOlderDeck(deckId)) return { kind: "unsupported", reason: FIXTURE_CONFIGURED_ROLES_UNSUPPORTED };
+    const home = FIXTURE_HOMES[deckId] ?? "/home/dev";
+    const orchestrations = fixtureProjectOrchestrations(home, path);
+    if (!orchestrations) return { kind: "not_project" };
+    return { kind: "project", path, displayPath: path, displayName: path.split("/").at(-1) ?? path, orchestrations, configRevision: "fixture-revision" };
   }
 
   async dispose(): Promise<void> {
@@ -3476,7 +3540,7 @@ export class TauriDeckBridge implements DeckBridge {
 
   async runAction(action: DeckAction): Promise<DeckActionResult> {
     const invoke = await this.getInvoke();
-    if (action.type === "start_agent" || action.type === "stop_agent" || action.type === "rename_agent" || action.type === "submit_text" || action.type === "start_workflow" || action.type === "stop_daemon" || action.type === "restart_daemon" || action.type === "allow_build_mismatch") {
+    if (action.type === "start_agent" || action.type === "start_orchestration" || action.type === "stop_agent" || action.type === "rename_agent" || action.type === "submit_text" || action.type === "start_workflow" || action.type === "stop_daemon" || action.type === "restart_daemon" || action.type === "allow_build_mismatch") {
       // `desktop_run_action` resolves with `ok: false` for a non-delivered
       // send rather than raising, so the result must be returned, not dropped.
       //
@@ -3782,6 +3846,12 @@ export class TauriDeckBridge implements DeckBridge {
   async newAgentOptions(deckId: string): Promise<NewAgentOptions> {
     const invoke = await this.getInvoke();
     return invoke<NewAgentOptions>("desktop_new_agent_options", { deckId });
+  }
+
+  /** PRD #1223 M6. The deck and the path go through untouched, as for {@link listDirectories}. */
+  async newAgentOrchestrations(deckId: string, path: string): Promise<NewAgentOrchestrations> {
+    const invoke = await this.getInvoke();
+    return invoke<NewAgentOrchestrations>("desktop_new_agent_orchestrations", { deckId, path });
   }
 
   async dispose(): Promise<void> {

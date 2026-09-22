@@ -1,4 +1,4 @@
-import type { AuthoringKind, ConnectionView, DeckDirectoryEntry, DeckFleet, NewAgentOption, NewAgentOptions } from "../types";
+import type { AuthoringKind, ConnectionView, DaemonOrchestration, DeckDirectoryEntry, DeckFleet, NewAgentOption, NewAgentOptions, NewAgentOrchestrations } from "../types";
 import { DISPLAY_LIMITS, deckName, displayText } from "./displayText";
 
 /**
@@ -170,6 +170,85 @@ export function resolveAuthoringCommand(command: string, defaultCommand: string 
   if (configured) return configured;
   return agents.find((agent) => agent.id === "claude")?.defaultCommand?.trim() || "claude";
 }
+
+/**
+ * The orchestration Mode chips (PRD #1223 M6) — the TUI's `[Orch: <name>]`, one
+ * per orchestration the chosen directory's project defines on that deck, or why
+ * none is offered. Nothing is offered while the answer is loading or for an
+ * ordinary directory, and a deck that cannot launch one from this flow gives
+ * its reason instead.
+ */
+export function orchestrationModes(answer: NewAgentOrchestrations | undefined): { offered: DaemonOrchestration[]; withheld?: string } {
+  if (answer === undefined || answer.kind === "not_project") return { offered: [] };
+  if (answer.kind === "unsupported") return { offered: [], withheld: answer.reason };
+  return { offered: answer.orchestrations };
+}
+
+/** The Mode chip id of an orchestration — distinct from every authoring kind and from `none`. */
+export function orchestrationModeId(name: string): `orch:${string}` {
+  return `orch:${name}`;
+}
+
+/**
+ * The titles of the orchestrations live on one deck — the TUI's
+ * `live_orchestration_cwds_and_titles`, read from that deck's own fleet entry:
+ * each orchestration role's title when it has one, else the orchestration's
+ * name, which is what its tab shows. Duplicates are dropped, so a run's many
+ * roles count once.
+ */
+export function liveOrchestrationTitles(fleet: DeckFleet, deckId: string): string[] {
+  const titles = new Set<string>();
+  for (const deck of fleet) {
+    if (deck.connection.deckId !== deckId) continue;
+    for (const agent of deck.agents) {
+      if (agent.tab.kind !== "orchestration") continue;
+      titles.add(agent.tab.displayTitle ? agent.tab.displayTitle : agent.tab.name);
+    }
+  }
+  return [...titles];
+}
+
+/** The directories live orchestrations run in on one deck — the TUI's same-directory warning reads these. */
+export function liveOrchestrationDirectories(fleet: DeckFleet, deckId: string): string[] {
+  const directories = new Set<string>();
+  for (const deck of fleet) {
+    if (deck.connection.deckId !== deckId) continue;
+    for (const agent of deck.agents) {
+      if (agent.tab.kind === "orchestration" && agent.tab.cwd) directories.add(agent.tab.cwd);
+    }
+  }
+  return [...directories];
+}
+
+/**
+ * The Name prefill while an orchestration is selected — the TUI's
+ * `suggest_orchestration_name`: `<basename>-orchestrator-N` for the lowest `N`
+ * no live orchestration's title on that deck already holds. Counted over the
+ * deck's live orchestrations, not per directory, because uniqueness is the
+ * point of the name.
+ */
+export function suggestOrchestrationName(basename: string, liveTitles: readonly string[]): string {
+  for (let n = 1; ; n += 1) {
+    const candidate = `${basename}-orchestrator-${n}`;
+    if (!liveTitles.includes(candidate)) return candidate;
+  }
+}
+
+/**
+ * The title a launch will actually take — the TUI's `resolved_title`: the Name
+ * when it is not empty, otherwise the orchestration's own name, which is what
+ * the tab falls back to. The collision check compares THIS, never the raw
+ * field, since an empty Name is not "no title".
+ */
+export function orchestrationRunTitle(name: string, orchestration: string): string {
+  return name === "" ? orchestration : name;
+}
+
+/** The TUI's `NAME_COLLISION_WARNING`, for the deck the run would start on. */
+export const ORCHESTRATION_TITLE_TAKEN = "This name is already in use by a live orchestration on this deck.";
+
+/** The TUI's `SAME_CWD_ORCHESTRATION_WARNING` — a warning, not a refusal. */
+export const SAME_DIRECTORY_ORCHESTRATION = "This directory already runs an orchestration on this deck. Both share its .dot-agent-deck role files and one working tree.";
 
 /**
  * Whether a refusal means the chosen deck has left the fleet — the crate's

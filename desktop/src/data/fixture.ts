@@ -1,5 +1,5 @@
 import type { VoiceCommandDto, VoiceResolvedParamDto, VoiceResultDto, VoiceScreen, VoiceStatusDto, VoiceTranscriptionDto } from "../lib/bridge";
-import type { AgentProfile, AgentSession, AgentStatus, AgentTab, DeckDirectoryEntry, DeckSnapshot, EvidenceItem, NewAgentOption, WorkflowStage } from "../types";
+import type { AgentProfile, AgentSession, AgentStatus, AgentTab, DaemonOrchestration, DeckDirectoryEntry, DeckSnapshot, EvidenceItem, NewAgentOption, WorkflowStage } from "../types";
 
 /**
  * The fixture's stand-in for a deck identity — used as BOTH `deckId` and
@@ -521,6 +521,38 @@ export function fixtureDirectoryTree(home: string): Map<string, FixtureDirectory
   ];
   return new Map(tree.map((directory) => [directory.path, directory]));
 }
+
+/**
+ * PRD #1223 M6 — the orchestrations a fixture deck's `demo-project` defines, as
+ * that deck's `ResolveProject` answers them: one, `demo-loop`, whose
+ * `planner` starts the run and whose `builder` works for it. Every other
+ * directory in {@link fixtureDirectoryTree} is an ordinary one.
+ */
+export function fixtureProjectOrchestrations(home: string, path: string): DaemonOrchestration[] | undefined {
+  if (path !== `${home}/demo-project`) return undefined;
+  return [
+    {
+      name: "demo-loop",
+      displayName: "demo-loop",
+      default: true,
+      roles: [
+        { name: "planner", displayName: "planner", start: true },
+        { name: "builder", displayName: "builder", start: false },
+      ],
+    },
+  ];
+}
+
+/**
+ * The commands `demo-loop`'s roles are configured with on a fixture deck — the
+ * deck's own config, which never crosses the wire. The fixture deck starts each
+ * role with its command the way a live deck does for a launch from the New
+ * agent dialog, so the preview's role panes are labelled by what they run.
+ */
+export const FIXTURE_ROLE_COMMANDS: Readonly<Record<string, string>> = {
+  planner: "claude",
+  builder: "codex",
+};
 
 /**
  * The agent registry a fixture deck reports, shaped as `new-agent-options`

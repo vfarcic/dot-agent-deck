@@ -1,7 +1,7 @@
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import { createFixtureSnapshot, createFixtureStartedAgent } from "../data/fixture";
-import type { AgentSession, ConnectionView, DeckDirectoryListing, DeckSnapshot, NewAgentOptions } from "../types";
+import type { AgentSession, ConnectionView, DeckDirectoryListing, DeckSnapshot, NewAgentOptions, NewAgentOrchestrations } from "../types";
 import { NewAgentDialog, type NewAgentRuntime } from "./NewAgentDialog";
 
 const LOCAL = "deck-000000000000aaaa";
@@ -30,6 +30,7 @@ const TREE: Record<string, Extract<DeckDirectoryListing, { kind: "listing" }>> =
   },
   "/home/dev": undefined as never,
   "/home/dev/beta": { kind: "listing", path: "/home/dev/beta", displayPath: "/home/dev/beta", parent: "/home/dev", entries: [{ path: "/home/dev/beta/leaf", displayName: "leaf", isProject: false }], truncated: false },
+  "/home/dev/Alpha-project": { kind: "listing", path: "/home/dev/Alpha-project", displayPath: "/home/dev/Alpha-project", parent: "/home/dev", entries: [], truncated: false },
   "/home/dev/beta/leaf": { kind: "listing", path: "/home/dev/beta/leaf", displayPath: "/home/dev/beta/leaf", parent: "/home/dev/beta", entries: [], truncated: false },
   "/canonical-parent-of-home": { kind: "listing", path: "/canonical-parent-of-home", displayPath: "/canonical-parent-of-home", entries: [{ path: "/home/dev", displayName: "dev", isProject: false }], truncated: false },
   "/typed/link/": { kind: "listing", path: "/real/target", displayPath: "/real/target", parent: "/real", entries: [], truncated: false },
@@ -676,6 +677,217 @@ describe("New agent dialog — authoring agents (PRD #1223 M7)", () => {
 
     await waitFor(() => expect(screen.getByTestId("new-agent-mode-none")).toHaveAttribute("aria-pressed", "true"));
     expect(screen.getByTestId("new-agent-mode-schedule")).toHaveAttribute("aria-pressed", "false");
+  });
+});
+
+describe("New agent dialog — orchestrations (PRD #1223 M6)", () => {
+  const PROJECT = "/home/dev/Alpha-project";
+  const PROJECT_ORCHESTRATIONS: NewAgentOrchestrations = {
+    kind: "project",
+    path: PROJECT,
+    displayPath: PROJECT,
+    displayName: "Alpha-project",
+    configRevision: "rev-1",
+    orchestrations: [
+      {
+        name: "loop",
+        displayName: "loop",
+        default: true,
+        roles: [
+          { name: "planner", displayName: "planner", start: true },
+          { name: "builder", displayName: "builder", start: false },
+        ],
+      },
+    ],
+  };
+  const orchestrationsOf = (answer: NewAgentOrchestrations = PROJECT_ORCHESTRATIONS) =>
+    vi.fn(async (_deckId: string, _path: string): Promise<NewAgentOrchestrations> => structuredClone(answer));
+
+  /** A live orchestration role on a deck, carrying `title` (or none) and running in `cwd`. */
+  function orchestrationRole(id: string, daemonId: string, title: string | undefined, name = "loop", cwd?: string): AgentSession {
+    return {
+      ...createFixtureStartedAgent({ id, daemonId }),
+      tab: { kind: "orchestration", name, displayTitle: title, roleName: "planner", roleIndex: 0, isStartRole: true, cwd, orchestrationId: `run-${id}` },
+      inOrchestration: true,
+      isStartRole: true,
+    };
+  }
+
+  /** Confirm the only eligible deck, enter the project directory — the first entry — and use it. */
+  async function reachProjectForm() {
+    fireEvent.keyDown(deckList(), { key: "Enter" });
+    await currentPath("/home/dev");
+    fireEvent.keyDown(directoryList(), { key: "Enter" });
+    await currentPath(PROJECT);
+    fireEvent.keyDown(directoryList(), { key: "Enter" });
+    await screen.findByTestId("new-agent-form");
+  }
+
+  const chip = () => screen.findByTestId("new-agent-mode-orch:loop");
+
+  /**
+   * Scenario: browse into a directory the listing marks as a project and use
+   * it. The CHOSEN deck is asked for that directory's orchestrations, and the
+   * Mode row offers `Orch: loop` right after No mode, as the TUI's cycler
+   * does.
+   */
+  it("offers one chip per orchestration of a project directory, asked of the chosen deck", async () => {
+    const runtime = fakeRuntime({ newAgentOrchestrations: orchestrationsOf() });
+    renderDialog(runtime);
+    await reachProjectForm();
+
+    expect(await chip()).toHaveTextContent("Orch: loop");
+    expect(runtime.newAgentOrchestrations).toHaveBeenCalledWith(LOCAL, PROJECT);
+    const modes = within(screen.getByTestId("new-agent-modes")).getAllByRole("button").map((button) => button.getAttribute("data-mode"));
+    expect(modes.slice(0, 2)).toEqual(["none", "orch:loop"]);
+  });
+
+  /**
+   * Scenario: use a directory the listing marked as NOT a project. The deck is
+   * not asked for orchestrations at all, and no orchestration chip appears.
+   */
+  it("asks nothing for a directory the listing marked as no project", async () => {
+    const runtime = fakeRuntime({ newAgentOrchestrations: orchestrationsOf() });
+    renderDialog(runtime);
+    await reachForm();
+
+    expect(runtime.newAgentOrchestrations).not.toHaveBeenCalled();
+    expect(screen.queryByTestId("new-agent-mode-orch:loop")).toBeNull();
+  });
+
+  /**
+   * Scenario: the chosen deck cannot launch an orchestration from this flow —
+   * it lacks the project verbs or cannot start a role with its configured
+   * command. No chip is offered and the deck's own reason is shown instead.
+   */
+  it("withholds the chips with the deck's reason", async () => {
+    const reason = "This deck cannot start orchestration roles with their configured commands, so its orchestrations are not offered here.";
+    renderDialog(fakeRuntime({ newAgentOrchestrations: orchestrationsOf({ kind: "unsupported", reason }) }));
+    await reachProjectForm();
+
+    expect(await screen.findByTestId("new-agent-orchestrations-withheld")).toHaveTextContent(reason);
+    expect(screen.queryByTestId("new-agent-mode-orch:loop")).toBeNull();
+  });
+
+  /**
+   * Scenario: the chosen deck already runs `Alpha-project-orchestrator-1`, and
+   * ANOTHER deck runs `Alpha-project-orchestrator-2`. Selecting the chip with
+   * an untouched Name prefills `Alpha-project-orchestrator-2` — the other
+   * deck's titles do not count — and hides Command; No mode restores the
+   * basename and Command. Once the Name is typed in, selecting the chip no
+   * longer replaces it.
+   */
+  it("prefills the next free name against the chosen deck's live titles and hides Command", async () => {
+    const runtime = fakeRuntime({
+      newAgentOrchestrations: orchestrationsOf(),
+      fleet: [
+        deck(LOCAL, { deckKind: "local" }, [orchestrationRole("3", LOCAL, "Alpha-project-orchestrator-1")]),
+        deck(REMOTE, { status: "disconnected" }, [orchestrationRole("4", REMOTE, "Alpha-project-orchestrator-2")]),
+      ],
+    });
+    renderDialog(runtime);
+    await reachProjectForm();
+    expect(screen.getByTestId("new-agent-name")).toHaveValue("Alpha-project");
+
+    fireEvent.click(await chip());
+    expect(screen.getByTestId("new-agent-name")).toHaveValue("Alpha-project-orchestrator-2");
+    expect(screen.queryByTestId("new-agent-command")).toBeNull();
+    expect(screen.getByTestId("new-agent-start")).toHaveTextContent("Start orchestration");
+
+    fireEvent.click(screen.getByTestId("new-agent-mode-none"));
+    expect(screen.getByTestId("new-agent-name")).toHaveValue("Alpha-project");
+    expect(screen.getByTestId("new-agent-command")).toBeVisible();
+
+    fireEvent.change(screen.getByTestId("new-agent-name"), { target: { value: "my-run" } });
+    fireEvent.click(await chip());
+    expect(screen.getByTestId("new-agent-name")).toHaveValue("my-run");
+  });
+
+  /**
+   * Scenario: the chosen deck runs an orchestration titled `taken-run`, and
+   * another whose title is its bare name `loop`. Typing `taken-run` refuses
+   * the start inline with Start disabled; an empty Name — whose run would
+   * take the orchestration's own name, `loop` — is refused the same way; any
+   * other Name clears the refusal. Nothing is sent while it stands.
+   */
+  it("refuses a Name that is a live orchestration's title on that deck", async () => {
+    const runtime = fakeRuntime({
+      newAgentOrchestrations: orchestrationsOf(),
+      fleet: [
+        deck(LOCAL, { deckKind: "local" }, [orchestrationRole("3", LOCAL, "taken-run"), orchestrationRole("5", LOCAL, undefined, "loop")]),
+        deck(REMOTE, { status: "disconnected" }),
+      ],
+    });
+    renderDialog(runtime);
+    await reachProjectForm();
+    fireEvent.click(await chip());
+
+    fireEvent.change(screen.getByTestId("new-agent-name"), { target: { value: "taken-run" } });
+    expect(screen.getByTestId("new-agent-title-taken")).toHaveTextContent("already in use by a live orchestration");
+    expect(screen.getByTestId("new-agent-start")).toBeDisabled();
+    fireEvent.submit(screen.getByTestId("new-agent-form"));
+
+    fireEvent.change(screen.getByTestId("new-agent-name"), { target: { value: "" } });
+    expect(screen.getByTestId("new-agent-title-taken")).toBeVisible();
+
+    fireEvent.change(screen.getByTestId("new-agent-name"), { target: { value: "fresh-run" } });
+    expect(screen.queryByTestId("new-agent-title-taken")).toBeNull();
+    expect(screen.getByTestId("new-agent-start")).toBeEnabled();
+    expect(runtime.runAction).not.toHaveBeenCalled();
+  });
+
+  /**
+   * Scenario: launch the orchestration. One `start_orchestration` goes to the
+   * captured deck with the deck's own project path and orchestration name,
+   * the Name as the run's title, the resolved config revision, and no command
+   * or task. Once that deck lists the START role the reply named, its pane is
+   * opened.
+   */
+  it("launches on the captured deck and opens the start role's pane once it is listed", async () => {
+    const runtime = fakeRuntime({ newAgentOrchestrations: orchestrationsOf(), runAction: vi.fn(async () => ({ ok: true, agentId: "12" })) });
+    const { onAppeared, rerenderWith } = renderDialog(runtime);
+    await reachProjectForm();
+    fireEvent.click(await chip());
+
+    fireEvent.click(screen.getByTestId("new-agent-start"));
+
+    expect(await screen.findByTestId("new-agent-waiting")).toBeVisible();
+    expect(runtime.runAction).toHaveBeenCalledWith({
+      type: "start_orchestration",
+      deckId: LOCAL,
+      path: PROJECT,
+      orchestration: "loop",
+      displayTitle: "Alpha-project-orchestrator-1",
+      configRevision: "rev-1",
+    });
+    expect(onAppeared).not.toHaveBeenCalled();
+
+    rerenderWith({ ...runtime, fleet: [deck(LOCAL, { deckKind: "local" }, [orchestrationRole("12", LOCAL, "Alpha-project-orchestrator-1")]), runtime.fleet[1]] });
+
+    await waitFor(() => expect(onAppeared).toHaveBeenCalledWith({ deckId: LOCAL, agentId: "12" }));
+  });
+
+  /**
+   * Scenario: a later role is refused mid-launch. The deck's refusal — which
+   * names the role that failed and the roles that had started — is shown
+   * inline, the dialog stays open, and the chip and the Name are kept.
+   */
+  it("keeps the dialog open with a partial failure inline", async () => {
+    const refusal = "failed to start orchestration role builder: start-prepared-agent failed; roles already started: planner; stopped 1 already-started role(s)";
+    const runtime = fakeRuntime({ newAgentOrchestrations: orchestrationsOf(), runAction: vi.fn(async () => { throw new Error(refusal); }) });
+    const { onClose } = renderDialog(runtime);
+    await reachProjectForm();
+    fireEvent.click(await chip());
+    fireEvent.change(screen.getByTestId("new-agent-name"), { target: { value: "nightly-run" } });
+
+    fireEvent.click(screen.getByTestId("new-agent-start"));
+
+    expect(await screen.findByTestId("new-agent-error")).toHaveTextContent("roles already started: planner");
+    expect(screen.getByTestId("new-agent-mode-orch:loop")).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getByTestId("new-agent-name")).toHaveValue("nightly-run");
+    expect(screen.getByTestId("new-agent-start")).toBeEnabled();
+    expect(onClose).not.toHaveBeenCalled();
+    expect(runtime.clearError).toHaveBeenCalled();
   });
 });
 

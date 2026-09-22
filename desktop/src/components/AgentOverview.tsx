@@ -760,9 +760,17 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
    */
   const newAgentRuntime = useMemo<NewAgentRuntime | undefined>(() => (
     runtime.listDirectories && runtime.newAgentOptions
-      ? { fleet: runtime.fleet, runAction: runtime.runAction, clearError: runtime.clearError, listDirectories: runtime.listDirectories, newAgentOptions: runtime.newAgentOptions }
+      ? {
+        fleet: runtime.fleet,
+        runAction: runtime.runAction,
+        clearError: runtime.clearError,
+        listDirectories: runtime.listDirectories,
+        newAgentOptions: runtime.newAgentOptions,
+        // PRD #1223 M6 — optional: a runtime without it offers no orchestration chips.
+        ...(runtime.newAgentOrchestrations ? { newAgentOrchestrations: runtime.newAgentOrchestrations } : {}),
+      }
       : undefined
-  ), [runtime.clearError, runtime.fleet, runtime.listDirectories, runtime.newAgentOptions, runtime.runAction]);
+  ), [runtime.clearError, runtime.fleet, runtime.listDirectories, runtime.newAgentOptions, runtime.newAgentOrchestrations, runtime.runAction]);
   /** The open flow and the deck it preselects; `undefined` while it is closed. */
   const [newAgent, setNewAgent] = useState<{ deckId?: string }>();
   /** What the flow could not finish on screen: an agent the deck accepted and has not listed. */

@@ -104,6 +104,71 @@ test.describe("the New agent flow", () => {
   });
 
   /**
+   * Scenario (PRD #1223 M6): on the fleet, open New agent and choose the
+   * remote deck. Its home marks `demo-project` as a project; enter it and use
+   * it. The Mode row offers `Orch: demo-loop` after No mode; select it with the
+   * arrow keys and the Name becomes `demo-project-orchestrator-1` while Command
+   * disappears. Start launches the orchestration on that deck: the START
+   * role's pane opens over the overview, and back on the overview both roles
+   * are rows of the remote deck.
+   */
+  test("launches an orchestration in a project directory and opens its start role's pane", async ({ page }) => {
+    await openOverview(page, "fleet");
+
+    await page.getByTestId("overview-new-agent").click();
+    const dialog = page.getByTestId("new-agent-dialog");
+    await page.getByTestId("new-agent-deck-list").locator(`[data-deck-id="${REMOTE_DECK}"]`).click();
+    await expect(page.getByTestId("new-agent-current-path")).toHaveText("/home/build");
+    const directories = page.getByTestId("new-agent-directory-list");
+    await expect(directories).toBeFocused();
+    await expect(directories.locator("[aria-selected='true']")).toHaveAttribute("data-path", "/home/build/demo-project");
+    await page.keyboard.press("Enter");
+    await expect(page.getByTestId("new-agent-current-path")).toHaveText("/home/build/demo-project");
+    await page.keyboard.press(" ");
+
+    await expect(dialog).toHaveAttribute("data-step", "form");
+    await expect(page.getByTestId("new-agent-name")).toHaveValue("demo-project");
+    const modes = page.getByTestId("new-agent-modes").getByRole("button");
+    await expect(modes).toHaveText(["No mode", "Orch: demo-loop", "schedule", "schedule: issues", "dispatcher"]);
+    await page.getByTestId("new-agent-mode-none").focus();
+    await page.keyboard.press("ArrowRight");
+    await expect(page.getByTestId("new-agent-mode-orch:demo-loop")).toHaveAttribute("aria-pressed", "true");
+    await expect(page.getByTestId("new-agent-name")).toHaveValue("demo-project-orchestrator-1");
+    await expect(page.getByTestId("new-agent-command")).toHaveCount(0);
+    await page.getByTestId("new-agent-start").click();
+
+    const overlay = page.getByTestId("agent-pane-overlay");
+    await expect(overlay).toBeVisible();
+    await expect(overlay).toHaveAttribute("aria-label", "Claude agent");
+    await expect(dialog).toHaveCount(0);
+
+    await page.keyboard.press("Escape");
+    await expect(overlay).toHaveCount(0);
+    const remoteGroup = page.locator(`[data-testid="daemon-group"][data-daemon-id="${REMOTE_DECK}"]`);
+    await expect(remoteGroup.getByRole("button", { name: "Open planner agent", exact: true })).toBeVisible();
+    await expect(remoteGroup.getByRole("button", { name: "Open builder agent", exact: true })).toBeVisible();
+  });
+
+  /**
+   * Scenario (PRD #1223 M6): with the remote deck playing a deck from before
+   * PRD #1223, open the flow from its header and type the project's path. The
+   * deck cannot start a role with its configured command, so no orchestration
+   * chip is offered and the form says why.
+   */
+  test("withholds orchestrations on a deck that cannot start configured roles", async ({ page }) => {
+    await page.goto(`/?fixture=1&state=fleet&older=${encodeURIComponent(REMOTE_DECK)}`);
+    await page.getByTestId("open-overview").click();
+    await page.locator(`[data-testid="daemon-group"][data-daemon-id="${REMOTE_DECK}"]`).getByTestId("daemon-new-agent").click();
+    await page.keyboard.press("Enter");
+    await expect(page.getByTestId("new-agent-path")).toBeFocused();
+    await page.keyboard.type("/home/build/demo-project");
+    await page.keyboard.press("Enter");
+
+    await expect(page.getByTestId("new-agent-orchestrations-withheld")).toContainText("configured commands");
+    await expect(page.getByTestId("new-agent-modes").getByRole("button")).toHaveText(["No mode"]);
+  });
+
+  /**
    * Scenario (PRD #1223 M7): with the remote deck playing a deck from before
    * PRD #1223, open the flow from its header and type a path. The form offers
    * No mode alone and says why the authoring agents are missing.

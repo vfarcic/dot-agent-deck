@@ -407,6 +407,27 @@ describe("TauriDeckBridge", () => {
   });
 
   /**
+   * Scenario (PRD #1223 M6): launch an orchestration and ask a deck for a
+   * directory's orchestrations through the live bridge. The launch reaches
+   * `desktop_run_action` exactly as sent and hands back the start role's id;
+   * the query reaches its own command with the deck and the path verbatim.
+   */
+  it("forwards start_orchestration and the orchestrations query untouched", async () => {
+    const { TauriDeckBridge } = await import("./bridge");
+    const bridge = new TauriDeckBridge();
+    invoke.mockResolvedValueOnce({ ok: true, agentId: "9", snapshot: {} });
+    invoke.mockResolvedValueOnce({ kind: "not_project" });
+
+    const action = { type: "start_orchestration", deckId: "deck-00000000000b0x01", path: "/srv/repo", orchestration: "loop", displayTitle: "repo-orchestrator-1", configRevision: "rev-1" } as const;
+    expect(await bridge.runAction(action)).toEqual({ ok: true, agentId: "9" });
+    expect(await bridge.newAgentOrchestrations("deck-00000000000b0x02", "/srv/other/")).toEqual({ kind: "not_project" });
+
+    expect(invoke).toHaveBeenNthCalledWith(1, "desktop_run_action", { action });
+    expect(invoke).toHaveBeenNthCalledWith(2, "desktop_new_agent_orchestrations", { deckId: "deck-00000000000b0x02", path: "/srv/other/" });
+    await bridge.dispose();
+  });
+
+  /**
    * Scenario: the crate refuses a start because its deck is not one the app
    * observes. The bridge surfaces that refusal as a rejection and sends
    * nothing else — no second attempt, and no deck filled in from the
@@ -1113,6 +1134,43 @@ describe("FixtureDeckBridge scenarios", () => {
     const before = (await older.connect()).find((deck) => deck.connection.deckId === FIXTURE_REMOTE_DAEMON_ID)?.agents.length;
     await expect(older.runAction({ type: "start_agent", deckId: FIXTURE_REMOTE_DAEMON_ID, command: "claude", cwd: "/home/build/scratch", authoringKind: "schedule" }))
       .rejects.toThrow("cannot start a `schedule` agent");
+    const after = (await older.connect()).find((deck) => deck.connection.deckId === FIXTURE_REMOTE_DAEMON_ID)?.agents.length;
+    expect(after).toBe(before);
+    await older.dispose();
+  });
+
+  /**
+   * Scenario (PRD #1223 M6): the fleet preview's `demo-project` defines the
+   * `demo-loop` orchestration on each deck, and every other directory is an
+   * ordinary one. Launching it on the remote deck adds both roles to THAT
+   * deck under the run's title and one orchestration id, and answers the
+   * start role; played as an older deck, the query withholds with the crate's
+   * reason and the launch is refused and adds nothing.
+   */
+  it("answers a fixture deck's orchestrations and launches one on the named deck", async () => {
+    const { FIXTURE_REMOTE_DAEMON_ID } = await import("../data/fixture");
+    window.history.replaceState({}, "", "/?fixture=1&state=fleet");
+    const { createDeckBridge } = await import("./bridge");
+    const bridge = createDeckBridge("fixture");
+    await bridge.connect();
+    expect(await bridge.newAgentOrchestrations(FIXTURE_REMOTE_DAEMON_ID, "/home/build/scratch")).toEqual({ kind: "not_project" });
+    const answer = await bridge.newAgentOrchestrations(FIXTURE_REMOTE_DAEMON_ID, "/home/build/demo-project");
+    expect(answer).toMatchObject({ kind: "project", path: "/home/build/demo-project", orchestrations: [{ name: "demo-loop" }] });
+
+    const started = await bridge.runAction({ type: "start_orchestration", deckId: FIXTURE_REMOTE_DAEMON_ID, path: "/home/build/demo-project", orchestration: "demo-loop", displayTitle: "demo-project-orchestrator-1" });
+    const fleet = await bridge.connect();
+    const roles = fleet.find((deck) => deck.connection.deckId === FIXTURE_REMOTE_DAEMON_ID)?.agents.filter((agent) => agent.tab.kind === "orchestration" && agent.tab.displayTitle === "demo-project-orchestrator-1") ?? [];
+    expect(roles.map((agent) => agent.displayName)).toEqual(["planner", "builder"]);
+    expect(new Set(roles.map((agent) => agent.tab.kind === "orchestration" ? agent.tab.orchestrationId : undefined)).size).toBe(1);
+    expect(started.agentId).toBe(roles.find((agent) => agent.isStartRole)?.id);
+    await bridge.dispose();
+
+    window.history.replaceState({}, "", `/?fixture=1&state=fleet&older=${encodeURIComponent(FIXTURE_REMOTE_DAEMON_ID)}`);
+    const older = createDeckBridge("fixture");
+    const before = (await older.connect()).find((deck) => deck.connection.deckId === FIXTURE_REMOTE_DAEMON_ID)?.agents.length;
+    expect(await older.newAgentOrchestrations(FIXTURE_REMOTE_DAEMON_ID, "/home/build/demo-project")).toMatchObject({ kind: "unsupported", reason: expect.stringContaining("configured commands") });
+    await expect(older.runAction({ type: "start_orchestration", deckId: FIXTURE_REMOTE_DAEMON_ID, path: "/home/build/demo-project", orchestration: "demo-loop" }))
+      .rejects.toThrow("configured commands");
     const after = (await older.connect()).find((deck) => deck.connection.deckId === FIXTURE_REMOTE_DAEMON_ID)?.agents.length;
     expect(after).toBe(before);
     await older.dispose();

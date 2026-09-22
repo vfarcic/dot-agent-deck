@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { createFixtureFleet, createFixtureSnapshot, createFixtureStartedAgent, FIXTURE_DAEMON_ID, FIXTURE_PENDING_DAEMON_ID, FIXTURE_REMOTE_DAEMON_ID, FIXTURE_UNREACHABLE_DAEMON_ID } from "../data/fixture";
-import type { ConnectionView, DeckFleet, NewAgentOptions } from "../types";
+import type { AgentSession, ConnectionView, DeckFleet, NewAgentOptions } from "../types";
 import {
   AUTHORING_WITHHELD,
   authoringModes,
@@ -12,10 +12,16 @@ import {
   fleetLists,
   isDeckGoneError,
   isNewAgentShortcut,
+  liveOrchestrationDirectories,
+  liveOrchestrationTitles,
   NEW_AGENT_APPEAR_TIMEOUT_MS,
+  orchestrationModeId,
+  orchestrationModes,
+  orchestrationRunTitle,
   preselectedDeck,
   resolveAuthoringCommand,
   seedCommand,
+  suggestOrchestrationName,
 } from "./newAgent";
 
 describe("New agent rules (PRD #1223 M4)", () => {
@@ -194,5 +200,55 @@ describe("New agent rules — authoring agents (PRD #1223 M7)", () => {
     expect(resolveAuthoringCommand("", "   ", registry)).toBe("claude-code-wrapper");
     expect(resolveAuthoringCommand("", undefined, [])).toBe("claude");
     expect(resolveAuthoringCommand("", undefined, [{ id: "claude", displayName: "ClaudeCode" }])).toBe("claude");
+  });
+});
+
+describe("New agent orchestration rules (PRD #1223 M6)", () => {
+  const role = (id: string, name: string, displayTitle?: string, cwd?: string): AgentSession => ({
+    ...createFixtureStartedAgent({ id, daemonId: "deck-a" }),
+    tab: { kind: "orchestration", name, displayTitle, roleName: `role-${id}`, roleIndex: 0, isStartRole: false, cwd },
+    inOrchestration: true,
+  });
+  const fleetOf = (decks: Record<string, AgentSession[]>): DeckFleet =>
+    Object.entries(decks).map(([deckId, agents]) => ({ ...createFixtureSnapshot("connected"), agents, connection: { status: "connected", deckId } }));
+
+  /**
+   * Scenario: the TUI's `live_orchestration_cwds_and_titles`, read from one
+   * deck's fleet entry. A role's title counts when it has one and its
+   * orchestration's name when it does not; a run's several roles count once;
+   * a dashboard agent and another deck's orchestrations do not count at all.
+   */
+  it("reads the chosen deck's live titles and directories, and only that deck's", () => {
+    const fleet = fleetOf({
+      "deck-a": [role("1", "loop", "night-run", "/p"), role("2", "loop", "night-run", "/p"), role("3", "review"), createFixtureStartedAgent({ id: "4", daemonId: "deck-a" })],
+      "deck-b": [role("1", "loop", "other-deck-run", "/q")],
+    });
+    expect(liveOrchestrationTitles(fleet, "deck-a")).toEqual(["night-run", "review"]);
+    expect(liveOrchestrationDirectories(fleet, "deck-a")).toEqual(["/p"]);
+    expect(liveOrchestrationTitles(fleet, "deck-c")).toEqual([]);
+  });
+
+  /**
+   * Scenario: the TUI's `suggest_orchestration_name` — the lowest
+   * `<basename>-orchestrator-N` no live title holds, skipping a taken `N` in
+   * the middle — and its `resolved_title`: an empty Name takes the
+   * orchestration's name, and anything else, whitespace included, is kept.
+   */
+  it("suggests the next free name and resolves the title a launch takes", () => {
+    expect(suggestOrchestrationName("repo", [])).toBe("repo-orchestrator-1");
+    expect(suggestOrchestrationName("repo", ["repo-orchestrator-1", "repo-orchestrator-3"])).toBe("repo-orchestrator-2");
+    expect(orchestrationRunTitle("", "loop")).toBe("loop");
+    expect(orchestrationRunTitle("my-run", "loop")).toBe("my-run");
+    expect(orchestrationRunTitle(" ", "loop")).toBe(" ");
+  });
+
+  /** Scenario: what each deck answer offers — chips for a project, nothing for an ordinary directory or a pending answer, the deck's reason for one that cannot launch. */
+  it("offers a project's orchestrations and withholds with the deck's reason", () => {
+    const loop = { name: "loop", displayName: "loop", default: true, roles: [] };
+    expect(orchestrationModes(undefined)).toEqual({ offered: [] });
+    expect(orchestrationModes({ kind: "not_project" })).toEqual({ offered: [] });
+    expect(orchestrationModes({ kind: "unsupported", reason: "too old" })).toEqual({ offered: [], withheld: "too old" });
+    expect(orchestrationModes({ kind: "project", path: "/p", displayPath: "/p", displayName: "p", orchestrations: [loop] })).toEqual({ offered: [loop] });
+    expect(orchestrationModeId("loop")).toBe("orch:loop");
   });
 });

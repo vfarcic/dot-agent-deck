@@ -364,6 +364,7 @@ export function useDeckRuntime(): DeckRuntimeState {
   // says in place, not faults of the screen behind it.
   const listDirectories = useCallback((deckId: string, path?: string) => bridge.listDirectories(deckId, path), [bridge]);
   const newAgentOptions = useCallback((deckId: string) => bridge.newAgentOptions(deckId), [bridge]);
+  const newAgentOrchestrations = useCallback((deckId: string, path: string) => bridge.newAgentOrchestrations(deckId, path), [bridge]);
 
   // PRD #882: the geometry the daemon has applied per agent. Held here rather
   // than inside each tile because the push is per agent and arrives on one
@@ -406,6 +407,7 @@ export function useDeckRuntime(): DeckRuntimeState {
     resolveProject,
     listDirectories,
     newAgentOptions,
+    newAgentOrchestrations,
     getSettings,
     saveSettings,
     testEndpoint,

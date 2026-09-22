@@ -327,6 +327,22 @@ export type NewAgentOptions =
   }
   | { kind: "unsupported"; desktopAgents: NewAgentOption[]; lastCommand?: string };
 
+/**
+ * The orchestrations the New agent form can offer for one directory on one deck
+ * (PRD #1223 M6) — that deck's `ResolveProject` answer.
+ *
+ * `project` carries the deck's canonical path, which is what the launch sends.
+ * `not_project` is an ordinary directory: the deck's generic `unresolved`
+ * refusal, which is an answer here and not an error. `unsupported` is a deck
+ * that cannot launch from this flow — it lacks the project verbs, or cannot
+ * start a role with its configured command — and `reason` says which; the form
+ * withholds the orchestration chips and shows it.
+ */
+export type NewAgentOrchestrations =
+  | ({ kind: "project" } & DaemonResolvedProject)
+  | { kind: "not_project" }
+  | { kind: "unsupported"; reason: string };
+
 export interface DeckPrompt {
   id: string;
   name: string;
@@ -753,6 +769,19 @@ export type DeckAction =
    * the seed refuses it and starts nothing.
    */
   | { type: "start_agent"; deckId: string; command?: string; cwd?: string; displayName?: string; rows?: number; cols?: number; authoringKind?: AuthoringKind }
+  /**
+   * Launch one of a project's orchestrations on the deck `deckId` names, the
+   * TUI's way (PRD #1223 M6): no task prompt, `displayTitle` (the form's Name)
+   * as the run's title — absent when the Name is empty, so the run takes the
+   * orchestration's name — and every role started with the command its config
+   * gives it, on the deck. `path` and `orchestration` are the deck's own
+   * spellings from `newAgentOrchestrations`. The START role's id comes back as
+   * `DeckActionResult.agentId`.
+   *
+   * Not `start_workflow`, which is the Runs screen's launch and keeps its own
+   * form rules.
+   */
+  | { type: "start_orchestration"; deckId: string; path: string; orchestration: string; displayTitle?: string; configRevision?: string; rows?: number; cols?: number }
   | { type: "retry_stage"; stageId: string }
   | { type: "stop_agent"; agentId: string }
   | { type: "rename_agent"; agentId: string; displayName: string }
@@ -1039,6 +1068,12 @@ export interface DeckRuntimeState {
   listDirectories?: (deckId: string, path?: string) => Promise<DeckDirectoryListing>;
   /** PRD #1223 M4 — what the New agent form needs to know about the deck `deckId` names. */
   newAgentOptions?: (deckId: string) => Promise<NewAgentOptions>;
+  /**
+   * PRD #1223 M6 — the orchestrations the New agent form can offer for `path`
+   * on the deck `deckId` names. Optional for the reason the two above are; a
+   * runtime without it offers no orchestration chips.
+   */
+  newAgentOrchestrations?: (deckId: string, path: string) => Promise<NewAgentOrchestrations>;
   /** The desktop app's own settings, and where they live (PRD #803). */
   getSettings: () => Promise<import("./lib/bridge").DesktopSettingsSnapshotDto>;
   /** Persist the whole document; resolves to what was written. */

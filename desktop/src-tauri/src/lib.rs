@@ -45,7 +45,7 @@ use dot_agent_deck::agent_pty::{
 };
 use dot_agent_deck::authoring_seeds::AuthoringKind;
 use dot_agent_deck::daemon_client::{
-    DaemonClient, Endpoint, EventSubscription, GatedQuery, StartAgentOptions,
+    ClientError, DaemonClient, Endpoint, EventSubscription, GatedQuery, StartAgentOptions,
 };
 use dot_agent_deck::daemon_stop::{StopOutcome, run_daemon_stop};
 use dot_agent_deck::event::{
@@ -71,10 +71,11 @@ use crate::daemon_bridge::{
 };
 use crate::dto::{
     BootstrapOptions, COMMAND_MAX_BYTES, ConnectionStatus, DesktopAction, DesktopActionResult,
-    DesktopAgentOption, DesktopDirectoryListing, DesktopNewAgentOptions, DesktopProjectListing,
-    DesktopResolvedProject, DesktopSnapshot, TerminalAttachResult, WorkflowRoleInput,
-    desktop_agent_registry, ensure_desktop_workflow_platform_supported, map_project_listing,
-    map_resolved_project, mint_desktop_pane_id, safe_message, selected_endpoint, validate_agent_id,
+    DesktopAgentOption, DesktopDirectoryListing, DesktopNewAgentOptions,
+    DesktopNewAgentOrchestrations, DesktopProjectListing, DesktopResolvedProject, DesktopSnapshot,
+    TerminalAttachResult, WorkflowRoleInput, desktop_agent_registry,
+    ensure_desktop_workflow_platform_supported, map_project_listing, map_resolved_project,
+    mint_desktop_pane_id, safe_message, selected_endpoint, validate_agent_id, validate_dimensions,
     validate_pasted_project_path, validate_start_fields, validate_workflow_shape,
 };
 use crate::secrets::{
@@ -361,6 +362,18 @@ trait WorkflowDaemon {
         options: StartAgentOptions,
         prep_token: Option<&str>,
     ) -> Result<String, String>;
+    /// PRD #1223 M6: start one prepared role with the command its project
+    /// config gives it, on the deck — `DaemonClient::start_prepared_role`,
+    /// which withholds (`Unsupported`, nothing sent) from a deck that does not
+    /// advertise `prepared-role-command`.
+    async fn start_configured_role(
+        &self,
+        options: StartAgentOptions,
+        prep_token: &str,
+    ) -> Result<GatedQuery<String>, String>;
+    /// The agent type the deck recorded for `agent_id` at spawn — for a
+    /// configured role, the role's resolved type. `None` when it recorded none.
+    async fn launched_agent_type(&self, agent_id: &str) -> Result<Option<AgentType>, String>;
     async fn stop_workflow_agent(&self, agent_id: &str) -> Result<(), String>;
     async fn reconcile_workflow_agent(
         &self,
@@ -415,6 +428,29 @@ impl WorkflowDaemon for DaemonClient {
         self.start_agent_with_prep_token(options, prep_token)
             .await
             .map_err(|error| safe_message(error.to_string()))
+    }
+
+    async fn start_configured_role(
+        &self,
+        options: StartAgentOptions,
+        prep_token: &str,
+    ) -> Result<GatedQuery<String>, String> {
+        self.start_prepared_role(options, prep_token)
+            .await
+            .map_err(|error| safe_message(error.to_string()))
+    }
+
+    async fn launched_agent_type(&self, agent_id: &str) -> Result<Option<AgentType>, String> {
+        let records = crate::daemon_bridge::bounded_reply(
+            "ListAgents for the coordinator's agent type",
+            self.list_agents(),
+        )
+        .await?;
+        records
+            .into_iter()
+            .find(|record| record.id == agent_id)
+            .map(|record| record.agent_type)
+            .ok_or_else(|| "the deck no longer lists the coordinator it just started".to_string())
     }
 
     async fn stop_workflow_agent(&self, agent_id: &str) -> Result<(), String> {
@@ -813,6 +849,220 @@ async fn launch_workflow<D: WorkflowDaemon + Sync>(
         let cleanup_status = rollback_workflow_agents(daemon, &started).await;
         return Err(format!(
             "workflow coordinator context delivery failed: {}; {cleanup_status}",
+            safe_message(error)
+        ));
+    }
+
+    Ok(WorkflowLaunchResult {
+        start_agent_id,
+        agent_ids: started,
+    })
+}
+
+/// What an orchestration launch aimed at a deck that cannot start a role with
+/// its configured command answers (PRD #1223 M6), and the reason the New agent
+/// form shows in place of the orchestration chips on such a deck.
+const CONFIGURED_ROLE_COMMAND_UNSUPPORTED: &str = "This deck cannot start orchestration roles with their configured commands, so its orchestrations are not offered here. Nothing was started. Launch them from the TUI on that deck's host, or upgrade the deck.";
+
+/// One role of a configured orchestration launch (PRD #1223 M6), as
+/// `StartPreparedAgent` with `use_configured_command` receives it: no
+/// `command`, no `agent_type` and no `seed`, because the deck takes all three
+/// from the role's config — sending any of them is refused.
+///
+/// What the request does carry is the TUI's role-spawn identity
+/// (`src/tab.rs`): the role name as the pane name and membership role, its start
+/// marker, its index, the orchestration and its directory, ONE orchestration id
+/// shared by every role, and the run's title — which, like the TUI's, is absent
+/// when the Name is empty so the tab falls back to the orchestration's name.
+#[allow(clippy::too_many_arguments)]
+fn configured_role_start_options(
+    orchestration: &str,
+    cwd: &str,
+    role: &ProjectRole,
+    role_index: usize,
+    orchestration_id: &str,
+    display_title: Option<&str>,
+    pane_id: String,
+    rows: u16,
+    cols: u16,
+) -> StartAgentOptions {
+    StartAgentOptions {
+        command: None,
+        cwd: Some(cwd.to_string()),
+        display_name: Some(role.name.clone()),
+        rows,
+        cols,
+        env: vec![(DOT_AGENT_DECK_PANE_ID.into(), pane_id)],
+        tab_membership: Some(TabMembership::Orchestration {
+            name: orchestration.to_string(),
+            role_index,
+            role_name: role.name.clone(),
+            is_start_role: role.start,
+            orchestration_cwd: Some(cwd.to_string()),
+            display_title: display_title.map(str::to_string),
+            orchestration_id: Some(orchestration_id.to_string()),
+        }),
+        agent_type: None,
+        seed: None,
+    }
+}
+
+/// PRD #1223 M6: launch a prepared orchestration the way the TUI's `Ctrl+n`
+/// does — every role with the command its project config gives it, started on
+/// the deck in the order the preparation listed them.
+///
+/// It is [`launch_workflow`]'s sibling rather than a mode of it, because the
+/// Runs launch's form rules are exactly what this flow must not inherit: that
+/// one builds each role's command from desktop agent profiles and refuses a Pi
+/// coordinator. What they share is the machinery around the spawns — the
+/// readiness subscription taken before the first spawn, the reconcile of a
+/// spawn whose reply was lost, the reverse-order rollback, and the
+/// acknowledged coordinator delivery.
+///
+/// # How the start role gets its coordinator prompt
+///
+/// The same two ways the TUI's does. A **Pi** start role was seeded by the deck
+/// at spawn — PRD #201's native delivery, with the deck's own PTY safety net —
+/// because the deck, not this client, knows the role is Pi; this reads the type
+/// the deck recorded and delivers nothing itself, which would be a second copy.
+/// Every **other** start role gets [`deliver_coordinator_prompt`], the Runs
+/// launch's readiness-gated, identity-bound submission, and a delivery that
+/// fails rolls the launch back as the Runs launch does.
+///
+/// # A role that cannot be started
+///
+/// The roles already started are stopped again, in reverse order, and the
+/// error names them — the TUI closes the panes it already created on the same
+/// failure. A deck that does not advertise `prepared-role-command` is answered
+/// by the client library without sending anything, and is reported as that.
+#[allow(clippy::too_many_arguments)]
+async fn launch_configured_orchestration<D: WorkflowDaemon + Sync>(
+    daemon: &D,
+    orchestration: &str,
+    display_title: Option<&str>,
+    prepared: &PreparedWorkflow,
+    rows: u16,
+    cols: u16,
+    orchestration_id: &str,
+) -> Result<WorkflowLaunchResult, String> {
+    if prepared.roles.iter().filter(|role| role.start).count() != 1 {
+        return Err(
+            "the deck prepared an orchestration without exactly one start role; nothing was started"
+                .into(),
+        );
+    }
+    let created_at = daemon.now();
+    // Subscribed before the first spawn, for `launch_workflow`'s reason: a fast
+    // SessionStart must not be lost between the spawn and the wait.
+    let mut readiness = daemon.begin_coordinator_readiness().await?;
+    let mut started: Vec<String> = Vec::with_capacity(prepared.roles.len());
+    let mut started_roles: Vec<&str> = Vec::with_capacity(prepared.roles.len());
+    let mut start_target = None;
+
+    for (role_index, role) in prepared.roles.iter().enumerate() {
+        let pane_id = mint_desktop_pane_id();
+        let options = configured_role_start_options(
+            orchestration,
+            &prepared.path,
+            role,
+            role_index,
+            orchestration_id,
+            display_title,
+            pane_id.clone(),
+            rows,
+            cols,
+        );
+        let failure = match daemon.start_configured_role(options, &prepared.token).await {
+            Ok(GatedQuery::Answered(agent_id)) => {
+                if role.start {
+                    start_target = Some((pane_id, agent_id.clone()));
+                }
+                started.push(agent_id);
+                started_roles.push(role.name.as_str());
+                continue;
+            }
+            // Withheld by the client library: nothing reached the deck for this
+            // role, so there is nothing to reconcile.
+            Ok(GatedQuery::Unsupported) => (
+                CONFIGURED_ROLE_COMMAND_UNSUPPORTED.to_string(),
+                String::new(),
+            ),
+            Err(error) => {
+                // A spawn can succeed and lose its reply; reconcile by pane and
+                // orchestration identity so that role is stopped too.
+                let note = match daemon
+                    .reconcile_workflow_agent(
+                        &pane_id,
+                        orchestration_id,
+                        COORDINATOR_DELIVERY_RPC_TIMEOUT,
+                    )
+                    .await
+                {
+                    Ok(Some(agent_id)) => {
+                        if !started.contains(&agent_id) {
+                            started.push(agent_id);
+                        }
+                        String::new()
+                    }
+                    Ok(None) => String::new(),
+                    Err(reconciliation_error) => format!(
+                        "; cleanup uncertainty: could not reconcile the failed role by pane and orchestration identity: {}",
+                        safe_message(reconciliation_error)
+                    ),
+                };
+                (safe_message(error), note)
+            }
+        };
+        let (error, reconciliation_note) = failure;
+        let already = if started_roles.is_empty() {
+            "no role had started".to_string()
+        } else {
+            format!(
+                "roles already started: {}",
+                started_roles
+                    .iter()
+                    .map(safe_message)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
+        let cleanup_status = rollback_workflow_agents(daemon, &started).await;
+        return Err(format!(
+            "failed to start orchestration role {}: {error}; {already}; {cleanup_status}{reconciliation_note}",
+            safe_message(&role.name),
+        ));
+    }
+
+    let Some((start_pane_id, start_agent_id)) = start_target else {
+        let cleanup_status = rollback_workflow_agents(daemon, &started).await;
+        return Err(format!(
+            "the orchestration started no coordinator; {cleanup_status}"
+        ));
+    };
+    let delivered_by_deck = match daemon.launched_agent_type(&start_agent_id).await {
+        Ok(agent_type) => agent_type == Some(AgentType::Pi),
+        Err(error) => {
+            let cleanup_status = rollback_workflow_agents(daemon, &started).await;
+            return Err(format!(
+                "could not tell how the coordinator receives its context: {}; {cleanup_status}",
+                safe_message(error)
+            ));
+        }
+    };
+    if !delivered_by_deck
+        && let Err(error) = deliver_coordinator_prompt(
+            daemon,
+            &mut readiness,
+            &start_pane_id,
+            &start_agent_id,
+            &prepared.prompt,
+            created_at,
+        )
+        .await
+    {
+        let cleanup_status = rollback_workflow_agents(daemon, &started).await;
+        return Err(format!(
+            "orchestration coordinator context delivery failed: {}; {cleanup_status}",
             safe_message(error)
         ));
     }
@@ -1482,6 +1732,91 @@ async fn new_agent_options_on(
             last_command,
         },
     })
+}
+
+/// PRD #1223 M6: the orchestrations the New agent form can offer for `path` on
+/// the deck `deck_id` names — that deck's `ResolveProject` answer.
+///
+/// `path` is the directory the form was opened on: one the deck listed, or one
+/// the user typed. An ordinary directory is
+/// [`DesktopNewAgentOrchestrations::NotProject`], not an error, because the
+/// deck's refusal for it is the deliberately generic `unresolved` one; a deck
+/// that cannot launch from this flow is
+/// [`DesktopNewAgentOrchestrations::Unsupported`] with the reason.
+#[tauri::command]
+async fn desktop_new_agent_orchestrations(
+    webview: Webview,
+    state: State<'_, DesktopState>,
+    deck_id: String,
+    path: String,
+) -> Result<DesktopNewAgentOrchestrations, String> {
+    ensure_main_webview(&webview)?;
+    new_agent_orchestrations_on(&state, &deck_id, &path).await
+}
+
+/// Why a deck cannot launch an orchestration from the New agent form, or
+/// `None` when it can (PRD #1223 M6).
+///
+/// Two reasons, in this order. The deck lacks the project verbs, which the
+/// connection already words as `projectActionsReason` — the sentence the Runs
+/// screen shows. Or it lacks `prepared-role-command`, so it could not run a
+/// role's configured command.
+///
+/// **A presentation read, not the gate.** It decides whether to offer the chips
+/// and whether a launch is worth preparing at all — a preparation publishes the
+/// coordinator context, which a deck that cannot then start the roles should
+/// not be asked to write. What decides whether the flag is ever SENT is
+/// [`DaemonClient::start_prepared_role`], from its own fresh handshake, so a
+/// set captured here that has since gone stale can offer a chip without being
+/// what decides the send.
+async fn orchestration_launch_unavailable(
+    daemon: &crate::daemon_bridge::TrustedDaemon,
+) -> Result<Option<String>, String> {
+    if let Some(reason) = daemon.connection().project_actions_reason {
+        return Ok(Some(reason));
+    }
+    let capabilities = daemon
+        .client
+        .capabilities()
+        .await
+        .map_err(|error| safe_message(error.to_string()))?;
+    Ok(
+        (!capabilities.supports(dot_agent_deck::daemon_protocol::CAP_PREPARED_ROLE_COMMAND))
+            .then(|| CONFIGURED_ROLE_COMMAND_UNSUPPORTED.to_string()),
+    )
+}
+
+/// [`desktop_new_agent_orchestrations`] minus the webview. Resolves its deck
+/// exactly as [`list_directories_on`] does, so a deck that left the fleet is
+/// refused with `DeckScope::resolve`'s error and nothing is asked of any other.
+async fn new_agent_orchestrations_on(
+    state: &DesktopState,
+    deck_id: &str,
+    path: &str,
+) -> Result<DesktopNewAgentOrchestrations, String> {
+    validate_pasted_project_path(path)?;
+    let scope = crate::dto::DeckScope::resolve(Some(deck_id))?;
+    let daemon = state.daemon.trusted(scope.endpoint()).await?;
+    daemon.require_compatible()?;
+    if let Some(reason) = orchestration_launch_unavailable(&daemon).await? {
+        return Ok(DesktopNewAgentOrchestrations::Unsupported { reason });
+    }
+    match daemon.client.resolve_project(path).await {
+        Ok(project) => Ok(DesktopNewAgentOrchestrations::Project(
+            map_resolved_project(project),
+        )),
+        // The resolve verb's one generic refusal: "not a project on this deck",
+        // which is an answer here. Every other refusal is a real error.
+        Err(ClientError::Server(message))
+            if message.starts_with(&format!(
+                "{}:",
+                dot_agent_deck::daemon_protocol::PROJECT_ERR_UNRESOLVED
+            )) =>
+        {
+            Ok(DesktopNewAgentOrchestrations::NotProject)
+        }
+        Err(error) => Err(safe_message(error.to_string())),
+    }
 }
 
 #[tauri::command]
@@ -2371,6 +2706,122 @@ async fn start_agent_action(
     Ok(StartedAgent { agent_id, scope })
 }
 
+/// The fields of [`DesktopAction::StartOrchestration`] after its deck id.
+struct StartOrchestrationRequest {
+    path: String,
+    orchestration: String,
+    display_title: Option<String>,
+    config_revision: Option<String>,
+    rows: Option<u16>,
+    cols: Option<u16>,
+}
+
+/// An orchestration launch the target deck accepted.
+struct StartedOrchestration {
+    /// The start role's agent — the pane the dialog opens.
+    start_agent_id: String,
+    /// Every role's agent, in the order they were started.
+    agent_ids: Vec<String>,
+    /// The deck, captured once before the first await.
+    scope: crate::dto::DeckScope,
+}
+
+/// Launch one of a project's orchestrations on the deck `deck_id` names, the
+/// TUI's way (PRD #1223 M6): prepare with **no task**, then start every role
+/// with the command its config gives it, on that deck.
+///
+/// # The deck comes from the request
+///
+/// For [`start_agent_action`]'s reason and through the same
+/// [`crate::dto::DeckScope::resolve`] capture: the preparation, every role start
+/// and the coordinator delivery all go to the one deck the dialog chose, and an
+/// id this app no longer observes is refused before anything is asked.
+///
+/// # What it deliberately does not inherit from the Runs launch
+///
+/// The Runs screen's [`DesktopAction::StartWorkflow`] refuses an empty task,
+/// builds each role's command from desktop agent profiles, refuses a Pi
+/// coordinator (its desktop-side delivery needs an acknowledgement Pi's native
+/// seed cannot give) and refuses Windows (its profile commands are POSIX-quoted).
+/// None of those reasons holds here: there is no task, the deck runs its own
+/// configured commands, and a Pi coordinator is seeded by the deck exactly as
+/// the TUI's is — see [`launch_configured_orchestration`]. The Runs screen keeps
+/// all four.
+///
+/// # Before preparing
+///
+/// A deck that cannot start a role with its configured command is refused
+/// before `prepare-workflow` — see [`orchestration_launch_unavailable`] — so it
+/// is not asked to publish a coordinator context nothing will read.
+async fn start_orchestration_action(
+    state: &DesktopState,
+    deck_id: &str,
+    request: StartOrchestrationRequest,
+) -> Result<StartedOrchestration, String> {
+    let StartOrchestrationRequest {
+        path,
+        orchestration,
+        display_title,
+        config_revision,
+        rows,
+        cols,
+    } = request;
+    validate_pasted_project_path(&path)?;
+    if !is_valid_display_name(&orchestration) {
+        return Err(
+            "orchestration name is invalid, oversized, empty, or contains control characters"
+                .into(),
+        );
+    }
+    if let Some(title) = display_title.as_deref()
+        && !is_valid_display_name(title)
+    {
+        return Err("the run name is invalid, oversized, or contains control characters".into());
+    }
+    let (rows, cols) = validate_dimensions(rows.unwrap_or(32), cols.unwrap_or(120))?;
+    // ONE capture, before the first await (issue #1116).
+    let scope = crate::dto::DeckScope::resolve(Some(deck_id))?;
+    let daemon = state.daemon.trusted(scope.endpoint()).await?;
+    daemon.require_compatible()?;
+    if let Some(reason) = orchestration_launch_unavailable(&daemon).await? {
+        return Err(reason);
+    }
+    let prepared = daemon
+        .client
+        .prepare_workflow(&path, &orchestration, "", config_revision.as_deref())
+        .await
+        .map_err(|error| safe_message(error.to_string()))?;
+    // Both are `#[serde(default)]` on the reply, and neither may be invented
+    // here — see `prepare_workflow_launch`.
+    if prepared.path.is_empty() {
+        return Err(
+            "the deck prepared the orchestration but reported no canonical project path; nothing was started"
+                .into(),
+        );
+    }
+    if prepared.prompt.trim().is_empty() {
+        return Err(
+            "the deck prepared the orchestration but reported no coordinator prompt; nothing was started"
+                .into(),
+        );
+    }
+    let launched = launch_configured_orchestration(
+        daemon.client.as_ref(),
+        &orchestration,
+        display_title.as_deref(),
+        &prepared,
+        rows,
+        cols,
+        &mint_orchestration_id(),
+    )
+    .await?;
+    Ok(StartedOrchestration {
+        start_agent_id: launched.start_agent_id,
+        agent_ids: launched.agent_ids,
+        scope,
+    })
+}
+
 /// The target deck's snapshot after a start, for the direct refresh that
 /// follows it (PRD #1223 M3) — `None` when the fleet moved while it was taken.
 ///
@@ -2664,6 +3115,36 @@ async fn desktop_run_action(
             }
             state.request_refetch(&started.scope.identity());
             result_agent_id = Some(started.agent_id);
+        }
+        DesktopAction::StartOrchestration {
+            deck_id,
+            path,
+            orchestration,
+            display_title,
+            config_revision,
+            rows,
+            cols,
+        } => {
+            let started = start_orchestration_action(
+                &state,
+                &deck_id,
+                StartOrchestrationRequest {
+                    path,
+                    orchestration,
+                    display_title,
+                    config_revision,
+                    rows,
+                    cols,
+                },
+            )
+            .await?;
+            // The target deck directly, as after a plain start (PRD #1223 M3).
+            if let Some(snapshot) = target_deck_snapshot(&state.daemon, &started.scope).await {
+                emit_snapshot(&app, &snapshot);
+            }
+            state.request_refetch(&started.scope.identity());
+            result_agent_id = Some(started.start_agent_id);
+            result_agent_ids = started.agent_ids;
         }
         DesktopAction::StartWorkflow {
             name,
@@ -3113,6 +3594,7 @@ pub fn run() {
             desktop_get_snapshot,
             desktop_list_projects,
             desktop_resolve_project,
+            desktop_new_agent_orchestrations,
             desktop_list_directories,
             desktop_new_agent_options,
             desktop_bootstrap,
@@ -3180,7 +3662,7 @@ mod tests {
     use super::*;
     use std::collections::VecDeque;
     use std::sync::Mutex;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     /// PRD #1105 M11 step 4: only a window's `Focused` event carries its focus
     /// state, in both directions; any other window event is not a focus change.
@@ -4252,6 +4734,13 @@ mod tests {
         outcomes: Mutex<VecDeque<Result<SendResult, String>>>,
         fallback_outcome: Result<SendResult, String>,
         sleeps: Mutex<Vec<Duration>>,
+        /// PRD #1223 M6: the client library withholds the configured start —
+        /// the deck does not advertise `prepared-role-command`.
+        configured_unsupported: AtomicBool,
+        /// The type the deck reports for a started agent (a configured role's
+        /// resolved type), and the ids it was asked about.
+        launched_type: Mutex<Option<AgentType>>,
+        launched_type_queries: Mutex<Vec<String>>,
     }
 
     impl FakeWorkflowDaemon {
@@ -4282,6 +4771,9 @@ mod tests {
                 outcomes: Mutex::new(outcomes.into_iter().collect()),
                 fallback_outcome,
                 sleeps: Mutex::new(Vec::new()),
+                configured_unsupported: AtomicBool::new(false),
+                launched_type: Mutex::new(None),
+                launched_type_queries: Mutex::new(Vec::new()),
             }
         }
 
@@ -4335,6 +4827,27 @@ mod tests {
                 .unwrap()
                 .pop_front()
                 .unwrap_or(Ok(agent_id))
+        }
+
+        async fn start_configured_role(
+            &self,
+            options: StartAgentOptions,
+            prep_token: &str,
+        ) -> Result<GatedQuery<String>, String> {
+            if self.configured_unsupported.load(Ordering::SeqCst) {
+                return Ok(GatedQuery::Unsupported);
+            }
+            self.start_workflow_agent(options, Some(prep_token))
+                .await
+                .map(GatedQuery::Answered)
+        }
+
+        async fn launched_agent_type(&self, agent_id: &str) -> Result<Option<AgentType>, String> {
+            self.launched_type_queries
+                .lock()
+                .unwrap()
+                .push(agent_id.to_string());
+            Ok(self.launched_type.lock().unwrap().clone())
         }
 
         async fn stop_workflow_agent(&self, agent_id: &str) -> Result<(), String> {
@@ -5048,6 +5561,213 @@ command = "configured-planner"
             [desktop_seed_buffer(), send_retry_delay(1)]
         );
         assert!(daemon.stopped.lock().unwrap().is_empty());
+    }
+
+    /// Scenario: the New agent dialog launches a prepared orchestration whose
+    /// start role is not Pi (PRD #1223 M6). Every role is started in the
+    /// preparation's order through the configured-command start — no command,
+    /// agent type or seed of the client's own — with the prepared token, one
+    /// shared orchestration id, the run's title and a minted pane id each; then
+    /// the coordinator prompt the DECK composed is delivered to the start
+    /// role's pane through the acknowledged Runs delivery.
+    #[tokio::test]
+    async fn a_configured_launch_starts_every_role_and_delivers_to_a_non_pi_coordinator() {
+        let daemon = FakeWorkflowDaemon::new(
+            Ok(Some("session-planner")),
+            [Ok(SendResult::Applied)],
+            Ok(SendResult::Applied),
+        );
+        *daemon.launched_type.lock().unwrap() = Some(AgentType::ClaudeCode);
+        let prepared = prepared_workflow();
+
+        let launched = launch_configured_orchestration(
+            &daemon,
+            "loop",
+            Some("demo-orchestrator-1"),
+            &prepared,
+            32,
+            120,
+            "orchestration-m6",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(launched.start_agent_id, "agent-0");
+        assert_eq!(launched.agent_ids, ["agent-0", "agent-1"]);
+        assert_eq!(
+            *daemon.spawn_log.lock().unwrap(),
+            ["start:planner", "start:builder"],
+            "the preparation's role order"
+        );
+        assert!(
+            daemon
+                .start_tokens
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|token| token.as_deref() == Some("prep-token-1"))
+        );
+        let started = daemon.started.lock().unwrap();
+        let mut pane_ids = HashSet::new();
+        for (index, (options, role)) in started.iter().zip(&prepared.roles).enumerate() {
+            assert_eq!(
+                options.command, None,
+                "the deck runs the configured command"
+            );
+            assert_eq!(options.agent_type, None);
+            assert_eq!(options.seed, None);
+            assert_eq!(options.cwd.as_deref(), Some("/canonical/project"));
+            assert_eq!(options.display_name.as_deref(), Some(role.name.as_str()));
+            let pane_id = options
+                .env
+                .iter()
+                .find(|(key, _)| key == DOT_AGENT_DECK_PANE_ID)
+                .map(|(_, value)| value.clone())
+                .expect("every role carries a minted pane id");
+            assert!(pane_ids.insert(pane_id), "one pane id per role");
+            match options.tab_membership.as_ref() {
+                Some(TabMembership::Orchestration {
+                    name,
+                    role_index,
+                    role_name,
+                    is_start_role,
+                    orchestration_cwd,
+                    display_title,
+                    orchestration_id,
+                }) => {
+                    assert_eq!(name, "loop");
+                    assert_eq!(*role_index, index);
+                    assert_eq!(role_name, &role.name);
+                    assert_eq!(*is_start_role, role.start);
+                    assert_eq!(orchestration_cwd.as_deref(), Some("/canonical/project"));
+                    assert_eq!(display_title.as_deref(), Some("demo-orchestrator-1"));
+                    assert_eq!(orchestration_id.as_deref(), Some("orchestration-m6"));
+                }
+                other => panic!("an orchestration role's membership, got {other:?}"),
+            }
+        }
+        drop(started);
+
+        assert_eq!(*daemon.launched_type_queries.lock().unwrap(), ["agent-0"]);
+        let submissions = daemon.submissions.lock().unwrap();
+        assert_eq!(submissions.len(), 1);
+        assert_eq!(submissions[0].prompt, prepared.prompt);
+        assert_eq!(submissions[0].expected_agent_id, "agent-0");
+        assert_eq!(
+            submissions[0].expected_session_id.as_deref(),
+            Some("session-planner")
+        );
+        drop(submissions);
+        assert!(daemon.stopped.lock().unwrap().is_empty());
+    }
+
+    /// Scenario: the same launch, but the deck reports the start role it just
+    /// started as Pi — so the deck seeded it natively, as the TUI's Pi
+    /// coordinators are (PRD #201). The client delivers nothing itself, which
+    /// would type the prompt in a second time, and the launch succeeds; the
+    /// Runs screen's refusal of a Pi coordinator is not inherited.
+    #[tokio::test]
+    async fn a_configured_launch_leaves_a_pi_coordinators_prompt_to_the_deck() {
+        let daemon = FakeWorkflowDaemon::new(Ok(None), [], Ok(SendResult::Applied));
+        *daemon.launched_type.lock().unwrap() = Some(AgentType::Pi);
+
+        let launched = launch_configured_orchestration(
+            &daemon,
+            "loop",
+            None,
+            &prepared_workflow(),
+            32,
+            120,
+            "orchestration-pi",
+        )
+        .await
+        .expect("a Pi coordinator launches from this flow");
+
+        assert_eq!(launched.start_agent_id, "agent-0");
+        assert!(
+            daemon.submissions.lock().unwrap().is_empty(),
+            "the deck seeded the Pi coordinator; the client must not deliver a second copy"
+        );
+        assert!(daemon.stopped.lock().unwrap().is_empty());
+        let started = daemon.started.lock().unwrap();
+        assert!(
+            started.iter().all(|options| matches!(
+                options.tab_membership.as_ref(),
+                Some(TabMembership::Orchestration {
+                    display_title: None,
+                    ..
+                })
+            )),
+            "an empty Name sends no title, so the tab falls back to the orchestration's name"
+        );
+    }
+
+    /// Scenario: the second role is refused mid-launch. The role already
+    /// started is stopped again, no coordinator prompt is delivered, and the
+    /// error names both the role that failed and the roles that had started —
+    /// which the dialog shows inline.
+    #[tokio::test]
+    async fn a_configured_launch_stops_the_started_roles_when_a_later_role_is_refused() {
+        let daemon = FakeWorkflowDaemon::new(Ok(None), [], Ok(SendResult::Applied));
+        daemon.start_results.lock().unwrap().extend([
+            Ok("agent-0".to_string()),
+            Err("builder refused".to_string()),
+        ]);
+
+        let error = launch_configured_orchestration(
+            &daemon,
+            "loop",
+            Some("run"),
+            &prepared_workflow(),
+            32,
+            120,
+            "orchestration-partial",
+        )
+        .await
+        .expect_err("a refused role fails the launch");
+
+        assert!(
+            error.contains("failed to start orchestration role builder: builder refused"),
+            "{error}"
+        );
+        assert!(error.contains("roles already started: planner"), "{error}");
+        assert!(
+            error.contains("stopped 1 already-started role(s)"),
+            "{error}"
+        );
+        assert_eq!(*daemon.stopped.lock().unwrap(), ["agent-0"]);
+        assert!(daemon.submissions.lock().unwrap().is_empty());
+        assert!(daemon.launched_type_queries.lock().unwrap().is_empty());
+    }
+
+    /// Scenario: the deck does not advertise `prepared-role-command`, so the
+    /// client library withholds the very first role start. Nothing was
+    /// started, nothing is stopped, and the refusal says why.
+    #[tokio::test]
+    async fn a_configured_launch_on_a_deck_without_the_capability_starts_nothing() {
+        let daemon = FakeWorkflowDaemon::new(Ok(None), [], Ok(SendResult::Applied));
+        daemon.configured_unsupported.store(true, Ordering::SeqCst);
+
+        let error = launch_configured_orchestration(
+            &daemon,
+            "loop",
+            Some("run"),
+            &prepared_workflow(),
+            32,
+            120,
+            "orchestration-older",
+        )
+        .await
+        .expect_err("an older deck cannot launch");
+
+        assert!(
+            error.contains(CONFIGURED_ROLE_COMMAND_UNSUPPORTED),
+            "{error}"
+        );
+        assert!(error.contains("no role had started"), "{error}");
+        assert!(daemon.started.lock().unwrap().is_empty());
+        assert!(daemon.stopped.lock().unwrap().is_empty());
+        assert!(daemon.submissions.lock().unwrap().is_empty());
     }
 
     #[test]
