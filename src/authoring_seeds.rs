@@ -322,8 +322,11 @@ pub(crate) fn is_safe_authoring_path(path: &str) -> bool {
 ///   seed carries the path verbatim into the agent's prompt, so a line break in
 ///   it (LF, NEL, U+2028), an ESC sequence or a bidi override would be text the
 ///   agent reads as more of its instructions, or text that does not read as
-///   written. That is the predicate `ListDirectories` filters its children by,
-///   so a path it listed always passes it — the check is on the string. The
+///   written. That is the predicate `ListDirectories` filters its CHILD entries
+///   by, so a child entry's path always passes it — the check is on the string.
+///   A listing's own `path` and `parent` are not filtered (see
+///   `docs/develop/directory-listing-verb.md`), which is why this check runs on
+///   whatever a start carries rather than trusting where it came from. The
 ///   refusal does not echo the path. A plain `StartAgent` does not come here
 ///   and keeps accepting whatever `cwd` it accepted before;
 /// * no `pane_id` (the start's sole, validated `DOT_AGENT_DECK_PANE_ID`; the
