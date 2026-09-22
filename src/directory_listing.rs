@@ -299,6 +299,9 @@ fn list_canonical_dir_between(
     Ok(DirectoryListing {
         // `canonicalize_project_dir` refused a non-UTF-8 canonical form, and a
         // parent of a UTF-8 path is UTF-8, so neither conversion can lose bytes.
+        // Neither is filtered by `is_safe_authoring_path` as the children are
+        // (audit F8): an authoring start's own check on its `cwd` is what
+        // refuses an unsafe one, before spawning.
         path: dir.to_string_lossy().into_owned(),
         parent: dir.parent().and_then(Path::to_str).map(str::to_owned),
         entries,
