@@ -1899,13 +1899,14 @@ async fn desktop_resolve_project(
 /// dialog's directory step.
 ///
 /// `path` is one the daemon listed (a listing's `path`, `parent` or an entry's
-/// `path`) or one the user typed, and it goes to the daemon **verbatim**; the
+/// `path`), and it goes to the daemon **verbatim**; the
 /// reply's canonical spelling is what the dialog carries from then on. `None`
 /// asks for the daemon user's home directory. Nothing here derives a path —
 /// not a parent by trimming, not a child by joining.
 ///
 /// A deck that predates the verb answers [`DesktopDirectoryListing::Unsupported`]
-/// rather than an error, and the dialog falls back to a typed path.
+/// rather than an error. The dialog does not ask one: the connection's
+/// `new_agent_reason` disables it at the deck step (PRD #1223 U1).
 #[tauri::command]
 async fn desktop_list_directories(
     webview: Webview,
@@ -1946,8 +1947,9 @@ async fn desktop_new_agent_options(
 /// error — which the dialog reads as "go back to the deck step" — and nothing
 /// is ever asked of whichever deck happens to be selected.
 ///
-/// A typed path gets the same string-shape check `desktop_resolve_project`
-/// applies before spending a round trip on it; it touches no filesystem.
+/// A path gets the same string-shape check `desktop_resolve_project` applies
+/// before spending a round trip on it; it touches no filesystem. The dialog
+/// only sends paths a deck listed, so this is defence in depth (audit D2).
 async fn list_directories_on(
     state: &DesktopState,
     deck_id: &str,
@@ -2923,10 +2925,11 @@ struct StartedAgent {
 /// # A named directory must be absolute (PRD #1223 audit D2)
 ///
 /// [`validate_start_fields`] checks a `cwd`'s bytes and length, not its shape,
-/// and on a deck without `list-directories` the dialog sends the path the user
-/// typed — so `repo` would start an agent relative to wherever that deck's
-/// daemon was spawned from. A present `cwd` therefore gets the string-shape
-/// check [`list_directories_on`] gives a typed path,
+/// so a relative `repo` would start an agent relative to wherever that deck's
+/// daemon was spawned from. The dialog now only sends a path a deck listed
+/// (PRD #1223 U1 removed the typed path), but this is the action boundary, so
+/// a present `cwd` still gets the string-shape check [`list_directories_on`]
+/// gives a path,
 /// [`validate_pasted_project_path`], before any deck is asked. An absent one
 /// stays allowed: that is the deck's default-directory start.
 async fn start_agent_action(

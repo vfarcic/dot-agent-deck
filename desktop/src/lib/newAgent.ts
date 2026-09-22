@@ -45,6 +45,11 @@ export const DECK_STATE_FALLBACK = {
  * deck whose build stamps differ is `error` until the user accepts it through
  * the overview's Connect anyway, and `connected` afterwards — so "compatible
  * or explicitly accepted" is the connected status, with no second flag to read.
+ *
+ * A connected deck can still be unable to take one from THIS flow (PRD #1223
+ * U1): the flow chooses a directory only by browsing the deck, so a deck that
+ * does not advertise `list-directories` carries the crate's `newAgentReason`,
+ * and that is its reason here.
  */
 export function deckUnavailableReason(connection: ConnectionView): string | undefined {
   const own = connection.message ? displayText(connection.message, DISPLAY_LIMITS.message) : undefined;
@@ -52,7 +57,7 @@ export function deckUnavailableReason(connection: ConnectionView): string | unde
   if (connection.unconfigured) return own ?? DECK_STATE_FALLBACK.unconfigured;
   switch (connection.status) {
     case "connected":
-      return undefined;
+      return connection.newAgentReason ? displayText(connection.newAgentReason, DISPLAY_LIMITS.message) : undefined;
     case "loading":
       return own ?? DECK_STATE_FALLBACK.loading;
     case "disconnected":
@@ -106,28 +111,6 @@ export function preselectedDeck(choices: readonly DeckChoice[], requested?: stri
  */
 export function directoryLabel(path: string): string {
   return path.split(/[\\/]+/).filter(Boolean).at(-1) ?? "";
-}
-
-/**
- * The crate's refusal of a typed path that is not askable as a directory —
- * `validate_pasted_project_path`'s sentence. The listing applies it to a typed
- * path, and since PRD #1223 audit D2 so does a start naming a directory; the
- * dialog and the fixture bridge repeat it so a client-side refusal reads the
- * same as the crate's.
- */
-export const TYPED_PATH_SHAPE_REFUSAL = "enter an absolute directory path, without control characters, that the deck can see";
-
-/**
- * The dialog's cheap pre-check on a typed path (PRD #1223 audit D2): absolute,
- * and free of ASCII controls. The crate makes the real check, per platform —
- * a leading `/` everywhere, plus `C:\`, `C:/` and UNC forms on Windows — so
- * this accepts the union of those shapes and never refuses one the crate would
- * take on any platform. What it exists to stop is `repo`, `./repo` or `~/repo`
- * on a deck without the listing verb, where the typed path is what the start
- * sends.
- */
-export function isAbsoluteTypedPath(path: string): boolean {
-  return /^(?:\/|\\[\\/]|[A-Za-z]:[\\/])/.test(path) && !/[\u0000-\u001f\u007f]/.test(path);
 }
 
 /**

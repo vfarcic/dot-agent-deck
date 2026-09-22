@@ -5,7 +5,7 @@ import { getTerminal } from "./terminalRegistry";
 import { applyHandoffEvent, mapDaemonEvent, MAX_LIVE_EVIDENCE } from "./daemonEvents";
 import { DISPLAY_LIMITS, displayText } from "./displayText";
 import { describeEndpoint } from "./endpoints";
-import { ambiguousOrchestrationReason, isAbsoluteTypedPath, TYPED_PATH_SHAPE_REFUSAL } from "./newAgent";
+import { ambiguousOrchestrationReason } from "./newAgent";
 import { clampZoom, DEFAULT_ZOOM } from "./zoom";
 import { UNREPORTED } from "../types";
 import type { HandoffEdge,
@@ -62,6 +62,8 @@ export interface DesktopSnapshotDto {
      * the same build as me".
      */
     projectActionsReason?: string;
+    /** Why the New agent flow cannot start anything on this deck (PRD #1223); absent when it can. */
+    newAgentReason?: string;
     error?: string;
     clientProtocolVersion: number;
     serverProtocolVersion?: number;
@@ -1475,13 +1477,13 @@ export interface DeckBridge {
   resolveProject(path: string): Promise<DaemonResolvedProject>;
   /**
    * PRD #1223 M4 — one directory on the deck `deckId` names, for the New agent
-   * dialog: a path that deck listed, one the user typed (sent verbatim), or its
-   * home directory when `path` is absent. The deck is NAMED rather than read
+   * dialog: a path that deck listed, or its home directory when `path` is
+   * absent. The deck is NAMED rather than read
    * from the selection, for `start_agent`'s reason: under All Decks the
    * selection is the local deck (#1083).
    *
    * Resolves `unsupported` for a deck without the verb. Rejects with the
-   * app's own shape refusal for a typed path that is not absolute, with the
+   * crate's shape refusal for a path that is not absolute, with the
    * deck's refusal for a path it cannot list, with the crate's
    * `DeckScope::resolve` wording for a deck the app no longer observes, or
    * with a connection error for one that stopped answering.
@@ -1504,8 +1506,25 @@ export interface DeckBridge {
 }
 
 
+/**
+ * The crate's `validate_pasted_project_path` refusal (PRD #1223 audit D2),
+ * repeated by the fixture wherever the live crate applies it: to a start's
+ * `cwd` and to a listing's `path`. The dialog sends only paths a deck returned,
+ * so neither is reachable from it; the fixture keeps the refusal so it answers
+ * a malformed request the way the crate does.
+ */
+export const FIXTURE_PASTED_PATH_REFUSAL = "enter an absolute directory path, without control characters, that the deck can see";
+
+/** Whether the crate's `validate_pasted_project_path` would accept `path` on a Unix deck — absolute, and free of ASCII controls. */
+function fixtureAcceptsPath(path: string): boolean {
+  return path.startsWith("/") && !/[\u0000-\u001f\u007f]/.test(path);
+}
+
+/** The sentence the live crate's `newAgentReason` carries for a deck without `list-directories` (PRD #1223 U1), repeated by the fixture's older decks. */
+export const FIXTURE_NO_LISTING_REASON = "This deck does not advertise list-directories, so it cannot be browsed for a directory to start in. Start agents on it from the TUI on its host, or upgrade the deck.";
+
 /** What a fixture deck says about a path that names no directory it has, in the daemon's own `unresolved` wording. */
-/** The live crate's `CONFIGURED_ROLE_COMMAND_UNSUPPORTED`, repeated by the fixture's older decks (PRD #1223 M6). */
+/** The live crate's `CONFIGURED_ROLE_COMMAND_UNSUPPORTED`, repeated by the fixture's older and non-Unix decks (PRD #1223 M6). */
 const FIXTURE_CONFIGURED_ROLES_UNSUPPORTED = "This deck cannot start orchestration roles with their configured commands, so its orchestrations are not offered here. Nothing was started. Launch them from the TUI on that deck's host, or upgrade the deck.";
 
 const FIXTURE_UNRESOLVED_REFUSAL = "daemon returned error: unresolved: that path did not resolve to a readable directory on this daemon";
@@ -1848,6 +1867,7 @@ export function mapDesktopSnapshot(dto: DesktopSnapshotDto, previous?: DeckSnaps
       localOnlyReason: dto.connection.localOnlyReason,
       selectionFallback: dto.connection.selectionFallback,
       projectActionsReason: dto.connection.projectActionsReason,
+      newAgentReason: dto.connection.newAgentReason,
     },
     health: dto.connection.status === "incompatible" ? "failed" : dto.connection.status === "disconnected" ? "idle" : agents.some((agent) => agent.status === "failed") ? "failed" : "healthy",
     elapsed: previous?.elapsed ?? "—",
@@ -1888,11 +1908,21 @@ class FixtureDeckBridge implements DeckBridge {
   private settings?: DesktopSettingsDto;
   /**
    * PRD #1223 M4 — the decks this preview plays as OLDER than the PRD: no
-   * listing verb and no options query, so the New agent dialog's fallbacks can
-   * be driven. Chosen by `?older=`: `1` or `all` for every deck, otherwise a
+   * listing verb and no options query. Since U1 removed the typed path such a
+   * deck has no directory step, so its connection carries the crate's
+   * `newAgentReason` and the New agent dialog shows it disabled at the deck
+   * step. Chosen by `?older=`: `1` or `all` for every deck, otherwise a
    * comma-separated list of fixture deck ids. Empty by default.
    */
   private olderDecks: "all" | ReadonlySet<string> = new Set();
+  /**
+   * PRD #1223 M6 — the decks this preview plays as built for a non-Unix
+   * platform: they list directories and answer the options query, but do not
+   * advertise `prepared-role-command`, so they cannot launch an orchestration
+   * from this flow. Chosen by `?nonunix=`, a comma-separated list of fixture
+   * deck ids. Empty by default.
+   */
+  private nonUnixDecks: ReadonlySet<string> = new Set();
   /** PRD #1223 M4 — the command each fixture deck last started a plain agent with, as the live crate keeps it: per deck, in memory. */
   private lastCommands = new Map<string, string>();
 
@@ -1917,10 +1947,24 @@ class FixtureDeckBridge implements DeckBridge {
     const older = new URLSearchParams(window.location.search).get("older");
     if (older === "1" || older === "all") this.olderDecks = "all";
     else if (older) this.olderDecks = new Set(older.split(",").map((deckId) => deckId.trim()).filter(Boolean));
+    const nonUnix = new URLSearchParams(window.location.search).get("nonunix");
+    if (nonUnix) this.nonUnixDecks = new Set(nonUnix.split(",").map((deckId) => deckId.trim()).filter(Boolean));
+    this.fleet.forEach((deck) => this.markOlderDeck(deck));
   }
 
   private isOlderDeck(deckId: string): boolean {
     return this.olderDecks === "all" || this.olderDecks.has(deckId);
+  }
+
+  /** Whether `deckId` cannot launch an orchestration from the New agent flow: an older deck, or a non-Unix one. */
+  private withholdsConfiguredRoles(deckId: string): boolean {
+    return this.isOlderDeck(deckId) || this.nonUnixDecks.has(deckId);
+  }
+
+  /** Give a deck this preview plays as older the connection's `newAgentReason`, as the live crate does for a deck without `list-directories`. */
+  private markOlderDeck(deck: DeckSnapshot): void {
+    const deckId = deck.connection.deckId;
+    if (deckId !== undefined && deck.connection.status === "connected" && this.isOlderDeck(deckId)) deck.connection.newAgentReason = FIXTURE_NO_LISTING_REASON;
   }
 
   /**
@@ -1999,6 +2043,7 @@ class FixtureDeckBridge implements DeckBridge {
         // Only the SELECTED deck is reset: `advance_fixture` is the deck
         // screen's own control, and the deck screen is single-deck.
         this.snapshot = createFixtureFleet("connected")[0];
+        this.markOlderDeck(this.snapshot);
       }
     }
     this.emitSnapshot();
@@ -2014,8 +2059,8 @@ class FixtureDeckBridge implements DeckBridge {
    */
   private startAgent(action: Extract<DeckAction, { type: "start_agent" }>): DeckActionResult {
     // PRD #1223 audit D2: the live crate refuses a relative directory before
-    // resolving the deck, in the typed-path sentence; so does the preview.
-    if (action.cwd !== undefined && !isAbsoluteTypedPath(action.cwd)) throw new Error(TYPED_PATH_SHAPE_REFUSAL);
+    // resolving the deck, in `validate_pasted_project_path`'s sentence; so does the preview.
+    if (action.cwd !== undefined && !fixtureAcceptsPath(action.cwd)) throw new Error(FIXTURE_PASTED_PATH_REFUSAL);
     const deck = this.connectedDeck(action.deckId);
     // PRD #1223 M7: a deck this preview plays as older cannot compose a seed,
     // and refuses an authoring start the way the live crate does — before
@@ -2056,7 +2101,7 @@ class FixtureDeckBridge implements DeckBridge {
    */
   private startOrchestration(action: Extract<DeckAction, { type: "start_orchestration" }>): DeckActionResult {
     const deck = this.connectedDeck(action.deckId);
-    if (this.isOlderDeck(action.deckId)) throw new Error(FIXTURE_CONFIGURED_ROLES_UNSUPPORTED);
+    if (this.withholdsConfiguredRoles(action.deckId)) throw new Error(FIXTURE_CONFIGURED_ROLES_UNSUPPORTED);
     const home = FIXTURE_HOMES[action.deckId] ?? "/home/dev";
     // PRD #1223 audit V4: the live action's cardinality check, mirrored — a
     // name the project defines twice is refused here rather than launching the
@@ -2393,18 +2438,15 @@ class FixtureDeckBridge implements DeckBridge {
 
   /**
    * PRD #1223 M4 — the named fixture deck's tree ({@link fixtureDirectoryTree}),
-   * answered the way a deck answers: its home for no path, and a typed path in
-   * the deck's own spelling. The one normalisation here — trailing and doubled
-   * slashes dropped — is the fixture playing the DECK's canonicaliser; the
-   * dialog sends what the user typed and carries what comes back.
+   * answered the way a deck answers: its home for no path, and any other path
+   * in the deck's own spelling. The one normalisation here — trailing and
+   * doubled slashes dropped — is the fixture playing the DECK's canonicaliser.
    */
   async listDirectories(deckId: string, path?: string): Promise<DeckDirectoryListing> {
     await Promise.resolve();
     this.connectedDeck(deckId);
     if (this.isOlderDeck(deckId)) return { kind: "unsupported" };
-    if (path !== undefined && (!path.startsWith("/") || /[\u0000-\u001f\u007f]/.test(path))) {
-      throw new Error(TYPED_PATH_SHAPE_REFUSAL);
-    }
+    if (path !== undefined && !fixtureAcceptsPath(path)) throw new Error(FIXTURE_PASTED_PATH_REFUSAL);
     const home = FIXTURE_HOMES[deckId] ?? "/home/dev";
     const wanted = path === undefined ? home : path.replace(/\/+/g, "/").replace(/(.)\/$/, "$1");
     const directory = fixtureDirectoryTree(home).get(wanted);
@@ -2441,12 +2483,13 @@ class FixtureDeckBridge implements DeckBridge {
    * PRD #1223 M6 — the named fixture deck's answer for `path`: `demo-project`'s
    * orchestration ({@link fixtureProjectOrchestrations}), `not_project` for any
    * other path — the live deck's generic `unresolved` refusal, read the same
-   * way — and `unsupported` for a deck this preview plays as older.
+   * way — and `unsupported` for a deck this preview plays as older or as
+   * non-Unix.
    */
   async newAgentOrchestrations(deckId: string, path: string): Promise<NewAgentOrchestrations> {
     await Promise.resolve();
     this.connectedDeck(deckId);
-    if (this.isOlderDeck(deckId)) return { kind: "unsupported", reason: FIXTURE_CONFIGURED_ROLES_UNSUPPORTED };
+    if (this.withholdsConfiguredRoles(deckId)) return { kind: "unsupported", reason: FIXTURE_CONFIGURED_ROLES_UNSUPPORTED };
     const home = FIXTURE_HOMES[deckId] ?? "/home/dev";
     const orchestrations = fixtureProjectOrchestrations(home, path);
     if (!orchestrations) return { kind: "not_project" };

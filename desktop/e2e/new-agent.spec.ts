@@ -188,92 +188,49 @@ test.describe("the New agent flow", () => {
   });
 
   /**
-   * Scenario (PRD #1223 M6): with the remote deck playing a deck from before
-   * PRD #1223, open the flow from its header and type the project's path. The
-   * deck cannot start a role with its configured command, so no orchestration
-   * chip is offered and the form says why.
+   * Scenario (PRD #1223 M6): with the remote deck playing one built for a
+   * non-Unix platform, open the flow from its header, browse into
+   * `demo-project` and use it. The deck cannot start a role with its configured
+   * command, so no orchestration chip is offered and the form says why.
    */
   test("withholds orchestrations on a deck that cannot start configured roles", async ({ page }) => {
-    await page.goto(`/?fixture=1&state=fleet&older=${encodeURIComponent(REMOTE_DECK)}`);
+    await page.goto(`/?fixture=1&state=fleet&nonunix=${encodeURIComponent(REMOTE_DECK)}`);
     await page.getByTestId("open-overview").click();
     await page.locator(`[data-testid="daemon-group"][data-daemon-id="${REMOTE_DECK}"]`).getByTestId("daemon-new-agent").click();
     await page.keyboard.press("Enter");
-    await expect(page.getByTestId("new-agent-path")).toBeFocused();
-    await page.keyboard.type("/home/build/demo-project");
+    const directories = page.getByTestId("new-agent-directory-list");
+    await expect(directories).toBeFocused();
+    await expect(directories.locator("[aria-selected='true']")).toHaveAttribute("data-path", "/home/build/demo-project");
     await page.keyboard.press("Enter");
+    await expect(page.getByTestId("new-agent-current-path")).toHaveText("/home/build/demo-project");
+    await page.keyboard.press(" ");
 
     await expect(page.getByTestId("new-agent-orchestrations-withheld")).toContainText("configured commands");
-    await expect(page.getByTestId("new-agent-modes").getByRole("button")).toHaveText(["No mode"]);
+    await expect(page.getByTestId("new-agent-modes").getByRole("button")).toHaveText(["No mode", "schedule", "schedule: issues", "dispatcher"]);
   });
 
   /**
-   * Scenario (PRD #1223 M7): with the remote deck playing a deck from before
-   * PRD #1223, open the flow from its header and type a path. The form offers
-   * No mode alone and says why the authoring agents are missing.
+   * Scenario (PRD #1223 U1): with the remote deck playing a deck from before
+   * PRD #1223, it has no directory listing, and browsing is the only way the
+   * flow chooses a directory. Its header offers no New agent; opened from the
+   * top bar, the deck step lists it disabled with the deck's reason, and
+   * clicking it leaves the flow on the deck step. The local deck still works.
    */
-  test("withholds the authoring agents on a deck that cannot compose their seeds", async ({ page }) => {
+  test("disables a deck without the listing verb at the deck step", async ({ page }) => {
     await page.goto(`/?fixture=1&state=fleet&older=${encodeURIComponent(REMOTE_DECK)}`);
     await page.getByTestId("open-overview").click();
-    await page.locator(`[data-testid="daemon-group"][data-daemon-id="${REMOTE_DECK}"]`).getByTestId("daemon-new-agent").click();
-    await page.keyboard.press("Enter");
-    await expect(page.getByTestId("new-agent-path")).toBeFocused();
-    await page.keyboard.type("/srv/checkouts/repo");
-    await page.keyboard.press("Enter");
+    await expect(page.locator(`[data-testid="daemon-group"][data-daemon-id="${REMOTE_DECK}"]`).getByTestId("daemon-new-agent")).toHaveCount(0);
 
-    await expect(page.getByTestId("new-agent-authoring-withheld")).toBeVisible();
-    await expect(page.getByTestId("new-agent-modes").getByRole("button")).toHaveText(["No mode"]);
-  });
-
-  /**
-   * Scenario: with the remote deck playing a deck from before PRD #1223, open
-   * the flow from that deck's own header. It is preselected and one Enter
-   * confirms it; there is no listing, so type the directory's path and use it.
-   * The form offers this app's own agent list and says so, and Start opens the
-   * pane as before.
-   */
-  test("falls back to a typed path on a deck without the listing verb", async ({ page }) => {
-    await page.goto(`/?fixture=1&state=fleet&older=${encodeURIComponent(REMOTE_DECK)}`);
-    await page.getByTestId("open-overview").click();
-    const remoteGroup = page.locator(`[data-testid="daemon-group"][data-daemon-id="${REMOTE_DECK}"]`);
-    await remoteGroup.getByTestId("daemon-new-agent").click();
-
-    await expect(page.getByTestId("new-agent-deck-list").locator("[aria-selected='true']")).toHaveAttribute("data-deck-id", REMOTE_DECK);
-    await page.keyboard.press("Enter");
-
-    await expect(page.getByTestId("new-agent-no-browse")).toBeVisible();
-    await expect(page.getByTestId("new-agent-directory-list")).toHaveCount(0);
-    await expect(page.getByTestId("new-agent-path")).toBeFocused();
-    await page.keyboard.type("/srv/checkouts/repo");
-    await page.keyboard.press("Enter");
-
-    await expect(page.getByTestId("new-agent-dir")).toHaveText("/srv/checkouts/repo");
-    await expect(page.getByTestId("new-agent-desktop-registry")).toBeVisible();
-    await page.getByTestId("new-agent-start").click();
-
-    await expect(page.getByTestId("agent-pane-overlay")).toBeVisible();
-  });
-
-  /**
-   * Scenario (PRD #1223 audit D2): on the same older deck, type a RELATIVE
-   * path. The typed path is what a start there would send, so the step
-   * refuses it inline in the deck's own sentence and stays on the directory;
-   * an absolute path typed after it reaches the form.
-   */
-  test("refuses a relative typed path on a deck without the listing verb", async ({ page }) => {
-    await page.goto(`/?fixture=1&state=fleet&older=${encodeURIComponent(REMOTE_DECK)}`);
-    await page.getByTestId("open-overview").click();
-    await page.locator(`[data-testid="daemon-group"][data-daemon-id="${REMOTE_DECK}"]`).getByTestId("daemon-new-agent").click();
-    await page.keyboard.press("Enter");
-    await expect(page.getByTestId("new-agent-path")).toBeFocused();
-    await page.keyboard.type("checkouts/repo");
-    await page.keyboard.press("Enter");
-
-    await expect(page.getByTestId("new-agent-directory-error")).toHaveText("enter an absolute directory path, without control characters, that the deck can see");
-    await expect(page.getByTestId("new-agent-dialog")).toHaveAttribute("data-step", "directory");
-
-    await page.getByTestId("new-agent-path").fill("/srv/checkouts/repo");
-    await page.keyboard.press("Enter");
-    await expect(page.getByTestId("new-agent-dir")).toHaveText("/srv/checkouts/repo");
+    await page.getByTestId("overview-new-agent").click();
+    const dialog = page.getByTestId("new-agent-dialog");
+    const remote = page.getByTestId("new-agent-deck-list").locator(`[data-deck-id="${REMOTE_DECK}"]`);
+    await expect(remote).toHaveAttribute("aria-disabled", "true");
+    await expect(remote).toContainText("does not advertise list-directories");
+    // Playwright will not click an `aria-disabled` element, which is the point;
+    // the click is dispatched to prove the row itself ignores it too.
+    await remote.dispatchEvent("click");
+    await expect(dialog).toHaveAttribute("data-step", "deck");
+    await expect(page.getByTestId("new-agent-path")).toHaveCount(0);
   });
 
   /**

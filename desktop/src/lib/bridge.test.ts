@@ -1107,16 +1107,19 @@ describe("FixtureDeckBridge scenarios", () => {
 
   /**
    * Scenario: `?older=` plays a named fixture deck as one from before PRD
-   * #1223. That deck answers both queries "unsupported" — the options with a
-   * registry to fall back on — while the deck beside it answers as before;
-   * `?older=1` plays every deck that way.
+   * #1223. That deck's connection carries the crate's `newAgentReason` and it
+   * answers both queries "unsupported" — the options with a registry to fall
+   * back on — while the deck beside it answers as before; `?older=1` plays
+   * every deck that way.
    */
   it("plays the decks ?older= names as decks without the new queries", async () => {
     const { FIXTURE_DAEMON_ID, FIXTURE_REMOTE_DAEMON_ID } = await import("../data/fixture");
     window.history.replaceState({}, "", `/?fixture=1&state=fleet&older=${encodeURIComponent(FIXTURE_REMOTE_DAEMON_ID)}`);
-    const { createDeckBridge } = await import("./bridge");
+    const { createDeckBridge, FIXTURE_NO_LISTING_REASON } = await import("./bridge");
     const bridge = createDeckBridge("fixture");
-    await bridge.connect();
+    const fleet = await bridge.connect();
+    expect(fleet.find((deck) => deck.connection.deckId === FIXTURE_REMOTE_DAEMON_ID)?.connection.newAgentReason).toBe(FIXTURE_NO_LISTING_REASON);
+    expect(fleet.find((deck) => deck.connection.deckId === FIXTURE_DAEMON_ID)?.connection.newAgentReason).toBeUndefined();
 
     expect(await bridge.listDirectories(FIXTURE_REMOTE_DAEMON_ID)).toEqual({ kind: "unsupported" });
     const older = await bridge.newAgentOptions(FIXTURE_REMOTE_DAEMON_ID);
@@ -1131,6 +1134,26 @@ describe("FixtureDeckBridge scenarios", () => {
     expect(await every.listDirectories(FIXTURE_DAEMON_ID)).toEqual({ kind: "unsupported" });
     expect((await every.newAgentOptions(FIXTURE_DAEMON_ID)).kind).toBe("unsupported");
     await every.dispose();
+  });
+
+  /**
+   * Scenario (PRD #1223 M6): `?nonunix=` plays a named fixture deck as one
+   * built for a non-Unix platform. It lists directories and answers the options
+   * query — so the New agent flow can reach its form — but withholds its
+   * orchestrations with the crate's reason and refuses a launch.
+   */
+  it("plays the decks ?nonunix= names as decks that cannot launch configured roles", async () => {
+    const { FIXTURE_REMOTE_DAEMON_ID } = await import("../data/fixture");
+    window.history.replaceState({}, "", `/?fixture=1&state=fleet&nonunix=${encodeURIComponent(FIXTURE_REMOTE_DAEMON_ID)}`);
+    const { createDeckBridge } = await import("./bridge");
+    const bridge = createDeckBridge("fixture");
+    const fleet = await bridge.connect();
+    expect(fleet.find((deck) => deck.connection.deckId === FIXTURE_REMOTE_DAEMON_ID)?.connection.newAgentReason).toBeUndefined();
+    expect(await bridge.listDirectories(FIXTURE_REMOTE_DAEMON_ID)).toMatchObject({ kind: "listing" });
+    expect((await bridge.newAgentOptions(FIXTURE_REMOTE_DAEMON_ID)).kind).toBe("deck");
+    expect(await bridge.newAgentOrchestrations(FIXTURE_REMOTE_DAEMON_ID, "/home/build/demo-project")).toMatchObject({ kind: "unsupported", reason: expect.stringContaining("configured commands") });
+    await expect(bridge.runAction({ type: "start_orchestration", deckId: FIXTURE_REMOTE_DAEMON_ID, path: "/home/build/demo-project", orchestration: "demo-loop" })).rejects.toThrow("configured commands");
+    await bridge.dispose();
   });
 
   /**

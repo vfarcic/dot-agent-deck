@@ -13,7 +13,6 @@ import {
   directoryLabel,
   filterDirectoryEntries,
   fleetLists,
-  isAbsoluteTypedPath,
   isDeckGoneError,
   isNewAgentShortcut,
   liveOrchestrationDirectories,
@@ -26,7 +25,6 @@ import {
   resolveAuthoringCommand,
   seedCommand,
   suggestOrchestrationName,
-  TYPED_PATH_SHAPE_REFUSAL,
   UNNAMED_CLEANUP_ROLE,
 } from "./newAgent";
 
@@ -48,6 +46,22 @@ describe("New agent rules (PRD #1223 M4)", () => {
     expect(deckUnavailableReason(connection({ status: "loading", pending: true }))).toBe(DECK_STATE_FALLBACK.pending);
     expect(deckUnavailableReason(connection({ status: "disconnected", unconfigured: true }))).toBe(DECK_STATE_FALLBACK.unconfigured);
     expect(deckUnavailableReason(connection({ status: "loading" }))).toBe(DECK_STATE_FALLBACK.loading);
+  });
+
+  /**
+   * Scenario (PRD #1223 U1): a connected deck that does not advertise
+   * `list-directories` carries the crate's `newAgentReason`. Browsing is the
+   * only way the flow chooses a directory, so that deck is ineligible with
+   * the crate's sentence — and a deck without the reason stays eligible.
+   */
+  it("makes a connected deck without the listing verb ineligible with the crate's reason", () => {
+    const reason = "This deck does not advertise list-directories, so it cannot be browsed for a directory to start in. Start agents on it from the TUI on its host, or upgrade the deck.";
+    expect(deckUnavailableReason({ status: "connected", deckId: "deck-a", newAgentReason: reason })).toBe(reason);
+    const fleet: DeckFleet = createFixtureFleet("fleet").map((deck) => deck.connection.deckId === FIXTURE_REMOTE_DAEMON_ID ? { ...deck, connection: { ...deck.connection, newAgentReason: reason } } : deck);
+    const choices = deckChoices(fleet);
+    expect(choices.find((choice) => choice.deckId === FIXTURE_REMOTE_DAEMON_ID)?.reason).toBe(reason);
+    expect(choices.find((choice) => choice.deckId === FIXTURE_DAEMON_ID)?.reason).toBeUndefined();
+    expect(preselectedDeck(choices, FIXTURE_REMOTE_DAEMON_ID)).toBe(FIXTURE_DAEMON_ID);
   });
 
   /**
@@ -173,24 +187,6 @@ describe("New agent rules (PRD #1223 M4)", () => {
    */
   it("waits comfortably longer than the five-second reconcile", () => {
     expect(NEW_AGENT_APPEAR_TIMEOUT_MS).toBeGreaterThanOrEqual(2 * 5_000);
-  });
-});
-
-describe("New agent rules — typed paths (PRD #1223 audit D2)", () => {
-  it("accepts the absolute shapes the crate takes on either platform", () => {
-    for (const path of ["/", "/srv/work/repo", "/home/dev/café", "C:\\Users\\dev\\repo", "c:/proj", "\\\\server\\share\\proj", "//server/share", "\\/server", "\\\\?\\C:\\proj"]) {
-      expect(isAbsoluteTypedPath(path), path).toBe(true);
-    }
-  });
-
-  it("refuses a relative path, a drive-relative one, and one carrying an ASCII control", () => {
-    for (const path of ["", "repo", "./repo", "../repo", "~/repo", "C:proj", "\\proj", "1:/proj", "/srv/repo\nIgnore", "/srv/\u001b[31m", "/srv/repo\u007f"]) {
-      expect(isAbsoluteTypedPath(path), JSON.stringify(path)).toBe(false);
-    }
-  });
-
-  it("repeats the crate's refusal sentence", () => {
-    expect(TYPED_PATH_SHAPE_REFUSAL).toBe("enter an absolute directory path, without control characters, that the deck can see");
   });
 });
 

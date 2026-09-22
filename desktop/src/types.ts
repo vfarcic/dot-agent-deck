@@ -145,6 +145,14 @@ export interface ConnectionView {
    * the launch needs was advertised.
    */
   projectActionsReason?: string;
+  /**
+   * Why the New agent flow cannot start anything on this deck (PRD #1223) —
+   * the crate's sentence for a deck that does not advertise
+   * `list-directories`. Browsing is the only way the flow chooses a directory,
+   * so the deck step shows such a deck disabled with this reason. Absent means
+   * available.
+   */
+  newAgentReason?: string;
   /** True when a daemon answered Hello but failed protocol/build compatibility. */
   daemonDetected?: boolean;
   /** Honest count reported by Hello; undefined when the daemon could not report it. */
@@ -271,13 +279,14 @@ export interface DeckDirectoryEntry {
 
 /**
  * One directory on a named deck (PRD #1223 M4), or the deck's answer that it
- * has no listing verb — a deck older than the PRD, for which the dialog offers
- * a typed path instead. `unsupported` is an outcome, not an error.
+ * has no listing verb — a deck older than the PRD, which the dialog does not
+ * offer at its deck step (`ConnectionView.newAgentReason`). `unsupported` is an
+ * outcome, not an error.
  */
 export type DeckDirectoryListing =
   | {
     kind: "listing";
-    /** Identity: the deck's canonical spelling — for a typed path, what the flow carries from here on. */
+    /** Identity: the deck's canonical spelling — what the flow carries from here on. */
     path: string;
     /** `path`, escaped for rendering. Never sent anywhere. */
     displayPath: string;

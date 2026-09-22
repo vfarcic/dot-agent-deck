@@ -286,6 +286,12 @@ pub struct DesktopConnection {
     /// "no sentence" is exactly what absence should mean.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub project_actions_reason: Option<String>,
+    /// Why the New agent flow cannot start anything on this deck (PRD #1223):
+    /// the deck does not advertise `list-directories`, and browsing is the
+    /// only way the flow chooses a directory. `None` means it can; omitted from
+    /// the wire when `None`, for [`Self::project_actions_reason`]'s reason.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub new_agent_reason: Option<String>,
 }
 
 /// The three endpoint-shaped fields of [`DesktopConnection`], **for one deck**.
@@ -1008,7 +1014,9 @@ pub enum DesktopDirectoryListing {
         truncated: bool,
     },
     /// The deck does not advertise `list-directories` — a deck older than PRD
-    /// #1223. The dialog falls back to a typed path.
+    /// #1223. The dialog never asks such a deck (its connection carries
+    /// `newAgentReason`, which disables it at the deck step), so this is the
+    /// crate's own answer should one be asked anyway.
     Unsupported,
 }
 
@@ -2019,6 +2027,7 @@ pub(crate) fn disconnected_snapshot(
             // Nothing was advertised because nothing answered. A disconnected
             // screen is already saying the only thing there is to say.
             project_actions_reason: None,
+            new_agent_reason: None,
         },
         agents: Vec::new(),
         // Issue #887: nothing answered, so this daemon reported no revision.

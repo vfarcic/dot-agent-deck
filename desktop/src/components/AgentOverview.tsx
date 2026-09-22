@@ -3,7 +3,7 @@ import { Blocks, Boxes, Columns3, LayoutList, Layers, Maximize2, Network, Plus, 
 import type { AgentSession, AgentStatus, ConnectionView, DeckRuntimeState, DeckView } from "../types";
 import { modeScopedKey } from "../lib/bridge";
 import { VOICE_ACTIONS } from "../lib/voiceActions";
-import { DECK_STATE_FALLBACK, isNewAgentShortcut } from "../lib/newAgent";
+import { DECK_STATE_FALLBACK, deckUnavailableReason, isNewAgentShortcut } from "../lib/newAgent";
 import { ConfirmDialog, type ConfirmState } from "./ConfirmDialog";
 import { NewAgentDialog, type NewAgentRuntime } from "./NewAgentDialog";
 import { DeckSelector } from "./DeckSelector";
@@ -948,7 +948,7 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
               onReconnect={() => void runtime.reconnect()}
               overrideError={deck.snapshot.connection.deckId === connection.deckId ? overrideError : undefined}
               onConnectAnyway={mode === "live" && deck.snapshot.connection.buildStampMismatchOnly ? requestConnectAnyway : undefined}
-              onNewAgent={newAgentAvailable && deck.connected && deck.snapshot.connection.deckId !== undefined ? () => VOICE_ACTIONS.openNewAgent.run(voiceContext, { deckId: deck.snapshot.connection.deckId }) : undefined}
+              onNewAgent={newAgentAvailable && deck.connected && deck.snapshot.connection.deckId !== undefined && deckUnavailableReason(deck.snapshot.connection) === undefined ? () => VOICE_ACTIONS.openNewAgent.run(voiceContext, { deckId: deck.snapshot.connection.deckId }) : undefined}
             />
           ))}
         </section>

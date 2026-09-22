@@ -266,47 +266,20 @@ describe("New agent dialog — directory step (PRD #1223 M4)", () => {
   });
 
   /**
-   * Scenario: type into the path field, including the picker's own letters —
-   * they stay in the field and move nothing. Submitting sends the text to the
-   * deck exactly as typed, trailing slash included; the deck answers with its
-   * canonical spelling, the keyboard returns to the listing, and Space carries
-   * that spelling into the form, which names the agent after it.
+   * Scenario (PRD #1223 U1): the directory step has no typed-path field, and a
+   * truncated listing's hint does not tell the user to type one.
    */
-  it("sends a typed path verbatim and carries the deck's canonical reply", async () => {
-    const runtime = fakeRuntime();
+  it("offers no typed path, and a truncated listing does not suggest one", async () => {
+    const runtime = fakeRuntime({
+      listDirectories: vi.fn(async (): Promise<DeckDirectoryListing> => ({ ...structuredClone(TREE[""]), truncated: true })),
+    });
     renderDialog(runtime);
     fireEvent.keyDown(deckList(), { key: "Enter" });
-    await currentPath("/home/dev");
 
-    const path = screen.getByTestId("new-agent-path");
-    fireEvent.keyDown(path, { key: "j" });
-    fireEvent.keyDown(path, { key: "l" });
-    expect(activeRow()).toBe("/home/dev/Alpha-project");
-    expect(runtime.listDirectories).toHaveBeenCalledTimes(1);
-    fireEvent.change(path, { target: { value: "/typed/link/" } });
-    fireEvent.submit(path.closest("form")!);
-
-    await currentPath("/real/target");
-    expect(runtime.listDirectories).toHaveBeenLastCalledWith(LOCAL, "/typed/link/");
-    await waitFor(() => expect(directoryList()).toHaveFocus());
-    fireEvent.keyDown(directoryList(), { key: " " });
-    expect(await screen.findByTestId("new-agent-dir")).toHaveTextContent("/real/target");
-    expect(screen.getByTestId("new-agent-name")).toHaveValue("target");
-  });
-
-  /** Scenario: a typed path the deck refuses keeps the listing on screen and shows the deck's refusal. */
-  it("shows a refused typed path inline and keeps the listing", async () => {
-    const runtime = fakeRuntime();
-    renderDialog(runtime);
-    fireEvent.keyDown(deckList(), { key: "Enter" });
-    await currentPath("/home/dev");
-
-    const path = screen.getByTestId("new-agent-path");
-    fireEvent.change(path, { target: { value: "/no/such/dir" } });
-    fireEvent.submit(path.closest("form")!);
-
-    expect(await screen.findByTestId("new-agent-directory-error")).toHaveTextContent("unresolved");
-    expect(screen.getByTestId("new-agent-current-path")).toHaveTextContent("/home/dev");
+    const hint = await screen.findByTestId("new-agent-truncated");
+    expect(hint.textContent ?? "").not.toMatch(/type/i);
+    expect(screen.queryByTestId("new-agent-path")).toBeNull();
+    expect(screen.queryByRole("textbox", { name: "Path" })).toBeNull();
   });
 });
 
@@ -461,78 +434,44 @@ describe("New agent dialog — a deck that leaves mid-flow (PRD #1223 M4)", () =
 
 describe("New agent dialog — older decks (PRD #1223 M5)", () => {
   /**
-   * Scenario: the deck has no listing verb. The directory step offers the
-   * typed path alone and says why; the typed path goes to the form verbatim,
-   * with no second listing request, and the form names it after its last
-   * component.
+   * Scenario (PRD #1223 U1): a connected deck that does not advertise the
+   * listing verb carries the crate's `newAgentReason`. It is listed disabled
+   * with that reason, is not preselected even when the flow was opened from
+   * it, and neither a click nor Enter takes the flow past the deck step.
    */
-  it("offers only the typed path on a deck without the listing verb", async () => {
+  it("disables a deck without the listing verb at the deck step, with the crate's reason", () => {
+    const reason = "This deck does not advertise list-directories, so it cannot be browsed for a directory to start in. Start agents on it from the TUI on its host, or upgrade the deck.";
+    const runtime = fakeRuntime({ fleet: [deck(LOCAL, { deckKind: "local" }), deck(REMOTE, { newAgentReason: reason })] });
+    renderDialog(runtime, { initialDeckId: REMOTE });
+
+    const options = within(deckList()).getAllByRole("option");
+    expect(options[1]).toHaveAttribute("aria-disabled", "true");
+    expect(options[1]).toHaveTextContent(reason);
+    expect(options[1]).toHaveAttribute("aria-selected", "false");
+    fireEvent.click(options[1]);
+    expect(runtime.listDirectories).not.toHaveBeenCalled();
+    expect(screen.getByTestId("new-agent-dialog")).toHaveAttribute("data-step", "deck");
+  });
+
+  /**
+   * Scenario: a deck that answers the listing `unsupported` anyway — replaced
+   * by an older build between its handshake and the request — says it cannot be
+   * browsed, offers no way to type a path, and puts focus on Back, the one
+   * thing left to do; Back returns to the deck step.
+   */
+  it("offers only Back when a deck answers the listing unsupported", async () => {
     const runtime = fakeRuntime({ listDirectories: vi.fn(async (): Promise<DeckDirectoryListing> => ({ kind: "unsupported" })) });
     renderDialog(runtime);
     fireEvent.keyDown(deckList(), { key: "Enter" });
 
     expect(await screen.findByTestId("new-agent-no-browse")).toBeVisible();
     expect(screen.queryByTestId("new-agent-directory-list")).toBeNull();
-    const path = screen.getByTestId("new-agent-path");
-    await waitFor(() => expect(path).toHaveFocus());
-    fireEvent.change(path, { target: { value: "/srv/work/repo" } });
-    fireEvent.submit(path.closest("form")!);
-
-    expect(await screen.findByTestId("new-agent-dir")).toHaveTextContent("/srv/work/repo");
-    expect(screen.getByTestId("new-agent-name")).toHaveValue("repo");
-    expect(runtime.listDirectories).toHaveBeenCalledTimes(1);
-  });
-
-  /**
-   * Scenario (PRD #1223 audit D2): on a deck without the listing verb the typed
-   * path is what the start sends, so a relative one — `repo` — is refused
-   * inline in the crate's own sentence, the step stays on the directory and
-   * nothing is started. Typing an absolute path afterwards clears the refusal
-   * and carries that path into the form and the start.
-   */
-  it("refuses a relative typed path inline on a deck without the listing verb and starts nothing", async () => {
-    const runtime = fakeRuntime({ listDirectories: vi.fn(async (): Promise<DeckDirectoryListing> => ({ kind: "unsupported" })) });
-    renderDialog(runtime);
-    fireEvent.keyDown(deckList(), { key: "Enter" });
-    await screen.findByTestId("new-agent-no-browse");
-
-    const path = screen.getByTestId("new-agent-path");
-    for (const typed of ["repo", "./repo", "~/repo"]) {
-      fireEvent.change(path, { target: { value: typed } });
-      fireEvent.submit(path.closest("form")!);
-      expect(await screen.findByTestId("new-agent-directory-error")).toHaveTextContent("enter an absolute directory path, without control characters, that the deck can see");
-      expect(screen.getByTestId("new-agent-dialog")).toHaveAttribute("data-step", "directory");
-    }
-    expect(screen.queryByTestId("new-agent-form")).toBeNull();
+    expect(screen.queryByTestId("new-agent-path")).toBeNull();
+    const back = screen.getByTestId("new-agent-directory-back");
+    await waitFor(() => expect(back).toHaveFocus());
+    fireEvent.click(back);
+    expect(screen.getByTestId("new-agent-dialog")).toHaveAttribute("data-step", "deck");
     expect(runtime.runAction).not.toHaveBeenCalled();
-    expect(runtime.listDirectories).toHaveBeenCalledTimes(1);
-
-    fireEvent.change(path, { target: { value: "/srv/work/repo" } });
-    fireEvent.submit(path.closest("form")!);
-    expect(await screen.findByTestId("new-agent-dir")).toHaveTextContent("/srv/work/repo");
-    fireEvent.click(screen.getByTestId("new-agent-start"));
-    await waitFor(() => expect(runtime.runAction).toHaveBeenCalledTimes(1));
-    expect(runtime.runAction).toHaveBeenCalledWith(expect.objectContaining({ type: "start_agent", deckId: LOCAL, cwd: "/srv/work/repo" }));
-  });
-
-  /**
-   * Scenario: the same refusal on a deck that CAN list — the relative path is
-   * not sent to the deck, the listing stays on screen, and the crate's
-   * sentence is shown beside it.
-   */
-  it("refuses a relative typed path before asking a deck that can list", async () => {
-    const runtime = fakeRuntime();
-    renderDialog(runtime);
-    fireEvent.keyDown(deckList(), { key: "Enter" });
-    await currentPath("/home/dev");
-
-    const path = screen.getByTestId("new-agent-path");
-    fireEvent.change(path, { target: { value: "beta" } });
-    fireEvent.submit(path.closest("form")!);
-
-    expect(await screen.findByTestId("new-agent-directory-error")).toHaveTextContent("enter an absolute directory path");
-    expect(runtime.listDirectories).toHaveBeenCalledTimes(1);
-    expect(screen.getByTestId("new-agent-current-path")).toHaveTextContent("/home/dev");
   });
 
   /**

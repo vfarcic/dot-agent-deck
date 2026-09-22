@@ -51,6 +51,9 @@ pub(crate) struct HandshakeInfo {
     /// Derived from what the `Hello` reply **advertised**, never from a version
     /// digit or a build stamp — see [`project_actions_reason`].
     pub(crate) project_actions_reason: Option<String>,
+    /// Why the New agent flow cannot start anything on this deck, or `None`
+    /// when it can (PRD #1223) — see [`new_agent_reason`].
+    pub(crate) new_agent_reason: Option<String>,
 }
 
 /// An established link to one deck: the handshake that classified it, and a
@@ -665,6 +668,28 @@ fn project_actions_reason(response: &AttachResponse) -> Option<String> {
     ))
 }
 
+/// Why the desktop's New agent flow cannot start anything on this deck, or
+/// `None` when the deck advertises [`CAP_LIST_DIRECTORIES`] (PRD #1223).
+///
+/// The flow's directory step browses the deck's own filesystem, and since the
+/// typed-path field was removed that is the ONLY way to choose where an agent
+/// starts. A deck without the verb therefore has no directory step at all, so
+/// the deck step shows it disabled with this sentence rather than letting the
+/// user choose it into a dead end. Read from the same `Hello` capture as
+/// [`project_actions_reason`], for the same reason.
+///
+/// [`CAP_LIST_DIRECTORIES`]: dot_agent_deck::daemon_protocol::CAP_LIST_DIRECTORIES
+fn new_agent_reason(response: &AttachResponse) -> Option<String> {
+    let capabilities = dot_agent_deck::daemon_client::DaemonCapabilities::from_hello(response);
+    if capabilities.supports(dot_agent_deck::daemon_protocol::CAP_LIST_DIRECTORIES) {
+        return None;
+    }
+    Some(format!(
+        "This deck does not advertise {}, so it cannot be browsed for a directory to start in. Start agents on it from the TUI on its host, or upgrade the deck.",
+        dot_agent_deck::daemon_protocol::CAP_LIST_DIRECTORIES
+    ))
+}
+
 /// Whether the build-stamp comparison is being relaxed, and by what.
 ///
 /// The handshake refuses a daemon whose git-describe stamp differs from the
@@ -877,6 +902,7 @@ fn classify_handshake(
             .ok
             .then(|| project_actions_reason(response))
             .flatten(),
+        new_agent_reason: response.ok.then(|| new_agent_reason(response)).flatten(),
     }
 }
 
@@ -929,6 +955,7 @@ fn connection_from_handshake(endpoint: &Endpoint, handshake: HandshakeInfo) -> D
         running_agent_count: handshake.running_agent_count,
         build_stamp_mismatch_only: handshake.build_stamp_mismatch_only,
         project_actions_reason: handshake.project_actions_reason,
+        new_agent_reason: handshake.new_agent_reason,
     }
 }
 
@@ -1868,6 +1895,45 @@ mod tests {
         );
     }
 
+    /// PRD #1223 U1: a deck that does not advertise `list-directories` has no
+    /// directory step in the New agent flow now that the typed path is gone,
+    /// so its connection says why and the deck step disables it. A deck that
+    /// does advertise it has nothing to explain.
+    #[test]
+    fn a_deck_without_the_listing_verb_is_not_offered_to_the_new_agent_flow() {
+        let _guard = AllowanceGuard::acquire();
+        let mut listing = AttachResponse::hello(PROTOCOL_VERSION);
+        listing.capabilities = Some(vec![
+            dot_agent_deck::daemon_protocol::CAP_LIST_DIRECTORIES.to_string(),
+        ]);
+        assert_eq!(
+            classify_handshake(
+                &listing,
+                listing.build_version.as_deref().unwrap(),
+                BuildMismatchAllowance::Refuse,
+            )
+            .new_agent_reason,
+            None,
+        );
+
+        let bare = AttachResponse::hello(PROTOCOL_VERSION);
+        let reason = classify_handshake(
+            &bare,
+            bare.build_version.as_deref().unwrap(),
+            BuildMismatchAllowance::Refuse,
+        )
+        .new_agent_reason
+        .expect("an unadvertised daemon cannot be browsed");
+        assert!(
+            reason.contains(dot_agent_deck::daemon_protocol::CAP_LIST_DIRECTORIES),
+            "the reason names the missing verb: {reason}"
+        );
+        assert!(
+            !reason.to_lowercase().contains("type"),
+            "the reason must not send the user to a typed path that no longer exists: {reason}"
+        );
+    }
+
     /// A PARTIAL set is withheld too, and names only what is absent.
     ///
     /// The four verbs are one flow. A daemon with three of them can get a user
@@ -2773,6 +2839,7 @@ mod tests {
                     running_agent_count: Some(0),
                     build_stamp_mismatch_only: false,
                     project_actions_reason: None,
+                    new_agent_reason: None,
                 },
             ),
             _transport: tokio::runtime::Runtime::new()

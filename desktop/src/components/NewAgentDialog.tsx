@@ -12,7 +12,6 @@ import {
   directoryLabel,
   filterDirectoryEntries,
   fleetLists,
-  isAbsoluteTypedPath,
   isDeckGoneError,
   liveOrchestrationDirectories,
   liveOrchestrationTitles,
@@ -26,7 +25,6 @@ import {
   SAME_DIRECTORY_ORCHESTRATION,
   seedCommand,
   suggestOrchestrationName,
-  TYPED_PATH_SHAPE_REFUSAL,
   type DeckChoice,
 } from "../lib/newAgent";
 import type { AuthoringKind, DaemonOrchestration, DeckDirectoryEntry, DeckDirectoryListing, DeckRuntimeState, NewAgentOption, NewAgentOptions, NewAgentOrchestrations } from "../types";
@@ -82,8 +80,9 @@ function messageOf(cause: unknown): string {
  * 1. **Deck** — every deck in the fleet; the ones that cannot take a spawn are
  *    shown disabled with the reason the overview gives for them.
  * 2. **Directory** — that deck's filesystem, browsed one level per request with
- *    the TUI picker's keys, plus a typed path — the only mode on a deck without
- *    the listing verb.
+ *    the TUI picker's keys. Browsing is the only way to choose one (PRD #1223
+ *    U1 removed the typed path), so a deck without the listing verb is
+ *    disabled at the deck step with the crate's `newAgentReason`.
  * 3. **Form** — Mode, Agent, Name and Command, prefilled in the TUI's order.
  *    Mode offers a plain agent; one `Orch: <name>` chip per orchestration the
  *    directory's project defines on that deck (PRD #1223 M6); and, on a deck
@@ -113,7 +112,7 @@ function messageOf(cause: unknown): string {
  * # No path is built here
  *
  * Every path the flow sends is one the deck returned — a listing's `path`,
- * `parent`, or an entry's `path` — or one the user typed, sent verbatim. The
+ * `parent`, or an entry's `path`. The
  * Name prefill is the last component of the deck's canonical path, which is a
  * label and is never sent back as a path.
  *
@@ -139,11 +138,8 @@ export function NewAgentDialog({ runtime, initialDeckId, onClose, onAppeared, on
   const [listingError, setListingError] = useState<string>();
   const [cursor, setCursor] = useState(0);
   const [filter, setFilter] = useState("");
-  const [typedPath, setTypedPath] = useState("");
   /** Drops the reply of any listing request a later one has superseded. */
   const listingSeq = useRef(0);
-  /** A typed path was just listed: hand the keyboard back to the listing, so Space uses it. */
-  const focusListingNext = useRef(false);
 
   // -- form step --------------------------------------------------------------
   const [target, setTarget] = useState<{ path: string; displayPath: string }>();
@@ -172,9 +168,8 @@ export function NewAgentDialog({ runtime, initialDeckId, onClose, onAppeared, on
   /**
    * Whether each path the deck listed holds a project, from the listings seen
    * so far — the marker that decides whether the deck is asked for
-   * orchestrations at all. A directory reached another way (typed, or by going
-   * up) has no entry here and is asked, and the deck's `not_project` answer
-   * covers it.
+   * orchestrations at all. A directory reached another way (by going up) has
+   * no entry here and is asked, and the deck's `not_project` answer covers it.
    */
   const projectMarks = useRef(new Map<string, boolean>());
   const [phase, setPhase] = useState<"idle" | "starting" | "waiting">("idle");
@@ -183,7 +178,7 @@ export function NewAgentDialog({ runtime, initialDeckId, onClose, onAppeared, on
   const deckListRef = useRef<HTMLUListElement>(null);
   const directoryListRef = useRef<HTMLUListElement>(null);
   const filterRef = useRef<HTMLInputElement>(null);
-  const pathRef = useRef<HTMLInputElement>(null);
+  const directoryBackRef = useRef<HTMLButtonElement>(null);
   const nameRef = useRef<HTMLInputElement>(null);
   const commandRef = useRef<HTMLInputElement>(null);
 
@@ -297,14 +292,12 @@ export function NewAgentDialog({ runtime, initialDeckId, onClose, onAppeared, on
       setListing(reply);
       setListingState("ready");
       setFilter("");
-      setTypedPath("");
       const offset = reply.parent === undefined ? 0 : 1;
       const focused = focusPath === undefined ? -1 : reply.entries.findIndex((entry) => entry.path === focusPath);
       setCursor(focused >= 0 ? focused + offset : reply.entries.length > 0 ? offset : 0);
     } catch (cause) {
       if (seq !== listingSeq.current) return;
       const message = messageOf(cause);
-      focusListingNext.current = false;
       if (isDeckGoneError(message)) {
         returnToDeckStep(message);
         return;
@@ -324,7 +317,7 @@ export function NewAgentDialog({ runtime, initialDeckId, onClose, onAppeared, on
     void loadListing(choice.deckId);
   };
 
-  /** Into the form, for a directory the deck returned — or, on a deck without the listing verb, the path the user typed. */
+  /** Into the form, for a directory the deck returned. */
   const confirmDirectory = (path: string, displayPath: string) => {
     if (!deck) return;
     const deckId = deck.deckId;
@@ -398,29 +391,6 @@ export function NewAgentDialog({ runtime, initialDeckId, onClose, onAppeared, on
     if (!row) return;
     if (row.kind === "up") goUp();
     else void loadListing(deck.deckId, row.entry.path);
-  };
-
-  const submitTypedPath = () => {
-    if (!deck || typedPath === "") return;
-    // PRD #1223 audit D2: a relative path is refused here, in the crate's own
-    // sentence, before anything is asked. It matters most on a deck without the
-    // listing verb, where the typed path is what the start sends — and the
-    // crate refuses it there too, so this only saves the round trip.
-    if (!isAbsoluteTypedPath(typedPath)) {
-      setListingError(TYPED_PATH_SHAPE_REFUSAL);
-      return;
-    }
-    // Verbatim: the deck canonicalises it, and its reply is what the flow
-    // carries. A deck without the listing verb has no reply to give, so the
-    // typed path itself goes to the form and the start is where the deck
-    // accepts or refuses it.
-    if (listingState === "unsupported") {
-      setListingError(undefined);
-      confirmDirectory(typedPath, displayText(typedPath, DISPLAY_LIMITS.path));
-      return;
-    }
-    focusListingNext.current = true;
-    void loadListing(deck.deckId, typedPath);
   };
 
   const agents: NewAgentOption[] = options?.kind === "deck" ? options.agents : options?.kind === "unsupported" ? options.desktopAgents : [];
@@ -615,16 +585,16 @@ export function NewAgentDialog({ runtime, initialDeckId, onClose, onAppeared, on
   }, [step]);
   useEffect(() => {
     if (step !== "directory") return;
+    // With no listing there is nothing to choose, and Back — to another deck —
+    // is the one thing left to do.
     if (listingState === "unsupported" || listingState === "failed") {
-      pathRef.current?.focus();
+      directoryBackRef.current?.focus();
       return;
     }
     if (listingState !== "ready") return;
-    // A listing that lands while the user is typing in the filter or the path
-    // field leaves the caret where it is — unless it is the typed path's own.
-    const typing = document.activeElement === filterRef.current || document.activeElement === pathRef.current;
-    if (focusListingNext.current || !typing) directoryListRef.current?.focus();
-    focusListingNext.current = false;
+    // A listing that lands while the user is typing in the filter leaves the
+    // caret where it is.
+    if (document.activeElement !== filterRef.current) directoryListRef.current?.focus();
   }, [listing, listingState, step]);
   const activeRowId = `${titleId}-row-${cursor}`;
   useEffect(() => {
@@ -797,27 +767,7 @@ export function NewAgentDialog({ runtime, initialDeckId, onClose, onAppeared, on
     const noSubdirectories = listing !== undefined && listing.entries.length === 0;
     body = (
       <>
-        <form
-          className="new-agent-path"
-          onSubmit={(event) => {
-            event.preventDefault();
-            submitTypedPath();
-          }}
-        >
-          <input
-            ref={pathRef}
-            aria-label="Path"
-            data-testid="new-agent-path"
-            value={typedPath}
-            placeholder={listingState === "unsupported" ? "Absolute path of a directory on this deck" : "Type a path to go there"}
-            spellCheck={false}
-            autoCapitalize="off"
-            autoCorrect="off"
-            onChange={(event) => setTypedPath(event.target.value)}
-          />
-          <button type="submit" className="button secondary compact" disabled={typedPath === ""}>{listingState === "unsupported" ? "Use path" : "Go"}</button>
-        </form>
-        {listingState === "unsupported" && <p className="new-agent-hint" data-testid="new-agent-no-browse">This deck cannot list directories. Type the directory's absolute path.</p>}
+        {listingState === "unsupported" && <p className="new-agent-hint" data-testid="new-agent-no-browse">This deck cannot list directories, so no directory can be chosen on it here. Go back and choose another deck.</p>}
         {listingError && <p className="new-agent-error" role="alert" data-testid="new-agent-directory-error">{displayText(listingError, DISPLAY_LIMITS.message)}</p>}
         {listingState === "loading" && <p className="new-agent-hint"><Loader2 className="spin" size={12} /> Listing…</p>}
         {listing && (
@@ -877,7 +827,7 @@ export function NewAgentDialog({ runtime, initialDeckId, onClose, onAppeared, on
               ))}
             </ul>
             {noSubdirectories && <p className="new-agent-hint">No subdirectories. Enter or Space uses this directory.</p>}
-            {listing.truncated && <p className="new-agent-hint" data-testid="new-agent-truncated">Not every subdirectory is listed. Type a path to reach one that is not.</p>}
+            {listing.truncated && <p className="new-agent-hint" data-testid="new-agent-truncated">Not every subdirectory is listed: the deck stopped at its limit, and the ones past it cannot be chosen here.</p>}
             <p className="new-agent-keys">j/k move · l or Enter opens · h or Backspace goes up · Space uses this directory · / filters</p>
           </>
         )}
@@ -885,7 +835,7 @@ export function NewAgentDialog({ runtime, initialDeckId, onClose, onAppeared, on
     );
     footer = (
       <>
-        <button type="button" className="button secondary" onClick={() => { listingSeq.current += 1; setStep("deck"); setDeck(undefined); }}><ArrowLeft size={14} /> Back</button>
+        <button type="button" ref={directoryBackRef} className="button secondary" data-testid="new-agent-directory-back" onClick={() => { listingSeq.current += 1; setStep("deck"); setDeck(undefined); }}><ArrowLeft size={14} /> Back</button>
         <button type="button" className="button secondary" onClick={requestClose}>Cancel</button>
         {listing?.parent !== undefined && <button type="button" className="button secondary" onClick={goUp}><ArrowUp size={14} /> Up</button>}
         <button type="button" className="button primary" data-testid="new-agent-use-directory" disabled={!listing} onClick={confirmCurrent}><Check size={14} /> Use this directory</button>

@@ -120,6 +120,20 @@ describe("the overview's New agent entry points (PRD #1223 M4)", () => {
   });
 
   /**
+   * Scenario (PRD #1223 U1): the remote deck does not advertise the listing
+   * verb, so its connection carries `newAgentReason`. Its header offers no New
+   * agent — the flow could not get past its deck step — while the local deck's
+   * header still does.
+   */
+  it("offers no header entry point on a deck the flow cannot browse", () => {
+    const fleet = createFixtureFleet("fleet").map((deck) => deck.connection.deckId === FIXTURE_REMOTE_DAEMON_ID ? { ...deck, connection: { ...deck.connection, newAgentReason: "This deck does not advertise list-directories." } } : deck);
+    render(<AgentOverview runtime={runtime({ fleet })} onNavigate={vi.fn()} />);
+    const group = (deckId: string) => screen.getAllByTestId("daemon-group").find((candidate) => candidate.getAttribute("data-daemon-id") === deckId)!;
+    expect(within(group(FIXTURE_REMOTE_DAEMON_ID)).queryByTestId("daemon-new-agent")).toBeNull();
+    expect(within(group(FIXTURE_DAEMON_ID)).getByTestId("daemon-new-agent")).toBeVisible();
+  });
+
+  /**
    * Scenario: a healthy deck running nothing. Its first-run note offers New
    * agent instead of pointing at the CLI, and the flow opens on that deck.
    */
