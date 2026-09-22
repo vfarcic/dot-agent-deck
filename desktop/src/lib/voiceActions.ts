@@ -190,6 +190,16 @@ export type VoiceActionContext = {
    * sentence about itself, so the honest answer to `close` with nothing open
    * is written there and not composed here. */
   reportNothingToClose: () => void;
+  /**
+   * Open the New agent dialog (PRD #1223), with `deckId` preselected when the
+   * control that opened it belongs to one deck — a deck group's header.
+   *
+   * **Served by the OVERVIEW alone**, the screen the flow lives on and the one
+   * whose fleet the deck step lists; see {@link VoiceOverviewContext}. The deck
+   * screen does not offer it, so a dispatch there is refused against `needs`
+   * rather than attempted.
+   */
+  openNewAgent: (deckId?: string) => void;
 };
 
 /**
@@ -441,6 +451,21 @@ export const VOICE_ACTIONS = {
     needs: ["advanceFixture"],
     run: (context: Pick<VoiceActionContext, "advanceFixture">) => context.advanceFixture(),
   },
+
+  // -- the overview's own -------------------------------------------------
+
+  openNewAgent: {
+    label: "Start a new agent on a chosen deck",
+    no_voice: "opens a multi-step interactive dialog — choose a deck, browse that deck's directories, then fill a form — and the table has no resolver kind that can turn a spoken phrase into a deck or a directory, so a row could open the dialog and then leave the user inside steps voice cannot finish; a voice entry is deferred to PRD #1195's widening of the voice command set",
+    needs: ["openNewAgent"],
+    /**
+     * The top bar's New agent button, the keyboard shortcut and the first-run
+     * note open it with no deck; a deck group's header passes its own, which
+     * the deck step preselects. An empty id — what a dispatch target carries
+     * where it has no deck — preselects nothing.
+     */
+    run: (context: Pick<VoiceActionContext, "openNewAgent">, target?: { deckId?: string }) => context.openNewAgent(target?.deckId || undefined),
+  },
 } satisfies Record<string, VoiceActionEntry>;
 
 /** Every action id, as the guard and the command table spell them. */
@@ -580,16 +605,27 @@ export type VoicePanelContext = Pick<VoiceActionContext, "stopVoice" | "showVoic
 export type VoicePanelChannel = { current: Partial<VoicePanelContext> | undefined };
 
 /**
- * Everything a SCREEN is expected to serve: the context minus the voice
- * surface's own members.
+ * Everything the DECK screen is expected to serve: the context minus the voice
+ * surface's own members and the overview's (PRD #1223 split the second set out;
+ * see {@link VoiceOverviewContext}).
  *
- * `Omit<…, keyof VoicePanelContext>` rather than a second hand-written list —
- * the two halves are complements by construction, so moving a member from one
- * to the other is one edit and cannot leave a member served twice or not at
+ * `Omit<…, keyof VoicePanelContext | …>` rather than a second hand-written
+ * list — the halves are complements by construction, so moving a member from
+ * one to another is one edit and cannot leave a member served twice or not at
  * all. Before `stopVoice` existed a screen served the whole context and this
  * was `VoiceActionContext` itself.
  */
-export type VoiceScreenContext = Omit<VoiceActionContext, keyof VoicePanelContext>;
+export type VoiceScreenContext = Omit<VoiceActionContext, keyof VoicePanelContext | keyof VoiceOverviewContext>;
+
+/**
+ * The members only the OVERVIEW serves (PRD #1223): opening the New agent
+ * dialog, which lives on that screen because its deck step lists the fleet the
+ * overview shows. Split out of {@link VoiceScreenContext} — which is what the
+ * DECK screen publishes — so the deck is not made to serve a member it has no
+ * dialog for; a dispatch of `openNewAgent` there is refused against its
+ * `needs`, the way the overview refuses a deck overlay.
+ */
+export type VoiceOverviewContext = Pick<VoiceActionContext, "openNewAgent">;
 
 /**
  * How a screen publishes its half of the context up to the host that dispatches

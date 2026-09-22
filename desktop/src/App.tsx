@@ -564,7 +564,7 @@ export function DeckShell({ runtime, workflowPlatformIssue, initialView = { kind
   const screenNode = base === "overview"
     ? (
       <>
-        <AgentOverview runtime={runtime} settings={settings} onNavigate={setView} />
+        <AgentOverview runtime={runtime} settings={settings} onNavigate={setView} agentPaneOpen={agentView !== undefined} />
         {/*
           The overview mounts no terminal of its own (PRD #745's commitment), so
           there is no tile here to promote and the pane is a sibling of the

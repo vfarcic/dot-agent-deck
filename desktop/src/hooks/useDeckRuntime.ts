@@ -359,6 +359,11 @@ export function useDeckRuntime(): DeckRuntimeState {
   // its own state and says what it means.
   const listProjects = useCallback(() => bridge.listProjects(), [bridge]);
   const resolveProject = useCallback((path: string) => bridge.resolveProject(path), [bridge]);
+  // PRD #1223 M4, and for the same reason: a deck that cannot list, a path it
+  // refuses and a deck that left the fleet are all things the New agent dialog
+  // says in place, not faults of the screen behind it.
+  const listDirectories = useCallback((deckId: string, path?: string) => bridge.listDirectories(deckId, path), [bridge]);
+  const newAgentOptions = useCallback((deckId: string) => bridge.newAgentOptions(deckId), [bridge]);
 
   // PRD #882: the geometry the daemon has applied per agent. Held here rather
   // than inside each tile because the push is per agent and arrives on one
@@ -399,6 +404,8 @@ export function useDeckRuntime(): DeckRuntimeState {
     reconnect,
     listProjects,
     resolveProject,
+    listDirectories,
+    newAgentOptions,
     getSettings,
     saveSettings,
     testEndpoint,

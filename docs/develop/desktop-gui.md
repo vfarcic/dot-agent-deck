@@ -64,6 +64,8 @@ pnpm dev
 
 Open `http://localhost:1420/`. A normal browser defaults to fixture transport; `http://localhost:1420/?fixture=1` selects it explicitly. `?state=` picks the scenario, and the six it accepts are `connected` (the default four-agent deck), `crowded`, `empty`, `disconnected`, `error` and `fleet` — for example `http://localhost:1420/?fixture=1&state=disconnected`. An unrecognised value falls back to `connected` rather than failing. See [The connection states](#the-connection-states) for what each one is for. (It said *five* until PRD #742 M4 added `fleet`, which is the only one of the six that renders more than one deck; every other scenario is one deck, byte for byte what it was before that milestone. `fleet` began as three decks — two answering and one not — and M14 added a fourth that has not reported yet, so it now carries every degraded state the overview can draw at once.)
 
+`?older=` makes the fixture play decks from before PRD #1223 — no directory listing and no new-agent options — so the New agent dialog's older-deck fallbacks (typed path only; this app's own agent list) can be driven without an old daemon. `older=1` (or `older=all`) plays every deck that way; otherwise it takes a comma-separated list of fixture deck ids, for example `http://localhost:1420/?fixture=1&state=fleet&older=dev%40build-box` for the fleet's remote deck. Unset, every fixture deck answers both queries.
+
 The fixture's **Advance fixture** control walks a fixed review → test → human-approval sequence. Terminal input, pause/resume, retry, approval, workflow ordering, and agent-profile editing affect fixture or browser-local state only.
 
 ## Live Tauri preview

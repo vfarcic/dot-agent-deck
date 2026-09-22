@@ -1,5 +1,5 @@
 import type { VoiceCommandDto, VoiceResolvedParamDto, VoiceResultDto, VoiceScreen, VoiceStatusDto, VoiceTranscriptionDto } from "../lib/bridge";
-import type { AgentProfile, AgentSession, AgentStatus, AgentTab, DeckSnapshot, EvidenceItem, WorkflowStage } from "../types";
+import type { AgentProfile, AgentSession, AgentStatus, AgentTab, DeckDirectoryEntry, DeckSnapshot, EvidenceItem, NewAgentOption, WorkflowStage } from "../types";
 
 /**
  * The fixture's stand-in for a deck identity — used as BOTH `deckId` and
@@ -479,6 +479,74 @@ export function nextFixtureAgentId(agents: readonly AgentSession[]): string {
   while (agents.some((agent) => agent.id === String(next))) next += 1;
   return String(next);
 }
+
+/**
+ * PRD #1223 M4 — each connected fixture deck's home directory, which is where
+ * the New agent dialog's directory step opens on it.
+ *
+ * Different per deck on purpose: a preview that listed the wrong deck's tree
+ * would show the wrong home, where two identical trees would hide it.
+ */
+export const FIXTURE_HOMES: Readonly<Record<string, string>> = {
+  [FIXTURE_DAEMON_ID]: "/home/dev",
+  [FIXTURE_REMOTE_DAEMON_ID]: "/home/build",
+};
+
+/** One directory of a fixture deck's tree, shaped the way a deck lists one. */
+export interface FixtureDirectory {
+  path: string;
+  parent?: string;
+  entries: DeckDirectoryEntry[];
+}
+
+/**
+ * The filesystem a fixture deck lists, rooted at `/`: a home holding a project
+ * directory (it carries the marker) and an ordinary one, and a directory one
+ * level deeper inside the ordinary one — enough to browse into, confirm a
+ * directory with no subdirectories, and go back up through every parent.
+ *
+ * Every path here is the fixture DECK's answer, the way a daemon answers with
+ * its own canonical spelling. The dialog never builds one of these itself.
+ */
+export function fixtureDirectoryTree(home: string): Map<string, FixtureDirectory> {
+  const user = home.split("/").filter(Boolean).at(-1) ?? "dev";
+  const entry = (path: string, isProject = false): DeckDirectoryEntry => ({ path, displayName: path.split("/").at(-1) ?? path, isProject });
+  const tree: FixtureDirectory[] = [
+    { path: "/", entries: [entry("/home")] },
+    { path: "/home", parent: "/", entries: [entry(`/home/${user}`)] },
+    { path: home, parent: "/home", entries: [entry(`${home}/demo-project`, true), entry(`${home}/scratch`)] },
+    { path: `${home}/demo-project`, parent: home, entries: [] },
+    { path: `${home}/scratch`, parent: home, entries: [entry(`${home}/scratch/notes`)] },
+    { path: `${home}/scratch/notes`, parent: `${home}/scratch`, entries: [] },
+  ];
+  return new Map(tree.map((directory) => [directory.path, directory]));
+}
+
+/**
+ * The agent registry a fixture deck reports, shaped as `new-agent-options`
+ * reports the real one: each entry's first basename as the id, its label, its
+ * default command, in registry order. The fixture has no Rust to ask, so this
+ * is preview data — a live deck answers with its own build's list, and an
+ * older live deck's fallback comes from this app's Rust build, never from here.
+ */
+export function fixtureAgentRegistry(): NewAgentOption[] {
+  return [
+    { id: "claude", displayName: "ClaudeCode", defaultCommand: "claude" },
+    { id: "opencode", displayName: "OpenCode", defaultCommand: "opencode" },
+    { id: "pi", displayName: "Pi", defaultCommand: "pi" },
+    { id: "codex", displayName: "Codex", defaultCommand: "codex" },
+    { id: "devin", displayName: "Devin", defaultCommand: "devin" },
+  ];
+}
+
+/**
+ * The `default_command` each fixture deck's host configures, if any. The remote
+ * deck has one and the local deck does not, so the preview shows both halves
+ * of the Command prefill order.
+ */
+export const FIXTURE_DEFAULT_COMMANDS: Readonly<Record<string, string>> = {
+  [FIXTURE_REMOTE_DAEMON_ID]: "claude",
+};
 
 function orchestrationTab(orchestrationId: string, name: string, displayTitle: string, roleName: string, roleIndex: number, isStartRole = false, cwd?: string): AgentTab {
   return { kind: "orchestration", orchestrationId, name, displayTitle, roleName, roleIndex, isStartRole, cwd };

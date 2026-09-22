@@ -408,6 +408,31 @@ describe("TauriDeckBridge", () => {
   });
 
   /**
+   * Scenario (PRD #1223 M4): the New agent dialog's two queries through the
+   * live bridge. Each reaches its own command with the deck it names; a typed
+   * path goes through exactly as given, trailing slash included, and a listing
+   * of the deck's home sends an explicit null path. The crate's answers come
+   * back untouched.
+   */
+  it("forwards the New agent queries with their deck and path verbatim", async () => {
+    const { TauriDeckBridge } = await import("./bridge");
+    const bridge = new TauriDeckBridge();
+    const listing = { kind: "listing", path: "/srv/work", displayPath: "/srv/work", entries: [], truncated: false };
+    invoke.mockResolvedValueOnce(listing);
+    invoke.mockResolvedValueOnce({ kind: "unsupported" });
+    invoke.mockResolvedValueOnce({ kind: "unsupported", desktopAgents: [] });
+
+    expect(await bridge.listDirectories("deck-00000000000b0x01", "/srv/work/")).toEqual(listing);
+    expect(await bridge.listDirectories("deck-00000000000b0x01")).toEqual({ kind: "unsupported" });
+    expect(await bridge.newAgentOptions("deck-00000000000b0x02")).toEqual({ kind: "unsupported", desktopAgents: [] });
+
+    expect(invoke).toHaveBeenNthCalledWith(1, "desktop_list_directories", { deckId: "deck-00000000000b0x01", path: "/srv/work/" });
+    expect(invoke).toHaveBeenNthCalledWith(2, "desktop_list_directories", { deckId: "deck-00000000000b0x01", path: null });
+    expect(invoke).toHaveBeenNthCalledWith(3, "desktop_new_agent_options", { deckId: "deck-00000000000b0x02" });
+    await bridge.dispose();
+  });
+
+  /**
    * Scenario: an action the crate answers with no agent id, and one where a
    * malformed value sits in that field. Neither result carries an `agentId`,
    * so a caller never reads a non-string as the agent to open.
@@ -955,6 +980,94 @@ describe("FixtureDeckBridge scenarios", () => {
 
     expect(counts(await bridge.connect())).toEqual(before);
     await bridge.dispose();
+  });
+
+  /**
+   * Scenario (PRD #1223 M4): browse the fleet preview's remote deck. Its home
+   * is its own (not the local deck's), holding a project directory and an
+   * ordinary one; a typed path with a trailing slash answers in the deck's
+   * canonical spelling, one level deeper holds a directory with no
+   * subdirectories, and the root has no parent. A relative path, a path the
+   * deck does not have, an unreachable deck and an unknown one are each
+   * refused in the wording the live app uses.
+   */
+  it("lists each fixture deck's own directory tree and refuses what the live app refuses", async () => {
+    window.history.replaceState({}, "", "/?fixture=1&state=fleet");
+    const { createDeckBridge } = await import("./bridge");
+    const { FIXTURE_DAEMON_ID, FIXTURE_REMOTE_DAEMON_ID, FIXTURE_UNREACHABLE_DAEMON_ID } = await import("../data/fixture");
+    const bridge = createDeckBridge("fixture");
+    await bridge.connect();
+
+    const home = await bridge.listDirectories(FIXTURE_REMOTE_DAEMON_ID);
+    expect(home).toMatchObject({ kind: "listing", path: "/home/build", parent: "/home", truncated: false });
+    expect(home.kind === "listing" && home.entries).toEqual([
+      { path: "/home/build/demo-project", displayName: "demo-project", isProject: true },
+      { path: "/home/build/scratch", displayName: "scratch", isProject: false },
+    ]);
+    expect(await bridge.listDirectories(FIXTURE_DAEMON_ID)).toMatchObject({ path: "/home/dev" });
+    const scratch = await bridge.listDirectories(FIXTURE_REMOTE_DAEMON_ID, "/home/build/scratch/");
+    expect(scratch).toMatchObject({ kind: "listing", path: "/home/build/scratch", parent: "/home/build" });
+    expect(await bridge.listDirectories(FIXTURE_REMOTE_DAEMON_ID, "/home/build/scratch/notes")).toMatchObject({ entries: [] });
+    const root = await bridge.listDirectories(FIXTURE_REMOTE_DAEMON_ID, "/");
+    expect(root).not.toHaveProperty("parent");
+
+    await expect(bridge.listDirectories(FIXTURE_REMOTE_DAEMON_ID, "home/build")).rejects.toThrow("enter an absolute directory path");
+    await expect(bridge.listDirectories(FIXTURE_REMOTE_DAEMON_ID, "/home/dev")).rejects.toThrow("unresolved");
+    await expect(bridge.listDirectories(FIXTURE_UNREACHABLE_DAEMON_ID)).rejects.toThrow("not connected");
+    await expect(bridge.listDirectories("deck-ffffffffffffffff")).rejects.toThrow("that deck is not one this app is observing");
+    await bridge.dispose();
+  });
+
+  /**
+   * Scenario: the fleet preview's decks answer the options query with their
+   * own default command — the remote deck configures one, the local deck does
+   * not — and a start on the local deck with a command makes that the local
+   * deck's last command and nobody else's; a blank start does not replace it.
+   */
+  it("answers fixture options per deck and remembers each deck's last command", async () => {
+    window.history.replaceState({}, "", "/?fixture=1&state=fleet");
+    const { createDeckBridge } = await import("./bridge");
+    const { FIXTURE_DAEMON_ID, FIXTURE_REMOTE_DAEMON_ID } = await import("../data/fixture");
+    const bridge = createDeckBridge("fixture");
+    await bridge.connect();
+
+    expect(await bridge.newAgentOptions(FIXTURE_REMOTE_DAEMON_ID)).toMatchObject({ kind: "deck", defaultCommand: "claude" });
+    expect(await bridge.newAgentOptions(FIXTURE_DAEMON_ID)).not.toHaveProperty("defaultCommand");
+
+    await bridge.runAction({ type: "start_agent", deckId: FIXTURE_DAEMON_ID, command: "codex --model gpt-5.6-sol", cwd: "/home/dev/scratch" });
+    await bridge.runAction({ type: "start_agent", deckId: FIXTURE_DAEMON_ID, cwd: "/home/dev/scratch" });
+
+    expect(await bridge.newAgentOptions(FIXTURE_DAEMON_ID)).toMatchObject({ lastCommand: "codex --model gpt-5.6-sol" });
+    expect(await bridge.newAgentOptions(FIXTURE_REMOTE_DAEMON_ID)).not.toHaveProperty("lastCommand");
+    await bridge.dispose();
+  });
+
+  /**
+   * Scenario: `?older=` plays a named fixture deck as one from before PRD
+   * #1223. That deck answers both queries "unsupported" — the options with a
+   * registry to fall back on — while the deck beside it answers as before;
+   * `?older=1` plays every deck that way.
+   */
+  it("plays the decks ?older= names as decks without the new queries", async () => {
+    const { FIXTURE_DAEMON_ID, FIXTURE_REMOTE_DAEMON_ID } = await import("../data/fixture");
+    window.history.replaceState({}, "", `/?fixture=1&state=fleet&older=${encodeURIComponent(FIXTURE_REMOTE_DAEMON_ID)}`);
+    const { createDeckBridge } = await import("./bridge");
+    const bridge = createDeckBridge("fixture");
+    await bridge.connect();
+
+    expect(await bridge.listDirectories(FIXTURE_REMOTE_DAEMON_ID)).toEqual({ kind: "unsupported" });
+    const older = await bridge.newAgentOptions(FIXTURE_REMOTE_DAEMON_ID);
+    expect(older.kind).toBe("unsupported");
+    expect(older.kind === "unsupported" && older.desktopAgents.map((agent) => agent.id)).toEqual(["claude", "opencode", "pi", "codex", "devin"]);
+    expect(await bridge.listDirectories(FIXTURE_DAEMON_ID)).toMatchObject({ kind: "listing" });
+    await bridge.dispose();
+
+    window.history.replaceState({}, "", "/?fixture=1&state=fleet&older=1");
+    const every = createDeckBridge("fixture");
+    await every.connect();
+    expect(await every.listDirectories(FIXTURE_DAEMON_ID)).toEqual({ kind: "unsupported" });
+    expect((await every.newAgentOptions(FIXTURE_DAEMON_ID)).kind).toBe("unsupported");
+    await every.dispose();
   });
 
   it("falls back to the four-agent scenario for an unknown ?state=", async () => {

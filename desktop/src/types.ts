@@ -252,6 +252,73 @@ export interface DaemonResolvedProject {
   configRevision?: string;
 }
 
+/**
+ * PRD #1223 M4 — one subdirectory of a deck's filesystem, as that deck listed
+ * it for the New agent dialog.
+ */
+export interface DeckDirectoryEntry {
+  /**
+   * Identity: the canonical path the DAEMON joined, byte for byte — the string
+   * entering this directory sends back. Never built here from a parent and a
+   * name: the deck's filesystem need not be this machine's.
+   */
+  path: string;
+  /** The entry's name, escaped for rendering. Display-only. */
+  displayName: string;
+  /** It holds a `.dot-agent-deck.toml` the deck's project reader would open. */
+  isProject: boolean;
+}
+
+/**
+ * One directory on a named deck (PRD #1223 M4), or the deck's answer that it
+ * has no listing verb — a deck older than the PRD, for which the dialog offers
+ * a typed path instead. `unsupported` is an outcome, not an error.
+ */
+export type DeckDirectoryListing =
+  | {
+    kind: "listing";
+    /** Identity: the deck's canonical spelling — for a typed path, what the flow carries from here on. */
+    path: string;
+    /** `path`, escaped for rendering. Never sent anywhere. */
+    displayPath: string;
+    /** The parent as the DECK computed it, which is what "up" sends. Absent at the root. */
+    parent?: string;
+    entries: DeckDirectoryEntry[];
+    /** The deck's entry cap or time budget cut the listing short. */
+    truncated: boolean;
+  }
+  | { kind: "unsupported" };
+
+/** One agent registry entry, for the New agent form's Agent picker (PRD #1223 M4). */
+export interface NewAgentOption {
+  /** The registry's stable key (`claude`, `opencode`, …). */
+  id: string;
+  /** The registry's label, escaped for rendering. */
+  displayName: string;
+  /** What choosing this agent writes into Command. */
+  defaultCommand?: string;
+}
+
+/**
+ * What the New agent form needs to know about one deck (PRD #1223 M4).
+ *
+ * `deck` is the deck's own answer. `unsupported` is a deck older than the PRD:
+ * nothing in it comes from the deck, and `desktopAgents` is the registry
+ * compiled into THIS app, which the form labels as such. `lastCommand` is the
+ * command this app last started a plain agent with on that deck, either way.
+ */
+export type NewAgentOptions =
+  | {
+    kind: "deck";
+    /** The deck host's configured `default_command` — Command's first prefill. */
+    defaultCommand?: string;
+    agents: NewAgentOption[];
+    experimental: boolean;
+    authoringKinds: string[];
+    lastCommand?: string;
+  }
+  | { kind: "unsupported"; desktopAgents: NewAgentOption[]; lastCommand?: string };
+
 export interface DeckPrompt {
   id: string;
   name: string;
@@ -944,6 +1011,20 @@ export interface DeckRuntimeState {
    * request uses.
    */
   resolveProject: (path: string) => Promise<DaemonResolvedProject>;
+  /**
+   * PRD #1223 M4 — list one directory on the deck `deckId` names: a path that
+   * deck listed, one the user typed, or its home directory when `path` is
+   * absent. Resolves `unsupported` for a deck without the verb; rejects with
+   * the deck's or the app's own refusal otherwise.
+   *
+   * **Optional, and absence is a real state**, for the voice members' reason:
+   * several render-only test runtimes have no deck to ask, and a runtime
+   * without these two offers no New agent flow rather than a dialog that
+   * cannot load.
+   */
+  listDirectories?: (deckId: string, path?: string) => Promise<DeckDirectoryListing>;
+  /** PRD #1223 M4 — what the New agent form needs to know about the deck `deckId` names. */
+  newAgentOptions?: (deckId: string) => Promise<NewAgentOptions>;
   /** The desktop app's own settings, and where they live (PRD #803). */
   getSettings: () => Promise<import("./lib/bridge").DesktopSettingsSnapshotDto>;
   /** Persist the whole document; resolves to what was written. */
