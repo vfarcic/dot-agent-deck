@@ -3612,6 +3612,15 @@ async fn handle_connection(
             // everything from the authorisation above through `unregister_pane`
             // and `finish_pane_close` is the pane-scoped cleanup the hold exists
             // to keep valid. Every `?` above releases it too, via `Drop`.
+            //
+            // Issue #1218: that puts the release AFTER the reply, and the order
+            // is incidental, not a promise. The reply says the agent is stopped,
+            // not that its pane id is free for a new spawn; a caller reusing the
+            // pane waits on `pane_close_in_flight`. Releasing before the reply
+            // would be just as sound — the cleanup is complete by then — but no
+            // in-tree client reuses a pane id after a stop (the TUI and the
+            // desktop both mint fresh ones), and one that relied on the stronger
+            // order would still race older daemons.
             drop(pane_cleanup_hold);
         }
         AttachRequest::SetAgentLabel {
