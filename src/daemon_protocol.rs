@@ -479,6 +479,24 @@ pub const CAP_STOP_DAEMON: &str = "stop-daemon";
 /// Unix-only carve-out of [`CAP_PREPARE_WORKFLOW`].
 pub const CAP_FOCUS_GAINED: &str = "focus-gained";
 
+/// Capability string for [`AttachRequest::ListDirectories`] (PRD #1223 M1).
+///
+/// Same convention as the PRD #819 verbs: the string is the variant's `op`, and
+/// a client sends `list-directories` only to a daemon whose `Hello` reply names
+/// it — [`crate::daemon_client::DaemonClient::list_directories`] holds that
+/// check, so no call site repeats it. Advertised on every platform: the arm is
+/// not `#[cfg]`-gated and the listing reads a directory without writing
+/// anything, so nothing here parallels the Unix-only carve-out of
+/// [`CAP_PREPARE_WORKFLOW`].
+pub const CAP_LIST_DIRECTORIES: &str = "list-directories";
+
+/// Capability string for [`AttachRequest::NewAgentOptions`] (PRD #1223 M2).
+///
+/// Held by [`crate::daemon_client::DaemonClient::new_agent_options`] the same
+/// way [`CAP_LIST_DIRECTORIES`] is held by its method, and advertised on every
+/// platform for the same reason.
+pub const CAP_NEW_AGENT_OPTIONS: &str = "new-agent-options";
+
 /// The longest [`AttachRequest::FocusGained::client_id`] (and
 /// [`AttachRequest::AttachStream::client_id`]) this daemon accepts, in bytes.
 ///
@@ -544,7 +562,9 @@ fn invalid_client_id_message() -> String {
 /// [`CAP_STOP_DAEMON`] and [`CAP_FOCUS_GAINED`] are on both lists: neither is a
 /// project verb, and neither [`AttachRequest::StopDaemon`]'s dispatch arm nor
 /// [`AttachRequest::FocusGained`]'s is `#[cfg]`-gated, so both are answered on
-/// every platform this builds for.
+/// every platform this builds for. PRD #1223's [`CAP_LIST_DIRECTORIES`] and
+/// [`CAP_NEW_AGENT_OPTIONS`] are on both lists for the same reason: neither
+/// dispatch arm is `#[cfg]`-gated.
 #[cfg(unix)]
 pub const DAEMON_CAPABILITIES: &[&str] = &[
     CAP_LIST_PROJECTS,
@@ -553,6 +573,8 @@ pub const DAEMON_CAPABILITIES: &[&str] = &[
     CAP_START_PREPARED_AGENT,
     CAP_STOP_DAEMON,
     CAP_FOCUS_GAINED,
+    CAP_LIST_DIRECTORIES,
+    CAP_NEW_AGENT_OPTIONS,
 ];
 #[cfg(not(unix))]
 pub const DAEMON_CAPABILITIES: &[&str] = &[
@@ -560,6 +582,8 @@ pub const DAEMON_CAPABILITIES: &[&str] = &[
     CAP_RESOLVE_PROJECT,
     CAP_STOP_DAEMON,
     CAP_FOCUS_GAINED,
+    CAP_LIST_DIRECTORIES,
+    CAP_NEW_AGENT_OPTIONS,
 ];
 
 // ---------------------------------------------------------------------------
@@ -1323,15 +1347,26 @@ pub enum AttachRequest {
     ///
     /// One path in, resolved. No directory walk, no children, no parents, and
     /// no implicit widening — resolving `/a/b` does not make `/a` or `/a/b/c`
-    /// known. This is the primitive the desktop lacks, and it is deliberately
+    /// known. This is the primitive the desktop lacked, and it is deliberately
     /// narrower than a filesystem API: PRD #76's rejected Phase 6 was
     /// `ListDir` / `ReadFile` / `Stat` and this is not that.
     ///
+    /// **Browsing is a separate verb now, and this one stays resolve-only.**
+    /// PRD #1223 added [`AttachRequest::ListDirectories`] for the desktop's
+    /// new-agent directory step: one level of subdirectory names per request,
+    /// capped, time-bounded, hidden and symlinked entries left out, and each
+    /// entry marked with whether it holds a project config. It reads no file
+    /// content and reports no metadata beyond that, so it is not Phase 6's
+    /// `ReadFile` / `Stat` either. `docs/develop/directory-listing-verb.md`
+    /// records why a bounded listing was added after this verb deliberately
+    /// was not one.
+    ///
     /// It is **API minimisation, not authorization.** Any peer that reaches
     /// this socket already has the daemon user's local-exec authority via
-    /// [`AttachRequest::StartAgent`] — see its trust-boundary note. Withholding
-    /// a browse verb limits the blast radius of a compromised or buggy UI and
-    /// keeps least privilege available later; it is not a privilege boundary.
+    /// [`AttachRequest::StartAgent`] — see its trust-boundary note. Keeping
+    /// this verb resolve-only and the listing verb bounded limits the blast
+    /// radius of a compromised or buggy UI and keeps least privilege available
+    /// later; neither is a privilege boundary.
     ///
     /// The reply rides back on [`AttachResponse::project`].
     ResolveProject {
@@ -1540,6 +1575,50 @@ pub enum AttachRequest {
         #[serde(default)]
         force: bool,
     },
+    /// PRD #1223 M1: list one directory's immediate, visible subdirectories.
+    /// **Read-only.** The reply rides back on [`AttachResponse::directories`].
+    ///
+    /// The backing for the desktop's new-agent directory step, which cannot
+    /// browse the deck's filesystem any other way — on a remote deck its own
+    /// filesystem is not the one the agent will run in. The bounds are
+    /// [`crate::directory_listing`]'s: one level, directories only, hidden and
+    /// symlinked entries left out, canonical absolute paths both ways, and a
+    /// result cap and a time budget that set `truncated` instead of failing.
+    ///
+    /// **Withheld unless the daemon advertises [`CAP_LIST_DIRECTORIES`]**, which
+    /// is why this variant contributes no [`PROTOCOL_VERSION`] bump: an older
+    /// daemon is never sent it, and one that is sent it anyway answers with the
+    /// generic `malformed request: …` refusal and lists nothing.
+    ///
+    /// It adds **no authority** to this wire. A peer that can send it can
+    /// already send [`Self::StartAgent`] with an arbitrary command and working
+    /// directory as the daemon's user, and read the output. The argument, and
+    /// the condition under which it stops holding (PRD #741 admitting a peer
+    /// with less than full account authority), are in
+    /// `docs/develop/directory-listing-verb.md`.
+    ListDirectories {
+        /// An absolute path to list — one this daemon returned, or one a user
+        /// typed; never one a client joined from a listed parent and a name.
+        /// Absent lists the daemon user's home directory. A relative path is
+        /// refused with [`PROJECT_ERR_INVALID_PATH`] before any filesystem
+        /// access.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        path: Option<String>,
+    },
+    /// PRD #1223 M2: what a new-agent form needs to know about this deck — its
+    /// configured default command, the agent registry it was built with, its
+    /// experimental-flag state and the authoring kinds it can compose.
+    /// **Read-only.** The reply rides back on
+    /// [`AttachResponse::new_agent_options`]; the shape is
+    /// [`crate::new_agent_options::NewAgentOptions`].
+    ///
+    /// A struct variant with no fields rather than a unit variant, for the
+    /// reason [`Self::ListProjects`] gives: a unit variant cannot later gain a
+    /// `#[serde(default)]` field without moving the wire shape.
+    ///
+    /// **Withheld unless the daemon advertises [`CAP_NEW_AGENT_OPTIONS`]**, on
+    /// the same no-bump basis as [`Self::ListDirectories`].
+    NewAgentOptions {},
 }
 
 fn default_rows() -> u16 {
@@ -1978,6 +2057,17 @@ pub struct AttachResponse {
     /// reason would look like.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stop_refusal: Option<StopDaemonRefusal>,
+    /// PRD #1223 M1: the answer to [`AttachRequest::ListDirectories`]. `None` on
+    /// every other response, and on a refusal. Additive + optional, and the
+    /// request it answers is capability-gated, so neither moves
+    /// [`PROTOCOL_VERSION`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub directories: Option<crate::directory_listing::DirectoryListing>,
+    /// PRD #1223 M2: the answer to [`AttachRequest::NewAgentOptions`]. `None` on
+    /// every other response. Additive + optional on the same basis as
+    /// [`Self::directories`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub new_agent_options: Option<crate::new_agent_options::NewAgentOptions>,
 }
 
 impl AttachResponse {
@@ -4149,6 +4239,56 @@ async fn handle_connection(
                 ),
             )
             .await?
+        }
+        // PRD #1223 M1. One level of one directory, under
+        // `crate::directory_listing`'s bounds. The filesystem work runs under the
+        // project verbs' blocking-thread bound rather than a pool of its own: it
+        // is the same class of work — a caller-selected path, read on the
+        // daemon's filesystem — and one daemon-wide bound is what keeps the sum
+        // of both from occupying more than a small slice of tokio's blocking
+        // pool.
+        AttachRequest::ListDirectories { path } => {
+            let resp = match crate::project_resolve::run_bounded(move || {
+                crate::directory_listing::list_directories(path.as_deref())
+            })
+            .await
+            {
+                Ok(Ok(listing)) => {
+                    let mut resp = AttachResponse::ok();
+                    resp.directories = Some(listing);
+                    resp
+                }
+                Ok(Err(refusal)) => AttachResponse::err(refusal),
+                Err(e) => {
+                    warn!(reason = %e, "list-directories could not complete");
+                    AttachResponse::err(format!(
+                        "{PROJECT_ERR_UNRESOLVED}: {}",
+                        crate::project_resolve::ProjectResolveError::Internal.detail()
+                    ))
+                }
+            };
+            write_resp(&mut stream, &resp).await?
+        }
+        // PRD #1223 M2. Read per request: the config file is on this host, the
+        // registry is this build's, and the flag is this process's. The config
+        // read is blocking file I/O, so it runs on a blocking thread.
+        AttachRequest::NewAgentOptions {} => {
+            let resp = match tokio::task::spawn_blocking(crate::new_agent_options::for_this_daemon)
+                .await
+            {
+                Ok(options) => {
+                    let mut resp = AttachResponse::ok();
+                    resp.new_agent_options = Some(options);
+                    resp
+                }
+                Err(e) => {
+                    warn!(reason = %e, "new-agent-options could not complete");
+                    AttachResponse::err(
+                        "new-agent-options: the daemon could not complete the request",
+                    )
+                }
+            };
+            write_resp(&mut stream, &resp).await?
         }
     }
     Ok(())
@@ -7650,5 +7790,81 @@ mod tests {
         let resp: AttachResponse = serde_json::from_str(json).unwrap();
         assert!(resp.ok);
         assert!(resp.server_version.is_none());
+    }
+
+    /// PRD #1223 — both new-agent queries are advertised on every platform, and
+    /// each capability string is its variant's `op`, per PRD #819's convention:
+    /// two spellings could drift, and a client would then withhold a verb the
+    /// daemon answers.
+    #[test]
+    fn new_agent_queries_are_advertised_under_their_op_names() {
+        for capability in [CAP_LIST_DIRECTORIES, CAP_NEW_AGENT_OPTIONS] {
+            assert!(
+                DAEMON_CAPABILITIES.contains(&capability),
+                "`{capability}` must be in this platform's advertised set"
+            );
+        }
+        assert_eq!(CAP_LIST_DIRECTORIES, "list-directories");
+        assert_eq!(CAP_NEW_AGENT_OPTIONS, "new-agent-options");
+        assert_eq!(
+            serde_json::to_value(AttachRequest::ListDirectories { path: None }).unwrap()["op"],
+            CAP_LIST_DIRECTORIES
+        );
+        assert_eq!(
+            serde_json::to_value(AttachRequest::NewAgentOptions {}).unwrap()["op"],
+            CAP_NEW_AGENT_OPTIONS
+        );
+    }
+
+    /// PRD #1223 — the request shapes: an absent `path` is omitted rather than
+    /// sent as `null`, a present one round-trips, and both verbs decode from the
+    /// bare `{"op": …}` a client with nothing to add sends.
+    #[test]
+    fn new_agent_query_requests_round_trip() {
+        assert_eq!(
+            serde_json::to_value(AttachRequest::ListDirectories { path: None }).unwrap(),
+            serde_json::json!({"op": "list-directories"})
+        );
+        assert_eq!(
+            serde_json::to_value(AttachRequest::ListDirectories {
+                path: Some("/srv/work".into()),
+            })
+            .unwrap(),
+            serde_json::json!({"op": "list-directories", "path": "/srv/work"})
+        );
+        assert_eq!(
+            serde_json::to_value(AttachRequest::NewAgentOptions {}).unwrap(),
+            serde_json::json!({"op": "new-agent-options"})
+        );
+
+        let decoded: AttachRequest =
+            serde_json::from_str(r#"{"op":"list-directories"}"#).expect("absent path decodes");
+        assert!(matches!(
+            decoded,
+            AttachRequest::ListDirectories { path: None }
+        ));
+        let decoded: AttachRequest =
+            serde_json::from_str(r#"{"op":"list-directories","path":"/srv/work"}"#)
+                .expect("a path decodes");
+        assert!(
+            matches!(decoded, AttachRequest::ListDirectories { path: Some(p) } if p == "/srv/work")
+        );
+        let decoded: AttachRequest =
+            serde_json::from_str(r#"{"op":"new-agent-options"}"#).expect("the query decodes");
+        assert!(matches!(decoded, AttachRequest::NewAgentOptions {}));
+    }
+
+    /// PRD #1223 — the two reply fields are additive: omitted from every other
+    /// response, so an older client reading this build's replies sees exactly
+    /// the keys it saw before, and absent-tolerant on decode.
+    #[test]
+    fn new_agent_query_reply_fields_are_omitted_when_unset() {
+        let plain = serde_json::to_value(AttachResponse::ok()).unwrap();
+        assert!(plain.get("directories").is_none());
+        assert!(plain.get("new_agent_options").is_none());
+
+        let decoded: AttachResponse = serde_json::from_str(r#"{"ok":true}"#).unwrap();
+        assert!(decoded.directories.is_none());
+        assert!(decoded.new_agent_options.is_none());
     }
 }

@@ -18,6 +18,9 @@ pub mod daemon_protocol;
 pub mod daemon_status;
 pub mod daemon_stop;
 pub mod devin_hooks_manage;
+// PRD #1223 M1: the daemon's one-level, bounded directory listing that backs
+// the desktop's new-agent directory step.
+pub mod directory_listing;
 pub mod dispatch;
 pub mod dispatch_return;
 pub mod embedded_pane;
@@ -47,6 +50,8 @@ pub mod lifetime_tag;
 pub mod logging;
 pub mod login_shell;
 pub mod mode_manager;
+// PRD #1223 M2: what the daemon reports about itself to a new-agent form.
+pub mod new_agent_options;
 pub mod opencode_manage;
 pub mod orchestrator_context;
 pub mod orchestrator_ext;

@@ -1156,6 +1156,25 @@ pub enum FocusReport {
     Superseded,
 }
 
+/// PRD #1223 — the answer to a query this client sends only to a daemon that
+/// advertises it: [`DaemonClient::list_directories`] and
+/// [`DaemonClient::new_agent_options`].
+///
+/// `Unsupported` is an **outcome, not an error**, for the reason
+/// [`FocusReport::Withheld`] is one: against an older deck the right behaviour
+/// is to degrade — the desktop offers only the typed-path field when there is
+/// no listing verb, and falls back to its own compiled registry when there is no
+/// options query — and a caller should not have to tell that apart from a
+/// failure by reading an error string.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GatedQuery<T> {
+    /// The daemon advertises the verb, was sent the request, and answered it.
+    Answered(T),
+    /// The daemon does not advertise the verb — including a daemon that
+    /// advertises no capabilities at all — so the request was never sent.
+    Unsupported,
+}
+
 /// PRD #1105 — a fresh client identity for [`DaemonClient::with_client_id`]:
 /// `c-` followed by 32 lowercase hex digits.
 ///
@@ -2038,6 +2057,85 @@ impl DaemonClient {
             ));
         }
         Ok(FocusReport::Recorded)
+    }
+
+    /// PRD #1223 M1 — list one directory's immediate, visible subdirectories on
+    /// the daemon's filesystem. **Read-only.**
+    ///
+    /// **Withholds unless the daemon advertises
+    /// [`crate::daemon_protocol::CAP_LIST_DIRECTORIES`]**, answering
+    /// [`GatedQuery::Unsupported`] without sending the request, so no call site
+    /// needs a capability check of its own. The capability comes from
+    /// [`Self::capabilities`], which costs one `Hello` per endpoint until that
+    /// cache is invalidated.
+    ///
+    /// `path` must be one this daemon returned — a listing's `path`, `parent`
+    /// or an entry's `path` — or one the user typed. `None` lists the daemon
+    /// user's home directory. Never join a listed parent and a name on the
+    /// client: the daemon's filesystem need not be this one.
+    ///
+    /// A refusal (a relative, missing or non-directory path) is
+    /// [`ClientError::Server`] carrying the daemon's generic sentence.
+    pub async fn list_directories(
+        &self,
+        path: Option<&str>,
+    ) -> Result<GatedQuery<crate::directory_listing::DirectoryListing>, ClientError> {
+        if !self
+            .capabilities()
+            .await?
+            .supports(crate::daemon_protocol::CAP_LIST_DIRECTORIES)
+        {
+            return Ok(GatedQuery::Unsupported);
+        }
+        let (mut rd, mut wr) = self.connect().await?;
+        let resp = issue_command(
+            &mut rd,
+            &mut wr,
+            &AttachRequest::ListDirectories {
+                path: path.map(str::to_string),
+            },
+        )
+        .await?;
+        if !resp.ok {
+            return Err(ClientError::Server(
+                resp.error
+                    .unwrap_or_else(|| "list-directories failed".into()),
+            ));
+        }
+        resp.directories
+            .map(GatedQuery::Answered)
+            .ok_or_else(|| ClientError::Malformed("list-directories ok but no listing".into()))
+    }
+
+    /// PRD #1223 M2 — what a new-agent form needs to know about this deck: its
+    /// configured default command, its agent registry, its experimental flag and
+    /// the authoring kinds it can compose. **Read-only.**
+    ///
+    /// **Withholds unless the daemon advertises
+    /// [`crate::daemon_protocol::CAP_NEW_AGENT_OPTIONS`]**, answering
+    /// [`GatedQuery::Unsupported`] without sending the request — the same
+    /// arrangement as [`Self::list_directories`].
+    pub async fn new_agent_options(
+        &self,
+    ) -> Result<GatedQuery<crate::new_agent_options::NewAgentOptions>, ClientError> {
+        if !self
+            .capabilities()
+            .await?
+            .supports(crate::daemon_protocol::CAP_NEW_AGENT_OPTIONS)
+        {
+            return Ok(GatedQuery::Unsupported);
+        }
+        let (mut rd, mut wr) = self.connect().await?;
+        let resp = issue_command(&mut rd, &mut wr, &AttachRequest::NewAgentOptions {}).await?;
+        if !resp.ok {
+            return Err(ClientError::Server(
+                resp.error
+                    .unwrap_or_else(|| "new-agent-options failed".into()),
+            ));
+        }
+        resp.new_agent_options
+            .map(GatedQuery::Answered)
+            .ok_or_else(|| ClientError::Malformed("new-agent-options ok but no options".into()))
     }
 
     /// Update the daemon-side display_name and/or cwd for an agent (M2.11).
@@ -3478,6 +3576,164 @@ mod tests {
         drop(client);
         server.await.unwrap();
         drop(dir);
+    }
+
+    /// PRD #1223 — both new-agent queries withhold against the two older daemons
+    /// a desktop will meet: one that advertises no capabilities at all (pre-PRD
+    /// #819), and one that advertises every verb up to `focus-gained` but neither
+    /// of these. Neither is sent either request, and neither answer is an error.
+    #[cfg(unix)]
+    #[test]
+    fn new_agent_queries_are_withheld_by_a_daemon_that_does_not_advertise_them() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("build older-daemon runtime");
+        runtime.block_on(async {
+            new_agent_queries_are_withheld_inner(None).await;
+            new_agent_queries_are_withheld_inner(Some(&[
+                CAP_LIST_PROJECTS,
+                CAP_RESOLVE_PROJECT,
+                CAP_PREPARE_WORKFLOW,
+                crate::daemon_protocol::CAP_START_PREPARED_AGENT,
+                crate::daemon_protocol::CAP_STOP_DAEMON,
+                crate::daemon_protocol::CAP_FOCUS_GAINED,
+            ]))
+            .await;
+        });
+    }
+
+    #[cfg(unix)]
+    async fn new_agent_queries_are_withheld_inner(advertised: Option<&'static [&'static str]>) {
+        let (dir, path, listener) = {
+            let _g = BIND_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("older-daemon.sock");
+            let listener = bind_attach_listener(&path).expect("bind older daemon");
+            (dir, path, listener)
+        };
+        let other_requests = Arc::new(AtomicUsize::new(0));
+        let server_other_requests = other_requests.clone();
+        let server = tokio::spawn(async move {
+            while let Ok(Ok(mut stream)) =
+                tokio::time::timeout(std::time::Duration::from_millis(500), listener.accept()).await
+            {
+                let Some((KIND_REQ, payload)) = read_frame(&mut stream)
+                    .await
+                    .expect("read older-daemon request frame")
+                else {
+                    continue;
+                };
+                let request: serde_json::Value =
+                    serde_json::from_slice(&payload).expect("decode older-daemon request");
+                let response = if request.get("op").and_then(|op| op.as_str()) == Some("hello") {
+                    AttachResponse {
+                        capabilities: advertised
+                            .map(|list| list.iter().map(|cap| cap.to_string()).collect()),
+                        ..AttachResponse::hello(PROTOCOL_VERSION)
+                    }
+                } else {
+                    server_other_requests.fetch_add(1, Ordering::SeqCst);
+                    AttachResponse::err("malformed request: unknown variant")
+                };
+                crate::daemon_protocol::write_resp(&mut stream, &response)
+                    .await
+                    .expect("write older-daemon response");
+            }
+        });
+        let client = DaemonClient::new(path);
+
+        assert_eq!(
+            client
+                .list_directories(Some("/"))
+                .await
+                .expect("a withhold is not an error"),
+            GatedQuery::Unsupported,
+            "advertised {advertised:?}: no `list-directories`, no listing"
+        );
+        assert_eq!(
+            client
+                .list_directories(None)
+                .await
+                .expect("a withhold is not an error"),
+            GatedQuery::Unsupported,
+            "advertised {advertised:?}: an absent path is withheld the same way"
+        );
+        assert_eq!(
+            client
+                .new_agent_options()
+                .await
+                .expect("a withhold is not an error"),
+            GatedQuery::Unsupported,
+            "advertised {advertised:?}: no `new-agent-options`, no options"
+        );
+        assert_eq!(
+            other_requests.load(Ordering::SeqCst),
+            0,
+            "advertised {advertised:?}: withholding means neither query reaches the socket"
+        );
+
+        drop(client);
+        server.await.unwrap();
+        drop(dir);
+    }
+
+    /// PRD #1223 — the positive half, against the real dispatch: a daemon at this
+    /// build advertises both queries, and the typed methods send them and decode
+    /// the answers. Without it, methods that withheld unconditionally would pass
+    /// the test above.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn new_agent_queries_are_answered_by_a_daemon_that_advertises_them() {
+        let (_dir, path, _registry) = spawn_test_server().await;
+        let client = DaemonClient::new(path);
+
+        let scratch = crate::test_temp::tempdir().expect("scratch dir");
+        let root = std::fs::canonicalize(scratch.path()).expect("canonical scratch root");
+        std::fs::create_dir(root.join("alpha")).expect("create a child");
+        let root_wire = root.to_str().expect("scratch paths are UTF-8");
+
+        let GatedQuery::Answered(listing) = client
+            .list_directories(Some(root_wire))
+            .await
+            .expect("an advertised listing is answered")
+        else {
+            panic!("a daemon at this build advertises `list-directories`");
+        };
+        assert_eq!(listing.path, root_wire);
+        assert_eq!(
+            listing
+                .entries
+                .iter()
+                .map(|e| e.path.as_str())
+                .collect::<Vec<_>>(),
+            vec![root.join("alpha").to_str().unwrap()]
+        );
+
+        let refusal = client
+            .list_directories(Some("relative/path"))
+            .await
+            .expect_err("a relative path is the daemon's refusal, not a withhold");
+        assert!(
+            matches!(&refusal, ClientError::Server(message)
+                if message.starts_with(crate::daemon_protocol::PROJECT_ERR_INVALID_PATH)),
+            "{refusal:?}"
+        );
+
+        let GatedQuery::Answered(options) = client
+            .new_agent_options()
+            .await
+            .expect("advertised options are answered")
+        else {
+            panic!("a daemon at this build advertises `new-agent-options`");
+        };
+        // `default_command` and `experimental` are read from this process's
+        // config file and process-global flag, which other tests may move, so
+        // only the build-derived halves are pinned here; the e2e
+        // `newagent/options/001` pins the other two against a daemon it owns.
+        assert_eq!(options.agents, crate::new_agent_options::registry_agents());
+        assert!(options.authoring_kinds.is_empty());
     }
 
     #[cfg(unix)]

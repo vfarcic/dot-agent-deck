@@ -205,6 +205,16 @@ pub const MAX_ENUMERATION_CANDIDATES: usize = 32;
 /// duration, and no such claim is made: a `stat` on an unresponsive network
 /// mount takes as long as it takes, which is the availability limit this bound
 /// contains rather than removes.
+///
+/// PRD #1223 added a caller outside this module: the daemon's
+/// `list-directories` arm runs [`crate::directory_listing::list_directories`]
+/// under the same bound, because it is the same class of work — a
+/// caller-selected path read on the daemon's filesystem. Its reply is capped at
+/// [`crate::directory_listing::MAX_DIRECTORY_ENTRIES`] entries, and its scan —
+/// which continues past that cap — stops at
+/// [`crate::directory_listing::DIRECTORY_LISTING_BUDGET`], checked between system
+/// calls rather than during one, so the no-bounded-duration caveat above applies
+/// to it too.
 pub const MAX_CONCURRENT_PROJECT_READS: usize = 4;
 
 // ---------------------------------------------------------------------------
