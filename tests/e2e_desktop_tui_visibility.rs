@@ -323,11 +323,9 @@ fn visibility_002_desktop_prepared_orchestration_rebuilds_its_tab_with_every_rol
 }
 
 /// Scenario: Keep a real TUI attached to an empty daemon, then launch the
-/// desktop's empty-task prepared orchestration. Inject one ordinary
-/// `SessionStart` per registered role so all three role agents are visibly
-/// present without relying on the stand-ins to emit hooks; the TUI must group
-/// those roles into the same separate, titled orchestration tab that its own
-/// launch control creates, without a reconnect or user interaction.
+/// desktop's empty-task prepared orchestration. The titled tab must appear
+/// without a reconnect, and switching into it must show all three role-named
+/// cards with their declared agent types.
 #[spec("newagent/visibility/002")]
 #[test]
 fn visibility_002_desktop_prepared_orchestration_surfaces_into_attached_tui_as_own_tab() {
@@ -352,50 +350,26 @@ fn visibility_002_desktop_prepared_orchestration_surfaces_into_attached_tui_as_o
     start_orchestration_from_desktop(&daemon, &project_path);
     let records = daemon.wait_for_agent_count(ORCHESTRATION_ROLES.len(), Duration::from_secs(10));
 
-    // A real agent's hook can surface a flat card, but it carries no structural
-    // tab membership. Inject all three so a missing tab cannot be mistaken for
-    // the hookless stand-ins merely not announcing themselves.
-    for (index, record) in records.iter().enumerate() {
-        let pane_id = record
-            .pane_id_env
-            .as_deref()
-            .unwrap_or_else(|| panic!("role record must carry its desktop pane id: {record:?}"));
-        let event = serde_json::json!({
-            "session_id": format!("desktop-visibility-session-{index}"),
-            "agent_type": record.agent_type.clone().unwrap_or(AgentType::None),
-            "event_type": "session_start",
-            "timestamp": "2026-09-22T12:00:00Z",
-            "pane_id": pane_id,
-            "agent_id": record.id,
-        });
-        common::write_hook_line(&daemon.hook_socket, &event.to_string())
-            .expect("inject the role's SessionStart through the real hook socket");
-    }
-    assert!(
-        common::wait_until(Duration::from_secs(10), || {
-            let grid = deck.snapshot_grid();
-            grid.contains("3 session(s)")
-                && grid.contains("ClaudeCode")
-                && grid.contains("OpenCode")
-                && grid.contains("Pi")
-        }),
-        "precondition: all three desktop-started agents must produce visible cards after their \
-         ordinary SessionStart hooks, distinguished by ClaudeCode/OpenCode/Pi. \
-         Records: {records:#?}\nGrid:\n{}",
-        deck.snapshot_grid()
-    );
+    deck.wait_until_grid("desktop-started orchestration tab appears", |grid| {
+        grid.lines()
+            .next()
+            .is_some_and(|tabs| tabs.contains("Dashboard") && tabs.contains(ORCHESTRATION_TITLE))
+    });
+    deck.send_bytes(b"\x1b[C"); // Right -> next tab -> Desktop prepared run
 
     assert!(
         common::wait_until(Duration::from_secs(10), || {
-            deck.snapshot_grid().lines().next().is_some_and(|tabs| {
+            let grid = deck.snapshot_grid();
+            grid.lines().next().is_some_and(|tabs| {
                 tabs.contains("Dashboard") && tabs.contains(ORCHESTRATION_TITLE)
-            })
+            }) && grid.contains("3 session(s)")
+                && grid.contains("ClaudeCode · coordinator")
+                && grid.contains("OpenCode · builder")
+                && grid.contains("Pi · reviewer")
         }),
-        "all desktop-started roles are visible, but the already-attached TUI never grouped them \
-         into their own tab titled {ORCHESTRATION_TITLE:?}. Missing roles: {:?}.\n\
-         Role distinctions (start flag, agent type and every membership field): {records:#?}\n\
-         Final grid:\n{}",
-        missing_roles(&deck.snapshot_grid()),
+        "the already-attached TUI created tab {ORCHESTRATION_TITLE:?}, but switching into it \
+         did not show exactly three sessions with the role-named ClaudeCode coordinator, \
+         OpenCode builder, and Pi reviewer cards. Role metadata: {records:#?}\nFinal grid:\n{}",
         deck.snapshot_grid()
     );
 }
