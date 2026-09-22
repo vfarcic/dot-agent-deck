@@ -2446,25 +2446,40 @@ mod tests {
         );
     }
 
-    /// Scenario: A stub daemon accepts the connection and then never reads a
-    /// byte, while the client sends a request line several times larger than
-    /// any default Unix-socket buffer under a 300ms deadline. The kernel
-    /// takes the prefix that fits and the rest of the write times out, so
-    /// part of the line is already in the daemon's buffer when the write
-    /// fails. That must classify as `SocketReply::NoReply` — possibly sent,
-    /// unconfirmed — and not as `SocketReply::Unreachable`, whose doc
-    /// promises a caller that nothing left the process and a retry cannot
-    /// duplicate anything.
+    /// Scenario: A stub daemon accepts the connection, shrinks its own
+    /// receive buffer to a few KiB, and then never reads a byte, while the
+    /// client sends a multi-megabyte request line under a 300ms deadline.
+    /// The kernel takes the prefix that fits in the shrunk buffer and the
+    /// rest of the write times out, so part of the line is already in the
+    /// daemon's buffer when the write fails. That must classify as
+    /// `SocketReply::NoReply` — possibly sent, unconfirmed — and not as
+    /// `SocketReply::Unreachable`, whose doc promises a caller that nothing
+    /// left the process and a retry cannot duplicate anything.
     #[spec("error/socket/013")]
     #[test]
     #[cfg(unix)]
     fn socket_013_a_write_that_breaks_after_bytes_left_is_no_reply_not_unreachable() {
-        /// Well above Linux's 208 KiB default `SO_SNDBUF` and well under the
-        /// daemon's own 8 MiB `MAX_HOOK_LINE_BYTES`, so the kernel does not
-        /// swallow the whole line and a real daemon would have accepted it. A
-        /// host tuned above 4 MiB fails the second assertion below rather than
-        /// passing falsely.
+        /// Comfortably larger than [`SHRUNK_RCVBUF_BYTES`] and well under the
+        /// daemon's own 8 MiB `MAX_HOOK_LINE_BYTES`, so the kernel cannot
+        /// swallow the whole line into the shrunk buffer and a real daemon
+        /// would have accepted it.
         const PAYLOAD_BYTES: usize = 4 * 1024 * 1024;
+        /// What [`SO_RCVBUF`] on the daemon's accepted stream is shrunk to —
+        /// the deterministic half of this test (PR #1232 review). Relying on
+        /// `PAYLOAD_BYTES` alone to outrun the HOST's default socket buffer
+        /// (PR #1232's prior version compared it to Linux's 208 KiB default)
+        /// made the test's pass/fail depend on kernel tuning this process
+        /// does not control: a host with `net.core.rmem_default` raised above
+        /// 4 MiB accepts the whole line inside the deadline, and the write
+        /// classifier correctly reports `Read(DeadlineExpired)` rather than a
+        /// partial write — which is not a bug, but is exactly the outcome the
+        /// assertions below reject, a false failure with nothing wrong in the
+        /// code under test. Pinning the daemon's own receive buffer removes
+        /// the host's tuning from the equation entirely: whatever this value
+        /// is set to is what Linux actually enforces (`man 7 socket`'s
+        /// documented doubling still applies, but that only widens the
+        /// margin `PAYLOAD_BYTES` has to clear, never narrows it).
+        const SHRUNK_RCVBUF_BYTES: i32 = 4096;
         /// Short enough to keep the test quick, long enough that the first
         /// write is not racing the deadline for the prefix that does fit.
         const BUDGET: std::time::Duration = std::time::Duration::from_millis(300);
@@ -2475,12 +2490,34 @@ mod tests {
             std::os::unix::net::UnixListener::bind(&socket_path).expect("bind stub daemon socket");
 
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
-        // Stub daemon: accept, then hold the connection open without reading
-        // a single byte, so the client's write fills the buffer and stalls.
+        // Stub daemon: accept, shrink the accepted stream's own receive
+        // buffer (see `SHRUNK_RCVBUF_BYTES`), then hold the connection open
+        // without reading a single byte, so the client's write fills the
+        // now-tiny buffer and stalls regardless of host socket tuning.
         // Released only after the client has returned — closing early would
         // hand the client an `EPIPE` on an empty buffer instead.
         let daemon_thread = std::thread::spawn(move || {
             if let Ok((stream, _)) = listener.accept() {
+                use std::os::unix::io::AsRawFd;
+                let fd = stream.as_raw_fd();
+                // SAFETY: `fd` is the accepted stream's own live socket, still
+                // owned by `stream` in this scope; `SO_RCVBUF` takes a plain
+                // `c_int` and this call cannot outlive the borrow above.
+                let rc = unsafe {
+                    libc::setsockopt(
+                        fd,
+                        libc::SOL_SOCKET,
+                        libc::SO_RCVBUF,
+                        std::ptr::from_ref(&SHRUNK_RCVBUF_BYTES).cast::<libc::c_void>(),
+                        std::mem::size_of::<i32>() as libc::socklen_t,
+                    )
+                };
+                assert_eq!(
+                    rc,
+                    0,
+                    "setsockopt(SO_RCVBUF) failed: {}",
+                    std::io::Error::last_os_error()
+                );
                 let _ = release_rx.recv();
                 drop(stream);
             }
@@ -2493,7 +2530,14 @@ mod tests {
         let (reply, cause) = request_from_socket_at_detailed(&socket_path, &request, Some(BUDGET));
 
         let _ = release_tx.send(());
-        let _ = daemon_thread.join();
+        // Unlike the `let _ =` this replaced, a failed `join` must surface: it
+        // is the only place a failed `setsockopt(SO_RCVBUF)` inside the thread
+        // would otherwise be seen, and swallowing it would silently put this
+        // test back to relying on host tuning — precisely what shrinking the
+        // buffer here exists to stop depending on.
+        daemon_thread
+            .join()
+            .expect("stub daemon thread panicked (see setsockopt assertion above)");
 
         assert!(
             matches!(reply, SocketReply::NoReply),
