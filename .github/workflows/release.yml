@@ -303,9 +303,18 @@ jobs:
           # RESERVE is headroom for the note `desktop-publish` appends later.
           # Without it the clamp passes and that step still fails, which is the
           # half of v0.41.1 that actually cost users something.
+          #
+          # Raised from 3000 to 3500 by issue #1152, which lengthened that note
+          # by 282 characters and left only 135 of headroom by the (deliberately
+          # overstating) measure `the_reserve_covers_the_note_desktop_publish_appends`
+          # takes. The note is prose and gets edited; a margin that thin means
+          # the next sentence added to it reopens the v0.41.1 failure. Clamping
+          # 500 characters earlier costs a release nothing -- it only bites
+          # bodies already over 121,500 characters, and then only by moving the
+          # cut one entry sooner.
           python3 - "${RUNNER_TEMP}/release-body.md" <<'CLAMP'
           import sys
-          LIMIT, RESERVE = 125000, 3000
+          LIMIT, RESERVE = 125000, 3500
           p = sys.argv[1]
           src = open(p, encoding="utf-8").read()
           if len(src) <= LIMIT - RESERVE:
@@ -612,6 +621,36 @@ jobs:
             dist/dot-agent-deck-*
             dist/checksums.txt
           fail_on_unmatched_files: true
+      # Issue #1152: hand the CLI manifest to `attest`, which has no checkout
+      # and can reach a file only as an artifact. Without this the manifest is
+      # the one CLI asset provenance never covered -- and it is the file a user
+      # leans on to validate all the others, so it is exactly the one worth
+      # swapping.
+      #
+      # THE BYTES MATTER MORE THAN THE WIRING HERE. `attest` must not re-run
+      # `shasum`: a second run in a different job would produce a file that is
+      # very probably identical and provably nothing, and an attestation over
+      # bytes the release does not carry is worse than no attestation at all.
+      # So the published file itself travels, and this step sits immediately
+      # after the release step that consumed it -- nothing between `task
+      # checksums` above and here writes to `dist/`.
+      #
+      # AFTER the release step and BEFORE the four `task` steps below, both
+      # deliberately: those write `dist/<name>.rb` and `dist/<name>.json` into
+      # the same directory, so `path:` names the single file rather than the
+      # directory, and the position keeps that true even if the glob is ever
+      # widened.
+      #
+      # The artifact NAME stays outside `dot-agent-deck-*` for the same reason
+      # `desktop-bundle`'s does: that is the pattern this job's own download
+      # selects on, so a re-run of `finalize` alone would otherwise pull the
+      # previous attempt's manifest into `dist/` and feed it straight back into
+      # `task checksums`' `shasum -a 256 dot-agent-deck-*`.
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: release-checksums
+          path: dist/checksums.txt
+          if-no-files-found: error
       # These four steps are the ones that hold the publishing tokens, so they
       # are the highest-value sink for an injected value: bind both the version
       # and the channel name through `env:` and pass each `task` variable as a
@@ -883,6 +922,22 @@ jobs:
         # `gh_calls_in_checkoutless_jobs_name_their_repository` in
         # xtask/linkage-check/src/release_workflow_wiring.rs.
         run: gh release upload "v$RELEASE_VERSION" dist-desktop/* --clobber --repo "$REPO"
+      # Issue #1152, and the mirror of the upload in `finalize`: the desktop
+      # manifest is written in THIS job, so `attest` cannot see it either. The
+      # bundles reach that job as `desktop-bundle-*` artifacts, but the manifest
+      # does not exist when those are uploaded -- it is generated here, from
+      # them -- so it needs a carrier of its own.
+      #
+      # Uploaded after the release upload above rather than after the generate
+      # step, so what travels is the file the release actually carries. Named
+      # outside `desktop-bundle-*`, the pattern the download at the top of this
+      # job selects on, so a re-run cannot feed a previous attempt's manifest
+      # back into `gh release upload dist-desktop/*`.
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: release-checksums-desktop
+          path: dist-desktop/checksums-desktop-alpha.txt
+          if-no-files-found: error
       - name: Note the unsigned alpha in the release body
         env:
           GH_TOKEN: ${{ github.token }}
@@ -908,7 +963,7 @@ jobs:
             printf "%s\n" "$MARKER"
             printf "### Desktop GUI (alpha, unsigned)\n\n"
             printf "The \`dot-agent-deck-desktop-alpha-*\` assets are an early preview of the desktop GUI. They are **unsigned**, and they are not covered by the support expectations of the CLI.\n\n"
-            printf "**Verify what you downloaded, before you do anything else with it.** Nothing about an unsigned build establishes that it is genuine, and no OS checks this on your behalf, so this is the step that tells you where the file actually came from -- and it is the prerequisite for the platform steps below rather than an alternative to them. The binaries and desktop packages on this release carry [build provenance](https://docs.github.com/en/actions/security-for-github-actions/using-artifact-attestations), which is a stronger claim than a checksum: it says this exact file was produced by this repository's release workflow, from a named commit, rather than merely that it matches a number printed on the same page that served it. A \`checksums-desktop-alpha.txt\` is published alongside the bundles if you want the checksum as well.\n\n"
+            printf "**Verify what you downloaded, before you do anything else with it.** Nothing about an unsigned build establishes that it is genuine, and no OS checks this on your behalf, so this is the step that tells you where the file actually came from -- and it is the prerequisite for the platform steps below rather than an alternative to them. Every asset this release uploads carries [build provenance](https://docs.github.com/en/actions/security-for-github-actions/using-artifact-attestations) -- the CLI binaries, the desktop packages, and both \`checksums.txt\` and \`checksums-desktop-alpha.txt\`. That is a stronger claim than a checksum: it says this exact file was produced by this repository's release workflow, from a named commit, rather than merely that it matches a number printed on the same page that served it. The manifests are covered for the same reason you would read one at all -- a list of hashes you check everything else against is the file worth swapping. GitHub's own **Source code** archives are the one exception: GitHub synthesizes those from the tag rather than this workflow uploading them.\n\n"
             printf "\`\`\`sh\ngh attestation verify <the-file-you-downloaded> --repo vfarcic/dot-agent-deck --signer-workflow vfarcic/dot-agent-deck/.github/workflows/release.yml\n\`\`\`\n\n"
             printf "If that does not report a verified attestation from this repository's release workflow, stop there: do not install the file, and do not override any warning your OS raises about it.\n\n"
             printf "**macOS** (\`.dmg\`) -- macOS quarantines an unsigned app and refuses the first launch. **Once the verification above has passed**, move the app to /Applications, then use either route to tell macOS you accept it:\n\n"
@@ -919,7 +974,16 @@ jobs:
             printf "Signing and notarization -- which is what would stop macOS warning you in the first place -- were considered and declined in https://github.com/vfarcic/dot-agent-deck/issues/757, so expect that warning on every release rather than waiting for a fix.\n"
           } | gh release edit "v$RELEASE_VERSION" --repo "$REPO" --notes-file -
 
-  # PRD #757: verifiable build provenance for every published asset.
+  # PRD #757: verifiable build provenance for the assets this workflow uploads.
+  #
+  # That heading described an intention rather than the job until issue #1152.
+  # The subject collection matched only `dot-agent-deck-*` and
+  # `dot-agent-deck-desktop-alpha-*`, so of the eight assets a full release
+  # publishes, the two checksum manifests carried nothing -- and a manifest is
+  # the file a user leans on to validate every other asset. It now covers all
+  # eight. It does NOT cover GitHub's auto-generated "Source code" archives:
+  # those are synthesized by GitHub from the tag rather than uploaded here, so
+  # no job ever holds their bytes.
   #
   # This is the free half of artifact trust, and it is the ONLY half that
   # reaches Linux. OS-level signing does nothing for the `.deb`: dpkg ships
@@ -974,15 +1038,41 @@ jobs:
           pattern: desktop-bundle-*
           path: dist-desktop
           merge-multiple: true
+      # Issue #1152: the two checksum manifests, each carried here by the job
+      # that published it rather than regenerated (see the upload steps for
+      # why). Downloaded into the same two directories as the assets they
+      # describe, which is also why neither `find` below changes: the manifests
+      # match neither `dot-agent-deck-*` nor `dot-agent-deck-desktop-alpha-*`.
+      #
+      # NOT tolerated, unlike the download above: `attest` runs only when
+      # `finalize` succeeded, and `finalize` cannot succeed without publishing
+      # `checksums.txt`. A missing artifact here means the wiring broke, and
+      # the release must say so rather than quietly attest one asset fewer.
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: release-checksums
+          path: dist
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        # Tolerated for exactly the reason the bundle download above is: this
+        # artifact exists only when `desktop-publish` ran, and a wholly failed
+        # desktop matrix is a legitimate state in which the CLI assets must
+        # still be attested.
+        continue-on-error: true
+        with:
+          name: release-checksums-desktop
+          path: dist-desktop
       - name: Collect the subjects to attest
         id: subjects
         # Built as an explicit list rather than handed to the action as a glob,
         # because a glob that matches nothing is an error there -- and
         # `dist-desktop/` legitimately holds nothing when both bundler legs
         # failed. Expanding here lets that case attest the CLI assets and move
-        # on. Filenames are `dot-agent-deck-*` and carry no spaces; the rename
-        # step in `desktop-bundle` is what guarantees that for the bundles,
-        # whose Tauri output name ("Agent Deck_<version>_amd64.deb") does.
+        # on. Every subject is either `dot-agent-deck-*` or one of the two
+        # `checksums*.txt` manifests, and none carries a space; the rename step
+        # in `desktop-bundle` is what guarantees that for the bundles, whose
+        # Tauri output name ("Agent Deck_<version>_amd64.deb") does. That
+        # matters because the action takes `subject-path` as a newline-separated
+        # list, so a space is survivable but a newline in a name would not be.
         run: |
           set -eu
           cli=$(find dist -maxdepth 1 -type f -name 'dot-agent-deck-*' | sort)
@@ -990,18 +1080,47 @@ jobs:
             echo "::error::no CLI artifacts to attest, but finalize succeeded. Something changed the artifact names or the download pattern."
             exit 1
           fi
+          # Issue #1152. Checked by exact name rather than swept up by widening
+          # the `find` above, so that "the CLI binaries arrived" and "the CLI
+          # manifest arrived" stay two answers: a manifest silently absent from
+          # a broadened glob is the failure this is guarding against.
+          if [ ! -f dist/checksums.txt ]; then
+            echo "::error::dist/checksums.txt did not arrive. finalize publishes it and uploads it as the release-checksums artifact; this job attests that published file rather than recomputing the hashes here, so there is nothing safe to attest in its place."
+            exit 1
+          fi
           desktop=$(find dist-desktop -maxdepth 1 -type f -name 'dot-agent-deck-desktop-alpha-*' 2>/dev/null | sort || true)
           if [ -z "$desktop" ]; then
             echo "::warning::no desktop bundles to attest; that platform's leg failed. Attesting the CLI assets."
           fi
+          # Absent whenever `desktop-publish` did not run, which the warning
+          # above already reports -- so its absence is only worth a line of its
+          # own when the bundles it describes DID arrive.
+          desktop_manifest=""
+          if [ -f dist-desktop/checksums-desktop-alpha.txt ]; then
+            desktop_manifest=dist-desktop/checksums-desktop-alpha.txt
+          elif [ -n "$desktop" ]; then
+            echo "::warning::desktop bundles arrived but checksums-desktop-alpha.txt did not. Attesting the bundles without their manifest."
+          fi
+          # Accumulated into ONE list that is both emitted and logged, rather
+          # than the two parallel sequences this used to carry. With four
+          # optional-ish members instead of two, a line added to the emitted
+          # list and forgotten in the log would leave the run reporting a set of
+          # subjects that is not the set attested -- and the log is the only
+          # record anybody reads afterwards. It also drops the `A && B || C`
+          # pattern shellcheck flags as not-an-if-then-else (SC2015).
+          subjects=$(printf '%s\ndist/checksums.txt' "$cli")
+          if [ -n "$desktop" ]; then
+            subjects=$(printf '%s\n%s' "$subjects" "$desktop")
+          fi
+          if [ -n "$desktop_manifest" ]; then
+            subjects=$(printf '%s\n%s' "$subjects" "$desktop_manifest")
+          fi
           {
             echo "paths<<SUBJECTS_EOF"
-            echo "$cli"
-            [ -n "$desktop" ] && echo "$desktop"
+            echo "$subjects"
             echo "SUBJECTS_EOF"
           } >> "$GITHUB_OUTPUT"
-          printf 'attesting:\n%s\n' "$cli"
-          [ -n "$desktop" ] && printf '%s\n' "$desktop" || true
+          printf 'attesting:\n%s\n' "$subjects"
       - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: ${{ steps.subjects.outputs.paths }}

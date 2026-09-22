@@ -1053,3 +1053,171 @@ fn a_body_with_no_line_breaks_is_still_clamped() {
         "the clamp returned a body no shorter than it received"
     );
 }
+
+/// The step blocks of a job, split on the `      - ` step markers.
+///
+/// Comments written *above* a step belong to the preceding step's block, since
+/// the `- ` line is what opens a new one. That is harmless for the callers
+/// below, which read only `uses:`/`name:`/`path:` code lines -- but it is worth
+/// knowing before writing a check here that greps a step for prose.
+fn steps(block: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut current: Option<Vec<String>> = None;
+    for line in block.lines() {
+        if line.starts_with("      - ") {
+            if let Some(body) = current.take() {
+                out.push(body.join("\n"));
+            }
+            current = Some(vec![line.to_string()]);
+            continue;
+        }
+        if let Some(body) = current.as_mut() {
+            body.push(line.to_string());
+        }
+    }
+    if let Some(body) = current.take() {
+        out.push(body.join("\n"));
+    }
+    out
+}
+
+/// The code lines of `step`, with trailing shell comments removed.
+fn step_code(step: &str) -> String {
+    step.lines()
+        .map(code_before_comment)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The `name:` of the `actions/upload-artifact` step in `block` whose `path:`
+/// is exactly `path`, together with whether it declares
+/// `if-no-files-found: error`.
+///
+/// Keyed on the PATH rather than on the artifact name, so the name itself stays
+/// an output of the check rather than an input to it. That is the whole point:
+/// the assertions below then compare the producer's chosen name against the
+/// consumer's, and a rename done in one place and not the other fails instead
+/// of passing twice over a hardcoded literal.
+fn uploaded_as(block: &str, path: &str) -> Option<(String, bool)> {
+    steps(block).into_iter().find_map(|step| {
+        let code = step_code(&step);
+        if !code.contains("actions/upload-artifact@") {
+            return None;
+        }
+        if !code.lines().any(|l| l.trim() == format!("path: {path}")) {
+            return None;
+        }
+        let name = code
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("name: ").map(str::to_string))?;
+        let strict = code.lines().any(|l| l.trim() == "if-no-files-found: error");
+        Some((name, strict))
+    })
+}
+
+/// Whether `block` has an `actions/download-artifact` step pulling exactly the
+/// artifact `name` (as `name:`, not as a `pattern:`).
+fn downloads_artifact(block: &str, name: &str) -> bool {
+    steps(block).iter().any(|step| {
+        let code = step_code(step);
+        code.contains("actions/download-artifact@")
+            && code.lines().any(|l| l.trim() == format!("name: {name}"))
+    })
+}
+
+/// Issue #1152: a full release publishes eight assets and the subject
+/// collection used to match six of them. The two it missed were the checksum
+/// manifests -- which is the worst pair to miss, because a manifest is a list
+/// of hashes a user leans on to validate everything else, so an unattested one
+/// is precisely the file worth swapping.
+///
+/// **Neither manifest is reachable from `attest` by default, and that is what
+/// this guards.** `checksums.txt` is written inside `finalize` and
+/// `checksums-desktop-alpha.txt` inside `desktop-publish`; `attest` has no
+/// checkout and neither generates them, so each has to travel as an artifact of
+/// its own. The obvious-looking alternative -- re-running `shasum` in `attest`
+/// -- is the one outcome that must not happen: it would mint provenance over
+/// bytes that are very probably identical to the published ones and provably
+/// nothing, and an attestation over a file that differs from the published one
+/// is worse than no attestation at all. So the absence of `shasum` from this
+/// job is asserted too.
+///
+/// Nothing else can catch a regression here. `release.yml` fires only on a tag,
+/// never on a pull request, and a dropped subject is invisible in the run: the
+/// action succeeds over whatever list it is handed. The symptom is a `404` from
+/// `gh attestation verify`, weeks later, on a release that has already shipped.
+#[test]
+fn both_checksum_manifests_are_attested_subjects() {
+    let all = jobs(&workflow());
+    let attest = job(&all, "attest");
+    // Comments stripped for both substring checks below, so a comment ABOUT the
+    // wiring cannot stand in for the wiring -- the same reason `note_step`'s
+    // callers strip them. The attest job is full of prose naming these files.
+    let attest_code = step_code(attest);
+
+    let cases = [
+        ("finalize", "dist/checksums.txt"),
+        (
+            "desktop-publish",
+            "dist-desktop/checksums-desktop-alpha.txt",
+        ),
+    ];
+
+    for (producer, path) in cases {
+        let (artifact, strict) = uploaded_as(job(&all, producer), path).unwrap_or_else(|| {
+            panic!(
+                "`{producer}` no longer uploads `{path}` as an artifact. It is written in that \
+                 job and published from there, and `attest` has no checkout -- so without this \
+                 hand-off the manifest is unreachable from the job that attests, and the only \
+                 way to attest it would be to regenerate it, which attests bytes the release \
+                 does not carry. #1152."
+            )
+        });
+
+        // The two `pattern:` downloads that already exist would sweep a
+        // carelessly named manifest artifact into a directory it must not reach:
+        // `dot-agent-deck-*` is what `finalize` selects on and feeds to
+        // `task checksums`' own `shasum -a 256 dot-agent-deck-*`, and
+        // `desktop-bundle-*` is what `desktop-publish` re-uploads wholesale with
+        // `gh release upload dist-desktop/*`.
+        for reserved in ["dot-agent-deck-", "desktop-bundle-"] {
+            assert!(
+                !artifact.starts_with(reserved),
+                "`{producer}` uploads `{path}` as artifact `{artifact}`, which matches the \
+                 `{reserved}*` download pattern already in this workflow. A re-run of that job \
+                 alone would then pull a previous attempt's manifest back into its own working \
+                 directory. Same rule as `desktop-bundle`'s artifact name."
+            );
+        }
+
+        assert!(
+            strict,
+            "`{producer}`'s upload of `{path}` does not declare `if-no-files-found: error`. \
+             Without it a missing manifest produces a warning and no artifact, and for the \
+             desktop half -- whose download in `attest` is deliberately tolerated -- that is a \
+             silently unattested asset rather than a failed release."
+        );
+
+        assert!(
+            downloads_artifact(attest, &artifact),
+            "`attest` does not download the `{artifact}` artifact that `{producer}` uploads. The \
+             producer and the consumer have to name the same artifact; renaming one alone drops \
+             `{path}` from the subject list without failing anything."
+        );
+
+        assert!(
+            attest_code.contains(path),
+            "`attest` never names `{path}`, so it is not in the subject list handed to \
+             `actions/attest-build-provenance`. Downloading the artifact is half the wiring; the \
+             collect step has to add the file to `subjects` as well. #1152."
+        );
+    }
+
+    assert!(
+        !attest_code.contains("shasum"),
+        "`attest` runs `shasum`. The manifests must travel from the jobs that published them, \
+         not be regenerated here: an attestation over a file that differs from the published one \
+         is worse than none, and a second `shasum` run in a different job is a claim about bytes \
+         nobody checked. #1152."
+    );
+}
