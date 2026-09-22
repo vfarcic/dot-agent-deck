@@ -5413,6 +5413,46 @@ agent = "opencode"
         std::fs::canonicalize(&project).expect("canonicalize the project")
     }
 
+    /// PRD #1223 audit V4: the same project with the orchestration name
+    /// declared TWICE, each declaration role-bearing and each with its own
+    /// commands. Config validation only warns about this, and
+    /// `PrepareWorkflow` takes the first declaration.
+    #[cfg(unix)]
+    fn namesake_orchestration_project(root: &std::path::Path) -> std::path::PathBuf {
+        let project = root.join("v4-project");
+        std::fs::create_dir_all(&project).expect("create the project");
+        std::fs::write(
+            project.join(".dot-agent-deck.toml"),
+            r#"
+[[orchestrations]]
+name = "m6"
+
+[[orchestrations.roles]]
+name = "planner"
+command = "sh -c 'echo first-planner >> configured.log; sleep 600'"
+start = true
+
+[[orchestrations]]
+name = "m6"
+
+[[orchestrations.roles]]
+name = "planner"
+command = "sh -c 'echo second-planner >> configured.log; sleep 600'"
+start = true
+
+[[orchestrations]]
+name = "solo"
+
+[[orchestrations.roles]]
+name = "planner"
+command = "sh -c 'echo solo-planner >> configured.log; sleep 600'"
+start = true
+"#,
+        )
+        .expect("write the project config");
+        std::fs::canonicalize(&project).expect("canonicalize the project")
+    }
+
     #[cfg(unix)]
     fn orchestration_start(
         path: &str,
@@ -5590,6 +5630,104 @@ agent = "opencode"
         assert!(
             on_local.is_empty(),
             "the local deck — the one All Decks resolves to — gains nothing: {on_local:?}"
+        );
+    }
+
+    /// Scenario (PRD #1223 audit V4): a real deck whose project declares the
+    /// orchestration name `m6` twice, each declaration with roles and its own
+    /// command. A launch naming it is refused at the action boundary with the
+    /// dialog's reason, the deck starts nothing, and — the half the dialog's
+    /// disabled chips cannot give — NO preparation runs, so no coordinator
+    /// context is published over whatever else the project holds. The uniquely
+    /// named `solo` in the same project still launches, so the check refuses
+    /// the ambiguity and not the project.
+    ///
+    /// **What it fails against.** Without the check the launch reaches
+    /// `PrepareWorkflow`, which takes the FIRST declaration: the context file
+    /// appears and `first-planner` runs under a name the user could equally
+    /// have meant for the second.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_namesake_orchestration_is_refused_before_anything_is_prepared() {
+        let _selection = crate::dto::SELECTION_LOCK.lock().await;
+        let local = RealDeck::start("v4-namesake");
+        let project = namesake_orchestration_project(&local.dir);
+        let project_wire = project.to_str().expect("a UTF-8 path").to_string();
+        let (settings, _unused_remote) = all_decks_with_one_remote_row("v4-box.example.com");
+        apply_all_decks_over(&local, &settings);
+        let state = crate::terminal::DesktopState::default();
+        let local_wire = deck_wire_id(&local.endpoint);
+
+        let offered = crate::new_agent_orchestrations_on(&state, &local_wire, &project_wire).await;
+        let refused = crate::start_orchestration_action(
+            &state,
+            &local_wire,
+            orchestration_start(&project_wire, Some("v4-project-orchestrator-1"), None),
+        )
+        .await;
+        let after_refusal = named_records(&local);
+        let context = project
+            .join(".dot-agent-deck")
+            .join("orchestrator-context.md");
+        let published_after_refusal = context.exists();
+        let solo = crate::start_orchestration_action(
+            &state,
+            &local_wire,
+            crate::StartOrchestrationRequest {
+                path: project_wire.clone(),
+                orchestration: "solo".into(),
+                display_title: Some("v4-project-orchestrator-2".into()),
+                config_revision: None,
+                rows: Some(24),
+                cols: Some(80),
+            },
+        )
+        .await;
+        // Read before the shutdown, which takes the deck's scratch tree — and
+        // the project inside it — with it.
+        let published_after_solo = context.exists();
+        local.shutdown();
+
+        match offered.expect("the deck answers the orchestrations query") {
+            crate::dto::DesktopNewAgentOrchestrations::Project(resolved) => {
+                let names: Vec<&str> = resolved
+                    .orchestrations
+                    .iter()
+                    .map(|orchestration| orchestration.name.as_str())
+                    .collect();
+                assert_eq!(
+                    names,
+                    ["m6", "m6", "solo"],
+                    "the deck lists both declarations; the desktop is what refuses the ambiguity"
+                );
+            }
+            other => panic!("the project resolves on its deck, got {other:?}"),
+        }
+        match refused {
+            Ok(started) => panic!(
+                "a namesake orchestration must not launch, yet {} started",
+                started.start_agent_id
+            ),
+            Err(error) => assert_eq!(
+                error.message(),
+                "This project defines more than one orchestration named m6; rename one to launch \
+                 it here. Nothing was started."
+            ),
+        }
+        assert!(
+            after_refusal.is_empty(),
+            "the refused launch started nothing: {after_refusal:?}"
+        );
+        assert!(
+            !published_after_refusal,
+            "the refused launch did not reach PrepareWorkflow, so it published no coordinator context"
+        );
+        let solo =
+            solo.expect("the uniquely named orchestration in the same project still launches");
+        assert_eq!(solo.agent_ids.len(), 1);
+        assert!(
+            published_after_solo,
+            "the launch that WAS prepared published its coordinator context"
         );
     }
 

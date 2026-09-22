@@ -3060,6 +3060,7 @@ async fn start_orchestration_action(
     if let Some(reason) = orchestration_launch_unavailable(&daemon).await? {
         return Err(reason.into());
     }
+    ensure_one_orchestration_of_that_name(&daemon, &path, &orchestration).await?;
     // Deliberately NOT under a client-side deadline, unlike every other call
     // this launch makes (PRD #1223 audit V1). The deck resolves, composes,
     // issues the token and publishes `orchestrator-context.md` on its blocking
@@ -3104,6 +3105,63 @@ async fn start_orchestration_action(
         agent_ids: launched.agent_ids,
         scope,
     })
+}
+
+/// The dialog's reason for a namesake orchestration, in the crate (PRD #1223
+/// audit V4) — the same sentence `ambiguousOrchestrationReason` builds in
+/// `desktop/src/lib/newAgent.ts`, plus what an action has to say that a
+/// disabled chip does not.
+fn ambiguous_orchestration_refusal(orchestration: &str) -> String {
+    format!(
+        "This project defines more than one orchestration named {}; rename one to launch it here. \
+         Nothing was started.",
+        safe_message(orchestration)
+    )
+}
+
+/// PRD #1223 audit V4: refuse a launch whose orchestration name does not name
+/// exactly ONE of the project's orchestrations on that deck.
+///
+/// `PrepareWorkflow` takes the FIRST role-bearing definition with the name
+/// (`project_resolve.rs`, the same rule the TUI's spawn uses), so launching a
+/// namesake would run the other definition's roles and commands under the name
+/// the user chose. Config validation only warns about the duplicate, and the
+/// name is all the wire carries.
+///
+/// The dialog already shows namesakes as disabled chips and never submits one
+/// (audit F2), but that is presentation: this is the boundary every caller
+/// crosses — the main webview's own action, a frontend regression, a fixture
+/// caller — so the invariant is checked where the launch is decided.
+///
+/// **Desktop-side only, deliberately.** Changing `PrepareWorkflow`'s
+/// first-match rule would change an existing verb that older desktops and the
+/// TUI already call, which is not this PR's to do; see issue #1233.
+///
+/// A name the project does not define at all is refused in the deck's own
+/// words, so the webview sees exactly the sentence `PrepareWorkflow` would have
+/// answered with. The roleless entries the daemon's lookup skips are not in
+/// this listing either — the resolve projection drops them — so the two count
+/// the same definitions.
+async fn ensure_one_orchestration_of_that_name(
+    daemon: &crate::daemon_bridge::TrustedDaemon,
+    path: &str,
+    orchestration: &str,
+) -> Result<(), DesktopActionError> {
+    let project = daemon
+        .client
+        .resolve_project(path)
+        .await
+        .map_err(|error| safe_message(error.to_string()))?;
+    let defined = project
+        .orchestrations
+        .iter()
+        .filter(|candidate| candidate.name == orchestration)
+        .count();
+    match defined {
+        1 => Ok(()),
+        0 => Err(dot_agent_deck::project_resolve::no_such_orchestration_refusal().into()),
+        _ => Err(ambiguous_orchestration_refusal(orchestration).into()),
+    }
 }
 
 /// The target deck's snapshot after a start, for the direct refresh that

@@ -5,7 +5,7 @@ import { getTerminal } from "./terminalRegistry";
 import { applyHandoffEvent, mapDaemonEvent, MAX_LIVE_EVIDENCE } from "./daemonEvents";
 import { DISPLAY_LIMITS, displayText } from "./displayText";
 import { describeEndpoint } from "./endpoints";
-import { isAbsoluteTypedPath, TYPED_PATH_SHAPE_REFUSAL } from "./newAgent";
+import { ambiguousOrchestrationReason, isAbsoluteTypedPath, TYPED_PATH_SHAPE_REFUSAL } from "./newAgent";
 import { clampZoom, DEFAULT_ZOOM } from "./zoom";
 import { UNREPORTED } from "../types";
 import type { HandoffEdge,
@@ -2058,7 +2058,13 @@ class FixtureDeckBridge implements DeckBridge {
     const deck = this.connectedDeck(action.deckId);
     if (this.isOlderDeck(action.deckId)) throw new Error(FIXTURE_CONFIGURED_ROLES_UNSUPPORTED);
     const home = FIXTURE_HOMES[action.deckId] ?? "/home/dev";
-    const orchestration = fixtureProjectOrchestrations(home, action.path)?.find((candidate) => candidate.name === action.orchestration);
+    // PRD #1223 audit V4: the live action's cardinality check, mirrored — a
+    // name the project defines twice is refused here rather than launching the
+    // first definition, exactly as `ensure_one_orchestration_of_that_name`
+    // refuses it in the crate. The dialog's disabled chips stay presentation.
+    const defined = fixtureProjectOrchestrations(home, action.path)?.filter((candidate) => candidate.name === action.orchestration) ?? [];
+    if (defined.length > 1) throw new Error(`${ambiguousOrchestrationReason(action.orchestration)} Nothing was started.`);
+    const orchestration = defined[0];
     if (!orchestration) throw new Error(FIXTURE_UNRESOLVED_REFUSAL);
     const orchestrationId = `fixture-orchestration-${nextFixtureAgentId(deck.agents)}`;
     let startAgentId: string | undefined;

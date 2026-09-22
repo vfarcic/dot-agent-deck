@@ -1200,6 +1200,32 @@ describe("FixtureDeckBridge scenarios", () => {
     await older.dispose();
   });
 
+  /**
+   * Scenario (PRD #1223 audit V4): the fixture project that defines `twin-loop`
+   * twice. The dialog never offers it, but the action boundary is what a
+   * direct caller or a frontend regression reaches — so a launch naming it is
+   * refused with the dialog's reason and starts nothing, while the uniquely
+   * named `solo-loop` in the same project still launches.
+   */
+  it("refuses a fixture launch naming an orchestration the project defines twice", async () => {
+    const { FIXTURE_REMOTE_DAEMON_ID } = await import("../data/fixture");
+    window.history.replaceState({}, "", "/?fixture=1&state=fleet");
+    const { createDeckBridge } = await import("./bridge");
+    const bridge = createDeckBridge("fixture");
+    await bridge.connect();
+    const project = "/home/build/scratch/twin-project";
+    const roleCount = async () => (await bridge.connect()).find((deck) => deck.connection.deckId === FIXTURE_REMOTE_DAEMON_ID)?.agents.length;
+    const before = await roleCount();
+
+    await expect(bridge.runAction({ type: "start_orchestration", deckId: FIXTURE_REMOTE_DAEMON_ID, path: project, orchestration: "twin-loop" }))
+      .rejects.toThrow("defines more than one orchestration named twin-loop");
+    expect(await roleCount()).toBe(before);
+
+    await bridge.runAction({ type: "start_orchestration", deckId: FIXTURE_REMOTE_DAEMON_ID, path: project, orchestration: "solo-loop" });
+    expect(await roleCount()).toBeGreaterThan(before!);
+    await bridge.dispose();
+  });
+
   it("falls back to the four-agent scenario for an unknown ?state=", async () => {
     window.history.replaceState({}, "", "/?fixture=1&state=nonsense");
     const { createDeckBridge } = await import("./bridge");
