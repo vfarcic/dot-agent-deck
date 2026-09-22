@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { createFixtureSnapshot, FIXTURE_DAEMON_ID } from "../data/fixture";
 import { agentKey } from "../lib/agentKey";
 import type { DeckBridge } from "../lib/bridge";
+import { LaunchCleanupError } from "../lib/actionError";
 import { terminalInputState } from "../lib/terminalInput";
 import type { TerminalChunk } from "../types";
 
@@ -204,5 +205,66 @@ describe("useDeckRuntime", () => {
     const planner = result.current.snapshot.agents.find((agent) => agent.id === "planner")!;
     expect(planner.writeLease).toBe("write");
     expect(terminalInputState(planner, result.current.terminalInputResults?.[key(planner.id)]).readOnly).toBe(false);
+  });
+  /**
+   * Scenario: two actions are in flight at once. The first rejects with a
+   * `LaunchCleanupError` naming roles that may still be running; the second
+   * then rejects ordinarily. The runtime must report the second failure's
+   * sentence with NO cleanup roles beside it — PRD #1223 audit follow-up W1.
+   *
+   * This is the sequencing seam, not the rendering: while the message and the
+   * roles were two `useState` calls, the later ordinary rejection replaced the
+   * message alone and left the earlier launch's roles attached to it, so the
+   * toast named roles the failure on screen had never touched.
+   */
+  it("never leaves an earlier failure's cleanup roles beside a later failure's message", async () => {
+    let rejectFirst: ((cause: unknown) => void) | undefined;
+    let rejectSecond: ((cause: unknown) => void) | undefined;
+    bridge.runAction
+      .mockImplementationOnce(() => new Promise((_resolve, reject) => { rejectFirst = reject; }))
+      .mockImplementationOnce(() => new Promise((_resolve, reject) => { rejectSecond = reject; }));
+    const { result } = renderHook(() => useDeckRuntime());
+    await waitFor(() => expect(result.current.snapshot.connection.status).toBe("connected"));
+
+    await act(async () => {
+      // Both start before either answers, so the second one's clear runs first
+      // and neither rejection can be read as "the only one in flight".
+      const first = result.current.runAction({ type: "pause_run" }).catch(() => {});
+      const second = result.current.runAction({ type: "pause_run" }).catch(() => {});
+      rejectFirst?.(new LaunchCleanupError("launch failed; cleanup could not confirm stop for 2 role(s)", ["planner", "coder"]));
+      rejectSecond?.(new Error("daemon returned error: publish-failed"));
+      await Promise.all([first, second]);
+    });
+
+    expect(result.current.error).toBe("daemon returned error: publish-failed");
+    expect(result.current.errorCleanup).toBeUndefined();
+  });
+
+  /**
+   * The same seam with `reconnect()` interleaved (PRD #1223 audit follow-up
+   * W1): a launch is in flight, Refresh starts and clears the failure, the
+   * launch then rejects with its roles, and the reconnect fails afterwards.
+   * Its failure path writes a sentence and nothing else, so the launch's roles
+   * must not survive into it either.
+   */
+  it("never leaves a launch's cleanup roles beside a failed reconnect", async () => {
+    let rejectLaunch: ((cause: unknown) => void) | undefined;
+    let rejectConnect: ((cause: unknown) => void) | undefined;
+    bridge.runAction.mockImplementationOnce(() => new Promise((_resolve, reject) => { rejectLaunch = reject; }));
+    const { result } = renderHook(() => useDeckRuntime());
+    await waitFor(() => expect(result.current.snapshot.connection.status).toBe("connected"));
+
+    await act(async () => {
+      const launch = result.current.runAction({ type: "pause_run" }).catch(() => {});
+      // Refresh, which clears the failure before either answer lands.
+      bridge.connect.mockImplementationOnce(() => new Promise((_resolve, reject) => { rejectConnect = reject; }));
+      const refresh = result.current.reconnect();
+      rejectLaunch?.(new LaunchCleanupError("launch failed; cleanup could not confirm stop for 1 role(s)", ["planner"]));
+      rejectConnect?.(new Error("the deck is not answering"));
+      await Promise.all([launch, refresh]);
+    });
+
+    expect(result.current.error).toBe("the deck is not answering");
+    expect(result.current.errorCleanup).toBeUndefined();
   });
 });

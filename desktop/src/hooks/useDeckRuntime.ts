@@ -77,7 +77,8 @@ export function useDeckRuntime(): DeckRuntimeState {
   const selectedDeckIdRef = useRef<string | undefined>(snapshot.connection.deckId);
   selectedDeckIdRef.current = snapshot.connection.deckId;
   /**
-   * The latest reported failure, or nothing.
+   * The latest reported failure, or nothing — the sentence and the roles a
+   * failed launch could not confirm are stopped, as ONE value.
    *
    * PRD #742 M8 carried a `{ message, id }` here so `App` could suppress one
    * dismissed failure by id rather than by sentence. Issue #1046 landed on
@@ -85,20 +86,27 @@ export function useDeckRuntime(): DeckRuntimeState {
    * (see {@link clearError}), which answers the same question with less: a
    * cleared error is per-occurrence by construction, so a second failure
    * carrying an identical sentence sets it again and shows.
-   */
-  const [error, setError] = useState<string>();
-  /**
-   * PRD #1223 audit V7 — the roles a failed launch could not confirm are
-   * stopped, kept beside the sentence they came with.
    *
-   * The structured rejection (`LaunchCleanupError`) used to survive only inside
-   * the New agent dialog, so a failure that arrived after the overview had
-   * dropped that dialog left the global toast with the prose alone — where the
+   * # Why one state and not two
+   *
+   * PRD #1223 audit V7 put the cleanup roles here beside the sentence, because
+   * the structured rejection (`LaunchCleanupError`) used to survive only inside
+   * the New agent dialog — so a failure that arrived after the overview had
+   * dropped that dialog left the global toast with the prose alone, where the
    * cleanup clause is the LAST thing said and the first thing a display clamp
-   * cuts. Held here, it is rendered with whichever copy of the failure is on
-   * screen.
+   * cuts.
+   *
+   * It held them in a SECOND `useState`, and the audit round after that one
+   * found the ordering that breaks: with two operations in flight, B clears
+   * both, A rejects with a `LaunchCleanupError` and writes its message and its
+   * roles, then B rejects ordinarily and replaces the message alone — leaving
+   * A's possibly-running roles attached to B's sentence, which the toast then
+   * renders as one alert. `reconnect()` and the bootstrap join the same
+   * ordering. Holding the pair as one value is what makes that unrepresentable:
+   * every writer below replaces the WHOLE failure, so a message and a cleanup
+   * list on screen together always came from one rejection.
    */
-  const [errorCleanup, setErrorCleanup] = useState<readonly string[]>();
+  const [failure, setFailure] = useState<{ message: string; cleanup?: readonly string[] }>();
   // PTY bytes deliberately bypass React state. Routing every output chunk
   // through setState re-rendered the whole deck per chunk per agent — with six
   // streaming agents the main thread spent its time reconciling instead of
@@ -231,15 +239,14 @@ export function useDeckRuntime(): DeckRuntimeState {
   }, []);
 
   const reconnect = useCallback(async () => {
-    setError(undefined);
-    setErrorCleanup(undefined);
+    setFailure(undefined);
     updateSelected((current) => ({ ...current, connection: { ...current.connection, status: "loading", message: "Reconnecting…" } }));
     try {
       const connected = await bridge.connect();
       adoptFleet(connected);
     } catch (cause) {
       const message = cause instanceof Error ? cause.message : String(cause);
-      setError(message);
+      setFailure({ message });
       updateSelected((current) => ({
         ...current,
         health: "failed",
@@ -267,7 +274,7 @@ export function useDeckRuntime(): DeckRuntimeState {
       } catch (cause) {
         if (!active) return;
         const message = cause instanceof Error ? cause.message : String(cause);
-        setError(message);
+        setFailure({ message });
         updateSelected((current) => ({ ...current, health: "failed", connection: { status: "error", message } }));
       }
     })();
@@ -280,8 +287,7 @@ export function useDeckRuntime(): DeckRuntimeState {
   }, [adoptFleet, bridge, updateSelected, updateTerminal]);
 
   const runAction = useCallback(async (action: DeckAction) => {
-    setError(undefined);
-    setErrorCleanup(undefined);
+    setFailure(undefined);
     const sentToDeckId = selectedDeckIdRef.current;
     try {
       const result = await bridge.runAction(action);
@@ -299,9 +305,10 @@ export function useDeckRuntime(): DeckRuntimeState {
       return result;
     } catch (cause) {
       const message = cause instanceof Error ? cause.message : String(cause);
-      setError(message);
-      // Audit V7: the roles as data, not only the sentence that names them last.
-      if (cause instanceof LaunchCleanupError) setErrorCleanup(cause.unconfirmedStops);
+      // Audit V7: the roles as data, not only the sentence that names them
+      // last — and in ONE write with the sentence, so no later rejection can
+      // replace the message and inherit these roles.
+      setFailure(cause instanceof LaunchCleanupError ? { message, cleanup: cause.unconfirmedStops } : { message });
       throw cause;
     }
   }, [bridge, noteTerminalInputResult]);
@@ -316,8 +323,7 @@ export function useDeckRuntime(): DeckRuntimeState {
    * behind for the banner is `snapshot.connection`, which this does not touch.
    */
   const clearError = useCallback(() => {
-    setError(undefined);
-    setErrorCleanup(undefined);
+    setFailure(undefined);
   }, []);
 
   const getSettings = useCallback(() => bridge.getSettings(), [bridge]);
@@ -415,8 +421,8 @@ export function useDeckRuntime(): DeckRuntimeState {
     fleet,
     terminalData: EMPTY_TERMINAL_DATA,
     terminalFeed,
-    error,
-    errorCleanup,
+    error: failure?.message,
+    errorCleanup: failure?.cleanup,
     clearError,
     runAction,
     terminalInputResults,
