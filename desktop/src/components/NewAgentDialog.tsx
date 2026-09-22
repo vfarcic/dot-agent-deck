@@ -93,8 +93,11 @@ export const STARTING_CLOSE_BLOCKED = "Waiting for the deck to answer the start.
 export const NO_DIRECTORY_BROWSER = "The New agent dialog is not showing a directory listing, so nothing was changed.";
 /** The browser moved between the utterance and its answer. */
 export const DIRECTORY_MOVED_ON = "The directory browser moved on while that was being worked out, so nothing was changed. Say it again.";
-/** The named child is no longer in the listing on screen. */
-export const DIRECTORY_NOT_LISTED = "That directory is not in the listing any more, so nothing was opened.";
+/**
+ * The named child is not among the rows on screen any more — gone from the
+ * listing, or hidden by a filter typed during the round trip.
+ */
+export const DIRECTORY_NOT_LISTED = "That directory is not on screen any more, so nothing was opened.";
 /** `..` is not on screen. */
 export const NO_PARENT_DIRECTORY = "This directory has no parent to go up to.";
 /*
@@ -583,7 +586,9 @@ export function NewAgentDialog({ runtime, initialDeckId, onClose, onAppeared, on
    * and the listing `path` in `target.declaredDirectories` — and refuses in
    * the dialog's own words when it is not, rather than acting on a listing the
    * user has since left. A start in flight refuses too, exactly as every
-   * control inside the dialog is disabled then.
+   * control inside the dialog is disabled then. The deck and the path are not
+   * the whole of what is on screen — the filter is the rest — so `open_dir`
+   * also requires its target among the rows the filter shows NOW.
    */
   const browserMovedOn = (target: VoiceDispatchTarget): string | undefined => {
     if (!deck || !listing || phase !== "idle") return NO_DIRECTORY_BROWSER;
@@ -594,13 +599,17 @@ export function NewAgentDialog({ runtime, initialDeckId, onClose, onAppeared, on
   const voiceOpenDirectory = (target: VoiceDispatchTarget): string | undefined => {
     const refused = browserMovedOn(target);
     if (refused !== undefined || !deck || !listing) return refused;
-    const entry = listing.entries.find((candidate) => candidate.path === target.directoryPath);
-    if (!entry) return DIRECTORY_NOT_LISTED;
-    // A click on the row: the cursor lands on it (when the filter shows it),
-    // then the deck lists it.
-    const index = rows.findIndex((row) => row.kind === "entry" && row.entry.path === entry.path);
-    if (index >= 0) setCursor(index);
-    void loadListing(deck.deckId, entry.path);
+    // Against the ROWS on screen, after the filter — not the unfiltered
+    // listing. The deck and the listing path can both be unchanged while the
+    // filter moved during the round trip ("doc" to "bill"), and a spoken name
+    // means a directory the user can see, so a child the filter now hides is
+    // refused rather than opened from behind it.
+    const index = rows.findIndex((row) => row.kind === "entry" && row.entry.path === target.directoryPath);
+    const row = rows[index];
+    if (row?.kind !== "entry") return DIRECTORY_NOT_LISTED;
+    // A click on the row: the cursor lands on it, then the deck lists it.
+    setCursor(index);
+    void loadListing(deck.deckId, row.entry.path);
     return undefined;
   };
   const voiceGoToParent = (target: VoiceDispatchTarget): string | undefined => {

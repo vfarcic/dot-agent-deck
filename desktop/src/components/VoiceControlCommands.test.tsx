@@ -22,7 +22,7 @@ vi.mock("./TerminalViewport", () => ({
 }));
 
 import { DeckShell } from "../App";
-import { DIRECTORY_MOVED_ON, FORM_MOVED_ON, FORM_UNDER_CONFIRMATION, MODE_NOT_OFFERED, NO_DIRECTORY_BROWSER, NO_NEW_AGENT_DIALOG, NO_NEW_AGENT_FORM, NO_PARENT_DIRECTORY, spokenName, START_AWAITING_CONFIRMATION, START_FORM_CHANGED, START_NEEDS_DIRECTORY, STARTING_CLOSE_BLOCKED } from "./NewAgentDialog";
+import { DIRECTORY_MOVED_ON, DIRECTORY_NOT_LISTED, FORM_MOVED_ON, FORM_UNDER_CONFIRMATION, MODE_NOT_OFFERED, NO_DIRECTORY_BROWSER, NO_NEW_AGENT_DIALOG, NO_NEW_AGENT_FORM, NO_PARENT_DIRECTORY, spokenName, START_AWAITING_CONFIRMATION, START_FORM_CHANGED, START_NEEDS_DIRECTORY, STARTING_CLOSE_BLOCKED } from "./NewAgentDialog";
 import { CONFIRMATION_ALREADY_OPEN, STOP_BEHIND_NEW_AGENT, STOP_TARGET_GONE } from "./AgentOverview";
 import {
   NOTHING_DISPATCHED,
@@ -1300,6 +1300,37 @@ describe("the New agent directory browser, by voice (PRD #1223)", () => {
     expect(currentPath()).toBe("/home/dev/billing");
     expect(listDirectories).not.toHaveBeenCalledWith(expect.any(String), "/home/dev/docs");
     expect(screen.getByTestId("voice-report")).toHaveTextContent(DIRECTORY_MOVED_ON);
+  });
+
+  /**
+   * Scenario: with the filter at "doc", say "open dir docs", and change the
+   * filter to "bill" while it is being resolved. The deck and the listing are
+   * unchanged, but `docs` is no longer on screen, so nothing is opened and the
+   * report says why.
+   */
+  it("refuses a directory the filter hid during the round trip", async () => {
+    const voice = microphone([]);
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const { deck, declarations, listDirectories } = browsingDeck(voice, { during: () => gate });
+    render(<DeckShell runtime={deck} initialView={{ kind: "overview" }} />);
+    await turnVoiceOn();
+    await openBrowser();
+    fireEvent.change(screen.getByTestId("new-agent-filter"), { target: { value: "doc" } });
+
+    voice.deliver("open dir docs");
+    await completeUtterance();
+    expect(declarations.at(-1)?.entries).toEqual([{ name: "docs", path: "/home/dev/docs" }]);
+    fireEvent.change(screen.getByTestId("new-agent-filter"), { target: { value: "bill" } });
+    await flush();
+
+    release();
+    await flush();
+    await flush();
+
+    expect(currentPath()).toBe("/home/dev");
+    expect(listDirectories).not.toHaveBeenCalledWith(expect.any(String), "/home/dev/docs");
+    expect(screen.getByTestId("voice-report")).toHaveTextContent(DIRECTORY_NOT_LISTED);
   });
 
   /**
