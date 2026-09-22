@@ -7426,15 +7426,25 @@ pub fn card_stats_border_label(usable_width: u16, last: &str, tools: usize) -> O
 ///
 /// The rule is now [`truncate_with_ellipsis`]'s: accumulate
 /// `UnicodeWidthChar::width(c).unwrap_or(0)` per character and stop before the
-/// first one that would overflow, so the two agree on the concatenated text for
-/// any input rather than only for single-width input. The `…` column is reserved
-/// **only** when the input actually overflows, so a title that exactly fills the
-/// budget is returned whole; for pure-ASCII titles — every existing card
-/// snapshot — this is identical, character for character, to the former
-/// char-count implementation. What this one adds is that the width accumulator
-/// carries ACROSS segment boundaries while each surviving piece keeps its own
-/// style, and that a segment whose next character is too wide for the remaining
-/// budget contributes no span at all rather than an empty one.
+/// first one that would overflow. The `…` column is reserved **only** when the
+/// input actually overflows, so a title that exactly fills the budget is
+/// returned whole; for pure-ASCII titles — every existing card snapshot — this
+/// is identical, character for character, to the former char-count
+/// implementation. What this one adds is that the width accumulator carries
+/// ACROSS segment boundaries while each surviving piece keeps its own style, and
+/// that a segment whose next character is too wide for the remaining budget
+/// contributes no span at all rather than an empty one.
+///
+/// So the two now agree on the concatenated text for WIDE input as well as
+/// single-width, which is the whole point — the old comment here scoped that
+/// equivalence to single-width text, and the scoping was the defect rather than
+/// a caveat. They still differ in exactly one place, deliberately: once the
+/// budget is exactly exhausted this stops at the segment boundary, so a
+/// **zero-width** character opening a LATER segment is dropped here and kept
+/// there. Keeping it would open a fresh styled span holding a combining mark
+/// with no base character in it, which is not a thing to draw; inside a single
+/// segment the two still agree, because the fill loop admits a zero-width
+/// character at an exhausted budget just as [`truncate_with_ellipsis`] does.
 ///
 /// Known limitation, carried over from [`truncate_with_ellipsis`]: iteration is
 /// per `char`, so a grapheme *cluster* — an emoji ZWJ sequence, or a base
@@ -40765,6 +40775,22 @@ mod tests {
         assert_eq!(title_text(&spans), format!(" 1 {accented}"));
         assert_eq!(spans.len(), 2, "no ellipsis segment is appended: {spans:?}");
         assert_eq!(spans[1].style, name);
+
+        // The one documented divergence from `truncate_with_ellipsis`: a
+        // zero-width character OPENING a later segment is dropped once the
+        // budget is exactly exhausted, rather than opening a styled span that
+        // holds a combining mark with no base character. Inside one segment they
+        // still agree — the mark after `b` is admitted at an exhausted budget.
+        let split = vec![
+            ("ab\u{301}".to_string(), badge),
+            ("\u{301}cd".to_string(), name),
+        ];
+        let spans = truncate_styled_segments(split, 3);
+        assert_eq!(title_text(&spans), "ab\u{301}…");
+        assert_eq!(
+            truncate_with_ellipsis("ab\u{301}\u{301}cd", 3),
+            "ab\u{301}\u{301}…"
+        );
     }
 
     /// Issue #357: when the budget runs out PART WAY through a double-width
