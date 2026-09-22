@@ -233,29 +233,48 @@ fn collect_images(base: &Path, entries: std::fs::ReadDir, out: &mut BTreeSet<Str
     }
 }
 
-/// Every UTF-8 file under the scanned trees, in a stable order.
+/// Every UTF-8 file under the scanned trees, in a stable order, plus one
+/// finding per [`SCANNED_DIRS`] entry that could not be read at all.
 ///
 /// Reads by content rather than by an extension allowlist — a reference is a
 /// string, and an allowlist silently stops covering a file type someone adds.
 /// Anything that is not valid UTF-8 (a checked-in image, say) is skipped rather
 /// than reported: it cannot carry a textual reference.
 ///
+/// **The top-level root is probed separately from what it contains**, on
+/// purpose — a Greptile finding on #1238 caught the version that was not.
+/// `docs` and `site/src` are two independent trees this rule promises to
+/// scan; losing one of them silently (missing directory, permissions) used to
+/// pass unnoticed as long as the *other* tree still produced a match, because
+/// `check`'s vacuous-scan guard only fires when NEITHER tree yields anything.
+/// So rule 16 could go green having stopped covering a whole declared input.
+/// An unreadable file or subdirectory *inside* a root that opened fine stays a
+/// silent skip — the same root-vs-nested asymmetry [`available_images`] draws
+/// for the image directory, and for the same reason: a page two directories
+/// down going unreadable is a narrower problem than the scan itself failing.
+///
 /// **Symlinks are never followed**, which is what keeps the walk out of
 /// `docs/img` — the symlink into `site/static/img` — so the rule never reads
 /// the images it resolves against, and never counts one of them as a page.
-fn text_files(root: &Path) -> Vec<TextFile> {
+fn text_files(root: &Path) -> (Vec<TextFile>, Vec<String>) {
     let mut acc: BTreeMap<String, String> = BTreeMap::new();
+    let mut missing_roots = Vec::new();
     for rel in SCANNED_DIRS {
         let dir = root.join(rel);
-        collect_text_files(root, &dir, &mut acc);
+        match std::fs::read_dir(&dir) {
+            Ok(entries) => collect_text_files(root, entries, &mut acc),
+            Err(e) => missing_roots.push(format!(
+                "{rel}/ is missing or unreadable ({e}) — this rule scans it for `/img/...` and \
+                 `./img/...` references, so it now covers nothing under that tree. If it moved, \
+                 move `SCANNED_DIRS` in `xtask/linkage-check/src/site_image_refs.rs` with it \
+                 (issue #1200)"
+            )),
+        }
     }
-    acc.into_iter().collect()
+    (acc.into_iter().collect(), missing_roots)
 }
 
-fn collect_text_files(root: &Path, dir: &Path, acc: &mut BTreeMap<String, String>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
+fn collect_text_files(root: &Path, entries: std::fs::ReadDir, acc: &mut BTreeMap<String, String>) {
     for entry in entries.flatten() {
         let Ok(file_type) = entry.file_type() else {
             continue;
@@ -265,7 +284,9 @@ fn collect_text_files(root: &Path, dir: &Path, acc: &mut BTreeMap<String, String
         }
         let path = entry.path();
         if file_type.is_dir() {
-            collect_text_files(root, &path, acc);
+            if let Ok(nested) = std::fs::read_dir(&path) {
+                collect_text_files(root, nested, acc);
+            }
         } else if let Ok(text) = std::fs::read_to_string(&path) {
             let display = path
                 .strip_prefix(root)
@@ -288,7 +309,9 @@ pub fn run(root: &Path) -> Vec<String> {
              `IMAGE_ROOT` with it (issue #1200)"
         )];
     };
-    check(&text_files(root), &available)
+    let (files, mut out) = text_files(root);
+    out.extend(check(&files, &available));
+    out
 }
 
 #[cfg(test)]
@@ -523,6 +546,33 @@ mod tests {
         );
     }
 
+    /// The bug rule 16 shipped with, caught by review on PR #1238: a missing
+    /// or unreadable `SCANNED_DIRS` root silently produced no files from THAT
+    /// tree while the other one still yielded matches, so `seen_any` stayed
+    /// true and `check`'s vacuous-scan guard never fired — the rule could pass
+    /// having lost all coverage of a whole declared input tree. `site/src/` is
+    /// never created here; `docs/` alone still resolves cleanly, and that must
+    /// not be enough for a clean run.
+    #[test]
+    fn a_missing_scanned_root_is_a_finding_even_when_the_other_tree_resolves_cleanly() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(IMAGE_ROOT)).expect("img root");
+        std::fs::write(root.join(IMAGE_ROOT).join("kept.png"), "x").expect("kept");
+        std::fs::create_dir_all(root.join("docs")).expect("docs");
+        std::fs::write(root.join("docs/page.md"), "![a](/img/kept.png)\n").expect("page");
+        // site/src/ is never created.
+
+        let findings = run(root);
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert!(findings[0].starts_with("site/src/"), "{}", findings[0]);
+        assert!(
+            findings[0].contains("is missing or unreadable"),
+            "{}",
+            findings[0]
+        );
+    }
+
     /// `run` end to end over a synthetic tree, including the walk: the miss is
     /// found in a nested `site/src/` module and reported with a `/`-separated
     /// path.
@@ -567,6 +617,7 @@ mod tests {
         std::fs::create_dir_all(root.join("docs")).expect("docs");
         std::fs::write(root.join("docs/page.md"), "![a](/img/note.svg)\n").expect("page");
         std::os::unix::fs::symlink("../site/static/img", root.join("docs/img")).expect("symlink");
+        std::fs::create_dir_all(root.join("site/src")).expect("site/src");
 
         let findings = run(root);
         assert!(findings.is_empty(), "{findings:?}");
