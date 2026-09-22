@@ -519,8 +519,11 @@ impl IpcClient {
     /// [`crate::hook`]'s write classifier depends on. `Ok(n)` for `n > 0` costs
     /// nothing at either call site: a short write is what a `Write::write` caller
     /// already has to expect and retry, and a short read is ordinary for
-    /// `Read::read`. Only a cancellation that moved zero bytes — the common case,
-    /// and the only one reachable before this fix — still reports `TimedOut`.
+    /// `Read::read`. Only a cancellation that moved zero bytes — the common case
+    /// — still reports `TimedOut`; before this fix every cancellation did,
+    /// whatever its count. `GetOverlappedResult`'s own return value is not
+    /// consulted: on failure it leaves `discarded` at zero, which lands in that
+    /// same `TimedOut` arm.
     fn wait_overlapped(&self, overlapped: &mut OVERLAPPED) -> io::Result<u32> {
         let handle = self.raw();
         let mut transferred: u32 = 0;

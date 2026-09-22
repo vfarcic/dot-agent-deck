@@ -2446,43 +2446,79 @@ mod tests {
         );
     }
 
-    /// Scenario: A stub daemon accepts the connection, shrinks its own
-    /// receive buffer to a few KiB, and then never reads a byte, while the
-    /// client sends a multi-megabyte request line under a 300ms deadline.
-    /// The kernel takes the prefix that fits in the shrunk buffer and the
-    /// rest of the write times out, so part of the line is already in the
-    /// daemon's buffer when the write fails. That must classify as
-    /// `SocketReply::NoReply` — possibly sent, unconfirmed — and not as
-    /// `SocketReply::Unreachable`, whose doc promises a caller that nothing
-    /// left the process and a retry cannot duplicate anything.
+    /// How many bytes one Unix-domain stream socket on this host accepts from a
+    /// writer before the writer would block, with nobody reading the other end
+    /// — measured on a fresh `UnixStream::pair`, which gets the same default
+    /// buffers as the connected pair `socket_013` uses.
+    ///
+    /// Measured rather than assumed because it is host tuning, and it is not
+    /// the knob it looks like. On Linux an `AF_UNIX` stream writer is bounded
+    /// by its **own** `SO_SNDBUF` (`net.core.wmem_default` for a socket that
+    /// never sets one), not by the reader's `SO_RCVBUF`: shrinking the stub
+    /// daemon's receive buffer to 4 KiB, which PR #1232's second revision
+    /// did, left the client writing exactly 219,264 bytes either way. On
+    /// macOS/BSD the reader's receive buffer does take part. A probe of the
+    /// real socket type covers both without the test having to know which.
+    #[cfg(unix)]
+    fn unix_stream_write_capacity() -> usize {
+        use std::io::Write as _;
+        /// Well past any buffer a host plausibly configures; reaching it
+        /// means the probe is not measuring what it thinks it is.
+        const PROBE_LIMIT: usize = 1 << 30;
+        let (writer, _reader) =
+            std::os::unix::net::UnixStream::pair().expect("create Unix stream pair for probe");
+        writer
+            .set_nonblocking(true)
+            .expect("make probe writer non-blocking");
+        let chunk = vec![0u8; 64 * 1024];
+        let mut total = 0usize;
+        loop {
+            match (&writer).write(&chunk) {
+                Ok(0) => break,
+                Ok(n) => total += n,
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(err) => panic!("probe write failed after {total} bytes: {err}"),
+            }
+            assert!(
+                total < PROBE_LIMIT,
+                "probe wrote {total} bytes without blocking — the reader end is not holding"
+            );
+        }
+        total
+    }
+
+    /// Scenario: A stub daemon accepts the connection and then never reads a
+    /// byte, while the client sends a request line several times larger than
+    /// this host's measured Unix-socket buffering under a 300ms deadline.
+    /// The kernel takes the prefix that fits and the rest of the write times
+    /// out, so part of the line is already in the daemon's buffer when the
+    /// write fails. That must classify as `SocketReply::NoReply` — possibly
+    /// sent, unconfirmed — and not as `SocketReply::Unreachable`, whose doc
+    /// promises a caller that nothing left the process and a retry cannot
+    /// duplicate anything.
     #[spec("error/socket/013")]
     #[test]
     #[cfg(unix)]
     fn socket_013_a_write_that_breaks_after_bytes_left_is_no_reply_not_unreachable() {
-        /// Comfortably larger than [`SHRUNK_RCVBUF_BYTES`] and well under the
-        /// daemon's own 8 MiB `MAX_HOOK_LINE_BYTES`, so the kernel cannot
-        /// swallow the whole line into the shrunk buffer and a real daemon
-        /// would have accepted it.
-        const PAYLOAD_BYTES: usize = 4 * 1024 * 1024;
-        /// What [`SO_RCVBUF`] on the daemon's accepted stream is shrunk to —
-        /// the deterministic half of this test (PR #1232 review). Relying on
-        /// `PAYLOAD_BYTES` alone to outrun the HOST's default socket buffer
-        /// (PR #1232's prior version compared it to Linux's 208 KiB default)
-        /// made the test's pass/fail depend on kernel tuning this process
-        /// does not control: a host with `net.core.rmem_default` raised above
-        /// 4 MiB accepts the whole line inside the deadline, and the write
-        /// classifier correctly reports `Read(DeadlineExpired)` rather than a
-        /// partial write — which is not a bug, but is exactly the outcome the
-        /// assertions below reject, a false failure with nothing wrong in the
-        /// code under test. Pinning the daemon's own receive buffer removes
-        /// the host's tuning from the equation entirely: whatever this value
-        /// is set to is what Linux actually enforces (`man 7 socket`'s
-        /// documented doubling still applies, but that only widens the
-        /// margin `PAYLOAD_BYTES` has to clear, never narrows it).
-        const SHRUNK_RCVBUF_BYTES: i32 = 4096;
+        /// The payload floor: what this test sent before the probe existed,
+        /// about 18x Linux's default ~230 KiB of buffering, so on an untuned
+        /// host the probe changes nothing.
+        const MIN_PAYLOAD_BYTES: usize = 4 * 1024 * 1024;
         /// Short enough to keep the test quick, long enough that the first
         /// write is not racing the deadline for the prefix that does fit.
         const BUDGET: std::time::Duration = std::time::Duration::from_millis(300);
+
+        // PR #1232 review: a fixed 4 MiB payload made the outcome depend on
+        // host tuning — raise `net.core.wmem_default` past it and the whole
+        // line fits, the classifier correctly reports `Read(DeadlineExpired)`,
+        // and the second assertion below fails with nothing wrong in the
+        // code under test. Four times the measured capacity keeps the line
+        // out of reach wherever the host puts that number. It can exceed the
+        // daemon's 8 MiB `MAX_HOOK_LINE_BYTES` on a heavily tuned host, which
+        // does not matter here: the stub never reads, so no line cap applies.
+        let capacity = unix_stream_write_capacity();
+        let payload_bytes = MIN_PAYLOAD_BYTES.max(capacity.saturating_mul(4));
 
         let _tmp = tempfile::tempdir().expect("create temp dir for stub daemon socket");
         let socket_path = _tmp.path().join("s.sock");
@@ -2490,34 +2526,12 @@ mod tests {
             std::os::unix::net::UnixListener::bind(&socket_path).expect("bind stub daemon socket");
 
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
-        // Stub daemon: accept, shrink the accepted stream's own receive
-        // buffer (see `SHRUNK_RCVBUF_BYTES`), then hold the connection open
-        // without reading a single byte, so the client's write fills the
-        // now-tiny buffer and stalls regardless of host socket tuning.
-        // Released only after the client has returned — closing early would
-        // hand the client an `EPIPE` on an empty buffer instead.
+        // Stub daemon: accept, then hold the connection open without reading
+        // a single byte, so the client's write fills the socket's buffering
+        // and stalls. Released only after the client has returned — closing
+        // early would hand the client an `EPIPE` on an empty buffer instead.
         let daemon_thread = std::thread::spawn(move || {
             if let Ok((stream, _)) = listener.accept() {
-                use std::os::unix::io::AsRawFd;
-                let fd = stream.as_raw_fd();
-                // SAFETY: `fd` is the accepted stream's own live socket, still
-                // owned by `stream` in this scope; `SO_RCVBUF` takes a plain
-                // `c_int` and this call cannot outlive the borrow above.
-                let rc = unsafe {
-                    libc::setsockopt(
-                        fd,
-                        libc::SOL_SOCKET,
-                        libc::SO_RCVBUF,
-                        std::ptr::from_ref(&SHRUNK_RCVBUF_BYTES).cast::<libc::c_void>(),
-                        std::mem::size_of::<i32>() as libc::socklen_t,
-                    )
-                };
-                assert_eq!(
-                    rc,
-                    0,
-                    "setsockopt(SO_RCVBUF) failed: {}",
-                    std::io::Error::last_os_error()
-                );
                 let _ = release_rx.recv();
                 drop(stream);
             }
@@ -2525,19 +2539,12 @@ mod tests {
 
         let request = format!(
             r#"{{"type":"get-seed","pad":"{}"}}"#,
-            "a".repeat(PAYLOAD_BYTES)
+            "a".repeat(payload_bytes)
         );
         let (reply, cause) = request_from_socket_at_detailed(&socket_path, &request, Some(BUDGET));
 
         let _ = release_tx.send(());
-        // Unlike the `let _ =` this replaced, a failed `join` must surface: it
-        // is the only place a failed `setsockopt(SO_RCVBUF)` inside the thread
-        // would otherwise be seen, and swallowing it would silently put this
-        // test back to relying on host tuning — precisely what shrinking the
-        // buffer here exists to stop depending on.
-        daemon_thread
-            .join()
-            .expect("stub daemon thread panicked (see setsockopt assertion above)");
+        daemon_thread.join().expect("stub daemon thread panicked");
 
         assert!(
             matches!(reply, SocketReply::NoReply),
@@ -2552,7 +2559,8 @@ mod tests {
                 if *written > 0 && *written < *total),
             "and it must be NoReply for the WRITE reason, with a prefix gone and a \
              remainder not: a `Read(DeadlineExpired)` here would mean the whole line fit \
-             after all and this test proved nothing about partial writes. Got {cause:?}."
+             after all and this test proved nothing about partial writes. Got {cause:?} \
+             (probed capacity {capacity} bytes, payload {payload_bytes} bytes)."
         );
     }
 
