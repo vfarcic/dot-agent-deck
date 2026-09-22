@@ -1,6 +1,8 @@
 use chrono::{Duration, Utc};
-use dot_agent_deck::event::{AgentEvent, AgentType, DISPLAY_NAME_METADATA_KEY, EventType};
-use dot_agent_deck::state::AppState;
+use dot_agent_deck::event::{
+    AgentEvent, AgentType, DISPLAY_NAME_METADATA_KEY, EventType, LiveTarget, TargetKind, Writable,
+};
+use dot_agent_deck::state::{AppState, SessionSnapshot, SessionStatus};
 
 use spec::spec;
 
@@ -845,5 +847,358 @@ fn status_supersede_015_a_stacked_key_collision_still_lands_on_its_own_pane() {
         pane_b.agent_id.as_deref(),
         Some("pi-agent-9"),
         "the colliding frame's own agent did not get the card for its pane"
+    );
+}
+
+/// The generation a reconnecting TUI seeds a card for in `status/supersede/016`
+/// and `017`.
+const RECONNECT_AGENT_ID: &str = "reconnect-agent";
+
+/// An instant `offset` from now, truncated to a whole millisecond.
+/// `SessionSnapshot` carries `last_activity` in epoch milliseconds, so the
+/// reconnect tests stamp their frames on whole milliseconds and a comparison
+/// between the daemon's value and the seeded one is exact rather than off by
+/// the truncation.
+fn whole_ms(offset: Duration) -> chrono::DateTime<Utc> {
+    let at = Utc::now() + offset;
+    chrono::DateTime::from_timestamp_millis(at.timestamp_millis()).expect("in range")
+}
+
+/// Seed `tui`'s card for `PANE_ID` from `snapshot`, exactly as the TUI's
+/// reconnect hydration does (`ui.rs`: `register_pane`, then
+/// `seed_hydrated_session` under the same lock).
+fn reconnect(tui: &mut AppState, snapshot: Option<&SessionSnapshot>) {
+    tui.register_pane(PANE_ID.to_string());
+    tui.seed_hydrated_session(
+        PANE_ID.to_string(),
+        Some("/tmp/runbox".to_string()),
+        Some(AgentType::Pi),
+        Some(RECONNECT_AGENT_ID.to_string()),
+        snapshot,
+    );
+}
+
+/// The key `seed_hydrated_session` stores `PANE_ID`'s card under.
+fn seeded_key() -> String {
+    format!("pane-{PANE_ID}")
+}
+
+/// Which generation a pane-keyed pick landed on. The daemon and a reconnected
+/// TUI key the same generation differently (the TUI's seeded card is
+/// `pane-<id>`), so the comparison is by the agent that owns the session.
+fn owner_of(state: &AppState, session_id: Option<String>) -> Option<String> {
+    session_id
+        .and_then(|id| state.sessions.get(&id))
+        .and_then(|session| session.agent_id.clone())
+}
+
+/// The `ListAgents` join's answer for `agent_id` on `PANE_ID`, as JSON so the
+/// whole snapshot — `last_activity_ms` included — compares at once.
+fn join(state: &AppState, agent_id: &str) -> Option<serde_json::Value> {
+    state
+        .live_session_for(agent_id, Some(PANE_ID))
+        .map(|snapshot| serde_json::to_value(snapshot).expect("a snapshot serializes"))
+}
+
+/// A history-only live-target declaration, so `pane_writable` has a visible
+/// answer that tells a seeded card apart from any session that declared none.
+fn history_only() -> LiveTarget {
+    LiveTarget {
+        kind: TargetKind::Process,
+        writable: Writable::HistoryOnly,
+    }
+}
+
+/// Scenario: A daemon holds an agent whose history-only card went quiet an hour ago, and a TUI reconnects and seeds its card from the daemon's snapshot. A different agent's frame then reaches both — stamped half an hour after the quiet instant in one run, half an hour before it in another. The TUI must retire or keep its seeded card exactly where the daemon retires or keeps its own, so `pane_writable`, `pane_session_id` and the `ListAgents` join pick the same generation on both sides.
+#[spec("status/supersede/016")]
+#[test]
+fn status_supersede_016_a_reconnected_card_is_superseded_exactly_where_the_daemons_is() {
+    let quiet_since = whole_ms(-Duration::hours(1));
+    for (straggler_at, daemon_retires_incumbent) in [
+        (quiet_since + Duration::minutes(30), true),
+        (quiet_since - Duration::minutes(30), false),
+    ] {
+        // The daemon's own state, built the way hook frames build it.
+        let mut daemon = AppState::default();
+        daemon.register_pane(PANE_ID.to_string());
+        let mut announced = event(
+            "incumbent-session",
+            AgentType::Pi,
+            EventType::SessionStart,
+            Some(RECONNECT_AGENT_ID),
+            quiet_since - Duration::minutes(5),
+        );
+        announced.live_target = Some(history_only());
+        daemon.apply_event(announced);
+        daemon.apply_event(event(
+            "incumbent-session",
+            AgentType::Pi,
+            EventType::Idle,
+            Some(RECONNECT_AGENT_ID),
+            quiet_since,
+        ));
+
+        // What `ListAgents` hands the reconnecting TUI for that record.
+        let snapshot = daemon
+            .live_session_for(RECONNECT_AGENT_ID, Some(PANE_ID))
+            .expect("the daemon holds a live session for the agent");
+        let mut tui = AppState::default();
+        reconnect(&mut tui, Some(&snapshot));
+
+        assert_eq!(
+            tui.sessions[&seeded_key()].last_activity,
+            quiet_since,
+            "the reconnected card must carry the daemon's quiet instant, not the moment it was seeded"
+        );
+        assert_eq!(
+            join(&tui, RECONNECT_AGENT_ID),
+            join(&daemon, RECONNECT_AGENT_ID),
+            "right after the reconnect the join must answer exactly what the daemon answers"
+        );
+
+        // Both sides receive the same broadcast frame: a different agent on the
+        // pane, whose takeover is only INFERRED, so `supersedes_generation`
+        // weighs its stamp against the incumbent's `last_activity`.
+        let straggler = event(
+            "successor-session",
+            AgentType::Pi,
+            EventType::Thinking,
+            Some("successor-agent"),
+            straggler_at,
+        );
+        daemon.apply_event(straggler.clone());
+        tui.apply_event(straggler);
+
+        let holds_incumbent = |state: &AppState| {
+            state
+                .sessions
+                .values()
+                .any(|session| session.agent_id.as_deref() == Some(RECONNECT_AGENT_ID))
+        };
+        assert_eq!(
+            holds_incumbent(&daemon),
+            !daemon_retires_incumbent,
+            "precondition: the daemon's own supersession decision"
+        );
+        assert_eq!(
+            holds_incumbent(&tui),
+            holds_incumbent(&daemon),
+            "a frame stamped {straggler_at} must retire the reconnected card exactly where it retires \
+             the daemon's (quiet since {quiet_since})"
+        );
+        assert_eq!(
+            tui.pane_writable(PANE_ID),
+            daemon.pane_writable(PANE_ID),
+            "pane_writable must pick the same generation on the TUI as on the daemon"
+        );
+        assert_eq!(
+            owner_of(&tui, tui.pane_session_id(PANE_ID)),
+            owner_of(&daemon, daemon.pane_session_id(PANE_ID)),
+            "pane_session_id must pick the same generation on the TUI as on the daemon"
+        );
+        for agent in [RECONNECT_AGENT_ID, "successor-agent"] {
+            assert_eq!(
+                join(&tui, agent),
+                join(&daemon, agent),
+                "the ListAgents join must answer the same for {agent} on both sides"
+            );
+        }
+    }
+}
+
+/// Scenario: A TUI already holds evidence for the card it is about to seed — a `SessionStart` that landed before hydration and ties the snapshot, an older one, a future-stamped session from another agent, a newer report the same agent sent without a pane, or the card itself after it saw a newer frame than the snapshot it is re-seeded from. Seeding the card from the daemon's snapshot must change no newest-wins pick: the seeded card wins exactly where a freshly minted one won, never ties, and its `last_activity` never drops below evidence the state already held.
+#[spec("status/supersede/017")]
+#[test]
+fn status_supersede_017_the_reconnect_overlay_changes_no_newest_wins_pick() {
+    let quiet_since = whole_ms(-Duration::hours(1));
+    let snapshot_at = |at: chrono::DateTime<Utc>| SessionSnapshot {
+        status: SessionStatus::Working,
+        agent_type: Some(AgentType::Pi),
+        active_tool: None,
+        // Distinct from anything a bare `SessionStart` card carries, so the
+        // join's answer says which card it picked.
+        tool_count: 7,
+        first_prompts: Vec::new(),
+        last_user_prompt: None,
+        live_target: Some(history_only()),
+        last_activity_ms: Some(at.timestamp_millis()),
+    };
+    // A key that sorts AFTER `pane-<id>`: the join breaks an exact tie on the
+    // larger session id, so a tie with this card is observable rather than
+    // resolved in the seeded card's favour by the alphabet.
+    let early_key = "zz-early-session";
+
+    // (a) A `SessionStart` reached the TUI before hydration seeded the pane (its
+    // event subscriber starts first), and it was the daemon's newest frame, so
+    // the snapshot's instant EQUALS its stamp.
+    // (b) The same, with the snapshot strictly newer than it.
+    for (early_at, overlay_applies) in [
+        (quiet_since, false),
+        (quiet_since - Duration::minutes(10), true),
+    ] {
+        let mut tui = AppState::default();
+        tui.apply_event(event(
+            early_key,
+            AgentType::Pi,
+            EventType::SessionStart,
+            Some(RECONNECT_AGENT_ID),
+            early_at,
+        ));
+        let before_seed = Utc::now();
+        reconnect(&mut tui, Some(&snapshot_at(quiet_since)));
+
+        let seeded = &tui.sessions[&seeded_key()];
+        if overlay_applies {
+            assert_eq!(
+                seeded.last_activity, quiet_since,
+                "a snapshot newer than everything the state holds must be taken"
+            );
+        } else {
+            assert!(
+                seeded.last_activity >= before_seed,
+                "a snapshot that only TIES the pane's newest evidence must leave the freshly minted \
+                 value, not create a tie; got {}",
+                seeded.last_activity
+            );
+        }
+        assert_eq!(
+            tui.pane_session_id(PANE_ID),
+            Some(seeded_key()),
+            "pane_session_id must still pick the seeded card (early frame at {early_at})"
+        );
+        assert_eq!(
+            tui.pane_writable(PANE_ID),
+            Writable::HistoryOnly,
+            "pane_writable must still pick the seeded card (early frame at {early_at})"
+        );
+        assert_eq!(
+            tui.agent_writable(RECONNECT_AGENT_ID),
+            Writable::HistoryOnly,
+            "agent_writable must still pick the seeded card (early frame at {early_at})"
+        );
+        assert_eq!(
+            tui.live_session_for(RECONNECT_AGENT_ID, Some(PANE_ID))
+                .map(|live| live.tool_count),
+            Some(7),
+            "the ListAgents join must still pick the seeded card (early frame at {early_at})"
+        );
+    }
+
+    // (c) A session from another agent on the pane carries a stamp in the
+    // future, so a freshly minted card never beat it. A snapshot stamped even
+    // further out must not flip that.
+    let mut tui = AppState::default();
+    tui.apply_event(event(
+        "future-session",
+        AgentType::Pi,
+        EventType::SessionStart,
+        Some("future-agent"),
+        whole_ms(Duration::hours(1)),
+    ));
+    reconnect(&mut tui, Some(&snapshot_at(whole_ms(Duration::hours(2)))));
+    assert_eq!(
+        owner_of(&tui, tui.pane_session_id(PANE_ID)).as_deref(),
+        Some("future-agent"),
+        "a card that lost to a future-stamped session before the overlay must still lose to it"
+    );
+    assert_eq!(
+        tui.pane_writable(PANE_ID),
+        Writable::Live,
+        "pane_writable must still pick the future-stamped session"
+    );
+
+    // (d) The same agent reported without a pane before hydration, later than
+    // the snapshot's instant. `agent_writable` weighs that session against the
+    // seeded card, so it is evidence too, even though it is on no pane.
+    let mut tui = AppState::default();
+    let mut paneless = event(
+        "paneless-session",
+        AgentType::Pi,
+        EventType::Thinking,
+        Some(RECONNECT_AGENT_ID),
+        quiet_since + Duration::minutes(1),
+    );
+    paneless.pane_id = None;
+    tui.apply_event(paneless);
+    reconnect(&mut tui, Some(&snapshot_at(quiet_since)));
+    assert_eq!(
+        tui.agent_writable(RECONNECT_AGENT_ID),
+        Writable::HistoryOnly,
+        "agent_writable must still pick the seeded card over the agent's paneless session"
+    );
+
+    // (e) The card saw a frame newer than the snapshot it is later re-seeded
+    // from. The re-seed must not move its evidence backward — the same
+    // high-water mark `apply_event` keeps (`status/supersede/004`).
+    let mut tui = AppState::default();
+    let stale = snapshot_at(quiet_since);
+    reconnect(&mut tui, Some(&stale));
+    let newer = quiet_since + Duration::minutes(30);
+    tui.apply_event(event(
+        "later-session",
+        AgentType::Pi,
+        EventType::Thinking,
+        Some(RECONNECT_AGENT_ID),
+        newer,
+    ));
+    assert_eq!(
+        tui.sessions[&seeded_key()].last_activity,
+        newer,
+        "precondition: the newer frame landed on the seeded card"
+    );
+    reconnect(&mut tui, Some(&stale));
+    assert!(
+        tui.sessions[&seeded_key()].last_activity >= newer,
+        "a re-seed from a snapshot older than the card's own evidence moved last_activity backward to {}",
+        tui.sessions[&seeded_key()].last_activity
+    );
+}
+
+/// Scenario: A TUI reconnects to a daemon whose agent reported a stamp an hour in the future, and seeds its card from that snapshot. A different agent then takes the pane and reports a minute after the reconnect. The card must not import the future stamp, so that honest successor still retires it; imported, the stamp would pin the stale card against every successor until the wall clock caught up, because the daemon's registry-ownership ground has no counterpart in a client.
+#[spec("status/supersede/018")]
+#[test]
+fn status_supersede_018_a_future_stamped_snapshot_cannot_pin_the_reconnected_card() {
+    let future = whole_ms(Duration::hours(1));
+    let snapshot = SessionSnapshot {
+        status: SessionStatus::Working,
+        agent_type: Some(AgentType::Pi),
+        active_tool: None,
+        tool_count: 7,
+        first_prompts: Vec::new(),
+        last_user_prompt: None,
+        live_target: Some(history_only()),
+        last_activity_ms: Some(future.timestamp_millis()),
+    };
+    let mut tui = AppState::default();
+    let before_seed = Utc::now();
+    reconnect(&mut tui, Some(&snapshot));
+    let after_seed = Utc::now();
+
+    let seeded = tui.sessions[&seeded_key()].last_activity;
+    assert!(
+        seeded >= before_seed && seeded <= after_seed,
+        "a snapshot stamped in the future must leave the freshly minted value, got {seeded}"
+    );
+
+    tui.apply_event(event(
+        "successor-session",
+        AgentType::Pi,
+        EventType::Thinking,
+        Some("successor-agent"),
+        after_seed + Duration::minutes(1),
+    ));
+    assert!(
+        !tui.sessions.contains_key(&seeded_key()),
+        "an honest successor's frame must still retire the reconnected card"
+    );
+    assert_eq!(
+        owner_of(&tui, tui.pane_session_id(PANE_ID)).as_deref(),
+        Some("successor-agent"),
+        "pane_session_id must follow the successor, not a card pinned by a future stamp"
+    );
+    assert_eq!(
+        tui.pane_writable(PANE_ID),
+        Writable::Live,
+        "pane_writable must follow the successor, not the pinned history-only card"
     );
 }

@@ -2626,7 +2626,8 @@ async fn live_003_join_picks_newest_last_activity_inner() {
 /// session the way `ui.rs` does — `AppState::seed_hydrated_session` — makes
 /// agent A's card carry the snapshot's `status` / `agent_type` (overriding the
 /// `None` spawn-time value) / `active_tool` / `tool_count` / `first_prompts` /
-/// `last_user_prompt`, NOT a bare `Idle` / "No agent" placeholder, while agent
+/// `last_user_prompt` and the instant it went quiet an hour earlier (issue
+/// #804), NOT a bare `Idle` / "No agent" placeholder, while agent
 /// B's snapshot-absent card falls back to today's bare placeholder (Idle,
 /// spawn-time `OpenCode`). Each pane seeds exactly one card — no duplicate.
 #[spec("session/live/004")]
@@ -2684,6 +2685,24 @@ async fn live_004_hydrated_session_seeds_from_live_snapshot_with_fallback_inner(
         drive_session_to_working(&mut guard, "sess-a", pane_a, &agent_a);
     }
 
+    // Issue #804: agent A then went quiet an hour ago. `drive_session_to_working`
+    // stamps its frames with `Utc::now()`, which cannot be told apart from a
+    // card minted at seed time, so move the daemon's high-water mark back to a
+    // whole millisecond an hour old — the precision the snapshot carries it at.
+    let quiet_since = chrono::DateTime::from_timestamp_millis(
+        (Utc::now() - chrono::Duration::hours(1)).timestamp_millis(),
+    )
+    .expect("an hour ago is a representable instant");
+    {
+        let mut guard = state.write().await;
+        guard
+            .sessions
+            .values_mut()
+            .find(|s| s.pane_id.as_deref() == Some(pane_a))
+            .expect("agent A's live session")
+            .last_activity = quiet_since;
+    }
+
     // Hydrate a fresh controller from the warm daemon.
     let ctrl = Arc::new(EmbeddedPaneController::new(
         path,
@@ -2739,6 +2758,11 @@ async fn live_004_hydrated_session_seeds_from_live_snapshot_with_fallback_inner(
         "first prompt threaded, got {:?}",
         live_a.first_prompts
     );
+    assert_eq!(
+        live_a.last_activity_ms,
+        Some(quiet_since.timestamp_millis()),
+        "the daemon's quiet instant threaded through HydratedPane.live"
+    );
     assert!(
         h_b.live.is_none(),
         "agent B has no live session → HydratedPane.live must be None; got {:?}",
@@ -2750,6 +2774,7 @@ async fn live_004_hydrated_session_seeds_from_live_snapshot_with_fallback_inner(
     // falls back to today's bare placeholder when absent. PRD #110 agent_id
     // minting is preserved on the seeded card.
     let mut tui_state = AppState::default();
+    let before_seed = Utc::now();
     for h in &hydrated {
         tui_state.register_pane(h.pane_id.clone());
         tui_state.seed_hydrated_session(
@@ -2810,6 +2835,11 @@ async fn live_004_hydrated_session_seeds_from_live_snapshot_with_fallback_inner(
         Some(agent_a.as_str()),
         "PRD #110 agent_id minting must be preserved on the seeded card"
     );
+    assert_eq!(
+        sess_a.last_activity, quiet_since,
+        "seeded card must say how long the agent has been quiet (issue #804), not reset to the \
+         moment it was seeded"
+    );
 
     // Fallback card (B): no snapshot → today's bare placeholder.
     let b_sessions: Vec<&SessionState> = tui_state
@@ -2836,6 +2866,11 @@ async fn live_004_hydrated_session_seeds_from_live_snapshot_with_fallback_inner(
     assert!(
         sess_b.active_tool.is_none(),
         "bare placeholder has no active tool"
+    );
+    assert!(
+        sess_b.last_activity >= before_seed,
+        "no snapshot must keep the placeholder's freshly minted last_activity; got {}",
+        sess_b.last_activity
     );
 
     drop(ctrl);

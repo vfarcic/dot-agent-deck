@@ -704,6 +704,39 @@ mod tests {
         );
     }
 
+    /// Scenario: install a reply whose record says the agent last did something
+    /// at a known instant, then read the list back. The rendered row must carry
+    /// that instant. The fold is seeded from the reply, and seeding it at the
+    /// install's own moment would report every idle agent as active "just now"
+    /// after every reconcile (issue #804).
+    #[test]
+    fn a_fetched_last_activity_survives_the_fold() {
+        let now = Instant::now();
+        let mut quiet = record("7", "pane-7");
+        quiet.live = Some(dot_agent_deck::state::SessionSnapshot {
+            status: SessionStatus::Idle,
+            agent_type: Some(AgentType::ClaudeCode),
+            active_tool: None,
+            tool_count: 9,
+            first_prompts: Vec::new(),
+            last_user_prompt: None,
+            live_target: None,
+            last_activity_ms: Some(1_700_000_000_000),
+        });
+
+        let mut view = AgentView::default();
+        view.install(listing(vec![quiet]), now);
+
+        assert_eq!(
+            view.records()[0]
+                .live
+                .as_ref()
+                .and_then(|live| live.last_activity_ms),
+            Some(1_700_000_000_000),
+            "the row must report when the daemon last saw the agent, not when the reply landed"
+        );
+    }
+
     /// Scenario: the first refresh of a fresh view must fetch — there is nothing
     /// to answer from, and an empty list is not the same claim as "no agents".
     #[test]

@@ -6994,6 +6994,67 @@ impl AppState {
     /// session exactly as `insert_placeholder_session` does, so a
     /// post-reconnect `SessionStart` from the same agent remaps onto this
     /// card via `apply_event`'s reuse guard instead of spawning a duplicate.
+    ///
+    /// # `last_activity`, and why it is overlaid only when it is newer
+    ///
+    /// Issue #804: the snapshot's [`SessionSnapshot::last_activity_ms`] replaces
+    /// the placeholder's freshly minted `Utc::now()`, so a reconnected card's
+    /// `Last:` readout says how long the agent has really been quiet instead of
+    /// `0s`. It is not only a display value, though. It is the ordering evidence
+    /// [`Self::supersedes_generation`] weighs and the key every newest-wins pick
+    /// resolves by ([`Self::pane_writable`], [`Self::pane_session_id`],
+    /// [`Self::agent_writable`], and the `ListAgents` join
+    /// [`Self::live_session_for`]). So the overlay is **newer-only**, measured
+    /// against the evidence this state already holds, not unconditional.
+    ///
+    /// "Already holds" means every session a newest-wins pick could weigh
+    /// against this card: those on the same pane or produced by the same agent,
+    /// **including the card this seed replaces**, read before the placeholder
+    /// overwrites it. The placeholder's own `Utc::now()` is not on that list.
+    /// Nothing observed it, and comparing against it would make the overlay a
+    /// no-op, since a snapshot of past activity is never newer than the present.
+    /// The snapshot's instant is taken only when it is strictly newer than all
+    /// of that evidence AND no later than the freshly minted value. Otherwise
+    /// the minted value stands, which is exactly what this function did before
+    /// #804. What the rule buys, each by construction:
+    ///
+    /// - **No newest-wins pick changes.** The overlay applies only where the
+    ///   snapshot's instant beats every competitor, and so does the minted value
+    ///   it may not exceed. So each pick that chose this card still does, and no
+    ///   new tie arises for hash order or the join's `session_id` tiebreak to
+    ///   settle. A competitor with a future stamp that already beat the minted
+    ///   card keeps beating it (`status/supersede/017`).
+    /// - **A future stamp is never imported.** The value is producer-supplied
+    ///   and unclamped (see [`SessionSnapshot::last_activity_ms`]), so the daemon
+    ///   can hold one no honest successor's frame will exceed. The daemon can
+    ///   afford to: its registry ground ([`Self::generation_disowned`]) retires
+    ///   a disowned generation whatever the stamps say. A client state has no
+    ///   registry to consult, so an imported future stamp would pin this card
+    ///   against every successor until the wall clock caught up
+    ///   (`status/supersede/018`). The minted value is kept instead, which also
+    ///   renders the same `Last:` readout, since `format_elapsed` shows `0s` for
+    ///   both.
+    /// - **The card's evidence never moves backward.** A re-seed from a snapshot
+    ///   older than a frame the card has since seen keeps the newer value. That
+    ///   is the high-water mark [`Self::apply_event`] maintains (PRD #284,
+    ///   `status/supersede/004`).
+    /// - **Later supersession is weighed against the daemon's own bar.** In a
+    ///   state that holds nothing else for this pane or agent, and for a stamp
+    ///   that is not in the future, the card carries the daemon's high-water
+    ///   mark. So `supersedes_generation`'s timestamp ground reaches the same
+    ///   verdict on a frame here as on the daemon (`status/supersede/016`),
+    ///   where a minted `now` protected the card from every frame stamped
+    ///   before the reconnect. The desktop builds a fresh fold per reply
+    ///   (`AgentView::install`). The TUI seeds a fresh state too, unless an
+    ///   event for this pane or agent reached it first, which can happen
+    ///   because its event subscriber starts before hydration. The match holds
+    ///   to the millisecond the wire carries: a frame stamped within the same
+    ///   millisecond as, but before, the daemon's instant is judged against the
+    ///   truncated value here.
+    ///
+    /// An absent value (an older daemon predating PRD #745 M9), or one no
+    /// `DateTime` can hold, keeps the minted value. That is the pre-#804
+    /// behaviour.
     pub fn seed_hydrated_session(
         &mut self,
         pane_id: String,
@@ -7008,6 +7069,11 @@ impl AppState {
             Some(snap) => snap.agent_type.clone().or(agent_type),
             None => agent_type,
         };
+        // Issue #804: the evidence the overlaid `last_activity` has to stay
+        // above, read BEFORE the placeholder insert overwrites a same-key card
+        // (see the doc comment).
+        let held_evidence =
+            live.and_then(|_| self.newest_activity_for(&pane_id, agent_id.as_deref()));
         // Mint the placeholder exactly as today (PRD #110 agent_id,
         // started_at reuse, session_id), then overlay the live snapshot
         // fields when one is present.
@@ -7033,8 +7099,37 @@ impl AppState {
                         .recent_events
                         .push_back(live_target_carrier_event(session, live_target));
                 }
+                // Issue #804: newer-only, per the doc comment. Deliberately
+                // AFTER the carrier above, which keeps its minted stamp: the
+                // carrier's timestamp feeds the pane's event watermark
+                // (`ui::pane_event_watermark`), a separate ordering surface this
+                // overlay does not move.
+                if let Some(observed) = snap
+                    .last_activity_ms
+                    .and_then(DateTime::<Utc>::from_timestamp_millis)
+                    && observed <= session.last_activity
+                    && held_evidence.is_none_or(|held| observed > held)
+                {
+                    session.last_activity = observed;
+                }
             }
         }
+    }
+
+    /// Issue #804: the newest `last_activity` among the sessions a newest-wins
+    /// pick could weigh against a card for `pane_id` produced by `agent_id`:
+    /// those on the same pane, and those from the same agent. `None` when this
+    /// state holds no such session. [`Self::seed_hydrated_session`] is the only
+    /// caller.
+    fn newest_activity_for(&self, pane_id: &str, agent_id: Option<&str>) -> Option<DateTime<Utc>> {
+        self.sessions
+            .values()
+            .filter(|s| {
+                s.pane_id.as_deref() == Some(pane_id)
+                    || (agent_id.is_some() && s.agent_id.as_deref() == agent_id)
+            })
+            .map(|s| s.last_activity)
+            .max()
     }
 
     /// Register ONE orchestration role pane in the daemon-side maps that
