@@ -1993,8 +1993,60 @@ impl DaemonClient {
         };
         self.require_capability(crate::daemon_protocol::CAP_START_PREPARED_AGENT)
             .await?;
+        self.send_start_prepared_agent(opts, token, false).await
+    }
+
+    /// PRD #1223 M6 — start one role of a workflow this daemon prepared **with
+    /// the role's configured command**, the way the TUI's orchestration launch
+    /// spawns it. Answers the new agent's id.
+    ///
+    /// Sends [`AttachRequest::StartPreparedAgent`] with `use_configured_command`
+    /// set: the daemon reads the role's command and resolved agent type from the
+    /// config its preparation approved (a stale config is refused with nothing
+    /// started), names the pane after the role when `opts.display_name` is
+    /// `None`, and seeds a **Pi** start role with the coordinator prompt
+    /// natively. A non-Pi start role's prompt is still the caller's to deliver,
+    /// as after [`Self::start_agent_with_prep_token`]. `opts.command`,
+    /// `opts.agent_type` and `opts.seed` must be `None` — the daemon refuses the
+    /// start otherwise (`ClientError::Server`) and starts nothing.
+    ///
+    /// **Withholds unless the daemon advertises
+    /// [`crate::daemon_protocol::CAP_PREPARED_ROLE_COMMAND`]**, answering
+    /// [`GatedQuery::Unsupported`] without sending anything. The flag is a FIELD
+    /// on a verb older daemons already accept, so sending it to one would start
+    /// the daemon's default shell for the role and report success — the silent
+    /// failure [`Self::start_authoring_agent`] guards against, and guarded the
+    /// same way: the decision comes from THIS call's own `Hello`
+    /// ([`Self::fresh_capabilities`]), never from the cache every clone shares.
+    /// One extra round trip per role a person launches; the residual is a daemon
+    /// replaced between that `Hello` and the start (`docs/develop/versioning.md`).
+    pub async fn start_prepared_role(
+        &self,
+        opts: StartAgentOptions,
+        prep_token: &str,
+    ) -> Result<GatedQuery<String>, ClientError> {
+        if !self
+            .fresh_capabilities()
+            .await?
+            .supports(crate::daemon_protocol::CAP_PREPARED_ROLE_COMMAND)
+        {
+            return Ok(GatedQuery::Unsupported);
+        }
+        self.send_start_prepared_agent(opts, prep_token, true)
+            .await
+            .map(GatedQuery::Answered)
+    }
+
+    /// The one `start-prepared-agent` sender. `use_configured_command` is `true`
+    /// only from [`Self::start_prepared_role`], after its capability check.
+    async fn send_start_prepared_agent(
+        &self,
+        opts: StartAgentOptions,
+        prep_token: &str,
+        use_configured_command: bool,
+    ) -> Result<String, ClientError> {
         let req = AttachRequest::StartPreparedAgent {
-            prep_token: token.to_string(),
+            prep_token: prep_token.to_string(),
             command: opts.command,
             cwd: opts.cwd,
             display_name: opts.display_name,
@@ -2004,6 +2056,7 @@ impl DaemonClient {
             tab_membership: opts.tab_membership,
             agent_type: opts.agent_type,
             seed: opts.seed,
+            use_configured_command,
         };
         let (mut rd, mut wr) = self.connect().await?;
         let resp = issue_command(&mut rd, &mut wr, &req).await?;
@@ -3985,6 +4038,191 @@ mod tests {
         drop(dir);
     }
 
+    /// PRD #1223 M6 — a configured-command prepared start withholds against the
+    /// two older daemons a desktop will meet: one advertising nothing (pre-PRD
+    /// #819), and one advertising everything up to M7 — `start-prepared-agent`
+    /// included — but not `prepared-role-command`. Neither is sent the start,
+    /// because such a daemon would drop the flag and start its default shell for
+    /// the role. The handle's cache names the capability, as if captured from a
+    /// daemon since replaced: the start must re-handshake rather than trust it.
+    #[cfg(unix)]
+    #[test]
+    fn prepared_role_start_is_withheld_by_a_daemon_that_does_not_advertise_it() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("build older-daemon runtime");
+        runtime.block_on(async {
+            prepared_role_start_is_withheld_inner(None).await;
+            prepared_role_start_is_withheld_inner(Some(&[
+                CAP_LIST_PROJECTS,
+                CAP_RESOLVE_PROJECT,
+                CAP_PREPARE_WORKFLOW,
+                crate::daemon_protocol::CAP_START_PREPARED_AGENT,
+                crate::daemon_protocol::CAP_STOP_DAEMON,
+                crate::daemon_protocol::CAP_FOCUS_GAINED,
+                crate::daemon_protocol::CAP_LIST_DIRECTORIES,
+                crate::daemon_protocol::CAP_NEW_AGENT_OPTIONS,
+                crate::daemon_protocol::CAP_AUTHORING_KIND,
+            ]))
+            .await;
+        });
+    }
+
+    #[cfg(unix)]
+    async fn prepared_role_start_is_withheld_inner(advertised: Option<&'static [&'static str]>) {
+        let (dir, path, listener) = {
+            let _g = BIND_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("older-daemon.sock");
+            let listener = bind_attach_listener(&path).expect("bind older daemon");
+            (dir, path, listener)
+        };
+        let other_requests = Arc::new(AtomicUsize::new(0));
+        let server_other_requests = other_requests.clone();
+        let server = tokio::spawn(async move {
+            while let Ok(Ok(mut stream)) =
+                tokio::time::timeout(std::time::Duration::from_millis(500), listener.accept()).await
+            {
+                let Some((KIND_REQ, payload)) = read_frame(&mut stream)
+                    .await
+                    .expect("read older-daemon request frame")
+                else {
+                    continue;
+                };
+                let request: serde_json::Value =
+                    serde_json::from_slice(&payload).expect("decode older-daemon request");
+                let response = if request.get("op").and_then(|op| op.as_str()) == Some("hello") {
+                    AttachResponse {
+                        capabilities: advertised
+                            .map(|list| list.iter().map(|cap| cap.to_string()).collect()),
+                        ..AttachResponse::hello(PROTOCOL_VERSION)
+                    }
+                } else {
+                    // What an older daemon would really do: drop the flag and
+                    // start its default shell. Counted, because reaching here at
+                    // all is the failure.
+                    server_other_requests.fetch_add(1, Ordering::SeqCst);
+                    AttachResponse::with_id("default-shell-role".into())
+                };
+                crate::daemon_protocol::write_resp(&mut stream, &response)
+                    .await
+                    .expect("write older-daemon response");
+            }
+        });
+        let client = DaemonClient::new(path);
+        client.store_capabilities_from_hello(
+            &AttachResponse::hello(PROTOCOL_VERSION).with_capabilities(),
+        );
+
+        assert_eq!(
+            GatedStart::PreparedRole
+                .start(client.clone())
+                .await
+                .expect("a withhold is not an error"),
+            GatedQuery::Unsupported,
+            "advertised {advertised:?}: no `prepared-role-command`, no configured start"
+        );
+        assert_eq!(
+            other_requests.load(Ordering::SeqCst),
+            0,
+            "advertised {advertised:?}: withholding means no start reaches the socket, even \
+             from a handle whose cached set still names `prepared-role-command`"
+        );
+
+        drop(client);
+        server.await.unwrap();
+        drop(dir);
+    }
+
+    /// PRD #1223 M6 — the positive half, against the real dispatch: a daemon at
+    /// this build advertises `prepared-role-command`, so the method sends the
+    /// start, and the daemon runs the role as configured — its declared agent,
+    /// its name on the pane. A start that also names a `command` is the daemon's
+    /// refusal with nothing started, not a withhold. Without this, a method that
+    /// withheld unconditionally would pass the tests above.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn prepared_role_start_is_sent_to_a_daemon_that_advertises_it() {
+        let (_dir, path, registry) = spawn_test_server().await;
+        let client = DaemonClient::new(path);
+        let scratch = crate::test_temp::tempdir().expect("scratch dir");
+        let project = std::fs::canonicalize(scratch.path()).expect("canonical project");
+        std::fs::write(
+            project.join(crate::project_config::CONFIG_FILE_NAME),
+            r#"
+[[orchestrations]]
+name = "loop"
+
+[[orchestrations.roles]]
+name = "planner"
+command = "sh -c 'sleep 600'"
+agent = "opencode"
+start = true
+"#,
+        )
+        .expect("write the project config");
+        let project_wire = project.to_str().expect("utf-8 scratch path");
+        let prepared = client
+            .prepare_workflow(project_wire, "loop", "", None)
+            .await
+            .expect("the preparation succeeds");
+        let opts = |command: Option<&str>| StartAgentOptions {
+            command: command.map(str::to_string),
+            cwd: Some(prepared.path.clone()),
+            env: vec![(
+                crate::agent_pty::DOT_AGENT_DECK_PANE_ID.into(),
+                "configured-planner".into(),
+            )],
+            tab_membership: Some(TabMembership::Orchestration {
+                name: "loop".into(),
+                role_index: 0,
+                role_name: "planner".into(),
+                is_start_role: true,
+                orchestration_cwd: Some(prepared.path.clone()),
+                display_title: Some("run title".into()),
+                orchestration_id: Some("configured-run".into()),
+            }),
+            ..StartAgentOptions::default()
+        };
+
+        let refusal = client
+            .start_prepared_role(opts(Some("/bin/sh")), &prepared.token)
+            .await
+            .expect_err("a command alongside the flag is the daemon's refusal");
+        assert!(
+            matches!(&refusal, ClientError::Server(message)
+                if message.contains("use_configured_command")),
+            "{refusal:?}"
+        );
+        assert!(
+            registry.agent_records().is_empty(),
+            "a refused configured start starts nothing"
+        );
+
+        let GatedQuery::Answered(id) = client
+            .start_prepared_role(opts(None), &prepared.token)
+            .await
+            .expect("an advertised configured start is sent")
+        else {
+            panic!("a daemon at this build advertises `prepared-role-command`");
+        };
+        let record = registry
+            .agent_records()
+            .into_iter()
+            .find(|record| record.id == id)
+            .expect("the answered id is the agent the daemon started");
+        assert_eq!(record.display_name.as_deref(), Some("planner"));
+        assert_eq!(record.agent_type, Some(AgentType::OpenCode));
+        assert_eq!(
+            registry.take_pending_seed_native_for("configured-planner", Some(&id)),
+            None,
+            "a non-Pi start role's coordinator prompt stays the client's to deliver"
+        );
+        registry.close_agent(&id).unwrap();
+    }
+
     /// PRD #1223 audit A1 — the authoring start decides from ITS OWN handshake,
     /// not from the cache every clone of the handle shares.
     ///
@@ -4022,20 +4260,157 @@ mod tests {
         runtime.block_on(async {
             // The stale fetch saw `authoring-kind`; the daemon now holding the
             // endpoint does not advertise it.
-            authoring_decision_ignores_a_concurrent_store_inner(DAEMON_CAPABILITIES, older).await;
+            gated_start_decision_ignores_a_concurrent_store_inner(
+                GatedStart::Authoring,
+                DAEMON_CAPABILITIES,
+                older,
+            )
+            .await;
             // And the reverse: the stale fetch saw an older daemon; the daemon now
             // holding the endpoint advertises it.
-            authoring_decision_ignores_a_concurrent_store_inner(older, DAEMON_CAPABILITIES).await;
+            gated_start_decision_ignores_a_concurrent_store_inner(
+                GatedStart::Authoring,
+                older,
+                DAEMON_CAPABILITIES,
+            )
+            .await;
         });
     }
 
+    /// PRD #1223 M6 — the configured-command prepared start is a gated FIELD
+    /// with the same silent older-daemon failure as `authoring_kind` (every role
+    /// would start the default shell), so it decides the same way: from its own
+    /// handshake, never from a set a clone stored concurrently. Same harness as
+    /// the A1 test above, in both directions.
     #[cfg(unix)]
-    async fn authoring_decision_ignores_a_concurrent_store_inner(
+    #[test]
+    fn prepared_role_start_decides_from_its_own_handshake_not_a_concurrent_store() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("build concurrent-store runtime");
+        let older: &'static [&'static str] = &[
+            CAP_LIST_PROJECTS,
+            CAP_RESOLVE_PROJECT,
+            CAP_PREPARE_WORKFLOW,
+            crate::daemon_protocol::CAP_START_PREPARED_AGENT,
+            crate::daemon_protocol::CAP_AUTHORING_KIND,
+        ];
+        runtime.block_on(async {
+            gated_start_decision_ignores_a_concurrent_store_inner(
+                GatedStart::PreparedRole,
+                DAEMON_CAPABILITIES,
+                older,
+            )
+            .await;
+            gated_start_decision_ignores_a_concurrent_store_inner(
+                GatedStart::PreparedRole,
+                older,
+                DAEMON_CAPABILITIES,
+            )
+            .await;
+        });
+    }
+
+    /// The two gated FIELD starts, which re-handshake on every call and must
+    /// decide from that handshake alone.
+    #[cfg(unix)]
+    #[derive(Clone, Copy, Debug)]
+    enum GatedStart {
+        /// [`DaemonClient::start_authoring_agent`] (PRD #1223 M7).
+        Authoring,
+        /// [`DaemonClient::start_prepared_role`] (PRD #1223 M6).
+        PreparedRole,
+    }
+
+    #[cfg(unix)]
+    impl GatedStart {
+        fn capability(self) -> &'static str {
+            match self {
+                Self::Authoring => crate::daemon_protocol::CAP_AUTHORING_KIND,
+                Self::PreparedRole => crate::daemon_protocol::CAP_PREPARED_ROLE_COMMAND,
+            }
+        }
+
+        fn op(self) -> &'static str {
+            match self {
+                Self::Authoring => "start-agent",
+                Self::PreparedRole => "start-prepared-agent",
+            }
+        }
+
+        async fn start(self, client: DaemonClient) -> Result<GatedQuery<String>, ClientError> {
+            let env = vec![(
+                crate::agent_pty::DOT_AGENT_DECK_PANE_ID.into(),
+                "gated-pane".into(),
+            )];
+            match self {
+                Self::Authoring => {
+                    client
+                        .start_authoring_agent(
+                            StartAgentOptions {
+                                command: Some("claude".into()),
+                                cwd: Some("/tmp".into()),
+                                env,
+                                ..StartAgentOptions::default()
+                            },
+                            crate::authoring_seeds::AuthoringKind::Dispatcher,
+                        )
+                        .await
+                }
+                Self::PreparedRole => {
+                    client
+                        .start_prepared_role(
+                            StartAgentOptions {
+                                cwd: Some("/tmp".into()),
+                                env,
+                                ..StartAgentOptions::default()
+                            },
+                            "prep-0123",
+                        )
+                        .await
+                }
+            }
+        }
+
+        /// What the start frame the handshake licensed must carry.
+        fn assert_sent(self, request: &serde_json::Value) {
+            match self {
+                Self::Authoring => assert_eq!(
+                    request.get("authoring_kind").and_then(|k| k.as_str()),
+                    Some("dispatcher")
+                ),
+                Self::PreparedRole => {
+                    assert_eq!(
+                        request
+                            .get("use_configured_command")
+                            .and_then(|k| k.as_bool()),
+                        Some(true)
+                    );
+                    assert_eq!(
+                        request.get("prep_token").and_then(|k| k.as_str()),
+                        Some("prep-0123")
+                    );
+                    assert!(
+                        request
+                            .get("command")
+                            .is_none_or(serde_json::Value::is_null),
+                        "an opted-in start carries no command: {request}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    async fn gated_start_decision_ignores_a_concurrent_store_inner(
+        gated: GatedStart,
         stale: &'static [&'static str],
         fresh: &'static [&'static str],
     ) {
-        use crate::daemon_protocol::CAP_AUTHORING_KIND;
         use crate::platform::ipc::IpcStream;
+        let capability = gated.capability();
 
         let (dir, path, listener) = {
             let _g = BIND_LOCK.lock().unwrap_or_else(|p| p.into_inner());
@@ -4088,29 +4463,13 @@ mod tests {
         let (mut stale_stream, request) = next_held(&mut held).await;
         assert_eq!(op(&request), "hello", "the clone's fetch is a handshake");
 
-        // 2. The authoring call starts while that fetch is in flight.
-        let authoring = client.clone();
-        let start = tokio::spawn(async move {
-            authoring
-                .start_authoring_agent(
-                    StartAgentOptions {
-                        command: Some("claude".into()),
-                        cwd: Some("/tmp".into()),
-                        env: vec![(
-                            crate::agent_pty::DOT_AGENT_DECK_PANE_ID.into(),
-                            "authoring-pane".into(),
-                        )],
-                        ..StartAgentOptions::default()
-                    },
-                    crate::authoring_seeds::AuthoringKind::Dispatcher,
-                )
-                .await
-        });
+        // 2. The gated call starts while that fetch is in flight.
+        let start = tokio::spawn(gated.start(client.clone()));
         let (mut fresh_stream, request) = next_held(&mut held).await;
         assert_eq!(
             op(&request),
             "hello",
-            "stale {stale:?}: the authoring call handshakes before it decides"
+            "{gated:?} stale {stale:?}: the gated call handshakes before it decides"
         );
 
         // 3. The stale fetch lands in the shared cache mid-refresh.
@@ -4124,33 +4483,30 @@ mod tests {
         assert_eq!(
             client
                 .cached_capabilities()
-                .map(|caps| caps.supports(CAP_AUTHORING_KIND)),
-            Some(stale.contains(&CAP_AUTHORING_KIND)),
-            "the stale set is in the shared cache before the authoring call's reply arrives"
+                .map(|caps| caps.supports(capability)),
+            Some(stale.contains(&capability)),
+            "{gated:?}: the stale set is in the shared cache before the gated call's reply arrives"
         );
 
-        // 4. The authoring call's own reply.
+        // 4. The gated call's own reply.
         crate::daemon_protocol::write_resp(&mut fresh_stream, &hello_advertising(fresh))
             .await
-            .expect("answer the authoring call's handshake");
-        let outcome = if fresh.contains(&CAP_AUTHORING_KIND) {
+            .expect("answer the gated call's handshake");
+        let outcome = if fresh.contains(&capability) {
             let (mut start_stream, request) = next_held(&mut held).await;
             assert_eq!(
                 op(&request),
-                "start-agent",
-                "fresh {fresh:?}: the handshake that answered it licenses the start"
+                gated.op(),
+                "{gated:?} fresh {fresh:?}: the handshake that answered it licenses the start"
             );
-            assert_eq!(
-                request.get("authoring_kind").and_then(|k| k.as_str()),
-                Some("dispatcher")
-            );
+            gated.assert_sent(&request);
             crate::daemon_protocol::write_resp(
                 &mut start_stream,
-                &AttachResponse::with_id("authoring-agent".into()),
+                &AttachResponse::with_id("gated-agent".into()),
             )
             .await
             .expect("answer the start");
-            GatedQuery::Answered("authoring-agent".to_string())
+            GatedQuery::Answered("gated-agent".to_string())
         } else {
             GatedQuery::Unsupported
         };
@@ -4158,24 +4514,25 @@ mod tests {
             tokio::time::timeout(std::time::Duration::from_secs(10), start)
                 .await
                 .unwrap_or_else(|_| panic!(
-                    "stale {stale:?} / fresh {fresh:?}: the authoring call is waiting on a \
-                     reply the test never sends — it sent a start its own handshake withheld"
+                    "{gated:?} stale {stale:?} / fresh {fresh:?}: the gated call is waiting on \
+                     a reply the test never sends — it sent a start its own handshake withheld"
                 ))
                 .unwrap()
-                .expect("the authoring call completes"),
+                .expect("the gated call completes"),
             outcome,
-            "stale {stale:?} / fresh {fresh:?}: the decision follows the call's own handshake"
+            "{gated:?} stale {stale:?} / fresh {fresh:?}: the decision follows the call's own \
+             handshake"
         );
         assert!(
             held.try_recv().is_err(),
-            "stale {stale:?} / fresh {fresh:?}: nothing else reached the server"
+            "{gated:?} stale {stale:?} / fresh {fresh:?}: nothing else reached the server"
         );
         assert_eq!(
             client
                 .cached_capabilities()
-                .map(|caps| caps.supports(CAP_AUTHORING_KIND)),
-            Some(fresh.contains(&CAP_AUTHORING_KIND)),
-            "the refresh leaves the cache describing the daemon that answered it"
+                .map(|caps| caps.supports(capability)),
+            Some(fresh.contains(&capability)),
+            "{gated:?}: the refresh leaves the cache describing the daemon that answered it"
         );
 
         server.abort();

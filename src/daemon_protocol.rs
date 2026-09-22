@@ -509,6 +509,19 @@ pub const CAP_NEW_AGENT_OPTIONS: &str = "new-agent-options";
 /// delivery path it uses is.
 pub const CAP_AUTHORING_KIND: &str = "authoring-kind";
 
+/// Capability string for [`AttachRequest::StartPreparedAgent`]'s
+/// `use_configured_command` field (PRD #1223 M6).
+///
+/// Names a FIELD, like [`CAP_AUTHORING_KIND`], and for the same reason: the verb
+/// it rides on predates it, and serde drops an unknown key there, so an older
+/// daemon would answer an opted-in start by spawning its **default shell** for
+/// every role (no `command` is sent) and reporting success. Held by
+/// [`crate::daemon_client::DaemonClient::start_prepared_role`], which decides
+/// from a fresh handshake. **Unix-only**, travelling with
+/// [`CAP_START_PREPARED_AGENT`]: a field on a verb this build refuses on other
+/// platforms is not one it can honour there.
+pub const CAP_PREPARED_ROLE_COMMAND: &str = "prepared-role-command";
+
 /// The longest [`AttachRequest::FocusGained::client_id`] (and
 /// [`AttachRequest::AttachStream::client_id`]) this daemon accepts, in bytes.
 ///
@@ -577,6 +590,8 @@ fn invalid_client_id_message() -> String {
 /// every platform this builds for. PRD #1223's [`CAP_LIST_DIRECTORIES`],
 /// [`CAP_NEW_AGENT_OPTIONS`] and [`CAP_AUTHORING_KIND`] are on both lists for the
 /// same reason: none of their dispatch arms is `#[cfg]`-gated.
+/// [`CAP_PREPARED_ROLE_COMMAND`] is on the Unix list only, beside
+/// [`CAP_START_PREPARED_AGENT`] — it names a field of that verb.
 #[cfg(unix)]
 pub const DAEMON_CAPABILITIES: &[&str] = &[
     CAP_LIST_PROJECTS,
@@ -588,6 +603,7 @@ pub const DAEMON_CAPABILITIES: &[&str] = &[
     CAP_LIST_DIRECTORIES,
     CAP_NEW_AGENT_OPTIONS,
     CAP_AUTHORING_KIND,
+    CAP_PREPARED_ROLE_COMMAND,
 ];
 #[cfg(not(unix))]
 pub const DAEMON_CAPABILITIES: &[&str] = &[
@@ -1543,6 +1559,37 @@ pub enum AttachRequest {
         agent_type: Option<AgentType>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         seed: Option<String>,
+        /// PRD #1223 M6: start this role **from its prepared config**, the way
+        /// the TUI's orchestration launch spawns it (`src/tab.rs`), rather than
+        /// with a command the client supplies. `false` — and absent, which is
+        /// every sender before this field — is the verb exactly as it was.
+        ///
+        /// When set, the daemon takes from the role the config approved — read
+        /// under this preparation's staleness checks, so an edited config is
+        /// refused with `stale-preparation` and nothing starts — everything the
+        /// TUI takes from it at spawn: the role's `command`; its resolved agent
+        /// type (a declared `agent` wins, else the type its command infers); the
+        /// role name as the display name when the request names none; and, for
+        /// the configured **start** role when that type is Pi, the preparation's
+        /// coordinator prompt as PRD #201's native `seed`. Every other start
+        /// role's prompt is still the client's to deliver, exactly as on the
+        /// unflagged verb. The identity fields (`cwd`, the membership's
+        /// orchestration, role, start marker, index, title and id) are the
+        /// request's, matched against the preparation as they always were.
+        ///
+        /// The fields the flag replaces must not also be sent: a request that
+        /// sets it together with `command`, `agent_type` or `seed` is refused
+        /// before anything spawns. The flag sends no role command to a client —
+        /// [`crate::event::ProjectRole`]'s note stands; the daemon reads the
+        /// command where it runs it.
+        ///
+        /// **Withheld unless the daemon advertises
+        /// [`CAP_PREPARED_ROLE_COMMAND`]**, by
+        /// [`crate::daemon_client::DaemonClient::start_prepared_role`], the one
+        /// production sender: an older daemon drops the key and starts the
+        /// default shell.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        use_configured_command: bool,
     },
     /// PRD #1105 (focus-driven sizing): "the client `client_id` has just gained
     /// focus".
@@ -2996,7 +3043,7 @@ async fn handle_connection(
     // on the wire's `start-agent`. The `op` a peer sent has already decided
     // whether this connection is a prepared start, which is the whole property
     // the verb buys — a daemon that lacks the variant never reaches this line.
-    let (req, prepared_token) = match req {
+    let (req, prepared_token, use_configured_command) = match req {
         AttachRequest::StartPreparedAgent {
             prep_token,
             command,
@@ -3008,6 +3055,7 @@ async fn handle_connection(
             tab_membership,
             agent_type,
             seed,
+            use_configured_command,
         } => {
             // Refused where `PrepareWorkflow` is refused, and for its reason
             // rather than a reason of its own: no preparation can exist on this
@@ -3019,6 +3067,23 @@ async fn handle_connection(
             // advertised set mean less than it says.
             if let Err(message) = refuse_prepared_start_where_unsupported() {
                 write_resp(&mut stream, &AttachResponse::err(message)).await?;
+                return Ok(());
+            }
+            // PRD #1223 M6: an opted-in start takes its command, agent type and
+            // seed from the role's config, so a request that also supplies any
+            // of them is asking for two things at once. Refused before anything
+            // spawns rather than resolved by a precedence rule the caller would
+            // have to know.
+            if use_configured_command
+                && (command.is_some() || agent_type.is_some() || seed.is_some())
+            {
+                write_resp(
+                    &mut stream,
+                    &AttachResponse::err(
+                        "start-prepared-agent: use_configured_command starts the role with its                          configured command, agent and seed, so the request must not also carry                          `command`, `agent_type` or `seed`; nothing was started",
+                    ),
+                )
+                .await?;
                 return Ok(());
             }
             (
@@ -3037,9 +3102,10 @@ async fn handle_connection(
                     authoring_kind: None,
                 },
                 Some(prep_token),
+                use_configured_command,
             )
         }
-        other => (other, None),
+        other => (other, None, false),
     };
 
     match req {
@@ -3266,6 +3332,8 @@ async fn handle_connection(
             // (`stale-token`); it is ours and live but the world moved under it
             // (`stale-preparation`); or it is ours, live and intact and this is
             // not the launch it approved (`preparation-mismatch`).
+            let mut configured_role: Option<(crate::project_resolve::PreparedRoleConfig, String)> =
+                None;
             if let Some(token) = prepared_token.as_deref() {
                 let Some(binding) = crate::prep_token::binding(token) else {
                     write_resp(
@@ -3299,15 +3367,22 @@ async fn handle_connection(
                         TabMembership::Mode { .. } => None,
                     }),
                 };
+                // PRD #1223 M6: the line a Pi start role is seeded with when
+                // the start runs its configured command. Taken before the
+                // binding moves into the check below.
+                let coordinator_prompt = binding.coordinator_prompt.clone();
                 // Filesystem work, so it goes through the same bounded blocking
                 // pool every other project verb uses — one call, one permit, and
                 // never from inside a task that already holds one.
                 let outcome = crate::project_resolve::run_bounded(move || {
-                    crate::project_resolve::verify_prepared_start(&binding, &request)
+                    crate::project_resolve::verify_prepared_start_role(&binding, &request)
                 })
                 .await;
                 let refusal = match outcome {
-                    Ok(Ok(())) => None,
+                    Ok(Ok(role)) => {
+                        configured_role = Some((role, coordinator_prompt));
+                        None
+                    }
                     Ok(Err(refusal)) => {
                         // The cause is named here and nowhere else: the wire gets
                         // one sentence per category, so the daemon log is the
@@ -3334,6 +3409,40 @@ async fn handle_connection(
                     return Ok(());
                 }
             }
+
+            // PRD #1223 M6: an opted-in prepared start runs the role the way the
+            // TUI's orchestration launch does (`src/tab.rs`), from the role the
+            // check above matched in the config read it passed — so the command
+            // that runs is the one this preparation approved. The normalisation
+            // already refused a request that supplied `command`, `agent_type` or
+            // `seed` alongside the flag, so nothing here overrides a caller's
+            // value. Only the configured START role, and only when it resolves
+            // to Pi, is seeded natively with the coordinator prompt (the TUI's
+            // PRD #201 rule); any other start role's prompt stays the client's to
+            // deliver, as on the unflagged verb.
+            let (command, agent_type, display_name, seed) = match configured_role {
+                Some((role, coordinator_prompt)) if use_configured_command => {
+                    if role.command.trim().is_empty() {
+                        write_resp(
+                            &mut stream,
+                            &AttachResponse::err(
+                                "start-prepared-agent: the configured role command is empty;                                  nothing was started",
+                            ),
+                        )
+                        .await?;
+                        return Ok(());
+                    }
+                    let seed = (role.start && role.agent_type == Some(AgentType::Pi))
+                        .then_some(coordinator_prompt);
+                    (
+                        Some(role.command),
+                        role.agent_type,
+                        display_name.or(Some(role.name)),
+                        seed,
+                    )
+                }
+                _ => (command, agent_type, display_name, seed),
+            };
 
             // PRD #93 round-5: capture the bits we need to populate the
             // daemon's `AppState` role map BEFORE the spawn (we'll need
@@ -8011,6 +8120,80 @@ mod tests {
             .is_err(),
             "an unknown authoring kind must fail the decode, not start a seedless agent"
         );
+    }
+
+    /// PRD #1223 M6 — `prepared-role-command` is advertised exactly where the
+    /// verb it modifies is (Unix), and `use_configured_command` is OMITTED when
+    /// false, so every prepared start that does not opt in keeps the exact wire
+    /// shape an older daemon already parses; set, it round-trips. A payload
+    /// without the key — every sender before M6 — decodes as `false`.
+    #[test]
+    fn prepared_role_command_is_advertised_with_its_verb_omitted_when_false_and_round_trips() {
+        assert_eq!(CAP_PREPARED_ROLE_COMMAND, "prepared-role-command");
+        assert_eq!(
+            DAEMON_CAPABILITIES.contains(&CAP_PREPARED_ROLE_COMMAND),
+            DAEMON_CAPABILITIES.contains(&CAP_START_PREPARED_AGENT),
+            "the field is advertised exactly where its verb is"
+        );
+        assert_eq!(
+            DAEMON_CAPABILITIES.contains(&CAP_PREPARED_ROLE_COMMAND),
+            cfg!(unix)
+        );
+
+        let start = |use_configured_command| AttachRequest::StartPreparedAgent {
+            prep_token: "prep-0123".into(),
+            command: None,
+            cwd: Some("/srv/repo".into()),
+            rows: 24,
+            cols: 80,
+            env: vec![],
+            display_name: None,
+            tab_membership: None,
+            agent_type: None,
+            seed: None,
+            use_configured_command,
+        };
+        let plain = serde_json::to_value(start(false)).unwrap();
+        assert!(
+            !plain
+                .as_object()
+                .unwrap()
+                .contains_key("use_configured_command"),
+            "use_configured_command=false must be omitted from the wire payload: {plain}"
+        );
+        let opted_in = serde_json::to_value(start(true)).unwrap();
+        assert_eq!(opted_in["op"], "start-prepared-agent");
+        assert_eq!(opted_in["use_configured_command"], true);
+        assert!(
+            opted_in["command"].is_null(),
+            "an opted-in start built without a command sends none (`command` has always \
+             serialized an absent value as null, which decodes as `None`): {opted_in}"
+        );
+        match serde_json::from_value::<AttachRequest>(opted_in).unwrap() {
+            AttachRequest::StartPreparedAgent {
+                use_configured_command,
+                command,
+                ..
+            } => {
+                assert!(use_configured_command);
+                assert!(command.is_none());
+            }
+            other => panic!("expected StartPreparedAgent, got {other:?}"),
+        }
+        match serde_json::from_str::<AttachRequest>(
+            r#"{"op":"start-prepared-agent","prep_token":"prep-0123","command":"/bin/sh"}"#,
+        )
+        .unwrap()
+        {
+            AttachRequest::StartPreparedAgent {
+                use_configured_command,
+                ..
+            } => assert!(
+                !use_configured_command,
+                "a sender that predates the field must keep today's meaning"
+            ),
+            other => panic!("expected StartPreparedAgent, got {other:?}"),
+        }
     }
 
     /// PRD #1223 — the request shapes: an absent `path` is omitted rather than

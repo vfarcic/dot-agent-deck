@@ -1618,6 +1618,7 @@ fn prepared_start_payload(
         }),
         agent_type: None,
         seed: None,
+        use_configured_command: false,
     };
     match serde_json::to_value(&request).expect("a prepared start serializes") {
         serde_json::Value::Object(fields) => fields,
@@ -2268,6 +2269,211 @@ async fn the_client_routes_a_presented_token_onto_the_prepared_verb() {
         .await
         .expect("a token-less start is byte-for-byte the ordinary `start-agent`");
     assert!(!id.is_empty());
+}
+
+/// PRD #1223 M6: a project whose roles are long-lived `sh` stand-ins with
+/// DECLARED agents, so the configured-command path's seed rule can be observed
+/// without a real agent. `pi_start` decides whether the start role is Pi.
+fn configured_role_project(pi_start: bool) -> String {
+    format!(
+        r#"
+[[orchestrations]]
+name = "loop"
+
+[[orchestrations.roles]]
+name = "planner"
+command = "sh -c 'sleep 600'"
+agent = "{}"
+start = true
+
+[[orchestrations.roles]]
+name = "builder"
+command = "sh -c 'sleep 600'"
+agent = "pi"
+"#,
+        if pi_start { "pi" } else { "opencode" }
+    )
+}
+
+/// An opted-in prepared start for `role` of `configured_role_project`: no
+/// `command`, a pane id to key the seed by, and the flag.
+fn configured_role_payload(
+    token: &str,
+    project: &str,
+    role: &str,
+    is_start_role: bool,
+    pane_id: &str,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut payload =
+        prepared_start_payload(token, Some(project), Some(("loop", role, is_start_role)));
+    payload.remove("command");
+    payload.insert(
+        "env".into(),
+        serde_json::json!([["DOT_AGENT_DECK_PANE_ID", pane_id]]),
+    );
+    payload.insert("use_configured_command".into(), serde_json::json!(true));
+    payload
+}
+
+async fn prepare_loop(server: &Server, project: &Path) -> dot_agent_deck::event::PreparedWorkflow {
+    let resp = issue_json_request(
+        server,
+        serde_json::json!({
+            "op": "prepare-workflow",
+            "path": project.to_str().unwrap(),
+            "orchestration": "loop",
+            "task": "",
+        }),
+    )
+    .await;
+    assert!(resp.ok, "the preparation must succeed: {:?}", resp.error);
+    resp.workflow_prepared.expect("a PreparedWorkflow")
+}
+
+/// PRD #1223 M6: an opted-in prepared start takes its command, agent type and
+/// seed from the role's config, so a request that ALSO supplies any one of them
+/// is refused in the ordinary shape and starts nothing — rather than being
+/// resolved by a precedence rule the caller would have to know. Each field is
+/// probed on its own, and the same request without it then starts, so the
+/// refusal is the conflict and not the preparation.
+#[tokio::test]
+async fn a_configured_prepared_start_refuses_a_supplied_command_agent_type_or_seed() {
+    let server = start_server().await;
+    let (_dir, project) = mint_project(&configured_role_project(false));
+    let prepared = prepare_loop(&server, &project).await;
+
+    for (field, value) in [
+        ("command", serde_json::json!("/bin/sh")),
+        ("agent_type", serde_json::json!("claude_code")),
+        (
+            "seed",
+            serde_json::json!("a seed the config did not choose"),
+        ),
+    ] {
+        let mut payload = configured_role_payload(
+            &prepared.token,
+            &prepared.path,
+            "builder",
+            false,
+            "configured-conflict",
+        );
+        payload.insert(field.into(), value);
+        let resp = issue_json_request(&server, serde_json::Value::Object(payload)).await;
+        assert!(!resp.ok, "{field} alongside the flag must be refused");
+        assert!(resp.id.is_none(), "{field}: a refused start reports no id");
+        assert!(
+            resp.error
+                .as_deref()
+                .is_some_and(|e| e.contains("use_configured_command")),
+            "{field}: the refusal is the flag's, in the ordinary shape: {:?}",
+            resp.error
+        );
+        assert!(
+            server.registry.agent_records().is_empty(),
+            "{field}: a refused configured start must not have spawned a pane"
+        );
+    }
+
+    let resp = issue_json_request(
+        &server,
+        serde_json::Value::Object(configured_role_payload(
+            &prepared.token,
+            &prepared.path,
+            "builder",
+            false,
+            "configured-control",
+        )),
+    )
+    .await;
+    assert!(
+        resp.ok && resp.id.is_some(),
+        "the same start without the conflicting field is served: {:?}",
+        resp.error
+    );
+    let record = server
+        .registry
+        .agent_records()
+        .into_iter()
+        .find(|record| Some(&record.id) == resp.id.as_ref())
+        .expect("the served start is listed");
+    assert_eq!(
+        record.display_name.as_deref(),
+        Some("builder"),
+        "an unnamed role pane takes the role's name"
+    );
+    assert_eq!(
+        record.agent_type,
+        Some(AgentType::Pi),
+        "the role's declared agent wins"
+    );
+    server.registry.close_agent(&record.id).unwrap();
+}
+
+/// PRD #1223 M6: the TUI's PRD #201 rule, on the daemon — an opted-in start of
+/// the configured START role whose resolved type is Pi is seeded natively with
+/// the preparation's coordinator prompt (exactly the line the reply carried),
+/// while a Pi WORKER role and a non-Pi start role are not: the non-Pi start
+/// role's prompt stays the client's to deliver, as on the unflagged verb.
+#[tokio::test]
+async fn a_configured_prepared_start_seeds_only_a_pi_start_role_with_the_coordinator_prompt() {
+    let server = start_server().await;
+
+    for pi_start in [true, false] {
+        let (_dir, project) = mint_project(&configured_role_project(pi_start));
+        let prepared = prepare_loop(&server, &project).await;
+        assert!(!prepared.prompt.trim().is_empty());
+
+        let start_pane = format!("configured-start-{pi_start}");
+        let worker_pane = format!("configured-worker-{pi_start}");
+        let mut ids = Vec::new();
+        for (role, is_start, pane) in [
+            ("planner", true, start_pane.as_str()),
+            ("builder", false, worker_pane.as_str()),
+        ] {
+            let resp = issue_json_request(
+                &server,
+                serde_json::Value::Object(configured_role_payload(
+                    &prepared.token,
+                    &prepared.path,
+                    role,
+                    is_start,
+                    pane,
+                )),
+            )
+            .await;
+            assert!(resp.ok, "pi_start={pi_start} {role}: {:?}", resp.error);
+            ids.push(resp.id.expect("a served start reports its id"));
+        }
+
+        let expected_start_type = if pi_start {
+            AgentType::Pi
+        } else {
+            AgentType::OpenCode
+        };
+        assert_eq!(
+            server.registry.spawn_agent_type(&ids[0]),
+            Some(expected_start_type),
+            "pi_start={pi_start}: the start role runs as its declared agent"
+        );
+        assert_eq!(
+            server
+                .registry
+                .take_pending_seed_native_for(&start_pane, Some(&ids[0])),
+            pi_start.then(|| prepared.prompt.clone()),
+            "pi_start={pi_start}: only a Pi start role is seeded natively, with the \
+             preparation's own coordinator prompt"
+        );
+        assert_eq!(
+            server
+                .registry
+                .take_pending_seed_native_for(&worker_pane, Some(&ids[1])),
+            None,
+            "pi_start={pi_start}: a Pi worker role is never seeded — it is not the coordinator"
+        );
+        for id in ids {
+            server.registry.close_agent(&id).unwrap();
+        }
+    }
 }
 
 /// PRD #819 M2/M5: the `Hello` reply advertises each project verb explicitly,

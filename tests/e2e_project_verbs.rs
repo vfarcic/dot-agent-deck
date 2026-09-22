@@ -736,6 +736,7 @@ fn project_launch_004_empty_task_omits_the_task_section_and_preserves_the_run_ti
                 }),
                 agent_type: None,
                 seed: None,
+                use_configured_command: false,
             })
             .expect("StartPreparedAgent over the attach socket");
         assert!(
