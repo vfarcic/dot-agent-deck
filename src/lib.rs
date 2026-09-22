@@ -3,6 +3,7 @@
 mod agent_hook_config;
 pub mod agent_pty;
 pub mod agent_registry;
+pub mod authoring_seeds;
 pub mod bounded_read;
 pub mod build_id;
 pub mod build_version_handshake;

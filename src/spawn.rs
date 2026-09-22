@@ -1289,7 +1289,12 @@ fn session_start_wait_timeout() -> Duration {
 /// registered by the time this is called; detaching only frees the caller from
 /// the (possibly multi-second) `SessionStart` fallback wait. See [`spawn`]'s
 /// `detach_delivery` parameter for why the issue-dispatch path detaches.
-async fn run_delivery(
+///
+/// PRD #1223 M7: also the delivery behind `AttachRequest::StartAgent`'s
+/// `authoring_kind` for every agent but Pi — hence `pub(crate)`. That caller
+/// subscribes before spawning, as [`spawn`] does, and always detaches, because
+/// it is answering a `start-agent` round trip.
+pub(crate) async fn run_delivery(
     registry: &Arc<AgentPtyRegistry>,
     pane_id: String,
     agent_id: String,

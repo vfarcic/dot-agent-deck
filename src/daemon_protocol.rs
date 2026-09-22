@@ -497,6 +497,18 @@ pub const CAP_LIST_DIRECTORIES: &str = "list-directories";
 /// platform for the same reason.
 pub const CAP_NEW_AGENT_OPTIONS: &str = "new-agent-options";
 
+/// Capability string for [`AttachRequest::StartAgent`]'s `authoring_kind` field
+/// (PRD #1223 M7).
+///
+/// The one capability here that names a FIELD rather than a verb, because the
+/// verb it rides on has existed since the attach protocol did: serde drops an
+/// unknown key on `start-agent`, so an older daemon would answer an authoring
+/// start by starting a plain agent and reporting success. Held by
+/// [`crate::daemon_client::DaemonClient::start_authoring_agent`], and advertised
+/// on every platform — the `StartAgent` arm is not `#[cfg]`-gated and neither
+/// delivery path it uses is.
+pub const CAP_AUTHORING_KIND: &str = "authoring-kind";
+
 /// The longest [`AttachRequest::FocusGained::client_id`] (and
 /// [`AttachRequest::AttachStream::client_id`]) this daemon accepts, in bytes.
 ///
@@ -562,9 +574,9 @@ fn invalid_client_id_message() -> String {
 /// [`CAP_STOP_DAEMON`] and [`CAP_FOCUS_GAINED`] are on both lists: neither is a
 /// project verb, and neither [`AttachRequest::StopDaemon`]'s dispatch arm nor
 /// [`AttachRequest::FocusGained`]'s is `#[cfg]`-gated, so both are answered on
-/// every platform this builds for. PRD #1223's [`CAP_LIST_DIRECTORIES`] and
-/// [`CAP_NEW_AGENT_OPTIONS`] are on both lists for the same reason: neither
-/// dispatch arm is `#[cfg]`-gated.
+/// every platform this builds for. PRD #1223's [`CAP_LIST_DIRECTORIES`],
+/// [`CAP_NEW_AGENT_OPTIONS`] and [`CAP_AUTHORING_KIND`] are on both lists for the
+/// same reason: none of their dispatch arms is `#[cfg]`-gated.
 #[cfg(unix)]
 pub const DAEMON_CAPABILITIES: &[&str] = &[
     CAP_LIST_PROJECTS,
@@ -575,6 +587,7 @@ pub const DAEMON_CAPABILITIES: &[&str] = &[
     CAP_FOCUS_GAINED,
     CAP_LIST_DIRECTORIES,
     CAP_NEW_AGENT_OPTIONS,
+    CAP_AUTHORING_KIND,
 ];
 #[cfg(not(unix))]
 pub const DAEMON_CAPABILITIES: &[&str] = &[
@@ -584,6 +597,7 @@ pub const DAEMON_CAPABILITIES: &[&str] = &[
     CAP_FOCUS_GAINED,
     CAP_LIST_DIRECTORIES,
     CAP_NEW_AGENT_OPTIONS,
+    CAP_AUTHORING_KIND,
 ];
 
 // ---------------------------------------------------------------------------
@@ -1147,6 +1161,30 @@ pub enum AttachRequest {
         /// unchanged PTY-injection path (the fallback still delivers).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         seed: Option<String>,
+        /// PRD #1223 M7: start an AUTHORING agent — the daemon composes that
+        /// kind's seed from [`crate::authoring_seeds`] (the text the TUI types
+        /// into its own `schedule` / `schedule: issues` / `dispatcher` agents,
+        /// with this start's `cwd` as the directory it names) and delivers it
+        /// once the agent is ready. `None` is today's start, unchanged.
+        ///
+        /// **Withheld unless the daemon advertises [`CAP_AUTHORING_KIND`]**, by
+        /// [`crate::daemon_client::DaemonClient::start_authoring_agent`], the one
+        /// production sender (`DaemonClient::start_agent` always sends `None`).
+        /// That is why this field is gated rather than merely optional: an older
+        /// daemon drops an unknown key, so it would start the agent with **no
+        /// seed and no error**.
+        ///
+        /// Delivery goes through the paths the daemon already has rather than a
+        /// new one (#528): a Pi agent gets PRD #201's native seed (the same
+        /// stash and PTY safety net `seed` above arms); every other agent gets
+        /// [`crate::spawn`]'s readiness-gated delivery, the one `dispatch` and the
+        /// scheduler use. `command` keeps its meaning — empty is the daemon's
+        /// default shell — so a client resolves a blank command for an authoring
+        /// agent itself, as the TUI does. Refused, with nothing started, when it
+        /// is combined with `seed`, or when the start names no `cwd` or no valid
+        /// `DOT_AGENT_DECK_PANE_ID` for the delivery to route by.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        authoring_kind: Option<crate::authoring_seeds::AuthoringKind>,
     },
     StopAgent {
         id: String,
@@ -2969,6 +3007,9 @@ async fn handle_connection(
                     tab_membership,
                     agent_type,
                     seed,
+                    // PRD #1223 M7: an orchestration role is not an authoring
+                    // agent, and `start-prepared-agent` has no such field.
+                    authoring_kind: None,
                 },
                 Some(prep_token),
             )
@@ -3111,6 +3152,7 @@ async fn handle_connection(
             tab_membership,
             agent_type,
             seed,
+            authoring_kind,
         } => {
             // PRD #92 F1 followup hardening: refuse to start a new agent
             // while the registry's `shutting_down` latch is set. The
@@ -3307,6 +3349,34 @@ async fn handle_connection(
                 });
             let cwd_for_state = cwd.clone();
 
+            // PRD #1223 M7: an authoring start's seed is composed — and its
+            // preconditions checked — before anything spawns, so a refusal
+            // starts nothing. See `AttachRequest::StartAgent::authoring_kind`.
+            let authoring_seed = match authoring_kind {
+                None => None,
+                Some(kind) => match crate::authoring_seeds::seed_for_start(
+                    kind,
+                    cwd.as_deref(),
+                    pane_id_env.as_deref(),
+                    seed.as_deref(),
+                ) {
+                    Ok(composed) => Some(composed),
+                    Err(refusal) => {
+                        write_resp(
+                            &mut stream,
+                            &AttachResponse::err(format!("start-agent: {refusal}")),
+                        )
+                        .await?;
+                        return Ok(());
+                    }
+                },
+            };
+            // Subscribed BEFORE the spawn, as every readiness-gated delivery is
+            // (`crate::spawn::spawn`, `crate::state::dispatch_one_owned`), so a
+            // fast-booting agent's `SessionStart` cannot reach the broadcast
+            // before this receiver exists.
+            let authoring_rx = authoring_seed.as_ref().map(|_| event_tx.subscribe());
+
             let opts = SpawnOptions {
                 command: command.as_deref(),
                 cwd: cwd.as_deref(),
@@ -3319,6 +3389,39 @@ async fn handle_connection(
             };
             match registry.spawn_agent(opts) {
                 Ok(id) => {
+                    // PRD #1223 M7: deliver the authoring seed through the path
+                    // this agent already has, never a new one (#528). A Pi pane
+                    // takes PRD #201's native seed — the branch just below, which
+                    // the TUI's Pi orchestrators already use, pulled by the
+                    // extension's `get-seed` with the PTY safety net behind it.
+                    // Every other agent takes `crate::spawn`'s readiness-gated
+                    // delivery — the one `dispatch` and the scheduler use —
+                    // detached, so this reply is not held for the readiness wait.
+                    // Which agent it is comes from the deck's frozen launch record
+                    // (no hook event can rewrite it), else from the command — the
+                    // resolution `crate::spawn::spawn_one` applies, and the one the
+                    // TUI makes before seeding a Pi orchestrator natively.
+                    let mut seed = seed;
+                    if let (Some(pane_id), Some(authoring_seed), Some(rx)) =
+                        (pane_id_env.as_deref(), authoring_seed, authoring_rx)
+                    {
+                        let launched_as = registry
+                            .spawn_agent_type(&id)
+                            .or_else(|| AgentType::from_command(command.as_deref()));
+                        if launched_as == Some(AgentType::Pi) {
+                            seed = Some(authoring_seed);
+                        } else {
+                            crate::spawn::run_delivery(
+                                &registry,
+                                pane_id.to_string(),
+                                id.clone(),
+                                Some(rx),
+                                authoring_seed,
+                                true,
+                            )
+                            .await;
+                        }
+                    }
                     // PRD #201 native prompt delivery: if the spawn carried a
                     // seed (a Pi start-role orchestrator pane), stash it for the
                     // pane's extension to pull natively via `get-seed`, and arm
@@ -6374,6 +6477,7 @@ mod tests {
             tab_membership: None,
             agent_type: None,
             seed: None,
+            authoring_kind: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         let back: AttachRequest = serde_json::from_str(&json).unwrap();
@@ -6409,6 +6513,7 @@ mod tests {
             tab_membership: None,
             agent_type: None,
             seed: None,
+            authoring_kind: None,
         };
         let v: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&req).unwrap()).unwrap();
@@ -6449,6 +6554,7 @@ mod tests {
             }),
             agent_type: None,
             seed: None,
+            authoring_kind: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -6489,6 +6595,7 @@ mod tests {
             }),
             agent_type: None,
             seed: None,
+            authoring_kind: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -7813,6 +7920,63 @@ mod tests {
         assert_eq!(
             serde_json::to_value(AttachRequest::NewAgentOptions {}).unwrap()["op"],
             CAP_NEW_AGENT_OPTIONS
+        );
+    }
+
+    /// PRD #1223 M7 — `authoring-kind` is advertised on every platform, and the
+    /// `StartAgent` field it gates is OMITTED when absent, so a plain start keeps
+    /// the exact wire shape every older daemon already parses; set, it
+    /// round-trips in its kebab-case spelling. An older client's payload decodes
+    /// as `None`, and a kind this build does not know fails the frame rather than
+    /// being read as `None` — which would start a seedless agent and report
+    /// success, the very failure the gate exists for.
+    #[test]
+    fn authoring_kind_is_advertised_omitted_when_absent_and_round_trips() {
+        use crate::authoring_seeds::AuthoringKind;
+
+        assert!(DAEMON_CAPABILITIES.contains(&CAP_AUTHORING_KIND));
+        assert_eq!(CAP_AUTHORING_KIND, "authoring-kind");
+
+        let start = |authoring_kind| AttachRequest::StartAgent {
+            command: Some("claude".into()),
+            cwd: Some("/srv/repo".into()),
+            rows: 24,
+            cols: 80,
+            env: vec![],
+            display_name: None,
+            tab_membership: None,
+            agent_type: None,
+            seed: None,
+            authoring_kind,
+        };
+        let plain = serde_json::to_value(start(None)).unwrap();
+        assert!(
+            !plain.as_object().unwrap().contains_key("authoring_kind"),
+            "authoring_kind=None must be omitted from the wire payload: {plain}"
+        );
+        for kind in AuthoringKind::ALL {
+            let json = serde_json::to_value(start(Some(kind))).unwrap();
+            assert_eq!(json["authoring_kind"], kind.as_str());
+            match serde_json::from_value::<AttachRequest>(json).unwrap() {
+                AttachRequest::StartAgent { authoring_kind, .. } => {
+                    assert_eq!(authoring_kind, Some(kind));
+                }
+                other => panic!("expected StartAgent, got {other:?}"),
+            }
+        }
+
+        match serde_json::from_str::<AttachRequest>(r#"{"op":"start-agent","command":"/bin/sh"}"#)
+            .unwrap()
+        {
+            AttachRequest::StartAgent { authoring_kind, .. } => assert!(authoring_kind.is_none()),
+            other => panic!("expected StartAgent, got {other:?}"),
+        }
+        assert!(
+            serde_json::from_str::<AttachRequest>(
+                r#"{"op":"start-agent","command":"/bin/sh","authoring_kind":"orchestration"}"#
+            )
+            .is_err(),
+            "an unknown authoring kind must fail the decode, not start a seedless agent"
         );
     }
 

@@ -34,9 +34,14 @@ pub struct NewAgentOptions {
     /// here.
     #[serde(default)]
     pub experimental: bool,
-    /// The authoring kinds this daemon can compose a seed for. **Empty until
-    /// PRD #1223 M7**, which adds the `StartAgent` field that carries one; an
-    /// empty list is the honest answer from a daemon that cannot.
+    /// The authoring kinds this daemon can compose a seed for — the values
+    /// `StartAgent.authoring_kind` accepts ([`crate::authoring_seeds::AuthoringKind::ALL`],
+    /// in the TUI Mode cycler's order). Every kind this build knows, whatever
+    /// the experimental flag says: the flag decides what a client SHOWS, which
+    /// is the client's call (the desktop hides `schedule-issues` unless
+    /// [`Self::experimental`] is true, as the TUI hides its chip), not what the
+    /// daemon can do. Empty from a daemon predating PRD #1223 M7, which is the
+    /// honest answer from one that cannot.
     #[serde(default)]
     pub authoring_kinds: Vec<String>,
 }
@@ -75,7 +80,10 @@ pub fn compose(config: &DashboardConfig, experimental: bool) -> NewAgentOptions 
         default_command: Some(config.default_command.clone()).filter(|c| !c.is_empty()),
         agents: registry_agents(),
         experimental,
-        authoring_kinds: Vec::new(),
+        authoring_kinds: crate::authoring_seeds::AuthoringKind::ALL
+            .iter()
+            .map(|kind| kind.as_str().to_string())
+            .collect(),
     }
 }
 
@@ -135,22 +143,27 @@ mod tests {
     }
 
     #[test]
-    fn the_flag_is_reported_as_given_and_no_authoring_kind_is_offered_yet() {
+    fn the_flag_is_reported_as_given_and_every_authoring_kind_is_offered_either_way() {
         for experimental in [false, true] {
             let options = compose(&config_with("claude"), experimental);
             assert_eq!(options.experimental, experimental);
-            assert!(
-                options.authoring_kinds.is_empty(),
-                "authoring kinds stay empty until PRD #1223 M7"
+            assert_eq!(
+                options.authoring_kinds,
+                ["schedule", "schedule-issues", "dispatcher"],
+                "PRD #1223 M7: the daemon lists every kind it can compose; filtering \
+                 `schedule-issues` on the flag is the client's job"
             );
         }
     }
 
     #[test]
-    fn the_wire_shape_keeps_an_empty_authoring_list_and_omits_an_absent_command() {
+    fn the_wire_shape_lists_the_authoring_kinds_and_omits_an_absent_command() {
         let json = serde_json::to_value(compose(&config_with(""), false)).unwrap();
         assert!(json.get("default_command").is_none());
-        assert_eq!(json["authoring_kinds"], serde_json::json!([]));
+        assert_eq!(
+            json["authoring_kinds"],
+            serde_json::json!(["schedule", "schedule-issues", "dispatcher"])
+        );
         assert_eq!(json["experimental"], serde_json::json!(false));
         assert_eq!(
             json["agents"][0],

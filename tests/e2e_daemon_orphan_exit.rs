@@ -374,6 +374,7 @@ async fn sigterm_003_signal_shutdown_names_the_agents_and_roles_it_destroys() {
             }),
             agent_type: None,
             seed: None,
+            authoring_kind: None,
         },
     )
     .await

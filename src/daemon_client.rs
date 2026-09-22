@@ -1156,9 +1156,10 @@ pub enum FocusReport {
     Superseded,
 }
 
-/// PRD #1223 — the answer to a query this client sends only to a daemon that
-/// advertises it: [`DaemonClient::list_directories`] and
-/// [`DaemonClient::new_agent_options`].
+/// PRD #1223 — the answer to a request this client sends only to a daemon that
+/// advertises it: the queries [`DaemonClient::list_directories`] and
+/// [`DaemonClient::new_agent_options`], and the start
+/// [`DaemonClient::start_authoring_agent`].
 ///
 /// `Unsupported` is an **outcome, not an error**, for the reason
 /// [`FocusReport::Withheld`] is one: against an older deck the right behaviour
@@ -1483,6 +1484,64 @@ impl DaemonClient {
     }
 
     pub async fn start_agent(&self, opts: StartAgentOptions) -> Result<String, ClientError> {
+        self.send_start_agent(opts, None).await
+    }
+
+    /// PRD #1223 M7 — start an AUTHORING agent: the daemon composes `kind`'s
+    /// seed (the text the TUI's own `schedule` / `schedule: issues` /
+    /// `dispatcher` option types in, naming `opts.cwd`) and delivers it once the
+    /// agent is ready. Answers the new agent's id.
+    ///
+    /// **Withholds unless the daemon advertises
+    /// [`crate::daemon_protocol::CAP_AUTHORING_KIND`]**, answering
+    /// [`GatedQuery::Unsupported`] without sending anything — the arrangement
+    /// [`Self::list_directories`] uses, and here it is load-bearing rather than
+    /// polite: an older daemon drops the unknown field, so sending it would start
+    /// a plain agent with no seed and report success. This method is the one
+    /// production sender of the field; [`Self::start_agent`] never sets it.
+    ///
+    /// **It re-handshakes rather than trusting the cached set**, which no other
+    /// gated method does, because of what the stale-cache residual does here. A
+    /// handle whose cached set outlived a daemon replaced by an older build sends
+    /// whatever the old set allowed; for a gated VERB the older daemon then
+    /// refuses the unknown op and nothing happens (`docs/develop/versioning.md`
+    /// item 1), but this is a FIELD on a verb every daemon knows, so the same
+    /// residual would start a seedless agent and report success. One extra `Hello`
+    /// per authoring start — a person clicking a chip, not a hot path — shrinks
+    /// that to a daemon replaced between two back-to-back round trips. It does
+    /// not close it: nothing a client can do before the write does.
+    ///
+    /// `opts` is an ordinary start, and the daemon gives `command` its ordinary
+    /// meaning — `None` is its default shell, not an agent — so resolve a blank
+    /// command before calling, as the TUI does. `opts.cwd` and a valid
+    /// `DOT_AGENT_DECK_PANE_ID` in `opts.env` are required, and `opts.seed` must
+    /// be `None`; the daemon refuses otherwise (`ClientError::Server`) and starts
+    /// nothing.
+    pub async fn start_authoring_agent(
+        &self,
+        opts: StartAgentOptions,
+        kind: crate::authoring_seeds::AuthoringKind,
+    ) -> Result<GatedQuery<String>, ClientError> {
+        self.invalidate_capabilities();
+        if !self
+            .capabilities()
+            .await?
+            .supports(crate::daemon_protocol::CAP_AUTHORING_KIND)
+        {
+            return Ok(GatedQuery::Unsupported);
+        }
+        self.send_start_agent(opts, Some(kind))
+            .await
+            .map(GatedQuery::Answered)
+    }
+
+    /// The one `start-agent` sender. `authoring_kind` is `Some` only from
+    /// [`Self::start_authoring_agent`], after its capability check.
+    async fn send_start_agent(
+        &self,
+        opts: StartAgentOptions,
+        authoring_kind: Option<crate::authoring_seeds::AuthoringKind>,
+    ) -> Result<String, ClientError> {
         let (mut rd, mut wr) = self.connect().await?;
         let req = AttachRequest::StartAgent {
             command: opts.command,
@@ -1494,6 +1553,7 @@ impl DaemonClient {
             tab_membership: opts.tab_membership,
             agent_type: opts.agent_type,
             seed: opts.seed,
+            authoring_kind,
         };
         let resp = issue_command(&mut rd, &mut wr, &req).await?;
         if !resp.ok {
@@ -3733,7 +3793,235 @@ mod tests {
         // only the build-derived halves are pinned here; the e2e
         // `newagent/options/001` pins the other two against a daemon it owns.
         assert_eq!(options.agents, crate::new_agent_options::registry_agents());
-        assert!(options.authoring_kinds.is_empty());
+        assert_eq!(
+            options.authoring_kinds,
+            ["schedule", "schedule-issues", "dispatcher"],
+            "PRD #1223 M7: a daemon at this build composes every authoring kind"
+        );
+    }
+
+    /// PRD #1223 M7 — an authoring start withholds against the two older daemons
+    /// a desktop will meet: one that advertises no capabilities at all (pre-PRD
+    /// #819), and one that advertises everything up to M1+M2 — the new-agent
+    /// queries included — but not `authoring-kind`. Neither is sent the start,
+    /// because an older daemon would drop the field and start a seedless agent.
+    #[cfg(unix)]
+    #[test]
+    fn authoring_start_is_withheld_by_a_daemon_that_does_not_advertise_it() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("build older-daemon runtime");
+        runtime.block_on(async {
+            authoring_start_is_withheld_inner(None).await;
+            authoring_start_is_withheld_inner(Some(&[
+                CAP_LIST_PROJECTS,
+                CAP_RESOLVE_PROJECT,
+                CAP_PREPARE_WORKFLOW,
+                crate::daemon_protocol::CAP_START_PREPARED_AGENT,
+                crate::daemon_protocol::CAP_STOP_DAEMON,
+                crate::daemon_protocol::CAP_FOCUS_GAINED,
+                crate::daemon_protocol::CAP_LIST_DIRECTORIES,
+                crate::daemon_protocol::CAP_NEW_AGENT_OPTIONS,
+            ]))
+            .await;
+        });
+    }
+
+    #[cfg(unix)]
+    async fn authoring_start_is_withheld_inner(advertised: Option<&'static [&'static str]>) {
+        let (dir, path, listener) = {
+            let _g = BIND_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("older-daemon.sock");
+            let listener = bind_attach_listener(&path).expect("bind older daemon");
+            (dir, path, listener)
+        };
+        let other_requests = Arc::new(AtomicUsize::new(0));
+        let server_other_requests = other_requests.clone();
+        let server = tokio::spawn(async move {
+            while let Ok(Ok(mut stream)) =
+                tokio::time::timeout(std::time::Duration::from_millis(500), listener.accept()).await
+            {
+                let Some((KIND_REQ, payload)) = read_frame(&mut stream)
+                    .await
+                    .expect("read older-daemon request frame")
+                else {
+                    continue;
+                };
+                let request: serde_json::Value =
+                    serde_json::from_slice(&payload).expect("decode older-daemon request");
+                let response = if request.get("op").and_then(|op| op.as_str()) == Some("hello") {
+                    AttachResponse {
+                        capabilities: advertised
+                            .map(|list| list.iter().map(|cap| cap.to_string()).collect()),
+                        ..AttachResponse::hello(PROTOCOL_VERSION)
+                    }
+                } else {
+                    // What an older daemon would really do with the frame: drop
+                    // the unknown field and start the agent. Counted, because
+                    // reaching here at all is the failure.
+                    server_other_requests.fetch_add(1, Ordering::SeqCst);
+                    AttachResponse::with_id("seedless-agent".into())
+                };
+                crate::daemon_protocol::write_resp(&mut stream, &response)
+                    .await
+                    .expect("write older-daemon response");
+            }
+        });
+        let client = DaemonClient::new(path);
+        // A cache captured from a daemon at this build, as if that daemon was
+        // since replaced by the older one now answering. The start must
+        // re-handshake rather than trust it (see `start_authoring_agent`).
+        client.store_capabilities_from_hello(
+            &AttachResponse::hello(PROTOCOL_VERSION).with_capabilities(),
+        );
+
+        for kind in crate::authoring_seeds::AuthoringKind::ALL {
+            assert_eq!(
+                client
+                    .start_authoring_agent(
+                        StartAgentOptions {
+                            command: Some("claude".into()),
+                            cwd: Some("/tmp".into()),
+                            env: vec![(
+                                crate::agent_pty::DOT_AGENT_DECK_PANE_ID.into(),
+                                "authoring-pane".into()
+                            )],
+                            ..StartAgentOptions::default()
+                        },
+                        kind,
+                    )
+                    .await
+                    .expect("a withhold is not an error"),
+                GatedQuery::Unsupported,
+                "advertised {advertised:?}: no `authoring-kind`, no {kind:?} start"
+            );
+        }
+        assert_eq!(
+            other_requests.load(Ordering::SeqCst),
+            0,
+            "advertised {advertised:?}: withholding means no start reaches the socket, even \
+             from a handle whose cached set still names `authoring-kind`"
+        );
+
+        drop(client);
+        server.await.unwrap();
+        drop(dir);
+    }
+
+    /// PRD #1223 M7 — the positive half, against the real dispatch: a daemon at
+    /// this build advertises `authoring-kind`, the typed method sends the start
+    /// and answers the new agent's id, and a start the daemon cannot deliver a
+    /// seed for (no `DOT_AGENT_DECK_PANE_ID`) is its refusal — with nothing
+    /// started — rather than a withhold. Without it, a method that withheld
+    /// unconditionally would pass the test above.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn authoring_start_is_sent_to_a_daemon_that_advertises_it() {
+        let (_dir, path, registry) = spawn_test_server().await;
+        let client = DaemonClient::new(path);
+        let kind = crate::authoring_seeds::AuthoringKind::Dispatcher;
+
+        let refusal = client
+            .start_authoring_agent(
+                StartAgentOptions {
+                    command: Some("/bin/sh".into()),
+                    cwd: Some("/tmp".into()),
+                    ..StartAgentOptions::default()
+                },
+                kind,
+            )
+            .await
+            .expect_err("no pane id is the daemon's refusal, not a withhold");
+        assert!(
+            matches!(&refusal, ClientError::Server(message)
+                if message.contains("DOT_AGENT_DECK_PANE_ID")),
+            "{refusal:?}"
+        );
+        assert!(
+            registry.agent_records().is_empty(),
+            "a refused authoring start starts nothing"
+        );
+
+        let GatedQuery::Answered(id) = client
+            .start_authoring_agent(
+                StartAgentOptions {
+                    command: Some("/bin/sh".into()),
+                    cwd: Some("/tmp".into()),
+                    env: vec![(
+                        crate::agent_pty::DOT_AGENT_DECK_PANE_ID.into(),
+                        "authoring-pane".into(),
+                    )],
+                    ..StartAgentOptions::default()
+                },
+                kind,
+            )
+            .await
+            .expect("an advertised authoring start is sent")
+        else {
+            panic!("a daemon at this build advertises `authoring-kind`");
+        };
+        assert!(
+            registry
+                .agent_records()
+                .iter()
+                .any(|record| record.id == id),
+            "the answered id is the agent the daemon started"
+        );
+        assert_eq!(
+            registry.take_pending_seed_native_for("authoring-pane", Some(&id)),
+            None,
+            "a non-Pi agent's seed goes down the spawn delivery, not PRD #201's native stash"
+        );
+        registry.close_agent(&id).unwrap();
+    }
+
+    /// PRD #1223 M7 — a Pi authoring agent is seeded the way the TUI's Pi
+    /// orchestrators already are: the composed seed is stashed for the
+    /// extension's native `get-seed` pull (PRD #201, with its PTY safety net),
+    /// not typed into the PTY. The type comes from the command here, as it does
+    /// for a client that sends no `agent_type`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_pi_authoring_agent_is_given_the_native_seed() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (_dir, path, registry) = spawn_test_server().await;
+        let client = DaemonClient::new(path);
+        let scratch = crate::test_temp::tempdir().expect("scratch dir");
+        let pi = scratch.path().join("pi");
+        std::fs::write(&pi, "#!/bin/sh\nexec sleep 30\n").expect("write the pi stand-in");
+        std::fs::set_permissions(&pi, std::fs::Permissions::from_mode(0o755))
+            .expect("make the pi stand-in executable");
+        let cwd = scratch.path().to_str().expect("scratch paths are UTF-8");
+        let kind = crate::authoring_seeds::AuthoringKind::Schedule;
+
+        let GatedQuery::Answered(id) = client
+            .start_authoring_agent(
+                StartAgentOptions {
+                    command: Some(pi.to_str().unwrap().to_string()),
+                    cwd: Some(cwd.to_string()),
+                    env: vec![(
+                        crate::agent_pty::DOT_AGENT_DECK_PANE_ID.into(),
+                        "pi-authoring-pane".into(),
+                    )],
+                    ..StartAgentOptions::default()
+                },
+                kind,
+            )
+            .await
+            .expect("an advertised authoring start is sent")
+        else {
+            panic!("a daemon at this build advertises `authoring-kind`");
+        };
+        assert_eq!(
+            registry.take_pending_seed_native_for("pi-authoring-pane", Some(&id)),
+            Some(kind.compose_seed(std::path::Path::new(cwd))),
+            "the Pi pane's native seed is the composed authoring seed"
+        );
+        registry.close_agent(&id).unwrap();
     }
 
     #[cfg(unix)]
