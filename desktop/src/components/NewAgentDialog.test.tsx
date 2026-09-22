@@ -313,6 +313,32 @@ describe("New agent dialog — directory step (PRD #1223 M4)", () => {
   });
 });
 
+describe("New agent dialog — going up (PRD #1223 U3)", () => {
+  /**
+   * Scenario: browse into `beta`. The footer offers Back and Use this
+   * directory, and no Up button beside Back; the `..` row is what goes up, and
+   * clicking it lists the reply's parent with the cursor back on `beta`.
+   */
+  it("goes up by the .. row, with no Up button in the footer", async () => {
+    const runtime = fakeRuntime();
+    renderDialog(runtime);
+    fireEvent.keyDown(deckList(), { key: "Enter" });
+    await currentPath("/home/dev");
+    fireEvent.keyDown(directoryList(), { key: "j" });
+    fireEvent.keyDown(directoryList(), { key: "Enter" });
+    await currentPath("/home/dev/beta");
+
+    const flow = screen.getByTestId("new-agent-dialog");
+    expect(within(flow).queryByRole("button", { name: /^up$/i })).toBeNull();
+    expect(within(flow.querySelector("footer")!).getAllByRole("button").map((button) => button.textContent?.trim())).toEqual(["Back", "Use this directory"]);
+    const up = within(directoryList()).getAllByRole("option")[0];
+    expect(up).toHaveTextContent("..");
+    fireEvent.click(up);
+    await currentPath("/home/dev");
+    expect(activeRow()).toBe("/home/dev/beta");
+  });
+});
+
 describe("New agent dialog — form (PRD #1223 M4)", () => {
   /**
    * Scenario: reach the form against three decks' options. Command is the

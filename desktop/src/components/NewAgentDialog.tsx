@@ -835,7 +835,6 @@ export function NewAgentDialog({ runtime, initialDeckId, onClose, onAppeared, on
     footer = (
       <>
         <button type="button" ref={directoryBackRef} className="button secondary" data-testid="new-agent-directory-back" onClick={() => { listingSeq.current += 1; setStep("deck"); setDeck(undefined); }}><ArrowLeft size={14} /> Back</button>
-        {listing?.parent !== undefined && <button type="button" className="button secondary" onClick={goUp}><ArrowUp size={14} /> Up</button>}
         <button type="button" className="button primary" data-testid="new-agent-use-directory" disabled={!listing} onClick={confirmCurrent}><Check size={14} /> Use this directory</button>
       </>
     );
