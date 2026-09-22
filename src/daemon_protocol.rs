@@ -3490,9 +3490,14 @@ async fn handle_connection(
             // the pane id from env and the orchestration metadata from
             // tab_membership). The spawn moves `opts`, so we clone what
             // we need first.
+            // Audit V6: the key is matched under the target platform's own
+            // equivalence, the same rule `sole_valid_pane_id` validates with —
+            // on Windows a differently-cased spelling IS this variable for the
+            // child, so reading it exactly would register a role under no pane
+            // id while the agent has one. Byte-identical on Unix.
             let pane_id_env: Option<String> = env
                 .iter()
-                .find(|(k, _)| k == DOT_AGENT_DECK_PANE_ID)
+                .find(|(key, _)| is_pane_id_key(key, ENV_KEYS_ARE_CASE_INSENSITIVE))
                 .map(|(_, v)| v.clone())
                 .filter(|v| is_valid_pane_id_env(v));
             // Round-11 auditor #C: also pull `orchestration_cwd` out of
@@ -4694,6 +4699,30 @@ fn refuse_prepared_start_where_unsupported() -> Result<(), String> {
     }
 }
 
+/// PRD #1223 audit V6: whether the TARGET platform's environment treats two
+/// spellings of a name as one variable.
+///
+/// Windows does — `GetEnvironmentVariable` is case-insensitive and
+/// `portable-pty` folds colliding keys when it builds the child's block — so
+/// `DOT_AGENT_DECK_PANE_ID` and `dot_agent_deck_pane_id` are ONE variable
+/// there and only one of the two values survives into the child. Every Unix
+/// treats them as two.
+const ENV_KEYS_ARE_CASE_INSENSITIVE: bool = cfg!(windows);
+
+/// Whether `key` names the pane-id variable under `case_insensitive` key
+/// equivalence.
+///
+/// Parameterised rather than reading the constant directly so the Windows rule
+/// is testable on every platform: the bug it closes is one a Unix CI can
+/// otherwise never execute.
+fn is_pane_id_key(key: &str, case_insensitive: bool) -> bool {
+    if case_insensitive {
+        key.eq_ignore_ascii_case(DOT_AGENT_DECK_PANE_ID)
+    } else {
+        key == DOT_AGENT_DECK_PANE_ID
+    }
+}
+
 /// PRD #1223 audit F7: the pane id a start carries when it carries exactly
 /// ONE `DOT_AGENT_DECK_PANE_ID` entry and that entry is valid; `None` for a
 /// missing, invalid or duplicated one.
@@ -4705,8 +4734,22 @@ fn refuse_prepared_start_where_unsupported() -> Result<(), String> {
 /// authoring seed, a configured role's registration and Pi seed) therefore
 /// refuse anything but a single valid entry, before anything spawns. The
 /// unflagged starts keep their existing first-entry reading.
+///
+/// Keys are compared under the target platform's own equivalence (audit V6):
+/// an exact-case comparison would let a Windows request carry a canonical entry
+/// and a differently-cased one, pass as a single valid entry, and hand the
+/// child the OTHER value — registering and seeding by an id the agent does not
+/// have. [`is_pane_id_key`] is what the extraction below uses too, so the id
+/// this validates and the id the spawn arm registers are chosen by one rule.
 fn sole_valid_pane_id(env: &[(String, String)]) -> Option<&str> {
-    let mut entries = env.iter().filter(|(k, _)| k == DOT_AGENT_DECK_PANE_ID);
+    sole_valid_pane_id_under(env, ENV_KEYS_ARE_CASE_INSENSITIVE)
+}
+
+/// [`sole_valid_pane_id`] with the platform's key equivalence supplied.
+fn sole_valid_pane_id_under(env: &[(String, String)], case_insensitive: bool) -> Option<&str> {
+    let mut entries = env
+        .iter()
+        .filter(|(key, _)| is_pane_id_key(key, case_insensitive));
     let (_, value) = entries.next()?;
     if entries.next().is_some() || !is_valid_pane_id_env(value) {
         return None;
@@ -5326,6 +5369,67 @@ mod tests {
                 "the refusal must carry the stable code, got {message:?}"
             );
         }
+    }
+
+    /// PRD #1223 audit V6: the pane-id key rule, run under BOTH platforms'
+    /// environment-key equivalence on whichever platform the test runs on.
+    ///
+    /// The case that made this a defect is Windows-only and a Unix CI can never
+    /// execute it: an env carrying `DOT_AGENT_DECK_PANE_ID=pane-a` and
+    /// `dot_agent_deck_pane_id=pane-b` is ONE variable for the child there, and
+    /// the exact-case comparison saw one valid entry and let the start through
+    /// — registering and seeding by `pane-a` while the child could receive
+    /// `pane-b`. Both orders are asserted, because which value survives into the
+    /// child is not something this side gets to choose.
+    #[test]
+    fn a_pane_id_key_is_compared_under_the_platforms_own_equivalence() {
+        let entry = |key: &str, value: &str| (key.to_string(), value.to_string());
+        let canonical_first = [
+            entry(DOT_AGENT_DECK_PANE_ID, "pane-a"),
+            entry("dot_agent_deck_pane_id", "pane-b"),
+        ];
+        let variant_first = [
+            entry("dot_agent_deck_pane_id", "pane-b"),
+            entry(DOT_AGENT_DECK_PANE_ID, "pane-a"),
+        ];
+        for colliding in [&canonical_first, &variant_first] {
+            assert_eq!(
+                sole_valid_pane_id_under(colliding, true),
+                None,
+                "under Windows equivalence these are one variable with two values, so no \
+                 single id is safe to register or seed by: {colliding:?}"
+            );
+        }
+        // The same env on Unix is two distinct variables, and only the
+        // canonical one names a pane.
+        assert_eq!(
+            sole_valid_pane_id_under(&canonical_first, false),
+            Some("pane-a")
+        );
+        assert_eq!(
+            sole_valid_pane_id_under(&variant_first, false),
+            Some("pane-a")
+        );
+        // A lone differently-cased entry IS the variable on Windows and is not
+        // one anywhere else — the half that makes validation and extraction
+        // agree, since the spawn arm reads the id with the same rule.
+        let variant_only = [entry("Dot_Agent_Deck_Pane_Id", "pane-b")];
+        assert_eq!(
+            sole_valid_pane_id_under(&variant_only, true),
+            Some("pane-b")
+        );
+        assert_eq!(sole_valid_pane_id_under(&variant_only, false), None);
+        // Neither equivalence changes what a valid id is.
+        let invalid = [entry(DOT_AGENT_DECK_PANE_ID, "pane a")];
+        for case_insensitive in [true, false] {
+            assert_eq!(sole_valid_pane_id_under(&invalid, case_insensitive), None);
+        }
+        // And the production reader takes the target platform's rule.
+        assert_eq!(
+            sole_valid_pane_id(&canonical_first).is_none(),
+            cfg!(windows),
+            "the shipped comparison must follow the platform it is built for"
+        );
     }
 
     /// Issue #801: every entry is `<issue>-<kebab-slug>`, and no entry appears
