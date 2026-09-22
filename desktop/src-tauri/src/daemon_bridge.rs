@@ -5302,6 +5302,82 @@ mod tests {
         );
     }
 
+    /// Scenario (PRD #1223 audit D2): under **All Decks**, the remote row is a
+    /// deck from before the listing verb — the deck on which the dialog sends
+    /// the path the user typed — and the local deck is a current real daemon.
+    /// A plain start naming a relative directory (`repo`, `./repo`, `../repo`,
+    /// `~/repo`) is refused on either deck with the typed-path shape sentence,
+    /// and neither deck receives it: the older one counts no request and the
+    /// local one lists no agent. A plain start naming no directory is still
+    /// started, on the local deck, in that deck's default directory.
+    ///
+    /// **What it fails against.** The start before D2, whose only `cwd` check
+    /// was `is_valid_cwd`: `repo` passed it, so the older deck would count a
+    /// `start-agent` it cannot decode, and the local deck would start `cat` in
+    /// a directory relative to wherever its daemon was spawned from.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_relative_typed_directory_is_refused_before_any_deck_is_asked() {
+        let _selection = crate::dto::SELECTION_LOCK.lock().await;
+        let local = RealDeck::start("d2-relative-local");
+        let older = OlderDeck::start("d2-relative-remote");
+        let (settings, remote_endpoint) = all_decks_with_one_remote_row("old-box.example.com");
+        apply_all_decks_over(&local, &settings);
+        let state = crate::terminal::DesktopState::default();
+        state
+            .tunnels
+            .insert_route(&remote_endpoint, &older.socket)
+            .await;
+        let older_wire = deck_wire_id(&remote_endpoint);
+        let local_wire = deck_wire_id(&local.endpoint);
+
+        let mut relative = Vec::new();
+        for (deck, wire) in [("older", &older_wire), ("local", &local_wire)] {
+            for typed in ["repo", "./repo", "../repo", "~/repo"] {
+                let outcome = crate::start_agent_action(
+                    &state,
+                    wire,
+                    crate::StartAgentRequest {
+                        cwd: Some(typed.into()),
+                        ..plain_start("d2-relative")
+                    },
+                )
+                .await;
+                relative.push((deck, typed, outcome));
+            }
+        }
+        let default_directory =
+            crate::start_agent_action(&state, &local_wire, plain_start("d2-default")).await;
+        let refused = older.refused.load(Ordering::SeqCst);
+        let on_local = named_records(&local);
+
+        local.shutdown();
+        older.shutdown();
+
+        for (deck, typed, outcome) in relative {
+            match outcome {
+                Ok(started) => panic!(
+                    "{deck} deck: `{typed}` is relative, yet agent {} started",
+                    started.agent_id
+                ),
+                Err(error) => assert!(
+                    error.contains("enter an absolute directory path"),
+                    "{deck} deck, `{typed}`: refused with the typed-path shape sentence, got {error}"
+                ),
+            }
+        }
+        assert_eq!(
+            refused, 0,
+            "the older deck was sent no request beyond a handshake"
+        );
+        let started = default_directory.expect("a start naming no directory is still allowed");
+        assert_eq!(
+            on_local,
+            vec![(started.agent_id, Some("d2-default".to_string()))],
+            "the local deck started only the default-directory agent"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // PRD #1223 M6 — orchestrations from the New agent dialog
     // -----------------------------------------------------------------------

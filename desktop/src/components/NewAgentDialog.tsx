@@ -8,6 +8,7 @@ import {
   directoryLabel,
   filterDirectoryEntries,
   fleetLists,
+  isAbsoluteTypedPath,
   isDeckGoneError,
   liveOrchestrationDirectories,
   liveOrchestrationTitles,
@@ -21,6 +22,7 @@ import {
   SAME_DIRECTORY_ORCHESTRATION,
   seedCommand,
   suggestOrchestrationName,
+  TYPED_PATH_SHAPE_REFUSAL,
   type DeckChoice,
 } from "../lib/newAgent";
 import type { AuthoringKind, DaemonOrchestration, DeckDirectoryEntry, DeckDirectoryListing, DeckRuntimeState, NewAgentOption, NewAgentOptions, NewAgentOrchestrations } from "../types";
@@ -319,11 +321,20 @@ export function NewAgentDialog({ runtime, initialDeckId, onClose, onAppeared, on
 
   const submitTypedPath = () => {
     if (!deck || typedPath === "") return;
+    // PRD #1223 audit D2: a relative path is refused here, in the crate's own
+    // sentence, before anything is asked. It matters most on a deck without the
+    // listing verb, where the typed path is what the start sends — and the
+    // crate refuses it there too, so this only saves the round trip.
+    if (!isAbsoluteTypedPath(typedPath)) {
+      setListingError(TYPED_PATH_SHAPE_REFUSAL);
+      return;
+    }
     // Verbatim: the deck canonicalises it, and its reply is what the flow
     // carries. A deck without the listing verb has no reply to give, so the
     // typed path itself goes to the form and the start is where the deck
     // accepts or refuses it.
     if (listingState === "unsupported") {
+      setListingError(undefined);
       confirmDirectory(typedPath, displayText(typedPath, DISPLAY_LIMITS.path));
       return;
     }

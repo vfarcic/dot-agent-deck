@@ -214,4 +214,27 @@ test.describe("the New agent flow", () => {
 
     await expect(page.getByTestId("agent-pane-overlay")).toBeVisible();
   });
+
+  /**
+   * Scenario (PRD #1223 audit D2): on the same older deck, type a RELATIVE
+   * path. The typed path is what a start there would send, so the step
+   * refuses it inline in the deck's own sentence and stays on the directory;
+   * an absolute path typed after it reaches the form.
+   */
+  test("refuses a relative typed path on a deck without the listing verb", async ({ page }) => {
+    await page.goto(`/?fixture=1&state=fleet&older=${encodeURIComponent(REMOTE_DECK)}`);
+    await page.getByTestId("open-overview").click();
+    await page.locator(`[data-testid="daemon-group"][data-daemon-id="${REMOTE_DECK}"]`).getByTestId("daemon-new-agent").click();
+    await page.keyboard.press("Enter");
+    await expect(page.getByTestId("new-agent-path")).toBeFocused();
+    await page.keyboard.type("checkouts/repo");
+    await page.keyboard.press("Enter");
+
+    await expect(page.getByTestId("new-agent-directory-error")).toHaveText("enter an absolute directory path, without control characters, that the deck can see");
+    await expect(page.getByTestId("new-agent-dialog")).toHaveAttribute("data-step", "directory");
+
+    await page.getByTestId("new-agent-path").fill("/srv/checkouts/repo");
+    await page.keyboard.press("Enter");
+    await expect(page.getByTestId("new-agent-dir")).toHaveText("/srv/checkouts/repo");
+  });
 });

@@ -109,6 +109,28 @@ export function directoryLabel(path: string): string {
 }
 
 /**
+ * The crate's refusal of a typed path that is not askable as a directory —
+ * `validate_pasted_project_path`'s sentence. The listing applies it to a typed
+ * path, and since PRD #1223 audit D2 so does a start naming a directory; the
+ * dialog and the fixture bridge repeat it so a client-side refusal reads the
+ * same as the crate's.
+ */
+export const TYPED_PATH_SHAPE_REFUSAL = "enter an absolute directory path, without control characters, that the deck can see";
+
+/**
+ * The dialog's cheap pre-check on a typed path (PRD #1223 audit D2): absolute,
+ * and free of ASCII controls. The crate makes the real check, per platform —
+ * a leading `/` everywhere, plus `C:\`, `C:/` and UNC forms on Windows — so
+ * this accepts the union of those shapes and never refuses one the crate would
+ * take on any platform. What it exists to stop is `repo`, `./repo` or `~/repo`
+ * on a deck without the listing verb, where the typed path is what the start
+ * sends.
+ */
+export function isAbsoluteTypedPath(path: string): boolean {
+  return /^(?:\/|\\[\\/]|[A-Za-z]:[\\/])/.test(path) && !/[\u0000-\u001f\u007f]/.test(path);
+}
+
+/**
  * The Command field's prefill, in the TUI's order (`resolve_seed_command`):
  * the deck host's configured `default_command`, then the command this app last
  * started a plain agent with on that deck, then blank — which starts the

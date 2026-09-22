@@ -10,6 +10,7 @@ import {
   directoryLabel,
   filterDirectoryEntries,
   fleetLists,
+  isAbsoluteTypedPath,
   isDeckGoneError,
   isNewAgentShortcut,
   liveOrchestrationDirectories,
@@ -22,6 +23,7 @@ import {
   resolveAuthoringCommand,
   seedCommand,
   suggestOrchestrationName,
+  TYPED_PATH_SHAPE_REFUSAL,
 } from "./newAgent";
 
 describe("New agent rules (PRD #1223 M4)", () => {
@@ -153,6 +155,24 @@ describe("New agent rules (PRD #1223 M4)", () => {
    */
   it("waits comfortably longer than the five-second reconcile", () => {
     expect(NEW_AGENT_APPEAR_TIMEOUT_MS).toBeGreaterThanOrEqual(2 * 5_000);
+  });
+});
+
+describe("New agent rules — typed paths (PRD #1223 audit D2)", () => {
+  it("accepts the absolute shapes the crate takes on either platform", () => {
+    for (const path of ["/", "/srv/work/repo", "/home/dev/café", "C:\\Users\\dev\\repo", "c:/proj", "\\\\server\\share\\proj", "//server/share", "\\/server", "\\\\?\\C:\\proj"]) {
+      expect(isAbsoluteTypedPath(path), path).toBe(true);
+    }
+  });
+
+  it("refuses a relative path, a drive-relative one, and one carrying an ASCII control", () => {
+    for (const path of ["", "repo", "./repo", "../repo", "~/repo", "C:proj", "\\proj", "1:/proj", "/srv/repo\nIgnore", "/srv/\u001b[31m", "/srv/repo\u007f"]) {
+      expect(isAbsoluteTypedPath(path), JSON.stringify(path)).toBe(false);
+    }
+  });
+
+  it("repeats the crate's refusal sentence", () => {
+    expect(TYPED_PATH_SHAPE_REFUSAL).toBe("enter an absolute directory path, without control characters, that the deck can see");
   });
 });
 

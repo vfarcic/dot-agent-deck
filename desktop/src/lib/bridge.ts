@@ -4,6 +4,7 @@ import { getTerminal } from "./terminalRegistry";
 import { applyHandoffEvent, mapDaemonEvent, MAX_LIVE_EVIDENCE } from "./daemonEvents";
 import { DISPLAY_LIMITS, displayText } from "./displayText";
 import { describeEndpoint } from "./endpoints";
+import { isAbsoluteTypedPath, TYPED_PATH_SHAPE_REFUSAL } from "./newAgent";
 import { clampZoom, DEFAULT_ZOOM } from "./zoom";
 import { UNREPORTED } from "../types";
 import type { HandoffEdge,
@@ -1501,12 +1502,6 @@ export interface DeckBridge {
   dispose(): Promise<void>;
 }
 
-/**
- * The live crate's refusal of a typed path that is not askable as one — the
- * shape check `validate_pasted_project_path` makes before spending a round
- * trip. The fixture repeats it so the preview refuses what the app refuses.
- */
-const TYPED_PATH_SHAPE_REFUSAL = "enter an absolute directory path, without control characters, that the deck can see";
 
 /** What a fixture deck says about a path that names no directory it has, in the daemon's own `unresolved` wording. */
 /** The live crate's `CONFIGURED_ROLE_COMMAND_UNSUPPORTED`, repeated by the fixture's older decks (PRD #1223 M6). */
@@ -2017,6 +2012,9 @@ class FixtureDeckBridge implements DeckBridge {
    * `(deckId, agentId)` to appear exactly as the live flow will.
    */
   private startAgent(action: Extract<DeckAction, { type: "start_agent" }>): DeckActionResult {
+    // PRD #1223 audit D2: the live crate refuses a relative directory before
+    // resolving the deck, in the typed-path sentence; so does the preview.
+    if (action.cwd !== undefined && !isAbsoluteTypedPath(action.cwd)) throw new Error(TYPED_PATH_SHAPE_REFUSAL);
     const deck = this.connectedDeck(action.deckId);
     // PRD #1223 M7: a deck this preview plays as older cannot compose a seed,
     // and refuses an authoring start the way the live crate does — before

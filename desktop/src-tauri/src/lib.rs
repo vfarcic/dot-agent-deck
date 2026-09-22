@@ -2636,6 +2636,16 @@ struct StartedAgent {
 /// TUI's `resolve_authoring_command` does and this refuses one that arrives
 /// blank rather than resolving it a second, divergent way. A `cwd` is required
 /// for the deck's reason: the seed names the directory the agent works in.
+///
+/// # A named directory must be absolute (PRD #1223 audit D2)
+///
+/// [`validate_start_fields`] checks a `cwd`'s bytes and length, not its shape,
+/// and on a deck without `list-directories` the dialog sends the path the user
+/// typed — so `repo` would start an agent relative to wherever that deck's
+/// daemon was spawned from. A present `cwd` therefore gets the string-shape
+/// check [`list_directories_on`] gives a typed path,
+/// [`validate_pasted_project_path`], before any deck is asked. An absent one
+/// stays allowed: that is the deck's default-directory start.
 async fn start_agent_action(
     state: &DesktopState,
     deck_id: &str,
@@ -2656,6 +2666,9 @@ async fn start_agent_action(
         rows.unwrap_or(24),
         cols.unwrap_or(80),
     )?;
+    if let Some(cwd) = cwd.as_deref() {
+        validate_pasted_project_path(cwd)?;
+    }
     if let Some(kind) = authoring_kind {
         if command.is_none() {
             return Err(format!(
