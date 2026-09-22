@@ -18,11 +18,26 @@
   --paper-sunken-strong: #eceae3;
   --skeleton: #e5e2da;
 
-  /* Light chrome — text. */
+  /* Light chrome — text. Issue #821: --faint and --muted both failed AA (4.5:1
+     for normal text) on every surface they land on, at 2.39–3.05:1 and
+     3.95–5.04:1. Fixing that is not a free choice of two values, because the
+     dimmest ground --faint lands on is `rgb(var(--scrim-rgb) / .04)` over
+     --red-soft — an `.overview-lease` badge on a failed overview row — and
+     clearing 4.5:1 there caps --faint at CIE L* 40.8. --muted's own ceiling is
+     only 1.9 L* above that, so it cannot sit at it: it has to drop a full step
+     BELOW --faint, which lands it where --ink-soft used to be (L* 31.4). That is
+     why --ink-soft moved as well — `.voice-help-section p` renders in --ink-soft
+     and in --muted as a deliberate undimmed/dimmed pair, so the two going equal
+     would flatten a distinction the markup relies on.
+
+     The four now sit ~8.7 L* apart (13.8 / 22.4 / 31.2 / 40.1), which is a more
+     even ladder than the 17.6 / 14.9 / 14.3 it replaces and no smaller a step
+     than the 8.2 the dark block below already ships between --muted and --faint.
+     The per-surface arithmetic is in the PR that closed #821. */
   --ink: #1d2522;
-  --ink-soft: #434c48;
-  --muted: #66706b;
-  --faint: #8d948f;
+  --ink-soft: #313734;
+  --muted: #444b48;
+  --faint: #5a605b;
   --on-accent: #ffffff;
 
   /* Light chrome — lines. */
@@ -69,10 +84,29 @@
   --violet-soft: #e8e0ef;
 
   /* Live status, read against both the light chrome and the dark instrument
-     chrome, so these are one family rather than two. */
+     chrome, so these are one family rather than two — which is why the dark
+     blocks below repeat these values rather than moving them.
+
+     Issue #822: --status-error was #d0685f, which put `.terminal-input-status
+     .is-blocked` — 9px text on --shell — at 4.08:1 in light and exactly 4.50:1
+     in dark, so light failed AA and dark sat on it to two decimal places. This is
+     the same hue and saturation one lightness step up (HSL 4.8° / 54%, L 59.4% →
+     63.9%): 4.76:1 on the light --shell and 5.25:1 on the dark one.
+
+     What that costs is recorded rather than hidden. `.connection-lamp
+     .connection-error` uses this token as a FILL, and three of its four call
+     sites — `.topbar`, the deck selector, `.daemon-group-header` — are LIGHT
+     chrome in light mode. No value can be light enough for 4.5:1 as text on
+     --shell and still 3:1 as a fill on --paper; the two windows do not overlap,
+     at any value, so the fill/--topbar figure was going below 3:1 the moment the
+     text case was fixed at all (it is 2.86:1, from 3.33:1). The lamp keeps its
+     WCAG 1.4.11 standing from the 2px --shell-line ring the base `.connection-lamp`
+     rule gives it: the ring is what identifies the component against the page,
+     and the fill only has to be told apart from the ring, which it clears at
+     4.37:1. */
   --status-ok: #6db58b;
   --status-warn: #c69a4e;
-  --status-error: #d0685f;
+  --status-error: #d57971;
 
   /* Instrument chrome — the dark surfaces wrapped around the terminals: the
      rail, the tab strip, the agent footer, the output panels and the reader
@@ -206,12 +240,17 @@
     /* Violet: needs a human. */
     --violet: #ab92ca;
     --violet-soft: #29223a;
-    /* Live status. Unchanged: these were already picked to read against the dark */
-    /* instrument chrome, and every one of their call sites is on it -- the rail's */
-    /* connection lamp, the terminal input-state notices, the check rows. */
+    /* Live status. Identical to the light block by decision: these were picked to */
+    /* read against the dark instrument chrome, which is where the terminal */
+    /* input-state notices and the check rows are. NOT every call site, though -- */
+    /* `.connection-lamp` also sits in `.topbar`, the deck selector and */
+    /* `.daemon-group-header`, which are LIGHT chrome in light mode; issue #822's */
+    /* note in the light block has what that constrains and what it cost. */
+    /* --status-error moved from #d0685f for #822 and moved in all three blocks, */
+    /* keeping the family identical across appearances. */
     --status-ok: #6db58b;
     --status-warn: #c69a4e;
-    --status-error: #d0685f;
+    --status-error: #d57971;
     /* Instrument chrome. Near-invariant by decision: PRD #743 keeps the terminals */
     /* dark in both appearances, so these surfaces were already right. The three */
     /* nudges are all one thing -- the canvas around them is dark now, so the */
@@ -310,12 +349,17 @@
   /* Violet: needs a human. */
   --violet: #ab92ca;
   --violet-soft: #29223a;
-  /* Live status. Unchanged: these were already picked to read against the dark */
-  /* instrument chrome, and every one of their call sites is on it -- the rail's */
-  /* connection lamp, the terminal input-state notices, the check rows. */
+  /* Live status. Identical to the light block by decision: these were picked to */
+  /* read against the dark instrument chrome, which is where the terminal */
+  /* input-state notices and the check rows are. NOT every call site, though -- */
+  /* `.connection-lamp` also sits in `.topbar`, the deck selector and */
+  /* `.daemon-group-header`, which are LIGHT chrome in light mode; issue #822's */
+  /* note in the light block has what that constrains and what it cost. */
+  /* --status-error moved from #d0685f for #822 and moved in all three blocks, */
+  /* keeping the family identical across appearances. */
   --status-ok: #6db58b;
   --status-warn: #c69a4e;
-  --status-error: #d0685f;
+  --status-error: #d57971;
   /* Instrument chrome. Near-invariant by decision: PRD #743 keeps the terminals */
   /* dark in both appearances, so these surfaces were already right. The three */
   /* nudges are all one thing -- the canvas around them is dark now, so the */
