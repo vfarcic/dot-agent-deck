@@ -687,6 +687,12 @@ export interface VoiceNewAgentDto {
     path: string;
     modes: { id: string; label: string }[];
     agentTypes: { id: string; label: string }[];
+    /**
+     * The chips the dialog knows and withholds on this form — never
+     * resolvable, declared so naming one is refused as not offered rather
+     * than answered with the nearest chip that is.
+     */
+    withheldModes?: { id: string; label: string }[];
   };
 }
 
@@ -710,6 +716,10 @@ export interface VoiceNewAgentDto {
  * * `mode_ref` and `agent_type_ref` resolve against **the New agent form's
  *   Mode chips and Agent picker as offered** ({@link VoiceNewAgentDto}, PRD
  *   #1223) — `value` is the chip's or entry's id, `label` what it shows.
+ * * `orchestration_ref` resolves against **the orchestrations among the live
+ *   agents**, grouped as the overview's cards are (PRD #1223) — `value` is one
+ *   member's agent id, which finds the card even when the daemon reported no
+ *   orchestration id, and `label` is the card's title.
  * * `spoken_prefix` resolves against **the transcript** — `spoken` is the
  *   boundary the model marked, the words that introduced a dictation, and
  *   `value` is what the app resolved that boundary to: the rest of the

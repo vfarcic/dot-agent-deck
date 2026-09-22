@@ -555,6 +555,10 @@ export function DeckShell({ runtime, workflowPlatformIssue, initialView = { kind
     const namedMode = outcome.params.find((param) => param.kind === "mode_ref");
     const namedAgentType = outcome.params.find((param) => param.kind === "agent_type_ref");
     const declaredForm = declaredNewAgent?.form;
+    /* PRD #1223 — the orchestration card an `orchestration_ref` resolved to,
+       named by one member's agent id on the selected deck, whose agents Rust
+       resolved it against. */
+    const namedOrchestration = outcome.params.find((param) => param.kind === "orchestration_ref");
     const target: VoiceDispatchTarget = {
       /* The dictation pair targets the pane on SCREEN — its row declares no
          agent param and is `screens = ["agent"]`, so `agentView` is defined
@@ -582,6 +586,7 @@ export function DeckShell({ runtime, workflowPlatformIssue, initialView = { kind
       ...(namedMode ? { modeId: namedMode.value } : {}),
       ...(namedAgentType ? { agentTypeId: namedAgentType.value } : {}),
       ...(declaredForm ? { declaredForm: { deckId: declaredForm.deckId, path: declaredForm.path } } : {}),
+      ...(namedOrchestration ? { orchestrationAgentId: namedOrchestration.value } : {}),
     };
     let moved = false;
     const context: VoiceDispatchContext = {

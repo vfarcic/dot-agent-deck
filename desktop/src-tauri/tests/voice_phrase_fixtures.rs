@@ -56,7 +56,7 @@ use dot_agent_deck_desktop::voice::{
     VoiceDirectoryEntry, VoiceNewAgent, VoiceNewAgentForm, VoiceOutcome,
     dictation::normalise,
     handle_utterance, table,
-    test_support::{api_preset, api_resolver, role_agent_in_state, with_tool},
+    test_support::{api_preset, api_resolver, in_orchestration, role_agent_in_state, with_tool},
 };
 use serde::Deserialize;
 
@@ -115,6 +115,13 @@ struct PhraseFixture {
     /// The registry id an `agent_type_ref` param must resolve to.
     #[serde(default)]
     resolved_agent_type: Option<String>,
+    /// Whether the New agent dialog is open with NO live form (PRD #1223) —
+    /// what a spoken "start it" meets before a directory is chosen.
+    #[serde(default)]
+    dialog: bool,
+    /// The card title an `orchestration_ref` param must resolve to.
+    #[serde(default)]
+    resolved_orchestration: Option<String>,
     /// The introducing words a dictation fixture expects the model to MARK.
     ///
     /// **Not the text to type**, which is the whole design: the app takes that
@@ -256,6 +263,18 @@ fn resolved_of(outcome: &VoiceOutcome, kind: ParamKind) -> Option<&str> {
     }
 }
 
+/// The label a dispatch's param of `kind` resolved to — for an orchestration,
+/// the card's title, which is what a fixture can name.
+fn resolved_label(outcome: &VoiceOutcome, kind: ParamKind) -> Option<&str> {
+    match outcome {
+        VoiceOutcome::Dispatch { params, .. } => params
+            .iter()
+            .find(|param| param.kind == kind)
+            .map(|param| param.label.as_str()),
+        _ => None,
+    }
+}
+
 /// What the model marked as the introducing words, for a dictation dispatch.
 ///
 /// Read off `spoken` rather than `value`: `value` is what the app resolved the
@@ -284,7 +303,7 @@ async fn voice_phrase_fixtures_match_the_default_backend() {
         fixtures.fixtures.len()
     );
 
-    let agents = vec![
+    let mut agents = vec![
         role_agent_in_state("agent-tester", "tester", "waiting_for_input"),
         with_tool(
             role_agent_in_state("agent-coder-one", "coder one", "working"),
@@ -298,6 +317,13 @@ async fn voice_phrase_fixtures_match_the_default_backend() {
         ),
         role_agent_in_state("agent-reviewer", "reviewer", "working"),
     ];
+    // PRD #1223 — the four are roles of ONE orchestration, as a real run's
+    // roles are: one `build` card on the overview, which is what
+    // `close_orchestration` resolves against.
+    agents = agents
+        .into_iter()
+        .map(|agent| in_orchestration(agent, "orch-build"))
+        .collect();
     let mut atlas_one = role_agent_in_state("agent-atlas-one", "coder", "working");
     atlas_one.display_name = Some("Atlas".to_string());
     let mut atlas_two = role_agent_in_state("agent-atlas-two", "coder", "working");
@@ -357,6 +383,8 @@ async fn voice_phrase_fixtures_match_the_default_backend() {
                 choice("pi", "Pi"),
                 choice("codex", "Codex"),
             ],
+            // What the dialog withholds with the flag off (PRD #1223).
+            withheld_modes: vec![choice("schedule-issues", "schedule: issues")],
         }),
     };
     let form_choices = new_agent_form.form.as_ref().expect("planted");
@@ -481,7 +509,14 @@ async fn voice_phrase_fixtures_match_the_default_backend() {
             &agents
         };
         let fixture_directories = fixture.listing.then_some(&directories);
-        let fixture_new_agent = fixture.form.then_some(&new_agent_form);
+        let dialog_only = VoiceNewAgent { form: None };
+        let fixture_new_agent = if fixture.form {
+            Some(&new_agent_form)
+        } else if fixture.dialog {
+            Some(&dialog_only)
+        } else {
+            None
+        };
         let resolved = tokio::time::timeout(
             REMOTE_TIMEOUT + PER_FIXTURE_GRACE,
             handle_utterance(
@@ -529,6 +564,13 @@ async fn voice_phrase_fixtures_match_the_default_backend() {
                     }
                     None => true,
                 };
+                let orchestration_matches = match fixture.resolved_orchestration.as_deref() {
+                    Some(expected) => {
+                        resolved_label(&answer.outcome, ParamKind::OrchestrationRef)
+                            == Some(expected)
+                    }
+                    None => true,
+                };
                 let prefix_matches = match fixture.dictate_prefix.as_deref() {
                     Some(expected) => marked_prefix(&answer.outcome)
                         .is_some_and(|marked| normalise(marked) == normalise(expected)),
@@ -541,6 +583,7 @@ async fn voice_phrase_fixtures_match_the_default_backend() {
                     && dir_matches
                     && mode_matches
                     && agent_type_matches
+                    && orchestration_matches
                     && prefix_matches
                 {
                     Ok(())
@@ -548,10 +591,10 @@ async fn voice_phrase_fixtures_match_the_default_backend() {
                     Err(format!(
                         "expected action={} outcome={} resolved_agent={:?} resolved_deck={:?} \
                          resolved_dir={:?} resolved_mode={:?} resolved_agent_type={:?} \
-                         dictate_prefix={:?}, got action={:?} \
+                         resolved_orchestration={:?} dictate_prefix={:?}, got action={:?} \
                          outcome={actual_outcome} resolved_agent={actual_agent:?} \
                          resolved_deck={:?} resolved_dir={:?} resolved_mode={:?} \
-                         resolved_agent_type={:?} dictate_prefix={:?}",
+                         resolved_agent_type={:?} resolved_orchestration={:?} dictate_prefix={:?}",
                         fixture.action,
                         fixture.outcome,
                         fixture.resolved_agent,
@@ -559,12 +602,14 @@ async fn voice_phrase_fixtures_match_the_default_backend() {
                         fixture.resolved_dir,
                         fixture.resolved_mode,
                         fixture.resolved_agent_type,
+                        fixture.resolved_orchestration,
                         fixture.dictate_prefix,
                         actual_action,
                         resolved_deck(&answer.outcome),
                         resolved_dir(&answer.outcome),
                         resolved_of(&answer.outcome, ParamKind::ModeRef),
                         resolved_of(&answer.outcome, ParamKind::AgentTypeRef),
+                        resolved_label(&answer.outcome, ParamKind::OrchestrationRef),
                         marked_prefix(&answer.outcome),
                     ))
                 }

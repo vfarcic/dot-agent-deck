@@ -124,7 +124,12 @@ pub const TOOL_INSTRUCTIONS: &str = "Pick the deck action the user asked for. Pi
     the words the user used for it. `new_agent_form`, when present, is the New \
     agent dialog's form: `modes` are the Mode chips it offers and `agent_types` \
     the entries of its Agent picker, and a `mode_ref` or `agent_type_ref` param \
-    names one of THOSE, answered with the words the user used for it. Write no prose; \
+    names one of THOSE, answered with the words the user used for it. \
+    `orchestrations` lists the orchestrations among those agents by `title`, with \
+    their roles; an `orchestration_ref` param names one of them, answered with the \
+    words the user used for it. An action that starts or stops something only \
+    ASKS: the app shows a confirmation and the user confirms by hand, so pick it \
+    whenever that is what the user asked for, however urgently. Write no prose; \
     the app writes what the user reads.";
 
 /// One row as the model sees it, with its availability on the screen the
@@ -268,6 +273,9 @@ mod tests {
                 "choose_mode".to_string(),
                 "choose_agent_type".to_string(),
                 "name_new_agent".to_string(),
+                "start_new_agent".to_string(),
+                "stop_agent".to_string(),
+                "close_orchestration".to_string(),
                 "none".to_string(),
             ]
         );
@@ -331,6 +339,9 @@ mod tests {
                 "choose_mode",
                 "choose_agent_type",
                 "name_new_agent",
+                "start_new_agent",
+                "stop_agent",
+                "close_orchestration",
                 "none"
             ]
         );
@@ -491,6 +502,9 @@ mod tests {
                 ("choose_mode".to_string(), false),
                 ("choose_agent_type".to_string(), false),
                 ("name_new_agent".to_string(), false),
+                ("start_new_agent".to_string(), false),
+                ("stop_agent".to_string(), false),
+                ("close_orchestration".to_string(), false),
             ]
         );
         assert_eq!(
@@ -518,6 +532,10 @@ mod tests {
                 ("choose_mode".to_string(), false),
                 ("choose_agent_type".to_string(), false),
                 ("name_new_agent".to_string(), false),
+                ("start_new_agent".to_string(), false),
+                // The D5 stops: on the overview, and each only opens a confirmation.
+                ("stop_agent".to_string(), true),
+                ("close_orchestration".to_string(), true),
             ]
         );
         assert_eq!(
@@ -541,6 +559,9 @@ mod tests {
                 ("choose_mode".to_string(), false),
                 ("choose_agent_type".to_string(), false),
                 ("name_new_agent".to_string(), false),
+                ("start_new_agent".to_string(), false),
+                ("stop_agent".to_string(), false),
+                ("close_orchestration".to_string(), false),
             ]
         );
     }

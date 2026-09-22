@@ -5,7 +5,7 @@ import { modeScopedKey } from "../lib/bridge";
 import { VOICE_ACTIONS, type NewAgentVoice, type NewAgentVoiceChannel, type VoiceDispatchTarget, type VoiceOverviewChannel } from "../lib/voiceActions";
 import { DECK_STATE_FALLBACK, deckUnavailableReason, isNewAgentShortcut } from "../lib/newAgent";
 import { ConfirmDialog, type ConfirmState } from "./ConfirmDialog";
-import { NewAgentDialog, NO_DIRECTORY_BROWSER, NO_NEW_AGENT_FORM, type NewAgentRuntime } from "./NewAgentDialog";
+import { NewAgentDialog, NO_DIRECTORY_BROWSER, NO_NEW_AGENT_DIALOG, NO_NEW_AGENT_FORM, type NewAgentRuntime } from "./NewAgentDialog";
 import { DeckSelector } from "./DeckSelector";
 import type { DesktopSettingsState } from "../hooks/useDesktopSettings";
 import { DISPLAY_LIMITS, deckName, displayActivity, displayIdentity, displayPath, displayText, displayTitle, displayUptime, domIdentity, rendersBlank } from "../lib/displayText";
@@ -632,6 +632,19 @@ interface OverviewStopControls {
 
 const StopControlsContext = createContext<OverviewStopControls | undefined>(undefined);
 
+/*
+  PRD #802 D5 — why a spoken stop opened no confirmation. Each says nothing
+  was stopped, because nothing was.
+*/
+/** The agent a spoken stop named is no longer on the overview. */
+export const STOP_TARGET_GONE = "That agent is not on the overview any more, so nothing was stopped.";
+/** The orchestration a spoken close named is no longer on the overview. */
+export const ORCHESTRATION_GONE = "That orchestration is not on the overview any more, so nothing was stopped.";
+/** A confirmation is already open; a second would replace it under the user's pointer. */
+export const CONFIRMATION_ALREADY_OPEN = "A confirmation is already open — answer it first. Nothing else was stopped.";
+/** The New agent dialog is modal, so a stop's confirmation could not be reached behind it. */
+export const STOP_BEHIND_NEW_AGENT = "The New agent dialog is open — close it first. Nothing was stopped.";
+
 /** What a stop or close confirmation calls one agent — the sanitised identity its row shows, or, in an orchestration, its role. */
 export function stopTargetName(agent: OverviewAgent): string {
   const raw = agent.tab.kind === "orchestration" && agent.tab.roleName ? agent.tab.roleName : agent.displayName;
@@ -825,6 +838,41 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
     setNewAgent({ deckId });
   }, [newAgentAvailable]);
   /*
+    PRD #802 D5 — the two stops by voice, each opening EXACTLY the
+    confirmation its manual control opens (`stopControls`, U4) and nothing
+    else: no deck action runs until the user presses that confirmation's
+    button. The agent is looked up in the fleet as it is NOW — the dispatch
+    names it by the deck and id Rust resolved against — and each refuses in
+    words rather than acting on a stale target:
+
+    - an agent or orchestration no longer on the overview;
+    - another confirmation already open, which a second one would silently
+      REPLACE under the user's pointer — the one mistake a confirmation must
+      not invite;
+    - the New agent dialog open, which is modal: a confirmation behind it
+      would be unreachable, and the user is doing something else.
+  */
+  const voiceStops = {
+    confirmStopAgent: (target: VoiceDispatchTarget): string | undefined => {
+      if (newAgent) return STOP_BEHIND_NEW_AGENT;
+      if (confirm) return CONFIRMATION_ALREADY_OPEN;
+      const deck = decks.find((candidate) => candidate.connected && candidate.snapshot.connection.deckId === target.deckId);
+      const agent = deck?.agents.find((candidate) => candidate.id === target.agentId);
+      if (!agent) return STOP_TARGET_GONE;
+      stopControls.stopAgent(agent);
+      return undefined;
+    },
+    confirmCloseOrchestration: (target: VoiceDispatchTarget): string | undefined => {
+      if (newAgent) return STOP_BEHIND_NEW_AGENT;
+      if (confirm) return CONFIRMATION_ALREADY_OPEN;
+      const deck = decks.find((candidate) => candidate.connected && candidate.snapshot.connection.deckId === target.deckId);
+      const group = deck?.groups.find((candidate) => candidate.kind === "orchestration" && candidate.agents.some((agent) => agent.id === target.orchestrationAgentId));
+      if (!group) return ORCHESTRATION_GONE;
+      stopControls.closeOrchestration(group);
+      return undefined;
+    },
+  };
+  /*
     PRD #1223 U5 — publish `closeNewAgent` only while the dialog is open, so
     `closeTopmost` can read its presence the way it reads the voice overlay's.
     And `openNewAgent` — the `open_new_agent` row — only while it is CLOSED and
@@ -858,6 +906,12 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
       chooseNewAgentMode: (target: VoiceDispatchTarget) => fill((slot) => slot.chooseNewAgentMode(target)),
       chooseNewAgentType: (target: VoiceDispatchTarget) => fill((slot) => slot.chooseNewAgentType(target)),
       nameNewAgent: (target: VoiceDispatchTarget) => fill((slot) => slot.nameNewAgent(target)),
+      /* PRD #802 D5 — the dialog's start confirmation, from its slot. */
+      confirmStartNewAgent: (target: VoiceDispatchTarget) => {
+        const slot = newAgentVoice?.current;
+        return slot ? slot.confirmStartNewAgent(target) : NO_NEW_AGENT_DIALOG;
+      },
+      ...voiceStops,
     };
     voiceChannel.current = newAgent
       ? { closeNewAgent: () => newAgentClose.current?.(), ...directoryMoves }

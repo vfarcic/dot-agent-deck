@@ -91,6 +91,10 @@ impl fmt::Display for Screen {
 /// the Agent picker's entries. Two kinds rather than one "choice" kind with the
 /// param name picking the set, because the kind is what selects a resolver, and
 /// a refusal has to say which of the two had no match.
+/// [`ParamKind::OrchestrationRef`] resolves against the orchestrations among
+/// the live agents, grouped exactly as the overview groups them into cards —
+/// by orchestration id, and an agent with none as a card of its own — and
+/// named by the card's title.
 /// [`ParamKind::SpokenPrefix`] resolves against **the transcript
 /// itself**, and nothing else — it is the words that introduced a dictation,
 /// and what it resolves *to* is the rest of what the user said, taken verbatim
@@ -113,16 +117,18 @@ pub enum ParamKind {
     DirRef,
     ModeRef,
     AgentTypeRef,
+    OrchestrationRef,
     SpokenPrefix,
 }
 
 impl ParamKind {
-    pub const ALL: [ParamKind; 6] = [
+    pub const ALL: [ParamKind; 7] = [
         ParamKind::AgentRef,
         ParamKind::DeckRef,
         ParamKind::DirRef,
         ParamKind::ModeRef,
         ParamKind::AgentTypeRef,
+        ParamKind::OrchestrationRef,
         ParamKind::SpokenPrefix,
     ];
 
@@ -133,6 +139,7 @@ impl ParamKind {
             ParamKind::DirRef => "dir_ref",
             ParamKind::ModeRef => "mode_ref",
             ParamKind::AgentTypeRef => "agent_type_ref",
+            ParamKind::OrchestrationRef => "orchestration_ref",
             ParamKind::SpokenPrefix => "spoken_prefix",
         }
     }
@@ -179,13 +186,19 @@ pub enum Requirement {
     /// and a directory chosen, no start in flight, and no start confirmation
     /// showing — the state in which a click on a chip or the picker would take.
     NewAgentForm,
+    /// The New agent dialog is open at all — whatever state its form is in.
+    /// What a spoken "start it" needs, because an incomplete form is a
+    /// sentence the dialog says ("choose a directory first"), not a hint about
+    /// being somewhere else.
+    NewAgentDialog,
 }
 
 impl Requirement {
-    pub const ALL: [Requirement; 3] = [
+    pub const ALL: [Requirement; 4] = [
         Requirement::DirectoryListing,
         Requirement::ParentDirectory,
         Requirement::NewAgentForm,
+        Requirement::NewAgentDialog,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -193,6 +206,7 @@ impl Requirement {
             Requirement::DirectoryListing => "directory_listing",
             Requirement::ParentDirectory => "parent_directory",
             Requirement::NewAgentForm => "new_agent_form",
+            Requirement::NewAgentDialog => "new_agent_dialog",
         }
     }
 
@@ -210,6 +224,7 @@ impl Requirement {
             Requirement::DirectoryListing => directories.is_some(),
             Requirement::ParentDirectory => directories.is_some_and(|listing| listing.has_parent),
             Requirement::NewAgentForm => new_agent.is_some_and(|dialog| dialog.form.is_some()),
+            Requirement::NewAgentDialog => new_agent.is_some(),
         }
     }
 }
@@ -713,6 +728,14 @@ mod tests {
                 ("choose_mode", "chooseNewAgentMode", vec!["overview"]),
                 ("choose_agent_type", "chooseNewAgentType", vec!["overview"]),
                 ("name_new_agent", "nameNewAgent", vec!["overview"]),
+                // PRD #802 D5's set: each only opens a confirmation.
+                ("start_new_agent", "confirmStartNewAgent", vec!["overview"]),
+                ("stop_agent", "confirmStopAgent", vec!["overview"]),
+                (
+                    "close_orchestration",
+                    "confirmCloseOrchestration",
+                    vec!["overview"]
+                ),
             ]
         );
     }
@@ -907,7 +930,7 @@ mod tests {
         let message = error.to_string();
         assert!(
             message.contains(
-                "`agent_ref`, `deck_ref`, `dir_ref`, `mode_ref`, `agent_type_ref`, `spoken_prefix`"
+                "`agent_ref`, `deck_ref`, `dir_ref`, `mode_ref`, `agent_type_ref`, `orchestration_ref`, `spoken_prefix`"
             ),
             "{message}"
         );
@@ -1206,7 +1229,11 @@ mod tests {
                 "close",
                 "voice_off",
                 "list_commands",
-                "open_new_agent"
+                "open_new_agent",
+                // PRD #802 D5's two stops: on the overview, where their
+                // controls are. Each only opens a confirmation.
+                "stop_agent",
+                "close_orchestration"
             ]
         );
         assert_eq!(
@@ -1239,6 +1266,10 @@ mod tests {
         assert_eq!(ParamKind::parse("dir_ref"), Some(ParamKind::DirRef));
         assert_eq!(ParamKind::parse("mode_ref"), Some(ParamKind::ModeRef));
         assert_eq!(
+            ParamKind::parse("orchestration_ref"),
+            Some(ParamKind::OrchestrationRef)
+        );
+        assert_eq!(
             ParamKind::parse("agent_type_ref"),
             Some(ParamKind::AgentTypeRef)
         );
@@ -1263,6 +1294,10 @@ mod tests {
         assert_eq!(
             Requirement::parse("new_agent_form"),
             Some(Requirement::NewAgentForm)
+        );
+        assert_eq!(
+            Requirement::parse("new_agent_dialog"),
+            Some(Requirement::NewAgentDialog)
         );
         assert_eq!(Requirement::parse("dialog_open"), None);
     }
@@ -1343,6 +1378,7 @@ mod tests {
                 path: "/home/dev/code".to_string(),
                 modes: Vec::new(),
                 agent_types: Vec::new(),
+                withheld_modes: Vec::new(),
             }),
         }
     }
@@ -1412,6 +1448,63 @@ mod tests {
             assert!(!row.callable(Screen::Deck, None, Some(&live)), "{id}");
             assert!(!row.callable(Screen::Agent, None, Some(&live)), "{id}");
         }
+    }
+
+    /// PRD #802 D5, as a property of the table: the rows that start or stop
+    /// something are exactly these three, each dispatches a registry entry
+    /// that only opens a confirmation, and each tells the model — and the
+    /// user, in its report — that nothing has happened yet.
+    #[test]
+    fn voice_table_d5_rows_only_ask() {
+        let table = super::table();
+        let asking: Vec<(&str, &str)> = table
+            .rows()
+            .iter()
+            .filter(|row| row.invoke.starts_with("confirm"))
+            .map(|row| (row.id.as_str(), row.invoke.as_str()))
+            .collect();
+        assert_eq!(
+            asking,
+            vec![
+                ("start_new_agent", "confirmStartNewAgent"),
+                ("stop_agent", "confirmStopAgent"),
+                ("close_orchestration", "confirmCloseOrchestration"),
+            ]
+        );
+        for (id, _) in &asking {
+            let row = table.row(id).expect("present");
+            assert!(
+                row.report.contains("nothing has"),
+                "{id}'s report must not claim an act: {}",
+                row.report
+            );
+            assert!(
+                row.description.contains("by itself") && row.description.contains("confirm"),
+                "{id}'s description must say it only asks: {}",
+                row.description
+            );
+            assert_eq!(row.screens, vec![Screen::Overview], "{id}");
+        }
+        let start = table.row("start_new_agent").expect("present");
+        assert_eq!(start.requires, vec![Requirement::NewAgentDialog]);
+        assert!(start.params.is_empty());
+        let stop = table.row("stop_agent").expect("present");
+        assert_eq!(stop.params[0].kind, ParamKind::AgentRef);
+        let close = table.row("close_orchestration").expect("present");
+        assert_eq!(close.params[0].kind, ParamKind::OrchestrationRef);
+    }
+
+    /// "start it" needs the dialog OPEN, not a complete form: an incomplete
+    /// form is the dialog's sentence to say, so the row must reach it.
+    #[test]
+    fn voice_table_start_needs_the_dialog_open_and_nothing_more() {
+        let table = super::table();
+        let start = table.row("start_new_agent").expect("present");
+        let open_no_form = VoiceNewAgent { form: None };
+        assert!(!start.callable(Screen::Overview, None, None));
+        assert!(start.callable(Screen::Overview, None, Some(&open_no_form)));
+        assert!(start.callable(Screen::Overview, None, Some(&form())));
+        assert!(!start.callable(Screen::Deck, None, Some(&open_no_form)));
     }
 
     /// The Command decision, as a property: no row's description offers to

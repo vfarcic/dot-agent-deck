@@ -1128,6 +1128,7 @@ mod tests {
                 "deck_ref",
                 "dir_ref",
                 "mode_ref",
+                "orchestration_ref",
                 "spoken_prefix",
             ]
             .into_iter()

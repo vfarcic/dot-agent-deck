@@ -19,7 +19,7 @@
 use serde_json::{Value, json};
 
 use super::DesktopAgent;
-use super::outcome::{display_label, role_name, same_spoken_name};
+use super::outcome::{display_label, orchestrations, role_name, same_spoken_name};
 use super::resolver::{IntentAnswer, IntentRequest};
 use super::schema::AnnotatedCommand;
 use super::table::NO_MATCH_ACTION;
@@ -190,13 +190,24 @@ pub fn param_names(commands: &[AnnotatedCommand]) -> Vec<String> {
 /// hosted backend should be handed to pick a command. The resolver matches
 /// against every declared entry, not only the ones shown here.
 ///
+/// # Orchestrations are CARDS, named as the overview names them (PRD #1223)
+///
+/// `orchestrations` lists each orchestration among the agents above the way
+/// the overview shows it as a card — its title and its members' roles — only
+/// when there is at least one. It is derived from the same agents, grouped by
+/// [`super::outcome`]'s rule that mirrors the overview's, so the title a model
+/// is shown is the title an `orchestration_ref` is matched against.
+///
 /// # The New agent form is LABELS, only while its fields are live (PRD #1223)
 ///
 /// `new_agent_form` is present only when the dialog declared a live form, and
 /// carries the Mode chips and the Agent picker's entries as their labels — the
 /// words on the chips — so a model can tell "schedule issues" is a mode and
 /// "opencode" an agent type, and see that a chip the user named is not
-/// offered. No deck id and no path, for the directories' reason.
+/// offered. `modes_not_offered` names the chips the dialog knows and withholds
+/// here, so a model copies "schedule issues" rather than substituting the
+/// nearest chip that IS offered. No deck id and no path, for the directories'
+/// reason.
 ///
 /// Nothing here is a transcript, an utterance or an audio buffer, so PRD #802's
 /// Open Question 5 is untouched — and this function still writes nothing
@@ -226,6 +237,15 @@ pub fn state(request: &IntentRequest<'_>) -> Value {
             "has_parent": directories.has_parent,
         });
     }
+    let cards = orchestrations(request.agents);
+    if !cards.is_empty() {
+        state["orchestrations"] = json!(
+            cards
+                .iter()
+                .map(|card| json!({ "title": card.title, "roles": card.roles }))
+                .collect::<Vec<_>>()
+        );
+    }
     if let Some(form) = request.new_agent.and_then(|dialog| dialog.form.as_ref()) {
         let labels = |choices: &[super::VoiceChoice]| {
             choices
@@ -233,10 +253,14 @@ pub fn state(request: &IntentRequest<'_>) -> Value {
                 .map(|choice| choice.label.clone())
                 .collect::<Vec<_>>()
         };
-        state["new_agent_form"] = json!({
+        let mut form_state = json!({
             "modes": labels(&form.modes),
             "agent_types": labels(&form.agent_types),
         });
+        if !form.withheld_modes.is_empty() {
+            form_state["modes_not_offered"] = json!(labels(&form.withheld_modes));
+        }
+        state["new_agent_form"] = form_state;
     }
     state
 }
@@ -407,6 +431,9 @@ mod tests {
                 "choose_mode".to_string(),
                 "choose_agent_type".to_string(),
                 "name_new_agent".to_string(),
+                "start_new_agent".to_string(),
+                "stop_agent".to_string(),
+                "close_orchestration".to_string(),
                 "none".to_string(),
             ]
         );
@@ -428,6 +455,7 @@ mod tests {
                 "dir".to_string(),
                 "mode".to_string(),
                 "agent_type".to_string(),
+                "orchestration".to_string(),
             ]
         );
     }
@@ -510,6 +538,38 @@ mod tests {
     }
 
     #[test]
+    fn voice_prompt_state_names_orchestrations_as_the_overview_s_cards() {
+        let commands = commands();
+        let transcript = Transcript::new("close the billing run");
+        let mut lead = agent("1", "lead");
+        let mut critic = agent("2", "critic");
+        for agent in [&mut lead, &mut critic] {
+            if let crate::dto::DesktopTab::Orchestration {
+                display_title,
+                orchestration_id,
+                ..
+            } = &mut agent.tab
+            {
+                *display_title = Some("billing-orchestrator-1".to_string());
+                *orchestration_id = Some("o-1".to_string());
+            }
+        }
+        let agents = [lead, critic];
+        let rendered = state(&request(&transcript, &commands, &agents));
+        assert_eq!(
+            rendered["orchestrations"],
+            json!([{ "title": "billing-orchestrator-1", "roles": ["lead", "critic"] }])
+        );
+        // None among the agents: no key, rather than an empty list.
+        let solo = [dashboard_agent("3", Some("solo"), "claude_code")];
+        assert!(
+            state(&request(&transcript, &commands, &solo))
+                .get("orchestrations")
+                .is_none()
+        );
+    }
+
+    #[test]
     fn voice_prompt_state_names_the_form_s_chips_only_while_it_is_live() {
         let commands = commands();
         let transcript = Transcript::new("use claude");
@@ -523,6 +583,7 @@ mod tests {
                 path: "/home/secret-user/code".to_string(),
                 modes: vec![choice("none", "No mode"), choice("schedule", "schedule")],
                 agent_types: vec![choice("auto", "auto"), choice("claude", "Claude Code")],
+                withheld_modes: vec![choice("schedule-issues", "schedule: issues")],
             }),
         };
         let closed_form = crate::voice::VoiceNewAgent { form: None };
@@ -543,7 +604,11 @@ mod tests {
         let rendered = state(&request(Some(&live)));
         assert_eq!(
             rendered["new_agent_form"],
-            json!({ "modes": ["No mode", "schedule"], "agent_types": ["auto", "Claude Code"] })
+            json!({
+                "modes": ["No mode", "schedule"],
+                "agent_types": ["auto", "Claude Code"],
+                "modes_not_offered": ["schedule: issues"],
+            })
         );
         // Labels only: never the deck id or where on its filesystem the form is.
         let text = rendered.to_string();

@@ -2754,6 +2754,7 @@ fn validate_voice_new_agent(new_agent: &voice::VoiceNewAgent) -> Result<(), Stri
         || too_long(&form.path, MAX_VOICE_DIRECTORY_PATH_BYTES)
         || oversized(&form.modes)
         || oversized(&form.agent_types)
+        || oversized(&form.withheld_modes)
     {
         return Err(
             "the New agent form sent with that command is larger than any form shows".to_string(),

@@ -259,6 +259,29 @@ export type VoiceActionContext = {
   chooseNewAgentMode: (target: VoiceDispatchTarget) => string | undefined;
   chooseNewAgentType: (target: VoiceDispatchTarget) => string | undefined;
   nameNewAgent: (target: VoiceDispatchTarget) => string | undefined;
+  /**
+   * PRD #802 D5 — the three voice members that lead to a START or a STOP, and
+   * the one rule they share: **each can only OPEN a confirmation.** None of
+   * them runs a deck action; the confirmation's own button does, pressed by
+   * the user. So a misheard or over-confident answer costs a dialog the user
+   * dismisses, never an agent nobody sanctioned.
+   *
+   * - `confirmStartNewAgent` — the New agent dialog's start, acting on the form
+   *   as it is: it opens the dialog's start confirmation naming the deck, the
+   *   directory, the mode and the command, or answers what is missing.
+   * - `confirmStopAgent` — the overview row's Stop, for the agent an
+   *   `agent_ref` resolved to: the same confirmation that button opens.
+   * - `confirmCloseOrchestration` — an orchestration card's Close, for the
+   *   card an `orchestration_ref` resolved to (`target.orchestrationAgentId`):
+   *   the same confirmation, naming every role it will stop.
+   *
+   * Each answers `undefined` when it opened the confirmation, or the sentence
+   * saying why it did not. The table's own `confirm` column PRD #802
+   * anticipates is not built; this frontend gate is what satisfies D5 today.
+   */
+  confirmStartNewAgent: (target: VoiceDispatchTarget) => string | undefined;
+  confirmStopAgent: (target: VoiceDispatchTarget) => string | undefined;
+  confirmCloseOrchestration: (target: VoiceDispatchTarget) => string | undefined;
 };
 
 /**
@@ -612,6 +635,42 @@ export const VOICE_ACTIONS = {
       if (refused !== undefined) context.reportRefused(refused);
     },
   },
+
+  /* PRD #802 D5 — the three rows that START or STOP something. Each entry
+     calls a member that can only OPEN a confirmation (see the members' own
+     comment on `VoiceActionContext`), so voice never reaches `runAction` for
+     a start or a stop: the confirmation's button does, pressed by hand. The
+     manual controls — the dialog's Start, a row's Stop, a card's Close — keep
+     exactly the behaviour they had and do not route through these. */
+  confirmStartNewAgent: {
+    label: "Ask to start the agent the New agent form describes",
+    voice: true,
+    needs: ["confirmStartNewAgent", "reportRefused"],
+    run: (context: Pick<VoiceActionContext, "confirmStartNewAgent" | "reportRefused">, target: VoiceDispatchTarget) => {
+      const refused = context.confirmStartNewAgent(target);
+      if (refused !== undefined) context.reportRefused(refused);
+    },
+  },
+
+  confirmStopAgent: {
+    label: "Ask to stop one agent on the overview",
+    voice: true,
+    needs: ["confirmStopAgent", "reportRefused"],
+    run: (context: Pick<VoiceActionContext, "confirmStopAgent" | "reportRefused">, target: VoiceDispatchTarget) => {
+      const refused = context.confirmStopAgent(target);
+      if (refused !== undefined) context.reportRefused(refused);
+    },
+  },
+
+  confirmCloseOrchestration: {
+    label: "Ask to close an orchestration on the overview",
+    voice: true,
+    needs: ["confirmCloseOrchestration", "reportRefused"],
+    run: (context: Pick<VoiceActionContext, "confirmCloseOrchestration" | "reportRefused">, target: VoiceDispatchTarget) => {
+      const refused = context.confirmCloseOrchestration(target);
+      if (refused !== undefined) context.reportRefused(refused);
+    },
+  },
 } satisfies Record<string, VoiceActionEntry>;
 
 /** Every action id, as the guard and the command table spell them. */
@@ -704,6 +763,12 @@ export type VoiceDispatchTarget = AgentViewTarget & {
    * {@link declaredDirectories}' reason.
    */
   declaredForm?: { deckId: string; path: string };
+  /**
+   * The orchestration card an `orchestration_ref` resolved to, named by one
+   * of its members' agent ids on {@link deckId} — a member, because a card
+   * whose daemon reported no orchestration id is still a card (PRD #1223).
+   */
+  orchestrationAgentId?: string;
   /**
    * The words to type into the open agent's prompt, for the dictation row
    * (PRD #802 D6, rebuilt).
@@ -813,10 +878,10 @@ export type VoiceScreenContext = Omit<VoiceActionContext, keyof VoicePanelContex
  * dialog for; a dispatch of `openNewAgent` there is refused against its
  * `needs`, the way the overview refuses a deck overlay.
  */
-export type VoiceOverviewContext = Pick<VoiceActionContext, "openNewAgent" | "closeNewAgent" | "openDirectory" | "goToParentDirectory" | "useThisDirectory" | NewAgentFormMember>;
+export type VoiceOverviewContext = Pick<VoiceActionContext, "openNewAgent" | "closeNewAgent" | "openDirectory" | "goToParentDirectory" | "useThisDirectory" | NewAgentFormMember | "confirmStopAgent" | "confirmCloseOrchestration">;
 
 /** The New agent form's members, served — like the browser's — from the dialog's slot. */
-export type NewAgentFormMember = "chooseNewAgentMode" | "chooseNewAgentType" | "nameNewAgent";
+export type NewAgentFormMember = "chooseNewAgentMode" | "chooseNewAgentType" | "nameNewAgent" | "confirmStartNewAgent";
 
 /**
  * What the New agent dialog publishes about its directory browser (PRD #1223),

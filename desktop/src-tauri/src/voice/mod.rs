@@ -173,6 +173,14 @@ pub struct VoiceNewAgentForm {
     pub modes: Vec<VoiceChoice>,
     /// The Agent picker's entries, `auto` first, as the select shows them.
     pub agent_types: Vec<VoiceChoice>,
+    /// The Mode chips the dialog KNOWS and withholds on this form — an
+    /// authoring kind the deck cannot compose, or `schedule: issues` with the
+    /// deck's experimental flag off. Never resolvable: they are here so that a
+    /// user who names one is told it is not offered, instead of being handed
+    /// the nearest chip that is (a model shown only the offered chips was
+    /// measured substituting `schedule` for "schedule issues").
+    #[serde(default)]
+    pub withheld_modes: Vec<VoiceChoice>,
 }
 
 /// One entry of a closed set on screen: the id the dialog selects by, and the
@@ -476,6 +484,18 @@ pub mod test_support {
     pub fn role_agent_in_state(id: &str, role: &str, status: &str) -> DesktopAgent {
         let mut agent = role_agent(id, role);
         agent.status = status.to_string();
+        agent
+    }
+
+    /// The same role agent as a member of the orchestration `id` — so several
+    /// share one overview card, as a real run's roles do (PRD #1223).
+    pub fn in_orchestration(mut agent: DesktopAgent, id: &str) -> DesktopAgent {
+        if let DesktopTab::Orchestration {
+            orchestration_id, ..
+        } = &mut agent.tab
+        {
+            *orchestration_id = Some(id.to_string());
+        }
         agent
     }
 

@@ -547,6 +547,39 @@ pub async fn handle_utterance(
                     });
                 }
             },
+            // PRD #1223 — an orchestration, as the overview's card for it:
+            // resolved against the live agents grouped the way `groupAgents`
+            // groups them, and the same two refusals. `value` is one of its
+            // members' agent ids, which is what lets the frontend find the
+            // card whether or not the daemon gave the orchestration an id.
+            ParamKind::OrchestrationRef => match resolve_orchestration_ref(spoken, agents) {
+                ChoiceMatch::One { id, label } => resolved.push(ResolvedParam {
+                    name: spec.name.clone(),
+                    kind: spec.kind,
+                    spoken: spoken.to_string(),
+                    value: id,
+                    label,
+                }),
+                ChoiceMatch::None => {
+                    return finish(VoiceOutcome::ParamUnresolved {
+                        sentence: heard(&transcript, &spec.kind.unresolved_phrase(spoken)),
+                        transcript,
+                        action: row.id.clone(),
+                        param: spec.name.clone(),
+                        spoken: spoken.to_string(),
+                    });
+                }
+                ChoiceMatch::Ambiguous(titles) => {
+                    return finish(VoiceOutcome::ParamAmbiguous {
+                        sentence: heard(&transcript, &spec.kind.ambiguous_phrase(spoken, &titles)),
+                        transcript,
+                        action: row.id.clone(),
+                        param: spec.name.clone(),
+                        spoken: spoken.to_string(),
+                        matches: titles,
+                    });
+                }
+            },
             // PRD #1223 — the New agent form's two closed sets, as the dialog
             // declared them ON SCREEN, and the same two refusals. `new_agent`
             // carries a form whenever a row requiring one got past `callable`;
@@ -560,7 +593,23 @@ pub async fn handle_utterance(
                     (_, None) => &[],
                 };
                 let resolved_choice = if spec.kind == ParamKind::ModeRef {
-                    resolve_mode_ref(spoken, choices)
+                    // A chip the form withholds is refused by name — whether
+                    // the model copied it or substituted a nearby offered chip
+                    // while the transcript names the withheld one. See
+                    // [`withheld_mode_named`].
+                    let withheld = form.map_or(&[][..], |form| form.withheld_modes.as_slice());
+                    match withheld_mode_named(spoken, transcript.text(), choices, withheld) {
+                        Some(label) => {
+                            return finish(VoiceOutcome::ParamUnresolved {
+                                sentence: heard(&transcript, &spec.kind.unresolved_phrase(&label)),
+                                transcript,
+                                action: row.id.clone(),
+                                param: spec.name.clone(),
+                                spoken: spoken.to_string(),
+                            });
+                        }
+                        None => resolve_mode_ref(spoken, choices),
+                    }
                 } else {
                     resolve_agent_type_ref(spoken, choices)
                 };
@@ -781,6 +830,7 @@ impl ParamKind {
             ParamKind::DirRef => "I could not tell which directory you meant",
             ParamKind::ModeRef => "I could not tell which mode you meant",
             ParamKind::AgentTypeRef => "I could not tell which agent type you meant",
+            ParamKind::OrchestrationRef => "I could not tell which orchestration you meant",
             // The model picked dictation and marked no boundary, so there is
             // no answer to the only question this kind asks: where do the
             // user's own words start? Nothing is typed, and the sentence says
@@ -821,6 +871,9 @@ impl ParamKind {
             ParamKind::AgentTypeRef => format!(
                 "no agent type in the New agent form's picker matches \u{201c}{spoken}\u{201d}"
             ),
+            ParamKind::OrchestrationRef => {
+                format!("no orchestration here matches \u{201c}{spoken}\u{201d}")
+            }
             // **The fidelity refusal**, and the one sentence in this file that
             // reports a disagreement between the app and the model. The words
             // quoted are the MODEL's — scrubbed like every foreign string — and
@@ -872,6 +925,9 @@ impl ParamKind {
             }
             ParamKind::AgentTypeRef => {
                 format!("\u{201c}{spoken}\u{201d} matches more than one agent type: {listed}")
+            }
+            ParamKind::OrchestrationRef => {
+                format!("\u{201c}{spoken}\u{201d} matches more than one orchestration: {listed}")
             }
             // Unreachable: a prefix resolves against the transcript, which
             // either starts with the marked words or does not. Written out
@@ -1120,6 +1176,55 @@ pub fn resolve_mode_ref(spoken: &str, modes: &[VoiceChoice]) -> ChoiceMatch {
     })
 }
 
+/// The withheld chip a spoken mode really names, if it names one (PRD #1223).
+///
+/// Two routes, because a model is one of them. The model's own answer may
+/// name the withheld chip — resolved over offered and withheld together, a
+/// withheld winner is refused. Or the model may have answered with the
+/// nearest OFFERED chip: measured on `gpt-5-mini`, "set the mode to schedule
+/// issues" on a deck with its flag off came back as `schedule` three runs in a
+/// row, whatever the row's description said. So the TRANSCRIPT is checked too:
+/// when it contains a withheld chip's words, and the chip the answer resolved
+/// to is a strict part of that withheld one, the user asked for the withheld
+/// chip and is told so. Nothing here ever resolves TO a withheld chip.
+fn withheld_mode_named(
+    spoken: &str,
+    transcript: &str,
+    offered: &[VoiceChoice],
+    withheld: &[VoiceChoice],
+) -> Option<String> {
+    if withheld.is_empty() {
+        return None;
+    }
+    let everything: Vec<VoiceChoice> = offered.iter().chain(withheld).cloned().collect();
+    if let ChoiceMatch::One { id, label } = resolve_mode_ref(spoken, &everything)
+        && withheld.iter().any(|choice| choice.id == id)
+    {
+        return Some(label);
+    }
+    let spaced = |text: &str| {
+        normalize(
+            &text
+                .chars()
+                .map(|c| if c.is_alphanumeric() { c } else { ' ' })
+                .collect::<String>(),
+        )
+    };
+    let heard = format!(" {} ", spaced(transcript));
+    let answered = match resolve_mode_ref(spoken, offered) {
+        ChoiceMatch::One { label, .. } => Some(words(&spaced(&label))),
+        _ => None,
+    };
+    withheld.iter().find_map(|choice| {
+        let name = spaced(&choice.label);
+        let named = !name.is_empty() && heard.contains(&format!(" {name} "));
+        let inside = answered
+            .as_ref()
+            .is_none_or(|offered| offered.is_subset(&words(&name)) && *offered != words(&name));
+        (named && inside).then(|| choice.label.clone())
+    })
+}
+
 /// Resolve a spoken agent type against the New agent form's Agent picker as it
 /// is on screen (PRD #1223): the deck's own registry, or the desktop's labelled
 /// fallback, plus `auto`. An entry answers to its label and to its registry id
@@ -1220,6 +1325,100 @@ fn resolve_choice(
         },
         _ => ChoiceMatch::Ambiguous(hits.iter().map(|choice| choice.label.clone()).collect()),
     }
+}
+
+/// One orchestration among the live agents, as the overview's card for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct AgentOrchestration {
+    /// The first member in snapshot order — what a dispatch names the card by.
+    pub member_id: String,
+    /// What the card is headed with: the run's title, else the config name.
+    pub title: String,
+    /// The config name, when a title is shown instead of it.
+    pub name: String,
+    /// Every member's role, in snapshot order.
+    pub roles: Vec<String>,
+}
+
+/// The orchestrations among `agents`, grouped EXACTLY as the overview's
+/// `groupAgents` groups them into cards: by `orchestration_id`, and an agent
+/// whose daemon reported none as a card of its own — never merged by name,
+/// which would put two unrelated runs' roles on one card. In order of each
+/// card's first member.
+pub(super) fn orchestrations(agents: &[DesktopAgent]) -> Vec<AgentOrchestration> {
+    let mut groups: Vec<(String, AgentOrchestration)> = Vec::new();
+    for agent in agents {
+        let DesktopTab::Orchestration {
+            name,
+            role_name,
+            display_title,
+            orchestration_id,
+            ..
+        } = &agent.tab
+        else {
+            continue;
+        };
+        let key = match orchestration_id {
+            Some(id) => format!("id:{id}"),
+            None => format!("self:{}", agent.id),
+        };
+        if let Some((_, group)) = groups.iter_mut().find(|(existing, _)| *existing == key) {
+            group.roles.push(role_name.clone());
+            continue;
+        }
+        let title = display_title
+            .as_ref()
+            .map(|title| title.trim())
+            .filter(|title| !title.is_empty())
+            .unwrap_or(name.as_str())
+            .to_string();
+        groups.push((
+            key,
+            AgentOrchestration {
+                member_id: agent.id.clone(),
+                title,
+                name: name.clone(),
+                roles: vec![role_name.clone()],
+            },
+        ));
+    }
+    groups.into_iter().map(|(_, group)| group).collect()
+}
+
+/// Resolve a spoken reference to an orchestration against the live agents
+/// (PRD #1223) — the card the overview shows for it, named by its title or its
+/// config name, with [`resolve_dir_ref`]'s exact-before-loose rule and the
+/// loose pass narrowed to its most specific hits. "orchestration" and "run"
+/// are filler here, since "the review orchestration" names `review`.
+///
+/// `id` in the answer is one member's agent id, not an orchestration id: an
+/// orchestration whose daemon reported no id still has a card, and a member is
+/// how the frontend finds it.
+pub fn resolve_orchestration_ref(spoken: &str, agents: &[DesktopAgent]) -> ChoiceMatch {
+    let cards = orchestrations(agents);
+    let choices: Vec<VoiceChoice> = cards
+        .iter()
+        .map(|card| VoiceChoice {
+            id: card.member_id.clone(),
+            label: card.title.clone(),
+        })
+        .collect();
+    let reference = normalize(spoken)
+        .split(' ')
+        .filter(|word| !matches!(*word, "orchestration" | "run" | "the"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    resolve_choice(&reference, &choices, |choice| {
+        let card = cards
+            .iter()
+            .find(|card| card.member_id == choice.id)
+            .expect("every choice is built from a card");
+        let mut names = vec![card.title.clone()];
+        if card.name != card.title {
+            names.push(card.name.clone());
+        }
+        names
+    })
 }
 
 /// [`word_subset`] for a closed set: see [`resolve_choice`] for why a name
@@ -1985,6 +2184,7 @@ mod tests {
                     choice("opencode", "OpenCode"),
                     choice("pi", "Pi"),
                 ],
+                withheld_modes: vec![choice("schedule-issues", "schedule: issues")],
             }),
         }
     }
@@ -2160,9 +2360,83 @@ mod tests {
         .await;
         assert_eq!(
             outcome.sentence(),
-            "Heard: \u{201c}mode schedule issues\u{201d} — no mode the New agent form offers matches \u{201c}schedule issues\u{201d}."
+            "Heard: \u{201c}mode schedule issues\u{201d} — no mode the New agent form offers matches \u{201c}schedule: issues\u{201d}."
         );
         assert!(matches!(outcome, VoiceOutcome::ParamUnresolved { .. }));
+    }
+
+    /// The measured model failure: asked for the withheld chip, the model
+    /// answers with the nearest OFFERED one. The transcript still names the
+    /// withheld chip, so the app refuses instead of choosing `schedule`.
+    #[tokio::test]
+    async fn voice_outcome_choose_mode_refuses_a_substituted_chip_the_transcript_contradicts() {
+        let resolver = StubResolver::new()
+            .answering(
+                "set the mode to schedule issues",
+                IntentAnswer::new("choose_mode").with_param("mode", "schedule"),
+            )
+            .answering(
+                "set the mode to schedule",
+                IntentAnswer::new("choose_mode").with_param("mode", "schedule"),
+            );
+        let form = new_agent_form();
+        let refused = run_form(
+            &resolver,
+            Screen::Overview,
+            Some(&form),
+            "set the mode to schedule issues",
+        )
+        .await;
+        assert_eq!(
+            refused.sentence(),
+            "Heard: \u{201c}set the mode to schedule issues\u{201d} — no mode the New agent form offers matches \u{201c}schedule: issues\u{201d}."
+        );
+        // The plain request is untouched: `schedule` is offered, and nothing
+        // withheld is in what was said.
+        let VoiceOutcome::Dispatch { params, .. } = run_form(
+            &resolver,
+            Screen::Overview,
+            Some(&form),
+            "set the mode to schedule",
+        )
+        .await
+        else {
+            panic!("a dispatch");
+        };
+        assert_eq!(params[0].value, "schedule");
+    }
+
+    #[test]
+    fn voice_outcome_withheld_mode_named_needs_the_offered_answer_to_be_part_of_it() {
+        let offered = vec![
+            choice("dispatcher", "dispatcher"),
+            choice("schedule", "schedule"),
+        ];
+        let withheld = vec![choice("schedule-issues", "schedule: issues")];
+        // The transcript names the withheld chip, but the answer is an
+        // unrelated offered one: the model's pick stands (it is not a
+        // substitution of the withheld chip).
+        assert_eq!(
+            withheld_mode_named(
+                "dispatcher",
+                "make it a dispatcher, not schedule issues",
+                &offered,
+                &withheld
+            ),
+            None
+        );
+        assert_eq!(
+            withheld_mode_named("schedule", "schedule issues please", &offered, &withheld),
+            Some("schedule: issues".to_string())
+        );
+        assert_eq!(
+            withheld_mode_named("schedule", "schedule it", &offered, &withheld),
+            None
+        );
+        assert_eq!(
+            withheld_mode_named("schedule", "schedule issues", &offered, &[]),
+            None
+        );
     }
 
     #[tokio::test]
@@ -2293,6 +2567,253 @@ mod tests {
                 );
             }
         }
+    }
+
+    // -- PRD #802 D5: start, stop and close only ASK (PRD #1223) ------------
+
+    /// A role of one orchestration, the way the daemon reports it.
+    fn member(
+        id: &str,
+        role: &str,
+        name: &str,
+        title: Option<&str>,
+        orchestration: Option<&str>,
+    ) -> DesktopAgent {
+        let mut agent = role_agent(id, role);
+        agent.tab = DesktopTab::Orchestration {
+            name: name.to_string(),
+            role_index: 0,
+            role_name: role.to_string(),
+            is_start_role: false,
+            cwd: None,
+            display_title: title.map(str::to_string),
+            orchestration_id: orchestration.map(str::to_string),
+        };
+        agent
+    }
+
+    /// Two runs of `review` with their own titles, one `billing` run, and an
+    /// id-less member that is a card of its own — the overview's grouping.
+    fn two_runs() -> Vec<DesktopAgent> {
+        vec![
+            member(
+                "1",
+                "lead",
+                "review",
+                Some("docs-orchestrator-1"),
+                Some("o-1"),
+            ),
+            member(
+                "2",
+                "critic",
+                "review",
+                Some("docs-orchestrator-1"),
+                Some("o-1"),
+            ),
+            member(
+                "3",
+                "lead",
+                "review",
+                Some("api-orchestrator-1"),
+                Some("o-2"),
+            ),
+            member("4", "planner", "billing", None, Some("o-3")),
+            member("5", "loner", "legacy", None, None),
+        ]
+    }
+
+    #[test]
+    fn voice_outcome_orchestrations_group_the_way_the_overview_does() {
+        let cards = orchestrations(&two_runs());
+        let shape: Vec<(&str, &str, Vec<&str>)> = cards
+            .iter()
+            .map(|card| {
+                (
+                    card.member_id.as_str(),
+                    card.title.as_str(),
+                    card.roles.iter().map(String::as_str).collect(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            shape,
+            vec![
+                ("1", "docs-orchestrator-1", vec!["lead", "critic"]),
+                ("3", "api-orchestrator-1", vec!["lead"]),
+                ("4", "billing", vec!["planner"]),
+                ("5", "legacy", vec!["loner"]),
+            ]
+        );
+        // Standalone agents are not orchestrations.
+        assert!(orchestrations(&[agent("9", Some("solo"), "claude_code")]).is_empty());
+    }
+
+    #[test]
+    fn voice_outcome_orchestration_ref_resolves_a_card_by_title_or_name() {
+        let agents = two_runs();
+        let one = |said: &str| match resolve_orchestration_ref(said, &agents) {
+            ChoiceMatch::One { id, label } => (id, label),
+            other => panic!("{said:?}: {other:?}"),
+        };
+        assert_eq!(one("billing"), ("4".to_string(), "billing".to_string()));
+        assert_eq!(
+            one("the billing orchestration"),
+            ("4".to_string(), "billing".to_string())
+        );
+        assert_eq!(
+            one("docs orchestrator 1"),
+            ("1".to_string(), "docs-orchestrator-1".to_string())
+        );
+        assert_eq!(
+            one("the docs run"),
+            ("1".to_string(), "docs-orchestrator-1".to_string())
+        );
+        assert_eq!(one("legacy"), ("5".to_string(), "legacy".to_string()));
+        // Two runs of one config are two cards, so the config name alone is
+        // ambiguous and the answer names both titles.
+        assert_eq!(
+            resolve_orchestration_ref("review", &agents),
+            ChoiceMatch::Ambiguous(vec![
+                "docs-orchestrator-1".to_string(),
+                "api-orchestrator-1".to_string()
+            ])
+        );
+        assert_eq!(
+            resolve_orchestration_ref("payments", &agents),
+            ChoiceMatch::None
+        );
+        assert_eq!(
+            resolve_orchestration_ref("the orchestration", &agents),
+            ChoiceMatch::None
+        );
+    }
+
+    #[tokio::test]
+    async fn voice_outcome_start_new_agent_reaches_an_open_dialog_whatever_its_form() {
+        // An incomplete form still dispatches: saying WHAT is missing is the
+        // dialog's job, and a hint about being somewhere else would be false.
+        let resolver =
+            StubResolver::new().answering("start it", IntentAnswer::new("start_new_agent"));
+        for declared in [VoiceNewAgent { form: None }, new_agent_form()] {
+            let outcome = run_form(&resolver, Screen::Overview, Some(&declared), "start it").await;
+            assert_eq!(
+                outcome,
+                VoiceOutcome::Dispatch {
+                    transcript: Transcript::new("start it"),
+                    action: "start_new_agent".to_string(),
+                    invoke: "confirmStartNewAgent".to_string(),
+                    params: Vec::new(),
+                    sentence: "Confirm the start in the dialog — nothing has started yet."
+                        .to_string(),
+                }
+            );
+        }
+        let closed = run_form(&resolver, Screen::Overview, None, "start it").await;
+        assert_eq!(
+            closed.sentence(),
+            "Not here — starting a new agent works while the New agent dialog is open."
+        );
+    }
+
+    async fn run_agents(
+        resolver: &StubResolver,
+        screen: Screen,
+        agents: &[DesktopAgent],
+        said: &str,
+    ) -> VoiceOutcome {
+        handle_utterance(
+            resolver,
+            table(),
+            screen,
+            agents,
+            &decks(),
+            None,
+            None,
+            Transcript::new(said),
+        )
+        .await
+        .outcome
+    }
+
+    #[tokio::test]
+    async fn voice_outcome_stop_agent_resolves_an_agent_and_claims_nothing() {
+        let resolver = StubResolver::new().answering(
+            "stop the tester",
+            IntentAnswer::new("stop_agent").with_param("agent", "tester"),
+        );
+        let outcome = run_agents(&resolver, Screen::Overview, &fleet(), "stop the tester").await;
+        let VoiceOutcome::Dispatch {
+            invoke,
+            params,
+            sentence,
+            ..
+        } = outcome
+        else {
+            panic!("a dispatch");
+        };
+        assert_eq!(invoke, "confirmStopAgent");
+        assert_eq!(params[0].value, "1");
+        assert_eq!(
+            sentence,
+            "Confirm stopping tester — nothing has been stopped yet."
+        );
+
+        let deck = run_agents(&resolver, Screen::Deck, &fleet(), "stop the tester").await;
+        assert_eq!(
+            deck.sentence(),
+            "Not here — stopping an agent works from the agent overview."
+        );
+    }
+
+    #[tokio::test]
+    async fn voice_outcome_close_orchestration_resolves_a_card() {
+        let resolver = StubResolver::new()
+            .answering(
+                "close the billing run",
+                IntentAnswer::new("close_orchestration").with_param("orchestration", "billing"),
+            )
+            .answering(
+                "close review",
+                IntentAnswer::new("close_orchestration").with_param("orchestration", "review"),
+            )
+            .answering(
+                "close payments",
+                IntentAnswer::new("close_orchestration").with_param("orchestration", "payments"),
+            );
+        let agents = two_runs();
+        let VoiceOutcome::Dispatch {
+            invoke,
+            params,
+            sentence,
+            ..
+        } = run_agents(
+            &resolver,
+            Screen::Overview,
+            &agents,
+            "close the billing run",
+        )
+        .await
+        else {
+            panic!("a dispatch");
+        };
+        assert_eq!(invoke, "confirmCloseOrchestration");
+        assert_eq!(params[0].kind, ParamKind::OrchestrationRef);
+        assert_eq!(params[0].value, "4");
+        assert_eq!(
+            sentence,
+            "Confirm closing billing — nothing has been stopped yet."
+        );
+
+        let ambiguous = run_agents(&resolver, Screen::Overview, &agents, "close review").await;
+        assert_eq!(
+            ambiguous.sentence(),
+            "Heard: \u{201c}close review\u{201d} — \u{201c}review\u{201d} matches more than one orchestration: docs-orchestrator-1, api-orchestrator-1."
+        );
+        let none = run_agents(&resolver, Screen::Overview, &agents, "close payments").await;
+        assert_eq!(
+            none.sentence(),
+            "Heard: \u{201c}close payments\u{201d} — no orchestration here matches \u{201c}payments\u{201d}."
+        );
     }
 
     async fn run(

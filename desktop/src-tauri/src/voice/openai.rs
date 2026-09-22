@@ -305,6 +305,9 @@ mod tests {
                 "choose_mode",
                 "choose_agent_type",
                 "name_new_agent",
+                "start_new_agent",
+                "stop_agent",
+                "close_orchestration",
                 "none"
             ]
         );
@@ -373,7 +376,15 @@ mod tests {
         );
         assert_eq!(
             schema["properties"]["params"]["required"],
-            json!(["agent", "prefix", "deck", "dir", "mode", "agent_type"])
+            json!([
+                "agent",
+                "prefix",
+                "deck",
+                "dir",
+                "mode",
+                "agent_type",
+                "orchestration"
+            ])
         );
     }
 

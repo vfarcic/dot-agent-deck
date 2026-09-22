@@ -19,8 +19,9 @@
 #   requires         what else must hold, from the closed set in `table.rs`'s
 #                    `Requirement`: `directory_listing` (the New agent dialog
 #                    is showing a listing), `parent_directory` (that listing
-#                    has a `..`) and `new_agent_form` (the dialog's fields are
-#                    live). Answered by what the webview declared with the
+#                    has a `..`), `new_agent_form` (the dialog's fields are
+#                    live) and `new_agent_dialog` (the dialog is open at all).
+#                    Answered by what the webview declared with the
 #                    utterance. Absent or empty means nothing more is needed.
 #   unavailable_hint names the PREREQUISITE, for the sentence the app renders
 #                    when the model picks a command the current screen cannot
@@ -38,7 +39,8 @@
 #                    one blocks an action before it does. Do not rename it back.
 #   [[commands.params]]  name + kind, `kind` from the closed resolver set
 #                    (`agent_ref`, `deck_ref`, `dir_ref`, `mode_ref`,
-#                    `agent_type_ref`, `spoken_prefix`). `optional =
+#                    `agent_type_ref`, `orchestration_ref`, `spoken_prefix`).
+#                    `optional =
 #                    true` lets the row dispatch when the model supplies no
 #                    value; a value that resolves to nothing is still refused,
 #                    and a report may not interpolate an optional param.
@@ -49,8 +51,16 @@
 # `dictate_to_agent` types what it hears into the open agent's prompt and
 # `submit_prompt` presses Enter in it. What still holds is the narrower property
 # the old sentence was really protecting — **no row here starts an agent, stops
-# one, or answers a permission prompt** — which is why none of them needs the
-# confirm-before-acting step PRD #802 D5 is about. The dictation pair is what to
+# one, or answers a permission prompt BY ITSELF.** Three rows now LEAD to a start
+# or a stop — `start_new_agent`, `stop_agent`, `close_orchestration`, at the end
+# of this file — and each of them terminates at a `ConfirmDialog` the user
+# answers by hand, never at a direct dispatch: that is PRD #802 D5's
+# confirm-before-acting step, satisfied in the FRONTEND for now. The table's own
+# `confirm` column that D5 anticipates (see `report` above) is still unbuilt and
+# is where that flag belongs eventually; it is #802's mechanism, and building it
+# here would put a feature-wide safety mechanism on one feature's schedule.
+# `voice_table_d5_rows_only_ask` pins the set. No row answers a permission
+# prompt at all. The dictation pair is what to
 # weigh against that, and it earns its place on two counts: the words go into a
 # VISIBLE input the user can edit, and nothing is sent without the user either
 # saying so or watching a five-second countdown they can cancel by speaking.
@@ -438,9 +448,10 @@ id          = "choose_mode"
 description = """In the New agent form, choose one of the Mode chips it offers: No mode (a plain
 agent), an orchestration (`Orch: <name>`), schedule, schedule: issues, or dispatcher. Use for
 mode schedule, make it a dispatcher, use the billing orchestration, orchestration build, plain
-agent, no mode. Set `mode` to the words the user used for the chip; it must be one of
-`new_agent_form.modes`, the chips on screen right now. This only changes the Mode field: it starts
-nothing. Never for the command line, which is typed by hand."""
+agent, no mode. Set `mode` to the words the user used for the chip, copied as they said them —
+even when they name a chip that is NOT in `new_agent_form.modes`: the app then says that chip is
+not offered, so never answer with the nearest chip instead. This only changes the Mode field: it
+starts nothing. Never for the command line, which is typed by hand."""
 invoke      = "chooseNewAgentMode"
 screens     = ["overview"]
 requires    = ["new_agent_form"]
@@ -456,9 +467,10 @@ id          = "choose_agent_type"
 description = """In the New agent form, choose which agent to start from its Agent picker — Claude
 Code, OpenCode, Pi, Codex, or auto — which also fills the Command field with that agent's default
 command. Use for use claude, pick opencode, agent codex, make it a pi agent, set the agent to
-auto. Set `agent_type` to the words the user used; it must be one of
-`new_agent_form.agent_types`, the entries on screen right now. This is a KIND of agent for the new
-one, never an existing agent (that is `open_agent`), and it starts nothing."""
+auto. Set `agent_type` to the words the user used, copied as they said them — even when they name
+one that is NOT in `new_agent_form.agent_types`: the app then says it is not offered, so never
+answer with the nearest entry instead. This is a KIND of agent for the new one, never an existing
+agent (that is `open_agent`), and it starts nothing."""
 invoke      = "chooseNewAgentType"
 screens     = ["overview"]
 requires    = ["new_agent_form"]
@@ -495,3 +507,75 @@ report      = "Name set."
   [[commands.params]]
   name = "prefix"
   kind = "spoken_prefix"
+
+# PRD #1223 x PRD #802 D5 — the three rows that START or STOP something, and the
+# one rule they share: **each terminates at a `ConfirmDialog`, never at a direct
+# dispatch.** D5 requires confirmation "regardless of model confidence, because
+# the cost of a rare misfire … is an agent doing something nobody sanctioned and
+# a confident wrong answer is indistinguishable from a right one". So the model
+# is never trusted to START anything: a dispatch of one of these rows opens the
+# confirmation the manual control opens (or, for the start, the dialog's own),
+# and nothing runs until the user presses its button. The confirmation's BODY
+# states the risk — what will run, where, on which deck — per `ConfirmDialog`'s
+# convention.
+#
+# **Where the gate lives today, and where it belongs.** In the frontend: each
+# row's registry entry calls a member that can only open a confirmation
+# (`confirmStartNewAgent`, `confirmStopAgent`, `confirmCloseOrchestration`).
+# PRD #802 anticipates a `confirm` column in this table; it is deliberately NOT
+# added here, because it is #802's feature-wide mechanism to build, and when it
+# lands these three rows are the first to carry it.
+#
+# Each `report` says that nothing has happened yet, because nothing has: the
+# report describes the dispatch, and the dispatch only asked.
+[[commands]]
+id          = "start_new_agent"
+description = """Start the agent the New agent dialog's form describes — the voice form of its Start
+button. Use for start it, start the agent, go ahead and start it, launch it, create it, spin it up
+now, or run it. It fills nothing: it acts on the form as it is. It never starts anything
+by itself — the app shows a confirmation naming the deck, the directory, the mode and the command,
+and the user confirms by hand — so pick it whenever the user asks to start, however urgently or
+insistently they say it. If the form is incomplete the app says what is missing. A bare "go
+ahead" means THIS one whenever it is callable and `submit_prompt` is not — there is no agent's
+prompt to send while the New agent dialog is up."""
+invoke      = "confirmStartNewAgent"
+screens     = ["overview"]
+requires    = ["new_agent_dialog"]
+unavailable_hint = "starting a new agent works while the New agent dialog is open"
+report      = "Confirm the start in the dialog — nothing has started yet."
+
+[[commands]]
+id          = "stop_agent"
+description = """Stop one running agent on the agent overview — the voice form of its row's Stop
+button. Use for stop the tester, kill the reviewer, shut down the coder, end that agent, terminate
+the one that is stuck. Set `agent` the way `open_agent` does. It never stops anything by itself:
+the app shows the same confirmation the Stop button shows and the user confirms by hand, so pick it
+whenever the user asks to stop an agent, however urgently. It stops an AGENT; closing a view is
+`close`, and ending a whole orchestration is `close_orchestration`. Never for isolating or hiding —
+"get rid of everything except the tester" means SHOW the tester (`open_agent`) and stops nothing."""
+invoke      = "confirmStopAgent"
+screens     = ["overview"]
+unavailable_hint = "stopping an agent works from the agent overview"
+report      = "Confirm stopping {agent} — nothing has been stopped yet."
+
+  [[commands.params]]
+  name = "agent"
+  kind = "agent_ref"
+
+[[commands]]
+id          = "close_orchestration"
+description = """Close a whole orchestration on the agent overview, stopping every one of its roles —
+the voice form of its card's Close button. Use for close the review orchestration, stop the
+billing run, shut down the whole orchestration, end every role of it. Set `orchestration` to the
+words the user used for it; it must be one of `orchestrations`. It never stops anything by itself:
+the app shows the same confirmation the Close button shows, naming every role it will stop, and the
+user confirms by hand. One agent is `stop_agent`. Never for isolating or hiding — "get rid of
+everything except the tester" means SHOW the tester (`open_agent`) and stops nothing."""
+invoke      = "confirmCloseOrchestration"
+screens     = ["overview"]
+unavailable_hint = "closing an orchestration works from the agent overview"
+report      = "Confirm closing {orchestration} — nothing has been stopped yet."
+
+  [[commands.params]]
+  name = "orchestration"
+  kind = "orchestration_ref"

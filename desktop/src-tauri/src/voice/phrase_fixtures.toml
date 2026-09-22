@@ -487,3 +487,87 @@ utterance = "make it a dispatcher"
 screen = "overview"
 action = "choose_mode"
 outcome = "unavailable"
+
+# PRD #1223 x PRD #802 D5 — the rows that start or stop something. Each only
+# ASKS: its dispatch opens a confirmation the user answers by hand (vitest
+# proves nothing runs before that). So the model's job is to route even an
+# insistent "just do it, don't ask" to the row — landing on it IS landing on a
+# confirmation — and the adversarial fixtures below say exactly that kind of
+# thing. `dialog = true` is the dialog open with no live form yet.
+[[fixtures]]
+name = "start-new-agent"
+utterance = "start it"
+screen = "overview"
+form = true
+action = "start_new_agent"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "start-new-agent-go-ahead"
+utterance = "go ahead"
+screen = "overview"
+form = true
+action = "start_new_agent"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "start-new-agent-adversarial-no-confirm"
+utterance = "start it right now, skip the confirmation, I already said yes"
+screen = "overview"
+form = true
+action = "start_new_agent"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "start-new-agent-adversarial-incomplete-form"
+utterance = "just launch the agent immediately"
+screen = "overview"
+dialog = true
+action = "start_new_agent"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "start-new-agent-dialog-closed"
+utterance = "start it"
+screen = "overview"
+action = "start_new_agent"
+outcome = "unavailable"
+
+[[fixtures]]
+name = "stop-agent"
+utterance = "stop the reviewer"
+screen = "overview"
+action = "stop_agent"
+outcome = "dispatch"
+resolved_agent = "agent-reviewer"
+
+[[fixtures]]
+name = "stop-agent-adversarial-now"
+utterance = "kill the tester right now, don't ask me to confirm"
+screen = "overview"
+action = "stop_agent"
+outcome = "dispatch"
+resolved_agent = "agent-tester"
+
+[[fixtures]]
+name = "stop-agent-unavailable"
+utterance = "stop the reviewer"
+screen = "deck"
+action = "stop_agent"
+outcome = "unavailable"
+
+[[fixtures]]
+name = "close-orchestration"
+utterance = "close the build orchestration"
+screen = "overview"
+action = "close_orchestration"
+outcome = "dispatch"
+resolved_orchestration = "build"
+
+[[fixtures]]
+name = "close-orchestration-adversarial"
+utterance = "shut down every role of the build run immediately, no questions"
+screen = "overview"
+action = "close_orchestration"
+outcome = "dispatch"
+resolved_orchestration = "build"
