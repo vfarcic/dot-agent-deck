@@ -57,6 +57,8 @@ import { VOICE_ACTIONS, dispatchVoiceAction, type DeckOverlay, type VoiceContext
 import { unreachableDeckTerminalState } from "./lib/terminalInput";
 import { applyAppearance } from "./lib/appearance";
 import { desktopWorkflowPlatformIssue } from "./lib/platform";
+import { LaunchCleanupError } from "./lib/actionError";
+import { cleanupWarning } from "./lib/newAgent";
 import type { VoiceOutcomeDto } from "./lib/bridge";
 import type { AgentSession, DeckAction, DeckRuntimeState, DeckSnapshot, DeckView, EvidenceItem, PanelTab, WorkflowLaunchConfig } from "./types";
 import { modeScopedKey } from "./lib/bridge";
@@ -1290,6 +1292,21 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
           await runtime.reconnect();
           setNotice(`${config.displayName} launched with ${config.roles.length} configured roles.`);
         } catch (cause) {
+          /*
+           * PRD #1223 audit V2 — FIRST, ahead of every refusal-code translation
+           * below. Each of those says "Nothing was started", and a launch whose
+           * rollback could not confirm a role stopped can carry one of their
+           * codes too: a `stale-preparation` refusal of a later role after an
+           * earlier one had started is exactly that composite. The roles arrive
+           * as data (`LaunchCleanupError`), so the warning does not depend on
+           * where the sentence puts them; the sentence itself stays the
+           * runtime's error, which takes the toast's place once this is
+           * dismissed.
+           */
+          if (cause instanceof LaunchCleanupError) {
+            setNotice(cleanupWarning(cause.unconfirmedStops));
+            return;
+          }
           const message = cause instanceof Error ? cause.message : String(cause);
           /*
            * PRD #819 M6, state 2. The daemon re-resolves on launch, and

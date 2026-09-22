@@ -756,10 +756,10 @@ struct RoleStartFailure {
     timed_out: bool,
 }
 
-/// Why [`launch_configured_orchestration`] failed: the whole sentence, and —
-/// as data, not prose (PRD #1223 audit F6) — every role it could not confirm is
-/// stopped, which [`crate::dto::DesktopActionError::launch`] carries to the
-/// webview.
+/// Why [`launch_configured_orchestration`] or [`launch_workflow`] failed: the
+/// whole sentence, and — as data, not prose (PRD #1223 audits F6 and V2) —
+/// every role it could not confirm is stopped, which
+/// [`crate::dto::DesktopActionError::launch`] carries to the webview.
 #[derive(Debug)]
 struct LaunchFailure {
     message: String,
@@ -900,7 +900,7 @@ async fn launch_workflow<D: WorkflowDaemon + Sync>(
     orchestration_id: &str,
     orchestrator_seed: &str,
     prep_token: Option<&str>,
-) -> Result<WorkflowLaunchResult, String> {
+) -> Result<WorkflowLaunchResult, LaunchFailure> {
     validate_desktop_coordinator(roles)?;
     let created_at = daemon.now();
     // Subscribe before the first spawn so a fast Claude SessionStart cannot be
@@ -954,7 +954,7 @@ async fn launch_workflow<D: WorkflowDaemon + Sync>(
                 // response. Reconcile the already-known pane + orchestration
                 // identity before rollback so that just-spawned role is not
                 // leaked merely because its id never reached this client.
-                let reconciliation_note = match reconcile_failed_start(
+                let uncertain = reconcile_failed_start(
                     daemon,
                     &mut started,
                     &pane_id,
@@ -962,25 +962,40 @@ async fn launch_workflow<D: WorkflowDaemon + Sync>(
                     &role.role,
                     failure.timed_out,
                 )
-                .await
-                {
-                    Some(uncertainty) => format!("; cleanup uncertainty: {}", uncertainty.reason),
-                    None => String::new(),
-                };
-                let cleanup_status = rollback_workflow_agents(daemon, &started).await.describe();
-                return Err(format!(
-                    "failed to start workflow role {}: {}; {cleanup_status}{reconciliation_note}",
-                    safe_message(&role.role),
-                    safe_message(failure.message)
+                .await;
+                let reconciliation_note = uncertain
+                    .as_ref()
+                    .map(|stop| format!("; cleanup uncertainty: {}", stop.reason))
+                    .unwrap_or_default();
+                let rollback = rollback_workflow_agents(daemon, &started).await;
+                // PRD #1223 audit V2: the roles it could not confirm travel as
+                // data, as the New agent launch's do, so the Runs screen puts
+                // the cleanup warning ahead of any refusal code this sentence
+                // also carries — a `stale-preparation:` refusal after a role
+                // started is exactly such a composite.
+                return Err(LaunchFailure::after_rollback(
+                    format!(
+                        "failed to start workflow role {}: {}; {}{reconciliation_note}",
+                        safe_message(&role.role),
+                        safe_message(failure.message),
+                        rollback.describe(),
+                    ),
+                    &rollback,
+                    uncertain.as_ref(),
                 ));
             }
         }
     }
 
     let Some((start_pane_id, start_agent_id)) = start_target else {
-        let cleanup_status = rollback_workflow_agents(daemon, &started).await.describe();
-        return Err(format!(
-            "validated workflow did not start a coordinator; {cleanup_status}"
+        let rollback = rollback_workflow_agents(daemon, &started).await;
+        return Err(LaunchFailure::after_rollback(
+            format!(
+                "validated workflow did not start a coordinator; {}",
+                rollback.describe()
+            ),
+            &rollback,
+            None,
         ));
     };
     if let Err(error) = deliver_coordinator_prompt(
@@ -993,10 +1008,15 @@ async fn launch_workflow<D: WorkflowDaemon + Sync>(
     )
     .await
     {
-        let cleanup_status = rollback_workflow_agents(daemon, &started).await.describe();
-        return Err(format!(
-            "workflow coordinator context delivery failed: {}; {cleanup_status}",
-            safe_message(error)
+        let rollback = rollback_workflow_agents(daemon, &started).await;
+        return Err(LaunchFailure::after_rollback(
+            format!(
+                "workflow coordinator context delivery failed: {}; {}",
+                safe_message(error),
+                rollback.describe()
+            ),
+            &rollback,
+            None,
         ));
     }
 
@@ -3463,7 +3483,10 @@ async fn desktop_run_action(
                 &prepared.prompt,
                 Some(&prepared.token),
             )
-            .await?;
+            .await
+            .map_err(|failure| {
+                DesktopActionError::launch(failure.message, failure.unconfirmed_stops)
+            })?;
             result_agent_id = Some(launched.start_agent_id);
             result_agent_ids = launched.agent_ids;
             result_message = Some(
@@ -5517,7 +5540,7 @@ command = "configured-planner"
         .await
         .unwrap();
 
-        let error = launch_workflow(
+        let failure = launch_workflow(
             &daemon,
             "loop",
             &prepared.path,
@@ -5530,6 +5553,7 @@ command = "configured-planner"
         )
         .await
         .unwrap_err();
+        let error = &failure.message;
 
         assert!(
             error.contains("start-prepared-agent"),
@@ -6259,7 +6283,7 @@ command = "configured-planner"
         );
         daemon.start_hangs.lock().unwrap().insert(1);
 
-        let error = launch_workflow(
+        let failure = launch_workflow(
             &daemon,
             "loop",
             "/tmp/project",
@@ -6272,6 +6296,7 @@ command = "configured-planner"
         )
         .await
         .unwrap_err();
+        let error = &failure.message;
 
         assert!(
             error.contains("failed to start workflow role builder: the deck did not answer the start within 15s"),
@@ -6286,6 +6311,78 @@ command = "configured-planner"
             "{error}"
         );
         assert_eq!(*daemon.stopped.lock().unwrap(), ["agent-0"]);
+        assert_eq!(
+            failure.unconfirmed_stops,
+            ["builder"],
+            "the Runs launch carries the role it could not vouch for as data (audit V2)"
+        );
+    }
+
+    /// Scenario (PRD #1223 audit V2): the Runs launch's composite failure — the
+    /// deck refuses the second role as `stale-preparation` after the first had
+    /// started, and the rollback's stop of the first is refused. The sentence
+    /// carries the refusal code the Runs screen translates into "Nothing was
+    /// started", so the role that may still be running has to arrive as data
+    /// for the screen to put the cleanup warning first.
+    #[tokio::test]
+    async fn a_runs_launch_carries_the_roles_its_rollback_could_not_stop_as_data() {
+        let daemon = FakeWorkflowDaemon::new(
+            Ok(Some("unused-session")),
+            std::iter::empty(),
+            Ok(SendResult::Applied),
+        );
+        daemon.start_results.lock().unwrap().extend([
+            Ok("agent-0".to_string()),
+            Err(format!(
+                "{}: the coordinator context changed since it was prepared",
+                dot_agent_deck::daemon_protocol::PROJECT_ERR_STALE_PREPARATION
+            )),
+        ]);
+        daemon
+            .stop_errors
+            .lock()
+            .unwrap()
+            .insert("agent-0".to_string(), "stop refused".to_string());
+
+        let failure = launch_workflow(
+            &daemon,
+            "loop",
+            "/tmp/project",
+            &launch_roles("claude"),
+            32,
+            120,
+            "orchestration-1",
+            "coordinator prompt",
+            Some("prep-token-1"),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            failure.message.contains("stale-preparation: "),
+            "{}",
+            failure.message
+        );
+        assert!(
+            failure
+                .message
+                .contains("cleanup could not confirm stop for 1 of 1 already-started role(s)"),
+            "{}",
+            failure.message
+        );
+        assert_eq!(failure.unconfirmed_stops, ["planner"]);
+        // What `desktop_run_action` rejects with for it: the structured shape,
+        // not the bare string the Runs screen used to classify by substring.
+        let message = failure.message.clone();
+        match crate::dto::DesktopActionError::launch(failure.message, failure.unconfirmed_stops) {
+            crate::dto::DesktopActionError::LaunchCleanup(cleanup) => {
+                assert_eq!(cleanup.message, message);
+                assert_eq!(cleanup.unconfirmed_stops, ["planner"]);
+            }
+            other => panic!(
+                "a Runs launch with an unconfirmed stop must reject with the structured shape: {other:?}"
+            ),
+        }
     }
 
     #[test]
@@ -6305,7 +6402,7 @@ command = "configured-planner"
             Ok(SendResult::Applied),
         );
 
-        let error = launch_workflow(
+        let failure = launch_workflow(
             &daemon,
             "loop",
             "/tmp/project",
@@ -6318,6 +6415,7 @@ command = "configured-planner"
         )
         .await
         .unwrap_err();
+        let error = &failure.message;
 
         assert!(error.contains("Pi cannot be the desktop workflow coordinator"));
         assert_eq!(daemon.begin_readiness_count.load(Ordering::SeqCst), 0);
@@ -6364,7 +6462,7 @@ command = "configured-planner"
             Ok(SendResult::NoLiveTarget),
         );
 
-        let error = launch_workflow(
+        let failure = launch_workflow(
             &daemon,
             "loop",
             "/tmp/project",
@@ -6377,6 +6475,7 @@ command = "configured-planner"
         )
         .await
         .unwrap_err();
+        let error = &failure.message;
 
         assert!(error.contains("60s deadline"), "unexpected error: {error}");
         assert!(error.contains("stopped 2 already-started role(s)"));
@@ -6416,7 +6515,7 @@ command = "configured-planner"
             },
         ];
 
-        let error = launch_workflow(
+        let failure = launch_workflow(
             &daemon,
             "loop",
             "/tmp/project",
@@ -6429,10 +6528,12 @@ command = "configured-planner"
         )
         .await
         .unwrap_err();
+        let error = &failure.message;
 
         assert!(error.contains("start response lost"));
         assert!(error.contains("stopped 2 already-started role(s)"));
         assert!(!error.contains("cleanup uncertainty"));
+        assert!(failure.unconfirmed_stops.is_empty());
         assert_eq!(
             *daemon.stopped.lock().unwrap(),
             ["agent-planner".to_string(), "agent-builder".to_string()]
@@ -6469,7 +6570,7 @@ command = "configured-planner"
             .unwrap()
             .push_back(Err("list-agents unavailable".to_string()));
 
-        let error = launch_workflow(
+        let failure = launch_workflow(
             &daemon,
             "loop",
             "/tmp/project",
@@ -6482,10 +6583,12 @@ command = "configured-planner"
         )
         .await
         .unwrap_err();
+        let error = &failure.message;
 
         assert!(error.contains("cleanup uncertainty"));
         assert!(error.contains("list-agents unavailable"));
         assert!(error.contains("stopped 0 already-started role(s)"));
+        assert_eq!(failure.unconfirmed_stops, ["planner"]);
         assert!(daemon.stopped.lock().unwrap().is_empty());
         assert_eq!(daemon.reconciliation_requests.lock().unwrap().len(), 1);
     }

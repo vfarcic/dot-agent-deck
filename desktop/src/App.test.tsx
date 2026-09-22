@@ -5,6 +5,7 @@ import { createFixtureSnapshot, FIXTURE_DAEMON_ID } from "./data/fixture";
 import { agentKey } from "./lib/agentKey";
 import { WINDOWS_WORKFLOW_BLOCK_REASON } from "./lib/platform";
 import { DEFAULT_DESKTOP_SETTINGS, type DesktopSettingsDto } from "./lib/bridge";
+import { LaunchCleanupError } from "./lib/actionError";
 import type { AgentSession, DaemonOrchestration, DaemonProject, DaemonResolvedProject, DeckRuntimeState, SendResult } from "./types";
 
 vi.mock("./components/TerminalViewport", () => ({
@@ -756,6 +757,36 @@ describe("ControlDeck", () => {
     expect(screen.getByTestId("toast")).toHaveAttribute("role", "status");
     // Re-read, so the next attempt carries the project's current revision.
     expect(vi.mocked(live.resolveProject).mock.calls.length).toBeGreaterThan(resolvesAfterPick);
+  });
+
+  /**
+   * PRD #1223 audit V2: a stale-preparation refusal of a LATER role, after an
+   * earlier one had started, whose rollback stop the deck then refused. The
+   * sentence carries `stale-preparation:`, which the case above translates
+   * into "Nothing was started" — false here, since the first role may still be
+   * running. The structured rejection is checked first, so the toast warns
+   * about that role instead.
+   */
+  it("warns about a role the rollback could not stop before translating a refusal code", async () => {
+    const live = liveWithProject({
+      runAction: vi.fn(async () => {
+        throw new LaunchCleanupError(
+          "failed to start workflow role coder: stale-preparation: that preparation no longer describes what it approved; prepare the workflow again; cleanup could not confirm stop for 1 of 1 already-started role(s): orchestrator (agent-0: stop refused)",
+          ["orchestrator"],
+        );
+      }),
+    });
+    render(<ControlDeck runtime={live} />);
+    await chooseTheOnlyProject();
+    fireEvent.change(screen.getByLabelText("Task prompt"), { target: { value: "Build it." } });
+    fireEvent.click(screen.getByTestId("launch-live-loop"));
+    fireEvent.click(screen.getAllByRole("button", { name: "Launch live loop" }).at(-1)!);
+
+    await waitFor(() => {
+      expect(screen.getByTestId("toast")).toHaveTextContent("1 role may still be running on this deck");
+    });
+    expect(screen.getByTestId("toast")).toHaveTextContent("orchestrator");
+    expect(screen.getByTestId("toast")).not.toHaveTextContent("Nothing was started");
   });
 
   /**
