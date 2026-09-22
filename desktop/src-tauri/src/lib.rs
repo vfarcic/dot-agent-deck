@@ -3161,8 +3161,8 @@ fn ambiguous_orchestration_refusal(orchestration: &str) -> String {
     )
 }
 
-/// PRD #1223 audit V4: refuse a launch whose orchestration name does not name
-/// exactly ONE of the project's orchestrations on that deck.
+/// PRD #1223 audit V4: refuse a launch whose orchestration name names MORE
+/// than one of the project's orchestrations on that deck.
 ///
 /// `PrepareWorkflow` takes the FIRST role-bearing definition with the name
 /// (`project_resolve.rs`, the same rule the TUI's spawn uses), so launching a
@@ -3179,11 +3179,13 @@ fn ambiguous_orchestration_refusal(orchestration: &str) -> String {
 /// first-match rule would change an existing verb that older desktops and the
 /// TUI already call, which is not this PR's to do; see issue #1233.
 ///
-/// A name the project does not define at all is refused in the deck's own
-/// words, so the webview sees exactly the sentence `PrepareWorkflow` would have
-/// answered with. The roleless entries the daemon's lookup skips are not in
-/// this listing either — the resolve projection drops them — so the two count
-/// the same definitions.
+/// A name the project defines NO orchestration under is deliberately left to
+/// the deck: its `PrepareWorkflow` refuses that before it composes or publishes
+/// anything, in its own words and with its own stable code, so refusing it here
+/// would only be a second copy of that sentence in a crate that is not allowed
+/// to resolve projects itself (`xtask/linkage-check` rule 12). The roleless
+/// entries the daemon's lookup skips are not in this listing either — the
+/// resolve projection drops them — so the two count the same definitions.
 async fn ensure_one_orchestration_of_that_name(
     daemon: &crate::daemon_bridge::TrustedDaemon,
     path: &str,
@@ -3199,11 +3201,10 @@ async fn ensure_one_orchestration_of_that_name(
         .iter()
         .filter(|candidate| candidate.name == orchestration)
         .count();
-    match defined {
-        1 => Ok(()),
-        0 => Err(dot_agent_deck::project_resolve::no_such_orchestration_refusal().into()),
-        _ => Err(ambiguous_orchestration_refusal(orchestration).into()),
+    if defined > 1 {
+        return Err(ambiguous_orchestration_refusal(orchestration).into());
     }
+    Ok(())
 }
 
 /// The target deck's snapshot after a start, for the direct refresh that
