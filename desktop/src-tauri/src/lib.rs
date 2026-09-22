@@ -3040,15 +3040,20 @@ async fn start_orchestration_action(
     if let Some(reason) = orchestration_launch_unavailable(&daemon).await? {
         return Err(reason.into());
     }
-    // Bounded (PRD #1223 audit F4) for `bounded_plain_start`'s reason: the
-    // dialog waiting on this launch cannot be closed while it is in flight.
-    let prepared = crate::daemon_bridge::bounded_reply(
-        "PrepareWorkflow",
-        daemon
-            .client
-            .prepare_workflow(&path, &orchestration, "", config_revision.as_deref()),
-    )
-    .await?;
+    // Deliberately NOT under a client-side deadline, unlike every other call
+    // this launch makes (PRD #1223 audit V1). The deck resolves, composes,
+    // issues the token and publishes `orchestrator-context.md` on its blocking
+    // pool, and dropping this future cannot stop that: a preparation reported
+    // here as timed out would still publish afterwards, possibly over a
+    // retry's context once the retry's last prepared-role check has passed.
+    // The role starts and rollback stops below stay bounded, because those
+    // are reconciled against what the deck lists; a preparation has nothing
+    // to reconcile against, so it is waited out instead.
+    let prepared = daemon
+        .client
+        .prepare_workflow(&path, &orchestration, "", config_revision.as_deref())
+        .await
+        .map_err(|error| safe_message(error.to_string()))?;
     // Both are `#[serde(default)]` on the reply, and neither may be invented
     // here — see `prepare_workflow_launch`.
     if prepared.path.is_empty() {
