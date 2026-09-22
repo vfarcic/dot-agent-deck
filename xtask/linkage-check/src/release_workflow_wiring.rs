@@ -1260,6 +1260,29 @@ fn subjects_script() -> String {
         .join("\n")
 }
 
+/// What [`run_subjects`] observed: whether the collector succeeded, the
+/// subject list it wrote to `GITHUB_OUTPUT`, and its stdout/stderr for when an
+/// assertion needs to say more than pass or fail.
+struct SubjectsRun {
+    ok: bool,
+    subjects: Vec<String>,
+    stdout: String,
+    stderr: String,
+}
+
+impl SubjectsRun {
+    /// A one-line-per-stream dump for a panic message, so a failure on a box
+    /// nobody can reproduce locally (this suite's own reason for existing —
+    /// see [`run_subjects`]'s doc comment) still says what actually happened
+    /// rather than just that it did.
+    fn diagnostics(&self) -> String {
+        format!(
+            "exit ok: {}\n--- stdout ---\n{}\n--- stderr ---\n{}",
+            self.ok, self.stdout, self.stderr
+        )
+    }
+}
+
 /// What the collector does when `dist/` and `dist-desktop/` hold exactly
 /// `files` and `desktop-publish` reported `desktop_result`.
 ///
@@ -1268,7 +1291,14 @@ fn subjects_script() -> String {
 /// the `paths<<SUBJECTS_EOF` heredoc rather than inferred. `None` means `bash`
 /// is absent and the caller should print `SKIP:` and return, the same tolerance
 /// `verify_pr_stream` and `junit_strip` take.
-fn run_subjects(files: &[&str], desktop_result: &str) -> Option<(bool, Vec<String>)> {
+///
+/// The `GITHUB_OUTPUT` path is normalised to forward slashes before being
+/// handed to bash as an environment value. On a native Windows runner
+/// `tempfile::tempdir()` returns a backslash path, and forward slashes are
+/// accepted by both Win32 and every POSIX-emulation layer MSYS ships, so
+/// normalising removes a possible source of trouble without removing anything
+/// Unix relies on.
+fn run_subjects(files: &[&str], desktop_result: &str) -> Option<SubjectsRun> {
     use std::process::Command;
     Command::new("bash").arg("--version").output().ok()?;
 
@@ -1281,12 +1311,26 @@ fn run_subjects(files: &[&str], desktop_result: &str) -> Option<(bool, Vec<Strin
     }
     let out_path = dir.path().join("github-output");
     fs::write(&out_path, "").expect("seed GITHUB_OUTPUT");
+    let out_path_arg = out_path.to_string_lossy().replace('\\', "/");
 
+    // A FILE, not `-c "<script>"` — the same choice `run_clamp` and
+    // `verify_pr_stream`'s `scan.sh` invocation already make, and not by
+    // accident. `-c` hands the whole multi-line, quote-heavy script through
+    // as a single argv element, which on Windows means Rust's `Command` has
+    // to re-encode it into ONE `CreateProcess` command-line string that MSYS
+    // bash then has to decode back into the same bytes -- a round trip this
+    // codebase has never previously asked of a script this size, unlike every
+    // other cross-platform harness test here. A file sidesteps the whole
+    // question: bash opens and reads it directly, so there is nothing for
+    // argv-quoting to get wrong. (This is exactly the failure mode that made
+    // `a_full_release_attests_every_asset_it_publishes` and its siblings fail
+    // on `build-windows` in the first version of this harness, PR #1227.)
+    let script_path = dir.path().join("collect-subjects.sh");
+    fs::write(&script_path, subjects_script()).expect("write the collector script");
     let out = Command::new("bash")
-        .arg("-c")
-        .arg(subjects_script())
+        .arg(&script_path)
         .current_dir(dir.path())
-        .env("GITHUB_OUTPUT", &out_path)
+        .env("GITHUB_OUTPUT", &out_path_arg)
         .env("DESKTOP_PUBLISH_RESULT", desktop_result)
         .output()
         .expect("run the subject collector");
@@ -1300,7 +1344,12 @@ fn run_subjects(files: &[&str], desktop_result: &str) -> Option<(bool, Vec<Strin
         .map(|l| l.trim().to_string())
         .filter(|l| !l.is_empty())
         .collect();
-    Some((out.status.success(), subjects))
+    Some(SubjectsRun {
+        ok: out.status.success(),
+        subjects,
+        stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+    })
 }
 
 /// The eight assets a full release publishes are the eight subjects attested.
@@ -1321,20 +1370,26 @@ fn a_full_release_attests_every_asset_it_publishes() {
         "dist-desktop/dot-agent-deck-desktop-alpha-macos-arm64.dmg",
         "dist-desktop/checksums-desktop-alpha.txt",
     ];
-    let Some((ok, subjects)) = run_subjects(&files, "success") else {
+    let Some(run) = run_subjects(&files, "success") else {
         eprintln!("SKIP: the subject-collection tests need `bash` on PATH");
         return;
     };
-    assert!(ok, "the collector failed on a complete set of artifacts");
+    assert!(
+        run.ok,
+        "the collector failed on a complete set of artifacts\n{}",
+        run.diagnostics()
+    );
 
     let mut want: Vec<String> = files.iter().map(|f| (*f).to_string()).collect();
     want.sort();
-    let mut got = subjects.clone();
+    let mut got = run.subjects.clone();
     got.sort();
     assert_eq!(
-        got, want,
+        got,
+        want,
         "the attested set is not the published set. Every file a full release uploads must be a \
-         subject -- #1152 is what happens when two of them are not."
+         subject -- #1152 is what happens when two of them are not.\n{}",
+        run.diagnostics()
     );
 }
 
@@ -1353,21 +1408,30 @@ fn a_wholly_failed_desktop_matrix_still_attests_the_cli_assets() {
         "dist/dot-agent-deck-darwin-arm64",
         "dist/checksums.txt",
     ];
-    let Some((ok, subjects)) = run_subjects(&files, "failure") else {
+    let Some(run) = run_subjects(&files, "failure") else {
         eprintln!("SKIP: the subject-collection tests need `bash` on PATH");
         return;
     };
     assert!(
-        ok,
+        run.ok,
         "a failed desktop matrix made the collector fail, discarding the CLI binaries' \
-         attestations. That is the #768 defect, one job over."
+         attestations. That is the #768 defect, one job over.\n{}",
+        run.diagnostics()
     );
     assert!(
-        subjects.contains(&"dist/checksums.txt".to_string()),
-        "the CLI manifest is missing from {subjects:?}. It is published on every release, \
-         desktop or not."
+        run.subjects.contains(&"dist/checksums.txt".to_string()),
+        "the CLI manifest is missing from {:?}. It is published on every release, desktop or \
+         not.\n{}",
+        run.subjects,
+        run.diagnostics()
     );
-    assert_eq!(subjects.len(), 3, "unexpected subjects: {subjects:?}");
+    assert_eq!(
+        run.subjects.len(),
+        3,
+        "unexpected subjects: {:?}\n{}",
+        run.subjects,
+        run.diagnostics()
+    );
 }
 
 /// A CLI manifest that did not arrive fails the collection rather than being
@@ -1380,13 +1444,15 @@ fn a_wholly_failed_desktop_matrix_still_attests_the_cli_assets() {
 /// #1152 was filed about.
 #[test]
 fn a_missing_cli_manifest_fails_the_collection() {
-    let Some((ok, subjects)) = run_subjects(&["dist/dot-agent-deck-linux-amd64"], "skipped") else {
+    let Some(run) = run_subjects(&["dist/dot-agent-deck-linux-amd64"], "skipped") else {
         eprintln!("SKIP: the subject-collection tests need `bash` on PATH");
         return;
     };
     assert!(
-        !ok,
-        "the collector accepted a run with no `dist/checksums.txt` and emitted {subjects:?}"
+        !run.ok,
+        "the collector accepted a run with no `dist/checksums.txt` and emitted {:?}\n{}",
+        run.subjects,
+        run.diagnostics()
     );
 }
 
@@ -1407,27 +1473,32 @@ fn a_missing_desktop_manifest_fails_only_when_its_claim_was_published() {
         "dist/checksums.txt",
         "dist-desktop/dot-agent-deck-desktop-alpha-linux-amd64.deb",
     ];
-    let Some((published, _)) = run_subjects(&files, "success") else {
+    let Some(claimed) = run_subjects(&files, "success") else {
         eprintln!("SKIP: the subject-collection tests need `bash` on PATH");
         return;
     };
     assert!(
-        !published,
+        !claimed.ok,
         "`desktop-publish` succeeded -- so the release body already says \
          `checksums-desktop-alpha.txt` carries provenance -- and the collector attested without \
-         it anyway. A green run must not leave that claim false."
+         it anyway. A green run must not leave that claim false.\n{}",
+        claimed.diagnostics()
     );
 
-    let (unpublished, subjects) =
-        run_subjects(&files, "failure").expect("bash was there a moment ago");
+    let unclaimed = run_subjects(&files, "failure").expect("bash was there a moment ago");
     assert!(
-        unpublished,
+        unclaimed.ok,
         "`desktop-publish` did not succeed, so nothing desktop reached the release and there is \
          no manifest to expect. Failing here would discard the CLI binaries' attestations for a \
-         bundler's failure -- the #768 defect again."
+         bundler's failure -- the #768 defect again.\n{}",
+        unclaimed.diagnostics()
     );
     assert!(
-        subjects.contains(&"dist/checksums.txt".to_string()),
-        "the CLI assets were not attested: {subjects:?}"
+        unclaimed
+            .subjects
+            .contains(&"dist/checksums.txt".to_string()),
+        "the CLI assets were not attested: {:?}\n{}",
+        unclaimed.subjects,
+        unclaimed.diagnostics()
     );
 }
