@@ -123,11 +123,13 @@ mod tests {
         );
     }
 
-    /// PR #1238: macOS used to return `None` here, leaving every lib-side
-    /// ceiling unscaled on `build-macos`. See the harness twin's test.
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    /// Issue #1244: macOS used to return `None` here, leaving every lib-side
+    /// ceiling unscaled on `build-macos`. macOS only, because a Linux box with
+    /// no readable `/proc/loadavg` returning `None` is correct — see the
+    /// harness twin's test.
+    #[cfg(target_os = "macos")]
     #[test]
-    fn the_load_is_measurable_on_linux_and_macos() {
+    fn the_load_is_measurable_on_macos() {
         let load = machine_load_per_cpu();
         assert!(
             load.is_some_and(|l| l.is_finite() && l >= 0.0),

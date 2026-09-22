@@ -4953,15 +4953,19 @@ fn unmeasurable_load_leaves_the_base_unscaled() {
     );
 }
 
-/// PR #1238: on the two platforms that publish a load average cheaply, the
-/// measurement must actually come back. macOS used to return `None` here on the
-/// false belief that `libc` did not expose `getloadavg`, which silently left
-/// every #709 ceiling unscaled on `build-macos` until `idle_worker_010` starved
-/// against a flat 8 s. `build-macos` runs this, so a regression is red there
-/// rather than a flake.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+/// Issue #1244: on macOS the measurement must actually come back. It used to
+/// return `None` there on the false belief that `libc` did not expose
+/// `getloadavg`, which silently left every #709 ceiling unscaled on
+/// `build-macos` until `idle_worker_010` starved against a flat 8 s.
+/// `build-macos` runs this, so a regression is red there rather than a flake.
+///
+/// macOS only, deliberately. On Linux a `None` is legitimate — a container or
+/// chroot with no readable `/proc/loadavg` is exactly the unmeasurable case
+/// [`load_factor`] is written to tolerate — and `getloadavg` has no such
+/// dependency, so only here is `None` a defect rather than an environment.
+#[cfg(target_os = "macos")]
 #[test]
-fn load_is_measurable_on_linux_and_macos() {
+fn load_is_measurable_on_macos() {
     let load = machine_load_per_cpu();
     assert!(
         load.is_some_and(|l| l.is_finite() && l >= 0.0),
