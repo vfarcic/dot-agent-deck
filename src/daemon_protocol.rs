@@ -378,6 +378,21 @@ pub fn parse_geometry_frame(bytes: &[u8]) -> Option<(u16, u16)> {
 /// item 1, which names `focus-gained` as its worked example. The two are meant
 /// to say the same thing; if you change one, change the other.
 ///
+/// **PRD #1223 contributes no bump either, for four capability-gated
+/// additions.** Two variants, [`AttachRequest::ListDirectories`]
+/// ([`CAP_LIST_DIRECTORIES`]) and [`AttachRequest::NewAgentOptions`]
+/// ([`CAP_NEW_AGENT_OPTIONS`]), each withheld by its `DaemonClient` method and
+/// failing closed in the residual pairing as `focus-gained` does; and two
+/// optional fields on verbs every daemon already knows,
+/// [`AttachRequest::StartAgent`]'s `authoring_kind` ([`CAP_AUTHORING_KIND`])
+/// and [`AttachRequest::StartPreparedAgent`]'s `use_configured_command`
+/// ([`CAP_PREPARED_ROLE_COMMAND`]). The two fields' residual does NOT fail
+/// closed — an older daemon drops the key and reports success — which is why
+/// their one sender each (`start_authoring_agent`, `start_prepared_role`)
+/// decides from a fresh handshake; `docs/develop/versioning.md` item 1 records
+/// that residual. No existing field changed meaning, so no
+/// [`CONTRACT_BREAKS`] entry either.
+///
 /// # Where this constant is enforced
 ///
 /// **Exactly one call site refuses on it: the desktop.**
