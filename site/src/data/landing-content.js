@@ -108,14 +108,21 @@
  * 5. "Every published asset carries build provenance" was false. A full
  *    release publishes EIGHT assets -- four CLI binaries, two desktop
  *    packages, and two checksum manifests -- and the subject collection at
- *    `release.yml:855-885` matches only `dot-agent-deck-*` and
+ *    the `attest` job in `release.yml` matched only `dot-agent-deck-*` and
  *    `dot-agent-deck-desktop-alpha-*`, so `checksums.txt` and
- *    `checksums-desktop-alpha.txt` are attested by nothing. Measured:
- *    `gh attestation verify` exits 0 on the `.dmg` and on a CLI binary, and
- *    returns an attestation API 404 on both checksum manifests. Widening the
- *    attestation subjects is the better long-term fix, but that is a
- *    release-workflow change and belongs in its own PR; the page narrows its
- *    claim instead.
+ *    `checksums-desktop-alpha.txt` were attested by nothing. Measured on
+ *    v0.41.0: `gh attestation verify` exits 0 on the `.dmg` and on a CLI
+ *    binary, and returns an attestation API 404 on both checksum manifests.
+ *    The page narrowed its claim to the six assets that genuinely carried
+ *    provenance, and noted that widening the subjects was the better fix.
+ *    Issue #1152 then did the widening: each manifest now travels to the
+ *    `attest` job as an artifact of its own, published bytes and all, so all
+ *    eight are subjects. The claim here is widened back to match -- with the
+ *    ONE exclusion that survives, which is not an oversight: GitHub's
+ *    auto-generated "Source code" archives are synthesized from the tag
+ *    rather than uploaded by the workflow, so no job ever holds their bytes
+ *    to attest. Read the wording as "every asset the workflow uploads", which
+ *    is what it says, rather than as "everything on the release page".
  * 6. The provenance command was weaker than the sentence above it. `--repo`
  *    alone pins the repository, not the workflow that produced the file.
  *    `--signer-workflow vfarcic/dot-agent-deck/.github/workflows/release.yml`
@@ -368,11 +375,11 @@ export const desktop = {
     },
   ],
   provenanceNote:
-    'The binaries and the desktop packages carry build provenance: proof that this exact file came out of this repository’s release workflow, and a record of the commit it was built from. Run it on what you downloaded before you open it.',
+    'Every asset the release workflow uploads — the binaries, the desktop packages, and both checksums manifests — carries build provenance: proof that this exact file came out of this repository’s release workflow, and a record of the commit it was built from. Run it on what you downloaded before you open it.',
   provenanceCommand:
     'gh attestation verify <file> --repo vfarcic/dot-agent-deck --signer-workflow vfarcic/dot-agent-deck/.github/workflows/release.yml',
   provenanceScope:
-    'It does not cover the two checksums manifests published beside them: those carry no attestation, so running the command on one returns a 404 rather than a verdict.',
+    'The manifests matter most here: the list of hashes you would check everything else against is exactly the file worth swapping, so it is vouched for by the same proof rather than trusted on its own. The one thing not covered is GitHub’s own “Source code” archives — GitHub synthesizes those from the tag rather than the workflow uploading them.',
 };
 
 /**
