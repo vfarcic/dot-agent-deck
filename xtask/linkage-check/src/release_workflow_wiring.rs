@@ -1205,12 +1205,14 @@ fn both_checksum_manifests_are_attested_subjects() {
              `{path}` from the subject list without failing anything."
         );
 
-        assert!(
-            attest_code.contains(path),
-            "`attest` never names `{path}`, so it is not in the subject list handed to \
-             `actions/attest-build-provenance`. Downloading the artifact is half the wiring; the \
-             collect step has to add the file to `subjects` as well. #1152."
-        );
+        // Deliberately NOT a `contains(path)` check on the job. That is what
+        // this test carried on its first push, and Greptile was right to call
+        // it: `dist/checksums.txt` also appears in the collector's own
+        // `[ ! -f ... ]` guard, so deleting the line that appends it to
+        // `subjects` left the substring in place and the assertion green while
+        // the asset silently stopped being attested. Whether a path reaches the
+        // EMITTED list is a question about what the script does, so it is
+        // answered by running the script -- see the four tests below.
     }
 
     assert!(
@@ -1219,5 +1221,213 @@ fn both_checksum_manifests_are_attested_subjects() {
          not be regenerated here: an attestation over a file that differs from the published one \
          is worse than none, and a second `shasum` run in a different job is a claim about bytes \
          nobody checked. #1152."
+    );
+}
+
+/// The shell body of `attest`'s "Collect the subjects to attest" step.
+///
+/// Extracted the way [`clamp_script`] extracts the release-body clamp, and for
+/// the same reason: the thing worth asserting about this step is what it *does*
+/// with a given set of files on disk, and no substring check over its source
+/// can answer that. Greptile's P2 on #1227 is the worked example — the path a
+/// subject must reach the emitted list by also appears in the guard that checks
+/// the file exists, so a check for the path passes with the append deleted.
+fn subjects_script() -> String {
+    let all = jobs(&workflow());
+    let step = steps(job(&all, "attest"))
+        .into_iter()
+        // The step HEADER carries the name, so the line reads
+        // `- name: Collect the subjects to attest` once trimmed -- matching on
+        // the bare `name:` form finds nothing.
+        .find(|s| {
+            s.lines()
+                .any(|l| l.trim() == "- name: Collect the subjects to attest")
+        })
+        .expect("`attest` has a `Collect the subjects to attest` step");
+    let mut lines = step.lines().skip_while(|l| l.trim() != "run: |");
+    lines.next().expect("the step has a `run: |` block");
+    let body: Vec<&str> = lines.collect();
+    assert!(!body.is_empty(), "the collect step's `run:` block is empty");
+    let indent = body
+        .iter()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| l.len() - l.trim_start().len())
+        .min()
+        .expect("the block has at least one non-blank line");
+    body.iter()
+        .map(|l| if l.len() >= indent { &l[indent..] } else { "" })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// What the collector does when `dist/` and `dist-desktop/` hold exactly
+/// `files` and `desktop-publish` reported `desktop_result`.
+///
+/// Returns the exit status and the subject list it wrote to `GITHUB_OUTPUT` —
+/// the actual list handed to `actions/attest-build-provenance`, parsed out of
+/// the `paths<<SUBJECTS_EOF` heredoc rather than inferred. `None` means `bash`
+/// is absent and the caller should print `SKIP:` and return, the same tolerance
+/// `verify_pr_stream` and `junit_strip` take.
+fn run_subjects(files: &[&str], desktop_result: &str) -> Option<(bool, Vec<String>)> {
+    use std::process::Command;
+    Command::new("bash").arg("--version").output().ok()?;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    for sub in ["dist", "dist-desktop"] {
+        fs::create_dir_all(dir.path().join(sub)).expect("create the artifact directory");
+    }
+    for f in files {
+        fs::write(dir.path().join(f), b"fixture\n").unwrap_or_else(|e| panic!("write {f}: {e}"));
+    }
+    let out_path = dir.path().join("github-output");
+    fs::write(&out_path, "").expect("seed GITHUB_OUTPUT");
+
+    let out = Command::new("bash")
+        .arg("-c")
+        .arg(subjects_script())
+        .current_dir(dir.path())
+        .env("GITHUB_OUTPUT", &out_path)
+        .env("DESKTOP_PUBLISH_RESULT", desktop_result)
+        .output()
+        .expect("run the subject collector");
+
+    let emitted = fs::read_to_string(&out_path).expect("read back GITHUB_OUTPUT");
+    let subjects: Vec<String> = emitted
+        .lines()
+        .skip_while(|l| l.trim() != "paths<<SUBJECTS_EOF")
+        .skip(1)
+        .take_while(|l| l.trim() != "SUBJECTS_EOF")
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect();
+    Some((out.status.success(), subjects))
+}
+
+/// The eight assets a full release publishes are the eight subjects attested.
+///
+/// This is the assertion issue #1152 is actually about. The subject collection
+/// matched six of them, and the two it missed were the checksum manifests — the
+/// files a user reads to validate all the others, so the ones most worth
+/// swapping.
+#[test]
+fn a_full_release_attests_every_asset_it_publishes() {
+    let files = [
+        "dist/dot-agent-deck-linux-amd64",
+        "dist/dot-agent-deck-linux-arm64",
+        "dist/dot-agent-deck-darwin-amd64",
+        "dist/dot-agent-deck-darwin-arm64",
+        "dist/checksums.txt",
+        "dist-desktop/dot-agent-deck-desktop-alpha-linux-amd64.deb",
+        "dist-desktop/dot-agent-deck-desktop-alpha-macos-arm64.dmg",
+        "dist-desktop/checksums-desktop-alpha.txt",
+    ];
+    let Some((ok, subjects)) = run_subjects(&files, "success") else {
+        eprintln!("SKIP: the subject-collection tests need `bash` on PATH");
+        return;
+    };
+    assert!(ok, "the collector failed on a complete set of artifacts");
+
+    let mut want: Vec<String> = files.iter().map(|f| (*f).to_string()).collect();
+    want.sort();
+    let mut got = subjects.clone();
+    got.sort();
+    assert_eq!(
+        got, want,
+        "the attested set is not the published set. Every file a full release uploads must be a \
+         subject -- #1152 is what happens when two of them are not."
+    );
+}
+
+/// A wholly failed desktop matrix still attests the CLI assets **and the CLI
+/// manifest**.
+///
+/// The CLI half must never be hostage to the desktop half: `needs:` on a matrix
+/// job resolves to the aggregate, which is the defect Greptile's P1 found in
+/// `desktop-publish` on #768 and which this job's `if:` gate exists to avoid.
+/// #1152 adds a second way to get it wrong — treating the desktop manifest as
+/// required unconditionally — so the case is pinned rather than reasoned about.
+#[test]
+fn a_wholly_failed_desktop_matrix_still_attests_the_cli_assets() {
+    let files = [
+        "dist/dot-agent-deck-linux-amd64",
+        "dist/dot-agent-deck-darwin-arm64",
+        "dist/checksums.txt",
+    ];
+    let Some((ok, subjects)) = run_subjects(&files, "failure") else {
+        eprintln!("SKIP: the subject-collection tests need `bash` on PATH");
+        return;
+    };
+    assert!(
+        ok,
+        "a failed desktop matrix made the collector fail, discarding the CLI binaries' \
+         attestations. That is the #768 defect, one job over."
+    );
+    assert!(
+        subjects.contains(&"dist/checksums.txt".to_string()),
+        "the CLI manifest is missing from {subjects:?}. It is published on every release, \
+         desktop or not."
+    );
+    assert_eq!(subjects.len(), 3, "unexpected subjects: {subjects:?}");
+}
+
+/// A CLI manifest that did not arrive fails the collection rather than being
+/// quietly dropped.
+///
+/// `finalize` cannot succeed without publishing `checksums.txt`, and `attest`
+/// runs only when `finalize` succeeded — so its absence here is broken wiring,
+/// and the alternative to failing is a release whose manifest silently carries
+/// no provenance. The symptom of that is a `404` weeks later, which is what
+/// #1152 was filed about.
+#[test]
+fn a_missing_cli_manifest_fails_the_collection() {
+    let Some((ok, subjects)) = run_subjects(&["dist/dot-agent-deck-linux-amd64"], "skipped") else {
+        eprintln!("SKIP: the subject-collection tests need `bash` on PATH");
+        return;
+    };
+    assert!(
+        !ok,
+        "the collector accepted a run with no `dist/checksums.txt` and emitted {subjects:?}"
+    );
+}
+
+/// A desktop manifest that did not arrive fails the collection **when
+/// `desktop-publish` succeeded**, and only then.
+///
+/// Greptile's P1 on #1227, and the asymmetry is the whole finding. That job
+/// publishes the manifest, uploads it as an artifact, and only then appends the
+/// release note saying every asset here carries provenance — in that order,
+/// under `bash -e`. So `success` means the claim is on the release: attesting
+/// around a missing manifest would leave a published security claim false while
+/// the run stayed green. Any other result means no desktop asset reached the
+/// release and no claim was made, so the CLI assets must still be attested.
+#[test]
+fn a_missing_desktop_manifest_fails_only_when_its_claim_was_published() {
+    let files = [
+        "dist/dot-agent-deck-linux-amd64",
+        "dist/checksums.txt",
+        "dist-desktop/dot-agent-deck-desktop-alpha-linux-amd64.deb",
+    ];
+    let Some((published, _)) = run_subjects(&files, "success") else {
+        eprintln!("SKIP: the subject-collection tests need `bash` on PATH");
+        return;
+    };
+    assert!(
+        !published,
+        "`desktop-publish` succeeded -- so the release body already says \
+         `checksums-desktop-alpha.txt` carries provenance -- and the collector attested without \
+         it anyway. A green run must not leave that claim false."
+    );
+
+    let (unpublished, subjects) =
+        run_subjects(&files, "failure").expect("bash was there a moment ago");
+    assert!(
+        unpublished,
+        "`desktop-publish` did not succeed, so nothing desktop reached the release and there is \
+         no manifest to expect. Failing here would discard the CLI binaries' attestations for a \
+         bundler's failure -- the #768 defect again."
+    );
+    assert!(
+        subjects.contains(&"dist/checksums.txt".to_string()),
+        "the CLI assets were not attested: {subjects:?}"
     );
 }

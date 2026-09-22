@@ -646,11 +646,31 @@ jobs:
       # selects on, so a re-run of `finalize` alone would otherwise pull the
       # previous attempt's manifest into `dist/` and feed it straight back into
       # `task checksums`' `shasum -a 256 dot-agent-deck-*`.
+      #
+      # `overwrite: true` because RE-RUNNING `finalize` IS A REAL PATH and this
+      # step sits in front of the part of it most likely to need one: artifacts
+      # are scoped to the run rather than the attempt and upload-artifact v4+
+      # refuses to replace an existing name, so without this a second attempt
+      # would die here -- before `task homebrew-publish` and
+      # `task scoop-publish`, the two steps that hold cross-repo tokens and that
+      # a retry usually exists to get past (v0.35.6's `GH006`).
+      #
+      # This is DELIBERATELY not `ci.yml`'s `-attempt-${{ github.run_attempt }}`
+      # convention, and the difference is what the artifact is for. Those are
+      # per-attempt diagnostic records, deliberately kept side by side so a
+      # failing attempt stays readable after its conclusion is gone. This is a
+      # HAND-OFF to a consumer in the same run, where only the newest is ever
+      # wanted and a stable name is what lets `attest` ask for it -- an
+      # attempt-qualified name would break the moment `attest` alone were
+      # re-run, since its `run_attempt` would no longer match the one
+      # `finalize` uploaded under. Same reasoning as the `--clobber` already on
+      # this workflow's `gh release upload`.
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: release-checksums
           path: dist/checksums.txt
           if-no-files-found: error
+          overwrite: true
       # These four steps are the ones that hold the publishing tokens, so they
       # are the highest-value sink for an injected value: bind both the version
       # and the channel name through `env:` and pass each `task` variable as a
@@ -932,12 +952,16 @@ jobs:
       # step, so what travels is the file the release actually carries. Named
       # outside `desktop-bundle-*`, the pattern the download at the top of this
       # job selects on, so a re-run cannot feed a previous attempt's manifest
-      # back into `gh release upload dist-desktop/*`.
+      # back into `gh release upload dist-desktop/*`. `overwrite: true` for the
+      # reason the sibling upload in `finalize` gives at length: stable name
+      # because `attest` has to ask for it by name, replaceable because a second
+      # attempt at this job must not die on its own first attempt's artifact.
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: release-checksums-desktop
           path: dist-desktop/checksums-desktop-alpha.txt
           if-no-files-found: error
+          overwrite: true
       - name: Note the unsigned alpha in the release body
         env:
           GH_TOKEN: ${{ github.token }}
@@ -1063,6 +1087,12 @@ jobs:
           path: dist-desktop
       - name: Collect the subjects to attest
         id: subjects
+        env:
+          # Bound through `env:` like every other context value this workflow
+          # feeds a `run:` script. It is the discriminator the missing-manifest
+          # branch below needs: `skipped` or `failure` means nothing desktop was
+          # published and no claim was made about it, `success` means both.
+          DESKTOP_PUBLISH_RESULT: ${{ needs.desktop-publish.result }}
         # Built as an explicit list rather than handed to the action as a glob,
         # because a glob that matches nothing is an error there -- and
         # `dist-desktop/` legitimately holds nothing when both bundler legs
@@ -1092,14 +1122,34 @@ jobs:
           if [ -z "$desktop" ]; then
             echo "::warning::no desktop bundles to attest; that platform's leg failed. Attesting the CLI assets."
           fi
-          # Absent whenever `desktop-publish` did not run, which the warning
-          # above already reports -- so its absence is only worth a line of its
-          # own when the bundles it describes DID arrive.
+          # A MISSING DESKTOP MANIFEST IS FATAL EXACTLY WHEN `desktop-publish`
+          # SUCCEEDED, and the asymmetry is the point (Greptile P1 on #1227).
+          #
+          # That job generates the manifest, publishes it with the bundles,
+          # uploads it as an artifact, and only THEN appends the release note
+          # that tells users every asset here carries provenance -- in that
+          # order, under `bash -e`. So `result == success` means the claim is on
+          # the release and the artifact was uploaded; the manifest failing to
+          # arrive here is then a transient download failure that the
+          # `continue-on-error` above swallowed, and attesting around it would
+          # leave a published security claim false while the run stayed green.
+          # Refuse instead: `attest` is off the critical path, so a red here
+          # costs a loud run and not the release.
+          #
+          # Any other result -- `failure`, `skipped`, `cancelled` -- means the
+          # note was never appended and nothing desktop reached the release, so
+          # there is no false claim to protect and no manifest to expect. Warn
+          # and attest what is here. Erroring in THAT case would throw away the
+          # CLI binaries' attestations every time a bundler failed, which is the
+          # #768 defect this job's `if:` gate already exists to avoid.
           desktop_manifest=""
           if [ -f dist-desktop/checksums-desktop-alpha.txt ]; then
             desktop_manifest=dist-desktop/checksums-desktop-alpha.txt
+          elif [ "$DESKTOP_PUBLISH_RESULT" = "success" ]; then
+            echo "::error::desktop-publish succeeded, so checksums-desktop-alpha.txt is on the release and the release body now says it carries provenance -- but the release-checksums-desktop artifact did not arrive here. Attesting without it would publish a claim this run did not make good. Refusing; re-run this job."
+            exit 1
           elif [ -n "$desktop" ]; then
-            echo "::warning::desktop bundles arrived but checksums-desktop-alpha.txt did not. Attesting the bundles without their manifest."
+            echo "::warning::desktop bundles are here but desktop-publish did not succeed (result: ${DESKTOP_PUBLISH_RESULT}), so no desktop asset reached the release and there is no manifest to attest. Attesting the bundles that were built."
           fi
           # Accumulated into ONE list that is both emitted and logged, rather
           # than the two parallel sequences this used to carry. With four
