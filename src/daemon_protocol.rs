@@ -1220,10 +1220,11 @@ pub enum AttachRequest {
         /// default shell — so a client resolves a blank command for an authoring
         /// agent itself, as the TUI does. Refused, with nothing started, when it
         /// is combined with `seed`, when the start names no `cwd` or one that
-        /// fails [`crate::agent_pty::is_valid_orchestration_cwd`] (a control
-        /// character would reach the agent inside its seed — PRD #1223 audit
-        /// A2; a plain start's `cwd` rules are unchanged), or when it names no
-        /// valid `DOT_AGENT_DECK_PANE_ID` for the delivery to route by.
+        /// fails [`crate::authoring_seeds::is_safe_authoring_path`] (a control
+        /// character, a Unicode line separator or a bidi override would reach
+        /// the agent inside its seed — PRD #1223 audits A2 and D1; a plain
+        /// start's `cwd` rules are unchanged), or when it names no valid
+        /// `DOT_AGENT_DECK_PANE_ID` for the delivery to route by.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         authoring_kind: Option<crate::authoring_seeds::AuthoringKind>,
     },
