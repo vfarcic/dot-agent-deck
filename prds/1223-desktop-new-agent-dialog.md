@@ -1,6 +1,6 @@
 # PRD #1223: Create an agent from the desktop overview — the TUI's Ctrl+n, with a deck step first
 
-**Status**: Draft — not started
+**Status**: Implemented — PR open, awaiting review and merge
 **Priority**: Medium
 **Created**: 2026-09-22
 **Issue**: [#1223](https://github.com/vfarcic/dot-agent-deck/issues/1223)
@@ -176,20 +176,20 @@ Ships **visible** (decided 2026-09-22). The desktop binary has no experimental-f
 
 ### Iteration 1 — a plain agent, end to end
 
-- [ ] **M1 — The directory-listing verb.** `ListDirectories` in the daemon, capability-gated and bounded as specified, with the threat model recorded in `docs/develop/` and protocol/socket tests for every bound. Closes #1048's Part 2.
-- [ ] **M2 — The deck's new-agent options.** `NewAgentOptions` (default command, agent registry, experimental state, authoring kinds advertised as none until M7), capability-gated, with tests.
-- [ ] **M3 — Deck-targeted start in the desktop backend.** A plain-agent start that takes a deck id, resolves it through `DeckScope::resolve`, returns the agent id through `DeckActionResult`, and is reachable from the frontend (`DeckAction`, `TauriDeckBridge.runAction`, the fixture bridge), with `RealDeck` tests including the All Decks case.
-- [ ] **M4 — The dialog.** Deck step, directory step (browser plus typed path), and the form with `No mode`, Agent, Name and Command at TUI parity; entry points on the overview (top bar, shortcut, deck-group header, first-run copy) and the voice registry entry; vitest coverage.
-- [ ] **M5 — After creation and degradation.** Opens the new agent's pane once the target deck lists it, with a bounded wait and a direct refresh of that deck; inline errors; each older-deck fallback; a Playwright spec for the whole flow.
+- [x] **M1 — The directory-listing verb.** `ListDirectories` in the daemon, capability-gated and bounded as specified, with the threat model recorded in `docs/develop/` and protocol/socket tests for every bound. Closes #1048's Part 2.
+- [x] **M2 — The deck's new-agent options.** `NewAgentOptions` (default command, agent registry, experimental state, authoring kinds advertised as none until M7), capability-gated, with tests.
+- [x] **M3 — Deck-targeted start in the desktop backend.** A plain-agent start that takes a deck id, resolves it through `DeckScope::resolve`, returns the agent id through `DeckActionResult`, and is reachable from the frontend (`DeckAction`, `TauriDeckBridge.runAction`, the fixture bridge), with `RealDeck` tests including the All Decks case.
+- [x] **M4 — The dialog.** Deck step, directory step (browser plus typed path), and the form with `No mode`, Agent, Name and Command at TUI parity; entry points on the overview (top bar, shortcut, deck-group header, first-run copy) and the voice registry entry; vitest coverage.
+- [x] **M5 — After creation and degradation.** Opens the new agent's pane once the target deck lists it, with a bounded wait and a direct refresh of that deck; inline errors; each older-deck fallback; a Playwright spec for the whole flow.
 
 ### Iteration 2 — the rest of the Mode row
 
-- [ ] **M6 — Orchestrations.** `[Orch: <name>]` chips from `ResolveProject`, the run-title Name rules, launch through `PrepareWorkflow` / `StartPreparedAgent` with no task prompt, the daemon's orchestrator context composed honestly without a task, and the start role's pane opened afterwards.
-- [ ] **M7 — Authoring agents.** The seed constants moved to a shared module, the capability-gated authoring kind on `StartAgent` with daemon-side readiness-gated delivery, and the `schedule`, `schedule: issues` and `dispatcher` chips, each verified to deliver the same text the TUI does.
+- [x] **M6 — Orchestrations.** `[Orch: <name>]` chips from `ResolveProject`, the run-title Name rules, launch through `PrepareWorkflow` / `StartPreparedAgent` with no task prompt, the daemon's orchestrator context composed honestly without a task, and the start role's pane opened afterwards.
+- [x] **M7 — Authoring agents.** The seed constants moved to a shared module, the capability-gated authoring kind on `StartAgent` with daemon-side readiness-gated delivery, and the `schedule`, `schedule: issues` and `dispatcher` chips, each verified to deliver the same text the TUI does.
 
 ### Iteration 3 — verified and documented
 
-- [ ] **M8 — Real agent, docs, cross-version.** The lane-2 real-agent scenario run locally and named; `docs/develop/desktop-gui.md` and the protocol notes updated (and a user-facing page if [#765](https://github.com/vfarcic/dot-agent-deck/issues/765) has given the desktop one by then); a changelog fragment; rule 12's cross-version test run and recorded here; the manual smoke check against a local and a remote deck; #1041 closed and #1048 narrowed.
+- [x] **M8 — Real agent, docs, cross-version.** The lane-2 real-agent scenario run locally and named; `docs/develop/desktop-gui.md` and the protocol notes updated (and a user-facing page if [#765](https://github.com/vfarcic/dot-agent-deck/issues/765) has given the desktop one by then); a changelog fragment; rule 12's cross-version test run and recorded here; the manual smoke check against a local and a remote deck; #1041 closed and #1048 narrowed.
 
 ## Risks
 
@@ -226,3 +226,28 @@ Scope settled with the user before writing:
 - **Deck first**: the flow opens on a deck-selection step, because the desktop drives several decks.
 - **Directory**: a **daemon-side browser**. Checked whether the daemon half already existed: at `ffcf48d8` no directory-listing verb exists in `src/daemon_protocol.rs` (whose `ResolveProject` doc still says it is not `ListDir`/`ReadFile`/`Stat`), no branch or PR implements one, and the open issue asking for it is #1048's Part 2 — absorbed here.
 - **Feature flag**: ships visible (CLAUDE.md rule 9 asked). The desktop binary has no flag mechanism.
+
+### 2026-09-22 — Implemented on `agent/dispatch-prd-1223`
+
+All eight milestones landed. `PROTOCOL_VERSION` stayed **10**: every wire addition is a capability-gated variant or a gated optional field, checked in the client library, so no `.breaking.md` and no `CONTRACT_BREAKS` entry is owed.
+
+| Addition | Capability | Client-library gate |
+| --- | --- | --- |
+| `AttachRequest::ListDirectories { path? }` | `list-directories` | `DaemonClient::list_directories` |
+| `AttachRequest::NewAgentOptions {}` | `new-agent-options` | `DaemonClient::new_agent_options` |
+| `StartAgent.authoring_kind` | `authoring-kind` | `DaemonClient::start_authoring_agent` (fresh handshake per call) |
+| `StartPreparedAgent.use_configured_command` | `prepared-role-command` (Unix, like `start-prepared-agent`) | `DaemonClient::start_prepared_role` (fresh handshake per call) |
+
+**Open Questions, as settled.** (1) The directory step starts in the daemon user's home. (2) Hidden and symlinked children are skipped as the TUI's picker skips them; a typed path is canonicalised by the daemon. (3) The desktop's last command is kept **in memory** per deck, not in `desktop.toml` — `desktop_settings_secrets`' `ALLOWED_FIELD_TYPES` forbids free text in that file, and a command line is where secrets live; persisting it on the deck is #1048 Part 1. (4) Ctrl+N / Cmd+N, on the overview only; no collision found, unverified on Windows WebView2. (5) `no_voice`, deferring a voice entry to PRD #1195.
+
+**Two findings changed the plan.** The daemon already omitted the `## Your task` section for an empty task and already carried a run title through `StartPreparedAgent.tab_membership`, so M6 needed no new daemon work for either — `project/launch/004` pins both as a regression guard. But role commands deliberately never reach a client (`ProjectRole`), so the desktop could not start roles at TUI parity: M6 added the explicit opt-in `use_configured_command` rather than giving an absent `command` a new meaning, which keeps every existing field's meaning intact.
+
+**A Pi coordinator is allowed here, and refused on the Runs screen.** Runs promises acknowledged all-or-nothing delivery and Pi's native seed cannot be acknowledged; this flow lets the deck seed a Pi start role exactly as the TUI does, and therefore cannot roll back on a Pi delivery failure it cannot detect.
+
+**Tests.** New catalog entries `newagent/browse/001–003`, `newagent/options/001`, `newagent/authoring/001–003`, `newagent/live/001` [reel], `project/launch/004–005`, plus desktop `RealDeck`, vitest and Playwright suites. `newagent/live/001` is the rule 4 real-agent scenario: a real interactive Haiku agent started through the flow's own daemon sequence in a browsed directory, reporting a sentinel file, run locally (lane 2 runs on no CI runner) and recorded for the demo reel.
+
+**Rule 12's cross-version check: PASS both directions** at `59624a52` against `v0.41.1`, re-run after the later daemon change was confirmed byte-identical on Unix. Forward (old daemon, branch TUI) and reverse (branch daemon, old TUI and CLI, `--probe generic`): one `Attach protocol listening` line, the same daemon end to end, the delegate routed, both hook kinds arrived, and the reverse run's `role-set` held. Evidence in the branch's `.dot-agent-deck/xver-prd1223-{forward,reverse}.md`.
+
+**Review and audit.** Four rounds. The audit's accepted findings produced: a fresh capability handshake per gated-field send; control characters, Unicode line separators and bidi formatting characters kept out of listed paths and authoring seeds; a re-check of each listed child at reply construction; a dedicated refusing permit pool so the new queries cannot starve the project verbs; a bounded config read; exactly one valid `DOT_AGENT_DECK_PANE_ID` required on both new surfaces (folded the way the target platform folds env keys); time limits on every role start and rollback stop with indeterminate failures reported rather than assumed; and the cleanup warning made visible and unlosable on both screens. Two findings were declined as pre-existing and cross-cutting — the single fixed `orchestrator-context.md` path per project, and prepared starts spawning by pathname after an inode check — and are tracked in [#1233](https://github.com/vfarcic/dot-agent-deck/issues/1233) with the daemon-side duplicate-name refusal and a daemon-owned preparation deadline. One low residual of the single-latest-error policy is [#1234](https://github.com/vfarcic/dot-agent-deck/issues/1234).
+
+**Not verified by this run.** The manual desktop smoke check against a local and a remote deck (`docs/develop/desktop-gui.md`) needs a human at the GUI; there is no `tauri-driver` tier ([#953](https://github.com/vfarcic/dot-agent-deck/issues/953)). No user-facing docs page was added: [#765](https://github.com/vfarcic/dot-agent-deck/issues/765) is still open and the desktop has no page under `docs/`.
