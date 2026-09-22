@@ -439,7 +439,9 @@ export function NewAgentDialog({ runtime, initialDeckId, onClose, onAppeared, on
     }
     setFormError(undefined);
     setPhase("starting");
-    const agentName = name.trim() ? name : "";
+    // Trimmed, as the TUI's `resolve_display_name` trims a plain agent's Name
+    // before it becomes `StartAgent.display_name`; a blank one is not sent.
+    const agentName = name.trim();
     // An authoring agent's blank Command resolves here, where the TUI resolves
     // it, and the field keeps what the user typed.
     const startCommand = authoringKind ? resolveAuthoringCommand(command, defaultCommand, agents) : command;

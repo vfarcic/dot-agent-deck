@@ -364,6 +364,32 @@ describe("New agent dialog — form (PRD #1223 M4)", () => {
     expect(runtime.runAction).toHaveBeenCalledWith({ type: "start_agent", deckId: LOCAL, cwd: "/home/dev/beta/leaf", command: "claude", displayName: "leaf" });
   });
 
+  /**
+   * Scenario: the Name is typed with surrounding spaces, then blanked. The
+   * start sends it trimmed, as the TUI's `resolve_display_name` trims a plain
+   * agent's Name, and a whitespace-only Name sends no name at all.
+   */
+  it("trims the Name of a plain agent, as the TUI does, and sends none when it is blank", async () => {
+    const runtime = fakeRuntime();
+    renderDialog(runtime);
+    await reachForm();
+    await waitFor(() => expect(runtime.newAgentOptions).toHaveBeenCalled());
+
+    fireEvent.change(screen.getByTestId("new-agent-name"), { target: { value: "  reviewer  " } });
+    fireEvent.submit(screen.getByTestId("new-agent-form"));
+    await waitFor(() => expect(runtime.runAction).toHaveBeenCalledTimes(1));
+    expect(runtime.runAction).toHaveBeenLastCalledWith(expect.objectContaining({ type: "start_agent", displayName: "reviewer" }));
+
+    const blank = fakeRuntime();
+    cleanupAndRender(blank);
+    await reachForm();
+    await waitFor(() => expect(blank.newAgentOptions).toHaveBeenCalled());
+    fireEvent.change(screen.getByTestId("new-agent-name"), { target: { value: "   " } });
+    fireEvent.submit(screen.getByTestId("new-agent-form"));
+    await waitFor(() => expect(blank.runAction).toHaveBeenCalledTimes(1));
+    expect(blank.runAction).toHaveBeenCalledWith({ type: "start_agent", deckId: LOCAL, cwd: "/home/dev/beta/leaf" });
+  });
+
   it("sends no command for a blank Command", async () => {
     const runtime = fakeRuntime();
     renderDialog(runtime);
