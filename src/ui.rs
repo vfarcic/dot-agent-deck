@@ -5250,6 +5250,12 @@ fn surface_one_orchestration(
                 );
                 continue;
             }
+            // PRD #1223: a slot this role fills may be a DEAD SLOT — routinely
+            // so for an attach-socket start, whose daemon surfaces one role at a
+            // time, so the tab's first build dead-slots every role not yet
+            // started. Remember it so its `No agent` card goes with it.
+            let replaced_dead_slot =
+                tab_manager.dead_slot_pane_for_role(existing_tab_index, &role_config.name);
             if let Ok((placed_at, was_new)) = tab_manager.add_role_to_existing_orchestration(
                 existing_tab_index,
                 role_config.clone(),
@@ -5272,6 +5278,9 @@ fn surface_one_orchestration(
                 // though its pane is live and hydrated.
                 let agent_id = embedded.pane_agent_id(&role.pane_id);
                 let mut st = state.blocking_write();
+                if let Some(dead) = replaced_dead_slot.as_deref() {
+                    st.remove_sessions_for_pane(dead);
+                }
                 st.register_pane(role.pane_id.clone());
                 st.insert_placeholder_session(
                     role.pane_id.clone(),

@@ -17,6 +17,23 @@ use crate::project_config::{
 };
 
 const MAX_RECENT_EVENTS: usize = 50;
+/// The session key a pane's PLACEHOLDER card is filed under — the one
+/// [`AppState::insert_placeholder_session`] mints.
+///
+/// PRD #1223: shared with the daemon's card-surfacing `SessionStart`
+/// (`crate::spawn::surface_spawned_pane`), which files its card under the SAME
+/// key. That is what makes the two producers of a pane's first card
+/// order-independent in an attached TUI: whichever lands second lands on the
+/// first one's card instead of beside it. The placeholder arriving second
+/// overwrites the synthetic card (`HashMap::insert`); the synthetic event
+/// arriving second updates the placeholder in place (`apply_event`'s
+/// `sessions.entry`). Without the shared key a TUI-owned start whose daemon
+/// broadcast beat its own placeholder insert drew two cards for one pane, and
+/// for a hookless command nothing ever retired the extra one.
+pub fn placeholder_session_id(pane_id: &str) -> String {
+    format!("pane-{pane_id}")
+}
+
 /// PRD #120 L1: cap on [`AppState::pending_orchestration_surfaces`]. The render
 /// loop drains the queue one surface per frame, so a daemon flooding surface
 /// events faster than it drains can't grow the Vec unbounded — beyond this the
@@ -6935,6 +6952,18 @@ impl AppState {
     /// placeholder it just created (the `SessionEnd` restorer re-applies the
     /// dying session's friendly name — issue #663) does not have to restate this
     /// function's key format and risk drifting from it.
+    ///
+    /// PRD #1223: an UPSERT for the generation it names. When the pane already
+    /// has a session under another key carrying this same `Some(agent_id)`, that
+    /// agent has already announced itself — its real `SessionStart` beat the
+    /// caller here — so the existing card IS this placeholder's card and is kept
+    /// untouched, and its id is returned. Minting beside it drew a second,
+    /// permanent card for one agent: the reuse guard that would have merged
+    /// them runs only on the NEXT event, and an idle agent sends none. Reached
+    /// routinely once the daemon surfaces attach-socket starts live, because the
+    /// TUI's surface consumer grows a tab a frame or more after the roles' first
+    /// hooks may have landed. An untagged (`None`) call, and a differing id,
+    /// keep minting as before.
     pub fn insert_placeholder_session(
         &mut self,
         pane_id: String,
@@ -6942,7 +6971,17 @@ impl AppState {
         agent_type: Option<AgentType>,
         agent_id: Option<String>,
     ) -> String {
-        let session_id = format!("pane-{}", pane_id);
+        let session_id = placeholder_session_id(&pane_id);
+        if agent_id.is_some()
+            && let Some(existing) = self.sessions.iter().find_map(|(id, session)| {
+                (*id != session_id
+                    && session.pane_id.as_deref() == Some(pane_id.as_str())
+                    && session.agent_id == agent_id)
+                    .then(|| id.clone())
+            })
+        {
+            return existing;
+        }
         let now = Utc::now();
         let started_at = self.pane_started_at.get(&pane_id).copied().unwrap_or(now);
         self.sessions.insert(
@@ -7011,28 +7050,31 @@ impl AppState {
         // Mint the placeholder exactly as today (PRD #110 agent_id,
         // started_at reuse, session_id), then overlay the live snapshot
         // fields when one is present.
-        self.insert_placeholder_session(pane_id.clone(), cwd, effective_agent_type, agent_id);
-        if let Some(snap) = live {
-            let session_id = format!("pane-{}", pane_id);
-            if let Some(session) = self.sessions.get_mut(&session_id) {
-                session.status = snap.status.clone();
-                session.active_tool = snap.active_tool.clone();
-                session.tool_count = snap.tool_count;
-                session.first_prompts = snap.first_prompts.clone();
-                session.last_user_prompt = snap.last_user_prompt.clone();
-                // PRD #20 blocker-4: restore the durable live-target so a
-                // history-only / view-only card keeps refusing input right
-                // after reconnect, before any new event re-declares it. The
-                // descriptor lives in `recent_events` (no dedicated field —
-                // uneditable fixtures build `SessionState` by exhaustive
-                // literal), so re-seed it as a single inert carrier event. It
-                // sets no prompt/tool, so the card's activity renderers ignore
-                // it; `apply_event`'s forward-stamping then keeps it durable.
-                if let Some(live_target) = snap.live_target {
-                    session
-                        .recent_events
-                        .push_back(live_target_carrier_event(session, live_target));
-                }
+        let session_id =
+            self.insert_placeholder_session(pane_id.clone(), cwd, effective_agent_type, agent_id);
+        // PRD #1223: a card the agent's own events already drew is newer than
+        // any snapshot, so only a freshly minted placeholder takes the overlay.
+        let minted = session_id == placeholder_session_id(&pane_id);
+        if let Some(snap) = live.filter(|_| minted)
+            && let Some(session) = self.sessions.get_mut(&session_id)
+        {
+            session.status = snap.status.clone();
+            session.active_tool = snap.active_tool.clone();
+            session.tool_count = snap.tool_count;
+            session.first_prompts = snap.first_prompts.clone();
+            session.last_user_prompt = snap.last_user_prompt.clone();
+            // PRD #20 blocker-4: restore the durable live-target so a
+            // history-only / view-only card keeps refusing input right
+            // after reconnect, before any new event re-declares it. The
+            // descriptor lives in `recent_events` (no dedicated field —
+            // uneditable fixtures build `SessionState` by exhaustive
+            // literal), so re-seed it as a single inert carrier event. It
+            // sets no prompt/tool, so the card's activity renderers ignore
+            // it; `apply_event`'s forward-stamping then keeps it durable.
+            if let Some(live_target) = snap.live_target {
+                session
+                    .recent_events
+                    .push_back(live_target_carrier_event(session, live_target));
             }
         }
     }
@@ -13694,6 +13736,43 @@ mod tests {
     /// The half that was NOT true before #398: the untagged event lands on the
     /// pane's existing session instead of minting a sibling, so the pane owns
     /// exactly one session and `build_pane_status` has nothing to arbitrate.
+    /// PRD #1223: a placeholder for a generation whose real `SessionStart`
+    /// already drew its card keeps that card instead of minting a second one,
+    /// while a placeholder for a DIFFERENT generation still mints.
+    #[test]
+    fn placeholder_for_an_already_announced_generation_keeps_its_card() {
+        let mut state = AppState::default();
+        state.register_pane("role-p".into());
+        let mut real = untagged_event("real-session", EventType::SessionStart);
+        real.pane_id = Some("role-p".into());
+        real.agent_id = Some("7".into());
+        state.apply_event(real);
+
+        let kept = state.insert_placeholder_session(
+            "role-p".into(),
+            Some("/work".into()),
+            None,
+            Some("7".into()),
+        );
+        assert_eq!(kept, "real-session", "the existing card's id is returned");
+        let on_pane = || {
+            state
+                .sessions
+                .values()
+                .filter(|s| s.pane_id.as_deref() == Some("role-p"))
+                .count()
+        };
+        assert_eq!(on_pane(), 1, "one agent, one card");
+
+        let minted = state.insert_placeholder_session(
+            "role-p".into(),
+            Some("/work".into()),
+            None,
+            Some("8".into()),
+        );
+        assert_eq!(minted, placeholder_session_id("role-p"));
+    }
+
     #[test]
     fn pre_f9_hook_with_no_agent_id_adopts_the_panes_session() {
         let mut state = pane_with_tagged_session();

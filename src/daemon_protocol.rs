@@ -3758,6 +3758,19 @@ async fn handle_connection(
                             cwd_for_state.as_deref(),
                         );
                     }
+                    // PRD #1223: announce the start to every attached TUI, not
+                    // only to the client that sent it — a desktop start was
+                    // otherwise invisible to an already-attached TUI. After the
+                    // record is published and the role registered, before the
+                    // reply. See `crate::spawn::surface_attach_started_agent`
+                    // for what is emitted and why the sending TUI is unaffected.
+                    if let Some(record) = registry.agent_record_any(&id) {
+                        crate::spawn::surface_attach_started_agent(
+                            &event_tx,
+                            &record,
+                            command.as_deref(),
+                        );
+                    }
                     write_resp(&mut stream, &AttachResponse::with_id(id)).await?
                 }
                 Err(e) => write_resp(&mut stream, &AttachResponse::err(e.to_string())).await?,

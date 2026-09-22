@@ -1426,6 +1426,31 @@ impl TabManager {
         Ok((role_index, true))
     }
 
+    /// PRD #1223: the synthetic DEAD-SLOT pane id currently standing in for the
+    /// role named `role_name` in orchestration tab `tab_index`, if that role's
+    /// slot is a dead slot. `None` for a live slot, an unknown role, or a tab
+    /// that is not an orchestration.
+    ///
+    /// Asked before [`Self::add_role_to_existing_orchestration`] fills the slot,
+    /// because that call overwrites the id and the dead slot's placeholder card
+    /// is keyed by it: without the id the caller cannot retire the card, and the
+    /// role then renders twice — once live, once as a `No agent` ghost.
+    pub fn dead_slot_pane_for_role(&self, tab_index: usize, role_name: &str) -> Option<String> {
+        let Some(Tab::Orchestration {
+            role_pane_ids,
+            config,
+            ..
+        }) = self.tabs.get(tab_index)
+        else {
+            return None;
+        };
+        let index = config.roles.iter().position(|r| r.name == role_name)?;
+        role_pane_ids
+            .get(index)
+            .filter(|id| crate::ui::is_dead_slot_pane_id(id))
+            .cloned()
+    }
+
     /// Issue #1096: which slot a role that is NEW to this tab belongs in,
     /// given the tab's own (possibly stale) role list and the CURRENT
     /// `.dot-agent-deck.toml` order.
@@ -1986,6 +2011,36 @@ mod tests {
                 },
             ],
         }
+    }
+
+    /// PRD #1223: the dead-slot lookup names only a role whose slot is a dead
+    /// slot, so the grow path retires exactly that placeholder card.
+    #[test]
+    fn dead_slot_pane_for_role_names_only_dead_slots() {
+        let pc = Arc::new(MockPaneController::new());
+        let mut tm = TabManager::new(pc);
+        let identity = crate::state::OrchestrationIdentity::NameCwd {
+            name: "team".into(),
+            cwd: "/work".into(),
+        };
+        let dead = crate::ui::dead_slot_pane_id(&identity, 1);
+        let (idx, _) = tm
+            .open_orchestration_tab_with_existing_role_panes(
+                &orch_config("team"),
+                "/work",
+                vec![Some("lead-pane".into()), Some(dead.clone())],
+                None,
+                None,
+            )
+            .expect("open the tab");
+        assert_eq!(tm.dead_slot_pane_for_role(idx, "coder"), Some(dead));
+        assert_eq!(tm.dead_slot_pane_for_role(idx, "orchestrator"), None);
+        assert_eq!(tm.dead_slot_pane_for_role(idx, "nobody"), None);
+        assert_eq!(
+            tm.dead_slot_pane_for_role(0, "coder"),
+            None,
+            "the Dashboard"
+        );
     }
 
     /// Scenario: Create an orchestration with a user-typed name ("My Custom

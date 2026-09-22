@@ -642,7 +642,7 @@ pub async fn spawn(
                     // No role config on a single-agent spawn, so nothing to
                     // declare (issue #308).
                     None,
-                    &req.task_name,
+                    Some(&req.task_name),
                 );
             }
             run_delivery(
@@ -997,7 +997,7 @@ pub async fn spawn(
                         &req.working_dir,
                         Some(&role.command),
                         role.agent_type.clone(),
-                        &role.role_name,
+                        Some(&role.role_name),
                     );
                 }
             }
@@ -2535,10 +2535,14 @@ fn surface_spawned_pane(
     // knew it was Codex, and the label only corrected itself on the pane's
     // first real hook — the exact pre-first-task blankness this issue is about.
     agent_type: Option<AgentType>,
-    task_name: &str,
+    // `None` only on the attach path ([`surface_attach_started_agent`]), for a
+    // start that named nothing and so has no friendly title to carry.
+    task_name: Option<&str>,
 ) {
     let mut metadata = HashMap::new();
-    metadata.insert(DISPLAY_NAME_METADATA_KEY.to_string(), task_name.to_string());
+    if let Some(task_name) = task_name {
+        metadata.insert(DISPLAY_NAME_METADATA_KEY.to_string(), task_name.to_string());
+    }
     // Issue #684: declare that the DAEMON authored this start to draw a card,
     // rather than a producer announcing a conversation. `session_id` below is the
     // PANE ID and there is no `agent_id`, so without the marker an attached TUI's
@@ -2552,7 +2556,10 @@ fn surface_spawned_pane(
         crate::event::CARD_SURFACE_SESSION_START_ORIGIN.to_string(),
     );
     let event = AgentEvent {
-        session_id: pane_id.to_string(),
+        // PRD #1223: the PLACEHOLDER key, not the bare pane id, so this card and
+        // a TUI-owned placeholder for the same pane are one card whichever order
+        // they reach the TUI in. See `crate::state::placeholder_session_id`.
+        session_id: crate::state::placeholder_session_id(pane_id),
         agent_type: agent_type
             .or_else(|| AgentType::from_command(command))
             .unwrap_or(AgentType::None),
@@ -2570,6 +2577,100 @@ fn surface_spawned_pane(
         live_target: None,
     };
     let _ = event_tx.send(BroadcastMsg::Event(event));
+}
+
+/// PRD #1223: surface an agent started over the ATTACH socket (`StartAgent` /
+/// `StartPreparedAgent`) to every attached TUI, from the registry record the
+/// spawn just published.
+///
+/// Before this, only the daemon-internal spawn path (`spawn` above — schedules
+/// and dispatch) surfaced what it started. An attach-socket start relied on the
+/// CLIENT that sent it to draw the card or tab locally, which is right for the
+/// sending TUI and leaves every other client blind: a desktop-started agent was
+/// registered and running while an already-attached TUI painted nothing, and a
+/// desktop-started orchestration showed up only as flat cards once its roles'
+/// hooks fired, with no tab and no role names (`newagent/visibility/001` /
+/// `002`). The same held between two attached TUIs. The daemon owns the start,
+/// so the daemon announces it, once, for every client.
+///
+/// What is emitted depends on the pane's membership, mirroring `spawn` above:
+///
+/// * no membership (a dashboard pane) — the card-surfacing `SessionStart`,
+///   titled with the record's display name;
+/// * an orchestration role — a ONE-role [`BroadcastMsg::OrchestrationSurface`],
+///   then that card-surfacing `SessionStart` titled with the role name. An
+///   attach start carries one role, so the daemon cannot know the whole set;
+///   the TUI's surface consumer builds the tab from the first role and GROWS it
+///   from each later one by the orchestration's identity (issue #868's path);
+/// * a mode pane, or a role with no role name — nothing. A mode tab is built
+///   from local `ModeConfig` and there is no live mode surface to publish, so a
+///   synthetic dashboard card would misfile the pane rather than surface it.
+///
+/// Idempotent against the sending TUI, which has already built its own card
+/// or tab: the `SessionStart` lands on that TUI's placeholder card under the
+/// shared key ([`crate::state::placeholder_session_id`]) in either order, and
+/// the surface consumer skips a surface whose pane an existing tab already owns
+/// (`surface_one_orchestration`'s `already_built`). Called after the record is
+/// published and any role registered, and before the start is answered, so a
+/// surface never names an agent the daemon does not yet hold. Best-effort, as
+/// every broadcast: with no subscriber the send errs and is ignored.
+pub(crate) fn surface_attach_started_agent(
+    event_tx: &broadcast::Sender<BroadcastMsg>,
+    record: &crate::agent_pty::AgentRecord,
+    command: Option<&str>,
+) {
+    let Some(pane_id) = record.pane_id_env.as_deref() else {
+        // No pane id means no hook routing and no TUI pane to attach by.
+        return;
+    };
+    let cwd = record.cwd.as_deref().unwrap_or_default();
+    match record.tab_membership.as_ref() {
+        None => surface_spawned_pane(
+            event_tx,
+            pane_id,
+            cwd,
+            command,
+            record.agent_type.clone(),
+            record.display_name.as_deref(),
+        ),
+        Some(TabMembership::Orchestration {
+            name,
+            role_index,
+            role_name,
+            is_start_role,
+            orchestration_cwd,
+            display_title,
+            orchestration_id,
+        }) if !role_name.is_empty() => {
+            let surface = crate::event::OrchestrationSurface {
+                name: name.clone(),
+                // The orchestration's SHARED cwd is its identity in the TUI
+                // (the tab is found and grown by it); a role's own cwd may
+                // differ, and is what the card below is rooted at.
+                cwd: orchestration_cwd.clone().unwrap_or_else(|| cwd.to_string()),
+                display_title: display_title.clone(),
+                orchestration_id: orchestration_id.clone(),
+                roles: vec![crate::event::OrchestrationSurfaceRole {
+                    pane_id: pane_id.to_string(),
+                    role_index: *role_index,
+                    role_name: role_name.clone(),
+                    is_start_role: *is_start_role,
+                }],
+            };
+            let _ = event_tx.send(BroadcastMsg::OrchestrationSurface(surface));
+            // After the surface, as `spawn` orders it, so the tab exists before
+            // the card it names.
+            surface_spawned_pane(
+                event_tx,
+                pane_id,
+                cwd,
+                command,
+                record.agent_type.clone(),
+                Some(role_name),
+            );
+        }
+        Some(_) => {}
+    }
 }
 
 /// Issue #960: the run-identifying tab label for a DAEMON-SPAWNED orchestration,
@@ -6587,7 +6688,7 @@ mod tests {
             "/tmp/scratch/runbox",
             Some("cat"),
             None,
-            "morning-digest",
+            Some("morning-digest"),
         );
         let BroadcastMsg::Event(e) = rx.try_recv().expect("a broadcast must be queued") else {
             panic!("expected a BroadcastMsg::Event");
@@ -6627,12 +6728,208 @@ mod tests {
         );
     }
 
+    fn attach_record(
+        pane_id: Option<&str>,
+        display_name: Option<&str>,
+        tab_membership: Option<TabMembership>,
+    ) -> crate::agent_pty::AgentRecord {
+        crate::agent_pty::AgentRecord {
+            id: "7".into(),
+            pane_id_env: pane_id.map(str::to_string),
+            display_name: display_name.map(str::to_string),
+            cwd: Some("/work/role".into()),
+            tab_membership,
+            agent_type: Some(AgentType::OpenCode),
+            rows: 24,
+            cols: 80,
+            live: None,
+            spawned_at_ms: None,
+            cli_name: None,
+            crashed: None,
+        }
+    }
+
+    fn orchestration_membership(role_name: &str) -> TabMembership {
+        TabMembership::Orchestration {
+            name: "team".into(),
+            role_index: 1,
+            role_name: role_name.into(),
+            is_start_role: false,
+            orchestration_cwd: Some("/work/team".into()),
+            display_title: Some("Team run".into()),
+            orchestration_id: Some("orch-1".into()),
+        }
+    }
+
+    fn drain(rx: &mut broadcast::Receiver<BroadcastMsg>) -> Vec<BroadcastMsg> {
+        std::iter::from_fn(|| rx.try_recv().ok()).collect()
+    }
+
+    /// PRD #1223: a dashboard pane started over the attach socket is announced
+    /// as the card-surfacing `SessionStart`, titled from the record and filed
+    /// under the TUI's placeholder key.
+    #[test]
+    fn attach_started_dashboard_pane_surfaces_one_titled_card() {
+        let (tx, mut rx) = broadcast::channel(8);
+        let record = attach_record(Some("desktop-ab-0"), Some("my-agent"), None);
+        surface_attach_started_agent(&tx, &record, Some("opencode"));
+        let msgs = drain(&mut rx);
+        let [BroadcastMsg::Event(e)] = msgs.as_slice() else {
+            panic!("expected exactly one card event, got {msgs:?}");
+        };
+        assert!(e.is_card_surface_session_start());
+        assert_eq!(
+            e.session_id,
+            crate::state::placeholder_session_id("desktop-ab-0")
+        );
+        assert_eq!(e.pane_id.as_deref(), Some("desktop-ab-0"));
+        assert_eq!(e.cwd.as_deref(), Some("/work/role"));
+        assert_eq!(e.agent_type, AgentType::OpenCode);
+        assert_eq!(
+            e.metadata
+                .get(DISPLAY_NAME_METADATA_KEY)
+                .map(String::as_str),
+            Some("my-agent")
+        );
+        assert!(e.agent_id.is_none());
+    }
+
+    /// PRD #1223: an unnamed start carries no display-name metadata rather than
+    /// an invented one.
+    #[test]
+    fn attach_started_unnamed_pane_carries_no_display_name() {
+        let (tx, mut rx) = broadcast::channel(8);
+        surface_attach_started_agent(&tx, &attach_record(Some("p-0"), None, None), None);
+        let msgs = drain(&mut rx);
+        let [BroadcastMsg::Event(e)] = msgs.as_slice() else {
+            panic!("expected exactly one card event, got {msgs:?}");
+        };
+        assert!(!e.metadata.contains_key(DISPLAY_NAME_METADATA_KEY));
+    }
+
+    /// PRD #1223: an orchestration role is announced as a ONE-role surface
+    /// keyed on the orchestration's shared identity, THEN its role-named card.
+    #[test]
+    fn attach_started_orchestration_role_surfaces_tab_then_card() {
+        let (tx, mut rx) = broadcast::channel(8);
+        let record = attach_record(
+            Some("desktop-ab-1"),
+            Some("builder"),
+            Some(orchestration_membership("builder")),
+        );
+        surface_attach_started_agent(&tx, &record, None);
+        let msgs = drain(&mut rx);
+        let [
+            BroadcastMsg::OrchestrationSurface(surface),
+            BroadcastMsg::Event(e),
+        ] = msgs.as_slice()
+        else {
+            panic!("expected a surface then a card, got {msgs:?}");
+        };
+        assert_eq!(surface.name, "team");
+        assert_eq!(surface.cwd, "/work/team", "the SHARED cwd, not the role's");
+        assert_eq!(surface.display_title.as_deref(), Some("Team run"));
+        assert_eq!(surface.orchestration_id.as_deref(), Some("orch-1"));
+        assert_eq!(surface.roles.len(), 1);
+        let role = &surface.roles[0];
+        assert_eq!(role.pane_id, "desktop-ab-1");
+        assert_eq!(role.role_index, 1);
+        assert_eq!(role.role_name, "builder");
+        assert!(!role.is_start_role);
+        assert_eq!(e.pane_id.as_deref(), Some("desktop-ab-1"));
+        assert_eq!(e.cwd.as_deref(), Some("/work/role"));
+        assert_eq!(
+            e.metadata
+                .get(DISPLAY_NAME_METADATA_KEY)
+                .map(String::as_str),
+            Some("builder")
+        );
+    }
+
+    /// PRD #1223: nothing is announced for a pane with no pane id, a mode pane,
+    /// or a role with no role name — none has a live surface to land on.
+    #[test]
+    fn attach_started_agent_without_a_live_surface_emits_nothing() {
+        let (tx, mut rx) = broadcast::channel(8);
+        for record in [
+            attach_record(None, Some("x"), None),
+            attach_record(
+                Some("mode-0"),
+                None,
+                Some(TabMembership::Mode {
+                    name: "review".into(),
+                }),
+            ),
+            attach_record(Some("role-0"), None, Some(orchestration_membership(""))),
+        ] {
+            surface_attach_started_agent(&tx, &record, None);
+            assert!(drain(&mut rx).is_empty(), "nothing for {record:?}");
+        }
+    }
+
+    /// PRD #1223 idempotency: the daemon's card and the sending TUI's own
+    /// placeholder are ONE card in an attached TUI whichever arrives first.
+    #[test]
+    fn attach_surfaced_card_and_tui_placeholder_are_one_card_in_either_order() {
+        let (tx, mut rx) = broadcast::channel(8);
+        surface_attach_started_agent(&tx, &attach_record(Some("tui-p"), Some("mine"), None), None);
+        let msgs = drain(&mut rx);
+        let [BroadcastMsg::Event(event)] = msgs.as_slice() else {
+            panic!("expected one card event, got {msgs:?}");
+        };
+        let cards_on_pane = |state: &crate::state::AppState| {
+            state
+                .sessions
+                .values()
+                .filter(|s| s.pane_id.as_deref() == Some("tui-p"))
+                .count()
+        };
+
+        // Daemon broadcast first, then the TUI's own post-start placeholder.
+        let mut state = crate::state::AppState::default();
+        state.apply_event(event.clone());
+        state.register_pane("tui-p".into());
+        state.insert_placeholder_session(
+            "tui-p".into(),
+            Some("/work/role".into()),
+            None,
+            Some("7".into()),
+        );
+        assert_eq!(cards_on_pane(&state), 1, "broadcast then placeholder");
+        assert_eq!(
+            state.sessions[&crate::state::placeholder_session_id("tui-p")]
+                .agent_id
+                .as_deref(),
+            Some("7"),
+            "the TUI's placeholder, with its generation, is the card that stays"
+        );
+
+        // The TUI's placeholder first, then the daemon broadcast.
+        let mut state = crate::state::AppState::default();
+        state.register_pane("tui-p".into());
+        state.insert_placeholder_session(
+            "tui-p".into(),
+            Some("/work/role".into()),
+            None,
+            Some("7".into()),
+        );
+        state.apply_event(event.clone());
+        assert_eq!(cards_on_pane(&state), 1, "placeholder then broadcast");
+        assert_eq!(
+            state.sessions[&crate::state::placeholder_session_id("tui-p")]
+                .agent_id
+                .as_deref(),
+            Some("7"),
+            "an untagged card-surface event must not blank the card's generation"
+        );
+    }
+
     #[test]
     fn surface_spawned_pane_send_is_noop_without_subscribers() {
         // The standalone-daemon case (no attached TUI): `send` errs, swallowed.
         let (tx, rx) = broadcast::channel::<BroadcastMsg>(8);
         drop(rx);
-        surface_spawned_pane(&tx, "sched-x-0", "/tmp/x", None, None, "x");
+        surface_spawned_pane(&tx, "sched-x-0", "/tmp/x", None, None, Some("x"));
     }
 
     /// PRD #225 hardening: the readiness-wait override may shorten the wait but
