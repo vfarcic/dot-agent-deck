@@ -3191,11 +3191,16 @@ async fn ensure_one_orchestration_of_that_name(
     path: &str,
     orchestration: &str,
 ) -> Result<(), DesktopActionError> {
-    let project = daemon
-        .client
-        .resolve_project(path)
-        .await
-        .map_err(|error| safe_message(error.to_string()))?;
+    // Bounded (PRD #1223 audit W3), unlike the preparation below. The reason
+    // that one is not — dropping the future cannot stop the publish it has
+    // already started — does not apply to a read: `ResolveProject` writes
+    // nothing and is idempotent, so a deck that takes the connection and never
+    // answers costs this and the launch fails rather than holding the dialog's
+    // **Starting…** open for as long as the peer holds the socket. Its sibling
+    // check, `orchestration_launch_unavailable`, already bounds its handshake.
+    let project =
+        crate::daemon_bridge::bounded_reply("ResolveProject", daemon.client.resolve_project(path))
+            .await?;
     let defined = project
         .orchestrations
         .iter()
