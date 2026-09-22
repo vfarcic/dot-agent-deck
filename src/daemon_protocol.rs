@@ -4715,9 +4715,22 @@ const ENV_KEYS_ARE_CASE_INSENSITIVE: bool = cfg!(windows);
 /// Parameterised rather than reading the constant directly so the Windows rule
 /// is testable on every platform: the bug it closes is one a Unix CI can
 /// otherwise never execute.
+///
+/// # The fold is Unicode, not ASCII (audit W4)
+///
+/// The case-insensitive branch must agree with whatever the spawn actually
+/// does, and that is `portable-pty`'s: `EnvEntry::map_key`
+/// (`cmdbuilder.rs`) folds a Windows key with `str::to_lowercase`, which is
+/// the FULL Unicode mapping. An `eq_ignore_ascii_case` here saw fewer
+/// collisions than the spawn map does — `DOT_AGENT_DEC\u{212A}_PANE_ID`
+/// (KELVIN SIGN) lowercases to the canonical key there, so an env carrying it
+/// beside `DOT_AGENT_DECK_PANE_ID` passed as a single valid entry while the
+/// child's block held one variable whose value was whichever spelling came
+/// last. Folding the same way is what keeps the id this validates and the id
+/// the child receives one id.
 fn is_pane_id_key(key: &str, case_insensitive: bool) -> bool {
     if case_insensitive {
-        key.eq_ignore_ascii_case(DOT_AGENT_DECK_PANE_ID)
+        key.to_lowercase() == DOT_AGENT_DECK_PANE_ID.to_lowercase()
     } else {
         key == DOT_AGENT_DECK_PANE_ID
     }
@@ -5419,6 +5432,43 @@ mod tests {
             Some("pane-b")
         );
         assert_eq!(sole_valid_pane_id_under(&variant_only, false), None);
+        // Audit W4: the fold is the FULL Unicode one, because that is what
+        // `portable-pty`'s `EnvEntry::map_key` applies on Windows. KELVIN SIGN
+        // lowercases to an ASCII `k`, so this spelling and the canonical one
+        // are one variable in the child's block — while `eq_ignore_ascii_case`
+        // saw two, passed the pair as a single valid entry, and let the start
+        // register and seed by an id the child need not have received.
+        let kelvin = "DOT_AGENT_DEC\u{212A}_PANE_ID";
+        let kelvin_first = [
+            entry(kelvin, "pane-b"),
+            entry(DOT_AGENT_DECK_PANE_ID, "pane-a"),
+        ];
+        let kelvin_last = [
+            entry(DOT_AGENT_DECK_PANE_ID, "pane-a"),
+            entry(kelvin, "pane-b"),
+        ];
+        for colliding in [&kelvin_first, &kelvin_last] {
+            assert_eq!(
+                sole_valid_pane_id_under(colliding, true),
+                None,
+                "KELVIN SIGN folds onto the canonical key the way the spawn map folds it, so \
+                 these are one variable with two values: {colliding:?}"
+            );
+        }
+        // Two distinct variables on Unix, where nothing is folded at all.
+        assert_eq!(
+            sole_valid_pane_id_under(&kelvin_first, false),
+            Some("pane-a")
+        );
+        assert_eq!(
+            sole_valid_pane_id_under(&kelvin_last, false),
+            Some("pane-a")
+        );
+        // And on its own it names the variable on Windows, as any other
+        // spelling that folds onto the canonical key does.
+        let kelvin_only = [entry(kelvin, "pane-b")];
+        assert_eq!(sole_valid_pane_id_under(&kelvin_only, true), Some("pane-b"));
+        assert_eq!(sole_valid_pane_id_under(&kelvin_only, false), None);
         // Neither equivalence changes what a valid id is.
         let invalid = [entry(DOT_AGENT_DECK_PANE_ID, "pane a")];
         for case_insensitive in [true, false] {
