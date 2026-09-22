@@ -5193,6 +5193,21 @@ mod hook_ingestion_tests {
         registry.shutdown_all();
     }
 
+    /// Await the next "a sample started" signal from a stub sampler (issue
+    /// #1133), bounded so a monitor that stops ticking fails with a message
+    /// instead of hanging the run.
+    ///
+    /// On a paused clock the bound costs no real time — the clock advances only
+    /// while every task is parked, so reaching 30s there means nothing else in
+    /// the runtime was going to happen.
+    async fn next_sample_start(rx: &mut tokio::sync::mpsc::UnboundedReceiver<()>, what: &str) {
+        match tokio::time::timeout(Duration::from_secs(30), rx.recv()).await {
+            Ok(Some(())) => {}
+            Ok(None) => panic!("the shell-activity monitor stopped before {what}"),
+            Err(_) => panic!("timed out waiting for {what}"),
+        }
+    }
+
     /// Scenario: PR #500 review, round 3 — the residual inside `MAX_TABLE_AGE`.
     /// A freshness bound is not an identity check: a pane can be replaced while a
     /// retained sample is still in flight, and if the replacement's shell pid is a
@@ -5207,16 +5222,43 @@ mod hook_ingestion_tests {
     /// promoted to `Working`; B (which did not exist then) must stay `Idle`.
     ///
     /// Asserting on A is what makes this test honest rather than merely green.
-    /// The sample lands ~2.5s old, inside `MAX_TABLE_AGE` — but if anything
-    /// slowed the run enough to push it past that bound, the freshness guard
-    /// would swallow the whole answer and B would stay `Idle` for a reason having
-    /// nothing to do with identity matching. A reaching `Working` proves the
-    /// answer was accepted, so B staying `Idle` can only be the identity filter.
-    /// (Measured while writing this: an earlier version closed pane A here, and
-    /// `close_agent`'s SIGTERM grace window — `/bin/sh` ignores SIGTERM — blocked
-    /// the current-thread runtime long enough that the sample landed at 3.4s and
-    /// the test passed entirely via the freshness guard.)
-    #[tokio::test]
+    /// The sample lands 2.5s old, inside `MAX_TABLE_AGE` — but if anything pushed
+    /// it past that bound, the freshness guard would swallow the whole answer and
+    /// B would stay `Idle` for a reason having nothing to do with identity
+    /// matching. A reaching `Working` proves the answer was accepted, so B
+    /// staying `Idle` can only be the identity filter. (Measured while writing
+    /// this: an earlier version closed pane A here, and `close_agent`'s SIGTERM
+    /// grace window — `/bin/sh` ignores SIGTERM — blocked the current-thread
+    /// runtime long enough that the sample landed at 3.4s and the test passed
+    /// entirely via the freshness guard.)
+    ///
+    /// Issue #1133: that 2.5s is now arithmetic rather than an estimate, and the
+    /// scenario is sequenced on observable events rather than on wall-clock
+    /// guesses. Two changes, because the test had two separate dependencies on
+    /// real time and neither fixes the other:
+    ///
+    /// - **The stub sampler announces itself.** It sends on `sample_started_rx`
+    ///   every time the monitor calls it, which the monitor does only after
+    ///   resolving that tick's candidates. Waiting for the first send is what
+    ///   makes B "a pane that appeared after the sample started" by construction
+    ///   rather than by a 700ms sleep guessing where the tick landed. Waiting for
+    ///   the *second* is what makes the read point "after the tick that collected
+    ///   the late answer finished classifying": a tick that resumes a retained
+    ///   sample starts none of its own, so the next start can only come from the
+    ///   tick after it.
+    /// - **`start_paused`.** Polling cannot protect `MAX_TABLE_AGE`, because that
+    ///   budget is spent by the MONITOR between starting a sample and collecting
+    ///   it — under load its own loop drifts and a healthy answer is discarded
+    ///   for being collected late. On tokio's virtual clock the budget is
+    ///   arithmetic instead: the sample starts at 500ms (one `POLL_INTERVAL`),
+    ///   overruns `SAMPLE_TIMEOUT` at 2500ms, and is collected on the next tick
+    ///   at 3000ms — 2500ms old, 500ms inside the 3s bound, independent of how
+    ///   much real time any of it took. Nothing here needs a real elapsed second:
+    ///   the process table is a stub, and the two `/bin/sh` panes exist only to
+    ///   supply live pids for it to name. The clock auto-advances while every
+    ///   task is parked, so the run also costs milliseconds rather than the 3.5s
+    ///   of sleeps it replaces.
+    #[tokio::test(start_paused = true)]
     async fn shell_activity_monitor_ignores_a_pane_that_appeared_after_the_sample_started() {
         const PANE_A: &str = "pane-500-a";
         const PANE_B: &str = "pane-500-b";
@@ -5267,20 +5309,36 @@ mod hook_ingestion_tests {
         let late_table: Arc<std::sync::Mutex<Vec<crate::platform::proc::ProcessInfo>>> =
             Arc::new(std::sync::Mutex::new(Vec::new()));
 
+        // One send per sample the monitor STARTS, which is what both waits below
+        // are sequenced on. An mpsc rather than a `Notify` because they have to
+        // COUNT: `Notify` stores at most one permit, so a second start landing
+        // before the test woke would coalesce into the first and the second wait
+        // would return without the tick it names having happened.
+        let (sample_started_tx, mut sample_started_rx) =
+            tokio::sync::mpsc::unbounded_channel::<()>();
+
         let monitor_handle = tokio::spawn({
             let registry = registry.clone();
             let state = state.clone();
             let late_table = late_table.clone();
             async move {
                 run_shell_activity_monitor_with(registry, state, event_tx, move |_roots| {
+                    // Sent from the closure body rather than from the future it
+                    // returns: the monitor resolves the tick's candidates and
+                    // only then calls this, so a send means the candidate set
+                    // this sample will be judged against is already fixed — the
+                    // exact instant after which a new pane is "late".
+                    let _ = sample_started_tx.send(());
                     let late_table = late_table.clone();
                     async move {
                         // Longer than SAMPLE_TIMEOUT (2s) so the sample is
                         // RETAINED rather than answered on its first tick, and
-                        // ready by the resumed tick — which lands it ~2.5s old,
+                        // ready by the resumed tick — which lands it 2.5s old,
                         // inside MAX_TABLE_AGE (3s). That is the window where the
                         // freshness bound alone would let it through, so it is
-                        // the window the identity filter has to cover.
+                        // the window the identity filter has to cover. On the
+                        // paused clock every figure in that sentence is exact
+                        // rather than a target this sleep is aiming at.
                         tokio::time::sleep(Duration::from_millis(2_100)).await;
                         Some(late_table.lock().unwrap().clone())
                     }
@@ -5289,10 +5347,14 @@ mod hook_ingestion_tests {
             }
         });
 
-        // Let the first tick resolve candidates (pane A only) and start the
-        // sample, then add pane B while that sample is still in flight.
-        // Deliberately no `close_agent` — see this test's doc comment.
-        tokio::time::sleep(Duration::from_millis(700)).await;
+        // Wait for the first tick to resolve its candidates (pane A only) and
+        // start the sample, then add pane B while that sample is still in
+        // flight. Deliberately no `close_agent` — see this test's doc comment.
+        next_sample_start(
+            &mut sample_started_rx,
+            "the monitor's first tick to start a sample, against pane A alone",
+        )
+        .await;
         let agent_b = registry
             .spawn_agent(SpawnOptions {
                 command: Some("/bin/sh"),
@@ -5353,8 +5415,23 @@ mod hook_ingestion_tests {
             );
         }
 
-        // Past the resumed tick that receives the late answer.
-        tokio::time::sleep(Duration::from_millis(2_800)).await;
+        // The tick that resumes a retained sample starts none of its own, so the
+        // next sample start is the first observable event that can only happen
+        // AFTER the late answer was collected and its whole snapshot applied.
+        // That is the honest read point in both directions: were the identity
+        // filter gone, B's promotion would already have happened by here, so
+        // waiting on an event rather than sleeping does not weaken the test.
+        next_sample_start(
+            &mut sample_started_rx,
+            "a second sample to start — the tick after the one that collected the \
+             late answer",
+        )
+        .await;
+
+        // Stop the monitor before reading, so no later tick can classify B off a
+        // sample it was a candidate for from the start.
+        monitor_handle.abort();
+        let _ = monitor_handle.await;
 
         let (status_a, status_b) = {
             let guard = state.read().await;
@@ -5363,8 +5440,6 @@ mod hook_ingestion_tests {
                 guard.sessions[SESSION_B].status.clone(),
             )
         };
-        monitor_handle.abort();
-        let _ = monitor_handle.await;
         registry.shutdown_all();
 
         assert_eq!(
