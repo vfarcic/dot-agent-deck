@@ -2835,15 +2835,14 @@ async fn desktop_voice_resolve(
     // Read per call rather than cached, for `voice_speech_settings`'s reason: a
     // user who changes the backend, the endpoint or the model uses it on the
     // next utterance instead of after a restart.
-    let commands = crate::settings::load_snapshot()
+    let settings = crate::settings::load_snapshot()
         .settings
         .voice
-        .unwrap_or_default()
-        .intent;
-    let resolver = voice::resolver_for(&commands, Arc::new(KeychainSecretStore::new()));
+        .unwrap_or_default();
+    let resolver = voice::resolver_for(&settings.intent, Arc::new(KeychainSecretStore::new()));
     let snapshot = get_snapshot(&state.daemon).await;
     let decks = voice_decks(&snapshot.observed);
-    Ok(voice::handle_utterance(
+    Ok(voice::handle_utterance_with(
         resolver.as_ref(),
         voice::table(),
         screen,
@@ -2852,6 +2851,7 @@ async fn desktop_voice_resolve(
         directories.as_ref(),
         new_agent.as_ref(),
         voice::Transcript::new(utterance),
+        settings.labels,
     )
     .await)
 }
@@ -2924,11 +2924,18 @@ async fn desktop_voice_commands(
     if let Some(new_agent) = &new_agent {
         validate_voice_new_agent(new_agent)?;
     }
-    Ok(voice::annotate_with(
+    Ok(voice::annotate_for(
         voice::table(),
         screen,
         directories.as_ref(),
         new_agent.as_ref(),
+        // Read per call, for `desktop_voice_resolve`'s reason: the overlay says
+        // what the NEXT utterance can do, so it follows the label choice too.
+        crate::settings::load_snapshot()
+            .settings
+            .voice
+            .unwrap_or_default()
+            .labels,
     ))
 }
 

@@ -2772,7 +2772,7 @@ describe("desktop settings hold no credential (issue 827)", () => {
       // it are gone rather than carried. The sentinel assertion above is what
       // proves the value went; this pins the key set it was rebuilt to.
       if (normalized.voice) {
-        expect(Object.keys(normalized.voice).sort()).toEqual(["activation", "intent", "transcription"]);
+        expect(Object.keys(normalized.voice).sort()).toEqual(["activation", "intent", "labels", "transcription"]);
         // Each stage is rebuilt to its own declared keys, so a key smuggled
         // one level down is gone with the rest. `endpoint` and `model` ARE
         // declared and are carried verbatim — deliberately, because coercing

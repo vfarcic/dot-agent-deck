@@ -64,7 +64,7 @@
  * that reads as a control and answers nothing is worse than no row, and the
  * stored field stays either way, so D4 adds a select here and loses nothing.
  */
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useId, useState } from "react";
 import { AlertTriangle } from "lucide-react";
 import {
   DEFAULT_VOICE_SETTINGS,
@@ -72,6 +72,7 @@ import {
   MAX_TOKEN_CEILING,
   MIN_TOKEN_CEILING,
   VOICE_INTENT_BACKENDS,
+  VOICE_LABEL_SHARING,
   VOICE_STAGE_PRESETS,
   VOICE_TRANSCRIPTION_BACKENDS,
   type SecretStatusDto,
@@ -101,6 +102,34 @@ const INTENT_LABELS: Record<string, string> = {
   anthropic: "Anthropic API — needs an Anthropic API key",
   openai_compatible: "OpenAI-compatible API — needs that provider's API key",
 };
+
+/**
+ * The Names row's options (PRD #1223, audit finding A1): whether each command
+ * sends the names on screen to the Commands endpoint.
+ */
+const LABEL_SHARING_LABELS: Record<string, string> = {
+  shared: "Shared",
+  withheld: "Withheld",
+};
+
+/**
+ * What every command sends, whatever the Names row says. Verified against the
+ * code rather than summarised from it: the transcript is `IntentRequest`'s
+ * `transcript`; the command list is `prompt::commands_state` — each row's id,
+ * description, params and `callable` flag plus its unavailable hint; and the
+ * two local fast paths are `outcome::local_intercept`.
+ */
+export const INTENT_DISCLOSURE = "Each command sends the Commands endpoint the words heard and this app's command list — every command's name, description and parameters, and whether it can run on the screen you are on. A dictation that starts with a recognised opener (\u201ctype \u2026\u201d) and a bare submit phrase are decided on this machine and send nothing.";
+
+/**
+ * What Names = Shared adds — `prompt::state`, field by field. Not sent in
+ * either mode: any path, deck or agent id, the deck's default directory, file
+ * metadata, a prompt typed into an agent, or a running tool's arguments.
+ */
+export const INTENT_DISCLOSURE_SHARED = "With Names shared it also sends the names on screen: each agent on the selected deck with its role, CLI name, live status and the tool it is running; every deck's label, which for a remote deck is its SSH user, host and any non-default port; while the New agent dialog shows a directory, up to 200 directory names from it and whether it has a parent; the dialog's Mode chips (including the project's orchestration names) and Agent picker entries; and each orchestration's title and roles. Never a path, an id, a prompt you typed or a tool's arguments.";
+
+/** What Names = Withheld leaves out, and what it costs. */
+export const INTENT_DISCLOSURE_WITHHELD = "With Names withheld it sends nothing else, so the commands that name an agent, deck, directory, mode, agent type or orchestration are unavailable.";
 
 /** The token the speech backend takes when it authenticates with a key. */
 const KEYED = "remote";
@@ -179,6 +208,9 @@ export function VoicePanel({ settings, onSave, saveError }: SettingsPanelProps) 
   // Materialised here for display; a save writes the whole section, which is
   // the first moment this build says anything about it.
   const voice = settings.voice ?? DEFAULT_VOICE_SETTINGS;
+  // Per instance, for AppearancePanel's reason: two panels in one document
+  // must not share the id a radiogroup is named by.
+  const namesLabelId = useId();
 
   const saveVoice = (next: VoiceSettingsDto) => onSave({ ...settings, voice: next });
 
@@ -244,6 +276,41 @@ export function VoicePanel({ settings, onSave, saveError }: SettingsPanelProps) 
       </div>
 
       <StageFields stage="intent" value={voice.intent} onSave={saveStage} />
+
+      {/* PRD #1223, audit finding A1 — what leaves the machine on each
+          command, beside the endpoint it goes to. Panel prose clears
+          `docs/develop/desktop-gui.md`'s bar here for the reason the speech
+          hint does: the endpoint may be hosted, and what a user's own deck
+          labels and directory names are sent to is a consequence they act on
+          (the Names row below). Every clause is checked against the code:
+          `voice::prompt::state` and `commands_state`, `outcome::local_intercept`,
+          and `DIRECTORY_NAMES_SHOWN` (200). */}
+      <p className="settings-hint" data-testid="voice-intent-disclosure">
+        {INTENT_DISCLOSURE}
+        {" "}{voice.labels === "withheld" ? INTENT_DISCLOSURE_WITHHELD : INTENT_DISCLOSURE_SHARED}
+      </p>
+
+      {/* Two short exclusive options, so a segmented control rather than a
+          select — `desktop-gui.md`'s cardinality rule, with AppearancePanel's
+          span + `aria-labelledby` radiogroup shape. The consequence of each is
+          the disclosure sentence above, which changes with it. */}
+      <div className="settings-row">
+        <span className="settings-row-label" id={namesLabelId}>Names</span>
+        <div className="segmented" role="radiogroup" aria-labelledby={namesLabelId}>
+          {VOICE_LABEL_SHARING.map((token) => (
+            <label key={token} className={token === voice.labels ? "is-selected" : ""}>
+              <input
+                type="radio"
+                name="voice-labels"
+                value={token}
+                checked={token === voice.labels}
+                onChange={() => saveVoice({ ...voice, labels: token })}
+              />
+              <span>{LABEL_SHARING_LABELS[token]}</span>
+            </label>
+          ))}
+        </div>
+      </div>
 
       {/* Commands only. A transcription is as long as the audio was, so a
           ceiling on the speech stage would bound nothing the user chose.

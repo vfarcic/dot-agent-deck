@@ -202,15 +202,16 @@ pub use capture::{
 pub use hold::VoiceHold;
 pub use outcome::{
     ChoiceMatch, DeckRefMatch, DirRefMatch, ResolvedParam, VoiceOutcome, VoiceResult,
-    handle_utterance, resolve_agent_type_ref, resolve_deck_ref, resolve_dir_ref, resolve_mode_ref,
+    handle_utterance, handle_utterance_with, resolve_agent_type_ref, resolve_deck_ref,
+    resolve_dir_ref, resolve_mode_ref,
 };
 pub use remote::{Protocol, REMOTE_TIMEOUT, RemoteResolver};
 pub use resolver::{
     IntentAnswer, IntentError, IntentRequest, IntentResolver, StubResolver, resolver_for,
 };
 pub use schema::{
-    AnnotatedCommand, AnnotatedParam, TOOL_INSTRUCTIONS, TOOL_NAME, annotate, annotate_with,
-    tool_schema,
+    AnnotatedCommand, AnnotatedParam, LABELS_WITHHELD_HINT, TOOL_INSTRUCTIONS, TOOL_NAME, annotate,
+    annotate_for, annotate_with, needs_labels, tool_schema,
 };
 pub use table::{
     CommandRow, CommandTable, NO_MATCH_ACTION, ParamKind, ParamSpec, Requirement, Screen, table,

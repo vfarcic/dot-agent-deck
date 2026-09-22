@@ -385,6 +385,13 @@ export interface VoiceSettingsDto {
   activation: string;
   intent: VoiceIntentStageDto;
   transcription: VoiceStageDto;
+  /**
+   * Whether each command request carries the names the app observed — agents,
+   * decks, directories on screen, the New agent form's chips and picker,
+   * orchestrations — or only the words heard and the command table (PRD
+   * #1223, audit finding A1). One of `VOICE_LABEL_SHARING`.
+   */
+  labels: string;
 }
 
 /**
@@ -540,6 +547,13 @@ export const VOICE_INTENT_BACKENDS = ["anthropic", "openai_compatible"] as const
 export const VOICE_TRANSCRIPTION_BACKENDS = ["local", "remote"] as const;
 
 /**
+ * Whether the command backend is shown the names on screen (PRD #1223, audit
+ * finding A1). `shared` is the default. Keep identical to
+ * `LabelSharing::TOKENS` in `src-tauri/src/settings.rs`.
+ */
+export const VOICE_LABEL_SHARING = ["shared", "withheld"] as const;
+
+/**
  * The bounds and the default for the command stage's answer ceiling.
  *
  * Mirrors `MIN_TOKEN_CEILING`, `MAX_TOKEN_CEILING` and `DEFAULT_TOKEN_CEILING`
@@ -614,6 +628,7 @@ export const DEFAULT_VOICE_SETTINGS: VoiceSettingsDto = {
   activation: "toggle",
   intent: VOICE_STAGE_PRESETS.intent.openai_compatible,
   transcription: VOICE_STAGE_PRESETS.transcription.local,
+  labels: "shared",
 };
 
 /**
@@ -1013,10 +1028,13 @@ function normalizeVoiceSettings(value: unknown): VoiceSettingsDto | undefined {
   const record = value as Record<string, unknown>;
   const activation = VOICE_ACTIVATION_MODES.find((candidate) => candidate === record.activation)
     ?? DEFAULT_VOICE_SETTINGS.activation;
+  const labels = VOICE_LABEL_SHARING.find((candidate) => candidate === record.labels)
+    ?? DEFAULT_VOICE_SETTINGS.labels;
   return {
     activation,
     intent: normalizeVoiceIntentStage(record.intent),
     transcription: normalizeVoiceStage(record.transcription, VOICE_TRANSCRIPTION_BACKENDS, DEFAULT_VOICE_SETTINGS.transcription, VOICE_STAGE_PRESETS.transcription),
+    labels,
   };
 }
 

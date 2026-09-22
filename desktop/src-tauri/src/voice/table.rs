@@ -147,6 +147,29 @@ impl ParamKind {
     pub fn parse(value: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|kind| kind.as_str() == value)
     }
+
+    /// Whether a value of this kind is one of the NAMES the app observed — an
+    /// agent, a deck, a directory on screen, a Mode chip, an Agent picker
+    /// entry, an orchestration (PRD #1223, audit finding A1).
+    ///
+    /// Such a param is resolvable only when the model was shown the names it
+    /// resolves against, so with the voice settings' `labels = "withheld"` a
+    /// row that takes one reports itself unavailable instead of resolving
+    /// against a model that saw none of them. Exhaustive, so a new kind has to
+    /// decide which side it is on.
+    pub fn names_something_observed(self) -> bool {
+        match self {
+            ParamKind::AgentRef
+            | ParamKind::DeckRef
+            | ParamKind::DirRef
+            | ParamKind::ModeRef
+            | ParamKind::AgentTypeRef
+            | ParamKind::OrchestrationRef => true,
+            // The user's own words, verified against the transcript; nothing
+            // observed is involved.
+            ParamKind::SpokenPrefix => false,
+        }
+    }
 }
 
 impl fmt::Display for ParamKind {

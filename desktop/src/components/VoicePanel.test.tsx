@@ -1,6 +1,6 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { VoicePanel } from "./VoicePanel";
+import { INTENT_DISCLOSURE, INTENT_DISCLOSURE_SHARED, INTENT_DISCLOSURE_WITHHELD, VoicePanel } from "./VoicePanel";
 import {
   DEFAULT_DESKTOP_SETTINGS,
   DEFAULT_VOICE_SETTINGS,
@@ -69,6 +69,7 @@ const BOTH_KEYED = {
     activation: "toggle",
     intent: VOICE_STAGE_PRESETS.intent.anthropic,
     transcription: VOICE_STAGE_PRESETS.transcription.remote,
+    labels: "shared",
   },
 };
 
@@ -191,9 +192,39 @@ describe("VoicePanel", () => {
           activation: "toggle",
           intent: VOICE_STAGE_PRESETS.intent.openai_compatible,
           transcription: VOICE_STAGE_PRESETS.transcription.remote,
+          labels: "shared",
         },
       }),
     );
+  });
+
+  /**
+   * PRD #1223, audit finding A1: the panel says what each command sends to
+   * the Commands endpoint, and the Names row decides whether the names on
+   * screen are part of it.
+   */
+  it("says what each command sends, and changes the sentence with the Names row", () => {
+    const { onSave } = renderPanel({ voice: undefined });
+    const disclosure = screen.getByTestId("voice-intent-disclosure");
+    expect(disclosure).toHaveTextContent(INTENT_DISCLOSURE);
+    expect(disclosure).toHaveTextContent(INTENT_DISCLOSURE_SHARED);
+    expect(disclosure).toHaveTextContent("SSH user, host and any non-default port");
+    expect(disclosure).toHaveTextContent("up to 200 directory names");
+    const names = screen.getByRole("radiogroup", { name: "Names" });
+    expect(within(names).getByLabelText("Shared")).toBeChecked();
+
+    fireEvent.click(within(names).getByLabelText("Withheld"));
+    expect(onSave).toHaveBeenCalledWith(
+      expect.objectContaining({ voice: { ...DEFAULT_VOICE_SETTINGS, labels: "withheld" } }),
+    );
+  });
+
+  it("says what a withheld Names row costs", () => {
+    renderPanel({ voice: { ...DEFAULT_VOICE_SETTINGS, labels: "withheld" } });
+    const disclosure = screen.getByTestId("voice-intent-disclosure");
+    expect(disclosure).toHaveTextContent(INTENT_DISCLOSURE_WITHHELD);
+    expect(disclosure).not.toHaveTextContent(INTENT_DISCLOSURE_SHARED);
+    expect(within(screen.getByRole("radiogroup", { name: "Names" })).getByLabelText("Withheld")).toBeChecked();
   });
 
   /**
