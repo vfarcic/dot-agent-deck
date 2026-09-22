@@ -348,8 +348,13 @@ export function NewAgentDialog({ runtime, initialDeckId, onClose, onAppeared, on
    * List `path` on the captured deck (its home when absent), then put the
    * cursor on `focusPath` — the directory just left, when going up — or else
    * on the first subdirectory rather than on `..`.
+   *
+   * `homeOnFailure` is the deck's configured default directory's fallback
+   * (PRD #1223): the deck vetted that path when it answered the options query,
+   * but it can vanish before the listing lands, and a browser that opened on an
+   * error would be a worse start than the home it replaces.
    */
-  const loadListing = useCallback(async (deckId: string, path?: string, focusPath?: string) => {
+  const loadListing = useCallback(async (deckId: string, path?: string, focusPath?: string, homeOnFailure = false) => {
     const seq = ++listingSeq.current;
     setListingError(undefined);
     setListingState((current) => (current === "ready" ? current : "loading"));
@@ -375,6 +380,10 @@ export function NewAgentDialog({ runtime, initialDeckId, onClose, onAppeared, on
         deckGone(message);
         return;
       }
+      if (homeOnFailure && path !== undefined) {
+        void loadListing(deckId);
+        return;
+      }
       setListingError(message);
       setListingState((current) => (current === "ready" ? current : "failed"));
     }
@@ -382,9 +391,18 @@ export function NewAgentDialog({ runtime, initialDeckId, onClose, onAppeared, on
 
   /**
    * Choosing a deck in the deck field: capture its wire id — once, here — and
-   * ask THAT deck for its home listing and its new-agent options. Choosing the
-   * deck already chosen changes nothing and only moves on to the browser, so
-   * Enter on a preselected deck does what the wizard's one keystroke did.
+   * ask THAT deck for its new-agent options and then its first listing. Choosing
+   * the deck already chosen changes nothing and only moves on to the browser,
+   * so Enter on a preselected deck does what the wizard's one keystroke did.
+   *
+   * **The listing waits for the options, deliberately** (PRD #1223): the
+   * options carry the deck's configured `defaultDir`, and the browser opens
+   * THERE when the deck names one — the folder most agents on that deck are
+   * started under — and in the daemon user's home otherwise. Listing home in
+   * parallel and then jumping would flash one directory and land on another.
+   * `..` still walks above the default; it is a starting point, not a root.
+   * An options query that fails for any reason but a lost deck still lists
+   * home, so the browser never waits on a setting.
    */
   const chooseDeck = (choice: DeckChoice | undefined) => {
     if (!choice || choice.reason !== undefined || phase !== "idle") return;
@@ -396,22 +414,27 @@ export function NewAgentDialog({ runtime, initialDeckId, onClose, onAppeared, on
     setDeckNotice(undefined);
     setListingState("loading");
     const deckId = choice.deckId;
-    void loadListing(deckId);
     const seq = ++optionsSeq.current;
     void (async () => {
+      let startAt: string | undefined;
       try {
         const answer = await runtime.newAgentOptions(deckId);
         if (seq !== optionsSeq.current) return;
         setOptions(answer);
+        if (answer.kind === "deck") startAt = answer.defaultDir;
         if (!commandTouched.current) {
           setCommand(answer.kind === "deck" ? seedCommand(answer.defaultCommand, answer.lastCommand) : seedCommand(undefined, answer.lastCommand));
         }
       } catch (cause) {
         if (seq !== optionsSeq.current) return;
         const message = messageOf(cause);
-        if (isDeckGoneError(message)) deckGone(message);
-        else setOptionsError(message);
+        if (isDeckGoneError(message)) {
+          deckGone(message);
+          return;
+        }
+        setOptionsError(message);
       }
+      void loadListing(deckId, startAt, undefined, startAt !== undefined);
     })();
   };
 

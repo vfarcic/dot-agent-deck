@@ -122,6 +122,26 @@ pub struct NewAgentOptions {
     /// default; otherwise verbatim, as the TUI's own prefill uses it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_command: Option<String>,
+    /// `DashboardConfig.default_dir` from the same file — the directory a
+    /// client's browser opens in instead of the daemon user's home (PRD #1223).
+    ///
+    /// **Validated, canonicalised, and absent rather than an error** when it is
+    /// anything but a readable directory ([`usable_default_dir`]): unset,
+    /// relative, a control character in it, missing, a file, unreadable, or a
+    /// canonical form that is not UTF-8. A bad setting must never fail the
+    /// options query — the form then has no default command either, which is a
+    /// worse outcome than browsing from home. Canonical because the value goes
+    /// straight back to [`crate::daemon_protocol::AttachRequest::ListDirectories`],
+    /// whose own boundary check it therefore already passes.
+    ///
+    /// **An additive optional field on a reply this PRD introduced**, already
+    /// gated behind [`crate::daemon_protocol::CAP_NEW_AGENT_OPTIONS`]: an older
+    /// client ignores it (the struct sets no `deny_unknown_fields`), and a
+    /// daemon predating it simply omits it, which a newer client reads as
+    /// "open in home". No capability of its own and no `PROTOCOL_VERSION` move
+    /// — the protocol's written "Do NOT bump" case.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_dir: Option<String>,
     /// The agent registry this daemon was built with
     /// ([`crate::agent_registry::ALL`]), in registry order.
     #[serde(default)]
@@ -174,10 +194,12 @@ pub fn for_this_daemon() -> NewAgentOptions {
 }
 
 /// [`for_this_daemon`]'s projection, with its two inputs passed in so it is
-/// testable without a config file or the process-global flag.
+/// testable without a config file or the process-global flag. It touches the
+/// filesystem only to vet [`DashboardConfig::default_dir`].
 pub fn compose(config: &DashboardConfig, experimental: bool) -> NewAgentOptions {
     NewAgentOptions {
         default_command: Some(config.default_command.clone()).filter(|c| !c.is_empty()),
+        default_dir: usable_default_dir(&config.default_dir),
         agents: registry_agents(),
         experimental,
         authoring_kinds: crate::authoring_seeds::AuthoringKind::ALL
@@ -185,6 +207,33 @@ pub fn compose(config: &DashboardConfig, experimental: bool) -> NewAgentOptions 
             .map(|kind| kind.as_str().to_string())
             .collect(),
     }
+}
+
+/// The configured default directory, if it is one a listing would accept —
+/// or `None`, never an error (see [`NewAgentOptions::default_dir`]).
+///
+/// The same three gates a caller-supplied listing path passes, in the same
+/// order: the wire-boundary predicate
+/// ([`crate::agent_pty::is_valid_orchestration_cwd`] — absolute, bounded, no
+/// control characters) before any filesystem access, then the project reader's
+/// canonicaliser (a directory, UTF-8), then the canonical form through the
+/// predicate again, because resolving a symlink can lengthen a path. Finally
+/// the directory has to OPEN, so a `0o000` directory is reported absent rather
+/// than handed to a browser whose first listing would fail. Opening a
+/// directory reads nothing, so this cannot block on a FIFO: the canonicaliser
+/// has already refused anything that is not a directory.
+pub fn usable_default_dir(raw: &str) -> Option<String> {
+    if raw.is_empty() || !crate::agent_pty::is_valid_orchestration_cwd(raw) {
+        return None;
+    }
+    let canonical =
+        crate::project_resolve::canonicalize_project_dir(std::path::Path::new(raw)).ok()?;
+    let text = canonical.to_str()?.to_string();
+    if !crate::agent_pty::is_valid_orchestration_cwd(&text) {
+        return None;
+    }
+    std::fs::read_dir(&canonical).ok()?;
+    Some(text)
 }
 
 /// [`crate::agent_registry::ALL`] projected onto the wire, in registry order.
@@ -208,6 +257,95 @@ pub fn registry_agents() -> Vec<AgentOption> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn config_with_dir(default_dir: &str) -> DashboardConfig {
+        DashboardConfig {
+            default_dir: default_dir.to_string(),
+            ..DashboardConfig::default()
+        }
+    }
+
+    /// Scenario (PRD #1223): a deck whose config names an existing directory
+    /// reports it, canonicalised, beside its default command.
+    #[test]
+    fn a_set_default_dir_is_served_canonicalised() {
+        let root = tempfile::tempdir().unwrap();
+        let reports = root.path().join("reports");
+        std::fs::create_dir(&reports).unwrap();
+        let canonical = std::fs::canonicalize(&reports).unwrap();
+        let options = compose(&config_with_dir(reports.to_str().unwrap()), false);
+        assert_eq!(options.default_dir.as_deref(), canonical.to_str());
+        // A spelling with `..` in it names the same directory and is reported
+        // in its canonical form, which is what a listing request would accept.
+        let dotted = root.path().join("reports").join("..").join("reports");
+        assert_eq!(
+            compose(&config_with_dir(dotted.to_str().unwrap()), false).default_dir,
+            options.default_dir
+        );
+    }
+
+    /// Scenario (PRD #1223): unset, relative, missing, a file, or a control
+    /// character — each is reported ABSENT, and the rest of the reply is still
+    /// served, so a bad setting never breaks the options query.
+    #[test]
+    fn an_unusable_default_dir_is_absent_and_never_fails_the_query() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("not-a-dir");
+        std::fs::write(&file, "x").unwrap();
+        let missing = root.path().join("gone");
+        let control = format!("{}/bad\u{1b}[31m", root.path().display());
+        for raw in [
+            "",
+            "relative/path",
+            "./x",
+            missing.to_str().unwrap(),
+            file.to_str().unwrap(),
+            control.as_str(),
+        ] {
+            let mut config = config_with_dir(raw);
+            config.default_command = "claude".to_string();
+            let options = compose(&config, false);
+            assert_eq!(options.default_dir, None, "{raw:?}");
+            assert_eq!(
+                options.default_command.as_deref(),
+                Some("claude"),
+                "{raw:?}"
+            );
+            assert!(!options.agents.is_empty(), "{raw:?}");
+        }
+    }
+
+    /// Scenario (PRD #1223): a directory the daemon user cannot open is
+    /// absent — the browser would otherwise open on a listing that fails.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_default_dir_is_absent() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let locked = root.path().join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // Root can open anything, so the property is only observable as a
+        // user the mode actually binds.
+        let binds = std::fs::read_dir(&locked).is_err();
+        let served = usable_default_dir(locked.to_str().unwrap());
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        if binds {
+            assert_eq!(served, None);
+        }
+    }
+
+    /// The field is additive and optional on the wire: omitted when absent, and
+    /// a reply from a daemon predating it deserialises with it `None`.
+    #[test]
+    fn the_wire_shape_omits_an_absent_default_dir_and_reads_one_from_an_older_daemon() {
+        let json = serde_json::to_value(compose(&config_with(""), false)).unwrap();
+        assert!(json.get("default_dir").is_none());
+        let older: NewAgentOptions =
+            serde_json::from_value(serde_json::json!({ "agents": [], "experimental": false }))
+                .unwrap();
+        assert_eq!(older.default_dir, None);
+    }
 
     fn config_with(default_command: &str) -> DashboardConfig {
         DashboardConfig {

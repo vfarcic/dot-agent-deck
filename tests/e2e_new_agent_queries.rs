@@ -388,3 +388,78 @@ fn newagent_options_001_reports_host_config_registry_features_and_capabilities()
         );
     }
 }
+
+/// Scenario: Launch three daemons whose host-side DashboardConfig names a real
+/// directory (through a symlinked spelling), a directory that does not exist,
+/// and a relative path. The first reply carries that directory's canonical
+/// path as `default_dir`, and listing it back succeeds; the other two omit
+/// `default_dir` and still answer every other field, because a bad setting
+/// must never fail the options query.
+#[spec("newagent/options/002")]
+#[test]
+fn newagent_options_002_serves_a_usable_default_dir_and_omits_a_bad_one() {
+    const CONFIGURED_COMMAND: &str = "new-agent-options-default-dir-command";
+
+    let fixture = common::harness_tempdir().expect("mint default-dir fixture");
+    let reports = fixture.path().join("reports");
+    std::fs::create_dir(&reports).expect("create the default directory");
+    std::fs::create_dir(reports.join("weekly")).expect("create a child to list");
+    let link = fixture.path().join("reports-link");
+    std::os::unix::fs::symlink(&reports, &link).expect("symlink the default directory");
+    let missing = fixture.path().join("no-such-dir");
+
+    let daemon_with = |label: &str, default_dir: &str| {
+        let path = fixture.path().join(format!("{label}.toml"));
+        std::fs::write(
+            &path,
+            format!("default_command = {CONFIGURED_COMMAND:?}\ndefault_dir = {default_dir:?}\n"),
+        )
+        .expect("write daemon DashboardConfig");
+        common::spawn_daemon_serve_with_env(
+            None,
+            "0",
+            &[("DOT_AGENT_DECK_CONFIG", wire_path(&path).as_str())],
+        )
+    };
+
+    let usable = daemon_with("usable", &wire_path(&link));
+    let response = send_json_request(&usable, &json!({"op": "new-agent-options"}));
+    assert_options(&response, false, CONFIGURED_COMMAND);
+    let served = successful_payload(&response, "new_agent_options", "NewAgentOptions")
+        .get("default_dir")
+        .and_then(Value::as_str)
+        .expect("a usable default_dir is served")
+        .to_string();
+    assert_eq!(
+        served,
+        wire_path(&canonical(&reports)),
+        "default_dir is reported canonical, symlink resolved"
+    );
+    let listing = send_json_request(&usable, &json!({"op": "list-directories", "path": served}));
+    let names: Vec<&str> = directory_listing(&listing)
+        .get("entries")
+        .and_then(Value::as_array)
+        .expect("a directory listing must carry entries")
+        .iter()
+        .filter_map(|entry| entry.get("name").and_then(Value::as_str))
+        .collect();
+    assert_eq!(
+        names,
+        vec!["weekly"],
+        "the served default_dir is a path ListDirectories accepts back"
+    );
+
+    for (label, default_dir) in [
+        ("missing", wire_path(&missing)),
+        ("relative", "relative/reports".to_string()),
+    ] {
+        let daemon = daemon_with(label, &default_dir);
+        let response = send_json_request(&daemon, &json!({"op": "new-agent-options"}));
+        assert_options(&response, false, CONFIGURED_COMMAND);
+        let options = successful_payload(&response, "new_agent_options", "NewAgentOptions");
+        assert!(
+            options.get("default_dir").is_none(),
+            "a {label} default_dir is omitted rather than failing the query: {options}"
+        );
+    }
+}

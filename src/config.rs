@@ -9,6 +9,10 @@ use crate::state::SessionStatus;
 pub const CONFIG_KEYS: &[(&str, &str)] = &[
     ("default_command", "Default shell command for new panes"),
     (
+        "default_dir",
+        "Absolute directory the desktop's New agent browser opens in (default: home)",
+    ),
+    (
         "auto_config_prompt",
         "Enable/disable the config generation prompt (default: true)",
     ),
@@ -110,6 +114,17 @@ impl BellConfig {
 #[serde(default)]
 pub struct DashboardConfig {
     pub default_command: String,
+    /// PRD #1223: the directory a new-agent form's browser opens in on this
+    /// deck — typically the one folder most agents here are started under.
+    ///
+    /// Stored verbatim; empty means unset. What a client is TOLD is
+    /// [`crate::new_agent_options::NewAgentOptions::default_dir`], which is
+    /// this value validated (absolute, the orchestration-cwd predicate) and
+    /// canonicalised — or absent when it fails, so a bad setting never breaks
+    /// the options query. Not serialised when empty, so a `config set` of an
+    /// unrelated key does not write `default_dir = ""` into the file.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub default_dir: String,
     pub bell: BellConfig,
     pub auto_config_prompt: bool,
 }
@@ -118,6 +133,7 @@ impl Default for DashboardConfig {
     fn default() -> Self {
         Self {
             default_command: String::new(),
+            default_dir: String::new(),
             bell: BellConfig::default(),
             auto_config_prompt: true,
         }
@@ -204,6 +220,7 @@ impl DashboardConfig {
     pub fn get_field(&self, key: &str) -> Result<String, String> {
         match key {
             "default_command" => Ok(self.default_command.clone()),
+            "default_dir" => Ok(self.default_dir.clone()),
             "bell.enabled" => Ok(self.bell.enabled.to_string()),
             "bell.on_waiting_for_input" => Ok(self.bell.on_waiting_for_input.to_string()),
             "bell.on_idle" => Ok(self.bell.on_idle.to_string()),
@@ -220,6 +237,19 @@ impl DashboardConfig {
         match key {
             "default_command" => {
                 self.default_command = value.to_string();
+                Ok(())
+            }
+            "default_dir" => {
+                // Refused here as well as at read time, so a typo is caught
+                // by the command that made it rather than by a browser that
+                // quietly opens in home. Empty unsets it.
+                if !value.is_empty() && !crate::agent_pty::is_valid_orchestration_cwd(value) {
+                    return Err(format!(
+                        "Invalid default_dir: {value:?} is not an absolute path \
+                         (empty unsets it)"
+                    ));
+                }
+                self.default_dir = value.to_string();
                 Ok(())
             }
             "bell.enabled" => {
@@ -2344,6 +2374,28 @@ timeout_secs = 600
             !CONFIG_KEYS.iter().any(|(k, _)| k.starts_with("idle_art.")),
             "no idle_art.* key should remain in the `config set --help` listing"
         );
+    }
+
+    /// PRD #1223: `config set default_dir` takes an absolute path, refuses a
+    /// relative one, unsets on empty, and an unset key is not written back.
+    #[test]
+    fn default_dir_is_settable_absolute_only_and_omitted_when_empty() {
+        let mut dc = DashboardConfig::default();
+        assert_eq!(dc.get_field("default_dir").unwrap(), "");
+        dc.set_field("default_dir", "/srv/reports").unwrap();
+        assert_eq!(dc.get_field("default_dir").unwrap(), "/srv/reports");
+        assert!(dc.set_field("default_dir", "reports").is_err());
+        assert_eq!(dc.default_dir, "/srv/reports");
+        assert!(
+            toml::to_string_pretty(&dc)
+                .unwrap()
+                .contains("default_dir = \"/srv/reports\"")
+        );
+        dc.set_field("default_dir", "").unwrap();
+        assert!(!toml::to_string_pretty(&dc).unwrap().contains("default_dir"));
+        let parsed: DashboardConfig = toml::from_str("default_dir = \"/srv/x\"").unwrap();
+        assert_eq!(parsed.default_dir, "/srv/x");
+        assert!(CONFIG_KEYS.iter().any(|(key, _)| *key == "default_dir"));
     }
 
     #[test]

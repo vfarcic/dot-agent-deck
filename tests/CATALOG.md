@@ -5858,6 +5858,13 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Does not assert:** the contents of `authoring_kinds`, which `newagent/authoring/001` pins as the three supported authoring kinds; authoring seed delivery (`newagent/authoring/001`–`002`); desktop fallback behaviour against a daemon missing either capability; any agent binary's availability on PATH; the desktop form's rendering and selection rules.
 - **Platform coverage:** mac+linux (`#![cfg(all(feature = "e2e", unix))]` — `DaemonProc` binds Unix-domain sockets).
 
+##### newagent/options/002 — `NewAgentOptions` serves a usable `default_dir` canonicalised and omits an unusable one.
+- **Layer:** L2 lane 1 (three headless `daemon serve` processes driven over their attach sockets, each pointed at its own `DashboardConfig` through `DOT_AGENT_DECK_CONFIG`; no PTY or TUI surface).
+- **Agent:** none. The daemons read config and list test-owned directories; nothing is spawned and no credential is spent.
+- **Asserts:** a `default_dir` naming a real directory through a symlink is served as that directory's canonical path, and a `ListDirectories` of the served path succeeds and lists its child; a `default_dir` naming a missing directory, and one that is relative, are each omitted from the reply while `default_command`, the registry projection and `experimental` are still served (`assert_options`), so a bad setting never fails the query.
+- **Does not assert:** an unreadable (`0o000`) directory, a file, or a control character in the path (unit-tested in `new_agent_options`); the desktop browser opening at the served path or falling back to home (`NewAgentDialog.test.tsx`); `config set default_dir` (unit-tested in `config`).
+- **Platform coverage:** mac+linux (`#![cfg(all(feature = "e2e", unix))]` — `DaemonProc` binds Unix-domain sockets and the fixture uses a Unix symlink).
+
 #### newagent/authoring
 
 ##### newagent/authoring/001 — Every authoring kind delivers the TUI's seed text once and is capability-advertised.

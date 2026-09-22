@@ -19,6 +19,18 @@ dot-agent-deck config get default_command
 
 When `default_command` is **unset or empty**, the new-pane form's Command field is instead pre-filled with your **last command** — the most recent command you launched from the new-agent form, in any mode (schedule / issue-dispatch authoring included). This value is global, persists across deck restarts, and is only ever pre-filled into the editable field (never auto-run), so you can edit or clear it before you submit. On a fresh install — where you have never launched a command from the form — the field starts blank. An explicit `default_command` always takes precedence over this last-command fallback.
 
+## Default Directory
+
+```bash
+# The directory the desktop app's New agent browser opens in on this deck
+dot-agent-deck config set default_dir "/home/me/reports"
+
+# Unset it (the browser opens in your home directory again)
+dot-agent-deck config set default_dir ""
+```
+
+`default_dir` is where the desktop app's **New agent** dialog starts browsing when you create an agent on this deck — useful when most of your agents here are started in the same place. It is a starting point, not a limit: `..` still walks above it. It must be an absolute path; `config set` refuses anything else. Because it is read on the deck's own host, a remote deck uses the value in *its* config file, not yours. If the directory is missing, is not a directory, or cannot be opened, the dialog simply opens in your home directory as before. The TUI's directory picker does not read it yet.
+
 ## Environment Variables
 
 | Variable | Default | Description |

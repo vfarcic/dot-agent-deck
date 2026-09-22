@@ -1130,6 +1130,13 @@ pub enum DesktopNewAgentOptions {
         /// the Command field's first prefill and goes back on the start.
         #[serde(skip_serializing_if = "Option::is_none")]
         default_command: Option<String>,
+        /// The deck host's configured `default_dir` (PRD #1223), canonical and
+        /// already vetted by the deck — absent when unset or unusable. It is
+        /// never rendered from here: the form sends it back as the first
+        /// directory listing's path, and what the user reads is that
+        /// listing's own `displayPath`.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        default_dir: Option<String>,
         /// The agent registry the DECK was built with, in its order.
         agents: Vec<DesktopAgentOption>,
         /// The deck's own experimental flag.

@@ -111,7 +111,7 @@ describe("the overview's New agent entry points (PRD #1223 M4)", () => {
    * flow with that deck chosen, and asks that deck — and no other — for its
    * home.
    */
-  it("opens the flow from a deck group's header with that deck preselected", () => {
+  it("opens the flow from a deck group's header with that deck preselected", async () => {
     const current = runtime();
     render(<AgentOverview runtime={current} onNavigate={vi.fn()} />);
     const headers = screen.getAllByTestId("daemon-new-agent");
@@ -122,7 +122,9 @@ describe("the overview's New agent entry points (PRD #1223 M4)", () => {
 
     expect(highlightedDeck()).toBe(FIXTURE_REMOTE_DAEMON_ID);
     expect(screen.getByTestId("new-agent-chosen-deck")).toBeVisible();
-    expect(current.listDirectories).toHaveBeenCalledTimes(1);
+    // The first listing follows the deck's options answer (PRD #1223's
+    // `defaultDir`), so it is awaited rather than read synchronously.
+    await waitFor(() => expect(current.listDirectories).toHaveBeenCalledTimes(1));
     expect(current.listDirectories).toHaveBeenCalledWith(FIXTURE_REMOTE_DAEMON_ID, undefined);
   });
 

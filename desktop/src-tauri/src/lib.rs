@@ -2058,6 +2058,7 @@ async fn new_agent_options_on(
     Ok(match answer {
         GatedQuery::Answered(options) => DesktopNewAgentOptions::Deck {
             default_command: options.default_command,
+            default_dir: options.default_dir,
             agents: options
                 .agents
                 .into_iter()

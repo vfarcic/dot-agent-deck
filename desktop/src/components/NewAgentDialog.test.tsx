@@ -470,6 +470,71 @@ describe("New agent dialog — going up (PRD #1223 U3)", () => {
   });
 });
 
+describe("New agent dialog — the deck's default directory (PRD #1223)", () => {
+  /**
+   * Scenario: the deck's config names `default_dir = "/home/dev/beta"`. The
+   * browser opens THERE — not in home, and without listing home first — and
+   * its `..` row still walks above it, back to home and beyond.
+   */
+  it("opens the browser in the deck's default directory, and .. still walks above it", async () => {
+    const runtime = fakeRuntime({ newAgentOptions: vi.fn(async (): Promise<NewAgentOptions> => ({ ...structuredClone(DECK_OPTIONS), defaultDir: "/home/dev/beta" })) });
+    renderDialog(runtime);
+
+    await currentPath("/home/dev/beta");
+    expect(runtime.listDirectories).toHaveBeenCalledTimes(1);
+    expect(runtime.listDirectories).toHaveBeenCalledWith(LOCAL, "/home/dev/beta");
+    expect(activeRow()).toBe("/home/dev/beta/leaf");
+
+    const up = within(directoryList()).getAllByRole("option")[0];
+    expect(up).toHaveTextContent("..");
+    fireEvent.click(up);
+    await currentPath("/home/dev");
+    expect(activeRow()).toBe("/home/dev/beta");
+  });
+
+  /**
+   * Scenario: no default directory is configured — or the deck is older than
+   * the setting and never names one. The browser opens in the daemon user's
+   * home, as it always has.
+   */
+  it.each([
+    ["no default directory is configured", DECK_OPTIONS],
+    ["the deck is older than the options query", { kind: "unsupported", desktopAgents: [] } as NewAgentOptions],
+  ])("opens in home when %s", async (_case, options) => {
+    const runtime = fakeRuntime({ newAgentOptions: vi.fn(async (): Promise<NewAgentOptions> => structuredClone(options)) });
+    renderDialog(runtime);
+
+    await currentPath("/home/dev");
+    expect(runtime.listDirectories).toHaveBeenCalledTimes(1);
+    expect(runtime.listDirectories).toHaveBeenCalledWith(LOCAL, undefined);
+  });
+
+  /**
+   * Scenario: the deck named a default directory that is gone by the time it
+   * is listed. The browser falls back to home rather than opening on an error.
+   */
+  it("falls back to home when the default directory no longer lists", async () => {
+    const runtime = fakeRuntime({ newAgentOptions: vi.fn(async (): Promise<NewAgentOptions> => ({ ...structuredClone(DECK_OPTIONS), defaultDir: "/home/dev/vanished" })) });
+    renderDialog(runtime);
+
+    await currentPath("/home/dev");
+    expect(vi.mocked(runtime.listDirectories).mock.calls.map(([, path]) => path)).toEqual(["/home/dev/vanished", undefined]);
+    expect(screen.queryByTestId("new-agent-directory-error")).toBeNull();
+  });
+
+  /**
+   * Scenario: the options query itself fails (the deck's query pool is busy).
+   * The browser still opens, in home, so it never waits on a setting.
+   */
+  it("still lists home when the options query fails", async () => {
+    const runtime = fakeRuntime({ newAgentOptions: vi.fn(async (): Promise<NewAgentOptions> => { throw new Error("daemon returned error: busy: too many new-agent queries"); }) });
+    renderDialog(runtime);
+
+    await currentPath("/home/dev");
+    expect(runtime.listDirectories).toHaveBeenCalledWith(LOCAL, undefined);
+  });
+});
+
 describe("New agent dialog — form (PRD #1223 M4)", () => {
   /**
    * Scenario: reach the form against three decks' options. Command is the
@@ -645,7 +710,7 @@ describe("New agent dialog — older decks (PRD #1223 M5)", () => {
    * with that reason, is not chosen even when the flow was opened from it —
    * the one eligible deck is — and neither a click nor the keys choose it.
    */
-  it("disables a deck without the listing verb in the deck field, with the crate's reason", () => {
+  it("disables a deck without the listing verb in the deck field, with the crate's reason", async () => {
     const reason = "This deck does not advertise list-directories, so it cannot be browsed for a directory to start in. Start agents on it from the TUI on its host, or upgrade the deck.";
     const runtime = fakeRuntime({ fleet: [deck(LOCAL, { deckKind: "local" }), deck(REMOTE, { newAgentReason: reason })] });
     renderDialog(runtime, { initialDeckId: REMOTE });
@@ -658,7 +723,9 @@ describe("New agent dialog — older decks (PRD #1223 M5)", () => {
     fireEvent.keyDown(deckList(), { key: "j" });
     fireEvent.keyDown(deckList(), { key: "Enter" });
     // The local deck, the only eligible one, is what the field chose on open.
-    expect(vi.mocked(runtime.listDirectories).mock.calls.map(([deckId]) => deckId)).toEqual([LOCAL]);
+    // Awaited: the first listing follows the options answer (PRD #1223's
+    // `defaultDir`), so it lands a microtask after the choice.
+    await waitFor(() => expect(vi.mocked(runtime.listDirectories).mock.calls.map(([deckId]) => deckId)).toEqual([LOCAL]));
     expect(deckList().querySelector("[data-chosen='true']")).toHaveAttribute("data-deck-id", LOCAL);
   });
 

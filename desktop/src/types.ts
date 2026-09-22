@@ -329,6 +329,12 @@ export type NewAgentOptions =
     kind: "deck";
     /** The deck host's configured `default_command` — Command's first prefill. */
     defaultCommand?: string;
+    /**
+     * The deck host's configured `default_dir` (PRD #1223), canonical and
+     * vetted by the deck; the directory browser opens here instead of home.
+     * Absent when unset or unusable.
+     */
+    defaultDir?: string;
     agents: NewAgentOption[];
     experimental: boolean;
     authoringKinds: string[];
