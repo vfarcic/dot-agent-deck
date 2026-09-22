@@ -27,6 +27,7 @@ import {
   seedCommand,
   suggestOrchestrationName,
   TYPED_PATH_SHAPE_REFUSAL,
+  UNNAMED_CLEANUP_ROLE,
 } from "./newAgent";
 
 describe("New agent rules (PRD #1223 M4)", () => {
@@ -331,6 +332,25 @@ describe("New agent rules — cleanup the launch could not confirm (PRD #1223 au
       overflow: 0,
     });
     expect(cleanupWarning(["plan\u202Ener"]).names).toEqual(["planner"]);
+  });
+
+  /**
+   * Scenario (PRD #1223 audit W5): a rollback could not confirm two roles, and
+   * one of them is named entirely of characters that render as nothing. Its
+   * list item must say something — a blank `<li>` under "2 roles may still be
+   * running on this deck" leaves the reader counting bullets to find out that
+   * a role was named at all, which is the moment they most need the name.
+   *
+   * `displayText` retains those characters on purpose (stripping them would
+   * corrupt emoji sequences and Persian, Arabic and Indic orthography), so the
+   * fix is `displayIdentity`'s visible fallback and not a wider filter.
+   */
+  it("names a role that renders as nothing rather than listing a blank line", () => {
+    expect(cleanupWarning(["\u200B\u200B", "coder"]).names).toEqual([UNNAMED_CLEANUP_ROLE, "coder"]);
+    // Blankness is judged before the clamp, so padding does not rescue it —
+    // and one visible character is enough to keep the real name.
+    expect(cleanupWarning(["\u200Bcoder"]).names).toEqual(["\u200Bcoder"]);
+    expect(cleanupWarning([" "]).names).toEqual([UNNAMED_CLEANUP_ROLE]);
   });
 
   /**

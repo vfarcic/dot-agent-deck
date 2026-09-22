@@ -1,5 +1,5 @@
 import type { AuthoringKind, ConnectionView, DaemonOrchestration, DeckDirectoryEntry, DeckFleet, NewAgentOption, NewAgentOptions, NewAgentOrchestrations } from "../types";
-import { DISPLAY_LIMITS, deckName, displayText } from "./displayText";
+import { DISPLAY_LIMITS, deckName, displayIdentity, displayText } from "./displayText";
 
 /**
  * PRD #1223 M4/M5 — the rules of the New agent flow, kept out of the component
@@ -301,11 +301,26 @@ export const SAME_DIRECTORY_ORCHESTRATION = "This directory already runs an orch
  */
 export const CLEANUP_WARNING_MAX_NAMES = 8;
 
+/**
+ * What a role whose name renders as nothing at all is listed as (PRD #1223
+ * audit W5).
+ *
+ * A list item is the one place a blank identity is worse than useless: an empty
+ * `<li>` under "2 roles may still be running" leaves the reader counting bullets
+ * to work out that one of them was named, which is exactly when they need to go
+ * and find it on the deck.
+ */
+export const UNNAMED_CLEANUP_ROLE = "unnamed role";
+
 /** The parts of the alert a failed launch shows — see {@link cleanupWarning}. */
 export type CleanupWarning = {
   /** The count and what to do about it. Never clamped away. */
   summary: string;
-  /** The first {@link CLEANUP_WARNING_MAX_NAMES} roles, each clamped as a name. */
+  /**
+   * The first {@link CLEANUP_WARNING_MAX_NAMES} roles, each clamped as a name
+   * and each guaranteed to render as something — see
+   * {@link UNNAMED_CLEANUP_ROLE}.
+   */
   names: string[];
   /** How many roles are not in `names`; `0` when they all are. */
   overflow: number;
@@ -320,6 +335,12 @@ export type CleanupWarning = {
  * long-named roles lost the later identities with nothing saying so. Each name
  * is now clamped on its own and rendered as a list item, and the ones past the
  * cap are COUNTED rather than dropped silently.
+ *
+ * Each name is an IDENTITY (audit W5), so it goes through `displayIdentity`
+ * and not `displayText`. `displayText` retains default-ignorable characters —
+ * deliberately, since stripping them would corrupt emoji sequences and Persian,
+ * Arabic and Indic orthography — so a role named only of them rendered as an
+ * empty list item, which is a blank line where the reader most needs a name.
  */
 export function cleanupWarning(unconfirmedStops: readonly string[]): CleanupWarning {
   const count = unconfirmedStops.length;
@@ -327,7 +348,7 @@ export function cleanupWarning(unconfirmedStops: readonly string[]): CleanupWarn
   const it = count === 1 ? "it" : "them";
   return {
     summary: displayText(`${subject} may still be running on this deck: the rollback could not confirm ${it} stopped. Check the deck and stop ${it} there.`, DISPLAY_LIMITS.message),
-    names: unconfirmedStops.slice(0, CLEANUP_WARNING_MAX_NAMES).map((role) => displayText(role, DISPLAY_LIMITS.name)),
+    names: unconfirmedStops.slice(0, CLEANUP_WARNING_MAX_NAMES).map((role) => displayIdentity(role, DISPLAY_LIMITS.name, UNNAMED_CLEANUP_ROLE)),
     overflow: Math.max(0, count - CLEANUP_WARNING_MAX_NAMES),
   };
 }
