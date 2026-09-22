@@ -326,9 +326,11 @@ pub(crate) fn is_safe_authoring_path(path: &str) -> bool {
 ///   so a path it listed always passes it — the check is on the string. The
 ///   refusal does not echo the path. A plain `StartAgent` does not come here
 ///   and keeps accepting whatever `cwd` it accepted before;
-/// * no `pane_id` (the start's validated `DOT_AGENT_DECK_PANE_ID`) — every
-///   delivery path routes by it, and the readiness gate matches the agent's
-///   `SessionStart` on it, so without one the seed could never be delivered.
+/// * no `pane_id` (the start's sole, validated `DOT_AGENT_DECK_PANE_ID`; the
+///   caller passes `None` for a missing, invalid or duplicated entry — audit
+///   F7) — every delivery path routes by it, and the readiness gate matches the
+///   agent's `SessionStart` on it, so without one the seed could never be
+///   delivered.
 pub(crate) fn seed_for_start(
     kind: AuthoringKind,
     cwd: Option<&str>,
@@ -350,8 +352,8 @@ pub(crate) fn seed_for_start(
     }
     if pane_id.is_none() {
         return Err(
-            "authoring_kind needs a valid DOT_AGENT_DECK_PANE_ID in env to deliver its seed to; \
-             nothing was started",
+            "authoring_kind needs exactly one valid DOT_AGENT_DECK_PANE_ID in env to deliver its \
+             seed to; nothing was started",
         );
     }
     Ok(kind.compose_seed(Path::new(cwd)))

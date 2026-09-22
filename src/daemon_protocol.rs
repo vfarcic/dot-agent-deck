@@ -1595,7 +1595,12 @@ pub enum AttachRequest {
         ///
         /// The fields the flag replaces must not also be sent: a request that
         /// sets it together with `command`, `agent_type` or `seed` is refused
-        /// before anything spawns. The flag sends no role command to a client —
+        /// before anything spawns. So is one whose `env` does not carry exactly
+        /// one valid `DOT_AGENT_DECK_PANE_ID` (audit F7): the role's
+        /// registration and a Pi start role's seed are keyed by it, and the
+        /// unflagged verb's reading — the first entry, if valid, else none —
+        /// would spawn the command as an agent no orchestration knows. The
+        /// flag sends no role command to a client —
         /// [`crate::event::ProjectRole`]'s note stands; the daemon reads the
         /// command where it runs it.
         ///
@@ -3104,6 +3109,23 @@ async fn handle_connection(
                 .await?;
                 return Ok(());
             }
+            // PRD #1223 audit F7: the role's registration and a Pi start role's
+            // native seed are both keyed by the pane id, so an opted-in start
+            // without exactly one valid id would run the configured command as
+            // an agent no orchestration knows and no prompt reaches. The same
+            // rule `authoring_kind` applies, and refused just as early.
+            if use_configured_command && sole_valid_pane_id(&env).is_none() {
+                write_resp(
+                    &mut stream,
+                    &AttachResponse::err(
+                        "start-prepared-agent: use_configured_command needs exactly one valid \
+                         DOT_AGENT_DECK_PANE_ID in env to register the role and seed it by; \
+                         nothing was started",
+                    ),
+                )
+                .await?;
+                return Ok(());
+            }
             (
                 AttachRequest::StartAgent {
                     command,
@@ -3507,10 +3529,12 @@ async fn handle_connection(
             // starts nothing. See `AttachRequest::StartAgent::authoring_kind`.
             let authoring_seed = match authoring_kind {
                 None => None,
+                // Audit F7: exactly one valid pane id, not `pane_id_env`'s
+                // first-entry reading — see `sole_valid_pane_id`.
                 Some(kind) => match crate::authoring_seeds::seed_for_start(
                     kind,
                     cwd.as_deref(),
-                    pane_id_env.as_deref(),
+                    sole_valid_pane_id(&env),
                     seed.as_deref(),
                 ) {
                     Ok(composed) => Some(composed),
@@ -4668,6 +4692,26 @@ fn refuse_prepared_start_where_unsupported() -> Result<(), String> {
              orchestration from a daemon running on Unix"
         ))
     }
+}
+
+/// PRD #1223 audit F7: the pane id a start carries when it carries exactly
+/// ONE `DOT_AGENT_DECK_PANE_ID` entry and that entry is valid; `None` for a
+/// missing, invalid or duplicated one.
+///
+/// The spawn arm's own `pane_id_env` takes the FIRST entry, while the child's
+/// environment is built entry by entry with the last one winning — so a
+/// duplicated key would register, seed and route by one id while the agent's
+/// hooks report the other. The start paths that depend on the id (an
+/// authoring seed, a configured role's registration and Pi seed) therefore
+/// refuse anything but a single valid entry, before anything spawns. The
+/// unflagged starts keep their existing first-entry reading.
+fn sole_valid_pane_id(env: &[(String, String)]) -> Option<&str> {
+    let mut entries = env.iter().filter(|(k, _)| k == DOT_AGENT_DECK_PANE_ID);
+    let (_, value) = entries.next()?;
+    if entries.next().is_some() || !is_valid_pane_id_env(value) {
+        return None;
+    }
+    Some(value)
 }
 
 fn validate_project_path(path: &str) -> Result<(), String> {

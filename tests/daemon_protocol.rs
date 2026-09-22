@@ -2414,6 +2414,84 @@ async fn a_configured_prepared_start_refuses_a_supplied_command_agent_type_or_se
     server.registry.close_agent(&record.id).unwrap();
 }
 
+/// PRD #1223 audit F7: an opted-in prepared start registers its role and seeds a
+/// Pi start role by the pane id, so one that carries no `DOT_AGENT_DECK_PANE_ID`,
+/// an invalid one, or two of them is refused in the ordinary shape and starts
+/// nothing — rather than spawning the configured command as an agent no
+/// orchestration knows and no prompt reaches. Each shape is probed on its own
+/// against the Pi START role (the one whose seed depends on the id), and the
+/// same start with exactly one valid id then starts, so the refusal is the pane
+/// id and not the preparation.
+#[tokio::test]
+async fn a_configured_prepared_start_refuses_a_missing_invalid_or_duplicated_pane_id() {
+    let server = start_server().await;
+    let (_dir, project) = mint_project(&configured_role_project(true));
+    let prepared = prepare_loop(&server, &project).await;
+
+    for (shape, env) in [
+        ("missing", serde_json::json!([])),
+        (
+            "invalid",
+            serde_json::json!([["DOT_AGENT_DECK_PANE_ID", "not a pane id!"]]),
+        ),
+        ("empty", serde_json::json!([["DOT_AGENT_DECK_PANE_ID", ""]])),
+        (
+            "duplicated",
+            serde_json::json!([
+                ["DOT_AGENT_DECK_PANE_ID", "configured-first"],
+                ["DOT_AGENT_DECK_PANE_ID", "configured-second"]
+            ]),
+        ),
+    ] {
+        let mut payload = configured_role_payload(
+            &prepared.token,
+            &prepared.path,
+            "planner",
+            true,
+            "configured-unused",
+        );
+        payload.insert("env".into(), env);
+        let resp = issue_json_request(&server, serde_json::Value::Object(payload)).await;
+        assert!(
+            !resp.ok,
+            "a {shape} pane id alongside the flag must be refused"
+        );
+        assert!(resp.id.is_none(), "{shape}: a refused start reports no id");
+        assert!(
+            resp.error.as_deref().is_some_and(|e| {
+                e.contains("use_configured_command")
+                    && e.contains("DOT_AGENT_DECK_PANE_ID")
+                    && e.ends_with("nothing was started")
+            }),
+            "{shape}: the refusal names the flag and the pane id, in the ordinary shape: {:?}",
+            resp.error
+        );
+        assert!(
+            server.registry.agent_records().is_empty(),
+            "{shape}: a refused configured start must not have spawned a pane"
+        );
+    }
+
+    let resp = issue_json_request(
+        &server,
+        serde_json::Value::Object(configured_role_payload(
+            &prepared.token,
+            &prepared.path,
+            "planner",
+            true,
+            "configured-sole",
+        )),
+    )
+    .await;
+    assert!(
+        resp.ok && resp.id.is_some(),
+        "the same start with exactly one valid pane id is served: {:?}",
+        resp.error
+    );
+    let id = resp.id.expect("the served start's id");
+    server.registry.close_agent(&id).unwrap();
+}
+
 /// PRD #1223 M6: the TUI's PRD #201 rule, on the daemon — an opted-in start of
 /// the configured START role whose resolved type is Pi is seeded natively with
 /// the preparation's coordinator prompt (exactly the line the reply carried),
