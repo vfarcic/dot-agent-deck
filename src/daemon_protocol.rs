@@ -997,6 +997,28 @@ pub const PROJECT_ERR_UNSUPPORTED_PLATFORM: &str = "unsupported-platform";
 /// source line and no raw OS error.
 pub const PROJECT_ERR_UNRESOLVED: &str = "unresolved";
 
+/// PRD #1223 audit A4: the daemon is already answering as many new-agent form
+/// queries ([`AttachRequest::ListDirectories`], [`AttachRequest::NewAgentOptions`])
+/// as it serves at once —
+/// [`crate::new_agent_options::MAX_CONCURRENT_NEW_AGENT_QUERIES`] — so this one
+/// was refused rather than queued, and nothing was read.
+///
+/// **Retryable**, and about the daemon's load rather than the request: the same
+/// request sent again once an earlier one finishes is answered normally. It is a
+/// code rather than prose so a client can tell it from
+/// [`PROJECT_ERR_UNRESOLVED`], whose remedy is a different path, not a retry.
+/// Only those two verbs return it; the project verbs still queue for their own
+/// [`crate::project_resolve::MAX_CONCURRENT_PROJECT_READS`] permits.
+pub const PROJECT_ERR_BUSY: &str = "busy";
+
+/// The whole [`PROJECT_ERR_BUSY`] refusal. One fixed sentence for both verbs.
+fn new_agent_query_busy_refusal() -> String {
+    format!(
+        "{PROJECT_ERR_BUSY}: the daemon is already answering as many new-agent queries as it \
+         serves at once; try again"
+    )
+}
+
 /// Bounded timeout for a single STREAM_OUT/STREAM_END write to a client. If
 /// a client stops draining its socket, the OS send buffer fills and our
 /// `write_all` blocks forever — which would also block lag detection (we
@@ -4344,14 +4366,13 @@ async fn handle_connection(
             .await?
         }
         // PRD #1223 M1. One level of one directory, under
-        // `crate::directory_listing`'s bounds. The filesystem work runs under the
-        // project verbs' blocking-thread bound rather than a pool of its own: it
-        // is the same class of work — a caller-selected path, read on the
-        // daemon's filesystem — and one daemon-wide bound is what keeps the sum
-        // of both from occupying more than a small slice of tokio's blocking
-        // pool.
+        // `crate::directory_listing`'s bounds. The filesystem work runs in the
+        // new-agent queries' own pool (audit A4), taken with try-acquire: a full
+        // pool refuses as `busy` rather than queueing, and a listing never holds
+        // one of the project verbs' permits, so a burst of slow listings cannot
+        // starve `ResolveProject` / `PrepareWorkflow`.
         AttachRequest::ListDirectories { path } => {
-            let resp = match crate::project_resolve::run_bounded(move || {
+            let resp = match crate::new_agent_options::run_new_agent_query(move || {
                 crate::directory_listing::list_directories(path.as_deref())
             })
             .await
@@ -4362,8 +4383,11 @@ async fn handle_connection(
                     resp
                 }
                 Ok(Err(refusal)) => AttachResponse::err(refusal),
-                Err(e) => {
-                    warn!(reason = %e, "list-directories could not complete");
+                Err(crate::new_agent_options::NewAgentQueryError::Busy) => {
+                    AttachResponse::err(new_agent_query_busy_refusal())
+                }
+                Err(crate::new_agent_options::NewAgentQueryError::Failed) => {
+                    warn!("list-directories could not complete");
                     AttachResponse::err(format!(
                         "{PROJECT_ERR_UNRESOLVED}: {}",
                         crate::project_resolve::ProjectResolveError::Internal.detail()
@@ -4374,18 +4398,24 @@ async fn handle_connection(
         }
         // PRD #1223 M2. Read per request: the config file is on this host, the
         // registry is this build's, and the flag is this process's. The config
-        // read is blocking file I/O, so it runs on a blocking thread.
+        // read is blocking file I/O, so it runs in the same bounded pool as the
+        // listing (audit A4), with the same `busy` refusal when that is full.
         AttachRequest::NewAgentOptions {} => {
-            let resp = match tokio::task::spawn_blocking(crate::new_agent_options::for_this_daemon)
-                .await
+            let resp = match crate::new_agent_options::run_new_agent_query(
+                crate::new_agent_options::for_this_daemon,
+            )
+            .await
             {
                 Ok(options) => {
                     let mut resp = AttachResponse::ok();
                     resp.new_agent_options = Some(options);
                     resp
                 }
-                Err(e) => {
-                    warn!(reason = %e, "new-agent-options could not complete");
+                Err(crate::new_agent_options::NewAgentQueryError::Busy) => {
+                    AttachResponse::err(new_agent_query_busy_refusal())
+                }
+                Err(crate::new_agent_options::NewAgentQueryError::Failed) => {
+                    warn!("new-agent-options could not complete");
                     AttachResponse::err(
                         "new-agent-options: the daemon could not complete the request",
                     )

@@ -9,9 +9,107 @@
 //! experimental flag has meaning where the spawn happens. So the daemon answers
 //! for itself rather than the desktop computing an answer from its own build.
 
+use std::sync::{Arc, OnceLock};
+
 use serde::{Deserialize, Serialize};
+use tokio::sync::Semaphore;
 
 use crate::config::DashboardConfig;
+
+/// PRD #1223 audit A4: how many new-agent form queries —
+/// [`crate::daemon_protocol::AttachRequest::ListDirectories`] and
+/// [`crate::daemon_protocol::AttachRequest::NewAgentOptions`] together — may
+/// hold a blocking thread across the whole daemon at once.
+///
+/// **4**, in a pool of their OWN. They used to wait on the project verbs'
+/// [`crate::project_resolve::MAX_CONCURRENT_PROJECT_READS`] permits (the
+/// listing) or take no permit at all (the options query), so a burst of
+/// listings against a slow directory could hold every permit `ResolveProject`
+/// and `PrepareWorkflow` need, and a burst of options queries could spawn one
+/// blocking job each. With their own pool neither can occupy a project-verb
+/// permit, and together they occupy at most this many blocking threads.
+///
+/// 4 rather than fewer because one dialog opening already sends two at once (the
+/// options query and the home listing), and a person clicking through a slow
+/// directory can leave a superseded listing still in flight; 2 would refuse
+/// ordinary use of one form, where 4 leaves room for a second client.
+///
+/// A query that finds the pool full is **refused, not queued**
+/// ([`run_new_agent_query`]): a queued query would still be a connection held
+/// open behind a slow filesystem, and the refusal is the retryable
+/// [`crate::daemon_protocol::PROJECT_ERR_BUSY`].
+pub const MAX_CONCURRENT_NEW_AGENT_QUERIES: usize = 4;
+
+/// Why [`run_new_agent_query`] did not run its closure to completion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NewAgentQueryError {
+    /// Every one of the [`MAX_CONCURRENT_NEW_AGENT_QUERIES`] permits was held,
+    /// so nothing was spawned. Retryable.
+    Busy,
+    /// The blocking task did not complete (it panicked or was cancelled).
+    Failed,
+}
+
+fn new_agent_query_limit() -> &'static Arc<Semaphore> {
+    static LIMIT: OnceLock<Arc<Semaphore>> = OnceLock::new();
+    LIMIT.get_or_init(|| Arc::new(Semaphore::new(MAX_CONCURRENT_NEW_AGENT_QUERIES)))
+}
+
+/// Run one new-agent form query on a blocking thread, behind the daemon-wide
+/// [`MAX_CONCURRENT_NEW_AGENT_QUERIES`] bound — or refuse it as
+/// [`NewAgentQueryError::Busy`] without spawning anything when the bound is
+/// reached.
+///
+/// The permit is taken with `try_acquire`, never awaited, and it is moved into
+/// the blocking closure's own frame, so it is held for exactly as long as a
+/// thread is occupied and an unwinding panic releases it too — the arrangement
+/// [`crate::project_resolve::run_bounded`] uses, minus the queue.
+pub async fn run_new_agent_query<T, F>(f: F) -> Result<T, NewAgentQueryError>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    try_run_bounded(new_agent_query_limit(), f).await
+}
+
+/// [`run_new_agent_query`] against a given pool, so the refuse-not-queue rule is
+/// testable without saturating the daemon-wide one.
+async fn try_run_bounded<T, F>(limit: &Arc<Semaphore>, f: F) -> Result<T, NewAgentQueryError>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    let permit = limit
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| NewAgentQueryError::Busy)?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        f()
+    })
+    .await
+    .map_err(|_| NewAgentQueryError::Failed)
+}
+
+/// Test-only: hold every permit of the daemon-wide pool, as a burst of slow
+/// queries would, so a test can observe what the dispatch does when it is full.
+///
+/// Tests that do this, and tests that send either query through the real
+/// dispatch, serialise on [`POOL_TEST_GUARD`] so a `cargo test` run (which,
+/// unlike nextest, shares one process across tests) cannot hand one of them a
+/// `busy` it did not cause.
+#[cfg(test)]
+pub(crate) async fn saturate_new_agent_query_pool() -> tokio::sync::OwnedSemaphorePermit {
+    new_agent_query_limit()
+        .clone()
+        .acquire_many_owned(MAX_CONCURRENT_NEW_AGENT_QUERIES as u32)
+        .await
+        .expect("the new-agent query pool is never closed")
+}
+
+/// See [`saturate_new_agent_query_pool`].
+#[cfg(test)]
+pub(crate) static POOL_TEST_GUARD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// PRD #1223 M2: the daemon's reply to
 /// [`crate::daemon_protocol::AttachRequest::NewAgentOptions`], carried on
@@ -62,13 +160,15 @@ pub struct AgentOption {
 
 /// The options this daemon process reports, read at the moment of the request.
 ///
-/// **Blocking** — it reads the host's `config.toml` — so the dispatch runs it on
-/// a blocking thread. Read per request rather than cached: `DashboardConfig` has
-/// no reload path in the daemon, and the TUI re-reads the same file whenever it
-/// starts, so a cache here would be the one reader that could go stale.
+/// **Blocking** — it reads the host's `config.toml` — so the dispatch runs it
+/// through [`run_new_agent_query`]. Read per request rather than cached:
+/// `DashboardConfig` has no reload path in the daemon, and the TUI re-reads the
+/// same file whenever it starts, so a cache here would be the one reader that
+/// could go stale. Read with [`DashboardConfig::load_bounded`], so a FIFO or an
+/// oversized file at the config path cannot hold the thread or its memory.
 pub fn for_this_daemon() -> NewAgentOptions {
     compose(
-        &DashboardConfig::load(),
+        &DashboardConfig::load_bounded(),
         crate::features::experimental_enabled(),
     )
 }
@@ -114,6 +214,95 @@ mod tests {
             default_command: default_command.to_string(),
             ..DashboardConfig::default()
         }
+    }
+
+    /// Audit A4: a full pool refuses the next query at once, without spawning
+    /// it, rather than parking it until a permit frees — and a permit returns to
+    /// the pool when the query holding it finishes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_full_pool_refuses_the_next_query_rather_than_queueing_it() {
+        let limit = Arc::new(Semaphore::new(MAX_CONCURRENT_NEW_AGENT_QUERIES));
+        let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
+        let mut releases = Vec::new();
+        let mut running = Vec::new();
+        for _ in 0..MAX_CONCURRENT_NEW_AGENT_QUERIES {
+            let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+            releases.push(release_tx);
+            let started_tx = started_tx.clone();
+            let limit = limit.clone();
+            running.push(tokio::spawn(async move {
+                try_run_bounded(&limit, move || {
+                    started_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                })
+                .await
+            }));
+        }
+        for _ in 0..MAX_CONCURRENT_NEW_AGENT_QUERIES {
+            started_rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .expect("every in-pool query reaches its blocking thread");
+        }
+
+        let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ran_in_job = ran.clone();
+        let excess = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            try_run_bounded(&limit, move || {
+                ran_in_job.store(true, std::sync::atomic::Ordering::SeqCst)
+            }),
+        )
+        .await
+        .expect("a full pool answers at once — a query that waits here was queued");
+        assert_eq!(excess, Err(NewAgentQueryError::Busy));
+        assert!(
+            !ran.load(std::sync::atomic::Ordering::SeqCst),
+            "a refused query spawns nothing"
+        );
+
+        for release in releases {
+            release.send(()).unwrap();
+        }
+        for query in running {
+            assert_eq!(query.await.unwrap(), Ok(()));
+        }
+        assert_eq!(
+            try_run_bounded(&limit, || 7).await,
+            Ok(7),
+            "the permits return to the pool when the queries holding them finish"
+        );
+    }
+
+    /// Audit A4: with the daemon-wide new-agent pool saturated, the queries are
+    /// refused while the project verbs' own pool still hands out a permit — the
+    /// two are separate, so listings can no longer starve `ResolveProject` /
+    /// `PrepareWorkflow`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn project_verbs_still_acquire_while_the_new_agent_pool_is_saturated() {
+        let _serial = POOL_TEST_GUARD.lock().await;
+        let held = saturate_new_agent_query_pool().await;
+
+        assert_eq!(
+            run_new_agent_query(|| ()).await,
+            Err(NewAgentQueryError::Busy),
+            "a saturated pool refuses the next query"
+        );
+        let project_work = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            crate::project_resolve::run_bounded(|| 7),
+        )
+        .await
+        .expect("a project verb acquires its own permit while the new-agent pool is full")
+        .expect("the project work runs");
+        assert_eq!(project_work, 7);
+
+        drop(held);
+        assert_eq!(run_new_agent_query(|| 1).await, Ok(1));
+    }
+
+    #[test]
+    fn the_new_agent_query_bound_is_small_and_its_own() {
+        assert_eq!(MAX_CONCURRENT_NEW_AGENT_QUERIES, 4);
     }
 
     #[test]

@@ -90,8 +90,8 @@ pub const MAX_DIRECTORY_ENTRIES: usize = 1_000;
 /// that blocks, so a `stat` or a `readdir` on an unresponsive network mount
 /// takes as long as that call takes. What contains that case is the
 /// daemon-wide concurrency bound the listing runs under
-/// ([`crate::project_resolve::MAX_CONCURRENT_PROJECT_READS`]), not this
-/// deadline.
+/// ([`crate::new_agent_options::MAX_CONCURRENT_NEW_AGENT_QUERIES`], a pool the
+/// project verbs do not share), not this deadline.
 pub const DIRECTORY_LISTING_BUDGET: Duration = Duration::from_secs(2);
 
 /// PRD #1223 M1: the daemon's reply to
@@ -147,8 +147,9 @@ pub struct DirectoryEntry {
 /// to be launched. `path` present must be absolute; it is canonicalised here.
 ///
 /// **Blocking.** The daemon's dispatch runs it through
-/// [`crate::project_resolve::run_bounded`], so it occupies one of the project
-/// verbs' blocking permits for its duration.
+/// [`crate::new_agent_options::run_new_agent_query`], so it occupies one of the
+/// new-agent queries' blocking permits for its duration — or is refused as busy
+/// when none is free.
 ///
 /// On refusal it returns the message the caller wraps in an
 /// [`crate::daemon_protocol::AttachResponse::err`]; see the module doc for

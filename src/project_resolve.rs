@@ -206,15 +206,12 @@ pub const MAX_ENUMERATION_CANDIDATES: usize = 32;
 /// mount takes as long as it takes, which is the availability limit this bound
 /// contains rather than removes.
 ///
-/// PRD #1223 added a caller outside this module: the daemon's
-/// `list-directories` arm runs [`crate::directory_listing::list_directories`]
-/// under the same bound, because it is the same class of work — a
-/// caller-selected path read on the daemon's filesystem. Its reply is capped at
-/// [`crate::directory_listing::MAX_DIRECTORY_ENTRIES`] entries, and its scan —
-/// which continues past that cap — stops at
-/// [`crate::directory_listing::DIRECTORY_LISTING_BUDGET`], checked between system
-/// calls rather than during one, so the no-bounded-duration caveat above applies
-/// to it too.
+/// PRD #1223's `list-directories` and `new-agent-options` arms do NOT take these
+/// permits. They first did (the listing) or took none (the options query), and
+/// audit A4 moved both into a pool of their own,
+/// [`crate::new_agent_options::MAX_CONCURRENT_NEW_AGENT_QUERIES`], taken with
+/// try-acquire and refused as busy when full, so a burst of slow listings
+/// cannot hold the permits this module's verbs queue for.
 pub const MAX_CONCURRENT_PROJECT_READS: usize = 4;
 
 // ---------------------------------------------------------------------------

@@ -143,6 +143,52 @@ impl DashboardConfig {
         }
     }
 
+    /// PRD #1223 audit A4: [`Self::load`] for the daemon, which reads this file
+    /// to answer a peer's `NewAgentOptions` query and so must not let the read
+    /// block, or allocate, without bound.
+    ///
+    /// The same file ([`config_path`], `DOT_AGENT_DECK_CONFIG` included) and the
+    /// same fallback — anything that is not a readable, parseable config yields
+    /// [`Self::default`] — with three differences, all confined to what a
+    /// pathological file does:
+    ///
+    /// * **The open cannot hang.** `O_NONBLOCK` on Unix, because a plain
+    ///   `open(2)` of a FIFO with no writer blocks inside the open — the reason
+    ///   [`crate::project_resolve::read_config_file`] sets it. A symlink IS
+    ///   followed, unlike that reader: a dotfiles manager linking `config.toml`
+    ///   into place is ordinary, and [`Self::load`] has always followed one.
+    /// * **Only a regular file is read**, checked on the open handle, so a FIFO,
+    ///   socket or device at the path (or behind a link) is refused unread.
+    /// * **At most [`MAX_DASHBOARD_CONFIG_BYTES`]**, checked against the recorded
+    ///   length and again by [`crate::bounded_read::read_capped`], which catches
+    ///   a file growing between the two.
+    ///
+    /// A refusal is logged without the TOML error's `Display`, which embeds a
+    /// snippet of the file (the `load_features_file` precedent).
+    pub fn load_bounded() -> Self {
+        Self::load_bounded_from(&config_path())
+    }
+
+    fn load_bounded_from(path: &Path) -> Self {
+        match read_dashboard_config_bounded(path) {
+            Ok(None) => Self::default(),
+            Ok(Some(contents)) => toml::from_str(&contents).unwrap_or_else(|_| {
+                tracing::warn!(
+                    "invalid config at {}: malformed TOML; using the defaults",
+                    path.display()
+                );
+                Self::default()
+            }),
+            Err(reason) => {
+                tracing::warn!(
+                    "config at {} not read ({reason}); using the defaults",
+                    path.display()
+                );
+                Self::default()
+            }
+        }
+    }
+
     pub fn save(&self) -> Result<(), String> {
         let path = config_path();
         if let Some(parent) = path.parent() {
@@ -201,6 +247,42 @@ impl DashboardConfig {
             _ => Err(format!("Unknown config key: {key}\n{}", config_keys_help())),
         }
     }
+}
+
+/// PRD #1223 audit A4: the most [`DashboardConfig::load_bounded`] reads.
+///
+/// **1 MiB**, the project-config reader's cap
+/// ([`crate::project_resolve::MAX_PROJECT_CONFIG_BYTES`]) — the other file the
+/// daemon reads on a peer's behalf — so the two bounds stay one number. A
+/// `config.toml` is a few hundred bytes; anything near this is not a config.
+pub const MAX_DASHBOARD_CONFIG_BYTES: u64 = crate::project_resolve::MAX_PROJECT_CONFIG_BYTES;
+
+/// [`DashboardConfig::load_bounded`]'s read: `Ok(None)` when there is no file,
+/// `Err` with a short reason (no file content) when there is one that is not a
+/// regular file within [`MAX_DASHBOARD_CONFIG_BYTES`] or cannot be read.
+fn read_dashboard_config_bounded(path: &Path) -> Result<Option<String>, String> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = match options.open(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("open failed: {e}")),
+    };
+    let metadata = file.metadata().map_err(|e| format!("stat failed: {e}"))?;
+    if !metadata.is_file() {
+        return Err("not a regular file".into());
+    }
+    if metadata.len() > MAX_DASHBOARD_CONFIG_BYTES {
+        return Err(format!(
+            "exceeds the {MAX_DASHBOARD_CONFIG_BYTES}-byte limit"
+        ));
+    }
+    crate::bounded_read::read_capped(file, MAX_DASHBOARD_CONFIG_BYTES, "config file").map(Some)
 }
 
 fn config_path() -> PathBuf {
@@ -1554,6 +1636,93 @@ pub fn load_features_file(
 mod tests {
     use super::*;
     use spec::spec;
+
+    /// PRD #1223 audit A4: the daemon's bounded read of `config.toml` answers
+    /// what `load` answers for an ordinary file — including one reached through
+    /// a symlink — and falls back to the defaults for no file at all.
+    #[test]
+    fn a_bounded_load_reads_an_ordinary_config_and_follows_a_link_to_one() {
+        let dir = crate::test_temp::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        assert_eq!(
+            DashboardConfig::load_bounded_from(&path).default_command,
+            "",
+            "no file is the defaults"
+        );
+
+        std::fs::write(&path, "default_command = \"opencode --model x\"\n").unwrap();
+        assert_eq!(
+            DashboardConfig::load_bounded_from(&path).default_command,
+            "opencode --model x"
+        );
+
+        #[cfg(unix)]
+        {
+            let link = dir.path().join("linked.toml");
+            std::os::unix::fs::symlink(&path, &link).unwrap();
+            assert_eq!(
+                DashboardConfig::load_bounded_from(&link).default_command,
+                "opencode --model x",
+                "a dotfiles-style link to a regular config is followed, as `load` follows it"
+            );
+        }
+
+        std::fs::write(&path, "default_command = [\n").unwrap();
+        assert_eq!(
+            DashboardConfig::load_bounded_from(&path).default_command,
+            "",
+            "a malformed config is the defaults"
+        );
+    }
+
+    /// Audit A4: a config over [`MAX_DASHBOARD_CONFIG_BYTES`] is not read into
+    /// memory; the daemon answers with the defaults instead.
+    #[test]
+    fn a_bounded_load_refuses_an_oversized_config() {
+        assert_eq!(
+            MAX_DASHBOARD_CONFIG_BYTES,
+            crate::project_resolve::MAX_PROJECT_CONFIG_BYTES
+        );
+        let dir = crate::test_temp::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut body = String::from("default_command = \"claude\"\n#");
+        body.push_str(&"x".repeat(MAX_DASHBOARD_CONFIG_BYTES as usize));
+        std::fs::write(&path, body).unwrap();
+        assert_eq!(
+            DashboardConfig::load_bounded_from(&path).default_command,
+            ""
+        );
+    }
+
+    /// Audit A4: a FIFO at the config path — directly or behind a link — is
+    /// refused without blocking in the open, where `load`'s plain read would
+    /// wait for a writer forever.
+    #[cfg(unix)]
+    #[test]
+    fn a_bounded_load_refuses_a_fifo_without_blocking() {
+        let dir = crate::test_temp::tempdir().unwrap();
+        let fifo = dir.path().join("config.toml");
+        let c_path = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).expect("cstring");
+        // SAFETY: `c_path` is a valid NUL-terminated string that outlives the
+        // call, and `mkfifo` only reads through it.
+        let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
+        assert_eq!(rc, 0, "mkfifo failed: {}", std::io::Error::last_os_error());
+        let link = dir.path().join("linked.toml");
+        std::os::unix::fs::symlink(&fifo, &link).unwrap();
+
+        for path in [fifo, link] {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let probe = path.clone();
+            std::thread::spawn(move || {
+                let _ = tx.send(DashboardConfig::load_bounded_from(&probe).default_command);
+            });
+            assert_eq!(
+                rx.recv_timeout(std::time::Duration::from_secs(10))
+                    .unwrap_or_else(|_| panic!("{}: the bounded load blocked", path.display())),
+                ""
+            );
+        }
+    }
 
     /// The pure trust rule the ancestor walk stops on (issue #577). Split out
     /// of the filesystem check so the deletion-unsafe direction — adopting an

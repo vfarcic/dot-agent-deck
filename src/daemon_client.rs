@@ -3770,6 +3770,8 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn new_agent_queries_are_answered_by_a_daemon_that_advertises_them() {
+        // Not a `busy` some pool-saturating test caused (see the guard's doc).
+        let _serial = crate::new_agent_options::POOL_TEST_GUARD.lock().await;
         let (_dir, path, _registry) = spawn_test_server().await;
         let client = DaemonClient::new(path);
 
@@ -3821,6 +3823,54 @@ mod tests {
             options.authoring_kinds,
             ["schedule", "schedule-issues", "dispatcher"],
             "PRD #1223 M7: a daemon at this build composes every authoring kind"
+        );
+    }
+
+    /// PRD #1223 audit A4, through the real dispatch: with the new-agent query
+    /// pool saturated, both queries are refused at once with the retryable
+    /// `busy` code — not queued behind the pool — while a project verb on the
+    /// same daemon is still answered from its own permits. Once the pool frees,
+    /// the same listing is answered.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_saturated_new_agent_pool_refuses_the_queries_but_not_the_project_verbs() {
+        let _serial = crate::new_agent_options::POOL_TEST_GUARD.lock().await;
+        let (_dir, path, _registry) = spawn_test_server().await;
+        let client = DaemonClient::new(path);
+        let scratch = crate::test_temp::tempdir().expect("scratch dir");
+        let root = std::fs::canonicalize(scratch.path()).expect("canonical scratch root");
+        std::fs::write(root.join(crate::project_config::CONFIG_FILE_NAME), "")
+            .expect("write an empty project config");
+        let root_wire = root.to_str().expect("scratch paths are UTF-8").to_string();
+
+        let held = crate::new_agent_options::saturate_new_agent_query_pool().await;
+        let within = std::time::Duration::from_secs(10);
+        fn busy<T>(answer: &Result<T, ClientError>) -> bool {
+            matches!(answer, Err(ClientError::Server(message))
+                if message.starts_with(&format!("{}: ", crate::daemon_protocol::PROJECT_ERR_BUSY)))
+        }
+        let listing = tokio::time::timeout(within, client.list_directories(Some(&root_wire)))
+            .await
+            .expect("a full pool answers at once — a listing that waits here was queued");
+        assert!(busy(&listing), "{listing:?}");
+        let options = tokio::time::timeout(within, client.new_agent_options())
+            .await
+            .expect("a full pool answers the options query at once");
+        assert!(busy(&options), "{options:?}");
+
+        let project = tokio::time::timeout(within, client.resolve_project(&root_wire))
+            .await
+            .expect("a project verb is not held behind the new-agent pool")
+            .expect("the project resolves from the project verbs' own permits");
+        assert_eq!(project.path, root_wire);
+
+        drop(held);
+        assert!(
+            matches!(
+                client.list_directories(Some(&root_wire)).await,
+                Ok(GatedQuery::Answered(_))
+            ),
+            "the refusal was the pool, not the request"
         );
     }
 
