@@ -788,7 +788,7 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Layer:** fast synthetic real-binary-subprocess integration (the REAL `dot-agent-deck daemon status` CLI as a subprocess against a scratch attach-socket path with nothing listening; no in-process daemon, no PTY, no LLM, no `e2e` feature gate).
 - **Agent:** none.
 - **Asserts:** the subprocess does not report success; its stderr carries no Rust panic; its exit code is not clap's own generic usage/parse-error code (`2`) and its stderr carries no clap `Usage:` banner — ruling out "this build's CLI does not understand the `status` subcommand" as the reason for the failure, so it stays distinguishable from a genuinely-handled "no daemon reachable" outcome; and the queried socket path still does not exist on disk afterward, proving the read-only diagnostic never starts the daemon it is diagnosing. Deliberately does not pin the exact exit code value or message wording.
-- **Does not assert:** the live-agent path (`daemon/status/001`/`002`); prompt redaction (`daemon/status/004`).
+- **Does not assert:** the live-agent path (`daemon/status/001`/`002`); prompt redaction (`daemon/status/004`); the accepted-but-unanswered path that actually reaches the round-trip deadline (`daemon/status/006`) — a path with nothing bound fails at `connect(2)` and never gets there.
 - **Platform coverage:** mac+linux.
 
 ##### daemon/status/004 — Neither human nor JSON daemon status output reveals prompt text or active-tool detail.
@@ -803,6 +803,13 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Agent:** none (synthetic — two `cat`-stub panes spawned through the TUI's real attach request; the driven pane runs the CLI with the exact `DOT_AGENT_DECK_PANE_ID` and daemon-injected `DOT_AGENT_DECK_AGENT_ID`, while the second is an untouched control).
 - **Asserts:** the lifecycle subprocess exits successfully and the daemon broadcasts its raw `Thinking` event carrying the exact pane and agent ids; human status distinguishes the driven row from the identity-normalized control row; and the driven JSON entry carries a `status` key rather than omitting it as a placeholder.
 - **Does not assert:** exact human status wording or column layout; the exact JSON status string and schema field names (`daemon/status/002`); a literal TUI detach/reconnect (`session/live/012`).
+- **Platform coverage:** mac+linux.
+
+##### daemon/status/006 — `dot-agent-deck daemon status` against a peer that accepts the connection and never replies gives up on its own deadline instead of hanging.
+- **Layer:** fast synthetic real-binary-subprocess integration (the REAL `dot-agent-deck daemon status` and `daemon status --json` CLIs as subprocesses against a stub Unix listener in a scratch dir; no in-process daemon, no PTY, no LLM, no `e2e` feature gate).
+- **Agent:** none (synthetic — a stub listener that accepts every connection and HOLDS it open without writing a byte; holding is load-bearing, since dropping the stream would close the connection and route the CLI into its transport-error branch instead of the timeout one).
+- **Asserts:** the stub accepted one connection per invocation, proving this is the accepted-but-unanswered path rather than `daemon/status/003`'s connect failure; each subprocess returns inside the test's own absolute 8s watchdog (which `SIGKILL`s the child on expiry, so a build that lost the deadline FAILS rather than hanging); neither reports success nor carries a Rust panic; each returns within the `STATUS_REQUEST_TIMEOUT` it declares plus spawn slack; each names that deadline on stderr (`no response within 3s`), the signature of the `Err(_elapsed)` arm alone; and each prints nothing on stdout, so `--json` never emits an empty-but-well-formed document that would read to a consumer as a healthy daemon with zero agents.
+- **Does not assert:** the exact exit code or the rest of the message wording; the connect-failure path (`daemon/status/003`); the live-agent paths (`daemon/status/001`/`002`/`005`); that the CLI closes its own connection on the way out.
 - **Platform coverage:** mac+linux.
 
 #### daemon/endpoint

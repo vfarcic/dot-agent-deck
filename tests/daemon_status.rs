@@ -6,7 +6,10 @@
 //! lifecycle CLI cannot carry. `/002` and `/005` exercise the real
 //! `agent-event --type running` subprocess with the pane/agent environment a
 //! daemon-managed spawn receives. `/003` queries a scratch attach-socket path
-//! with nothing listening.
+//! with nothing listening, and `/006` queries one where a stub peer accepts
+//! the connection and then never replies — the only staging that reaches the
+//! [`STATUS_REQUEST_TIMEOUT`] deadline, since `/003`'s path fails at
+//! `connect(2)` long before it.
 
 use std::path::Path;
 use std::time::Duration;
@@ -15,6 +18,8 @@ use dot_agent_deck::agent_pty::{
     DOT_AGENT_DECK_AGENT_ID, DOT_AGENT_DECK_PANE_ID, SpawnOptions, TabMembership,
 };
 use dot_agent_deck::daemon_client::{DaemonClient, StartAgentOptions};
+#[cfg(unix)]
+use dot_agent_deck::daemon_status::STATUS_REQUEST_TIMEOUT;
 use dot_agent_deck::event::{AgentEvent, AgentType, BroadcastMsg, EventType};
 use dot_agent_deck::state::SessionStatus;
 #[cfg(unix)]
@@ -44,6 +49,34 @@ const TOOL_DETAIL_SENTINEL: &str = "DAEMON-STATUS-TOOL-DETAIL-SENTINEL-7c4b2e";
 const CLI_DRIVEN_PANE: &str = "status-cli-driven-pane-6a8d31";
 #[cfg(unix)]
 const CLI_CONTROL_PANE: &str = "status-cli-control-pane-8c2f47";
+
+/// Absolute ceiling on ONE wedged-peer `daemon status` run, watchdogged in
+/// this test rather than trusted to the binary.
+///
+/// Deliberately a literal, and deliberately NOT derived from
+/// [`STATUS_REQUEST_TIMEOUT`]: a bound that follows the constant it is
+/// guarding would sail through a build that raised that constant to a minute,
+/// which is half of what `daemon/status/006` exists to catch. The other half —
+/// a build that dropped the deadline entirely — hangs forever, so without a
+/// watchdog the test would HANG rather than fail, which reports nothing to
+/// anyone.
+///
+/// 8s leaves the passing run (~3s of deadline plus subprocess startup, both
+/// modes concurrent against one stub) a wide margin while keeping even the
+/// failing run inside the fast tier's budget.
+#[cfg(unix)]
+const WEDGED_PEER_DEADLINE: std::time::Duration = std::time::Duration::from_secs(8);
+
+/// Slack over [`STATUS_REQUEST_TIMEOUT`] allowed for forking the debug binary,
+/// dynamically linking it, and CI scheduling noise before the deadline it
+/// declares can even start running.
+///
+/// Paired with [`WEDGED_PEER_DEADLINE`], not redundant with it: this one is
+/// relative, and catches a build whose code no longer honours the constant it
+/// still declares (a diagnostic that says "no response within 3s" after
+/// waiting six is lying to the operator reading it).
+#[cfg(unix)]
+const WEDGED_PEER_SPAWN_SLACK: std::time::Duration = std::time::Duration::from_secs(4);
 
 /// Build the same raw `AgentEvent` the `agent-event --type running` CLI path
 /// sends (`agent_event_type_from_state("running") == EventType::Thinking`),
@@ -133,6 +166,135 @@ async fn run_daemon_status_cli(attach_socket: &Path, json: bool) -> CliStatusRes
     })
     .await
     .expect("daemon status CLI subprocess task did not panic")
+}
+
+/// A peer bound to an attach-socket path that ACCEPTS every connection and
+/// then never writes a byte back.
+///
+/// A peer that is merely ABSENT does not reach [`STATUS_REQUEST_TIMEOUT`],
+/// which is what issue #458 is about: `daemon/status/003` points the CLI at a
+/// path with nothing bound, and that fails at `connect(2)` in microseconds and
+/// takes the transport-error branch. Accepting and then staying silent is the
+/// cheap, deterministic way to hold the client at the deadline instead — a
+/// real daemon can of course get there by simply being slow, but nothing in
+/// the suite can stage that on demand.
+///
+/// The accepted streams are HELD in `held` rather than dropped, and that is
+/// load-bearing: dropping one closes the connection, the client reads EOF, and
+/// `run_daemon_status_cli` reports `unavailable (<transport error>)` from its
+/// `Ok(Err(_))` arm instead of the timeout arm — a green-looking run of the
+/// wrong branch.
+#[cfg(unix)]
+struct WedgedPeer {
+    path: std::path::PathBuf,
+    held: std::sync::Arc<tokio::sync::Mutex<Vec<tokio::net::UnixStream>>>,
+    acceptor: tokio::task::JoinHandle<()>,
+}
+
+#[cfg(unix)]
+impl WedgedPeer {
+    /// Bind the stub inside a scratch directory. The caller owns the path, so
+    /// this never touches the per-user attach socket a real daemon on this
+    /// machine is listening on.
+    async fn bind(path: std::path::PathBuf) -> Self {
+        let listener = tokio::net::UnixListener::bind(&path)
+            .unwrap_or_else(|e| panic!("bind the wedged stub listener at {}: {e}", path.display()));
+        let held = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let accepted = std::sync::Arc::clone(&held);
+        let acceptor = tokio::spawn(async move {
+            while let Ok((stream, _addr)) = listener.accept().await {
+                accepted.lock().await.push(stream);
+            }
+        });
+        Self {
+            path,
+            held,
+            acceptor,
+        }
+    }
+
+    /// How many connections the stub has accepted and is still holding open.
+    async fn connections_accepted(&self) -> usize {
+        self.held.lock().await.len()
+    }
+
+    /// Tear the stub down through its own handle: stop the acceptor, close
+    /// every held connection, and unlink the socket inode (binding a Unix
+    /// socket creates a file that closing the listener does not remove).
+    async fn shutdown(self) {
+        let Self {
+            path,
+            held,
+            acceptor,
+        } = self;
+        acceptor.abort();
+        let _ = acceptor.await;
+        drop(held);
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
+/// One watchdogged CLI run: what the subprocess reported, and how long the
+/// caller actually waited for it.
+#[cfg(unix)]
+struct TimedCliRun {
+    result: CliStatusResult,
+    elapsed: std::time::Duration,
+}
+
+/// Run the REAL `dot-agent-deck daemon status [--json]` CLI against
+/// `attach_socket` under this test's own wall-clock watchdog.
+///
+/// `kill_on_drop` is what makes the watchdog real rather than decorative: on
+/// expiry `tokio::time::timeout` drops the wait future, which drops the
+/// [`tokio::process::Child`] it owns, which sends the child a `SIGKILL`.
+/// Without it a build that lost its deadline would leave a `daemon status`
+/// process blocked on the stub's socket for the rest of the test binary's
+/// life.
+#[cfg(unix)]
+async fn run_daemon_status_cli_bounded(
+    attach_socket: &Path,
+    json: bool,
+    ceiling: std::time::Duration,
+) -> TimedCliRun {
+    let mut cmd = tokio::process::Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"));
+    cmd.arg("daemon").arg("status");
+    if json {
+        cmd.arg("--json");
+    }
+    cmd.env("DOT_AGENT_DECK_ATTACH_SOCKET", attach_socket)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+
+    let started = std::time::Instant::now();
+    let child = cmd
+        .spawn()
+        .expect("spawn the real `dot-agent-deck daemon status` CLI as a subprocess");
+    let output = tokio::time::timeout(ceiling, child.wait_with_output())
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "`dot-agent-deck daemon status{}` did not return within {ceiling:?} against a \
+                 peer that accepted the connection and never replied. The command bounds its \
+                 whole connect+request round trip with STATUS_REQUEST_TIMEOUT ({}s, \
+                 `src/daemon_status.rs`); it is now either gone, raised past this test's own \
+                 ceiling, or no longer wrapping this path, so `daemon status` hangs on a \
+                 wedged daemon instead of reporting it",
+                if json { " --json" } else { "" },
+                STATUS_REQUEST_TIMEOUT.as_secs(),
+            )
+        })
+        .expect("collect the daemon status CLI subprocess output");
+    TimedCliRun {
+        result: CliStatusResult {
+            status: output.status,
+            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        },
+        elapsed: started.elapsed(),
+    }
 }
 
 /// Wait until the in-process daemon's attach endpoint accepts connections.
@@ -786,4 +948,89 @@ async fn daemon_status_005_real_agent_event_cli_joins_live_state_inner() {
     );
 
     daemon.registry.shutdown_all();
+}
+
+/// Scenario: Bind a stub Unix socket in a scratch directory that accepts every connection and then never writes a reply, and point the REAL `dot-agent-deck daemon status` CLI at it in both its human and `--json` forms at once. Assert each subprocess returns inside this test's own 8s watchdog rather than hanging, exits non-zero without panicking, prints the `no response within 3s` timeout diagnostic naming the command's declared deadline, and emits nothing on stdout — so a wedged daemon is reported rather than waited on, and `--json` never fabricates an empty document for one.
+#[spec("daemon/status/006")]
+#[test]
+#[cfg(unix)]
+fn daemon_status_006_wedged_peer_times_out_instead_of_hanging() {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("build wedged-peer daemon-status runtime")
+        .block_on(daemon_status_006_wedged_peer_times_out_instead_of_hanging_inner());
+}
+
+#[cfg(unix)]
+async fn daemon_status_006_wedged_peer_times_out_instead_of_hanging_inner() {
+    common::init_test_env();
+    let scratch = common::race_safe_tempdir();
+    let attach_path = scratch.path().join("wedged-attach.sock");
+    let peer = WedgedPeer::bind(attach_path.clone()).await;
+
+    // Both modes concurrently against the one stub: each pays the same ~3s
+    // deadline, so running them in parallel keeps the whole test at roughly
+    // one deadline instead of two.
+    let (human, json) = tokio::join!(
+        run_daemon_status_cli_bounded(&attach_path, false, WEDGED_PEER_DEADLINE),
+        run_daemon_status_cli_bounded(&attach_path, true, WEDGED_PEER_DEADLINE),
+    );
+
+    let accepted = peer.connections_accepted().await;
+    peer.shutdown().await;
+
+    assert_eq!(
+        accepted, 2,
+        "the stub must have ACCEPTED one connection per CLI invocation; anything else means \
+         this ran `daemon/status/003`'s connect-failure path again rather than the \
+         accepted-but-unanswered one the round-trip deadline exists for"
+    );
+
+    for (mode, run) in [("daemon status", &human), ("daemon status --json", &json)] {
+        assert!(
+            !run.result.status.success(),
+            "`{mode}` against a peer that never replies must not report success; got \
+             status={:?} stdout={:?} stderr={:?}",
+            run.result.status,
+            run.result.stdout,
+            run.result.stderr
+        );
+        assert!(
+            !run.result.stderr.contains("panicked"),
+            "a wedged daemon must produce a controlled diagnostic, not a Rust panic; \
+             `{mode}` stderr={:?}",
+            run.result.stderr
+        );
+        assert!(
+            run.elapsed <= STATUS_REQUEST_TIMEOUT + WEDGED_PEER_SPAWN_SLACK,
+            "`{mode}` took {:?}, past its own declared {:?} round-trip deadline plus {:?} of \
+             spawn slack — the command is no longer honouring the STATUS_REQUEST_TIMEOUT it \
+             still reports to the operator",
+            run.elapsed,
+            STATUS_REQUEST_TIMEOUT,
+            WEDGED_PEER_SPAWN_SLACK
+        );
+        // The phrase is the branch's own signature: `run_daemon_status_cli`
+        // prints it from the `Err(_elapsed)` arm alone, so matching it rules
+        // out a transport error or a server-side `ok: false` having produced
+        // the non-zero exit instead.
+        let expected = format!("no response within {}s", STATUS_REQUEST_TIMEOUT.as_secs());
+        assert!(
+            run.result.stderr.contains(&expected),
+            "`{mode}` must report the round-trip deadline expiring, naming the deadline it \
+             actually applied; expected stderr to contain {expected:?}, got stderr={:?} \
+             stdout={:?}",
+            run.result.stderr,
+            run.result.stdout
+        );
+        assert!(
+            run.result.stdout.trim().is_empty(),
+            "a timed-out `{mode}` must print no status output at all — for `--json` in \
+             particular, an empty-but-well-formed document would tell a consumer the daemon \
+             is up with zero agents, which is the opposite of what happened; stdout={:?}",
+            run.result.stdout
+        );
+    }
 }
