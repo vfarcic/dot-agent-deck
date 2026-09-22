@@ -1552,6 +1552,13 @@ async fn ingest_event(
     // registry has never heard of the pane, and a non-`SessionStart` frame is
     // dropped. The card that needs the badge is an attached TUI's.
     state.stamp_orchestration_orphan(&mut event, daemon_owns_pane);
+    // PRD #1223: the pane-closed marker is the daemon's alone too — it makes an
+    // attached TUI drop the pane — so a producer's copy never reaches the
+    // fan-out. The daemon's own removal is broadcast directly and never passes
+    // through here (`crate::spawn::surface_attach_stopped_agent`).
+    event
+        .metadata
+        .remove(crate::event::DAEMON_PANE_CLOSED_METADATA_KEY);
     let _ = event_tx.send(BroadcastMsg::Event(event.clone()));
     state.apply_event(event);
 }
@@ -3421,6 +3428,48 @@ mod hook_ingestion_tests {
     use std::os::unix::fs::PermissionsExt;
     use tokio::io::AsyncWriteExt;
     use tokio::net::{UnixListener, UnixStream};
+
+    /// PRD #1223: the pane-closed marker is daemon-authoritative. A producer
+    /// posting it on the hook socket must not reach an attached TUI with it —
+    /// that would let any same-uid process make a TUI drop a live pane.
+    #[tokio::test]
+    async fn ingest_strips_a_producer_supplied_pane_closed_marker() {
+        let registry = AgentPtyRegistry::new();
+        let state: SharedState =
+            Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
+        let (event_tx, mut rx) = broadcast::channel(8);
+        let mut metadata = std::collections::HashMap::new();
+        metadata.insert(
+            crate::event::DAEMON_PANE_CLOSED_METADATA_KEY.to_string(),
+            crate::event::DAEMON_PANE_CLOSED_METADATA_VALUE.to_string(),
+        );
+        let forged = AgentEvent {
+            session_id: "pane-victim".to_string(),
+            agent_type: AgentType::None,
+            event_type: crate::event::EventType::SessionEnd,
+            tool_name: None,
+            tool_detail: None,
+            cwd: None,
+            timestamp: chrono::Utc::now(),
+            user_prompt: None,
+            metadata,
+            pane_id: Some("victim".to_string()),
+            agent_id: None,
+            agent_version: None,
+            schema_version: None,
+            live_target: None,
+        };
+        assert!(forged.is_daemon_pane_closed(), "precondition");
+        ingest_event(&state, &event_tx, &registry, forged).await;
+        let BroadcastMsg::Event(relayed) = rx.try_recv().expect("the event is relayed") else {
+            panic!("expected an event");
+        };
+        assert!(
+            !relayed.is_daemon_pane_closed(),
+            "the relayed copy must not carry the marker: {:?}",
+            relayed.metadata
+        );
+    }
 
     /// Scenario: Surface a hookless scheduled pane only through the daemon's live broadcast, leaving daemon AppState intentionally empty, then publish the exact delivery notice used when the 256-watch cap rejects the next confirmation. The already-visible attached-TUI card must receive an Error event through the production sink.
     #[spec("scheduler/dispatch/017")]

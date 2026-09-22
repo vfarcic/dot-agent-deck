@@ -2673,6 +2673,59 @@ pub(crate) fn surface_attach_started_agent(
     }
 }
 
+/// PRD #1223: announce to every attached TUI that `record`'s agent was stopped
+/// and its pane `pane_id` is gone — the removal half of
+/// [`surface_attach_started_agent`].
+///
+/// `StopAgent` used to answer only the client that sent it. The sending TUI
+/// cleans up locally after its own close, but every OTHER client was left with
+/// what it had drawn: a desktop-stopped agent kept its card in an attached TUI,
+/// and a desktop-closed orchestration kept its tab, indefinitely
+/// (`newagent/visibility/003` / `004`). Emitted from the `StopAgent` arm itself,
+/// so it covers every route into it — the desktop's single stop, its per-role
+/// orchestration fan-out, a TUI's own `Ctrl+W`, and a TUI's attach-failure
+/// cleanup — without asking which client sent it.
+///
+/// One card-surface-shaped `SessionEnd`, marked
+/// [`crate::event::DAEMON_PANE_CLOSED_METADATA_KEY`] and filed under the
+/// placeholder key as the start's card is. It names the stopped agent, so a TUI
+/// never drops a pane a successor agent has since taken.
+///
+/// Idempotent by construction on the receiving side
+/// ([`crate::state::AppState::apply_daemon_pane_closed`]): a TUI that already
+/// closed the pane itself finds nothing to remove. The caller emits it only
+/// after the child is reaped and the pane unregistered, and while it still holds
+/// the pane's cleanup hold, so no successor's start can be broadcast ahead of
+/// it. Best-effort, as every broadcast.
+pub(crate) fn surface_attach_stopped_agent(
+    event_tx: &broadcast::Sender<BroadcastMsg>,
+    record: &crate::agent_pty::AgentRecord,
+    pane_id: &str,
+) {
+    let mut metadata = HashMap::new();
+    metadata.insert(
+        crate::event::DAEMON_PANE_CLOSED_METADATA_KEY.to_string(),
+        crate::event::DAEMON_PANE_CLOSED_METADATA_VALUE.to_string(),
+    );
+    let event = AgentEvent {
+        session_id: crate::state::placeholder_session_id(pane_id),
+        agent_type: record.agent_type.clone().unwrap_or(AgentType::None),
+        event_type: EventType::SessionEnd,
+        tool_name: None,
+        tool_detail: None,
+        cwd: record.cwd.clone(),
+        timestamp: Utc::now(),
+        user_prompt: None,
+        metadata,
+        pane_id: Some(pane_id.to_string()),
+        agent_id: Some(record.id.clone()),
+        agent_version: None,
+        schema_version: None,
+        live_target: None,
+    };
+    let _ = event_tx.send(BroadcastMsg::Event(event));
+}
+
 /// Issue #960: the run-identifying tab label for a DAEMON-SPAWNED orchestration,
 /// or `None` when there is nothing to add to the canonical `name`.
 ///
@@ -6922,6 +6975,51 @@ mod tests {
             Some("7"),
             "an untagged card-surface event must not blank the card's generation"
         );
+    }
+
+    /// PRD #1223: a stop is announced as ONE marked `SessionEnd` naming the
+    /// stopped agent, filed under the placeholder key the start's card used.
+    #[test]
+    fn attach_stopped_agent_announces_one_marked_session_end() {
+        let (tx, mut rx) = broadcast::channel(8);
+        let record = attach_record(
+            Some("desktop-ab-1"),
+            Some("builder"),
+            Some(orchestration_membership("builder")),
+        );
+        surface_attach_stopped_agent(&tx, &record, "desktop-ab-1");
+        let msgs = drain(&mut rx);
+        let [BroadcastMsg::Event(e)] = msgs.as_slice() else {
+            panic!("expected exactly one event, got {msgs:?}");
+        };
+        assert!(e.is_daemon_pane_closed());
+        assert_eq!(e.event_type, EventType::SessionEnd);
+        assert_eq!(
+            e.session_id,
+            crate::state::placeholder_session_id("desktop-ab-1")
+        );
+        assert_eq!(e.pane_id.as_deref(), Some("desktop-ab-1"));
+        assert_eq!(e.agent_id.as_deref(), Some("7"));
+        assert!(e.is_daemon_synthetic());
+
+        // And the TUI side removes the card the matching start drew.
+        let (tx, mut rx) = broadcast::channel(8);
+        let dashboard = attach_record(Some("desktop-ab-0"), Some("mine"), None);
+        surface_attach_started_agent(&tx, &dashboard, None);
+        surface_attach_stopped_agent(&tx, &dashboard, "desktop-ab-0");
+        let mut state = crate::state::AppState::default();
+        for msg in drain(&mut rx) {
+            let BroadcastMsg::Event(e) = msg else {
+                panic!("expected events only");
+            };
+            state.apply_event(e);
+        }
+        assert!(
+            state.sessions.is_empty(),
+            "start then stop leaves no card: {:?}",
+            state.sessions
+        );
+        assert!(!state.managed_pane_ids.contains("desktop-ab-0"));
     }
 
     #[test]

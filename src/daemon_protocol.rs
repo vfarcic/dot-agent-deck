@@ -3921,6 +3921,25 @@ async fn handle_connection(
                         // leaves a record behind.
                         state.write().await.unregister_pane(pane_id);
                         registry.finish_pane_close(pane_id, true);
+                        // PRD #1223: tell every attached TUI the pane is gone,
+                        // not only the client that asked — a desktop stop was
+                        // otherwise invisible to an attached TUI, which kept
+                        // the card (and an orchestration's tab) indefinitely.
+                        // Here, and only here, for three reasons: it is the one
+                        // arm every stop route reaches; `pane_id_env` is `Some`
+                        // only while this agent still held the pane, so a stale
+                        // stop never removes a successor's pane; and the
+                        // cleanup hold is still held, so no successor's start
+                        // can be broadcast ahead of this removal. After the
+                        // child is reaped, so the removal describes a finished
+                        // stop; a hook the dying agent posted that is still in
+                        // flight lands on a pane the TUI has unregistered, where
+                        // a non-`SessionStart` frame is dropped rather than
+                        // redrawing the card. See
+                        // `crate::spawn::surface_attach_stopped_agent`.
+                        if let Some(record) = stopping_record.as_ref() {
+                            crate::spawn::surface_attach_stopped_agent(&event_tx, record, pane_id);
+                        }
                     }
                     // PRD #120 M2.4 + S1: if this agent was dispatched into a
                     // per-issue worktree, the tab close is its cleanup trigger.
@@ -6065,6 +6084,125 @@ mod tests {
                 "…and its routing identity"
             );
         }
+
+        registry.shutdown_all();
+        server.abort();
+    }
+
+    /// PRD #1223: a successful `StopAgent` announces the closed pane to EVERY
+    /// subscriber — not only the client that asked, which is how a desktop stop
+    /// left an attached TUI's card up forever — naming the stopped agent, after
+    /// the daemon has unregistered the pane. A stale stop for a retired
+    /// generation whose pane a successor has since taken announces nothing: the
+    /// removal would otherwise take the LIVE successor's card off every TUI.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stop_agent_announces_the_closed_pane_but_a_stale_stop_announces_nothing() {
+        use crate::daemon_client::{DaemonClient, StartAgentOptions};
+
+        let dir = tempfile::tempdir().expect("tempdir for the attach socket");
+        let sock = dir.path().join("attach.sock");
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let (event_tx, mut rx) = broadcast::channel(64);
+        let state: SharedState =
+            Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
+
+        let server = {
+            let sock = sock.clone();
+            let registry = registry.clone();
+            let state = state.clone();
+            tokio::spawn(async move {
+                let _ = run_attach_server_with_counter(
+                    &sock,
+                    registry,
+                    event_tx,
+                    Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                    state,
+                )
+                .await;
+            })
+        };
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while tokio::net::UnixStream::connect(&sock).await.is_err() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "attach socket never came up at {}",
+                sock.display()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let client = DaemonClient::new(sock.clone());
+        let spawn_on = |command: &str, pane_id: &str| StartAgentOptions {
+            command: Some(command.to_string()),
+            cwd: Some(dir.path().to_string_lossy().into_owned()),
+            env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), pane_id.to_string())],
+            ..StartAgentOptions::default()
+        };
+        let closures = |rx: &mut broadcast::Receiver<BroadcastMsg>| {
+            std::iter::from_fn(|| rx.try_recv().ok())
+                .filter_map(|msg| match msg {
+                    BroadcastMsg::Event(e) if e.is_daemon_pane_closed() => Some(e),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+
+        // The ordinary stop.
+        let pane_id = "stopped-pane-1223";
+        let agent_id = client
+            .start_agent(spawn_on("/bin/cat", pane_id))
+            .await
+            .expect("spawn a live pane");
+        let _ = closures(&mut rx);
+        client.stop_agent(&agent_id).await.expect("stop it");
+        let announced = closures(&mut rx);
+        let [closure] = announced.as_slice() else {
+            panic!("expected exactly one pane-closed announcement, got {announced:#?}");
+        };
+        assert_eq!(closure.pane_id.as_deref(), Some(pane_id));
+        assert_eq!(closure.agent_id.as_deref(), Some(agent_id.as_str()));
+        assert_eq!(
+            closure.session_id,
+            crate::state::placeholder_session_id(pane_id),
+            "filed under the placeholder key the start's card uses"
+        );
+        assert!(
+            !state.read().await.managed_pane_ids.contains(pane_id),
+            "announced only once the daemon itself has let the pane go"
+        );
+
+        // The stale stop: A dies, B takes the pane, only then is A stopped.
+        let pane_id = "handover-pane-1223";
+        let old_id = client
+            .start_agent(spawn_on("/usr/bin/true", pane_id))
+            .await
+            .expect("spawn the first generation");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while registry.live_count() != 0 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the first child never exited"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let new_id = client
+            .start_agent(spawn_on("/bin/cat", pane_id))
+            .await
+            .expect("the pane is reusable once its child is gone");
+        let _ = closures(&mut rx);
+        client
+            .stop_agent(&old_id)
+            .await
+            .expect("stop the retired generation");
+        let announced = closures(&mut rx);
+        assert!(
+            announced.is_empty(),
+            "a stale stop must not announce the successor's pane closed: {announced:#?}"
+        );
+        assert_eq!(
+            registry.pane_current_agent_id(pane_id).as_deref(),
+            Some(new_id.as_str())
+        );
 
         registry.shutdown_all();
         server.abort();

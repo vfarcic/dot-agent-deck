@@ -41,6 +41,24 @@ pub fn placeholder_session_id(pane_id: &str) -> String {
 /// to build). Sized well above any realistic concurrent-dispatch burst (a fire's
 /// `max_per_run` issue dispatches is single/low-double digits).
 const MAX_PENDING_ORCHESTRATION_SURFACES: usize = 64;
+
+/// PRD #1223: cap on [`AppState::pending_pane_closures`], for the same reason
+/// and with the same drop-oldest policy as the surface queue above. Closures are
+/// drained all at once each frame, so this is only reached by a burst larger
+/// than any orchestration (a tab holds at most
+/// `ORCHESTRATION_ROLE_INDEX_MAX + 1` roles).
+const MAX_PENDING_PANE_CLOSURES: usize = 256;
+
+/// PRD #1223: a pane the daemon announced as stopped and gone, queued for the
+/// TUI's render loop (see [`AppState::apply_daemon_pane_closed`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaneClosure {
+    pub pane_id: String,
+    /// The registry id of the agent that was stopped. The render loop leaves a
+    /// pane alone whose local attachment is bound to a DIFFERENT agent — a
+    /// successor now owns it.
+    pub agent_id: Option<String>,
+}
 /// Maximum number of first-prompt entries retained per session. The live-side
 /// cap in `apply_event` and the wire-boundary clamp in
 /// [`crate::daemon_client`] (which re-clamps a hostile/oversized daemon
@@ -1160,6 +1178,13 @@ pub struct AppState {
     /// holding a queue of them would invite the unbounded growth
     /// `pending_orchestration_surfaces` needs a cap for.
     pub pending_worktree_kept: Option<crate::issue_dispatch_run::KeptWorktree>,
+    /// PRD #1223: panes the daemon announced as stopped, waiting for the render
+    /// loop to drop them from the `TabManager`, the pane controller and the
+    /// `UiState` maps — none of which the event subscriber can reach. The
+    /// `AppState` half of the cleanup is applied at once, in broadcast order, by
+    /// [`Self::apply_daemon_pane_closed`]; only the rest waits here. Bounded by
+    /// `MAX_PENDING_PANE_CLOSURES`.
+    pub pending_pane_closures: Vec<PaneClosure>,
     /// PRD #20 R20-003 (finding #4): the DAEMON-AUTHORITATIVE hook session id
     /// (the "generation") currently bound to each pane, keyed by `pane_id`.
     /// Captured from every event's ORIGINAL `session_id` BEFORE the same-agent
@@ -6918,6 +6943,69 @@ impl AppState {
         self.pending_worktree_kept = Some(kept);
     }
 
+    /// PRD #1223: apply the daemon's pane-closed announcement
+    /// ([`crate::event::DAEMON_PANE_CLOSED_METADATA_KEY`]) — the removal a TUI
+    /// performs for its own close, for a stop some OTHER client asked for.
+    ///
+    /// Two halves, split by what this side can reach:
+    ///
+    /// * here, at once and in broadcast order — every session on the pane that
+    ///   belongs to the stopped agent (or names no agent, as a placeholder or a
+    ///   daemon-surfaced card does) goes, and the pane is unregistered, exactly
+    ///   as the native close's `remove_sessions_for_pane` + `unregister_pane`.
+    ///   Doing it in order is what keeps a later event from being undone: a
+    ///   successor's start for the same pane id can only be broadcast after this
+    ///   removal, so it is applied after it and redraws its own card, and a late
+    ///   hook from the dying agent finds the pane unregistered and is dropped;
+    /// * queued ([`Self::pending_pane_closures`]) — the tab, the pane
+    ///   controller's local attachment and the `UiState` maps, which live on the
+    ///   render thread.
+    ///
+    /// **Idempotent.** A pane this TUI already closed itself — its own `Ctrl+W`
+    /// also reaches the daemon's `StopAgent`, so it receives this too — has no
+    /// sessions and no registration left, and both calls are no-ops; the queued
+    /// half then finds no tab and no attachment either. A session tagged with a
+    /// DIFFERENT agent id is a successor's and is kept, and so is the pane's
+    /// registration while any session remains on it.
+    pub fn apply_daemon_pane_closed(&mut self, pane_id: &str, agent_id: Option<&str>) {
+        let doomed: Vec<String> = self
+            .sessions
+            .iter()
+            .filter(|(_, s)| {
+                s.pane_id.as_deref() == Some(pane_id)
+                    && (s.agent_id.is_none() || s.agent_id.as_deref() == agent_id)
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in doomed {
+            self.sessions.remove(&id);
+        }
+        if !self
+            .sessions
+            .values()
+            .any(|s| s.pane_id.as_deref() == Some(pane_id))
+        {
+            self.unregister_pane(pane_id);
+        }
+        if self.pending_pane_closures.len() >= MAX_PENDING_PANE_CLOSURES {
+            let dropped = self.pending_pane_closures.remove(0);
+            tracing::warn!(
+                pane_id = %dropped.pane_id,
+                cap = MAX_PENDING_PANE_CLOSURES,
+                "apply_daemon_pane_closed: pending queue at cap; dropping oldest closure"
+            );
+        }
+        self.pending_pane_closures.push(PaneClosure {
+            pane_id: pane_id.to_string(),
+            agent_id: agent_id.map(str::to_string),
+        });
+    }
+
+    /// PRD #1223: take every queued pane closure, oldest first.
+    pub fn take_pane_closures(&mut self) -> Vec<PaneClosure> {
+        std::mem::take(&mut self.pending_pane_closures)
+    }
+
     /// Issue #717: take the pending kept-worktree report, if any.
     pub fn take_worktree_kept(&mut self) -> Option<crate::issue_dispatch_run::KeptWorktree> {
         self.pending_worktree_kept.take()
@@ -8657,6 +8745,16 @@ impl AppState {
     }
 
     pub fn apply_event(&mut self, mut event: AgentEvent) {
+        // PRD #1223: the daemon's pane-closed announcement is a statement ABOUT
+        // a pane, not a producer's conversation ending, so none of the
+        // `SessionEnd` machinery below applies to it — in particular its
+        // restore-a-placeholder step would redraw the very card it removes.
+        if event.is_daemon_pane_closed() {
+            if let Some(pane_id) = event.pane_id.as_deref() {
+                self.apply_daemon_pane_closed(pane_id, event.agent_id.as_deref());
+            }
+            return;
+        }
         // Issue #833: `tool_name` / `tool_detail` are PRODUCER-supplied — every
         // agent on the deck can post to the hook socket — and both are drawn
         // into a card's tool line (`ui::recent_tool_lines` reads them off the
@@ -11868,6 +11966,103 @@ mod tests {
             None,
             "a token-less worker must not resolve a tokened orchestrator"
         );
+    }
+
+    fn daemon_pane_closed(pane: &str, agent: Option<&str>) -> AgentEvent {
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            crate::event::DAEMON_PANE_CLOSED_METADATA_KEY.to_string(),
+            crate::event::DAEMON_PANE_CLOSED_METADATA_VALUE.to_string(),
+        );
+        AgentEvent {
+            session_id: placeholder_session_id(pane),
+            agent_type: AgentType::None,
+            event_type: EventType::SessionEnd,
+            tool_name: None,
+            tool_detail: None,
+            cwd: None,
+            timestamp: Utc::now(),
+            user_prompt: None,
+            metadata,
+            pane_id: Some(pane.to_string()),
+            agent_id: agent.map(str::to_string),
+            agent_version: None,
+            schema_version: None,
+            live_target: None,
+        }
+    }
+
+    /// PRD #1223: the daemon's pane-closed announcement removes EVERY card the
+    /// stopped agent had on the pane and unregisters it — without the ordinary
+    /// `SessionEnd` path's restored placeholder, which would redraw the card —
+    /// and queues the pane for the render loop. Applying it again, as a TUI
+    /// whose own close reached the daemon does, removes nothing more.
+    #[test]
+    fn daemon_pane_closed_removes_the_panes_cards_and_is_idempotent() {
+        let mut state = AppState::default();
+        state.register_pane("p-1".into());
+        state.insert_placeholder_session("p-1".into(), Some("/w".into()), None, Some("7".into()));
+        state.register_pane("other".into());
+        state.insert_placeholder_session("other".into(), None, None, None);
+
+        state.apply_event(daemon_pane_closed("p-1", Some("7")));
+        assert!(
+            state
+                .sessions
+                .values()
+                .all(|s| s.pane_id.as_deref() != Some("p-1")),
+            "no card left on the closed pane: {:?}",
+            state.sessions
+        );
+        assert!(!state.managed_pane_ids.contains("p-1"));
+        assert!(
+            state.managed_pane_ids.contains("other"),
+            "other panes untouched"
+        );
+        assert_eq!(state.sessions.len(), 1);
+
+        state.apply_event(daemon_pane_closed("p-1", Some("7")));
+        assert_eq!(state.sessions.len(), 1, "a second announcement is a no-op");
+        assert_eq!(
+            state.take_pane_closures(),
+            vec![
+                PaneClosure {
+                    pane_id: "p-1".into(),
+                    agent_id: Some("7".into()),
+                };
+                2
+            ],
+            "each announcement is queued; the render loop's half is idempotent too"
+        );
+        assert!(state.take_pane_closures().is_empty(), "take drains");
+    }
+
+    /// PRD #1223: a card tagged with a DIFFERENT agent is a successor's, so it
+    /// and the pane's registration survive a removal naming the stopped agent.
+    #[test]
+    fn daemon_pane_closed_spares_a_successor_agents_card() {
+        let mut state = AppState::default();
+        state.register_pane("p-1".into());
+        state.insert_placeholder_session("p-1".into(), None, None, Some("8".into()));
+
+        state.apply_event(daemon_pane_closed("p-1", Some("7")));
+        assert_eq!(state.sessions.len(), 1, "the successor's card stays");
+        assert!(
+            state.managed_pane_ids.contains("p-1"),
+            "and so does the pane"
+        );
+    }
+
+    /// PRD #1223: the marker is only honoured on a `SessionEnd` with a pane id.
+    #[test]
+    fn daemon_pane_closed_requires_a_session_end_with_a_pane() {
+        let mut other_type = daemon_pane_closed("p-1", None);
+        other_type.event_type = EventType::Idle;
+        assert!(!other_type.is_daemon_pane_closed());
+        let mut paneless = daemon_pane_closed("p-1", None);
+        paneless.pane_id = None;
+        assert!(!paneless.is_daemon_pane_closed());
+        assert!(daemon_pane_closed("p-1", None).is_daemon_pane_closed());
     }
 
     /// M2.3: closing a pane drops its routing identity, so a later delegate

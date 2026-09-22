@@ -5120,6 +5120,111 @@ fn process_pending_orchestration_surfaces(
     surface_one_orchestration(state, embedded, tab_manager, surface, ui);
 }
 
+/// PRD #1223: the render-thread half of a daemon pane-closed announcement —
+/// what a native close removes that the event subscriber cannot reach.
+///
+/// [`AppState::apply_daemon_pane_closed`] has already dropped the pane's
+/// sessions and registration, in broadcast order; this drops the pane's local
+/// attachment, its slot in a Mode/Orchestration tab, and its `UiState` maps. A
+/// tab left with no live pane goes too — [`TabManager::forget_externally_closed_pane`]
+/// — together with its dead-slot placeholder cards, and focus follows
+/// [`close_tab_by_index`]: a user on that tab is returned to the Dashboard and
+/// out of `PaneInput`, and a user anywhere else keeps their tab and their mode.
+/// Leaving `PaneInput` also happens when the stopped pane was the one being
+/// typed into, which a native close does by construction (it is confirmed from
+/// a modal) and a remote one has to do explicitly.
+///
+/// Idempotent: a pane this TUI closed itself (its own close reached the same
+/// `StopAgent`, so it is announced too) is in no tab and holds no attachment,
+/// and nothing happens. A pane whose local attachment is bound to a different
+/// agent than the stopped one belongs to a successor and is left alone.
+fn process_pending_pane_closures(
+    state: &SharedState,
+    pane: &dyn PaneController,
+    tab_manager: &mut TabManager,
+    ui: &mut UiState,
+) {
+    // Same cheap read-lock peek as the surface drain above.
+    if state.blocking_read().pending_pane_closures.is_empty() {
+        return;
+    }
+    let closures = state.blocking_write().take_pane_closures();
+    for closure in closures {
+        apply_pane_closure(state, pane, tab_manager, ui, &closure);
+    }
+}
+
+fn apply_pane_closure(
+    state: &SharedState,
+    pane: &dyn PaneController,
+    tab_manager: &mut TabManager,
+    ui: &mut UiState,
+    closure: &crate::state::PaneClosure,
+) {
+    let pane_id = closure.pane_id.as_str();
+    if let (Some(bound), Some(stopped)) = (pane.pane_agent_id(pane_id), closure.agent_id.as_deref())
+        && bound != stopped
+    {
+        tracing::debug!(
+            pane_id,
+            bound_agent_id = %bound,
+            stopped_agent_id = %stopped,
+            "daemon pane closure: pane is attached to a different agent now; leaving it"
+        );
+        return;
+    }
+    let was_focused = pane.focused_pane_id().as_deref() == Some(pane_id);
+    let forgot_attachment = pane.forget_pane(pane_id);
+    let tab_outcome = tab_manager.forget_externally_closed_pane(pane_id);
+    let known = forgot_attachment
+        || tab_outcome.is_some()
+        || ui.pane_metadata.contains_key(pane_id)
+        || ui.pane_names.contains_key(pane_id);
+    if !known {
+        return;
+    }
+    {
+        let mut st = state.blocking_write();
+        // Again, for anything the render thread drew on this pane since the
+        // subscriber's pass (a surface grown into it this frame).
+        st.sessions.retain(|_, s| {
+            s.pane_id.as_deref() != Some(pane_id)
+                || s.agent_id
+                    .as_deref()
+                    .is_some_and(|a| Some(a) != closure.agent_id.as_deref())
+        });
+        if !st
+            .sessions
+            .values()
+            .any(|s| s.pane_id.as_deref() == Some(pane_id))
+        {
+            st.unregister_pane(pane_id);
+        }
+        if let Some(outcome) = tab_outcome.as_ref() {
+            for dead in &outcome.dead_slot_pane_ids {
+                st.remove_sessions_for_pane(dead);
+            }
+        }
+    }
+    ui.pane_metadata.remove(pane_id);
+    ui.pane_declared_agent.remove(pane_id);
+    ui.pane_display_names.remove(pane_id);
+    ui.pane_names.remove(pane_id);
+    let left_active_tab = tab_outcome
+        .as_ref()
+        .is_some_and(|o| o.tab_removed && o.was_active);
+    if ui.mode == UiMode::PaneInput && (left_active_tab || was_focused) {
+        ui.mode = UiMode::Normal;
+    }
+    if tab_outcome.as_ref().is_some_and(|o| o.tab_removed) {
+        ui.status_message = Some((
+            "Closed a tab whose agents were stopped by another client".to_string(),
+            std::time::Instant::now(),
+        ));
+    }
+    ui.mark_session_dirty();
+}
+
 /// Build one live orchestration tab from a daemon [`OrchestrationSurface`].
 /// Idempotent on the role pane ids, so a duplicate broadcast (or a race with a
 /// reconnect that already hydrated the tab) doesn't double-build.
@@ -13446,6 +13551,10 @@ pub fn run_tui(
         // mid-session (issue dispatch). Done before the snapshot clone + tab
         // derivation below so a freshly-surfaced tab paints this same frame.
         process_pending_orchestration_surfaces(&state, &pane, &mut tab_manager, &mut ui);
+        // PRD #1223: drop panes the daemon announced as stopped by another
+        // client — after the surfaces, so a tab a pending surface still has to
+        // build or grow is never judged empty before it exists.
+        process_pending_pane_closures(&state, pane.as_ref(), &mut tab_manager, &mut ui);
         // Issue #717: report a dispatched worktree the daemon actually left
         // on disk. Queued by the event subscriber, drained here because the
         // status line is `UiState`.
@@ -40476,5 +40585,239 @@ mod tests {
             !text.replace('\n', "").contains(char::is_control),
             "no control character from a warning body may reach the terminal: {text:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod pane_closure_tests {
+    //! PRD #1223: the render-thread half of a daemon pane-closed announcement.
+    use super::*;
+    use crate::project_config::OrchestrationRoleConfig;
+    use std::sync::Mutex;
+
+    /// A controller holding local attachments `pane → agent id`, with one of
+    /// them focused, recording what `forget_pane` dropped. `close_pane` must
+    /// never be reached: the agent is already gone.
+    struct AttachedPC {
+        attached: Mutex<HashMap<String, String>>,
+        focused: Option<String>,
+    }
+    impl AttachedPC {
+        fn new(attached: &[(&str, &str)], focused: Option<&str>) -> Self {
+            Self {
+                attached: Mutex::new(
+                    attached
+                        .iter()
+                        .map(|(p, a)| (p.to_string(), a.to_string()))
+                        .collect(),
+                ),
+                focused: focused.map(str::to_string),
+            }
+        }
+        fn holds(&self, pane: &str) -> bool {
+            self.attached.lock().unwrap().contains_key(pane)
+        }
+    }
+    impl PaneController for AttachedPC {
+        fn focus_pane(&self, _id: &str) -> Result<(), PaneError> {
+            Ok(())
+        }
+        fn focused_pane_id(&self) -> Option<String> {
+            self.focused.clone()
+        }
+        fn pane_agent_id(&self, pane_id: &str) -> Option<String> {
+            self.attached.lock().unwrap().get(pane_id).cloned()
+        }
+        fn forget_pane(&self, pane_id: &str) -> bool {
+            self.attached.lock().unwrap().remove(pane_id).is_some()
+        }
+        fn close_pane(&self, id: &str) -> Result<(), PaneError> {
+            panic!("a pane another client stopped must not be closed again: {id}");
+        }
+        fn list_panes(&self) -> Result<Vec<crate::pane::PaneInfo>, PaneError> {
+            Ok(vec![])
+        }
+        fn resize_pane(
+            &self,
+            _i: &str,
+            _d: crate::pane::PaneDirection,
+            _a: u16,
+        ) -> Result<(), PaneError> {
+            Ok(())
+        }
+        fn rename_pane(&self, _i: &str, n: &str) -> Result<RenameOutcome, PaneError> {
+            Ok(RenameOutcome::Applied(n.to_string()))
+        }
+        fn toggle_layout(&self) -> Result<(), PaneError> {
+            Ok(())
+        }
+        fn write_to_pane(&self, _i: &str, _t: &str) -> Result<(), PaneError> {
+            Ok(())
+        }
+        fn name(&self) -> &str {
+            "attached-mock"
+        }
+        fn is_available(&self) -> bool {
+            true
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    fn role(name: &str, start: bool) -> OrchestrationRoleConfig {
+        OrchestrationRoleConfig {
+            agent: None,
+            name: name.to_string(),
+            command: format!("echo {name}"),
+            start,
+            description: None,
+            prompt_template: None,
+            clear: false,
+        }
+    }
+
+    fn team() -> OrchestrationConfig {
+        OrchestrationConfig {
+            default: false,
+            name: "team".to_string(),
+            roles: vec![role("lead", true), role("coder", false)],
+        }
+    }
+
+    /// Announce `pane` closed the way the daemon does and run the render loop's
+    /// drain once.
+    fn announce(
+        state: &SharedState,
+        pane: &dyn PaneController,
+        tab_manager: &mut TabManager,
+        ui: &mut UiState,
+        pane_id: &str,
+        agent_id: &str,
+    ) {
+        state
+            .blocking_write()
+            .apply_daemon_pane_closed(pane_id, Some(agent_id));
+        process_pending_pane_closures(state, pane, tab_manager, ui);
+    }
+
+    fn cards_on(state: &SharedState, pane_id: &str) -> usize {
+        state
+            .blocking_read()
+            .sessions
+            .values()
+            .filter(|s| s.pane_id.as_deref() == Some(pane_id))
+            .count()
+    }
+
+    /// Stopping every role of an orchestration the user is typing into removes
+    /// the tab and its cards, returns them to the Dashboard and out of
+    /// `PaneInput`, and never calls `close_pane`. Repeating the announcement —
+    /// what a TUI's own close produces — changes nothing.
+    #[test]
+    fn stopping_every_role_removes_the_tab_and_returns_focus_to_the_dashboard() {
+        let pc = Arc::new(AttachedPC::new(
+            &[("lead", "1"), ("coder", "2")],
+            Some("coder"),
+        ));
+        let mut tab_manager = TabManager::new(pc.clone());
+        tab_manager
+            .open_orchestration_tab_with_existing_role_panes(
+                &team(),
+                "/work",
+                vec![Some("lead".into()), Some("coder".into())],
+                Some("Team run"),
+                None,
+            )
+            .expect("open the tab");
+        let state: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
+        {
+            let mut st = state.blocking_write();
+            for (pane, agent) in [("lead", "1"), ("coder", "2")] {
+                st.register_pane(pane.into());
+                st.insert_placeholder_session(pane.into(), None, None, Some(agent.into()));
+            }
+        }
+        let mut ui = UiState::new(DashboardConfig::default(), KeybindingConfig::default());
+        ui.mode = UiMode::PaneInput;
+        ui.pane_names.insert("lead".into(), "lead".into());
+        ui.pane_names.insert("coder".into(), "coder".into());
+
+        announce(&state, pc.as_ref(), &mut tab_manager, &mut ui, "lead", "1");
+        assert_eq!(tab_manager.tab_count(), 2, "a live role remains");
+        assert_eq!(
+            ui.mode,
+            UiMode::PaneInput,
+            "the focused role is still alive"
+        );
+        assert!(!pc.holds("lead"));
+        assert_eq!(cards_on(&state, "lead"), 0);
+        assert!(!ui.pane_names.contains_key("lead"));
+
+        announce(&state, pc.as_ref(), &mut tab_manager, &mut ui, "coder", "2");
+        assert_eq!(tab_manager.tab_count(), 1, "the now-empty tab is gone");
+        assert_eq!(tab_manager.active_index(), 0, "back on the Dashboard");
+        assert_eq!(ui.mode, UiMode::Normal);
+        assert!(state.blocking_read().sessions.is_empty());
+
+        announce(&state, pc.as_ref(), &mut tab_manager, &mut ui, "coder", "2");
+        assert_eq!(tab_manager.tab_count(), 1, "idempotent");
+    }
+
+    /// A user on the Dashboard keeps their place and mode when an orchestration
+    /// tab they are not looking at empties.
+    #[test]
+    fn a_user_elsewhere_keeps_their_focus() {
+        let pc = Arc::new(AttachedPC::new(
+            &[("lead", "1"), ("mine", "9")],
+            Some("mine"),
+        ));
+        let mut tab_manager = TabManager::new(pc.clone());
+        tab_manager
+            .open_orchestration_tab_with_existing_role_panes(
+                &team(),
+                "/work",
+                vec![Some("lead".into()), None],
+                None,
+                None,
+            )
+            .expect("open the tab");
+        tab_manager.switch_to(0);
+        let state: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
+        let mut ui = UiState::new(DashboardConfig::default(), KeybindingConfig::default());
+        ui.mode = UiMode::PaneInput;
+
+        announce(&state, pc.as_ref(), &mut tab_manager, &mut ui, "lead", "1");
+        assert_eq!(tab_manager.tab_count(), 1);
+        assert_eq!(tab_manager.active_index(), 0);
+        assert_eq!(
+            ui.mode,
+            UiMode::PaneInput,
+            "typing into another pane is left alone"
+        );
+        assert!(pc.holds("mine"));
+    }
+
+    /// A pane whose attachment is bound to a DIFFERENT agent than the stopped
+    /// one belongs to a successor and is left entirely alone.
+    #[test]
+    fn a_successor_bound_pane_is_left_alone() {
+        let pc = Arc::new(AttachedPC::new(&[("lead", "5")], None));
+        let mut tab_manager = TabManager::new(pc.clone());
+        tab_manager
+            .open_orchestration_tab_with_existing_role_panes(
+                &team(),
+                "/work",
+                vec![Some("lead".into()), None],
+                None,
+                None,
+            )
+            .expect("open the tab");
+        let state: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
+        let mut ui = UiState::new(DashboardConfig::default(), KeybindingConfig::default());
+
+        announce(&state, pc.as_ref(), &mut tab_manager, &mut ui, "lead", "1");
+        assert!(pc.holds("lead"));
+        assert_eq!(tab_manager.tab_count(), 2);
     }
 }
