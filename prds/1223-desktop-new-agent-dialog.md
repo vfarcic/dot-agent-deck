@@ -1,0 +1,228 @@
+# PRD #1223: Create an agent from the desktop overview — the TUI's Ctrl+n, with a deck step first
+
+**Status**: Draft — not started
+**Priority**: Medium
+**Created**: 2026-09-22
+**Issue**: [#1223](https://github.com/vfarcic/dot-agent-deck/issues/1223)
+
+## Problem Statement
+
+The desktop app cannot start an agent from its supervisory surface. The one creation path it has is the Runs screen's workflow launch, and that path needs a resolved project — a directory holding a `.dot-agent-deck.toml`. Point it at an ordinary repository and the daemon refuses with `unresolved: that path did not resolve to a project on this daemon` ([#1041](https://github.com/vfarcic/dot-agent-deck/issues/1041)). The TUI's most ordinary use — open a directory and start one agent in it — has no desktop equivalent.
+
+**The plumbing half exists and nothing reaches it.** `DesktopAction::StartAgent { command, cwd, display_name, rows, cols }` is defined in `desktop/src-tauri/src/dto.rs` and handled by `desktop_run_action` in `desktop/src-tauri/src/lib.rs`, but at `ffcf48d8` no frontend code dispatches it: the frontend's `DeckAction` union has no `start_agent` member, `TauriDeckBridge.runAction` forwards a fixed list that excludes it, and the `agent_id` the backend returns is dropped because `DeckActionResult` has no field for it.
+
+**Even if it were reachable, it would start the agent on the wrong deck.** The `StartAgent` arm reaches its daemon through `trusted_daemon()`, which reads the globally applied selection, and `EndpointSettings::resolve()` maps `Selection::All` to the local deck ([#1083](https://github.com/vfarcic/dot-agent-deck/issues/1083)). The overview is the screen that shows every deck at once, so it is precisely the screen where "the selected deck" is least likely to be the one the user meant.
+
+**And the first step of the TUI's flow has no translation yet.** Ctrl+n opens a directory picker that reads the TUI process's own filesystem (`DirPickerState` in `src/ui.rs`, `std::fs::read_dir`). That is correct for the TUI, which always runs on the daemon's host — locally, or on the remote machine under `dot-agent-deck connect`'s `ssh -t`. The desktop may be on a different machine from the deck it is driving, and the daemon exposes no verb that lists directories: [PRD #819](https://github.com/vfarcic/dot-agent-deck/issues/819) excluded one deliberately and said a browse verb could arrive later only as "an explicit, separately-argued verb with its own bounds" (`prds/done/819-move-project-resolution-daemon-side.md`). [#1048](https://github.com/vfarcic/dot-agent-deck/issues/1048)'s Part 2 asks for that verb. **This PRD is that argument.**
+
+## Solution Overview
+
+A **New agent** flow opened from the overview that does what the TUI's Ctrl+n does, with one step added in front of it because the desktop drives several decks:
+
+1. **Deck** — choose which connected deck the agent will run on.
+2. **Directory** — browse that deck's filesystem, the way the TUI's picker browses its own.
+3. **Form** — the TUI's New Agent form: a **Mode** row (`No mode`, one chip per orchestration the directory defines, `schedule`, `schedule: issues` where the deck's experimental flag is on, and `dispatcher`), an **Agent** picker over the agent registry, a **Name**, and a **Command**.
+4. **Start** — the agent (or the orchestration's roles) starts on the chosen deck, and the desktop opens the new agent's pane — the desktop's equivalent of the TUI focusing the new pane.
+
+Four commitments shape it.
+
+**It mirrors Ctrl+n, not the Runs screen.** The Runs screen's workflow form diverges from the TUI in ways this PRD does not inherit — a mandatory task prompt and no run name ([#1044](https://github.com/vfarcic/dot-agent-deck/issues/1044)). Orchestrations launched from this flow behave like the TUI's: no task prompt, and the Name field is the run's title. The two flows share **daemon verbs** (`PrepareWorkflow` / `StartPreparedAgent`), not UI or form rules. The Runs screen is revisited separately.
+
+**Workspace modes are excluded.** They are scheduled for removal ([#1199](https://github.com/vfarcic/dot-agent-deck/issues/1199)), and the desktop has no mode-tab surface to render their side panes. Every other Mode chip the TUI offers is in scope.
+
+**The daemon serves every fact about the deck.** The directory listing, which orchestrations a directory defines, the deck's default command, the agent registry, the experimental flag state, and the text of the authoring seed prompts all come from the daemon, per CLAUDE.md rule 18 and [#1043](https://github.com/vfarcic/dot-agent-deck/issues/1043). The desktop derives no path from its own environment, which is PRD #819's rule and linkage-check 12's tripwire.
+
+**Every action names its deck.** The flow captures the chosen deck's wire id once and resolves it with `DeckScope::resolve(deck_id)` — the mechanism PRD #1105 added for cross-deck terminal attach — rather than reading the global selection. With **All Decks** selected, the agent lands on the deck the user picked, never silently on local.
+
+## Scope
+
+### In Scope
+
+- A **New agent** entry point on the overview: a top-bar action, a keyboard shortcut, an affordance on each deck group's header (which preselects that deck), and the first-run empty state, whose copy currently tells the user to "start an agent from the CLI" (`desktop/src/components/AgentOverview.tsx:1184`).
+- The **deck step**: every deck in the overview's fleet is listed; those that can take a spawn (connected, not pending, configured, compatible or explicitly accepted via "Connect anyway") are selectable, and the rest are shown disabled with the reason. When exactly one deck is eligible, or the flow was opened from a deck's header, that deck is preselected and the step is confirmed with one keystroke.
+- A **daemon-side directory-listing verb**, capability-gated, bounded, with its threat model recorded (see [The directory-listing verb](#the-directory-listing-verb)). It closes #1048's Part 2.
+- The **directory step**, keyboard-first like the TUI's picker (move, enter, go up, confirm the current directory, filter), plus a typed-path field, which is also what an older deck without the listing verb falls back to.
+- The **form**, at parity with `NewPaneFormState` minus workspace modes: Mode chips, Agent picker (selecting an agent overwrites Command with that agent's default command), Name (prefilled with the directory's basename; for an orchestration, the next free `<basename>-orchestrator-N` until the user edits it; refused when it matches a live orchestration's title on that deck), Command (prefilled — see [Prefilling Command](#prefilling-command); hidden when an orchestration is selected).
+- **Daemon support** for what the form needs: a capability-gated query for the deck's new-agent options, and daemon-side composition and delivery of the `schedule`, `schedule: issues` and `dispatcher` seed prompts.
+- **Deck-targeted start actions** in the desktop backend — plain agent, authoring agent, orchestration — each resolving the chosen deck through `DeckScope::resolve` and returning the new agent's id (for an orchestration, the start role's).
+- **After creation**: the desktop waits until the target deck's fleet entry lists the new agent, then opens its pane in the PRD #1105 overlay.
+- A **voice registry** entry for the new action, as linkage-check 13 requires (`xtask/linkage-check/src/voice_command_registry.rs`) — either `voice: true` or a `no_voice` reason.
+- Tests at every tier the desktop and daemon have, documentation, and CLAUDE.md rule 12's cross-version check.
+
+### Out of Scope
+
+- **Workspace modes** ([#1199](https://github.com/vfarcic/dot-agent-deck/issues/1199)).
+- **The Runs screen and its workflow form** ([#1044](https://github.com/vfarcic/dot-agent-deck/issues/1044), [#1083](https://github.com/vfarcic/dot-agent-deck/issues/1083)'s Runs half). Revisited separately. This PRD fixes the silent-local fallback only for its own flow, by naming the deck.
+- **Changing the TUI's picker or form.** The TUI keeps reading its own filesystem; moving it onto the listing verb is not needed for parity, since the TUI always runs on the daemon's host. The one TUI-side change is that the three authoring seed constants move out of `src/ui.rs` so the TUI and the daemon compose from one source.
+- **Remembering a directory per deck** — #1048's Part 1. The TUI does not remember one either (its picker always opens at the TUI process's current directory), so parity does not need it.
+- **A native folder picker.** It would show the client's filesystem, which for a remote deck is the wrong machine — PRD #741's reasoning, unchanged.
+- **Authentication on the attach protocol** ([PRD #741](https://github.com/vfarcic/dot-agent-deck/issues/741)). The listing verb's bounds are not a substitute for it; see the threat model.
+- **An experimental-flag mechanism for the desktop** ([#1198](https://github.com/vfarcic/dot-agent-deck/issues/1198)). This flow ships visible.
+- **Making orchestration-title uniqueness authoritative in the daemon** ([#555](https://github.com/vfarcic/dot-agent-deck/issues/555)). This flow mirrors the TUI's client-side refusal; #555 is where it becomes a daemon guarantee.
+- **The desktop's Scheduled Tasks Add/Edit reusing the directory step.** The TUI reuses its picker there (`DirPickerIntent::ScheduleAdd` / `ScheduleEdit`); a desktop equivalent can reuse this step later.
+
+## Technical Approach
+
+### What Ctrl+n does today — the reference
+
+Captured at `ffcf48d8`, from `src/ui.rs` unless stated:
+
+- **Binding.** `KbAction::NewPane`, default `Ctrl+n` (`src/keybindings.rs`), live in every mode except the close confirmation; there is no separate orchestration dialog — orchestrations are Mode chips in the same form.
+- **Directory picker** (`DirPickerState`). Opens at the TUI process's current directory. Lists `..` plus subdirectories, sorted; hidden directories are skipped; entries are tested with `DirEntry::file_type().is_dir()`, which does not follow symlinks, so a symlinked directory is not listed. Keys: move with `j`/`k`/arrows, enter with `l`/Right/Enter (Enter on a directory with no subdirectories confirms it), go up with `h`/Left/Backspace, confirm the current directory with Space, filter with `/`, cancel with Esc or `q`. There is no typed-path entry.
+- **Form** (`NewPaneFormState`, rendered by `render_new_pane_form`). A read-only `Dir:` line; the Mode row (`[No mode]`, each `[[modes]]`, each `[Orch: <name>]`, `[schedule]`, `[schedule: issues]` when the experimental flag is on, `[dispatcher]`); the `[auto]` Agent chip over `agent_registry::ALL`, which overwrites Command with the chosen agent's `default_command`; Name, prefilled with the directory basename, switched to the next free `<basename>-orchestrator-N` while an orchestration is selected and the name is untouched, and blocking submit when it equals a live orchestration's title; Command, prefilled from `DashboardConfig.default_command`, then the saved `last_command`, then blank, and hidden while an orchestration is selected.
+- **Submit.** A plain agent sends one `AttachRequest::StartAgent` (an empty command means the daemon's default shell). `schedule`, `schedule: issues` and `dispatcher` start a dashboard agent carrying `SCHEDULE_AUTHORING_SEED_PROMPT`, `ISSUE_DISPATCH_AUTHORING_SEED_PROMPT` or `DISPATCHER_SEED_PROMPT`, with a blank Command resolved to the default command and then `claude`; the TUI queues the seed and types it in once the agent is ready. An orchestration writes the coordinator context on the TUI's filesystem and sends one `StartAgent` per role, sharing one freshly minted `orchestration_id`.
+- **Afterwards.** A plain or authoring agent: the TUI switches to the Dashboard tab and focuses the new pane (PRD #154). An orchestration: the TUI focuses the start role. A failure is reported in the status bar after the form has closed.
+
+### The deck step
+
+The candidates are the overview's `runtime.fleet` entries, keyed by their wire `deckId` — the value `DeckScope::resolve` accepts. A deck is selectable when its `ConnectionView` is connected and neither pending nor unconfigured, and either compatible or accepted through the overview's existing "Connect anyway". A disabled deck carries the reason the overview already shows for it.
+
+The deck id is **captured once** when the step is confirmed and carried by every later request in the flow — listing, options, resolve, start. None of them reads the applied selection. That is also what keeps `selection_capture.rs`'s per-module budget of raw `trusted_daemon` / `selected_endpoint` reads from growing: the new code paths add no raw reads.
+
+If the chosen deck disconnects mid-flow, the next request fails with `DeckScope::resolve`'s "that deck is not one this app is observing" error, and the flow returns to the deck step with that message rather than retargeting.
+
+### The directory-listing verb
+
+A new `AttachRequest` variant — provisionally `ListDirectories { path: Option<String> }` — advertised under a new capability string. With `path` absent, the daemon lists its starting directory (see [Open Questions](#open-questions)); with a path, it lists that path's immediate subdirectories.
+
+**Reply.** The canonical path that was listed, its parent's canonical path (absent at the root), and one entry per subdirectory: its name, its full canonical path, and whether it holds a `.dot-agent-deck.toml`. The desktop sends back only paths the daemon supplied or the user typed — PRD #819's rule — so it never joins a parent and a child name itself. The project marker is what lets the form decide whether to ask `ResolveProject` for orchestrations; today that verb refuses a directory with no config with a deliberately generic `unresolved` error, which the form would otherwise have to treat as a failure.
+
+**Bounds**, carried from #1048's list:
+
+- **One level per request.** No recursion, no walk.
+- **Directories only.** No files, sizes, times, owners or modes.
+- **A result cap** with a `truncated` flag, and a time budget, so a huge directory degrades to a partial listing instead of a stalled request.
+- **Hidden directories and symlinks** are handled as the TUI's picker handles them (hidden skipped; symlinked directories not listed) unless the open question below decides otherwise, and the listing reuses the existing reader's refusals rather than inventing new ones.
+- **Canonical, absolute paths only**, in both directions.
+
+**Threat model — what a caller learns that it could not learn before.** Nothing, for any caller that can reach the attach socket today. The same socket accepts `StartAgent` with an arbitrary command and working directory, executed as the daemon's user — a caller that can send `ListDirectories` can already start `ls -la` anywhere that user can read, and receive its output over `AttachStream`. The verb adds a **structured, bounded** route to information the socket already exposes; it adds no authority. That is the honest answer to #819's "resolve-only, never list" bound: the bound constrained the project verbs, whose purpose was naming projects, and it was never what stopped enumeration.
+
+It is **not** a reason to leave the verb unbounded. #819's audit recorded that bounding the project verbs is not a substitute for authentication if PRD #741 ever admits a peer with less than full account authority, and the same holds here: if such a peer is ever admitted, this verb must be re-examined alongside `StartAgent`, not after it. The bounds above exist for robustness and so that the verb's surface is already small when that day comes.
+
+### What the daemon serves for the form
+
+A second capability-gated query — provisionally `NewAgentOptions {}` — returning what the form needs about the deck rather than the desktop computing it:
+
+- the deck's **default command** (`DashboardConfig.default_command` from the configuration on the daemon's host — the file the TUI reads there);
+- the **agent registry** the deck was built with — each agent's display name and default command — so the Agent picker offers what that deck's build knows, not what the desktop's build knows;
+- whether the deck's **experimental flag** is on, which decides whether the `schedule: issues` chip is shown — keyed on the deck, because that is where the flag has meaning for the spawn;
+- which **authoring kinds** the deck can compose (below).
+
+Orchestrations for a directory come from the existing `ResolveProject`, called only when the listing marks the directory as a project.
+
+### Authoring agents — the seeds move to the daemon
+
+`schedule`, `schedule: issues` and `dispatcher` differ from a plain agent only by a seed prompt, and today those prompts are constants in `src/ui.rs` that the TUI types in after readiness. The desktop must not copy them — a third copy is exactly the drift #1043 describes — and it should not type into the PTY itself either.
+
+So `StartAgent` gains an optional, capability-gated **authoring kind**. The daemon composes the seed from the shared constants (moved out of `src/ui.rs` into a module both use) and delivers it once the agent is ready, through the daemon's existing readiness-gated delivery rather than a new one ([#528](https://github.com/vfarcic/dot-agent-deck/issues/528) tracks unifying the three that exist). The desktop withholds the three chips on a deck that does not advertise the capability. An older daemon ignoring an unknown field would otherwise start the agent with **no seed and no error**, which is why the field is gated rather than merely optional.
+
+### Orchestrations
+
+The launch uses the daemon verbs the desktop already speaks — `PrepareWorkflow { path, orchestration, task, config_revision }`, then `StartPreparedAgent` per role — so the coordinator context is published on the deck, not on the client. Two differences from the Runs screen's use of them:
+
+- **No task prompt.** The TUI's Ctrl+n has none. `PrepareWorkflow` already accepts an empty `task` (the Runs form's refusal is client-side, #1044). What the orchestrator context should say with no task is #1044's own open question; this PRD settles it daemon-side, because an empty `## Your task` heading is worse than omitting the section.
+- **The Name field is the run's title**, carried as the `display_title` of each role's orchestration membership, with the TUI's refusal of a title already live on that deck, checked against that deck's snapshot.
+
+After launch, the desktop opens the **start role's** pane, as the TUI focuses it.
+
+### Prefilling Command
+
+The TUI prefills from `default_command`, then its `last_command`, both files on the TUI's host. For the desktop, `default_command` comes from `NewAgentOptions`. Where the desktop's "last command" lives is an [open question](#open-questions); the provisional answer is per deck in `desktop.toml`, keyed by endpoint — never global, for #1048's Part 1 reason that one deck's command means nothing on another.
+
+### After creation
+
+The start action returns the new agent's id through `DeckActionResult`. The desktop does **not** open the pane immediately: `paneAgentRetired` treats a connected deck that does not list the agent as "the agent is gone" and closes the view (`desktop/src/App.tsx`). It waits until the target deck's fleet entry lists `(deckId, agentId)`, then calls `VOICE_ACTIONS.openAgent` with `from: "overview"`.
+
+Two timing facts make that wait worth engineering. `desktop_run_action` ends with `refresh_and_emit` for the **selected** deck only, so a spawn on another deck appears when that deck's watcher next re-fetches. And a spawn emits no broadcast of its own — a `SessionStart` arrives only from the agent's hook — so an agent without hooks appears on the 5 s reconcile. The action should trigger a refresh of the target deck directly, and bound the wait: if the agent is not listed within the bound, the flow closes and the overview says the agent was started but has not appeared.
+
+A failure keeps the dialog open with an inline error and the values the user entered — a deliberate improvement on the TUI's status-bar message, which arrives after the form has already closed.
+
+### Older decks
+
+Each new verb is capability-gated, and the desktop checks the capability in the client library rather than at each call site (the pattern `DaemonClient::focus_gained_while` established for PRD #1105). Against a deck that lacks them:
+
+- **no listing verb** → the directory step offers the typed-path field only;
+- **no options query** → Command is prefilled from the desktop's own per-deck memory only, and the Agent picker falls back to the registry compiled into the desktop, labelled as such;
+- **no authoring kind** → the `schedule`, `schedule: issues` and `dispatcher` chips are withheld;
+- **no `prepare-workflow` capability** → orchestration chips are withheld, carrying the reason the connection already reports as `projectActionsReason` (which the Runs screen's workflow panel shows today).
+
+### Cross-version safety
+
+Every wire addition here is on CLAUDE.md rule 18's no-bump rungs: new request variants that every sender withholds until the daemon advertises them, and an optional field on `StartAgent` gated the same way. `PROTOCOL_VERSION` (10 at `ffcf48d8`) should not move. The semantic question — does any existing field change meaning — is answered explicitly per milestone, and the empty-task composition change in particular: no existing client sends an empty task through `PrepareWorkflow` (the desktop's Runs form refuses one, and the TUI does not use the verb), so its composition change reaches no current caller, but that is a claim to re-verify when the milestone lands, not to inherit from this paragraph. Rule 12's cross-version test runs before the PR (`cargo xver --branch <branch>`); `--direction reverse` is worth running too, since the new verbs live in the daemon.
+
+### Feature flag
+
+Ships **visible** (decided 2026-09-22). The desktop binary has no experimental-flag mechanism — PRD #176's decision 6 and PRD #745's feature-flag section recorded that the flag does not apply to it — and the overview this flow lives on already ships by default. If #1198 later gives the desktop a flag, this flow is not a candidate for it.
+
+### Testing — what rule 4 means here
+
+- **Daemon verbs** — protocol unit tests and socket tests in the root crate for the listing verb's bounds (one level, cap and `truncated`, hidden and symlink handling, refusal of relative paths), the options query, and authoring-kind seed delivery; capability-withheld behaviour for each.
+- **Desktop backend** — Rust tests in `desktop/src-tauri` against the existing two-deck `RealDeck` harness: an agent started with **All Decks** selected lands on the chosen, non-local deck; a disconnected deck fails with the resolve error rather than retargeting.
+- **Desktop frontend** — vitest suites for the dialog's steps and form rules, and a Playwright spec on the fixture bridge for the whole flow from the overview to the opened pane.
+- **Real agent.** Rule 4 asks for at least one test that drives the genuine spawn → agent → work path with a cheap model: an agent started through the deck-targeted path in a browsed directory, asked to report a uniquely named sentinel file. Anything that reaches a real agent is lane 2 and runs on no CI runner (rule 5), so the milestone that adds it also runs it locally with `cargo test-e2e-live <filter>` and names it in the PR.
+- **The honest gap.** There is no `tauri-driver` tier ([#953](https://github.com/vfarcic/dot-agent-deck/issues/953)), so no automated test drives the real Tauri window. The compensating control is the manual smoke check in `docs/develop/desktop-gui.md`, run against a local deck and a remote one.
+
+## Success Criteria
+
+- From the overview, a user starts a plain agent on any eligible deck, in a directory browsed on that deck that holds no `.dot-agent-deck.toml`, and lands in that agent's pane.
+- The same flow starts an orchestration (no task prompt; the Name is the run title), a `schedule` authoring agent, a `schedule: issues` authoring agent where the deck's flag is on, and a dispatcher — each arriving with the same seed text the TUI delivers.
+- With **All Decks** selected, the agent starts on the deck the user chose; no action in the flow reads the global selection.
+- No path in the flow is derived from the client's environment; linkage-check 12 stays green without an exemption.
+- Against an older deck, each missing capability degrades as described in [Older decks](#older-decks) instead of failing silently.
+- `PROTOCOL_VERSION` is unchanged, and rule 12's cross-version test has been run and recorded.
+- #1041 is closed, and #1048 is narrowed to its Part 1.
+
+## Milestones
+
+### Iteration 1 — a plain agent, end to end
+
+- [ ] **M1 — The directory-listing verb.** `ListDirectories` in the daemon, capability-gated and bounded as specified, with the threat model recorded in `docs/develop/` and protocol/socket tests for every bound. Closes #1048's Part 2.
+- [ ] **M2 — The deck's new-agent options.** `NewAgentOptions` (default command, agent registry, experimental state, authoring kinds advertised as none until M7), capability-gated, with tests.
+- [ ] **M3 — Deck-targeted start in the desktop backend.** A plain-agent start that takes a deck id, resolves it through `DeckScope::resolve`, returns the agent id through `DeckActionResult`, and is reachable from the frontend (`DeckAction`, `TauriDeckBridge.runAction`, the fixture bridge), with `RealDeck` tests including the All Decks case.
+- [ ] **M4 — The dialog.** Deck step, directory step (browser plus typed path), and the form with `No mode`, Agent, Name and Command at TUI parity; entry points on the overview (top bar, shortcut, deck-group header, first-run copy) and the voice registry entry; vitest coverage.
+- [ ] **M5 — After creation and degradation.** Opens the new agent's pane once the target deck lists it, with a bounded wait and a direct refresh of that deck; inline errors; each older-deck fallback; a Playwright spec for the whole flow.
+
+### Iteration 2 — the rest of the Mode row
+
+- [ ] **M6 — Orchestrations.** `[Orch: <name>]` chips from `ResolveProject`, the run-title Name rules, launch through `PrepareWorkflow` / `StartPreparedAgent` with no task prompt, the daemon's orchestrator context composed honestly without a task, and the start role's pane opened afterwards.
+- [ ] **M7 — Authoring agents.** The seed constants moved to a shared module, the capability-gated authoring kind on `StartAgent` with daemon-side readiness-gated delivery, and the `schedule`, `schedule: issues` and `dispatcher` chips, each verified to deliver the same text the TUI does.
+
+### Iteration 3 — verified and documented
+
+- [ ] **M8 — Real agent, docs, cross-version.** The lane-2 real-agent scenario run locally and named; `docs/develop/desktop-gui.md` and the protocol notes updated (and a user-facing page if [#765](https://github.com/vfarcic/dot-agent-deck/issues/765) has given the desktop one by then); a changelog fragment; rule 12's cross-version test run and recorded here; the manual smoke check against a local and a remote deck; #1041 closed and #1048 narrowed.
+
+## Risks
+
+- **Re-opening a recorded decision.** The listing verb contradicts #819's written bound. Mitigated by arguing it here rather than assuming it — the threat model above — and by the bounds and capability gate. If review rejects the argument, the fallback is the typed-path field alone, which weakens parity but not correctness.
+- **Seed delivery for agents other than Pi.** Readiness detection varies by agent and has a history of races ([#699](https://github.com/vfarcic/dot-agent-deck/issues/699), [#529](https://github.com/vfarcic/dot-agent-deck/issues/529)). Reusing the daemon's existing delivery path rather than writing a fourth is the mitigation; M7's tests must cover a late readiness announcement.
+- **Opening the pane too early closes it.** `paneAgentRetired` closes a view whose agent the deck does not list. The wait-for-fleet step exists for this; its bound must be long enough for a hookless agent's 5 s reconcile.
+- **Scope.** Full parity across four spawn kinds on a new UI surface is large. The iterations are ordered so a plain agent ships end to end before orchestrations and authoring kinds are started.
+
+## Open Questions
+
+1. **Where does the directory step start?** The TUI starts at its process's current directory, which under `connect` is the remote login directory. Candidates for the daemon: the daemon user's home directory, or the daemon's startup directory. Provisional: home.
+2. **Symlinked and hidden directories.** Mirror the TUI's picker (skip both), or list them? Following a symlink needs a policy consistent with the existing reader's refusals.
+3. **Where does the desktop's "last command" live?** Per deck in `desktop.toml` (provisional), or on the deck, shared with the TUI's `session.toml` — which the TUI process writes today.
+4. **Keyboard shortcut.** Ctrl+N mirrors the TUI; check it against the desktop's existing bindings and the platform's own (Cmd+N on macOS).
+5. **Voice.** `voice: true` opening the dialog at the deck step, or a `no_voice` reason for now ([PRD #1195](https://github.com/vfarcic/dot-agent-deck/issues/1195) is widening the voice command set).
+
+## Related
+
+- [#1041](https://github.com/vfarcic/dot-agent-deck/issues/1041) — `start_agent` has no UI. Closed by this PRD.
+- [#1048](https://github.com/vfarcic/dot-agent-deck/issues/1048) — Part 2 (the daemon-side browser) is absorbed here; Part 1 (remembering a project per deck) stays open.
+- [#1044](https://github.com/vfarcic/dot-agent-deck/issues/1044), [#1083](https://github.com/vfarcic/dot-agent-deck/issues/1083) — the Runs screen's divergences, revisited separately.
+- [#1199](https://github.com/vfarcic/dot-agent-deck/issues/1199) — removing workspace modes, why modes are excluded.
+- [#1043](https://github.com/vfarcic/dot-agent-deck/issues/1043), [#555](https://github.com/vfarcic/dot-agent-deck/issues/555), [#528](https://github.com/vfarcic/dot-agent-deck/issues/528) — daemon-owned facts, title uniqueness, prompt-delivery unification.
+- [#1196](https://github.com/vfarcic/dot-agent-deck/issues/1196), [#1197](https://github.com/vfarcic/dot-agent-deck/issues/1197), [#1198](https://github.com/vfarcic/dot-agent-deck/issues/1198) — the overview as landing screen, the rail, the flag. Adjacent, not dependencies.
+- PRDs [#745](https://github.com/vfarcic/dot-agent-deck/issues/745) (the overview), [#1105](https://github.com/vfarcic/dot-agent-deck/issues/1105) (the pane overlay and cross-deck attach), [#742](https://github.com/vfarcic/dot-agent-deck/issues/742) (the fleet view), [#819](https://github.com/vfarcic/dot-agent-deck/issues/819) (project resolution behind the daemon).
+
+## Work Log
+
+### 2026-09-22 — Created
+
+Scope settled with the user before writing:
+
+- **Parity target**: the TUI's Ctrl+n — plain agent, orchestrations, `schedule`, `schedule: issues`, `dispatcher` — **excluding workspace modes**, which are being removed (#1199). Explicitly **not** based on the Runs screen's workflow creation, which is revisited later.
+- **Deck first**: the flow opens on a deck-selection step, because the desktop drives several decks.
+- **Directory**: a **daemon-side browser**. Checked whether the daemon half already existed: at `ffcf48d8` no directory-listing verb exists in `src/daemon_protocol.rs` (whose `ResolveProject` doc still says it is not `ListDir`/`ReadFile`/`Stat`), no branch or PR implements one, and the open issue asking for it is #1048's Part 2 — absorbed here.
+- **Feature flag**: ships visible (CLAUDE.md rule 9 asked). The desktop binary has no flag mechanism.
