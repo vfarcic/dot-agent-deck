@@ -417,6 +417,34 @@ impl IdleHarness {
         );
     }
 
+    /// Issue #1218: wait until no close is still taking `pane_id` apart, so the
+    /// caller can hand the pane id to a successor — the `StopAgent` counterpart
+    /// of [`Self::end_orchestrator_process`]'s wait.
+    ///
+    /// A `StopAgent` reply is NOT that signal. The handler writes its reply and
+    /// only then drops the pane's cleanup hold, and `spawn_agent` refuses a held
+    /// pane with `DuplicatePaneId`, so a spawn issued the moment the reply lands
+    /// races the release — and loses under load. The reply says the agent is
+    /// stopped, not that its pane id is free; the daemon's own pane reusers
+    /// (`respawn_or_recreate_agent_for_pane`) wait on this same predicate.
+    ///
+    /// Nor is `end_orchestrator_process`'s `pane_current_agent_id` wait:
+    /// `close_agent` removed the record before the reply was written, so that
+    /// condition already holds when `StopAgent` returns and waits for nothing.
+    async fn wait_for_pane_close_released(&self, pane_id: &str) {
+        let released = tokio::time::timeout(common::load_scaled(Duration::from_secs(5)), async {
+            while self.registry.pane_close_in_flight(pane_id) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(
+            released.is_ok(),
+            "StopAgent answered but its close never released pane {pane_id}, so the pane id was \
+             never freed for reuse and the scenario under test could not occur"
+        );
+    }
+
     /// Stop an agent through the REAL `StopAgent` attach request, off the async
     /// runtime, and report how long the close took. A SIGTERM-ignoring child
     /// keeps the pane marked closing for the whole `AGENT_TERMINATE_GRACE`
@@ -941,7 +969,7 @@ fn idle_worker_006_stop_agent_cancels_idle_prompt() {
     });
 }
 
-/// Scenario: Delegate to a silent worker, close the ORCHESTRATOR through the real StopAgent request, then spawn a brand-new unrelated agent that inherits the freed orchestrator pane id. After two full timeout windows the new occupant's PTY must still hold only its own readiness marker — the dead orchestration's idle prompt must never be auto-submitted into a stranger's session.
+/// Scenario: Delegate to a silent worker, close the ORCHESTRATOR through the real StopAgent request, wait for that close to release its pane, then spawn a brand-new unrelated agent that inherits the freed orchestrator pane id. After two full timeout windows the new occupant's PTY must still hold only its own readiness marker — the dead orchestration's idle prompt must never be auto-submitted into a stranger's session.
 #[spec("scheduler/idle-worker/008")]
 #[test]
 fn idle_worker_008_closed_orchestrator_pane_id_reuse_receives_nothing() {
@@ -952,9 +980,11 @@ fn idle_worker_008_closed_orchestrator_pane_id_reuse_receives_nothing() {
         let server = start_attach_server(&harness).await;
         harness.delegate(&["orphaned-worker"]).await;
 
-        // Close the ORCHESTRATOR. Its pane id is now free for reuse.
+        // Close the ORCHESTRATOR, then wait for the close to let go of its pane
+        // id. The reply alone does not free it (issue #1218).
         IdleHarness::stop_agent_timed(server.path.clone(), harness.orchestrator_agent_id.clone())
             .await;
+        harness.wait_for_pane_close_released(ORCH_PANE).await;
 
         // A different agent — no orchestration membership, no relationship to
         // the delegation — takes the freed pane id, exactly as a fresh spawn
