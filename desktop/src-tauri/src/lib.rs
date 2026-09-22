@@ -361,7 +361,7 @@ trait WorkflowDaemon {
         &self,
         options: StartAgentOptions,
         prep_token: Option<&str>,
-    ) -> Result<String, String>;
+    ) -> Result<String, RoleStartFailure>;
     /// PRD #1223 M6: start one prepared role with the command its project
     /// config gives it, on the deck — `DaemonClient::start_prepared_role`,
     /// which withholds (`Unsupported`, nothing sent) from a deck that does not
@@ -370,7 +370,7 @@ trait WorkflowDaemon {
         &self,
         options: StartAgentOptions,
         prep_token: &str,
-    ) -> Result<GatedQuery<String>, String>;
+    ) -> Result<GatedQuery<String>, RoleStartFailure>;
     /// The agent type the deck recorded for `agent_id` at spawn — for a
     /// configured role, the role's resolved type. `None` when it recorded none.
     async fn launched_agent_type(&self, agent_id: &str) -> Result<Option<AgentType>, String>;
@@ -424,20 +424,20 @@ impl WorkflowDaemon for DaemonClient {
         &self,
         options: StartAgentOptions,
         prep_token: Option<&str>,
-    ) -> Result<String, String> {
+    ) -> Result<String, RoleStartFailure> {
         self.start_agent_with_prep_token(options, prep_token)
             .await
-            .map_err(|error| safe_message(error.to_string()))
+            .map_err(RoleStartFailure::from_client)
     }
 
     async fn start_configured_role(
         &self,
         options: StartAgentOptions,
         prep_token: &str,
-    ) -> Result<GatedQuery<String>, String> {
+    ) -> Result<GatedQuery<String>, RoleStartFailure> {
         self.start_prepared_role(options, prep_token)
             .await
-            .map_err(|error| safe_message(error.to_string()))
+            .map_err(RoleStartFailure::from_client)
     }
 
     async fn launched_agent_type(&self, agent_id: &str) -> Result<Option<AgentType>, String> {
@@ -725,35 +725,75 @@ async fn rollback_workflow_agents<D: WorkflowDaemon + Sync>(
 }
 
 /// One role's start under [`WORKFLOW_ROLE_START_TIMEOUT`], with the elapsed
-/// case reported as an ordinary start failure — which is what sends it through
-/// the caller's reconciliation, so a start that landed although its reply never
-/// arrived is found and stopped with the rest.
+/// case reported as an ordinary — and INDETERMINATE — start failure, which is
+/// what sends it through the caller's reconciliation, so a start that landed
+/// although its reply never arrived is found and stopped with the rest.
 async fn bounded_role_start<T>(
-    start: impl std::future::Future<Output = Result<T, String>>,
+    start: impl std::future::Future<Output = Result<T, RoleStartFailure>>,
 ) -> Result<T, RoleStartFailure> {
     match tokio::time::timeout(WORKFLOW_ROLE_START_TIMEOUT, start).await {
         Ok(Ok(value)) => Ok(value),
-        Ok(Err(error)) => Err(RoleStartFailure {
-            message: error,
-            timed_out: false,
-        }),
+        Ok(Err(failure)) => Err(failure),
         Err(_) => Err(RoleStartFailure {
             message: format!(
                 "the deck did not answer the start within {}s",
                 WORKFLOW_ROLE_START_TIMEOUT.as_secs()
             ),
-            timed_out: true,
+            indeterminate: true,
         }),
     }
 }
 
-/// Why one role's start failed. `timed_out` matters to the reconciliation that
-/// follows: a deck that did not answer may still spawn the role after the
-/// reconciliation looked, so a timed-out start the deck does not list is a
-/// start whose outcome is unknown, not one that did not happen.
+/// Why one role's start failed, and whether the deck may still act on it (PRD
+/// #1223 audit V5).
+///
+/// `indeterminate` is what the reconciliation that follows reads: a start whose
+/// outcome is unknown may still be spawned by the deck after the reconciliation
+/// looked, so one the deck does not list is a start this launch cannot vouch
+/// for rather than one that did not happen.
+#[derive(Debug)]
 struct RoleStartFailure {
     message: String,
-    timed_out: bool,
+    /// `true` when the request may have reached the deck and its outcome is
+    /// unknown. `false` only when the outcome is known: the deck ANSWERED with
+    /// a refusal, or the client never sent the request.
+    indeterminate: bool,
+}
+
+impl RoleStartFailure {
+    /// How a client error classifies.
+    ///
+    /// **Definitive** — the deck's own answer, or a request that was never
+    /// written:
+    ///
+    /// * [`ClientError::Server`] is a refusal the deck composed, so it read the
+    ///   request and started nothing;
+    /// * [`ClientError::SocketMissing`] is decided before a connection exists.
+    ///
+    /// **Indeterminate** — everything else, because nothing here can tell a
+    /// connection that failed BEFORE the request was written from one that
+    /// failed after the deck had read it:
+    ///
+    /// * [`ClientError::Io`] covers both, and the second is exactly the lost
+    ///   reply this classification exists for;
+    /// * [`ClientError::Malformed`] is the one that carries the lost reply in
+    ///   practice — a deck that reads the request and then drops the connection
+    ///   ends the client's read at `daemon closed connection before sending
+    ///   RESP`, which is this variant and not `Io`. It also covers a reply this
+    ///   client could not decode, which says nothing about what the deck did.
+    ///
+    /// Erring toward indeterminate costs a cleanup warning the user may not
+    /// have needed; erring the other way loses a role that is running.
+    fn from_client(error: ClientError) -> Self {
+        let indeterminate = !matches!(
+            error,
+            ClientError::Server(_) | ClientError::SocketMissing(_)
+        );
+        Self {
+            message: safe_message(error.to_string()),
+            indeterminate,
+        }
+    }
 }
 
 /// Why [`launch_configured_orchestration`] or [`launch_workflow`] failed: the
@@ -960,7 +1000,7 @@ async fn launch_workflow<D: WorkflowDaemon + Sync>(
                     &pane_id,
                     orchestration_id,
                     &role.role,
-                    failure.timed_out,
+                    failure.indeterminate,
                 )
                 .await;
                 let reconciliation_note = uncertain
@@ -1032,16 +1072,17 @@ async fn launch_workflow<D: WorkflowDaemon + Sync>(
 /// `started` and stopped by the rollback like the others.
 ///
 /// `Some` is a role this launch cannot vouch for: the lookup itself failed, or
-/// (after a timeout) found nothing although the deck may still spawn the role
-/// once whatever held its reply clears. Either way the rollback will not stop
-/// it, so the caller reports it as cleanup it could not confirm.
+/// — after an INDETERMINATE failure (PRD #1223 audit V5), one whose request may
+/// have reached the deck — it found nothing although the deck may still spawn
+/// the role once whatever held its reply clears. Either way the rollback will
+/// not stop it, so the caller reports it as cleanup it could not confirm.
 async fn reconcile_failed_start<D: WorkflowDaemon + Sync>(
     daemon: &D,
     started: &mut Vec<StartedRole>,
     pane_id: &str,
     orchestration_id: &str,
     role: &str,
-    timed_out: bool,
+    indeterminate: bool,
 ) -> Option<UnconfirmedStop> {
     match daemon
         .reconcile_workflow_agent(pane_id, orchestration_id, COORDINATOR_DELIVERY_RPC_TIMEOUT)
@@ -1056,11 +1097,12 @@ async fn reconcile_failed_start<D: WorkflowDaemon + Sync>(
             }
             None
         }
-        Ok(None) if !timed_out => None,
+        Ok(None) if !indeterminate => None,
         Ok(None) => Some(UnconfirmedStop {
             role: role.to_string(),
-            reason: "the deck did not answer the role's start and did not list it afterwards; \
-                     if it starts late it will not be stopped"
+            reason: "the role's start was not answered, so the deck may have received it, and \
+                     the deck did not list the role afterwards; if it starts late it will not \
+                     be stopped"
                 .to_string(),
         }),
         Err(reconciliation_error) => Some(UnconfirmedStop {
@@ -1234,7 +1276,7 @@ async fn launch_configured_orchestration<D: WorkflowDaemon + Sync>(
                     &pane_id,
                     orchestration_id,
                     &role.name,
-                    failure.timed_out,
+                    failure.indeterminate,
                 )
                 .await;
                 (safe_message(failure.message), uncertain)
@@ -5059,6 +5101,24 @@ mod tests {
         config_revision: Option<String>,
     }
 
+    /// A start the deck ANSWERED with a refusal: its outcome is known, so the
+    /// launch may report it as definitive (PRD #1223 audit V5).
+    fn refused(message: &str) -> Result<String, RoleStartFailure> {
+        Err(RoleStartFailure {
+            message: message.to_string(),
+            indeterminate: false,
+        })
+    }
+
+    /// A start whose reply never arrived: the deck may have received it, so the
+    /// launch may not report "nothing started" (PRD #1223 audit V5).
+    fn lost(message: &str) -> Result<String, RoleStartFailure> {
+        Err(RoleStartFailure {
+            message: message.to_string(),
+            indeterminate: true,
+        })
+    }
+
     struct FakeWorkflowDaemon {
         now: Mutex<std::time::Instant>,
         prepare_requests: Mutex<Vec<PrepareRequest>>,
@@ -5069,7 +5129,7 @@ mod tests {
         spawn_log: Mutex<Vec<String>>,
         start_tokens: Mutex<Vec<Option<String>>>,
         started: Mutex<Vec<StartAgentOptions>>,
-        start_results: Mutex<VecDeque<Result<String, String>>>,
+        start_results: Mutex<VecDeque<Result<String, RoleStartFailure>>>,
         stopped: Mutex<Vec<String>>,
         reconciliation_results: Mutex<VecDeque<Result<Option<String>, String>>>,
         reconciliation_requests: Mutex<Vec<(String, String)>>,
@@ -5169,7 +5229,7 @@ mod tests {
             &self,
             options: StartAgentOptions,
             prep_token: Option<&str>,
-        ) -> Result<String, String> {
+        ) -> Result<String, RoleStartFailure> {
             self.spawn_log.lock().unwrap().push(format!(
                 "start:{}",
                 options.display_name.as_deref().unwrap_or("?")
@@ -5199,7 +5259,7 @@ mod tests {
             &self,
             options: StartAgentOptions,
             prep_token: &str,
-        ) -> Result<GatedQuery<String>, String> {
+        ) -> Result<GatedQuery<String>, RoleStartFailure> {
             if self.configured_unsupported.load(Ordering::SeqCst) {
                 return Ok(GatedQuery::Unsupported);
             }
@@ -5582,10 +5642,9 @@ command = "configured-planner"
             [Ok(SendResult::Applied)],
             Ok(SendResult::Applied),
         );
-        daemon.start_results.lock().unwrap().push_back(Err(
+        daemon.start_results.lock().unwrap().push_back(refused(
             "malformed request: unknown variant `start-prepared-agent`, expected one of \
-             `list-agents`, `start-agent`, `hello`"
-                .into(),
+             `list-agents`, `start-agent`, `hello`",
         ));
         let (roles, prepared) = prepare_workflow_launch(
             &daemon,
@@ -6088,10 +6147,11 @@ command = "configured-planner"
     #[tokio::test]
     async fn a_configured_launch_stops_the_started_roles_when_a_later_role_is_refused() {
         let daemon = FakeWorkflowDaemon::new(Ok(None), [], Ok(SendResult::Applied));
-        daemon.start_results.lock().unwrap().extend([
-            Ok("agent-0".to_string()),
-            Err("builder refused".to_string()),
-        ]);
+        daemon
+            .start_results
+            .lock()
+            .unwrap()
+            .extend([Ok("agent-0".to_string()), refused("builder refused")]);
 
         let failure = launch_configured_orchestration(
             &daemon,
@@ -6275,7 +6335,7 @@ command = "configured-planner"
             Ok("agent-0".to_string()),
             Ok("agent-1".to_string()),
             Ok("agent-2".to_string()),
-            Err("tester refused".to_string()),
+            refused("tester refused"),
         ]);
         daemon
             .stop_hangs
@@ -6376,6 +6436,171 @@ command = "configured-planner"
         );
     }
 
+    /// Scenario (PRD #1223 audit V5): a real `DaemonClient` against a scripted
+    /// deck that takes the start's connection, READS the request and then drops
+    /// it without answering — the lost reply of a request the deck may well
+    /// have acted on. The failure must classify as indeterminate, so the
+    /// reconciliation that follows reports a role it cannot find as cleanup it
+    /// could not confirm. The same deck's `ok: false` refusal of the next start
+    /// must classify as definitive: the deck answered, so nothing is pending.
+    ///
+    /// Only the classification is exercised here; what the launch then does
+    /// with it is `an_indeterminate_start_the_deck_does_not_list_is_reported_as_unconfirmed`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_start_whose_connection_drops_is_indeterminate_and_a_refusal_is_not() {
+        use dot_agent_deck::daemon_protocol::{
+            AttachResponse, DAEMON_CAPABILITIES, KIND_REQ, KIND_RESP, PROTOCOL_VERSION, read_frame,
+            write_frame,
+        };
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("a scratch dir for the socket");
+        let socket = dir.path().join("s");
+        let listener = tokio::net::UnixListener::bind(&socket).expect("bind the scripted deck");
+        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))
+            .expect("restate 0o600 on the socket inode");
+        // Each call opens its own short-lived connection, and
+        // `start_prepared_role` re-handshakes before every start — so the
+        // script is: hello, the start that is dropped, hello, the start that is
+        // refused.
+        let deck = tokio::spawn(async move {
+            let mut answered_starts = 0usize;
+            loop {
+                let Ok((stream, _peer)) = listener.accept().await else {
+                    return;
+                };
+                let (mut reader, mut writer) = stream.into_split();
+                let Ok(Some((KIND_REQ, payload))) = read_frame(&mut reader).await else {
+                    continue;
+                };
+                let request: serde_json::Value =
+                    serde_json::from_slice(&payload).unwrap_or_default();
+                if request["op"] == "hello" {
+                    let mut reply = AttachResponse::hello(PROTOCOL_VERSION);
+                    reply.capabilities = Some(
+                        DAEMON_CAPABILITIES
+                            .iter()
+                            .map(|capability| (*capability).to_string())
+                            .collect(),
+                    );
+                    let encoded = serde_json::to_vec(&reply).expect("serialize the hello");
+                    let _ = write_frame(&mut writer, KIND_RESP, &encoded).await;
+                    continue;
+                }
+                answered_starts += 1;
+                if answered_starts == 1 {
+                    // The request was read and the connection goes away with no
+                    // reply — the deck may have started the role.
+                    drop(writer);
+                    continue;
+                }
+                let encoded = serde_json::to_vec(&AttachResponse::err("builder refused"))
+                    .expect("serialize the refusal");
+                let _ = write_frame(&mut writer, KIND_RESP, &encoded).await;
+            }
+        });
+
+        let client = DaemonClient::new(socket);
+        let options = || StartAgentOptions {
+            command: None,
+            cwd: Some("/canonical/project".into()),
+            display_name: Some("builder".into()),
+            rows: 24,
+            cols: 80,
+            env: vec![(DOT_AGENT_DECK_PANE_ID.into(), mint_desktop_pane_id())],
+            tab_membership: None,
+            agent_type: None,
+            seed: None,
+        };
+
+        let dropped = WorkflowDaemon::start_configured_role(&client, options(), "prep-token-1")
+            .await
+            .expect_err("a dropped connection is a failed start");
+        let answered = WorkflowDaemon::start_configured_role(&client, options(), "prep-token-1")
+            .await
+            .expect_err("the deck refused this one");
+        deck.abort();
+
+        assert!(
+            dropped.indeterminate,
+            "a start whose reply was lost may still have been acted on: {}",
+            dropped.message
+        );
+        assert!(
+            dropped
+                .message
+                .contains("closed connection before sending RESP"),
+            "the dropped connection is what failed, not something earlier: {}",
+            dropped.message
+        );
+        assert!(
+            !answered.indeterminate,
+            "a refusal the deck composed means it started nothing: {}",
+            answered.message
+        );
+        assert!(
+            answered.message.contains("builder refused"),
+            "{}",
+            answered.message
+        );
+    }
+
+    /// Scenario (PRD #1223 audit V5): a configured role's start fails with its
+    /// reply LOST rather than refused — the request may have reached the deck —
+    /// and the reconciliation that follows lists nothing. The launch cannot say
+    /// that role did not start, so it reports it as cleanup it could not
+    /// confirm, exactly as it does for a start that timed out. A start the deck
+    /// ANSWERED with a refusal in the same shape reports no such uncertainty,
+    /// which is the half that keeps the warning meaningful.
+    #[tokio::test]
+    async fn an_indeterminate_start_the_deck_does_not_list_is_reported_as_unconfirmed() {
+        for (script, expected_uncertainty) in [
+            (lost("the connection closed before the reply"), true),
+            (refused("builder refused"), false),
+        ] {
+            let daemon = FakeWorkflowDaemon::new(Ok(None), [], Ok(SendResult::Applied));
+            daemon
+                .start_results
+                .lock()
+                .unwrap()
+                .extend([Ok("agent-0".to_string()), script]);
+
+            let failure = launch_configured_orchestration(
+                &daemon,
+                "loop",
+                Some("run"),
+                &prepared_workflow(),
+                32,
+                120,
+                "orchestration-indeterminate",
+            )
+            .await
+            .unwrap_err();
+
+            // Either way the deck was asked, and the role it did start was
+            // stopped: only the report about the role that failed differs.
+            assert_eq!(daemon.reconciliation_requests.lock().unwrap().len(), 1);
+            assert_eq!(*daemon.stopped.lock().unwrap(), ["agent-0"]);
+            assert_eq!(
+                failure.message.contains("cleanup uncertainty"),
+                expected_uncertainty,
+                "{}",
+                failure.message
+            );
+            assert_eq!(
+                failure.unconfirmed_stops,
+                if expected_uncertainty {
+                    vec!["builder".to_string()]
+                } else {
+                    Vec::new()
+                },
+                "{}",
+                failure.message
+            );
+        }
+    }
+
     /// Scenario (PRD #1223 audit V2): the Runs launch's composite failure — the
     /// deck refuses the second role as `stale-preparation` after the first had
     /// started, and the rollback's stop of the first is refused. The sentence
@@ -6391,7 +6616,7 @@ command = "configured-planner"
         );
         daemon.start_results.lock().unwrap().extend([
             Ok("agent-0".to_string()),
-            Err(format!(
+            refused(&format!(
                 "{}: the coordinator context changed since it was prepared",
                 dot_agent_deck::daemon_protocol::PROJECT_ERR_STALE_PREPARATION
             )),
@@ -6551,10 +6776,11 @@ command = "configured-planner"
             std::iter::empty(),
             Ok(SendResult::Applied),
         );
-        daemon.start_results.lock().unwrap().extend([
-            Ok("agent-builder".to_string()),
-            Err("start response lost".to_string()),
-        ]);
+        daemon
+            .start_results
+            .lock()
+            .unwrap()
+            .extend([Ok("agent-builder".to_string()), lost("start response lost")]);
         daemon
             .reconciliation_results
             .lock()
@@ -6621,7 +6847,7 @@ command = "configured-planner"
             .start_results
             .lock()
             .unwrap()
-            .push_back(Err("start response lost".to_string()));
+            .push_back(lost("start response lost"));
         daemon
             .reconciliation_results
             .lock()
