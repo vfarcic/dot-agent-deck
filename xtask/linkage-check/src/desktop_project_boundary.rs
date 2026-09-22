@@ -1,4 +1,4 @@
-//! PRD #819 M7 — check 12: a regression tripwire over the desktop crate's
+//! PRD #819 M7 — rule 12: a regression tripwire over the desktop crate's
 //! production sources.
 //!
 //! # What this is, and what it is NOT
@@ -282,7 +282,7 @@ pub fn run(root: &Path) -> Vec<String> {
     let dir = root.join(DESKTOP_SRC);
     if !dir.is_dir() {
         return vec![format!(
-            "{DESKTOP_SRC} is missing — check 12 covers nothing. If the desktop crate moved, move \
+            "{DESKTOP_SRC} is missing — rule 12 covers nothing. If the desktop crate moved, move \
              this rule with it; do not leave it pointing at a path that no longer exists"
         )];
     }
@@ -305,7 +305,7 @@ pub fn run(root: &Path) -> Vec<String> {
         match violations(&display, &text) {
             Ok(found) => findings.extend(found),
             Err(e) => failures.push(format!(
-                "failed to parse {display} as Rust: {e} — check 12 cannot see a file it cannot \
+                "failed to parse {display} as Rust: {e} — rule 12 cannot see a file it cannot \
                  parse, so this is a failure rather than a skip"
             )),
         }
@@ -422,7 +422,7 @@ impl Scan {
     /// [`TokenStream`], so neither [`Visit::visit_lit_str`] nor
     /// [`Visit::visit_path`] ever sees inside one — and the desktop's project
     /// prose lives almost entirely inside `format!`. Measured: without this,
-    /// check 12 found **zero** of `lib.rs`'s project-state literals.
+    /// rule 12 found **zero** of `lib.rs`'s project-state literals.
     ///
     /// This walks the tokens rather than expanding the macro. String literals
     /// are checked as literals; runs of `ident (:: ident)*` are reassembled and
