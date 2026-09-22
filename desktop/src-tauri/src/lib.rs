@@ -931,6 +931,10 @@ fn spawn_deck_watcher(app: &AppHandle, state: &DesktopState, endpoint: Endpoint)
     // task so the first observed generation is the one in force when the
     // watcher started, not whatever it happens to be when the task is polled.
     let mut selection = state.selection.subscribe();
+    // PRD #1223 M3: this deck's refetch nudge, subscribed here for the same
+    // reason the selection is — a start that lands before the task is first
+    // polled must still be an edge the loop observes.
+    let mut refetch = state.refetch_signal(&key);
     let handle = tauri::async_runtime::spawn(async move {
         // PRD #741 M4(b): the incremental agent list. It belongs to this task
         // and to nothing else — it is only ever correct while this task's
@@ -985,9 +989,16 @@ fn spawn_deck_watcher(app: &AppHandle, state: &DesktopState, endpoint: Endpoint)
             // starts from here rather than firing once on a stale edge.
             selection.mark_unchanged();
             let reader = spawn_event_reader(subscription);
-            let ended =
-                watch_one_subscription(&app, &endpoint, &links, &mut view, reader, &mut selection)
-                    .await;
+            let ended = watch_one_subscription(
+                &app,
+                &endpoint,
+                &links,
+                &mut view,
+                reader,
+                &mut selection,
+                &mut refetch,
+            )
+            .await;
             // PRD #741 M4(a): the event stream ended. That is this watcher's
             // long-lived connection to its daemon going away, and a daemon
             // cannot be replaced without the old process dying and taking this
@@ -1067,6 +1078,7 @@ async fn watch_one_subscription(
     view: &mut AgentView,
     mut events: tokio::sync::mpsc::Receiver<BroadcastMsg>,
     selection: &mut tokio::sync::watch::Receiver<u64>,
+    refetch: &mut tokio::sync::watch::Receiver<u64>,
 ) -> SubscriptionEnd {
     let mut reconcile = tokio::time::interval(RECONCILE_INTERVAL);
     reconcile.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -1074,6 +1086,15 @@ async fn watch_one_subscription(
     // fetches because a fresh view demands it, so consume that one here rather
     // than paying for it twice.
     reconcile.tick().await;
+    // Deliberately NOT `mark_unchanged()`, unlike the selection: a nudge that
+    // landed between subscriptions should wake this loop into its first
+    // refresh now rather than leave the deck unlisted until the next event or
+    // reconcile tick. The fresh view makes that refresh a fetch either way.
+    //
+    // Cleared when the sender is gone — `retain_watchers` dropped this deck and
+    // is aborting this task — so a closed channel cannot complete the arm on
+    // every pass and spin the loop.
+    let mut refetch_open = true;
 
     let mut last_refresh: Option<tokio::time::Instant> = None;
     loop {
@@ -1087,6 +1108,15 @@ async fn watch_one_subscription(
                 None => return SubscriptionEnd::Ended,
             },
             _ = reconcile.tick() => view.mark_reconcile_due(),
+            // PRD #1223 M3: a deck-targeted start just spawned an agent here,
+            // and the daemon's `StartAgent` handler broadcasts nothing — so the
+            // fold cannot know about it and the next emit has to be a fresh
+            // listing. See
+            // `DesktopState::refetch`.
+            changed = refetch.changed(), if refetch_open => match changed {
+                Ok(()) => view.mark_reconcile_due(),
+                Err(_) => refetch_open = false,
+            },
             // PRD #741 M9: returns BEFORE the refresh below, deliberately, and
             // the shape is kept — but PRD #742 M3 changed what it buys, so the
             // reason is restated rather than inherited.
@@ -2075,6 +2105,118 @@ async fn stop_agent_action(state: &DesktopState, agent_id: &str) -> Result<(), S
     Ok(())
 }
 
+/// What the webview asked a [`DesktopAction::StartAgent`] to spawn, minus the
+/// deck. Grouped so [`start_agent_action`] takes the deck and the request as
+/// two arguments rather than seven.
+struct StartAgentRequest {
+    command: Option<String>,
+    cwd: Option<String>,
+    display_name: Option<String>,
+    rows: Option<u16>,
+    cols: Option<u16>,
+}
+
+/// A start the target deck accepted.
+struct StartedAgent {
+    /// The id the target daemon minted. Unique only within that daemon, so it
+    /// means nothing without [`Self::scope`]'s deck beside it.
+    agent_id: String,
+    /// The deck the agent was started on — captured once, before the first
+    /// await, and the only deck any later step of the action may name.
+    scope: crate::dto::DeckScope,
+}
+
+/// Start one plain agent on the deck `deck_id` names (PRD #1223 M3).
+///
+/// # The deck comes from the request, never from the selection
+///
+/// This was the `StartAgent` arm reaching its daemon through `trusted_daemon()`,
+/// which resolves the applied selection — and `Selection::All` resolves to the
+/// local deck (#1083). The overview shows every deck at once, so it is exactly
+/// the screen where "the selected deck" is least likely to be the one the user
+/// meant. [`crate::dto::DeckScope::resolve`] is PRD #1105's answer for terminal
+/// attach and it is the same answer here: the id is matched against the
+/// observed set, so an id this app is not observing — a deck that disconnected
+/// or was removed mid-flow, or a forged one — is refused with that function's
+/// error and nothing is started anywhere. There is no retargeting and no
+/// fallback to the selection, because a fallback would turn a stale id into a
+/// silent spawn on whichever deck is in force.
+///
+/// # Split out for the reason [`stop_agent_action`] is
+///
+/// Everything here is testable and the emit around it is not, so a test can
+/// drive it against two real daemons with the selection on All Decks.
+async fn start_agent_action(
+    state: &DesktopState,
+    deck_id: &str,
+    request: StartAgentRequest,
+) -> Result<StartedAgent, String> {
+    let StartAgentRequest {
+        command,
+        cwd,
+        display_name,
+        rows,
+        cols,
+    } = request;
+    let (rows, cols) = validate_start_fields(
+        command.as_deref(),
+        cwd.as_deref(),
+        display_name.as_deref(),
+        rows.unwrap_or(24),
+        cols.unwrap_or(80),
+    )?;
+    // ONE capture, before the first await (issue #1116).
+    let scope = crate::dto::DeckScope::resolve(Some(deck_id))?;
+    let agent_type = AgentType::from_command(command.as_deref());
+    let pane_id = mint_desktop_pane_id();
+    let daemon = state.daemon.trusted(scope.endpoint()).await?;
+    daemon.require_compatible()?;
+    let agent_id = daemon
+        .client
+        .start_agent(StartAgentOptions {
+            command,
+            cwd,
+            display_name,
+            rows,
+            cols,
+            env: vec![(DOT_AGENT_DECK_PANE_ID.into(), pane_id)],
+            agent_type,
+            ..Default::default()
+        })
+        .await
+        .map_err(|error| safe_message(error.to_string()))?;
+    Ok(StartedAgent { agent_id, scope })
+}
+
+/// The target deck's snapshot after a start, for the direct refresh that
+/// follows it (PRD #1223 M3) — `None` when the fleet moved while it was taken.
+///
+/// # Why the action refreshes the target and not only the selected deck
+///
+/// Every `DesktopAction` tails `refresh_and_emit`, which snapshots the
+/// **selected** deck. A start on another deck would then appear only when that
+/// deck's watcher next re-fetched, and the daemon's `StartAgent` handler
+/// broadcasts nothing, so for an agent with no hooks that is the five-second
+/// reconcile.
+///
+/// # Checked on both sides of the await
+///
+/// Before, so a deck that left the fleet since the start is not re-handshaken
+/// for a snapshot nobody will show. After, because this is a publication: a
+/// snapshot emitted for a deck that left while it was being taken would put
+/// that deck's group back on an overview that has just pruned it. The start
+/// itself is not undone either way — the agent is running, and saying
+/// otherwise would be worse than the watcher showing it late.
+async fn target_deck_snapshot(
+    links: &DaemonLinks,
+    scope: &crate::dto::DeckScope,
+) -> Option<DesktopSnapshot> {
+    scope.revalidate().ok()?;
+    let snapshot = snapshot_with(scope.endpoint(), links, None).await;
+    scope.revalidate().ok()?;
+    Some(snapshot)
+}
+
 /// [`apply_selection`] minus the emit, reporting whether the deck moved.
 ///
 /// Split out because everything above the emit is testable and the emit is not —
@@ -2309,38 +2451,34 @@ async fn desktop_run_action(
             });
         }
         DesktopAction::StartAgent {
+            deck_id,
             command,
             cwd,
             display_name,
             rows,
             cols,
         } => {
-            let (rows, cols) = validate_start_fields(
-                command.as_deref(),
-                cwd.as_deref(),
-                display_name.as_deref(),
-                rows.unwrap_or(24),
-                cols.unwrap_or(80),
-            )?;
-            let agent_type = AgentType::from_command(command.as_deref());
-            let pane_id = mint_desktop_pane_id();
-            let daemon = trusted_daemon(&state.daemon).await?;
-            daemon.require_compatible()?;
-            let id = daemon
-                .client
-                .start_agent(StartAgentOptions {
+            let started = start_agent_action(
+                &state,
+                &deck_id,
+                StartAgentRequest {
                     command,
                     cwd,
                     display_name,
                     rows,
                     cols,
-                    env: vec![(DOT_AGENT_DECK_PANE_ID.into(), pane_id)],
-                    agent_type,
-                    ..Default::default()
-                })
-                .await
-                .map_err(|error| safe_message(error.to_string()))?;
-            result_agent_id = Some(id);
+                },
+            )
+            .await?;
+            // PRD #1223 M3: the TARGET deck, directly — the tail below
+            // refreshes only the selected one. The watcher nudge is what keeps
+            // that deck's next watcher emit from answering out of a fold that
+            // has never heard of the new agent and taking it off screen again.
+            if let Some(snapshot) = target_deck_snapshot(&state.daemon, &started.scope).await {
+                emit_snapshot(&app, &snapshot);
+            }
+            state.request_refetch(&started.scope.identity());
+            result_agent_id = Some(started.agent_id);
         }
         DesktopAction::StartWorkflow {
             name,

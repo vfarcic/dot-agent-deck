@@ -4495,4 +4495,250 @@ mod tests {
             "and its transport is not re-acquired either"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // PRD #1223 M3 — a deck-targeted plain-agent start, against two REAL
+    // daemons
+    //
+    // The two decks of an All Decks fleet cannot both be local: a settings
+    // document names the local deck and REMOTE rows, nothing else (see the
+    // membership test above). So the "other" deck is a remote row whose
+    // transport `EndpointTunnels::insert_route` points at a second production
+    // attach server — the forwarded socket an `ssh -L` would hand the client,
+    // with the ssh hop taken out. The local deck is the first server, reached
+    // through `DOT_AGENT_DECK_ATTACH_SOCKET` because no document can name it;
+    // that write is process-global, which is safe under nextest's
+    // process-per-test model and is the precedent `terminal::tests` set for
+    // the same reason.
+    // -----------------------------------------------------------------------
+
+    /// An All Decks document with one remote row, and the endpoint that row
+    /// resolves to.
+    #[cfg(unix)]
+    fn all_decks_with_one_remote_row(host: &str) -> (crate::settings::DesktopSettings, Endpoint) {
+        use crate::settings::{
+            DesktopSettings, EndpointId, EndpointSettings, RemoteEndpointSettings, Selection,
+        };
+        use dot_agent_deck::remote_tunnel::{Hostname, RemoteSocketPath};
+        let mut row = RemoteEndpointSettings::new(
+            EndpointId::parse("deck000000000001").expect("a valid id"),
+            Hostname::parse(host).expect("a valid host"),
+        );
+        row.socket = Some(RemoteSocketPath::parse("/run/deck.sock").expect("a path"));
+        let settings = DesktopSettings {
+            endpoints: Some(EndpointSettings {
+                remote: vec![row],
+                selection: Selection::All,
+            }),
+            ..DesktopSettings::default()
+        };
+        let remote = settings
+            .connectable_endpoints()
+            .into_iter()
+            .nth(1)
+            .expect("the row is connectable");
+        (settings, remote)
+    }
+
+    /// Make `local` the app's local deck and apply `settings`, asserting the
+    /// fixture really selects All Decks with the local deck in force — the
+    /// state under which the old arm went to the wrong deck.
+    #[cfg(unix)]
+    fn apply_all_decks_over(local: &RealDeck, settings: &crate::settings::DesktopSettings) {
+        let socket = local
+            .endpoint
+            .as_local()
+            .expect("a RealDeck is local")
+            .path()
+            .to_path_buf();
+        // SAFETY: under nextest this test owns its process, so no other thread
+        // is reading the environment here. See the section comment above.
+        unsafe { std::env::set_var("DOT_AGENT_DECK_ATTACH_SOCKET", &socket) };
+        crate::dto::apply_settings_selection(settings);
+        assert_eq!(
+            crate::dto::selected_endpoint().identity(),
+            local.endpoint.identity(),
+            "fixture: All Decks resolves to the local deck, which is the real daemon `local`"
+        );
+    }
+
+    /// A plain `cat` agent with a name no fixture agent carries, so where it
+    /// landed can be read off either registry without trusting ids, which both
+    /// daemons mint from their own counters.
+    #[cfg(unix)]
+    fn plain_start(name: &str) -> crate::StartAgentRequest {
+        crate::StartAgentRequest {
+            command: Some("cat".into()),
+            cwd: None,
+            display_name: Some(name.into()),
+            rows: Some(24),
+            cols: Some(80),
+        }
+    }
+
+    /// `(id, display name)` for every agent a real registry holds.
+    #[cfg(unix)]
+    fn named_records(deck: &RealDeck) -> Vec<(String, Option<String>)> {
+        deck.registry
+            .agent_records()
+            .into_iter()
+            .map(|record| (record.id, record.display_name))
+            .collect()
+    }
+
+    /// Scenario: two real daemons — the local deck and a remote row routed to
+    /// the second — are observed under **All Decks**, and each already runs
+    /// one agent. A plain-agent start aimed at the remote row's wire id lands
+    /// on that deck: its registry lists the new agent under the id the action
+    /// returned, with the requested name; the local deck's registry is exactly
+    /// what it was; and the direct refresh of the target lists the agent under
+    /// the target's own deck id.
+    ///
+    /// **What it fails against.** The `StartAgent` arm this replaced reached
+    /// its daemon through `trusted_daemon()`, and All Decks resolves to the
+    /// local deck (#1083) — so the agent landed on `local`, which is a real
+    /// daemon here and would list it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_start_aimed_at_another_deck_under_all_decks_lands_on_that_deck() {
+        let _selection = crate::dto::SELECTION_LOCK.lock().await;
+        let local = RealDeck::start("m3-land-local");
+        let remote = RealDeck::start("m3-land-remote");
+        let local_agent = local.spawn_agent("pane-local");
+        let remote_agent = remote.spawn_agent("pane-remote");
+        let (settings, remote_endpoint) = all_decks_with_one_remote_row("build-box.example.com");
+        apply_all_decks_over(&local, &settings);
+        let state = crate::terminal::DesktopState::default();
+        state
+            .tunnels
+            .insert_route(
+                &remote_endpoint,
+                remote.endpoint.as_local().expect("local socket").path(),
+            )
+            .await;
+        let remote_wire = deck_wire_id(&remote_endpoint);
+
+        let started =
+            crate::start_agent_action(&state, &remote_wire, plain_start("m3-started")).await;
+        let refreshed = match &started {
+            Ok(started) => crate::target_deck_snapshot(&state.daemon, &started.scope).await,
+            Err(_) => None,
+        };
+
+        // Read both registries and let go of the PTY children BEFORE asserting,
+        // so a failing run still cleans up.
+        let on_local = named_records(&local);
+        let on_remote = named_records(&remote);
+        local.shutdown();
+        remote.shutdown();
+
+        let started = started.expect("the targeted deck accepts the start");
+        assert_eq!(
+            started.scope.identity(),
+            remote_endpoint.identity(),
+            "the action captured the deck it was aimed at, not the selected one"
+        );
+        assert!(
+            on_remote.contains(&(started.agent_id.clone(), Some("m3-started".to_string()))),
+            "the targeted deck lists the new agent under the returned id: {on_remote:?}"
+        );
+        assert_eq!(
+            on_remote.len(),
+            2,
+            "the remote deck's own agent plus the new one"
+        );
+        assert!(on_remote.iter().any(|(id, _)| *id == remote_agent));
+        assert_eq!(
+            on_local,
+            vec![(local_agent, None)],
+            "the local deck — the one All Decks resolves to — gains nothing"
+        );
+
+        let refreshed = refreshed.expect("the fleet did not move, so the target is refreshed");
+        assert_eq!(refreshed.connection.status, ConnectionStatus::Connected);
+        assert_eq!(
+            refreshed.connection.deck_id, remote_wire,
+            "the direct refresh is the TARGET deck's snapshot, not the selected deck's"
+        );
+        assert!(
+            refreshed
+                .agents
+                .iter()
+                .any(|agent| agent.id == started.agent_id),
+            "and it already lists the new agent"
+        );
+    }
+
+    /// Scenario: the same two real daemons under **All Decks**. A start aimed
+    /// at a deck id the app has never observed is refused with
+    /// `DeckScope::resolve`'s error. The remote row is then removed from the
+    /// document — its deck leaves the fleet, the way a disconnected or deleted
+    /// deck does mid-flow — and a start aimed at its previously valid id is
+    /// refused the same way. Neither daemon gains an agent either time.
+    ///
+    /// **What it fails against.** Any fallback to the selection: under All
+    /// Decks that is the local deck, a real daemon here that would list the
+    /// agent. The removed deck's route is deliberately left in the tunnel map,
+    /// so a retarget to it would reach a live daemon too.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_start_aimed_at_a_deck_the_app_is_not_observing_starts_nothing_anywhere() {
+        let _selection = crate::dto::SELECTION_LOCK.lock().await;
+        let local = RealDeck::start("m3-refuse-local");
+        let remote = RealDeck::start("m3-refuse-remote");
+        let (settings, remote_endpoint) = all_decks_with_one_remote_row("build-box.example.com");
+        apply_all_decks_over(&local, &settings);
+        let state = crate::terminal::DesktopState::default();
+        state
+            .tunnels
+            .insert_route(
+                &remote_endpoint,
+                remote.endpoint.as_local().expect("local socket").path(),
+            )
+            .await;
+        let remote_wire = deck_wire_id(&remote_endpoint);
+
+        let unknown =
+            crate::start_agent_action(&state, "deck-ffffffffffffffff", plain_start("m3-unknown"))
+                .await;
+
+        // The row goes; the local deck and All Decks stay.
+        let without_row = crate::settings::DesktopSettings {
+            endpoints: Some(crate::settings::EndpointSettings {
+                remote: Vec::new(),
+                selection: crate::settings::Selection::All,
+            }),
+            ..crate::settings::DesktopSettings::default()
+        };
+        apply_all_decks_over(&local, &without_row);
+        let departed =
+            crate::start_agent_action(&state, &remote_wire, plain_start("m3-departed")).await;
+
+        let on_local = named_records(&local);
+        let on_remote = named_records(&remote);
+        local.shutdown();
+        remote.shutdown();
+
+        for (case, outcome) in [("an unknown id", unknown), ("a departed deck", departed)] {
+            let error = match outcome {
+                Ok(started) => panic!(
+                    "{case}: a start must not resolve, yet agent {} started",
+                    started.agent_id
+                ),
+                Err(error) => error,
+            };
+            assert!(
+                error.contains("that deck is not one this app is observing"),
+                "{case}: refused with DeckScope::resolve's error, got: {error}"
+            );
+        }
+        assert!(
+            on_local.is_empty(),
+            "nothing fell back to the local deck: {on_local:?}"
+        );
+        assert!(
+            on_remote.is_empty(),
+            "and nothing was retargeted to the departed deck: {on_remote:?}"
+        );
+    }
 }

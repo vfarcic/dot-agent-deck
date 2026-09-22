@@ -413,6 +413,73 @@ function crowdedAgent(seed: CrowdedSeed): AgentSession {
   };
 }
 
+/** What the preview was asked to start — `start_agent`'s fields plus the id the fixture deck minted. */
+export interface FixtureStartedAgent {
+  id: string;
+  daemonId: string;
+  displayName?: string;
+  command?: string;
+  cwd?: string;
+  rows?: number;
+  cols?: number;
+}
+
+/**
+ * The agent a fixture deck gains when the preview starts one (PRD #1223 M3).
+ *
+ * Shaped the way `agentFromDto` shapes a freshly spawned LIVE agent, by the
+ * convention {@link crowdedAgent} set: an agent that has emitted no hook event
+ * yet is `running` (the crate maps a record with no hook state to `running`),
+ * every field the daemon does not report carries live mode's placeholder, and
+ * there is no tool, prompt or activity to show. The CLI is the command's first
+ * word and absent when no command was given — the daemon then starts its
+ * default shell and names no binary, and absence is the honest rendering.
+ */
+export function createFixtureStartedAgent(started: FixtureStartedAgent): AgentSession {
+  const cli = started.command?.trim().split(/\s+/)[0] || undefined;
+  const role = cli ? cli.charAt(0).toUpperCase() + cli.slice(1) : "Agent";
+  return {
+    id: started.id,
+    daemonId: started.daemonId,
+    role,
+    displayName: started.displayName || role,
+    cli,
+    model: "Unavailable",
+    status: "running",
+    task: "Task metadata unavailable from the deck",
+    cwd: started.cwd,
+    duration: "—",
+    tokens: 0,
+    cost: 0,
+    contextPercent: 0,
+    worktree: "Unavailable",
+    writeLease: "unknown",
+    spawnedAtMs: Date.now(),
+    rows: started.rows ?? 24,
+    cols: started.cols ?? 80,
+    toolCount: 0,
+    transcript: "",
+    diff: [],
+    checks: [],
+    handoffIds: [],
+    artifacts: [],
+    tab: { kind: "dashboard" },
+    inOrchestration: false,
+    isStartRole: false,
+  };
+}
+
+/**
+ * The next id a fixture deck mints: the lowest positive integer none of its
+ * agents already uses. A daemon mints per-daemon monotonic integers, so two
+ * decks answering the same id is the ordinary case the preview must show too.
+ */
+export function nextFixtureAgentId(agents: readonly AgentSession[]): string {
+  let next = 1;
+  while (agents.some((agent) => agent.id === String(next))) next += 1;
+  return String(next);
+}
+
 function orchestrationTab(orchestrationId: string, name: string, displayTitle: string, roleName: string, roleIndex: number, isStartRole = false, cwd?: string): AgentTab {
   return { kind: "orchestration", orchestrationId, name, displayTitle, roleName, roleIndex, isStartRole, cwd };
 }

@@ -360,6 +360,69 @@ describe("TauriDeckBridge", () => {
     await bridge.dispose();
   });
 
+  /**
+   * Scenario (PRD #1223 M3): start a plain agent on a named deck through the
+   * live bridge. The action reaches `desktop_run_action` exactly as sent —
+   * `deckId` included, since the crate is what resolves it — and the id the
+   * target deck minted comes back on the result instead of being dropped.
+   */
+  it("forwards start_agent with its deck and returns the started agent's id", async () => {
+    const { TauriDeckBridge } = await import("./bridge");
+    const bridge = new TauriDeckBridge();
+    invoke.mockResolvedValueOnce({ ok: true, agentId: "7", snapshot: {} });
+
+    const action = {
+      type: "start_agent",
+      deckId: "deck-00000000000b0x01",
+      command: "claude",
+      cwd: "/home/dev/code/repo",
+      displayName: "repo",
+      rows: 30,
+      cols: 110,
+    } as const;
+    const result = await bridge.runAction(action);
+
+    expect(invoke).toHaveBeenCalledTimes(1);
+    expect(invoke).toHaveBeenCalledWith("desktop_run_action", { action });
+    expect(result).toEqual({ ok: true, agentId: "7" });
+    await bridge.dispose();
+  });
+
+  /**
+   * Scenario: the crate refuses a start because its deck is not one the app
+   * observes. The bridge surfaces that refusal as a rejection and sends
+   * nothing else — no second attempt, and no deck filled in from the
+   * selection.
+   */
+  it("surfaces a refused start_agent without retrying it elsewhere", async () => {
+    const { TauriDeckBridge } = await import("./bridge");
+    const bridge = new TauriDeckBridge();
+    invoke.mockRejectedValueOnce(new Error("that deck is not one this app is observing: deck-ffffffffffffffff"));
+
+    await expect(bridge.runAction({ type: "start_agent", deckId: "deck-ffffffffffffffff" }))
+      .rejects.toThrow("that deck is not one this app is observing");
+
+    expect(invoke).toHaveBeenCalledTimes(1);
+    expect(invoke).toHaveBeenCalledWith("desktop_run_action", { action: { type: "start_agent", deckId: "deck-ffffffffffffffff" } });
+    await bridge.dispose();
+  });
+
+  /**
+   * Scenario: an action the crate answers with no agent id, and one where a
+   * malformed value sits in that field. Neither result carries an `agentId`,
+   * so a caller never reads a non-string as the agent to open.
+   */
+  it("reports agentId only when the crate returned a string", async () => {
+    const { TauriDeckBridge } = await import("./bridge");
+    const bridge = new TauriDeckBridge();
+    invoke.mockResolvedValueOnce({ ok: true });
+    invoke.mockResolvedValueOnce({ ok: true, agentId: 42 });
+
+    expect(await bridge.runAction({ type: "stop_daemon" })).not.toHaveProperty("agentId");
+    expect(await bridge.runAction({ type: "start_agent", deckId: "deck-000000000000dec1" })).not.toHaveProperty("agentId");
+    await bridge.dispose();
+  });
+
   it("sends restart_daemon through the live bridge", async () => {
     const { TauriDeckBridge } = await import("./bridge");
     const bridge = new TauriDeckBridge();
@@ -817,6 +880,81 @@ describe("FixtureDeckBridge scenarios", () => {
 
     expect(view.connection.status).toBe("connected");
     expect(view.agents).toHaveLength(0);
+  });
+
+  /**
+   * Scenario (PRD #1223 M3): in the three-deck fleet preview, start a plain
+   * agent on the REMOTE deck, which is not the selected one. The result
+   * carries the id that deck minted; the fleet the bridge emits lists the new
+   * agent on that deck and nowhere else, as a running agent with the name and
+   * directory it was started with; and a fresh `connect()` still shows it.
+   */
+  it("starts a fixture agent on the deck it names and lists it in that deck's fleet entry", async () => {
+    window.history.replaceState({}, "", "/?fixture=1&state=fleet");
+    const { createDeckBridge } = await import("./bridge");
+    const { FIXTURE_DAEMON_ID, FIXTURE_REMOTE_DAEMON_ID } = await import("../data/fixture");
+    const bridge = createDeckBridge("fixture");
+    const before = await bridge.connect();
+    const localBefore = before.find((deck) => deck.connection.deckId === FIXTURE_DAEMON_ID)!.agents.length;
+    const fleets: DeckFleet[] = [];
+    await bridge.subscribe((fleet) => fleets.push(fleet), () => {});
+
+    const result = await bridge.runAction({ type: "start_agent", deckId: FIXTURE_REMOTE_DAEMON_ID, command: "claude --model haiku", cwd: "/home/dev/code/repo", displayName: "repo" });
+
+    expect(result.ok).toBe(true);
+    expect(result.agentId).toBeDefined();
+    const emitted = fleets.at(-1)!;
+    const remote = emitted.find((deck) => deck.connection.deckId === FIXTURE_REMOTE_DAEMON_ID)!;
+    const started = remote.agents.find((agent) => agent.id === result.agentId);
+    expect(started).toMatchObject({ daemonId: FIXTURE_REMOTE_DAEMON_ID, displayName: "repo", cwd: "/home/dev/code/repo", cli: "claude", status: "running", tab: { kind: "dashboard" } });
+    const local = emitted.find((deck) => deck.connection.deckId === FIXTURE_DAEMON_ID)!;
+    expect(local.agents).toHaveLength(localBefore);
+    expect(local.agents.some((agent) => agent.displayName === "repo")).toBe(false);
+
+    const again = await bridge.connect();
+    expect(again.find((deck) => deck.connection.deckId === FIXTURE_REMOTE_DAEMON_ID)!.agents.some((agent) => agent.id === result.agentId)).toBe(true);
+    await bridge.dispose();
+  });
+
+  /**
+   * Scenario: the fixture deck mints ids the way a daemon does — per deck,
+   * the next integer none of its agents holds — so two starts on one deck get
+   * two ids, and the first agent on a deck with no numeric ids is `1`.
+   */
+  it("mints a fresh per-deck id for every fixture start", async () => {
+    window.history.replaceState({}, "", "/?fixture=1&state=fleet");
+    const { createDeckBridge } = await import("./bridge");
+    const { FIXTURE_REMOTE_DAEMON_ID } = await import("../data/fixture");
+    const bridge = createDeckBridge("fixture");
+    await bridge.connect();
+
+    const first = await bridge.runAction({ type: "start_agent", deckId: FIXTURE_REMOTE_DAEMON_ID });
+    const second = await bridge.runAction({ type: "start_agent", deckId: FIXTURE_REMOTE_DAEMON_ID });
+
+    expect(first.agentId).toBe("1");
+    expect(second.agentId).toBe("2");
+    await bridge.dispose();
+  });
+
+  /**
+   * Scenario: start a fixture agent on a deck id the preview does not show,
+   * and on a deck it shows as unreachable. Both are refused — the first with
+   * the crate's own `DeckScope::resolve` wording — and no deck's agent list
+   * changes: nothing falls back to the selected deck.
+   */
+  it("refuses a fixture start on an unknown or unreachable deck and starts nothing", async () => {
+    window.history.replaceState({}, "", "/?fixture=1&state=fleet");
+    const { createDeckBridge } = await import("./bridge");
+    const { FIXTURE_UNREACHABLE_DAEMON_ID } = await import("../data/fixture");
+    const bridge = createDeckBridge("fixture");
+    const counts = (fleet: DeckFleet) => fleet.map((deck) => deck.agents.length);
+    const before = counts(await bridge.connect());
+
+    await expect(bridge.runAction({ type: "start_agent", deckId: "deck-ffffffffffffffff" })).rejects.toThrow("that deck is not one this app is observing");
+    await expect(bridge.runAction({ type: "start_agent", deckId: FIXTURE_UNREACHABLE_DAEMON_ID })).rejects.toThrow("not connected");
+
+    expect(counts(await bridge.connect())).toEqual(before);
+    await bridge.dispose();
   });
 
   it("falls back to the four-agent scenario for an unknown ?state=", async () => {

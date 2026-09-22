@@ -1,4 +1,4 @@
-import { createFixtureFleet, DEFAULT_PROFILES, fixtureVoiceCommands, fixtureVoiceHeard, fixtureVoiceScript, fixtureVoiceStatus, fixtureVoiceTranscription, resolveFixtureVoice, type FixtureState } from "../data/fixture";
+import { createFixtureFleet, createFixtureStartedAgent, DEFAULT_PROFILES, fixtureVoiceCommands, nextFixtureAgentId, fixtureVoiceHeard, fixtureVoiceScript, fixtureVoiceStatus, fixtureVoiceTranscription, resolveFixtureVoice, type FixtureState } from "../data/fixture";
 import { agentKey } from "./agentKey";
 import { getTerminal } from "./terminalRegistry";
 import { applyHandoffEvent, mapDaemonEvent, MAX_LIVE_EVIDENCE } from "./daemonEvents";
@@ -304,6 +304,8 @@ export interface DesktopActionResultDto {
   ok: boolean;
   sendResult?: import("../types").SendResult;
   message?: string;
+  /** The agent the action acted on; for `start_agent`, the id the target deck minted. */
+  agentId?: string;
 }
 
 /**
@@ -1204,7 +1206,7 @@ export interface DesktopTerminalStateDto {
 export type DesktopRunActionDto =
   | { type: "refresh" }
   | { type: "bootstrap"; startIfMissing?: boolean }
-  | { type: "start_agent"; command?: string; cwd?: string; displayName?: string; rows?: number; cols?: number }
+  | { type: "start_agent"; deckId: string; command?: string; cwd?: string; displayName?: string; rows?: number; cols?: number }
   | { type: "stop_agent"; agentId: string }
   | { type: "rename_agent"; agentId: string; displayName: string }
   | { type: "attach_terminal"; agentId: string; onOutput: import("@tauri-apps/api/core").Channel<ArrayBuffer> }
@@ -1885,6 +1887,12 @@ class FixtureDeckBridge implements DeckBridge {
   }
 
   async runAction(action: DeckAction): Promise<DeckActionResult> {
+    if (action.type === "start_agent") {
+      // PRD #1223 M3 — the one fixture action that is NOT the selected deck's:
+      // it names its deck, like the live one, so a start from the overview
+      // lands on the deck the user picked whichever deck is selected.
+      return this.startAgent(action);
+    }
     if (action.type === "pause_run" || action.type === "resume_run") {
       this.snapshot.paused = action.type === "pause_run";
     } else if (action.type === "approve_run") {
@@ -1920,6 +1928,38 @@ class FixtureDeckBridge implements DeckBridge {
     }
     this.emitSnapshot();
     return { ok: true, sendResult: action.type === "submit_text" ? "applied" : undefined };
+  }
+
+  /**
+   * The fixture half of the deck-targeted start: refuse a deck this preview
+   * does not show with the crate's own wording (`DeckScope::resolve`), refuse
+   * one that is not connected, and otherwise add the agent to THAT deck's
+   * fleet entry and hand back the id it minted — so a spec can wait for
+   * `(deckId, agentId)` to appear exactly as the live flow will.
+   */
+  private startAgent(action: Extract<DeckAction, { type: "start_agent" }>): DeckActionResult {
+    const deck = this.fleet.find((candidate) => candidate.connection.deckId === action.deckId);
+    if (!deck) {
+      throw new Error(`that deck is not one this app is observing: ${action.deckId}`);
+    }
+    if (deck.connection.status !== "connected") {
+      throw new Error(`that deck is not connected: ${action.deckId}`);
+    }
+    const agentId = nextFixtureAgentId(deck.agents);
+    deck.agents = [
+      ...deck.agents,
+      createFixtureStartedAgent({
+        id: agentId,
+        daemonId: action.deckId,
+        displayName: action.displayName,
+        command: action.command,
+        cwd: action.cwd,
+        rows: action.rows,
+        cols: action.cols,
+      }),
+    ];
+    this.emitSnapshot();
+    return { ok: true, agentId };
   }
 
   /**
@@ -3320,9 +3360,14 @@ export class TauriDeckBridge implements DeckBridge {
 
   async runAction(action: DeckAction): Promise<DeckActionResult> {
     const invoke = await this.getInvoke();
-    if (action.type === "stop_agent" || action.type === "rename_agent" || action.type === "submit_text" || action.type === "start_workflow" || action.type === "stop_daemon" || action.type === "restart_daemon" || action.type === "allow_build_mismatch") {
+    if (action.type === "start_agent" || action.type === "stop_agent" || action.type === "rename_agent" || action.type === "submit_text" || action.type === "start_workflow" || action.type === "stop_daemon" || action.type === "restart_daemon" || action.type === "allow_build_mismatch") {
       // `desktop_run_action` resolves with `ok: false` for a non-delivered
       // send rather than raising, so the result must be returned, not dropped.
+      //
+      // `start_agent` carries its target `deckId` through untouched (PRD #1223
+      // M3): the crate resolves it against the decks this app observes and
+      // refuses anything else, so nothing here may fill it in from the
+      // selection.
       const result = await invoke<DesktopActionResultDto>("desktop_run_action", { action: action satisfies DesktopRunActionDto });
       if (action.type === "stop_daemon" || action.type === "restart_daemon") {
         this.sessions.clear();
@@ -3335,7 +3380,11 @@ export class TauriDeckBridge implements DeckBridge {
         this.warm.clear();
         this.lifecycle += 1;
       }
-      return { ok: result?.ok !== false, sendResult: result?.sendResult, message: result?.message };
+      // The crate already returned `agentId` for every agent-scoped action and
+      // this dropped it, which left a started agent's id — the one thing the
+      // caller needs to open its pane — unreadable (#1041).
+      const agentId = typeof result?.agentId === "string" ? result.agentId : undefined;
+      return { ok: result?.ok !== false, sendResult: result?.sendResult, message: result?.message, ...(agentId === undefined ? {} : { agentId }) };
     }
     if (action.type === "start_daemon") {
       const dto = await invoke<DesktopSnapshotDto>("desktop_bootstrap", { options: { startIfMissing: true } });

@@ -503,7 +503,18 @@ pub enum DesktopAction {
         #[serde(default)]
         start_if_missing: bool,
     },
+    /// Start one plain agent on the deck `deck_id` names (PRD #1223 M3).
     StartAgent {
+        /// The target deck's wire id — `connection.deckId`, the value
+        /// [`DeckScope::resolve`] accepts — and **required**, which is the
+        /// point. This arm used to read the applied selection through
+        /// `trusted_daemon()`, and under **All Decks** that resolves to the
+        /// local deck (#1083): the overview, the one screen that shows every
+        /// deck at once, would have started the agent on whichever deck
+        /// happened to be selected. A start with no deck is now refused at
+        /// decode rather than defaulted, so there is no selection-reading path
+        /// left to fall back to.
+        deck_id: String,
         command: Option<String>,
         cwd: Option<String>,
         display_name: Option<String>,
@@ -2624,6 +2635,7 @@ mod tests {
     fn profile_start_action_uses_camel_case_fields() {
         let action: DesktopAction = serde_json::from_value(serde_json::json!({
             "type": "start_agent",
+            "deckId": "deck-000000000000dec1",
             "command": "codex --model gpt-5.6-sol",
             "cwd": "/tmp/project",
             "displayName": "builder",
@@ -2634,12 +2646,33 @@ mod tests {
         assert!(matches!(
             action,
             DesktopAction::StartAgent {
+                deck_id,
                 display_name: Some(name),
                 rows: Some(30),
                 cols: Some(110),
                 ..
-            } if name == "builder"
+            } if name == "builder" && deck_id == "deck-000000000000dec1"
         ));
+    }
+
+    /// Scenario: the webview sends a `start_agent` that names no deck. It must
+    /// fail to decode — PRD #1223 M3 made `deckId` required so that a start can
+    /// never fall back to the applied selection, which under All Decks is the
+    /// local deck whatever the user was looking at (#1083).
+    #[test]
+    fn a_start_agent_action_without_a_deck_is_refused_at_decode() {
+        let refused = serde_json::from_value::<DesktopAction>(serde_json::json!({
+            "type": "start_agent",
+            "command": "codex"
+        }));
+        let error = match refused {
+            Ok(_) => panic!("a start with no deck must not decode"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error.contains("deckId"),
+            "the refusal names the field: {error}"
+        );
     }
 
     #[test]

@@ -662,6 +662,16 @@ export type DeckAction =
   | { type: "restart_daemon" }
   | { type: "allow_build_mismatch" }
   | { type: "start_workflow"; name: string; cwd: string; taskPrompt: string; roles: WorkflowLaunchRole[]; rows: number; cols: number; configRevision?: string }
+  /**
+   * Start one plain agent on the deck `deckId` names (PRD #1223 M3) — the
+   * wire `connection.deckId` of the target, captured once when the user picks
+   * the deck. Required, and never defaulted to the selected deck: under All
+   * Decks the selection resolves to the local deck (#1083), which is exactly
+   * the wrong answer on the overview. A deck the app is not observing is
+   * refused and nothing starts anywhere. The new agent's id comes back as
+   * `DeckActionResult.agentId`.
+   */
+  | { type: "start_agent"; deckId: string; command?: string; cwd?: string; displayName?: string; rows?: number; cols?: number }
   | { type: "retry_stage"; stageId: string }
   | { type: "stop_agent"; agentId: string }
   | { type: "rename_agent"; agentId: string; displayName: string }
@@ -694,6 +704,13 @@ export interface DeckActionResult {
   ok: boolean;
   sendResult?: SendResult;
   message?: string;
+  /**
+   * The id of the agent the action acted on — for `start_agent`, the one the
+   * target deck just minted (PRD #1223 M3). Unique only within that deck, so
+   * it means nothing without the `deckId` the action was sent with: a
+   * consumer keys it as `(deckId, agentId)`, never alone.
+   */
+  agentId?: string;
 }
 
 /** True only for the two outcomes that actually reached the agent. */

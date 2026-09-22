@@ -257,6 +257,28 @@ pub(crate) struct DesktopState {
     /// wait instead of being lost. The value is a counter and nobody reads it;
     /// what carries the signal is that it moved.
     pub(crate) selection: tokio::sync::watch::Sender<u64>,
+    /// PRD #1223 M3: one "re-read your agent list now" signal per **watched
+    /// deck**, which a deck-targeted start fires at the deck it started on.
+    ///
+    /// # Why an emit alone is not enough
+    ///
+    /// The daemon's `StartAgent` handler broadcasts nothing, so the target
+    /// deck's watcher answers its next emit from an
+    /// [`crate::agent_view::AgentView`] that does not hold the new agent until
+    /// the agent's own hook sends a `SessionStart` — never, for a hookless
+    /// command — or the [`crate::agent_view::RECONCILE_INTERVAL`] re-read
+    /// comes round. And on a busy deck the next emit is one coalescing window
+    /// away, triggered by some other agent's event. A one-off snapshot emitted
+    /// by the action would show the agent and that emit would take it away
+    /// again for up to five seconds, which is the window PRD #1223's "opening
+    /// the pane too early closes it" risk is about. Marking the watcher's view
+    /// reconcile-due makes its own next emit a fresh listing instead.
+    ///
+    /// A [`tokio::sync::watch`] per deck for the reason [`Self::selection`] is
+    /// one: `changed()` is cancel-safe and edge-tracking, so a nudge that lands
+    /// while the watcher is between subscriptions is still seen. Entries go
+    /// with their deck in [`Self::retain_watchers`].
+    refetch: Mutex<HashMap<EndpointIdentity, tokio::sync::watch::Sender<u64>>>,
     /// PRD #1105 M11 step 4: whether the app window holds focus, as Tauri last
     /// reported it through [`window_focus_changed`], and the generation of that
     /// report.
@@ -319,6 +341,7 @@ impl Default for DesktopState {
             daemon: Arc::clone(&daemon),
             tunnels: daemon.tunnels(),
             selection: tokio::sync::watch::Sender::new(0),
+            refetch: Mutex::new(HashMap::new()),
             window_focus: Arc::new(Mutex::new(WindowFocus::default())),
         }
     }
@@ -458,6 +481,44 @@ impl DesktopState {
             }
             false
         });
+        self.refetch_senders()
+            .retain(|deck, _| observed.contains(deck));
+    }
+
+    /// The refetch signal map, poison-tolerant for the reason
+    /// [`Self::watchers`] is: it holds deck keys and senders, nothing a panic
+    /// could leave half-written.
+    fn refetch_senders(
+        &self,
+    ) -> MutexGuard<'_, HashMap<EndpointIdentity, tokio::sync::watch::Sender<u64>>> {
+        self.refetch
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Subscribe one deck's watcher to its refetch signal (PRD #1223 M3). See
+    /// [`Self::refetch`].
+    ///
+    /// Called by the watcher before its task is spawned, so a nudge fired the
+    /// moment after is already on an edge this receiver will observe.
+    pub(crate) fn refetch_signal(
+        &self,
+        deck: &EndpointIdentity,
+    ) -> tokio::sync::watch::Receiver<u64> {
+        self.refetch_senders()
+            .entry(deck.clone())
+            .or_insert_with(|| tokio::sync::watch::Sender::new(0))
+            .subscribe()
+    }
+
+    /// Tell `deck`'s watcher to answer its next emit from a fresh listing
+    /// (PRD #1223 M3). A deck nobody is watching has no entry, and a nudge to
+    /// it is dropped rather than parked: the watcher that eventually starts
+    /// for it begins with a fetch anyway, because a fresh view demands one.
+    pub(crate) fn request_refetch(&self, deck: &EndpointIdentity) {
+        if let Some(sender) = self.refetch_senders().get(deck) {
+            sender.send_modify(|generation| *generation += 1);
+        }
     }
 
     /// Which decks currently have a watcher.
@@ -1538,6 +1599,58 @@ mod tests {
             "deck B's same-id session is untouched"
         );
         assert!(sessions.contains_key("terminal-a2"));
+    }
+
+    /// PRD #1223 M3 — a deck-targeted start nudges the watcher of the deck it
+    /// started on, and no other.
+    ///
+    /// Scenario: two decks' watchers subscribe to their refetch signals and a
+    /// start nudges deck A. A's receiver sees the edge and B's does not. A
+    /// nudge to a deck nobody watches is dropped rather than minting a signal
+    /// for it. Once deck A leaves the observed set its receiver reports the
+    /// channel closed, which is what switches the watcher's arm off instead of
+    /// letting a closed channel complete it on every pass.
+    #[cfg(unix)]
+    #[test]
+    fn a_refetch_nudge_reaches_only_the_deck_it_names() {
+        let state = DesktopState::default();
+        let deck_a = fixture_deck("/tmp/dot-agent-deck-refetch-a.sock");
+        let deck_b = fixture_deck("/tmp/dot-agent-deck-refetch-b.sock");
+        let unwatched = fixture_deck("/tmp/dot-agent-deck-refetch-none.sock");
+        let watcher_a = state.refetch_signal(&deck_a.identity());
+        let watcher_b = state.refetch_signal(&deck_b.identity());
+        assert!(
+            !watcher_a.has_changed().unwrap(),
+            "fixture: nothing pending yet"
+        );
+
+        state.request_refetch(&deck_a.identity());
+        assert!(
+            watcher_a.has_changed().unwrap(),
+            "the started-on deck is nudged"
+        );
+        assert!(
+            !watcher_b.has_changed().unwrap(),
+            "another deck's watcher is not"
+        );
+
+        state.request_refetch(&unwatched.identity());
+        assert_eq!(
+            state.refetch_senders().len(),
+            2,
+            "a nudge to an unwatched deck mints nothing"
+        );
+
+        let only_b: HashSet<EndpointIdentity> = [deck_b.identity()].into_iter().collect();
+        state.retain_watchers(&only_b);
+        assert!(
+            watcher_a.has_changed().is_err(),
+            "a departed deck's signal closes, so its watcher stops selecting on it"
+        );
+        assert!(
+            !watcher_b.has_changed().unwrap(),
+            "the deck that stayed keeps its"
+        );
     }
 
     /// `detach_agent_on` ends one deck's `planner` and leaves the other's.
