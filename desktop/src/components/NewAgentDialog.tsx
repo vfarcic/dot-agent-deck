@@ -47,6 +47,13 @@ export interface NewAgentDialogProps {
   onNotAppeared: (report: { deckName: string; agentName: string }) => void;
   /** Test seam; production uses {@link NEW_AGENT_APPEAR_TIMEOUT_MS}. */
   appearTimeoutMs?: number;
+  /**
+   * PRD #1223 U5 — where the dialog publishes its close for a route that is
+   * not one of its own controls: voice's `close`. The function closes exactly
+   * as the X does and answers `undefined`, or — while a start is in flight —
+   * closes nothing and answers the sentence the X's `title` carries.
+   */
+  closeRequest?: { current: (() => string | undefined) | undefined };
 }
 
 type Listing = Extract<DeckDirectoryListing, { kind: "listing" }>;
@@ -67,7 +74,7 @@ type ModeId = typeof NO_MODE.id | AuthoringKind | ReturnType<typeof orchestratio
 const AUTO_AGENT = "auto";
 
 /** Why the dialog cannot be closed during a start (PRD #1223 audit F5). */
-const STARTING_CLOSE_BLOCKED = "Waiting for the deck to answer the start. The dialog can be closed once it has.";
+export const STARTING_CLOSE_BLOCKED = "Waiting for the deck to answer the start. The dialog can be closed once it has.";
 
 function messageOf(cause: unknown): string {
   return cause instanceof Error ? cause.message : String(cause);
@@ -123,7 +130,7 @@ function messageOf(cause: unknown): string {
  * until the target deck's fleet entry lists `(deckId, agentId)`, bounded by
  * {@link NEW_AGENT_APPEAR_TIMEOUT_MS}, and hands the identity to `onAppeared`.
  */
-export function NewAgentDialog({ runtime, initialDeckId, onClose, onAppeared, onNotAppeared, appearTimeoutMs = NEW_AGENT_APPEAR_TIMEOUT_MS }: NewAgentDialogProps) {
+export function NewAgentDialog({ runtime, initialDeckId, onClose, onAppeared, onNotAppeared, appearTimeoutMs = NEW_AGENT_APPEAR_TIMEOUT_MS, closeRequest }: NewAgentDialogProps) {
   const titleId = useId();
   const choices = useMemo(() => deckChoices(runtime.fleet), [runtime.fleet]);
   const [step, setStep] = useState<"deck" | "directory" | "form">("deck");
@@ -216,7 +223,8 @@ export function NewAgentDialog({ runtime, initialDeckId, onClose, onAppeared, on
 
   /**
    * Every way out of the dialog — the header's close button, Esc, a backdrop
-   * click and the directory step's `q` — and none of them works while
+   * click, the directory step's `q` and, through `closeRequest`, voice's
+   * `close` (PRD #1223 U5) — and none of them works while
    * a start is in flight (PRD #1223 audit F5). Closing then would unmount the
    * one place a failure is explained, while the action itself carries on.
    *
@@ -237,9 +245,19 @@ export function NewAgentDialog({ runtime, initialDeckId, onClose, onAppeared, on
    * closing works as before.
    */
   const starting = phase === "starting";
-  const requestClose = () => {
-    if (!starting) onClose();
+  /** Close, or answer why not. Every route calls this; only voice reads the answer. */
+  const requestClose = (): string | undefined => {
+    if (starting) return STARTING_CLOSE_BLOCKED;
+    onClose();
+    return undefined;
   };
+  /* No dependency array: the slot holds this render's `requestClose`, which
+     reads this render's `phase`. */
+  useEffect(() => {
+    if (!closeRequest) return;
+    closeRequest.current = requestClose;
+    return () => { closeRequest.current = undefined; };
+  });
 
   /**
    * A start the deck refused. The runtime files a failed action under its

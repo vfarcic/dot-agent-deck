@@ -1210,6 +1210,8 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel }: Voic
 
   /** Say there was nothing on top to close. See {@link VOICE_NOTHING_TO_CLOSE}. */
   const reportNothingToClose = useCallback(() => setProblem(VOICE_NOTHING_TO_CLOSE), []);
+  /** Say that what is on top refused to close, in its own sentence (PRD #1223 U5). */
+  const reportCloseRefused = useCallback((reason: string) => setProblem(reason), []);
 
   /*
     PRD #802 — publish the members only this surface can serve, so a row naming
@@ -1237,6 +1239,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel }: Voic
       typeIntoAgent,
       submitAgentPrompt,
       reportNothingToClose,
+      reportCloseRefused,
       ...(voiceCommands ? { showVoiceCommands } : {}),
       /* PRD #802 — published only while the overlay is OPEN, and that is how
          "an overlay is open" reaches a dispatch at all: it is a `useState`

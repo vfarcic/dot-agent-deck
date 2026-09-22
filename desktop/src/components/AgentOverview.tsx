@@ -2,7 +2,7 @@ import { createContext, useCallback, useContext, useEffect, useId, useMemo, useR
 import { Blocks, Boxes, CircleStop, Columns3, LayoutList, Layers, Maximize2, Network, Plus, RefreshCw, RotateCcw, ShieldAlert, Sparkles, SquareTerminal, Wrench, X } from "lucide-react";
 import type { AgentSession, AgentStatus, ConnectionView, DeckRuntimeState, DeckView } from "../types";
 import { modeScopedKey } from "../lib/bridge";
-import { VOICE_ACTIONS } from "../lib/voiceActions";
+import { VOICE_ACTIONS, type VoiceOverviewChannel } from "../lib/voiceActions";
 import { DECK_STATE_FALLBACK, deckUnavailableReason, isNewAgentShortcut } from "../lib/newAgent";
 import { ConfirmDialog, type ConfirmState } from "./ConfirmDialog";
 import { NewAgentDialog, type NewAgentRuntime } from "./NewAgentDialog";
@@ -664,7 +664,7 @@ export function stopTargetName(agent: OverviewAgent): string {
  * passes it to whichever view is mounted; a caller that renders this screen
  * standalone gets everything except the control that needs a document.
  */
-export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = false }: {
+export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = false, voiceChannel }: {
   runtime: DeckRuntimeState;
   settings?: DesktopSettingsState;
   onNavigate: (view: DeckView) => void;
@@ -674,6 +674,12 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
    * readline's next-history key, and an agent's terminal may be waiting for it.
    */
   agentPaneOpen?: boolean;
+  /**
+   * PRD #1223 U5 — where this screen publishes what a voice dispatch may need
+   * from it: `closeNewAgent`, only while the New agent dialog is open. Absent
+   * where nothing dispatches voice (a standalone render).
+   */
+  voiceChannel?: VoiceOverviewChannel;
 }) {
   const { fleet, snapshot, mode } = runtime;
   /*
@@ -802,6 +808,19 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
   ), [runtime.clearError, runtime.fleet, runtime.listDirectories, runtime.newAgentOptions, runtime.newAgentOrchestrations, runtime.runAction]);
   /** The open flow and the deck it preselects; `undefined` while it is closed. */
   const [newAgent, setNewAgent] = useState<{ deckId?: string }>();
+  /** The open dialog's own close — every route it has, blocked while a start is in flight — published by the dialog (PRD #1223 U5). */
+  const newAgentClose = useRef<(() => string | undefined) | undefined>(undefined);
+  /*
+    PRD #1223 U5 — publish `closeNewAgent` only while the dialog is open, so
+    `closeTopmost` can read its presence the way it reads the voice overlay's.
+    No dependency array, for the voice surface's reason: the slot must hold the
+    last committed closure, and the cleanup clears it on unmount.
+  */
+  useEffect(() => {
+    if (!voiceChannel) return;
+    voiceChannel.current = newAgent ? { closeNewAgent: () => newAgentClose.current?.() } : {};
+    return () => { voiceChannel.current = undefined; };
+  });
   /** What the flow could not finish on screen: an agent the deck accepted and has not listed. */
   const [newAgentNotice, setNewAgentNotice] = useState<string>();
   const newAgentAvailable = newAgentRuntime !== undefined;
@@ -1032,6 +1051,7 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
         <NewAgentDialog
           runtime={newAgentRuntime}
           initialDeckId={newAgent.deckId}
+          closeRequest={newAgentClose}
           onClose={() => setNewAgent(undefined)}
           onAppeared={(target) => {
             setNewAgent(undefined);

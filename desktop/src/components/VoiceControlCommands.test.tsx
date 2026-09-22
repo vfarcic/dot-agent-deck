@@ -20,6 +20,7 @@ vi.mock("./TerminalViewport", () => ({
 }));
 
 import { DeckShell } from "../App";
+import { STARTING_CLOSE_BLOCKED } from "./NewAgentDialog";
 import {
   NOTHING_DISPATCHED,
   VOICE_DICTATION_SEND_MS,
@@ -895,6 +896,76 @@ describe("closing what is on top", () => {
     voice.deliver("close this");
     await completeUtterance();
     expect(screen.queryByTestId("agent-pane-overlay")).toBeNull();
+  });
+
+  /** A runtime that can also run the New agent flow, over the one-deck fixture, with the start held until the test settles it. */
+  function newAgentDeck(voice: VoiceControls) {
+    let settle!: () => void;
+    const runAction = vi.fn((action: { type: string }) => action.type === "start_agent"
+      ? new Promise<DeckActionResult>((_resolve, reject) => { settle = () => reject(new Error("the deck refused the start")); })
+      : Promise.resolve({ ok: true } as DeckActionResult));
+    const deck = runtime(closing(), voice, {
+      runAction,
+      listDirectories: vi.fn(async () => ({ kind: "listing" as const, path: "/home/dev", displayPath: "/home/dev", entries: [], truncated: false })),
+      newAgentOptions: vi.fn(async () => ({ kind: "deck" as const, agents: [], experimental: false, authoringKinds: [] })),
+    });
+    return { deck, refuseStart: () => settle() };
+  }
+
+  /**
+   * Scenario (PRD #1223 U5): on the overview, open the New agent dialog and
+   * say "close". It closes the dialog — it used to answer "nothing to close"
+   * with the dialog still on screen, because `close` knew only the voice
+   * overlay and the agent pane.
+   */
+  it("closes the New agent dialog", async () => {
+    const voice = microphone([]);
+    const { deck } = newAgentDeck(voice);
+    render(<DeckShell runtime={deck} initialView={{ kind: "overview" }} />);
+
+    await turnVoiceOn();
+    fireEvent.click(screen.getByTestId("overview-new-agent"));
+    expect(screen.getByTestId("new-agent-dialog")).toBeInTheDocument();
+
+    voice.deliver("close this");
+    await completeUtterance();
+
+    expect(screen.queryByTestId("new-agent-dialog")).toBeNull();
+    expect(screen.queryByTestId("voice-report")?.textContent ?? "").not.toContain(VOICE_NOTHING_TO_CLOSE);
+  });
+
+  /**
+   * Scenario (PRD #1223 U5 and audit F5): with a start in flight, "close" is
+   * refused exactly as the X, Esc and the backdrop are — the dialog stays —
+   * and the report says why in the dialog's own sentence rather than doing
+   * nothing silently. Once the deck has refused the start, "close" works.
+   */
+  it("refuses to close the New agent dialog while a start is in flight, and says why", async () => {
+    const voice = microphone([]);
+    const { deck, refuseStart } = newAgentDeck(voice);
+    render(<DeckShell runtime={deck} initialView={{ kind: "overview" }} />);
+
+    await turnVoiceOn();
+    fireEvent.click(screen.getByTestId("overview-new-agent"));
+    fireEvent.keyDown(screen.getByTestId("new-agent-deck-list"), { key: "Enter" });
+    await flush();
+    fireEvent.keyDown(screen.getByTestId("new-agent-directory-list"), { key: " " });
+    await flush();
+    fireEvent.click(screen.getByTestId("new-agent-start"));
+    await flush();
+    expect(screen.getByTestId("new-agent-starting")).toBeInTheDocument();
+
+    voice.deliver("close this");
+    await completeUtterance();
+    expect(screen.getByTestId("new-agent-dialog")).toBeInTheDocument();
+    expect(screen.getByTestId("voice-report")).toHaveTextContent(STARTING_CLOSE_BLOCKED);
+
+    await act(async () => refuseStart());
+    await flush();
+    expect(screen.getByTestId("new-agent-error")).toBeInTheDocument();
+    voice.deliver("close this");
+    await completeUtterance();
+    expect(screen.queryByTestId("new-agent-dialog")).toBeNull();
   });
 
   /**

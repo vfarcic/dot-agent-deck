@@ -191,6 +191,27 @@ export type VoiceActionContext = {
    * is written there and not composed here. */
   reportNothingToClose: () => void;
   /**
+   * Say that `close` found something on top that may not be closed yet, in
+   * that thing's own words (PRD #1223 U5). The voice surface renders it where
+   * it renders {@link reportNothingToClose}'s sentence; the sentence itself
+   * belongs to whatever refused.
+   */
+  reportCloseRefused: (reason: string) => void;
+  /**
+   * Close the New agent dialog (PRD #1223 U5) — every close route the dialog
+   * has, reached by voice. Answers `undefined` when it closed, or the dialog's
+   * own sentence when it would not: while a start is in flight every route is
+   * blocked (audit F5), and voice is blocked the same way rather than
+   * differently.
+   *
+   * **Published by the overview only while the dialog is OPEN**, for
+   * {@link dismissVoiceOverlay}'s reason: *"the dialog is open"* is a
+   * `useState` in the overview, not a `DeckView`, so {@link closeTopmost}
+   * reads it as this member's presence. It is NOT a way to open or drive the
+   * dialog — `openNewAgent` stays `no_voice`.
+   */
+  closeNewAgent: () => string | undefined;
+  /**
    * Open the New agent dialog (PRD #1223), with `deckId` preselected when the
    * control that opened it belongs to one deck — a deck group's header.
    *
@@ -299,7 +320,7 @@ export const VOICE_ACTIONS = {
   closeTopmost: {
     label: "Close whatever is open over the screen",
     voice: true,
-    needs: ["closeAgentView", "reportNothingToClose"],
+    needs: ["closeAgentView", "reportNothingToClose", "reportCloseRefused"],
     /**
      * PRD #802 — the precedence, decided HERE because it cannot be decided in
      * the table.
@@ -307,21 +328,34 @@ export const VOICE_ACTIONS = {
      * `screens` draws on `DeckView`, and the voice surface's overlay is a
      * `useState` boolean that is not in it. So the row is callable everywhere
      * and the ordering lives at dispatch: the overlay if it is up, otherwise
-     * the agent's pane, otherwise an honest report that there was nothing to
-     * close. That order is the only one that cannot surprise — the overlay is
-     * literally on top of the pane, so closing the pane underneath it would
-     * leave the thing the user was looking at still on screen.
+     * the New agent dialog if it is open (PRD #1223 U5), otherwise the agent's
+     * pane, otherwise an honest report that there was nothing to close. That
+     * order is the only one that cannot surprise — the overlay is literally on
+     * top of everything, so closing what is underneath it would leave the
+     * thing the user was looking at still on screen.
+     *
+     * The dialog may REFUSE: while a start is in flight it cannot be closed by
+     * any route (PRD #1223 audit F5), and `close` says so in the dialog's own
+     * sentence rather than falling through to the pane or answering "nothing
+     * to close", which was the lie this branch replaced.
      *
      * `dismissVoiceOverlay` is read through its own presence rather than
      * declared in `needs`: the surface publishes it only while the overlay is
      * open, so its absence IS the answer to "is anything on top?". Declaring it
-     * would refuse the whole row whenever the overlay was closed.
+     * would refuse the whole row whenever the overlay was closed. The same
+     * holds for `closeNewAgent`, which the overview publishes only while the
+     * dialog is open.
      */
     run: (
-      context: Pick<VoiceActionContext, "closeAgentView" | "reportNothingToClose"> & Partial<Pick<VoiceActionContext, "dismissVoiceOverlay">>,
+      context: Pick<VoiceActionContext, "closeAgentView" | "reportNothingToClose" | "reportCloseRefused"> & Partial<Pick<VoiceActionContext, "dismissVoiceOverlay" | "closeNewAgent">>,
       target: VoiceDispatchTarget,
     ) => {
       if (context.dismissVoiceOverlay) return context.dismissVoiceOverlay();
+      if (context.closeNewAgent) {
+        const refused = context.closeNewAgent();
+        if (refused !== undefined) context.reportCloseRefused(refused);
+        return;
+      }
       if (target.agentViewOpen) return context.closeAgentView();
       context.reportNothingToClose();
     },
@@ -591,7 +625,7 @@ export type VoiceDispatchContext = Pick<VoiceActionContext, "navigate" | "closeA
  * set's complement, so a screen that tried to serve one of these members would
  * not type-check, and neither would a panel that left one out.
  */
-export type VoicePanelContext = Pick<VoiceActionContext, "stopVoice" | "showVoiceCommands" | "typeIntoAgent" | "submitAgentPrompt" | "dismissVoiceOverlay" | "reportNothingToClose">;
+export type VoicePanelContext = Pick<VoiceActionContext, "stopVoice" | "showVoiceCommands" | "typeIntoAgent" | "submitAgentPrompt" | "dismissVoiceOverlay" | "reportNothingToClose" | "reportCloseRefused">;
 /**
  * `Partial`, because a panel can serve one of these and not another.
  *
@@ -620,12 +654,20 @@ export type VoiceScreenContext = Omit<VoiceActionContext, keyof VoicePanelContex
 /**
  * The members only the OVERVIEW serves (PRD #1223): opening the New agent
  * dialog, which lives on that screen because its deck step lists the fleet the
- * overview shows. Split out of {@link VoiceScreenContext} — which is what the
+ * overview shows, and — while it is open — closing it (U5). Split out of {@link VoiceScreenContext} — which is what the
  * DECK screen publishes — so the deck is not made to serve a member it has no
  * dialog for; a dispatch of `openNewAgent` there is refused against its
  * `needs`, the way the overview refuses a deck overlay.
  */
-export type VoiceOverviewContext = Pick<VoiceActionContext, "openNewAgent">;
+export type VoiceOverviewContext = Pick<VoiceActionContext, "openNewAgent" | "closeNewAgent">;
+
+/**
+ * How the overview publishes what a voice dispatch may need from it — today
+ * `closeNewAgent`, and only while the dialog is open — to the shell that
+ * dispatches, the way {@link VoiceContextChannel} carries the deck's.
+ * `openNewAgent` is `no_voice` and is not published.
+ */
+export type VoiceOverviewChannel = { current: Partial<VoiceOverviewContext> | undefined };
 
 /**
  * How a screen publishes its half of the context up to the host that dispatches

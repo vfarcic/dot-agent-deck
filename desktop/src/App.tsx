@@ -53,7 +53,7 @@ import { useShownTerminals } from "./hooks/useShownTerminals";
 import { useHeldAgentRecord, type HeldAgentRecord } from "./hooks/useHeldAgentRecord";
 import { useZoom } from "./hooks/useZoom";
 import { agentKey } from "./lib/agentKey";
-import { VOICE_ACTIONS, dispatchVoiceAction, type DeckOverlay, type VoiceContextChannel, type VoiceDispatchContext, type VoiceDispatchTarget, type VoicePanelContext, type VoiceScreenContext } from "./lib/voiceActions";
+import { VOICE_ACTIONS, dispatchVoiceAction, type DeckOverlay, type VoiceContextChannel, type VoiceDispatchContext, type VoiceDispatchTarget, type VoiceOverviewContext, type VoicePanelContext, type VoiceScreenContext } from "./lib/voiceActions";
 import { unreachableDeckTerminalState } from "./lib/terminalInput";
 import { applyAppearance } from "./lib/appearance";
 import { desktopWorkflowPlatformIssue } from "./lib/platform";
@@ -168,6 +168,12 @@ export function DeckShell({ runtime, workflowPlatformIssue, initialView = { kind
    * what `voice_off` needs and what neither the deck nor this shell can offer.
    */
   const panelVoiceContext = useRef<VoicePanelContext | undefined>(undefined);
+  /**
+   * PRD #1223 U5 — the OVERVIEW's half, published while it is mounted: today
+   * only `closeNewAgent`, and only while the New agent dialog is open, so
+   * `close` can close that dialog rather than report "nothing to close".
+   */
+  const overviewVoiceContext = useRef<Partial<VoiceOverviewContext> | undefined>(undefined);
   const agentView = view.kind === "agent" ? view : undefined;
   /**
    * Back, and the whole of it. The destination is read off the view rather
@@ -550,6 +556,9 @@ export function DeckShell({ runtime, workflowPlatformIssue, initialView = { kind
     let moved = false;
     const context: VoiceDispatchContext = {
       ...deckVoiceContext.current,
+      /* The overview's, which is never mounted beside the deck, so the two
+         cannot both publish (PRD #1223 U5). */
+      ...overviewVoiceContext.current,
       /* After the deck's, and the two sets are disjoint by construction — see
          `VoicePanelContext`, which is a narrow `Pick` precisely so a screen and
          the voice surface can never offer the same member. */
@@ -566,7 +575,7 @@ export function DeckShell({ runtime, workflowPlatformIssue, initialView = { kind
   const screenNode = base === "overview"
     ? (
       <>
-        <AgentOverview runtime={runtime} settings={settings} onNavigate={setView} agentPaneOpen={agentView !== undefined} />
+        <AgentOverview runtime={runtime} settings={settings} onNavigate={setView} agentPaneOpen={agentView !== undefined} voiceChannel={overviewVoiceContext} />
         {/*
           The overview mounts no terminal of its own (PRD #745's commitment), so
           there is no tile here to promote and the pane is a sibling of the
