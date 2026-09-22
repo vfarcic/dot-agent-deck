@@ -174,6 +174,60 @@ fn start_orchestration_from_desktop(daemon: &DaemonProc, project_path: &str) {
     }
 }
 
+/// Send the same single-agent stop request as the desktop's
+/// `stop_agent_action`, and require the daemon to confirm it.
+fn stop_agent_from_desktop(daemon: &DaemonProc, agent_id: &str) {
+    let response = daemon
+        .send_attach_request(&AttachRequest::StopAgent {
+            id: agent_id.into(),
+        })
+        .expect("desktop-shaped StopAgent over the attach socket");
+    assert!(
+        response.ok,
+        "desktop-shaped StopAgent for {agent_id:?} must succeed: {:?}",
+        response.error
+    );
+}
+
+/// Mirror `stop_orchestration_action`: issue one independent `StopAgent` per
+/// role concurrently, then require every stop to have been confirmed.
+fn stop_orchestration_from_desktop(daemon: &DaemonProc, role_agents: &[(String, String)]) {
+    let attach_socket = daemon.attach_socket.clone();
+    let outcomes = std::thread::scope(|scope| {
+        role_agents
+            .iter()
+            .map(|(role, agent_id)| {
+                let role = role.clone();
+                let agent_id = agent_id.clone();
+                let attach_socket = attach_socket.clone();
+                scope.spawn(move || {
+                    let response = common::attach_request_on(
+                        &attach_socket,
+                        &AttachRequest::StopAgent {
+                            id: agent_id.clone(),
+                        },
+                    );
+                    (role, agent_id, response)
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|handle| handle.join().expect("desktop role-stop thread"))
+            .collect::<Vec<_>>()
+    });
+
+    for (role, agent_id, response) in outcomes {
+        let response = response.unwrap_or_else(|error| {
+            panic!("desktop-shaped StopAgent for role {role:?} ({agent_id}) failed: {error}")
+        });
+        assert!(
+            response.ok,
+            "desktop-shaped StopAgent for role {role:?} ({agent_id}) must succeed: {:?}",
+            response.error
+        );
+    }
+}
+
 fn write_orchestration_project() -> tempfile::TempDir {
     let project = common::harness_tempdir().expect("create desktop project");
     std::fs::write(
@@ -371,5 +425,180 @@ fn visibility_002_desktop_prepared_orchestration_surfaces_into_attached_tui_as_o
          did not show exactly three sessions with the role-named ClaudeCode coordinator, \
          OpenCode builder, and Pi reviewer cards. Role metadata: {records:#?}\nFinal grid:\n{}",
         deck.snapshot_grid()
+    );
+}
+
+/// Scenario: Start the same named plain agent through the desktop-shaped
+/// request twice against already-attached TUIs. A confirmed TUI-native close is
+/// the control; a desktop-shaped `StopAgent` must remove the second card from
+/// the live dashboard just as completely, without any TUI input or reconnect.
+#[spec("newagent/visibility/003")]
+#[test]
+fn visibility_003_desktop_stop_removes_plain_agent_from_attached_dashboard() {
+    // Control: stop a desktop-started card through the TUI's own confirmed
+    // Ctrl+W path. This proves the card and pane can be removed normally.
+    let control_daemon = common::spawn_daemon_serve(None, "0");
+    let control_deck = launch_tui_against(&control_daemon);
+    control_deck.wait_for_string("No active sessions");
+    let control_cwd = common::harness_tempdir().expect("create control cwd");
+    start_plain_from_desktop(
+        &control_daemon,
+        canonical_string(control_cwd.path()),
+        &desktop_pane_id(0),
+    );
+    control_deck.wait_for_string(PLAIN_LABEL);
+    let (label_col, label_row) = control_deck.wait_for_in_grid(PLAIN_LABEL);
+    control_deck.click(label_col, label_row);
+    control_deck.send_keys(b"\x17"); // Ctrl+W -> close confirmation
+    control_deck.wait_for_string("Close selected pane?");
+    control_deck.send_keys(b"\x1b[B"); // Down -> Close
+    control_deck.send_keys(b"\r");
+    control_deck.wait_until_grid("TUI-native stop removes the desktop-started card", |grid| {
+        grid.contains("No active sessions") && !grid.contains(PLAIN_LABEL)
+    });
+    assert!(
+        common::wait_until(Duration::from_secs(10), || control_daemon
+            .agent_records()
+            .is_empty()),
+        "control: the TUI-native close must empty the daemon registry"
+    );
+    drop(control_deck);
+    drop(control_daemon);
+
+    // Reproduction: the TUI stays untouched after the desktop-shaped stop.
+    let daemon = common::spawn_daemon_serve(None, "0");
+    let deck = launch_tui_against(&daemon);
+    deck.wait_for_string("No active sessions");
+    let cwd = common::harness_tempdir().expect("create desktop-selected cwd");
+    start_plain_from_desktop(&daemon, canonical_string(cwd.path()), &desktop_pane_id(0));
+    deck.wait_for_string(PLAIN_LABEL);
+    let record = daemon
+        .wait_for_agent_count(1, Duration::from_secs(10))
+        .into_iter()
+        .next()
+        .expect("desktop-started plain agent in daemon registry");
+
+    // Subscribe only after the start-side surface has landed, so this buffer is
+    // diagnostic evidence about the stop rather than the synthetic start.
+    let stop_events = daemon.subscribe_events();
+    stop_agent_from_desktop(&daemon, &record.id);
+    let registry_empty = common::wait_until(Duration::from_secs(10), || {
+        daemon.agent_records().is_empty()
+    });
+    let card_disappeared = common::wait_until(Duration::from_secs(15), || {
+        let grid = deck.snapshot_grid();
+        grid.contains("No active sessions") && !grid.contains(PLAIN_LABEL)
+    });
+    let final_grid = deck.snapshot_grid();
+    let published_events = stop_events.snapshot();
+
+    assert!(
+        registry_empty,
+        "desktop-shaped StopAgent was accepted but the daemon registry did not empty. \
+         Records: {:#?}",
+        daemon.agent_records()
+    );
+    assert!(
+        card_disappeared,
+        "the desktop-shaped StopAgent emptied the daemon registry, but the already-attached \
+         TUI did not remove {PLAIN_LABEL:?} WITHOUT a keypress, reconnect, or manual refresh. \
+         AgentEvents published after stop: {published_events:#?}\nFinal grid:\n{final_grid}"
+    );
+}
+
+/// Scenario: Start the same prepared three-role orchestration twice through
+/// the desktop-shaped request sequence. A confirmed TUI-native tab close is the
+/// control; concurrently stopping every role the desktop's way must remove the
+/// second now-empty tab without TUI input or reconnect.
+#[spec("newagent/visibility/004")]
+#[test]
+fn visibility_004_desktop_close_removes_orchestration_tab_from_attached_tui() {
+    // Control: close the desktop-created orchestration through the TUI. The
+    // native path stops all roles concurrently and removes a clean tab.
+    let control_daemon = common::spawn_daemon_serve(None, "0");
+    let control_deck = launch_tui_against(&control_daemon);
+    control_deck.wait_for_string("No active sessions");
+    let control_project = write_orchestration_project();
+    let control_project_path = canonical_string(control_project.path());
+    start_orchestration_from_desktop(&control_daemon, &control_project_path);
+    control_deck.wait_until_grid("control orchestration tab appears", |grid| {
+        grid.lines()
+            .next()
+            .is_some_and(|tabs| tabs.contains(ORCHESTRATION_TITLE))
+    });
+    control_deck.send_keys(b"\x1b[C"); // Right -> Desktop prepared run
+    control_deck.wait_for_string("3 session(s)");
+    control_deck.send_keys(b"\x17"); // Ctrl+W -> whole-tab confirmation
+    control_deck.wait_for_string("Close this tab and all its panes?");
+    control_deck.send_keys(b"\x1b[B"); // Down -> Close
+    control_deck.send_keys(b"\r");
+    control_deck.wait_until_grid("TUI-native close removes the orchestration tab", |grid| {
+        grid.contains("No active sessions") && !grid.contains(ORCHESTRATION_TITLE)
+    });
+    assert!(
+        common::wait_until(Duration::from_secs(10), || control_daemon
+            .agent_records()
+            .is_empty()),
+        "control: the TUI-native whole-tab close must empty the daemon registry"
+    );
+    drop(control_deck);
+    drop(control_daemon);
+
+    // Reproduction: close every listed role concurrently, exactly as the
+    // desktop action does, while leaving the attached TUI untouched.
+    let daemon = common::spawn_daemon_serve(None, "0");
+    let deck = launch_tui_against(&daemon);
+    deck.wait_for_string("No active sessions");
+    let project = write_orchestration_project();
+    let project_path = canonical_string(project.path());
+    start_orchestration_from_desktop(&daemon, &project_path);
+    deck.wait_until_grid("desktop-started orchestration tab appears", |grid| {
+        grid.lines()
+            .next()
+            .is_some_and(|tabs| tabs.contains(ORCHESTRATION_TITLE))
+    });
+    let records = daemon.wait_for_agent_count(ORCHESTRATION_ROLES.len(), Duration::from_secs(10));
+    assert_eq!(
+        records.len(),
+        ORCHESTRATION_ROLES.len(),
+        "precondition: every desktop-started role must be registered"
+    );
+    let role_agents: Vec<_> = records
+        .iter()
+        .map(|record| {
+            (
+                record
+                    .display_name
+                    .clone()
+                    .unwrap_or_else(|| "<unnamed role>".into()),
+                record.id.clone(),
+            )
+        })
+        .collect();
+
+    let stop_events = daemon.subscribe_events();
+    stop_orchestration_from_desktop(&daemon, &role_agents);
+    let registry_empty = common::wait_until(Duration::from_secs(10), || {
+        daemon.agent_records().is_empty()
+    });
+    let tab_disappeared = common::wait_until(Duration::from_secs(15), || {
+        let grid = deck.snapshot_grid();
+        grid.contains("No active sessions") && !grid.contains(ORCHESTRATION_TITLE)
+    });
+    let final_grid = deck.snapshot_grid();
+    let published_events = stop_events.snapshot();
+
+    assert!(
+        registry_empty,
+        "desktop-shaped orchestration close returned but the daemon registry did not empty. \
+         Role agents: {role_agents:#?}; records: {:#?}",
+        daemon.agent_records()
+    );
+    assert!(
+        tab_disappeared,
+        "concurrent desktop-shaped StopAgent requests emptied every role from the daemon, but \
+         the already-attached TUI did not remove the now-empty {ORCHESTRATION_TITLE:?} tab \
+         WITHOUT a keypress, reconnect, or manual refresh. Role agents: {role_agents:#?}; \
+         AgentEvents published after stops: {published_events:#?}\nFinal grid:\n{final_grid}"
     );
 }

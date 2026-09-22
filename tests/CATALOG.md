@@ -5904,6 +5904,20 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Does not assert:** the Tauri form itself; coordinator prompt delivery; hook delivery; agent work; role-pane body contents beyond the exact role-card labels, session count and tab strip.
 - **Platform coverage:** mac+linux (`#![cfg(all(feature = "e2e", unix))]` — the daemon/harness uses Unix-domain sockets and PTYs).
 
+##### newagent/visibility/003 — A desktop-stopped plain agent disappears from an already-attached TUI dashboard.
+- **Layer:** L2 lane 1, PTY-attached (both halves start the same hookless plain agent through the desktop-shaped `StartAgent`; the control closes its live card through the TUI's confirmed `Ctrl+W` path, while the reproduction sends the desktop-shaped `StopAgent` over the attach socket and then leaves the TUI untouched).
+- **Agent:** none (`sleep 600` stand-in; no credential).
+- **Asserts:** the TUI-native close removes the named card and empties `ListAgents`; the desktop-shaped stop is confirmed and likewise empties `ListAgents`, after which the already-attached dashboard must reach `No active sessions` and stop rendering the name without a keypress, reconnect, or manual refresh. RED: `ListAgents` is empty and no post-stop `AgentEvent` is published, but after 15 seconds the grid still renders `dot-agent-deck — 1 session(s)` and the `No agent · desktop-visible-agent` card with `0 active │ 0 tools`.
+- **Does not assert:** the Tauri button itself; child signal escalation timing; the desktop's terminal-tile detach; filesystem cleanup; a naturally exiting or hook-emitting agent.
+- **Platform coverage:** mac+linux (`#![cfg(all(feature = "e2e", unix))]` — `DaemonProc` binds Unix-domain sockets and `TuiDeck` uses a PTY).
+
+##### newagent/visibility/004 — Closing a desktop-started orchestration removes its now-empty tab from an already-attached TUI.
+- **Layer:** L2 lane 1, PTY-attached (both halves use empty-task `PrepareWorkflow` plus one configured `StartPreparedAgent` per role against an already-attached real TUI; the control confirms the TUI's whole-tab `Ctrl+W` close, while the reproduction concurrently sends one desktop-shaped `StopAgent` per listed role and then leaves the TUI untouched).
+- **Agent:** none (three `printf …; sleep 600` role stand-ins declared as Claude Code coordinator, OpenCode builder and Pi reviewer; no credential).
+- **Asserts:** the native close stops all three roles, empties `ListAgents`, deletes the clean orchestration tab, and returns to the empty Dashboard; the desktop-shaped close confirms every concurrent role stop and empties `ListAgents`, after which the already-attached TUI must remove the identically titled now-empty tab without a keypress, reconnect, or manual refresh. RED: all three role ids disappear from `ListAgents` and no post-stop `AgentEvent` is published, but after 15 seconds the `Desktop prepared run [×]` tab remains with stale role cards and impossible aggregate counts (observed as `1/4 session(s)` with one stale role and `2/5 session(s)` with two on repeat).
+- **Does not assert:** the Tauri Close control itself; partial-stop failure rendering; stop completion order; worktree cleanup; agent work or hooks; the desktop's per-role terminal detaches.
+- **Platform coverage:** mac+linux (`#![cfg(all(feature = "e2e", unix))]` — the daemon/harness uses Unix-domain sockets and PTYs).
+
 #### newagent/live
 
 ##### newagent/live/001 — A REAL interactive Haiku agent visibly reports a unique sentinel from the ordinary directory selected through the desktop new-agent daemon sequence (PRD #1223, CLAUDE.md rule 4). [reel]
