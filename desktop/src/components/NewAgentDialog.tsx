@@ -1,9 +1,11 @@
 import { useCallback, useEffect, useId, useMemo, useRef, useState, type KeyboardEvent, type ReactNode } from "react";
 import { ArrowLeft, ArrowUp, Check, Folder, FolderGit2, Loader2, Plus, X } from "lucide-react";
+import { LaunchCleanupError } from "../lib/actionError";
 import { DISPLAY_LIMITS, displayText } from "../lib/displayText";
 import {
   AUTHORING_MODES,
   authoringModes,
+  cleanupWarning,
   deckChoices,
   directoryLabel,
   filterDirectoryEntries,
@@ -150,6 +152,11 @@ export function NewAgentDialog({ runtime, initialDeckId, onClose, onAppeared, on
   /** Drops an options reply for a directory the user has since left. */
   const optionsSeq = useRef(0);
   const [formError, setFormError] = useState<string>();
+  /**
+   * The roles a failed launch could not confirm are stopped (PRD #1223 audit
+   * F6) — carried as data by the crate, shown before `formError`'s clamped copy.
+   */
+  const [formCleanup, setFormCleanup] = useState<readonly string[]>();
   /** The deck's orchestrations for the chosen directory (PRD #1223 M6). */
   const [orchestrations, setOrchestrations] = useState<NewAgentOrchestrations>();
   const [orchestrationsError, setOrchestrationsError] = useState<string>();
@@ -260,6 +267,7 @@ export function NewAgentDialog({ runtime, initialDeckId, onClose, onAppeared, on
     setOrchestrations(undefined);
     setOrchestrationsError(undefined);
     setFormError(undefined);
+    setFormCleanup(undefined);
     setStep("form");
     // PRD #1223 M6: the deck's orchestrations for this directory — asked unless
     // a listing already marked it as no project. The deck answers `not_project`
@@ -402,6 +410,7 @@ export function NewAgentDialog({ runtime, initialDeckId, onClose, onAppeared, on
   const submitOrchestration = async (orchestration: DaemonOrchestration) => {
     if (!deck || orchestrations?.kind !== "project" || titleTaken) return;
     setFormError(undefined);
+    setFormCleanup(undefined);
     setPhase("starting");
     const title = orchestrationRunTitle(name, orchestration.name);
     try {
@@ -427,6 +436,7 @@ export function NewAgentDialog({ runtime, initialDeckId, onClose, onAppeared, on
         return;
       }
       setFormError(message);
+      setFormCleanup(cause instanceof LaunchCleanupError ? cause.unconfirmedStops : undefined);
       setPhase("idle");
     }
   };
@@ -438,6 +448,7 @@ export function NewAgentDialog({ runtime, initialDeckId, onClose, onAppeared, on
       return;
     }
     setFormError(undefined);
+    setFormCleanup(undefined);
     setPhase("starting");
     // Trimmed, as the TUI's `resolve_display_name` trims a plain agent's Name
     // before it becomes `StartAgent.display_name`; a blank one is not sent.
@@ -470,6 +481,7 @@ export function NewAgentDialog({ runtime, initialDeckId, onClose, onAppeared, on
         return;
       }
       setFormError(message);
+      setFormCleanup(cause instanceof LaunchCleanupError ? cause.unconfirmedStops : undefined);
       setPhase("idle");
     }
   };
@@ -860,7 +872,14 @@ export function NewAgentDialog({ runtime, initialDeckId, onClose, onAppeared, on
             }}
           />
         </label>}
+        {formCleanup && formCleanup.length > 0 && <p className="new-agent-error new-agent-cleanup" role="alert" data-testid="new-agent-cleanup-warning">{cleanupWarning(formCleanup)}</p>}
         {formError && <p className="new-agent-error" role="alert" data-testid="new-agent-error">{displayText(formError, DISPLAY_LIMITS.message)}</p>}
+        {formError && displayText(formError, DISPLAY_LIMITS.detail) !== displayText(formError, DISPLAY_LIMITS.message) && (
+          <details className="new-agent-detail" data-testid="new-agent-error-detail">
+            <summary>Full detail</summary>
+            <p>{displayText(formError, DISPLAY_LIMITS.detail)}</p>
+          </details>
+        )}
         {phase === "waiting" && <p className="new-agent-hint" data-testid="new-agent-waiting"><Loader2 className="spin" size={12} /> Started. Waiting for the deck to list it…</p>}
       </form>
     );

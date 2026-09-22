@@ -970,6 +970,10 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .new-agent-hint, .new-agent-keys { margin: 0; display: flex; align-items: center; gap: 5px; color: var(--muted); font-size: 9.5px; line-height: 1.4; }
 .new-agent-keys { color: var(--faint); }
 .new-agent-error { margin: 0; color: var(--red); font-size: 10px; line-height: 1.4; overflow-wrap: anywhere; }
+.new-agent-cleanup { font-weight: 650; }
+.new-agent-detail { color: var(--muted); font-size: 9.5px; line-height: 1.4; }
+.new-agent-detail summary { cursor: pointer; }
+.new-agent-detail p { margin: 4px 0 0; max-height: 120px; overflow: auto; overflow-wrap: anywhere; white-space: pre-wrap; }
 .new-agent-form { display: flex; flex-direction: column; gap: 9px; }
 .new-agent-field { display: grid; grid-template-columns: 76px minmax(0, 1fr); align-items: center; gap: 9px; font-size: 11px; }
 .new-agent-field > span { color: var(--muted); font-weight: 650; }

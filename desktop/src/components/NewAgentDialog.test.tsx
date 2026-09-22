@@ -2,6 +2,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testi
 import { describe, expect, it, vi } from "vitest";
 import { createFixtureSnapshot, createFixtureStartedAgent } from "../data/fixture";
 import type { AgentSession, ConnectionView, DeckDirectoryListing, DeckSnapshot, NewAgentOptions, NewAgentOrchestrations } from "../types";
+import { LaunchCleanupError } from "../lib/actionError";
 import { NewAgentDialog, type NewAgentRuntime } from "./NewAgentDialog";
 
 const LOCAL = "deck-000000000000aaaa";
@@ -966,6 +967,57 @@ describe("New agent dialog — orchestrations (PRD #1223 M6)", () => {
     expect(screen.getByTestId("new-agent-start")).toBeEnabled();
     expect(onClose).not.toHaveBeenCalled();
     expect(runtime.clearError).toHaveBeenCalled();
+  });
+
+  /**
+   * Scenario (PRD #1223 audit F6): a launch of roles with 128-character names
+   * fails, and its rollback could not confirm two of them stopped. The crate's
+   * sentence names every started role before it gets to the cleanup, so the
+   * 240-character copy cuts that part off; the dialog shows the warning on its
+   * own, ABOVE the clamped sentence, from the roles the crate sent as data —
+   * and the whole sentence stays readable behind "Full detail".
+   */
+  it("shows a cleanup warning ahead of the clamped error, and the full sentence on demand", async () => {
+    const long = (prefix: string) => `${prefix}${"x".repeat(128 - prefix.length)}`;
+    const [planner, builder, reviewer] = [long("planner-"), long("builder-"), long("reviewer-")];
+    const refusal = `failed to start orchestration role tester: refused; roles already started: ${planner}, ${builder}, ${reviewer}; cleanup could not confirm stop for 2 of 3 already-started role(s): ${reviewer} (agent-2: the deck did not answer the stop within 15s), ${planner} (agent-0: stop refused)`;
+    const runtime = fakeRuntime({
+      newAgentOrchestrations: orchestrationsOf(),
+      runAction: vi.fn(async () => { throw new LaunchCleanupError(refusal, [reviewer, planner]); }),
+    });
+    renderDialog(runtime);
+    await reachProjectForm();
+    fireEvent.click(await chip());
+
+    fireEvent.click(screen.getByTestId("new-agent-start"));
+
+    const warning = await screen.findByTestId("new-agent-cleanup-warning");
+    const error = screen.getByTestId("new-agent-error");
+    expect(warning).toHaveTextContent("2 roles may still be running on this deck");
+    expect(warning).toHaveTextContent("reviewer-");
+    expect(warning.compareDocumentPosition(error) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(error.textContent).not.toContain("cleanup could not confirm");
+    const detail = screen.getByTestId("new-agent-error-detail");
+    expect(detail).toHaveTextContent("cleanup could not confirm stop for 2 of 3 already-started role(s)");
+    expect(detail).toHaveTextContent("agent-0: stop refused");
+  });
+
+  /**
+   * Scenario (PRD #1223 audit F6): a failure whose rollback was confirmed is
+   * a plain rejection, and a short one — so there is no warning and no "Full
+   * detail" to open.
+   */
+  it("shows no cleanup warning or detail view for a short failure the rollback confirmed", async () => {
+    const runtime = fakeRuntime({ newAgentOrchestrations: orchestrationsOf(), runAction: vi.fn(async () => { throw new Error("failed to start orchestration role builder: refused; stopped 1 already-started role(s)"); }) });
+    renderDialog(runtime);
+    await reachProjectForm();
+    fireEvent.click(await chip());
+
+    fireEvent.click(screen.getByTestId("new-agent-start"));
+
+    expect(await screen.findByTestId("new-agent-error")).toHaveTextContent("stopped 1 already-started role(s)");
+    expect(screen.queryByTestId("new-agent-cleanup-warning")).toBeNull();
+    expect(screen.queryByTestId("new-agent-error-detail")).toBeNull();
   });
 });
 

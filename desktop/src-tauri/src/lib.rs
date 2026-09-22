@@ -70,8 +70,8 @@ use crate::daemon_bridge::{
     trusted_daemon,
 };
 use crate::dto::{
-    BootstrapOptions, COMMAND_MAX_BYTES, ConnectionStatus, DesktopAction, DesktopActionResult,
-    DesktopAgentOption, DesktopDirectoryListing, DesktopNewAgentOptions,
+    BootstrapOptions, COMMAND_MAX_BYTES, ConnectionStatus, DesktopAction, DesktopActionError,
+    DesktopActionResult, DesktopAgentOption, DesktopDirectoryListing, DesktopNewAgentOptions,
     DesktopNewAgentOrchestrations, DesktopProjectListing, DesktopResolvedProject, DesktopSnapshot,
     TerminalAttachResult, WorkflowRoleInput, desktop_agent_registry,
     ensure_desktop_workflow_platform_supported, map_project_listing, map_resolved_project,
@@ -756,6 +756,46 @@ struct RoleStartFailure {
     timed_out: bool,
 }
 
+/// Why [`launch_configured_orchestration`] failed: the whole sentence, and —
+/// as data, not prose (PRD #1223 audit F6) — every role it could not confirm is
+/// stopped, which [`crate::dto::DesktopActionError::launch`] carries to the
+/// webview.
+#[derive(Debug)]
+struct LaunchFailure {
+    message: String,
+    unconfirmed_stops: Vec<String>,
+}
+
+impl LaunchFailure {
+    /// A failure after `rollback`, plus the role a reconciliation could not
+    /// vouch for, if any.
+    fn after_rollback(
+        message: String,
+        rollback: &RollbackOutcome,
+        uncertain: Option<&UnconfirmedStop>,
+    ) -> Self {
+        Self {
+            message,
+            unconfirmed_stops: rollback
+                .unconfirmed
+                .iter()
+                .chain(uncertain)
+                .map(|stop| stop.role.clone())
+                .collect(),
+        }
+    }
+}
+
+impl From<String> for LaunchFailure {
+    /// A failure before anything started, so there is nothing to confirm.
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            unconfirmed_stops: Vec::new(),
+        }
+    }
+}
+
 async fn deliver_coordinator_prompt<D: WorkflowDaemon + Sync>(
     daemon: &D,
     readiness: &mut D::ReadinessWatch,
@@ -1098,10 +1138,11 @@ async fn launch_configured_orchestration<D: WorkflowDaemon + Sync>(
     rows: u16,
     cols: u16,
     orchestration_id: &str,
-) -> Result<WorkflowLaunchResult, String> {
+) -> Result<WorkflowLaunchResult, LaunchFailure> {
     if prepared.roles.iter().filter(|role| role.start).count() != 1 {
         return Err(
             "the deck prepared an orchestration without exactly one start role; nothing was started"
+                .to_string()
                 .into(),
         );
     }
@@ -1184,26 +1225,40 @@ async fn launch_configured_orchestration<D: WorkflowDaemon + Sync>(
             .as_ref()
             .map(|stop| format!("; cleanup uncertainty: {}", stop.reason))
             .unwrap_or_default();
-        return Err(format!(
-            "failed to start orchestration role {}: {error}; {already}; {}{reconciliation_note}",
-            safe_message(&role.name),
-            rollback.describe(),
+        return Err(LaunchFailure::after_rollback(
+            format!(
+                "failed to start orchestration role {}: {error}; {already}; {}{reconciliation_note}",
+                safe_message(&role.name),
+                rollback.describe(),
+            ),
+            &rollback,
+            uncertain.as_ref(),
         ));
     }
 
     let Some((start_pane_id, start_agent_id)) = start_target else {
-        let cleanup_status = rollback_workflow_agents(daemon, &started).await.describe();
-        return Err(format!(
-            "the orchestration started no coordinator; {cleanup_status}"
+        let rollback = rollback_workflow_agents(daemon, &started).await;
+        return Err(LaunchFailure::after_rollback(
+            format!(
+                "the orchestration started no coordinator; {}",
+                rollback.describe()
+            ),
+            &rollback,
+            None,
         ));
     };
     let delivered_by_deck = match daemon.launched_agent_type(&start_agent_id).await {
         Ok(agent_type) => agent_type == Some(AgentType::Pi),
         Err(error) => {
-            let cleanup_status = rollback_workflow_agents(daemon, &started).await.describe();
-            return Err(format!(
-                "could not tell how the coordinator receives its context: {}; {cleanup_status}",
-                safe_message(error)
+            let rollback = rollback_workflow_agents(daemon, &started).await;
+            return Err(LaunchFailure::after_rollback(
+                format!(
+                    "could not tell how the coordinator receives its context: {}; {}",
+                    safe_message(error),
+                    rollback.describe()
+                ),
+                &rollback,
+                None,
             ));
         }
     };
@@ -1218,10 +1273,15 @@ async fn launch_configured_orchestration<D: WorkflowDaemon + Sync>(
         )
         .await
     {
-        let cleanup_status = rollback_workflow_agents(daemon, &started).await.describe();
-        return Err(format!(
-            "orchestration coordinator context delivery failed: {}; {cleanup_status}",
-            safe_message(error)
+        let rollback = rollback_workflow_agents(daemon, &started).await;
+        return Err(LaunchFailure::after_rollback(
+            format!(
+                "orchestration coordinator context delivery failed: {}; {}",
+                safe_message(error),
+                rollback.describe()
+            ),
+            &rollback,
+            None,
         ));
     }
 
@@ -2951,7 +3011,7 @@ async fn start_orchestration_action(
     state: &DesktopState,
     deck_id: &str,
     request: StartOrchestrationRequest,
-) -> Result<StartedOrchestration, String> {
+) -> Result<StartedOrchestration, DesktopActionError> {
     let StartOrchestrationRequest {
         path,
         orchestration,
@@ -2978,7 +3038,7 @@ async fn start_orchestration_action(
     let daemon = state.daemon.trusted(scope.endpoint()).await?;
     daemon.require_compatible()?;
     if let Some(reason) = orchestration_launch_unavailable(&daemon).await? {
-        return Err(reason);
+        return Err(reason.into());
     }
     // Bounded (PRD #1223 audit F4) for `bounded_plain_start`'s reason: the
     // dialog waiting on this launch cannot be closed while it is in flight.
@@ -3012,7 +3072,8 @@ async fn start_orchestration_action(
         cols,
         &mint_orchestration_id(),
     )
-    .await?;
+    .await
+    .map_err(|failure| DesktopActionError::launch(failure.message, failure.unconfirmed_stops))?;
     Ok(StartedOrchestration {
         start_agent_id: launched.start_agent_id,
         agent_ids: launched.agent_ids,
@@ -3257,7 +3318,7 @@ async fn desktop_run_action(
     webview: Webview,
     state: State<'_, DesktopState>,
     action: DesktopAction,
-) -> Result<DesktopActionResult, String> {
+) -> Result<DesktopActionResult, DesktopActionError> {
     ensure_main_webview(&webview)?;
     let mut result_agent_id = None;
     let mut result_agent_ids = Vec::new();
@@ -3549,7 +3610,8 @@ async fn desktop_run_action(
             if text.is_empty() || text.len() > COMMAND_MAX_BYTES || text.contains('\0') {
                 return Err(format!(
                     "text must be 1..={COMMAND_MAX_BYTES} bytes and contain no NUL"
-                ));
+                )
+                .into());
             }
             let daemon = trusted_daemon(&state.daemon).await?;
             daemon.require_compatible()?;
@@ -5944,7 +6006,7 @@ command = "configured-planner"
             Err("builder refused".to_string()),
         ]);
 
-        let error = launch_configured_orchestration(
+        let failure = launch_configured_orchestration(
             &daemon,
             "loop",
             Some("run"),
@@ -5955,6 +6017,7 @@ command = "configured-planner"
         )
         .await
         .expect_err("a refused role fails the launch");
+        let error = &failure.message;
 
         assert!(
             error.contains("failed to start orchestration role builder: builder refused"),
@@ -5968,6 +6031,10 @@ command = "configured-planner"
         assert_eq!(*daemon.stopped.lock().unwrap(), ["agent-0"]);
         assert!(daemon.submissions.lock().unwrap().is_empty());
         assert!(daemon.launched_type_queries.lock().unwrap().is_empty());
+        assert!(
+            failure.unconfirmed_stops.is_empty(),
+            "a confirmed rollback carries no cleanup warning"
+        );
     }
 
     /// Scenario: the deck does not advertise `prepared-role-command`, so the
@@ -5978,7 +6045,7 @@ command = "configured-planner"
         let daemon = FakeWorkflowDaemon::new(Ok(None), [], Ok(SendResult::Applied));
         daemon.configured_unsupported.store(true, Ordering::SeqCst);
 
-        let error = launch_configured_orchestration(
+        let failure = launch_configured_orchestration(
             &daemon,
             "loop",
             Some("run"),
@@ -5989,6 +6056,7 @@ command = "configured-planner"
         )
         .await
         .expect_err("an older deck cannot launch");
+        let error = &failure.message;
 
         assert!(
             error.contains(CONFIGURED_ROLE_COMMAND_UNSUPPORTED),
@@ -6028,7 +6096,7 @@ command = "configured-planner"
             .push_back(Ok(Some("agent-1".to_string())));
         let began = tokio::time::Instant::now();
 
-        let error = launch_configured_orchestration(
+        let failure = launch_configured_orchestration(
             &daemon,
             "loop",
             Some("run"),
@@ -6039,6 +6107,7 @@ command = "configured-planner"
         )
         .await
         .expect_err("a start the deck never answers fails the launch");
+        let error = &failure.message;
 
         assert_eq!(
             began.elapsed(),
@@ -6055,6 +6124,7 @@ command = "configured-planner"
             "{error}"
         );
         assert!(!error.contains("cleanup uncertainty"), "{error}");
+        assert!(failure.unconfirmed_stops.is_empty());
         assert_eq!(
             *daemon.stopped.lock().unwrap(),
             ["agent-1", "agent-0"],
@@ -6073,7 +6143,7 @@ command = "configured-planner"
         let daemon = FakeWorkflowDaemon::new(Ok(None), [], Ok(SendResult::Applied));
         daemon.start_hangs.lock().unwrap().insert(1);
 
-        let error = launch_configured_orchestration(
+        let failure = launch_configured_orchestration(
             &daemon,
             "loop",
             Some("run"),
@@ -6084,6 +6154,7 @@ command = "configured-planner"
         )
         .await
         .expect_err("a start the deck never answers fails the launch");
+        let error = &failure.message;
 
         assert!(
             error.contains("stopped 1 already-started role(s)"),
@@ -6098,6 +6169,11 @@ command = "configured-planner"
             "{error}"
         );
         assert_eq!(*daemon.stopped.lock().unwrap(), ["agent-0"]);
+        assert_eq!(
+            failure.unconfirmed_stops,
+            ["builder"],
+            "the role whose start outcome is unknown is carried as data (audit F6)"
+        );
     }
 
     /// Scenario (PRD #1223 audit F4): the fourth role is refused, and of the
@@ -6126,7 +6202,7 @@ command = "configured-planner"
             .insert("agent-0".to_string(), "stop refused".to_string());
         let began = tokio::time::Instant::now();
 
-        let error = launch_configured_orchestration(
+        let failure = launch_configured_orchestration(
             &daemon,
             "loop",
             Some("run"),
@@ -6137,6 +6213,7 @@ command = "configured-planner"
         )
         .await
         .expect_err("a refused role fails the launch");
+        let error = &failure.message;
 
         assert_eq!(
             *daemon.stop_attempts.lock().unwrap(),
@@ -6158,6 +6235,11 @@ command = "configured-planner"
             "{error}"
         );
         assert!(error.contains("planner (agent-0: stop refused)"), "{error}");
+        assert_eq!(
+            failure.unconfirmed_stops,
+            ["reviewer", "planner"],
+            "every role whose stop was not confirmed is carried as data, newest first (audit F6)"
+        );
     }
 
     /// Scenario (PRD #1223 audit F4): the Runs launch shares the rollback, and

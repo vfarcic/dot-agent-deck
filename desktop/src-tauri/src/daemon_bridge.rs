@@ -5683,7 +5683,7 @@ agent = "opencode"
                 "the older deck cannot start configured roles, yet {} started",
                 started.start_agent_id
             ),
-            Err(error) => assert_eq!(error, crate::CONFIGURED_ROLE_COMMAND_UNSUPPORTED),
+            Err(error) => assert_eq!(error.message(), crate::CONFIGURED_ROLE_COMMAND_UNSUPPORTED),
         }
         assert_eq!(
             refused, 0,
@@ -5691,7 +5691,12 @@ agent = "opencode"
         );
         for (case, error) in [
             ("query", unobserved_query.err()),
-            ("launch", unobserved_launch.err()),
+            (
+                "launch",
+                unobserved_launch
+                    .err()
+                    .map(|error| error.message().to_string()),
+            ),
         ] {
             assert!(
                 error.as_deref().is_some_and(

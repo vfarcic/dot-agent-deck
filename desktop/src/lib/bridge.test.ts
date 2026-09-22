@@ -428,6 +428,30 @@ describe("TauriDeckBridge", () => {
   });
 
   /**
+   * Scenario (PRD #1223 audit F6): a launch fails and the crate could not
+   * confirm every role stopped, so it rejects with `{ message,
+   * unconfirmedStops }`. The bridge rethrows that as a `LaunchCleanupError`
+   * carrying both; a bare-string rejection — every other failure — is
+   * rethrown as exactly the value it was.
+   */
+  it("rethrows a launch that could not confirm its cleanup as a LaunchCleanupError, and anything else untouched", async () => {
+    const { TauriDeckBridge } = await import("./bridge");
+    const { LaunchCleanupError } = await import("./actionError");
+    const bridge = new TauriDeckBridge();
+    const action = { type: "start_orchestration", deckId: "deck-00000000000b0x01", path: "/srv/repo", orchestration: "loop" } as const;
+    invoke.mockRejectedValueOnce({ message: "failed to start orchestration role builder: refused", unconfirmedStops: ["reviewer", "planner"] });
+
+    const structured = await bridge.runAction(action).catch((cause: unknown) => cause);
+    expect(structured).toBeInstanceOf(LaunchCleanupError);
+    expect((structured as InstanceType<typeof LaunchCleanupError>).message).toBe("failed to start orchestration role builder: refused");
+    expect((structured as InstanceType<typeof LaunchCleanupError>).unconfirmedStops).toEqual(["reviewer", "planner"]);
+
+    invoke.mockRejectedValueOnce("failed to start orchestration role builder: refused; stopped 1 already-started role(s)");
+    await expect(bridge.runAction(action)).rejects.toBe("failed to start orchestration role builder: refused; stopped 1 already-started role(s)");
+    await bridge.dispose();
+  });
+
+  /**
    * Scenario: the crate refuses a start because its deck is not one the app
    * observes. The bridge surfaces that refusal as a rejection and sends
    * nothing else — no second attempt, and no deck filled in from the

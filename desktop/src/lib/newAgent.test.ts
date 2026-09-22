@@ -4,6 +4,7 @@ import type { AgentSession, ConnectionView, DeckFleet, NewAgentOptions } from ".
 import {
   AUTHORING_WITHHELD,
   authoringModes,
+  cleanupWarning,
   DECK_STATE_FALLBACK,
   deckChoices,
   deckUnavailableReason,
@@ -270,5 +271,24 @@ describe("New agent orchestration rules (PRD #1223 M6)", () => {
     expect(orchestrationModes({ kind: "unsupported", reason: "too old" })).toEqual({ offered: [], withheld: "too old" });
     expect(orchestrationModes({ kind: "project", path: "/p", displayPath: "/p", displayName: "p", orchestrations: [loop] })).toEqual({ offered: [loop] });
     expect(orchestrationModeId("loop")).toBe("orch:loop");
+  });
+});
+
+describe("New agent rules — cleanup the launch could not confirm (PRD #1223 audit F6)", () => {
+  /**
+   * Scenario: a failed launch could not confirm two roles stopped, each with
+   * a 128-character name. The alert still leads with the count and what to
+   * do, fits the message budget, and a name is never longer than a name's
+   * budget allows — however long the list, the part that matters survives.
+   */
+  it("keeps the count and the instruction ahead of long role names within the message budget", () => {
+    const long = (prefix: string) => `${prefix}${"r".repeat(128 - prefix.length)}`;
+    const warning = cleanupWarning([long("reviewer-"), long("planner-")]);
+
+    expect(warning.startsWith("2 roles may still be running on this deck: the rollback could not confirm them stopped. Check the deck and stop them there")).toBe(true);
+    expect(Array.from(warning).length).toBeLessThanOrEqual(241);
+    expect(warning).toContain("reviewer-");
+    expect(cleanupWarning(["builder"])).toBe("1 role may still be running on this deck: the rollback could not confirm it stopped. Check the deck and stop it there — builder");
+    expect(cleanupWarning(["plan\u202Ener"])).toContain("planner");
   });
 });

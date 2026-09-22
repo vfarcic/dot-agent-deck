@@ -273,6 +273,20 @@ export const ORCHESTRATION_TITLE_TAKEN = "This name is already in use by a live 
 export const SAME_DIRECTORY_ORCHESTRATION = "This directory already runs an orchestration on this deck. Both share its .dot-agent-deck role files and one working tree.";
 
 /**
+ * PRD #1223 audit F6 — the alert a failed launch shows, on its own and before
+ * the error sentence, when its rollback could not confirm every role stopped.
+ *
+ * Built so the part that matters survives the `message` clamp: the count and
+ * what to do come first, and the role names — each clamped as a name — last.
+ */
+export function cleanupWarning(unconfirmedStops: readonly string[]): string {
+  const count = unconfirmedStops.length;
+  const subject = count === 1 ? "1 role" : `${count} roles`;
+  const names = unconfirmedStops.map((role) => displayText(role, DISPLAY_LIMITS.name)).join(", ");
+  return displayText(`${subject} may still be running on this deck: the rollback could not confirm ${count === 1 ? "it" : "them"} stopped. Check the deck and stop ${count === 1 ? "it" : "them"} there — ${names}`, DISPLAY_LIMITS.message);
+}
+
+/**
  * Whether a refusal means the chosen deck has left the fleet — the crate's
  * `DeckScope::resolve` wording, which the fixture bridge repeats. The flow
  * returns to the deck step on it rather than retargeting another deck.

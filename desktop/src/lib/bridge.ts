@@ -1,4 +1,5 @@
 import { createFixtureFleet, createFixtureStartedAgent, DEFAULT_PROFILES, FIXTURE_DEFAULT_COMMANDS, FIXTURE_EXPERIMENTAL_DECKS, FIXTURE_HOMES, fixtureAgentRegistry, fixtureDirectoryTree, fixtureProjectOrchestrations, FIXTURE_ROLE_COMMANDS, fixtureVoiceCommands, nextFixtureAgentId, fixtureVoiceHeard, fixtureVoiceScript, fixtureVoiceStatus, fixtureVoiceTranscription, resolveFixtureVoice, type FixtureState } from "../data/fixture";
+import { actionErrorFrom } from "./actionError";
 import { agentKey } from "./agentKey";
 import { getTerminal } from "./terminalRegistry";
 import { applyHandoffEvent, mapDaemonEvent, MAX_LIVE_EVIDENCE } from "./daemonEvents";
@@ -3546,7 +3547,17 @@ export class TauriDeckBridge implements DeckBridge {
       // M3): the crate resolves it against the decks this app observes and
       // refuses anything else, so nothing here may fill it in from the
       // selection.
-      const result = await invoke<DesktopActionResultDto>("desktop_run_action", { action: action satisfies DesktopRunActionDto });
+      //
+      // A rejection is rethrown through `actionErrorFrom`: the crate's one
+      // structured failure — a launch whose cleanup it could not confirm (PRD
+      // #1223 audit F6) — becomes a `LaunchCleanupError`, and every other
+      // rejection is rethrown exactly as it arrived.
+      let result: DesktopActionResultDto;
+      try {
+        result = await invoke<DesktopActionResultDto>("desktop_run_action", { action: action satisfies DesktopRunActionDto });
+      } catch (cause) {
+        throw actionErrorFrom(cause);
+      }
       if (action.type === "stop_daemon" || action.type === "restart_daemon") {
         this.sessions.clear();
         this.sessionKeys.clear();

@@ -124,6 +124,15 @@ export const DISPLAY_LIMITS = {
   /** The daemon's own connection message. */
   message: 240,
   /**
+   * A failure's full sentence, where `message` shows its first 240 characters
+   * and a disclosure offers the rest (PRD #1223 audit F6: a launch error names
+   * the role that failed, then every role that had started, then what the
+   * rollback did — so the part a reader most needs is the part the `message`
+   * clamp cuts). 2048 is the crate's own `ERROR_MESSAGE_MAX_CHARS`, the cap
+   * `safe_message` applies to each part of such a sentence.
+   */
+  detail: 2048,
+  /**
    * Identity values that reach a DOM attribute, an IDREF or a React key —
    * `domIdentity` is the seam. Generous next to the others because these are
    * percent-encoded composites (`<kind>:<encoded id>`, `<encoded daemonId>:<encoded

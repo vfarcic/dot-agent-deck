@@ -625,6 +625,75 @@ pub struct WorkflowRoleInput {
     pub start: bool,
 }
 
+/// What `desktop_run_action` rejects with (PRD #1223 audit F6).
+///
+/// **A bare string for every failure but one**, exactly as before this type
+/// existed — `#[serde(untagged)]` serialises [`Self::Message`] as the string
+/// itself, so every existing `catch` on the webview side reads the same value it
+/// always read. The one exception is a launch whose rollback could not confirm
+/// that every role it touched is stopped: that failure is an object carrying
+/// the list as data, so the webview can put "these may still be running" in
+/// front of the reader without parsing it back out of the prose — where it is
+/// the LAST clause, after the primary error and every started role's name, and
+/// so the first thing a display clamp cuts.
+///
+/// Serialize-only, so `untagged`'s deserialisation cost (see
+/// `settings::StageSpec`) does not arise.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(untagged)]
+pub enum DesktopActionError {
+    Message(String),
+    LaunchCleanup(DesktopLaunchCleanupFailure),
+}
+
+/// A failed launch that could not confirm its cleanup — see
+/// [`DesktopActionError`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DesktopLaunchCleanupFailure {
+    /// The whole error, as a string rejection would have carried it.
+    pub message: String,
+    /// Every role the launch started, or may have started, whose stop it could
+    /// not confirm — each through [`safe_message`]. Never empty: a launch
+    /// whose cleanup was confirmed rejects with a plain
+    /// [`DesktopActionError::Message`].
+    pub unconfirmed_stops: Vec<String>,
+}
+
+impl DesktopActionError {
+    /// The sentence either variant carries.
+    #[cfg(test)]
+    pub fn message(&self) -> &str {
+        match self {
+            Self::Message(message) => message,
+            Self::LaunchCleanup(failure) => &failure.message,
+        }
+    }
+
+    /// A launch failure, as the variant its cleanup calls for.
+    pub fn launch(message: String, unconfirmed_stops: Vec<String>) -> Self {
+        if unconfirmed_stops.is_empty() {
+            return Self::Message(message);
+        }
+        Self::LaunchCleanup(DesktopLaunchCleanupFailure {
+            message,
+            unconfirmed_stops: unconfirmed_stops.iter().map(safe_message).collect(),
+        })
+    }
+}
+
+impl From<String> for DesktopActionError {
+    fn from(message: String) -> Self {
+        Self::Message(message)
+    }
+}
+
+impl From<&str> for DesktopActionError {
+    fn from(message: &str) -> Self {
+        Self::Message(message.to_string())
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DesktopActionResult {
@@ -3282,6 +3351,39 @@ mod tests {
         assert_eq!(orchestration.roles[0].name, role_name);
         assert_eq!(orchestration.roles[0].display_name, "planner");
         assert!(orchestration.roles[0].start);
+    }
+
+    /// Scenario (PRD #1223 audit F6): `desktop_run_action`'s rejection is the
+    /// bare string every webview `catch` already reads — including a launch
+    /// whose cleanup was confirmed — and only a launch that could not confirm
+    /// every stop rejects with an object carrying the roles as data.
+    #[test]
+    fn a_launch_rejection_carries_unconfirmed_stops_as_data_and_every_other_is_a_string() {
+        assert_eq!(
+            serde_json::to_value(DesktopActionError::from("deck refused")).unwrap(),
+            serde_json::json!("deck refused")
+        );
+        assert_eq!(
+            serde_json::to_value(DesktopActionError::launch(
+                "failed; stopped 2 already-started role(s)".into(),
+                Vec::new()
+            ))
+            .unwrap(),
+            serde_json::json!("failed; stopped 2 already-started role(s)"),
+            "a confirmed rollback needs no warning, so it keeps the string shape"
+        );
+        assert_eq!(
+            serde_json::to_value(DesktopActionError::launch(
+                "failed; cleanup could not confirm stop".into(),
+                vec!["reviewer".into(), "plan\u{1b}ner".into()]
+            ))
+            .unwrap(),
+            serde_json::json!({
+                "message": "failed; cleanup could not confirm stop",
+                "unconfirmedStops": ["reviewer", "planner"],
+            }),
+            "each role name goes through safe_message"
+        );
     }
 
     /// Scenario: the longest name the daemon will project is one this crate's
