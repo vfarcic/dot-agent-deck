@@ -66,6 +66,9 @@ type ModeId = typeof NO_MODE.id | AuthoringKind | ReturnType<typeof orchestratio
 
 const AUTO_AGENT = "auto";
 
+/** Why the dialog cannot be closed during a start (PRD #1223 audit F5). */
+const STARTING_CLOSE_BLOCKED = "Waiting for the deck to answer the start. The dialog can be closed once it has.";
+
 function messageOf(cause: unknown): string {
   return cause instanceof Error ? cause.message : String(cause);
 }
@@ -196,6 +199,55 @@ export function NewAgentDialog({ runtime, initialDeckId, onClose, onAppeared, on
     setAwaiting(undefined);
     setHighlight(preselectedDeck(deckChoices(runtime.fleet)));
   }, [runtime.fleet]);
+
+  /**
+   * PRD #1223 audit F5 — whether this dialog is still mounted. A start's reply
+   * can outlive the dialog (the overview can drop it for its own reasons), and
+   * the failure handler below must then touch nothing: not local state, which
+   * is gone, and above all not the runtime's global error, which is by then the
+   * ONLY copy of the failure — and, for a launch whose rollback could not
+   * confirm every stop, the only place the user can learn that roles may
+   * still be running.
+   */
+  const mounted = useRef(true);
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+    };
+  }, []);
+
+  /**
+   * Every way out of the dialog — Cancel, the header's close button, Esc, a
+   * backdrop click and the directory step's `q` — and none of them works while
+   * a start is in flight (PRD #1223 audit F5). Closing then would unmount the
+   * one place a failure is explained, while the action itself carries on; the
+   * wait is bounded instead, because every deck call a start makes is (audit
+   * F4). Once the deck has answered — the "waiting for the fleet" phase
+   * included — closing works as before.
+   */
+  const starting = phase === "starting";
+  const requestClose = () => {
+    if (!starting) onClose();
+  };
+
+  /**
+   * A start the deck refused. The runtime files a failed action under its
+   * global error as well; a MOUNTED dialog says it here, beside the values, so
+   * that copy is dropped. An unmounted one leaves it alone — see `mounted`.
+   */
+  const failStart = (cause: unknown) => {
+    if (!mounted.current) return;
+    runtime.clearError();
+    const message = messageOf(cause);
+    if (isDeckGoneError(message)) {
+      returnToDeckStep(message);
+      return;
+    }
+    setFormError(message);
+    setFormCleanup(cause instanceof LaunchCleanupError ? cause.unconfirmedStops : undefined);
+    setPhase("idle");
+  };
 
   const rows = useMemo<DirectoryRow[]>(() => {
     if (!listing) return [];
@@ -426,18 +478,11 @@ export function NewAgentDialog({ runtime, initialDeckId, onClose, onAppeared, on
         onNotAppeared({ deckName: deck.name, agentName: title });
         return;
       }
+      if (!mounted.current) return;
       setPhase("waiting");
       setAwaiting({ deckId: deck.deckId, agentId: result.agentId, deckName: deck.name, agentName: title });
     } catch (cause) {
-      runtime.clearError();
-      const message = messageOf(cause);
-      if (isDeckGoneError(message)) {
-        returnToDeckStep(message);
-        return;
-      }
-      setFormError(message);
-      setFormCleanup(cause instanceof LaunchCleanupError ? cause.unconfirmedStops : undefined);
-      setPhase("idle");
+      failStart(cause);
     }
   };
 
@@ -469,20 +514,11 @@ export function NewAgentDialog({ runtime, initialDeckId, onClose, onAppeared, on
         onNotAppeared({ deckName: deck.name, agentName });
         return;
       }
+      if (!mounted.current) return;
       setPhase("waiting");
       setAwaiting({ deckId: deck.deckId, agentId: result.agentId, deckName: deck.name, agentName });
     } catch (cause) {
-      // The runtime files a failed action under its global error as well; the
-      // dialog says it here, beside the values, so that copy is dropped.
-      runtime.clearError();
-      const message = messageOf(cause);
-      if (isDeckGoneError(message)) {
-        returnToDeckStep(message);
-        return;
-      }
-      setFormError(message);
-      setFormCleanup(cause instanceof LaunchCleanupError ? cause.unconfirmedStops : undefined);
-      setPhase("idle");
+      failStart(cause);
     }
   };
 
@@ -581,7 +617,7 @@ export function NewAgentDialog({ runtime, initialDeckId, onClose, onAppeared, on
         return;
       case "q":
         event.preventDefault();
-        onClose();
+        requestClose();
         return;
       case "Escape":
         // The TUI picker's Esc: a filter is cleared first, and only an
@@ -630,7 +666,7 @@ export function NewAgentDialog({ runtime, initialDeckId, onClose, onAppeared, on
   const onDialogKeyDown = (event: KeyboardEvent<HTMLElement>) => {
     if (event.key === "Escape") {
       event.preventDefault();
-      onClose();
+      requestClose();
     }
   };
 
@@ -683,7 +719,7 @@ export function NewAgentDialog({ runtime, initialDeckId, onClose, onAppeared, on
     );
     footer = (
       <>
-        <button type="button" className="button secondary" onClick={onClose}>Cancel</button>
+        <button type="button" className="button secondary" onClick={requestClose}>Cancel</button>
         <button type="button" className="button primary" data-testid="new-agent-deck-next" disabled={!highlighted || highlighted.reason !== undefined} onClick={() => confirmDeck(highlighted)}>Next</button>
       </>
     );
@@ -780,7 +816,7 @@ export function NewAgentDialog({ runtime, initialDeckId, onClose, onAppeared, on
     footer = (
       <>
         <button type="button" className="button secondary" onClick={() => { listingSeq.current += 1; setStep("deck"); setDeck(undefined); }}><ArrowLeft size={14} /> Back</button>
-        <button type="button" className="button secondary" onClick={onClose}>Cancel</button>
+        <button type="button" className="button secondary" onClick={requestClose}>Cancel</button>
         {listing?.parent !== undefined && <button type="button" className="button secondary" onClick={goUp}><ArrowUp size={14} /> Up</button>}
         <button type="button" className="button primary" data-testid="new-agent-use-directory" disabled={!listing} onClick={confirmCurrent}><Check size={14} /> Use this directory</button>
       </>
@@ -880,13 +916,14 @@ export function NewAgentDialog({ runtime, initialDeckId, onClose, onAppeared, on
             <p>{displayText(formError, DISPLAY_LIMITS.detail)}</p>
           </details>
         )}
+        {starting && <p className="new-agent-hint" data-testid="new-agent-starting"><Loader2 className="spin" size={12} /> {STARTING_CLOSE_BLOCKED}</p>}
         {phase === "waiting" && <p className="new-agent-hint" data-testid="new-agent-waiting"><Loader2 className="spin" size={12} /> Started. Waiting for the deck to list it…</p>}
       </form>
     );
     footer = (
       <>
         <button type="button" className="button secondary" disabled={busy} onClick={() => setStep("directory")}><ArrowLeft size={14} /> Back</button>
-        <button type="button" className="button secondary" onClick={onClose}>Cancel</button>
+        <button type="button" className="button secondary" data-testid="new-agent-cancel" disabled={starting} title={starting ? STARTING_CLOSE_BLOCKED : undefined} onClick={requestClose}>Cancel</button>
         <button type="submit" form={`${titleId}-form`} className="button primary" data-testid="new-agent-start" disabled={busy || titleTaken}>
           {phase === "idle" ? <><Plus size={14} /> {selectedOrchestration ? "Start orchestration" : "Start agent"}</> : phase === "starting" ? "Starting…" : "Opening…"}
         </button>
@@ -895,7 +932,7 @@ export function NewAgentDialog({ runtime, initialDeckId, onClose, onAppeared, on
   }
 
   return (
-    <div className="dialog-backdrop" role="presentation" onMouseDown={onClose}>
+    <div className="dialog-backdrop" role="presentation" data-testid="new-agent-backdrop" onMouseDown={requestClose}>
       <section
         className="new-agent-dialog"
         role="dialog"
@@ -909,7 +946,7 @@ export function NewAgentDialog({ runtime, initialDeckId, onClose, onAppeared, on
         <header>
           <h2 id={titleId}>New agent</h2>
           {deck && <span className="new-agent-deck" data-testid="new-agent-chosen-deck">{deck.name}</span>}
-          <button type="button" className="icon-button" aria-label="Close new agent" onClick={onClose}><X size={15} /></button>
+          <button type="button" className="icon-button" aria-label="Close new agent" disabled={starting} title={starting ? STARTING_CLOSE_BLOCKED : undefined} onClick={requestClose}><X size={15} /></button>
         </header>
         <div className="new-agent-body">{body}</div>
         <footer>{footer}</footer>

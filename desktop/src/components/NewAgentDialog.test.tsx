@@ -598,6 +598,89 @@ describe("New agent dialog — after the start (PRD #1223 M5)", () => {
   });
 });
 
+describe("New agent dialog — a start in flight (PRD #1223 audit F5)", () => {
+  /** A `runAction` whose answer the test releases by hand. */
+  function heldStart() {
+    let settle: { resolve: (value: { ok: boolean; agentId?: string }) => void; reject: (cause: unknown) => void } | undefined;
+    const runAction = vi.fn(() => new Promise<{ ok: boolean; agentId?: string }>((resolve, reject) => { settle = { resolve, reject }; }));
+    return { runAction, settle: () => settle! };
+  }
+
+  /**
+   * Scenario: Start is pressed and the deck has not answered. Cancel and the
+   * header's close button are disabled and say why, and neither Esc nor a
+   * backdrop click closes the dialog. Once the deck refuses the start, the
+   * refusal is shown and every way out works again.
+   */
+  it("cannot be closed until the deck answers the start", async () => {
+    const held = heldStart();
+    const runtime = fakeRuntime({ runAction: held.runAction });
+    const { onClose } = renderDialog(runtime);
+    await reachForm();
+
+    fireEvent.click(screen.getByTestId("new-agent-start"));
+    expect(await screen.findByTestId("new-agent-starting")).toHaveTextContent("Waiting for the deck to answer the start");
+    expect(screen.getByTestId("new-agent-cancel")).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Close new agent" })).toBeDisabled();
+    fireEvent.click(screen.getByTestId("new-agent-cancel"));
+    fireEvent.click(screen.getByRole("button", { name: "Close new agent" }));
+    fireEvent.keyDown(screen.getByTestId("new-agent-dialog"), { key: "Escape" });
+    fireEvent.mouseDown(screen.getByTestId("new-agent-backdrop"));
+    expect(onClose).not.toHaveBeenCalled();
+
+    await act(async () => held.settle().reject(new Error("the deck did not answer the start within 15s")));
+
+    expect(await screen.findByTestId("new-agent-error")).toHaveTextContent("did not answer the start within 15s");
+    expect(screen.queryByTestId("new-agent-starting")).toBeNull();
+    expect(screen.getByTestId("new-agent-cancel")).toBeEnabled();
+    fireEvent.keyDown(screen.getByTestId("new-agent-dialog"), { key: "Escape" });
+    fireEvent.mouseDown(screen.getByTestId("new-agent-backdrop"));
+    fireEvent.click(screen.getByTestId("new-agent-cancel"));
+    expect(onClose).toHaveBeenCalledTimes(3);
+  });
+
+  /**
+   * Scenario: the overview drops the dialog for its own reasons while an
+   * orchestration launch is in flight, and the launch then fails with roles
+   * it could not confirm stopped. The runtime has already filed that failure
+   * under its global error — now the only copy of it — and the gone dialog
+   * must leave it there rather than clear it.
+   */
+  it("leaves the runtime's global error alone when a start fails after the dialog is gone", async () => {
+    const held = heldStart();
+    const runtime = fakeRuntime({ runAction: held.runAction, newAgentOrchestrations: vi.fn(async (): Promise<NewAgentOrchestrations> => ({ kind: "project", path: "/home/dev/Alpha-project", displayPath: "/home/dev/Alpha-project", displayName: "Alpha-project", orchestrations: [{ name: "loop", displayName: "loop", default: true, roles: [{ name: "planner", displayName: "planner", start: true }] }] })) });
+    const { unmount } = renderDialog(runtime);
+    fireEvent.keyDown(deckList(), { key: "Enter" });
+    await currentPath("/home/dev");
+    fireEvent.keyDown(directoryList(), { key: "Enter" });
+    await currentPath("/home/dev/Alpha-project");
+    fireEvent.keyDown(directoryList(), { key: "Enter" });
+    fireEvent.click(await screen.findByTestId("new-agent-mode-orch:loop"));
+    fireEvent.click(screen.getByTestId("new-agent-start"));
+    await screen.findByTestId("new-agent-starting");
+
+    unmount();
+    await act(async () => held.settle().reject(new LaunchCleanupError("failed to start orchestration role builder: refused; cleanup could not confirm stop for 1 of 1", ["planner"])));
+
+    expect(runtime.clearError).not.toHaveBeenCalled();
+  });
+
+  /** Scenario: the same, for a plain agent's start. */
+  it("leaves the global error alone for a plain start that fails after the dialog is gone", async () => {
+    const held = heldStart();
+    const runtime = fakeRuntime({ runAction: held.runAction });
+    const { unmount } = renderDialog(runtime);
+    await reachForm();
+    fireEvent.click(screen.getByTestId("new-agent-start"));
+    await screen.findByTestId("new-agent-starting");
+
+    unmount();
+    await act(async () => held.settle().reject(new Error("deck refused")));
+
+    expect(runtime.clearError).not.toHaveBeenCalled();
+  });
+});
+
 describe("New agent dialog — authoring agents (PRD #1223 M7)", () => {
   const AUTHORING: NewAgentOptions = { ...DECK_OPTIONS, authoringKinds: ["schedule", "schedule-issues", "dispatcher"] };
   const optionsOf = (patch: Partial<Extract<NewAgentOptions, { kind: "deck" }>> = {}) => vi.fn(async (): Promise<NewAgentOptions> => ({ ...structuredClone(AUTHORING), ...patch } as NewAgentOptions));
