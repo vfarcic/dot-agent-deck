@@ -52,8 +52,19 @@
 #                    presses Enter in an agent's prompt — had nothing else
 #                    between a steered pick and a dispatch. Tune a too-narrow
 #                    vocabulary here; do not loosen the rule.
-#   ungrounded       instead of `heard_as`: why this row CANNOT be grounded by
-#                    words. Every row carries exactly one of the two, so no
+#   heard_as_whole   instead of `heard_as`: the row is asked for only when the
+#                    WHOLE utterance is one of these entries — case,
+#                    punctuation and an edge politeness word ("okay",
+#                    "please", "now", …) aside —
+#                    never when one merely occurs in it (closing audit G1).
+#                    For a row whose action cannot be taken back, where an
+#                    unrelated occurrence of one ordinary word ("tell it to put
+#                    END after the report") must not be enough. Same own-words
+#                    rule. Exactly one row uses it, `submit_prompt`
+#                    (`voice_table_whole_utterance_rows_are_the_deliberate_set`);
+#                    on an ordinary row it would make natural speech fail.
+#   ungrounded       instead of either: why this row CANNOT be grounded by
+#                    words. Every row carries exactly one of the three, so no
 #                    row is exempt by omission. No shipped row uses it
 #                    (`voice_table_no_row_is_exempt_from_action_grounding`).
 #   [[commands.params]]  name + kind, `kind` from the closed resolver set
@@ -323,6 +334,15 @@ heard_as    = ["type", "write", "say", "dictate", "tell", "ask", "want", "prompt
 # is unrecoverable — see the constant's own doc for the phrases that were
 # rejected and why.
 #
+# The MODEL's path is held to the same rule by `heard_as_whole` (PRD #1223,
+# closing audit G1). With `heard_as` a steered pick grounded on any occurrence
+# of one of these words — "tell it to enter the result", "tell it the build has
+# finished", "tell it to go ahead with the refactor" — and the surface presses
+# Enter at once. So the whole utterance must BE one of the entries below, less
+# an edge politeness word ("okay", "please", "now", …): "okay, send it please"
+# still submits, and a sentence that merely contains "send" is dictation or
+# nothing.
+#
 # `screens = ["agent"]` for `dictate_to_agent`'s reason: there is one prompt to
 # send only when there is one pane on screen.
 [[commands]]
@@ -335,7 +355,10 @@ invoke      = "submitAgentPrompt"
 screens     = ["agent"]
 unavailable_hint = "sending a prompt needs an agent's pane open"
 report      = "Sent."
-heard_as    = ["send", "submit", "enter", "go ahead", "end", "finished"]
+heard_as_whole = [
+  "send it", "send", "submit it", "submit", "press enter", "enter", "go ahead", "end",
+  "that is the end", "finished", "the prompt is finished",
+]
 
 # PRD #1223 — open the New agent dialog, and the first row with a `deck_ref`.
 #

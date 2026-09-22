@@ -131,11 +131,21 @@ export const INTENT_DISCLOSURE = "Each command sends the Commands endpoint the w
  * What Names = Shared adds — `prompt::state`, field by field. The narrow fact
  * it closes on is the one to keep true: `prompt::state` carries labels and
  * names only, never an entry's `path`, a deck's `id` or an agent's `id`.
+ *
+ * **Scoped to that payload, and it says so** (PRD #1223, closing audit G2).
+ * The transcript goes with every request and can hold anything the user said,
+ * so "it sends no path" is false of the REQUEST; it is true only of the names
+ * this app observed and added. The last sentence is there so nobody reads the
+ * one before it as a statement about their words.
  */
-export const INTENT_DISCLOSURE_SHARED = "With Names shared it also sends the names on screen: each agent on the selected deck with its role, CLI name, live status and the tool it is running; every deck's label, which for a remote deck is its SSH user, host and any non-default port; while the New agent dialog shows a directory, up to 200 directory names from it and whether it has a parent; the dialog's Mode chips (including the project's orchestration names) and Agent picker entries; and each orchestration's title and roles. It sends no filesystem path, no deck or agent id, no prompt you typed and no tool's arguments.";
+export const INTENT_DISCLOSURE_SHARED = "With Names shared it also sends the names on screen: each agent on the selected deck with its role, CLI name, live status and the tool it is running; every deck's label, which for a remote deck is its SSH user, host and any non-default port; while the New agent dialog shows a directory, up to 200 directory names from it and whether it has a parent; the dialog's Mode chips (including the project's orchestration names) and Agent picker entries; and each orchestration's title and roles. Those names include no filesystem path, no deck or agent id, no prompt text and no tool's arguments. The words you speak are always sent as heard, and may themselves contain a path, an id or anything else you say.";
 
-/** What Names = Withheld leaves out, and what it costs. */
-export const INTENT_DISCLOSURE_WITHHELD = "With Names withheld it sends none of the names on screen, so the commands that name an agent, deck, directory, mode, agent type or orchestration are unavailable.";
+/**
+ * What Names = Withheld leaves out, and what it costs. Withholding drops the
+ * observed-names turn from the request; it does not redact the transcript
+ * (PRD #1223, closing audit G2), which is why the second sentence exists.
+ */
+export const INTENT_DISCLOSURE_WITHHELD = "With Names withheld it sends none of the names this app reads from the screen, so the commands that name an agent, deck, directory, mode, agent type or orchestration are unavailable. It does not redact your words: what you speak is still sent as heard.";
 
 /** The token the speech backend takes when it authenticates with a key. */
 const KEYED = "remote";

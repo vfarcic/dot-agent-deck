@@ -216,7 +216,12 @@ describe("VoicePanel", () => {
     expect(disclosure).toHaveTextContent("the hint shown when it cannot");
     expect(disclosure).toHaveTextContent("the model name and token limit");
     expect(disclosure).toHaveTextContent("your Commands API key in its authentication header");
-    expect(disclosure).toHaveTextContent("It sends no filesystem path, no deck or agent id");
+    // PRD #1223, closing audit G2: the negations are about the app-observed
+    // names only, and the words spoken are said to be always sent.
+    expect(disclosure).toHaveTextContent("Those names include no filesystem path, no deck or agent id");
+    expect(disclosure).toHaveTextContent("The words you speak are always sent as heard, and may themselves contain a path, an id or anything else you say.");
+    expect(disclosure).not.toHaveTextContent("It sends no filesystem path");
+    expect(disclosure).not.toHaveTextContent("no prompt you typed");
     expect(disclosure).not.toHaveTextContent("Never a path, an id");
     const names = screen.getByRole("radiogroup", { name: "Names" });
     expect(within(names).getByLabelText("Shared")).toBeChecked();
@@ -235,6 +240,11 @@ describe("VoicePanel", () => {
     // It withholds the names, not the request: the always-sent part stays.
     expect(disclosure).toHaveTextContent(INTENT_DISCLOSURE);
     expect(disclosure).not.toHaveTextContent("sends nothing else");
+    // PRD #1223, closing audit G2: withholding removes the observed names, not
+    // the user's own words, and says so rather than implying a redaction.
+    expect(disclosure).toHaveTextContent("none of the names this app reads from the screen");
+    expect(disclosure).toHaveTextContent("It does not redact your words: what you speak is still sent as heard.");
+    expect(disclosure).not.toHaveTextContent("sends none of the names on screen");
     expect(within(screen.getByRole("radiogroup", { name: "Names" })).getByLabelText("Withheld")).toBeChecked();
   });
 

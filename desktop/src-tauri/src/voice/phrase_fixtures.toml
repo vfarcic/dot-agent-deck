@@ -301,21 +301,38 @@ outcome = "unavailable"
 
 # `submit_prompt` through the model rather than through the local phrase list,
 # for the reason above: `end`, `send it` and `submit` never reach a backend.
-# This is the phrasing a user reaches for that no whole-utterance list can hold.
+# The model's path is held to the WHOLE utterance too (PRD #1223, closing audit
+# G1), so these are the command said on its own in words the local list does
+# not hold — "send it" wrapped in an edge "okay" / "please". They replaced
+# "okay that's the whole prompt, send it off", which a sentence containing
+# "send" now cannot ground. A bare "go ahead" on the agent screen is NOT here:
+# measured 2026-09-22, the default model answers it with `close` (four runs of
+# four), which grounding refuses — so it submits nothing by voice today, a gap
+# that predates G1 and is reported rather than pinned red.
 
 [[fixtures]]
-name = "submit-that-is-the-whole-prompt"
-utterance = "okay that's the whole prompt, send it off"
+name = "submit-politely"
+utterance = "okay, send it please"
 screen = "agent"
 action = "submit_prompt"
 outcome = "dispatch"
 
 [[fixtures]]
 name = "submit-unavailable"
-utterance = "okay that's the whole prompt, send it off"
+utterance = "okay, send it please"
 screen = "overview"
 action = "submit_prompt"
 outcome = "unavailable"
+
+# A submit word used in passing is a request to TYPE something (G1): "end" is
+# the agent's word to write, not the user's instruction to press Enter.
+[[fixtures]]
+name = "dictate-a-submit-word-in-passing"
+utterance = "tell it to put END after the report"
+screen = "agent"
+action = "dictate_to_agent"
+outcome = "dispatch"
+dictate_prefix = "tell it to"
 
 # PRD #1223 — `open_new_agent`, the first row with a `deck_ref` and the first
 # optional param. The bare phrase must dispatch with no deck; a named deck must

@@ -143,7 +143,8 @@ pub enum VoiceOutcome {
     },
     /// The model picked a row the user's words did not ask for (PRD #1223,
     /// closing audit F1): none of the row's `heard_as` words is in the
-    /// transcript. Refused before anything else about the row is considered,
+    /// transcript, or — for a `heard_as_whole` row — the transcript is not one
+    /// of its entries (closing audit G1). Refused before anything else about the row is considered,
     /// because an observed name written to steer the model is exactly what
     /// produces this, and the honest answer is that the user did not ask.
     ActionUngrounded {
@@ -234,14 +235,23 @@ impl VoiceOutcome {
     }
 
     fn action_ungrounded(transcript: Transcript, row: &CommandRow) -> Self {
-        Self::ActionUngrounded {
-            sentence: heard(
-                &transcript,
-                &format!(
-                    "nothing in that asks for \u{201c}{}\u{201d}, so nothing was done",
-                    row.id
-                ),
+        // A whole-utterance row says how to ask for it, because its words may
+        // well have been in what the user said — "tell it the build has
+        // finished" — and "nothing in that asks" would read as the app not
+        // having heard them.
+        let why = match &row.grounding {
+            ActionGrounding::HeardAsWhole(phrases) => format!(
+                "\u{201c}{}\u{201d} needs to be said on its own, like \u{201c}{}\u{201d}, so nothing was done",
+                row.id,
+                phrases.first().map(String::as_str).unwrap_or_default()
             ),
+            _ => format!(
+                "nothing in that asks for \u{201c}{}\u{201d}, so nothing was done",
+                row.id
+            ),
+        };
+        Self::ActionUngrounded {
+            sentence: heard(&transcript, &why),
             action: row.id.clone(),
             transcript,
         }
@@ -474,7 +484,8 @@ pub async fn handle_utterance_with(
     };
 
     // The ACTION, held against the transcript (PRD #1223, closing audit F1):
-    // the user's words must contain one of the row's `heard_as` entries. First,
+    // the user's words must contain one of the row's `heard_as` entries, or be
+    // one of its `heard_as_whole` entries. First,
     // ahead of availability, because a pick the user did not ask for should be
     // answered as that and not as "not here" — and because it is the one check
     // that covers every row, parameterless ones included. See
@@ -857,8 +868,9 @@ fn local_intercept(
     transcript: &Transcript,
 ) -> Option<VoiceOutcome> {
     let dispatch = |row: &CommandRow, params: Vec<ResolvedParam>| {
-        // Both fast paths' words are in their rows' `heard_as`
-        // (`voice_outcome_the_fast_paths_are_action_grounded`), so this never
+        // Both fast paths' words are in their rows' vocabularies — every
+        // `SUBMIT_PHRASES` entry is a whole `heard_as_whole` entry of
+        // `submit_prompt` — (`voice_outcome_the_fast_paths_are_action_grounded`), so this never
         // refuses a shipped table; it is here so no dispatch is built anywhere
         // without the check.
         if !action_grounded(row, transcript.text()) {
@@ -988,7 +1000,8 @@ const GROUNDING_FILLER: [&str; 52] = [
 /// nothing, "so a thing genuinely NAMED `open` still has a word to be matched
 /// by" — which meant a directory called `open` was grounded by the command verb
 /// of "open docs", and one called `this-directory` by "use this directory". A
-/// name made only of command words cannot be told apart from the command, so
+/// name made only of command or filler words — `run`, `new`, `agent` and `in`
+/// as much as `open` — cannot be told apart from the command, so
 /// [`grounding`] answers [`Grounding::CommandWordsOnly`] for it instead.
 fn content_words(text: &str) -> BTreeSet<String> {
     spoken_words(text)
@@ -1053,7 +1066,8 @@ fn same_word(one: &str, other: &str) -> bool {
 }
 
 /// Whether the transcript asks for `row`'s ACTION (PRD #1223, closing audit
-/// F1): at least one of its `heard_as` entries is [`Heard`] in it.
+/// F1): at least one of its `heard_as` entries is [`Heard`] in it, or, for a
+/// `heard_as_whole` row, the whole utterance is one of its entries (G1).
 ///
 /// # Why it exists
 ///
@@ -1073,6 +1087,17 @@ fn same_word(one: &str, other: &str) -> bool {
 /// user said supports, which is the shape an injected name produces. A row
 /// marked `ungrounded` in the table is exempt, with its reason beside it; no
 /// shipped row is.
+///
+/// # Token presence is too weak for an irreversible row
+///
+/// A `heard_as` entry counts wherever it occurs, so for `submit_prompt` —
+/// whose vocabulary is `send`, `enter`, `end`, `finished`, `go ahead` — "tell
+/// it to put END after the report" would ground a steered pick, and the
+/// surface presses Enter at once (PRD #1223, closing audit G1). Such a row
+/// declares `heard_as_whole` instead, and is grounded only when the WHOLE
+/// utterance is one of its entries ([`whole_utterance`]): the rule the local
+/// fast path already applies through `dictation::SUBMIT_PHRASES`, now applied
+/// to the model's path as well.
 fn action_grounded(row: &CommandRow, transcript: &str) -> bool {
     match &row.grounding {
         ActionGrounding::Exempt(_) => true,
@@ -1080,7 +1105,40 @@ fn action_grounded(row: &CommandRow, transcript: &str) -> bool {
             let heard = Heard::new(transcript);
             phrases.iter().any(|phrase| heard.phrase(phrase))
         }
+        ActionGrounding::HeardAsWhole(phrases) => {
+            let said = whole_utterance(transcript);
+            !said.is_empty() && phrases.iter().any(|phrase| spoken_words(phrase) == said)
+        }
     }
+}
+
+/// Words that may open or close a whole-utterance command without making it a
+/// different request: "okay, send it", "send it now", "yes go ahead please".
+///
+/// **Stripped only at the edges, and only these.** Anything else in the
+/// utterance — a verb, a noun, "tell it to" — makes it a sentence ABOUT the
+/// command rather than the command, which is the distinction
+/// [`ActionGrounding::HeardAsWhole`] exists to draw. A longer list is a looser
+/// rule; add to it only a word that cannot carry content of its own.
+const WHOLE_UTTERANCE_POLITENESS: [&str; 9] = [
+    "okay", "ok", "alright", "yes", "yeah", "please", "just", "now", "thanks",
+];
+
+/// The transcript's [`spoken_words`] — case and punctuation already gone —
+/// less any [`WHOLE_UTTERANCE_POLITENESS`] word at either end. What a
+/// `heard_as_whole` entry is compared against, by equality.
+fn whole_utterance(transcript: &str) -> Vec<String> {
+    let words = spoken_words(transcript);
+    let polite = |word: &String| WHOLE_UTTERANCE_POLITENESS.contains(&word.as_str());
+    let start = words
+        .iter()
+        .position(|word| !polite(word))
+        .unwrap_or(words.len());
+    let end = words
+        .iter()
+        .rposition(|word| !polite(word))
+        .map_or(start, |at| at + 1);
+    words[start..end].to_vec()
 }
 
 /// [`grounding`]'s three answers.
@@ -1194,8 +1252,8 @@ fn refuse_ungrounded(
             safe_message(target)
         ),
         Grounding::CommandWordsOnly => format!(
-            "\u{201c}{}\u{201d} is named only with command words, so it cannot be chosen by \
-             voice \u{2014} choose it by hand",
+            "\u{201c}{}\u{201d} is named only with command or filler words, so it cannot be \
+             chosen by voice \u{2014} choose it by hand",
             safe_message(target)
         ),
     };
@@ -3921,7 +3979,9 @@ mod tests {
             };
             // Said in the row's own words, so the action is grounded and what
             // is left to answer is the screen (PRD #1223, closing audit F1).
-            let ActionGrounding::HeardAs(phrases) = &row.grounding else {
+            let (ActionGrounding::HeardAs(phrases) | ActionGrounding::HeardAsWhole(phrases)) =
+                &row.grounding
+            else {
                 panic!("`{}` is exempt from action grounding", row.id);
             };
             let said = phrases[0].as_str();
@@ -5057,10 +5117,18 @@ mod tests {
                 VoiceOutcome::ActionUngrounded {
                     transcript: Transcript::new("open docs"),
                     action: action.to_string(),
-                    sentence: format!(
-                        "Heard: \u{201c}open docs\u{201d} — nothing in that asks for \
-                         \u{201c}{action}\u{201d}, so nothing was done."
-                    ),
+                    sentence: if action == SUBMIT_ROW {
+                        // The whole-utterance row names its remedy (G1).
+                        "Heard: \u{201c}open docs\u{201d} — \u{201c}submit_prompt\u{201d} \
+                         needs to be said on its own, like \u{201c}send it\u{201d}, so \
+                         nothing was done."
+                            .to_string()
+                    } else {
+                        format!(
+                            "Heard: \u{201c}open docs\u{201d} — nothing in that asks for \
+                             \u{201c}{action}\u{201d}, so nothing was done."
+                        )
+                    },
                 },
                 "{action}"
             );
@@ -5119,11 +5187,9 @@ mod tests {
     #[tokio::test]
     async fn voice_outcome_a_row_asked_for_in_its_own_words_dispatches() {
         for (action, screen, said) in [
-            (
-                "submit_prompt",
-                Screen::Agent,
-                "okay that's the whole prompt, send it off",
-            ),
+            // `submit_prompt` is held to the WHOLE utterance (G1), so its
+            // phrasings here are the command alone, less an edge "okay".
+            ("submit_prompt", Screen::Agent, "okay, send it please"),
             ("submit_prompt", Screen::Agent, "go ahead"),
             ("go_to_parent", Screen::Overview, "go up one level"),
             ("go_to_parent", Screen::Overview, "cd dot dot"),
@@ -5173,6 +5239,132 @@ mod tests {
         }
     }
 
+    // -- whole-utterance grounding (PRD #1223, closing audit G1) -----------
+
+    /// The auditor's four utterances: each contains one of `submit_prompt`'s
+    /// words in passing, and none asks to submit anything.
+    const SUBMIT_WORD_IN_PASSING: [&str; 4] = [
+        "tell it to put END after the report",
+        "tell it to enter the result",
+        "tell it the build has finished",
+        "tell it to go ahead with the refactor",
+    ];
+
+    /// Scenario: with unsent text in an agent's prompt, the user says a
+    /// sentence that merely contains "end", "enter", "finished" or "go ahead",
+    /// and an observed name steers the model to `submit_prompt`. Enter is not
+    /// pressed: the pick is refused as not asked for, with a sentence saying
+    /// the command has to be said on its own.
+    #[tokio::test]
+    async fn voice_outcome_a_submit_word_used_in_passing_does_not_submit() {
+        for said in SUBMIT_WORD_IN_PASSING {
+            let resolver = StubResolver::new().answering(said, IntentAnswer::new(SUBMIT_ROW));
+            let outcome = run_everything(&resolver, Screen::Agent, said).await;
+            assert_eq!(
+                outcome,
+                VoiceOutcome::ActionUngrounded {
+                    transcript: Transcript::new(said),
+                    action: SUBMIT_ROW.to_string(),
+                    sentence: format!(
+                        "Heard: \u{201c}{said}\u{201d} — \u{201c}submit_prompt\u{201d} needs \
+                         to be said on its own, like \u{201c}send it\u{201d}, so nothing was \
+                         done."
+                    ),
+                },
+                "{said}"
+            );
+        }
+    }
+
+    /// Scenario: the same four utterances never reach the local fast path's
+    /// submit either — none IS a submit phrase — so no route presses Enter.
+    #[test]
+    fn voice_outcome_a_submit_word_used_in_passing_is_not_a_fast_path_submit() {
+        let submit = table().row(SUBMIT_ROW).expect("row");
+        for said in SUBMIT_WORD_IN_PASSING {
+            assert!(!action_grounded(submit, said), "{said}");
+            let intercepted = local_intercept(table(), Screen::Agent, &Transcript::new(said));
+            assert!(
+                !matches!(&intercepted, Some(VoiceOutcome::Dispatch { action, .. }) if action == SUBMIT_ROW),
+                "{said}: {intercepted:?}"
+            );
+        }
+    }
+
+    /// Scenario: the user says "send it", "submit" or "go ahead" and nothing
+    /// else — with the transcriber's own casing and punctuation, and an edge
+    /// "okay" or "please" — and the prompt is sent, through the local fast
+    /// path where the phrase is one of `SUBMIT_PHRASES` and through the model
+    /// where it is not.
+    #[tokio::test]
+    async fn voice_outcome_a_whole_submit_utterance_still_submits_on_both_paths() {
+        // The fast path: no model call at all.
+        for said in ["send it", "Submit.", "Send it!", "press enter"] {
+            let resolver = CountingResolver::default();
+            let answer = handle_utterance(
+                &resolver,
+                table(),
+                Screen::Agent,
+                &fleet(),
+                &[],
+                None,
+                None,
+                Transcript::new(said),
+            )
+            .await;
+            assert!(
+                matches!(&answer.outcome, VoiceOutcome::Dispatch { action, .. } if action == SUBMIT_ROW),
+                "{said}: {:?}",
+                answer.outcome
+            );
+            assert_eq!(resolver.calls(), 0, "{said}");
+        }
+        // The model's path, held to the same whole-utterance rule.
+        for said in [
+            "go ahead",
+            "Go ahead.",
+            "okay, send it please",
+            "yes, go ahead",
+            "submit it now",
+            "That is the end.",
+        ] {
+            let resolver = StubResolver::new().answering(said, IntentAnswer::new(SUBMIT_ROW));
+            let outcome = run_everything(&resolver, Screen::Agent, said).await;
+            assert!(
+                matches!(&outcome, VoiceOutcome::Dispatch { action, .. } if action == SUBMIT_ROW),
+                "{said}: {outcome:?}"
+            );
+        }
+        // And the model's check accepts every fast-path phrase too, so the two
+        // paths never disagree about what a submission sounds like.
+        let submit = table().row(SUBMIT_ROW).expect("row");
+        for said in ["send it", "submit", "go ahead"] {
+            assert!(action_grounded(submit, said), "{said}");
+        }
+    }
+
+    #[test]
+    fn voice_outcome_whole_utterance_strips_only_edge_politeness() {
+        assert_eq!(
+            whole_utterance("Okay, send it, please!"),
+            vec!["send", "it"]
+        );
+        assert_eq!(
+            whole_utterance("please just send it now"),
+            vec!["send", "it"]
+        );
+        // Inside the utterance a politeness word is a word like any other.
+        assert_eq!(
+            whole_utterance("send it please now to the reviewer"),
+            vec!["send", "it", "please", "now", "to", "the", "reviewer"]
+        );
+        assert!(whole_utterance("okay please").is_empty());
+        assert!(whole_utterance("").is_empty());
+        let submit = table().row(SUBMIT_ROW).expect("row");
+        assert!(!action_grounded(submit, "okay please"));
+        assert!(!action_grounded(submit, ""));
+    }
+
     #[test]
     fn voice_outcome_heard_phrases_are_adjacent_words_in_order() {
         let heard = Heard::new("Okay, go ahead!");
@@ -5218,8 +5410,8 @@ mod tests {
                     spoken: dir.to_string(),
                     sentence: format!(
                         "Heard: \u{201c}{said}\u{201d} — \u{201c}{target}\u{201d} is named only \
-                         with command words, so it cannot be chosen by voice \u{2014} choose it \
-                         by hand."
+                         with command or filler words, so it cannot be chosen by voice \u{2014} \
+                         choose it by hand."
                     ),
                 },
                 "{said:?}"
