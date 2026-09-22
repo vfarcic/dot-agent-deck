@@ -1224,6 +1224,106 @@ fn both_checksum_manifests_are_attested_subjects() {
     );
 }
 
+/// The index of the first step in `steps` whose code (comments stripped)
+/// satisfies `pred`, or a panic naming `what` when none does.
+fn step_index(steps: &[String], what: &str, pred: impl Fn(&str) -> bool) -> usize {
+    steps
+        .iter()
+        .position(|s| pred(&step_code(s)))
+        .unwrap_or_else(|| panic!("no step {what}"))
+}
+
+/// Each manifest's artifact upload sits IMMEDIATELY after the step that
+/// publishes it, and in `finalize` before the steps that write more files into
+/// `dist/`.
+///
+/// This is what makes "the attested bytes are the published bytes" true, and
+/// [`both_checksum_manifests_are_attested_subjects`] cannot see it: that test
+/// pins WHICH artifact carries each manifest, not WHEN it is uploaded. Both of
+/// these edits would leave it green while attesting a file the release may not
+/// carry:
+///
+/// - moving the upload above the publish step, so a step inserted between the
+///   two could rewrite the manifest after it travelled and before it shipped;
+/// - moving `finalize`'s upload below `task homebrew-formula` /
+///   `task scoop-manifest`, which write `dist/<name>.rb` and `dist/<name>.json`
+///   into the directory the manifest lives in.
+///
+/// Asserted as adjacency rather than mere precedence, because the property the
+/// upload steps' comments claim is "nothing between the publish and the
+/// upload", and precedence alone would let a writer slip in between.
+#[test]
+fn manifest_uploads_directly_follow_the_steps_that_publish_them() {
+    let all = jobs(&workflow());
+
+    let finalize = steps(job(&all, "finalize"));
+    let generate = step_index(&finalize, "runs `task checksums`", |c| {
+        c.contains("run: task checksums")
+    });
+    let publish = step_index(&finalize, "creates the GitHub release", |c| {
+        c.contains("softprops/action-gh-release@")
+    });
+    let upload = step_index(&finalize, "uploads `dist/checksums.txt`", |c| {
+        c.contains("actions/upload-artifact@")
+            && c.lines().any(|l| l.trim() == "path: dist/checksums.txt")
+    });
+    let formula = step_index(&finalize, "runs `task homebrew-formula`", |c| {
+        c.contains("task homebrew-formula")
+    });
+    assert!(
+        generate < publish,
+        "`finalize` publishes the release before `task checksums` has written the manifest"
+    );
+    assert_eq!(
+        upload,
+        publish + 1,
+        "`finalize`'s `release-checksums` upload is no longer the step directly after the \
+         release step (upload at {upload}, release at {publish}). What travels to `attest` must \
+         be the file the release carried, with nothing in between able to rewrite it. #1152."
+    );
+    assert!(
+        upload < formula,
+        "`finalize` uploads `dist/checksums.txt` after `task homebrew-formula`, which writes into \
+         `dist/` as well. #1152."
+    );
+
+    let desktop = steps(job(&all, "desktop-publish"));
+    let generate = step_index(&desktop, "writes `checksums-desktop-alpha.txt`", |c| {
+        c.contains("> checksums-desktop-alpha.txt")
+    });
+    let publish = step_index(&desktop, "runs `gh release upload`", |c| {
+        c.contains("gh release upload")
+    });
+    let upload = step_index(
+        &desktop,
+        "uploads `dist-desktop/checksums-desktop-alpha.txt`",
+        |c| {
+            c.contains("actions/upload-artifact@")
+                && c.lines()
+                    .any(|l| l.trim() == "path: dist-desktop/checksums-desktop-alpha.txt")
+        },
+    );
+    let note = step_index(&desktop, "appends the alpha note", |c| {
+        c.contains("gh release edit")
+    });
+    assert!(
+        generate < publish,
+        "`desktop-publish` uploads the release assets before the desktop manifest is written"
+    );
+    assert_eq!(
+        upload,
+        publish + 1,
+        "`desktop-publish`'s `release-checksums-desktop` upload is no longer the step directly \
+         after `gh release upload` (upload at {upload}, release upload at {publish}). #1152."
+    );
+    assert!(
+        upload < note,
+        "`desktop-publish` appends the note claiming the manifest carries provenance before it \
+         hands the manifest to `attest`. `attest` refuses a missing manifest exactly when this job \
+         succeeded, which is only sound if the artifact exists whenever the claim does. #1152."
+    );
+}
+
 /// The shell body of `attest`'s "Collect the subjects to attest" step.
 ///
 /// Extracted the way [`clamp_script`] extracts the release-body clamp, and for
@@ -1343,12 +1443,21 @@ fn run_subjects(files: &[&str], desktop_result: &str) -> Option<SubjectsRun> {
     // codebase has never previously asked of a script this size, unlike every
     // other cross-platform harness test here. A file sidesteps the whole
     // question: bash opens and reads it directly, so there is nothing for
-    // argv-quoting to get wrong. (This is exactly the failure mode that made
-    // `a_full_release_attests_every_asset_it_publishes` and its siblings fail
-    // on `build-windows` in the first version of this harness, PR #1227.)
+    // argv-quoting to get wrong. (This was the first suspect when
+    // `a_full_release_attests_every_asset_it_publishes` and its siblings failed
+    // on `build-windows` in PR #1227, but the log showed the real cause: the
+    // WSL launcher stub answering to `bash`, which the presence check above
+    // now screens out. The file is kept because it removes the question.)
+    //
+    // Invoked with the flags GitHub Actions itself uses for `shell: bash` --
+    // `bash --noprofile --norc -eo pipefail {0}` -- so the harness runs the
+    // step the way the runner does. The script sets `-eu` on its own, but
+    // `pipefail` comes only from the runner, and the collector has pipelines
+    // (`find ... | sort`) whose behaviour it changes.
     let script_path = dir.path().join("collect-subjects.sh");
     fs::write(&script_path, subjects_script()).expect("write the collector script");
     let out = Command::new("bash")
+        .args(["--noprofile", "--norc", "-eo", "pipefail"])
         .arg(&script_path)
         .current_dir(dir.path())
         .env("GITHUB_OUTPUT", &out_path_arg)
