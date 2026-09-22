@@ -93,6 +93,36 @@ async function reachForm() {
   await screen.findByTestId("new-agent-form");
 }
 
+describe("New agent dialog — closing (PRD #1223 U2)", () => {
+  /**
+   * Scenario: walk the three steps. None of them has a Cancel button — the
+   * header's X is the one close control, as on every other sheet here — and
+   * the X, Esc and a backdrop click each close the dialog from every step.
+   */
+  it("has no Cancel on any step and closes by the X, Esc and the backdrop", async () => {
+    const runtime = fakeRuntime();
+    const { onClose } = renderDialog(runtime);
+    const noCancel = () => expect(within(screen.getByTestId("new-agent-dialog")).queryByRole("button", { name: /cancel/i })).toBeNull();
+
+    noCancel();
+    fireEvent.click(screen.getByRole("button", { name: "Close new agent" }));
+    fireEvent.keyDown(deckList(), { key: "Enter" });
+    await currentPath("/home/dev");
+    noCancel();
+    fireEvent.keyDown(screen.getByTestId("new-agent-dialog"), { key: "Escape" });
+    fireEvent.keyDown(directoryList(), { key: "j" });
+    fireEvent.keyDown(directoryList(), { key: "Enter" });
+    await currentPath("/home/dev/beta");
+    fireEvent.keyDown(directoryList(), { key: "Enter" });
+    await currentPath("/home/dev/beta/leaf");
+    fireEvent.keyDown(directoryList(), { key: "Enter" });
+    await screen.findByTestId("new-agent-form");
+    noCancel();
+    fireEvent.mouseDown(screen.getByTestId("new-agent-backdrop"));
+    expect(onClose).toHaveBeenCalledTimes(3);
+  });
+});
+
 describe("New agent dialog — deck step (PRD #1223 M4)", () => {
   /**
    * Scenario: open the flow over a fleet of four decks — one connected, one
@@ -546,9 +576,9 @@ describe("New agent dialog — a start in flight (PRD #1223 audit F5)", () => {
   }
 
   /**
-   * Scenario: Start is pressed and the deck has not answered. Cancel and the
-   * header's close button are disabled and say why, and neither Esc nor a
-   * backdrop click closes the dialog. Once the deck refuses the start, the
+   * Scenario: Start is pressed and the deck has not answered. The header's
+   * close button is disabled and says why, and neither Esc nor a backdrop
+   * click closes the dialog. Once the deck refuses the start, the
    * refusal is shown and every way out works again.
    */
   it("cannot be closed until the deck answers the start", async () => {
@@ -559,10 +589,10 @@ describe("New agent dialog — a start in flight (PRD #1223 audit F5)", () => {
 
     fireEvent.click(screen.getByTestId("new-agent-start"));
     expect(await screen.findByTestId("new-agent-starting")).toHaveTextContent("Waiting for the deck to answer the start");
-    expect(screen.getByTestId("new-agent-cancel")).toBeDisabled();
-    expect(screen.getByRole("button", { name: "Close new agent" })).toBeDisabled();
-    fireEvent.click(screen.getByTestId("new-agent-cancel"));
-    fireEvent.click(screen.getByRole("button", { name: "Close new agent" }));
+    const close = screen.getByRole("button", { name: "Close new agent" });
+    expect(close).toBeDisabled();
+    expect(close).toHaveAttribute("title", expect.stringContaining("Waiting for the deck to answer the start"));
+    fireEvent.click(close);
     fireEvent.keyDown(screen.getByTestId("new-agent-dialog"), { key: "Escape" });
     fireEvent.mouseDown(screen.getByTestId("new-agent-backdrop"));
     expect(onClose).not.toHaveBeenCalled();
@@ -571,10 +601,10 @@ describe("New agent dialog — a start in flight (PRD #1223 audit F5)", () => {
 
     expect(await screen.findByTestId("new-agent-error")).toHaveTextContent("did not answer the start within 15s");
     expect(screen.queryByTestId("new-agent-starting")).toBeNull();
-    expect(screen.getByTestId("new-agent-cancel")).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Close new agent" })).toBeEnabled();
     fireEvent.keyDown(screen.getByTestId("new-agent-dialog"), { key: "Escape" });
     fireEvent.mouseDown(screen.getByTestId("new-agent-backdrop"));
-    fireEvent.click(screen.getByTestId("new-agent-cancel"));
+    fireEvent.click(screen.getByRole("button", { name: "Close new agent" }));
     expect(onClose).toHaveBeenCalledTimes(3);
   });
 
@@ -584,7 +614,7 @@ describe("New agent dialog — a start in flight (PRD #1223 audit F5)", () => {
    * is left inside it and none outside either — the background is inert — and
    * the dialog itself is the focus target that is left. The sentence explaining
    * why nothing answers is a live region, which is the only way a screen reader
-   * learns it: a disabled Cancel announces neither itself nor the `title` that
+   * learns it: a disabled close button announces neither itself nor the `title` that
    * carries the same explanation for a sighted user.
    *
    * **What this tier proves is the markup, not the focus outcome.** Measured by
@@ -617,7 +647,7 @@ describe("New agent dialog — a start in flight (PRD #1223 audit F5)", () => {
 
     await act(async () => held.settle().reject(new Error("the deck did not answer the start within 15s")));
     await screen.findByTestId("new-agent-error");
-    expect(screen.getByTestId("new-agent-cancel")).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Close new agent" })).toBeEnabled();
   });
 
   /**

@@ -215,8 +215,8 @@ export function NewAgentDialog({ runtime, initialDeckId, onClose, onAppeared, on
   }, []);
 
   /**
-   * Every way out of the dialog — Cancel, the header's close button, Esc, a
-   * backdrop click and the directory step's `q` — and none of them works while
+   * Every way out of the dialog — the header's close button, Esc, a backdrop
+   * click and the directory step's `q` — and none of them works while
    * a start is in flight (PRD #1223 audit F5). Closing then would unmount the
    * one place a failure is explained, while the action itself carries on.
    *
@@ -759,7 +759,6 @@ export function NewAgentDialog({ runtime, initialDeckId, onClose, onAppeared, on
     );
     footer = (
       <>
-        <button type="button" className="button secondary" onClick={requestClose}>Cancel</button>
         <button type="button" className="button primary" data-testid="new-agent-deck-next" disabled={!highlighted || highlighted.reason !== undefined} onClick={() => confirmDeck(highlighted)}>Next</button>
       </>
     );
@@ -836,7 +835,6 @@ export function NewAgentDialog({ runtime, initialDeckId, onClose, onAppeared, on
     footer = (
       <>
         <button type="button" ref={directoryBackRef} className="button secondary" data-testid="new-agent-directory-back" onClick={() => { listingSeq.current += 1; setStep("deck"); setDeck(undefined); }}><ArrowLeft size={14} /> Back</button>
-        <button type="button" className="button secondary" onClick={requestClose}>Cancel</button>
         {listing?.parent !== undefined && <button type="button" className="button secondary" onClick={goUp}><ArrowUp size={14} /> Up</button>}
         <button type="button" className="button primary" data-testid="new-agent-use-directory" disabled={!listing} onClick={confirmCurrent}><Check size={14} /> Use this directory</button>
       </>
@@ -946,12 +944,15 @@ export function NewAgentDialog({ runtime, initialDeckId, onClose, onAppeared, on
         {/*
             `role="status"`, because in this one phase there is nothing left to
             read it off. Audit F5 blocks every close route while a start is in
-            flight by DISABLING the controls — Cancel, the header's close
-            button, Back, Start and the fields all at once — and a disabled
-            button is neither focusable nor announced, so Cancel's `title`
-            explaining the block is invisible to a screen reader. Focus falls
-            back to the dialog itself (see `tabIndex` below), and this is what
-            tells a listener why nothing answers.
+            flight by DISABLING the controls — the header's close button, Back,
+            Start and the fields all at once — and a disabled button is neither
+            focusable nor announced, so the close button's `title` explaining
+            the block is invisible to a screen reader. Focus falls back to the
+            dialog itself (see `tabIndex` below, and `useInertBackground`, which
+            moves it there when the pressed Start is blurred), and this is what
+            tells a listener why nothing answers. There is no Cancel button
+            (PRD #1223 U2): it was the same close as the header's X, and no
+            other dialog here has both.
         */}
         {starting && <p className="new-agent-hint" role="status" data-testid="new-agent-starting"><Loader2 className="spin" size={12} /> {STARTING_CLOSE_BLOCKED}</p>}
         {phase === "waiting" && <p className="new-agent-hint" data-testid="new-agent-waiting"><Loader2 className="spin" size={12} /> Started. Waiting for the deck to list it…</p>}
@@ -960,7 +961,6 @@ export function NewAgentDialog({ runtime, initialDeckId, onClose, onAppeared, on
     footer = (
       <>
         <button type="button" className="button secondary" disabled={busy} onClick={() => setStep("directory")}><ArrowLeft size={14} /> Back</button>
-        <button type="button" className="button secondary" data-testid="new-agent-cancel" disabled={starting} title={starting ? STARTING_CLOSE_BLOCKED : undefined} onClick={requestClose}>Cancel</button>
         <button type="submit" form={`${titleId}-form`} className="button primary" data-testid="new-agent-start" disabled={busy || titleTaken}>
           {phase === "idle" ? <><Plus size={14} /> {selectedOrchestration ? "Start orchestration" : "Start agent"}</> : phase === "starting" ? "Starting…" : "Opening…"}
         </button>
