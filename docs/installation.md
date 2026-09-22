@@ -86,7 +86,7 @@ nix profile install github:vfarcic/dot-agent-deck
 }
 ```
 
-The `follows` line is the usual tradeoff: one nixpkgs in your closure instead of two, paid for by building against a nixpkgs this project has not tested against, which has to be recent enough to carry rustc 1.85 or newer.
+The `follows` line is the usual tradeoff: one nixpkgs in your closure instead of two, paid for by building against a nixpkgs this project has not tested against, which has to be recent enough to carry rustc 1.93.1 or newer.
 
 **Via the overlay.** If you would rather reach it as `pkgs.dot-agent-deck` everywhere, apply the overlay instead:
 
@@ -98,7 +98,7 @@ The `follows` line is the usual tradeoff: one nixpkgs in your closure instead of
 }
 ```
 
-The overlay always builds against *your* nixpkgs, never the pinned one, so that rustc 1.85 minimum applies here whether or not you set `follows`. The crate is edition 2024, which is where the floor comes from.
+The overlay always builds against *your* nixpkgs, never the pinned one, so that rustc 1.93.1 minimum applies here whether or not you set `follows`. The number is the workspace's declared `rust-version` in `Cargo.toml`, so a nixpkgs carrying an older rustc stops immediately with cargo's own `rustc <version> is not supported by the following packages` message rather than failing part-way through the compile with something that looks unrelated to the toolchain. It is measured — the oldest toolchain the whole workspace has been verified to compile on — and not the edition-2024 floor this page used to cite: that one (1.85) is several releases lower and was never tested. It is also deliberately *lower* than the toolchain this project builds and tests with, so a nixpkgs a few releases behind current stable still works.
 
 ### The home-manager module
 
@@ -160,6 +160,8 @@ cargo build --release
 ```
 
 The binary will be at `target/release/dot-agent-deck`.
+
+Needs rustc 1.93.1 or newer. That is the workspace's declared `rust-version`, which cargo checks before it compiles anything, so an older toolchain stops with `rustc <version> is not supported by the following packages` rather than failing further into the build with something that looks unrelated to the toolchain. It is the oldest toolchain the workspace is verified to compile on — the project itself is developed and tested against a newer one, pinned in `devbox.json`, so the minimum is deliberately a floor and not the version we build with.
 
 ## Verify
 

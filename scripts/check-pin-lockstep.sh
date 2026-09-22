@@ -52,6 +52,18 @@
 # this script never needs touching when a pin moves — only when a new pin class
 # starts being duplicated across the two.
 #
+# `rust-version` IS NOT SUCH A CLASS, and that is a decision rather than an
+# omission (issue #451). The root `Cargo.toml`'s `[workspace.package]` declares
+# a minimum supported toolchain, and it is a FLOOR THAT LAGS THE PIN: the pins
+# above answer "what do we build and test with", the floor answers "what is the
+# oldest rustc that still compiles this", and the two are equal only by
+# accident. Reading the floor here would force every six-weekly Renovate
+# toolchain bump to raise it too, which would narrow what downstream packagers
+# can build with by construction — the harm #451 reported, with the sign
+# flipped. So a toolchain-bump PR touches these two files and NOT `Cargo.toml`.
+# Raising the floor is a separate, deliberately measured change;
+# `docs/develop/versioning.md` has the procedure and what the lag costs.
+#
 # Usage: scripts/check-pin-lockstep.sh [REPO_ROOT]
 # Exit:  0 = the pins agree, 1 = they do not (details on stderr).
 

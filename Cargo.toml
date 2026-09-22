@@ -8,10 +8,45 @@ members = [
     "xtask/spec",
 ]
 
+# Issue #451 — the MINIMUM SUPPORTED TOOLCHAIN, inherited by every member below
+# via `rust-version.workspace = true`. Cargo refuses an older rustc up front and
+# names this number, instead of letting the build die somewhere inside a
+# dependency with an error that looks unrelated to the toolchain.
+#
+# THIS IS A FLOOR THAT LAGS THE PIN, NOT A THIRD PIN. `devbox.json` and
+# `.github/workflows/` pin one toolchain version between them, and
+# `scripts/check-pin-lockstep.sh` fails the build when those two disagree,
+# because `cargo test-fast` in a devbox shell and `cargo nextest run` in CI are
+# the same claim only while they match. (That version is deliberately not quoted
+# here — read it off `devbox.json`. Issue #648: a version written into prose
+# rots on the next bump with nothing to catch it.) This field answers a
+# different question: the OLDEST rustc that still compiles the workspace, which
+# is what somebody building from source needs — the Nix overlay path in
+# `docs/installation.md` builds against whatever rustc the consumer's nixpkgs
+# carries, never the one this flake pins. The two numbers coincide only by
+# accident, so the lockstep guard deliberately does not read this one, and a
+# Renovate toolchain bump must NOT touch it: moving the floor with the pin would
+# narrow what we support every six weeks BY CONSTRUCTION, which is #451's
+# complaint with the sign flipped.
+#
+# 1.93.1 is MEASURED, not the edition-2024 floor (1.85) `docs/installation.md`
+# used to cite. On 2026-09-22 `cargo +1.93.1 check --locked --workspace
+# --all-targets --features e2e,e2e-live` passed, covering all 88 `e2e_*` test
+# targets, and the same command on 1.93.0 failed before compiling anything with
+# `serial_test@4.0.1 requires rustc 1.93.1`. So the floor is tight, and TODAY IT
+# IS SET BY A LOCKED DEPENDENCY rather than by anything under `src/`.
+#
+# What moves it is therefore the LOCKFILE, not the toolchain pin, and nothing
+# re-measures it automatically. `docs/develop/versioning.md` has the decision,
+# the re-measurement procedure, and what the lag costs.
+[workspace.package]
+rust-version = "1.93.1"
+
 [package]
 name = "dot-agent-deck"
 version = "0.1.0"
 edition = "2024"
+rust-version.workspace = true
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }

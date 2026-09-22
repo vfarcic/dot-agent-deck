@@ -3,9 +3,14 @@
 
   # nixpkgs and flake-utils, plus crane for the build itself.
   #
-  # No rust-overlay: the crate is edition 2024, which needs rustc 1.85 or newer,
-  # and nixos-unstable already ships a stable rustc well past that. An extra
-  # input would be one more thing for consumers to keep locked for no gain.
+  # No rust-overlay: the workspace declares a minimum supported toolchain —
+  # `rust-version` in the root Cargo.toml's `[workspace.package]`, issue #451,
+  # where the number and the reasoning live — and nixos-unstable already ships a
+  # stable rustc well past it. An extra input would be one more thing for
+  # consumers to keep locked for no gain. Note that pinning nixpkgs here does
+  # NOT protect the OVERLAY path, which builds against the consumer's own
+  # nixpkgs: the declared floor is what covers that, by making cargo refuse a
+  # too-old rustc and name it.
   #
   # crane is the one input that does earn its keep. It splits the build in two,
   # compiling the dependency closure as a derivation of its own, so a change to
