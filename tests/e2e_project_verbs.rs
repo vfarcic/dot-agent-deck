@@ -36,11 +36,17 @@
 
 mod common;
 
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use common::DaemonProc;
-use dot_agent_deck::daemon_protocol::{AttachRequest, PROJECT_ERR_UNIMPLEMENTED, TabMembership};
+use dot_agent_deck::daemon_protocol::{
+    AttachRequest, KIND_REQ, KIND_RESP, PROJECT_ERR_STALE_PREPARATION, PROJECT_ERR_UNIMPLEMENTED,
+    PROTOCOL_VERSION, TabMembership,
+};
+use dot_agent_deck::event::AgentType;
+use serde_json::{Value, json};
 use spec::spec;
 
 /// A project whose single orchestration is NAMED, so nothing about it depends
@@ -85,6 +91,25 @@ command = "cat"
 description = "Implements the requested change"
 "#;
 
+/// Both role commands stay alive after writing their distinct token so
+/// `ListAgents` can prove which configured agent declaration and orchestration
+/// membership the daemon recorded for each spawn.
+const CONFIGURED_COMMAND_PROJECT_TOML: &str = r#"
+[[orchestrations]]
+name = "configured-commands"
+
+[[orchestrations.roles]]
+name = "planner"
+command = "sh -c 'echo planner-configured >> configured-commands.log; sleep 600'"
+agent = "opencode"
+start = true
+
+[[orchestrations.roles]]
+name = "builder"
+command = "sh -c 'echo builder-configured >> configured-commands.log; sleep 600'"
+agent = "pi"
+"#;
+
 /// Create `parent/name`, and drop a `.dot-agent-deck.toml` in it when `config`
 /// is `Some`. `None` makes an ordinary directory — a perfectly legitimate agent
 /// cwd, and not a project.
@@ -112,6 +137,96 @@ fn wire_path(path: &Path) -> String {
     path.to_str()
         .unwrap_or_else(|| panic!("harness paths are UTF-8: {}", path.display()))
         .to_string()
+}
+
+/// Send a JSON request through the attach protocol without constructing an
+/// `AttachRequest`. `project/launch/005` must compile before its additive
+/// `use_configured_command` field exists in the typed request enum, so that one
+/// scenario deliberately pins the public JSON shape directly.
+fn send_json_request(daemon: &DaemonProc, request: &Value) -> Value {
+    let mut stream = std::os::unix::net::UnixStream::connect(&daemon.attach_socket)
+        .expect("connect to the daemon attach socket");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .expect("set attach read timeout");
+    stream
+        .set_write_timeout(Some(Duration::from_secs(10)))
+        .expect("set attach write timeout");
+
+    let payload = serde_json::to_vec(request).expect("serialize raw attach request");
+    let mut header = [0_u8; 5];
+    header[0] = KIND_REQ;
+    header[1..].copy_from_slice(&(payload.len() as u32).to_be_bytes());
+    stream.write_all(&header).expect("write request header");
+    stream.write_all(&payload).expect("write request payload");
+    stream.flush().expect("flush request");
+
+    let mut response_header = [0_u8; 5];
+    stream
+        .read_exact(&mut response_header)
+        .expect("read response header");
+    assert_eq!(
+        response_header[0], KIND_RESP,
+        "raw attach request must receive a RESP frame"
+    );
+    let len = u32::from_be_bytes([
+        response_header[1],
+        response_header[2],
+        response_header[3],
+        response_header[4],
+    ]) as usize;
+    let mut body = vec![0_u8; len];
+    stream.read_exact(&mut body).expect("read response payload");
+    serde_json::from_slice(&body).expect("response payload is JSON")
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepared_role_request(
+    prep_token: &str,
+    project: &str,
+    role_index: usize,
+    role_name: &str,
+    is_start_role: bool,
+    pane_id: &str,
+    command: Option<&str>,
+    use_configured_command: bool,
+) -> Value {
+    let mut request = json!({
+        "op": "start-prepared-agent",
+        "prep_token": prep_token,
+        "cwd": project,
+        "rows": 24,
+        "cols": 80,
+        "env": [["DOT_AGENT_DECK_PANE_ID", pane_id]],
+        "display_name": role_name,
+        "tab_membership": {
+            "kind": "orchestration",
+            "name": "configured-commands",
+            "role_index": role_index,
+            "role_name": role_name,
+            "is_start_role": is_start_role,
+            "orchestration_cwd": project,
+            "display_title": "Configured command run",
+            "orchestration_id": "project-launch-005-run",
+        },
+    });
+    if let Some(command) = command {
+        request["command"] = json!(command);
+    }
+    if use_configured_command {
+        request["use_configured_command"] = json!(true);
+    }
+    request
+}
+
+fn sorted_agent_ids(daemon: &DaemonProc) -> Vec<String> {
+    let mut ids: Vec<String> = daemon
+        .agent_records()
+        .into_iter()
+        .map(|record| record.id)
+        .collect();
+    ids.sort();
+    ids
 }
 
 /// The process's working directory as it was when this was taken, restored on
@@ -809,5 +924,278 @@ fn project_launch_004_empty_task_omits_the_task_section_and_preserves_the_run_ti
         control_prepared.prompt.contains("## Your task"),
         "the non-empty control pointer must direct the coordinator to its task; got {:?}",
         control_prepared.prompt
+    );
+}
+
+/// Scenario: Prepare a two-role workflow and opt each prepared start into the
+/// daemon-side role command, proving both configured stand-ins run and retain
+/// their role membership and declared agent type. Conflicting explicit-command
+/// and stale-config starts are refused, while an unflagged explicit command
+/// remains the compatibility control.
+#[spec("project/launch/005")]
+#[test]
+fn project_launch_005_prepared_roles_use_their_daemon_configured_commands() {
+    let daemon = common::spawn_daemon_serve_with_env(None, "0", &[]);
+    let workspace = common::harness_tempdir().expect("mint the project sandbox");
+    let project = canonical(&make_dir(
+        workspace.path(),
+        "configured-command-project",
+        Some(CONFIGURED_COMMAND_PROJECT_TOML),
+    ));
+    let project_wire = wire_path(&project);
+    let config_path = project.join(".dot-agent-deck.toml");
+    let configured_log = project.join("configured-commands.log");
+
+    let hello = send_json_request(
+        &daemon,
+        &json!({
+            "op": "hello",
+            "client_version": PROTOCOL_VERSION,
+        }),
+    );
+    let capabilities = hello
+        .get("capabilities")
+        .and_then(Value::as_array)
+        .unwrap_or_else(|| panic!("Hello must carry capabilities; response: {hello}"));
+    let advertises_prepared_role_command = capabilities
+        .iter()
+        .any(|capability| capability == "prepared-role-command");
+
+    let prepare_response = daemon
+        .send_attach_request(&AttachRequest::PrepareWorkflow {
+            path: project_wire.clone(),
+            orchestration: "configured-commands".into(),
+            task: String::new(),
+            config_revision: None,
+        })
+        .expect("PrepareWorkflow over the attach socket");
+    assert!(
+        prepare_response.ok,
+        "PrepareWorkflow must accept the configured-command fixture; error: {:?}",
+        prepare_response.error
+    );
+    let prepared = prepare_response
+        .workflow_prepared
+        .expect("a successful preparation must carry a PreparedWorkflow");
+    assert_eq!(
+        prepared.roles.len(),
+        2,
+        "the fixture must project exactly its planner and builder roles"
+    );
+
+    let expected_roles = [
+        ("planner", true, AgentType::OpenCode),
+        ("builder", false, AgentType::Pi),
+    ];
+    let mut configured_start_ids = Vec::new();
+    for (role_name, is_start_role, _) in &expected_roles {
+        let (role_index, role) = prepared
+            .roles
+            .iter()
+            .enumerate()
+            .find(|(_, role)| role.name == *role_name)
+            .unwrap_or_else(|| panic!("prepared roles must contain {role_name:?}"));
+        assert_eq!(
+            role.start, *is_start_role,
+            "prepared role {role_name:?} must retain its configured start flag"
+        );
+        let pane_id = format!("project-launch-005-{role_name}");
+        let response = send_json_request(
+            &daemon,
+            &prepared_role_request(
+                &prepared.token,
+                &project_wire,
+                role_index,
+                role_name,
+                *is_start_role,
+                &pane_id,
+                None,
+                true,
+            ),
+        );
+        assert_eq!(
+            response.get("ok").and_then(Value::as_bool),
+            Some(true),
+            "configured start for role {role_name:?} must succeed; response: {response}"
+        );
+        configured_start_ids.push(
+            response
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or_else(|| {
+                    panic!("configured start for role {role_name:?} returned no id: {response}")
+                })
+                .to_string(),
+        );
+    }
+
+    let records = daemon.wait_for_agent_count(expected_roles.len(), Duration::from_secs(10));
+    let mut role_observations = Vec::new();
+    let mut role_metadata_matches = true;
+    for (role_name, is_start_role, agent) in &expected_roles {
+        let pane_id = format!("project-launch-005-{role_name}");
+        let Some(record) = records.iter().find(|record| {
+            configured_start_ids.contains(&record.id)
+                && record.pane_id_env.as_deref() == Some(pane_id.as_str())
+        }) else {
+            role_observations.push(format!("{role_name}: missing from {records:?}"));
+            role_metadata_matches = false;
+            continue;
+        };
+        let membership_matches = matches!(
+            record.tab_membership.as_ref(),
+            Some(TabMembership::Orchestration {
+                name,
+                role_name: recorded_role,
+                is_start_role: recorded_start,
+                orchestration_cwd: Some(cwd),
+                display_title: Some(title),
+                orchestration_id: Some(orchestration_id),
+                ..
+            }) if name == "configured-commands"
+                && recorded_role == role_name
+                && recorded_start == is_start_role
+                && cwd == &project_wire
+                && title == "Configured command run"
+                && orchestration_id == "project-launch-005-run"
+        );
+        role_observations.push(format!(
+            "{role_name}: agent={:?}, membership={:?}",
+            record.agent_type, record.tab_membership
+        ));
+        role_metadata_matches &= record.display_name.as_deref() == Some(*role_name)
+            && record.agent_type.as_ref() == Some(agent)
+            && membership_matches;
+    }
+
+    let configured_wait = common::wait_for_file_lines(
+        &configured_log,
+        expected_roles.len(),
+        Duration::from_secs(5),
+    );
+    let configured_output = std::fs::read_to_string(&configured_log).unwrap_or_default();
+    let configured_commands_ran = configured_wait.is_ok()
+        && configured_output
+            .lines()
+            .any(|line| line == "planner-configured")
+        && configured_output
+            .lines()
+            .any(|line| line == "builder-configured");
+
+    let conflict_marker = project.join("conflicting-command.marker");
+    let before_conflict = sorted_agent_ids(&daemon);
+    let conflict_response = send_json_request(
+        &daemon,
+        &prepared_role_request(
+            &prepared.token,
+            &project_wire,
+            0,
+            "planner",
+            true,
+            "project-launch-005-conflict",
+            Some("sh -c 'echo conflicting-command > conflicting-command.marker; sleep 600'"),
+            true,
+        ),
+    );
+    let conflict_refused = conflict_response.get("ok").and_then(Value::as_bool) == Some(false)
+        && conflict_response
+            .get("error")
+            .and_then(Value::as_str)
+            .is_some_and(|error| !error.is_empty())
+        && conflict_response.get("id").is_none_or(Value::is_null);
+    if !conflict_refused {
+        let _ = common::wait_for_file_trimmed_eq(
+            &conflict_marker,
+            "conflicting-command",
+            Duration::from_secs(5),
+        );
+    }
+    let conflict_started_nothing =
+        before_conflict == sorted_agent_ids(&daemon) && !conflict_marker.exists();
+
+    // Compatibility control: without the opt-in field, an explicit command is
+    // still the command that runs. This is deliberately raw JSON too, so
+    // accidentally defaulting an absent field to true cannot hide behind the
+    // typed request constructor.
+    let control_marker = project.join("explicit-control.marker");
+    let control_response = send_json_request(
+        &daemon,
+        &prepared_role_request(
+            &prepared.token,
+            &project_wire,
+            1,
+            "builder",
+            false,
+            "project-launch-005-control",
+            Some("sh -c 'echo explicit-control > explicit-control.marker; sleep 600'"),
+            false,
+        ),
+    );
+    assert_eq!(
+        control_response.get("ok").and_then(Value::as_bool),
+        Some(true),
+        "an unflagged prepared start with an explicit command must retain its existing behavior; \
+         response: {control_response}"
+    );
+    common::wait_for_file_trimmed_eq(&control_marker, "explicit-control", Duration::from_secs(5))
+        .unwrap_or_else(|observation| {
+            panic!("the unflagged explicit-command control did not run: {observation}")
+        });
+
+    // The daemon already revalidates every prepared start. Pin the flagged
+    // variant specifically so resolving the configured command cannot bypass
+    // that gate when the implementation re-reads the role config.
+    std::fs::write(
+        &config_path,
+        format!("{CONFIGURED_COMMAND_PROJECT_TOML}\n# revision changed after preparation\n"),
+    )
+    .unwrap_or_else(|e| panic!("modify {}: {e}", config_path.display()));
+    let before_stale = sorted_agent_ids(&daemon);
+    let stale_response = send_json_request(
+        &daemon,
+        &prepared_role_request(
+            &prepared.token,
+            &project_wire,
+            1,
+            "builder",
+            false,
+            "project-launch-005-stale",
+            None,
+            true,
+        ),
+    );
+    let stale_error = stale_response
+        .get("error")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    assert_eq!(
+        stale_response.get("ok").and_then(Value::as_bool),
+        Some(false),
+        "a flagged prepared start must be refused after the config revision changes; response: \
+         {stale_response}"
+    );
+    assert!(
+        stale_error.starts_with(PROJECT_ERR_STALE_PREPARATION),
+        "the flagged stale start must use the existing prepared-start staleness refusal; got \
+         {stale_error:?}"
+    );
+    assert!(
+        stale_response.get("id").is_none_or(Value::is_null)
+            && before_stale == sorted_agent_ids(&daemon),
+        "a flagged stale start must start nothing; response: {stale_response}"
+    );
+
+    assert!(
+        advertises_prepared_role_command
+            && configured_commands_ran
+            && role_metadata_matches
+            && conflict_refused
+            && conflict_started_nothing,
+        "prepared-role-command contract is incomplete:\n\
+         Hello advertised capability: {advertises_prepared_role_command}\n\
+         configured command observation: {configured_wait:?}; output={configured_output:?}\n\
+         configured role records: {role_observations:?}\n\
+         explicit-command conflict response: {conflict_response}; started nothing: \
+         {conflict_started_nothing}"
     );
 }

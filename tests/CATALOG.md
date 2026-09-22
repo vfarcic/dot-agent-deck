@@ -5757,6 +5757,13 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Does not assert:** desktop form rendering, duplicate-title refusal, role launch ordering, coordinator prompt delivery, or a new top-level `display_title` field — the existing `StartPreparedAgent.tab_membership` wire already carries `TabMembership::Orchestration.display_title`.
 - **Platform coverage:** mac+linux (`#![cfg(all(feature = "e2e", unix))]` — `DaemonProc` binds Unix-domain sockets).
 
+##### project/launch/005 — An opted-in prepared start runs each role's daemon-side configured command and records its configured agent identity.
+- **Layer:** L2 lane 1 (one headless `daemon serve` driven through raw attach-socket JSON for the additive `use_configured_command` field; no terminal grid).
+- **Agent:** three long-lived synthetic `sh` stand-ins: the two configured roles append distinct tokens to one project-local log, and the unflagged compatibility control writes its own marker. The two refusal probes are also observable by marker if either unexpectedly spawns; no credential is used.
+- **Asserts:** `Hello` advertises `prepared-role-command`; after `PrepareWorkflow`, flagged starts that omit `command` run the `planner` and `builder` commands held in `.dot-agent-deck.toml`, observed as the distinct `planner-configured` and `builder-configured` log lines. `ListAgents` reports both roles' supplied orchestration membership plus the configured declarations `agent = "opencode"` and `agent = "pi"`. Combining the flag with an explicit command returns the ordinary non-empty-error refusal shape and starts nothing. Editing the config after preparation makes a flagged start return the pre-existing `stale-preparation` refusal and starts nothing. An unflagged prepared start with an explicit command still runs that explicit command.
+- **Does not assert:** role commands or other private config fields crossing the wire (they remain daemon-side); exact refusal prose; desktop chip rendering/client capability gating; seed delivery for a Pi start role (the fixture's start role is OpenCode); a real agent or PTY-attached UI.
+- **Platform coverage:** mac+linux (`#![cfg(all(feature = "e2e", unix))]` — the harness uses Unix-domain sockets and the stand-ins use `sh`).
+
 
 ### Experimental feature flag (PRD #139)
 
@@ -5835,6 +5842,13 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Does not assert:** which entries survive when the cap truncates a larger set; a forced time-budget truncation, because the production budget has no injectable clock and deliberately small local fixtures do not reliably exhaust it; unreadable-directory behaviour, whose outcome depends on the account running the test; client-side error wording.
 - **Platform coverage:** mac+linux (`#![cfg(all(feature = "e2e", unix))]` — the attach harness binds Unix-domain sockets).
 
+##### newagent/browse/003 — `ListDirectories` omits child paths unsafe for authoring seeds.
+- **Layer:** L2 lane 1 (one headless `daemon serve` lists a real Unix filesystem fixture over its attach socket; no PTY or TUI surface).
+- **Agent:** none. The daemon lists test-owned directories and starts no process.
+- **Asserts:** a parent containing one ordinary child plus real child directories whose names contain U+000A LF with prompt-like text, U+001B ESC, U+000D CR, U+0085 NEL, U+2028 LINE SEPARATOR, U+2029 PARAGRAPH SEPARATOR, or U+202E RIGHT-TO-LEFT OVERRIDE returns only the ordinary child.
+- **Does not assert:** other C0/C1 controls; U+061C, U+200E, U+200F, U+202A–U+202D, or U+2066–U+2069 bidi formatting characters; non-UTF-8 names (the JSON wire cannot represent them); paths over the predicate's 4096-byte whole-path limit (a single Unix component cannot reach it, and the harness does not construct descriptor-relative over-`PATH_MAX` trees); desktop rendering.
+- **Platform coverage:** mac+linux (`#![cfg(all(feature = "e2e", unix))]` — the fixture requires Unix filenames and `DaemonProc` binds Unix-domain sockets).
+
 #### newagent/options
 
 ##### newagent/options/001 — `NewAgentOptions` reports daemon-host configuration, registry order, feature state and capabilities.
@@ -5859,6 +5873,13 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Asserts:** no authoring bytes are queued before the deliberately late readiness announcement; after it, the exact schedule seed from `AuthoringKind::compose_seed` arrives once and no second copy follows. A `StartAgent` with no `authoring_kind` reaches readiness but receives no daemon-owned input.
 - **Does not assert:** delivery-time latency after readiness, the native Pi `get-seed` path, any TUI or desktop surface, or the real agent's semantic interpretation of the seed.
 - **Platform coverage:** mac+linux (`#![cfg(all(feature = "e2e", unix))]` — the daemon, hook and PTY harness uses Unix-domain sockets and Unix PTYs).
+
+##### newagent/authoring/003 — Authoring starts refuse unsafe working directories without changing plain starts.
+- **Layer:** L2 lane 1 (one headless `daemon serve` driven over its attach socket; real Unix directories exercise the authoring seed boundary before spawn).
+- **Agent:** synthetic `/bin/cat` processes keep successful control panes live without a credential; each refused authoring case must start no process.
+- **Asserts:** `StartAgent` with `authoring_kind: "schedule"` and a real cwd whose name contains U+000A LF with prompt-like instructions, U+0085 NEL, U+2028 LINE SEPARATOR, or U+202E RIGHT-TO-LEFT OVERRIDE returns the existing refusal shape and leaves `ListAgents` unchanged; the same authoring request with an ordinary cwd succeeds; a plain `StartAgent` with the U+000A cwd still succeeds and appears in `ListAgents`, pinning that existing behavior as unchanged.
+- **Does not assert:** U+2029 PARAGRAPH SEPARATOR at the direct authoring-start boundary (covered through the shared listing predicate by `newagent/browse/003`); other C0/C1 controls; U+061C, U+200E, U+200F, U+202A–U+202D, or U+2066–U+2069 bidi formatting characters; exact refusal prose; seed delivery after the valid authoring control (owned by `newagent/authoring/001`–`002`); desktop validation or error rendering; real-agent interpretation.
+- **Platform coverage:** mac+linux (`#![cfg(all(feature = "e2e", unix))]` — the fixture requires a Unix filename containing LF and the daemon uses Unix-domain sockets and Unix PTYs).
 
 #### newagent/live
 
