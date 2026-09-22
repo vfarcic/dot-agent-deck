@@ -80,9 +80,11 @@ const directoryList = () => screen.getByTestId("new-agent-directory-list");
 const activeRow = () => directoryList().querySelector("[aria-selected='true']")?.getAttribute("data-path");
 const currentPath = async (path: string) => expect(await screen.findByTestId("new-agent-current-path")).toHaveTextContent(path);
 
-/** Confirm the only eligible deck and browse into a directory with no subdirectories, then use it. */
+/**
+ * The only eligible deck is chosen on open, so its home is listed without a
+ * key; browse into a directory with no subdirectories and use it.
+ */
 async function reachForm() {
-  fireEvent.keyDown(deckList(), { key: "Enter" });
   await currentPath("/home/dev");
   fireEvent.keyDown(directoryList(), { key: "j" });
   fireEvent.keyDown(directoryList(), { key: "Enter" });
@@ -90,47 +92,181 @@ async function reachForm() {
   fireEvent.keyDown(directoryList(), { key: "Enter" });
   await currentPath("/home/dev/beta/leaf");
   fireEvent.keyDown(directoryList(), { key: "Enter" });
-  await screen.findByTestId("new-agent-form");
+  await waitFor(() => expect(screen.getByTestId("new-agent-name")).toBeEnabled());
 }
 
-describe("New agent dialog — closing (PRD #1223 U2)", () => {
+describe("New agent dialog — one surface (PRD #1223, the voice-first redesign)", () => {
   /**
-   * Scenario: walk the three steps. None of them has a Cancel button — the
-   * header's X is the one close control, as on every other sheet here — and
-   * the X, Esc and a backdrop click each close the dialog from every step.
+   * Scenario: open the dialog over a fleet with one eligible deck. Every
+   * control is on screen at once — the deck field, the directory browser, and
+   * Mode, Agent, Name, Command and Start — with no Next, no Back and no step to
+   * pass. The deck is chosen already and its home is listed without a key;
+   * the form's fields wait, disabled, until a directory is chosen.
    */
-  it("has no Cancel on any step and closes by the X, Esc and the backdrop", async () => {
+  it("mounts every control at once, and the form waits for a directory", async () => {
     const runtime = fakeRuntime();
-    const { onClose } = renderDialog(runtime);
-    const noCancel = () => expect(within(screen.getByTestId("new-agent-dialog")).queryByRole("button", { name: /cancel/i })).toBeNull();
+    renderDialog(runtime);
 
-    noCancel();
-    fireEvent.click(screen.getByRole("button", { name: "Close new agent" }));
-    fireEvent.keyDown(deckList(), { key: "Enter" });
+    expect(deckList()).toBeVisible();
+    expect(screen.getByTestId("new-agent-directory-panel")).toBeVisible();
+    expect(screen.getByTestId("new-agent-form")).toBeVisible();
+    for (const id of ["new-agent-mode-none", "new-agent-agent", "new-agent-name", "new-agent-command", "new-agent-start"]) {
+      expect(screen.getByTestId(id)).toBeDisabled();
+    }
+    expect(screen.getByTestId("new-agent-dir")).toHaveTextContent("No directory chosen yet");
+    const flow = screen.getByTestId("new-agent-dialog");
+    expect(flow).not.toHaveAttribute("data-step");
+    expect(within(flow).queryByRole("button", { name: /^(next|back)$/i })).toBeNull();
+    expect(screen.queryByTestId("new-agent-deck-next")).toBeNull();
+
     await currentPath("/home/dev");
-    noCancel();
-    fireEvent.keyDown(screen.getByTestId("new-agent-dialog"), { key: "Escape" });
-    fireEvent.keyDown(directoryList(), { key: "j" });
-    fireEvent.keyDown(directoryList(), { key: "Enter" });
-    await currentPath("/home/dev/beta");
-    fireEvent.keyDown(directoryList(), { key: "Enter" });
-    await currentPath("/home/dev/beta/leaf");
-    fireEvent.keyDown(directoryList(), { key: "Enter" });
-    await screen.findByTestId("new-agent-form");
-    noCancel();
-    fireEvent.mouseDown(screen.getByTestId("new-agent-backdrop"));
-    expect(onClose).toHaveBeenCalledTimes(3);
+    expect(runtime.listDirectories).toHaveBeenCalledWith(LOCAL, undefined);
+    expect(runtime.newAgentOptions).toHaveBeenCalledWith(LOCAL);
+
+    fireEvent.keyDown(directoryList(), { key: " " });
+    for (const id of ["new-agent-mode-none", "new-agent-agent", "new-agent-name", "new-agent-command", "new-agent-start"]) {
+      expect(screen.getByTestId(id)).toBeEnabled();
+    }
+    expect(screen.getByTestId("new-agent-dir")).toHaveTextContent("/home/dev");
+  });
+
+  /**
+   * Scenario: open the dialog over two eligible decks. Nothing is chosen for
+   * the user, nothing is listed, the directory panel says to choose a deck
+   * first, and focus is on the deck field — the first control left unsatisfied.
+   */
+  it("focuses the deck field and lists nothing while no deck is chosen", async () => {
+    const runtime = fakeRuntime({ fleet: [deck(LOCAL, { deckKind: "local" }), deck(REMOTE)] });
+    renderDialog(runtime);
+
+    await waitFor(() => expect(deckList()).toHaveFocus());
+    expect(screen.getByTestId("new-agent-directory-idle")).toHaveTextContent("Choose a deck");
+    expect(screen.queryByTestId("new-agent-directory-list")).toBeNull();
+    expect(runtime.listDirectories).not.toHaveBeenCalled();
+    expect(runtime.newAgentOptions).not.toHaveBeenCalled();
+  });
+
+  /**
+   * Scenario: the focus order, as the wizard's steps had it. With the deck
+   * preselected, focus opens on the directory browser; confirming a directory
+   * moves it to Name. The tab stops run deck → directory → Mode → Agent → Name
+   * → Command → Start in document order.
+   */
+  it("moves focus deck → browser → form, and tabs through them in that order", async () => {
+    renderDialog(fakeRuntime());
+    await currentPath("/home/dev");
+    await waitFor(() => expect(directoryList()).toHaveFocus());
+
+    fireEvent.keyDown(directoryList(), { key: " " });
+    await waitFor(() => expect(screen.getByTestId("new-agent-name")).toHaveFocus());
+
+    const flow = screen.getByTestId("new-agent-dialog");
+    const stops = Array.from(flow.querySelectorAll<HTMLElement>("button, input, select, [tabindex='0']"))
+      .filter((element) => !element.hasAttribute("disabled") && element.getAttribute("aria-label") !== "Close new agent")
+      .map((element) => element.getAttribute("data-testid"));
+    expect(stops).toEqual([
+      "new-agent-deck-list",
+      "new-agent-filter",
+      "new-agent-directory-list",
+      "new-agent-use-directory",
+      "new-agent-mode-none",
+      "new-agent-agent",
+      "new-agent-name",
+      "new-agent-command",
+      "new-agent-start",
+    ]);
+  });
+
+  /**
+   * Scenario: choose the local deck, use its home, type a Name — then choose
+   * the other deck. What hung off the first deck goes: the chosen directory,
+   * its listing and its options, and the new deck is asked for its own. The
+   * typed Name is kept, because it was the user's.
+   */
+  it("re-derives the directory and the options from a newly chosen deck, keeping a typed Name", async () => {
+    const runtime = fakeRuntime({ fleet: [deck(LOCAL, { deckKind: "local" }), deck(REMOTE)] });
+    renderDialog(runtime, { initialDeckId: LOCAL });
+    await currentPath("/home/dev");
+    fireEvent.keyDown(directoryList(), { key: " " });
+    await waitFor(() => expect(screen.getByTestId("new-agent-name")).toBeEnabled());
+    fireEvent.change(screen.getByTestId("new-agent-name"), { target: { value: "mine" } });
+
+    fireEvent.click(deckList().querySelector(`[data-deck-id="${REMOTE}"]`)!);
+
+    expect(screen.getByTestId("new-agent-dir")).toHaveTextContent("No directory chosen yet");
+    expect(screen.getByTestId("new-agent-name")).toBeDisabled();
+    expect(screen.getByTestId("new-agent-name")).toHaveValue("mine");
+    await currentPath("/home/dev");
+    expect(runtime.listDirectories).toHaveBeenLastCalledWith(REMOTE, undefined);
+    expect(runtime.newAgentOptions).toHaveBeenLastCalledWith(REMOTE);
+    expect(screen.getByTestId("new-agent-chosen-deck")).toHaveTextContent(`dev@${REMOTE}`);
+    expect(deckList().querySelector("[data-chosen='true']")).toHaveAttribute("data-deck-id", REMOTE);
+  });
+
+  /**
+   * Scenario: with the deck preselected and listed, press Enter on the deck
+   * field — the wizard's one keystroke. The deck is already chosen, so nothing
+   * is asked again: focus just moves on to the browser.
+   */
+  it("treats Enter on the already chosen deck as moving on, not as a new choice", async () => {
+    const runtime = fakeRuntime();
+    renderDialog(runtime);
+    await currentPath("/home/dev");
+    deckList().focus();
+
+    fireEvent.keyDown(deckList(), { key: "Enter" });
+
+    await waitFor(() => expect(directoryList()).toHaveFocus());
+    expect(runtime.listDirectories).toHaveBeenCalledTimes(1);
+    expect(runtime.newAgentOptions).toHaveBeenCalledTimes(1);
   });
 });
 
-describe("New agent dialog — deck step (PRD #1223 M4)", () => {
+describe("New agent dialog — closing (PRD #1223 U2)", () => {
+  /**
+   * Scenario: the dialog has no Cancel button — the header's X is the one
+   * close control, as on every other sheet here — and the X, Esc and a
+   * backdrop click each close it.
+   */
+  it("has no Cancel and closes by the X, Esc and the backdrop", async () => {
+    const runtime = fakeRuntime();
+    const { onClose } = renderDialog(runtime);
+    expect(within(screen.getByTestId("new-agent-dialog")).queryByRole("button", { name: /cancel/i })).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "Close new agent" }));
+    fireEvent.keyDown(screen.getByTestId("new-agent-dialog"), { key: "Escape" });
+    fireEvent.mouseDown(screen.getByTestId("new-agent-backdrop"));
+    expect(onClose).toHaveBeenCalledTimes(3);
+  });
+
+  /**
+   * Scenario: `q` closes the dialog only from the directory browser, as the
+   * TUI picker's does. Typed into Name, Command or the filter it is a letter,
+   * and nothing closes.
+   */
+  it("closes on q only while focus is in the directory browser", async () => {
+    const runtime = fakeRuntime();
+    const { onClose } = renderDialog(runtime);
+    await reachForm();
+
+    for (const id of ["new-agent-name", "new-agent-command", "new-agent-filter"]) {
+      fireEvent.keyDown(screen.getByTestId(id), { key: "q" });
+    }
+    expect(onClose).not.toHaveBeenCalled();
+
+    fireEvent.keyDown(directoryList(), { key: "q" });
+    expect(onClose).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("New agent dialog — deck field (PRD #1223 M4)", () => {
   /**
    * Scenario: open the flow over a fleet of four decks — one connected, one
    * disconnected with its own message, one still waiting to report and one
    * incompatible. Every deck is listed; the three that cannot take a spawn are
-   * disabled and each says why, and clicking one of them starts nothing.
+   * disabled and each says why, and clicking one of them lists nothing.
    */
-  it("lists every deck and disables the ones that cannot take a spawn, with the reason", () => {
+  it("lists every deck and disables the ones that cannot take a spawn, with the reason", async () => {
     const runtime = fakeRuntime({
       fleet: [
         deck(LOCAL, { deckKind: "local" }),
@@ -140,6 +276,7 @@ describe("New agent dialog — deck step (PRD #1223 M4)", () => {
       ],
     });
     renderDialog(runtime);
+    await currentPath("/home/dev");
 
     const options = within(deckList()).getAllByRole("option");
     expect(options).toHaveLength(4);
@@ -149,37 +286,33 @@ describe("New agent dialog — deck step (PRD #1223 M4)", () => {
     expect(options[2]).toHaveTextContent("This deck has not reported yet.");
     expect(options[3]).toHaveTextContent("Protocol handshake failed.");
     fireEvent.click(options[1]);
-    expect(runtime.listDirectories).not.toHaveBeenCalled();
-    expect(screen.getByTestId("new-agent-dialog")).toHaveAttribute("data-step", "deck");
+    expect(runtime.listDirectories).toHaveBeenCalledTimes(1);
+    expect(runtime.listDirectories).toHaveBeenCalledWith(LOCAL, undefined);
+    expect(deckList().querySelector("[data-chosen='true']")).toHaveAttribute("data-deck-id", LOCAL);
   });
 
   /**
-   * Scenario: with exactly one deck able to take a spawn, the step opens with
-   * it selected, and a single Enter confirms it: the directory step asks THAT
-   * deck for its home directory.
+   * Scenario: with exactly one deck able to take a spawn, the field opens with
+   * it chosen, and THAT deck is asked for its home directory — no key pressed.
    */
-  it("preselects the only eligible deck and confirms it with one Enter", async () => {
+  it("chooses the only eligible deck on open and lists its home", async () => {
     const runtime = fakeRuntime();
     renderDialog(runtime);
 
     expect(within(deckList()).getAllByRole("option")[0]).toHaveAttribute("aria-selected", "true");
-    fireEvent.keyDown(deckList(), { key: "Enter" });
-
     await currentPath("/home/dev");
     expect(runtime.listDirectories).toHaveBeenCalledWith(LOCAL, undefined);
   });
 
   /**
    * Scenario: two decks can take a spawn and the flow was opened from the
-   * remote one's header. That deck is preselected, and Enter lists its home.
+   * remote one's header. That deck is chosen and its home listed.
    */
-  it("preselects the deck the flow was opened from", async () => {
+  it("chooses the deck the flow was opened from", async () => {
     const runtime = fakeRuntime({ fleet: [deck(LOCAL, { deckKind: "local" }), deck(REMOTE)] });
     renderDialog(runtime, { initialDeckId: REMOTE });
 
     expect(deckList().querySelector("[aria-selected='true']")).toHaveAttribute("data-deck-id", REMOTE);
-    fireEvent.keyDown(deckList(), { key: "Enter" });
-
     await currentPath("/home/dev");
     expect(runtime.listDirectories).toHaveBeenCalledWith(REMOTE, undefined);
     expect(screen.getByTestId("new-agent-chosen-deck")).toHaveTextContent(`dev@${REMOTE}`);
@@ -187,9 +320,9 @@ describe("New agent dialog — deck step (PRD #1223 M4)", () => {
 
   /**
    * Scenario: two decks can take a spawn and a disconnected one sits between
-   * them. Nothing is preselected and Next is disabled; `j` moves to the first
-   * eligible deck and again past the disconnected one to the second, and Enter
-   * confirms the deck the cursor is on.
+   * them. Nothing is preselected; `j` moves to the first eligible deck and
+   * again past the disconnected one to the second, and Enter chooses the deck
+   * the cursor is on — moving the cursor alone chooses nothing.
    */
   it("preselects nothing between two eligible decks and moves over disabled ones", async () => {
     const third = "deck-000000000000eeee";
@@ -197,19 +330,20 @@ describe("New agent dialog — deck step (PRD #1223 M4)", () => {
     renderDialog(runtime);
 
     expect(deckList().querySelector("[aria-selected='true']")).toBeNull();
-    expect(screen.getByTestId("new-agent-deck-next")).toBeDisabled();
     fireEvent.keyDown(deckList(), { key: "j" });
     expect(deckList().querySelector("[aria-selected='true']")).toHaveAttribute("data-deck-id", LOCAL);
     fireEvent.keyDown(deckList(), { key: "ArrowDown" });
     expect(deckList().querySelector("[aria-selected='true']")).toHaveAttribute("data-deck-id", third);
+    expect(runtime.listDirectories).not.toHaveBeenCalled();
     fireEvent.keyDown(deckList(), { key: "Enter" });
 
     await currentPath("/home/dev");
     expect(runtime.listDirectories).toHaveBeenCalledWith(third, undefined);
+    await waitFor(() => expect(directoryList()).toHaveFocus());
   });
 });
 
-describe("New agent dialog — directory step (PRD #1223 M4)", () => {
+describe("New agent dialog — directory browser (PRD #1223 M4)", () => {
   /**
    * Scenario: browse with the TUI picker's keys. The home listing opens with
    * the cursor on its first subdirectory, the project marked; `j` moves to
@@ -221,7 +355,6 @@ describe("New agent dialog — directory step (PRD #1223 M4)", () => {
   it("moves, enters, goes up through the reply's parent, and confirms with Space", async () => {
     const runtime = fakeRuntime();
     renderDialog(runtime);
-    fireEvent.keyDown(deckList(), { key: "Enter" });
     await currentPath("/home/dev");
 
     expect(activeRow()).toBe("/home/dev/Alpha-project");
@@ -268,7 +401,6 @@ describe("New agent dialog — directory step (PRD #1223 M4)", () => {
   it("filters with / and clears the filter on Escape without closing", async () => {
     const runtime = fakeRuntime();
     const { onClose } = renderDialog(runtime);
-    fireEvent.keyDown(deckList(), { key: "Enter" });
     await currentPath("/home/dev");
 
     fireEvent.keyDown(directoryList(), { key: "/" });
@@ -290,13 +422,12 @@ describe("New agent dialog — directory step (PRD #1223 M4)", () => {
       listDirectories: vi.fn(async (): Promise<DeckDirectoryListing> => ({ ...structuredClone(TREE[""]), truncated: true })),
     });
     renderDialog(runtime);
-    fireEvent.keyDown(deckList(), { key: "Enter" });
 
     expect(await screen.findByTestId("new-agent-truncated")).toBeVisible();
   });
 
   /**
-   * Scenario (PRD #1223 U1): the directory step has no typed-path field, and a
+   * Scenario (PRD #1223 U1): the directory browser has no typed-path field, and a
    * truncated listing's hint does not tell the user to type one.
    */
   it("offers no typed path, and a truncated listing does not suggest one", async () => {
@@ -304,7 +435,6 @@ describe("New agent dialog — directory step (PRD #1223 M4)", () => {
       listDirectories: vi.fn(async (): Promise<DeckDirectoryListing> => ({ ...structuredClone(TREE[""]), truncated: true })),
     });
     renderDialog(runtime);
-    fireEvent.keyDown(deckList(), { key: "Enter" });
 
     const hint = await screen.findByTestId("new-agent-truncated");
     expect(hint.textContent ?? "").not.toMatch(/type/i);
@@ -315,14 +445,14 @@ describe("New agent dialog — directory step (PRD #1223 M4)", () => {
 
 describe("New agent dialog — going up (PRD #1223 U3)", () => {
   /**
-   * Scenario: browse into `beta`. The footer offers Back and Use this
-   * directory, and no Up button beside Back; the `..` row is what goes up, and
-   * clicking it lists the reply's parent with the cursor back on `beta`.
+   * Scenario: browse into `beta`. The browser offers Use this directory and
+   * no Up button; the `..` row is what goes up, and clicking it lists the
+   * reply's parent with the cursor back on `beta`. The footer carries Start
+   * and nothing else — no Back, since there is no step to go back to.
    */
-  it("goes up by the .. row, with no Up button in the footer", async () => {
+  it("goes up by the .. row, with no Up button anywhere", async () => {
     const runtime = fakeRuntime();
     renderDialog(runtime);
-    fireEvent.keyDown(deckList(), { key: "Enter" });
     await currentPath("/home/dev");
     fireEvent.keyDown(directoryList(), { key: "j" });
     fireEvent.keyDown(directoryList(), { key: "Enter" });
@@ -330,7 +460,8 @@ describe("New agent dialog — going up (PRD #1223 U3)", () => {
 
     const flow = screen.getByTestId("new-agent-dialog");
     expect(within(flow).queryByRole("button", { name: /^up$/i })).toBeNull();
-    expect(within(flow.querySelector("footer")!).getAllByRole("button").map((button) => button.textContent?.trim())).toEqual(["Back", "Use this directory"]);
+    expect(within(flow.querySelector("footer")!).getAllByRole("button").map((button) => button.textContent?.trim())).toEqual(["Start agent"]);
+    expect(within(screen.getByTestId("new-agent-directory-panel")).getAllByRole("button").map((button) => button.textContent?.trim())).toEqual(["Use this directory"]);
     const up = within(directoryList()).getAllByRole("option")[0];
     expect(up).toHaveTextContent("..");
     fireEvent.click(up);
@@ -460,31 +591,50 @@ describe("New agent dialog — a deck that leaves mid-flow (PRD #1223 M4)", () =
 
   /**
    * Scenario: the chosen deck leaves the fleet before its home is listed. The
-   * refusal takes the flow back to the deck step and says why; no other deck
-   * is asked for anything.
+   * refusal is shown at the deck field, focus goes back there, nothing is
+   * chosen in its place, and no other deck is asked for anything.
    */
-  it("returns to the deck step when the listing is refused for a departed deck", async () => {
+  it("clears the flow back to the deck field when the listing is refused for a departed deck", async () => {
     const runtime = fakeRuntime({ listDirectories: vi.fn(async (): Promise<DeckDirectoryListing> => { throw new Error(GONE); }) });
     renderDialog(runtime);
-    fireEvent.keyDown(deckList(), { key: "Enter" });
 
     expect(await screen.findByTestId("new-agent-deck-notice")).toHaveTextContent("that deck is not one this app is observing");
-    expect(screen.getByTestId("new-agent-dialog")).toHaveAttribute("data-step", "deck");
+    await waitFor(() => expect(deckList()).toHaveFocus());
+    expect(deckList().querySelector("[data-chosen='true']")).toBeNull();
+    expect(screen.queryByTestId("new-agent-chosen-deck")).toBeNull();
+    expect(screen.getByTestId("new-agent-directory-idle")).toBeVisible();
     expect(runtime.listDirectories).toHaveBeenCalledTimes(1);
     expect(runtime.listDirectories).toHaveBeenCalledWith(LOCAL, undefined);
   });
 
-  /** Scenario: the chosen deck leaves between the form and the start. The start's refusal takes the flow back to the deck step. */
-  it("returns to the deck step when the start is refused for a departed deck", async () => {
+  /**
+   * Scenario: the chosen deck leaves between choosing a directory and the
+   * start. The start's refusal clears the directory panel and the form — no
+   * listing, no chosen directory, a blank Name — refocuses the deck field and
+   * shows the refusal there. It is the wizard's return to its deck step, with
+   * no navigation.
+   */
+  it("clears the directory panel and the form when the start is refused for a departed deck", async () => {
     const runtime = fakeRuntime({ runAction: vi.fn(async () => { throw new Error(GONE); }) });
     renderDialog(runtime);
     await reachForm();
+    fireEvent.change(screen.getByTestId("new-agent-name"), { target: { value: "typed" } });
 
     fireEvent.click(screen.getByTestId("new-agent-start"));
 
     expect(await screen.findByTestId("new-agent-deck-notice")).toHaveTextContent("that deck is not one this app is observing");
-    expect(screen.getByTestId("new-agent-dialog")).toHaveAttribute("data-step", "deck");
+    await waitFor(() => expect(deckList()).toHaveFocus());
+    expect(screen.queryByTestId("new-agent-directory-list")).toBeNull();
+    expect(screen.getByTestId("new-agent-dir")).toHaveTextContent("No directory chosen yet");
+    expect(screen.getByTestId("new-agent-name")).toHaveValue("");
+    expect(screen.getByTestId("new-agent-name")).toBeDisabled();
+    expect(screen.queryByTestId("new-agent-error")).toBeNull();
     expect(runtime.runAction).toHaveBeenCalledTimes(1);
+
+    // Choosing the deck again starts over on it.
+    fireEvent.keyDown(deckList(), { key: "Enter" });
+    await currentPath("/home/dev");
+    expect(screen.queryByTestId("new-agent-deck-notice")).toBeNull();
   });
 });
 
@@ -492,10 +642,10 @@ describe("New agent dialog — older decks (PRD #1223 M5)", () => {
   /**
    * Scenario (PRD #1223 U1): a connected deck that does not advertise the
    * listing verb carries the crate's `newAgentReason`. It is listed disabled
-   * with that reason, is not preselected even when the flow was opened from
-   * it, and neither a click nor Enter takes the flow past the deck step.
+   * with that reason, is not chosen even when the flow was opened from it —
+   * the one eligible deck is — and neither a click nor the keys choose it.
    */
-  it("disables a deck without the listing verb at the deck step, with the crate's reason", () => {
+  it("disables a deck without the listing verb in the deck field, with the crate's reason", () => {
     const reason = "This deck does not advertise list-directories, so it cannot be browsed for a directory to start in. Start agents on it from the TUI on its host, or upgrade the deck.";
     const runtime = fakeRuntime({ fleet: [deck(LOCAL, { deckKind: "local" }), deck(REMOTE, { newAgentReason: reason })] });
     renderDialog(runtime, { initialDeckId: REMOTE });
@@ -505,28 +655,29 @@ describe("New agent dialog — older decks (PRD #1223 M5)", () => {
     expect(options[1]).toHaveTextContent(reason);
     expect(options[1]).toHaveAttribute("aria-selected", "false");
     fireEvent.click(options[1]);
-    expect(runtime.listDirectories).not.toHaveBeenCalled();
-    expect(screen.getByTestId("new-agent-dialog")).toHaveAttribute("data-step", "deck");
+    fireEvent.keyDown(deckList(), { key: "j" });
+    fireEvent.keyDown(deckList(), { key: "Enter" });
+    // The local deck, the only eligible one, is what the field chose on open.
+    expect(vi.mocked(runtime.listDirectories).mock.calls.map(([deckId]) => deckId)).toEqual([LOCAL]);
+    expect(deckList().querySelector("[data-chosen='true']")).toHaveAttribute("data-deck-id", LOCAL);
   });
 
   /**
    * Scenario: a deck that answers the listing `unsupported` anyway — replaced
    * by an older build between its handshake and the request — says it cannot be
-   * browsed, offers no way to type a path, and puts focus on Back, the one
-   * thing left to do; Back returns to the deck step.
+   * browsed, offers no way to type a path, and puts focus back on the deck
+   * field, since another deck is the one thing left to do. There is no Back.
    */
-  it("offers only Back when a deck answers the listing unsupported", async () => {
+  it("points back at the deck field when a deck answers the listing unsupported", async () => {
     const runtime = fakeRuntime({ listDirectories: vi.fn(async (): Promise<DeckDirectoryListing> => ({ kind: "unsupported" })) });
     renderDialog(runtime);
-    fireEvent.keyDown(deckList(), { key: "Enter" });
 
-    expect(await screen.findByTestId("new-agent-no-browse")).toBeVisible();
+    expect(await screen.findByTestId("new-agent-no-browse")).toHaveTextContent("Choose another deck");
     expect(screen.queryByTestId("new-agent-directory-list")).toBeNull();
     expect(screen.queryByTestId("new-agent-path")).toBeNull();
-    const back = screen.getByTestId("new-agent-directory-back");
-    await waitFor(() => expect(back).toHaveFocus());
-    fireEvent.click(back);
-    expect(screen.getByTestId("new-agent-dialog")).toHaveAttribute("data-step", "deck");
+    expect(screen.queryByTestId("new-agent-directory-back")).toBeNull();
+    await waitFor(() => expect(deckList()).toHaveFocus());
+    expect(screen.getByTestId("new-agent-start")).toBeDisabled();
     expect(runtime.runAction).not.toHaveBeenCalled();
   });
 
@@ -687,7 +838,6 @@ describe("New agent dialog — a start in flight (PRD #1223 audit F5)", () => {
     const held = heldStart();
     const runtime = fakeRuntime({ runAction: held.runAction, newAgentOrchestrations: vi.fn(async (): Promise<NewAgentOrchestrations> => ({ kind: "project", path: "/home/dev/Alpha-project", displayPath: "/home/dev/Alpha-project", displayName: "Alpha-project", orchestrations: [{ name: "loop", displayName: "loop", default: true, roles: [{ name: "planner", displayName: "planner", start: true }] }] })) });
     const { unmount } = renderDialog(runtime);
-    fireEvent.keyDown(deckList(), { key: "Enter" });
     await currentPath("/home/dev");
     fireEvent.keyDown(directoryList(), { key: "Enter" });
     await currentPath("/home/dev/Alpha-project");
@@ -862,20 +1012,27 @@ describe("New agent dialog — authoring agents (PRD #1223 M7)", () => {
   });
 
   /**
-   * Scenario: choose schedule, go back to the directory step and confirm a
-   * directory again. The form it opens starts on No mode, as every fresh TUI
-   * form does.
+   * Scenario: choose schedule, pick Pi, then go up in the browser and use
+   * that directory instead. The Mode goes back to No mode, as every fresh TUI
+   * form does, and the Name follows the new directory — while Agent and
+   * Command, which hang off the deck rather than the directory, stay.
    */
-  it("opens every confirmed directory's form on No mode", async () => {
+  it("re-derives Mode and Name from a newly confirmed directory, keeping Agent and Command", async () => {
     renderDialog(fakeRuntime({ newAgentOptions: optionsOf() }));
     await reachForm();
     fireEvent.click(await screen.findByTestId("new-agent-mode-schedule"));
+    fireEvent.change(screen.getByTestId("new-agent-agent"), { target: { value: "pi" } });
 
-    fireEvent.click(screen.getByRole("button", { name: /Back/ }));
-    fireEvent.click(await screen.findByTestId("new-agent-use-directory"));
+    fireEvent.keyDown(directoryList(), { key: "h" });
+    await currentPath("/home/dev/beta");
+    fireEvent.click(screen.getByTestId("new-agent-use-directory"));
 
     await waitFor(() => expect(screen.getByTestId("new-agent-mode-none")).toHaveAttribute("aria-pressed", "true"));
     expect(screen.getByTestId("new-agent-mode-schedule")).toHaveAttribute("aria-pressed", "false");
+    expect(screen.getByTestId("new-agent-dir")).toHaveTextContent("/home/dev/beta");
+    expect(screen.getByTestId("new-agent-name")).toHaveValue("beta");
+    expect(screen.getByTestId("new-agent-agent")).toHaveValue("pi");
+    expect(screen.getByTestId("new-agent-command")).toHaveValue("pi --thinking");
   });
 });
 
@@ -912,14 +1069,13 @@ describe("New agent dialog — orchestrations (PRD #1223 M6)", () => {
     };
   }
 
-  /** Confirm the only eligible deck, enter the project directory — the first entry — and use it. */
+  /** With the only eligible deck chosen on open, enter the project directory — the first entry — and use it. */
   async function reachProjectForm() {
-    fireEvent.keyDown(deckList(), { key: "Enter" });
     await currentPath("/home/dev");
     fireEvent.keyDown(directoryList(), { key: "Enter" });
     await currentPath(PROJECT);
     fireEvent.keyDown(directoryList(), { key: "Enter" });
-    await screen.findByTestId("new-agent-form");
+    await waitFor(() => expect(screen.getByTestId("new-agent-name")).toBeEnabled());
   }
 
   const chip = () => screen.findByTestId("new-agent-mode-orch:loop");
@@ -1169,7 +1325,7 @@ describe("New agent dialog — orchestrations (PRD #1223 M6)", () => {
    * Scenario (PRD #1223 audit V3): the project's roles are named after the
    * crate's "deck left the fleet" refusal, which the crate interpolates into
    * the launch's failure sentence. That sentence must not be classified as
-   * deck loss: the flow would leave the form, the deck step renders prose
+   * deck loss: the flow would clear the form, the deck field renders prose
    * only, and the roles that may still be running would be dropped on the way.
    */
   it("keeps the cleanup warning when a role name quotes the deck-gone refusal", async () => {
@@ -1188,10 +1344,11 @@ describe("New agent dialog — orchestrations (PRD #1223 M6)", () => {
     const warning = await screen.findByTestId("new-agent-cleanup-warning");
     expect(warning).toHaveTextContent("1 role may still be running on this deck");
     expect(warning).toHaveTextContent(hostile);
-    // Still on the form, with the failure beside the values — not back on the
-    // deck step, which would have said the deck had left.
+    // The failure stays beside the values — not cleared back to the deck
+    // field, which would have said the deck had left.
     expect(screen.getByTestId("new-agent-error")).toHaveTextContent("failed to start orchestration role builder");
-    expect(screen.queryByTestId("new-agent-deck-list")).toBeNull();
+    expect(screen.queryByTestId("new-agent-deck-notice")).toBeNull();
+    expect(screen.getByTestId("new-agent-dir")).toHaveTextContent(PROJECT);
   });
 
   /**

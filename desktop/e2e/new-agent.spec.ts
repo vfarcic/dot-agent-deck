@@ -4,10 +4,12 @@ import { openOverview } from "./support/overview";
 
 /**
  * PRD #1223 M4/M5 — the New agent flow, end to end on the fixture bridge: from
- * the overview, through the deck step, a directory browsed on the chosen deck
- * and the form, to the new agent's pane open over the overview.
+ * the overview, through the one dialog's deck field, a directory browsed on the
+ * chosen deck and the form below it, to the new agent's pane open over the
+ * overview. There are no steps: every field is on screen at once (PRD #1223,
+ * the voice-first redesign).
  *
- * The vitest tier drives each step against a fake runtime; what only this tier
+ * The vitest tier drives each field against a fake runtime; what only this tier
  * has is the production bundle, a real keyboard delivering the picker's keys to
  * the element that has focus, and the fixture deck adding the agent to its
  * fleet entry the way a live deck's snapshot does — so the pane opening here is
@@ -31,7 +33,12 @@ test.describe("the New agent flow", () => {
 
     await page.getByTestId("overview-new-agent").click();
     const dialog = page.getByTestId("new-agent-dialog");
-    await expect(dialog).toHaveAttribute("data-step", "deck");
+    // One surface: the deck field, the directory panel and the form are all
+    // there before anything is chosen, the form waiting for a directory.
+    await expect(page.getByTestId("new-agent-deck-list")).toBeFocused();
+    await expect(page.getByTestId("new-agent-directory-idle")).toBeVisible();
+    await expect(page.getByTestId("new-agent-name")).toBeDisabled();
+    await expect(page.getByTestId("new-agent-start")).toBeDisabled();
     const decks = page.getByTestId("new-agent-deck-list").getByRole("option");
     await expect(decks).toHaveCount(4);
     await expect(decks.and(page.locator("[aria-disabled='true']"))).toHaveCount(2);
@@ -48,7 +55,7 @@ test.describe("the New agent flow", () => {
     await expect(page.getByTestId("new-agent-current-path")).toHaveText("/home/build/scratch");
     await page.keyboard.press(" ");
 
-    await expect(dialog).toHaveAttribute("data-step", "form");
+    await expect(page.getByTestId("new-agent-name")).toBeFocused();
     await expect(page.getByTestId("new-agent-dir")).toHaveText("/home/build/scratch");
     await expect(page.getByTestId("new-agent-name")).toHaveValue("scratch");
     await expect(page.getByTestId("new-agent-command")).toHaveValue("claude");
@@ -156,7 +163,7 @@ test.describe("the New agent flow", () => {
     await expect(page.getByTestId("new-agent-directory-list")).toBeFocused();
     await page.keyboard.press(" ");
 
-    await expect(dialog).toHaveAttribute("data-step", "form");
+    await expect(page.getByTestId("new-agent-name")).toBeFocused();
     const modes = page.getByTestId("new-agent-modes").getByRole("button");
     await expect(modes).toHaveText(["No mode", "schedule", "schedule: issues", "dispatcher"]);
     await page.getByTestId("new-agent-mode-none").focus();
@@ -197,7 +204,7 @@ test.describe("the New agent flow", () => {
     await expect(page.getByTestId("new-agent-current-path")).toHaveText("/home/build/demo-project");
     await page.keyboard.press(" ");
 
-    await expect(dialog).toHaveAttribute("data-step", "form");
+    await expect(page.getByTestId("new-agent-name")).toBeFocused();
     await expect(page.getByTestId("new-agent-name")).toHaveValue("demo-project");
     const modes = page.getByTestId("new-agent-modes").getByRole("button");
     await expect(modes).toHaveText(["No mode", "Orch: demo-loop", "schedule", "schedule: issues", "dispatcher"]);
@@ -245,7 +252,7 @@ test.describe("the New agent flow", () => {
     await expect(page.getByTestId("new-agent-current-path")).toHaveText("/home/build/scratch/twin-project");
     await page.keyboard.press(" ");
 
-    await expect(dialog).toHaveAttribute("data-step", "form");
+    await expect(page.getByTestId("new-agent-name")).toBeFocused();
     const modes = page.getByTestId("new-agent-modes").getByRole("button");
     await expect(modes).toHaveText(["No mode", "Orch: solo-loop", "Orch: twin-loop", "Orch: twin-loop", "schedule", "schedule: issues", "dispatcher"]);
     await expect(page.getByTestId("new-agent-mode-ambiguous-0")).toBeDisabled();
@@ -267,8 +274,9 @@ test.describe("the New agent flow", () => {
   test("withholds orchestrations on a deck that cannot start configured roles", async ({ page }) => {
     await page.goto(`/?fixture=1&state=fleet&nonunix=${encodeURIComponent(REMOTE_DECK)}`);
     await page.getByTestId("open-overview").click();
+    // Opened from the deck's header, the deck is chosen and its home listed
+    // with no key pressed; focus is already in the browser.
     await page.locator(`[data-testid="daemon-group"][data-daemon-id="${REMOTE_DECK}"]`).getByTestId("daemon-new-agent").click();
-    await page.keyboard.press("Enter");
     const directories = page.getByTestId("new-agent-directory-list");
     await expect(directories).toBeFocused();
     await expect(directories.locator("[aria-selected='true']")).toHaveAttribute("data-path", "/home/build/demo-project");
@@ -284,10 +292,11 @@ test.describe("the New agent flow", () => {
    * Scenario (PRD #1223 U1): with the remote deck playing a deck from before
    * PRD #1223, it has no directory listing, and browsing is the only way the
    * flow chooses a directory. Its header offers no New agent; opened from the
-   * top bar, the deck step lists it disabled with the deck's reason, and
-   * clicking it leaves the flow on the deck step. The local deck still works.
+   * top bar, the deck field lists it disabled with the deck's reason, and
+   * clicking it chooses nothing. The local deck — the one eligible deck, so
+   * chosen on open — still lists its home.
    */
-  test("disables a deck without the listing verb at the deck step", async ({ page }) => {
+  test("disables a deck without the listing verb in the deck field", async ({ page }) => {
     await page.goto(`/?fixture=1&state=fleet&older=${encodeURIComponent(REMOTE_DECK)}`);
     await page.getByTestId("open-overview").click();
     await expect(page.locator(`[data-testid="daemon-group"][data-daemon-id="${REMOTE_DECK}"]`).getByTestId("daemon-new-agent")).toHaveCount(0);
@@ -300,8 +309,47 @@ test.describe("the New agent flow", () => {
     // Playwright will not click an `aria-disabled` element, which is the point;
     // the click is dispatched to prove the row itself ignores it too.
     await remote.dispatchEvent("click");
-    await expect(dialog).toHaveAttribute("data-step", "deck");
+    await expect(dialog).toBeVisible();
+    await expect(remote).not.toHaveAttribute("data-chosen", "true");
+    await expect(page.getByTestId("new-agent-deck-list").locator("[data-chosen='true']")).toHaveCount(1);
+    await expect(page.getByTestId("new-agent-directory-list")).toBeFocused();
     await expect(page.getByTestId("new-agent-path")).toHaveCount(0);
+  });
+
+  /**
+   * Scenario (PRD #1223, the voice-first redesign): open New agent from the top
+   * bar and choose the remote deck by clicking it. Focus moves to its listing
+   * without a Next; Space uses the home directory and focus moves on to Name.
+   * Typing a `q` there types it — `q` closes only from the browser — and
+   * Shift+Tab walks back up through Agent and Mode into the browser. There,
+   * `q` closes the dialog and focus returns to the button that opened it.
+   */
+  test("moves focus field by field and scopes q to the browser", async ({ page }) => {
+    await openOverview(page, "fleet");
+
+    const opener = page.getByTestId("overview-new-agent");
+    await opener.click();
+    const dialog = page.getByTestId("new-agent-dialog");
+    await page.getByTestId("new-agent-deck-list").locator(`[data-deck-id="${REMOTE_DECK}"]`).click();
+    const directories = page.getByTestId("new-agent-directory-list");
+    await expect(directories).toBeFocused();
+    await page.keyboard.press(" ");
+
+    const name = page.getByTestId("new-agent-name");
+    await expect(name).toBeFocused();
+    await expect(name).toHaveValue("build");
+    await page.keyboard.press("q");
+    await expect(name).toHaveValue("buildq");
+    await expect(dialog).toBeVisible();
+
+    await page.keyboard.press("Shift+Tab");
+    await expect(page.getByTestId("new-agent-agent")).toBeFocused();
+    await page.keyboard.press("Shift+Tab");
+    await expect(page.getByTestId("new-agent-modes").locator(":focus")).toHaveCount(1);
+    await directories.focus();
+    await page.keyboard.press("q");
+    await expect(dialog).toHaveCount(0);
+    await expect(opener).toBeFocused();
   });
 
   /**

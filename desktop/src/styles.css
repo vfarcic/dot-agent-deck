@@ -956,6 +956,7 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .new-agent-row { min-height: 30px; padding: 5px 8px; display: flex; flex-wrap: wrap; align-items: center; gap: 7px; border-radius: 4px; cursor: pointer; font-size: 11px; }
 .new-agent-row:hover { background: var(--paper-sunken); }
 .new-agent-row.is-active { background: var(--teal-soft); }
+.new-agent-row.is-chosen .new-agent-row-name { color: var(--teal-deep); }
 .new-agent-row.is-disabled { color: var(--faint); cursor: default; }
 .new-agent-row.is-disabled:hover { background: transparent; }
 .new-agent-row-name { min-width: 0; overflow: hidden; font-weight: 650; text-overflow: ellipsis; white-space: nowrap; }
@@ -975,6 +976,15 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .new-agent-detail summary { cursor: pointer; }
 .new-agent-detail p { margin: 4px 0 0; max-height: 120px; overflow: auto; overflow-wrap: anywhere; white-space: pre-wrap; }
 .new-agent-form { display: flex; flex-direction: column; gap: 9px; }
+/* The single surface (PRD #1223): deck, directory browser and form stacked in one scrolling body. */
+.new-agent-section { display: flex; flex-direction: column; gap: 7px; }
+.new-agent-section + .new-agent-section { padding-top: 9px; border-top: 1px solid var(--line); }
+.new-agent-section > h3 { margin: 0; color: var(--muted); font-size: 10px; font-weight: 650; letter-spacing: .04em; text-transform: uppercase; }
+.new-agent-list.is-decks { max-height: 132px; }
+.new-agent-list.is-directories { max-height: 200px; }
+.new-agent-list[aria-disabled="true"] { opacity: .6; }
+.new-agent-current .new-agent-keys { flex: 1; }
+.new-agent-unset { color: var(--faint); font-family: inherit; font-weight: 400; }
 .new-agent-field { display: grid; grid-template-columns: 76px minmax(0, 1fr); align-items: center; gap: 9px; font-size: 11px; }
 .new-agent-field > span { color: var(--muted); font-weight: 650; }
 .new-agent-field > strong { min-width: 0; overflow: hidden; font-family: "JetBrains Mono", monospace; font-size: 10.5px; text-overflow: ellipsis; white-space: nowrap; }

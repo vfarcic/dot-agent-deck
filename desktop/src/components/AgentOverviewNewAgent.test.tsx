@@ -42,9 +42,8 @@ function runtime(overrides: Partial<DeckRuntimeState> = {}): DeckRuntimeState {
 const dialog = () => screen.queryByTestId("new-agent-dialog");
 const highlightedDeck = () => screen.getByTestId("new-agent-deck-list").querySelector("[aria-selected='true']")?.getAttribute("data-deck-id");
 
-/** Choose the highlighted deck, use its home, and start the agent. */
+/** The only deck is chosen on open: use its home, and start the agent. */
 async function startFromDialog() {
-  fireEvent.keyDown(screen.getByTestId("new-agent-deck-list"), { key: "Enter" });
   fireEvent.keyDown(await screen.findByTestId("new-agent-directory-list"), { key: " " });
   await waitFor(() => expect(screen.getByTestId("new-agent-command")).toHaveValue("claude"));
   fireEvent.click(screen.getByTestId("new-agent-start"));
@@ -53,16 +52,19 @@ async function startFromDialog() {
 describe("the overview's New agent entry points (PRD #1223 M4)", () => {
   /**
    * Scenario: open the overview on the four-deck fleet and click the top bar's
-   * New agent. The dialog opens on its deck step with nothing preselected —
-   * two decks can take a spawn. A runtime without the flow's queries renders
-   * no such control at all.
+   * New agent. The dialog opens with nothing preselected — two decks can take
+   * a spawn — so no deck is chosen and focus is on the deck field. A runtime
+   * without the flow's queries renders no such control at all.
    */
   it("opens the flow from the top bar, and offers none without the flow's queries", () => {
-    render(<AgentOverview runtime={runtime()} onNavigate={vi.fn()} />);
+    const current = runtime();
+    render(<AgentOverview runtime={current} onNavigate={vi.fn()} />);
     fireEvent.click(screen.getByTestId("overview-new-agent"));
 
-    expect(dialog()).toHaveAttribute("data-step", "deck");
+    expect(dialog()).not.toBeNull();
     expect(highlightedDeck()).toBeUndefined();
+    expect(screen.getByTestId("new-agent-deck-list")).toHaveFocus();
+    expect(current.listDirectories).not.toHaveBeenCalled();
   });
 
   it("offers no New agent control for a runtime without the flow's queries", () => {
@@ -106,10 +108,12 @@ describe("the overview's New agent entry points (PRD #1223 M4)", () => {
   /**
    * Scenario: each connected deck's group header carries its own New agent;
    * the unreachable and pending decks' do not. The remote deck's opens the
-   * flow with that deck preselected.
+   * flow with that deck chosen, and asks that deck — and no other — for its
+   * home.
    */
   it("opens the flow from a deck group's header with that deck preselected", () => {
-    render(<AgentOverview runtime={runtime()} onNavigate={vi.fn()} />);
+    const current = runtime();
+    render(<AgentOverview runtime={current} onNavigate={vi.fn()} />);
     const headers = screen.getAllByTestId("daemon-new-agent");
     expect(headers).toHaveLength(2);
 
@@ -117,12 +121,15 @@ describe("the overview's New agent entry points (PRD #1223 M4)", () => {
     fireEvent.click(within(remoteGroup).getByTestId("daemon-new-agent"));
 
     expect(highlightedDeck()).toBe(FIXTURE_REMOTE_DAEMON_ID);
+    expect(screen.getByTestId("new-agent-chosen-deck")).toBeVisible();
+    expect(current.listDirectories).toHaveBeenCalledTimes(1);
+    expect(current.listDirectories).toHaveBeenCalledWith(FIXTURE_REMOTE_DAEMON_ID, undefined);
   });
 
   /**
    * Scenario (PRD #1223 U1): the remote deck does not advertise the listing
    * verb, so its connection carries `newAgentReason`. Its header offers no New
-   * agent — the flow could not get past its deck step — while the local deck's
+   * agent — the flow could not choose it — while the local deck's
    * header still does.
    */
   it("offers no header entry point on a deck the flow cannot browse", () => {
