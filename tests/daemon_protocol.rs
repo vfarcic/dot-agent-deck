@@ -2369,6 +2369,11 @@ async fn a_configured_prepared_start_refuses_a_supplied_command_agent_type_or_se
             resp.error
         );
         assert!(
+            resp.error.as_deref().is_some_and(|e| !e.contains("  ")),
+            "{field}: the refusal reads with single spaces, not source indentation: {:?}",
+            resp.error
+        );
+        assert!(
             server.registry.agent_records().is_empty(),
             "{field}: a refused configured start must not have spawned a pane"
         );

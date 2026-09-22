@@ -3096,7 +3096,9 @@ async fn handle_connection(
                 write_resp(
                     &mut stream,
                     &AttachResponse::err(
-                        "start-prepared-agent: use_configured_command starts the role with its                          configured command, agent and seed, so the request must not also carry                          `command`, `agent_type` or `seed`; nothing was started",
+                        "start-prepared-agent: use_configured_command starts the role with its \
+                         configured command, agent and seed, so the request must not also \
+                         carry `command`, `agent_type` or `seed`; nothing was started",
                     ),
                 )
                 .await?;
@@ -3442,7 +3444,8 @@ async fn handle_connection(
                         write_resp(
                             &mut stream,
                             &AttachResponse::err(
-                                "start-prepared-agent: the configured role command is empty;                                  nothing was started",
+                                "start-prepared-agent: the configured role command is empty; \
+                                 nothing was started",
                             ),
                         )
                         .await?;
