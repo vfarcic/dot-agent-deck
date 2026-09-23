@@ -820,3 +820,128 @@ screen = "overview"
 form = true
 action = "open_deck"
 outcome = "dispatch"
+
+# PRD #1223 — a control's visible label is part of its voice vocabulary. Reading
+# a button aloud is the most natural thing a user can do, so each of these is a
+# label on the New agent dialog or the overview, said as it is written, and must
+# reach the row that control invokes (`docs/develop/voice-first-design.md`,
+# section 5's label rule).
+#
+# The user's own report first: with an orchestration chosen, the Start button
+# reads "Start orchestration", and saying that did not start it — the model
+# took it as choosing the Mode "orchestration" and the chip resolver found no
+# chip called that. `start_new_agent` now claims the button's words and
+# `choose_mode` names a chip, never the bare category.
+
+[[fixtures]]
+name = "start-orchestration-button-label"
+utterance = "Start orchestration"
+screen = "overview"
+form = true
+action = "start_new_agent"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "start-the-orchestration"
+utterance = "start the orchestration"
+screen = "overview"
+form = true
+action = "start_new_agent"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "start-the-run"
+utterance = "start the run"
+screen = "overview"
+form = true
+action = "start_new_agent"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "start-agent-button-label"
+utterance = "Start agent"
+screen = "overview"
+form = true
+action = "start_new_agent"
+outcome = "dispatch"
+
+# With the dialog closed the button's words open it, as "start it" does (D3).
+[[fixtures]]
+name = "start-orchestration-dialog-closed"
+utterance = "Start orchestration"
+screen = "overview"
+action = "open_new_agent"
+outcome = "dispatch"
+no_deck = true
+
+[[fixtures]]
+name = "new-agent-button-label"
+utterance = "New agent"
+screen = "overview"
+action = "open_new_agent"
+outcome = "dispatch"
+no_deck = true
+
+[[fixtures]]
+name = "open-deck-button-label"
+utterance = "Open deck"
+screen = "overview"
+action = "open_deck"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "close-new-agent-button-label"
+utterance = "Close new agent"
+screen = "overview"
+form = true
+action = "close"
+outcome = "dispatch"
+
+# The Mode chips, each said as its label reads. "Orch: billing-run" is spoken
+# without the colon — nobody says "orch colon".
+[[fixtures]]
+name = "choose-mode-no-mode-chip-label"
+utterance = "No mode"
+screen = "overview"
+form = true
+action = "choose_mode"
+outcome = "dispatch"
+resolved_mode = "none"
+
+[[fixtures]]
+name = "choose-mode-orch-chip-label"
+utterance = "Orch billing run"
+screen = "overview"
+form = true
+action = "choose_mode"
+outcome = "dispatch"
+resolved_mode = "orchestration:billing-run"
+
+[[fixtures]]
+name = "choose-mode-dispatcher-chip-label"
+utterance = "dispatcher"
+screen = "overview"
+form = true
+action = "choose_mode"
+outcome = "dispatch"
+resolved_mode = "dispatcher"
+
+[[fixtures]]
+name = "open-agent-row-control-label"
+utterance = "Open tester agent"
+screen = "overview"
+action = "open_agent"
+outcome = "dispatch"
+resolved_agent = "agent-tester"
+
+# The orchestration card's button reads "Close", and its accessible name is
+# "Close <title> orchestration". The accessible name is the destructive phrasing
+# and routes to `close_orchestration` (`close-the-orchestration` above); the bare
+# visible word must NOT, because "close" is a view word (D1) — it is `close`,
+# which stops nothing.
+[[fixtures]]
+name = "close-bare-on-the-overview"
+utterance = "Close"
+screen = "overview"
+action = "close"
+outcome = "dispatch"

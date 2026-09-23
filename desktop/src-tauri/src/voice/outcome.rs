@@ -539,18 +539,25 @@ pub async fn handle_utterance_with(
     // the row's own hint rather than dispatched into a dialog that cannot take
     // it.
     if !row.callable(screen, directories, new_agent) {
-        // A row that needs another OPEN first (`unavailable_opens`, PRD #1223
-        // D3): "start it" with the New agent dialog closed opens the dialog
-        // rather than being told to say "new agent" first — when the target
-        // can run here and the user's words ground it too. The target only
-        // opens something, and the parser holds it to taking no required
-        // param, so it is dispatched with none.
+        // A row whose words another row answers here (`unavailable_redirects`,
+        // PRD #1223 D3): "start it" with the New agent dialog closed opens the
+        // dialog rather than being told to say "new agent" first, and "Start
+        // agent" with it OPEN — read as the opener — presses its Start. Only
+        // when the target can run here and the user's words ground it by its
+        // OWN vocabulary, so a redirect reaches nothing those words could not
+        // reach directly. The parser holds the target to taking no required
+        // param, so it is dispatched with none — which is why a pick carrying
+        // a value is not redirected: "start an agent on local" over an open
+        // dialog names a deck the form may not show, and starting the form
+        // would drop what the user asked for.
+        let carries_a_value = answer.params.values().any(|value| !value.trim().is_empty());
         if let Some(target) = row
-            .unavailable_opens
+            .unavailable_redirects
             .as_deref()
             .and_then(|id| table.row(id))
             .filter(|target| {
-                target.callable(screen, directories, new_agent)
+                !carries_a_value
+                    && target.callable(screen, directories, new_agent)
                     && action_grounded(target, transcript.text(), directories, new_agent)
             })
         {
@@ -2617,7 +2624,8 @@ mod tests {
             let outcome = run(&resolver, screen, &fleet(), "new agent").await;
             assert_eq!(
                 outcome.sentence(),
-                "Not here — starting a new agent works from the agent overview.",
+                "Not here — the New agent dialog opens from the agent overview, when it is not \
+                 already open.",
                 "{screen}"
             );
         }
@@ -2968,14 +2976,15 @@ mod tests {
             assert!(!row(id).callable, "{id} should be unavailable");
             assert_eq!(row(id).unavailable_hint, LABELS_WITHHELD_HINT, "{id}");
         }
-        for id in [
-            "open_new_agent",
-            "go_to_parent",
-            "use_this_directory",
-            "name_new_agent",
-        ] {
+        for id in ["go_to_parent", "use_this_directory", "name_new_agent"] {
             assert!(row(id).callable, "{id} names nothing observed");
         }
+        // `open_new_agent` names nothing observed either, but this request
+        // declares the New agent dialog OPEN, where the opener cannot run
+        // (`new_agent_dialog_closed`, PRD #1223) — for that reason, with its own
+        // hint, and not for the withheld names.
+        assert!(!row("open_new_agent").callable);
+        assert_ne!(row("open_new_agent").unavailable_hint, LABELS_WITHHELD_HINT);
 
         // Shared, the same request carries the data turn.
         let shared = Recording::answering(IntentAnswer::new("use_this_directory"));
@@ -3970,7 +3979,7 @@ mod tests {
                 }
             );
         }
-        // Closed, the pick OPENS the dialog (`unavailable_opens`, D3) rather
+        // Closed, the pick OPENS the dialog (`unavailable_redirects`, D3) rather
         // than being refused as "not here".
         let closed = run_form(&resolver, Screen::Overview, None, "start it").await;
         assert_eq!(
@@ -4607,7 +4616,7 @@ mod tests {
             grounding: ActionGrounding::Exempt("a hand-built row".to_string()),
             grounding_while: Vec::new(),
             grounding_also: Vec::new(),
-            unavailable_opens: None,
+            unavailable_redirects: None,
         };
         let param = |name: &str, label: &str| ResolvedParam {
             name: name.to_string(),
@@ -4672,7 +4681,7 @@ mod tests {
             grounding: ActionGrounding::Exempt("a hand-built row".to_string()),
             grounding_while: Vec::new(),
             grounding_also: Vec::new(),
-            unavailable_opens: None,
+            unavailable_redirects: None,
         };
         let param = ResolvedParam {
             name: "agent".to_string(),
@@ -6289,5 +6298,354 @@ mod tests {
             }
         }
         assert!(refused.is_empty(), "refused:\n{}", refused.join("\n"));
+    }
+
+    // -- a control's visible label is part of its voice vocabulary ---------
+
+    /// Scenario: in the New agent dialog, with an orchestration chosen in
+    /// Mode, the Start button reads "Start orchestration"; the user reads it
+    /// aloud and the run starts — the dialog's own start, not a Mode change.
+    /// The same holds for the button's other label and the phrasings around
+    /// it (PRD #1223, the user's report).
+    #[tokio::test]
+    async fn voice_outcome_start_orchestration_starts_the_run() {
+        for said in [
+            "Start orchestration",
+            "start the orchestration",
+            "start the run",
+            "Start agent",
+        ] {
+            let outcome = heard_as_user_said(
+                said,
+                IntentAnswer::new("start_new_agent"),
+                Screen::Overview,
+                &fleet(),
+                Some(&new_agent_form()),
+            )
+            .await;
+            let VoiceOutcome::Dispatch {
+                invoke, sentence, ..
+            } = &outcome
+            else {
+                panic!("{said}: expected a dispatch, got {outcome:?}");
+            };
+            assert_eq!(invoke, "startNewAgent", "{said}");
+            assert_eq!(sentence, "Starting the agent.", "{said}");
+        }
+        // With the dialog closed the button's words open it, as "start it" does.
+        let closed = heard_as_user_said(
+            "Start orchestration",
+            IntentAnswer::new("start_new_agent"),
+            Screen::Overview,
+            &fleet(),
+            None,
+        )
+        .await;
+        let VoiceOutcome::Dispatch { action, .. } = &closed else {
+            panic!("expected a dispatch, got {closed:?}");
+        };
+        assert_eq!(action, "open_new_agent");
+    }
+
+    /// The source files the labels below are rendered from. Read as text so a
+    /// renamed button fails here, beside the vocabulary that has to follow it,
+    /// rather than silently leaving the old words as the only spoken form.
+    const NEW_AGENT_DIALOG_TSX: &str = include_str!("../../../src/components/NewAgentDialog.tsx");
+    const AGENT_OVERVIEW_TSX: &str = include_str!("../../../src/components/AgentOverview.tsx");
+    const NEW_AGENT_TS: &str = include_str!("../../../src/lib/newAgent.ts");
+
+    /// Where a label lives, as the literal the source renders it from.
+    struct ControlLabel {
+        /// The source text the label is rendered from, verbatim.
+        source: &'static str,
+        /// The file it must appear in.
+        file: &'static str,
+        /// The label read aloud — a template's placeholder filled with a name
+        /// from the fixtures, punctuation spoken as a space.
+        said: &'static str,
+        /// The row the control invokes.
+        row: &'static str,
+        /// Whether the New agent form is declared when the label is on screen.
+        over_the_form: bool,
+    }
+
+    /// Every visible label on the New agent dialog and the overview whose
+    /// control has a voice row, with that row. `docs/develop/voice-first-design.md`
+    /// section 5 has the rule; the labels left out on purpose are listed there
+    /// with their reasons.
+    const CONTROL_LABELS: [ControlLabel; 16] = [
+        ControlLabel {
+            source: "\"Start orchestration\"",
+            file: NEW_AGENT_DIALOG_TSX,
+            said: "Start orchestration",
+            row: "start_new_agent",
+            over_the_form: true,
+        },
+        ControlLabel {
+            source: "\"Start agent\"",
+            file: NEW_AGENT_DIALOG_TSX,
+            said: "Start agent",
+            row: "start_new_agent",
+            over_the_form: true,
+        },
+        ControlLabel {
+            source: "<Check size={14} /> Use this directory</button>",
+            file: NEW_AGENT_DIALOG_TSX,
+            said: "Use this directory",
+            row: "use_this_directory",
+            over_the_form: false,
+        },
+        ControlLabel {
+            source: "aria-label=\"Close new agent\"",
+            file: NEW_AGENT_DIALOG_TSX,
+            said: "Close new agent",
+            row: "close",
+            over_the_form: true,
+        },
+        ControlLabel {
+            source: "{ id: \"none\", label: \"No mode\" }",
+            file: NEW_AGENT_DIALOG_TSX,
+            said: "No mode",
+            row: "choose_mode",
+            over_the_form: true,
+        },
+        ControlLabel {
+            source: "label: `Orch: ${",
+            file: NEW_AGENT_DIALOG_TSX,
+            said: "Orch billing run",
+            row: "choose_mode",
+            over_the_form: true,
+        },
+        ControlLabel {
+            source: "{ kind: \"schedule\", label: \"schedule\" }",
+            file: NEW_AGENT_TS,
+            said: "schedule",
+            row: "choose_mode",
+            over_the_form: true,
+        },
+        ControlLabel {
+            source: "{ kind: \"schedule-issues\", label: \"schedule: issues\" }",
+            file: NEW_AGENT_TS,
+            said: "schedule issues",
+            row: "choose_mode",
+            over_the_form: true,
+        },
+        ControlLabel {
+            source: "{ kind: \"dispatcher\", label: \"dispatcher\" }",
+            file: NEW_AGENT_TS,
+            said: "dispatcher",
+            row: "choose_mode",
+            over_the_form: true,
+        },
+        ControlLabel {
+            source: "<span>New agent</span>",
+            file: AGENT_OVERVIEW_TSX,
+            said: "New agent",
+            row: "open_new_agent",
+            over_the_form: false,
+        },
+        ControlLabel {
+            source: "aria-label={`New agent on ${deckName(connection)}`}",
+            file: AGENT_OVERVIEW_TSX,
+            said: "New agent on local",
+            row: "open_new_agent",
+            over_the_form: false,
+        },
+        ControlLabel {
+            source: "<span>Open deck</span>",
+            file: AGENT_OVERVIEW_TSX,
+            said: "Open deck",
+            row: "open_deck",
+            over_the_form: false,
+        },
+        ControlLabel {
+            source: "label=\"Deck\"",
+            file: AGENT_OVERVIEW_TSX,
+            said: "Deck",
+            row: "open_deck",
+            over_the_form: false,
+        },
+        ControlLabel {
+            source: "aria-label={`Open ${name} agent`}",
+            file: AGENT_OVERVIEW_TSX,
+            said: "Open tester agent",
+            row: "open_agent",
+            over_the_form: false,
+        },
+        ControlLabel {
+            source: "aria-label={`Stop ${name} agent`}",
+            file: AGENT_OVERVIEW_TSX,
+            said: "Stop tester agent",
+            row: "stop_agent",
+            over_the_form: false,
+        },
+        ControlLabel {
+            source: "aria-label={`Close ${groupName} orchestration`}",
+            file: AGENT_OVERVIEW_TSX,
+            said: "Close billing orchestration",
+            row: "close_orchestration",
+            over_the_form: false,
+        },
+    ];
+
+    /// The label rule as a property: each control's label, said as it reads,
+    /// is grounded for the row that control invokes — and the row's
+    /// description, which is the model's prompt, carries the label's words, so
+    /// the model is steered to the row the grounding accepts.
+    #[test]
+    fn voice_outcome_every_control_label_asks_for_its_own_row() {
+        let form = new_agent_form();
+        let mut failures = Vec::new();
+        for label in &CONTROL_LABELS {
+            if !label.file.contains(label.source) {
+                failures.push(format!(
+                    "{:?} is no longer in its source file — the control was renamed, so its \
+                     spoken form in `commands.toml` has to follow it",
+                    label.source
+                ));
+            }
+            let row = table()
+                .row(label.row)
+                .unwrap_or_else(|| panic!("{} is in the table", label.row));
+            let new_agent = label.over_the_form.then_some(&form);
+            if !action_grounded(row, label.said, None, new_agent) {
+                failures.push(format!("{:?} does not ground `{}`", label.said, label.row));
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    /// The labels the user hit, and the ones this sweep found missing from the
+    /// row's prompt: each is written into its row's description, so the model
+    /// reads the button's own words as that row.
+    #[test]
+    fn voice_outcome_label_phrasings_are_in_the_rows_prompt() {
+        for (row, phrase) in [
+            ("start_new_agent", "Start orchestration"),
+            ("start_new_agent", "Start agent"),
+            ("start_new_agent", "start the orchestration"),
+            ("start_new_agent", "start the run"),
+            ("close", "close new agent"),
+            ("open_deck", "open deck"),
+            ("open_agent", "open tester agent"),
+            ("stop_agent", "stop tester agent"),
+        ] {
+            // A description wraps across lines, so compare word runs.
+            let description = spoken_words(&table().row(row).expect("present").description);
+            let phrase_words = spoken_words(phrase);
+            assert!(
+                description
+                    .windows(phrase_words.len())
+                    .any(|window| window == phrase_words.as_slice()),
+                "`{row}`'s description does not carry {phrase:?}"
+            );
+        }
+        // And `choose_mode` says the bare category is not a chip, and that the
+        // Start button's words belong to the start.
+        let mode = table()
+            .row("choose_mode")
+            .expect("present")
+            .description
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(mode.contains("The bare word \"orchestration\" names NO chip"));
+        assert!(mode.contains("\"Start orchestration\""));
+        assert!(mode.contains("mean `start_new_agent`"));
+    }
+
+    /// The destructive half of the rule: a label that also names a
+    /// destructive action reads as the harmless one when said bare. The
+    /// orchestration card's button SHOWS "Close"; said on its own that closes a
+    /// view and grounds neither stop, and only the accessible name — which
+    /// names the orchestration — reaches `close_orchestration`.
+    #[test]
+    fn voice_outcome_a_bare_close_label_stops_nothing() {
+        assert!(AGENT_OVERVIEW_TSX.contains("<X size={12} /><span>Close</span>"));
+        for destructive in ["close_orchestration", "stop_agent"] {
+            let row = table().row(destructive).expect("present");
+            assert!(
+                !action_grounded(row, "Close", None, None),
+                "a bare \"Close\" must not ground `{destructive}`"
+            );
+        }
+        let close = table().row("close").expect("present");
+        assert!(action_grounded(close, "Close", None, None));
+    }
+
+    /// Scenario: the user reads the X button's accessible name, "Close new
+    /// agent", while filling the form. It closes the dialog — the same as
+    /// clicking the X — where it used to be refused because the dialog's
+    /// whole-utterance list had only "close the new agent dialog".
+    #[tokio::test]
+    async fn voice_outcome_close_new_agent_closes_the_dialog() {
+        let outcome = heard_as_user_said(
+            "Close new agent",
+            IntentAnswer::new("close"),
+            Screen::Overview,
+            &fleet(),
+            Some(&new_agent_form()),
+        )
+        .await;
+        let VoiceOutcome::Dispatch { invoke, .. } = &outcome else {
+            panic!("expected a dispatch, got {outcome:?}");
+        };
+        assert_eq!(invoke, "closeTopmost");
+    }
+
+    /// Scenario: with the New agent dialog open the user reads its Start
+    /// button, "Start agent", and the model answers the OPENER — which the open
+    /// dialog cannot serve, and which used to end in "That command is not wired
+    /// to anything in this build." The pick is handed to the start, because
+    /// the start's own words ground it. "new agent" has no start word and gets
+    /// the opener's hint; a named deck is not redirected, since starting the
+    /// form would drop it.
+    #[tokio::test]
+    async fn voice_outcome_an_opener_picked_over_the_open_dialog_presses_its_start() {
+        let form = new_agent_form();
+        let dialog = VoiceNewAgent { form: None };
+        for (said, declared) in [
+            ("Start agent", &form),
+            ("Start the new agent", &form),
+            ("just launch the agent immediately", &dialog),
+        ] {
+            let outcome = heard_as_user_said(
+                said,
+                IntentAnswer::new("open_new_agent"),
+                Screen::Overview,
+                &fleet(),
+                Some(declared),
+            )
+            .await;
+            let VoiceOutcome::Dispatch { invoke, .. } = &outcome else {
+                panic!("{said}: expected a dispatch, got {outcome:?}");
+            };
+            assert_eq!(invoke, "startNewAgent", "{said}");
+        }
+        let bare = heard_as_user_said(
+            "new agent",
+            IntentAnswer::new("open_new_agent"),
+            Screen::Overview,
+            &fleet(),
+            Some(&form),
+        )
+        .await;
+        assert_eq!(
+            bare.sentence(),
+            "Not here — the New agent dialog opens from the agent overview, when it is not \
+             already open."
+        );
+        let on_a_deck = heard_as_user_said(
+            "start an agent on local",
+            IntentAnswer::new("open_new_agent").with_param("deck", "local"),
+            Screen::Overview,
+            &fleet(),
+            Some(&form),
+        )
+        .await;
+        assert!(
+            matches!(on_a_deck, VoiceOutcome::Unavailable { .. }),
+            "a named deck must not start the form: {on_a_deck:?}"
+        );
     }
 }

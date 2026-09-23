@@ -318,3 +318,42 @@ Three changes the user asked for after using the shipped voice flow, plus the vo
 **Tests, each seen failing first.** Rust: `voice_outcome_close_the_agent_never_grounds_closing_an_orchestration`, `voice_outcome_start_it_starts_without_asking`, `voice_outcome_a_start_picked_with_the_dialog_closed_opens_it` (red with the exact sentence the user got), and `voice_outcome_the_row_walk_gaps_are_heard` (all seven phrasings refused before); table pins `voice_table_conjunctive_rows_are_the_deliberate_set`, `voice_table_redirecting_rows_are_the_deliberate_set` and `voice_table_close_the_agent_grounds_only_the_view`, plus parser tests for both new columns. Vitest: four rewritten start tests in `VoiceControlCommands.test.tsx`, red against the previous source.
 
 **Phrase fixtures, against gpt-5-mini.** Fourteen new ones for the user's phrasings ("Close the agent" on two screens, "close the agent screen", "stop the agent", "stop the tester agent", "close the build orchestration", "Start the new agent" with the dialog open and closed, "spawn an agent", "I want another agent", "cancel", "never mind", "close the new agent dialog", "show me the deck"), and `start-new-agent-dialog-closed` re-pinned from `unavailable` to opening the dialog. Before the change: **83 of 91**, every failure one of the new targets. On the final table: **90 of 91** and **91 of 91**. The one miss (`open-dir-dialog-closed`, an untouched row, answered `none`) passed in every other run; so did the one-off miss of the intermediate table (`open-deck-unavailable`).
+
+### 2026-09-23 — If a button says it, saying it must work
+
+The user, with an orchestration chosen: *"Using voice, if I set it up to use orchestration, the "Start orchestration" instruction (matches button text) does not work. If I say "Create the agent" it works."* The Start button reads "Start orchestration" once an orchestration is chosen in Mode, and "Start agent" otherwise.
+
+**Cause, measured rather than assumed.** On the default backend (`gpt-5-mini`) the model answered `none`, *no matching action*, for "Start orchestration" and "start the orchestration", with the dialog open and with it closed. It did not answer `choose_mode` as first suspected. `start_new_agent`'s description never mentioned an orchestration, and `choose_mode` claimed the word `orchestration` without being a start. So nothing claimed the button's words.
+
+**The rule that came out of it**, recorded in `docs/develop/voice-first-design.md` beside the ambiguity principle and as checklist item 9: a control's visible label is part of its voice vocabulary. A sweep of every label on the dialog and the overview found three mismatches beyond the reported one:
+
+- "Start agent" (the other Start label) was answered as `open_new_agent` while the dialog was open. The overview does not serve that row there, so the user was told "That command is not wired to anything in this build".
+- "Close new agent" (the dialog X's accessible name) was refused, because the dialog's whole-utterance list had only "close the new agent dialog".
+- The table said nothing about the orchestration card's bare "Close". That one is deliberately *not* a voice phrase for its control: it closes a view and stops nothing.
+
+The doc lists every deliberate exception with its reason.
+
+**What changed.**
+- `start_new_agent` names both labels. `choose_mode` says it chooses a named chip, and that the Start button's words are the start.
+- `close`'s dialog list gains "close new agent".
+- `open_new_agent` now `requires = ["new_agent_dialog_closed"]`, a new `Requirement` met by the absence of a declaration.
+- The redirect column is renamed `unavailable_opens` → `unavailable_redirects`, now that it points both ways. `open_new_agent` → `start_new_agent` hands a pick of the opener over an open dialog to the start, only when the start's own words ground the utterance and the pick names no deck.
+
+The last change is deterministic rather than a prompt change because a sentence added to the opener's description coincided with *more* open-dialog starts going to the opener (three fixtures in the next run, against one in the baseline). The start's description also regained "pick it however insistently it is asked for". That sentence had been removed for the closed-dialog case, which the redirect now covers.
+
+**Tests.**
+- Rust: `voice_outcome_start_orchestration_starts_the_run`, `voice_outcome_every_control_label_asks_for_its_own_row` (16 labels, each read out of the TSX so a rename fails beside the vocabulary), `voice_outcome_label_phrasings_are_in_the_rows_prompt`, `voice_outcome_a_bare_close_label_stops_nothing`, `voice_outcome_close_new_agent_closes_the_dialog` and `voice_outcome_an_opener_picked_over_the_open_dialog_presses_its_start`, plus the widened `voice_table_redirecting_rows_are_the_deliberate_set`.
+- Vitest: `starts the chosen orchestration when the Start button's label is said`.
+
+**Phrase fixtures, against gpt-5-mini.** 13 new ones, one per label as said (91 → 104):
+
+| run | table | passed |
+| --- | --- | --- |
+| baseline | old | 98 of 104 — five new label fixtures plus `open-dir-dialog-closed` failed |
+| 1 | prompt changes only | 100 |
+| 2 | with the redirect | 103 |
+| 3 | intermediate | 103 |
+| 4 | intermediate | 103 |
+| 5 | final | 104 |
+
+Every miss after the baseline was a different single fixture, and each passed in the other runs.

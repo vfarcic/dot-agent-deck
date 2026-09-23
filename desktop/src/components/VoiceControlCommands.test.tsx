@@ -1802,7 +1802,9 @@ describe("PRD #802 D5 — a spoken stop opens a confirmation; a spoken start sta
    */
   function d5Voice(declared: () => VoiceNewAgentDto | undefined): ResolveVoice {
     return vi.fn(async (utterance: string) => {
-      if (utterance === "start it" || utterance === "start the new agent") {
+      // "Start orchestration" is the Start button's own label with an
+      // orchestration chosen — the label rule (PRD #1223).
+      if (utterance === "start it" || utterance === "start the new agent" || utterance === "Start orchestration") {
         // With the dialog closed the callable row that answers "start" is
         // `open_new_agent` (D3); with it open, `start_new_agent` starts.
         if (!declared()) return dispatch("open_new_agent", "openNewAgent", "Opening the New agent dialog.", utterance);
@@ -1977,6 +1979,32 @@ describe("PRD #802 D5 — a spoken stop opens a confirmation; a spoken start sta
     await flush();
 
     expect(confirmation()).toBeNull();
+    expect(runAction).toHaveBeenCalledTimes(1);
+    expect(runAction.mock.calls[0][0]).toMatchObject({ type: "start_orchestration", orchestration: "audit", path: "/home/dev/billing" });
+  });
+
+  /**
+   * Scenario: the user's own report. With the `audit` orchestration chosen in
+   * Mode the Start button reads "Start orchestration"; the user reads it aloud
+   * and the orchestration launches — the button's words work as a command.
+   */
+  it("starts the chosen orchestration when the Start button's label is said", async () => {
+    const voice = microphone([]);
+    const { deck, runAction } = d5Deck(voice);
+    render(<DeckShell runtime={deck} initialView={{ kind: "overview" }} />);
+    await turnVoiceOn();
+    await openDialog();
+    await chooseBilling();
+    fireEvent.click(screen.getByTestId("new-agent-mode-orch:audit"));
+    await flush();
+    expect(screen.getByTestId("new-agent-start")).toHaveTextContent("Start orchestration");
+
+    voice.deliver("Start orchestration");
+    await completeUtterance();
+    await flush();
+
+    expect(confirmation()).toBeNull();
+    expect(screen.getByTestId("voice-report")).toHaveTextContent("Starting the agent.");
     expect(runAction).toHaveBeenCalledTimes(1);
     expect(runAction.mock.calls[0][0]).toMatchObject({ type: "start_orchestration", orchestration: "audit", path: "/home/dev/billing" });
   });

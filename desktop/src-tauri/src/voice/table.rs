@@ -194,8 +194,10 @@ impl fmt::Display for ParamKind {
 ///
 /// Each one is answered by what the webview DECLARED with the utterance
 /// ([`super::VoiceDirectories`]), never by a guess: absent declaration, every
-/// requirement is unmet and the row is `callable: false`, which is what
-/// "dispatching into a closed dialog" is refused as.
+/// requirement but one is unmet and the row is `callable: false`, which is what
+/// "dispatching into a closed dialog" is refused as. The one is
+/// [`Requirement::NewAgentDialogClosed`], which is the ABSENCE of a
+/// declaration and so is met exactly then.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Requirement {
@@ -214,14 +216,22 @@ pub enum Requirement {
     /// sentence the dialog says ("choose a directory first"), not a hint about
     /// being somewhere else.
     NewAgentDialog,
+    /// The New agent dialog is NOT open — what opening it needs (PRD #1223).
+    /// `open_new_agent` used to be callable over an open dialog, which the
+    /// overview does not serve, so a model that read "Start agent" (the
+    /// dialog's own button) as that row got "That command is not wired to
+    /// anything in this build." Held to this, such a pick is not callable and
+    /// `unavailable_redirects` hands it to the start the words asked for.
+    NewAgentDialogClosed,
 }
 
 impl Requirement {
-    pub const ALL: [Requirement; 4] = [
+    pub const ALL: [Requirement; 5] = [
         Requirement::DirectoryListing,
         Requirement::ParentDirectory,
         Requirement::NewAgentForm,
         Requirement::NewAgentDialog,
+        Requirement::NewAgentDialogClosed,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -230,6 +240,7 @@ impl Requirement {
             Requirement::ParentDirectory => "parent_directory",
             Requirement::NewAgentForm => "new_agent_form",
             Requirement::NewAgentDialog => "new_agent_dialog",
+            Requirement::NewAgentDialogClosed => "new_agent_dialog_closed",
         }
     }
 
@@ -246,6 +257,7 @@ impl Requirement {
             Requirement::ParentDirectory => "while a directory with a parent is showing",
             Requirement::NewAgentForm => "while the New agent form is open",
             Requirement::NewAgentDialog => "while the New agent dialog is open",
+            Requirement::NewAgentDialogClosed => "while the New agent dialog is closed",
         }
     }
 
@@ -260,6 +272,7 @@ impl Requirement {
             Requirement::ParentDirectory => directories.is_some_and(|listing| listing.has_parent),
             Requirement::NewAgentForm => new_agent.is_some_and(|dialog| dialog.form.is_some()),
             Requirement::NewAgentDialog => new_agent.is_some(),
+            Requirement::NewAgentDialogClosed => new_agent.is_none(),
         }
     }
 }
@@ -374,17 +387,29 @@ pub struct CommandRow {
     /// ([`TableError::MisplacedGroundingAlso`]), and under the same own-words
     /// rule.
     pub grounding_also: Vec<String>,
-    /// The row that must be OPEN before this one can run — the
-    /// `unavailable_opens` column (PRD #1223, D3). A pick of this row that is
-    /// not callable dispatches that row instead, with no params, when it is
-    /// callable and grounded by the same words. `start_new_agent` →
-    /// `open_new_agent`, and nothing else: a bare "start it" with the dialog
-    /// closed was answered with the start row in every measured run, whatever
-    /// its description said, and "Not here — say 'new agent' first" is a
-    /// sentence the target row makes unnecessary. The parser holds the target
-    /// to existing, being another row, and taking no required param
-    /// ([`TableError::UnknownUnavailableOpens`]).
-    pub unavailable_opens: Option<String>,
+    /// The row that answers the same words where this one cannot run — the
+    /// `unavailable_redirects` column (PRD #1223, D3; named `unavailable_opens`
+    /// while its only use opened something). A pick of this row that is not
+    /// callable dispatches that row instead, with no params, when it is
+    /// callable and grounded by the same words. Two rows use it, and they are
+    /// each other's targets across the New agent dialog's one boundary:
+    ///
+    /// - `start_new_agent` → `open_new_agent`: a bare "start it" with the
+    ///   dialog closed was answered with the start row in every measured run,
+    ///   whatever its description said, and "Not here — say 'new agent' first"
+    ///   is a sentence the target row makes unnecessary.
+    /// - `open_new_agent` → `start_new_agent`: with the dialog OPEN, "Start
+    ///   agent" (its button) and "Start the new agent" were answered with the
+    ///   opener, which the open dialog cannot serve. The start is reached only
+    ///   through its OWN grounding — a start word in the transcript — which is
+    ///   what lets it start without a confirmation at all, so the redirect adds
+    ///   no path to a start that saying "start it" did not already have.
+    ///
+    /// The two can never chain: each redirects only where its target is
+    /// callable, and their requirements are exact complements. The parser holds
+    /// the target to existing, being another row, and taking no required param
+    /// ([`TableError::UnknownUnavailableRedirect`]).
+    pub unavailable_redirects: Option<String>,
 }
 
 /// A row's grounding while one [`Requirement`] holds (PRD #1223, closing
@@ -814,13 +839,13 @@ impl CommandTable {
                 grounding,
                 grounding_while,
                 grounding_also,
-                unavailable_opens: row.unavailable_opens,
+                unavailable_redirects: row.unavailable_redirects,
             });
         }
 
         // Checked once every row exists, since a target may come later.
         for row in &commands {
-            let Some(target) = row.unavailable_opens.as_deref() else {
+            let Some(target) = row.unavailable_redirects.as_deref() else {
                 continue;
             };
             let valid = target != row.id
@@ -828,7 +853,7 @@ impl CommandTable {
                     candidate.id == target && candidate.params.iter().all(|param| param.optional)
                 });
             if !valid {
-                return Err(TableError::UnknownUnavailableOpens {
+                return Err(TableError::UnknownUnavailableRedirect {
                     id: row.id.clone(),
                     target: target.to_string(),
                 });
@@ -989,9 +1014,9 @@ pub enum TableError {
     /// A `heard_as_also` on a row that is not token-grounded by `heard_as`,
     /// or that also declares `heard_as_whole_while`.
     MisplacedGroundingAlso { id: String },
-    /// An `unavailable_opens` naming no row, the row itself, or a row with a
+    /// An `unavailable_redirects` naming no row, the row itself, or a row with a
     /// required param — none of which a redirect with no params can dispatch.
-    UnknownUnavailableOpens { id: String, target: String },
+    UnknownUnavailableRedirect { id: String, target: String },
 }
 
 impl fmt::Display for TableError {
@@ -1098,9 +1123,9 @@ impl fmt::Display for TableError {
                 f,
                 "command `{id}` declares `heard_as_also` without `heard_as`, or beside `heard_as_whole_while`; it only adds a second list to a token grounding"
             ),
-            TableError::UnknownUnavailableOpens { id, target } => write!(
+            TableError::UnknownUnavailableRedirect { id, target } => write!(
                 f,
-                "command `{id}`'s `unavailable_opens` names `{target}`, which is not another row that takes no required param"
+                "command `{id}`'s `unavailable_redirects` names `{target}`, which is not another row that takes no required param"
             ),
         }
     }
@@ -1851,6 +1876,9 @@ mod tests {
                     "close the dialog",
                     "close this dialog",
                     "close the new agent dialog",
+                    // The dialog's X button's accessible name (PRD #1223's
+                    // label rule).
+                    "close new agent",
                     "cancel",
                     "cancel this",
                     "cancel it",
@@ -2460,25 +2488,47 @@ mod tests {
         }
     }
 
-    /// The rows whose unavailable pick opens another row instead (PRD #1223,
-    /// D3), pinned: a start with the New agent dialog closed opens it, and
-    /// nothing else redirects.
+    /// The rows whose unavailable pick dispatches another row instead (PRD
+    /// #1223, D3), pinned: a start with the New agent dialog closed opens it,
+    /// an opener picked with the dialog open presses its Start when the words
+    /// ask to start, and nothing else redirects.
     #[test]
     fn voice_table_redirecting_rows_are_the_deliberate_set() {
         let redirecting: Vec<(&str, &str)> = super::table()
             .rows()
             .iter()
             .filter_map(|row| {
-                row.unavailable_opens
+                row.unavailable_redirects
                     .as_deref()
                     .map(|target| (row.id.as_str(), target))
             })
             .collect();
-        assert_eq!(redirecting, vec![("start_new_agent", "open_new_agent")]);
+        assert_eq!(
+            redirecting,
+            vec![
+                ("open_new_agent", "start_new_agent"),
+                ("start_new_agent", "open_new_agent"),
+            ]
+        );
+        // Each other's targets, so they must never both be uncallable where a
+        // redirect is asked for: their requirements are exact complements.
+        let table = super::table();
+        let open = table.row("open_new_agent").expect("present");
+        let start = table.row("start_new_agent").expect("present");
+        assert_eq!(open.requires, vec![Requirement::NewAgentDialogClosed]);
+        assert_eq!(start.requires, vec![Requirement::NewAgentDialog]);
+        let dialog = VoiceNewAgent { form: None };
+        for declared in [None, Some(&dialog), Some(&form())] {
+            assert_ne!(
+                open.callable(Screen::Overview, None, declared),
+                start.callable(Screen::Overview, None, declared),
+                "{declared:?}"
+            );
+        }
     }
 
     #[test]
-    fn voice_table_rejects_an_unavailable_opens_it_cannot_dispatch() {
+    fn voice_table_rejects_an_unavailable_redirects_it_cannot_dispatch() {
         // A second row with no params, which a redirect can dispatch.
         let second = [
             "[[commands]]",
@@ -2497,18 +2547,21 @@ mod tests {
                 "{}\n\n{then}",
                 one_row().replace(
                     "heard_as = [\"open\"]",
-                    &format!("heard_as = [\"open\"]\nunavailable_opens = \"{target}\""),
+                    &format!("heard_as = [\"open\"]\nunavailable_redirects = \"{target}\""),
                 )
             )
         };
         let table = CommandTable::parse(&first_opens("second", &second)).expect("parses");
-        assert_eq!(table.rows()[0].unavailable_opens.as_deref(), Some("second"));
+        assert_eq!(
+            table.rows()[0].unavailable_redirects.as_deref(),
+            Some("second")
+        );
         // Itself, or a row that does not exist.
         for bad in ["open_agent", "ghost"] {
             assert!(
                 matches!(
                     CommandTable::parse(&first_opens(bad, &second)),
-                    Err(TableError::UnknownUnavailableOpens { .. })
+                    Err(TableError::UnknownUnavailableRedirect { .. })
                 ),
                 "{bad}"
             );
@@ -2517,7 +2570,7 @@ mod tests {
         let needs_param = one_row().replace("id = \"open_agent\"", "id = \"second\"");
         assert!(matches!(
             CommandTable::parse(&first_opens("second", &needs_param)),
-            Err(TableError::UnknownUnavailableOpens { .. })
+            Err(TableError::UnknownUnavailableRedirect { .. })
         ));
     }
 
@@ -2790,7 +2843,7 @@ struct RawCommand {
     heard_as_whole: Option<Vec<String>>,
     heard_as_whole_while: Option<std::collections::BTreeMap<String, Vec<String>>>,
     heard_as_also: Option<Vec<String>>,
-    unavailable_opens: Option<String>,
+    unavailable_redirects: Option<String>,
     ungrounded: Option<String>,
     #[serde(default)]
     params: Vec<RawParam>,
