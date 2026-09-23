@@ -357,6 +357,34 @@ pub struct CommandRow {
     /// never longer than one ([`TableError::SeveralGroundingsWhile`]). See
     /// [`ContextGrounding`] and [`CommandRow::grounding_for`].
     pub grounding_while: Vec<ContextGrounding>,
+    /// Words the transcript must ALSO contain, beside one of the row's
+    /// `heard_as` entries — the `heard_as_also` column (PRD #1223). Empty for
+    /// every row but `close_orchestration`.
+    ///
+    /// **Why a conjunction.** `close_orchestration` stops every role of a run
+    /// at once, and its verbs are the words a user closes a VIEW with: "close
+    /// the billing agent" grounded it on `close`, and a model reading that as
+    /// the whole `billing` run turned a request to close a pane into a request
+    /// to stop several agents. The rule is that an utterance with a
+    /// destructive and a non-destructive reading resolves to the
+    /// non-destructive one, so this row needs the orchestration or the run
+    /// NAMED as well. Grounding on those nouns alone would have dropped the
+    /// verb — "show me the build orchestration" would ground a stop — so both
+    /// are required. Only valid beside `heard_as`
+    /// ([`TableError::MisplacedGroundingAlso`]), and under the same own-words
+    /// rule.
+    pub grounding_also: Vec<String>,
+    /// The row that must be OPEN before this one can run — the
+    /// `unavailable_opens` column (PRD #1223, D3). A pick of this row that is
+    /// not callable dispatches that row instead, with no params, when it is
+    /// callable and grounded by the same words. `start_new_agent` →
+    /// `open_new_agent`, and nothing else: a bare "start it" with the dialog
+    /// closed was answered with the start row in every measured run, whatever
+    /// its description said, and "Not here — say 'new agent' first" is a
+    /// sentence the target row makes unnecessary. The parser holds the target
+    /// to existing, being another row, and taking no required param
+    /// ([`TableError::UnknownUnavailableOpens`]).
+    pub unavailable_opens: Option<String>,
 }
 
 /// A row's grounding while one [`Requirement`] holds (PRD #1223, closing
@@ -700,6 +728,22 @@ impl CommandTable {
                 });
             }
 
+            // A second list the transcript must also contain. Only beside a
+            // token grounding, and never beside a context: a context replaces
+            // `heard_as` with whole utterances, and nothing would say whether
+            // those must contain these words too.
+            let grounding_also = match row.heard_as_also {
+                None => Vec::new(),
+                Some(phrases) => {
+                    if !matches!(grounding, ActionGrounding::HeardAs(_))
+                        || !grounding_while.is_empty()
+                    {
+                        return Err(TableError::MisplacedGroundingAlso { id: id.clone() });
+                    }
+                    own_words(phrases)?
+                }
+            };
+
             // The suggestion: each placeholder names a REQUIRED param, as a
             // report's does, and the fixed words — the text between
             // placeholders, each run on its own — must ask for the row under
@@ -732,9 +776,15 @@ impl CommandTable {
                 !wanted.is_empty() && words.windows(wanted.len()).any(|window| window == wanted)
             };
             let suggestion_grounded = match &grounding {
-                ActionGrounding::HeardAs(phrases) => segments
-                    .iter()
-                    .any(|words| phrases.iter().any(|phrase| contains(words, phrase))),
+                ActionGrounding::HeardAs(phrases) => {
+                    segments
+                        .iter()
+                        .any(|words| phrases.iter().any(|phrase| contains(words, phrase)))
+                        && (grounding_also.is_empty()
+                            || segments.iter().any(|words| {
+                                grounding_also.iter().any(|phrase| contains(words, phrase))
+                            }))
+                }
                 ActionGrounding::HeardAsWhole(phrases) => {
                     segments.len() == 1
                         && phrases
@@ -763,7 +813,26 @@ impl CommandTable {
                 params,
                 grounding,
                 grounding_while,
+                grounding_also,
+                unavailable_opens: row.unavailable_opens,
             });
+        }
+
+        // Checked once every row exists, since a target may come later.
+        for row in &commands {
+            let Some(target) = row.unavailable_opens.as_deref() else {
+                continue;
+            };
+            let valid = target != row.id
+                && commands.iter().any(|candidate| {
+                    candidate.id == target && candidate.params.iter().all(|param| param.optional)
+                });
+            if !valid {
+                return Err(TableError::UnknownUnavailableOpens {
+                    id: row.id.clone(),
+                    target: target.to_string(),
+                });
+            }
         }
 
         Ok(Self { commands })
@@ -917,6 +986,12 @@ pub enum TableError {
         id: String,
         requirements: Vec<String>,
     },
+    /// A `heard_as_also` on a row that is not token-grounded by `heard_as`,
+    /// or that also declares `heard_as_whole_while`.
+    MisplacedGroundingAlso { id: String },
+    /// An `unavailable_opens` naming no row, the row itself, or a row with a
+    /// required param — none of which a redirect with no params can dispatch.
+    UnknownUnavailableOpens { id: String, target: String },
 }
 
 impl fmt::Display for TableError {
@@ -1018,6 +1093,14 @@ impl fmt::Display for TableError {
                 f,
                 "command `{id}` declares `heard_as_whole_while` for more than one context ({}); a row takes one, since nothing would decide which grounds it where both hold",
                 joined(requirements.iter().map(String::as_str))
+            ),
+            TableError::MisplacedGroundingAlso { id } => write!(
+                f,
+                "command `{id}` declares `heard_as_also` without `heard_as`, or beside `heard_as_whole_while`; it only adds a second list to a token grounding"
+            ),
+            TableError::UnknownUnavailableOpens { id, target } => write!(
+                f,
+                "command `{id}`'s `unavailable_opens` names `{target}`, which is not another row that takes no required param"
             ),
         }
     }
@@ -1142,8 +1225,10 @@ mod tests {
                 ("choose_mode", "chooseNewAgentMode", vec!["overview"]),
                 ("choose_agent_type", "chooseNewAgentType", vec!["overview"]),
                 ("name_new_agent", "nameNewAgent", vec!["overview"]),
+                // The dialog's own start — no confirmation since PRD #802 D5's
+                // start half was revisited (PRD #1223, 2026-09-23).
+                ("start_new_agent", "startNewAgent", vec!["overview"]),
                 // PRD #802 D5's set: each only opens a confirmation.
-                ("start_new_agent", "confirmStartNewAgent", vec!["overview"]),
                 ("stop_agent", "confirmStopAgent", vec!["overview"]),
                 (
                     "close_orchestration",
@@ -1747,6 +1832,8 @@ mod tests {
                     "return to the deck",
                     "the deck",
                     "deck",
+                    "show me the deck",
+                    "show the deck",
                     "show the terminals",
                 ]
                 .map(String::from)
@@ -1763,6 +1850,11 @@ mod tests {
                     "close it",
                     "close the dialog",
                     "close this dialog",
+                    "close the new agent dialog",
+                    "cancel",
+                    "cancel this",
+                    "cancel it",
+                    "never mind",
                     "dismiss",
                     "dismiss this",
                     "hide this",
@@ -2304,10 +2396,17 @@ mod tests {
         }
     }
 
-    /// PRD #802 D5, as a property of the table: the rows that start or stop
-    /// something are exactly these three, each dispatches a registry entry
-    /// that only opens a confirmation, and each tells the model — and the
-    /// user, in its report — that nothing has happened yet.
+    /// PRD #802 D5, as a property of the table: the rows that STOP something
+    /// are exactly these two, each dispatches a registry entry that only opens
+    /// a confirmation, and each tells the model — and the user, in its report
+    /// — that nothing has happened yet.
+    ///
+    /// **This pin used to hold three rows, and `start_new_agent` left it
+    /// deliberately** (PRD #1223, 2026-09-23): D5's start half was revisited —
+    /// the reasons are in PRD #802's D5 and `docs/develop/voice-first-design.md`
+    /// — so the start now presses the dialog's own Start, and the second half
+    /// of this test pins that it does so honestly rather than still claiming to
+    /// ask.
     #[test]
     fn voice_table_d5_rows_only_ask() {
         let table = super::table();
@@ -2320,7 +2419,6 @@ mod tests {
         assert_eq!(
             asking,
             vec![
-                ("start_new_agent", "confirmStartNewAgent"),
                 ("stop_agent", "confirmStopAgent"),
                 ("close_orchestration", "confirmCloseOrchestration"),
             ]
@@ -2339,13 +2437,202 @@ mod tests {
             );
             assert_eq!(row.screens, vec![Screen::Overview], "{id}");
         }
-        let start = table.row("start_new_agent").expect("present");
-        assert_eq!(start.requires, vec![Requirement::NewAgentDialog]);
-        assert!(start.params.is_empty());
         let stop = table.row("stop_agent").expect("present");
         assert_eq!(stop.params[0].kind, ParamKind::AgentRef);
         let close = table.row("close_orchestration").expect("present");
         assert_eq!(close.params[0].kind, ParamKind::OrchestrationRef);
+
+        // The start: the dialog's own Start, and nothing in its row may still
+        // tell the model or the user that it asks first.
+        let start = table.row("start_new_agent").expect("present");
+        assert_eq!(start.invoke, "startNewAgent");
+        assert_eq!(start.requires, vec![Requirement::NewAgentDialog]);
+        assert_eq!(start.screens, vec![Screen::Overview]);
+        assert!(start.params.is_empty());
+        assert_eq!(start.report, "Starting the agent.");
+        for claim in ["confirm", "by itself", "nothing has"] {
+            assert!(
+                !start.description.contains(claim) && !start.report.contains(claim),
+                "start_new_agent still claims `{claim}`: {} / {}",
+                start.description,
+                start.report
+            );
+        }
+    }
+
+    /// The rows whose unavailable pick opens another row instead (PRD #1223,
+    /// D3), pinned: a start with the New agent dialog closed opens it, and
+    /// nothing else redirects.
+    #[test]
+    fn voice_table_redirecting_rows_are_the_deliberate_set() {
+        let redirecting: Vec<(&str, &str)> = super::table()
+            .rows()
+            .iter()
+            .filter_map(|row| {
+                row.unavailable_opens
+                    .as_deref()
+                    .map(|target| (row.id.as_str(), target))
+            })
+            .collect();
+        assert_eq!(redirecting, vec![("start_new_agent", "open_new_agent")]);
+    }
+
+    #[test]
+    fn voice_table_rejects_an_unavailable_opens_it_cannot_dispatch() {
+        // A second row with no params, which a redirect can dispatch.
+        let second = [
+            "[[commands]]",
+            "id = \"second\"",
+            "description = \"Open the list.\"",
+            "invoke = \"openList\"",
+            "unavailable_hint = \"it works anywhere\"",
+            "report = \"Opening the list.\"",
+            "asks_to = \"open the list\"",
+            "try_saying = \"open the list\"",
+            "heard_as = [\"open\"]",
+        ]
+        .join("\n");
+        let first_opens = |target: &str, then: &str| {
+            format!(
+                "{}\n\n{then}",
+                one_row().replace(
+                    "heard_as = [\"open\"]",
+                    &format!("heard_as = [\"open\"]\nunavailable_opens = \"{target}\""),
+                )
+            )
+        };
+        let table = CommandTable::parse(&first_opens("second", &second)).expect("parses");
+        assert_eq!(table.rows()[0].unavailable_opens.as_deref(), Some("second"));
+        // Itself, or a row that does not exist.
+        for bad in ["open_agent", "ghost"] {
+            assert!(
+                matches!(
+                    CommandTable::parse(&first_opens(bad, &second)),
+                    Err(TableError::UnknownUnavailableOpens { .. })
+                ),
+                "{bad}"
+            );
+        }
+        // A target with a required param cannot be dispatched with none.
+        let needs_param = one_row().replace("id = \"open_agent\"", "id = \"second\"");
+        assert!(matches!(
+            CommandTable::parse(&first_opens("second", &needs_param)),
+            Err(TableError::UnknownUnavailableOpens { .. })
+        ));
+    }
+
+    /// The rows that need a SECOND list heard beside `heard_as` (PRD #1223,
+    /// D1), pinned with their words: exactly `close_orchestration`, the row
+    /// that stops several agents at once, whose verbs are also the words a
+    /// user closes a view with. "Close the agent" must never ground it.
+    #[test]
+    fn voice_table_conjunctive_rows_are_the_deliberate_set() {
+        let conjunctive: Vec<(&str, Vec<&str>)> = super::table()
+            .rows()
+            .iter()
+            .filter(|row| !row.grounding_also.is_empty())
+            .map(|row| {
+                (
+                    row.id.as_str(),
+                    row.grounding_also.iter().map(String::as_str).collect(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            conjunctive,
+            vec![(
+                "close_orchestration",
+                vec![
+                    "orchestration",
+                    "run",
+                    "every role",
+                    "all roles",
+                    "all the roles"
+                ]
+            )]
+        );
+    }
+
+    /// D1's rule as a table property: no row that STOPS something is grounded
+    /// by "close the agent" or its view synonyms, and `close` is.
+    #[test]
+    fn voice_table_close_the_agent_grounds_only_the_view() {
+        let table = super::table();
+        let close = table.row("close").expect("present");
+        let ActionGrounding::HeardAs(close_words) = &close.grounding else {
+            panic!("close is token-grounded");
+        };
+        assert!(close_words.iter().any(|word| word == "close"));
+        let stop = table.row("stop_agent").expect("present");
+        let ActionGrounding::HeardAs(stop_words) = &stop.grounding else {
+            panic!("stop_agent is token-grounded");
+        };
+        assert!(
+            !stop_words
+                .iter()
+                .any(|word| spoken_words(word).contains(&"close".to_string())),
+            "stop_agent must not answer to close: {stop_words:?}"
+        );
+        let orchestration = table.row("close_orchestration").expect("present");
+        for said in [
+            "close the agent",
+            "close the agent screen",
+            "close the billing agent",
+        ] {
+            let words = spoken_words(said);
+            assert!(
+                !orchestration
+                    .grounding_also
+                    .iter()
+                    .any(|entry| words.contains(entry)),
+                "{said} must not name an orchestration"
+            );
+        }
+    }
+
+    #[test]
+    fn voice_table_parses_heard_as_also_only_beside_a_token_grounding() {
+        let with = |column: &str| {
+            one_row().replace("heard_as = [\"open\"]", column).replace(
+                "try_saying = \"open {agent}\"",
+                "try_saying = \"open agent {agent}\"",
+            )
+        };
+        let table =
+            CommandTable::parse(&with("heard_as = [\"open\"]\nheard_as_also = [\"agent\"]"))
+                .expect("parses");
+        assert_eq!(table.rows()[0].grounding_also, vec!["agent".to_string()]);
+        // A suggestion must satisfy BOTH lists, or the refusal would suggest a
+        // phrasing that is itself refused.
+        let bare = one_row().replace(
+            "heard_as = [\"open\"]",
+            "heard_as = [\"open\"]\nheard_as_also = [\"agent\"]",
+        );
+        assert!(matches!(
+            CommandTable::parse(&bare),
+            Err(TableError::UngroundedTrySaying { .. })
+        ));
+        for misplaced in [
+            "heard_as_whole = [\"open\"]\nheard_as_also = [\"agent\"]",
+            "ungrounded = \"because\"\nheard_as_also = [\"agent\"]",
+            "heard_as = [\"open\"]\nheard_as_whole_while.new_agent_dialog = [\"open\"]\nheard_as_also = [\"agent\"]",
+        ] {
+            assert!(
+                matches!(
+                    CommandTable::parse(&with(misplaced)),
+                    Err(TableError::MisplacedGroundingAlso { .. })
+                ),
+                "{misplaced}"
+            );
+        }
+        assert!(matches!(
+            CommandTable::parse(&with("heard_as = [\"open\"]\nheard_as_also = [\"send\"]")),
+            Err(TableError::ForeignHeardAs { .. })
+        ));
+        assert!(matches!(
+            CommandTable::parse(&with("heard_as = [\"open\"]\nheard_as_also = []")),
+            Err(TableError::MissingGrounding { .. })
+        ));
     }
 
     /// "start it" needs the dialog OPEN, not a complete form: an incomplete
@@ -2502,6 +2789,8 @@ struct RawCommand {
     heard_as: Option<Vec<String>>,
     heard_as_whole: Option<Vec<String>>,
     heard_as_whole_while: Option<std::collections::BTreeMap<String, Vec<String>>>,
+    heard_as_also: Option<Vec<String>>,
+    unavailable_opens: Option<String>,
     ungrounded: Option<String>,
     #[serde(default)]
     params: Vec<RawParam>,

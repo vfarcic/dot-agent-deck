@@ -264,15 +264,22 @@ export type VoiceActionContext = {
   chooseNewAgentType: (target: VoiceDispatchTarget) => string | undefined;
   nameNewAgent: (target: VoiceDispatchTarget) => string | undefined;
   /**
-   * PRD #802 D5 — the three voice members that lead to a START or a STOP, and
-   * the one rule they share: **each can only OPEN a confirmation.** None of
-   * them runs a deck action; the confirmation's own button does, pressed by
-   * the user. So a misheard or over-confident answer costs a dialog the user
-   * dismisses, never an agent nobody sanctioned.
+   * The New agent dialog's start, by voice — the Start button, acting on the
+   * form as it is, which the user is looking at: it starts at once, or answers
+   * what is missing. **It used to open a confirmation**; PRD #802 D5's start
+   * half was revisited on 2026-09-23 (PRD #1223), for the reasons recorded
+   * there and in `docs/develop/voice-first-design.md`.
+   */
+  startNewAgent: (target: VoiceDispatchTarget) => string | undefined;
+  /**
+   * PRD #802 D5 — the two voice members that lead to a STOP, and the one rule
+   * they share: **each can only OPEN a confirmation.** Neither runs a deck
+   * action; the confirmation's own button does, pressed by the user. So a
+   * misheard or over-confident answer costs a dialog the user dismisses, never
+   * an agent stopped that nobody meant to stop. They keep it where the start
+   * did not because they are destructive, their target may be off-screen, and
+   * an orchestration close takes several roles at once.
    *
-   * - `confirmStartNewAgent` — the New agent dialog's start, acting on the form
-   *   as it is: it opens the dialog's start confirmation naming the deck, the
-   *   directory, the mode and the command, or answers what is missing.
    * - `confirmStopAgent` — the overview row's Stop, for the agent an
    *   `agent_ref` resolved to: the same confirmation that button opens.
    * - `confirmCloseOrchestration` — an orchestration card's Close, for the
@@ -283,7 +290,6 @@ export type VoiceActionContext = {
    * saying why it did not. The table's own `confirm` column PRD #802
    * anticipates is not built; this frontend gate is what satisfies D5 today.
    */
-  confirmStartNewAgent: (target: VoiceDispatchTarget) => string | undefined;
   confirmStopAgent: (target: VoiceDispatchTarget) => string | undefined;
   confirmCloseOrchestration: (target: VoiceDispatchTarget) => string | undefined;
 };
@@ -640,21 +646,25 @@ export const VOICE_ACTIONS = {
     },
   },
 
-  /* PRD #802 D5 — the three rows that START or STOP something. Each entry
-     calls a member that can only OPEN a confirmation (see the members' own
-     comment on `VoiceActionContext`), so voice never reaches `runAction` for
-     a start or a stop: the confirmation's button does, pressed by hand. The
-     manual controls — the dialog's Start, a row's Stop, a card's Close — keep
-     exactly the behaviour they had and do not route through these. */
-  confirmStartNewAgent: {
-    label: "Ask to start the agent the New agent form describes",
+  /* The New agent dialog's Start, by voice (PRD #1223). It calls the function
+     the button calls and starts at once — PRD #802 D5's start half was
+     revisited on 2026-09-23 — or reports why the form cannot start. */
+  startNewAgent: {
+    label: "Start the agent the New agent form describes",
     voice: true,
-    needs: ["confirmStartNewAgent", "reportRefused"],
-    run: (context: Pick<VoiceActionContext, "confirmStartNewAgent" | "reportRefused">, target: VoiceDispatchTarget) => {
-      const refused = context.confirmStartNewAgent(target);
+    needs: ["startNewAgent", "reportRefused"],
+    run: (context: Pick<VoiceActionContext, "startNewAgent" | "reportRefused">, target: VoiceDispatchTarget) => {
+      const refused = context.startNewAgent(target);
       if (refused !== undefined) context.reportRefused(refused);
     },
   },
+
+  /* PRD #802 D5 — the two rows that STOP something. Each entry calls a member
+     that can only OPEN a confirmation (see the members' own comment on
+     `VoiceActionContext`), so voice never reaches `runAction` for a stop: the
+     confirmation's button does, pressed by hand. The manual controls — a
+     row's Stop, a card's Close — keep exactly the behaviour they had and do
+     not route through these. */
 
   confirmStopAgent: {
     label: "Ask to stop one agent on the overview",
@@ -885,7 +895,7 @@ export type VoiceScreenContext = Omit<VoiceActionContext, keyof VoicePanelContex
 export type VoiceOverviewContext = Pick<VoiceActionContext, "openNewAgent" | "closeNewAgent" | "openDirectory" | "goToParentDirectory" | "useThisDirectory" | NewAgentFormMember | "confirmStopAgent" | "confirmCloseOrchestration">;
 
 /** The New agent form's members, served — like the browser's — from the dialog's slot. */
-export type NewAgentFormMember = "chooseNewAgentMode" | "chooseNewAgentType" | "nameNewAgent" | "confirmStartNewAgent";
+export type NewAgentFormMember = "chooseNewAgentMode" | "chooseNewAgentType" | "nameNewAgent" | "startNewAgent";
 
 /**
  * What the New agent dialog publishes about its directory browser (PRD #1223),

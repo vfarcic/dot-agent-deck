@@ -2,7 +2,6 @@ import { Fragment, useCallback, useEffect, useId, useMemo, useRef, useState, typ
 import { ArrowUp, Check, Folder, FolderGit2, Loader2, Plus, Server, X } from "lucide-react";
 import { LaunchCleanupError } from "../lib/actionError";
 import { CleanupWarning } from "./CleanupWarning";
-import { ConfirmDialog, type ConfirmState } from "./ConfirmDialog";
 import { DISPLAY_LIMITS, displayText } from "../lib/displayText";
 import { useInertBackground } from "../hooks/useInertBackground";
 import {
@@ -113,8 +112,6 @@ export const MODE_NOT_OFFERED = "That mode is not offered on this form any more,
 export const AGENT_TYPE_NOT_OFFERED = "That agent is not offered on this deck any more, so the Command was not changed.";
 /** An orchestration is selected, so there is no Command field to fill. */
 export const COMMAND_HIDDEN_BY_ORCHESTRATION = "An orchestration is selected and each of its roles runs its own command, so the Command was not changed.";
-/** The start confirmation is showing; a fill would change what it describes. */
-export const FORM_UNDER_CONFIRMATION = "The start confirmation is open, so the form was not changed. Answer it first.";
 /** The words after "name it" were only punctuation. */
 export const NO_NAME_HEARD = "No name was heard after that, so the Name was not changed.";
 
@@ -131,10 +128,6 @@ export const START_NEEDS_DECK = "Nothing was started: choose a deck first.";
 export const START_NEEDS_DIRECTORY = "Nothing was started: choose a directory first — the agent needs one to start in.";
 /** A start is already in flight or waiting for the deck to list it. */
 export const START_IN_FLIGHT = "A start is already under way, so nothing else was started.";
-/** The start confirmation is already showing. */
-export const START_AWAITING_CONFIRMATION = "The start is already waiting for your confirmation in the dialog. Nothing else was started.";
-/** The form changed between the confirmation opening and being confirmed. */
-export const START_FORM_CHANGED = "The form changed after the confirmation opened, so nothing was started. Check it and start again.";
 
 /**
  * A spoken Name as the Name field takes it: the words after the marked
@@ -266,12 +259,6 @@ export function NewAgentDialog({ runtime, initialDeckId, onClose, onAppeared, on
    */
   const projectMarks = useRef(new Map<string, boolean>());
   const [phase, setPhase] = useState<"idle" | "starting" | "waiting">("idle");
-  /**
-   * PRD #802 D5 — the confirmation a SPOKEN start opens, and the form it was
-   * opened on. The manual Start button never opens it: it starts as it always
-   * has. See `voiceRequestStart`.
-   */
-  const [startConfirm, setStartConfirm] = useState<{ state: ConfirmState; signature: string }>();
   const [awaiting, setAwaiting] = useState<{ deckId: string; agentId: string; deckName: string; agentName: string }>();
 
   const deckListRef = useRef<HTMLUListElement>(null);
@@ -644,7 +631,6 @@ export function NewAgentDialog({ runtime, initialDeckId, onClose, onAppeared, on
    */
   const formMovedOn = (dispatch: VoiceDispatchTarget): string | undefined => {
     if (!deck || !target || phase !== "idle") return NO_NEW_AGENT_FORM;
-    if (startConfirm) return FORM_UNDER_CONFIRMATION;
     const declared = dispatch.declaredForm;
     if (!declared || declared.deckId !== deck.deckId || declared.path !== target.path) return FORM_MOVED_ON;
     return undefined;
@@ -675,12 +661,8 @@ export function NewAgentDialog({ runtime, initialDeckId, onClose, onAppeared, on
     setName(spoken);
     return undefined;
   };
-  /**
-   * Whether the form's fields are live — what a click on one of them needs —
-   * and, for voice, not under a start confirmation: a fill while the
-   * confirmation is showing would change what it describes behind its back.
-   */
-  const formLive = deck !== undefined && target !== undefined && phase === "idle" && startConfirm === undefined;
+  /** Whether the form's fields are live — what a click on one of them needs. */
+  const formLive = deck !== undefined && target !== undefined && phase === "idle";
 
   /*
     The slot, rewritten every render — no dependency array, for `closeRequest`'s
@@ -726,7 +708,7 @@ export function NewAgentDialog({ runtime, initialDeckId, onClose, onAppeared, on
       chooseNewAgentMode: voiceChooseMode,
       chooseNewAgentType: voiceChooseAgentType,
       nameNewAgent: voiceNameNewAgent,
-      confirmStartNewAgent: voiceRequestStart,
+      startNewAgent: voiceStart,
     };
     return () => { voice.current = undefined; };
   });
@@ -878,66 +860,36 @@ export function NewAgentDialog({ runtime, initialDeckId, onClose, onAppeared, on
   };
 
   /**
-   * PRD #802 D5 — a spoken "start it": it fills nothing and STARTS NOTHING. It
-   * acts on the form as it is and opens a confirmation whose body states the
-   * risk — the deck, the directory, the mode and the command that will run —
-   * and only that confirmation's button, pressed by hand, calls `submit`.
+   * A spoken "start it" — the Start button, by voice. It fills nothing: it acts
+   * on the form as it is, which the user is looking at, and starts it at once.
    *
-   * A start that cannot happen is refused in words rather than confirmed:
-   * exactly the conditions the Start button is disabled on (no deck, no
-   * directory, a start already under way, a run title already live), plus a
-   * confirmation already showing.
+   * **It used to open a confirmation, and PRD #802 D5's start half was
+   * revisited** (PRD #1223, 2026-09-23). The user's words: "it shows another
+   * popup asking me to confirm. I think that only introduced friction by me
+   * having to give the same instruction twice." What made dropping it safe is
+   * recorded in #802's D5 and `docs/develop/voice-first-design.md`: action
+   * grounding already requires a start word in the transcript, so a hostile
+   * label cannot steer the model into a start; the confirmation re-stated a
+   * form that is on screen; and a mistaken agent is one "close" away. The two
+   * STOPS keep their confirmations.
    *
-   * **Confirming starts exactly what the confirmation showed.** The form's
-   * signature is captured when it opens and compared when it is confirmed;
-   * if anything moved in between — the options landing, a key pressed behind
-   * the scrim — the confirmation starts nothing and says so. `submitRef` is
-   * the LATEST `submit`, so an unchanged form is started from its live state.
+   * A start that cannot happen is refused in words: exactly the conditions the
+   * Start button is disabled on (no deck, no directory, a start already under
+   * way, a run title already live). And an utterance judged against a live
+   * form starts only that form — the confirmation's signature check used to
+   * guarantee "starts what was shown", and this is its replacement: a deck or
+   * directory that moved during the round trip refuses with `FORM_MOVED_ON`,
+   * as every fill does. An edit the declaration does not carry, such as a typed
+   * Name, is on screen and is started, as the Start button would start it.
    */
-  const formSignature = JSON.stringify([deck?.deckId, target?.path, mode, name, selectedOrchestration ? null : command]);
-  const liveSignature = useRef(formSignature);
-  liveSignature.current = formSignature;
-  const submitRef = useRef(submit);
-  submitRef.current = submit;
-  const voiceRequestStart = (): string | undefined => {
-    if (startConfirm) return START_AWAITING_CONFIRMATION;
+  const voiceStart = (dispatch: VoiceDispatchTarget): string | undefined => {
     if (phase !== "idle") return START_IN_FLIGHT;
     if (!deck) return START_NEEDS_DECK;
     if (!target) return START_NEEDS_DIRECTORY;
+    const declared = dispatch.declaredForm;
+    if (declared && (declared.deckId !== deck.deckId || declared.path !== target.path)) return FORM_MOVED_ON;
     if (titleTaken) return `Nothing was started: ${ORCHESTRATION_TITLE_TAKEN}`;
-    const signature = formSignature;
-    const where = displayText(target.displayPath, DISPLAY_LIMITS.path);
-    let title: string;
-    let body: string;
-    if (selectedOrchestration) {
-      const orchestrationName = displayText(selectedOrchestration.displayName, DISPLAY_LIMITS.name);
-      const roles = selectedOrchestration.roles.map((role) => displayText(role.displayName, DISPLAY_LIMITS.name)).join(", ");
-      title = `Start the ${orchestrationName} orchestration?`;
-      body = `You asked by voice to start the ${orchestrationName} orchestration on ${deck.name} in ${where}. Every role starts — ${roles} — each running the command its configuration gives it, as the deck's user, under the run title “${displayText(runTitle ?? "", DISPLAY_LIMITS.name)}”. Nothing has started yet.`;
-    } else {
-      const startCommand = authoringKind ? resolveAuthoringCommand(command, defaultCommand, agents) : command;
-      const runs = startCommand.trim() ? `runs ${displayText(startCommand, DISPLAY_LIMITS.message)}` : "runs the deck's default shell";
-      const modeLabel = modes.find((candidate) => candidate.id === mode)?.label ?? NO_MODE.label;
-      const named = name.trim() ? ` named “${displayText(name.trim(), DISPLAY_LIMITS.name)}”` : "";
-      title = "Start this agent?";
-      body = `You asked by voice to start an agent${named} on ${deck.name} in ${where}. Mode: ${modeLabel}. It ${runs} as the deck's user, with that directory's access, until it is stopped. Nothing has started yet.`;
-    }
-    setStartConfirm({
-      signature,
-      state: {
-        title,
-        body,
-        label: selectedOrchestration ? "Start orchestration" : "Start agent",
-        busyLabel: "Starting…",
-        action: async () => {
-          if (liveSignature.current !== signature) {
-            setFormError(START_FORM_CHANGED);
-            return;
-          }
-          await submitRef.current();
-        },
-      },
-    });
+    void submit();
     return undefined;
   };
 
@@ -1125,10 +1077,7 @@ export function NewAgentDialog({ runtime, initialDeckId, onClose, onAppeared, on
   const onDialogKeyDown = (event: KeyboardEvent<HTMLElement>) => {
     if (event.key === "Escape") {
       event.preventDefault();
-      // Esc answers the innermost thing: a start confirmation is cancelled,
-      // and the dialog under it stays.
-      if (startConfirm) setStartConfirm(undefined);
-      else requestClose();
+      requestClose();
     }
   };
 
@@ -1412,10 +1361,6 @@ export function NewAgentDialog({ runtime, initialDeckId, onClose, onAppeared, on
             {phase === "idle" ? <><Plus size={14} /> {selectedOrchestration ? "Start orchestration" : "Start agent"}</> : phase === "starting" ? "Starting…" : "Opening…"}
           </button>
         </footer>
-        {/* PRD #802 D5 — a spoken start's confirmation. INSIDE the dialog, so
-            `useInertBackground` leaves it reachable; its scrim covers the form,
-            and its Cancel and Esc return to it unchanged. */}
-        {startConfirm && <ConfirmDialog state={startConfirm.state} onClose={() => setStartConfirm(undefined)} />}
       </section>
     </div>
   );

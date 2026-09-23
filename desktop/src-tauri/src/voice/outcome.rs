@@ -539,6 +539,29 @@ pub async fn handle_utterance_with(
     // the row's own hint rather than dispatched into a dialog that cannot take
     // it.
     if !row.callable(screen, directories, new_agent) {
+        // A row that needs another OPEN first (`unavailable_opens`, PRD #1223
+        // D3): "start it" with the New agent dialog closed opens the dialog
+        // rather than being told to say "new agent" first — when the target
+        // can run here and the user's words ground it too. The target only
+        // opens something, and the parser holds it to taking no required
+        // param, so it is dispatched with none.
+        if let Some(target) = row
+            .unavailable_opens
+            .as_deref()
+            .and_then(|id| table.row(id))
+            .filter(|target| {
+                target.callable(screen, directories, new_agent)
+                    && action_grounded(target, transcript.text(), directories, new_agent)
+            })
+        {
+            return finish(VoiceOutcome::Dispatch {
+                sentence: report(target, &[]),
+                transcript,
+                action: target.id.clone(),
+                invoke: target.invoke.clone(),
+                params: Vec::new(),
+            });
+        }
         return finish(VoiceOutcome::unavailable(transcript, row));
     }
     if withheld && needs_labels(row) {
@@ -1219,9 +1242,13 @@ fn action_grounded(
 ) -> bool {
     match row.grounding_for(directories, new_agent).0 {
         ActionGrounding::Exempt(_) => true,
+        // `grounding_also` beside it: a row that stops several things at once
+        // needs what it stops NAMED as well as a verb (`close_orchestration`).
         ActionGrounding::HeardAs(phrases) => {
             let heard = Heard::new(transcript);
             phrases.iter().any(|phrase| heard.phrase(phrase))
+                && (row.grounding_also.is_empty()
+                    || row.grounding_also.iter().any(|phrase| heard.phrase(phrase)))
         }
         ActionGrounding::HeardAsWhole(phrases) => {
             let said = whole_utterance(transcript);
@@ -3925,6 +3952,9 @@ mod tests {
     async fn voice_outcome_start_new_agent_reaches_an_open_dialog_whatever_its_form() {
         // An incomplete form still dispatches: saying WHAT is missing is the
         // dialog's job, and a hint about being somewhere else would be false.
+        // The dispatch is the dialog's own start, not a confirmation — PRD
+        // #802 D5's start half was revisited on 2026-09-23 (PRD #1223), so this
+        // pin moved from `confirmStartNewAgent` deliberately.
         let resolver =
             StubResolver::new().answering("start it", IntentAnswer::new("start_new_agent"));
         for declared in [VoiceNewAgent { form: None }, new_agent_form()] {
@@ -3934,16 +3964,29 @@ mod tests {
                 VoiceOutcome::Dispatch {
                     transcript: Transcript::new("start it"),
                     action: "start_new_agent".to_string(),
-                    invoke: "confirmStartNewAgent".to_string(),
+                    invoke: "startNewAgent".to_string(),
                     params: Vec::new(),
-                    sentence: "Confirm the start in the dialog — nothing has started yet."
-                        .to_string(),
+                    sentence: "Starting the agent.".to_string(),
                 }
             );
         }
+        // Closed, the pick OPENS the dialog (`unavailable_opens`, D3) rather
+        // than being refused as "not here".
         let closed = run_form(&resolver, Screen::Overview, None, "start it").await;
         assert_eq!(
-            closed.sentence(),
+            closed,
+            VoiceOutcome::Dispatch {
+                transcript: Transcript::new("start it"),
+                action: "open_new_agent".to_string(),
+                invoke: "openNewAgent".to_string(),
+                params: Vec::new(),
+                sentence: "Opening the New agent dialog.".to_string(),
+            }
+        );
+        // Off the overview neither row can run, and the start's own hint stands.
+        let deck = run_form(&resolver, Screen::Deck, None, "start it").await;
+        assert_eq!(
+            deck.sentence(),
             "Not here — starting a new agent needs the New agent dialog; say \u{201c}new agent\u{201d} first."
         );
     }
@@ -4006,11 +4049,11 @@ mod tests {
                 IntentAnswer::new("close_orchestration").with_param("orchestration", "billing"),
             )
             .answering(
-                "close review",
+                "close the review orchestration",
                 IntentAnswer::new("close_orchestration").with_param("orchestration", "review"),
             )
             .answering(
-                "close payments",
+                "close the payments run",
                 IntentAnswer::new("close_orchestration").with_param("orchestration", "payments"),
             );
         let agents = two_runs();
@@ -4037,15 +4080,30 @@ mod tests {
             "Confirm closing billing — nothing has been stopped yet."
         );
 
-        let ambiguous = run_agents(&resolver, Screen::Overview, &agents, "close review").await;
+        // Named with the orchestration or the run, as the row now requires
+        // (PRD #1223, D1): "close review" alone is `close`'s, and is refused
+        // here — see `voice_outcome_close_the_agent_never_grounds_closing_an_orchestration`.
+        let ambiguous = run_agents(
+            &resolver,
+            Screen::Overview,
+            &agents,
+            "close the review orchestration",
+        )
+        .await;
         assert_eq!(
             ambiguous.sentence(),
-            "Heard: \u{201c}close review\u{201d} — \u{201c}review\u{201d} matches more than one orchestration: docs-orchestrator-1, api-orchestrator-1."
+            "Heard: \u{201c}close the review orchestration\u{201d} — \u{201c}review\u{201d} matches more than one orchestration: docs-orchestrator-1, api-orchestrator-1."
         );
-        let none = run_agents(&resolver, Screen::Overview, &agents, "close payments").await;
+        let none = run_agents(
+            &resolver,
+            Screen::Overview,
+            &agents,
+            "close the payments run",
+        )
+        .await;
         assert_eq!(
             none.sentence(),
-            "Heard: \u{201c}close payments\u{201d} — no orchestration here matches \u{201c}payments\u{201d}."
+            "Heard: \u{201c}close the payments run\u{201d} — no orchestration here matches \u{201c}payments\u{201d}."
         );
     }
 
@@ -4278,7 +4336,12 @@ mod tests {
             else {
                 panic!("`{}` is exempt from action grounding", row.id);
             };
-            let said = phrases[0].as_str();
+            // A row with `heard_as_also` needs one of those words beside it.
+            let said = match row.grounding_also.first() {
+                Some(also) => format!("{} {also}", phrases[0]),
+                None => phrases[0].clone(),
+            };
+            let said = said.as_str();
             let resolver = StubResolver::new().answering(said, IntentAnswer::new(&row.id));
             let outcome = run(&resolver, screen, &fleet(), said).await;
             assert_eq!(
@@ -4543,6 +4606,8 @@ mod tests {
             params: Vec::new(),
             grounding: ActionGrounding::Exempt("a hand-built row".to_string()),
             grounding_while: Vec::new(),
+            grounding_also: Vec::new(),
+            unavailable_opens: None,
         };
         let param = |name: &str, label: &str| ResolvedParam {
             name: name.to_string(),
@@ -4606,6 +4671,8 @@ mod tests {
             params: Vec::new(),
             grounding: ActionGrounding::Exempt("a hand-built row".to_string()),
             grounding_while: Vec::new(),
+            grounding_also: Vec::new(),
+            unavailable_opens: None,
         };
         let param = ResolvedParam {
             name: "agent".to_string(),
@@ -6045,5 +6112,182 @@ mod tests {
             grounding("sesame", &names(&["open-sesame"]), "open sesame"),
             Grounding::Grounded
         );
+    }
+
+    // -- the user's phrasings after the shipped flow (PRD #1223) ------------
+
+    /// Dispatch `said` against `answer` with the given agents and New agent
+    /// declaration, the way the surface would.
+    async fn heard_as_user_said(
+        said: &str,
+        answer: IntentAnswer,
+        screen: Screen,
+        agents: &[DesktopAgent],
+        new_agent: Option<&VoiceNewAgent>,
+    ) -> VoiceOutcome {
+        let resolver = StubResolver::new().answering(said, answer);
+        handle_utterance(
+            &resolver,
+            table(),
+            screen,
+            agents,
+            &decks(),
+            None,
+            new_agent,
+            Transcript::new(said),
+        )
+        .await
+        .outcome
+    }
+
+    /// Scenario: on the overview, with the `billing` orchestration's planner
+    /// running, the user says "close the billing agent" and a model reads it
+    /// as closing the whole orchestration. The app refuses: stopping every
+    /// role needs the orchestration or the run NAMED, because the utterance's
+    /// other reading — close the view — destroys nothing (D1).
+    #[tokio::test]
+    async fn voice_outcome_close_the_agent_never_grounds_closing_an_orchestration() {
+        let outcome = heard_as_user_said(
+            "close the billing agent",
+            IntentAnswer::new("close_orchestration").with_param("orchestration", "billing"),
+            Screen::Overview,
+            &two_runs(),
+            None,
+        )
+        .await;
+        assert!(
+            matches!(outcome, VoiceOutcome::ActionUngrounded { .. }),
+            "a bare close of an agent must not stop an orchestration: {outcome:?}"
+        );
+        // Naming the orchestration or the run still reaches it.
+        for said in ["close the billing orchestration", "stop the billing run"] {
+            let outcome = heard_as_user_said(
+                said,
+                IntentAnswer::new("close_orchestration").with_param("orchestration", "billing"),
+                Screen::Overview,
+                &two_runs(),
+                None,
+            )
+            .await;
+            assert!(outcome.is_dispatch(), "{said}: {outcome:?}");
+        }
+    }
+
+    /// Scenario: with an agent's pane open the user says "Close the agent" —
+    /// the phrase that was taken as a stop. It closes the VIEW (D1).
+    #[tokio::test]
+    async fn voice_outcome_close_the_agent_closes_the_view() {
+        for said in [
+            "Close the agent",
+            "close the agent screen",
+            "close the agent view",
+            "close the agent pane",
+        ] {
+            let outcome = heard_as_user_said(
+                said,
+                IntentAnswer::new("close"),
+                Screen::Agent,
+                &fleet(),
+                None,
+            )
+            .await;
+            let VoiceOutcome::Dispatch { invoke, .. } = &outcome else {
+                panic!("{said}: expected a dispatch, got {outcome:?}");
+            };
+            assert_eq!(invoke, "closeTopmost", "{said}");
+        }
+    }
+
+    /// Scenario: with the form filled, "start it" starts the agent — the
+    /// dispatch is the dialog's own start, not a confirmation, and its report
+    /// says it is starting rather than that nothing has happened (D2).
+    #[tokio::test]
+    async fn voice_outcome_start_it_starts_without_asking() {
+        let outcome = heard_as_user_said(
+            "start it",
+            IntentAnswer::new("start_new_agent"),
+            Screen::Overview,
+            &fleet(),
+            Some(&new_agent_form()),
+        )
+        .await;
+        let VoiceOutcome::Dispatch {
+            invoke, sentence, ..
+        } = &outcome
+        else {
+            panic!("expected a dispatch, got {outcome:?}");
+        };
+        assert_eq!(invoke, "startNewAgent");
+        assert_eq!(sentence, "Starting the agent.");
+    }
+
+    /// Scenario: with the New agent dialog CLOSED the user says "Start the new
+    /// agent", and the model answers the row that can run here. It opens the
+    /// dialog rather than being told to say "new agent" first (D3).
+    #[tokio::test]
+    async fn voice_outcome_start_the_new_agent_with_the_dialog_closed_opens_it() {
+        let outcome = heard_as_user_said(
+            "Start the new agent",
+            IntentAnswer::new("open_new_agent"),
+            Screen::Overview,
+            &fleet(),
+            None,
+        )
+        .await;
+        assert!(outcome.is_dispatch(), "{outcome:?}");
+    }
+
+    /// Scenario: with the dialog CLOSED the user says "Start the new agent"
+    /// and the model answers the START row, as it did for the user. The app
+    /// opens the dialog instead of answering "Not here — … say 'new agent'
+    /// first" (D3).
+    #[tokio::test]
+    async fn voice_outcome_a_start_picked_with_the_dialog_closed_opens_it() {
+        for said in ["Start the new agent", "start it"] {
+            let outcome = heard_as_user_said(
+                said,
+                IntentAnswer::new("start_new_agent"),
+                Screen::Overview,
+                &fleet(),
+                None,
+            )
+            .await;
+            let VoiceOutcome::Dispatch { action, .. } = &outcome else {
+                panic!("{said}: expected a dispatch, got {outcome:?}");
+            };
+            assert_eq!(action, "open_new_agent", "{said}");
+        }
+    }
+
+    /// Scenario: the phrasings the row walk found refused (D4) — each is the
+    /// right row, and each used to be refused as "nothing in that asks to …".
+    #[tokio::test]
+    async fn voice_outcome_the_row_walk_gaps_are_heard() {
+        let dialog = VoiceNewAgent { form: None };
+        let form = new_agent_form();
+        let cases: [(&str, &str, Option<&VoiceNewAgent>); 7] = [
+            ("spawn an agent", "open_new_agent", None),
+            ("I want another agent", "open_new_agent", None),
+            ("cancel", "close", Some(&dialog)),
+            ("never mind", "close", Some(&form)),
+            ("Cancel.", "close", Some(&form)),
+            ("close the new agent dialog", "close", Some(&form)),
+            ("show me the deck", "open_deck", Some(&form)),
+        ];
+        let mut refused = Vec::new();
+        for (said, action, new_agent) in cases {
+            let outcome = heard_as_user_said(
+                said,
+                IntentAnswer::new(action),
+                Screen::Overview,
+                &fleet(),
+                new_agent,
+            )
+            .await;
+            if !outcome.is_dispatch() {
+                refused.push(format!("{said} → {action}: {}", outcome.sentence()));
+            }
+        }
+        assert!(refused.is_empty(), "refused:\n{}", refused.join("\n"));
     }
 }

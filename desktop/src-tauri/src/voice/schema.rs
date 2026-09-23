@@ -132,10 +132,13 @@ pub const TOOL_INSTRUCTIONS: &str = "Pick the deck action the user asked for. Pi
     names one of THOSE, answered with the words the user used for it. \
     `orchestrations` lists the orchestrations among those agents by `title`, with \
     their roles; an `orchestration_ref` param names one of them, answered with the \
-    words the user used for it. An action that starts or stops something only \
-    ASKS: the app shows a confirmation and the user confirms by hand, so pick it \
-    whenever that is what the user asked for, however urgently. Write no prose; \
-    the app writes what the user reads.";
+    words the user used for it. When the user's words could mean closing a VIEW \
+    or stopping something — \"close the agent\" — they mean the view: pick the \
+    action that stops nothing, and pick a stop only for words that can only mean \
+    stopping. An action that stops something only ASKS: the app shows a \
+    confirmation and the user confirms by hand, so pick it whenever the user \
+    asked to stop, however urgently. Write no prose; the app writes what the \
+    user reads.";
 
 /// One row as the model sees it, with its availability on the screen the
 /// request was built for.

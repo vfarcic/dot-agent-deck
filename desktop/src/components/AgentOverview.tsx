@@ -906,10 +906,10 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
       chooseNewAgentMode: (target: VoiceDispatchTarget) => fill((slot) => slot.chooseNewAgentMode(target)),
       chooseNewAgentType: (target: VoiceDispatchTarget) => fill((slot) => slot.chooseNewAgentType(target)),
       nameNewAgent: (target: VoiceDispatchTarget) => fill((slot) => slot.nameNewAgent(target)),
-      /* PRD #802 D5 — the dialog's start confirmation, from its slot. */
-      confirmStartNewAgent: (target: VoiceDispatchTarget) => {
+      /* The dialog's own start, from its slot (PRD #1223). */
+      startNewAgent: (target: VoiceDispatchTarget) => {
         const slot = newAgentVoice?.current;
-        return slot ? slot.confirmStartNewAgent(target) : NO_NEW_AGENT_DIALOG;
+        return slot ? slot.startNewAgent(target) : NO_NEW_AGENT_DIALOG;
       },
       ...voiceStops,
     };

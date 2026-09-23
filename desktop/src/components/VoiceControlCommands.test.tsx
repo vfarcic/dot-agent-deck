@@ -22,7 +22,7 @@ vi.mock("./TerminalViewport", () => ({
 }));
 
 import { DeckShell } from "../App";
-import { COMMAND_HIDDEN_BY_ORCHESTRATION, DIRECTORY_MOVED_ON, DIRECTORY_NOT_LISTED, FORM_MOVED_ON, FORM_UNDER_CONFIRMATION, MODE_NOT_OFFERED, NO_DIRECTORY_BROWSER, NO_NEW_AGENT_DIALOG, NO_NEW_AGENT_FORM, NO_PARENT_DIRECTORY, spokenName, START_AWAITING_CONFIRMATION, START_FORM_CHANGED, START_NEEDS_DIRECTORY, STARTING_CLOSE_BLOCKED } from "./NewAgentDialog";
+import { COMMAND_HIDDEN_BY_ORCHESTRATION, DIRECTORY_MOVED_ON, DIRECTORY_NOT_LISTED, FORM_MOVED_ON, MODE_NOT_OFFERED, NO_DIRECTORY_BROWSER, NO_NEW_AGENT_DIALOG, NO_NEW_AGENT_FORM, NO_PARENT_DIRECTORY, spokenName, START_IN_FLIGHT, START_NEEDS_DIRECTORY, STARTING_CLOSE_BLOCKED } from "./NewAgentDialog";
 import { CONFIRMATION_ALREADY_OPEN, STOP_BEHIND_NEW_AGENT, STOP_TARGET_GONE } from "./AgentOverview";
 import {
   DIALOG_MOVED_ON,
@@ -1772,7 +1772,7 @@ describe("the rest of the New agent form, by voice (PRD #1223)", () => {
   });
 });
 
-describe("PRD #802 D5 — a spoken start or stop only ever opens a confirmation (PRD #1223)", () => {
+describe("PRD #802 D5 — a spoken stop opens a confirmation; a spoken start starts (PRD #1223, D5 revisited 2026-09-23)", () => {
   beforeEach(() => {
     window.localStorage.clear();
     vi.useFakeTimers();
@@ -1793,17 +1793,20 @@ describe("PRD #802 D5 — a spoken start or stop only ever opens a confirmation 
   const BILLING = { ...HOME, path: "/home/dev/billing", displayPath: "/home/dev/billing", parent: "/home/dev", entries: [] };
 
   /**
-   * What Rust answers for the three D5 rows, and nothing else: `start it`
-   * needs the dialog OPEN (any form), `stop <id>` resolves an agent id on the
+   * What Rust answers for the start and the two D5 stops, and nothing else:
+   * `start it` starts when the dialog is OPEN (any form) and opens it when it
+   * is closed, `stop <id>` resolves an agent id on the
    * selected deck, and `close <member>` names an orchestration card by one
    * member's id. Each is only a DISPATCH — the tests below are about what the
    * app does with it.
    */
   function d5Voice(declared: () => VoiceNewAgentDto | undefined): ResolveVoice {
     return vi.fn(async (utterance: string) => {
-      if (utterance === "start it") {
-        if (!declared()) return { resolveMs: 21, backend: "stub", outcome: { kind: "unavailable", transcript: utterance, action: "start_new_agent", hint: "starting a new agent needs the New agent dialog; say “new agent” first", sentence: "Not here — starting a new agent needs the New agent dialog; say “new agent” first." } } as VoiceResultDto;
-        return dispatch("start_new_agent", "confirmStartNewAgent", "Confirm the start in the dialog — nothing has started yet.", utterance);
+      if (utterance === "start it" || utterance === "start the new agent") {
+        // With the dialog closed the callable row that answers "start" is
+        // `open_new_agent` (D3); with it open, `start_new_agent` starts.
+        if (!declared()) return dispatch("open_new_agent", "openNewAgent", "Opening the New agent dialog.", utterance);
+        return dispatch("start_new_agent", "startNewAgent", "Starting the agent.", utterance);
       }
       if (utterance.startsWith("stop ")) {
         const id = utterance.slice("stop ".length);
@@ -1863,12 +1866,12 @@ describe("PRD #802 D5 — a spoken start or stop only ever opens a confirmation 
   const confirmation = () => screen.queryByRole("alertdialog");
 
   /**
-   * Scenario: with the form filled, say "start it". A confirmation opens that
-   * names the deck, the directory, the mode and the command — and NOTHING is
-   * started. Pressing its Start agent button starts exactly what the form
-   * showed, once.
+   * Scenario: with the form filled, say "start it". The agent starts at once
+   * with exactly what the form shows, and no confirmation opens — the user's
+   * words were "it only introduced friction by me having to give the same
+   * instruction twice" (PRD #802 D5, revisited for the start only).
    */
-  it("opens a confirmation, starts nothing until it is confirmed, then starts exactly the form", async () => {
+  it("starts exactly the form at once, with no confirmation", async () => {
     const voice = microphone([]);
     const { deck, runAction, snapshot } = d5Deck(voice);
     render(<DeckShell runtime={deck} initialView={{ kind: "overview" }} />);
@@ -1879,25 +1882,10 @@ describe("PRD #802 D5 — a spoken start or stop only ever opens a confirmation 
 
     voice.deliver("start it");
     await completeUtterance();
-
-    const dialog = confirmation();
-    expect(dialog).not.toBeNull();
-    expect(dialog).toHaveTextContent("Start this agent?");
-    expect(dialog).toHaveTextContent("“billing-worker”");
-    expect(dialog).toHaveTextContent("/home/dev/billing");
-    expect(dialog).toHaveTextContent("Mode: No mode");
-    expect(dialog).toHaveTextContent("runs claude --model haiku");
-    expect(dialog).toHaveTextContent("Nothing has started yet.");
-    expect(screen.getByTestId("voice-report")).toHaveTextContent("Confirm the start in the dialog — nothing has started yet.");
-    await act(async () => { await vi.advanceTimersByTimeAsync(5_000); });
-    expect(runAction).not.toHaveBeenCalled();
-
-    await act(async () => {
-      fireEvent.click(within(confirmation()!).getByRole("button", { name: "Start agent" }));
-      await Promise.resolve();
-    });
     await flush();
 
+    expect(confirmation()).toBeNull();
+    expect(screen.getByTestId("voice-report")).toHaveTextContent("Starting the agent.");
     expect(runAction).toHaveBeenCalledTimes(1);
     expect(runAction).toHaveBeenCalledWith({
       type: "start_agent",
@@ -1908,37 +1896,11 @@ describe("PRD #802 D5 — a spoken start or stop only ever opens a confirmation 
     });
   });
 
-  /** Scenario: Cancel — or Esc — leaves the dialog and its form, and starts nothing. */
-  it("starts nothing when the confirmation is cancelled", async () => {
-    const voice = microphone([]);
-    const { deck, runAction } = d5Deck(voice);
-    render(<DeckShell runtime={deck} initialView={{ kind: "overview" }} />);
-    await turnVoiceOn();
-    await openDialog();
-    await chooseBilling();
-
-    voice.deliver("start it");
-    await completeUtterance();
-    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
-    await flush();
-    expect(confirmation()).toBeNull();
-
-    voice.deliver("start it");
-    await completeUtterance();
-    fireEvent.keyDown(screen.getByTestId("new-agent-dialog"), { key: "Escape" });
-    await flush();
-
-    expect(confirmation()).toBeNull();
-    expect(screen.getByTestId("new-agent-dialog")).toBeInTheDocument();
-    expect(runAction).not.toHaveBeenCalled();
-  });
-
   /**
-   * Scenario: say "start it" before a directory is chosen. No confirmation
-   * opens for a start that cannot happen; the voice surface says what is
-   * missing.
+   * Scenario: say "start it" before a directory is chosen. Nothing starts and
+   * no confirmation opens; the voice surface says what is missing.
    */
-  it("refuses an incomplete form with the reason, and opens no confirmation", async () => {
+  it("refuses an incomplete form with the reason", async () => {
     const voice = microphone([]);
     const { deck, runAction, declarations } = d5Deck(voice);
     render(<DeckShell runtime={deck} initialView={{ kind: "overview" }} />);
@@ -1954,29 +1916,33 @@ describe("PRD #802 D5 — a spoken start or stop only ever opens a confirmation 
     expect(runAction).not.toHaveBeenCalled();
   });
 
-  /** Scenario: with the dialog closed "start it" is not here, and nothing opens. */
-  it("is unavailable with the dialog closed", async () => {
-    const voice = microphone(["start it"]);
+  /**
+   * Scenario: with the dialog closed, "start the new agent" opens it (D3) —
+   * Rust answers the callable `open_new_agent` row — and starts nothing.
+   */
+  it("opens the dialog when a start is asked for with it closed", async () => {
+    const voice = microphone(["start the new agent"]);
     const { deck, runAction } = d5Deck(voice);
     render(<DeckShell runtime={deck} initialView={{ kind: "overview" }} />);
     await turnVoiceOn();
     await completeUtterance();
+    await flush();
 
-    expect(screen.getByTestId("voice-report")).toHaveTextContent("Not here — starting a new agent needs the New agent dialog; say “new agent” first.");
+    expect(screen.getByTestId("new-agent-dialog")).toBeInTheDocument();
     expect(confirmation()).toBeNull();
     expect(runAction).not.toHaveBeenCalled();
-    // A dispatch that arrives anyway finds no dialog to confirm in.
+    // A start dispatch that arrives anyway finds no dialog to start from.
     expect(NO_NEW_AGENT_DIALOG).toContain("nothing was started");
   });
 
   /**
-   * Scenario: the Name is edited behind the confirmation. Confirming then
-   * starts nothing — it would not be what the confirmation described — and
-   * the form says so.
+   * Scenario: a second "start it" while the first start is still in flight
+   * starts nothing more, and says why.
    */
-  it("starts nothing when the form changed after the confirmation opened", async () => {
+  it("refuses a second start while one is under way", async () => {
     const voice = microphone([]);
     const { deck, runAction } = d5Deck(voice);
+    runAction.mockImplementation(() => new Promise(() => {}));
     render(<DeckShell runtime={deck} initialView={{ kind: "overview" }} />);
     await turnVoiceOn();
     await openDialog();
@@ -1984,49 +1950,19 @@ describe("PRD #802 D5 — a spoken start or stop only ever opens a confirmation 
 
     voice.deliver("start it");
     await completeUtterance();
-    fireEvent.change(screen.getByTestId("new-agent-name"), { target: { value: "something-else" } });
-    await act(async () => {
-      fireEvent.click(within(confirmation()!).getByRole("button", { name: "Start agent" }));
-      await Promise.resolve();
-    });
-    await flush();
+    voice.deliver("start it");
+    await completeUtterance();
 
-    expect(runAction).not.toHaveBeenCalled();
-    expect(screen.getByTestId("new-agent-error")).toHaveTextContent(START_FORM_CHANGED);
+    expect(screen.getByTestId("voice-report")).toHaveTextContent(START_IN_FLIGHT);
+    expect(confirmation()).toBeNull();
+    expect(runAction).toHaveBeenCalledTimes(1);
   });
 
   /**
-   * Scenario: while the confirmation is open the form is withdrawn from
-   * voice — a fill would change what it describes — and a second "start it"
-   * opens nothing more.
+   * Scenario: with an orchestration chosen, "start it" launches it at once,
+   * with no confirmation.
    */
-  it("withdraws the form from voice while the confirmation is open", async () => {
-    const voice = microphone([]);
-    const { deck, runAction, declarations } = d5Deck(voice);
-    render(<DeckShell runtime={deck} initialView={{ kind: "overview" }} />);
-    await turnVoiceOn();
-    await openDialog();
-    await chooseBilling();
-
-    voice.deliver("start it");
-    await completeUtterance();
-    voice.deliver("mode dispatcher");
-    await completeUtterance();
-    expect(declarations.at(-1)).toEqual({ form: undefined });
-    expect(screen.getByTestId("voice-report")).toHaveTextContent(FORM_UNDER_CONFIRMATION);
-
-    voice.deliver("start it");
-    await completeUtterance();
-    expect(screen.getByTestId("voice-report")).toHaveTextContent(START_AWAITING_CONFIRMATION);
-    expect(screen.getAllByRole("alertdialog")).toHaveLength(1);
-    expect(runAction).not.toHaveBeenCalled();
-  });
-
-  /**
-   * Scenario: with an orchestration chosen, "start it" opens a confirmation
-   * naming the orchestration and every role it starts; confirming launches it.
-   */
-  it("names every role an orchestration start will start", async () => {
+  it("starts an orchestration at once", async () => {
     const voice = microphone([]);
     const { deck, runAction } = d5Deck(voice);
     render(<DeckShell runtime={deck} initialView={{ kind: "overview" }} />);
@@ -2038,15 +1974,9 @@ describe("PRD #802 D5 — a spoken start or stop only ever opens a confirmation 
 
     voice.deliver("start it");
     await completeUtterance();
-
-    expect(confirmation()).toHaveTextContent("Start the audit orchestration?");
-    expect(confirmation()).toHaveTextContent("lead, checker");
-    expect(runAction).not.toHaveBeenCalled();
-    await act(async () => {
-      fireEvent.click(within(confirmation()!).getByRole("button", { name: "Start orchestration" }));
-      await Promise.resolve();
-    });
     await flush();
+
+    expect(confirmation()).toBeNull();
     expect(runAction).toHaveBeenCalledTimes(1);
     expect(runAction.mock.calls[0][0]).toMatchObject({ type: "start_orchestration", orchestration: "audit", path: "/home/dev/billing" });
   });

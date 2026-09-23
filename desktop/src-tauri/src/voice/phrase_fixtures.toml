@@ -644,12 +644,17 @@ dialog = true
 action = "start_new_agent"
 outcome = "dispatch"
 
+# With the dialog CLOSED, a start-shaped request opens it (PRD #1223, D3)
+# rather than being refused as "not here": `open_new_agent` is the callable row
+# that answers "start", and it starts nothing by itself. This fixture used to
+# expect `start_new_agent` → `unavailable`.
 [[fixtures]]
 name = "start-new-agent-dialog-closed"
 utterance = "start it"
 screen = "overview"
-action = "start_new_agent"
-outcome = "unavailable"
+action = "open_new_agent"
+outcome = "dispatch"
+no_deck = true
 
 [[fixtures]]
 name = "stop-agent"
@@ -689,3 +694,129 @@ screen = "overview"
 action = "close_orchestration"
 outcome = "dispatch"
 resolved_orchestration = "build"
+
+# PRD #1223 — the user's own phrasings after using the shipped flow, the
+# fixtures that matter most here.
+#
+# D1: an utterance with a destructive and a non-destructive reading resolves to
+# the non-destructive one. "Close the agent" was taken as stopping it; it closes
+# the VIEW, and the agent keeps running. On the overview there may be no pane to
+# close, and `close` then says so — which is still not a stop.
+
+[[fixtures]]
+name = "close-the-agent"
+utterance = "Close the agent"
+screen = "agent"
+action = "close"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "close-the-agent-on-the-overview"
+utterance = "Close the agent"
+screen = "overview"
+action = "close"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "close-the-agent-screen"
+utterance = "close the agent screen"
+screen = "agent"
+action = "close"
+outcome = "dispatch"
+
+# Stopping needs wording that can only mean stopping. On the agent screen the
+# row is not callable (its confirmation lives on the overview's row), so the
+# fixture pins that the request is READ as a stop, and refused as "not here".
+[[fixtures]]
+name = "stop-the-agent"
+utterance = "stop the agent"
+screen = "agent"
+action = "stop_agent"
+outcome = "unavailable"
+
+[[fixtures]]
+name = "stop-the-tester-agent"
+utterance = "stop the tester agent"
+screen = "overview"
+action = "stop_agent"
+outcome = "dispatch"
+resolved_agent = "agent-tester"
+
+# Closing an orchestration stops every role, so it needs the orchestration named.
+[[fixtures]]
+name = "close-the-orchestration"
+utterance = "close the build orchestration"
+screen = "overview"
+action = "close_orchestration"
+outcome = "dispatch"
+resolved_orchestration = "build"
+
+# D2: "start it" starts, with no confirmation after it (vitest proves the
+# dispatch reaches the dialog's start). D3: "start the new agent" with the
+# dialog CLOSED opens it rather than being refused.
+[[fixtures]]
+name = "start-the-new-agent-form-open"
+utterance = "Start the new agent"
+screen = "overview"
+form = true
+action = "start_new_agent"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "start-the-new-agent-dialog-closed"
+utterance = "Start the new agent"
+screen = "overview"
+action = "open_new_agent"
+outcome = "dispatch"
+no_deck = true
+
+# D4: vocabulary gaps. `spawn` and `another` were in no vocabulary.
+[[fixtures]]
+name = "open-new-agent-spawn"
+utterance = "spawn an agent"
+screen = "overview"
+action = "open_new_agent"
+outcome = "dispatch"
+no_deck = true
+
+[[fixtures]]
+name = "open-new-agent-another"
+utterance = "I want another agent"
+screen = "overview"
+action = "open_new_agent"
+outcome = "dispatch"
+no_deck = true
+
+# "Cancel" is the most natural word for dismissing a dialog, and the dialog has
+# no Cancel button any more (U2), so voice is the only place it can land.
+[[fixtures]]
+name = "close-the-new-agent-dialog-cancel"
+utterance = "cancel"
+screen = "overview"
+dialog = true
+action = "close"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "close-the-new-agent-dialog-never-mind"
+utterance = "never mind"
+screen = "overview"
+form = true
+action = "close"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "close-the-new-agent-dialog-by-name"
+utterance = "close the new agent dialog"
+screen = "overview"
+form = true
+action = "close"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "open-deck-show-me-over-the-new-agent-dialog"
+utterance = "show me the deck"
+screen = "overview"
+form = true
+action = "open_deck"
+outcome = "dispatch"
