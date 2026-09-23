@@ -503,6 +503,27 @@ impl IpcClient {
     /// `CancelIoEx` only *requests* cancellation, and until the operation actually
     /// completes the kernel may still write into the `OVERLAPPED` and into the
     /// caller's buffer — both of which are about to go out of scope.
+    ///
+    /// A cancelled operation that had already moved bytes before the cancel took
+    /// effect is reported as `Ok(n)`, not folded into the timeout error (PR #1232
+    /// review, issue #434). A `WriteFile` larger than the pipe's kernel buffer can
+    /// still be pending when our deadline fires, and `CancelIoEx` does not undo
+    /// what the kernel already accepted — the post-cancel `GetOverlappedResult`
+    /// byte count can be nonzero. The version of this function that threw that
+    /// count away violated `Write::write`'s own contract ("if this returns an
+    /// error, no bytes were written"), which is exactly the gap
+    /// [`SocketReply::Unreachable`](crate::hook::SocketReply::Unreachable) exists
+    /// to close: that variant tells a caller a request is safe to retry because
+    /// **provably** nothing left this process, and a discarded nonzero count here
+    /// reopened precisely that misclassification on Windows, on the transport
+    /// [`crate::hook`]'s write classifier depends on. `Ok(n)` for `n > 0` costs
+    /// nothing at either call site: a short write is what a `Write::write` caller
+    /// already has to expect and retry, and a short read is ordinary for
+    /// `Read::read`. Only a cancellation that moved zero bytes — the common case
+    /// — still reports `TimedOut`; before this fix every cancellation did,
+    /// whatever its count. `GetOverlappedResult`'s own return value is not
+    /// consulted: on failure it leaves `discarded` at zero, which lands in that
+    /// same `TimedOut` arm.
     fn wait_overlapped(&self, overlapped: &mut OVERLAPPED) -> io::Result<u32> {
         let handle = self.raw();
         let mut transferred: u32 = 0;
@@ -525,14 +546,28 @@ impl IpcClient {
         let mut discarded: u32 = 0;
         // SAFETY: `bWait = TRUE` blocks until the cancelled operation has really
         // finished, after which the kernel is done with `overlapped` and with the
-        // caller's buffer. The result itself is deliberately ignored — the
-        // operation failed either way.
+        // caller's buffer. The byte count decides the return below — it is no
+        // longer thrown away (issue #434 review).
         unsafe { GetOverlappedResult(handle, overlapped, &mut discarded, 1) };
-        Err(io::Error::new(
-            io::ErrorKind::TimedOut,
-            format!("named-pipe I/O timed out after {timeout}ms"),
-        ))
+        classify_cancelled_transfer(discarded, timeout)
     }
+}
+
+/// The decision [`IpcClient::wait_overlapped`] makes once a cancelled overlapped
+/// operation has been reaped: a nonzero `transferred` is a short read/write, not
+/// a failure, because bytes the kernel already accepted cannot be recalled by
+/// `CancelIoEx`. Pulled out as a pure function so the branch that fixes issue
+/// #434's Windows corner (PR #1232 review) is unit-testable without an OVERLAPPED
+/// I/O to drive — `wait_overlapped` itself needs a live pipe handle and cannot
+/// run outside a Windows process.
+fn classify_cancelled_transfer(transferred: u32, timeout_ms: u32) -> io::Result<u32> {
+    if transferred > 0 {
+        return Ok(transferred);
+    }
+    Err(io::Error::new(
+        io::ErrorKind::TimedOut,
+        format!("named-pipe I/O timed out after {timeout_ms}ms"),
+    ))
 }
 
 impl std::io::Read for IpcClient {
@@ -663,5 +698,27 @@ mod tests {
             INFINITE
         );
         assert!(duration_to_ms(Duration::from_secs(u64::MAX / 1000)) < INFINITE);
+    }
+
+    /// Issue #434's Windows corner (PR #1232 review): a cancelled overlapped
+    /// operation that had already moved bytes must be reported as a short
+    /// read/write, not folded into `TimedOut` — the fold is what let a partially
+    /// delivered write come back as [`SocketReply::Unreachable`]
+    /// (`crate::hook::SocketReply::Unreachable`), telling a caller a resend was
+    /// safe when the daemon may already hold an actionable prefix of the line.
+    #[test]
+    fn classify_cancelled_transfer_reports_a_nonzero_count_as_a_short_operation_not_a_timeout() {
+        let ok = classify_cancelled_transfer(7, 300).expect("nonzero transfer is not an error");
+        assert_eq!(ok, 7);
+    }
+
+    /// The one case that still means "nothing to salvage": the cancel reaped the
+    /// operation before it moved a single byte, so there is nothing a caller
+    /// could treat as a short read/write.
+    #[test]
+    fn classify_cancelled_transfer_reports_zero_as_timed_out() {
+        let err = classify_cancelled_transfer(0, 300).expect_err("zero transfer is a real timeout");
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert!(err.to_string().contains("300ms"));
     }
 }
