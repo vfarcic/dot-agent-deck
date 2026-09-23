@@ -96,6 +96,7 @@ DENY_REASONS = {
     ),
     "MAINTAINERS.md": "This edits the **record of who the maintainers are**.",
     "greptile.json": "This edits the **other reviewer's configuration**.",
+    ".pr_agent.toml": "This edits the **other reviewer's configuration**.",
     ".github/": (
         "This edits **CI or repository automation**, which is how permissions and gates get "
         "widened."

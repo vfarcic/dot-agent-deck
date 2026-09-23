@@ -1,0 +1,42 @@
+# Qodo code review — run in parallel with Greptile (`greptile.json`) as an
+# evaluation of whether Qodo can replace it. docs/develop/governance.md, "The
+# automated reviewers", has the reasoning; the settings below are chosen so the
+# two are compared on equal terms and so Qodo cannot disturb what this repo's
+# own tooling reads.
+#
+# Qodo reads this file from the default branch, so a change here takes effect
+# only for pull requests opened after it merges.
+# Reference: https://docs.qodo.ai/install-and-configure/configuration-overview/configuration-and-command-reference
+
+[github_app]
+# Review once, when the pull request is opened (or reopened, or marked ready).
+pr_commands = ["/agentic_describe", "/agentic_review"]
+# Mirrors Greptile's `triggerOnUpdates: false`: no re-review on push. Keeps the
+# comparison fair, and keeps every fix push from spawning a fresh round of
+# review threads that `required_review_thread_resolution` then makes someone
+# resolve. `/agentic_review` in a comment still re-runs it on demand.
+handle_push_trigger = false
+
+[qodo_describe_agent]
+# Never touch the PR body. Pull request bodies here carry verification evidence
+# (named tests, rule 12's cross-version record) that the agent reviewer reads,
+# so the summary goes in a comment of its own. This is Qodo's default; it is
+# pinned so a portal-side change cannot flip it.
+publish_mode = "comment"
+
+[review_agent]
+# Findings in the summary comment AND inline, so they land at
+# `pulls/<n>/comments` beside Greptile's, where every skill already reads them.
+comments_location_policy = "both"
+# Inline (thread-creating) findings only at medium severity and above; the
+# informational tier stays in the summary. Every inline comment is a thread
+# that blocks the merge until resolved, and two reviewers double that cost.
+inline_comments_severity_threshold = 2
+# A finding is advice to the author, not a commit Qodo writes. Default, pinned.
+enable_commitable_suggestions = false
+
+[pr_code_suggestions]
+# Do not auto-answer questions in PR comments. Agents reply to Greptile's
+# threads in prose, and an unprompted Qodo reply in those threads is noise
+# rather than review. `/ask` still works.
+enable_chat_in_code_suggestions = false

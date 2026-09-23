@@ -74,7 +74,7 @@ Re-run the query after resolving and confirm it returns nothing. "I resolved the
 
 Resolve only what you actually addressed. Leave a thread open when you are waiting on the commenter, or when they asked something they still need answered there — a thread closed over unaddressed feedback is worse than one left open.
 
-Push fixes **before** requesting review (step 2). Do not wait for a re-review: `greptile.json` sets `triggerOnUpdates: false`, so the reviewer runs once at open and never again.
+Push fixes **before** requesting review (step 2). Do not wait for a re-review: `greptile.json` sets `triggerOnUpdates: false` and `.pr_agent.toml` sets `handle_push_trigger = false`, so both review apps (Greptile, and Qodo while it is being evaluated beside it) run once at open and never again. Their inline findings arrive at the same endpoint, and a Qodo finding is answered and resolved exactly like a Greptile one.
 
 ## 5. Hand off
 
