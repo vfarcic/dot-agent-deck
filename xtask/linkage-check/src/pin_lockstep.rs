@@ -865,3 +865,98 @@ fn a_script_named_after_a_package_is_not_a_pin() {
         combined(&out)
     );
 }
+
+/// Issue #451: the declared MSRV is a **third** copy of the pinned toolchain,
+/// and it drifts for the same reason the other two did.
+///
+/// `Cargo.toml`'s `[workspace.package] rust-version` says what rustc this
+/// project supports. It is set to the toolchain the project actually tests —
+/// the one `devbox.json` installs and every workflow job asks
+/// `dtolnay/rust-toolchain` for — because that is the only number anything
+/// here verifies. A floor measured once and then left alone is a claim nothing
+/// re-checks: no job builds on it, so the real minimum moves under it silently.
+///
+/// Which makes the declaration worth exactly as much as its agreement with the
+/// pins, so this compares them. It reads the workflow side rather than
+/// `devbox.json` deliberately: the workflow pins are a plain `toolchain: X.Y.Z`
+/// this can parse in a few lines, and `repository_pins_are_in_lockstep` above
+/// already ties those to devbox — so agreeing with one is agreeing with both,
+/// without a second copy of `devbox_pins`' two-spelling parser.
+///
+/// Skips the `$VAR` sites for the same reason `scan_workflow_toolchain` does:
+/// `windows-cross-check` echoes a resolved rustup directory, which is
+/// diagnostics rather than a pin.
+#[test]
+fn the_declared_msrv_matches_the_pinned_toolchain() {
+    let manifest = std::fs::read_to_string(repo_root().join("Cargo.toml"))
+        .expect("the workspace manifest is readable");
+    let declared = manifest
+        .lines()
+        .find_map(|l| {
+            let rest = l.trim().strip_prefix("rust-version")?.trim_start();
+            let value = rest.strip_prefix('=')?.trim().trim_matches('"');
+            (!value.is_empty()).then(|| value.to_string())
+        })
+        .expect(
+            "Cargo.toml declares `[workspace.package] rust-version` (issue #451). If it was \
+             removed deliberately, this test goes with it — but read its doc comment first: \
+             the point of the declaration is that it agrees with what CI installs.",
+        );
+
+    let mut sites: Vec<(String, String)> = Vec::new();
+    let workflows = repo_root().join(".github/workflows");
+    for entry in std::fs::read_dir(&workflows).expect("the workflow directory is readable") {
+        let path = entry.expect("a readable directory entry").path();
+        let is_yaml = path.extension().is_some_and(|e| e == "yml" || e == "yaml");
+        if !is_yaml {
+            continue;
+        }
+        let body = std::fs::read_to_string(&path).expect("a readable workflow file");
+        for line in body.lines() {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with('#') {
+                continue;
+            }
+            let Some((_, after)) = trimmed.split_once("toolchain:") else {
+                continue;
+            };
+            let value = after
+                .trim()
+                .split([' ', ',', '}'])
+                .next()
+                .unwrap_or_default()
+                .to_string();
+            if value.contains('$') || value.is_empty() {
+                continue;
+            }
+            let name = path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
+            sites.push((name, value));
+        }
+    }
+
+    assert!(
+        !sites.is_empty(),
+        "no `toolchain:` pin was found under .github/workflows/, so this check would pass \
+         vacuously. Either the jobs stopped pinning a toolchain, or the spelling changed \
+         (fix this test).",
+    );
+
+    let drifted: Vec<&(String, String)> = sites.iter().filter(|(_, v)| *v != declared).collect();
+    assert!(
+        drifted.is_empty(),
+        "Cargo.toml declares rust-version = \"{declared}\" but {} workflow site(s) pin a \
+         different toolchain: {}. The declared MSRV is the toolchain this project tests, so \
+         the two move together — bump both, or the floor is a number nothing verifies \
+         (issue #451).",
+        drifted.len(),
+        drifted
+            .iter()
+            .map(|(f, v)| format!("{f} => {v}"))
+            .collect::<Vec<_>>()
+            .join(", "),
+    );
+}

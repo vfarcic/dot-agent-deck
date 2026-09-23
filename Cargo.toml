@@ -8,10 +8,32 @@ members = [
     "xtask/spec",
 ]
 
+# Issue #451 — the minimum supported Rust toolchain, inherited by every member
+# through `rust-version.workspace = true`. Without it, a build on an older
+# rustc dies at an arbitrary compile error instead of cargo saying which
+# version the package needs, which is what `docs/installation.md` sends Nix
+# overlay users into.
+#
+# THIS IS THE TOOLCHAIN THIS PROJECT ACTUALLY TESTS, and that is the whole
+# reason it is this number. It equals the pin in `devbox.json` and in every
+# `.github/workflows/` job, so `the_declared_msrv_matches_the_pinned_toolchain`
+# in `xtask/linkage-check/src/pin_lockstep.rs` fails the build when the two
+# drift apart — move this line and the pins together, or that test says so.
+#
+# A LOWER, MEASURED floor was the obvious alternative and was rejected. It can
+# be established once, on one host, on one platform, in one profile — and then
+# nothing re-establishes it: no job builds on it, so a dependency bump or a new
+# `std` call raises the real floor silently and the declared one becomes a
+# claim with nothing behind it. `docs/develop/versioning.md` has the rest,
+# including what this means for `cargo update` and Renovate.
+[workspace.package]
+rust-version = "1.97.1"
+
 [package]
 name = "dot-agent-deck"
 version = "0.1.0"
 edition = "2024"
+rust-version.workspace = true
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
