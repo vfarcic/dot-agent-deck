@@ -1,4 +1,4 @@
-//! PRD #802 M3 — check 13: the voice command table and the frontend action
+//! PRD #802 M3 — rule 14: the voice command table and the frontend action
 //! registry must resolve against each other.
 //!
 //! # What it asserts
@@ -99,12 +99,12 @@ const SUBMIT_LIST: &str = "SUBMIT_PHRASES";
 /// It carries the residual as well as the rule, because the residual is what a
 /// reader infers wrongly: a green check here says the registry is internally
 /// consistent, not that the app's capabilities are all in it.
-pub const VOICE_REGISTRY_RULE: &str = "PRD #802 check 13: `desktop/src-tauri/src/voice/commands.toml` and `VOICE_ACTIONS` \
+pub const VOICE_REGISTRY_RULE: &str = "PRD #802 rule 14: `desktop/src-tauri/src/voice/commands.toml` and `VOICE_ACTIONS` \
      (`desktop/src/lib/voiceActions.ts`) must resolve against each other, and every registry entry must carry either \
      `voice: true` or a written `no_voice` reason, and the two locally-matched phrase lists in \
      `desktop/src-tauri/src/voice/dictation.rs` must stay disjoint and covered by their own rows' \
      descriptions. WHAT THIS RULE DOES NOT SEE: a control wired with a bare `onClick` \
-     that never reaches the registry — 80 such sites in non-test `.tsx` when this was written — so a green check 13 is \
+     that never reaches the registry — 80 such sites in non-test `.tsx` when this was written — so a green rule 14 is \
      NOT evidence that no capability was forgotten";
 
 /// The texts the rule reads, so the assertions can be driven from planted input
@@ -129,7 +129,7 @@ pub fn run(root: &Path) -> Vec<String> {
         Ok(text) => text,
         Err(error) => {
             missing.push(format!(
-                "could not read {rel}: {error} — check 13 cannot see a file it cannot read, so this is a failure \
+                "could not read {rel}: {error} — rule 14 cannot see a file it cannot read, so this is a failure \
                  rather than a skip. If the file moved, move this rule with it"
             ));
             String::new()
@@ -279,7 +279,7 @@ fn phrase_lists(sources: &Sources, rows: &[Row], findings: &mut Vec<String>) {
             let found = string_literals(&text, &masked, body);
             if found.is_empty() {
                 findings.push(format!(
-                    "{DICTATION_RS}: `{name}` yielded no phrases — check 13 cannot compare a list it cannot read, so \
+                    "{DICTATION_RS}: `{name}` yielded no phrases — rule 14 cannot compare a list it cannot read, so \
                      this is a failure rather than a skip"
                 ));
             }
@@ -406,7 +406,7 @@ fn command_rows(source: &str, findings: &mut Vec<String>) -> Vec<Row> {
         Ok(document) => document,
         Err(error) => {
             findings.push(format!(
-                "{COMMANDS_TOML}: is not valid TOML: {error} — check 13 cannot see a table it cannot parse"
+                "{COMMANDS_TOML}: is not valid TOML: {error} — rule 14 cannot see a table it cannot parse"
             ));
             return Vec::new();
         }
@@ -416,7 +416,7 @@ fn command_rows(source: &str, findings: &mut Vec<String>) -> Vec<Row> {
         .and_then(toml_edit::Item::as_array_of_tables)
     else {
         findings.push(format!(
-            "{COMMANDS_TOML}: holds no `[[commands]]` array of tables — check 13 would then pass by inspecting \
+            "{COMMANDS_TOML}: holds no `[[commands]]` array of tables — rule 14 would then pass by inspecting \
              nothing, which is worse than failing"
         ));
         return Vec::new();
@@ -520,7 +520,7 @@ fn registry_entries(source: &str, findings: &mut Vec<String>) -> BTreeMap<String
     let masked = mask(&text);
     let Some(body) = literal_body(&masked, "VOICE_ACTIONS") else {
         findings.push(format!(
-            "{REGISTRY_TS}: no `VOICE_ACTIONS = {{ … }}` object literal found — check 13 would then have an empty key \
+            "{REGISTRY_TS}: no `VOICE_ACTIONS = {{ … }}` object literal found — rule 14 would then have an empty key \
              set and pass by inspecting nothing"
         ));
         return BTreeMap::new();
@@ -587,7 +587,7 @@ fn deck_view_kinds(source: &str, findings: &mut Vec<String>) -> BTreeSet<String>
     let masked = mask(&text);
     let Some(start) = find(&masked, 0, "export type DeckView") else {
         findings.push(format!(
-            "{DECK_VIEW_TS}: no `export type DeckView` declaration found — check 13 cannot check a screen against a \
+            "{DECK_VIEW_TS}: no `export type DeckView` declaration found — rule 14 cannot check a screen against a \
              set it could not read"
         ));
         return BTreeSet::new();
@@ -630,7 +630,7 @@ fn deck_view_kinds(source: &str, findings: &mut Vec<String>) -> BTreeSet<String>
     }
     if kinds.is_empty() {
         findings.push(format!(
-            "{DECK_VIEW_TS}: `DeckView` yielded no `kind` literals — check 13 would then reject every screen, or \
+            "{DECK_VIEW_TS}: `DeckView` yielded no `kind` literals — rule 14 would then reject every screen, or \
              accept none, depending on nothing"
         ));
     }
@@ -650,7 +650,7 @@ fn param_kinds(source: &str, findings: &mut Vec<String>) -> BTreeSet<String> {
         .unwrap_or_default();
     if kinds.is_empty() {
         findings.push(format!(
-            "{PARAM_KIND_RS}: `impl ParamKind`'s `as_str` yielded no kind literals — check 13 would then reject every \
+            "{PARAM_KIND_RS}: `impl ParamKind`'s `as_str` yielded no kind literals — rule 14 would then reject every \
              declared param kind, or accept none. If `ParamKind` moved, move this rule with it"
         ));
     }
@@ -1093,7 +1093,7 @@ mod tests {
     #[test]
     fn the_checked_in_table_and_registry_resolve_against_each_other() {
         let findings = check(&checked_in());
-        assert!(findings.is_empty(), "check 13: {}", findings.join("\n"));
+        assert!(findings.is_empty(), "rule 14: {}", findings.join("\n"));
     }
 
     /// And that the scan is not vacuous: a rule that found no rows, no entries

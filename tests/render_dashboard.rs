@@ -12,7 +12,9 @@ use std::sync::{Arc, Mutex};
 use dot_agent_deck::agent_pty::DISPLAY_NAME_MAX_LEN;
 use dot_agent_deck::event::{AgentEvent, AgentType, DISPLAY_NAME_METADATA_KEY, EventType};
 use dot_agent_deck::pane::RenameOutcome;
-use dot_agent_deck::state::{ActiveTool, AppState, DashboardStats, SessionState, SessionStatus};
+use dot_agent_deck::state::{
+    ActiveTool, AppState, DashboardStats, SessionSnapshot, SessionState, SessionStatus,
+};
 use dot_agent_deck::tab::Tab;
 use dot_agent_deck::terminal_widget::TerminalWidget;
 use dot_agent_deck::ui::{
@@ -260,6 +262,85 @@ fn card_stats_001_wide_card_places_full_stats_in_bottom_right_border() {
         placeholder_bottom.contains("Last:") && placeholder_bottom.contains("Tools: 0"),
         "placeholder cards must retain full Last/Tools counters in the bottom border:\n{placeholder}"
     );
+}
+
+/// Scenario: Reconnect a TUI to a daemon whose agent has been quiet for an hour: seed the card from the daemon's snapshot the way hydration does, then render it into an 80-column L1 buffer. The bottom border must read `Last: 1h`, not the `0s` a freshly minted placeholder shows. A snapshot from an older daemon that omits the instant, or one carrying an instant no timestamp can hold, still renders the placeholder's seconds-old readout.
+#[spec("session/live/016")]
+#[test]
+fn live_016_reconnected_card_reads_how_long_the_agent_has_been_quiet() {
+    let quiet_for_an_hour = (chrono::Utc::now() - chrono::Duration::hours(1)).timestamp_millis();
+    let bottom_border_after_reconnect = |last_activity_ms: Option<i64>| {
+        let snapshot = SessionSnapshot {
+            status: SessionStatus::Idle,
+            agent_type: Some(AgentType::ClaudeCode),
+            active_tool: None,
+            tool_count: 14,
+            first_prompts: vec!["move the stats into the border".to_string()],
+            last_user_prompt: Some("move the stats into the border".to_string()),
+            live_target: None,
+            last_activity_ms,
+        };
+        let mut state = AppState::default();
+        state.register_pane("pane-reconnect".to_string());
+        state.seed_hydrated_session(
+            "pane-reconnect".to_string(),
+            Some("/home/dev/api-svc".to_string()),
+            Some(AgentType::ClaudeCode),
+            Some("agent-reconnect".to_string()),
+            Some(&snapshot),
+        );
+        let session = state
+            .sessions
+            .get("pane-pane-reconnect")
+            .expect("hydration seeds the pane's card");
+        let density = CardDensityKind::Normal;
+        let rendered = buffer_to_text(&render_card_to_buffer(
+            session,
+            Some("api-svc"),
+            Some(1),
+            density,
+            0,
+            false,
+            80,
+            density.rendered_height(),
+        ));
+        rendered
+            .lines()
+            .last()
+            .expect("card must have a bottom border")
+            .to_string()
+    };
+
+    let bottom = bottom_border_after_reconnect(Some(quiet_for_an_hour));
+    assert!(
+        bottom.contains(" Last: 1h  Tools: 14 "),
+        "a reconnected card must say how long the agent has been quiet, not reset to 0s:\n{bottom}"
+    );
+
+    for (case, last_activity_ms) in [
+        ("an older daemon's snapshot without the instant", None),
+        (
+            "an instant outside what a timestamp can hold",
+            Some(i64::MAX),
+        ),
+    ] {
+        let bottom = bottom_border_after_reconnect(last_activity_ms);
+        let elapsed = bottom
+            .split(" Last: ")
+            .nth(1)
+            .and_then(|rest| rest.split("  Tools: ").next())
+            .unwrap_or_else(|| panic!("{case}: the full stats label must render:\n{bottom}"));
+        // The seconds form, not a pinned `0s`: `format_elapsed` reads the clock
+        // at render time, so a loaded box can tip a just-minted card to `1s`
+        // (issue #350).
+        assert!(
+            elapsed.ends_with('s')
+                && elapsed[..elapsed.len() - 1]
+                    .bytes()
+                    .all(|b| b.is_ascii_digit()),
+            "{case}: the card must keep the freshly minted placeholder's readout, got `{elapsed}`:\n{bottom}"
+        );
+    }
 }
 
 /// Scenario: Render a card at the narrowest realistic 20-column width. The

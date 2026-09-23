@@ -48,7 +48,7 @@ Four commitments shape it.
 - **Daemon support** for what the form needs: a capability-gated query for the deck's new-agent options, and daemon-side composition and delivery of the `schedule`, `schedule: issues` and `dispatcher` seed prompts.
 - **Deck-targeted start actions** in the desktop backend — plain agent, authoring agent, orchestration — each resolving the chosen deck through `DeckScope::resolve` and returning the new agent's id (for an orchestration, the start role's).
 - **After creation**: the desktop waits until the target deck's fleet entry lists the new agent, then opens its pane in the PRD #1105 overlay.
-- A **voice registry** entry for the new action, as linkage-check 13 requires (`xtask/linkage-check/src/voice_command_registry.rs`) — either `voice: true` or a `no_voice` reason.
+- A **voice registry** entry for the new action, as linkage-check rule 14 requires (`xtask/linkage-check/src/voice_command_registry.rs`) — either `voice: true` or a `no_voice` reason.
 - Tests at every tier the desktop and daemon have, documentation, and CLAUDE.md rule 12's cross-version check.
 
 ### Out of Scope

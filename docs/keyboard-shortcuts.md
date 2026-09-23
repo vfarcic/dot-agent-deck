@@ -9,7 +9,9 @@ title: Keyboard Shortcuts
 
 Every keyboard action below is also reachable with the mouse. Every clickable control shows its keyboard shortcut inline, so the on-screen controls double as a legend. On a dashboard card, a single click selects it and a double click focuses its pane.
 
-The wheel scrolls the focused pane — or a mode tab's side pane when the pointer is over one. In command mode the wheel always drives Agent Deck's own scrollback and is never forwarded to the agent, so a full-screen TUI cannot move under you while you read. While you are typing in a pane, the wheel goes to the agent if the agent has mouse reporting enabled.
+**The wheel goes to whatever the pointer is over.** It scrolls the focused pane while the pointer is inside that pane — or a mode tab's side pane when the pointer is over one. Elsewhere on the deck the wheel does nothing: over the card list, the stats bar, the tab bar, the bottom button bar, a pane's border, or a pane that is not the focused one, it is dropped — the same way a click that lands on nothing is. Point at the pane you want to scroll. (The card grid has no scroll of its own — it moves only as a consequence of moving the selection.) An open dialog is its own case: while the Scheduled Tasks manager is up it takes the wheel for its own list, and the other modals swallow it rather than let it reach the pane behind them.
+
+In command mode the wheel always drives Agent Deck's own scrollback and is never forwarded to the agent, so a full-screen TUI cannot move under you while you read. While you are typing in a pane, the wheel goes to the agent if the agent has mouse reporting enabled — and it carries the cell the pointer is actually on, which is why a wheel from outside the pane is dropped rather than delivered at the nearest edge.
 
 **Whether anything actually moves depends on the agent** — see [Scrolling back through a pane](#scrolling-back-through-a-pane).
 

@@ -8927,10 +8927,16 @@ impl AgentPtyRegistry {
     /// Almost nothing, because the pane is already unavailable for most of the
     /// same window. While the stopping agent's child is LIVE its record fails
     /// the reservation's exclusivity test on its own, and that covers the whole
-    /// termination grace — the one interval this genuinely adds is the short tail
-    /// between the child being dead and `close_agent` dropping its record. A
-    /// spawn that lands in that tail is refused with `DuplicatePaneId`, the same
-    /// error it would get one instant earlier.
+    /// termination grace. What this genuinely adds is the tail after the child is
+    /// dead, in two parts. Until `close_agent` drops the record, a spawn is
+    /// refused with `DuplicatePaneId`, the same error it would get one instant
+    /// earlier. After that the pane has no record at all, and the hold goes on
+    /// refusing a spawn that would otherwise succeed through `unregister_pane`,
+    /// `finish_pane_close` and the handler's reply — the hold is dropped only
+    /// after the reply is written. So a caller that reuses a pane id after a
+    /// close must wait on [`Self::pane_close_in_flight`], as
+    /// [`Self::respawn_or_recreate_agent_for_pane`] does, not on the reply
+    /// (issue #1218).
     pub fn hold_pane_for_cleanup(
         self: &Arc<Self>,
         pane_id: &str,

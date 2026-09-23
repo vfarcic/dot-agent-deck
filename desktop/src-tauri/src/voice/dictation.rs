@@ -94,7 +94,7 @@ pub const DICTATION_OPENERS: [&str; 4] = ["type", "write", "say", "dictate"];
 /// `submit_prompt`'s own description names it, so a bare *"go ahead"* is
 /// answered by the model rather than here — and the model is told it means
 /// send. This list decides who answers an utterance, never what happens to it,
-/// which is why check 13 runs one way only. The worry that kept it out — an
+/// which is why rule 14 runs one way only. The worry that kept it out — an
 /// agent that has just asked *"shall I proceed?"* makes *"go ahead"* an answer
 /// the user wants **typed** — is real, and keeping it out does not serve it:
 /// [`strip_opening`] always strips at least one introducing token, so no

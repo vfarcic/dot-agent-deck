@@ -1,4 +1,4 @@
-//! Check 13 (issue #1181): no `git` program literal in the root crate's
+//! Rule 13 (issue #1181): no `git` program literal in the root crate's
 //! PRODUCTION sources, outside the one module that neutralizes the ambient git
 //! environment.
 //!

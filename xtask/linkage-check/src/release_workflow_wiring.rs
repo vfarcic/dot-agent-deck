@@ -1053,3 +1053,582 @@ fn a_body_with_no_line_breaks_is_still_clamped() {
         "the clamp returned a body no shorter than it received"
     );
 }
+
+/// The step blocks of a job, split on the `      - ` step markers.
+///
+/// Comments written *above* a step belong to the preceding step's block, since
+/// the `- ` line is what opens a new one. That is harmless for the callers
+/// below, which read only `uses:`/`name:`/`path:` code lines -- but it is worth
+/// knowing before writing a check here that greps a step for prose.
+fn steps(block: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut current: Option<Vec<String>> = None;
+    for line in block.lines() {
+        if line.starts_with("      - ") {
+            if let Some(body) = current.take() {
+                out.push(body.join("\n"));
+            }
+            current = Some(vec![line.to_string()]);
+            continue;
+        }
+        if let Some(body) = current.as_mut() {
+            body.push(line.to_string());
+        }
+    }
+    if let Some(body) = current.take() {
+        out.push(body.join("\n"));
+    }
+    out
+}
+
+/// The code lines of `step`, with trailing shell comments removed.
+fn step_code(step: &str) -> String {
+    step.lines()
+        .map(code_before_comment)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The `name:` of the `actions/upload-artifact` step in `block` whose `path:`
+/// is exactly `path`, together with whether it declares
+/// `if-no-files-found: error`.
+///
+/// Keyed on the PATH rather than on the artifact name, so the name itself stays
+/// an output of the check rather than an input to it. That is the whole point:
+/// the assertions below then compare the producer's chosen name against the
+/// consumer's, and a rename done in one place and not the other fails instead
+/// of passing twice over a hardcoded literal.
+fn uploaded_as(block: &str, path: &str) -> Option<(String, bool)> {
+    steps(block).into_iter().find_map(|step| {
+        let code = step_code(&step);
+        if !code.contains("actions/upload-artifact@") {
+            return None;
+        }
+        if !code.lines().any(|l| l.trim() == format!("path: {path}")) {
+            return None;
+        }
+        let name = code
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("name: ").map(str::to_string))?;
+        let strict = code.lines().any(|l| l.trim() == "if-no-files-found: error");
+        Some((name, strict))
+    })
+}
+
+/// Whether `block` has an `actions/download-artifact` step pulling exactly the
+/// artifact `name` (as `name:`, not as a `pattern:`).
+fn downloads_artifact(block: &str, name: &str) -> bool {
+    steps(block).iter().any(|step| {
+        let code = step_code(step);
+        code.contains("actions/download-artifact@")
+            && code.lines().any(|l| l.trim() == format!("name: {name}"))
+    })
+}
+
+/// Issue #1152: a full release publishes eight assets and the subject
+/// collection used to match six of them. The two it missed were the checksum
+/// manifests -- which is the worst pair to miss, because a manifest is a list
+/// of hashes a user leans on to validate everything else, so an unattested one
+/// is precisely the file worth swapping.
+///
+/// **Neither manifest is reachable from `attest` by default, and that is what
+/// this guards.** `checksums.txt` is written inside `finalize` and
+/// `checksums-desktop-alpha.txt` inside `desktop-publish`; `attest` has no
+/// checkout and neither generates them, so each has to travel as an artifact of
+/// its own. The obvious-looking alternative -- re-running `shasum` in `attest`
+/// -- is the one outcome that must not happen: it would mint provenance over
+/// bytes that are very probably identical to the published ones and provably
+/// nothing, and an attestation over a file that differs from the published one
+/// is worse than no attestation at all. So the absence of `shasum` from this
+/// job is asserted too.
+///
+/// Nothing else can catch a regression here. `release.yml` fires only on a tag,
+/// never on a pull request, and a dropped subject is invisible in the run: the
+/// action succeeds over whatever list it is handed. The symptom is a `404` from
+/// `gh attestation verify`, weeks later, on a release that has already shipped.
+#[test]
+fn both_checksum_manifests_are_attested_subjects() {
+    let all = jobs(&workflow());
+    let attest = job(&all, "attest");
+    // Comments stripped for both substring checks below, so a comment ABOUT the
+    // wiring cannot stand in for the wiring -- the same reason `note_step`'s
+    // callers strip them. The attest job is full of prose naming these files.
+    let attest_code = step_code(attest);
+
+    let cases = [
+        ("finalize", "dist/checksums.txt"),
+        (
+            "desktop-publish",
+            "dist-desktop/checksums-desktop-alpha.txt",
+        ),
+    ];
+
+    for (producer, path) in cases {
+        let (artifact, strict) = uploaded_as(job(&all, producer), path).unwrap_or_else(|| {
+            panic!(
+                "`{producer}` no longer uploads `{path}` as an artifact. It is written in that \
+                 job and published from there, and `attest` has no checkout -- so without this \
+                 hand-off the manifest is unreachable from the job that attests, and the only \
+                 way to attest it would be to regenerate it, which attests bytes the release \
+                 does not carry. #1152."
+            )
+        });
+
+        // The two `pattern:` downloads that already exist would sweep a
+        // carelessly named manifest artifact into a directory it must not reach:
+        // `dot-agent-deck-*` is what `finalize` selects on and feeds to
+        // `task checksums`' own `shasum -a 256 dot-agent-deck-*`, and
+        // `desktop-bundle-*` is what `desktop-publish` re-uploads wholesale with
+        // `gh release upload dist-desktop/*`.
+        for reserved in ["dot-agent-deck-", "desktop-bundle-"] {
+            assert!(
+                !artifact.starts_with(reserved),
+                "`{producer}` uploads `{path}` as artifact `{artifact}`, which matches the \
+                 `{reserved}*` download pattern already in this workflow. A re-run of that job \
+                 alone would then pull a previous attempt's manifest back into its own working \
+                 directory. Same rule as `desktop-bundle`'s artifact name."
+            );
+        }
+
+        assert!(
+            strict,
+            "`{producer}`'s upload of `{path}` does not declare `if-no-files-found: error`. \
+             Without it a missing manifest produces a warning and no artifact, and for the \
+             desktop half -- whose download in `attest` is deliberately tolerated -- that is a \
+             silently unattested asset rather than a failed release."
+        );
+
+        assert!(
+            downloads_artifact(attest, &artifact),
+            "`attest` does not download the `{artifact}` artifact that `{producer}` uploads. The \
+             producer and the consumer have to name the same artifact; renaming one alone drops \
+             `{path}` from the subject list without failing anything."
+        );
+
+        // Deliberately NOT a `contains(path)` check on the job. That is what
+        // this test carried on its first push, and Greptile was right to call
+        // it: `dist/checksums.txt` also appears in the collector's own
+        // `[ ! -f ... ]` guard, so deleting the line that appends it to
+        // `subjects` left the substring in place and the assertion green while
+        // the asset silently stopped being attested. Whether a path reaches the
+        // EMITTED list is a question about what the script does, so it is
+        // answered by running the script -- see the four tests below.
+    }
+
+    assert!(
+        !attest_code.contains("shasum"),
+        "`attest` runs `shasum`. The manifests must travel from the jobs that published them, \
+         not be regenerated here: an attestation over a file that differs from the published one \
+         is worse than none, and a second `shasum` run in a different job is a claim about bytes \
+         nobody checked. #1152."
+    );
+}
+
+/// The index of the first step in `steps` whose code (comments stripped)
+/// satisfies `pred`, or a panic naming `what` when none does.
+fn step_index(steps: &[String], what: &str, pred: impl Fn(&str) -> bool) -> usize {
+    steps
+        .iter()
+        .position(|s| pred(&step_code(s)))
+        .unwrap_or_else(|| panic!("no step {what}"))
+}
+
+/// Each manifest's artifact upload sits IMMEDIATELY after the step that
+/// publishes it, and in `finalize` before the steps that write more files into
+/// `dist/`.
+///
+/// This is what makes "the attested bytes are the published bytes" true, and
+/// [`both_checksum_manifests_are_attested_subjects`] cannot see it: that test
+/// pins WHICH artifact carries each manifest, not WHEN it is uploaded. Both of
+/// these edits would leave it green while attesting a file the release may not
+/// carry:
+///
+/// - moving the upload above the publish step, so a step inserted between the
+///   two could rewrite the manifest after it travelled and before it shipped;
+/// - moving `finalize`'s upload below `task homebrew-formula` /
+///   `task scoop-manifest`, which write `dist/<name>.rb` and `dist/<name>.json`
+///   into the directory the manifest lives in.
+///
+/// Asserted as adjacency rather than mere precedence, because the property the
+/// upload steps' comments claim is "nothing between the publish and the
+/// upload", and precedence alone would let a writer slip in between.
+#[test]
+fn manifest_uploads_directly_follow_the_steps_that_publish_them() {
+    let all = jobs(&workflow());
+
+    let finalize = steps(job(&all, "finalize"));
+    let generate = step_index(&finalize, "runs `task checksums`", |c| {
+        c.contains("run: task checksums")
+    });
+    let publish = step_index(&finalize, "creates the GitHub release", |c| {
+        c.contains("softprops/action-gh-release@")
+    });
+    let upload = step_index(&finalize, "uploads `dist/checksums.txt`", |c| {
+        c.contains("actions/upload-artifact@")
+            && c.lines().any(|l| l.trim() == "path: dist/checksums.txt")
+    });
+    let formula = step_index(&finalize, "runs `task homebrew-formula`", |c| {
+        c.contains("task homebrew-formula")
+    });
+    assert!(
+        generate < publish,
+        "`finalize` publishes the release before `task checksums` has written the manifest"
+    );
+    assert_eq!(
+        upload,
+        publish + 1,
+        "`finalize`'s `release-checksums` upload is no longer the step directly after the \
+         release step (upload at {upload}, release at {publish}). What travels to `attest` must \
+         be the file the release carried, with nothing in between able to rewrite it. #1152."
+    );
+    assert!(
+        upload < formula,
+        "`finalize` uploads `dist/checksums.txt` after `task homebrew-formula`, which writes into \
+         `dist/` as well. #1152."
+    );
+
+    let desktop = steps(job(&all, "desktop-publish"));
+    let generate = step_index(&desktop, "writes `checksums-desktop-alpha.txt`", |c| {
+        c.contains("> checksums-desktop-alpha.txt")
+    });
+    let publish = step_index(&desktop, "runs `gh release upload`", |c| {
+        c.contains("gh release upload")
+    });
+    let upload = step_index(
+        &desktop,
+        "uploads `dist-desktop/checksums-desktop-alpha.txt`",
+        |c| {
+            c.contains("actions/upload-artifact@")
+                && c.lines()
+                    .any(|l| l.trim() == "path: dist-desktop/checksums-desktop-alpha.txt")
+        },
+    );
+    let note = step_index(&desktop, "appends the alpha note", |c| {
+        c.contains("gh release edit")
+    });
+    assert!(
+        generate < publish,
+        "`desktop-publish` uploads the release assets before the desktop manifest is written"
+    );
+    assert_eq!(
+        upload,
+        publish + 1,
+        "`desktop-publish`'s `release-checksums-desktop` upload is no longer the step directly \
+         after `gh release upload` (upload at {upload}, release upload at {publish}). #1152."
+    );
+    assert!(
+        upload < note,
+        "`desktop-publish` appends the note claiming the manifest carries provenance before it \
+         hands the manifest to `attest`. `attest` refuses a missing manifest exactly when this job \
+         succeeded, which is only sound if the artifact exists whenever the claim does. #1152."
+    );
+}
+
+/// The shell body of `attest`'s "Collect the subjects to attest" step.
+///
+/// Extracted the way [`clamp_script`] extracts the release-body clamp, and for
+/// the same reason: the thing worth asserting about this step is what it *does*
+/// with a given set of files on disk, and no substring check over its source
+/// can answer that. Greptile's P2 on #1227 is the worked example — the path a
+/// subject must reach the emitted list by also appears in the guard that checks
+/// the file exists, so a check for the path passes with the append deleted.
+fn subjects_script() -> String {
+    let all = jobs(&workflow());
+    let step = steps(job(&all, "attest"))
+        .into_iter()
+        // The step HEADER carries the name, so the line reads
+        // `- name: Collect the subjects to attest` once trimmed -- matching on
+        // the bare `name:` form finds nothing.
+        .find(|s| {
+            s.lines()
+                .any(|l| l.trim() == "- name: Collect the subjects to attest")
+        })
+        .expect("`attest` has a `Collect the subjects to attest` step");
+    let mut lines = step.lines().skip_while(|l| l.trim() != "run: |");
+    lines.next().expect("the step has a `run: |` block");
+    let body: Vec<&str> = lines.collect();
+    assert!(!body.is_empty(), "the collect step's `run:` block is empty");
+    let indent = body
+        .iter()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| l.len() - l.trim_start().len())
+        .min()
+        .expect("the block has at least one non-blank line");
+    body.iter()
+        .map(|l| if l.len() >= indent { &l[indent..] } else { "" })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// What [`run_subjects`] observed: whether the collector succeeded, the
+/// subject list it wrote to `GITHUB_OUTPUT`, and its stdout/stderr for when an
+/// assertion needs to say more than pass or fail.
+struct SubjectsRun {
+    ok: bool,
+    subjects: Vec<String>,
+    stdout: String,
+    stderr: String,
+}
+
+impl SubjectsRun {
+    /// A one-line-per-stream dump for a panic message, so a failure on a box
+    /// nobody can reproduce locally (this suite's own reason for existing —
+    /// see [`run_subjects`]'s doc comment) still says what actually happened
+    /// rather than just that it did.
+    fn diagnostics(&self) -> String {
+        format!(
+            "exit ok: {}\n--- stdout ---\n{}\n--- stderr ---\n{}",
+            self.ok, self.stdout, self.stderr
+        )
+    }
+}
+
+/// What the collector does when `dist/` and `dist-desktop/` hold exactly
+/// `files` and `desktop-publish` reported `desktop_result`.
+///
+/// Returns the exit status and the subject list it wrote to `GITHUB_OUTPUT` —
+/// the actual list handed to `actions/attest-build-provenance`, parsed out of
+/// the `paths<<SUBJECTS_EOF` heredoc rather than inferred. `None` means `bash`
+/// is absent and the caller should print `SKIP:` and return, the same tolerance
+/// `verify_pr_stream` and `junit_strip` take.
+///
+/// The `GITHUB_OUTPUT` path is normalised to forward slashes before being
+/// handed to bash as an environment value. On a native Windows runner
+/// `tempfile::tempdir()` returns a backslash path, and forward slashes are
+/// accepted by both Win32 and every POSIX-emulation layer MSYS ships, so
+/// normalising removes a possible source of trouble without removing anything
+/// Unix relies on.
+///
+/// The presence check requires `--version` to EXIT SUCCESSFULLY, not merely to
+/// spawn -- `.output().ok()` alone only catches "no such program", and on a
+/// native Windows runner there IS a program named `bash` on PATH even with no
+/// usable shell behind it: `C:\Windows\System32\bash.exe`, the WSL launcher
+/// stub, which spawns fine and then exits nonzero printing "Windows Subsystem
+/// for Linux has no installed distributions." Measured on `build-windows` in
+/// PR #1227: that is exactly what every one of this module's `run_subjects`
+/// calls hit, because the runner's PATH puts System32 ahead of Git for
+/// Windows' `bash.exe`. `verify_pr_stream`'s `tool_present` helper already
+/// checks `.status.success()` for this reason, which is why ITS bash-invoking
+/// tests reported PASS on the same runner -- they detected the same broken
+/// `bash` and skipped, silently and correctly, while this module's weaker
+/// check let three tests attempt to run a shell that cannot run anything.
+fn run_subjects(files: &[&str], desktop_result: &str) -> Option<SubjectsRun> {
+    use std::process::Command;
+    let usable = Command::new("bash")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !usable {
+        return None;
+    }
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    for sub in ["dist", "dist-desktop"] {
+        fs::create_dir_all(dir.path().join(sub)).expect("create the artifact directory");
+    }
+    for f in files {
+        fs::write(dir.path().join(f), b"fixture\n").unwrap_or_else(|e| panic!("write {f}: {e}"));
+    }
+    let out_path = dir.path().join("github-output");
+    fs::write(&out_path, "").expect("seed GITHUB_OUTPUT");
+    let out_path_arg = out_path.to_string_lossy().replace('\\', "/");
+
+    // A FILE, not `-c "<script>"` — the same choice `run_clamp` and
+    // `verify_pr_stream`'s `scan.sh` invocation already make, and not by
+    // accident. `-c` hands the whole multi-line, quote-heavy script through
+    // as a single argv element, which on Windows means Rust's `Command` has
+    // to re-encode it into ONE `CreateProcess` command-line string that MSYS
+    // bash then has to decode back into the same bytes -- a round trip this
+    // codebase has never previously asked of a script this size, unlike every
+    // other cross-platform harness test here. A file sidesteps the whole
+    // question: bash opens and reads it directly, so there is nothing for
+    // argv-quoting to get wrong. (This was the first suspect when
+    // `a_full_release_attests_every_asset_it_publishes` and its siblings failed
+    // on `build-windows` in PR #1227, but the log showed the real cause: the
+    // WSL launcher stub answering to `bash`, which the presence check above
+    // now screens out. The file is kept because it removes the question.)
+    //
+    // Invoked with the flags GitHub Actions itself uses for `shell: bash` --
+    // `bash --noprofile --norc -eo pipefail {0}` -- so the harness runs the
+    // step the way the runner does. The script sets `-eu` on its own, but
+    // `pipefail` comes only from the runner, and the collector has pipelines
+    // (`find ... | sort`) whose behaviour it changes.
+    let script_path = dir.path().join("collect-subjects.sh");
+    fs::write(&script_path, subjects_script()).expect("write the collector script");
+    let out = Command::new("bash")
+        .args(["--noprofile", "--norc", "-eo", "pipefail"])
+        .arg(&script_path)
+        .current_dir(dir.path())
+        .env("GITHUB_OUTPUT", &out_path_arg)
+        .env("DESKTOP_PUBLISH_RESULT", desktop_result)
+        .output()
+        .expect("run the subject collector");
+
+    let emitted = fs::read_to_string(&out_path).expect("read back GITHUB_OUTPUT");
+    let subjects: Vec<String> = emitted
+        .lines()
+        .skip_while(|l| l.trim() != "paths<<SUBJECTS_EOF")
+        .skip(1)
+        .take_while(|l| l.trim() != "SUBJECTS_EOF")
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect();
+    Some(SubjectsRun {
+        ok: out.status.success(),
+        subjects,
+        stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+    })
+}
+
+/// The eight assets a full release publishes are the eight subjects attested.
+///
+/// This is the assertion issue #1152 is actually about. The subject collection
+/// matched six of them, and the two it missed were the checksum manifests — the
+/// files a user reads to validate all the others, so the ones most worth
+/// swapping.
+#[test]
+fn a_full_release_attests_every_asset_it_publishes() {
+    let files = [
+        "dist/dot-agent-deck-linux-amd64",
+        "dist/dot-agent-deck-linux-arm64",
+        "dist/dot-agent-deck-darwin-amd64",
+        "dist/dot-agent-deck-darwin-arm64",
+        "dist/checksums.txt",
+        "dist-desktop/dot-agent-deck-desktop-alpha-linux-amd64.deb",
+        "dist-desktop/dot-agent-deck-desktop-alpha-macos-arm64.dmg",
+        "dist-desktop/checksums-desktop-alpha.txt",
+    ];
+    let Some(run) = run_subjects(&files, "success") else {
+        eprintln!("SKIP: the subject-collection tests need `bash` on PATH");
+        return;
+    };
+    assert!(
+        run.ok,
+        "the collector failed on a complete set of artifacts\n{}",
+        run.diagnostics()
+    );
+
+    let mut want: Vec<String> = files.iter().map(|f| (*f).to_string()).collect();
+    want.sort();
+    let mut got = run.subjects.clone();
+    got.sort();
+    assert_eq!(
+        got,
+        want,
+        "the attested set is not the published set. Every file a full release uploads must be a \
+         subject -- #1152 is what happens when two of them are not.\n{}",
+        run.diagnostics()
+    );
+}
+
+/// A wholly failed desktop matrix still attests the CLI assets **and the CLI
+/// manifest**.
+///
+/// The CLI half must never be hostage to the desktop half: `needs:` on a matrix
+/// job resolves to the aggregate, which is the defect Greptile's P1 found in
+/// `desktop-publish` on #768 and which this job's `if:` gate exists to avoid.
+/// #1152 adds a second way to get it wrong — treating the desktop manifest as
+/// required unconditionally — so the case is pinned rather than reasoned about.
+#[test]
+fn a_wholly_failed_desktop_matrix_still_attests_the_cli_assets() {
+    let files = [
+        "dist/dot-agent-deck-linux-amd64",
+        "dist/dot-agent-deck-darwin-arm64",
+        "dist/checksums.txt",
+    ];
+    let Some(run) = run_subjects(&files, "failure") else {
+        eprintln!("SKIP: the subject-collection tests need `bash` on PATH");
+        return;
+    };
+    assert!(
+        run.ok,
+        "a failed desktop matrix made the collector fail, discarding the CLI binaries' \
+         attestations. That is the #768 defect, one job over.\n{}",
+        run.diagnostics()
+    );
+    assert!(
+        run.subjects.contains(&"dist/checksums.txt".to_string()),
+        "the CLI manifest is missing from {:?}. It is published on every release, desktop or \
+         not.\n{}",
+        run.subjects,
+        run.diagnostics()
+    );
+    assert_eq!(
+        run.subjects.len(),
+        3,
+        "unexpected subjects: {:?}\n{}",
+        run.subjects,
+        run.diagnostics()
+    );
+}
+
+/// A CLI manifest that did not arrive fails the collection rather than being
+/// quietly dropped.
+///
+/// `finalize` cannot succeed without publishing `checksums.txt`, and `attest`
+/// runs only when `finalize` succeeded — so its absence here is broken wiring,
+/// and the alternative to failing is a release whose manifest silently carries
+/// no provenance. The symptom of that is a `404` weeks later, which is what
+/// #1152 was filed about.
+#[test]
+fn a_missing_cli_manifest_fails_the_collection() {
+    let Some(run) = run_subjects(&["dist/dot-agent-deck-linux-amd64"], "skipped") else {
+        eprintln!("SKIP: the subject-collection tests need `bash` on PATH");
+        return;
+    };
+    assert!(
+        !run.ok,
+        "the collector accepted a run with no `dist/checksums.txt` and emitted {:?}\n{}",
+        run.subjects,
+        run.diagnostics()
+    );
+}
+
+/// A desktop manifest that did not arrive fails the collection **when
+/// `desktop-publish` succeeded**, and only then.
+///
+/// Greptile's P1 on #1227, and the asymmetry is the whole finding. That job
+/// publishes the manifest, uploads it as an artifact, and only then appends the
+/// release note saying every asset here carries provenance — in that order,
+/// under `bash -e`. So `success` means the claim is on the release: attesting
+/// around a missing manifest would leave a published security claim false while
+/// the run stayed green. Any other result means no desktop asset reached the
+/// release and no claim was made, so the CLI assets must still be attested.
+#[test]
+fn a_missing_desktop_manifest_fails_only_when_its_claim_was_published() {
+    let files = [
+        "dist/dot-agent-deck-linux-amd64",
+        "dist/checksums.txt",
+        "dist-desktop/dot-agent-deck-desktop-alpha-linux-amd64.deb",
+    ];
+    let Some(claimed) = run_subjects(&files, "success") else {
+        eprintln!("SKIP: the subject-collection tests need `bash` on PATH");
+        return;
+    };
+    assert!(
+        !claimed.ok,
+        "`desktop-publish` succeeded -- so the release body already says \
+         `checksums-desktop-alpha.txt` carries provenance -- and the collector attested without \
+         it anyway. A green run must not leave that claim false.\n{}",
+        claimed.diagnostics()
+    );
+
+    let unclaimed = run_subjects(&files, "failure").expect("bash was there a moment ago");
+    assert!(
+        unclaimed.ok,
+        "`desktop-publish` did not succeed, so nothing desktop reached the release and there is \
+         no manifest to expect. Failing here would discard the CLI binaries' attestations for a \
+         bundler's failure -- the #768 defect again.\n{}",
+        unclaimed.diagnostics()
+    );
+    assert!(
+        unclaimed
+            .subjects
+            .contains(&"dist/checksums.txt".to_string()),
+        "the CLI assets were not attested: {:?}\n{}",
+        unclaimed.subjects,
+        unclaimed.diagnostics()
+    );
+}

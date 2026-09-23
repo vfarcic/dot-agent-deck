@@ -5,82 +5,49 @@
 //! Subcommands:
 //!
 //! - `linkage-check` (default) — first runs a repository-state preflight
-//!   (issue #557; see [`repo_state`]), then performs the thirteen checks
-//!   listed in Decision 7 + Decision 30:
+//!   (issue #557; see [`repo_state`]), then runs every rule registered in
+//!   [`RULES`].
 //!
-//!   The preflight is deliberately not one of the numbered checks: it answers
+//!   The preflight is deliberately not one of the numbered rules: it answers
 //!   "is this repository sane to reason about", a different question from
 //!   "does the catalog match the tests", and it runs first so a repository
-//!   in a state that would misdiagnose the checks below is caught before
+//!   in a state that would misdiagnose the rules below is caught before
 //!   any of them run. It asserts that the object store is not unexpectedly
 //!   shallow and that the worktree registry has not drifted from what is on
 //!   disk — both gated so a legitimately shallow, single-worktree CI clone
 //!   is exempt by construction. See [`repo_state`] for the full reasoning.
 //!
-//!   1. Every catalog ID has at least one `#[spec("...")]` referencing
-//!      it OR is on the allowlist (`m2.allowlist`).
-//!   2. Every `#[spec("...")]` references a real catalog ID.
-//!   3. Catalog IDs match the format regex.
-//!   4. Function name carries the `<sub>_<NNN>` prefix (Decision 17).
-//!   5. No raw `std::thread::sleep` / `tokio::time::sleep` /
-//!      `for _ in 0..N` polling in `tests/e2e_*.rs` bodies (Decision 21).
-//!   6. No `#[ignore]` on `#[spec(...)]`-annotated tests (Decision 26).
-//!   7. Every `#[spec(...)]` test carries a `/// Scenario:` doc
-//!      comment with a body AND `cargo xtask docs --tests` exits 0
-//!      against the current source + catalog (Decision 30 / M4.3).
-//!      The byte-identity diff against the on-disk `.md` is gone:
-//!      `.dot-agent-deck/` is gitignored dev-time state and would
-//!      not exist on a fresh clone.
-//!   8. No bare `tempfile` constructor — directory (`tempdir()`,
-//!      `TempDir::new()`) *or* file (`NamedTempFile::new()`,
-//!      `tempfile()`) — anywhere under `tests/`, or in the files on
-//!      [`EXTRA_TEMP_COVERED`]. Issue #322. See
-//!      [`BARE_TEMPDIR_RULE`].
-//!   9. No `crate::` path in `src/test_temp.rs`, which is
-//!      `#[path]`-included by the lib target AND by every
-//!      integration-test crate that needs a disk-backed scratch dir.
-//!      Issue #474. See [`SELF_CONTAINED_RULE`].
-//!  10. Every file under `tests/` that builds an `AgentPtyRegistry`
-//!      or calls `run_daemon_with` also arms the wrapped-child
-//!      lifetime bound — `common::init_test_env()` or
-//!      `child_lifetime_bound::arm()`. Issue #668. See
-//!      [`UNARMED_SPAWN_RULE`].
-//!  11. No file under `tests/` pins a wrapped-child lifetime cap
-//!      longer than the one `clean-e2e-tmp` derives its dead-owner
-//!      deletion floor from. Issue #679. See
-//!      [`overlong_lifetime_cap_rule`].
-//!  12. No client-side project resolution in the desktop crate's
-//!      PRODUCTION sources — PRD #819's invariant. A regression
-//!      TRIPWIRE, not enforcement and not a security boundary: the
-//!      desktop path-depends on the whole root crate, so a wrapper
-//!      with an innocuous name bypasses it, and only issue #176
-//!      M1.1 makes the invariant compiler-checked. See
-//!      [`desktop_project_boundary`].
-//!  13. No `git` program literal in the root crate's PRODUCTION
-//!      sources outside `src/git_env.rs`, which is the one place
-//!      the ambient git LOCATION environment is switched off. An
-//!      ambient `GIT_DIR` outranks both `-C <dir>` and
-//!      `current_dir`, so an un-neutralized `git` creates,
-//!      enumerates and DELETES worktrees in whatever repository
-//!      that variable names (issue #1181). A tripwire for the next
-//!      call site, which no runtime test can be. See
-//!      [`git_program_literal`].
-//!  14. The voice command table and the frontend action registry
-//!      resolve against each other — PRD #802 M3. Every `invoke` in
-//!      `commands.toml` names a `VOICE_ACTIONS` key, every `screens`
-//!      entry is a `DeckView` `kind`, every param `kind` is a
-//!      `ParamKind`, every registry entry is classified by a row or a
-//!      written `no_voice` reason, and the registry literal stays
-//!      statically readable. It proves the registry is CONSISTENT, not
-//!      that it is COMPLETE; see [`voice_command_registry`].
-//!  15. No bare `Command::new("git")` in test-support code — all of
-//!      `tests/`, plus the files on [`EXTRA_GIT_COVERED`]. Issues
-//!      #834 / #1121. See [`BARE_GIT_RULE`].
+//!   **There is no rule list here any more, and that is the point** (issue
+//!   #1216). [`RULES`] is the one registration per rule, and everything that
+//!   used to be written out by hand derives from it: the `[N]` tag on a
+//!   finding, the rule count in the success line, and the list itself, which
+//!   `cargo xtask linkage-check --list-rules` prints from each entry's
+//!   `summary`. Adding a rule is one entry and nothing else.
 //!
-//!   The numbers are stable identifiers in the failure output, so a
-//!   new rule takes the next one rather than renumbering the others.
+//!   Before that, adding one meant editing **four** places in this file with
+//!   sequential numbers — a hand-numbered doc list here, a `// Check N`
+//!   comment at the registration site, a `format!("[N] {v}")` tag, and a
+//!   literal count in the success line — so two rule-adding pull requests
+//!   conflicted by construction whatever they were about: measured three
+//!   times in one day, between #1190/#1163, #1190/#1179 and #1163/#1179,
+//!   none of which shared a subject. The count was the worse half. Two
+//!   branches each raising the same literal produce IDENTICAL text, which
+//!   git merges cleanly and silently: it shipped saying `14` with fifteen
+//!   rules registered, twice in that same day, past fmt, clippy and
+//!   `cargo test-fast`. Deriving it removes that mode, and
+//!   `rule_numbers_are_unique_and_run_from_one_without_a_gap` is what turns
+//!   the remaining collision — two branches both claiming the next number —
+//!   into a red test rather than a quiet merge.
 //!
-//!   Checks 1/2/4/6 bind each `#[spec("…")]` to its test function
+//!   **Rule numbers are stable identifiers and no existing one ever
+//!   renumbers.** They are cited by number in `CLAUDE.md`, under `docs/` and
+//!   in comments throughout `tests/`, and they are what a reader maps a
+//!   failure tag back through; `name` is beside each number for the same job
+//!   without the renumbering hazard. A new rule takes the next unused number.
+//!   `docs/develop/linkage-check-rules.md` is the contributor-facing version
+//!   of all of this.
+//!
+//!   Rules 1/2/4/6 bind each `#[spec("…")]` to its test function
 //!   through the SAME syn walker rule 7 uses
 //!   ([`xtask_docs::discover_tests`]) rather than a line regex. Issue
 //!   #406: the old regex matched `^\s*fn\s+` only, so an `async fn`
@@ -127,8 +94,8 @@ mod contract_breaks;
 #[cfg(test)]
 mod desktop_palette;
 /// PRD #819 M7: the desktop crate's project-resolution boundary. Unlike the
-/// `#[cfg(test)]` modules around it this one carries a live rule — check 12
-/// below — as well as its own tests.
+/// `#[cfg(test)]` modules around it this one carries a live rule — rule 12 in
+/// [`RULES`] — as well as its own tests.
 mod desktop_project_boundary;
 /// Issue #827: the desktop settings store's credential boundary on the
 /// surfaces `settings.rs`'s own tests cannot reach — the Rust schema's field
@@ -150,8 +117,8 @@ mod devbox_gtk_origin;
 #[cfg(test)]
 mod gh_aw_lock_consistency;
 /// Issue #1181: no `git` program literal in the root crate's production
-/// sources. Like `desktop_project_boundary` this carries a live rule — check
-/// 13 below — as well as its own tests.
+/// sources. Like `desktop_project_boundary` this carries a live rule — rule 13
+/// in [`RULES`] — as well as its own tests.
 mod git_program_literal;
 /// Issue #603: the adaptive issue labeler's post-agent memory validator. Tests
 /// only — the rule lives in the agentic workflow, and these drive the real
@@ -222,6 +189,11 @@ mod sample_attribution;
 /// runs today because nothing cuts a Tauri bundle yet.
 #[cfg(all(test, unix))]
 mod sidecar_staging;
+/// Issue #1200: every `/img/…` and `./img/…` image reference under `docs/` and
+/// `site/src/` resolves to a file in `site/static/img/`. Like
+/// `desktop_project_boundary` this one carries a live rule — rule 16 in
+/// [`RULES`] — as well as its own planted-bad-input tests.
+mod site_image_refs;
 /// Issue #1061: every `.claude/skills/*/SKILL.md` frontmatter block is valid
 /// YAML and every skill name matches the spec's `^[a-z0-9-]+$`. Tests only —
 /// nothing compiles a `SKILL.md` and no CI job read one before this, so the
@@ -235,8 +207,8 @@ mod verify_pr_stream;
 /// PRD #802 M3: the voice command table (`commands.toml`) against the frontend
 /// action registry (`desktop/src/lib/voiceActions.ts`), plus the two closed sets
 /// the table's columns draw from. Like `desktop_project_boundary` this one
-/// carries a live rule — check 13 below — as well as its own planted-bad-input
-/// tests.
+/// carries a live rule — rule 14 in [`RULES`] — as well as its own
+/// planted-bad-input tests.
 mod voice_command_registry;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -252,7 +224,7 @@ const CATALOG_PATH: &str = "tests/CATALOG.md";
 const ALLOWLIST_PATH: &str = "xtask/linkage-check/m2.allowlist";
 const TESTS_DIR: &str = "tests";
 
-/// Check 8 (issue #322): why a bare `tempfile` constructor is forbidden under
+/// Rule 8 (issue #322): why a bare `tempfile` constructor is forbidden under
 /// `tests/`, spelled out here because the violation is invisible at the call
 /// site.
 ///
@@ -306,7 +278,7 @@ const BARE_TEMPDIR_RULE: &str = "bare tempfile constructor — use `common::harn
      lands under the harness temp root even when it is the process's FIRST \
      allocation (issue #322)";
 
-/// Files outside `tests/` that check 8 also covers.
+/// Files outside `tests/` that rule 8 also covers.
 ///
 /// `src/dispatch.rs` — lib-target unit tests that build real git repos and
 /// worktrees. They do not link `tests/common/` at all and use
@@ -324,10 +296,10 @@ const BARE_TEMPDIR_RULE: &str = "bare tempfile constructor — use `common::harn
 /// normalised, so this works on Windows too.
 const EXTRA_TEMP_COVERED: &[&str] = &["src/dispatch.rs"];
 
-/// Opt-out marker for check 8, on the offending line.
+/// Opt-out marker for rule 8, on the offending line.
 const BARE_TEMPDIR_ALLOW: &str = "linkage-check:allow-bare-tempdir";
 
-/// Check 15 (issues #834, #1121): a fixture must not shell out to `git` with a
+/// Rule 15 (issues #834, #1121): a fixture must not shell out to `git` with a
 /// bare [`std::process::Command`].
 ///
 /// Git resolves a repository from `GIT_DIR` and the other discovery variables
@@ -354,14 +326,14 @@ const BARE_GIT_RULE: &str = "bare `Command::new(\"git\")` in test-support code �
      commit identity does not come from the developer's own config (issues #834, \
      #1121)";
 
-/// Opt-out marker for check 13, on the offending line.
+/// Opt-out marker for rule 15, on the offending line.
 ///
 /// Taken by the fixture helpers themselves — each one IS the single bare
 /// `Command::new("git")` that the neutralisation is then applied to — and by
 /// `worktree_owner::git_at`, which is production.
 const BARE_GIT_ALLOW: &str = "linkage-check:allow-bare-git";
 
-/// Files outside `tests/` that check 13 covers.
+/// Files outside `tests/` that rule 15 covers.
 ///
 /// The three `src/` modules whose unit tests build real git repositories and
 /// worktrees. Their PRODUCTION git calls do not go through
@@ -399,7 +371,7 @@ fn bare_git_ctor_re() -> Regex {
     Regex::new(r#"Command::new\s*\(\s*"git"\s*\)"#).expect("bare git constructor regex compiles")
 }
 
-/// Whether check 13 applies to `file`.
+/// Whether rule 15 applies to `file`.
 fn git_ctor_rule_covers(file: &Path, root: &Path, tests_dir: &Path) -> bool {
     if file.starts_with(tests_dir) {
         return true;
@@ -440,7 +412,7 @@ fn bare_temp_ctor_re() -> Regex {
     .expect("bare temp constructor regex compiles")
 }
 
-/// Whether check 8 applies to `file`.
+/// Whether rule 8 applies to `file`.
 ///
 /// Everything under `tests/`, plus the explicit [`EXTRA_TEMP_COVERED`] list for
 /// the lib target. `is_e2e` is no longer consulted — an `e2e_` file is under
@@ -455,7 +427,7 @@ fn temp_ctor_rule_covers(file: &Path, root: &Path, tests_dir: &Path, _is_e2e: bo
         .any(|rel| file == root.join(rel).as_path())
 }
 
-/// Check 9 (issue #474): the one file in this repository that may not name its
+/// Rule 9 (issue #474): the one file in this repository that may not name its
 /// own crate, spelled out here because nothing at the offending line says so.
 ///
 /// `src/test_temp.rs` is compiled twice over: as an ordinary `mod test_temp` in
@@ -505,11 +477,11 @@ const SELF_CONTAINED_RULE: &str = "`crate::` path in a `#[path]`-shared file —
      arrive as an argument instead. Sharing it this way is what costs 12 extra \
      fast-tier executions rather than the ~530 `mod common;` would (issue #474)";
 
-/// The file check 9 guards. Repo-relative, joined onto the workspace root, so
+/// The file rule 9 guards. Repo-relative, joined onto the workspace root, so
 /// the platform separator is whatever `Path::join` produces.
 const SELF_CONTAINED_PATH: &str = "src/test_temp.rs";
 
-/// The `crate::` paths check 9 forbids.
+/// The `crate::` paths rule 9 forbids.
 ///
 /// The leading `\b` is what keeps `some_crate::x` out: `_` is a word character,
 /// so no boundary falls in front of that `crate`. `$crate::` from a
@@ -541,7 +513,7 @@ fn self_contained_violations(display: &str, text: &str) -> Vec<String> {
         .collect()
 }
 
-/// Run check 9 against a workspace root.
+/// Run rule 9 against a workspace root.
 ///
 /// An unreadable file is itself a failure. The guard's entire job is to outlive
 /// edits to the arrangement it protects, and a rename that left this constant
@@ -552,7 +524,7 @@ fn check_self_contained(root: &Path) -> Vec<String> {
     match std::fs::read_to_string(&path) {
         Ok(text) => self_contained_violations(&path.display().to_string(), &text),
         Err(e) => vec![format!(
-            "{}: cannot read the file check 9 guards ({e}) — if it moved, point \
+            "{}: cannot read the file rule 9 guards ({e}) — if it moved, point \
              `SELF_CONTAINED_PATH` at its new home; if the `#[path]` sharing is \
              gone, delete the rule (issue #474)",
             path.display()
@@ -560,7 +532,7 @@ fn check_self_contained(root: &Path) -> Vec<String> {
     }
 }
 
-/// Check 10 (issue #668): a test file that spawns agents must arm the wrapped-
+/// Rule 10 (issue #668): a test file that spawns agents must arm the wrapped-
 /// child lifetime bound, spelled out here because nothing at the offending line
 /// says so.
 ///
@@ -629,7 +601,7 @@ const UNARMED_SPAWN_RULE: &str = "agent spawn path with no lifetime bound armed 
      `child_lifetime_bound::arm()`. A deliberate exception pins its own cap per-`Command` and \
      carries `linkage-check:allow-unarmed-agent-spawn` on this line";
 
-/// Opt-out marker for check 10, on the offending line. Same shape as
+/// Opt-out marker for rule 10, on the offending line. Same shape as
 /// [`BARE_TEMPDIR_ALLOW`]: an exception is declared where it is taken, so review
 /// sees it, rather than in a list far from the code.
 ///
@@ -639,12 +611,12 @@ const UNARMED_SPAWN_RULE: &str = "agent spawn path with no lifetime bound armed 
 /// registry, and `agent_lifetime_bound.rs` calls `init_test_env()` anyway.
 const UNARMED_SPAWN_ALLOW: &str = "linkage-check:allow-unarmed-agent-spawn";
 
-/// The spawn sites check 10 requires arming for.
+/// The spawn sites rule 10 requires arming for.
 ///
 /// `AgentPtyRegistry::default()` is matched alongside `::new()` even though no
 /// call site uses it: it is the ordinary second constructor, and a rule that
 /// covers most of its stated territory is the shape that let
-/// `NamedTempFile::new()` sit undetected under check 8. `run_daemon_with` needs
+/// `NamedTempFile::new()` sit undetected under rule 8. `run_daemon_with` needs
 /// its `(` — an import (`use dot_agent_deck::daemon::{Daemon, run_daemon_with};`)
 /// names it without calling it and is deliberately not a violation.
 fn agent_spawn_site_re() -> Regex {
@@ -652,13 +624,13 @@ fn agent_spawn_site_re() -> Regex {
         .expect("agent spawn site regex compiles")
 }
 
-/// The calls that arm the bound, either of which clears check 10 for a file.
+/// The calls that arm the bound, either of which clears rule 10 for a file.
 fn lifetime_bound_armed_re() -> Regex {
     Regex::new(r"\binit_test_env\s*\(|\bchild_lifetime_bound\s*::\s*arm\s*\(")
         .expect("lifetime bound arming regex compiles")
 }
 
-/// Check 11 (issue #679): no test may pin a wrapped-child lifetime cap longer
+/// Rule 11 (issue #679): no test may pin a wrapped-child lifetime cap longer
 /// than the one `clean-e2e-tmp` derives its dead-owner deletion floor from.
 ///
 /// `cargo xtask clean-e2e-tmp` reaps a root whose owning *test* process is dead
@@ -815,91 +787,432 @@ fn unarmed_agent_spawn_violations(display: &str, text: &str) -> Vec<String> {
         .collect()
 }
 
-fn main() -> ExitCode {
-    // PRD #77 M4: route subcommands through this binary so the
-    // single `cargo xtask` alias can drive both linkage-check and
-    // docs. `cargo xtask docs --tests` → docs generator;
-    // anything else (including no first arg or `linkage-check`) →
-    // the seven Decision-7 / Decision-30 checks below.
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    if matches!(args.first().map(String::as_str), Some("docs")) {
-        return run_docs(&args[1..]);
-    }
-    if matches!(args.first().map(String::as_str), Some("list-tests")) {
-        return run_list_tests(&args[1..]);
-    }
-    if matches!(args.first().map(String::as_str), Some("clean-e2e-tmp")) {
-        return clean_tmp::run(&args[1..]);
-    }
+/// One registered rule: everything about it that used to be spread over four
+/// hand-maintained places in this file (issue #1216).
+///
+/// - `number` is the stable identifier a finding is tagged with — the one
+///   `CLAUDE.md`, `docs/` and comments under `tests/` cite. It is written here
+///   rather than taken from the entry's position so that inserting or
+///   reordering an entry cannot silently renumber a cited rule; the invariant
+///   that the numbers still run 1..=N with no gap is a test
+///   (`rule_numbers_are_unique_and_run_from_one_without_a_gap`),
+///   which is what makes two branches both claiming the next number red
+///   instead of a clean merge.
+/// - `name` is the same identity without the renumbering hazard, for prose and
+///   for `--list-rules`.
+/// - `summary` is what the rule enforces, printed by `--list-rules`. This is
+///   the rule list that used to be a numbered doc comment at the top of the
+///   file — moved onto the registration so it cannot drift from it, and so the
+///   tool can print it rather than only rustdoc.
+/// - `check` is the rule, reading the [`Inputs`] every rule resolves against.
+struct Rule {
+    number: u16,
+    name: &'static str,
+    summary: &'static str,
+    check: fn(&Inputs) -> Vec<String>,
+}
 
-    let root = repo_root();
+/// Every rule, in number order. **The single registration per rule.**
+///
+/// Adding one means adding one entry here, with the next unused `number`, and
+/// nothing else: the failure tag, the success line's count and the
+/// `--list-rules` output all read this table. Removing one is deliberately
+/// harder than it looks — the numbers are cited outside this crate, so retire a
+/// rule by making it a no-op with a `summary` that says so rather than by
+/// deleting its entry and renumbering its successors.
+const RULES: &[Rule] = &[
+    Rule {
+        number: 1,
+        name: "catalog-id-has-a-test",
+        summary: "Every catalog ID has at least one `#[spec(\"...\")]` referencing it OR is on the \
+                  allowlist (`m2.allowlist`).",
+        check: rule_catalog_id_has_a_test,
+    },
+    Rule {
+        number: 2,
+        name: "annotation-names-a-catalog-id",
+        summary: "Every `#[spec(\"...\")]` references a real catalog ID.",
+        check: rule_annotation_names_a_catalog_id,
+    },
+    Rule {
+        number: 3,
+        name: "catalog-id-format",
+        summary: "Catalog IDs match the format regex `<area>/<sub>/<NNN>`.",
+        check: rule_catalog_id_format,
+    },
+    Rule {
+        number: 4,
+        name: "fn-name-carries-the-spec-prefix",
+        summary: "Function name carries the `<sub>_<NNN>` prefix, or the category-qualified \
+                  `<area>_<sub>_<NNN>` form (Decision 17) — and every annotation the text scan \
+                  found is one syn could bind to a `fn` (issue #406).",
+        check: rule_fn_name_carries_the_spec_prefix,
+    },
+    Rule {
+        number: 5,
+        name: "no-raw-wait-in-e2e",
+        summary: "No raw `std::thread::sleep` / `tokio::time::sleep` / `for _ in 0..N` polling in \
+                  `tests/e2e_*.rs` bodies (Decision 21).",
+        check: rule_no_raw_wait_in_e2e,
+    },
+    Rule {
+        number: 6,
+        name: "no-ignored-spec-test",
+        summary: "No `#[ignore]` on `#[spec(...)]`-annotated tests (Decision 26).",
+        check: rule_no_ignored_spec_test,
+    },
+    Rule {
+        number: 7,
+        name: "scenario-comment-and-docs-generator",
+        summary: "Every `#[spec(...)]` test carries a `/// Scenario:` doc comment with a body AND \
+                  `cargo xtask docs --tests` exits 0 against the current source + catalog \
+                  (Decision 30 / M4.3). The byte-identity diff against the on-disk `.md` is gone: \
+                  `.dot-agent-deck/` is gitignored dev-time state and would not exist on a fresh \
+                  clone.",
+        check: rule_scenario_comment_and_docs_generator,
+    },
+    Rule {
+        number: 8,
+        name: "no-bare-tempfile-ctor",
+        summary: "No bare `tempfile` constructor — directory (`tempdir()`, `TempDir::new()`) *or* \
+                  file (`NamedTempFile::new()`, `tempfile()`) — anywhere under `tests/`, or in \
+                  the files on `EXTRA_TEMP_COVERED`. Issue #322; see `BARE_TEMPDIR_RULE`.",
+        check: rule_no_bare_tempfile_ctor,
+    },
+    Rule {
+        number: 9,
+        name: "self-contained-test-temp",
+        summary: "No `crate::` path in `src/test_temp.rs`, which is `#[path]`-included by the lib \
+                  target AND by every integration-test crate that needs a disk-backed scratch \
+                  dir. Issue #474; see `SELF_CONTAINED_RULE`.",
+        check: rule_self_contained_test_temp,
+    },
+    Rule {
+        number: 10,
+        name: "armed-agent-spawn",
+        summary: "Every file under `tests/` that builds an `AgentPtyRegistry` or calls \
+                  `run_daemon_with` also arms the wrapped-child lifetime bound — \
+                  `common::init_test_env()` or `child_lifetime_bound::arm()`. Issue #668; see \
+                  `UNARMED_SPAWN_RULE`.",
+        check: rule_armed_agent_spawn,
+    },
+    Rule {
+        number: 11,
+        name: "lifetime-cap-under-the-reaper-floor",
+        summary: "No file under `tests/` pins a wrapped-child lifetime cap longer than the one \
+                  `clean-e2e-tmp` derives its dead-owner deletion floor from. Issue #679; see \
+                  `overlong_lifetime_cap_rule`.",
+        check: rule_lifetime_cap_under_the_reaper_floor,
+    },
+    Rule {
+        number: 12,
+        name: "desktop-project-boundary",
+        summary: "No client-side project resolution in the desktop crate's PRODUCTION sources — \
+                  PRD #819's invariant. A regression TRIPWIRE, not enforcement and not a security \
+                  boundary: the desktop path-depends on the whole root crate, so a wrapper with \
+                  an innocuous name bypasses it, and only issue #176 M1.1 makes the invariant \
+                  compiler-checked. See `desktop_project_boundary`.",
+        check: rule_desktop_project_boundary,
+    },
+    Rule {
+        number: 13,
+        name: "git-program-literal",
+        summary: "No `git` program literal in the root crate's PRODUCTION sources outside \
+                  `src/git_env.rs`, which is the one place the ambient git LOCATION environment \
+                  is switched off. An ambient `GIT_DIR` outranks both `-C <dir>` and \
+                  `current_dir`, so an un-neutralized `git` creates, enumerates and DELETES \
+                  worktrees in whatever repository that variable names (issue #1181). A tripwire \
+                  for the next call site, which no runtime test can be. See `git_program_literal`.",
+        check: rule_git_program_literal,
+    },
+    Rule {
+        number: 14,
+        name: "voice-command-registry",
+        summary: "The voice command table and the frontend action registry resolve against each \
+                  other — PRD #802 M3. Every `invoke` in `commands.toml` names a `VOICE_ACTIONS` \
+                  key, every `screens` entry is a `DeckView` `kind`, every param `kind` is a \
+                  `ParamKind`, every registry entry is classified by a row or a written \
+                  `no_voice` reason, and the registry literal stays statically readable. It \
+                  proves the registry is CONSISTENT, not that it is COMPLETE; see \
+                  `voice_command_registry`.",
+        check: rule_voice_command_registry,
+    },
+    Rule {
+        number: 15,
+        name: "no-bare-git-ctor",
+        summary: "No bare `Command::new(\"git\")` in test-support code — all of `tests/`, plus the \
+                  files on `EXTRA_GIT_COVERED`. Issues #834 / #1121; see `BARE_GIT_RULE`.",
+        check: rule_no_bare_git_ctor,
+    },
+    Rule {
+        number: 16,
+        name: "site-image-refs",
+        summary: "Every `/img/...` and `./img/...` image reference under `docs/` and `site/src/` \
+                  resolves to a file in `site/static/img/`. Docusaurus does not resolve an image \
+                  path at build time, so `onBrokenLinks: 'throw'` never sees a dead one: the page \
+                  builds clean and the browser 404s (issue #1200). See `site_image_refs`.",
+        check: rule_site_image_refs,
+    },
+];
 
-    // Repository-state preflight (issue #557): a different question from
-    // the catalog↔test checks below, and one worth answering before any of
-    // them spend seconds parsing the catalog. Runs first and short-circuits
-    // on its own rather than joining `failures` below, so it stays a
-    // preflight rather than becoming a ninth catalog check.
-    let repo_state_failures = repo_state::run(&root);
-    if !repo_state_failures.is_empty() {
-        eprintln!(
-            "linkage-check: repository-state preflight: {} failure(s):",
-            repo_state_failures.len()
-        );
-        for f in &repo_state_failures {
-            eprintln!("  {f}");
-        }
-        return ExitCode::FAILURE;
-    }
+/// Everything the rules read, resolved once before any of them runs.
+///
+/// Rules 1–7 all reason about the same catalog, allowlist and syn-bound
+/// annotation set, and five more read findings collected by one pass over
+/// `tests/` + `src/`; parsing any of that per rule would be both slower and a
+/// way for two rules to disagree about what the tree says.
+struct Inputs {
+    root: PathBuf,
+    catalog_ids: BTreeSet<String>,
+    allowlist: BTreeSet<String>,
+    docs_config: xtask_docs::DocsConfig,
+    occurrences: Vec<SpecOccurrence>,
+    discovered: Vec<xtask_docs::DiscoveredTest>,
+    scanned: ScannedFindings,
+}
 
-    let catalog_path = root.join(CATALOG_PATH);
-    let allowlist_path = root.join(ALLOWLIST_PATH);
-    let tests_dir = root.join(TESTS_DIR);
+/// The findings the single line-scan pass collected, one bucket per rule that
+/// owns them.
+///
+/// These rules are line scans over the same files, so they share the walk, the
+/// read and the comment-stripping — but each bucket belongs to exactly one
+/// registered rule, which is what keeps the tag on a finding derivable from the
+/// table rather than written at the site that produced it.
+#[derive(Default)]
+struct ScannedFindings {
+    /// Rule 5.
+    forbidden_wait: Vec<String>,
+    /// Rule 8.
+    bare_tempdir: Vec<String>,
+    /// Rule 10.
+    unarmed_spawn: Vec<String>,
+    /// Rule 11.
+    overlong_cap: Vec<String>,
+    /// Rule 15.
+    bare_git: Vec<String>,
+}
 
-    let mut failures: Vec<String> = Vec::new();
+fn rule_catalog_id_has_a_test(inputs: &Inputs) -> Vec<String> {
+    // M2 ships only `dashboard/pane/004` and `hooks/delivery/001` on the
+    // allowlist; M4+ ticks IDs off it as it lands tests.
+    let annotated: BTreeSet<&str> = inputs
+        .discovered
+        .iter()
+        .map(|ann| ann.spec_id.as_str())
+        .collect();
+    inputs
+        .catalog_ids
+        .iter()
+        .filter(|id| !annotated.contains(id.as_str()) && !inputs.allowlist.contains(*id))
+        .map(|id| {
+            format!(
+                "catalog ID `{id}` has no #[spec({id:?})]-annotated test and is not on the M2 allowlist"
+            )
+        })
+        .collect()
+}
 
-    let catalog_ids = match parse_catalog_ids(&catalog_path) {
-        Ok(ids) => ids,
-        Err(e) => {
-            eprintln!("failed to parse catalog at {}: {e}", catalog_path.display());
-            return ExitCode::from(2);
-        }
-    };
-    let allowlist = match read_allowlist(&allowlist_path) {
-        Ok(set) => set,
-        Err(e) => {
-            eprintln!(
-                "failed to read allowlist at {}: {e}",
-                allowlist_path.display()
-            );
-            return ExitCode::from(2);
-        }
-    };
+fn rule_annotation_names_a_catalog_id(inputs: &Inputs) -> Vec<String> {
+    inputs
+        .discovered
+        .iter()
+        .filter(|ann| !inputs.catalog_ids.contains(&ann.spec_id))
+        .map(|ann| {
+            format!(
+                "{} carries #[spec({:?})] which is not in the catalog",
+                ann.source_path.display(),
+                ann.spec_id
+            )
+        })
+        .collect()
+}
 
-    // Check 3: format regex on catalog IDs.
+fn rule_catalog_id_format(inputs: &Inputs) -> Vec<String> {
     let id_re = Regex::new(r"^[a-z][a-z0-9-]*/[a-z][a-z0-9-]*/\d{3}$")
         .expect("catalog ID format regex compiles");
-    for id in &catalog_ids {
-        if !id_re.is_match(id) {
-            failures.push(format!(
-                "[3] catalog ID {id:?} does not match `<area>/<sub>/<NNN>`"
+    inputs
+        .catalog_ids
+        .iter()
+        .filter(|id| !id_re.is_match(id))
+        .map(|id| format!("catalog ID {id:?} does not match `<area>/<sub>/<NNN>`"))
+        .collect()
+}
+
+/// Rule 4, both halves: the Decision-17 prefix, and issue #406's honest
+/// failure for an annotation syn could not bind at all.
+///
+/// The prefix accepts EITHER the short `<sub>_<NNN>` form OR the
+/// category-qualified `<area>_<sub>_<NNN>` full-ID form (both hyphen →
+/// underscore normalized for Rust idents, M2.1 reviewer S1). The qualified form
+/// is what lets tests whose short prefix collides across categories carry
+/// unambiguous names WITHOUT renaming — e.g. `chain-smoke/pi/001` and
+/// `scheduler/pi/001` both shorten to `pi_001`, so they use `chain_smoke_pi_001`
+/// / `scheduler_pi_001` (PRD #201). The short form stays valid so the many
+/// pre-existing short-named tests — including other colliding sub-areas that
+/// predate this rule (`help_001`, `form_001`, `live_001`, `spawn_001`,
+/// `selection_001`, `layout_001`, …) — keep passing. See [`fn_name_matches_spec`].
+///
+/// The unbound half comes first because it is the one that invalidates the
+/// other: an annotation nothing bound cannot have its function's name checked.
+fn rule_fn_name_carries_the_spec_prefix(inputs: &Inputs) -> Vec<String> {
+    let mut out = unattached_annotation_failures(&inputs.occurrences, &inputs.discovered);
+    for ann in &inputs.discovered {
+        if !fn_name_matches_spec(&ann.spec_id, &ann.fn_name) {
+            out.push(format!(
+                "{} fn `{}` does not start with `{}` (short) or `{}` (category-qualified) (Decision 17, derived from #[spec({:?})])",
+                ann.source_path.display(),
+                ann.fn_name,
+                sub_area_prefix(&ann.spec_id).unwrap_or_default(),
+                qualified_id_prefix(&ann.spec_id).unwrap_or_default(),
+                ann.spec_id
             ));
         }
     }
+    out
+}
 
-    // Scan tests/ AND src/ for `#[spec(...)]` annotations. PRD #83
-    // added per-tab-selection `#[spec]` unit tests in `src/tab.rs`; the
-    // e2e-only checks below key off the `e2e_` filename prefix, so
-    // library sources never trip the sleep/polling rules.
-    //
-    // This text scan no longer decides which FUNCTION an annotation
-    // belongs to — syn does that below (issue #406). It only records
-    // where each annotation is, so an annotation syn could not bind is
-    // reported at its own line.
-    let mut test_files = collect_test_rs_files(&tests_dir);
+fn rule_no_raw_wait_in_e2e(inputs: &Inputs) -> Vec<String> {
+    inputs.scanned.forbidden_wait.clone()
+}
+
+/// Rule 6 (Decision 26): read straight off the function's own attributes.
+///
+/// The old line scan credited a test with any `#[ignore]` sitting between the
+/// annotation and the next plain `fn`, which could belong to a different
+/// function entirely.
+fn rule_no_ignored_spec_test(inputs: &Inputs) -> Vec<String> {
+    inputs
+        .discovered
+        .iter()
+        .filter(|ann| ann.ignored)
+        .map(|ann| {
+            format!(
+                "{}: #[spec({:?})] annotates an #[ignore]-d test `{}` (Decision 26)",
+                ann.source_path.display(),
+                ann.spec_id,
+                ann.fn_name
+            )
+        })
+        .collect()
+}
+
+/// Rule 7 (PRD #77 Decision 30 / M4.3). The `xtask-docs` library raises `Err`
+/// on a missing Scenario or a malformed test source, which is exactly the two
+/// failure modes to surface here.
+fn rule_scenario_comment_and_docs_generator(inputs: &Inputs) -> Vec<String> {
+    match xtask_docs::check_rule_7(&inputs.docs_config) {
+        Ok(()) => Vec::new(),
+        Err(e) => vec![e],
+    }
+}
+
+fn rule_no_bare_tempfile_ctor(inputs: &Inputs) -> Vec<String> {
+    inputs.scanned.bare_tempdir.clone()
+}
+
+/// Rule 9 (issue #474): `src/test_temp.rs` names no crate of its own. Read
+/// directly rather than folded into the shared scan, so that the file going
+/// missing is reported instead of quietly emptying the rule.
+fn rule_self_contained_test_temp(inputs: &Inputs) -> Vec<String> {
+    check_self_contained(&inputs.root)
+}
+
+fn rule_armed_agent_spawn(inputs: &Inputs) -> Vec<String> {
+    inputs.scanned.unarmed_spawn.clone()
+}
+
+fn rule_lifetime_cap_under_the_reaper_floor(inputs: &Inputs) -> Vec<String> {
+    inputs.scanned.overlong_cap.clone()
+}
+
+/// Rule 12 (PRD #819 M7). Read straight off `desktop/src-tauri/src/` rather
+/// than folded into the `tests/` + `src/` scan, because it covers a different
+/// tree entirely — and because the directory going missing must be reported
+/// rather than quietly emptying the rule.
+fn rule_desktop_project_boundary(inputs: &Inputs) -> Vec<String> {
+    desktop_project_boundary::run(&inputs.root)
+}
+
+/// Rule 13 (issue #1181). Read straight off `src/` rather than folded into the
+/// shared scan, because that scan is line-based and this one has to track
+/// strings, comments, char literals and `#[cfg(test)]` item bodies across lines
+/// to tell a production literal from prose about one — and because `src/` or
+/// `src/git_env.rs` going missing must be reported rather than quietly emptying
+/// the rule.
+fn rule_git_program_literal(inputs: &Inputs) -> Vec<String> {
+    git_program_literal::run(&inputs.root)
+}
+
+/// Rule 14 (PRD #802 M3). Read straight off its own four files for rule 12's
+/// reason — a different tree, and an input going missing must be reported
+/// rather than quietly emptying the rule.
+fn rule_voice_command_registry(inputs: &Inputs) -> Vec<String> {
+    voice_command_registry::run(&inputs.root)
+}
+
+fn rule_no_bare_git_ctor(inputs: &Inputs) -> Vec<String> {
+    inputs.scanned.bare_git.clone()
+}
+
+/// Rule 16 (issue #1200). Its own trees — `docs/` and `site/src/` against
+/// `site/static/img/` — so, like rules 12–14, the inputs going missing is a
+/// finding rather than a vacuous pass.
+fn rule_site_image_refs(inputs: &Inputs) -> Vec<String> {
+    site_image_refs::run(&inputs.root)
+}
+
+/// Run every registered rule, tagging each finding with its rule's number.
+///
+/// The tag is applied HERE, from the table, rather than written into each
+/// rule's own `format!`. That is not tidying: while the tag was a `format!` at
+/// the registration site, rules 5 and 6 emitted findings with **no** tag at all
+/// — for as long as they have existed — because nothing connected the tag to
+/// the registration. It also means a rule's own unit tests assert the message
+/// without the tag, so they cannot pin a number that has moved.
+fn run_rules(inputs: &Inputs) -> Vec<String> {
+    let mut failures = Vec::new();
+    for rule in RULES {
+        failures.extend(
+            (rule.check)(inputs)
+                .into_iter()
+                .map(|finding| format!("[{}] {finding}", rule.number)),
+        );
+    }
+    failures
+}
+
+/// `--list-rules`: what each `[N]` in the failure output means.
+///
+/// This is the rule list that used to be a numbered doc comment only rustdoc
+/// could show. It is printed from the same table the tags come from, so the two
+/// cannot disagree.
+fn list_rules() -> ExitCode {
+    println!("linkage-check: {} rules", RULES.len());
+    for rule in RULES {
+        println!();
+        println!("[{}] {}", rule.number, rule.name);
+        println!("     {}", rule.summary);
+    }
+    ExitCode::SUCCESS
+}
+
+/// The single pass over `tests/` + `src/` that the line-scanning rules share.
+///
+/// Returns the `#[spec(...)]` occurrences the text scan located — which no
+/// longer decide which FUNCTION an annotation belongs to, syn does that (issue
+/// #406); they only record where each annotation is, so one syn could not bind
+/// is reported at its own line — plus one findings bucket per rule that reads
+/// this walk.
+///
+/// `src/` is scanned alongside `tests/` because PRD #83 added per-tab-selection
+/// `#[spec]` unit tests in `src/tab.rs`; the e2e-only rules key off the `e2e_`
+/// filename prefix, so library sources never trip the sleep/polling rule.
+fn scan_sources(root: &Path, tests_dir: &Path) -> (Vec<SpecOccurrence>, ScannedFindings) {
+    let mut test_files = collect_test_rs_files(tests_dir);
     test_files.extend(collect_test_rs_files(&root.join("src")));
+
     let mut occurrences: Vec<SpecOccurrence> = Vec::new();
-    let mut e2e_violations: Vec<String> = Vec::new();
-    let mut ignore_violations: Vec<String> = Vec::new();
+    let mut found = ScannedFindings::default();
 
     let spec_re = Regex::new(r#"#\[spec\("([^"]+)"\)\]"#).expect("spec attr regex compiles");
     // Decision 21: forbidden in test bodies.
@@ -909,10 +1222,6 @@ fn main() -> ExitCode {
         Regex::new(r"for\s+_\s+in\s+0\.\.\s*\d+\s*\{").expect("polling regex compiles");
     let bare_tempdir_re = bare_temp_ctor_re();
     let bare_git_re = bare_git_ctor_re();
-    let mut bare_tempdir_violations: Vec<String> = Vec::new();
-    let mut bare_git_violations: Vec<String> = Vec::new();
-    let mut unarmed_spawn_violations: Vec<String> = Vec::new();
-    let mut overlong_cap_violations: Vec<String> = Vec::new();
 
     for file in &test_files {
         let text = match std::fs::read_to_string(file) {
@@ -947,7 +1256,7 @@ fn main() -> ExitCode {
             });
         }
 
-        // Check 8 (issue #322): all of `tests/`, plus `EXTRA_TEMP_COVERED` for
+        // Rule 8 (issue #322): all of `tests/`, plus `EXTRA_TEMP_COVERED` for
         // the lib target. The e2e tier is where the allocations are whole cloned
         // repositories, where nextest's `slow-timeout terminate-after` SIGKILLs
         // a process before it can clean up, and where real agent credentials
@@ -958,11 +1267,11 @@ fn main() -> ExitCode {
         // on SIGKILL, survive as untagged `.tmp*` the reaper will not remove by
         // default. Run against the stripped view so a comment naming the
         // constructor is not a violation, but report the raw line number.
-        if temp_ctor_rule_covers(file, &root, &tests_dir, is_e2e) {
+        if temp_ctor_rule_covers(file, root, tests_dir, is_e2e) {
             for (idx, raw) in raw_lines.iter().enumerate() {
                 let stripped_line = stripped_lines.get(idx).copied().unwrap_or("");
                 if bare_tempdir_re.is_match(stripped_line) && !raw.contains(BARE_TEMPDIR_ALLOW) {
-                    bare_tempdir_violations.push(format!(
+                    found.bare_tempdir.push(format!(
                         "{}:{}: {BARE_TEMPDIR_RULE}",
                         file.display(),
                         idx + 1
@@ -971,46 +1280,44 @@ fn main() -> ExitCode {
             }
         }
 
-        // Check 15 (issues #834, #1121): all of `tests/`, plus
+        // Rule 15 (issues #834, #1121): all of `tests/`, plus
         // `EXTRA_GIT_COVERED` for the lib target's fixtures. Run against the
         // stripped view so a comment naming the constructor is not a
-        // violation, but report the raw line number — same shape as check 8.
-        if git_ctor_rule_covers(file, &root, &tests_dir) {
+        // violation, but report the raw line number — same shape as rule 8.
+        if git_ctor_rule_covers(file, root, tests_dir) {
             for (idx, raw) in raw_lines.iter().enumerate() {
                 let stripped_line = stripped_lines.get(idx).copied().unwrap_or("");
                 if bare_git_re.is_match(stripped_line) && !raw.contains(BARE_GIT_ALLOW) {
-                    bare_git_violations.push(format!(
-                        "{}:{}: {BARE_GIT_RULE}",
-                        file.display(),
-                        idx + 1
-                    ));
+                    found
+                        .bare_git
+                        .push(format!("{}:{}: {BARE_GIT_RULE}", file.display(), idx + 1));
                 }
             }
         }
 
-        // Check 10 (issue #668): `tests/` only — `src/daemon.rs` calls
+        // Rule 10 (issue #668): `tests/` only — `src/daemon.rs` calls
         // `run_daemon_with` in production, where the gate must stay unarmed.
         // The whole-file arming lookup is inside the helper, which does its own
         // comment-stripping so it can be unit-tested against synthetic sources
         // rather than only against a checkout that is clean by construction.
-        if file.starts_with(&tests_dir) {
-            unarmed_spawn_violations.extend(unarmed_agent_spawn_violations(
+        if file.starts_with(tests_dir) {
+            found.unarmed_spawn.extend(unarmed_agent_spawn_violations(
                 &file.display().to_string(),
                 &text,
             ));
 
-            // Check 11 (issue #679): `tests/` only, for the same reason. The
+            // Rule 11 (issue #679): `tests/` only, for the same reason. The
             // variable gates a TEST-only backstop, so `src/` never pins it —
             // `src/agent_pty.rs` only names it — and the population the
             // reaper's floor has to bound is exactly the pins written here.
-            overlong_cap_violations.extend(overlong_lifetime_cap_violations(
+            found.overlong_cap.extend(overlong_lifetime_cap_violations(
                 &file.display().to_string(),
                 &text,
             ));
         }
 
         if is_e2e {
-            // Check 5: forbidden waits / polling in e2e test bodies.
+            // Rule 5: forbidden waits / polling in e2e test bodies.
             // Run against the stripped (comment-free) view so a
             // commented-out `// std::thread::sleep` doesn't trip the
             // check, but keep the raw line numbers in the error message
@@ -1018,14 +1325,14 @@ fn main() -> ExitCode {
             for (idx, _raw) in raw_lines.iter().enumerate() {
                 let stripped_line = stripped_lines.get(idx).copied().unwrap_or("");
                 if sleep_re.is_match(stripped_line) {
-                    e2e_violations.push(format!(
+                    found.forbidden_wait.push(format!(
                         "{}:{}: forbidden sleep call (Decision 21)",
                         file.display(),
                         idx + 1
                     ));
                 }
                 if polling_re.is_match(stripped_line) {
-                    e2e_violations.push(format!(
+                    found.forbidden_wait.push(format!(
                         "{}:{}: forbidden fixed-count polling loop (Decision 21)",
                         file.display(),
                         idx + 1
@@ -1035,176 +1342,115 @@ fn main() -> ExitCode {
         }
     }
 
+    (occurrences, found)
+}
+
+/// Resolve everything the rules read. `Err` carries the exit code for an input
+/// this tool cannot reason without — a parse failure here would make rules
+/// 1/2/4/6 report garbage, so it is fatal rather than a finding.
+fn gather_inputs(root: PathBuf) -> Result<Inputs, ExitCode> {
+    let catalog_path = root.join(CATALOG_PATH);
+    let allowlist_path = root.join(ALLOWLIST_PATH);
+    let tests_dir = root.join(TESTS_DIR);
+
+    let catalog_ids = match parse_catalog_ids(&catalog_path) {
+        Ok(ids) => ids,
+        Err(e) => {
+            eprintln!("failed to parse catalog at {}: {e}", catalog_path.display());
+            return Err(ExitCode::from(2));
+        }
+    };
+    let allowlist = match read_allowlist(&allowlist_path) {
+        Ok(set) => set,
+        Err(e) => {
+            eprintln!(
+                "failed to read allowlist at {}: {e}",
+                allowlist_path.display()
+            );
+            return Err(ExitCode::from(2));
+        }
+    };
+
+    let (occurrences, scanned) = scan_sources(&root, &tests_dir);
+
     // Bind every annotation to its test function with syn — the same
-    // walker rule 7 runs (issue #406). A parse failure here is fatal:
-    // with no reliable binding, checks 1/2/4/6 would report garbage.
+    // walker rule 7 runs (issue #406).
     let docs_config = xtask_docs::DocsConfig::from_workspace(root.clone());
     let discovered = match discover_spec_tests(&docs_config) {
         Ok(tests) => tests,
         Err(e) => {
             eprintln!("failed to parse #[spec] test sources: {e}");
-            return ExitCode::from(2);
+            return Err(ExitCode::from(2));
         }
     };
 
-    // Issue #406, the honest-failure half: every `#[spec(...)]` the text
-    // scan found must correspond to a function syn bound. One that does
-    // not (annotating a non-`fn` item, or emitted from inside a macro
-    // body syn does not expand) is named at its own file:line rather
-    // than silently attaching itself to a neighbouring function.
-    failures.extend(unattached_annotation_failures(&occurrences, &discovered));
+    Ok(Inputs {
+        root,
+        catalog_ids,
+        allowlist,
+        docs_config,
+        occurrences,
+        discovered,
+        scanned,
+    })
+}
 
-    let mut annotated_ids: BTreeSet<&str> = BTreeSet::new();
-    for ann in &discovered {
-        annotated_ids.insert(&ann.spec_id);
-
-        // Check 2: annotation references a real catalog ID.
-        if !catalog_ids.contains(&ann.spec_id) {
-            failures.push(format!(
-                "[2] {} carries #[spec({:?})] which is not in the catalog",
-                ann.source_path.display(),
-                ann.spec_id
-            ));
-        }
-
-        // Check 4: function name carries a Decision-17 prefix derived
-        // from the catalog ID. We accept EITHER the short `<sub>_<NNN>`
-        // form OR the category-qualified `<area>_<sub>_<NNN>` full-ID
-        // form (both hyphen → underscore normalized for Rust idents,
-        // M2.1 reviewer S1). The qualified form is what lets tests whose
-        // short prefix collides across categories carry unambiguous
-        // names WITHOUT renaming — e.g. `chain-smoke/pi/001` and
-        // `scheduler/pi/001` both shorten to `pi_001`, so they use
-        // `chain_smoke_pi_001` / `scheduler_pi_001` (PRD #201). The short
-        // form stays valid so the many pre-existing short-named tests —
-        // including other colliding sub-areas that predate this rule
-        // (`help_001`, `form_001`, `live_001`, `spawn_001`,
-        // `selection_001`, `layout_001`, …) — keep passing. See
-        // `fn_name_matches_spec`.
-        if !fn_name_matches_spec(&ann.spec_id, &ann.fn_name) {
-            failures.push(format!(
-                "[4] {} fn `{}` does not start with `{}` (short) or `{}` (category-qualified) (Decision 17, derived from #[spec({:?})])",
-                ann.source_path.display(),
-                ann.fn_name,
-                sub_area_prefix(&ann.spec_id).unwrap_or_default(),
-                qualified_id_prefix(&ann.spec_id).unwrap_or_default(),
-                ann.spec_id
-            ));
-        }
-
-        // Check 6 (Decision 26): read straight off the function's own
-        // attributes. The old line scan credited this test with any
-        // `#[ignore]` sitting between the annotation and the next plain
-        // `fn`, which could belong to a different function entirely.
-        if ann.ignored {
-            ignore_violations.push(format!(
-                "{}: #[spec({:?})] annotates an #[ignore]-d test `{}` (Decision 26)",
-                ann.source_path.display(),
-                ann.spec_id,
-                ann.fn_name
-            ));
-        }
+fn main() -> ExitCode {
+    // PRD #77 M4: route subcommands through this binary so the
+    // single `cargo xtask` alias can drive both linkage-check and
+    // docs. `cargo xtask docs --tests` → docs generator;
+    // anything else (including no first arg or `linkage-check`) →
+    // every rule registered in `RULES`.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if matches!(args.first().map(String::as_str), Some("docs")) {
+        return run_docs(&args[1..]);
+    }
+    if matches!(args.first().map(String::as_str), Some("list-tests")) {
+        return run_list_tests(&args[1..]);
+    }
+    if matches!(args.first().map(String::as_str), Some("clean-e2e-tmp")) {
+        return clean_tmp::run(&args[1..]);
+    }
+    // Accepted anywhere in the remaining args, because the `linkage-check`
+    // subcommand name itself is optional: `cargo xtask --list-rules` and
+    // `cargo xtask linkage-check --list-rules` both have to work.
+    if args.iter().any(|a| a == "--list-rules") {
+        return list_rules();
     }
 
-    // Check 1: every catalog ID has at least one annotation OR is on
-    // the allowlist (M2 ships only `dashboard/pane/004` and
-    // `hooks/delivery/001`; M4+ ticks IDs off the allowlist as it
-    // lands tests).
-    for id in &catalog_ids {
-        if annotated_ids.contains(id.as_str()) {
-            continue;
+    let root = repo_root();
+
+    // Repository-state preflight (issue #557): a different question from
+    // the rules below, and one worth answering before any of them spend
+    // seconds parsing the catalog. Runs first and short-circuits on its own
+    // rather than joining `failures` below, so it stays a preflight rather
+    // than becoming another registered rule.
+    let repo_state_failures = repo_state::run(&root);
+    if !repo_state_failures.is_empty() {
+        eprintln!(
+            "linkage-check: repository-state preflight: {} failure(s):",
+            repo_state_failures.len()
+        );
+        for f in &repo_state_failures {
+            eprintln!("  {f}");
         }
-        if allowlist.contains(id) {
-            continue;
-        }
-        failures.push(format!(
-            "[1] catalog ID `{id}` has no #[spec({id:?})]-annotated test and is not on the M2 allowlist"
-        ));
+        return ExitCode::FAILURE;
     }
 
-    failures.extend(e2e_violations);
-    failures.extend(ignore_violations);
-    failures.extend(
-        bare_tempdir_violations
-            .into_iter()
-            .map(|v| format!("[8] {v}")),
-    );
+    let inputs = match gather_inputs(root) {
+        Ok(inputs) => inputs,
+        Err(code) => return code,
+    };
 
-    failures.extend(bare_git_violations.into_iter().map(|v| format!("[15] {v}")));
-
-    failures.extend(
-        unarmed_spawn_violations
-            .into_iter()
-            .map(|v| format!("[10] {v}")),
-    );
-
-    failures.extend(
-        overlong_cap_violations
-            .into_iter()
-            .map(|v| format!("[11] {v}")),
-    );
-
-    // Check 9 (issue #474): `src/test_temp.rs` names no crate of its own. It is
-    // read directly rather than folded into the scan above, so that the file
-    // going missing is reported instead of quietly emptying the rule.
-    failures.extend(
-        check_self_contained(&root)
-            .into_iter()
-            .map(|v| format!("[9] {v}")),
-    );
-
-    // Check 12 (PRD #819 M7): no client-side project resolution in the desktop
-    // crate's production sources. Read straight off `desktop/src-tauri/src/`
-    // rather than folded into the `tests/` + `src/` scan above, because it
-    // covers a different tree entirely — and because the directory going
-    // missing must be reported rather than quietly emptying the rule.
-    failures.extend(
-        desktop_project_boundary::run(&root)
-            .into_iter()
-            .map(|v| format!("[12] {v}")),
-    );
-
-    // Check 13 (issue #1181): no `git` program literal in the root crate's
-    // production sources. Read straight off `src/` rather than folded into the
-    // scan above, because that scan is line-based and this one has to track
-    // strings, comments, char literals and `#[cfg(test)]` item bodies across
-    // lines to tell a production literal from prose about one — and because
-    // `src/` or `src/git_env.rs` going missing must be reported rather than
-    // quietly emptying the rule.
-    failures.extend(
-        git_program_literal::run(&root)
-            .into_iter()
-            .map(|v| format!("[13] {v}")),
-    );
-
-    // Check 14 (PRD #802 M3): the voice command table and the frontend action
-    // registry resolve against each other. Read straight off its own four files
-    // for check 12's reason — a different tree, and an input going missing must
-    // be reported rather than quietly emptying the rule.
-    failures.extend(
-        voice_command_registry::run(&root)
-            .into_iter()
-            .map(|v| format!("[14] {v}")),
-    );
-
-    // Check 7 (PRD #77 Decision 30 / M4.3): every #[spec] test has
-    // a `/// Scenario:` doc comment with a body AND
-    // `cargo xtask docs --tests` succeeds against the current source
-    // + catalog. The xtask-docs library raises `Err` on a missing
-    // Scenario or a malformed test source, which is exactly the two
-    // failure modes we want to surface here. The byte-identity check
-    // against on-disk `.md` is gone in M4.3: `.dot-agent-deck/` is
-    // gitignored, so on a fresh clone there is no `.md` to compare.
-    if let Err(e) = xtask_docs::check_rule_7(&docs_config) {
-        failures.push(format!("[7] {e}"));
-    }
+    let failures = run_rules(&inputs);
 
     if failures.is_empty() {
         println!(
-            "linkage-check: ok ({} catalog ids, {} annotations, {} allowlisted, 15 rules)",
-            catalog_ids.len(),
-            discovered.len(),
-            allowlist.len()
+            "linkage-check: ok ({} catalog ids, {} annotations, {} allowlisted, {} rules)",
+            inputs.catalog_ids.len(),
+            inputs.discovered.len(),
+            inputs.allowlist.len(),
+            RULES.len()
         );
         ExitCode::SUCCESS
     } else {
@@ -1212,6 +1458,10 @@ fn main() -> ExitCode {
         for f in &failures {
             eprintln!("  {f}");
         }
+        eprintln!(
+            "each `[N]` names a rule — `cargo xtask linkage-check --list-rules` prints all {}",
+            RULES.len()
+        );
         ExitCode::FAILURE
     }
 }
@@ -1370,7 +1620,7 @@ fn unattached_annotation_failures(
             .collect::<Vec<_>>()
             .join(", ");
         out.push(format!(
-            "[4] {} {unbound} of {} #[spec({id:?})] annotation(s) (line(s) {where_}) is not attached to a `fn` definition \
+            "{} {unbound} of {} #[spec({id:?})] annotation(s) (line(s) {where_}) is not attached to a `fn` definition \
              — an attribute on a non-function item, or inside a macro body the parser does not expand",
             file.display(),
             lines.len(),
@@ -1467,14 +1717,14 @@ fn visit(dir: &Path, acc: &mut BTreeMap<PathBuf, ()>) {
 /// Fed the output of [`strip_rust_comments`], so it never has to tell a `"`
 /// inside a comment from a real one — those bytes are already spaces.
 ///
-/// **Used by check 10 only, deliberately, and not folded into
+/// **Used by rule 10 only, deliberately, and not folded into
 /// [`strip_rust_comments`].** That function's other callers *depend* on seeing
-/// inside literals: check 9's doc comment says so outright ("A `crate::` inside
-/// a string literal is not exempt"), and check 8's bare-tempdir scan reads the
+/// inside literals: rule 9's doc comment says so outright ("A `crate::` inside
+/// a string literal is not exempt"), and rule 8's bare-tempdir scan reads the
 /// same view. Changing the shared stripper in place would silently widen those
-/// two rules' blind spots to buy check 10 its fix.
+/// two rules' blind spots to buy rule 10 its fix.
 ///
-/// Why check 10 wants it, in both directions. As a **false negative**: the rule
+/// Why rule 10 wants it, in both directions. As a **false negative**: the rule
 /// clears a whole file the moment its arming regex matches anywhere, so a test
 /// that merely *quotes* `child_lifetime_bound::arm()` — the obvious shape for a
 /// future case asserting this rule's own remedy text — would satisfy it while
@@ -1829,7 +2079,7 @@ fn qualified_id_prefix(id: &str) -> Option<String> {
 /// contrary to the "keep existing short-form names valid" contract.
 ///
 /// A malformed ID with no derivable prefix is treated as vacuously OK —
-/// the ID-format check (check 3) already flags it.
+/// the ID-format check (rule 3) already flags it.
 fn fn_name_matches_spec(id: &str, fname: &str) -> bool {
     let short = sub_area_prefix(id).unwrap_or_default();
     let qualified = qualified_id_prefix(id).unwrap_or_default();
@@ -1844,7 +2094,121 @@ fn fn_name_matches_spec(id: &str, fname: &str) -> bool {
 mod tests {
     use super::*;
 
-    /// Check 8 must see the *file* constructors, not only the directory ones.
+    // --- the rule registry (issue #1216) ---
+
+    /// **The test that replaces the hardcoded count**, and the reason it is a
+    /// test rather than an assertion inside `main`.
+    ///
+    /// Adding a rule used to mean raising a literal in the success line. Two
+    /// branches each adding one both raise it by one, which produces
+    /// **identical text** — so git merges it cleanly, with no conflict to look
+    /// at, and `main` ends up reporting one fewer rule than it registers. That
+    /// happened twice in one day (#1163, then #1179) and was caught by neither
+    /// the merge, nor `cargo fmt`, nor clippy, nor `cargo test-fast`. The count
+    /// is now `RULES.len()`, which removes that mode entirely.
+    ///
+    /// The collision that survives is two branches both claiming the next
+    /// `number`. Those entries are *different* text so they usually conflict —
+    /// but appended at different offsets they can merge, leaving two rules
+    /// numbered 16 and one number never used. This is what makes that red: the
+    /// numbers must be unique, start at 1, and run without a gap in
+    /// declaration order, which also pins the numeric order the failure output
+    /// is printed in.
+    #[test]
+    fn rule_numbers_are_unique_and_run_from_one_without_a_gap() {
+        let numbers: Vec<u16> = RULES.iter().map(|r| r.number).collect();
+        let expected: Vec<u16> = (1..=RULES.len() as u16).collect();
+        assert_eq!(
+            numbers,
+            expected,
+            "RULES must be declared in number order, 1..={}, with no gap and no duplicate — a \
+             duplicate is what a clean merge of two rule-adding branches leaves behind, and a \
+             renumber silently invalidates every `rule N` citation in CLAUDE.md, docs/ and tests/",
+            RULES.len()
+        );
+    }
+
+    /// The name is the identity that does NOT renumber, so it has to be usable
+    /// as one: unique, and spelled the one way so `grep` finds every mention.
+    #[test]
+    fn rule_names_are_unique_and_kebab_case() {
+        let mut seen: BTreeSet<&str> = BTreeSet::new();
+        for rule in RULES {
+            assert!(
+                seen.insert(rule.name),
+                "duplicate rule name `{}` in RULES",
+                rule.name
+            );
+            assert!(
+                !rule.name.is_empty()
+                    && rule
+                        .name
+                        .chars()
+                        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+                    && !rule.name.starts_with('-')
+                    && !rule.name.ends_with('-'),
+                "rule name `{}` is not kebab-case",
+                rule.name
+            );
+        }
+    }
+
+    /// `--list-rules` is the only rule list there is now, so an entry with no
+    /// summary is a rule nobody can map a `[N]` tag back to.
+    #[test]
+    fn every_rule_carries_a_summary_that_says_something() {
+        for rule in RULES {
+            let summary = rule.summary.trim();
+            assert!(
+                summary.len() > 30,
+                "rule {} (`{}`) has no usable summary — it is the whole rule list \
+                 `--list-rules` prints",
+                rule.number,
+                rule.name
+            );
+            assert!(
+                summary.ends_with('.'),
+                "rule {} (`{}`) summary should read as a sentence",
+                rule.number,
+                rule.name
+            );
+        }
+    }
+
+    /// No rule's own summary cites a number other than its own.
+    ///
+    /// This is the drift the registry is for, and it had already happened three
+    /// times over: `check 13` named the git-literal rule (13, correctly), the
+    /// bare-`git` rule (15) and the voice-registry rule (14) in different files
+    /// of this one crate, because each was written while its rule was expected
+    /// to land as 13 and nothing tied the prose to the registration. The tag on
+    /// a finding now comes from [`run_rules`] reading this table, so the only
+    /// place a number can still be written by hand is prose — including these
+    /// summaries.
+    #[test]
+    fn no_rule_summary_cites_another_rules_number() {
+        for rule in RULES {
+            for other in RULES {
+                if other.number == rule.number {
+                    continue;
+                }
+                for spelling in [
+                    format!("rule {}", other.number),
+                    format!("Rule {}", other.number),
+                    format!("check {}", other.number),
+                ] {
+                    assert!(
+                        !rule.summary.contains(&spelling),
+                        "rule {} (`{}`) says `{spelling}` in its own summary",
+                        rule.number,
+                        rule.name
+                    );
+                }
+            }
+        }
+    }
+
+    /// Rule 8 must see the *file* constructors, not only the directory ones.
     /// This is the hole that let the Codex-auth pre-flight's
     /// `NamedTempFile::new()` sit inside the rule's own scope, measured live in
     /// `/tmp` on `5e8e0ed`.
@@ -1916,7 +2280,7 @@ mod tests {
         }
     }
 
-    // --- check 13: bare `Command::new("git")` in test-support code ---
+    // --- rule 15: bare `Command::new("git")` in test-support code ---
 
     #[test]
     fn bare_git_ctor_re_matches_every_spelling_of_the_constructor() {
@@ -2010,7 +2374,7 @@ mod tests {
         assert!(!covers("src/test_temp.rs", false));
     }
 
-    /// Check 9 rejects a `crate::` path wherever it sits — a `use`, a call —
+    /// Rule 9 rejects a `crate::` path wherever it sits — a `use`, a call —
     /// and reports each at its own raw line number.
     #[test]
     fn self_contained_violations_rejects_crate_paths() {
@@ -2124,7 +2488,7 @@ mod tests {
 
         assert_eq!(found.len(), 1, "{found:#?}");
         assert!(
-            found[0].contains("cannot read the file check 9 guards"),
+            found[0].contains("cannot read the file rule 9 guards"),
             "{}",
             found[0]
         );
@@ -2132,7 +2496,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------
-    // Check 10 (issue #668): the wrapped-child lifetime bound is armed.
+    // Rule 10 (issue #668): the wrapped-child lifetime bound is armed.
     // ---------------------------------------------------------------------
     //
     // Both directions, against synthetic sources: a checkout that is clean by
@@ -2369,7 +2733,7 @@ mod tests {
         );
     }
 
-    /// The escape hatch, on the offending line, the way check 8's is. No file
+    /// The escape hatch, on the offending line, the way rule 8's is. No file
     /// needs it today; it exists so a deliberate exception (one pinning its own
     /// per-`Command` cap) is declared where it is taken instead of weakening the
     /// rule for everyone. Note it suppresses only the line it is on — the second
@@ -2393,7 +2757,7 @@ mod tests {
         );
     }
 
-    // Check 11 (issue #679): no pinned wrapped-child lifetime cap may exceed
+    // Rule 11 (issue #679): no pinned wrapped-child lifetime cap may exceed
     // the number `clean-e2e-tmp`'s dead-owner deletion floor is derived from.
 
     /// The cap the rule is written against, so a future raise of
@@ -2713,8 +3077,8 @@ mod tests {
 
     #[test]
     fn fn_name_matches_spec_vacuously_ok_for_malformed_id() {
-        // Malformed IDs have no derivable prefix; check 3 flags the
-        // format, so check 4 must not double-report.
+        // Malformed IDs have no derivable prefix; rule 3 flags the
+        // format, so rule 4 must not double-report.
         assert!(fn_name_matches_spec("not-an-id", "whatever_name"));
     }
 
@@ -2858,7 +3222,7 @@ mod tests {
         let src = "// line1\nlet x = 0;\n// line3";
         let out = strip_rust_comments(src);
         // Three lines in → three lines out — the per-line indexing in
-        // check 5/6 depends on this invariant.
+        // rules 5/6 depend on this invariant.
         assert_eq!(out.lines().count(), src.lines().count());
     }
 

@@ -1066,7 +1066,7 @@ impl DesktopDirectoryListing {
     /// The listing variant, built from the daemon reply's parts.
     ///
     /// Takes parts rather than the root crate's reply type because the desktop
-    /// may not name that module: `xtask/linkage-check`'s check 12 bounds which
+    /// may not name that module: `xtask/linkage-check`'s rule 12 bounds which
     /// root modules the production desktop reaches across, and the module that
     /// owns the reply also owns a filesystem listing a client must never run.
     pub(crate) fn listing(
