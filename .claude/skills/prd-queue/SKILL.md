@@ -515,9 +515,10 @@ message would be false. Then append one line to .dot-agent-deck/notify-log.md
 GREPTILE'S FINDINGS ARE PART OF THE JOB, NOT PART OF THE MERGE. Greptile
 reviews once, a few minutes after the PR opens, and never again —
 greptile.json sets triggerOnUpdates: false, so do NOT wait for a re-review
-after you push fixes. Qodo, evaluated beside it, also reviews once
-(.pr_agent.toml); its inline findings arrive at the same endpoint and are
-answered and resolved the same way. Greptile's findings live ONLY at
+after you push fixes. Qodo, evaluated beside it, re-reviews on EVERY push
+(.pr_agent.toml): after your last push, wait (bounded) for its re-review and
+answer what it raised. Its inline findings arrive at the same endpoint and
+are answered and resolved the same way. Greptile's findings live ONLY at
 `gh api repos/<owner>/<repo>/pulls/<pr>/comments --paginate`; the green
 `Greptile Review` check and the summary comment carry none of them. Keep the
 --paginate: replies count toward the page, so without it a busy PR silently
