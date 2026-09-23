@@ -153,8 +153,10 @@ pub fn escape_control_and_bidi(s: &str) -> String {
 ///
 /// Note the clamp counts BYTES, not display columns. That matches every other
 /// length bound in this project and is not the render budget: the title's own
-/// fit is decided later by `ui::truncate_styled_segments`, whose char-vs-column
-/// accounting is issue #357.
+/// fit is decided later by `ui::truncate_styled_segments`, which budgets display
+/// columns since issue #357. The two bounds are independent — a name well inside
+/// this byte ceiling can still be wider than the title region it is drawn into,
+/// and the render truncator is what ellipsizes it there.
 pub fn sanitize_display_name(raw: &str) -> Option<String> {
     let stripped = strip_control_and_bidi(raw, false);
     let trimmed = stripped.trim();

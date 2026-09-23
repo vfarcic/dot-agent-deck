@@ -4,6 +4,15 @@ filename = "docs/CHANGELOG.md"
 title_format = "## [{version}] - {project_date}"
 issue_format = "[#{issue}](https://github.com/vfarcic/dot-agent-deck/issues/{issue})"
 
+# WHEN A CHANGE GETS A FRAGMENT AT ALL (issue #1250): when a USER CAN OBSERVE THE
+# CHANGE. An internal-only change -- CI, developer tooling, the test harness, a
+# refactor with no behavioural difference, repository configuration -- gets NO
+# fragment, of any type. The release body is what a user reads to decide whether
+# to upgrade and what changed for them; work they cannot see does not belong in
+# it. CLAUDE.md rule 19 states the same rule for agents, and
+# docs/develop/versioning.md carries the reasoning. The types below are the
+# choice you make once that question is answered "yes".
+
 # feature: New user-facing functionality (users directly interact with or benefit from this)
 [[tool.towncrier.type]]
 directory = "feature"
@@ -33,7 +42,12 @@ directory = "doc"
 name = "Documentation"
 showcontent = true
 
-# misc: Internal improvements, CI/CD, tooling, refactoring (improves the project but users don't directly see it)
+# misc: A user-observable change that is none of the above -- packaging,
+# distribution, a deprecation notice, a default that moved. NOT a home for
+# internal work: CI, tooling, test-harness and refactor changes get no fragment
+# at all (see the rule above). This type used to be defined as exactly that
+# internal bucket, which is how ~90 lines of CI and harness detail reached the
+# 0.41.1 release notes.
 [[tool.towncrier.type]]
 directory = "misc"
 name = "Other Changes"
