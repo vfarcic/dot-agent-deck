@@ -935,8 +935,8 @@ fn contrast_pairs() -> Vec<(&'static str, Surface, f64)> {
         ("--muted", Token("--teal-wash"), 4.5),
         ("--muted", Token("--green-soft"), 4.5),
         ("--muted", Token("--red-soft"), 4.5),
-        // --ink-soft (forced to move by #821 -- see the comment on the light
-        // block's text tokens)
+        // --ink-soft (moved with #821 to keep a visible step above --muted --
+        // see the comment on the light block's text tokens)
         ("--ink-soft", Token("--paper"), 4.5),
         ("--ink-soft", Token("--paper-sunken-strong"), 4.5),
         // --status-error (issue #822)
@@ -946,9 +946,10 @@ fn contrast_pairs() -> Vec<(&'static str, Surface, f64)> {
         // two of its four grounds, each a non-text WCAG 1.4.11 case. NOT the
         // topbar/canvas ground (`rgb(var(--paper-rgb) / .97)` composited on
         // --canvas): that one is 2.86:1, below 3.0, and stays so on purpose
-        // -- no value clears 4.5:1 as text on --shell and 3:1 as a fill on
-        // --paper at once, because the two windows do not overlap at any
-        // value (see the comment beside --status-error). It is not
+        // -- the only values that clear 4.5:1 as text on the light --shell and
+        // 3:1 as a fill on --paper at once sit in a relative-luminance band of
+        // 0.2714-0.2739, at both bars with no headroom, and #822 took the
+        // headroom on the text (see the comment beside --status-error). It is not
         // unenforced, though: WCAG 1.4.11 asks for 3:1 against the colour
         // actually ADJACENT to the fill, which for this lamp is its own
         // ring, not the page two rules away -- and that pair is the next
