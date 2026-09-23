@@ -63,6 +63,16 @@
 #                    rule. Exactly one row uses it, `submit_prompt`
 #                    (`voice_table_whole_utterance_rows_are_the_deliberate_set`);
 #                    on an ordinary row it would make natural speech fail.
+#   heard_as_whole_while
+#                    beside `heard_as`: a table keyed by a `requires` value,
+#                    each holding `heard_as_whole` entries that REPLACE
+#                    `heard_as` while that requirement is met (closing audit
+#                    H1). For a row reversible in general and destructive in
+#                    one declared context. Every entry must contain one of the
+#                    row's `heard_as` entries, so a context only narrows.
+#                    Two rows use it, `open_deck` and `close`, both over the New
+#                    agent dialog, which each would unmount with its form
+#                    (`voice_table_context_grounded_rows_are_the_deliberate_set`).
 #   ungrounded       instead of either: why this row CANNOT be grounded by
 #                    words. Every row carries exactly one of the three, so no
 #                    row is exempt by omission. No shipped row uses it
@@ -135,6 +145,16 @@ screens     = ["overview"]
 unavailable_hint = "returning to the deck works from the agent overview"
 report      = "Back to the deck."
 heard_as    = ["deck", "back", "return", "terminals", "panes"]
+# Over the New agent dialog this row is `close`'s destructive case by another
+# route (PRD #1223, closing audit H1): leaving the overview unmounts it, and the
+# form goes with it. So there it needs the whole utterance, and only an explicit
+# request for the deck — a bare "back" or "take me back" to a user filling a
+# form is as likely to mean the dialog or the parent directory. The dialog is
+# modal, so no click reaches the deck from behind it either.
+heard_as_whole_while.new_agent_dialog = [
+  "go back to the deck", "back to the deck", "return to the deck", "the deck", "deck",
+  "show the terminals",
+]
 
 # PRD #802 — "close" means the thing on TOP, and this row replaced
 # `close_agent_view` rather than sitting beside it.
@@ -165,12 +185,25 @@ heard_as    = ["deck", "back", "return", "terminals", "panes"]
 # It closes a VIEW rather than a terminal pane. The agent keeps running and its
 # pane is untouched — the two are one word apart in speech, so the description
 # says so.
+#
+# Reversible — EXCEPT over the New agent dialog (PRD #1223, closing audit H1).
+# A pane or the command list reopens as it was; the dialog's deck, directory,
+# Mode, Agent, Name and hand-edited Command are component-local state that
+# closing discards. So while the dialog is declared, `heard_as_whole_while`
+# replaces `heard_as` with whole-utterance equality: "name it done worker"
+# contains `done`, and a steered `close` must not ground on it and throw the
+# form away. The narrower list leaves out the words a user filling a form says
+# for other reasons — `done`, `leave`, `back`, `stop looking` — so over the
+# dialog only a plain request to close or dismiss it closes it. The parser
+# refuses an entry here that none of `heard_as` grounds, so this can only take
+# phrasings away. Everywhere else the row is token-grounded as before.
 [[commands]]
 id          = "close"
 description = """Close whatever is open OVER the current screen and go back to what was
-underneath. That is the list of spoken commands if it is showing, and otherwise one agent's open
-pane. Use for close, close this, close it, dismiss this, hide this, get rid of this, I'm done
-with this, stop looking at this, or leave this agent. A bare "go back" or "back" means THIS one ONLY when `open_deck`
+underneath. That is the list of spoken commands if it is showing, then the New agent dialog if it
+is open, and otherwise one agent's open pane. Use for close, close this, close it, close the
+dialog, close this dialog, dismiss this, hide this, get rid of this, I'm done with this, stop
+looking at this, or leave this agent. A bare "go back" or "back" means THIS one ONLY when `open_deck`
 is not callable — a callable `open_deck` means the deck itself is what "back" leads to, and that
 one wins. This only closes what is on top: it does NOT stop any agent, does NOT close an agent's
 terminal pane, and does NOT turn voice off."""
@@ -178,6 +211,10 @@ invoke      = "closeTopmost"
 unavailable_hint = "closing what is on top works anywhere"
 report      = "Closed."
 heard_as    = ["close", "dismiss", "hide", "get rid", "done", "leave", "stop looking", "back"]
+heard_as_whole_while.new_agent_dialog = [
+  "close", "close this", "close it", "close the dialog", "close this dialog",
+  "dismiss", "dismiss this", "hide this", "get rid of this",
+]
 
 # PRD #802 M8 — the cost-of-a-row proof: the first command added after the
 # plumbing existed. It cost SEVEN files, five of them test-only and none of them

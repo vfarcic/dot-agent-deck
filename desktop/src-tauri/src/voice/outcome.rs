@@ -47,7 +47,9 @@ use super::dictation::{
 };
 use super::resolver::{IntentError, IntentRequest, IntentResolver};
 use super::schema::{LABELS_WITHHELD_HINT, annotate_for, needs_labels};
-use super::table::{ActionGrounding, CommandRow, CommandTable, ParamKind, Screen, spoken_words};
+use super::table::{
+    ActionGrounding, CommandRow, CommandTable, ParamKind, Requirement, Screen, spoken_words,
+};
 use super::{DesktopAgent, Transcript, VoiceChoice, VoiceDeck, VoiceDirectories, VoiceNewAgent};
 use crate::dto::{DesktopTab, safe_message};
 use crate::settings::LabelSharing;
@@ -234,15 +236,26 @@ impl VoiceOutcome {
         }
     }
 
-    fn action_ungrounded(transcript: Transcript, row: &CommandRow) -> Self {
+    /// `grounding` is the one that refused — the row's own, or the stricter
+    /// one a declared context selected ([`CommandRow::grounding_for`]), whose
+    /// requirement the sentence then names so the user learns why a word that
+    /// works elsewhere did not work here.
+    fn action_ungrounded(
+        transcript: Transcript,
+        row: &CommandRow,
+        grounding: (&ActionGrounding, Option<Requirement>),
+    ) -> Self {
         // A whole-utterance row says how to ask for it, because its words may
         // well have been in what the user said — "tell it the build has
         // finished" — and "nothing in that asks" would read as the app not
         // having heard them.
-        let why = match &row.grounding {
-            ActionGrounding::HeardAsWhole(phrases) => format!(
-                "\u{201c}{}\u{201d} needs to be said on its own, like \u{201c}{}\u{201d}, so nothing was done",
+        let why = match grounding {
+            (ActionGrounding::HeardAsWhole(phrases), context) => format!(
+                "\u{201c}{}\u{201d} needs to be said on its own{}, like \u{201c}{}\u{201d}, so nothing was done",
                 row.id,
+                context
+                    .map(|requirement| format!(" {}", requirement.while_phrase()))
+                    .unwrap_or_default(),
                 phrases.first().map(String::as_str).unwrap_or_default()
             ),
             _ => format!(
@@ -439,7 +452,7 @@ pub async fn handle_utterance_with(
     // The local fast paths, ahead of every backend call (PRD #802 D6, rebuilt).
     // See [`local_intercept`] for what is decided here and — more importantly —
     // what deliberately is not.
-    if let Some(outcome) = local_intercept(table, screen, &transcript) {
+    if let Some(outcome) = local_intercept(table, screen, directories, new_agent, &transcript) {
         return finish(outcome, None);
     }
 
@@ -490,8 +503,9 @@ pub async fn handle_utterance_with(
     // answered as that and not as "not here" — and because it is the one check
     // that covers every row, parameterless ones included. See
     // [`action_grounded`].
-    if !action_grounded(row, transcript.text()) {
-        return finish(VoiceOutcome::action_ungrounded(transcript, row));
+    if !action_grounded(row, transcript.text(), directories, new_agent) {
+        let grounding = row.grounding_for(directories, new_agent);
+        return finish(VoiceOutcome::action_ungrounded(transcript, row, grounding));
     }
 
     // The screen AND the row's `requires` (PRD #1223): a directory row picked
@@ -865,6 +879,8 @@ pub async fn handle_utterance_with(
 fn local_intercept(
     table: &CommandTable,
     screen: Screen,
+    directories: Option<&VoiceDirectories>,
+    new_agent: Option<&VoiceNewAgent>,
     transcript: &Transcript,
 ) -> Option<VoiceOutcome> {
     let dispatch = |row: &CommandRow, params: Vec<ResolvedParam>| {
@@ -873,8 +889,9 @@ fn local_intercept(
         // `submit_prompt` — (`voice_outcome_the_fast_paths_are_action_grounded`), so this never
         // refuses a shipped table; it is here so no dispatch is built anywhere
         // without the check.
-        if !action_grounded(row, transcript.text()) {
-            return VoiceOutcome::action_ungrounded(transcript.clone(), row);
+        if !action_grounded(row, transcript.text(), directories, new_agent) {
+            let grounding = row.grounding_for(directories, new_agent);
+            return VoiceOutcome::action_ungrounded(transcript.clone(), row, grounding);
         }
         if !row.callable_on(screen) {
             return VoiceOutcome::unavailable(transcript.clone(), row);
@@ -1098,8 +1115,28 @@ fn same_word(one: &str, other: &str) -> bool {
 /// utterance is one of its entries ([`whole_utterance`]): the rule the local
 /// fast path already applies through `dictation::SUBMIT_PHRASES`, now applied
 /// to the model's path as well.
-fn action_grounded(row: &CommandRow, transcript: &str) -> bool {
-    match &row.grounding {
+///
+/// # A context can make a row stricter (closing audit H1)
+///
+/// The grounding held is [`CommandRow::grounding_for`] the declared dialog,
+/// not a fixed column: `close` is token-grounded over a pane or the voice
+/// overlay, which reopen at no cost, and whole-utterance while the New agent
+/// dialog is declared, because closing THAT discards a filled form. "name it
+/// done worker" contains `done`, and without the context a steered `close`
+/// would ground on it and unmount the form.
+///
+/// The declaration is the dialog being MOUNTED, and the overlay can be up over
+/// it — in which case `close` dismisses the overlay (`closeTopmost`'s order in
+/// `voiceActions.ts`) and the whole-utterance rule is stricter than that needs.
+/// It errs that way deliberately: the backend is not told about the overlay,
+/// and the cost of the stricter rule is one more word.
+fn action_grounded(
+    row: &CommandRow,
+    transcript: &str,
+    directories: Option<&VoiceDirectories>,
+    new_agent: Option<&VoiceNewAgent>,
+) -> bool {
+    match row.grounding_for(directories, new_agent).0 {
         ActionGrounding::Exempt(_) => true,
         ActionGrounding::HeardAs(phrases) => {
             let heard = Heard::new(transcript);
@@ -2125,6 +2162,20 @@ mod tests {
     use crate::voice::table::table;
 
     use crate::voice::fixtures::{agent, role_agent};
+
+    /// A row whose grounding depends on the New agent dialog (closing audit
+    /// H1).
+    const CLOSE_ROW: &str = "close";
+
+    /// A row's first whole-utterance phrase over the New agent dialog, when it
+    /// has a grounding that depends on it.
+    fn over_the_dialog(action: &str) -> Option<String> {
+        let row = table().row(action)?;
+        match row.grounding_for(None, Some(&VoiceNewAgent { form: None })) {
+            (ActionGrounding::HeardAsWhole(phrases), Some(_)) => phrases.first().cloned(),
+            _ => None,
+        }
+    }
 
     fn fleet() -> Vec<DesktopAgent> {
         vec![role_agent("1", "tester"), role_agent("2", "orchestrator")]
@@ -4246,6 +4297,7 @@ mod tests {
             report: "{first} then {second}.".to_string(),
             params: Vec::new(),
             grounding: ActionGrounding::Exempt("a hand-built row".to_string()),
+            grounding_while: Vec::new(),
         };
         let param = |name: &str, label: &str| ResolvedParam {
             name: name.to_string(),
@@ -4306,6 +4358,7 @@ mod tests {
             report: "Opening { agent }.".to_string(),
             params: Vec::new(),
             grounding: ActionGrounding::Exempt("a hand-built row".to_string()),
+            grounding_while: Vec::new(),
         };
         let param = ResolvedParam {
             name: "agent".to_string(),
@@ -5123,6 +5176,15 @@ mod tests {
                          needs to be said on its own, like \u{201c}send it\u{201d}, so \
                          nothing was done."
                             .to_string()
+                    } else if let Some(like) = over_the_dialog(action) {
+                        // `run_everything` declares the New agent dialog, which
+                        // holds `close` and `open_deck` to the whole utterance
+                        // too (H1) — and the sentence names that context.
+                        format!(
+                            "Heard: \u{201c}open docs\u{201d} — \u{201c}{action}\u{201d} needs \
+                             to be said on its own while the New agent dialog is open, like \
+                             \u{201c}{like}\u{201d}, so nothing was done."
+                        )
                     } else {
                         format!(
                             "Heard: \u{201c}open docs\u{201d} — nothing in that asks for \
@@ -5218,7 +5280,15 @@ mod tests {
             ("open_new_agent", Screen::Overview, "spin up an agent"),
         ] {
             let resolver = StubResolver::new().answering(said, IntentAnswer::new(action));
-            let outcome = run_everything(&resolver, screen, said).await;
+            // `close` and `open_deck` are token-grounded only while the New
+            // agent dialog is NOT declared (H1), and `run_everything` declares
+            // it — so their ordinary phrasings are asked with nothing declared.
+            // Over the dialog they are the H1 tests below.
+            let outcome = if over_the_dialog(action).is_some() {
+                run(&resolver, screen, &fleet(), said).await
+            } else {
+                run_everything(&resolver, screen, said).await
+            };
             assert!(outcome.is_dispatch(), "{action} for {said:?}: {outcome:?}");
         }
     }
@@ -5230,12 +5300,12 @@ mod tests {
     fn voice_outcome_the_fast_paths_are_action_grounded() {
         let submit = table().row(SUBMIT_ROW).expect("row");
         for phrase in SUBMIT_PHRASES {
-            assert!(action_grounded(submit, phrase), "{phrase:?}");
+            assert!(action_grounded(submit, phrase, None, None), "{phrase:?}");
         }
         let dictate = table().row(DICTATE_ROW).expect("row");
         for opener in DICTATION_OPENERS {
             let said = format!("{opener} run the tests");
-            assert!(action_grounded(dictate, &said), "{said:?}");
+            assert!(action_grounded(dictate, &said, None, None), "{said:?}");
         }
     }
 
@@ -5282,8 +5352,9 @@ mod tests {
     fn voice_outcome_a_submit_word_used_in_passing_is_not_a_fast_path_submit() {
         let submit = table().row(SUBMIT_ROW).expect("row");
         for said in SUBMIT_WORD_IN_PASSING {
-            assert!(!action_grounded(submit, said), "{said}");
-            let intercepted = local_intercept(table(), Screen::Agent, &Transcript::new(said));
+            assert!(!action_grounded(submit, said, None, None), "{said}");
+            let intercepted =
+                local_intercept(table(), Screen::Agent, None, None, &Transcript::new(said));
             assert!(
                 !matches!(&intercepted, Some(VoiceOutcome::Dispatch { action, .. }) if action == SUBMIT_ROW),
                 "{said}: {intercepted:?}"
@@ -5339,7 +5410,7 @@ mod tests {
         // paths never disagree about what a submission sounds like.
         let submit = table().row(SUBMIT_ROW).expect("row");
         for said in ["send it", "submit", "go ahead"] {
-            assert!(action_grounded(submit, said), "{said}");
+            assert!(action_grounded(submit, said, None, None), "{said}");
         }
     }
 
@@ -5361,8 +5432,202 @@ mod tests {
         assert!(whole_utterance("okay please").is_empty());
         assert!(whole_utterance("").is_empty());
         let submit = table().row(SUBMIT_ROW).expect("row");
-        assert!(!action_grounded(submit, "okay please"));
-        assert!(!action_grounded(submit, ""));
+        assert!(!action_grounded(submit, "okay please", None, None));
+        assert!(!action_grounded(submit, "", None, None));
+    }
+
+    // -- context-dependent grounding (PRD #1223, closing audit H1) --------
+
+    /// `close` with the New agent dialog declared and nothing else — the
+    /// dialog is mounted on the overview, which is where it is.
+    async fn close_over_the_dialog(said: &str, form: bool) -> VoiceOutcome {
+        let resolver = StubResolver::new().answering(said, IntentAnswer::new(CLOSE_ROW));
+        let declared = if form {
+            new_agent_form()
+        } else {
+            VoiceNewAgent { form: None }
+        };
+        handle_utterance(
+            &resolver,
+            table(),
+            Screen::Overview,
+            &fleet(),
+            &decks(),
+            None,
+            Some(&declared),
+            Transcript::new(said),
+        )
+        .await
+        .outcome
+    }
+
+    /// Scenario: with the New agent dialog open and its form filled, the user
+    /// says "name it done worker" — meaning the Name field — while an observed
+    /// orchestration title steers the model to `close`. `done` is one of
+    /// `close`'s words, but over the dialog the row needs the whole utterance,
+    /// so nothing closes, the form survives, and the sentence says why.
+    #[tokio::test]
+    async fn voice_outcome_a_close_word_in_passing_does_not_close_the_new_agent_dialog() {
+        for said in [
+            "name it done worker",
+            "call it leave-early and go back to the mode",
+            "hide nothing, use claude",
+            "close enough, set the mode to dispatcher",
+            "I'm done with this form, start it",
+        ] {
+            for form in [true, false] {
+                let outcome = close_over_the_dialog(said, form).await;
+                assert_eq!(
+                    outcome,
+                    VoiceOutcome::ActionUngrounded {
+                        transcript: Transcript::new(said),
+                        action: CLOSE_ROW.to_string(),
+                        sentence: format!(
+                            "Heard: \u{201c}{said}\u{201d} — \u{201c}close\u{201d} needs to be \
+                             said on its own while the New agent dialog is open, like \
+                             \u{201c}close\u{201d}, so nothing was done."
+                        ),
+                    },
+                    "{said} (form live: {form})"
+                );
+            }
+        }
+    }
+
+    /// Scenario: with the New agent dialog open, the user says "close", "close
+    /// this" or "dismiss this" and nothing else — with the transcriber's
+    /// casing and punctuation and an edge "okay" or "please" — and the dialog
+    /// closes.
+    #[tokio::test]
+    async fn voice_outcome_close_said_on_its_own_still_closes_the_new_agent_dialog() {
+        for said in [
+            "close",
+            "Close.",
+            "okay, close this please",
+            "close the dialog",
+            "Close this dialog!",
+            "dismiss this",
+            "get rid of this",
+        ] {
+            for form in [true, false] {
+                let outcome = close_over_the_dialog(said, form).await;
+                assert!(
+                    matches!(&outcome, VoiceOutcome::Dispatch { action, invoke, .. }
+                        if action == CLOSE_ROW && invoke == "closeTopmost"),
+                    "{said} (form live: {form}): {outcome:?}"
+                );
+            }
+        }
+    }
+
+    /// Scenario: with no New agent dialog declared, `close` keeps its token
+    /// grounding — "I'm done with this agent" or "leave this agent, it's
+    /// fine" closes the pane or the command list on top, because reopening
+    /// either loses nothing.
+    #[tokio::test]
+    async fn voice_outcome_close_by_a_word_in_a_sentence_still_closes_an_ordinary_view() {
+        for (screen, said) in [
+            (Screen::Agent, "I'm done with this agent"),
+            (Screen::Agent, "leave this agent, it's fine"),
+            (Screen::Agent, "stop looking at this one"),
+            (Screen::Deck, "hide the list of commands"),
+            (Screen::Overview, "get rid of the command list"),
+        ] {
+            let resolver = StubResolver::new().answering(said, IntentAnswer::new(CLOSE_ROW));
+            let outcome = run(&resolver, screen, &fleet(), said).await;
+            assert!(
+                matches!(&outcome, VoiceOutcome::Dispatch { action, .. } if action == CLOSE_ROW),
+                "{said}: {outcome:?}"
+            );
+        }
+    }
+
+    /// The context narrows and never widens: every phrase that closes the
+    /// dialog also closes an ordinary view, and the words a user filling a
+    /// form says for other reasons are not among them.
+    #[test]
+    fn voice_outcome_close_over_the_dialog_is_narrower_than_close_elsewhere() {
+        let close = table().row(CLOSE_ROW).expect("row");
+        let dialog = VoiceNewAgent { form: None };
+        let (over_dialog, context) = close.grounding_for(None, Some(&dialog));
+        assert_eq!(context, Some(Requirement::NewAgentDialog));
+        let ActionGrounding::HeardAsWhole(phrases) = over_dialog else {
+            panic!("{over_dialog:?}");
+        };
+        for phrase in phrases {
+            assert!(action_grounded(close, phrase, None, None), "{phrase}");
+            assert!(
+                action_grounded(close, phrase, None, Some(&dialog)),
+                "{phrase}"
+            );
+        }
+        for said in ["done", "leave", "back", "go back", "stop looking at this"] {
+            assert!(action_grounded(close, said, None, None), "{said}");
+            assert!(!action_grounded(close, said, None, Some(&dialog)), "{said}");
+        }
+        // And a declared listing alone — which the dialog always comes with,
+        // never without — selects nothing: the context is the dialog.
+        let level = listing(&["docs"], true);
+        assert_eq!(close.grounding_for(Some(&level), None).1, None);
+    }
+
+    /// Scenario: with the New agent dialog open and filled, the user says
+    /// "name it back-end worker" or "call it deck-helper" while an observed
+    /// name steers the model to `open_deck` — which would leave the overview
+    /// and unmount the dialog with its form. Refused; "go back to the deck"
+    /// said on its own still goes, and a bare "go back" over the dialog does
+    /// not, since a user filling a form may mean the dialog or the parent.
+    #[tokio::test]
+    async fn voice_outcome_a_deck_word_in_passing_does_not_leave_the_new_agent_dialog() {
+        let form = new_agent_form();
+        let ask = |said: &'static str| {
+            let form = form.clone();
+            async move {
+                let resolver = StubResolver::new().answering(said, IntentAnswer::new("open_deck"));
+                handle_utterance(
+                    &resolver,
+                    table(),
+                    Screen::Overview,
+                    &fleet(),
+                    &decks(),
+                    None,
+                    Some(&form),
+                    Transcript::new(said),
+                )
+                .await
+                .outcome
+            }
+        };
+        for said in [
+            "name it back-end worker",
+            "call it deck-helper",
+            "go back",
+            "back",
+            "take me back",
+        ] {
+            let outcome = ask(said).await;
+            assert!(
+                matches!(&outcome, VoiceOutcome::ActionUngrounded { action, sentence, .. }
+                    if action == "open_deck"
+                        && sentence.contains("while the New agent dialog is open")),
+                "{said}: {outcome:?}"
+            );
+        }
+        for said in [
+            "go back to the deck",
+            "Okay, back to the deck.",
+            "the deck please",
+        ] {
+            let outcome = ask(said).await;
+            assert!(
+                matches!(&outcome, VoiceOutcome::Dispatch { action, .. } if action == "open_deck"),
+                "{said}: {outcome:?}"
+            );
+        }
+        // With no dialog declared, the bare phrase keeps working.
+        let resolver = StubResolver::new().answering("go back", IntentAnswer::new("open_deck"));
+        let outcome = run(&resolver, Screen::Overview, &fleet(), "go back").await;
+        assert!(outcome.is_dispatch(), "{outcome:?}");
     }
 
     #[test]

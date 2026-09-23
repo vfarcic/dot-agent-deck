@@ -237,6 +237,18 @@ impl Requirement {
         Self::ALL.into_iter().find(|kind| kind.as_str() == value)
     }
 
+    /// The requirement as a user-facing clause — "while the New agent dialog
+    /// is open" — for a refusal that depends on it
+    /// ([`CommandRow::grounding_while`]).
+    pub fn while_phrase(self) -> &'static str {
+        match self {
+            Requirement::DirectoryListing => "while a directory listing is showing",
+            Requirement::ParentDirectory => "while a directory with a parent is showing",
+            Requirement::NewAgentForm => "while the New agent form is open",
+            Requirement::NewAgentDialog => "while the New agent dialog is open",
+        }
+    }
+
     /// Whether what the webview declared meets this requirement.
     pub fn met_by(
         self,
@@ -318,6 +330,37 @@ pub struct CommandRow {
     /// What in a transcript counts as the user having asked for THIS action
     /// (PRD #1223, closing audit F1). See [`ActionGrounding`].
     pub grounding: ActionGrounding,
+    /// A stricter grounding that replaces [`CommandRow::grounding`] while a
+    /// requirement holds — the `heard_as_whole_while` column (PRD #1223,
+    /// closing audit H1). Empty for every row but `open_deck` and `close`. See
+    /// [`ContextGrounding`] and [`CommandRow::grounding_for`].
+    pub grounding_while: Vec<ContextGrounding>,
+}
+
+/// A row's grounding while one [`Requirement`] holds (PRD #1223, closing
+/// audit H1): always [`ActionGrounding::HeardAsWhole`], and always NARROWER than
+/// the row's own `heard_as` — every entry contains one of those words, which
+/// the parser checks ([`TableError::LooserGroundingWhile`]), so a context can
+/// only take phrasings away.
+///
+/// # Why grounding needed a context at all
+///
+/// The grounding mode was a static property of a row, chosen by one criterion:
+/// is the action irreversible? For `close` that had one answer — it closes a
+/// VIEW, and a view reopens — until the view is the New agent dialog, whose
+/// deck, directory, Mode, Agent, Name and hand-edited Command are
+/// component-local state that unmounting discards. So the same row is
+/// reversible over an agent's pane and destructive over a filled form, and
+/// the declaration that says which is the one the webview already sends with
+/// every utterance ([`super::VoiceNewAgent`], present while the dialog is
+/// mounted). Moving `close` wholesale into `heard_as_whole` would have made
+/// "I'm done with this agent" stop closing a pane, which costs nothing to
+/// undo; this keeps that and holds only the destructive case to the whole
+/// utterance.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContextGrounding {
+    pub requires: Requirement,
+    pub grounding: ActionGrounding,
 }
 
 /// How a row's ACTION is held against the transcript before it dispatches
@@ -369,6 +412,23 @@ pub enum ActionGrounding {
 }
 
 impl CommandRow {
+    /// The grounding that holds this row with `directories` and `new_agent`
+    /// declared, and the requirement that selected it: the first
+    /// [`CommandRow::grounding_while`] entry whose requirement is met, or the
+    /// row's own [`CommandRow::grounding`] with `None`.
+    pub fn grounding_for(
+        &self,
+        directories: Option<&VoiceDirectories>,
+        new_agent: Option<&VoiceNewAgent>,
+    ) -> (&ActionGrounding, Option<Requirement>) {
+        self.grounding_while
+            .iter()
+            .find(|context| context.requires.met_by(directories, new_agent))
+            .map_or((&self.grounding, None), |context| {
+                (&context.grounding, Some(context.requires))
+            })
+    }
+
     /// Whether this row can run on `screen`.
     ///
     /// An empty `screens` list is "available everywhere" rather than "available
@@ -555,6 +615,46 @@ impl CommandTable {
                 return Err(TableError::MissingGrounding { id: id.clone() });
             };
 
+            // Only a token-grounded row can be made stricter in a context: a
+            // whole-utterance row is already as strict as this gets, and an
+            // exempt one has no words to be strict about.
+            let mut grounding_while = Vec::new();
+            for (requirement, phrases) in row.heard_as_whole_while.unwrap_or_default() {
+                let ActionGrounding::HeardAs(base) = &grounding else {
+                    return Err(TableError::MisplacedGroundingWhile { id: id.clone() });
+                };
+                let requires = Requirement::parse(&requirement).ok_or_else(|| {
+                    TableError::UnknownRequirement {
+                        id: id.clone(),
+                        requirement: requirement.clone(),
+                    }
+                })?;
+                let phrases = own_words(phrases)?;
+                // Narrower only: each entry, said on its own, must already be
+                // grounded by the row's `heard_as` — checked as a contiguous
+                // run of words, which is stricter than the transcript check,
+                // so it implies it.
+                for phrase in &phrases {
+                    let words = spoken_words(phrase);
+                    let covered = base.iter().any(|entry| {
+                        let wanted = spoken_words(entry);
+                        !wanted.is_empty()
+                            && words.windows(wanted.len()).any(|window| window == wanted)
+                    });
+                    if !covered {
+                        return Err(TableError::LooserGroundingWhile {
+                            id: id.clone(),
+                            requirement: requires,
+                            phrase: phrase.clone(),
+                        });
+                    }
+                }
+                grounding_while.push(ContextGrounding {
+                    requires,
+                    grounding: ActionGrounding::HeardAsWhole(phrases),
+                });
+            }
+
             commands.push(CommandRow {
                 id,
                 description,
@@ -565,6 +665,7 @@ impl CommandTable {
                 report,
                 params,
                 grounding,
+                grounding_while,
             });
         }
 
@@ -688,6 +789,16 @@ pub enum TableError {
     /// A `heard_as` or `heard_as_whole` entry that is not words of the row's
     /// own `id` or `description`.
     ForeignHeardAs { id: String, phrase: String },
+    /// A `heard_as_whole_while` on a row whose own grounding is not
+    /// `heard_as` — there is nothing for a context to narrow.
+    MisplacedGroundingWhile { id: String },
+    /// A `heard_as_whole_while` entry that none of the row's `heard_as`
+    /// entries grounds, which would make the row LOOSER in that context.
+    LooserGroundingWhile {
+        id: String,
+        requirement: Requirement,
+        phrase: String,
+    },
 }
 
 impl fmt::Display for TableError {
@@ -760,6 +871,18 @@ impl fmt::Display for TableError {
             TableError::ForeignHeardAs { id, phrase } => write!(
                 f,
                 "command `{id}`'s grounding entry `{phrase}` is not words of its own id or description"
+            ),
+            TableError::MisplacedGroundingWhile { id } => write!(
+                f,
+                "command `{id}` declares `heard_as_whole_while` without `heard_as`; only a token-grounded row can be narrowed in a context"
+            ),
+            TableError::LooserGroundingWhile {
+                id,
+                requirement,
+                phrase,
+            } => write!(
+                f,
+                "command `{id}`'s `heard_as_whole_while.{requirement}` entry `{phrase}` contains none of its `heard_as` entries, so it would loosen the row there rather than narrow it"
             ),
         }
     }
@@ -1346,6 +1469,151 @@ mod tests {
             .map(|row| row.id.as_str())
             .collect();
         assert_eq!(whole, vec!["submit_prompt"]);
+    }
+
+    /// The rows whose grounding changes with a declared context (PRD #1223,
+    /// closing audit H1), pinned with the context and its phrases: `open_deck`
+    /// and `close`, over the New agent dialog — the two rows whose dispatch
+    /// unmounts it — and nothing else.
+    #[test]
+    fn voice_table_context_grounded_rows_are_the_deliberate_set() {
+        let contextual: Vec<(&str, Requirement)> = super::table()
+            .rows()
+            .iter()
+            .flat_map(|row| {
+                row.grounding_while
+                    .iter()
+                    .map(move |context| (row.id.as_str(), context.requires))
+            })
+            .collect();
+        assert_eq!(
+            contextual,
+            vec![
+                ("open_deck", Requirement::NewAgentDialog),
+                ("close", Requirement::NewAgentDialog),
+            ]
+        );
+        let open_deck = super::table().row("open_deck").expect("row");
+        assert_eq!(
+            open_deck.grounding_while[0].grounding,
+            ActionGrounding::HeardAsWhole(
+                [
+                    "go back to the deck",
+                    "back to the deck",
+                    "return to the deck",
+                    "the deck",
+                    "deck",
+                    "show the terminals",
+                ]
+                .map(String::from)
+                .to_vec()
+            )
+        );
+        let close = super::table().row("close").expect("row");
+        assert_eq!(
+            close.grounding_while[0].grounding,
+            ActionGrounding::HeardAsWhole(
+                [
+                    "close",
+                    "close this",
+                    "close it",
+                    "close the dialog",
+                    "close this dialog",
+                    "dismiss",
+                    "dismiss this",
+                    "hide this",
+                    "get rid of this",
+                ]
+                .map(String::from)
+                .to_vec()
+            )
+        );
+    }
+
+    #[test]
+    fn voice_table_parses_a_context_grounding_under_the_own_words_rule() {
+        let with = |column: &str| one_row().replace("heard_as = [\"open\"]", column);
+        let table = CommandTable::parse(&with(
+            "heard_as = [\"open\"]\nheard_as_whole_while.new_agent_dialog = [\"open agent\"]",
+        ))
+        .expect("parses");
+        let row = &table.rows()[0];
+        assert_eq!(
+            row.grounding_while,
+            vec![ContextGrounding {
+                requires: Requirement::NewAgentDialog,
+                grounding: ActionGrounding::HeardAsWhole(vec!["open agent".to_string()]),
+            }]
+        );
+        // Outside the context the row's own grounding holds.
+        assert_eq!(
+            row.grounding_for(None, None),
+            (&ActionGrounding::HeardAs(vec!["open".to_string()]), None)
+        );
+
+        // A context on a row with nothing to narrow.
+        for base in ["heard_as_whole = [\"open\"]", "ungrounded = \"because\""] {
+            let error = CommandTable::parse(&with(&format!(
+                "{base}\nheard_as_whole_while.new_agent_dialog = [\"open\"]"
+            )))
+            .expect_err("refused");
+            assert_eq!(
+                error,
+                TableError::MisplacedGroundingWhile {
+                    id: "open_agent".to_string()
+                },
+                "{base}"
+            );
+        }
+        // An unknown context.
+        let error = CommandTable::parse(&with(
+            "heard_as = [\"open\"]\nheard_as_whole_while.somewhere = [\"open\"]",
+        ))
+        .expect_err("refused");
+        assert!(
+            matches!(error, TableError::UnknownRequirement { ref requirement, .. } if requirement == "somewhere"),
+            "{error:?}"
+        );
+        // A foreign phrase, and an empty list.
+        let error = CommandTable::parse(&with(
+            "heard_as = [\"open\"]\nheard_as_whole_while.new_agent_dialog = [\"send\"]",
+        ))
+        .expect_err("refused");
+        assert!(
+            matches!(error, TableError::ForeignHeardAs { .. }),
+            "{error:?}"
+        );
+        let error = CommandTable::parse(&with(
+            "heard_as = [\"open\"]\nheard_as_whole_while.new_agent_dialog = []",
+        ))
+        .expect_err("refused");
+        assert!(
+            matches!(error, TableError::MissingGrounding { .. }),
+            "{error:?}"
+        );
+    }
+
+    /// A context may only take phrasings away: an entry that none of the
+    /// row's `heard_as` grounds would make the row LOOSER there.
+    #[test]
+    fn voice_table_rejects_a_context_grounding_that_loosens_the_row() {
+        let source = one_row().replace(
+            "heard_as = [\"open\"]",
+            "heard_as = [\"open\"]\nheard_as_whole_while.new_agent_dialog = [\"one agent\"]",
+        );
+        let error = CommandTable::parse(&source).expect_err("refused");
+        assert_eq!(
+            error,
+            TableError::LooserGroundingWhile {
+                id: "open_agent".to_string(),
+                requirement: Requirement::NewAgentDialog,
+                phrase: "one agent".to_string(),
+            }
+        );
+        assert!(
+            error.to_string().contains("would loosen the row"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -1955,6 +2223,7 @@ struct RawCommand {
     report: Option<String>,
     heard_as: Option<Vec<String>>,
     heard_as_whole: Option<Vec<String>>,
+    heard_as_whole_while: Option<std::collections::BTreeMap<String, Vec<String>>>,
     ungrounded: Option<String>,
     #[serde(default)]
     params: Vec<RawParam>,

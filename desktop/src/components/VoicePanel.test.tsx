@@ -218,8 +218,15 @@ describe("VoicePanel", () => {
     expect(disclosure).toHaveTextContent("your Commands API key in its authentication header");
     // PRD #1223, closing audit G2: the negations are about the app-observed
     // names only, and the words spoken are said to be always sent.
-    expect(disclosure).toHaveTextContent("Those names include no filesystem path, no deck or agent id");
-    expect(disclosure).toHaveTextContent("The words you speak are always sent as heard, and may themselves contain a path, an id or anything else you say.");
+    // PRD #1223, closing audit H2: stated as FIELD provenance — the app adds
+    // no such field — because a name is arbitrary text and can itself be a
+    // path; and the words go with a command that REACHES the endpoint, since
+    // the locally decided ones named above send nothing.
+    expect(disclosure).toHaveTextContent("This app adds no field of its own for a filesystem path, a deck or agent id, prompt text or a tool's arguments");
+    expect(disclosure).toHaveTextContent("a name is whatever it was set to, so a name can itself be a path.");
+    expect(disclosure).toHaveTextContent("Every command that reaches the endpoint also carries your words as heard, which may contain anything you say.");
+    expect(disclosure).not.toHaveTextContent("Those names include no filesystem path");
+    expect(disclosure).not.toHaveTextContent("always sent as heard");
     expect(disclosure).not.toHaveTextContent("It sends no filesystem path");
     expect(disclosure).not.toHaveTextContent("no prompt you typed");
     expect(disclosure).not.toHaveTextContent("Never a path, an id");
@@ -243,7 +250,11 @@ describe("VoicePanel", () => {
     // PRD #1223, closing audit G2: withholding removes the observed names, not
     // the user's own words, and says so rather than implying a redaction.
     expect(disclosure).toHaveTextContent("none of the names this app reads from the screen");
-    expect(disclosure).toHaveTextContent("It does not redact your words: what you speak is still sent as heard.");
+    // Closing audit H2: scoped to the commands that reach the endpoint — the
+    // always-sent paragraph beside it names the ones decided on this machine.
+    expect(disclosure).toHaveTextContent("It does not redact your words: every command that reaches the endpoint still carries them as heard.");
+    expect(disclosure).not.toHaveTextContent("what you speak is still sent as heard");
+    expect(disclosure).not.toHaveTextContent("always sent as heard");
     expect(disclosure).not.toHaveTextContent("sends none of the names on screen");
     expect(within(screen.getByRole("radiogroup", { name: "Names" })).getByLabelText("Withheld")).toBeChecked();
   });

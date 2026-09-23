@@ -134,6 +134,43 @@ screen = "deck"
 action = "close"
 outcome = "dispatch"
 
+# PRD #1223, closing audit H1 — over the New agent dialog, `close` and
+# `open_deck` would each unmount it with its form, so there both need the whole
+# utterance. These pin that the plain requests still route and land, and that a
+# close word inside a naming request is the naming request.
+[[fixtures]]
+name = "close-the-new-agent-dialog"
+utterance = "close this"
+screen = "overview"
+form = true
+action = "close"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "close-the-new-agent-dialog-before-a-form"
+utterance = "close the dialog"
+screen = "overview"
+dialog = true
+action = "close"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "name-new-agent-with-a-close-word"
+utterance = "name it done worker"
+screen = "overview"
+form = true
+action = "name_new_agent"
+outcome = "dispatch"
+dictate_prefix = "name it"
+
+[[fixtures]]
+name = "open-deck-over-the-new-agent-dialog"
+utterance = "go back to the deck"
+screen = "overview"
+form = true
+action = "open_deck"
+outcome = "dispatch"
+
 # Settings is exposed only from the deck; overview and agent requests must be unavailable.
 
 [[fixtures]]
