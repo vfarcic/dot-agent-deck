@@ -109,3 +109,46 @@ xver = "run --quiet --package xtask-cross-version --"
 # and the degradation ladder are in `docs/develop/build-gate.md`.
 [target.x86_64-unknown-linux-gnu]
 linker = "./scripts/link-gate.sh"
+
+# Issue #451 — keep DEPENDENCY RESOLUTION blind to the declared `rust-version`.
+# Declaring a floor in `Cargo.toml` has two effects, and only the first one is
+# wanted. It makes cargo refuse an older rustc up front and name the number,
+# which is the whole point of the declaration. But under resolver v3 (selected
+# by `edition = "2024"`) it ALSO switches `cargo update` to preferring
+# versions compatible with the floor rather than with the installed toolchain
+# (`incompatible-rust-versions = "fallback"`, the default).
+#
+# That second effect makes Renovate fight itself. Its per-dependency PRs run
+# `cargo update --package X@old --precise new`, and `--precise` keeps a version
+# whose own `rust-version` is above the floor. Its weekly lock file maintenance
+# runs plain `cargo update`, which DOWNGRADES that same version back to the
+# newest one compatible with the floor. Measured with a 1.88 floor standing in
+# for a future dependency above ours: `--precise 0.9.3` kept `aes@0.9.3`, and
+# plain `cargo update` proposed `Downgrading aes v0.9.3 -> v0.9.2`. So a
+# dependency patch that needs a newer rustc would be automerged (CI builds on
+# the pinned toolchain, well above the floor), downgraded the next Monday, and
+# re-proposed.
+#
+# `allow` picks the newest version that satisfies the requirement and ignores
+# `rust-version` entirely. With it, the same 1.88 probe proposed no downgrade,
+# and on today's lockfile `cargo update --dry-run --verbose` proposes the same
+# versions it did before the floor was declared. It is not quite the old
+# behaviour: undeclared, cargo preferred versions compatible with the rustc
+# running `cargo update`, and `allow` does not. The two differ only for a
+# version that needs a newer rustc than the one resolving, and CI refuses such
+# a version on the pinned toolchain, so it turns that PR red rather than `main`.
+# It does NOT weaken the up-front
+# refusal: that check compares each package's `rust-version` against the
+# running rustc at build time and is independent of this key. The cost is the
+# one `docs/develop/versioning.md` already accepts — a dependency bump can raise
+# the real floor while the declared number stands still, and nothing notices
+# until someone re-measures.
+#
+# Renovate's cargo commands pass no working directory, so they run from the
+# repository root, where cargo's config discovery starts, and should therefore
+# pick this key up. That is read off Renovate's source (`lib/util/exec/index.ts`,
+# `getCwd`) and has not been observed in a Renovate run: the first lock file
+# maintenance PR after this lands is the confirmation. If it proposes a
+# downgrade, this key is not reaching it.
+[resolver]
+incompatible-rust-versions = "allow"

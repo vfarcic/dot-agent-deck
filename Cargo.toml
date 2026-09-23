@@ -37,8 +37,13 @@ members = [
 # IS SET BY A LOCKED DEPENDENCY rather than by anything under `src/`.
 #
 # What moves it is therefore the LOCKFILE, not the toolchain pin, and nothing
-# re-measures it automatically. `docs/develop/versioning.md` has the decision,
-# the re-measurement procedure, and what the lag costs.
+# re-measures it automatically. Dependency resolution deliberately does NOT
+# read this field: `.cargo/config.toml` sets `[resolver]
+# incompatible-rust-versions = "allow"`, because resolving against the floor
+# makes Renovate's weekly lock file maintenance downgrade what its own
+# per-dependency PRs land (the reasoning and the measurement are there).
+# `docs/develop/versioning.md` has the decision, the re-measurement procedure,
+# and what the lag costs.
 [workspace.package]
 rust-version = "1.93.1"
 
