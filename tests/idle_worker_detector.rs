@@ -1321,8 +1321,10 @@ fn idle_worker_010_delegate_during_close_refuses_to_arm() {
         // 5.252 s against the 5 s ceiling, while the whole test is 3.04-3.12 s
         // here — stable under 16 spinners on 16 cores, because its duration is
         // dominated by the 3 s SIGTERM grace and not by CPU. `CHILD_BOOT_BASE`
-        // is 8 s, and `machine_load_per_cpu` is `None` on macOS so no
-        // multiplier applies there: the platform that failed gets a flat 8 s.
+        // is 8 s. `machine_load_per_cpu` used to be `None` on macOS, so the
+        // platform that failed got a flat 8 s — and failed again at 8.248 s on
+        // PR #1238's `build-macos` run. It now reads `getloadavg(3)` there, so
+        // this ceiling scales with the runner's load on macOS as on Linux.
         //
         // Widening a PRECONDITION cannot weaken what this test asserts. The
         // guard that makes the race real is the assertion AFTER the delegate —

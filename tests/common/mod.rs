@@ -103,24 +103,47 @@ pub const CHILD_BOOT_BASE: Duration = Duration::from_secs(8);
 /// Issue #709: the 1-minute load average per CPU, or `None` where this platform
 /// does not publish one cheaply.
 ///
-/// Linux only, deliberately. `getloadavg(3)` exists on macOS but is not exposed
-/// by the `libc` crate for either `linux-gnu` or `apple` targets, and shelling
-/// out to `sysctl` from a test helper buys a process spawn on every wait to
-/// refine a number that is only ever used to make a ceiling MORE generous.
-/// Elsewhere the answer is `None`, and [`load_scaled`] then applies NO
-/// multiplier at all — see [`load_factor`] for why an unmeasurable load is not
-/// treated as a maximal one.
+/// Linux reads `/proc/loadavg` and macOS calls `getloadavg(3)`. Elsewhere the
+/// answer is `None`, and [`load_scaled`] then applies NO multiplier at all —
+/// see [`load_factor`] for why an unmeasurable load is not treated as a maximal
+/// one.
+///
+/// **macOS used to be `None` as well, and that was a flake.** This comment said
+/// `getloadavg` was not exposed by the `libc` crate for Apple targets. It is:
+/// `libc` declares it in `unix/bsd/mod.rs`, which `apple` sits under. So
+/// `build-macos` — a 3-core runner under a full `cargo nextest run` — got the
+/// flat [`CHILD_BOOT_BASE`] with no scaling, and `idle_worker_010` failed there
+/// at 8.248 s against that 8 s ceiling with "the pane never entered the closing
+/// state" (PR #1238, run 35747708815): #709's starvation shape, on the one
+/// platform #709 could not scale. [`load_factor`]'s clamp bounds a macOS
+/// reading exactly as it bounds a Linux one.
 pub fn machine_load_per_cpu() -> Option<f64> {
-    if !cfg!(target_os = "linux") {
-        return None;
-    }
-    let raw = std::fs::read_to_string("/proc/loadavg").ok()?;
-    let one_minute: f64 = raw.split_whitespace().next()?.parse().ok()?;
+    let one_minute = one_minute_load_average()?;
     let cpus = std::thread::available_parallelism().ok()?.get() as f64;
     if !one_minute.is_finite() || cpus <= 0.0 {
         return None;
     }
     Some(one_minute / cpus)
+}
+
+#[cfg(target_os = "linux")]
+fn one_minute_load_average() -> Option<f64> {
+    let raw = std::fs::read_to_string("/proc/loadavg").ok()?;
+    raw.split_whitespace().next()?.parse().ok()
+}
+
+#[cfg(target_os = "macos")]
+fn one_minute_load_average() -> Option<f64> {
+    let mut sample = [0.0_f64; 1];
+    // SAFETY: `getloadavg` writes at most `nelem` (1) doubles into a buffer we
+    // own and have sized to 1, and returns how many it wrote, or -1 on failure.
+    let written = unsafe { libc::getloadavg(sample.as_mut_ptr(), 1) };
+    (written == 1).then_some(sample[0])
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn one_minute_load_average() -> Option<f64> {
+    None
 }
 
 /// Issue #709: the largest factor [`load_scaled`] will multiply a base ceiling
@@ -138,8 +161,8 @@ pub(crate) const MAX_LOAD_FACTOR: f64 = 6.0;
 /// Issue #709: widen a wait ceiling in proportion to how contended the machine
 /// is, so a fast box still fails fast and a loaded one still passes.
 ///
-/// Where the load cannot be measured at all — every non-Linux target — the base
-/// is returned unscaled rather than at the maximum multiplier. [`load_factor`]
+/// Where the load cannot be measured at all — every target but Linux and macOS —
+/// the base is returned unscaled rather than at the maximum multiplier. [`load_factor`]
 /// carries that reasoning and the measurement behind it.
 ///
 /// Apply this ONLY to a ceiling on something that must HAPPEN, never to a
@@ -153,8 +176,9 @@ pub fn load_scaled(base: Duration) -> Duration {
 }
 
 /// The factor [`load_scaled`] multiplies its base by, split out from it so the
-/// non-Linux branch is testable on Linux — where [`machine_load_per_cpu`] never
-/// returns `None`, and so where the interesting case is otherwise unreachable.
+/// unmeasurable branch is testable on Linux and macOS — where
+/// [`machine_load_per_cpu`] does not return `None` in practice, and so where the
+/// interesting case is otherwise unreachable.
 ///
 /// **An UNMEASURABLE load yields 1.0, not [`MAX_LOAD_FACTOR`].** This function
 /// widens a ceiling in proportion to *measured* contention; `None` is the
@@ -162,7 +186,7 @@ pub fn load_scaled(base: Duration) -> Duration {
 /// answer is to leave the base alone. Treating it as maximal contention — which
 /// is what an earlier `unwrap_or(MAX_LOAD_FACTOR)` here did — multiplied every
 /// `load_scaled` wait by 6 on **every** macOS and Windows run, idle or not,
-/// because `machine_load_per_cpu` is Linux-only by construction. That is the
+/// because `machine_load_per_cpu` was Linux-only by construction then. That is the
 /// largest possible error rather than a safe default: the true factor on an idle
 /// box is exactly 1.0.
 ///
