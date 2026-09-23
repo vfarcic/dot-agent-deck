@@ -28,6 +28,7 @@ use spec::spec;
 
 const PLAIN_LABEL: &str = "desktop-visible-agent";
 const SECOND_PLAIN_LABEL: &str = "second-desktop-agent";
+const THIRD_PLAIN_LABEL: &str = "third-desktop-agent";
 const TWO_CLIENT_LABEL: &str = "two-client-desktop-agent";
 const LAZY_SPAWN_LABEL: &str = "lazy-spawn-desktop-agent";
 const REFETCH_LABEL: &str = "refetch-desktop-agent";
@@ -409,6 +410,20 @@ fn missing_roles(grid: &str) -> Vec<&'static str> {
         .collect()
 }
 
+/// The single-tab dashboard has a session-count header, one bordered card per
+/// plain agent, and the command-mode dashboard controls along the bottom.
+fn plain_dashboard_shows(grid: &str, labels: &[&str]) -> bool {
+    grid.lines().next() == Some(format!(" dot-agent-deck — {} session(s)", labels.len()).as_str())
+        && labels.iter().all(|label| grid.contains(label))
+        && grid.matches('┌').count() + grid.matches('┏').count() == labels.len()
+        && grid.matches('└').count() + grid.matches('┗').count() == labels.len()
+        && grid.matches("Launch an agent to get started").count() == labels.len()
+        && grid
+            .lines()
+            .any(|line| line.starts_with(" COMMAND  [Back to Pane Ctrl+D]"))
+        && grid.contains("[Filter /] [Rename r] [Generate g] [Scheduled Tasks s]")
+}
+
 /// Send the plain `StartAgent` shape built by the desktop action. The explicit
 /// type is inferred from the command exactly as `start_agent_action` does.
 fn start_plain_from_desktop(daemon: &DaemonProc, cwd: String, pane_id: &str, display_name: &str) {
@@ -733,9 +748,11 @@ fn visibility_001_desktop_started_plain_agent_appears_without_selection() {
     );
 }
 
-/// Scenario: Keep a real TUI on its zero-session empty dashboard, then send two
-/// desktop-shaped plain `StartAgent` requests. Without any TUI input, the first
-/// accepted agent must surface as a card and the second must surface beside it.
+/// Scenario: Keep a real TUI on its empty dashboard and start a desktop-shaped
+/// agent; it must render as a dashboard card before selection, and a click must
+/// select that card without changing views. In a second untouched attachment,
+/// start two cards and then a third, requiring the dashboard to retain all
+/// three bordered cards, its three-session header, and its command-mode footer.
 #[spec("newagent/visibility/001")]
 #[test]
 fn visibility_001_desktop_started_plain_agent_surfaces_into_attached_dashboard() {
@@ -767,16 +784,33 @@ fn visibility_001_desktop_started_plain_agent_surfaces_into_attached_dashboard()
     );
     let first_records = daemon.wait_for_agent_count(1, Duration::from_secs(10));
 
-    assert!(
-        common::wait_until(Duration::from_secs(10), || {
-            deck.snapshot_grid().contains(PLAIN_LABEL)
-        }),
-        "the already-attached TUI must show the desktop-started agent WITHOUT a keypress, \
-         selection, reconnect, or agent hook, but {PLAIN_LABEL:?} never appeared even though \
-         the daemon registered it. Records: {first_records:#?}\nFinal grid:\n{}",
-        deck.snapshot_grid()
+    deck.wait_until_grid("first desktop start stays on one-card dashboard", |grid| {
+        plain_dashboard_shows(grid, &[PLAIN_LABEL])
+    });
+    assert_eq!(
+        first_records[0].display_name.as_deref(),
+        Some(PLAIN_LABEL),
+        "the first dashboard card must represent the desktop-started agent"
     );
 
+    let (label_col, label_row) = deck.wait_for_in_grid(PLAIN_LABEL);
+    deck.click(label_col, label_row);
+    deck.wait_until_grid("selecting the first card keeps the dashboard", |grid| {
+        plain_dashboard_shows(grid, &[PLAIN_LABEL]) && grid.contains('▸')
+    });
+    drop(deck);
+    drop(daemon);
+
+    // The third start reaches a TUI that has never selected or focused a card.
+    let daemon = common::spawn_daemon_serve(None, "0");
+    let deck = launch_tui_against(&daemon);
+    deck.wait_for_string("No active sessions. Press Ctrl+n to create a pane.");
+    start_plain_from_desktop(
+        &daemon,
+        canonical_cwd.clone(),
+        &desktop_pane_id(0),
+        PLAIN_LABEL,
+    );
     start_plain_from_desktop(
         &daemon,
         canonical_cwd,
@@ -784,15 +818,26 @@ fn visibility_001_desktop_started_plain_agent_surfaces_into_attached_dashboard()
         SECOND_PLAIN_LABEL,
     );
     let second_records = daemon.wait_for_agent_count(2, Duration::from_secs(10));
-    assert!(
-        common::wait_until(Duration::from_secs(10), || {
-            let grid = deck.snapshot_grid();
-            grid.contains(PLAIN_LABEL) && grid.contains(SECOND_PLAIN_LABEL)
-        }),
-        "after the first card surfaced, the same untouched TUI must also show the second \
-         desktop-started agent, but both labels never appeared together. Records: \
-         {second_records:#?}\nFinal grid:\n{}",
-        deck.snapshot_grid()
+    deck.wait_until_grid("two desktop cards share the dashboard", |grid| {
+        plain_dashboard_shows(grid, &[PLAIN_LABEL, SECOND_PLAIN_LABEL])
+    });
+    assert_eq!(second_records.len(), 2, "both starts must be registered");
+
+    start_plain_from_desktop(
+        &daemon,
+        canonical_string(cwd.path()),
+        &desktop_pane_id(2),
+        THIRD_PLAIN_LABEL,
+    );
+    let third_records = daemon.wait_for_agent_count(3, Duration::from_secs(10));
+    deck.wait_until_grid(
+        "third desktop card joins the two existing dashboard cards",
+        |grid| plain_dashboard_shows(grid, &[PLAIN_LABEL, SECOND_PLAIN_LABEL, THIRD_PLAIN_LABEL]),
+    );
+    assert_eq!(
+        third_records.len(),
+        3,
+        "all three starts must be registered"
     );
 }
 
