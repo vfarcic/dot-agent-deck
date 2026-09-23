@@ -332,7 +332,8 @@ pub struct CommandRow {
     pub grounding: ActionGrounding,
     /// A stricter grounding that replaces [`CommandRow::grounding`] while a
     /// requirement holds — the `heard_as_whole_while` column (PRD #1223,
-    /// closing audit H1). Empty for every row but `open_deck` and `close`. See
+    /// closing audit H1). Empty for every row but `open_deck` and `close`, and
+    /// never longer than one ([`TableError::SeveralGroundingsWhile`]). See
     /// [`ContextGrounding`] and [`CommandRow::grounding_for`].
     pub grounding_while: Vec<ContextGrounding>,
 }
@@ -413,9 +414,11 @@ pub enum ActionGrounding {
 
 impl CommandRow {
     /// The grounding that holds this row with `directories` and `new_agent`
-    /// declared, and the requirement that selected it: the first
-    /// [`CommandRow::grounding_while`] entry whose requirement is met, or the
-    /// row's own [`CommandRow::grounding`] with `None`.
+    /// declared, and the requirement that selected it: the
+    /// [`CommandRow::grounding_while`] entry if its requirement is met, or the
+    /// row's own [`CommandRow::grounding`] with `None`. There is at most one
+    /// entry — the parser refuses a second
+    /// ([`TableError::SeveralGroundingsWhile`]) — so no precedence is involved.
     pub fn grounding_for(
         &self,
         directories: Option<&VoiceDirectories>,
@@ -618,8 +621,19 @@ impl CommandTable {
             // Only a token-grounded row can be made stricter in a context: a
             // whole-utterance row is already as strict as this gets, and an
             // exempt one has no words to be strict about.
+            let contexts = row.heard_as_whole_while.unwrap_or_default();
+            // One context per row (closing audit I2). Two would both be
+            // narrower than `heard_as`, but nothing would say which wins
+            // where both hold — `grounding_for` takes the first met, and the
+            // map's order is alphabetical, not a decision.
+            if contexts.len() > 1 {
+                return Err(TableError::SeveralGroundingsWhile {
+                    id: id.clone(),
+                    requirements: contexts.keys().cloned().collect(),
+                });
+            }
             let mut grounding_while = Vec::new();
-            for (requirement, phrases) in row.heard_as_whole_while.unwrap_or_default() {
+            for (requirement, phrases) in contexts {
                 let ActionGrounding::HeardAs(base) = &grounding else {
                     return Err(TableError::MisplacedGroundingWhile { id: id.clone() });
                 };
@@ -799,6 +813,12 @@ pub enum TableError {
         requirement: Requirement,
         phrase: String,
     },
+    /// A `heard_as_whole_while` naming more than one context: where two held
+    /// at once, which one grounded the row would be decided by key order.
+    SeveralGroundingsWhile {
+        id: String,
+        requirements: Vec<String>,
+    },
 }
 
 impl fmt::Display for TableError {
@@ -883,6 +903,11 @@ impl fmt::Display for TableError {
             } => write!(
                 f,
                 "command `{id}`'s `heard_as_whole_while.{requirement}` entry `{phrase}` contains none of its `heard_as` entries, so it would loosen the row there rather than narrow it"
+            ),
+            TableError::SeveralGroundingsWhile { id, requirements } => write!(
+                f,
+                "command `{id}` declares `heard_as_whole_while` for more than one context ({}); a row takes one, since nothing would decide which grounds it where both hold",
+                joined(requirements.iter().map(String::as_str))
             ),
         }
     }
@@ -1612,6 +1637,31 @@ mod tests {
         );
         assert!(
             error.to_string().contains("would loosen the row"),
+            "{error}"
+        );
+    }
+
+    /// One context per row (closing audit I2): two narrower lists that both
+    /// hold would be ordered by map key — `new_agent_dialog` before
+    /// `new_agent_form` — rather than by any decision, so a second is refused.
+    #[test]
+    fn voice_table_rejects_a_row_narrowed_in_more_than_one_context() {
+        let source = one_row().replace(
+            "heard_as = [\"open\"]",
+            "heard_as = [\"open\"]\nheard_as_whole_while.new_agent_form = [\"open agent\"]\nheard_as_whole_while.new_agent_dialog = [\"open\"]",
+        );
+        let error = CommandTable::parse(&source).expect_err("refused");
+        assert_eq!(
+            error,
+            TableError::SeveralGroundingsWhile {
+                id: "open_agent".to_string(),
+                requirements: vec!["new_agent_dialog".to_string(), "new_agent_form".to_string()],
+            }
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("`new_agent_dialog`, `new_agent_form`"),
             "{error}"
         );
     }

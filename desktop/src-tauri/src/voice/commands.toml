@@ -70,6 +70,8 @@
 #                    H1). For a row reversible in general and destructive in
 #                    one declared context. Every entry must contain one of the
 #                    row's `heard_as` entries, so a context only narrows.
+#                    At most ONE context per row (closing audit I2): with two,
+#                    nothing would decide which grounds the row where both hold.
 #                    Two rows use it, `open_deck` and `close`, both over the New
 #                    agent dialog, which each would unmount with its form
 #                    (`voice_table_context_grounded_rows_are_the_deliberate_set`).

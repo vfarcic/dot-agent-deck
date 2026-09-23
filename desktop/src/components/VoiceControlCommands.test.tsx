@@ -25,6 +25,7 @@ import { DeckShell } from "../App";
 import { DIRECTORY_MOVED_ON, DIRECTORY_NOT_LISTED, FORM_MOVED_ON, FORM_UNDER_CONFIRMATION, MODE_NOT_OFFERED, NO_DIRECTORY_BROWSER, NO_NEW_AGENT_DIALOG, NO_NEW_AGENT_FORM, NO_PARENT_DIRECTORY, spokenName, START_AWAITING_CONFIRMATION, START_FORM_CHANGED, START_NEEDS_DIRECTORY, STARTING_CLOSE_BLOCKED } from "./NewAgentDialog";
 import { CONFIRMATION_ALREADY_OPEN, STOP_BEHIND_NEW_AGENT, STOP_TARGET_GONE } from "./AgentOverview";
 import {
+  DIALOG_MOVED_ON,
   NOTHING_DISPATCHED,
   VOICE_DICTATION_SEND_MS,
   VOICE_NOTHING_TO_CLOSE,
@@ -2150,5 +2151,146 @@ describe("PRD #802 D5 — a spoken start or stop only ever opens a confirmation 
     expect(screen.getByTestId("voice-report")).toHaveTextContent(STOP_BEHIND_NEW_AGENT);
     expect(confirmation()).toBeNull();
     expect(runAction).not.toHaveBeenCalled();
+  });
+});
+
+describe("a pending answer and a New agent dialog that changed under it (PRD #1223 audit I1)", () => {
+  beforeEach(() => {
+    window.localStorage.clear();
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  const HOME = {
+    kind: "listing" as const,
+    path: "/home/dev",
+    displayPath: "/home/dev",
+    parent: "/home",
+    entries: [{ path: "/home/dev/billing", displayName: "billing", isProject: false }],
+    truncated: false,
+  };
+  const BILLING = { ...HOME, path: "/home/dev/billing", displayPath: "/home/dev/billing", parent: "/home/dev", entries: [] };
+
+  const ANSWERS: Record<string, VoiceResultDto> = {
+    close: dispatch("close", "closeTopmost", "Closed.", "done"),
+    open_deck: dispatch("open_deck", "openDeck", "Back to the deck.", "back"),
+  };
+
+  /**
+   * A resolver held open until the test releases it, answering with a steered
+   * `close` or `open_deck` — the answers the ordinary token list lets through
+   * and the dialog's own grounding would have refused.
+   */
+  function heldDeck(voice: VoiceControls, answer: VoiceResultDto) {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const resolveVoice: ResolveVoice = vi.fn(async () => {
+      await gate;
+      return answer;
+    });
+    const deck = runtime(resolveVoice, voice, {
+      runAction: vi.fn(async () => ({ ok: true }) as DeckActionResult),
+      listDirectories: vi.fn(async (_deckId: string, path?: string) => (path === "/home/dev/billing" ? BILLING : HOME)),
+      newAgentOptions: vi.fn(async () => ({ kind: "deck" as const, defaultCommand: "bash", agents: [], experimental: false, authoringKinds: [] })),
+    } as Partial<DeckRuntimeState>);
+    return { deck, release };
+  }
+
+  async function openDialog() {
+    fireEvent.click(screen.getByTestId("overview-new-agent"));
+    await flush();
+    await flush();
+  }
+
+  async function chooseBilling() {
+    fireEvent.click(screen.getByTestId("new-agent-directory-list").querySelector("[data-path='/home/dev/billing']")!);
+    await flush();
+    fireEvent.click(screen.getByTestId("new-agent-use-directory"));
+    await flush();
+    await flush();
+  }
+
+  /**
+   * Scenario: with no dialog open, say "done" (or "back"). While it is being
+   * worked out, open the New agent dialog, choose a directory and type a Name.
+   * The answer arrives as a `close` (or `open_deck`): it was judged with no
+   * dialog declared, so it runs nothing — the dialog and its draft stay, and
+   * the report says why.
+   */
+  it.each(Object.keys(ANSWERS))("refuses the %s answer judged before the dialog opened", async (kind) => {
+    const voice = microphone([]);
+    const { deck, release } = heldDeck(voice, ANSWERS[kind]);
+    render(<DeckShell runtime={deck} initialView={{ kind: "overview" }} />);
+    await turnVoiceOn();
+
+    voice.deliver(kind === "close" ? "done" : "back");
+    await completeUtterance();
+    expect(deck.resolveVoice).toHaveBeenCalledTimes(1);
+    await openDialog();
+    await chooseBilling();
+    fireEvent.change(screen.getByTestId("new-agent-name"), { target: { value: "draft" } });
+
+    release();
+    await flush();
+    await flush();
+
+    expect(screen.getByTestId("new-agent-dialog")).toBeInTheDocument();
+    expect(screen.getByTestId("new-agent-name")).toHaveValue("draft");
+    expect(screen.getByTestId("new-agent-dir")).toHaveTextContent("/home/dev/billing");
+    expect(screen.getByTestId("voice-report")).toHaveTextContent(DIALOG_MOVED_ON);
+  });
+
+  /**
+   * Scenario: with the dialog open but no directory chosen yet, say "done".
+   * While it is being worked out, choose a directory, which makes the form
+   * live. The `close` that arrives was judged against the dialog without a
+   * form, so it runs nothing and the form stays.
+   */
+  it("refuses a close answer judged before the form became live", async () => {
+    const voice = microphone([]);
+    const { deck, release } = heldDeck(voice, ANSWERS.close);
+    render(<DeckShell runtime={deck} initialView={{ kind: "overview" }} />);
+    await turnVoiceOn();
+    await openDialog();
+
+    voice.deliver("done");
+    await completeUtterance();
+    await chooseBilling();
+    expect(screen.getByTestId("new-agent-name")).toBeEnabled();
+
+    release();
+    await flush();
+    await flush();
+
+    expect(screen.getByTestId("new-agent-dialog")).toBeInTheDocument();
+    expect(screen.getByTestId("new-agent-dir")).toHaveTextContent("/home/dev/billing");
+    expect(screen.getByTestId("voice-report")).toHaveTextContent(DIALOG_MOVED_ON);
+  });
+
+  /**
+   * Scenario: the control — with the dialog unchanged across the round trip,
+   * the same held `close` does close it. The refusal above is about the
+   * declaration moving, not about a slow answer.
+   */
+  it("runs the answer when the dialog did not change while it was pending", async () => {
+    const voice = microphone([]);
+    const { deck, release } = heldDeck(voice, ANSWERS.close);
+    render(<DeckShell runtime={deck} initialView={{ kind: "overview" }} />);
+    await turnVoiceOn();
+    await openDialog();
+    await chooseBilling();
+
+    voice.deliver("done");
+    await completeUtterance();
+    fireEvent.change(screen.getByTestId("new-agent-name"), { target: { value: "draft" } });
+
+    release();
+    await flush();
+    await flush();
+
+    expect(screen.queryByTestId("new-agent-dialog")).toBeNull();
   });
 });

@@ -39,9 +39,9 @@
  * being the single answer to what the app says.
  *
  * The sentences written here are {@link NOTHING_DISPATCHED},
- * {@link SCREEN_MOVED_ON}, {@link VOICE_UNAVAILABLE},
+ * {@link SCREEN_MOVED_ON}, {@link DIALOG_MOVED_ON}, {@link VOICE_UNAVAILABLE},
  * {@link VOICE_CAP_DISCARDED}, {@link VOICE_RELEASE_REFUSED} and
- * {@link VOICE_EMPTY_STATE}. The first two are for situations Rust
+ * {@link VOICE_EMPTY_STATE}. The first three are for situations Rust
  * structurally cannot know about; the rest are about the surface's own state
  * — a release it cannot vouch for, a microphone it has nothing to open, a row
  * with nothing in it yet — rather than about an utterance. See their own
@@ -154,6 +154,42 @@ export const NOTHING_DISPATCHED = "That command is not wired to anything in this
  * its place, which reads as the surface having lost the command.
  */
 export const SCREEN_MOVED_ON = "You moved to another screen while that was being worked out, so nothing ran. Say it again here.";
+
+/**
+ * PRD #1223 audit I1 — {@link SCREEN_MOVED_ON}'s case one level down: the
+ * screen stayed put, but the New agent dialog opened or closed, or its form
+ * became live or stopped being live, while the answer was being worked out.
+ *
+ * Opening the dialog leaves the base screen as `overview`, so the screen check
+ * alone let an answer through that Rust grounded under the OTHER declaration —
+ * a `close` or `open_deck` judged by the ordinary token list, dispatched into a
+ * dialog whose own grounding (`heard_as_whole_while`) would have refused it,
+ * and discarding the draft. See {@link sameNewAgentDeclaration} for which
+ * changes count.
+ */
+export const DIALOG_MOVED_ON = "The New agent dialog changed while that was being worked out, so nothing ran. Say it again.";
+
+/**
+ * Whether two New agent declarations are the same CONTEXT for grounding — the
+ * test {@link DIALOG_MOVED_ON} applies to a pending answer.
+ *
+ * Two presences, and they are exactly what the grounding reads: whether the
+ * dialog is declared at all (the `new_agent_dialog` requirement, which selects
+ * `close`'s and `open_deck`'s `heard_as_whole_while` lists) and whether its
+ * form is (`new_agent_form`, which gates the fill rows).
+ *
+ * **Which deck and directory the form is for is deliberately not compared
+ * here.** A move between two live forms changes no requirement, so the answer
+ * was grounded under the rules that still hold; and every row that resolved
+ * against the form's contents is already re-checked against its `{deckId,
+ * path}` by the dialog at dispatch, which refuses in its own, more specific
+ * words (`FORM_MOVED_ON`, `DIRECTORY_MOVED_ON`). This is the layer above those
+ * re-checks, not a copy of them. Edits the declaration does not carry, such as
+ * a typed Name, are not a change of context either.
+ */
+export function sameNewAgentDeclaration(a: VoiceNewAgentDto | undefined, b: VoiceNewAgentDto | undefined): boolean {
+  return (a === undefined) === (b === undefined) && (a?.form === undefined) === (b?.form === undefined);
+}
 
 /**
  * What a press gets when there is no transcription backend to listen with.
@@ -855,6 +891,12 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
       if (!ours()) return;
       if (screenRef.current !== declared) {
         setProblem(SCREEN_MOVED_ON);
+        return;
+      }
+      /* The same question for the declaration the grounding was computed
+         against: the answer is only an answer about THAT dialog state. */
+      if (!sameNewAgentDeclaration(declaredNewAgent, newAgentRef.current?.())) {
+        setProblem(DIALOG_MOVED_ON);
         return;
       }
       setResult(answer);
