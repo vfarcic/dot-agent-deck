@@ -5933,10 +5933,10 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 
 #### newagent/visibility
 
-##### newagent/visibility/001 — A desktop-started plain agent surfaces without selection on fresh and live TUI attachment.
+##### newagent/visibility/001 — Desktop-started plain agents surface without selection on fresh and live TUI attachment.
 - **Layer:** L2 lane 1, PTY-attached (a headless real daemon receives the desktop-shaped `StartAgent`, then a real TUI attaches through `TuiDeck`; the control starts the same named command through the TUI's own new-agent form).
 - **Agent:** none (both paths run a `sleep 600` stand-in; no credential).
-- **Asserts:** the TUI-native control visibly renders the named plain pane; the desktop-shaped request carries cwd, command, display name, a minted `DOT_AGENT_DECK_PANE_ID`, 24×80 dimensions, no tab membership, and the agent type inferred from its command. Starting before attachment hydrates the named card without input; starting against an already-attached TUI surfaces the same card without a keypress, selection, reconnect, or hook from the hookless stand-in. Regression guard: before `9d66ef6b`, the daemon registered the pane but direct `StartAgent` published no card-surface event, so the live grid remained `No active sessions`.
+- **Asserts:** the TUI-native control visibly renders the named plain pane; the desktop-shaped request carries cwd, command, display name, a minted `DOT_AGENT_DECK_PANE_ID`, 24×80 dimensions, no tab membership, and the agent type inferred from its command. Starting before attachment hydrates the named card without input; starting against an already-attached TUI whose rendered dashboard and daemon registry both have zero sessions surfaces the first card without a keypress, selection, reconnect, or hook from the hookless stand-in, and a second desktop start surfaces alongside it in the same untouched attachment. Regression guard: before `9d66ef6b`, the daemon registered the pane but direct `StartAgent` published no card-surface event, so the live grid remained `No active sessions`.
 - **Does not assert:** the Tauri form itself (there is no `tauri-driver` tier); agent work or hook delivery; exact card layout beyond the visible display name.
 - **Platform coverage:** mac+linux (`#![cfg(all(feature = "e2e", unix))]` — `DaemonProc` binds Unix-domain sockets and `TuiDeck` uses a PTY).
 

@@ -18,6 +18,7 @@ use dot_agent_deck::event::AgentType;
 use spec::spec;
 
 const PLAIN_LABEL: &str = "desktop-visible-agent";
+const SECOND_PLAIN_LABEL: &str = "second-desktop-agent";
 const PLAIN_COMMAND: &str = "sleep 600";
 const ORCHESTRATION_NAME: &str = "desktop-visibility-team";
 const ORCHESTRATION_TITLE: &str = "Desktop prepared run";
@@ -93,7 +94,7 @@ fn missing_roles(grid: &str) -> Vec<&'static str> {
 
 /// Send the plain `StartAgent` shape built by the desktop action. The explicit
 /// type is inferred from the command exactly as `start_agent_action` does.
-fn start_plain_from_desktop(daemon: &DaemonProc, cwd: String, pane_id: &str) {
+fn start_plain_from_desktop(daemon: &DaemonProc, cwd: String, pane_id: &str, display_name: &str) {
     let response = daemon
         .send_attach_request(&AttachRequest::StartAgent {
             command: Some(PLAIN_COMMAND.into()),
@@ -101,7 +102,7 @@ fn start_plain_from_desktop(daemon: &DaemonProc, cwd: String, pane_id: &str) {
             rows: 24,
             cols: 80,
             env: vec![(DOT_AGENT_DECK_PANE_ID.into(), pane_id.into())],
-            display_name: Some(PLAIN_LABEL.into()),
+            display_name: Some(display_name.into()),
             tab_membership: None,
             agent_type: AgentType::from_command(Some(PLAIN_COMMAND)),
             seed: None,
@@ -260,7 +261,7 @@ fn visibility_001_desktop_started_plain_agent_appears_without_selection() {
     let daemon = common::spawn_daemon_serve(None, "0");
     let cwd = common::harness_tempdir().expect("create desktop-selected cwd");
     let canonical_cwd = canonical_string(cwd.path());
-    start_plain_from_desktop(&daemon, canonical_cwd, &desktop_pane_id(0));
+    start_plain_from_desktop(&daemon, canonical_cwd, &desktop_pane_id(0), PLAIN_LABEL);
     let records = daemon.wait_for_agent_count(1, Duration::from_secs(10));
     assert_eq!(
         records[0].display_name.as_deref(),
@@ -280,10 +281,9 @@ fn visibility_001_desktop_started_plain_agent_appears_without_selection() {
     );
 }
 
-/// Scenario: Keep a real TUI attached to an empty daemon, then send the same
-/// desktop-shaped plain `StartAgent` request used by the fresh-attach control.
-/// Without any keypress, selection, or agent hook, the newly accepted agent
-/// must surface as a named dashboard card just as a TUI-native start does.
+/// Scenario: Keep a real TUI on its zero-session empty dashboard, then send two
+/// desktop-shaped plain `StartAgent` requests. Without any TUI input, the first
+/// accepted agent must surface as a card and the second must surface beside it.
 #[spec("newagent/visibility/001")]
 #[test]
 fn visibility_001_desktop_started_plain_agent_surfaces_into_attached_dashboard() {
@@ -300,10 +300,20 @@ fn visibility_001_desktop_started_plain_agent_surfaces_into_attached_dashboard()
 
     let daemon = common::spawn_daemon_serve(None, "0");
     let deck = launch_tui_against(&daemon);
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active sessions. Press Ctrl+n to create a pane.");
+    assert!(
+        daemon.agent_records().is_empty(),
+        "precondition: the attached TUI's empty dashboard must correspond to a daemon with zero agents"
+    );
     let cwd = common::harness_tempdir().expect("create desktop-selected cwd");
-    start_plain_from_desktop(&daemon, canonical_string(cwd.path()), &desktop_pane_id(0));
-    let records = daemon.wait_for_agent_count(1, Duration::from_secs(10));
+    let canonical_cwd = canonical_string(cwd.path());
+    start_plain_from_desktop(
+        &daemon,
+        canonical_cwd.clone(),
+        &desktop_pane_id(0),
+        PLAIN_LABEL,
+    );
+    let first_records = daemon.wait_for_agent_count(1, Duration::from_secs(10));
 
     assert!(
         common::wait_until(Duration::from_secs(10), || {
@@ -311,7 +321,25 @@ fn visibility_001_desktop_started_plain_agent_surfaces_into_attached_dashboard()
         }),
         "the already-attached TUI must show the desktop-started agent WITHOUT a keypress, \
          selection, reconnect, or agent hook, but {PLAIN_LABEL:?} never appeared even though \
-         the daemon registered it. Records: {records:#?}\nFinal grid:\n{}",
+         the daemon registered it. Records: {first_records:#?}\nFinal grid:\n{}",
+        deck.snapshot_grid()
+    );
+
+    start_plain_from_desktop(
+        &daemon,
+        canonical_cwd,
+        &desktop_pane_id(1),
+        SECOND_PLAIN_LABEL,
+    );
+    let second_records = daemon.wait_for_agent_count(2, Duration::from_secs(10));
+    assert!(
+        common::wait_until(Duration::from_secs(10), || {
+            let grid = deck.snapshot_grid();
+            grid.contains(PLAIN_LABEL) && grid.contains(SECOND_PLAIN_LABEL)
+        }),
+        "after the first card surfaced, the same untouched TUI must also show the second \
+         desktop-started agent, but both labels never appeared together. Records: \
+         {second_records:#?}\nFinal grid:\n{}",
         deck.snapshot_grid()
     );
 }
@@ -445,6 +473,7 @@ fn visibility_003_desktop_stop_removes_plain_agent_from_attached_dashboard() {
         &control_daemon,
         canonical_string(control_cwd.path()),
         &desktop_pane_id(0),
+        PLAIN_LABEL,
     );
     control_deck.wait_for_string(PLAIN_LABEL);
     let (label_col, label_row) = control_deck.wait_for_in_grid(PLAIN_LABEL);
@@ -470,7 +499,12 @@ fn visibility_003_desktop_stop_removes_plain_agent_from_attached_dashboard() {
     let deck = launch_tui_against(&daemon);
     deck.wait_for_string("No active sessions");
     let cwd = common::harness_tempdir().expect("create desktop-selected cwd");
-    start_plain_from_desktop(&daemon, canonical_string(cwd.path()), &desktop_pane_id(0));
+    start_plain_from_desktop(
+        &daemon,
+        canonical_string(cwd.path()),
+        &desktop_pane_id(0),
+        PLAIN_LABEL,
+    );
     deck.wait_for_string(PLAIN_LABEL);
     let record = daemon
         .wait_for_agent_count(1, Duration::from_secs(10))
