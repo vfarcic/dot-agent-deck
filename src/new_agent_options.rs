@@ -210,7 +210,9 @@ pub fn compose(config: &DashboardConfig, experimental: bool) -> NewAgentOptions 
 }
 
 /// The configured default directory, if it is one a listing would accept —
-/// or `None`, never an error (see [`NewAgentOptions::default_dir`]).
+/// or `None`, never an error (see [`NewAgentOptions::default_dir`]). The TUI's
+/// directory picker calls it too, on its own `DashboardConfig`, so both clients
+/// vet the setting identically.
 ///
 /// The same three gates a caller-supplied listing path passes, in the same
 /// order: the wire-boundary predicate

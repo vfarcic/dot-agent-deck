@@ -8377,9 +8377,34 @@ fn handle_scheduled_tasks_key(key: KeyEvent, ui: &mut UiState) -> Action {
     }
 }
 
+/// PRD #1223: where a directory picker with no directory of its own opens —
+/// the deck's configured `default_dir` when it is usable, the TUI process's
+/// cwd otherwise (and `/` if even that cannot be read). The `Ctrl+n` pick and
+/// a schedule Add start here; a schedule Edit starts at its row's own
+/// `working_dir` instead. Vetted by the same
+/// [`crate::new_agent_options::usable_default_dir`] the daemon serves the
+/// desktop from, so an unset, relative, missing or unreadable value falls back
+/// silently rather than opening the picker on an error. It is only a start:
+/// `..` still walks above it.
+fn picker_start_dir(config: &DashboardConfig) -> PathBuf {
+    crate::new_agent_options::usable_default_dir(&config.default_dir)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")))
+}
+
+/// `Ctrl+n`: open the directory picker for a new pane at [`picker_start_dir`].
+fn open_new_pane_dir_picker(ui: &mut UiState) {
+    // PRD #170: mark this pick as an ordinary new-pane open (not a schedule
+    // Add/Edit) so a prior schedule intent can't leak.
+    ui.dir_picker_intent = DirPickerIntent::NewPane;
+    ui.mode = UiMode::DirPicker;
+    ui.dir_picker = Some(DirPickerState::new(picker_start_dir(&ui.config)));
+}
+
 /// PRD #170 (unify): open the directory picker for a manager Add (`existing =
 /// None`) or Edit (`existing = Some(row)`), reusing the `Ctrl+n` flow instead
-/// of a bespoke pick-agent modal. Add starts the picker at the cwd; Edit starts
+/// of a bespoke pick-agent modal. Add starts the picker at
+/// [`picker_start_dir`] (the deck's `default_dir`, else the cwd); Edit starts
 /// it at the row's `working_dir` and carries the row so the mode-locked form
 /// pre-fills the authoring seed. The picked directory then drives
 /// [`transition_after_dir_pick`] (branching on the `dir_picker_intent` set
@@ -8391,10 +8416,7 @@ fn open_schedule_dir_picker(ui: &mut UiState, existing: Option<config::Scheduled
             let start = PathBuf::from(&row.working_dir);
             (DirPickerIntent::ScheduleEdit(Box::new(row)), start)
         }
-        None => (
-            DirPickerIntent::ScheduleAdd,
-            std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")),
-        ),
+        None => (DirPickerIntent::ScheduleAdd, picker_start_dir(&ui.config)),
     };
     ui.dir_picker_intent = intent;
     ui.dir_picker = Some(DirPickerState::new(start));
@@ -9799,15 +9821,7 @@ fn dispatch_action(
     match action {
         // ===== PRD #80 global command actions (formerly inline in run_tui) =====
         // Ctrl+n: new pane (open directory picker).
-        Action::NewPane => {
-            // PRD #170: mark this pick as an ordinary new-pane open (not a
-            // schedule Add/Edit) so a prior schedule intent can't leak.
-            ui.dir_picker_intent = DirPickerIntent::NewPane;
-            ui.mode = UiMode::DirPicker;
-            ui.dir_picker = Some(DirPickerState::new(
-                std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")),
-            ));
-        }
+        Action::NewPane => open_new_pane_dir_picker(ui),
         // Ctrl+t: toggle layout.
         Action::ToggleLayout => {
             ui.pane_layout = match ui.pane_layout {
@@ -28561,6 +28575,134 @@ mod tests {
         assert_eq!(picker.current_dir, root);
         assert!(picker.filter_text.is_empty());
         assert!(!picker.filtering);
+    }
+
+    fn ui_with_default_dir(default_dir: &str) -> UiState {
+        UiState::new(
+            DashboardConfig {
+                default_dir: default_dir.to_string(),
+                ..DashboardConfig::default()
+            },
+            KeybindingConfig::default(),
+        )
+    }
+
+    /// Scenario (PRD #1223): with `default_dir` set to a real directory,
+    /// Ctrl+n opens the picker there (canonicalised) rather than in the TUI's
+    /// cwd, and `..` still walks above it.
+    #[test]
+    fn dir_picker_new_pane_opens_at_default_dir() {
+        let root = tempfile::tempdir().unwrap();
+        let reports = root.path().join("reports");
+        std::fs::create_dir(&reports).unwrap();
+        let canonical = reports.canonicalize().unwrap();
+        let mut ui = ui_with_default_dir(reports.to_str().unwrap());
+
+        open_new_pane_dir_picker(&mut ui);
+
+        assert_eq!(ui.mode, UiMode::DirPicker);
+        assert!(matches!(ui.dir_picker_intent, DirPickerIntent::NewPane));
+        let picker = ui.dir_picker.as_mut().unwrap();
+        assert_eq!(picker.current_dir, canonical);
+        picker.go_up();
+        assert_eq!(picker.current_dir, canonical.parent().unwrap());
+    }
+
+    /// Scenario (PRD #1223): an unset, relative, missing, non-directory or
+    /// unreadable `default_dir` never stops Ctrl+n — the picker opens in the
+    /// TUI process's cwd exactly as before the key existed.
+    #[test]
+    fn dir_picker_new_pane_falls_back_to_cwd_for_an_unusable_default_dir() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("a-file");
+        std::fs::write(&file, "x").unwrap();
+        let missing = root.path().join("missing");
+        let cwd = std::env::current_dir().unwrap();
+        for raw in [
+            "",
+            "relative/reports",
+            missing.to_str().unwrap(),
+            file.to_str().unwrap(),
+        ] {
+            let mut ui = ui_with_default_dir(raw);
+            open_new_pane_dir_picker(&mut ui);
+            assert_eq!(ui.mode, UiMode::DirPicker, "{raw:?}");
+            assert_eq!(ui.dir_picker.as_ref().unwrap().current_dir, cwd, "{raw:?}");
+        }
+    }
+
+    /// Scenario (PRD #1223): a `default_dir` the TUI user cannot open falls
+    /// back to the cwd rather than opening the picker on a failed listing.
+    #[cfg(unix)]
+    #[test]
+    fn dir_picker_new_pane_falls_back_to_cwd_for_an_unreadable_default_dir() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let locked = root.path().join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // Root can open anything, so the property is only observable as a
+        // user the mode actually binds.
+        let binds = std::fs::read_dir(&locked).is_err();
+        let mut ui = ui_with_default_dir(locked.to_str().unwrap());
+        open_new_pane_dir_picker(&mut ui);
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        if binds {
+            assert_eq!(
+                ui.dir_picker.as_ref().unwrap().current_dir,
+                std::env::current_dir().unwrap()
+            );
+        }
+    }
+
+    /// Scenario (PRD #1223): a schedule Add from the manager opens the picker
+    /// at `default_dir` like Ctrl+n, while a schedule Edit still opens at the
+    /// row's own `working_dir` — the directory that schedule already runs in.
+    #[test]
+    fn dir_picker_schedule_add_uses_default_dir_and_edit_keeps_its_row_dir() {
+        let root = tempfile::tempdir().unwrap();
+        let reports = root.path().join("reports");
+        let row_dir = root.path().join("row");
+        std::fs::create_dir(&reports).unwrap();
+        std::fs::create_dir(&row_dir).unwrap();
+        let mut ui = ui_with_default_dir(reports.to_str().unwrap());
+
+        open_schedule_dir_picker(&mut ui, None);
+        assert!(matches!(ui.dir_picker_intent, DirPickerIntent::ScheduleAdd));
+        assert_eq!(
+            ui.dir_picker.as_ref().unwrap().current_dir,
+            reports.canonicalize().unwrap()
+        );
+
+        let row = config::ScheduledTask {
+            name: "nightly".to_string(),
+            cron: "0 9 * * *".to_string(),
+            working_dir: row_dir.to_str().unwrap().to_string(),
+            command: Some("cat".to_string()),
+            prompt: "p".to_string(),
+            new_tab_per_fire: false,
+            enabled: true,
+            shape: None,
+            issue_dispatch: None,
+        };
+        open_schedule_dir_picker(&mut ui, Some(row));
+        assert!(matches!(
+            ui.dir_picker_intent,
+            DirPickerIntent::ScheduleEdit(_)
+        ));
+        assert_eq!(ui.dir_picker.as_ref().unwrap().current_dir, row_dir);
+    }
+
+    /// Scenario (PRD #1223): with no `default_dir`, a schedule Add opens the
+    /// picker in the TUI's cwd, unchanged.
+    #[test]
+    fn dir_picker_schedule_add_falls_back_to_cwd_without_default_dir() {
+        let mut ui = ui_with_default_dir("");
+        open_schedule_dir_picker(&mut ui, None);
+        assert_eq!(
+            ui.dir_picker.as_ref().unwrap().current_dir,
+            std::env::current_dir().unwrap()
+        );
     }
 
     #[test]

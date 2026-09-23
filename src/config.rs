@@ -114,14 +114,18 @@ impl BellConfig {
 #[serde(default)]
 pub struct DashboardConfig {
     pub default_command: String,
-    /// PRD #1223: the directory a new-agent form's browser opens in on this
-    /// deck — typically the one folder most agents here are started under.
+    /// PRD #1223: a deck-level setting — the directory that creating an agent
+    /// on this deck starts browsing in, typically the one folder most agents
+    /// here are started under.
     ///
-    /// Stored verbatim; empty means unset. What a client is TOLD is
-    /// [`crate::new_agent_options::NewAgentOptions::default_dir`], which is
-    /// this value validated (absolute, the orchestration-cwd predicate) and
-    /// canonicalised — or absent when it fails, so a bad setting never breaks
-    /// the options query. Not serialised when empty, so a `config set` of an
+    /// Stored verbatim; empty means unset. Every reader goes through
+    /// [`crate::new_agent_options::usable_default_dir`] — validated (absolute,
+    /// the orchestration-cwd predicate), canonicalised and opened, or `None`.
+    /// The desktop is TOLD it as
+    /// [`crate::new_agent_options::NewAgentOptions::default_dir`], absent when
+    /// it fails, so a bad setting never breaks the options query; the TUI,
+    /// which runs on this host, reads it from its own copy of this struct for
+    /// its directory picker and falls back to its cwd. Not serialised when empty, so a `config set` of an
     /// unrelated key does not write `default_dir = ""` into the file.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub default_dir: String,

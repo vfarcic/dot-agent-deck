@@ -262,7 +262,7 @@ The Out-of-Scope bullet read "Changing the TUI's picker or form", which was mean
 
 The bullet is corrected above, and the principle is recorded rather than left implicit: **a fact the deck owns belongs to every client that can use it, and the TUI and the desktop should have parity wherever parity makes sense.** A difference between them needs a reason rooted in what actually differs — the desktop may be on another machine, the TUI never is — not in which client happened to be built first.
 
-Fixed here: the TUI's Ctrl+n picker now honours `default_dir` with the same vetting the daemon applies, falling back to its current directory exactly as before. Doing it in this PR rather than a follow-up is the cheap moment: the key is new, so nobody has it set, and no existing behaviour changes.
+Fixed here: the TUI's Ctrl+n picker now honours `default_dir` with the same vetting the daemon applies (`usable_default_dir`, called directly — the TUI shares the crate), falling back to its current directory exactly as before. The Scheduled Tasks manager's Add opens the same picker and honours it too; its Edit keeps starting at the row's own `working_dir`, the directory that schedule already runs in. Doing it in this PR rather than a follow-up is the cheap moment: the key is new, so nobody has it set, and no existing behaviour changes.
 
 Asymmetries deliberately left, each with its reason: voice exists only on the desktop (the TUI has no voice surface); the desktop's per-deck last command is in memory while the TUI's `last_command` persists (the desktop's settings file forbids free text — see the entry above); and the TUI reads its own filesystem rather than the listing verb, which is the corrected bullet's real content.
 

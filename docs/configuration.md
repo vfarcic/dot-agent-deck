@@ -22,14 +22,14 @@ When `default_command` is **unset or empty**, the new-pane form's Command field 
 ## Default Directory
 
 ```bash
-# The directory the desktop app's New agent browser opens in on this deck
+# The directory agent creation starts browsing in on this deck
 dot-agent-deck config set default_dir "/home/me/reports"
 
-# Unset it (the browser opens in your home directory again)
+# Unset it (browsing starts where it did before)
 dot-agent-deck config set default_dir ""
 ```
 
-`default_dir` is where the desktop app's **New agent** dialog starts browsing when you create an agent on this deck — useful when most of your agents here are started in the same place. It is a starting point, not a limit: `..` still walks above it. It must be an absolute path; `config set` refuses anything else. Because it is read on the deck's own host, a remote deck uses the value in *its* config file, not yours. If the directory is missing, is not a directory, or cannot be opened, the dialog simply opens in your home directory as before. The TUI's directory picker does not read it yet.
+`default_dir` is a setting of the deck: the directory that creating an agent on this deck starts browsing in — useful when most of your agents here are started in the same place. Both clients honour it. The TUI's `Ctrl+n` directory picker, and its **Add** in the Scheduled Tasks manager, open there; so does the desktop app's **New agent** dialog. Editing a scheduled task still opens at that task's own directory. It is a starting point, not a limit: `..` still walks above it. It must be an absolute path; `config set` refuses anything else. It lives in the deck's own config file, beside `default_command`, so a remote deck uses the value in *its* config file, not yours — the TUI runs on the deck's host even when you `connect` to it, and the desktop asks the deck for it. If the value is unset, or the directory is missing, is not a directory, or cannot be opened, nothing fails: the TUI's picker opens in the directory you launched the TUI from, and the desktop's dialog in your home directory on that deck, as they do without the setting.
 
 ## Environment Variables
 
