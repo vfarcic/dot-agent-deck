@@ -692,13 +692,17 @@ fn parse_signal_ack(line: &str) -> Option<dot_agent_deck::event::SignalAck> {
 /// The four outcomes, and why only one of them is a failure the caller did not
 /// already have:
 ///
-/// * [`SocketReply::Unreachable`] — never sent. Exactly what a `None` from
-///   `send_to_socket` meant, reported the same way.
-/// * [`SocketReply::NoReply`] — a daemon that does not write an ack, i.e. one
-///   predating issue #1129. **Success**, for the reason `delegate`'s own
-///   `NoReply` arm is: the verb was fire-and-forget before the daemon answered
-///   it, so a daemon that does not answer must not become a phantom failure on
-///   every mixed-version pair.
+/// * [`SocketReply::Unreachable`] — never sent, and since issue #434 that is
+///   established by the byte count rather than assumed. Exactly what a `None`
+///   from `send_to_socket` meant, reported the same way.
+/// * [`SocketReply::NoReply`] — usually a daemon that does not write an ack,
+///   i.e. one predating issue #1129; since issue #434 also a request write
+///   that broke with bytes already gone. **Success** in both cases, for the
+///   reason `delegate`'s own `NoReply` arm is: the verb was fire-and-forget
+///   before the daemon answered it, so a daemon that does not answer must not
+///   become a phantom failure on every mixed-version pair — and a broken write
+///   may still have handed the daemon a complete line, so reporting a failure
+///   the sender would then retry is the one outcome that can double-send it.
 /// * a line that is not a recognisable ack — treated as `NoReply`, per
 ///   [`parse_signal_ack`].
 /// * an ack with `accepted: false` — the one new failure. The daemon refused
@@ -1005,9 +1009,21 @@ fn main() -> ExitCode {
                 }
                 // Handed to the socket of a daemon that answered nothing
                 // readable in `DELEGATE_REPLY_TIMEOUT` — usually one predating
-                // this response. Pre-response contract: unverifiable, and the
-                // caller must not turn that into a phantom failure. See
-                // `SocketReply::NoReply`.
+                // this response — or, since issue #434, a request write that
+                // broke with bytes already gone. Pre-response contract:
+                // unverifiable, and the caller must not turn that into a
+                // phantom failure. See `SocketReply::NoReply`.
+                //
+                // Deliberately silent as well as successful, and the broken
+                // write is why that is worth stating rather than inheriting.
+                // The orchestrator reading this is an agent: a stderr line
+                // saying the delegate might not have landed is an invitation
+                // to send it again, and the daemon may already be holding a
+                // complete line (`read_capped_line` treats a trailing
+                // unterminated line as a line), so the retry is what
+                // double-dispatches the worker. Exit 0 with no output is the
+                // "do not resend" signal; the record of the broken write is
+                // the `warn!` `request_from_socket_at_detailed` logs.
                 SocketReply::NoReply => return ExitCode::SUCCESS,
                 SocketReply::Line(line) => line,
             };
@@ -1409,17 +1425,21 @@ fn main() -> ExitCode {
                     }
                     // Unlike `delegate`'s fire-and-forget `NoReply`, `pane
                     // restart` must not read a silent close as success — but
-                    // `NoReply` folds several distinct `ReplyReadError`
-                    // causes (see its doc comment above), only one of which
-                    // is "old daemon"; a `DeadlineExpired` here means the
-                    // restart may well have already succeeded, so the
-                    // message below stays cause-agnostic rather than
-                    // asserting "old daemon" and telling the agent to
-                    // restart the whole daemon, which would be the worst
-                    // possible advice in that case (PR #918 review).
+                    // `NoReply` folds several distinct `NoReplyCause`s (see
+                    // its doc comment above), only one of which is "old
+                    // daemon"; a `DeadlineExpired` here means the restart may
+                    // well have already succeeded, so the message below stays
+                    // cause-agnostic rather than asserting "old daemon" and
+                    // telling the agent to restart the whole daemon, which
+                    // would be the worst possible advice in that case (PR
+                    // #918 review). Issue #434 added a cause the wording had
+                    // to lose two words for: a write that broke with bytes
+                    // already gone did not fail "in time", and the daemon may
+                    // still act on what it holds — which is the same "check
+                    // before retrying" this arm already advises.
                     SocketReply::NoReply => {
                         eprintln!(
-                            "Error: the daemon did not answer `pane restart {role}` in time — \
+                            "Error: the daemon did not answer `pane restart {role}` — \
                              either it does not support this command (an older build; restart \
                              the daemon to pick up the new one) or the restart is still in \
                              flight and may have already succeeded. Check the pane before \
@@ -1492,15 +1512,17 @@ fn main() -> ExitCode {
                     }
                     // Unlike `delegate`'s fire-and-forget `NoReply`, `pane
                     // spawn` must not read a silent close as success — but
-                    // `NoReply` folds several distinct `ReplyReadError`
-                    // causes (see its doc comment above), only one of which
-                    // is "old daemon"; a `DeadlineExpired` here means the
-                    // spawn may still be in flight, so the message below
-                    // stays cause-agnostic rather than asserting "old
-                    // daemon" (PR #918 review).
+                    // `NoReply` folds several distinct `NoReplyCause`s (see
+                    // its doc comment above), only one of which is "old
+                    // daemon"; a `DeadlineExpired` here means the spawn may
+                    // still be in flight, so the message below stays
+                    // cause-agnostic rather than asserting "old daemon" (PR
+                    // #918 review). Issue #434's broken write is a third
+                    // cause, and "in time" was wrong for it — see the same
+                    // arm behind `pane restart`.
                     SocketReply::NoReply => {
                         eprintln!(
-                            "Error: the daemon did not answer `pane spawn {role}` in time — \
+                            "Error: the daemon did not answer `pane spawn {role}` — \
                              either it does not support this command (an older build; restart \
                              the daemon to pick up the new one) or the spawn is still in \
                              flight. Check the pane before retrying."

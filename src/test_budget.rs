@@ -32,14 +32,11 @@ use std::time::Duration;
 const MAX_LOAD_FACTOR: f64 = 6.0;
 
 /// The 1-minute load average per CPU, or `None` where this platform does not
-/// publish one cheaply. Linux only, exactly as the harness's twin — and for the
-/// same reason: an unmeasurable load must widen nothing.
+/// publish one cheaply. Linux (`/proc/loadavg`) and macOS (`getloadavg(3)`),
+/// exactly as the harness's twin, which records why macOS joined; elsewhere
+/// `None`, because an unmeasurable load must widen nothing.
 fn machine_load_per_cpu() -> Option<f64> {
-    if !cfg!(target_os = "linux") {
-        return None;
-    }
-    let raw = std::fs::read_to_string("/proc/loadavg").ok()?;
-    let one_minute: f64 = raw.split_whitespace().next()?.parse().ok()?;
+    let one_minute = one_minute_load_average()?;
     let cpus = std::thread::available_parallelism().ok()?.get() as f64;
     if !one_minute.is_finite() || cpus <= 0.0 {
         return None;
@@ -47,8 +44,29 @@ fn machine_load_per_cpu() -> Option<f64> {
     Some(one_minute / cpus)
 }
 
+#[cfg(target_os = "linux")]
+fn one_minute_load_average() -> Option<f64> {
+    let raw = std::fs::read_to_string("/proc/loadavg").ok()?;
+    raw.split_whitespace().next()?.parse().ok()
+}
+
+#[cfg(target_os = "macos")]
+fn one_minute_load_average() -> Option<f64> {
+    let mut sample = [0.0_f64; 1];
+    // SAFETY: `getloadavg` writes at most `nelem` (1) doubles into a buffer we
+    // own and have sized to 1, and returns how many it wrote, or -1 on failure.
+    let written = unsafe { libc::getloadavg(sample.as_mut_ptr(), 1) };
+    (written == 1).then_some(sample[0])
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn one_minute_load_average() -> Option<f64> {
+    None
+}
+
 /// The multiplier [`load_scaled`] applies, split out so the unmeasurable branch
-/// is testable on Linux — where [`machine_load_per_cpu`] never returns `None`.
+/// is testable on Linux and macOS — where [`machine_load_per_cpu`] does not
+/// return `None` in practice.
 ///
 /// **An unmeasurable load yields 1.0, not [`MAX_LOAD_FACTOR`].** `None` is the
 /// absence of a measurement, not evidence of contention, and the harness's twin
@@ -102,6 +120,20 @@ mod tests {
             load_factor(Some(99.0)),
             MAX_LOAD_FACTOR,
             "clamped, not unbounded"
+        );
+    }
+
+    /// Issue #1244: macOS used to return `None` here, leaving every lib-side
+    /// ceiling unscaled on `build-macos`. macOS only, because a Linux box with
+    /// no readable `/proc/loadavg` returning `None` is correct — see the
+    /// harness twin's test.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_load_is_measurable_on_macos() {
+        let load = machine_load_per_cpu();
+        assert!(
+            load.is_some_and(|l| l.is_finite() && l >= 0.0),
+            "machine_load_per_cpu() must measure the load here, got {load:?}"
         );
     }
 

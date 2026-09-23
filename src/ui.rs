@@ -7295,54 +7295,127 @@ pub fn card_stats_border_label(usable_width: u16, last: &str, tools: usize) -> O
     .find(|form| form.width() <= usable_width as usize)
 }
 
-/// Truncate a sequence of styled title segments to `max_chars` total characters,
-/// appending a single `…` (in the last surviving segment's style) when they
-/// don't all fit, while preserving each segment's style — letting the coloured
-/// agent-type badge (PRD #20 M5) keep its registry colour even on a narrow card.
+/// Truncate a sequence of styled title segments so their rendered width —
+/// including the trailing `…` when one is added — is at most `max_width`
+/// **terminal columns**, while preserving each segment's style, so the coloured
+/// agent-type badge (PRD #20 M5) keeps its registry colour even on a narrow
+/// card. The `…` carries the style of the last segment that contributed a
+/// glyph.
 ///
-/// For single-width text this produces the same character sequence as
-/// [`truncate_with_ellipsis`] on the concatenated input, so text-only snapshots
-/// of the title match the plain truncator. The two diverge on wide or zero-width
-/// characters: this one still budgets `char`s, whereas `truncate_with_ellipsis`
-/// budgets display columns. Titles are the pre-existing char-counted surface and
-/// PRD #339 did not touch them; converting them is a separate change.
+/// Issue #357: the caller's budget is a slice of the card's rectangle
+/// (`area.width` less the status badge and the two borders), so it is measured
+/// in cells. This counted `char`s instead, which under-counts wide characters —
+/// a six-scalar CJK display name is twelve columns, so an eight-cell budget
+/// accepted it unchanged, and the status badge, which a `Block` draws after the
+/// left-hand title, was drawn over its tail with no `…` — and over-counts
+/// zero-width ones, so a combining sequence that would have fitted was
+/// truncated. That is the same defect PRD #339 fixed for the card's `Dir:` /
+/// `Prmt:` lines in [`truncate_with_ellipsis`] and deliberately left standing
+/// here.
+///
+/// The unit is the **grapheme cluster as ratatui draws it**, not the `char`.
+/// Each segment is split with `Span::styled_graphemes` — the same segmentation
+/// the renderer applies to that span, which also drops every cluster holding a
+/// control character — and each cluster is sized with ratatui's own
+/// [`CellWidth`](ratatui::buffer::CellWidth), the rule `Span::render` advances
+/// the cursor by. Summing `UnicodeWidthChar` per `char`, as
+/// [`truncate_with_ellipsis`] does, is not a safe substitute here, because it
+/// measures some clusters NARROWER than they draw: `❤️` (U+2764 + VS16) and a
+/// keycap `1️⃣` are one column per `char` and two on screen, and a halfwidth
+/// `ｶﾞ` is one against two. A title made of those passed the fit check and was
+/// drawn over by the badge — the #357 symptom again, on input the char count
+/// had handled correctly. Cutting on clusters also means a ZWJ sequence or a
+/// letter with its combining marks is kept or dropped whole, never split.
+///
+/// The output holds only the clusters the renderer will draw, so a control
+/// character never reaches it even on the fits-as-is path. That matters for the
+/// budget and not only for the screen: `Span::width`, which `Line::width` sums
+/// to size the area a `Block` renders the left-hand title into, counts a `\n`
+/// as a column although no cell ever shows it, so a kept control would widen
+/// the title past the budget it fitted by drawn width. For text with no control
+/// character the clusters concatenate back to the input byte for byte, and a
+/// cluster that is one single-column `char` is measured exactly as the char
+/// count measured it, so titles built from such characters — ASCII plus the
+/// deck's own `▸` and `·`, which is every card snapshot committed before this
+/// change — are unchanged.
+///
+/// The `…` column is reserved **only** when the input actually overflows, so a
+/// title that exactly fills the budget is returned whole. The width accumulator
+/// carries ACROSS segment boundaries while each surviving piece keeps its own
+/// style; a segment whose next cluster is too wide for the remaining budget
+/// contributes no span at all rather than an empty one; and once the budget is
+/// exactly exhausted this stops at the segment boundary, so a zero-width cluster
+/// opening a LATER segment is dropped rather than opening a fresh styled span
+/// holding a combining mark with no base character in it.
 fn truncate_styled_segments(
     segments: Vec<(String, Style)>,
-    max_chars: usize,
+    max_width: usize,
 ) -> Vec<Span<'static>> {
-    if max_chars == 0 {
+    if max_width == 0 {
         return Vec::new();
     }
-    let total: usize = segments.iter().map(|(t, _)| t.chars().count()).sum();
-    if total <= max_chars {
-        return segments
-            .into_iter()
-            .map(|(t, s)| Span::styled(t, s))
+    // Borrowed views, so the clusters below are slices of the input.
+    let views: Vec<Span<'_>> = segments
+        .iter()
+        .map(|(text, style)| Span::styled(text.as_str(), *style))
+        .collect();
+    let total: usize = views
+        .iter()
+        .flat_map(|view| drawn_clusters(view))
+        .map(|(_, w)| w)
+        .sum();
+    if total <= max_width {
+        return views
+            .iter()
+            .map(|view| {
+                let text: String = drawn_clusters(view).map(|(g, _)| g).collect();
+                Span::styled(text, view.style)
+            })
             .collect();
     }
-    // Overflow: keep the first (max_chars - 1) chars, then a trailing ellipsis.
-    let keep = max_chars - 1;
+    // Overflow confirmed, so one column now belongs to the `…`.
+    let budget = max_width - 1;
     let mut out: Vec<Span<'static>> = Vec::new();
     let mut used = 0usize;
     let mut last_style = text_primary();
-    for (text, style) in segments {
-        if used >= keep {
+    for view in &views {
+        if used >= budget {
             break;
         }
-        let remaining = keep - used;
-        let cnt = text.chars().count();
-        last_style = style;
-        if cnt <= remaining {
-            used += cnt;
-            out.push(Span::styled(text, style));
-        } else {
-            let piece: String = text.chars().take(remaining).collect();
-            out.push(Span::styled(piece, style));
+        // Fill from this segment until the next cluster would overflow. The
+        // accumulator is shared across segments; the style is not.
+        let mut piece = String::new();
+        let mut took_whole_segment = true;
+        for (cluster, w) in drawn_clusters(view) {
+            if used + w > budget {
+                took_whole_segment = false;
+                break;
+            }
+            piece.push_str(cluster);
+            used += w;
+        }
+        if !piece.is_empty() {
+            // Only a segment that actually put a glyph on screen may colour the
+            // `…`; a wide cluster rejected at the boundary contributes nothing.
+            last_style = view.style;
+            out.push(Span::styled(piece, view.style));
+        }
+        if !took_whole_segment {
             break;
         }
     }
     out.push(Span::styled("…".to_string(), last_style));
     out
+}
+
+/// The grapheme clusters ratatui draws for `span`, each with the cells it
+/// occupies — `Span::styled_graphemes` for the segmentation and the
+/// control-character filter, and `CellWidth` for the width, which are the two
+/// halves of what `Span::render` does with the same span.
+fn drawn_clusters<'a>(span: &'a Span<'a>) -> impl Iterator<Item = (&'a str, usize)> + 'a {
+    use ratatui::buffer::CellWidth;
+    span.styled_graphemes(Style::default())
+        .map(|g| (g.symbol, usize::from(g.symbol.cell_width())))
 }
 
 /// PRD #20 M4: the feedback shown when a user tries to enter (type into) a
@@ -20672,8 +20745,15 @@ fn render_session_card(
 
     let dot = flash_dot(&session.status, tick);
     let status_text = format!(" {} {} ", dot, status_label);
-    // area.width includes left+right borders (2 chars)
-    let max_title = (area.width as usize).saturating_sub(status_text.chars().count() + 2);
+    // What is left of the card's width once the right-hand status badge and the
+    // two border cells are paid for. Issue #357: this is a COLUMN budget — both
+    // terms it subtracts are cells on the same row — and `truncate_styled_segments`
+    // now spends it as one. The badge is measured with `UnicodeWidthStr` for that
+    // reason rather than by `char`; the two agree on every badge this renders
+    // today (ASCII labels, and `flash_dot`'s `●` is ambiguous-width, so one
+    // column), so the budget is unchanged and no card snapshot moves.
+    let max_title = (area.width as usize)
+        .saturating_sub(unicode_width::UnicodeWidthStr::width(status_text.as_str()) + 2);
     let title_spans = truncate_styled_segments(title_segments, max_title);
 
     // Issue #442. An UNSELECTED card's border colour is its STATUS, so an idle
@@ -40944,6 +41024,311 @@ mod tests {
             !text.replace('\n', "").contains(char::is_control),
             "no control character from a warning body may reach the terminal: {text:?}"
         );
+    }
+
+    /// The rendered text of a truncated title — the spans concatenated, which
+    /// is what the row of cells ends up holding.
+    fn title_text(spans: &[Span<'static>]) -> String {
+        spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    /// Columns a run of title spans occupies when ratatui renders it: the larger
+    /// of the two measures a `Block` title goes through. `Line::width` sizes the
+    /// area the left-hand title is rendered into, and so decides whether the
+    /// right-hand status badge, drawn after it, lands on top of the title's tail;
+    /// `Buffer::set_line` reports the cells actually filled, one grapheme cluster
+    /// at a time. Both are read off the renderer rather than restated, because
+    /// the previous oracle here summed `UnicodeWidthChar` per `char` — the very
+    /// rule under test — and so could not see a cluster such as `❤️` (U+2764 +
+    /// VS16), which that rule measures at one column and ratatui draws in two.
+    fn rendered_columns(spans: &[Span<'static>]) -> usize {
+        let line = Line::from(spans.to_vec());
+        let mut buf = Buffer::empty(Rect::new(0, 0, 400, 1));
+        let (end_x, _) = buf.set_line(0, 0, &line, 400);
+        line.width().max(usize::from(end_x))
+    }
+
+    /// [`rendered_columns`] of one unstyled string.
+    fn rendered_str_columns(s: &str) -> usize {
+        rendered_columns(&[Span::raw(s.to_string())])
+    }
+
+    /// [`rendered_columns`] of the segments as the caller hands them over,
+    /// before any truncation.
+    fn rendered_segment_columns(segments: &[(String, Style)]) -> usize {
+        let spans: Vec<Span<'static>> = segments
+            .iter()
+            .map(|(t, s)| Span::styled(t.clone(), *s))
+            .collect();
+        rendered_columns(&spans)
+    }
+
+    /// Issue #357: a CJK display name is half as many scalars as it is columns,
+    /// so the char-counting truncator accepted it whole and ratatui bare-clipped
+    /// it at the card's right edge with no `…`. The title must now be cut to the
+    /// COLUMN budget, and each surviving piece must keep the style of the
+    /// segment it came from — the agent-type badge is a separate segment purely
+    /// so it can keep its registry colour.
+    #[test]
+    fn truncate_styled_segments_budgets_a_cjk_title_in_columns() {
+        let shortcut = Style::default().fg(Color::White);
+        let badge = Style::default().fg(Color::Magenta);
+        let name = Style::default().fg(Color::Gray);
+        let segments = vec![
+            (" 1 ".to_string(), shortcut),
+            ("Claude".to_string(), badge),
+            (" · 项目目录管理 ".to_string(), name),
+        ];
+
+        // 3 + 6 + 16 = 25 columns, but only 19 scalars — which is why a 21-cell
+        // budget used to accept the whole thing and overflow the card by four.
+        assert_eq!(rendered_segment_columns(&segments), 25);
+        assert_eq!(
+            segments
+                .iter()
+                .map(|(t, _)| t.chars().count())
+                .sum::<usize>(),
+            19
+        );
+
+        let spans = truncate_styled_segments(segments, 21);
+        assert_eq!(title_text(&spans), " 1 Claude · 项目目录…");
+        assert_eq!(rendered_columns(&spans), 21);
+
+        // Styles stay attached to the segment each piece came from, and the `…`
+        // inherits the last one that actually put a character on screen.
+        let styled: Vec<(&str, Style)> = spans
+            .iter()
+            .map(|s| (s.content.as_ref(), s.style))
+            .collect();
+        assert_eq!(
+            styled,
+            vec![
+                (" 1 ", shortcut),
+                ("Claude", badge),
+                (" · 项目目录", name),
+                ("…", name),
+            ]
+        );
+    }
+
+    /// Issue #357: an emoji is one scalar and two columns, the same
+    /// under-count as CJK on a surface a display name reaches routinely.
+    #[test]
+    fn truncate_styled_segments_budgets_an_emoji_title_in_columns() {
+        let badge = Style::default().fg(Color::Magenta);
+        let name = Style::default().fg(Color::Gray);
+        let segments = vec![(" 1 ".to_string(), badge), ("😀😀😀".to_string(), name)];
+
+        // Six scalars against nine columns: a six-cell budget used to return
+        // this whole and let the terminal clip three columns off the end.
+        assert_eq!(
+            segments
+                .iter()
+                .map(|(t, _)| t.chars().count())
+                .sum::<usize>(),
+            6
+        );
+
+        let spans = truncate_styled_segments(segments, 6);
+        assert_eq!(title_text(&spans), " 1 😀…");
+        assert_eq!(rendered_columns(&spans), 6);
+    }
+
+    /// Issue #357, the other direction: a base character plus a combining mark
+    /// is two scalars and one column, so a char budget truncated a title that
+    /// fitted. Four accented letters are eight scalars but four columns, and a
+    /// seven-column title must now be returned untouched — no `…`, and both
+    /// segments intact.
+    #[test]
+    fn truncate_styled_segments_keeps_a_combining_sequence_that_fits_by_width() {
+        let badge = Style::default().fg(Color::Magenta);
+        let name = Style::default().fg(Color::Gray);
+        // `e` + U+0301 COMBINING ACUTE ACCENT, four times.
+        let accented = "e\u{301}e\u{301}e\u{301}e\u{301}".to_string();
+        assert_eq!(accented.chars().count(), 8);
+        assert_eq!(rendered_str_columns(&accented), 4);
+
+        let segments = vec![(" 1 ".to_string(), badge), (accented.clone(), name)];
+        let spans = truncate_styled_segments(segments, 7);
+
+        assert_eq!(title_text(&spans), format!(" 1 {accented}"));
+        assert_eq!(spans.len(), 2, "no ellipsis segment is appended: {spans:?}");
+        assert_eq!(spans[1].style, name);
+
+        // A zero-width cluster OPENING a later segment is dropped once the
+        // budget is exactly exhausted, rather than opening a styled span that
+        // holds a combining mark with no base character. A mark that follows a
+        // letter belongs to that letter's cluster, so `b\u{301}` is kept or cut
+        // as one glyph.
+        let split = vec![
+            ("ab\u{301}".to_string(), badge),
+            ("\u{301}cd".to_string(), name),
+        ];
+        let spans = truncate_styled_segments(split, 3);
+        assert_eq!(title_text(&spans), "ab\u{301}…");
+    }
+
+    /// Issue #357: when the budget runs out PART WAY through a double-width
+    /// glyph there is no half-column to put it in, so the glyph is dropped and
+    /// the result comes in one column under budget. Dropping it must not leave
+    /// an empty span behind, and the `…` must take the style of the last
+    /// segment that did contribute — not of the one whose glyph was refused.
+    #[test]
+    fn truncate_styled_segments_drops_a_glyph_that_straddles_the_budget() {
+        let ascii = Style::default().fg(Color::White);
+        let wide = Style::default().fg(Color::Magenta);
+        let segments = || vec![("ab".to_string(), ascii), ("項目".to_string(), wide)];
+
+        // A budget the wide glyph lands evenly inside: `項` fits, `目` does not.
+        let even = truncate_styled_segments(segments(), 5);
+        assert_eq!(title_text(&even), "ab項…");
+        assert_eq!(rendered_columns(&even), 5);
+        assert_eq!(even.last().expect("an ellipsis span").style, wide);
+
+        // One column tighter, and `項` no longer fits at all.
+        let straddled = truncate_styled_segments(segments(), 4);
+        assert_eq!(title_text(&straddled), "ab…");
+        assert_eq!(
+            rendered_columns(&straddled),
+            3,
+            "a straddling glyph is dropped, never half-drawn or overrun"
+        );
+        assert_eq!(
+            straddled
+                .iter()
+                .map(|s| (s.content.as_ref(), s.style))
+                .collect::<Vec<_>>(),
+            vec![("ab", ascii), ("…", ascii)],
+            "the refused segment contributes no span, and does not colour the `…`"
+        );
+    }
+
+    /// Pure-ASCII behaviour is unchanged by issue #357 — every column is one
+    /// scalar, so the column rule and the old char rule agree character for
+    /// character. This is what keeps the committed card snapshots from churning.
+    #[test]
+    fn truncate_styled_segments_is_unchanged_for_ascii() {
+        let a = Style::default().fg(Color::White);
+        let b = Style::default().fg(Color::Magenta);
+        let segments = || vec![(" 1 ".to_string(), a), ("Claude · worker".to_string(), b)];
+
+        // Exactly filling the budget is not truncation: no column is spent on an
+        // `…` unless the input genuinely overflows.
+        let exact = truncate_styled_segments(segments(), 18);
+        assert_eq!(title_text(&exact), " 1 Claude · worker");
+        assert_eq!(exact.len(), 2);
+
+        // One column short, and the last column becomes the `…`.
+        let over = truncate_styled_segments(segments(), 17);
+        assert_eq!(title_text(&over), " 1 Claude · work…");
+        assert_eq!(rendered_columns(&over), 17);
+
+        // A budget with room for nothing but the marker still marks the cut.
+        let marker_only = truncate_styled_segments(segments(), 1);
+        assert_eq!(title_text(&marker_only), "…");
+
+        // Zero columns render nothing at all — even an `…` would overflow.
+        assert!(truncate_styled_segments(segments(), 0).is_empty());
+    }
+
+    /// The property the card actually depends on, swept rather than sampled:
+    /// whatever the budget, the title never occupies more columns than it — the
+    /// `…` included — as measured by the renderer itself. An overrun is what the
+    /// status badge is drawn over, which is the visible half of issue #357. The
+    /// bodies deliberately include the clusters a per-`char` width sum gets
+    /// wrong in the dangerous direction (VS16 emoji, keycaps, halfwidth
+    /// dakuten), a ZWJ sequence, a flag, and control characters, which ratatui
+    /// never draws but `Span::width` — and so `Line::width` — still counts.
+    #[test]
+    fn truncate_styled_segments_never_exceeds_its_column_budget() {
+        let a = Style::default().fg(Color::White);
+        let b = Style::default().fg(Color::Magenta);
+        let c = Style::default().fg(Color::Gray);
+        for body in [
+            "worker-01",
+            "项目目录管理",
+            "😀 build 😀",
+            "e\u{301}e\u{301}e\u{301}e\u{301}",
+            "mixed 项目 😀 e\u{301}",
+            "❤\u{fe0f} ok ❤\u{fe0f}❤\u{fe0f}",
+            "1\u{fe0f}\u{20e3}2\u{fe0f}\u{20e3}3\u{fe0f}\u{20e3}",
+            "ｶﾞｷﾞｸﾞｹﾞ",
+            "👨\u{200d}👩\u{200d}👧 fam 👨\u{200d}👩\u{200d}👧",
+            "🇯🇵🇺🇸🇩🇪",
+            "id\nwith\tctl\r\nx",
+        ] {
+            for max_width in 0..=30usize {
+                let segments = vec![
+                    (" 12 ".to_string(), a),
+                    ("OpenCode".to_string(), b),
+                    (format!(" · {body} "), c),
+                ];
+                let spans = truncate_styled_segments(segments, max_width);
+                assert!(
+                    rendered_columns(&spans) <= max_width,
+                    "`{body}` at budget {max_width} rendered {} columns: {:?}",
+                    rendered_columns(&spans),
+                    title_text(&spans)
+                );
+            }
+        }
+    }
+
+    /// Issue #357, the half the per-`char` conversion got wrong. `❤️` is U+2764
+    /// plus VARIATION SELECTOR-16, which summed per `char` is one column and
+    /// ratatui draws — as one grapheme cluster — in two; a keycap `1️⃣` is one
+    /// column against two, and a halfwidth `ｶﾞ` is one against two. A title
+    /// made of them measured as fitting, went to the renderer wider than its
+    /// budget, and the status badge was drawn over its tail with no `…` — the
+    /// #357 symptom, on input the char-counting truncator had handled
+    /// correctly. Each cluster is now budgeted at the width it is drawn at, and
+    /// kept or cut whole, so a ZWJ family is never split at the cut either.
+    #[test]
+    fn truncate_styled_segments_budgets_clusters_at_their_drawn_width() {
+        let badge = Style::default().fg(Color::Magenta);
+        let name = Style::default().fg(Color::Gray);
+        for (body, cut) in [
+            ("❤\u{fe0f}❤\u{fe0f}❤\u{fe0f}❤\u{fe0f}", " 1 ❤\u{fe0f}…"),
+            (
+                "1\u{fe0f}\u{20e3}2\u{fe0f}\u{20e3}3\u{fe0f}\u{20e3}",
+                " 1 1\u{fe0f}\u{20e3}…",
+            ),
+            ("ｶﾞｷﾞｸﾞ", " 1 ｶﾞ…"),
+            (
+                "👨\u{200d}👩\u{200d}👧👨\u{200d}👩\u{200d}👧👨\u{200d}👩\u{200d}👧",
+                " 1 👨\u{200d}👩\u{200d}👧…",
+            ),
+        ] {
+            let segments = vec![(" 1 ".to_string(), badge), (body.to_string(), name)];
+            // Three cells of prefix and at least six of body: a six-cell budget
+            // must overflow, keep one two-cell cluster, and mark the cut.
+            assert!(rendered_segment_columns(&segments) > 6, "{body:?}");
+            let spans = truncate_styled_segments(segments, 6);
+            assert_eq!(title_text(&spans), cut, "{body:?}");
+            assert_eq!(rendered_columns(&spans), 6, "{body:?}");
+        }
+    }
+
+    /// A control character is dropped by ratatui before it reaches a cell, yet
+    /// `Span::width` — which `Line::width` sums to size the title's area — still
+    /// counts `\n` as a column. Kept in the output, it would make a title that fits by its drawn
+    /// width claim more room than the budget and slide under the status badge.
+    /// This is reachable: the session id is producer-controlled, and
+    /// `render_session_card`'s own issue #574 comment records that nothing
+    /// checks its charset between the hook socket and the card. So the truncator
+    /// emits only the clusters the renderer draws.
+    #[test]
+    fn truncate_styled_segments_emits_no_control_characters() {
+        let a = Style::default().fg(Color::White);
+        let segments = vec![(" 1 ".to_string(), a), ("ab\ncd\t".to_string(), a)];
+        let fits = truncate_styled_segments(segments.clone(), 7);
+        assert_eq!(title_text(&fits), " 1 abcd");
+        assert_eq!(rendered_columns(&fits), 7);
+
+        let cut = truncate_styled_segments(segments, 6);
+        assert_eq!(title_text(&cut), " 1 ab…");
+        assert!(!title_text(&cut).contains(char::is_control));
     }
 }
 

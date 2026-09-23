@@ -535,6 +535,14 @@ STOP CONDITION: open the PR, request review from the other maintainer with
 `gh pr create --reviewer <OTHER>`, and STOP. Do not merge. Per CLAUDE.md rule 8
 nobody merges their own unapproved PR, and for an admin account that would
 succeed silently rather than fail. You may arm auto-merge; you may not press it.
+BUT --auto waits only for the REQUIRED checks and the review rule, so a
+non-required check that is still pending does NOT hold it. Armed here, before
+the approval, the PR reads BLOCKED and gh arms it normally (`autoMergeRequest`
+is set, so nothing looks wrong); GitHub then merges the moment the approval
+lands, whether or not that check has passed. PR #1208 landed a lockfile update
+inside Renovate's renovate/stability-days window by the same gap. So read
+`gh pr checks <n>` before arming, and if an unrequired check is pending and
+matters, leave the PR DISARMED rather than arming it.
 ```
 
 ### 8b — The `--orchestration` task
