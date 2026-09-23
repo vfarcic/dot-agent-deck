@@ -1103,7 +1103,7 @@ impl VoiceToken for ActivationMode {
 
 /// Whether each command request carries the LABELS the app observed — agent
 /// names and live status, deck labels, the directory names on screen, the New
-/// agent form's Mode chips and Agent picker entries, orchestration titles and
+/// agent form's Mode chips and agent entries, orchestration titles and
 /// roles — or none of them (PRD #1223, audit finding A1). Either way the
 /// request also carries what every command does: the transcript, the fixed
 /// instructions and response schema, the command table, the model name and

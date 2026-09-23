@@ -48,7 +48,7 @@ pub struct IntentRequest<'a> {
     /// the webview rather than read Rust-side.
     pub directories: Option<&'a VoiceDirectories>,
     /// What the New agent dialog shows besides its browser, while it is open
-    /// (PRD #1223) — the Mode chips and Agent picker entries a spoken
+    /// (PRD #1223) — the Mode chips and agent entries a spoken
     /// `mode_ref` or `agent_type_ref` resolves against. `None` while the
     /// dialog is closed; see [`VoiceNewAgent`].
     pub new_agent: Option<&'a VoiceNewAgent>,

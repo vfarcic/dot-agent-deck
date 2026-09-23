@@ -691,7 +691,7 @@ export interface VoiceDirectoriesDto {
  *
  * `form` is present only while the form's fields are live — a deck and a
  * directory chosen, no start in flight, and no start confirmation open — and
- * carries the Mode chips and Agent picker entries AS OFFERED: they vary by the
+ * carries the Mode chips and agent entries AS OFFERED: they vary by the
  * deck's capabilities, its experimental flag and whether the directory is a
  * project, and a spoken `mode_ref` or `agent_type_ref` resolves against these
  * and nothing else.
@@ -729,7 +729,7 @@ export interface VoiceNewAgentDto {
  *   ({@link VoiceDirectoriesDto}, PRD #1223) — `spoken` is what the user called
  *   one, `value` is the deck's own path for it, and `label` its `displayName`.
  * * `mode_ref` and `agent_type_ref` resolve against **the New agent form's
- *   Mode chips and Agent picker as offered** ({@link VoiceNewAgentDto}, PRD
+ *   Mode chips and agents as offered** ({@link VoiceNewAgentDto}, PRD
  *   #1223) — `value` is the chip's or entry's id, `label` what it shows.
  * * `orchestration_ref` resolves against **the orchestrations among the live
  *   agents**, grouped as the overview's cards are (PRD #1223) — `value` is one

@@ -549,7 +549,7 @@ export function DeckShell({ runtime, workflowPlatformIssue, initialView = { kind
     /* PRD #1223 — the child a `dir_ref` resolved to, against the browser's
        children on screen: its `value` is the deck's own path for it. */
     const namedDirectory = outcome.params.find((param) => param.kind === "dir_ref");
-    /* PRD #1223 — the Mode chip and the Agent picker entry a `mode_ref` and an
+    /* PRD #1223 — the Mode chip and the agent entry a `mode_ref` and an
        `agent_type_ref` resolved to, against the form AS DECLARED: `value` is
        the id the dialog selects by. */
     const namedMode = outcome.params.find((param) => param.kind === "mode_ref");

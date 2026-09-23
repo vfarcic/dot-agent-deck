@@ -1480,9 +1480,9 @@ impl ParamKind {
             ParamKind::ModeRef => {
                 format!("no mode the New agent form offers matches \u{201c}{spoken}\u{201d}")
             }
-            ParamKind::AgentTypeRef => format!(
-                "no agent type in the New agent form's picker matches \u{201c}{spoken}\u{201d}"
-            ),
+            ParamKind::AgentTypeRef => {
+                format!("no agent this deck offers matches \u{201c}{spoken}\u{201d}")
+            }
             ParamKind::OrchestrationRef => {
                 format!("no orchestration here matches \u{201c}{spoken}\u{201d}")
             }
@@ -1757,7 +1757,7 @@ fn dir_names(name: &str) -> Vec<String> {
 }
 
 /// What a spoken reference to one entry of a closed set on screen resolved to
-/// — a Mode chip or an Agent picker entry (PRD #1223).
+/// — a Mode chip or an agent entry (PRD #1223).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChoiceMatch {
     /// `id` is what the dialog selects by; `label` is what it shows.
@@ -1846,22 +1846,19 @@ fn withheld_mode_named(
     })
 }
 
-/// Resolve a spoken agent type against the New agent form's Agent picker as it
+/// Resolve a spoken agent type against the New agent form's agent list as it
 /// is on screen (PRD #1223): the deck's own registry, or the desktop's labelled
-/// fallback, plus `auto`. An entry answers to its label and to its registry id
+/// fallback. An entry answers to its label and to its registry id
 /// (`claude` beside "Claude Code"), which is the binary a user names.
 pub fn resolve_agent_type_ref(spoken: &str, agent_types: &[VoiceChoice]) -> ChoiceMatch {
     resolve_choice(spoken, agent_types, agent_type_names)
 }
 
-/// Every name an Agent picker entry answers to. See [`resolve_agent_type_ref`].
+/// Every name an agent entry answers to. See [`resolve_agent_type_ref`].
 fn agent_type_names(choice: &VoiceChoice) -> Vec<String> {
     let mut names = vec![choice.label.clone()];
     if choice.id != choice.label {
         names.push(choice.id.clone());
-    }
-    if choice.id == "auto" {
-        names.push("automatic".to_string());
     }
     names
 }
@@ -3233,7 +3230,6 @@ mod tests {
                     choice("dispatcher", "dispatcher"),
                 ],
                 agent_types: vec![
-                    choice("auto", "auto"),
                     choice("claude", "Claude Code"),
                     choice("opencode", "OpenCode"),
                     choice("pi", "Pi"),
@@ -3321,8 +3317,11 @@ mod tests {
             one("opencode"),
             ("opencode".to_string(), "OpenCode".to_string())
         );
-        assert_eq!(one("auto"), ("auto".to_string(), "auto".to_string()));
-        assert_eq!(one("automatic"), ("auto".to_string(), "auto".to_string()));
+        // `auto` went with the Agent picker (PRD #1223): it named no agent.
+        assert_eq!(
+            resolve_agent_type_ref("auto", agent_types),
+            ChoiceMatch::None
+        );
         // Codex is in the desktop's own registry but not in THIS deck's picker,
         // so it is refused rather than guessed.
         assert_eq!(
@@ -3513,7 +3512,7 @@ mod tests {
         assert_eq!(invoke, "chooseNewAgentType");
         assert_eq!(params[0].value, "claude");
         assert_eq!(params[0].kind, ParamKind::AgentTypeRef);
-        assert_eq!(sentence, "Agent: Claude Code.");
+        assert_eq!(sentence, "Command set to Claude Code's default command.");
     }
 
     #[tokio::test]
@@ -3526,7 +3525,7 @@ mod tests {
         let outcome = run_form(&resolver, Screen::Overview, Some(&form), "use codex").await;
         assert_eq!(
             outcome.sentence(),
-            "Heard: \u{201c}use codex\u{201d} — no agent type in the New agent form's picker matches \u{201c}codex\u{201d}."
+            "Heard: \u{201c}use codex\u{201d} — no agent this deck offers matches \u{201c}codex\u{201d}."
         );
     }
 

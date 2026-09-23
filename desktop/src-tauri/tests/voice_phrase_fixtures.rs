@@ -398,7 +398,6 @@ async fn voice_phrase_fixtures_match_the_default_backend() {
                 choice("dispatcher", "dispatcher"),
             ],
             agent_types: vec![
-                choice("auto", "auto"),
                 choice("claude", "Claude Code"),
                 choice("opencode", "OpenCode"),
                 choice("pi", "Pi"),

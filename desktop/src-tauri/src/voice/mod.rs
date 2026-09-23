@@ -156,7 +156,7 @@ pub struct VoiceNewAgent {
 /// **The chips and the picker entries are the ones the dialog actually
 /// offers**, never a list this crate knows: the Mode row varies by the deck's
 /// capabilities, the deck's experimental flag, and whether the chosen
-/// directory is a project with orchestrations; the Agent picker is the deck's
+/// directory is a project with orchestrations; the agent list is the deck's
 /// own registry, or the desktop's labelled fallback for a deck that does not
 /// report one. A spoken mode or agent type resolves against these and nothing
 /// else, so a chip that is not offered is refused rather than guessed.
@@ -171,7 +171,7 @@ pub struct VoiceNewAgentForm {
     /// namesake orchestration chip is NOT here: it cannot be chosen by a click
     /// either.
     pub modes: Vec<VoiceChoice>,
-    /// The Agent picker's entries, `auto` first, as the select shows them.
+    /// The agents the deck offers, as the dialog declares them — its registry, or this app's fallback copy for a deck that reports none.
     pub agent_types: Vec<VoiceChoice>,
     /// The Mode chips the dialog KNOWS and withholds on this form — an
     /// authoring kind the deck cannot compose, or `schedule: issues` with the

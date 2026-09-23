@@ -128,7 +128,7 @@ pub const TOOL_INSTRUCTIONS: &str = "Pick the deck action the user asked for. Pi
     directories on screen, and a `dir_ref` param names one of THOSE, answered with \
     the words the user used for it. `new_agent_form`, when present, is the New \
     agent dialog's form: `modes` are the Mode chips it offers and `agent_types` \
-    the entries of its Agent picker, and a `mode_ref` or `agent_type_ref` param \
+    the agents whose default command it can put in Command, and a `mode_ref` or `agent_type_ref` param \
     names one of THOSE, answered with the words the user used for it. \
     `orchestrations` lists the orchestrations among those agents by `title`, with \
     their roles; an `orchestration_ref` param names one of them, answered with the \

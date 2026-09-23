@@ -22,7 +22,7 @@ vi.mock("./TerminalViewport", () => ({
 }));
 
 import { DeckShell } from "../App";
-import { DIRECTORY_MOVED_ON, DIRECTORY_NOT_LISTED, FORM_MOVED_ON, FORM_UNDER_CONFIRMATION, MODE_NOT_OFFERED, NO_DIRECTORY_BROWSER, NO_NEW_AGENT_DIALOG, NO_NEW_AGENT_FORM, NO_PARENT_DIRECTORY, spokenName, START_AWAITING_CONFIRMATION, START_FORM_CHANGED, START_NEEDS_DIRECTORY, STARTING_CLOSE_BLOCKED } from "./NewAgentDialog";
+import { COMMAND_HIDDEN_BY_ORCHESTRATION, DIRECTORY_MOVED_ON, DIRECTORY_NOT_LISTED, FORM_MOVED_ON, FORM_UNDER_CONFIRMATION, MODE_NOT_OFFERED, NO_DIRECTORY_BROWSER, NO_NEW_AGENT_DIALOG, NO_NEW_AGENT_FORM, NO_PARENT_DIRECTORY, spokenName, START_AWAITING_CONFIRMATION, START_FORM_CHANGED, START_NEEDS_DIRECTORY, STARTING_CLOSE_BLOCKED } from "./NewAgentDialog";
 import { CONFIRMATION_ALREADY_OPEN, STOP_BEHIND_NEW_AGENT, STOP_TARGET_GONE } from "./AgentOverview";
 import {
   DIALOG_MOVED_ON,
@@ -1458,8 +1458,8 @@ describe("the rest of the New agent form, by voice (PRD #1223)", () => {
         const spoken = utterance.slice("use ".length);
         if (!form && !options.forced) return unavailable("choose_agent_type", "choosing an agent needs a deck and a directory chosen in the New agent dialog; choose those first");
         const entry = form?.agentTypes.find((candidate) => candidate.id === spoken || candidate.label.toLowerCase() === spoken);
-        if (!entry) return unresolved("choose_agent_type", "agent_type", spoken, `Heard: “${utterance}” — no agent type in the New agent form's picker matches “${spoken}”.`);
-        return dispatch("choose_agent_type", "chooseNewAgentType", `Agent: ${entry.label}.`, utterance, [{ name: "agent_type", kind: "agent_type_ref", spoken, value: entry.id, label: entry.label }]);
+        if (!entry) return unresolved("choose_agent_type", "agent_type", spoken, `Heard: “${utterance}” — no agent this deck offers matches “${spoken}”.`);
+        return dispatch("choose_agent_type", "chooseNewAgentType", `Command set to ${entry.label}'s default command.`, utterance, [{ name: "agent_type", kind: "agent_type_ref", spoken, value: entry.id, label: entry.label }]);
       }
       if (utterance.startsWith("call it ")) {
         if (!form && !options.forced) return unavailable("name_new_agent", "naming the new agent needs a deck and a directory chosen in the New agent dialog; choose those first");
@@ -1602,11 +1602,11 @@ describe("the rest of the New agent form, by voice (PRD #1223)", () => {
   });
 
   /**
-   * Scenario: say "use claude". The picker moves to Claude Code and Command is
-   * overwritten with its default command — the picker's own behaviour. The
-   * declaration lists `auto` first, then the deck's registry.
+   * Scenario: say "use claude". There is no Agent picker any more (PRD #1223),
+   * so Command is overwritten with Claude Code's default command and the report
+   * says so. The declaration is the deck's registry, with no `auto`.
    */
-  it("chooses an agent type, which fills Command the way the picker does", async () => {
+  it("chooses an agent type by filling Command with its default command", async () => {
     const voice = microphone([]);
     const { deck, declarations } = formDeck(voice);
     render(<DeckShell runtime={deck} initialView={{ kind: "overview" }} />);
@@ -1617,14 +1617,37 @@ describe("the rest of the New agent form, by voice (PRD #1223)", () => {
     voice.deliver("use claude");
     await completeUtterance();
 
-    expect(declarations.at(-1)?.form?.agentTypes).toEqual([{ id: "auto", label: "auto" }, { id: "claude", label: "Claude Code" }, { id: "opencode", label: "OpenCode" }]);
-    expect(screen.getByTestId("new-agent-agent")).toHaveValue("claude");
+    expect(declarations.at(-1)?.form?.agentTypes).toEqual([{ id: "claude", label: "Claude Code" }, { id: "opencode", label: "OpenCode" }]);
+    expect(screen.queryByTestId("new-agent-agent")).toBeNull();
     expect(screen.getByTestId("new-agent-command")).toHaveValue("claude --model haiku");
-    expect(screen.getByTestId("voice-report")).toHaveTextContent("Agent: Claude Code.");
+    expect(screen.getByTestId("voice-report")).toHaveTextContent("Command set to Claude Code's default command.");
   });
 
-  /** Scenario: an agent the deck's picker does not list is refused, and the picker is left alone. */
-  it("refuses an agent type the picker does not list", async () => {
+  /**
+   * Scenario: choose the review orchestration, then say "use claude". Its
+   * roles run their own commands and Command is hidden, so nothing is filled
+   * behind the user's back: the dialog refuses, and choosing No mode again
+   * shows Command as it was.
+   */
+  it("refuses to fill Command while an orchestration is selected", async () => {
+    const voice = microphone([]);
+    const { deck } = formDeck(voice);
+    render(<DeckShell runtime={deck} initialView={{ kind: "overview" }} />);
+    await turnVoiceOn();
+    await openForm();
+
+    voice.deliver("mode orch: review");
+    await completeUtterance();
+    voice.deliver("use claude");
+    await completeUtterance();
+
+    expect(screen.getByTestId("voice-report")).toHaveTextContent(COMMAND_HIDDEN_BY_ORCHESTRATION);
+    fireEvent.click(screen.getByTestId("new-agent-mode-none"));
+    expect(screen.getByTestId("new-agent-command")).toHaveValue("bash");
+  });
+
+  /** Scenario: an agent the deck does not offer is refused, and Command is left alone. */
+  it("refuses an agent type the deck does not offer", async () => {
     const voice = microphone([]);
     const { deck } = formDeck(voice);
     render(<DeckShell runtime={deck} initialView={{ kind: "overview" }} />);
@@ -1634,8 +1657,8 @@ describe("the rest of the New agent form, by voice (PRD #1223)", () => {
     voice.deliver("use codex");
     await completeUtterance();
 
-    expect(screen.getByTestId("voice-report")).toHaveTextContent("no agent type in the New agent form's picker matches “codex”");
-    expect(screen.getByTestId("new-agent-agent")).toHaveValue("auto");
+    expect(screen.getByTestId("voice-report")).toHaveTextContent("no agent this deck offers matches “codex”");
+    expect(screen.getByTestId("new-agent-command")).toHaveValue("bash");
   });
 
   /**

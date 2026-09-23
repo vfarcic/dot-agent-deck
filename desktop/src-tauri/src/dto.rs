@@ -1158,7 +1158,7 @@ pub enum DesktopNewAgentOptions {
     },
 }
 
-/// One entry of an agent registry, for the form's Agent picker.
+/// One entry of an agent registry, for the New agent form.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DesktopAgentOption {

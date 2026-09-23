@@ -2732,7 +2732,7 @@ fn validate_voice_directories(directories: &voice::VoiceDirectories) -> Result<(
 ///
 /// Both lists are small closed sets on a real form: the Mode row is `No mode`,
 /// one chip per orchestration a project defines, and three authoring kinds; the
-/// Agent picker is a deck's registry plus `auto`. The caps are far above either
+/// agent list is a deck's registry. The caps are far above either
 /// and far below a payload.
 const MAX_VOICE_FORM_CHOICES: usize = 256;
 const MAX_VOICE_FORM_CHOICE_BYTES: usize = 1024;
@@ -2793,7 +2793,7 @@ fn validate_voice_new_agent(new_agent: &voice::VoiceNewAgent) -> Result<(), Stri
 /// webview and its own Rust half; nothing about it reaches the daemon.
 ///
 /// **`new_agent` is the third** (PRD #1223): the New agent form's Mode chips
-/// and Agent picker entries as they are on screen, present while the dialog is
+/// and agent entries as they are on screen, present while the dialog is
 /// open. Same route, same reason, bounded by [`validate_voice_new_agent`], and
 /// likewise never sent to the daemon.
 ///
@@ -4459,7 +4459,7 @@ mod tests {
                 "deckId": "deck-1",
                 "path": "/home/dev/code",
                 "modes": [{ "id": "none", "label": "No mode" }],
-                "agentTypes": [{ "id": "auto", "label": "auto" }],
+                "agentTypes": [{ "id": "claude", "label": "Claude Code" }],
             },
         }))
         .expect("parses");

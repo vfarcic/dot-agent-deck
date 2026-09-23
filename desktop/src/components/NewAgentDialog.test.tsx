@@ -99,7 +99,7 @@ describe("New agent dialog — one surface (PRD #1223, the voice-first redesign)
   /**
    * Scenario: open the dialog over a fleet with one eligible deck. Every
    * control is on screen at once — the deck field, the directory browser, and
-   * Mode, Agent, Name, Command and Start — with no Next, no Back and no step to
+   * Mode, Name, Command and Start — with no Next, no Back and no step to
    * pass. The deck is chosen already and its home is listed without a key;
    * the form's fields wait, disabled, until a directory is chosen.
    */
@@ -110,7 +110,7 @@ describe("New agent dialog — one surface (PRD #1223, the voice-first redesign)
     expect(deckList()).toBeVisible();
     expect(screen.getByTestId("new-agent-directory-panel")).toBeVisible();
     expect(screen.getByTestId("new-agent-form")).toBeVisible();
-    for (const id of ["new-agent-mode-none", "new-agent-agent", "new-agent-name", "new-agent-command", "new-agent-start"]) {
+    for (const id of ["new-agent-mode-none", "new-agent-name", "new-agent-command", "new-agent-start"]) {
       expect(screen.getByTestId(id)).toBeDisabled();
     }
     expect(screen.getByTestId("new-agent-dir")).toHaveTextContent("No directory chosen yet");
@@ -124,7 +124,7 @@ describe("New agent dialog — one surface (PRD #1223, the voice-first redesign)
     expect(runtime.newAgentOptions).toHaveBeenCalledWith(LOCAL);
 
     fireEvent.keyDown(directoryList(), { key: " " });
-    for (const id of ["new-agent-mode-none", "new-agent-agent", "new-agent-name", "new-agent-command", "new-agent-start"]) {
+    for (const id of ["new-agent-mode-none", "new-agent-name", "new-agent-command", "new-agent-start"]) {
       expect(screen.getByTestId(id)).toBeEnabled();
     }
     expect(screen.getByTestId("new-agent-dir")).toHaveTextContent("/home/dev");
@@ -149,8 +149,9 @@ describe("New agent dialog — one surface (PRD #1223, the voice-first redesign)
   /**
    * Scenario: the focus order, as the wizard's steps had it. With the deck
    * preselected, focus opens on the directory browser; confirming a directory
-   * moves it to Name. The tab stops run deck → directory → Mode → Agent → Name
-   * → Command → Start in document order.
+   * moves it to Name. The tab stops run deck → directory → Mode → Name →
+   * Command → Start in document order — no Agent picker (PRD #1223 removed it
+   * from both clients).
    */
   it("moves focus deck → browser → form, and tabs through them in that order", async () => {
     renderDialog(fakeRuntime());
@@ -170,7 +171,6 @@ describe("New agent dialog — one surface (PRD #1223, the voice-first redesign)
       "new-agent-directory-list",
       "new-agent-use-directory",
       "new-agent-mode-none",
-      "new-agent-agent",
       "new-agent-name",
       "new-agent-command",
       "new-agent-start",
@@ -555,21 +555,22 @@ describe("New agent dialog — form (PRD #1223 M4)", () => {
   });
 
   /**
-   * Scenario: type a command of your own, then pick Pi in the Agent picker —
-   * Command is overwritten with Pi's default command. Going back to `auto`
-   * leaves it as it is.
+   * Scenario: reach the form and look for an Agent picker. There is none — no
+   * select, no "Agent" field, no `auto` — because it saved one word of typing
+   * (every default command is the agent's bare binary name), its `auto` meant
+   * nothing and its label went stale against an edited Command (PRD #1223).
+   * What the agent runs is the Command field, typed as the user wants it.
    */
-  it("overwrites Command with the chosen agent's default command", async () => {
+  it("has no Agent picker: Command is what the agent runs", async () => {
     const runtime = fakeRuntime();
     renderDialog(runtime);
     await reachForm();
-    const agent = screen.getByTestId("new-agent-agent");
-    await waitFor(() => expect(within(agent).getAllByRole("option")).toHaveLength(3));
 
-    fireEvent.change(screen.getByTestId("new-agent-command"), { target: { value: "my-own-agent --flag" } });
-    fireEvent.change(agent, { target: { value: "pi" } });
-    expect(screen.getByTestId("new-agent-command")).toHaveValue("pi --thinking");
-    fireEvent.change(agent, { target: { value: "auto" } });
+    expect(screen.queryByTestId("new-agent-agent")).toBeNull();
+    const form = screen.getByTestId("new-agent-form");
+    expect(form.querySelector("select")).toBeNull();
+    expect(within(form).queryByText(/^Agent$/)).toBeNull();
+    fireEvent.change(screen.getByTestId("new-agent-command"), { target: { value: "pi --thinking" } });
     expect(screen.getByTestId("new-agent-command")).toHaveValue("pi --thinking");
   });
 
@@ -750,8 +751,8 @@ describe("New agent dialog — older decks (PRD #1223 M5)", () => {
 
   /**
    * Scenario: the deck has no options query. Command is prefilled from this
-   * app's memory of the deck's last command, and the Agent picker offers this
-   * app's own registry, saying that is what it is.
+   * app's memory of the deck's last command. (The fallback registry is still
+   * this app's own, for voice's "use codex"; there is no picker to label.)
    */
   it("falls back to this app's memory and registry on a deck without the options query", async () => {
     const runtime = fakeRuntime({
@@ -760,9 +761,9 @@ describe("New agent dialog — older decks (PRD #1223 M5)", () => {
     renderDialog(runtime);
     await reachForm();
 
-    expect(await screen.findByTestId("new-agent-desktop-registry")).toHaveTextContent("The list is this app's own.");
-    expect(screen.getByTestId("new-agent-command")).toHaveValue("codex --model gpt-5.6-sol");
-    expect(within(screen.getByTestId("new-agent-agent")).getAllByRole("option").map((option) => option.textContent)).toEqual(["auto", "Codex"]);
+    await waitFor(() => expect(screen.getByTestId("new-agent-command")).toHaveValue("codex --model gpt-5.6-sol"));
+    expect(screen.queryByTestId("new-agent-desktop-registry")).toBeNull();
+    expect(screen.queryByText(/this app's own/)).toBeNull();
   });
 });
 
@@ -1079,16 +1080,16 @@ describe("New agent dialog — authoring agents (PRD #1223 M7)", () => {
   });
 
   /**
-   * Scenario: choose schedule, pick Pi, then go up in the browser and use
-   * that directory instead. The Mode goes back to No mode, as every fresh TUI
-   * form does, and the Name follows the new directory — while Agent and
-   * Command, which hang off the deck rather than the directory, stay.
+   * Scenario: choose schedule, type Pi's command, then go up in the browser
+   * and use that directory instead. The Mode goes back to No mode, as every
+   * fresh TUI form does, and the Name follows the new directory — while
+   * Command, which hangs off the deck rather than the directory, stays.
    */
-  it("re-derives Mode and Name from a newly confirmed directory, keeping Agent and Command", async () => {
+  it("re-derives Mode and Name from a newly confirmed directory, keeping Command", async () => {
     renderDialog(fakeRuntime({ newAgentOptions: optionsOf() }));
     await reachForm();
     fireEvent.click(await screen.findByTestId("new-agent-mode-schedule"));
-    fireEvent.change(screen.getByTestId("new-agent-agent"), { target: { value: "pi" } });
+    fireEvent.change(screen.getByTestId("new-agent-command"), { target: { value: "pi --thinking" } });
 
     fireEvent.keyDown(directoryList(), { key: "h" });
     await currentPath("/home/dev/beta");
@@ -1098,7 +1099,6 @@ describe("New agent dialog — authoring agents (PRD #1223 M7)", () => {
     expect(screen.getByTestId("new-agent-mode-schedule")).toHaveAttribute("aria-pressed", "false");
     expect(screen.getByTestId("new-agent-dir")).toHaveTextContent("/home/dev/beta");
     expect(screen.getByTestId("new-agent-name")).toHaveValue("beta");
-    expect(screen.getByTestId("new-agent-agent")).toHaveValue("pi");
     expect(screen.getByTestId("new-agent-command")).toHaveValue("pi --thinking");
   });
 });

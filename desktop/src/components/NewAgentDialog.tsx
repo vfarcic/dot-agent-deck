@@ -79,8 +79,6 @@ const NO_MODE = { id: "none", label: "No mode" } as const;
 
 type ModeId = typeof NO_MODE.id | AuthoringKind | ReturnType<typeof orchestrationModeId>;
 
-const AUTO_AGENT = "auto";
-
 /** Why the dialog cannot be closed during a start (PRD #1223 audit F5). */
 export const STARTING_CLOSE_BLOCKED = "Waiting for the deck to answer the start. The dialog can be closed once it has.";
 
@@ -111,8 +109,10 @@ export const NO_NEW_AGENT_FORM = "The New agent form has no deck and directory c
 export const FORM_MOVED_ON = "The New agent form moved on while that was being worked out, so nothing was changed. Say it again.";
 /** The chip is not in the Mode row any more. */
 export const MODE_NOT_OFFERED = "That mode is not offered on this form any more, so the mode was not changed.";
-/** The entry is not in the Agent picker any more. */
-export const AGENT_TYPE_NOT_OFFERED = "That agent is not in this form's picker any more, so the agent was not changed.";
+/** The agent is not among the ones this deck offers any more. */
+export const AGENT_TYPE_NOT_OFFERED = "That agent is not offered on this deck any more, so the Command was not changed.";
+/** An orchestration is selected, so there is no Command field to fill. */
+export const COMMAND_HIDDEN_BY_ORCHESTRATION = "An orchestration is selected and each of its roles runs its own command, so the Command was not changed.";
 /** The start confirmation is showing; a fill would change what it describes. */
 export const FORM_UNDER_CONFIRMATION = "The start confirmation is open, so the form was not changed. Answer it first.";
 /** The words after "name it" were only punctuation. */
@@ -169,7 +169,7 @@ function messageOf(cause: unknown): string {
  *    choose one (PRD #1223 U1 removed the typed path), so a deck without the
  *    listing verb is disabled in the deck field with the crate's
  *    `newAgentReason`.
- * 3. **Form** — Mode, Agent, Name and Command, prefilled in the TUI's order and
+ * 3. **Form** — Mode, Name and Command, prefilled in the TUI's order and
  *    enabled once a directory is chosen.
  *    Mode offers a plain agent; one `Orch: <name>` chip per orchestration the
  *    directory's project defines on that deck (PRD #1223 M6); and, on a deck
@@ -239,7 +239,6 @@ export function NewAgentDialog({ runtime, initialDeckId, onClose, onAppeared, on
   const [target, setTarget] = useState<{ path: string; displayPath: string }>();
   const [options, setOptions] = useState<NewAgentOptions>();
   const [optionsError, setOptionsError] = useState<string>();
-  const [agentChoice, setAgentChoice] = useState<string>(AUTO_AGENT);
   const [modeChoice, setModeChoice] = useState<ModeId>(NO_MODE.id);
   const [name, setName] = useState("");
   const [command, setCommand] = useState("");
@@ -302,7 +301,6 @@ export function NewAgentDialog({ runtime, initialDeckId, onClose, onAppeared, on
     setOptionsError(undefined);
     setOrchestrations(undefined);
     setOrchestrationsError(undefined);
-    setAgentChoice(AUTO_AGENT);
     setModeChoice(NO_MODE.id);
     setFormError(undefined);
     setFormCleanup(undefined);
@@ -626,11 +624,17 @@ export function NewAgentDialog({ runtime, initialDeckId, onClose, onAppeared, on
     return undefined;
   };
   /**
-   * PRD #1223 — the rest of the form by voice: Mode, Agent and Name. Each calls
-   * what the control's own click or keystroke calls (`selectMode`,
-   * `chooseAgent`, the Name input's setter) and nothing else, so a spoken
-   * choice of agent overwrites Command exactly as the picker does, and a spoken
-   * Name is an edit exactly as a typed one is.
+   * PRD #1223 — the rest of the form by voice: Mode, the agent and Name. Mode
+   * and Name call what the control's own click or keystroke calls
+   * (`selectMode`, the Name input's setter) and nothing else, so a spoken Name
+   * is an edit exactly as a typed one is. The agent has no control of its own
+   * any more — the Agent picker was removed, because every `default_command`
+   * is the bare binary name and the picker saved one word of typing while its
+   * `auto` meant nothing and its label went stale against an edited Command —
+   * so "use claude" sets Command to that agent's default command
+   * ({@link commandFromAgent}), resolved against the deck's own registry (or
+   * this app's fallback copy for a deck that reports none). Voice has no other
+   * way to choose what the agent runs, since Command is never dictated.
    *
    * Each first re-checks that the form is still the one the utterance was
    * judged against — its deck and its chosen directory — for the browser's
@@ -656,9 +660,10 @@ export function NewAgentDialog({ runtime, initialDeckId, onClose, onAppeared, on
   const voiceChooseAgentType = (dispatch: VoiceDispatchTarget): string | undefined => {
     const refused = formMovedOn(dispatch);
     if (refused !== undefined) return refused;
-    const id = dispatch.agentTypeId;
-    if (id !== AUTO_AGENT && !agents.some((candidate) => candidate.id === id)) return AGENT_TYPE_NOT_OFFERED;
-    chooseAgent(id ?? AUTO_AGENT);
+    if (selectedOrchestration) return COMMAND_HIDDEN_BY_ORCHESTRATION;
+    const agent = agents.find((candidate) => candidate.id === dispatch.agentTypeId);
+    if (!agent) return AGENT_TYPE_NOT_OFFERED;
+    commandFromAgent(agent);
     return undefined;
   };
   const voiceNameNewAgent = (dispatch: VoiceDispatchTarget): string | undefined => {
@@ -709,7 +714,7 @@ export function NewAgentDialog({ runtime, initialDeckId, onClose, onAppeared, on
             deckId: deck.deckId,
             path: target.path,
             modes: modes.map(({ id, label }) => ({ id, label })),
-            agentTypes: [{ id: AUTO_AGENT, label: AUTO_AGENT }, ...agents.map((agent) => ({ id: agent.id, label: agent.displayName }))],
+            agentTypes: agents.map((agent) => ({ id: agent.id, label: agent.displayName })),
             /* The authoring chips this form withholds — for a deck that cannot
                compose them, or `schedule: issues` with its flag off — so a
                spoken one is refused BY NAME instead of becoming the nearest
@@ -793,15 +798,14 @@ export function NewAgentDialog({ runtime, initialDeckId, onClose, onAppeared, on
     setName(orchestrationChips.some((chip) => chip.id === id) ? suggestOrchestrationName(basename, liveTitles) : basename);
   };
 
-  const chooseAgent = (id: string) => {
-    setAgentChoice(id);
-    const agent = agents.find((candidate) => candidate.id === id);
-    // The TUI's `select_agent`: choosing an agent OVERWRITES Command with its
-    // default command. Going back to `auto` leaves Command as it is.
-    if (agent) {
-      setCommand(agent.defaultCommand ?? "");
-      commandTouched.current = true;
-    }
+  /**
+   * Voice's "use claude": OVERWRITE Command with that agent's default command
+   * and count it as an edit, so a later options reply does not replace it.
+   * The field is on screen beside the report, so what was set is visible.
+   */
+  const commandFromAgent = (agent: NewAgentOption) => {
+    setCommand(agent.defaultCommand ?? "");
+    commandTouched.current = true;
   };
 
   /**
@@ -890,7 +894,7 @@ export function NewAgentDialog({ runtime, initialDeckId, onClose, onAppeared, on
    * the scrim — the confirmation starts nothing and says so. `submitRef` is
    * the LATEST `submit`, so an unchanged form is started from its live state.
    */
-  const formSignature = JSON.stringify([deck?.deckId, target?.path, mode, agentChoice, name, selectedOrchestration ? null : command]);
+  const formSignature = JSON.stringify([deck?.deckId, target?.path, mode, name, selectedOrchestration ? null : command]);
   const liveSignature = useRef(formSignature);
   liveSignature.current = formSignature;
   const submitRef = useRef(submit);
@@ -1133,7 +1137,6 @@ export function NewAgentDialog({ runtime, initialDeckId, onClose, onAppeared, on
       {chip.label}
     </button>
   ));
-  const unsupportedOptions = options?.kind === "unsupported";
 
   const highlighted = choices.find((choice) => choice.deckId === highlight);
   const noSubdirectories = listing !== undefined && listing.entries.length === 0;
@@ -1303,14 +1306,6 @@ export function NewAgentDialog({ runtime, initialDeckId, onClose, onAppeared, on
       {orchestrationOffer.withheld && <p className="new-agent-hint" data-testid="new-agent-orchestrations-withheld">{displayText(orchestrationOffer.withheld, DISPLAY_LIMITS.message)}</p>}
       {orchestrationsError && <p className="new-agent-error" data-testid="new-agent-orchestrations-error">{displayText(orchestrationsError, DISPLAY_LIMITS.message)}</p>}
       {authoring.withheld && <p className="new-agent-hint" data-testid="new-agent-authoring-withheld">{authoring.withheld}</p>}
-      <label className="new-agent-field">
-        <span>Agent</span>
-        <select data-testid="new-agent-agent" value={agentChoice} disabled={formDisabled} onChange={(event) => chooseAgent(event.target.value)}>
-          <option value={AUTO_AGENT}>auto</option>
-          {agents.map((agent) => <option key={agent.id} value={agent.id}>{displayText(agent.displayName, DISPLAY_LIMITS.name)}</option>)}
-        </select>
-      </label>
-      {unsupportedOptions && <p className="new-agent-hint" data-testid="new-agent-desktop-registry">This deck does not report its agents. The list is this app's own.</p>}
       {optionsError && <p className="new-agent-error" data-testid="new-agent-options-error">{displayText(optionsError, DISPLAY_LIMITS.message)}</p>}
       <label className="new-agent-field">
         <span>Name</span>
@@ -1406,7 +1401,7 @@ export function NewAgentDialog({ runtime, initialDeckId, onClose, onAppeared, on
           <button type="button" className="icon-button" aria-label="Close new agent" disabled={starting} title={starting ? STARTING_CLOSE_BLOCKED : undefined} onClick={requestClose}><X size={15} /></button>
         </header>
         {/* Top to bottom in the tab order the wizard's steps had: deck, the
-            directory browser, then Mode, Agent, Name, Command and Start. */}
+            directory browser, then Mode, Name, Command and Start. */}
         <div className="new-agent-body">
           {deckField}
           {directoryPanel}

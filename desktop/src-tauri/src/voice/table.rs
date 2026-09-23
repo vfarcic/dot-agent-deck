@@ -88,7 +88,7 @@ impl fmt::Display for Screen {
 /// [`ParamKind::ModeRef`] and [`ParamKind::AgentTypeRef`] are the same shape
 /// once more, against the New agent form's two closed sets as they are ON
 /// SCREEN ([`super::VoiceNewAgentForm`]): the Mode chips the dialog offers and
-/// the Agent picker's entries. Two kinds rather than one "choice" kind with the
+/// the agent entries. Two kinds rather than one "choice" kind with the
 /// param name picking the set, because the kind is what selects a resolver, and
 /// a refusal has to say which of the two had no match.
 /// [`ParamKind::OrchestrationRef`] resolves against the orchestrations among
@@ -149,8 +149,8 @@ impl ParamKind {
     }
 
     /// Whether a value of this kind is one of the NAMES the app observed — an
-    /// agent, a deck, a directory on screen, a Mode chip, an Agent picker
-    /// entry, an orchestration (PRD #1223, audit finding A1).
+    /// agent, a deck, a directory on screen, a Mode chip, an agent the
+    /// New agent form offers, an orchestration (PRD #1223, audit finding A1).
     ///
     /// Such a param is resolvable only when the model was shown the names it
     /// resolves against, so with the voice settings' `labels = "withheld"` a
@@ -366,7 +366,7 @@ pub struct CommandRow {
 /// The grounding mode was a static property of a row, chosen by one criterion:
 /// is the action irreversible? For `close` that had one answer — it closes a
 /// VIEW, and a view reopens — until the view is the New agent dialog, whose
-/// deck, directory, Mode, Agent, Name and hand-edited Command are
+/// deck, directory, Mode, Name and hand-edited Command are
 /// component-local state that unmounting discards. So the same row is
 /// reversible over an agent's pane and destructive over a filled form, and
 /// the declaration that says which is the one the webview already sends with
@@ -2232,8 +2232,9 @@ mod tests {
         }
     }
 
-    /// PRD #1223: the three fill rows pinned by value. Command has no row —
-    /// `voice_table_no_row_fills_the_command` says so as a property.
+    /// PRD #1223: the three fill rows pinned by value. Command has no row of
+    /// its own — `voice_table_no_row_dictates_the_command` says so as a
+    /// property.
     #[test]
     fn voice_table_form_rows_are_pinned_by_value() {
         let table = super::table();
@@ -2267,7 +2268,7 @@ mod tests {
             "chooseNewAgentType",
             "agent_type",
             ParamKind::AgentTypeRef,
-            "Agent: {agent_type}.",
+            "Command set to {agent_type}'s default command.",
         );
         pinned(
             "name_new_agent",
@@ -2356,13 +2357,15 @@ mod tests {
         assert!(!start.callable(Screen::Deck, None, Some(&open_no_form)));
     }
 
-    /// The Command decision, as a property: no row's description offers to
-    /// fill the command line, and every fill row says so. It is the one field
-    /// that executes, so it stays typed by hand (see `commands.toml`).
+    /// The Command decision, as a property: no row DICTATES the command line,
+    /// and every fill row says so. It is the one field that executes, so the
+    /// only thing voice puts there is an agent's registry default
+    /// (`choose_agent_type`, since the Agent picker was removed) and anything
+    /// else stays typed by hand (see `commands.toml`).
     #[test]
-    fn voice_table_no_row_fills_the_command() {
+    fn voice_table_no_row_dictates_the_command() {
         let table = super::table();
-        for id in ["choose_mode", "name_new_agent"] {
+        for id in ["choose_mode", "choose_agent_type", "name_new_agent"] {
             let row = table.row(id).expect("present");
             assert!(
                 row.description.contains("typed by hand"),

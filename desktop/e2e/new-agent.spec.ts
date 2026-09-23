@@ -321,7 +321,8 @@ test.describe("the New agent flow", () => {
    * bar and choose the remote deck by clicking it. Focus moves to its listing
    * without a Next; Space uses the home directory and focus moves on to Name.
    * Typing a `q` there types it — `q` closes only from the browser — and
-   * Shift+Tab walks back up through Agent and Mode into the browser. There,
+   * Shift+Tab walks back up through Mode into the browser — there is no Agent
+   * picker between them any more (PRD #1223). There,
    * `q` closes the dialog and focus returns to the button that opened it.
    */
   test("moves focus field by field and scopes q to the browser", async ({ page }) => {
@@ -342,8 +343,7 @@ test.describe("the New agent flow", () => {
     await expect(name).toHaveValue("buildq");
     await expect(dialog).toBeVisible();
 
-    await page.keyboard.press("Shift+Tab");
-    await expect(page.getByTestId("new-agent-agent")).toBeFocused();
+    await expect(page.getByTestId("new-agent-agent")).toHaveCount(0);
     await page.keyboard.press("Shift+Tab");
     await expect(page.getByTestId("new-agent-modes").locator(":focus")).toHaveCount(1);
     await directories.focus();

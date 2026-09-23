@@ -276,7 +276,7 @@ pub fn data_turn(request: &IntentRequest<'_>) -> Option<String> {
 /// # The New agent form is LABELS, only while its fields are live (PRD #1223)
 ///
 /// `new_agent_form` is present only when the dialog declared a live form, and
-/// carries the Mode chips and the Agent picker's entries as their labels — the
+/// carries the Mode chips and the agent entries as their labels — the
 /// words on the chips — so a model can tell "schedule issues" is a mode and
 /// "opencode" an agent type, and see that a chip the user named is not
 /// offered. `modes_not_offered` names the chips the dialog knows and withholds
@@ -743,7 +743,7 @@ pub(crate) mod tests {
                 deck_id: "deck-0000000000000001".to_string(),
                 path: "/home/secret-user/code".to_string(),
                 modes: vec![choice("none", "No mode"), choice("schedule", "schedule")],
-                agent_types: vec![choice("auto", "auto"), choice("claude", "Claude Code")],
+                agent_types: vec![choice("claude", "Claude Code"), choice("pi", "Pi")],
                 withheld_modes: vec![choice("schedule-issues", "schedule: issues")],
             }),
         };
@@ -767,7 +767,7 @@ pub(crate) mod tests {
             rendered["new_agent_form"],
             json!({
                 "modes": ["No mode", "schedule"],
-                "agent_types": ["auto", "Claude Code"],
+                "agent_types": ["Claude Code", "Pi"],
                 "modes_not_offered": ["schedule: issues"],
             })
         );

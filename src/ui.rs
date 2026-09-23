@@ -974,11 +974,6 @@ fn live_orchestration_cwds_and_titles() -> (Vec<String>, Vec<String>) {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FormField {
     Mode,
-    /// PRD #20 finding #8: the per-agent selector. A CLICK-activated chip (not
-    /// part of the Tab/Enter Mode→Name→Command cycle, so existing key-driven
-    /// flows are unchanged); focusing it or cycling it with ◀▶ seeds the
-    /// Command from the selected registry entry's `default_command`.
-    Agent,
     Name,
     Command,
 }
@@ -1032,11 +1027,6 @@ struct NewPaneFormState {
     /// form, which renders no cycler at all.
     show_dispatcher: bool,
     selection_index: usize, // 0 = "No mode", 1..M = modes, M+1..M+O = orchestrations, then "schedule" [, "schedule: issues"]
-    /// PRD #20 finding #8: the selected agent's index into
-    /// [`crate::agent_registry::ALL`], or `None` when the user hasn't picked one
-    /// (the Command then comes from the global default / typed text). Selecting
-    /// an agent seeds the Command from that entry's `default_command`.
-    agent_selection: Option<usize>,
     has_mode_field: bool,
     focused: FormField,
     /// PRD #170 (unify): when `true` the form is MODE-LOCKED to schedule
@@ -1162,7 +1152,6 @@ impl NewPaneFormState {
             // unrelated reason (that form hides the cycler entirely).
             show_dispatcher: true,
             selection_index: 0,
-            agent_selection: None,
             has_mode_field,
             focused: FormField::Mode,
             // PRD #170: the ordinary `Ctrl+n` form is never locked.
@@ -1363,7 +1352,6 @@ impl NewPaneFormState {
             dispatcher_authoring,
             show_dispatcher: false,
             selection_index: 0,
-            agent_selection: None,
             has_mode_field: true,
             focused: FormField::Command,
             schedule_locked: true,
@@ -1536,54 +1524,6 @@ impl NewPaneFormState {
         self.selected_orchestration().is_none()
     }
 
-    /// PRD #20 finding #8: the label shown in the Agent chip — the selected
-    /// registry entry's label, or `auto` when no agent is picked (Command comes
-    /// from the global default / typed text).
-    fn agent_label(&self) -> String {
-        match self.agent_selection {
-            Some(idx) => crate::agent_registry::ALL
-                .get(idx)
-                .map(|spec| spec.label.to_string())
-                .unwrap_or_else(|| "auto".to_string()),
-            None => "auto".to_string(),
-        }
-    }
-
-    /// PRD #20 finding #8: select the agent at `idx` and SEED the Command field
-    /// from its registry `default_command`. This is the whole point of the
-    /// selector — picking an agent fills in how to launch it — so the seed
-    /// consults the registry, not any global config value.
-    fn select_agent(&mut self, idx: usize) {
-        if let Some(spec) = crate::agent_registry::ALL.get(idx) {
-            self.agent_selection = Some(idx);
-            self.command = spec.default_command.unwrap_or_default().to_string();
-        }
-    }
-
-    /// Advance the Agent selection to the next shipped agent (wrapping), seeding
-    /// the Command. An unselected field starts at the first agent.
-    fn cycle_agent_next(&mut self) {
-        let n = crate::agent_registry::ALL.len();
-        if n == 0 {
-            return;
-        }
-        let next = self.agent_selection.map(|i| (i + 1) % n).unwrap_or(0);
-        self.select_agent(next);
-    }
-
-    /// Reverse of [`Self::cycle_agent_next`].
-    fn cycle_agent_prev(&mut self) {
-        let n = crate::agent_registry::ALL.len();
-        if n == 0 {
-            return;
-        }
-        let prev = self
-            .agent_selection
-            .map(|i| (i + n - 1) % n)
-            .unwrap_or(n - 1);
-        self.select_agent(prev);
-    }
-
     fn next_field(&self) -> FormField {
         // PRD #170: the locked schedule form has a single navigable field
         // (Command) — Mode + Name are hidden, so Tab is a no-op.
@@ -1593,9 +1533,6 @@ impl NewPaneFormState {
         let cmd_visible = self.command_visible();
         match self.focused {
             FormField::Mode => FormField::Name,
-            // PRD #20 finding #8: the Agent chip is off the Tab cycle (only
-            // reachable by click); leaving it advances to Name.
-            FormField::Agent => FormField::Name,
             FormField::Name => {
                 if cmd_visible {
                     FormField::Command
@@ -1630,9 +1567,6 @@ impl NewPaneFormState {
                     FormField::Name
                 }
             }
-            // PRD #20 finding #8: the Agent chip is off the Tab cycle; stepping
-            // back from it lands on Mode.
-            FormField::Agent => FormField::Mode,
             FormField::Name => {
                 if self.has_mode_field {
                     FormField::Mode
@@ -8957,22 +8891,8 @@ fn handle_new_pane_form_key(key: KeyEvent, ui: &mut UiState) -> Action {
         KeyCode::Right | KeyCode::Char('l') if form.focused == FormField::Mode => {
             form.select_next_mode();
         }
-        // PRD #20 finding #8: Left/Right cycle the Agent selector when it is
-        // focused (via click), seeding the Command from the picked registry
-        // entry's default_command.
-        KeyCode::Left | KeyCode::Char('h') if form.focused == FormField::Agent => {
-            form.cycle_agent_prev();
-        }
-        KeyCode::Right | KeyCode::Char('l') if form.focused == FormField::Agent => {
-            form.cycle_agent_next();
-        }
         KeyCode::Enter => match form.focused {
             FormField::Mode => {
-                form.focused = FormField::Name;
-            }
-            // PRD #20 finding #8: Enter from the click-focused Agent chip
-            // advances to Name (it is off the Tab cycle).
-            FormField::Agent => {
                 form.focused = FormField::Name;
             }
             FormField::Name if form.command_visible() => {
@@ -9012,7 +8932,7 @@ fn handle_new_pane_form_key(key: KeyEvent, ui: &mut UiState) -> Action {
                     &mut form.name
                 }
                 FormField::Command => &mut form.command,
-                FormField::Mode | FormField::Agent => unreachable!(),
+                FormField::Mode => unreachable!(),
             };
             field.pop();
         }
@@ -9024,7 +8944,7 @@ fn handle_new_pane_form_key(key: KeyEvent, ui: &mut UiState) -> Action {
                     &mut form.name
                 }
                 FormField::Command => &mut form.command,
-                FormField::Mode | FormField::Agent => unreachable!(),
+                FormField::Mode => unreachable!(),
             };
             field.push(c);
         }
@@ -11288,12 +11208,6 @@ fn dispatch_action(
         Action::FormFocusField(field) => {
             if let Some(form) = ui.new_pane_form.as_mut() {
                 form.focused = field;
-                // PRD #20 finding #8: clicking the Agent chip picks an agent
-                // (the first one if none was selected yet) and seeds the
-                // Command from its registry default_command.
-                if field == FormField::Agent {
-                    form.select_agent(form.agent_selection.unwrap_or(0));
-                }
             }
         }
         // click a mode chip → select that option (== Left/Right/h/l cycler).
@@ -19974,10 +19888,6 @@ fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState) -> FormClick
     };
     // PRD #170: the locked schedule form also drops the Name row.
     let name_rows: u16 = if show_name { 1 } else { 0 };
-    // PRD #20 finding #8: the Agent selector row shows in the ordinary form
-    // (same condition as Name); the locked schedule form omits it.
-    let show_agent = show_name;
-    let agent_rows: u16 = if show_agent { 1 } else { 0 };
     // PRD #106: when the Command field is hidden (orchestration selected) the
     // form is two rows shorter — Command's label row plus its spacing row.
     let cmd_visible = form.command_visible();
@@ -20027,8 +19937,7 @@ fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState) -> FormClick
     // than the chip row (`warning_w` is 0 when no warning shows, so the width is
     // unchanged in every other state).
     let desired_w = chip_row_w.max(warning_w).saturating_add(4).max(56);
-    let desired_h =
-        9 + name_rows + agent_rows + mode_extra + cmd_rows + schedule_rows + warning_rows;
+    let desired_h = 9 + name_rows + mode_extra + cmd_rows + schedule_rows + warning_rows;
     let popup_area = modal_rect(desired_w, desired_h, area, 56, 10);
     let popup_width = popup_area.width;
 
@@ -20047,11 +19956,6 @@ fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState) -> FormClick
         unfocused_label
     };
     let cmd_style = if form.focused == FormField::Command {
-        focused_label
-    } else {
-        unfocused_label
-    };
-    let agent_style = if form.focused == FormField::Agent {
         focused_label
     } else {
         unfocused_label
@@ -20102,26 +20006,6 @@ fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState) -> FormClick
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::ITALIC),
         ));
-    }
-
-    // PRD #20 finding #8: the Agent selector chip. Rendered as a `[label]` chip
-    // (`auto` when unpicked) so its value is machine-readable next to the
-    // `Agent:` label. Off the Tab/Enter cycle — clicking it (or ◀▶ once focused)
-    // picks an agent and seeds the Command from its registry default_command.
-    let mut agent_line_idx: Option<usize> = None;
-    if show_agent {
-        agent_line_idx = Some(lines.len());
-        lines.push(Line::from(vec![
-            Span::styled("  Agent:   ", agent_style),
-            Span::styled(
-                format!("[{}]", form.agent_label()),
-                if form.focused == FormField::Agent {
-                    text_primary()
-                } else {
-                    unfocused_label
-                },
-            ),
-        ]));
     }
 
     // PRD #170: the locked schedule form hides the Name field — the card's name
@@ -20241,20 +20125,6 @@ fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState) -> FormClick
     let inner_end = row_x + row_width;
 
     let mut field_rects: Vec<(FormField, Rect)> = Vec::new();
-    // PRD #20 finding #8: clicking the Agent row focuses it (and picks/seeds).
-    if let Some(ai) = agent_line_idx
-        && line_y(ai) < popup_bottom
-    {
-        field_rects.push((
-            FormField::Agent,
-            Rect {
-                x: row_x,
-                y: line_y(ai),
-                width: row_width,
-                height: 1,
-            },
-        ));
-    }
     if let Some(ni) = name_line_idx {
         field_rects.push((
             FormField::Name,
@@ -28225,6 +28095,71 @@ mod tests {
             out.push('\n');
         }
         out
+    }
+
+    /// Scenario: open the ordinary `Ctrl+n` new-pane form (two modes, a Name
+    /// and a Command) and render it into an 80x24 `TestBackend`. It shows the
+    /// Mode chips, `Name:` and `Command:` and NO `Agent:` row — no `[auto]`
+    /// chip and no click target for one — and Tab visits Mode → Name →
+    /// Command and back. PRD #1223 removed the Agent chip from both clients: it
+    /// sat outside the Tab cycle so a keyboard user could not reach it, its
+    /// `auto` meant nothing and its label went stale against an edited
+    /// Command. This pins its absence at L1; `prompt/new-pane/015` pins it in
+    /// the real binary.
+    #[test]
+    fn new_pane_form_has_no_agent_row() {
+        let modes = ["demo", "demo2"]
+            .iter()
+            .map(|name| ModeConfig {
+                agent: None,
+                name: (*name).to_string(),
+                init_command: None,
+                seed_prompt: None,
+                panes: Vec::new(),
+                rules: Vec::new(),
+                reactive_panes: 0,
+            })
+            .collect();
+        let mut form = NewPaneFormState::new(
+            PathBuf::from("/tmp/project"),
+            "myname".to_string(),
+            "claude".to_string(),
+            modes,
+            Vec::new(),
+        );
+        let mut targets = None;
+        let rendered = buffer_to_string(&render_overlay_to_buffer(80, 24, |frame| {
+            targets = Some(render_new_pane_form(frame, &form));
+        }));
+
+        assert!(rendered.contains("Name:"), "got:\n{rendered}");
+        assert!(rendered.contains("Command:"), "got:\n{rendered}");
+        assert!(rendered.contains("demo2"), "got:\n{rendered}");
+        assert!(
+            !rendered.contains("Agent:") && !rendered.contains("[auto]"),
+            "the form must render no Agent row, got:\n{rendered}"
+        );
+        let (fields, _, _) = targets.expect("rendered");
+        assert_eq!(
+            fields.iter().map(|(field, _)| *field).collect::<Vec<_>>(),
+            vec![FormField::Name, FormField::Command, FormField::Mode],
+            "the only clickable field rows are Name, Command and the Mode row"
+        );
+
+        let mut visited = vec![form.focused];
+        for _ in 0..3 {
+            form.focused = form.next_field();
+            visited.push(form.focused);
+        }
+        assert_eq!(
+            visited,
+            vec![
+                FormField::Mode,
+                FormField::Name,
+                FormField::Command,
+                FormField::Mode
+            ]
+        );
     }
 
     // -----------------------------------------------------------------------

@@ -217,7 +217,7 @@ heard_as_whole_while.new_agent_dialog = [
 #
 # Reversible — EXCEPT over the New agent dialog (PRD #1223, closing audit H1).
 # A pane or the command list reopens as it was; the dialog's deck, directory,
-# Mode, Agent, Name and hand-edited Command are component-local state that
+# Mode, Name and hand-edited Command are component-local state that
 # closing discards. So while the dialog is declared, `heard_as_whole_while`
 # replaces `heard_as` with whole-utterance equality: "name it done worker"
 # contains `done`, and a steered `close` must not ground on it and throw the
@@ -563,34 +563,38 @@ heard_as    = [
   "this directory", "this folder",
 ]
 
-# PRD #1223 — the rest of the New agent form by voice: Mode, Agent and Name.
+# PRD #1223 — the rest of the New agent form by voice: Mode, the agent's
+# command, and Name.
 #
 # **Each resolves against what the form OFFERS, as the dialog declared it**
 # (`VoiceNewAgentForm`), never against a list this table knows. The Mode row
 # varies by the deck's capabilities (the authoring chips need `authoring-kind`,
 # orchestration chips need `prepare-workflow`), the deck's experimental flag
-# (`schedule: issues`) and whether the directory is a project; the Agent picker
-# is the deck's own registry, or the desktop's labelled fallback. So "mode
+# (`schedule: issues`) and whether the directory is a project; the agents are
+# the deck's own registry, or the desktop's fallback copy. So "mode
 # schedule issues" on a deck whose flag is off is refused as a chip that is not
 # offered — the same `ParamUnresolved` a directory not on screen gets — rather
 # than resolved against a chip nobody can see.
 #
 # **Availability is `requires = ["new_agent_form"]`**: the fields are live only
 # with a deck and a directory chosen, no start in flight and no start
-# confirmation open — exactly when a click on them would take. Each row calls the
-# function its click calls (`selectMode`, `chooseAgent`, the Name input's own
-# setter), so choosing an agent overwrites Command with its default exactly as
-# the picker does, and a spoken Name counts as an edit exactly as a typed one.
+# confirmation open — exactly when a click on them would take. `choose_mode` and
+# `name_new_agent` call the function their control calls (`selectMode`, the
+# Name input's own setter), so a spoken Name counts as an edit exactly as a
+# typed one. `choose_agent_type` has had no control of its own since the Agent
+# picker was removed from both clients (PRD #1223): it sets Command to the named
+# agent's `default_command`, overwriting what is there.
 #
 # **Command has NO row, deliberately.** It is the one field that executes: what
 # is in it runs as the deck's user in the chosen directory. Dictating a shell
 # command is the most error-prone thing a transcriber can be asked to do —
 # flags, quotes, paths and punctuation are precisely what it normalises away —
 # and a mis-dictated command is the one mistake in this dialog with
-# consequences beyond the form. Choosing an agent already fills it with that
-# agent's default command, which covers the common case, and the field stays
-# typed by hand. `choose_mode`'s and `name_new_agent`'s descriptions say so, so
-# "set the command to …" is not coerced into either.
+# consequences beyond the form. `choose_agent_type` fills it with an agent's
+# REGISTRY default — a value the deck supplied, never a transcription — which
+# covers the common case, and anything else is typed by hand. All three form
+# rows' descriptions say so, so "set the command to …" is not coerced into a
+# dictation.
 #
 # **None of these starts anything**, so none is in PRD #802 D5's set: they
 # change what the form will say, and a start is still a separate, confirmed
@@ -619,21 +623,22 @@ heard_as    = ["mode", "schedule", "dispatcher", "orchestration", "orch", "plain
 
 [[commands]]
 id          = "choose_agent_type"
-description = """In the New agent form, choose which agent to start from its Agent picker — Claude
-Code, OpenCode, Pi, Codex, or auto — which also fills the Command field with that agent's default
-command. Use for use claude, pick opencode, agent codex, make it a pi agent, set the agent to
-auto. Set `agent_type` to the words the user used, copied as they said them — even when they name
-one that is NOT in `new_agent_form.agent_types`: the app then says it is not offered, so never
-answer with the nearest entry instead. This is a KIND of agent for the new one, never an existing
-agent (that is `open_agent`), and it starts nothing."""
+description = """In the New agent form, choose which agent to start — Claude Code, OpenCode, Pi or
+Codex — by filling the Command field with that agent's default command. Use for use claude, pick
+opencode, agent codex, make it a pi agent, set the agent to claude. Set `agent_type` to the words
+the user used, copied as they said them — even when they name one that is NOT in
+`new_agent_form.agent_types`: the app then says it is not offered, so never answer with the
+nearest entry instead. This is a KIND of agent for the new one, never an existing agent (that is
+`open_agent`), and it starts nothing. It only ever puts an agent's own default command in the
+field: any other command line is typed by hand."""
 invoke      = "chooseNewAgentType"
 screens     = ["overview"]
 requires    = ["new_agent_form"]
 unavailable_hint = "choosing an agent needs a deck and a directory chosen in the New agent dialog; choose those first"
-report      = "Agent: {agent_type}."
+report      = "Command set to {agent_type}'s default command."
 asks_to     = "choose an agent"
 try_saying  = "use {agent_type}"
-heard_as    = ["agent", "use", "pick", "choose", "make it", "set", "claude", "opencode", "pi", "codex", "auto"]
+heard_as    = ["agent", "use", "pick", "choose", "make it", "set", "claude", "opencode", "pi", "codex"]
 
   [[commands.params]]
   name = "agent_type"

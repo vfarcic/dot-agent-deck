@@ -245,16 +245,20 @@ export type VoiceActionContext = {
   useThisDirectory: (target: VoiceDispatchTarget) => string | undefined;
   /**
    * PRD #1223 — the rest of the New agent form by voice: choose the Mode chip
-   * a `mode_ref` resolved to (`target.modeId`), the Agent picker entry an
-   * `agent_type_ref` resolved to (`target.agentTypeId`), or set Name to the
-   * words after the marked boundary (`target.text`). Each calls the function
-   * the control's own click or keystroke calls, and each answers `undefined`
-   * when it acted or the dialog's sentence when it would not — the form can
-   * move during the round trip exactly as the browser can, so each re-checks
-   * {@link VoiceDispatchTarget.declaredForm} against the live form first.
+   * a `mode_ref` resolved to (`target.modeId`), set Command to the default
+   * command of the agent an `agent_type_ref` resolved to
+   * (`target.agentTypeId`), or set Name to the words after the marked
+   * boundary (`target.text`). Mode and Name call the function the control's
+   * own click or keystroke calls; the agent has no control since the Agent
+   * picker was removed, and fills Command from the deck's registry. Each
+   * answers `undefined` when it acted or the dialog's sentence when it would
+   * not — the form can move during the round trip exactly as the browser can,
+   * so each re-checks {@link VoiceDispatchTarget.declaredForm} against the
+   * live form first.
    *
-   * There is deliberately no member for Command: it is the field that
-   * executes, and it stays typed by hand (`commands.toml` has the argument).
+   * Command is never DICTATED: it is the field that executes, so the only
+   * thing voice puts there is a registry default (`commands.toml` has the
+   * argument).
    */
   chooseNewAgentMode: (target: VoiceDispatchTarget) => string | undefined;
   chooseNewAgentType: (target: VoiceDispatchTarget) => string | undefined;
@@ -617,7 +621,7 @@ export const VOICE_ACTIONS = {
   },
 
   chooseNewAgentType: {
-    label: "Choose the agent in the New agent form's picker",
+    label: "Set the New agent form's Command to an agent's default command",
     voice: true,
     needs: ["chooseNewAgentType", "reportRefused"],
     run: (context: Pick<VoiceActionContext, "chooseNewAgentType" | "reportRefused">, target: VoiceDispatchTarget) => {
@@ -754,7 +758,7 @@ export type VoiceDispatchTarget = AgentViewTarget & {
    * (PRD #1223).
    */
   modeId?: string;
-  /** The Agent picker entry an `agent_type_ref` resolved to — its registry id, or `auto`. */
+  /** The agent entry an `agent_type_ref` resolved to — its registry id. */
   agentTypeId?: string;
   /**
    * The New agent form the utterance was JUDGED against — its deck and chosen

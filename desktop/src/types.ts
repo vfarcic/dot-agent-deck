@@ -298,7 +298,7 @@ export type DeckDirectoryListing =
   }
   | { kind: "unsupported" };
 
-/** One agent registry entry, for the New agent form's Agent picker (PRD #1223 M4). */
+/** One agent registry entry, for the New agent form's agent list (PRD #1223 M4). */
 export interface NewAgentOption {
   /** The registry's stable key (`claude`, `opencode`, …). */
   id: string;

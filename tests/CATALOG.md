@@ -1487,11 +1487,11 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** the in-process read-back within one launch (covered by `prompt/new-pane/011`); the `default_command` precedence (covered by `prompt/new-pane/012`); the authoring-mode recording (covered by `prompt/new-pane/013`).
 - **Platform coverage:** mac+linux.
 
-##### prompt/new-pane/015 — Selecting an agent in the real new-pane form seeds its registry default without a global-config copy (PRD #20, finding 8).
-- **Layer:** L2 PTY-attached (the private new-pane form is driven through the real binary and its visible selector is clicked/cycled).
-- **Agent:** none (selection rows for Claude Code, OpenCode, Pi, and Codex; no agent process is submitted).
-- **Asserts:** with no global `default_command`, the form exposes an `Agent:` selector; selecting each shipped type visibly updates Command to exactly that type's `AgentSpec.default_command`.
-- **Does not assert:** launch wrapping (covered by `codex/spawn/*` and `codex/live/001`) or custom command arguments.
+##### prompt/new-pane/015 — The real new-pane form has no Agent selector (PRD #1223; it pinned PRD #20 finding 8's chip until that was removed).
+- **Layer:** L2 PTY-attached (the new-pane form is opened through the real binary and its painted grid read).
+- **Agent:** none (no agent process is submitted).
+- **Asserts:** the form renders `Name:` and `Command:` and no `Agent:` row or `[auto]` chip; two Tabs from Mode reach Command, where a typed character lands. The chip it used to cycle sat outside the Tab order, meant nothing as `auto` and went stale against an edited Command, so PRD #1223 removed it from the TUI and the desktop alike. The L1 half is `ui::tests::new_pane_form_has_no_agent_row`.
+- **Does not assert:** launch wrapping (covered by `codex/spawn/*` and `codex/live/001`); the desktop's voice `choose_agent_type`, which is the remaining way to set Command from an agent's registry default.
 - **Platform coverage:** mac+linux.
 
 ##### prompt/new-pane/016 — Selecting the "dispatcher" option in the new-pane form opens a live dispatcher dashboard card whose real Claude agent, given a goal, invokes `dot-agent-deck dispatch` itself and the daemon creates the promised sibling git worktree (PRD #220). [reel]
