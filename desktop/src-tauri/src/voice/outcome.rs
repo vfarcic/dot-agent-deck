@@ -378,7 +378,8 @@ impl VoiceResult {
 /// ask the backend, then refuse anything the table does not sanction — an
 /// action that is not in it, an action the current screen cannot run, a missing
 /// param, a param that resolves to nothing or to more than one thing. Each
-/// refusal is its own outcome carrying its own sentence.
+/// refusal is its own outcome carrying its own sentence. An OPTIONAL param that
+/// fails is the exception: it is dropped, and the dispatch's sentence says so.
 ///
 /// `table` is a parameter rather than [`super::table::table()`] so a test can
 /// drive a fixture table; M6 passes the embedded one. `decks` is the observed
@@ -431,9 +432,11 @@ pub async fn handle_utterance(
 /// an off-machine endpoint, the key. **The table**: every
 /// row that [`needs_labels`] is `callable: false` with
 /// [`LABELS_WITHHELD_HINT`] ([`annotate_for`]). **The refusals**: such a row
-/// picked anyway, or an optional observed-name param supplied anyway
-/// (`open_new_agent` with a deck named), is [`VoiceOutcome::Unavailable`] with
-/// that hint — never resolved against a model that saw nothing.
+/// picked anyway is [`VoiceOutcome::Unavailable`] with that hint — never
+/// resolved against a model that saw nothing. An optional observed-name param
+/// supplied anyway (`open_new_agent` with a deck named) is not resolved either,
+/// but it no longer refuses the row: it is dropped like any optional param that
+/// fails, and the report names the setting that withheld it.
 ///
 /// **What it does not change** is what the APP holds: callability still reads
 /// the dialog's declarations, because whether `go_to_parent` can run is a
@@ -549,6 +552,7 @@ pub async fn handle_utterance_with(
     // a registry entry that EXISTS is a different question, and not one this
     // function answers — M3's guard is what answers it, at commit time.)
     let mut resolved: Vec<ResolvedParam> = Vec::with_capacity(row.params.len());
+    let mut dropped: Vec<String> = Vec::new();
     for spec in &row.params {
         let Some(spoken) = answer
             .params
@@ -557,9 +561,8 @@ pub async fn handle_utterance_with(
             .filter(|value| !value.is_empty())
         else {
             // An optional param the model left out is simply not dispatched
-            // (PRD #1223's "new agent" with no deck named). Only ABSENCE is
-            // forgiven: a value that resolves to nothing is refused below
-            // exactly as a required one is.
+            // (PRD #1223's "new agent" with no deck named), and says nothing:
+            // the user did not ask for one either.
             if spec.optional {
                 continue;
             }
@@ -570,295 +573,345 @@ pub async fn handle_utterance_with(
                 param: spec.name.clone(),
             });
         };
-        // An optional observed-name param the model supplied while labels are
-        // withheld: the user named something this request could not show the
-        // model, so it is refused with the reason rather than resolved.
-        if withheld && spec.kind.names_something_observed() {
-            return finish(VoiceOutcome::labels_withheld(transcript, row));
-        }
-        match spec.kind {
-            // The fidelity guarantee (PRD #802 D6, rebuilt), and it is checked
-            // HERE rather than trusted anywhere: the model marked a boundary in
-            // words it says the user used, and this is where those words are
-            // held against the transcript the transcriber actually produced.
-            // What goes into `value` — which is what the agent's prompt
-            // receives — is a slice of THAT transcript. There is deliberately
-            // no arm that falls back to the model's own string, which is the
-            // whole difference between a model locating content and a model
-            // supplying it.
-            ParamKind::SpokenPrefix => match strip_opening(transcript.text(), spoken) {
-                Some(rest) if !rest.trim().is_empty() => resolved.push(ResolvedParam {
-                    name: spec.name.clone(),
-                    kind: spec.kind,
-                    spoken: spoken.to_string(),
-                    value: rest.to_string(),
-                    label: rest.to_string(),
-                }),
-                // Two situations, one refusal, because the user's position is
-                // the same in both: nothing was typed. Either the marked words
-                // are not how the utterance started, or they are the whole of
-                // it and there is nothing left to type.
-                _ => {
-                    return finish(VoiceOutcome::ParamUnresolved {
-                        sentence: heard(&transcript, &spec.kind.unresolved_phrase(spoken)),
-                        transcript,
-                        action: row.id.clone(),
-                        param: spec.name.clone(),
-                        spoken: spoken.to_string(),
-                    });
-                }
-            },
-            ParamKind::AgentRef => match resolve_agent_ref(spoken, agents) {
-                AgentRefMatch::One { id, label } => resolved.push(ResolvedParam {
-                    name: spec.name.clone(),
-                    kind: spec.kind,
-                    spoken: spoken.to_string(),
-                    value: id,
-                    label,
-                }),
-                AgentRefMatch::None => {
-                    return finish(VoiceOutcome::ParamUnresolved {
-                        sentence: heard(&transcript, &spec.kind.unresolved_phrase(spoken)),
-                        transcript,
-                        action: row.id.clone(),
-                        param: spec.name.clone(),
-                        spoken: spoken.to_string(),
-                    });
-                }
-                AgentRefMatch::Ambiguous(labels) => {
-                    return finish(VoiceOutcome::ParamAmbiguous {
-                        sentence: heard(&transcript, &spec.kind.ambiguous_phrase(spoken, &labels)),
-                        transcript,
-                        action: row.id.clone(),
-                        param: spec.name.clone(),
-                        spoken: spoken.to_string(),
-                        matches: labels,
-                    });
-                }
-            },
-            // PRD #1223 — the same three answers as an agent reference, against
-            // the observed fleet, and the same two refusals: no new outcome
-            // variant, because from where the user stands "no deck matches" and
-            // "no agent matches" are the same situation about different things.
-            ParamKind::DeckRef => match resolve_deck_ref(spoken, decks) {
-                DeckRefMatch::One { id, label } => {
-                    let names = decks
-                        .iter()
-                        .find(|deck| deck.id == id)
-                        .map(deck_spoken_names)
-                        .unwrap_or_default();
-                    if let Some(refusal) =
-                        refuse_ungrounded(&transcript, row, spec, spoken, &names, &label)
-                    {
-                        return finish(refusal);
-                    }
-                    resolved.push(ResolvedParam {
-                        name: spec.name.clone(),
-                        kind: spec.kind,
-                        spoken: spoken.to_string(),
-                        value: id,
-                        label,
-                    })
-                }
-                DeckRefMatch::None => {
-                    return finish(VoiceOutcome::ParamUnresolved {
-                        sentence: heard(&transcript, &spec.kind.unresolved_phrase(spoken)),
-                        transcript,
-                        action: row.id.clone(),
-                        param: spec.name.clone(),
-                        spoken: spoken.to_string(),
-                    });
-                }
-                DeckRefMatch::Ambiguous(labels) => {
-                    return finish(VoiceOutcome::ParamAmbiguous {
-                        sentence: heard(&transcript, &spec.kind.ambiguous_phrase(spoken, &labels)),
-                        transcript,
-                        action: row.id.clone(),
-                        param: spec.name.clone(),
-                        spoken: spoken.to_string(),
-                        matches: labels,
-                    });
-                }
-            },
-            // PRD #1223 — the browser's children on screen, and the same two
-            // refusals once more. `directories` is `Some` here whenever the row
-            // got past `callable` above, since every `dir_ref` row requires a
-            // listing; the `None` arm of the resolver answers no match rather
-            // than trusting that, so a future row that forgot the requirement
-            // refuses instead of resolving against nothing.
-            ParamKind::DirRef => match resolve_dir_ref(spoken, directories) {
-                DirRefMatch::One { path, name } => {
-                    if let Some(refusal) =
-                        refuse_ungrounded(&transcript, row, spec, spoken, &dir_names(&name), &name)
-                    {
-                        return finish(refusal);
-                    }
-                    resolved.push(ResolvedParam {
-                        name: spec.name.clone(),
-                        kind: spec.kind,
-                        spoken: spoken.to_string(),
-                        value: path,
-                        label: name,
-                    })
-                }
-                DirRefMatch::None => {
-                    return finish(VoiceOutcome::ParamUnresolved {
-                        sentence: heard(&transcript, &spec.kind.unresolved_phrase(spoken)),
-                        transcript,
-                        action: row.id.clone(),
-                        param: spec.name.clone(),
-                        spoken: spoken.to_string(),
-                    });
-                }
-                DirRefMatch::Ambiguous(names) => {
-                    return finish(VoiceOutcome::ParamAmbiguous {
-                        sentence: heard(&transcript, &spec.kind.ambiguous_phrase(spoken, &names)),
-                        transcript,
-                        action: row.id.clone(),
-                        param: spec.name.clone(),
-                        spoken: spoken.to_string(),
-                        matches: names,
-                    });
-                }
-            },
-            // PRD #1223 — an orchestration, as the overview's card for it:
-            // resolved against the live agents grouped the way `groupAgents`
-            // groups them, and the same two refusals. `value` is one of its
-            // members' agent ids, which is what lets the frontend find the
-            // card whether or not the daemon gave the orchestration an id.
-            ParamKind::OrchestrationRef => match resolve_orchestration_ref(spoken, agents) {
-                ChoiceMatch::One { id, label } => {
-                    let names = orchestrations(agents)
-                        .into_iter()
-                        .find(|card| card.member_id == id)
-                        .map(|card| orchestration_names(&card))
-                        .unwrap_or_default();
-                    if let Some(refusal) =
-                        refuse_ungrounded(&transcript, row, spec, spoken, &names, &label)
-                    {
-                        return finish(refusal);
-                    }
-                    resolved.push(ResolvedParam {
-                        name: spec.name.clone(),
-                        kind: spec.kind,
-                        spoken: spoken.to_string(),
-                        value: id,
-                        label,
-                    })
-                }
-                ChoiceMatch::None => {
-                    return finish(VoiceOutcome::ParamUnresolved {
-                        sentence: heard(&transcript, &spec.kind.unresolved_phrase(spoken)),
-                        transcript,
-                        action: row.id.clone(),
-                        param: spec.name.clone(),
-                        spoken: spoken.to_string(),
-                    });
-                }
-                ChoiceMatch::Ambiguous(titles) => {
-                    return finish(VoiceOutcome::ParamAmbiguous {
-                        sentence: heard(&transcript, &spec.kind.ambiguous_phrase(spoken, &titles)),
-                        transcript,
-                        action: row.id.clone(),
-                        param: spec.name.clone(),
-                        spoken: spoken.to_string(),
-                        matches: titles,
-                    });
-                }
-            },
-            // PRD #1223 — the New agent form's two closed sets, as the dialog
-            // declared them ON SCREEN, and the same two refusals. `new_agent`
-            // carries a form whenever a row requiring one got past `callable`;
-            // the resolver answers no match without one rather than trusting
-            // that, for the `dir_ref` arm's reason.
-            ParamKind::ModeRef | ParamKind::AgentTypeRef => {
-                let form = new_agent.and_then(|dialog| dialog.form.as_ref());
-                let choices = match (spec.kind, form) {
-                    (ParamKind::ModeRef, Some(form)) => form.modes.as_slice(),
-                    (_, Some(form)) => form.agent_types.as_slice(),
-                    (_, None) => &[],
-                };
-                let resolved_choice = if spec.kind == ParamKind::ModeRef {
-                    // A chip the form withholds is refused by name — whether
-                    // the model copied it or substituted a nearby offered chip
-                    // while the transcript names the withheld one. See
-                    // [`withheld_mode_named`].
-                    let withheld = form.map_or(&[][..], |form| form.withheld_modes.as_slice());
-                    match withheld_mode_named(spoken, transcript.text(), choices, withheld) {
-                        Some(label) => {
-                            return finish(VoiceOutcome::ParamUnresolved {
-                                sentence: heard(&transcript, &spec.kind.unresolved_phrase(&label)),
-                                transcript,
-                                action: row.id.clone(),
-                                param: spec.name.clone(),
-                                spoken: spoken.to_string(),
-                            });
-                        }
-                        None => resolve_mode_ref(spoken, choices),
-                    }
-                } else {
-                    resolve_agent_type_ref(spoken, choices)
-                };
-                match resolved_choice {
-                    ChoiceMatch::One { id, label } => {
-                        let names = choices
-                            .iter()
-                            .find(|choice| choice.id == id)
-                            .map(|choice| {
-                                if spec.kind == ParamKind::ModeRef {
-                                    mode_names(choice)
-                                } else {
-                                    agent_type_names(choice)
-                                }
-                            })
-                            .unwrap_or_default();
-                        if let Some(refusal) =
-                            refuse_ungrounded(&transcript, row, spec, spoken, &names, &label)
-                        {
-                            return finish(refusal);
-                        }
-                        resolved.push(ResolvedParam {
-                            name: spec.name.clone(),
-                            kind: spec.kind,
-                            spoken: spoken.to_string(),
-                            value: id,
-                            label,
-                        })
-                    }
-                    ChoiceMatch::None => {
-                        return finish(VoiceOutcome::ParamUnresolved {
-                            sentence: heard(&transcript, &spec.kind.unresolved_phrase(spoken)),
-                            transcript,
-                            action: row.id.clone(),
-                            param: spec.name.clone(),
-                            spoken: spoken.to_string(),
-                        });
-                    }
-                    ChoiceMatch::Ambiguous(labels) => {
-                        return finish(VoiceOutcome::ParamAmbiguous {
-                            sentence: heard(
-                                &transcript,
-                                &spec.kind.ambiguous_phrase(spoken, &labels),
-                            ),
-                            transcript,
-                            action: row.id.clone(),
-                            param: spec.name.clone(),
-                            spoken: spoken.to_string(),
-                            matches: labels,
-                        });
-                    }
-                }
+        // An observed-name param the model supplied while labels are withheld:
+        // this request could not show the model the name, so it is never
+        // resolved. (A REQUIRED one never gets here — `needs_labels` refused
+        // its row above — so in practice this is always the optional case.)
+        let step = if withheld && spec.kind.names_something_observed() {
+            Err(Unmet::LabelsWithheld)
+        } else {
+            resolve_param(
+                spec,
+                spoken,
+                &transcript,
+                agents,
+                decks,
+                directories,
+                new_agent,
+            )
+        };
+        match step {
+            Ok(param) => resolved.push(param),
+            // **An optional param that fails is DROPPED, and the action
+            // proceeds without it** (PRD #1223) — whichever way it failed:
+            // not grounded in what the user said, matching nothing, matching
+            // several, or withheld from the model.
+            //
+            // Grounding and resolution exist to stop an unsupported VALUE being
+            // acted on. For an optional param, leaving it out is precisely the
+            // safe outcome: it is the same state as the user not having
+            // supplied it, which the row already handles — "new agent" with no
+            // deck opens the dialog on its deck step. Refusing the whole action
+            // instead converted a value the model INVENTED into a failure of a
+            // command the user genuinely asked for — "Create a new agent" was
+            // refused with `you did not name "Local deck"` — and the action
+            // itself was already held against the transcript separately, by
+            // `action_grounded` above.
+            //
+            // It is dropped out loud, not silently: the report says what was
+            // left out and why ([`Unmet::dropped_note`]), so an ambiguous deck
+            // the user really did name is named back with its candidates
+            // rather than quietly ignored, and the dialog it opens is where the
+            // choice is made anyway.
+            //
+            // A REQUIRED param that fails still refuses the action, exactly as
+            // before: without it there is nothing to dispatch.
+            Err(unmet) if spec.optional => {
+                dropped.push(unmet.dropped_note(spec.kind, spoken, &transcript));
             }
+            Err(unmet) => return finish(unmet.refusal(transcript, row, spec, spoken)),
         }
     }
 
+    let mut sentence = report(row, &resolved);
+    for note in &dropped {
+        sentence.push(' ');
+        sentence.push_str(note);
+    }
     finish(VoiceOutcome::Dispatch {
-        sentence: report(row, &resolved),
+        sentence,
         transcript,
         action: row.id.clone(),
         invoke: row.invoke.clone(),
         params: resolved,
     })
+}
+
+/// Why a supplied param did not become a [`ResolvedParam`] — kept as a reason
+/// rather than rendered straight into a refusal, because the same failure is a
+/// refusal for a required param and a note on a dispatch for an optional one
+/// (see the disposal in [`handle_utterance_with`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Unmet {
+    /// Nothing live matches what the model supplied — or, for a
+    /// [`ParamKind::SpokenPrefix`], the marked words are not how the utterance
+    /// started, or they are the whole of it and there is nothing left to type.
+    NoMatch,
+    /// A mode chip the form withholds, named by the label the form knows it by
+    /// ([`withheld_mode_named`]).
+    WithheldChoice(String),
+    /// More than one thing matches; the labels of each, as the screen shows them.
+    Ambiguous(Vec<String>),
+    /// It resolved to this target, and the user's words do not reach it
+    /// ([`Grounding::Ungrounded`]).
+    NotNamed(String),
+    /// It resolved to this target, which is named only with command or filler
+    /// words ([`Grounding::CommandWordsOnly`]).
+    CommandWordsOnly(String),
+    /// The voice settings withhold observed names from the model, so nothing it
+    /// supplies for one is resolved (PRD #1223, audit finding A1).
+    LabelsWithheld,
+}
+
+impl Unmet {
+    /// The refusal a REQUIRED param gets. Every sentence here is the one the
+    /// resolution loop rendered before the reason was separated out.
+    fn refusal(
+        self,
+        transcript: Transcript,
+        row: &CommandRow,
+        spec: &super::table::ParamSpec,
+        spoken: &str,
+    ) -> VoiceOutcome {
+        let unresolved = |situation: String| VoiceOutcome::ParamUnresolved {
+            sentence: heard(&transcript, &situation),
+            action: row.id.clone(),
+            param: spec.name.clone(),
+            spoken: spoken.to_string(),
+            transcript: transcript.clone(),
+        };
+        match self {
+            Unmet::NoMatch => unresolved(spec.kind.unresolved_phrase(spoken)),
+            Unmet::WithheldChoice(label) => unresolved(spec.kind.unresolved_phrase(&label)),
+            // From where the user stands a target they did not name is the
+            // same situation as "no directory matches that" — nothing was
+            // done, and what they said did not reach a thing — so it is a
+            // `ParamUnresolved` rather than a variant of its own, with a
+            // sentence that says which. The name quoted is the TARGET's,
+            // scrubbed like every foreign string.
+            Unmet::NotNamed(target) => unresolved(format!(
+                "you did not name \u{201c}{}\u{201d}, so nothing was done",
+                safe_message(&target)
+            )),
+            Unmet::CommandWordsOnly(target) => unresolved(format!(
+                "\u{201c}{}\u{201d} is named only with command or filler words, so it cannot be \
+                 chosen by voice \u{2014} choose it by hand",
+                safe_message(&target)
+            )),
+            Unmet::Ambiguous(matches) => VoiceOutcome::ParamAmbiguous {
+                sentence: heard(&transcript, &spec.kind.ambiguous_phrase(spoken, &matches)),
+                transcript,
+                action: row.id.clone(),
+                param: spec.name.clone(),
+                spoken: spoken.to_string(),
+                matches,
+            },
+            Unmet::LabelsWithheld => VoiceOutcome::labels_withheld(transcript, row),
+        }
+    }
+
+    /// The sentence appended to a dispatch's report when an OPTIONAL param is
+    /// dropped for this reason.
+    ///
+    /// **Whether the user said it decides the wording first.** A value none of
+    /// whose words the user spoke is the model's own invention, and quoting it
+    /// back — `no deck matches "Local deck"` after "Create a new agent" — would
+    /// report a request the user never made; so every reason renders the same
+    /// "I did not catch which deck" for it. Only a value the user really said
+    /// is named back, with what stopped it.
+    fn dropped_note(&self, kind: ParamKind, spoken: &str, transcript: &Transcript) -> String {
+        let noun = kind.noun();
+        let not_caught = format!("I did not catch which {noun}, so none is preselected.");
+        if !said(spoken, transcript.text()) {
+            return not_caught;
+        }
+        match self {
+            Unmet::NoMatch => format!(
+                "{}, so none is preselected.",
+                capitalised(&kind.unresolved_phrase(spoken))
+            ),
+            Unmet::WithheldChoice(label) => format!(
+                "{}, so none is preselected.",
+                capitalised(&kind.unresolved_phrase(label))
+            ),
+            Unmet::Ambiguous(matches) => format!(
+                "\u{201c}{}\u{201d} matches more than one {noun}, so none is preselected: {}.",
+                safe_message(spoken),
+                listed(matches)
+            ),
+            Unmet::NotNamed(_) => not_caught,
+            Unmet::CommandWordsOnly(target) => format!(
+                "\u{201c}{}\u{201d} can only be chosen by hand, so no {noun} is preselected.",
+                safe_message(target)
+            ),
+            Unmet::LabelsWithheld => format!(
+                "Settings \u{2192} Voice \u{2192} Names withholds {noun} names, so none is \
+                 preselected."
+            ),
+        }
+    }
+}
+
+/// Whether the user SAID `spoken`: it has a content word ([`content_words`])
+/// and every one of them is [`Heard`] in the transcript.
+fn said(spoken: &str, transcript: &str) -> bool {
+    let words = content_words(spoken);
+    let heard = Heard::new(transcript);
+    !words.is_empty() && words.iter().all(|word| heard.word(word))
+}
+
+/// `text` with its first character upper-cased, for a refusal's situation
+/// phrase reused as a sentence of its own.
+fn capitalised(text: &str) -> String {
+    let mut chars = text.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
+    }
+}
+
+/// Resolve one supplied param against live state — the value to dispatch, or
+/// why there is none.
+///
+/// Whether a failure refuses the action or is dropped is NOT decided here: that
+/// depends on whether the param is optional, and is [`handle_utterance_with`]'s
+/// call.
+fn resolve_param(
+    spec: &super::table::ParamSpec,
+    spoken: &str,
+    transcript: &Transcript,
+    agents: &[DesktopAgent],
+    decks: &[VoiceDeck],
+    directories: Option<&VoiceDirectories>,
+    new_agent: Option<&VoiceNewAgent>,
+) -> Result<ResolvedParam, Unmet> {
+    let param = |value: String, label: String| ResolvedParam {
+        name: spec.name.clone(),
+        kind: spec.kind,
+        spoken: spoken.to_string(),
+        value,
+        label,
+    };
+    match spec.kind {
+        // The fidelity guarantee (PRD #802 D6, rebuilt), and it is checked
+        // HERE rather than trusted anywhere: the model marked a boundary in
+        // words it says the user used, and this is where those words are
+        // held against the transcript the transcriber actually produced.
+        // What goes into `value` — which is what the agent's prompt
+        // receives — is a slice of THAT transcript. There is deliberately
+        // no arm that falls back to the model's own string, which is the
+        // whole difference between a model locating content and a model
+        // supplying it.
+        ParamKind::SpokenPrefix => match strip_opening(transcript.text(), spoken) {
+            Some(rest) if !rest.trim().is_empty() => Ok(param(rest.to_string(), rest.to_string())),
+            // Two situations, one refusal, because the user's position is
+            // the same in both: nothing was typed. Either the marked words
+            // are not how the utterance started, or they are the whole of
+            // it and there is nothing left to type.
+            _ => Err(Unmet::NoMatch),
+        },
+        ParamKind::AgentRef => match resolve_agent_ref(spoken, agents) {
+            AgentRefMatch::One { id, label } => Ok(param(id, label)),
+            AgentRefMatch::None => Err(Unmet::NoMatch),
+            AgentRefMatch::Ambiguous(labels) => Err(Unmet::Ambiguous(labels)),
+        },
+        // PRD #1223 — the same three answers as an agent reference, against
+        // the observed fleet, and the same two refusals: no new outcome
+        // variant, because from where the user stands "no deck matches" and
+        // "no agent matches" are the same situation about different things.
+        ParamKind::DeckRef => match resolve_deck_ref(spoken, decks) {
+            DeckRefMatch::One { id, label } => {
+                let names = decks
+                    .iter()
+                    .find(|deck| deck.id == id)
+                    .map(deck_spoken_names)
+                    .unwrap_or_default();
+                grounded_target(spoken, &names, &label, transcript)?;
+                Ok(param(id, label))
+            }
+            DeckRefMatch::None => Err(Unmet::NoMatch),
+            DeckRefMatch::Ambiguous(labels) => Err(Unmet::Ambiguous(labels)),
+        },
+        // PRD #1223 — the browser's children on screen, and the same two
+        // refusals once more. `directories` is `Some` here whenever the row
+        // got past `callable`, since every `dir_ref` row requires a
+        // listing; the `None` arm of the resolver answers no match rather
+        // than trusting that, so a future row that forgot the requirement
+        // refuses instead of resolving against nothing.
+        ParamKind::DirRef => match resolve_dir_ref(spoken, directories) {
+            DirRefMatch::One { path, name } => {
+                grounded_target(spoken, &dir_names(&name), &name, transcript)?;
+                Ok(param(path, name))
+            }
+            DirRefMatch::None => Err(Unmet::NoMatch),
+            DirRefMatch::Ambiguous(names) => Err(Unmet::Ambiguous(names)),
+        },
+        // PRD #1223 — an orchestration, as the overview's card for it:
+        // resolved against the live agents grouped the way `groupAgents`
+        // groups them, and the same two refusals. `value` is one of its
+        // members' agent ids, which is what lets the frontend find the
+        // card whether or not the daemon gave the orchestration an id.
+        ParamKind::OrchestrationRef => match resolve_orchestration_ref(spoken, agents) {
+            ChoiceMatch::One { id, label } => {
+                let names = orchestrations(agents)
+                    .into_iter()
+                    .find(|card| card.member_id == id)
+                    .map(|card| orchestration_names(&card))
+                    .unwrap_or_default();
+                grounded_target(spoken, &names, &label, transcript)?;
+                Ok(param(id, label))
+            }
+            ChoiceMatch::None => Err(Unmet::NoMatch),
+            ChoiceMatch::Ambiguous(titles) => Err(Unmet::Ambiguous(titles)),
+        },
+        // PRD #1223 — the New agent form's two closed sets, as the dialog
+        // declared them ON SCREEN, and the same two refusals. `new_agent`
+        // carries a form whenever a row requiring one got past `callable`;
+        // the resolver answers no match without one rather than trusting
+        // that, for the `dir_ref` arm's reason.
+        ParamKind::ModeRef | ParamKind::AgentTypeRef => {
+            let form = new_agent.and_then(|dialog| dialog.form.as_ref());
+            let choices = match (spec.kind, form) {
+                (ParamKind::ModeRef, Some(form)) => form.modes.as_slice(),
+                (_, Some(form)) => form.agent_types.as_slice(),
+                (_, None) => &[],
+            };
+            let resolved_choice = if spec.kind == ParamKind::ModeRef {
+                // A chip the form withholds is refused by name — whether
+                // the model copied it or substituted a nearby offered chip
+                // while the transcript names the withheld one. See
+                // [`withheld_mode_named`].
+                let withheld = form.map_or(&[][..], |form| form.withheld_modes.as_slice());
+                if let Some(label) =
+                    withheld_mode_named(spoken, transcript.text(), choices, withheld)
+                {
+                    return Err(Unmet::WithheldChoice(label));
+                }
+                resolve_mode_ref(spoken, choices)
+            } else {
+                resolve_agent_type_ref(spoken, choices)
+            };
+            match resolved_choice {
+                ChoiceMatch::One { id, label } => {
+                    let names = choices
+                        .iter()
+                        .find(|choice| choice.id == id)
+                        .map(|choice| {
+                            if spec.kind == ParamKind::ModeRef {
+                                mode_names(choice)
+                            } else {
+                                agent_type_names(choice)
+                            }
+                        })
+                        .unwrap_or_default();
+                    grounded_target(spoken, &names, &label, transcript)?;
+                    Ok(param(id, label))
+                }
+                ChoiceMatch::None => Err(Unmet::NoMatch),
+                ChoiceMatch::Ambiguous(labels) => Err(Unmet::Ambiguous(labels)),
+            }
+        }
+    }
 }
 
 /// The two things this app answers without asking a model, and the boundary of
@@ -1294,41 +1347,21 @@ fn grounding(spoken: &str, names: &[String], transcript: &str) -> Grounding {
     }
 }
 
-/// [`grounding`] for a resolved target, as the refusal to return when it is
-/// not [`Grounding::Grounded`] — or `None` to go on and dispatch.
-///
-/// A [`VoiceOutcome::ParamUnresolved`] either way rather than a variant of its
-/// own — from where the user stands it is the same situation as "no directory
-/// matches that" (nothing was done, and what they said did not reach a thing)
-/// — with a sentence that says which: the name quoted is the TARGET's,
-/// scrubbed like every foreign string, beside the transcript quoted verbatim.
-fn refuse_ungrounded(
-    transcript: &Transcript,
-    row: &CommandRow,
-    spec: &super::table::ParamSpec,
+/// [`grounding`] for a resolved target: `Ok` to go on and dispatch, or the
+/// reason it is not [`Grounding::Grounded`] — which [`Unmet::refusal`] renders
+/// as a [`VoiceOutcome::ParamUnresolved`] for a required param, and
+/// [`Unmet::dropped_note`] as a note for an optional one.
+fn grounded_target(
     spoken: &str,
     names: &[String],
     target: &str,
-) -> Option<VoiceOutcome> {
-    let situation = match grounding(spoken, names, transcript.text()) {
-        Grounding::Grounded => return None,
-        Grounding::Ungrounded => format!(
-            "you did not name \u{201c}{}\u{201d}, so nothing was done",
-            safe_message(target)
-        ),
-        Grounding::CommandWordsOnly => format!(
-            "\u{201c}{}\u{201d} is named only with command or filler words, so it cannot be \
-             chosen by voice \u{2014} choose it by hand",
-            safe_message(target)
-        ),
-    };
-    Some(VoiceOutcome::ParamUnresolved {
-        sentence: heard(transcript, &situation),
-        transcript: transcript.clone(),
-        action: row.id.clone(),
-        param: spec.name.clone(),
-        spoken: spoken.to_string(),
-    })
+    transcript: &Transcript,
+) -> Result<(), Unmet> {
+    match grounding(spoken, names, transcript.text()) {
+        Grounding::Grounded => Ok(()),
+        Grounding::Ungrounded => Err(Unmet::NotNamed(target.to_string())),
+        Grounding::CommandWordsOnly => Err(Unmet::CommandWordsOnly(target.to_string())),
+    }
 }
 
 /// The row's [`CommandRow::try_saying`] with each `{param}` filled, for the
@@ -1510,18 +1543,7 @@ impl ParamKind {
     /// [#741]: https://github.com/vfarcic/dot-agent-deck/issues/741
     fn ambiguous_phrase(self, spoken: &str, matches: &[String]) -> String {
         let spoken = safe_message(spoken);
-        let shown = matches
-            .iter()
-            .take(AMBIGUITY_NAMES_SHOWN)
-            .map(safe_message)
-            .collect::<Vec<_>>()
-            .join(", ");
-        let rest = matches.len().saturating_sub(AMBIGUITY_NAMES_SHOWN);
-        let listed = if rest == 0 {
-            shown
-        } else {
-            format!("{shown} and {rest} more")
-        };
+        let listed = listed(matches);
         match self {
             ParamKind::AgentRef => {
                 format!("\u{201c}{spoken}\u{201d} matches more than one agent: {listed}")
@@ -1550,6 +1572,37 @@ impl ParamKind {
                 "\u{201c}{spoken}\u{201d} matches more than one place in what you said: {listed}"
             ),
         }
+    }
+
+    /// What one of these is called in a sentence — "which deck", "no agent
+    /// type is preselected".
+    fn noun(self) -> &'static str {
+        match self {
+            ParamKind::AgentRef => "agent",
+            ParamKind::DeckRef => "deck",
+            ParamKind::DirRef => "directory",
+            ParamKind::ModeRef => "mode",
+            ParamKind::AgentTypeRef => "agent type",
+            ParamKind::OrchestrationRef => "orchestration",
+            ParamKind::SpokenPrefix => "words",
+        }
+    }
+}
+
+/// The first [`AMBIGUITY_NAMES_SHOWN`] of `matches`, scrubbed, with a count of
+/// the rest — the list an ambiguity sentence names.
+fn listed(matches: &[String]) -> String {
+    let shown = matches
+        .iter()
+        .take(AMBIGUITY_NAMES_SHOWN)
+        .map(safe_message)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let rest = matches.len().saturating_sub(AMBIGUITY_NAMES_SHOWN);
+    if rest == 0 {
+        shown
+    } else {
+        format!("{shown} and {rest} more")
     }
 }
 
@@ -2353,6 +2406,33 @@ mod tests {
         );
     }
 
+    /// Scenario: with a fleet on the overview the user says "Create a new
+    /// agent", naming no deck, and the model fills the optional deck in anyway
+    /// with the local one. The dialog opens with nothing preselected and the
+    /// report says the deck was not caught — the user's first real use of the
+    /// row, which used to be refused outright.
+    #[tokio::test]
+    async fn voice_outcome_open_new_agent_drops_a_deck_the_user_did_not_name() {
+        let resolver = StubResolver::new().answering(
+            "Create a new agent",
+            IntentAnswer::new("open_new_agent").with_param("deck", "Local deck"),
+        );
+        let outcome = run(&resolver, Screen::Overview, &fleet(), "Create a new agent").await;
+        assert_eq!(
+            outcome,
+            VoiceOutcome::Dispatch {
+                transcript: Transcript::new("Create a new agent"),
+                action: "open_new_agent".to_string(),
+                invoke: "openNewAgent".to_string(),
+                params: Vec::new(),
+                sentence: format!("Opening the New agent dialog. {NOT_CAUGHT_DECK}"),
+            }
+        );
+    }
+
+    /// What the report adds when the model supplied a deck the user did not say.
+    const NOT_CAUGHT_DECK: &str = "I did not catch which deck, so none is preselected.";
+
     #[tokio::test]
     async fn voice_outcome_open_new_agent_on_a_deck_dispatches_its_id() {
         let resolver = StubResolver::new().answering(
@@ -2366,10 +2446,18 @@ mod tests {
             "new agent on the build box",
         )
         .await;
-        let VoiceOutcome::Dispatch { params, invoke, .. } = outcome else {
+        let VoiceOutcome::Dispatch {
+            params,
+            invoke,
+            sentence,
+            ..
+        } = outcome
+        else {
             panic!("expected a dispatch, got {outcome:?}");
         };
         assert_eq!(invoke, "openNewAgent");
+        // A deck that resolved and was named adds nothing to the report.
+        assert_eq!(sentence, "Opening the New agent dialog.");
         assert_eq!(
             params,
             vec![ResolvedParam {
@@ -2382,10 +2470,12 @@ mod tests {
         );
     }
 
+    /// Scenario: "new agent on the ghost box" names a deck the fleet does not
+    /// have. The dialog opens with nothing preselected and the report names
+    /// the deck that matched nothing — while a deck the MODEL invented and
+    /// matched to nothing is reported as not caught, not quoted back.
     #[tokio::test]
-    async fn voice_outcome_open_new_agent_refuses_a_deck_that_matches_nothing() {
-        // Optional forgives ABSENCE only: a deck the user named and the fleet
-        // does not have is refused, not silently dropped.
+    async fn voice_outcome_open_new_agent_opens_without_a_deck_that_matches_nothing() {
         let resolver = StubResolver::new().answering(
             "new agent on the ghost box",
             IntentAnswer::new("open_new_agent").with_param("deck", "ghost box"),
@@ -2399,16 +2489,29 @@ mod tests {
         .await;
         assert_eq!(
             outcome,
-            VoiceOutcome::ParamUnresolved {
+            VoiceOutcome::Dispatch {
                 transcript: Transcript::new("new agent on the ghost box"),
                 action: "open_new_agent".to_string(),
-                param: "deck".to_string(),
-                spoken: "ghost box".to_string(),
-                sentence: "Heard: \u{201c}new agent on the ghost box\u{201d} — no deck matches \u{201c}ghost box\u{201d}.".to_string(),
+                invoke: "openNewAgent".to_string(),
+                params: Vec::new(),
+                sentence: "Opening the New agent dialog. No deck matches \u{201c}ghost box\u{201d}, so none is preselected.".to_string(),
             }
+        );
+
+        let invented = StubResolver::new().answering(
+            "new agent",
+            IntentAnswer::new("open_new_agent").with_param("deck", "ghost box"),
+        );
+        let outcome = run(&invented, Screen::Overview, &fleet(), "new agent").await;
+        assert_eq!(
+            outcome.sentence(),
+            format!("Opening the New agent dialog. {NOT_CAUGHT_DECK}")
         );
     }
 
+    /// Scenario: "new agent on build" names a word two decks share. The dialog
+    /// opens with nothing preselected, and the report says the deck was
+    /// ambiguous and names both, so the choice is not silently ignored.
     #[tokio::test]
     async fn voice_outcome_open_new_agent_names_the_candidates_of_an_ambiguous_deck() {
         let resolver = StubResolver::new().answering(
@@ -2416,22 +2519,66 @@ mod tests {
             IntentAnswer::new("open_new_agent").with_param("deck", "build"),
         );
         let outcome = run(&resolver, Screen::Overview, &fleet(), "new agent on build").await;
-        let VoiceOutcome::ParamAmbiguous {
-            matches, sentence, ..
-        } = outcome
-        else {
-            panic!("expected an ambiguity, got {outcome:?}");
-        };
         assert_eq!(
-            matches,
-            vec![
-                "deploy@build-box.example.com:2222".to_string(),
-                "ci@build-farm".to_string()
-            ]
+            outcome,
+            VoiceOutcome::Dispatch {
+                transcript: Transcript::new("new agent on build"),
+                action: "open_new_agent".to_string(),
+                invoke: "openNewAgent".to_string(),
+                params: Vec::new(),
+                sentence: "Opening the New agent dialog. \u{201c}build\u{201d} matches more than one deck, so none is preselected: deploy@build-box.example.com:2222, ci@build-farm.".to_string(),
+            }
         );
+
+        let invented = StubResolver::new().answering(
+            "new agent",
+            IntentAnswer::new("open_new_agent").with_param("deck", "build"),
+        );
+        let outcome = run(&invented, Screen::Overview, &fleet(), "new agent").await;
+        assert_eq!(
+            outcome.sentence(),
+            format!("Opening the New agent dialog. {NOT_CAUGHT_DECK}")
+        );
+    }
+
+    /// Scenario: the three ways a REQUIRED param fails — a target the user
+    /// did not name, a name matching nothing, a name matching several — each
+    /// still refuses the action. Dropping is for optional params only.
+    #[tokio::test]
+    async fn voice_outcome_a_required_param_that_fails_still_refuses_the_action() {
+        use crate::voice::prompt::tests::{HOSTILE_NAME, hostile_listing};
+        let hostile = StubResolver::new().answering(
+            "open docs",
+            IntentAnswer::new("open_dir").with_param("dir", HOSTILE_NAME),
+        );
+        let level = hostile_listing();
+        let outcome = run_with(&hostile, Screen::Overview, Some(&level), "open docs").await;
         assert!(
-            sentence.contains("matches more than one deck"),
-            "{sentence}"
+            matches!(&outcome, VoiceOutcome::ParamUnresolved { sentence, .. }
+                if sentence.contains("you did not name")),
+            "{outcome:?}"
+        );
+
+        let ghost = StubResolver::new().answering(
+            "open the deployer",
+            IntentAnswer::new("open_agent").with_param("agent", "deployer"),
+        );
+        let outcome = run(&ghost, Screen::Deck, &fleet(), "open the deployer").await;
+        assert!(
+            matches!(&outcome, VoiceOutcome::ParamUnresolved { sentence, .. }
+                if sentence.contains("no agent here matches")),
+            "{outcome:?}"
+        );
+
+        let billing = listing(&["billing-api", "billing-web"], true);
+        let several = StubResolver::new().answering(
+            "open billing",
+            IntentAnswer::new("open_dir").with_param("dir", "billing"),
+        );
+        let outcome = run_with(&several, Screen::Overview, Some(&billing), "open billing").await;
+        assert!(
+            matches!(&outcome, VoiceOutcome::ParamAmbiguous { .. }),
+            "{outcome:?}"
         );
     }
 
@@ -2825,8 +2972,9 @@ mod tests {
     }
 
     /// Scenario: with labels withheld, a model that picks a row naming an
-    /// agent anyway — or fills in the optional deck of "new agent" — is
-    /// refused in words, and "new agent" with no deck still opens the dialog.
+    /// agent anyway is refused in words; one that fills in the optional deck
+    /// of "new agent" opens the dialog with nothing preselected and says why;
+    /// and "new agent" with no deck opens it as before.
     #[tokio::test]
     async fn voice_outcome_withheld_labels_refuse_in_words_rather_than_resolve() {
         let expected = format!("Not here — {LABELS_WITHHELD_HINT}.");
@@ -2839,6 +2987,8 @@ mod tests {
             matches!(&outcome, VoiceOutcome::Unavailable { action, .. } if action == "open_agent")
         );
 
+        // The deck is never resolved against a model that saw no decks — it is
+        // dropped, and the report names the setting that withheld it.
         let named_deck = Recording::answering(
             IntentAnswer::new("open_new_agent").with_param("deck", "build box"),
         );
@@ -2850,11 +3000,35 @@ mod tests {
             "new agent on the build box",
         )
         .await;
-        assert_eq!(outcome.sentence(), expected);
+        assert!(
+            matches!(&outcome, VoiceOutcome::Dispatch { params, .. } if params.is_empty()),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            outcome.sentence(),
+            "Opening the New agent dialog. Settings \u{2192} Voice \u{2192} Names withholds deck \
+             names, so none is preselected."
+        );
+
+        // One the user did not say is not caught, whatever withheld it.
+        let invented_deck =
+            Recording::answering(IntentAnswer::new("open_new_agent").with_param("deck", "local"));
+        let outcome = run_labels(
+            &invented_deck,
+            LabelSharing::Withheld,
+            None,
+            None,
+            "new agent",
+        )
+        .await;
+        assert_eq!(
+            outcome.sentence(),
+            format!("Opening the New agent dialog. {NOT_CAUGHT_DECK}")
+        );
 
         let no_deck = Recording::answering(IntentAnswer::new("open_new_agent"));
         let outcome = run_labels(&no_deck, LabelSharing::Withheld, None, None, "new agent").await;
-        assert!(outcome.is_dispatch(), "{outcome:?}");
+        assert_eq!(outcome.sentence(), "Opening the New agent dialog.");
     }
 
     // -- grounding (audit finding A2) ---------------------------------------
@@ -2974,17 +3148,19 @@ mod tests {
     }
 
     /// Scenario: "new agent" names no deck; a model that fills one in anyway
-    /// is refused rather than preselecting a deck the user did not choose.
+    /// with a real deck is DROPPED — the dialog opens with nothing preselected
+    /// rather than on a deck the user did not choose — while the same deck,
+    /// named, is preselected.
     #[tokio::test]
-    async fn voice_outcome_open_new_agent_refuses_a_deck_the_user_did_not_name() {
+    async fn voice_outcome_open_new_agent_drops_an_invented_deck_and_keeps_a_named_one() {
         let resolver = StubResolver::new().answering(
             "new agent",
             IntentAnswer::new("open_new_agent").with_param("deck", "build box"),
         );
         let outcome = run(&resolver, Screen::Overview, &fleet(), "new agent").await;
         assert!(
-            matches!(&outcome, VoiceOutcome::ParamUnresolved { param, sentence, .. }
-                if param == "deck" && sentence.contains("you did not name")),
+            matches!(&outcome, VoiceOutcome::Dispatch { params, sentence, .. }
+                if params.is_empty() && sentence.ends_with(NOT_CAUGHT_DECK)),
             "{outcome:?}"
         );
         let named = StubResolver::new().answering(
@@ -2999,7 +3175,11 @@ mod tests {
             "new agent on the build box",
         )
         .await;
-        assert!(outcome.is_dispatch(), "{outcome:?}");
+        assert!(
+            matches!(&outcome, VoiceOutcome::Dispatch { params, .. }
+                if params.len() == 1 && params[0].value == "deck-build"),
+            "{outcome:?}"
+        );
     }
 
     /// Scenario: a mode, an agent type and an orchestration each resolve from

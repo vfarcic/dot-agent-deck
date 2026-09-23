@@ -173,8 +173,9 @@ pub const LABELS_WITHHELD_HINT: &str = "naming an agent, deck, directory, mode, 
 
 /// Whether this row needs the observed labels at all: it declares a REQUIRED
 /// param whose kind [`ParamKind::names_something_observed`]. An optional one
-/// (`open_new_agent`'s deck) leaves the row usable without it — the refusal
-/// then comes only if the model supplies one.
+/// (`open_new_agent`'s deck) leaves the row usable without it — a value the
+/// model supplies for one anyway is dropped unresolved, and the report says the
+/// setting withheld it.
 pub fn needs_labels(row: &super::table::CommandRow) -> bool {
     row.params
         .iter()

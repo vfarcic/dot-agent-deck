@@ -96,6 +96,12 @@ struct PhraseFixture {
     /// against the planted fleet the way `resolved_agent` is against agents.
     #[serde(default)]
     resolved_deck: Option<String>,
+    /// The dispatch must carry NO `deck_ref` (PRD #1223): the utterance named
+    /// no deck, so whatever the model filled in must not be preselected. Only
+    /// meaningful beside `outcome = "dispatch"`, and exclusive of
+    /// `resolved_deck`.
+    #[serde(default)]
+    no_deck: bool,
     /// Whether the New agent dialog's directory browser is showing the
     /// planted listing for this fixture (PRD #1223). Absent means the dialog
     /// is closed, which is every fixture that predates the directory rows.
@@ -460,6 +466,11 @@ async fn voice_phrase_fixtures_match_the_default_backend() {
                 fixture.name
             );
         }
+        assert!(
+            !(fixture.no_deck && fixture.resolved_deck.is_some()),
+            "{}: `no_deck` and `resolved_deck` contradict each other",
+            fixture.name
+        );
         if let Some(expected) = fixture.resolved_deck.as_deref() {
             assert!(
                 decks.iter().any(|deck| deck.id == expected),
@@ -571,7 +582,7 @@ async fn voice_phrase_fixtures_match_the_default_backend() {
                 };
                 let deck_matches = match fixture.resolved_deck.as_deref() {
                     Some(expected) => resolved_deck(&answer.outcome) == Some(expected),
-                    None => true,
+                    None => !fixture.no_deck || resolved_deck(&answer.outcome).is_none(),
                 };
                 let dir_matches = match fixture.resolved_dir.as_deref() {
                     Some(expected) => resolved_dir(&answer.outcome) == Some(expected),

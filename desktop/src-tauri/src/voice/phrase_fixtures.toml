@@ -381,6 +381,18 @@ utterance = "start a new agent"
 screen = "overview"
 action = "open_new_agent"
 outcome = "dispatch"
+no_deck = true
+
+# The user's own first phrasing, which was refused as `you did not name "Local
+# deck"` when the model filled the optional deck in: it must open the dialog
+# with no deck preselected, whatever the model does with the optional param.
+[[fixtures]]
+name = "open-new-agent-create"
+utterance = "Create a new agent"
+screen = "overview"
+action = "open_new_agent"
+outcome = "dispatch"
+no_deck = true
 
 [[fixtures]]
 name = "open-new-agent-on-deck"

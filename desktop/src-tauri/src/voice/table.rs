@@ -278,12 +278,16 @@ pub struct ParamSpec {
     /// Whether the row still dispatches when the model supplies no value
     /// (`optional = true` in the TOML; absent means required).
     ///
-    /// **Absence is not a refusal for an optional param, and a value that
-    /// fails to resolve still is.** *"new agent"* with no deck named opens the
-    /// dialog with nothing preselected, which is a complete command; *"new
-    /// agent on the ghost box"* names a deck the fleet does not have, and
-    /// dispatching as though it had not been said would silently drop what the
-    /// user asked for. So only the missing case changes.
+    /// **Neither absence nor failure refuses the action for an optional
+    /// param.** *"new agent"* with no deck named opens the dialog with nothing
+    /// preselected, which is a complete command. A value that fails — not
+    /// grounded in what the user said, matching nothing, matching several —
+    /// is DROPPED and the row dispatches without it, with the report saying
+    /// what was left out (`outcome::Unmet::dropped_note`): *"new agent on the
+    /// ghost box"* opens the dialog and says no deck matches. This used to
+    /// refuse the whole action, which turned a deck the model invented for
+    /// "Create a new agent" into a refusal of a command the user did ask for.
+    /// A required param that fails still refuses.
     ///
     /// A report may not interpolate an optional param
     /// ([`TableError::OptionalPlaceholder`]): with nothing supplied there is
