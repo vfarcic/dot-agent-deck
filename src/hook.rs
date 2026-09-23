@@ -610,7 +610,10 @@ pub const DELEGATE_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::fro
 /// degrade to "no seed") and wrong for `delegate`, where the first is a failure
 /// the orchestrator must see and the second must stay a success or every
 /// delegate against an older daemon starts reporting a phantom error. Only
-/// [`SocketReply::Unreachable`] means the signal was not delivered.
+/// [`SocketReply::Unreachable`] means the signal was not delivered — and
+/// since issue #434 that is something the transport establishes by counting
+/// the bytes it wrote, rather than something this sentence asserts on its
+/// behalf.
 ///
 /// Deliberately the same transport as `get-seed` — [`request_from_socket_at`],
 /// bounded by [`DELEGATE_REPLY_TIMEOUT`] — rather than a second hand-rolled
@@ -841,9 +844,13 @@ const GET_SEED_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_
 /// through a helper that classifies rather than collapsing — see
 /// [`send_and_await_reply`] and [`send_and_await_signal_ack`]. Raw
 /// `agent-event` traffic is still answered by nothing.) Returns `None` if the socket is
-/// absent/unreadable, or if the daemon goes completely silent — or keeps
+/// absent/unreadable, if the request write breaks at any point, or if the
+/// daemon goes completely silent — or keeps
 /// dribbling bytes without ever finishing a reply line — for longer than
-/// [`GET_SEED_REQUEST_TIMEOUT`]. The caller (get-seed) treats all of these
+/// [`GET_SEED_REQUEST_TIMEOUT`]. Issue #434 split that write failure across
+/// [`SocketReply::Unreachable`] and [`SocketReply::NoReply`] by how many
+/// bytes left the process, which changes nothing here: this caller collapses
+/// both to `None`. The caller (get-seed) treats all of these
 /// identically as "no seed", so an older
 /// daemon that never replies, a daemon that never even accepts the
 /// connection, one that accepts the connection and then stops sending bytes
@@ -883,27 +890,54 @@ pub fn request_from_socket(json: &str) -> Option<String> {
 ///
 /// That caller is now real: [`send_and_await_reply`], behind
 /// `dot-agent-deck delegate`.
+///
+/// The line the variants are cut along is **how much of the request left this
+/// process**, because that is what a retry decision turns on: a caller may
+/// resend only what it knows the daemon cannot already be holding. Issue #434
+/// moved a partial write across that line, from [`SocketReply::Unreachable`]
+/// to [`SocketReply::NoReply`] — see both variants below.
 #[derive(Debug)]
 pub enum SocketReply {
     /// Connected, wrote the request, and read a reply line (possibly empty).
     Line(String),
-    /// Connected and wrote the request, but no reply arrived before the
-    /// deadline — either the daemon closed without answering (an old daemon
-    /// that doesn't know this request type), an individual read timed out,
-    /// or the total-operation deadline elapsed while a peer kept dribbling
-    /// bytes without ever finishing the reply line. The request was still
-    /// sent.
+    /// The request may have reached the daemon, and nothing here is evidence
+    /// that it did not — so a caller must not resend it blind.
+    ///
+    /// Two shapes land here. The request went out **in full** and no reply
+    /// line came back before the deadline: the daemon closed without
+    /// answering (an old daemon that doesn't know this request type), an
+    /// individual read timed out, or the total-operation deadline elapsed
+    /// while a peer kept dribbling bytes without ever finishing the reply
+    /// line. Or — since issue #434 — the write **broke partway through**,
+    /// with at least one byte already gone from this process; that case used
+    /// to be reported as [`SocketReply::Unreachable`], which claimed more
+    /// than the code knew.
     ///
     /// For `delegate` this is the pre-response contract: the verb was
     /// fire-and-forget before the daemon answered it at all, so a daemon that
     /// does not answer must stay a success — handed to the socket,
     /// unverifiable — rather than becoming a phantom failure on every
     /// mixed-version pair. It is deliberately NOT "delivered": a daemon killed
-    /// between accept and read also lands here.
+    /// between accept and read also lands here, as does the broken write
+    /// above.
     NoReply,
-    /// Could not connect to the daemon, or failed while writing — the
-    /// request was never sent. The only case a caller may report as "not
-    /// delivered".
+    /// Provably nothing left this process: the connect failed, the socket
+    /// could not be armed with the deadline, or the first write failed with
+    /// the byte count still at zero. The one case a caller may report as "not
+    /// delivered", and the one it may retry without risking a duplicate.
+    ///
+    /// **Issue #434: this used to be returned for any write failure**, from a
+    /// `write_all(…).is_err() || flush().is_err()` whose `Result` cannot say
+    /// how far it got. Since issue #419 the socket carries a write timeout, so
+    /// a write can fail with part of the line already in the daemon's receive
+    /// buffer — and a partial line is not harmlessly ignored on the other
+    /// side: the daemon's reader treats a trailing unterminated line as a line
+    /// (the EOF arm of [`crate::bounded_read::read_capped_line`], "a trailing
+    /// partial line is still a line"), so a write that broke after the last
+    /// JSON byte but before the `\n` hands the daemon a complete, actionable
+    /// request. Reporting that as "never sent" is what would invite the retry
+    /// that double-sends it. [`write_request_line`] tracks the byte count so
+    /// this variant means what it says.
     Unreachable,
 }
 
@@ -927,7 +961,7 @@ fn request_from_socket_at(
     request_from_socket_at_detailed(path, json, timeout).0
 }
 
-/// [`request_from_socket_at`], plus the [`ReplyReadError`] behind a
+/// [`request_from_socket_at`], plus the [`NoReplyCause`] behind a
 /// [`SocketReply::NoReply`] when there is one.
 ///
 /// The extra half is diagnostic only — `request_from_socket_at` above is
@@ -940,7 +974,7 @@ fn request_from_socket_at_detailed(
     path: &std::path::Path,
     json: &str,
     timeout: Option<std::time::Duration>,
-) -> (SocketReply, Option<ReplyReadError>) {
+) -> (SocketReply, Option<NoReplyCause>) {
     // The total-operation deadline starts here, before connect, rather than
     // being re-armed with a fresh full budget once the connection is
     // established and the request written below. Connect and the write are
@@ -974,15 +1008,45 @@ fn request_from_socket_at_detailed(
         // during connect folds into `NoReply`, matching how the read loop
         // treats a deadline that expires mid-operation.
         let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) else {
-            return (SocketReply::NoReply, Some(ReplyReadError::DeadlineExpired));
+            return (
+                SocketReply::NoReply,
+                Some(NoReplyCause::Read(ReplyReadError::DeadlineExpired)),
+            );
         };
         if stream.set_timeouts(remaining).is_err() {
             return (SocketReply::Unreachable, None);
         }
     }
     let msg = format!("{json}\n");
-    if stream.write_all(msg.as_bytes()).is_err() || stream.flush().is_err() {
-        return (SocketReply::Unreachable, None);
+    match write_request_line(&mut stream, msg.as_bytes()) {
+        RequestWrite::Written => {}
+        RequestWrite::NothingWritten(err) => {
+            tracing::debug!(
+                reason = %err,
+                "hook socket request failed before a single byte left this process"
+            );
+            return (SocketReply::Unreachable, None);
+        }
+        RequestWrite::PartiallyWritten { written, err } => {
+            // Issue #434: bytes are already gone, so "never sent" is not a
+            // claim this process can make any more. `warn!` where the read
+            // side below settles for `debug!`, because the consequence is
+            // heavier: a caller handed `NoReply` cannot resend without
+            // risking a duplicate. It is also the only record production
+            // keeps — `request_from_socket_at` drops the cause below, and
+            // every production caller reaches the socket through it.
+            let cause = NoReplyCause::PartialWrite {
+                written,
+                total: msg.len(),
+            };
+            tracing::warn!(
+                cause = %cause,
+                reason = %err,
+                "hook socket request broke mid-write — part of the line may already be in \
+                 the daemon's buffer, so the outcome is unconfirmed rather than undelivered"
+            );
+            return (SocketReply::NoReply, Some(cause));
+        }
     }
     // Half-close our write side so the daemon's line reader sees EOF after our
     // single request and doesn't block waiting for more (it reads in a loop).
@@ -1010,8 +1074,109 @@ fn request_from_socket_at_detailed(
             // both had to be diagnosed from a nextest *duration* (0.4s of a 5s
             // budget) after the fact: the reply path had no way to say which of
             // its four terminal branches fired.
-            tracing::debug!(reason = %err, "hook socket request read no reply line");
-            (SocketReply::NoReply, Some(err))
+            let cause = NoReplyCause::Read(err);
+            tracing::debug!(reason = %cause, "hook socket request read no reply line");
+            (SocketReply::NoReply, Some(cause))
+        }
+    }
+}
+
+/// How far [`write_request_line`] got before it stopped — the evidence
+/// [`SocketReply::Unreachable`]'s "provably nothing left this process" claim
+/// rests on, and which `write_all`'s own `Result` does not carry.
+#[derive(Debug)]
+enum RequestWrite {
+    /// Every byte of the request line was accepted by the transport and the
+    /// flush that followed succeeded. Says nothing about whether the daemon
+    /// read them — only that this process is done handing them over.
+    Written,
+    /// The write or the flush failed with at least one byte already gone from
+    /// this process. `written` is how many bytes the transport had accepted.
+    PartiallyWritten { written: usize, err: std::io::Error },
+    /// The failure came with the byte count still at zero.
+    NothingWritten(std::io::Error),
+}
+
+impl RequestWrite {
+    /// Classify a write/flush failure by the one thing that decides whether a
+    /// resend is safe: whether any byte had already left the process.
+    fn from_failure(written: usize, err: std::io::Error) -> Self {
+        if written == 0 {
+            Self::NothingWritten(err)
+        } else {
+            Self::PartiallyWritten { written, err }
+        }
+    }
+}
+
+/// Write one request line and report how far it got, in place of the
+/// `write_all` + `flush` pair this replaced — whose `Result` cannot tell a
+/// write that failed before the first byte from one that failed after some of
+/// them, which is exactly the distinction [`SocketReply::Unreachable`]
+/// promises its callers (issue #434).
+///
+/// Generic over [`std::io::Write`] rather than taking
+/// [`crate::platform::ipc::IpcClient`] so the classification can be unit
+/// tested against a stub writer that fails at a chosen byte offset. A real
+/// socket can be driven into a partial write (`socket/013` does), but the
+/// kernel picks where it stops, so a test cannot pin the count that way.
+///
+/// Matches `write_all`'s two documented behaviours, so swapping it in changes
+/// what is reported and not what is written: an `ErrorKind::Interrupted` is
+/// retried rather than counted as a failed write (the write-side twin of
+/// [`is_transient_read_error`]'s `EINTR` arm, issue #564), and a `write` that
+/// returns `Ok(0)` for a non-empty buffer becomes an `ErrorKind::WriteZero`
+/// failure rather than an endless loop.
+fn write_request_line<W: std::io::Write>(stream: &mut W, msg: &[u8]) -> RequestWrite {
+    let mut written = 0usize;
+    while written < msg.len() {
+        match stream.write(&msg[written..]) {
+            Ok(0) => {
+                return RequestWrite::from_failure(
+                    written,
+                    std::io::Error::new(
+                        std::io::ErrorKind::WriteZero,
+                        "failed to write whole request line",
+                    ),
+                );
+            }
+            Ok(n) => written += n,
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(err) => return RequestWrite::from_failure(written, err),
+        }
+    }
+    match stream.flush() {
+        Ok(()) => RequestWrite::Written,
+        // Routed through the same classifier rather than assumed partial. For
+        // a non-empty line every byte is already gone by the time the flush
+        // runs, but it is the byte count that says so, and going through the
+        // classifier keeps that true if this is ever handed an empty buffer.
+        Err(err) => RequestWrite::from_failure(written, err),
+    }
+}
+
+/// Why a request ended in [`SocketReply::NoReply`] — diagnostic only, and
+/// never load-bearing: every cause folds into the one variant the callers
+/// match on.
+#[derive(Debug)]
+enum NoReplyCause {
+    /// The request write broke after bytes had already left this process:
+    /// `written` of `total` had been accepted by the transport (issue #434).
+    PartialWrite { written: usize, total: usize },
+    /// The request went out in full and no reply line came back.
+    Read(ReplyReadError),
+}
+
+impl std::fmt::Display for NoReplyCause {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::PartialWrite { written, total } => write!(
+                f,
+                "request write broke after {written} of {total} bytes had left this process"
+            ),
+            // Verbatim, so the read path's log line reads exactly as it did
+            // before this wrapper existed.
+            Self::Read(err) => write!(f, "{err}"),
         }
     }
 }
@@ -2075,6 +2240,353 @@ mod tests {
              can no longer be re-armed — got {outcome:?}. `Io(Os {{ code: 22 }})` here is \
              macOS refusing `setsockopt` on a fully shut-down socket, which says nothing \
              about whether there is a reply waiting, and there is one."
+        );
+    }
+
+    /// One scripted outcome for a single [`std::io::Write::write`] call on a
+    /// [`ScriptedWriter`].
+    #[derive(Debug, Clone, Copy)]
+    enum WriteStep {
+        /// Accept at most this many bytes of whatever is offered.
+        Accept(usize),
+        /// Fail with this kind, having accepted nothing on this call.
+        Fail(std::io::ErrorKind),
+        /// Return `Ok(0)` for a non-empty buffer — the short circuit
+        /// `write_all` turns into an `ErrorKind::WriteZero` error, and which
+        /// a naive loop would spin on forever.
+        Zero,
+    }
+
+    /// A [`std::io::Write`] that fails at a byte offset the test picked.
+    ///
+    /// Issue #434's classification turns on how many bytes had left the
+    /// process when the write failed, and that is the one thing a real socket
+    /// cannot be asked for on demand: `error/socket/013` drives a genuine
+    /// partial write through a real Unix socket, but it can only assert that
+    /// SOME prefix went, never that exactly seven bytes did. The stub pins
+    /// the classifier; the socket test pins the wiring.
+    ///
+    /// Once the script is exhausted every remaining byte is accepted, so a
+    /// test only scripts the part it is about.
+    struct ScriptedWriter {
+        steps: std::collections::VecDeque<WriteStep>,
+        /// Every byte the stub accepted, in order — the independent count a
+        /// test checks [`RequestWrite`]'s own against.
+        accepted: Vec<u8>,
+        /// What [`std::io::Write::flush`] returns.
+        flush_failure: Option<std::io::ErrorKind>,
+    }
+
+    impl ScriptedWriter {
+        fn new(steps: &[WriteStep]) -> Self {
+            Self {
+                steps: steps.iter().copied().collect(),
+                accepted: Vec::new(),
+                flush_failure: None,
+            }
+        }
+
+        fn failing_flush(mut self, kind: std::io::ErrorKind) -> Self {
+            self.flush_failure = Some(kind);
+            self
+        }
+    }
+
+    impl std::io::Write for ScriptedWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            match self.steps.pop_front() {
+                Some(WriteStep::Accept(n)) => {
+                    let n = n.min(buf.len());
+                    self.accepted.extend_from_slice(&buf[..n]);
+                    Ok(n)
+                }
+                Some(WriteStep::Fail(kind)) => {
+                    Err(std::io::Error::new(kind, "scripted write failure"))
+                }
+                Some(WriteStep::Zero) => Ok(0),
+                None => {
+                    self.accepted.extend_from_slice(buf);
+                    Ok(buf.len())
+                }
+            }
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            match self.flush_failure {
+                Some(kind) => Err(std::io::Error::new(kind, "scripted flush failure")),
+                None => Ok(()),
+            }
+        }
+    }
+
+    /// The request line every `write_request_line` unit test below writes.
+    const STUB_REQUEST: &[u8] = b"{\"type\":\"get-seed\"}\n";
+
+    /// Acceptance case (c): nothing fails, so the whole line goes and the
+    /// classifier says so. The control the other two are read against.
+    #[test]
+    fn write_request_line_reports_written_when_every_byte_is_accepted() {
+        let mut writer = ScriptedWriter::new(&[WriteStep::Accept(5), WriteStep::Accept(6)]);
+        let outcome = write_request_line(&mut writer, STUB_REQUEST);
+        assert!(
+            matches!(outcome, RequestWrite::Written),
+            "a write that completes across several passes is `Written` — got {outcome:?}"
+        );
+        assert_eq!(
+            writer.accepted, STUB_REQUEST,
+            "every byte of the request line must have reached the writer"
+        );
+    }
+
+    /// Acceptance case (a): the writer takes seven bytes and then errors.
+    /// Issue #434 — `write_all`'s `Result` cannot say those seven went, which
+    /// is how a partial write came back as `SocketReply::Unreachable`'s
+    /// "the request was never sent".
+    #[test]
+    fn write_request_line_classifies_a_failure_after_a_partial_write_as_partially_written() {
+        let mut writer = ScriptedWriter::new(&[
+            WriteStep::Accept(7),
+            WriteStep::Fail(std::io::ErrorKind::WouldBlock),
+        ]);
+        let outcome = write_request_line(&mut writer, STUB_REQUEST);
+        assert!(
+            matches!(&outcome, RequestWrite::PartiallyWritten { written, .. } if *written == 7),
+            "a write that fails having already handed 7 bytes over is `PartiallyWritten {{ \
+             written: 7 }}`, never `NothingWritten` — got {outcome:?}"
+        );
+        assert_eq!(
+            writer.accepted.len(),
+            7,
+            "the classifier's byte count must be the count that really left the caller"
+        );
+    }
+
+    /// Acceptance case (b): the very first write fails, so nothing left the
+    /// process and `SocketReply::Unreachable`'s retry-safe claim holds.
+    #[test]
+    fn write_request_line_classifies_a_failure_before_the_first_byte_as_nothing_written() {
+        let mut writer =
+            ScriptedWriter::new(&[WriteStep::Fail(std::io::ErrorKind::ConnectionRefused)]);
+        let outcome = write_request_line(&mut writer, STUB_REQUEST);
+        assert!(
+            matches!(&outcome, RequestWrite::NothingWritten(err)
+                if err.kind() == std::io::ErrorKind::ConnectionRefused),
+            "a write that fails before a single byte moves is `NothingWritten`, carrying the \
+             cause — got {outcome:?}"
+        );
+        assert!(
+            writer.accepted.is_empty(),
+            "nothing may have reached the writer"
+        );
+    }
+
+    /// `write_all` retries `ErrorKind::Interrupted` rather than reporting a
+    /// failed write, and the replacement has to as well: an `EINTR` on the
+    /// write side says nothing about the peer, exactly as `error/socket/007`
+    /// established for the read side. Treating one as a failed write would
+    /// newly classify a signalled `delegate` as unsent.
+    #[test]
+    fn write_request_line_retries_an_interrupted_write_exactly_as_write_all_does() {
+        let mut writer = ScriptedWriter::new(&[
+            WriteStep::Fail(std::io::ErrorKind::Interrupted),
+            WriteStep::Accept(3),
+            WriteStep::Fail(std::io::ErrorKind::Interrupted),
+        ]);
+        let outcome = write_request_line(&mut writer, STUB_REQUEST);
+        assert!(
+            matches!(outcome, RequestWrite::Written),
+            "an interrupted write is retried, not reported — got {outcome:?}"
+        );
+        assert_eq!(
+            writer.accepted, STUB_REQUEST,
+            "the retry must resume at the byte the interruption left off at"
+        );
+    }
+
+    /// A `write` returning `Ok(0)` for a non-empty buffer is `write_all`'s
+    /// `ErrorKind::WriteZero`, and it is classified by the same byte count as
+    /// any other failure — partial when bytes had already gone, nothing when
+    /// they had not. A loop that merely retried it would never return.
+    #[test]
+    fn write_request_line_treats_a_short_circuiting_zero_write_as_a_classified_failure() {
+        let mut after = ScriptedWriter::new(&[WriteStep::Accept(4), WriteStep::Zero]);
+        let outcome = write_request_line(&mut after, STUB_REQUEST);
+        assert!(
+            matches!(&outcome, RequestWrite::PartiallyWritten { written, err }
+                if *written == 4 && err.kind() == std::io::ErrorKind::WriteZero),
+            "an `Ok(0)` after 4 bytes is a `WriteZero` failure with 4 bytes gone — got \
+             {outcome:?}"
+        );
+
+        let mut immediately = ScriptedWriter::new(&[WriteStep::Zero]);
+        let outcome = write_request_line(&mut immediately, STUB_REQUEST);
+        assert!(
+            matches!(&outcome, RequestWrite::NothingWritten(err)
+                if err.kind() == std::io::ErrorKind::WriteZero),
+            "an `Ok(0)` on the first call left nothing behind — got {outcome:?}"
+        );
+    }
+
+    /// The flush is the second half of what `write_all(..).is_err() ||
+    /// flush().is_err()` collapsed, and it is classified by the same count:
+    /// by the time a non-empty line reaches the flush every byte is already
+    /// gone, so a flush failure cannot mean "nothing sent". Read rather than
+    /// assumed: `platform::ipc::windows`'s `flush` returns a literal `Ok(())`
+    /// and `platform::ipc::unix`'s delegates to `std`'s `UnixStream`, so this
+    /// pins the arm rather than reproducing a failure seen in production.
+    #[test]
+    fn write_request_line_counts_a_flush_failure_after_a_complete_write_as_bytes_gone() {
+        let mut writer = ScriptedWriter::new(&[]).failing_flush(std::io::ErrorKind::BrokenPipe);
+        let outcome = write_request_line(&mut writer, STUB_REQUEST);
+        assert!(
+            matches!(&outcome, RequestWrite::PartiallyWritten { written, .. }
+                if *written == STUB_REQUEST.len()),
+            "a flush that fails after the whole line went is still bytes-gone, not \
+             nothing-sent — got {outcome:?}"
+        );
+    }
+
+    /// How many bytes one Unix-domain stream socket on this host accepts from a
+    /// writer before the writer would block, with nobody reading the other end
+    /// — measured on a fresh `UnixStream::pair`, which gets the same default
+    /// buffers as the connected pair `socket_013` uses.
+    ///
+    /// Measured rather than assumed because it is host tuning, and it is not
+    /// the knob it looks like. On Linux an `AF_UNIX` stream writer is bounded
+    /// by its **own** `SO_SNDBUF` (`net.core.wmem_default` for a socket that
+    /// never sets one), not by the reader's `SO_RCVBUF`: shrinking the stub
+    /// daemon's receive buffer to 4 KiB, which PR #1232's second revision
+    /// did, left the client writing exactly 219,264 bytes either way. On
+    /// macOS/BSD the reader's receive buffer does take part. A probe of the
+    /// real socket type covers both without the test having to know which.
+    #[cfg(unix)]
+    fn unix_stream_write_capacity() -> usize {
+        use std::io::Write as _;
+        /// Well past any buffer a host plausibly configures; reaching it
+        /// means the probe is not measuring what it thinks it is.
+        const PROBE_LIMIT: usize = 1 << 30;
+        let (writer, _reader) =
+            std::os::unix::net::UnixStream::pair().expect("create Unix stream pair for probe");
+        writer
+            .set_nonblocking(true)
+            .expect("make probe writer non-blocking");
+        let chunk = vec![0u8; 64 * 1024];
+        let mut total = 0usize;
+        loop {
+            match (&writer).write(&chunk) {
+                Ok(0) => break,
+                Ok(n) => total += n,
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(err) => panic!("probe write failed after {total} bytes: {err}"),
+            }
+            assert!(
+                total < PROBE_LIMIT,
+                "probe wrote {total} bytes without blocking — the reader end is not holding"
+            );
+        }
+        total
+    }
+
+    /// Scenario: A stub daemon accepts the connection and then never reads a
+    /// byte, while the client sends a request line several times larger than
+    /// this host's measured Unix-socket buffering under a 300ms deadline.
+    /// The kernel takes the prefix that fits and the rest of the write times
+    /// out, so part of the line is already in the daemon's buffer when the
+    /// write fails. That must classify as `SocketReply::NoReply` — possibly
+    /// sent, unconfirmed — and not as `SocketReply::Unreachable`, whose doc
+    /// promises a caller that nothing left the process and a retry cannot
+    /// duplicate anything.
+    #[spec("error/socket/013")]
+    #[test]
+    #[cfg(unix)]
+    fn socket_013_a_write_that_breaks_after_bytes_left_is_no_reply_not_unreachable() {
+        /// The payload floor: what this test sent before the probe existed,
+        /// about 18x Linux's default ~230 KiB of buffering, so on an untuned
+        /// host the probe changes nothing.
+        const MIN_PAYLOAD_BYTES: usize = 4 * 1024 * 1024;
+        /// Short enough to keep the test quick, long enough that the first
+        /// write is not racing the deadline for the prefix that does fit.
+        const BUDGET: std::time::Duration = std::time::Duration::from_millis(300);
+
+        // PR #1232 review: a fixed 4 MiB payload made the outcome depend on
+        // host tuning — raise `net.core.wmem_default` past it and the whole
+        // line fits, the classifier correctly reports `Read(DeadlineExpired)`,
+        // and the second assertion below fails with nothing wrong in the
+        // code under test. Four times the measured capacity keeps the line
+        // out of reach wherever the host puts that number. It can exceed the
+        // daemon's 8 MiB `MAX_HOOK_LINE_BYTES` on a heavily tuned host, which
+        // does not matter here: the stub never reads, so no line cap applies.
+        let capacity = unix_stream_write_capacity();
+        let payload_bytes = MIN_PAYLOAD_BYTES.max(capacity.saturating_mul(4));
+
+        let _tmp = tempfile::tempdir().expect("create temp dir for stub daemon socket");
+        let socket_path = _tmp.path().join("s.sock");
+        let listener =
+            std::os::unix::net::UnixListener::bind(&socket_path).expect("bind stub daemon socket");
+
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        // Stub daemon: accept, then hold the connection open without reading
+        // a single byte, so the client's write fills the socket's buffering
+        // and stalls. Released only after the client has returned — closing
+        // early would hand the client an `EPIPE` on an empty buffer instead.
+        let daemon_thread = std::thread::spawn(move || {
+            if let Ok((stream, _)) = listener.accept() {
+                let _ = release_rx.recv();
+                drop(stream);
+            }
+        });
+
+        let request = format!(
+            r#"{{"type":"get-seed","pad":"{}"}}"#,
+            "a".repeat(payload_bytes)
+        );
+        let (reply, cause) = request_from_socket_at_detailed(&socket_path, &request, Some(BUDGET));
+
+        let _ = release_tx.send(());
+        daemon_thread.join().expect("stub daemon thread panicked");
+
+        assert!(
+            matches!(reply, SocketReply::NoReply),
+            "a write that broke with bytes already in the daemon's buffer must be \
+             SocketReply::NoReply — `Unreachable` tells its caller nothing was sent and the \
+             request is safe to resend, and the daemon's reader treats a trailing \
+             unterminated line as a line, so a resend can double-send. Got {reply:?} \
+             (cause: {cause:?})."
+        );
+        assert!(
+            matches!(&cause, Some(NoReplyCause::PartialWrite { written, total })
+                if *written > 0 && *written < *total),
+            "and it must be NoReply for the WRITE reason, with a prefix gone and a \
+             remainder not: a `Read(DeadlineExpired)` here would mean the whole line fit \
+             after all and this test proved nothing about partial writes. Got {cause:?} \
+             (probed capacity {capacity} bytes, payload {payload_bytes} bytes)."
+        );
+    }
+
+    /// The other side of `error/socket/013`: with no listener at all the
+    /// connect fails, nothing is written, and `SocketReply::Unreachable`
+    /// keeps the strong meaning its doc claims. Plain `#[test]` rather than a
+    /// catalog entry because it pins a classification that has not changed —
+    /// it is here because, as `error/socket/003`'s catalog entry records, no
+    /// test asserted `Unreachable` at all before issue #434 made the variant
+    /// load-bearing.
+    #[test]
+    #[cfg(unix)]
+    fn an_absent_socket_is_unreachable_with_no_cause_recorded() {
+        let _tmp = tempfile::tempdir().expect("create temp dir for the absent socket path");
+        let absent = _tmp.path().join("nobody-is-listening.sock");
+
+        let (reply, cause) = request_from_socket_at_detailed(
+            &absent,
+            r#"{"type":"get-seed"}"#,
+            Some(std::time::Duration::from_millis(300)),
+        );
+
+        assert!(
+            matches!(reply, SocketReply::Unreachable) && cause.is_none(),
+            "a connect that never succeeded wrote nothing, so the caller may report \"not \
+             delivered\" and retry — got {reply:?} (cause: {cause:?})"
         );
     }
 

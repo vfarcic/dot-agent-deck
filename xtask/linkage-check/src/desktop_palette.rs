@@ -767,6 +767,308 @@ fn report_dark(problems: &[String]) -> String {
     msg
 }
 
+/// A place a token's colour is measured against. The two forms are the only
+/// two `desktop/src` actually paints a background with: a solid palette
+/// token, or `rgb(var(--channel) / alpha)` composited over another surface
+/// (the lease badge, the topbar wash — see the comment beside `--faint` and
+/// `--status-error` in `styles.css` for the call sites each pair covers).
+#[derive(Debug, Clone)]
+enum Surface {
+    Token(&'static str),
+    Composited {
+        channel: &'static str,
+        alpha: f64,
+        on: Box<Surface>,
+    },
+}
+
+/// A short label for a [`Surface`], used only in failure output.
+fn describe_surface(surface: &Surface) -> String {
+    match surface {
+        Surface::Token(name) => format!("`{name}`"),
+        Surface::Composited { channel, alpha, on } => {
+            format!(
+                "`rgb(var({channel}) / {alpha})` on {}",
+                describe_surface(on)
+            )
+        }
+    }
+}
+
+/// Parse `#rgb` or `#rrggbb` into `[r, g, b]`. `None` on anything else,
+/// which callers turn into a clear failure rather than a panic — a malformed
+/// hex literal is exactly the kind of thing this guard exists to catch.
+fn parse_hex(value: &str) -> Option<[u8; 3]> {
+    let s = value.trim().strip_prefix('#')?;
+    let digit = |c: char| c.to_digit(16);
+    match s.len() {
+        3 => {
+            let mut chars = s.chars();
+            let (r, g, b) = (
+                digit(chars.next()?)?,
+                digit(chars.next()?)?,
+                digit(chars.next()?)?,
+            );
+            Some([(r * 16 + r) as u8, (g * 16 + g) as u8, (b * 16 + b) as u8])
+        }
+        6 => {
+            let byte = |i: usize| u8::from_str_radix(s.get(i..i + 2)?, 16).ok();
+            Some([byte(0)?, byte(2)?, byte(4)?])
+        }
+        _ => None,
+    }
+}
+
+/// Parse the channel-triplet form a `-rgb` token holds, `"R G B"` (as used at
+/// each of its `rgb(var(--x-rgb) / alpha)` call sites).
+fn parse_channel_triplet(value: &str) -> Option<[u8; 3]> {
+    let mut parts = value.split_whitespace();
+    let triplet = [
+        parts.next()?.parse().ok()?,
+        parts.next()?.parse().ok()?,
+        parts.next()?.parse().ok()?,
+    ];
+    parts.next().is_none().then_some(triplet)
+}
+
+/// WCAG 2.x relative luminance of one sRGB channel, 0-255 in, 0.0-1.0 out.
+fn srgb_channel_luminance(c: u8) -> f64 {
+    let s = f64::from(c) / 255.0;
+    if s <= 0.04045 {
+        s / 12.92
+    } else {
+        ((s + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+/// WCAG 2.x relative luminance of an sRGB colour.
+fn relative_luminance(rgb: [u8; 3]) -> f64 {
+    0.2126 * srgb_channel_luminance(rgb[0])
+        + 0.7152 * srgb_channel_luminance(rgb[1])
+        + 0.0722 * srgb_channel_luminance(rgb[2])
+}
+
+/// WCAG 2.x contrast ratio between two colours. Order-independent, per the
+/// spec's own `(L1 + 0.05) / (L2 + 0.05)` with `L1` the lighter of the two.
+fn contrast_ratio(a: [u8; 3], b: [u8; 3]) -> f64 {
+    let (la, lb) = (relative_luminance(a), relative_luminance(b));
+    let (hi, lo) = if la >= lb { (la, lb) } else { (lb, la) };
+    (hi + 0.05) / (lo + 0.05)
+}
+
+/// Source-over composite of `fg` at `alpha` onto an opaque `bg`, the model
+/// `rgb(var(--x) / alpha)` paints with.
+fn composite_over(fg: [u8; 3], alpha: f64, bg: [u8; 3]) -> [u8; 3] {
+    std::array::from_fn(|i| {
+        (f64::from(fg[i]) * alpha + f64::from(bg[i]) * (1.0 - alpha))
+            .round()
+            .clamp(0.0, 255.0) as u8
+    })
+}
+
+/// Resolve a [`Surface`] to an RGB colour against one block's token map.
+/// `None` means a token the surface needs is missing from that block, which
+/// the caller reports rather than panicking on.
+fn resolve_surface(surface: &Surface, tokens: &BTreeMap<String, String>) -> Option<[u8; 3]> {
+    match surface {
+        Surface::Token(name) => parse_hex(tokens.get(*name)?),
+        Surface::Composited { channel, alpha, on } => {
+            let fg = parse_channel_triplet(tokens.get(*channel)?)?;
+            let bg = resolve_surface(on, tokens)?;
+            Some(composite_over(fg, *alpha, bg))
+        }
+    }
+}
+
+/// Every (token, surface, minimum-ratio) pair issues #821 and #822 measured
+/// and PR #1231's body tabulates, in the same order. Found by grepping
+/// `desktop/src` for each token and walking its selector up to the nearest
+/// rule that paints a background; the composited ones are the lease badge
+/// (`--scrim-rgb` over a card) and the topbar/canvas wash (`--paper-rgb`).
+/// The bar is 4.5 for normal text and 3.0 for the two WCAG 1.4.11 (non-text)
+/// cases: a filled status dot, and that same fill against its own ring.
+fn contrast_pairs() -> Vec<(&'static str, Surface, f64)> {
+    use Surface::{Composited, Token};
+    let topbar_wash = || Composited {
+        channel: "--paper-rgb",
+        alpha: 0.97,
+        on: Box::new(Token("--canvas")),
+    };
+    let lease = |on: &'static str| Composited {
+        channel: "--scrim-rgb",
+        alpha: 0.04,
+        on: Box::new(Token(on)),
+    };
+    vec![
+        // --faint (issue #821)
+        ("--faint", Token("--paper-strong"), 4.5),
+        ("--faint", Token("--paper"), 4.5),
+        ("--faint", Token("--canvas"), 4.5),
+        ("--faint", Token("--paper-sunken"), 4.5),
+        ("--faint", Token("--paper-sunken-strong"), 4.5),
+        ("--faint", topbar_wash(), 4.5),
+        ("--faint", lease("--paper-strong"), 4.5),
+        ("--faint", lease("--paper"), 4.5),
+        ("--faint", Token("--red-soft"), 4.5),
+        ("--faint", lease("--red-soft"), 4.5),
+        ("--faint", Token("--green-soft"), 4.5),
+        // `.agent-state-mark` (idle): --faint as a FILL, not text, ringed
+        // 2px `--paper-strong` — the non-text WCAG 1.4.11 case.
+        ("--faint", Token("--paper-strong"), 3.0),
+        // --muted (issue #821)
+        ("--muted", Token("--paper-strong"), 4.5),
+        ("--muted", Token("--paper"), 4.5),
+        ("--muted", Token("--canvas"), 4.5),
+        ("--muted", Token("--paper-sunken"), 4.5),
+        ("--muted", Token("--paper-sunken-strong"), 4.5),
+        ("--muted", topbar_wash(), 4.5),
+        (
+            "--muted",
+            Composited {
+                channel: "--paper-rgb",
+                alpha: 0.55,
+                on: Box::new(Token("--canvas")),
+            },
+            4.5,
+        ),
+        ("--muted", Token("--teal-soft"), 4.5),
+        ("--muted", Token("--teal-wash"), 4.5),
+        ("--muted", Token("--green-soft"), 4.5),
+        ("--muted", Token("--red-soft"), 4.5),
+        // --ink-soft (moved with #821 to keep a visible step above --muted --
+        // see the comment on the light block's text tokens)
+        ("--ink-soft", Token("--paper"), 4.5),
+        ("--ink-soft", Token("--paper-sunken-strong"), 4.5),
+        // --status-error (issue #822)
+        // `.terminal-input-status.is-blocked`: 9px TEXT on --shell.
+        ("--status-error", Token("--shell"), 4.5),
+        // `.connection-lamp.connection-error`: the same token as a FILL, at
+        // two of its four grounds, each a non-text WCAG 1.4.11 case. NOT the
+        // topbar/canvas ground (`rgb(var(--paper-rgb) / .97)` composited on
+        // --canvas): that one is 2.86:1, below 3.0, and stays so on purpose
+        // -- the only values that clear 4.5:1 as text on the light --shell and
+        // 3:1 as a fill on --paper at once sit in a relative-luminance band of
+        // 0.2714-0.2739, at both bars with no headroom, and #822 took the
+        // headroom on the text (see the comment beside --status-error). It is not
+        // unenforced, though: WCAG 1.4.11 asks for 3:1 against the colour
+        // actually ADJACENT to the fill, which for this lamp is its own
+        // ring, not the page two rules away -- and that pair is the next
+        // one in this list, and it is required.
+        ("--status-error", Token("--shell"), 3.0),
+        ("--status-error", Token("--paper-strong"), 3.0),
+        // The lamp fill against its own 2px `--shell-line` ring -- the
+        // colour actually adjacent to it, and the pair that carries its
+        // WCAG 1.4.11 standing (see the comment beside --status-error).
+        ("--status-error", Token("--shell-line"), 3.0),
+    ]
+}
+
+/// Every pair [`contrast_pairs`] names clears its bar, in the light block and
+/// in both dark deliveries.
+///
+/// This is the check [`check_dark_palette`] is not: that guard asks whether a
+/// colour came from a token and whether the two dark deliveries agree with
+/// each other, never whether a value clears any particular bar. Reverting
+/// `--faint`, `--muted`, `--ink-soft` or `--status-error` to its pre-#821/#822
+/// value leaves every other gate in this file green -- issue #821 measured
+/// `--faint` at 2.39-3.05:1 and `--muted` at 3.95-5.04:1 against the 4.5:1
+/// text bar, and #822 measured `--status-error` at 4.08:1 on light `--shell`,
+/// all of which `check_dark_palette` and the tokenisation guard above are
+/// structurally blind to. This is the guard that is not.
+fn check_contrast_floor(css: &str) -> Result<(), String> {
+    let masked = mask_comments(css, false);
+    let blocks = root_blocks(&masked.code);
+    let find = |selector: &str| blocks.iter().find(|block| block.selector == selector);
+    let (Some(light), Some(media), Some(attr)) = (
+        find(LIGHT_BLOCK),
+        find(DARK_MEDIA_BLOCK),
+        find(DARK_ATTR_BLOCK),
+    ) else {
+        // A missing block is [`check_dark_palette`]'s failure to report, in
+        // more detail than this guard has any business duplicating; there is
+        // nothing this guard can check without all three.
+        return Ok(());
+    };
+    let as_map =
+        |decls: &[(String, String)]| decls.iter().cloned().collect::<BTreeMap<String, String>>();
+    let light_map = as_map(&light.declarations);
+    let dark_deliveries = [
+        ("the media query", as_map(&media.declarations)),
+        (r#"`[data-theme="dark"]`"#, as_map(&attr.declarations)),
+    ];
+
+    let mut problems = Vec::new();
+    for (token, surface, bar) in contrast_pairs() {
+        let where_ = describe_surface(&surface);
+        match (
+            light_map.get(token).and_then(|v| parse_hex(v)),
+            resolve_surface(&surface, &light_map),
+        ) {
+            (Some(fg), Some(bg)) => {
+                let ratio = contrast_ratio(fg, bg);
+                if ratio < bar {
+                    problems.push(format!(
+                        "light: `{token}` on {where_} is {ratio:.2}:1, below the {bar:.1}:1 bar"
+                    ));
+                }
+            }
+            _ => problems.push(format!(
+                "light: could not resolve `{token}` on {where_} -- a token the pair needs is \
+                 missing or not a recognised colour"
+            )),
+        }
+        for (label, dark_map) in &dark_deliveries {
+            match (
+                dark_map.get(token).and_then(|v| parse_hex(v)),
+                resolve_surface(&surface, dark_map),
+            ) {
+                (Some(fg), Some(bg)) => {
+                    let ratio = contrast_ratio(fg, bg);
+                    if ratio < bar {
+                        problems.push(format!(
+                            "dark ({label}): `{token}` on {where_} is {ratio:.2}:1, below the \
+                             {bar:.1}:1 bar"
+                        ));
+                    }
+                }
+                _ => problems.push(format!(
+                    "dark ({label}): could not resolve `{token}` on {where_} -- a token the \
+                     pair needs is missing or not a recognised colour"
+                )),
+            }
+        }
+    }
+
+    if problems.is_empty() {
+        Ok(())
+    } else {
+        Err(report_contrast_floor(&problems))
+    }
+}
+
+/// The operator-facing half of [`check_contrast_floor`].
+fn report_contrast_floor(problems: &[String]) -> String {
+    let mut msg = format!(
+        "desktop/src/styles.css: {} contrast regression{} against the minimums issues #821 \
+         and #822 recorded\n\n",
+        problems.len(),
+        if problems.len() == 1 { "" } else { "s" }
+    );
+    for problem in problems {
+        let _ = writeln!(msg, "  {problem}");
+    }
+    msg.push_str(
+        "\nEach pair above is measured and written down already -- in the comments beside\n\
+         `--faint`, `--muted`, `--ink-soft` and `--status-error` in desktop/src/styles.css,\n\
+         and in changelog.d/821.bugfix.md / changelog.d/822.bugfix.md. This guard exists\n\
+         because nothing else here computes a contrast ratio: the tokenisation guard above\n\
+         only asks whether a colour came from a token, and the dark-agreement guard only\n\
+         asks whether the two dark deliveries match EACH OTHER, so reverting any of the\n\
+         four tokens to its pre-fix value left both green. This one does not.\n",
+    );
+    msg
+}
+
 /// Scan one file's text. `palette` marks the file whose `:root` blocks hold the
 /// token declarations.
 fn scan_text(label: &str, src: &str, is_css: bool, palette: bool) -> Vec<Finding> {
@@ -1017,6 +1319,83 @@ mod tests {
         );
         let report = check_dark_palette(&dark_only).expect_err("a dark-only token must be caught");
         assert!(report.contains("--dark-only"), "{report}");
+    }
+
+    /// The contrast floor is what [`check_dark_palette`] is not: every pair
+    /// issues #821 and #822 measured clears its bar today, in both light and
+    /// dark.
+    #[test]
+    fn the_real_palette_clears_the_821_822_contrast_floor() {
+        let css = fs::read_to_string(repo_root().join("desktop/src/styles.css"))
+            .expect("read styles.css");
+        if let Err(report) = check_contrast_floor(&css) {
+            panic!("{report}");
+        }
+    }
+
+    /// And that the assertion above is not vacuous: reverting `--faint` to
+    /// the exact value #821 replaced -- in the LIGHT block only, the one
+    /// delivery this guard actually protects, since dark already cleared the
+    /// bar before #821 touched anything -- is caught.
+    #[test]
+    fn the_contrast_floor_catches_a_revert_of_faint_to_its_pre_821_value() {
+        let css = fs::read_to_string(repo_root().join("desktop/src/styles.css"))
+            .expect("read styles.css");
+        let reverted = css.replacen("--faint: #5a605b;", "--faint: #8d948f;", 1);
+        let report =
+            check_contrast_floor(&reverted).expect_err("a reverted --faint must be caught");
+        assert!(report.contains("--faint"), "{report}");
+        assert!(report.contains("below the 4.5:1 bar"), "{report}");
+        // `--faint` lands on eleven light surfaces at the 4.5:1 bar (issue
+        // #821); the old value failed all eleven, so this is not a report
+        // with one line.
+        assert!(
+            report.matches("light: `--faint`").count() > 1,
+            "expected the pre-#821 value to fail more than one surface: {report}"
+        );
+    }
+
+    /// Same shape, for `--status-error` (#822): reverting the LIGHT
+    /// declaration alone -- the one `replacen(.., 1)` hits first, since all
+    /// three blocks currently share this token's value -- is caught, and
+    /// leaving the two dark deliveries at the fixed value does not paper
+    /// over it.
+    #[test]
+    fn the_contrast_floor_catches_a_revert_of_status_error_to_its_pre_822_value() {
+        let css = fs::read_to_string(repo_root().join("desktop/src/styles.css"))
+            .expect("read styles.css");
+        let reverted = css.replacen("--status-error: #d57971;", "--status-error: #d0685f;", 1);
+        let report =
+            check_contrast_floor(&reverted).expect_err("a reverted --status-error must be caught");
+        assert!(report.contains("--status-error"), "{report}");
+        assert!(report.contains("`--shell`"), "{report}");
+    }
+
+    /// The composite-surface arithmetic itself, independent of the real file:
+    /// a lease badge at `rgb(var(--scrim-rgb) / .04)` over a white card
+    /// darkens the card slightly, and the ratio moves accordingly.
+    #[test]
+    fn resolve_surface_composites_a_channel_token_over_its_base() {
+        let mut tokens = BTreeMap::new();
+        tokens.insert("--scrim-rgb".to_string(), "0 0 0".to_string());
+        tokens.insert("--card".to_string(), "#ffffff".to_string());
+        let surface = Surface::Composited {
+            channel: "--scrim-rgb",
+            alpha: 0.04,
+            on: Box::new(Surface::Token("--card")),
+        };
+        let rgb = resolve_surface(&surface, &tokens).expect("both tokens are present");
+        // 4% black over white is #f5f5f5 (255 * .96, rounded).
+        assert_eq!(rgb, [245, 245, 245]);
+    }
+
+    /// The contrast-ratio arithmetic against WCAG's own worked values: pure
+    /// black on pure white is exactly 21:1, and a colour against itself is
+    /// always 1:1.
+    #[test]
+    fn contrast_ratio_matches_wcags_own_worked_values() {
+        assert!((contrast_ratio([0, 0, 0], [255, 255, 255]) - 21.0).abs() < 0.001);
+        assert!((contrast_ratio([100, 150, 200], [100, 150, 200]) - 1.0).abs() < 0.001);
     }
 
     /// The `:not([data-theme="light"])` guard is the whole reason an explicit
