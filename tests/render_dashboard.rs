@@ -2926,6 +2926,112 @@ fn pane_014_hostile_tool_text_cannot_corrupt_the_card() {
     );
 }
 
+/// Scenario: Render a card whose display name is `项目目录管理` — six characters
+/// but twelve terminal columns — into a 40-column Normal-density buffer, where
+/// the title region is only 26 columns wide. The card's top border must show the
+/// name cut short and marked with an `…` that is itself inside the budget, with
+/// the `● Thinking` badge still whole beside it, instead of the full name
+/// running over the badge and being bare-clipped at the right edge. An ASCII
+/// name of the same character count renders untouched, and a name of eight
+/// `❤️` — one column per `char`, two as drawn — is cut and marked the same way.
+#[spec("dashboard/pane/015")]
+#[test]
+fn pane_015_wide_title_is_ellipsized_within_the_column_budget() {
+    // Issue #357. `truncate_styled_segments` budgeted Unicode scalar values
+    // while its caller's budget is a slice of the card rectangle — cells on one
+    // row. `项目目录管理` is 6 scalars against 12 columns, so the whole title
+    // (` 1 `, the `ClaudeCode` badge and ` · 项目目录管理 `) measured 23
+    // "characters" inside a 26-cell budget and was returned untouched at 29
+    // columns; ratatui then clipped the overhang at the right edge with no `…`,
+    // so the card gave no sign it had shortened anything.
+    //
+    // 40 columns is chosen for what it leaves rather than as a round number: the
+    // badge (` ● Thinking ` = 12 cells) and the two borders take 14, leaving 26
+    // for the title — which the ASCII control fits and the CJK name does not.
+    const WIDTH: u16 = 40;
+    let density = CardDensityKind::Normal;
+
+    let wide = buffer_to_text(&render_card_to_buffer(
+        &card_stats_session("/home/dev/example-project"),
+        Some("项目目录管理"),
+        Some(1),
+        density,
+        0,     // animation tick
+        false, // not selected
+        WIDTH,
+        density.rendered_height(),
+    ));
+    let title_row = wide.lines().next().expect("the card draws a top border");
+
+    assert!(
+        title_row.contains('…'),
+        "a name too wide for the title region must be marked as cut:\n{wide}"
+    );
+    assert!(
+        !title_row.contains('管') && !title_row.contains('理'),
+        "the characters past the budget must be dropped, not drawn over the badge:\n{wide}"
+    );
+    // The badge is right-aligned on the same row, so an over-wide title shows up
+    // as the badge losing cells to it.
+    assert!(
+        title_row.contains("● Thinking"),
+        "the status badge must survive the title beside it:\n{wide}"
+    );
+    // Cells, not display columns: `buffer_to_text` joins a wide glyph's second
+    // (padding) cell in as a space, so the row holds exactly one `char` per cell
+    // and counting them is counting the card's width. A title that overran would
+    // have had to take cells from the badge to fit.
+    assert_eq!(
+        title_row.chars().count(),
+        WIDTH as usize,
+        "the top border must occupy exactly the card's width:\n{wide}"
+    );
+
+    // The control: six ASCII characters are six columns, so the same card at the
+    // same width draws the name whole and marks nothing. This is the property
+    // that keeps every committed card snapshot from churning.
+    let ascii = buffer_to_text(&render_card_to_buffer(
+        &card_stats_session("/home/dev/example-project"),
+        Some("abcdef"),
+        Some(1),
+        density,
+        0,
+        false,
+        WIDTH,
+        density.rendered_height(),
+    ));
+    let ascii_title_row = ascii.lines().next().expect("the card draws a top border");
+    assert!(
+        ascii_title_row.contains("· abcdef") && !ascii_title_row.contains('…'),
+        "an ASCII name inside the budget renders untouched:\n{ascii}"
+    );
+
+    // A name whose glyphs are grapheme CLUSTERS wider than their `char`s:
+    // `❤️` is U+2764 + VARIATION SELECTOR-16, one column summed per `char` and
+    // two as ratatui draws it. Eight of them are 16 columns, past what the
+    // title's 26-cell region has left once the 16-cell prefix is paid for, so
+    // the cut must be marked. Budgeting per `char` measured them at 8, passed
+    // the title whole, and the badge was drawn over its tail — no `…`, no
+    // border fill, the CJK symptom again, on input the char count had handled.
+    let hearts = buffer_to_text(&render_card_to_buffer(
+        &card_stats_session("/home/dev/example-project"),
+        Some(&"❤\u{fe0f}".repeat(8)),
+        Some(1),
+        density,
+        0,
+        false,
+        WIDTH,
+        density.rendered_height(),
+    ));
+    let hearts_title_row = hearts.lines().next().expect("the card draws a top border");
+    assert!(
+        hearts_title_row.contains('…') && hearts_title_row.contains("● Thinking"),
+        "a name of VS16 emoji too wide for the title region must be marked as cut:\n{hearts}"
+    );
+
+    insta::assert_snapshot!(wide);
+}
+
 // ---------------------------------------------------------------------------
 // dashboard/grid — the card grid's joint column/density layout (issue #588)
 // ---------------------------------------------------------------------------
