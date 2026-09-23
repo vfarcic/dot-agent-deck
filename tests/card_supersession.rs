@@ -1006,7 +1006,7 @@ fn status_supersede_016_a_reconnected_card_is_superseded_exactly_where_the_daemo
     }
 }
 
-/// Scenario: A TUI already holds evidence for the card it is about to seed — the same agent's `SessionStart` that landed on the pane before hydration (tying the snapshot, older than it, or older than a future-stamped one), a future-stamped session from another agent, a report the same agent sent without a pane (newer than the snapshot, or tying it), or the card itself after it saw a newer frame than the snapshot it is re-seeded from. The agent keeps one card, which takes the snapshot only when the snapshot is the fresher evidence and not in the future; a freshly minted card changes no newest-wins pick, and no card's `last_activity` drops below evidence the state already held.
+/// Scenario: A TUI already holds evidence for the card it is about to seed — the same agent's `SessionStart` that landed on the pane before hydration (tying the snapshot with or without a live target of its own, older than it, or older than a future-stamped one), a future-stamped session from another agent, a report the same agent sent without a pane (newer than the snapshot, or tying it), or the card itself after it saw a newer frame than the snapshot it is re-seeded from. The agent keeps one card, which takes the snapshot only when the snapshot is the fresher evidence and not in the future — except that on an exact tie a card declaring no live target adopts the snapshot's, and only that; a freshly minted card changes no newest-wins pick, and no card's `last_activity` drops below evidence the state already held.
 #[spec("status/supersede/017")]
 #[test]
 fn status_supersede_017_the_reconnect_overlay_takes_only_fresher_evidence() {
@@ -1025,34 +1025,65 @@ fn status_supersede_017_the_reconnect_overlay_takes_only_fresher_evidence() {
     };
     let early_key = "zz-early-session";
 
+    // What the kept card must end up with, per PRD #1223's rule.
+    #[derive(Clone, Copy, PartialEq, Debug)]
+    enum Outcome {
+        /// The snapshot is the fresher evidence: every overlaid field moves.
+        Overlay,
+        /// An exact tie and the card declares no live target: it adopts the
+        /// snapshot's live target and nothing else.
+        AdoptLiveTargetOnly,
+        /// The card is left exactly as it was.
+        Untouched,
+    }
+    let own_live = LiveTarget {
+        kind: TargetKind::Process,
+        writable: Writable::Live,
+    };
+
     // A `SessionStart` from the same agent reached the TUI before hydration
     // seeded the pane (its event subscriber starts first), so PRD #1223's
     // upsert keeps that card instead of minting `pane-<id>` beside it.
     // (a) It was the daemon's newest frame: the snapshot's instant EQUALS its
     //     stamp, so the card already holds evidence as new as the snapshot's.
+    //     It declares no live target, so it adopts the snapshot's (a missing
+    //     one is a safety property) and keeps every display field.
+    // (a') The same tie, but the card declares its own live target: it keeps
+    //     its own, and nothing moves.
     // (b) The snapshot is strictly newer than it: the daemon saw activity the
     //     card has not, and the card must carry it.
     // (b') The snapshot is newer but in the future: refused by #804's clock bar.
-    for (early_at, snapshot_instant, overlay_applies) in [
-        (quiet_since, quiet_since, false),
-        (quiet_since - Duration::minutes(10), quiet_since, true),
+    for (early_at, early_live, snapshot_instant, outcome) in [
+        (quiet_since, None, quiet_since, Outcome::AdoptLiveTargetOnly),
+        (quiet_since, Some(own_live), quiet_since, Outcome::Untouched),
         (
             quiet_since - Duration::minutes(10),
+            None,
+            quiet_since,
+            Outcome::Overlay,
+        ),
+        (
+            quiet_since - Duration::minutes(10),
+            None,
             whole_ms(Duration::hours(1)),
-            false,
+            Outcome::Untouched,
         ),
     ] {
         let mut tui = AppState::default();
-        tui.apply_event(event(
+        let mut early = event(
             early_key,
             AgentType::Pi,
             EventType::SessionStart,
             Some(RECONNECT_AGENT_ID),
             early_at,
-        ));
+        );
+        early.live_target = early_live;
+        tui.apply_event(early);
         tui.register_pane(PANE_ID.to_string());
         let before = join(&tui, RECONNECT_AGENT_ID);
         let journal_before = tui.sessions[early_key].recent_events.len();
+        let status_before = tui.sessions[early_key].status.clone();
+        let tool_count_before = tui.sessions[early_key].tool_count;
         reconnect(&mut tui, Some(&snapshot_at(snapshot_instant)));
 
         let on_pane: Vec<&str> = tui
@@ -1068,52 +1099,99 @@ fn status_supersede_017_the_reconnect_overlay_takes_only_fresher_evidence() {
              {snapshot_instant})"
         );
         let card = &tui.sessions[early_key];
-        if overlay_applies {
-            assert_eq!(
-                card.last_activity, snapshot_instant,
-                "the kept card must take the fresher snapshot's instant"
-            );
-            assert_eq!(card.status, SessionStatus::Working, "fresher status");
-            assert_eq!(card.tool_count, 7, "fresher tool fields");
-            assert_eq!(
-                card.writable(),
-                Writable::HistoryOnly,
-                "the snapshot's live target must reach the kept card, so it refuses input"
-            );
-            assert_eq!(
-                tui.pane_session_id(PANE_ID).as_deref(),
-                Some(early_key),
-                "pane_session_id picks the one card"
-            );
-            assert_eq!(
-                tui.pane_writable(PANE_ID),
-                Writable::HistoryOnly,
-                "pane_writable reads the snapshot's live target off the one card"
-            );
-            assert_eq!(
-                tui.agent_writable(RECONNECT_AGENT_ID),
-                Writable::HistoryOnly,
-                "agent_writable reads the snapshot's live target off the one card"
-            );
-            assert_eq!(
-                tui.live_session_for(RECONNECT_AGENT_ID, Some(PANE_ID))
-                    .map(|live| live.tool_count),
-                Some(7),
-                "the ListAgents join answers with the fresher evidence"
-            );
-        } else {
-            assert_eq!(
-                join(&tui, RECONNECT_AGENT_ID),
-                before,
-                "a snapshot that is not the fresher evidence must leave the kept card as it was \
-                 (early frame at {early_at}, snapshot at {snapshot_instant})"
-            );
-            assert_eq!(
-                card.recent_events.len(),
-                journal_before,
-                "nor push a live-target carrier onto it"
-            );
-            assert_eq!(card.last_activity, early_at, "nor move its evidence");
+        match outcome {
+            Outcome::Overlay => {
+                assert_eq!(
+                    card.last_activity, snapshot_instant,
+                    "the kept card must take the fresher snapshot's instant"
+                );
+                assert_eq!(card.status, SessionStatus::Working, "fresher status");
+                assert_eq!(card.tool_count, 7, "fresher tool fields");
+                assert_eq!(
+                    card.writable(),
+                    Writable::HistoryOnly,
+                    "the snapshot's live target must reach the kept card, so it refuses input"
+                );
+                assert_eq!(
+                    tui.pane_session_id(PANE_ID).as_deref(),
+                    Some(early_key),
+                    "pane_session_id picks the one card"
+                );
+                assert_eq!(
+                    tui.pane_writable(PANE_ID),
+                    Writable::HistoryOnly,
+                    "pane_writable reads the snapshot's live target off the one card"
+                );
+                assert_eq!(
+                    tui.agent_writable(RECONNECT_AGENT_ID),
+                    Writable::HistoryOnly,
+                    "agent_writable reads the snapshot's live target off the one card"
+                );
+                assert_eq!(
+                    tui.live_session_for(RECONNECT_AGENT_ID, Some(PANE_ID))
+                        .map(|live| live.tool_count),
+                    Some(7),
+                    "the ListAgents join answers with the fresher evidence"
+                );
+            }
+            Outcome::AdoptLiveTargetOnly => {
+                assert_eq!(
+                    card.writable(),
+                    Writable::HistoryOnly,
+                    "on a tie, a kept card with no live target must adopt the snapshot's, so it \
+                     refuses input"
+                );
+                assert_eq!(
+                    tui.pane_writable(PANE_ID),
+                    Writable::HistoryOnly,
+                    "pane_writable reads the adopted live target off the one card"
+                );
+                assert_eq!(
+                    tui.agent_writable(RECONNECT_AGENT_ID),
+                    Writable::HistoryOnly,
+                    "agent_writable reads the adopted live target off the one card"
+                );
+                assert_eq!(
+                    card.recent_events.len(),
+                    journal_before + 1,
+                    "exactly one live-target carrier is pushed"
+                );
+                // Every display field stays: the join answers exactly as it did
+                // before, except for the adopted live target.
+                let mut expected = before.clone().expect("the kept card joins");
+                expected["live_target"] =
+                    serde_json::to_value(history_only()).expect("a live target serializes");
+                assert_eq!(
+                    join(&tui, RECONNECT_AGENT_ID),
+                    Some(expected),
+                    "a tie moves the live target and nothing else"
+                );
+                assert_eq!(card.status, status_before, "a tie keeps the card's status");
+                assert_eq!(
+                    card.tool_count, tool_count_before,
+                    "a tie keeps the card's tool fields"
+                );
+                assert_eq!(card.last_activity, early_at, "nor moves its evidence");
+            }
+            Outcome::Untouched => {
+                assert_eq!(
+                    join(&tui, RECONNECT_AGENT_ID),
+                    before,
+                    "a snapshot that is not the fresher evidence must leave the kept card as it \
+                     was (early frame at {early_at}, snapshot at {snapshot_instant})"
+                );
+                assert_eq!(
+                    card.recent_events.len(),
+                    journal_before,
+                    "nor push a live-target carrier onto it"
+                );
+                assert_eq!(card.last_activity, early_at, "nor move its evidence");
+                assert_eq!(
+                    card.live_target(),
+                    early_live,
+                    "a card that declares its own live target keeps it"
+                );
+            }
         }
     }
 

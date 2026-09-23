@@ -6476,11 +6476,17 @@ fn overlay_snapshot_fields(session: &mut SessionState, snap: &SessionSnapshot) {
     // prompt/tool, so the card's activity renderers ignore it; `apply_event`'s
     // forward-stamping then keeps it durable.
     if let Some(live_target) = snap.live_target {
-        let carrier = live_target_carrier_event(session, live_target);
-        session.recent_events.push_back(carrier);
-        if session.recent_events.len() > MAX_RECENT_EVENTS {
-            session.recent_events.pop_front();
-        }
+        push_live_target_carrier(session, live_target);
+    }
+}
+
+/// Push a [`live_target_carrier_event`] onto `session`'s bounded journal,
+/// stamped at its current `last_activity`.
+fn push_live_target_carrier(session: &mut SessionState, live_target: LiveTarget) {
+    let carrier = live_target_carrier_event(session, live_target);
+    session.recent_events.push_back(carrier);
+    if session.recent_events.len() > MAX_RECENT_EVENTS {
+        session.recent_events.pop_front();
     }
 }
 
@@ -7224,10 +7230,23 @@ impl AppState {
     /// (so a card that should refuse input does), the snapshot's event-derived
     /// `agent_type` when it has one, and `last_activity`.
     ///
-    /// Otherwise the card is left exactly as it is. A tie means the card
-    /// already holds evidence as new as the snapshot's; an older or absent
-    /// instant is no reason to overwrite what the agent's own events drew; and
-    /// a future stamp is refused for the reason given above.
+    /// Otherwise the card is left exactly as it is, with one exception on an
+    /// exact tie. A tie means the card already holds evidence as new as the
+    /// snapshot's; an older or absent instant is no reason to overwrite what
+    /// the agent's own events drew; and a future stamp is refused for the
+    /// reason given above.
+    ///
+    /// The exception: on a tie (`last_activity_ms` equal to the card's own
+    /// `last_activity`), a card that declares **no** live target adopts the
+    /// snapshot's live-target carrier, and nothing else. The tie is treated
+    /// asymmetrically on purpose. The daemon's snapshot can hold a declaration
+    /// from frames that reached it before the TUI subscribed, and a missing
+    /// live target is a safety property: a history-only or view-only card that
+    /// lacks it accepts input it should refuse. The other fields are display
+    /// state, and at an equal stamp there is no reason to prefer either
+    /// source, so the card's own `status`, tool fields, prompts and
+    /// `last_activity` stay. A card that already declares a live target keeps
+    /// its own.
     ///
     /// Unlike the minted branch, the kept card is measured against its own
     /// evidence only, not against every session on the pane or from the agent.
@@ -7298,6 +7317,18 @@ impl AppState {
             // holds, and still no later than now.
             session.last_activity = observed;
             overlay_snapshot_fields(session, snap);
+        } else if let Some(observed) = observed
+            && observed == session.last_activity
+            && session.live_target().is_none()
+            && let Some(live_target) = snap.live_target
+        {
+            // PRD #1223: the tie exception in the doc comment. Only the
+            // live-target carrier moves, because a missing one lets a card
+            // that should refuse input accept it; the display fields stay,
+            // since an equal stamp gives no reason to prefer the snapshot's.
+            // The carrier is stamped at the card's `last_activity`, which is
+            // the snapshot's instant too, so it moves no watermark.
+            push_live_target_carrier(session, live_target);
         }
     }
 
