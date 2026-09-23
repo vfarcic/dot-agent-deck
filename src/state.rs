@@ -6458,6 +6458,32 @@ fn live_target_carrier_event(session: &SessionState, live_target: LiveTarget) ->
     }
 }
 
+/// The snapshot fields [`AppState::seed_hydrated_session`] copies onto a card:
+/// status, tool fields, prompt context and the live-target carrier. Everything
+/// but `agent_type` and `last_activity`, which the two callers decide
+/// differently (see that function's doc comment).
+fn overlay_snapshot_fields(session: &mut SessionState, snap: &SessionSnapshot) {
+    session.status = snap.status.clone();
+    session.active_tool = snap.active_tool.clone();
+    session.tool_count = snap.tool_count;
+    session.first_prompts = snap.first_prompts.clone();
+    session.last_user_prompt = snap.last_user_prompt.clone();
+    // PRD #20 blocker-4: restore the durable live-target so a history-only /
+    // view-only card keeps refusing input right after reconnect, before any new
+    // event re-declares it. The descriptor lives in `recent_events` (no
+    // dedicated field — uneditable fixtures build `SessionState` by exhaustive
+    // literal), so re-seed it as a single inert carrier event. It sets no
+    // prompt/tool, so the card's activity renderers ignore it; `apply_event`'s
+    // forward-stamping then keeps it durable.
+    if let Some(live_target) = snap.live_target {
+        let carrier = live_target_carrier_event(session, live_target);
+        session.recent_events.push_back(carrier);
+        if session.recent_events.len() > MAX_RECENT_EVENTS {
+            session.recent_events.pop_front();
+        }
+    }
+}
+
 impl AppState {
     pub fn aggregate_stats(&self) -> DashboardStats {
         let mut stats = DashboardStats::default();
@@ -7183,12 +7209,34 @@ impl AppState {
     /// `DateTime` can hold, keeps the minted value. That is the pre-#804
     /// behaviour.
     ///
-    /// PRD #1223: when [`Self::insert_placeholder_session`] keeps an existing
-    /// card for the same pane and `Some(agent_id)` instead of minting, no
-    /// snapshot field is overlaid, `last_activity` included. The #804 rule
-    /// agrees without being consulted: that card is on the pane, so it is part
-    /// of the held evidence, and no instant is both strictly newer than it and
-    /// no later than its own `last_activity`.
+    /// # A card the upsert keeps, and why it takes only fresher evidence
+    ///
+    /// PRD #1223: [`Self::insert_placeholder_session`] keeps an existing card
+    /// for the same pane and `Some(agent_id)` instead of minting a second one,
+    /// so one agent on one pane has one card. That card can predate the
+    /// snapshot (the TUI's event subscriber starts before hydration), and the
+    /// daemon may have seen activity since that the card has not. So the kept
+    /// card takes the snapshot when, and only when, the snapshot's instant is
+    /// **strictly newer than the card's own `last_activity` and no later than
+    /// now**. That is issue #804's clock bar, decided the same way, so the two
+    /// rules share one notion of "newer". The overlay covers what a minted card
+    /// takes: `status`, the tool fields, the prompts, the live-target carrier
+    /// (so a card that should refuse input does), the snapshot's event-derived
+    /// `agent_type` when it has one, and `last_activity`.
+    ///
+    /// Otherwise the card is left exactly as it is. A tie means the card
+    /// already holds evidence as new as the snapshot's; an older or absent
+    /// instant is no reason to overwrite what the agent's own events drew; and
+    /// a future stamp is refused for the reason given above.
+    ///
+    /// Unlike the minted branch, the kept card is measured against its own
+    /// evidence only, not against every session on the pane or from the agent.
+    /// The question here is whether this card's content is stale, and another
+    /// session's stamp says nothing about that. The cost is that the "no
+    /// newest-wins pick changes" property above does not hold for this branch,
+    /// and deliberately: once the card carries evidence newer than a competitor,
+    /// it is the newest session and the picks follow it. `status/supersede/017`
+    /// pins both halves.
     pub fn seed_hydrated_session(
         &mut self,
         pane_id: String,
@@ -7213,46 +7261,43 @@ impl AppState {
         // fields when one is present.
         let session_id =
             self.insert_placeholder_session(pane_id.clone(), cwd, effective_agent_type, agent_id);
-        // PRD #1223: a card the agent's own events already drew is newer than
-        // any snapshot, so only a freshly minted placeholder takes the overlay.
+        let Some(snap) = live else { return };
+        let observed = snap
+            .last_activity_ms
+            .and_then(DateTime::<Utc>::from_timestamp_millis);
         let minted = session_id == placeholder_session_id(&pane_id);
-        if let Some(snap) = live.filter(|_| minted)
-            && let Some(session) = self.sessions.get_mut(&session_id)
-        {
-            session.status = snap.status.clone();
-            session.active_tool = snap.active_tool.clone();
-            session.tool_count = snap.tool_count;
-            session.first_prompts = snap.first_prompts.clone();
-            session.last_user_prompt = snap.last_user_prompt.clone();
-            // PRD #20 blocker-4: restore the durable live-target so a
-            // history-only / view-only card keeps refusing input right
-            // after reconnect, before any new event re-declares it. The
-            // descriptor lives in `recent_events` (no dedicated field —
-            // uneditable fixtures build `SessionState` by exhaustive
-            // literal), so re-seed it as a single inert carrier event. It
-            // sets no prompt/tool, so the card's activity renderers ignore
-            // it; `apply_event`'s forward-stamping then keeps it durable.
-            if let Some(live_target) = snap.live_target {
-                session
-                    .recent_events
-                    .push_back(live_target_carrier_event(session, live_target));
-            }
+        let Some(session) = self.sessions.get_mut(&session_id) else {
+            return;
+        };
+        if minted {
+            overlay_snapshot_fields(session, snap);
             // Issue #804: newer-only, per the doc comment. Deliberately
-            // AFTER the carrier above, which keeps its minted stamp: the
-            // carrier's timestamp feeds the pane's event watermark
-            // (`ui::pane_event_watermark`), a separate ordering surface this
-            // overlay does not move. Reached only for a freshly minted
-            // placeholder (PRD #1223, above); for a kept card the rule could
-            // not fire anyway, since that card is part of `held_evidence` and
-            // `observed` would have to be both above it and at or below it.
-            if let Some(observed) = snap
-                .last_activity_ms
-                .and_then(DateTime::<Utc>::from_timestamp_millis)
+            // AFTER the carrier `overlay_snapshot_fields` pushed, which keeps
+            // its minted stamp: the carrier's timestamp feeds the pane's event
+            // watermark (`ui::pane_event_watermark`), a separate ordering
+            // surface this overlay does not move.
+            if let Some(observed) = observed
                 && observed <= session.last_activity
                 && held_evidence.is_none_or(|held| observed > held)
             {
                 session.last_activity = observed;
             }
+        } else if let Some(observed) = observed
+            && observed > session.last_activity
+            && observed <= Utc::now()
+        {
+            // PRD #1223 with issue #804: a card the upsert kept takes the
+            // snapshot only when the snapshot is the fresher evidence, by the
+            // same clock bar as the minted branch: strictly newer than what the
+            // card holds, and no later than now. See the doc comment.
+            if let Some(agent_type) = snap.agent_type.clone() {
+                session.agent_type = agent_type;
+            }
+            // The stamp moves BEFORE the carrier is built, so the carrier sits
+            // at the snapshot's instant: the newest evidence the card now
+            // holds, and still no later than now.
+            session.last_activity = observed;
+            overlay_snapshot_fields(session, snap);
         }
     }
 
