@@ -326,6 +326,23 @@ pub struct CommandRow {
     /// are close to opposite: this describes an action that happened, that one
     /// blocks an action before it does. `commands.toml` says so at the column.
     pub report: String,
+    /// What the row does, in the user's terms — "open a directory" — for the
+    /// refusal of a pick the user's words did not ask for (PRD #1223). That
+    /// sentence used to quote [`CommandRow::id`], and `nothing in that asks
+    /// for "open_dir"` is meaningless to the person who hears it; the first
+    /// real use of the directory browser met exactly that. A verb phrase that
+    /// follows "asks to", so no leading capital and no trailing period, and
+    /// never the id: the parser refuses one that contains an `_`
+    /// ([`TableError::InternalAsksTo`]).
+    pub asks_to: String,
+    /// A phrasing that DOES ask for this row, offered in the same refusal —
+    /// "open {dir}". A `{param}` placeholder is filled with what the model
+    /// heard for that param only when the user said every word of it, and the
+    /// suggestion is left out otherwise, so the sentence never repeats a value
+    /// the model supplied on its own. The parser holds it to the row's own
+    /// grounding ([`TableError::UngroundedTrySaying`]): a suggestion that would
+    /// itself be refused is worse than none.
+    pub try_saying: String,
     pub params: Vec<ParamSpec>,
     /// What in a transcript counts as the user having asked for THIS action
     /// (PRD #1223, closing audit F1). See [`ActionGrounding`].
@@ -497,6 +514,16 @@ impl CommandTable {
             let description = required(row.description, &id, "description")?;
             let unavailable_hint = required(row.unavailable_hint, &id, "unavailable_hint")?;
             let report = required(row.report, &id, "report")?;
+            let asks_to = required(row.asks_to, &id, "asks_to")?;
+            let try_saying = required(row.try_saying, &id, "try_saying")?;
+            // The column exists to keep the id out of a user-facing sentence,
+            // so an id-shaped value is refused rather than trusted to review.
+            if asks_to.contains('_') {
+                return Err(TableError::InternalAsksTo {
+                    id: id.clone(),
+                    asks_to,
+                });
+            }
 
             let mut screens = Vec::new();
             for screen in row.screens.unwrap_or_default() {
@@ -559,7 +586,7 @@ impl CommandTable {
             // it, so it gets the same treatment `invoke` gets from M3's guard:
             // a placeholder naming no declared param is refused here rather
             // than rendering as a literal `{agent}` to the user.
-            for placeholder in placeholders(&report, &id)? {
+            for placeholder in placeholders(&report, &id, "report")? {
                 match params.iter().find(|param| param.name == placeholder) {
                     None => {
                         return Err(TableError::UnknownPlaceholder {
@@ -669,6 +696,56 @@ impl CommandTable {
                 });
             }
 
+            // The suggestion: each placeholder names a REQUIRED param, as a
+            // report's does, and the fixed words — the text between
+            // placeholders, each run on its own — must ask for the row under
+            // its own grounding. Checked as a contiguous run of words, which
+            // is stricter than the transcript check and so implies it.
+            for placeholder in placeholders(&try_saying, &id, "try_saying")? {
+                if !params
+                    .iter()
+                    .any(|param| param.name == placeholder && !param.optional)
+                {
+                    return Err(TableError::TrySayingPlaceholder {
+                        id: id.clone(),
+                        placeholder,
+                    });
+                }
+            }
+            // `placeholders` has already refused unpaired braces.
+            let mut segments: Vec<Vec<String>> = Vec::new();
+            let mut rest = try_saying.as_str();
+            while let Some(open) = rest.find('{') {
+                segments.push(spoken_words(&rest[..open]));
+                let close = rest[open..]
+                    .find('}')
+                    .map_or(rest.len(), |at| open + at + 1);
+                rest = &rest[close..];
+            }
+            segments.push(spoken_words(rest));
+            let contains = |words: &[String], phrase: &str| {
+                let wanted = spoken_words(phrase);
+                !wanted.is_empty() && words.windows(wanted.len()).any(|window| window == wanted)
+            };
+            let suggestion_grounded = match &grounding {
+                ActionGrounding::HeardAs(phrases) => segments
+                    .iter()
+                    .any(|words| phrases.iter().any(|phrase| contains(words, phrase))),
+                ActionGrounding::HeardAsWhole(phrases) => {
+                    segments.len() == 1
+                        && phrases
+                            .iter()
+                            .any(|phrase| spoken_words(phrase) == segments[0])
+                }
+                ActionGrounding::Exempt(_) => true,
+            };
+            if !suggestion_grounded {
+                return Err(TableError::UngroundedTrySaying {
+                    id: id.clone(),
+                    phrase: try_saying,
+                });
+            }
+
             commands.push(CommandRow {
                 id,
                 description,
@@ -677,6 +754,8 @@ impl CommandTable {
                 requires,
                 unavailable_hint,
                 report,
+                asks_to,
+                try_saying,
                 params,
                 grounding,
                 grounding_while,
@@ -723,24 +802,26 @@ pub(crate) fn spoken_words(text: &str) -> Vec<String> {
         .collect()
 }
 
-/// The `{name}` placeholders in a report, in order.
+/// The `{name}` placeholders in a report or a `try_saying`, in order.
 ///
 /// There is no escape for a literal `{` and nothing in the table needs one; an
 /// unclosed brace is refused rather than passed through, so a report that
 /// looks interpolated and is not cannot reach a user.
-fn placeholders(text: &str, id: &str) -> Result<Vec<String>, TableError> {
+fn placeholders(text: &str, id: &str, column: &'static str) -> Result<Vec<String>, TableError> {
     let mut found = Vec::new();
     let mut rest = text;
     while let Some(open) = rest.find('{') {
         let after = &rest[open + 1..];
         let close = after.find('}').ok_or_else(|| TableError::MalformedReport {
             id: id.to_string(),
+            column,
             detail: "an opening `{` with no closing `}`".to_string(),
         })?;
         let name = after[..close].trim().to_string();
         if name.is_empty() {
             return Err(TableError::MalformedReport {
                 id: id.to_string(),
+                column,
                 detail: "an empty `{}` placeholder".to_string(),
             });
         }
@@ -791,8 +872,21 @@ pub enum TableError {
     /// A `report` placeholder naming an OPTIONAL param, which would render
     /// as a literal `{name}` whenever the user named nothing.
     OptionalPlaceholder { id: String, placeholder: String },
-    /// A `report` whose braces do not pair up.
-    MalformedReport { id: String, detail: String },
+    /// A `report` or `try_saying` whose braces do not pair up.
+    MalformedReport {
+        id: String,
+        column: &'static str,
+        detail: String,
+    },
+    /// An `asks_to` that looks like an internal id — it contains an `_` —
+    /// in the one column that exists to keep ids out of what the user reads.
+    InternalAsksTo { id: String, asks_to: String },
+    /// A `try_saying` placeholder naming no declared param, or an optional
+    /// one: either would leave a hole in the suggestion.
+    TrySayingPlaceholder { id: String, placeholder: String },
+    /// A `try_saying` whose words the row's own grounding would refuse, so
+    /// the refusal would suggest a phrasing that is refused in turn.
+    UngroundedTrySaying { id: String, phrase: String },
     /// A row with none of a non-empty `heard_as`, a non-empty
     /// `heard_as_whole` or an `ungrounded` reason: nothing would say whether
     /// the user asked for it.
@@ -877,9 +971,21 @@ impl fmt::Display for TableError {
                 f,
                 "command `{id}`'s report names `{{{placeholder}}}`, which is optional and so may have nothing to say"
             ),
-            TableError::MalformedReport { id, detail } => {
-                write!(f, "command `{id}`'s report has {detail}")
+            TableError::MalformedReport { id, column, detail } => {
+                write!(f, "command `{id}`'s {column} has {detail}")
             }
+            TableError::InternalAsksTo { id, asks_to } => write!(
+                f,
+                "command `{id}`'s asks_to `{asks_to}` contains an `_`; it is read by the user, so it names the action in words, never by id"
+            ),
+            TableError::TrySayingPlaceholder { id, placeholder } => write!(
+                f,
+                "command `{id}`'s try_saying names `{{{placeholder}}}`, which is not one of its required params"
+            ),
+            TableError::UngroundedTrySaying { id, phrase } => write!(
+                f,
+                "command `{id}`'s try_saying `{phrase}` would not itself ask for the row under its own grounding"
+            ),
             TableError::MissingGrounding { id } => write!(
                 f,
                 "command `{id}` has no `heard_as` or `heard_as_whole` (the words that ask for it) and no `ungrounded` reason"
@@ -962,6 +1068,8 @@ mod tests {
             "screens = [\"deck\"]",
             "unavailable_hint = \"it works from the deck\"",
             "report = \"Opening {agent}.\"",
+            "asks_to = \"open an agent\"",
+            "try_saying = \"open {agent}\"",
             "heard_as = [\"open\"]",
             "",
             "[[commands.params]]",
@@ -1079,6 +1187,106 @@ mod tests {
         }
     }
 
+    /// PRD #1223: the refusal of an ungrounded pick reads `asks_to` into
+    /// "nothing in that asks to …", so each is a lower-case verb phrase with no
+    /// period and no id in it — and every row's suggestion is its own.
+    #[test]
+    fn voice_table_embedded_asks_to_are_fragments_in_the_users_words() {
+        for row in super::table().rows() {
+            let asks_to = &row.asks_to;
+            assert!(!asks_to.ends_with('.'), "`{}`'s asks_to", row.id);
+            assert!(
+                asks_to.starts_with(|c: char| c.is_lowercase()),
+                "`{}`'s asks_to starts with a capital",
+                row.id
+            );
+            assert!(!row.try_saying.ends_with('.'), "`{}`'s try_saying", row.id);
+        }
+    }
+
+    #[test]
+    fn voice_table_rejects_an_id_shaped_asks_to() {
+        let source = one_row().replace("asks_to = \"open an agent\"", "asks_to = \"open_agent\"");
+        assert_eq!(
+            CommandTable::parse(&source).expect_err("refused"),
+            TableError::InternalAsksTo {
+                id: "open_agent".to_string(),
+                asks_to: "open_agent".to_string(),
+            }
+        );
+    }
+
+    /// A suggestion is held to what a report is held to — a placeholder names
+    /// a REQUIRED param — and to one thing more: its own row must accept it.
+    #[test]
+    fn voice_table_rejects_a_try_saying_the_row_would_not_accept() {
+        let with = |try_saying: &str| {
+            one_row().replace(
+                "try_saying = \"open {agent}\"",
+                &format!("try_saying = \"{try_saying}\""),
+            )
+        };
+        assert!(CommandTable::parse(&with("open the tester")).is_ok());
+        assert!(CommandTable::parse(&with("OPEN {agent}")).is_ok());
+        assert_eq!(
+            CommandTable::parse(&with("open {pane}")).expect_err("refused"),
+            TableError::TrySayingPlaceholder {
+                id: "open_agent".to_string(),
+                placeholder: "pane".to_string(),
+            }
+        );
+        assert!(matches!(
+            CommandTable::parse(&with("open {agent")).expect_err("refused"),
+            TableError::MalformedReport {
+                column: "try_saying",
+                ..
+            }
+        ));
+        // The row's word is split by the placeholder, so no run of fixed words
+        // contains it; and a suggestion without it asks for nothing.
+        for ungrounded in ["op{agent}en", "show {agent}"] {
+            assert_eq!(
+                CommandTable::parse(&with(ungrounded)).expect_err("refused"),
+                TableError::UngroundedTrySaying {
+                    id: "open_agent".to_string(),
+                    phrase: ungrounded.to_string(),
+                },
+                "{ungrounded}"
+            );
+        }
+        // An optional param may not be interpolated either.
+        let optional = with("open {agent}")
+            .replace(
+                "kind = \"agent_ref\"",
+                "kind = \"agent_ref\"\noptional = true",
+            )
+            .replace("report = \"Opening {agent}.\"", "report = \"Opening.\"");
+        assert_eq!(
+            CommandTable::parse(&optional).expect_err("refused"),
+            TableError::TrySayingPlaceholder {
+                id: "open_agent".to_string(),
+                placeholder: "agent".to_string(),
+            }
+        );
+        // A whole-utterance row's suggestion is one of its entries, exactly.
+        let whole = one_row().replace("heard_as = [\"open\"]", "heard_as_whole = [\"open agent\"]");
+        for (try_saying, accepted) in [
+            ("open agent", true),
+            ("open agent now", false),
+            ("open {agent}", false),
+        ] {
+            let source = whole.replace(
+                "try_saying = \"open {agent}\"",
+                &format!("try_saying = \"{try_saying}\""),
+            );
+            assert_eq!(
+                CommandTable::parse(&source).is_ok(),
+                accepted,
+                "{try_saying}"
+            );
+        }
+    }
+
     #[test]
     fn voice_table_parses_a_minimal_row() {
         let table = CommandTable::parse(&one_row()).expect("parses");
@@ -1186,6 +1394,8 @@ mod tests {
                 "unavailable_hint",
             ),
             ("report = \"Opening {agent}.\"\n", "report"),
+            ("asks_to = \"open an agent\"\n", "asks_to"),
+            ("try_saying = \"open {agent}\"\n", "try_saying"),
         ] {
             let source = one_row().replace(line, "");
             let error = CommandTable::parse(&source).expect_err("refused");
@@ -1267,6 +1477,7 @@ mod tests {
 
         let source = one_row()
             .replace("report = \"Opening {agent}.\"", "report = \"Opening.\"")
+            .replace("try_saying = \"open {agent}\"", "try_saying = \"open\"")
             .replace(
                 "kind = \"agent_ref\"",
                 "kind = \"deck_ref\"\noptional = true",
@@ -1425,8 +1636,12 @@ mod tests {
         // "Open one agent." is the description, so `open agent` (the id's
         // words) and `one agent` are its own; `send` and `agent one` are not.
         for good in ["open", "one agent", "open agent", "OPEN"] {
-            let source =
-                one_row().replace("heard_as = [\"open\"]", &format!("heard_as = [\"{good}\"]"));
+            let source = one_row()
+                .replace("heard_as = [\"open\"]", &format!("heard_as = [\"{good}\"]"))
+                .replace(
+                    "try_saying = \"open {agent}\"",
+                    &format!("try_saying = \"{good}\""),
+                );
             assert!(CommandTable::parse(&source).is_ok(), "{good}");
         }
         for foreign in ["send", "agent one", "", "  "] {
@@ -1687,8 +1902,12 @@ mod tests {
 
     #[test]
     fn voice_table_parses_a_whole_utterance_row_under_the_own_words_rule() {
-        let source =
-            one_row().replace("heard_as = [\"open\"]", "heard_as_whole = [\"open agent\"]");
+        let source = one_row()
+            .replace("heard_as = [\"open\"]", "heard_as_whole = [\"open agent\"]")
+            .replace(
+                "try_saying = \"open {agent}\"",
+                "try_saying = \"open agent\"",
+            );
         let table = CommandTable::parse(&source).expect("parses");
         assert_eq!(
             table.rows()[0].grounding,
@@ -2271,6 +2490,8 @@ struct RawCommand {
     requires: Option<Vec<String>>,
     unavailable_hint: Option<String>,
     report: Option<String>,
+    asks_to: Option<String>,
+    try_saying: Option<String>,
     heard_as: Option<Vec<String>>,
     heard_as_whole: Option<Vec<String>>,
     heard_as_whole_while: Option<std::collections::BTreeMap<String, Vec<String>>>,

@@ -620,6 +620,8 @@ mod tests {
             "invoke = \"anywhere\"",
             "unavailable_hint = \"unreachable\"",
             "report = \"Done.\"",
+            "asks_to = \"do it\"",
+            "try_saying = \"anywhere\"",
             "heard_as = [\"anywhere\"]",
         ]
         .join("\n");

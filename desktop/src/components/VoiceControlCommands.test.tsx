@@ -1106,16 +1106,16 @@ describe("the New agent directory browser, by voice (PRD #1223)", () => {
       const unavailable = (action: string, hint: string): VoiceResultDto => ({ resolveMs: 21, backend: "stub", outcome: { kind: "unavailable", transcript: utterance, action, hint, sentence: `Not here — ${hint}.` } });
       if (utterance.startsWith("open dir ")) {
         const name = utterance.slice("open dir ".length);
-        if (!directories && !options.forced) return unavailable("open_dir", "opening a directory works while the New agent dialog is showing a directory listing");
+        if (!directories && !options.forced) return unavailable("open_dir", "opening a directory needs the New agent dialog's directory listing; say “new agent” and choose a deck first");
         const entry = directories?.entries.find((candidate) => candidate.name === name) ?? { name, path: `/home/dev/${name}` };
         return dispatch("open_dir", "openDirectory", `Opening ${entry.name}.`, utterance, [{ name: "dir", kind: "dir_ref", spoken: name, value: entry.path, label: entry.name }]);
       }
       if (utterance === "go to parent") {
-        if (!directories?.hasParent && !options.forced) return unavailable("go_to_parent", "going up works while the New agent dialog is showing a directory that has a parent");
+        if (!directories?.hasParent && !options.forced) return unavailable("go_to_parent", "going up needs the New agent dialog showing a directory below the top; choose a deck and open a directory first");
         return dispatch("go_to_parent", "goToParentDirectory", "Going up.", utterance);
       }
       if (utterance === "use this directory") {
-        if (!directories && !options.forced) return unavailable("use_this_directory", "choosing a directory works while the New agent dialog is showing a directory listing");
+        if (!directories && !options.forced) return unavailable("use_this_directory", "choosing a directory needs the New agent dialog's directory listing; say “new agent” and choose a deck first");
         return dispatch("use_this_directory", "useThisDirectory", "Using this directory.", utterance);
       }
       return dispatch("close", "closeTopmost", "Closed.", utterance);
@@ -1250,7 +1250,7 @@ describe("the New agent directory browser, by voice (PRD #1223)", () => {
     await completeUtterance();
 
     expect(declarations).toEqual([undefined]);
-    expect(screen.getByTestId("voice-report")).toHaveTextContent("Not here — opening a directory works while the New agent dialog is showing a directory listing.");
+    expect(screen.getByTestId("voice-report")).toHaveTextContent("Not here — opening a directory needs the New agent dialog's directory listing; say “new agent” and choose a deck first.");
     expect(listDirectories).not.toHaveBeenCalled();
     expect(screen.queryByTestId("new-agent-dialog")).toBeNull();
   });
@@ -1349,7 +1349,7 @@ describe("the New agent directory browser, by voice (PRD #1223)", () => {
     voice.deliver("go to parent");
     await completeUtterance();
     expect(declarations.at(-1)?.hasParent).toBe(false);
-    expect(screen.getByTestId("voice-report")).toHaveTextContent("Not here — going up works while the New agent dialog is showing a directory that has a parent.");
+    expect(screen.getByTestId("voice-report")).toHaveTextContent("Not here — going up needs the New agent dialog showing a directory below the top; choose a deck and open a directory first.");
     expect(listDirectories).toHaveBeenCalledTimes(1);
     expect(currentPath()).toBe("/");
   });
@@ -1449,20 +1449,20 @@ describe("the rest of the New agent form, by voice (PRD #1223)", () => {
       const unresolved = (action: string, param: string, spoken: string, sentence: string): VoiceResultDto => ({ resolveMs: 21, backend: "stub", outcome: { kind: "param_unresolved", transcript: utterance, action, param, spoken, sentence } });
       if (utterance.startsWith("mode ")) {
         const spoken = utterance.slice("mode ".length);
-        if (!form && !options.forced) return unavailable("choose_mode", "choosing a mode works while the New agent form has a deck and a directory chosen");
+        if (!form && !options.forced) return unavailable("choose_mode", "choosing a mode needs a deck and a directory chosen in the New agent dialog; choose those first");
         const chip = form?.modes.find((candidate) => candidate.label.toLowerCase() === spoken) ?? (options.forced ? { id: spoken, label: spoken } : undefined);
         if (!chip) return unresolved("choose_mode", "mode", spoken, `Heard: “${utterance}” — no mode the New agent form offers matches “${spoken}”.`);
         return dispatch("choose_mode", "chooseNewAgentMode", `Mode: ${chip.label}.`, utterance, [{ name: "mode", kind: "mode_ref", spoken, value: chip.id, label: chip.label }]);
       }
       if (utterance.startsWith("use ")) {
         const spoken = utterance.slice("use ".length);
-        if (!form && !options.forced) return unavailable("choose_agent_type", "choosing an agent works while the New agent form has a deck and a directory chosen");
+        if (!form && !options.forced) return unavailable("choose_agent_type", "choosing an agent needs a deck and a directory chosen in the New agent dialog; choose those first");
         const entry = form?.agentTypes.find((candidate) => candidate.id === spoken || candidate.label.toLowerCase() === spoken);
         if (!entry) return unresolved("choose_agent_type", "agent_type", spoken, `Heard: “${utterance}” — no agent type in the New agent form's picker matches “${spoken}”.`);
         return dispatch("choose_agent_type", "chooseNewAgentType", `Agent: ${entry.label}.`, utterance, [{ name: "agent_type", kind: "agent_type_ref", spoken, value: entry.id, label: entry.label }]);
       }
       if (utterance.startsWith("call it ")) {
-        if (!form && !options.forced) return unavailable("name_new_agent", "naming the new agent works while the New agent form has a deck and a directory chosen");
+        if (!form && !options.forced) return unavailable("name_new_agent", "naming the new agent needs a deck and a directory chosen in the New agent dialog; choose those first");
         const rest = utterance.slice("call it ".length);
         return dispatch("name_new_agent", "nameNewAgent", "Name set.", utterance, [{ name: "prefix", kind: "spoken_prefix", spoken: "call it", value: rest, label: rest }]);
       }
@@ -1703,7 +1703,7 @@ describe("the rest of the New agent form, by voice (PRD #1223)", () => {
     await completeUtterance();
 
     expect(declarations.at(-1)).toEqual({ form: undefined });
-    expect(screen.getByTestId("voice-report")).toHaveTextContent("Not here — choosing a mode works while the New agent form has a deck and a directory chosen.");
+    expect(screen.getByTestId("voice-report")).toHaveTextContent("Not here — choosing a mode needs a deck and a directory chosen in the New agent dialog; choose those first.");
   });
 
   /** Scenario: with the dialog closed nothing is declared, and a forced fill finds no form. */
@@ -1779,7 +1779,7 @@ describe("PRD #802 D5 — a spoken start or stop only ever opens a confirmation 
   function d5Voice(declared: () => VoiceNewAgentDto | undefined): ResolveVoice {
     return vi.fn(async (utterance: string) => {
       if (utterance === "start it") {
-        if (!declared()) return { resolveMs: 21, backend: "stub", outcome: { kind: "unavailable", transcript: utterance, action: "start_new_agent", hint: "starting a new agent works while the New agent dialog is open", sentence: "Not here — starting a new agent works while the New agent dialog is open." } } as VoiceResultDto;
+        if (!declared()) return { resolveMs: 21, backend: "stub", outcome: { kind: "unavailable", transcript: utterance, action: "start_new_agent", hint: "starting a new agent needs the New agent dialog; say “new agent” first", sentence: "Not here — starting a new agent needs the New agent dialog; say “new agent” first." } } as VoiceResultDto;
         return dispatch("start_new_agent", "confirmStartNewAgent", "Confirm the start in the dialog — nothing has started yet.", utterance);
       }
       if (utterance.startsWith("stop ")) {
@@ -1939,7 +1939,7 @@ describe("PRD #802 D5 — a spoken start or stop only ever opens a confirmation 
     await turnVoiceOn();
     await completeUtterance();
 
-    expect(screen.getByTestId("voice-report")).toHaveTextContent("Not here — starting a new agent works while the New agent dialog is open.");
+    expect(screen.getByTestId("voice-report")).toHaveTextContent("Not here — starting a new agent needs the New agent dialog; say “new agent” first.");
     expect(confirmation()).toBeNull();
     expect(runAction).not.toHaveBeenCalled();
     // A dispatch that arrives anyway finds no dialog to confirm in.

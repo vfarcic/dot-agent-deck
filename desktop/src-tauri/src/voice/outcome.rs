@@ -38,7 +38,7 @@
 //! `invoke` target and the resolved params; the frontend dispatches it where a
 //! click dispatches one (M2/M6).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::Serialize;
 
@@ -240,28 +240,46 @@ impl VoiceOutcome {
     /// one a declared context selected ([`CommandRow::grounding_for`]), whose
     /// requirement the sentence then names so the user learns why a word that
     /// works elsewhere did not work here.
+    ///
+    /// **The sentence names the action in the user's terms, never by id**
+    /// ([`CommandRow::asks_to`], PRD #1223). It used to read `nothing in that
+    /// asks for "open_dir"`, which the first real use of the directory browser
+    /// met and could do nothing with. It now offers a phrasing that would have
+    /// worked ([`CommandRow::try_saying`]), filled from `answered` only with
+    /// words the user really said — see [`suggestion`].
     fn action_ungrounded(
         transcript: Transcript,
         row: &CommandRow,
         grounding: (&ActionGrounding, Option<Requirement>),
+        answered: &BTreeMap<String, String>,
     ) -> Self {
         // A whole-utterance row says how to ask for it, because its words may
         // well have been in what the user said — "tell it the build has
         // finished" — and "nothing in that asks" would read as the app not
-        // having heard them.
+        // having heard them. Over a context, the example is the context's own
+        // first entry: the row's `try_saying` is what works elsewhere.
         let why = match grounding {
             (ActionGrounding::HeardAsWhole(phrases), context) => format!(
-                "\u{201c}{}\u{201d} needs to be said on its own{}, like \u{201c}{}\u{201d}, so nothing was done",
-                row.id,
+                "asking to {} needs to be said on its own{}, like \u{201c}{}\u{201d}, so nothing was done",
+                row.asks_to,
                 context
                     .map(|requirement| format!(" {}", requirement.while_phrase()))
                     .unwrap_or_default(),
-                phrases.first().map(String::as_str).unwrap_or_default()
+                match context {
+                    Some(_) => phrases.first().map(String::as_str).unwrap_or_default(),
+                    None => row.try_saying.as_str(),
+                }
             ),
-            _ => format!(
-                "nothing in that asks for \u{201c}{}\u{201d}, so nothing was done",
-                row.id
-            ),
+            _ => {
+                let mut why = format!(
+                    "nothing in that asks to {}, so nothing was done",
+                    row.asks_to
+                );
+                if let Some(example) = suggestion(row, &transcript, answered) {
+                    why.push_str(&format!("; try \u{201c}{example}\u{201d}"));
+                }
+                why
+            }
         };
         Self::ActionUngrounded {
             sentence: heard(&transcript, &why),
@@ -505,7 +523,12 @@ pub async fn handle_utterance_with(
     // [`action_grounded`].
     if !action_grounded(row, transcript.text(), directories, new_agent) {
         let grounding = row.grounding_for(directories, new_agent);
-        return finish(VoiceOutcome::action_ungrounded(transcript, row, grounding));
+        return finish(VoiceOutcome::action_ungrounded(
+            transcript,
+            row,
+            grounding,
+            &answer.params,
+        ));
     }
 
     // The screen AND the row's `requires` (PRD #1223): a directory row picked
@@ -891,7 +914,12 @@ fn local_intercept(
         // without the check.
         if !action_grounded(row, transcript.text(), directories, new_agent) {
             let grounding = row.grounding_for(directories, new_agent);
-            return VoiceOutcome::action_ungrounded(transcript.clone(), row, grounding);
+            return VoiceOutcome::action_ungrounded(
+                transcript.clone(),
+                row,
+                grounding,
+                &BTreeMap::new(),
+            );
         }
         if !row.callable_on(screen) {
             return VoiceOutcome::unavailable(transcript.clone(), row);
@@ -1301,6 +1329,42 @@ fn refuse_ungrounded(
         param: spec.name.clone(),
         spoken: spoken.to_string(),
     })
+}
+
+/// The row's [`CommandRow::try_saying`] with each `{param}` filled, for the
+/// refusal of a pick the user did not ask for — or `None` when a placeholder
+/// cannot be filled honestly.
+///
+/// **A placeholder is filled only with words the user SAID.** The model's
+/// value for the param is the candidate, and it is used only when every one
+/// of its words is [`Heard`] in the transcript. That keeps the suggestion
+/// useful — "select directory code" gets *try "open code"* — without letting
+/// the refusal repeat a value the model supplied on its own, which is what a
+/// name written to steer it would produce. With no such value the suggestion
+/// is left out rather than rendered with a hole.
+fn suggestion(
+    row: &CommandRow,
+    transcript: &Transcript,
+    answered: &BTreeMap<String, String>,
+) -> Option<String> {
+    let heard = Heard::new(transcript.text());
+    let mut out = String::new();
+    let mut rest = row.try_saying.as_str();
+    // The parser refused unpaired braces and placeholders naming no required
+    // param, so every `{` here opens a name that `answered` may hold.
+    while let Some(open) = rest.find('{') {
+        out.push_str(&rest[..open]);
+        let after = &rest[open + 1..];
+        let close = after.find('}')?;
+        let words = spoken_words(answered.get(after[..close].trim())?);
+        if words.is_empty() || !words.iter().all(|word| heard.word(word)) {
+            return None;
+        }
+        out.push_str(&words.join(" "));
+        rest = &after[close + 1..];
+    }
+    out.push_str(rest);
+    Some(out)
 }
 
 /// `Heard: “<transcript>” — <situation>.`
@@ -3083,17 +3147,17 @@ mod tests {
             (
                 "open dir billing",
                 "open_dir",
-                "opening a directory works while the New agent dialog is showing a directory listing",
+                "opening a directory needs the New agent dialog's directory listing; say \u{201c}new agent\u{201d} and choose a deck first",
             ),
             (
                 "go to parent dir",
                 "go_to_parent",
-                "going up works while the New agent dialog is showing a directory that has a parent",
+                "going up needs the New agent dialog showing a directory below the top; choose a deck and open a directory first",
             ),
             (
                 "use this directory",
                 "use_this_directory",
-                "choosing a directory works while the New agent dialog is showing a directory listing",
+                "choosing a directory needs the New agent dialog's directory listing; say \u{201c}new agent\u{201d} and choose a deck first",
             ),
         ] {
             let answer = if action == "open_dir" {
@@ -3142,7 +3206,7 @@ mod tests {
         let outcome = run_with(&resolver, Screen::Overview, Some(&root), "go up").await;
         assert_eq!(
             outcome.sentence(),
-            "Not here — going up works while the New agent dialog is showing a directory that has a parent."
+            "Not here — going up needs the New agent dialog showing a directory below the top; choose a deck and open a directory first."
         );
     }
 
@@ -3524,21 +3588,21 @@ mod tests {
                 "choose_mode",
                 "mode",
                 "schedule",
-                "choosing a mode works while the New agent form has a deck and a directory chosen",
+                "choosing a mode needs a deck and a directory chosen in the New agent dialog; choose those first",
             ),
             (
                 "use claude",
                 "choose_agent_type",
                 "agent_type",
                 "claude",
-                "choosing an agent works while the New agent form has a deck and a directory chosen",
+                "choosing an agent needs a deck and a directory chosen in the New agent dialog; choose those first",
             ),
             (
                 "name it docs",
                 "name_new_agent",
                 "prefix",
                 "name it",
-                "naming the new agent works while the New agent form has a deck and a directory chosen",
+                "naming the new agent needs a deck and a directory chosen in the New agent dialog; choose those first",
             ),
         ] {
             let resolver = StubResolver::new()
@@ -3701,7 +3765,7 @@ mod tests {
         let closed = run_form(&resolver, Screen::Overview, None, "start it").await;
         assert_eq!(
             closed.sentence(),
-            "Not here — starting a new agent works while the New agent dialog is open."
+            "Not here — starting a new agent needs the New agent dialog; say \u{201c}new agent\u{201d} first."
         );
     }
 
@@ -4295,6 +4359,8 @@ mod tests {
             requires: Vec::new(),
             unavailable_hint: "h".to_string(),
             report: "{first} then {second}.".to_string(),
+            asks_to: "a".to_string(),
+            try_saying: "t".to_string(),
             params: Vec::new(),
             grounding: ActionGrounding::Exempt("a hand-built row".to_string()),
             grounding_while: Vec::new(),
@@ -4356,6 +4422,8 @@ mod tests {
             requires: Vec::new(),
             unavailable_hint: "h".to_string(),
             report: "Opening { agent }.".to_string(),
+            asks_to: "a".to_string(),
+            try_saying: "t".to_string(),
             params: Vec::new(),
             grounding: ActionGrounding::Exempt("a hand-built row".to_string()),
             grounding_while: Vec::new(),
@@ -4389,6 +4457,8 @@ mod tests {
                  screens = [\"deck\"]\n\
                  unavailable_hint = \"open the deck first\"\n\
                  report = \"Opening {spelling}.\"\n\
+                 asks_to = \"open an agent\"\n\
+                 try_saying = \"open\"\n\
                  heard_as = [\"open\"]\n\
                  params = [{{ name = \"agent\", kind = \"agent_ref\" }}]\n"
             );
@@ -5172,7 +5242,7 @@ mod tests {
                     action: action.to_string(),
                     sentence: if action == SUBMIT_ROW {
                         // The whole-utterance row names its remedy (G1).
-                        "Heard: \u{201c}open docs\u{201d} — \u{201c}submit_prompt\u{201d} \
+                        "Heard: \u{201c}open docs\u{201d} — asking to send the agent's prompt \
                          needs to be said on its own, like \u{201c}send it\u{201d}, so \
                          nothing was done."
                             .to_string()
@@ -5181,20 +5251,82 @@ mod tests {
                         // holds `close` and `open_deck` to the whole utterance
                         // too (H1) — and the sentence names that context.
                         format!(
-                            "Heard: \u{201c}open docs\u{201d} — \u{201c}{action}\u{201d} needs \
+                            "Heard: \u{201c}open docs\u{201d} — asking to {} needs \
                              to be said on its own while the New agent dialog is open, like \
-                             \u{201c}{like}\u{201d}, so nothing was done."
+                             \u{201c}{like}\u{201d}, so nothing was done.",
+                            table().row(action).expect("present").asks_to
                         )
                     } else {
+                        // None of these rows' suggestions has a placeholder,
+                        // so each is offered as written.
+                        let row = table().row(action).expect("present");
                         format!(
-                            "Heard: \u{201c}open docs\u{201d} — nothing in that asks for \
-                             \u{201c}{action}\u{201d}, so nothing was done."
+                            "Heard: \u{201c}open docs\u{201d} — nothing in that asks to {}, \
+                             so nothing was done; try \u{201c}{}\u{201d}.",
+                            row.asks_to, row.try_saying
                         )
                     },
                 },
                 "{action}"
             );
+            // The id is for the model and the code, never for the user. (An
+            // id that is also a plain word — `close` — may of course be said.)
+            assert!(
+                !action.contains('_') || !outcome.sentence().contains(action),
+                "{action}: {}",
+                outcome.sentence()
+            );
         }
+    }
+
+    /// Scenario: the New agent dialog shows a listing with `code` in it and the
+    /// user says "select directory code" — the report that found both defects
+    /// in one sentence (PRD #1223). `select` now asks for `open_dir`, so the
+    /// directory opens; and a sentence whose words ask for no directory row is
+    /// refused in the user's terms, with a phrasing that would have worked.
+    #[tokio::test]
+    async fn voice_outcome_select_directory_opens_it_and_a_miss_names_the_action_in_words() {
+        let level = listing(&["code", "docs"], true);
+        for said in [
+            "Select directory code",
+            "choose code",
+            "pick the code folder",
+            "go to code",
+            "navigate to code",
+        ] {
+            let resolver = StubResolver::new().answering(
+                said,
+                IntentAnswer::new("open_dir").with_param("dir", "code"),
+            );
+            let outcome = run_with(&resolver, Screen::Overview, Some(&level), said).await;
+            assert!(outcome.is_dispatch(), "{said}: {outcome:?}");
+        }
+
+        // A miss: nothing in "code please" asks to open anything. The value
+        // the model heard was said, so the suggestion carries it.
+        let resolver = StubResolver::new().answering(
+            "code please",
+            IntentAnswer::new("open_dir").with_param("dir", "code"),
+        );
+        let outcome = run_with(&resolver, Screen::Overview, Some(&level), "code please").await;
+        assert_eq!(
+            outcome.sentence(),
+            "Heard: \u{201c}code please\u{201d} — nothing in that asks to open a directory, so \
+             nothing was done; try \u{201c}open code\u{201d}."
+        );
+
+        // A value the user did NOT say is never repeated back: a name written
+        // to steer the model must not reach the sentence by this route.
+        let resolver = StubResolver::new().answering(
+            "code please",
+            IntentAnswer::new("open_dir").with_param("dir", "docs"),
+        );
+        let outcome = run_with(&resolver, Screen::Overview, Some(&level), "code please").await;
+        assert_eq!(
+            outcome.sentence(),
+            "Heard: \u{201c}code please\u{201d} — nothing in that asks to open a directory, so \
+             nothing was done."
+        );
     }
 
     /// Scenario: the same steering toward the two `spoken_prefix` rows. The
@@ -5336,9 +5468,9 @@ mod tests {
                     transcript: Transcript::new(said),
                     action: SUBMIT_ROW.to_string(),
                     sentence: format!(
-                        "Heard: \u{201c}{said}\u{201d} — \u{201c}submit_prompt\u{201d} needs \
-                         to be said on its own, like \u{201c}send it\u{201d}, so nothing was \
-                         done."
+                        "Heard: \u{201c}{said}\u{201d} — asking to send the agent's prompt \
+                         needs to be said on its own, like \u{201c}send it\u{201d}, so nothing \
+                         was done."
                     ),
                 },
                 "{said}"
@@ -5483,9 +5615,9 @@ mod tests {
                         transcript: Transcript::new(said),
                         action: CLOSE_ROW.to_string(),
                         sentence: format!(
-                            "Heard: \u{201c}{said}\u{201d} — \u{201c}close\u{201d} needs to be \
-                             said on its own while the New agent dialog is open, like \
-                             \u{201c}close\u{201d}, so nothing was done."
+                            "Heard: \u{201c}{said}\u{201d} — asking to close what is on top \
+                             needs to be said on its own while the New agent dialog is open, \
+                             like \u{201c}close\u{201d}, so nothing was done."
                         ),
                     },
                     "{said} (form live: {form})"

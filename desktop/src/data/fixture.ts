@@ -1067,7 +1067,7 @@ const FIXTURE_VOICE_COMMANDS: ReadonlyArray<{
     action: "submit_prompt",
     invoke: "submitAgentPrompt",
     screens: ["agent"],
-    unavailableHint: "sending a prompt needs an agent's pane open",
+    unavailableHint: "sending a prompt needs an agent's pane open — open one first",
     report: "Sent.",
   },
 ];

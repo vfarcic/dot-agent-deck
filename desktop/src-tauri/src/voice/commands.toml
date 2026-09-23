@@ -26,7 +26,13 @@
 #   unavailable_hint names the PREREQUISITE, for the sentence the app renders
 #                    when the model picks a command the current screen cannot
 #                    run. No leading capital and no trailing period: it is
-#                    rendered into a sentence, not as one.
+#                    rendered into a sentence, not as one. Where reaching the
+#                    prerequisite takes a step the user may not know — the New
+#                    agent dialog's fields fill in order, deck then directory
+#                    then the rest — the hint says WHAT TO DO FIRST ("choose a
+#                    deck first"), not merely that the command is unavailable.
+#                    It is also sent to the model, so a change here is a prompt
+#                    change too.
 #   report           the user-facing sentence for a successful dispatch — the
 #                    pipeline's stage 6. A `{param}` placeholder is replaced
 #                    with what that param resolved to; `table.rs` refuses a
@@ -37,6 +43,21 @@
 #                    confirm-before-acting flag, and the two are close to
 #                    opposite — this describes an action that HAPPENED, that
 #                    one blocks an action before it does. Do not rename it back.
+#   asks_to          the action in the USER's words — "open a directory" — for
+#                    the refusal of a pick the transcript does not ask for:
+#                    "nothing in that asks to open a directory". A verb phrase
+#                    that follows "asks to": no leading capital, no trailing
+#                    period, and never the id (`table.rs` refuses an `_`). That
+#                    sentence used to quote the id — `nothing in that asks for
+#                    "open_dir"` — and the first real use of the directory
+#                    browser met it (PRD #1223). Not sent to the model.
+#   try_saying       a phrasing that DOES ask for the row, offered in the same
+#                    refusal: `try "open code"`. A `{param}` placeholder names a
+#                    required param and is filled with what the model heard for
+#                    it ONLY when the user said every word of that value;
+#                    otherwise the suggestion is left out. `table.rs` refuses a
+#                    suggestion its own row's grounding would refuse. Not sent
+#                    to the model.
 #   heard_as         the words that ASK for this action (PRD #1223, closing
 #                    audit F1). A pick is dispatched only when the transcript
 #                    contains at least one entry — a word (heard with or
@@ -119,6 +140,8 @@ invoke      = "openAgent"
 screens     = ["deck", "overview"]
 unavailable_hint = "opening an agent works from the deck or the agent overview"
 report      = "Opening {agent}."
+asks_to     = "open an agent's pane"
+try_saying  = "open {agent}"
 heard_as    = ["open", "show", "see", "focus", "enlarge", "zoom", "look", "watch", "except"]
 
   [[commands.params]]
@@ -134,6 +157,8 @@ invoke      = "openOverview"
 screens     = ["deck"]
 unavailable_hint = "the agent overview opens from the deck"
 report      = "Opening the agent overview."
+asks_to     = "show the agent overview"
+try_saying  = "show everything"
 heard_as    = ["overview", "everything", "all", "fleet", "running", "attention"]
 
 [[commands]]
@@ -146,6 +171,8 @@ invoke      = "openDeck"
 screens     = ["overview"]
 unavailable_hint = "returning to the deck works from the agent overview"
 report      = "Back to the deck."
+asks_to     = "go back to the deck"
+try_saying  = "go back to the deck"
 heard_as    = ["deck", "back", "return", "terminals", "panes"]
 # Over the New agent dialog this row is `close`'s destructive case by another
 # route (PRD #1223, closing audit H1): leaving the overview unmounts it, and the
@@ -212,6 +239,8 @@ terminal pane, and does NOT turn voice off."""
 invoke      = "closeTopmost"
 unavailable_hint = "closing what is on top works anywhere"
 report      = "Closed."
+asks_to     = "close what is on top"
+try_saying  = "close this"
 heard_as    = ["close", "dismiss", "hide", "get rid", "done", "leave", "stop looking", "back"]
 heard_as_whole_while.new_agent_dialog = [
   "close", "close this", "close it", "close the dialog", "close this dialog",
@@ -240,6 +269,8 @@ invoke      = "openSettings"
 screens     = ["deck"]
 unavailable_hint = "settings open from the deck"
 report      = "Opening settings."
+asks_to     = "open settings"
+try_saying  = "open settings"
 heard_as    = ["settings", "preferences", "options", "configuration", "api key"]
 
 # PRD #802 — the first row with NO `screens` key, which means callable
@@ -270,6 +301,8 @@ agent."""
 invoke      = "stopVoice"
 unavailable_hint = "turning voice off works anywhere"
 report      = "Voice control off."
+asks_to     = "turn voice off"
+try_saying  = "voice off"
 heard_as    = ["voice", "listening", "microphone", "mic", "mute"]
 
 # PRD #802 D7 — discovery, and the second row with no `screens` key.
@@ -294,6 +327,8 @@ the list — it runs none of the commands on it."""
 invoke      = "showVoiceCommands"
 unavailable_hint = "the list of commands opens anywhere"
 report      = "Here is what you can say."
+asks_to     = "list what you can say"
+try_saying  = "what can I say"
 heard_as    = ["say", "commands", "help", "options", "list", "what can", "how"]
 
 # PRD #802 D6, REBUILT — dictation without a mode, and the feature's own point
@@ -350,6 +385,8 @@ invoke      = "dictateToAgent"
 screens     = ["agent"]
 unavailable_hint = "typing to an agent needs that agent's pane open — open one first"
 report      = "Typed: “{prefix}”."
+asks_to     = "type to the agent"
+try_saying  = "type run the tests"
 heard_as    = ["type", "write", "say", "dictate", "tell", "ask", "want", "prompt", "note"]
 
   [[commands.params]]
@@ -392,8 +429,10 @@ prompt is finished. A bare "send", "submit", "enter" or "end" means this. It sen
 ALREADY there and types nothing new: a request to write something down is `dictate_to_agent`."""
 invoke      = "submitAgentPrompt"
 screens     = ["agent"]
-unavailable_hint = "sending a prompt needs an agent's pane open"
+unavailable_hint = "sending a prompt needs an agent's pane open — open one first"
 report      = "Sent."
+asks_to     = "send the agent's prompt"
+try_saying  = "send it"
 heard_as_whole = [
   "send it", "send", "submit it", "submit", "press enter", "enter", "go ahead", "end",
   "that is the end", "finished", "the prompt is finished",
@@ -428,6 +467,8 @@ invoke      = "openNewAgent"
 screens     = ["overview"]
 unavailable_hint = "starting a new agent works from the agent overview"
 report      = "Opening the New agent dialog."
+asks_to     = "open the New agent dialog"
+try_saying  = "new agent"
 heard_as    = ["new", "create", "launch", "add", "spin", "start"]
 
   [[commands.params]]
@@ -466,16 +507,23 @@ heard_as    = ["new", "create", "launch", "add", "spin", "start"]
 id          = "open_dir"
 description = """In the New agent dialog's directory browser, open one of the directories listed
 on screen — go down into it. Use for open dir billing, open the billing folder, go into src, enter
-docs, cd into api. Set `dir` to the words the user used for the directory; it must be one of
+docs, cd into api — and when the user NAMES a listed directory with select, choose, pick, go to or
+navigate: select directory billing, choose the api folder, pick src, go to docs, navigate to tests.
+Set `dir` to the words the user used for the directory; it must be one of
 `directories.entries`, the directories on screen right now. This only moves the browser: it
 starts nothing and does not choose the directory for the agent (that is `use_this_directory`).
 Not for going up (`go_to_parent`), and never for an agent or a deck."""
 invoke      = "openDirectory"
 screens     = ["overview"]
 requires    = ["directory_listing"]
-unavailable_hint = "opening a directory works while the New agent dialog is showing a directory listing"
+unavailable_hint = "opening a directory needs the New agent dialog's directory listing; say “new agent” and choose a deck first"
 report      = "Opening {dir}."
-heard_as    = ["open", "into", "enter", "cd", "go down"]
+asks_to     = "open a directory"
+try_saying  = "open {dir}"
+heard_as    = [
+  "open", "into", "enter", "cd", "go down",
+  "select", "choose", "pick", "go to", "navigate",
+]
 
   [[commands.params]]
   name = "dir"
@@ -489,22 +537,31 @@ level up, parent directory, or cd dot dot. It moves the browser only and starts 
 invoke      = "goToParentDirectory"
 screens     = ["overview"]
 requires    = ["parent_directory"]
-unavailable_hint = "going up works while the New agent dialog is showing a directory that has a parent"
+unavailable_hint = "going up needs the New agent dialog showing a directory below the top; choose a deck and open a directory first"
 report      = "Going up."
+asks_to     = "go up a directory"
+try_saying  = "go up"
 heard_as    = ["parent", "up", "dot dot"]
 
 [[commands]]
 id          = "use_this_directory"
 description = """In the New agent dialog's directory browser, choose the directory on screen as the
 one the new agent starts in, which unlocks the rest of the form. Use for use this directory, use
-this folder, pick this one, choose this directory, this is the one, or select this directory.
-It chooses the directory and starts nothing — the user still presses Start."""
+this folder, pick this one, choose this directory, this is the one, that one, select this directory,
+this directory, or this folder. It is the directory the browser is IN; a directory named
+from the listing ("select directory billing") is `open_dir`. It chooses the directory and starts
+nothing — the user still presses Start."""
 invoke      = "useThisDirectory"
 screens     = ["overview"]
 requires    = ["directory_listing"]
-unavailable_hint = "choosing a directory works while the New agent dialog is showing a directory listing"
+unavailable_hint = "choosing a directory needs the New agent dialog's directory listing; say “new agent” and choose a deck first"
 report      = "Using this directory."
-heard_as    = ["use", "pick", "choose", "select", "this is the one", "this one"]
+asks_to     = "use this directory"
+try_saying  = "use this directory"
+heard_as    = [
+  "use", "pick", "choose", "select", "this is the one", "this one", "that one",
+  "this directory", "this folder",
+]
 
 # PRD #1223 — the rest of the New agent form by voice: Mode, Agent and Name.
 #
@@ -550,8 +607,10 @@ starts nothing. Never for the command line, which is typed by hand."""
 invoke      = "chooseNewAgentMode"
 screens     = ["overview"]
 requires    = ["new_agent_form"]
-unavailable_hint = "choosing a mode works while the New agent form has a deck and a directory chosen"
+unavailable_hint = "choosing a mode needs a deck and a directory chosen in the New agent dialog; choose those first"
 report      = "Mode: {mode}."
+asks_to     = "choose a mode"
+try_saying  = "mode {mode}"
 heard_as    = ["mode", "schedule", "dispatcher", "orchestration", "orch", "plain", "make it", "use", "choose", "set"]
 
   [[commands.params]]
@@ -570,8 +629,10 @@ agent (that is `open_agent`), and it starts nothing."""
 invoke      = "chooseNewAgentType"
 screens     = ["overview"]
 requires    = ["new_agent_form"]
-unavailable_hint = "choosing an agent works while the New agent form has a deck and a directory chosen"
+unavailable_hint = "choosing an agent needs a deck and a directory chosen in the New agent dialog; choose those first"
 report      = "Agent: {agent_type}."
+asks_to     = "choose an agent"
+try_saying  = "use {agent_type}"
 heard_as    = ["agent", "use", "pick", "choose", "make it", "set", "claude", "opencode", "pi", "codex", "auto"]
 
   [[commands.params]]
@@ -598,8 +659,10 @@ starts nothing."""
 invoke      = "nameNewAgent"
 screens     = ["overview"]
 requires    = ["new_agent_form"]
-unavailable_hint = "naming the new agent works while the New agent form has a deck and a directory chosen"
+unavailable_hint = "naming the new agent needs a deck and a directory chosen in the New agent dialog; choose those first"
 report      = "Name set."
+asks_to     = "name the new agent"
+try_saying  = "name it docs bot"
 heard_as    = ["name", "call"]
 
   [[commands.params]]
@@ -639,8 +702,10 @@ prompt to send while the New agent dialog is up."""
 invoke      = "confirmStartNewAgent"
 screens     = ["overview"]
 requires    = ["new_agent_dialog"]
-unavailable_hint = "starting a new agent works while the New agent dialog is open"
+unavailable_hint = "starting a new agent needs the New agent dialog; say “new agent” first"
 report      = "Confirm the start in the dialog — nothing has started yet."
+asks_to     = "start the new agent"
+try_saying  = "start it"
 heard_as    = ["start", "launch", "create", "spin", "run", "go ahead"]
 
 [[commands]]
@@ -656,6 +721,8 @@ invoke      = "confirmStopAgent"
 screens     = ["overview"]
 unavailable_hint = "stopping an agent works from the agent overview"
 report      = "Confirm stopping {agent} — nothing has been stopped yet."
+asks_to     = "stop an agent"
+try_saying  = "stop {agent}"
 heard_as    = ["stop", "kill", "shut down", "end", "terminate"]
 
   [[commands.params]]
@@ -675,6 +742,8 @@ invoke      = "confirmCloseOrchestration"
 screens     = ["overview"]
 unavailable_hint = "closing an orchestration works from the agent overview"
 report      = "Confirm closing {orchestration} — nothing has been stopped yet."
+asks_to     = "close an orchestration"
+try_saying  = "close {orchestration}"
 heard_as    = ["close", "stop", "shut down", "end"]
 
   [[commands.params]]

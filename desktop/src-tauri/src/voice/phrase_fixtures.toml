@@ -428,6 +428,28 @@ action = "open_dir"
 outcome = "dispatch"
 resolved_dir = "/home/dev/code/docs"
 
+# PRD #1223 — the user's own report: "Select directory code" with a listing
+# showing was refused as "nothing in that asks for open_dir", because neither
+# `select` nor `directory` was in `open_dir`'s vocabulary. The model picked the
+# right row; grounding refused it.
+[[fixtures]]
+name = "open-dir-select-by-name"
+utterance = "Select directory docs"
+screen = "overview"
+listing = true
+action = "open_dir"
+outcome = "dispatch"
+resolved_dir = "/home/dev/code/docs"
+
+[[fixtures]]
+name = "open-dir-navigate"
+utterance = "navigate to infra"
+screen = "overview"
+listing = true
+action = "open_dir"
+outcome = "dispatch"
+resolved_dir = "/home/dev/code/infra"
+
 [[fixtures]]
 name = "go-to-parent"
 utterance = "go to parent dir"
