@@ -21,12 +21,16 @@ use std::time::Duration;
 
 use common::{DaemonProc, TuiDeck};
 use dot_agent_deck::agent_pty::{DOT_AGENT_DECK_PANE_ID, TabMembership};
+use dot_agent_deck::daemon_client::{DaemonClient, EventSubscription, StartAgentOptions};
 use dot_agent_deck::daemon_protocol::{AttachRequest, AttachResponse, KIND_EVENT, KIND_RESP};
 use dot_agent_deck::event::{AgentType, BroadcastMsg};
 use spec::spec;
 
 const PLAIN_LABEL: &str = "desktop-visible-agent";
 const SECOND_PLAIN_LABEL: &str = "second-desktop-agent";
+const TWO_CLIENT_LABEL: &str = "two-client-desktop-agent";
+const LAZY_SPAWN_LABEL: &str = "lazy-spawn-desktop-agent";
+const REFETCH_LABEL: &str = "refetch-desktop-agent";
 const PLAIN_COMMAND: &str = "sleep 600";
 const ORCHESTRATION_NAME: &str = "desktop-visibility-team";
 const ORCHESTRATION_TITLE: &str = "Desktop prepared run";
@@ -429,6 +433,95 @@ fn start_plain_from_desktop(daemon: &DaemonProc, cwd: String, pane_id: &str, dis
     );
 }
 
+/// A desktop-shaped client that uses the production `DaemonClient`: one
+/// long-lived event subscription plus short-lived command connections from the
+/// same handle, matching the desktop watcher and action paths.
+struct DesktopAttachClient {
+    runtime: tokio::runtime::Runtime,
+    client: DaemonClient,
+    events: EventSubscription,
+}
+
+impl DesktopAttachClient {
+    fn connect(attach_socket: &Path) -> Self {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("build desktop attach-client runtime");
+        let client = DaemonClient::new(attach_socket.to_path_buf());
+        let capabilities = runtime
+            .block_on(client.capabilities())
+            .expect("desktop client handshake");
+        assert!(
+            capabilities.is_advertised(),
+            "the branch daemon must advertise capabilities to the branch desktop client"
+        );
+        let events = runtime
+            .block_on(client.subscribe_events())
+            .expect("desktop client SubscribeEvents");
+        Self {
+            runtime,
+            client,
+            events,
+        }
+    }
+
+    fn start_plain(&self, cwd: String, pane_id: &str, display_name: &str) -> String {
+        self.runtime
+            .block_on(self.client.start_agent(StartAgentOptions {
+                command: Some(PLAIN_COMMAND.into()),
+                cwd: Some(cwd),
+                display_name: Some(display_name.into()),
+                rows: 24,
+                cols: 80,
+                env: vec![(DOT_AGENT_DECK_PANE_ID.into(), pane_id.into())],
+                tab_membership: None,
+                agent_type: AgentType::from_command(Some(PLAIN_COMMAND)),
+                seed: None,
+            }))
+            .expect("desktop client's production StartAgent path")
+    }
+
+    fn list_agents(&self) -> Vec<dot_agent_deck::agent_pty::AgentRecord> {
+        self.runtime
+            .block_on(self.client.list_agents())
+            .expect("desktop client's post-start ListAgents refetch")
+    }
+
+    fn wait_for_surface_event(&mut self, pane_id: &str) {
+        self.runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    match self
+                        .events
+                        .next_event()
+                        .await
+                        .expect("read desktop client's subscribed event")
+                    {
+                        Some(BroadcastMsg::Event(event))
+                            if event.pane_id.as_deref() == Some(pane_id)
+                                && event.is_card_surface_session_start() =>
+                        {
+                            return;
+                        }
+                        Some(_) => {}
+                        None => panic!(
+                            "desktop client's SubscribeEvents stream ended before the card-surface event for {pane_id:?}"
+                        ),
+                    }
+                }
+            })
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "desktop client's own event subscription did not receive the card-surface event for {pane_id:?}"
+                )
+            });
+        });
+    }
+}
+
 fn run_mid_attach_start_attempt(attempt: usize) {
     let daemon = common::spawn_daemon_serve(None, "0");
     assert!(
@@ -699,6 +792,120 @@ fn visibility_001_desktop_started_plain_agent_surfaces_into_attached_dashboard()
         "after the first card surfaced, the same untouched TUI must also show the second \
          desktop-started agent, but both labels never appeared together. Records: \
          {second_records:#?}\nFinal grid:\n{}",
+        deck.snapshot_grid()
+    );
+}
+
+/// Scenario: Attach a real TUI to an already-running empty daemon, then attach a
+/// second production `DaemonClient` with its own live event subscription. Start
+/// the first agent through that second client and require both subscribers to
+/// observe it without any TUI input.
+#[spec("newagent/visibility/001")]
+#[test]
+fn visibility_001_second_subscriber_start_reaches_attached_tui() {
+    let daemon = common::spawn_daemon_serve(None, "0");
+    let deck = launch_tui_against(&daemon);
+    deck.wait_for_string("No active sessions. Press Ctrl+n to create a pane.");
+
+    let mut desktop = DesktopAttachClient::connect(&daemon.attach_socket);
+    let cwd = common::harness_tempdir().expect("create two-client desktop-selected cwd");
+    let pane_id = desktop_pane_id(200);
+    let agent_id = desktop.start_plain(canonical_string(cwd.path()), &pane_id, TWO_CLIENT_LABEL);
+    desktop.wait_for_surface_event(&pane_id);
+    let records = daemon.wait_for_agent_count(1, Duration::from_secs(10));
+
+    assert_eq!(
+        records[0].id, agent_id,
+        "the agent observed through the daemon registry must be the one the second client started"
+    );
+    assert!(
+        common::wait_until(Duration::from_secs(10), || {
+            deck.snapshot_grid().contains(TWO_CLIENT_LABEL)
+        }),
+        "the daemon broadcast the first start to the desktop client's own subscription, but the \
+         already-attached TUI subscriber did not render {TWO_CLIENT_LABEL:?} without input. \
+         Records: {records:#?}\nFinal grid:\n{}",
+        deck.snapshot_grid()
+    );
+}
+
+/// Scenario: Let a real TUI lazily spawn its isolated daemon, then attach a
+/// second production client with its own event subscription and start the first
+/// desktop-shaped agent. The untouched spawning TUI must render that agent.
+#[spec("newagent/visibility/001")]
+#[test]
+fn visibility_001_tui_spawner_receives_second_client_first_start() {
+    let deck = TuiDeck::builder()
+        .with_pty_size(120, 40)
+        .launch_with_fixture("minimal");
+    deck.wait_for_string("No active sessions. Press Ctrl+n to create a pane.");
+
+    let mut desktop = DesktopAttachClient::connect(deck.attach_socket_path());
+    let cwd = common::harness_tempdir().expect("create lazy-spawn desktop-selected cwd");
+    let pane_id = desktop_pane_id(201);
+    let agent_id = desktop.start_plain(canonical_string(cwd.path()), &pane_id, LAZY_SPAWN_LABEL);
+    desktop.wait_for_surface_event(&pane_id);
+    let records = desktop.list_agents();
+
+    assert_eq!(
+        records.len(),
+        1,
+        "the TUI-spawned daemon must register exactly the second client's first agent"
+    );
+    assert_eq!(
+        records[0].id, agent_id,
+        "the lazy daemon's first registry record must be the second client's start"
+    );
+    assert!(
+        common::wait_until(Duration::from_secs(10), || {
+            deck.snapshot_grid().contains(LAZY_SPAWN_LABEL)
+        }),
+        "the TUI lazily spawned the daemon and the desktop client's own subscription received \
+         the first card-surface event, but the untouched spawning TUI did not render \
+         {LAZY_SPAWN_LABEL:?}. Records: {records:#?}\nFinal grid:\n{}",
+        deck.snapshot_grid()
+    );
+}
+
+/// Scenario: After a TUI lazily spawns the daemon and a second subscribed client
+/// starts its first agent, immediately perform the desktop's post-start
+/// `ListAgents` refetch before consuming the queued event. The refetch ordering
+/// must not keep the untouched TUI on its empty dashboard.
+#[spec("newagent/visibility/001")]
+#[test]
+fn visibility_001_desktop_refetch_after_first_start_keeps_tui_visible() {
+    let deck = TuiDeck::builder()
+        .with_pty_size(120, 40)
+        .launch_with_fixture("minimal");
+    deck.wait_for_string("No active sessions. Press Ctrl+n to create a pane.");
+
+    let mut desktop = DesktopAttachClient::connect(deck.attach_socket_path());
+    let cwd = common::harness_tempdir().expect("create post-start-refetch desktop-selected cwd");
+    let pane_id = desktop_pane_id(202);
+    let agent_id = desktop.start_plain(canonical_string(cwd.path()), &pane_id, REFETCH_LABEL);
+
+    // The production action fetches the target-deck snapshot immediately after
+    // StartAgent answers, while its independent watcher consumes the broadcast.
+    // Fetch first here so the ordering is deterministic and maximally strict.
+    let records = desktop.list_agents();
+    desktop.wait_for_surface_event(&pane_id);
+
+    assert_eq!(
+        records.len(),
+        1,
+        "the immediate desktop refetch must include its accepted first start"
+    );
+    assert_eq!(
+        records[0].id, agent_id,
+        "the immediate desktop refetch must return the agent StartAgent just accepted"
+    );
+    assert!(
+        common::wait_until(Duration::from_secs(10), || {
+            deck.snapshot_grid().contains(REFETCH_LABEL)
+        }),
+        "the desktop client's immediate post-start ListAgents refetch and its subscribed \
+         card-surface event both completed, but the untouched TUI did not render \
+         {REFETCH_LABEL:?}. Records: {records:#?}\nFinal grid:\n{}",
         deck.snapshot_grid()
     );
 }
