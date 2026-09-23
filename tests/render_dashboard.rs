@@ -2851,7 +2851,8 @@ fn pane_014_hostile_tool_text_cannot_corrupt_the_card() {
 /// name cut short and marked with an `…` that is itself inside the budget, with
 /// the `● Thinking` badge still whole beside it, instead of the full name
 /// running over the badge and being bare-clipped at the right edge. An ASCII
-/// name of the same character count in the same card renders untouched.
+/// name of the same character count renders untouched, and a name of eight
+/// `❤️` — one column per `char`, two as drawn — is cut and marked the same way.
 #[spec("dashboard/pane/015")]
 #[test]
 fn pane_015_wide_title_is_ellipsized_within_the_column_budget() {
@@ -2922,6 +2923,29 @@ fn pane_015_wide_title_is_ellipsized_within_the_column_budget() {
     assert!(
         ascii_title_row.contains("· abcdef") && !ascii_title_row.contains('…'),
         "an ASCII name inside the budget renders untouched:\n{ascii}"
+    );
+
+    // A name whose glyphs are grapheme CLUSTERS wider than their `char`s:
+    // `❤️` is U+2764 + VARIATION SELECTOR-16, one column summed per `char` and
+    // two as ratatui draws it. Eight of them are 16 columns, past what the
+    // title's 26-cell region has left once the 16-cell prefix is paid for, so
+    // the cut must be marked. Budgeting per `char` measured them at 8, passed
+    // the title whole, and the badge was drawn over its tail — no `…`, no
+    // border fill, the CJK symptom again, on input the char count had handled.
+    let hearts = buffer_to_text(&render_card_to_buffer(
+        &card_stats_session("/home/dev/example-project"),
+        Some(&"❤\u{fe0f}".repeat(8)),
+        Some(1),
+        density,
+        0,
+        false,
+        WIDTH,
+        density.rendered_height(),
+    ));
+    let hearts_title_row = hearts.lines().next().expect("the card draws a top border");
+    assert!(
+        hearts_title_row.contains('…') && hearts_title_row.contains("● Thinking"),
+        "a name of VS16 emoji too wide for the title region must be marked as cut:\n{hearts}"
     );
 
     insta::assert_snapshot!(wide);
