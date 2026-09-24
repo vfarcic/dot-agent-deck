@@ -59,7 +59,7 @@ Four commitments shape it.
 ### Out of scope
 
 - **Per-agent attribution** — deferred to iteration 3 and argued there rather than assumed. It is materially harder than host totals: an agent's descendants `setsid` out of its process group, which CLAUDE.md rule 14 records as measured (an escapee found at `PPID 1` four days after its owner died), so a naive per-pane rollup undercounts in exactly the case that matters — an agent that started a build. Iteration 1 and 2 show the *host's* numbers for a selected agent and label them as such.
-- **Automatic placement.** The recommendation never routes a spawn by itself. The heuristic is unproven; a wrong advisory costs a glance, a wrong auto-route costs a run and is invisible until it fails. PRD #1264's `dispatch --deck auto` is where a verdict does route a spawn, only when the calling agent names `auto` explicitly; that argument is #1264's to make, and nothing in this PRD's own flows depends on it.
+- **Automatic placement.** The recommendation never routes a spawn by itself. The heuristic is unproven; a wrong advisory costs a glance, a wrong auto-route costs a run and is invisible until it fails. PRD #1264's `dispatch --deck recommended` is where a verdict does route a spawn — only after the user has chosen it for the session, or for a dispatcher with nobody to ask; that argument is #1264's to make, and nothing in this PRD's own flows depends on it.
 - **History, graphs, alerting.** One current sample, no time series, no thresholds that notify.
 - **Windows.** The daemon reports `Unsupported` there (`docs/installation.md`), so the sampler is Unix.
 - **Per-process memory accounting for the deck itself**, cgroup/container awareness, and GPU.
@@ -83,7 +83,7 @@ Four commitments shape it.
 ### Iteration 2 — several decks, and the recommendation
 
 - [ ] **M4 — The desktop surface.** Per-deck utilisation on the overview, several hosts at once, and the "not available from this deck" state for an older daemon. A Playwright spec for the surface.
-- [ ] **M5 — The headroom verdict.** A qualified/not-qualified answer with its reason, computed by each daemon for its own host and served beside the numbers behind the same capability gate, derived from disk headroom and a load ceiling, both configurable per deck and both defaulting to values taken from the measurements in this document rather than invented. Clients display it and never recompute it. "No deck qualifies" states what is short. PRD #1264's `--deck auto` is blocked on this milestone.
+- [ ] **M5 — The headroom verdict.** A qualified/not-qualified answer with its reason, computed by each daemon for its own host and served beside the numbers behind the same capability gate, derived from disk headroom and a load ceiling, both configurable per deck and both defaulting to values taken from the measurements in this document rather than invented. Clients display it and never recompute it. The request accepts an optional footprint from the caller — PRD #1264 passes a repository's expected per-unit size — and falls back to the deck's configured headroom floor without one. "No deck qualifies" states what is short. PRD #1264's deck recommendation is blocked on this milestone.
 - [ ] **M6 — Recommend and default.** The New agent flow's deck step pre-selects a qualifying deck and shows the reason; choosing another warns and proceeds. `dispatch` states its own deck's verdict in its acknowledgement; choosing among decks from `dispatch` is PRD #1264. An L2 test for the TUI/dispatch path and a Playwright spec for the desktop one.
 
 ### Iteration 3 — verified, documented, and the harder half
@@ -103,7 +103,7 @@ Four commitments shape it.
 
 1. **Where do the watched paths come from?** The deck's working root is known; the worktree parent is `..` by convention (`../<repo>-dispatch-<name>`); the temp root may be moved by `DAD_E2E_TMPDIR`. Are these three fixed roles, or configurable?
 2. **What is "one unit's disk headroom"?** The `/issue-queue` skill says ~90G from observed `target/` sizes of 70–108G. Is that the default? Per-deck configuration is the natural home for it now that each deck computes its own verdict.
-3. **Does `dispatch` warn or refuse below the floor?** This PRD says warn. A refusal with an override flag is the alternative. PRD #1264's `--deck auto` refusing when no deck qualifies is a different case — there the caller asked for a choice to be made.
+3. **Does `dispatch` warn or refuse below the floor?** This PRD says warn. A refusal with an override flag is the alternative. PRD #1264's recommendation reporting that no deck qualifies is a different case — there the caller asked for a choice to be made.
 4. **Does the TUI overlay show remote decks the user has configured**, or strictly the attached one? Strictly attached is the assumption here.
 
 ## Success criteria
