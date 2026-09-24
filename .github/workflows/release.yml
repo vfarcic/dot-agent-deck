@@ -1843,9 +1843,25 @@ jobs:
               before = body[:at.start()]
               close = line(end).search(body, at.end())
               after = body[close.end():] if close else ""
-          open(prefix_path, "w", encoding="utf-8").write(before.rstrip())
-          open(suffix_path, "w", encoding="utf-8").write(after.strip())
-          print(f"release body: {len(body)} chars; kept {len(before.rstrip())} before the note and {len(after.strip())} after it")
+          # Whole blank lines only -- the separators this step writes around
+          # the block -- and never whitespace inside a line. `str.strip()` here
+          # used to eat the leading indent of a suffix that opens with an
+          # indented code block, and every re-run reformatted it again. The
+          # prefix is trimmed at its end only: its start is the start of the
+          # release body, not a separator.
+          blank = lambda l: l.strip(" \t\r") == ""
+          def trim(text, leading):
+              lines = text.split("\n")
+              lo, hi = 0, len(lines)
+              while hi > lo and blank(lines[hi - 1]):
+                  hi -= 1
+              while leading and lo < hi and blank(lines[lo]):
+                  lo += 1
+              return "\n".join(lines[lo:hi])
+          before, after = trim(before, False), trim(after, True)
+          open(prefix_path, "w", encoding="utf-8").write(before)
+          open(suffix_path, "w", encoding="utf-8").write(after)
+          print(f"release body: {len(body)} chars; kept {len(before)} before the note and {len(after)} after it")
           SPLICE
           MAC_DMG=dist-desktop/dot-agent-deck-desktop-alpha-macos-arm64.dmg
           LINUX_DEB=dist-desktop/dot-agent-deck-desktop-alpha-linux-amd64.deb
