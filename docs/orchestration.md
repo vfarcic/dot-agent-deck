@@ -141,7 +141,7 @@ A worker that never signals completion would otherwise stall the pipeline silent
 
 A worker that has been delegated a task owes a `work-done` for it, and until that arrives the deck refuses to hand the same worker another task. `dot-agent-deck delegate` then exits non-zero with `this delegate was NOT sent`, naming the worker, how many delegations it still owes, and how long ago the oldest was issued. When a delegate names several `--to` roles, the free ones still get the task: the command prints a warning naming the refused ones and exits 0, so re-send to just those roles rather than repeating the whole delegate, which would hand the free roles the task twice.
 
-The refusal is decided from the deck's own record of what it has delegated, not from the worker's status. Status is reported by the agent itself and can be wrong for hours — an agent whose API quota has run out can go on showing `Working` — so it is not something the deck will refuse on.
+The refusal is decided from the deck's own record of what it has delegated, not from the worker's status. Status is reported by the agent itself and can be wrong for hours — an agent whose API quota has run out can go on showing `Working` — so it is not something the deck will refuse on. The same record also does not look at whether the worker's agent is still alive: a worker whose agent exited without reporting still owes its task, and a plain delegate to it is refused like any other. Restarting it with `dot-agent-deck pane restart <role>` — the recovery the orchestrator is already taught for a crashed worker — clears that.
 
 When the earlier task is not coming back, there are three ways out:
 
