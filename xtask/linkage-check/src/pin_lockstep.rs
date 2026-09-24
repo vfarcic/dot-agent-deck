@@ -1226,7 +1226,9 @@ fn a_version_outside_the_with_mapping_is_not_a_pnpm_pin() {
 /// Raised by Qodo on #1284. A flow mapping may span lines — `with: {` on one,
 /// the keys on the next — and Renovate YAML-parses it like any other. The
 /// scanner read a flow mapping only on the `with:` line itself, so this spelling
-/// reported a correctly pinned step as having no version.
+/// reported a correctly pinned step as having no version. The quoted
+/// `${{ … }}` before the pin is the follow-up Qodo raised: a brace inside a
+/// quoted value must not read as the mapping closing.
 #[test]
 fn a_multiline_flow_with_mapping_is_read() {
     if !bash_present() {
@@ -1236,6 +1238,7 @@ fn a_multiline_flow_with_mapping_is_read() {
     let body = "jobs:\n  desktop-web:\n    steps:\n      \
                 - uses: pnpm/action-setup@v6\n        \
                 with: {\n          \
+                package_json_file: \"${{ matrix.file }}\",\n          \
                 version: 11.21.0,\n          \
                 run_install: false }\n      \
                 - uses: actions/setup-node@v7\n        \
@@ -1251,7 +1254,7 @@ fn a_multiline_flow_with_mapping_is_read() {
     .run();
     let text = combined(&out);
     assert!(
-        !out.status.success() && text.contains("desktop.yml:6 11.21.0"),
+        !out.status.success() && text.contains("desktop.yml:7 11.21.0"),
         "the version inside a multi-line flow mapping must be read and compared:\n{text}"
     );
     assert!(

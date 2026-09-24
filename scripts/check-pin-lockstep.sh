@@ -296,6 +296,25 @@ scan_workflow_pnpm() {
       # Each line is kept with any TRAILING comment removed — YAML starts one at
       # a `#` preceded by whitespace — so `run_install: false # was version: 12`
       # is not read as a `version:` input. Indentation is unaffected.
+      # Net `{` minus `}` in `s`, counting only braces OUTSIDE quoted scalars,
+      # so `package_json_file: "${{ matrix.file }}"` inside a multi-line flow
+      # mapping does not look like the mapping closing.
+      function brace_delta(s,   i, c, d, instr) {
+        d = 0
+        instr = ""
+        for (i = 1; i <= length(s); i++) {
+          c = substr(s, i, 1)
+          if (instr != "") {
+            if (instr == "\"" && c == "\\") i++
+            else if (c == instr) instr = ""
+            continue
+          }
+          if (c == "\"" || c == q) instr = c
+          else if (c == "{") d++
+          else if (c == "}") d--
+        }
+        return d
+      }
       { l = $0; sub(/[[:space:]]#.*$/, "", l); line[NR] = l }
       END {
         for (i = 1; i <= NR; i++) {
@@ -333,7 +352,8 @@ scan_workflow_pnpm() {
             cand = ""
             if (in_flow) {
               cand = line[j]
-              if (index(cand, "}") > 0) in_flow = 0
+              flow_depth += brace_delta(cand)
+              if (flow_depth <= 0) in_flow = 0
             } else if (match(line[j], /^ *(- +)?with:/)) {
               after = substr(line[j], RSTART + RLENGTH)
               if (after ~ /^[[:space:]]*$/) {
@@ -341,7 +361,10 @@ scan_workflow_pnpm() {
                 continue
               }
               cand = after
-              if (after ~ /^[[:space:]]*\{/ && index(after, "}") == 0) in_flow = 1
+              if (after ~ /^[[:space:]]*\{/) {
+                flow_depth = brace_delta(after)
+                if (flow_depth > 0) in_flow = 1
+              }
             } else if (with_at >= 0) {
               cand = line[j]
             }
