@@ -1367,8 +1367,9 @@ fn run_desktop_note_splice(body: &str) -> (String, String) {
 }
 
 /// Scenario: The release workflow's actual Python splice preserves changelog
-/// text and human suffixes while replacing legacy and bounded alpha notes.
-/// An inline quoted marker stays in the changelog, and a second run is stable.
+/// text (including trailing spaces) and human suffixes (including indented code)
+/// while replacing alpha notes. An inline quoted marker stays in the changelog,
+/// and a second run preserves both sides byte for byte.
 #[cfg(unix)]
 #[test]
 fn desktop_note_splice_replaces_old_notes_and_is_idempotent() {
@@ -1382,6 +1383,8 @@ fn desktop_note_splice_replaces_old_notes_and_is_idempotent() {
     let changelog = "# Release notes\nA changelog entry with exact punctuation.";
     let suffix = "A human addendum with exact punctuation.";
     let quoted = "# Release notes\nThe changelog quotes `<!-- desktop-alpha -->` inline.";
+    let spaced_prefix = "# Release notes\nA changelog line with trailing spaces.   ";
+    let indented_suffix = "    command --flag\n    continued  ";
     let cases = [
         ("changelog only", changelog.to_string(), changelog, ""),
         (
@@ -1396,12 +1399,23 @@ fn desktop_note_splice_replaces_old_notes_and_is_idempotent() {
             changelog,
             suffix,
         ),
+        (
+            "indented suffix and spaced prefix",
+            format!(
+                "{spaced_prefix}\n \t\n{START}\nold unsigned note\n{END}\n \t\n\n{indented_suffix}\n \t\n"
+            ),
+            spaced_prefix,
+            indented_suffix,
+        ),
         ("inline quote", quoted.to_string(), quoted, ""),
     ];
     for (label, body, expected_prefix, expected_suffix) in cases {
         let (prefix, kept_suffix) = run_desktop_note_splice(&body);
-        assert_eq!(prefix, expected_prefix, "{label}: changelog changed");
-        assert_eq!(kept_suffix, expected_suffix, "{label}: suffix changed");
+        assert_eq!(
+            (prefix.as_str(), kept_suffix.as_str()),
+            (expected_prefix, expected_suffix),
+            "{label}: surrounding text changed"
+        );
         let mut rendered = format!("{prefix}\n\n{START}\nnew signed note\n{END}\n");
         if !kept_suffix.is_empty() {
             rendered.push_str(&format!("\n{kept_suffix}\n"));
