@@ -312,9 +312,16 @@ jobs:
           # 500 characters earlier costs a release nothing -- it only bites
           # bodies already over 121,500 characters, and then only by moving the
           # cut one entry sooner.
+          #
+          # Raised again, from 3500 to 4000, by PRD #757 M4: the note now has a
+          # signed and an unsigned macOS paragraph, and that test's measure sums
+          # every `printf` in the step -- both branches -- which put it at 3443
+          # and left 57 characters of headroom. Only one macOS branch is ever
+          # appended, so the real note is shorter than that measure; the
+          # headroom is kept on the overstating side for the reason above.
           python3 - "${RUNNER_TEMP}/release-body.md" <<'CLAMP'
           import sys
-          LIMIT, RESERVE = 125000, 3500
+          LIMIT, RESERVE = 125000, 4000
           p = sys.argv[1]
           src = open(p, encoding="utf-8").read()
           if len(src) <= LIMIT - RESERVE:
@@ -698,7 +705,10 @@ jobs:
           CHANNEL_NAME: ${{ steps.channel.outputs.name }}
         run: task scoop-publish "VERSION=v$RELEASE_VERSION" "NAME=$CHANNEL_NAME"
 
-  # PRD #740: bundle the desktop GUI (`desktop/`) as an unsigned alpha artifact.
+  # PRD #740: bundle the desktop GUI (`desktop/`) as an alpha artifact. The
+  # Linux leg's `.deb` is the release asset; since PRD #757 M4 the macOS leg
+  # produces an unsigned `.app` for `desktop-sign`, which builds the `.dmg`.
+  # This job holds no signing credential.
   #
   # The topology is the design. This job hangs off `prepare`, NOT `build`, so it
   # runs concurrently with the CLI matrix and adds nothing to the critical path;
@@ -724,14 +734,21 @@ jobs:
     if: ${{ !inputs.skip_desktop }}
     strategy:
       # One platform's bundler breaking must not cancel the other's; a macOS
-      # dmg is still worth publishing when an AppImage fetch times out.
+      # app is still worth signing and publishing when the Linux leg fails.
       fail-fast: false
       matrix:
         include:
           - target: aarch64-apple-darwin
             os: macos-latest
             asset_suffix: macos-arm64
-            bundles: dmg
+            # The `.app` only, NOT a `.dmg` (PRD #757 Decision 4). The disk
+            # image is built by `desktop-sign`, after the app inside it has been
+            # signed -- signing an app already sealed inside a `.dmg` would mean
+            # unpacking and rebuilding it anyway. This leg holds no signing
+            # credential and must not be given one: it compiles the desktop
+            # crate's whole third-party dependency graph, and a cargo build
+            # script is arbitrary code.
+            bundles: app
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
             asset_suffix: linux-amd64
@@ -805,11 +822,27 @@ jobs:
           # depend on the Tauri CLI accepting repeated --config arguments.
           jq --arg v "$RELEASE_VERSION" '. + {version: $v}' \
             src-tauri/tauri.bundle.conf.json > src-tauri/tauri.release.conf.json
-          pnpm tauri build \
+          set -- \
             --target "$MATRIX_TARGET" \
             --config src-tauri/tauri.release.conf.json \
             --bundles "$MATRIX_BUNDLES"
+          # PRD #757: `--no-sign` on macOS makes "this leg does not sign" a
+          # property of the invocation rather than of which environment
+          # variables happen to be absent. Tauri's bundler (tauri-cli 2.11.5,
+          # the version desktop/pnpm-lock.yaml pins) signs the `.app` when its
+          # environment holds APPLE_CERTIFICATE together with
+          # APPLE_CERTIFICATE_PASSWORD, or when a signing identity is named by
+          # APPLE_SIGNING_IDENTITY or `bundle.macOS.signingIdentity`; with none
+          # of them it skips signing without an error. None is set here today,
+          # and this flag keeps a future edit that adds one from silently
+          # moving signing back onto this runner. The Linux invocation is left
+          # exactly as it was.
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            set -- "$@" --no-sign
+          fi
+          pnpm tauri build "$@"
       - name: Collect and rename the bundle assets
+        if: runner.os == 'Linux'
         env:
           MATRIX_TARGET: ${{ matrix.target }}
           ASSET_SUFFIX: ${{ matrix.asset_suffix }}
@@ -859,18 +892,786 @@ jobs:
             echo "::error::no bundle filename contains ${RELEASE_VERSION}; the version injection did not reach the bundle and these artifacts would be labelled 0.1.0."
             exit 1
           fi
+      # PRD #757: the macOS leg's output is an app for `desktop-sign` to sign,
+      # not a release asset, so it is archived here and handed on rather than
+      # collected into `dist-desktop/`.
+      #
+      # A `ditto` archive rather than the `.app` directory itself, because
+      # `actions/upload-artifact` documents that it does not keep file
+      # permissions -- every file arrives 644 -- which would strip the
+      # executable bit from the main binary and from the `dot-agent-deck`
+      # daemon sidecar, the very files `desktop-sign` is about to sign.
+      # `ditto` records modes, symlinks and extended attributes inside the zip,
+      # where the uploader cannot flatten them. `--sequesterRsrc` keeps
+      # resource forks in `__MACOSX` rather than as AppleDouble files beside
+      # the code, which would otherwise be sealed into the signature.
+      - name: Archive the macOS app for signing
+        if: runner.os == 'macOS'
+        env:
+          MATRIX_TARGET: ${{ matrix.target }}
+          ASSET_SUFFIX: ${{ matrix.asset_suffix }}
+          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -eu
+          APP_DIR="target/${MATRIX_TARGET}/release/bundle/macos"
+          # Same reasoning as the Linux collector: `bundle.active` is false
+          # unless the overlay config is passed, so a lost --config exits 0 with
+          # no bundle. Assert the output rather than trusting the exit code.
+          count=$(find "$APP_DIR" -maxdepth 1 -type d -name '*.app' 2>/dev/null | wc -l | tr -d ' ')
+          if [ "$count" -ne 1 ]; then
+            echo "::error::expected exactly one .app under ${APP_DIR}, found ${count}. tauri build exited 0 but did not produce the app bundle."
+            exit 1
+          fi
+          APP=$(find "$APP_DIR" -maxdepth 1 -type d -name '*.app')
+          # A `.app` name carries no version, unlike the Linux leg's output
+          # file, so the injected-version check reads Info.plist instead. It is
+          # the same evidence: the release version reached the bundle rather
+          # than the 0.1.0 placeholder.
+          bundled=$(plutil -extract CFBundleShortVersionString raw -o - "$APP/Contents/Info.plist")
+          if [ "$bundled" != "$RELEASE_VERSION" ]; then
+            echo "::error::${APP} reports CFBundleShortVersionString ${bundled}, not ${RELEASE_VERSION}; the version injection did not reach the bundle."
+            exit 1
+          fi
+          mkdir -p dist-desktop-app
+          ditto -c -k --sequesterRsrc --keepParent "$APP" "dist-desktop-app/dot-agent-deck-desktop-alpha-${ASSET_SUFFIX}.app.zip"
+          ls -la dist-desktop-app
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        if: runner.os == 'Linux'
         with:
           # Deliberately NOT `dot-agent-deck-*`: that is the pattern `finalize`
           # selects on, and these must stay out of the CLI release's `dist/`.
           name: desktop-bundle-${{ matrix.asset_suffix }}
           path: dist-desktop/
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        if: runner.os == 'macOS'
+        with:
+          # Outside BOTH download patterns in this file: not `dot-agent-deck-*`
+          # (`finalize`) and not `desktop-bundle-*` (`desktop-publish` and
+          # `attest`), because this archive is an intermediate and must never
+          # be published or attested. `desktop-sign` asks for it by name and
+          # uploads the finished `.dmg` as `desktop-bundle-macos-arm64`, which
+          # is what those two jobs select.
+          name: desktop-app-${{ matrix.asset_suffix }}
+          path: dist-desktop-app/
+          if-no-files-found: error
+
+  # PRD #757 Decision 4: the one job that holds the Apple signing credentials.
+  #
+  # It is split out of `desktop-bundle` for a single reason. That job compiles
+  # the desktop crate's full Rust dependency graph and installs `desktop/`'s npm
+  # graph, Renovate automerges cargo patch bumps (and minors of crates at 1.0
+  # or later) with no human in the loop, and a cargo build script is arbitrary
+  # code. A Developer ID private key in that job's environment would be
+  # readable by whatever a dependency update brought in. So the key lives here instead, in a job that has no
+  # `actions/checkout` and runs its own inline steps, two SHA-pinned artifact
+  # actions (`download-artifact`, `upload-artifact`; Renovate holds their
+  # updates in this file for a human, see renovate.json) and the runner's
+  # system tools (`security`, `codesign`, `ditto`, `hdiutil`, `xcrun`,
+  # `plutil`, `openssl`, `curl`, `shasum`, `file`, `python3`). None of its
+  # steps invokes the binaries it signs -- `file`, `codesign` and the notary
+  # service read them as data.
+  #
+  # What this does NOT protect against, stated because a split reads as more
+  # than it is: `desktop-bundle` can still put anything it likes INSIDE the app,
+  # and this job will sign it. The split keeps the key from being exfiltrated
+  # by build-time code; it does not vouch for what that code produced. The
+  # notary service's scan and its audit trail of submissions are the check on
+  # that, and PRD #757 Decision 5 records why a leaked key would cost far more
+  # than a bad submission: an exposed Developer ID certificate is revoked, not
+  # rotated, and revocation stops already-installed copies launching.
+  #
+  # The credentials are ENVIRONMENT secrets of `desktop-signing`, not repository
+  # secrets, so no job that does not declare that environment can read them --
+  # which includes the reusable workflow `docs` calls with `secrets: inherit`.
+  # docs/develop/desktop-signing.md has the inventory, the registration steps,
+  # the environment's deployment-ref restriction, expiry, rotation and the
+  # revocation runbook.
+  #
+  # Three outcomes, chosen by the "Classify the signing credentials" step:
+  # all five secrets empty -> an UNSIGNED `.dmg`, `signed=false`, job green
+  # (today's state, before any credential is registered); all five set ->
+  # signed, notarized and stapled, `signed=true`; any other combination ->
+  # fail, because a half-registered set is a mistake to surface, not a reason
+  # to ship unsigned. An expired or nearly expired certificate fails too.
+  #
+  # Off the CLI's critical path like the rest of the desktop chain: `finalize`
+  # does not wait on it, so a signing or notarization failure turns the run red
+  # and leaves the CLI release complete. `desktop-publish` still publishes the
+  # `.deb` when this job fails.
+  desktop-sign:
+    needs: [desktop-bundle]
+    # `!cancelled()` because `needs` on the bundle MATRIX resolves to the
+    # aggregate: without it, a failed LINUX leg would skip this job and throw
+    # away a macOS app that built fine -- the #768 defect `desktop-publish`
+    # already guards against. Whether the macOS leg itself produced an app is
+    # answered by the download step below.
+    if: ${{ !cancelled() && !inputs.skip_desktop }}
+    runs-on: macos-latest
+    environment: desktop-signing
+    # Job-level permissions replace the workflow-level `contents: write` /
+    # `packages: write`. This job needs no GITHUB_TOKEN scope: it has no
+    # checkout and calls no GitHub API (its network calls go to Apple), and
+    # same-run artifact transfer authenticates with the runner's own token
+    # rather than GITHUB_TOKEN.
+    permissions: {}
+    # Notarization waits on Apple, and the job submits twice (the app, then the
+    # disk image). Bounded so a stuck notary queue cannot hold the runner, and
+    # the credentials on it, for the platform default of six hours.
+    timeout-minutes: 180
+    outputs:
+      # Set by the LAST step, and only once the `.dmg` has been uploaded, so an
+      # empty value means "this job did not deliver a disk image" rather than
+      # defaulting to either claim. `desktop-publish`'s note reads it.
+      signed: ${{ steps.result.outputs.signed }}
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        id: app
+        # Tolerated so the step below can say WHY there is nothing to sign,
+        # instead of the action's own "Artifact not found".
+        continue-on-error: true
+        with:
+          name: desktop-app-macos-arm64
+          path: app-archive
+      - name: Check there is an app to sign
+        env:
+          DOWNLOAD_OUTCOME: ${{ steps.app.outcome }}
+        run: |
+          set -eu
+          if [ "$DOWNLOAD_OUTCOME" != "success" ] || [ ! -f app-archive/dot-agent-deck-desktop-alpha-macos-arm64.app.zip ]; then
+            echo "::error::no desktop-app-macos-arm64 artifact: the macOS desktop-bundle leg failed or its artifact could not be downloaded, so there is no app to sign and no .dmg will be published. The Linux .deb and the CLI release are unaffected."
+            exit 1
+          fi
+      # Self-contained on purpose: this step reads only its environment and
+      # writes only `$GITHUB_OUTPUT`, and uses nothing macOS-specific, so its
+      # `run:` block can be lifted out and executed under bash with each
+      # combination of set and empty variables. It prints secret NAMES, never
+      # values.
+      - name: Classify the signing credentials
+        id: creds
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY_PATH: ${{ secrets.APPLE_API_KEY_PATH }}
+        run: |
+          set -eu
+          present=""
+          missing=""
+          for name in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_API_KEY APPLE_API_ISSUER APPLE_API_KEY_PATH; do
+            eval "value=\${$name:-}"
+            if [ -n "$value" ]; then
+              present="$present $name"
+            else
+              missing="$missing $name"
+            fi
+          done
+          if [ -z "$present" ]; then
+            echo "::notice::no Apple signing credentials are registered for the desktop-signing environment, so this release's macOS .dmg is built UNSIGNED. See docs/develop/desktop-signing.md to register them."
+            echo "mode=unsigned" >> "$GITHUB_OUTPUT"
+          elif [ -z "$missing" ]; then
+            echo "all five Apple signing credentials are present; signing and notarizing."
+            echo "mode=signed" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::the Apple signing credentials are only partly registered. Present:${present}. Missing or empty:${missing}. Refusing to fall back to an unsigned build when signing was evidently intended -- register the missing secrets in the desktop-signing environment, or remove all five to ship unsigned deliberately. See docs/develop/desktop-signing.md."
+            exit 1
+          fi
+      # The archive was produced by `desktop-bundle`, the job that runs
+      # third-party build code, and it is unpacked on the runner that holds the
+      # key -- so its member list is checked before anything is written to
+      # disk. `ditto -x -k`'s own handling of absolute paths, `..` components
+      # and entries written through an archived symlink is NOT measured on a
+      # Mac; this step does not rely on it being safe, and it does not claim
+      # `ditto` would have been unsafe without it.
+      #
+      # Self-contained on purpose, like the classifier above: it reads only
+      # `APP_ARCHIVE` and writes nothing but its log, and its `run:` block uses
+      # `python3`'s standard-library `zipfile` and nothing macOS-specific, so it
+      # can be lifted out and run on a Linux host against hostile zips. python3
+      # rather than `zipinfo`/`unzip -Z` because zipinfo's text output would
+      # have to be parsed to recover names containing spaces or newlines, and
+      # `zipfile` hands over the raw name and mode bits directly. python3 ships
+      # on both GitHub-hosted macOS and Ubuntu images.
+      #
+      # It rejects the archive when an entry:
+      # - has an absolute name, or a `..`, `.` or empty path component, or a
+      #   NUL or backslash in its name (the raw name is checked, because
+      #   `zipfile` silently truncates a name at NUL);
+      # - is neither a regular file, a directory nor a symlink (device, fifo,
+      #   socket), judged from the Unix mode bits in its external attributes;
+      # - lies outside the single top-level `<name>.app/` directory, other than
+      #   `__MACOSX/<name>.app/...`, where `--sequesterRsrc` puts extended
+      #   attributes and resource forks as plain files;
+      # - repeats a name, or sits beneath an archived symlink -- compared after
+      #   Unicode NFD normalisation and case folding, because the runner's APFS
+      #   volume is case- and normalisation-insensitive by default, so
+      #   `Contents/L` and `Contents/l` are one path there;
+      # - is a symlink whose target is absolute, empty, not UTF-8, or which,
+      #   resolved inside the archive (following other archived symlinks, at
+      #   most 40 hops), does not land inside the `.app`.
+      #
+      # WHY SYMLINKS ARE ALLOWED AT ALL: a legitimate bundle can carry them --
+      # a versioned macOS framework has `Versions/Current -> A` and top-level
+      # links into it. This bundle ships no framework today, so it probably has none,
+      # but rejecting every symlink would make the first framework dependency
+      # fail the release for a layout Apple requires. A link that stays inside
+      # the bundle can only alias a file the archive already controls; one that
+      # leaves it is how an unpack writes, or a later step reads, outside the
+      # unpack root, so that is the line drawn. Names are printed with repr()
+      # so a newline in a hostile name cannot start a workflow command.
+      #
+      # Every member is also opened, which makes `zipfile` reject one whose
+      # local header names a different path than its central-directory entry.
+      #
+      # Not covered: decompression bombs (size); a local file header that no
+      # central-directory entry points at, which this check never sees (it
+      # reads the central directory; which one `ditto` reads is unmeasured);
+      # and anything about what the files CONTAIN -- see the job comment above.
+      - name: Validate the app archive before extracting it
+        env:
+          APP_ARCHIVE: app-archive/dot-agent-deck-desktop-alpha-macos-arm64.app.zip
+        run: |
+          set -eu
+          python3 - "$APP_ARCHIVE" <<'PY'
+          import stat
+          import sys
+          import unicodedata
+          import zipfile
+
+          archive = sys.argv[1]
+          problems = []
+
+
+          def key(path):
+              return unicodedata.normalize("NFD", path).casefold()
+
+
+          try:
+              zf = zipfile.ZipFile(archive)
+          except (OSError, zipfile.BadZipFile) as err:
+              print(f"::error::cannot read {archive!r} as a zip archive: {err}")
+              sys.exit(1)
+
+          entries = []
+          links = {}
+          seen = set()
+          tops = set()
+          with zf:
+              for info in zf.infolist():
+                  raw = info.orig_filename
+                  if "\0" in raw or "\\" in raw:
+                      problems.append(f"{raw!r}: NUL or backslash in the name")
+                      continue
+                  if raw.startswith("/"):
+                      problems.append(f"{raw!r}: absolute path")
+                      continue
+                  named_dir = raw.endswith("/")
+                  path = raw[:-1] if named_dir else raw
+                  parts = path.split("/")
+                  if any(p in ("", ".", "..") for p in parts):
+                      problems.append(f"{raw!r}: empty, '.' or '..' path component")
+                      continue
+                  mode = info.external_attr >> 16
+                  ftype = stat.S_IFMT(mode)
+                  if ftype == 0:
+                      kind = "dir" if named_dir else "file"
+                  elif stat.S_ISDIR(mode):
+                      kind = "dir"
+                  elif stat.S_ISREG(mode) and not named_dir:
+                      kind = "file"
+                  elif stat.S_ISLNK(mode) and not named_dir:
+                      kind = "link"
+                  else:
+                      problems.append(f"{raw!r}: not a regular file, directory or symlink (mode {mode:o})")
+                      continue
+                  k = key(path)
+                  if k in seen:
+                      problems.append(f"{raw!r}: duplicate entry (after case folding and normalisation)")
+                      continue
+                  seen.add(k)
+                  tops.add(parts[0])
+                  # Opening a member is what makes zipfile compare the local
+                  # header's name with the central directory's, which is the
+                  # list everything else here reads.
+                  try:
+                      with zf.open(info):
+                          pass
+                  except (zipfile.BadZipFile, NotImplementedError, RuntimeError) as err:
+                      problems.append(f"{raw!r}: unreadable or inconsistent entry: {err}")
+                      continue
+                  if kind == "link":
+                      try:
+                          target = zf.read(info).decode("utf-8")
+                      except UnicodeDecodeError:
+                          problems.append(f"{raw!r}: symlink target is not UTF-8")
+                          continue
+                      links[k] = target
+                  entries.append((raw, parts, kind))
+
+          apps = sorted(t for t in tops if t != "__MACOSX")
+          if len(apps) != 1 or not apps[0].endswith(".app"):
+              problems.append(f"expected exactly one top-level '<name>.app' directory, found {apps!r}")
+              top = None
+          else:
+              top = apps[0]
+
+
+          def resolve(start, target):
+              parts = list(start)
+              pending = target.split("/")[::-1]
+              hops = 0
+              while pending:
+                  c = pending.pop()
+                  if c in ("", "."):
+                      continue
+                  if c == "..":
+                      if not parts:
+                          return None
+                      parts.pop()
+                      continue
+                  parts.append(key(c))
+                  here = "/".join(parts)
+                  if here in links:
+                      hops += 1
+                      nxt = links[here]
+                      if hops > 40 or nxt.startswith("/"):
+                          return None
+                      parts.pop()
+                      pending.extend(nxt.split("/")[::-1])
+              return parts
+
+
+          if top is not None:
+              for raw, parts, kind in entries:
+                  if parts[0] == "__MACOSX":
+                      if kind == "link":
+                          problems.append(f"{raw!r}: symlink inside __MACOSX")
+                          continue
+                      # Where ditto applies this entry: the path it describes.
+                      # An AppleDouble file sits beside what it describes, so
+                      # the bundle root's own one is `__MACOSX/._<top>` and
+                      # the prefix has to come off before the root compare.
+                      mapped = parts[1:]
+                      if kind == "file" and mapped and mapped[-1].startswith("._"):
+                          mapped[-1] = mapped[-1][2:]
+                      if mapped and mapped[0] != top:
+                          problems.append(f"{raw!r}: __MACOSX entry for something other than {top!r}")
+                          continue
+                  else:
+                      mapped = parts
+                  for i in range(1, len(mapped)):
+                      if key("/".join(mapped[:i])) in links:
+                          problems.append(f"{raw!r}: lies beneath an archived symlink")
+                          break
+                  if kind != "link":
+                      continue
+                  target = links[key("/".join(parts))]
+                  if not target or target.startswith("/"):
+                      problems.append(f"{raw!r}: symlink target {target!r} is empty or absolute")
+                      continue
+                  landed = resolve([key(p) for p in parts[:-1]], target)
+                  if not landed or landed[0] != key(top):
+                      problems.append(f"{raw!r}: symlink target {target!r} does not resolve to a path inside {top!r}")
+
+          if problems:
+              for p in problems[:50]:
+                  print(f"::error::unsafe app archive entry: {p}")
+              if len(problems) > 50:
+                  print(f"::error::... and {len(problems) - 50} more")
+              print(f"::error::refusing to extract {archive!r} on the signing runner ({len(problems)} problem(s)).")
+              sys.exit(1)
+          print(f"app archive OK: {len(entries)} entries under {top!r}, {len(links)} symlink(s), all resolving inside it.")
+          PY
+      - name: Unpack the app
+        id: unpack
+        run: |
+          set -eu
+          UNPACK="$RUNNER_TEMP/app"
+          mkdir -p "$UNPACK"
+          ditto -x -k app-archive/dot-agent-deck-desktop-alpha-macos-arm64.app.zip "$UNPACK"
+          # The second half of the check above, against what `ditto` actually
+          # wrote rather than what the archive claimed: no device, fifo or
+          # socket file, and no symlink whose fully resolved target leaves the
+          # unpack root.
+          special=$(find "$UNPACK" \( -type b -o -type c -o -type p -o -type s \) -print)
+          if [ -n "$special" ]; then
+            echo "::error::the unpacked app contains device, fifo or socket files; refusing to sign it:"
+            printf '%s\n' "$special"
+            exit 1
+          fi
+          find "$UNPACK" -type l -print0 | python3 -c '
+          import os, sys
+          root = os.path.realpath(sys.argv[1])
+          bad = [p for p in sys.stdin.buffer.read().split(b"\0") if p]
+          bad = [p for p in bad if not os.path.realpath(p).startswith(os.fsencode(root) + b"/")]
+          for p in bad:
+              print(f"::error::unpacked symlink {p!r} resolves outside the unpack root, to {os.path.realpath(p)!r}")
+          sys.exit(1 if bad else 0)
+          ' "$UNPACK"
+          count=$(find "$RUNNER_TEMP/app" -maxdepth 1 -type d -name '*.app' | wc -l | tr -d ' ')
+          if [ "$count" -ne 1 ]; then
+            echo "::error::the app archive holds ${count} .app bundles at its top level, expected exactly one."
+            exit 1
+          fi
+          APP=$(find "$RUNNER_TEMP/app" -maxdepth 1 -type d -name '*.app')
+          # The property the ditto archive exists to preserve. If it did not
+          # survive, codesign would seal a sidecar that cannot be executed.
+          if [ ! -x "$APP/Contents/MacOS/dot-agent-deck" ]; then
+            echo "::error::${APP}/Contents/MacOS/dot-agent-deck is missing or not executable after unpacking; the daemon sidecar did not survive the artifact hand-off."
+            exit 1
+          fi
+          echo "app=$APP" >> "$GITHUB_OUTPUT"
+      - name: Import the certificate into a throwaway keychain
+        if: steps.creds.outputs.mode == 'signed'
+        id: keychain
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          set -eu
+          KEYCHAIN="$RUNNER_TEMP/desktop-signing.keychain-db"
+          P12="$RUNNER_TEMP/desktop-signing.p12"
+          # Random per run and never printed. The keychain is deleted by the
+          # cleanup step at the end of this job whatever happens.
+          KEYCHAIN_PASSWORD=$(openssl rand -hex 32)
+          echo "::add-mask::$KEYCHAIN_PASSWORD"
+          umask 077
+          printf '%s' "$APPLE_CERTIFICATE" | base64 --decode > "$P12"
+          # EXPIRY, which an emptiness check cannot see: an expired certificate
+          # is present, imports cleanly, and fails at codesign -- or worse, is
+          # caught only by notarization. It is read from the `.p12` itself,
+          # before anything enters the keychain, for two reasons. First,
+          # `find-identity -v` hides an expired identity, so the keychain can
+          # only report "found 0" where this names the real cause. Second, a
+          # search by name (`find-certificate -c`) returns the first match and
+          # can read a different certificate from the one that signs; the
+          # `.p12`'s one certificate-with-key IS the signing certificate, and
+          # the identity check below asserts that by SHA-1.
+          #
+          # `-clcerts -nokeys` writes only the certificate(s) paired with a
+          # private key, never the key. The password travels by environment,
+          # not argv. Under OpenSSL 3 a `.p12` exported with the older RC2-40
+          # encryption reads only with `-legacy`, an option not every
+          # `openssl` on a macOS runner accepts, so the plain form is tried
+          # first and `-legacy` only if it fails.
+          LEAF="$RUNNER_TEMP/developer-id.pem"
+          if ! openssl pkcs12 -in "$P12" -nokeys -clcerts -passin env:APPLE_CERTIFICATE_PASSWORD -out "$LEAF" 2> /dev/null \
+            && ! openssl pkcs12 -legacy -in "$P12" -nokeys -clcerts -passin env:APPLE_CERTIFICATE_PASSWORD -out "$LEAF"; then
+            echo "::error::could not read the certificate out of APPLE_CERTIFICATE with APPLE_CERTIFICATE_PASSWORD. Check that the password matches the .p12 (docs/develop/desktop-signing.md)."
+            exit 1
+          fi
+          leaves=$(grep -c 'BEGIN CERTIFICATE' "$LEAF" || true)
+          if [ "$leaves" -ne 1 ]; then
+            echo "::error::expected APPLE_CERTIFICATE to hold exactly one certificate with its private key, found ${leaves}. Export only the Developer ID Application certificate and its key as the .p12 (docs/develop/desktop-signing.md)."
+            exit 1
+          fi
+          subject=$(openssl x509 -in "$LEAF" -noout -subject)
+          case "$subject" in
+            *"Developer ID Application"*) ;;
+            *)
+              echo "::error::the certificate in APPLE_CERTIFICATE is not a Developer ID Application certificate (${subject}). Export the Developer ID Application certificate and its key as the .p12 (docs/develop/desktop-signing.md)."
+              exit 1
+              ;;
+          esac
+          # The fail threshold is one day, not zero, because this job runs for
+          # up to three hours after this point and signs twice. Signatures are
+          # made with `--timestamp`, so a signature made while the certificate
+          # is valid stays valid after it expires; what must not happen is the
+          # certificate expiring between here and the second codesign.
+          enddate=$(openssl x509 -in "$LEAF" -noout -enddate)
+          echo "Developer ID Application certificate ${enddate}"
+          if ! openssl x509 -in "$LEAF" -noout -checkend 86400 > /dev/null; then
+            echo "::error::the Developer ID Application certificate in APPLE_CERTIFICATE has expired or expires within 24 hours (${enddate}). Refusing to sign. Renew it and replace APPLE_CERTIFICATE and APPLE_CERTIFICATE_PASSWORD -- docs/develop/desktop-signing.md, 'Certificate expiry'."
+            exit 1
+          fi
+          if ! openssl x509 -in "$LEAF" -noout -checkend 2592000 > /dev/null; then
+            echo "::warning::the Developer ID Application certificate expires within 30 days (${enddate}). Renew it before the next release -- docs/develop/desktop-signing.md, 'Certificate expiry'."
+          fi
+          LEAF_SHA1=$(openssl x509 -in "$LEAF" -noout -fingerprint -sha1 | sed 's/^.*=//' | tr -d ':' | tr '[:lower:]' '[:upper:]')
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security import "$P12" -k "$KEYCHAIN" -P "$APPLE_CERTIFICATE_PASSWORD" -f pkcs12 -T /usr/bin/codesign
+          rm -f "$P12"
+          # Apple's Developer ID G2 intermediate, so the chain resolves whether
+          # or not the `.p12` was exported with it. An intermediate cannot
+          # create trust on its own: the chain is still validated up to the
+          # Apple root already in the system keychain.
+          #
+          # PINNED by the SHA-256 of its DER bytes, so what enters the keychain
+          # beside the key is a known certificate rather than whatever that URL
+          # served on the day. `--proto '=https'` and `--proto-redir '=https'`
+          # keep `-L` from following a redirect to plain HTTP. The pin was
+          # computed on 2026-09-24 from that URL (served HTTP 200, no redirect,
+          # 1090 bytes): subject `CN=Developer ID Certification Authority,
+          # OU=G2, O=Apple Inc., C=US`, issuer `Apple Root CA`, serial
+          # 7FB4003FCD97497ACB834D92A48A7873C2845D43, valid 2021-09-22 to
+          # 2031-09-17. Recompute it with
+          #   curl --proto '=https' --proto-redir '=https' -fsSL https://www.apple.com/certificateauthority/DeveloperIDG2CA.cer | shasum -a 256
+          # and check the subject, issuer and dates with
+          #   openssl x509 -inform DER -noout -subject -issuer -serial -dates
+          # before changing it (docs/develop/desktop-signing.md, "The Apple
+          # intermediate pin").
+          G2_SHA256=f16cd3c54c7f83cea4bf1a3e6a0819c8aaa8e4a1528fd144715f350643d2df3a
+          curl --proto '=https' --proto-redir '=https' -fsSL --retry 3 https://www.apple.com/certificateauthority/DeveloperIDG2CA.cer -o "$RUNNER_TEMP/DeveloperIDG2CA.cer"
+          got=$(shasum -a 256 "$RUNNER_TEMP/DeveloperIDG2CA.cer" | awk '{print $1}')
+          if [ "$got" != "$G2_SHA256" ]; then
+            echo "::error::the Apple Developer ID G2 intermediate downloaded from apple.com has SHA-256 ${got}, not the pinned ${G2_SHA256}. Refusing to import it. Review what Apple now serves at that URL and, if it is a legitimate reissue, update G2_SHA256 in release.yml -- docs/develop/desktop-signing.md, 'The Apple intermediate pin'."
+            exit 1
+          fi
+          security import "$RUNNER_TEMP/DeveloperIDG2CA.cer" -k "$KEYCHAIN"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" > /dev/null
+          # Put the throwaway keychain on the search list so codesign finds the
+          # identity, keeping the runner's existing keychains after it.
+          existing=$(security list-keychains -d user | tr -d '"' | tr '\n' ' ')
+          # shellcheck disable=SC2086 # word-splitting the list is the point
+          security list-keychains -d user -s "$KEYCHAIN" $existing
+          # Exactly one Developer ID Application identity, addressed by its
+          # SHA-1 so a second certificate with the same name cannot be picked
+          # by accident.
+          identities=$(security find-identity -v -p codesigning "$KEYCHAIN" | grep 'Developer ID Application' || true)
+          n=$(printf '%s\n' "$identities" | grep -c 'Developer ID Application' || true)
+          if [ "$n" -ne 1 ]; then
+            echo "::error::expected exactly one valid 'Developer ID Application' identity in APPLE_CERTIFICATE, found ${n}. Export the Developer ID Application certificate together with its private key as the .p12 (docs/develop/desktop-signing.md)."
+            security find-identity -v -p codesigning "$KEYCHAIN" || true
+            exit 1
+          fi
+          IDENTITY=$(printf '%s\n' "$identities" | awk '{print $2}')
+          # The identity codesign will use must be the certificate whose expiry
+          # was just checked, not merely one with the same name.
+          if [ "$IDENTITY" != "$LEAF_SHA1" ]; then
+            echo "::error::the keychain's Developer ID Application identity (${IDENTITY}) is not the certificate read from APPLE_CERTIFICATE (${LEAF_SHA1}). Refusing to sign with a certificate whose expiry was not checked."
+            exit 1
+          fi
+          echo "identity=$IDENTITY" >> "$GITHUB_OUTPUT"
+          echo "keychain=$KEYCHAIN" >> "$GITHUB_OUTPUT"
+      - name: Sign the app
+        if: steps.creds.outputs.mode == 'signed'
+        env:
+          APP: ${{ steps.unpack.outputs.app }}
+          IDENTITY: ${{ steps.keychain.outputs.identity }}
+          KEYCHAIN: ${{ steps.keychain.outputs.keychain }}
+        run: |
+          set -eu
+          # Hardened-runtime entitlements for the APP. Authored here, inline,
+          # rather than read from the tree: this job has no checkout, and a
+          # plist carried over from `desktop-bundle` would let the job that
+          # runs third-party build code choose what the key vouches for. Every
+          # key is listed with its reason; add none without one.
+          #
+          # - com.apple.security.cs.allow-jit: PRD #757 Decision 4 records a
+          #   missing JIT entitlement as producing a bundle that signs cleanly
+          #   and crashes on launch. NOT measured on this app: WKWebView runs
+          #   JavaScript in Apple's own WebContent process, so this may prove
+          #   unnecessary for the host process. Kept until M6 measures it,
+          #   because omitting it risks a signed release that cannot start,
+          #   while including it only loosens one hardened-runtime restriction
+          #   on this process.
+          # - com.apple.security.device.audio-input: voice capture (PRD #802
+          #   M7, desktop/src-tauri/src/voice/capture.rs) opens the microphone
+          #   through CoreAudio. The hardened runtime denies audio input to a
+          #   process that lacks this entitlement, independently of the
+          #   Info.plist usage string and of the user's permission.
+          #
+          # Deliberately absent: allow-unsigned-executable-memory (the legacy
+          # form of JIT, superseded by allow-jit), disable-library-validation
+          # (no dylib or framework is configured for bundling -- tauri.conf.json
+          # sets no `bundle.macOS.frameworks` -- so there is nothing of ours
+          # for library validation to reject), and get-task-allow (debug
+          # only, and notarization rejects it).
+          ENTITLEMENTS="$RUNNER_TEMP/Entitlements.plist"
+          cat > "$ENTITLEMENTS" <<'PLIST'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>com.apple.security.cs.allow-jit</key>
+            <true/>
+            <key>com.apple.security.device.audio-input</key>
+            <true/>
+          </dict>
+          </plist>
+          PLIST
+          plutil -lint "$ENTITLEMENTS"
+          MAIN=$(plutil -extract CFBundleExecutable raw -o - "$APP/Contents/Info.plist")
+          # Inside out, per Apple: every nested Mach-O first, deepest path
+          # first, then the bundle, whose seal records their signatures. No
+          # `--deep` for signing -- it applies one set of options and
+          # entitlements to everything it finds, which is why Apple deprecates
+          # it for this. `--force` replaces the ad-hoc signature the arm64
+          # linker already put on each binary.
+          #
+          # Nested code gets the hardened runtime and NO entitlements. Today
+          # that is the `dot-agent-deck` daemon sidecar, which needs neither
+          # JIT nor the microphone; an entitlement it does not need is only
+          # attack surface. tauri#11992 reports notarization failing when
+          # `externalBin` is configured, which is this sidecar -- the
+          # `--verify --deep --strict` below is the first check of that class.
+          find "$APP/Contents" -type f -print0 > "$RUNNER_TEMP/bundle-files.list"
+          : > "$RUNNER_TEMP/nested.list"
+          while IFS= read -r -d "" f; do
+            if [ "$f" = "$APP/Contents/MacOS/$MAIN" ]; then
+              continue
+            fi
+            if file -b "$f" | grep -q 'Mach-O'; then
+              depth=$(printf '%s' "$f" | tr -cd '/' | wc -c | tr -d ' ')
+              printf '%s\t%s\n' "$depth" "$f" >> "$RUNNER_TEMP/nested.list"
+            fi
+          done < "$RUNNER_TEMP/bundle-files.list"
+          if [ ! -s "$RUNNER_TEMP/nested.list" ]; then
+            echo "::error::found no nested Mach-O binary in ${APP}; the daemon sidecar should be one. Refusing to sign a bundle whose layout is not what this step expects."
+            exit 1
+          fi
+          sort -rn "$RUNNER_TEMP/nested.list" | cut -f2- > "$RUNNER_TEMP/nested.sorted"
+          while IFS= read -r f; do
+            echo "signing nested: $f"
+            codesign --force --timestamp --options runtime --keychain "$KEYCHAIN" --sign "$IDENTITY" "$f"
+          done < "$RUNNER_TEMP/nested.sorted"
+          echo "signing app: $APP"
+          codesign --force --timestamp --options runtime --entitlements "$ENTITLEMENTS" --keychain "$KEYCHAIN" --sign "$IDENTITY" "$APP"
+          # `--deep` IS right here: for verification it walks every nested
+          # signature instead of trusting the seal.
+          codesign --verify --deep --strict --verbose=4 "$APP"
+          codesign --display --entitlements - "$APP"
+      - name: Notarize and staple the app
+        if: steps.creds.outputs.mode == 'signed'
+        env:
+          APP: ${{ steps.unpack.outputs.app }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          # Despite its name, the CONTENTS of the App Store Connect `.p8` key,
+          # not a path to one -- a secret cannot be a file. The name is kept
+          # because it is the one registered; it is written to a file below.
+          APPLE_API_KEY_PATH: ${{ secrets.APPLE_API_KEY_PATH }}
+        run: |
+          set -eu
+          # The app is notarized and stapled on its own, BEFORE it goes into
+          # the disk image, so the ticket travels with the app when a user
+          # drags it to /Applications. Stapling only the `.dmg` would leave the
+          # installed app to fetch its ticket from Apple at first launch, which
+          # fails offline -- and an offline launch is M6's acceptance test.
+          umask 077
+          printf '%s\n' "$APPLE_API_KEY_PATH" > "$RUNNER_TEMP/AuthKey.p8"
+          ditto -c -k --keepParent "$APP" "$RUNNER_TEMP/app-for-notary.zip"
+          xcrun notarytool submit "$RUNNER_TEMP/app-for-notary.zip" \
+            --key "$RUNNER_TEMP/AuthKey.p8" --key-id "$APPLE_API_KEY" --issuer "$APPLE_API_ISSUER" \
+            --wait --timeout 75m --output-format json > "$RUNNER_TEMP/notary-app.json" || true
+          cat "$RUNNER_TEMP/notary-app.json"
+          status=$(plutil -extract status raw -o - "$RUNNER_TEMP/notary-app.json" 2>/dev/null || echo unknown)
+          if [ "$status" != "Accepted" ]; then
+            id=$(plutil -extract id raw -o - "$RUNNER_TEMP/notary-app.json" 2>/dev/null || true)
+            echo "::error::notarization of the app returned status '${status}', not Accepted."
+            if [ -n "$id" ]; then
+              xcrun notarytool log "$id" --key "$RUNNER_TEMP/AuthKey.p8" --key-id "$APPLE_API_KEY" --issuer "$APPLE_API_ISSUER" || true
+            fi
+            exit 1
+          fi
+          rm -f "$RUNNER_TEMP/app-for-notary.zip"
+          xcrun stapler staple "$APP"
+          xcrun stapler validate "$APP"
+      # Both paths build the disk image the same way, so a signed and an
+      # unsigned release differ only in the signatures -- not in layout. The
+      # layout is the app plus an /Applications link for drag-install; Tauri's
+      # own `.dmg` bundler is not used, because it runs inside `tauri build`
+      # on the job that must not hold the key.
+      - name: Build the disk image
+        env:
+          APP: ${{ steps.unpack.outputs.app }}
+        run: |
+          set -eu
+          STAGE="$RUNNER_TEMP/dmg-stage"
+          mkdir -p "$STAGE" dist-desktop
+          ditto "$APP" "$STAGE/$(basename "$APP")"
+          ln -s /Applications "$STAGE/Applications"
+          DMG=dist-desktop/dot-agent-deck-desktop-alpha-macos-arm64.dmg
+          # `hdiutil create` intermittently fails on hosted runners with
+          # "Resource busy"; retried rather than failing a release on it.
+          ok=0
+          for attempt in 1 2 3; do
+            if hdiutil create -volname "Agent Deck" -srcfolder "$STAGE" -ov -format UDZO "$DMG"; then
+              ok=1
+              break
+            fi
+            echo "hdiutil create failed (attempt ${attempt}); retrying"
+            sleep 10
+          done
+          if [ "$ok" -ne 1 ]; then
+            echo "::error::hdiutil could not create the disk image after three attempts."
+            exit 1
+          fi
+          ls -la dist-desktop
+      - name: Sign, notarize and staple the disk image
+        if: steps.creds.outputs.mode == 'signed'
+        env:
+          IDENTITY: ${{ steps.keychain.outputs.identity }}
+          KEYCHAIN: ${{ steps.keychain.outputs.keychain }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY_PATH: ${{ secrets.APPLE_API_KEY_PATH }}
+        run: |
+          set -eu
+          DMG=dist-desktop/dot-agent-deck-desktop-alpha-macos-arm64.dmg
+          umask 077
+          # Rewritten rather than reused from the previous step, so that step's
+          # cleanup (or its absence) cannot decide whether this one works.
+          printf '%s\n' "$APPLE_API_KEY_PATH" > "$RUNNER_TEMP/AuthKey.p8"
+          codesign --force --timestamp --keychain "$KEYCHAIN" --sign "$IDENTITY" "$DMG"
+          codesign --verify --strict --verbose=4 "$DMG"
+          xcrun notarytool submit "$DMG" \
+            --key "$RUNNER_TEMP/AuthKey.p8" --key-id "$APPLE_API_KEY" --issuer "$APPLE_API_ISSUER" \
+            --wait --timeout 75m --output-format json > "$RUNNER_TEMP/notary-dmg.json" || true
+          cat "$RUNNER_TEMP/notary-dmg.json"
+          status=$(plutil -extract status raw -o - "$RUNNER_TEMP/notary-dmg.json" 2>/dev/null || echo unknown)
+          if [ "$status" != "Accepted" ]; then
+            id=$(plutil -extract id raw -o - "$RUNNER_TEMP/notary-dmg.json" 2>/dev/null || true)
+            echo "::error::notarization of the disk image returned status '${status}', not Accepted."
+            if [ -n "$id" ]; then
+              xcrun notarytool log "$id" --key "$RUNNER_TEMP/AuthKey.p8" --key-id "$APPLE_API_KEY" --issuer "$APPLE_API_ISSUER" || true
+            fi
+            exit 1
+          fi
+          xcrun stapler staple "$DMG"
+          xcrun stapler validate "$DMG"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          # THE name `desktop-publish` and `attest` select with their
+          # `desktop-bundle-*` pattern, so the `.dmg` they publish and attest is
+          # this file, byte for byte. The macOS bundle leg no longer uploads
+          # under it (it uploads `desktop-app-macos-arm64`), so the name is free.
+          name: desktop-bundle-macos-arm64
+          path: dist-desktop/
+          if-no-files-found: error
+      - name: Record whether the disk image is signed
+        id: result
+        env:
+          MODE: ${{ steps.creds.outputs.mode }}
+        run: |
+          set -eu
+          case "$MODE" in
+            signed) echo "signed=true" >> "$GITHUB_OUTPUT" ;;
+            unsigned) echo "signed=false" >> "$GITHUB_OUTPUT" ;;
+            *)
+              echo "::error::unexpected credential mode '${MODE}'."
+              exit 1
+              ;;
+          esac
+      - name: Delete the throwaway keychain and key files
+        if: always()
+        run: |
+          KEYCHAIN="$RUNNER_TEMP/desktop-signing.keychain-db"
+          if [ -f "$KEYCHAIN" ]; then
+            security delete-keychain "$KEYCHAIN" || true
+          fi
+          rm -f "$RUNNER_TEMP/AuthKey.p8" "$RUNNER_TEMP/desktop-signing.p12" "$RUNNER_TEMP/developer-id.pem" "$RUNNER_TEMP/DeveloperIDG2CA.cer"
 
   # Attaches the desktop assets to the release that `finalize` already created.
   # Separated from `desktop-bundle` so the upload happens once, after the
   # release object exists, rather than racing per matrix leg.
   desktop-publish:
-    needs: [prepare, finalize, desktop-bundle]
+    # `desktop-sign` because the macOS `.dmg` is now its output, not the bundle
+    # matrix's; `desktop-bundle` still, because the Linux `.deb` comes from
+    # there directly.
+    needs: [prepare, finalize, desktop-bundle, desktop-sign]
     # `needs` on a MATRIX job resolves to the AGGREGATE result of every leg, so
     # `needs: desktop-bundle` alone would skip this job the moment ONE platform
     # failed — discarding the other platform's perfectly good bundle, which is
@@ -881,7 +1682,9 @@ jobs:
     # So gate on what actually matters instead: the release object must exist
     # (`finalize` succeeded) and we must not have been cancelled. Whether there
     # is anything worth publishing is then a question for the steps below,
-    # which can see the artifacts and say which platforms are missing.
+    # which can see the artifacts and say which platforms are missing. The same
+    # holds for `desktop-sign`: when it fails there is no `.dmg`, and the `.deb`
+    # is still published.
     if: ${{ !cancelled() && needs.finalize.result == 'success' && !inputs.skip_desktop }}
     runs-on: ubuntu-latest
     steps:
@@ -906,8 +1709,12 @@ jobs:
           # release carrying only one platform should say so in the log rather
           # than look like a full one.
           for expected in macos-arm64 linux-amd64; do
-            if ! ls dist-desktop | grep -q -- "-${expected}\."; then
-              echo "::warning::no bundle for ${expected}; that platform's leg failed. Publishing the platforms that did build."
+            present=0
+            for f in dist-desktop/*"-${expected}".*; do
+              if [ -e "$f" ]; then present=1; fi
+            done
+            if [ "$present" -eq 0 ]; then
+              echo "::warning::no bundle for ${expected}; that platform's bundle leg failed (or, for macos-arm64, desktop-sign did). Publishing the platforms that did build."
             fi
           done
           ls -la dist-desktop
@@ -944,7 +1751,8 @@ jobs:
         run: gh release upload "v$RELEASE_VERSION" dist-desktop/* --clobber --repo "$REPO"
       # Issue #1152, and the mirror of the upload in `finalize`: the desktop
       # manifest is written in THIS job, so `attest` cannot see it either. The
-      # bundles reach that job as `desktop-bundle-*` artifacts, but the manifest
+      # bundles reach that job as `desktop-bundle-*` artifacts (the `.deb` from
+      # `desktop-bundle`, the `.dmg` from `desktop-sign`), but the manifest
       # does not exist when those are uploaded -- it is generated here, from
       # them -- so it needs a carrier of its own.
       #
@@ -962,14 +1770,20 @@ jobs:
           path: dist-desktop/checksums-desktop-alpha.txt
           if-no-files-found: error
           overwrite: true
-      - name: Note the unsigned alpha in the release body
+      - name: Note the unsigned alpha, or the signed macOS build, in the release body
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+          # `true` or `false` once `desktop-sign` has uploaded a `.dmg`, empty
+          # otherwise. PRD #757 Decision 10: the note says what was actually
+          # signed rather than a fixed string.
+          SIGNED: ${{ needs.desktop-sign.outputs.signed }}
         # Appended here rather than assembled in `prepare` so the note appears
         # only when the assets it describes actually exist -- a release whose
-        # bundler failed must not advertise downloads it does not have.
+        # bundler failed must not advertise downloads it does not have. Each
+        # platform's paragraph is written only when that platform's asset is
+        # in `dist-desktop/`, which is exactly what the upload step published.
         run: |
           set -eu
           MARKER="<!-- desktop-alpha -->"
@@ -982,21 +1796,48 @@ jobs:
               exit 0
               ;;
           esac
+          MAC_DMG=dist-desktop/dot-agent-deck-desktop-alpha-macos-arm64.dmg
+          LINUX_DEB=dist-desktop/dot-agent-deck-desktop-alpha-linux-amd64.deb
+          # Anything other than an explicit `true` beside a published `.dmg`
+          # is described as unsigned. That is the safe direction to be wrong
+          # in: calling a signed build unsigned costs a user a needless step,
+          # while calling an unsigned build signed would tell them a Gatekeeper
+          # warning is a sign of tampering. No `.dmg`, no macOS paragraph.
+          if [ ! -f "$MAC_DMG" ]; then
+            SIGNED=absent
+          elif [ "$SIGNED" != "true" ]; then
+            SIGNED=false
+          fi
+          NOTE="$RUNNER_TEMP/desktop-note.md"
           {
             printf "%s\n\n" "$BODY"
             printf "%s\n" "$MARKER"
-            printf "### Desktop GUI (alpha, unsigned)\n\n"
-            printf "The \`dot-agent-deck-desktop-alpha-*\` assets are an early preview of the desktop GUI. They are **unsigned**, and they are not covered by the support expectations of the CLI.\n\n"
-            printf "**Verify what you downloaded, before you do anything else with it.** Nothing about an unsigned build establishes that it is genuine, and no OS checks this on your behalf, so this is the step that tells you where the file actually came from -- and it is the prerequisite for the platform steps below rather than an alternative to them. Every asset this release uploads carries [build provenance](https://docs.github.com/en/actions/security-for-github-actions/using-artifact-attestations) -- the CLI binaries, the desktop packages, and both \`checksums.txt\` and \`checksums-desktop-alpha.txt\`. That is a stronger claim than a checksum: it says this exact file was produced by this repository's release workflow, from a named commit, rather than merely that it matches a number printed on the same page that served it. The manifests are covered for the same reason you would read one at all -- a list of hashes you check everything else against is the file worth swapping. GitHub's own **Source code** archives are the one exception: GitHub synthesizes those from the tag rather than this workflow uploading them.\n\n"
+            if [ "$SIGNED" = "true" ]; then
+              printf "### Desktop GUI (alpha)\n\n"
+            else
+              printf "### Desktop GUI (alpha, unsigned)\n\n"
+            fi
+            printf "The \`dot-agent-deck-desktop-alpha-*\` assets are an early preview of the desktop GUI, and they are not covered by the support expectations of the CLI. Each platform's paragraph below says whether its asset is signed.\n\n"
+            printf "**Verify what you downloaded, before you do anything else with it.** No OS checks build provenance on your behalf, so this is the step that tells you where the file actually came from -- for an unsigned asset it is the only one, and it is the prerequisite for the platform steps below rather than an alternative to them. Every asset this release uploads carries [build provenance](https://docs.github.com/en/actions/security-for-github-actions/using-artifact-attestations) -- the CLI binaries, the desktop packages, and both \`checksums.txt\` and \`checksums-desktop-alpha.txt\`. That is a stronger claim than a checksum: it says this exact file was produced by this repository's release workflow, from a named commit, rather than merely that it matches a number printed on the same page that served it. The manifests are covered for the same reason you would read one at all -- a list of hashes you check everything else against is the file worth swapping. GitHub's own **Source code** archives are the one exception: GitHub synthesizes those from the tag rather than this workflow uploading them.\n\n"
             printf "\`\`\`sh\ngh attestation verify <the-file-you-downloaded> --repo vfarcic/dot-agent-deck --signer-workflow vfarcic/dot-agent-deck/.github/workflows/release.yml\n\`\`\`\n\n"
             printf "If that does not report a verified attestation from this repository's release workflow, stop there: do not install the file, and do not override any warning your OS raises about it.\n\n"
-            printf "**macOS** (\`.dmg\`) -- macOS quarantines an unsigned app and refuses the first launch. **Once the verification above has passed**, move the app to /Applications, then use either route to tell macOS you accept it:\n\n"
-            printf -- "- Open **System Settings > Privacy & Security**, find the message naming Agent Deck, and choose **Open Anyway**. Control-clicking the app to bypass this no longer works on macOS Sequoia and later, which is why this route is listed first.\n"
-            printf -- "- Or clear the quarantine flag from a terminal:\n\n"
-            printf "  \`\`\`sh\n  xattr -dr com.apple.quarantine \"/Applications/Agent Deck.app\"\n  \`\`\`\n\n"
-            printf "**Linux** (\`.deb\`) -- nothing blocks this install and nothing warns you: \`dpkg -i\` does not verify package signatures, so the checks above are the only ones anybody makes.\n\n"
-            printf "Signing and notarization -- which is what would stop macOS warning you in the first place -- were considered and declined in https://github.com/vfarcic/dot-agent-deck/issues/757, so expect that warning on every release rather than waiting for a fix.\n"
-          } | gh release edit "v$RELEASE_VERSION" --repo "$REPO" --notes-file -
+          } > "$NOTE"
+          if [ "$SIGNED" = "true" ]; then
+            printf "**macOS** (\`.dmg\`) -- signed with this project's Apple Developer ID and notarized by Apple, with the notarization ticket stapled to both the app and the disk image. Open the disk image, drag Agent Deck to /Applications and launch it: macOS should ask only to confirm opening an app downloaded from the internet. If it instead reports the app as damaged or from an unidentified developer, do not override that -- report it at https://github.com/vfarcic/dot-agent-deck/issues.\n\n" >> "$NOTE"
+          fi
+          if [ "$SIGNED" = "false" ]; then
+            {
+              printf "**macOS** (\`.dmg\`) -- this build is **unsigned**, so macOS quarantines the app and refuses the first launch. **Once the verification above has passed**, move the app to /Applications, then use either route to tell macOS you accept it:\n\n"
+              printf -- "- Open **System Settings > Privacy & Security**, find the message naming Agent Deck, and choose **Open Anyway**. Control-clicking the app to bypass this no longer works on macOS Sequoia and later, which is why this route is listed first.\n"
+              printf -- "- Or clear the quarantine flag from a terminal:\n\n"
+              printf "  \`\`\`sh\n  xattr -dr com.apple.quarantine \"/Applications/Agent Deck.app\"\n  \`\`\`\n\n"
+              printf "The release workflow signs and notarizes the macOS build once the project's Apple signing credentials are configured, and this release was built without them -- see https://github.com/vfarcic/dot-agent-deck/issues/757.\n\n"
+            } >> "$NOTE"
+          fi
+          if [ -f "$LINUX_DEB" ]; then
+            printf "**Linux** (\`.deb\`) -- unsigned. Nothing blocks this install and nothing warns you: \`dpkg -i\` does not verify package signatures, so the checks above are the only ones anybody makes.\n" >> "$NOTE"
+          fi
+          gh release edit "v$RELEASE_VERSION" --repo "$REPO" --notes-file "$NOTE"
 
   # PRD #757: verifiable build provenance for the assets this workflow uploads.
   #
@@ -1098,9 +1939,10 @@ jobs:
         # `dist-desktop/` legitimately holds nothing when both bundler legs
         # failed. Expanding here lets that case attest the CLI assets and move
         # on. Every subject is either `dot-agent-deck-*` or one of the two
-        # `checksums*.txt` manifests, and none carries a space; the rename step
-        # in `desktop-bundle` is what guarantees that for the bundles, whose
-        # Tauri output name ("Agent Deck_<version>_amd64.deb") does. That
+        # `checksums*.txt` manifests, and none carries a space; for the bundles
+        # that is guaranteed by the rename step in `desktop-bundle` (the `.deb`,
+        # whose Tauri output name "Agent Deck_<version>_amd64.deb" has one) and
+        # by `desktop-sign` writing the `.dmg` under its final name. That
         # matters because the action takes `subject-path` as a newline-separated
         # list, so a space is survivable but a newline in a name would not be.
         run: |

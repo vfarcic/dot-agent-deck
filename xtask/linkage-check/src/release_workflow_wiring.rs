@@ -32,6 +32,13 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+thread_local! {
+    // Mutation checks feed the existing guards a changed in-memory workflow.
+    // Each nextest test runs in its own process, and this also isolates them
+    // if the module is run under the standard test harness.
+    static WORKFLOW_OVERRIDE: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -41,6 +48,9 @@ fn repo_root() -> PathBuf {
 }
 
 fn workflow() -> String {
+    if let Some(text) = WORKFLOW_OVERRIDE.with(|slot| slot.borrow().clone()) {
+        return text;
+    }
     let path = repo_root().join(".github/workflows/release.yml");
     fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
 }
@@ -107,6 +117,795 @@ fn needs(block: &str) -> Vec<String> {
         .map(|s| s.trim().trim_matches('"').trim_matches('\'').to_string())
         .filter(|s| !s.is_empty())
         .collect()
+}
+
+/// Code lines alone, so prose about a safety property cannot satisfy it or
+/// falsely make another job appear to hold a signing secret.
+fn code(block: &str) -> String {
+    block
+        .lines()
+        .map(code_before_comment)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The signing job belongs between the uncredentialed bundle matrix and the
+/// publisher. `finalize` must continue to create the CLI release independently.
+#[test]
+fn desktop_sign_is_between_bundle_and_publish_off_the_cli_path() {
+    let all = jobs(&workflow());
+    let sign_needs = needs(&code(job(&all, "desktop-sign")));
+    let publish_needs = needs(&code(job(&all, "desktop-publish")));
+    let finalize_needs = needs(&code(job(&all, "finalize")));
+
+    assert!(
+        sign_needs.contains(&"desktop-bundle".to_string()),
+        "`desktop-sign` must need `desktop-bundle`, got {sign_needs:?}"
+    );
+    assert!(
+        publish_needs.contains(&"desktop-sign".to_string()),
+        "`desktop-publish` must need `desktop-sign`, got {publish_needs:?}"
+    );
+    for name in [
+        "desktop-bundle",
+        "desktop-sign",
+        "desktop-publish",
+        "attest",
+    ] {
+        assert!(
+            !finalize_needs.contains(&name.to_string()),
+            "`finalize` must not need `{name}`, got {finalize_needs:?}"
+        );
+    }
+}
+
+/// The runner that receives a Developer ID private key must never execute a
+/// checkout of the release repository.
+#[test]
+fn desktop_sign_does_not_check_out_repository_code() {
+    let all = jobs(&workflow());
+    assert!(
+        !checks_out(&code(job(&all, "desktop-sign"))),
+        "`desktop-sign` must download artifacts without `actions/checkout`"
+    );
+}
+
+/// A code-line mention outside the signing job makes a secret available to a
+/// runner that may execute third-party build code. Comments are deliberately
+/// ignored because they can describe the very isolation being guarded here.
+#[test]
+fn apple_signing_secrets_are_named_only_in_desktop_sign() {
+    let workflow = workflow();
+    let all = jobs(&workflow);
+    let sign = code(job(&all, "desktop-sign"));
+    let outside = code(&workflow.replacen(job(&all, "desktop-sign"), "", 1));
+    for secret in [
+        "APPLE_CERTIFICATE",
+        "APPLE_CERTIFICATE_PASSWORD",
+        "APPLE_API_KEY",
+        "APPLE_API_ISSUER",
+        "APPLE_API_KEY_PATH",
+    ] {
+        assert!(
+            sign.contains(secret),
+            "`desktop-sign` does not name `{secret}`"
+        );
+        assert!(
+            !outside.contains(secret),
+            "`{secret}` appears on a code line outside `desktop-sign`"
+        );
+    }
+}
+
+/// Environment-scoped secrets should be readable by the one signing job.
+#[test]
+fn desktop_sign_declares_the_signing_environment() {
+    let all = jobs(&workflow());
+    let sign = code(job(&all, "desktop-sign"));
+    let direct = sign
+        .lines()
+        .any(|l| l.trim() == "environment: desktop-signing");
+    let mapping = sign.contains("environment:\n      name: desktop-signing")
+        || sign.contains("environment:\n        name: desktop-signing");
+    assert!(
+        direct || mapping,
+        "`desktop-sign` must declare `environment: desktop-signing` (or a mapping with that name)"
+    );
+}
+
+/// Upload-artifact flattens file modes, so the macOS app must cross the job
+/// boundary inside a ditto archive that the signing job restores.
+#[test]
+fn desktop_app_crosses_the_artifact_boundary_in_a_ditto_archive() {
+    let all = jobs(&workflow());
+    let bundle = code(job(&all, "desktop-bundle"));
+    let sign = code(job(&all, "desktop-sign"));
+    let archive = bundle
+        .lines()
+        .find(|l| l.contains("ditto -c -k --sequesterRsrc --keepParent"));
+    assert!(
+        archive.is_some_and(|l| l.contains(".app") && l.contains(".zip")),
+        "the macOS bundle leg must archive its `.app` as a `.zip` with `ditto -c -k --sequesterRsrc --keepParent`"
+    );
+    assert!(
+        sign.lines()
+            .any(|l| l.contains("ditto -x -k") && l.contains(".zip")),
+        "`desktop-sign` must restore the zipped app with `ditto -x -k`"
+    );
+}
+
+/// Tauri's WebView needs JIT under hardened runtime. The entitlement can be
+/// inlined in the job or carried as a repository plist named by that job.
+#[test]
+fn desktop_codesign_uses_runtime_and_jit_entitlements() {
+    let all = jobs(&workflow());
+    let sign = code(job(&all, "desktop-sign"));
+    assert!(
+        sign.contains("codesign")
+            && sign.contains("--options runtime")
+            && sign.contains("--entitlements"),
+        "`desktop-sign` must codesign with `--options runtime` and `--entitlements`"
+    );
+    let inline_jit = sign.contains("com.apple.security.cs.allow-jit");
+    let referenced_jit = [
+        "desktop/src-tauri/Entitlements.plist",
+        "desktop/src-tauri/entitlements.plist",
+    ]
+    .into_iter()
+    .filter(|path| sign.contains(path))
+    .any(|path| {
+        fs::read_to_string(repo_root().join(path))
+            .is_ok_and(|plist| plist.contains("com.apple.security.cs.allow-jit"))
+    });
+    assert!(
+        inline_jit || referenced_jit,
+        "the entitlements used by `desktop-sign` must contain `com.apple.security.cs.allow-jit` inline or in its referenced plist"
+    );
+}
+
+/// An expired certificate is present but unusable; checking only whether the
+/// secret is empty would allow a broken release to reach codesign.
+/// Scenario: The signing job checks both the one-day failure threshold and the
+/// thirty-day warning threshold before it signs an app.
+#[test]
+fn desktop_sign_checks_certificate_expiry() {
+    let all = jobs(&workflow());
+    let sign = code(job(&all, "desktop-sign"));
+    assert!(
+        sign.contains("openssl x509")
+            && sign.contains("-enddate")
+            && sign.contains("-checkend 86400")
+            && sign.contains("-checkend 2592000"),
+        "`desktop-sign` must inspect the certificate end date and check both one-day and thirty-day expiry thresholds with `openssl x509 -checkend`"
+    );
+}
+
+/// Scenario: The signing runner validates the downloaded app archive before
+/// the unpack step can write any of its members to disk.
+#[test]
+fn desktop_sign_validates_archive_before_unpacking() {
+    let all = jobs(&workflow());
+    let sign = job(&all, "desktop-sign");
+    let validate = named_step(sign, "Validate the app archive before extracting it");
+    let unpack = named_step(sign, "Unpack the app");
+    assert!(
+        sign.find(validate).unwrap() < sign.find(unpack).unwrap(),
+        "archive validation must precede unpacking"
+    );
+    assert!(
+        code(validate).contains("python3 - \"$APP_ARCHIVE\"")
+            && code(unpack).contains("ditto -x -k"),
+        "the validator must check APP_ARCHIVE before ditto extracts it"
+    );
+}
+
+/// Scenario: The Apple intermediate download stays on HTTPS, and the signing
+/// runner checks its pinned SHA-256 before importing it into the keychain.
+#[test]
+fn desktop_sign_pins_apple_intermediate_before_import() {
+    let all = jobs(&workflow());
+    let step = code(named_step(
+        job(&all, "desktop-sign"),
+        "Import the certificate into a throwaway keychain",
+    ));
+    let curl = step
+        .lines()
+        .find(|line| line.trim_start().starts_with("curl ") && line.contains("DeveloperIDG2CA.cer"))
+        .expect("Apple intermediate download");
+    assert!(
+        curl.contains("--proto '=https'") && curl.contains("--proto-redir '=https'"),
+        "Apple intermediate curl must restrict both initial and redirect protocols to HTTPS"
+    );
+    let pin = step
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("G2_SHA256="))
+        .expect("Apple intermediate digest pin");
+    assert!(
+        pin.len() == 64 && pin.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "Apple intermediate pin must be a SHA-256 digest"
+    );
+    let hash = step
+        .find("got=$(shasum -a 256")
+        .expect("digest calculation");
+    let compare = step
+        .find("if [ \"$got\" != \"$G2_SHA256\" ]; then")
+        .expect("digest comparison");
+    let failure = step[compare..]
+        .find("exit 1")
+        .expect("digest mismatch fails")
+        + compare;
+    let import = step
+        .find("security import \"$RUNNER_TEMP/DeveloperIDG2CA.cer\"")
+        .expect("intermediate import");
+    assert!(
+        hash < compare && compare < failure && failure < import,
+        "the intermediate must be hashed and rejected on mismatch before security import"
+    );
+}
+
+/// Scenario: Every third-party action executed beside the signing key is held
+/// for manual review by the final matching Renovate rule.
+#[test]
+fn desktop_sign_actions_are_held_for_manual_review() {
+    let config: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(repo_root().join("renovate.json")).expect("read renovate.json"),
+    )
+    .expect("parse renovate.json");
+    let rule = config["packageRules"]
+        .as_array()
+        .and_then(|rules| rules.last())
+        .expect("last Renovate package rule");
+    let contains = |field: &str, value: &str| {
+        rule[field]
+            .as_array()
+            .is_some_and(|values| values.iter().any(|item| item.as_str() == Some(value)))
+    };
+    assert!(
+        contains("matchManagers", "github-actions")
+            && contains("matchFileNames", ".github/workflows/release.yml")
+            && rule["automerge"] == false
+            && rule["groupName"].is_null()
+            && contains("labels", "manual-review"),
+        "the last Renovate rule must hold release workflow actions for manual review"
+    );
+    let all = jobs(&workflow());
+    let sign = job(&all, "desktop-sign");
+    let actions: Vec<&str> = sign
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("- uses: "))
+        .filter_map(|reference| reference.split_once('@').map(|(name, _)| name))
+        .collect();
+    assert!(!actions.is_empty(), "desktop-sign must name its actions");
+    for action in actions {
+        assert!(
+            contains("matchPackageNames", action),
+            "desktop-sign action {action} is missing from the manual-review rule"
+        );
+    }
+}
+
+/// The quarantine bypass and unsigned macOS wording belong only to an
+/// unsigned macOS artifact. The note must read the signing job's actual output.
+#[test]
+fn desktop_note_offers_quarantine_bypass_only_when_unsigned() {
+    let all = jobs(&workflow());
+    let sign = code(job(&all, "desktop-sign"));
+    let note = note_step(job(&all, "desktop-publish"));
+    assert!(
+        sign.contains("signed:"),
+        "`desktop-sign` must expose a `signed` job output"
+    );
+    assert!(
+        note.contains("SIGNED: ${{ needs.desktop-sign.outputs.signed }}"),
+        "the release-note step must read `needs.desktop-sign.outputs.signed` into `SIGNED`"
+    );
+    let condition = note.find("if [ \"$SIGNED\" = \"false\" ]; then").unwrap_or_else(|| {
+        panic!("the release-note step must open an unsigned-only branch with `if [ \"$SIGNED\" = \"false\" ]; then`")
+    });
+    let branch = note[condition..]
+        .split("\n          fi")
+        .next()
+        .unwrap_or_default();
+    assert!(
+        branch.contains("xattr -dr com.apple.quarantine") && branch.contains("unsigned"),
+        "the unsigned-only branch must contain both the quarantine workaround and unsigned macOS wording"
+    );
+}
+
+/// Replace one known line in the real workflow, failing if the workflow has
+/// changed enough that the mutation no longer represents the intended edit.
+fn replace_once(text: &str, from: &str, to: &str) -> String {
+    assert!(text.contains(from), "mutation target absent: {from}");
+    text.replacen(from, to, 1)
+}
+
+/// Scenario: Each signing guard rejects the specific unsafe workflow edit it
+/// protects against. A comment naming a secret remains harmless because it
+/// gives no job access to that secret.
+#[test]
+fn desktop_sign_guards_reject_unsafe_workflow_mutations() {
+    let original = workflow();
+    let xattr_line = original
+        .lines()
+        .find(|line| line.contains("xattr -dr com.apple.quarantine"))
+        .expect("unsigned note contains xattr");
+    let without_xattr = replace_once(&original, &format!("{xattr_line}\n"), "");
+    let xattr_outside = replace_once(
+        &without_xattr,
+        "            } >> \"$NOTE\"\n          fi\n",
+        &format!("            }} >> \"$NOTE\"\n          fi\n{xattr_line} >> \"$NOTE\"\n"),
+    );
+    let archive_line = original
+        .lines()
+        .find(|line| line.contains("ditto -c -k --sequesterRsrc --keepParent"))
+        .expect("macOS app archive command");
+    let all = jobs(&original);
+    let sign = job(&all, "desktop-sign");
+    let validator = named_step(sign, "Validate the app archive before extracting it");
+
+    let cases = [
+        (
+            "secret in desktop-bundle",
+            replace_once(
+                &original,
+                "  desktop-bundle:\n",
+                "  desktop-bundle:\n    env:\n      APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}\n",
+            ),
+            Some("apple_signing_secrets_are_named_only_in_desktop_sign"),
+        ),
+        (
+            "secret name in a bundle comment",
+            replace_once(
+                &original,
+                "  desktop-bundle:\n",
+                "  desktop-bundle:\n    # APPLE_CERTIFICATE stays in desktop-sign only.\n",
+            ),
+            None,
+        ),
+        (
+            "checkout in desktop-sign",
+            replace_once(
+                &original,
+                "  desktop-sign:\n",
+                "  desktop-sign:\n    steps:\n      - uses: actions/checkout@pinned\n",
+            ),
+            Some("desktop_sign_does_not_check_out_repository_code"),
+        ),
+        (
+            "missing signing environment",
+            replace_once(&original, "    environment: desktop-signing\n", ""),
+            Some("desktop_sign_declares_the_signing_environment"),
+        ),
+        (
+            "publisher does not need signer",
+            replace_once(
+                &original,
+                "    needs: [prepare, finalize, desktop-bundle, desktop-sign]",
+                "    needs: [prepare, finalize, desktop-bundle]",
+            ),
+            Some("desktop_sign_is_between_bundle_and_publish_off_the_cli_path"),
+        ),
+        (
+            "finalize needs signer",
+            replace_once(
+                &original,
+                "    needs: [prepare, build]",
+                "    needs: [prepare, build, desktop-sign]",
+            ),
+            Some("desktop_sign_is_between_bundle_and_publish_off_the_cli_path"),
+        ),
+        (
+            "missing hardened runtime",
+            original.replace("--options runtime", ""),
+            Some("desktop_codesign_uses_runtime_and_jit_entitlements"),
+        ),
+        (
+            "missing JIT entitlement",
+            original.replace(
+                "com.apple.security.cs.allow-jit",
+                "com.apple.security.cs.no-jit",
+            ),
+            Some("desktop_codesign_uses_runtime_and_jit_entitlements"),
+        ),
+        (
+            "raw app artifact",
+            replace_once(
+                &original,
+                archive_line,
+                "          cp -R \"$APP\" dist-desktop-app/Agent-Deck.app",
+            ),
+            Some("desktop_app_crosses_the_artifact_boundary_in_a_ditto_archive"),
+        ),
+        (
+            "missing one-day certificate check",
+            replace_once(&original, "-checkend 86400", ""),
+            Some("desktop_sign_checks_certificate_expiry"),
+        ),
+        (
+            "missing thirty-day certificate check",
+            replace_once(&original, "-checkend 2592000", ""),
+            Some("desktop_sign_checks_certificate_expiry"),
+        ),
+        (
+            "missing archive validator",
+            replace_once(&original, validator, ""),
+            Some("desktop_sign_validates_archive_before_unpacking"),
+        ),
+        (
+            "redirect protocol unrestricted",
+            replace_once(
+                &original,
+                "--proto-redir '=https' -fsSL --retry 3",
+                "-fsSL --retry 3",
+            ),
+            Some("desktop_sign_pins_apple_intermediate_before_import"),
+        ),
+        (
+            "missing intermediate digest comparison",
+            replace_once(
+                &original,
+                "if [ \"$got\" != \"$G2_SHA256\" ]; then",
+                "if false; then",
+            ),
+            Some("desktop_sign_pins_apple_intermediate_before_import"),
+        ),
+        (
+            "new unreviewed signing action",
+            replace_once(
+                &original,
+                "  desktop-sign:\n",
+                "  desktop-sign:\n    steps:\n      - uses: actions/cache@pinned\n",
+            ),
+            Some("desktop_sign_actions_are_held_for_manual_review"),
+        ),
+        (
+            "quarantine workaround outside unsigned branch",
+            xattr_outside,
+            Some("desktop_note_offers_quarantine_bypass_only_when_unsigned"),
+        ),
+    ];
+
+    let guards: [(&str, fn()); 11] = [
+        (
+            "desktop_sign_is_between_bundle_and_publish_off_the_cli_path",
+            desktop_sign_is_between_bundle_and_publish_off_the_cli_path,
+        ),
+        (
+            "desktop_sign_does_not_check_out_repository_code",
+            desktop_sign_does_not_check_out_repository_code,
+        ),
+        (
+            "apple_signing_secrets_are_named_only_in_desktop_sign",
+            apple_signing_secrets_are_named_only_in_desktop_sign,
+        ),
+        (
+            "desktop_sign_declares_the_signing_environment",
+            desktop_sign_declares_the_signing_environment,
+        ),
+        (
+            "desktop_app_crosses_the_artifact_boundary_in_a_ditto_archive",
+            desktop_app_crosses_the_artifact_boundary_in_a_ditto_archive,
+        ),
+        (
+            "desktop_codesign_uses_runtime_and_jit_entitlements",
+            desktop_codesign_uses_runtime_and_jit_entitlements,
+        ),
+        (
+            "desktop_sign_checks_certificate_expiry",
+            desktop_sign_checks_certificate_expiry,
+        ),
+        (
+            "desktop_note_offers_quarantine_bypass_only_when_unsigned",
+            desktop_note_offers_quarantine_bypass_only_when_unsigned,
+        ),
+        (
+            "desktop_sign_validates_archive_before_unpacking",
+            desktop_sign_validates_archive_before_unpacking,
+        ),
+        (
+            "desktop_sign_pins_apple_intermediate_before_import",
+            desktop_sign_pins_apple_intermediate_before_import,
+        ),
+        (
+            "desktop_sign_actions_are_held_for_manual_review",
+            desktop_sign_actions_are_held_for_manual_review,
+        ),
+    ];
+    for (label, mutated, expected) in cases {
+        WORKFLOW_OVERRIDE.with(|slot| *slot.borrow_mut() = Some(mutated));
+        let failed: Vec<&str> = guards
+            .iter()
+            .filter_map(|(name, guard)| std::panic::catch_unwind(guard).is_err().then_some(*name))
+            .collect();
+        WORKFLOW_OVERRIDE.with(|slot| *slot.borrow_mut() = None);
+        let mut expected = expected.into_iter().collect::<Vec<_>>();
+        if label == "checkout in desktop-sign" {
+            expected.push("desktop_sign_actions_are_held_for_manual_review");
+        }
+        assert_eq!(failed, expected, "{label}");
+    }
+}
+
+/// Return the complete named step, including its run block, from a job.
+fn named_step<'a>(block: &'a str, name: &str) -> &'a str {
+    let header = format!("      - name: {name}\n");
+    let start = block
+        .find(&header)
+        .unwrap_or_else(|| panic!("missing step: {name}"));
+    let rest = &block[start + header.len()..];
+    let end = rest
+        .find("\n      - ")
+        .map_or(block.len(), |pos| start + header.len() + pos + 1);
+    &block[start..end]
+}
+
+/// Lift an actual shell body out of the workflow so runtime tests cannot
+/// pass against a copy that differs from the release step.
+// These runtime fixtures execute macOS Bash steps with a Unix-only PATH.
+// Windows can find the unusable WSL bash stub, so keep the fixtures on Unix.
+#[cfg(unix)]
+fn step_script(name: &str) -> String {
+    let all = jobs(&workflow());
+    let sign = job(&all, "desktop-sign");
+    let step = named_step(sign, name);
+    let mut lines = step.lines();
+    let run = lines
+        .find(|line| line.trim() == "run: |")
+        .unwrap_or_else(|| panic!("{name} has no run block"));
+    let indent = run.len() - run.trim_start().len();
+    lines
+        .take_while(|line| line.trim().is_empty() || line.len() - line.trim_start().len() > indent)
+        .map(|line| {
+            line.strip_prefix(" ".repeat(indent + 2).as_str())
+                .unwrap_or(line)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[cfg(unix)]
+fn signing_classifier_script() -> String {
+    let script = step_script("Classify the signing credentials");
+    assert!(script.contains("mode=signed") && script.contains("mode=unsigned"));
+    script
+}
+
+/// Scenario: The release workflow's credential classifier chooses unsigned
+/// only when all five values are absent and signed only when all are present.
+/// Partial and empty credentials fail without printing values or executing a
+/// shell command embedded in a value.
+#[cfg(unix)]
+#[test]
+fn desktop_sign_classifier_handles_real_shell_inputs() {
+    use std::process::Command;
+    if Command::new("bash").arg("--version").output().is_err() {
+        println!("SKIP: bash is unavailable");
+        return;
+    }
+    let script = signing_classifier_script();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let output_path = dir.path().join("github-output");
+    let names = [
+        "APPLE_CERTIFICATE",
+        "APPLE_CERTIFICATE_PASSWORD",
+        "APPLE_API_KEY",
+        "APPLE_API_ISSUER",
+        "APPLE_API_KEY_PATH",
+    ];
+    let values = [
+        "certificate-marker-48c1",
+        "password-marker-c88a",
+        "api-key-marker-750f",
+        "issuer-marker-e344",
+        "api-path-marker-a059",
+    ];
+    let run = |provided: &[(&str, &str)]| {
+        let _ = fs::remove_file(&output_path);
+        let mut cmd = Command::new("bash");
+        cmd.arg("-c")
+            .arg(&script)
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("GITHUB_OUTPUT", &output_path);
+        for &(name, value) in provided {
+            cmd.env(name, value);
+        }
+        let result = cmd.output().expect("run classifier with bash");
+        let written = fs::read_to_string(&output_path).unwrap_or_default();
+        let log = format!(
+            "{}{}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+        (result.status, written, log)
+    };
+
+    let (status, written, _) = run(&[]);
+    assert!(status.success(), "all absent should choose unsigned");
+    assert_eq!(written, "mode=unsigned\n");
+
+    let all = names.into_iter().zip(values).collect::<Vec<_>>();
+    let (status, written, _) = run(&all);
+    assert!(status.success(), "all present should choose signed");
+    assert_eq!(written, "mode=signed\n");
+
+    for (missing, name) in names.iter().enumerate() {
+        let partial = all
+            .iter()
+            .enumerate()
+            .filter_map(|(index, pair)| (index != missing).then_some(*pair))
+            .collect::<Vec<_>>();
+        let (status, written, log) = run(&partial);
+        assert!(!status.success(), "missing {name} should fail");
+        assert!(written.is_empty(), "partial input must not select a mode");
+        for value in values {
+            assert!(
+                !log.contains(value) && !written.contains(value),
+                "the error for missing {} exposed a credential value",
+                name
+            );
+        }
+    }
+
+    let mut empty = all.clone();
+    empty[0].1 = "";
+    let (status, written, log) = run(&empty);
+    assert!(!status.success(), "a set-but-empty value should fail");
+    assert!(
+        written.is_empty(),
+        "empty credential must not select a mode"
+    );
+    for value in values {
+        assert!(
+            !log.contains(value),
+            "empty-value error exposed a credential value"
+        );
+    }
+
+    let marker = dir.path().join("unexpected-command-execution");
+    let injection = format!("$(touch {})", marker.display());
+    let mut injected = all.clone();
+    injected[0].1 = &injection;
+    let (status, written, _) = run(&injected);
+    assert!(
+        status.success(),
+        "a nonempty literal value should count as present"
+    );
+    assert_eq!(written, "mode=signed\n");
+    assert!(
+        !marker.exists(),
+        "classifier executed a command inside a value"
+    );
+}
+
+/// Scenario: The release workflow's real archive validator accepts ordinary,
+/// framework-style and AppleDouble app zips. It rejects metadata for another
+/// app, disguised AppleDouble directories, symlinks inside metadata, and unsafe paths, links, modes or archives.
+#[cfg(unix)]
+#[test]
+fn desktop_sign_archive_validator_handles_real_zip_inputs() {
+    use std::process::Command;
+    for tool in ["bash", "python3"] {
+        if Command::new(tool).arg("--version").output().is_err() {
+            println!("SKIP: {tool} is unavailable");
+            return;
+        }
+    }
+    let script = step_script("Validate the app archive before extracting it");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let make_zips = r#"
+import pathlib, stat, sys, zipfile
+root = pathlib.Path(sys.argv[1])
+app = 'Agent Deck.app/'
+base = app + 'Contents/'
+
+def add(z, name, data=b'', mode=None):
+    info = zipfile.ZipInfo(name)
+    info.create_system = 3
+    if mode is not None:
+        info.external_attr = mode << 16
+    z.writestr(info, data)
+
+def zip_case(name, extra):
+    with zipfile.ZipFile(root / (name + '.zip'), 'w') as z:
+        add(z, base + 'MacOS/Agent Deck', b'bin', stat.S_IFREG | 0o755)
+        extra(z)
+
+zip_case('benign', lambda z: None)
+def framework(z):
+    prefix = base + 'Frameworks/Widget.framework/Versions/'
+    add(z, prefix + 'A/Widget', b'framework', stat.S_IFREG | 0o644)
+    add(z, prefix + 'Current', b'A', stat.S_IFLNK | 0o777)
+    add(z, base + 'Frameworks/Widget.framework/Widget', b'Versions/Current/Widget', stat.S_IFLNK | 0o777)
+zip_case('framework', framework)
+zip_case('appledouble-nested', lambda z: add(z, '__MACOSX/Agent Deck.app/Contents/._Info.plist', b'metadata'))
+zip_case('appledouble-app-root', lambda z: add(z, '__MACOSX/._Agent Deck.app', b'metadata'))
+zip_case('appledouble-app-root-dir', lambda z: add(z, '__MACOSX/._Agent Deck.app/', mode=stat.S_IFDIR | 0o755))
+zip_case('appledouble-app-root-child', lambda z: add(z, '__MACOSX/._Agent Deck.app/x', b'x'))
+zip_case('appledouble-other-root', lambda z: add(z, '__MACOSX/._Other.app', b'metadata'))
+zip_case('macosx-other-app', lambda z: add(z, '__MACOSX/Other.app/x', b'x'))
+zip_case('macosx-symlink', lambda z: add(z, '__MACOSX/Agent Deck.app/Contents/._Alias', b'Info.plist', stat.S_IFLNK | 0o777))
+zip_case('dotdot', lambda z: add(z, app + '../escape', b'x'))
+zip_case('absolute', lambda z: add(z, '/etc/x', b'x'))
+zip_case('second-top', lambda z: add(z, 'Other.app/Contents/x', b'x'))
+zip_case('absolute-link', lambda z: add(z, base + 'bad-link', b'/etc', stat.S_IFLNK | 0o777))
+def escaping_chain(z):
+    add(z, base + 'first', b'second', stat.S_IFLNK | 0o777)
+    add(z, base + 'second', b'../../../outside', stat.S_IFLNK | 0o777)
+zip_case('escaping-chain', escaping_chain)
+def beneath_link(z):
+    add(z, base + 'pivot', b'MacOS', stat.S_IFLNK | 0o777)
+    add(z, base + 'pivot/evil', b'x')
+zip_case('beneath-link', beneath_link)
+def duplicate(z):
+    add(z, base + 'Readme', b'a')
+    add(z, base + 'README', b'b')
+zip_case('casefold-duplicate', duplicate)
+zip_case('fifo', lambda z: add(z, base + 'pipe', b'', stat.S_IFIFO | 0o644))
+(root / 'nonzip.zip').write_bytes(b'not a zip file')
+"#;
+    let generated = Command::new("python3")
+        .arg("-c")
+        .arg(make_zips)
+        .arg(dir.path())
+        .output()
+        .expect("generate zip fixtures");
+    assert!(
+        generated.status.success(),
+        "zip fixture generation failed: {}",
+        String::from_utf8_lossy(&generated.stderr)
+    );
+
+    let cases = [
+        ("benign", true),
+        ("framework", true),
+        ("appledouble-nested", true),
+        ("appledouble-app-root", true),
+        ("appledouble-app-root-dir", false),
+        ("appledouble-app-root-child", false),
+        ("appledouble-other-root", false),
+        ("macosx-other-app", false),
+        ("macosx-symlink", false),
+        ("dotdot", false),
+        ("absolute", false),
+        ("second-top", false),
+        ("absolute-link", false),
+        ("escaping-chain", false),
+        ("beneath-link", false),
+        ("casefold-duplicate", false),
+        ("fifo", false),
+        ("nonzip", false),
+    ];
+    for (name, accepted) in cases {
+        let result = Command::new("bash")
+            .arg("-c")
+            .arg(&script)
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("APP_ARCHIVE", dir.path().join(format!("{name}.zip")))
+            .output()
+            .expect("run archive validator");
+        let log = format!(
+            "{}{}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert_eq!(
+            result.status.success(),
+            accepted,
+            "{name}: unexpected exit status {:?}; log:\n{log}",
+            result.status.code()
+        );
+        let marker = if accepted {
+            "app archive OK:"
+        } else {
+            "::error::"
+        };
+        assert!(
+            log.contains(marker),
+            "{name}: missing {marker:?}; log:\n{log}"
+        );
+    }
 }
 
 #[test]
