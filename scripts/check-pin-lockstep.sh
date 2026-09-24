@@ -292,11 +292,16 @@ scan_workflow_pnpm() {
           v = substr(v, 2, length(v) - 2)
         return v
       }
-      { line[NR] = $0 }
+      # Each line is kept with any TRAILING comment removed — YAML starts one at
+      # a `#` preceded by whitespace — so `run_install: false # was version: 12`
+      # is not read as a `version:` input. Indentation is unaffected.
+      { l = $0; sub(/[[:space:]]#.*$/, "", l); line[NR] = l }
       END {
         for (i = 1; i <= NR; i++) {
           if (is_comment(line[i])) continue
-          if (line[i] !~ /uses:[[:space:]]*pnpm\/action-setup@/) continue
+          # An optional quote before the action: Renovate YAML-parses `uses:`
+          # too, so `uses: "pnpm/action-setup@…"` is the same tracked step.
+          if (line[i] !~ /uses:[[:space:]]*["\047]?pnpm\/action-setup@/) continue
 
           # The `- ` that opens this step: this line, or the nearest one above
           # it indented LESS than this `uses:` key.

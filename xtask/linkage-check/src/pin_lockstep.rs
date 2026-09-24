@@ -1120,3 +1120,62 @@ fn devbox_without_pnpm_fails() {
         "the failure must name the missing package:\n{text}"
     );
 }
+
+/// Raised by Qodo on #1284. Renovate YAML-parses `uses:` as it does `version:`,
+/// so a quoted `uses: "pnpm/action-setup@…"` is the same tracked step. The
+/// scanner used to match only the bare spelling, so a quoted site that drifted
+/// was silently dropped and the class compared the survivors.
+#[test]
+fn a_quoted_pnpm_action_reference_is_still_a_site() {
+    if !bash_present() {
+        eprintln!("SKIP: needs `bash` on PATH");
+        return;
+    }
+    let body = "jobs:\n  desktop-web:\n    steps:\n      \
+                - uses: \"pnpm/action-setup@v6\"\n        \
+                with:\n          \
+                version: 11.21.0\n";
+    let out = Fixture::new(
+        &good_packages(),
+        &[
+            ("ci.yml", workflow("1.97.1", "0.9.143")),
+            ("desktop.yml", pnpm_workflow("version: 11.22.0")),
+            ("release.yml", body.to_string()),
+        ],
+    )
+    .run();
+    let text = combined(&out);
+    assert!(
+        !out.status.success() && text.contains("release.yml:6 11.21.0"),
+        "the drifted pin behind a quoted `uses:` must be read and reported:\n{text}"
+    );
+}
+
+/// Raised by Qodo on #1284. A trailing comment that mentions `version:` is not
+/// an input, and reading it as one failed the guard on a file whose pin is
+/// fine — the false positive that makes a guard the problem.
+#[test]
+fn a_version_in_a_trailing_comment_is_not_a_pnpm_pin() {
+    if !bash_present() {
+        eprintln!("SKIP: needs `bash` on PATH");
+        return;
+    }
+    let out = Fixture::new(
+        &good_packages(),
+        &[
+            ("ci.yml", workflow("1.97.1", "0.9.143")),
+            (
+                "desktop.yml",
+                pnpm_workflow(
+                    "run_install: false # was version: 12\n          version: 11.22.0 # exact",
+                ),
+            ),
+        ],
+    )
+    .run();
+    assert!(
+        out.status.success(),
+        "a `version:` inside a trailing comment must not be read as a pin:\n{}",
+        combined(&out)
+    );
+}
