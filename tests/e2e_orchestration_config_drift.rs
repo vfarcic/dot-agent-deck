@@ -129,19 +129,13 @@ fn detach_quit(deck: &mut TuiDeck) {
     );
 }
 
-/// Scenario: Seed a warm daemon with a two-role `review-team` orchestration,
-/// then attach the real TUI three times. With a config that still lists it, the
-/// tab reattaches with no drift marker and nothing about drift is printed on
-/// exit (the control). After renaming the orchestration in
-/// `.dot-agent-deck.toml`, the reattached tab is labelled
-/// `review-team [config drift]`, the status line explains the marker, and the
-/// detach-quit prints a warning naming the orchestration, its directory and the
-/// roles it is running. After instead renaming a role (`coder` → `qa`), the tab
-/// is marked again and the exit warning names both role lists. With a file that
-/// does not parse, the tab is marked and the exit warning names the file as
-/// unloadable. With the file
-/// deleted — the branch a remote reconnect takes — the tab reattaches unmarked
-/// and nothing about drift is printed.
+/// Scenario: Seed a warm daemon with a two-role `review-team` orchestration, then
+/// attach the real TUI after each of five edits to `.dot-agent-deck.toml`:
+/// unchanged, orchestration renamed, role renamed, malformed TOML, file deleted.
+/// Each drifted attach must mark the tab `! review-team [config drift]` and
+/// print an exit warning naming the drift (the rename also shows the status
+/// line), while the unchanged and deleted-file attaches show no marker and print
+/// nothing about drift.
 #[spec("session/restore/020")]
 #[test]
 fn restore_020_reattach_surfaces_orchestration_config_drift() {

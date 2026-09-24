@@ -3294,7 +3294,10 @@ pub fn orchestration_config_drift_warning(
         .iter()
         .map(|s| {
             if s.role_name.is_empty() {
-                format!("role-{}", s.role_index)
+                // Not `role-{i}`, the synthesised card label: this list is
+                // presented as the names the daemon routes by, and a daemon
+                // that echoed none has no name to route by (Qodo on #1281).
+                format!("<unnamed role at slot {}>", s.role_index)
             } else {
                 s.role_name.clone()
             }
@@ -3358,6 +3361,44 @@ pub fn orchestration_config_drift_warning(
          ({running}) that no longer match {file} ({configured}); {placement}. {consequence}",
         file = crate::project_config::CONFIG_FILE_NAME,
         running = running.join(", "),
+        configured = configured.join(", "),
+    ))
+}
+
+/// Issue #554 (Qodo on PR #1281): the drift check for a role surfaced into an
+/// orchestration tab that is ALREADY open. A live surface carries only the
+/// newly spawned role, so [`orchestration_config_drift_warning`] run on it sees
+/// one matching role and cannot notice that a role already on the tab was since
+/// renamed or removed in the file. This compares the tab's own role names — the
+/// ones it was built with — against the file's, and reports any the file no
+/// longer lists.
+///
+/// A name check rather than an index check on purpose: inserting a role
+/// mid-list and spawning it into the running orchestration is a supported
+/// workflow (issue #1096) that shifts every later index while leaving every
+/// existing name routable, and it must not read as drift.
+pub fn grown_orchestration_tab_drift_warning(
+    tab_role_names: &[&str],
+    local: &crate::project_config::OrchestrationConfig,
+    name: &str,
+    cwd: &str,
+) -> Option<String> {
+    let configured: Vec<&str> = local.roles.iter().map(|r| r.name.as_str()).collect();
+    let missing: Vec<&str> = tab_role_names
+        .iter()
+        .copied()
+        .filter(|role| !configured.contains(role))
+        .collect();
+    if missing.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "Warning: config drift — the open tab of orchestration '{name}' in {cwd} shows roles \
+         ({missing}) that {file} no longer lists ({configured}). `dot-agent-deck delegate` still \
+         routes to those panes by the role names they were started with; restart the \
+         orchestration to pick up the file's roles.",
+        file = crate::project_config::CONFIG_FILE_NAME,
+        missing = missing.join(", "),
         configured = configured.join(", "),
     ))
 }
@@ -5463,7 +5504,7 @@ fn surface_one_orchestration(
         Ok(Some(_)) => LocalOrchestrationConfig::Loaded(local.as_ref()),
     };
     let drift_warning = orchestration_config_drift_warning(lookup, &bucket);
-    let orch_config = resolve_orch_config_for_hydration(local, &bucket);
+    let orch_config = resolve_orch_config_for_hydration(local.clone(), &bucket);
 
     // Issue #868: the `already_built` guard above only catches a duplicate
     // re-broadcast of an EXISTING tab's own roles — it's always false for
@@ -5481,6 +5522,22 @@ fn surface_one_orchestration(
         &surface.name,
         surface.orchestration_id.as_deref(),
     ) {
+        // Issue #554: the surface's own bucket holds only the new role, so also
+        // check the roles the tab already shows — read BEFORE the growth below
+        // rewrites the tab's config with the file's role list.
+        let drift_warning = drift_warning.or_else(|| {
+            let (Ok(Some(_)), Some(local)) = (&project_config, local.as_ref()) else {
+                return None;
+            };
+            let Some(Tab::Orchestration {
+                config: tab_config, ..
+            }) = tab_manager.tabs().get(existing_tab_index)
+            else {
+                return None;
+            };
+            let tab_roles: Vec<&str> = tab_config.roles.iter().map(|r| r.name.as_str()).collect();
+            grown_orchestration_tab_drift_warning(&tab_roles, local, &surface.name, &surface.cwd)
+        });
         // Whether anything actually grew, so the "grew existing tab" info
         // log below only fires when it's true — it would otherwise fire
         // unconditionally even when every role in this surface failed to
@@ -42060,6 +42117,58 @@ mod config_drift_tests {
                 "warning must contain {needle:?}: {warning}"
             );
         }
+    }
+
+    /// Qodo on PR #1281: a daemon older than PRD #111 echoes no role name, and
+    /// the warning must not present the synthesised `role-{i}` card label as a
+    /// name the daemon routes by.
+    #[test]
+    fn drift_warning_does_not_invent_names_for_unnamed_slots() {
+        let b = bucket("review", &[(0, ""), (1, "coder")]);
+        let warning = orchestration_config_drift_warning(
+            LocalOrchestrationConfig::Unreadable("parse error"),
+            &b,
+        )
+        .expect("drift");
+        assert!(
+            warning.contains("(<unnamed role at slot 0>, coder)"),
+            "{warning}"
+        );
+        assert!(!warning.contains("role-0"), "{warning}");
+    }
+
+    /// Qodo on PR #1281: a role renamed in the file while its tab is open is
+    /// caught when another role is later spawned into that tab.
+    #[test]
+    fn grown_tab_drift_names_tab_roles_the_file_no_longer_lists() {
+        let local = config("review", &["lead", "qa", "tester"]);
+        let warning = grown_orchestration_tab_drift_warning(
+            &["lead", "coder"],
+            &local,
+            "review",
+            "/work/proj",
+        )
+        .expect("a tab role the file no longer lists is drift");
+        assert!(
+            warning.contains("(coder)") && warning.contains("(lead, qa, tester)"),
+            "{warning}"
+        );
+        assert!(
+            warning.contains("'review'") && warning.contains("/work/proj"),
+            "{warning}"
+        );
+    }
+
+    /// Issue #1096's supported workflow — insert a role mid-list and spawn it
+    /// into the running orchestration — shifts indices but renames nothing, and
+    /// must not read as drift.
+    #[test]
+    fn grown_tab_drift_is_silent_for_a_role_inserted_mid_list() {
+        let local = config("review", &["lead", "reviewer", "coder"]);
+        assert_eq!(
+            grown_orchestration_tab_drift_warning(&["lead", "coder"], &local, "review", "/w"),
+            None
+        );
     }
 
     /// The control: a file that lists the orchestration with the same role
