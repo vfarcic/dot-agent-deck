@@ -65,7 +65,7 @@ fn run_py(body: &str) -> Output {
         \x20    DENY_PATHS, already_reviewed_at, already_noticed_at, NO_VOTE_MARKER,\n\
         \x20    concat_json_documents, bot_rejection_is_stale,\n\
         \x20    classify_check_runs, FALLBACK_REQUIRED_CONTEXTS,\n\
-        \x20    focus_pass_requested)\n\
+        \x20    focus_pass_requested, coverage_gap)\n\
          REQ = ('build', 'build-macos', 'build-windows', 'security', 'e2e-deterministic')\n\
          def crun(name, conclusion='success', status='completed', started_at=None, run_id=None):\n\
         \x20   return {{'name': name, 'status': status, 'conclusion': conclusion,\n\
@@ -932,4 +932,56 @@ fn a_truthy_looking_value_is_not_consent() {
             "assert not focus_pass_requested({value:?}, '1235'), {value:?}"
         ));
     }
+}
+
+/// Issue #1266, Qodo's finding on PR #1268: with focused passes an `APPROVE`
+/// can rest on coverage accumulated across SEVERAL verdicts, so the union is
+/// verified HERE rather than trusted to the agent's arithmetic.
+///
+/// Before focused passes this check would have been redundant — `APPROVE` was a
+/// claim about the agent's own reading, and the agent/vote split deliberately
+/// bounds a diff that talks it into approving. A union is a claim about OTHER
+/// comments and is mechanically checkable, so it is checked.
+#[test]
+fn a_complete_union_leaves_no_gap() {
+    assert_py_ok(
+        "assert coverage_gap([{'covered_paths': ['a.rs', 'b.rs']}, \
+         {'covered_paths': ['c.rs']}], ['a.rs', 'b.rs', 'c.rs']) == []",
+    );
+}
+
+/// The whole point: a changed file no verdict claims is an approval of code
+/// nobody read, and the vote job refuses on exactly this list.
+#[test]
+fn an_uncovered_file_is_reported() {
+    assert_py_ok(
+        "assert coverage_gap([{'covered_paths': ['a.rs']}], ['a.rs', 'unread.rs']) \
+         == ['unread.rs']",
+    );
+}
+
+/// A verdict with no `covered_paths` contributes NOTHING rather than an assumed
+/// everything. Every verdict written before this field existed is that case, so
+/// reading absence as full coverage would approve old PRs sight unseen.
+#[test]
+fn a_verdict_without_covered_paths_covers_nothing() {
+    assert_py_ok("assert coverage_gap([{}], ['a.rs']) == ['a.rs']");
+    assert_py_ok("assert coverage_gap([{'covered_paths': None}], ['a.rs']) == ['a.rs']");
+}
+
+/// Malformed entries cannot smuggle coverage in: a non-list, or a list holding
+/// non-strings, contributes only what is genuinely a path.
+#[test]
+fn malformed_coverage_entries_contribute_nothing() {
+    assert_py_ok("assert coverage_gap([{'covered_paths': 'a.rs'}], ['a.rs']) == ['a.rs']");
+    assert_py_ok(
+        "assert coverage_gap([{'covered_paths': [None, 7, 'a.rs']}], ['a.rs', 'b.rs']) \
+         == ['b.rs']",
+    );
+}
+
+/// No verdicts at all — the state every pull request starts in — covers nothing.
+#[test]
+fn no_verdicts_cover_nothing() {
+    assert_py_ok("assert coverage_gap([], ['a.rs', 'b.rs']) == ['a.rs', 'b.rs']");
 }

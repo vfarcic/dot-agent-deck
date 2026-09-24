@@ -436,6 +436,73 @@ def parse_verdict(body):
     return data
 
 
+def trusted_verdicts_at(repo, pr_number, sha):
+    """Every trusted `pr-review/v1` verdict written for exactly this head SHA.
+
+    `latest_verdict` answers "what is the current verdict"; this answers "what
+    has been covered so far", which needs all of them, because a focused pass
+    accumulates coverage across runs (issue #1266).
+
+    Same trust filter, same reason. A malformed block from the trusted author
+    still raises, exactly as it does there: a broken reviewer must be loud.
+    """
+    comments = gh_json_paginated(
+        "api", f"repos/{repo}/issues/{pr_number}/comments", "--paginate",
+        "--jq", "[.[] | {id, body, created_at, user: {login: .user.login}}]",
+    )
+    out = []
+    for comment in comments:
+        if not _is_trusted_verdict_comment(comment):
+            continue
+        verdict = parse_verdict(comment.get("body"))
+        if verdict is not None and verdict.get("head_sha") == sha:
+            out.append(verdict)
+    return out
+
+
+def pr_changed_paths(repo, number):
+    """Every file the pull request touches, as repo-relative paths."""
+    # Paginated for the same reason `touches_denied` is: past 100 files
+    # `gh --paginate` emits one JSON document per page and a single json.loads
+    # raises -- here that would take down the vote rather than one file.
+    return gh_json_paginated(
+        "api", f"repos/{repo}/pulls/{number}/files", "--paginate",
+        "--jq", "[.[].filename]",
+    )
+
+
+def coverage_gap(verdicts, changed_paths):
+    """Issue #1266: changed files no TRUSTED verdict claims to have deep-read.
+
+    Empty means the union covers the diff. Anything in it is a file the union
+    does not reach, and an `APPROVE` resting on that union is therefore an
+    approval of code nobody read.
+
+    This exists because the union rule would otherwise live only in the agent's
+    prompt (Qodo's finding on PR #1268). Before focused passes, `APPROVE` was a
+    claim about the agent's OWN reading, and the agent/vote split bounded the
+    damage to "a diff that talks the agent into approving is approved". A union
+    is different in kind: it is a claim about OTHER comments, and it is
+    mechanically checkable from here — so checking it costs one comparison and
+    removes a whole class of unearned approval, including the agent simply
+    miscounting.
+
+    `verdicts` must already be filtered to trusted comments. That filter is
+    `_is_trusted_verdict_comment`, and it is not "the bot posted it": every
+    Actions workflow shares that login, so it also requires this workflow's
+    provenance marker and id (Greptile's finding on the same PR). A verdict with
+    no `covered_paths`, or a malformed one, contributes NOTHING rather than an
+    assumed everything.
+    """
+    covered = set()
+    for verdict in verdicts:
+        paths = verdict.get("covered_paths")
+        if not isinstance(paths, list):
+            continue
+        covered.update(p for p in paths if isinstance(p, str))
+    return sorted(set(changed_paths) - covered)
+
+
 def focus_pass_requested(flag, only_pr):
     """Issue #1266: is this a FOCUSED follow-up pass over one head?
 
