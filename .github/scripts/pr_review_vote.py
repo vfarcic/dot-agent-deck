@@ -55,6 +55,7 @@ from pr_review_common import (  # noqa: E402
     gh_ok,
     coverage_gap,
     independent_review_at,
+    NO_INDEPENDENT_REVIEW_MARKER,
     latest_verdict,
     pr_changed_paths,
     pr_review_comments,
@@ -339,7 +340,12 @@ def main():
             pr_reviews(repo, pr_number),
         )
         if reviewer is None:
-            if already_noticed_at(pr_comments(repo, pr_number), expected_sha, app_login):
+            if already_noticed_at(
+                pr_comments(repo, pr_number),
+                expected_sha,
+                app_login,
+                NO_INDEPENDENT_REVIEW_MARKER,
+            ):
                 print(
                     f"#{pr_number}: no independent review at {expected_sha[:8]}, already "
                     "said so; not repeating it."
@@ -362,8 +368,11 @@ def main():
         # accumulated coverage, which since #1270 means a focused pass and
         # nothing else. The ordinary gate never asserts it read the diff, so
         # demanding full coverage of it would refuse every approval.
-        # `covered_paths` IS the claim; its absence means none was made.
-        if verdict.get("covered_paths"):
+        # `covered_paths` IS the claim, and its PRESENCE is what makes it --
+        # keyed on the key, not its truthiness, because `covered_paths: []` is a
+        # focused pass claiming it covered nothing, which must fail the union
+        # check rather than skip it (Greptile and Qodo on PR #1271).
+        if "covered_paths" in verdict:
             gap = coverage_gap(
                 trusted_verdicts_at(repo, pr_number, expected_sha),
                 pr_changed_paths(repo, pr_number),

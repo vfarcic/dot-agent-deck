@@ -505,6 +505,11 @@ def independent_review_at(sha, comments, review_comments, reviews):
         return None
     for review in reviews or ():
         login = ((review.get("user") or {}).get("login")) or ""
+        # A PENDING review is a draft its author has not submitted. `pr_reviews`
+        # already carries the state, and counting an unsubmitted one would let
+        # unfinished evidence unlock an approval (Qodo on PR #1271).
+        if review.get("state") == "PENDING":
+            continue
         if login in INDEPENDENT_REVIEWERS and review.get("commit_id") == sha:
             return login
     for comment in review_comments or ():
@@ -600,6 +605,10 @@ def latest_verdict(repo, pr_number):
 # THIS HEAD, which is the whole question `already_noticed_at` answers.
 NO_VOTE_MARKER = "**No vote cast**"
 
+# Per-reason discriminator, so one no-vote notice cannot suppress another at
+# the same head (issue #1270; found by Qodo and Greptile on PR #1271).
+NO_INDEPENDENT_REVIEW_MARKER = "No independent review covers this head"
+
 
 def already_reviewed_at(reviews, sha, app_login):
     """True when `app_login` has already cast a review on this exact head.
@@ -633,7 +642,7 @@ def already_reviewed_at(reviews, sha, app_login):
     )
 
 
-def already_noticed_at(comments, sha, app_login):
+def already_noticed_at(comments, sha, app_login, reason_marker=None):
     """True when `app_login` has already posted a no-vote notice for this head.
 
     The comment-only outcomes re-posted on the same cadence and for the same
@@ -656,6 +665,13 @@ def already_noticed_at(comments, sha, app_login):
         (comment.get("user") or {}).get("login") == app_login
         and NO_VOTE_MARKER in (comment.get("body") or "")
         and short in (comment.get("body") or "")
+        # `reason_marker` keys the notice by WHY no vote was cast. Without it two
+        # different reasons at one head collide: #1270's no-independent-review
+        # notice would suppress the armed-auto-merge warning that tells the
+        # maintainer to disarm, or an INSUFFICIENT notice, leaving a stale
+        # explanation in place (Qodo and Greptile on PR #1271). Callers with one
+        # reason omit it and keep the original behaviour.
+        and (reason_marker is None or reason_marker in (comment.get("body") or ""))
         for comment in comments or ()
     )
 

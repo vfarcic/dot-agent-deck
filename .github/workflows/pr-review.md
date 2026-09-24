@@ -181,13 +181,13 @@ That leaves one honest strategy: **bound the work, then emit once.** You cannot 
 2. **Read code only where judging that evidence requires it** — a finding whose answer you cannot evaluate without seeing the hunk, or a contract question the body does not settle. Bounded and targeted. You are not the first reader of this diff and must not spend the run becoming one (issue #1270); the rubric's priority list is the whole of your job.
 3. **Emit the verdict as your final action, and make it the only pass.** There is no second, deeper sweep — if you find yourself planning one, you have already spent what it would have cost.
 
-If your coverage was thin, say so in `reasons` and weigh `INSUFFICIENT` rather than reporting confidence you do not have.
+If the evidence is thin — nothing independent has read this head, a finding whose answer you cannot evaluate, an obligation you cannot see discharged — say so in `reasons` and return `INSUFFICIENT` rather than reporting confidence you do not have. The vote job withholds the approval on the same grounds, so saying it costs nothing. **Do not emit `covered_paths` outside a focused pass**: it is a claim that the union of verdicts covers the whole diff, and the vote job enforces exactly that (issue #1270).
 
 **Subagents are the largest single cost and the easiest way to overrun.** Each carries its own context over the same diff, so a fan-out of four on a large pull request can spend the whole budget before any of them reports — which is exactly how the 2026-09-13 run died. Do not delegate by default. Use at most **two**, only on a diff above roughly 40 changed files, and only with a brief scoped to specific files rather than a whole area.
 
 A verdict of `INSUFFICIENT` is the honest answer when you could not review confidently within budget. Say what you did and did not cover in `reasons`. It is a legitimate outcome and far more useful than an optimistic `APPROVE` or a run that dies silently.
 
-**Record what you covered, every time, in `covered_paths`** — the repo-relative path of every file you deep-read this pass. That list is what lets a later focused pass (below) pick up where you stopped, so an `INSUFFICIENT` on a large pull request stops being a dead end. List only what you genuinely read in full; a path you skimmed is not covered, and claiming it hides the gap from the pass that would otherwise close it.
+**On a focused follow-up pass ONLY, record what you covered in `covered_paths`** — the repo-relative path of every file you deep-read this pass. That list is what lets a later focused pass (below) pick up where you stopped, so an `INSUFFICIENT` on a large pull request stops being a dead end. List only what you genuinely read in full; a path you skimmed is not covered, and claiming it hides the gap from the pass that would otherwise close it.
 
 ## If this is a focused follow-up pass
 
