@@ -53,7 +53,10 @@ from pr_review_common import (  # noqa: E402
     gh,
     gh_json,
     gh_ok,
+    coverage_gap,
     latest_verdict,
+    pr_changed_paths,
+    trusted_verdicts_at,
     pr_comments,
     pr_reviews,
 )
@@ -301,6 +304,32 @@ def main():
 
     decision = verdict["verdict"]
     reasons = "\n".join(f"- {r}" for r in verdict.get("reasons", [])) or "- (none given)"
+
+    # Issue #1266: an APPROVE may now rest on coverage accumulated across
+    # SEVERAL focused passes, so verify the union here rather than trusting the
+    # agent to have added it up. Before focused passes this check would have
+    # been redundant -- APPROVE was a claim about the agent's own reading, and
+    # the split deliberately bounds the damage of a diff that talks it into
+    # approving. A union is a claim about OTHER comments, and it is checkable
+    # from here, so it is checked (Qodo on PR #1268).
+    #
+    # Refusing is a `fail`, not a downgrade to a notice: an APPROVE whose
+    # coverage does not add up means the reviewer and this job disagree about
+    # what was read, and that is a broken reviewer rather than a quiet
+    # no-vote. Loud beats silent, the same way a malformed verdict is loud.
+    if decision == "APPROVE":
+        gap = coverage_gap(
+            trusted_verdicts_at(repo, pr_number, expected_sha),
+            pr_changed_paths(repo, pr_number),
+        )
+        if gap:
+            shown = ", ".join(gap[:5]) + (f" (+{len(gap) - 5} more)" if len(gap) > 5 else "")
+            fail(
+                f"#{pr_number}: APPROVE at {expected_sha[:8]} but no trusted verdict "
+                f"covers {len(gap)} changed file(s): {shown}. Refusing to vote -- an "
+                f"approval must rest on files something actually read."
+            )
+            return
 
     if decision == "INSUFFICIENT":
         # Say it once per head. The verdict is fixed for this SHA, so a re-post

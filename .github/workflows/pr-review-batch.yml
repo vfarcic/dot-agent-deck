@@ -43,6 +43,24 @@ name: Agent PR review
         required: false
         default: "50"
         type: string
+      # Issue #1266. Exists because a large pull request is reviewed in ONE
+      # bounded pass (~10 deep-read files), so a diff bigger than that budget
+      # earns an honest INSUFFICIENT and can never earn anything else however
+      # often it is re-run: idempotence skips the second attempt, and without it
+      # the second attempt would re-read the same highest-risk files anyway.
+      #
+      # A focused pass reads the earlier verdicts' `covered_paths` and reviews
+      # the complement, so coverage ACCUMULATES across runs at one head SHA
+      # instead of resetting. Manual only, and requires `pr_number` — the
+      # selector enforces that, because a focused sweep would re-review every
+      # eligible head on every run.
+      focus_unreviewed:
+        description: >-
+          Focused follow-up pass on one PR: review only what earlier verdicts at
+          this same head SHA did not cover. Requires pr_number.
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -89,6 +107,11 @@ jobs:
           REPO: ${{ github.repository }}
           ONLY_PR: ${{ inputs.pr_number }}
           MAX_PRS: ${{ inputs.max_prs || '50' }}
+          # Issue #1266: empty on every scheduled run, because `inputs` is empty
+          # on a schedule -- so the sweep keeps its idempotence, and only a
+          # manual dispatch can ask for a second pass over one head. Set here
+          # and NOT on the vote selection below, which never consults it.
+          FOCUS_UNREVIEWED: ${{ inputs.focus_unreviewed }}
           # PR_REVIEW_LIVE is the single switch that authorises voting, and it
           # authorises the UNATTENDED kind too: with it set, the daily sweep
           # casts approvals on its own. A manual dispatch can additionally force
@@ -123,6 +146,10 @@ jobs:
     with:
       pr_number: ${{ matrix.item.number }}
       head_sha: ${{ matrix.item.sha }}
+      # The selector decides WHETHER a focused pass runs; this tells the agent
+      # that it is one, which changes what it reads and what its verdict may
+      # claim. Both sides read the same input rather than inferring it.
+      focus_unreviewed: ${{ inputs.focus_unreviewed == true }}
     secrets:
       ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
 
