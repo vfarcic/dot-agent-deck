@@ -1,6 +1,6 @@
 # PRD #1279: On-demand InMotion Cloud dev box
 
-**Status**: Not started — this document is the plan, written before any implementation.
+**Status**: In progress — M1 done.
 **Priority**: Medium
 **Created**: 2026-09-24
 **Issue**: [#1279](https://github.com/vfarcic/dot-agent-deck/issues/1279)
@@ -78,21 +78,24 @@ OS_APPLICATION_CREDENTIAL_SECRET: ref+gcpsecrets://vfarcic/inmotion-secret
 
 With those set, the `openstack` CLI needs no `clouds.yaml`. Verified on 2026-09-24: `openstack token issue` succeeds against project `c10f1329…`.
 
-What the project offers, as listed on 2026-09-24: flavors `m7i.medium` through `m7i.8xlarge`; images Ubuntu 20.04/22.04/24.04; external networks `External` and `ext` and no tenant network; volume types `NVME` and `HDD`; no existing servers.
+What the project offers, as listed on 2026-09-24: flavors `m7i.medium` through `m7i.8xlarge`; images Ubuntu 20.04/22.04/24.04; external networks `External` and `ext` and no tenant network; volume types `NVME` and `HDD`; unlimited quotas (`-1`) for instances, cores, RAM, volumes, gigabytes, networks, routers and ports; no existing servers.
+
+**Neither external network can host a server directly.** Both are `router:external`, owned by other projects and not shared with this one; `External` is the default (`is_default: true`, MTU 1500), `ext` is not (MTU 1492). So `up` creates a private network, a subnet and a router whose gateway is on `External`. The router gives the box outbound internet, and Tailscale needs nothing more — **the box gets no public or floating IP at all**, which is stronger than decision 6's empty security group on a public address.
 
 ### `inmotion.sh up`
 
 1. **Image**: if no `ubuntu-26.04-dad` image exists, download the 26.04 server cloud image, verify it against Ubuntu's `SHA256SUMS`, and upload it.
-2. **Keypair and security group**: a keypair from the operator's public key (a fallback path only — normal access is over Tailscale) and a security group with **no ingress rules**.
-3. **Volume**: create the `NVME` data volume if it does not exist; reuse it if it does.
-4. **Server**: create it on the external network with the minimal cloud-init, attach the volume, wait for it to join the tailnet.
-5. **Hand-off**: run `bootstrap.sh` over SSH via the Tailscale address, then print the auth checklist it produces.
+2. **Network**: a private network, subnet and router with its gateway on `External`, created once and reused.
+3. **Keypair and security group**: a keypair from the operator's public key (for the console-and-fallback path only — normal access is over Tailscale) and a security group with **no ingress rules**.
+4. **Volume**: create the `NVME` data volume if it does not exist; reuse it if it does.
+5. **Server**: create it on the private network with the minimal cloud-init and no floating IP, attach the volume, wait for it to join the tailnet.
+6. **Hand-off**: run `bootstrap.sh` over SSH via the Tailscale address, then print the auth checklist it produces.
 
 Every resource carries a name prefix derived from `--name`, so `down` and `destroy` find exactly what `up` created and nothing else.
 
 ### Tailscale join
 
-The VM must join the tailnet during first boot, before anything can reach it. That needs an auth key in cloud-init user-data, which anyone who can manage the InMotion project — and any process on the VM, through the metadata service — can read. So the key is **single-use, pre-approved, tagged and short-lived**, generated per `up` or held in GCP Secret Manager and pulled through `vals`. The fallback, if that proves impractical, is one ingress rule for SSH from the operator's current public IP that `up` removes after the join.
+The VM must join the tailnet during first boot, before anything can reach it. That needs an auth key in cloud-init user-data, which anyone who can manage the InMotion project — and any process on the VM, through the metadata service — can read. So the key is **single-use, pre-approved, tagged and short-lived**, generated per `up` or held in GCP Secret Manager and pulled through `vals`. The fallback, if that proves impractical, is a temporary floating IP plus one ingress rule for SSH from the operator's current public IP, both removed by `up` after the join.
 
 ### The data volume
 
@@ -147,7 +150,7 @@ No TUI surface changes, so rule 4 does not apply. Validation is:
 
 ## Milestones
 
-- [ ] **M1 — Cloud access wired.** `openstackclient` pinned in `devbox.json`; the `OS_*` entries in `.env.vals.yaml`; `openstack token issue` works from a devbox shell with `USE_VALS=1`.
+- [x] **M1 — Cloud access wired.** `openstackclient` pinned in `devbox.json`; the `OS_*` entries in `.env.vals.yaml`; `openstack token issue` works from a devbox shell with `USE_VALS=1`.
 - [ ] **M2 — `inmotion.sh` lifecycle.** `up`/`down`/`destroy`/`ssh`/`ip`/`status` working and idempotent: image upload, no-ingress security group, NVME volume, Tailscale join, volume mount settled.
 - [ ] **M3 — `bootstrap.sh` system layer.** apt, system settings, docker, tailscale, linger, imported timers — re-runnable.
 - [ ] **M4 — `bootstrap.sh` user layer.** nix + devbox, `devbox global`, agents, `dot-agent-deck` + hooks, config seeding, `--repo`, auth checklist.
@@ -165,7 +168,7 @@ No TUI surface changes, so rule 4 does not apply. Validation is:
 
 ## Open Questions
 
-1. Which external network — `External` or `ext` — should servers attach to?
+1. ~~Which external network should servers attach to?~~ Neither directly — see [Cloud access](#cloud-access). The router's gateway goes on `External`.
 2. The Tailscale auth key: generated per `up` through the Tailscale API, or a reusable tagged key held in GCP Secret Manager?
 3. Is an UpCloud account still available to validate M6 end to end, or is that milestone validated by review only?
 4. Does refactoring `examples/provision-upcloud-vm.sh` warrant a changelog fragment (rule 19)? The example is in the public repo but not on the docs site.
@@ -176,3 +179,9 @@ No TUI surface changes, so rule 4 does not apply. Validation is:
 ### 2026-09-24 — Created
 
 Planned with the maintainer in one session. The inventory above was taken read-only on the dev box. The same session removed `aether` and `dot-ai` from the dev box, filed #1277 / PR #1278 to remove the project-local `dot-ai` skill, granted the `vals` service account read access to `inmotion-id` and `inmotion-secret`, and verified the application credential against `https://iad4.inmotioncloud.net:5000/v3`. An earlier claim in that session that `/tmp` was not a tmpfs on the dev box was wrong — it is a 14 GB tmpfs, and CLAUDE.md rule 14 stands.
+
+### 2026-09-24 — M1: cloud access wired
+
+`openstackclient` 10.0.0 pinned in `devbox.json` beside `upcloud-cli` (nixpkgs' base client covers compute, network, image, volume and identity). `.env.vals.yaml` gained the seven `OS_*` entries shown under [Cloud access](#cloud-access), `OS_INTERFACE` and `OS_IDENTITY_API_VERSION` included. Verified from `USE_VALS=1 devbox run`: `openstack token issue` returns project `c10f1329…`, `openstack server list` returns nothing, and all seven variables are exported. Without `USE_VALS` nothing changes — the entries are read only by the existing `vals env` line in `init_hook`.
+
+The network inspection that followed settled open question 1: both external networks are other projects' and not shared, so the box sits on its own private network behind a router, and never has a public address.

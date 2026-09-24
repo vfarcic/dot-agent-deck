@@ -5,6 +5,7 @@
     "go-task":                      "3.53.1",
     "git":                          "2.55.0",
     "upcloud-cli":                  "3.36.0",
+    "openstackclient":              "10.0.0",
     "gh":                           "2.98.0",
     "asciinema":                    "3.2.1",
     "cargo-nextest":                "0.9.143",
