@@ -316,6 +316,27 @@ describe("TauriDeckBridge", () => {
    * answer — a fallback is exactly what would reinstate the
    * silently-wrong-filesystem behaviour on the least tested path.
    */
+  /**
+   * Scenario (PRD #1223): the New agent dialog's deck step declared with an
+   * utterance travels to `desktop_voice_resolve` as `deckStep`, beside the
+   * screen and the dialog declarations; with none declared it is `null`, which
+   * Rust reads as "every deck eligible".
+   */
+  it("sends the declared deck step with the utterance it was declared for", async () => {
+    const { TauriDeckBridge } = await import("./bridge");
+    const bridge = new TauriDeckBridge();
+    invoke.mockResolvedValue({ outcome: { kind: "no_match", sentence: "", transcript: "" } });
+
+    const deckStep = [{ deckId: "deck-local" }, { deckId: "deck-build", reason: "No deck is listening on the configured socket." }];
+    bridge.declareVoiceScreen("overview", undefined, undefined, deckStep);
+    await bridge.resolveVoice("new agent on the build box");
+    expect(invoke).toHaveBeenLastCalledWith("desktop_voice_resolve", { utterance: "new agent on the build box", screen: "overview", directories: null, newAgent: null, deckStep });
+
+    bridge.declareVoiceScreen("overview");
+    await bridge.resolveVoice("new agent");
+    expect(invoke).toHaveBeenLastCalledWith("desktop_voice_resolve", { utterance: "new agent", screen: "overview", directories: null, newAgent: null, deckStep: null });
+  });
+
   it("asks the daemon for its projects and resolves a path verbatim", async () => {
     const { TauriDeckBridge } = await import("./bridge");
     const bridge = new TauriDeckBridge();

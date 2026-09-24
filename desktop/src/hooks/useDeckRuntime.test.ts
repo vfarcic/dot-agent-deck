@@ -1,6 +1,6 @@
 import { act, renderHook, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { createFixtureSnapshot, FIXTURE_DAEMON_ID } from "../data/fixture";
+import { createFixtureFleet, createFixtureSnapshot, FIXTURE_DAEMON_ID, FIXTURE_UNREACHABLE_DAEMON_ID } from "../data/fixture";
 import { agentKey } from "../lib/agentKey";
 import type { DeckBridge } from "../lib/bridge";
 import { LaunchCleanupError } from "../lib/actionError";
@@ -31,6 +31,7 @@ const { bridge } = vi.hoisted(() => ({
     setShownTerminals: vi.fn(async () => {}),
     listProjects: vi.fn(async () => ({ projects: [] })),
     resolveProject: vi.fn(),
+    declareVoiceScreen: vi.fn(),
     dispose: vi.fn(async () => {}),
   },
 }));
@@ -84,6 +85,26 @@ describe("useDeckRuntime", () => {
 
     expect(result.current.error).toBeUndefined();
     expect(result.current.snapshot.connection.status).toBe("connected");
+  });
+
+  /**
+   * Scenario (PRD #1223): a voice declaration made through the runtime carries
+   * the New agent dialog's deck step for the fleet the runtime holds — the
+   * same list the dialog preselects from — so an unreachable deck reaches Rust
+   * with the reason the step shows, and the panel had to say nothing about it.
+   */
+  it("declares the fleet's deck step with every voice declaration", async () => {
+    bridge.connect.mockResolvedValue(createFixtureFleet("fleet"));
+    const { result } = renderHook(() => useDeckRuntime());
+    await waitFor(() => expect(result.current.fleet.length).toBeGreaterThan(1));
+
+    act(() => result.current.declareVoiceScreen?.("overview"));
+
+    expect(bridge.declareVoiceScreen).toHaveBeenCalledTimes(1);
+    const [screen, directories, newAgent, deckStep] = bridge.declareVoiceScreen.mock.calls[0];
+    expect([screen, directories, newAgent]).toEqual(["overview", undefined, undefined]);
+    expect(deckStep).toContainEqual({ deckId: FIXTURE_DAEMON_ID });
+    expect(deckStep).toContainEqual({ deckId: FIXTURE_UNREACHABLE_DAEMON_ID, reason: "No deck is listening on the configured socket." });
   });
 
   /**

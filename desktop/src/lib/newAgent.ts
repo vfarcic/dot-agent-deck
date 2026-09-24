@@ -1,4 +1,5 @@
 import type { AuthoringKind, ConnectionView, DaemonOrchestration, DeckDirectoryEntry, DeckFleet, NewAgentOption, NewAgentOptions, NewAgentOrchestrations } from "../types";
+import type { VoiceDeckChoiceDto } from "./bridge";
 import { DISPLAY_LIMITS, deckName, displayIdentity, displayText } from "./displayText";
 
 /**
@@ -90,6 +91,17 @@ export function deckChoices(fleet: DeckFleet): DeckChoice[] {
     const reason = deckUnavailableReason(deck.connection);
     return [{ deckId, name: deckName(deck.connection), deckKind: deck.connection.deckKind ?? "local", ...(reason === undefined ? {} : { reason }) }];
   });
+}
+
+/**
+ * The deck step as voice is told it (PRD #1223): each deck's id and, for one
+ * that cannot take a spawn, the reason the step shows — {@link deckChoices},
+ * less what Rust already reads for itself (names and kinds). It is what lets a
+ * spoken "new agent" preselect only a deck the dialog would, and name a
+ * disabled one by the step's own words.
+ */
+export function voiceDeckStep(fleet: DeckFleet): VoiceDeckChoiceDto[] {
+  return deckChoices(fleet).map(({ deckId, reason }) => (reason === undefined ? { deckId } : { deckId, reason }));
 }
 
 /**

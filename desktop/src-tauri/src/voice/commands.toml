@@ -533,7 +533,12 @@ heard_as_whole = [
 # nothing, or several, is dropped and the report says so ("No deck matches …, so
 # none is preselected."); one that resolves is preselected — whether or not the
 # user said it — and the report names it ("Preselected deck: Local deck."), so
-# a deck the model guessed is heard before anything starts on it.
+# a deck the model guessed is heard before anything starts on it. Only a deck
+# the dialog can preselect: one its deck step disables is never offered to the
+# model, and one the user names is answered with the step's reason instead
+# (`voice::VoiceDeckChoice`). With exactly one eligible deck the dialog
+# preselects it anyway, so voice dispatches and names it even for a bare "new
+# agent" — "none is preselected" is said only when it is true.
 #
 # `screens = ["overview"]`: the dialog lives on the overview, whose fleet its
 # deck step lists (`VoiceOverviewContext` in `voiceActions.ts`), and a row

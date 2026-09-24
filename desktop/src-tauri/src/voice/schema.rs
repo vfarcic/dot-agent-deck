@@ -119,10 +119,10 @@ pub const TOOL_INSTRUCTIONS: &str = "Pick the deck action the user asked for. Pi
     readily as by name — \"the one that is stuck\", \"whichever is waiting\" — so \
     resolve such a reference against those fields and answer with that agent's \
     `label`. For a reference the user made by name, answer with the words the user \
-    used and let the app resolve them. `decks` lists every deck the app can \
-    reach, named the way the screen names it; a `deck_ref` param is a reference \
-    to one of those decks — \"local\" means this machine's — and is answered \
-    with the words the user used for it, never with an agent. A param marked \
+    used and let the app resolve them. `decks` lists every deck a new agent \
+    can be started on, named the way the screen names it; a `deck_ref` param is a \
+    reference to one of those decks — \"local\" means this machine's — and is \
+    answered with the words the user used for it, never with an agent. A param marked \
     `optional` is left out when the user named nothing for it. `directories`, \
     when present, is the New agent dialog's directory browser: `entries` are the \
     directories on screen, and a `dir_ref` param names one of THOSE, answered with \

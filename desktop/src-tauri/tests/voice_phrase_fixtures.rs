@@ -78,6 +78,9 @@ const API_KEY_ENV: &str = "OPENAI_API_KEY";
 const MIN_FIXTURE_COUNT: usize = 30;
 const PENDING_OPEN_SETTINGS_ACTION: &str = "open_settings";
 const PER_FIXTURE_GRACE: Duration = Duration::from_secs(15);
+/// The deck step's reason for the planted disabled deck — the fallback the
+/// webview shows for a deck whose daemon is not listening.
+const STALE_BOX_REASON: &str = "No deck is listening on the configured socket.";
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -99,6 +102,12 @@ struct PhraseFixture {
     /// against the planted fleet the way `resolved_agent` is against agents.
     #[serde(default)]
     resolved_deck: Option<String>,
+    /// The report must say the deck the user named cannot take a new agent
+    /// (PRD #1223): the planted `ci@stale-box` is disabled at the New agent
+    /// dialog's deck step, so it is never offered to the model and never
+    /// preselected, and naming it must be answered with the step's reason.
+    #[serde(default)]
+    names_unavailable_deck: bool,
     /// Whether the New agent dialog's directory browser is showing the
     /// planted listing for this fixture (PRD #1223). Absent means the dialog
     /// is closed, which is every fixture that predates the directory rows.
@@ -370,17 +379,27 @@ async fn voice_phrase_fixtures_match_the_default_backend() {
     })
     .collect();
     // PRD #1223 — the fleet a `deck_ref` resolves against: this machine's deck
-    // and one remote, labelled the way the overview labels them.
+    // and one remote, labelled the way the overview labels them — plus a
+    // remote the New agent dialog shows DISABLED, which the model is never
+    // shown, so no fixture can preselect it (checked on every fixture below).
     let decks = vec![
         dot_agent_deck_desktop::voice::VoiceDeck {
             id: "deck-local".to_string(),
             label: "Local deck".to_string(),
             local: true,
+            unavailable: None,
         },
         dot_agent_deck_desktop::voice::VoiceDeck {
             id: "deck-build-box".to_string(),
             label: "deploy@build-box".to_string(),
             local: false,
+            unavailable: None,
+        },
+        dot_agent_deck_desktop::voice::VoiceDeck {
+            id: "deck-stale-box".to_string(),
+            label: "ci@stale-box".to_string(),
+            local: false,
+            unavailable: Some(STALE_BOX_REASON.to_string()),
         },
     ];
     // PRD #1223 — what the New agent dialog's browser shows when a fixture says
@@ -642,6 +661,18 @@ async fn voice_phrase_fixtures_match_the_default_backend() {
                 // the report must name it so a wrong guess is heard (PRD
                 // #1223, #1263). Checked on whatever the model answered, so the
                 // unasked preselections the fixtures cannot pin are covered too.
+                // Every fixture, too: a deck the dialog shows disabled is never
+                // what voice preselects, whatever the model answered.
+                let deck_eligible = resolved_deck(&answer.outcome).is_none_or(|id| {
+                    decks
+                        .iter()
+                        .any(|deck| deck.id == id && deck.unavailable.is_none())
+                });
+                let unavailable_named = !fixture.names_unavailable_deck
+                    || answer.outcome.sentence().contains(&format!(
+                        "Deck ci@stale-box cannot take a new agent, so none is preselected: {}",
+                        STALE_BOX_REASON.trim_end_matches('.')
+                    ));
                 let deck_named =
                     resolved_label(&answer.outcome, ParamKind::DeckRef).is_none_or(|label| {
                         answer
@@ -659,6 +690,8 @@ async fn voice_phrase_fixtures_match_the_default_backend() {
                     && orchestration_matches
                     && prefix_matches
                     && deck_named
+                    && deck_eligible
+                    && unavailable_named
                 {
                     Ok(())
                 } else {
@@ -670,10 +703,14 @@ async fn voice_phrase_fixtures_match_the_default_backend() {
                          resolved_deck={:?} resolved_dir={:?} resolved_mode={:?} \
                          resolved_agent_type={:?} resolved_orchestration={:?} dictate_prefix={:?} \
                          sentence={:?}",
-                        if deck_named {
-                            ""
-                        } else {
+                        if !deck_named {
                             "the report does not name the preselected deck; "
+                        } else if !deck_eligible {
+                            "a deck the dialog disables was preselected; "
+                        } else if !unavailable_named {
+                            "the report does not say the named deck cannot take a new agent; "
+                        } else {
+                            ""
                         },
                         fixture.action,
                         fixture.outcome,

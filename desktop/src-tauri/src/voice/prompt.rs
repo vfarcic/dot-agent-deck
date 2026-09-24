@@ -681,11 +681,13 @@ pub(crate) mod tests {
                 id: "deck-0000000000000001".to_string(),
                 label: "Local deck".to_string(),
                 local: true,
+                unavailable: None,
             },
             crate::voice::VoiceDeck {
                 id: "deck-0000000000000002".to_string(),
                 label: "deploy@build-box".to_string(),
                 local: false,
+                unavailable: None,
             },
         ];
         let rendered = state(&IntentRequest {

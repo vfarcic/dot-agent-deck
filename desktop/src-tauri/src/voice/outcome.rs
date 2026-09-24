@@ -478,6 +478,16 @@ pub async fn handle_utterance_with(
     }
 
     let commands = annotate_for(table, screen, directories, new_agent, labels);
+    // Only the decks the New agent dialog could preselect (PRD #1223): a deck
+    // it shows disabled is not offered, so the model cannot pick one. The full
+    // fleet is still what a supplied deck resolves against, so a deck the user
+    // NAMED that cannot take an agent is reported as that, with its reason,
+    // rather than as a deck that does not exist.
+    let offered: Vec<VoiceDeck> = decks
+        .iter()
+        .filter(|deck| deck.eligible())
+        .cloned()
+        .collect();
     let started = std::time::Instant::now();
     // With labels withheld the backend is shown none of them — see this
     // function's doc comment.
@@ -486,7 +496,7 @@ pub async fn handle_utterance_with(
             transcript: &transcript,
             commands: &commands,
             agents: if withheld { &[] } else { agents },
-            decks: if withheld { &[] } else { decks },
+            decks: if withheld { &[] } else { &offered },
             directories: directories.filter(|_| !withheld),
             new_agent: new_agent.filter(|_| !withheld),
         })
@@ -594,8 +604,14 @@ pub async fn handle_utterance_with(
         else {
             // An optional param the model left out is simply not dispatched
             // (PRD #1223's "new agent" with no deck named), and says nothing:
-            // the user did not ask for one either.
+            // the user did not ask for one either — unless the dialog will
+            // preselect one anyway, which the report then names
+            // ([`implied_param`]).
             if spec.optional {
+                if let Some(param) = implied_param(spec, decks) {
+                    notes.push(preselected_note(&param));
+                    resolved.push(param);
+                }
                 continue;
             }
             return finish(VoiceOutcome::ParamMissing {
@@ -663,8 +679,15 @@ pub async fn handle_utterance_with(
             //
             // A REQUIRED param that fails still refuses the action, exactly as
             // before: without it there is nothing to dispatch.
+            //
+            // **And "none is preselected" has to be true.** When exactly one
+            // deck can take a new agent the dialog preselects it whatever it
+            // was asked for, so that deck is dispatched and named instead
+            // ([`implied_param`]) — the report says what the dialog shows.
             Err(unmet) if spec.optional => {
-                notes.push(unmet.dropped_note(spec.kind, spoken, &transcript));
+                let implied = implied_param(spec, decks);
+                notes.push(unmet.dropped_note(spec.kind, spoken, &transcript, implied.as_ref()));
+                resolved.extend(implied);
             }
             Err(unmet) => return finish(unmet.refusal(transcript, row, spec, spoken)),
         }
@@ -702,6 +725,14 @@ enum Unmet {
     /// The voice settings withhold observed names from the model, so nothing it
     /// supplies for one is resolved (PRD #1223, audit finding A1).
     LabelsWithheld,
+    /// The one deck it names cannot take a new agent (PRD #1223): the New
+    /// agent dialog shows it disabled, for `reason` — the words the deck step
+    /// shows beside it ([`VoiceDeck::unavailable`]).
+    DeckUnavailable {
+        label: String,
+        local: bool,
+        reason: String,
+    },
 }
 
 impl Unmet {
@@ -733,6 +764,17 @@ impl Unmet {
                 matches,
             },
             Unmet::LabelsWithheld => VoiceOutcome::labels_withheld(transcript, row),
+            Unmet::DeckUnavailable {
+                label,
+                local,
+                reason,
+            } => {
+                let (head, detail) = deck_unavailable(&label, local, &reason);
+                unresolved(match detail {
+                    Some(detail) => format!("{head}: {detail}"),
+                    None => head,
+                })
+            }
         }
     }
 
@@ -745,32 +787,99 @@ impl Unmet {
     /// report a request the user never made; so every reason renders the same
     /// "I did not catch which deck" for it. Only a value the user really said
     /// is named back, with what stopped it.
-    fn dropped_note(&self, kind: ParamKind, spoken: &str, transcript: &Transcript) -> String {
+    ///
+    /// **`implied` decides how it ends**: "…, so none is preselected." when
+    /// nothing will be, or the implied deck's own note when the dialog will
+    /// preselect the only deck that can take an agent regardless — "No deck
+    /// matches “ghost”. Preselected deck: Local deck." ([`implied_param`]).
+    fn dropped_note(
+        &self,
+        kind: ParamKind,
+        spoken: &str,
+        transcript: &Transcript,
+        implied: Option<&ResolvedParam>,
+    ) -> String {
         let noun = kind.noun();
-        let not_caught = format!("I did not catch which {noun}, so none is preselected.");
-        if !said(spoken, transcript.text()) {
-            return not_caught;
-        }
-        match self {
-            Unmet::NoMatch => format!(
-                "{}, so none is preselected.",
-                capitalised(&kind.unresolved_phrase(spoken))
-            ),
-            Unmet::WithheldChoice(label) => format!(
-                "{}, so none is preselected.",
-                capitalised(&kind.unresolved_phrase(label))
-            ),
-            Unmet::Ambiguous(matches) => format!(
-                "\u{201c}{}\u{201d} matches more than one {noun}, so none is preselected: {}.",
-                safe_message(spoken),
-                listed(matches)
-            ),
-            Unmet::LabelsWithheld => format!(
-                "Settings \u{2192} Voice \u{2192} Names withholds {noun} names, so none is \
-                 preselected."
-            ),
+        let (head, detail) = if !said(spoken, transcript.text()) {
+            (format!("I did not catch which {noun}"), None)
+        } else {
+            match self {
+                Unmet::NoMatch => (capitalised(&kind.unresolved_phrase(spoken)), None),
+                Unmet::WithheldChoice(label) => (capitalised(&kind.unresolved_phrase(label)), None),
+                Unmet::Ambiguous(matches) => (
+                    format!(
+                        "\u{201c}{}\u{201d} matches more than one {noun}",
+                        safe_message(spoken)
+                    ),
+                    Some(listed(matches)),
+                ),
+                Unmet::LabelsWithheld => (
+                    format!("Settings \u{2192} Voice \u{2192} Names withholds {noun} names"),
+                    None,
+                ),
+                Unmet::DeckUnavailable {
+                    label,
+                    local,
+                    reason,
+                } => deck_unavailable(label, *local, reason),
+            }
+        };
+        match (implied, detail) {
+            (None, None) => format!("{head}, so none is preselected."),
+            (None, Some(detail)) => format!("{head}, so none is preselected: {detail}."),
+            (Some(implied), None) => format!("{head}. {}", preselected_note(implied)),
+            (Some(implied), Some(detail)) => {
+                format!("{head}: {detail}. {}", preselected_note(implied))
+            }
         }
     }
+}
+
+/// "Deck X cannot take a new agent", and the deck step's reason for it as the
+/// detail — scrubbed, since it is display text that came through the webview,
+/// and without its closing full stop, which the caller's sentence supplies.
+/// The local deck's label already says "deck", so only a remote one, whose
+/// label is an address, is introduced as one.
+fn deck_unavailable(label: &str, local: bool, reason: &str) -> (String, Option<String>) {
+    let label = safe_message(label);
+    let head = if local {
+        format!("{label} cannot take a new agent")
+    } else {
+        format!("Deck {label} cannot take a new agent")
+    };
+    let reason = safe_message(reason);
+    let reason = reason.trim().trim_end_matches('.').trim_end();
+    (head, (!reason.is_empty()).then(|| reason.to_string()))
+}
+
+/// The deck the New agent dialog preselects when voice gives it none it can
+/// use (PRD #1223): the only deck that can take a new agent, when there is
+/// exactly one — `preselectedDeck`'s own fallback in
+/// `desktop/src/lib/newAgent.ts`.
+///
+/// **Dispatched, not only named.** The dialog would pick it anyway; sending it
+/// makes the report and the dialog agree by construction, even if the fleet
+/// gains a second eligible deck during the round trip (the dialog preselects
+/// a requested deck that can take an agent). `spoken` is empty because the
+/// user said nothing that chose it.
+///
+/// Only for a `deck_ref`: no other kind has a fallback in the dialog.
+fn implied_param(spec: &super::table::ParamSpec, decks: &[VoiceDeck]) -> Option<ResolvedParam> {
+    if spec.kind != ParamKind::DeckRef {
+        return None;
+    }
+    let mut eligible = decks.iter().filter(|deck| deck.eligible());
+    let only = eligible.next()?;
+    if eligible.next().is_some() {
+        return None;
+    }
+    Some(ResolvedParam {
+        name: spec.name.clone(),
+        kind: spec.kind,
+        spoken: String::new(),
+        value: only.id.clone(),
+        label: only.label.clone(),
+    })
 }
 
 /// The sentence appended to a dispatch's report when an OPTIONAL param
@@ -884,8 +993,24 @@ fn resolve_param(
         // the observed fleet, and the same two refusals: no new outcome
         // variant, because from where the user stands "no deck matches" and
         // "no agent matches" are the same situation about different things.
+        // A deck the dialog shows disabled resolves too — the user named it —
+        // and is then answered with the reason the deck step gives, never
+        // preselected ([`VoiceDeck::unavailable`]).
         ParamKind::DeckRef => match resolve_deck_ref(spoken, decks) {
-            DeckRefMatch::One { id, label } => Ok(param(id, label)),
+            DeckRefMatch::One { id, label } => {
+                match decks
+                    .iter()
+                    .find(|deck| deck.id == id)
+                    .and_then(|deck| deck.unavailable.as_ref().map(|reason| (deck, reason)))
+                {
+                    Some((deck, reason)) => Err(Unmet::DeckUnavailable {
+                        label,
+                        local: deck.local,
+                        reason: reason.clone(),
+                    }),
+                    None => Ok(param(id, label)),
+                }
+            }
             DeckRefMatch::None => Err(Unmet::NoMatch),
             DeckRefMatch::Ambiguous(labels) => Err(Unmet::Ambiguous(labels)),
         },
@@ -2245,6 +2370,15 @@ mod tests {
             id: id.to_string(),
             label: label.to_string(),
             local,
+            unavailable: None,
+        }
+    }
+
+    /// A deck the New agent dialog shows disabled, for `reason`.
+    fn unavailable_deck(id: &str, label: &str, local: bool, reason: &str) -> VoiceDeck {
+        VoiceDeck {
+            unavailable: Some(reason.to_string()),
+            ..deck(id, label, local)
         }
     }
 
@@ -3265,6 +3399,206 @@ mod tests {
         let resolver =
             StubResolver::new().answering("new agent", IntentAnswer::new("open_new_agent"));
         let outcome = run(&resolver, Screen::Overview, &fleet(), "new agent").await;
+        assert_eq!(outcome.sentence(), "Opening the New agent dialog.");
+    }
+
+    /// `open_new_agent` said as `said` over `decks`, answered with `answer` —
+    /// the outcome, and the data turn the model was sent.
+    async fn open_new_agent_over(
+        decks: &[VoiceDeck],
+        answer: IntentAnswer,
+        said: &str,
+    ) -> (VoiceOutcome, String) {
+        let resolver = Recording::answering(answer);
+        let outcome = handle_utterance(
+            &resolver,
+            table(),
+            Screen::Overview,
+            &fleet(),
+            decks,
+            None,
+            None,
+            Transcript::new(said),
+        )
+        .await
+        .outcome;
+        let data = resolver
+            .sent()
+            .0
+            .expect("the decks are shown in a data turn");
+        (outcome, data)
+    }
+
+    const NOT_LISTENING: &str = "No deck is listening on the configured socket.";
+
+    /// Scenario: the New agent dialog shows a deck disabled — here the build
+    /// box, whose daemon is not listening — and the user says "new agent on
+    /// the build box". The model was never shown that deck, and when its
+    /// answer names it anyway the report says it cannot take a new agent, with
+    /// the reason the dialog's deck step shows, instead of "Preselected deck:"
+    /// for a deck the dialog will not preselect. A deck the user did not name
+    /// is not caught, as before.
+    #[tokio::test]
+    async fn voice_outcome_new_agent_never_offers_or_preselects_a_deck_that_cannot_take_one() {
+        let fleet = [
+            deck("deck-local", "Local deck", true),
+            unavailable_deck(
+                "deck-build",
+                "deploy@build-box.example.com:2222",
+                false,
+                NOT_LISTENING,
+            ),
+            deck("deck-build-two", "ci@build-farm", false),
+        ];
+
+        let (outcome, data) = open_new_agent_over(
+            &fleet,
+            IntentAnswer::new("open_new_agent").with_param("deck", "build box"),
+            "new agent on the build box",
+        )
+        .await;
+        assert!(
+            data.contains("Local deck") && data.contains("ci@build-farm"),
+            "the decks that can take an agent are offered: {data}"
+        );
+        assert!(
+            !data.contains("build-box"),
+            "a deck the dialog disables is not offered at all: {data}"
+        );
+        assert!(
+            matches!(&outcome, VoiceOutcome::Dispatch { params, .. } if params.is_empty()),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            outcome.sentence(),
+            "Opening the New agent dialog. Deck deploy@build-box.example.com:2222 cannot take a \
+             new agent, so none is preselected: No deck is listening on the configured socket."
+        );
+
+        // The model's own invention of it is not caught, like any invented deck.
+        let (outcome, _) = open_new_agent_over(
+            &fleet,
+            IntentAnswer::new("open_new_agent")
+                .with_param("deck", "deploy@build-box.example.com:2222"),
+            "new agent",
+        )
+        .await;
+        assert_eq!(
+            outcome.sentence(),
+            format!("Opening the New agent dialog. {NOT_CAUGHT_DECK}")
+        );
+
+        // The local deck is its own name, so it is not introduced as "Deck".
+        let local_disabled = [
+            unavailable_deck(
+                "deck-local",
+                "Local deck",
+                true,
+                "This deck does not list directories, so a new agent cannot be started on it from here.",
+            ),
+            deck("deck-build", "deploy@build-box.example.com:2222", false),
+            deck("deck-build-two", "ci@build-farm", false),
+        ];
+        let (outcome, _) = open_new_agent_over(
+            &local_disabled,
+            IntentAnswer::new("open_new_agent").with_param("deck", "local"),
+            "new agent on local",
+        )
+        .await;
+        assert!(
+            matches!(&outcome, VoiceOutcome::Dispatch { params, .. } if params.is_empty()),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            outcome.sentence(),
+            "Opening the New agent dialog. Local deck cannot take a new agent, so none is \
+             preselected: This deck does not list directories, so a new agent cannot be started \
+             on it from here."
+        );
+    }
+
+    /// Scenario: only one deck can take a new agent, so the dialog preselects
+    /// it whatever voice asked for — and the report names it every time: for a
+    /// plain "new agent", for a deck the dialog disables, and for a deck that
+    /// does not exist. "None is preselected" is said only when it is true.
+    #[tokio::test]
+    async fn voice_outcome_new_agent_names_the_only_deck_that_can_take_one() {
+        let fleet = [
+            deck("deck-local", "Local deck", true),
+            unavailable_deck(
+                "deck-build",
+                "deploy@build-box.example.com:2222",
+                false,
+                NOT_LISTENING,
+            ),
+            unavailable_deck(
+                "deck-build-two",
+                "ci@build-farm",
+                false,
+                "This deck has not reported yet.",
+            ),
+        ];
+        let dispatched_local = |outcome: &VoiceOutcome| {
+            matches!(outcome, VoiceOutcome::Dispatch { params, .. }
+                if params.len() == 1
+                    && params[0].kind == ParamKind::DeckRef
+                    && params[0].value == "deck-local"
+                    && params[0].label == "Local deck")
+        };
+
+        for (said, answer, sentence) in [
+            (
+                "new agent",
+                IntentAnswer::new("open_new_agent"),
+                "Opening the New agent dialog. Preselected deck: Local deck.",
+            ),
+            (
+                "new agent on the build box",
+                IntentAnswer::new("open_new_agent").with_param("deck", "build box"),
+                "Opening the New agent dialog. Deck deploy@build-box.example.com:2222 cannot \
+                 take a new agent: No deck is listening on the configured socket. Preselected \
+                 deck: Local deck.",
+            ),
+            (
+                "new agent on the ghost box",
+                IntentAnswer::new("open_new_agent").with_param("deck", "ghost box"),
+                "Opening the New agent dialog. No deck matches \u{201c}ghost box\u{201d}. \
+                 Preselected deck: Local deck.",
+            ),
+            (
+                "new agent on build",
+                IntentAnswer::new("open_new_agent").with_param("deck", "build"),
+                "Opening the New agent dialog. \u{201c}build\u{201d} matches more than one \
+                 deck: deploy@build-box.example.com:2222, ci@build-farm. Preselected deck: Local \
+                 deck.",
+            ),
+        ] {
+            let (outcome, _) = open_new_agent_over(&fleet, answer, said).await;
+            assert!(dispatched_local(&outcome), "{said:?}: {outcome:?}");
+            assert_eq!(outcome.sentence(), sentence, "{said:?}");
+        }
+
+        // A fleet with nothing that can take one preselects nothing, and says
+        // nothing about a deck the user did not ask for.
+        let none_eligible = [
+            unavailable_deck("deck-local", "Local deck", true, NOT_LISTENING),
+            unavailable_deck(
+                "deck-build",
+                "deploy@build-box.example.com:2222",
+                false,
+                NOT_LISTENING,
+            ),
+        ];
+        let (outcome, _) = open_new_agent_over(
+            &none_eligible,
+            IntentAnswer::new("open_new_agent"),
+            "new agent",
+        )
+        .await;
+        assert!(
+            matches!(&outcome, VoiceOutcome::Dispatch { params, .. } if params.is_empty()),
+            "{outcome:?}"
+        );
         assert_eq!(outcome.sentence(), "Opening the New agent dialog.");
     }
 

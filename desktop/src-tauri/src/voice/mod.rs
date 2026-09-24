@@ -71,10 +71,10 @@ pub use crate::dto::DesktopAgent;
 /// Built from the fleet the desktop already observes
 /// (`dto::observed_fleet_decks`), never from the webview, for
 /// [`DesktopAgent`]'s reason: a list arriving from the page would be a second
-/// answer to "which decks are there". Three fields because resolution needs no
-/// more — the key the frontend dispatches with, the name the screen shows, and
-/// whether the deck is this machine's, which is what makes the literal *"local"*
-/// name it.
+/// answer to "which decks are there". Resolution needs the key the frontend
+/// dispatches with, the name the screen shows, and whether the deck is this
+/// machine's, which is what makes the literal *"local"* name it. The fourth
+/// field is whether the New agent dialog can preselect it at all.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VoiceDeck {
     /// `EndpointIdentity::wire_id()` — the same `deckId` the overview keys its
@@ -84,7 +84,59 @@ pub struct VoiceDeck {
     pub label: String,
     /// Whether it is the local endpoint.
     pub local: bool,
+    /// Why this deck cannot take a new agent, in the words the New agent
+    /// dialog's deck step shows beside it — or `None` when it can.
+    ///
+    /// **Taken from the webview's [`VoiceDeckChoice`] declaration**, the one
+    /// piece of a deck that is not read here: the dialog decides what to
+    /// preselect from the webview's fleet (`preselectedDeck` in
+    /// `desktop/src/lib/newAgent.ts`), and a report that is to agree with the
+    /// dialog has to be judged against the same list the dialog judges. A deck
+    /// with a reason is never shown to the model, so it cannot be picked, and
+    /// one resolved anyway from the user's own words is reported as unable to
+    /// take the agent rather than as preselected.
+    pub unavailable: Option<String>,
 }
+
+impl VoiceDeck {
+    /// Whether the New agent dialog would preselect this deck if asked to.
+    pub fn eligible(&self) -> bool {
+        self.unavailable.is_none()
+    }
+}
+
+/// One row of the New agent dialog's deck step, as the webview DECLARED it
+/// with an utterance (PRD #1223): a deck id and, for a deck that cannot take a
+/// spawn, the reason the step shows beside it (`deckChoices` in
+/// `desktop/src/lib/newAgent.ts`).
+///
+/// # It comes from the webview, and only annotates [`VoiceDeck`]
+///
+/// The DECKS are still read Rust-side; this adds nothing to that list and a
+/// deck id it names that the fleet does not have is ignored. What it carries is
+/// whether each deck is eligible, and that is a question about the dialog: the
+/// dialog preselects from the webview's fleet, whose connection states and
+/// fallback sentences (`deckUnavailableReason`) are computed there. Declared on
+/// every utterance rather than only while the dialog is open, because
+/// `open_new_agent` — the one row with a `deck_ref` — runs while it is closed.
+///
+/// It can only narrow what voice will preselect: a deck it marks eligible
+/// that the dialog then refuses is still refused by the dialog.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct VoiceDeckChoice {
+    /// The wire `deckId`.
+    pub deck_id: String,
+    /// Why it cannot take a new agent, as display text; absent when it can.
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+/// What a deck the fleet observes but the deck step does not list says about
+/// itself: `DECK_STATE_FALLBACK.pending` in `desktop/src/lib/newAgent.ts`,
+/// because a deck the webview's fleet has no entry for is one that has not
+/// reported to it yet.
+pub const DECK_NOT_REPORTED: &str = "This deck has not reported yet.";
 
 /// What the New agent dialog's directory browser is showing, as the webview
 /// DECLARED it for one utterance (PRD #1223) — the set a spoken

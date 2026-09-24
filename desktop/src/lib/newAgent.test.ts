@@ -22,6 +22,7 @@ import {
   orchestrationModes,
   orchestrationRunTitle,
   preselectedDeck,
+  voiceDeckStep,
   resolveAuthoringCommand,
   seedCommand,
   suggestOrchestrationName,
@@ -77,6 +78,24 @@ describe("New agent rules (PRD #1223 M4)", () => {
     expect(choices.map((choice) => choice.reason === undefined)).toEqual([true, true, false, false]);
     expect(choices[1]).toMatchObject({ deckKind: "remote" });
     expect(choices[2].reason).toBe("No deck is listening on the configured socket.");
+  });
+
+  /**
+   * Scenario: what voice is told about the deck step (PRD #1223) is the step
+   * itself — every listed deck by id, and each one it disables with the exact
+   * sentence it shows — so a spoken "new agent" can only preselect a deck the
+   * dialog would, and names a disabled one in the step's own words.
+   */
+  it("declares the deck step to voice as ids and the step's own reasons", () => {
+    const reason = "This deck does not advertise list-directories, so it cannot be browsed for a directory to start in.";
+    const fleet: DeckFleet = createFixtureFleet("fleet").map((deck) => deck.connection.deckId === FIXTURE_REMOTE_DAEMON_ID ? { ...deck, connection: { ...deck.connection, newAgentReason: reason } } : deck);
+    const step = voiceDeckStep(fleet);
+    expect(step.map((row) => row.deckId)).toEqual(deckChoices(fleet).map((choice) => choice.deckId));
+    expect(step).toContainEqual({ deckId: FIXTURE_DAEMON_ID });
+    expect(step).toContainEqual({ deckId: FIXTURE_REMOTE_DAEMON_ID, reason });
+    expect(step).toContainEqual({ deckId: FIXTURE_UNREACHABLE_DAEMON_ID, reason: "No deck is listening on the configured socket." });
+    expect(step.find((row) => row.deckId === FIXTURE_PENDING_DAEMON_ID)?.reason).toBe(deckChoices(fleet).find((choice) => choice.deckId === FIXTURE_PENDING_DAEMON_ID)?.reason);
+    expect(Object.keys(step[0])).toEqual(["deckId"]);
   });
 
   /**

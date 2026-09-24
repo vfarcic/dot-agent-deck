@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createFixtureSnapshot } from "../data/fixture";
 import { createDeckBridge, selectRuntimeMode } from "../lib/bridge";
 import type { DesktopSettingsDto, VoiceDirectoriesDto, VoiceNewAgentDto, VoiceScreen, VoiceSecretId } from "../lib/bridge";
+import { voiceDeckStep } from "../lib/newAgent";
 import { agentKey } from "../lib/agentKey";
 import { LaunchCleanupError } from "../lib/actionError";
 import { applyTerminalChunk } from "../lib/terminalBuffer";
@@ -364,7 +365,14 @@ export function useDeckRuntime(): DeckRuntimeState {
    * routing "no matching action" into the deck's global error toast would
    * present a voice answer as a fault of the screen behind it.
    */
-  const declareVoiceScreen = useCallback((screen: VoiceScreen, directories?: VoiceDirectoriesDto, newAgent?: VoiceNewAgentDto) => bridge.declareVoiceScreen(screen, directories, newAgent), [bridge]);
+  /* PRD #1223 — the fleet as of the last render, so a declaration made from a
+     callback describes the deck step the New agent dialog would show NOW. */
+  const fleetRef = useRef(fleet);
+  fleetRef.current = fleet;
+  /* Every declaration carries the New agent dialog's deck step, computed from
+     the same `fleet` the dialog reads, so what voice says it preselected and
+     what the dialog preselects are judged against one list. */
+  const declareVoiceScreen = useCallback((screen: VoiceScreen, directories?: VoiceDirectoriesDto, newAgent?: VoiceNewAgentDto) => bridge.declareVoiceScreen(screen, directories, newAgent, voiceDeckStep(fleetRef.current)), [bridge]);
   const resolveVoice = useCallback((utterance: string) => bridge.resolveVoice(utterance), [bridge]);
   const voiceCommands = useCallback((screen: VoiceScreen, directories?: VoiceDirectoriesDto, newAgent?: VoiceNewAgentDto) => bridge.voiceCommands(screen, directories, newAgent), [bridge]);
   const voiceStart = useCallback(() => bridge.voiceStart(), [bridge]);

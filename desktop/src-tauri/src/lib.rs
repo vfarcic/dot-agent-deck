@@ -2763,6 +2763,33 @@ fn validate_voice_new_agent(new_agent: &voice::VoiceNewAgent) -> Result<(), Stri
     Ok(())
 }
 
+/// The bounds on the deck step a webview may declare (PRD #1223), checked by
+/// [`validate_voice_deck_step`] for [`validate_voice_directories`]' reason.
+///
+/// A deck step lists the observed fleet, a handful of decks; the reason is
+/// display text the webview has already cut to `DISPLAY_LIMITS.message` (240
+/// characters, so at most 960 bytes).
+const MAX_VOICE_DECK_STEP_ROWS: usize = 256;
+const MAX_VOICE_DECK_REASON_BYTES: usize = 1024;
+
+/// Refuse a deck step no real dialog could have produced.
+fn validate_voice_deck_step(deck_step: &[voice::VoiceDeckChoice]) -> Result<(), String> {
+    if deck_step.len() > MAX_VOICE_DECK_STEP_ROWS
+        || deck_step.iter().any(|choice| {
+            choice.deck_id.len() > MAX_VOICE_DECK_ID_BYTES
+                || choice
+                    .reason
+                    .as_ref()
+                    .is_some_and(|reason| reason.len() > MAX_VOICE_DECK_REASON_BYTES)
+        })
+    {
+        return Err(
+            "the deck list sent with that command is larger than any fleet shows".to_string(),
+        );
+    }
+    Ok(())
+}
+
 /// PRD #802 M6: take one utterance to an outcome carrying the sentence to show.
 ///
 /// # What it does NOT do
@@ -2797,6 +2824,12 @@ fn validate_voice_new_agent(new_agent: &voice::VoiceNewAgent) -> Result<(), Stri
 /// open. Same route, same reason, bounded by [`validate_voice_new_agent`], and
 /// likewise never sent to the daemon.
 ///
+/// **`deck_step` is the fourth**: the New agent dialog's deck step — every
+/// deck it lists and why each one it disables cannot take a spawn — declared
+/// on every utterance, because the row it matters to opens the dialog. It
+/// only annotates the decks read here ([`voice_decks`]), bounded by
+/// [`validate_voice_deck_step`], and never reaches the daemon either.
+///
 /// # One `ListAgents` per utterance
 ///
 /// [`get_snapshot`] fetches rather than reading a cache, which is one daemon
@@ -2819,6 +2852,7 @@ async fn desktop_voice_resolve(
     screen: voice::Screen,
     directories: Option<voice::VoiceDirectories>,
     new_agent: Option<voice::VoiceNewAgent>,
+    deck_step: Option<Vec<voice::VoiceDeckChoice>>,
 ) -> Result<voice::VoiceResult, String> {
     ensure_main_webview(&webview)?;
     if utterance.len() > MAX_UTTERANCE_BYTES {
@@ -2832,6 +2866,9 @@ async fn desktop_voice_resolve(
     if let Some(new_agent) = &new_agent {
         validate_voice_new_agent(new_agent)?;
     }
+    if let Some(deck_step) = &deck_step {
+        validate_voice_deck_step(deck_step)?;
+    }
     // Read per call rather than cached, for `voice_speech_settings`'s reason: a
     // user who changes the backend, the endpoint or the model uses it on the
     // next utterance instead of after a restart.
@@ -2841,7 +2878,7 @@ async fn desktop_voice_resolve(
         .unwrap_or_default();
     let resolver = voice::resolver_for(&settings.intent, Arc::new(KeychainSecretStore::new()));
     let snapshot = get_snapshot(&state.daemon).await;
-    let decks = voice_decks(&snapshot.observed);
+    let decks = voice_decks(&snapshot.observed, deck_step.as_deref());
     Ok(voice::handle_utterance_with(
         resolver.as_ref(),
         voice::table(),
@@ -2867,11 +2904,27 @@ async fn desktop_voice_resolve(
 /// The label is `deckName`'s (`desktop/src/lib/displayText.ts`): "Local deck"
 /// for the local endpoint, the `user@host[:port]` label for a remote one — so a
 /// report or an ambiguity sentence names a deck the way the screen does.
-fn voice_decks(observed: &[crate::dto::ObservedDeckDto]) -> Vec<voice::VoiceDeck> {
+///
+/// **Eligibility is the webview's `deck_step`**, the New agent dialog's deck
+/// step as it stands ([`voice::VoiceDeckChoice`] says why that one piece is
+/// declared): a deck it gives a reason keeps that reason, word for word, and a
+/// deck it does not list at all is one the webview's fleet has not heard from
+/// ([`voice::DECK_NOT_REPORTED`]). With no declaration every deck is taken as
+/// eligible, which is what voice assumed before it was told.
+fn voice_decks(
+    observed: &[crate::dto::ObservedDeckDto],
+    deck_step: Option<&[voice::VoiceDeckChoice]>,
+) -> Vec<voice::VoiceDeck> {
     observed
         .iter()
         .map(|deck| {
             let local = deck.deck_kind != "remote";
+            let unavailable = deck_step.and_then(|step| {
+                match step.iter().find(|choice| choice.deck_id == deck.deck_id) {
+                    Some(choice) => choice.reason.clone(),
+                    None => Some(voice::DECK_NOT_REPORTED.to_string()),
+                }
+            });
             voice::VoiceDeck {
                 id: deck.deck_id.clone(),
                 label: if local || deck.label.trim().is_empty() {
@@ -2880,6 +2933,7 @@ fn voice_decks(observed: &[crate::dto::ObservedDeckDto]) -> Vec<voice::VoiceDeck
                     deck.label.clone()
                 },
                 local,
+                unavailable,
             }
         })
         .collect()
@@ -4492,6 +4546,89 @@ mod tests {
         long_path.form.as_mut().expect("a form").path =
             "/".repeat(MAX_VOICE_DIRECTORY_PATH_BYTES + 1);
         assert!(validate_voice_new_agent(&long_path).is_err());
+    }
+
+    /// Scenario: the webview declares the New agent dialog's deck step with an
+    /// utterance — one deck eligible, one disabled with the reason the step
+    /// shows — and the fleet has a third deck the step does not list. Voice's
+    /// decks keep the declared reason word for word, take the unlisted deck as
+    /// not yet reported, and with no declaration treat every deck as eligible.
+    /// An oversized or unknown-shaped declaration is refused.
+    #[test]
+    fn voice_decks_take_eligibility_from_the_declared_deck_step() {
+        let observed =
+            |deck_id: &str, label: &str, deck_kind: &'static str| crate::dto::ObservedDeckDto {
+                deck_id: deck_id.to_string(),
+                label: label.to_string(),
+                deck_kind,
+            };
+        let fleet = [
+            observed("deck-local", "/run/deck.sock", "local"),
+            observed("deck-build", "deploy@build-box", "remote"),
+            observed("deck-new", "ci@new-box", "remote"),
+        ];
+        let step: Vec<voice::VoiceDeckChoice> = serde_json::from_value(serde_json::json!([
+            { "deckId": "deck-local" },
+            { "deckId": "deck-build", "reason": "No deck is listening on the configured socket." },
+            { "deckId": "deck-elsewhere", "reason": "not in this fleet" },
+        ]))
+        .expect("the webview's shape parses");
+        assert!(validate_voice_deck_step(&step).is_ok());
+
+        let decks = voice_decks(&fleet, Some(&step));
+        let unavailable = |id: &str| {
+            decks
+                .iter()
+                .find(|deck| deck.id == id)
+                .expect("an observed deck")
+                .unavailable
+                .clone()
+        };
+        assert_eq!(
+            decks.len(),
+            3,
+            "the fleet, not the declaration, lists the decks"
+        );
+        assert_eq!(unavailable("deck-local"), None);
+        assert_eq!(
+            unavailable("deck-build").as_deref(),
+            Some("No deck is listening on the configured socket.")
+        );
+        assert_eq!(
+            unavailable("deck-new").as_deref(),
+            Some(voice::DECK_NOT_REPORTED)
+        );
+        assert!(
+            voice_decks(&fleet, None)
+                .iter()
+                .all(voice::VoiceDeck::eligible),
+            "no declaration, no narrowing"
+        );
+
+        assert!(
+            serde_json::from_value::<Vec<voice::VoiceDeckChoice>>(serde_json::json!([
+                { "deckId": "deck-local", "eligible": true },
+            ]))
+            .is_err(),
+            "nothing the declaration does not name"
+        );
+        let many: Vec<voice::VoiceDeckChoice> = (0..=MAX_VOICE_DECK_STEP_ROWS)
+            .map(|index| voice::VoiceDeckChoice {
+                deck_id: format!("deck-{index}"),
+                reason: None,
+            })
+            .collect();
+        assert!(validate_voice_deck_step(&many).is_err());
+        let long_reason = [voice::VoiceDeckChoice {
+            deck_id: "deck-local".to_string(),
+            reason: Some("x".repeat(MAX_VOICE_DECK_REASON_BYTES + 1)),
+        }];
+        assert!(validate_voice_deck_step(&long_reason).is_err());
+        let long_id = [voice::VoiceDeckChoice {
+            deck_id: "d".repeat(MAX_VOICE_DECK_ID_BYTES + 1),
+            reason: None,
+        }];
+        assert!(validate_voice_deck_step(&long_id).is_err());
     }
 
     /// The declaration's wire shape is the webview's: camelCase, and nothing

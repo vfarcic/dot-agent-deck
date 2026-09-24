@@ -686,6 +686,18 @@ export interface VoiceDirectoriesDto {
 }
 
 /**
+ * One row of the New agent dialog's deck step, declared with every utterance
+ * (PRD #1223) — `voice::VoiceDeckChoice`. `reason` is the sentence the step
+ * shows beside a deck that cannot take a spawn (`deckChoices`), absent when it
+ * can. Rust offers the model only the decks without one, and names a deck
+ * with one by that reason instead of claiming to preselect it.
+ */
+export interface VoiceDeckChoiceDto {
+  deckId: string;
+  reason?: string;
+}
+
+/**
  * What the New agent dialog shows BESIDES its browser, declared with an
  * utterance while the dialog is open (PRD #1223) — `voice::VoiceNewAgent`.
  *
@@ -1456,9 +1468,12 @@ export interface DeckBridge {
    * `undefined` when it is showing nothing. It rides the same declaration for
    * the same reason, and is what makes the directory rows callable at all.
    * `newAgent` is the third: the New agent dialog's form, present while the
-   * dialog is open ({@link VoiceNewAgentDto}).
+   * dialog is open ({@link VoiceNewAgentDto}). `deckStep` is the fourth: the
+   * dialog's deck step for the fleet as it stands ({@link VoiceDeckChoiceDto}),
+   * which the runtime adds to every declaration because the row it matters to
+   * opens the dialog.
    */
-  declareVoiceScreen(screen: VoiceScreen, directories?: VoiceDirectoriesDto, newAgent?: VoiceNewAgentDto): void;
+  declareVoiceScreen(screen: VoiceScreen, directories?: VoiceDirectoriesDto, newAgent?: VoiceNewAgentDto, deckStep?: VoiceDeckChoiceDto[]): void;
   /**
    * Take one utterance — transcribed from the microphone — to an outcome
    * carrying the sentence to show (PRD #802 M6).
@@ -3881,16 +3896,19 @@ export class TauriDeckBridge implements DeckBridge {
   private voiceDirectories: VoiceDirectoriesDto | undefined;
   /** PRD #1223 — the New agent dialog declared with it, while it is open. */
   private voiceNewAgent: VoiceNewAgentDto | undefined;
+  /** PRD #1223 — the dialog's deck step for the fleet as it stood. */
+  private voiceDeckStep: VoiceDeckChoiceDto[] | undefined;
 
-  declareVoiceScreen(screen: VoiceScreen, directories?: VoiceDirectoriesDto, newAgent?: VoiceNewAgentDto): void {
+  declareVoiceScreen(screen: VoiceScreen, directories?: VoiceDirectoriesDto, newAgent?: VoiceNewAgentDto, deckStep?: VoiceDeckChoiceDto[]): void {
     this.voiceScreen = screen;
     this.voiceDirectories = directories;
     this.voiceNewAgent = newAgent;
+    this.voiceDeckStep = deckStep;
   }
 
   async resolveVoice(utterance: string): Promise<VoiceResultDto> {
     const invoke = await this.getInvoke();
-    return invoke<VoiceResultDto>("desktop_voice_resolve", { utterance, screen: this.voiceScreen, directories: this.voiceDirectories ?? null, newAgent: this.voiceNewAgent ?? null });
+    return invoke<VoiceResultDto>("desktop_voice_resolve", { utterance, screen: this.voiceScreen, directories: this.voiceDirectories ?? null, newAgent: this.voiceNewAgent ?? null, deckStep: this.voiceDeckStep ?? null });
   }
 
   /**

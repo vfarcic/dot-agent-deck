@@ -426,6 +426,19 @@ action = "open_new_agent"
 outcome = "dispatch"
 resolved_deck = "deck-local"
 
+# PRD #1223 — a deck the New agent dialog shows DISABLED (`ci@stale-box`, whose
+# daemon is not listening). It is never offered to the model, so it cannot be
+# preselected — the harness checks that on every fixture — and when the user
+# names it the report must say it cannot take a new agent, with the deck step's
+# own reason, rather than claim a preselection the dialog will not make.
+[[fixtures]]
+name = "open-new-agent-on-a-deck-that-cannot-take-one"
+utterance = "new agent on the stale box"
+screen = "overview"
+action = "open_new_agent"
+outcome = "dispatch"
+names_unavailable_deck = true
+
 [[fixtures]]
 name = "open-new-agent-unavailable"
 utterance = "start a new agent"
