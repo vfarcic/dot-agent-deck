@@ -137,7 +137,9 @@ fn detach_quit(deck: &mut TuiDeck) {
 /// `review-team [config drift]`, the status line explains the marker, and the
 /// detach-quit prints a warning naming the orchestration, its directory and the
 /// roles it is running. After instead renaming a role (`coder` → `qa`), the tab
-/// is marked again and the exit warning names both role lists. With the file
+/// is marked again and the exit warning names both role lists. With a file that
+/// does not parse, the tab is marked and the exit warning names the file as
+/// unloadable. With the file
 /// deleted — the branch a remote reconnect takes — the tab reattaches unmarked
 /// and nothing about drift is printed.
 #[spec("session/restore/020")]
@@ -217,6 +219,30 @@ fn restore_020_reattach_surfaces_orchestration_config_drift() {
         "the exit warning must name the running and the configured roles"
     );
     drop(role_renamed);
+
+    // A file that exists but does not parse falls back to the daemon's roles
+    // exactly like an absent one, and must not be quiet like one (Qodo on PR
+    // #1281).
+    std::fs::write(
+        project.path().join(".dot-agent-deck.toml"),
+        "[[orchestrations]\nname = ",
+    )
+    .expect("write malformed config");
+    let mut malformed = launch_tui_against(&daemon);
+    wait_for_rebuilt_tab(&malformed);
+    malformed.wait_until_grid("the unreadable-config tab carries the marker", |grid| {
+        grid.lines()
+            .next()
+            .is_some_and(|tabs| tabs.contains(&format!("{ORCHESTRATION} {MARKER}")))
+    });
+    detach_quit(&mut malformed);
+    let stream = malformed.stream_text();
+    assert!(
+        stream.contains(&format!("{cwd}/.dot-agent-deck.toml could not be loaded"))
+            && stream.contains(&format!("orchestration '{ORCHESTRATION}' was rebuilt")),
+        "the exit warning must name the unreadable file and the orchestration"
+    );
+    drop(malformed);
 
     // No file at all: the branch a remote reconnect takes (PRD #111), where the
     // synthesised tab is the right answer and a warning would be noise.

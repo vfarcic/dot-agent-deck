@@ -3161,21 +3161,31 @@ pub fn resolve_orch_config_for_hydration(
 /// exit warnings.
 pub const CONFIG_DRIFT_TAB_MARKER: &str = "[config drift]";
 
+/// Issue #554: the one-column PREFIX a drifted tab's strip label also carries.
+/// The strip truncates labels from the tail (`fit_tab_labels` keeps the head
+/// and appends `…`), so the spelled-out suffix is the first thing a crowded
+/// strip drops — while the status line has expired and the exit warning is not
+/// printed yet (Greptile on PR #1281). The prefix survives any truncation that
+/// leaves the label a visible character. ASCII, so its width cannot vary by
+/// terminal.
+pub const CONFIG_DRIFT_TAB_PREFIX: &str = "!";
+
 /// Issue #554: the strip label of an orchestration tab — its title, a status
-/// suffix, and [`CONFIG_DRIFT_TAB_MARKER`] when the tab was rebuilt from daemon
-/// role metadata that no longer matches the project config. Extracted from the
-/// render loop so the label is testable without a terminal.
+/// suffix, and, when the tab was rebuilt from daemon role metadata that no
+/// longer matches the project config, [`CONFIG_DRIFT_TAB_PREFIX`] in front and
+/// [`CONFIG_DRIFT_TAB_MARKER`] behind. Extracted from the render loop so the
+/// label is testable without a terminal.
 pub fn orchestration_tab_label(name: &str, status: &OrchestrationStatus, drifted: bool) -> String {
-    let mut label = match status {
+    let label = match status {
         OrchestrationStatus::Completed => format!("{name} [done]"),
         OrchestrationStatus::Delegated => format!("{name} [active]"),
         OrchestrationStatus::WaitingForOrchestrator => name.to_string(),
     };
     if drifted {
-        label.push(' ');
-        label.push_str(CONFIG_DRIFT_TAB_MARKER);
+        format!("{CONFIG_DRIFT_TAB_PREFIX} {label} {CONFIG_DRIFT_TAB_MARKER}")
+    } else {
+        label
     }
-    label
 }
 
 /// Issue #554: put a drift warning from [`orchestration_config_drift_warning`]
@@ -3203,7 +3213,7 @@ fn surface_orchestration_config_drift(ui: &mut UiState, tab: Option<&Tab>, warni
     };
     let summary = if marked_this_tab {
         format!(
-            "Config drift: an orchestration tab marked {CONFIG_DRIFT_TAB_MARKER} no longer matches \
+            "Config drift: an orchestration tab marked {CONFIG_DRIFT_TAB_PREFIX} … {CONFIG_DRIFT_TAB_MARKER} no longer matches \
              {file} — details are printed on exit"
         )
     } else {
@@ -3213,6 +3223,21 @@ fn surface_orchestration_config_drift(ui: &mut UiState, tab: Option<&Tab>, warni
     };
     ui.status_message = Some((summary, std::time::Instant::now()));
     ui.session_warnings.push(warning);
+}
+
+/// Issue #554: what the TUI found when it looked for the project config of an
+/// orchestration it is about to rebuild — the input to
+/// [`orchestration_config_drift_warning`]. Three states rather than an
+/// `Option`, because "no file" and "a file that failed to load" both fall back
+/// to the daemon's roles but only the first is expected (Qodo on PR #1281).
+#[derive(Debug, Clone, Copy)]
+pub enum LocalOrchestrationConfig<'a> {
+    /// No `.dot-agent-deck.toml` in the orchestration's cwd.
+    Absent,
+    /// The file exists but reading or parsing it failed; carries the error.
+    Unreadable(&'a str),
+    /// The file loaded; carries the orchestration of this name, if it lists one.
+    Loaded(Option<&'a crate::project_config::OrchestrationConfig>),
 }
 
 /// Issue #554: decide whether rebuilding an orchestration tab from `bucket` is
@@ -3225,11 +3250,16 @@ fn surface_orchestration_config_drift(ui: &mut UiState, tab: Option<&Tab>, warni
 /// has, or shows the file's names over panes the daemon knows by others — and a
 /// delegate to a renamed role reaches no pane. Both used to be one `info!` line.
 ///
-/// - `config_present == false` → `None`. The file could not be read for
-///   `bucket.cwd` at all, which is the legitimate remote-reconnect case
-///   (PRD #111: a laptop TUI on a VM daemon whose cwd is not local). The
-///   synthesised config is the right answer there and warning on every
-///   remote reconnect would be noise.
+/// - [`LocalOrchestrationConfig::Absent`] → `None`. There is no file for
+///   `bucket.cwd`, which is the legitimate remote-reconnect case (PRD #111: a
+///   laptop TUI on a VM daemon whose cwd is not local). The synthesised config
+///   is the right answer there and warning on every remote reconnect would be
+///   noise.
+/// - [`LocalOrchestrationConfig::Unreadable`] → a warning naming the file and
+///   the load error. The file exists but could not be read or parsed, so the
+///   tab falls back to the daemon's roles exactly as if it were absent — the
+///   one thing that must not happen quietly, because the user's edit is what
+///   broke it (Qodo on PR #1281).
 /// - the file is present but lists no orchestration named
 ///   `bucket.orchestration_name` → a warning naming it, its cwd and the roles
 ///   the daemon is running.
@@ -3244,11 +3274,10 @@ fn surface_orchestration_config_drift(ui: &mut UiState, tab: Option<&Tab>, warni
 /// prefers the local config — because re-slotting live panes against a changed
 /// role list is a separate decision (issue #554).
 pub fn orchestration_config_drift_warning(
-    config_present: bool,
-    local: Option<&crate::project_config::OrchestrationConfig>,
+    local: LocalOrchestrationConfig<'_>,
     bucket: &OrchestrationHydrationBucket,
 ) -> Option<String> {
-    if !config_present {
+    if matches!(local, LocalOrchestrationConfig::Absent) {
         return None;
     }
     // The live slots in role order, first-wins on a duplicate index — the same
@@ -3276,6 +3305,19 @@ pub fn orchestration_config_drift_warning(
     let consequence = "`dot-agent-deck delegate` still routes to these panes by the role names \
                        they were started with; restart the orchestration to pick up the file's \
                        roles.";
+    let local = match local {
+        LocalOrchestrationConfig::Absent => return None,
+        LocalOrchestrationConfig::Unreadable(error) => {
+            return Some(format!(
+                "Warning: config drift — {cwd}/{file} could not be loaded ({error}), so orchestration \
+                 '{name}' was rebuilt from the roles the daemon started it with ({roles}), not \
+                 from the project config. {consequence}",
+                file = crate::project_config::CONFIG_FILE_NAME,
+                roles = running.join(", "),
+            ));
+        }
+        LocalOrchestrationConfig::Loaded(local) => local,
+    };
     let Some(local) = local else {
         return Some(format!(
             "Warning: config drift — orchestration '{name}' is not listed in {cwd}/{file}, so its \
@@ -3293,10 +3335,27 @@ pub fn orchestration_config_drift_warning(
         return None;
     }
     let configured: Vec<&str> = local.roles.iter().map(|r| r.name.as_str()).collect();
+    // A live slot past the file's last role is not relabelled — every rebuild
+    // path drops it from the tab (Greptile on PR #1281) — so say so rather than
+    // imply it is on screen under another name.
+    let left_out: Vec<&str> = slots
+        .iter()
+        .zip(&running)
+        .filter(|(s, _)| s.role_index >= local.roles.len())
+        .map(|(_, name)| name.as_str())
+        .collect();
+    let placement = if left_out.is_empty() {
+        "its tab labels them from the file".to_string()
+    } else {
+        format!(
+            "its tab labels the ones the file still has a slot for from the file, and leaves \
+             out {}",
+            left_out.join(", ")
+        )
+    };
     Some(format!(
         "Warning: config drift — orchestration '{name}' in {cwd} was started with roles \
-         ({running}) that no longer match {file} ({configured}); its tab labels them from the \
-         file. {consequence}",
+         ({running}) that no longer match {file} ({configured}); {placement}. {consequence}",
         file = crate::project_config::CONFIG_FILE_NAME,
         running = running.join(", "),
         configured = configured.join(", "),
@@ -5389,19 +5448,21 @@ fn surface_one_orchestration(
             })
             .collect(),
     };
-    let project_config = load_project_config(Path::new(&surface.cwd)).ok().flatten();
-    let config_present = project_config.is_some();
-    let local = project_config.and_then(|c| {
-        c.orchestrations
-            .into_iter()
-            .find(|o| o.name == surface.name)
-    });
-    // Issue #554: the same drift decision as reconnect hydration. Computed
-    // here, before `local` is consumed, and surfaced only on the path below
-    // that builds a NEW tab — growing an existing tab (the branch that
-    // returns early) reuses a tab whose drift, if any, was decided when it
-    // was built.
-    let drift_warning = orchestration_config_drift_warning(config_present, local.as_ref(), &bucket);
+    let project_config = load_project_config(Path::new(&surface.cwd)).map_err(|e| e.to_string());
+    let local = project_config
+        .as_ref()
+        .ok()
+        .and_then(Option::as_ref)
+        .and_then(|c| c.orchestrations.iter().find(|o| o.name == surface.name))
+        .cloned();
+    // Issue #554: the same drift decision as reconnect hydration, surfaced on
+    // both paths below — growing an existing tab and building a new one.
+    let lookup = match &project_config {
+        Err(error) => LocalOrchestrationConfig::Unreadable(error),
+        Ok(None) => LocalOrchestrationConfig::Absent,
+        Ok(Some(_)) => LocalOrchestrationConfig::Loaded(local.as_ref()),
+    };
+    let drift_warning = orchestration_config_drift_warning(lookup, &bucket);
     let orch_config = resolve_orch_config_for_hydration(local, &bucket);
 
     // Issue #868: the `already_built` guard above only catches a duplicate
@@ -5642,6 +5703,27 @@ fn surface_one_orchestration(
                 orchestration = %surface.name,
                 "live orchestration surface: grew existing tab with newly-spawned role(s)"
             );
+        }
+        // Issue #554 (Greptile on PR #1281): a role spawned into a tab whose
+        // config changed since it opened is drift too — the new pane is
+        // labelled from the current file while the daemon registered the name
+        // it spawned under. Surfaced once per tab: a tab already marked has
+        // already said this, and repeating it on every spawn would only keep
+        // resetting the status line.
+        if let Some(warning) = drift_warning {
+            let tab = tab_manager.tabs().get(existing_tab_index);
+            let already_marked = matches!(
+                tab,
+                Some(Tab::Orchestration { id, .. }) if ui.config_drift_tabs.contains(id)
+            );
+            if !already_marked {
+                tracing::warn!(
+                    cwd = %surface.cwd,
+                    orchestration = %surface.name,
+                    "live orchestration surface: {warning}"
+                );
+                surface_orchestration_config_drift(ui, tab, warning);
+            }
         }
         return;
     }
@@ -12775,31 +12857,27 @@ pub fn run_tui(
             }
         }
         // Cache cwd → project config so the lookup happens once per
-        // distinct cwd regardless of how many buckets share it.
-        let mut config_cache: std::collections::HashMap<
-            String,
-            Option<crate::project_config::ProjectConfig>,
-        > = std::collections::HashMap::new();
-        let lookup_config = |cache: &mut std::collections::HashMap<
-            String,
-            Option<crate::project_config::ProjectConfig>,
-        >,
+        // distinct cwd regardless of how many buckets share it. A load error
+        // is kept as `Err` (issue #554, Qodo on PR #1281) so the orchestration
+        // loop can tell it apart from an absent file; mode tabs still treat
+        // both as "no config".
+        type ConfigLookup = Result<Option<crate::project_config::ProjectConfig>, String>;
+        let mut config_cache: std::collections::HashMap<String, ConfigLookup> =
+            std::collections::HashMap::new();
+        let lookup_config = |cache: &mut std::collections::HashMap<String, ConfigLookup>,
                              cwd: &str|
-         -> Option<crate::project_config::ProjectConfig> {
+         -> ConfigLookup {
             if let Some(cached) = cache.get(cwd) {
                 return cached.clone();
             }
-            let loaded = match load_project_config(std::path::Path::new(cwd)) {
-                Ok(opt) => opt,
-                Err(e) => {
-                    tracing::error!(
-                        cwd = %cwd,
-                        error = %e,
-                        "hydration: failed to load project config; dropping mode/orchestration tabs to dashboard"
-                    );
-                    None
-                }
-            };
+            let loaded = load_project_config(std::path::Path::new(cwd)).map_err(|e| {
+                tracing::error!(
+                    cwd = %cwd,
+                    error = %e,
+                    "hydration: failed to load project config; mode tabs drop to dashboard, orchestration tabs rebuild from daemon roles"
+                );
+                e.to_string()
+            });
             cache.insert(cwd.to_string(), loaded.clone());
             loaded
         };
@@ -12812,7 +12890,7 @@ pub fn run_tui(
         // is active, but spawning at the right size avoids the 24×80 hiccup.
         let hydration_frame_area = terminal.get_frame().area();
         for bucket in &partition.mode_buckets {
-            let cfg = lookup_config(&mut config_cache, &bucket.cwd);
+            let cfg = lookup_config(&mut config_cache, &bucket.cwd).ok().flatten();
             let mode_config = cfg
                 .as_ref()
                 .and_then(|c| c.modes.iter().find(|m| m.name == bucket.mode_name).cloned());
@@ -12857,7 +12935,7 @@ pub fn run_tui(
         let mut first_orchestration_tab_index: Option<usize> = None;
         for bucket in &partition.orchestration_buckets {
             let cfg = lookup_config(&mut config_cache, &bucket.cwd);
-            let local_orch_config = cfg.as_ref().and_then(|c| {
+            let local_orch_config = cfg.as_ref().ok().and_then(Option::as_ref).and_then(|c| {
                 c.orchestrations
                     .iter()
                     .find(|o| o.name == bucket.orchestration_name)
@@ -12879,7 +12957,7 @@ pub fn run_tui(
             // stays at `info!` and off the screen; drift against a file that
             // WAS read is decided by the pure helper and surfaced below, once
             // the tab exists to carry the marker.
-            if local_orch_config.is_none() && cfg.is_none() {
+            if matches!(cfg, Ok(None)) {
                 tracing::info!(
                     cwd = %bucket.cwd,
                     orchestration = %bucket.orchestration_name,
@@ -12887,11 +12965,12 @@ pub fn run_tui(
                     "hydration: rebuilding orchestration tab from synthesised config (local .dot-agent-deck.toml absent — remote daemon path)"
                 );
             }
-            let drift_warning = orchestration_config_drift_warning(
-                cfg.is_some(),
-                local_orch_config.as_ref(),
-                bucket,
-            );
+            let lookup = match &cfg {
+                Err(error) => LocalOrchestrationConfig::Unreadable(error),
+                Ok(None) => LocalOrchestrationConfig::Absent,
+                Ok(Some(_)) => LocalOrchestrationConfig::Loaded(local_orch_config.as_ref()),
+            };
+            let drift_warning = orchestration_config_drift_warning(lookup, bucket);
             if let Some(warning) = &drift_warning {
                 tracing::warn!(
                     cwd = %bucket.cwd,
@@ -41929,7 +42008,10 @@ mod config_drift_tests {
     #[test]
     fn drift_warning_is_silent_when_the_config_file_is_absent() {
         let b = bucket("review", &[(0, "lead"), (1, "coder")]);
-        assert_eq!(orchestration_config_drift_warning(false, None, &b), None);
+        assert_eq!(
+            orchestration_config_drift_warning(LocalOrchestrationConfig::Absent, &b),
+            None
+        );
     }
 
     /// The issue's reported case: the file was read and does not list the
@@ -41938,8 +42020,9 @@ mod config_drift_tests {
     #[test]
     fn drift_warning_names_an_orchestration_the_file_no_longer_lists() {
         let b = bucket("review", &[(1, "coder"), (0, "lead")]);
-        let warning = orchestration_config_drift_warning(true, None, &b)
-            .expect("a config that does not list the orchestration is drift");
+        let warning =
+            orchestration_config_drift_warning(LocalOrchestrationConfig::Loaded(None), &b)
+                .expect("a config that does not list the orchestration is drift");
         for needle in [
             "config drift",
             "'review'",
@@ -41947,6 +42030,30 @@ mod config_drift_tests {
             ".dot-agent-deck.toml",
             "(lead, coder)",
             "dot-agent-deck delegate",
+        ] {
+            assert!(
+                warning.contains(needle),
+                "warning must contain {needle:?}: {warning}"
+            );
+        }
+    }
+
+    /// Qodo on PR #1281: a file that exists but fails to load falls back to the
+    /// daemon's roles exactly like an absent one, and must not be quiet like it.
+    #[test]
+    fn drift_warning_names_a_config_file_that_failed_to_load() {
+        let b = bucket("review", &[(0, "lead"), (1, "coder")]);
+        let warning = orchestration_config_drift_warning(
+            LocalOrchestrationConfig::Unreadable("TOML parse error at line 3"),
+            &b,
+        )
+        .expect("an unreadable config is drift, not the quiet remote case");
+        for needle in [
+            "/work/proj/.dot-agent-deck.toml",
+            "could not be loaded",
+            "TOML parse error at line 3",
+            "'review'",
+            "(lead, coder)",
         ] {
             assert!(
                 warning.contains(needle),
@@ -41963,7 +42070,7 @@ mod config_drift_tests {
         // A dead `tester` slot is absent from the bucket; that is not drift.
         let b = bucket("review", &[(0, "lead"), (1, "coder")]);
         assert_eq!(
-            orchestration_config_drift_warning(true, Some(&local), &b),
+            orchestration_config_drift_warning(LocalOrchestrationConfig::Loaded(Some(&local)), &b),
             None
         );
     }
@@ -41975,8 +42082,9 @@ mod config_drift_tests {
     fn drift_warning_names_both_role_lists_after_a_role_rename() {
         let local = config("review", &["lead", "qa"]);
         let b = bucket("review", &[(0, "lead"), (1, "tester")]);
-        let warning = orchestration_config_drift_warning(true, Some(&local), &b)
-            .expect("a renamed role is drift");
+        let warning =
+            orchestration_config_drift_warning(LocalOrchestrationConfig::Loaded(Some(&local)), &b)
+                .expect("a renamed role is drift");
         assert!(
             warning.contains("(lead, tester)") && warning.contains("(lead, qa)"),
             "warning must name the running and the configured roles: {warning}"
@@ -41989,11 +42097,20 @@ mod config_drift_tests {
 
     /// A role removed from the end of the file leaves a live slot past the
     /// configured roles — drift, even though every configured name matches.
+    /// The rebuild drops such a slot from the tab (Greptile on PR #1281), so
+    /// the warning must say it is left out rather than relabelled.
     #[test]
     fn drift_warning_fires_for_a_live_slot_past_the_configured_roles() {
         let local = config("review", &["lead"]);
         let b = bucket("review", &[(0, "lead"), (1, "coder")]);
-        assert!(orchestration_config_drift_warning(true, Some(&local), &b).is_some());
+        let warning =
+            orchestration_config_drift_warning(LocalOrchestrationConfig::Loaded(Some(&local)), &b)
+                .expect("a live slot past the configured roles is drift");
+        assert!(warning.contains("leaves out coder"), "{warning}");
+        assert!(
+            !warning.contains("its tab labels them from the file"),
+            "{warning}"
+        );
     }
 
     /// A daemon older than PRD #111 echoes no role name. That says nothing about
@@ -42003,7 +42120,7 @@ mod config_drift_tests {
         let local = config("review", &["lead", "coder"]);
         let b = bucket("review", &[(0, ""), (1, "coder")]);
         assert_eq!(
-            orchestration_config_drift_warning(true, Some(&local), &b),
+            orchestration_config_drift_warning(LocalOrchestrationConfig::Loaded(Some(&local)), &b),
             None
         );
     }
@@ -42014,7 +42131,9 @@ mod config_drift_tests {
     #[test]
     fn drift_warning_reports_the_first_slot_of_a_duplicate_index() {
         let b = bucket("review", &[(0, "lead"), (0, "impostor"), (1, "coder")]);
-        let warning = orchestration_config_drift_warning(true, None, &b).expect("drift");
+        let warning =
+            orchestration_config_drift_warning(LocalOrchestrationConfig::Loaded(None), &b)
+                .expect("drift");
         assert!(warning.contains("(lead, coder)"), "{warning}");
         assert!(!warning.contains("impostor"), "{warning}");
     }
@@ -42035,11 +42154,11 @@ mod config_drift_tests {
         );
         assert_eq!(
             orchestration_tab_label("review", &OrchestrationStatus::Completed, true),
-            "review [done] [config drift]"
+            "! review [done] [config drift]"
         );
         assert_eq!(
             orchestration_tab_label("review", &OrchestrationStatus::WaitingForOrchestrator, true),
-            "review [config drift]"
+            "! review [config drift]"
         );
     }
 
@@ -42109,7 +42228,7 @@ mod config_drift_tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(labels, vec!["review [config drift]", "build"]);
+        assert_eq!(labels, vec!["! review [config drift]", "build"]);
     }
 
     /// A tab that is not an orchestration tab (or none at all) must not be
