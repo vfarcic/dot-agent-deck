@@ -2187,6 +2187,13 @@ struct UiState {
     command_entry_locked: bool,
     /// Warnings collected during session save/restore, flushed after terminal restore.
     session_warnings: Vec<String>,
+    /// Issue #554: orchestration tabs rebuilt from a daemon whose role metadata
+    /// no longer matches the project config (see
+    /// [`orchestration_config_drift_warning`]). Their tab-strip label carries
+    /// [`CONFIG_DRIFT_TAB_MARKER`] for as long as the tab lives. Keyed by
+    /// [`TabId`], which `TabManager` allocates monotonically and never reuses,
+    /// so an entry left behind by a closed tab can never mark a later one.
+    config_drift_tabs: HashSet<TabId>,
     /// PRD #89 review-fix G1: tracks whether the most recent periodic snapshot
     /// write (in `flush_session_snapshot_if_due`) failed. F10 keeps the
     /// coalescer dirty on failure so the next loop retries; on a *persistent*
@@ -2571,6 +2578,7 @@ impl UiState {
             pane_layout: PaneLayout::Stacked,
             command_entry_locked: true,
             session_warnings: Vec::new(),
+            config_drift_tabs: HashSet::new(),
             session_snapshot_write_failed: false,
             selection: None,
             focused_pane_rect: None,
@@ -3122,9 +3130,9 @@ pub struct OrchestrationRoleSlot {
 ///   same role names, same start role) but enrichment fields are
 ///   defaulted.
 ///
-/// The hydration call site decides which `tracing::info!` line to
-/// emit *before* calling this helper so the "config absent" vs
-/// "config drift" distinction (auditor nit) stays observable.
+/// The "config absent" vs "config drift" distinction is not made here:
+/// callers ask [`orchestration_config_drift_warning`] first, which stays
+/// quiet for an absent file and surfaces drift to the user (issue #554).
 pub fn resolve_orch_config_for_hydration(
     local: Option<crate::project_config::OrchestrationConfig>,
     bucket: &OrchestrationHydrationBucket,
@@ -3145,6 +3153,154 @@ pub fn resolve_orch_config_for_hydration(
         &bucket.orchestration_name,
         &synthesis_slots,
     )
+}
+
+/// Issue #554: the suffix an orchestration tab's strip label carries when
+/// [`orchestration_config_drift_warning`] fired for it. Short on purpose — the
+/// strip truncates — and the full explanation is on the status line and in the
+/// exit warnings.
+pub const CONFIG_DRIFT_TAB_MARKER: &str = "[config drift]";
+
+/// Issue #554: the strip label of an orchestration tab — its title, a status
+/// suffix, and [`CONFIG_DRIFT_TAB_MARKER`] when the tab was rebuilt from daemon
+/// role metadata that no longer matches the project config. Extracted from the
+/// render loop so the label is testable without a terminal.
+pub fn orchestration_tab_label(name: &str, status: &OrchestrationStatus, drifted: bool) -> String {
+    let mut label = match status {
+        OrchestrationStatus::Completed => format!("{name} [done]"),
+        OrchestrationStatus::Delegated => format!("{name} [active]"),
+        OrchestrationStatus::WaitingForOrchestrator => name.to_string(),
+    };
+    if drifted {
+        label.push(' ');
+        label.push_str(CONFIG_DRIFT_TAB_MARKER);
+    }
+    label
+}
+
+/// Issue #554: put a drift warning from [`orchestration_config_drift_warning`]
+/// in front of the user, for the orchestration tab it was computed for.
+///
+/// Three surfaces, because each covers a gap in the others: the tab keeps
+/// [`CONFIG_DRIFT_TAB_MARKER`] on its strip label for as long as it lives (the
+/// status line expires after [`STATUS_MESSAGE_TTL`]); the status line says what
+/// the marker means at the moment the tab appears; and the full message — which
+/// names the roles on both sides and is too long for one status row — joins
+/// `session_warnings`, printed to stderr when the deck exits, which is where the
+/// snapshot-restore path reports the same drift class.
+///
+/// `tab` is the tab the rebuild just opened; anything but an orchestration tab
+/// (including `None`) records the warning without a marker rather than marking
+/// the wrong tab.
+fn surface_orchestration_config_drift(ui: &mut UiState, tab: Option<&Tab>, warning: String) {
+    let file = crate::project_config::CONFIG_FILE_NAME;
+    let marked_this_tab = match tab {
+        Some(Tab::Orchestration { id, .. }) => {
+            ui.config_drift_tabs.insert(*id);
+            true
+        }
+        _ => false,
+    };
+    let summary = if marked_this_tab {
+        format!(
+            "Config drift: an orchestration tab marked {CONFIG_DRIFT_TAB_MARKER} no longer matches \
+             {file} — details are printed on exit"
+        )
+    } else {
+        format!(
+            "Config drift: an orchestration no longer matches {file} — details are printed on exit"
+        )
+    };
+    ui.status_message = Some((summary, std::time::Instant::now()));
+    ui.session_warnings.push(warning);
+}
+
+/// Issue #554: decide whether rebuilding an orchestration tab from `bucket` is
+/// config drift the user has to be told about, and if so, what to tell them.
+///
+/// The daemon routes `dot-agent-deck delegate` by the role name recorded for
+/// each pane when it was started (its `pane_role_map`), and does not re-derive
+/// that name from `.dot-agent-deck.toml` while the pane runs. So once the file
+/// stops matching those names, the tab either shows roles the file no longer
+/// has, or shows the file's names over panes the daemon knows by others — and a
+/// delegate to a renamed role reaches no pane. Both used to be one `info!` line.
+///
+/// - `config_present == false` → `None`. The file could not be read for
+///   `bucket.cwd` at all, which is the legitimate remote-reconnect case
+///   (PRD #111: a laptop TUI on a VM daemon whose cwd is not local). The
+///   synthesised config is the right answer there and warning on every
+///   remote reconnect would be noise.
+/// - the file is present but lists no orchestration named
+///   `bucket.orchestration_name` → a warning naming it, its cwd and the roles
+///   the daemon is running.
+/// - the file lists it, but a live slot's daemon-recorded role name differs
+///   from the file's role at that index (a renamed, removed or re-ordered role)
+///   → a warning naming both lists. A slot whose `role_name` is empty (a daemon
+///   older than PRD #111 echoes none) is not evidence either way and is
+///   skipped.
+///
+/// Pure: the caller decides where the message goes. It does not change which
+/// config the tab is built from — [`resolve_orch_config_for_hydration`] still
+/// prefers the local config — because re-slotting live panes against a changed
+/// role list is a separate decision (issue #554).
+pub fn orchestration_config_drift_warning(
+    config_present: bool,
+    local: Option<&crate::project_config::OrchestrationConfig>,
+    bucket: &OrchestrationHydrationBucket,
+) -> Option<String> {
+    if !config_present {
+        return None;
+    }
+    // The live slots in role order, first-wins on a duplicate index — the same
+    // rule the hydration loop and `synthesize_from_bucket_metadata` apply, so
+    // the names reported are the ones the tab was actually built from.
+    let mut slots: Vec<&OrchestrationRoleSlot> = Vec::new();
+    for slot in &bucket.role_slots {
+        if !slots.iter().any(|s| s.role_index == slot.role_index) {
+            slots.push(slot);
+        }
+    }
+    slots.sort_by_key(|s| s.role_index);
+    let running: Vec<String> = slots
+        .iter()
+        .map(|s| {
+            if s.role_name.is_empty() {
+                format!("role-{}", s.role_index)
+            } else {
+                s.role_name.clone()
+            }
+        })
+        .collect();
+    let name = &bucket.orchestration_name;
+    let cwd = &bucket.cwd;
+    let consequence = "`dot-agent-deck delegate` still routes to these panes by the role names \
+                       they were started with; restart the orchestration to pick up the file's \
+                       roles.";
+    let Some(local) = local else {
+        return Some(format!(
+            "Warning: config drift — orchestration '{name}' is not listed in {cwd}/{file}, so its \
+             tab shows the roles the daemon started it with ({roles}), not the project config. \
+             {consequence}",
+            file = crate::project_config::CONFIG_FILE_NAME,
+            roles = running.join(", "),
+        ));
+    };
+    let diverged = slots.iter().any(|s| {
+        !s.role_name.is_empty()
+            && local.roles.get(s.role_index).map(|r| r.name.as_str()) != Some(s.role_name.as_str())
+    });
+    if !diverged {
+        return None;
+    }
+    let configured: Vec<&str> = local.roles.iter().map(|r| r.name.as_str()).collect();
+    Some(format!(
+        "Warning: config drift — orchestration '{name}' in {cwd} was started with roles \
+         ({running}) that no longer match {file} ({configured}); its tab labels them from the \
+         file. {consequence}",
+        file = crate::project_config::CONFIG_FILE_NAME,
+        running = running.join(", "),
+        configured = configured.join(", "),
+    ))
 }
 
 /// Diagnostic info for a hydrated pane the partition couldn't bucket
@@ -5233,14 +5389,19 @@ fn surface_one_orchestration(
             })
             .collect(),
     };
-    let local = load_project_config(Path::new(&surface.cwd))
-        .ok()
-        .flatten()
-        .and_then(|c| {
-            c.orchestrations
-                .into_iter()
-                .find(|o| o.name == surface.name)
-        });
+    let project_config = load_project_config(Path::new(&surface.cwd)).ok().flatten();
+    let config_present = project_config.is_some();
+    let local = project_config.and_then(|c| {
+        c.orchestrations
+            .into_iter()
+            .find(|o| o.name == surface.name)
+    });
+    // Issue #554: the same drift decision as reconnect hydration. Computed
+    // here, before `local` is consumed, and surfaced only on the path below
+    // that builds a NEW tab — growing an existing tab (the branch that
+    // returns early) reuses a tab whose drift, if any, was decided when it
+    // was built.
+    let drift_warning = orchestration_config_drift_warning(config_present, local.as_ref(), &bucket);
     let orch_config = resolve_orch_config_for_hydration(local, &bucket);
 
     // Issue #868: the `already_built` guard above only catches a duplicate
@@ -5541,7 +5702,15 @@ fn surface_one_orchestration(
         bucket.display_title.as_deref(),
         bucket.orchestration_id.as_deref(),
     ) {
-        Ok(_) => {
+        Ok((tab_index, _)) => {
+            if let Some(warning) = drift_warning {
+                tracing::warn!(
+                    cwd = %surface.cwd,
+                    orchestration = %surface.name,
+                    "live orchestration surface: {warning}"
+                );
+                surface_orchestration_config_drift(ui, tab_manager.tabs().get(tab_index), warning);
+            }
             let mut st = state.blocking_write();
             // Seed placeholder cards for synthetic dead slots only (live roles
             // get their card from the agent's own SessionStart hook).
@@ -12706,29 +12875,31 @@ pub fn run_tui(
             // missing. Without this fallback, every remote-reconnect
             // user would see their orchestration panes dumped into the
             // dashboard.
-            if local_orch_config.is_none() {
-                // PRD #111 auditor nit: distinguish the two
-                // "synthesise" cases so operators can tell whether
-                // the file is genuinely absent (legitimate remote
-                // reconnect — `cfg.is_none()`) or present but
-                // missing this orchestration (config drift —
-                // `cfg.is_some()`). Same level (info) for both;
-                // distinct messages so log search picks them apart.
-                if cfg.is_none() {
-                    tracing::info!(
-                        cwd = %bucket.cwd,
-                        orchestration = %bucket.orchestration_name,
-                        role_count = bucket.role_slots.len(),
-                        "hydration: rebuilding orchestration tab from synthesised config (local .dot-agent-deck.toml absent — remote daemon path)"
-                    );
-                } else {
-                    tracing::info!(
-                        cwd = %bucket.cwd,
-                        orchestration = %bucket.orchestration_name,
-                        role_count = bucket.role_slots.len(),
-                        "hydration: rebuilding orchestration tab from synthesised config (local config exists but does not list this orchestration — config drift or stale)"
-                    );
-                }
+            // Issue #554: the file-absent case (legitimate remote reconnect)
+            // stays at `info!` and off the screen; drift against a file that
+            // WAS read is decided by the pure helper and surfaced below, once
+            // the tab exists to carry the marker.
+            if local_orch_config.is_none() && cfg.is_none() {
+                tracing::info!(
+                    cwd = %bucket.cwd,
+                    orchestration = %bucket.orchestration_name,
+                    role_count = bucket.role_slots.len(),
+                    "hydration: rebuilding orchestration tab from synthesised config (local .dot-agent-deck.toml absent — remote daemon path)"
+                );
+            }
+            let drift_warning = orchestration_config_drift_warning(
+                cfg.is_some(),
+                local_orch_config.as_ref(),
+                bucket,
+            );
+            if let Some(warning) = &drift_warning {
+                tracing::warn!(
+                    cwd = %bucket.cwd,
+                    orchestration = %bucket.orchestration_name,
+                    role_count = bucket.role_slots.len(),
+                    local_config_lists_orchestration = local_orch_config.is_some(),
+                    "hydration: {warning}"
+                );
             }
             let orch_config = resolve_orch_config_for_hydration(local_orch_config, bucket);
             // Build a Vec<Option<String>> of length config.roles.len()
@@ -12819,6 +12990,13 @@ pub fn run_tui(
                 Ok((tab_index, _)) => {
                     if first_orchestration_tab_index.is_none() {
                         first_orchestration_tab_index = Some(tab_index);
+                    }
+                    if let Some(warning) = drift_warning {
+                        surface_orchestration_config_drift(
+                            &mut ui,
+                            tab_manager.tabs().get(tab_index),
+                            warning,
+                        );
                     }
                     let mut st = state.blocking_write();
                     // CodeRabbit PR #118 finding #3: seed placeholder
@@ -13935,11 +14113,9 @@ pub fn run_tui(
                     .get(agent_pane_id)
                     .map(|m| m.name.clone())
                     .unwrap_or_else(|| name.clone()),
-                Tab::Orchestration { name, status, .. } => match status {
-                    OrchestrationStatus::Completed => format!("{name} [done]"),
-                    OrchestrationStatus::Delegated => format!("{name} [active]"),
-                    OrchestrationStatus::WaitingForOrchestrator => name.clone(),
-                },
+                Tab::Orchestration {
+                    id, name, status, ..
+                } => orchestration_tab_label(name, status, ui.config_drift_tabs.contains(id)),
             })
             .collect();
         // PRD #333: join each Orchestration tab's role panes to their live
@@ -41654,5 +41830,297 @@ mod pane_closure_tests {
         announce(&state, pc.as_ref(), &mut tab_manager, &mut ui, "lead", "1");
         assert!(pc.holds("lead"));
         assert_eq!(tab_manager.tab_count(), 2);
+    }
+}
+
+#[cfg(test)]
+mod config_drift_tests {
+    //! Issue #554: an orchestration tab rebuilt from daemon role metadata that
+    //! no longer matches `.dot-agent-deck.toml` is surfaced, not silent.
+    use super::*;
+    use crate::project_config::OrchestrationRoleConfig;
+
+    struct NoopPC;
+    impl PaneController for NoopPC {
+        fn focus_pane(&self, _id: &str) -> Result<(), PaneError> {
+            Ok(())
+        }
+        fn close_pane(&self, _id: &str) -> Result<(), PaneError> {
+            Ok(())
+        }
+        fn list_panes(&self) -> Result<Vec<crate::pane::PaneInfo>, PaneError> {
+            Ok(vec![])
+        }
+        fn resize_pane(
+            &self,
+            _i: &str,
+            _d: crate::pane::PaneDirection,
+            _a: u16,
+        ) -> Result<(), PaneError> {
+            Ok(())
+        }
+        fn rename_pane(&self, _i: &str, n: &str) -> Result<RenameOutcome, PaneError> {
+            Ok(RenameOutcome::Applied(n.to_string()))
+        }
+        fn toggle_layout(&self) -> Result<(), PaneError> {
+            Ok(())
+        }
+        fn write_to_pane(&self, _i: &str, _t: &str) -> Result<(), PaneError> {
+            Ok(())
+        }
+        fn name(&self) -> &str {
+            "noop"
+        }
+        fn is_available(&self) -> bool {
+            true
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    fn role(name: &str, start: bool) -> OrchestrationRoleConfig {
+        OrchestrationRoleConfig {
+            agent: None,
+            name: name.to_string(),
+            command: format!("echo {name}"),
+            start,
+            description: None,
+            prompt_template: None,
+            clear: true,
+        }
+    }
+
+    fn config(name: &str, roles: &[&str]) -> OrchestrationConfig {
+        OrchestrationConfig {
+            default: false,
+            name: name.to_string(),
+            roles: roles
+                .iter()
+                .enumerate()
+                .map(|(i, r)| role(r, i == 0))
+                .collect(),
+        }
+    }
+
+    /// A bucket as the daemon reports it: `slots` are `(role_index, role_name)`
+    /// pairs, each on its own pane.
+    fn bucket(name: &str, slots: &[(usize, &str)]) -> OrchestrationHydrationBucket {
+        OrchestrationHydrationBucket {
+            cwd: "/work/proj".into(),
+            orchestration_name: name.into(),
+            display_title: None,
+            orchestration_id: None,
+            role_slots: slots
+                .iter()
+                .map(|(i, r)| OrchestrationRoleSlot {
+                    role_index: *i,
+                    pane_id: format!("p{i}-{r}"),
+                    role_name: r.to_string(),
+                    is_start_role: *i == 0,
+                })
+                .collect(),
+        }
+    }
+
+    /// PRD #111's motivating case: a laptop TUI on a remote daemon whose cwd has
+    /// no local config. Synthesis is the right answer and must stay quiet, or
+    /// every remote reconnect would be spammed.
+    #[test]
+    fn drift_warning_is_silent_when_the_config_file_is_absent() {
+        let b = bucket("review", &[(0, "lead"), (1, "coder")]);
+        assert_eq!(orchestration_config_drift_warning(false, None, &b), None);
+    }
+
+    /// The issue's reported case: the file was read and does not list the
+    /// orchestration (renamed or removed). The warning names the orchestration,
+    /// its cwd, the file, and the roles the tab is actually showing.
+    #[test]
+    fn drift_warning_names_an_orchestration_the_file_no_longer_lists() {
+        let b = bucket("review", &[(1, "coder"), (0, "lead")]);
+        let warning = orchestration_config_drift_warning(true, None, &b)
+            .expect("a config that does not list the orchestration is drift");
+        for needle in [
+            "config drift",
+            "'review'",
+            "/work/proj",
+            ".dot-agent-deck.toml",
+            "(lead, coder)",
+            "dot-agent-deck delegate",
+        ] {
+            assert!(
+                warning.contains(needle),
+                "warning must contain {needle:?}: {warning}"
+            );
+        }
+    }
+
+    /// The control: a file that lists the orchestration with the same role
+    /// names at the same indices is not drift.
+    #[test]
+    fn drift_warning_is_silent_when_the_file_matches_the_running_roles() {
+        let local = config("review", &["lead", "coder", "tester"]);
+        // A dead `tester` slot is absent from the bucket; that is not drift.
+        let b = bucket("review", &[(0, "lead"), (1, "coder")]);
+        assert_eq!(
+            orchestration_config_drift_warning(true, Some(&local), &b),
+            None
+        );
+    }
+
+    /// The misroute the issue's follow-up describes: a role renamed in the file
+    /// while the orchestration runs. The daemon still routes by the old name, so
+    /// the warning must name both lists.
+    #[test]
+    fn drift_warning_names_both_role_lists_after_a_role_rename() {
+        let local = config("review", &["lead", "qa"]);
+        let b = bucket("review", &[(0, "lead"), (1, "tester")]);
+        let warning = orchestration_config_drift_warning(true, Some(&local), &b)
+            .expect("a renamed role is drift");
+        assert!(
+            warning.contains("(lead, tester)") && warning.contains("(lead, qa)"),
+            "warning must name the running and the configured roles: {warning}"
+        );
+        assert!(
+            warning.contains("'review'") && warning.contains("/work/proj"),
+            "{warning}"
+        );
+    }
+
+    /// A role removed from the end of the file leaves a live slot past the
+    /// configured roles — drift, even though every configured name matches.
+    #[test]
+    fn drift_warning_fires_for_a_live_slot_past_the_configured_roles() {
+        let local = config("review", &["lead"]);
+        let b = bucket("review", &[(0, "lead"), (1, "coder")]);
+        assert!(orchestration_config_drift_warning(true, Some(&local), &b).is_some());
+    }
+
+    /// A daemon older than PRD #111 echoes no role name. That says nothing about
+    /// the file, so it must not read as drift.
+    #[test]
+    fn drift_warning_skips_slots_with_no_recorded_role_name() {
+        let local = config("review", &["lead", "coder"]);
+        let b = bucket("review", &[(0, ""), (1, "coder")]);
+        assert_eq!(
+            orchestration_config_drift_warning(true, Some(&local), &b),
+            None
+        );
+    }
+
+    /// Duplicate indices are first-wins everywhere else in hydration, so the
+    /// reported running roles must be too — the names in the warning are the
+    /// ones the tab was built from.
+    #[test]
+    fn drift_warning_reports_the_first_slot_of_a_duplicate_index() {
+        let b = bucket("review", &[(0, "lead"), (0, "impostor"), (1, "coder")]);
+        let warning = orchestration_config_drift_warning(true, None, &b).expect("drift");
+        assert!(warning.contains("(lead, coder)"), "{warning}");
+        assert!(!warning.contains("impostor"), "{warning}");
+    }
+
+    #[test]
+    fn orchestration_tab_label_appends_the_marker_after_the_status() {
+        assert_eq!(
+            orchestration_tab_label(
+                "review",
+                &OrchestrationStatus::WaitingForOrchestrator,
+                false
+            ),
+            "review"
+        );
+        assert_eq!(
+            orchestration_tab_label("review", &OrchestrationStatus::Delegated, false),
+            "review [active]"
+        );
+        assert_eq!(
+            orchestration_tab_label("review", &OrchestrationStatus::Completed, true),
+            "review [done] [config drift]"
+        );
+        assert_eq!(
+            orchestration_tab_label("review", &OrchestrationStatus::WaitingForOrchestrator, true),
+            "review [config drift]"
+        );
+    }
+
+    /// The surfacing: the tab the rebuild opened is marked (and only that tab),
+    /// the status line explains the marker, and the full warning joins the
+    /// exit warnings the snapshot-restore path already uses for this class.
+    #[test]
+    fn surfacing_marks_the_tab_sets_the_status_line_and_queues_the_warning() {
+        let mut tab_manager = TabManager::new(Arc::new(NoopPC));
+        let (drifted, _) = tab_manager
+            .open_orchestration_tab_with_existing_role_panes(
+                &config("review", &["lead", "coder"]),
+                "/work/proj",
+                vec![Some("a0".into()), Some("a1".into())],
+                None,
+                None,
+            )
+            .expect("open drifted tab");
+        let (clean, _) = tab_manager
+            .open_orchestration_tab_with_existing_role_panes(
+                &config("build", &["lead", "coder"]),
+                "/work/other",
+                vec![Some("b0".into()), Some("b1".into())],
+                None,
+                None,
+            )
+            .expect("open clean tab");
+        let mut ui = UiState::new(DashboardConfig::default(), KeybindingConfig::default());
+
+        surface_orchestration_config_drift(
+            &mut ui,
+            tab_manager.tabs().get(drifted),
+            "Warning: config drift — the full text".to_string(),
+        );
+
+        let id_of = |index: usize| match &tab_manager.tabs()[index] {
+            Tab::Orchestration { id, .. } => *id,
+            _ => panic!("tab {index} is not an orchestration tab"),
+        };
+        assert!(ui.config_drift_tabs.contains(&id_of(drifted)));
+        assert!(
+            !ui.config_drift_tabs.contains(&id_of(clean)),
+            "only the rebuilt tab may carry the marker"
+        );
+        let (status, _) = ui.status_message.as_ref().expect("status line set");
+        assert!(
+            status.contains(CONFIG_DRIFT_TAB_MARKER) && status.contains(".dot-agent-deck.toml"),
+            "the status line must explain the marker: {status}"
+        );
+        assert_eq!(
+            ui.session_warnings,
+            vec!["Warning: config drift — the full text".to_string()]
+        );
+
+        // The label the render loop builds for each tab.
+        let labels: Vec<String> = tab_manager
+            .tabs()
+            .iter()
+            .filter_map(|tab| match tab {
+                Tab::Orchestration {
+                    id, name, status, ..
+                } => Some(orchestration_tab_label(
+                    name,
+                    status,
+                    ui.config_drift_tabs.contains(id),
+                )),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(labels, vec!["review [config drift]", "build"]);
+    }
+
+    /// A tab that is not an orchestration tab (or none at all) must not be
+    /// marked, and the status line must not claim a marker it did not place.
+    #[test]
+    fn surfacing_without_an_orchestration_tab_records_the_warning_unmarked() {
+        let mut ui = UiState::new(DashboardConfig::default(), KeybindingConfig::default());
+        surface_orchestration_config_drift(&mut ui, None, "w".to_string());
+        assert!(ui.config_drift_tabs.is_empty());
+        let (status, _) = ui.status_message.as_ref().expect("status line set");
+        assert!(!status.contains(CONFIG_DRIFT_TAB_MARKER), "{status}");
+        assert_eq!(ui.session_warnings, vec!["w".to_string()]);
     }
 }

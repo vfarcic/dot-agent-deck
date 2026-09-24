@@ -409,3 +409,55 @@ fn orchestration_013_dispatched_run_label_reads_name_first_under_truncation() {
          row = {inverted_row:?}"
     );
 }
+
+/// Scenario: Build the strip label of two orchestration tabs through the
+/// production `orchestration_tab_label` — one rebuilt from daemon role metadata
+/// that no longer matches `.dot-agent-deck.toml` (issue #554), one that still
+/// matches — and render the strip. The drifted tab's label must read its name
+/// followed by `[config drift]`, and the matching tab must carry no marker.
+#[spec("tabs/orchestration/014")]
+#[test]
+fn orchestration_014_config_drift_marker_paints_on_the_drifted_tab_only() {
+    use dot_agent_deck::tab::OrchestrationStatus;
+    use dot_agent_deck::ui::{CONFIG_DRIFT_TAB_MARKER, orchestration_tab_label};
+
+    let drifted = orchestration_tab_label("review", &OrchestrationStatus::Delegated, true);
+    let clean = orchestration_tab_label("build", &OrchestrationStatus::Delegated, false);
+    let buf = render_tab_bar_to_buffer(
+        &["Dashboard", &drifted, &clean],
+        &[false, true, true],
+        0,
+        100,
+        &[None, None, None],
+    );
+    let row = rendered_row(&buf);
+    assert!(
+        row.contains(&format!("review [active] {CONFIG_DRIFT_TAB_MARKER}")),
+        "the drifted tab must paint its name, status and the drift marker; row = {row:?}"
+    );
+    assert!(
+        row.contains("build [active]"),
+        "precondition: the clean tab must paint; row = {row:?}"
+    );
+    assert_eq!(
+        row.matches(CONFIG_DRIFT_TAB_MARKER).count(),
+        1,
+        "only the drifted tab may carry the marker; row = {row:?}"
+    );
+
+    // Name-first under truncation, like `tabs/orchestration/013`: the marker is
+    // a suffix, so a strip too narrow for it still names the orchestration.
+    let narrow = render_tab_bar_to_buffer(
+        &["Dashboard", &drifted],
+        &[false, true],
+        0,
+        28,
+        &[None, None],
+    );
+    let narrow_row = rendered_row(&narrow);
+    assert!(
+        narrow_row.contains("review") && narrow_row.contains('…'),
+        "under truncation the orchestration name must still read and the suffix must be what \
+         is elided; row = {narrow_row:?}"
+    );
+}
