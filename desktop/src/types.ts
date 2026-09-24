@@ -982,6 +982,16 @@ export interface AgentTarget {
   agentId: string;
 }
 
+/**
+ * Issue #1234 — one failed action's roles whose stop could not be confirmed.
+ * `id` is minted by the runtime per rejection, so two warnings naming the same
+ * roles are still two warnings, dismissed separately.
+ */
+export interface CleanupWarningEntry {
+  id: number;
+  stops: readonly string[];
+}
+
 export interface DeckRuntimeState {
   mode: RuntimeMode;
   /**
@@ -1007,13 +1017,23 @@ export interface DeckRuntimeState {
   terminalFeed?: TerminalFeed;
   error?: string;
   /**
-   * PRD #1223 audit V7 — the roles a failed launch could not confirm are
-   * stopped, for the copy of the failure `error` carries. Absent unless the
-   * last action rejected with a `LaunchCleanupError`.
+   * Issue #1234 — every unconfirmed-stop warning not yet dismissed, oldest
+   * first: one per action that rejected with a `LaunchCleanupError`.
+   *
+   * Deliberately NOT part of `error`. That is the single latest failure, and
+   * the next failure, the next action and `reconnect()` all replace or clear
+   * it — so a warning that roles may still be running, carried beside it,
+   * could be replaced in the same React batch it was set in and never reach
+   * a frame. An entry here is removed by {@link dismissCleanupWarning} and by
+   * nothing else. Optional so render-only test runtimes need not carry it; the
+   * real runtime always does.
    */
-  errorCleanup?: readonly string[];
+  cleanupWarnings?: readonly CleanupWarningEntry[];
+  /** Remove one entry of {@link cleanupWarnings} — the user's explicit dismissal. */
+  dismissCleanupWarning?: (id: number) => void;
   /**
-   * Drop the last action's error and the cleanup roles with it (issue #1046).
+   * Drop the last action's error (issue #1046). The cleanup warnings are
+   * untouched — see {@link cleanupWarnings}.
    *
    * Required rather than optional: the toast in `App.tsx` renders on
    * `notice || error`, so a runtime that cannot clear `error` produces a toast

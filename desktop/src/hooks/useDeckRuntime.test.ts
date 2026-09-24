@@ -230,15 +230,16 @@ describe("useDeckRuntime", () => {
   /**
    * Scenario: two actions are in flight at once. The first rejects with a
    * `LaunchCleanupError` naming roles that may still be running; the second
-   * then rejects ordinarily. The runtime must report the second failure's
-   * sentence with NO cleanup roles beside it — PRD #1223 audit follow-up W1.
+   * then rejects ordinarily, in the same batch. The runtime must report the
+   * second failure's sentence AND still hold the first one's roles, as a
+   * warning of their own — issue #1234.
    *
-   * This is the sequencing seam, not the rendering: while the message and the
-   * roles were two `useState` calls, the later ordinary rejection replaced the
-   * message alone and left the earlier launch's roles attached to it, so the
-   * toast named roles the failure on screen had never touched.
+   * PRD #1223 audit W1 fixed half of this seam: the roles must never read as
+   * belonging to the later sentence. The other half is that they must not be
+   * lost either — while they lived in the single failure slot, the ordinary
+   * rejection replaced the whole value and no frame ever named them.
    */
-  it("never leaves an earlier failure's cleanup roles beside a later failure's message", async () => {
+  it("keeps an earlier failure's cleanup roles as their own warning when a later failure replaces its message", async () => {
     let rejectFirst: ((cause: unknown) => void) | undefined;
     let rejectSecond: ((cause: unknown) => void) | undefined;
     bridge.runAction
@@ -258,17 +259,17 @@ describe("useDeckRuntime", () => {
     });
 
     expect(result.current.error).toBe("daemon returned error: publish-failed");
-    expect(result.current.errorCleanup).toBeUndefined();
+    expect(result.current.cleanupWarnings?.map((warning) => warning.stops)).toEqual([["planner", "coder"]]);
   });
 
   /**
    * The same seam with `reconnect()` interleaved (PRD #1223 audit follow-up
-   * W1): a launch is in flight, Refresh starts and clears the failure, the
-   * launch then rejects with its roles, and the reconnect fails afterwards.
-   * Its failure path writes a sentence and nothing else, so the launch's roles
-   * must not survive into it either.
+   * W1, issue #1234): a launch is in flight, Refresh starts and clears the
+   * failure, the launch then rejects with its roles, and the reconnect fails
+   * afterwards. The reconnect's sentence replaces the error; the launch's
+   * roles stay queued as their own warning.
    */
-  it("never leaves a launch's cleanup roles beside a failed reconnect", async () => {
+  it("keeps a launch's cleanup roles through a failed reconnect", async () => {
     let rejectLaunch: ((cause: unknown) => void) | undefined;
     let rejectConnect: ((cause: unknown) => void) | undefined;
     bridge.runAction.mockImplementationOnce(() => new Promise((_resolve, reject) => { rejectLaunch = reject; }));
@@ -286,6 +287,47 @@ describe("useDeckRuntime", () => {
     });
 
     expect(result.current.error).toBe("the deck is not answering");
-    expect(result.current.errorCleanup).toBeUndefined();
+    expect(result.current.cleanupWarnings?.map((warning) => warning.stops)).toEqual([["planner"]]);
+  });
+
+  /**
+   * Issue #1234: every other writer of the failure slot clears it — a new
+   * action, `reconnect()`, and the toast's own dismissal through
+   * `clearError`. None of them may take a cleanup warning with it; only
+   * dismissing THAT warning does, and a dismissal names one warning, so a
+   * second one naming the very same roles survives it.
+   */
+  it("ends a cleanup warning only when that warning is dismissed", async () => {
+    bridge.runAction.mockRejectedValue(new LaunchCleanupError("launch failed; cleanup could not confirm stop for 1 role(s)", ["planner"]));
+    const { result } = renderHook(() => useDeckRuntime());
+    await waitFor(() => expect(result.current.snapshot.connection.status).toBe("connected"));
+
+    await act(async () => {
+      await result.current.runAction({ type: "pause_run" }).catch(() => {});
+    });
+    expect(result.current.cleanupWarnings).toHaveLength(1);
+
+    bridge.runAction.mockResolvedValue({ ok: true });
+    await act(async () => {
+      await result.current.runAction({ type: "pause_run" });
+      await result.current.reconnect();
+    });
+    act(() => result.current.clearError());
+    expect(result.current.error).toBeUndefined();
+    expect(result.current.cleanupWarnings?.map((warning) => warning.stops)).toEqual([["planner"]]);
+
+    // A second rejection naming the same role is a second warning.
+    bridge.runAction.mockRejectedValue(new LaunchCleanupError("launch failed; cleanup could not confirm stop for 1 role(s)", ["planner"]));
+    await act(async () => {
+      await result.current.runAction({ type: "pause_run" }).catch(() => {});
+    });
+    const [first, second] = result.current.cleanupWarnings ?? [];
+    expect(second).toBeDefined();
+    expect(first.id).not.toBe(second.id);
+
+    act(() => result.current.dismissCleanupWarning?.(first.id));
+    expect(result.current.cleanupWarnings).toEqual([second]);
+    act(() => result.current.dismissCleanupWarning?.(second.id));
+    expect(result.current.cleanupWarnings).toEqual([]);
   });
 });

@@ -60,7 +60,7 @@ import { desktopWorkflowPlatformIssue } from "./lib/platform";
 import { LaunchCleanupError } from "./lib/actionError";
 import { CleanupWarning } from "./components/CleanupWarning";
 import type { VoiceDirectoriesDto, VoiceNewAgentDto, VoiceOutcomeDto } from "./lib/bridge";
-import type { AgentSession, DeckAction, DeckRuntimeState, DeckSnapshot, DeckView, EvidenceItem, PanelTab, WorkflowLaunchConfig } from "./types";
+import type { AgentSession, CleanupWarningEntry, DeckAction, DeckRuntimeState, DeckSnapshot, DeckView, EvidenceItem, PanelTab, WorkflowLaunchConfig } from "./types";
 import { modeScopedKey } from "./lib/bridge";
 
 const WORKFLOW_STORAGE_KEY = modeScopedKey("dot-agent-deck.desktop.workflow-preview.v1");
@@ -639,9 +639,10 @@ export function DeckShell({ runtime, workflowPlatformIssue, initialView = { kind
 
           `runtime.error` alone: the notice beside it on the deck is that
           screen's own state, and this screen has none. The two are never
-          mounted together, so there is at most one toast.
+          mounted together, so there is at most one toast. The cleanup
+          warnings ride with it but outlive it (issue #1234).
         */}
-        {runtime.error && <Toast message={runtime.error} cleanup={runtime.errorCleanup} onDismiss={runtime.clearError} />}
+        <Toast message={runtime.error} onDismiss={runtime.clearError} warnings={runtime.cleanupWarnings} onDismissWarning={runtime.dismissCleanupWarning} />
       </>
     )
     : <DeckSurface runtime={runtime} settings={settings} workflowPlatformIssue={workflowPlatformIssue} onNavigate={setView} openAgent={openAgent} onCloseAgent={closeAgent} voiceChannel={deckVoiceContext} />;
@@ -910,19 +911,9 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [helpOpen, setHelpOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
-  const [noticeState, setNoticeState] = useState<string>();
-  /**
-   * PRD #1223 audit V7 — the roles a failed launch could not confirm are
-   * stopped, shown above whichever message the toast is carrying. Held beside
-   * the notice rather than folded into it so a later notice cannot inherit an
-   * older failure's roles: {@link setNotice} replaces both at once.
-   */
-  const [noticeCleanup, setNoticeCleanup] = useState<readonly string[]>();
-  const notice = noticeState;
-  const setNotice = useCallback((message?: string, cleanup?: readonly string[]) => {
-    setNoticeState(message);
-    setNoticeCleanup(message === undefined ? undefined : cleanup);
-  }, []);
+  /* Issue #1234: a sentence only. The roles a failed launch could not confirm
+     are stopped are the runtime's `cleanupWarnings`, which outlive any notice. */
+  const [notice, setNotice] = useState<string>();
   const [confirm, setConfirm] = useState<ConfirmState>();
   // Memoised so the context value is stable across renders; `runtime.testEndpoint`
   // is itself stable for the lifetime of the bridge.
@@ -1377,13 +1368,14 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
            * rollback could not confirm a role stopped can carry one of their
            * codes too: a `stale-preparation` refusal of a later role after an
            * earlier one had started is exactly that composite. The roles arrive
-           * as data (`LaunchCleanupError`), so the warning does not depend on
-           * where the sentence puts them; the sentence itself stays the
+           * as data (`LaunchCleanupError`) and the runtime has already queued
+           * them as a warning of their own (issue #1234), so this only has to
+           * keep the untranslated sentence — the sentence itself stays the
            * runtime's error, which takes the toast's place once this is
            * dismissed.
            */
           if (cause instanceof LaunchCleanupError) {
-            setNotice(cause.message, cause.unconfirmedStops);
+            setNotice(cause.message);
             return;
           }
           const message = cause instanceof Error ? cause.message : String(cause);
@@ -1464,9 +1456,6 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
    * friendlier words, and when an error arrives while an older notice is still
    * up — nothing expires a notice.
    */
-  /** The cleanup roles belonging to whichever copy of a failure the toast shows. */
-  const toastCleanup = notice === undefined ? runtime.errorCleanup : noticeCleanup;
-
   const dismissToast = () => {
     if (notice === undefined || notice === runtime.error) runtime.clearError();
     setNotice(undefined);
@@ -1721,18 +1710,19 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
       {helpOpen && <ShortcutHelp onClose={() => setHelpOpen(false)} />}
       {confirm && <ConfirmDialog state={confirm} onClose={() => setConfirm(undefined)} />}
       {/* PRD #1223 audit V7: the roles a rollback could not confirm are shown
-          above the sentence, from whichever half is on screen. The overview
+          above the sentence — since issue #1234 from the runtime's own queue,
+          whether the sentence is a notice or the runtime's error. The overview
           mounts its own copy of this over `runtime.error` alone (audit W2) —
           it has no notice of its own, and it is not mounted at the same time
           as this one. */}
-      {(notice || runtime.error) && <Toast message={notice ?? runtime.error ?? ""} cleanup={toastCleanup} onDismiss={dismissToast} />}
+      <Toast message={notice || runtime.error} onDismiss={dismissToast} warnings={runtime.cleanupWarnings} onDismissWarning={runtime.dismissCleanupWarning} />
     </div>
   );
 }
 
 /**
  * The one message surface either screen shows: a failed action's sentence, the
- * roles a rollback could not confirm are stopped above it, and a dismiss.
+ * roles a rollback could not confirm are stopped above it, and a dismiss each.
  *
  * One component rather than markup per screen (PRD #1223 audit W2). The deck
  * had the only copy, and the overview mounts INSTEAD of the deck — so a launch
@@ -1742,16 +1732,35 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
  *
  * The message goes through `displayText` like every other daemon-influenced
  * string here, because a role name reaches it inside the failure sentence.
+ *
+ * # The warnings are not the message (issue #1234)
+ *
+ * Each cleanup warning is its own box with its own dismiss, rendered whether or
+ * not there is a sentence at all: the sentence is one replaceable slot — a
+ * later failure, a new action, `reconnect()` or a deck notice takes its place —
+ * while a warning that roles may still be running ends only when the user
+ * dismisses THAT warning.
  */
-function Toast({ message, cleanup, onDismiss }: { message: string; cleanup?: readonly string[]; onDismiss: () => void }) {
+function Toast({ message, onDismiss, warnings, onDismissWarning }: { message?: string; onDismiss: () => void; warnings?: readonly CleanupWarningEntry[]; onDismissWarning?: (id: number) => void }) {
+  if (!message && !warnings?.length) return null;
   return (
-    <div className="toast" data-testid="toast" role="status">
-      <AlertTriangle size={15} />
-      <div className="toast-body">
-        {cleanup && cleanup.length > 0 && <CleanupWarning stops={cleanup} testId="toast-cleanup-warning" />}
-        <span>{displayText(message, DISPLAY_LIMITS.message)}</span>
-      </div>
-      <button aria-label="Dismiss message" onClick={onDismiss}><X size={14} /></button>
+    <div className="toast-stack">
+      {warnings?.map((warning) => (
+        <div key={warning.id} className="toast" data-testid="cleanup-toast">
+          <AlertTriangle size={15} />
+          <CleanupWarning stops={warning.stops} testId="toast-cleanup-warning" className="toast-body" />
+          <button aria-label="Dismiss cleanup warning" onClick={() => onDismissWarning?.(warning.id)}><X size={14} /></button>
+        </div>
+      ))}
+      {message && (
+        <div className="toast" data-testid="toast" role="status">
+          <AlertTriangle size={15} />
+          <div className="toast-body">
+            <span>{displayText(message, DISPLAY_LIMITS.message)}</span>
+          </div>
+          <button aria-label="Dismiss message" onClick={onDismiss}><X size={14} /></button>
+        </div>
+      )}
     </div>
   );
 }
