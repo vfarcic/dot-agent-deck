@@ -599,15 +599,22 @@ def latest_verdict(repo, pr_number):
 
 # The marker every no-vote notice carries, so the job can recognise its own.
 #
-# Both notices (an INSUFFICIENT verdict, and a deny-listed pull request whose
-# auto-merge is armed) open with this, and both quote the short head SHA. Author
-# plus marker plus SHA is what makes a notice identifiable as ALREADY POSTED FOR
-# THIS HEAD, which is the whole question `already_noticed_at` answers.
+# Every notice opens with this and quotes the short head SHA -- an INSUFFICIENT
+# verdict, a deny-listed pull request whose auto-merge is armed, and since #1270
+# a head no independent review has read. Author plus marker plus SHA is what
+# makes a notice identifiable as ALREADY POSTED FOR THIS HEAD; the reason marker
+# below is what tells two of them apart, and `already_noticed_at` wants both.
 NO_VOTE_MARKER = "**No vote cast**"
 
-# Per-reason discriminator, so one no-vote notice cannot suppress another at
-# the same head (issue #1270; found by Qodo and Greptile on PR #1271).
+# Per-reason discriminators, so one no-vote notice cannot suppress another at
+# the same head (issue #1270; found by Qodo and Greptile on PR #1271). Every
+# no-vote branch owns one, each appears verbatim in its own notice body and in
+# no other, and `already_noticed_at` REQUIRES one -- a new branch that forgets
+# to mint a marker fails at the call rather than silently sharing another
+# branch's key, which is exactly how this defect arrived.
 NO_INDEPENDENT_REVIEW_MARKER = "No independent review covers this head"
+INSUFFICIENT_MARKER = "my verdict was `INSUFFICIENT`"
+AUTO_MERGE_ARMED_MARKER = "**Auto-merge is armed on this pull request.**"
 
 
 def already_reviewed_at(reviews, sha, app_login):
@@ -642,12 +649,17 @@ def already_reviewed_at(reviews, sha, app_login):
     )
 
 
-def already_noticed_at(comments, sha, app_login, reason_marker=None):
+def already_noticed_at(comments, sha, app_login, reason_marker):
     """True when `app_login` has already posted a no-vote notice for this head.
 
     The comment-only outcomes re-posted on the same cadence and for the same
     reason as the duplicate reviews, so they take the same key: author, marker,
     and the short SHA the notice itself quotes.
+
+    `reason_marker` is part of that key and is REQUIRED, because a notice is
+    identified by its reason as well as its head: an armed-auto-merge warning
+    and a no-independent-review notice are different instructions to the reader,
+    and neither may stand in for the other.
 
     Note which branch this must NOT suppress. The armed-auto-merge notice tells
     the reader to disarm auto-merge and re-run, so it has to stay re-runnable
@@ -667,11 +679,12 @@ def already_noticed_at(comments, sha, app_login, reason_marker=None):
         and short in (comment.get("body") or "")
         # `reason_marker` keys the notice by WHY no vote was cast. Without it two
         # different reasons at one head collide: #1270's no-independent-review
-        # notice would suppress the armed-auto-merge warning that tells the
-        # maintainer to disarm, or an INSUFFICIENT notice, leaving a stale
-        # explanation in place (Qodo and Greptile on PR #1271). Callers with one
-        # reason omit it and keep the original behaviour.
-        and (reason_marker is None or reason_marker in (comment.get("body") or ""))
+        # notice suppressed the armed-auto-merge warning that tells the
+        # maintainer to disarm, and the INSUFFICIENT notice, leaving a stale
+        # explanation in place and the reader with no instruction (Qodo and
+        # Greptile on PR #1271). It is required rather than defaulted: the
+        # collision came from a branch that did not pass one.
+        and reason_marker in (comment.get("body") or "")
         for comment in comments or ()
     )
 

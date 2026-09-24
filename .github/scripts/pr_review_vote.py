@@ -54,7 +54,9 @@ from pr_review_common import (  # noqa: E402
     gh_json,
     gh_ok,
     coverage_gap,
+    AUTO_MERGE_ARMED_MARKER,
     independent_review_at,
+    INSUFFICIENT_MARKER,
     NO_INDEPENDENT_REVIEW_MARKER,
     latest_verdict,
     pr_changed_paths,
@@ -389,7 +391,9 @@ def main():
     if decision == "INSUFFICIENT":
         # Say it once per head. The verdict is fixed for this SHA, so a re-post
         # carries no new information and only teaches the reader to scroll past it.
-        if already_noticed_at(pr_comments(repo, pr_number), expected_sha, app_login):
+        if already_noticed_at(
+            pr_comments(repo, pr_number), expected_sha, app_login, INSUFFICIENT_MARKER
+        ):
             print(
                 f"#{pr_number}: verdict INSUFFICIENT and already said so for "
                 f"{expected_sha[:8]}; not repeating it."
@@ -415,7 +419,12 @@ def main():
             # what keeps the notice's own instruction honest: disarming drops out
             # of this branch entirely and the job votes. Reached only when armed,
             # so the guard can never strand a pull request the reader has acted on.
-            if already_noticed_at(pr_comments(repo, pr_number), expected_sha, app_login):
+            if already_noticed_at(
+                pr_comments(repo, pr_number),
+                expected_sha,
+                app_login,
+                AUTO_MERGE_ARMED_MARKER,
+            ):
                 print(
                     f"#{pr_number}: deny-listed, auto-merge still armed, and already said "
                     f"so for {expected_sha[:8]}; not repeating it."

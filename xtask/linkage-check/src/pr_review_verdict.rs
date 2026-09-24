@@ -66,6 +66,8 @@ fn run_py(body: &str) -> Output {
         \x20    concat_json_documents, bot_rejection_is_stale,\n\
         \x20    classify_check_runs, FALLBACK_REQUIRED_CONTEXTS,\n\
         \x20    focus_pass_requested, coverage_gap,\n\
+        \x20    NO_INDEPENDENT_REVIEW_MARKER, INSUFFICIENT_MARKER,\n\
+        \x20    AUTO_MERGE_ARMED_MARKER,\n\
         \x20    independent_review_at)\n\
          REQ = ('build', 'build-macos', 'build-windows', 'security', 'e2e-deterministic')\n\
          def crun(name, conclusion='success', status='completed', started_at=None, run_id=None):\n\
@@ -80,8 +82,8 @@ fn run_py(body: &str) -> Output {
          def review(login, commit_id, state='APPROVED'):\n\
         \x20   return {{'user': {{'login': login}}, 'commit_id': commit_id, 'state': state}}\n\
          APP = 'dot-agent-deck-reviewer[bot]'\n\
-         def notice(sha, login=APP):\n\
-        \x20   return comment(login, NO_VOTE_MARKER + ' for `' + sha[:8] + '` — reasons')\n\
+         def notice(sha, login=APP, reason=INSUFFICIENT_MARKER):\n\
+        \x20   return comment(login, NO_VOTE_MARKER + ' for `' + sha[:8] + '` — ' + reason)\n\
          {body}\n",
         scripts = root.join(".github/scripts").to_string_lossy(),
         body = body,
@@ -389,7 +391,7 @@ fn an_unknown_app_identity_fails_open_rather_than_blocking_every_merge() {
     assert_py_ok(
         "assert not already_reviewed_at([review(APP, 'deadbeef')], 'deadbeef', '')\n\
          assert not already_reviewed_at([review(APP, 'deadbeef')], 'deadbeef', None)\n\
-         assert not already_noticed_at([notice('deadbeef')], 'deadbeef', '')",
+         assert not already_noticed_at([notice('deadbeef')], 'deadbeef', '', INSUFFICIENT_MARKER)",
     );
 }
 
@@ -410,9 +412,10 @@ fn a_failed_vote_leaves_nothing_behind_and_is_retried() {
 #[test]
 fn a_no_vote_notice_is_said_once_per_head() {
     assert_py_ok(
-        "assert already_noticed_at([notice('1263627a')], '1263627a', APP)\n\
-         assert not already_noticed_at([notice('1263627a')], '455719d4', APP)\n\
-         assert not already_noticed_at([notice('1263627a', 'vfarcic')], '1263627a', APP)",
+        "M = INSUFFICIENT_MARKER\n\
+         assert already_noticed_at([notice('1263627a')], '1263627a', APP, M)\n\
+         assert not already_noticed_at([notice('1263627a')], '455719d4', APP, M)\n\
+         assert not already_noticed_at([notice('1263627a', 'vfarcic')], '1263627a', APP, M)",
     );
 }
 
@@ -425,7 +428,51 @@ fn an_ordinary_app_comment_is_not_mistaken_for_a_notice() {
     assert_py_ok(
         "sha = 'deadbeef' + '0' * 32\n\
          plain = comment(APP, 'Automated review (`APPROVE`) for `' + sha + '`.')\n\
-         assert not already_noticed_at([plain], sha, APP)",
+         assert not already_noticed_at([plain], sha, APP, INSUFFICIENT_MARKER)",
+    );
+}
+
+/// Scenario: one head, two different reasons for withholding the vote. A notice
+/// saying "nothing independent has read this head" must not suppress the warning
+/// that auto-merge is armed, nor an `INSUFFICIENT` explanation — they are
+/// different instructions to the reader, and neither stands in for the other.
+#[test]
+fn a_notice_for_one_reason_does_not_suppress_another() {
+    assert_py_ok(
+        "sha = '1263627a'\n\
+         MARKERS = (NO_INDEPENDENT_REVIEW_MARKER, INSUFFICIENT_MARKER, AUTO_MERGE_ARMED_MARKER)\n\
+         for posted in MARKERS:\n\
+        \x20   for asked in MARKERS:\n\
+        \x20       hit = already_noticed_at([notice(sha, APP, posted)], sha, APP, asked)\n\
+        \x20       assert hit == (posted == asked), (posted, asked, hit)",
+    );
+}
+
+/// Scenario: read `pr_review_vote.py` itself and check that every no-vote branch
+/// passes a reason marker to `already_noticed_at`, that the markers are pairwise
+/// distinct rather than one containing another, and that each marker's text is
+/// present in the script — a marker that appears in no notice body never matches,
+/// so its notice repeats on every sweep instead of being said once.
+#[test]
+fn every_no_vote_branch_owns_a_distinct_marker() {
+    assert_py_ok(
+        "import ast, os\n\
+         src = open(os.path.join(sys.path[0], 'pr_review_vote.py')).read()\n\
+         calls = [n for n in ast.walk(ast.parse(src)) if isinstance(n, ast.Call)\n\
+        \x20        and getattr(n.func, 'id', '') == 'already_noticed_at']\n\
+         assert len(calls) == 3, len(calls)\n\
+         for c in calls:\n\
+        \x20   assert len(c.args) == 4, ast.dump(c)\n\
+        \x20   assert isinstance(c.args[3], ast.Name), ast.dump(c)\n\
+        \x20   assert c.args[3].id.endswith('_MARKER'), c.args[3].id\n\
+         used = [c.args[3].id for c in calls]\n\
+         assert len(set(used)) == len(used), used\n\
+         MARKERS = (NO_INDEPENDENT_REVIEW_MARKER, INSUFFICIENT_MARKER, AUTO_MERGE_ARMED_MARKER)\n\
+         assert len(set(MARKERS)) == 3\n\
+         for a in MARKERS:\n\
+        \x20   assert src.count(a) >= 1, a\n\
+        \x20   for b in MARKERS:\n\
+        \x20       assert a == b or a not in b, (a, b)",
     );
 }
 
