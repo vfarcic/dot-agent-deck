@@ -958,10 +958,14 @@ fn sigkilled_wrapper_case(interactive: bool) -> StrandedChildOutcome {
         .env("WRAP_CHILD_PID_FILE", &child_pid_path)
         .env("WRAP_GRANDCHILD_PID_FILE", &grandchild_pid_path)
         .env("DOT_AGENT_DECK_SOCKET", &socket)
-        // The behaviour under test: the shortest cap the parser accepts, so the
-        // whole probe finishes in cap + WRAP_TERMINATE_GRACE rather than the
-        // 300s the e2e harness pins.
-        .env("DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS", "1")
+        // The behaviour under test: a short cap, so the whole probe finishes in
+        // cap + WRAP_TERMINATE_GRACE rather than the 300s the e2e harness pins.
+        // Not the parser's 1 s floor: cap + WRAP_TERMINATE_GRACE also bounds how
+        // long the test may take between the arm and its SIGKILL before the
+        // reaper ends these TERM-ignoring probes on its own and the case proves
+        // nothing, so 3 s (4.5 s with the grace) buys a loaded host headroom
+        // there (see the liveness check before the SIGKILL).
+        .env("DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS", "3")
         .env_remove("DOT_AGENT_DECK_PANE_ID")
         .env_remove("DOT_AGENT_DECK_AGENT_ID");
 
@@ -1026,6 +1030,31 @@ fn sigkilled_wrapper_case(interactive: bool) -> StrandedChildOutcome {
         );
     }
 
+    // The other precondition: both probes must still be alive when the wrapper
+    // dies. If the test stalled past cap + WRAP_TERMINATE_GRACE after the arm,
+    // the reaper (or the wrapper's own backstop) has already ended them, and
+    // the assertions below would pass without the wrapper ever having been
+    // killed out from under a live child. Checked here rather than inferred, so that case fails loudly
+    // instead of passing vacuously.
+    let probes_alive = [child_pid, grandchild_pid].map(common::process_running);
+    if probes_alive != [true, true] {
+        terminate(&mut wrapper);
+        for pid in [child_pid, grandchild_pid] {
+            // SAFETY: best-effort cleanup of pids this test created.
+            unsafe {
+                libc::kill(-pid, libc::SIGKILL);
+                libc::kill(pid, libc::SIGKILL);
+            }
+        }
+        panic!(
+            "{} probes were not both alive when the wrapper was about to be \
+             SIGKILLed (child, grandchild alive = {probes_alive:?}), so this run \
+             cannot tell a working backstop from a vacuous pass — the test took \
+             longer than the cap plus its TERM grace between arming and the kill",
+            if interactive { "PTY" } else { "pipe" }
+        );
+    }
+
     // SIGKILL, not SIGTERM: the point is that the wrapper gets NO chance to reap.
     // SAFETY: the wrapper pid came from this test's live `Child`; ending it
     // uncleanly is the behavior under test.
@@ -1037,7 +1066,7 @@ fn sigkilled_wrapper_case(interactive: bool) -> StrandedChildOutcome {
     );
     let _ = wrapper.wait();
 
-    // Bounded by the 1 s cap + one 250 ms poll + WRAP_TERMINATE_GRACE (1.5 s).
+    // Bounded by the 3 s cap + one 250 ms poll + WRAP_TERMINATE_GRACE (1.5 s).
     // 30 s is loose headroom for a loaded host, not an expected duration.
     let deadline = Duration::from_secs(30);
     let child_gone = common::wait_until(deadline, || !common::process_running(child_pid));
