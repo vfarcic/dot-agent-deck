@@ -5133,6 +5133,15 @@ fn apply_pane_closure(
                 // as the dead agent's own placeholder (Qodo on PR #1235); without
                 // this, a successor that starts between the subscriber's pass and
                 // this frame is erased and its running agent has no card at all.
+                //
+                // Paired with `apply_daemon_pane_closed` dropping the pane's
+                // `pane_started_at`: a successor inherits that remembered start
+                // otherwise, and would compare as older than its own closure.
+                // The comparison is over wall-clock instants, and a REMOTE
+                // deck's card can carry that daemon's clock rather than ours
+                // (`apply_event` takes `event.timestamp`), so under enough skew
+                // this decides no better than the agent-id clause alone did --
+                // which is the behaviour it replaces, not a regression from it.
                 || s.started_at > closure.queued_at
         });
         if !st
@@ -41345,6 +41354,7 @@ mod pane_closure_tests {
     //! PRD #1223: the render-thread half of a daemon pane-closed announcement.
     use super::*;
     use crate::project_config::OrchestrationRoleConfig;
+    use chrono::Duration;
     use std::sync::Mutex;
 
     /// A controller holding local attachments `pane → agent id`, with one of
@@ -41531,6 +41541,12 @@ mod pane_closure_tests {
             let mut st = state.blocking_write();
             st.register_pane("lead".into());
             st.insert_placeholder_session("lead".into(), None, None, Some("1".into()));
+            // What production has and a bare `insert_placeholder_session` does
+            // not: the pane's remembered start, minted when the first agent
+            // began. It is what a successor's card inherits, so without it this
+            // test would pass on a technicality -- the successor would get
+            // `Utc::now()` whether or not the close clears the map.
+            st.remember_pane_start_for_test("lead", Utc::now() - Duration::seconds(30));
         }
         let mut ui = UiState::new(DashboardConfig::default(), KeybindingConfig::default());
         ui.pane_names.insert("lead".into(), "lead".into());

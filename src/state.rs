@@ -7024,6 +7024,15 @@ impl AppState {
         for id in doomed {
             self.sessions.remove(&id);
         }
+        // The pane the daemon announced is GONE, so its remembered start goes
+        // with it. `pane_started_at` exists to keep a card's start across an
+        // agent RESTARTING IN PLACE, and it is otherwise never removed -- so a
+        // successor that reuses this pane id would be minted carrying the dead
+        // agent's start time (`insert_placeholder_session` reads it), which is
+        // both wrong on the card and, since the queued closure is settled by
+        // comparing against it, enough to get the successor's card deleted by
+        // the render-thread half. A pane id reused after a close is a new pane.
+        self.pane_started_at.remove(pane_id);
         if !self
             .sessions
             .values()
@@ -8903,6 +8912,15 @@ impl AppState {
     /// `self.sessions`, and its write is a pane's first by construction, so
     /// routing it through a `&mut self` method would mean restructuring that
     /// branch to buy a property it already has.
+    /// Test seam for the one property a unit test cannot otherwise set up: the
+    /// pane's remembered start, which production mints through `apply_event`
+    /// and a successor's card inherits. Without it a close/reuse test passes on
+    /// a technicality (see `a_successor_started_after_the_announcement_keeps_its_card`).
+    #[cfg(test)]
+    pub fn remember_pane_start_for_test(&mut self, pane_id: &str, started_at: DateTime<Utc>) {
+        self.remember_pane_start(pane_id, started_at);
+    }
+
     fn remember_pane_start(&mut self, pane_id: &str, started_at: DateTime<Utc>) {
         self.pane_started_at
             .entry(pane_id.to_string())
