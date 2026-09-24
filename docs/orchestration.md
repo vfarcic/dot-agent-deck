@@ -146,7 +146,7 @@ The refusal is decided from the deck's own record of what it has delegated, not 
 When the earlier task is not coming back, there are three ways out:
 
 - **`dot-agent-deck delegate --supersede …`** dispatches anyway, and the command says it superseded. It does not cancel the earlier task: on a `clear = false` worker the new task is typed into the same live session, and if the earlier task's `work-done` does arrive it is credited like any other. On a `clear = true` worker the delegation replaces the agent, so what the replaced agent owed is dropped.
-- **`dot-agent-deck pane restart <role>`** replaces the worker's agent and drops what it owed, since the replacement never saw that task. A delegate that was already on its way to the pane when the restart ran is kept, because it is delivered to the replacement.
+- **`dot-agent-deck pane restart <role>`** replaces the worker's agent and drops what it owed, since the replacement never saw that task; the [idle-worker and went-quiet reports](idle-workers-and-notifications.md) for that task are cancelled with it. A delegate that was already on its way to the pane when the restart ran is kept, because it is delivered to the replacement.
 - **Waiting it out.** The deck stops counting a delegation seven days after it was issued, whether or not anything answered it. Seven days is deliberately long: forgetting a delegation whose worker is still busy would mislabel that worker's genuine completion as [unsolicited](#orchestrator-is-told-a-completion-was-unsolicited).
 
 ### What `clear` does to delivery

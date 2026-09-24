@@ -3488,7 +3488,7 @@ mod tests {
         let msg = v.message.expect("a busy worker must never be silent");
         assert!(
             msg.contains("NOT sent")
-                && msg.contains("`coder`")
+                && msg.contains("[UNTRUSTED-ROLE-LABEL: coder :END-UNTRUSTED-ROLE-LABEL]")
                 && msg.contains("1 unanswered delegation,")
                 && msg.contains("12 minutes ago")
                 && msg.contains("It WAS delivered to: tester")
@@ -3525,7 +3525,7 @@ mod tests {
         assert!(!v.failed);
         let msg = v.message.expect("a supersession must be reported");
         assert!(
-            msg.contains("still owed a work-done") && msg.contains("`coder`"),
+            msg.contains("still owed a work-done") && msg.contains("UNTRUSTED-ROLE-LABEL: coder"),
             "the note must name the superseded worker: {msg}"
         );
     }

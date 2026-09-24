@@ -1741,12 +1741,17 @@ fn format_idle_elapsed(elapsed: std::time::Duration) -> String {
 /// reached it, with how many delegations it owed and how old the oldest is — the
 /// clause both refusal messages share (the daemon's `error` when nothing was
 /// dispatched, and the CLI's warning on a partial dispatch).
+///
+/// The role goes through [`quote_untrusted_role`] (Greptile, #1285): it names a
+/// role from the repository's `.dot-agent-deck.toml`, which travels with a
+/// clone, and the message is read by the orchestrator agent, so a role named as
+/// an instruction must read as a label, not as the deck's own sentence.
 pub fn describe_busy_workers(busy: &[crate::event::BusyWorker]) -> String {
     busy.iter()
         .map(|worker| {
             format!(
-                "`{}` ({} unanswered delegation{}, the oldest issued {} ago)",
-                worker.role,
+                "{} ({} unanswered delegation{}, the oldest issued {} ago)",
+                quote_untrusted_role(&worker.role),
                 worker.outstanding,
                 if worker.outstanding == 1 { "" } else { "s" },
                 format_idle_elapsed(std::time::Duration::from_secs(worker.oldest_age_secs)),
@@ -8401,6 +8406,15 @@ pub async fn handle_restart_role_with_state(
                     "pane restart: retired the replaced worker's unanswered delegation commissions"
                 );
             }
+            // The same restart ends the two watches on that task, or either can
+            // later report the cancelled task as a silent worker (Greptile, #1285).
+            if registry.cancel_watches_of_replaced_agent(&resolved.pane_id) {
+                tracing::debug!(
+                    pane_id = %resolved.pane_id,
+                    role = %signal.role,
+                    "pane restart: cancelled the replaced worker's idle and silent-worker watches"
+                );
+            }
             if recreated && let Some(identity) = resolved.orchestration.clone() {
                 // See this function's own locking note: `state` is cloned
                 // and the write lock is taken inside a DETACHED task, only
@@ -12198,7 +12212,7 @@ mod tests {
             .expect("a delegate that reached only busy workers must be an error");
         assert!(
             error.contains("NOT sent")
-                && error.contains("`coder`")
+                && error.contains("[UNTRUSTED-ROLE-LABEL: coder :END-UNTRUSTED-ROLE-LABEL]")
                 && error.contains("--supersede"),
             "the error must say it was not sent, name the role and give the remedy: {error}"
         );

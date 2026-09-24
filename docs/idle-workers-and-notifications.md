@@ -104,6 +104,7 @@ Comments and blank lines before the first table are fine; the rule is only about
 - **One prompt per delegation.** The detector fires once and then forgets that delegation, so a run that is stuck for a day produces one report rather than a stream of nags.
 - **An arriving `work-done` cancels the timer.** A worker that finishes one second before the deadline produces no report — the completion and the timer contend for the same record, and the completion wins. You cannot get a "worker is silent" prompt for a worker that answered.
 - **Closing the worker's pane cancels it too.** Deliberately shutting down a stuck worker means you are already handling it; the deck does not report it back to you two hours later.
+- **So does restarting the worker.** `dot-agent-deck pane restart <role>` replaces the agent, and the task it was working on goes with it, so the timer for that task is cancelled. The one exception is a delegation still on its way to the pane at the moment of the restart: that one is delivered to the replacement, and the pane's timer is left armed for it.
 - **Delivery is bound to the orchestrator's identity, not to a pane position.** If the orchestrator that delegated is gone by the time the timer fires — its pane closed, or a different agent now occupies it — the report is dropped rather than delivered to whoever is standing there. No nudge is better than a nudge that reaches a stranger, possibly in a different orchestration.
 
 ### Limitations worth knowing
