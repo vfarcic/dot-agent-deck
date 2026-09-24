@@ -637,6 +637,18 @@ async fn voice_phrase_fixtures_match_the_default_backend() {
                         .is_some_and(|marked| normalise(marked) == normalise(expected)),
                     None => true,
                 };
+                // Every fixture, not only those with `resolved_deck`: a deck
+                // the model fills in for "spawn an agent" is preselected, and
+                // the report must name it so a wrong guess is heard (PRD
+                // #1223, #1263). Checked on whatever the model answered, so the
+                // unasked preselections the fixtures cannot pin are covered too.
+                let deck_named =
+                    resolved_label(&answer.outcome, ParamKind::DeckRef).is_none_or(|label| {
+                        answer
+                            .outcome
+                            .sentence()
+                            .contains(&format!("Preselected deck: {label}."))
+                    });
                 if action_matches
                     && actual_outcome == fixture.outcome
                     && agent_matches
@@ -646,17 +658,23 @@ async fn voice_phrase_fixtures_match_the_default_backend() {
                     && agent_type_matches
                     && orchestration_matches
                     && prefix_matches
+                    && deck_named
                 {
                     Ok(())
                 } else {
                     Err(format!(
-                        "expected action={} outcome={} resolved_agent={:?} resolved_deck={:?} \
+                        "{}expected action={} outcome={} resolved_agent={:?} resolved_deck={:?} \
                          resolved_dir={:?} resolved_mode={:?} resolved_agent_type={:?} \
                          resolved_orchestration={:?} dictate_prefix={:?}, got action={:?} \
                          outcome={actual_outcome} resolved_agent={actual_agent:?} \
                          resolved_deck={:?} resolved_dir={:?} resolved_mode={:?} \
                          resolved_agent_type={:?} resolved_orchestration={:?} dictate_prefix={:?} \
                          sentence={:?}",
+                        if deck_named {
+                            ""
+                        } else {
+                            "the report does not name the preselected deck; "
+                        },
                         fixture.action,
                         fixture.outcome,
                         fixture.resolved_agent,

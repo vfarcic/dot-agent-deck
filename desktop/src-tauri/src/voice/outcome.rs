@@ -582,7 +582,9 @@ pub async fn handle_utterance_with(
     // a registry entry that EXISTS is a different question, and not one this
     // function answers — M3's guard is what answers it, at commit time.)
     let mut resolved: Vec<ResolvedParam> = Vec::with_capacity(row.params.len());
-    let mut dropped: Vec<String> = Vec::new();
+    // What the report adds for each OPTIONAL param, in the row's param order:
+    // the value it preselected, or why none is.
+    let mut notes: Vec<String> = Vec::new();
     for spec in &row.params {
         let Some(spoken) = answer
             .params
@@ -621,7 +623,21 @@ pub async fn handle_utterance_with(
             )
         };
         match step {
-            Ok(param) => resolved.push(param),
+            // **An optional param that resolves is named in the report**
+            // (PRD #1223), whether or not the user said it. A row's report may
+            // not interpolate an optional param — it may have nothing to say —
+            // so the value goes in a note of its own, the positive twin of the
+            // dropped note below. Since reference grounding went, a deck the
+            // model fills in for "new agent" is preselected rather than
+            // dropped; naming it makes a wrong guess audible instead of
+            // silent, which matters because a voice-only user cannot change
+            // the deck once the dialog is open (#1263).
+            Ok(param) => {
+                if spec.optional {
+                    notes.push(preselected_note(&param));
+                }
+                resolved.push(param);
+            }
             // **An optional param that fails is DROPPED, and the action
             // proceeds without it** (PRD #1223) — whichever way it failed:
             // matching nothing, matching several, or withheld from the model.
@@ -648,14 +664,14 @@ pub async fn handle_utterance_with(
             // A REQUIRED param that fails still refuses the action, exactly as
             // before: without it there is nothing to dispatch.
             Err(unmet) if spec.optional => {
-                dropped.push(unmet.dropped_note(spec.kind, spoken, &transcript));
+                notes.push(unmet.dropped_note(spec.kind, spoken, &transcript));
             }
             Err(unmet) => return finish(unmet.refusal(transcript, row, spec, spoken)),
         }
     }
 
     let mut sentence = report(row, &resolved);
-    for note in &dropped {
+    for note in &notes {
         sentence.push(' ');
         sentence.push_str(note);
     }
@@ -755,6 +771,19 @@ impl Unmet {
             ),
         }
     }
+}
+
+/// The sentence appended to a dispatch's report when an OPTIONAL param
+/// resolved: what it preselected, by the name the screen shows — "Preselected
+/// deck: Local deck." The kind leads because a remote deck's label is an
+/// address, which says nothing on its own; the label is scrubbed on its way
+/// in, as [`report`] scrubs one.
+fn preselected_note(param: &ResolvedParam) -> String {
+    format!(
+        "Preselected {}: {}.",
+        param.kind.noun(),
+        safe_message(&param.label)
+    )
 }
 
 /// Whether the user SAID `spoken`: it has a content word ([`content_words`])
@@ -2353,7 +2382,9 @@ mod tests {
                     value: "deck-local".to_string(),
                     label: "Local deck".to_string(),
                 }],
-                sentence: "Opening the New agent dialog.".to_string(),
+                // Named, because the user did not name it: a wrong guess is
+                // heard rather than found later on a deck they did not choose.
+                sentence: "Opening the New agent dialog. Preselected deck: Local deck.".to_string(),
             }
         );
     }
@@ -2384,8 +2415,11 @@ mod tests {
             panic!("expected a dispatch, got {outcome:?}");
         };
         assert_eq!(invoke, "openNewAgent");
-        // A deck that resolved and was named adds nothing to the report.
-        assert_eq!(sentence, "Opening the New agent dialog.");
+        // A deck that resolved is named back by the name the screen shows.
+        assert_eq!(
+            sentence,
+            "Opening the New agent dialog. Preselected deck: deploy@build-box.example.com:2222."
+        );
         assert_eq!(
             params,
             vec![ResolvedParam {
@@ -3096,7 +3130,7 @@ mod tests {
         assert!(
             matches!(&outcome, VoiceOutcome::Dispatch { params, sentence, .. }
                 if params.len() == 1 && params[0].value == "deck-build"
-                    && sentence == "Opening the New agent dialog."),
+                    && sentence == "Opening the New agent dialog. Preselected deck: deploy@build-box.example.com:2222."),
             "{outcome:?}"
         );
 
@@ -3197,7 +3231,11 @@ mod tests {
 
     /// Scenario: "new agent" names no deck, and a model fills one in anyway
     /// with a deck the fleet has. It is on screen, so it is preselected — the
-    /// dialog is where the deck is shown, and choosing another replaces it.
+    /// dialog is where the deck is shown, and choosing another replaces it —
+    /// and the report NAMES it, invented or not, so a wrong guess is heard
+    /// rather than discovered after a start on a deck the user did not choose
+    /// (a voice-only user cannot change the deck in an open dialog, #1263).
+    /// With no deck at all the report says nothing about one.
     ///
     /// Premise change (2026-09-24): this was
     /// `voice_outcome_open_new_agent_drops_an_invented_deck_and_keeps_a_named_one`,
@@ -3216,7 +3254,18 @@ mod tests {
                     if params.len() == 1 && params[0].value == "deck-build"),
                 "{said:?}: {outcome:?}"
             );
+            assert_eq!(
+                outcome.sentence(),
+                "Opening the New agent dialog. Preselected deck: \
+                 deploy@build-box.example.com:2222.",
+                "{said:?}"
+            );
         }
+
+        let resolver =
+            StubResolver::new().answering("new agent", IntentAnswer::new("open_new_agent"));
+        let outcome = run(&resolver, Screen::Overview, &fleet(), "new agent").await;
+        assert_eq!(outcome.sentence(), "Opening the New agent dialog.");
     }
 
     /// Scenario: the four protections that remain once references are not

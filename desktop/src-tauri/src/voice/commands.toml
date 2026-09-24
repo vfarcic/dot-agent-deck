@@ -128,8 +128,10 @@
 #                    `agent_type_ref`, `orchestration_ref`, `spoken_prefix`).
 #                    `optional =
 #                    true` lets the row dispatch when the model supplies no
-#                    value; a value that resolves to nothing is still refused,
-#                    and a report may not interpolate an optional param.
+#                    value; a value that fails is dropped with a note saying
+#                    why, one that resolves gets a note naming it
+#                    ("Preselected deck: Local deck."), and a report may not
+#                    interpolate an optional param.
 #
 # **This table was NAVIGATION ONLY and is not any more**, which is worth saying
 # in the sentence that used to claim it rather than leaving the claim to rot:
@@ -527,9 +529,11 @@ heard_as_whole = [
 # The `deck` param is OPTIONAL — the first one in the table. "new agent" alone
 # is a complete command (the dialog opens on its deck step, exactly as the top
 # bar's button opens it), and "new agent on the build box" preselects that deck,
-# which is what a deck group's own header button does. A deck the fleet does not
-# have is still refused rather than dropped: the user named one, and opening the
-# dialog as though they had not would lose what they asked for.
+# which is what a deck group's own header button does. A deck that matches
+# nothing, or several, is dropped and the report says so ("No deck matches …, so
+# none is preselected."); one that resolves is preselected — whether or not the
+# user said it — and the report names it ("Preselected deck: Local deck."), so
+# a deck the model guessed is heard before anything starts on it.
 #
 # `screens = ["overview"]`: the dialog lives on the overview, whose fleet its
 # deck step lists (`VoiceOverviewContext` in `voiceActions.ts`), and a row
