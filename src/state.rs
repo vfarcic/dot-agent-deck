@@ -17,6 +17,23 @@ use crate::project_config::{
 };
 
 const MAX_RECENT_EVENTS: usize = 50;
+/// The session key a pane's PLACEHOLDER card is filed under — the one
+/// [`AppState::insert_placeholder_session`] mints.
+///
+/// PRD #1223: shared with the daemon's card-surfacing `SessionStart`
+/// (`crate::spawn::surface_spawned_pane`), which files its card under the SAME
+/// key. That is what makes the two producers of a pane's first card
+/// order-independent in an attached TUI: whichever lands second lands on the
+/// first one's card instead of beside it. The placeholder arriving second
+/// overwrites the synthetic card (`HashMap::insert`); the synthetic event
+/// arriving second updates the placeholder in place (`apply_event`'s
+/// `sessions.entry`). Without the shared key a TUI-owned start whose daemon
+/// broadcast beat its own placeholder insert drew two cards for one pane, and
+/// for a hookless command nothing ever retired the extra one.
+pub fn placeholder_session_id(pane_id: &str) -> String {
+    format!("pane-{pane_id}")
+}
+
 /// PRD #120 L1: cap on [`AppState::pending_orchestration_surfaces`]. The render
 /// loop drains the queue one surface per frame, so a daemon flooding surface
 /// events faster than it drains can't grow the Vec unbounded — beyond this the
@@ -24,6 +41,36 @@ const MAX_RECENT_EVENTS: usize = 50;
 /// to build). Sized well above any realistic concurrent-dispatch burst (a fire's
 /// `max_per_run` issue dispatches is single/low-double digits).
 const MAX_PENDING_ORCHESTRATION_SURFACES: usize = 64;
+
+/// PRD #1223: cap on [`AppState::pending_pane_closures`], for the same reason
+/// and with the same drop-oldest policy as the surface queue above. Closures are
+/// drained all at once each frame, so this is only reached by a burst larger
+/// than any orchestration (a tab holds at most
+/// `ORCHESTRATION_ROLE_INDEX_MAX + 1` roles).
+const MAX_PENDING_PANE_CLOSURES: usize = 256;
+
+/// PRD #1223: a pane the daemon announced as stopped and gone, queued for the
+/// TUI's render loop (see [`AppState::apply_daemon_pane_closed`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaneClosure {
+    pub pane_id: String,
+    /// The registry id of the agent that was stopped. The render loop leaves a
+    /// pane alone whose local attachment is bound to a DIFFERENT agent — a
+    /// successor now owns it.
+    pub agent_id: Option<String>,
+    /// When the announcement was applied, so the render-thread half can tell a
+    /// card that belongs to the dying pane from one a SUCCESSOR started on the
+    /// reused pane id while this closure sat in the queue.
+    ///
+    /// The agent id alone cannot: a daemon-surfaced attach start deliberately
+    /// creates its card with no agent id (`agent_id: None`), which is also what
+    /// a placeholder for the dead agent looks like, so the deferred pass would
+    /// match the successor's card and remove it — leaving a running agent with
+    /// no card in the attached TUI (Qodo on PR #1235). A card that began
+    /// strictly after the daemon said this pane was gone cannot belong to the
+    /// agent that was stopped, whatever its agent id says.
+    pub queued_at: DateTime<Utc>,
+}
 /// Maximum number of first-prompt entries retained per session. The live-side
 /// cap in `apply_event` and the wire-boundary clamp in
 /// [`crate::daemon_client`] (which re-clamps a hostile/oversized daemon
@@ -1143,6 +1190,13 @@ pub struct AppState {
     /// holding a queue of them would invite the unbounded growth
     /// `pending_orchestration_surfaces` needs a cap for.
     pub pending_worktree_kept: Option<crate::issue_dispatch_run::KeptWorktree>,
+    /// PRD #1223: panes the daemon announced as stopped, waiting for the render
+    /// loop to drop them from the `TabManager`, the pane controller and the
+    /// `UiState` maps — none of which the event subscriber can reach. The
+    /// `AppState` half of the cleanup is applied at once, in broadcast order, by
+    /// [`Self::apply_daemon_pane_closed`]; only the rest waits here. Bounded by
+    /// `MAX_PENDING_PANE_CLOSURES`.
+    pub pending_pane_closures: Vec<PaneClosure>,
     /// PRD #20 R20-003 (finding #4): the DAEMON-AUTHORITATIVE hook session id
     /// (the "generation") currently bound to each pane, keyed by `pane_id`.
     /// Captured from every event's ORIGINAL `session_id` BEFORE the same-agent
@@ -6416,6 +6470,38 @@ fn live_target_carrier_event(session: &SessionState, live_target: LiveTarget) ->
     }
 }
 
+/// The snapshot fields [`AppState::seed_hydrated_session`] copies onto a card:
+/// status, tool fields, prompt context and the live-target carrier. Everything
+/// but `agent_type` and `last_activity`, which the two callers decide
+/// differently (see that function's doc comment).
+fn overlay_snapshot_fields(session: &mut SessionState, snap: &SessionSnapshot) {
+    session.status = snap.status.clone();
+    session.active_tool = snap.active_tool.clone();
+    session.tool_count = snap.tool_count;
+    session.first_prompts = snap.first_prompts.clone();
+    session.last_user_prompt = snap.last_user_prompt.clone();
+    // PRD #20 blocker-4: restore the durable live-target so a history-only /
+    // view-only card keeps refusing input right after reconnect, before any new
+    // event re-declares it. The descriptor lives in `recent_events` (no
+    // dedicated field — uneditable fixtures build `SessionState` by exhaustive
+    // literal), so re-seed it as a single inert carrier event. It sets no
+    // prompt/tool, so the card's activity renderers ignore it; `apply_event`'s
+    // forward-stamping then keeps it durable.
+    if let Some(live_target) = snap.live_target {
+        push_live_target_carrier(session, live_target);
+    }
+}
+
+/// Push a [`live_target_carrier_event`] onto `session`'s bounded journal,
+/// stamped at its current `last_activity`.
+fn push_live_target_carrier(session: &mut SessionState, live_target: LiveTarget) {
+    let carrier = live_target_carrier_event(session, live_target);
+    session.recent_events.push_back(carrier);
+    if session.recent_events.len() > MAX_RECENT_EVENTS {
+        session.recent_events.pop_front();
+    }
+}
+
 impl AppState {
     pub fn aggregate_stats(&self) -> DashboardStats {
         let mut stats = DashboardStats::default();
@@ -6901,6 +6987,79 @@ impl AppState {
         self.pending_worktree_kept = Some(kept);
     }
 
+    /// PRD #1223: apply the daemon's pane-closed announcement
+    /// ([`crate::event::DAEMON_PANE_CLOSED_METADATA_KEY`]) — the removal a TUI
+    /// performs for its own close, for a stop some OTHER client asked for.
+    ///
+    /// Two halves, split by what this side can reach:
+    ///
+    /// * here, at once and in broadcast order — every session on the pane that
+    ///   belongs to the stopped agent (or names no agent, as a placeholder or a
+    ///   daemon-surfaced card does) goes, and the pane is unregistered, exactly
+    ///   as the native close's `remove_sessions_for_pane` + `unregister_pane`.
+    ///   Doing it in order is what keeps a later event from being undone: a
+    ///   successor's start for the same pane id can only be broadcast after this
+    ///   removal, so it is applied after it and redraws its own card, and a late
+    ///   hook from the dying agent finds the pane unregistered and is dropped;
+    /// * queued ([`Self::pending_pane_closures`]) — the tab, the pane
+    ///   controller's local attachment and the `UiState` maps, which live on the
+    ///   render thread.
+    ///
+    /// **Idempotent.** A pane this TUI already closed itself — its own `Ctrl+W`
+    /// also reaches the daemon's `StopAgent`, so it receives this too — has no
+    /// sessions and no registration left, and both calls are no-ops; the queued
+    /// half then finds no tab and no attachment either. A session tagged with a
+    /// DIFFERENT agent id is a successor's and is kept, and so is the pane's
+    /// registration while any session remains on it.
+    pub fn apply_daemon_pane_closed(&mut self, pane_id: &str, agent_id: Option<&str>) {
+        let doomed: Vec<String> = self
+            .sessions
+            .iter()
+            .filter(|(_, s)| {
+                s.pane_id.as_deref() == Some(pane_id)
+                    && (s.agent_id.is_none() || s.agent_id.as_deref() == agent_id)
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in doomed {
+            self.sessions.remove(&id);
+        }
+        // The pane the daemon announced is GONE, so its remembered start goes
+        // with it. `pane_started_at` exists to keep a card's start across an
+        // agent RESTARTING IN PLACE, and it is otherwise never removed -- so a
+        // successor that reuses this pane id would be minted carrying the dead
+        // agent's start time (`insert_placeholder_session` reads it), which is
+        // both wrong on the card and, since the queued closure is settled by
+        // comparing against it, enough to get the successor's card deleted by
+        // the render-thread half. A pane id reused after a close is a new pane.
+        self.pane_started_at.remove(pane_id);
+        if !self
+            .sessions
+            .values()
+            .any(|s| s.pane_id.as_deref() == Some(pane_id))
+        {
+            self.unregister_pane(pane_id);
+        }
+        if self.pending_pane_closures.len() >= MAX_PENDING_PANE_CLOSURES {
+            let dropped = self.pending_pane_closures.remove(0);
+            tracing::warn!(
+                pane_id = %dropped.pane_id,
+                cap = MAX_PENDING_PANE_CLOSURES,
+                "apply_daemon_pane_closed: pending queue at cap; dropping oldest closure"
+            );
+        }
+        self.pending_pane_closures.push(PaneClosure {
+            pane_id: pane_id.to_string(),
+            agent_id: agent_id.map(str::to_string),
+            queued_at: Utc::now(),
+        });
+    }
+
+    /// PRD #1223: take every queued pane closure, oldest first.
+    pub fn take_pane_closures(&mut self) -> Vec<PaneClosure> {
+        std::mem::take(&mut self.pending_pane_closures)
+    }
+
     /// Issue #717: take the pending kept-worktree report, if any.
     pub fn take_worktree_kept(&mut self) -> Option<crate::issue_dispatch_run::KeptWorktree> {
         self.pending_worktree_kept.take()
@@ -6935,6 +7094,18 @@ impl AppState {
     /// placeholder it just created (the `SessionEnd` restorer re-applies the
     /// dying session's friendly name — issue #663) does not have to restate this
     /// function's key format and risk drifting from it.
+    ///
+    /// PRD #1223: an UPSERT for the generation it names. When the pane already
+    /// has a session under another key carrying this same `Some(agent_id)`, that
+    /// agent has already announced itself — its real `SessionStart` beat the
+    /// caller here — so the existing card IS this placeholder's card and is kept
+    /// untouched, and its id is returned. Minting beside it drew a second,
+    /// permanent card for one agent: the reuse guard that would have merged
+    /// them runs only on the NEXT event, and an idle agent sends none. Reached
+    /// routinely once the daemon surfaces attach-socket starts live, because the
+    /// TUI's surface consumer grows a tab a frame or more after the roles' first
+    /// hooks may have landed. An untagged (`None`) call, and a differing id,
+    /// keep minting as before.
     pub fn insert_placeholder_session(
         &mut self,
         pane_id: String,
@@ -6942,7 +7113,17 @@ impl AppState {
         agent_type: Option<AgentType>,
         agent_id: Option<String>,
     ) -> String {
-        let session_id = format!("pane-{}", pane_id);
+        let session_id = placeholder_session_id(&pane_id);
+        if agent_id.is_some()
+            && let Some(existing) = self.sessions.iter().find_map(|(id, session)| {
+                (*id != session_id
+                    && session.pane_id.as_deref() == Some(pane_id.as_str())
+                    && session.agent_id == agent_id)
+                    .then(|| id.clone())
+            })
+        {
+            return existing;
+        }
         let now = Utc::now();
         let started_at = self.pane_started_at.get(&pane_id).copied().unwrap_or(now);
         self.sessions.insert(
@@ -7055,6 +7236,48 @@ impl AppState {
     /// An absent value (an older daemon predating PRD #745 M9), or one no
     /// `DateTime` can hold, keeps the minted value. That is the pre-#804
     /// behaviour.
+    ///
+    /// # A card the upsert keeps, and why it takes only fresher evidence
+    ///
+    /// PRD #1223: [`Self::insert_placeholder_session`] keeps an existing card
+    /// for the same pane and `Some(agent_id)` instead of minting a second one,
+    /// so one agent on one pane has one card. That card can predate the
+    /// snapshot (the TUI's event subscriber starts before hydration), and the
+    /// daemon may have seen activity since that the card has not. So the kept
+    /// card takes the snapshot when, and only when, the snapshot's instant is
+    /// **strictly newer than the card's own `last_activity` and no later than
+    /// now**. That is issue #804's clock bar, decided the same way, so the two
+    /// rules share one notion of "newer". The overlay covers what a minted card
+    /// takes: `status`, the tool fields, the prompts, the live-target carrier
+    /// (so a card that should refuse input does), the snapshot's event-derived
+    /// `agent_type` when it has one, and `last_activity`.
+    ///
+    /// Otherwise the card is left exactly as it is, with one exception on an
+    /// exact tie. A tie means the card already holds evidence as new as the
+    /// snapshot's; an older or absent instant is no reason to overwrite what
+    /// the agent's own events drew; and a future stamp is refused for the
+    /// reason given above.
+    ///
+    /// The exception: on a tie (`last_activity_ms` equal to the card's own
+    /// `last_activity`), a card that declares **no** live target adopts the
+    /// snapshot's live-target carrier, and nothing else. The tie is treated
+    /// asymmetrically on purpose. The daemon's snapshot can hold a declaration
+    /// from frames that reached it before the TUI subscribed, and a missing
+    /// live target is a safety property: a history-only or view-only card that
+    /// lacks it accepts input it should refuse. The other fields are display
+    /// state, and at an equal stamp there is no reason to prefer either
+    /// source, so the card's own `status`, tool fields, prompts and
+    /// `last_activity` stay. A card that already declares a live target keeps
+    /// its own.
+    ///
+    /// Unlike the minted branch, the kept card is measured against its own
+    /// evidence only, not against every session on the pane or from the agent.
+    /// The question here is whether this card's content is stale, and another
+    /// session's stamp says nothing about that. The cost is that the "no
+    /// newest-wins pick changes" property above does not hold for this branch,
+    /// and deliberately: once the card carries evidence newer than a competitor,
+    /// it is the newest session and the picks follow it. `status/supersede/017`
+    /// pins both halves.
     pub fn seed_hydrated_session(
         &mut self,
         pane_id: String,
@@ -7077,42 +7300,57 @@ impl AppState {
         // Mint the placeholder exactly as today (PRD #110 agent_id,
         // started_at reuse, session_id), then overlay the live snapshot
         // fields when one is present.
-        self.insert_placeholder_session(pane_id.clone(), cwd, effective_agent_type, agent_id);
-        if let Some(snap) = live {
-            let session_id = format!("pane-{}", pane_id);
-            if let Some(session) = self.sessions.get_mut(&session_id) {
-                session.status = snap.status.clone();
-                session.active_tool = snap.active_tool.clone();
-                session.tool_count = snap.tool_count;
-                session.first_prompts = snap.first_prompts.clone();
-                session.last_user_prompt = snap.last_user_prompt.clone();
-                // PRD #20 blocker-4: restore the durable live-target so a
-                // history-only / view-only card keeps refusing input right
-                // after reconnect, before any new event re-declares it. The
-                // descriptor lives in `recent_events` (no dedicated field —
-                // uneditable fixtures build `SessionState` by exhaustive
-                // literal), so re-seed it as a single inert carrier event. It
-                // sets no prompt/tool, so the card's activity renderers ignore
-                // it; `apply_event`'s forward-stamping then keeps it durable.
-                if let Some(live_target) = snap.live_target {
-                    session
-                        .recent_events
-                        .push_back(live_target_carrier_event(session, live_target));
-                }
-                // Issue #804: newer-only, per the doc comment. Deliberately
-                // AFTER the carrier above, which keeps its minted stamp: the
-                // carrier's timestamp feeds the pane's event watermark
-                // (`ui::pane_event_watermark`), a separate ordering surface this
-                // overlay does not move.
-                if let Some(observed) = snap
-                    .last_activity_ms
-                    .and_then(DateTime::<Utc>::from_timestamp_millis)
-                    && observed <= session.last_activity
-                    && held_evidence.is_none_or(|held| observed > held)
-                {
-                    session.last_activity = observed;
-                }
+        let session_id =
+            self.insert_placeholder_session(pane_id.clone(), cwd, effective_agent_type, agent_id);
+        let Some(snap) = live else { return };
+        let observed = snap
+            .last_activity_ms
+            .and_then(DateTime::<Utc>::from_timestamp_millis);
+        let minted = session_id == placeholder_session_id(&pane_id);
+        let Some(session) = self.sessions.get_mut(&session_id) else {
+            return;
+        };
+        if minted {
+            overlay_snapshot_fields(session, snap);
+            // Issue #804: newer-only, per the doc comment. Deliberately
+            // AFTER the carrier `overlay_snapshot_fields` pushed, which keeps
+            // its minted stamp: the carrier's timestamp feeds the pane's event
+            // watermark (`ui::pane_event_watermark`), a separate ordering
+            // surface this overlay does not move.
+            if let Some(observed) = observed
+                && observed <= session.last_activity
+                && held_evidence.is_none_or(|held| observed > held)
+            {
+                session.last_activity = observed;
             }
+        } else if let Some(observed) = observed
+            && observed > session.last_activity
+            && observed <= Utc::now()
+        {
+            // PRD #1223 with issue #804: a card the upsert kept takes the
+            // snapshot only when the snapshot is the fresher evidence, by the
+            // same clock bar as the minted branch: strictly newer than what the
+            // card holds, and no later than now. See the doc comment.
+            if let Some(agent_type) = snap.agent_type.clone() {
+                session.agent_type = agent_type;
+            }
+            // The stamp moves BEFORE the carrier is built, so the carrier sits
+            // at the snapshot's instant: the newest evidence the card now
+            // holds, and still no later than now.
+            session.last_activity = observed;
+            overlay_snapshot_fields(session, snap);
+        } else if let Some(observed) = observed
+            && observed == session.last_activity
+            && session.live_target().is_none()
+            && let Some(live_target) = snap.live_target
+        {
+            // PRD #1223: the tie exception in the doc comment. Only the
+            // live-target carrier moves, because a missing one lets a card
+            // that should refuse input accept it; the display fields stay,
+            // since an equal stamp gives no reason to prefer the snapshot's.
+            // The carrier is stamped at the card's `last_activity`, which is
+            // the snapshot's instant too, so it moves no watermark.
+            push_live_target_carrier(session, live_target);
         }
     }
 
@@ -8674,6 +8912,15 @@ impl AppState {
     /// `self.sessions`, and its write is a pane's first by construction, so
     /// routing it through a `&mut self` method would mean restructuring that
     /// branch to buy a property it already has.
+    /// Test seam for the one property a unit test cannot otherwise set up: the
+    /// pane's remembered start, which production mints through `apply_event`
+    /// and a successor's card inherits. Without it a close/reuse test passes on
+    /// a technicality (see `a_successor_started_after_the_announcement_keeps_its_card`).
+    #[cfg(test)]
+    pub fn remember_pane_start_for_test(&mut self, pane_id: &str, started_at: DateTime<Utc>) {
+        self.remember_pane_start(pane_id, started_at);
+    }
+
     fn remember_pane_start(&mut self, pane_id: &str, started_at: DateTime<Utc>) {
         self.pane_started_at
             .entry(pane_id.to_string())
@@ -8710,6 +8957,16 @@ impl AppState {
     }
 
     pub fn apply_event(&mut self, mut event: AgentEvent) {
+        // PRD #1223: the daemon's pane-closed announcement is a statement ABOUT
+        // a pane, not a producer's conversation ending, so none of the
+        // `SessionEnd` machinery below applies to it — in particular its
+        // restore-a-placeholder step would redraw the very card it removes.
+        if event.is_daemon_pane_closed() {
+            if let Some(pane_id) = event.pane_id.as_deref() {
+                self.apply_daemon_pane_closed(pane_id, event.agent_id.as_deref());
+            }
+            return;
+        }
         // Issue #833: `tool_name` / `tool_detail` are PRODUCER-supplied — every
         // agent on the deck can post to the hook socket — and both are drawn
         // into a card's tool line (`ui::recent_tool_lines` reads them off the
@@ -11923,6 +12180,106 @@ mod tests {
         );
     }
 
+    fn daemon_pane_closed(pane: &str, agent: Option<&str>) -> AgentEvent {
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            crate::event::DAEMON_PANE_CLOSED_METADATA_KEY.to_string(),
+            crate::event::DAEMON_PANE_CLOSED_METADATA_VALUE.to_string(),
+        );
+        AgentEvent {
+            session_id: placeholder_session_id(pane),
+            agent_type: AgentType::None,
+            event_type: EventType::SessionEnd,
+            tool_name: None,
+            tool_detail: None,
+            cwd: None,
+            timestamp: Utc::now(),
+            user_prompt: None,
+            metadata,
+            pane_id: Some(pane.to_string()),
+            agent_id: agent.map(str::to_string),
+            agent_version: None,
+            schema_version: None,
+            live_target: None,
+        }
+    }
+
+    /// PRD #1223: the daemon's pane-closed announcement removes EVERY card the
+    /// stopped agent had on the pane and unregisters it — without the ordinary
+    /// `SessionEnd` path's restored placeholder, which would redraw the card —
+    /// and queues the pane for the render loop. Applying it again, as a TUI
+    /// whose own close reached the daemon does, removes nothing more.
+    #[test]
+    fn daemon_pane_closed_removes_the_panes_cards_and_is_idempotent() {
+        let mut state = AppState::default();
+        state.register_pane("p-1".into());
+        state.insert_placeholder_session("p-1".into(), Some("/w".into()), None, Some("7".into()));
+        state.register_pane("other".into());
+        state.insert_placeholder_session("other".into(), None, None, None);
+
+        state.apply_event(daemon_pane_closed("p-1", Some("7")));
+        assert!(
+            state
+                .sessions
+                .values()
+                .all(|s| s.pane_id.as_deref() != Some("p-1")),
+            "no card left on the closed pane: {:?}",
+            state.sessions
+        );
+        assert!(!state.managed_pane_ids.contains("p-1"));
+        assert!(
+            state.managed_pane_ids.contains("other"),
+            "other panes untouched"
+        );
+        assert_eq!(state.sessions.len(), 1);
+
+        state.apply_event(daemon_pane_closed("p-1", Some("7")));
+        assert_eq!(state.sessions.len(), 1, "a second announcement is a no-op");
+        let queued = state.take_pane_closures();
+        assert_eq!(
+            queued
+                .iter()
+                .map(|c| (c.pane_id.as_str(), c.agent_id.as_deref()))
+                .collect::<Vec<_>>(),
+            vec![("p-1", Some("7")); 2],
+            "each announcement is queued; the render loop's half is idempotent too"
+        );
+        assert!(
+            queued.iter().all(|c| c.queued_at <= Utc::now()),
+            "each closure records when it was queued, so the render-thread half \
+             can tell a successor's card from the dead agent's"
+        );
+        assert!(state.take_pane_closures().is_empty(), "take drains");
+    }
+
+    /// PRD #1223: a card tagged with a DIFFERENT agent is a successor's, so it
+    /// and the pane's registration survive a removal naming the stopped agent.
+    #[test]
+    fn daemon_pane_closed_spares_a_successor_agents_card() {
+        let mut state = AppState::default();
+        state.register_pane("p-1".into());
+        state.insert_placeholder_session("p-1".into(), None, None, Some("8".into()));
+
+        state.apply_event(daemon_pane_closed("p-1", Some("7")));
+        assert_eq!(state.sessions.len(), 1, "the successor's card stays");
+        assert!(
+            state.managed_pane_ids.contains("p-1"),
+            "and so does the pane"
+        );
+    }
+
+    /// PRD #1223: the marker is only honoured on a `SessionEnd` with a pane id.
+    #[test]
+    fn daemon_pane_closed_requires_a_session_end_with_a_pane() {
+        let mut other_type = daemon_pane_closed("p-1", None);
+        other_type.event_type = EventType::Idle;
+        assert!(!other_type.is_daemon_pane_closed());
+        let mut paneless = daemon_pane_closed("p-1", None);
+        paneless.pane_id = None;
+        assert!(!paneless.is_daemon_pane_closed());
+        assert!(daemon_pane_closed("p-1", None).is_daemon_pane_closed());
+    }
+
     /// M2.3: closing a pane drops its routing identity, so a later delegate
     /// aimed at that role no longer resolves the dead pane.
     #[test]
@@ -13789,6 +14146,43 @@ mod tests {
     /// The half that was NOT true before #398: the untagged event lands on the
     /// pane's existing session instead of minting a sibling, so the pane owns
     /// exactly one session and `build_pane_status` has nothing to arbitrate.
+    /// PRD #1223: a placeholder for a generation whose real `SessionStart`
+    /// already drew its card keeps that card instead of minting a second one,
+    /// while a placeholder for a DIFFERENT generation still mints.
+    #[test]
+    fn placeholder_for_an_already_announced_generation_keeps_its_card() {
+        let mut state = AppState::default();
+        state.register_pane("role-p".into());
+        let mut real = untagged_event("real-session", EventType::SessionStart);
+        real.pane_id = Some("role-p".into());
+        real.agent_id = Some("7".into());
+        state.apply_event(real);
+
+        let kept = state.insert_placeholder_session(
+            "role-p".into(),
+            Some("/work".into()),
+            None,
+            Some("7".into()),
+        );
+        assert_eq!(kept, "real-session", "the existing card's id is returned");
+        let on_pane = || {
+            state
+                .sessions
+                .values()
+                .filter(|s| s.pane_id.as_deref() == Some("role-p"))
+                .count()
+        };
+        assert_eq!(on_pane(), 1, "one agent, one card");
+
+        let minted = state.insert_placeholder_session(
+            "role-p".into(),
+            Some("/work".into()),
+            None,
+            Some("8".into()),
+        );
+        assert_eq!(minted, placeholder_session_id("role-p"));
+    }
+
     #[test]
     fn pre_f9_hook_with_no_agent_id_adopts_the_panes_session() {
         let mut state = pane_with_tagged_session();

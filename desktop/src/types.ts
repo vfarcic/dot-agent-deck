@@ -145,6 +145,14 @@ export interface ConnectionView {
    * the launch needs was advertised.
    */
   projectActionsReason?: string;
+  /**
+   * Why the New agent flow cannot start anything on this deck (PRD #1223) —
+   * the crate's sentence for a deck that does not advertise
+   * `list-directories`. Browsing is the only way the flow chooses a directory,
+   * so the deck step shows such a deck disabled with this reason. Absent means
+   * available.
+   */
+  newAgentReason?: string;
   /** True when a daemon answered Hello but failed protocol/build compatibility. */
   daemonDetected?: boolean;
   /** Honest count reported by Hello; undefined when the daemon could not report it. */
@@ -251,6 +259,104 @@ export interface DaemonResolvedProject {
    */
   configRevision?: string;
 }
+
+/**
+ * PRD #1223 M4 — one subdirectory of a deck's filesystem, as that deck listed
+ * it for the New agent dialog.
+ */
+export interface DeckDirectoryEntry {
+  /**
+   * Identity: the canonical path the DAEMON joined, byte for byte — the string
+   * entering this directory sends back. Never built here from a parent and a
+   * name: the deck's filesystem need not be this machine's.
+   */
+  path: string;
+  /** The entry's name, escaped for rendering. Display-only. */
+  displayName: string;
+  /** It holds a `.dot-agent-deck.toml` the deck's project reader would open. */
+  isProject: boolean;
+}
+
+/**
+ * One directory on a named deck (PRD #1223 M4), or the deck's answer that it
+ * has no listing verb — a deck older than the PRD, which the dialog does not
+ * offer at its deck step (`ConnectionView.newAgentReason`). `unsupported` is an
+ * outcome, not an error.
+ */
+export type DeckDirectoryListing =
+  | {
+    kind: "listing";
+    /** Identity: the deck's canonical spelling — what the flow carries from here on. */
+    path: string;
+    /** `path`, escaped for rendering. Never sent anywhere. */
+    displayPath: string;
+    /** The parent as the DECK computed it, which is what "up" sends. Absent at the root. */
+    parent?: string;
+    entries: DeckDirectoryEntry[];
+    /** The deck's entry cap or time budget cut the listing short. */
+    truncated: boolean;
+  }
+  | { kind: "unsupported" };
+
+/** One agent registry entry, for the New agent form's agent list (PRD #1223 M4). */
+export interface NewAgentOption {
+  /** The registry's stable key (`claude`, `opencode`, …). */
+  id: string;
+  /** The registry's label, escaped for rendering. */
+  displayName: string;
+  /** What choosing this agent writes into Command. */
+  defaultCommand?: string;
+}
+
+/**
+ * The authoring agents a deck can start (PRD #1223 M7) — the TUI's
+ * `schedule`, `schedule: issues` and `dispatcher` Mode options, spelled as the
+ * wire spells them. A closed set: the crate refuses any other value rather
+ * than starting a plain agent with no seed.
+ */
+export type AuthoringKind = "schedule" | "schedule-issues" | "dispatcher";
+
+/**
+ * What the New agent form needs to know about one deck (PRD #1223 M4).
+ *
+ * `deck` is the deck's own answer. `unsupported` is a deck older than the PRD:
+ * nothing in it comes from the deck, and `desktopAgents` is the registry
+ * compiled into THIS app, which the form labels as such. `lastCommand` is the
+ * command this app last started a plain agent with on that deck, either way.
+ */
+export type NewAgentOptions =
+  | {
+    kind: "deck";
+    /** The deck host's configured `default_command` — Command's first prefill. */
+    defaultCommand?: string;
+    /**
+     * The deck host's configured `default_dir` (PRD #1223), canonical and
+     * vetted by the deck; the directory browser opens here instead of home.
+     * Absent when unset or unusable.
+     */
+    defaultDir?: string;
+    agents: NewAgentOption[];
+    experimental: boolean;
+    authoringKinds: string[];
+    lastCommand?: string;
+  }
+  | { kind: "unsupported"; desktopAgents: NewAgentOption[]; lastCommand?: string };
+
+/**
+ * The orchestrations the New agent form can offer for one directory on one deck
+ * (PRD #1223 M6) — that deck's `ResolveProject` answer.
+ *
+ * `project` carries the deck's canonical path, which is what the launch sends.
+ * `not_project` is an ordinary directory: the deck's generic `unresolved`
+ * refusal, which is an answer here and not an error. `unsupported` is a deck
+ * that cannot launch from this flow — it lacks the project verbs, or cannot
+ * start a role with its configured command — and `reason` says which; the form
+ * withholds the orchestration chips and shows it.
+ */
+export type NewAgentOrchestrations =
+  | ({ kind: "project" } & DaemonResolvedProject)
+  | { kind: "not_project" }
+  | { kind: "unsupported"; reason: string };
 
 export interface DeckPrompt {
   id: string;
@@ -662,8 +768,51 @@ export type DeckAction =
   | { type: "restart_daemon" }
   | { type: "allow_build_mismatch" }
   | { type: "start_workflow"; name: string; cwd: string; taskPrompt: string; roles: WorkflowLaunchRole[]; rows: number; cols: number; configRevision?: string }
+  /**
+   * Start one plain agent on the deck `deckId` names (PRD #1223 M3) — the
+   * wire `connection.deckId` of the target, captured once when the user picks
+   * the deck. Required, and never defaulted to the selected deck: under All
+   * Decks the selection resolves to the local deck (#1083), which is exactly
+   * the wrong answer on the overview. A deck the app is not observing is
+   * refused and nothing starts anywhere. The new agent's id comes back as
+   * `DeckActionResult.agentId`.
+   *
+   * `authoringKind` (PRD #1223 M7) starts an authoring agent instead, whose
+   * seed the deck composes and delivers once the agent is ready. It needs a
+   * `cwd` and a resolved `command` — a blank one would start the deck's
+   * default shell, which cannot act on a seed — and a deck that cannot compose
+   * the seed refuses it and starts nothing.
+   */
+  | { type: "start_agent"; deckId: string; command?: string; cwd?: string; displayName?: string; rows?: number; cols?: number; authoringKind?: AuthoringKind }
+  /**
+   * Launch one of a project's orchestrations on the deck `deckId` names, the
+   * TUI's way (PRD #1223 M6): no task prompt, `displayTitle` (the form's Name)
+   * as the run's title — absent when the Name is empty, so the run takes the
+   * orchestration's name — and every role started with the command its config
+   * gives it, on the deck. `path` and `orchestration` are the deck's own
+   * spellings from `newAgentOrchestrations`. The START role's id comes back as
+   * `DeckActionResult.agentId`.
+   *
+   * Not `start_workflow`, which is the Runs screen's launch and keeps its own
+   * form rules.
+   */
+  | { type: "start_orchestration"; deckId: string; path: string; orchestration: string; displayTitle?: string; configRevision?: string; rows?: number; cols?: number }
   | { type: "retry_stage"; stageId: string }
-  | { type: "stop_agent"; agentId: string }
+  /**
+   * PRD #1223 U4 — stop one agent on the deck `deckId` names, which the crate
+   * resolves as it resolves a start's: never from the selection, so an agent on
+   * another deck can be stopped from the overview under All Decks.
+   */
+  | { type: "stop_agent"; deckId: string; agentId: string }
+  /**
+   * PRD #1223 U4 — close a whole orchestration: stop every one of `roles` on the
+   * deck `deckId` names, concurrently. There is no orchestration-wide daemon
+   * verb; this is `stop_agent` fanned out, as the TUI's Ctrl+W closes a tab's
+   * panes. A role whose stop the deck refused or did not answer is named in the
+   * rejection, which arrives as a `LaunchCleanupError`; `name` is what it is
+   * named as.
+   */
+  | { type: "stop_orchestration"; deckId: string; roles: { agentId: string; name: string }[] }
   | { type: "rename_agent"; agentId: string; displayName: string }
   | { type: "submit_text"; agentId: string; text: string };
 
@@ -694,6 +843,13 @@ export interface DeckActionResult {
   ok: boolean;
   sendResult?: SendResult;
   message?: string;
+  /**
+   * The id of the agent the action acted on — for `start_agent`, the one the
+   * target deck just minted (PRD #1223 M3). Unique only within that deck, so
+   * it means nothing without the `deckId` the action was sent with: a
+   * consumer keys it as `(deckId, agentId)`, never alone.
+   */
+  agentId?: string;
 }
 
 /** True only for the two outcomes that actually reached the agent. */
@@ -851,7 +1007,13 @@ export interface DeckRuntimeState {
   terminalFeed?: TerminalFeed;
   error?: string;
   /**
-   * Drop the last action's error (issue #1046).
+   * PRD #1223 audit V7 — the roles a failed launch could not confirm are
+   * stopped, for the copy of the failure `error` carries. Absent unless the
+   * last action rejected with a `LaunchCleanupError`.
+   */
+  errorCleanup?: readonly string[];
+  /**
+   * Drop the last action's error and the cleanup roles with it (issue #1046).
    *
    * Required rather than optional: the toast in `App.tsx` renders on
    * `notice || error`, so a runtime that cannot clear `error` produces a toast
@@ -927,6 +1089,26 @@ export interface DeckRuntimeState {
    * request uses.
    */
   resolveProject: (path: string) => Promise<DaemonResolvedProject>;
+  /**
+   * PRD #1223 M4 — list one directory on the deck `deckId` names: a path that
+   * deck listed, one the user typed, or its home directory when `path` is
+   * absent. Resolves `unsupported` for a deck without the verb; rejects with
+   * the deck's or the app's own refusal otherwise.
+   *
+   * **Optional, and absence is a real state**, for the voice members' reason:
+   * several render-only test runtimes have no deck to ask, and a runtime
+   * without these two offers no New agent flow rather than a dialog that
+   * cannot load.
+   */
+  listDirectories?: (deckId: string, path?: string) => Promise<DeckDirectoryListing>;
+  /** PRD #1223 M4 — what the New agent form needs to know about the deck `deckId` names. */
+  newAgentOptions?: (deckId: string) => Promise<NewAgentOptions>;
+  /**
+   * PRD #1223 M6 — the orchestrations the New agent form can offer for `path`
+   * on the deck `deckId` names. Optional for the reason the two above are; a
+   * runtime without it offers no orchestration chips.
+   */
+  newAgentOrchestrations?: (deckId: string, path: string) => Promise<NewAgentOrchestrations>;
   /** The desktop app's own settings, and where they live (PRD #803). */
   getSettings: () => Promise<import("./lib/bridge").DesktopSettingsSnapshotDto>;
   /** Persist the whole document; resolves to what was written. */
@@ -989,7 +1171,7 @@ export interface DeckRuntimeState {
    * screen is the one piece of live state that exists ONLY in the webview; see
    * `DeckBridge.declareVoiceScreen` for the whole of that seam.
    */
-  declareVoiceScreen?: (screen: import("./lib/bridge").VoiceScreen) => void;
+  declareVoiceScreen?: (screen: import("./lib/bridge").VoiceScreen, directories?: import("./lib/bridge").VoiceDirectoriesDto, newAgent?: import("./lib/bridge").VoiceNewAgentDto) => void;
   resolveVoice?: (utterance: string) => Promise<import("./lib/bridge").VoiceResultDto>;
   /**
    * Every command in the table, annotated for one screen (PRD #802 D7) — what
@@ -1004,6 +1186,8 @@ export interface DeckRuntimeState {
    */
   voiceCommands?: (
     screen: import("./lib/bridge").VoiceScreen,
+    directories?: import("./lib/bridge").VoiceDirectoriesDto,
+    newAgent?: import("./lib/bridge").VoiceNewAgentDto,
   ) => Promise<import("./lib/bridge").VoiceCommandDto[]>;
   /** Open the microphone. Rejects with the not-configured sentence when transcription is off. */
   voiceStart?: () => Promise<import("./lib/bridge").VoiceStatusDto>;

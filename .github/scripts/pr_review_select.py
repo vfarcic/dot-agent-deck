@@ -19,6 +19,7 @@ from pr_review_common import (  # noqa: E402
     deny_sort_key,
     gh_json,
     gh_json_paginated,
+    focus_pass_requested,
     latest_verdict,
     pr_reviews,
     unresolved_threads,
@@ -90,6 +91,18 @@ def main():
     # produced by this run must still be votable, and a verdict produced by an
     # earlier run must not be orphaned just because it is no longer new.
     mode = env("SELECT_MODE", "review")
+    # Issue #1266: a FOCUSED follow-up pass re-reviews a head that already has a
+    # verdict, covering only what earlier verdicts did not. Idempotence below
+    # would otherwise skip it, which is right for every other caller: the sweep
+    # must not pay for a head twice.
+    #
+    # ONLY_PR is required, and that is the guard rather than a convenience. The
+    # flag reaches this script only from a manual `workflow_dispatch`, but an
+    # input is a string someone can also set on a sweep, and a focused SWEEP
+    # would re-review every eligible head on every run — unbounded spend from one
+    # true-ish value. Requiring a single named pull request bounds it to the one
+    # the operator asked for.
+    focus_unreviewed = focus_pass_requested(env("FOCUS_UNREVIEWED", ""), only_pr)
     review_authors = set(env("REVIEW_AUTHORS").split())
     vote_authors = set(env("VOTE_AUTHORS").split())
     try:
@@ -184,10 +197,17 @@ def main():
         existing = latest_verdict(repo, number)
         has_current_verdict = bool(existing and existing.get("head_sha") == sha)
 
-        if mode == "review" and has_current_verdict:
+        if mode == "review" and has_current_verdict and not focus_unreviewed:
             # Idempotence: nothing to add for a head that already has a verdict.
             skipped.append((number, f"already has a verdict for {sha[:8]}"))
             continue
+        if mode == "review" and has_current_verdict and focus_unreviewed:
+            # Said out loud because the run costs credits and the operator asked
+            # for it: a focused pass is the ONE case where paying twice for a
+            # head is the point. What makes it worth paying is that the second
+            # verdict covers what the first one declined to, which the agent
+            # reads out of the earlier verdict's `covered_paths`.
+            print(f"note #{number}: focused re-review of {sha[:8]}; it already has a verdict")
         if mode == "vote" and not has_current_verdict:
             skipped.append((number, f"no current verdict for {sha[:8]}"))
             continue

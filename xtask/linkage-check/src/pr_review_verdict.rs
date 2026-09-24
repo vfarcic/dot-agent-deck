@@ -64,7 +64,11 @@ fn run_py(body: &str) -> Output {
          from pr_review_common import (_is_trusted_verdict_comment, parse_verdict,\n\
         \x20    DENY_PATHS, already_reviewed_at, already_noticed_at, NO_VOTE_MARKER,\n\
         \x20    concat_json_documents, bot_rejection_is_stale,\n\
-        \x20    classify_check_runs, FALLBACK_REQUIRED_CONTEXTS)\n\
+        \x20    classify_check_runs, FALLBACK_REQUIRED_CONTEXTS,\n\
+        \x20    focus_pass_requested, coverage_gap,\n\
+        \x20    NO_INDEPENDENT_REVIEW_MARKER, INSUFFICIENT_MARKER,\n\
+        \x20    AUTO_MERGE_ARMED_MARKER,\n\
+        \x20    independent_review_at)\n\
          REQ = ('build', 'build-macos', 'build-windows', 'security', 'e2e-deterministic')\n\
          def crun(name, conclusion='success', status='completed', started_at=None, run_id=None):\n\
         \x20   return {{'name': name, 'status': status, 'conclusion': conclusion,\n\
@@ -78,8 +82,8 @@ fn run_py(body: &str) -> Output {
          def review(login, commit_id, state='APPROVED'):\n\
         \x20   return {{'user': {{'login': login}}, 'commit_id': commit_id, 'state': state}}\n\
          APP = 'dot-agent-deck-reviewer[bot]'\n\
-         def notice(sha, login=APP):\n\
-        \x20   return comment(login, NO_VOTE_MARKER + ' for `' + sha[:8] + '` — reasons')\n\
+         def notice(sha, login=APP, reason=INSUFFICIENT_MARKER):\n\
+        \x20   return comment(login, NO_VOTE_MARKER + ' for `' + sha[:8] + '` — ' + reason)\n\
          {body}\n",
         scripts = root.join(".github/scripts").to_string_lossy(),
         body = body,
@@ -387,7 +391,7 @@ fn an_unknown_app_identity_fails_open_rather_than_blocking_every_merge() {
     assert_py_ok(
         "assert not already_reviewed_at([review(APP, 'deadbeef')], 'deadbeef', '')\n\
          assert not already_reviewed_at([review(APP, 'deadbeef')], 'deadbeef', None)\n\
-         assert not already_noticed_at([notice('deadbeef')], 'deadbeef', '')",
+         assert not already_noticed_at([notice('deadbeef')], 'deadbeef', '', INSUFFICIENT_MARKER)",
     );
 }
 
@@ -408,9 +412,10 @@ fn a_failed_vote_leaves_nothing_behind_and_is_retried() {
 #[test]
 fn a_no_vote_notice_is_said_once_per_head() {
     assert_py_ok(
-        "assert already_noticed_at([notice('1263627a')], '1263627a', APP)\n\
-         assert not already_noticed_at([notice('1263627a')], '455719d4', APP)\n\
-         assert not already_noticed_at([notice('1263627a', 'vfarcic')], '1263627a', APP)",
+        "M = INSUFFICIENT_MARKER\n\
+         assert already_noticed_at([notice('1263627a')], '1263627a', APP, M)\n\
+         assert not already_noticed_at([notice('1263627a')], '455719d4', APP, M)\n\
+         assert not already_noticed_at([notice('1263627a', 'vfarcic')], '1263627a', APP, M)",
     );
 }
 
@@ -423,7 +428,52 @@ fn an_ordinary_app_comment_is_not_mistaken_for_a_notice() {
     assert_py_ok(
         "sha = 'deadbeef' + '0' * 32\n\
          plain = comment(APP, 'Automated review (`APPROVE`) for `' + sha + '`.')\n\
-         assert not already_noticed_at([plain], sha, APP)",
+         assert not already_noticed_at([plain], sha, APP, INSUFFICIENT_MARKER)",
+    );
+}
+
+/// Scenario: one head, two different reasons for withholding the vote. A notice
+/// saying "nothing independent has read this head" must not suppress the warning
+/// that auto-merge is armed, nor an `INSUFFICIENT` explanation — they are
+/// different instructions to the reader, and neither stands in for the other.
+#[test]
+fn a_notice_for_one_reason_does_not_suppress_another() {
+    assert_py_ok(
+        "sha = '1263627a'\n\
+         MARKERS = (NO_INDEPENDENT_REVIEW_MARKER, INSUFFICIENT_MARKER, AUTO_MERGE_ARMED_MARKER)\n\
+         for posted in MARKERS:\n\
+        \x20   for asked in MARKERS:\n\
+        \x20       hit = already_noticed_at([notice(sha, APP, posted)], sha, APP, asked)\n\
+        \x20       assert hit == (posted == asked), (posted, asked, hit)",
+    );
+}
+
+/// Scenario: read `pr_review_vote.py` itself and check that every no-vote branch
+/// passes a reason marker to `already_noticed_at`, that the markers are pairwise
+/// distinct rather than one containing another, and that each marker's text is
+/// present in the script — a marker that appears in no notice body never matches,
+/// so its notice repeats on every sweep instead of being said once.
+#[test]
+fn every_no_vote_branch_owns_a_distinct_marker() {
+    assert_py_ok(
+        "import ast, os\n\
+         path = os.path.join(sys.path[0], 'pr_review_vote.py')\n\
+         src = open(path, encoding='utf-8').read()\n\
+         calls = [n for n in ast.walk(ast.parse(src)) if isinstance(n, ast.Call)\n\
+        \x20        and getattr(n.func, 'id', '') == 'already_noticed_at']\n\
+         assert len(calls) == 3, len(calls)\n\
+         for c in calls:\n\
+        \x20   assert len(c.args) == 4, ast.dump(c)\n\
+        \x20   assert isinstance(c.args[3], ast.Name), ast.dump(c)\n\
+        \x20   assert c.args[3].id.endswith('_MARKER'), c.args[3].id\n\
+         used = [c.args[3].id for c in calls]\n\
+         assert len(set(used)) == len(used), used\n\
+         MARKERS = (NO_INDEPENDENT_REVIEW_MARKER, INSUFFICIENT_MARKER, AUTO_MERGE_ARMED_MARKER)\n\
+         assert len(set(MARKERS)) == 3\n\
+         for a in MARKERS:\n\
+        \x20   assert src.count(a) >= 1, a\n\
+        \x20   for b in MARKERS:\n\
+        \x20       assert a == b or a not in b, (a, b)",
     );
 }
 
@@ -890,4 +940,198 @@ fn the_fallback_list_matches_the_branch_protection_script() {
         "assert sorted(FALLBACK_REQUIRED_CONTEXTS) == sorted({expected:?}), \\\n\
         \x20   (sorted(FALLBACK_REQUIRED_CONTEXTS), sorted({expected:?}))"
     ));
+}
+
+/// Issue #1266: a focused follow-up pass deliberately bypasses the
+/// already-has-a-verdict idempotence, which is the one thing keeping a quiet
+/// sweep free. These pin the two halves of the gate that bound what that costs.
+///
+/// The property is runtime-only. Nothing about the type of a workflow input
+/// stops a sweep from carrying `focus_unreviewed: true`, and the failure would
+/// be a bill rather than a red build — every eligible head re-reviewed on every
+/// run, for as long as nobody noticed.
+#[test]
+fn a_focused_pass_needs_both_the_flag_and_one_named_pull_request() {
+    assert_py_ok("assert focus_pass_requested('true', '1235')");
+}
+
+/// The half that bounds the spend. A focused SWEEP is the failure this guard
+/// exists for, so it stays off even though the operator did ask for focus.
+#[test]
+fn a_focused_sweep_is_refused() {
+    assert_py_ok("assert not focus_pass_requested('true', '')");
+}
+
+/// The ordinary manual single-PR review keeps its idempotence: naming a pull
+/// request is not by itself a request to pay for its head a second time.
+#[test]
+fn naming_one_pull_request_alone_does_not_focus() {
+    assert_py_ok("assert not focus_pass_requested('false', '1235')");
+    assert_py_ok("assert not focus_pass_requested('', '1235')");
+}
+
+/// Exact match on `true`, because the value arrives as a STRING from a workflow
+/// input. GitHub writes booleans lowercase, so anything else is a typo or a
+/// hand-set value, and reading it as consent would spend credits nobody
+/// authorised. Failing closed costs one re-run; failing open costs a bill.
+#[test]
+fn a_truthy_looking_value_is_not_consent() {
+    for value in ["True", "TRUE", "1", "yes", "on", "true "] {
+        assert_py_ok(&format!(
+            "assert not focus_pass_requested({value:?}, '1235'), {value:?}"
+        ));
+    }
+}
+
+/// Issue #1266, Qodo's finding on PR #1268: with focused passes an `APPROVE`
+/// can rest on coverage accumulated across SEVERAL verdicts, so the union is
+/// verified HERE rather than trusted to the agent's arithmetic.
+///
+/// Before focused passes this check would have been redundant — `APPROVE` was a
+/// claim about the agent's own reading, and the agent/vote split deliberately
+/// bounds a diff that talks it into approving. A union is a claim about OTHER
+/// comments and is mechanically checkable, so it is checked.
+#[test]
+fn a_complete_union_leaves_no_gap() {
+    assert_py_ok(
+        "assert coverage_gap([{'covered_paths': ['a.rs', 'b.rs']}, \
+         {'covered_paths': ['c.rs']}], ['a.rs', 'b.rs', 'c.rs']) == []",
+    );
+}
+
+/// The whole point: a changed file no verdict claims is an approval of code
+/// nobody read, and the vote job refuses on exactly this list.
+#[test]
+fn an_uncovered_file_is_reported() {
+    assert_py_ok(
+        "assert coverage_gap([{'covered_paths': ['a.rs']}], ['a.rs', 'unread.rs']) \
+         == ['unread.rs']",
+    );
+}
+
+/// A verdict with no `covered_paths` contributes NOTHING rather than an assumed
+/// everything. Every verdict written before this field existed is that case, so
+/// reading absence as full coverage would approve old PRs sight unseen.
+#[test]
+fn a_verdict_without_covered_paths_covers_nothing() {
+    assert_py_ok("assert coverage_gap([{}], ['a.rs']) == ['a.rs']");
+    assert_py_ok("assert coverage_gap([{'covered_paths': None}], ['a.rs']) == ['a.rs']");
+}
+
+/// Malformed entries cannot smuggle coverage in: a non-list, or a list holding
+/// non-strings, contributes only what is genuinely a path.
+#[test]
+fn malformed_coverage_entries_contribute_nothing() {
+    assert_py_ok("assert coverage_gap([{'covered_paths': 'a.rs'}], ['a.rs']) == ['a.rs']");
+    assert_py_ok(
+        "assert coverage_gap([{'covered_paths': [None, 7, 'a.rs']}], ['a.rs', 'b.rs']) \
+         == ['b.rs']",
+    );
+}
+
+/// No verdicts at all — the state every pull request starts in — covers nothing.
+#[test]
+fn no_verdicts_cover_nothing() {
+    assert_py_ok("assert coverage_gap([], ['a.rs', 'b.rs']) == ['a.rs', 'b.rs']");
+}
+
+/// Issue #1270: an approval from this workflow asserts "nothing is
+/// outstanding", and that rests on somebody INDEPENDENT having read this head.
+/// The predicate is what decides whether a vote may be cast at all, so it is
+/// pinned here rather than left to the prompt — the same reason
+/// `_is_trusted_verdict_comment` is.
+///
+/// Three shapes count, because the two products express it differently: a
+/// submitted review pinned to the head, an inline comment pinned to it, and an
+/// issue comment whose body NAMES the head. The third exists because Qodo edits
+/// one summary comment in place as commits land — measured 2026-09-24 on #1268,
+/// where `created_at` sat two commits behind while the body cited the head.
+#[test]
+fn a_review_pinned_to_this_head_counts() {
+    assert_py_ok(
+        "assert independent_review_at(SHA, [], [], \
+         [{'user': {'login': 'greptile-apps[bot]'}, 'commit_id': SHA}]) \
+         == 'greptile-apps[bot]'",
+    );
+}
+
+#[test]
+fn an_inline_finding_pinned_to_this_head_counts() {
+    assert_py_ok(
+        "assert independent_review_at(SHA, [], \
+         [{'user': {'login': 'qodo-code-review[bot]'}, 'commit_id': SHA, \
+         'original_commit_id': SHA}], []) \
+         == 'qodo-code-review[bot]'",
+    );
+}
+
+/// Scenario: an inline finding written against an EARLIER commit, on a pull
+/// request whose head has since moved. GitHub re-anchors `commit_id` to the
+/// current head for a comment that still applies, so the old finding reports
+/// today's SHA — measured on #1235, where a comment created two days earlier
+/// against `1540db0f` came back as `commit_id=e4596523`. Reading that field
+/// would make this gate vacuous on any pull request that ever received an
+/// inline comment, so only `original_commit_id` counts.
+#[test]
+fn a_finding_re_anchored_to_this_head_does_not_count() {
+    assert_py_ok(
+        "older = '1' * 40\n\
+         moved = [{'user': {'login': 'greptile-apps[bot]'}, 'commit_id': SHA, \
+         'original_commit_id': older}]\n\
+         assert independent_review_at(SHA, [], moved, []) is None\n\
+         assert independent_review_at(older, [], moved, []) == 'greptile-apps[bot]'",
+    );
+}
+
+/// Qodo's shape. Without this the gate would read every Qodo review as stale,
+/// because the comment it edits keeps its original `created_at`.
+#[test]
+fn a_summary_comment_naming_this_head_counts() {
+    assert_py_ok(
+        "assert independent_review_at(SHA, \
+         [{'user': {'login': 'qodo-code-review[bot]'}, 'body': 'reviewed ' + SHA}], [], []) \
+         == 'qodo-code-review[bot]'",
+    );
+}
+
+/// The freshness half. A review of an earlier commit says nothing about what is
+/// on the head now, which is the whole reason this is keyed on the SHA.
+#[test]
+fn a_review_of_an_earlier_commit_does_not_count() {
+    assert_py_ok(
+        "assert independent_review_at(SHA, \
+         [{'user': {'login': 'qodo-code-review[bot]'}, 'body': 'reviewed ' + 'b' * 40}], \
+         [{'user': {'login': 'qodo-code-review[bot]'}, 'commit_id': 'b' * 40}], \
+         [{'user': {'login': 'greptile-apps[bot]'}, 'commit_id': 'b' * 40}]) is None",
+    );
+}
+
+/// The independence half. A maintainer quoting the SHA, the pull request's own
+/// author, and this workflow's own verdict are all not independent — the last
+/// one especially, since counting it would let the gate satisfy itself.
+#[test]
+fn nobody_else_can_satisfy_the_independence_requirement() {
+    for login in [
+        "vfarcic",
+        "github-actions[bot]",
+        "app/aether-agent",
+        "random-account",
+    ] {
+        assert_py_ok(&format!(
+            "assert independent_review_at(SHA, \
+             [{{'user': {{'login': {login:?}}}, 'body': SHA}}], \
+             [{{'user': {{'login': {login:?}}}, 'commit_id': SHA}}], \
+             [{{'user': {{'login': {login:?}}}, 'commit_id': SHA}}]) is None, {login:?}"
+        ));
+    }
+}
+
+/// No evidence at all is the state of every pull request before its first
+/// review, and of one opened before Qodo was installed — #1235 was exactly
+/// that. It must read as "wait", which the vote job turns into a withheld vote
+/// rather than a failure.
+#[test]
+fn no_evidence_reads_as_no_independent_review() {
+    assert_py_ok("assert independent_review_at(SHA, [], [], []) is None");
+    assert_py_ok("assert independent_review_at('', [], [], []) is None");
 }

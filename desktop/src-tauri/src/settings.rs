@@ -362,6 +362,9 @@ pub struct VoiceSettings {
     pub activation: ActivationMode,
     pub intent: IntentSettings,
     pub transcription: TranscriptionSettings,
+    /// Whether the command backend is shown the names the app observed (PRD
+    /// #1223, audit finding A1). See [`LabelSharing`].
+    pub labels: LabelSharing,
 }
 
 /// The endpoint the keyless local speech container listens on.
@@ -1098,6 +1101,59 @@ impl VoiceToken for ActivationMode {
     }
 }
 
+/// Whether each command request carries the LABELS the app observed — agent
+/// names and live status, deck labels, the directory names on screen, the New
+/// agent form's Mode chips and agent entries, orchestration titles and
+/// roles — or none of them (PRD #1223, audit finding A1). Either way the
+/// request also carries what every command does: the transcript, the fixed
+/// instructions and response schema, the command table, the model name and
+/// token ceiling, and — off this machine — the stored key in its
+/// authentication header (`VoicePanel.tsx`'s `INTENT_DISCLOSURE`).
+///
+/// **Shared by default**, because without them a model cannot tell that "the
+/// build box" is a deck or "billing" a directory, and cannot serve "the one
+/// that's stuck" at all. **Withheld** is for a user whose Commands endpoint is
+/// hosted and who does not want those names on it: a remote deck's label is
+/// `user@host[:port]`, and a directory name is whatever a repository called it.
+///
+/// **Withheld is honest rather than silent.** Every command whose param is one
+/// of those names reports itself unavailable with the reason
+/// (`voice::LABELS_WITHHELD_HINT`) instead of resolving against a model that
+/// was never shown them; what remains is navigation, dictation, the New agent
+/// dialog without a named deck, the directory browser's parameterless moves,
+/// Name and Start.
+///
+/// A closed enum and not a `bool`, for this section's reason: `bool` is not on
+/// `ALLOWED_FIELD_TYPES`, and a token folds an unknown value to the default
+/// the way its three neighbours do.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum LabelSharing {
+    /// Send the observed labels, in a data turn marked untrusted.
+    #[default]
+    Shared,
+    /// Send none of the observed labels: no data turn at all.
+    Withheld,
+}
+
+impl VoiceToken for LabelSharing {
+    const TOKENS: &'static [&'static str] = &["shared", "withheld"];
+    const LABEL: &'static str = "a label-sharing choice";
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Shared => "shared",
+            Self::Withheld => "withheld",
+        }
+    }
+
+    fn from_str_lossy(raw: &str) -> Self {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "withheld" => Self::Withheld,
+            _ => Self::default(),
+        }
+    }
+}
+
 macro_rules! voice_token_serde {
     ($($ty:ty),+ $(,)?) => {$(
         impl $ty {
@@ -1121,10 +1177,15 @@ macro_rules! voice_token_serde {
     )+};
 }
 
-// Three identical serde impls, written once. The macro generates NO struct and
+// Four identical serde impls, written once. The macro generates NO struct and
 // NO field — see [`VoiceToken`] for why that boundary matters to the
 // linkage-check scanner that reads this file as text.
-voice_token_serde!(ActivationMode, IntentBackend, TranscriptionBackend);
+voice_token_serde!(
+    ActivationMode,
+    IntentBackend,
+    TranscriptionBackend,
+    LabelSharing
+);
 
 /// The whole settings document.
 ///
@@ -3659,6 +3720,9 @@ mod tests {
                     "endpoint": LOCAL_SPEECH_ENDPOINT,
                     "model": LOCAL_SPEECH_MODEL,
                 },
+                // Absent from the document above, so this build's default:
+                // the observed names ARE sent (PRD #1223, audit finding A1).
+                "labels": "shared",
             })
         );
 
@@ -4451,9 +4515,15 @@ mod tests {
                 assert_eq!(T::from_str_lossy(&token.to_uppercase()).as_str(), *token);
             }
         }
+        assert_eq!(
+            <LabelSharing as VoiceToken>::TOKENS,
+            ["shared", "withheld"],
+            "keep this identical to VOICE_LABEL_SHARING in desktop/src/lib/bridge.ts"
+        );
         round_trips::<ActivationMode>();
         round_trips::<IntentBackend>();
         round_trips::<TranscriptionBackend>();
+        round_trips::<LabelSharing>();
     }
 
     /// The preset endpoints and models are duplicated in
@@ -6229,6 +6299,7 @@ forms it is.";
                     endpoint: ServiceUrl::parse(HOSTED_SPEECH_ENDPOINT).unwrap(),
                     model: ModelId::parse(HOSTED_SPEECH_MODEL).unwrap(),
                 },
+                labels: LabelSharing::Withheld,
             }),
             ..DesktopSettings::default()
         }
@@ -7100,6 +7171,7 @@ user = \"dev\"
 
 [voice]
 activation = \"toggle\"
+labels = \"withheld\"
 
 [voice.intent]
 backend = \"anthropic\"

@@ -65,6 +65,184 @@ use serde::{Deserialize, Serialize};
 /// renders. A parallel shape here would be a second answer to "what agents are
 /// there" with nothing keeping the two in step.
 pub use crate::dto::DesktopAgent;
+
+/// One deck a spoken [`ParamKind::DeckRef`] can name (PRD #1223).
+///
+/// Built from the fleet the desktop already observes
+/// (`dto::observed_fleet_decks`), never from the webview, for
+/// [`DesktopAgent`]'s reason: a list arriving from the page would be a second
+/// answer to "which decks are there". Resolution needs the key the frontend
+/// dispatches with, the name the screen shows, and whether the deck is this
+/// machine's, which is what makes the literal *"local"* name it. The fourth
+/// field is whether the New agent dialog can preselect it at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VoiceDeck {
+    /// `EndpointIdentity::wire_id()` — the same `deckId` the overview keys its
+    /// groups on and `openNewAgent` preselects.
+    pub id: String,
+    /// What the overview calls it: "Local deck", or `user@host[:port]`.
+    pub label: String,
+    /// Whether it is the local endpoint.
+    pub local: bool,
+    /// Why this deck cannot take a new agent, in the words the New agent
+    /// dialog's deck step shows beside it — or `None` when it can.
+    ///
+    /// **Taken from the webview's [`VoiceDeckChoice`] declaration**, the one
+    /// piece of a deck that is not read here: the dialog decides what to
+    /// preselect from the webview's fleet (`preselectedDeck` in
+    /// `desktop/src/lib/newAgent.ts`), and a report that is to agree with the
+    /// dialog has to be judged against the same list the dialog judges. A deck
+    /// with a reason is never shown to the model, so it cannot be picked, and
+    /// one resolved anyway from the user's own words is reported as unable to
+    /// take the agent rather than as preselected.
+    pub unavailable: Option<String>,
+}
+
+impl VoiceDeck {
+    /// Whether the New agent dialog would preselect this deck if asked to.
+    pub fn eligible(&self) -> bool {
+        self.unavailable.is_none()
+    }
+}
+
+/// One row of the New agent dialog's deck step, as the webview DECLARED it
+/// with an utterance (PRD #1223): a deck id and, for a deck that cannot take a
+/// spawn, the reason the step shows beside it (`deckChoices` in
+/// `desktop/src/lib/newAgent.ts`).
+///
+/// # It comes from the webview, and only annotates [`VoiceDeck`]
+///
+/// The DECKS are still read Rust-side; this adds nothing to that list and a
+/// deck id it names that the fleet does not have is ignored. What it carries is
+/// whether each deck is eligible, and that is a question about the dialog: the
+/// dialog preselects from the webview's fleet, whose connection states and
+/// fallback sentences (`deckUnavailableReason`) are computed there. Declared on
+/// every utterance rather than only while the dialog is open, because
+/// `open_new_agent` — the one row with a `deck_ref` — runs while it is closed.
+///
+/// It can only narrow what voice will preselect: a deck it marks eligible
+/// that the dialog then refuses is still refused by the dialog.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct VoiceDeckChoice {
+    /// The wire `deckId`.
+    pub deck_id: String,
+    /// Why it cannot take a new agent, as display text; absent when it can.
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+/// What a deck the fleet observes but the deck step does not list says about
+/// itself: `DECK_STATE_FALLBACK.pending` in `desktop/src/lib/newAgent.ts`,
+/// because a deck the webview's fleet has no entry for is one that has not
+/// reported to it yet.
+pub const DECK_NOT_REPORTED: &str = "This deck has not reported yet.";
+
+/// What the New agent dialog's directory browser is showing, as the webview
+/// DECLARED it for one utterance (PRD #1223) — the set a spoken
+/// [`ParamKind::DirRef`] resolves against.
+///
+/// # It comes from the webview, unlike [`VoiceDeck`], and that is not a lapse
+///
+/// [`VoiceDeck`] and [`DesktopAgent`] are read Rust-side because that is where
+/// they live, and a list from the page would be a second answer to a question
+/// the snapshot already answers. The browser's listing has no Rust-side home at
+/// all: it is `NewAgentDialog`'s component state — which deck the flow chose,
+/// which directory it is looking at, and which of that directory's children the
+/// filter leaves on screen — and the daemon lists one level per request and
+/// remembers none of them. So it is exactly the kind of state the mounted
+/// SCREEN is, and it travels the way the screen does: stated by the webview
+/// immediately before the resolve (`DeckBridge.declareVoiceScreen`). Absent
+/// means the dialog is closed, no deck is chosen, no listing has landed, or a
+/// start is in flight — every case where there is nothing on screen to name —
+/// and each `requires`-gated row is then `callable: false`.
+///
+/// Every path in it is one the deck returned (the dialog builds none), so a
+/// dispatch sends back a path that came from the deck, by way of the page.
+/// `lib.rs` bounds the declaration before it is used.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct VoiceDirectories {
+    /// The flow's chosen deck — the wire `deckId` its listing came from.
+    pub deck_id: String,
+    /// The listing's own `path`: the directory on screen.
+    pub path: String,
+    /// Whether the listing has a parent, i.e. whether `..` is on screen.
+    pub has_parent: bool,
+    /// The children on screen, in the order the browser shows them — after
+    /// the filter, because a spoken name means one the user can see.
+    pub entries: Vec<VoiceDirectoryEntry>,
+}
+
+/// One child directory on screen.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct VoiceDirectoryEntry {
+    /// The `displayName` the browser renders, which is what a user says.
+    pub name: String,
+    /// The deck's own path for it — what `open_dir` dispatches with.
+    pub path: String,
+}
+
+/// What the New agent dialog is showing BESIDES its directory browser, as the
+/// webview declared it for one utterance (PRD #1223) — present exactly while the
+/// dialog is mounted.
+///
+/// Declared by the webview for [`VoiceDirectories`]' reason, and separately
+/// from it because the two are present at different times: the browser can be
+/// empty (no deck chosen, no listing, a deck that cannot list) while the dialog
+/// is open, and a spoken "start it" must be able to say THAT rather than be
+/// refused as though no dialog were there.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct VoiceNewAgent {
+    /// The form's live fields, present only while they can be changed: a deck
+    /// and a directory chosen, no start in flight, and no start confirmation
+    /// open. Absent, every fill row is `callable: false`.
+    #[serde(default)]
+    pub form: Option<VoiceNewAgentForm>,
+}
+
+/// The New agent form's closed sets, as they are ON SCREEN (PRD #1223).
+///
+/// **The chips and the picker entries are the ones the dialog actually
+/// offers**, never a list this crate knows: the Mode row varies by the deck's
+/// capabilities, the deck's experimental flag, and whether the chosen
+/// directory is a project with orchestrations; the agent list is the deck's
+/// own registry, or the desktop's labelled fallback for a deck that does not
+/// report one. A spoken mode or agent type resolves against these and nothing
+/// else, so a chip that is not offered is refused rather than guessed.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct VoiceNewAgentForm {
+    /// The deck the form is about — the wire `deckId` the flow captured.
+    pub deck_id: String,
+    /// The chosen directory, as the deck spelled it.
+    pub path: String,
+    /// The Mode chips offered, in the order the row shows them. A disabled
+    /// namesake orchestration chip is NOT here: it cannot be chosen by a click
+    /// either.
+    pub modes: Vec<VoiceChoice>,
+    /// The agents the deck offers, as the dialog declares them — its registry, or this app's fallback copy for a deck that reports none.
+    pub agent_types: Vec<VoiceChoice>,
+    /// The Mode chips the dialog KNOWS and withholds on this form — an
+    /// authoring kind the deck cannot compose, or `schedule: issues` with the
+    /// deck's experimental flag off. Never resolvable: they are here so that a
+    /// user who names one is told it is not offered, instead of being handed
+    /// the nearest chip that is (a model shown only the offered chips was
+    /// measured substituting `schedule` for "schedule issues").
+    #[serde(default)]
+    pub withheld_modes: Vec<VoiceChoice>,
+}
+
+/// One entry of a closed set on screen: the id the dialog selects by, and the
+/// label it renders — which is what a user says.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct VoiceChoice {
+    pub id: String,
+    pub label: String,
+}
 pub use dictation::{DICTATION_OPENERS, SUBMIT_PHRASES};
 
 pub use capture::{
@@ -74,15 +252,22 @@ pub use capture::{
     TARGET_SAMPLE_RATE, Vad,
 };
 pub use hold::VoiceHold;
-pub use outcome::{ResolvedParam, VoiceOutcome, VoiceResult, handle_utterance};
+pub use outcome::{
+    ChoiceMatch, DeckRefMatch, DirRefMatch, ResolvedParam, VoiceOutcome, VoiceResult,
+    handle_utterance, handle_utterance_with, resolve_agent_type_ref, resolve_deck_ref,
+    resolve_dir_ref, resolve_mode_ref,
+};
 pub use remote::{Protocol, REMOTE_TIMEOUT, RemoteResolver};
 pub use resolver::{
     IntentAnswer, IntentError, IntentRequest, IntentResolver, StubResolver, resolver_for,
 };
 pub use schema::{
-    AnnotatedCommand, AnnotatedParam, TOOL_INSTRUCTIONS, TOOL_NAME, annotate, tool_schema,
+    AnnotatedCommand, AnnotatedParam, LABELS_WITHHELD_HINT, TOOL_INSTRUCTIONS, TOOL_NAME, annotate,
+    annotate_for, annotate_with, needs_labels, tool_schema,
 };
-pub use table::{CommandRow, CommandTable, NO_MATCH_ACTION, ParamKind, ParamSpec, Screen, table};
+pub use table::{
+    CommandRow, CommandTable, NO_MATCH_ACTION, ParamKind, ParamSpec, Requirement, Screen, table,
+};
 pub use transcribe::{
     HttpTranscriber, StubTranscriber, TRANSCRIBE_TIMEOUT, Transcriber, TranscriptionError,
     TranscriptionOutcome, VoiceTranscription, handle_audio, transcriber_for, unreachable_detail,
@@ -352,6 +537,42 @@ pub mod test_support {
     pub fn role_agent_in_state(id: &str, role: &str, status: &str) -> DesktopAgent {
         let mut agent = role_agent(id, role);
         agent.status = status.to_string();
+        agent
+    }
+
+    /// The same role agent as a member of the orchestration `id` — so several
+    /// share one overview card, as a real run's roles do (PRD #1223).
+    pub fn in_orchestration(mut agent: DesktopAgent, id: &str) -> DesktopAgent {
+        if let DesktopTab::Orchestration {
+            orchestration_id, ..
+        } = &mut agent.tab
+        {
+            *orchestration_id = Some(id.to_string());
+        }
+        agent
+    }
+
+    /// The same role agent as a member of the orchestration `id`, running the
+    /// config `name` under the run title `title` — the auto-generated
+    /// `<basename>-orchestrator-N` a real run is headed with, which is what a
+    /// user has to refer to on the overview (PRD #1223).
+    pub fn in_titled_orchestration(
+        mut agent: DesktopAgent,
+        id: &str,
+        name: &str,
+        title: &str,
+    ) -> DesktopAgent {
+        if let DesktopTab::Orchestration {
+            orchestration_id,
+            name: config,
+            display_title,
+            ..
+        } = &mut agent.tab
+        {
+            *orchestration_id = Some(id.to_string());
+            *config = name.to_string();
+            *display_title = Some(title.to_string());
+        }
         agent
     }
 

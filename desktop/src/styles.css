@@ -992,9 +992,70 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .confirm-dialog h2 { margin: 0; font-size: 15px; }
 .confirm-dialog p { margin: 7px auto 16px; max-width: 320px; color: var(--muted); font-size: 9.5px; line-height: 1.5; }
 .confirm-dialog > div:last-child { display: flex; justify-content: center; gap: 7px; }
+
+/* PRD #1223 M4 — the New agent dialog. One card over the `.dialog-backdrop`
+   scrim, as the palette and the confirmation are: a deck step, a directory step
+   and a form share it, so its height follows the step rather than a sheet's. */
+.new-agent-dialog { width: min(560px, 100%); max-height: calc(100vh - 11vh - 40px); display: flex; flex-direction: column; border: 1px solid var(--dialog-edge); border-radius: 7px; background: var(--paper-strong); box-shadow: 0 18px 50px rgb(var(--scrim-rgb) / .24); }
+.new-agent-dialog > header { padding: 12px 13px; display: flex; align-items: center; gap: 9px; border-bottom: 1px solid var(--line); }
+.new-agent-dialog > header h2 { margin: 0; font-size: 14px; }
+.new-agent-dialog > header .icon-button { margin-left: auto; }
+.new-agent-deck { min-width: 0; overflow: hidden; color: var(--muted); font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+.new-agent-body { min-height: 0; padding: 12px 13px; display: flex; flex-direction: column; gap: 9px; overflow: auto; }
+.new-agent-dialog > footer { padding: 10px 13px; display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 7px; border-top: 1px solid var(--line); }
+.new-agent-list { max-height: 300px; margin: 0; padding: 4px; overflow: auto; list-style: none; border: 1px solid var(--line); border-radius: 5px; background: var(--paper); }
+.new-agent-list:focus-visible { outline: 2px solid var(--teal); outline-offset: 1px; }
+.new-agent-row { min-height: 30px; padding: 5px 8px; display: flex; flex-wrap: wrap; align-items: center; gap: 7px; border-radius: 4px; cursor: pointer; font-size: 11px; }
+.new-agent-row:hover { background: var(--paper-sunken); }
+.new-agent-row.is-active { background: var(--teal-soft); }
+.new-agent-row.is-chosen .new-agent-row-name { color: var(--teal-deep); }
+.new-agent-row.is-disabled { color: var(--faint); cursor: default; }
+.new-agent-row.is-disabled:hover { background: transparent; }
+.new-agent-row-name { min-width: 0; overflow: hidden; font-weight: 650; text-overflow: ellipsis; white-space: nowrap; }
+.new-agent-row-tag { padding: 1px 5px; border: 1px solid var(--line); border-radius: 3px; color: var(--muted); font-size: 8.5px; text-transform: uppercase; letter-spacing: .04em; }
+.new-agent-row-reason { flex-basis: 100%; color: var(--faint); font-size: 9.5px; }
+.new-agent-current input, .new-agent-field input, .new-agent-field select { min-width: 0; height: 30px; padding: 0 8px; border: 1px solid var(--line-strong); border-radius: 4px; color: var(--ink); background: var(--paper); font: inherit; font-size: 11px; }
+.new-agent-current { display: flex; align-items: center; gap: 9px; }
+.new-agent-current strong { min-width: 0; flex: 1; overflow: hidden; font-family: "JetBrains Mono", monospace; font-size: 10.5px; text-overflow: ellipsis; white-space: nowrap; }
+.new-agent-current input { width: 150px; }
+.new-agent-hint, .new-agent-keys { margin: 0; display: flex; align-items: center; gap: 5px; color: var(--muted); font-size: 9.5px; line-height: 1.4; }
+.new-agent-keys { color: var(--faint); }
+.new-agent-error { margin: 0; color: var(--red); font-size: 10px; line-height: 1.4; overflow-wrap: anywhere; }
+.new-agent-cleanup { font-weight: 650; }
+.cleanup-warning p { margin: 0; }
+.cleanup-warning ul { margin: 2px 0 0; padding-left: 15px; max-height: 96px; overflow: auto; overflow-wrap: anywhere; }
+.new-agent-detail { color: var(--muted); font-size: 9.5px; line-height: 1.4; }
+.new-agent-detail summary { cursor: pointer; }
+.new-agent-detail p { margin: 4px 0 0; max-height: 120px; overflow: auto; overflow-wrap: anywhere; white-space: pre-wrap; }
+.new-agent-form { display: flex; flex-direction: column; gap: 9px; }
+/* The single surface (PRD #1223): deck, directory browser and form stacked in one scrolling body. */
+.new-agent-section { display: flex; flex-direction: column; gap: 7px; }
+.new-agent-section + .new-agent-section { padding-top: 9px; border-top: 1px solid var(--line); }
+.new-agent-section > h3 { margin: 0; color: var(--muted); font-size: 10px; font-weight: 650; letter-spacing: .04em; text-transform: uppercase; }
+.new-agent-list.is-decks { max-height: 132px; }
+.new-agent-list.is-directories { max-height: 200px; }
+.new-agent-list[aria-disabled="true"] { opacity: .6; }
+.new-agent-current .new-agent-keys { flex: 1; }
+.new-agent-unset { color: var(--faint); font-family: inherit; font-weight: 400; }
+.new-agent-field { display: grid; grid-template-columns: 76px minmax(0, 1fr); align-items: center; gap: 9px; font-size: 11px; }
+.new-agent-field > span { color: var(--muted); font-weight: 650; }
+.new-agent-field > strong { min-width: 0; overflow: hidden; font-family: "JetBrains Mono", monospace; font-size: 10.5px; text-overflow: ellipsis; white-space: nowrap; }
+.new-agent-field input[data-testid="new-agent-command"] { font-family: "JetBrains Mono", monospace; }
+.new-agent-chips { display: flex; flex-wrap: wrap; gap: 5px; }
+.new-agent-chip { min-height: 26px; padding: 0 9px; border: 1px solid var(--line-strong); border-radius: 13px; color: var(--ink); background: var(--paper); cursor: pointer; font-size: 10px; font-weight: 650; }
+.new-agent-chip.is-active { border-color: var(--teal-deep); color: var(--on-accent); background: var(--teal); }
+.new-agent-chip.is-disabled { border-style: dashed; color: var(--faint); cursor: not-allowed; }
+/* The overview's own line for what the New agent flow could not finish on
+   screen — an agent that started and has not been listed yet. */
+.overview-banner { padding: 8px 10px; display: flex; align-items: center; gap: 8px; border: 1px solid var(--amber-rim); border-radius: 5px; color: var(--amber-ink); background: var(--amber-bright); font-size: 10px; }
+.overview-banner span { flex: 1; }
+.overview-banner button { width: 22px; height: 22px; display: grid; place-items: center; border: 0; border-radius: 3px; color: inherit; background: transparent; cursor: pointer; }
+.daemon-new-agent { flex: 0 0 auto; margin-left: auto; }
+.daemon-pips + .daemon-new-agent { margin-left: 0; }
 /* Lifted clear of the voice row (see `.voice-row`). It is z-index 120 and would
    otherwise sit on top of the report text, which is the same corner. */
 .toast { max-width: min(470px, calc(100vw - 30px)); min-height: 42px; padding: 8px 9px; position: fixed; z-index: 120; right: 18px; bottom: calc(var(--voice-reserved) + 16px); display: grid; grid-template-columns: 18px minmax(0, 1fr) 24px; align-items: center; gap: 5px; border: 1px solid var(--amber-rim); border-radius: 5px; color: var(--amber-ink); background: var(--amber-bright); box-shadow: 0 8px 22px rgb(var(--scrim-rgb) / .13); font-size: 9px; }
+.toast-body { display: grid; gap: 3px; min-width: 0; }
 .toast button { width: 22px; height: 22px; display: grid; place-items: center; border: 0; background: transparent; cursor: pointer; }
 
 @media (min-width: 1450px) {
@@ -1348,6 +1409,9 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
    clamped by its own `text-overflow` and the control never moves. */
 .overview-open-agent { flex: 0 0 auto; margin-left: auto; width: 20px; height: 20px; display: grid; place-items: center; border: 1px solid transparent; border-radius: 4px; color: var(--faint); background: transparent; cursor: pointer; }
 .overview-open-agent:hover, .overview-open-agent:focus-visible, .overview-row.is-openable:hover .overview-open-agent { color: var(--teal); border-color: var(--teal-focus); background: var(--teal-soft); }
+.overview-stop-agent { flex: 0 0 auto; width: 20px; height: 20px; display: grid; place-items: center; border: 1px solid transparent; border-radius: 4px; color: var(--faint); background: transparent; cursor: pointer; }
+.overview-stop-agent:hover, .overview-stop-agent:focus-visible { color: var(--red); border-color: currentColor; }
+.overview-close-orchestration { margin-left: 6px; }
 /* A click anywhere on the row opens the pane too, so the row reads as one
    target: a pointer over all of it, and while it is hovered the control lights
    exactly as it does under the pointer itself. The control is what carries the

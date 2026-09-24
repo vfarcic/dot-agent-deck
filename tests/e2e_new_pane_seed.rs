@@ -30,15 +30,13 @@
 //! - `prompt/new-pane/014` — regression guard: the recorded last command must
 //!   survive a full deck RESTART (two launches sharing one HOME) — proving the
 //!   value round-trips through the persisted `session.toml`, not just in-process.
-//! - `prompt/new-pane/015` — RED until PRD #20 M8: each recognized command seed
-//!   matches that agent's registry default, and submitting Codex launches it
-//!   through `dot-agent-deck wrap --agent codex -- codex` rather than bare.
+//! - `prompt/new-pane/015` — the form has no Agent selector. It pinned PRD #20
+//!   finding 8's click-only chip until PRD #1223 removed that chip from both
+//!   clients; it now pins the absence in the real binary.
 
 mod common;
 
 use common::TuiDeck;
-use dot_agent_deck::agent_registry;
-use dot_agent_deck::event::AgentType;
 use spec::spec;
 
 /// Read the new-pane form's Command-field text from a rendered vt100 grid.
@@ -65,23 +63,6 @@ fn command_field_value(grid: &str) -> String {
         .map(|(head, _)| head)
         .unwrap_or(after);
     value.trim().to_string()
-}
-
-fn agent_field_value(grid: &str) -> String {
-    let line = grid
-        .lines()
-        .find(|line| line.contains("Agent:"))
-        .unwrap_or_else(|| {
-            panic!("the new-pane form must render an `Agent:` selector.\nGrid:\n{grid}")
-        });
-    let after = line.split("Agent:").nth(1).unwrap_or("");
-    after
-        .split_once('\u{2502}')
-        .map(|(value, _)| value)
-        .unwrap_or(after)
-        .trim()
-        .trim_matches(['[', ']'])
-        .to_string()
 }
 
 fn open_new_pane_form(deck: &TuiDeck) -> String {
@@ -377,48 +358,28 @@ fn new_pane_014_last_command_survives_restart() {
     drop(shared_home);
 }
 
-/// Scenario: Open the new-pane form with no global default command, click its
-/// agent selector, and cycle through Claude Code, OpenCode, Pi, and Codex. Each
-/// real UI selection must immediately seed Command from that selected registry
-/// entry, without the test copying the expected value into global config first.
+/// Scenario: Open the new-pane form in the real binary and read the painted
+/// grid. It shows Name and Command and no `Agent:` selector — no `[auto]` chip
+/// — because PRD #1223 removed it from both clients; Tab from Mode reaches
+/// Name and then Command, where a typed character lands.
 #[spec("prompt/new-pane/015")]
 #[test]
-fn new_pane_015_registry_defaults_and_codex_launches_wrapped() {
+fn new_pane_015_form_has_no_agent_selector() {
     let deck = TuiDeck::launch_with_fixture("minimal");
-    open_new_pane_form(&deck);
-    // `wait_for_in_grid` dumps the grid itself on timeout, so the form
-    // snapshot this used to keep for its panic message is no longer needed.
-    let (agent_x, agent_y) = deck.wait_for_in_grid("Agent:");
-    deck.click(agent_x, agent_y);
+    let grid = open_new_pane_form(&deck);
+    assert!(
+        grid.contains("Name:") && grid.contains("Command:"),
+        "the form must still render Name and Command.\nGrid:\n{grid}"
+    );
+    assert!(
+        !grid.contains("Agent:") && !grid.contains("[auto]"),
+        "the new-pane form must render no Agent selector.\nGrid:\n{grid}"
+    );
 
-    for (index, agent_type) in [
-        AgentType::ClaudeCode,
-        AgentType::OpenCode,
-        AgentType::Pi,
-        AgentType::Codex,
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        if index > 0 {
-            deck.send_keys(b"\x1b[C");
-        }
-        let expected = agent_registry::spec(&agent_type)
-            .default_command
-            .expect("every selectable shipped agent has a default command");
-        deck.wait_until_grid("selected agent updates its command seed", |grid| {
-            agent_field_value(grid) == agent_registry::spec(&agent_type).label
-                && command_field_value(grid) == expected
-        });
-        let grid = deck.snapshot_grid();
-        assert_eq!(
-            agent_field_value(&grid),
-            agent_registry::spec(&agent_type).label
-        );
-        assert_eq!(
-            command_field_value(&grid),
-            expected,
-            "selecting {agent_type} in the real form must seed its registry default without a global default_command override\nGrid:\n{grid}"
-        );
-    }
+    // Mode → Name → Command: two Tabs, then a keystroke lands in Command.
+    deck.send_keys(b"\t\t");
+    deck.send_keys(b"x");
+    deck.wait_until_grid("a typed character lands in Command", |grid| {
+        command_field_value(grid).ends_with('x')
+    });
 }

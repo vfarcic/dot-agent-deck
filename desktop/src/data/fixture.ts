@@ -1,5 +1,5 @@
 import type { VoiceCommandDto, VoiceResolvedParamDto, VoiceResultDto, VoiceScreen, VoiceStatusDto, VoiceTranscriptionDto } from "../lib/bridge";
-import type { AgentProfile, AgentSession, AgentStatus, AgentTab, DeckSnapshot, EvidenceItem, WorkflowStage } from "../types";
+import type { AgentProfile, AgentSession, AgentStatus, AgentTab, DaemonOrchestration, DeckDirectoryEntry, DeckSnapshot, EvidenceItem, NewAgentOption, WorkflowStage } from "../types";
 
 /**
  * The fixture's stand-in for a deck identity — used as BOTH `deckId` and
@@ -412,6 +412,191 @@ function crowdedAgent(seed: CrowdedSeed): AgentSession {
     isStartRole: orchestration?.isStartRole ?? false,
   };
 }
+
+/** What the preview was asked to start — `start_agent`'s fields plus the id the fixture deck minted. */
+export interface FixtureStartedAgent {
+  id: string;
+  daemonId: string;
+  displayName?: string;
+  command?: string;
+  cwd?: string;
+  rows?: number;
+  cols?: number;
+}
+
+/**
+ * The agent a fixture deck gains when the preview starts one (PRD #1223 M3).
+ *
+ * Shaped the way `agentFromDto` shapes a freshly spawned LIVE agent, by the
+ * convention {@link crowdedAgent} set: an agent that has emitted no hook event
+ * yet is `running` (the crate maps a record with no hook state to `running`),
+ * every field the daemon does not report carries live mode's placeholder, and
+ * there is no tool, prompt or activity to show. The CLI is the command's first
+ * word and absent when no command was given — the daemon then starts its
+ * default shell and names no binary, and absence is the honest rendering.
+ */
+export function createFixtureStartedAgent(started: FixtureStartedAgent): AgentSession {
+  const cli = started.command?.trim().split(/\s+/)[0] || undefined;
+  const role = cli ? cli.charAt(0).toUpperCase() + cli.slice(1) : "Agent";
+  return {
+    id: started.id,
+    daemonId: started.daemonId,
+    role,
+    displayName: started.displayName || role,
+    cli,
+    model: "Unavailable",
+    status: "running",
+    task: "Task metadata unavailable from the deck",
+    cwd: started.cwd,
+    duration: "—",
+    tokens: 0,
+    cost: 0,
+    contextPercent: 0,
+    worktree: "Unavailable",
+    writeLease: "unknown",
+    spawnedAtMs: Date.now(),
+    rows: started.rows ?? 24,
+    cols: started.cols ?? 80,
+    toolCount: 0,
+    transcript: "",
+    diff: [],
+    checks: [],
+    handoffIds: [],
+    artifacts: [],
+    tab: { kind: "dashboard" },
+    inOrchestration: false,
+    isStartRole: false,
+  };
+}
+
+/**
+ * The next id a fixture deck mints: the lowest positive integer none of its
+ * agents already uses. A daemon mints per-daemon monotonic integers, so two
+ * decks answering the same id is the ordinary case the preview must show too.
+ */
+export function nextFixtureAgentId(agents: readonly AgentSession[]): string {
+  let next = 1;
+  while (agents.some((agent) => agent.id === String(next))) next += 1;
+  return String(next);
+}
+
+/**
+ * PRD #1223 M4 — each connected fixture deck's home directory, which is where
+ * the New agent dialog's directory step opens on it.
+ *
+ * Different per deck on purpose: a preview that listed the wrong deck's tree
+ * would show the wrong home, where two identical trees would hide it.
+ */
+export const FIXTURE_HOMES: Readonly<Record<string, string>> = {
+  [FIXTURE_DAEMON_ID]: "/home/dev",
+  [FIXTURE_REMOTE_DAEMON_ID]: "/home/build",
+};
+
+/** One directory of a fixture deck's tree, shaped the way a deck lists one. */
+export interface FixtureDirectory {
+  path: string;
+  parent?: string;
+  entries: DeckDirectoryEntry[];
+}
+
+/**
+ * The filesystem a fixture deck lists, rooted at `/`: a home holding a project
+ * directory (it carries the marker) and an ordinary one, and a directory one
+ * level deeper inside the ordinary one — enough to browse into, confirm a
+ * directory with no subdirectories, and go back up through every parent.
+ *
+ * Every path here is the fixture DECK's answer, the way a daemon answers with
+ * its own canonical spelling. The dialog never builds one of these itself.
+ */
+export function fixtureDirectoryTree(home: string): Map<string, FixtureDirectory> {
+  const user = home.split("/").filter(Boolean).at(-1) ?? "dev";
+  const entry = (path: string, isProject = false): DeckDirectoryEntry => ({ path, displayName: path.split("/").at(-1) ?? path, isProject });
+  const tree: FixtureDirectory[] = [
+    { path: "/", entries: [entry("/home")] },
+    { path: "/home", parent: "/", entries: [entry(`/home/${user}`)] },
+    { path: home, parent: "/home", entries: [entry(`${home}/demo-project`, true), entry(`${home}/scratch`)] },
+    { path: `${home}/demo-project`, parent: home, entries: [] },
+    { path: `${home}/scratch`, parent: home, entries: [entry(`${home}/scratch/notes`), entry(`${home}/scratch/twin-project`, true)] },
+    { path: `${home}/scratch/notes`, parent: `${home}/scratch`, entries: [] },
+    { path: `${home}/scratch/twin-project`, parent: `${home}/scratch`, entries: [] },
+  ];
+  return new Map(tree.map((directory) => [directory.path, directory]));
+}
+
+/**
+ * PRD #1223 M6 — the orchestrations a fixture deck's `demo-project` defines, as
+ * that deck's `ResolveProject` answers them: one, `demo-loop`, whose
+ * `planner` starts the run and whose `builder` works for it.
+ *
+ * `scratch/twin-project` is the audit F2 case: it defines `twin-loop` TWICE —
+ * which a real config may, since validation only warns — and `solo-loop` once,
+ * so the preview shows namesakes disabled beside an orchestration that can be
+ * chosen. Every other directory in {@link fixtureDirectoryTree} is an ordinary
+ * one.
+ */
+export function fixtureProjectOrchestrations(home: string, path: string): DaemonOrchestration[] | undefined {
+  if (path === `${home}/scratch/twin-project`) {
+    const single = (name: string, role: string): DaemonOrchestration => ({ name, displayName: name, default: false, roles: [{ name: role, displayName: role, start: true }] });
+    return [single("twin-loop", "planner"), single("solo-loop", "planner"), single("twin-loop", "builder")];
+  }
+  if (path !== `${home}/demo-project`) return undefined;
+  return [
+    {
+      name: "demo-loop",
+      displayName: "demo-loop",
+      default: true,
+      roles: [
+        { name: "planner", displayName: "planner", start: true },
+        { name: "builder", displayName: "builder", start: false },
+      ],
+    },
+  ];
+}
+
+/**
+ * The commands `demo-loop`'s roles are configured with on a fixture deck — the
+ * deck's own config, which never crosses the wire. The fixture deck starts each
+ * role with its command the way a live deck does for a launch from the New
+ * agent dialog, so the preview's role panes are labelled by what they run.
+ */
+export const FIXTURE_ROLE_COMMANDS: Readonly<Record<string, string>> = {
+  planner: "claude",
+  builder: "codex",
+};
+
+/**
+ * The agent registry a fixture deck reports, shaped as `new-agent-options`
+ * reports the real one: each entry's first basename as the id, its label, its
+ * default command, in registry order. The fixture has no Rust to ask, so this
+ * is preview data — a live deck answers with its own build's list, and an
+ * older live deck's fallback comes from this app's Rust build, never from here.
+ */
+export function fixtureAgentRegistry(): NewAgentOption[] {
+  return [
+    { id: "claude", displayName: "ClaudeCode", defaultCommand: "claude" },
+    { id: "opencode", displayName: "OpenCode", defaultCommand: "opencode" },
+    { id: "pi", displayName: "Pi", defaultCommand: "pi" },
+    { id: "codex", displayName: "Codex", defaultCommand: "codex" },
+    { id: "devin", displayName: "Devin", defaultCommand: "devin" },
+  ];
+}
+
+/**
+ * The `default_command` each fixture deck's host configures, if any. The remote
+ * deck has one and the local deck does not, so the preview shows both halves
+ * of the Command prefill order.
+ */
+export const FIXTURE_DEFAULT_COMMANDS: Readonly<Record<string, string>> = {
+  [FIXTURE_REMOTE_DAEMON_ID]: "claude",
+};
+
+/**
+ * The fixture decks whose own experimental flag is on (PRD #1223 M7). The
+ * remote deck's is and the local deck's is not, so the preview shows the
+ * `schedule: issues` chip on one deck and withholds it on the other — the flag
+ * is the deck's, not this app's.
+ */
+export const FIXTURE_EXPERIMENTAL_DECKS: ReadonlySet<string> = new Set([FIXTURE_REMOTE_DAEMON_ID]);
 
 function orchestrationTab(orchestrationId: string, name: string, displayTitle: string, roleName: string, roleIndex: number, isStartRole = false, cwd?: string): AgentTab {
   return { kind: "orchestration", orchestrationId, name, displayTitle, roleName, roleIndex, isStartRole, cwd };
@@ -882,7 +1067,7 @@ const FIXTURE_VOICE_COMMANDS: ReadonlyArray<{
     action: "submit_prompt",
     invoke: "submitAgentPrompt",
     screens: ["agent"],
-    unavailableHint: "sending a prompt needs an agent's pane open",
+    unavailableHint: "sending a prompt needs an agent's pane open — open one first",
     report: "Sent.",
   },
 ];

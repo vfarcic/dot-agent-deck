@@ -10110,6 +10110,84 @@ pub fn write_late_announcing_agent(
     )
 }
 
+/// [`write_late_announcing_agent`] with Claude Code's bracketed-paste submit
+/// shape: all lines between `ESC[200~` and `ESC[201~` become one
+/// `UserPromptSubmit` event instead of one event per line.
+///
+/// This is opt-in because existing callers deliberately exercise the older
+/// line-at-a-time stand-in. The authoring seeds use it because the deck writes
+/// each multi-line seed as one bracketed paste and real Claude Code reports
+/// that paste as one turn. The fixture accepts the marker both with its leading
+/// ESC byte and in the `[200~` / `[201~` form observed after the fixture PTY's
+/// input processing. It logs each marker-free line as `received|…`, then logs
+/// `submitted|paste` after the single hook invocation so callers can reconstruct
+/// the exact submitted text without weakening duplicate-delivery assertions.
+#[cfg(unix)]
+#[allow(dead_code)]
+pub fn write_late_announcing_paste_agent(
+    dir: &Path,
+    log_name: &str,
+    announce_after_secs: u64,
+) -> PathBuf {
+    let genuine_start = late_announce_hook(
+        r#"{"hook_event_name":"SessionStart","session_id":"genuine-%s"}"#,
+        "\"$DOT_AGENT_DECK_PANE_ID\"",
+        98,
+    );
+    let submitted = late_announce_hook(
+        r#"{"hook_event_name":"UserPromptSubmit","session_id":"genuine-%s","prompt":"%s"}"#,
+        "\"$DOT_AGENT_DECK_PANE_ID\" \"$json_prompt\"",
+        99,
+    );
+    write_late_announcing_script(
+        dir,
+        &format!(
+            "{prologue}\
+             {genuine_start}\
+             paste_open=$(printf '\\033[200~')\n\
+             paste_close=$(printf '\\033[201~')\n\
+             in_paste=0\n\
+             json_prompt=''\n\
+             separator=''\n\
+             while IFS= read -r line; do\n\
+             \x20 if [ \"$in_paste\" -eq 0 ]; then\n\
+             \x20\x20 case \"$line\" in\n\
+             \x20\x20\x20 \"$paste_open\"*) line=${{line#\"$paste_open\"}}; in_paste=1 ;;\n\
+             \x20\x20\x20 \"[200~\"*) line=${{line#\"[200~\"}}; in_paste=1 ;;\n\
+             \x20\x20 esac\n\
+             \x20 fi\n\
+             \x20 paste_done=0\n\
+             \x20 if [ \"$in_paste\" -eq 1 ]; then\n\
+             \x20\x20 case \"$line\" in\n\
+             \x20\x20\x20 *\"$paste_close\") line=${{line%\"$paste_close\"}}; paste_done=1 ;;\n\
+             \x20\x20\x20 *\"[201~\") line=${{line%\"[201~\"}}; paste_done=1 ;;\n\
+             \x20\x20 esac\n\
+             \x20 fi\n\
+             \x20 printf 'received|%s\\n' \"$line\" >> \"$log\"\n\
+             \x20 {json_escape}\n\
+             \x20 if [ \"$in_paste\" -eq 1 ]; then\n\
+             \x20\x20 json_prompt=\"${{json_prompt}}${{separator}}${{json_line}}\"\n\
+             \x20\x20 separator='\\n'\n\
+             \x20\x20 if [ \"$paste_done\" -eq 1 ]; then\n\
+             \x20\x20\x20 {submitted}\
+             \x20\x20\x20 printf 'submitted|paste\\n' >> \"$log\"\n\
+             \x20\x20\x20 in_paste=0\n\
+             \x20\x20\x20 json_prompt=''\n\
+             \x20\x20\x20 separator=''\n\
+             \x20\x20 fi\n\
+             \x20 else\n\
+             \x20\x20 json_prompt=$json_line\n\
+             \x20\x20 {submitted}\
+             \x20\x20 printf 'submitted|line\\n' >> \"$log\"\n\
+             \x20\x20 json_prompt=''\n\
+             \x20 fi\n\
+             done\n",
+            prologue = late_announce_prologue(log_name, announce_after_secs),
+            json_escape = LATE_ANNOUNCE_JSON_ESCAPE,
+        ),
+    )
+}
+
 /// Issue #1006: the same fixture with a REAL agent as its tail — the shape the
 /// field environment has (`devbox run agent` → init hooks → `claude`), and the
 /// one `prompt/new-pane/016` needs in order to be able to fail at all.
