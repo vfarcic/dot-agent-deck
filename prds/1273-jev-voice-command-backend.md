@@ -25,8 +25,8 @@ Add Jev as a **third Commands backend**, chosen in the same settings panel as th
 
     | param kind | Jev question | options come from |
     | --- | --- | --- |
-    | `agent_ref` | which agent? | live agent names, as the resolver already sees them |
-    | `spoken_prefix` | where does the text to type start? | **the transcript itself**, cut after each word — generated per utterance, never a predefined list |
+    | `agent_ref` | which agent? | the distinct names the model is shown for live agents today (label, role, CLI name — `voice/prompt.rs`'s `state`), each offered once; the chosen name then goes through `resolve_agent_ref` unchanged |
+    | `spoken_prefix` | where does the text to type start? | **the transcript itself**, cut after each word, up to and including the whole utterance — generated per utterance, never a predefined list |
 
   Jev answers every question on every request; the app ignores the answers that do not belong to the chosen action. Output is free, so this costs nothing extra.
 - **Speech is untouched.** Transcription stays its own stage with its own fields and model. Selecting Jev means a user has two different keys (Speech and Commands) rather than pasting one OpenAI key into both — a lost convenience, not a new field.
@@ -37,6 +37,8 @@ Add Jev as a **third Commands backend**, chosen in the same settings panel as th
 `dictate_to_agent` asks the model for `prefix`: the words that *introduce* the dictation (*"let's write a prompt"* in *"let's write a prompt run the login tests"*), which `voice::dictation::strip_opening` verifies against the transcript before anything is typed. Jev cannot write words, so the adapter turns the prefix into a choice among the transcript's own leading word sequences:
 
 For *"alright so could you get it to run the login tests"*: `alright` · `alright so` · `alright so could` · … · `alright so could you get it to` ← the answer · … · the whole sentence.
+
+The whole sentence stays an option on purpose: it is how Jev says "the user spoke only an introduction and there is nothing to type". `strip_opening` accepts it and leaves no text, and the validation that already runs after `strip_opening` (`voice/outcome.rs`, the `SpokenPrefix` arm) refuses that as `ParamUnresolved` — the same outcome a chat-model backend gets today when its prefix is the whole utterance.
 
 Nothing is predicted in advance — the options are every way of splitting **this** utterance into "introduction" and "text to type", so any opening a user could say is among them because they said it. Two consequences worth stating:
 
@@ -71,15 +73,19 @@ Whether Jev picks the **right** split (*"ask it to"* and not *"ask it to summari
 | --- | --- |
 | action = `none` | `NoMatch` |
 | action whose `screens` excludes the current screen | `Unavailable` (the app computes availability from `screens`, as validation already does) |
-| action with an `agent_ref` param, agent answer resolves | `Dispatch` |
-| action with a `spoken_prefix` param, `strip_opening` accepts the chosen split | `Dispatch` |
+| action with an `agent_ref` param, `resolve_agent_ref` matches the chosen name to one live agent | `Dispatch` |
+| action with an `agent_ref` param, the chosen name matches more than one live agent | `ParamAmbiguous` |
+| action with an `agent_ref` param, the chosen name matches no live agent | `ParamUnresolved` |
+| action with an `agent_ref` param and no live agent to offer | `ParamMissing` (the question has no options, so the adapter does not ask it and reports the param absent) |
+| action with a `spoken_prefix` param, `strip_opening` accepts the chosen split and text remains to type | `Dispatch` |
+| action with a `spoken_prefix` param, the chosen split is the whole utterance | `ParamUnresolved` |
 | request failed, timed out, or the reply does not parse | `ResolutionFailed` |
 
 Three existing outcomes behave differently under Jev, and the PRD accepts that rather than hiding it:
 
-- **`ParamAmbiguous` will not occur for agents.** Today the model returns the name it heard and `resolve_agent_ref` (`voice/outcome.rs:734`) matches it against live agents, reporting ambiguity when two match. Under Jev the agent is a choice, so Jev picks one. Recovering ambiguity would need the probabilities, which are out of scope.
+- **`ParamAmbiguous` for agents narrows to shared names.** Today the model returns the name it heard and `resolve_agent_ref` (`voice/outcome.rs:734`) matches it against live agents, reporting ambiguity when it matches more than one — either because two agents answer to the same name (the `open-agent-ambiguous-name` fixture, *"zoom coder"* against two agents both shown as *Atlas* with role `coder`) or because a partial name loosely matches several distinct ones. Because Jev's options are names rather than agents, and the chosen name goes through `resolve_agent_ref` unchanged, a name two agents share is still reported as ambiguous, so that fixture stays passable and M1's parity bar needs no exception for it. What is lost is the partial-name case: unless the partial name is itself some agent's whole name, it is not among the options, so Jev picks one of the complete names. Recovering it would need the probabilities, which are out of scope.
 - **`UnknownAction` becomes unreachable** because the action is a closed choice. It stays a variant for the other backends.
-- **`ParamMissing` / `ParamUnresolved`** apply only if the live agent list is empty or the chosen agent vanished between request and dispatch; the adapter must still route those cases to those outcomes rather than dispatching.
+- **`ParamMissing` / `ParamUnresolved`** narrow to the rows in the table above: `ParamMissing` when there is no live agent to offer, and `ParamUnresolved` when the chosen prefix is the whole utterance or the chosen name matches no live agent. That last row is not dead: a label the model is shown is not always a name `resolve_agent_ref` answers to — an agent with no display name and no role is shown as `Agent N` (`display_label`), which is not among the names the resolver matches (`spoken_names`) — so M3 either builds the options from the names the resolver matches or keeps that refusal. **An agent that exits while Jev is answering is not caught at resolution:** `desktop_voice_resolve` (`desktop/src-tauri/src/lib.rs`) reads one snapshot before the request and `handle_utterance` validates against that same snapshot. That window exists for the current backends too; this PRD neither widens nor closes it, and closing it (a fresh existence check at dispatch) would be its own change.
 
 ### The `description` column is shared
 
@@ -126,7 +132,7 @@ Selecting Jev sends transcripts and live agent names to TypeSafe, whose data-ret
 - **Jev's documented weaknesses fall on this workload.** TypeSafe's own docs list literal reading, indirection, irrelevant context and adversarial content among Jev 1.13's failure modes. Spoken commands are indirect by nature, and agent names in the live state are not fully trusted input. Mitigation: M1 measures the first two directly; validation and `strip_opening` stay in the path for the rest.
 - **The latency win may be smaller end to end than the intent-stage number.** Speech is a separate round trip that Jev does not shorten. Mitigation: M1 records the intent-stage latency; the smoke walk is where the end-to-end difference is felt.
 - **Shared descriptions.** See Technical Approach; mitigation is the fixtures plus the accepted fallback of a Jev-specific column.
-- **Lost `ParamAmbiguous` for agents.** Two similarly named agents are resolved by Jev's pick rather than by asking. Mitigation: accepted for this PRD; the probabilities follow-up can restore it.
+- **Lost `ParamAmbiguous` for partial agent names.** A partial name that loosely matches several agents is resolved by Jev's pick rather than by asking; a name two agents share is still reported as ambiguous (Technical Approach). Mitigation: accepted for this PRD; the probabilities follow-up can restore it.
 
 ## Open Questions
 
