@@ -17,9 +17,11 @@
 //! - three source the validator under `bash` with good and hostile values;
 //! - the last runs the two generating tasks through go-task itself, whose
 //!   built-in interpreter (mvdan/sh) is what executes the task bodies in a
-//!   release. It skips where `task` is not on PATH — devbox installs it; the
-//!   CI build jobs, as of this writing, do not — so in CI the `bash` tests are
-//!   what runs, and the script keeps to constructs both shells implement.
+//!   release. It skips where `task` is not on PATH, except where
+//!   `DAD_REQUIRE_GO_TASK` is set: ci.yml's Linux `build` job installs go-task
+//!   and sets it, and devbox installs go-task too. `build-macos` does not, so
+//!   there the `bash` tests are what runs; the script keeps to constructs both
+//!   shells implement.
 //!
 //! Unix-only, like `pin_lockstep`: the validator needs a POSIX shell, and its
 //! one automation caller is release.yml's Ubuntu `finalize` job.
@@ -328,6 +330,12 @@ fn task_present() -> bool {
 #[test]
 fn release_channel_vars_005_generating_tasks_run_under_go_task_on_the_release_dist() {
     if !task_present() {
+        // ci.yml's Linux `build` job installs go-task and sets this, so the
+        // one job that can run this test cannot pass it by skipping.
+        assert!(
+            std::env::var_os("DAD_REQUIRE_GO_TASK").is_none(),
+            "DAD_REQUIRE_GO_TASK is set but go-task (`task`) is not on PATH"
+        );
         eprintln!("SKIP: needs go-task (`task`) on PATH");
         return;
     }
