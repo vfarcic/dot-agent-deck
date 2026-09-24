@@ -605,13 +605,20 @@ pub async fn handle_utterance_with(
             // An optional param the model left out is simply not dispatched
             // (PRD #1223's "new agent" with no deck named), and says nothing:
             // the user did not ask for one either — unless the dialog will
-            // preselect one anyway, which the report then names
-            // ([`implied_param`]).
+            // preselect one anyway, which is then dispatched so the report and
+            // the dialog agree ([`implied_param`]).
+            //
+            // **Dispatched, and still not named.** The implied deck is the
+            // only one that can take a new agent, nobody referred to any deck,
+            // and no note precedes it: there was no choice and no guess, so
+            // "Preselected deck: …" would tell the user nothing they do not
+            // already know, on every "new agent". It is named where it carries
+            // information — a deck someone referred to (`Ok` below), or after
+            // a dropped one, whose note it answers ([`Unmet::dropped_note`]).
+            // Several eligible decks never reach here with one: the dialog
+            // then preselects nothing unless told.
             if spec.optional {
-                if let Some(param) = implied_param(spec, decks) {
-                    notes.push(preselected_note(&param));
-                    resolved.push(param);
-                }
+                resolved.extend(implied_param(spec, decks));
                 continue;
             }
             return finish(VoiceOutcome::ParamMissing {
@@ -3518,11 +3525,15 @@ mod tests {
     }
 
     /// Scenario: only one deck can take a new agent, so the dialog preselects
-    /// it whatever voice asked for — and the report names it every time: for a
-    /// plain "new agent", for a deck the dialog disables, and for a deck that
-    /// does not exist. "None is preselected" is said only when it is true.
+    /// it whatever voice asked for, and voice always dispatches it. The report
+    /// names it only when that says something: silent for a plain "new agent"
+    /// (no choice, no guess), named when the user or the model referred to a
+    /// deck, and named after a note — a deck the dialog disables, one that does
+    /// not exist, or an ambiguous one — so "none is preselected" is never said
+    /// when one is. With several eligible decks, a deck the model picks among
+    /// them is named, and a plain "new agent" preselects and says nothing.
     #[tokio::test]
-    async fn voice_outcome_new_agent_names_the_only_deck_that_can_take_one() {
+    async fn voice_outcome_new_agent_names_the_implied_deck_only_when_it_carries_information() {
         let fleet = [
             deck("deck-local", "Local deck", true),
             unavailable_deck(
@@ -3547,11 +3558,24 @@ mod tests {
         };
 
         for (said, answer, sentence) in [
+            // No choice and no guess: dispatched, and nothing said about it.
             (
                 "new agent",
                 IntentAnswer::new("open_new_agent"),
+                "Opening the New agent dialog.",
+            ),
+            // Referred to, by the user or by the model's own filling-in.
+            (
+                "new agent on local",
+                IntentAnswer::new("open_new_agent").with_param("deck", "local"),
                 "Opening the New agent dialog. Preselected deck: Local deck.",
             ),
+            (
+                "new agent",
+                IntentAnswer::new("open_new_agent").with_param("deck", "Local deck"),
+                "Opening the New agent dialog. Preselected deck: Local deck.",
+            ),
+            // A note precedes it, and the implied deck answers that note.
             (
                 "new agent on the build box",
                 IntentAnswer::new("open_new_agent").with_param("deck", "build box"),
@@ -3577,6 +3601,37 @@ mod tests {
             assert!(dispatched_local(&outcome), "{said:?}: {outcome:?}");
             assert_eq!(outcome.sentence(), sentence, "{said:?}");
         }
+
+        // Several decks can take one: the dialog preselects nothing unless
+        // told, so a plain "new agent" dispatches no deck and says nothing,
+        // while a deck the model picks among them is a choice, and named.
+        let several_eligible = [
+            deck("deck-local", "Local deck", true),
+            deck("deck-build", "deploy@build-box.example.com:2222", false),
+            unavailable_deck("deck-build-two", "ci@build-farm", false, NOT_LISTENING),
+        ];
+        let (outcome, _) = open_new_agent_over(
+            &several_eligible,
+            IntentAnswer::new("open_new_agent"),
+            "new agent",
+        )
+        .await;
+        assert!(
+            matches!(&outcome, VoiceOutcome::Dispatch { params, .. } if params.is_empty()),
+            "{outcome:?}"
+        );
+        assert_eq!(outcome.sentence(), "Opening the New agent dialog.");
+        let (outcome, _) = open_new_agent_over(
+            &several_eligible,
+            IntentAnswer::new("open_new_agent").with_param("deck", "Local deck"),
+            "new agent",
+        )
+        .await;
+        assert!(dispatched_local(&outcome), "{outcome:?}");
+        assert_eq!(
+            outcome.sentence(),
+            "Opening the New agent dialog. Preselected deck: Local deck."
+        );
 
         // A fleet with nothing that can take one preselects nothing, and says
         // nothing about a deck the user did not ask for.
