@@ -107,10 +107,12 @@ impl Fixture {
         for (name, body) in workflows {
             fs::write(wf.join(name), body).expect("write a fixture workflow");
         }
-        if !workflows
-            .iter()
-            .any(|(_, body)| body.contains("pnpm/action-setup"))
-        {
+        // A full-line comment naming the action is not a step, and the
+        // scanner ignores it too, so it must not suppress the default.
+        if !workflows.iter().any(|(_, body)| {
+            body.lines()
+                .any(|l| !l.trim_start().starts_with('#') && l.contains("pnpm/action-setup"))
+        }) {
             fs::write(
                 wf.join("desktop.yml"),
                 pnpm_workflow(&format!("version: {PNPM}")),
@@ -1177,5 +1179,35 @@ fn a_version_in_a_trailing_comment_is_not_a_pnpm_pin() {
         out.status.success(),
         "a `version:` inside a trailing comment must not be read as a pin:\n{}",
         combined(&out)
+    );
+}
+
+/// Raised by Greptile on #1284. Only the step's `with:` mapping carries the
+/// action's input, so a `version:` elsewhere in the step — here an `env:` —
+/// must not be read as the pin. It used to be, which let a step with NO pnpm
+/// version pass the missing-pin check on an unrelated key's agreeing value.
+#[test]
+fn a_version_outside_the_with_mapping_is_not_a_pnpm_pin() {
+    if !bash_present() {
+        eprintln!("SKIP: needs `bash` on PATH");
+        return;
+    }
+    let body = "jobs:\n  desktop-web:\n    steps:\n      \
+                - uses: pnpm/action-setup@v6\n        \
+                env: { version: 11.22.0 }\n        \
+                with:\n          \
+                run_install: false\n";
+    let out = Fixture::new(
+        &good_packages(),
+        &[
+            ("ci.yml", workflow("1.97.1", "0.9.143")),
+            ("desktop.yml", body.to_string()),
+        ],
+    )
+    .run();
+    let text = combined(&out);
+    assert!(
+        !out.status.success() && text.contains("no version: input"),
+        "an `env:` version is not the action's input, so this step is unpinned:\n{text}"
     );
 }

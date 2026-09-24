@@ -258,10 +258,11 @@ scan_workflow_nextest() {
 # world take, so the only thing that makes a given `version:` a pnpm pin is
 # that it sits in the same STEP as `uses: pnpm/action-setup@…`. The walk
 # therefore finds each such `uses:`, backs up to the `- ` that opens its step,
-# and reads every `version:` key from there to the next line indented no deeper
-# than that dash — so it reads the input whichever order the step's keys are
-# written in, and in block (`version: 11.22.0`) or flow
-# (`with: { version: 11.22.0 }`) style.
+# and reads the `version:` key of that step's `with:` mapping, looking from
+# there to the next line indented no deeper than that dash — so it reads the
+# input whichever order the step's keys are written in, and in block
+# (`version: 11.22.0`) or flow (`with: { version: 11.22.0 }`) style. A
+# `version:` elsewhere in the step (under `env:`, say) is not the input.
 #
 # Renovate reads this pin DIFFERENTLY from the two above, and that decides what
 # counts as unreadable here. It is not a customManager regex: `pnpm/action-setup`
@@ -315,13 +316,32 @@ scan_workflow_pnpm() {
           }
           dash_at = indent(line[start])
 
+          # Only the `with:` mapping of the step is read. A `version:` elsewhere
+          # in the step (`env: { version: … }`, say) is not an input of the action,
+          # and reading it would let a step with no pin pass as pinned.
+          # `with_at` is the column of the `with:` key while inside its block
+          # form, or -1; the flow form is read on the `with:` line itself.
           found = 0
+          with_at = -1
           for (j = start; j <= NR; j++) {
             if (j > start && !is_comment(line[j]) && indent(line[j]) <= dash_at) break
             if (is_comment(line[j])) continue
-            if (!match(line[j], /(^|[[:space:]{,])version:/)) continue
+            if (with_at >= 0 && indent(line[j]) <= with_at) with_at = -1
+            cand = ""
+            if (match(line[j], /^ *(- +)?with:/)) {
+              after = substr(line[j], RSTART + RLENGTH)
+              if (after ~ /^[[:space:]]*$/) {
+                with_at = RLENGTH - 5
+                continue
+              }
+              cand = after
+            } else if (with_at >= 0) {
+              cand = line[j]
+            }
+            if (cand == "") continue
+            if (!match(cand, /(^|[[:space:]{,])version:/)) continue
             found = 1
-            rest = substr(line[j], RSTART + RLENGTH)
+            rest = substr(cand, RSTART + RLENGTH)
             v = value_of(rest)
             # The SEMVER test written out rather than passed in with `-v`: awk
             # processes escapes in a `-v` value, so `\.` would arrive as `.`
