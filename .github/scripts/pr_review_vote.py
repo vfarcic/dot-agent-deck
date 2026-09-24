@@ -54,8 +54,10 @@ from pr_review_common import (  # noqa: E402
     gh_json,
     gh_ok,
     coverage_gap,
+    independent_review_at,
     latest_verdict,
     pr_changed_paths,
+    pr_review_comments,
     trusted_verdicts_at,
     pr_comments,
     pr_reviews,
@@ -318,18 +320,62 @@ def main():
     # what was read, and that is a broken reviewer rather than a quiet
     # no-vote. Loud beats silent, the same way a malformed verdict is loud.
     if decision == "APPROVE":
-        gap = coverage_gap(
-            trusted_verdicts_at(repo, pr_number, expected_sha),
-            pr_changed_paths(repo, pr_number),
+        # Issue #1270: what an approval from this workflow now asserts is
+        # "nothing is outstanding", and the evidence for that is somebody
+        # INDEPENDENT having read this head -- not this workflow, which is the
+        # actor being gated. Four agents read every diff here (the author's,
+        # the other maintainer's, Qodo's, then this one) and on 2026-09-24 this
+        # one contributed zero findings on both pull requests it read, so its
+        # job is to adjudicate that evidence rather than to be a fourth reader.
+        #
+        # Withheld, not refused: "nobody independent has read this head yet" is
+        # a reason to wait. A `fail` would turn an ordinary sequencing gap -- a
+        # push that outran the reviewer, or a pull request opened before Qodo
+        # existed, as #1235 was -- into a red job.
+        reviewer = independent_review_at(
+            expected_sha,
+            pr_comments(repo, pr_number),
+            pr_review_comments(repo, pr_number),
+            pr_reviews(repo, pr_number),
         )
-        if gap:
-            shown = ", ".join(gap[:5]) + (f" (+{len(gap) - 5} more)" if len(gap) > 5 else "")
-            fail(
-                f"#{pr_number}: APPROVE at {expected_sha[:8]} but no trusted verdict "
-                f"covers {len(gap)} changed file(s): {shown}. Refusing to vote -- an "
-                f"approval must rest on files something actually read."
+        if reviewer is None:
+            if already_noticed_at(pr_comments(repo, pr_number), expected_sha, app_login):
+                print(
+                    f"#{pr_number}: no independent review at {expected_sha[:8]}, already "
+                    "said so; not repeating it."
+                )
+                return
+            comment(
+                repo,
+                pr_number,
+                f"**No vote cast** for `{expected_sha[:8]}`, even though my verdict was "
+                f"`{decision}`.\n\nNo independent review covers this head yet. My approval "
+                "reports that nothing is outstanding, and that rests on somebody other than "
+                "me having read the code -- so there is nothing here for me to adjudicate."
+                "\n\nComment `/review` to ask for one, then re-run this workflow.",
             )
+            print(f"#{pr_number}: no independent review at {expected_sha[:8]}; no vote cast.")
             return
+        print(f"#{pr_number}: independent review at {expected_sha[:8]} by {reviewer}.")
+
+        # The union check (Qodo on #1268) applies only to a verdict that CLAIMS
+        # accumulated coverage, which since #1270 means a focused pass and
+        # nothing else. The ordinary gate never asserts it read the diff, so
+        # demanding full coverage of it would refuse every approval.
+        # `covered_paths` IS the claim; its absence means none was made.
+        if verdict.get("covered_paths"):
+            gap = coverage_gap(
+                trusted_verdicts_at(repo, pr_number, expected_sha),
+                pr_changed_paths(repo, pr_number),
+            )
+            if gap:
+                shown = ", ".join(gap[:5]) + (f" (+{len(gap) - 5} more)" if len(gap) > 5 else "")
+                fail(
+                    f"#{pr_number}: APPROVE at {expected_sha[:8]} claims accumulated coverage, "
+                    f"but no trusted verdict covers {len(gap)} changed file(s): {shown}. "
+                    f"Refusing to vote -- a coverage claim must rest on files something read."
+                )
+                return
 
     if decision == "INSUFFICIENT":
         # Say it once per head. The verdict is fixed for this SHA, so a re-post

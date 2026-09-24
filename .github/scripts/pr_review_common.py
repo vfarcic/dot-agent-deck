@@ -471,6 +471,53 @@ def pr_changed_paths(repo, number):
     )
 
 
+# Issue #1270: who counts as an INDEPENDENT review of a pull request.
+#
+# Not this workflow (it is the actor being gated), not the pull request's own
+# author, and not a human pasting a verdict — the point is that some reviewer
+# other than the approver looked at this exact code. Today that is Qodo, with
+# Greptile alongside it while its credits last.
+#
+# Adding a name here widens what may satisfy the gate, so it is a list in code
+# rather than a repository variable: it shows up in a diff and is reviewed.
+INDEPENDENT_REVIEWERS = ("qodo-code-review[bot]", "greptile-apps[bot]")
+
+
+def independent_review_at(sha, comments, review_comments, reviews):
+    """Did an independent reviewer look at THIS head? (issue #1270)
+
+    Three shapes count, because the two products express it differently:
+
+      * a submitted review whose `commit_id` is the head — Greptile's shape;
+      * an inline review comment pinned to the head — how a finding arrives;
+      * an issue comment by such a reviewer whose body NAMES the head SHA —
+        Qodo's shape, because it edits one summary comment in place as new
+        commits land rather than posting a new one. Measured 2026-09-24 on
+        #1268: the comment's `created_at` sat two commits behind the head while
+        its body cited the head SHA, so `created_at` is not the freshness
+        signal and a timestamp comparison would read as stale.
+
+    Returns the reviewer's login, or None. Absence is not a defect — it means
+    nobody independent has read this head yet, which is a reason to withhold an
+    approval rather than to refuse the pull request.
+    """
+    if not sha:
+        return None
+    for review in reviews or ():
+        login = ((review.get("user") or {}).get("login")) or ""
+        if login in INDEPENDENT_REVIEWERS and review.get("commit_id") == sha:
+            return login
+    for comment in review_comments or ():
+        login = ((comment.get("user") or {}).get("login")) or ""
+        if login in INDEPENDENT_REVIEWERS and comment.get("commit_id") == sha:
+            return login
+    for comment in comments or ():
+        login = ((comment.get("user") or {}).get("login")) or ""
+        if login in INDEPENDENT_REVIEWERS and sha in (comment.get("body") or ""):
+            return login
+    return None
+
+
 def coverage_gap(verdicts, changed_paths):
     """Issue #1266: changed files no TRUSTED verdict claims to have deep-read.
 
@@ -671,6 +718,19 @@ def pr_comments(repo, pr_number):
     return gh_json_paginated(
         "api", f"repos/{repo}/issues/{pr_number}/comments", "--paginate",
         "--jq", "[.[] | {body, user: {login: .user.login}}]",
+    )
+
+
+def pr_review_comments(repo, pr_number):
+    """Every INLINE review comment, paginated. Same paging reason as its siblings.
+
+    `commit_id` is what makes these useful to `independent_review_at`: an inline
+    finding is pinned to the commit it was written against, so it answers "did
+    somebody independent look at THIS head" without parsing anyone's prose.
+    """
+    return gh_json_paginated(
+        "api", f"repos/{repo}/pulls/{pr_number}/comments", "--paginate",
+        "--jq", "[.[] | {commit_id, body, user: {login: .user.login}}]",
     )
 
 

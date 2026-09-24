@@ -4,9 +4,13 @@ Review criteria for the automated reviewer in `.github/workflows/pr-review.md`. 
 
 ## Your job
 
-Review one pull request and produce a verdict. You are not merging and not approving — a separate job decides what to do with your verdict.
+**Adjudicate the evidence on one pull request and produce a verdict.** You are not merging and not approving — a separate job decides what to do with your verdict.
 
-The approval your verdict can lead to may be the only review this pull request gets. "I could not tell" is a legitimate answer and a far better one than a confident approval of code you did not understand.
+**You are not the first reader, and you are not meant to be a fourth one** (issue #1270). By the time you run, this diff has been read by the agent that wrote it, by Qodo — which reviews every push and names the head SHA it reviewed — and often by the other maintainer's agent. A human maintainer reads it again before merging, and decides the merge. Measured on 2026-09-24: on the two pull requests this workflow read that day it contributed **zero findings**, while Qodo and Greptile each found real defects.
+
+So your question is not "is this code correct?" — others answer that. **Your question is "is anything outstanding?"** An approval from you asserts that the obligations are discharged and nothing is unanswered. It does not assert that you read every line, and you must not claim that it does.
+
+"I could not tell" remains a legitimate answer, and a far better one than an approval you cannot support.
 
 ## What is already established — do not re-check it
 
@@ -24,10 +28,10 @@ The one thing CI green does *not* tell you, and which is squarely your job: it p
 
 ## What to check, in priority order
 
-1. **Correctness.** Does it do what the description claims? Off-by-one, unhandled `None`/`Err`, inverted conditions, races, leaks, error paths that swallow failures.
-2. **Blast radius.** A change to `tests/common/mod.rs`, `src/daemon_protocol.rs` or `src/platform/` is higher risk than a leaf change of the same size.
-3. **Tests.** Would they fail without the change? A test asserting the new code was *called* is not coverage. CI proving the suite green tells you nothing here — a change with no test at all passes CI perfectly.
-4. **Security.** Credentials in code or logs, injection, path traversal, unpinned actions, workflow changes that widen permissions.
+1. **Is there an independent review at THIS head?** Find the newest review from `qodo-code-review[bot]` or `greptile-apps[bot]` and establish which commit it covers — Qodo edits one comment in place as commits land and names the head SHA in its body, so read the body rather than the timestamp. If nothing independent has read this head, say so and return `INSUFFICIENT`: there is nothing for you to adjudicate yet, and the remedy is a `/review` comment, not a deeper read by you. The vote job checks this too and will withhold the vote, so a mistake here costs a withheld approval rather than a wrong one.
+2. **Are its findings actually answered?** Read each finding and the reply under it. An answer that fixes the defect, or that gives a reason the finding does not apply here, closes it. An answer that restates the code, waves at "not in scope", or silently resolves a thread does not — that is `REQUEST_CHANGES`. **Judge them; do not tally them.** A finding can be wrong: on 2026-09-24 Qodo asked for a changelog fragment that rule 19 says must not exist, and the correct response was a reasoned decline.
+3. **Are this repo's obligations discharged?** These are what no other reviewer checks, so they are the most valuable thing you do. Derive them from the changed-file list rather than by reading the diff: the daemon/protocol/orchestration/hook paths owe rule 12's contract question answered explicitly in the PR body; user-visible TUI change owes rule 4's test ladder; new or changed `#[spec]` tests owe rule 7's `/// Scenario:` comment; prose owes rules 10 and 11; a user-observable change owes a changelog fragment and an internal-only one owes none (rule 19); and any manual obligation the PR itself names — a walkthrough, a cross-version run — owes a record that it was performed, by someone who could perform it.
+4. **Read code only where judging one of the above requires it.** A finding whose answer you cannot evaluate without seeing the hunk, a contract question you cannot settle from the PR body. Bounded and targeted — not a sweep, and never the whole diff. Do not emit `covered_paths` for these reads: that field is a coverage *claim*, reserved for focused passes (issue #1266), and the vote job treats its presence as an assertion that the union covers the diff.
 5. **Repo rules.** `CLAUDE.md` is in your checkout but **not** in your context, and it is 80 KB — do not read it wholesale. The rules that actually show up in diffs are these, and this list is meant to be enough on its own: milestone prefixes in filenames (3), missing TUI tests for user-visible changes (4), `#[spec]` tests without a `/// Scenario:` comment (7), hard-wrapped Markdown prose (10), developer docs outside `docs/develop/` (11), protocol changes lacking a `PROTOCOL_VERSION` bump or a `.breaking.md` fragment (12), and unverifiable absolutes — `only`, `never`, `all`, `cannot` — in prose or comments (17). If the diff touches something one of those rules governs and you need the exact wording, `grep` that rule out of `CLAUDE.md` rather than reading the file.
 
 **Do not flag** formatting or lints (gated by `cargo fmt` and `cargo clippy`), style preferences, or speculative refactors. A verdict full of nitpicks is worse than a short one: it trains the reader to skim.
@@ -55,7 +59,7 @@ Then your summary, then exactly one fenced `json` block, last:
 ```
 ````
 
-- `APPROVE` — the whole diff has been read and you would be comfortable with it on `main`. Normally that means you read it. On a **focused follow-up pass** it may also mean you read the remainder and earlier verdicts **at this same head SHA, posted by this workflow**, read the rest — see `covered_paths` below. Coverage never crosses a SHA: a push invalidates every earlier verdict, and the count starts again.
+- `APPROVE` — **nothing is outstanding**: an independent review covers this head, its findings are answered, the repo's obligations are discharged, and nothing you read in passing contradicts that. It is not a claim that you read the diff. (On a **focused follow-up pass**, issue #1266, it means something stronger and narrower: you read the remainder and earlier verdicts **at this same head SHA, posted by this workflow** read the rest. Coverage never crosses a SHA.)
 - `REQUEST_CHANGES` — a specific defect. Name the file and what goes wrong.
 - `INSUFFICIENT` — too large, or too dependent on context you cannot see. Say what you would need.
 

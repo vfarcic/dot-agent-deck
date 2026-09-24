@@ -177,8 +177,8 @@ You have **10000 AI credits** for this run, and a 45-minute wall clock. Both are
 
 That leaves one honest strategy: **bound the work, then emit once.** You cannot see your own credit meter, so budget the work instead, which you can count:
 
-1. **Read the diff summary and changed-file list first**, and decide where the risk is — protocol and daemon changes, credentials, deletion or process termination, security-relevant paths. Rank before reading.
-2. **Deep-read the top of that ranking only**, roughly the ten highest-risk files. Do not read the whole diff evenly; on a large pull request that alone can exhaust the budget.
+1. **Establish the evidence first**, in this order: the changed-file list (paths, not contents), the newest independent review and which head it covers, each of its findings and the reply under it, and the pull request body's own claims about the obligations it owes.
+2. **Read code only where judging that evidence requires it** — a finding whose answer you cannot evaluate without seeing the hunk, or a contract question the body does not settle. Bounded and targeted. You are not the first reader of this diff and must not spend the run becoming one (issue #1270); the rubric's priority list is the whole of your job.
 3. **Emit the verdict as your final action, and make it the only pass.** There is no second, deeper sweep — if you find yourself planning one, you have already spent what it would have cost.
 
 If your coverage was thin, say so in `reasons` and weigh `INSUFFICIENT` rather than reporting confidence you do not have.

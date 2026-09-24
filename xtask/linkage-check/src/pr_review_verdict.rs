@@ -65,7 +65,8 @@ fn run_py(body: &str) -> Output {
         \x20    DENY_PATHS, already_reviewed_at, already_noticed_at, NO_VOTE_MARKER,\n\
         \x20    concat_json_documents, bot_rejection_is_stale,\n\
         \x20    classify_check_runs, FALLBACK_REQUIRED_CONTEXTS,\n\
-        \x20    focus_pass_requested, coverage_gap)\n\
+        \x20    focus_pass_requested, coverage_gap,\n\
+        \x20    independent_review_at)\n\
          REQ = ('build', 'build-macos', 'build-windows', 'security', 'e2e-deterministic')\n\
          def crun(name, conclusion='success', status='completed', started_at=None, run_id=None):\n\
         \x20   return {{'name': name, 'status': status, 'conclusion': conclusion,\n\
@@ -984,4 +985,86 @@ fn malformed_coverage_entries_contribute_nothing() {
 #[test]
 fn no_verdicts_cover_nothing() {
     assert_py_ok("assert coverage_gap([], ['a.rs', 'b.rs']) == ['a.rs', 'b.rs']");
+}
+
+/// Issue #1270: an approval from this workflow asserts "nothing is
+/// outstanding", and that rests on somebody INDEPENDENT having read this head.
+/// The predicate is what decides whether a vote may be cast at all, so it is
+/// pinned here rather than left to the prompt — the same reason
+/// `_is_trusted_verdict_comment` is.
+///
+/// Three shapes count, because the two products express it differently: a
+/// submitted review pinned to the head, an inline comment pinned to it, and an
+/// issue comment whose body NAMES the head. The third exists because Qodo edits
+/// one summary comment in place as commits land — measured 2026-09-24 on #1268,
+/// where `created_at` sat two commits behind while the body cited the head.
+#[test]
+fn a_review_pinned_to_this_head_counts() {
+    assert_py_ok(
+        "assert independent_review_at(SHA, [], [], \
+         [{'user': {'login': 'greptile-apps[bot]'}, 'commit_id': SHA}]) \
+         == 'greptile-apps[bot]'",
+    );
+}
+
+#[test]
+fn an_inline_finding_pinned_to_this_head_counts() {
+    assert_py_ok(
+        "assert independent_review_at(SHA, [], \
+         [{'user': {'login': 'qodo-code-review[bot]'}, 'commit_id': SHA}], []) \
+         == 'qodo-code-review[bot]'",
+    );
+}
+
+/// Qodo's shape. Without this the gate would read every Qodo review as stale,
+/// because the comment it edits keeps its original `created_at`.
+#[test]
+fn a_summary_comment_naming_this_head_counts() {
+    assert_py_ok(
+        "assert independent_review_at(SHA, \
+         [{'user': {'login': 'qodo-code-review[bot]'}, 'body': 'reviewed ' + SHA}], [], []) \
+         == 'qodo-code-review[bot]'",
+    );
+}
+
+/// The freshness half. A review of an earlier commit says nothing about what is
+/// on the head now, which is the whole reason this is keyed on the SHA.
+#[test]
+fn a_review_of_an_earlier_commit_does_not_count() {
+    assert_py_ok(
+        "assert independent_review_at(SHA, \
+         [{'user': {'login': 'qodo-code-review[bot]'}, 'body': 'reviewed ' + 'b' * 40}], \
+         [{'user': {'login': 'qodo-code-review[bot]'}, 'commit_id': 'b' * 40}], \
+         [{'user': {'login': 'greptile-apps[bot]'}, 'commit_id': 'b' * 40}]) is None",
+    );
+}
+
+/// The independence half. A maintainer quoting the SHA, the pull request's own
+/// author, and this workflow's own verdict are all not independent — the last
+/// one especially, since counting it would let the gate satisfy itself.
+#[test]
+fn nobody_else_can_satisfy_the_independence_requirement() {
+    for login in [
+        "vfarcic",
+        "github-actions[bot]",
+        "app/aether-agent",
+        "random-account",
+    ] {
+        assert_py_ok(&format!(
+            "assert independent_review_at(SHA, \
+             [{{'user': {{'login': {login:?}}}, 'body': SHA}}], \
+             [{{'user': {{'login': {login:?}}}, 'commit_id': SHA}}], \
+             [{{'user': {{'login': {login:?}}}, 'commit_id': SHA}}]) is None, {login:?}"
+        ));
+    }
+}
+
+/// No evidence at all is the state of every pull request before its first
+/// review, and of one opened before Qodo was installed — #1235 was exactly
+/// that. It must read as "wait", which the vote job turns into a withheld vote
+/// rather than a failure.
+#[test]
+fn no_evidence_reads_as_no_independent_review() {
+    assert_py_ok("assert independent_review_at(SHA, [], [], []) is None");
+    assert_py_ok("assert independent_review_at('', [], [], []) is None");
 }
