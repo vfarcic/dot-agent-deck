@@ -4597,6 +4597,13 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 - **Does not assert:** the CLI's rendering of the refusal (`delegate_verdict`'s unit tests in `src/main.rs` own that); the commission's age-based expiry (`agent_pty`'s `commission_ledger_*` unit tests own that); a real agent.
 - **Platform coverage:** mac+linux (unix-only).
 
+##### pane/restart/013 — `pane restart --force` cancels the silent-worker notice for the task it cancelled (issue #590; PR #1285 review).
+- **Layer:** L1/fast (in-process — the real `handle_delegate_with_state` and `handle_restart_role_with_state` against a daemon-owned `cat`-orchestrator + `cat` worker, with `DOT_AGENT_DECK_DELEGATE_NO_EVENT_WINDOW_MS=1000` and the idle detector off; no daemon socket, no LLM).
+- **Agent:** none (`cat` stand-ins: the worker never emits an agent event, and the orchestrator echoes whatever the daemon writes into its pane).
+- **Asserts:** after a delegate whose pointer landed is cancelled with `pane restart --force`, three silent-worker windows pass with no "delegated worker went quiet" notice in the orchestrator pane; a second, uncancelled delegate then produces that notice (the control that makes the negative mean something).
+- **Does not assert:** the idle-worker (`worker_response_timeout_minutes`) report, which the same restart cancels by the same call; the case of a dispatch queued behind the pane lock during the restart (`agent_pty`'s `replaced_agent_watches_are_cancelled_unless_a_dispatch_is_in_flight` owns that).
+- **Platform coverage:** mac+linux (unix-only).
+
 #### pane/spawn
 
 ##### pane/spawn/001 — Spawning a configured-but-unspawned role succeeds and it becomes reachable (issue #868).
