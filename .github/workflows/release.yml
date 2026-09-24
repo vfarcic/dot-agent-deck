@@ -942,6 +942,11 @@ jobs:
           # selects on, and these must stay out of the CLI release's `dist/`.
           name: desktop-bundle-${{ matrix.asset_suffix }}
           path: dist-desktop/
+          # Re-running a failed `desktop-bundle` leg must not die on the
+          # artifact its own earlier attempt uploaded: artifacts are scoped to
+          # the run, not the attempt. The sibling upload in `finalize` has the
+          # longer reasoning.
+          overwrite: true
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         if: runner.os == 'macOS'
         with:
@@ -954,6 +959,8 @@ jobs:
           name: desktop-app-${{ matrix.asset_suffix }}
           path: dist-desktop-app/
           if-no-files-found: error
+          # Same re-run reasoning as the Linux upload above.
+          overwrite: true
 
   # PRD #757 Decision 4: the one job that holds the Apple signing credentials.
   #
@@ -1638,9 +1645,17 @@ jobs:
           # `desktop-bundle-*` pattern, so the `.dmg` they publish and attest is
           # this file, byte for byte. The macOS bundle leg no longer uploads
           # under it (it uploads `desktop-app-macos-arm64`), so the name is free.
+          #
+          # `overwrite: true` so that re-running this job after a later step
+          # failed replaces the `.dmg` instead of dying here on the one its own
+          # earlier attempt uploaded. That is the only artifact the overwrite
+          # can replace: no other upload in this workflow produces this name --
+          # `desktop-bundle`'s `desktop-bundle-*` upload runs on its Linux leg
+          # only, as `desktop-bundle-linux-amd64`.
           name: desktop-bundle-macos-arm64
           path: dist-desktop/
           if-no-files-found: error
+          overwrite: true
       - name: Record whether the disk image is signed
         id: result
         env:
@@ -1784,18 +1799,54 @@ jobs:
         # bundler failed must not advertise downloads it does not have. Each
         # platform's paragraph is written only when that platform's asset is
         # in `dist-desktop/`, which is exactly what the upload step published.
+        #
+        # REPLACED on every run, never skipped. The note sits between a START
+        # and an END marker line, and each run rewrites that block from what
+        # this run published. This step used to exit early when the START
+        # marker was already present, which left the note describing the FIRST
+        # attempt forever: a re-run that swapped an unsigned `.dmg` for a
+        # signed one kept telling users to strip the quarantine flag from a
+        # signed build (PRD #757 Decision 10's sharpest failure), and a first
+        # attempt whose `desktop-sign` failed left a note with no macOS
+        # paragraph that no re-run could add.
+        #
+        # What sits OUTSIDE the block, and is kept byte for byte apart from
+        # surrounding blank lines: everything before the START line -- the
+        # changelog body `finalize` published, already clamped by `prepare` to
+        # leave RESERVE for this note -- and everything after the END line,
+        # which no job in this workflow writes, so it can only be a human edit.
+        # The block is found by the LAST line that is exactly the START marker,
+        # so a changelog entry quoting the marker inline is not mistaken for
+        # it. A START with no END after it is a note written before the END
+        # marker existed, which always ran to the end of the body; everything
+        # from it onward is dropped and rewritten, including any text a human
+        # added after such a note.
         run: |
           set -eu
           MARKER="<!-- desktop-alpha -->"
+          END_MARKER="<!-- /desktop-alpha -->"
+          PREFIX="$RUNNER_TEMP/release-body-before-note.md"
+          SUFFIX="$RUNNER_TEMP/release-body-after-note.md"
           # `--repo`, for the reason given on the step above: no checkout in
           # this job means no git context for `gh` to fall back on.
-          BODY=$(gh release view "v$RELEASE_VERSION" --repo "$REPO" --json body -q .body)
-          case "$BODY" in
-            *"$MARKER"*)
-              echo "release body already carries the desktop alpha note; nothing to do"
-              exit 0
-              ;;
-          esac
+          gh release view "v$RELEASE_VERSION" --repo "$REPO" --json body -q .body > "$RUNNER_TEMP/release-body-current.md"
+          python3 - "$RUNNER_TEMP/release-body-current.md" "$MARKER" "$END_MARKER" "$PREFIX" "$SUFFIX" <<'SPLICE'
+          import re, sys
+          body_path, start, end, prefix_path, suffix_path = sys.argv[1:]
+          body = open(body_path, encoding="utf-8").read()
+          line = lambda m: re.compile(r"^[ \t]*" + re.escape(m) + r"[ \t\r]*$", re.M)
+          starts = list(line(start).finditer(body))
+          if not starts:
+              before, after = body, ""
+          else:
+              at = starts[-1]
+              before = body[:at.start()]
+              close = line(end).search(body, at.end())
+              after = body[close.end():] if close else ""
+          open(prefix_path, "w", encoding="utf-8").write(before.rstrip())
+          open(suffix_path, "w", encoding="utf-8").write(after.strip())
+          print(f"release body: {len(body)} chars; kept {len(before.rstrip())} before the note and {len(after.strip())} after it")
+          SPLICE
           MAC_DMG=dist-desktop/dot-agent-deck-desktop-alpha-macos-arm64.dmg
           LINUX_DEB=dist-desktop/dot-agent-deck-desktop-alpha-linux-amd64.deb
           # Anything other than an explicit `true` beside a published `.dmg`
@@ -1810,7 +1861,10 @@ jobs:
           fi
           NOTE="$RUNNER_TEMP/desktop-note.md"
           {
-            printf "%s\n\n" "$BODY"
+            if [ -s "$PREFIX" ]; then
+              cat "$PREFIX"
+              printf "\n\n"
+            fi
             printf "%s\n" "$MARKER"
             if [ "$SIGNED" = "true" ]; then
               printf "### Desktop GUI (alpha)\n\n"
@@ -1836,6 +1890,14 @@ jobs:
           fi
           if [ -f "$LINUX_DEB" ]; then
             printf "**Linux** (\`.deb\`) -- unsigned. Nothing blocks this install and nothing warns you: \`dpkg -i\` does not verify package signatures, so the checks above are the only ones anybody makes.\n" >> "$NOTE"
+          fi
+          printf "\n%s\n" "$END_MARKER" >> "$NOTE"
+          if [ -s "$SUFFIX" ]; then
+            {
+              printf "\n"
+              cat "$SUFFIX"
+              printf "\n"
+            } >> "$NOTE"
           fi
           gh release edit "v$RELEASE_VERSION" --repo "$REPO" --notes-file "$NOTE"
 
