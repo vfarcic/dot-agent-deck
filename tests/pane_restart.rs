@@ -1021,6 +1021,38 @@ async fn pane_restart_012_force_restart_cancels_the_task_a_busy_refusal_names() 
     );
 }
 
+/// Sets environment variables and puts back what was there before when
+/// dropped, including on a panic. For `pane/restart/013`, which needs a
+/// sub-minute silent-worker window and has only the environment to ask for it.
+struct EnvRestore(Vec<(&'static str, Option<std::ffi::OsString>)>);
+
+impl EnvRestore {
+    fn set(vars: &[(&'static str, &str)]) -> Self {
+        let saved = vars
+            .iter()
+            .map(|(key, _)| (*key, std::env::var_os(key)))
+            .collect();
+        for (key, value) in vars {
+            // SAFETY: called before the test starts its runtime, so this thread
+            // is the only one of the test reading the environment.
+            unsafe { std::env::set_var(key, value) };
+        }
+        Self(saved)
+    }
+}
+
+impl Drop for EnvRestore {
+    fn drop(&mut self) {
+        for (key, value) in &self.0 {
+            // SAFETY: dropped after the test's runtime has shut down.
+            match value {
+                Some(value) => unsafe { std::env::set_var(key, value) },
+                None => unsafe { std::env::remove_var(key) },
+            }
+        }
+    }
+}
+
 /// Whether the orchestrator pane shows the daemon's silent-worker notice.
 fn orchestrator_shows_silence_notice(registry: &AgentPtyRegistry) -> bool {
     let text = registry
@@ -1041,14 +1073,17 @@ fn orchestrator_shows_silence_notice(registry: &AgentPtyRegistry) -> bool {
 #[test]
 #[spec("pane/restart/013")]
 fn pane_restart_013_force_restart_cancels_the_silent_worker_notice() {
-    // Set before the runtime starts, so no runtime thread can be reading the
-    // environment while it changes. nextest runs each test in its own process,
-    // so the values reach no other test there.
-    // SAFETY: no other thread of this process exists yet.
-    unsafe {
-        std::env::set_var("DOT_AGENT_DECK_DELEGATE_NO_EVENT_WINDOW_MS", "1000");
-        std::env::set_var("DOT_AGENT_DECK_WORKER_RESPONSE_TIMEOUT_MS", "0");
-    }
+    // Set before the runtime starts and restored by `_env` after it has shut
+    // down — on a panic too — so no runtime thread of this test is reading the
+    // environment while it changes. Every cargo alias in this repo runs nextest,
+    // which gives each test its own process, so no other test sees these values.
+    // Under plain `cargo test` the other tests of this file may run concurrently
+    // in the same process; for them the values only switch the idle detector off
+    // and shorten the silent-worker window, and none of them asserts on either.
+    let _env = EnvRestore::set(&[
+        ("DOT_AGENT_DECK_DELEGATE_NO_EVENT_WINDOW_MS", "1000"),
+        ("DOT_AGENT_DECK_WORKER_RESPONSE_TIMEOUT_MS", "0"),
+    ]);
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
