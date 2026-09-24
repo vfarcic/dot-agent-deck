@@ -436,6 +436,28 @@ def parse_verdict(body):
     return data
 
 
+def focus_pass_requested(flag, only_pr):
+    """Issue #1266: is this a FOCUSED follow-up pass over one head?
+
+    True only for a manual dispatch that (a) asked for it and (b) named a single
+    pull request. Both halves are load-bearing:
+
+      * the flag alone would let a SWEEP re-review every eligible head on every
+        run, since a focused pass deliberately bypasses the already-has-a-verdict
+        idempotence that keeps a quiet sweep free. That is unbounded spend from
+        one true-ish value;
+      * `only_pr` alone is the ordinary manual single-PR review, which must keep
+        its idempotence.
+
+    The comparison is exact against `"true"`. A workflow input arrives here as a
+    string, and GitHub writes booleans as lowercase `true`/`false`; anything else
+    ("True", "1", "yes", a typo) is NOT an instruction to spend credits twice on
+    one head, so it reads as off. Failing closed costs a re-run with the right
+    value; failing open costs a bill nobody asked for.
+    """
+    return flag == "true" and bool(only_pr)
+
+
 def latest_verdict(repo, pr_number):
     """Newest pr-review/v1 verdict written by OUR workflow, or None.
 

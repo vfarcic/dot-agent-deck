@@ -64,7 +64,8 @@ fn run_py(body: &str) -> Output {
          from pr_review_common import (_is_trusted_verdict_comment, parse_verdict,\n\
         \x20    DENY_PATHS, already_reviewed_at, already_noticed_at, NO_VOTE_MARKER,\n\
         \x20    concat_json_documents, bot_rejection_is_stale,\n\
-        \x20    classify_check_runs, FALLBACK_REQUIRED_CONTEXTS)\n\
+        \x20    classify_check_runs, FALLBACK_REQUIRED_CONTEXTS,\n\
+        \x20    focus_pass_requested)\n\
          REQ = ('build', 'build-macos', 'build-windows', 'security', 'e2e-deterministic')\n\
          def crun(name, conclusion='success', status='completed', started_at=None, run_id=None):\n\
         \x20   return {{'name': name, 'status': status, 'conclusion': conclusion,\n\
@@ -890,4 +891,45 @@ fn the_fallback_list_matches_the_branch_protection_script() {
         "assert sorted(FALLBACK_REQUIRED_CONTEXTS) == sorted({expected:?}), \\\n\
         \x20   (sorted(FALLBACK_REQUIRED_CONTEXTS), sorted({expected:?}))"
     ));
+}
+
+/// Issue #1266: a focused follow-up pass deliberately bypasses the
+/// already-has-a-verdict idempotence, which is the one thing keeping a quiet
+/// sweep free. These pin the two halves of the gate that bound what that costs.
+///
+/// The property is runtime-only. Nothing about the type of a workflow input
+/// stops a sweep from carrying `focus_unreviewed: true`, and the failure would
+/// be a bill rather than a red build — every eligible head re-reviewed on every
+/// run, for as long as nobody noticed.
+#[test]
+fn a_focused_pass_needs_both_the_flag_and_one_named_pull_request() {
+    assert_py_ok("assert focus_pass_requested('true', '1235')");
+}
+
+/// The half that bounds the spend. A focused SWEEP is the failure this guard
+/// exists for, so it stays off even though the operator did ask for focus.
+#[test]
+fn a_focused_sweep_is_refused() {
+    assert_py_ok("assert not focus_pass_requested('true', '')");
+}
+
+/// The ordinary manual single-PR review keeps its idempotence: naming a pull
+/// request is not by itself a request to pay for its head a second time.
+#[test]
+fn naming_one_pull_request_alone_does_not_focus() {
+    assert_py_ok("assert not focus_pass_requested('false', '1235')");
+    assert_py_ok("assert not focus_pass_requested('', '1235')");
+}
+
+/// Exact match on `true`, because the value arrives as a STRING from a workflow
+/// input. GitHub writes booleans lowercase, so anything else is a typo or a
+/// hand-set value, and reading it as consent would spend credits nobody
+/// authorised. Failing closed costs one re-run; failing open costs a bill.
+#[test]
+fn a_truthy_looking_value_is_not_consent() {
+    for value in ["True", "TRUE", "1", "yes", "on", "true "] {
+        assert_py_ok(&format!(
+            "assert not focus_pass_requested({value:?}, '1235'), {value:?}"
+        ));
+    }
 }
