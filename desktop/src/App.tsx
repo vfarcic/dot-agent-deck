@@ -1713,6 +1713,7 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
           onSave={settings.save}
           saveError={settings.saveError}
           path={settings.path}
+          problem={settings.problem}
           loaded={settings.loaded}
           mode={mode}
         />

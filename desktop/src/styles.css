@@ -812,6 +812,9 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .settings-footer { justify-content: flex-start; }
 .settings-footer > span { display: flex; align-items: center; gap: 7px; }
 .settings-footer code { color: var(--muted); font-size: 8px; }
+/* The document is not in use (issue #829): the footer carries the reason in
+   place of the path, in the same ink the panel's own problem line uses. */
+.settings-footer .is-problem { color: var(--red-ink); }
 
 /* One setting, one row: a two-column grid — a label column, a gutter, then the
    control immediately beside it (PRD #803's density rule —

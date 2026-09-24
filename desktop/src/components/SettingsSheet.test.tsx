@@ -30,7 +30,7 @@ function stubSection(id: string, label: string): SettingsSection {
   };
 }
 
-function renderSheet(sections?: SettingsSection[]) {
+function renderSheet(sections?: SettingsSection[], location: { path?: string; problem?: string } = { path: "/home/dev/.config/dot-agent-deck/desktop.toml" }) {
   const onClose = vi.fn();
   const onSave = vi.fn();
   render(
@@ -41,7 +41,8 @@ function renderSheet(sections?: SettingsSection[]) {
       onSave={onSave}
       loaded
       mode="live"
-      path="/home/dev/.config/dot-agent-deck/desktop.toml"
+      path={location.path}
+      problem={location.problem}
       sections={sections}
     />,
   );
@@ -125,5 +126,31 @@ describe("SettingsSheet section column", () => {
     renderSheet([]);
     expect(screen.queryByRole("navigation", { name: "Settings sections" })).not.toBeInTheDocument();
     expect(screen.getByText("No settings sections are registered.")).toBeVisible();
+  });
+});
+
+describe("SettingsSheet footer", () => {
+  it("names the file it stores the settings in when nothing is wrong with it", () => {
+    renderSheet([stubSection("alpha", "Alpha")]);
+    const location = screen.getByTestId("settings-location");
+    expect(location).toHaveTextContent("Stored in /home/dev/.config/dot-agent-deck/desktop.toml");
+    expect(location).not.toHaveClass("is-problem");
+  });
+
+  /**
+   * Scenario (issue #829): `DOT_AGENT_DECK_DESKTOP_CONFIG` names a relative
+   * path, so the backend resolves it, refuses to read or write it, and reports
+   * why. Open Settings and the footer must say what is wrong rather than claim
+   * the settings are stored at a path the app will not use.
+   */
+  it("says why the settings location is unusable instead of naming the path", () => {
+    const problem = "The desktop settings path is unusable: it is not an absolute path. This session is using default settings, and nothing will be saved over the file until it is fixed or removed.";
+    renderSheet([stubSection("alpha", "Alpha")], { path: "relative/desktop.toml", problem });
+
+    const location = screen.getByTestId("settings-location");
+    expect(location).toHaveTextContent(problem);
+    expect(location).toHaveClass("is-problem");
+    expect(location).not.toHaveTextContent("Stored in");
+    expect(location).not.toHaveTextContent("relative/desktop.toml");
   });
 });

@@ -54,14 +54,25 @@ export interface DesktopSettingsState {
    *   build's schema rejects. The app is then running on defaults and the Rust
    *   side refuses every save rather than publishing those defaults over the
    *   user's file, so this is set from the moment the load resolves, before any
-   *   save has been attempted. Nothing else on screen explains why a user's
-   *   settings look reset — the footer names the file but not what is wrong
-   *   with it.
+   *   save has been attempted. This is what explains why a user's settings
+   *   look reset; the footer carries the same sentence as `problem` below, in
+   *   place of the path it would otherwise name (issue #829).
    *
    * A save failure wins while both are set: it is the newer answer, and the
    * refusal message carries the same locator the load problem does.
    */
   saveError?: string;
+  /**
+   * Why the document at `path` is not in use, when it is not — the load
+   * problem alone, without a save failure folded in. `undefined` once a save
+   * succeeds, because that proves the path usable.
+   *
+   * Separate from `saveError` because the footer answers a different question
+   * from the panel's alert: "where are my settings kept?" A failed save does
+   * not change that answer; a document the app refuses to use does (issue
+   * #829), and the footer must not go on naming that path as the store.
+   */
+  problem?: string;
   save: (next: DesktopSettingsDto) => void;
 }
 
@@ -182,5 +193,5 @@ export function useDesktopSettings(runtime: DeckRuntimeState): DesktopSettingsSt
   // here, because it is monotonic (false to true, never back) and every write
   // to it is paired with a `setSettings` in the same call, so the render that
   // observes the new value is one React was already going to perform.
-  return { settings, path, loaded, chosen: read || edited.current, saveError: saveFailure ?? documentProblem, save };
+  return { settings, path, loaded, chosen: read || edited.current, saveError: saveFailure ?? documentProblem, problem: documentProblem, save };
 }

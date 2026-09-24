@@ -1687,7 +1687,8 @@ describe("ControlDeck", () => {
    * Scenario (issue #1072): the `desktop.toml` on disk cannot be read, so the
    * app came up on defaults. Open Settings and the panel says what is wrong and
    * where in the file, before the user has touched anything — and the footer
-   * names the file itself, which is the other half of "where".
+   * says the same instead of claiming the settings are stored in that file,
+   * which the app is refusing to save to (issue #829).
    *
    * The symptom this replaces is the whole point: the app looked like a fresh
    * install, said nothing anybody would see, and destroyed the document on the
@@ -1712,7 +1713,32 @@ describe("ControlDeck", () => {
     // send them looking for a click they never made.
     expect(alert).not.toHaveTextContent("saving it failed");
     expect(store.saveSettings).not.toHaveBeenCalled();
-    expect(screen.getByTestId("settings-location")).toHaveTextContent("desktop.toml");
+    const location = screen.getByTestId("settings-location");
+    expect(location).toHaveTextContent("line 3, column 9");
+    expect(location).not.toHaveTextContent("Stored in");
+    expect(location).not.toHaveTextContent("desktop.toml");
+  });
+
+  /**
+   * Scenario (issue #829): the app came up with a settings problem, then a
+   * save succeeded — which the backend only allows once the document is one it
+   * can use. Open Settings, choose Dark, and the footer goes from the problem
+   * back to naming the file, because the path is now genuinely the store.
+   */
+  it("names the settings file again once a save proves the document usable", async () => {
+    const store = settingsStore(
+      undefined,
+      "/home/dev/.config/dot-agent-deck/desktop.toml",
+      "The desktop settings file cannot be read: line 3, column 9 is not valid settings. This session is using default settings, and nothing will be saved over the file until it is fixed or removed.",
+    );
+    render(<ControlDeck runtime={runtime({ mode: "live", getSettings: store.getSettings, saveSettings: store.saveSettings })} />);
+
+    fireEvent.click(screen.getByTestId("open-settings"));
+    await waitFor(() => expect(screen.getByTestId("settings-location")).toHaveTextContent("line 3, column 9"));
+
+    fireEvent.click(screen.getByRole("radio", { name: /Dark/ }));
+    await waitFor(() => expect(screen.getByTestId("settings-location"))
+      .toHaveTextContent("Stored in /home/dev/.config/dot-agent-deck/desktop.toml"));
   });
 
   /**
