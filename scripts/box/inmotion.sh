@@ -13,11 +13,12 @@
 #   scripts/box/inmotion.sh ip        # print the box's public IP
 #   scripts/box/inmotion.sh status    # list what exists
 #   scripts/box/inmotion.sh allow-ip  # point the SSH/mosh rules at your current IP
+#   scripts/box/inmotion.sh grow --volume-size GB  # enlarge /home while the box runs
 #
 # Options (defaults in brackets):
-#   --name NAME          resource prefix and hostname [dad-box]
+#   --name NAME          resource prefix and hostname [inmotion]
 #   --flavor FLAVOR      [m7i.4xlarge]
-#   --volume-size GB     data volume size, mounted at /home [300]
+#   --volume-size GB     data volume size, mounted at /home [2000]
 #   --volume-type TYPE   [NVME]
 #   --user USER          login user on the box [$USER]
 #   --allow-cidr CIDR    who may reach SSH/mosh; repeatable [your public IPv4/32]
@@ -29,16 +30,18 @@
 #   USE_VALS=1 devbox run -- scripts/box/inmotion.sh up
 #
 # Access is SSH from --allow-cidr only; the security group opens nothing else.
-# The script reaches the box with its own key, ~/.ssh/dad-box_ed25519, created
+# The script reaches the box with its own key, ~/.ssh/inmotion_ed25519, created
 # on first use.
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-NAME=dad-box
+NAME=inmotion
 FLAVOR=m7i.4xlarge
-VOLUME_SIZE=300
+# Every dispatched worktree builds its own `--features e2e` target/, measured at
+# 25-95 GB each; six of them filled a 300 GB volume in two hours (PRD #1279).
+VOLUME_SIZE=2000
 VOLUME_TYPE=NVME
 BOX_USER="${USER:-$(id -un)}"
 AUTHORIZED_KEYS="$HOME/.ssh/authorized_keys"
@@ -51,7 +54,7 @@ SUBNET_CIDR=10.42.0.0/24
 IMAGE_NAME=ubuntu-26.04-server-dad
 IMAGE_URL=https://cloud-images.ubuntu.com/releases/resolute/release/ubuntu-26.04-server-cloudimg-amd64.img
 IMAGE_SUMS_URL=https://cloud-images.ubuntu.com/releases/resolute/release/SHA256SUMS
-BOX_KEY="$HOME/.ssh/dad-box_ed25519"
+BOX_KEY="$HOME/.ssh/inmotion_ed25519"
 CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/dot-agent-deck/box"
 
 die() { echo "inmotion.sh: $*" >&2; exit 1; }
@@ -132,7 +135,7 @@ ensure_box_key() {
   [ -f "$BOX_KEY" ] && return
   log "creating SSH key $BOX_KEY"
   mkdir -p "$(dirname "$BOX_KEY")" && chmod 700 "$(dirname "$BOX_KEY")"
-  ssh-keygen -q -t ed25519 -N '' -C "dad-box@$(hostname)" -f "$BOX_KEY"
+  ssh-keygen -q -t ed25519 -N '' -C "inmotion@$(hostname)" -f "$BOX_KEY"
 }
 
 ensure_image() {
@@ -334,7 +337,7 @@ do_up() {
   wait_for_ssh "$ip"
   trust_host_key "$ip"
   log "waiting for cloud-init to finish"
-  ssh "${SSH_OPTS[@]}" "$BOX_USER@$ip" 'sudo cloud-init status --wait >/dev/null; cloud-init status --long | sed -n "1,3p"; findmnt -no SOURCE,SIZE /home'
+  ssh "${SSH_OPTS[@]}" "$BOX_USER@$ip" 'sudo cloud-init status --wait >/dev/null; cloud-init status --long | sed -n "1,3p"; sudo resize2fs "$(findmnt -no SOURCE /home)" >/dev/null 2>&1; findmnt -no SOURCE,SIZE /home'
 
   if [ "$BOOTSTRAP" -eq 1 ]; then
     log "running bootstrap.sh on the box"
@@ -414,6 +417,31 @@ do_destroy() {
   log "destroyed $NAME"
 }
 
+# Extend the attached volume and then its filesystem, with no downtime. Cinder
+# extends an in-use volume from API microversion 3.42; resize2fs grows a
+# mounted ext4 filesystem online.
+do_grow() {
+  require_cloud
+  local current
+  current="$(os volume show "$VOLUME" -f value -c size 2>/dev/null)" || die "no volume $VOLUME"
+  [ "$VOLUME_SIZE" -gt "$current" ] || die "$VOLUME is already ${current} GB; pass a larger --volume-size (volumes cannot shrink)"
+  log "extending $VOLUME from ${current} GB to ${VOLUME_SIZE} GB"
+  os --os-volume-api-version 3.42 volume set --size "$VOLUME_SIZE" "$VOLUME"
+  for _ in $(seq 1 60); do
+    [ "$(os volume show "$VOLUME" -f value -c size)" = "$VOLUME_SIZE" ] && \
+      [ "$(os volume show "$VOLUME" -f value -c status)" != extending ] && break
+    sleep 3
+  done
+  local ip
+  ip="$(floating_ip)"
+  if [ -n "$ip" ]; then
+    log "growing the filesystem on the box"
+    ssh "${SSH_OPTS[@]}" "$BOX_USER@$ip" 'sudo resize2fs "$(findmnt -no SOURCE /home)" >/dev/null && df -h /home'
+  else
+    log "box is down; \`up\` grows the filesystem when it next runs"
+  fi
+}
+
 do_status() {
   require_cloud
   local what id
@@ -445,6 +473,7 @@ case "$ACTION" in
   status)   do_status ;;
   ip)       require_cloud; floating_ip ;;
   ssh)      do_ssh "$@" ;;
+  grow)     do_grow ;;
   allow-ip) require_cloud; [ -n "$(os_id security group "$SECGROUP")" ] || die "no security group $SECGROUP"; set_allowed_cidrs ;;
   -h|--help|help) usage ;;
   *)        die "unknown action: $ACTION (try --help)" ;;
