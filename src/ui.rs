@@ -5126,6 +5126,14 @@ fn apply_pane_closure(
                 || s.agent_id
                     .as_deref()
                     .is_some_and(|a| Some(a) != closure.agent_id.as_deref())
+                // A card that began after the daemon announced this pane closed
+                // belongs to a SUCCESSOR on the reused pane id, not to the agent
+                // that was stopped. Needed because a daemon-surfaced attach start
+                // creates its card with no agent id, which the clause above reads
+                // as the dead agent's own placeholder (Qodo on PR #1235); without
+                // this, a successor that starts between the subscriber's pass and
+                // this frame is erased and its running agent has no card at all.
+                || s.started_at > closure.queued_at
         });
         if !st
             .sessions
@@ -41506,6 +41514,73 @@ mod pane_closure_tests {
 
         announce(&state, pc.as_ref(), &mut tab_manager, &mut ui, "coder", "2");
         assert_eq!(tab_manager.tab_count(), 1, "idempotent");
+    }
+
+    /// A successor that starts on the reused pane id between the subscriber's
+    /// pass and the render thread's must keep its card. The daemon-surfaced
+    /// attach start deliberately creates that card with no agent id, which is
+    /// exactly what the dead agent's own placeholder looks like — so before
+    /// PR #1235's fix the deferred pass matched it and removed it, leaving a
+    /// running agent with no card anywhere in the attached TUI (Qodo).
+    #[test]
+    fn a_successor_started_after_the_announcement_keeps_its_card() {
+        let pc = Arc::new(AttachedPC::new(&[("lead", "1")], None));
+        let mut tab_manager = TabManager::new(pc.clone());
+        let state: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
+        {
+            let mut st = state.blocking_write();
+            st.register_pane("lead".into());
+            st.insert_placeholder_session("lead".into(), None, None, Some("1".into()));
+        }
+        let mut ui = UiState::new(DashboardConfig::default(), KeybindingConfig::default());
+        ui.pane_names.insert("lead".into(), "lead".into());
+
+        // The subscriber applies the announcement and queues the render-thread
+        // half; the successor starts before that half runs.
+        state
+            .blocking_write()
+            .apply_daemon_pane_closed("lead", Some("1"));
+        assert_eq!(cards_on(&state, "lead"), 0, "the dead agent's card is gone");
+        {
+            let mut st = state.blocking_write();
+            st.register_pane("lead".into());
+            // No agent id: this is what a daemon-surfaced attach start creates.
+            st.insert_placeholder_session("lead".into(), None, None, None);
+        }
+
+        process_pending_pane_closures(&state, pc.as_ref(), &mut tab_manager, &mut ui);
+
+        assert_eq!(
+            cards_on(&state, "lead"),
+            1,
+            "the successor's card survives the deferred half"
+        );
+        assert!(
+            state.blocking_read().managed_pane_ids.contains("lead"),
+            "and so does the pane registration it needs"
+        );
+    }
+
+    /// The other side of that guard: a card already on the pane when the
+    /// announcement arrived is the dead agent's, and the deferred pass still
+    /// removes it even though it carries no agent id.
+    #[test]
+    fn an_agentless_card_from_before_the_announcement_is_still_removed() {
+        let pc = Arc::new(AttachedPC::new(&[("lead", "1")], None));
+        let mut tab_manager = TabManager::new(pc.clone());
+        let state: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
+        {
+            let mut st = state.blocking_write();
+            st.register_pane("lead".into());
+            st.insert_placeholder_session("lead".into(), None, None, None);
+        }
+        let mut ui = UiState::new(DashboardConfig::default(), KeybindingConfig::default());
+        ui.pane_names.insert("lead".into(), "lead".into());
+
+        announce(&state, pc.as_ref(), &mut tab_manager, &mut ui, "lead", "1");
+
+        assert_eq!(cards_on(&state, "lead"), 0);
+        assert!(!ui.pane_names.contains_key("lead"));
     }
 
     /// A user on the Dashboard keeps their place and mode when an orchestration

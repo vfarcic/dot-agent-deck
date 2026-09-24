@@ -919,6 +919,19 @@ export type NewAgentVoice = Pick<VoiceActionContext, "openDirectory" | "goToPare
    * a `form` only while the form's fields are live. See `VoiceNewAgentDto`.
    */
   newAgent: import("./bridge").VoiceNewAgentDto;
+  /**
+   * This MOUNT of the dialog, minted once per open and never sent to Rust.
+   *
+   * The declaration above deliberately compares only presences, so two live
+   * forms look alike however different their contents (see
+   * `sameNewAgentDeclaration`), and the rows that care re-check `{deckId,
+   * path}` at dispatch. `close` has nothing to re-check: it closes whatever
+   * dialog is open when it lands. So a `close` resolved against one dialog
+   * closed a REPLACEMENT the user had opened meanwhile, discarding its draft
+   * (Qodo on PR #1235). Comparing this refuses that with `DIALOG_MOVED_ON`,
+   * which is what a user who reopened the dialog should hear.
+   */
+  instance: string;
 };
 export type NewAgentVoiceChannel = { current: NewAgentVoice | undefined };
 

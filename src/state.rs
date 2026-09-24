@@ -58,6 +58,18 @@ pub struct PaneClosure {
     /// pane alone whose local attachment is bound to a DIFFERENT agent — a
     /// successor now owns it.
     pub agent_id: Option<String>,
+    /// When the announcement was applied, so the render-thread half can tell a
+    /// card that belongs to the dying pane from one a SUCCESSOR started on the
+    /// reused pane id while this closure sat in the queue.
+    ///
+    /// The agent id alone cannot: a daemon-surfaced attach start deliberately
+    /// creates its card with no agent id (`agent_id: None`), which is also what
+    /// a placeholder for the dead agent looks like, so the deferred pass would
+    /// match the successor's card and remove it — leaving a running agent with
+    /// no card in the attached TUI (Qodo on PR #1235). A card that began
+    /// strictly after the daemon said this pane was gone cannot belong to the
+    /// agent that was stopped, whatever its agent id says.
+    pub queued_at: DateTime<Utc>,
 }
 /// Maximum number of first-prompt entries retained per session. The live-side
 /// cap in `apply_event` and the wire-boundary clamp in
@@ -7030,6 +7042,7 @@ impl AppState {
         self.pending_pane_closures.push(PaneClosure {
             pane_id: pane_id.to_string(),
             agent_id: agent_id.map(str::to_string),
+            queued_at: Utc::now(),
         });
     }
 
@@ -12204,16 +12217,19 @@ mod tests {
 
         state.apply_event(daemon_pane_closed("p-1", Some("7")));
         assert_eq!(state.sessions.len(), 1, "a second announcement is a no-op");
+        let queued = state.take_pane_closures();
         assert_eq!(
-            state.take_pane_closures(),
-            vec![
-                PaneClosure {
-                    pane_id: "p-1".into(),
-                    agent_id: Some("7".into()),
-                };
-                2
-            ],
+            queued
+                .iter()
+                .map(|c| (c.pane_id.as_str(), c.agent_id.as_deref()))
+                .collect::<Vec<_>>(),
+            vec![("p-1", Some("7")); 2],
             "each announcement is queued; the render loop's half is idempotent too"
+        );
+        assert!(
+            queued.iter().all(|c| c.queued_at <= Utc::now()),
+            "each closure records when it was queued, so the render-thread half \
+             can tell a successor's card from the dead agent's"
         );
         assert!(state.take_pane_closures().is_empty(), "take drains");
     }

@@ -608,6 +608,9 @@ export function DeckShell({ runtime, workflowPlatformIssue, initialView = { kind
   const readDirectories = useCallback(() => newAgentVoice.current?.directories, []);
   /** PRD #1223 — what the New agent dialog shows besides its browser, while it is open. */
   const readNewAgent = useCallback(() => newAgentVoice.current?.newAgent, []);
+  /* Which mount of the dialog that declaration came from — never sent to Rust,
+     read only to refuse an answer whose dialog has been replaced (PRD #1223). */
+  const readNewAgentInstance = useCallback(() => newAgentVoice.current?.instance, []);
   /* The COMPOSITE identity, never the bare id. See `deckPaneRetargeted` above
      and `DeckSurface`'s own promotion condition. */
   const openAgent = agentView ? { deckId: agentView.deckId, agentId: agentView.agentId } : undefined;
@@ -664,7 +667,7 @@ export function DeckShell({ runtime, workflowPlatformIssue, initialView = { kind
   return (
     <>
       {screenNode}
-      <VoiceControlPanel runtime={runtime} screen={view.kind} onDispatch={dispatchVoice} channel={panelVoiceContext} directories={readDirectories} newAgent={readNewAgent} />
+      <VoiceControlPanel runtime={runtime} screen={view.kind} onDispatch={dispatchVoice} channel={panelVoiceContext} directories={readDirectories} newAgent={readNewAgent} newAgentInstance={readNewAgentInstance} />
     </>
   );
 }

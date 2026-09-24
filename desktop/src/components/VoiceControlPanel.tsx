@@ -473,6 +473,15 @@ interface VoiceControlPanelProps {
    */
   newAgent?: () => VoiceNewAgentDto | undefined;
   /**
+   * Which MOUNT of the New agent dialog that declaration came from (PRD #1223;
+   * Qodo on PR #1235) — read at the same moment and compared at the same
+   * moment, so an answer resolved against a dialog the user has since closed
+   * and reopened is refused with {@link DIALOG_MOVED_ON} instead of acting on
+   * the replacement. The declaration itself cannot say: it compares presences,
+   * and two live forms look alike.
+   */
+  newAgentInstance?: () => string | undefined;
+  /**
    * Where this panel publishes the context members only IT can serve
    * (PRD #802, the `voice_off` row).
    *
@@ -532,13 +541,15 @@ function progressNote(indicator: VoiceIndicator, phase: VoicePhase): string | un
  * real state: a control with nothing behind it would be worse than its absence,
  * and it is the same reasoning the microphone itself gets one layer down.
  */
-export function VoiceControlPanel({ runtime, screen, onDispatch, channel, directories, newAgent }: VoiceControlPanelProps) {
+export function VoiceControlPanel({ runtime, screen, onDispatch, channel, directories, newAgent, newAgentInstance }: VoiceControlPanelProps) {
   /* Held in a ref so the resolve and the overlay read the host's latest getter
      without either callback being rebuilt when the host re-renders. */
   const directoriesRef = useRef(directories);
   directoriesRef.current = directories;
   const newAgentRef = useRef(newAgent);
   newAgentRef.current = newAgent;
+  const newAgentInstanceRef = useRef(newAgentInstance);
+  newAgentInstanceRef.current = newAgentInstance;
   const { declareVoiceScreen, resolveVoice, voiceCommands, voiceStart, voiceStop, voiceStatus, voiceCancel, sendTerminalInput } = runtime;
 
   const [on, setOnState] = useState(false);
@@ -882,6 +893,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
     /* PRD #1223 — and the directory browser as it stands, declared with it. */
     const declaredDirectories = directoriesRef.current?.();
     const declaredNewAgent = newAgentRef.current?.();
+    const declaredInstance = newAgentInstanceRef.current?.();
     setPhase("resolving");
     try {
       declareVoiceScreen?.(declared, declaredDirectories, declaredNewAgent);
@@ -895,7 +907,15 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
       }
       /* The same question for the declaration the grounding was computed
          against: the answer is only an answer about THAT dialog state. */
-      if (!sameNewAgentDeclaration(declaredNewAgent, newAgentRef.current?.())) {
+      if (
+        !sameNewAgentDeclaration(declaredNewAgent, newAgentRef.current?.())
+        // A different MOUNT is a different dialog even when both declarations
+        // look alike: closing and reopening replaces the draft, and a `close`
+        // grounded against the first would discard the second's (Qodo on
+        // PR #1235). The rows that resolve against form CONTENTS re-check
+        // `{deckId, path}` at dispatch; `close` has nothing to re-check.
+        || declaredInstance !== newAgentInstanceRef.current?.()
+      ) {
         setProblem(DIALOG_MOVED_ON);
         return;
       }

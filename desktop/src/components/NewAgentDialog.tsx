@@ -256,8 +256,23 @@ export function NewAgentDialog({ runtime, initialDeckId, onClose, onAppeared, on
    * so far — the marker that decides whether the deck is asked for
    * orchestrations at all. A directory reached another way (by going up) has
    * no entry here and is asked, and the deck's `not_project` answer covers it.
+   *
+   * Keyed by path alone, so it is DECK-SCOPED data and `clearDeckDependents`
+   * drops it: two decks can expose the same path with different project status
+   * (a remote deck's `/work` and a local one's), and keeping the previous
+   * deck's `false` would suppress the orchestrations query on the new deck and
+   * silently remove mode choices the user does have (Qodo on PR #1235). The
+   * cost of dropping it is one extra query on a path revisited after a deck
+   * switch; the cost of keeping it is a wrong answer.
    */
   const projectMarks = useRef(new Map<string, boolean>());
+  /**
+   * This mount of the dialog, for the voice surface to tell a pending answer's
+   * dialog from the one on screen now (see `NewAgentVoice.instance`). A ref,
+   * so reopening the dialog — a fresh mount — mints a fresh one, and a
+   * re-render never does.
+   */
+  const instanceId = useRef(`new-agent-${Math.random().toString(36).slice(2)}-${Date.now()}`);
   const [phase, setPhase] = useState<"idle" | "starting" | "waiting">("idle");
   const [awaiting, setAwaiting] = useState<{ deckId: string; agentId: string; deckName: string; agentName: string }>();
 
@@ -269,8 +284,8 @@ export function NewAgentDialog({ runtime, initialDeckId, onClose, onAppeared, on
 
   /**
    * Everything that hangs off the chosen deck, dropped: the directory panel,
-   * the chosen directory, the deck's options and orchestrations, and every
-   * reply still in flight for them. `keepEdits` keeps a Name or Command the
+   * the chosen directory, the deck's options and orchestrations, the project
+   * markers its listings produced, and every reply still in flight for them. `keepEdits` keeps a Name or Command the
    * user typed — a voluntary change of deck — and otherwise the form is
    * cleared as well.
    */
@@ -278,6 +293,7 @@ export function NewAgentDialog({ runtime, initialDeckId, onClose, onAppeared, on
     listingSeq.current += 1;
     optionsSeq.current += 1;
     orchestrationsSeq.current += 1;
+    projectMarks.current.clear();
     setListing(undefined);
     setListingState("idle");
     setListingError(undefined);
@@ -709,6 +725,7 @@ export function NewAgentDialog({ runtime, initialDeckId, onClose, onAppeared, on
       chooseNewAgentType: voiceChooseAgentType,
       nameNewAgent: voiceNameNewAgent,
       startNewAgent: voiceStart,
+      instance: instanceId.current,
     };
     return () => { voice.current = undefined; };
   });

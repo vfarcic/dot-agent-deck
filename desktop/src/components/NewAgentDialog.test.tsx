@@ -1178,6 +1178,46 @@ describe("New agent dialog — orchestrations (PRD #1223 M6)", () => {
   });
 
   /**
+   * Scenario: two decks expose the SAME path, and only the second holds a
+   * project there. Browse to it on the first deck — no orchestrations asked,
+   * the listing marked it as no project — then switch to a deck whose HOME is
+   * that path, so nothing re-lists it. The second deck is still asked, and its
+   * modes appear. The markers come from a deck's own listings, so carrying
+   * them across a deck switch hid modes the user does have (Qodo on PR #1235).
+   */
+  it("re-asks for orchestrations after a deck switch, rather than trusting the old deck's marker", async () => {
+    const SHARED = "/home/dev/shared";
+    const listing = (path: string, entries: { path: string; displayName: string; isProject: boolean }[], parent?: string) =>
+      ({ kind: "listing", path, displayPath: path, parent, entries, truncated: false }) as DeckDirectoryListing;
+    const runtime = fakeRuntime({
+      fleet: [deck(LOCAL, { deckKind: "local" }), deck(REMOTE)],
+      // The REMOTE deck's home IS the shared path, so choosing it there never
+      // re-lists its parent and never re-marks it.
+      listDirectories: vi.fn(async (deckId: string, path?: string): Promise<DeckDirectoryListing> =>
+        path === SHARED || (path === undefined && deckId === REMOTE)
+          ? listing(SHARED, [], "/home/dev")
+          : listing("/home/dev", [{ path: SHARED, displayName: "shared", isProject: false }])),
+      newAgentOrchestrations: orchestrationsOf(),
+    });
+    renderDialog(runtime, { initialDeckId: LOCAL });
+
+    await currentPath("/home/dev");
+    fireEvent.keyDown(directoryList(), { key: "Enter" });
+    await currentPath(SHARED);
+    fireEvent.keyDown(directoryList(), { key: " " });
+    await waitFor(() => expect(screen.getByTestId("new-agent-name")).toBeEnabled());
+    expect(runtime.newAgentOrchestrations).not.toHaveBeenCalled();
+
+    fireEvent.click(deckList().querySelector(`[data-deck-id="${REMOTE}"]`)!);
+    await currentPath(SHARED);
+    fireEvent.keyDown(directoryList(), { key: " " });
+    await waitFor(() => expect(screen.getByTestId("new-agent-name")).toBeEnabled());
+
+    expect(runtime.newAgentOrchestrations).toHaveBeenCalledWith(REMOTE, SHARED);
+    expect(await chip()).toHaveTextContent("Orch: loop");
+  });
+
+  /**
    * Scenario: the chosen deck cannot launch an orchestration from this flow —
    * it lacks the project verbs or cannot start a role with its configured
    * command. No chip is offered and the deck's own reason is shown instead.

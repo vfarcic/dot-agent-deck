@@ -2252,6 +2252,40 @@ describe("a pending answer and a New agent dialog that changed under it (PRD #12
   });
 
   /**
+   * Scenario: with the dialog open and its form live, say "done". While it is
+   * being worked out, close the dialog and open it again — a NEW dialog, with
+   * a new draft. The `close` that arrives was grounded against the first one,
+   * so it runs nothing: the replacement and its draft stay. Both declarations
+   * name a live form, so nothing but the dialog's identity separates them
+   * (Qodo on PR #1235).
+   */
+  it("refuses a close answer grounded against a dialog the user has since reopened", async () => {
+    const voice = microphone([]);
+    const { deck, release } = heldDeck(voice, ANSWERS.close);
+    render(<DeckShell runtime={deck} initialView={{ kind: "overview" }} />);
+    await turnVoiceOn();
+    await openDialog();
+    await chooseBilling();
+
+    voice.deliver("done");
+    await completeUtterance();
+
+    await act(async () => { fireEvent.keyDown(screen.getByTestId("new-agent-dialog"), { key: "Escape" }); });
+    expect(screen.queryByTestId("new-agent-dialog")).toBeNull();
+    await openDialog();
+    await chooseBilling();
+    fireEvent.change(screen.getByTestId("new-agent-name"), { target: { value: "draft" } });
+
+    release();
+    await flush();
+    await flush();
+
+    expect(screen.getByTestId("new-agent-dialog")).toBeInTheDocument();
+    expect(screen.getByTestId("new-agent-name")).toHaveValue("draft");
+    expect(screen.getByTestId("voice-report")).toHaveTextContent(DIALOG_MOVED_ON);
+  });
+
+  /**
    * Scenario: the control — with the dialog unchanged across the round trip,
    * the same held `close` does close it. The refusal above is about the
    * declaration moving, not about a slow answer.
