@@ -74,7 +74,7 @@ Re-run the query after resolving and confirm it returns nothing. "I resolved the
 
 Resolve only what you actually addressed. Leave a thread open when you are waiting on the commenter, or when they asked something they still need answered there — a thread closed over unaddressed feedback is worse than one left open.
 
-Push fixes **before** requesting review (step 2). Do not wait for a re-review: `greptile.json` sets `triggerOnUpdates: false`, so the reviewer runs once at open and never again.
+Push fixes **before** requesting review (step 2). Greptile does not re-review — `greptile.json` sets `triggerOnUpdates: false` — but Qodo, evaluated beside it, re-reviews on **every push** (`.pr_agent.toml`). So after your last push, wait for Qodo too, and repeat this step for anything new it raised; a finding raised on your final push and left unanswered is still an unresolved thread blocking the merge. **Do not wait the way step 3 waits**: that wait keys on a check-run, and **Qodo creates none** — measured 2026-09-24 on #1235, #1257 and #1271, where the head commit's check-runs carry `Greptile Review` and nothing from Qodo, so "until its check appears" never returns. Wait on its summary comment instead: it edits one comment in place rather than posting a new one, and the body **names the head SHA it reviewed**, so the review is done for this push when that body cites your head. Bound it the same way regardless, and proceed reporting that no re-review was obtained. Its **medium and above** findings arrive at the same endpoint as Greptile's and are answered and resolved the same way; its **informational** tier stays in that summary comment (`inline_comments_severity_threshold = 2`), so read it as well as the inline endpoint.
 
 ## 5. Hand off
 

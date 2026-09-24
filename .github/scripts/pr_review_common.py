@@ -54,6 +54,7 @@ DENY_PATHS = (
     ".github/",
     "scripts/apply-branch-protection.sh",
     "greptile.json",
+    ".pr_agent.toml",
     "MAINTAINERS.md",
     "CLAUDE.md",
     "src/daemon_protocol.rs",
@@ -79,6 +80,7 @@ DENY_PRECEDENCE = (
     "scripts/apply-branch-protection.sh",
     "MAINTAINERS.md",
     "greptile.json",
+    ".pr_agent.toml",
     ".github/",
 )
 
