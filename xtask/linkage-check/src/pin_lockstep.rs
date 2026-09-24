@@ -1262,3 +1262,41 @@ fn a_multiline_flow_with_mapping_is_read() {
         "a multi-line flow mapping carries the input, so the step is pinned:\n{text}"
     );
 }
+
+/// Raised by Qodo on #1284. A double-quoted scalar may span lines, so the
+/// quote state has to survive the line break: here the `}` on the scalar's
+/// second line is inside the quotes and must not close the mapping, which
+/// would hide the drifted `version:` after it.
+#[test]
+fn a_quoted_scalar_spanning_lines_does_not_close_the_flow_mapping() {
+    if !bash_present() {
+        eprintln!("SKIP: needs `bash` on PATH");
+        return;
+    }
+    let body = "jobs:\n  desktop-web:\n    steps:\n      \
+                - uses: pnpm/action-setup@v6\n        \
+                with: {\n          \
+                package_json_file: \"first half\n            \
+                second } half\",\n          \
+                version: 11.21.0 }\n      \
+                - uses: some/other-action@v1\n        \
+                with:\n          \
+                version: 11.22.0\n";
+    let out = Fixture::new(
+        &good_packages(),
+        &[
+            ("ci.yml", workflow("1.97.1", "0.9.143")),
+            ("desktop.yml", body.to_string()),
+        ],
+    )
+    .run();
+    let text = combined(&out);
+    assert!(
+        !out.status.success() && text.contains("desktop.yml:8 11.21.0"),
+        "the pin after a multi-line quoted scalar must be read:\n{text}"
+    );
+    assert!(
+        !text.contains("desktop.yml:11"),
+        "the next action's `version:` must never be read as this step's pin:\n{text}"
+    );
+}

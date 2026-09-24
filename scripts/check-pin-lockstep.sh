@@ -298,10 +298,11 @@ scan_workflow_pnpm() {
       # is not read as a `version:` input. Indentation is unaffected.
       # Net `{` minus `}` in `s`, counting only braces OUTSIDE quoted scalars,
       # so `package_json_file: "${{ matrix.file }}"` inside a multi-line flow
-      # mapping does not look like the mapping closing.
-      function brace_delta(s,   i, c, d, instr) {
+      # mapping does not look like the mapping closing. The quote state is the
+      # global `instr`, reset when a flow mapping opens and carried across its
+      # lines, because a quoted scalar may itself span lines.
+      function brace_delta(s,   i, c, d) {
         d = 0
-        instr = ""
         for (i = 1; i <= length(s); i++) {
           c = substr(s, i, 1)
           if (instr != "") {
@@ -346,7 +347,10 @@ scan_workflow_pnpm() {
           with_at = -1
           in_flow = 0
           for (j = start; j <= NR; j++) {
-            if (j > start && !in_flow && !is_comment(line[j]) && indent(line[j]) <= dash_at) break
+            # Applies inside a flow mapping too: YAML indents its continuation
+            # lines deeper than the step, so an unbalanced quote or brace can
+            # never carry the read into the next step.
+            if (j > start && !is_comment(line[j]) && indent(line[j]) <= dash_at) break
             if (is_comment(line[j])) continue
             if (with_at >= 0 && indent(line[j]) <= with_at) with_at = -1
             cand = ""
@@ -362,6 +366,7 @@ scan_workflow_pnpm() {
               }
               cand = after
               if (after ~ /^[[:space:]]*\{/) {
+                instr = ""
                 flow_depth = brace_delta(after)
                 if (flow_depth > 0) in_flow = 1
               }
