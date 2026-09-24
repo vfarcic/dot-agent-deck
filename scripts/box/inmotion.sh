@@ -281,6 +281,17 @@ wait_for_ssh() {
   die "SSH did not come up on $ip within 5 minutes (is your IP in --allow-cidr?)"
 }
 
+# `dot-agent-deck remote add`/`connect` use the operator's own known_hosts, not
+# this script's per-box file. Floating IPs are reused across boxes, so drop any
+# stale entry for the address before adding the current box's key.
+trust_host_key() {
+  local ip="$1"
+  [ -s "$KNOWN_HOSTS" ] || return 0
+  touch "$HOME/.ssh/known_hosts"
+  ssh-keygen -R "$ip" -f "$HOME/.ssh/known_hosts" >/dev/null 2>&1 || true
+  cat "$KNOWN_HOSTS" >> "$HOME/.ssh/known_hosts"
+}
+
 do_up() {
   require_cloud
   ensure_box_key
@@ -321,20 +332,18 @@ do_up() {
   log "public IP: $ip"
 
   wait_for_ssh "$ip"
+  trust_host_key "$ip"
   log "waiting for cloud-init to finish"
   ssh "${SSH_OPTS[@]}" "$BOX_USER@$ip" 'sudo cloud-init status --wait >/dev/null; cloud-init status --long | sed -n "1,3p"; findmnt -no SOURCE,SIZE /home'
 
   if [ "$BOOTSTRAP" -eq 1 ]; then
-    if [ -f "$SCRIPT_DIR/bootstrap.sh" ]; then
-      log "running bootstrap.sh on the box"
-      local remote_cmd="bash -s --"
-      # Expanded here on purpose, each argument quoted for the remote shell.
-      [ ${#BOOTSTRAP_ARGS[@]} -gt 0 ] && remote_cmd+="$(printf ' %q' "${BOOTSTRAP_ARGS[@]}")"
-      # shellcheck disable=SC2029
-      ssh "${SSH_OPTS[@]}" "$BOX_USER@$ip" "$remote_cmd" < "$SCRIPT_DIR/bootstrap.sh"
-    else
-      log "no bootstrap.sh next to this script yet; skipping bootstrap"
-    fi
+    log "running bootstrap.sh on the box"
+    # Ship the whole directory: bootstrap.sh reads the files beside it.
+    local remote_cmd="rm -rf ~/.dad-box && mkdir -p ~/.dad-box && tar -xzf - -C ~/.dad-box && bash ~/.dad-box/bootstrap.sh"
+    # Expanded here on purpose, each argument quoted for the remote shell.
+    [ ${#BOOTSTRAP_ARGS[@]} -gt 0 ] && remote_cmd+="$(printf ' %q' "${BOOTSTRAP_ARGS[@]}")"
+    # shellcheck disable=SC2029
+    tar -czf - -C "$SCRIPT_DIR" --exclude=inmotion.sh . | ssh "${SSH_OPTS[@]}" "$BOX_USER@$ip" "$remote_cmd"
   fi
 
   cat <<EOF
@@ -342,6 +351,7 @@ do_up() {
 Box '$NAME' is up.
   ssh:     $0 ssh --name $NAME
   deck:    dot-agent-deck remote add $NAME $BOX_USER@$ip --key $BOX_KEY
+           dot-agent-deck connect $NAME
   pause:   $0 down --name $NAME      (keeps /home)
   remove:  $0 destroy --name $NAME   (deletes everything)
 EOF
@@ -368,6 +378,7 @@ do_down() {
   if [ -n "$ip" ]; then
     log "releasing public IP $ip"
     os floating ip delete "$ip"
+    ssh-keygen -R "$ip" -f "$HOME/.ssh/known_hosts" >/dev/null 2>&1 || true
   fi
   log "down: $VOLUME is kept; \`up\` reattaches it"
 }

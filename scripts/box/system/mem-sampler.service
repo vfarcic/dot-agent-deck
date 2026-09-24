@@ -1,0 +1,9 @@
+[Unit]
+Description=Sample top memory consumers into the journal
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/mem-sampler.sh
+SyslogIdentifier=mem-sampler
+Nice=19
+IOSchedulingClass=idle

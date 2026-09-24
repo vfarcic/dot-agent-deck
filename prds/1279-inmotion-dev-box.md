@@ -1,6 +1,6 @@
 # PRD #1279: On-demand InMotion Cloud dev box
 
-**Status**: In progress — M1 and M2 done.
+**Status**: In progress — M1–M4 done; M5 awaits the maintainer's agent logins.
 **Priority**: Medium
 **Created**: 2026-09-24
 **Issue**: [#1279](https://github.com/vfarcic/dot-agent-deck/issues/1279)
@@ -39,7 +39,9 @@ All made with the maintainer on 2026-09-24.
 | 9 | **Data volume: `NVME` type, 300 GB** by default, overridable | Cargo builds and nextest are I/O-heavy; the dev box runs on an NVMe SSD. |
 | 10 | **Upload Ubuntu's official 26.04 server cloud image** (`resolute-server-cloudimg-amd64.img`) once, reuse it after | InMotion offers only 20.04/22.04/24.04. |
 | 11 | **Not installed**: `aether`, `dot-ai` | Removed from the dev box on 2026-09-24 as well; the project-local `dot-ai` skill went in #1277. |
-| 12 | **Installed**: the dev box's own timers (`heartbeat`, `mem-sampler`, `boot-canary`), auditd, `sem`, `devin` | Confirmed wanted on the cloud boxes. `tailscale-watchdog` and tailscale itself dropped with decision 6. |
+| 12 | **Installed**: `mem-sampler`, auditd, `sem`, `devin`. **Dropped**: `boot-canary`, `heartbeat` (revised the same day) | `boot-canary` guarded this machine's wireless card through one kernel upgrade and had already disarmed itself; `heartbeat` judged health by Tailscale and treats silence as the alarm, so every intentional `down` would page. "We can always add more later" — the priority is that the deck works on the box. `tailscale-watchdog` and tailscale went with decision 6. |
+| 15 | **Agent runtimes from apt `nodejs`/`npm`; codex and pi as global npm packages under `/usr/local`** — as on the dev box | `/usr/local/bin` is on every PATH, including the non-interactive ssh session the deck daemon starts from. Node is therefore **not** in `devbox global`: a devbox `node` would shadow apt's in interactive shells and point `npm -g` at the read-only nix store. |
+| 16 | **Agent config seeding is deferred** | Not needed for the deck to work; the agents write their own config on first login. |
 | 14 | **The script reaches the box with its own key**, `~/.ssh/dad-box_ed25519`, created on first use, **plus** every key in the operator machine's `~/.ssh/authorized_keys` | The dev box has no outbound SSH key of its own — `~/.ssh` holds only `authorized_keys` (`gh:vfarcic` and `dot-agent-deck`). Copying those means whoever can reach the dev box can reach the new ones. |
 | 13 | **Work happens in a worktree**, `../dot-agent-deck-1279` | Another agent may be working in the main checkout. |
 
@@ -111,9 +113,9 @@ Ordered so each layer can assume the one before it:
 1. **apt**: docker (Docker's own repo, plus the `docker` group), auditd, build-essential (the project's cargo links with the system C compiler — `devbox.json` carries none), and whatever the cloud image lacks of openssh and chrony.
 2. **System settings**: `vm.swappiness=10`, `vm.dirty_ratio=10`, `vm.dirty_background_ratio=5`; an 8 GB swap file; `nofile` 524288; linger for the operator.
 3. **Timers**: the imported `heartbeat`, `mem-sampler` and `boot-canary` units, plus `scripts/install-reaper-timer.sh` for the orphan reaper.
-4. **nix + devbox**, then `devbox global install` from the checked-in definition, and `devbox global shellenv` added to both `~/.profile` and `~/.bashrc`. `mosh-server` gets a symlink into `/usr/local/bin`, because a non-interactive SSH session never reads the shellenv.
-5. **Agents**: claude, opencode, codex, pi and devin through their own installers; `dot-agent-deck` itself; then `dot-agent-deck hooks install` rather than copying hook files.
-6. **Agent config**: optionally seeded once from the operator's machine (`~/.claude/settings.json` and plugins, codex `config.toml`, `opencode.jsonc`, pi settings) and never managed afterwards — the agents write to those files themselves.
+4. **nix + devbox**, then `devbox global install` from `scripts/box/devbox-global.json`. **PATH** is set three ways, because the deck daemon starts from a non-interactive ssh session and every agent inherits its PATH: a marked block at the **top** of `~/.bashrc` (Ubuntu's `.bashrc` returns early for non-interactive shells, so anything below that guard never runs), `devbox global shellenv` at the bottom for interactive shells, and `~/.config/environment.d/999-dad-box.conf` plus `systemctl --user set-environment` for systemd user units. The `999-` prefix matters: Ubuntu's `/usr/lib/environment.d/99-environment.conf` resets PATH from `/etc/environment`, and a `10-` file was silently overridden.
+5. **Agents**: claude, opencode and devin through their own installers, codex and pi through `sudo npm -g` (decision 15), `sem`; `dot-agent-deck` from the latest release; then `dot-agent-deck hooks install --agent X` for `claude-code`, `opencode`, `codex` and `devin` — the command defaults to Claude Code alone, and so does `remote add`. Pi needs no step: the deck materializes its extension when it spawns a Pi pane.
+6. **Agent config**: deferred (decision 16).
 7. **Project** (with `--repo`): clone it onto the data volume and run `devbox install`.
 8. **Auth checklist**: for each agent, detect whether it is already logged in and list only what is missing.
 
@@ -125,12 +127,13 @@ Taken read-only on the dev box on 2026-09-24. Classification:
 
 | Channel | Items |
 | --- | --- |
-| apt | docker-ce + buildx/compose plugins, containerd, auditd, build-essential |
-| `devbox global` | git, gh, jq, curl, rsync, unzip, mosh, xvfb, go, uv, rustup + cargo-audit/cross/rust-analyzer, kcl, node, pnpm |
-| Native installer | claude (`~/.local/bin`), opencode (`~/.opencode/bin`), codex, pi, devin, sem, dot-agent-deck |
-| Imported from the box | `heartbeat`, `mem-sampler`, `boot-canary` scripts and units |
+| apt | docker-ce + buildx/compose plugins, containerd, auditd, build-essential, nodejs, npm |
+| `devbox global` | git, gh, jq, curl, rsync, unzip, mosh, xvfb-run, go, uv, rustup + cargo-audit/cargo-cross/rust-analyzer, kcl |
+| Native installer | claude (`~/.local/bin`), opencode (`~/.opencode/bin`), devin, sem, dot-agent-deck; codex and pi via `npm -g` |
+| Imported from the box | `mem-sampler` script and units (`scripts/box/system/`) |
 | System settings | sysctl values, swap, limits, linger, `docker` group |
 | Skipped — no tailnet (decision 6) | tailscale, `tailscale-watchdog` |
+| Skipped — decision 12 | `boot-canary`, `heartbeat`; also `dad-debug`/`dad-watchdog` in `~/.local/bin`, incident-debugging helpers |
 | Skipped — this machine's hardware | grub/EFI, nvme-cli, wpasupplicant, ModemManager, gpu-manager, vmtoolsd |
 | Skipped — duplicates | apt `nodejs`/`npm` and `~/.local/lib/nodejs` (devbox provides node), apt `gh`, five rustup toolchains |
 | Skipped — project-owned | Tauri/GTK/WebKit `lib*` (devbox's `tauri-deps`, #780); Playwright's fonts and GStreamer (`ci.yml:359`) |
@@ -156,8 +159,8 @@ No TUI surface changes, so rule 4 does not apply. Validation is:
 
 - [x] **M1 — Cloud access wired.** `openstackclient` pinned in `devbox.json`; the `OS_*` entries in `.env.vals.yaml`; `openstack token issue` works from a devbox shell with `USE_VALS=1`.
 - [x] **M2 — `inmotion.sh` lifecycle.** `up`/`down`/`destroy`/`ssh`/`ip`/`status` working and idempotent: image upload, network and router, SSH/mosh-only security group, NVME volume mounted at `/home`, floating IP.
-- [ ] **M3 — `bootstrap.sh` system layer.** apt, system settings, docker, linger, imported timers — re-runnable.
-- [ ] **M4 — `bootstrap.sh` user layer.** nix + devbox, `devbox global`, agents, `dot-agent-deck` + hooks, config seeding, `--repo`, auth checklist.
+- [x] **M3 — `bootstrap.sh` system layer.** apt, system settings, docker, linger, imported timers — re-runnable.
+- [x] **M4 — `bootstrap.sh` user layer.** nix + devbox, `devbox global`, agents, `dot-agent-deck` + hooks, `--repo`, auth checklist. (Config seeding deferred — decision 16.)
 - [ ] **M5 — End-to-end validation on InMotion.** The full run in [Testing](#testing), recorded in the Work Log with timings.
 - [ ] **M6 — UpCloud example refactored** onto `bootstrap.sh`, its own install steps deleted.
 - [ ] **M7 — Docs.** `docs/develop/` page covering prerequisites, commands, the auth checklist, costs and teardown; linked from `CONTRIBUTING.md`.
@@ -202,3 +205,16 @@ The network inspection that followed settled open question 1: both external netw
 - **`destroy` leaves nothing**: 0 servers, volumes, subnets, routers, keypairs, floating IPs and private images; the only networks and security group left are the pre-existing `External`, `ext` and `default`.
 
 **Found and fixed: cloud-init's `fs_setup` wiped the data volume.** The first `down`/`up` lost a marker file in `/home`. `cloud-init.log` showed `fs_setup` with `partition: none` and `overwrite: false` running `mkfs.ext4 -L dad-home -F /dev/vdb` over the existing filesystem. Replaced by the guarded `bootcmd` described under [The data volume](#the-data-volume); re-tested both ways — an existing filesystem survived `down`/`up` (same creation time, mount count 2, no `mkfs` in the log) and a fresh empty volume was formatted and mounted. `down` also gained a graceful stop before the delete, since a bare `server delete` powers the guest off.
+
+### 2026-09-24 — M3 and M4: `bootstrap.sh`, and the deck on the box
+
+`scripts/box/bootstrap.sh`, `scripts/box/devbox-global.json` and `scripts/box/system/mem-sampler.*`; `inmotion.sh up` now tars `scripts/box/` to `~/.dad-box` on the box and runs it there. Validated on the `dad-test` box (`m7i.large`, 50 GB) with `--repo https://github.com/vfarcic/dot-agent-deck`:
+
+- **First full bootstrap** installed every layer, cloned this repo, ran its `devbox install` (the full toolchain, Tauri deps and gcloud included) and installed its orphan-reaper timer. **Re-run: 48 s, every layer skipped.**
+- Versions on the box: dot-agent-deck 0.41.2, claude 2.1.281, opencode 1.18.32, codex 0.156.1, pi 0.87.1, devin 3000.11.3, sem 0.36.0, docker 29.8.1, node 22.22.1, devbox 0.18.3, git 2.55.0, gh 2.98.0.
+- **A non-interactive ssh shell — what the deck daemon inherits — resolves every agent**, dot-agent-deck, git, node, docker, devbox and mosh-server. The systemd user manager has the same PATH now and at its next start.
+- **The deck works against the box.** From the dev box, with a scratch registry (`DOT_AGENT_DECK_REMOTES`): `remote add dad-test …` installed the client's 0.41.0 and hooks; `remote doctor` passed `HostReachable`, `RemoteBinary` and `ProtocolCompatible`. Its one `FAIL` (`RemoteForward`) and the `WARN` concern the optional reverse-tunnel recipe; its `UNKNOWN`s need root to read `sshd -T`, which was checked directly in M2.
+
+Found and fixed on the way: the Devin installer ends by running `devin setup`, an interactive login that fails without a terminal and aborted the first run — bootstrap now feeds it no input and judges by whether the binary landed; apt's recommends pulled in alacritty and Mesa (`--no-install-recommends`); `hooks install` covers Claude Code alone by default (now one call per agent); the `environment.d` override described above; and `remote add` rejected the box's host key because the deck reads `~/.ssh/known_hosts`, not the script's per-box file — `up` now copies the box's key there after removing any stale entry for the reused IP, and `down` removes it.
+
+**Not yet done — M5:** an agent logged in and working in a deck pane on the box. Logging agents in is the operator's step (decision 5), so this is the maintainer's manual check.
