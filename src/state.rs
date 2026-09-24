@@ -8060,6 +8060,12 @@ impl AppState {
                 orchestration_cwd.as_deref(),
                 cwd.as_deref(),
             );
+            // Issue #590 review (Qodo, #1285): tell the in-flight guard which idle
+            // record this dispatch owns, so a `pane restart` that lands while it
+            // is queued keeps that record and cancels only the replaced agent's.
+            if let Some(in_flight) = commission_in_flight.as_ref() {
+                in_flight.bind_idle_record(delegation_seq);
+            }
 
             // PRD #249 M3: resolved HERE, next to the idle watch's own
             // resolution and for the same reasons — see [`SilenceWatch`]. The

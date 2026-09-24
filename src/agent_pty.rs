@@ -3620,7 +3620,14 @@ struct DelegationTracker {
     /// Separate from `commissions` because a pane close drains that map while a
     /// dispatch task may still be queued, and the task's guard must still find
     /// something to give back.
-    commission_dispatches_in_flight: HashMap<String, u32>,
+    ///
+    /// Keyed by worker pane, then by the guard's own id; the value is which
+    /// idle-worker record that dispatch armed — `None` until the caller has said
+    /// ([`CommissionDispatchInFlight::bind_idle_record`]), `Some(None)` for a
+    /// dispatch that armed none, `Some(Some(seq))` for one that armed `seq`. What
+    /// lets [`AgentPtyRegistry::cancel_watches_of_replaced_agent`] keep exactly
+    /// the idle record a queued, replacement-bound dispatch owns (Qodo, #1285).
+    commission_dispatches_in_flight: HashMap<String, HashMap<u64, Option<Option<u64>>>>,
     /// Panes between [`AgentPtyRegistry::begin_pane_close`] and
     /// [`AgentPtyRegistry::finish_pane_close`]. Arming is refused for a pane in
     /// this set (as worker *or* as orchestrator), which is what closes the
@@ -3706,13 +3713,12 @@ struct DelegationCommission {
     /// Arm instant of each outstanding commission, oldest first — one per
     /// commission, so every one expires on its own age.
     ///
-    /// Unbounded by count, bounded by time: every ledger operation on this entry
-    /// first drops the instants older than [`DELEGATION_COMMISSION_TTL`], so the
-    /// deque holds at most the delegations issued to this one worker within the
-    /// last seven days that nothing has answered — and since issue #580 each one
-    /// past the first needed an explicit `--supersede`. An earlier revision
-    /// capped it and folded the oldest instants into a count, which let a folded
-    /// commission outlive its own deadline (Greptile, #1285).
+    /// At most [`MAX_OUTSTANDING_COMMISSIONS`] long, and every ledger operation on
+    /// this entry first drops the instants older than
+    /// [`DELEGATION_COMMISSION_TTL`]. An earlier revision folded the oldest
+    /// instants past a cap into a bare count, which let a folded commission
+    /// outlive its own deadline (Greptile, #1285); the cap now saturates the
+    /// count instead — see [`Self::push`].
     armed_at: VecDeque<Instant>,
     /// Pane of the orchestrator that issued them, so closing the ORCHESTRATOR
     /// clears the ledger as well as the two watches — a commission is owed to a
@@ -3744,6 +3750,13 @@ struct DelegationCommission {
 /// delegation may plausibly run — borrowed as a magnitude, not read from the knob.
 pub const DELEGATION_COMMISSION_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
+/// The most commissions one worker's ledger entry counts. Reaching it takes
+/// that many delegations to one worker in seven days with no `work-done`, each
+/// past the first an explicit `--supersede`; beyond it the count saturates (see
+/// [`DelegationCommission::push`]) so a runaway caller cannot grow the daemon's
+/// memory without bound.
+const MAX_OUTSTANDING_COMMISSIONS: usize = 1024;
+
 impl DelegationCommission {
     fn new(orchestrator_pane_id: &str) -> Self {
         Self {
@@ -3759,7 +3772,16 @@ impl DelegationCommission {
         u32::try_from(self.armed_at.len()).unwrap_or(u32::MAX)
     }
 
+    /// Record one more commission. At [`MAX_OUTSTANDING_COMMISSIONS`] the count
+    /// saturates instead of growing (Qodo, #1285): the newest instant is
+    /// replaced by `now` rather than a new one appended. Every instant kept is
+    /// still the arm time of a real delegation, so none expires before its own
+    /// deadline — what saturates is the count, exactly as the `u32` this deque
+    /// replaced did at `u32::MAX`.
     fn push(&mut self, now: Instant) {
+        if self.armed_at.len() >= MAX_OUTSTANDING_COMMISSIONS {
+            self.armed_at.pop_back();
+        }
         self.armed_at.push_back(now);
     }
 
@@ -3835,6 +3857,26 @@ pub enum CommissionArm {
 pub struct CommissionDispatchInFlight {
     registry: Arc<AgentPtyRegistry>,
     worker_pane_id: String,
+    /// This guard's key in `DelegationTracker::commission_dispatches_in_flight`.
+    id: u64,
+}
+
+impl CommissionDispatchInFlight {
+    /// Record which idle-worker record this dispatch armed — its `seq`, or
+    /// `None` when the idle detector armed nothing for it. Until this is called
+    /// the dispatch's idle record is unknown, and
+    /// [`AgentPtyRegistry::cancel_watches_of_replaced_agent`] keeps the pane's
+    /// idle record rather than risk cancelling this dispatch's.
+    pub fn bind_idle_record(&self, seq: Option<u64>) {
+        let mut tracker = self.registry.delegations.lock().unwrap();
+        if let Some(slot) = tracker
+            .commission_dispatches_in_flight
+            .get_mut(&self.worker_pane_id)
+            .and_then(|guards| guards.get_mut(&self.id))
+        {
+            *slot = Some(seq);
+        }
+    }
 }
 
 // Hand-written because `AgentPtyRegistry` is not `Debug`; the pane is the only
@@ -3850,12 +3892,12 @@ impl std::fmt::Debug for CommissionDispatchInFlight {
 impl Drop for CommissionDispatchInFlight {
     fn drop(&mut self) {
         let mut tracker = self.registry.delegations.lock().unwrap();
-        if let Some(count) = tracker
+        if let Some(guards) = tracker
             .commission_dispatches_in_flight
             .get_mut(&self.worker_pane_id)
         {
-            *count = count.saturating_sub(1);
-            if *count == 0 {
+            guards.remove(&self.id);
+            if guards.is_empty() {
                 tracker
                     .commission_dispatches_in_flight
                     .remove(&self.worker_pane_id);
@@ -4894,17 +4936,19 @@ impl AgentPtyRegistry {
         // pointing its close sweep at the dead pane.
         entry.orchestrator_pane_id = orchestrator_pane_id.to_string();
         entry.orchestrator_agent_id = orchestrator_agent_id.map(str::to_string);
-        let in_flight = tracker
+        let id = self.delegation_seq.fetch_add(1, Ordering::SeqCst);
+        tracker
             .commission_dispatches_in_flight
             .entry(worker_pane_id.to_string())
-            .or_insert(0);
-        *in_flight = in_flight.saturating_add(1);
+            .or_default()
+            .insert(id, None);
         CommissionArm::Armed {
             superseded,
             superseded_oldest_age,
             in_flight: CommissionDispatchInFlight {
                 registry: Arc::clone(self),
                 worker_pane_id: worker_pane_id.to_string(),
+                id,
             },
         }
     }
@@ -5023,24 +5067,41 @@ impl AgentPtyRegistry {
     /// Worker-side only: records naming this pane as an ORCHESTRATOR are left
     /// alone, since `pane restart` refuses the orchestrator's own pane.
     ///
-    /// Does nothing while any dispatch to the pane is still in flight
-    /// ([`CommissionDispatchInFlight`]). Each watch map holds only the NEWEST
-    /// record per worker, and a delegate queued behind the lock armed its
-    /// records before the restart ran, so the records present may be the ones
-    /// its replacement-bound pointer will answer — and cancelling those would
-    /// leave that delegation unwatched. Keeping them costs, at worst, one
-    /// discardable report; dropping them could cost the report that matters.
+    /// The two watches are decided differently, because they are armed at
+    /// different moments (Qodo, #1285):
+    ///
+    /// - **The silent-worker watch is always cancelled.** Both of its arm sites
+    ///   are inside `dispatch_one_owned` with the pane's dispatch lock held, and
+    ///   the caller holds that lock now — so a watch present here was armed by a
+    ///   dispatch that has already finished, for the agent being replaced. A
+    ///   dispatch still queued arms its own after it takes the lock.
+    /// - **The idle-worker record is cancelled unless a queued dispatch owns it.**
+    ///   It is armed in `handle_delegate`'s synchronous fan-out, before the lock,
+    ///   and the map holds only the newest record per worker, so a queued,
+    ///   replacement-bound dispatch may own the record present. It is kept when
+    ///   its `seq` is one a queued dispatch bound, or when some queued dispatch
+    ///   has not yet said which record it armed; otherwise it is the replaced
+    ///   agent's, including when every queued dispatch armed none.
     pub fn cancel_watches_of_replaced_agent(&self, worker_pane_id: &str) -> bool {
         let mut tracker = self.delegations.lock().unwrap();
-        if tracker
-            .commission_dispatches_in_flight
-            .get(worker_pane_id)
-            .is_some_and(|count| *count > 0)
-        {
-            return false;
-        }
-        let idle = tracker.records.remove(worker_pane_id).is_some();
         let silence = tracker.silence_watches.remove(worker_pane_id).is_some();
+        let record_seq = tracker.records.get(worker_pane_id).map(|record| record.seq);
+        let owned_by_a_queued_dispatch = record_seq.is_some_and(|seq| {
+            tracker
+                .commission_dispatches_in_flight
+                .get(worker_pane_id)
+                .is_some_and(|guards| {
+                    guards.values().any(|bound| match bound {
+                        // Not yet told which record it armed: it might be this one.
+                        None => true,
+                        Some(None) => false,
+                        Some(Some(owned)) => *owned == seq,
+                    })
+                })
+        });
+        let idle = record_seq.is_some()
+            && !owned_by_a_queued_dispatch
+            && tracker.records.remove(worker_pane_id).is_some();
         idle || silence
     }
 
@@ -5082,8 +5143,7 @@ impl AgentPtyRegistry {
         let in_flight = tracker
             .commission_dispatches_in_flight
             .get(worker_pane_id)
-            .copied()
-            .unwrap_or(0);
+            .map_or(0, |guards| u32::try_from(guards.len()).unwrap_or(u32::MAX));
         let keep = in_flight.saturating_add(u32::from(keep_own));
         let Some(entry) = tracker.commissions.get_mut(worker_pane_id) else {
             return 0;
@@ -16482,24 +16542,77 @@ mod spawn_tests {
             CommissionArm::Armed { in_flight, .. } => in_flight,
             other => panic!("expected an armed commission, got {other:?}"),
         };
-        assert!(
-            !reg.cancel_watches_of_replaced_agent("worker"),
-            "a dispatch in flight keeps the pane's watches"
-        );
-        drop(queued);
-
+        // The queued dispatch has not said which idle record it armed, so the
+        // idle record is kept; the silence watch was armed under the lock by a
+        // finished dispatch, so it goes regardless.
         assert!(reg.cancel_watches_of_replaced_agent("worker"));
-        assert!(matches!(
-            reg.retire_outstanding_delegation("worker"),
-            DelegationRetirement::Nothing
-        ));
         assert!(matches!(
             reg.retire_silence_watch("worker"),
             SilenceWatchRetirement::Nothing
         ));
         assert!(
+            !matches!(
+                reg.retire_outstanding_delegation("worker"),
+                DelegationRetirement::Nothing
+            ),
+            "an unbound queued dispatch keeps the idle record"
+        );
+
+        // A queued dispatch that armed NO idle record does not protect the
+        // replaced agent's one (Qodo, #1285).
+        assert!(
+            reg.arm_outstanding_delegation("worker", "coder", "orch", "orch-agent", None)
+                .is_some()
+        );
+        queued.bind_idle_record(None);
+        assert!(reg.cancel_watches_of_replaced_agent("worker"));
+        assert!(matches!(
+            reg.retire_outstanding_delegation("worker"),
+            DelegationRetirement::Nothing
+        ));
+
+        // A queued dispatch that armed the record present keeps it.
+        let own = reg
+            .arm_outstanding_delegation("worker", "coder", "orch", "orch-agent", None)
+            .expect("arm the queued dispatch's idle record");
+        queued.bind_idle_record(Some(own.seq));
+        assert!(!reg.cancel_watches_of_replaced_agent("worker"));
+        drop(queued);
+        assert!(
+            reg.cancel_watches_of_replaced_agent("worker"),
+            "no longer in flight, so the record is the replaced agent's"
+        );
+        assert!(
             !reg.cancel_watches_of_replaced_agent("worker"),
             "nothing left"
+        );
+    }
+
+    /// Issue #590 review (Qodo, #1285): past [`MAX_OUTSTANDING_COMMISSIONS`] the
+    /// count saturates rather than growing, and the instants kept still expire
+    /// on their own deadlines.
+    #[test]
+    fn commission_ledger_saturates_at_the_cap() {
+        let reg = Arc::new(AgentPtyRegistry::new());
+        let t0 = Instant::now();
+        let second = Duration::from_secs(1);
+        let cap = MAX_OUTSTANDING_COMMISSIONS as u32;
+        for i in 0..cap + 5 {
+            assert!(matches!(
+                reg.arm_delegation_commission_at("worker", "orch", None, true, t0 + second * i),
+                CommissionArm::Armed { superseded, .. } if superseded == i.min(cap)
+            ));
+        }
+        assert_eq!(
+            reg.retire_delegation_commission_at("worker", t0 + second * (cap + 5)),
+            WorkDoneProvenance::Solicited { remaining: cap - 1 },
+            "the count saturated at the cap"
+        );
+        // The retire above dropped the oldest instant (t0), so the oldest kept is
+        // t0+1s: at t0+1s+TTL exactly that one expires, and not a moment before.
+        assert_eq!(
+            reg.retire_delegation_commission_at("worker", t0 + second + DELEGATION_COMMISSION_TTL),
+            WorkDoneProvenance::Solicited { remaining: cap - 3 }
         );
     }
 
