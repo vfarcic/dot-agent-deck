@@ -711,7 +711,10 @@ fn repair_advice(installed: &Path) -> String {
 /// answer is the name `remote.rs` and every install path already use. A
 /// renamed build looking for a renamed install would find nothing on the one
 /// machine layout the project actually ships.
-fn durable_binary_file_name() -> String {
+///
+/// `wrap.rs` reuses it for the co-located cargo build its wrapper rewrite looks
+/// for beside a test harness, which cargo names after the package too.
+pub(crate) fn durable_binary_file_name() -> String {
     format!("{DEFAULT_BINARY_NAME}{}", std::env::consts::EXE_SUFFIX)
 }
 
