@@ -1233,6 +1233,202 @@ fn note_step(block: &str) -> String {
         .join("\n")
 }
 
+/// Scenario: Re-running either desktop producer replaces its earlier artifact
+/// instead of failing when the same artifact name already exists in the run.
+#[test]
+fn desktop_uploads_replace_artifacts_on_rerun() {
+    let all = jobs(&workflow());
+    for name in ["desktop-bundle", "desktop-sign"] {
+        let uploads: Vec<String> = steps(job(&all, name))
+            .into_iter()
+            .map(|step| step_code(&step))
+            .filter(|step| step.contains("actions/upload-artifact@"))
+            .collect();
+        assert!(
+            !uploads.is_empty(),
+            "{name} has no artifact uploads to guard"
+        );
+        for upload in uploads {
+            assert!(
+                upload.lines().any(|line| line.trim() == "overwrite: true"),
+                "{name} upload must set `overwrite: true`: {upload}"
+            );
+        }
+    }
+}
+
+/// Scenario: A desktop publish retry rewrites its bounded alpha note instead
+/// of leaving the previous attempt's signing and platform claims in the body.
+#[test]
+fn desktop_note_is_replaced_on_every_run() {
+    let all = jobs(&workflow());
+    let note = note_step(job(&all, "desktop-publish"));
+    assert!(
+        !note.lines().any(|line| line.contains("exit 0")),
+        "the note step must not exit early when an alpha marker is present"
+    );
+    for line in [
+        "MARKER=\"<!-- desktop-alpha -->\"",
+        "END_MARKER=\"<!-- /desktop-alpha -->\"",
+        "printf \"%s\\n\" \"$MARKER\"",
+        "printf \"\\n%s\\n\" \"$END_MARKER\"",
+    ] {
+        assert!(note.contains(line), "the note step must write `{line}`");
+    }
+}
+
+/// Scenario: Removing an upload overwrite or restoring the marker's early
+/// exit makes the corresponding release workflow guard fail.
+#[test]
+fn desktop_rerun_guards_reject_workflow_mutations() {
+    let original = workflow();
+    let sign = job(&jobs(&original), "desktop-sign").to_string();
+    let sign_upload = steps(&sign)
+        .into_iter()
+        .find(|step| step.contains("actions/upload-artifact@"))
+        .expect("desktop-sign upload");
+    let without_overwrite = replace_once(&sign_upload, "          overwrite: true", "");
+    let missing_overwrite = replace_once(&original, &sign_upload, &without_overwrite);
+    WORKFLOW_OVERRIDE.with(|slot| *slot.borrow_mut() = Some(missing_overwrite));
+    let upload_failed =
+        std::panic::catch_unwind(desktop_uploads_replace_artifacts_on_rerun).is_err();
+    WORKFLOW_OVERRIDE.with(|slot| *slot.borrow_mut() = None);
+    assert!(
+        upload_failed,
+        "removing desktop-sign overwrite was accepted"
+    );
+
+    let early_exit = replace_once(
+        &original,
+        "          END_MARKER=\"<!-- /desktop-alpha -->\"",
+        "          END_MARKER=\"<!-- /desktop-alpha -->\"\n          case *\"$MARKER\"*) exit 0 ;;",
+    );
+    WORKFLOW_OVERRIDE.with(|slot| *slot.borrow_mut() = Some(early_exit));
+    let note_failed = std::panic::catch_unwind(desktop_note_is_replaced_on_every_run).is_err();
+    WORKFLOW_OVERRIDE.with(|slot| *slot.borrow_mut() = None);
+    assert!(note_failed, "restoring the marker early exit was accepted");
+}
+
+#[cfg(unix)]
+fn desktop_note_splice_script() -> String {
+    let all = jobs(&workflow());
+    let step = named_step(
+        job(&all, "desktop-publish"),
+        "Note the unsigned alpha, or the signed macOS build, in the release body",
+    );
+    let mut lines = step.lines().skip_while(|line| !line.contains("<<'SPLICE'"));
+    assert!(
+        lines.next().is_some(),
+        "the desktop note has no SPLICE heredoc"
+    );
+    let body: Vec<&str> = lines.take_while(|line| line.trim() != "SPLICE").collect();
+    assert!(!body.is_empty(), "the SPLICE heredoc is empty");
+    let indent = body
+        .iter()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| line.len() - line.trim_start().len())
+        .min()
+        .expect("nonempty SPLICE heredoc");
+    body.iter()
+        .map(|line| &line[indent..])
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[cfg(unix)]
+fn run_desktop_note_splice(body: &str) -> (String, String) {
+    use std::process::Command;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let body_path = dir.path().join("body.md");
+    let prefix_path = dir.path().join("prefix.md");
+    let suffix_path = dir.path().join("suffix.md");
+    let script_path = dir.path().join("splice.py");
+    fs::write(&body_path, body).expect("write release body");
+    fs::write(&script_path, desktop_note_splice_script()).expect("write extracted SPLICE");
+    let output = Command::new("python3")
+        .arg(&script_path)
+        .arg(&body_path)
+        .arg("<!-- desktop-alpha -->")
+        .arg("<!-- /desktop-alpha -->")
+        .arg(&prefix_path)
+        .arg(&suffix_path)
+        .output()
+        .expect("run SPLICE under python3");
+    assert!(
+        output.status.success(),
+        "SPLICE exited {}: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    (
+        fs::read_to_string(&prefix_path).expect("read SPLICE prefix"),
+        fs::read_to_string(&suffix_path).expect("read SPLICE suffix"),
+    )
+}
+
+/// Scenario: The release workflow's actual Python splice preserves changelog
+/// text and human suffixes while replacing legacy and bounded alpha notes.
+/// An inline quoted marker stays in the changelog, and a second run is stable.
+#[cfg(unix)]
+#[test]
+fn desktop_note_splice_replaces_old_notes_and_is_idempotent() {
+    use std::process::Command;
+    if Command::new("python3").arg("--version").output().is_err() {
+        println!("SKIP: the desktop note splice test needs `python3` on PATH");
+        return;
+    }
+    const START: &str = "<!-- desktop-alpha -->";
+    const END: &str = "<!-- /desktop-alpha -->";
+    let changelog = "# Release notes\nA changelog entry with exact punctuation.";
+    let suffix = "A human addendum with exact punctuation.";
+    let quoted = "# Release notes\nThe changelog quotes `<!-- desktop-alpha -->` inline.";
+    let cases = [
+        ("changelog only", changelog.to_string(), changelog, ""),
+        (
+            "legacy note",
+            format!("{changelog}\n\n{START}\nold unsigned note"),
+            changelog,
+            "",
+        ),
+        (
+            "bounded note with suffix",
+            format!("{changelog}\n\n{START}\nold unsigned note\n{END}\n\n{suffix}\n"),
+            changelog,
+            suffix,
+        ),
+        ("inline quote", quoted.to_string(), quoted, ""),
+    ];
+    for (label, body, expected_prefix, expected_suffix) in cases {
+        let (prefix, kept_suffix) = run_desktop_note_splice(&body);
+        assert_eq!(prefix, expected_prefix, "{label}: changelog changed");
+        assert_eq!(kept_suffix, expected_suffix, "{label}: suffix changed");
+        let mut rendered = format!("{prefix}\n\n{START}\nnew signed note\n{END}\n");
+        if !kept_suffix.is_empty() {
+            rendered.push_str(&format!("\n{kept_suffix}\n"));
+        }
+        assert_eq!(
+            rendered.lines().filter(|line| *line == START).count(),
+            1,
+            "{label}: START line count"
+        );
+        assert_eq!(
+            rendered.lines().filter(|line| *line == END).count(),
+            1,
+            "{label}: END line count"
+        );
+        assert!(
+            !rendered.contains("old unsigned note"),
+            "{label}: stale note"
+        );
+        let (again_prefix, again_suffix) = run_desktop_note_splice(&rendered);
+        assert_eq!(again_prefix, prefix, "{label}: second run changed prefix");
+        assert_eq!(
+            again_suffix, kept_suffix,
+            "{label}: second run changed suffix"
+        );
+    }
+}
+
 /// The release-body note is the only installation instruction this project
 /// publishes for the desktop bundles -- PRD #740 Decision 11 ships the alpha
 /// unadvertised, so there is no `docs/` page to correct it. Two properties of
