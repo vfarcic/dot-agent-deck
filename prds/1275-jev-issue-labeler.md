@@ -28,13 +28,13 @@ Replace the Codex classification with **one Jev request per item**, whose questi
 | Size | one when estimable | choice: `low` · `medium` · `high` · `unknown` |
 | Triage | issues only, when type or priority cannot be chosen confidently | see Open Question 1 |
 
-State is the item's title, body and (for pull requests) changed file paths. Jev answers all questions in parallel; the workflow keeps the top answer of each choice (`none` and `unknown` mean no label on that axis) and every yes/no above 0.5, then applies the existing per-item cap of 6. A yes/no answer is a confidence by nature, so 0.5 is simply what "the top result" means for it, not a tuned threshold.
+State is the item's title, body and (for pull requests) changed file paths. Jev answers all questions in parallel; the workflow keeps the top answer of each choice (`none` and `unknown` mean no label on that axis) and every yes/no above 0.5, then selects at most 6 labels, the existing per-item cap. Selection is not optional: the memory validator rejects a prediction carrying more than 6 labels rather than trimming it (`validateLabels` against `maxPredictionLabels` in `.github/workflows/issue-labeler.md`), and the Area and Component questions alone can say yes to nine. The rule: keep every choice-axis label and `needs-triage` (at most four together, however Open Question 1 is answered), then fill the remaining slots with the yes/no labels in descending confidence, ties broken alphabetically. A yes/no answer is a confidence by nature, so 0.5 is simply what "the top result" means for it, not a tuned threshold.
 
 **What stays exactly as it is:**
 
 - **The allowlist is still the enforcement boundary.** Jev proposes; a separate step applies only labels in `add-labels.allowed`, and never authority or lifecycle labels (`PRD`, `duplicate`, `wontfix`, …).
 - **Activation stays with the maintainer**: automatic runs remain gated on `ISSUE_LABELER_ENABLED`, and the batch workflow's preview-by-default path stays.
-- **Correction memory and its validator.** Predictions and human corrections keep the same files, fields and limits on the memory branch, and the validator — "the workflow's one safety property that does not rest on the model behaving" — keeps its tests in `xtask/linkage-check/src/issue_labeler_memory.rs`. The BM25-selected past corrections can be passed to Jev as part of the state (Open Question 3).
+- **Correction memory and its validator.** Predictions and human corrections keep the same files, fields and limits on the memory branch, and the validator — "the workflow's one safety property that does not rest on the model behaving" — keeps its tests in `xtask/linkage-check/src/issue_labeler_memory.rs`. That holds as written only while the labeler stays on gh-aw, because the validator's inputs are gh-aw's: it reads the memory clone at `/tmp/gh-aw/repo-memory/default`, derives the expected prediction from `/tmp/gh-aw/agent_output.json` (exactly one `add_labels` or `noop` item), and its tests extract the script from `issue-labeler.md` and assert it is embedded verbatim in the gh-aw-generated `.lock.yml`. So the Jev step emits its selection in that safe-output shape, and a move off gh-aw (Open Question 2) carries the contract stated in M4. The BM25-selected past corrections can be passed to Jev as part of the state (Open Question 3).
 - **Fork pull requests stay skipped**, because the workflow holds a credential.
 - **The PRD #421 interlock**: exactly one mechanism applies the classification taxonomy to this repository at a time. This PRD replaces the classifier inside the existing mechanism; it does not add a second one.
 
@@ -76,11 +76,11 @@ Three limits of that data, stated so M1's result is read correctly:
 
 - **Labels were not applied by a controlled process.** Some were applied by agents through a maintainer's `gh` credential, so "the existing label" is a reference, not verified ground truth.
 - **An absent label is ambiguous.** An issue without a type label may have been judged typeless or simply never labeled. So evaluation scores **only axes the issue carries a label on** for type, priority and size, and treats area/component yes/no answers as agreement measures rather than accuracy.
-- **Some classes are too sparse to measure** (`feature`, `question`, `priority:high`, `size:high`). M1 reports them without drawing conclusions.
+- **Some classes are too sparse to measure** (`feature`, `question`, `priority:high`, `size:high`). M1 reports them without drawing conclusions. Sparseness within an axis does not remove the axis from the go/no-go; coverage of the axis itself is required (below).
 
 ### The comparison
 
-M1 compares Jev with the current Codex classifier, not only with the labels. Codex runs through the batch workflow's preview path (20 items per dispatch, metered in AI credits, so the sample is chosen deliberately); Jev runs through the offline harness on the same items and on the full labeled set.
+M1 compares Jev with the current Codex classifier, not only with the labels. Codex runs through the batch workflow's preview path (20 items per dispatch, metered in AI credits, so the sample is chosen deliberately); Jev runs through the offline harness on the same items and on the full labeled set. The Codex sample is chosen so that every scored axis — type, area, component, priority, size — has items in it carrying a label on that axis. Triage is not scored: no issue carries `needs-triage`, and Open Question 1 makes it a design decision.
 
 ### Credential
 
@@ -93,18 +93,18 @@ The workflow would hold a TypeSafe key as a repository secret instead of `OPENAI
 
 ## Success Criteria
 
-- **Go/no-go (M1):** on the items both classifiers see, Jev's agreement with the existing labels, per axis, is at least the Codex classifier's. Below that, the PRD stops at M1 with the measurement recorded.
+- **Go/no-go (M1):** on the items both classifiers see, Jev's agreement with the existing labels, per axis, is at least the Codex classifier's. Below that, the PRD stops at M1 with the measurement recorded. An axis with no labeled items among the shared sample has no result, and it counts as **not yet met** rather than as a pass: M1 adds items for that axis and re-runs both classifiers on them before deciding.
 - Per item, the Jev path completes in seconds and costs a small fraction of the current 0.736 + 0.454 credits; M1 records both.
 - A preview run proposes labels in the run summary and writes nothing; an apply run adds only allowlisted labels, within the cap, and records the prediction.
-- The memory validator's existing tests pass unchanged, and a new test proves a crafted Jev reply containing a non-taxonomy label is not applied.
+- The memory validator's existing accept and reject cases pass — unchanged while the labeler stays on gh-aw, or ported with the validator if M4 moves it off — and a new test proves a crafted Jev reply containing a non-taxonomy label is not applied.
 - After M5, nothing in the repository describes the labeler as using Codex or `OPENAI_API_KEY`, and the labeler no longer references that secret.
 
 ## Milestones
 
-- [ ] **M1 — Go/no-go measurement.** With a Jev account: an offline harness that pulls labeled issues, asks Jev the taxonomy questions, and scores per-axis agreement; a Codex preview run over a deliberately chosen sample of the same items. Record agreement per axis, latency and cost for both. **Stop here if the bar is not met.**
+- [ ] **M1 — Go/no-go measurement.** With a Jev account: an offline harness that pulls labeled issues, asks Jev the taxonomy questions, and scores per-axis agreement; a Codex preview run over a deliberately chosen sample of the same items. Record agreement per axis, latency and cost for both, and confirm every scored axis has labeled items in the shared sample before reading the go/no-go. **Stop here if the bar is not met.**
 - [ ] **M2 — Jev in the preview path.** The preview workflow classifies with Jev and reports proposed labels in the run summary with no writes; the batch workflow's fan-out and input validation are unchanged.
-- [ ] **M3 — Jev in the live path.** Apply step enforcing allowlist and cap independently of the model; predictions and feedback written through the existing memory files and validator; tests for the crafted-reply case.
-- [ ] **M4 — Codex path removed.** The agent engine, threat-detection pass and gh-aw machinery that only an agent needed are removed or kept per Open Question 2's answer; the labeler stops referencing `OPENAI_API_KEY`.
+- [ ] **M3 — Jev in the live path.** Apply step enforcing allowlist and cap independently of the model; predictions and feedback written through the existing memory files and validator; tests for the crafted-reply case and for an answer set above the cap, which must be trimmed by the selection rule rather than submitted.
+- [ ] **M4 — Codex path removed.** The agent engine, threat-detection pass and gh-aw machinery that only an agent needed are removed or kept per Open Question 2's answer; the labeler stops referencing `OPENAI_API_KEY`. If the answer is a plain Actions workflow, the same change must preserve the validator's inputs or replace them — a baseline and a writable memory clone, and one structured selection record the validator derives the expected prediction from — and port the validator and `issue_labeler_memory.rs` with them, since those tests read `issue-labeler.md` and its `.lock.yml` by path. Removing gh-aw without that leaves predictions and feedback unvalidated.
 - [ ] **M5 — Every description of the labeler's credential updated.** `docs/develop/issue-labeling.md`; CLAUDE.md rule 5's paragraph on the Codex issue-labeler (and a check that rule 17's historical example still reads as history); the comments in `.github/workflows/ci.yml` that describe the labeler passing `OPENAI_API_KEY` into `codex exec`; `THIRD_PARTY_NOTICES.md` if the `dosu-ai/auto-label` derivative no longer applies. Sweep with `grep -rn "OPENAI_API_KEY\|codex exec\|issue-labeler"` rather than trusting this list.
 
 ## Risks
