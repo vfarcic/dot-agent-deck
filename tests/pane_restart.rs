@@ -18,7 +18,9 @@ use std::time::Duration;
 use dot_agent_deck::agent_pty::{
     AgentPtyRegistry, DOT_AGENT_DECK_PANE_ID, PaneRecreateIdentity, SpawnOptions, TabMembership,
 };
-use dot_agent_deck::event::{RestartRoleResponse, RestartRoleSignal};
+use dot_agent_deck::event::{
+    DelegateResponse, DelegateSignal, RestartRoleResponse, RestartRoleSignal,
+};
 use dot_agent_deck::state::OrchestrationIdentity;
 use spec::spec;
 
@@ -875,5 +877,145 @@ async fn pane_restart_011_force_bypasses_the_post_dispatch_lock_recheck_too() {
         "force must replace the concurrent delegate's healthy replacement with a freshly \
          spawned agent, not leave it in place; occupant = {occupant:?}, \
          replacement = {replacement_agent_id}"
+    );
+}
+
+/// The pointer line `dispatch_one_owned` writes into the `coder` worker's PTY.
+const POINTER: &[u8] = b"Read .dot-agent-deck/worker-task-coder.md for your task.";
+
+/// Count `POINTER` in whatever agent currently owns the worker pane.
+fn pointers_in_worker_pane(registry: &AgentPtyRegistry) -> usize {
+    registry
+        .pane_current_agent_id(WORKER_PANE)
+        .and_then(|id| registry.snapshot(&id).ok())
+        .unwrap_or_default()
+        .windows(POINTER.len())
+        .filter(|w| *w == POINTER)
+        .count()
+}
+
+/// Poll until the worker pane's current agent has received at least `count`
+/// pointers, or `timeout` passes. Returns whether it got there.
+async fn wait_for_pointers(registry: &AgentPtyRegistry, count: usize, timeout: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if pointers_in_worker_pane(registry) >= count {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+async fn delegate_to_worker(fx: &Fixture, supersede: bool) -> DelegateResponse {
+    let signal = DelegateSignal {
+        pane_id: ORCH_PANE.to_string(),
+        task: "Probe task for the busy-worker refusal.".to_string(),
+        to: vec![WORKER_ROLE.to_string()],
+        supersede,
+        timestamp: chrono::Utc::now(),
+        token: None,
+    };
+    fx.daemon
+        .state
+        .read()
+        .await
+        .handle_delegate_with_state(
+            signal,
+            &fx.daemon.registry,
+            &fx.daemon.event_tx,
+            Some(&fx.daemon.state),
+        )
+        .await
+}
+
+/// Scenario: the orchestrator delegates to a healthy `cat` worker, waits for the
+/// task pointer to land, and delegates to it again before any work-done — that
+/// second delegate must be refused as busy and never reach the pane (issue
+/// #580). The orchestrator then cancels the task with `pane restart --force`,
+/// and a plain delegate to the restarted role must go through, because the
+/// restart retired the commission only the replaced agent could have answered
+/// (issue #590).
+#[tokio::test(flavor = "multi_thread")]
+#[spec("pane/restart/012")]
+async fn pane_restart_012_force_restart_cancels_the_task_a_busy_refusal_names() {
+    let fx = fixture("cat").await;
+    // `clear = false`, so a delegate writes into the live `cat` rather than
+    // respawning it and waiting out a `SessionStart` a `cat` never sends. The
+    // config is read on every delegate, so rewriting it here is enough.
+    std::fs::write(
+        fx._dir.path().join(".dot-agent-deck.toml"),
+        format!("{}clear = false\n", config("cat")),
+    )
+    .expect("rewrite the orchestration config with a clear = false worker");
+
+    let first = delegate_to_worker(&fx, false).await;
+    assert_eq!(
+        first.delivered,
+        vec![WORKER_ROLE.to_string()],
+        "the first delegate to an idle worker must be dispatched; response = {first:?}"
+    );
+    assert!(
+        wait_for_pointers(&fx.daemon.registry, 1, Duration::from_secs(20)).await,
+        "precondition: the first task pointer never reached the worker"
+    );
+    // The pty echoes the line and `cat` writes it back, so one delivery can
+    // show the pointer more than once. Let it settle and compare against that.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let delivered_once = pointers_in_worker_pane(&fx.daemon.registry);
+
+    let refused = delegate_to_worker(&fx, false).await;
+    assert!(
+        refused.delivered.is_empty(),
+        "a delegate to a worker that still owes a work-done must not be dispatched; \
+         response = {refused:?}"
+    );
+    assert_eq!(
+        refused
+            .busy
+            .iter()
+            .map(|b| b.role.as_str())
+            .collect::<Vec<_>>(),
+        vec![WORKER_ROLE],
+        "the busy worker must be named; response = {refused:?}"
+    );
+    assert!(
+        refused
+            .error
+            .as_deref()
+            .is_some_and(|e| e.contains("--supersede")),
+        "the refusal must be an error naming the remedy; response = {refused:?}"
+    );
+    // Give a (wrongly) dispatched second pointer the time the first one took
+    // and then some, before asserting it never came.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(
+        pointers_in_worker_pane(&fx.daemon.registry),
+        delivered_once,
+        "the refused delegate must not have written a second pointer into the busy pane"
+    );
+
+    let restarted = restart_role(&fx, ORCH_PANE, WORKER_ROLE, true).await;
+    assert!(
+        restarted.restarted,
+        "precondition: the forced restart must succeed; response = {restarted:?}"
+    );
+
+    let after_restart = delegate_to_worker(&fx, false).await;
+    assert_eq!(
+        after_restart.delivered,
+        vec![WORKER_ROLE.to_string()],
+        "after `pane restart --force` the role takes a plain delegate again — the cancelled \
+         task's commission went with the agent that owed it; response = {after_restart:?}"
+    );
+    assert!(
+        after_restart.busy.is_empty() && after_restart.superseded.is_empty(),
+        "nothing was outstanding to refuse or supersede; response = {after_restart:?}"
+    );
+    assert!(
+        wait_for_pointers(&fx.daemon.registry, 1, Duration::from_secs(20)).await,
+        "the delegate after the restart must reach the replacement agent"
     );
 }

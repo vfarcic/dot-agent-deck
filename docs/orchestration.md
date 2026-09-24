@@ -137,6 +137,18 @@ The orchestrator delegates a task to one or more workers. The deck delivers the 
 
 A worker that never signals completion would otherwise stall the pipeline silently, since the orchestrator is parked waiting for it and gets no turn in which to notice. The daemon covers that case on a timeout — see [Idle Workers & Notifications](idle-workers-and-notifications.md), which also shows how to turn the moments a run stops and waits for you into messages that reach you away from the terminal.
 
+### One task per worker at a time
+
+A worker that has been delegated a task owes a `work-done` for it, and until that arrives the deck refuses to hand the same worker another task. `dot-agent-deck delegate` then exits non-zero with `this delegate was NOT sent`, naming the worker, how many delegations it still owes, and how long ago the oldest was issued. When a delegate names several `--to` roles, the free ones still get the task: the command prints a warning naming the refused ones and exits 0, so re-send to just those roles rather than repeating the whole delegate, which would hand the free roles the task twice.
+
+The refusal is decided from the deck's own record of what it has delegated, not from the worker's status. Status is reported by the agent itself and can be wrong for hours — an agent whose API quota has run out can go on showing `Working` — so it is not something the deck will refuse on.
+
+When the earlier task is not coming back, there are three ways out:
+
+- **`dot-agent-deck delegate --supersede …`** dispatches anyway, and the command says it superseded. It does not cancel the earlier task: on a `clear = false` worker the new task is typed into the same live session, and if the earlier task's `work-done` does arrive it is credited like any other. On a `clear = true` worker the delegation replaces the agent, so what the replaced agent owed is dropped.
+- **`dot-agent-deck pane restart <role>`** replaces the worker's agent and drops what it owed, since the replacement never saw that task. A delegate that was already on its way to the pane when the restart ran is kept, because it is delivered to the replacement.
+- **Waiting it out.** The deck stops counting a delegation seven days after it was issued, whether or not anything answered it. Seven days is deliberately long: forgetting a delegation whose worker is still busy would mislabel that worker's genuine completion as [unsolicited](#orchestrator-is-told-a-completion-was-unsolicited).
+
 ### What `clear` does to delivery
 
 [`clear`](#configuration-reference) decides whether the worker that receives a task is the same process that handled the last one, and that has consequences for how the task is delivered.
@@ -451,6 +463,8 @@ If a delegated worker role stops responding or its pane looks dead, run
 the task it was working on. Only ask the user if the restart itself fails.
 ```
 
+The re-delegation in that snippet is accepted even though the earlier task never reported back: restarting a worker drops the delegation it owed, so the deck does not [refuse it as busy](#one-task-per-worker-at-a-time).
+
 You don't have to add this yourself to get the behavior — the orchestrator's own context teaches it both commands automatically, so a `prompt_template` line like the one above is reinforcement, not the only way the orchestrator learns these commands exist.
 
 ## Validate your config
@@ -612,6 +626,10 @@ Restart only acts on a pane the daemon has flagged as having actually exited —
 
 `dot-agent-deck pane spawn <role>` is refused if the role is already live — it starts a NEW pane for a role that has none, not a second instance of one that already has one. To run two instances of the same kind of worker at once, give the second one its own role name in `.dot-agent-deck.toml` (e.g. `reviewer2`) rather than spawning the same name twice.
 
+### `delegate` says "this delegate was NOT sent: every worker it reached still owes a work-done"
+
+The worker has not reported `work-done` for an earlier delegation, so the deck refused to hand it another task — see [One task per worker at a time](#one-task-per-worker-at-a-time) for why and for the three ways out. If you believe the worker did report, look for that `work-done` in its pane: a `work-done` the daemon refused (for example over a [capability token](troubleshooting.md#work-done-dispatch-or-delegate-fails-with-refused--hook-capability-token)) never reached the deck.
+
 ### Worker receives no task
 
 The role name in `--to` must match the `name` field in the config exactly (case-sensitive). Check for typos. Also verify the worker's pane is part of the same orchestration tab — you cannot delegate across tabs.
@@ -644,7 +662,7 @@ The daemon records every delegation it dispatches, and a `work-done` that answer
 
 Nothing is dropped — the report still arrives, framed as information rather than as delivered work — and `.dot-agent-deck/work-done-<role>.md` is deliberately left untouched, so an uncommissioned report cannot overwrite the last one the orchestrator did commission. If you want a completion to be reported as delegated work, delegate it: task the worker through the orchestrator rather than typing into its pane.
 
-Two consequences of "untouched" are worth knowing before you go looking for a file. An **orchestrator** running `dot-agent-deck work-done` on itself without `--done` counts as uncommissioned too — nobody delegates to the orchestrator — so no `work-done-<orchestrator-role>.md` is written for it; use `--done` to close out the orchestration, or delegate the work to a role. And a delegate that never actually **reached** its worker — the identity gate refused the write, a `clear = true` respawn failed and left the notice `⚠ respawn failed for role '<role>'` in your orchestrator pane, or the replacement never came up and left `⚠ delegated worker never came up` there — commissions nothing, so a completion arriving from that worker afterwards is uncommissioned by the same rule. That is deliberate: the alternative is a stale commission that quietly relabels some later, unrelated completion as delegated work.
+Two consequences of "untouched" are worth knowing before you go looking for a file. An **orchestrator** running `dot-agent-deck work-done` on itself without `--done` counts as uncommissioned too — nobody delegates to the orchestrator — so no `work-done-<orchestrator-role>.md` is written for it; use `--done` to close out the orchestration, or delegate the work to a role. And a delegate that never actually **reached** its worker — the identity gate refused the write, a `clear = true` respawn failed and left the notice `⚠ respawn failed for role '<role>'` in your orchestrator pane, or the replacement never came up and left `⚠ delegated worker never came up` there — commissions nothing, so a completion arriving from that worker afterwards is uncommissioned by the same rule. That is deliberate: the alternative is a stale commission that quietly relabels some later, unrelated completion as delegated work. The same rule covers two more cases: a delegation stops counting seven days after it was issued, and `dot-agent-deck pane restart <role>` drops what the replaced worker owed — so a completion from that worker afterwards, for work nobody has delegated since, is labelled uncommissioned too.
 
 ### The summary file could not be written
 

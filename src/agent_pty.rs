@@ -3606,6 +3606,21 @@ struct DelegationTracker {
     /// armed for every delegate the daemon dispatches regardless of either
     /// timeout, so `Unsolicited` here means what it says.
     commissions: HashMap<String, DelegationCommission>,
+    /// Issue #590: per worker pane, how many armed commissions belong to a
+    /// dispatch task that has not yet taken that pane's
+    /// [`AgentPtyRegistry::pane_dispatch_lock`]. Each is held by a
+    /// [`CommissionDispatchInFlight`] and given back when the task takes the lock
+    /// (or is dropped without ever taking it).
+    ///
+    /// It is what lets [`AgentPtyRegistry::retire_commissions_of_replaced_agent`]
+    /// tell the commissions the REPLACED agent owed from the ones whose task
+    /// pointer will be written to its replacement: under the dispatch lock, every
+    /// armed commission not counted here has already been through a dispatch that
+    /// either delivered to the previous occupant or released its commission.
+    /// Separate from `commissions` because a pane close drains that map while a
+    /// dispatch task may still be queued, and the task's guard must still find
+    /// something to give back.
+    commission_dispatches_in_flight: HashMap<String, u32>,
     /// Panes between [`AgentPtyRegistry::begin_pane_close`] and
     /// [`AgentPtyRegistry::finish_pane_close`]. Arming is refused for a pane in
     /// this set (as worker *or* as orchestrator), which is what closes the
@@ -3677,15 +3692,191 @@ struct SilenceWatchRecord {
 /// be matched to a specific delegation anyway — and the two maps that do carry
 /// generations already own every accounting decision that depends on knowing
 /// *which* one.
+///
+/// Issue #590: each commission also carries the instant it was armed, so it can
+/// expire on its own age ([`DELEGATION_COMMISSION_TTL`]). The count is still what
+/// every caller reads; the timestamps only decide when a commission stops being
+/// owed. Whenever one commission leaves the entry — a completion credited, an
+/// undelivered delegate released, an expiry — it is the OLDEST timestamp that
+/// goes, because which delegation a completion answered is unknowable, and
+/// dropping the oldest leaves the survivors carrying the newest arm times the
+/// entry has seen: any mismatch then errs toward a commission living longer,
+/// never shorter.
 struct DelegationCommission {
-    /// Delegations dispatched to this worker pane that no completion has been
-    /// credited to yet. Saturating, like [`OutstandingDelegation::superseded`].
-    outstanding: u32,
+    /// Arm instant of each outstanding commission whose time is still tracked,
+    /// oldest first. At most [`MAX_TIMED_COMMISSIONS`] long.
+    armed_at: VecDeque<Instant>,
+    /// Commissions OLDER than every entry in `armed_at`, whose own arm instants
+    /// were folded away when `armed_at` reached [`MAX_TIMED_COMMISSIONS`].
+    /// Saturating, like [`OutstandingDelegation::superseded`]. Non-zero only when
+    /// `armed_at` is full or has been drained from the front since, so
+    /// `untimed > 0` implies `armed_at` is non-empty.
+    untimed: u32,
     /// Pane of the orchestrator that issued them, so closing the ORCHESTRATOR
     /// clears the ledger as well as the two watches — a commission is owed to a
     /// specific orchestrator, and a pane id freed by a close can be inherited by
     /// an unrelated agent that commissioned nothing.
     orchestrator_pane_id: String,
+}
+
+/// Issue #590: how long a commission stays owed without a `work-done` crediting
+/// it, measured from the moment it was armed.
+///
+/// A constant, and deliberately NOT derived from `worker_response_timeout_minutes`
+/// (PRD #126) or `delegate_no_event_window` (PRD #249): those knobs switch a
+/// *detector* on and off, and a ledger that depends on a switchable detector is
+/// the original #448 defect. Seven days because the failure directions are not
+/// symmetric. Expiring a commission whose worker is still legitimately working
+/// relabels its genuine completion as unsolicited and suppresses its summary
+/// file; keeping one too long only lets a much later uncommissioned completion
+/// read as solicited, and (issue #580) makes a delegate to that worker ask for
+/// `--supersede`. Seven days is the longest `worker_response_timeout_minutes` the
+/// config accepts (`10080`), i.e. the longest a project can already declare one
+/// delegation may plausibly run — borrowed as a magnitude, not read from the knob.
+pub const DELEGATION_COMMISSION_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
+/// Issue #590: the most arm instants one ledger entry tracks individually. Beyond
+/// it the oldest instant is folded into [`DelegationCommission::untimed`], which
+/// keeps the count exact and the memory bounded. Reaching it takes that many
+/// unanswered delegations to one worker, each of which (issue #580) needed an
+/// explicit `--supersede`.
+const MAX_TIMED_COMMISSIONS: usize = 256;
+
+impl DelegationCommission {
+    fn new(orchestrator_pane_id: &str) -> Self {
+        Self {
+            armed_at: VecDeque::new(),
+            untimed: 0,
+            orchestrator_pane_id: orchestrator_pane_id.to_string(),
+        }
+    }
+
+    /// Commissions still owed. `armed_at.len()` is bounded by
+    /// [`MAX_TIMED_COMMISSIONS`], so the cast cannot truncate.
+    fn outstanding(&self) -> u32 {
+        self.untimed.saturating_add(self.armed_at.len() as u32)
+    }
+
+    fn push(&mut self, now: Instant) {
+        if self.armed_at.len() >= MAX_TIMED_COMMISSIONS {
+            self.armed_at.pop_front();
+            self.untimed = self.untimed.saturating_add(1);
+        }
+        self.armed_at.push_back(now);
+    }
+
+    /// Remove one commission, the oldest — see the type's doc comment for why
+    /// it is always the oldest. The untimed ones are older than every timed one.
+    fn pop_oldest(&mut self) {
+        if self.untimed > 0 {
+            self.untimed -= 1;
+        } else {
+            self.armed_at.pop_front();
+        }
+    }
+
+    /// Drop every commission at least [`DELEGATION_COMMISSION_TTL`] old, and
+    /// return how many went.
+    ///
+    /// The untimed commissions have no instant of their own, but each is older
+    /// than every timed one, so they are expired exactly when at least one timed
+    /// commission is — and kept, fail-safe, while the oldest timed one is young.
+    fn expire(&mut self, now: Instant) -> u32 {
+        let mut expired: u32 = 0;
+        while let Some(armed) = self.armed_at.front() {
+            if now.saturating_duration_since(*armed) < DELEGATION_COMMISSION_TTL {
+                break;
+            }
+            self.armed_at.pop_front();
+            expired = expired.saturating_add(1);
+        }
+        if expired > 0 {
+            expired = expired.saturating_add(self.untimed);
+            self.untimed = 0;
+        }
+        expired
+    }
+
+    /// Age of the oldest commission whose arm instant is still tracked — a
+    /// lower bound on the true oldest when any are untimed.
+    fn oldest_age(&self, now: Instant) -> Duration {
+        self.armed_at.front().map_or(Duration::ZERO, |armed| {
+            now.saturating_duration_since(*armed)
+        })
+    }
+}
+
+/// Issue #580: what [`AgentPtyRegistry::arm_delegation_commission`] did.
+#[derive(Debug)]
+pub enum CommissionArm {
+    /// A commission is now owed for this delegate. `superseded` is how many were
+    /// already outstanding to this worker — non-zero only for a
+    /// `delegate --supersede` to a worker that still owed a `work-done`.
+    ///
+    /// `in_flight` must travel with the dispatch task and be dropped once that
+    /// task holds the worker's `pane_dispatch_lock` — see
+    /// [`CommissionDispatchInFlight`].
+    Armed {
+        superseded: u32,
+        /// Age of the oldest of those `superseded` commissions — see
+        /// [`DelegationCommission::oldest_age`]. Zero when `superseded` is.
+        superseded_oldest_age: Duration,
+        in_flight: CommissionDispatchInFlight,
+    },
+    /// Refused: the worker still owes a `work-done` for an earlier delegation and
+    /// the caller did not pass `supersede`. Nothing was recorded, and the
+    /// delegate must not be dispatched.
+    Busy {
+        outstanding: u32,
+        oldest_age: Duration,
+    },
+    /// Nothing recorded because the worker or orchestrator pane is mid-close —
+    /// the arm-after-cancel guard described on
+    /// [`AgentPtyRegistry::arm_delegation_commission`]. Not a refusal: the
+    /// delegate still proceeds, and a completion it produces is labelled
+    /// unsolicited rather than dropped.
+    Closing,
+}
+
+/// Issue #590: one armed commission whose dispatch task has not yet taken the
+/// worker pane's `pane_dispatch_lock`. Counted in
+/// `DelegationTracker::commission_dispatches_in_flight` from the moment the
+/// commission is armed — under the same lock hold, so nothing can observe the
+/// commission without it — until this guard is dropped.
+///
+/// Dropping it is the whole interface: the dispatch task drops it immediately
+/// after taking the lock, and a task that never runs (a runtime shutting down)
+/// drops it with its future, so the count cannot leak on either road.
+pub struct CommissionDispatchInFlight {
+    registry: Arc<AgentPtyRegistry>,
+    worker_pane_id: String,
+}
+
+// Hand-written because `AgentPtyRegistry` is not `Debug`; the pane is the only
+// part worth printing.
+impl std::fmt::Debug for CommissionDispatchInFlight {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CommissionDispatchInFlight")
+            .field("worker_pane_id", &self.worker_pane_id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for CommissionDispatchInFlight {
+    fn drop(&mut self) {
+        let mut tracker = self.registry.delegations.lock().unwrap();
+        if let Some(count) = tracker
+            .commission_dispatches_in_flight
+            .get_mut(&self.worker_pane_id)
+        {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                tracker
+                    .commission_dispatches_in_flight
+                    .remove(&self.worker_pane_id);
+            }
+        }
+    }
 }
 
 /// Issue #448: did the orchestrator actually commission the work a `work-done`
@@ -4618,8 +4809,8 @@ impl AgentPtyRegistry {
     }
 
     /// Issue #448: record that the orchestrator has commissioned work from
-    /// `worker_pane_id` and owes itself a `work-done` for it. Returns whether the
-    /// commission was recorded.
+    /// `worker_pane_id` and owes itself a `work-done` for it — or, issue #580,
+    /// refuse because the worker still owes one for an earlier delegation.
     ///
     /// Armed for EVERY delegate the daemon dispatches, deliberately independent
     /// of both `worker_response_timeout_minutes` (PRD #126) and
@@ -4629,43 +4820,118 @@ impl AgentPtyRegistry {
     /// solicited?" from either watch made a project with the idle detector turned
     /// off indistinguishable from a worker nobody delegated to.
     ///
-    /// Returns `false` — nothing recorded — when either pane is mid-close
-    /// ([`Self::begin_pane_close`]), the same arm-after-cancel guard as
-    /// [`Self::arm_outstanding_delegation`] and [`Self::arm_silence_watch`]: the
-    /// close sweep has already passed, so an entry armed now would never be
+    /// Returns [`CommissionArm::Closing`] — nothing recorded — when either pane
+    /// is mid-close ([`Self::begin_pane_close`]), the same arm-after-cancel guard
+    /// as [`Self::arm_outstanding_delegation`] and [`Self::arm_silence_watch`]:
+    /// the close sweep has already passed, so an entry armed now would never be
     /// swept, and a phantom commission makes a later unsolicited completion read
     /// as solicited. Failing to record fails safe in the other direction (a
     /// genuine completion is *labelled* unsolicited rather than dropped), which
     /// is why this is a refusal and not a queue.
     ///
-    /// Unlike the two watches, arming does not REPLACE a previous entry — it
-    /// increments it. Two unanswered delegations to one worker are two
-    /// commissions, so two completions are credited before a third is called
-    /// unsolicited.
+    /// Issue #580: returns [`CommissionArm::Busy`] — nothing recorded — when the
+    /// worker already owes a `work-done` and `supersede` is false. The check and
+    /// the arm happen under one lock hold, so two concurrent delegates to an idle
+    /// worker cannot both pass it. Expired commissions
+    /// ([`DELEGATION_COMMISSION_TTL`]) are dropped first, which is what keeps a
+    /// commission nobody will ever answer from refusing that worker for ever
+    /// (issue #590). The ledger is the signal rather than the worker's status:
+    /// status is hook-reported, and a hook event is not proof of anything.
+    ///
+    /// With `supersede`, arming does not REPLACE a previous entry — it
+    /// increments it, exactly as every delegate did before #580. Two unanswered
+    /// delegations to one live worker are two commissions, so two completions are
+    /// credited before a third is called unsolicited; resetting to one instead
+    /// would relabel the second task's genuine completion. The commissions a
+    /// replaced agent can no longer answer are retired by
+    /// [`Self::retire_commissions_of_replaced_agent`], not here.
     pub fn arm_delegation_commission(
-        &self,
+        self: &Arc<Self>,
         worker_pane_id: &str,
         orchestrator_pane_id: &str,
-    ) -> bool {
+        supersede: bool,
+    ) -> CommissionArm {
+        self.arm_delegation_commission_at(
+            worker_pane_id,
+            orchestrator_pane_id,
+            supersede,
+            Instant::now(),
+        )
+    }
+
+    /// [`Self::arm_delegation_commission`] against an explicit clock, so the
+    /// expiry is testable without waiting a week.
+    fn arm_delegation_commission_at(
+        self: &Arc<Self>,
+        worker_pane_id: &str,
+        orchestrator_pane_id: &str,
+        supersede: bool,
+        now: Instant,
+    ) -> CommissionArm {
         let mut tracker = self.delegations.lock().unwrap();
         if tracker.closing_panes.contains(worker_pane_id)
             || tracker.closing_panes.contains(orchestrator_pane_id)
         {
-            return false;
+            return CommissionArm::Closing;
         }
+        Self::expire_commissions(&mut tracker, worker_pane_id, now);
         let entry = tracker
             .commissions
             .entry(worker_pane_id.to_string())
-            .or_insert_with(|| DelegationCommission {
-                outstanding: 0,
-                orchestrator_pane_id: orchestrator_pane_id.to_string(),
-            });
-        entry.outstanding = entry.outstanding.saturating_add(1);
+            .or_insert_with(|| DelegationCommission::new(orchestrator_pane_id));
+        let superseded = entry.outstanding();
+        let superseded_oldest_age = entry.oldest_age(now);
+        if superseded > 0 && !supersede {
+            return CommissionArm::Busy {
+                outstanding: superseded,
+                oldest_age: superseded_oldest_age,
+            };
+        }
+        entry.push(now);
         // Last delegate wins: a pane id that has changed hands (orchestrator
         // closed, successor spawned onto the same id) must not leave the ledger
         // pointing its close sweep at the dead pane.
         entry.orchestrator_pane_id = orchestrator_pane_id.to_string();
-        true
+        let in_flight = tracker
+            .commission_dispatches_in_flight
+            .entry(worker_pane_id.to_string())
+            .or_insert(0);
+        *in_flight = in_flight.saturating_add(1);
+        CommissionArm::Armed {
+            superseded,
+            superseded_oldest_age,
+            in_flight: CommissionDispatchInFlight {
+                registry: Arc::clone(self),
+                worker_pane_id: worker_pane_id.to_string(),
+            },
+        }
+    }
+
+    /// Issue #590: drop `worker_pane_id`'s commissions that have outlived
+    /// [`DELEGATION_COMMISSION_TTL`], removing the entry if none remain. Every
+    /// ledger operation that reads the count runs this first, so an expired
+    /// commission is never observed — there is no timer, and none is needed.
+    /// Caller holds the tracker lock.
+    fn expire_commissions(tracker: &mut DelegationTracker, worker_pane_id: &str, now: Instant) {
+        let Some(entry) = tracker.commissions.get_mut(worker_pane_id) else {
+            return;
+        };
+        let expired = entry.expire(now);
+        if expired == 0 {
+            return;
+        }
+        let remaining = entry.outstanding();
+        if remaining == 0 {
+            tracker.commissions.remove(worker_pane_id);
+        }
+        tracing::info!(
+            pane_id = %worker_pane_id,
+            expired,
+            remaining,
+            ttl_secs = DELEGATION_COMMISSION_TTL.as_secs(),
+            "delegation commission expired unanswered: a work-done from this worker is no \
+             longer credited to it"
+        );
     }
 
     /// Issue #448: credit a `work-done` from `worker_pane_id` against the
@@ -4674,16 +4940,25 @@ impl AgentPtyRegistry {
     ///
     /// The last commission for a pane removes its entry rather than leaving a
     /// zero behind, so the map tracks live debt instead of every worker pane that
-    /// has ever been delegated to.
+    /// has ever been delegated to. Issue #590: expired commissions are dropped
+    /// before the credit, so a completion arriving after
+    /// [`DELEGATION_COMMISSION_TTL`] is not laundered into a solicited one.
     pub fn retire_delegation_commission(&self, worker_pane_id: &str) -> WorkDoneProvenance {
+        self.retire_delegation_commission_at(worker_pane_id, Instant::now())
+    }
+
+    /// [`Self::retire_delegation_commission`] against an explicit clock.
+    fn retire_delegation_commission_at(
+        &self,
+        worker_pane_id: &str,
+        now: Instant,
+    ) -> WorkDoneProvenance {
         let mut tracker = self.delegations.lock().unwrap();
-        let Some(outstanding) = tracker
-            .commissions
-            .get(worker_pane_id)
-            .map(|entry| entry.outstanding)
-        else {
+        Self::expire_commissions(&mut tracker, worker_pane_id, now);
+        let Some(entry) = tracker.commissions.get_mut(worker_pane_id) else {
             return WorkDoneProvenance::Unsolicited;
         };
+        let outstanding = entry.outstanding();
         if outstanding <= 1 {
             tracker.commissions.remove(worker_pane_id);
             // A `0` entry cannot normally exist — this branch removes an entry as
@@ -4695,13 +4970,10 @@ impl AgentPtyRegistry {
                 WorkDoneProvenance::Solicited { remaining: 0 }
             };
         }
-        let remaining = outstanding - 1;
-        tracker
-            .commissions
-            .get_mut(worker_pane_id)
-            .expect("entry present under the same lock")
-            .outstanding = remaining;
-        WorkDoneProvenance::Solicited { remaining }
+        entry.pop_oldest();
+        WorkDoneProvenance::Solicited {
+            remaining: entry.outstanding(),
+        }
     }
 
     /// Issue #448 review (finding 1): release ONE commission armed for
@@ -4720,20 +4992,75 @@ impl AgentPtyRegistry {
     /// DECREMENTS rather than removing the entry: two delegations may be
     /// outstanding to one worker and only one of them failed, so dropping the
     /// whole entry would discard a sibling delegation's genuine commission and
-    /// mislabel ITS completion as unsolicited. Saturating for the same
-    /// defense-in-depth reason as [`Self::retire_delegation_commission`], and
-    /// the entry is removed as it reaches zero so the map keeps tracking live
-    /// debt rather than every pane ever delegated to.
+    /// mislabel ITS completion as unsolicited. The entry is removed as it
+    /// reaches zero so the map keeps tracking live debt rather than every pane
+    /// ever delegated to. Issue #590: it is the OLDEST arm instant that goes, not
+    /// the undelivered delegate's own — see [`DelegationCommission`] for why
+    /// that is the direction that can only lengthen a survivor's life.
     pub fn release_delegation_commission(&self, worker_pane_id: &str) -> bool {
         let mut tracker = self.delegations.lock().unwrap();
         let Some(entry) = tracker.commissions.get_mut(worker_pane_id) else {
             return false;
         };
-        entry.outstanding = entry.outstanding.saturating_sub(1);
-        if entry.outstanding == 0 {
+        entry.pop_oldest();
+        if entry.outstanding() == 0 {
             tracker.commissions.remove(worker_pane_id);
         }
         true
+    }
+
+    /// Issue #590: the agent in `worker_pane_id` has just been REPLACED —
+    /// `pane restart` or a `clear = true` delegate respawned it — so retire every
+    /// commission only that agent could have answered. Returns how many were
+    /// retired. Call it while holding the pane's `pane_dispatch_lock`.
+    ///
+    /// Under that lock, the pane's armed commissions fall into three groups:
+    ///
+    /// 1. **In flight** — armed, but their dispatch task has not taken the lock
+    ///    yet ([`CommissionDispatchInFlight`]). Their pointer will be written to
+    ///    the replacement, so the replacement owes them. Kept.
+    /// 2. **The caller's own**, when the caller is a `clear = true` dispatch
+    ///    (`keep_own`): it holds the lock and will deliver to the replacement
+    ///    it just spawned. Kept — sweeping it is exactly what the respawn path's
+    ///    refusal to call `begin_pane_close` exists to avoid.
+    /// 3. **Everything else** — armed by a dispatch that has already held the
+    ///    lock and either wrote its pointer to the previous occupant or released
+    ///    its commission on the way out. Only the previous occupant could answer
+    ///    these, and it is gone. Retired.
+    ///
+    /// Without this, `pane restart --force` — in practice the only way an
+    /// orchestrator can cancel in-flight work — left the cancelled task's
+    /// commission standing: undischargeable, reported as a silent worker hours
+    /// later, and (issue #580) refusing every later delegate to the role.
+    ///
+    /// Retires the OLDEST commissions: the ones kept are the newest, which is
+    /// the fail-safe direction for their expiry (see [`DelegationCommission`]).
+    /// What this cannot see is a completion the replaced agent wrote before it
+    /// died but that is processed after this runs; that one is labelled
+    /// unsolicited, which is what a cancelled task's completion is.
+    pub fn retire_commissions_of_replaced_agent(
+        &self,
+        worker_pane_id: &str,
+        keep_own: bool,
+    ) -> u32 {
+        let mut tracker = self.delegations.lock().unwrap();
+        let in_flight = tracker
+            .commission_dispatches_in_flight
+            .get(worker_pane_id)
+            .copied()
+            .unwrap_or(0);
+        let keep = in_flight.saturating_add(u32::from(keep_own));
+        let Some(entry) = tracker.commissions.get_mut(worker_pane_id) else {
+            return 0;
+        };
+        let retired = entry.outstanding().saturating_sub(keep);
+        for _ in 0..retired {
+            entry.pop_oldest();
+        }
+        if entry.outstanding() == 0 {
+            tracker.commissions.remove(worker_pane_id);
+        }
+        retired
     }
 
     /// PRD #249 M3 review (finding B4): a `work-done` arrived from
@@ -15791,6 +16118,18 @@ mod spawn_tests {
         registry.shutdown_all();
     }
 
+    /// Arm one commission the way every delegate did before issue #580 — with
+    /// `supersede`, so a second one to the same worker counts rather than being
+    /// refused — and report whether it was recorded. The in-flight guard is
+    /// dropped at once, as a dispatch task that has taken the pane lock would.
+    fn arm_commission(reg: &Arc<AgentPtyRegistry>, worker: &str, orch: &str) -> bool {
+        match reg.arm_delegation_commission(worker, orch, true) {
+            CommissionArm::Armed { .. } => true,
+            CommissionArm::Closing => false,
+            CommissionArm::Busy { .. } => panic!("a superseding arm is never refused as busy"),
+        }
+    }
+
     /// Issue #448: the commission ledger answers "did the orchestrator ask for
     /// this?" on its own, so it counts delegations rather than tracking the newest
     /// — two unanswered delegations are two commissions, and only a completion
@@ -15804,8 +16143,8 @@ mod spawn_tests {
             "a worker nobody delegated to owes nothing"
         );
 
-        assert!(reg.arm_delegation_commission("worker", "orch"));
-        assert!(reg.arm_delegation_commission("worker", "orch"));
+        assert!(arm_commission(&reg, "worker", "orch"));
+        assert!(arm_commission(&reg, "worker", "orch"));
         assert_eq!(
             reg.retire_delegation_commission("worker"),
             WorkDoneProvenance::Solicited { remaining: 1 },
@@ -15837,7 +16176,7 @@ mod spawn_tests {
         );
 
         // One delegate, undelivered: the ledger must not keep the debt.
-        assert!(reg.arm_delegation_commission("worker", "orch"));
+        assert!(arm_commission(&reg, "worker", "orch"));
         assert!(reg.release_delegation_commission("worker"));
         assert_eq!(
             reg.retire_delegation_commission("worker"),
@@ -15847,8 +16186,8 @@ mod spawn_tests {
         );
 
         // Two delegates, only the second undelivered: the first is still owed.
-        assert!(reg.arm_delegation_commission("worker", "orch"));
-        assert!(reg.arm_delegation_commission("worker", "orch"));
+        assert!(arm_commission(&reg, "worker", "orch"));
+        assert!(arm_commission(&reg, "worker", "orch"));
         assert!(reg.release_delegation_commission("worker"));
         assert_eq!(
             reg.retire_delegation_commission("worker"),
@@ -15870,8 +16209,8 @@ mod spawn_tests {
     #[test]
     fn commission_ledger_is_swept_by_either_panes_close_and_refuses_mid_close() {
         let reg = Arc::new(AgentPtyRegistry::new());
-        assert!(reg.arm_delegation_commission("worker-a", "orch-1"));
-        assert!(reg.arm_delegation_commission("worker-b", "orch-2"));
+        assert!(arm_commission(&reg, "worker-a", "orch-1"));
+        assert!(arm_commission(&reg, "worker-b", "orch-2"));
 
         // Closing the ORCHESTRATOR clears what was owed to it; an unrelated
         // orchestration's commission survives.
@@ -15892,19 +16231,241 @@ mod spawn_tests {
         // completion into a solicited one.
         assert!(reg.is_pane_closing("orch-1"));
         assert!(
-            !reg.arm_delegation_commission("worker-a", "orch-1"),
+            !arm_commission(&reg, "worker-a", "orch-1"),
             "a closing orchestrator must not accept new commissions"
         );
-        assert!(reg.arm_delegation_commission("worker-a", "orch-live"));
+        assert!(arm_commission(&reg, "worker-a", "orch-live"));
         drop(reg.begin_pane_close("worker-a"));
         assert!(
-            !reg.arm_delegation_commission("worker-a", "orch-live"),
+            !arm_commission(&reg, "worker-a", "orch-live"),
             "a closing worker must not accept new commissions"
         );
         assert_eq!(
             reg.retire_delegation_commission("worker-a"),
             WorkDoneProvenance::Unsolicited,
             "the worker's own close swept its ledger entry too"
+        );
+    }
+
+    /// Issue #590: a commission expires on its own age, measured from when it
+    /// was armed, and not a moment before — expiring early relabels a genuine
+    /// completion as unsolicited, which is the worse of the two failure
+    /// directions.
+    #[test]
+    fn commission_ledger_expires_a_commission_on_its_own_age() {
+        let reg = Arc::new(AgentPtyRegistry::new());
+        let t0 = Instant::now();
+        let second = Duration::from_secs(1);
+
+        assert!(matches!(
+            reg.arm_delegation_commission_at("worker", "orch", false, t0),
+            CommissionArm::Armed { superseded: 0, .. }
+        ));
+        assert_eq!(
+            reg.retire_delegation_commission_at("worker", t0 + DELEGATION_COMMISSION_TTL - second),
+            WorkDoneProvenance::Solicited { remaining: 0 },
+            "one second short of the TTL the commission is still owed"
+        );
+
+        assert!(matches!(
+            reg.arm_delegation_commission_at("worker", "orch", false, t0),
+            CommissionArm::Armed { .. }
+        ));
+        assert_eq!(
+            reg.retire_delegation_commission_at("worker", t0 + DELEGATION_COMMISSION_TTL),
+            WorkDoneProvenance::Unsolicited,
+            "at the TTL the commission has expired, so a completion arriving now is not \
+             laundered into a solicited one"
+        );
+    }
+
+    /// Issue #590: each commission expires on ITS OWN age. A young commission
+    /// must survive an old one expiring beside it, and the survivor must be the
+    /// one carrying the newest arm time.
+    #[test]
+    fn commission_ledger_expiry_keeps_a_younger_commission() {
+        let reg = Arc::new(AgentPtyRegistry::new());
+        let t0 = Instant::now();
+        let day = Duration::from_secs(24 * 60 * 60);
+
+        assert!(matches!(
+            reg.arm_delegation_commission_at("worker", "orch", false, t0),
+            CommissionArm::Armed { .. }
+        ));
+        assert!(matches!(
+            reg.arm_delegation_commission_at("worker", "orch", true, t0 + 3 * day),
+            CommissionArm::Armed { superseded: 1, .. }
+        ));
+        let after_first_expiry = t0 + DELEGATION_COMMISSION_TTL + day;
+        assert_eq!(
+            reg.retire_delegation_commission_at("worker", after_first_expiry),
+            WorkDoneProvenance::Solicited { remaining: 0 },
+            "the older commission expired; the one armed three days later is still owed"
+        );
+        assert_eq!(
+            reg.retire_delegation_commission_at("worker", after_first_expiry),
+            WorkDoneProvenance::Unsolicited
+        );
+
+        // A credited completion drops the OLDEST arm time, so the survivor keeps
+        // the newest and cannot expire earlier than its own delegation would.
+        assert!(matches!(
+            reg.arm_delegation_commission_at("worker", "orch", false, t0),
+            CommissionArm::Armed { .. }
+        ));
+        assert!(matches!(
+            reg.arm_delegation_commission_at("worker", "orch", true, t0 + 3 * day),
+            CommissionArm::Armed { .. }
+        ));
+        assert_eq!(
+            reg.retire_delegation_commission_at("worker", t0 + day),
+            WorkDoneProvenance::Solicited { remaining: 1 }
+        );
+        assert_eq!(
+            reg.retire_delegation_commission_at("worker", t0 + DELEGATION_COMMISSION_TTL + day),
+            WorkDoneProvenance::Solicited { remaining: 0 },
+            "the survivor carries the day-3 arm time, so it is still owed on day 8"
+        );
+    }
+
+    /// Issue #580: a delegate to a worker that still owes a `work-done` is
+    /// refused unless it supersedes, and a refusal records nothing. Issue #590
+    /// is what keeps that refusal from lasting for ever: once the stranded
+    /// commission expires, the worker takes a plain delegate again.
+    #[test]
+    fn commission_ledger_refuses_a_busy_worker_until_superseded_or_expired() {
+        let reg = Arc::new(AgentPtyRegistry::new());
+        let t0 = Instant::now();
+        let minute = Duration::from_secs(60);
+
+        assert!(matches!(
+            reg.arm_delegation_commission_at("worker", "orch", false, t0),
+            CommissionArm::Armed { superseded: 0, .. }
+        ));
+        match reg.arm_delegation_commission_at("worker", "orch", false, t0 + 5 * minute) {
+            CommissionArm::Busy {
+                outstanding,
+                oldest_age,
+            } => {
+                assert_eq!(outstanding, 1);
+                assert_eq!(oldest_age, 5 * minute);
+            }
+            other => panic!("a second plain delegate must be refused as busy, got {other:?}"),
+        }
+        match reg.arm_delegation_commission_at("worker", "orch", true, t0 + 6 * minute) {
+            CommissionArm::Armed {
+                superseded,
+                superseded_oldest_age,
+                ..
+            } => {
+                assert_eq!(superseded, 1, "the refusal above recorded nothing");
+                assert_eq!(superseded_oldest_age, 6 * minute);
+            }
+            other => panic!("--supersede must dispatch, got {other:?}"),
+        }
+        assert!(
+            matches!(
+                reg.arm_delegation_commission_at(
+                    "worker",
+                    "orch",
+                    false,
+                    t0 + 6 * minute + DELEGATION_COMMISSION_TTL
+                ),
+                CommissionArm::Armed { superseded: 0, .. }
+            ),
+            "both stranded commissions expired, so a plain delegate is accepted again"
+        );
+        // Another worker is unaffected by this one's debt.
+        assert!(matches!(
+            reg.arm_delegation_commission_at("other", "orch", false, t0),
+            CommissionArm::Armed { superseded: 0, .. }
+        ));
+    }
+
+    /// Issue #590: replacing a worker's agent retires what only the replaced
+    /// agent could answer, and keeps what will be delivered to its replacement —
+    /// a dispatch still queued behind the pane lock, and (for a `clear = true`
+    /// dispatch) the caller's own commission.
+    #[test]
+    fn commission_ledger_retires_only_what_a_replaced_agent_owed() {
+        let reg = Arc::new(AgentPtyRegistry::new());
+
+        // Delivered to the previous occupant: its dispatch took the lock (the
+        // guard is dropped) and wrote the pointer.
+        assert!(arm_commission(&reg, "worker", "orch"));
+        // Still queued behind the lock: its guard is alive.
+        let queued = match reg.arm_delegation_commission("worker", "orch", true) {
+            CommissionArm::Armed { in_flight, .. } => in_flight,
+            other => panic!("expected an armed commission, got {other:?}"),
+        };
+        assert_eq!(
+            reg.retire_commissions_of_replaced_agent("worker", false),
+            1,
+            "`pane restart` retires the delivered commission and keeps the queued one"
+        );
+        drop(queued);
+        assert_eq!(
+            reg.retire_delegation_commission("worker"),
+            WorkDoneProvenance::Solicited { remaining: 0 },
+            "the queued delegate's commission survived the restart"
+        );
+
+        // A `clear = true` dispatch holding the lock keeps its own.
+        assert!(arm_commission(&reg, "worker", "orch"));
+        assert!(arm_commission(&reg, "worker", "orch"));
+        assert_eq!(reg.retire_commissions_of_replaced_agent("worker", true), 1);
+        assert_eq!(
+            reg.retire_delegation_commission("worker"),
+            WorkDoneProvenance::Solicited { remaining: 0 }
+        );
+        assert_eq!(
+            reg.retire_commissions_of_replaced_agent("worker", false),
+            0,
+            "nothing owed, nothing retired"
+        );
+
+        // `keep_own` when the caller's commission was never armed (a mid-close
+        // pane) keeps one that is not its own — fail-safe, never early.
+        assert!(arm_commission(&reg, "worker", "orch"));
+        assert_eq!(reg.retire_commissions_of_replaced_agent("worker", true), 0);
+    }
+
+    /// Issue #590: past [`MAX_TIMED_COMMISSIONS`] the count stays exact, and the
+    /// folded-away commissions — older than every timed one — expire with the
+    /// first timed one to expire, never before.
+    #[test]
+    fn commission_ledger_count_stays_exact_past_the_timed_cap() {
+        let reg = Arc::new(AgentPtyRegistry::new());
+        let t0 = Instant::now();
+        let second = Duration::from_secs(1);
+        let total = MAX_TIMED_COMMISSIONS as u32 + 3;
+        for i in 0..total {
+            assert!(matches!(
+                reg.arm_delegation_commission_at("worker", "orch", true, t0 + second * i),
+                CommissionArm::Armed { superseded, .. } if superseded == i
+            ));
+        }
+        // The three untimed are the oldest; the timed front was armed at t0+3s.
+        // At t0+TTL+2s the timed front is young, so nothing expires.
+        assert_eq!(
+            reg.retire_delegation_commission_at(
+                "worker",
+                t0 + DELEGATION_COMMISSION_TTL + 2 * second
+            ),
+            WorkDoneProvenance::Solicited {
+                remaining: total - 1
+            }
+        );
+        // At t0+TTL+3s the timed front (t0+3s) expires, and the two untimed left
+        // with it — they are older.
+        assert_eq!(
+            reg.retire_delegation_commission_at(
+                "worker",
+                t0 + DELEGATION_COMMISSION_TTL + 3 * second
+            ),
+            WorkDoneProvenance::Solicited {
+                remaining: MAX_TIMED_COMMISSIONS as u32 - 2
+            }
         );
     }
 

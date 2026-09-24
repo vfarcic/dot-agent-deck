@@ -192,6 +192,8 @@ pub fn build_orchestrator_context(config: &OrchestrationConfig) -> String {
          Your only job: understand what needs doing, frame clear task descriptions, and hand off.\n\n\
          Never send a new task to a worker that is still working on a previous task. \
          Wait for its work-done signal before delegating again to the same worker. \
+         The daemon enforces this: a delegate to a worker that still owes a work-done is \
+         refused, and the refusal names the worker and what to do. \
          Delegating to different workers in parallel is fine.\n\n\
          Delegation is one-way: orchestrator → worker. Workers NEVER delegate to other workers \
          — a `{bin} delegate` call from inside a worker does not route back through your \

@@ -5785,6 +5785,7 @@ mod hook_ingestion_tests {
                 pane_id: claimed_pane.to_string(),
                 task: "PROVENANCE-TASK".to_string(),
                 to: vec!["worker".to_string()],
+                supersede: false,
                 timestamp: chrono::Utc::now(),
                 token: token.map(str::to_string),
             });

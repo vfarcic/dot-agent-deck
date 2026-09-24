@@ -331,6 +331,12 @@ impl IdleHarness {
             pane_id: ORCH_PANE.to_string(),
             task: "Perform the delegated test task.".to_string(),
             to: roles.iter().map(|role| (*role).to_string()).collect(),
+            // Issue #580: several of these tests re-delegate to a worker that
+            // has not answered, to pin what that does to the idle detector.
+            // Without `supersede` the daemon now refuses such a delegate before
+            // any watch is armed; superseding keeps every delegate here
+            // dispatched, as all of them were when these tests were written.
+            supersede: true,
             timestamp: chrono::Utc::now(),
             token: None,
         };

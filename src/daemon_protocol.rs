@@ -756,6 +756,14 @@ pub const CONTRACT_BREAKS: &[&str] = &[
     // what the size in an unchanged answer MEANS, which is the definition of a
     // semantic break and precisely what a version number cannot express.
     "1105-focused-client-terminal-size",
+    // Issue #580, at 10 without moving it. A `delegate` to a worker that still
+    // owes a `work-done` for an earlier delegation used to be dispatched; a newer
+    // daemon refuses it unless the caller passes `supersede`. Everything that
+    // moved on the wire is an optional hook-socket field an older build ignores
+    // (`DelegateSignal::supersede`, `DelegateResponse::busy` / `superseded`), and
+    // the hook socket is not what PROTOCOL_VERSION versions anyway. What changed
+    // is which delegates are refused, which a version number cannot express.
+    "580-delegate-refuses-busy-worker",
 ];
 
 /// What comparing this build's [`CONTRACT_BREAKS`] against a peer's found.

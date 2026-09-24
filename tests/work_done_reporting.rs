@@ -195,6 +195,7 @@ impl WorkDoneHarness {
                     pane_id: ORCH_PANE.to_string(),
                     task: "Perform the delegated test task.".to_string(),
                     to: vec![WORKER_ROLE.to_string()],
+                    supersede: false,
                     timestamp: chrono::Utc::now(),
                     token: None,
                 },
