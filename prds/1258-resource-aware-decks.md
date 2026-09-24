@@ -4,6 +4,7 @@
 **Priority**: Medium
 **Created**: 2026-09-23
 **Issue**: [#1258](https://github.com/vfarcic/dot-agent-deck/issues/1258)
+**Related**: [#1264](https://github.com/vfarcic/dot-agent-deck/issues/1264) (cross-deck dispatch — consumes this PRD's verdict over daemon-to-daemon links; amended 2026-09-24 to move the verdict into the daemon for it)
 
 ## Problem Statement
 
@@ -22,7 +23,7 @@ Each daemon serves **its own host's** utilisation, and the clients present it:
 1. **The daemon measures and serves.** A capability-gated request returns disk, CPU load and memory for the host the daemon runs on. It is the only component that can: the TUI may be attached over ssh, and the desktop may be on a different machine entirely from the deck it is driving.
 2. **The TUI shows one host**, in an overlay on a keybinding — the host of the daemon it is attached to, because a TUI attaches to exactly one at a time (`Endpoint` is a single `Local`/`Remote` choice, not a map).
 3. **The desktop compares decks**, because it is the component that holds several. Cross-deck comparison belongs here and nowhere else.
-4. **Starting an agent recommends a deck and defaults to it.** The New agent flow (PRD #1223) and `dispatch` pre-select a deck that has headroom, say why, and let the user choose otherwise. Advisory, never automatic.
+4. **Starting an agent recommends a deck and defaults to it.** The New agent flow (PRD #1223) pre-selects a deck that has headroom, says why, and lets the user choose otherwise — advisory, never automatic. `dispatch` reports the verdict for its own deck. Choosing a *different* deck from `dispatch` is PRD #1264's, because `dispatch` today can only place a unit on the deck it runs on (`handle_dispatch` cuts the worktree beside the dispatcher's own checkout and spawns through its own daemon's registry).
 
 Four commitments shape it.
 
@@ -34,13 +35,15 @@ Four commitments shape it.
 
 **The recommendation is a headroom test, not a score.** Cost here is bursty: a cold build saturates every core for minutes and then stops, so an instantaneous average ranks badly. A deck qualifies when it has at least one unit's disk headroom and is under a load ceiling; the answer is a qualified/not-qualified verdict with the reason, and "no deck qualifies" is a first-class outcome that says what is short rather than picking the least bad.
 
+**The daemon computes the verdict, not the client.** Each daemon judges its own host against its own configured thresholds and serves the verdict, with its reason, beside the raw numbers. Clients compare and display verdicts and never re-derive one. Two consumers need it this way: the desktop, which compares decks, and PRD #1264, where a dispatcher's daemon asks peer daemons for their verdict with no client involved at all — a verdict computed in the desktop would be unreachable there, and a TUI-started or scheduled dispatcher would have none.
+
 ## What the user sees
 
 **In the TUI.** A keybinding opens an overlay over the current deck: disk free and total for each watched path, load per core against the core count, memory used and available, and how old the sample is. Escape closes it. It describes the host this deck runs on, and says so — a user attached to a remote deck is looking at the remote machine.
 
 **In the desktop.** Each deck on the overview carries its own utilisation, so several hosts are visible at once, and a deck whose daemon is too old to answer says exactly that instead of showing zeros.
 
-**When starting an agent.** The deck step of the New agent flow marks each deck with whether it has room, defaults to a deck that does, and states the reason next to it ("412G free, load 1.2/16"). Choosing a deck with no headroom is possible and warns rather than blocks. `dispatch` prints the same verdict for the deck it is about to use.
+**When starting an agent.** The deck step of the New agent flow marks each deck with whether it has room, defaults to a deck that does, and states the reason next to it ("412G free, load 1.2/16"). Choosing a deck with no headroom is possible and warns rather than blocks. `dispatch` prints the same verdict for its own deck, the only one it can use until PRD #1264.
 
 ## Scope
 
@@ -50,13 +53,13 @@ Four commitments shape it.
 - Consolidating the two existing `machine_load_per_cpu` implementations into the one the daemon uses.
 - The TUI overlay and its keybinding, with the customisation path every other binding has.
 - The desktop's per-deck display and cross-deck comparison.
-- The headroom verdict, and its use as a default in the New agent flow and in `dispatch`.
+- The headroom verdict, computed by each daemon for its own host, and its use as a default in the New agent flow and as a report in `dispatch`.
 - Degradation against a deck whose daemon does not advertise the capability.
 
 ### Out of scope
 
 - **Per-agent attribution** — deferred to iteration 3 and argued there rather than assumed. It is materially harder than host totals: an agent's descendants `setsid` out of its process group, which CLAUDE.md rule 14 records as measured (an escapee found at `PPID 1` four days after its owner died), so a naive per-pane rollup undercounts in exactly the case that matters — an agent that started a build. Iteration 1 and 2 show the *host's* numbers for a selected agent and label them as such.
-- **Automatic placement.** The recommendation never routes a spawn by itself. The heuristic is unproven; a wrong advisory costs a glance, a wrong auto-route costs a run and is invisible until it fails.
+- **Automatic placement.** The recommendation never routes a spawn by itself. The heuristic is unproven; a wrong advisory costs a glance, a wrong auto-route costs a run and is invisible until it fails. PRD #1264's `dispatch --deck auto` is where a verdict does route a spawn, only when the calling agent names `auto` explicitly; that argument is #1264's to make, and nothing in this PRD's own flows depends on it.
 - **History, graphs, alerting.** One current sample, no time series, no thresholds that notify.
 - **Windows.** The daemon reports `Unsupported` there (`docs/installation.md`), so the sampler is Unix.
 - **Per-process memory accounting for the deck itself**, cgroup/container awareness, and GPU.
@@ -64,7 +67,7 @@ Four commitments shape it.
 ## Design decisions and constraints
 
 - **No `PROTOCOL_VERSION` bump.** The request is a new `AttachRequest` variant gated on a new capability (`CAP_HOST_METRICS`), with the check in the client library rather than in each caller — the documented exception in `src/daemon_protocol.rs` and the `focus-gained` precedent (PRD #1105). Rule 12's question is answered explicitly in the PR, and the cross-version test is run. A **semantic** break is not expected, but the question is asked rather than assumed.
-- **The daemon serves every fact.** Clients derive no path and read no `/proc` of their own, which is PRD #819's rule and what linkage-check rule 12 guards.
+- **The daemon serves every fact.** Clients derive no path and read no `/proc` of their own, which is PRD #819's rule and what linkage-check rule 12 guards. The verdict is one of those facts: the daemon serves it, and no client implements the rule that produces it.
 - **Numbers, not paths.** The response carries free/total bytes per *named role* (`working_root`, `worktree_parent`, `temp_root`), not absolute paths: a remote deck's directory layout is not the client's business, and a path is the part of this that could leak something.
 - **Freshness is explicit.** Every response states the age of its sample, and the client shows it. A stale number presented as current is the defect class this repo keeps finding.
 - **Degradation is designed, not discovered.** A deck that does not advertise the capability shows "not available from this deck" everywhere it would otherwise show numbers, and never qualifies or disqualifies itself in the recommendation.
@@ -80,8 +83,8 @@ Four commitments shape it.
 ### Iteration 2 — several decks, and the recommendation
 
 - [ ] **M4 — The desktop surface.** Per-deck utilisation on the overview, several hosts at once, and the "not available from this deck" state for an older daemon. A Playwright spec for the surface.
-- [ ] **M5 — The headroom verdict.** A qualified/not-qualified answer per deck with its reason, derived from disk headroom and a load ceiling, both configurable and both defaulting to values taken from the measurements in this document rather than invented. "No deck qualifies" states what is short.
-- [ ] **M6 — Recommend and default.** The New agent flow's deck step and `dispatch` pre-select a qualifying deck and show the reason; choosing another warns and proceeds. An L2 test for the TUI/dispatch path and a Playwright spec for the desktop one.
+- [ ] **M5 — The headroom verdict.** A qualified/not-qualified answer with its reason, computed by each daemon for its own host and served beside the numbers behind the same capability gate, derived from disk headroom and a load ceiling, both configurable per deck and both defaulting to values taken from the measurements in this document rather than invented. Clients display it and never recompute it. "No deck qualifies" states what is short. PRD #1264's `--deck auto` is blocked on this milestone.
+- [ ] **M6 — Recommend and default.** The New agent flow's deck step pre-selects a qualifying deck and shows the reason; choosing another warns and proceeds. `dispatch` states its own deck's verdict in its acknowledgement; choosing among decks from `dispatch` is PRD #1264. An L2 test for the TUI/dispatch path and a Playwright spec for the desktop one.
 
 ### Iteration 3 — verified, documented, and the harder half
 
@@ -99,8 +102,8 @@ Four commitments shape it.
 ## Open questions
 
 1. **Where do the watched paths come from?** The deck's working root is known; the worktree parent is `..` by convention (`../<repo>-dispatch-<name>`); the temp root may be moved by `DAD_E2E_TMPDIR`. Are these three fixed roles, or configurable?
-2. **What is "one unit's disk headroom"?** The `/issue-queue` skill says ~90G from observed `target/` sizes of 70–108G. Is that the default, and is it per-deck configurable?
-3. **Does `dispatch` warn or refuse below the floor?** This PRD says warn. A refusal with an override flag is the alternative.
+2. **What is "one unit's disk headroom"?** The `/issue-queue` skill says ~90G from observed `target/` sizes of 70–108G. Is that the default? Per-deck configuration is the natural home for it now that each deck computes its own verdict.
+3. **Does `dispatch` warn or refuse below the floor?** This PRD says warn. A refusal with an override flag is the alternative. PRD #1264's `--deck auto` refusing when no deck qualifies is a different case — there the caller asked for a choice to be made.
 4. **Does the TUI overlay show remote decks the user has configured**, or strictly the attached one? Strictly attached is the assumption here.
 
 ## Success criteria
@@ -108,6 +111,7 @@ Four commitments shape it.
 - A daemon reports its host's disk, load and memory, with a sample age, and an older daemon degrades visibly rather than silently.
 - The TUI overlay and the desktop surface both show it, and both name whose host it is.
 - Starting an agent defaults to a deck with headroom and says why, and "no deck qualifies" explains what is short.
+- The verdict is computed and served by the daemon, and no client recomputes it.
 - `PROTOCOL_VERSION` is unchanged, and rule 12's cross-version test has been run and recorded.
 - Exactly one load-average implementation remains in the tree.
 - The sampler's cost is measured and stated, and no new timer was added.
