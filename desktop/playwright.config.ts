@@ -70,8 +70,19 @@ export default defineConfig({
     // under pnpm 12.5.1 a three-test spec exited in 5s; under 12.6.0 the same
     // spec passed and then never exited. `exec` makes the shell itself become
     // the server, so the group Playwright kills is the server's own.
+    //
+    // `exec` is a POSIX shell builtin and `cmd.exe` rejects it, so on Windows
+    // the build would finish and the preview server would never start —
+    // Playwright would then wait for port 4173 until it timed out (Qodo, PR
+    // #1269). CI runs this tier on `ubuntu-latest` only, but the browser tier
+    // needs no daemon, so running it locally on Windows is a reasonable thing
+    // to do and must not be broken by a hang fix for a different platform.
+    // Windows keeps the pre-#1269 form: pnpm's process-group behaviour is what
+    // this works around, and the workaround is only correct where `exec` is.
     command:
-      "./node_modules/.bin/vite build && exec ./node_modules/.bin/vite preview --port 4173 --strictPort --host 127.0.0.1",
+      process.platform === "win32"
+        ? "pnpm exec vite build && pnpm exec vite preview --port 4173 --strictPort --host 127.0.0.1"
+        : "./node_modules/.bin/vite build && exec ./node_modules/.bin/vite preview --port 4173 --strictPort --host 127.0.0.1",
     url: "http://127.0.0.1:4173/",
     // `false` in CI, so a run there always builds and serves its own bundle.
     // Locally it is `true`, and that is the footgun: `--strictPort` only makes
