@@ -33,7 +33,7 @@ Four commitments shape it.
 
 **No second timer.** The daemon already runs an idle monitor on a 500 ms tick with a `MAX_TABLE_AGE` freshness bound, and #1237 has just made that sampling deterministic. Host metrics are sampled on demand into a cache with a stated maximum age, on the same discipline — not on a new independent clock.
 
-**The recommendation is a headroom test, not a score.** Cost here is bursty: a cold build saturates every core for minutes and then stops, so an instantaneous average ranks badly. A deck qualifies when it has at least one unit's disk headroom and is under a load ceiling; the answer is a qualified/not-qualified verdict with the reason, and "no deck qualifies" is a first-class outcome that says what is short rather than picking the least bad.
+**The recommendation is a headroom test, not a score.** Cost here is bursty: a cold build saturates every core for minutes and then stops, so an instantaneous average ranks badly. A deck qualifies when it has at least one unit's disk headroom, is under a load ceiling, and has available memory above a floor; the answer is a qualified/not-qualified verdict with the reason, and "no deck qualifies" is a first-class outcome that says what is short rather than picking the least bad.
 
 **The daemon computes the verdict, not the client.** Each daemon judges its own host against its own configured thresholds and serves the verdict, with its reason, beside the raw numbers. Clients compare and display verdicts and never re-derive one. Two consumers need it this way: the desktop, which compares decks, and PRD #1264, where a dispatcher's daemon asks peer daemons for their verdict with no client involved at all — a verdict computed in the desktop would be unreachable there, and a TUI-started or scheduled dispatcher would have none.
 
@@ -43,7 +43,7 @@ Four commitments shape it.
 
 **In the desktop.** Each deck on the overview carries its own utilisation, so several hosts are visible at once, and a deck whose daemon is too old to answer says exactly that instead of showing zeros.
 
-**When starting an agent.** The deck step of the New agent flow marks each deck with whether it has room, defaults to a deck that does, and states the reason next to it ("412G free, load 1.2/16"). Choosing a deck with no headroom is possible and warns rather than blocks. `dispatch` prints the same verdict for its own deck, the only one it can use until PRD #1264.
+**When starting an agent.** The deck step of the New agent flow marks each deck with whether it has room, defaults to a deck that does, and states the reason next to it ("412G free, load 1.2/16, 38G memory available"). Choosing a deck with no headroom is possible and warns rather than blocks. `dispatch` reports the same verdict for its own deck, the only one it can use until PRD #1264, in the result it writes back into the calling pane.
 
 ## Scope
 
@@ -83,8 +83,8 @@ Four commitments shape it.
 ### Iteration 2 — several decks, and the recommendation
 
 - [ ] **M4 — The desktop surface.** Per-deck utilisation on the overview, several hosts at once, and the "not available from this deck" state for an older daemon. A Playwright spec for the surface.
-- [ ] **M5 — The headroom verdict.** A qualified/not-qualified answer with its reason, computed by each daemon for its own host and served beside the numbers behind the same capability gate, derived from disk headroom and a load ceiling, both configurable per deck and both defaulting to values taken from the measurements in this document rather than invented. Clients display it and never recompute it. The request accepts an optional footprint from the caller — PRD #1264 passes a repository's expected per-unit size — and falls back to the deck's configured headroom floor without one. "No deck qualifies" states what is short. PRD #1264's deck recommendation is blocked on this milestone.
-- [ ] **M6 — Recommend and default.** The New agent flow's deck step pre-selects a qualifying deck and shows the reason; choosing another warns and proceeds. `dispatch` states its own deck's verdict in its acknowledgement; choosing among decks from `dispatch` is PRD #1264. An L2 test for the TUI/dispatch path and a Playwright spec for the desktop one.
+- [ ] **M5 — The headroom verdict.** A qualified/not-qualified answer with its reason, computed by each daemon for its own host and served beside the numbers behind the same capability gate, derived from disk headroom, a load ceiling and an available-memory floor, all three configurable per deck. The disk and load defaults are taken from the measurements in this document rather than invented; this document holds no measured memory figure, so the memory default is open question 5 and is settled from a measurement before M5 ships. Memory is in the verdict because rule 14's `SIGKILL`-ed `rustc` is a memory failure a deck with ample disk and low load can still produce. Clients display it and never recompute it. The request accepts an optional footprint from the caller — PRD #1264 passes a repository's expected per-unit size — and falls back to the deck's configured headroom floor without one. "No deck qualifies" states what is short. PRD #1264's deck recommendation is blocked on this milestone.
+- [ ] **M6 — Recommend and default.** The New agent flow's deck step pre-selects a qualifying deck and shows the reason; choosing another warns and proceeds. `dispatch` states its own deck's verdict in the result `handle_dispatch` writes back into the calling pane — not in the `SignalAck`, which the daemon sends before the handler runs and which claims only admission past the provenance gate (`src/event.rs`). Choosing among decks from `dispatch` is PRD #1264. An L2 test for the TUI path, one asserting the verdict arrives in the calling pane's dispatch result, and a Playwright spec for the desktop one.
 
 ### Iteration 3 — verified, documented, and the harder half
 
@@ -105,6 +105,7 @@ Four commitments shape it.
 2. **What is "one unit's disk headroom"?** The `/issue-queue` skill says ~90G from observed `target/` sizes of 70–108G. Is that the default? Per-deck configuration is the natural home for it now that each deck computes its own verdict.
 3. **Does `dispatch` warn or refuse below the floor?** This PRD says warn. A refusal with an override flag is the alternative. PRD #1264's recommendation reporting that no deck qualifies is a different case — there the caller asked for a choice to be made.
 4. **Does the TUI overlay show remote decks the user has configured**, or strictly the attached one? Strictly attached is the assumption here.
+5. **What is the default available-memory floor?** No incident recorded here gives a number. The current dev box's `/tmp` is a 14 GB RAM-backed tmpfs (rule 14), which bounds how much a scratchpad can take, but the floor should come from measured peak `rustc`/link memory for an `--features e2e` build, not from that.
 
 ## Success criteria
 
