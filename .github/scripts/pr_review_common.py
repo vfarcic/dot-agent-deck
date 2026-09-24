@@ -714,9 +714,15 @@ def bot_rejection_is_stale(reviews, sha):
     no App credential and cannot ask who it is. That is sound here for a reason
     rather than by luck: a human's changes-requested must keep parking the pull
     request (it is someone else's homework, and re-deriving a verdict talks over
-    them mid-fix), and the only other bot reviewing here posts `COMMENTED` and
-    never `CHANGES_REQUESTED`. The vote job, which does know its own login, is
-    stricter still.
+    them mid-fix), and the other reviewing bots post `COMMENTED` rather than
+    `CHANGES_REQUESTED`. That last clause said "the only other bot" while there
+    were two -- Qodo joined Greptile on 2026-09-23 -- so it is worth having the
+    evidence rather than the quantifier: across the reviews on #1235, #1257,
+    #1259, #1265, #1268, #1271, #1274 and #1276 on 2026-09-24, Qodo and Greptile
+    posted 7 `COMMENTED` reviews each and no `CHANGES_REQUESTED` between them.
+    A third app that did reject would have its rejection treated as stale once
+    the head moved, which is the same bargain this function already strikes with
+    its own. The vote job, which does know its own login, is stricter still.
 
     Dismissed reviews are ignored: a dismissal has already released the pull
     request, so it is not what is holding it.
