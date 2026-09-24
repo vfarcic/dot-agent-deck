@@ -1033,6 +1033,14 @@ fn inject_lifetime_tag(cmd: &mut StdCommand) -> Option<crate::lifetime_tag::Life
 /// It is itself bounded by deadline + grace and holds no descriptor, so it can
 /// never become the leak it exists to prevent.
 ///
+/// **It is forked after `spawn` returns, so there is a window with no reaper.**
+/// The child is already running by then, and a wrapper `SIGKILL`ed before this
+/// fork completes leaves nothing holding the deadline. On the PTY path the
+/// inner master's hangup still ends the child; on the pipe path the child sees
+/// at most an EOF on its stdin, which ends only a child that reads it.
+/// The window is one scheduling gap wide rather than zero, and issue #963 is a
+/// test that used to land its `SIGKILL` inside it under CI load.
+///
 /// **Telling a reaper apart from the leak it hunts.** It is a `fork` of this
 /// wrapper, so it keeps the wrapper's argv and shows up in `ps` looking like a
 /// second `dot-agent-deck wrap --agent … -- …` at `ppid=1`. Given #657 is partly
@@ -2203,7 +2211,9 @@ fn run_wrap_pty(
     // The session has begun — surface the card immediately. PRD #225 M3: this is
     // a CARD-SURFACING signal, not a readiness signal (the child may still be
     // `devbox`/a shell for seconds before the agent TUI exists), so it carries
-    // the wrapper-fork origin marker.
+    // the wrapper-fork origin marker. Keep it AFTER `arm_child_group_backstop`:
+    // `tests/wrap_io.rs`'s stranded-child probe reads it as proof the reaper is
+    // forked before it SIGKILLs this wrapper (issue #963).
     emitter.emit_fork_session_start();
 
     // Raw-mode the outer terminal ONLY when stdin is itself a terminal, so
@@ -2504,6 +2514,7 @@ fn run_wrap_pipe(
 
     // PRD #225 M3: same fork-time card-surfacing event as the PTY path, and the
     // same marker — it says "a session exists", not "the agent is ready".
+    // After the arm above for the same reason as there (issue #963).
     emitter.emit_fork_session_start();
 
     let child_stdout = child.stdout.take().expect("piped child stdout");
