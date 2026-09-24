@@ -201,6 +201,13 @@ pub struct PrepBinding {
     /// the same check, and the half that also catches an in-place rewrite that
     /// keeps the inode (a shell `>` redirect, another tool's `fs::write`).
     pub context_digest: String,
+    /// PRD #1223 M6: the one-line coordinator prompt this preparation composed
+    /// ([`crate::event::PreparedWorkflow::prompt`]), kept so a prepared start
+    /// that opts into the role's configured command can seed a **Pi** start role
+    /// natively — the TUI's PRD #201 delivery — without the client handing the
+    /// line back. Not a check: nothing is compared against it. It is the same
+    /// string the reply already carried to the client that prepared.
+    pub coordinator_prompt: String,
 }
 
 /// One live record.
@@ -338,6 +345,7 @@ mod tests {
             context_path: PathBuf::from(dir).join(".dot-agent-deck/orchestrator-context.md"),
             context_identity: Some(InodeIdentity { dev: 1, ino: 3 }),
             context_digest: "ctx-fnv1a128-00".to_string(),
+            coordinator_prompt: "Read .dot-agent-deck/orchestrator-context.md".to_string(),
         }
     }
 

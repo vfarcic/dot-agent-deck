@@ -19,6 +19,18 @@ dot-agent-deck config get default_command
 
 When `default_command` is **unset or empty**, the new-pane form's Command field is instead pre-filled with your **last command** — the most recent command you launched from the new-agent form, in any mode (schedule / issue-dispatch authoring included). This value is global, persists across deck restarts, and is only ever pre-filled into the editable field (never auto-run), so you can edit or clear it before you submit. On a fresh install — where you have never launched a command from the form — the field starts blank. An explicit `default_command` always takes precedence over this last-command fallback.
 
+## Default Directory
+
+```bash
+# The directory agent creation starts browsing in on this deck
+dot-agent-deck config set default_dir "/home/me/reports"
+
+# Unset it (browsing starts where it did before)
+dot-agent-deck config set default_dir ""
+```
+
+`default_dir` is a setting of the deck: the directory that creating an agent on this deck starts browsing in — useful when most of your agents here are started in the same place. Both clients honour it. The TUI's `Ctrl+n` directory picker, and its **Add** in the Scheduled Tasks manager, open there; so does the desktop app's **New agent** dialog. Editing a scheduled task still opens at that task's own directory. It is a starting point, not a limit: `..` still walks above it. It must be an absolute path; `config set` refuses anything else. It lives in the deck's own config file, beside `default_command`, so a remote deck uses the value in *its* config file, not yours — the TUI runs on the deck's host even when you `connect` to it, and the desktop asks the deck for it. If the value is unset, or the directory is missing, is not a directory, or cannot be opened, nothing fails: the TUI's picker opens in the directory you launched the TUI from, and the desktop's dialog in your home directory on that deck, as they do without the setting.
+
 ## Environment Variables
 
 | Variable | Default | Description |

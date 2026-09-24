@@ -205,6 +205,13 @@ pub const MAX_ENUMERATION_CANDIDATES: usize = 32;
 /// duration, and no such claim is made: a `stat` on an unresponsive network
 /// mount takes as long as it takes, which is the availability limit this bound
 /// contains rather than removes.
+///
+/// PRD #1223's `list-directories` and `new-agent-options` arms do NOT take these
+/// permits. They first did (the listing) or took none (the options query), and
+/// audit A4 moved both into a pool of their own,
+/// [`crate::new_agent_options::MAX_CONCURRENT_NEW_AGENT_QUERIES`], taken with
+/// try-acquire and refused as busy when full, so a burst of slow listings
+/// cannot hold the permits this module's verbs queue for.
 pub const MAX_CONCURRENT_PROJECT_READS: usize = 4;
 
 // ---------------------------------------------------------------------------
@@ -1171,6 +1178,7 @@ pub fn prepare_workflow_for_wire(
         context_path: prepared.context_path.clone(),
         context_identity: prepared.context_identity,
         context_digest: context_digest(&prepared.content),
+        coordinator_prompt: prepared.prompt.clone(),
     });
 
     Ok(crate::event::PreparedWorkflow {
@@ -1307,6 +1315,8 @@ fn revalidate_approved_roles(
         .map(|role| ApprovedRole {
             name: role.name.clone(),
             start: role.start,
+            command: role.command.clone(),
+            agent_type: role.resolved_agent_type(),
         })
         .collect();
 
@@ -1321,12 +1331,37 @@ fn revalidate_approved_roles(
 }
 
 /// One role of the orchestration a preparation approved, as the config declares
-/// it: the exact name a spawn must send back, and whether that role is the one
-/// the orchestration starts.
+/// it: the exact name a spawn must send back, whether that role is the one the
+/// orchestration starts, and — for PRD #1223 M6's opted-in start — what the TUI
+/// takes from the role's config when it spawns it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ApprovedRole {
     name: String,
     start: bool,
+    command: String,
+    agent_type: Option<crate::event::AgentType>,
+}
+
+/// PRD #1223 M6: the configured role a prepared start was matched to, as the
+/// config read that just passed every staleness check declares it.
+///
+/// This is what [`verify_prepared_start_role`] hands back so a start that opts
+/// into `use_configured_command` can spawn the role the way the TUI's
+/// orchestration launch does (`src/tab.rs`): `command` is the role's configured
+/// command, `agent_type` its [`crate::project_config::OrchestrationRoleConfig::resolved_agent_type`]
+/// (a declared `agent` wins, else the type the command infers), and `name` /
+/// `start` the identity the request was already matched against.
+///
+/// **Daemon-side only.** It never goes on the wire:
+/// [`crate::event::ProjectRole`]'s note — command strings stay on the machine
+/// the agents run on — is the reason this is a separate type rather than a
+/// widening of that one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedRoleConfig {
+    pub name: String,
+    pub start: bool,
+    pub command: String,
+    pub agent_type: Option<crate::event::AgentType>,
 }
 
 /// Why a preparation no longer describes what it approved.
@@ -1580,6 +1615,9 @@ impl std::fmt::Display for PreparedStartRefusal {
 /// here is **identity** (project, orchestration, role) and not **content**.
 /// Binding the command would also buy nothing this socket protects: a peer that
 /// wants to run an arbitrary command calls `StartAgent` and presents no token.
+/// PRD #1223 M6 added the other direction rather than a binding: a start that
+/// opts into `use_configured_command` sends no command at all and runs the one
+/// [`verify_prepared_start_role`] read from the approved config.
 ///
 /// Nor are `rows`, `cols`, `display_name`, `env`, `agent_type`, `seed`,
 /// `role_index`, `display_title` or `orchestration_id`: each is either
@@ -1602,6 +1640,24 @@ pub fn verify_prepared_start(
     binding: &crate::prep_token::PrepBinding,
     request: &PreparedStartRequest,
 ) -> Result<(), PreparedStartRefusal> {
+    verify_prepared_start_role(binding, request).map(|_| ())
+}
+
+/// [`verify_prepared_start`], answering the configured role the request was
+/// matched to (PRD #1223 M6).
+///
+/// Every check is [`verify_prepared_start`]'s, in the same order, and the role
+/// comes from the **same** config read the staleness checks passed — so a start
+/// that runs the role's configured command runs the command this preparation
+/// approved, never one read again after the config could have moved. That is the
+/// property that keeps an opted-in start inside the existing staleness gate: an
+/// edited config refuses with `stale-preparation`, and no command from it runs.
+///
+/// **Blocking** — the caller goes through [`run_bounded`].
+pub fn verify_prepared_start_role(
+    binding: &crate::prep_token::PrepBinding,
+    request: &PreparedStartRequest,
+) -> Result<PreparedRoleConfig, PreparedStartRefusal> {
     use PreparedStartRefusal::{Mismatch, Stale};
 
     // The prepared directory as the daemon spelled it. `canonicalize_project_dir`
@@ -1634,7 +1690,12 @@ pub fn verify_prepared_start(
     if role.start != membership.is_start_role {
         return Err(Mismatch(PreparationMismatch::StartMarkerDiffers));
     }
-    Ok(())
+    Ok(PreparedRoleConfig {
+        name: role.name.clone(),
+        start: role.start,
+        command: role.command.clone(),
+        agent_type: role.agent_type.clone(),
+    })
 }
 
 /// Read the coordinator context back for [`revalidate_preparation`], under the

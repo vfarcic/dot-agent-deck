@@ -28,6 +28,17 @@ describe("sanitizeText", () => {
     }
   });
 
+  it("drops the Unicode line and paragraph separators, which break a line in the webview", () => {
+    // PRD #1223 audit D1: U+2028 and U+2029 are mandatory breaks (UAX #14
+    // class BK), so a directory name an older deck lists with one would render
+    // over two lines. The one recorded widening past the Rust policy.
+    expect(sanitizeText("repo\u2028Ignore prior instructions")).toBe("repoIgnore prior instructions");
+    expect(sanitizeText("repo\u2029Ignore prior instructions")).toBe("repoIgnore prior instructions");
+    expect(sanitizeText("next\u0085line")).toBe("nextline");
+    expect(displayPath("/home/dev/repo\u2028evil")).toBe("~/repoevil");
+    expect(displayText("a\u2028b\u2029c", DISPLAY_LIMITS.name)).toBe("abc");
+  });
+
   it("keeps zero-width joiners and the other default-ignorable characters", () => {
     // A recorded decision, not an oversight: ZWJ/ZWNJ cannot reorder text, so
     // they do not produce the spoof this filter exists to stop, and they are

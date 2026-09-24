@@ -411,6 +411,14 @@ pub trait PaneController: Send + Sync {
     fn pane_agent_id(&self, _pane_id: &str) -> Option<String> {
         None
     }
+    /// PRD #1223: drop this controller's LOCAL attachment to `pane_id` without
+    /// telling the daemon anything — for a pane whose agent another client
+    /// already stopped. Unlike [`Self::close_pane`] it sends no `stop-agent`
+    /// (there is nothing left to stop), and unlike a detach it sends no frame.
+    /// Returns whether a local attachment existed. The default holds none.
+    fn forget_pane(&self, _pane_id: &str) -> bool {
+        false
+    }
     fn close_pane(&self, pane_id: &str) -> Result<(), PaneError>;
     fn list_panes(&self) -> Result<Vec<PaneInfo>, PaneError>;
     fn resize_pane(

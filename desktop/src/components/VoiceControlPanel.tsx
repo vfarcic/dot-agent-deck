@@ -39,9 +39,9 @@
  * being the single answer to what the app says.
  *
  * The sentences written here are {@link NOTHING_DISPATCHED},
- * {@link SCREEN_MOVED_ON}, {@link VOICE_UNAVAILABLE},
+ * {@link SCREEN_MOVED_ON}, {@link DIALOG_MOVED_ON}, {@link VOICE_UNAVAILABLE},
  * {@link VOICE_CAP_DISCARDED}, {@link VOICE_RELEASE_REFUSED} and
- * {@link VOICE_EMPTY_STATE}. The first two are for situations Rust
+ * {@link VOICE_EMPTY_STATE}. The first three are for situations Rust
  * structurally cannot know about; the rest are about the surface's own state
  * — a release it cannot vouch for, a microphone it has nothing to open, a row
  * with nothing in it yet — rather than about an utterance. See their own
@@ -81,7 +81,7 @@ import { Mic, MicOff, Undo2, X } from "lucide-react";
 import { DISPLAY_LIMITS, displayText } from "../lib/displayText";
 import { VOICE_PEER_PROPS } from "../hooks/useInertBackground";
 import { VOICE_ACTIONS, type VoiceDispatchTarget, type VoicePanelChannel, type VoicePanelContext } from "../lib/voiceActions";
-import type { VoiceCommandDto, VoiceOutcomeDto, VoiceResultDto, VoiceScreen, VoiceStatusDto } from "../lib/bridge";
+import type { VoiceCommandDto, VoiceDirectoriesDto, VoiceNewAgentDto, VoiceOutcomeDto, VoiceResultDto, VoiceScreen, VoiceStatusDto } from "../lib/bridge";
 import type { DeckRuntimeState } from "../types";
 
 /**
@@ -154,6 +154,42 @@ export const NOTHING_DISPATCHED = "That command is not wired to anything in this
  * its place, which reads as the surface having lost the command.
  */
 export const SCREEN_MOVED_ON = "You moved to another screen while that was being worked out, so nothing ran. Say it again here.";
+
+/**
+ * PRD #1223 audit I1 — {@link SCREEN_MOVED_ON}'s case one level down: the
+ * screen stayed put, but the New agent dialog opened or closed, or its form
+ * became live or stopped being live, while the answer was being worked out.
+ *
+ * Opening the dialog leaves the base screen as `overview`, so the screen check
+ * alone let an answer through that Rust grounded under the OTHER declaration —
+ * a `close` or `open_deck` judged by the ordinary token list, dispatched into a
+ * dialog whose own grounding (`heard_as_whole_while`) would have refused it,
+ * and discarding the draft. See {@link sameNewAgentDeclaration} for which
+ * changes count.
+ */
+export const DIALOG_MOVED_ON = "The New agent dialog changed while that was being worked out, so nothing ran. Say it again.";
+
+/**
+ * Whether two New agent declarations are the same CONTEXT for grounding — the
+ * test {@link DIALOG_MOVED_ON} applies to a pending answer.
+ *
+ * Two presences, and they are exactly what the grounding reads: whether the
+ * dialog is declared at all (the `new_agent_dialog` requirement, which selects
+ * `close`'s and `open_deck`'s `heard_as_whole_while` lists) and whether its
+ * form is (`new_agent_form`, which gates the fill rows).
+ *
+ * **Which deck and directory the form is for is deliberately not compared
+ * here.** A move between two live forms changes no requirement, so the answer
+ * was grounded under the rules that still hold; and every row that resolved
+ * against the form's contents is already re-checked against its `{deckId,
+ * path}` by the dialog at dispatch, which refuses in its own, more specific
+ * words (`FORM_MOVED_ON`, `DIRECTORY_MOVED_ON`). This is the layer above those
+ * re-checks, not a copy of them. Edits the declaration does not carry, such as
+ * a typed Name, are not a change of context either.
+ */
+export function sameNewAgentDeclaration(a: VoiceNewAgentDto | undefined, b: VoiceNewAgentDto | undefined): boolean {
+  return (a === undefined) === (b === undefined) && (a?.form === undefined) === (b?.form === undefined);
+}
 
 /**
  * What a press gets when there is no transcription backend to listen with.
@@ -417,7 +453,34 @@ interface VoiceControlPanelProps {
    * cases stay distinguishable: one is a report the surface must correct, the
    * other is an ordinary command with no Undo beside it.
    */
-  onDispatch: (outcome: Extract<VoiceOutcomeDto, { kind: "dispatch" }>) => { undo?: () => void } | undefined;
+  onDispatch: (outcome: Extract<VoiceOutcomeDto, { kind: "dispatch" }>, declaredDirectories?: VoiceDirectoriesDto, declaredNewAgent?: VoiceNewAgentDto) => { undo?: () => void } | undefined;
+  /**
+   * What the New agent dialog's directory browser is showing right now, or
+   * `undefined` when it is showing nothing (PRD #1223).
+   *
+   * A getter rather than a value, read immediately before each resolve for the
+   * screen's reason: a declaration that lagged the browser would judge the
+   * utterance against a listing the user has left. The same declaration is
+   * handed back to `onDispatch`, so the directory members can tell whether the
+   * browser moved during the round trip.
+   */
+  directories?: () => VoiceDirectoriesDto | undefined;
+  /**
+   * What the New agent dialog shows besides its browser, or `undefined` while
+   * it is closed (PRD #1223) — read and handed back exactly as `directories`
+   * is, so the form rows can tell whether the form moved during the round
+   * trip.
+   */
+  newAgent?: () => VoiceNewAgentDto | undefined;
+  /**
+   * Which MOUNT of the New agent dialog that declaration came from (PRD #1223;
+   * Qodo on PR #1235) — read at the same moment and compared at the same
+   * moment, so an answer resolved against a dialog the user has since closed
+   * and reopened is refused with {@link DIALOG_MOVED_ON} instead of acting on
+   * the replacement. The declaration itself cannot say: it compares presences,
+   * and two live forms look alike.
+   */
+  newAgentInstance?: () => string | undefined;
   /**
    * Where this panel publishes the context members only IT can serve
    * (PRD #802, the `voice_off` row).
@@ -478,7 +541,15 @@ function progressNote(indicator: VoiceIndicator, phase: VoicePhase): string | un
  * real state: a control with nothing behind it would be worse than its absence,
  * and it is the same reasoning the microphone itself gets one layer down.
  */
-export function VoiceControlPanel({ runtime, screen, onDispatch, channel }: VoiceControlPanelProps) {
+export function VoiceControlPanel({ runtime, screen, onDispatch, channel, directories, newAgent, newAgentInstance }: VoiceControlPanelProps) {
+  /* Held in a ref so the resolve and the overlay read the host's latest getter
+     without either callback being rebuilt when the host re-renders. */
+  const directoriesRef = useRef(directories);
+  directoriesRef.current = directories;
+  const newAgentRef = useRef(newAgent);
+  newAgentRef.current = newAgent;
+  const newAgentInstanceRef = useRef(newAgentInstance);
+  newAgentInstanceRef.current = newAgentInstance;
   const { declareVoiceScreen, resolveVoice, voiceCommands, voiceStart, voiceStop, voiceStatus, voiceCancel, sendTerminalInput } = runtime;
 
   const [on, setOnState] = useState(false);
@@ -819,9 +890,13 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel }: Voic
        `unavailable` means "not on that screen", so an outcome is only an
        answer about the screen that was declared with it. */
     const declared = screenRef.current;
+    /* PRD #1223 — and the directory browser as it stands, declared with it. */
+    const declaredDirectories = directoriesRef.current?.();
+    const declaredNewAgent = newAgentRef.current?.();
+    const declaredInstance = newAgentInstanceRef.current?.();
     setPhase("resolving");
     try {
-      declareVoiceScreen?.(declared);
+      declareVoiceScreen?.(declared, declaredDirectories, declaredNewAgent);
       const answer = await resolveVoice(utterance);
       // Abandoned, or replaced by a later utterance. Say nothing and run
       // nothing: voice is off, or this belongs to the cycle that replaced it.
@@ -830,9 +905,23 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel }: Voic
         setProblem(SCREEN_MOVED_ON);
         return;
       }
+      /* The same question for the declaration the grounding was computed
+         against: the answer is only an answer about THAT dialog state. */
+      if (
+        !sameNewAgentDeclaration(declaredNewAgent, newAgentRef.current?.())
+        // A different MOUNT is a different dialog even when both declarations
+        // look alike: closing and reopening replaces the draft, and a `close`
+        // grounded against the first would discard the second's (Qodo on
+        // PR #1235). The rows that resolve against form CONTENTS re-check
+        // `{deckId, path}` at dispatch; `close` has nothing to re-check.
+        || declaredInstance !== newAgentInstanceRef.current?.()
+      ) {
+        setProblem(DIALOG_MOVED_ON);
+        return;
+      }
       setResult(answer);
       if (answer.outcome.kind === "dispatch") {
-        const dispatched = onDispatch(answer.outcome);
+        const dispatched = onDispatch(answer.outcome, declaredDirectories, declaredNewAgent);
         if (!dispatched) setProblem(NOTHING_DISPATCHED);
         else if (dispatched.undo) setUndo({ run: dispatched.undo });
       }
@@ -1132,7 +1221,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel }: Voic
     /* `screenRef` rather than the prop: this runs from a dispatch, which is a
        promise continuation, and the prop captured when the callback was built
        may be a screen the user has already left. */
-    void voiceCommands(screenRef.current).then(
+    void voiceCommands(screenRef.current, directoriesRef.current?.(), newAgentRef.current?.()).then(
       (commands) => { if (vocabularyRequest.current === mine) setVocabulary({ commands }); },
       (cause) => { if (vocabularyRequest.current === mine) setVocabulary({ problem: sentenceOf(cause) }); },
     );
@@ -1210,6 +1299,8 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel }: Voic
 
   /** Say there was nothing on top to close. See {@link VOICE_NOTHING_TO_CLOSE}. */
   const reportNothingToClose = useCallback(() => setProblem(VOICE_NOTHING_TO_CLOSE), []);
+  /** Say that what a dispatch reached refused, in its own sentence (PRD #1223). */
+  const reportRefused = useCallback((reason: string) => setProblem(reason), []);
 
   /*
     PRD #802 — publish the members only this surface can serve, so a row naming
@@ -1237,6 +1328,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel }: Voic
       typeIntoAgent,
       submitAgentPrompt,
       reportNothingToClose,
+      reportRefused,
       ...(voiceCommands ? { showVoiceCommands } : {}),
       /* PRD #802 — published only while the overlay is OPEN, and that is how
          "an overlay is open" reaches a dispatch at all: it is a `useState`

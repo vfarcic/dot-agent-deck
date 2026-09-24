@@ -485,6 +485,39 @@ impl EndpointTunnels {
         lease
     }
 
+    /// Seed the map with a transport under `endpoint`'s key that **leads
+    /// somewhere**: a real daemon listening on `address`. Test-only.
+    ///
+    /// [`Self::insert_stand_in`]'s docs draw the line this crosses on purpose:
+    /// that seam's lease is never connected through, and "anything that would
+    /// *use* the transport belongs in an integration test with a real deck at
+    /// the other end". This is that test's half. What a forwarded `ssh -L`
+    /// socket hands a client is a local Unix socket whose far end is a daemon,
+    /// so a lease whose address is a real daemon's socket, filed under a
+    /// **remote** deck's identity, is that same shape with the `ssh` hop taken
+    /// out — and the hop is the one part a unit test cannot run. PRD #1223 M3
+    /// needs it because a settings document can only name remote rows beside
+    /// the local deck, so the "other" deck of an All Decks fleet is remote by
+    /// construction.
+    #[cfg(test)]
+    pub(crate) async fn insert_route(
+        &self,
+        endpoint: &Endpoint,
+        address: &std::path::Path,
+    ) -> Arc<TunnelLease> {
+        let lease = Arc::new(TunnelLease {
+            address: address.to_path_buf(),
+            connection: Mutex::new(EndpointConnection::Local(
+                dot_agent_deck::daemon_client::LocalEndpoint::at(address),
+            )),
+        });
+        self.tunnels
+            .lock()
+            .await
+            .insert(endpoint.identity(), Arc::clone(&lease));
+        lease
+    }
+
     /// How many transports are held. Test-only: no production path has a reason
     /// to ask, and the leak this milestone is about is exactly a count that
     /// does not come back down.

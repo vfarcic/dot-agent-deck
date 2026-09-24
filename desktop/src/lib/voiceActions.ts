@@ -190,6 +190,108 @@ export type VoiceActionContext = {
    * sentence about itself, so the honest answer to `close` with nothing open
    * is written there and not composed here. */
   reportNothingToClose: () => void;
+  /**
+   * Say that a dispatch reached something that would not do it, in that
+   * thing's own words: `close` finding a dialog that may not be closed yet
+   * (PRD #1223 U5), or a directory row finding that the browser has moved on
+   * since the utterance was declared (PRD #1223). The voice surface renders it
+   * where it renders {@link reportNothingToClose}'s sentence; the sentence
+   * itself belongs to whatever refused.
+   */
+  reportRefused: (reason: string) => void;
+  /**
+   * Close the New agent dialog (PRD #1223 U5) — every close route the dialog
+   * has, reached by voice. Answers `undefined` when it closed, or the dialog's
+   * own sentence when it would not: while a start is in flight every route is
+   * blocked (audit F5), and voice is blocked the same way rather than
+   * differently.
+   *
+   * **Published by the overview only while the dialog is OPEN**, for
+   * {@link dismissVoiceOverlay}'s reason: *"the dialog is open"* is a
+   * `useState` in the overview, not a `DeckView`, so {@link closeTopmost}
+   * reads it as this member's presence. It is NOT a way to open or drive the
+   * dialog — that is `openNewAgent`, the `open_new_agent` row.
+   */
+  closeNewAgent: () => string | undefined;
+  /**
+   * Open the New agent dialog (PRD #1223), with `deckId` preselected when the
+   * control that opened it belongs to one deck — a deck group's header.
+   *
+   * **Served by the OVERVIEW alone**, the screen the flow lives on and the one
+   * whose fleet the deck step lists; see {@link VoiceOverviewContext}. The deck
+   * screen does not offer it, so a dispatch there is refused against `needs`
+   * rather than attempted. The overview publishes it only while the dialog is
+   * closed, for the same reason `Ctrl+N` stands down while it is open.
+   */
+  openNewAgent: (deckId?: string) => void;
+  /**
+   * PRD #1223 — the New agent dialog's directory browser, by voice: go into
+   * the child a `dir_ref` resolved to (`target.directoryPath`), go up to `..`,
+   * or choose the directory on screen. Each calls the function the browser's
+   * own key calls, and each answers `undefined` when it acted or the dialog's
+   * sentence when it would not — see {@link VoiceDispatchTarget.declaredDirectories}.
+   *
+   * **The first members that reach INSIDE a mounted dialog**, which is the new
+   * shape and the reason they refuse rather than merely run: the row was judged
+   * callable against what the webview DECLARED with the utterance, and the
+   * browser can move during the round trip (a click, a key, a listing landing).
+   * So each re-checks the declaration against the live browser and refuses
+   * when the two differ, instead of acting on a listing the user has left.
+   *
+   * Served by the overview, which owns the dialog; see {@link VoiceOverviewContext}.
+   */
+  openDirectory: (target: VoiceDispatchTarget) => string | undefined;
+  goToParentDirectory: (target: VoiceDispatchTarget) => string | undefined;
+  useThisDirectory: (target: VoiceDispatchTarget) => string | undefined;
+  /**
+   * PRD #1223 — the rest of the New agent form by voice: choose the Mode chip
+   * a `mode_ref` resolved to (`target.modeId`), set Command to the default
+   * command of the agent an `agent_type_ref` resolved to
+   * (`target.agentTypeId`), or set Name to the words after the marked
+   * boundary (`target.text`). Mode and Name call the function the control's
+   * own click or keystroke calls; the agent has no control since the Agent
+   * picker was removed, and fills Command from the deck's registry. Each
+   * answers `undefined` when it acted or the dialog's sentence when it would
+   * not — the form can move during the round trip exactly as the browser can,
+   * so each re-checks {@link VoiceDispatchTarget.declaredForm} against the
+   * live form first.
+   *
+   * Command is never DICTATED: it is the field that executes, so the only
+   * thing voice puts there is a registry default (`commands.toml` has the
+   * argument).
+   */
+  chooseNewAgentMode: (target: VoiceDispatchTarget) => string | undefined;
+  chooseNewAgentType: (target: VoiceDispatchTarget) => string | undefined;
+  nameNewAgent: (target: VoiceDispatchTarget) => string | undefined;
+  /**
+   * The New agent dialog's start, by voice — the Start button, acting on the
+   * form as it is, which the user is looking at: it starts at once, or answers
+   * what is missing. **It used to open a confirmation**; PRD #802 D5's start
+   * half was revisited on 2026-09-23 (PRD #1223), for the reasons recorded
+   * there and in `docs/develop/voice-first-design.md`.
+   */
+  startNewAgent: (target: VoiceDispatchTarget) => string | undefined;
+  /**
+   * PRD #802 D5 — the two voice members that lead to a STOP, and the one rule
+   * they share: **each can only OPEN a confirmation.** Neither runs a deck
+   * action; the confirmation's own button does, pressed by the user. So a
+   * misheard or over-confident answer costs a dialog the user dismisses, never
+   * an agent stopped that nobody meant to stop. They keep it where the start
+   * did not because they are destructive, their target may be off-screen, and
+   * an orchestration close takes several roles at once.
+   *
+   * - `confirmStopAgent` — the overview row's Stop, for the agent an
+   *   `agent_ref` resolved to: the same confirmation that button opens.
+   * - `confirmCloseOrchestration` — an orchestration card's Close, for the
+   *   card an `orchestration_ref` resolved to (`target.orchestrationAgentId`):
+   *   the same confirmation, naming every role it will stop.
+   *
+   * Each answers `undefined` when it opened the confirmation, or the sentence
+   * saying why it did not. The table's own `confirm` column PRD #802
+   * anticipates is not built; this frontend gate is what satisfies D5 today.
+   */
+  confirmStopAgent: (target: VoiceDispatchTarget) => string | undefined;
+  confirmCloseOrchestration: (target: VoiceDispatchTarget) => string | undefined;
 };
 
 /**
@@ -289,7 +391,7 @@ export const VOICE_ACTIONS = {
   closeTopmost: {
     label: "Close whatever is open over the screen",
     voice: true,
-    needs: ["closeAgentView", "reportNothingToClose"],
+    needs: ["closeAgentView", "reportNothingToClose", "reportRefused"],
     /**
      * PRD #802 — the precedence, decided HERE because it cannot be decided in
      * the table.
@@ -297,21 +399,34 @@ export const VOICE_ACTIONS = {
      * `screens` draws on `DeckView`, and the voice surface's overlay is a
      * `useState` boolean that is not in it. So the row is callable everywhere
      * and the ordering lives at dispatch: the overlay if it is up, otherwise
-     * the agent's pane, otherwise an honest report that there was nothing to
-     * close. That order is the only one that cannot surprise — the overlay is
-     * literally on top of the pane, so closing the pane underneath it would
-     * leave the thing the user was looking at still on screen.
+     * the New agent dialog if it is open (PRD #1223 U5), otherwise the agent's
+     * pane, otherwise an honest report that there was nothing to close. That
+     * order is the only one that cannot surprise — the overlay is literally on
+     * top of everything, so closing what is underneath it would leave the
+     * thing the user was looking at still on screen.
+     *
+     * The dialog may REFUSE: while a start is in flight it cannot be closed by
+     * any route (PRD #1223 audit F5), and `close` says so in the dialog's own
+     * sentence rather than falling through to the pane or answering "nothing
+     * to close", which was the lie this branch replaced.
      *
      * `dismissVoiceOverlay` is read through its own presence rather than
      * declared in `needs`: the surface publishes it only while the overlay is
      * open, so its absence IS the answer to "is anything on top?". Declaring it
-     * would refuse the whole row whenever the overlay was closed.
+     * would refuse the whole row whenever the overlay was closed. The same
+     * holds for `closeNewAgent`, which the overview publishes only while the
+     * dialog is open.
      */
     run: (
-      context: Pick<VoiceActionContext, "closeAgentView" | "reportNothingToClose"> & Partial<Pick<VoiceActionContext, "dismissVoiceOverlay">>,
+      context: Pick<VoiceActionContext, "closeAgentView" | "reportNothingToClose" | "reportRefused"> & Partial<Pick<VoiceActionContext, "dismissVoiceOverlay" | "closeNewAgent">>,
       target: VoiceDispatchTarget,
     ) => {
       if (context.dismissVoiceOverlay) return context.dismissVoiceOverlay();
+      if (context.closeNewAgent) {
+        const refused = context.closeNewAgent();
+        if (refused !== undefined) context.reportRefused(refused);
+        return;
+      }
       if (target.agentViewOpen) return context.closeAgentView();
       context.reportNothingToClose();
     },
@@ -441,6 +556,135 @@ export const VOICE_ACTIONS = {
     needs: ["advanceFixture"],
     run: (context: Pick<VoiceActionContext, "advanceFixture">) => context.advanceFixture(),
   },
+
+  // -- the overview's own -------------------------------------------------
+
+  openNewAgent: {
+    label: "Start a new agent on a chosen deck",
+    /* The `open_new_agent` row (PRD #1223). It OPENS the dialog and starts
+       nothing — the dialog's own Start is still the only thing that does — so
+       it is outside PRD #802 D5's confirmation set. A spoken deck arrives as
+       the row's `deck_ref` param, resolved Rust-side against the observed
+       fleet, and `App.tsx` carries its value in as `deckId`. */
+    voice: true,
+    needs: ["openNewAgent"],
+    /**
+     * The top bar's New agent button, the keyboard shortcut and the first-run
+     * note open it with no deck; a deck group's header passes its own, which
+     * the deck step preselects, and so does a spoken "new agent on <deck>"
+     * (the `open_new_agent` row's `deck_ref`). An empty id preselects nothing.
+     */
+    run: (context: Pick<VoiceActionContext, "openNewAgent">, target?: { preselectDeckId?: string }) => context.openNewAgent(target?.preselectDeckId || undefined),
+  },
+
+  /* PRD #1223 — the three `requires`-gated rows: the New agent dialog's
+     directory browser. None starts anything — the dialog's Start is still the
+     only thing that does — so none is in PRD #802 D5's confirmation set. The
+     manual paths (the `..` row, the keys, the Use this directory button) call
+     the same dialog functions directly and are unchanged. */
+  openDirectory: {
+    label: "Open a directory listed in the New agent browser",
+    voice: true,
+    needs: ["openDirectory", "reportRefused"],
+    run: (context: Pick<VoiceActionContext, "openDirectory" | "reportRefused">, target: VoiceDispatchTarget) => {
+      const refused = context.openDirectory(target);
+      if (refused !== undefined) context.reportRefused(refused);
+    },
+  },
+
+  goToParentDirectory: {
+    label: "Go up to the parent directory in the New agent browser",
+    voice: true,
+    needs: ["goToParentDirectory", "reportRefused"],
+    run: (context: Pick<VoiceActionContext, "goToParentDirectory" | "reportRefused">, target: VoiceDispatchTarget) => {
+      const refused = context.goToParentDirectory(target);
+      if (refused !== undefined) context.reportRefused(refused);
+    },
+  },
+
+  useThisDirectory: {
+    label: "Use the directory on screen for the new agent",
+    voice: true,
+    needs: ["useThisDirectory", "reportRefused"],
+    run: (context: Pick<VoiceActionContext, "useThisDirectory" | "reportRefused">, target: VoiceDispatchTarget) => {
+      const refused = context.useThisDirectory(target);
+      if (refused !== undefined) context.reportRefused(refused);
+    },
+  },
+
+  /* PRD #1223 — the three `new_agent_form` rows: Mode, Agent and Name. None
+     starts anything, so none is in PRD #802 D5's confirmation set; the manual
+     chips, picker and Name input are unchanged and call the same functions.
+     Command has no entry here on purpose. */
+  chooseNewAgentMode: {
+    label: "Choose a Mode chip in the New agent form",
+    voice: true,
+    needs: ["chooseNewAgentMode", "reportRefused"],
+    run: (context: Pick<VoiceActionContext, "chooseNewAgentMode" | "reportRefused">, target: VoiceDispatchTarget) => {
+      const refused = context.chooseNewAgentMode(target);
+      if (refused !== undefined) context.reportRefused(refused);
+    },
+  },
+
+  chooseNewAgentType: {
+    label: "Set the New agent form's Command to an agent's default command",
+    voice: true,
+    needs: ["chooseNewAgentType", "reportRefused"],
+    run: (context: Pick<VoiceActionContext, "chooseNewAgentType" | "reportRefused">, target: VoiceDispatchTarget) => {
+      const refused = context.chooseNewAgentType(target);
+      if (refused !== undefined) context.reportRefused(refused);
+    },
+  },
+
+  nameNewAgent: {
+    label: "Set the New agent form's Name",
+    voice: true,
+    needs: ["nameNewAgent", "reportRefused"],
+    run: (context: Pick<VoiceActionContext, "nameNewAgent" | "reportRefused">, target: VoiceDispatchTarget) => {
+      const refused = context.nameNewAgent(target);
+      if (refused !== undefined) context.reportRefused(refused);
+    },
+  },
+
+  /* The New agent dialog's Start, by voice (PRD #1223). It calls the function
+     the button calls and starts at once — PRD #802 D5's start half was
+     revisited on 2026-09-23 — or reports why the form cannot start. */
+  startNewAgent: {
+    label: "Start the agent the New agent form describes",
+    voice: true,
+    needs: ["startNewAgent", "reportRefused"],
+    run: (context: Pick<VoiceActionContext, "startNewAgent" | "reportRefused">, target: VoiceDispatchTarget) => {
+      const refused = context.startNewAgent(target);
+      if (refused !== undefined) context.reportRefused(refused);
+    },
+  },
+
+  /* PRD #802 D5 — the two rows that STOP something. Each entry calls a member
+     that can only OPEN a confirmation (see the members' own comment on
+     `VoiceActionContext`), so voice never reaches `runAction` for a stop: the
+     confirmation's button does, pressed by hand. The manual controls — a
+     row's Stop, a card's Close — keep exactly the behaviour they had and do
+     not route through these. */
+
+  confirmStopAgent: {
+    label: "Ask to stop one agent on the overview",
+    voice: true,
+    needs: ["confirmStopAgent", "reportRefused"],
+    run: (context: Pick<VoiceActionContext, "confirmStopAgent" | "reportRefused">, target: VoiceDispatchTarget) => {
+      const refused = context.confirmStopAgent(target);
+      if (refused !== undefined) context.reportRefused(refused);
+    },
+  },
+
+  confirmCloseOrchestration: {
+    label: "Ask to close an orchestration on the overview",
+    voice: true,
+    needs: ["confirmCloseOrchestration", "reportRefused"],
+    run: (context: Pick<VoiceActionContext, "confirmCloseOrchestration" | "reportRefused">, target: VoiceDispatchTarget) => {
+      const refused = context.confirmCloseOrchestration(target);
+      if (refused !== undefined) context.reportRefused(refused);
+    },
+  },
 } satisfies Record<string, VoiceActionEntry>;
 
 /** Every action id, as the guard and the command table spell them. */
@@ -491,6 +735,54 @@ void NEEDS_COVERS_RUN;
  * `AgentTarget`'s single member is a subset of it.
  */
 export type VoiceDispatchTarget = AgentViewTarget & {
+  /**
+   * The deck to PRESELECT — what a row's `deck_ref` param resolved to (PRD
+   * #1223), and absent when the user named none.
+   *
+   * Deliberately not `deckId` above. That member is the deck an AGENT lives
+   * on, and `App.tsx` fills it for every dispatch, falling back to the
+   * selected deck — so an entry reading it could not tell "the user said the
+   * build box" from "the user said nothing and the build box is selected", and
+   * the bare "new agent" would preselect whatever deck happened to be in view.
+   */
+  preselectDeckId?: string;
+  /**
+   * The child directory to open — the deck's own path a row's `dir_ref` param
+   * resolved to, against the browser's children on screen (PRD #1223).
+   */
+  directoryPath?: string;
+  /**
+   * The directory browser the utterance was JUDGED against: the deck and the
+   * listing `path` the webview declared with it (PRD #1223), or absent when it
+   * declared none.
+   *
+   * The screen gets `SCREEN_MOVED_ON` in the voice surface for the same
+   * hazard, but a browser that moved is not a reason to refuse every command —
+   * "close" is still right after a listing lands — so the check lives in the
+   * three directory members, which compare this against the live browser and
+   * refuse when the two differ.
+   */
+  declaredDirectories?: { deckId: string; path: string };
+  /**
+   * The Mode chip a `mode_ref` resolved to — its id in the form as declared
+   * (PRD #1223).
+   */
+  modeId?: string;
+  /** The agent entry an `agent_type_ref` resolved to — its registry id. */
+  agentTypeId?: string;
+  /**
+   * The New agent form the utterance was JUDGED against — its deck and chosen
+   * directory as declared — or absent when no live form was declared. The
+   * form members refuse when the live form differs, for
+   * {@link declaredDirectories}' reason.
+   */
+  declaredForm?: { deckId: string; path: string };
+  /**
+   * The orchestration card an `orchestration_ref` resolved to, named by one
+   * of its members' agent ids on {@link deckId} — a member, because a card
+   * whose daemon reported no orchestration id is still a card (PRD #1223).
+   */
+  orchestrationAgentId?: string;
   /**
    * The words to type into the open agent's prompt, for the dictation row
    * (PRD #802 D6, rebuilt).
@@ -566,7 +858,7 @@ export type VoiceDispatchContext = Pick<VoiceActionContext, "navigate" | "closeA
  * set's complement, so a screen that tried to serve one of these members would
  * not type-check, and neither would a panel that left one out.
  */
-export type VoicePanelContext = Pick<VoiceActionContext, "stopVoice" | "showVoiceCommands" | "typeIntoAgent" | "submitAgentPrompt" | "dismissVoiceOverlay" | "reportNothingToClose">;
+export type VoicePanelContext = Pick<VoiceActionContext, "stopVoice" | "showVoiceCommands" | "typeIntoAgent" | "submitAgentPrompt" | "dismissVoiceOverlay" | "reportNothingToClose" | "reportRefused">;
 /**
  * `Partial`, because a panel can serve one of these and not another.
  *
@@ -580,16 +872,77 @@ export type VoicePanelContext = Pick<VoiceActionContext, "stopVoice" | "showVoic
 export type VoicePanelChannel = { current: Partial<VoicePanelContext> | undefined };
 
 /**
- * Everything a SCREEN is expected to serve: the context minus the voice
- * surface's own members.
+ * Everything the DECK screen is expected to serve: the context minus the voice
+ * surface's own members and the overview's (PRD #1223 split the second set out;
+ * see {@link VoiceOverviewContext}).
  *
- * `Omit<…, keyof VoicePanelContext>` rather than a second hand-written list —
- * the two halves are complements by construction, so moving a member from one
- * to the other is one edit and cannot leave a member served twice or not at
+ * `Omit<…, keyof VoicePanelContext | …>` rather than a second hand-written
+ * list — the halves are complements by construction, so moving a member from
+ * one to another is one edit and cannot leave a member served twice or not at
  * all. Before `stopVoice` existed a screen served the whole context and this
  * was `VoiceActionContext` itself.
  */
-export type VoiceScreenContext = Omit<VoiceActionContext, keyof VoicePanelContext>;
+export type VoiceScreenContext = Omit<VoiceActionContext, keyof VoicePanelContext | keyof VoiceOverviewContext>;
+
+/**
+ * The members only the OVERVIEW serves (PRD #1223): opening the New agent
+ * dialog, which lives on that screen because its deck step lists the fleet the
+ * overview shows, and — while it is open — closing it (U5). Split out of {@link VoiceScreenContext} — which is what the
+ * DECK screen publishes — so the deck is not made to serve a member it has no
+ * dialog for; a dispatch of `openNewAgent` there is refused against its
+ * `needs`, the way the overview refuses a deck overlay.
+ */
+export type VoiceOverviewContext = Pick<VoiceActionContext, "openNewAgent" | "closeNewAgent" | "openDirectory" | "goToParentDirectory" | "useThisDirectory" | NewAgentFormMember | "confirmStopAgent" | "confirmCloseOrchestration">;
+
+/** The New agent form's members, served — like the browser's — from the dialog's slot. */
+export type NewAgentFormMember = "chooseNewAgentMode" | "chooseNewAgentType" | "nameNewAgent" | "startNewAgent";
+
+/**
+ * What the New agent dialog publishes about its directory browser (PRD #1223),
+ * and the one slot through which the INSIDE of a mounted dialog reaches voice.
+ *
+ * `directories` is the declaration — what the browser shows, or `undefined`
+ * when it shows nothing to name — which the voice surface sends with each
+ * utterance. The three functions are the browser's own moves, each refusing
+ * in the dialog's words when it cannot apply.
+ *
+ * Written by the dialog on every render and cleared on unmount, so a reader at
+ * resolve or dispatch time sees the last committed browser or nothing. The
+ * overview serves the three context members by reading this slot at call time
+ * (see `AgentOverview`), which is what keeps "the dialog closed during the
+ * round trip" a refusal with a sentence rather than a `needs` miss.
+ */
+export type NewAgentVoice = Pick<VoiceActionContext, "openDirectory" | "goToParentDirectory" | "useThisDirectory" | NewAgentFormMember> & {
+  directories: import("./bridge").VoiceDirectoriesDto | undefined;
+  /**
+   * The dialog's own declaration — present for as long as it is mounted, with
+   * a `form` only while the form's fields are live. See `VoiceNewAgentDto`.
+   */
+  newAgent: import("./bridge").VoiceNewAgentDto;
+  /**
+   * This MOUNT of the dialog, minted once per open and never sent to Rust.
+   *
+   * The declaration above deliberately compares only presences, so two live
+   * forms look alike however different their contents (see
+   * `sameNewAgentDeclaration`), and the rows that care re-check `{deckId,
+   * path}` at dispatch. `close` has nothing to re-check: it closes whatever
+   * dialog is open when it lands. So a `close` resolved against one dialog
+   * closed a REPLACEMENT the user had opened meanwhile, discarding its draft
+   * (Qodo on PR #1235). Comparing this refuses that with `DIALOG_MOVED_ON`,
+   * which is what a user who reopened the dialog should hear.
+   */
+  instance: string;
+};
+export type NewAgentVoiceChannel = { current: NewAgentVoice | undefined };
+
+/**
+ * How the overview publishes what a voice dispatch may need from it —
+ * `closeNewAgent` while the dialog is open, `openNewAgent` while it is closed,
+ * and the three directory members always, each refusing in words when there
+ * is no browser to move — to the shell that dispatches, the way
+ * {@link VoiceContextChannel} carries the deck's.
+ */
+export type VoiceOverviewChannel = { current: Partial<VoiceOverviewContext> | undefined };
 
 /**
  * How a screen publishes its half of the context up to the host that dispatches

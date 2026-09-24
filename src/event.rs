@@ -476,6 +476,35 @@ pub const ORCHESTRATION_ORPHANED_METADATA_KEY: &str = "orchestration_orphaned";
 /// becomes a channel for text the daemon did not author.
 pub const ORCHESTRATION_ORPHANED_METADATA_VALUE: &str = "1";
 
+/// `AgentEvent.metadata` key marking a `SessionEnd` the DAEMON authored to say
+/// "this pane's agent was stopped and the pane is gone" (PRD #1223).
+///
+/// The removal half of the live-surface broadcast. `StopAgent` removed an agent
+/// from the registry and told only the client that sent it, so a TUI already
+/// attached when the DESKTOP stopped an agent kept its card — and, for an
+/// orchestration, its now-empty tab — indefinitely
+/// (`newagent/visibility/003` / `004`). The daemon now announces every
+/// successful `StopAgent` that gave the pane up
+/// ([`crate::spawn::surface_attach_stopped_agent`]), and an attached TUI applies
+/// the same cleanup a native close performs
+/// ([`crate::state::AppState::apply_daemon_pane_closed`]).
+///
+/// **Daemon-authoritative**, like [`ORCHESTRATION_ORPHANED_METADATA_KEY`]: the
+/// event is broadcast straight onto the fan-out and never ingested, and
+/// `ingest_event` REMOVES the key from every inbound hook event, so a producer on
+/// the unauthenticated same-uid hook socket cannot make a TUI drop a live pane.
+///
+/// Additive on the wire in both directions, so no
+/// [`crate::daemon_protocol::PROTOCOL_VERSION`] bump: an older TUI reads it as
+/// an ordinary `SessionEnd` for the pane's placeholder key, which restores the
+/// same placeholder it removes (today's stale card, unchanged), and the desktop
+/// reads any `SessionEnd` as "refetch the agent list now".
+pub const DAEMON_PANE_CLOSED_METADATA_KEY: &str = "daemon_pane_closed";
+
+/// The [`DAEMON_PANE_CLOSED_METADATA_KEY`] value meaning "yes". Fixed for the
+/// same reason as [`ORCHESTRATION_ORPHANED_METADATA_VALUE`].
+pub const DAEMON_PANE_CLOSED_METADATA_VALUE: &str = "1";
+
 /// `AgentEvent.metadata` key declaring WHERE a `SessionStart` came from (PRD
 /// #225 M3). The wrapper adapter is the only INTENDED producer, with one of the
 /// three values [`WRAPPER_FORK_SESSION_START_ORIGIN`] /
@@ -839,6 +868,19 @@ impl AgentEvent {
             .is_some_and(|origin| origin == CARD_SURFACE_SESSION_START_ORIGIN)
     }
 
+    /// PRD #1223: is this the daemon's pane-closed `SessionEnd` (see
+    /// [`DAEMON_PANE_CLOSED_METADATA_KEY`])? Requires the event type and a pane
+    /// id as well as the marker, so a malformed frame is never read as a
+    /// removal of nothing in particular.
+    pub fn is_daemon_pane_closed(&self) -> bool {
+        self.event_type == EventType::SessionEnd
+            && self.pane_id.is_some()
+            && self
+                .metadata
+                .get(DAEMON_PANE_CLOSED_METADATA_KEY)
+                .is_some_and(|v| v == DAEMON_PANE_CLOSED_METADATA_VALUE)
+    }
+
     /// Issue #770: does this event carry the daemon's ORPHANED-ROLE marker (see
     /// [`ORCHESTRATION_ORPHANED_METADATA_KEY`])? `false` for every event
     /// without it, which is every event an older daemon relays and every event
@@ -946,6 +988,7 @@ impl AgentEvent {
         matches!(self.event_type, EventType::ShellBusy | EventType::ShellIdle)
             || self.metadata.contains_key(DELIVERY_NOTICE_METADATA_KEY)
             || self.is_card_surface_session_start()
+            || self.is_daemon_pane_closed()
     }
 }
 

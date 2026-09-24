@@ -53,11 +53,13 @@ import { useShownTerminals } from "./hooks/useShownTerminals";
 import { useHeldAgentRecord, type HeldAgentRecord } from "./hooks/useHeldAgentRecord";
 import { useZoom } from "./hooks/useZoom";
 import { agentKey } from "./lib/agentKey";
-import { VOICE_ACTIONS, dispatchVoiceAction, type DeckOverlay, type VoiceContextChannel, type VoiceDispatchContext, type VoiceDispatchTarget, type VoicePanelContext, type VoiceScreenContext } from "./lib/voiceActions";
+import { VOICE_ACTIONS, dispatchVoiceAction, type DeckOverlay, type NewAgentVoice, type VoiceContextChannel, type VoiceDispatchContext, type VoiceDispatchTarget, type VoiceOverviewContext, type VoicePanelContext, type VoiceScreenContext } from "./lib/voiceActions";
 import { unreachableDeckTerminalState } from "./lib/terminalInput";
 import { applyAppearance } from "./lib/appearance";
 import { desktopWorkflowPlatformIssue } from "./lib/platform";
-import type { VoiceOutcomeDto } from "./lib/bridge";
+import { LaunchCleanupError } from "./lib/actionError";
+import { CleanupWarning } from "./components/CleanupWarning";
+import type { VoiceDirectoriesDto, VoiceNewAgentDto, VoiceOutcomeDto } from "./lib/bridge";
 import type { AgentSession, DeckAction, DeckRuntimeState, DeckSnapshot, DeckView, EvidenceItem, PanelTab, WorkflowLaunchConfig } from "./types";
 import { modeScopedKey } from "./lib/bridge";
 
@@ -166,6 +168,21 @@ export function DeckShell({ runtime, workflowPlatformIssue, initialView = { kind
    * what `voice_off` needs and what neither the deck nor this shell can offer.
    */
   const panelVoiceContext = useRef<VoicePanelContext | undefined>(undefined);
+  /**
+   * PRD #1223 U5 — the OVERVIEW's half, published while it is mounted:
+   * `closeNewAgent` while the New agent dialog is open, so `close` can close
+   * that dialog rather than report "nothing to close"; `openNewAgent` while it
+   * is closed; and the directory browser's three moves.
+   */
+  const overviewVoiceContext = useRef<Partial<VoiceOverviewContext> | undefined>(undefined);
+  /**
+   * PRD #1223 — the New agent dialog's own slot: what its directory browser
+   * shows, and its three moves. Created here rather than in the overview
+   * because the voice surface, which declares the browser with each
+   * utterance, is this shell's child and not the overview's; the overview
+   * hands the slot to the dialog and serves the moves by reading it.
+   */
+  const newAgentVoice = useRef<NewAgentVoice | undefined>(undefined);
   const agentView = view.kind === "agent" ? view : undefined;
   /**
    * Back, and the whole of it. The destination is read off the view rather
@@ -506,7 +523,7 @@ export function DeckShell({ runtime, workflowPlatformIssue, initialView = { kind
    * aimed: it types one utterance into the pane that is already open, so there
    * is no navigation to observe and nothing for the flag to suppress.
    */
-  const dispatchVoice = useCallback((outcome: Extract<VoiceOutcomeDto, { kind: "dispatch" }>) => {
+  const dispatchVoice = useCallback((outcome: Extract<VoiceOutcomeDto, { kind: "dispatch" }>, declaredDirectories?: VoiceDirectoriesDto, declaredNewAgent?: VoiceNewAgentDto) => {
     const previous = view;
     /*
       One target for every entry, built from the outcome's own resolved params —
@@ -525,6 +542,23 @@ export function DeckShell({ runtime, workflowPlatformIssue, initialView = { kind
        model marked, and `value` is what this app resolved that boundary to in
        its own transcript. The model's string never reaches a terminal. */
     const dictated = outcome.params.find((param) => param.kind === "spoken_prefix");
+    /* PRD #1223 — the deck a `deck_ref` resolved to, against the observed
+       fleet, Rust-side. Its own member rather than `deckId`, which falls back
+       to the selected deck below and so cannot say "the user named none". */
+    const namedDeck = outcome.params.find((param) => param.kind === "deck_ref");
+    /* PRD #1223 — the child a `dir_ref` resolved to, against the browser's
+       children on screen: its `value` is the deck's own path for it. */
+    const namedDirectory = outcome.params.find((param) => param.kind === "dir_ref");
+    /* PRD #1223 — the Mode chip and the agent entry a `mode_ref` and an
+       `agent_type_ref` resolved to, against the form AS DECLARED: `value` is
+       the id the dialog selects by. */
+    const namedMode = outcome.params.find((param) => param.kind === "mode_ref");
+    const namedAgentType = outcome.params.find((param) => param.kind === "agent_type_ref");
+    const declaredForm = declaredNewAgent?.form;
+    /* PRD #1223 — the orchestration card an `orchestration_ref` resolved to,
+       named by one member's agent id on the selected deck, whose agents Rust
+       resolved it against. */
+    const namedOrchestration = outcome.params.find((param) => param.kind === "orchestration_ref");
     const target: VoiceDispatchTarget = {
       /* The dictation pair targets the pane on SCREEN — its row declares no
          agent param and is `screens = ["agent"]`, so `agentView` is defined
@@ -544,10 +578,22 @@ export function DeckShell({ runtime, workflowPlatformIssue, initialView = { kind
       agentLabel: agent?.label ?? paneAgent?.displayName,
       text: dictated?.value,
       agentViewOpen: agentView !== undefined,
+      ...(namedDeck ? { preselectDeckId: namedDeck.value } : {}),
+      ...(namedDirectory ? { directoryPath: namedDirectory.value } : {}),
+      /* What the utterance was judged against, so a directory move can refuse
+         a browser that has moved on since (see the member's own comment). */
+      ...(declaredDirectories ? { declaredDirectories: { deckId: declaredDirectories.deckId, path: declaredDirectories.path } } : {}),
+      ...(namedMode ? { modeId: namedMode.value } : {}),
+      ...(namedAgentType ? { agentTypeId: namedAgentType.value } : {}),
+      ...(declaredForm ? { declaredForm: { deckId: declaredForm.deckId, path: declaredForm.path } } : {}),
+      ...(namedOrchestration ? { orchestrationAgentId: namedOrchestration.value } : {}),
     };
     let moved = false;
     const context: VoiceDispatchContext = {
       ...deckVoiceContext.current,
+      /* The overview's, which is never mounted beside the deck, so the two
+         cannot both publish (PRD #1223 U5). */
+      ...overviewVoiceContext.current,
       /* After the deck's, and the two sets are disjoint by construction — see
          `VoicePanelContext`, which is a narrow `Pick` precisely so a screen and
          the voice surface can never offer the same member. */
@@ -558,13 +604,20 @@ export function DeckShell({ runtime, workflowPlatformIssue, initialView = { kind
     if (!dispatchVoiceAction(outcome.invoke, context, target)) return undefined;
     return moved ? { undo: () => setView(previous) } : {};
   }, [agentView, base, closeAgent, paneAgent, selectedDeckId, view]);
+  /** PRD #1223 — what the directory browser shows, read at declaration time. */
+  const readDirectories = useCallback(() => newAgentVoice.current?.directories, []);
+  /** PRD #1223 — what the New agent dialog shows besides its browser, while it is open. */
+  const readNewAgent = useCallback(() => newAgentVoice.current?.newAgent, []);
+  /* Which mount of the dialog that declaration came from — never sent to Rust,
+     read only to refuse an answer whose dialog has been replaced (PRD #1223). */
+  const readNewAgentInstance = useCallback(() => newAgentVoice.current?.instance, []);
   /* The COMPOSITE identity, never the bare id. See `deckPaneRetargeted` above
      and `DeckSurface`'s own promotion condition. */
   const openAgent = agentView ? { deckId: agentView.deckId, agentId: agentView.agentId } : undefined;
   const screenNode = base === "overview"
     ? (
       <>
-        <AgentOverview runtime={runtime} settings={settings} onNavigate={setView} />
+        <AgentOverview runtime={runtime} settings={settings} onNavigate={setView} agentPaneOpen={agentView !== undefined} voiceChannel={overviewVoiceContext} newAgentVoice={newAgentVoice} />
         {/*
           The overview mounts no terminal of its own (PRD #745's commitment), so
           there is no tile here to promote and the pane is a sibling of the
@@ -573,6 +626,22 @@ export function DeckShell({ runtime, workflowPlatformIssue, initialView = { kind
           actually requires.
         */}
         {agentView && paneDeck && paneAgentShown && <OverviewAgentPane runtime={runtime} view={agentView} deck={paneDeck} agent={paneAgentShown} held={heldPaneAgent} attached={paneDeckAttachable} onClose={closeAgentView} />}
+        {/*
+          PRD #1223 audit W2 — the runtime's last failure, on THIS screen too.
+
+          The New agent flow lives here, and its dialog deliberately leaves the
+          runtime's error alone once it is unmounted (`NewAgentDialog`'s
+          `mounted` ref) because by then it is the only copy of the failure.
+          The only surface rendering that copy was the deck's toast, which is
+          unmounted whenever this screen is up — so a launch that failed with
+          roles still possibly running was reported nowhere, and this screen's
+          Refresh calls `reconnect()`, which clears it unseen.
+
+          `runtime.error` alone: the notice beside it on the deck is that
+          screen's own state, and this screen has none. The two are never
+          mounted together, so there is at most one toast.
+        */}
+        {runtime.error && <Toast message={runtime.error} cleanup={runtime.errorCleanup} onDismiss={runtime.clearError} />}
       </>
     )
     : <DeckSurface runtime={runtime} settings={settings} workflowPlatformIssue={workflowPlatformIssue} onNavigate={setView} openAgent={openAgent} onCloseAgent={closeAgent} voiceChannel={deckVoiceContext} />;
@@ -598,7 +667,7 @@ export function DeckShell({ runtime, workflowPlatformIssue, initialView = { kind
   return (
     <>
       {screenNode}
-      <VoiceControlPanel runtime={runtime} screen={view.kind} onDispatch={dispatchVoice} channel={panelVoiceContext} />
+      <VoiceControlPanel runtime={runtime} screen={view.kind} onDispatch={dispatchVoice} channel={panelVoiceContext} directories={readDirectories} newAgent={readNewAgent} newAgentInstance={readNewAgentInstance} />
     </>
   );
 }
@@ -841,7 +910,19 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [helpOpen, setHelpOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
-  const [notice, setNotice] = useState<string>();
+  const [noticeState, setNoticeState] = useState<string>();
+  /**
+   * PRD #1223 audit V7 — the roles a failed launch could not confirm are
+   * stopped, shown above whichever message the toast is carrying. Held beside
+   * the notice rather than folded into it so a later notice cannot inherit an
+   * older failure's roles: {@link setNotice} replaces both at once.
+   */
+  const [noticeCleanup, setNoticeCleanup] = useState<readonly string[]>();
+  const notice = noticeState;
+  const setNotice = useCallback((message?: string, cleanup?: readonly string[]) => {
+    setNoticeState(message);
+    setNoticeCleanup(message === undefined ? undefined : cleanup);
+  }, []);
   const [confirm, setConfirm] = useState<ConfirmState>();
   // Memoised so the context value is stable across renders; `runtime.testEndpoint`
   // is itself stable for the lifetime of the bridge.
@@ -1201,7 +1282,7 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
       body: `This sends a stop request to ${selectedAgent.displayName}. Unsaved terminal work may be interrupted.`,
       label: "Stop agent",
       busyLabel: "Stopping…",
-      action: async () => { await perform({ type: "stop_agent", agentId: selectedAgent.id }, `${selectedAgent.role} stop requested.`); },
+      action: async () => { await perform({ type: "stop_agent", deckId: snapshot.connection.deckId ?? "", agentId: selectedAgent.id }, `${selectedAgent.role} stop requested.`); },
     });
   };
 
@@ -1290,6 +1371,21 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
           await runtime.reconnect();
           setNotice(`${config.displayName} launched with ${config.roles.length} configured roles.`);
         } catch (cause) {
+          /*
+           * PRD #1223 audit V2 — FIRST, ahead of every refusal-code translation
+           * below. Each of those says "Nothing was started", and a launch whose
+           * rollback could not confirm a role stopped can carry one of their
+           * codes too: a `stale-preparation` refusal of a later role after an
+           * earlier one had started is exactly that composite. The roles arrive
+           * as data (`LaunchCleanupError`), so the warning does not depend on
+           * where the sentence puts them; the sentence itself stays the
+           * runtime's error, which takes the toast's place once this is
+           * dismissed.
+           */
+          if (cause instanceof LaunchCleanupError) {
+            setNotice(cause.message, cause.unconfirmedStops);
+            return;
+          }
           const message = cause instanceof Error ? cause.message : String(cause);
           /*
            * PRD #819 M6, state 2. The daemon re-resolves on launch, and
@@ -1368,6 +1464,9 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
    * friendlier words, and when an error arrives while an older notice is still
    * up — nothing expires a notice.
    */
+  /** The cleanup roles belonging to whichever copy of a failure the toast shows. */
+  const toastCleanup = notice === undefined ? runtime.errorCleanup : noticeCleanup;
+
   const dismissToast = () => {
     if (notice === undefined || notice === runtime.error) runtime.clearError();
     setNotice(undefined);
@@ -1621,7 +1720,38 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
       {paletteOpen && <CommandPalette commands={commandItems} onClose={() => setPaletteOpen(false)} />}
       {helpOpen && <ShortcutHelp onClose={() => setHelpOpen(false)} />}
       {confirm && <ConfirmDialog state={confirm} onClose={() => setConfirm(undefined)} />}
-      {(notice || runtime.error) && <div className="toast" data-testid="toast" role="status"><AlertTriangle size={15} /><span>{notice ?? runtime.error}</span><button aria-label="Dismiss message" onClick={dismissToast}><X size={14} /></button></div>}
+      {/* PRD #1223 audit V7: the roles a rollback could not confirm are shown
+          above the sentence, from whichever half is on screen. The overview
+          mounts its own copy of this over `runtime.error` alone (audit W2) —
+          it has no notice of its own, and it is not mounted at the same time
+          as this one. */}
+      {(notice || runtime.error) && <Toast message={notice ?? runtime.error ?? ""} cleanup={toastCleanup} onDismiss={dismissToast} />}
+    </div>
+  );
+}
+
+/**
+ * The one message surface either screen shows: a failed action's sentence, the
+ * roles a rollback could not confirm are stopped above it, and a dismiss.
+ *
+ * One component rather than markup per screen (PRD #1223 audit W2). The deck
+ * had the only copy, and the overview mounts INSTEAD of the deck — so a launch
+ * that failed after the New agent dialog was gone, which is the case the
+ * runtime holds these roles for at all, was reported on a screen the user was
+ * no longer on. The overview's Refresh then cleared it unseen.
+ *
+ * The message goes through `displayText` like every other daemon-influenced
+ * string here, because a role name reaches it inside the failure sentence.
+ */
+function Toast({ message, cleanup, onDismiss }: { message: string; cleanup?: readonly string[]; onDismiss: () => void }) {
+  return (
+    <div className="toast" data-testid="toast" role="status">
+      <AlertTriangle size={15} />
+      <div className="toast-body">
+        {cleanup && cleanup.length > 0 && <CleanupWarning stops={cleanup} testId="toast-cleanup-warning" />}
+        <span>{displayText(message, DISPLAY_LIMITS.message)}</span>
+      </div>
+      <button aria-label="Dismiss message" onClick={onDismiss}><X size={14} /></button>
     </div>
   );
 }
