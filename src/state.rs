@@ -2262,14 +2262,24 @@ pub(crate) fn orchestration_still_matches(
 /// Issue #580: the other refusal — the worker still owes a `work-done` and the
 /// caller did not pass `--supersede` — is NOT ignored. It comes back as
 /// [`crate::agent_pty::CommissionArm::Busy`], and the caller must not dispatch.
+///
+/// `sender_agent_id` is the orchestrator agent the hook provenance gate attested
+/// for this delegate, when there is one. It is preferred over the pane's current
+/// occupant (Qodo, #1285): the pane can change hands between the gate and this
+/// call, and re-resolving then would attribute a predecessor's delegate to its
+/// successor — letting it past the predecessor's own busy refusal. The pane's
+/// occupant is the fallback only for a caller that has no attested identity.
 fn record_delegation_commission(
     registry: &Arc<AgentPtyRegistry>,
     worker_pane_id: &str,
     role: &str,
     orchestrator_pane_id: &str,
+    sender_agent_id: Option<&str>,
     supersede: bool,
 ) -> crate::agent_pty::CommissionArm {
-    let orchestrator_agent_id = registry.pane_current_agent_id(orchestrator_pane_id);
+    let orchestrator_agent_id = sender_agent_id
+        .map(str::to_string)
+        .or_else(|| registry.pane_current_agent_id(orchestrator_pane_id));
     let arm = registry.arm_delegation_commission(
         worker_pane_id,
         orchestrator_pane_id,
@@ -7871,6 +7881,24 @@ impl AppState {
         event_tx: &broadcast::Sender<BroadcastMsg>,
         state: Option<&SharedState>,
     ) -> crate::event::DelegateResponse {
+        self.handle_attested_delegate(signal, registry, event_tx, state, None)
+            .await
+    }
+
+    /// [`Self::handle_delegate_with_state`] for a delegate whose sender the hook
+    /// provenance gate attested: `sender_agent_id` is the registry agent id its
+    /// capability token was minted for. The daemon's hook loop calls this; see
+    /// [`record_delegation_commission`] for what the identity decides (issue #580
+    /// review, Qodo, #1285). `None` behaves exactly as
+    /// [`Self::handle_delegate_with_state`].
+    pub async fn handle_attested_delegate(
+        &self,
+        signal: DelegateSignal,
+        registry: &Arc<AgentPtyRegistry>,
+        event_tx: &broadcast::Sender<BroadcastMsg>,
+        state: Option<&SharedState>,
+        sender_agent_id: Option<&str>,
+    ) -> crate::event::DelegateResponse {
         use crate::event::DelegateResponse;
         if let Some(error) = self.refuse_unless_orchestrator_caller(&signal.pane_id, "delegate") {
             return DelegateResponse {
@@ -7969,6 +7997,7 @@ impl AppState {
                 &pane_id,
                 &target_role,
                 &orchestrator_pane_id,
+                sender_agent_id,
                 signal.supersede,
             ) {
                 crate::agent_pty::CommissionArm::Busy {
@@ -12248,6 +12277,49 @@ mod tests {
             crate::agent_pty::WorkDoneProvenance::Solicited { remaining: 1 },
             "--supersede adds a commission rather than replacing the earlier one"
         );
+    }
+
+    /// Issue #580 review (Qodo, #1285): the busy check reads the ATTESTED sender,
+    /// not the orchestrator pane's current occupant. Here the pane has no live
+    /// agent at all, so a re-resolving check would see no identity and refuse;
+    /// the attested successor identity is what makes it a supersession — and the
+    /// attested predecessor identity is what keeps its own refusal.
+    #[tokio::test]
+    async fn handle_attested_delegate_decides_on_the_attested_sender() {
+        let state = two_same_name_cwd_tabs(true);
+        let registry = Arc::new(AgentPtyRegistry::new());
+        match registry.arm_delegation_commission("A_coder", "A_orch", Some("orch-agent-1"), false) {
+            crate::agent_pty::CommissionArm::Armed { .. } => {}
+            other => panic!("priming the ledger must arm a commission, got {other:?}"),
+        }
+        let (event_tx, _event_rx) = broadcast::channel(16);
+        let signal = || DelegateSignal {
+            pane_id: "A_orch".to_string(),
+            task: "probe".to_string(),
+            to: vec!["coder".to_string()],
+            supersede: false,
+            timestamp: Utc::now(),
+            token: None,
+        };
+
+        let predecessor = state
+            .handle_attested_delegate(signal(), &registry, &event_tx, None, Some("orch-agent-1"))
+            .await;
+        assert_eq!(
+            predecessor.busy.len(),
+            1,
+            "the delegating orchestrator is refused: {predecessor:?}"
+        );
+
+        let successor = state
+            .handle_attested_delegate(signal(), &registry, &event_tx, None, Some("orch-agent-2"))
+            .await;
+        assert_eq!(
+            successor.delivered,
+            vec!["coder".to_string()],
+            "{successor:?}"
+        );
+        assert_eq!(successor.superseded.len(), 1, "{successor:?}");
     }
 
     /// Issue #580: a busy worker beside an idle one is a PARTIAL outcome, like
