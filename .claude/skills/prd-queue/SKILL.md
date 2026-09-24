@@ -517,8 +517,13 @@ reviews once, a few minutes after the PR opens, and never again —
 greptile.json sets triggerOnUpdates: false, so do NOT wait for a re-review
 after you push fixes. Qodo, evaluated beside it, re-reviews on EVERY push
 (.pr_agent.toml): after your last push, wait (bounded) for its re-review and
-answer what it raised. Its inline findings arrive at the same endpoint and
-are answered and resolved the same way. Greptile's findings live ONLY at
+answer what it raised. Do NOT wait for a Qodo check-run — it creates none
+(measured 2026-09-24 on #1235, #1257, #1271); it edits one summary comment in
+place and that body names the head SHA it reviewed, which is the signal. Its
+medium-and-above findings arrive at the same endpoint and are answered and
+resolved the same way; its informational tier stays in that summary comment
+(inline_comments_severity_threshold = 2), so read both. Greptile's findings
+live ONLY at
 `gh api repos/<owner>/<repo>/pulls/<pr>/comments --paginate`; the green
 `Greptile Review` check and the summary comment carry none of them. Keep the
 --paginate: replies count toward the page, so without it a busy PR silently
