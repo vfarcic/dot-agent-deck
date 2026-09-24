@@ -3717,6 +3717,13 @@ struct DelegationCommission {
     /// specific orchestrator, and a pane id freed by a close can be inherited by
     /// an unrelated agent that commissioned nothing.
     orchestrator_pane_id: String,
+    /// Issue #580 review (Qodo): the registry agent id of the orchestrator that
+    /// armed the newest commission, when it was known. Last delegate wins, like
+    /// `orchestrator_pane_id`. Read only by the busy check: a commission owed to
+    /// an orchestrator conversation that has since been REPLACED in its pane —
+    /// an agent exit that took no close path, so nothing swept the ledger — must
+    /// not refuse the successor, which never delegated that work.
+    orchestrator_agent_id: Option<String>,
 }
 
 /// Issue #590: how long a commission stays owed without a `work-done` crediting
@@ -3748,6 +3755,7 @@ impl DelegationCommission {
             armed_at: VecDeque::new(),
             untimed: 0,
             orchestrator_pane_id: orchestrator_pane_id.to_string(),
+            orchestrator_agent_id: None,
         }
     }
 
@@ -4845,15 +4853,26 @@ impl AgentPtyRegistry {
     /// would relabel the second task's genuine completion. The commissions a
     /// replaced agent can no longer answer are retired by
     /// [`Self::retire_commissions_of_replaced_agent`], not here.
+    ///
+    /// `orchestrator_agent_id` is the delegating orchestrator's registry agent id
+    /// when known. The refusal applies only to the SAME orchestrator conversation
+    /// asking again: when the entry was armed by a different, known orchestrator
+    /// agent — its predecessor in the pane, gone without a close sweeping the
+    /// ledger — the delegate is dispatched as superseding (counted and reported,
+    /// never refused), because the successor cannot know about work it never
+    /// delegated. When either id is unknown the entry is treated as the same
+    /// orchestrator's, so an unresolvable identity never waives the refusal.
     pub fn arm_delegation_commission(
         self: &Arc<Self>,
         worker_pane_id: &str,
         orchestrator_pane_id: &str,
+        orchestrator_agent_id: Option<&str>,
         supersede: bool,
     ) -> CommissionArm {
         self.arm_delegation_commission_at(
             worker_pane_id,
             orchestrator_pane_id,
+            orchestrator_agent_id,
             supersede,
             Instant::now(),
         )
@@ -4865,6 +4884,7 @@ impl AgentPtyRegistry {
         self: &Arc<Self>,
         worker_pane_id: &str,
         orchestrator_pane_id: &str,
+        orchestrator_agent_id: Option<&str>,
         supersede: bool,
         now: Instant,
     ) -> CommissionArm {
@@ -4881,7 +4901,11 @@ impl AgentPtyRegistry {
             .or_insert_with(|| DelegationCommission::new(orchestrator_pane_id));
         let superseded = entry.outstanding();
         let superseded_oldest_age = entry.oldest_age(now);
-        if superseded > 0 && !supersede {
+        let owed_to_a_replaced_orchestrator = matches!(
+            (entry.orchestrator_agent_id.as_deref(), orchestrator_agent_id),
+            (Some(owed_to), Some(caller)) if owed_to != caller
+        );
+        if superseded > 0 && !supersede && !owed_to_a_replaced_orchestrator {
             return CommissionArm::Busy {
                 outstanding: superseded,
                 oldest_age: superseded_oldest_age,
@@ -4892,6 +4916,7 @@ impl AgentPtyRegistry {
         // closed, successor spawned onto the same id) must not leave the ledger
         // pointing its close sweep at the dead pane.
         entry.orchestrator_pane_id = orchestrator_pane_id.to_string();
+        entry.orchestrator_agent_id = orchestrator_agent_id.map(str::to_string);
         let in_flight = tracker
             .commission_dispatches_in_flight
             .entry(worker_pane_id.to_string())
@@ -16123,7 +16148,7 @@ mod spawn_tests {
     /// refused — and report whether it was recorded. The in-flight guard is
     /// dropped at once, as a dispatch task that has taken the pane lock would.
     fn arm_commission(reg: &Arc<AgentPtyRegistry>, worker: &str, orch: &str) -> bool {
-        match reg.arm_delegation_commission(worker, orch, true) {
+        match reg.arm_delegation_commission(worker, orch, None, true) {
             CommissionArm::Armed { .. } => true,
             CommissionArm::Closing => false,
             CommissionArm::Busy { .. } => panic!("a superseding arm is never refused as busy"),
@@ -16258,7 +16283,7 @@ mod spawn_tests {
         let second = Duration::from_secs(1);
 
         assert!(matches!(
-            reg.arm_delegation_commission_at("worker", "orch", false, t0),
+            reg.arm_delegation_commission_at("worker", "orch", None, false, t0),
             CommissionArm::Armed { superseded: 0, .. }
         ));
         assert_eq!(
@@ -16268,7 +16293,7 @@ mod spawn_tests {
         );
 
         assert!(matches!(
-            reg.arm_delegation_commission_at("worker", "orch", false, t0),
+            reg.arm_delegation_commission_at("worker", "orch", None, false, t0),
             CommissionArm::Armed { .. }
         ));
         assert_eq!(
@@ -16289,11 +16314,11 @@ mod spawn_tests {
         let day = Duration::from_secs(24 * 60 * 60);
 
         assert!(matches!(
-            reg.arm_delegation_commission_at("worker", "orch", false, t0),
+            reg.arm_delegation_commission_at("worker", "orch", None, false, t0),
             CommissionArm::Armed { .. }
         ));
         assert!(matches!(
-            reg.arm_delegation_commission_at("worker", "orch", true, t0 + 3 * day),
+            reg.arm_delegation_commission_at("worker", "orch", None, true, t0 + 3 * day),
             CommissionArm::Armed { superseded: 1, .. }
         ));
         let after_first_expiry = t0 + DELEGATION_COMMISSION_TTL + day;
@@ -16310,11 +16335,11 @@ mod spawn_tests {
         // A credited completion drops the OLDEST arm time, so the survivor keeps
         // the newest and cannot expire earlier than its own delegation would.
         assert!(matches!(
-            reg.arm_delegation_commission_at("worker", "orch", false, t0),
+            reg.arm_delegation_commission_at("worker", "orch", None, false, t0),
             CommissionArm::Armed { .. }
         ));
         assert!(matches!(
-            reg.arm_delegation_commission_at("worker", "orch", true, t0 + 3 * day),
+            reg.arm_delegation_commission_at("worker", "orch", None, true, t0 + 3 * day),
             CommissionArm::Armed { .. }
         ));
         assert_eq!(
@@ -16339,10 +16364,10 @@ mod spawn_tests {
         let minute = Duration::from_secs(60);
 
         assert!(matches!(
-            reg.arm_delegation_commission_at("worker", "orch", false, t0),
+            reg.arm_delegation_commission_at("worker", "orch", None, false, t0),
             CommissionArm::Armed { superseded: 0, .. }
         ));
-        match reg.arm_delegation_commission_at("worker", "orch", false, t0 + 5 * minute) {
+        match reg.arm_delegation_commission_at("worker", "orch", None, false, t0 + 5 * minute) {
             CommissionArm::Busy {
                 outstanding,
                 oldest_age,
@@ -16352,7 +16377,7 @@ mod spawn_tests {
             }
             other => panic!("a second plain delegate must be refused as busy, got {other:?}"),
         }
-        match reg.arm_delegation_commission_at("worker", "orch", true, t0 + 6 * minute) {
+        match reg.arm_delegation_commission_at("worker", "orch", None, true, t0 + 6 * minute) {
             CommissionArm::Armed {
                 superseded,
                 superseded_oldest_age,
@@ -16368,6 +16393,7 @@ mod spawn_tests {
                 reg.arm_delegation_commission_at(
                     "worker",
                     "orch",
+                    None,
                     false,
                     t0 + 6 * minute + DELEGATION_COMMISSION_TTL
                 ),
@@ -16377,9 +16403,53 @@ mod spawn_tests {
         );
         // Another worker is unaffected by this one's debt.
         assert!(matches!(
-            reg.arm_delegation_commission_at("other", "orch", false, t0),
+            reg.arm_delegation_commission_at("other", "orch", None, false, t0),
             CommissionArm::Armed { superseded: 0, .. }
         ));
+    }
+
+    /// Issue #580 review (Qodo): the refusal is for the SAME orchestrator asking
+    /// again. A commission armed by an orchestrator agent that has since been
+    /// replaced in its pane — without a close sweeping the ledger — must not
+    /// refuse the successor, which never delegated that work: its delegate is
+    /// dispatched as superseding. An unknown identity on either side never
+    /// waives the refusal.
+    #[test]
+    fn commission_ledger_does_not_refuse_a_successor_orchestrator() {
+        let reg = Arc::new(AgentPtyRegistry::new());
+        let t0 = Instant::now();
+        assert!(matches!(
+            reg.arm_delegation_commission_at("worker", "orch", Some("orch-agent-1"), false, t0),
+            CommissionArm::Armed { superseded: 0, .. }
+        ));
+        assert!(
+            matches!(
+                reg.arm_delegation_commission_at("worker", "orch", Some("orch-agent-1"), false, t0),
+                CommissionArm::Busy { outstanding: 1, .. }
+            ),
+            "the orchestrator that delegated is refused a second task for the same worker"
+        );
+        assert!(
+            matches!(
+                reg.arm_delegation_commission_at("worker", "orch", None, false, t0),
+                CommissionArm::Busy { .. }
+            ),
+            "an unresolvable caller identity does not waive the refusal"
+        );
+        assert!(
+            matches!(
+                reg.arm_delegation_commission_at("worker", "orch", Some("orch-agent-2"), false, t0),
+                CommissionArm::Armed { superseded: 1, .. }
+            ),
+            "a successor orchestrator is dispatched as superseding, not refused"
+        );
+        assert!(
+            matches!(
+                reg.arm_delegation_commission_at("worker", "orch", Some("orch-agent-2"), false, t0),
+                CommissionArm::Busy { outstanding: 2, .. }
+            ),
+            "once the successor has delegated, the refusal is its own again"
+        );
     }
 
     /// Issue #590: replacing a worker's agent retires what only the replaced
@@ -16394,7 +16464,7 @@ mod spawn_tests {
         // guard is dropped) and wrote the pointer.
         assert!(arm_commission(&reg, "worker", "orch"));
         // Still queued behind the lock: its guard is alive.
-        let queued = match reg.arm_delegation_commission("worker", "orch", true) {
+        let queued = match reg.arm_delegation_commission("worker", "orch", None, true) {
             CommissionArm::Armed { in_flight, .. } => in_flight,
             other => panic!("expected an armed commission, got {other:?}"),
         };
@@ -16441,7 +16511,7 @@ mod spawn_tests {
         let total = MAX_TIMED_COMMISSIONS as u32 + 3;
         for i in 0..total {
             assert!(matches!(
-                reg.arm_delegation_commission_at("worker", "orch", true, t0 + second * i),
+                reg.arm_delegation_commission_at("worker", "orch", None, true, t0 + second * i),
                 CommissionArm::Armed { superseded, .. } if superseded == i
             ));
         }

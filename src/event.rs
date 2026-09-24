@@ -1680,9 +1680,11 @@ pub struct DelegateResponse {
     /// which is `changelog.d/580.breaking.md`.
     #[serde(default)]
     pub busy: Vec<BusyWorker>,
-    /// Issue #580: roles that WERE dispatched under `--supersede` while their
-    /// worker still owed a `work-done` — the supersession, reported instead of
-    /// silent. A role listed here is also in `delivered`.
+    /// Issue #580: roles that WERE dispatched while their worker still owed a
+    /// `work-done` — the supersession, reported instead of silent. Either the
+    /// caller passed `--supersede`, or what was owed had been delegated by an
+    /// orchestrator agent since replaced in its pane, which the successor is
+    /// not refused over. A role listed here is also in `delivered`.
     #[serde(default)]
     pub superseded: Vec<BusyWorker>,
 }

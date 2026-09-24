@@ -2264,7 +2264,13 @@ fn record_delegation_commission(
     orchestrator_pane_id: &str,
     supersede: bool,
 ) -> crate::agent_pty::CommissionArm {
-    let arm = registry.arm_delegation_commission(worker_pane_id, orchestrator_pane_id, supersede);
+    let orchestrator_agent_id = registry.pane_current_agent_id(orchestrator_pane_id);
+    let arm = registry.arm_delegation_commission(
+        worker_pane_id,
+        orchestrator_pane_id,
+        orchestrator_agent_id.as_deref(),
+        supersede,
+    );
     match &arm {
         crate::agent_pty::CommissionArm::Closing => {
             tracing::debug!(
@@ -2292,7 +2298,8 @@ fn record_delegation_commission(
                 pane_id = %worker_pane_id,
                 role = %role,
                 superseded,
-                "delegate --supersede: dispatching to a worker that still owes a work-done"
+                "delegate: dispatching to a worker that still owes a work-done (--supersede, or \
+                 owed to an orchestrator agent since replaced in its pane)"
             );
         }
         crate::agent_pty::CommissionArm::Armed { .. } => {}
@@ -12159,7 +12166,7 @@ mod tests {
     /// delegate leaves it — the in-flight guard dropped, as the dispatch task
     /// drops it once it holds the pane lock.
     fn owe_work_done(registry: &Arc<AgentPtyRegistry>, worker_pane: &str) {
-        match registry.arm_delegation_commission(worker_pane, "A_orch", false) {
+        match registry.arm_delegation_commission(worker_pane, "A_orch", None, false) {
             crate::agent_pty::CommissionArm::Armed { .. } => {}
             other => panic!("priming the ledger must arm a commission, got {other:?}"),
         }

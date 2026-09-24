@@ -945,10 +945,11 @@ async fn pane_restart_012_force_restart_cancels_the_task_a_busy_refusal_names() 
     // `clear = false`, so a delegate writes into the live `cat` rather than
     // respawning it and waiting out a `SessionStart` a `cat` never sends. The
     // config is read on every delegate, so rewriting it here is enough.
-    std::fs::write(
+    tokio::fs::write(
         fx._dir.path().join(".dot-agent-deck.toml"),
         format!("{}clear = false\n", config("cat")),
     )
+    .await
     .expect("rewrite the orchestration config with a clear = false worker");
 
     let first = delegate_to_worker(&fx, false).await;

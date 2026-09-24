@@ -792,9 +792,9 @@ fn delegate_verdict(
     let mut notes: Vec<String> = Vec::new();
     if !resp.superseded.is_empty() {
         notes.push(format!(
-            "Note: --supersede dispatched to worker(s) that still owed a work-done: {}. Their \
-             earlier task is not cancelled — its work-done, if it comes, is credited like any \
-             other.",
+            "Note: dispatched to worker(s) that still owed a work-done for an earlier \
+             delegation: {}. That earlier task is not cancelled — its work-done, if it comes, is \
+             credited like any other.",
             dot_agent_deck::state::describe_busy_workers(&resp.superseded)
         ));
     }
@@ -3525,7 +3525,7 @@ mod tests {
         assert!(!v.failed);
         let msg = v.message.expect("a supersession must be reported");
         assert!(
-            msg.contains("--supersede") && msg.contains("`coder`"),
+            msg.contains("still owed a work-done") && msg.contains("`coder`"),
             "the note must name the superseded worker: {msg}"
         );
     }
