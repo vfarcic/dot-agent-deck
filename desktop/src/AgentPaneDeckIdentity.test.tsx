@@ -433,7 +433,12 @@ describe("agent pane identity fence", () => {
     const pane = await screen.findByTestId("agent-pane-overlay");
     const undo = screen.getByRole("button", { name: "Undo" });
 
-    expect(screen.getByTestId("deck-selector-toggle").closest("[inert]")).not.toBeNull();
+    // `useInertBackground` marks the background from an effect, which can land
+    // after the render `findByTestId` resolved on; seen failing intermittently on
+    // CI runners (PR #1285) while passing locally. Wait for it rather than race it.
+    await waitFor(() =>
+      expect(screen.getByTestId("deck-selector-toggle").closest("[inert]")).not.toBeNull(),
+    );
     // Voice and its report are peers, not background. Equality to this complete
     // set keeps the containment assertion strict: any other reachable control
     // is a regression, rather than something an allow-list filter could hide.
