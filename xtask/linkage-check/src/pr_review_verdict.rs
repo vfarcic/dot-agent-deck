@@ -1059,8 +1059,27 @@ fn a_review_pinned_to_this_head_counts() {
 fn an_inline_finding_pinned_to_this_head_counts() {
     assert_py_ok(
         "assert independent_review_at(SHA, [], \
-         [{'user': {'login': 'qodo-code-review[bot]'}, 'commit_id': SHA}], []) \
+         [{'user': {'login': 'qodo-code-review[bot]'}, 'commit_id': SHA, \
+         'original_commit_id': SHA}], []) \
          == 'qodo-code-review[bot]'",
+    );
+}
+
+/// Scenario: an inline finding written against an EARLIER commit, on a pull
+/// request whose head has since moved. GitHub re-anchors `commit_id` to the
+/// current head for a comment that still applies, so the old finding reports
+/// today's SHA — measured on #1235, where a comment created two days earlier
+/// against `1540db0f` came back as `commit_id=e4596523`. Reading that field
+/// would make this gate vacuous on any pull request that ever received an
+/// inline comment, so only `original_commit_id` counts.
+#[test]
+fn a_finding_re_anchored_to_this_head_does_not_count() {
+    assert_py_ok(
+        "older = '1' * 40\n\
+         moved = [{'user': {'login': 'greptile-apps[bot]'}, 'commit_id': SHA, \
+         'original_commit_id': older}]\n\
+         assert independent_review_at(SHA, [], moved, []) is None\n\
+         assert independent_review_at(older, [], moved, []) == 'greptile-apps[bot]'",
     );
 }
 

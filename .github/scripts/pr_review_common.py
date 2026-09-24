@@ -489,7 +489,13 @@ def independent_review_at(sha, comments, review_comments, reviews):
     Three shapes count, because the two products express it differently:
 
       * a submitted review whose `commit_id` is the head — Greptile's shape;
-      * an inline review comment pinned to the head — how a finding arrives;
+      * an inline review comment whose ORIGINAL_commit_id is the head — how a
+        finding arrives. `original_commit_id` and not `commit_id`: GitHub
+        RE-ANCHORS `commit_id` to the current head for a comment that still
+        applies, so an old finding reports today's SHA and would satisfy this
+        gate without its author having read one new line. Measured 2026-09-24
+        on #1235 — a Greptile comment created on the 22nd against `1540db0f`
+        reported `commit_id=e4596523`, the head pushed minutes earlier;
       * an issue comment by such a reviewer whose body NAMES the head SHA —
         Qodo's shape, because it edits one summary comment in place as new
         commits land rather than posting a new one. Measured 2026-09-24 on
@@ -514,7 +520,10 @@ def independent_review_at(sha, comments, review_comments, reviews):
             return login
     for comment in review_comments or ():
         login = ((comment.get("user") or {}).get("login")) or ""
-        if login in INDEPENDENT_REVIEWERS and comment.get("commit_id") == sha:
+        # `original_commit_id` is where the comment was WRITTEN; `commit_id`
+        # follows the head. See the docstring -- reading the latter makes this
+        # gate vacuous on any pull request that ever received an inline finding.
+        if login in INDEPENDENT_REVIEWERS and comment.get("original_commit_id") == sha:
             return login
     for comment in comments or ():
         login = ((comment.get("user") or {}).get("login")) or ""
@@ -753,13 +762,17 @@ def pr_comments(repo, pr_number):
 def pr_review_comments(repo, pr_number):
     """Every INLINE review comment, paginated. Same paging reason as its siblings.
 
-    `commit_id` is what makes these useful to `independent_review_at`: an inline
-    finding is pinned to the commit it was written against, so it answers "did
+    `original_commit_id` is what makes these useful to `independent_review_at`:
+    it is the commit the finding was WRITTEN against, so it answers "did
     somebody independent look at THIS head" without parsing anyone's prose.
+
+    `commit_id` is fetched too, and is deliberately NOT that answer: GitHub
+    moves it to the current head for a comment that still applies, so it says
+    where a finding is displayed rather than what its author read.
     """
     return gh_json_paginated(
         "api", f"repos/{repo}/pulls/{pr_number}/comments", "--paginate",
-        "--jq", "[.[] | {commit_id, body, user: {login: .user.login}}]",
+        "--jq", "[.[] | {commit_id, original_commit_id, body, user: {login: .user.login}}]",
     )
 
 
