@@ -1742,13 +1742,20 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
  * dismisses THAT warning.
  */
 function Toast({ message, onDismiss, warnings, onDismissWarning }: { message?: string; onDismiss: () => void; warnings?: readonly CleanupWarningEntry[]; onDismissWarning?: (id: number) => void }) {
+  /* The newest entries are at the bottom, so an overflowing stack is kept
+     scrolled there whenever something is added or the message changes. */
+  const stack = useRef<HTMLDivElement>(null);
+  const newestWarning = warnings?.at(-1)?.id;
+  useEffect(() => {
+    if (stack.current) stack.current.scrollTop = stack.current.scrollHeight;
+  }, [newestWarning, message]);
   if (!message && !warnings?.length) return null;
   return (
-    <div className="toast-stack">
+    <div className="toast-stack" ref={stack}>
       {warnings?.map((warning) => (
         <div key={warning.id} className="toast" data-testid="cleanup-toast">
           <AlertTriangle size={15} />
-          <CleanupWarning stops={warning.stops} testId="toast-cleanup-warning" className="toast-body" />
+          <CleanupWarning stops={warning.stops} deck={warning.deck} testId="toast-cleanup-warning" className="toast-body" />
           <button aria-label="Dismiss cleanup warning" onClick={() => onDismissWarning?.(warning.id)}><X size={14} /></button>
         </div>
       ))}

@@ -990,6 +990,13 @@ export interface AgentTarget {
 export interface CleanupWarningEntry {
   id: number;
   stops: readonly string[];
+  /**
+   * The deck the failed action was sent to, as a display label (`deckName`),
+   * resolved when it failed. The warning outlives the screen and the selection
+   * it was raised under, so "this deck" would name whichever deck is selected
+   * when it is read. Absent only when that deck was not in the fleet.
+   */
+  deck?: string;
 }
 
 export interface DeckRuntimeState {

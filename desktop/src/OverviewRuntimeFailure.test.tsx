@@ -137,7 +137,7 @@ describe("a launch failure that lands while the overview is up (PRD #1223 audit 
 
     const toast = await screen.findByTestId("toast");
     const warning = screen.getByTestId("toast-cleanup-warning");
-    expect(warning).toHaveTextContent("2 roles may still be running on this deck");
+    expect(warning).toHaveTextContent("2 roles may still be running on Local deck");
     expect(warning).toHaveTextContent("orchestrator");
     expect(warning).toHaveTextContent("planner");
     expect(toast).toHaveTextContent("failed to start orchestration role");
@@ -188,7 +188,7 @@ describe("an unconfirmed-stop warning outlives the failure slot (issue #1234)", 
 
     expect(screen.getByTestId("toast")).toHaveTextContent("publish-failed");
     const warning = screen.getByTestId("toast-cleanup-warning");
-    expect(warning).toHaveTextContent("1 role may still be running on this deck");
+    expect(warning).toHaveTextContent("1 role may still be running on Local deck");
     expect(warning).toHaveTextContent("orchestrator");
 
     // Refresh clears the sentence slot, and a successful one leaves it empty.

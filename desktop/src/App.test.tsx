@@ -817,6 +817,24 @@ describe("ControlDeck", () => {
   });
 
   /**
+   * Scenario (issue #1234 review): warnings pile up oldest first, with the
+   * message last, in a stack that scrolls once it is taller than its cap. A
+   * newly queued warning must not land below the visible part of it, so the
+   * stack is scrolled to its bottom when one arrives.
+   */
+  it("scrolls the message stack to the newest cleanup warning", () => {
+    const view = render(<ControlDeck runtime={runtime({ cleanupWarnings: [{ id: 1, stops: ["planner"] }] })} />);
+    const stack = view.container.querySelector(".toast-stack") as HTMLDivElement;
+    let scrolledTo = 0;
+    Object.defineProperty(stack, "scrollHeight", { configurable: true, get: () => 900 });
+    Object.defineProperty(stack, "scrollTop", { configurable: true, get: () => scrolledTo, set: (value: number) => { scrolledTo = value; } });
+
+    view.rerender(<ControlDeck runtime={runtime({ cleanupWarnings: [{ id: 1, stops: ["planner"] }, { id: 2, stops: ["coder"] }] })} />);
+
+    expect(scrolledTo).toBe(900);
+  });
+
+  /**
    * PRD #1223 audit V2: a stale-preparation refusal of a LATER role, after an
    * earlier one had started, whose rollback stop the deck then refused. The
    * sentence carries `stale-preparation:`, which the case above translates

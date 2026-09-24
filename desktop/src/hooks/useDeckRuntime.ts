@@ -6,6 +6,7 @@ import { voiceDeckStep } from "../lib/newAgent";
 import { agentKey } from "../lib/agentKey";
 import { LaunchCleanupError } from "../lib/actionError";
 import { applyTerminalChunk } from "../lib/terminalBuffer";
+import { deckName } from "../lib/displayText";
 const EMPTY_TERMINAL_DATA: Record<string, TerminalBuffer> = {};
 import { isDelivered } from "../types";
 import type { AgentTarget, CleanupWarningEntry, DeckAction, DeckFleet, DeckRuntimeState, DeckSnapshot, RuntimeMode, SendResult, TerminalBuffer } from "../types";
@@ -77,6 +78,11 @@ export function useDeckRuntime(): DeckRuntimeState {
    */
   const selectedDeckIdRef = useRef<string | undefined>(snapshot.connection.deckId);
   selectedDeckIdRef.current = snapshot.connection.deckId;
+  /* PRD #1223 — the fleet as of the last render, so a declaration made from a
+     callback describes the deck step the New agent dialog would show NOW, and
+     a cleanup warning (issue #1234) names the deck its action was sent to. */
+  const fleetRef = useRef(fleet);
+  fleetRef.current = fleet;
   /**
    * The latest reported failure's sentence, or nothing.
    *
@@ -315,7 +321,11 @@ export function useDeckRuntime(): DeckRuntimeState {
       // a later rejection replacing the sentence above cannot take them too.
       if (cause instanceof LaunchCleanupError) {
         nextCleanupWarningId.current += 1;
-        const entry = { id: nextCleanupWarningId.current, stops: cause.unconfirmedStops };
+        // A deck-scoped action names its deck; every other one went to the
+        // selection as it was when the action was sent.
+        const targetDeckId = "deckId" in action && typeof action.deckId === "string" ? action.deckId : sentToDeckId;
+        const target = fleetRef.current.find((deck) => deck.connection.deckId === targetDeckId);
+        const entry: CleanupWarningEntry = { id: nextCleanupWarningId.current, stops: cause.unconfirmedStops, ...(target ? { deck: deckName(target.connection) } : {}) };
         setCleanupWarnings((current) => [...current, entry]);
       }
       throw cause;
@@ -378,10 +388,6 @@ export function useDeckRuntime(): DeckRuntimeState {
    * routing "no matching action" into the deck's global error toast would
    * present a voice answer as a fault of the screen behind it.
    */
-  /* PRD #1223 — the fleet as of the last render, so a declaration made from a
-     callback describes the deck step the New agent dialog would show NOW. */
-  const fleetRef = useRef(fleet);
-  fleetRef.current = fleet;
   /* Every declaration carries the New agent dialog's deck step, computed from
      the same `fleet` the dialog reads, so what voice says it preselected and
      what the dialog preselects are judged against one list. */

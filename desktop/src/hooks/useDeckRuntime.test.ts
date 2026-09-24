@@ -1,7 +1,8 @@
 import { act, renderHook, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { createFixtureFleet, createFixtureSnapshot, FIXTURE_DAEMON_ID, FIXTURE_UNREACHABLE_DAEMON_ID } from "../data/fixture";
+import { createFixtureFleet, createFixtureSnapshot, FIXTURE_DAEMON_ID, FIXTURE_REMOTE_DAEMON_ID, FIXTURE_UNREACHABLE_DAEMON_ID } from "../data/fixture";
 import { agentKey } from "../lib/agentKey";
+import { deckName } from "../lib/displayText";
 import type { DeckBridge } from "../lib/bridge";
 import { LaunchCleanupError } from "../lib/actionError";
 import { terminalInputState } from "../lib/terminalInput";
@@ -329,5 +330,28 @@ describe("useDeckRuntime", () => {
     expect(result.current.cleanupWarnings).toEqual([second]);
     act(() => result.current.dismissCleanupWarning?.(second.id));
     expect(result.current.cleanupWarnings).toEqual([]);
+  });
+
+  /**
+   * Issue #1234 review: a warning outlives the selection it was raised under,
+   * so it must name the deck its action was SENT to. A deck-scoped close of an
+   * orchestration on the remote deck, from a fleet whose selected deck is the
+   * local one, is labelled with the remote deck; an action that names no deck
+   * is labelled with the deck that was selected when it was sent.
+   */
+  it("labels a cleanup warning with the deck its action was sent to", async () => {
+    bridge.connect.mockResolvedValue(createFixtureFleet("fleet"));
+    bridge.runAction.mockRejectedValue(new LaunchCleanupError("close failed; cleanup could not confirm stop for 1 role(s)", ["planner"]));
+    const { result } = renderHook(() => useDeckRuntime());
+    await waitFor(() => expect(result.current.fleet.length).toBeGreaterThan(1));
+    const remote = result.current.fleet.find((deck) => deck.connection.deckId === FIXTURE_REMOTE_DAEMON_ID)!;
+
+    await act(async () => {
+      await result.current.runAction({ type: "stop_orchestration", deckId: FIXTURE_REMOTE_DAEMON_ID, roles: [{ agentId: "agent-1", name: "planner" }] }).catch(() => {});
+      await result.current.runAction({ type: "pause_run" }).catch(() => {});
+    });
+
+    expect(result.current.snapshot.connection.deckId).not.toBe(FIXTURE_REMOTE_DAEMON_ID);
+    expect(result.current.cleanupWarnings?.map((warning) => warning.deck)).toEqual([deckName(remote.connection), "Local deck"]);
   });
 });
