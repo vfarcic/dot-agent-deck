@@ -372,27 +372,40 @@ outcome = "dispatch"
 dictate_prefix = "tell it to"
 
 # PRD #1223 — `open_new_agent`, the first row with a `deck_ref` and the first
-# optional param. The bare phrase must dispatch with no deck; a named deck must
+# optional param. The bare phrase must open the dialog; a named deck must
 # resolve against the planted fleet; and the deck screen must say where the
 # dialog lives rather than guess.
+#
+# These fixtures, and the six other deck-less openers below, used to assert
+# `no_deck = true` — nothing preselected. That held only because reference
+# grounding dropped a deck the model filled in unasked; since 2026-09-24 a
+# deck the model supplies that is on screen is preselected, and the field was
+# removed as a premise change. Measured the run it was found: "spawn an
+# agent" came back with the local deck in one run of two.
 [[fixtures]]
 name = "open-new-agent-bare"
 utterance = "start a new agent"
 screen = "overview"
 action = "open_new_agent"
 outcome = "dispatch"
-no_deck = true
 
 # The user's own first phrasing, which was refused as `you did not name "Local
-# deck"` when the model filled the optional deck in: it must open the dialog
-# with no deck preselected, whatever the model does with the optional param.
+# deck"` when the model filled the optional deck in: it must open the dialog.
+# (It also asserted `no_deck = true`; see above.)
 [[fixtures]]
 name = "open-new-agent-create"
 utterance = "Create a new agent"
 screen = "overview"
 action = "open_new_agent"
 outcome = "dispatch"
-no_deck = true
+
+[[fixtures]]
+name = "open-new-agent-on-the-remote-deck"
+utterance = "new agent on the remote deck"
+screen = "overview"
+action = "open_new_agent"
+outcome = "dispatch"
+resolved_deck = "deck-build-box"
 
 [[fixtures]]
 name = "open-new-agent-on-deck"
@@ -452,6 +465,35 @@ listing = true
 action = "open_dir"
 outcome = "dispatch"
 resolved_dir = "/home/dev/code/docs"
+
+# PRD #1223, 2026-09-24 — a directory by part of its name, and as a
+# transcriber spells it, now that the resolved name need not be said exactly.
+[[fixtures]]
+name = "open-dir-by-one-word"
+utterance = "open the billing folder"
+screen = "overview"
+listing = true
+action = "open_dir"
+outcome = "dispatch"
+resolved_dir = "/home/dev/code/billing-service"
+
+[[fixtures]]
+name = "open-dir-transcribed-dots"
+utterance = "open dot agent dot deck"
+screen = "overview"
+listing = true
+action = "open_dir"
+outcome = "dispatch"
+resolved_dir = "/home/dev/code/dot-agent-deck"
+
+[[fixtures]]
+name = "open-dir-by-its-last-word"
+utterance = "go into the service directory"
+screen = "overview"
+listing = true
+action = "open_dir"
+outcome = "dispatch"
+resolved_dir = "/home/dev/code/billing-service"
 
 [[fixtures]]
 name = "open-dir-navigate"
@@ -654,7 +696,6 @@ utterance = "start it"
 screen = "overview"
 action = "open_new_agent"
 outcome = "dispatch"
-no_deck = true
 
 [[fixtures]]
 name = "stop-agent"
@@ -751,6 +792,55 @@ action = "close_orchestration"
 outcome = "dispatch"
 resolved_orchestration = "build"
 
+# PRD #1223, 2026-09-24 — references are no longer held against the
+# transcript. The user's own report first: with `dot-agent-deck-orchestrator-1`
+# on the overview (`generated_run = true`), "Stop the orchestration 1." was
+# refused as `you did not name "dot-agent-deck-orchestrator-1"`. The
+# confirmation it opens is the control; the name need not be said exactly.
+[[fixtures]]
+name = "close-orchestration-by-number"
+utterance = "Stop the orchestration 1."
+screen = "overview"
+generated_run = true
+action = "close_orchestration"
+outcome = "dispatch"
+resolved_orchestration = "dot-agent-deck-orchestrator-1"
+
+[[fixtures]]
+name = "close-orchestration-by-category"
+utterance = "close the orchestration"
+screen = "overview"
+generated_run = true
+action = "close_orchestration"
+outcome = "dispatch"
+resolved_orchestration = "dot-agent-deck-orchestrator-1"
+
+[[fixtures]]
+name = "close-orchestration-transcribed-dots"
+utterance = "stop the dot agent dot deck orchestration"
+screen = "overview"
+generated_run = true
+action = "close_orchestration"
+outcome = "dispatch"
+resolved_orchestration = "dot-agent-deck-orchestrator-1"
+
+[[fixtures]]
+name = "close-orchestration-the-whole-run"
+utterance = "shut down the whole run"
+screen = "overview"
+action = "close_orchestration"
+outcome = "dispatch"
+resolved_orchestration = "build"
+
+[[fixtures]]
+name = "stop-agent-by-role-in-generated-run"
+utterance = "stop the coder"
+screen = "overview"
+generated_run = true
+action = "stop_agent"
+outcome = "dispatch"
+resolved_agent = "agent-gen-coder"
+
 # D2: "start it" starts, with no confirmation after it (vitest proves the
 # dispatch reaches the dialog's start). D3: "start the new agent" with the
 # dialog CLOSED opens it rather than being refused.
@@ -768,7 +858,6 @@ utterance = "Start the new agent"
 screen = "overview"
 action = "open_new_agent"
 outcome = "dispatch"
-no_deck = true
 
 # D4: vocabulary gaps. `spawn` and `another` were in no vocabulary.
 [[fixtures]]
@@ -777,7 +866,6 @@ utterance = "spawn an agent"
 screen = "overview"
 action = "open_new_agent"
 outcome = "dispatch"
-no_deck = true
 
 [[fixtures]]
 name = "open-new-agent-another"
@@ -785,7 +873,6 @@ utterance = "I want another agent"
 screen = "overview"
 action = "open_new_agent"
 outcome = "dispatch"
-no_deck = true
 
 # "Cancel" is the most natural word for dismissing a dialog, and the dialog has
 # no Cancel button any more (U2), so voice is the only place it can land.
@@ -872,7 +959,6 @@ utterance = "Start orchestration"
 screen = "overview"
 action = "open_new_agent"
 outcome = "dispatch"
-no_deck = true
 
 [[fixtures]]
 name = "new-agent-button-label"
@@ -880,7 +966,6 @@ utterance = "New agent"
 screen = "overview"
 action = "open_new_agent"
 outcome = "dispatch"
-no_deck = true
 
 [[fixtures]]
 name = "open-deck-button-label"

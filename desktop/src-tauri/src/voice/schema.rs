@@ -132,7 +132,10 @@ pub const TOOL_INSTRUCTIONS: &str = "Pick the deck action the user asked for. Pi
     names one of THOSE, answered with the words the user used for it. \
     `orchestrations` lists the orchestrations among those agents by `title`, with \
     their roles; an `orchestration_ref` param names one of them, answered with the \
-    words the user used for it. When the user's words could mean closing a VIEW \
+    words the user used for it. When the user refers to a deck, a directory or an \
+    orchestration by its position or by what kind of thing it is rather than by a \
+    word of its name — \"the first one\", \"the remote deck\", \"the other run\" — \
+    answer with that entry's name exactly as listed. When the user's words could mean closing a VIEW \
     or stopping something — \"close the agent\" — they mean the view: pick the \
     action that stops nothing, and pick a stop only for words that can only mean \
     stopping. An action that stops something only ASKS: the app shows a \

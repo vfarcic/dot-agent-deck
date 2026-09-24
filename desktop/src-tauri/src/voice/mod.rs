@@ -500,6 +500,30 @@ pub mod test_support {
         agent
     }
 
+    /// The same role agent as a member of the orchestration `id`, running the
+    /// config `name` under the run title `title` — the auto-generated
+    /// `<basename>-orchestrator-N` a real run is headed with, which is what a
+    /// user has to refer to on the overview (PRD #1223).
+    pub fn in_titled_orchestration(
+        mut agent: DesktopAgent,
+        id: &str,
+        name: &str,
+        title: &str,
+    ) -> DesktopAgent {
+        if let DesktopTab::Orchestration {
+            orchestration_id,
+            name: config,
+            display_title,
+            ..
+        } = &mut agent.tab
+        {
+            *orchestration_id = Some(id.to_string());
+            *config = name.to_string();
+            *display_title = Some(title.to_string());
+        }
+        agent
+    }
+
     /// An agent with a tool running, for the other half of the live state the
     /// prompt carries.
     pub fn with_tool(mut agent: DesktopAgent, name: &str, detail: Option<&str>) -> DesktopAgent {

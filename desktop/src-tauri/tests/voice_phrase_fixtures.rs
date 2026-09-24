@@ -56,7 +56,10 @@ use dot_agent_deck_desktop::voice::{
     VoiceDirectoryEntry, VoiceNewAgent, VoiceNewAgentForm, VoiceOutcome,
     dictation::normalise,
     handle_utterance, table,
-    test_support::{api_preset, api_resolver, in_orchestration, role_agent_in_state, with_tool},
+    test_support::{
+        api_preset, api_resolver, in_orchestration, in_titled_orchestration, role_agent_in_state,
+        with_tool,
+    },
 };
 use serde::Deserialize;
 
@@ -96,12 +99,6 @@ struct PhraseFixture {
     /// against the planted fleet the way `resolved_agent` is against agents.
     #[serde(default)]
     resolved_deck: Option<String>,
-    /// The dispatch must carry NO `deck_ref` (PRD #1223): the utterance named
-    /// no deck, so whatever the model filled in must not be preselected. Only
-    /// meaningful beside `outcome = "dispatch"`, and exclusive of
-    /// `resolved_deck`.
-    #[serde(default)]
-    no_deck: bool,
     /// Whether the New agent dialog's directory browser is showing the
     /// planted listing for this fixture (PRD #1223). Absent means the dialog
     /// is closed, which is every fixture that predates the directory rows.
@@ -134,6 +131,12 @@ struct PhraseFixture {
     /// The card title an `orchestration_ref` param must resolve to.
     #[serde(default)]
     resolved_orchestration: Option<String>,
+    /// Plant the overview the user was looking at when they said "Stop the
+    /// orchestration 1." (PRD #1223, 2026-09-24): one run headed with the
+    /// auto-generated `dot-agent-deck-orchestrator-1`, instead of the `build`
+    /// fleet.
+    #[serde(default)]
+    generated_run: bool,
     /// The introducing words a dictation fixture expects the model to MARK.
     ///
     /// **Not the text to type**, which is the whole design: the app takes that
@@ -346,6 +349,26 @@ async fn voice_phrase_fixtures_match_the_default_backend() {
     let mut atlas_two = role_agent_in_state("agent-atlas-two", "coder", "working");
     atlas_two.display_name = Some("Atlas".to_string());
     let ambiguous_name_agents = vec![atlas_one, atlas_two];
+    // The run title a real orchestration gets — `<basename>-orchestrator-N`,
+    // inheriting the repository's name — which nobody says word for word.
+    let generated_run_agents: Vec<_> = [
+        (
+            "agent-gen-orchestrator",
+            "orchestrator",
+            "waiting_for_input",
+        ),
+        ("agent-gen-coder", "coder", "working"),
+    ]
+    .into_iter()
+    .map(|(id, role, status)| {
+        in_titled_orchestration(
+            role_agent_in_state(id, role, status),
+            "orch-gen",
+            "tdd",
+            "dot-agent-deck-orchestrator-1",
+        )
+    })
+    .collect();
     // PRD #1223 — the fleet a `deck_ref` resolves against: this machine's deck
     // and one remote, labelled the way the overview labels them.
     let decks = vec![
@@ -460,17 +483,17 @@ async fn voice_phrase_fixtures_match_the_default_backend() {
             );
         }
         if let Some(expected) = fixture.resolved_agent.as_deref() {
+            let planted = if fixture.generated_run {
+                &generated_run_agents
+            } else {
+                &agents
+            };
             assert!(
-                agents.iter().any(|agent| agent.id == expected),
+                planted.iter().any(|agent| agent.id == expected),
                 "{}: fixture expects unknown agent id `{expected}`",
                 fixture.name
             );
         }
-        assert!(
-            !(fixture.no_deck && fixture.resolved_deck.is_some()),
-            "{}: `no_deck` and `resolved_deck` contradict each other",
-            fixture.name
-        );
         if let Some(expected) = fixture.resolved_deck.as_deref() {
             assert!(
                 decks.iter().any(|deck| deck.id == expected),
@@ -537,6 +560,8 @@ async fn voice_phrase_fixtures_match_the_default_backend() {
         let started = Instant::now();
         let fixture_agents = if fixture.name == "open-agent-ambiguous-name" {
             &ambiguous_name_agents
+        } else if fixture.generated_run {
+            &generated_run_agents
         } else {
             &agents
         };
@@ -582,7 +607,7 @@ async fn voice_phrase_fixtures_match_the_default_backend() {
                 };
                 let deck_matches = match fixture.resolved_deck.as_deref() {
                     Some(expected) => resolved_deck(&answer.outcome) == Some(expected),
-                    None => !fixture.no_deck || resolved_deck(&answer.outcome).is_none(),
+                    None => true,
                 };
                 let dir_matches = match fixture.resolved_dir.as_deref() {
                     Some(expected) => resolved_dir(&answer.outcome) == Some(expected),
