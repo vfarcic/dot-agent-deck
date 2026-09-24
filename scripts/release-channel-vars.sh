@@ -56,13 +56,25 @@ esac
 VERSION_NO_V="${DAD_RELEASE_VERSION#v}"
 BASE_URL="https://github.com/vfarcic/dot-agent-deck/releases/download/${DAD_RELEASE_VERSION}"
 
-# dad_checksum ASSET: print ASSET's SHA-256 from dist/checksums.txt, relative
-# to the caller's cwd, or fail. Call it as `x=$(dad_checksum ASSET) || exit 1`:
-# the failure is a subshell's, so the caller has to propagate it. The value
-# lands in a generated file, so it is held to the shape `shasum -a 256` prints —
-# one line of 64 lowercase hex digits.
+# dad_checksum ASSET [optional]: print ASSET's SHA-256 from dist/checksums.txt,
+# relative to the caller's cwd, or fail. Call it as
+# `x=$(dad_checksum ASSET) || exit 1`: the failure is a subshell's, so the
+# caller has to propagate it. The value lands in a generated file, so it is
+# held to the shape `shasum -a 256` prints — one line of 64 lowercase hex
+# digits.
+#
+# `optional` lets an ASSET with no line at all print nothing and succeed, while
+# a line that is present must still have that shape. It exists for the Windows
+# binary: release.yml's build matrix has no Windows leg, so the published
+# checksums.txt has no such line (v0.41.2's has none), and the manifest the
+# previous Taskfile published for v0.41.2 carries `"hash": ""`. Failing here
+# instead would abort `finalize` after the GitHub Release and the Homebrew
+# formula are already out.
 dad_checksum() {
   _dad_sum=$(grep "${1}\$" dist/checksums.txt | awk '{print $1}')
+  if [ -z "$_dad_sum" ] && [ "${2-}" = optional ]; then
+    return 0
+  fi
   if [[ ! "$_dad_sum" =~ ^[0123456789abcdef]{64}$ ]]; then
     echo "Error: no single SHA-256 for ${1} in dist/checksums.txt — check that file" >&2
     return 1

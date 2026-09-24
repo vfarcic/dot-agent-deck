@@ -236,7 +236,9 @@ tasks:
     cmds:
       - |
         . "$DAD_TASKFILE_DIR/scripts/release-channel-vars.sh"
-        SHA_WINDOWS_AMD64=$(dad_checksum dot-agent-deck-windows-amd64.exe) || exit 1
+        # Optional: no release builds a Windows binary yet, and the manifest has
+        # always been written with an empty hash in that case (see the helper).
+        SHA_WINDOWS_AMD64=$(dad_checksum dot-agent-deck-windows-amd64.exe optional) || exit 1
         cat > "dist/${DAD_CHANNEL_NAME}.json" << MANIFEST
         {
             "version": "${VERSION_NO_V}",

@@ -14,14 +14,15 @@
 //!   command that is not on a short allowlist of templates whose output is
 //!   inert — so the next task added with a spliced variable goes red here
 //!   rather than waiting for the next audit;
-//! - the rest source the validator under `bash` with good and hostile values.
-//!   go-task itself runs it under its built-in interpreter (mvdan/sh), which
-//!   these do not exercise; the script keeps to constructs both implement, and
-//!   its regex is anchored the same way in both (`$` is end-of-string in
-//!   bash's ERE and in Go's RE2).
+//! - three source the validator under `bash` with good and hostile values;
+//! - the last runs the two generating tasks through go-task itself, whose
+//!   built-in interpreter (mvdan/sh) is what executes the task bodies in a
+//!   release. It skips where `task` is not on PATH — devbox installs it; the
+//!   CI build jobs, as of this writing, do not — so in CI the `bash` tests are
+//!   what runs, and the script keeps to constructs both shells implement.
 //!
-//! Unix-only, like `pin_lockstep`: the validator needs a POSIX shell and runs
-//! only in release.yml's Ubuntu `finalize` job.
+//! Unix-only, like `pin_lockstep`: the validator needs a POSIX shell, and its
+//! one automation caller is release.yml's Ubuntu `finalize` job.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -236,6 +237,26 @@ fn release_channel_vars_003_rejects_hostile_and_malformed_values_without_running
     );
 }
 
+/// Run `dad_checksum dot-agent-deck-linux-amd64 [mode]` against a
+/// `dist/checksums.txt` holding `checksums`.
+fn checksum(checksums: &str, mode: &str) -> Output {
+    let dir = tempfile::tempdir().expect("temp dir");
+    fs::create_dir(dir.path().join("dist")).expect("dist/");
+    fs::write(dir.path().join("dist/checksums.txt"), checksums).expect("checksums.txt");
+    let script = repo_root().join("scripts/release-channel-vars.sh");
+    Command::new("bash")
+        .arg("-c")
+        .arg(r#". "$1" && x=$(dad_checksum dot-agent-deck-linux-amd64 $2) || exit 1; printf '%s' "$x""#)
+        .arg("release-channel-vars-test")
+        .arg(&script)
+        .arg(mode)
+        .current_dir(dir.path())
+        .env("DAD_RELEASE_VERSION", "v1.2.3")
+        .env("DAD_CHANNEL_NAME", "dot-agent-deck")
+        .output()
+        .expect("run bash")
+}
+
 #[test]
 fn release_channel_vars_004_checksum_helper_takes_exactly_one_sha256() {
     if !bash_present() {
@@ -244,44 +265,141 @@ fn release_channel_vars_004_checksum_helper_takes_exactly_one_sha256() {
     }
     let sha = "a".repeat(64);
     let other = "b".repeat(64);
-    let run = |checksums: &str| {
-        let dir = tempfile::tempdir().expect("temp dir");
-        fs::create_dir(dir.path().join("dist")).expect("dist/");
-        fs::write(dir.path().join("dist/checksums.txt"), checksums).expect("checksums.txt");
-        let script = repo_root().join("scripts/release-channel-vars.sh");
-        Command::new("bash")
-            .arg("-c")
-            .arg(r#". "$1" && x=$(dad_checksum dot-agent-deck-linux-amd64) || exit 1; printf '%s' "$x""#)
-            .arg("release-channel-vars-test")
-            .arg(&script)
-            .current_dir(dir.path())
-            .env("DAD_RELEASE_VERSION", "v1.2.3")
-            .env("DAD_CHANNEL_NAME", "dot-agent-deck")
-            .output()
-            .expect("run bash")
-    };
-
-    let out = run(&format!(
-        "{sha}  dot-agent-deck-linux-amd64\n{other}  dot-agent-deck-linux-arm64\n"
-    ));
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert_eq!(String::from_utf8_lossy(&out.stdout), sha);
-
-    for bad in [
-        String::new(),
+    let good = format!("{sha}  dot-agent-deck-linux-amd64\n{other}  dot-agent-deck-linux-arm64\n");
+    let malformed = [
         "deadbeef  dot-agent-deck-linux-amd64\n".to_string(),
         format!("{}  dot-agent-deck-linux-amd64\n", sha.to_uppercase()),
         format!("{sha}  dot-agent-deck-linux-amd64\n{other}  dot-agent-deck-linux-amd64\n"),
-    ] {
-        let out = run(&bad);
+    ];
+    let absent = format!("{other}  dot-agent-deck-linux-arm64\n");
+
+    for mode in ["", "optional"] {
+        let out = checksum(&good, mode);
+        assert!(
+            out.status.success(),
+            "mode {mode:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&out.stdout), sha, "mode {mode:?}");
+
+        // `optional` relaxes only absence: a line that is there is still
+        // held to the shape.
+        for bad in &malformed {
+            let out = checksum(bad, mode);
+            assert!(
+                !out.status.success(),
+                "mode {mode:?} accepted checksums.txt {bad:?} and printed {:?}",
+                String::from_utf8_lossy(&out.stdout)
+            );
+        }
+    }
+
+    for missing in [String::new(), absent] {
+        let out = checksum(&missing, "");
         assert!(
             !out.status.success(),
-            "accepted checksums.txt {bad:?} and printed {:?}",
-            String::from_utf8_lossy(&out.stdout)
+            "a required asset absent from checksums.txt {missing:?} was accepted"
+        );
+        let out = checksum(&missing, "optional");
+        assert!(
+            out.status.success() && out.stdout.is_empty(),
+            "an optional asset absent from checksums.txt {missing:?} should print nothing and \
+             succeed; stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
         );
     }
+}
+
+fn task_present() -> bool {
+    Command::new("task")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// Greptile's finding on PR #1283: the tests above drive the validator under
+/// `bash`, but go-task runs the task bodies under its own interpreter, and the
+/// first version of this fix aborted `scoop-manifest` on the release's real
+/// `dist/` — which has no Windows binary. So this runs the two generating
+/// tasks through `task` itself, from a copy of the real Taskfile and
+/// validator, against a `dist/` shaped like the one release.yml's `finalize`
+/// assembles. It needs go-task on PATH (devbox installs it) and skips without.
+#[test]
+fn release_channel_vars_005_generating_tasks_run_under_go_task_on_the_release_dist() {
+    if !task_present() {
+        eprintln!("SKIP: needs go-task (`task`) on PATH");
+        return;
+    }
+    let root = repo_root();
+    let dir = tempfile::tempdir().expect("temp dir");
+    let w = dir.path();
+    fs::copy(root.join("Taskfile.yml"), w.join("Taskfile.yml")).expect("copy Taskfile.yml");
+    fs::create_dir_all(w.join("scripts")).expect("scripts/");
+    fs::copy(
+        root.join("scripts/release-channel-vars.sh"),
+        w.join("scripts/release-channel-vars.sh"),
+    )
+    .expect("copy the validator");
+    fs::create_dir_all(w.join("dist")).expect("dist/");
+    // The four assets release.yml's build matrix produces, and no Windows one.
+    let assets = [
+        ("darwin-arm64", "1"),
+        ("darwin-amd64", "2"),
+        ("linux-arm64", "3"),
+        ("linux-amd64", "4"),
+    ];
+    let checksums: String = assets
+        .iter()
+        .map(|(a, c)| format!("{}  dot-agent-deck-{a}\n", c.repeat(64)))
+        .collect();
+    fs::write(w.join("dist/checksums.txt"), checksums).expect("checksums.txt");
+
+    for (task, args) in [
+        (
+            "homebrew-formula",
+            vec!["VERSION=v0.42.0-rc.1", "NAME=dot-agent-deck-beta"],
+        ),
+        (
+            "scoop-manifest",
+            vec!["VERSION=v0.42.0-rc.1", "NAME=dot-agent-deck-beta"],
+        ),
+    ] {
+        let out = Command::new("task")
+            .arg("--silent")
+            .arg(task)
+            .args(&args)
+            .current_dir(w)
+            .output()
+            .expect("run task");
+        assert!(
+            out.status.success(),
+            "`task {task}` failed on the release-shaped dist/: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    let base = "https://github.com/vfarcic/dot-agent-deck/releases/download/v0.42.0-rc.1";
+    let rb = fs::read_to_string(w.join("dist/dot-agent-deck-beta.rb")).expect("formula");
+    for line in [
+        "class DotAgentDeckBeta < Formula\n".to_string(),
+        "  version \"0.42.0-rc.1\"\n".to_string(),
+        "  conflicts_with \"dot-agent-deck\",\n".to_string(),
+        "    because: \"both install a `dot-agent-deck` binary; only one channel can be active at a time\"\n".to_string(),
+        format!("      url \"{base}/dot-agent-deck-linux-amd64\"\n"),
+        format!("      sha256 \"{}\"\n", "4".repeat(64)),
+        "    assert_match \"dot-agent-deck\", shell_output(\"#{bin}/dot-agent-deck --help\")\n".to_string(),
+    ] {
+        assert!(rb.contains(&line), "formula lacks {line:?}:\n{rb}");
+    }
+    let json = fs::read_to_string(w.join("dist/dot-agent-deck-beta.json")).expect("manifest");
+    for line in [
+        "    \"version\": \"0.42.0-rc.1\",\n".to_string(),
+        format!("    \"url\": \"{base}/dot-agent-deck-windows-amd64.exe\",\n"),
+        "    \"hash\": \"\"\n".to_string(),
+        "releases/download/v$version/dot-agent-deck-windows-amd64.exe\"\n".to_string(),
+    ] {
+        assert!(json.contains(&line), "manifest lacks {line:?}:\n{json}");
+    }
+    serde_json::from_str::<serde_json::Value>(&json).expect("the Scoop manifest is valid JSON");
 }
