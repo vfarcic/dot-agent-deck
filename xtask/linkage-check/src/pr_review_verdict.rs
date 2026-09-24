@@ -457,7 +457,8 @@ fn a_notice_for_one_reason_does_not_suppress_another() {
 fn every_no_vote_branch_owns_a_distinct_marker() {
     assert_py_ok(
         "import ast, os\n\
-         src = open(os.path.join(sys.path[0], 'pr_review_vote.py')).read()\n\
+         path = os.path.join(sys.path[0], 'pr_review_vote.py')\n\
+         src = open(path, encoding='utf-8').read()\n\
          calls = [n for n in ast.walk(ast.parse(src)) if isinstance(n, ast.Call)\n\
         \x20        and getattr(n.func, 'id', '') == 'already_noticed_at']\n\
          assert len(calls) == 3, len(calls)\n\
