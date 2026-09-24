@@ -321,20 +321,27 @@ scan_workflow_pnpm() {
           # and reading it would let a step with no pin pass as pinned.
           # `with_at` is the column of the `with:` key while inside its block
           # form, or -1; the flow form is read on the `with:` line itself.
+          # `in_flow` is set while a flow mapping opened on the `with:` line
+          # (`with: {`) continues onto later lines, until its closing brace.
           found = 0
           with_at = -1
+          in_flow = 0
           for (j = start; j <= NR; j++) {
-            if (j > start && !is_comment(line[j]) && indent(line[j]) <= dash_at) break
+            if (j > start && !in_flow && !is_comment(line[j]) && indent(line[j]) <= dash_at) break
             if (is_comment(line[j])) continue
             if (with_at >= 0 && indent(line[j]) <= with_at) with_at = -1
             cand = ""
-            if (match(line[j], /^ *(- +)?with:/)) {
+            if (in_flow) {
+              cand = line[j]
+              if (index(cand, "}") > 0) in_flow = 0
+            } else if (match(line[j], /^ *(- +)?with:/)) {
               after = substr(line[j], RSTART + RLENGTH)
               if (after ~ /^[[:space:]]*$/) {
                 with_at = RLENGTH - 5
                 continue
               }
               cand = after
+              if (after ~ /^[[:space:]]*\{/ && index(after, "}") == 0) in_flow = 1
             } else if (with_at >= 0) {
               cand = line[j]
             }

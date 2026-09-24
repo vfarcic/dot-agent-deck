@@ -72,7 +72,7 @@ fn combined(out: &Output) -> String {
 
 /// A synthetic repository holding nothing but the two files the script reads.
 ///
-/// Every fixture also gets a `desktop.yml` carrying an agreeing pnpm pin
+/// Every fixture also gets a `default-pnpm.yml` carrying an agreeing pnpm pin
 /// ([`pnpm_workflow`] at [`PNPM`]) unless one of the workflows passed in already
 /// names `pnpm/action-setup`. Without it every fixture would also fail the pnpm
 /// class (issue #1262), and a test asserting only that the script FAILS — such
@@ -113,8 +113,16 @@ impl Fixture {
             body.lines()
                 .any(|l| !l.trim_start().starts_with('#') && l.contains("pnpm/action-setup"))
         }) {
+            // A name no test passes, so the default can never overwrite a
+            // workflow a test supplied (raised by Qodo on #1284).
+            assert!(
+                workflows
+                    .iter()
+                    .all(|(name, _)| *name != DEFAULT_PNPM_WORKFLOW),
+                "{DEFAULT_PNPM_WORKFLOW} is reserved for the fixture's default pnpm pin"
+            );
             fs::write(
-                wf.join("desktop.yml"),
+                wf.join(DEFAULT_PNPM_WORKFLOW),
                 pnpm_workflow(&format!("version: {PNPM}")),
             )
             .expect("write the fixture pnpm workflow");
@@ -129,6 +137,9 @@ impl Fixture {
 
 /// The pnpm version the fixtures agree on.
 const PNPM: &str = "11.22.0";
+
+/// Where [`Fixture`] writes its default agreeing pnpm workflow.
+const DEFAULT_PNPM_WORKFLOW: &str = "default-pnpm.yml";
 
 /// devbox.json entries that agree with [`workflow`]'s defaults and [`PNPM`].
 fn good_packages() -> Vec<&'static str> {
@@ -1209,5 +1220,42 @@ fn a_version_outside_the_with_mapping_is_not_a_pnpm_pin() {
     assert!(
         !out.status.success() && text.contains("no version: input"),
         "an `env:` version is not the action's input, so this step is unpinned:\n{text}"
+    );
+}
+
+/// Raised by Qodo on #1284. A flow mapping may span lines — `with: {` on one,
+/// the keys on the next — and Renovate YAML-parses it like any other. The
+/// scanner read a flow mapping only on the `with:` line itself, so this spelling
+/// reported a correctly pinned step as having no version.
+#[test]
+fn a_multiline_flow_with_mapping_is_read() {
+    if !bash_present() {
+        eprintln!("SKIP: needs `bash` on PATH");
+        return;
+    }
+    let body = "jobs:\n  desktop-web:\n    steps:\n      \
+                - uses: pnpm/action-setup@v6\n        \
+                with: {\n          \
+                version: 11.21.0,\n          \
+                run_install: false }\n      \
+                - uses: actions/setup-node@v7\n        \
+                with:\n          \
+                node-version: 24\n";
+    let out = Fixture::new(
+        &good_packages(),
+        &[
+            ("ci.yml", workflow("1.97.1", "0.9.143")),
+            ("desktop.yml", body.to_string()),
+        ],
+    )
+    .run();
+    let text = combined(&out);
+    assert!(
+        !out.status.success() && text.contains("desktop.yml:6 11.21.0"),
+        "the version inside a multi-line flow mapping must be read and compared:\n{text}"
+    );
+    assert!(
+        !text.contains("no version: input"),
+        "a multi-line flow mapping carries the input, so the step is pinned:\n{text}"
     );
 }
