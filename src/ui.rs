@@ -3365,6 +3365,27 @@ pub fn orchestration_config_drift_warning(
     ))
 }
 
+/// Issue #554: the names of an orchestration tab's roles that are backed by a
+/// live daemon pane, in tab order — every role whose slot is not a synthetic
+/// dead-slot placeholder ([`is_dead_slot_pane_id`]). `role_pane_ids` is aligned
+/// with `config.roles`; a role with no entry at all is treated as dead.
+fn live_tab_role_names<'a>(
+    config: &'a crate::project_config::OrchestrationConfig,
+    role_pane_ids: &[String],
+) -> Vec<&'a str> {
+    config
+        .roles
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| {
+            role_pane_ids
+                .get(*i)
+                .is_some_and(|p| !is_dead_slot_pane_id(p))
+        })
+        .map(|(_, r)| r.name.as_str())
+        .collect()
+}
+
 /// Issue #554 (Qodo on PR #1281): the drift check for a role surfaced into an
 /// orchestration tab that is ALREADY open. A live surface carries only the
 /// newly spawned role, so [`orchestration_config_drift_warning`] run on it sees
@@ -5530,12 +5551,17 @@ fn surface_one_orchestration(
                 return None;
             };
             let Some(Tab::Orchestration {
-                config: tab_config, ..
+                config: tab_config,
+                role_pane_ids,
+                ..
             }) = tab_manager.tabs().get(existing_tab_index)
             else {
                 return None;
             };
-            let tab_roles: Vec<&str> = tab_config.roles.iter().map(|r| r.name.as_str()).collect();
+            // Only roles with a live daemon pane: a dead-slot placeholder has
+            // no pane the daemon could route to, so removing its role from the
+            // file is a cleanup, not drift (Qodo on PR #1281).
+            let tab_roles = live_tab_role_names(tab_config, role_pane_ids);
             grown_orchestration_tab_drift_warning(&tab_roles, local, &surface.name, &surface.cwd)
         });
         // Whether anything actually grew, so the "grew existing tab" info
@@ -42156,6 +42182,38 @@ mod config_drift_tests {
         assert!(
             warning.contains("'review'") && warning.contains("/work/proj"),
             "{warning}"
+        );
+    }
+
+    /// Qodo on PR #1281: a dead-slot placeholder has no daemon pane, so a role
+    /// removed from the file while its slot is dead is not drift.
+    #[test]
+    fn live_tab_role_names_skip_dead_slot_placeholders() {
+        let cfg = config("review", &["lead", "coder", "tester"]);
+        let mut ids = vec![
+            Some("p-lead".to_string()),
+            None,
+            Some("p-tester".to_string()),
+        ];
+        let _ = assign_synthetic_dead_slot_ids(
+            &mut ids,
+            &crate::state::OrchestrationIdentity::NameCwd {
+                name: "review".into(),
+                cwd: "/w".into(),
+            },
+        );
+        let ids: Vec<String> = ids.into_iter().map(|p| p.expect("filled")).collect();
+        assert!(
+            is_dead_slot_pane_id(&ids[1]),
+            "precondition: slot 1 is a dead slot"
+        );
+        let live = live_tab_role_names(&cfg, &ids);
+        assert_eq!(live, vec!["lead", "tester"]);
+        // `coder` (dead) was removed from the file: not drift.
+        let local = config("review", &["lead", "tester"]);
+        assert_eq!(
+            grown_orchestration_tab_drift_warning(&live, &local, "review", "/w"),
+            None
         );
     }
 
