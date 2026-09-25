@@ -557,7 +557,7 @@ fn deck_binary_for_wrap() -> String {
 ///   `-_.+`, no leading `-`), and every character of the path must be in
 ///   [`is_shell_inert_path_char`]'s allowlist, which excludes whitespace,
 ///   quotes, `$`, backticks, `;`, `&`, `|`, `<`, `>`, `(`, `)`, `*`, `?`,
-///   `[`, `~`, `#` and `!`. Before issue #533 the file name was pinned to
+///   `[`, `#`, `!`, and `~` except in a Windows path. Before issue #533 the file name was pinned to
 ///   `dot-agent-deck` and only whitespace was checked; accepting a renamed
 ///   build's own file name is what made the allowlist necessary.
 ///
@@ -614,12 +614,15 @@ fn resolve_deck_binary_for_wrap(current_exe: std::io::Result<std::path::PathBuf>
 /// read back by the spawning shell as itself: ASCII alphanumerics plus
 /// `/ . _ - + = : @ % ,` — the set `platform::paths::shell_quote_if_needed`
 /// leaves unquoted — and, only when `windows_host`, the `\` separator, which a
-/// POSIX shell would instead consume as an escape. A parameter rather than a
-/// `#[cfg]` so both dialects are unit-testable from any host.
+/// POSIX shell would instead consume as an escape, and `~`, which every 8.3
+/// short name carries (`C:\Users\RUNNER~1\…`, the GitHub runner's own temp
+/// directory) and which a POSIX shell could tilde-expand at the start of a
+/// relative path. A parameter rather than a `#[cfg]` so both dialects are
+/// unit-testable from any host.
 fn is_shell_inert_path_char(c: char, windows_host: bool) -> bool {
     c.is_ascii_alphanumeric()
         || matches!(c, '/' | '.' | '_' | '-' | '+' | '=' | ':' | '@' | '%' | ',')
-        || (windows_host && c == '\\')
+        || (windows_host && matches!(c, '\\' | '~'))
 }
 
 /// Whether `command` is already a `wrap` invocation of a deck — the idempotency
@@ -3104,7 +3107,7 @@ mod tests {
     ///
     /// Unix-only because several of these names (`"`, `|`) cannot be created on
     /// Windows at all; the Windows dialect of the allowlist is covered by
-    /// `is_shell_inert_path_char_admits_backslash_only_for_windows`.
+    /// `is_shell_inert_path_char_admits_backslash_and_tilde_only_for_windows`.
     #[cfg(unix)]
     #[test]
     fn resolve_deck_binary_for_wrap_refuses_shell_syntax_in_the_path() {
@@ -3144,14 +3147,17 @@ mod tests {
     }
 
     #[test]
-    fn is_shell_inert_path_char_admits_backslash_only_for_windows() {
+    fn is_shell_inert_path_char_admits_backslash_and_tilde_only_for_windows() {
         assert!(is_shell_inert_path_char('\\', true));
         assert!(!is_shell_inert_path_char('\\', false));
+        // 8.3 short names (`RUNNER~1`) are ordinary Windows paths.
+        assert!(is_shell_inert_path_char('~', true));
+        assert!(!is_shell_inert_path_char('~', false));
         for c in ['/', '.', '_', '-', '+', ':', 'a', 'Z', '0'] {
             assert!(is_shell_inert_path_char(c, false), "{c:?}");
         }
         for c in [
-            ' ', '$', '`', ';', '\'', '"', '&', '|', '(', ')', '*', '~', '#', '!',
+            ' ', '$', '`', ';', '\'', '"', '&', '|', '(', ')', '*', '#', '!',
         ] {
             assert!(!is_shell_inert_path_char(c, false), "{c:?}");
             assert!(!is_shell_inert_path_char(c, true), "{c:?}");
