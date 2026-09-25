@@ -2076,25 +2076,30 @@ mod tests {
 
         // A destination the clone can never be moved onto — a file — fails the
         // placement, and the copy it could not place is discarded rather than
-        // left to accumulate one per fire.
-        let blocked = ws.path().join("blocked");
-        std::fs::write(&blocked, "not a directory").expect("occupy the destination");
-        let err = clone_via_staging(&blocked, |staging| async move {
-            std::fs::create_dir_all(staging.join(".git")).expect("clone");
-            Ok(())
-        })
-        .await
-        .expect_err("a clone that cannot be placed must fail");
-        assert!(err.contains("could not move it"), "{err}");
-        assert_eq!(
-            entries(),
-            vec![
-                "blocked".to_string(),
-                "repo".to_string(),
-                "repo.cloning-concurrent".to_string()
-            ],
-            "the unplaceable copy's staging directory is discarded"
-        );
+        // left to accumulate one per fire. Unix only: Windows' `rename` replaces
+        // an existing FILE with the directory (measured on `build-windows`,
+        // PR #1304), so there a file is not a destination that refuses.
+        #[cfg(unix)]
+        {
+            let blocked = ws.path().join("blocked");
+            std::fs::write(&blocked, "not a directory").expect("occupy the destination");
+            let err = clone_via_staging(&blocked, |staging| async move {
+                std::fs::create_dir_all(staging.join(".git")).expect("clone");
+                Ok(())
+            })
+            .await
+            .expect_err("a clone that cannot be placed must fail");
+            assert!(err.contains("could not move it"), "{err}");
+            assert_eq!(
+                entries(),
+                vec![
+                    "blocked".to_string(),
+                    "repo".to_string(),
+                    "repo.cloning-concurrent".to_string()
+                ],
+                "the unplaceable copy's staging directory is discarded"
+            );
+        }
     }
 
     /// PR #1304 (Qodo): the branch probe tells "absent" from "could not
