@@ -1810,6 +1810,11 @@ struct WriteAndSubmitExtras {
     /// A stable idempotency key. The daemon caches the first result for a
     /// delivery id and replays it on a retry, so a re-sent ambiguous transport
     /// failure never double-submits (R20-004).
+    ///
+    /// Issue #527: at most [`crate::agent_pty::MAX_DELIVERY_ID_BYTES`] bytes. A
+    /// longer id still DECODES (the wire type is unchanged), but the ledger
+    /// refuses to admit it and the daemon answers with an error and writes
+    /// nothing. The charset stays unrestricted.
     #[serde(default)]
     delivery_id: Option<String>,
 }
@@ -4262,6 +4267,19 @@ async fn handle_connection(
                             )
                             .await?
                         }
+                        // Issue #527: refused before the ledger stores it and
+                        // before anything is written. The message states the
+                        // limit and not the id, which is the value that failed.
+                        crate::agent_pty::DeliveryAdmission::Oversized => {
+                            write_resp(
+                                &mut stream,
+                                &AttachResponse::err(format!(
+                                    "delivery id exceeds {} bytes — refusing the write",
+                                    crate::agent_pty::MAX_DELIVERY_ID_BYTES
+                                )),
+                            )
+                            .await?
+                        }
                         crate::agent_pty::DeliveryAdmission::Proceed(permit) => {
                             match compute_write_and_submit_outcome(
                                 &registry, &state, &pane_id, &text, &extras,
@@ -5361,7 +5379,12 @@ async fn handle_attach_stream(
                 // respect to handoff, and this call keeps the frame-level
                 // contract (including the zero-byte frame the auditor noted)
                 // exactly as it was.
-                registry.note_user_input(&pane_id);
+                //
+                // Issue #542: stamped THROUGH the held writer, which skips it
+                // once this agent has been closed — a frame that passed the
+                // re-validation above and finishes after the close must not
+                // bring the closed pane's clock back.
+                w.note_user_input(&pane_id);
                 drop(w);
             }
             Ok(Some((KIND_DETACH, _))) => {

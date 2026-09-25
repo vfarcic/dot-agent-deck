@@ -3019,6 +3019,74 @@ fn pane_input_017_malformed_guard_identity_fails_closed() {
     });
 }
 
+/// Scenario: Send a guarded write to a live, deliverable pane whose `delivery_id` is one byte over the daemon's cap. The daemon must refuse it with an error and write nothing, while the same request carrying an id exactly at the cap is delivered.
+#[spec("prompt/pane-input/039")]
+#[test]
+fn pane_input_039_oversized_delivery_id_is_refused_before_the_write() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("build oversized-delivery-id runtime");
+    runtime.block_on(async {
+        let server = start_server().await;
+        let pane_id = "pane-oversized-delivery-id";
+        let agent_id = start_plain_agent_for_pane(&server, "/bin/sh", pane_id).await;
+        server.state.write().await.register_pane(pane_id.to_string());
+        let mut attached = connect_attach(&server, &agent_id).await;
+        let cap = dot_agent_deck::agent_pty::MAX_DELIVERY_ID_BYTES;
+
+        let oversized = issue_json_request(
+            &server,
+            serde_json::json!({
+                "op": "write-and-submit",
+                "pane_id": pane_id,
+                "text": "printf 'OVERSIZED-DELIVERY-ID-LEAKED\n'",
+                "expected_agent_id": agent_id,
+                "delivery_id": "o".repeat(cap + 1)
+            }),
+        )
+        .await;
+        let (leaked, _) = observe_stream_input_outcome(
+            &mut attached,
+            b"OVERSIZED-DELIVERY-ID-LEAKED",
+            Duration::from_millis(750),
+        )
+        .await;
+
+        let at_cap = issue_json_request(
+            &server,
+            serde_json::json!({
+                "op": "write-and-submit",
+                "pane_id": pane_id,
+                "text": "printf 'AT-CAP-DELIVERY-ID-DELIVERED\n'",
+                "expected_agent_id": agent_id,
+                "delivery_id": "c".repeat(cap)
+            }),
+        )
+        .await;
+        let delivered = stream_contains_within(
+            &mut attached,
+            b"AT-CAP-DELIVERY-ID-DELIVERED",
+            Duration::from_millis(750),
+        )
+        .await;
+        server.registry.close_agent(&agent_id).unwrap();
+
+        assert!(
+            !oversized.ok && oversized.send_result.is_none() && !leaked,
+            "an id over the cap must be refused and write nothing; ok={}, result={:?}, leaked={leaked}",
+            oversized.ok,
+            oversized.send_result
+        );
+        assert_eq!(
+            (at_cap.send_result, delivered),
+            (Some(SendResult::Applied), true),
+            "the control: the same request with an id at the cap is delivered"
+        );
+    });
+}
+
 /// Scenario: Attach to a history-only agent that has no pane environment identity, then send stream input. The daemon must return a typed rejection and must not write the submitted marker to the agent PTY.
 #[spec("prompt/pane-input/018")]
 #[test]
