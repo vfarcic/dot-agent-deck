@@ -46,7 +46,9 @@ use super::dictation::{
     DICTATION_OPENERS, SUBMIT_PHRASES, opening_with, strip_opening, whole_utterance_is,
 };
 use super::resolver::{IntentError, IntentRequest, IntentResolver};
-use super::schema::{LABELS_WITHHELD_HINT, annotate_for, needs_labels};
+use super::schema::{
+    DECK_HIDDEN_HINT, LABELS_WITHHELD_HINT, annotate_for, hidden_by_flag, needs_labels,
+};
 use super::table::{
     ActionGrounding, CommandRow, CommandTable, ParamKind, Requirement, Screen, spoken_words,
 };
@@ -300,6 +302,17 @@ impl VoiceOutcome {
     /// The action exists and needs names the voice settings withhold (PRD
     /// #1223, audit finding A1) — [`VoiceOutcome::unavailable`]'s shape with
     /// [`LABELS_WITHHELD_HINT`] in place of the row's own hint.
+    /// Issue #1198 — a pick of the row whose screen the experimental flag
+    /// hides, refused with [`DECK_HIDDEN_HINT`] rather than dispatched.
+    fn hidden_by_flag(transcript: Transcript, row: &CommandRow) -> Self {
+        Self::Unavailable {
+            sentence: format!("Not here — {DECK_HIDDEN_HINT}."),
+            action: row.id.clone(),
+            hint: DECK_HIDDEN_HINT.to_string(),
+            transcript,
+        }
+    }
+
     fn labels_withheld(transcript: Transcript, row: &CommandRow) -> Self {
         Self::Unavailable {
             sentence: format!("Not here — {LABELS_WITHHELD_HINT}."),
@@ -416,6 +429,10 @@ pub async fn handle_utterance(
         new_agent,
         transcript,
         LabelSharing::Shared,
+        // The deck SHOWN — the experimental configuration, and the one the
+        // phrase fixtures and this module's tests resolve against. The shipped
+        // app calls `handle_utterance_with` with the flag's own answer.
+        true,
     )
     .await
 }
@@ -443,6 +460,14 @@ pub async fn handle_utterance(
 /// question about the screen, not about what the model was told. That is also
 /// why the command table still carries a `callable` flag per row, and the
 /// voice panel's disclosure says so.
+///
+/// # `show_deck` (issue #1198)
+///
+/// `false` while the experimental flag hides the deck: the row that goes there
+/// is offered `callable: false` with [`DECK_HIDDEN_HINT`], and picked anyway it
+/// is [`VoiceOutcome::Unavailable`] with that hint. Held to the transcript
+/// first, like every row, so a pick the user did not ask for is still answered
+/// as that. `desktop_voice_resolve` passes `features::show_desktop_deck()`.
 #[allow(clippy::too_many_arguments)]
 pub async fn handle_utterance_with(
     resolver: &dyn IntentResolver,
@@ -454,6 +479,7 @@ pub async fn handle_utterance_with(
     new_agent: Option<&VoiceNewAgent>,
     transcript: Transcript,
     labels: LabelSharing,
+    show_deck: bool,
 ) -> VoiceResult {
     let withheld = labels == LabelSharing::Withheld;
     let backend = resolver.backend_name();
@@ -477,7 +503,7 @@ pub async fn handle_utterance_with(
         return finish(outcome, None);
     }
 
-    let commands = annotate_for(table, screen, directories, new_agent, labels);
+    let commands = annotate_for(table, screen, directories, new_agent, labels, show_deck);
     // Only the decks the New agent dialog could preselect (PRD #1223): a deck
     // it shows disabled is not offered, so the model cannot pick one. The full
     // fleet is still what a supplied deck resolves against, so a deck the user
@@ -542,6 +568,13 @@ pub async fn handle_utterance_with(
             grounding,
             &answer.params,
         ));
+    }
+
+    // Issue #1198: the deck is hidden, so the row that goes there is refused
+    // with that reason — ahead of the screen check, whose own hint ("opens
+    // from the rail") would name a door the rail does not have.
+    if hidden_by_flag(row, show_deck) {
+        return finish(VoiceOutcome::hidden_by_flag(transcript, row));
     }
 
     // The screen AND the row's `requires` (PRD #1223): a directory row picked
@@ -2982,6 +3015,7 @@ mod tests {
             new_agent,
             Transcript::new(said),
             labels,
+            true,
         )
         .await
         .outcome
@@ -6453,6 +6487,45 @@ mod tests {
         let resolver = StubResolver::new().answering("go back", IntentAnswer::new("open_deck"));
         let outcome = run(&resolver, Screen::Overview, &fleet(), "go back").await;
         assert!(outcome.is_dispatch(), "{outcome:?}");
+    }
+
+    /// Scenario: on the overview with the deck hidden (issue #1198), the user
+    /// says "take me back to the deck" and the model answers `open_deck`
+    /// anyway. It is refused as unavailable, naming the flag, rather than
+    /// dispatched — and a pick the user did not ask for is still refused as
+    /// that first.
+    #[tokio::test]
+    async fn voice_outcome_refuses_the_deck_while_it_is_hidden() {
+        let ask = |said: &'static str| async move {
+            let resolver = StubResolver::new().answering(said, IntentAnswer::new("open_deck"));
+            handle_utterance_with(
+                &resolver,
+                table(),
+                Screen::Overview,
+                &fleet(),
+                &decks(),
+                None,
+                None,
+                Transcript::new(said),
+                LabelSharing::Shared,
+                false,
+            )
+            .await
+            .outcome
+        };
+        let outcome = ask("take me back to the deck").await;
+        assert_eq!(
+            outcome,
+            VoiceOutcome::Unavailable {
+                sentence: format!("Not here — {DECK_HIDDEN_HINT}."),
+                action: "open_deck".to_string(),
+                hint: DECK_HIDDEN_HINT.to_string(),
+                transcript: Transcript::new("take me back to the deck"),
+            }
+        );
+        assert!(
+            matches!(ask("open docs").await, VoiceOutcome::ActionUngrounded { action, .. } if action == "open_deck")
+        );
     }
 
     #[test]

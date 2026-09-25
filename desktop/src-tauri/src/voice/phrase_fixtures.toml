@@ -73,6 +73,16 @@ screen = "agent"
 action = "open_overview"
 outcome = "unavailable"
 
+# The four `open_deck` fixtures below resolve with the deck SHOWN: the harness
+# calls `handle_utterance`, which passes `show_deck = true` — the `experimental`
+# configuration. With the flag off, the shipped default (issue #1198), the
+# crate offers `open_deck` as `callable: false` and refuses a pick of it, so
+# none of the three `dispatch` cases below is what a default build does. That
+# refusal is pinned with a stub resolver by
+# `voice_outcome_refuses_the_deck_while_it_is_hidden`; no live fixture pins
+# what a real model answers with the deck hidden (for "go back" on the
+# overview, `close`'s description says `close` wins once `open_deck` is not
+# callable).
 [[fixtures]]
 name = "open-deck-back"
 utterance = "go back"

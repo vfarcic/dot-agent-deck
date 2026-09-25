@@ -1610,8 +1610,9 @@ export interface DeckBridge {
   /**
    * Issue #1198 — which of the app's experimental surfaces to show: the
    * desktop process's own flag, read through its `features::show_desktop_*`
-   * wrappers. Read per call, so a caller that asks again sees a live reload of
-   * the file. Fixture mode answers all OFF unless `?experimental=1`.
+   * wrappers. The runtime asks ONCE at startup (`useDeckRuntime`), and the
+   * crate resolves the flag once too, so restarting the app is how it changes.
+   * Fixture mode answers all OFF unless `?experimental=1`.
    */
   desktopFeatures(): Promise<DesktopFeatures>;
   dispose(): Promise<void>;

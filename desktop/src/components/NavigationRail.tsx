@@ -1,5 +1,5 @@
 import { BookMarked, Bot, FolderGit2, Keyboard, LayoutList, Network, Settings2, SquareTerminal } from "lucide-react";
-import type { ConnectionView } from "../types";
+import type { ConnectionView, DesktopFeatures } from "../types";
 import type { RailScreen, ShellOverlayState } from "../hooks/useShellOverlays";
 import { DISPLAY_LIMITS, displayText } from "../lib/displayText";
 import { VOICE_ACTIONS, type VoiceActionContext } from "../lib/voiceActions";
@@ -25,8 +25,14 @@ export type RailContext = Pick<VoiceActionContext, "navigate" | "openOverlay" | 
  * entry for a deck panel pressed on the overview goes to the deck and opens it
  * there, since those panels exist only on the deck; Settings opens over
  * whichever screen is up.
+ *
+ * Issue #1198 — the deck and its four panels are experimental surfaces, so
+ * each entry renders only while its own `features` field says so. With the
+ * flag off — the shipped default — the rail is Overview and Settings. Nothing
+ * else here reads the flag: the entries that remain dispatch exactly as they
+ * did.
  */
-export function NavigationRail({ screen, overlays, context, connection, onShowShortcuts }: { screen: RailScreen; overlays: ShellOverlayState; context: RailContext; connection: ConnectionView; onShowShortcuts?: () => void }) {
+export function NavigationRail({ screen, overlays, context, connection, features, onShowShortcuts }: { screen: RailScreen; overlays: ShellOverlayState; context: RailContext; connection: ConnectionView; features: DesktopFeatures; onShowShortcuts?: () => void }) {
   const overlayOpen = Boolean(overlays.projects || overlays.prompts || overlays.profiles || overlays.workflow || overlays.settings);
   /* Deck is what the deck's rail used to call Runs: on the deck it clears the
      overlays, as Runs always did, and from the overview it goes to the deck. */
@@ -36,11 +42,11 @@ export function NavigationRail({ screen, overlays, context, connection, onShowSh
       <div className="brand-mark" aria-label="Agent Deck"><span>AD</span><i aria-hidden="true" /></div>
       <nav>
         <RailButton icon={LayoutList} label="Overview" active={screen === "overview" && !overlayOpen} onClick={() => VOICE_ACTIONS.openOverview.run(context)} testId="open-overview" />
-        <RailButton icon={SquareTerminal} label="Deck" active={screen === "deck" && !overlayOpen} onClick={toDeck} testId="open-deck" />
-        <RailButton icon={FolderGit2} label="Projects" active={overlays.projects} onClick={() => VOICE_ACTIONS.openProjects.run(context)} testId="open-projects" />
-        <RailButton icon={BookMarked} label="Prompts" active={overlays.prompts} onClick={() => VOICE_ACTIONS.openPromptLibrary.run(context)} testId="open-prompts" />
-        <RailButton icon={Network} label="Workflows" active={overlays.workflow} onClick={() => VOICE_ACTIONS.openWorkflowOrder.run(context)} />
-        <RailButton icon={Bot} label="Agent Profiles" active={overlays.profiles} onClick={() => VOICE_ACTIONS.openAgentProfiles.run(context)} testId="open-agent-profiles" />
+        {features.showDeck && <RailButton icon={SquareTerminal} label="Deck" active={screen === "deck" && !overlayOpen} onClick={toDeck} testId="open-deck" />}
+        {features.showProjects && <RailButton icon={FolderGit2} label="Projects" active={overlays.projects} onClick={() => VOICE_ACTIONS.openProjects.run(context)} testId="open-projects" />}
+        {features.showPrompts && <RailButton icon={BookMarked} label="Prompts" active={overlays.prompts} onClick={() => VOICE_ACTIONS.openPromptLibrary.run(context)} testId="open-prompts" />}
+        {features.showWorkflows && <RailButton icon={Network} label="Workflows" active={overlays.workflow} onClick={() => VOICE_ACTIONS.openWorkflowOrder.run(context)} />}
+        {features.showAgentProfiles && <RailButton icon={Bot} label="Agent Profiles" active={overlays.profiles} onClick={() => VOICE_ACTIONS.openAgentProfiles.run(context)} testId="open-agent-profiles" />}
         <RailButton icon={Settings2} label="Settings" active={overlays.settings} onClick={() => VOICE_ACTIONS.openSettings.run(context)} testId="open-settings" />
       </nav>
       <div className="rail-bottom">

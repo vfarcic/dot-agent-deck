@@ -1208,8 +1208,9 @@ pub(crate) fn desktop_agent_registry() -> Vec<DesktopAgentOption> {
 ///
 /// Each field is ONE wrapper in the root crate's `features` module (CLAUDE.md
 /// #9), called in this process — so the flag is the desktop's own, read from
-/// the same `.dot-agent-deck.toml` / `DOT_AGENT_DECK_EXPERIMENTAL` sources the
-/// TUI reads (see [`crate::init_features`]). It is deliberately NOT the per-deck
+/// this process's environment (`DOT_AGENT_DECK_EXPERIMENTAL`, or the file
+/// `DOT_AGENT_DECK_FEATURES_CONFIG` names) with no project walk; see
+/// [`crate::init_features`]. It is deliberately NOT the per-deck
 /// `experimental` a deck reports in [`DesktopNewAgentOptions`]: these surfaces
 /// belong to the app, not to any one deck, and the app observes several.
 ///
@@ -1226,9 +1227,8 @@ pub struct DesktopFeatures {
 }
 
 impl DesktopFeatures {
-    /// The surfaces the process-global flag shows at this moment. Read per
-    /// call rather than cached, so a live reload of the file reaches the next
-    /// query.
+    /// The surfaces the process-global flag shows. Read through the wrappers
+    /// on each call; the flag behind them is resolved once at startup.
     pub(crate) fn current() -> Self {
         use dot_agent_deck::features;
         Self {

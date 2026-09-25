@@ -1241,4 +1241,22 @@ export interface DeckRuntimeState {
    * no webview to scale.
    */
   setZoom: (level: number) => Promise<number>;
+  /**
+   * Issue #1198 — which of the app's experimental surfaces this window shows,
+   * read ONCE when the runtime starts (see {@link desktopFeaturesOf}).
+   *
+   * Optional, and `undefined` reads as every surface hidden: before the answer
+   * arrives, when the bridge has no such method, and when the call is refused.
+   * The flag defaults OFF, and an unanswered question must not show a surface.
+   */
+  desktopFeatures?: DesktopFeatures;
+}
+
+/**
+ * The features a runtime carries, with a missing answer read as the shipped
+ * default (issue #1198). Every gated call site reads through this, so it reads
+ * `features.showDeck` rather than guarding `undefined` itself.
+ */
+export function desktopFeaturesOf(runtime: Pick<DeckRuntimeState, "desktopFeatures">): DesktopFeatures {
+  return runtime.desktopFeatures ?? DEFAULT_DESKTOP_FEATURES;
 }

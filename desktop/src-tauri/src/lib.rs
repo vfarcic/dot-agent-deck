@@ -2256,30 +2256,28 @@ async fn desktop_terminal_detach(
 
 /// Which of the app's experimental surfaces to show (issue #1198) — the
 /// desktop process's own flag, through one `features::show_desktop_*` wrapper
-/// per surface. Read per call, so a live reload of the file reaches the next
-/// query; nothing is cached on this side.
+/// per surface. The webview asks once at startup; the flag itself is resolved
+/// once, by [`init_features`], so restarting the app is how it changes.
 #[tauri::command]
 async fn desktop_features(webview: Webview) -> Result<dto::DesktopFeatures, String> {
     ensure_main_webview(&webview)?;
     Ok(dto::DesktopFeatures::current())
 }
 
-/// Resolve the desktop process's experimental flag and start its reload
-/// watcher (issue #1198) — the same `features::init_and_watch` the TUI and the
-/// daemon call, keyed off the same launch-directory walk as the TUI's
-/// `launch_project_dir`. Until this runs every `show_desktop_*` wrapper reads
-/// the default, OFF.
+/// Resolve the desktop process's experimental flag (issue #1198). Until this
+/// runs every `show_desktop_*` wrapper reads the default, OFF.
 ///
-/// The launch directory is only where the walk STARTS, and for a packaged app
-/// it is rarely a project: launched from Finder or a desktop launcher the cwd
-/// is `/` or `$HOME`, and the app does not inherit a shell's environment. So
-/// the reachable switches there are `DOT_AGENT_DECK_FEATURES_CONFIG` (naming
-/// the file outright) or `DOT_AGENT_DECK_EXPERIMENTAL`, set wherever the
-/// platform's GUI session takes its environment from. `tauri dev` inherits the
-/// shell and starts inside the repo, so the walk finds the repo's own file.
+/// From this process's environment ONLY — `DOT_AGENT_DECK_EXPERIMENTAL`, and
+/// the file `DOT_AGENT_DECK_FEATURES_CONFIG` names outright — through
+/// `features::init_from_process_env`. There is deliberately no walk up from the
+/// working directory for a `.dot-agent-deck.toml`, which is what the TUI and
+/// the daemon do: that is a client-side project guess, exactly what PRD #819
+/// removed from this crate and linkage-check rule 12 refuses here. A remote
+/// deck's project is on another machine, and a Finder-launched app's working
+/// directory is `/`. `docs/develop/experimental-flag.md` says how a packaged
+/// app is given either variable.
 fn init_features() {
-    let start = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    dot_agent_deck::features::init_and_watch(&dot_agent_deck::config::resolve_project_dir(&start));
+    dot_agent_deck::features::init_from_process_env();
 }
 
 /// Read the desktop app's own settings document, and where it lives (PRD #803).
@@ -2917,6 +2915,9 @@ async fn desktop_voice_resolve(
         new_agent.as_ref(),
         voice::Transcript::new(utterance),
         settings.labels,
+        // Issue #1198: the deck is an experimental surface, so voice neither
+        // offers nor dispatches the way there while it is hidden.
+        dot_agent_deck::features::show_desktop_deck(),
     )
     .await)
 }
@@ -3018,6 +3019,9 @@ async fn desktop_voice_commands(
             .voice
             .unwrap_or_default()
             .labels,
+        // Issue #1198: the list marks the deck's row unavailable while the deck
+        // is hidden, for the same reason the resolver refuses it.
+        dot_agent_deck::features::show_desktop_deck(),
     ))
 }
 

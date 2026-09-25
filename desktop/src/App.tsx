@@ -59,6 +59,7 @@ import { desktopWorkflowPlatformIssue } from "./lib/platform";
 import { LaunchCleanupError } from "./lib/actionError";
 import { CleanupWarning } from "./components/CleanupWarning";
 import type { VoiceDirectoriesDto, VoiceNewAgentDto, VoiceOutcomeDto } from "./lib/bridge";
+import { desktopFeaturesOf } from "./types";
 import type { AgentSession, DeckAction, DeckRuntimeState, DeckSnapshot, DeckView, EvidenceItem, PanelTab, WorkflowLaunchConfig } from "./types";
 import { modeScopedKey } from "./lib/bridge";
 
@@ -111,6 +112,23 @@ function evidenceOpenOnFirstLoad(): boolean {
   return window.innerWidth >= 1260;
 }
 
+/**
+ * The registry entry voice's `open_deck` row invokes — typed against the
+ * registry, so renaming the entry breaks this rather than the gate below.
+ */
+const OPEN_DECK_INVOKE: keyof typeof VOICE_ACTIONS = "openDeck";
+
+/**
+ * Issue #1198 — what a view that names the deck is shown as while the deck is
+ * hidden: the overview, and a pane opened over the deck opens over the
+ * overview instead. Views that do not name the deck come back unchanged.
+ */
+function overviewInsteadOfDeck(view: DeckView): DeckView {
+  if (view.kind === "deck") return { kind: "overview" };
+  if (view.kind === "agent" && view.from === "deck") return { ...view, from: "overview" };
+  return view;
+}
+
 export default function App() {
   return <DeckShell runtime={useDeckRuntime()} />;
 }
@@ -134,7 +152,18 @@ export default function App() {
  * which is why the switch below reads `base` rather than `view.kind`.
  */
 export function DeckShell({ runtime, workflowPlatformIssue, initialView = { kind: "overview" } }: { runtime: DeckRuntimeState; workflowPlatformIssue?: string; initialView?: DeckView }) {
-  const [view, setView] = useState<DeckView>(initialView);
+  const [requestedView, setView] = useState<DeckView>(initialView);
+  /**
+   * Issue #1198 — the app's experimental surfaces, read once at startup. The
+   * deck is one of them, so while it is hidden a view that names it — an
+   * `initialView`, a deep link, a pane opened over it — is SHOWN as the
+   * overview instead. Derived rather than written back, so nothing about the
+   * request is lost and no effect races the first render; every navigation
+   * control that could ask for the deck is itself withheld below (the rail,
+   * the overview's Open deck buttons, voice's `open_deck`).
+   */
+  const features = desktopFeaturesOf(runtime);
+  const view = useMemo(() => (features.showDeck ? requestedView : overviewInsteadOfDeck(requestedView)), [features.showDeck, requestedView]);
   /**
    * The settings document and the zoom keys live HERE, not in the deck,
    * because both are the app's and not one screen's — and `DeckShell` is the
@@ -636,9 +665,15 @@ export function DeckShell({ runtime, workflowPlatformIssue, initialView = { kind
       navigate: (next) => { moved = true; setView(next); },
       closeAgentView: () => { moved = true; closeAgent(); },
     };
+    /* Issue #1198 — the deck is hidden, so voice does not go there even when a
+       resolver names it. The crate already withholds `open_deck` from what the
+       model is offered (`voice::schema::annotate_for`); this is the same gate at
+       the dispatch seam, for an answer that arrives anyway. Refused like any
+       dispatch the host cannot serve, so the report says nothing ran. */
+    if (outcome.invoke === OPEN_DECK_INVOKE && !features.showDeck) return undefined;
     if (!dispatchVoiceAction(outcome.invoke, context, target)) return undefined;
     return moved ? { undo: () => setView(previous) } : {};
-  }, [agentView, base, closeAgent, paneAgent, railContext, selectedDeckId, view]);
+  }, [agentView, base, closeAgent, features.showDeck, paneAgent, railContext, selectedDeckId, view]);
   /** PRD #1223 — what the directory browser shows, read at declaration time. */
   const readDirectories = useCallback(() => newAgentVoice.current?.directories, []);
   /** PRD #1223 — what the New agent dialog shows besides its browser, while it is open. */
@@ -705,7 +740,7 @@ export function DeckShell({ runtime, workflowPlatformIssue, initialView = { kind
   */
   return (
     <>
-      <NavigationRail screen={screen} overlays={overlaysOpen} context={railContext} connection={runtime.snapshot.connection} onShowShortcuts={screen === "deck" ? () => setOverlay("deck", "shortcuts", true) : undefined} />
+      <NavigationRail screen={screen} overlays={overlaysOpen} context={railContext} connection={runtime.snapshot.connection} features={features} onShowShortcuts={screen === "deck" ? () => setOverlay("deck", "shortcuts", true) : undefined} />
       {screenNode}
       <VoiceControlPanel runtime={runtime} screen={view.kind} onDispatch={dispatchVoice} channel={panelVoiceContext} directories={readDirectories} newAgent={readNewAgent} newAgentInstance={readNewAgentInstance} />
       <ShellSettings runtime={runtime} settings={settings} open={overlaysOpen.settings ?? false} onClose={() => setOverlay(screen, "settings", false)} />
@@ -924,7 +959,7 @@ export function ControlDeck(props: { runtime: DeckRuntimeState; workflowPlatform
   };
   return (
     <>
-      <NavigationRail screen="deck" overlays={open} context={context} connection={props.runtime.snapshot.connection} onShowShortcuts={() => setOverlay("deck", "shortcuts", true)} />
+      <NavigationRail screen="deck" overlays={open} context={context} connection={props.runtime.snapshot.connection} features={desktopFeaturesOf(props.runtime)} onShowShortcuts={() => setOverlay("deck", "shortcuts", true)} />
       <DeckSurface {...props} settings={settings} overlays={deck} />
       <ShellSettings runtime={props.runtime} settings={settings} open={open.settings ?? false} onClose={() => setOverlay("deck", "settings", false)} />
     </>
@@ -933,6 +968,7 @@ export function ControlDeck(props: { runtime: DeckRuntimeState; workflowPlatform
 
 export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktopWorkflowPlatformIssue(), onNavigate, openAgent, onCloseAgent, voiceChannel, overlays: shellOverlays }: { runtime: DeckRuntimeState; settings: DesktopSettingsState; workflowPlatformIssue?: string; onNavigate?: (view: DeckView) => void; openAgent?: { deckId: string; agentId: string }; onCloseAgent?: () => void; voiceChannel?: VoiceContextChannel; overlays?: ScreenOverlays }) {
   const { snapshot, mode, setShownTerminals } = runtime;
+  const features = desktopFeaturesOf(runtime);
   /**
    * Issue #1197 — the overlay booleans are held by the shell that renders the
    * one rail, because the rail shows them as active and Settings opens over the
@@ -1539,10 +1575,19 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
    */
   const commandItems = [
     ...(coordinator ? [{ label: "Message coordinator…", hint: `Focus ${coordinator.displayName}'s terminal`, icon: Send, run: () => VOICE_ACTIONS.messageCoordinator.run(voiceContext, { agentId: coordinator.id }) }] : []),
-    { label: "Manage projects", hint: "Choose repositories & workflows", icon: FolderGit2, run: () => VOICE_ACTIONS.openProjects.run(voiceContext) },
-    { label: "Open prompt library", hint: "Reusable workflow launch prompts", icon: BookMarked, run: () => VOICE_ACTIONS.openPromptLibrary.run(voiceContext) },
-    { label: "Open agent profiles", hint: "Configure models & permissions", icon: Bot, run: () => VOICE_ACTIONS.openAgentProfiles.run(voiceContext) },
-    { label: "Edit workflow order", hint: "Enable, skip, or reorder roles", icon: Network, run: () => VOICE_ACTIONS.openWorkflowOrder.run(voiceContext) },
+    /* Issue #1198 — each experimental panel's entry follows its own field, as
+       its rail entry does. The palette itself is the deck's (it is bound here,
+       and the deck is unmounted while `showDeck` is off), so it needs no gate
+       of its own. NOT gated, and named so the residual is known: the panels'
+       in-deck doors — the run graph's Edit loop, the empty deck's Configure
+       agents, and the Projects ↔ Workflows cross-links inside those panels.
+       Each sits inside a surface that is itself hidden with the flag off, and
+       all five fields follow the one flag today; if they ever diverge, those
+       doors need gates of their own. */
+    ...(features.showProjects ? [{ label: "Manage projects", hint: "Choose repositories & workflows", icon: FolderGit2, run: () => VOICE_ACTIONS.openProjects.run(voiceContext) }] : []),
+    ...(features.showPrompts ? [{ label: "Open prompt library", hint: "Reusable workflow launch prompts", icon: BookMarked, run: () => VOICE_ACTIONS.openPromptLibrary.run(voiceContext) }] : []),
+    ...(features.showAgentProfiles ? [{ label: "Open agent profiles", hint: "Configure models & permissions", icon: Bot, run: () => VOICE_ACTIONS.openAgentProfiles.run(voiceContext) }] : []),
+    ...(features.showWorkflows ? [{ label: "Edit workflow order", hint: "Enable, skip, or reorder roles", icon: Network, run: () => VOICE_ACTIONS.openWorkflowOrder.run(voiceContext) }] : []),
     { label: "Open settings", hint: "Appearance and other app preferences", icon: Settings2, run: () => VOICE_ACTIONS.openSettings.run(voiceContext) },
     { label: evidenceOpen ? "Hide evidence drawer" : "Show evidence drawer", hint: "Toggle transition evidence", icon: PanelRight, run: () => VOICE_ACTIONS.toggleEvidenceDrawer.run(voiceContext) },
     ...snapshot.agents.map((agent, index) => ({ label: `Focus ${agent.role}`, hint: `Shortcut ${index + 1}`, icon: SquareTerminal, run: () => VOICE_ACTIONS.focusAgent.run(voiceContext, { agentId: agent.id }) })),
