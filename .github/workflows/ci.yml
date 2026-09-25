@@ -251,7 +251,7 @@ jobs:
       # site in .github/workflows/ is not an exact version or disagrees with it.
       - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
         with:
-          version: 11.22.0
+          version: 12.6.0
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
           node-version: 24
@@ -325,7 +325,7 @@ jobs:
       # Exact, and in lockstep with devbox.json — see `desktop-web` above.
       - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
         with:
-          version: 11.22.0
+          version: 12.6.0
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
           node-version: 24

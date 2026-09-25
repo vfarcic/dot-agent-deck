@@ -786,7 +786,7 @@ jobs:
             patchelf fakeroot file desktop-file-utils
       - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
         with:
-          version: 11.22.0
+          version: 12.6.0
       # pnpm and Node match ci.yml's `desktop-web` job, so what is tested is
       # what is shipped. pnpm is also the exact version devbox.json pins, and
       # `scripts/check-pin-lockstep.sh` fails if any of those sites disagree
