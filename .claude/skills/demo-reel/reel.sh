@@ -106,13 +106,14 @@ CLIP_SPEED="${CLIP_SPEED:-1.0}"
 # render-loop ticks, which retime.sh --trailing measures). Left at agg's default,
 # the two stack: issue #365 measured PRD #341's reel ending on 5.27s of one
 # identical frame, ~2.2s of cast tail plus agg's hold. So the hold is sized per
-# clip instead: CLIP_LAST_FRAME seconds (a short closing beat), raised just
-# enough that the final state is visible for at least CLIP_FINAL_DWELL seconds
-# in total. The floor matters for a cast that ENDS on its payoff — a test that
-# stops recording the moment its assertion matches paints the answer at or near
-# its last event, with little or no tail — and adds nothing once the tail is at
-# least CLIP_FINAL_DWELL - CLIP_LAST_FRAME. Both are env-overridable, in seconds
-# of reel time.
+# clip instead: the cast's tail plus CLIP_LAST_FRAME seconds (a short closing
+# beat), raised to at least CLIP_FINAL_DWELL seconds in total. The tail is cut
+# from the cast and folded into the hold (see the render call) so that total is
+# what actually reaches the screen. The floor matters for a cast that ENDS on
+# its payoff — a test that stops recording the moment its assertion matches
+# paints the answer at or near its last event, with little or no tail — and adds
+# nothing once the tail is at least CLIP_FINAL_DWELL - CLIP_LAST_FRAME. Both are
+# env-overridable, in seconds of reel time.
 CLIP_LAST_FRAME="${CLIP_LAST_FRAME:-1}"
 CLIP_FINAL_DWELL="${CLIP_FINAL_DWELL:-2}"
 # A card is one static frame. agg only needs a brief span to paint it, so the
@@ -663,15 +664,19 @@ for ((i = 0; i < n; i++)); do
       read -r clip_cols clip_rows < <(cast_grid "$clip")
       clip_font="${CLIP_FONT_SIZE:-$(fit_font_size "$clip_cols" "$clip_rows")}"
       note "clip $i: grid ${clip_cols}x${clip_rows} rendered at font $clip_font"
-      # Size the final-frame hold (see CLIP_LAST_FRAME above). The tail is in cast
-      # seconds, so divide by CLIP_SPEED to get the reel seconds agg will show it
-      # for; agg's --last-frame-duration itself is not scaled by --speed.
+      # Size the final-frame hold (see CLIP_LAST_FRAME above). The tail is cut out
+      # of the cast (retime.sh --cut-tail) and re-added here as part of the hold,
+      # because agg emits no frame for a tick that leaves the image unchanged, so
+      # left in the cast the tail may or may not reach the screen. The tail is in
+      # cast seconds, so divide by CLIP_SPEED to get reel seconds; agg's
+      # --last-frame-duration itself is not scaled by --speed.
       tail_s="$("$RETIME_SCRIPT" --trailing "$WORKDIR/clip_$i.retimed.cast")"
+      "$RETIME_SCRIPT" --cut-tail "$WORKDIR/clip_$i.retimed.cast" --out "$WORKDIR/clip_$i.cut.cast"
       last_frame="$(awk -v t="$tail_s" -v sp="$CLIP_SPEED" -v lf="$CLIP_LAST_FRAME" -v fd="$CLIP_FINAL_DWELL" \
-        'BEGIN { need = fd - (sp > 0 ? t / sp : t); printf "%.3f", (need > lf ? need : lf) }')"
+        'BEGIN { held = (sp > 0 ? t / sp : t) + lf; printf "%.3f", (held > fd ? held : fd) }')"
       note "$(awk -v t="$tail_s" -v lf="$last_frame" -v i="$i" \
-        'BEGIN { printf "clip %s: final state has a %.2fs cast tail, held a further %.2fs", i, t, lf }')"
-      render_cast "$WORKDIR/clip_$i.retimed.cast" "$WORKDIR/clip_$i.gif" "$CLIP_IDLE" "$clip_font" "$CLIP_SPEED" "$last_frame"
+        'BEGIN { printf "clip %s: final state held %.2fs (includes a %.2fs cast tail)", i, lf, t }')"
+      render_cast "$WORKDIR/clip_$i.cut.cast" "$WORKDIR/clip_$i.gif" "$CLIP_IDLE" "$clip_font" "$CLIP_SPEED" "$last_frame"
       warn_aspect "$WORKDIR/clip_$i.gif" "clip $i ($clip)"
       natives+=("$WORKDIR/clip_$i.gif")
       holds+=("") ;;

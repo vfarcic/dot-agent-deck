@@ -21,7 +21,12 @@
 #   * the duration matches card holds + each retimed clip + the final-frame hold
 #     the engine sizes for it, to within half a second. That is the guard for
 #     issue #365, where agg's default 3s last-frame hold stacked on each clip's
-#     own tail (see CLIP_LAST_FRAME / CLIP_FINAL_DWELL in reel.sh).
+#     own tail (see CLIP_LAST_FRAME / CLIP_FINAL_DWELL in reel.sh). clip-a ends on
+#     its last printed output (no tail, so the CLIP_FINAL_DWELL floor sizes its
+#     hold) and clip-b ends on render-loop ticks (a 1.2s tail, held as tail +
+#     CLIP_LAST_FRAME), so both branches of that sizing are rendered;
+#   * retime.sh --trailing, which measures that tail, returns the exact expected
+#     value on both fixtures and on control-only endings that change the screen.
 #
 # It needs only agg + ffmpeg/ffprobe (already in devbox.json). It is LOCAL-ONLY
 # and never runs in CI. The real YouTube upload is NOT exercised here — that
@@ -53,6 +58,31 @@ fail() { echo "SMOKE FAIL: $*" >&2; exit 1; }
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 OUT="$TMP/reel.mp4"
+
+# --- retime.sh --trailing (pure jq, exact) -------------------------------
+# The engine sizes each clip's final-frame hold from this number, so check it
+# directly before the render, where a wrong value would only move the duration
+# by a fraction of a second. Values are compared to the millisecond.
+RETIME="$HERE/../retime.sh"
+assert_trailing() {
+  local label="$1" cast="$2" want="$3" got
+  got="$("$RETIME" --trailing "$cast")"
+  awk -v g="$got" -v w="$want" 'BEGIN { x = g - w; if (x < 0) x = -x; exit !(x < 0.001) }' \
+    || fail "retime.sh --trailing on $label: got ${got}s, want ${want}s"
+}
+"$RETIME" "$FIXTURES/clip-a.cast" --out "$TMP/a.retimed.cast"
+"$RETIME" "$FIXTURES/clip-b.cast" --out "$TMP/b.retimed.cast"
+assert_trailing "retimed clip-a (ends on printed output)" "$TMP/a.retimed.cast" 0
+assert_trailing "retimed clip-b (three render-loop ticks, IDLE_CAP apart)" "$TMP/b.retimed.cast" 1.2
+# Control-only events that DO change the screen count as the final change, even
+# though they print no characters: an erase followed by a tick, and a bare
+# newline as the last event.
+printf '%s\n' '{"version": 2, "width": 80, "height": 24}' '[0.0, "o", "text"]' \
+  '[0.5, "o", "\u001b[2J"]' '[0.9, "o", "\u001b[0m\u001b[?25h\u001b[1;1H"]' > "$TMP/erase.cast"
+assert_trailing "an erase at 0.5s then a tick at 0.9s" "$TMP/erase.cast" 0.4
+printf '%s\n' '{"version": 2, "width": 80, "height": 24}' '[0.0, "o", "text"]' \
+  '[0.9, "o", "\r\n"]' > "$TMP/newline.cast"
+assert_trailing "a trailing newline" "$TMP/newline.cast" 0
 
 # Stitch only — must succeed with no credentials in the environment. Run from
 # the fixtures dir because clip paths in the manifest are relative to CWD.
@@ -99,8 +129,9 @@ CLIP_LAST_FRAME="${CLIP_LAST_FRAME:-1}"
 CLIP_FINAL_DWELL="${CLIP_FINAL_DWELL:-2}"
 CLIP_SPEED="${CLIP_SPEED:-1.0}"
 max_hold="$(awk -v lf="$CLIP_LAST_FRAME" -v fd="$CLIP_FINAL_DWELL" 'BEGIN { print (lf > fd ? lf : fd) }')"
-# Per clip: max(MIN_BUDGET, MAX_STRETCH x its own duration), + max_hold for the
-# final frame + 1s of frame/encoder rounding. Clip paths are relative to the
+# Per clip: max(MIN_BUDGET, MAX_STRETCH x its own duration), played at CLIP_SPEED
+# (so divided by it), + max_hold for the final frame + 1s of frame/encoder
+# rounding. Clip paths are relative to the
 # fixtures dir (that is where the engine ran), so resolve them from there. The
 # fixture casts are sub-second, so MIN_BUDGET is their binding cap; for a real
 # multi-second cast the MAX_STRETCH term dominates.
@@ -112,8 +143,8 @@ max_dur="$(cd "$FIXTURES" && {
     else
       cdur="$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$clip")"
     fi
-    total="$(awk -v t="$total" -v d="${cdur:-0}" -v ms="$MAX_STRETCH" -v mb="$MIN_BUDGET" -v mh="$max_hold" \
-      'BEGIN { b = d * ms; if (b < mb) b = mb; print t + b + mh + 1 }')"
+    total="$(awk -v t="$total" -v d="${cdur:-0}" -v ms="$MAX_STRETCH" -v mb="$MIN_BUDGET" -v mh="$max_hold" -v sp="$CLIP_SPEED" \
+      'BEGIN { b = d * ms; if (b < mb) b = mb; print t + b / sp + mh + 1 }')"
   done < <(jq -r '.[].clip' "$MANIFEST")
   printf '%s' "$total"
 })"
@@ -121,12 +152,14 @@ awk -v d="$DUR" -v m="$max_dur" 'BEGIN { exit !(d + 0 <= m + 0) }' \
   || fail "duration ${DUR}s > engine's own bound ${max_dur}s — a segment is being stretched (see retime.sh MAX_STRETCH/MIN_BUDGET)"
 
 # ...and, tightly, what the engine should have produced: card holds + each clip's
-# RETIMED duration (at CLIP_SPEED) + the final-frame hold it sizes from the
-# retimed cast's tail — max(CLIP_LAST_FRAME, CLIP_FINAL_DWELL - tail). Only .cast
-# clips are accounted for; the fixture has no gif/mp4. Rendering and encoding
+# RETIMED duration (at CLIP_SPEED) + max(CLIP_LAST_FRAME, CLIP_FINAL_DWELL - tail).
+# The engine cuts the tail out of the cast and holds the final frame for
+# max(CLIP_FINAL_DWELL, tail + CLIP_LAST_FRAME), which totals the same — so this
+# also fails if the cut is dropped, since agg then renders no time at all for
+# clip-b's tail of ticks that leave the image unchanged. Only .cast clips are
+# accounted for; the fixture has no gif/mp4. Rendering and encoding
 # round each segment to whole frames, so half a second of slack is generous,
 # while agg's default 3s hold creeping back would overshoot it on the first clip.
-RETIME="$HERE/../retime.sh"
 expected="$(cd "$FIXTURES" && {
   total="$sum_holds"
   while IFS= read -r clip; do
