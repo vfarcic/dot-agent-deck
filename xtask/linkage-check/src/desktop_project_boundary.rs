@@ -137,6 +137,28 @@ const ALLOWED_ROOT_MODULES: &[&str] = &[
     "daemon_protocol",
     "daemon_stop",
     "event",
+    // Issue #1198, argued rather than added quietly. The desktop names two
+    // things here: the five `show_desktop_*` wrappers, one per surface the
+    // app hides behind the `experimental` flag (CLAUDE.md rule 9 puts every
+    // gate behind a wrapper in this module, so a desktop-side copy of the
+    // flag read would be the second list the rule exists to prevent), and
+    // `init_from_process_env`, which resolves the flag for this process.
+    //
+    // That entry point is the one the desktop may call, and it crosses none
+    // of this rule's lines: it reads `DOT_AGENT_DECK_EXPERIMENTAL` and the
+    // file `DOT_AGENT_DECK_FEATURES_CONFIG` names outright, takes no project
+    // directory, walks nowhere and never calls `std::env::current_dir`.
+    //
+    // The module ITSELF is not that clean, and saying so is the point of
+    // arguing the entry: `init_and_watch` — the TUI's and the daemon's entry
+    // point — resolves the flag against a project directory its caller walked
+    // to, and a desktop call to it would be the client-side project read PRD
+    // #819 removed. The first commit that wired the desktop did exactly that
+    // (with a `current_dir` walk, which the `cwd-fallback` finding caught).
+    // With this entry allowlisted, a desktop call to `init_and_watch` is the
+    // "root-crate wrapper with an innocuous name" residual this file's header
+    // already admits: nothing here would catch it.
+    "features",
     "platform",
     "prompt_delivery",
     // PRD #741 M6, argued rather than added quietly. The desktop's settings

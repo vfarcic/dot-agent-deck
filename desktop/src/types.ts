@@ -343,6 +343,33 @@ export type NewAgentOptions =
   | { kind: "unsupported"; desktopAgents: NewAgentOption[]; lastCommand?: string };
 
 /**
+ * Which of the app's experimental surfaces to show (issue #1198) — the Tauri
+ * `desktop_features` reply, one field per `features::show_desktop_*` wrapper in
+ * the root crate.
+ *
+ * It is the DESKTOP process's flag and belongs to the app, not to a deck — do
+ * not confuse it with {@link NewAgentOptions}' per-deck `experimental`. All
+ * `false` is the shipped default. The agent overview, the agent overlay and
+ * Settings have no field because they are never gated.
+ */
+export interface DesktopFeatures {
+  showDeck: boolean;
+  showProjects: boolean;
+  showPrompts: boolean;
+  showWorkflows: boolean;
+  showAgentProfiles: boolean;
+}
+
+/** Every experimental surface hidden — the shipped default, and what fixture mode answers unless `?experimental=1`. */
+export const DEFAULT_DESKTOP_FEATURES: DesktopFeatures = {
+  showDeck: false,
+  showProjects: false,
+  showPrompts: false,
+  showWorkflows: false,
+  showAgentProfiles: false,
+};
+
+/**
  * The orchestrations the New agent form can offer for one directory on one deck
  * (PRD #1223 M6) — that deck's `ResolveProject` answer.
  *
@@ -489,7 +516,7 @@ export interface AgentSession {
    *
    * A DISPLAY COPY, sanitised and clamped to `DISPLAY_LIMITS.prompt` by
    * `agentFromDto`'s `taskLine`, because `AgentTile` prints it straight into a
-   * DOM text node and the deck is the screen the app opens on. Bounding it at
+   * DOM text node on the deck, one of the app's two screens. Bounding it at
    * the projection rather than at that one tile is deliberate: nothing sorts,
    * groups or keys on this field, so making it a display copy costs nothing and
    * makes every consumer of it safe by construction rather than by memory.
@@ -1214,4 +1241,22 @@ export interface DeckRuntimeState {
    * no webview to scale.
    */
   setZoom: (level: number) => Promise<number>;
+  /**
+   * Issue #1198 — which of the app's experimental surfaces this window shows,
+   * read ONCE when the runtime starts (see {@link desktopFeaturesOf}).
+   *
+   * Optional, and `undefined` reads as every surface hidden: before the answer
+   * arrives, when the bridge has no such method, and when the call is refused.
+   * The flag defaults OFF, and an unanswered question must not show a surface.
+   */
+  desktopFeatures?: DesktopFeatures;
+}
+
+/**
+ * The features a runtime carries, with a missing answer read as the shipped
+ * default (issue #1198). Every gated call site reads through this, so it reads
+ * `features.showDeck` rather than guarding `undefined` itself.
+ */
+export function desktopFeaturesOf(runtime: Pick<DeckRuntimeState, "desktopFeatures">): DesktopFeatures {
+  return runtime.desktopFeatures ?? DEFAULT_DESKTOP_FEATURES;
 }

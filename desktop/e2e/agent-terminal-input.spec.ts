@@ -1,4 +1,5 @@
 import { expect, test } from "@playwright/test";
+import { enterDeck } from "./support/overview";
 
 /**
  * The deck's terminal-input contract, exercised against the crowded fixture so
@@ -13,6 +14,7 @@ test.describe("agent terminal input", () => {
    */
   test("renders xterm as each tile's only text input", async ({ page }) => {
     await page.goto("/?fixture=1&state=crowded");
+    await enterDeck(page);
 
     const tiles = page.locator(".agent-tile");
     const terminalInputs = tiles.locator("textarea.xterm-helper-textarea");
@@ -32,6 +34,7 @@ test.describe("agent terminal input", () => {
    */
   test("marks non-live fixture panes instead of accepting terminal input", async ({ page }) => {
     await page.goto("/?fixture=1&state=crowded");
+    await enterDeck(page);
 
     const historyOnly = page.getByTestId("terminal-11");
     await expect(historyOnly).toHaveAttribute("data-input-state", "history-only");

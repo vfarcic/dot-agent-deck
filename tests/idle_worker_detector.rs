@@ -78,7 +78,21 @@ const WORKER_COMMAND: &str = "cat";
 /// timer firing inside it used to inject the very nudge the close exists to
 /// suppress. `SHELL` is pinned so the `trap` builtin is POSIX `sh`'s (it is
 /// consumed as a wrapper choice and never exported into the child).
-const TERM_RESISTANT_WORKER_COMMAND: &str = "trap '' TERM; exec cat";
+///
+/// It prints [`TERM_RESISTANT_READY`] only AFTER the trap is installed, and a
+/// test must wait for that marker ([`IdleHarness::wait_for_term_resistant`])
+/// before it stops the worker. Until the `trap` builtin has run the child is an
+/// ordinary `sh`, so a SIGTERM that beats it kills the child at once and the
+/// close is over after one 50 ms `try_wait` poll instead of the 3 s grace —
+/// measured at 52.8 ms by delaying the trap. `scheduler/idle-worker/010` stops
+/// the worker immediately after boot, so on a loaded `build-macos` runner it
+/// sometimes did beat the trap, and its barrier then missed a ~50 ms window
+/// and waited out its whole ceiling (5.25 s, 8.25 s and 20.92 s against
+/// ceilings of 5, 8 and ~20 s: never late, always "never").
+const TERM_RESISTANT_WORKER_COMMAND: &str = "trap '' TERM; printf TERM-READY; exec cat";
+
+/// What [`TERM_RESISTANT_WORKER_COMMAND`] prints once SIGTERM is ignored.
+const TERM_RESISTANT_READY: &[u8] = b"TERM-READY";
 
 /// A worker that stays alive just long enough to receive its
 /// delegated task pointer, then ENDS ITS OWN PROCESS — no SIGTERM, no
@@ -442,6 +456,26 @@ impl IdleHarness {
             released.is_ok(),
             "StopAgent answered but its close never released pane {pane_id}, so the pane id was \
              never freed for reuse and the scenario under test could not occur"
+        );
+    }
+
+    /// Wait until the [`TERM_RESISTANT_WORKER_COMMAND`] worker for `role` has
+    /// installed its SIGTERM trap. Without this a `StopAgent` can land before
+    /// the trap and the close no longer holds the grace window open.
+    async fn wait_for_term_resistant(&self, role: &str) {
+        let agent_id = self
+            .worker_agent_ids
+            .get(role)
+            .unwrap_or_else(|| panic!("{role} registry id"));
+        let snapshot =
+            common::wait_for_child_first_output(&self.registry, agent_id, TERM_RESISTANT_READY)
+                .await;
+        assert!(
+            snapshot
+                .windows(TERM_RESISTANT_READY.len())
+                .any(|window| window == TERM_RESISTANT_READY),
+            "{role} never reported that it ignores SIGTERM; snapshot = {:?}",
+            String::from_utf8_lossy(&snapshot)
         );
     }
 
@@ -1233,6 +1267,9 @@ fn idle_worker_009_close_grace_window_suppresses_the_timeout() {
             None,
         )
         .await;
+        harness
+            .wait_for_term_resistant("term-resistant-worker")
+            .await;
         let server = start_attach_server(&harness).await;
 
         let delegated_at = tokio::time::Instant::now();
@@ -1294,53 +1331,58 @@ fn idle_worker_010_delegate_during_close_refuses_to_arm() {
         .await;
         let server = start_attach_server(&harness).await;
 
+        let closing_pane = worker_pane("closing-worker");
+        harness.wait_for_term_resistant("closing-worker").await;
         let stopped_id = harness
             .worker_agent_ids
             .get("closing-worker")
             .expect("closing worker registry id")
             .clone();
-        let close = tokio::spawn(IdleHarness::stop_agent_timed(
+        // Registered BEFORE the stop is sent, so the close's beginning is an
+        // edge this test cannot miss (see the barrier below).
+        let close_begun = harness.registry.pane_close_signal(&closing_pane);
+        let mut close = tokio::spawn(IdleHarness::stop_agent_timed(
             server.path.clone(),
             stopped_id,
         ));
 
         // Barrier: the delegate below must land strictly INSIDE the close
         // transition, which the SIGTERM-ignoring child holds open for the full
-        // three-second grace.
+        // three-second grace once it has reported its trap installed.
         //
-        // The ceiling is issue #709's load-scaled [`common::child_boot_budget`]
-        // rather than the flat 5 s it used to be, and this is the same defect
-        // #709 converted the other flat `from_secs(2)`/`from_secs(5)` waits for:
-        // the wait itself was already condition-driven — it returns the instant
-        // the pane is closing — but its CEILING was sized for an idle machine,
-        // and what it is waiting on is a `StopAgent` socket round trip plus a
-        // fork. Starved of either, the barrier expired and reported "the pane
-        // never entered the closing state", which is true and useless: not "the
-        // close finished early" but "the close had not started". Measured on
-        // `build-macos` (2468 fast-tier tests in 152 s on a 3-core runner) at
-        // 5.252 s against the 5 s ceiling, while the whole test is 3.04-3.12 s
-        // here — stable under 16 spinners on 16 cores, because its duration is
-        // dominated by the 3 s SIGTERM grace and not by CPU. `CHILD_BOOT_BASE`
-        // is 8 s. `machine_load_per_cpu` used to be `None` on macOS, so the
-        // platform that failed got a flat 8 s — and failed again at 8.248 s on
-        // PR #1238's `build-macos` run. It now reads `getloadavg(3)` there, so
-        // this ceiling scales with the runner's load on macOS as on Linux.
+        // This barrier used to POLL `is_pane_closing` every 5 ms, and it failed
+        // on `build-macos` three times with "the pane never entered the closing
+        // state": at 5.252 s against a flat 5 s ceiling, at 8.248 s against
+        // 8 s (PR #1238), and at 20.92 s against issue #709's load-scaled
+        // `child_boot_budget` once #1245 made that scale on macOS (PR #1307).
+        // Each widening was read as starvation, and each time the test ran the
+        // whole ceiling and a quarter of a second more — the signature of a
+        // condition that was never going to hold, not of one arriving late.
+        // What actually happened is that the stop was sent immediately after
+        // boot and could beat the worker's `trap '' TERM`, so the child died on
+        // SIGTERM and the close lasted one ~50 ms `try_wait` poll; a poller
+        // starved for longer than that missed the whole transition, and the
+        // pane then never enters the closing state again. The fix is both
+        // halves: wait for the trap ([`IdleHarness::wait_for_term_resistant`]),
+        // and wait on the registry's own close-begin signal instead of polling
+        // a level, so even a short close cannot slip between two samples.
         //
-        // Widening a PRECONDITION cannot weaken what this test asserts. The
-        // guard that makes the race real is the assertion AFTER the delegate —
-        // `is_pane_closing` still true when it landed — and that is untouched.
-        // The one cost is that a genuinely-missed window now takes ~8 s to
-        // report instead of 5 s, and that case is unreachable while the
-        // stand-in ignores SIGTERM: the close is held open for the full grace by
-        // construction, so an unobserved window means starvation, not speed.
-        let closing_pane = worker_pane("closing-worker");
-        let entered = tokio::time::timeout(common::child_boot_budget(), async {
-            while !harness.registry.is_pane_closing(&closing_pane) {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await;
-        assert!(entered.is_ok(), "the pane never entered the closing state");
+        // And if the stop finishes WITHOUT a close ever beginning, say so now
+        // rather than sleeping out the ceiling — that is a different defect
+        // (the handler skipped `begin_pane_close`) and deserves its own message.
+        // The ceiling stays load-scaled: it bounds a socket round trip plus
+        // handler scheduling, which is exactly what #709 scales.
+        tokio::select! {
+            _ = close_begun => {}
+            finished = &mut close => panic!(
+                "StopAgent completed without the pane ever entering the closing state; \
+                 result = {finished:?}"
+            ),
+            _ = tokio::time::sleep(common::child_boot_budget()) => panic!(
+                "the pane never entered the closing state: StopAgent was still in flight after {:?}",
+                common::child_boot_budget()
+            ),
+        }
 
         harness
             .delegate(&["closing-worker", "silent-control"])
