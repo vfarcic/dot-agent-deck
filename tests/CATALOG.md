@@ -1306,6 +1306,20 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** an LLM response (nothing is submitted, exactly like `prompt/pane-input/022`); that the daemon rather than the user sent the bytes — no fault seam for a partial PTY write exists at the e2e layer, so the write path itself is covered at L1 (`scheduler/idle-worker/019`, `orchestration/delegate/031`); the abstaining conditions (`agent_pty::deliver_payload_refuses_to_erase_what_it_cannot_undo_exactly`); the other agent CLIs, whose editors are unexercised here.
 - **Platform coverage:** mac+linux.
 
+##### prompt/pane-input/039 — An oversized `delivery_id` is refused before the ledger stores it or anything is written (issue #527).
+- **Layer:** L1 protocol integration with an in-process daemon and a real PTY-backed shell.
+- **Agent:** synthetic pane target backed by `/bin/sh`, registered as a sessionless pane so a guarded send is otherwise deliverable.
+- **Asserts:** a `write-and-submit` whose `delivery_id` is `MAX_DELIVERY_ID_BYTES + 1` bytes is answered with an error and no `SendResult`, and its marker never reaches the pane; the same request with an id of exactly `MAX_DELIVERY_ID_BYTES` bytes is `Applied` and its marker arrives, so the refusal is the cap and not the fixture.
+- **Does not assert:** that the ledger stays empty after the refusal, or that the longest id a client mints fits the cap — both pinned at the unit level by `agent_pty::delivery_ledger_refuses_an_oversized_id_without_storing_it`.
+- **Platform coverage:** mac+linux.
+
+##### prompt/pane-input/040 — The 10-second readiness fallback pays the readiness buffer before it writes, on both spawn-time delivery paths (issue #529).
+- **Layer:** L1, in `src/ui.rs`'s own test module (the production `process_pending_seed_prompts` and `deliver_orchestrator_prompt` driven over a recording pane controller), so it runs under `cargo test-fast` and therefore in the `build` job.
+- **Agent:** none (panes with no session at all, so nothing announces a conversation and `spawn_time_agent_ready` stays false — asserted as a precondition on the seed half).
+- **Asserts:** a seed aged 1 ms past `SPAWN_TIME_READINESS_TIMEOUT` gets NO write and is held rather than dropped; re-aged to `SPAWN_TIME_READINESS_TIMEOUT + SPAWN_TIME_READINESS_BUFFER` it gets exactly one write carrying the seed. The same pair for an orchestration start-role remit, driven with explicit instants against its tab anchor: no write and the remit not consumed at `anchor + 10 s + 1 ms`, exactly one write carrying it at `anchor + 10 s + 500 ms`. The seed fixture carries an already-spent `ready_since`, so a fallback that borrowed that stamp instead of counting from its own 10 s would also go red.
+- **Why it exists:** both paths used to set `buffer_elapsed = true` on the timeout branch, so the one delivery made with no evidence at all that the agent's input handling was up was also the one made with no buffer. Fails on the pre-fix code at each half's first assertion.
+- **Does not assert:** the buffer's size (500 ms, tuned under PRD #128); the fast path's buffer (`should_inject_spawn_time_prompt`'s unit tests); that the fallback still delivers for a producer that announces nothing (`prompt/pane-input/036`); confirmation, retry or deadline behaviour after the write (`prompt/pane-input/023`–`/030`); the daemon-owned delegate path, which pays its own buffer after its timeout in `state.rs`.
+
 ##### prompt/pane-input/041 — A TUI-owned retry waits out a genuine Codex confirmation 8.45 s after the write, and a delivery that is never confirmed is still retried (issue #637).
 - **Layer:** L1, in `src/ui.rs`'s own test module (the production `deliver_orchestrator_prompt` driven over an `Applied`-returning pane controller at explicit clock offsets, with a hook-derived `AppState`), so it runs under `cargo test-fast`.
 - **Agent:** none (a synthetic Codex pane — `announced_prompt_snapshot` declares the producer as Codex).
@@ -1637,6 +1651,13 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Agent:** none (fixture whose single mode has one persistent pane running `printf …; sleep 600` under the default watch wrapper).
 - **Asserts:** a sentinel assembled at runtime by the command — so it cannot appear in the command line the pane's shell echoes — is visible in the side pane although the command never exits; the echoed wrapper invocation is gone from the pane, proving the watcher cleared the screen ahead of its first output rather than after process exit.
 - **Does not assert:** the 10s re-run interval; the ordering of interleaved stdout/stderr; the buffer-then-clear internals (covered by `watch::tests` unit tests).
+- **Platform coverage:** mac+linux.
+
+##### tabs/mode/007 — A mode's `seed_prompt` reaches an agent that never signals readiness, through the 10-second fallback and no sooner than its readiness buffer allows (issue #529).
+- **Layer:** L2 (lane 1).
+- **Agent:** none — `tabs/mode/005`'s recorder with its `SessionStart` line removed, so nothing announces a conversation and only the `timeout_ready` fallback in `process_pending_seed_prompts` can open the pane.
+- **Asserts:** spawning the `seeded` mode via the new-pane dialog with that silent recorder still delivers the configured `seed_prompt` into the agent pane (the marker is recorded within 30 s), and it is observed more than 10.5 s after the test began typing the spawn. That instant precedes the seed's `created_at` anchor, so with the buffer in place the bound holds by construction and cannot flake on a slow box.
+- **Does not assert:** the 500 ms boundary itself. Spawn latency and render-frame jitter are the same order as the buffer, so the pre-fix code can also clear 10.5 s here; `prompt/pane-input/040` is the discriminator, at L1 with explicit instants. Also not: the orchestrator remit's fallback (L1 only, same entry), or confirmation and retry after the write.
 - **Platform coverage:** mac+linux.
 
 #### tabs/orchestration
@@ -4375,6 +4396,13 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 - **Platform coverage:** mac+linux (real-agent tier is local-only).
 - **Cost note:** one minimal mini-model availability probe; the launched interactive agent receives no prompt.
 
+##### codex/spawn/013 — A plain new-pane Codex command launches through the Wrapper strategy exactly once (issue #533).
+- **Layer:** L2 synthetic PTY-attached new-pane flow (no mode) with PATH recorder stubs.
+- **Agent:** synthetic Codex recorder.
+- **Asserts:** submitting the Ctrl+N form with no mode and Command bare `codex` executes exactly `dot-agent-deck wrap --agent codex -- codex` — the wrapper once, never bare Codex and never a second wrapper. Issue #533 moved this path's rewrite from the TUI to the daemon's spawn boundary, which this pins from the outside.
+- **Does not assert:** which deck binary the daemon names as the wrapper (the recorder is injected through `DOT_AGENT_DECK_WRAP_BIN`; renamed-build resolution is unit-tested in `src/wrap.rs`); a real Codex process (`codex/live/001`).
+- **Platform coverage:** mac+linux.
+
 #### codex/hooks
 
 ##### codex/hooks/001 — A real launcher-script interactive Codex turn reports native prompt/tool detail and becomes Idle without process exit (PRD #20 W1, R20-013/R20-014, §4.3.7). [reel]
@@ -4609,6 +4637,20 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 - **Agent:** none (a `sleep 0.2` crashed worker stand-in, then a `cat` stand-in installed as the healthy replacement).
 - **Asserts:** with the worker's record marked crashed, the test holds `pane_dispatch_lock(WORKER_PANE)`, then manually polls `handle_restart_role_with_state(force: true)` once with a no-op waker and asserts that first poll is already `Pending` (blocked acquiring the same lock). Only then — still holding the lock — does the test call `AgentPtyRegistry::respawn_or_recreate_agent_for_pane` to install a healthy replacement, the same simulated concurrent-delegate step `pane/restart/010` uses. After the lock is released and the restart future is driven to completion, it must report `restarted: true` with no error, and the pane's occupant afterward must be a freshly spawned agent, NOT the replacement installed by the simulated delegate — proof force restarts regardless of the pane no longer being crashed by the time the dispatch lock is actually held.
 - **Does not assert:** the non-force refusal path (`pane/restart/010` owns that); the CLI/socket layer.
+- **Platform coverage:** mac+linux (unix-only).
+
+##### pane/restart/012 — A delegate to a worker that still owes a work-done is refused as busy, and `pane restart --force` cancels that task so the role takes a plain delegate again (issues #580 and #590).
+- **Layer:** L1/fast (in-process — the real `handle_delegate_with_state` and `handle_restart_role_with_state` against a daemon-owned `cat`-orchestrator + `cat` worker; no daemon socket, no LLM).
+- **Agent:** none (a `cat` stand-in, which echoes the task pointer so its delivery is observable).
+- **Asserts:** the first delegate is dispatched and its pointer reaches the worker; a second plain delegate before any work-done comes back with `delivered` empty, the role in `busy` and an `error` naming `--supersede`, and no second pointer reaches the pane; after `pane restart --force` a plain delegate is dispatched with nothing in `busy` or `superseded`, and its pointer reaches the replacement agent.
+- **Does not assert:** the CLI's rendering of the refusal (`delegate_verdict`'s unit tests in `src/main.rs` own that); the commission's age-based expiry (`agent_pty`'s `commission_ledger_*` unit tests own that); a real agent.
+- **Platform coverage:** mac+linux (unix-only).
+
+##### pane/restart/013 — `pane restart --force` cancels the silent-worker notice for the task it cancelled (issue #590; PR #1285 review).
+- **Layer:** L1/fast (in-process — the real `handle_delegate_with_state` and `handle_restart_role_with_state` against a daemon-owned `cat`-orchestrator + `cat` worker, with `DOT_AGENT_DECK_DELEGATE_NO_EVENT_WINDOW_MS=1000` and the idle detector off; no daemon socket, no LLM).
+- **Agent:** none (`cat` stand-ins: the worker never emits an agent event, and the orchestrator echoes whatever the daemon writes into its pane).
+- **Asserts:** after a delegate whose pointer landed is cancelled with `pane restart --force`, three silent-worker windows pass with no "delegated worker went quiet" notice in the orchestrator pane; a second, uncancelled delegate then produces that notice (the control that makes the negative mean something).
+- **Does not assert:** the idle-worker (`worker_response_timeout_minutes`) report, which the same restart cancels by the same call; the case of a dispatch queued behind the pane lock during the restart (`agent_pty`'s `replaced_agent_watches_are_cancelled_unless_a_dispatch_is_in_flight` owns that).
 - **Platform coverage:** mac+linux (unix-only).
 
 #### pane/spawn

@@ -711,7 +711,10 @@ fn repair_advice(installed: &Path) -> String {
 /// answer is the name `remote.rs` and every install path already use. A
 /// renamed build looking for a renamed install would find nothing on the one
 /// machine layout the project actually ships.
-fn durable_binary_file_name() -> String {
+///
+/// `wrap.rs` reuses it for the co-located cargo build its wrapper rewrite looks
+/// for beside a test harness, which cargo names after the package too.
+pub(crate) fn durable_binary_file_name() -> String {
     format!("{DEFAULT_BINARY_NAME}{}", std::env::consts::EXE_SUFFIX)
 }
 
@@ -993,7 +996,7 @@ fn posix_command_word(path: &str, windows_host: bool) -> Option<String> {
 /// motivating cases (`dot-agent-deck (1)` from a browser download,
 /// `dot-agent-deck copy` from a Finder duplicate) alongside the adversarial
 /// ones (`;`, `` ` ``, `$`, a literal newline).
-fn is_safe_binary_name(name: &str) -> bool {
+pub(crate) fn is_safe_binary_name(name: &str) -> bool {
     !name.is_empty()
         && !name.starts_with('-')
         && name

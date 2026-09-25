@@ -1247,8 +1247,11 @@ pub fn mint_delivery_id(pane_id: &str) -> String {
 /// onto one submission through the ledger's single-flight guard, and the
 /// fingerprint check still refuses a reused id carrying a different payload.
 ///
-/// The wire field is an opaque string with no charset or length validation
+/// The wire field is an opaque string with no charset validation
 /// (`daemon_protocol::WriteAndSubmitExtras`), so this needs no protocol change.
+/// Its length IS bounded, since issue #527, by
+/// [`crate::agent_pty::MAX_DELIVERY_ID_BYTES`]; the suffixes this function and
+/// `ui::wire_attempt_id` append are counted in that constant's derivation.
 pub fn attempt_delivery_id(delivery_id: &str, attempt: u32) -> String {
     format!("{delivery_id}#a{attempt}")
 }

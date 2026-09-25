@@ -110,6 +110,7 @@ impl SyntheticAgent {
             pane_id: self.pane_id.clone(),
             task: task.into(),
             to: to.iter().map(|r| r.to_string()).collect(),
+            supersede: false,
             timestamp: chrono::Utc::now(),
             token: None,
         }
