@@ -1088,9 +1088,100 @@ pub fn submission_is_after_watermark(
     }
 }
 
+/// Issue #637: how long a GENUINE confirmation from this producer can plausibly
+/// still be in flight after a submission — so the soonest a re-submission may
+/// follow one without risking a second copy of a prompt the agent already took.
+///
+/// Every retry [`unconfirmed_retry_delay`] schedules lands in a pane whose agent
+/// may already have taken the prompt: the replacement payload types the whole
+/// prompt again and submits it as a new turn, and a probe submits whatever the
+/// box then holds. So a window shorter than the producer's real confirmation
+/// latency is not a faster recovery, it is a double submit racing a
+/// confirmation that was on its way.
+/// The escalating schedule alone started at 500 ms for every producer, which is
+/// what #637 reported.
+///
+/// The two directions this trades between, and why each answer is where it is:
+///
+/// * too SHORT duplicates the task in a live agent — the failure this exists to
+///   prevent, and the worse of the two;
+/// * too LONG delays recovery when a submit was genuinely lost, by the
+///   difference between this and the old 500 ms. A delivery whose confirmation
+///   arrives inside the window does not wait for the window to end: the
+///   daemon's watch returns on the event, and a TUI-owned delivery finalizes on
+///   its next render pass.
+///
+/// Per producer:
+///
+/// * Claude Code — [`FAST_CONFIRMATION_LATENCY`]. Its `UserPromptSubmit` is a
+///   native hook Claude Code runs on the submit itself; the real-agent sample in
+///   #570's control delivery is 58 ms between the write's log line and the
+///   confirmation's. 2 s is ~34x that, and it is raised from 500 ms because a
+///   hook process on a contended box is slower than on an idle one —
+///   `tests/e2e_orchestration_remit.rs` records a stand-in producer missing the
+///   500 ms window under a 64-way CPU load.
+/// * Codex — [`SLOW_CONFIRMATION_LATENCY`]. A downstream fork measured a
+///   genuine confirmation arriving up to ~8.45 s after the prompt was delivered
+///   (#637), so at 500 ms the first retry landed ~7.95 s ahead of it. Not
+///   re-measured in this repository; 10 s is that figure plus margin.
+/// * OpenCode, Devin — [`SLOW_CONFIRMATION_LATENCY`] because neither has been
+///   measured. An unverified short answer is the unsafe direction: it is exactly
+///   the double submit above. Flip one when it is measured, in this one place.
+/// * Pi, [`AgentType::None`] — never arm a retry
+///   ([`agent_reports_submitted_prompt`] is false), so they are not consulted by
+///   [`confirmation_latency_floor`]; answered with the slow value so a caller
+///   that asks anyway gets the conservative one.
+///
+/// Exhaustive on purpose, like [`agent_start_precedes_first_prompt`]: a new
+/// agent type must answer this rather than inherit a default.
+pub fn submission_confirmation_latency(agent_type: &AgentType) -> std::time::Duration {
+    match agent_type {
+        AgentType::ClaudeCode => FAST_CONFIRMATION_LATENCY,
+        AgentType::Codex
+        | AgentType::OpenCode
+        | AgentType::Devin
+        | AgentType::Pi
+        | AgentType::None => SLOW_CONFIRMATION_LATENCY,
+    }
+}
+
+/// Issue #637: the confirmation-latency floor for a producer whose submission
+/// reports arrive on the submit itself. See [`submission_confirmation_latency`].
+pub const FAST_CONFIRMATION_LATENCY: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Issue #637: the confirmation-latency floor for a producer measured to confirm
+/// slowly (Codex, ~8.45 s downstream), and for the producers that have not been
+/// measured. See [`submission_confirmation_latency`].
+pub const SLOW_CONFIRMATION_LATENCY: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Issue #637: the floor under every [`unconfirmed_retry_delay`] window for a
+/// delivery whose producer is one of `producers` — the SLOWEST reporting one,
+/// since a confirmation from any of them may be the one in flight.
+///
+/// Only producers that can report a submitted prompt are consulted: a Pi status
+/// frame on the same pane says nothing about how long a confirmation takes,
+/// because Pi never sends one. With no reporting producer known the answer is
+/// [`SLOW_CONFIRMATION_LATENCY`] — the delivery has no basis for a shorter one.
+pub fn confirmation_latency_floor<'a>(
+    producers: impl IntoIterator<Item = &'a AgentType>,
+) -> std::time::Duration {
+    producers
+        .into_iter()
+        .filter(|producer| agent_reports_submitted_prompt(producer))
+        .map(submission_confirmation_latency)
+        .max()
+        .unwrap_or(SLOW_CONFIRMATION_LATENCY)
+}
+
 /// Backoff before re-submitting a written-but-UNCONFIRMED prompt: 0.5 s, 1 s,
-/// 2 s, 4 s, 8 s, then capped at 15 s. `attempts` is the number of submissions
-/// made so far (≥ 1).
+/// 2 s, 4 s, 8 s, then capped at 15 s — and never shorter than `floor`, the
+/// producer's plausible confirmation latency from [`confirmation_latency_floor`]
+/// (issue #637). `attempts` is the number of submissions made so far (≥ 1).
+///
+/// So for Claude Code the schedule reads 2 s, 2 s, 2 s, 4 s, 8 s, 15 s…, and for
+/// Codex or an unmeasured producer 10 s, 10 s, 10 s, 10 s, 15 s…. The floor
+/// applies to EVERY window, not only the first: each one follows a submission
+/// whose genuine confirmation can be exactly as slow as the first one's.
 ///
 /// Deliberately NOT `crate::ui::send_retry_delay`'s 2 s-capped schedule, which
 /// exists for a target that is *refusing* delivery and may become live at any
@@ -1101,11 +1192,13 @@ pub fn submission_is_after_watermark(
 /// typed into whatever the pane is showing. Escalating to a 15 s cap keeps the
 /// whole [`AUTOMATIC_PROMPT_DEADLINE`] window covered in single-digit attempts
 /// instead of ~30.
-pub fn unconfirmed_retry_delay(attempts: u32) -> std::time::Duration {
+pub fn unconfirmed_retry_delay(attempts: u32, floor: std::time::Duration) -> std::time::Duration {
     const BASE_MS: u64 = 500;
     const CAP: std::time::Duration = std::time::Duration::from_secs(15);
     let shift = attempts.saturating_sub(1).min(8);
-    std::time::Duration::from_millis(BASE_MS.saturating_mul(1u64 << shift)).min(CAP)
+    std::time::Duration::from_millis(BASE_MS.saturating_mul(1u64 << shift))
+        .min(CAP)
+        .max(floor)
 }
 
 /// Mint a GLOBALLY-UNIQUE logical delivery id for an automatic prompt.
@@ -2378,36 +2471,109 @@ mod tests {
 
     #[test]
     fn unconfirmed_backoff_escalates_then_caps() {
+        use std::time::Duration;
+        // With no floor the escalation itself is unchanged.
         assert_eq!(
-            unconfirmed_retry_delay(1),
-            std::time::Duration::from_millis(500)
+            unconfirmed_retry_delay(1, Duration::ZERO),
+            Duration::from_millis(500)
         );
         assert_eq!(
-            unconfirmed_retry_delay(2),
-            std::time::Duration::from_secs(1)
+            unconfirmed_retry_delay(2, Duration::ZERO),
+            Duration::from_secs(1)
         );
         assert_eq!(
-            unconfirmed_retry_delay(3),
-            std::time::Duration::from_secs(2)
+            unconfirmed_retry_delay(3, Duration::ZERO),
+            Duration::from_secs(2)
         );
         assert_eq!(
-            unconfirmed_retry_delay(5),
-            std::time::Duration::from_secs(8)
+            unconfirmed_retry_delay(5, Duration::ZERO),
+            Duration::from_secs(8)
         );
         assert_eq!(
-            unconfirmed_retry_delay(9),
+            unconfirmed_retry_delay(9, Duration::ZERO),
+            Duration::from_secs(15)
+        );
+        // The whole deadline window is covered in single-digit attempts, for
+        // every floor a producer can resolve to.
+        for floor in [
+            Duration::ZERO,
+            FAST_CONFIRMATION_LATENCY,
+            SLOW_CONFIRMATION_LATENCY,
+        ] {
+            let mut total = Duration::ZERO;
+            let mut attempts = 0u32;
+            while total < AUTOMATIC_PROMPT_DEADLINE {
+                attempts += 1;
+                total += unconfirmed_retry_delay(attempts, floor);
+            }
+            assert!(
+                attempts <= 9,
+                "{attempts} submissions to cover the deadline at floor {floor:?}"
+            );
+        }
+    }
+
+    /// Issue #637: no retry window may be shorter than the time a genuine
+    /// confirmation from the pane's producer can take, on ANY attempt — each
+    /// window follows a submission whose confirmation may be just as slow.
+    #[test]
+    fn unconfirmed_backoff_never_undercuts_the_producers_confirmation_latency() {
+        let codex = confirmation_latency_floor([&AgentType::Codex]);
+        let claude = confirmation_latency_floor([&AgentType::ClaudeCode]);
+        // The downstream measurement #637 reports for a genuine Codex
+        // confirmation; the first retry used to fire 7.95 s ahead of it.
+        let measured_codex = std::time::Duration::from_millis(8450);
+        for attempts in 1..=12 {
+            assert!(
+                unconfirmed_retry_delay(attempts, codex) > measured_codex,
+                "attempt {attempts} would re-submit into a Codex pane before its measured confirmation"
+            );
+            assert!(unconfirmed_retry_delay(attempts, claude) >= FAST_CONFIRMATION_LATENCY);
+        }
+        // The escalation still wins once it passes the floor.
+        assert_eq!(
+            unconfirmed_retry_delay(4, claude),
+            std::time::Duration::from_secs(4)
+        );
+        assert_eq!(
+            unconfirmed_retry_delay(9, codex),
             std::time::Duration::from_secs(15)
         );
-        // The whole deadline window is covered in single-digit attempts.
-        let mut total = std::time::Duration::ZERO;
-        let mut attempts = 0u32;
-        while total < AUTOMATIC_PROMPT_DEADLINE {
-            attempts += 1;
-            total += unconfirmed_retry_delay(attempts);
+    }
+
+    /// Issue #637: the floor is the SLOWEST reporting producer on the pane, a
+    /// non-reporting one is ignored, and an unknown pane gets the slow answer —
+    /// the short one is only ever earned.
+    #[test]
+    fn confirmation_latency_floor_takes_the_slowest_reporting_producer() {
+        assert_eq!(
+            confirmation_latency_floor([&AgentType::ClaudeCode]),
+            FAST_CONFIRMATION_LATENCY
+        );
+        for slow in [AgentType::Codex, AgentType::OpenCode, AgentType::Devin] {
+            assert_eq!(
+                confirmation_latency_floor([&slow]),
+                SLOW_CONFIRMATION_LATENCY,
+                "{slow:?}"
+            );
+            assert_eq!(
+                confirmation_latency_floor([&AgentType::ClaudeCode, &slow]),
+                SLOW_CONFIRMATION_LATENCY,
+                "Claude Code alongside {slow:?}"
+            );
         }
-        assert!(
-            attempts <= 9,
-            "{attempts} submissions to cover the deadline"
+        assert_eq!(
+            confirmation_latency_floor([&AgentType::Pi, &AgentType::ClaudeCode]),
+            FAST_CONFIRMATION_LATENCY,
+            "a producer that never confirms must not set the floor"
+        );
+        assert_eq!(
+            confirmation_latency_floor(std::iter::empty()),
+            SLOW_CONFIRMATION_LATENCY
+        );
+        assert_eq!(
+            confirmation_latency_floor([&AgentType::None]),
+            SLOW_CONFIRMATION_LATENCY
         );
     }
 

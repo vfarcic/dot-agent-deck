@@ -31,11 +31,11 @@ use crate::pane::{AgentSpawnOptions, PaneController, PaneError, RenameOutcome};
 use crate::project_config::{ModeConfig, OrchestrationConfig, load_project_config};
 use crate::prompt_delivery::{
     AUTOMATIC_PROMPT_DEADLINE, AgentStartRearm, ConfirmationCapability, ConfirmedSubmission,
-    attempt_delivery_id, attempt_writes_payload, classify_prompt_submission, log_prompt_abandoned,
-    log_prompt_accumulated, log_prompt_confirmed, log_prompt_probe_submitted, log_prompt_stopped,
-    log_prompt_unconfirmable, log_prompt_unconfirmed, log_prompt_written, mint_delivery_id,
-    pane_confirmation_capability, prompt_submission_accumulated, submission_is_after_watermark,
-    unconfirmed_retry_delay,
+    attempt_delivery_id, attempt_writes_payload, classify_prompt_submission,
+    confirmation_latency_floor, log_prompt_abandoned, log_prompt_accumulated, log_prompt_confirmed,
+    log_prompt_probe_submitted, log_prompt_stopped, log_prompt_unconfirmable,
+    log_prompt_unconfirmed, log_prompt_written, mint_delivery_id, pane_confirmation_capability,
+    prompt_submission_accumulated, submission_is_after_watermark, unconfirmed_retry_delay,
 };
 use crate::repo_identity;
 use crate::state::{AppState, DashboardStats, SessionState, SessionStatus, SharedState};
@@ -3797,7 +3797,13 @@ fn process_pending_seed_prompts(
                         }
                         ConfirmationCapability::Reports => {
                             log_prompt_unconfirmed("seed", &sp.pane_id, &delivery_id, attempt);
-                            schedule_unconfirmed_retry(&mut backoff, &sp.pane_id, now, attempt);
+                            schedule_unconfirmed_retry(
+                                &mut backoff,
+                                snapshot,
+                                &sp.pane_id,
+                                now,
+                                attempt,
+                            );
                             return true;
                         }
                     }
@@ -4468,16 +4474,29 @@ fn pane_event_watermark(snapshot: &AppState, pane_id: &str) -> Option<DateTime<U
 /// [`unconfirmed_retry_delay`]. Distinct from [`schedule_send_retry`], which
 /// backs off a target that REFUSED delivery; see that helper's docs for why the
 /// two schedules differ.
+///
+/// Issue #637: the window is floored at the confirmation latency of the
+/// producers this pane's sessions declare ([`confirmation_latency_floor`]), so a
+/// retry does not fire inside the time a genuine confirmation from the slowest
+/// of them can plausibly take.
 fn schedule_unconfirmed_retry(
     backoff: &mut HashMap<String, SendRetryState>,
+    snapshot: &AppState,
     pane_id: &str,
     now: std::time::Instant,
     attempts: u32,
 ) {
+    let floor = confirmation_latency_floor(
+        snapshot
+            .sessions
+            .values()
+            .filter(|session| session.pane_id.as_deref() == Some(pane_id))
+            .map(|session| &session.agent_type),
+    );
     backoff.insert(
         pane_id.to_string(),
         SendRetryState {
-            next_attempt_at: now + unconfirmed_retry_delay(attempts),
+            next_attempt_at: now + unconfirmed_retry_delay(attempts, floor),
             attempts,
         },
     );
@@ -4904,6 +4923,7 @@ fn deliver_orchestrator_prompt(
                     log_prompt_unconfirmed("orchestrator", &start_pane_id, &logged_id, attempt);
                     schedule_unconfirmed_retry(
                         &mut ui.send_retry_backoff,
+                        snapshot,
                         &start_pane_id,
                         now,
                         attempt,
@@ -39159,6 +39179,120 @@ mod tests {
         assert!(
             slow_ui.send_retry_backoff.contains_key(SLOW_PANE_ID),
             "the late producer's unconfirmed retry remains provisionally watched"
+        );
+    }
+
+    /// Scenario: Write an orchestrator prompt into a Codex pane, then let a render pass run 8.45 s later — the latency issue #637 reports for a genuine Codex confirmation — before the agent's submission report arrives. No second write may reach the pane before that report, which then finalizes the role on the one write; separately, a pane whose report never comes is still re-submitted once the confirmation floor has passed.
+    #[spec("prompt/pane-input/041")]
+    #[test]
+    fn pane_input_041_retry_waits_out_a_slow_genuine_confirmation() {
+        const PANE_ID: &str = "slow-confirmation-pane";
+        const AGENT_ID: &str = "slow-confirmation-agent";
+        const PROMPT: &str = "Prompt whose confirmation is genuinely slow";
+        // What #637 measured for a genuine Codex confirmation. The retry used to
+        // fire at 500 ms, 7.95 s ahead of it.
+        let measured_confirmation = std::time::Duration::from_millis(8450);
+
+        let run = |confirm: bool| {
+            let attempts = Arc::new(AtomicUsize::new(0));
+            let pane: Arc<dyn PaneController> = Arc::new(SendResultPaneController::new(
+                InjectedSendOutcome::Applied,
+                attempts.clone(),
+            ));
+            let created = std::time::Instant::now();
+            let tab_id: TabId = 41;
+            let mut ui = default_ui();
+            ui.orchestration_prompt_anchor_at.insert(tab_id, created);
+            ui.orchestration_ready_since.insert(
+                tab_id,
+                created
+                    .checked_sub(SPAWN_TIME_READINESS_BUFFER + std::time::Duration::from_millis(1))
+                    .expect("ready timestamp"),
+            );
+            // `announced_prompt_snapshot` declares the pane's producer as Codex.
+            let mut snapshot = announced_prompt_snapshot(PANE_ID, AGENT_ID);
+            let mut role_statuses = vec![OrchestrationRoleStatus::Waiting];
+            let mut prompt = Some(PROMPT.to_string());
+            let pass_at = |ui: &mut UiState,
+                           snapshot: &AppState,
+                           role_statuses: &mut [OrchestrationRoleStatus],
+                           prompt: &mut Option<String>,
+                           offset: std::time::Duration| {
+                deliver_orchestrator_prompt(
+                    ui,
+                    pane.as_ref(),
+                    snapshot,
+                    created.checked_add(offset).expect("pass timestamp"),
+                    tab_id,
+                    &[PANE_ID.to_string()],
+                    0,
+                    role_statuses,
+                    prompt,
+                );
+            };
+
+            pass_at(
+                &mut ui,
+                &snapshot,
+                &mut role_statuses,
+                &mut prompt,
+                std::time::Duration::ZERO,
+            );
+            assert_eq!(
+                attempts.load(Ordering::SeqCst),
+                1,
+                "precondition: attempt 1"
+            );
+            pass_at(
+                &mut ui,
+                &snapshot,
+                &mut role_statuses,
+                &mut prompt,
+                measured_confirmation,
+            );
+            assert_eq!(
+                attempts.load(Ordering::SeqCst),
+                1,
+                "a retry fired while a genuine Codex confirmation could still be in flight — \
+                 the agent would receive this prompt twice"
+            );
+            if confirm {
+                apply_prompt_confirmation(&mut snapshot, PANE_ID, AGENT_ID, PROMPT);
+                pass_at(
+                    &mut ui,
+                    &snapshot,
+                    &mut role_statuses,
+                    &mut prompt,
+                    measured_confirmation + std::time::Duration::from_millis(1),
+                );
+                assert!(
+                    prompt.is_none(),
+                    "the slow genuine confirmation must still finalize the prompt"
+                );
+                assert_eq!(role_statuses, [OrchestrationRoleStatus::Working]);
+            } else {
+                pass_at(
+                    &mut ui,
+                    &snapshot,
+                    &mut role_statuses,
+                    &mut prompt,
+                    crate::prompt_delivery::SLOW_CONFIRMATION_LATENCY,
+                );
+                assert_eq!(prompt.as_deref(), Some(PROMPT));
+            }
+            attempts.load(Ordering::SeqCst)
+        };
+
+        assert_eq!(
+            run(true),
+            1,
+            "a confirmed delivery must finalize on its one write"
+        );
+        assert_eq!(
+            run(false),
+            2,
+            "a delivery that is never confirmed must still be re-submitted once the floor passes \
+             — the fix must not trade the double submit for a missing one"
         );
     }
 
