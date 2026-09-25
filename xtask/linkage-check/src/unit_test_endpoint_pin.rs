@@ -56,9 +56,13 @@
 //!
 //! A CALL to either pin helper anywhere in the innermost `fn` that holds the
 //! emitter (closures inside it included) — through a path whose second-to-last
-//! segment is `test_isolation`, or by a bare name the file imported from a
-//! `test_isolation` path. Naming the helper without calling it, or calling a
-//! same-named function from any other module, does not count. Program words
+//! segment is `test_isolation` or a `use`d alias of it, or by a bare name a
+//! `use` of a `test_isolation` path binds in a lexically enclosing scope
+//! (modules do not inherit their parent's `use`s; blocks do). Naming the helper
+//! without calling it, or calling a same-named function from any other module,
+//! does not count. This is lexical resolution of `use` and `fn` items only —
+//! not the compiler's name resolution — so a re-export through a third module
+//! is not followed. Program words
 //! are compared case-insensitively with any-case `.exe` dropped, the way
 //! Windows resolves them. Or
 //! the marker [`ALLOW`] in a comment on the `fn` line or directly above it —
@@ -448,11 +452,9 @@ pub fn scan(
     whole_file_is_test: bool,
     agents: &Agents,
 ) -> Report {
-    let mut uses = PinImports::default();
-    uses.visit_file(ast);
     let mut scan = Scan {
         agents,
-        imported_pins: uses.names,
+        names: Vec::new(),
         test_depth: usize::from(whole_file_is_test || cfg_selects_test_only(&ast.attrs)),
         fns: Vec::new(),
         unpinned: Vec::new(),
@@ -526,9 +528,8 @@ struct Unpinned {
 
 struct Scan<'a> {
     agents: &'a Agents,
-    /// Bare names this file imports as a pin helper (`use
-    /// crate::test_isolation::{pin_unreachable_endpoints as pin}` adds `pin`).
-    imported_pins: BTreeSet<String>,
+    /// The lexical scopes enclosing the current node, innermost last.
+    names: Vec<NameScope>,
     test_depth: usize,
     fns: Vec<FnScope>,
     unpinned: Vec<Unpinned>,
@@ -536,15 +537,34 @@ struct Scan<'a> {
 }
 
 impl Scan<'_> {
+    /// Whether `path` resolves, lexically, to one of `test_isolation`'s pin
+    /// helpers: `test_isolation::<helper>` (however it is prefixed), an alias
+    /// of that module, or a bare name bound to a helper in an enclosing scope.
     fn is_pin_helper_call(&self, path: &syn::Path) -> bool {
         let segs: Vec<String> = path.segments.iter().map(|s| s.ident.to_string()).collect();
         match segs.as_slice() {
-            [name] => self.imported_pins.contains(name),
+            [name] => self.lookup(|scope| scope.fns.get(name).copied()),
             [.., module, name] => {
-                module == "test_isolation" && PIN_HELPERS.contains(&name.as_str())
+                PIN_HELPERS.contains(&name.as_str())
+                    && (module == "test_isolation"
+                        || self.lookup(|scope| scope.modules.contains(module).then_some(true)))
             }
             [] => false,
         }
+    }
+
+    /// The innermost answer `find` gives, walking outward and stopping after
+    /// the first module scope; `false` when no visible scope answers.
+    fn lookup(&self, find: impl Fn(&NameScope) -> Option<bool>) -> bool {
+        for scope in self.names.iter().rev() {
+            if let Some(answer) = find(scope) {
+                return answer;
+            }
+            if scope.module_boundary {
+                break;
+            }
+        }
+        false
     }
 
     fn in_test(&self) -> bool {
@@ -764,6 +784,30 @@ fn macro_exprs(mac: &syn::Macro) -> Vec<syn::Expr> {
 }
 
 impl<'ast> Visit<'ast> for Scan<'_> {
+    fn visit_file(&mut self, node: &'ast syn::File) {
+        self.names
+            .push(NameScope::from_items(node.items.iter(), true));
+        syn::visit::visit_file(self, node);
+        self.names.pop();
+    }
+
+    fn visit_item_mod(&mut self, node: &'ast syn::ItemMod) {
+        let items = node.content.iter().flat_map(|(_, items)| items.iter());
+        self.names.push(NameScope::from_items(items, true));
+        syn::visit::visit_item_mod(self, node);
+        self.names.pop();
+    }
+
+    fn visit_block(&mut self, node: &'ast syn::Block) {
+        let items = node.stmts.iter().filter_map(|stmt| match stmt {
+            syn::Stmt::Item(item) => Some(item),
+            _ => None,
+        });
+        self.names.push(NameScope::from_items(items, false));
+        syn::visit::visit_block(self, node);
+        self.names.pop();
+    }
+
     fn visit_item(&mut self, item: &'ast syn::Item) {
         let test = item_attrs(item).is_some_and(cfg_selects_test_only);
         self.scoped(test, |s| syn::visit::visit_item(s, item));
@@ -844,10 +888,9 @@ impl<'ast> Visit<'ast> for Scan<'_> {
 
     fn visit_expr_call(&mut self, node: &'ast syn::ExprCall) {
         // Only a CALL pins: naming the helper as a value, or importing it,
-        // applies nothing to any child. And only a call that names
-        // `test_isolation`'s helper — a path through that module, or a bare
-        // name this file imported from it — so a same-named function of some
-        // other module's does not stand in for the pin.
+        // applies nothing to any child. And only a call that resolves,
+        // lexically, to `test_isolation`'s helper, so a same-named function of
+        // some other module's does not stand in for the pin.
         if let syn::Expr::Path(p) = node.func.as_ref()
             && self.is_pin_helper_call(&p.path)
             && let Some(scope) = self.fns.last_mut()
@@ -891,47 +934,81 @@ impl<'ast> Visit<'ast> for Scan<'_> {
     fn visit_attribute(&mut self, _node: &'ast syn::Attribute) {}
 }
 
-/// Every bare name a `use` in the file binds to a pin helper, read from use
-/// trees that pass through a `test_isolation` segment. A glob of that module
-/// binds both helpers.
+/// What one lexical scope binds that matters to [`Scan::is_pin_helper_call`].
+///
+/// Rust's rules, as far as this needs them: a module's `use`s and items are
+/// visible in that module and in the blocks inside it, but NOT in a child
+/// module, which starts fresh; a block's own items and `use`s shadow its
+/// enclosing scopes'. So a lookup walks outward from the innermost scope and
+/// stops after the first module scope.
 #[derive(Default)]
-struct PinImports {
-    names: BTreeSet<String>,
+struct NameScope {
+    /// A bare name bound here: `true` when it is a `test_isolation` pin helper
+    /// (imported, possibly renamed or globbed), `false` when it is anything
+    /// else of a helper's name — a local `fn`, or an import from some other
+    /// module — which shadows an outer binding.
+    fns: BTreeMap<String, bool>,
+    /// Names this scope binds to the `test_isolation` module itself
+    /// (`use crate::test_isolation as iso;` binds `iso`).
+    modules: BTreeSet<String>,
+    module_boundary: bool,
 }
 
-impl PinImports {
-    fn walk(&mut self, tree: &syn::UseTree, through_isolation: bool) {
+impl NameScope {
+    fn from_items<'a>(items: impl Iterator<Item = &'a syn::Item>, module_boundary: bool) -> Self {
+        let mut scope = NameScope {
+            module_boundary,
+            ..NameScope::default()
+        };
+        for item in items {
+            match item {
+                syn::Item::Use(u) => scope.walk_use(&u.tree, false),
+                syn::Item::Fn(f) => {
+                    let name = f.sig.ident.to_string();
+                    if PIN_HELPERS.contains(&name.as_str()) {
+                        scope.fns.insert(name, false);
+                    }
+                }
+                _ => {}
+            }
+        }
+        scope
+    }
+
+    fn walk_use(&mut self, tree: &syn::UseTree, through_isolation: bool) {
         match tree {
             syn::UseTree::Path(p) => {
-                self.walk(&p.tree, through_isolation || p.ident == "test_isolation")
+                self.walk_use(&p.tree, through_isolation || p.ident == "test_isolation")
             }
             syn::UseTree::Name(n) => {
-                if through_isolation && PIN_HELPERS.contains(&n.ident.to_string().as_str()) {
-                    self.names.insert(n.ident.to_string());
+                let name = n.ident.to_string();
+                if name == "test_isolation" {
+                    self.modules.insert(name);
+                } else if PIN_HELPERS.contains(&name.as_str()) {
+                    self.fns.insert(name, through_isolation);
                 }
             }
             syn::UseTree::Rename(r) => {
-                if through_isolation && PIN_HELPERS.contains(&r.ident.to_string().as_str()) {
-                    self.names.insert(r.rename.to_string());
+                let original = r.ident.to_string();
+                if original == "test_isolation" {
+                    self.modules.insert(r.rename.to_string());
+                } else if PIN_HELPERS.contains(&original.as_str()) {
+                    self.fns.insert(r.rename.to_string(), through_isolation);
                 }
             }
             syn::UseTree::Glob(_) => {
                 if through_isolation {
-                    self.names.extend(PIN_HELPERS.iter().map(|h| h.to_string()));
+                    for helper in PIN_HELPERS {
+                        self.fns.insert(helper.to_string(), true);
+                    }
                 }
             }
             syn::UseTree::Group(g) => {
                 for item in &g.items {
-                    self.walk(item, through_isolation);
+                    self.walk_use(item, through_isolation);
                 }
             }
         }
-    }
-}
-
-impl<'ast> Visit<'ast> for PinImports {
-    fn visit_item_use(&mut self, node: &'ast syn::ItemUse) {
-        self.walk(&node.tree, false);
     }
 }
 
@@ -1477,6 +1554,39 @@ mod t {
             "use crate::test_isolation::*;\n    fn f() { let _ = unreachable_endpoints();",
             "fn f() { let _ = super::test_isolation::unreachable_endpoints();",
         ] {
+            let src = format!(
+                "#[cfg(test)]\nmod t {{\n    {pin}\n        let _ = std::process::Command::new(\"codex\");\n    }}\n}}\n"
+            );
+            assert!(findings(&src).is_empty(), "{pin:?} did not clear the rule");
+        }
+    }
+
+    /// Imports are scoped the way Rust scopes them (PR #1315 review): a
+    /// sibling module's import does not reach, a child module does not inherit
+    /// its parent's, and a module alias of `test_isolation` works.
+    #[test]
+    fn pin_imports_are_resolved_by_lexical_scope() {
+        let reported = [
+            // The import is in a sibling module; `f` calls a local look-alike.
+            "mod a { use crate::test_isolation::unreachable_endpoints; }\n    fn unreachable_endpoints() -> Vec<(String, String)> { vec![] }\n    fn f() { let _ = unreachable_endpoints();",
+            // A child module does not inherit the parent's `use`.
+            "use crate::test_isolation::unreachable_endpoints;\n    mod inner { fn f() { let _ = unreachable_endpoints();",
+            // A block-local look-alike shadows the module-level import.
+            "use crate::test_isolation::unreachable_endpoints;\n    fn f() { fn unreachable_endpoints() -> Vec<(String, String)> { vec![] } let _ = unreachable_endpoints();",
+        ];
+        for pin in reported {
+            let close = if pin.contains("mod inner") { "}" } else { "" };
+            let src = format!(
+                "#[cfg(test)]\nmod t {{\n    {pin}\n        let _ = std::process::Command::new(\"codex\");\n    }}{close}\n}}\n"
+            );
+            assert_eq!(findings(&src).len(), 1, "{pin:?} cleared the rule");
+        }
+        let cleared = [
+            "use crate::test_isolation as iso;\n    fn f() { let _ = iso::unreachable_endpoints();",
+            "fn f() { use crate::test_isolation::pin_unreachable_endpoints; let _ = pin_unreachable_endpoints(vec![]);",
+            "use crate::test_isolation;\n    fn f() { let _ = test_isolation::unreachable_endpoints();",
+        ];
+        for pin in cleared {
             let src = format!(
                 "#[cfg(test)]\nmod t {{\n    {pin}\n        let _ = std::process::Command::new(\"codex\");\n    }}\n}}\n"
             );
