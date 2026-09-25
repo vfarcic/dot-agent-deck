@@ -3183,7 +3183,8 @@ async fn live_007_list_agents_sanitizes_and_clamps_hostile_live_snapshot_inner()
         shell_synthetic_working: false,
         orchestration_orphaned: false,
     };
-    let (buffer, _) = render_card_grid_to_buffer(&[(&session, Some(name))], Some(0), 0, 80, 20);
+    let (buffer, _) =
+        render_card_grid_to_buffer(&[(&session, Some(name))], Some(0), 0, now, 80, 20);
     let area = *buffer.area();
     for y in 0..area.height {
         for x in 0..area.width {

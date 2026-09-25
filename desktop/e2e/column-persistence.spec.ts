@@ -65,7 +65,7 @@ async function storedColumnChoices(page: Page, base: string): Promise<Record<str
   }, base);
 }
 
-/** Land back on the overview after a navigation, which always starts on the deck. */
+/** Select the overview after a navigation or reload, regardless of the landing view. */
 async function reopenOverview(page: Page): Promise<void> {
   await page.getByTestId("open-overview").click();
   await expect(page.getByTestId("overview-table-region")).toBeVisible();

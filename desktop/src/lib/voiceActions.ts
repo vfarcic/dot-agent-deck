@@ -214,6 +214,16 @@ export type VoiceActionContext = {
    */
   closeNewAgent: () => string | undefined;
   /**
+   * Close the Settings sheet (issue #1197).
+   *
+   * **Served by the SHELL, and only while Settings is OPEN**, for
+   * {@link dismissVoiceOverlay}'s reason: Settings is a shell-level overlay
+   * boolean (`useShellOverlays`), not a `DeckView`, so {@link closeTopmost}
+   * reads *"Settings is open"* as this member's presence. The shell and not a
+   * screen, because the sheet opens over the overview as well as the deck.
+   */
+  closeSettings: () => void;
+  /**
    * Open the New agent dialog (PRD #1223), with `deckId` preselected when the
    * control that opened it belongs to one deck — a deck group's header.
    *
@@ -415,10 +425,18 @@ export const VOICE_ACTIONS = {
      * open, so its absence IS the answer to "is anything on top?". Declaring it
      * would refuse the whole row whenever the overlay was closed. The same
      * holds for `closeNewAgent`, which the overview publishes only while the
-     * dialog is open.
+     * dialog is open, and for `closeSettings`, which the shell publishes only
+     * while Settings is open.
+     *
+     * **Settings is checked LAST, below the agent's pane** (issue #1197). The
+     * sheet is a shell overlay that stays open across a pane opened over it —
+     * by voice, or from the rail — and that pane is then what the user is
+     * looking at, so `close` takes the pane first and Settings on the next
+     * utterance. Before Settings moved to the shell it was not in this order
+     * at all, and `close` with it open answered "nothing to close".
      */
     run: (
-      context: Pick<VoiceActionContext, "closeAgentView" | "reportNothingToClose" | "reportRefused"> & Partial<Pick<VoiceActionContext, "dismissVoiceOverlay" | "closeNewAgent">>,
+      context: Pick<VoiceActionContext, "closeAgentView" | "reportNothingToClose" | "reportRefused"> & Partial<Pick<VoiceActionContext, "dismissVoiceOverlay" | "closeNewAgent" | "closeSettings">>,
       target: VoiceDispatchTarget,
     ) => {
       if (context.dismissVoiceOverlay) return context.dismissVoiceOverlay();
@@ -428,6 +446,7 @@ export const VOICE_ACTIONS = {
         return;
       }
       if (target.agentViewOpen) return context.closeAgentView();
+      if (context.closeSettings) return context.closeSettings();
       context.reportNothingToClose();
     },
   },
@@ -439,6 +458,12 @@ export const VOICE_ACTIONS = {
     run: (context: Pick<VoiceActionContext, "navigate">) => context.navigate({ kind: "overview" }),
   },
 
+  /**
+   * Voice-reachable, and the one row whose screen issue #1198 hides by
+   * default: while the flag is off the crate offers it `callable: false`
+   * (`voice::schema::hidden_by_flag`) and `DeckShell` refuses it at dispatch,
+   * so the row stays in the table and the door stays shut.
+   */
   openDeck: {
     label: "Go back to the deck",
     voice: true,
@@ -483,28 +508,28 @@ export const VOICE_ACTIONS = {
 
   openProjects: {
     label: "Manage projects",
-    no_voice: "opens a picker over daemon-supplied project paths, and the table has no resolver kind that can turn a spoken phrase into one — a row could open the panel and then leave the user inside a list voice cannot choose from, which is a worse dead end than having no command",
+    no_voice: "hidden unless the experimental flag is on (issue #1198), so by default a row would be a spoken door to a panel the app does not show; and with the flag on, it opens a picker over daemon-supplied project paths, and the table has no resolver kind that can turn a spoken phrase into one — a row could open the panel and then leave the user inside a list voice cannot choose from, which is a worse dead end than having no command",
     needs: ["openOverlay"],
     run: (context: Pick<VoiceActionContext, "openOverlay">) => context.openOverlay("projects"),
   },
 
   openPromptLibrary: {
     label: "Open the prompt library",
-    no_voice: "a browse-and-edit surface: choosing, adding, editing and removing a stored prompt are all beyond this PRD's navigation-only slice, so the command would open a panel and stop",
+    no_voice: "hidden unless the experimental flag is on (issue #1198), so by default a row would be a spoken door to a panel the app does not show; and with the flag on, it is a browse-and-edit surface: choosing, adding, editing and removing a stored prompt are all beyond this PRD's navigation-only slice, so the command would open a panel and stop",
     needs: ["openOverlay"],
     run: (context: Pick<VoiceActionContext, "openOverlay">) => context.openOverlay("prompts"),
   },
 
   openAgentProfiles: {
     label: "Open agent profiles",
-    no_voice: "opens the form that sets each role's model and permissions — the configuration surface PRD #802 D5 puts behind confirmation, so exposing the door before the confirmation flow exists would invite the misfire D5 is about",
+    no_voice: "hidden unless the experimental flag is on (issue #1198), so by default a row would be a spoken door to a panel the app does not show; and with the flag on, it opens the form that sets each role's model and permissions — the configuration surface PRD #802 D5 puts behind confirmation, so exposing the door before the confirmation flow exists would invite the misfire D5 is about",
     needs: ["openOverlay"],
     run: (context: Pick<VoiceActionContext, "openOverlay">) => context.openOverlay("profiles"),
   },
 
   openWorkflowOrder: {
     label: "Edit workflow order",
-    no_voice: "the editor it opens enables, skips, reorders and LAUNCHES roles; launching an orchestration starts agents, and nothing in this slice starts anything",
+    no_voice: "hidden unless the experimental flag is on (issue #1198), so by default a row would be a spoken door to a panel the app does not show; and with the flag on, the editor it opens enables, skips, reorders and LAUNCHES roles; launching an orchestration starts agents, and nothing in this slice starts anything",
     needs: ["openOverlay"],
     run: (context: Pick<VoiceActionContext, "openOverlay">) => context.openOverlay("workflow"),
   },
@@ -882,7 +907,15 @@ export type VoicePanelChannel = { current: Partial<VoicePanelContext> | undefine
  * all. Before `stopVoice` existed a screen served the whole context and this
  * was `VoiceActionContext` itself.
  */
-export type VoiceScreenContext = Omit<VoiceActionContext, keyof VoicePanelContext | keyof VoiceOverviewContext>;
+export type VoiceScreenContext = Omit<VoiceActionContext, keyof VoicePanelContext | keyof VoiceOverviewContext | keyof VoiceShellContext>;
+
+/**
+ * The members only the SHELL serves (issue #1197): closing Settings, which is
+ * the shell's overlay rather than a screen's, since it opens over the overview
+ * as well as the deck. Published only while the sheet is open — see
+ * {@link VoiceActionContext.closeSettings}.
+ */
+export type VoiceShellContext = Pick<VoiceActionContext, "closeSettings">;
 
 /**
  * The members only the OVERVIEW serves (PRD #1223): opening the New agent

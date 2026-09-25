@@ -14,7 +14,11 @@ name = "xtask-linkage-check"
 path = "src/main.rs"
 
 [dependencies]
-proc-macro2 = "1"
+# `span-locations` (issue #688, rule 17) so a finding can name the line syn
+# parsed a `fn` at, rather than re-finding it by text. A feature of a crate
+# already in Cargo.lock, on the normal-dependency instance only — proc-macro
+# builds get their own resolution and are untouched.
+proc-macro2 = { version = "1", features = ["span-locations"] }
 regex = "1"
 # PRD #819 M7 (rule 12) walks the desktop crate's AST, so it needs `visit`
 # on top of what the `#[spec]` binding already uses. Pure feature — it pulls no

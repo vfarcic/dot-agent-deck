@@ -1,4 +1,5 @@
 import { expect, test, type Page } from "@playwright/test";
+import { enterDeck, selectOverview } from "./support/overview";
 
 const SETTINGS_KEY = "dot-agent-deck.desktop-settings";
 
@@ -23,7 +24,7 @@ const SETTINGS_KEY = "dot-agent-deck.desktop-settings";
  * treats as *no backend*, so a document naming the section is what turns the
  * simulated microphone on.
  */
-async function openSpeaking(page: Page, script: string[], state = "connected") {
+async function openSpeaking(page: Page, script: string[], state = "connected", startOnOverview = false) {
   await page.addInitScript((key) => {
     window.localStorage.setItem(key, JSON.stringify({
       version: 1,
@@ -34,6 +35,7 @@ async function openSpeaking(page: Page, script: string[], state = "connected") {
   }, SETTINGS_KEY);
   const spoken = script.map((phrase) => `voice=${encodeURIComponent(phrase)}`).join("&");
   await page.goto(`/?fixture=1&state=${state}&${spoken}`);
+  if (!startOnOverview) await enterDeck(page);
 }
 
 function voiceButton(page: Page) {
@@ -76,6 +78,36 @@ test.describe("voice off, said out loud", () => {
   });
 });
 
+test.describe("Settings from the overview by voice", () => {
+  /**
+   * Scenario: start on the overview and say "open settings" to the scripted
+   * fixture microphone. The Settings sheet opens on that screen.
+   */
+  test("opens Settings on the overview", async ({ page }) => {
+    await openSpeaking(page, ["open settings"], "connected", true);
+    await selectOverview(page);
+    await voiceButton(page).click();
+    await expect(page.getByRole("dialog", { name: "Settings" })).toBeVisible();
+  });
+
+  /**
+   * Scenario: on the shipped overview, open Settings from the rail and say
+   * "close this" through the scripted microphone. The sheet goes away and
+   * the overview remains visible.
+   */
+  test("closes Settings by voice on the overview", async ({ page }) => {
+    await openSpeaking(page, ["close this"], "connected", true);
+    await selectOverview(page);
+    await page.getByRole("button", { name: "Settings" }).click();
+    await expect(page.getByRole("dialog", { name: "Settings" })).toBeVisible();
+
+    await voiceButton(page).click();
+
+    await expect(page.getByRole("dialog", { name: "Settings" })).toHaveCount(0);
+    await expect(page.getByTestId("overview-table-region")).toBeVisible();
+  });
+});
+
 test.describe("what can I say?", () => {
   /**
    * Scenario: ask the preview what can be said. An overlay opens over the deck
@@ -91,9 +123,9 @@ test.describe("what can I say?", () => {
     const overlay = page.getByTestId("voice-help");
     await expect(overlay).toBeVisible();
     await expect(overlay.locator('[data-where="here"] [data-command="open_overview"]')).toBeVisible();
-    // The deck cannot run `open_deck`, so it is listed under the other heading
-    // rather than left out — knowing a command exists is most of discovery.
-    await expect(overlay.locator('[data-where="elsewhere"] [data-command="open_deck"]')).toBeVisible();
+    await expect(overlay.locator('[data-where="here"] [data-command="open_deck"]')).toBeVisible();
+    await expect(overlay.locator('[data-where="here"] [data-command="open_settings"]')).toBeVisible();
+    await expect(overlay.locator('[data-where="elsewhere"] [data-command="dictate_to_agent"]')).toBeVisible();
 
     await page.getByTestId("voice-help-close").click();
     await expect(overlay).toHaveCount(0);

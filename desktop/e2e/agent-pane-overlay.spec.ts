@@ -1,5 +1,5 @@
 import { expect, test, type Locator, type Page } from "@playwright/test";
-import { openOverview } from "./support/overview";
+import { enterDeck, openOverview } from "./support/overview";
 
 interface TerminalLayout {
   paneContentWidth: number;
@@ -143,6 +143,7 @@ test.describe("agent pane overlay", () => {
   test("occupies the window over a still-mounted deck and closes on Escape", async ({ page }) => {
     await captureTerminalMetrics(page);
     await page.goto("/?fixture=1&state=connected");
+    await enterDeck(page);
 
     const grid = page.locator(".agent-grid");
     const otherTile = page.getByTestId("agent-tile-builder");
@@ -180,6 +181,7 @@ test.describe("agent pane overlay", () => {
   test("keeps the overview mounted below the pane and returns there on Escape", async ({ page }) => {
     await captureTerminalMetrics(page);
     await page.goto("/?fixture=1&state=connected");
+    await enterDeck(page);
     const tileLayout = await terminalLayout(page.getByTestId("terminal-planner"));
     await openOverview(page, "connected");
 
