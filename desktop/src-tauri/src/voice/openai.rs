@@ -50,9 +50,10 @@
 //! # Three differences from the Anthropic protocol, each forced
 //!
 //! - **The instructions go in the `system` turn.** There is no tool, so there is
-//!   no `description` field to put them in. The state goes with them and the
-//!   transcript stays the one user turn, which keeps the volatile half last
-//!   exactly as [`super::remote::request_body`] does.
+//!   no `description` field to put them in. The command table goes with them;
+//!   the observed labels go in a user turn of their own marked untrusted
+//!   ([`super::prompt::data_turn`]), and the transcript stays the last turn,
+//!   exactly as [`super::remote::request_body`] orders them.
 //! - **Every property is `required`.** OpenAI's strict structured outputs refuse
 //!   a schema where a declared property is optional, so `params` cannot simply
 //!   be left out of `required` the way the tool-use schema leaves it. Each param
@@ -71,7 +72,7 @@ use serde_json::{Value, json};
 
 use crate::model_service::TokenCeiling;
 
-use super::prompt::{action_enum, param_names, state};
+use super::prompt::{action_enum, commands_state, data_turn, param_names};
 use super::remote::truncated_at;
 use super::resolver::{IntentAnswer, IntentError, IntentRequest};
 use super::schema::{AnnotatedCommand, TOOL_INSTRUCTIONS, TOOL_NAME};
@@ -115,10 +116,13 @@ pub fn response_schema(commands: &[AnnotatedCommand]) -> Value {
 
 /// The whole request body.
 ///
-/// The instructions and the live state are the system turn and the transcript is
-/// the user turn, which is the split [`super::remote::request_body`] makes and
-/// for the same reason: the commands and the agent list are the same across
-/// consecutive utterances and the transcript is not.
+/// Three turns, and the split is by TRUST before it is by volatility (audit
+/// finding A2): the instructions and the command table — this build's own
+/// words — are the system turn; the labels the app observed are a user turn
+/// marked untrusted, present only when there are any
+/// ([`super::prompt::data_turn`]); and the transcript is the last turn. That is
+/// the order [`super::remote::request_body`] uses, and it still keeps the
+/// volatile half last.
 ///
 /// **`max_tokens` is the older spelling of the ceiling and is deliberately not
 /// sent.** OpenAI deprecated it for chat completions and its newer models
@@ -145,20 +149,22 @@ pub fn request_body(
     max_tokens: TokenCeiling,
     reasoning_effort: Option<&str>,
 ) -> Value {
+    let mut messages = vec![json!({
+        "role": "system",
+        "content": format!(
+            "You route ONE spoken utterance to ONE action in a desktop app.\n\n{}\n\nCommands:\n{}",
+            TOOL_INSTRUCTIONS,
+            commands_state(request),
+        ),
+    })];
+    if let Some(data) = data_turn(request) {
+        messages.push(json!({ "role": "user", "content": data }));
+    }
+    messages.push(json!({ "role": "user", "content": request.transcript.text() }));
     let mut body = json!({
         "model": model,
         "max_completion_tokens": max_tokens.get(),
-        "messages": [
-            {
-                "role": "system",
-                "content": format!(
-                    "You route ONE spoken utterance to ONE action in a desktop app.\n\n{}\n\nState:\n{}",
-                    TOOL_INSTRUCTIONS,
-                    state(request),
-                ),
-            },
-            { "role": "user", "content": request.transcript.text() },
-        ],
+        "messages": messages,
         "response_format": {
             "type": "json_schema",
             "json_schema": {
@@ -225,6 +231,8 @@ mod tests {
     use crate::settings::OPENAI_COMMAND_REASONING_EFFORT;
     use crate::voice::Transcript;
     use crate::voice::fixtures::role_agent as agent;
+    use crate::voice::prompt::UNTRUSTED_STATE_PREAMBLE;
+    use crate::voice::prompt::tests::{HOSTILE_NAME, hostile_listing};
     use crate::voice::schema::annotate;
     use crate::voice::table::{Screen, table};
 
@@ -245,6 +253,9 @@ mod tests {
                 transcript: &transcript,
                 commands: &commands,
                 agents: &agents,
+                decks: &[],
+                directories: None,
+                new_agent: None,
             },
             "a-model",
             TokenCeiling::default(),
@@ -295,6 +306,16 @@ mod tests {
                 "list_commands",
                 "dictate_to_agent",
                 "submit_prompt",
+                "open_new_agent",
+                "open_dir",
+                "go_to_parent",
+                "use_this_directory",
+                "choose_mode",
+                "choose_agent_type",
+                "name_new_agent",
+                "start_new_agent",
+                "stop_agent",
+                "close_orchestration",
                 "none"
             ]
         );
@@ -354,25 +375,98 @@ mod tests {
             json!(["string", "null"])
         );
         assert_eq!(
+            schema["properties"]["params"]["properties"]["deck"]["type"],
+            json!(["string", "null"])
+        );
+        assert_eq!(
+            schema["properties"]["params"]["properties"]["dir"]["type"],
+            json!(["string", "null"])
+        );
+        assert_eq!(
             schema["properties"]["params"]["required"],
-            json!(["agent", "prefix"])
+            json!([
+                "agent",
+                "prefix",
+                "deck",
+                "dir",
+                "mode",
+                "agent_type",
+                "orchestration"
+            ])
         );
     }
 
     #[test]
-    fn voice_openai_request_puts_the_instructions_and_state_in_system_and_the_utterance_last() {
+    fn voice_openai_request_splits_the_turns_by_trust_and_puts_the_utterance_last() {
         let body = body("show me the tester");
-        let system = body["messages"][0]["content"].as_str().expect("a string");
-        assert_eq!(body["messages"][0]["role"], "system");
+        let messages = body["messages"].as_array().expect("an array");
+        assert_eq!(messages.len(), 3, "{body}");
+        let system = messages[0]["content"].as_str().expect("a string");
+        assert_eq!(messages[0]["role"], "system");
         assert!(system.contains(TOOL_INSTRUCTIONS), "{system}");
         assert!(system.contains("open_agent"), "{system}");
-        assert!(system.contains("tester"), "{system}");
-        // The volatile half is the user turn, so consecutive utterances share a
-        // prefix rather than differing at the front of it.
+        // The observed labels are NOT in the system turn (audit finding A2).
+        assert!(!system.contains("\"agents_on_screen\":"), "{system}");
+        assert!(!system.contains("\"label\":\"tester\""), "{system}");
         assert!(!system.contains("show me the tester"), "{system}");
-        assert_eq!(body["messages"][1]["role"], "user");
-        assert_eq!(body["messages"][1]["content"], "show me the tester");
-        assert_eq!(body["messages"].as_array().expect("an array").len(), 2);
+        // They are the data turn, framed as untrusted …
+        assert_eq!(messages[1]["role"], "user");
+        let data = messages[1]["content"].as_str().expect("a string");
+        assert!(data.starts_with(UNTRUSTED_STATE_PREAMBLE), "{data}");
+        assert!(data.contains("\"label\":\"tester\""), "{data}");
+        // … and the utterance is last, verbatim.
+        assert_eq!(messages[2]["role"], "user");
+        assert_eq!(messages[2]["content"], "show me the tester");
+    }
+
+    #[test]
+    fn voice_openai_request_keeps_a_hostile_directory_name_out_of_the_system_turn() {
+        let commands = commands();
+        let transcript = Transcript::new("open docs");
+        let listing = hostile_listing();
+        let body = request_body(
+            &IntentRequest {
+                transcript: &transcript,
+                commands: &commands,
+                agents: &[],
+                decks: &[],
+                directories: Some(&listing),
+                new_agent: None,
+            },
+            "a-model",
+            TokenCeiling::default(),
+            None,
+        );
+        let system = body["messages"][0]["content"].as_str().expect("a string");
+        assert!(!system.contains(HOSTILE_NAME), "{system}");
+        let data = body["messages"][1]["content"].as_str().expect("a string");
+        assert!(data.contains(HOSTILE_NAME), "{data}");
+        assert_eq!(body["messages"][2]["content"], "open docs");
+    }
+
+    #[test]
+    fn voice_openai_request_sends_no_data_turn_when_nothing_was_observed() {
+        // What `labels = "withheld"` produces: the instructions, the command
+        // table and the transcript, and nothing else.
+        let commands = commands();
+        let transcript = Transcript::new("go back");
+        let body = request_body(
+            &IntentRequest {
+                transcript: &transcript,
+                commands: &commands,
+                agents: &[],
+                decks: &[],
+                directories: None,
+                new_agent: None,
+            },
+            "a-model",
+            TokenCeiling::default(),
+            None,
+        );
+        let messages = body["messages"].as_array().expect("an array");
+        assert_eq!(messages.len(), 2, "{body}");
+        assert_eq!(messages[1]["content"], "go back");
+        assert!(!body.to_string().contains("untrusted_state"), "{body}");
     }
 
     #[test]
@@ -400,6 +494,9 @@ mod tests {
             transcript: &transcript,
             commands: &commands,
             agents: &agents,
+            decks: &[],
+            directories: None,
+            new_agent: None,
         };
         for ceiling in [MIN_TOKEN_CEILING, 1024, MAX_TOKEN_CEILING] {
             let ceiling = TokenCeiling::parse(i64::from(ceiling)).expect("in range");
@@ -426,6 +523,9 @@ mod tests {
             transcript: &transcript,
             commands: &commands,
             agents: &agents,
+            decks: &[],
+            directories: None,
+            new_agent: None,
         };
 
         let bare = request_body(&request, "a-model", TokenCeiling::default(), None);

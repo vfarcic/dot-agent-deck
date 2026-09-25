@@ -17,8 +17,10 @@ import type { ConnectionView } from "../types";
  * here rather than in the Rust DTO — sanitising upstream would corrupt the keys.
  *
  * The policy mirrors `src/untrusted_text.rs::strip_control_and_bidi`
- * character for character. Keep it that way: that module's own header records
- * that the bug class came from two copies of the policy drifting apart.
+ * character for character, with ONE recorded widening: `U+2028` and `U+2029`
+ * (see `UNSAFE_DISPLAY_CHARS`). Keep it that way otherwise: that module's own
+ * header records that the bug class came from two copies of the policy
+ * drifting apart.
  *
  * `displayActivity` and `displayUptime` at the bottom of the file are the same
  * seam for a daemon-supplied INSTANT rather than a string (PRD #745 M9, M11):
@@ -42,6 +44,18 @@ import type { ConnectionView } from "../types";
  *   swallow the inline siblings printed after it, the COORDINATOR badge
  *   included, on a screen whose entire purpose is telling one agent from
  *   another.
+ * - `U+2028` LINE SEPARATOR and `U+2029` PARAGRAPH SEPARATOR (PRD #1223 audit
+ *   D1). Neither is a control character (`Zl` / `Zp`), but both are MANDATORY
+ *   line breaks under Unicode's line-breaking algorithm (UAX #14 class `BK`),
+ *   which browser line breakers implement — so in the webview either one can
+ *   break a one-line cell the way a newline would, which is what the C0 clause
+ *   above exists to stop. This is the one place the list is wider than the
+ *   Rust policy, and deliberately: a terminal does not break a line on them,
+ *   so the TUI does not need it for the same string. A current deck keeps
+ *   them out of the paths it lists and refuses them in an authoring start's
+ *   directory, but an older deck can still list a directory named with one,
+ *   and other daemon strings — a display name, for one — can carry one
+ *   regardless.
  *
  * Zero-width joiners and the other default-ignorable format characters
  * (`U+200B` ZWSP, `U+200C` ZWNJ, `U+200D` ZWJ, `U+FEFF`) are deliberately NOT
@@ -60,7 +74,7 @@ import type { ConnectionView } from "../types";
  * columns below 680px, so a narrow window leaves two same-status rows with
  * nothing to tell them apart.
  */
-const UNSAFE_DISPLAY_CHARS = /[\u0000-\u001F\u007F-\u009F\u061C\u200E\u200F\u202A-\u202E\u2066-\u2069]/g;
+const UNSAFE_DISPLAY_CHARS = /[\u0000-\u001F\u007F-\u009F\u061C\u200E\u200F\u2028\u2029\u202A-\u202E\u2066-\u2069]/g;
 
 /**
  * Character budgets. `DesktopAgentDto` is a TypeScript *assertion* about a shape
@@ -110,6 +124,15 @@ export const DISPLAY_LIMITS = {
   /** The daemon's own connection message. */
   message: 240,
   /**
+   * A failure's full sentence, where `message` shows its first 240 characters
+   * and a disclosure offers the rest (PRD #1223 audit F6: a launch error names
+   * the role that failed, then every role that had started, then what the
+   * rollback did — so the part a reader most needs is the part the `message`
+   * clamp cuts). 2048 is the crate's own `ERROR_MESSAGE_MAX_CHARS`, the cap
+   * `safe_message` applies to each part of such a sentence.
+   */
+  detail: 2048,
+  /**
    * Identity values that reach a DOM attribute, an IDREF or a React key —
    * `domIdentity` is the seam. Generous next to the others because these are
    * percent-encoded composites (`<kind>:<encoded id>`, `<encoded daemonId>:<encoded
@@ -121,7 +144,7 @@ export const DISPLAY_LIMITS = {
   domIdentity: 160,
 } as const;
 
-/** Drop every control and bidi character. Nothing else is touched. */
+/** Drop every control, bidi and line/paragraph-separator character. Nothing else is touched. */
 export function sanitizeText(value: string): string {
   return value.replace(UNSAFE_DISPLAY_CHARS, "");
 }

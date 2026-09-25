@@ -215,6 +215,19 @@ impl Tab {
 // TabManager
 // ---------------------------------------------------------------------------
 
+/// PRD #1223: what [`TabManager::forget_externally_closed_pane`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternalPaneClose {
+    /// The tab had no live pane left and was removed.
+    pub tab_removed: bool,
+    /// The tab was the active one when the pane was struck.
+    pub was_active: bool,
+    /// For a removed orchestration tab, the synthetic dead-slot ids it still
+    /// carried: each has a placeholder `No agent` card the caller must retire
+    /// with the tab. Empty when the tab was kept.
+    pub dead_slot_pane_ids: Vec<String>,
+}
+
 pub struct TabManager {
     tabs: Vec<Tab>,
     active_index: usize,
@@ -1426,6 +1439,31 @@ impl TabManager {
         Ok((role_index, true))
     }
 
+    /// PRD #1223: the synthetic DEAD-SLOT pane id currently standing in for the
+    /// role named `role_name` in orchestration tab `tab_index`, if that role's
+    /// slot is a dead slot. `None` for a live slot, an unknown role, or a tab
+    /// that is not an orchestration.
+    ///
+    /// Asked before [`Self::add_role_to_existing_orchestration`] fills the slot,
+    /// because that call overwrites the id and the dead slot's placeholder card
+    /// is keyed by it: without the id the caller cannot retire the card, and the
+    /// role then renders twice — once live, once as a `No agent` ghost.
+    pub fn dead_slot_pane_for_role(&self, tab_index: usize, role_name: &str) -> Option<String> {
+        let Some(Tab::Orchestration {
+            role_pane_ids,
+            config,
+            ..
+        }) = self.tabs.get(tab_index)
+        else {
+            return None;
+        };
+        let index = config.roles.iter().position(|r| r.name == role_name)?;
+        role_pane_ids
+            .get(index)
+            .filter(|id| crate::ui::is_dead_slot_pane_id(id))
+            .cloned()
+    }
+
     /// Issue #1096: which slot a role that is NEW to this tab belongs in,
     /// given the tab's own (possibly stale) role list and the CURRENT
     /// `.dot-agent-deck.toml` order.
@@ -1683,6 +1721,89 @@ impl TabManager {
             }
             Tab::Dashboard { .. } => {}
         }
+    }
+
+    /// PRD #1223: drop `pane_id` from whichever Mode/Orchestration tab holds it,
+    /// for a pane whose agent ANOTHER client stopped — the daemon announced it
+    /// gone, so there is nothing to stop and `close_tab`'s `close_pane` round
+    /// trip must not run.
+    ///
+    /// The pane is struck exactly as [`Self::close_tab`] strikes a pane that did
+    /// close while a sibling did not ([`Self::forget_closed_panes`]). When that
+    /// leaves the tab with no live pane at all — every role slot empty or a
+    /// synthetic dead slot, a mode tab with no agent pane and no side pane — the
+    /// tab is removed, with `close_tab`'s own active-index rule: a user on the
+    /// removed tab lands on the Dashboard, and a user anywhere else stays where
+    /// they are. A tab that still has live panes is kept, as `close_tab` keeps
+    /// one holding panes that would not stop.
+    ///
+    /// `None` when no Mode/Orchestration tab holds the pane (a Dashboard pane,
+    /// or one already closed) — the idempotent case.
+    pub fn forget_externally_closed_pane(&mut self, pane_id: &str) -> Option<ExternalPaneClose> {
+        if pane_id.is_empty() || crate::ui::is_dead_slot_pane_id(pane_id) {
+            return None;
+        }
+        let index = self.tabs.iter().position(|tab| match tab {
+            Tab::Mode {
+                mode_manager,
+                agent_pane_id,
+                ..
+            } => {
+                agent_pane_id == pane_id
+                    || mode_manager
+                        .managed_pane_ids()
+                        .iter()
+                        .any(|id| id == pane_id)
+            }
+            Tab::Orchestration { role_pane_ids, .. } => {
+                role_pane_ids.iter().any(|id| id == pane_id)
+            }
+            Tab::Dashboard { .. } => false,
+        })?;
+        self.forget_closed_panes(index, &[pane_id.to_string()]);
+        let (has_live_pane, dead_slot_pane_ids) = match &self.tabs[index] {
+            Tab::Mode {
+                mode_manager,
+                agent_pane_id,
+                ..
+            } => (
+                !agent_pane_id.is_empty() || !mode_manager.managed_pane_ids().is_empty(),
+                Vec::new(),
+            ),
+            Tab::Orchestration { role_pane_ids, .. } => (
+                role_pane_ids
+                    .iter()
+                    .any(|id| !id.is_empty() && !crate::ui::is_dead_slot_pane_id(id)),
+                role_pane_ids
+                    .iter()
+                    .filter(|id| crate::ui::is_dead_slot_pane_id(id))
+                    .cloned()
+                    .collect(),
+            ),
+            Tab::Dashboard { .. } => (true, Vec::new()),
+        };
+        if has_live_pane {
+            return Some(ExternalPaneClose {
+                tab_removed: false,
+                was_active: index == self.active_index,
+                dead_slot_pane_ids: Vec::new(),
+            });
+        }
+        let was_active = index == self.active_index;
+        self.tabs.remove(index);
+        // The same adjustment `close_tab` makes after its removal.
+        if self.active_index >= self.tabs.len() {
+            self.active_index = self.tabs.len() - 1;
+        } else if self.active_index > index {
+            self.active_index -= 1;
+        } else if self.active_index == index {
+            self.active_index = 0;
+        }
+        Some(ExternalPaneClose {
+            tab_removed: true,
+            was_active,
+            dead_slot_pane_ids,
+        })
     }
 
     /// Collect all managed pane IDs across all mode tabs.
@@ -1986,6 +2107,146 @@ mod tests {
                 },
             ],
         }
+    }
+
+    /// PRD #1223: the dead-slot lookup names only a role whose slot is a dead
+    /// slot, so the grow path retires exactly that placeholder card.
+    #[test]
+    fn dead_slot_pane_for_role_names_only_dead_slots() {
+        let pc = Arc::new(MockPaneController::new());
+        let mut tm = TabManager::new(pc);
+        let identity = crate::state::OrchestrationIdentity::NameCwd {
+            name: "team".into(),
+            cwd: "/work".into(),
+        };
+        let dead = crate::ui::dead_slot_pane_id(&identity, 1);
+        let (idx, _) = tm
+            .open_orchestration_tab_with_existing_role_panes(
+                &orch_config("team"),
+                "/work",
+                vec![Some("lead-pane".into()), Some(dead.clone())],
+                None,
+                None,
+            )
+            .expect("open the tab");
+        assert_eq!(tm.dead_slot_pane_for_role(idx, "coder"), Some(dead));
+        assert_eq!(tm.dead_slot_pane_for_role(idx, "orchestrator"), None);
+        assert_eq!(tm.dead_slot_pane_for_role(idx, "nobody"), None);
+        assert_eq!(
+            tm.dead_slot_pane_for_role(0, "coder"),
+            None,
+            "the Dashboard"
+        );
+    }
+
+    /// PRD #1223: a pane another client stopped is struck from its tab without
+    /// a `close_pane` round trip; the tab survives while a live pane remains,
+    /// and goes — handing back its dead-slot ids — once none does. A pane no
+    /// tab holds is the idempotent `None`.
+    #[test]
+    fn forget_externally_closed_pane_removes_the_tab_with_its_last_live_pane() {
+        let pc = Arc::new(MockPaneController::new());
+        let mut tm = TabManager::new(pc);
+        let identity = crate::state::OrchestrationIdentity::NameCwd {
+            name: "team".into(),
+            cwd: "/work".into(),
+        };
+        let dead = crate::ui::dead_slot_pane_id(&identity, 1);
+        let config = orch_config_4("team");
+        let (idx, _) = tm
+            .open_orchestration_tab_with_existing_role_panes(
+                &config,
+                "/work",
+                vec![
+                    Some("lead".into()),
+                    Some(dead.clone()),
+                    Some("coder".into()),
+                    Some("reviewer".into()),
+                ],
+                None,
+                None,
+            )
+            .expect("open the tab");
+        assert_eq!(
+            tm.active_index(),
+            idx,
+            "precondition: the user is on the tab"
+        );
+
+        assert_eq!(tm.forget_externally_closed_pane("nobody"), None);
+        assert_eq!(
+            tm.forget_externally_closed_pane(&dead),
+            None,
+            "never a dead slot"
+        );
+
+        for pane in ["lead", "coder"] {
+            let outcome = tm.forget_externally_closed_pane(pane).expect("held pane");
+            assert!(!outcome.tab_removed, "{pane}: a live role remains");
+            assert_eq!(tm.tab_count(), 2);
+        }
+        assert_eq!(
+            tm.forget_externally_closed_pane("coder"),
+            None,
+            "a pane already struck is not found again"
+        );
+
+        let outcome = tm
+            .forget_externally_closed_pane("reviewer")
+            .expect("the last live role");
+        assert_eq!(
+            outcome,
+            ExternalPaneClose {
+                tab_removed: true,
+                was_active: true,
+                dead_slot_pane_ids: vec![dead],
+            }
+        );
+        assert_eq!(tm.tab_count(), 1, "only the Dashboard is left");
+        assert_eq!(tm.active_index(), 0, "the user lands on the Dashboard");
+    }
+
+    /// PRD #1223: removing a tab the user is NOT on keeps them where they are,
+    /// with the index shifted past the removed tab exactly as `close_tab` does.
+    #[test]
+    fn forget_externally_closed_pane_keeps_a_user_on_another_tab_there() {
+        let pc = Arc::new(MockPaneController::new());
+        let mut tm = TabManager::new(pc);
+        tm.open_orchestration_tab_with_existing_role_panes(
+            &orch_config("first"),
+            "/one",
+            vec![Some("a-lead".into()), Some("a-coder".into())],
+            None,
+            None,
+        )
+        .expect("open the first tab");
+        let (second, _) = tm
+            .open_orchestration_tab_with_existing_role_panes(
+                &orch_config("second"),
+                "/two",
+                vec![Some("b-lead".into()), Some("b-coder".into())],
+                None,
+                None,
+            )
+            .expect("open the second tab");
+        assert_eq!(tm.active_index(), second);
+
+        tm.forget_externally_closed_pane("a-lead");
+        let outcome = tm
+            .forget_externally_closed_pane("a-coder")
+            .expect("the first tab's last role");
+        assert!(outcome.tab_removed);
+        assert!(!outcome.was_active);
+        assert_eq!(tm.tab_count(), 2);
+        assert_eq!(
+            tm.active_index(),
+            1,
+            "still on the second tab, one place left"
+        );
+        assert!(matches!(
+            tm.active_tab(),
+            Tab::Orchestration { name, .. } if name.contains("second")
+        ));
     }
 
     /// Scenario: Create an orchestration with a user-typed name ("My Custom

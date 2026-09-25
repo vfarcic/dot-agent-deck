@@ -104,7 +104,7 @@ use serde_json::{Value, json};
 use crate::model_service::{ModelId, ServiceUrl, TokenCeiling};
 use crate::secrets::{SecretId, SecretStore, load_off_runtime};
 
-use super::prompt::{action_enum, param_names, state};
+use super::prompt::{action_enum, commands_state, data_turn, param_names};
 use super::resolver::{IntentAnswer, IntentError, IntentRequest, IntentResolver, ResolveFuture};
 use super::schema::{AnnotatedCommand, TOOL_INSTRUCTIONS, TOOL_NAME};
 
@@ -405,20 +405,30 @@ pub fn tool_definition(commands: &[AnnotatedCommand]) -> Value {
 /// that refuses a forced tool choice gets an unreadable-answer error, which is
 /// the honest failure for a coordinate they chose.)
 ///
-/// The state goes in `system` and the utterance in the one user turn, which is
-/// the split that keeps the volatile half last: the commands and the agent list
-/// are the same across consecutive utterances and the transcript is not.
+/// The command table goes in `system`, beside the tool that carries the
+/// instructions; the one user turn holds the labels the app observed as a text
+/// block of their own marked untrusted ([`super::prompt::data_turn`], absent
+/// when there are none) and then the utterance, last. Split by TRUST (audit
+/// finding A2): every repo-, config- and remote-sourced name is out of the
+/// system role. It is one turn with two blocks rather than two user turns
+/// because the Messages API folds consecutive same-role turns into one anyway,
+/// and saying so in the body is plainer than relying on it.
 pub fn request_body(request: &IntentRequest<'_>, model: &str, max_tokens: TokenCeiling) -> Value {
+    let mut content = Vec::new();
+    if let Some(data) = data_turn(request) {
+        content.push(json!({ "type": "text", "text": data }));
+    }
+    content.push(json!({ "type": "text", "text": request.transcript.text() }));
     json!({
         "model": model,
         "max_tokens": max_tokens.get(),
         "system": format!(
-            "You route ONE spoken utterance to ONE action in a desktop app.\n\nState:\n{}",
-            state(request)
+            "You route ONE spoken utterance to ONE action in a desktop app.\n\nCommands:\n{}",
+            commands_state(request)
         ),
         "tools": [tool_definition(request.commands)],
         "tool_choice": { "type": "tool", "name": TOOL_NAME },
-        "messages": [{ "role": "user", "content": request.transcript.text() }],
+        "messages": [{ "role": "user", "content": content }],
     })
 }
 
@@ -526,6 +536,8 @@ mod tests {
     use crate::settings::HOSTED_COMMAND_MODEL;
     use crate::voice::Transcript;
     use crate::voice::fixtures::role_agent as agent;
+    use crate::voice::prompt::UNTRUSTED_STATE_PREAMBLE;
+    use crate::voice::prompt::tests::{HOSTILE_NAME, hostile_listing};
     use crate::voice::schema::annotate;
     use crate::voice::table::{Screen, table};
 
@@ -549,6 +561,9 @@ mod tests {
                 transcript: &transcript,
                 commands: &commands,
                 agents: &agents,
+                decks: &[],
+                directories: None,
+                new_agent: None,
             },
             HOSTED_COMMAND_MODEL,
             TokenCeiling::default(),
@@ -601,6 +616,9 @@ mod tests {
             transcript: &transcript,
             commands: &commands,
             agents: &agents,
+            decks: &[],
+            directories: None,
+            new_agent: None,
         };
         for ceiling in [MIN_TOKEN_CEILING, 1024, MAX_TOKEN_CEILING] {
             let ceiling = TokenCeiling::parse(i64::from(ceiling)).expect("in range");
@@ -635,6 +653,16 @@ mod tests {
                 "list_commands",
                 "dictate_to_agent",
                 "submit_prompt",
+                "open_new_agent",
+                "open_dir",
+                "go_to_parent",
+                "use_this_directory",
+                "choose_mode",
+                "choose_agent_type",
+                "name_new_agent",
+                "start_new_agent",
+                "stop_agent",
+                "close_orchestration",
                 "none"
             ]
         );
@@ -686,16 +714,75 @@ mod tests {
     }
 
     #[test]
-    fn voice_remote_request_puts_the_state_in_system_and_the_utterance_last() {
+    fn voice_remote_request_splits_the_turns_by_trust_and_puts_the_utterance_last() {
         let body = body("show me the tester");
         let system = body["system"].as_str().expect("a string");
         assert!(system.contains("open_agent"), "{system}");
-        assert!(system.contains("tester"), "{system}");
-        // The volatile half is the user turn, so consecutive utterances share a
-        // prefix rather than differing at the front of it.
+        // The observed labels are NOT in the system role (audit finding A2).
+        assert!(!system.contains("\"agents_on_screen\":"), "{system}");
+        assert!(!system.contains("\"label\":\"tester\""), "{system}");
         assert!(!system.contains("show me the tester"), "{system}");
+        assert_eq!(body["messages"].as_array().expect("an array").len(), 1);
         assert_eq!(body["messages"][0]["role"], "user");
-        assert_eq!(body["messages"][0]["content"], "show me the tester");
+        let content = body["messages"][0]["content"].as_array().expect("blocks");
+        assert_eq!(content.len(), 2, "{body}");
+        let data = content[0]["text"].as_str().expect("a string");
+        assert!(data.starts_with(UNTRUSTED_STATE_PREAMBLE), "{data}");
+        assert!(data.contains("\"label\":\"tester\""), "{data}");
+        // The utterance is last, verbatim.
+        assert_eq!(content[1]["type"], "text");
+        assert_eq!(content[1]["text"], "show me the tester");
+    }
+
+    #[test]
+    fn voice_remote_request_keeps_a_hostile_directory_name_out_of_the_system_role() {
+        let commands = commands();
+        let transcript = Transcript::new("open docs");
+        let listing = hostile_listing();
+        let body = request_body(
+            &IntentRequest {
+                transcript: &transcript,
+                commands: &commands,
+                agents: &[],
+                decks: &[],
+                directories: Some(&listing),
+                new_agent: None,
+            },
+            HOSTED_COMMAND_MODEL,
+            TokenCeiling::default(),
+        );
+        let system = body["system"].as_str().expect("a string");
+        assert!(!system.contains(HOSTILE_NAME), "{system}");
+        let content = body["messages"][0]["content"].as_array().expect("blocks");
+        assert!(
+            content[0]["text"]
+                .as_str()
+                .expect("a string")
+                .contains(HOSTILE_NAME)
+        );
+        assert_eq!(content[1]["text"], "open docs");
+    }
+
+    #[test]
+    fn voice_remote_request_sends_only_the_utterance_when_nothing_was_observed() {
+        let commands = commands();
+        let transcript = Transcript::new("go back");
+        let body = request_body(
+            &IntentRequest {
+                transcript: &transcript,
+                commands: &commands,
+                agents: &[],
+                decks: &[],
+                directories: None,
+                new_agent: None,
+            },
+            HOSTED_COMMAND_MODEL,
+            TokenCeiling::default(),
+        );
+        let content = body["messages"][0]["content"].as_array().expect("blocks");
+        assert_eq!(content.len(), 1, "{body}");
+        assert_eq!(content[0]["text"], "go back");
+        assert!(!body.to_string().contains("untrusted_state"), "{body}");
     }
 
     #[test]
@@ -863,6 +950,9 @@ mod tests {
                 transcript: &transcript,
                 commands: &commands,
                 agents: &[],
+                decks: &[],
+                directories: None,
+                new_agent: None,
             })
             .await
             .expect_err("fails");
@@ -886,6 +976,9 @@ mod tests {
                 transcript: &transcript,
                 commands: &commands,
                 agents: &[],
+                decks: &[],
+                directories: None,
+                new_agent: None,
             })
             .await
             .expect_err("fails");
@@ -914,6 +1007,9 @@ mod tests {
                 transcript: &transcript,
                 commands: &commands,
                 agents: &[],
+                decks: &[],
+                directories: None,
+                new_agent: None,
             })
             .await
             .expect_err("no key is stored");
@@ -993,6 +1089,9 @@ mod tests {
                 transcript: &transcript,
                 commands: &commands,
                 agents: &[],
+                decks: &[],
+                directories: None,
+                new_agent: None,
             })
             .await
             .expect_err("nothing is listening on port 1");

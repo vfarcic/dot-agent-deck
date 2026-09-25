@@ -3766,6 +3766,15 @@ impl PaneController for EmbeddedPaneController {
             .map(|p| p.backend.agent_id.lock().unwrap().clone())
     }
 
+    fn forget_pane(&self, pane_id: &str) -> bool {
+        // Dropping the pane drops its `StreamBackend`, which aborts the I/O
+        // task and closes the socket — including a reattach loop the stop's
+        // STREAM_END started, which would otherwise poll for a replacement
+        // agent that is not coming.
+        let removed = self.panes.lock().unwrap().remove(pane_id);
+        removed.is_some()
+    }
+
     fn create_pane_with_options(
         &self,
         command: Option<&str>,

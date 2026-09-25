@@ -1,6 +1,6 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { VoicePanel } from "./VoicePanel";
+import { INTENT_DISCLOSURE, INTENT_DISCLOSURE_SHARED, INTENT_DISCLOSURE_WITHHELD, VoicePanel } from "./VoicePanel";
 import {
   DEFAULT_DESKTOP_SETTINGS,
   DEFAULT_VOICE_SETTINGS,
@@ -69,6 +69,7 @@ const BOTH_KEYED = {
     activation: "toggle",
     intent: VOICE_STAGE_PRESETS.intent.anthropic,
     transcription: VOICE_STAGE_PRESETS.transcription.remote,
+    labels: "shared",
   },
 };
 
@@ -191,9 +192,71 @@ describe("VoicePanel", () => {
           activation: "toggle",
           intent: VOICE_STAGE_PRESETS.intent.openai_compatible,
           transcription: VOICE_STAGE_PRESETS.transcription.remote,
+          labels: "shared",
         },
       }),
     );
+  });
+
+  /**
+   * PRD #1223, audit finding A1: the panel says what each command sends to
+   * the Commands endpoint, and the Names row decides whether the names on
+   * screen are part of it.
+   */
+  it("says what each command sends, and changes the sentence with the Names row", () => {
+    const { onSave } = renderPanel({ voice: undefined });
+    const disclosure = screen.getByTestId("voice-intent-disclosure");
+    expect(disclosure).toHaveTextContent(INTENT_DISCLOSURE);
+    expect(disclosure).toHaveTextContent(INTENT_DISCLOSURE_SHARED);
+    expect(disclosure).toHaveTextContent("SSH user, host and any non-default port");
+    expect(disclosure).toHaveTextContent("up to 200 directory names");
+    // PRD #1223, closing audit F3: the always-sent components are named, and
+    // the narrow fact Shared keeps is stated as exactly that.
+    expect(disclosure).toHaveTextContent("every command's id, description, parameter names and kinds");
+    expect(disclosure).toHaveTextContent("the hint shown when it cannot");
+    expect(disclosure).toHaveTextContent("the model name and token limit");
+    expect(disclosure).toHaveTextContent("your Commands API key in its authentication header");
+    // PRD #1223, closing audit G2: the negations are about the app-observed
+    // names only, and the words spoken are said to be always sent.
+    // PRD #1223, closing audit H2: stated as FIELD provenance — the app adds
+    // no such field — because a name is arbitrary text and can itself be a
+    // path; and the words go with a command that REACHES the endpoint, since
+    // the locally decided ones named above send nothing.
+    expect(disclosure).toHaveTextContent("This app adds no field of its own for a filesystem path, a deck or agent id, prompt text or a tool's arguments");
+    expect(disclosure).toHaveTextContent("a name is whatever it was set to, so a name can itself be a path.");
+    expect(disclosure).toHaveTextContent("Every command that reaches the endpoint also carries your words as heard, which may contain anything you say.");
+    expect(disclosure).not.toHaveTextContent("Those names include no filesystem path");
+    expect(disclosure).not.toHaveTextContent("always sent as heard");
+    expect(disclosure).not.toHaveTextContent("It sends no filesystem path");
+    expect(disclosure).not.toHaveTextContent("no prompt you typed");
+    expect(disclosure).not.toHaveTextContent("Never a path, an id");
+    const names = screen.getByRole("radiogroup", { name: "Names" });
+    expect(within(names).getByLabelText("Shared")).toBeChecked();
+
+    fireEvent.click(within(names).getByLabelText("Withheld"));
+    expect(onSave).toHaveBeenCalledWith(
+      expect.objectContaining({ voice: { ...DEFAULT_VOICE_SETTINGS, labels: "withheld" } }),
+    );
+  });
+
+  it("says what a withheld Names row costs", () => {
+    renderPanel({ voice: { ...DEFAULT_VOICE_SETTINGS, labels: "withheld" } });
+    const disclosure = screen.getByTestId("voice-intent-disclosure");
+    expect(disclosure).toHaveTextContent(INTENT_DISCLOSURE_WITHHELD);
+    expect(disclosure).not.toHaveTextContent(INTENT_DISCLOSURE_SHARED);
+    // It withholds the names, not the request: the always-sent part stays.
+    expect(disclosure).toHaveTextContent(INTENT_DISCLOSURE);
+    expect(disclosure).not.toHaveTextContent("sends nothing else");
+    // PRD #1223, closing audit G2: withholding removes the observed names, not
+    // the user's own words, and says so rather than implying a redaction.
+    expect(disclosure).toHaveTextContent("none of the names this app reads from the screen");
+    // Closing audit H2: scoped to the commands that reach the endpoint — the
+    // always-sent paragraph beside it names the ones decided on this machine.
+    expect(disclosure).toHaveTextContent("It does not redact your words: every command that reaches the endpoint still carries them as heard.");
+    expect(disclosure).not.toHaveTextContent("what you speak is still sent as heard");
+    expect(disclosure).not.toHaveTextContent("always sent as heard");
+    expect(disclosure).not.toHaveTextContent("sends none of the names on screen");
+    expect(within(screen.getByRole("radiogroup", { name: "Names" })).getByLabelText("Withheld")).toBeChecked();
   });
 
   /**

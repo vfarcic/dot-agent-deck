@@ -276,6 +276,7 @@ fn project_launch_003_a_real_coordinator_reads_the_daemon_published_context() {
             // Pi's native seed pull only; a claude coordinator is driven by the
             // guarded PTY delivery below.
             seed: None,
+            authoring_kind: None,
         },
     )
     .expect("StartAgent over the attach socket");

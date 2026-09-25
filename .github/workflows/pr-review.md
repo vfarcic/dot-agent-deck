@@ -177,17 +177,17 @@ You have **10000 AI credits** for this run, and a 45-minute wall clock. Both are
 
 That leaves one honest strategy: **bound the work, then emit once.** You cannot see your own credit meter, so budget the work instead, which you can count:
 
-1. **Read the diff summary and changed-file list first**, and decide where the risk is — protocol and daemon changes, credentials, deletion or process termination, security-relevant paths. Rank before reading.
-2. **Deep-read the top of that ranking only**, roughly the ten highest-risk files. Do not read the whole diff evenly; on a large pull request that alone can exhaust the budget.
+1. **Establish the evidence first**, in this order: the changed-file list (paths, not contents), **every** independent review at this head and which head each covers — both products, not the newest one, because a later clean review from one does not answer an earlier finding from the other (Qodo on PR #1271) — then each of their findings and the reply under it, and the pull request body's own claims about the obligations it owes.
+2. **Read code where judging that evidence requires it** — a finding whose answer you cannot evaluate without seeing the hunk, or a contract question the body does not settle — **and on the one class the rubric says to read regardless**: the hunks that touch a secret, a token, a permission block, an action pin, or a path or command built from input. An independent review establishes that somebody read this head, not that anybody looked for those. Bounded and targeted either way. You are not the first reader of this diff and must not spend the run becoming one (issue #1270); the rubric's priority list is the whole of your job.
 3. **Emit the verdict as your final action, and make it the only pass.** There is no second, deeper sweep — if you find yourself planning one, you have already spent what it would have cost.
 
-If your coverage was thin, say so in `reasons` and weigh `INSUFFICIENT` rather than reporting confidence you do not have.
+If the evidence is thin — nothing independent has read this head, a finding whose answer you cannot evaluate, an obligation you cannot see discharged — say so in `reasons` and return `INSUFFICIENT` rather than reporting confidence you do not have. The vote job withholds the approval on the same grounds, so saying it costs nothing. **Do not emit `covered_paths` outside a focused pass**: it is a claim that the union of verdicts covers the whole diff, and the vote job enforces exactly that (issue #1270).
 
 **Subagents are the largest single cost and the easiest way to overrun.** Each carries its own context over the same diff, so a fan-out of four on a large pull request can spend the whole budget before any of them reports — which is exactly how the 2026-09-13 run died. Do not delegate by default. Use at most **two**, only on a diff above roughly 40 changed files, and only with a brief scoped to specific files rather than a whole area.
 
 A verdict of `INSUFFICIENT` is the honest answer when you could not review confidently within budget. Say what you did and did not cover in `reasons`. It is a legitimate outcome and far more useful than an optimistic `APPROVE` or a run that dies silently.
 
-**Record what you covered, every time, in `covered_paths`** — the repo-relative path of every file you deep-read this pass. That list is what lets a later focused pass (below) pick up where you stopped, so an `INSUFFICIENT` on a large pull request stops being a dead end. List only what you genuinely read in full; a path you skimmed is not covered, and claiming it hides the gap from the pass that would otherwise close it.
+**On a focused follow-up pass ONLY, record what you covered in `covered_paths`** — the repo-relative path of every file you deep-read this pass. That list is what lets a later focused pass (below) pick up where you stopped, so an `INSUFFICIENT` on a large pull request stops being a dead end. List only what you genuinely read in full; a path you skimmed is not covered, and claiming it hides the gap from the pass that would otherwise close it.
 
 ## If this is a focused follow-up pass
 

@@ -16,10 +16,25 @@
 #   screens          where the command can run: `deck`, `overview`, `agent` —
 #                    the three `DeckView` kinds (`desktop/src/types.ts`).
 #                    Absent or empty means available everywhere.
+#   requires         what else must hold, from the closed set in `table.rs`'s
+#                    `Requirement`: `directory_listing` (the New agent dialog
+#                    is showing a listing), `parent_directory` (that listing
+#                    has a `..`), `new_agent_form` (the dialog's fields are
+#                    live), `new_agent_dialog` (the dialog is open at all) and
+#                    `new_agent_dialog_closed` (it is not — the one met by
+#                    the ABSENCE of a declaration).
+#                    Answered by what the webview declared with the
+#                    utterance. Absent or empty means nothing more is needed.
 #   unavailable_hint names the PREREQUISITE, for the sentence the app renders
 #                    when the model picks a command the current screen cannot
 #                    run. No leading capital and no trailing period: it is
-#                    rendered into a sentence, not as one.
+#                    rendered into a sentence, not as one. Where reaching the
+#                    prerequisite takes a step the user may not know — the New
+#                    agent dialog's fields fill in order, deck then directory
+#                    then the rest — the hint says WHAT TO DO FIRST ("choose a
+#                    deck first"), not merely that the command is unavailable.
+#                    It is also sent to the model, so a change here is a prompt
+#                    change too.
 #   report           the user-facing sentence for a successful dispatch — the
 #                    pipeline's stage 6. A `{param}` placeholder is replaced
 #                    with what that param resolved to; `table.rs` refuses a
@@ -30,16 +45,111 @@
 #                    confirm-before-acting flag, and the two are close to
 #                    opposite — this describes an action that HAPPENED, that
 #                    one blocks an action before it does. Do not rename it back.
-#   [[commands.params]]  name + kind, `kind` from the closed resolver set.
+#   asks_to          the action in the USER's words — "open a directory" — for
+#                    the refusal of a pick the transcript does not ask for:
+#                    "nothing in that asks to open a directory". A verb phrase
+#                    that follows "asks to": no leading capital, no trailing
+#                    period, and never the id (`table.rs` refuses an `_`). That
+#                    sentence used to quote the id — `nothing in that asks for
+#                    "open_dir"` — and the first real use of the directory
+#                    browser met it (PRD #1223). Not sent to the model.
+#   try_saying       a phrasing that DOES ask for the row, offered in the same
+#                    refusal: `try "open code"`. A `{param}` placeholder names a
+#                    required param and is filled with what the model heard for
+#                    it ONLY when the user said every word of that value;
+#                    otherwise the suggestion is left out. `table.rs` refuses a
+#                    suggestion its own row's grounding would refuse. Not sent
+#                    to the model.
+#   heard_as         the words that ASK for this action (PRD #1223, closing
+#                    audit F1). A pick is dispatched only when the transcript
+#                    contains at least one entry — a word (heard with or
+#                    without a trailing `s`, or split across two or three
+#                    adjacent words) or a phrase (its words adjacent, in
+#                    order). Otherwise the app refuses with "nothing in that
+#                    asks for …". Every entry must be words of the row's own
+#                    `id` or `description`, which `table.rs` checks, so the
+#                    vocabulary is the one the model picks on. It exists
+#                    because observed names (directories, agent labels,
+#                    orchestration titles) can be written to steer the model,
+#                    and a row with no reference to ground — `submit_prompt`
+#                    presses Enter in an agent's prompt — had nothing else
+#                    between a steered pick and a dispatch. Tune a too-narrow
+#                    vocabulary here; do not loosen the rule.
+#   heard_as_whole   instead of `heard_as`: the row is asked for only when the
+#                    WHOLE utterance is one of these entries — case,
+#                    punctuation and an edge politeness word ("okay",
+#                    "please", "now", …) aside —
+#                    never when one merely occurs in it (closing audit G1).
+#                    For a row whose action cannot be taken back, where an
+#                    unrelated occurrence of one ordinary word ("tell it to put
+#                    END after the report") must not be enough. Same own-words
+#                    rule. Exactly one row uses it, `submit_prompt`
+#                    (`voice_table_whole_utterance_rows_are_the_deliberate_set`);
+#                    on an ordinary row it would make natural speech fail.
+#   heard_as_whole_while
+#                    beside `heard_as`: a table keyed by a `requires` value,
+#                    each holding `heard_as_whole` entries that REPLACE
+#                    `heard_as` while that requirement is met (closing audit
+#                    H1). For a row reversible in general and destructive in
+#                    one declared context. Every entry must contain one of the
+#                    row's `heard_as` entries, so a context only narrows.
+#                    At most ONE context per row (closing audit I2): with two,
+#                    nothing would decide which grounds the row where both hold.
+#                    Two rows use it, `open_deck` and `close`, both over the New
+#                    agent dialog, which each would unmount with its form
+#                    (`voice_table_context_grounded_rows_are_the_deliberate_set`).
+#   heard_as_also    beside `heard_as`: a second list the transcript must ALSO
+#                    contain one entry of (PRD #1223). For a row whose verbs
+#                    are ordinary words with a harmless reading, where the
+#                    destructive reading needs its object NAMED as well:
+#                    `close_orchestration` stops every role of a run, and
+#                    "close the billing agent" must not ground it on `close`.
+#                    Same own-words rule; not beside `heard_as_whole_while`.
+#                    Exactly one row uses it
+#                    (`voice_table_conjunctive_rows_are_the_deliberate_set`).
+#   unavailable_redirects
+#                    the id of the row that answers this row's words where
+#                    this one cannot run (PRD #1223, D3; `unavailable_opens`
+#                    while its only use opened something). A pick of this row
+#                    that is not callable, and carries no param value,
+#                    dispatches that row instead — with no params — when that
+#                    row is callable and its own grounding accepts the same
+#                    words; otherwise the usual "Not here" stands. The target
+#                    must exist, be another row, and declare no required
+#                    param. Two rows use it, each other's targets across the
+#                    New agent dialog's boundary
+#                    (`voice_table_redirecting_rows_are_the_deliberate_set`).
+#   ungrounded       instead of either: why this row CANNOT be grounded by
+#                    words. Every row carries exactly one of the three, so no
+#                    row is exempt by omission. No shipped row uses it
+#                    (`voice_table_no_row_is_exempt_from_action_grounding`).
+#   [[commands.params]]  name + kind, `kind` from the closed resolver set
+#                    (`agent_ref`, `deck_ref`, `dir_ref`, `mode_ref`,
+#                    `agent_type_ref`, `orchestration_ref`, `spoken_prefix`).
+#                    `optional =
+#                    true` lets the row dispatch when the model supplies no
+#                    value; a value that fails is dropped with a note saying
+#                    why, one that resolves gets a note naming it
+#                    ("Preselected deck: Local deck."), and a report may not
+#                    interpolate an optional param.
 #
 # **This table was NAVIGATION ONLY and is not any more**, which is worth saying
 # in the sentence that used to claim it rather than leaving the claim to rot:
 # `voice_off` stops the microphone, `list_commands` opens an overlay,
 # `dictate_to_agent` types what it hears into the open agent's prompt and
 # `submit_prompt` presses Enter in it. What still holds is the narrower property
-# the old sentence was really protecting — **no row here starts an agent, stops
-# one, or answers a permission prompt** — which is why none of them needs the
-# confirm-before-acting step PRD #802 D5 is about. The dictation pair is what to
+# the old sentence was really protecting — **no row here STOPS anything, or
+# answers a permission prompt, BY ITSELF.** Two rows lead to a stop —
+# `stop_agent` and `close_orchestration`, at the end of this file — and each
+# terminates at a `ConfirmDialog` the user answers by hand, never at a direct
+# dispatch: PRD #802 D5's confirm-before-acting step, satisfied in the FRONTEND
+# for now. The table's own `confirm` column that D5 anticipates (see `report`
+# above) is still unbuilt and is where that flag belongs eventually.
+# `voice_table_d5_rows_only_ask` pins the set. One row STARTS something:
+# `start_new_agent` presses the New agent dialog's Start, with the form the user
+# is looking at, and no longer asks first — D5's start half was revisited on
+# 2026-09-23 (PRD #1223; the reasons are above that row). No row answers a
+# permission prompt at all. The dictation pair is what to
 # weigh against that, and it earns its place on two counts: the words go into a
 # VISIBLE input the user can edit, and nothing is sent without the user either
 # saying so or watching a five-second countdown they can cancel by speaking.
@@ -49,13 +159,17 @@
 [[commands]]
 id          = "open_agent"
 description = """Open one agent's pane over the current screen, so the user can watch that one
-agent's terminal. Use when the user asks to focus on, enlarge, zoom, open, show or look at ONE
-named agent. The agent is named the way the deck shows it — a role like "tester" or
+agent's terminal. Use when the user asks to focus on, enlarge, zoom, open, show, see or look at ONE
+named agent, or to see only that one ("everything except the tester") — including "open tester
+agent", the accessible name of an overview row's open control. The agent is named the way the deck shows it — a role like "tester" or
 "orchestrator", or a name the user gave it."""
 invoke      = "openAgent"
 screens     = ["deck", "overview"]
 unavailable_hint = "opening an agent works from the deck or the agent overview"
 report      = "Opening {agent}."
+asks_to     = "open an agent's pane"
+try_saying  = "open {agent}"
+heard_as    = ["open", "show", "see", "focus", "enlarge", "zoom", "look", "watch", "except"]
 
   [[commands.params]]
   name = "agent"
@@ -70,17 +184,34 @@ invoke      = "openOverview"
 screens     = ["deck"]
 unavailable_hint = "the agent overview opens from the deck"
 report      = "Opening the agent overview."
+asks_to     = "show the agent overview"
+try_saying  = "show everything"
+heard_as    = ["overview", "everything", "all", "fleet", "running", "attention"]
 
 [[commands]]
 id          = "open_deck"
 description = """Go back to the deck — the screen with the terminals on it — leaving the agent
 overview. On the agent overview a bare "go back" or "back" means THIS one, because the deck is
-the screen the overview was opened from. Also use for return to the deck, take me back, or show
-the terminals or panes again."""
+the screen the overview was opened from. Also use for open deck and deck — the labels of the
+overview's Open deck button and its rail's Deck button — and for return to the deck, take me back,
+show me the deck, show the deck, or show the terminals or panes again."""
 invoke      = "openDeck"
 screens     = ["overview"]
 unavailable_hint = "returning to the deck works from the agent overview"
 report      = "Back to the deck."
+asks_to     = "go back to the deck"
+try_saying  = "go back to the deck"
+heard_as    = ["deck", "back", "return", "terminals", "panes"]
+# Over the New agent dialog this row is `close`'s destructive case by another
+# route (PRD #1223, closing audit H1): leaving the overview unmounts it, and the
+# form goes with it. So there it needs the whole utterance, and only an explicit
+# request for the deck — a bare "back" or "take me back" to a user filling a
+# form is as likely to mean the dialog or the parent directory. The dialog is
+# modal, so no click reaches the deck from behind it either.
+heard_as_whole_while.new_agent_dialog = [
+  "go back to the deck", "back to the deck", "return to the deck", "the deck", "deck",
+  "show me the deck", "show the deck", "show the terminals",
+]
 
 # PRD #802 — "close" means the thing on TOP, and this row replaced
 # `close_agent_view` rather than sitting beside it.
@@ -111,18 +242,68 @@ report      = "Back to the deck."
 # It closes a VIEW rather than a terminal pane. The agent keeps running and its
 # pane is untouched — the two are one word apart in speech, so the description
 # says so.
+#
+# **"Close the agent" is THIS row** (PRD #1223): an utterance with a destructive
+# and a non-destructive reading resolves to the non-destructive one, and a
+# destructive action needs wording that can only mean destruction
+# (`docs/develop/voice-first-design.md`). The user said "Close the agent" and it
+# was taken as a stop. So this row claims "close the agent" and its view/pane/
+# screen synonyms, `stop_agent` disclaims "close", and `close_orchestration`
+# needs the orchestration or run named (`heard_as_also`).
+#
+# "close new agent" is in the dialog's list because it is the accessible name of
+# the dialog's X button — a control's label is part of its voice vocabulary
+# (PRD #1223). "close the new agent dialog" was there and this was not, so
+# reading the button aloud was refused.
+#
+# `cancel` and `never mind` are in `heard_as` because the dialog has no Cancel
+# button any more (U2), so voice is the only place the most natural word for
+# dismissing a dialog can land — and the context list below may only NARROW
+# `heard_as`, so they had to be base words to be allowed there at all. That
+# widens the row everywhere else too, which costs nothing there: elsewhere this
+# row closes a pane or the command list, and either reopens as it was.
+#
+# Reversible — EXCEPT over the New agent dialog (PRD #1223, closing audit H1).
+# A pane or the command list reopens as it was; the dialog's deck, directory,
+# Mode, Name and hand-edited Command are component-local state that
+# closing discards. So while the dialog is declared, `heard_as_whole_while`
+# replaces `heard_as` with whole-utterance equality: "name it done worker"
+# contains `done`, and a steered `close` must not ground on it and throw the
+# form away. The narrower list leaves out the words a user filling a form says
+# for other reasons — `done`, `leave`, `back`, `stop looking` — so over the
+# dialog only a plain request to close or dismiss it closes it. The parser
+# refuses an entry here that none of `heard_as` grounds, so this can only take
+# phrasings away. Everywhere else the row is token-grounded as before.
 [[commands]]
 id          = "close"
 description = """Close whatever is open OVER the current screen and go back to what was
-underneath. That is the list of spoken commands if it is showing, and otherwise one agent's open
-pane. Use for close, close this, close it, dismiss this, hide this, get rid of this, I'm done
-with this, or leave this agent. A bare "go back" or "back" means THIS one ONLY when `open_deck`
-is not callable — a callable `open_deck` means the deck itself is what "back" leads to, and that
-one wins. This only closes what is on top: it does NOT stop any agent, does NOT close an agent's
+underneath. That is the list of spoken commands if it is showing, then the New agent dialog if it
+is open, and otherwise one agent's open pane. Use for close, close this, close it, close the
+dialog, close this dialog, close the new agent dialog, close new agent (the accessible name of the
+dialog's X button), cancel, cancel this, cancel it, never mind,
+dismiss this, hide this, get rid of this, I'm done with this, stop looking at this, leave this
+agent, or back to the overview. "Close the agent", "close the agent screen", "close the agent
+view" and "close the agent pane" mean THIS one: they close the VIEW of the agent, and the agent
+keeps running. When closing a view and stopping something are both possible readings, closing the
+view is the one meant. A bare "go back" or "back" means THIS one ONLY when `open_deck` is not
+callable — a callable `open_deck` means the deck itself is what "back" leads to, and that one
+wins. This only closes what is on top: it does NOT stop any agent, does NOT close an agent's
 terminal pane, and does NOT turn voice off."""
 invoke      = "closeTopmost"
 unavailable_hint = "closing what is on top works anywhere"
 report      = "Closed."
+asks_to     = "close what is on top"
+try_saying  = "close this"
+heard_as    = [
+  "close", "dismiss", "hide", "get rid", "done", "leave", "stop looking", "back",
+  "cancel", "never mind",
+]
+heard_as_whole_while.new_agent_dialog = [
+  "close", "close this", "close it", "close the dialog", "close this dialog",
+  "close the new agent dialog", "close new agent",
+  "cancel", "cancel this", "cancel it", "never mind",
+  "dismiss", "dismiss this", "hide this", "get rid of this",
+]
 
 # PRD #802 M8 — the cost-of-a-row proof: the first command added after the
 # plumbing existed. It cost SEVEN files, five of them test-only and none of them
@@ -146,6 +327,9 @@ invoke      = "openSettings"
 screens     = ["deck"]
 unavailable_hint = "settings open from the deck"
 report      = "Opening settings."
+asks_to     = "open settings"
+try_saying  = "open settings"
+heard_as    = ["settings", "preferences", "options", "configuration", "api key"]
 
 # PRD #802 — the first row with NO `screens` key, which means callable
 # everywhere, and that is the requirement rather than an oversight: stopping
@@ -168,12 +352,16 @@ report      = "Opening settings."
 id          = "voice_off"
 description = """Turn voice control off — close the microphone and stop listening, so nothing
 further is heard until the Voice button is pressed again. Use for voice off, turn off the voice,
-turn voice off, stop listening, stop voice control, stop voice, or any request to stop LISTENING.
+turn voice off, stop listening, stop voice control, stop voice, mute, mic off, or any request to stop
+LISTENING.
 This stops the microphone and nothing else: it changes no screen, closes no view, and stops no
 agent."""
 invoke      = "stopVoice"
 unavailable_hint = "turning voice off works anywhere"
 report      = "Voice control off."
+asks_to     = "turn voice off"
+try_saying  = "voice off"
+heard_as    = ["voice", "listening", "microphone", "mic", "mute"]
 
 # PRD #802 D7 — discovery, and the second row with no `screens` key.
 #
@@ -192,11 +380,14 @@ report      = "Voice control off."
 id          = "list_commands"
 description = """List everything the user can say right now: an overlay naming every spoken
 command and what each one does. Use when the user asks what they can say, what commands there
-are, what you can do, how this works, for help, for the options, or for a list. This only shows
+are, "what can you do", how this works, for help, for the options, or for a list. This only shows
 the list — it runs none of the commands on it."""
 invoke      = "showVoiceCommands"
 unavailable_hint = "the list of commands opens anywhere"
 report      = "Here is what you can say."
+asks_to     = "list what you can say"
+try_saying  = "what can I say"
+heard_as    = ["say", "commands", "help", "options", "list", "what can", "how"]
 
 # PRD #802 D6, REBUILT — dictation without a mode, and the feature's own point
 # in the product owner's words: *"see what's going on in any of the agents and
@@ -252,6 +443,9 @@ invoke      = "dictateToAgent"
 screens     = ["agent"]
 unavailable_hint = "typing to an agent needs that agent's pane open — open one first"
 report      = "Typed: “{prefix}”."
+asks_to     = "type to the agent"
+try_saying  = "type run the tests"
+heard_as    = ["type", "write", "say", "dictate", "tell", "ask", "want", "prompt", "note"]
 
   [[commands.params]]
   name = "prefix"
@@ -274,6 +468,15 @@ report      = "Typed: “{prefix}”."
 # is unrecoverable — see the constant's own doc for the phrases that were
 # rejected and why.
 #
+# The MODEL's path is held to the same rule by `heard_as_whole` (PRD #1223,
+# closing audit G1). With `heard_as` a steered pick grounded on any occurrence
+# of one of these words — "tell it to enter the result", "tell it the build has
+# finished", "tell it to go ahead with the refactor" — and the surface presses
+# Enter at once. So the whole utterance must BE one of the entries below, less
+# an edge politeness word ("okay", "please", "now", …): "okay, send it please"
+# still submits, and a sentence that merely contains "send" is dictation or
+# nothing.
+#
 # `screens = ["agent"]` for `dictate_to_agent`'s reason: there is one prompt to
 # send only when there is one pane on screen.
 [[commands]]
@@ -284,5 +487,442 @@ prompt is finished. A bare "send", "submit", "enter" or "end" means this. It sen
 ALREADY there and types nothing new: a request to write something down is `dictate_to_agent`."""
 invoke      = "submitAgentPrompt"
 screens     = ["agent"]
-unavailable_hint = "sending a prompt needs an agent's pane open"
+unavailable_hint = "sending a prompt needs an agent's pane open — open one first"
 report      = "Sent."
+asks_to     = "send the agent's prompt"
+try_saying  = "send it"
+heard_as_whole = [
+  "send it", "send", "submit it", "submit", "press enter", "enter", "go ahead", "end",
+  "that is the end", "finished", "the prompt is finished",
+]
+
+# PRD #1223 — open the New agent dialog, and the first row with a `deck_ref`.
+#
+# It OPENS A DIALOG AND STARTS NOTHING: the dialog's Start — pressed, or said
+# as "start it" (`start_new_agent`) — is still the only thing that starts an
+# agent, with the form in front of the user. "close" dismisses it (U5).
+#
+# **A start-shaped request with the dialog CLOSED is this row** (PRD #1223,
+# D3). The user said "Start the new agent" with no dialog open and was told
+# "Not here — … say 'new agent' first": accurate and unhelpful, since both rows
+# answer "start" and only this one can run then. `schema`'s own instruction
+# already says an ambiguous request means the callable row; what broke it was
+# `start_new_agent`'s old "pick it whenever the user asks to start, however
+# urgently", written for when that row only opened a confirmation. With that
+# sentence gone and this description naming the case, "Start the new agent"
+# routes here. A bare "start it" still went to the start row in every measured
+# run, so `start_new_agent` also carries `unavailable_redirects = "open_new_agent"`
+# — see the comment above that row.
+#
+# **And the other way round: with the dialog OPEN this row cannot run**
+# (`requires = ["new_agent_dialog_closed"]`, PRD #1223). It used to be callable
+# there, and the overview does not serve it while the dialog is up — so when the
+# model read "Start agent", the dialog's own button, or "Start the new agent" as
+# this row, the user was told "That command is not wired to anything in this
+# build." Now such a pick is not callable, and `unavailable_redirects =
+# "start_new_agent"` hands it to the start when the start's OWN words ground
+# the utterance — a start word, which is what lets the start run without a
+# confirmation at all — and it carries no deck. "new agent" over an open dialog
+# has no start word and gets the hint instead; "start an agent on local" names a
+# deck and is not redirected, because starting the form would drop it.
+#
+# The `deck` param is OPTIONAL — the first one in the table. "new agent" alone
+# is a complete command (the dialog opens on its deck step, exactly as the top
+# bar's button opens it), and "new agent on the build box" preselects that deck,
+# which is what a deck group's own header button does. A deck that matches
+# nothing, or several, is dropped and the report says so ("No deck matches …, so
+# none is preselected."); one that resolves is preselected — whether or not the
+# user said it — and the report names it ("Preselected deck: Local deck."), so
+# a deck the model guessed is heard before anything starts on it. Only a deck
+# the dialog can preselect: one its deck step disables is never offered to the
+# model, and one the user names is answered with the step's reason instead
+# (`voice::VoiceDeckChoice`). With exactly one eligible deck the dialog
+# preselects it anyway, so voice dispatches it even for a bare "new agent" —
+# naming it only after a dropped deck's note or when a deck was referred to, so
+# "none is preselected" is said only when it is true and a single-deck user's
+# plain "new agent" hears nothing it already knows.
+#
+# `screens = ["overview"]`: the dialog lives on the overview, whose fleet its
+# deck step lists (`VoiceOverviewContext` in `voiceActions.ts`), and a row
+# exposes behaviour that already exists rather than adding a route of its own.
+[[commands]]
+id          = "open_new_agent"
+description = """Open the New agent dialog, where the user picks a deck, a directory and an agent to
+start. Use for new agent, start a new agent, create an agent, launch an agent, add an agent, spawn
+an agent, spin one up, or I want another agent. While the New agent dialog is NOT open, any
+request to start an agent — "start the new agent", "start it", "launch the agent", "start
+orchestration" — means THIS one, because the dialog has to be open before anything can start.
+When the user names the deck it
+should go on — "new agent on the build box", "start an agent on local" — set `deck` to the words
+they used for it; otherwise leave `deck` out. This only OPENS the dialog: it starts nothing. It is
+not `open_agent`, which shows an agent that already exists."""
+invoke      = "openNewAgent"
+screens     = ["overview"]
+requires    = ["new_agent_dialog_closed"]
+unavailable_hint = "the New agent dialog opens from the agent overview, when it is not already open"
+report      = "Opening the New agent dialog."
+asks_to     = "open the New agent dialog"
+try_saying  = "new agent"
+heard_as    = ["new", "create", "launch", "add", "spin", "spawn", "another", "start"]
+unavailable_redirects = "start_new_agent"
+
+  [[commands.params]]
+  name     = "deck"
+  kind     = "deck_ref"
+  optional = true
+
+# PRD #1223 — the directory browser by voice: the first rows that address a
+# control INSIDE a mounted dialog rather than app-level state.
+#
+# **Why a name resolves at all.** The daemon lists one level per request, so
+# there is no flat set of the deck's directories to match a spoken name against
+# — and the verb that would make one, a directory search, was declined (#819,
+# and again in this PRD) because it needs its own bounds, capability and threat
+# model. But at any moment the browser HAS a finite, visible set of named
+# children on screen, and "open dir billing" means the child called billing in
+# the level the user is looking at. That set is what a `dir_ref` resolves
+# against, exactly as `agent_ref` resolves against the live agent list. Each
+# utterance stays independent: the dialog holds the cursor and the resolver
+# needs no memory. **None of this can find a directory anywhere else on the
+# deck** — that is still the declined search verb, and it stays declined.
+#
+# **Availability is the `requires` column, not `screens`**, because a dialog is
+# not a `DeckView`. The webview declares what the browser shows with each
+# utterance (`VoiceDirectories`); with no declaration — dialog closed, no deck
+# chosen, no listing yet, a start in flight — every row below is `callable:
+# false` and a pick of one renders the hint rather than dispatching into a
+# closed dialog.
+#
+# **None of these starts anything**, so none is in PRD #802 D5's confirmation
+# set: navigating a listing and choosing a directory change what the FORM will
+# say, and the dialog's own Start is still the only thing that starts an agent.
+# The manual paths — the `..` row, `h`/Left/Backspace, Enter/`l`/Right, Space,
+# the filter, `q` — are untouched; each row calls the function its key calls.
+[[commands]]
+id          = "open_dir"
+description = """In the New agent dialog's directory browser, open one of the directories listed
+on screen — go down into it. Use for open dir billing, open the billing folder, go into src, enter
+docs, cd into api — and when the user NAMES a listed directory with select, choose, pick, go to or
+navigate: select directory billing, choose the api folder, pick src, go to docs, navigate to tests.
+Set `dir` to the words the user used for the directory; it must be one of
+`directories.entries`, the directories on screen right now. This only moves the browser: it
+starts nothing and does not choose the directory for the agent (that is `use_this_directory`).
+A request to open a directory is THIS one even when `directories` is absent — the dialog is closed
+or has no listing yet — and the action is then `callable: false`: pick it anyway rather than
+`none`, and the app says how to get to a listing. Not for going up (`go_to_parent`), and never for
+an agent or a deck."""
+invoke      = "openDirectory"
+screens     = ["overview"]
+requires    = ["directory_listing"]
+unavailable_hint = "opening a directory needs the New agent dialog's directory listing; say “new agent” and choose a deck first"
+report      = "Opening {dir}."
+asks_to     = "open a directory"
+try_saying  = "open {dir}"
+heard_as    = [
+  "open", "into", "enter", "cd", "go down",
+  "select", "choose", "pick", "go to", "navigate",
+]
+
+  [[commands.params]]
+  name = "dir"
+  kind = "dir_ref"
+
+[[commands]]
+id          = "go_to_parent"
+description = """In the New agent dialog's directory browser, go up one level to the parent
+directory — the `..` row. Use for go to parent, go to the parent dir, go up, up one level, one
+level up, parent directory, or cd dot dot. It moves the browser only and starts nothing."""
+invoke      = "goToParentDirectory"
+screens     = ["overview"]
+requires    = ["parent_directory"]
+unavailable_hint = "going up needs the New agent dialog showing a directory below the top; choose a deck and open a directory first"
+report      = "Going up."
+asks_to     = "go up a directory"
+try_saying  = "go up"
+heard_as    = ["parent", "up", "dot dot"]
+
+[[commands]]
+id          = "use_this_directory"
+description = """In the New agent dialog's directory browser, choose the directory on screen as the
+one the new agent starts in, which unlocks the rest of the form. Use for use this directory, use
+this folder, pick this one, choose this directory, this is the one, that one, select this directory,
+this directory, or this folder. It is the directory the browser is IN; a directory named
+from the listing ("select directory billing") is `open_dir`. It chooses the directory and starts
+nothing — the user still presses Start."""
+invoke      = "useThisDirectory"
+screens     = ["overview"]
+requires    = ["directory_listing"]
+unavailable_hint = "choosing a directory needs the New agent dialog's directory listing; say “new agent” and choose a deck first"
+report      = "Using this directory."
+asks_to     = "use this directory"
+try_saying  = "use this directory"
+heard_as    = [
+  "use", "pick", "choose", "select", "this is the one", "this one", "that one",
+  "this directory", "this folder",
+]
+
+# PRD #1223 — the rest of the New agent form by voice: Mode, the agent's
+# command, and Name.
+#
+# **Each resolves against what the form OFFERS, as the dialog declared it**
+# (`VoiceNewAgentForm`), never against a list this table knows. The Mode row
+# varies by the deck's capabilities (the authoring chips need `authoring-kind`,
+# orchestration chips need `prepare-workflow`), the deck's experimental flag
+# (`schedule: issues`) and whether the directory is a project; the agents are
+# the deck's own registry, or the desktop's fallback copy. So "mode
+# schedule issues" on a deck whose flag is off is refused as a chip that is not
+# offered — the same `ParamUnresolved` a directory not on screen gets — rather
+# than resolved against a chip nobody can see.
+#
+# **Availability is `requires = ["new_agent_form"]`**: the fields are live only
+# with a deck and a directory chosen, no start in flight and no start
+# confirmation open — exactly when a click on them would take. `choose_mode` and
+# `name_new_agent` call the function their control calls (`selectMode`, the
+# Name input's own setter), so a spoken Name counts as an edit exactly as a
+# typed one. `choose_agent_type` has had no control of its own since the Agent
+# picker was removed from both clients (PRD #1223): it sets Command to the named
+# agent's `default_command`, overwriting what is there.
+#
+# **Command has NO row, deliberately.** It is the one field that executes: what
+# is in it runs as the deck's user in the chosen directory. Dictating a shell
+# command is the most error-prone thing a transcriber can be asked to do —
+# flags, quotes, paths and punctuation are precisely what it normalises away —
+# and a mis-dictated command is the one mistake in this dialog with
+# consequences beyond the form. `choose_agent_type` fills it with an agent's
+# REGISTRY default — a value the deck supplied, never a transcription — which
+# covers the common case, and anything else is typed by hand. All three form
+# rows' descriptions say so, so "set the command to …" is not coerced into a
+# dictation.
+#
+# **None of these starts anything**, so none is in PRD #802 D5's set: they
+# change what the form will say, and a start is still a separate act
+# (`start_new_agent`, below, and the dialog's own Start).
+#
+# **`choose_mode` chooses a NAMED chip, never the category** (PRD #1223). Its
+# `heard_as` keeps `orchestration`, because "use the billing orchestration" is
+# how people name a chip, but its description now says the bare word names no
+# chip and that "Start orchestration" — the Start button's label once an
+# orchestration is chosen — is `start_new_agent`. Each chip's own label, said as
+# it reads ("No mode", "Orch billing run", "schedule", "dispatcher"), is in the
+# description too, for the label rule.
+[[commands]]
+id          = "choose_mode"
+description = """In the New agent form, choose one of the Mode chips it offers, BY NAME: No mode (a
+plain agent), one NAMED orchestration (`Orch: <name>`), schedule, schedule: issues, or dispatcher.
+Use for mode schedule, make it a dispatcher, use the billing orchestration, orchestration build,
+orch billing, plain agent, no mode — and for a chip's label read aloud as it is written: "No mode",
+"Orch billing", "schedule", "schedule issues", "dispatcher". Set `mode` to the words the user used
+for the chip, copied as they said them — even when they name a chip that is NOT in
+`new_agent_form.modes`: the app then says that chip is not offered, so never answer with the
+nearest chip instead. The bare word "orchestration" names NO chip: an orchestration chip is chosen
+by its name. "Start orchestration", "start the orchestration" and "start the run" are the Start
+button's words and mean `start_new_agent` — they never choose a chip. This only changes the Mode
+field: it starts nothing. Never for the command line, which is typed by hand."""
+invoke      = "chooseNewAgentMode"
+screens     = ["overview"]
+requires    = ["new_agent_form"]
+unavailable_hint = "choosing a mode needs a deck and a directory chosen in the New agent dialog; choose those first"
+report      = "Mode: {mode}."
+asks_to     = "choose a mode"
+try_saying  = "mode {mode}"
+heard_as    = ["mode", "schedule", "dispatcher", "orchestration", "orch", "plain", "make it", "use", "choose", "set"]
+
+  [[commands.params]]
+  name = "mode"
+  kind = "mode_ref"
+
+[[commands]]
+id          = "choose_agent_type"
+description = """In the New agent form, choose which agent to start — Claude Code, OpenCode, Pi or
+Codex — by filling the Command field with that agent's default command. Use for use claude, pick
+opencode, agent codex, make it a pi agent, set the agent to claude. Set `agent_type` to the words
+the user used, copied as they said them — even when they name one that is NOT in
+`new_agent_form.agent_types`: the app then says it is not offered, so never answer with the
+nearest entry instead. This is a KIND of agent for the new one, never an existing agent (that is
+`open_agent`), and it starts nothing. It only ever puts an agent's own default command in the
+field: any other command line is typed by hand."""
+invoke      = "chooseNewAgentType"
+screens     = ["overview"]
+requires    = ["new_agent_form"]
+unavailable_hint = "choosing an agent needs a deck and a directory chosen in the New agent dialog; choose those first"
+report      = "Command set to {agent_type}'s default command."
+asks_to     = "choose an agent"
+try_saying  = "use {agent_type}"
+heard_as    = ["agent", "use", "pick", "choose", "make it", "set", "claude", "opencode", "pi", "codex"]
+
+  [[commands.params]]
+  name = "agent_type"
+  kind = "agent_type_ref"
+
+# The `spoken_prefix` kind, reused rather than a new free-text kind: the model
+# marks where the introducing words end ("name it", "call it") and the app takes
+# the name from its own transcript after them — the dictation row's fidelity
+# rule, for the same reason. The dialog trims the trailing full stop a
+# transcriber adds to a sentence; nothing else about the words is changed.
+#
+# The report names no value on purpose: the field itself is on screen beside it,
+# and a sentence repeating the transcript would disagree with the field by
+# exactly that trimmed full stop.
+[[commands]]
+id          = "name_new_agent"
+description = """In the New agent form, set the Name field to what the user says. Use for name it
+billing worker, call it the api reviewer, set the name to docs bot. Answer with `prefix` set to
+the exact introducing words and NOTHING else — "name it", "call it", "set the name to" — copied
+from the user's own sentence; the app takes the name from the words after them. Never answer with
+the name itself. Only the Name field: never the command line, which is typed by hand, and it
+starts nothing."""
+invoke      = "nameNewAgent"
+screens     = ["overview"]
+requires    = ["new_agent_form"]
+unavailable_hint = "naming the new agent needs a deck and a directory chosen in the New agent dialog; choose those first"
+report      = "Name set."
+asks_to     = "name the new agent"
+try_saying  = "name it docs bot"
+heard_as    = ["name", "call"]
+
+  [[commands.params]]
+  name = "prefix"
+  kind = "spoken_prefix"
+
+# PRD #1223 x PRD #802 D5 — the row that STARTS something.
+#
+# **It starts at once, and that is D5 REVISITED, not ignored** (2026-09-23). As
+# first shipped, this row opened a `ConfirmDialog` restating the form, and the
+# user's verdict was: "it shows another popup asking me to confirm. I think that
+# only introduced friction by me having to give the same instruction twice." The
+# confirmation was dropped for the START only, for three reasons recorded in PRD
+# #802's D5 and in `docs/develop/voice-first-design.md`:
+#
+# - **action grounding** now requires the transcript to contain a start word, so
+#   a hostile label can no longer steer the model into starting something while
+#   the user said something else — the injection risk D5 was written against is
+#   closed at a different layer;
+# - the confirmation **re-stated what is already on screen** — deck, directory,
+#   mode and command are all visible in the dialog the user is looking at;
+# - a mistaken agent is now **one "close" away**, which was not true when D5 was
+#   written.
+#
+# The two stops keep theirs (below): they are destructive, their target may be
+# OFF-SCREEN — there is no form to read — and an orchestration close takes
+# several roles at once. That asymmetry is the point.
+#
+# **`unavailable_redirects`: a start with the dialog CLOSED opens it** (D3). The
+# descriptions carry this too, and for "start the new agent" they are enough —
+# the model answers `open_new_agent` — but a bare "start it" was answered with
+# this row in every measured run, including one whose description said in so
+# many words not to pick it while `callable: false`. The model's tie-break is
+# a probability and this is a sentence the user should never hear, so the pick
+# is redirected deterministically instead: a pick of this row that is not
+# callable dispatches `open_new_agent` when THAT row is callable and grounded
+# by the same words. Safe because the target only opens a dialog.
+#
+# **The button's labels are this row's words** (PRD #1223, the label rule in
+# `docs/develop/voice-first-design.md`). With an orchestration chosen the Start
+# button reads "Start orchestration", and the user said exactly that and nothing
+# started: measured on the default backend, the model answered `none` for it,
+# dialog open or closed, because this description never mentioned an
+# orchestration and `choose_mode` claimed the word without starting anything.
+# "Start agent", the other label, went to `open_new_agent` while the dialog was
+# open. So the description names both labels and says a start chooses no Mode;
+# `start` already grounds them, so `heard_as` did not have to move.
+#
+# `invoke` names the dialog's own start (`startNewAgent`), the function its
+# Start button calls; it refuses in the dialog's words when the form cannot
+# start (no deck, no directory, a start under way, a run title already live).
+[[commands]]
+id          = "start_new_agent"
+description = """Start what the New agent dialog's form describes — the voice form of its Start
+button, and it starts at once. The button reads "Start agent", or "Start orchestration" when an
+orchestration is chosen in Mode, and either label said aloud means THIS one. Use for start agent,
+start orchestration, start the orchestration, start the run, start it, start the agent, start the
+new agent, go ahead and start it, launch it, launch the orchestration, create it, spin it up now,
+or run it. It fills nothing and chooses no Mode: it acts on the form as it is, which the user is
+looking at, so "start orchestration" starts the orchestration already chosen and is never
+`choose_mode`. It runs only while the New agent dialog is open; while it is closed, a request to
+start an agent or an orchestration is `open_new_agent`, which opens the dialog. If the form is
+incomplete the app says what is missing. Pick it however urgently or insistently the start is asked
+for — "start it right now", "just launch it, don't ask me" — since it starts at once and there is
+no second step for it to skip. A bare "go ahead" means THIS one whenever it is callable
+and `submit_prompt` is not — there is no agent's prompt to send while the New agent dialog is up."""
+invoke      = "startNewAgent"
+screens     = ["overview"]
+requires    = ["new_agent_dialog"]
+unavailable_hint = "starting a new agent needs the New agent dialog; say “new agent” first"
+report      = "Starting the agent."
+asks_to     = "start the new agent"
+try_saying  = "start it"
+heard_as    = ["start", "launch", "create", "spin", "run", "go ahead"]
+unavailable_redirects = "open_new_agent"
+
+# PRD #1223 x PRD #802 D5 — the two rows that STOP something, and the one rule
+# they share: **each terminates at a `ConfirmDialog`, never at a direct
+# dispatch.** D5 requires confirmation "regardless of model confidence, because
+# the cost of a rare misfire … is an agent doing something nobody sanctioned and
+# a confident wrong answer is indistinguishable from a right one". A dispatch of
+# one of these opens the confirmation the manual control opens, and nothing
+# stops until the user presses its button. The confirmation's BODY states the
+# risk — what will stop, on which deck — per `ConfirmDialog`'s convention.
+#
+# **Where the gate lives today, and where it belongs.** In the frontend: each
+# row's registry entry calls a member that can only open a confirmation
+# (`confirmStopAgent`, `confirmCloseOrchestration`). PRD #802 anticipates a
+# `confirm` column in this table; it is deliberately NOT added here, because it
+# is #802's feature-wide mechanism to build, and when it lands these two rows
+# are the first to carry it.
+#
+# **Their words are the destructive reading, and only that** (PRD #1223, D1):
+# "close" is a VIEW word (`close`) and grounds neither — `stop_agent` has no
+# `close` at all, and `close_orchestration` needs the orchestration or the run
+# named beside its verb (`heard_as_also`).
+#
+# Each `report` says that nothing has happened yet, because nothing has: the
+# report describes the dispatch, and the dispatch only asked.
+[[commands]]
+id          = "stop_agent"
+description = """Stop one running agent on the agent overview — the voice form of its row's Stop
+button, whose accessible name is "Stop <name> agent". Use for stop tester agent, stop the tester,
+stop the agent, kill the reviewer, kill it, shut down the coder,
+shut it down, end that agent, terminate the one that is stuck. Set `agent` the way `open_agent`
+does. It never stops anything by itself: the app shows the same confirmation the Stop button shows
+and the user confirms by hand, so pick it whenever the user asks to stop an agent, however
+urgently. It needs a word that can only mean stopping: "close" is NOT one — "close the agent" and
+"close the tester" close the VIEW (`close`) and stop nothing. Ending a whole orchestration is
+`close_orchestration`. Never for isolating or hiding — "get rid of everything except the tester"
+means SHOW the tester (`open_agent`) and stops nothing."""
+invoke      = "confirmStopAgent"
+screens     = ["overview"]
+unavailable_hint = "stopping an agent works from the agent overview"
+report      = "Confirm stopping {agent} — nothing has been stopped yet."
+asks_to     = "stop an agent"
+try_saying  = "stop {agent}"
+heard_as    = ["stop", "kill", "shut down", "shut it down", "end", "terminate"]
+
+  [[commands.params]]
+  name = "agent"
+  kind = "agent_ref"
+
+[[commands]]
+id          = "close_orchestration"
+description = """Close a whole orchestration on the agent overview, stopping every one of its roles —
+the voice form of its card's Close button, whose accessible name is "Close <title> orchestration".
+The button's visible word is a bare "Close", and a bare "close" is NOT this row: it is `close`,
+which closes a view and stops nothing. Use for close the review orchestration, stop the
+billing run, shut down the whole orchestration, end every role of it, stop all roles, stop all the
+roles. Set `orchestration` to the words the user used for it; it must be one of `orchestrations`.
+The user must NAME the orchestration or the run — "close the agent" or "close the billing agent"
+is `close`, which closes a view and stops nothing. It never stops anything by itself: the app shows
+the same confirmation the Close button shows, naming every role it will stop, and the user
+confirms by hand. One agent is `stop_agent`. Never for isolating or hiding — "get rid of everything
+except the tester" means SHOW the tester (`open_agent`) and stops nothing."""
+invoke      = "confirmCloseOrchestration"
+screens     = ["overview"]
+unavailable_hint = "closing an orchestration works from the agent overview"
+report      = "Confirm closing {orchestration} — nothing has been stopped yet."
+asks_to     = "close an orchestration"
+try_saying  = "close the {orchestration} orchestration"
+heard_as    = ["close", "stop", "shut down", "end"]
+heard_as_also = ["orchestration", "run", "every role", "all roles", "all the roles"]
+
+  [[commands.params]]
+  name = "orchestration"
+  kind = "orchestration_ref"

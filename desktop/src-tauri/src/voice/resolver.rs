@@ -20,8 +20,8 @@ use std::pin::Pin;
 
 use serde::{Deserialize, Serialize};
 
-use super::Transcript;
 use super::schema::AnnotatedCommand;
+use super::{Transcript, VoiceDeck, VoiceDirectories, VoiceNewAgent};
 use crate::dto::DesktopAgent;
 
 /// Everything a backend is given for one utterance.
@@ -36,6 +36,22 @@ pub struct IntentRequest<'a> {
     /// reference like "the tester". Read-only here; a backend names an agent
     /// the way the user did and the app resolves it.
     pub agents: &'a [DesktopAgent],
+    /// The decks the app observes, for resolving a spoken deck reference like
+    /// "the build box" (PRD #1223). The whole observed fleet, not only the
+    /// selected deck — naming a deck other than the one on screen is what a
+    /// deck reference is for. Read-only here for `agents`' reason.
+    pub decks: &'a [VoiceDeck],
+    /// What the New agent dialog's directory browser is showing, when it is
+    /// showing a listing (PRD #1223) — the set a spoken `dir_ref` like
+    /// "billing" resolves against. `None` whenever there is nothing on screen
+    /// to name; see [`VoiceDirectories`] for why this one piece is declared by
+    /// the webview rather than read Rust-side.
+    pub directories: Option<&'a VoiceDirectories>,
+    /// What the New agent dialog shows besides its browser, while it is open
+    /// (PRD #1223) — the Mode chips and agent entries a spoken
+    /// `mode_ref` or `agent_type_ref` resolves against. `None` while the
+    /// dialog is closed; see [`VoiceNewAgent`].
+    pub new_agent: Option<&'a VoiceNewAgent>,
 }
 
 /// What a backend answers with: an action id and the params as the user
@@ -292,6 +308,9 @@ mod tests {
             transcript,
             commands,
             agents: &[],
+            decks: &[],
+            directories: None,
+            new_agent: None,
         }
     }
 

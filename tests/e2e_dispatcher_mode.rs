@@ -24,7 +24,7 @@ use dot_agent_deck::event::SendResult;
 use dot_agent_deck::state::{DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS, SessionStatus};
 use spec::spec;
 
-/// The opening words of `ui::DISPATCHER_SEED_PROMPT` (private to `src/ui.rs`).
+/// The opening words of `authoring_seeds::DISPATCHER_SEED_PROMPT`.
 /// Distinctive enough that an unseeded agent cannot produce it, and near enough
 /// the front of the seed to survive the hook's `USER_PROMPT_MAX_LEN` truncation.
 const DISPATCHER_SEED_OPENING: &str = "You are an ordinary assistant";
