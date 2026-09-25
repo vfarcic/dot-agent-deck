@@ -340,13 +340,17 @@ export type CleanupWarning = {
  * Arabic and Indic orthography — so a role named only of them rendered as an
  * empty list item, which is a blank line where the reader most needs a name.
  */
-export function cleanupWarning(unconfirmedStops: readonly string[]): CleanupWarning {
+// `deck`, when given, is an already-sanitised deck label (`deckName`).
+export function cleanupWarning(unconfirmedStops: readonly string[], deck?: string): CleanupWarning {
   const count = unconfirmedStops.length;
   const subject = count === 1 ? "1 role" : `${count} roles`;
   const it = count === 1 ? "it" : "them";
   const stops = count === 1 ? "its stop" : "their stops";
+  // Issue #1234: a warning that outlives its screen names the deck it is about,
+  // because "this deck" then reads as whichever deck is selected when it is seen.
+  const where = deck === undefined ? "this deck" : deck;
   return {
-    summary: displayText(`${subject} may still be running on this deck: ${stops} could not be confirmed. Check the deck and stop ${it} there.`, DISPLAY_LIMITS.message),
+    summary: displayText(`${subject} may still be running on ${where}: ${stops} could not be confirmed. Check the deck and stop ${it} there.`, DISPLAY_LIMITS.message),
     names: unconfirmedStops.slice(0, CLEANUP_WARNING_MAX_NAMES).map((role) => displayIdentity(role, DISPLAY_LIMITS.name, UNNAMED_CLEANUP_ROLE)),
     overflow: Math.max(0, count - CLEANUP_WARNING_MAX_NAMES),
   };

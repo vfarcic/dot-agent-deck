@@ -14,7 +14,7 @@ Three production lines in `desktop/src-tauri/src/lib.rs` do it — `:16` (the `l
 
 **Workflow launch is the only desktop feature that resolves a project config from a filesystem.** The project the header displays (`desktop/src/lib/bridge.ts:359-363`, a four-way `cwd` fallback) and the project list the launcher offers (`desktop/src/hooks/useProjects.ts`) are the only other project-aware surfaces, and this PRD addresses both. Everything else the app shows — agent list, PTY streams, status, hook events — already comes from the daemon. So the surface is one code path plus two identity sources, not the nine milestones PRD #76's rejected Phase 6 faced, and every feature added before this lands arrives as one more branch to port.
 
-Two PRDs already deferred this work outward (`prds/176-desktop-gui.md:85` and #741) and **the tracker both of them deferred to was never created**, which is why #741's critical path read as murky: its long pole was not in the backlog. This PRD is that tracker.
+Two PRDs already deferred this work outward (`prds/done/176-desktop-gui.md:85` and #741) and **the tracker both of them deferred to was never created**, which is why #741's critical path read as murky: its long pole was not in the backlog. This PRD is that tracker.
 
 ## The governing principle
 

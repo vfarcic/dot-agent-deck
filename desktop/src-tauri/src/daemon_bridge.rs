@@ -1164,10 +1164,16 @@ async fn establish(
 /// [`crate::dto::DeckScope`] instead and hand its endpoint to
 /// [`DaemonLinks::trusted`] directly. `DesktopAction::StopAgent` is the site
 /// that proved the distinction matters; see `crate::stop_agent_action`.
+///
+/// **Refused under All Decks** (#1083), before any deck is contacted. Every
+/// caller acts on one deck — the project listing and resolve, the Runs
+/// screen's workflow launch, rename, submitted text — and All Decks resolves
+/// the selection to the local deck only because the plumbing needs an
+/// endpoint. Taking that as the target would launch on this machine's deck
+/// because the user chose every deck; see [`crate::dto::DeckScope::one_selected`].
 pub(crate) async fn trusted_daemon(links: &DaemonLinks) -> Result<Arc<TrustedDaemon>, String> {
-    links
-        .trusted(crate::dto::DeckScope::selected().endpoint())
-        .await
+    let scope = crate::dto::DeckScope::one_selected()?;
+    links.trusted(scope.endpoint()).await
 }
 
 /// The selected deck's snapshot. Same caveat as [`trusted_daemon`]: this is a
@@ -1228,6 +1234,7 @@ pub(crate) async fn snapshot_with(
             fleet: observed_fleet(),
             unconfigured: unconfigured_fleet(),
             observed: observed_fleet_decks(),
+            all_decks: crate::dto::all_decks_applied(),
         };
     }
 
@@ -1312,6 +1319,7 @@ fn connected_snapshot(
         fleet: observed_fleet(),
         unconfigured: unconfigured_fleet(),
         observed: observed_fleet_decks(),
+        all_decks: crate::dto::all_decks_applied(),
     }
 }
 
@@ -4832,6 +4840,113 @@ mod tests {
             on_remote.is_empty(),
             "and nothing was retargeted to the departed deck: {on_remote:?}"
         );
+    }
+
+    /// A Runs-screen launch request that passes every shape check, so the
+    /// first thing it can fail on is reaching a deck.
+    #[cfg(unix)]
+    fn runs_launch(cwd: &std::path::Path) -> crate::StartWorkflowRequest {
+        crate::StartWorkflowRequest {
+            name: "review".into(),
+            cwd: cwd.to_string_lossy().into_owned(),
+            task_prompt: "list the files".into(),
+            roles: vec![crate::dto::WorkflowRoleInput {
+                role: "orchestrator".into(),
+                command: "cat".into(),
+                start: true,
+            }],
+            rows: Some(24),
+            cols: Some(80),
+            config_revision: None,
+        }
+    }
+
+    /// Scenario (#1083): the local deck is a real daemon running one agent,
+    /// and **All Decks** is selected. A Runs-screen workflow launch is refused
+    /// with the "Select a deck" sentence, and so is the selected-deck link the
+    /// project listing and resolve use; the app performs no handshake and holds
+    /// no link, and the local deck's registry is exactly what it was. The
+    /// selected-deck snapshot it is still sent is marked `all_decks`. As a
+    /// control, the same launch with the local deck selected does reach that
+    /// daemon, which is what makes "no handshake" mean something, and its
+    /// snapshot is not marked.
+    ///
+    /// **What it fails against.** `trusted_daemon` resolving the selection
+    /// through `DeckScope::selected()`, where All Decks is the local deck: the
+    /// launch handshook with `local` and asked it to prepare, and the refusal
+    /// it came back with was the daemon's, not this one.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_runs_launch_under_all_decks_never_reaches_the_local_deck() {
+        let _selection = crate::dto::SELECTION_LOCK.lock().await;
+        let local = RealDeck::start("1083-all-local");
+        let local_agent = local.spawn_agent("pane-local");
+        let (settings, _remote) = all_decks_with_one_remote_row("build-box.example.com");
+        apply_all_decks_over(&local, &settings);
+        let state = crate::terminal::DesktopState::default();
+
+        let launched = crate::start_workflow_action(&state, runs_launch(&local.dir)).await;
+        let linked = trusted_daemon(&state.daemon).await.map(|_| ());
+        let handshakes_under_all = state.daemon.handshake_count();
+        let held_under_all = state.daemon.held().await;
+        let on_local = named_records(&local);
+        // Taken after the counts above, since a snapshot does contact the deck.
+        let snapshot_under_all = get_snapshot(&state.daemon).await;
+
+        let mut only_local = settings.clone();
+        only_local
+            .endpoints
+            .as_mut()
+            .expect("built with an [endpoints] section")
+            .selection = crate::settings::Selection::Local;
+        crate::dto::apply_settings_selection(&only_local);
+        let control = crate::start_workflow_action(&state, runs_launch(&local.dir)).await;
+        let handshakes_under_local = state.daemon.handshake_count();
+        let snapshot_under_local = get_snapshot(&state.daemon).await;
+        local.shutdown();
+
+        let Err(refused) = launched else {
+            panic!("a launch under All Decks is refused");
+        };
+        let refused = refused.message().to_string();
+        assert_eq!(refused, crate::dto::ALL_DECKS_NEEDS_ONE_DECK);
+        assert_eq!(
+            linked,
+            Err(crate::dto::ALL_DECKS_NEEDS_ONE_DECK.to_string()),
+            "the selected-deck link the project listing uses is refused too"
+        );
+        assert_eq!(
+            handshakes_under_all, 0,
+            "no deck was contacted under All Decks"
+        );
+        assert_eq!(held_under_all, 0, "and no link is held for one");
+        assert_eq!(
+            on_local,
+            vec![(local_agent, None)],
+            "the local deck — the one All Decks resolves to — gains nothing"
+        );
+        let Err(control) = control else {
+            panic!("the scratch dir is not a project, so the control launch is refused");
+        };
+        let control = control.message().to_string();
+        assert_ne!(
+            control,
+            crate::dto::ALL_DECKS_NEEDS_ONE_DECK,
+            "with the local deck selected the refusal is the deck's own"
+        );
+        assert!(
+            handshakes_under_local > 0,
+            "control: with the local deck selected the same launch reaches it"
+        );
+        assert!(
+            snapshot_under_all.all_decks,
+            "the local deck's snapshot under All Decks says so, so the webview does not render it"
+        );
+        assert_eq!(
+            snapshot_under_all.connection.status,
+            ConnectionStatus::Connected
+        );
+        assert!(!snapshot_under_local.all_decks);
     }
 
     /// The ids a real registry still lists as live.

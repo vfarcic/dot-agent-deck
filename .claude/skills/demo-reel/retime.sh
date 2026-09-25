@@ -49,9 +49,24 @@
 # slack under the duration budget above.
 #
 # Usage:
-#   retime.sh [INPUT.cast] [--out OUT.cast]
+#   retime.sh [INPUT.cast] [--out OUT.cast] [--trailing | --cut-tail]
 #     INPUT.cast   path to read (default: stdin)
 #     --out PATH   path to write the retimed cast (default: stdout)
+#     --trailing   instead of re-timing, print the seconds between the cast's
+#                  LAST VISIBLE CHANGE and its end — how long the final state is
+#                  already on screen before the renderer's last-frame hold
+#                  begins. The engine runs this on the RETIMED cast to size that
+#                  hold (reel.sh CLIP_FINAL_DWELL). A visible change is any event
+#                  that is not "inert" (see JQ_DEFS): stricter than the tick
+#                  class, so a control-only erase or scroll counts as a change.
+#     --cut-tail   instead of re-timing, move every event after the last visible
+#                  change onto that change's timestamp, so the tail takes no time
+#                  but its cursor/attribute state still lands in the final frame.
+#                  The engine renders this and re-adds the tail as part of agg's
+#                  last-frame hold: agg only emits a frame when the image changes,
+#                  so a tail of ticks that change nothing never reaches the screen,
+#                  and whether one does depends on the cursor, which only a
+#                  terminal emulator can tell.
 #
 # Tunables (env-overridable, like the engine's CLIP_SPEED — all in SECONDS except
 # SIZE_THRESHOLD, which is in BYTES, and MAX_STRETCH, which is a ratio):
@@ -85,18 +100,85 @@ usage_error() { echo "$SCRIPT_NAME: error: $*" >&2; exit 2; }
 
 IN=""
 OUT=""
+TRAILING=0
+CUT_TAIL=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --out)   [[ $# -ge 2 ]] || usage_error "--out requires a path argument"; OUT="$2"; shift 2 ;;
     --out=*) OUT="${1#*=}"; shift ;;
-    -h|--help) echo "Usage: $SCRIPT_NAME [INPUT.cast] [--out OUT.cast]"; exit 0 ;;
+    --trailing) TRAILING=1; shift ;;
+    --cut-tail) CUT_TAIL=1; shift ;;
+    -h|--help) echo "Usage: $SCRIPT_NAME [INPUT.cast] [--out OUT.cast] [--trailing | --cut-tail]"; exit 0 ;;
     --) shift; break ;;
     -*) usage_error "unknown option: $1" ;;
     *)  [[ -z "$IN" ]] || usage_error "unexpected extra argument: $1"; IN="$1"; shift ;;
   esac
 done
 
+[[ "$TRAILING" -eq 0 || "$CUT_TAIL" -eq 0 ]] || usage_error "--trailing and --cut-tail are mutually exclusive"
+
 command -v jq >/dev/null 2>&1 || { echo "$SCRIPT_NAME: error: jq is required but not on PATH" >&2; exit 1; }
+
+# The event classifier used by the re-timing program, plus the stricter "inert"
+# predicate --trailing and --cut-tail use. Needs --arg e/b (ESC/BEL, below).
+JQ_DEFS='
+  # Everything the payload actually PRINTS, with terminal control sequences
+  # removed: OSC first (it swallows a text argument of its own), then CSI, then
+  # any other two-character ESC sequence. What survives is real screen content.
+  def printed:
+      gsub("\($e)\\][^\($b)\($e)]*(\($b)|\($e)\\\\)?"; "")
+    | gsub("\($e)\\[[0-9;:?<>=!]*[ -/]*[@-~]"; "")
+    | gsub("\($e)."; "");
+  # A payload "prints" iff something visible (not whitespace, not a control
+  # character) survives that stripping. A keystroke does; a render-loop tail of
+  # SGR-reset + show-cursor + cursor-position does not.
+  def prints: printed | test("[^[:space:][:cntrl:]]");
+  # op / type / tick, as described in the header.
+  def kind($st): if (.data | utf8bytelength) > $st then "op" elif (.data | prints) then "type" else "tick" end;
+  # A payload that cannot change what is on screen: nothing but SGR attributes
+  # (which only affect LATER writes), cursor show/hide, and cursor positioning or
+  # movement — the render-loop tail. Narrower than "tick" on purpose: a tick is
+  # anything that prints no characters, which includes erase, scroll and newline,
+  # and those do change the screen.
+  def inert:
+      gsub("\($e)\\[[0-9;:]*m"; "")
+    | gsub("\($e)\\[\\?25[hl]"; "")
+    | gsub("\($e)\\[[0-9;]*[HfABCDGd]"; "")
+    | . == "";
+'
+
+if [[ "$TRAILING" -eq 1 ]]; then
+  # Seconds from the last event that is not inert to the last event. A cast with
+  # no visible change at all reports the timestamp of its last event; an empty
+  # cast reports 0.
+  jq -sr \
+    --arg e "$(printf '\033')" \
+    --arg b "$(printf '\007')" "$JQ_DEFS"'
+    (.[1:] | map({t: .[0], data: .[2]})) as $evs
+    | (if ($evs | length) == 0 then 0 else $evs[-1].t end) as $end
+    | ([ $evs[] | select(.data | inert | not) | .t ] | last // 0) as $visible
+    | $end - $visible
+  ' "${IN:-/dev/stdin}" > "${OUT:-/dev/stdout}"
+  exit 0
+fi
+
+if [[ "$CUT_TAIL" -eq 1 ]]; then
+  # The complement of --trailing: every event after the last visible change is
+  # re-stamped to that change's time (0 when nothing is visible, matching
+  # --trailing reporting the whole timeline as tail). Payloads and order are
+  # untouched, so the rendered final frame is the same image.
+  jq -sc \
+    --arg e "$(printf '\033')" \
+    --arg b "$(printf '\007')" "$JQ_DEFS"'
+    .[0] as $header
+    | .[1:] as $evs
+    | ([ range(0; ($evs | length)) | select($evs[.][2] | inert | not) ] | last) as $iv
+    | (if $iv == null then 0 else $evs[$iv][0] end) as $tv
+    | $header,
+      ($evs | to_entries[] | if ($iv == null or .key > $iv) then (.value | .[0] = $tv) else .value end)
+  ' "${IN:-/dev/stdin}" > "${OUT:-/dev/stdout}"
+  exit 0
+fi
 
 # Read the whole cast (small — KB-scale e2e recordings). The cast is a SEQUENCE of
 # JSON values: a header object on line 1, then one "[t, code, data]" array per
@@ -132,22 +214,10 @@ jq -sc \
   --argjson ic "$IDLE_CAP" \
   --argjson ms "$MAX_STRETCH" \
   --argjson mb "$MIN_BUDGET" \
-  --argjson cg "$COALESCE_GAP" '
-  # Everything the payload actually PRINTS, with terminal control sequences
-  # removed: OSC first (it swallows a text argument of its own), then CSI, then
-  # any other two-character ESC sequence. What survives is real screen content.
-  def printed:
-      gsub("\($e)\\][^\($b)\($e)]*(\($b)|\($e)\\\\)?"; "")
-    | gsub("\($e)\\[[0-9;:?<>=!]*[ -/]*[@-~]"; "")
-    | gsub("\($e)."; "");
-  # A payload "prints" iff something visible (not whitespace, not a control
-  # character) survives that stripping. A keystroke does; a render-loop tail of
-  # SGR-reset + show-cursor + cursor-position does not.
-  def prints: printed | test("[^[:space:][:cntrl:]]");
-
+  --argjson cg "$COALESCE_GAP" "$JQ_DEFS"'
   .[0] as $header
   | (.[1:] | map({t: .[0], code: .[1], data: .[2],
-                  size: (.[2] | utf8bytelength), text: (.[2] | prints)})) as $evs
+                  size: (.[2] | utf8bytelength)} | . + {kind: kind($st)})) as $evs
   | (if ($evs | length) == 0 then 0 else $evs[-1].t end) as $orig
   # Two distinct limits, and keeping them separate is the whole point:
   #   $hold_budget — what the output may total once operation holds are added. It
@@ -166,7 +236,7 @@ jq -sc \
   # Pass 1: fold events into steps (coalescing chunked operation repaints).
   | (reduce $evs[] as $e ([];
       (.[-1]) as $last
-      | (if $e.size > $st then "op" elif $e.text then "type" else "tick" end) as $kind
+      | $e.kind as $kind
       | if ($last != null) and ($kind == "op") and ($last.kind == "op")
            and (($e.t - $last.last_t) <= $cg) then
           # continuation chunk of the same repaint: merge into the last op step

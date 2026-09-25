@@ -11,7 +11,7 @@ import { act, fireEvent, render, screen, waitFor, within } from "@testing-librar
 import "../styles.css";
 import { describe, expect, it, vi } from "vitest";
 import { createFixtureSnapshot } from "../data/fixture";
-import { DEFAULT_DESKTOP_SETTINGS, type DesktopSettingsDto, type EndpointSettingsDto } from "../lib/bridge";
+import { DEFAULT_DESKTOP_SETTINGS, fixtureDesktopFeatures, type DesktopSettingsDto, type EndpointSettingsDto } from "../lib/bridge";
 import type { DeckRuntimeState, DeckSnapshot } from "../types";
 import { DeckShell } from "../App";
 import { deckStateNote } from "./DeckSelector";
@@ -42,6 +42,7 @@ function runtime(overrides: Partial<DeckRuntimeState> = {}): DeckRuntimeState {
   const base = createFixtureSnapshot("crowded");
   return {
     mode: "live",
+    desktopFeatures: fixtureDesktopFeatures("?experimental=1"),
     snapshot: base,
     terminalData: {},
     clearError: vi.fn(),

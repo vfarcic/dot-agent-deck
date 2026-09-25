@@ -441,6 +441,23 @@ export function sameSelection(left: DeckSelection, right: DeckSelection): boolea
   return selectionToken(left) === selectionToken(right);
 }
 
+/**
+ * Whether the stored selection is **All Decks** (#1083).
+ *
+ * The screens that cannot merge across decks — the deck screen, whose tiles
+ * own terminals, and the Projects and Workflows sheets that launch there — read
+ * this to show "Select a deck" instead of rendering one deck. Under All Decks
+ * the crate still resolves "the selected deck" to the local one, because its
+ * plumbing needs an endpoint, so a screen that took that answer would be
+ * showing, and launching on, this machine's deck without saying so.
+ *
+ * It reads the same stored token the Deck selector does, so the body state and
+ * the selector's label cannot disagree.
+ */
+export function selectsAllDecks(section: EndpointSettingsDto | undefined): boolean {
+  return parseSelection(section?.selection ?? LOCAL_ENDPOINT_SELECTION).kind === "all";
+}
+
 /** One entry in the Deck selector: what it is, and how it is named on screen. */
 export interface DeckChoice {
   /** Stable per entry, and what the selector keys and test ids use. */

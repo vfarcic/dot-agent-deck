@@ -337,6 +337,25 @@ describe("TauriDeckBridge", () => {
     expect(invoke).toHaveBeenLastCalledWith("desktop_voice_resolve", { utterance: "new agent", screen: "overview", directories: null, newAgent: null, deckStep: null });
   });
 
+  /**
+   * Scenario (issue #1198): the live bridge asks the crate's `desktop_features`
+   * command which experimental surfaces to show and passes its answer through;
+   * a field the reply leaves out, or carries as anything but `true`, reads as
+   * hidden rather than shown.
+   */
+  it("reads the experimental surfaces from desktop_features, hiding what the reply does not show", async () => {
+    const { TauriDeckBridge } = await import("./bridge");
+    const bridge = new TauriDeckBridge();
+
+    invoke.mockResolvedValueOnce({ showDeck: true, showProjects: false, showPrompts: true, showWorkflows: false, showAgentProfiles: true });
+    await expect(bridge.desktopFeatures()).resolves.toEqual({ showDeck: true, showProjects: false, showPrompts: true, showWorkflows: false, showAgentProfiles: true });
+    expect(invoke).toHaveBeenLastCalledWith("desktop_features");
+
+    invoke.mockResolvedValueOnce({ showDeck: "yes", showProjects: 1 });
+    await expect(bridge.desktopFeatures()).resolves.toEqual({ showDeck: false, showProjects: false, showPrompts: false, showWorkflows: false, showAgentProfiles: false });
+    await bridge.dispose();
+  });
+
   it("asks the daemon for its projects and resolves a path verbatim", async () => {
     const { TauriDeckBridge } = await import("./bridge");
     const bridge = new TauriDeckBridge();
@@ -979,6 +998,26 @@ describe("FixtureDeckBridge scenarios", () => {
     // owns no PTYs. Nothing in the UI may have to know which bridge it holds.
     await expect(bridge.setShownTerminals(view.agents.map((agent) => on(agent.id)))).resolves.toBeUndefined();
     await expect(bridge.setShownTerminals([])).resolves.toBeUndefined();
+  });
+
+  /**
+   * Scenario (issue #1198): the browser preview hides every experimental
+   * surface by default, as a shipped build does, and `?experimental=1` shows
+   * them all — read per call, so rewriting the URL changes the answer without
+   * a new bridge.
+   */
+  it("hides the experimental surfaces unless ?experimental=1", async () => {
+    window.history.replaceState({}, "", "/?fixture=1");
+    const { createDeckBridge } = await import("./bridge");
+    const bridge = createDeckBridge("fixture");
+
+    await expect(bridge.desktopFeatures()).resolves.toEqual({ showDeck: false, showProjects: false, showPrompts: false, showWorkflows: false, showAgentProfiles: false });
+
+    window.history.replaceState({}, "", "/?fixture=1&experimental=1");
+    await expect(bridge.desktopFeatures()).resolves.toEqual({ showDeck: true, showProjects: true, showPrompts: true, showWorkflows: true, showAgentProfiles: true });
+
+    window.history.replaceState({}, "", "/?fixture=1&experimental=0");
+    await expect(bridge.desktopFeatures()).resolves.toEqual({ showDeck: false, showProjects: false, showPrompts: false, showWorkflows: false, showAgentProfiles: false });
   });
 
   it("treats ?state=empty as a healthy daemon owning nothing, not as a disconnected one", async () => {

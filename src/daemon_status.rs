@@ -333,6 +333,89 @@ mod tests {
         );
     }
 
+    /// The public `status` string for every [`SessionStatus`] variant.
+    ///
+    /// Issue #456: `StatusAgent::status` serializes state.rs's `SessionStatus`
+    /// directly, so a variant rename or a serde attribute there changes the
+    /// `--json` document with nothing in this module touched. The match has no
+    /// wildcard arm on purpose — adding a variant stops this module compiling
+    /// until someone writes the string that variant will publish (and decides
+    /// whether it owes a [`SCHEMA_VERSION`] bump), then adds it to
+    /// [`ALL_STATUSES`].
+    fn published_status(status: &SessionStatus) -> &'static str {
+        match status {
+            SessionStatus::Thinking => "Thinking",
+            SessionStatus::Working => "Working",
+            SessionStatus::Compacting => "Compacting",
+            SessionStatus::WaitingForInput => "WaitingForInput",
+            SessionStatus::Idle => "Idle",
+            SessionStatus::Error => "Error",
+            // Deserialize-side catch-all for a status string a newer daemon
+            // sends that this build does not know. The CLI still re-emits it,
+            // so it is part of what a script can read.
+            SessionStatus::Unknown => "Unknown",
+        }
+    }
+
+    const ALL_STATUSES: [SessionStatus; 7] = [
+        SessionStatus::Thinking,
+        SessionStatus::Working,
+        SessionStatus::Compacting,
+        SessionStatus::WaitingForInput,
+        SessionStatus::Idle,
+        SessionStatus::Error,
+        SessionStatus::Unknown,
+    ];
+
+    /// Scenario: for every `SessionStatus` variant, build a fully populated
+    /// status row plus a row with no optional fields, serialize the whole
+    /// `--json` document, and compare it to a literal. A renamed field, a
+    /// changed status string, a dropped `skip_serializing_if`, or a reshaped
+    /// `active_tool` fails here (issue #456).
+    #[test]
+    fn json_document_pins_field_names_and_every_status_string() {
+        for status in ALL_STATUSES {
+            let expected_status = published_status(&status);
+            let mut snap = snapshot(status.clone());
+            snap.active_tool = Some(ActiveTool {
+                name: "Bash".to_string(),
+                detail: Some("cargo test".to_string()),
+            });
+            let mut populated = record("agent-1", "pane-1", Some(snap));
+            populated.display_name = Some("api".to_string());
+            populated.tab_membership = Some(TabMembership::Mode {
+                name: "review".to_string(),
+            });
+            let mut bare = record("agent-2", "unused", None);
+            bare.pane_id_env = None;
+            bare.cwd = None;
+
+            let document = StatusDocument::new(build_status_agents(vec![populated, bare]));
+            let json = serde_json::to_value(&document).unwrap();
+            assert_eq!(
+                json,
+                serde_json::json!({
+                    "schema_version": 2,
+                    "agents": [
+                        {
+                            "agent_id": "agent-1",
+                            "pane_id": "pane-1",
+                            "label": "api",
+                            "cwd": "/tmp/x",
+                            "role": "mode:review",
+                            "status": expected_status,
+                            "active_tool": { "name": "Bash" },
+                        },
+                        { "agent_id": "agent-2" },
+                    ],
+                }),
+                "the public `daemon status --json` shape moved for {status:?}; if that is \
+                 deliberate, bump SCHEMA_VERSION for a removal or meaning change and \
+                 update this literal"
+            );
+        }
+    }
+
     #[test]
     fn json_document_carries_schema_version_and_pane_id() {
         let agents = build_status_agents(vec![record("agent-1", "json-pane", None)]);

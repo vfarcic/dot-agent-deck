@@ -40,6 +40,11 @@ interface SettingsSheetProps {
   saveError?: string;
   /** Where the document lives; absent in the browser preview and if the read failed. */
   path?: string;
+  /**
+   * Why the document at `path` is not in use, as the backend reported it
+   * (issue #1072). Present, the footer renders this instead of the path.
+   */
+  problem?: string;
   loaded: boolean;
   mode: RuntimeMode;
   /**
@@ -52,7 +57,7 @@ interface SettingsSheetProps {
   sections?: SettingsSection[];
 }
 
-export function SettingsSheet({ open, onClose, settings, onSave, saveError, path, loaded, mode, sections = SETTINGS_SECTIONS }: SettingsSheetProps) {
+export function SettingsSheet({ open, onClose, settings, onSave, saveError, path, problem, loaded, mode, sections = SETTINGS_SECTIONS }: SettingsSheetProps) {
   const [activeId, setActiveId] = useState(sections[0]?.id ?? "");
   if (!open) return null;
 
@@ -116,7 +121,7 @@ export function SettingsSheet({ open, onClose, settings, onSave, saveError, path
         <footer className="sheet-footer settings-footer">
           <span>
             <FileCog size={13} />
-            <SettingsLocation mode={mode} path={path} loaded={loaded} />
+            <SettingsLocation mode={mode} path={path} problem={problem} loaded={loaded} />
           </span>
         </footer>
       </section>
@@ -125,15 +130,25 @@ export function SettingsSheet({ open, onClose, settings, onSave, saveError, path
 }
 
 /**
- * Where the settings live, said honestly in each of the three cases.
+ * Where the settings live, said honestly in each of the four cases.
  *
  * The browser preview genuinely has no file — `FixtureDeckBridge` keeps
  * settings in `localStorage` and structurally cannot reach the filesystem — so
  * it must not print a plausible-looking path for something that does not exist.
+ *
+ * A `problem` means the app is on defaults and refuses to save to `path` —
+ * because the path is unusable (relative, a directory, a symlink, a FIFO…) or
+ * because the document there cannot be read. "Stored in <path>" is false in
+ * both, so the footer says what is wrong instead (issue #829). The sentence is
+ * `SettingsDocumentProblem::public`, which the backend builds without the path;
+ * the app's log carries the half that names it.
  */
-function SettingsLocation({ mode, path, loaded }: { mode: RuntimeMode; path?: string; loaded: boolean }) {
+function SettingsLocation({ mode, path, problem, loaded }: { mode: RuntimeMode; path?: string; problem?: string; loaded: boolean }) {
   if (mode === "fixture") {
     return <span data-testid="settings-location">Browser preview — kept in this browser's local storage, not in a file.</span>;
+  }
+  if (problem) {
+    return <span data-testid="settings-location" className="is-problem">{problem}</span>;
   }
   if (path) {
     return <span data-testid="settings-location">Stored in <code>{path}</code></span>;

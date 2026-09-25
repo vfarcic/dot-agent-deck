@@ -132,6 +132,17 @@ pub struct DesktopSnapshot {
     /// question, and an answer from here would be one the crate would have to
     /// keep in step with a stream it does not observe.
     pub observed: Vec<ObservedDeckDto>,
+    /// The applied selection is **All Decks** (#1083).
+    ///
+    /// Under All Decks the selected deck's snapshot is the local deck's, only
+    /// because the watcher and the tunnels need an endpoint. The webview's
+    /// single-deck screens read this to show "Select a deck" instead of that
+    /// content. It is on the snapshot rather than left to the webview's settings
+    /// read because it then arrives WITH the content it qualifies: a start with
+    /// All Decks stored cannot render local tiles while that read is in flight.
+    /// A property of the applied document, like [`Self::fleet`], so every
+    /// deck's snapshot carries the same value.
+    pub all_decks: bool,
 }
 
 /// One deck the app connects to, named without having been heard from (PRD
@@ -1203,6 +1214,44 @@ pub(crate) fn desktop_agent_registry() -> Vec<DesktopAgentOption> {
         .collect()
 }
 
+/// Which of the app's experimental surfaces this desktop process shows (issue
+/// #1198), for the webview to gate its render and navigation seams on.
+///
+/// Each field is ONE wrapper in the root crate's `features` module (CLAUDE.md
+/// #9), called in this process — so the flag is the desktop's own, read from
+/// this process's environment (`DOT_AGENT_DECK_EXPERIMENTAL`, or the file
+/// `DOT_AGENT_DECK_FEATURES_CONFIG` names) with no project walk; see
+/// [`crate::init_features`]. It is deliberately NOT the per-deck
+/// `experimental` a deck reports in [`DesktopNewAgentOptions`]: these surfaces
+/// belong to the app, not to any one deck, and the app observes several.
+///
+/// All `false` is the shipped default. The overview, the agent overlay and
+/// Settings have no field because they are never gated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DesktopFeatures {
+    pub show_deck: bool,
+    pub show_projects: bool,
+    pub show_prompts: bool,
+    pub show_workflows: bool,
+    pub show_agent_profiles: bool,
+}
+
+impl DesktopFeatures {
+    /// The surfaces the process-global flag shows. Read through the wrappers
+    /// on each call; the flag behind them is resolved once at startup.
+    pub(crate) fn current() -> Self {
+        use dot_agent_deck::features;
+        Self {
+            show_deck: features::show_desktop_deck(),
+            show_projects: features::show_desktop_projects(),
+            show_prompts: features::show_desktop_prompts(),
+            show_workflows: features::show_desktop_workflows(),
+            show_agent_profiles: features::show_desktop_agent_profiles(),
+        }
+    }
+}
+
 /// The STRING-SHAPE check the desktop may make on a path the **user** typed,
 /// before spending a daemon round trip on it.
 ///
@@ -1391,10 +1440,17 @@ pub(crate) fn safe_display_text(text: impl AsRef<str>) -> String {
 /// local deck was substituted — "that deck is gone" and "that deck has no
 /// socket path yet" are different things to tell a user, and neither is
 /// "connected to local".
+///
+/// `all_decks` is `true` under **All Decks**, where `endpoint` is the local
+/// deck only because the plumbing needs one (see
+/// `crate::settings::EndpointSettings::resolve`). It is what lets an operation
+/// that acts on one deck refuse instead of taking that local deck as the
+/// user's choice — [`DeckScope::one_selected`] (#1083).
 #[derive(Debug, Clone)]
 pub(crate) struct SelectedDeck {
     pub(crate) endpoint: Endpoint,
     pub(crate) fallback: Option<String>,
+    pub(crate) all_decks: bool,
 }
 
 impl Default for SelectedDeck {
@@ -1402,9 +1458,17 @@ impl Default for SelectedDeck {
         Self {
             endpoint: Endpoint::local(),
             fallback: None,
+            all_decks: false,
         }
     }
 }
+
+/// Why an operation that acts on ONE deck refused to run under **All Decks**
+/// (#1083). The webview gates these operations behind its "Select a deck"
+/// state first, so this is the backstop a user should not normally see — and
+/// it says what to do rather than what went wrong, like that state does.
+pub(crate) const ALL_DECKS_NEEDS_ONE_DECK: &str =
+    "All Decks is selected, which is every deck at once. Select a deck to act on one.";
 
 /// The applied selection — the deck in force AND the set the fleet observes, as
 /// **one value under one lock** (PRD #742 M8).
@@ -1577,6 +1641,7 @@ pub(crate) fn apply_settings_selection(
         fallback: resolved
             .fallback
             .map(|fallback| safe_display_text(fallback.to_string())),
+        all_decks: settings.selects_all_decks(),
     };
     let observed = settings.connectable_endpoints();
     if let Ok(mut slot) = APPLIED_SELECTION.write() {
@@ -1670,6 +1735,27 @@ impl DeckScope {
             endpoint: applied.selected.endpoint,
             observed_generation: applied.observed_generation,
         }
+    }
+
+    /// The selected deck, captured for an operation that acts on **one** deck
+    /// and has no deck of its own to name — or a refusal under **All Decks**.
+    ///
+    /// [`Self::selected`] answers All Decks with the local deck, which is right
+    /// for the plumbing that needs an endpoint and wrong for an operation: a
+    /// project listing, a workflow launch or a keystroke sent there would land
+    /// on this machine's deck because the user chose *every* deck (#1083). So
+    /// this refuses with [`ALL_DECKS_NEEDS_ONE_DECK`] instead, before any deck
+    /// is contacted. ONE read, so the flag and the endpoint describe the same
+    /// applied selection.
+    pub(crate) fn one_selected() -> Result<Self, String> {
+        let applied = applied_selection();
+        if applied.selected.all_decks {
+            return Err(ALL_DECKS_NEEDS_ONE_DECK.to_string());
+        }
+        Ok(Self {
+            endpoint: applied.selected.endpoint,
+            observed_generation: applied.observed_generation,
+        })
     }
 
     /// The deck one wire id names, or the selected deck when the caller named
@@ -1959,6 +2045,11 @@ pub(crate) fn unconfigured_fleet() -> Vec<UnconfiguredDeckDto> {
 /// `fleet` with nothing here to name it would otherwise be an unnameable group.
 /// Deriving from here cannot produce one — every entry carries its own name —
 /// and the next arrival restates all three.
+/// Whether the applied selection is All Decks — [`DesktopSnapshot::all_decks`].
+pub(crate) fn all_decks_applied() -> bool {
+    selected_deck().all_decks
+}
+
 pub(crate) fn observed_fleet_decks() -> Vec<ObservedDeckDto> {
     observed_decks()
         .iter()
@@ -2073,6 +2164,7 @@ pub(crate) fn disconnected_snapshot(
         fleet: observed_fleet(),
         unconfigured: unconfigured_fleet(),
         observed: observed_fleet_decks(),
+        all_decks: all_decks_applied(),
     }
 }
 
@@ -3563,5 +3655,82 @@ mod tests {
         });
 
         apply_settings_selection(&crate::settings::DesktopSettings::default());
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #1198 — the app-level experimental surfaces
+    // -----------------------------------------------------------------------
+
+    /// Serialises the tests that write the process-global `Features`. Under
+    /// nextest every test is its own process, so this only matters to a plain
+    /// `cargo test`, where they share one — the same shape as the root crate's
+    /// `tests/features.rs`. Nothing else in this crate's tests reads the flag.
+    static FEATURES_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Puts back whatever `Features` a test found, even when it panics.
+    struct RestoreFeatures(dot_agent_deck::features::Features);
+
+    impl Drop for RestoreFeatures {
+        fn drop(&mut self) {
+            dot_agent_deck::features::set_for_test(self.0);
+        }
+    }
+
+    /// Every gated surface follows the one flag through its own wrapper: all
+    /// hidden while it is off — the shipped default — and all shown once it is
+    /// on, with no surface left behind in either direction.
+    #[test]
+    fn desktop_features_follow_the_experimental_flag() {
+        use dot_agent_deck::features::{self, Features};
+        let _lock = FEATURES_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _restore = RestoreFeatures(features::current());
+
+        features::set_for_test(Features::test_with(false));
+        assert_eq!(
+            DesktopFeatures::current(),
+            DesktopFeatures {
+                show_deck: false,
+                show_projects: false,
+                show_prompts: false,
+                show_workflows: false,
+                show_agent_profiles: false,
+            }
+        );
+
+        features::set_for_test(Features::test_with(true));
+        assert_eq!(
+            DesktopFeatures::current(),
+            DesktopFeatures {
+                show_deck: true,
+                show_projects: true,
+                show_prompts: true,
+                show_workflows: true,
+                show_agent_profiles: true,
+            }
+        );
+    }
+
+    /// The wire shape the webview's `DesktopFeaturesDto` reads: camelCase keys,
+    /// one per gated surface, and nothing else.
+    #[test]
+    fn desktop_features_serialise_in_camel_case() {
+        let value = serde_json::to_value(DesktopFeatures {
+            show_deck: true,
+            show_projects: false,
+            show_prompts: true,
+            show_workflows: false,
+            show_agent_profiles: true,
+        })
+        .expect("serialises");
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "showDeck": true,
+                "showProjects": false,
+                "showPrompts": true,
+                "showWorkflows": false,
+                "showAgentProfiles": true,
+            })
+        );
     }
 }

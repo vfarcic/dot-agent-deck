@@ -42,7 +42,7 @@
  * used to carry a paragraph explaining *why* the agent terminals stay dark in
  * both appearances. That is an engineering constraint, it is true, and it
  * changed nothing a reader does next — so it now lives only in
- * `docs/develop/desktop-gui.md` and `prds/743-desktop-light-dark-appearance.md`.
+ * `docs/develop/desktop-gui.md` and `prds/done/743-desktop-light-dark-appearance.md`.
  * The failed-save alert below stays, because it is a consequence the user has to
  * act on.
  *

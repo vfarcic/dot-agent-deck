@@ -13,8 +13,8 @@ import { cleanupWarning } from "../lib/newAgent";
  * through `displayText`, so a role name carrying bidi or control characters
  * cannot reorder what is around it.
  */
-export function CleanupWarning({ stops, testId, className }: { stops: readonly string[]; testId: string; className?: string }) {
-  const warning = cleanupWarning(stops);
+export function CleanupWarning({ stops, deck, testId, className }: { stops: readonly string[]; deck?: string; testId: string; className?: string }) {
+  const warning = cleanupWarning(stops, deck);
   return (
     <div className={className ? `cleanup-warning ${className}` : "cleanup-warning"} role="alert" data-testid={testId}>
       <p>{warning.summary}</p>
