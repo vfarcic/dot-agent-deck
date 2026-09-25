@@ -695,6 +695,12 @@ export interface DeckSnapshot {
    * be compared.
    */
   scheduleRevision?: number;
+  /**
+   * The crate's applied selection is All Decks (#1083), so this snapshot is the
+   * local deck's only because the plumbing needs one. The deck screen reads it
+   * to show "Select a deck" instead. Absent in fixture mode.
+   */
+  allDecks?: boolean;
   stages: WorkflowStage[];
   agents: AgentSession[];
   evidence: EvidenceItem[];

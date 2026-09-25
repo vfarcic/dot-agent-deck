@@ -132,6 +132,17 @@ pub struct DesktopSnapshot {
     /// question, and an answer from here would be one the crate would have to
     /// keep in step with a stream it does not observe.
     pub observed: Vec<ObservedDeckDto>,
+    /// The applied selection is **All Decks** (#1083).
+    ///
+    /// Under All Decks the selected deck's snapshot is the local deck's, only
+    /// because the watcher and the tunnels need an endpoint. The webview's
+    /// single-deck screens read this to show "Select a deck" instead of that
+    /// content. It is on the snapshot rather than left to the webview's settings
+    /// read because it then arrives WITH the content it qualifies: a start with
+    /// All Decks stored cannot render local tiles while that read is in flight.
+    /// A property of the applied document, like [`Self::fleet`], so every
+    /// deck's snapshot carries the same value.
+    pub all_decks: bool,
 }
 
 /// One deck the app connects to, named without having been heard from (PRD
@@ -1996,6 +2007,11 @@ pub(crate) fn unconfigured_fleet() -> Vec<UnconfiguredDeckDto> {
 /// `fleet` with nothing here to name it would otherwise be an unnameable group.
 /// Deriving from here cannot produce one — every entry carries its own name —
 /// and the next arrival restates all three.
+/// Whether the applied selection is All Decks — [`DesktopSnapshot::all_decks`].
+pub(crate) fn all_decks_applied() -> bool {
+    selected_deck().all_decks
+}
+
 pub(crate) fn observed_fleet_decks() -> Vec<ObservedDeckDto> {
     observed_decks()
         .iter()
@@ -2110,6 +2126,7 @@ pub(crate) fn disconnected_snapshot(
         fleet: observed_fleet(),
         unconfigured: unconfigured_fleet(),
         observed: observed_fleet_decks(),
+        all_decks: all_decks_applied(),
     }
 }
 

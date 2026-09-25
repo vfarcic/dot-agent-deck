@@ -11,7 +11,7 @@ import type { DeckSnapshot } from "../types";
  * it shows "Select a deck" instead, and this is what keeps the local deck out
  * of everything else on that screen too: no tile, so no terminal is declared
  * shown; no `1`–`4` or palette focus target; no evidence, handoff or run-graph
- * node; and no project name in the top bar taken from a local agent's cwd.
+ * node; and no run id or project name in the top bar taken from the local deck.
  *
  * The connection is kept, because the Deck selector and the banner read it, and
  * so are the profiles, which are this device's drafts rather than any deck's.
@@ -22,6 +22,7 @@ export function deckScreenSnapshot(snapshot: DeckSnapshot, allDecks: boolean): D
   if (!allDecks) return snapshot;
   return {
     ...snapshot,
+    runId: "—",
     repo: "All Decks",
     worktree: "",
     branch: undefined,

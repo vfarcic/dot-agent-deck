@@ -1234,6 +1234,7 @@ pub(crate) async fn snapshot_with(
             fleet: observed_fleet(),
             unconfigured: unconfigured_fleet(),
             observed: observed_fleet_decks(),
+            all_decks: crate::dto::all_decks_applied(),
         };
     }
 
@@ -1318,6 +1319,7 @@ fn connected_snapshot(
         fleet: observed_fleet(),
         unconfigured: unconfigured_fleet(),
         observed: observed_fleet_decks(),
+        all_decks: crate::dto::all_decks_applied(),
     }
 }
 
@@ -4863,9 +4865,11 @@ mod tests {
     /// and **All Decks** is selected. A Runs-screen workflow launch is refused
     /// with the "Select a deck" sentence, and so is the selected-deck link the
     /// project listing and resolve use; the app performs no handshake and holds
-    /// no link, and the local deck's registry is exactly what it was. As a
+    /// no link, and the local deck's registry is exactly what it was. The
+    /// selected-deck snapshot it is still sent is marked `all_decks`. As a
     /// control, the same launch with the local deck selected does reach that
-    /// daemon, which is what makes "no handshake" mean something.
+    /// daemon, which is what makes "no handshake" mean something, and its
+    /// snapshot is not marked.
     ///
     /// **What it fails against.** `trusted_daemon` resolving the selection
     /// through `DeckScope::selected()`, where All Decks is the local deck: the
@@ -4886,6 +4890,8 @@ mod tests {
         let handshakes_under_all = state.daemon.handshake_count();
         let held_under_all = state.daemon.held().await;
         let on_local = named_records(&local);
+        // Taken after the counts above, since a snapshot does contact the deck.
+        let snapshot_under_all = get_snapshot(&state.daemon).await;
 
         let mut only_local = settings.clone();
         only_local
@@ -4896,6 +4902,7 @@ mod tests {
         crate::dto::apply_settings_selection(&only_local);
         let control = crate::start_workflow_action(&state, runs_launch(&local.dir)).await;
         let handshakes_under_local = state.daemon.handshake_count();
+        let snapshot_under_local = get_snapshot(&state.daemon).await;
         local.shutdown();
 
         let Err(refused) = launched else {
@@ -4931,6 +4938,15 @@ mod tests {
             handshakes_under_local > 0,
             "control: with the local deck selected the same launch reaches it"
         );
+        assert!(
+            snapshot_under_all.all_decks,
+            "the local deck's snapshot under All Decks says so, so the webview does not render it"
+        );
+        assert_eq!(
+            snapshot_under_all.connection.status,
+            ConnectionStatus::Connected
+        );
+        assert!(!snapshot_under_local.all_decks);
     }
 
     /// The ids a real registry still lists as live.

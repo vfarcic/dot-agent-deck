@@ -883,8 +883,12 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
   const { mode, setShownTerminals } = runtime;
   // #1083: this screen cannot merge across decks, so under All Decks it shows
   // "Select a deck" and renders nothing of the local deck the selection
-  // resolves to underneath — see `deckScreenSnapshot`.
-  const allDecks = selectsAllDecks(settings.settings.endpoints);
+  // resolves to underneath — see `deckScreenSnapshot`. Two sources, either of
+  // which is enough: the stored token, which moves the moment the selector is
+  // used, and the crate's own `allDecks` on the snapshot, which travels WITH
+  // the local deck's content — so a start with All Decks stored cannot flash
+  // local tiles while the settings read is still in flight.
+  const allDecks = selectsAllDecks(settings.settings.endpoints) || runtime.snapshot.allDecks === true;
   const snapshot = useMemo(() => deckScreenSnapshot(runtime.snapshot, allDecks), [runtime.snapshot, allDecks]);
   /**
    * Which tile is promoted, decided on the FULL `(deckId, agentId)` identity.
@@ -1500,7 +1504,7 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
   ];
 
   return (
-    <div className={`control-deck ${evidenceOpen ? "with-evidence" : ""}`}>
+    <div className={`control-deck ${evidenceOpen && !allDecks ? "with-evidence" : ""}`}>
       <aside className="rail" aria-label="Primary navigation">
         <div className="brand-mark" aria-label="Agent Deck"><span>AD</span><i aria-hidden="true" /></div>
         <nav>
@@ -1695,7 +1699,7 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
         </section>}
       </main>
 
-      {evidenceOpen && <EvidenceDrawer evidence={snapshot.evidence} selected={selectedEvidence} onSelect={setSelectedEvidenceId} onClose={() => setEvidenceOpen(false)} />}
+      {evidenceOpen && !allDecks && <EvidenceDrawer evidence={snapshot.evidence} selected={selectedEvidence} onSelect={setSelectedEvidenceId} onClose={() => setEvidenceOpen(false)} />}
 
       <ProjectsPanel
         open={projectsOpen}

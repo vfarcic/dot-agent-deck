@@ -2150,6 +2150,7 @@ describe("ControlDeck", () => {
     expect(screen.queryByTestId("agent-tile-builder")).toBeNull();
     expect(screen.queryByTestId("terminal-builder")).toBeNull();
     expect(screen.queryByTestId("run-health")).toBeNull();
+    expect(screen.queryByTestId("evidence-drawer")).toBeNull();
     expect(vi.mocked(live.setShownTerminals).mock.calls.at(-1)?.[0]).toEqual([]);
 
     fireEvent.click(screen.getByTestId("deck-selector-toggle"));
@@ -2158,6 +2159,27 @@ describe("ControlDeck", () => {
     await waitFor(() => expect(screen.getByTestId("agent-tile-builder")).toBeVisible());
     expect(screen.queryByTestId("deck-select-deck")).toBeNull();
     expect(store.current.endpoints?.selection).toBe("local");
+  });
+
+  /**
+   * Scenario (#1083): All Decks is stored and the settings read has not come
+   * back, so the webview still holds the defaults, which select the local
+   * deck. The crate's snapshot of the local deck arrives marked `allDecks`.
+   * The Runs screen shows "Select a deck" from the first render, and no local
+   * tile or terminal is ever declared shown — there is no startup flash.
+   */
+  it("shows Select a deck from the first render when the snapshot says All Decks before settings load", () => {
+    const live = runtime({
+      mode: "live",
+      snapshot: { ...createFixtureSnapshot("connected"), allDecks: true },
+      getSettings: vi.fn(() => new Promise<never>(() => undefined)),
+    });
+    render(<ControlDeck runtime={live} />);
+
+    expect(screen.getByTestId("deck-select-deck")).toHaveTextContent("Select a deck to see its runs");
+    expect(screen.queryByTestId("agent-tile-builder")).toBeNull();
+    expect(screen.queryByTestId("evidence-drawer")).toBeNull();
+    expect(vi.mocked(live.setShownTerminals).mock.calls.every(([targets]) => targets.length === 0)).toBe(true);
   });
 
   /**
