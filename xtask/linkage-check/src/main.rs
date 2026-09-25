@@ -171,6 +171,11 @@ mod pr_review_verdict;
 /// installed systemd timer is Linux-only for the same reason.
 #[cfg(all(test, target_os = "linux"))]
 mod reap_orphans;
+/// Issue #324: no task variable spliced into `Taskfile.yml`'s shell text, and
+/// the release tasks' VERSION/NAME validator. Tests only, and Unix only — the
+/// validator is `scripts/release-channel-vars.sh`, driven here under `bash`.
+#[cfg(all(test, unix))]
+mod release_channel_vars;
 /// PRD #740: the job-graph properties in `release.yml` that keep a desktop
 /// bundler failure off the CLI release. Tests only — nothing can run that
 /// workflow outside a tag, so a bad edit is otherwise observable only after a
