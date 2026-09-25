@@ -272,10 +272,7 @@ fn card_stats_001_wide_card_places_full_stats_in_bottom_right_border() {
 fn live_016_reconnected_card_reads_how_long_the_agent_has_been_quiet() {
     // The real clock, not `render_now()`: hydration mints the placeholder card
     // with its own `Utc::now()`, which this test cannot inject. Issue #413: it is
-    // read ONCE, before any card is minted, and handed to the seam, so the
-    // render measures `Last:` against the same instant the snapshot's hour is
-    // counted back from — and every placeholder minted afterwards sits at or
-    // after it.
+    // read ONCE, and the snapshot's hour is counted back from it.
     let now = chrono::Utc::now();
     let quiet_for_an_hour = (now - chrono::Duration::hours(1)).timestamp_millis();
     let bottom_border_after_reconnect = |last_activity_ms: Option<i64>| {
@@ -340,13 +337,18 @@ fn live_016_reconnected_card_reads_how_long_the_agent_has_been_quiet() {
             .nth(1)
             .and_then(|rest| rest.split("  Tools: ").next())
             .unwrap_or_else(|| panic!("{case}: the full stats label must render:\n{bottom}"));
-        // A pinned `0s` (issue #413): the placeholder was minted after `now`
-        // was read, and `format_elapsed` clamps a `last_activity` ahead of the
-        // render instant to zero, so no scheduling delay can tip it to `1s`.
-        // Only a backwards wall-clock step between the two reads could.
-        assert_eq!(
-            elapsed, "0s",
-            "{case}: the card must keep the freshly minted placeholder's readout:\n{bottom}"
+        // The seconds form, not a pinned `0s`. The render itself reads no clock
+        // (issue #413), and in the ordinary case the placeholder is minted after
+        // `now` was read and clamps to `0s`. But the placeholder's instant comes
+        // from hydration's own `Utc::now()`, which this test cannot inject, so a
+        // backwards wall-clock step between the two reads would show as a few
+        // seconds.
+        assert!(
+            elapsed.ends_with('s')
+                && elapsed[..elapsed.len() - 1]
+                    .bytes()
+                    .all(|b| b.is_ascii_digit()),
+            "{case}: the card must keep the freshly minted placeholder's readout, got `{elapsed}`:\n{bottom}"
         );
     }
 }
