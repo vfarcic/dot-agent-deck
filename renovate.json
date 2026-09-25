@@ -143,6 +143,15 @@
       "automerge": false,
       "labels": ["dependencies", "manual-review"],
       "description": "Major bumps always stay manual."
+    },
+    {
+      "matchManagers": ["github-actions"],
+      "matchFileNames": [".github/workflows/release.yml"],
+      "matchPackageNames": ["actions/download-artifact", "actions/upload-artifact"],
+      "groupName": null,
+      "automerge": false,
+      "labels": ["dependencies", "manual-review"],
+      "description": "The two artifact actions in release.yml are held for a human even on a digest, pin, patch or minor update, overriding the automerging `GitHub Actions` rule above. WHY: `desktop-sign` (PRD #757) is the one job that holds the Apple Developer ID private key, and it runs `actions/download-artifact` and `actions/upload-artifact` — the download before anything else, where it can change what every later step executes (through `$GITHUB_PATH` or `$GITHUB_ENV`, for instance), and the upload while the throwaway keychain holding that key and `AuthKey.p8` are still on the runner. Those two actions are the only third-party code in that job; everything else is its own inline steps and the macOS runner's system tools. An automerged digest bump is a change to code that runs next to the key, landed with no human reading it, which is exactly what the job was split out of `desktop-bundle` to avoid. `matchFileNames` scopes it to release.yml, so these actions keep automerging in every other workflow; within release.yml it also holds every other job's uses of the same two actions, because the rule matches by file rather than by job, and holding a few extra PRs is the cheap direction to be wrong in. `groupName: null` takes these updates out of the `GitHub Actions` group, so they get their own PR rather than riding a grouped, automerged one — the same shape as the `Devbox toolchain packages` rule. It is LAST in the list on purpose: later packageRules override earlier ones, so nothing below can hand these back to the group. BEFORE MERGING one of these PRs, verify the new digest is the commit the release tag names in the action's own repository (`gh api repos/actions/upload-artifact/commits/<tag> --jq .sha`, which dereferences an annotated tag), and read the diff between the old and new digest. docs/develop/desktop-signing.md, 'Dependency updates on the signing runner'. If `desktop-sign` gains another action, add it here."
     }
   ]
 }

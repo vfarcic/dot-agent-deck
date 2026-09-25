@@ -16,6 +16,17 @@ pr_commands = ["/agentic_describe", "/agentic_review"]
 # `required_review_thread_resolution` then blocks the merge on until answered.
 handle_push_trigger = true
 push_commands = ["/agentic_review"]
+# Review pull requests that a bot opens or pushes to (issue #1286). PR-Agent
+# skips any event whose sender is a bot by default: `ignore_bot_pr` (read here
+# first, then from `[github]`, where it defaults to true) and
+# `push_trigger_ignore_bot_commits` (default true). That left every Renovate PR
+# without an independent review, and priority 1 of .github/pr-review-rubric.md
+# requires one at the current head, so the approval workflow could only ever
+# return INSUFFICIENT on them. The second key matters as much as the first:
+# Renovate rebases its branches, and each rebase is a new head that needs its
+# own review.
+ignore_bot_pr = false
+push_trigger_ignore_bot_commits = false
 
 [qodo_describe_agent]
 # Never touch the PR body. Pull request bodies here carry verification evidence
