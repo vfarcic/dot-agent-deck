@@ -79,7 +79,7 @@ A follow-up issue is filed at the end of this PRD for the control half, carrying
 
 ### DECISION 4 — no `experimental` flag (CLAUDE.md rule 9)
 
-**DECIDED by the user: no.** This is not a fresh judgement — it is the third time the same mechanical reason has decided it. #803 Open Question 1 and #741 DECISION 2 both said no because **the flag does not reach the desktop app by any route**: nothing under `desktop/` mentions it, it is not on the daemon protocol, and the desktop crate never calls `features::init_and_watch`, so `experimental_enabled()` would read its `false` default forever whatever the TOML or the environment said. Gating this would mean building the flag's Tauri delivery mechanism as part of this PRD, and would raise "against which project directory?" for a packaged build — a question the desktop app has no good answer to. `prds/176-desktop-gui.md` decision 6 holds the prior: a separate GUI binary has no such seam, because the act of building and running it is the opt-in, with maturity handled by packaging (the bundles are unsigned alphas).
+**DECIDED by the user: no.** This is not a fresh judgement — it is the third time the same mechanical reason has decided it. #803 Open Question 1 and #741 DECISION 2 both said no because **the flag does not reach the desktop app by any route**: nothing under `desktop/` mentions it, it is not on the daemon protocol, and the desktop crate never calls `features::init_and_watch`, so `experimental_enabled()` would read its `false` default forever whatever the TOML or the environment said. Gating this would mean building the flag's Tauri delivery mechanism as part of this PRD, and would raise "against which project directory?" for a packaged build — a question the desktop app has no good answer to. `prds/done/176-desktop-gui.md` decision 6 holds the prior: a separate GUI binary has no such seam, because the act of building and running it is the opt-in, with maturity handled by packaging (the bundles are unsigned alphas).
 
 ### The `all` token, and the one collision worth knowing about
 
@@ -238,7 +238,7 @@ Ordering follows the recon's recommendation, which puts the risky correctness wo
 
 ### 2026-09-13 — Written from the placeholder issue plus two read-only reconnaissance passes
 
-Written by the orchestrator from #742's body and all three comments (the third, dated 2026-09-11, is a deliberate hand-off from #741), `prds/741-desktop-connect-any-daemon.md`, and the **Decks** section of `docs/develop/desktop-gui.md` — plus two read-only recon passes, one on client architecture, state shape, the overview's data path and test tiers, and one on trust, lifecycle, resources and cross-version safety. Neither modified a file. Full reports at `.dot-agent-deck/prd742-recon-reviewer-report.md` and `.dot-agent-deck/prd742-audit-half2-report.md`.
+Written by the orchestrator from #742's body and all three comments (the third, dated 2026-09-11, is a deliberate hand-off from #741), `prds/done/741-desktop-connect-any-daemon.md`, and the **Decks** section of `docs/develop/desktop-gui.md` — plus two read-only recon passes, one on client architecture, state shape, the overview's data path and test tiers, and one on trust, lifecycle, resources and cross-version safety. Neither modified a file. Full reports at `.dot-agent-deck/prd742-recon-reviewer-report.md` and `.dot-agent-deck/prd742-audit-half2-report.md`.
 
 ### 2026-09-13 — M1 landed: the selection value, the reservation, and the selector option
 

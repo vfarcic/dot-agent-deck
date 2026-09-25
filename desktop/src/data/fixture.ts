@@ -218,7 +218,7 @@ const agents: AgentSession[] = [
     diff: [],
     checks: [{ id: "plan-contract", name: "Acceptance contract", status: "passed", duration: "0.2s" }],
     handoffIds: ["ev-plan"],
-    artifacts: [{ id: "prd", name: "Desktop GUI PRD", kind: "file", path: "prds/176-desktop-gui.md" }],
+    artifacts: [{ id: "prd", name: "Desktop GUI PRD", kind: "file", path: "prds/done/176-desktop-gui.md" }],
   },
   {
     id: "builder",
