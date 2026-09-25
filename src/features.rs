@@ -109,7 +109,7 @@ pub fn show_issue_dispatch_authoring() -> bool {
 /// `Ctrl+E` binding resolution, the keystroke gate on a focused worker pane,
 /// and the auto-focus chain that steers toward waiting panes. Nothing else
 /// branches on it — `UiState::command_entry_locked` still starts `true` and the
-/// helpers (`scope_command_entry_lock`, `gate_pane_input_key`) are flag-free,
+/// helpers (`scope_orchestration_chord`, `gate_pane_input_key`) are flag-free,
 /// so their unit tests keep exercising the real logic rather than the gate.
 ///
 /// With the flag OFF the deck behaves exactly as v0.35.8 did: `Ctrl+E` is not
