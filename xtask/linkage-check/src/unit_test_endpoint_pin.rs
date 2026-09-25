@@ -54,10 +54,13 @@
 //!
 //! ## What clears it
 //!
-//! A CALL to either pin helper, matched by the last segment of the called
-//! path, anywhere in the innermost `fn` that holds the emitter (closures inside
-//! it included). Naming the helper without calling it — importing it, or
-//! passing it as a value — does not count. Or
+//! A CALL to either pin helper anywhere in the innermost `fn` that holds the
+//! emitter (closures inside it included) — through a path whose second-to-last
+//! segment is `test_isolation`, or by a bare name the file imported from a
+//! `test_isolation` path. Naming the helper without calling it, or calling a
+//! same-named function from any other module, does not count. Program words
+//! are compared case-insensitively with any-case `.exe` dropped, the way
+//! Windows resolves them. Or
 //! the marker [`ALLOW`] in a comment on the `fn` line or directly above it —
 //! for a child that is deliberately pinned at the test's own sandbox daemon.
 //!
@@ -445,8 +448,11 @@ pub fn scan(
     whole_file_is_test: bool,
     agents: &Agents,
 ) -> Report {
+    let mut uses = PinImports::default();
+    uses.visit_file(ast);
     let mut scan = Scan {
         agents,
+        imported_pins: uses.names,
         test_depth: usize::from(whole_file_is_test || cfg_selects_test_only(&ast.attrs)),
         fns: Vec::new(),
         unpinned: Vec::new(),
@@ -520,6 +526,9 @@ struct Unpinned {
 
 struct Scan<'a> {
     agents: &'a Agents,
+    /// Bare names this file imports as a pin helper (`use
+    /// crate::test_isolation::{pin_unreachable_endpoints as pin}` adds `pin`).
+    imported_pins: BTreeSet<String>,
     test_depth: usize,
     fns: Vec<FnScope>,
     unpinned: Vec<Unpinned>,
@@ -527,6 +536,17 @@ struct Scan<'a> {
 }
 
 impl Scan<'_> {
+    fn is_pin_helper_call(&self, path: &syn::Path) -> bool {
+        let segs: Vec<String> = path.segments.iter().map(|s| s.ident.to_string()).collect();
+        match segs.as_slice() {
+            [name] => self.imported_pins.contains(name),
+            [.., module, name] => {
+                module == "test_isolation" && PIN_HELPERS.contains(&name.as_str())
+            }
+            [] => false,
+        }
+    }
+
     fn in_test(&self) -> bool {
         self.test_depth > 0
     }
@@ -577,9 +597,10 @@ impl Scan<'_> {
 
     /// Whether `word` is the deck binary or a registered agent, and which.
     fn emitter_word(&self, word: &str) -> Option<String> {
+        let word = normalize_program(word);
         if word == DECK_BINARY {
             Some("the deck binary".into())
-        } else if self.agents.basenames.contains(word) {
+        } else if self.agents.basenames.contains(&word) {
             Some(format!("the `{word}` agent"))
         } else {
             None
@@ -606,7 +627,7 @@ impl Scan<'_> {
                 let Some(first) = split.next().map(program_basename) else {
                     continue;
                 };
-                if LAUNCHERS.contains(&first) {
+                if LAUNCHERS.contains(&normalize_program(first).as_str()) {
                     std::iter::once(first)
                         .chain(split.flat_map(command_tokens))
                         .collect()
@@ -696,6 +717,17 @@ pub const LAUNCHERS: [&str; 14] = [
 /// A program word's basename, quotes and a trailing `.exe` removed:
 /// `'/usr/bin/codex'` and `C:\bin\dot-agent-deck.exe` yield `codex` and
 /// `dot-agent-deck`.
+/// A program word as Windows compares it: case-insensitively, with any-case
+/// `.exe` dropped. Registry basenames, [`DECK_BINARY`] and [`LAUNCHERS`] are
+/// all lower case, so `CODEX.EXE` and `Codex.exe` match `codex`.
+fn normalize_program(word: &str) -> String {
+    let lower = word.to_ascii_lowercase();
+    match lower.strip_suffix(".exe") {
+        Some(stem) => stem.to_string(),
+        None => lower,
+    }
+}
+
 fn program_basename(word: &str) -> &str {
     let word = word.trim_matches(|c| c == '\'' || c == '"');
     let base = word.rsplit(['/', '\\']).next().unwrap_or(word);
@@ -812,9 +844,12 @@ impl<'ast> Visit<'ast> for Scan<'_> {
 
     fn visit_expr_call(&mut self, node: &'ast syn::ExprCall) {
         // Only a CALL pins: naming the helper as a value, or importing it,
-        // applies nothing to any child.
+        // applies nothing to any child. And only a call that names
+        // `test_isolation`'s helper — a path through that module, or a bare
+        // name this file imported from it — so a same-named function of some
+        // other module's does not stand in for the pin.
         if let syn::Expr::Path(p) = node.func.as_ref()
-            && last_segment(&p.path).is_some_and(|l| PIN_HELPERS.contains(&l.as_str()))
+            && self.is_pin_helper_call(&p.path)
             && let Some(scope) = self.fns.last_mut()
         {
             scope.pinned = true;
@@ -835,7 +870,7 @@ impl<'ast> Visit<'ast> for Scan<'_> {
         if self.in_test()
             && (node.method == "arg" || node.method == "args")
             && command_ctor_program(&node.receiver)
-                .is_some_and(|program| LAUNCHERS.contains(&program.as_str()))
+                .is_some_and(|program| LAUNCHERS.contains(&normalize_program(&program).as_str()))
         {
             let found = node.args.iter().find_map(|a| self.command_emitter(a, true));
             if let Some(what) = found {
@@ -854,6 +889,50 @@ impl<'ast> Visit<'ast> for Scan<'_> {
     /// Attributes are not scanned: `///` doc comments reach syn as
     /// `#[doc = "…"]`, and prose about an emitter is not one.
     fn visit_attribute(&mut self, _node: &'ast syn::Attribute) {}
+}
+
+/// Every bare name a `use` in the file binds to a pin helper, read from use
+/// trees that pass through a `test_isolation` segment. A glob of that module
+/// binds both helpers.
+#[derive(Default)]
+struct PinImports {
+    names: BTreeSet<String>,
+}
+
+impl PinImports {
+    fn walk(&mut self, tree: &syn::UseTree, through_isolation: bool) {
+        match tree {
+            syn::UseTree::Path(p) => {
+                self.walk(&p.tree, through_isolation || p.ident == "test_isolation")
+            }
+            syn::UseTree::Name(n) => {
+                if through_isolation && PIN_HELPERS.contains(&n.ident.to_string().as_str()) {
+                    self.names.insert(n.ident.to_string());
+                }
+            }
+            syn::UseTree::Rename(r) => {
+                if through_isolation && PIN_HELPERS.contains(&r.ident.to_string().as_str()) {
+                    self.names.insert(r.rename.to_string());
+                }
+            }
+            syn::UseTree::Glob(_) => {
+                if through_isolation {
+                    self.names.extend(PIN_HELPERS.iter().map(|h| h.to_string()));
+                }
+            }
+            syn::UseTree::Group(g) => {
+                for item in &g.items {
+                    self.walk(item, through_isolation);
+                }
+            }
+        }
+    }
+}
+
+impl<'ast> Visit<'ast> for PinImports {
+    fn visit_item_use(&mut self, node: &'ast syn::ItemUse) {
+        self.walk(&node.tree, false);
+    }
 }
 
 /// String literals, the last segment of every path, and the last segment of
@@ -1104,7 +1183,7 @@ mod t {
             assert!(findings(&src).is_empty(), "{pin} did not clear the rule");
         }
         // Pinned in a closure inside the fn still counts: the closure is the fn.
-        let src = "#[cfg(test)]\nmod t {\n    fn f() {\n        let pin = || pin_unreachable_endpoints(vec![]);\n        let _ = SpawnOptions { command: Some(\"codex\"), env: pin(), ..Default::default() };\n    }\n}\n";
+        let src = "#[cfg(test)]\nmod t {\n    use crate::test_isolation::pin_unreachable_endpoints;\n    fn f() {\n        let pin = || pin_unreachable_endpoints(vec![]);\n        let _ = SpawnOptions { command: Some(\"codex\"), env: pin(), ..Default::default() };\n    }\n}\n";
         assert!(findings(src).is_empty());
     }
 
@@ -1376,6 +1455,49 @@ mod t {
                 .any(|f| f.starts_with("src/locked: cannot be listed")),
             "{found:#?}"
         );
+    }
+
+    /// Only `test_isolation`'s helpers pin (PR #1315 review): a same-named
+    /// local function, or one from another module, clears nothing.
+    #[test]
+    fn a_same_named_function_elsewhere_is_not_the_pin() {
+        for pin in [
+            "fn unreachable_endpoints() -> Vec<(String, String)> { vec![] }\n    fn f() { let _ = unreachable_endpoints();",
+            "fn f() { let _ = other::pin_unreachable_endpoints(vec![]);",
+            "use other::unreachable_endpoints;\n    fn f() { let _ = unreachable_endpoints();",
+        ] {
+            let src = format!(
+                "#[cfg(test)]\nmod t {{\n    {pin}\n        let _ = std::process::Command::new(\"codex\");\n    }}\n}}\n"
+            );
+            assert_eq!(findings(&src).len(), 1, "{pin:?} cleared the rule");
+        }
+        for pin in [
+            "use crate::test_isolation::{detach_from_any_live_deck, unreachable_endpoints};\n    fn f() { let _ = unreachable_endpoints();",
+            "use crate::test_isolation::pin_unreachable_endpoints as pin;\n    fn f() { let _ = pin(vec![]);",
+            "use crate::test_isolation::*;\n    fn f() { let _ = unreachable_endpoints();",
+            "fn f() { let _ = super::test_isolation::unreachable_endpoints();",
+        ] {
+            let src = format!(
+                "#[cfg(test)]\nmod t {{\n    {pin}\n        let _ = std::process::Command::new(\"codex\");\n    }}\n}}\n"
+            );
+            assert!(findings(&src).is_empty(), "{pin:?} did not clear the rule");
+        }
+    }
+
+    /// Windows resolves a program case-insensitively (PR #1315 review).
+    #[test]
+    fn program_names_match_regardless_of_case_and_exe() {
+        for command in [
+            "CODEX.EXE",
+            "Codex.exe",
+            r"C:\\Tools\\Dot-Agent-Deck.EXE hook",
+            "SH -c codex",
+        ] {
+            let src = format!(
+                "#[cfg(test)]\nmod t {{\n    fn f() {{\n        let _ = SpawnOptions {{ command: Some({command:?}), ..Default::default() }};\n    }}\n}}\n"
+            );
+            assert_eq!(findings(&src).len(), 1, "{command:?} was not reported");
+        }
     }
 
     /// The live tree is clean — which only means something because every
