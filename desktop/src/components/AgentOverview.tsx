@@ -6,7 +6,8 @@ import { modeScopedKey } from "../lib/bridge";
 import { VOICE_ACTIONS, type NewAgentVoice, type NewAgentVoiceChannel, type VoiceDispatchTarget, type VoiceOverviewChannel } from "../lib/voiceActions";
 import { DECK_STATE_FALLBACK, deckUnavailableReason, isNewAgentShortcut } from "../lib/newAgent";
 import { ConfirmDialog, type ConfirmState } from "./ConfirmDialog";
-import { NewAgentDialog, NO_DIRECTORY_BROWSER, NO_NEW_AGENT_DIALOG, NO_NEW_AGENT_FORM, type NewAgentRuntime } from "./NewAgentDialog";
+import { NewAgentDialog, NO_DIALOG_FOR_DECK, NO_DIALOG_TO_DISCARD, NO_DIRECTORY_BROWSER, NO_NEW_AGENT_DIALOG, NO_NEW_AGENT_FORM, type NewAgentRuntime } from "./NewAgentDialog";
+import type { NewAgentDraft } from "../lib/newAgentDraft";
 import { DeckSelector } from "./DeckSelector";
 import type { DesktopSettingsState } from "../hooks/useDesktopSettings";
 import { DISPLAY_LIMITS, deckName, displayActivity, displayIdentity, displayPath, displayText, displayTitle, displayUptime, domIdentity, rendersBlank } from "../lib/displayText";
@@ -832,6 +833,15 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
   const newAgentClose = useRef<(() => string | undefined) | undefined>(undefined);
   /** What the flow could not finish on screen: an agent the deck accepted and has not listed. */
   const [newAgentNotice, setNewAgentNotice] = useState<string>();
+  /**
+   * Issue #1247 — the form the dialog handed back when it was last closed,
+   * replayed by the next open. Here rather than in the dialog because closing
+   * is the dialog's unmount; cleared by the dialog's Discard (which hands back
+   * nothing) and by a start the deck accepted. It lives as long as this screen
+   * does, so leaving the overview for the deck screen loses it — see
+   * `lib/newAgentDraft.ts` for the whole keep/discard list.
+   */
+  const [newAgentDraft, setNewAgentDraft] = useState<NewAgentDraft>();
   const newAgentAvailable = newAgentRuntime !== undefined;
   const openNewAgent = useCallback((deckId?: string) => {
     if (!newAgentAvailable) return;
@@ -907,6 +917,14 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
       chooseNewAgentMode: (target: VoiceDispatchTarget) => fill((slot) => slot.chooseNewAgentMode(target)),
       chooseNewAgentType: (target: VoiceDispatchTarget) => fill((slot) => slot.chooseNewAgentType(target)),
       nameNewAgent: (target: VoiceDispatchTarget) => fill((slot) => slot.nameNewAgent(target)),
+      /* #1263 and #1247 — callable whenever the dialog is open, so a slot that
+         has gone during the round trip means the dialog closed, not that the
+         form has no deck. */
+      chooseNewAgentDeck: (target: VoiceDispatchTarget) => newAgentVoice?.current?.chooseNewAgentDeck(target) ?? NO_DIALOG_FOR_DECK,
+      discardNewAgent: (target: VoiceDispatchTarget) => {
+        const slot = newAgentVoice?.current;
+        return slot ? slot.discardNewAgent(target) : NO_DIALOG_TO_DISCARD;
+      },
       /* The dialog's own start, from its slot (PRD #1223). */
       startNewAgent: (target: VoiceDispatchTarget) => {
         const slot = newAgentVoice?.current;
@@ -1134,16 +1152,22 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
         <NewAgentDialog
           runtime={newAgentRuntime}
           initialDeckId={newAgent.deckId}
+          draft={newAgentDraft}
           closeRequest={newAgentClose}
           voice={newAgentVoice}
-          onClose={() => setNewAgent(undefined)}
+          onClose={(draft) => {
+            setNewAgentDraft(draft);
+            setNewAgent(undefined);
+          }}
           onAppeared={(target) => {
+            setNewAgentDraft(undefined);
             setNewAgent(undefined);
             // PRD #1223 M5: only now — the deck lists the agent, so the pane's
             // retirement check has a record to find.
             VOICE_ACTIONS.openAgent.run(voiceContext, { ...target, from: "overview" });
           }}
           onNotAppeared={({ deckName: onDeck, agentName }) => {
+            setNewAgentDraft(undefined);
             setNewAgent(undefined);
             setNewAgentNotice(`Started ${agentName ? displayText(agentName, DISPLAY_LIMITS.name) : "an agent"} on ${onDeck}, but the deck has not listed it yet.`);
           }}

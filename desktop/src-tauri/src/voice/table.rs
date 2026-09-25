@@ -1252,9 +1252,14 @@ mod tests {
                 ("choose_mode", "chooseNewAgentMode", vec!["overview"]),
                 ("choose_agent_type", "chooseNewAgentType", vec!["overview"]),
                 ("name_new_agent", "nameNewAgent", vec!["overview"]),
+                // The deck field once the dialog is open (#1263) — `overview`,
+                // plus `requires = ["new_agent_dialog"]`.
+                ("choose_deck", "chooseNewAgentDeck", vec!["overview"]),
                 // The dialog's own start — no confirmation since PRD #802 D5's
                 // start half was revisited (PRD #1223, 2026-09-23).
                 ("start_new_agent", "startNewAgent", vec!["overview"]),
+                // The dialog's Discard (#1247): the one close that keeps no draft.
+                ("discard_new_agent", "discardNewAgent", vec!["overview"]),
                 // PRD #802 D5's set: each only opens a confirmation.
                 ("stop_agent", "confirmStopAgent", vec!["overview"]),
                 (
@@ -1813,8 +1818,8 @@ mod tests {
     }
 
     /// The rows held to the WHOLE utterance rather than a word in it (PRD
-    /// #1223, closing audit G1), pinned: exactly the row whose action cannot
-    /// be taken back. Adding one makes every phrasing but its listed ones
+    /// #1223, closing audit G1), pinned: exactly the rows whose action cannot
+    /// be taken back — `submit_prompt`, and since #1247 `discard_new_agent`. Adding one makes every phrasing but its listed ones
     /// fail, so it is a decision for review, not a default.
     #[test]
     fn voice_table_whole_utterance_rows_are_the_deliberate_set() {
@@ -1824,7 +1829,9 @@ mod tests {
             .filter(|row| matches!(row.grounding, ActionGrounding::HeardAsWhole(_)))
             .map(|row| row.id.as_str())
             .collect();
-        assert_eq!(whole, vec!["submit_prompt"]);
+        // `discard_new_agent` (#1247) for `submit_prompt`'s reason: it cannot
+        // be taken back, and "discard" is an ordinary word.
+        assert_eq!(whole, vec!["submit_prompt", "discard_new_agent"]);
     }
 
     /// The rows whose grounding changes with a declared context (PRD #1223,
@@ -1857,8 +1864,8 @@ mod tests {
                     "go back to the deck",
                     "back to the deck",
                     "return to the deck",
-                    "the deck",
-                    "deck",
+                    // No bare "deck" or "the deck" since #1263: over the dialog
+                    // that is its Deck field's label (`choose_deck`).
                     "show me the deck",
                     "show the deck",
                     "show the terminals",
@@ -2705,6 +2712,50 @@ mod tests {
         assert!(start.callable(Screen::Overview, None, Some(&open_no_form)));
         assert!(start.callable(Screen::Overview, None, Some(&form())));
         assert!(!start.callable(Screen::Deck, None, Some(&open_no_form)));
+    }
+
+    /// #1263 and #1247 — the deck field's row and Discard's, pinned: each runs
+    /// whenever the dialog is OPEN, form or no form, because choosing a deck is
+    /// how the form becomes live and discarding needs no form at all. The deck
+    /// is required on `choose_deck` — there is nothing to choose without one —
+    /// and Discard takes nothing.
+    #[test]
+    fn voice_table_deck_and_discard_rows_need_the_dialog_open_and_nothing_more() {
+        let table = super::table();
+        let open_no_form = VoiceNewAgent { form: None };
+        for (id, invoke, params) in [
+            (
+                "choose_deck",
+                "chooseNewAgentDeck",
+                vec![ParamSpec {
+                    name: "deck".to_string(),
+                    kind: ParamKind::DeckRef,
+                    optional: false,
+                }],
+            ),
+            ("discard_new_agent", "discardNewAgent", vec![]),
+        ] {
+            let row = table.row(id).expect("present");
+            assert_eq!(row.invoke, invoke, "{id}");
+            assert_eq!(row.requires, vec![Requirement::NewAgentDialog], "{id}");
+            assert_eq!(row.params, params, "{id}");
+            assert!(!row.callable(Screen::Overview, None, None), "{id}");
+            assert!(
+                row.callable(Screen::Overview, None, Some(&open_no_form)),
+                "{id}"
+            );
+            assert!(row.callable(Screen::Overview, None, Some(&form())), "{id}");
+            assert!(
+                !row.callable(Screen::Deck, None, Some(&open_no_form)),
+                "{id}"
+            );
+        }
+        // Grounded by the word "deck" alone — no shared verb — so a steered
+        // pick needs the user to have talked about a deck (see commands.toml).
+        assert_eq!(
+            table.row("choose_deck").expect("present").grounding,
+            ActionGrounding::HeardAs(vec!["deck".to_string()])
+        );
     }
 
     /// The Command decision, as a property: no row DICTATES the command line,
