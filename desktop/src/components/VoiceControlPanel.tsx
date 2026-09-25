@@ -82,7 +82,7 @@ import { DISPLAY_LIMITS, displayText } from "../lib/displayText";
 import { VOICE_PEER_PROPS } from "../hooks/useInertBackground";
 import { VOICE_ACTIONS, type VoiceDispatchTarget, type VoicePanelChannel, type VoicePanelContext } from "../lib/voiceActions";
 import type { VoiceCommandDto, VoiceDirectoriesDto, VoiceNewAgentDto, VoiceOutcomeDto, VoiceResultDto, VoiceScreen, VoiceStatusDto } from "../lib/bridge";
-import type { DeckRuntimeState } from "../types";
+import { desktopFeaturesOf, type DeckRuntimeState } from "../types";
 
 /**
  * How long an Undo stays on offer, in milliseconds.
@@ -336,7 +336,10 @@ export const VOICE_DICTATION_SUBMIT = "\r";
 export const VOICE_NOTHING_TO_CLOSE = "Nothing to close — this is the screen itself.";
 
 /** The voice half of the runtime, which a runtime may not have at all. */
-type Voice = Pick<DeckRuntimeState, "declareVoiceScreen" | "resolveVoice" | "voiceCommands" | "voiceStart" | "voiceStop" | "voiceStatus" | "voiceCancel" | "sendTerminalInput">;
+type Voice = Pick<DeckRuntimeState, "declareVoiceScreen" | "resolveVoice" | "voiceCommands" | "voiceStart" | "voiceStop" | "voiceStatus" | "voiceCancel" | "sendTerminalInput" | "desktopFeatures">;
+
+/** The command table's row for the deck, whose screen issue #1198 hides by default. */
+const OPEN_DECK_COMMAND = "open_deck";
 
 /**
  * Whose prompt has words in it that nobody has sent yet (PRD #802 D6, rebuilt).
@@ -551,6 +554,12 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
   const newAgentInstanceRef = useRef(newAgentInstance);
   newAgentInstanceRef.current = newAgentInstance;
   const { declareVoiceScreen, resolveVoice, voiceCommands, voiceStart, voiceStop, voiceStatus, voiceCancel, sendTerminalInput } = runtime;
+  /* Issue #1198 — the list of what can be said leaves out the deck while the
+     deck is hidden, even from its "elsewhere" half: it is not somewhere else,
+     it is not there. The crate withholds the row from the model as well
+     (`voice::schema::annotate_for`); this covers the overlay's own render,
+     including against an older crate that still lists it as callable. */
+  const showDeck = desktopFeaturesOf(runtime).showDeck;
 
   const [on, setOnState] = useState(false);
   const [phase, setPhaseState] = useState<VoicePhase>("idle");
@@ -1222,10 +1231,10 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
        promise continuation, and the prop captured when the callback was built
        may be a screen the user has already left. */
     void voiceCommands(screenRef.current, directoriesRef.current?.(), newAgentRef.current?.()).then(
-      (commands) => { if (vocabularyRequest.current === mine) setVocabulary({ commands }); },
+      (commands) => { if (vocabularyRequest.current === mine) setVocabulary({ commands: showDeck ? commands : commands.filter((command) => command.id !== OPEN_DECK_COMMAND) }); },
       (cause) => { if (vocabularyRequest.current === mine) setVocabulary({ problem: sentenceOf(cause) }); },
     );
-  }, [voiceCommands]);
+  }, [showDeck, voiceCommands]);
 
   /*
     Escape closes it. The overlay is the one thing this surface puts over the

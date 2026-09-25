@@ -1,4 +1,5 @@
 import { expect, test, type Page } from "@playwright/test";
+import { enterDeck } from "./support/overview";
 
 const SETTINGS_KEY = "dot-agent-deck.desktop-settings";
 
@@ -13,6 +14,7 @@ async function openWithSpeech(page: Page) {
     }));
   }, SETTINGS_KEY);
   await page.goto("/?fixture=1&state=connected");
+  await enterDeck(page);
 }
 
 function voiceButton(page: Page) {

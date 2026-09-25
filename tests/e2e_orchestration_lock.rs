@@ -51,15 +51,68 @@ fn open_orchestration(deck: &TuiDeck) {
     deck.send_keys(b"\r"); // submit (Command hidden for an orchestration)
 }
 
-/// Switch focus from the orchestrator role to the fixture's second role
-/// ("worker", `role_pane_ids` index 1): Ctrl+D back to Normal mode, then digit
-/// `2` (`Jump2` -> `Action::FocusCard(1)`) — the same mechanism
-/// `focus/orchestration/001` pins for "1-9 on an orchestration tab jumps to
-/// role pane N and focuses it". `focus_deck` re-enters `PaneInput` mode on
-/// success, so no separate Enter is needed.
+/// The bottom bar's mode chip (`src/ui.rs::mode_chip_label`), drawn in cell 0
+/// of the bar row in every mode but Filter/Rename — the same left-anchored
+/// read `e2e_mode_indication.rs` uses.
+fn typing_chip_shown(grid: &str) -> bool {
+    grid.lines().any(|line| line.starts_with(" TYPING "))
+}
+
+fn command_chip_shown(grid: &str) -> bool {
+    grid.lines().any(|line| line.starts_with(" COMMAND "))
+}
+
+/// Focus the fixture's second role ("worker", `role_pane_ids` index 1) in
+/// `PaneInput` mode, from either `PaneInput` or command mode, and panic unless
+/// it got there.
+///
+/// The jump itself is digit `2` from command mode (`Jump2` ->
+/// `Action::FocusCard(1)`) — the mechanism `focus/orchestration/001` pins for
+/// "1-9 on an orchestration tab jumps to role pane N and focuses it" — and
+/// `focus_deck` re-enters `PaneInput` on success. Reaching command mode first
+/// is the part that depends on where the caller starts: `Ctrl+d` is a TOGGLE
+/// (`Action::DetachToNormal`), so sending it unconditionally from command mode
+/// drops back INTO the focused pane and types the `2` there. For a lock test
+/// that pane is the orchestrator, which is never gated, so every sentinel after
+/// it echoed and the test passed without consulting the lock (issue #440). So
+/// the starting mode is read off the mode chip rather than assumed, and
+/// `Ctrl+d` is sent only from `PaneInput`.
+///
+/// The postcondition is what makes a wrong guess loud: the helper returns only
+/// once the TYPING chip is up and the worker — not the orchestrator — is the
+/// role drawn as the expanded pane box, which only the focused role gets
+/// (`e2e_orchestration_focus.rs::expanded_header`).
 fn focus_worker_role(deck: &TuiDeck) {
-    deck.send_bytes(b"\x04"); // Ctrl+D -> Normal mode
+    assert!(
+        deck.wait_for_grid_predicate_within(Duration::from_secs(5), |grid| {
+            typing_chip_shown(grid) || command_chip_shown(grid)
+        }),
+        "focus_worker_role: neither the TYPING nor the COMMAND mode chip is on \
+         the bottom bar, so the starting mode is unknown and Ctrl+d (a toggle) \
+         could go either way.\nGrid:\n{}",
+        deck.snapshot_grid()
+    );
+    if typing_chip_shown(&deck.snapshot_grid()) {
+        deck.send_bytes(b"\x04"); // Ctrl+d -> command mode
+        assert!(
+            deck.wait_for_grid_predicate_within(Duration::from_secs(5), command_chip_shown),
+            "focus_worker_role: Ctrl+d from PaneInput never brought up the \
+             COMMAND mode chip.\nGrid:\n{}",
+            deck.snapshot_grid()
+        );
+    }
     deck.send_keys(b"2"); // Jump2 -> focus role index 1 ("worker")
+    assert!(
+        deck.wait_for_grid_predicate_within(Duration::from_secs(5), |grid| {
+            typing_chip_shown(grid)
+                && common::role_pane_left_edge(grid, "worker").is_some()
+                && common::role_pane_left_edge(grid, "orchestrator").is_none()
+        }),
+        "focus_worker_role: after `2` from command mode the deck did not land in \
+         PaneInput with the worker role as the expanded (focused) pane — a \
+         keystroke sent now would not be aimed at the worker.\nGrid:\n{}",
+        deck.snapshot_grid()
+    );
 }
 
 /// Scenario: Open a real orchestration tab (default LOCKED) and confirm the
@@ -204,14 +257,13 @@ fn lock_009_ctrl_e_scoped_to_command_mode_on_real_panes() {
         deck.snapshot_grid()
     );
 
-    // Jump straight to the worker from command mode. Deliberately NOT
-    // `focus_worker_role`, which opens with its own `Ctrl+d`: that helper
-    // assumes it is called from PaneInput, and `Ctrl+d` is a TOGGLE, so using
-    // it here would drop back INTO the pane and type the `2` at the
-    // orchestrator instead of jumping. The sentinel would then land in the
-    // orchestrator's own never-gated pane and this test would pass without the
-    // lock having been consulted at all.
-    deck.send_keys(b"2"); // Jump2 -> focus role index 1 ("worker")
+    // Jump to the worker from command mode. This is the call issue #440 was
+    // about: the old helper opened with an unconditional `Ctrl+d`, which from
+    // here dropped back INTO the orchestrator's never-gated pane, so the
+    // sentinel landed there and this test passed without the lock having been
+    // consulted at all. The helper now sends `Ctrl+d` only from PaneInput and
+    // asserts the worker is the focused pane before returning.
+    focus_worker_role(&deck);
     deck.send_keys(format!("{WORKER_UNLOCKED_SENTINEL}\r").as_bytes());
     assert!(
         deck.wait_for_grid_string_within(WORKER_UNLOCKED_SENTINEL, Duration::from_secs(3)),

@@ -68,11 +68,17 @@
  * about two of them:
  *
  * 1. The desktop GUI. Issue #1021 calls the artifacts "signed and notarized".
- *    They are neither. `.github/workflows/release.yml:523` introduces the
- *    bundle job as "an unsigned alpha artifact", the release body it writes is
- *    headed "Desktop GUI (alpha, unsigned)", and PRD #757 was closed having
- *    decided the free options only -- "the macOS warning stays, because there
- *    is no free way to remove it". The latest release (v0.41.0) carries exactly
+ *    They are neither. `.github/workflows/release.yml` introduces the bundle
+ *    job as "an unsigned alpha artifact" and, while no signing credential is
+ *    registered, heads the release body's desktop section "Desktop GUI
+ *    (alpha, unsigned)". PRD #757 first settled on the free options only --
+ *    "the macOS warning stays, because there is no free way to remove it" --
+ *    and REVERSED that on 2026-09-24: the paid macOS path is now wired (its
+ *    M4, the `desktop-sign` job), but that job ships an unsigned `.dmg` until
+ *    the maintainer registers the Apple credentials. So the "Unsigned, so
+ *    macOS will stop you" copy below is still true, and has to change the
+ *    moment a signed, notarized `.dmg` ships -- PRD #757's M6, the real signed
+ *    release verified on a clean Mac. The latest release (v0.41.0) carries exactly
  *    two desktop assets, both named `...-desktop-alpha-...`. There is also no
  *    Windows bundle: release.yml says "Windows is deliberately absent", because
  *    a Tauri bundle carries the daemon as a sidecar and no Windows daemon

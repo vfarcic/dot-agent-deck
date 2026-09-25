@@ -3388,24 +3388,6 @@ mod tests {
         spawn_typed_byte_target(registry, pane_id, None)
     }
 
-    /// A hook endpoint with no listener, for the byte targets' children.
-    ///
-    /// Clearing the inherited endpoints (`crate::test_isolation`) stops a child
-    /// INHERITING a route to a real deck; it does not stop one RESOLVING it.
-    /// With the variable absent, [`crate::platform::paths::socket_path`] falls
-    /// back to `$XDG_RUNTIME_DIR/dot-agent-deck.sock` — the developer's live
-    /// daemon — so an emitting child reaches it either way, and `spawn`'s own
-    /// `env_remove` of the same variable cannot help. Pinning a path nothing
-    /// listens on makes the emit fail closed instead. These targets are bare
-    /// byte sinks that emit nothing at all, so this is belt to that braces: it
-    /// is what keeps the guarantee true for a fixture added later.
-    fn unreachable_hook_endpoint() -> String {
-        std::env::temp_dir()
-            .join(format!("dad-unit-no-listener-{}.sock", std::process::id()))
-            .to_string_lossy()
-            .into_owned()
-    }
-
     /// The same byte-observation target, carrying the
     /// [`SpawnOptions::agent_type`] the deck itself decides at the spawn site
     /// (issue #570). `None` is the hookless pane the deck can vouch for
@@ -3444,13 +3426,15 @@ mod tests {
         let agent_id = registry
             .spawn_agent(SpawnOptions {
                 command: Some(command),
-                env: vec![
-                    (DOT_AGENT_DECK_PANE_ID.to_string(), pane_id.to_string()),
-                    (
-                        crate::agent_pty::DOT_AGENT_DECK_SOCKET.to_string(),
-                        unreachable_hook_endpoint(),
-                    ),
-                ],
+                // Pinned endpoints: clearing the inherited ones
+                // (`crate::test_isolation`) stops a child INHERITING a route to
+                // a real deck, not RESOLVING one. These targets are bare byte
+                // sinks that emit nothing, so this is belt to that braces — it
+                // is what keeps the guarantee true for a fixture added later.
+                env: crate::test_isolation::pin_unreachable_endpoints(vec![(
+                    DOT_AGENT_DECK_PANE_ID.to_string(),
+                    pane_id.to_string(),
+                )]),
                 agent_type: if wrapped { None } else { agent_type.clone() },
                 ..SpawnOptions::default()
             })
@@ -4118,7 +4102,8 @@ mod tests {
         // `common::init_test_env()`, so nothing had cleared the deck endpoints
         // this process inherited from the pane the suite was launched in. See
         // `crate::test_isolation` for what that does and does not cover; the
-        // byte targets pin an unreachable endpoint of their own for the rest.
+        // byte targets pin unreachable endpoints for the rest
+        // (`test_isolation::pin_unreachable_endpoints`).
         crate::test_isolation::detach_from_any_live_deck();
         cancel_all_prompt_confirmations();
         const PROMPT: &str = "DETACHED-STALE-PROMPT-MARKER";

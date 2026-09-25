@@ -171,6 +171,11 @@ mod pr_review_verdict;
 /// installed systemd timer is Linux-only for the same reason.
 #[cfg(all(test, target_os = "linux"))]
 mod reap_orphans;
+/// Issue #324: no task variable spliced into `Taskfile.yml`'s shell text, and
+/// the release tasks' VERSION/NAME validator. Tests only, and Unix only — the
+/// validator is `scripts/release-channel-vars.sh`, driven here under `bash`.
+#[cfg(all(test, unix))]
+mod release_channel_vars;
 /// PRD #740: the job-graph properties in `release.yml` that keep a desktop
 /// bundler failure off the CLI release. Tests only — nothing can run that
 /// workflow outside a tag, so a bad edit is otherwise observable only after a
@@ -200,6 +205,12 @@ mod site_image_refs;
 /// property exists purely at run time in repository files.
 #[cfg(test)]
 mod skill_frontmatter;
+/// Issue #688: a `src/` unit test that spawns a hook emitter — a
+/// Wrapper-strategy `agent_type`, or a command naming an agent or the deck —
+/// pins that child's deck endpoints through `src/test_isolation.rs`. Like
+/// `desktop_project_boundary` this carries a live rule — rule 17 in [`RULES`] —
+/// as well as its own planted-bad-input tests.
+mod unit_test_endpoint_pin;
 /// Issue #521: the `/verify-pr` scripts' `KEY=value` output contract. Tests
 /// only — there is no runtime rule here, the scripts enforce themselves.
 #[cfg(test)]
@@ -953,6 +964,18 @@ const RULES: &[Rule] = &[
                   builds clean and the browser 404s (issue #1200). See `site_image_refs`.",
         check: rule_site_image_refs,
     },
+    Rule {
+        number: 17,
+        name: "unit-test-emitter-pins-endpoints",
+        summary: "A `fn` in `src/` test code that spawns a hook emitter it can see as a literal — a \
+                  `SpawnOptions` with a Wrapper-strategy `agent_type`, or a `SpawnOptions` / \
+                  `Command` whose command names a registered agent or the deck binary — calls \
+                  `test_isolation::pin_unreachable_endpoints` or `unreachable_endpoints`. \
+                  Clearing the test's own environment does not stop a child resolving the \
+                  developer's live daemon itself (issue #688). A tripwire for literals, not a \
+                  proof; see `unit_test_endpoint_pin`.",
+        check: rule_unit_test_emitter_pins_endpoints,
+    },
 ];
 
 /// Everything the rules read, resolved once before any of them runs.
@@ -1159,6 +1182,14 @@ fn rule_no_bare_git_ctor(inputs: &Inputs) -> Vec<String> {
 /// finding rather than a vacuous pass.
 fn rule_site_image_refs(inputs: &Inputs) -> Vec<String> {
     site_image_refs::run(&inputs.root)
+}
+
+/// Rule 17 (issue #688). Its own walk of `src/`, because it needs the AST —
+/// which `fn` holds a spawn, and which code is test code — and because its
+/// inputs going missing (the agent registry, the pin helpers) must be reported
+/// rather than quietly emptying the rule.
+fn rule_unit_test_emitter_pins_endpoints(inputs: &Inputs) -> Vec<String> {
+    unit_test_endpoint_pin::run(&inputs.root)
 }
 
 /// Run every registered rule, tagging each finding with its rule's number.
