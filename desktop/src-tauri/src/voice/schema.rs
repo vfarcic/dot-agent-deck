@@ -523,6 +523,8 @@ mod tests {
         }
     }
 
+    /// Scenario: describe the commands offered on each screen. Navigation and
+    /// Settings are callable from both screens that display the shared rail.
     #[test]
     fn voice_schema_annotates_callable_per_screen() {
         let flags = |screen: Screen| {
@@ -536,7 +538,7 @@ mod tests {
             vec![
                 ("open_agent".to_string(), true),
                 ("open_overview".to_string(), true),
-                ("open_deck".to_string(), false),
+                ("open_deck".to_string(), true),
                 ("close".to_string(), true),
                 ("open_settings".to_string(), true),
                 ("voice_off".to_string(), true),
@@ -563,12 +565,11 @@ mod tests {
             flags(Screen::Overview),
             vec![
                 ("open_agent".to_string(), true),
-                ("open_overview".to_string(), false),
+                ("open_overview".to_string(), true),
                 ("open_deck".to_string(), true),
                 ("close".to_string(), true),
-                // PRD #802 M8's ruling in one flag: Settings is reachable only
-                // from the deck rail, so voice must not offer it here either.
-                ("open_settings".to_string(), false),
+                // The shared rail offers Settings from the overview too.
+                ("open_settings".to_string(), true),
                 // Callable everywhere: stopping must never be unavailable,
                 // and neither must the phrase that lists what can be said.
                 ("voice_off".to_string(), true),

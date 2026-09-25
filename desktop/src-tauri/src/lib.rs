@@ -2254,6 +2254,34 @@ async fn desktop_terminal_detach(
     terminal::detach(&state, &session_id).await
 }
 
+/// Which of the app's experimental surfaces to show (issue #1198) — the
+/// desktop process's own flag, through one `features::show_desktop_*` wrapper
+/// per surface. Read per call, so a live reload of the file reaches the next
+/// query; nothing is cached on this side.
+#[tauri::command]
+async fn desktop_features(webview: Webview) -> Result<dto::DesktopFeatures, String> {
+    ensure_main_webview(&webview)?;
+    Ok(dto::DesktopFeatures::current())
+}
+
+/// Resolve the desktop process's experimental flag and start its reload
+/// watcher (issue #1198) — the same `features::init_and_watch` the TUI and the
+/// daemon call, keyed off the same launch-directory walk as the TUI's
+/// `launch_project_dir`. Until this runs every `show_desktop_*` wrapper reads
+/// the default, OFF.
+///
+/// The launch directory is only where the walk STARTS, and for a packaged app
+/// it is rarely a project: launched from Finder or a desktop launcher the cwd
+/// is `/` or `$HOME`, and the app does not inherit a shell's environment. So
+/// the reachable switches there are `DOT_AGENT_DECK_FEATURES_CONFIG` (naming
+/// the file outright) or `DOT_AGENT_DECK_EXPERIMENTAL`, set wherever the
+/// platform's GUI session takes its environment from. `tauri dev` inherits the
+/// shell and starts inside the repo, so the walk finds the repo's own file.
+fn init_features() {
+    let start = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    dot_agent_deck::features::init_and_watch(&dot_agent_deck::config::resolve_project_dir(&start));
+}
+
 /// Read the desktop app's own settings document, and where it lives (PRD #803).
 ///
 /// A standalone command rather than a `DesktopAction`, for the same reason the
@@ -4301,6 +4329,7 @@ pub fn run() {
         // A missing window is not an error. `load_snapshot` never fails, and a
         // default level makes this a no-op rather than a special case.
         .setup(|app| {
+            init_features();
             let stored = settings::load_snapshot().settings;
             // PRD #741 M7: the stored deck selection goes into force before the
             // first snapshot, so the app connects to the deck the user chose
@@ -4401,6 +4430,7 @@ pub fn run() {
             desktop_terminal_write,
             desktop_terminal_resize,
             desktop_terminal_detach,
+            desktop_features,
             desktop_get_settings,
             desktop_set_settings,
             desktop_test_endpoint,

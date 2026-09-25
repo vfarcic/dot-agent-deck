@@ -343,6 +343,33 @@ export type NewAgentOptions =
   | { kind: "unsupported"; desktopAgents: NewAgentOption[]; lastCommand?: string };
 
 /**
+ * Which of the app's experimental surfaces to show (issue #1198) — the Tauri
+ * `desktop_features` reply, one field per `features::show_desktop_*` wrapper in
+ * the root crate.
+ *
+ * It is the DESKTOP process's flag and belongs to the app, not to a deck — do
+ * not confuse it with {@link NewAgentOptions}' per-deck `experimental`. All
+ * `false` is the shipped default. The agent overview, the agent overlay and
+ * Settings have no field because they are never gated.
+ */
+export interface DesktopFeatures {
+  showDeck: boolean;
+  showProjects: boolean;
+  showPrompts: boolean;
+  showWorkflows: boolean;
+  showAgentProfiles: boolean;
+}
+
+/** Every experimental surface hidden — the shipped default, and what fixture mode answers unless `?experimental=1`. */
+export const DEFAULT_DESKTOP_FEATURES: DesktopFeatures = {
+  showDeck: false,
+  showProjects: false,
+  showPrompts: false,
+  showWorkflows: false,
+  showAgentProfiles: false,
+};
+
+/**
  * The orchestrations the New agent form can offer for one directory on one deck
  * (PRD #1223 M6) — that deck's `ResolveProject` answer.
  *

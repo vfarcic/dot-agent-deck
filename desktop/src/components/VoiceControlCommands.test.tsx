@@ -21,7 +21,12 @@ vi.mock("./TerminalViewport", () => ({
   ),
 }));
 
-import { DeckShell } from "../App";
+import { DeckShell as AppDeckShell } from "../App";
+
+/** Existing deck-specific voice cases enter the deck explicitly. */
+function DeckShell(props: Parameters<typeof AppDeckShell>[0]) {
+  return <AppDeckShell initialView={{ kind: "deck" }} {...props} />;
+}
 import { COMMAND_HIDDEN_BY_ORCHESTRATION, DIRECTORY_MOVED_ON, DIRECTORY_NOT_LISTED, FORM_MOVED_ON, MODE_NOT_OFFERED, NO_DIRECTORY_BROWSER, NO_NEW_AGENT_DIALOG, NO_NEW_AGENT_FORM, NO_PARENT_DIRECTORY, spokenName, START_IN_FLIGHT, START_NEEDS_DIRECTORY, STARTING_CLOSE_BLOCKED } from "./NewAgentDialog";
 import { CONFIRMATION_ALREADY_OPEN, STOP_BEHIND_NEW_AGENT, STOP_TARGET_GONE } from "./AgentOverview";
 import {
@@ -296,6 +301,31 @@ describe("voice off, as a command", () => {
   });
 });
 
+describe("Settings from the overview by voice", () => {
+  beforeEach(() => {
+    window.localStorage.clear();
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => vi.useRealTimers());
+
+  /**
+   * Scenario: while the overview is open, say "open settings". The voice
+   * action opens the same Settings sheet that the overview rail exposes.
+   */
+  it("opens the Settings sheet from the overview", async () => {
+    const voice = microphone(["open settings"]);
+    const resolveVoice: ResolveVoice = vi.fn(async () => dispatch("open_settings", "openSettings", "Opening settings.", "open settings"));
+    render(<DeckShell runtime={runtime(resolveVoice, voice)} initialView={{ kind: "overview" }} />);
+
+    await turnVoiceOn();
+    await completeUtterance();
+
+    expect(resolveVoice).toHaveBeenCalledWith("open settings");
+    expect(screen.getByRole("dialog", { name: "Settings" })).toBeVisible();
+  });
+});
+
 describe("what can I say?", () => {
   beforeEach(() => {
     window.localStorage.clear();
@@ -309,7 +339,9 @@ describe("what can I say?", () => {
   const VOCABULARY: VoiceCommandDto[] = [
     { id: "open_overview", description: "Show every agent in one list.", callable: true, unavailable_hint: "the agent overview opens from the deck", params: [] },
     { id: "voice_off", description: "Stop listening.", callable: true, unavailable_hint: "turning voice off works anywhere", params: [] },
-    { id: "open_deck", description: "Go back to the terminals.", callable: false, unavailable_hint: "returning to the deck works from the agent overview", params: [] },
+    { id: "open_deck", description: "Go back to the terminals.", callable: true, unavailable_hint: "returning to the deck works from the agent overview", params: [] },
+    { id: "open_settings", description: "Open Settings.", callable: true, unavailable_hint: "settings open from the rail", params: [] },
+    { id: "dictate_to_agent", description: "Type into an agent.", callable: false, unavailable_hint: "open an agent first", params: [] },
   ];
 
   function listing(voice: VoiceControls, commands = VOCABULARY) {
@@ -339,9 +371,9 @@ describe("what can I say?", () => {
     const here = overlay.querySelector('[data-where="here"]');
     const elsewhere = overlay.querySelector('[data-where="elsewhere"]');
     expect(Array.from(here?.querySelectorAll("[data-command]") ?? []).map((row) => row.getAttribute("data-command")))
-      .toEqual(["open_overview", "voice_off"]);
+      .toEqual(["open_overview", "voice_off", "open_deck", "open_settings"]);
     expect(Array.from(elsewhere?.querySelectorAll("[data-command]") ?? []).map((row) => row.getAttribute("data-command")))
-      .toEqual(["open_deck"]);
+      .toEqual(["dictate_to_agent"]);
   });
 
   /**

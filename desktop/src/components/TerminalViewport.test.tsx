@@ -71,7 +71,12 @@ vi.mock("@xterm/addon-webgl", () => ({
   } as unknown as typeof import("@xterm/addon-webgl").WebglAddon,
 }));
 
-import { DeckShell } from "../App";
+import { DeckShell as AppDeckShell } from "../App";
+
+/** The terminal case opens the deck explicitly. */
+function DeckShell(props: Parameters<typeof AppDeckShell>[0]) {
+  return <AppDeckShell initialView={{ kind: "deck" }} {...props} />;
+}
 import { createFixtureSnapshot, FIXTURE_DAEMON_ID } from "../data/fixture";
 import { agentKey } from "../lib/agentKey";
 import { DEFAULT_DESKTOP_SETTINGS, type DesktopSettingsDto } from "../lib/bridge";

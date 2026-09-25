@@ -17,7 +17,12 @@ vi.mock("./TerminalViewport", () => ({
   ),
 }));
 
-import { DeckShell } from "../App";
+import { DeckShell as AppDeckShell } from "../App";
+
+/** Existing deck-specific voice cases enter the deck explicitly. */
+function DeckShell(props: Parameters<typeof AppDeckShell>[0]) {
+  return <AppDeckShell initialView={{ kind: "deck" }} {...props} />;
+}
 import {
   NOTHING_DISPATCHED,
   SCREEN_MOVED_ON,

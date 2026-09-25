@@ -2122,14 +2122,13 @@ describe("DeckShell", () => {
     expect(screen.queryByTestId("agent-tile-planner")).not.toBeInTheDocument();
   });
 
-  it("opens on the deck and reaches the overview from the rail without mounting a terminal", () => {
+  /**
+   * Scenario: launch the app without a saved view. It opens on the overview,
+   * and the rail can take the user to the deck and back without attaching a
+   * terminal on the overview.
+   */
+  it("opens on the overview and reaches the deck from the rail without mounting a terminal", () => {
     render(<DeckShell runtime={runtime({ snapshot: createFixtureSnapshot("connected") })} />);
-
-    expect(screen.getByTestId("agent-tile-planner")).toBeVisible();
-    expect(screen.queryByTestId("daemon-group")).not.toBeInTheDocument();
-
-    terminalMounted.mockClear();
-    fireEvent.click(screen.getByTestId("open-overview"));
 
     expect(screen.getByTestId("daemon-group")).toBeVisible();
     expect(screen.queryByTestId("agent-tile-planner")).not.toBeInTheDocument();
@@ -2137,7 +2136,60 @@ describe("DeckShell", () => {
 
     fireEvent.click(screen.getByTestId("open-deck"));
     expect(screen.getByTestId("agent-tile-planner")).toBeVisible();
-    expect(screen.queryByTestId("daemon-group")).not.toBeInTheDocument();
+
+    terminalMounted.mockClear();
+    fireEvent.click(screen.getByTestId("open-overview"));
+    expect(screen.getByTestId("daemon-group")).toBeVisible();
+    expect(screen.queryByTestId("agent-tile-planner")).not.toBeInTheDocument();
+    expect(terminalMounted).not.toHaveBeenCalled();
+  });
+
+  /**
+   * Scenario: switch between the deck and overview, then open an agent from
+   * the overview. The same single navigation rail remains mounted throughout.
+   */
+  it("keeps one rail with the same entries across deck, overview, and agent view", () => {
+    render(<DeckShell runtime={runtime({ snapshot: createFixtureSnapshot("connected") })} initialView={{ kind: "deck" }} />);
+    const rail = () => document.querySelectorAll("aside.rail");
+    const entries = () => Array.from(rail()[0]?.querySelectorAll("nav button") ?? []).map((button) => button.textContent?.trim());
+
+    expect(rail()).toHaveLength(1);
+    const deckEntries = entries();
+    expect(deckEntries[0]).toBe("Overview");
+    expect(deckEntries).toContain("Settings");
+    fireEvent.click(screen.getByTestId("open-overview"));
+    expect(rail()).toHaveLength(1);
+    expect(entries()).toEqual(deckEntries);
+
+    fireEvent.click(screen.getByRole("button", { name: "Open Planner agent" }));
+    expect(screen.getByTestId("agent-pane-overlay")).toBeVisible();
+    expect(rail()).toHaveLength(1);
+    expect(entries()).toEqual(deckEntries);
+  });
+
+  /**
+   * Scenario: move from the deck to the overview and open an agent there. The
+   * rail marks the screen underneath the agent pane as current.
+   */
+  it("marks the deck or overview as current, preserving overview under an agent pane", () => {
+    render(<DeckShell runtime={runtime({ snapshot: createFixtureSnapshot("connected") })} initialView={{ kind: "deck" }} />);
+    const current = () => document.querySelector("aside.rail nav [aria-current='page']")?.textContent?.trim();
+    expect(current()).toBe("Deck");
+
+    fireEvent.click(screen.getByTestId("open-overview"));
+    expect(current()).toBe("Overview");
+    fireEvent.click(screen.getByRole("button", { name: "Open Planner agent" }));
+    expect(current()).toBe("Overview");
+  });
+
+  /**
+   * Scenario: arrive at the overview and use its Settings rail control. The
+   * Settings sheet opens without requiring a visit to the deck first.
+   */
+  it("opens Settings from the overview rail", () => {
+    render(<DeckShell runtime={runtime({ snapshot: createFixtureSnapshot("connected") })} initialView={{ kind: "overview" }} />);
+    fireEvent.click(screen.getByTestId("open-settings"));
+    expect(screen.getByRole("dialog", { name: "Settings" })).toBeVisible();
   });
 
   /**
@@ -2151,7 +2203,7 @@ describe("DeckShell", () => {
    * leave the screen half-reachable.
    */
   it("offers the overview in live mode", () => {
-    render(<DeckShell runtime={runtime({ mode: "live", snapshot: createFixtureSnapshot("connected") })} />);
+    render(<DeckShell runtime={runtime({ mode: "live", snapshot: createFixtureSnapshot("connected") })} initialView={{ kind: "deck" }} />);
 
     expect(screen.getByTestId("agent-tile-planner")).toBeVisible();
     expect(screen.getByTestId("open-overview")).toBeVisible();
@@ -2202,7 +2254,7 @@ describe("DeckShell", () => {
 
   it("zooms on the deck (the control for the overview case above)", () => {
     const state = runtime({ mode: "live", snapshot: createFixtureSnapshot("connected") });
-    render(<DeckShell runtime={state} />);
+    render(<DeckShell runtime={state} initialView={{ kind: "deck" }} />);
     expect(screen.getByTestId("agent-tile-planner")).toBeVisible();
 
     fireEvent.keyDown(document.body, { key: "=", ctrlKey: true });

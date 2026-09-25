@@ -3,9 +3,9 @@
 //! A single boolean — `experimental` — gates **only user-visible surfaces**
 //! introduced by in-flight work. Off by default. Opt-in via the
 //! `[features]` table in the project `.dot-agent-deck.toml` or the
-//! `DOT_AGENT_DECK_EXPERIMENTAL` env var (env wins, OQ3). Both the TUI and
-//! the daemon read the flag independently from the same source of truth (the
-//! file); see [`init_and_watch`].
+//! `DOT_AGENT_DECK_EXPERIMENTAL` env var (env wins, OQ3). The TUI, the daemon
+//! and the desktop app each read the flag independently from the same source
+//! of truth (the file); see [`init_and_watch`].
 //!
 //! ## Gating convention (CLAUDE.md #9 / PRD #139 M3.2)
 //!
@@ -116,6 +116,56 @@ pub fn show_issue_dispatch_authoring() -> bool {
 /// automatic focus movement happens. Note that the focus steering is part of
 /// the gated surface, not a separate feature — it only ever ran while locked.
 pub fn show_command_entry_lock() -> bool {
+    experimental_enabled()
+}
+
+/// Production wrapper for the desktop app's **deck** screen — the multi-pane
+/// terminal workspace (issue #1198). One wrapper per surface (CLAUDE.md #9) so
+/// `grep show_desktop_deck` finds every gate at graduation — see the
+/// `graduate-desktop-deck` issue.
+///
+/// A *presentation* switch read in the desktop process and handed to the
+/// webview through the desktop crate's `desktop_features` command; the webview
+/// gates its render and navigation seams on it. With the flag OFF the agent
+/// overview is the landing screen and the full-screen agent overlay is how a
+/// terminal is seen. Nothing in the daemon, the protocol or the TUI reads it.
+pub fn show_desktop_deck() -> bool {
+    experimental_enabled()
+}
+
+/// Production wrapper for the desktop app's **Projects** surface (issue
+/// #1198). One wrapper per surface (CLAUDE.md #9) so `grep
+/// show_desktop_projects` finds every gate at graduation — see the
+/// `graduate-desktop-projects` issue. A presentation switch, carried to the
+/// webview by `desktop_features`, exactly like [`show_desktop_deck`].
+pub fn show_desktop_projects() -> bool {
+    experimental_enabled()
+}
+
+/// Production wrapper for the desktop app's **Prompts** library (issue
+/// #1198). One wrapper per surface (CLAUDE.md #9) so `grep
+/// show_desktop_prompts` finds every gate at graduation — see the
+/// `graduate-desktop-prompts` issue. A presentation switch, carried to the
+/// webview by `desktop_features`, exactly like [`show_desktop_deck`].
+pub fn show_desktop_prompts() -> bool {
+    experimental_enabled()
+}
+
+/// Production wrapper for the desktop app's **Workflows** surface (issue
+/// #1198). One wrapper per surface (CLAUDE.md #9) so `grep
+/// show_desktop_workflows` finds every gate at graduation — see the
+/// `graduate-desktop-workflows` issue. A presentation switch, carried to the
+/// webview by `desktop_features`, exactly like [`show_desktop_deck`].
+pub fn show_desktop_workflows() -> bool {
+    experimental_enabled()
+}
+
+/// Production wrapper for the desktop app's **Agent Profiles** surface (issue
+/// #1198). One wrapper per surface (CLAUDE.md #9) so `grep
+/// show_desktop_agent_profiles` finds every gate at graduation — see the
+/// `graduate-desktop-agent-profiles` issue. A presentation switch, carried to
+/// the webview by `desktop_features`, exactly like [`show_desktop_deck`].
+pub fn show_desktop_agent_profiles() -> bool {
     experimental_enabled()
 }
 

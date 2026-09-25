@@ -7,7 +7,7 @@ import { DISPLAY_LIMITS, displayText } from "./displayText";
 import { describeEndpoint } from "./endpoints";
 import { ambiguousOrchestrationReason } from "./newAgent";
 import { clampZoom, DEFAULT_ZOOM } from "./zoom";
-import { UNREPORTED } from "../types";
+import { DEFAULT_DESKTOP_FEATURES, UNREPORTED } from "../types";
 import type { HandoffEdge,
   AgentSession,
   AgentTarget,
@@ -20,6 +20,7 @@ import type { HandoffEdge,
   DeckDirectoryListing,
   DeckFleet,
   DeckSnapshot,
+  DesktopFeatures,
   EvidenceItem,
   NewAgentOptions,
   NewAgentOrchestrations,
@@ -1606,7 +1607,40 @@ export interface DeckBridge {
    * one from this flow. Rejects exactly as {@link listDirectories} does.
    */
   newAgentOrchestrations(deckId: string, path: string): Promise<NewAgentOrchestrations>;
+  /**
+   * Issue #1198 — which of the app's experimental surfaces to show: the
+   * desktop process's own flag, read through its `features::show_desktop_*`
+   * wrappers. Read per call, so a caller that asks again sees a live reload of
+   * the file. Fixture mode answers all OFF unless `?experimental=1`.
+   */
+  desktopFeatures(): Promise<DesktopFeatures>;
   dispose(): Promise<void>;
+}
+
+/**
+ * Read a `desktop_features` reply field by field, so a field this build does
+ * not name, or one an older crate does not send, reads as hidden rather than
+ * as `undefined` — the flag's default is OFF and an unreadable answer must not
+ * show a surface.
+ */
+export function normalizeDesktopFeatures(value: unknown): DesktopFeatures {
+  const record = typeof value === "object" && value !== null ? value as Record<string, unknown> : {};
+  const features = { ...DEFAULT_DESKTOP_FEATURES };
+  for (const key of Object.keys(features) as (keyof DesktopFeatures)[]) features[key] = record[key] === true;
+  return features;
+}
+
+/**
+ * Fixture mode's answer to {@link DeckBridge.desktopFeatures}: all OFF, the
+ * shipped default, unless the preview URL carries `?experimental=1` (or
+ * `true`) — the seam the vitest and Playwright suites use to see the gated
+ * surfaces, following `?state=`, `?older=` and `?nonunix=`. Read per call, so a
+ * test that rewrites the URL sees the new answer without a new bridge.
+ */
+export function fixtureDesktopFeatures(search = window.location.search): DesktopFeatures {
+  const requested = new URLSearchParams(search).get("experimental")?.trim().toLowerCase();
+  if (requested !== "1" && requested !== "true") return { ...DEFAULT_DESKTOP_FEATURES };
+  return { showDeck: true, showProjects: true, showPrompts: true, showWorkflows: true, showAgentProfiles: true };
 }
 
 
@@ -2588,6 +2622,12 @@ class FixtureDeckBridge implements DeckBridge {
       entries: directory.entries.map((entry) => ({ ...entry })),
       truncated: false,
     };
+  }
+
+  /** Issue #1198 — see {@link fixtureDesktopFeatures}. */
+  async desktopFeatures(): Promise<DesktopFeatures> {
+    await Promise.resolve();
+    return fixtureDesktopFeatures();
   }
 
   /** PRD #1223 M4 — the named fixture deck's options, or `unsupported` for one this preview plays as older. */
@@ -4038,6 +4078,11 @@ export class TauriDeckBridge implements DeckBridge {
   async listDirectories(deckId: string, path?: string): Promise<DeckDirectoryListing> {
     const invoke = await this.getInvoke();
     return invoke<DeckDirectoryListing>("desktop_list_directories", { deckId, path: path ?? null });
+  }
+
+  async desktopFeatures(): Promise<DesktopFeatures> {
+    const invoke = await this.getInvoke();
+    return normalizeDesktopFeatures(await invoke<DesktopFeatures>("desktop_features"));
   }
 
   async newAgentOptions(deckId: string): Promise<NewAgentOptions> {

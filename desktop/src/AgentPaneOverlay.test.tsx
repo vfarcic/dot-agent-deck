@@ -46,7 +46,12 @@ vi.mock("./components/AgentTile", async () => {
   };
 });
 
-import { DeckShell } from "./App";
+import { DeckShell as AppDeckShell } from "./App";
+
+/** Existing deck-specific cases enter the deck explicitly after the app default changes. */
+function DeckShell(props: Parameters<typeof AppDeckShell>[0]) {
+  return <AppDeckShell initialView={{ kind: "deck" }} {...props} />;
+}
 
 function settingsStore() {
   let document: DesktopSettingsDto = { ...DEFAULT_DESKTOP_SETTINGS };
