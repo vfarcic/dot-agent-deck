@@ -34,10 +34,13 @@
 //! 1. a `SpawnOptions { … }` literal whose `agent_type` field names a
 //!    Wrapper-strategy `AgentType` variant;
 //! 2. a `SpawnOptions { … }` literal whose `command` field holds a string
-//!    literal naming a registered agent basename or `dot-agent-deck`, or calls
-//!    one of [`DECK_BINARY_RESOLVERS`];
-//! 3. `Command::new(…)` / `CommandBuilder::new(…)` — and any `.arg(…)` /
-//!    `.args(…)` chained directly onto one — with an argument of shape 2.
+//!    literal whose program — its first word, or any word after a
+//!    [`LAUNCHERS`] first word such as `sh -c` — is a registered agent basename
+//!    or `dot-agent-deck`, or which calls one of [`DECK_BINARY_RESOLVERS`];
+//! 3. `Command::new(…)` / `CommandBuilder::new(…)` with a program of shape 2,
+//!    or any `.arg(…)` / `.args(…)` chained directly onto one whose program
+//!    literal is a launcher, with a word naming such a program. Arguments to
+//!    any other program are data (`printf pi` names no agent).
 //!
 //! Wrapper-strategy variants and agent basenames are read from
 //! `src/agent_registry.rs`'s `AgentSpec` statics rather than listed here, so a
@@ -51,8 +54,10 @@
 //!
 //! ## What clears it
 //!
-//! A call to either pin helper, matched by the LAST path segment, anywhere in
-//! the innermost `fn` that holds the emitter (closures inside it included). Or
+//! A CALL to either pin helper, matched by the last segment of the called
+//! path, anywhere in the innermost `fn` that holds the emitter (closures inside
+//! it included). Naming the helper without calling it — importing it, or
+//! passing it as a value — does not count. Or
 //! the marker [`ALLOW`] in a comment on the `fn` line or directly above it —
 //! for a child that is deliberately pinned at the test's own sandbox daemon.
 //!
@@ -61,6 +66,9 @@
 //! - a command or agent type held in a variable, a `const`, or a helper's
 //!   parameter — `spawn_typed_byte_target`'s `agent_type` is one — because the
 //!   rule reads literals;
+//! - an agent reached through a program outside [`LAUNCHERS`] that runs its
+//!   arguments (`timeout 5 codex`, say) or a launcher's program held in a
+//!   variable;
 //! - spawns that go some other way: `AttachRequest::StartAgent` to an
 //!   in-process daemon, `DaemonClient::start_agent`, a TUI-driven spawn, or
 //!   `.arg` on a `Command` held in a variable;
@@ -233,7 +241,15 @@ pub fn run(root: &Path) -> Vec<String> {
     }
 
     let mut files = Vec::new();
-    collect_rs(&src, &mut files);
+    let mut unreadable = Vec::new();
+    collect_rs(&src, &mut files, &mut unreadable);
+    out.extend(unreadable.into_iter().map(|(dir, e)| {
+        format!(
+            "{}: cannot be listed ({e}) — the unit tests under it were not scanned, which is \
+             a failure rather than a skip",
+            display(root, &dir)
+        )
+    }));
     files.sort();
     if files.is_empty() {
         out.push(format!(
@@ -307,7 +323,14 @@ fn test_only_files(parsed: &BTreeMap<PathBuf, (String, syn::File)>) -> BTreeSet<
     for (file, (_, ast)) in parsed {
         let mut found = Vec::new();
         let file_test = cfg_selects_test_only(&ast.attrs);
-        collect_mod_decls(&ast.items, file, &module_dir(file), file_test, &mut found);
+        collect_mod_decls(
+            &ast.items,
+            file,
+            &module_dir(file),
+            file_test,
+            false,
+            &mut found,
+        );
         decls.insert(file, found);
     }
     let mut set = BTreeSet::new();
@@ -338,6 +361,7 @@ fn collect_mod_decls(
     file: &Path,
     dir: &Path,
     in_test: bool,
+    inline: bool,
     out: &mut Vec<(PathBuf, bool)>,
 ) {
     for item in items {
@@ -363,11 +387,19 @@ fn collect_mod_decls(
         });
         match &m.content {
             Some((_, inner)) => {
-                collect_mod_decls(inner, file, &dir.join(m.ident.to_string()), test, out);
+                collect_mod_decls(inner, file, &dir.join(m.ident.to_string()), test, true, out);
             }
             None => {
+                // A `#[path]` at a file's top level is relative to the file's
+                // own directory; inside an inline module it is relative to
+                // that module's directory, which is what `dir` has accumulated.
+                let base = if inline {
+                    dir
+                } else {
+                    file.parent().unwrap_or(dir)
+                };
                 let candidates = match &explicit {
-                    Some(p) => vec![file.parent().unwrap_or(dir).join(p)],
+                    Some(p) => vec![base.join(p)],
                     None => {
                         let name = m.ident.to_string();
                         vec![
@@ -417,21 +449,16 @@ pub fn scan(
         agents,
         test_depth: usize::from(whole_file_is_test || cfg_selects_test_only(&ast.attrs)),
         fns: Vec::new(),
-        ordinals: BTreeMap::new(),
         unpinned: Vec::new(),
         spawn_literals: 0,
     };
     scan.visit_file(ast);
-    let located = crate::blank_string_literal_contents(&crate::strip_rust_comments(text));
     let raw: Vec<&str> = text.lines().collect();
     let findings = scan
         .unpinned
         .into_iter()
         .filter_map(|u| {
-            let line = u
-                .name
-                .as_deref()
-                .and_then(|name| nth_fn_line(&located, name, u.ordinal));
+            let line = u.line;
             if let Some(line) = line
                 && allowed(&raw, line)
             {
@@ -452,14 +479,6 @@ pub fn scan(
         findings,
         spawn_literals: scan.spawn_literals,
     }
-}
-
-/// The 1-indexed line of the `ordinal`-th (0-based) `fn name` in `located`,
-/// which is comment- and string-blanked so prose cannot be counted.
-fn nth_fn_line(located: &str, name: &str, ordinal: usize) -> Option<usize> {
-    let re = regex::Regex::new(&format!(r"\bfn\s+{}\b", regex::escape(name))).ok()?;
-    let m = re.find_iter(located).nth(ordinal)?;
-    Some(located[..m.start()].bytes().filter(|b| *b == b'\n').count() + 1)
 }
 
 /// Whether the opt-out marker sits on `line` (1-indexed) or in the unbroken
@@ -485,14 +504,17 @@ fn allowed(raw: &[&str], line: usize) -> bool {
 
 struct FnScope {
     name: Option<String>,
-    ordinal: usize,
+    /// The `fn` keyword's line, from syn's span (`proc-macro2`'s
+    /// `span-locations`), so a `fn`-shaped token inside a macro body cannot
+    /// shift it the way a text search would.
+    line: usize,
     triggers: Vec<String>,
     pinned: bool,
 }
 
 struct Unpinned {
     name: Option<String>,
-    ordinal: usize,
+    line: Option<usize>,
     triggers: Vec<String>,
 }
 
@@ -500,9 +522,6 @@ struct Scan<'a> {
     agents: &'a Agents,
     test_depth: usize,
     fns: Vec<FnScope>,
-    /// How many `fn`s of each name have been entered, test or not — the index
-    /// [`nth_fn_line`] needs.
-    ordinals: BTreeMap<String, usize>,
     unpinned: Vec<Unpinned>,
     spawn_literals: usize,
 }
@@ -512,18 +531,15 @@ impl Scan<'_> {
         self.test_depth > 0
     }
 
-    fn enter_fn(&mut self, name: String, is_test_fn: bool) {
-        let ordinal = {
-            let n = self.ordinals.entry(name.clone()).or_default();
-            *n += 1;
-            *n - 1
-        };
+    fn enter_fn(&mut self, sig: &syn::Signature, is_test_fn: bool) {
+        let line = sig.fn_token.span.start().line;
+        let name = sig.ident.to_string();
         if is_test_fn {
             self.test_depth += 1;
         }
         self.fns.push(FnScope {
             name: Some(name),
-            ordinal,
+            line,
             triggers: Vec::new(),
             pinned: false,
         });
@@ -539,7 +555,7 @@ impl Scan<'_> {
         if !scope.pinned && !scope.triggers.is_empty() {
             self.unpinned.push(Unpinned {
                 name: scope.name,
-                ordinal: scope.ordinal,
+                line: Some(scope.line),
                 triggers: scope.triggers,
             });
         }
@@ -553,24 +569,53 @@ impl Scan<'_> {
             Some(scope) => scope.triggers.push(what),
             None => self.unpinned.push(Unpinned {
                 name: None,
-                ordinal: 0,
+                line: None,
                 triggers: vec![what],
             }),
         }
     }
 
+    /// Whether `word` is the deck binary or a registered agent, and which.
+    fn emitter_word(&self, word: &str) -> Option<String> {
+        if word == DECK_BINARY {
+            Some("the deck binary".into())
+        } else if self.agents.basenames.contains(word) {
+            Some(format!("the `{word}` agent"))
+        } else {
+            None
+        }
+    }
+
     /// What in `expr` makes it a command that runs an emitter, if anything.
-    fn command_emitter(&self, expr: &syn::Expr) -> Option<String> {
+    ///
+    /// `expr` sits in PROGRAM position — a `SpawnOptions::command`, or
+    /// `Command::new`'s argument — unless `as_args` is set, in which case it is
+    /// what a [`LAUNCHERS`] program was handed. In program position only a
+    /// literal's first word is the program, so `echo pi` names no agent; the
+    /// rest of the literal is read too only when that first word is itself a
+    /// launcher (`sh -c 'codex exec'`), the way `AgentType::from_command` sees
+    /// through one. Every word of a launcher's arguments is read.
+    fn command_emitter(&self, expr: &syn::Expr, as_args: bool) -> Option<String> {
         let mut c = Collect::default();
         c.visit_expr(expr);
         for s in &c.strings {
-            for token in command_tokens(s) {
-                if token == DECK_BINARY {
-                    return Some(format!("command names the deck binary (`{s}`)"));
+            let words: Vec<&str> = if as_args {
+                command_tokens(s).collect()
+            } else {
+                let mut split = s.split_whitespace();
+                let Some(first) = split.next().map(program_basename) else {
+                    continue;
+                };
+                if LAUNCHERS.contains(&first) {
+                    std::iter::once(first)
+                        .chain(split.flat_map(command_tokens))
+                        .collect()
+                } else {
+                    vec![first]
                 }
-                if self.agents.basenames.contains(token) {
-                    return Some(format!("command names the `{token}` agent (`{s}`)"));
-                }
+            };
+            if let Some(what) = words.into_iter().find_map(|w| self.emitter_word(w)) {
+                return Some(format!("command names {what} (`{s}`)"));
             }
         }
         DECK_BINARY_RESOLVERS
@@ -608,17 +653,53 @@ fn is_command_ctor(expr: &syn::Expr) -> bool {
     )
 }
 
-/// Whether a method-call chain is rooted at a command constructor.
-fn rooted_at_command_ctor(mut expr: &syn::Expr) -> bool {
+/// The program basename of the command constructor a method-call chain is
+/// rooted at, when that program is a string literal.
+fn command_ctor_program(mut expr: &syn::Expr) -> Option<String> {
     loop {
         match expr {
             syn::Expr::MethodCall(m) => expr = &m.receiver,
-            syn::Expr::Call(c) => return is_command_ctor(&c.func),
             syn::Expr::Paren(p) => expr = &p.expr,
             syn::Expr::Reference(r) => expr = &r.expr,
-            _ => return false,
+            syn::Expr::Call(c) if is_command_ctor(&c.func) => {
+                let mut lits = Collect::default();
+                lits.visit_expr(c.args.first()?);
+                return lits
+                    .strings
+                    .first()
+                    .map(|s| program_basename(s).to_string());
+            }
+            _ => return None,
         }
     }
+}
+
+/// Programs that run another program named in their arguments, so their
+/// arguments are read as commands too. Anything else's arguments are data.
+pub const LAUNCHERS: [&str; 14] = [
+    "sh",
+    "bash",
+    "zsh",
+    "dash",
+    "fish",
+    "env",
+    "sudo",
+    "exec",
+    "nohup",
+    "time",
+    "xargs",
+    "cmd",
+    "powershell",
+    "pwsh",
+];
+
+/// A program word's basename, quotes and a trailing `.exe` removed:
+/// `'/usr/bin/codex'` and `C:\bin\dot-agent-deck.exe` yield `codex` and
+/// `dot-agent-deck`.
+fn program_basename(word: &str) -> &str {
+    let word = word.trim_matches(|c| c == '\'' || c == '"');
+    let base = word.rsplit(['/', '\\']).next().unwrap_or(word);
+    base.strip_suffix(".exe").unwrap_or(base)
 }
 
 /// Split a command literal into the words a basename comparison needs:
@@ -678,33 +759,23 @@ impl<'ast> Visit<'ast> for Scan<'_> {
 
     fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
         let is_test = has_test_attr(&node.attrs);
-        self.enter_fn(node.sig.ident.to_string(), is_test);
+        self.enter_fn(&node.sig, is_test);
         syn::visit::visit_item_fn(self, node);
         self.leave_fn(is_test);
     }
 
     fn visit_impl_item_fn(&mut self, node: &'ast syn::ImplItemFn) {
         let is_test = has_test_attr(&node.attrs);
-        self.enter_fn(node.sig.ident.to_string(), is_test);
+        self.enter_fn(&node.sig, is_test);
         syn::visit::visit_impl_item_fn(self, node);
         self.leave_fn(is_test);
     }
 
     fn visit_trait_item_fn(&mut self, node: &'ast syn::TraitItemFn) {
         let is_test = has_test_attr(&node.attrs);
-        self.enter_fn(node.sig.ident.to_string(), is_test);
+        self.enter_fn(&node.sig, is_test);
         syn::visit::visit_trait_item_fn(self, node);
         self.leave_fn(is_test);
-    }
-
-    fn visit_path(&mut self, node: &'ast syn::Path) {
-        if let Some(last) = last_segment(node)
-            && PIN_HELPERS.contains(&last.as_str())
-            && let Some(scope) = self.fns.last_mut()
-        {
-            scope.pinned = true;
-        }
-        syn::visit::visit_path(self, node);
     }
 
     fn visit_expr_struct(&mut self, node: &'ast syn::ExprStruct) {
@@ -730,7 +801,7 @@ impl<'ast> Visit<'ast> for Scan<'_> {
                         ));
                     }
                 } else if name == "command"
-                    && let Some(what) = self.command_emitter(&field.expr)
+                    && let Some(what) = self.command_emitter(&field.expr, false)
                 {
                     self.trigger(format!("`SpawnOptions` {what}"));
                 }
@@ -740,8 +811,19 @@ impl<'ast> Visit<'ast> for Scan<'_> {
     }
 
     fn visit_expr_call(&mut self, node: &'ast syn::ExprCall) {
+        // Only a CALL pins: naming the helper as a value, or importing it,
+        // applies nothing to any child.
+        if let syn::Expr::Path(p) = node.func.as_ref()
+            && last_segment(&p.path).is_some_and(|l| PIN_HELPERS.contains(&l.as_str()))
+            && let Some(scope) = self.fns.last_mut()
+        {
+            scope.pinned = true;
+        }
         if self.in_test() && is_command_ctor(&node.func) {
-            let found = node.args.iter().find_map(|a| self.command_emitter(a));
+            let found = node
+                .args
+                .iter()
+                .find_map(|a| self.command_emitter(a, false));
             if let Some(what) = found {
                 self.trigger(format!("`Command::new` {what}"));
             }
@@ -752,9 +834,10 @@ impl<'ast> Visit<'ast> for Scan<'_> {
     fn visit_expr_method_call(&mut self, node: &'ast syn::ExprMethodCall) {
         if self.in_test()
             && (node.method == "arg" || node.method == "args")
-            && rooted_at_command_ctor(&node.receiver)
+            && command_ctor_program(&node.receiver)
+                .is_some_and(|program| LAUNCHERS.contains(&program.as_str()))
         {
-            let found = node.args.iter().find_map(|a| self.command_emitter(a));
+            let found = node.args.iter().find_map(|a| self.command_emitter(a, true));
             if let Some(what) = found {
                 self.trigger(format!("`.{}(…)` on a `Command` — {what}", node.method));
             }
@@ -826,14 +909,28 @@ fn display(root: &Path, file: &Path) -> String {
         .replace('\\', "/")
 }
 
-fn collect_rs(dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
+/// Every `.rs` under `dir`. A directory or entry that cannot be read is
+/// recorded in `errors` rather than dropped, so a subtree this rule could not
+/// see is a finding instead of a quiet pass.
+fn collect_rs(dir: &Path, out: &mut Vec<PathBuf>, errors: &mut Vec<(PathBuf, std::io::Error)>) {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) => {
+            errors.push((dir.to_path_buf(), e));
+            return;
+        }
     };
-    for entry in entries.flatten() {
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(e) => {
+                errors.push((dir.to_path_buf(), e));
+                continue;
+            }
+        };
         let path = entry.path();
         if path.is_dir() {
-            collect_rs(&path, out);
+            collect_rs(&path, out, errors);
         } else if path.extension().is_some_and(|e| e == "rs") {
             out.push(path);
         }
@@ -949,7 +1046,14 @@ mod tests {
             );
             assert_eq!(findings(&src).len(), 1, "{command:?} was not reported");
         }
-        // Words that merely CONTAIN an agent name are not one.
+        // Data handed to a program that is not a launcher is not a command,
+        // and a word that merely CONTAINS an agent name is not one.
+        for command in ["echo pi", "printf codex", "/bin/codexish claude-like"] {
+            let src = format!(
+                "#[cfg(test)]\nmod t {{\n    fn f() {{\n        let _ = SpawnOptions {{ command: Some({command:?}), ..Default::default() }};\n    }}\n}}\n"
+            );
+            assert!(findings(&src).is_empty(), "{command:?} was reported");
+        }
         let src = "#[cfg(test)]\nmod t {\n    fn f() {\n        let _ = SpawnOptions { command: Some(\"/bin/codexish claude-like\"), ..Default::default() };\n    }\n}\n";
         assert!(findings(src).is_empty());
     }
@@ -979,6 +1083,7 @@ mod t {
     fn f() {
         let _ = tokio::process::Command::new(\"sh\").arg(\"-c\").args([\"codex\"]).spawn();
         let _ = std::process::Command::new(\"git\").args([\"log\", \"--oneline\"]).spawn();
+        let _ = std::process::Command::new(\"printf\").arg(\"pi\").spawn();
     }
 }
 ";
@@ -1167,6 +1272,108 @@ mod t {
         );
         assert!(
             found.iter().any(|f| f.contains("saw no `SpawnOptions")),
+            "{found:#?}"
+        );
+    }
+
+    /// Naming a helper is not calling it (PR #1315 review): an import, or the
+    /// helper passed around as a value, pins nothing.
+    #[test]
+    fn naming_a_pin_helper_without_calling_it_does_not_clear_it() {
+        let src = "\
+#[cfg(test)]
+mod t {
+    fn f() {
+        use crate::test_isolation::unreachable_endpoints;
+        let _unused = unreachable_endpoints;
+        let _ = std::process::Command::new(\"codex\");
+    }
+}
+";
+        assert_eq!(findings(src).len(), 1);
+    }
+
+    /// A `fn`-shaped token inside a macro body sits before the real `fn` of
+    /// the same name. The line — and so the marker — must be the real one's.
+    #[test]
+    fn a_fn_token_in_a_macro_does_not_move_the_line_or_the_marker() {
+        let src = "\
+macro_rules! m { () => { fn f() {} }; }
+#[cfg(test)]
+mod t {
+    fn f() {
+        let _ = std::process::Command::new(\"codex\");
+    }
+}
+";
+        let found = findings(src);
+        assert_eq!(found.len(), 1);
+        assert!(found[0].starts_with("src/x.rs:4: fn f: "), "{}", found[0]);
+
+        let marked = src.replace(
+            "    fn f() {\n",
+            "    // linkage-check:allow-unpinned-emitter\n    fn f() {\n",
+        );
+        assert!(findings(&marked).is_empty(), "the marker on the real fn");
+        let misplaced = format!("// linkage-check:allow-unpinned-emitter\n{src}");
+        assert_eq!(
+            findings(&misplaced).len(),
+            1,
+            "a marker above the macro must not reach the real fn"
+        );
+    }
+
+    /// `#[path]` inside an inline test module resolves against that module's
+    /// directory, not the file's (PR #1315 review).
+    #[test]
+    fn a_path_attr_inside_an_inline_test_module_is_followed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(src.join("host").join("tests")).unwrap();
+        let files = [
+            (
+                "host.rs",
+                "#[cfg(test)]\nmod tests {\n    #[path = \"fixtures.rs\"]\n    mod fixtures;\n}\n",
+            ),
+            ("host/tests/fixtures.rs", "fn f() {}\n"),
+            // A decoy at the file-relative location the old code resolved.
+            ("fixtures.rs", "fn g() {}\n"),
+        ];
+        let mut parsed = BTreeMap::new();
+        for (name, text) in files {
+            let path = src.join(name);
+            std::fs::write(&path, text).unwrap();
+            parsed.insert(path, (text.to_string(), syn::parse_file(text).unwrap()));
+        }
+        let set = test_only_files(&parsed);
+        assert!(
+            set.contains(&src.join("host/tests/fixtures.rs")),
+            "{set:#?}"
+        );
+        assert!(!set.contains(&src.join("fixtures.rs")), "{set:#?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unlistable_directory_is_a_finding() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let locked = dir.path().join("src").join("locked");
+        std::fs::create_dir_all(&locked).unwrap();
+        // The walk is reached only once the registry reads, so give it one.
+        std::fs::write(dir.path().join("src/agent_registry.rs"), REGISTRY_FIXTURE).unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read_dir(&locked).is_ok() {
+            // Root ignores the mode bits, so there is nothing to observe.
+            eprintln!("SKIP: running with permission to read a mode-000 directory");
+            return;
+        }
+        let found = run(dir.path());
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            found
+                .iter()
+                .any(|f| f.starts_with("src/locked: cannot be listed")),
             "{found:#?}"
         );
     }
