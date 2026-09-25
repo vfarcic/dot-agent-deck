@@ -1,6 +1,6 @@
 # PRD #1105: An agent pane overlay for the desktop
 
-**Status**: Not started — this document is the plan, written before any implementation.
+**Status**: Closed — issue #1105 was closed on 2026-09-18, and this document was archived under #1297. Last status recorded while it was open: Not started — this document is the plan, written before any implementation.
 **Priority**: Medium
 **Created**: 2026-09-15
 **Issue**: [#1105](https://github.com/vfarcic/dot-agent-deck/issues/1105)

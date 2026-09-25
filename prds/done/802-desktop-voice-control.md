@@ -1,6 +1,6 @@
 # PRD #802: Voice control for the desktop app
 
-**Status**: M1–M10 all shipped, including M9's credentialed phrase fixtures — 24 of 24 twice, locally, because nothing in CI runs them. The PR is [#1163](https://github.com/vfarcic/dot-agent-deck/pull/1163) and what remains is its review. This document was written first and is what implementation was delegated against — where a measurement contradicted it, the document was corrected rather than the measurement explained away, and the [one-file claim](#success-criteria) is the worked example.
+**Status**: Closed — issue #802 was closed on 2026-09-21, and this document was archived under #1297. Last status recorded while it was open: M1–M10 all shipped, including M9's credentialed phrase fixtures — 24 of 24 twice, locally, because nothing in CI runs them. The PR is [#1163](https://github.com/vfarcic/dot-agent-deck/pull/1163) and what remains is its review. This document was written first and is what implementation was delegated against — where a measurement contradicted it, the document was corrected rather than the measurement explained away, and the [one-file claim](#success-criteria) is the worked example.
 **Priority**: Medium (its hard dependency, [PRD #803](803-desktop-settings-surface.md), has shipped; nothing is blocked on this)
 **Created**: 2026-09-18
 

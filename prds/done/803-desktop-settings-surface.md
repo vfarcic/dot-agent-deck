@@ -1,6 +1,6 @@
 # PRD #803: A settings surface for the desktop app
 
-**Status**: In progress — implemented alongside [PRD #743](743-desktop-light-dark-appearance.md) in one PR
+**Status**: Closed — issue #803 was closed on 2026-09-04, and this document was archived under #1297. Last status recorded while it was open: In progress — implemented alongside [PRD #743](743-desktop-light-dark-appearance.md) in one PR
 **Priority**: High (three PRDs are blocked on it)
 **Created**: 2026-09-02
 

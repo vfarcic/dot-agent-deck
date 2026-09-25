@@ -1,6 +1,6 @@
 # PRD #742: Connect the desktop GUI to several decks at once — the fleet view
 
-**Status**: Delivered and awaiting the user's merge decision. [PR #1076](https://github.com/vfarcic/dot-agent-deck/pull/1076) is green on all 13 required checks, approved, with every review thread resolved. One thing is deliberately still open: nobody has yet looked at two decks in one window, which is the only surface no automated tier can reach (#953).
+**Status**: Closed — issue #742 was closed on 2026-09-15, and this document was archived under #1297. Last status recorded while it was open: Delivered and awaiting the user's merge decision. [PR #1076](https://github.com/vfarcic/dot-agent-deck/pull/1076) is green on all 13 required checks, approved, with every review thread resolved. One thing is deliberately still open: nobody has yet looked at two decks in one window, which is the only surface no automated tier can reach (#953).
 
 **Original status**: Plan drafted 2026-09-13, awaiting the step-1 gate. Four decisions already taken by the user and recorded in Technical Approach; the reconnaissance corrected the issue's own framing of the central retrofit, which is the first thing to read.
 **Priority**: High — [#741](https://github.com/vfarcic/dot-agent-deck/issues/741) built the seam for it and named it as the thing that inherits it, and #742's own body argues this is the strongest case for the desktop app existing at all.

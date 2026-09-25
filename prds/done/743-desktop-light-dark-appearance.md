@@ -1,6 +1,6 @@
 # PRD #743: Follow the OS light/dark appearance, with an in-app override
 
-**Status**: In progress — implemented alongside [PRD #803](803-desktop-settings-surface.md) in one PR
+**Status**: Closed — issue #743 was closed on 2026-09-04, and this document was archived under #1297. Last status recorded while it was open: In progress — implemented alongside [PRD #803](803-desktop-settings-surface.md) in one PR
 **Priority**: Medium
 **Created**: 2026-09-02
 

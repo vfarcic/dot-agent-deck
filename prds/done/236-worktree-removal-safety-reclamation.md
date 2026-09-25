@@ -4,7 +4,7 @@
 
 **Priority**: High
 
-**Status**: Not started
+**Status**: Closed — issue #236 was closed on 2026-08-26, and this document was archived under #1297. Last status recorded while it was open: Not started
 
 ## Problem Statement
 

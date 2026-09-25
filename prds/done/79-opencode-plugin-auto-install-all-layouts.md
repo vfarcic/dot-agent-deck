@@ -1,6 +1,6 @@
 # PRD #79: OpenCode plugin auto-install must refresh every existing layout
 
-**Status**: Not started
+**Status**: Closed — issue #79 was closed on 2026-06-22, and this document was archived under #1297. Last status recorded while it was open: Not started
 **Priority**: Medium
 **Created**: 2026-05-09
 

@@ -1,6 +1,6 @@
 # PRD #741: Connect the desktop GUI to any daemon, anywhere, configured in the app
 
-**Status**: Plan approved 2026-09-11. All four decisions taken by the user and recorded below; implementation started at M1. See the Work Log for what the gate conversation changed — it changed a lot.
+**Status**: Closed — issue #741 was closed on 2026-09-13, and this document was archived under #1297. Last status recorded while it was open: Plan approved 2026-09-11. All four decisions taken by the user and recorded below; implementation started at M1. See the Work Log for what the gate conversation changed — it changed a lot.
 **Priority**: High — it discharges [#819](https://github.com/vfarcic/dot-agent-deck/issues/819)'s M10, the one milestone that project moved deliberately unticked, and it unblocks [#742](https://github.com/vfarcic/dot-agent-deck/issues/742) and Windows desktop.
 **Created**: 2026-09-10
 **Issue**: [#741](https://github.com/vfarcic/dot-agent-deck/issues/741)

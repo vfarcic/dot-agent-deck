@@ -1,6 +1,6 @@
 # PRD #220: Dispatcher mode + worktree dispatch — one-step, agent-callable isolated line of work
 
-**Status**: Planning
+**Status**: Closed — issue #220 was closed on 2026-09-14, and this document was archived under #1297. Last status recorded while it was open: Planning
 **Priority**: Medium
 **Created**: 2026-07-19
 **GitHub Issue**: [#220](https://github.com/vfarcic/dot-agent-deck/issues/220)

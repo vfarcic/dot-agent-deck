@@ -1,6 +1,6 @@
 # PRD #106: Hide command field in new-pane form when orchestration is selected
 
-**Status**: Open  
+**Status**: Closed — issue #106 was closed on 2026-05-25, and this document was archived under #1297. Last status recorded while it was open: Open  
 **Priority**: Low  
 **Created**: 2026-05-24  
 **GitHub Issue**: [#106](https://github.com/vfarcic/dot-agent-deck/issues/106)

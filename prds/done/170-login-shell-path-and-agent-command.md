@@ -1,6 +1,6 @@
 # PRD #170: Spawned panes inherit login-shell PATH + configurable agent command
 
-**Status**: In Progress
+**Status**: Closed — issue #170 was closed on 2026-06-17, and this document was archived under #1297. Last status recorded while it was open: In Progress
 **Priority**: High
 **Created**: 2026-06-16
 **GitHub Issue**: [#170](https://github.com/vfarcic/dot-agent-deck/issues/170)
