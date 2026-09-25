@@ -35,7 +35,7 @@ Four commitments define it.
 
 Stated explicitly, because the risk here is quietly redefining someone else's deferred milestone to be whatever happened to get built.
 
-#745's iteration 3 is written as four things: **a group view** (the existing deck, filtered to one tab bucket), **a single-agent view**, **drill-in navigation between them**, and **promoting the overview to the actual landing screen** (`prds/745-desktop-agent-overview-landing-screen.md:282`).
+#745's iteration 3 is written as four things: **a group view** (the existing deck, filtered to one tab bucket), **a single-agent view**, **drill-in navigation between them**, and **promoting the overview to the actual landing screen** (`prds/done/745-desktop-agent-overview-landing-screen.md:282`).
 
 This PRD takes the **single-agent view** and the **navigation to it from both screens**. It leaves the **group view** and the **promotion to landing screen** untaken, and neither is reduced in scope by being left — the group view is still the whole deck-filtered-to-a-bucket screen #745 describes, with its own unanswered question about how many terminals it mounts (#745 open question 1). **#745's iteration 3 is therefore still open after this ships**, and should not be closed by it.
 

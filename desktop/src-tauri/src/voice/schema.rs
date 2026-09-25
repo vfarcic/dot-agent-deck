@@ -188,24 +188,51 @@ pub fn needs_labels(row: &super::table::CommandRow) -> bool {
         .any(|param| !param.optional && param.kind.names_something_observed())
 }
 
+/// Why `open_deck` is unavailable while the deck is hidden (issue #1198) —
+/// the hint the model is shown and the refusal a user reads
+/// (`Not here — <hint>.`).
+pub const DECK_HIDDEN_HINT: &str = "the deck is an experimental screen, and this app shows it \
+    only while the experimental flag is on";
+
+/// The registry entry the deck's row invokes (`desktop/src/lib/voiceActions.ts`).
+const OPEN_DECK_INVOKE: &str = "openDeck";
+
+/// Whether the experimental flag hides the screen this row goes to (issue
+/// #1198): the deck, for the row that invokes `openDeck`, while `show_deck` is
+/// false.
+///
+/// `show_deck` is an argument rather than a read of the flag here, so the
+/// command seams in `lib.rs` are where `features::show_desktop_deck()` is
+/// called (CLAUDE.md rule 9: gate at the seam) and this stays a pure function
+/// of what it is handed. It is a presentation gate: it decides what voice
+/// OFFERS and what it refuses, and changes nothing about what any row does.
+pub fn hidden_by_flag(row: &super::table::CommandRow, show_deck: bool) -> bool {
+    !show_deck && row.invoke == OPEN_DECK_INVOKE
+}
+
 /// [`annotate_with`], and then — when the voice settings withhold labels —
 /// every row that [`needs_labels`] marked `callable: false` with
-/// [`LABELS_WITHHELD_HINT`], whatever the screen would have said. The one
-/// annotation both the intent backend and the discovery overlay are handed.
+/// [`LABELS_WITHHELD_HINT`], whatever the screen would have said; and — while
+/// the deck is hidden (issue #1198) — the row [`hidden_by_flag`] marks
+/// `callable: false` with [`DECK_HIDDEN_HINT`]. The one annotation both the
+/// intent backend and the discovery overlay are handed.
 pub fn annotate_for(
     table: &CommandTable,
     screen: Screen,
     directories: Option<&VoiceDirectories>,
     new_agent: Option<&VoiceNewAgent>,
     labels: crate::settings::LabelSharing,
+    show_deck: bool,
 ) -> Vec<AnnotatedCommand> {
     let mut commands = annotate_with(table, screen, directories, new_agent);
-    if labels == crate::settings::LabelSharing::Withheld {
-        for (command, row) in commands.iter_mut().zip(table.rows()) {
-            if needs_labels(row) {
-                command.callable = false;
-                command.unavailable_hint = LABELS_WITHHELD_HINT.to_string();
-            }
+    for (command, row) in commands.iter_mut().zip(table.rows()) {
+        if labels == crate::settings::LabelSharing::Withheld && needs_labels(row) {
+            command.callable = false;
+            command.unavailable_hint = LABELS_WITHHELD_HINT.to_string();
+        }
+        if hidden_by_flag(row, show_deck) {
+            command.callable = false;
+            command.unavailable_hint = DECK_HIDDEN_HINT.to_string();
         }
     }
     commands
@@ -523,6 +550,8 @@ mod tests {
         }
     }
 
+    /// Scenario: describe the commands offered on each screen. Navigation and
+    /// Settings are callable from both screens that display the shared rail.
     #[test]
     fn voice_schema_annotates_callable_per_screen() {
         let flags = |screen: Screen| {
@@ -536,7 +565,7 @@ mod tests {
             vec![
                 ("open_agent".to_string(), true),
                 ("open_overview".to_string(), true),
-                ("open_deck".to_string(), false),
+                ("open_deck".to_string(), true),
                 ("close".to_string(), true),
                 ("open_settings".to_string(), true),
                 ("voice_off".to_string(), true),
@@ -563,12 +592,11 @@ mod tests {
             flags(Screen::Overview),
             vec![
                 ("open_agent".to_string(), true),
-                ("open_overview".to_string(), false),
+                ("open_overview".to_string(), true),
                 ("open_deck".to_string(), true),
                 ("close".to_string(), true),
-                // PRD #802 M8's ruling in one flag: Settings is reachable only
-                // from the deck rail, so voice must not offer it here either.
-                ("open_settings".to_string(), false),
+                // The shared rail offers Settings from the overview too.
+                ("open_settings".to_string(), true),
                 // Callable everywhere: stopping must never be unavailable,
                 // and neither must the phrase that lists what can be said.
                 ("voice_off".to_string(), true),
@@ -706,6 +734,46 @@ mod tests {
         );
         assert!(TOOL_INSTRUCTIONS.contains("\"local\" means this machine's"));
         assert!(TOOL_INSTRUCTIONS.contains("`optional` is left out"));
+    }
+
+    /// Scenario: annotate the shipped table for the overview with the deck
+    /// hidden, then shown (issue #1198). Hidden, `open_deck` alone turns
+    /// unavailable and carries the flag's reason; shown, every row reads
+    /// exactly as the unannotated table does.
+    #[test]
+    fn voice_schema_withholds_the_deck_row_while_the_deck_is_hidden() {
+        use crate::settings::LabelSharing;
+        let plain = annotate(table(), Screen::Overview);
+        let hidden = annotate_for(
+            table(),
+            Screen::Overview,
+            None,
+            None,
+            LabelSharing::Shared,
+            false,
+        );
+        for (hidden, plain) in hidden.iter().zip(&plain) {
+            if hidden.id == "open_deck" {
+                assert!(plain.callable, "the overview offers the deck when shown");
+                assert!(!hidden.callable);
+                assert_eq!(hidden.unavailable_hint, DECK_HIDDEN_HINT);
+            } else {
+                assert_eq!(
+                    hidden, plain,
+                    "`{}` changed with the deck hidden",
+                    hidden.id
+                );
+            }
+        }
+        let shown = annotate_for(
+            table(),
+            Screen::Overview,
+            None,
+            None,
+            LabelSharing::Shared,
+            true,
+        );
+        assert_eq!(shown, plain);
     }
 
     #[test]
