@@ -14035,6 +14035,9 @@ pub fn run_tui(
                 &tab_view,
                 &tab_bar_info,
                 &frame_layout,
+                // Issue #413: the cards' clock, read once per frame here so
+                // every card on it measures `Last:` against the same instant.
+                Utc::now(),
             );
             // PRD #139: draw the experimental footer into the reserved bottom
             // row (disjoint from `frame_layout`), using the SAME flag snapshot
@@ -16259,6 +16262,7 @@ fn deck_title_line(showing: usize, total_sessions: usize, scroll_hint: &str) -> 
 ///   there was the bug: an unpainted role is indistinguishable from a role that
 ///   failed to start, which sent two separate investigations after a hydration
 ///   defect that was not there.
+#[allow(clippy::too_many_arguments)]
 fn render_card_grid(
     frame: &mut Frame,
     area: Rect,
@@ -16267,6 +16271,8 @@ fn render_card_grid(
     session_ids: &[&String],
     total_sessions: usize,
     tick: u64,
+    // Issue #413: handed to every card's `Last:` field — see `format_elapsed`.
+    now: DateTime<Utc>,
 ) -> Rect {
     // 1 row for the title + 1 row for the stats bar at the bottom of the deck.
     let available_for_cards = area.height.saturating_sub(2);
@@ -16413,6 +16419,7 @@ fn render_card_grid(
                 // selection accent and the running app cannot disagree.
                 ui.mode,
                 declared_agent_type,
+                now,
             );
             // PRD #80 M4: record this card's screen rect (paired with its flat
             // selection index) for the mouse hit-test. Safe to mutate `ui` here
@@ -16437,6 +16444,11 @@ fn render_frame(
     tab_view: &ActiveTabView,
     tab_bar: &TabBarInfo,
     layout: &FrameLayout,
+    // Issue #413: the wall-clock instant this frame is drawn at, read once by
+    // the caller. Distinct from the monotonic `now` below, which times the
+    // command banner; this one is only what the cards' `Last:` field measures
+    // elapsed time against.
+    wall_now: DateTime<Utc>,
 ) {
     // PRD #84 + #139: `render_frame` reads the precomputed `FrameLayout` (one
     // layout pass per frame). The PRD #139 experimental-footer row is reserved
@@ -16743,6 +16755,7 @@ fn render_frame(
             &session_ids,
             total_sessions,
             tick,
+            wall_now,
         );
         render_stats_bar(
             frame,
@@ -20657,6 +20670,10 @@ fn render_session_card(
     // with no declaration, which is every pane before this key existed and the
     // default for the L1 render seams.
     declared_agent_type: Option<&AgentType>,
+    // Issue #413: the instant the bottom border's `Last:` field is measured
+    // against. Passed in, never read here, so a card renders as a pure function
+    // of its inputs — see `format_elapsed`.
+    now: DateTime<Utc>,
 ) {
     // The type the card SHOWS. A launcher command (`devbox run -- codex`)
     // identifies nothing, so without the declaration this stays
@@ -20803,7 +20820,7 @@ fn render_session_card(
     //
     // The border reads `Last: 2m`, not `Last: 2m ago` — four columns of suffix
     // are expensive there, and the `Last:` label already says "time since".
-    let elapsed = format_elapsed(session.last_activity);
+    let elapsed = format_elapsed(session.last_activity, now);
     let stats_title = card_stats_border_label(
         area.width.saturating_sub(2),
         &elapsed,
@@ -20982,8 +20999,13 @@ fn status_style(status: &SessionStatus) -> (&str, Style) {
 /// No ` ago` suffix — four columns of it are expensive on a border, and the
 /// `Last:` label already says "time since". [`render_session_card`] is the only
 /// caller, so there is one form and one function.
-fn format_elapsed(last_activity: DateTime<Utc>) -> String {
-    let now = Utc::now();
+///
+/// Issue #413: `now` is an input rather than a `Utc::now()` read, so the text
+/// is a pure function of its two arguments. The render path takes `now` from
+/// its caller all the way down — the main loop reads the clock once per frame
+/// and the L1 seams take it from the test — so a card snapshot built against a
+/// fixed instant renders the same `Last:` text however long the render takes.
+fn format_elapsed(last_activity: DateTime<Utc>, now: DateTime<Utc>) -> String {
     let delta = now.signed_duration_since(last_activity);
     let total_secs = delta.num_seconds().max(0);
 
@@ -21212,6 +21234,10 @@ pub fn render_config_gen_prompt_to_buffer(
 /// full-strength Magenta+BOLD+`▸ ` rendering, byte-for-byte what it produced
 /// before the mode became an input. Use [`render_card_for_mode_to_buffer`] to
 /// vary the mode.
+///
+/// Issue #413: `now` is the instant the card's `Last:` field is measured
+/// against. The seam reads no clock, so a fixture built against a fixed instant
+/// and rendered with that same instant produces the same buffer every run.
 #[doc(hidden)]
 #[allow(clippy::too_many_arguments)]
 pub fn render_card_to_buffer(
@@ -21220,6 +21246,7 @@ pub fn render_card_to_buffer(
     card_number: Option<u8>,
     density: CardDensityKind,
     tick: u64,
+    now: DateTime<Utc>,
     selected: bool,
     width: u16,
     height: u16,
@@ -21230,6 +21257,7 @@ pub fn render_card_to_buffer(
         card_number,
         density,
         tick,
+        now,
         selected,
         UiMode::Normal,
         width,
@@ -21257,6 +21285,7 @@ pub fn render_card_for_mode_to_buffer(
     card_number: Option<u8>,
     density: CardDensityKind,
     tick: u64,
+    now: DateTime<Utc>,
     selected: bool,
     mode: UiMode,
     width: u16,
@@ -21268,6 +21297,7 @@ pub fn render_card_for_mode_to_buffer(
         card_number,
         density,
         tick,
+        now,
         selected,
         mode,
         // Issue #308: the pre-#308 seams declare nothing, so a fixture that
@@ -21306,6 +21336,7 @@ pub fn render_card_with_declared_agent_to_buffer(
     card_number: Option<u8>,
     density: CardDensityKind,
     tick: u64,
+    now: DateTime<Utc>,
     selected: bool,
     mode: UiMode,
     declared_agent_type: Option<&AgentType>,
@@ -21339,6 +21370,7 @@ pub fn render_card_with_declared_agent_to_buffer(
                 density.into(),
                 mode,
                 declared_agent_type,
+                now,
             );
         })
         .expect("TestBackend draw should succeed");
@@ -21356,12 +21388,16 @@ pub fn render_card_with_declared_agent_to_buffer(
 /// PRD #341 M4: like [`render_card_to_buffer`], this is the command-mode
 /// (`UiMode::Normal`) baseline — the full-strength selection accent. The
 /// mode-varying single-card seam is [`render_card_for_mode_to_buffer`].
+///
+/// Issue #413: every card's `Last:` field is measured against `now`, as in
+/// [`render_card_to_buffer`].
 #[doc(hidden)]
 pub fn render_dashboard_cards_to_buffer(
     cards: &[(&SessionState, Option<&str>)],
     selected: Option<usize>,
     density: CardDensityKind,
     tick: u64,
+    now: DateTime<Utc>,
     width: u16,
 ) -> ratatui::buffer::Buffer {
     use ratatui::Terminal;
@@ -21408,6 +21444,7 @@ pub fn render_dashboard_cards_to_buffer(
                     card_density,
                     UiMode::Normal,
                     None,
+                    now,
                 );
             }
         })
@@ -21443,12 +21480,14 @@ pub struct CardGridProbe {
 /// — the thing that was dropping cards — had no L1 coverage at all.
 ///
 /// `cards` is `(session, display_name)` in deck order; `width` × `height` is the
-/// deck area, including the title and stats-bar rows it reserves.
+/// deck area, including the title and stats-bar rows it reserves. `now` is the
+/// instant each card's `Last:` field is measured against (issue #413).
 #[doc(hidden)]
 pub fn render_card_grid_to_buffer(
     cards: &[(&SessionState, Option<&str>)],
     selected: Option<usize>,
     scroll_offset: usize,
+    now: DateTime<Utc>,
     width: u16,
     height: u16,
 ) -> (ratatui::buffer::Buffer, CardGridProbe) {
@@ -21493,6 +21532,7 @@ pub fn render_card_grid_to_buffer(
                 &id_refs,
                 sessions.len(),
                 0,
+                now,
             );
         })
         .expect("TestBackend draw should succeed");
@@ -21663,12 +21703,13 @@ pub fn render_orchestration_frame_to_buffer(
 
     let mut ui = UiState::new(DashboardConfig::default(), KeybindingConfig::default());
     let mut state = AppState::default();
-    // Two hours back rather than "now": the card's bottom border renders
-    // `format_elapsed`, so a fresh timestamp reads `0s` for only ONE second
-    // before it becomes `1s`. At two hours the string is `2h` for a full minute,
-    // which is the difference between a snapshot that is deterministic in
-    // practice and one that is deterministic on a loaded machine too.
-    let last_activity = Utc::now() - chrono::Duration::hours(2);
+    // Issue #413: `now` is read once here and handed to `render_frame`, which
+    // reads no clock of its own, so every card's `Last:` field is `2h` however
+    // long the render takes. The two-hour offset used to be what bought that
+    // determinism (a fresh timestamp read `0s` for only one second); it now just
+    // keeps the rendering `render/layout/006` has always pinned.
+    let now = Utc::now();
+    let last_activity = now - chrono::Duration::hours(2);
     for (i, role) in role_names.iter().enumerate() {
         let session_id = format!("seam-role-{i}");
         state.sessions.insert(
@@ -21739,6 +21780,7 @@ pub fn render_orchestration_frame_to_buffer(
         .draw(|frame| {
             render_frame(
                 frame, &state, &mut ui, &filtered, 0, true, &ctrl, &tab_view, &tab_bar, &layout,
+                now,
             );
         })
         .expect("TestBackend draw should succeed");
@@ -22453,10 +22495,11 @@ pub fn observe_dashboard_geometry(width: u16, height: u16, card_count: usize) ->
 
     let mut ui = UiState::new(DashboardConfig::default(), KeybindingConfig::default());
     let mut state = AppState::default();
-    // Two hours back for the same reason the orchestration frame seam uses it:
-    // `format_elapsed` renders into the card, and a fresh timestamp changes
-    // string width within a second of the render.
-    let last_activity = Utc::now() - chrono::Duration::hours(2);
+    // Issue #413: one `now`, shared by the fixture and `render_frame`, as in the
+    // orchestration frame seam — the cards' `Last:` text cannot drift between
+    // building the sessions and drawing them.
+    let now = Utc::now();
+    let last_activity = now - chrono::Duration::hours(2);
     for i in 0..card_count {
         let session_id = format!("seam-session-{i}");
         state.sessions.insert(
@@ -22518,6 +22561,7 @@ pub fn observe_dashboard_geometry(width: u16, height: u16, card_count: usize) ->
         .draw(|frame| {
             render_frame(
                 frame, &state, &mut ui, &filtered, 0, true, &ctrl, &tab_view, &tab_bar, &layout,
+                now,
             );
         })
         .expect("TestBackend draw should succeed");
@@ -24183,8 +24227,17 @@ mod tests {
                     .map(|(_, r)| *r);
 
                 render_frame(
-                    frame, &state, &mut ui, &filtered, 0, false, &noop, &tab_view, &tab_bar,
+                    frame,
+                    &state,
+                    &mut ui,
+                    &filtered,
+                    0,
+                    false,
+                    &noop,
+                    &tab_view,
+                    &tab_bar,
                     &layout,
+                    Utc::now(),
                 );
             })
             .unwrap();
@@ -27473,15 +27526,20 @@ mod tests {
 
     #[test]
     fn test_format_elapsed() {
-        let now = Utc::now();
+        // Issue #413: a fixed instant, not `Utc::now()` — `format_elapsed` no
+        // longer reads the clock, so nothing here depends on how long it runs.
+        let now = DateTime::from_timestamp(1_767_225_600, 0).expect("valid instant");
         // PRD #339: compact form, no ` ago` suffix — the card's bottom border
         // is the only surface that renders this.
-        assert_eq!(format_elapsed(now), "0s");
-        assert_eq!(format_elapsed(now - Duration::seconds(3)), "3s");
-        assert_eq!(format_elapsed(now - Duration::seconds(90)), "1m 30s");
-        assert_eq!(format_elapsed(now - Duration::seconds(60)), "1m");
-        assert_eq!(format_elapsed(now - Duration::seconds(3900)), "1h 5m");
-        assert_eq!(format_elapsed(now - Duration::seconds(3600)), "1h");
+        assert_eq!(format_elapsed(now, now), "0s");
+        assert_eq!(format_elapsed(now - Duration::seconds(3), now), "3s");
+        assert_eq!(format_elapsed(now - Duration::seconds(90), now), "1m 30s");
+        assert_eq!(format_elapsed(now - Duration::seconds(60), now), "1m");
+        assert_eq!(format_elapsed(now - Duration::seconds(3900), now), "1h 5m");
+        assert_eq!(format_elapsed(now - Duration::seconds(3600), now), "1h");
+        // A `last_activity` ahead of `now` (clock skew between the event's
+        // producer and the deck) clamps to zero rather than going negative.
+        assert_eq!(format_elapsed(now + Duration::seconds(30), now), "0s");
     }
 
     #[test]
@@ -27604,8 +27662,17 @@ mod tests {
                     1,
                 );
                 render_frame(
-                    frame, &state, &mut ui, &filtered, 0, false, &noop, &tab_view, &tab_bar,
+                    frame,
+                    &state,
+                    &mut ui,
+                    &filtered,
+                    0,
+                    false,
+                    &noop,
+                    &tab_view,
+                    &tab_bar,
                     &layout,
+                    Utc::now(),
                 )
             })
             .unwrap();
@@ -27686,8 +27753,17 @@ mod tests {
                     1,
                 );
                 render_frame(
-                    frame, &state, &mut ui, &filtered, 0, false, &noop, &tab_view, &tab_bar,
+                    frame,
+                    &state,
+                    &mut ui,
+                    &filtered,
+                    0,
+                    false,
+                    &noop,
+                    &tab_view,
+                    &tab_bar,
                     &layout,
+                    Utc::now(),
                 )
             })
             .unwrap();
@@ -27819,8 +27895,17 @@ mod tests {
                     1,
                 );
                 render_frame(
-                    frame, &state, &mut ui, &filtered, 0, false, &noop, &tab_view, &tab_bar,
+                    frame,
+                    &state,
+                    &mut ui,
+                    &filtered,
+                    0,
+                    false,
+                    &noop,
+                    &tab_view,
+                    &tab_bar,
                     &layout,
+                    Utc::now(),
                 )
             })
             .unwrap();
@@ -28172,8 +28257,17 @@ mod tests {
                     1,
                 );
                 render_frame(
-                    frame, &state, &mut ui, &filtered, 0, false, &noop, &tab_view, &tab_bar,
+                    frame,
+                    &state,
+                    &mut ui,
+                    &filtered,
+                    0,
+                    false,
+                    &noop,
+                    &tab_view,
+                    &tab_bar,
                     &layout,
+                    Utc::now(),
                 )
             })
             .unwrap();
@@ -28322,8 +28416,17 @@ mod tests {
                     1,
                 );
                 render_frame(
-                    frame, &state, &mut ui, &filtered, 0, false, &noop, &tab_view, &tab_bar,
+                    frame,
+                    &state,
+                    &mut ui,
+                    &filtered,
+                    0,
+                    false,
+                    &noop,
+                    &tab_view,
+                    &tab_bar,
                     &layout,
+                    Utc::now(),
                 )
             })
             .unwrap();
@@ -28382,8 +28485,17 @@ mod tests {
                     1,
                 );
                 render_frame(
-                    frame, &state, &mut ui, &filtered, 0, false, &noop, &tab_view, &tab_bar,
+                    frame,
+                    &state,
+                    &mut ui,
+                    &filtered,
+                    0,
+                    false,
+                    &noop,
+                    &tab_view,
+                    &tab_bar,
                     &layout,
+                    Utc::now(),
                 )
             })
             .unwrap();
@@ -29112,6 +29224,7 @@ mod tests {
             ui.selected_index,
             CardDensityKind::Normal,
             0,
+            Utc::now(),
             100,
         );
         let visible: String = (0..buffer.area().height)
@@ -30165,6 +30278,7 @@ mod tests {
             ui.selected_index,
             CardDensityKind::Normal,
             0,
+            Utc::now(),
             80,
         );
         assert!(
@@ -30497,6 +30611,7 @@ mod tests {
             ui.selected_index,
             CardDensityKind::Normal,
             0,
+            Utc::now(),
             80,
         );
         assert!(
@@ -30505,8 +30620,14 @@ mod tests {
         );
 
         // Inactive → no card carries the marker.
-        let inactive =
-            render_dashboard_cards_to_buffer(&cards, None, CardDensityKind::Normal, 0, 80);
+        let inactive = render_dashboard_cards_to_buffer(
+            &cards,
+            None,
+            CardDensityKind::Normal,
+            0,
+            Utc::now(),
+            80,
+        );
         assert!(
             !buf_text(&inactive).contains('▸'),
             "an inactive selection paints no highlight"
