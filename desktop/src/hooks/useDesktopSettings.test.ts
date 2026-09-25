@@ -201,4 +201,21 @@ describe("useDesktopSettings unreadable document", () => {
     expect(result.current.problem).toBeUndefined();
     expect(result.current.saveError).toBeUndefined();
   });
+
+  it("still reports the problem a load that starts after an accepted save finds", async () => {
+    // Only a read already in flight when the save landed is stale. A later read
+    // — `getSettings` changes identity when the bridge does — describes the file
+    // as it is now, and a document broken again since must reach the footer.
+    const { pending, saveSettings } = deferredSaves();
+    const first = runtime(saveSettings);
+    const { result, rerender } = renderHook(({ value }) => useDesktopSettings(value), { initialProps: { value: first } });
+    await waitFor(() => expect(result.current.loaded).toBe(true));
+
+    await act(async () => { result.current.save(withMode("dark")); });
+    await act(async () => { pending[0].resolve(withMode("dark")); });
+    expect(result.current.problem).toBeUndefined();
+
+    rerender({ value: runtime(saveSettings, UNREADABLE) });
+    await waitFor(() => expect(result.current.problem).toBe(UNREADABLE));
+  });
 });
