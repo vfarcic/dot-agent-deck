@@ -738,47 +738,68 @@ async fn provision_repo(workspace: &Path, clone_dir: &Path, repo: &str) -> Resul
 /// on disk, and every later fire takes an existing directory for a finished
 /// clone: it checks the origin, tries a refresh that can only fail, and never
 /// clones again, so the schedule could not recover without someone deleting the
-/// directory by hand. Staged, `clone_dir` exists only as a complete clone, and
-/// whatever a failed attempt left is in the staging directory, which the next
-/// attempt clears before it starts. Raised by Greptile on PR #1304.
+/// directory by hand. Staged, `clone_dir` exists only as a complete clone.
+/// Raised by Greptile on PR #1304.
+///
+/// **The staging name is unique to this call** (process id plus a
+/// per-process counter), so two attempts at the same clone — two tasks sharing
+/// a workspace, or two daemons — never clear or rename each other's work in
+/// progress (raised by Qodo on PR #1304). The cost is that a staging directory
+/// orphaned by a daemon that died mid-clone is not reclaimed automatically; it
+/// is inert, because nothing reads a `.cloning-*` sibling as a clone. If
+/// another attempt finished first, `rename` onto its non-empty directory fails,
+/// and that is reported as success once `clone_dir` is present: the clone the
+/// caller wanted exists, and this attempt's copy is discarded.
 ///
 /// The staging directory is a sibling so the final `rename` stays on one
 /// filesystem and is atomic. Moving a fresh clone is safe because it has no
 /// linked worktrees yet (`.worktrees/` is created later), and a linked worktree
-/// is what would record the clone's absolute path.
+/// is what would record the clone's absolute path. The filesystem calls go
+/// through `tokio::fs`, which runs them off the async workers, because removing
+/// a partial clone walks every file it has.
 async fn clone_via_staging<F, Fut>(clone_dir: &Path, clone: F) -> Result<(), String>
 where
     F: FnOnce(PathBuf) -> Fut,
     Fut: std::future::Future<Output = Result<(), String>>,
 {
+    static ATTEMPT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let name = clone_dir
         .file_name()
         .ok_or_else(|| format!("clone dir {} has no file name", clone_dir.display()))?;
     let mut staging_name = name.to_os_string();
-    staging_name.push(".cloning");
+    staging_name.push(format!(
+        ".cloning-{}-{}",
+        std::process::id(),
+        ATTEMPT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
     let staging = clone_dir.with_file_name(staging_name);
-    let clear = |path: &Path| match std::fs::remove_dir_all(path) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(format!(
-            "failed to clear the partial clone at {}: {e}",
-            path.display()
-        )),
-    };
-    clear(&staging)?;
-    if let Err(e) = clone(staging.clone()).await {
-        if let Err(cleanup) = clear(&staging) {
-            tracing::warn!(error = %cleanup, "issue-dispatch: partial clone left in place");
+    let discard = |path: PathBuf| async move {
+        match tokio::fs::remove_dir_all(&path).await {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => tracing::warn!(
+                staging = %path.display(),
+                error = %e,
+                "issue-dispatch: could not remove a partial clone's staging directory"
+            ),
         }
+    };
+    if let Err(e) = clone(staging.clone()).await {
+        discard(staging).await;
         return Err(e);
     }
-    std::fs::rename(&staging, clone_dir).map_err(|e| {
-        format!(
+    match tokio::fs::rename(&staging, clone_dir).await {
+        Ok(()) => Ok(()),
+        Err(_) if clone_dir.is_dir() => {
+            discard(staging).await;
+            Ok(())
+        }
+        Err(e) => Err(format!(
             "cloned into {} but could not move it to {}: {e}",
             staging.display(),
             clone_dir.display()
-        )
-    })
+        )),
+    }
 }
 
 /// Keep the per-issue worktrees dir (`<clone>/.worktrees/`) out of the clone's
@@ -1147,9 +1168,9 @@ pub async fn create_worktree(
     let branch_ref = format!("refs/heads/{branch}");
     let mut attempt: u32 = 1;
     // Issue #692 / PR #1304: what a timed-out add may be cleaned up against.
-    // Whether the branch was there before the FIRST attempt — later attempts can
-    // only see a branch our own failed attempt made — and whether the worktree
-    // directory was there before the attempt that ended the loop.
+    // What the FIRST attempt's branch probe found — later attempts can only see
+    // a branch our own failed attempt made — and whether the worktree directory
+    // was there before the attempt that ended the loop.
     let mut branch_existed_initially = None;
     let mut dir_existed_before_add;
     let add = loop {
@@ -1159,17 +1180,9 @@ pub async fn create_worktree(
         // fail with "a branch named … already exists" and turn a transient race
         // into a hard failure — and, with `reuse_existing_branch: false`, into a
         // dispatch name the user has to `git branch -D` by hand.
-        let branch_exists = run_git_status(&[
-            "-C",
-            &clone,
-            "rev-parse",
-            "--verify",
-            "--quiet",
-            &branch_ref,
-        ])
-        .await
-        .is_ok();
-        branch_existed_initially.get_or_insert(branch_exists);
+        let probe = probe_branch(&clone, &branch_ref).await;
+        let branch_exists = probe == BranchProbe::Present;
+        branch_existed_initially.get_or_insert(probe);
         // Only attempt 1 can report BranchExists. Reaching attempt 2 means the
         // branch was PROVEN absent moments ago, so anything there now was
         // created either by our own failed attempt or by a dispatch racing us —
@@ -1268,7 +1281,11 @@ pub async fn create_worktree(
         // dispatch from having created it in between. Without the lock the
         // directory is left alone and the timeout is reported as it stands.
         Err(e) if is_subprocess_timeout(&e) && repo_lock.is_some() && !dir_existed_before_add => {
-            let created_branch = (branch_existed_initially == Some(false)).then_some(branch);
+            // Only a DEFINITE absence licenses deleting the branch: a probe that
+            // could not answer (it timed out, or git would not run) proves
+            // nothing, and the branch may hold committed work (Qodo, PR #1304).
+            let created_branch =
+                (branch_existed_initially == Some(BranchProbe::Absent)).then_some(branch);
             discard_timed_out_worktree(clone_dir, worktree_dir, created_branch).await;
             Err(e)
         }
@@ -1285,6 +1302,39 @@ pub async fn create_worktree(
     }
 }
 
+/// What `git rev-parse --verify --quiet <ref>` said about a branch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BranchProbe {
+    /// Exit 0: the ref resolves.
+    Present,
+    /// Exit 1, which is how `--verify --quiet` reports a ref that does not
+    /// exist.
+    Absent,
+    /// Anything else — a timeout, a `git` that would not start, another exit
+    /// status. Treated as absent for choosing `-b`, exactly as the old
+    /// `is_ok()` probe did, but never as proof that a branch may be deleted.
+    Unknown,
+}
+
+/// Probe `branch_ref` in `clone`, telling "absent" apart from "could not tell"
+/// (Qodo, PR #1304) — the difference decides whether a timed-out add's cleanup
+/// may delete the branch.
+async fn probe_branch(clone: &str, branch_ref: &str) -> BranchProbe {
+    let args = ["-C", clone, "rev-parse", "--verify", "--quiet", branch_ref];
+    match output_within(
+        crate::git_env::git_async(),
+        crate::git_env::GIT,
+        &args,
+        SUBPROCESS_TIMEOUT,
+    )
+    .await
+    {
+        Ok(out) if out.status.success() => BranchProbe::Present,
+        Ok(out) if out.status.code() == Some(1) => BranchProbe::Absent,
+        _ => BranchProbe::Unknown,
+    }
+}
+
 /// Undo what a `git worktree add` killed at [`SUBPROCESS_TIMEOUT`] left behind
 /// (issue #692): its half-checked-out directory, its administrative entry, and —
 /// when `created_branch` names one — the branch its `-b` created.
@@ -1296,7 +1346,8 @@ pub async fn create_worktree(
 /// existed without it. `--force` twice, because a killed add leaves its entry
 /// `locked` ("initializing") and a single `--force` refuses a locked worktree.
 /// The branch is deleted only when it did not exist before the first attempt,
-/// so a reused branch that may hold committed work is never touched.
+/// so a reused branch that may hold committed work is never touched — and `git
+/// branch -D` itself refuses a branch another worktree has checked out.
 async fn discard_timed_out_worktree(
     clone_dir: &Path,
     worktree_dir: &Path,
@@ -1315,7 +1366,9 @@ async fn discard_timed_out_worktree(
             "issue-dispatch: git could not remove the timed-out worktree; removing its directory"
         );
     }
-    match std::fs::remove_dir_all(worktree_dir) {
+    // `tokio::fs` so walking a large partial checkout does not hold an async
+    // worker (Qodo, PR #1304).
+    match tokio::fs::remove_dir_all(worktree_dir).await {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => tracing::warn!(
@@ -1913,14 +1966,25 @@ mod tests {
         assert!(!is_subprocess_timeout(&err), "{err}");
     }
 
-    /// PR #1304 (Greptile): a clone that fails partway leaves no `clone_dir`,
-    /// so the next fire clones again instead of taking a half-written directory
-    /// for a finished clone; a stale staging directory from an earlier attempt
-    /// is cleared; and a clone that succeeds lands at `clone_dir`.
+    /// PR #1304 (Greptile, Qodo): a clone that fails partway leaves no
+    /// `clone_dir` and no staging directory, so the next fire clones again
+    /// instead of taking a half-written directory for a finished clone; each
+    /// call stages under its own name, so a concurrent attempt's work in
+    /// progress is untouched; a clone that succeeds lands at `clone_dir`; and
+    /// one that loses the race to an attempt that already finished still
+    /// succeeds, leaving the winner's clone in place.
     #[tokio::test]
     async fn a_failed_clone_leaves_nothing_a_later_fire_would_mistake_for_a_clone() {
         let ws = tempfile::tempdir().expect("tempdir");
         let clone_dir = ws.path().join("repo");
+        let entries = || -> Vec<String> {
+            let mut names: Vec<String> = std::fs::read_dir(ws.path())
+                .expect("read workspace")
+                .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+                .collect();
+            names.sort();
+            names
+        };
 
         let err = clone_via_staging(&clone_dir, |staging| async move {
             std::fs::create_dir_all(staging.join(".git")).expect("start a partial clone");
@@ -1930,21 +1994,14 @@ mod tests {
         .expect_err("a failed clone must fail");
         assert!(err.contains("did not finish"), "{err}");
         assert!(
-            !clone_dir.exists(),
-            "a failed clone must not leave clone_dir"
-        );
-        assert!(
-            !ws.path().join("repo.cloning").exists(),
-            "the failed attempt's staging directory must be cleared"
+            entries().is_empty(),
+            "a failed clone must leave neither clone_dir nor its staging dir: {:?}",
+            entries()
         );
 
-        std::fs::create_dir_all(ws.path().join("repo.cloning").join("stale"))
-            .expect("plant a leftover from a daemon that died mid-clone");
+        let concurrent = ws.path().join("repo.cloning-concurrent");
+        std::fs::create_dir_all(concurrent.join(".git")).expect("another attempt, mid-clone");
         clone_via_staging(&clone_dir, |staging| async move {
-            assert!(
-                !staging.exists(),
-                "a leftover staging directory must be cleared before cloning"
-            );
             std::fs::create_dir_all(staging.join(".git")).expect("clone");
             Ok(())
         })
@@ -1954,7 +2011,55 @@ mod tests {
             clone_dir.join(".git").is_dir(),
             "the clone lands at clone_dir"
         );
-        assert!(!ws.path().join("repo.cloning").exists());
+        assert!(
+            concurrent.join(".git").is_dir(),
+            "another attempt's staging directory must be left alone"
+        );
+
+        std::fs::write(clone_dir.join("winner"), "").expect("mark the finished clone");
+        clone_via_staging(&clone_dir, |staging| async move {
+            std::fs::create_dir_all(staging.join(".git")).expect("clone");
+            std::fs::write(staging.join("loser"), "").expect("mark this copy");
+            Ok(())
+        })
+        .await
+        .expect("losing the race to a finished clone is still a clone");
+        assert!(
+            clone_dir.join("winner").exists(),
+            "the winner's clone is kept"
+        );
+        assert!(!clone_dir.join("loser").exists());
+        assert_eq!(
+            entries(),
+            vec!["repo".to_string(), "repo.cloning-concurrent".to_string()],
+            "the losing copy's staging directory is discarded"
+        );
+    }
+
+    /// PR #1304 (Qodo): the branch probe tells "absent" from "could not
+    /// tell", because only a definite absence lets a timed-out add's cleanup
+    /// delete the branch. A directory that is not a repository makes `git`
+    /// exit 128, which must not read as absent.
+    #[tokio::test]
+    async fn the_branch_probe_does_not_mistake_a_failed_probe_for_an_absent_branch() {
+        let scratch = crate::test_temp::tempdir().expect("scratch tempdir");
+        let repo = scratch.path().join("repo");
+        init_repo_with_commit(scratch.path(), &repo);
+        let clone = repo.to_string_lossy();
+        assert_eq!(
+            probe_branch(&clone, "refs/heads/main").await,
+            BranchProbe::Present
+        );
+        assert_eq!(
+            probe_branch(&clone, "refs/heads/agent/no-such-branch").await,
+            BranchProbe::Absent
+        );
+        let not_a_repo = scratch.path().join("not-a-repo");
+        std::fs::create_dir_all(&not_a_repo).expect("create a plain directory");
+        assert_eq!(
+            probe_branch(&not_a_repo.to_string_lossy(), "refs/heads/main").await,
+            BranchProbe::Unknown
+        );
     }
 
     /// PR #1304 (Greptile): what a killed `git worktree add` leaves — a
