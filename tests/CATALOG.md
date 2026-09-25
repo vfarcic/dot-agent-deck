@@ -1313,6 +1313,14 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** that the ledger stays empty after the refusal, or that the longest id a client mints fits the cap — both pinned at the unit level by `agent_pty::delivery_ledger_refuses_an_oversized_id_without_storing_it`.
 - **Platform coverage:** mac+linux.
 
+##### prompt/pane-input/040 — The 10-second readiness fallback pays the readiness buffer before it writes, on both spawn-time delivery paths (issue #529).
+- **Layer:** L1, in `src/ui.rs`'s own test module (the production `process_pending_seed_prompts` and `deliver_orchestrator_prompt` driven over a recording pane controller), so it runs under `cargo test-fast` and therefore in the `build` job.
+- **Agent:** none (panes with no session at all, so nothing announces a conversation and `spawn_time_agent_ready` stays false — asserted as a precondition on the seed half).
+- **Asserts:** a seed aged 1 ms past `SPAWN_TIME_READINESS_TIMEOUT` gets NO write and is held rather than dropped; re-aged to `SPAWN_TIME_READINESS_TIMEOUT + SPAWN_TIME_READINESS_BUFFER` it gets exactly one write carrying the seed. The same pair for an orchestration start-role remit, driven with explicit instants against its tab anchor: no write and the remit not consumed at `anchor + 10 s + 1 ms`, exactly one write carrying it at `anchor + 10 s + 500 ms`. The seed fixture carries an already-spent `ready_since`, so a fallback that borrowed that stamp instead of counting from its own 10 s would also go red.
+- **Why it exists:** both paths used to set `buffer_elapsed = true` on the timeout branch, so the one delivery made with no evidence at all that the agent's input handling was up was also the one made with no buffer. Fails on the pre-fix code at each half's first assertion.
+- **Does not assert:** the buffer's size (500 ms, tuned under PRD #128); the fast path's buffer (`should_inject_spawn_time_prompt`'s unit tests); that the fallback still delivers for a producer that announces nothing (`prompt/pane-input/036`); confirmation, retry or deadline behaviour after the write (`prompt/pane-input/023`–`/030`); the daemon-owned delegate path, which pays its own buffer after its timeout in `state.rs`.
+- **Platform coverage:** mac+linux+windows.
+
 #### prompt/quit
 
 ##### prompt/quit/001 — `Ctrl+c` from command mode opens the quit confirmation dialog with three options: **Detach** (default), **Stop**, **Cancel**.
@@ -1637,6 +1645,13 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Agent:** none (fixture whose single mode has one persistent pane running `printf …; sleep 600` under the default watch wrapper).
 - **Asserts:** a sentinel assembled at runtime by the command — so it cannot appear in the command line the pane's shell echoes — is visible in the side pane although the command never exits; the echoed wrapper invocation is gone from the pane, proving the watcher cleared the screen ahead of its first output rather than after process exit.
 - **Does not assert:** the 10s re-run interval; the ordering of interleaved stdout/stderr; the buffer-then-clear internals (covered by `watch::tests` unit tests).
+- **Platform coverage:** mac+linux.
+
+##### tabs/mode/007 — A mode's `seed_prompt` reaches an agent that never signals readiness, through the 10-second fallback and no sooner than its readiness buffer allows (issue #529).
+- **Layer:** L2 (lane 1).
+- **Agent:** none — `tabs/mode/005`'s recorder with its `SessionStart` line removed, so nothing announces a conversation and only the `timeout_ready` fallback in `process_pending_seed_prompts` can open the pane.
+- **Asserts:** spawning the `seeded` mode via the new-pane dialog with that silent recorder still delivers the configured `seed_prompt` into the agent pane (the marker is recorded within 30 s), and it is observed more than 10.5 s after the test began typing the spawn. That instant precedes the seed's `created_at` anchor, so with the buffer in place the bound holds by construction and cannot flake on a slow box.
+- **Does not assert:** the 500 ms boundary itself. Spawn latency and render-frame jitter are the same order as the buffer, so the pre-fix code can also clear 10.5 s here; `prompt/pane-input/040` is the discriminator, at L1 with explicit instants. Also not: the orchestrator remit's fallback (L1 only, same entry), or confirmation and retry after the write.
 - **Platform coverage:** mac+linux.
 
 #### tabs/orchestration
