@@ -2332,6 +2332,14 @@ pub struct RunningAgent {
     pub process_group: crate::platform::proc::AgentProcessGroup,
     pub master: Box<dyn portable_pty::MasterPty + Send>,
     pub writer: Arc<AsyncMutex<PaneWriter>>,
+    /// Issue #542: shared with [`Self::writer`]'s [`PaneWriter`] and set by
+    /// [`AgentPtyRegistry::close_agent`] and
+    /// [`AgentPtyRegistry::respawn_agent_for_pane`] when this record leaves the
+    /// registry, so a write already holding that writer cannot record into
+    /// [`PaneInputState`] after the removal. An atomic beside the writer rather
+    /// than a field behind its async lock, because the removal paths are
+    /// synchronous and must not wait on a writer another task holds.
+    pub pane_retired: Arc<AtomicBool>,
     pub bus: Arc<AgentBus>,
     /// Value of [`DOT_AGENT_DECK_PANE_ID`] captured from the spawn-time env,
     /// if the caller supplied one. Echoed back to clients via the M2.x
@@ -3356,6 +3364,17 @@ pub struct PaneWriter {
     /// observe.
     pane_id_env: Option<String>,
     state: Arc<Mutex<PaneInputState>>,
+    /// Issue #542: set once this writer's agent has left the registry — the
+    /// same flag as [`RunningAgent::pane_retired`]. From then on nothing written
+    /// through this writer records anything in [`PaneInputState`].
+    ///
+    /// Read only while holding `state`'s lock, and set by the removal path
+    /// BEFORE it takes that lock to prune the pane. So a record made through
+    /// this writer is either made before the prune (and removed by it) or finds
+    /// the flag already set (and is skipped). A write or a guarded send that
+    /// passed its ownership check before the close and finishes after it can no
+    /// longer bring a closed pane's clocks back.
+    retired: Arc<AtomicBool>,
 }
 
 impl PaneWriter {
@@ -3363,11 +3382,51 @@ impl PaneWriter {
         inner: Box<dyn std::io::Write + Send>,
         pane_id_env: Option<String>,
         state: Arc<Mutex<PaneInputState>>,
+        retired: Arc<AtomicBool>,
     ) -> Self {
         Self {
             inner,
             pane_id_env,
             state,
+            retired,
+        }
+    }
+
+    /// PRD #127 M2.2: stamp `pane_id_env`'s user-input clock as this writer —
+    /// a no-op once the writer's agent has left the registry (issue #542, see
+    /// [`Self::retired`]). The attach STREAM_IN path calls this while holding
+    /// the writer, in place of [`AgentPtyRegistry::note_user_input`], which has
+    /// no generation to check.
+    pub(crate) fn note_user_input(&self, pane_id_env: &str) {
+        let mut state = self.state.lock().unwrap();
+        if !self.retired.load(Ordering::SeqCst) {
+            state.note_user_input(pane_id_env);
+        }
+    }
+
+    /// Issue #424 F1: record that a guarded send in `mode` just put `payload`
+    /// into `pane_id_env`. See
+    /// [`AgentPtyRegistry::user_typed_since_automatic_write`] and
+    /// [`AgentPtyRegistry::user_typed_since_writing_payload`].
+    ///
+    /// An empty SUBMIT payload — a probe — advances the clock without touching
+    /// the recorded payloads. It wrote no bytes, so it left the box holding
+    /// whatever the last payload write put there, and if that submitted
+    /// cleanly the delivery is confirmed and there is no later attempt to
+    /// guard. Keeping the record is the conservative half of the choice: it can
+    /// only refuse a repeat, never let one through.
+    ///
+    /// Issue #424 H2: a [`SubmitMode::Notice`] records NOTHING. It advances no
+    /// clock a submit decision reads, and its LF-terminated bytes are not a task
+    /// a replacement could double — see [`AutomaticWrite::submitted_at`].
+    ///
+    /// Issue #542: made AS the writer the guarded send holds, rather than
+    /// through the registry, so it is a no-op once that writer's agent has left
+    /// the registry — see [`Self::retired`].
+    fn note_automatic_write(&self, pane_id_env: &str, mode: SubmitMode, payload: &[u8]) {
+        let mut state = self.state.lock().unwrap();
+        if !self.retired.load(Ordering::SeqCst) {
+            state.note_automatic_write(pane_id_env, mode, payload);
         }
     }
 
@@ -3386,10 +3445,11 @@ impl std::io::Write for PaneWriter {
         if written > 0
             && let Some(pane_id) = self.pane_id_env.as_deref()
         {
-            self.state
-                .lock()
-                .unwrap()
-                .note_user_bytes(pane_id, &buf[..written]);
+            let mut state = self.state.lock().unwrap();
+            // Issue #542: checked under `state`'s lock — see [`Self::retired`].
+            if !self.retired.load(Ordering::SeqCst) {
+                state.note_user_bytes(pane_id, &buf[..written]);
+            }
         }
         Ok(written)
     }
@@ -6056,27 +6116,6 @@ impl AgentPtyRegistry {
             .is_some_and(crate::prompt_delivery::agent_reports_submitted_prompt)
     }
 
-    /// Issue #424 F1: record that a guarded send in `mode` just put `payload`
-    /// into `pane_id_env`. See [`Self::user_typed_since_automatic_write`] and
-    /// [`Self::user_typed_since_writing_payload`].
-    ///
-    /// An empty SUBMIT payload — a probe — advances the clock without touching
-    /// the recorded payloads. It wrote no bytes, so it left the box holding
-    /// whatever the last payload write put there, and if that submitted
-    /// cleanly the delivery is confirmed and there is no later attempt to
-    /// guard. Keeping the record is the conservative half of the choice: it can
-    /// only refuse a repeat, never let one through.
-    ///
-    /// Issue #424 H2: a [`SubmitMode::Notice`] records NOTHING. It advances no
-    /// clock a submit decision reads, and its LF-terminated bytes are not a task
-    /// a replacement could double — see [`AutomaticWrite::submitted_at`].
-    fn note_automatic_write(&self, pane_id_env: &str, mode: SubmitMode, payload: &[u8]) {
-        self.pane_input
-            .lock()
-            .unwrap()
-            .note_automatic_write(pane_id_env, mode, payload);
-    }
-
     /// PRD #127 M2.2: whether `agent_id` is still a live (non-exited) agent in
     /// the registry. The scheduler's reuse registry uses this to decide whether
     /// a recorded tab is still reusable or stale (closed/exited → spawn fresh).
@@ -6596,6 +6635,7 @@ impl AgentPtyRegistry {
             )
         });
 
+        let pane_retired = Arc::new(AtomicBool::new(false));
         let agent = RunningAgent {
             child,
             process_group,
@@ -6607,7 +6647,9 @@ impl AgentPtyRegistry {
                 writer,
                 pane_id_env.clone(),
                 self.pane_input.clone(),
+                pane_retired.clone(),
             ))),
+            pane_retired,
             bus,
             pane_id_env,
             display_name,
@@ -7194,7 +7236,7 @@ impl AgentPtyRegistry {
             // write is the case where a replacement is most tempting and most
             // dangerous.
             PayloadDelivery::Applied => {
-                self.note_automatic_write(pane_id, mode, &payload);
+                w.note_automatic_write(pane_id, mode, &payload);
                 Ok(GuardedSendDetail::Outcome(GuardedSend::Applied))
             }
             // Issue #876: an ambiguous write is recorded only while bytes of
@@ -7223,7 +7265,7 @@ impl AgentPtyRegistry {
                 let leaves_bytes_behind = stranded > 0;
                 let is_submit = matches!(mode, SubmitMode::Submit);
                 if leaves_bytes_behind || payload.is_empty() {
-                    self.note_automatic_write(pane_id, mode, &payload);
+                    w.note_automatic_write(pane_id, mode, &payload);
                 }
                 if leaves_bytes_behind && is_submit {
                     tracing::warn!(
@@ -7453,12 +7495,17 @@ impl AgentPtyRegistry {
     /// The map's monotonic growth is bounded by pane creation rate
     /// (~64 B/entry) — accepted as negligible.
     ///
-    /// Issue #542: the removal also drops the agent's launcher standing and,
-    /// when nothing left in the registry — no other record, live or exited, and
-    /// no spawn reservation — names its pane, every pane-keyed clock for that
-    /// pane. Both happen under the same registry lock as the removal, so a
+    /// Issue #542: the removal also drops the agent's launcher standing, retires
+    /// its writer ([`RunningAgent::pane_retired`]) so nothing already holding it
+    /// can record into the pane's clocks afterwards, and — when no other record,
+    /// live or exited, names its pane — drops every pane-keyed clock for that
+    /// pane. All of it happens under the same registry lock as the removal, so a
     /// successor spawning into the pane either claims it first (and the clocks
     /// are kept for it) or claims it after (and starts from a pane with none).
+    /// A spawn that has only RESERVED the pane does not keep them: its agent is
+    /// a new input box whatever the reservation's outcome, and keeping them for
+    /// a reservation that then failed would leave them with nothing to prune
+    /// them.
     pub fn close_agent(&self, id: &str) -> Result<(), AgentPtyError> {
         let mut agent = {
             let mut inner = self.inner.lock().unwrap();
@@ -7467,15 +7514,13 @@ impl AgentPtyRegistry {
                 .remove(id)
                 .ok_or_else(|| AgentPtyError::NotFound(id.to_string()))?;
             self.forget_launcher_handoff(id);
+            // Before the pane-state lock below — see [`PaneWriter::retired`].
+            agent.pane_retired.store(true, Ordering::SeqCst);
             if let Some(pane) = agent.pane_id_env.as_deref() {
                 let still_claimed = inner
                     .agents
                     .values()
-                    .any(|a| a.pane_id_env.as_deref() == Some(pane))
-                    || inner
-                        .pending_spawns
-                        .values()
-                        .any(|reserved| reserved.as_deref() == Some(pane));
+                    .any(|a| a.pane_id_env.as_deref() == Some(pane));
                 if !still_claimed {
                     self.pane_input.lock().unwrap().forget_closed_pane(pane);
                 }
@@ -7666,8 +7711,11 @@ impl AgentPtyRegistry {
                 .expect("agent_id was just located inside the same lock hold");
             // Issue #542: the old generation's launcher standing leaves with
             // it. The pane-keyed clocks stay — the pane is not going away, and
-            // `spawn_agent` resets what a new occupant must not inherit.
+            // `spawn_agent` resets what a new occupant must not inherit. The
+            // old generation's writer is retired all the same, so a write it is
+            // still finishing cannot record into the successor's input box.
             self.forget_launcher_handoff(&agent_id);
+            removed.pane_retired.store(true, Ordering::SeqCst);
             removed
         };
 
@@ -7721,6 +7769,7 @@ impl AgentPtyRegistry {
             // handover flag has nothing left to disown. The fresh generation
             // starts `false` and takes the pane over in `spawn_agent`.
             pane_handed_over: _,
+            pane_retired: _,
             // PRD #201: a respawn (`clear = true` delegate) drops any seed the
             // old child left unconsumed; the caller re-arms the fresh child's
             // seed via `set_pending_seed` right after this returns.
@@ -9465,6 +9514,7 @@ impl AgentPtyRegistry {
         let mut inner = self.inner.lock().unwrap();
         inner.next_id += 1;
         let id = format!("test-agent-{}", inner.next_id);
+        let pane_retired = Arc::new(AtomicBool::new(false));
         inner.agents.insert(
             id.clone(),
             RunningAgent {
@@ -9482,7 +9532,9 @@ impl AgentPtyRegistry {
                     writer,
                     None,
                     self.pane_input.clone(),
+                    pane_retired.clone(),
                 ))),
+                pane_retired,
                 bus: Arc::new(AgentBus::new()),
                 pane_id_env: pane_id_env.map(str::to_string),
                 display_name: None,
@@ -15279,7 +15331,11 @@ mod spawn_tests {
             .expect("spawn sh");
 
         registry.note_launcher_handoff(&id, AgentType::ClaudeCode);
-        registry.note_automatic_write(PANE, SubmitMode::Submit, b"payload");
+        registry.pane_input.lock().unwrap().note_automatic_write(
+            PANE,
+            SubmitMode::Submit,
+            b"payload",
+        );
         registry
             .pane_input
             .lock()
@@ -15346,7 +15402,11 @@ mod spawn_tests {
             })
             .expect("spawn the successor into the same pane");
         registry.note_launcher_handoff(&successor, AgentType::ClaudeCode);
-        registry.note_automatic_write(PANE, SubmitMode::Submit, b"payload");
+        registry.pane_input.lock().unwrap().note_automatic_write(
+            PANE,
+            SubmitMode::Submit,
+            b"payload",
+        );
         registry.note_user_input(PANE);
 
         registry
@@ -15367,6 +15427,106 @@ mod spawn_tests {
             .expect("close the successor");
         assert!(!registry.pane_input_tracks(PANE));
         assert_eq!(registry.launcher_handoff_count(), 0);
+    }
+
+    /// Issue #542 (PR #1293 review): an operation that already holds the
+    /// agent's writer when the close lands — a STREAM_IN frame or a guarded
+    /// send past its ownership re-validation — finishes after the prune. Its
+    /// record must not bring the closed pane's clocks back.
+    #[tokio::test]
+    async fn a_writer_held_across_close_agent_records_nothing_after_it() {
+        const PANE: &str = "issue-542-held-writer";
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let id = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("/bin/sh"),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), PANE.to_string())],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn sh");
+        let writer = registry
+            .inner
+            .lock()
+            .unwrap()
+            .agents
+            .get(&id)
+            .expect("the agent is registered")
+            .writer
+            .clone();
+        let w = writer.lock().await;
+        // The control: the same calls record while the agent is registered.
+        w.note_user_input(PANE);
+        w.note_automatic_write(PANE, SubmitMode::Submit, b"payload");
+        assert!(registry.pane_input_tracks(PANE));
+
+        registry
+            .close_agent(&id)
+            .expect("close while the writer is held");
+        assert!(!registry.pane_input_tracks(PANE));
+
+        w.note_user_input(PANE);
+        w.note_automatic_write(PANE, SubmitMode::Submit, b"payload");
+        assert!(
+            !registry.pane_input_tracks(PANE),
+            "a retired writer must record nothing into the closed pane"
+        );
+    }
+
+    /// Issue #542: the user-byte stamp inside `PaneWriter`'s `Write` impl
+    /// honours the retired flag too — that is the path an attach stream's bytes
+    /// take, and it stamps before `note_user_input` does.
+    #[test]
+    fn a_retired_pane_writer_stamps_no_user_bytes() {
+        use std::io::Write as _;
+        const PANE: &str = "issue-542-retired-writer";
+        let state = Arc::new(Mutex::new(PaneInputState::default()));
+        let retired = Arc::new(AtomicBool::new(false));
+        let mut writer = PaneWriter::new(
+            Box::new(std::io::sink()),
+            Some(PANE.to_string()),
+            state.clone(),
+            retired.clone(),
+        );
+        writer.write_all(b"typed").expect("write to sink");
+        assert!(state.lock().unwrap().tracks_pane(PANE), "the control");
+
+        state.lock().unwrap().forget_closed_pane(PANE);
+        retired.store(true, Ordering::SeqCst);
+        writer.write_all(b"typed").expect("write to sink");
+        assert!(!state.lock().unwrap().tracks_pane(PANE));
+    }
+
+    /// Issue #542 (PR #1293 review): a spawn that has only RESERVED the pane
+    /// does not keep a closed pane's clocks. Were they kept and that spawn then
+    /// failed, nothing would be left to prune them, and a later occupant would
+    /// inherit a stale user-input stamp.
+    #[tokio::test]
+    async fn close_agent_does_not_keep_pane_clocks_for_a_mere_reservation() {
+        const PANE: &str = "issue-542-reserved-pane";
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let id = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("/bin/sh"),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), PANE.to_string())],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn sh");
+        registry.note_user_input(PANE);
+        registry
+            .inner
+            .lock()
+            .unwrap()
+            .pending_spawns
+            .insert("pending-successor".to_string(), Some(PANE.to_string()));
+
+        registry.close_agent(&id).expect("close");
+        assert!(!registry.pane_input_tracks(PANE));
+        registry
+            .inner
+            .lock()
+            .unwrap()
+            .pending_spawns
+            .remove("pending-successor");
     }
 
     /// Issue #542: a respawn removes the old generation, so its launcher

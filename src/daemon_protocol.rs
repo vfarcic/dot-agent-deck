@@ -5371,7 +5371,12 @@ async fn handle_attach_stream(
                 // respect to handoff, and this call keeps the frame-level
                 // contract (including the zero-byte frame the auditor noted)
                 // exactly as it was.
-                registry.note_user_input(&pane_id);
+                //
+                // Issue #542: stamped THROUGH the held writer, which skips it
+                // once this agent has been closed — a frame that passed the
+                // re-validation above and finishes after the close must not
+                // bring the closed pane's clock back.
+                w.note_user_input(&pane_id);
                 drop(w);
             }
             Ok(Some((KIND_DETACH, _))) => {
