@@ -1640,6 +1640,13 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** the 10s re-run interval; the ordering of interleaved stdout/stderr; the buffer-then-clear internals (covered by `watch::tests` unit tests).
 - **Platform coverage:** mac+linux.
 
+##### tabs/mode/007 — A mode's `seed_prompt` reaches an agent that never signals readiness, through the 10-second fallback and no sooner than its readiness buffer allows (issue #529).
+- **Layer:** L2 (lane 1).
+- **Agent:** none — `tabs/mode/005`'s recorder with its `SessionStart` line removed, so nothing announces a conversation and only the `timeout_ready` fallback in `process_pending_seed_prompts` can open the pane.
+- **Asserts:** spawning the `seeded` mode via the new-pane dialog with that silent recorder still delivers the configured `seed_prompt` into the agent pane (the marker is recorded within 30 s), and it is observed more than 10.5 s after the test began typing the spawn. That instant precedes the seed's `created_at` anchor, so with the buffer in place the bound holds by construction and cannot flake on a slow box.
+- **Does not assert:** the 500 ms boundary itself. Spawn latency and render-frame jitter are the same order as the buffer, so the pre-fix code can also clear 10.5 s here; `prompt/pane-input/040` is the discriminator, at L1 with explicit instants. Also not: the orchestrator remit's fallback (L1 only, same entry), or confirmation and retry after the write.
+- **Platform coverage:** mac+linux.
+
 #### tabs/orchestration
 
 ##### tabs/orchestration/001 — Selecting an orchestration on the new-pane form opens one pane per role with the orchestrator's pane in focus.
