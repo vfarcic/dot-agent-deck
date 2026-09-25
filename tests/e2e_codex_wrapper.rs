@@ -20,6 +20,36 @@ const INTERACTIVE_PROOF_NAME: &str = "codex-interactive-proof.txt";
 /// matching only the meaningful part of it, as `tests/e2e_codex_hooks.rs`.
 const CODEX_COMPOSER_READY: &str = "Ask Codex to do anything";
 
+/// Whether this host lets an unprivileged process create a user namespace,
+/// which Codex's Linux `workspace-write` sandbox needs (it runs its tools
+/// under `bwrap`). A host that refuses — Ubuntu's
+/// `kernel.apparmor_restrict_unprivileged_userns=1` is the measured case —
+/// makes every shell command and every patch Codex attempts fail with
+/// `bwrap: setting up uid map: Permission denied`, so a test that needs Codex
+/// to do real work there cannot pass whatever the deck does. Probed with
+/// util-linux's `unshare -Ur true`; a host without `unshare` is not judged, so
+/// the test runs and speaks for itself.
+fn check_codex_sandbox_can_start() -> Result<(), String> {
+    if !cfg!(target_os = "linux") {
+        return Ok(());
+    }
+    match std::process::Command::new("unshare")
+        .args(["-Ur", "true"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+    {
+        Ok(status) if !status.success() => Err(
+            "this host refuses unprivileged user namespaces (`unshare -Ur true` failed), so \
+             Codex's workspace-write sandbox cannot start a shell or apply a patch here — \
+             check `kernel.apparmor_restrict_unprivileged_userns`"
+                .into(),
+        ),
+        _ => Ok(()),
+    }
+}
+
 fn path_with_binary_dir() -> String {
     let bin = env!("CARGO_BIN_EXE_dot-agent-deck");
     let bin_dir = std::path::Path::new(bin)
@@ -127,6 +157,7 @@ fn codex_wrap_001_synthetic_jsonl_reaches_dashboard() {
 #[test]
 fn codex_live_001_real_interactive_new_pane_runs_and_reports_status() {
     skip_unless!(common::check_codex_available());
+    skip_unless!(check_codex_sandbox_can_start());
 
     let prompt = format!(
         "Use the shell to list the current directory and confirm {SENTINEL_NAME} exists. Then write exactly {SENTINEL_NAME} followed by a newline to {INTERACTIVE_PROOF_NAME}. Do not modify any other file."

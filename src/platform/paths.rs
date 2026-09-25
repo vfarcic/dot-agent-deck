@@ -996,7 +996,7 @@ fn posix_command_word(path: &str, windows_host: bool) -> Option<String> {
 /// motivating cases (`dot-agent-deck (1)` from a browser download,
 /// `dot-agent-deck copy` from a Finder duplicate) alongside the adversarial
 /// ones (`;`, `` ` ``, `$`, a literal newline).
-fn is_safe_binary_name(name: &str) -> bool {
+pub(crate) fn is_safe_binary_name(name: &str) -> bool {
     !name.is_empty()
         && !name.starts_with('-')
         && name

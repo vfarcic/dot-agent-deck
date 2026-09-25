@@ -4354,6 +4354,13 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 - **Platform coverage:** mac+linux (real-agent tier is local-only).
 - **Cost note:** one minimal mini-model availability probe; the launched interactive agent receives no prompt.
 
+##### codex/spawn/013 — A plain new-pane Codex command launches through the Wrapper strategy exactly once (issue #533).
+- **Layer:** L2 synthetic PTY-attached new-pane flow (no mode) with PATH recorder stubs.
+- **Agent:** synthetic Codex recorder.
+- **Asserts:** submitting the Ctrl+N form with no mode and Command bare `codex` executes exactly `dot-agent-deck wrap --agent codex -- codex` — the wrapper once, never bare Codex and never a second wrapper. Issue #533 moved this path's rewrite from the TUI to the daemon's spawn boundary, which this pins from the outside.
+- **Does not assert:** which deck binary the daemon names as the wrapper (the recorder is injected through `DOT_AGENT_DECK_WRAP_BIN`; renamed-build resolution is unit-tested in `src/wrap.rs`); a real Codex process (`codex/live/001`).
+- **Platform coverage:** mac+linux.
+
 #### codex/hooks
 
 ##### codex/hooks/001 — A real launcher-script interactive Codex turn reports native prompt/tool detail and becomes Idle without process exit (PRD #20 W1, R20-013/R20-014, §4.3.7). [reel]

@@ -10813,7 +10813,7 @@ fn dispatch_action(
                     // while the identity may be declared in `[[modes]]`, so the
                     // declaration answers first — that is the only thing that
                     // can identify a `devbox run codex-big` agent pane, and it
-                    // drives the wrap below as well as the badge.
+                    // drives the (daemon-side) wrap as well as the badge.
                     let spawn_agent_type = match req.mode_config.as_ref() {
                         Some(mode) if !req.command.is_empty() => {
                             mode.resolved_agent_type(req.command.as_str())
@@ -10822,23 +10822,30 @@ fn dispatch_action(
                         None if req.command.is_empty() => None,
                         None => AgentType::from_command(Some(req.command.as_str())),
                     };
-                    // PRD #20 M8: launch Wrapper-strategy agents (Codex now;
-                    // Gemini later) WRAPPED so their stdout is monitored
-                    // transparently — whether the command came from the registry
-                    // seed or was typed by the user. Only the LAUNCHED process is
-                    // rewritten to `dot-agent-deck wrap --agent <name> -- <base>`;
-                    // the Command field, `last_command`, and the persisted
-                    // `SavedPane.command` all keep the bare base command (so the
-                    // seed round-trips), and the transform is idempotent so a
-                    // restore re-wraps exactly once, never double-wraps.
-                    let launch_command = match &spawn_agent_type {
-                        Some(at) => crate::wrap::wrap_launch_command(&req.command, at),
-                        None => req.command.clone(),
-                    };
+                    // PRD #20 M8: Wrapper-strategy agents (Codex now; Gemini
+                    // later) launch WRAPPED so their stdout is monitored
+                    // transparently, but the wrap is applied by the DAEMON, not
+                    // here: this command goes out BARE with `spawn_agent_type` as
+                    // `StartAgent.agent_type`, and `agent_pty`'s common spawn
+                    // boundary rewrites it to `<deck> wrap --agent <name> --
+                    // <base>` from that same identity. The Command field,
+                    // `last_command` and `SavedPane.command` keep the bare base
+                    // command as before.
+                    //
+                    // Issue #533: this site used to rewrite the command itself,
+                    // and the daemon then re-applied the rewrite, relying on its
+                    // idempotency guard to recognise the TUI's. Once a renamed
+                    // build names ITSELF as the wrapper, a daemon of a different
+                    // build cannot recognise that name and wraps a second time.
+                    // Leaving the rewrite to the daemon means every daemon names
+                    // its own binary, in any TUI/daemon pairing. Mode panes do
+                    // not come through here (`cmd` is `None` for them): their
+                    // command is typed into a shell, which `wrap_agent_command`
+                    // still wraps TUI-side because no daemon rewrite follows.
                     let cmd = if req.command.is_empty() || is_mode {
                         None
                     } else {
-                        Some(launch_command.as_str())
+                        Some(req.command.as_str())
                     };
                     // Thread the form's Name through to `StartAgent.display_name`
                     // so a disconnect or crash between create and rename can't
@@ -10886,8 +10893,8 @@ fn dispatch_action(
                             tab_manager.show_tab_bar(),
                         )
                     };
-                    // `spawn_agent_type` and the wrapped `launch_command` (used
-                    // for `cmd` above) were both resolved before the dims block.
+                    // `spawn_agent_type` (which the daemon also wraps from) and
+                    // `cmd` were both resolved before the dims block.
                     match pane.create_pane_with_options(
                         cmd,
                         Some(&dir_str),

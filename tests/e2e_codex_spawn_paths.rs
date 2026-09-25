@@ -353,3 +353,27 @@ fn spawn_012_real_script_launched_codex_badges_before_first_prompt() {
         "the real script-launched Codex role must render a Codex Idle card before any prompt is submitted; real_launch={real_launch:?}, codex_badge={codex_badge}, no_prompt_event={no_prompt_event}\nFinal grid:\n{grid}"
     );
 }
+
+/// Scenario: Open a plain pane (no mode) through the normal Ctrl+N new-pane
+/// form with the Command field set to bare `codex`, and submit it. The pane
+/// must launch through the Wrapper strategy exactly once — never bare Codex and
+/// never wrapped twice.
+#[spec("codex/spawn/013")]
+#[test]
+#[cfg(unix)]
+fn spawn_013_plain_new_pane_wraps_codex_once() {
+    let fixture = common::harness_tempdir().expect("plain new-pane record dir");
+    let record = fixture.path().join("plain-new-pane.log");
+    let (_bin, path, wrap_bin) = recorder_path(&record);
+    let deck = TuiDeck::builder()
+        .with_env("PATH", path)
+        .with_env("CODEX_PATH_RECORD", record.to_string_lossy())
+        .with_env("DOT_AGENT_DECK_WRAP_BIN", wrap_bin.to_string_lossy())
+        .launch_with_fixture("minimal");
+    open_form(&deck);
+    deck.send_keys(b"\r"); // Mode → Name
+    deck.send_keys(b"\r"); // Name → Command
+    deck.send_keys(b"codex");
+    deck.send_keys(b"\r"); // submit
+    assert_only_wrapped(&record);
+}

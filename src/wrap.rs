@@ -537,9 +537,11 @@ fn deck_binary_for_wrap() -> String {
 /// in production it always is: the callers of [`wrap_launch_command`] are the
 /// daemon's spawn seam (`agent_pty`) and the TUI (`ui`), both subcommands of
 /// the one `dot-agent-deck` binary. The process that is NOT the deck is a cargo
-/// test harness, and that is now recognised by where it lives — cargo puts
-/// every test executable in `target/<profile>/deps/` — which is the same test
-/// the sibling lookup below already used.
+/// test harness, and that is now recognised by cargo's own signature for one:
+/// it lives in a `deps` directory (`target/<profile>/deps/`) AND its file stem
+/// ends in cargo's `-<16 hex digits>` metadata hash (`dot_agent_deck-3f…`).
+/// Both are required, so a real deck that merely sits in a directory called
+/// `deps` still names itself.
 ///
 /// Falls back when the running executable is unusable, so behaviour only ever
 /// improves on what `$PATH` would have found:
@@ -548,8 +550,16 @@ fn deck_binary_for_wrap() -> String {
 ///   what lets in-process tests drive the build they just compiled;
 /// - a path that no longer exists: Linux reports a replaced binary as
 ///   `<path> (deleted)`, routine while rebuilding during development;
-/// - a path containing whitespace, which the shell would re-split (nothing
-///   quotes this command string).
+/// - a path the shell would not read back as the same file — nothing quotes
+///   this command string, so it is rejected rather than quoted, the posture
+///   [`crate::platform::paths::binary_name`] takes for the same reason. The
+///   file name must pass `is_safe_binary_name` (ASCII alphanumerics plus
+///   `-_.+`, no leading `-`), and every character of the path must be in
+///   [`is_shell_inert_path_char`]'s allowlist, which excludes whitespace,
+///   quotes, `$`, backticks, `;`, `&`, `|`, `<`, `>`, `(`, `)`, `*`, `?`,
+///   `[`, `~`, `#` and `!`. Before issue #533 the file name was pinned to
+///   `dot-agent-deck` and only whitespace was checked; accepting a renamed
+///   build's own file name is what made the allowlist necessary.
 ///
 /// The sibling looked for is the package's own file name
 /// ([`crate::platform::paths::durable_binary_file_name`], `.exe` on Windows),
@@ -558,10 +568,24 @@ fn resolve_deck_binary_for_wrap(current_exe: std::io::Result<std::path::PathBuf>
     use crate::platform::paths::{DEFAULT_BINARY_NAME, durable_binary_file_name};
     fn usable(path: &std::path::Path) -> Option<String> {
         let text = path.to_str()?;
-        (!text.chars().any(char::is_whitespace) && path.is_file()).then(|| text.to_string())
+        let name = path.file_name()?.to_str()?;
+        (crate::platform::paths::is_safe_binary_name(name)
+            && text
+                .chars()
+                .all(|c| is_shell_inert_path_char(c, cfg!(windows)))
+            && path.is_file())
+        .then(|| text.to_string())
     }
     fn in_deps_dir(dir: &std::path::Path) -> bool {
         dir.file_name() == Some(std::ffi::OsStr::new("deps"))
+    }
+    fn has_cargo_hash_suffix(exe: &std::path::Path) -> bool {
+        exe.file_stem()
+            .and_then(|stem| stem.to_str())
+            .and_then(|stem| stem.rsplit_once('-'))
+            .is_some_and(|(_, hash)| {
+                hash.len() == 16 && hash.bytes().all(|b| b.is_ascii_hexdigit())
+            })
     }
 
     let Ok(exe) = current_exe else {
@@ -570,9 +594,8 @@ fn resolve_deck_binary_for_wrap(current_exe: std::io::Result<std::path::PathBuf>
     let Some(dir) = exe.parent() else {
         return DEFAULT_BINARY_NAME.to_string();
     };
-    if !in_deps_dir(dir)
-        && let Some(found) = usable(&exe)
-    {
+    let is_test_harness = in_deps_dir(dir) && has_cargo_hash_suffix(&exe);
+    if !is_test_harness && let Some(found) = usable(&exe) {
         return found;
     }
     let sibling = durable_binary_file_name();
@@ -587,6 +610,18 @@ fn resolve_deck_binary_for_wrap(current_exe: std::io::Result<std::path::PathBuf>
         .unwrap_or_else(|| DEFAULT_BINARY_NAME.to_string())
 }
 
+/// Whether `c` can appear UNQUOTED in the wrapper's command word and still be
+/// read back by the spawning shell as itself: ASCII alphanumerics plus
+/// `/ . _ - + = : @ % ,` — the set `platform::paths::shell_quote_if_needed`
+/// leaves unquoted — and, only when `windows_host`, the `\` separator, which a
+/// POSIX shell would instead consume as an escape. A parameter rather than a
+/// `#[cfg]` so both dialects are unit-testable from any host.
+fn is_shell_inert_path_char(c: char, windows_host: bool) -> bool {
+    c.is_ascii_alphanumeric()
+        || matches!(c, '/' | '.' | '_' | '-' | '+' | '=' | ':' | '@' | '%' | ',')
+        || (windows_host && c == '\\')
+}
+
 /// Whether `command` is already a `wrap` invocation of a deck — the idempotency
 /// guard for [`wrap_launch_command`]. `deck` is the program the rewrite would
 /// name ([`deck_binary_for_wrap`]'s result). Tolerant of a leading path on the
@@ -595,16 +630,18 @@ fn resolve_deck_binary_for_wrap(current_exe: std::io::Result<std::path::PathBuf>
 /// Issue #533: the program's file name used to be compared against the literal
 /// `dot-agent-deck` only. That held while [`deck_binary_for_wrap`] could name
 /// nothing else; now that a renamed build names itself, a literal-only guard
-/// would miss the invocation the build had itself produced, and the command
-/// the TUI rewrites is rewritten again at the daemon's `agent_pty` spawn seam —
-/// a second wrapper around the first. The file name of `deck` is therefore
-/// accepted too, alongside the package name (with and without the platform's
-/// executable suffix), which a command from a default-named build carries.
+/// would miss the invocation the build had itself produced and wrap it a second
+/// time. The file name of `deck` is therefore accepted too, alongside the
+/// package name (with and without the platform's executable suffix), which a
+/// command from a default-named build carries.
 ///
-/// This guard can only know the names of the build it runs in. A command
-/// rewritten by one renamed build and re-applied by a deck of a different
-/// build — a TUI attached to a daemon it does not match — is not recognised,
-/// and that pairing stacks a second wrapper.
+/// This guard can only know the names of the build it runs in, which is why
+/// the TUI's new-pane path no longer pre-wraps a command it hands to the daemon
+/// (`ui.rs`, the `StartAgent` spawn): a renamed TUI's rewrite reaching a daemon
+/// of a different build would not be recognised there. The daemon wraps it
+/// instead, naming its own binary. What remains is a command that already
+/// carries some OTHER renamed build's `wrap` invocation — typed or configured
+/// that way by hand — which is not recognised and gets a second wrapper.
 fn is_wrap_invocation(command: &str, deck: &str) -> bool {
     use crate::platform::paths::{DEFAULT_BINARY_NAME, durable_binary_file_name};
     let file_name = |program: &str| -> Option<String> {
@@ -3061,6 +3098,81 @@ mod tests {
         );
     }
 
+    /// Nothing quotes the wrapper's command word, so a renamed executable (or
+    /// a directory above it) the shell would reinterpret is refused, never
+    /// quoted: the resolution falls back as it does for any unusable path.
+    ///
+    /// Unix-only because several of these names (`"`, `|`) cannot be created on
+    /// Windows at all; the Windows dialect of the allowlist is covered by
+    /// `is_shell_inert_path_char_admits_backslash_only_for_windows`.
+    #[cfg(unix)]
+    #[test]
+    fn resolve_deck_binary_for_wrap_refuses_shell_syntax_in_the_path() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let hostile_names = [
+            "deck$(touch pwned)",
+            "deck`id`",
+            "deck;id",
+            "deck'q",
+            "deck\"q",
+            "deck&id",
+            "deck|id",
+            "deck (1)",
+            "-deck",
+        ];
+        for name in hostile_names {
+            let exe = root.path().join(name);
+            std::fs::write(&exe, b"").expect("seed hostile build");
+            assert_eq!(
+                resolve_deck_binary_for_wrap(Ok(exe)),
+                crate::platform::paths::DEFAULT_BINARY_NAME,
+                "{name:?} must not reach the unquoted command word"
+            );
+        }
+
+        // A hostile DIRECTORY is refused too, including for a default-named
+        // build — the sibling lookup shares the directory, so it falls back to
+        // the bare name rather than to a sibling.
+        let dir = root.path().join("d$(id)");
+        std::fs::create_dir(&dir).expect("hostile dir");
+        let exe = dir.join(crate::platform::paths::durable_binary_file_name());
+        std::fs::write(&exe, b"").expect("seed build in hostile dir");
+        assert_eq!(
+            resolve_deck_binary_for_wrap(Ok(exe)),
+            crate::platform::paths::DEFAULT_BINARY_NAME
+        );
+    }
+
+    #[test]
+    fn is_shell_inert_path_char_admits_backslash_only_for_windows() {
+        assert!(is_shell_inert_path_char('\\', true));
+        assert!(!is_shell_inert_path_char('\\', false));
+        for c in ['/', '.', '_', '-', '+', ':', 'a', 'Z', '0'] {
+            assert!(is_shell_inert_path_char(c, false), "{c:?}");
+        }
+        for c in [
+            ' ', '$', '`', ';', '\'', '"', '&', '|', '(', ')', '*', '~', '#', '!',
+        ] {
+            assert!(!is_shell_inert_path_char(c, false), "{c:?}");
+            assert!(!is_shell_inert_path_char(c, true), "{c:?}");
+        }
+    }
+
+    /// A real deck that merely sits in a directory named `deps` is not a test
+    /// harness: without cargo's `-<16 hex>` hash on its stem it names itself.
+    #[test]
+    fn resolve_deck_binary_for_wrap_takes_a_renamed_build_in_a_deps_dir() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let deps = root.path().join("deps");
+        std::fs::create_dir(&deps).expect("deps dir");
+        let renamed = deps.join("dot-agent-deck-linux-amd64");
+        std::fs::write(&renamed, b"").expect("seed renamed build");
+        assert_eq!(
+            resolve_deck_binary_for_wrap(Ok(renamed.clone())),
+            renamed.to_str().expect("tempdir path is UTF-8")
+        );
+    }
+
     /// The name check #533 removed was what kept a cargo test harness from
     /// naming itself as the wrapper. It still cannot: an executable inside a
     /// `deps` directory is passed over for the build one level up, whatever its
@@ -3089,8 +3201,8 @@ mod tests {
     }
 
     /// Issue #533: a renamed build recognises the `wrap` invocation it produced
-    /// itself, so re-applying the rewrite (the TUI rewrites, then the daemon's
-    /// spawn seam rewrites again) does not stack a second wrapper. The rewrite and the
+    /// itself, so re-applying the rewrite does not stack a second wrapper. The
+    /// rewrite and the
     /// guard are driven through the same resolved program, exactly as
     /// [`wrap_launch_command`] drives them.
     #[test]
