@@ -2349,16 +2349,23 @@ fn abandon_spawn_prompt(
 }
 
 /// Issue #637: the floor under every watch window of a delivery to `agent_id` —
-/// [`confirmation_latency_floor`] of the producer the deck believed was there
-/// BEFORE it wrote ([`AgentPtyRegistry::pre_write_believed_agent_type`]).
+/// [`confirmation_latency_floor`] of the agent type THE DECK ITSELF spawned
+/// there ([`AgentPtyRegistry::spawn_agent_type`]), and the slow floor when it
+/// spawned no known type.
 ///
 /// No window may end before a genuine confirmation from that producer could
 /// plausibly have arrived, or the retry that follows races it and the agent
-/// receives the prompt twice. Read from the same pre-write belief the #666
-/// rearm reads: a pane whose producer only names itself after the write gets
-/// the slow floor, which spends recovery latency instead of risking a copy.
+/// receives the prompt twice. Deliberately NOT
+/// [`AgentPtyRegistry::pre_write_believed_agent_type`], which also accepts a
+/// launcher's pre-write declaration (PR #1314 review): a short floor is a
+/// permission to re-submit sooner, and — as with the #666 rearm, where a
+/// declared type may withhold but never grant — a producer's own claim does not
+/// earn it. A launcher that declares Claude Code and execs Codex would otherwise
+/// have its payload retried after 2 s while the Codex confirmation was still on
+/// its way. What it costs is recovery latency for the `devbox run claude …`
+/// shape, whose command resolves to no type: it takes the slow floor.
 fn confirmation_floor_for(registry: &AgentPtyRegistry, agent_id: &str) -> Duration {
-    confirmation_latency_floor(registry.pre_write_believed_agent_type(agent_id).as_ref())
+    confirmation_latency_floor(registry.spawn_agent_type(agent_id).as_ref())
 }
 
 /// Everything one detached confirmation loop needs, bundled so the loop's
@@ -5305,6 +5312,44 @@ mod tests {
         drop(notices);
         drop(event_tx);
         registry.shutdown_all();
+    }
+
+    /// Issue #637, PR #1314 review (Qodo): only the type the deck itself
+    /// spawned earns a producer's short floor. A launcher's pre-write
+    /// declaration is the producer's own claim, so a pane whose command
+    /// resolved to no type takes the slow floor whatever it declared.
+    #[test]
+    fn confirmation_floor_is_earned_by_the_spawn_record_not_a_launcher_claim() {
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let spawned_claude = spawn_typed_byte_target(
+            &registry,
+            "floor-spawned-claude",
+            Some(AgentType::ClaudeCode),
+        );
+        let launcher = spawn_byte_target(&registry, "floor-launcher-declared-claude");
+        registry.note_launcher_handoff(&launcher, AgentType::ClaudeCode);
+        assert_eq!(
+            registry.pre_write_believed_agent_type(&launcher),
+            Some(AgentType::ClaudeCode),
+            "precondition: the launcher's declaration is the pane's pre-write belief"
+        );
+        let spawned_codex =
+            spawn_typed_byte_target(&registry, "floor-spawned-codex", Some(AgentType::Codex));
+
+        let floors = (
+            confirmation_floor_for(&registry, &spawned_claude),
+            confirmation_floor_for(&registry, &launcher),
+            confirmation_floor_for(&registry, &spawned_codex),
+        );
+        registry.shutdown_all();
+        assert_eq!(
+            floors,
+            (
+                crate::prompt_delivery::FAST_CONFIRMATION_LATENCY,
+                crate::prompt_delivery::SLOW_CONFIRMATION_LATENCY,
+                crate::prompt_delivery::SLOW_CONFIRMATION_LATENCY,
+            )
+        );
     }
 
     /// Scenario: Write a prompt into a pane the deck spawned as Codex and start the detached confirmation watch on paused time, then deliver the agent's genuine submission report 8.45 s later — the latency issue #637 reports for Codex. The watch must accept it as attempt 1's confirmation, having logged no re-submission: no replacement payload and no submit probe went into the pane in between.
