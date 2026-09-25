@@ -2022,7 +2022,9 @@ mod tests {
         };
 
         let err = clone_via_staging(&clone_dir, |staging| async move {
-            std::fs::create_dir_all(staging.join(".git")).expect("start a partial clone");
+            tokio::fs::create_dir_all(staging.join(".git"))
+                .await
+                .expect("start a partial clone");
             Err("timed out: `gh repo clone` did not finish".to_string())
         })
         .await
@@ -2035,9 +2037,13 @@ mod tests {
         );
 
         let concurrent = ws.path().join("repo.cloning-concurrent");
-        std::fs::create_dir_all(concurrent.join(".git")).expect("another attempt, mid-clone");
+        tokio::fs::create_dir_all(concurrent.join(".git"))
+            .await
+            .expect("another attempt, mid-clone");
         let placed = clone_via_staging(&clone_dir, |staging| async move {
-            std::fs::create_dir_all(staging.join(".git")).expect("clone");
+            tokio::fs::create_dir_all(staging.join(".git"))
+                .await
+                .expect("clone");
             Ok(())
         })
         .await;
@@ -2051,10 +2057,16 @@ mod tests {
             "another attempt's staging directory must be left alone"
         );
 
-        std::fs::write(clone_dir.join("winner"), "").expect("mark the finished clone");
+        tokio::fs::write(clone_dir.join("winner"), "")
+            .await
+            .expect("mark the finished clone");
         let lost = clone_via_staging(&clone_dir, |staging| async move {
-            std::fs::create_dir_all(staging.join(".git")).expect("clone");
-            std::fs::write(staging.join("loser"), "").expect("mark this copy");
+            tokio::fs::create_dir_all(staging.join(".git"))
+                .await
+                .expect("clone");
+            tokio::fs::write(staging.join("loser"), "")
+                .await
+                .expect("mark this copy");
             Ok(())
         })
         .await;
@@ -2082,9 +2094,13 @@ mod tests {
         #[cfg(unix)]
         {
             let blocked = ws.path().join("blocked");
-            std::fs::write(&blocked, "not a directory").expect("occupy the destination");
+            tokio::fs::write(&blocked, "not a directory")
+                .await
+                .expect("occupy the destination");
             let err = clone_via_staging(&blocked, |staging| async move {
-                std::fs::create_dir_all(staging.join(".git")).expect("clone");
+                tokio::fs::create_dir_all(staging.join(".git"))
+                    .await
+                    .expect("clone");
                 Ok(())
             })
             .await
