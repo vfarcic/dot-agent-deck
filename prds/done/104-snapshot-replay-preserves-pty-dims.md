@@ -1,6 +1,6 @@
 # PRD #104: Snapshot replay preserves PTY dimensions so reattach doesn't scramble scrollback
 
-**Status**: Defined; ready to implement
+**Status**: Closed — issue #104 was closed on 2026-06-06, and this document was archived under #1297. Last status recorded while it was open: Defined; ready to implement
 **Priority**: Medium
 **Created**: 2026-05-22
 **GitHub Issue**: [#104](https://github.com/vfarcic/dot-agent-deck/issues/104)

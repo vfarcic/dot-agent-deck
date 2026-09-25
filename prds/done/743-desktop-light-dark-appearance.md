@@ -1,6 +1,6 @@
 # PRD #743: Follow the OS light/dark appearance, with an in-app override
 
-**Status**: In progress — implemented alongside [PRD #803](803-desktop-settings-surface.md) in one PR
+**Status**: Closed — issue #743 was closed on 2026-09-04, and this document was archived under #1297. Last status recorded while it was open: In progress — implemented alongside [PRD #803](803-desktop-settings-surface.md) in one PR
 **Priority**: Medium
 **Created**: 2026-09-02
 
@@ -137,7 +137,7 @@ All decided, on 2026-09-02, with the user offline and having asked for judgement
 1. **Do the terminals follow the app appearance?** **No** — they stay dark in both themes. Reasoning in Technical Approach: the readability failure lands on the working surface and is caused by agent output we do not control. The user raised this directly and chose to leave the terminals as they are.
 2. **Is a "terminal appearance" setting shipped anyway, defaulting to dark?** **No, deferred.** It is cheap to add later to a section that will exist, and shipping it now means shipping a control whose other position we have not measured.
 3. **How many tokens?** Target 25–40, judged on whether the app keeps its layering rather than on the count.
-4. **Does this ship behind the `experimental` flag (rule 9)?** **No.** The flag does not reach the Tauri app by any route — see #803's Open Question 1 and `prds/176-desktop-gui.md` decision 6. The user confirmed this on 2026-09-02.
+4. **Does this ship behind the `experimental` flag (rule 9)?** **No.** The flag does not reach the Tauri app by any route — see #803's Open Question 1 and `prds/done/176-desktop-gui.md` decision 6. The user confirmed this on 2026-09-02.
 
 ## Work Log
 

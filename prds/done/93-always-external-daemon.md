@@ -1,6 +1,6 @@
 # PRD #93: Always-external daemon (unify local and remote architecture)
 
-**Status**: In Progress (Phases 1-3 complete; Phase 4 in flight)
+**Status**: Closed — issue #93 was closed on 2026-05-22, and this document was archived under #1297. Last status recorded while it was open: In Progress (Phases 1-3 complete; Phase 4 in flight)
 **Priority**: Medium
 **Created**: 2026-05-17
 **GitHub Issue**: [#93](https://github.com/vfarcic/dot-agent-deck/issues/93)

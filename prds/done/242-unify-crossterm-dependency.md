@@ -1,6 +1,6 @@
 # PRD #242: Unify the crossterm dependency (one version, not 0.28.1 + 0.29.0)
 
-**Status**: Not started
+**Status**: Closed — issue #242 was closed on 2026-08-26, and this document was archived under #1297. Last status recorded while it was open: Not started
 **Priority**: Medium
 **Created**: 2026-07-28
 **GitHub Issue**: [#242](https://github.com/vfarcic/dot-agent-deck/issues/242)

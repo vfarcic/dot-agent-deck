@@ -1,6 +1,6 @@
 # PRD #78: Tab-Level Status Indicators
 
-**Status**: Not started
+**Status**: Closed — issue #78 was closed on 2026-05-09, and this document was archived under #1297. Last status recorded while it was open: Not started
 **Priority**: Medium
 **Created**: 2026-05-09
 

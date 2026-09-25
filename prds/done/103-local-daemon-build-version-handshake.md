@@ -1,6 +1,6 @@
 # PRD #103: Local daemon build-version handshake + `daemon stop` CLI
 
-**Status**: Planning
+**Status**: Closed — issue #103 was closed on 2026-05-25, and this document was archived under #1297. Last status recorded while it was open: Planning
 **Priority**: High
 **Created**: 2026-05-22
 **GitHub Issue**: [#103](https://github.com/vfarcic/dot-agent-deck/issues/103)
@@ -238,7 +238,7 @@ pub struct AttachResponse {
 - `src/daemon_attach.rs` — `ensure_external_daemon_or_die` (`:393`). The version check and the new `peer_pid()` helper live here. The version comparison itself lives in `main.rs` because the binary crate is where `env!("DAD_BUILD_ID")` resolves.
 - `src/main.rs` — `run_tui_session` (around `:583` where `ensure_external_daemon_or_die` is called); `DaemonCmd` enum (`:135`); `cmd_daemon_hello` (`:777`); new `cmd_daemon_stop` / `cmd_daemon_restart`.
 - `src/connect.rs` — `probe_remote_protocol` (`:460`); the remote `AttachResponse` deserialization (`:495`) and `server_version` comparison (`:517`) — the new `build_version` comparison sits alongside.
-- `prds/93-always-external-daemon.md` — parent PRD. Line 39 references the promised "equivalent local command".
+- `prds/done/93-always-external-daemon.md` — parent PRD. Line 39 references the promised "equivalent local command".
 - `prds/done/90-remote-daemon-upgrade.md` — related PRD (now closed; superseded by #76 + this PRD) that the M1.4 remote build-version comparison helped obsolete.
 - `docs/installation.md` and/or `docs/getting-started.mdx` — daemon-lifecycle docs introduced by PRD #93; this PRD extends them.
 

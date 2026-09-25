@@ -1,6 +1,6 @@
 # PRD #740: Publish the desktop GUI as an unsigned alpha artifact
 
-**Status**: Not started
+**Status**: Closed — issue #740 was closed on 2026-08-31, and this document was archived under #1297. Last status recorded while it was open: Not started
 **Priority**: Medium
 **Created**: 2026-08-30
 

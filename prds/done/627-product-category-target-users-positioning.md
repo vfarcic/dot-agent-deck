@@ -1,6 +1,6 @@
 # PRD #627: Product category, target users, and positioning
 
-**Status**: Candidate (Discovery)
+**Status**: Closed — issue #627 was closed on 2026-09-13, and this document was archived under #1297. Last status recorded while it was open: Candidate (Discovery)
 **Issue**: [#627](https://github.com/vfarcic/dot-agent-deck/issues/627)
 **Priority**: High
 **Created**: 2026-08-21

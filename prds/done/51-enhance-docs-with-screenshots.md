@@ -1,6 +1,6 @@
 # PRD #51: Enhance Documentation with Screenshots
 
-**Status**: Draft
+**Status**: Closed — issue #51 was closed on 2026-04-28, and this document was archived under #1297. Last status recorded while it was open: Draft
 **Priority**: Medium
 **Created**: 2026-04-06
 
