@@ -1306,6 +1306,13 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** an LLM response (nothing is submitted, exactly like `prompt/pane-input/022`); that the daemon rather than the user sent the bytes — no fault seam for a partial PTY write exists at the e2e layer, so the write path itself is covered at L1 (`scheduler/idle-worker/019`, `orchestration/delegate/031`); the abstaining conditions (`agent_pty::deliver_payload_refuses_to_erase_what_it_cannot_undo_exactly`); the other agent CLIs, whose editors are unexercised here.
 - **Platform coverage:** mac+linux.
 
+##### prompt/pane-input/039 — An oversized `delivery_id` is refused before the ledger stores it or anything is written (issue #527).
+- **Layer:** L1 protocol integration with an in-process daemon and a real PTY-backed shell.
+- **Agent:** synthetic pane target backed by `/bin/sh`, registered as a sessionless pane so a guarded send is otherwise deliverable.
+- **Asserts:** a `write-and-submit` whose `delivery_id` is `MAX_DELIVERY_ID_BYTES + 1` bytes is answered with an error and no `SendResult`, and its marker never reaches the pane; the same request with an id of exactly `MAX_DELIVERY_ID_BYTES` bytes is `Applied` and its marker arrives, so the refusal is the cap and not the fixture.
+- **Does not assert:** that the ledger stays empty after the refusal, or that the longest id a client mints fits the cap — both pinned at the unit level by `agent_pty::delivery_ledger_refuses_an_oversized_id_without_storing_it`.
+- **Platform coverage:** mac+linux.
+
 #### prompt/quit
 
 ##### prompt/quit/001 — `Ctrl+c` from command mode opens the quit confirmation dialog with three options: **Detach** (default), **Stop**, **Cancel**.

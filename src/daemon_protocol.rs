@@ -1802,6 +1802,11 @@ struct WriteAndSubmitExtras {
     /// A stable idempotency key. The daemon caches the first result for a
     /// delivery id and replays it on a retry, so a re-sent ambiguous transport
     /// failure never double-submits (R20-004).
+    ///
+    /// Issue #527: at most [`crate::agent_pty::MAX_DELIVERY_ID_BYTES`] bytes. A
+    /// longer id still DECODES (the wire type is unchanged), but the ledger
+    /// refuses to admit it and the daemon answers with an error and writes
+    /// nothing. The charset stays unrestricted.
     #[serde(default)]
     delivery_id: Option<String>,
 }
@@ -4251,6 +4256,19 @@ async fn handle_connection(
                                 &AttachResponse::err(
                                     "delivery id reused with a conflicting payload/target",
                                 ),
+                            )
+                            .await?
+                        }
+                        // Issue #527: refused before the ledger stores it and
+                        // before anything is written. The message states the
+                        // limit and not the id, which is the value that failed.
+                        crate::agent_pty::DeliveryAdmission::Oversized => {
+                            write_resp(
+                                &mut stream,
+                                &AttachResponse::err(format!(
+                                    "delivery id exceeds {} bytes — refusing the write",
+                                    crate::agent_pty::MAX_DELIVERY_ID_BYTES
+                                )),
                             )
                             .await?
                         }

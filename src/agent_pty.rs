@@ -1523,6 +1523,27 @@ const GEOMETRY_BROADCAST_CAPACITY: usize = 16;
 /// abandoned.
 const MAX_DELIVERY_RESULTS: usize = 8192;
 
+/// Issue #527: the longest `delivery_id` the daemon admits into the
+/// idempotency ledger, in bytes. [`MAX_DELIVERY_RESULTS`] bounds the ledger by
+/// COUNT, and each id is stored twice (the record's map key and its LRU slot),
+/// so without a length bound a few ids near [`crate::daemon_protocol`]'s 16 MiB
+/// frame limit exhaust memory long before the count cap evicts anything. With
+/// it, the cached ledger's ids are bounded at `8192 × 256 × 2` bytes — 4 MiB.
+///
+/// Sized from the ids this repository's clients mint, not from a guess. The
+/// longest is the TUI's retry form, `send-<16 hex>-<pane>-<seq>` from
+/// [`crate::prompt_delivery::mint_delivery_id`] with `#e<epoch>`, `#probe` and
+/// `#a<attempt>` appended by `ui::wire_attempt_id`: 5 + 16 + 1 + 64
+/// ([`PANE_ID_ENV_MAX_LEN`]) + 1 + 20 (a `u64` seq) + 12 + 6 + 12 = 137 bytes.
+/// The desktop's `desktop-seed-<pane>` is shorter. 256 leaves that form ~119
+/// bytes of headroom and is the ceiling issue #527 named.
+///
+/// A longer id is REFUSED ([`DeliveryAdmission::Oversized`]), not truncated or
+/// dropped: truncating could merge two deliveries onto one record and replay
+/// one's result for the other, and dropping the id would deliver without the
+/// retry dedup the caller asked for.
+pub const MAX_DELIVERY_ID_BYTES: usize = 256;
+
 /// Per-agent broadcast bus. Producers (the reader thread) atomically append
 /// to scrollback and publish to subscribers under the same lock so a fresh
 /// subscriber's `(snapshot, receiver)` is always consistent: the snapshot
@@ -1972,6 +1993,10 @@ pub enum DeliveryAdmission {
     /// [`AgentPtyRegistry::record_delivery_outcome`]. The permit holds the
     /// single-flight guard so concurrent duplicates wait behind it.
     Proceed(DeliveryPermit),
+    /// Issue #527: the id is longer than [`MAX_DELIVERY_ID_BYTES`]. Refused
+    /// before it touches the ledger, so nothing is stored and nothing is
+    /// written to the target.
+    Oversized,
 }
 
 /// PRD #20 R20-004 (finding #3): RAII-ish permit returned by
@@ -3103,8 +3128,9 @@ struct PaneInputState {
     /// (the attach STREAM_IN path) and the explicit
     /// [`AgentPtyRegistry::note_user_input`] update it — daemon-initiated writes
     /// go through [`PaneWriter::daemon`] and do not, so a scheduled delivery
-    /// never resets its own debounce clock. In-memory, monotonically growing by
-    /// `pane_id_env` seen (negligible).
+    /// never resets its own debounce clock. In-memory. Issue #542: all three
+    /// maps here drop a pane's entry when the pane is closed for good
+    /// ([`Self::forget_closed_pane`]), not when it changes hands.
     user_input_at: HashMap<String, Instant>,
     /// Issue #424 F1: what THIS daemon's guarded sends put into each pane.
     automatic: HashMap<String, AutomaticWrite>,
@@ -3229,6 +3255,33 @@ impl PaneInputState {
     fn forget_pane(&mut self, pane_id_env: &str) {
         self.automatic.remove(pane_id_env);
         self.input.remove(pane_id_env);
+    }
+
+    /// Issue #542: drop EVERY clock for `pane_id_env`, the user-input one
+    /// included — the pane has been closed and nothing in the registry names it
+    /// any more, so no input box is left for any of them to describe.
+    ///
+    /// Deliberately a separate, stronger call than [`Self::forget_pane`]. That
+    /// one runs when a pane changes hands and keeps `user_input_at`, so a user
+    /// who was typing at the pane keeps the debounce and the blind-probe refusal
+    /// across a respawn. This one runs only from
+    /// [`AgentPtyRegistry::close_agent`], under the registry lock, once no
+    /// record and no spawn reservation claims the pane — which is what keeps it
+    /// from weakening the #424 F1 guard: an absent `automatic` entry reads as
+    /// "nothing of ours is in that box", and that is only true here because the
+    /// box itself is gone.
+    fn forget_closed_pane(&mut self, pane_id_env: &str) {
+        self.user_input_at.remove(pane_id_env);
+        self.automatic.remove(pane_id_env);
+        self.input.remove(pane_id_env);
+    }
+
+    /// Issue #542 test seam: does any of the three clocks hold `pane_id_env`?
+    #[cfg(test)]
+    fn tracks_pane(&self, pane_id_env: &str) -> bool {
+        self.user_input_at.contains_key(pane_id_env)
+            || self.automatic.contains_key(pane_id_env)
+            || self.input.contains_key(pane_id_env)
     }
 
     fn last_user_input_at(&self, pane_id_env: &str) -> Option<Instant> {
@@ -3429,8 +3482,13 @@ pub struct AgentPtyRegistry {
     /// — two functions that share nothing but this registry. Keyed by AGENT id,
     /// not pane id: pane ids are reused across spawns, and a previous
     /// occupant's launcher declaration must not grant standing to the next
-    /// delivery. Grows by agents spawned in one daemon's lifetime, like
-    /// [`Self::user_input_at`] (negligible: one short string each).
+    /// delivery.
+    ///
+    /// Issue #542: an entry is dropped when its agent leaves the registry —
+    /// [`Self::close_agent`] and [`Self::respawn_agent_for_pane_declared`] —
+    /// and [`Self::note_launcher_handoff`] records nothing for an agent that is
+    /// no longer in it, so a declaration racing the close cannot re-insert one.
+    /// Keyed by agent id, so the prune is on agent removal, never on pane close.
     launcher_handoff_agents: Mutex<HashMap<String, AgentType>>,
     /// PRD #20 R20-004 (finding #3): atomic, fingerprint-bound idempotency ledger
     /// for guarded write-and-submit. Keyed by the caller's stable `delivery_id`;
@@ -5770,12 +5828,43 @@ impl AgentPtyRegistry {
     /// a different type does not revise the belief — otherwise a producer that
     /// can post one could walk the pane's believed type to whatever it needs the
     /// post-write declaration to match, which is the grant #424 F4 forbids.
+    ///
+    /// Issue #542: recorded only while `agent_id` is in the registry, checked
+    /// under the registry lock that its removal takes, so a declaration arriving
+    /// after [`Self::close_agent`] cannot leave an entry nothing will prune.
+    /// Nothing reads the standing of an agent that is gone.
     pub fn note_launcher_handoff(&self, agent_id: &str, declared: AgentType) {
+        let inner = self.inner.lock().unwrap();
+        if !inner.agents.contains_key(agent_id) {
+            return;
+        }
         self.launcher_handoff_agents
             .lock()
             .unwrap()
             .entry(agent_id.to_string())
             .or_insert(declared);
+    }
+
+    /// Issue #542: `agent_id` has left the registry, so its launcher standing
+    /// goes with it. Callers hold the registry lock, which is the order
+    /// [`Self::note_launcher_handoff`] takes the two locks in.
+    fn forget_launcher_handoff(&self, agent_id: &str) {
+        self.launcher_handoff_agents
+            .lock()
+            .unwrap()
+            .remove(agent_id);
+    }
+
+    /// Issue #542 test seam: how many agents hold launcher standing.
+    #[cfg(test)]
+    fn launcher_handoff_count(&self) -> usize {
+        self.launcher_handoff_agents.lock().unwrap().len()
+    }
+
+    /// Issue #542 test seam: does any pane-keyed clock hold `pane_id_env`?
+    #[cfg(test)]
+    fn pane_input_tracks(&self, pane_id_env: &str) -> bool {
+        self.pane_input.lock().unwrap().tracks_pane(pane_id_env)
     }
 
     /// Issue #424 F4: whether `agent_id`'s pane made that declaration — one of
@@ -6605,8 +6694,13 @@ impl AgentPtyRegistry {
     /// * an id reused with a DIFFERENT fingerprint → [`DeliveryAdmission::Conflict`];
     /// * otherwise → [`DeliveryAdmission::Proceed`] holding the single-flight
     ///   guard, so a concurrent duplicate blocks and replays this attempt's
-    ///   result instead of double-submitting.
+    ///   result instead of double-submitting;
+    /// * an id longer than [`MAX_DELIVERY_ID_BYTES`] → [`DeliveryAdmission::Oversized`],
+    ///   before the ledger is consulted (issue #527).
     pub async fn admit_delivery(&self, delivery_id: &str, fingerprint: u64) -> DeliveryAdmission {
+        if delivery_id.len() > MAX_DELIVERY_ID_BYTES {
+            return DeliveryAdmission::Oversized;
+        }
         // Phase 1 (sync): immediate replay/conflict check + get-or-create the
         // per-id single-flight lock.
         let lock = {
@@ -7358,13 +7452,35 @@ impl AgentPtyRegistry {
     /// same `pane_id_env`, and the two dispatchers stop serializing.
     /// The map's monotonic growth is bounded by pane creation rate
     /// (~64 B/entry) — accepted as negligible.
+    ///
+    /// Issue #542: the removal also drops the agent's launcher standing and,
+    /// when nothing left in the registry — no other record, live or exited, and
+    /// no spawn reservation — names its pane, every pane-keyed clock for that
+    /// pane. Both happen under the same registry lock as the removal, so a
+    /// successor spawning into the pane either claims it first (and the clocks
+    /// are kept for it) or claims it after (and starts from a pane with none).
     pub fn close_agent(&self, id: &str) -> Result<(), AgentPtyError> {
         let mut agent = {
             let mut inner = self.inner.lock().unwrap();
-            inner
+            let agent = inner
                 .agents
                 .remove(id)
-                .ok_or_else(|| AgentPtyError::NotFound(id.to_string()))?
+                .ok_or_else(|| AgentPtyError::NotFound(id.to_string()))?;
+            self.forget_launcher_handoff(id);
+            if let Some(pane) = agent.pane_id_env.as_deref() {
+                let still_claimed = inner
+                    .agents
+                    .values()
+                    .any(|a| a.pane_id_env.as_deref() == Some(pane))
+                    || inner
+                        .pending_spawns
+                        .values()
+                        .any(|reserved| reserved.as_deref() == Some(pane));
+                if !still_claimed {
+                    self.pane_input.lock().unwrap().forget_closed_pane(pane);
+                }
+            }
+            agent
         };
         crate::platform::proc::terminate_child_with_grace_and_wait(
             &mut agent.child,
@@ -7544,10 +7660,15 @@ impl AgentPtyRegistry {
                 .find(|(_, a)| a.pane_id_env.as_deref() == Some(pane_id_env))
                 .map(|(id, _)| id.clone())
                 .ok_or_else(|| AgentPtyError::NotFound(pane_id_env.to_string()))?;
-            inner
+            let removed = inner
                 .agents
                 .remove(&agent_id)
-                .expect("agent_id was just located inside the same lock hold")
+                .expect("agent_id was just located inside the same lock hold");
+            // Issue #542: the old generation's launcher standing leaves with
+            // it. The pane-keyed clocks stay — the pane is not going away, and
+            // `spawn_agent` resets what a new occupant must not inherit.
+            self.forget_launcher_handoff(&agent_id);
+            removed
         };
 
         let RunningAgent {
@@ -15016,6 +15137,7 @@ mod spawn_tests {
             DeliveryAdmission::Proceed(p) => p,
             DeliveryAdmission::Replay(_) => panic!("first admission must Proceed, got Replay"),
             DeliveryAdmission::Conflict => panic!("first admission must Proceed, got Conflict"),
+            DeliveryAdmission::Oversized => panic!("first admission must Proceed, got Oversized"),
         };
         reg.record_delivery_outcome(&permit, SendResult::Applied);
         drop(permit);
@@ -15082,6 +15204,205 @@ mod spawn_tests {
             reg.admit_delivery("shared-id", fp_b).await,
             DeliveryAdmission::Conflict
         ));
+    }
+
+    /// Issue #527: an id longer than `MAX_DELIVERY_ID_BYTES` is refused before
+    /// the ledger stores anything, while the longest id this repository's own
+    /// clients can mint is admitted — so the cap cannot refuse a real delivery.
+    #[tokio::test]
+    async fn delivery_ledger_refuses_an_oversized_id_without_storing_it() {
+        let reg = Arc::new(AgentPtyRegistry::new());
+        let fp = AgentPtyRegistry::delivery_fingerprint(Some("agent-1"), None, "pane", "text");
+
+        let oversized = "d".repeat(MAX_DELIVERY_ID_BYTES + 1);
+        assert!(matches!(
+            reg.admit_delivery(&oversized, fp).await,
+            DeliveryAdmission::Oversized
+        ));
+        {
+            let ledger = reg.delivery_ledger.lock().unwrap();
+            assert!(
+                ledger.records.is_empty() && ledger.order.is_empty(),
+                "a refused id must leave nothing in the ledger"
+            );
+        }
+        // A byte count, not a char count: 104 chars, but 52 × (2 + 3) = 260 bytes.
+        assert!(matches!(
+            reg.admit_delivery(&"é€".repeat(52), fp).await,
+            DeliveryAdmission::Oversized
+        ));
+
+        // The TUI's longest wire form, every numeric field at its maximum and a
+        // pane id at the retained-pane cap: `mint_delivery_id` plus the
+        // `#e<epoch>`, `#probe` and `#a<attempt>` suffixes `ui::wire_attempt_id`
+        // appends.
+        let pane = "p".repeat(PANE_ID_ENV_MAX_LEN);
+        let longest_minted = crate::prompt_delivery::attempt_delivery_id(
+            &format!(
+                "send-{:016x}-{pane}-{}#e{}#probe",
+                u64::MAX,
+                u64::MAX,
+                u32::MAX
+            ),
+            u32::MAX,
+        );
+        assert!(
+            longest_minted.len() <= MAX_DELIVERY_ID_BYTES,
+            "the cap must admit every id a client mints: {} bytes",
+            longest_minted.len()
+        );
+        for id in [longest_minted, "d".repeat(MAX_DELIVERY_ID_BYTES)] {
+            assert!(
+                matches!(
+                    reg.admit_delivery(&id, fp).await,
+                    DeliveryAdmission::Proceed(_)
+                ),
+                "an id within the cap is admitted ({} bytes)",
+                id.len()
+            );
+        }
+    }
+
+    /// Issue #542: closing an agent drops its launcher standing and, with no
+    /// other record left on the pane, all three pane-keyed clocks — and a
+    /// declaration arriving after the close cannot put the standing back.
+    #[tokio::test]
+    async fn close_agent_empties_launcher_standing_and_pane_clocks() {
+        const PANE: &str = "issue-542-closed-pane";
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let id = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("/bin/sh"),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), PANE.to_string())],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn sh");
+
+        registry.note_launcher_handoff(&id, AgentType::ClaudeCode);
+        registry.note_automatic_write(PANE, SubmitMode::Submit, b"payload");
+        registry
+            .pane_input
+            .lock()
+            .unwrap()
+            .note_user_bytes(PANE, b"typed");
+        assert_eq!(registry.launcher_handoff_count(), 1);
+        {
+            let state = registry.pane_input.lock().unwrap();
+            assert!(
+                state.user_input_at.contains_key(PANE)
+                    && state.automatic.contains_key(PANE)
+                    && state.input.contains_key(PANE),
+                "the fixture must populate all three clocks"
+            );
+        }
+
+        registry.close_agent(&id).expect("close");
+        assert_eq!(
+            registry.launcher_handoff_count(),
+            0,
+            "the closed agent's launcher standing must be gone"
+        );
+        assert!(
+            !registry.pane_input_tracks(PANE),
+            "every pane-keyed clock must be gone once nothing names the pane"
+        );
+
+        registry.note_launcher_handoff(&id, AgentType::ClaudeCode);
+        assert_eq!(
+            registry.launcher_handoff_count(),
+            0,
+            "a declaration racing the close must not re-insert standing"
+        );
+    }
+
+    /// Issue #542: the pane-keyed clocks are pruned only when the pane is
+    /// genuinely gone. Closing a retired generation while its successor holds
+    /// the same pane keeps them — dropping `automatic` there would weaken the
+    /// #424 F1 guard for the live occupant.
+    #[tokio::test]
+    async fn close_agent_keeps_pane_clocks_while_a_successor_holds_the_pane() {
+        const PANE: &str = "issue-542-reused-pane";
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let retired = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("/usr/bin/true"),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), PANE.to_string())],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn /usr/bin/true");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while registry.live_count() != 0 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the child never exited"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let successor = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("/bin/sh"),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), PANE.to_string())],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn the successor into the same pane");
+        registry.note_launcher_handoff(&successor, AgentType::ClaudeCode);
+        registry.note_automatic_write(PANE, SubmitMode::Submit, b"payload");
+        registry.note_user_input(PANE);
+
+        registry
+            .close_agent(&retired)
+            .expect("close the retired generation");
+        assert!(
+            registry.pane_input_tracks(PANE),
+            "the successor still holds the pane, so its clocks must survive"
+        );
+        assert_eq!(
+            registry.launcher_handoff_count(),
+            1,
+            "the successor's standing is its own, keyed by agent id"
+        );
+
+        registry
+            .close_agent(&successor)
+            .expect("close the successor");
+        assert!(!registry.pane_input_tracks(PANE));
+        assert_eq!(registry.launcher_handoff_count(), 0);
+    }
+
+    /// Issue #542: a respawn removes the old generation, so its launcher
+    /// standing goes — while the pane stays, and so does the user-input clock a
+    /// user typing at it established.
+    #[tokio::test]
+    async fn respawn_drops_the_old_generations_launcher_standing() {
+        const PANE: &str = "issue-542-respawned-pane";
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let first = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("cat"),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), PANE.to_string())],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn");
+        registry.note_launcher_handoff(&first, AgentType::ClaudeCode);
+        registry.note_user_input(PANE);
+
+        let second = registry
+            .respawn_agent_for_pane(PANE, "cat")
+            .await
+            .expect("respawn");
+        assert_ne!(first, second);
+        assert_eq!(
+            registry.launcher_handoff_count(),
+            0,
+            "the departed generation's standing must not outlive its record"
+        );
+        assert!(
+            registry.last_user_input_at(PANE).is_some(),
+            "a respawn is not the pane going away"
+        );
+
+        registry.close_agent(&second).expect("close");
+        assert!(!registry.pane_input_tracks(PANE));
     }
 
     /// PRD #20 R20-006 (finding #7): removal-after-authorization barrier. Hold
