@@ -19,6 +19,7 @@ import {
 } from "lucide-react";
 import { defaultCliForProvider, permissionModeLabel, permissionModeOptions, resolveProfileCommand } from "../lib/profileCommands";
 import type { DaemonProjectsState } from "../hooks/useDaemonProjects";
+import { SelectDeckNote } from "./SelectDeckNote";
 import type { AgentProfile, DaemonResolvedProject, DeckPrompt, Provider, RuntimeMode, WorkflowLaunchConfig } from "../types";
 
 /**
@@ -36,9 +37,15 @@ interface ProjectsPanelProps {
   state: DaemonProjectsState;
   onClose: () => void;
   onConfigureWorkflow: () => void;
+  /**
+   * **All Decks** is selected (#1083). Projects come from ONE deck, so the
+   * sheet says "Select a deck" instead of listing the local deck's — which is
+   * what "the selected deck" resolves to underneath All Decks.
+   */
+  allDecks?: boolean;
 }
 
-export function ProjectsPanel({ open, state, onClose, onConfigureWorkflow }: ProjectsPanelProps) {
+export function ProjectsPanel({ open, state, onClose, onConfigureWorkflow, allDecks = false }: ProjectsPanelProps) {
   const [pasted, setPasted] = useState("");
   if (!open) return null;
   const { projects, primary, listing, listingError, selected, resolving, resolveError, vanished } = state;
@@ -63,6 +70,12 @@ export function ProjectsPanel({ open, state, onClose, onConfigureWorkflow }: Pro
           <div><span className="eyebrow">PROJECT SELECTION</span><h2 id="projects-title">Projects</h2><p>Choose the project this launch runs in. The deck answers with what it knows.</p></div>
           <button className="icon-button" aria-label="Close projects" onClick={onClose}><X size={18} /></button>
         </header>
+        {allDecks ? (
+          <SelectDeckNote testId="projects-select-deck" className="sheet-select-deck" title="Select a deck to see its projects">
+            <p>Projects come from one deck — the machine a launch will run on — and All Decks is every deck at once.</p>
+            <p className="overview-note-hint">Close this sheet and choose a deck in the Deck selector.</p>
+          </SelectDeckNote>
+        ) : <>
         <div className="local-only-notice project-notice"><FolderCheck size={15} /><span><strong>From the deck</strong> — these are the projects the connected deck can see on its own machine, and nothing is remembered between launches.</span></div>
 
         <div className="projects-layout">
@@ -120,6 +133,7 @@ export function ProjectsPanel({ open, state, onClose, onConfigureWorkflow }: Pro
             </footer>
           </form>
         </div>
+        </>}
       </section>
     </div>
   );
@@ -384,9 +398,17 @@ interface WorkflowPanelProps {
    */
   capabilityIssue?: string;
   prompts?: DeckPrompt[];
+  /**
+   * **All Decks** is selected (#1083). A workflow launches on ONE deck, so the
+   * launch form is replaced by "Select a deck" and Launch stays disabled rather
+   * than targeting the local deck, which is what "the selected deck" resolves
+   * to underneath All Decks. The role order below is a local draft and stays
+   * editable.
+   */
+  allDecks?: boolean;
 }
 
-export function WorkflowPanel({ open, profiles, order, mode, project, onChooseProject, onClose, onToggle, onMove, onLaunch, platformIssue, capabilityIssue, prompts = [] }: WorkflowPanelProps) {
+export function WorkflowPanel({ open, profiles, order, mode, project, onChooseProject, onClose, onToggle, onMove, onLaunch, platformIssue, capabilityIssue, prompts = [], allDecks = false }: WorkflowPanelProps) {
   const orchestrations = project?.orchestrations ?? [];
   const [name, setName] = useState("");
   const [taskPrompt, setTaskPrompt] = useState("");
@@ -451,7 +473,7 @@ export function WorkflowPanel({ open, profiles, order, mode, project, onChoosePr
     ? `${orchestration.displayName} marks no role as its start role, so there is no coordinator to launch. Mark one of its roles \`start = true\` in the project's .dot-agent-deck.toml.`
     : undefined;
   const allRequiredRolesEnabled = Boolean(orchestration) && !missingRoles.length && !extraRoles.length && !startRoleIssue && roles.some((role) => role.start);
-  const canLaunch = mode === "live" && !platformIssue && !capabilityIssue && Boolean(project) && name.trim().length > 0 && cwd.startsWith("/") && taskPrompt.trim().length > 0 && allRequiredRolesEnabled && invalidCommands.length === 0;
+  const canLaunch = mode === "live" && !allDecks && !platformIssue && !capabilityIssue && Boolean(project) && name.trim().length > 0 && cwd.startsWith("/") && taskPrompt.trim().length > 0 && allRequiredRolesEnabled && invalidCommands.length === 0;
   const customCommandCount = resolved.filter(({ resolution }) => resolution.source === "custom").length;
   const generatedFullAccessCount = resolved.filter(({ profile, resolution }) => resolution.source === "generated" && profile.permissionMode === "full-access").length;
   return (
@@ -462,7 +484,13 @@ export function WorkflowPanel({ open, profiles, order, mode, project, onChoosePr
           <button className="icon-button" aria-label="Close workflow editor" onClick={onClose}><X size={18} /></button>
         </header>
         <div className="local-only-notice"><AlertTriangle size={15} /><span><strong>Local ordering</strong> — role order is a desktop draft. Launch uses these commands but does not rewrite project TOML.</span></div>
-        {mode === "live" && (
+        {mode === "live" && allDecks && (
+          <SelectDeckNote testId="workflow-select-deck" className="sheet-select-deck" title="Select a deck to launch a workflow">
+            <p>A workflow launches on one deck, and All Decks is every deck at once — so there is no deck here to launch on.</p>
+            <p className="overview-note-hint">Close this sheet and choose a deck in the Deck selector.</p>
+          </SelectDeckNote>
+        )}
+        {mode === "live" && !allDecks && (
           <div className="workflow-launch-form">
             {/*
               A SELECT, not a text field: the workflows on offer are the ones

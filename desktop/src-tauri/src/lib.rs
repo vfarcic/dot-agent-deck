@@ -3450,6 +3450,87 @@ struct StartedOrchestration {
     scope: crate::dto::DeckScope,
 }
 
+/// [`DesktopAction::StartWorkflow`]'s fields, unpacked for
+/// [`start_workflow_action`].
+struct StartWorkflowRequest {
+    name: String,
+    cwd: String,
+    task_prompt: String,
+    roles: Vec<WorkflowRoleInput>,
+    rows: Option<u16>,
+    cols: Option<u16>,
+    config_revision: Option<String>,
+}
+
+/// The Runs screen's workflow launch ([`DesktopAction::StartWorkflow`]).
+///
+/// # It launches on the SELECTED deck, and never under All Decks
+///
+/// The Runs screen shows one deck, so its launch names none and goes to the
+/// selected one through [`trusted_daemon`]. Under **All Decks** that refuses
+/// before any deck is contacted (#1083): the selection resolves to the local
+/// deck there only because the plumbing needs an endpoint, and a launch that
+/// took it would start agents on this machine because the user chose every
+/// deck. The webview shows "Select a deck" instead of the launch form in that
+/// state; this is the backstop. Split out of the action arm so that property
+/// can be driven against a real daemon
+/// (`daemon_bridge::tests::a_runs_launch_under_all_decks_never_reaches_the_local_deck`).
+async fn start_workflow_action(
+    state: &DesktopState,
+    request: StartWorkflowRequest,
+) -> Result<WorkflowLaunchResult, DesktopActionError> {
+    let StartWorkflowRequest {
+        name,
+        cwd,
+        task_prompt,
+        roles,
+        rows,
+        cols,
+        config_revision,
+    } = request;
+    ensure_desktop_workflow_platform_supported(std::env::consts::OS)?;
+    let (rows, cols) =
+        validate_workflow_shape(&name, &cwd, &roles, rows.unwrap_or(32), cols.unwrap_or(120))?;
+    // PRD #819 M6: the connection comes FIRST now. Resolution used to
+    // run two lines above the first daemon contact, against this
+    // process's own filesystem; it now runs on the daemon's, so a
+    // connection has to exist before a launch can be prepared at all.
+    // The supported non-Pi coordinator still uses the readiness-gated,
+    // identity-bound retry path in `launch_workflow`; Pi is rejected
+    // inside the preparation, before anything is spawned.
+    let daemon = trusted_daemon(&state.daemon).await?;
+    daemon.require_compatible()?;
+    ensure_daemon_can_prepare(daemon.client.cached_capabilities().as_ref())?;
+    let (roles, prepared) = prepare_workflow_launch(
+        daemon.client.as_ref(),
+        &name,
+        &cwd,
+        &task_prompt,
+        &roles,
+        config_revision.as_deref(),
+    )
+    .await?;
+    let orchestration_id = mint_orchestration_id();
+    launch_workflow(
+        daemon.client.as_ref(),
+        &name,
+        // The daemon's CANONICAL spelling, not the one that was sent.
+        // An alias or a symlink resolves elsewhere, canonicalising
+        // changes the basename, and an empty orchestration name is
+        // derived from that basename — so preparing under one spelling
+        // and spawning under another is PRD #220's bug verbatim.
+        &prepared.path,
+        &roles,
+        rows,
+        cols,
+        &orchestration_id,
+        &prepared.prompt,
+        Some(&prepared.token),
+    )
+    .await
+    .map_err(|failure| DesktopActionError::launch(failure.message, failure.unconfirmed_stops))
+}
+
 /// Launch one of a project's orchestrations on the deck `deck_id` names, the
 /// TUI's way (PRD #1223 M6): prepare with **no task**, then start every role
 /// with the command its config gives it, on that deck.
@@ -3961,54 +4042,19 @@ async fn desktop_run_action(
             cols,
             config_revision,
         } => {
-            ensure_desktop_workflow_platform_supported(std::env::consts::OS)?;
-            let (rows, cols) = validate_workflow_shape(
-                &name,
-                &cwd,
-                &roles,
-                rows.unwrap_or(32),
-                cols.unwrap_or(120),
-            )?;
-            // PRD #819 M6: the connection comes FIRST now. Resolution used to
-            // run two lines above the first daemon contact, against this
-            // process's own filesystem; it now runs on the daemon's, so a
-            // connection has to exist before a launch can be prepared at all.
-            // The supported non-Pi coordinator still uses the readiness-gated,
-            // identity-bound retry path in `launch_workflow`; Pi is rejected
-            // inside the preparation, before anything is spawned.
-            let daemon = trusted_daemon(&state.daemon).await?;
-            daemon.require_compatible()?;
-            ensure_daemon_can_prepare(daemon.client.cached_capabilities().as_ref())?;
-            let (roles, prepared) = prepare_workflow_launch(
-                daemon.client.as_ref(),
-                &name,
-                &cwd,
-                &task_prompt,
-                &roles,
-                config_revision.as_deref(),
+            let launched = start_workflow_action(
+                &state,
+                StartWorkflowRequest {
+                    name,
+                    cwd,
+                    task_prompt,
+                    roles,
+                    rows,
+                    cols,
+                    config_revision,
+                },
             )
             .await?;
-            let orchestration_id = mint_orchestration_id();
-            let launched = launch_workflow(
-                daemon.client.as_ref(),
-                &name,
-                // The daemon's CANONICAL spelling, not the one that was sent.
-                // An alias or a symlink resolves elsewhere, canonicalising
-                // changes the basename, and an empty orchestration name is
-                // derived from that basename — so preparing under one spelling
-                // and spawning under another is PRD #220's bug verbatim.
-                &prepared.path,
-                &roles,
-                rows,
-                cols,
-                &orchestration_id,
-                &prepared.prompt,
-                Some(&prepared.token),
-            )
-            .await
-            .map_err(|failure| {
-                DesktopActionError::launch(failure.message, failure.unconfirmed_stops)
-            })?;
             result_agent_id = Some(launched.start_agent_id);
             result_agent_ids = launched.agent_ids;
             result_message = Some(

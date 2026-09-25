@@ -168,6 +168,15 @@ export interface DesktopSnapshotDto {
    * `unconfigured`.
    */
   observed?: ObservedDeckDto[];
+  /**
+   * The applied selection is **All Decks** (#1083). The crate still sends the
+   * local deck's snapshot as "the selected deck's" in that state, so this is
+   * how the single-deck screens know not to render it — and because it arrives
+   * WITH that content, it holds before the settings read has settled. A
+   * property of the applied document, like {@link fleet}; absent reads as
+   * `false`.
+   */
+  allDecks?: boolean;
 }
 
 /** One configured-but-unaddressed deck (PRD #742 M12). */
@@ -1992,6 +2001,8 @@ export function mapDesktopSnapshot(dto: DesktopSnapshotDto, previous?: DeckSnaps
     // Issue #887: copied through so `projectsRevision` can key on it. Nothing
     // renders it.
     scheduleRevision: dto.scheduleRevision,
+    // #1083: see `DesktopSnapshotDto.allDecks`.
+    allDecks: dto.allDecks === true,
     connection: {
       status: dto.connection.status === "incompatible" ? "error" : dto.connection.status,
       deckId: dto.connection.deckId,

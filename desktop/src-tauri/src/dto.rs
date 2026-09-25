@@ -132,6 +132,17 @@ pub struct DesktopSnapshot {
     /// question, and an answer from here would be one the crate would have to
     /// keep in step with a stream it does not observe.
     pub observed: Vec<ObservedDeckDto>,
+    /// The applied selection is **All Decks** (#1083).
+    ///
+    /// Under All Decks the selected deck's snapshot is the local deck's, only
+    /// because the watcher and the tunnels need an endpoint. The webview's
+    /// single-deck screens read this to show "Select a deck" instead of that
+    /// content. It is on the snapshot rather than left to the webview's settings
+    /// read because it then arrives WITH the content it qualifies: a start with
+    /// All Decks stored cannot render local tiles while that read is in flight.
+    /// A property of the applied document, like [`Self::fleet`], so every
+    /// deck's snapshot carries the same value.
+    pub all_decks: bool,
 }
 
 /// One deck the app connects to, named without having been heard from (PRD
@@ -1429,10 +1440,17 @@ pub(crate) fn safe_display_text(text: impl AsRef<str>) -> String {
 /// local deck was substituted — "that deck is gone" and "that deck has no
 /// socket path yet" are different things to tell a user, and neither is
 /// "connected to local".
+///
+/// `all_decks` is `true` under **All Decks**, where `endpoint` is the local
+/// deck only because the plumbing needs one (see
+/// `crate::settings::EndpointSettings::resolve`). It is what lets an operation
+/// that acts on one deck refuse instead of taking that local deck as the
+/// user's choice — [`DeckScope::one_selected`] (#1083).
 #[derive(Debug, Clone)]
 pub(crate) struct SelectedDeck {
     pub(crate) endpoint: Endpoint,
     pub(crate) fallback: Option<String>,
+    pub(crate) all_decks: bool,
 }
 
 impl Default for SelectedDeck {
@@ -1440,9 +1458,17 @@ impl Default for SelectedDeck {
         Self {
             endpoint: Endpoint::local(),
             fallback: None,
+            all_decks: false,
         }
     }
 }
+
+/// Why an operation that acts on ONE deck refused to run under **All Decks**
+/// (#1083). The webview gates these operations behind its "Select a deck"
+/// state first, so this is the backstop a user should not normally see — and
+/// it says what to do rather than what went wrong, like that state does.
+pub(crate) const ALL_DECKS_NEEDS_ONE_DECK: &str =
+    "All Decks is selected, which is every deck at once. Select a deck to act on one.";
 
 /// The applied selection — the deck in force AND the set the fleet observes, as
 /// **one value under one lock** (PRD #742 M8).
@@ -1615,6 +1641,7 @@ pub(crate) fn apply_settings_selection(
         fallback: resolved
             .fallback
             .map(|fallback| safe_display_text(fallback.to_string())),
+        all_decks: settings.selects_all_decks(),
     };
     let observed = settings.connectable_endpoints();
     if let Ok(mut slot) = APPLIED_SELECTION.write() {
@@ -1708,6 +1735,27 @@ impl DeckScope {
             endpoint: applied.selected.endpoint,
             observed_generation: applied.observed_generation,
         }
+    }
+
+    /// The selected deck, captured for an operation that acts on **one** deck
+    /// and has no deck of its own to name — or a refusal under **All Decks**.
+    ///
+    /// [`Self::selected`] answers All Decks with the local deck, which is right
+    /// for the plumbing that needs an endpoint and wrong for an operation: a
+    /// project listing, a workflow launch or a keystroke sent there would land
+    /// on this machine's deck because the user chose *every* deck (#1083). So
+    /// this refuses with [`ALL_DECKS_NEEDS_ONE_DECK`] instead, before any deck
+    /// is contacted. ONE read, so the flag and the endpoint describe the same
+    /// applied selection.
+    pub(crate) fn one_selected() -> Result<Self, String> {
+        let applied = applied_selection();
+        if applied.selected.all_decks {
+            return Err(ALL_DECKS_NEEDS_ONE_DECK.to_string());
+        }
+        Ok(Self {
+            endpoint: applied.selected.endpoint,
+            observed_generation: applied.observed_generation,
+        })
     }
 
     /// The deck one wire id names, or the selected deck when the caller named
@@ -1997,6 +2045,11 @@ pub(crate) fn unconfigured_fleet() -> Vec<UnconfiguredDeckDto> {
 /// `fleet` with nothing here to name it would otherwise be an unnameable group.
 /// Deriving from here cannot produce one — every entry carries its own name —
 /// and the next arrival restates all three.
+/// Whether the applied selection is All Decks — [`DesktopSnapshot::all_decks`].
+pub(crate) fn all_decks_applied() -> bool {
+    selected_deck().all_decks
+}
+
 pub(crate) fn observed_fleet_decks() -> Vec<ObservedDeckDto> {
     observed_decks()
         .iter()
@@ -2111,6 +2164,7 @@ pub(crate) fn disconnected_snapshot(
         fleet: observed_fleet(),
         unconfigured: unconfigured_fleet(),
         observed: observed_fleet_decks(),
+        all_decks: all_decks_applied(),
     }
 }
 

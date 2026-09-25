@@ -75,7 +75,7 @@ const PANE_AGENT_STATUS = createFixtureSnapshot("connected").agents.find((agent)
  * what `remoteStatus` itself produces, and conflating them is what let the two
  * be treated alike.
  */
-function harness(remoteStatus: "connected" | "disconnected" = "connected", retired?: string) {
+function harness(remoteStatus: "connected" | "disconnected" = "connected", retired?: string, selection: string = ALL_ENDPOINT_SELECTION) {
   const local = createFixtureSnapshot("connected");
   const remote: DeckSnapshot = {
     ...local,
@@ -103,7 +103,7 @@ function harness(remoteStatus: "connected" | "disconnected" = "connected", retir
   */
   const stored: DesktopSettingsDto = {
     ...structuredClone(DEFAULT_DESKTOP_SETTINGS),
-    endpoints: { remote: [{ id: "row-build-box", host: "build-box", user: "dev", port: 22, socket: "/run/deck.sock" }], selection: ALL_ENDPOINT_SELECTION },
+    endpoints: { remote: [{ id: "row-build-box", host: "build-box", user: "dev", port: 22, socket: "/run/deck.sock" }], selection },
   };
   const saveSettings = vi.fn(async (next: DesktopSettingsDto) => structuredClone(next));
   const base = {
@@ -130,6 +130,9 @@ function harness(remoteStatus: "connected" | "disconnected" = "connected", retir
   } as unknown as DeckRuntimeState);
   return { local, remote, runtime, setShownTerminals, saveSettings };
 }
+
+/** The stored row id for build-box, which is also its selection token. */
+const BUILD_BOX_ROW = "row-build-box";
 
 /** The overview's open control for one agent, named as the row renders it. */
 const openControl = (name: string) => screen.getByRole("button", { name: `Open ${name} agent` });
@@ -443,11 +446,13 @@ describe("a pane with no terminal", () => {
    */
   it("leaves a deck-origin pane's screen to explain itself, with its remedy reachable", async () => {
     const deckView = { kind: "agent" as const, deckId: REMOTE_DECK_ID, agentId: "planner", from: "deck" as const };
-    const answering = harness("connected");
+    // build-box selected, not All Decks: the deck screen shows one deck, and
+    // under All Decks it shows "Select a deck" instead (#1083).
+    const answering = harness("connected", undefined, BUILD_BOX_ROW);
     const { rerender } = render(<DeckShell runtime={answering.runtime("remote")} initialView={deckView} />);
     expect(screen.getByTestId("agent-pane-overlay")).toBeVisible();
 
-    const away = harness("disconnected");
+    const away = harness("disconnected", undefined, BUILD_BOX_ROW);
     await act(async () => { rerender(<DeckShell runtime={away.runtime("remote")} initialView={deckView} />); });
 
     // No pane, so nothing is inert and the screen speaks for itself.
@@ -460,7 +465,7 @@ describe("a pane with no terminal", () => {
 
     // The view was KEPT, so the pane is back when the deck is — PR #1126's
     // guarantee, which this path still has and still needs.
-    const returned = harness("connected");
+    const returned = harness("connected", undefined, BUILD_BOX_ROW);
     await act(async () => { rerender(<DeckShell runtime={returned.runtime("remote")} initialView={deckView} />); });
     expect(screen.getByTestId("agent-pane-overlay")).toBeVisible();
   });
@@ -649,18 +654,19 @@ describe("a pane whose agent has left the fleet", () => {
    */
   it("closes a deck-origin pane when the deck under it retires the agent", async () => {
     const deckView = { ...paneView, from: "deck" as const };
-    const answering = harness("connected");
+    // build-box selected, for the reason the test above gives.
+    const answering = harness("connected", undefined, BUILD_BOX_ROW);
     const { rerender } = render(<DeckShell runtime={answering.runtime("remote")} initialView={deckView} />);
 
     expect(screen.getByTestId("agent-pane-overlay")).toBeVisible();
 
-    const retired = harness("connected", "planner");
+    const retired = harness("connected", "planner", BUILD_BOX_ROW);
     await act(async () => { rerender(<DeckShell runtime={retired.runtime("remote")} initialView={deckView} />); });
 
     expect(screen.queryByTestId("agent-pane-overlay")).not.toBeInTheDocument();
     // Closed rather than waiting to resurrect: the agent coming back gets a
     // tile offering Open, not the pane.
-    const back = harness("connected");
+    const back = harness("connected", undefined, BUILD_BOX_ROW);
     await act(async () => { rerender(<DeckShell runtime={back.runtime("remote")} initialView={deckView} />); });
 
     expect(screen.queryByTestId("agent-pane-overlay")).not.toBeInTheDocument();
