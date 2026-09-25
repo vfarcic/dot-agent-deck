@@ -1,5 +1,5 @@
 import { Fragment, useCallback, useEffect, useId, useMemo, useRef, useState, type KeyboardEvent } from "react";
-import { ArrowUp, Check, Folder, FolderGit2, Loader2, Plus, Server, X } from "lucide-react";
+import { ArrowUp, Check, Folder, FolderGit2, Loader2, Plus, Server, Trash2, X } from "lucide-react";
 import { LaunchCleanupError } from "../lib/actionError";
 import { CleanupWarning } from "./CleanupWarning";
 import { DISPLAY_LIMITS, displayText } from "../lib/displayText";
@@ -29,6 +29,7 @@ import {
 } from "../lib/newAgent";
 import type { AuthoringKind, DaemonOrchestration, DeckDirectoryEntry, DeckDirectoryListing, DeckRuntimeState, NewAgentOption, NewAgentOptions, NewAgentOrchestrations } from "../types";
 import type { NewAgentVoiceChannel, VoiceDispatchTarget } from "../lib/voiceActions";
+import { draftHasEdits, draftWorthKeeping, type NewAgentDraft } from "../lib/newAgentDraft";
 
 /**
  * What the dialog needs from the runtime. The two queries are REQUIRED here
@@ -41,7 +42,19 @@ export interface NewAgentDialogProps {
   runtime: NewAgentRuntime;
   /** The deck the flow was opened from — a deck header's affordance — which the deck field preselects — and chooses — when it can take a spawn. */
   initialDeckId?: string;
-  onClose: () => void;
+  /**
+   * Issue #1247 — what the form held when it was last closed without being
+   * discarded, replayed on open against fresh answers from the deck (see
+   * the open effect's "A saved draft"). Read once, on mount.
+   */
+  draft?: NewAgentDraft;
+  /**
+   * Every way out: `draft` is what to keep for the next open, or `undefined`
+   * when there is nothing to keep — the form was discarded, it was empty, or
+   * it had already been started. The caller stores it; the dialog holds no
+   * state across mounts. See `lib/newAgentDraft.ts` for which actions keep it.
+   */
+  onClose: (draft?: NewAgentDraft) => void;
   /** The started agent is listed by its deck: the caller opens its pane. */
   onAppeared: (target: { deckId: string; agentId: string }) => void;
   /** The deck accepted the start and has not listed the agent within the bound. */
@@ -68,18 +81,63 @@ type Listing = Extract<DeckDirectoryListing, { kind: "listing" }>;
 /** One row of the directory panel: the parent (`..`), or a subdirectory. */
 type DirectoryRow = { kind: "up"; path: string } | { kind: "entry"; entry: DeckDirectoryEntry };
 
+/** #1247 — the part of a saved draft that hangs off its deck, replayed once that deck answers. */
+type Resume = Pick<NewAgentDraft, "browsing" | "directory" | "mode">;
+
+/**
+ * What became of one listing request: it landed and is on screen, it failed,
+ * the deck cannot list at all, or a later request (or the deck leaving)
+ * superseded it — in which case nothing it would have done is done.
+ */
+type ListingOutcome = { kind: "listed"; listing: Listing } | { kind: "failed" } | { kind: "unsupported" } | { kind: "stale" };
+
 /**
  * The Mode row's first chip — a plain agent. Then, in the TUI cycler's order,
  * one chip per orchestration the directory's project defines on the deck (PRD
  * #1223 M6, from {@link orchestrationModes}), then the authoring kinds the deck
  * can start (PRD #1223 M7, from {@link authoringModes}).
  */
+// The literal, not `NO_MODE_ID`: `voice_outcome_every_control_label_asks_for_its_own_row`
+// reads this line to find the chip's label. `lib/newAgentDraft.ts` keeps the two equal.
 const NO_MODE = { id: "none", label: "No mode" } as const;
 
 type ModeId = typeof NO_MODE.id | AuthoringKind | ReturnType<typeof orchestrationModeId>;
 
 /** Why the dialog cannot be closed during a start (PRD #1223 audit F5). */
 export const STARTING_CLOSE_BLOCKED = "Waiting for the deck to answer the start. The dialog can be closed once it has.";
+
+/*
+  Issue #1247 — what a reopened dialog says about the form it put back. Each
+  names what was restored or why a saved choice was not, because a restore
+  that silently dropped a directory would read as the draft having been lost.
+*/
+/** Something the user chose or typed was put back. */
+export const DRAFT_RESTORED = "Restored what was entered when this form was last closed. Discard clears it.";
+/** The saved directory could not be listed again on its deck. */
+export const DRAFT_DIRECTORY_GONE = "The directory chosen last time could not be listed on this deck any more, so it was not chosen again.";
+/** The saved Mode chip is not offered on the restored form. */
+export const DRAFT_MODE_GONE = "The Mode chosen last time is not offered on this form any more, so the form is back to No mode.";
+/** The form was opened for a deck other than the saved one, which wins. */
+export const draftOtherDeck = (savedDeck: string) => `This form was opened for another deck, so the directory chosen on ${savedDeck} last time was not restored.`;
+/** The saved deck cannot take a new agent now, or has left the fleet. */
+export const draftDeckGone = (savedDeck: string, hadDirectory: boolean) => `${savedDeck}, the deck chosen last time, cannot take a new agent now, so ${hadDirectory ? "it and its directory were" : "it was"} not restored.`;
+
+/*
+  Issue #1263 — the deck field by voice, in the dialog's own words. Rust
+  resolves the spoken deck against the observed fleet and offers the model
+  only the decks the field can choose, so each of these answers a fleet or a
+  dialog that changed during the round trip.
+*/
+/** A start is in flight, when the deck field is disabled. */
+export const DECK_CHANGE_IN_FLIGHT = "A start is under way, so the deck was not changed.";
+/** The deck is not in the field's list any more. */
+export const DECK_NOT_LISTED = "That deck is not in the New agent dialog's deck list any more, so the deck was not changed.";
+/** The deck is listed, disabled. */
+export const DECK_CANNOT_TAKE_AGENT = "That deck cannot take a new agent now, so the deck was not changed.";
+/** The dialog closed during the round trip (served by the overview). */
+export const NO_DIALOG_FOR_DECK = "The New agent dialog is not open, so no deck was chosen.";
+/** The dialog closed during the round trip, so there was nothing to discard. */
+export const NO_DIALOG_TO_DISCARD = "The New agent dialog is not open, so nothing was discarded.";
 
 /*
   PRD #1223 — the directory browser's refusals by voice, in the dialog's own
@@ -204,11 +262,22 @@ function messageOf(cause: unknown): string {
  * until the target deck's fleet entry lists `(deckId, agentId)`, bounded by
  * {@link NEW_AGENT_APPEAR_TIMEOUT_MS}, and hands the identity to `onAppeared`.
  */
-export function NewAgentDialog({ runtime, initialDeckId, onClose, onAppeared, onNotAppeared, appearTimeoutMs = NEW_AGENT_APPEAR_TIMEOUT_MS, closeRequest, voice }: NewAgentDialogProps) {
+export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppeared, onNotAppeared, appearTimeoutMs = NEW_AGENT_APPEAR_TIMEOUT_MS, closeRequest, voice }: NewAgentDialogProps) {
   const titleId = useId();
   const choices = useMemo(() => deckChoices(runtime.fleet), [runtime.fleet]);
-  /** The deck field's cursor — moved by `j`/`k`, and not a choice until Enter or a click. */
-  const [highlight, setHighlight] = useState<string | undefined>(() => preselectedDeck(deckChoices(runtime.fleet), initialDeckId));
+  /** The draft this mount was opened with (#1247) — read once, by the open effect. */
+  const savedDraft = useRef(draft);
+  /**
+   * The deck field's cursor — moved by `j`/`k`, and not a choice until Enter or a click.
+   *
+   * On open it is the deck the flow was opened FOR, when it names one — a deck
+   * header's button, or a spoken "new agent on the build box" — and otherwise
+   * the saved draft's deck (#1247): an explicit request outranks a draft, whose
+   * directory is then not restored (the open effect says so).
+   */
+  const [highlight, setHighlight] = useState<string | undefined>(() => preselectedDeck(deckChoices(runtime.fleet), initialDeckId ?? draft?.deckId));
+  /** What the open put back and what it could not (#1247); absent for a fresh form. */
+  const [restoreNotes, setRestoreNotes] = useState<string[]>();
   const [deckNotice, setDeckNotice] = useState<string>();
   /** The deck the flow is about — captured once per choice of it, in the deck field. */
   const [deck, setDeck] = useState<DeckChoice>();
@@ -249,6 +318,24 @@ export function NewAgentDialog({ runtime, initialDeckId, onClose, onAppeared, on
   const [orchestrationsError, setOrchestrationsError] = useState<string>();
   /** Drops an orchestrations reply for a directory the user has since left. */
   const orchestrationsSeq = useRef(0);
+  /** An orchestrations query is in flight — the Mode row may still grow. */
+  const [orchestrationsPending, setOrchestrationsPending] = useState(false);
+  /**
+   * #1247 — the saved directory and Mode not yet replayed: set when the open
+   * chooses the saved deck, cleared once the deck has answered for them, and
+   * dropped by anything that supersedes the restore (another deck, the user
+   * browsing, the deck leaving). While it is set, a close keeps it, so a
+   * dialog closed again before the deck answered still has its draft.
+   */
+  const resumePending = useRef<Resume | undefined>(undefined);
+  /**
+   * #1247 — the saved Mode chip, waiting for the Mode row to offer it: the
+   * authoring chips come with the deck's options and the orchestration chips
+   * with the directory's orchestrations, so the chip may appear a reply after
+   * the directory does. Chosen as a click chooses it once it is offered, and
+   * dropped with a note once every answer is in and it is not.
+   */
+  const pendingMode = useRef<string | undefined>(undefined);
   /** A human edited Name — a generated default may replace a generated default, never an edit. */
   const nameTouched = useRef(false);
   /**
@@ -294,6 +381,9 @@ export function NewAgentDialog({ runtime, initialDeckId, onClose, onAppeared, on
     optionsSeq.current += 1;
     orchestrationsSeq.current += 1;
     projectMarks.current.clear();
+    resumePending.current = undefined;
+    pendingMode.current = undefined;
+    setOrchestrationsPending(false);
     setListing(undefined);
     setListingState("idle");
     setListingError(undefined);
@@ -355,7 +445,8 @@ export function NewAgentDialog({ runtime, initialDeckId, onClose, onAppeared, on
   /**
    * Every way out of the dialog — the header's close button, Esc, a backdrop
    * click, the directory panel's `q` and, through `closeRequest`, voice's
-   * `close` (PRD #1223 U5) — and none of them works while
+   * `close` (PRD #1223 U5), all of which keep the form as a draft (#1247), and
+   * Discard, which does not — and none of them works while
    * a start is in flight (PRD #1223 audit F5). Closing then would unmount the
    * one place a failure is explained, while the action itself carries on.
    *
@@ -376,10 +467,48 @@ export function NewAgentDialog({ runtime, initialDeckId, onClose, onAppeared, on
    * closing works as before.
    */
   const starting = phase === "starting";
-  /** Close, or answer why not. Every route calls this; only voice reads the answer. */
+  /**
+   * #1247 — the form as a draft to keep: the CHOICES on it, never the deck's
+   * answers (see `lib/newAgentDraft.ts`). A restore still in progress is kept
+   * as it was saved, so closing a reopened dialog before the deck answered
+   * loses nothing. Nothing is kept once a start has been accepted — the
+   * "waiting for the deck to list it" phase — because that form has been
+   * started, and reopening it would invite starting it twice.
+   */
+  const snapshot = (): NewAgentDraft | undefined => {
+    if (phase !== "idle") return undefined;
+    const resume = resumePending.current;
+    const directory = target ?? resume?.directory;
+    const browsing = listing?.path ?? resume?.browsing;
+    const kept: NewAgentDraft = {
+      ...(deck ? { deckId: deck.deckId, deckName: deck.name } : {}),
+      ...(browsing !== undefined ? { browsing } : {}),
+      ...(directory ? { directory: { path: directory.path, displayPath: directory.displayPath } } : {}),
+      mode: resume && !target ? resume.mode : pendingMode.current ?? mode,
+      name,
+      nameTouched: nameTouched.current,
+      command,
+      commandTouched: commandTouched.current,
+    };
+    return draftWorthKeeping(kept) ? kept : undefined;
+  };
+  /**
+   * Close, or answer why not. Every route calls this; only voice reads the
+   * answer. It KEEPS the form as a draft (#1247): Esc, a stray backdrop click
+   * or a steered `close` used to throw a filled form away.
+   */
   const requestClose = (): string | undefined => {
     if (starting) return STARTING_CLOSE_BLOCKED;
-    onClose();
+    onClose(snapshot());
+    return undefined;
+  };
+  /**
+   * The Discard button and voice's `discard_new_agent` (#1247): close, and keep
+   * nothing. Blocked during a start for `requestClose`'s reason.
+   */
+  const requestDiscard = (): string | undefined => {
+    if (starting) return STARTING_CLOSE_BLOCKED;
+    onClose(undefined);
     return undefined;
   };
   /* No dependency array: the slot holds this render's `requestClose`, which
@@ -426,22 +555,29 @@ export function NewAgentDialog({ runtime, initialDeckId, onClose, onAppeared, on
    * cursor on `focusPath` — the directory just left, when going up — or else
    * on the first subdirectory rather than on `..`.
    *
-   * `homeOnFailure` is the deck's configured default directory's fallback
-   * (PRD #1223): the deck vetted that path when it answered the options query,
-   * but it can vanish before the listing lands, and a browser that opened on an
-   * error would be a worse start than the home it replaces.
+   * `onFailure` says what a failure that is not deck loss does. `report`
+   * shows it in the panel. `home` is the deck's configured default
+   * directory's fallback (PRD #1223): the deck vetted that path when it
+   * answered the options query, but it can vanish before the listing lands,
+   * and a browser that opened on an error would be a worse start than the home
+   * it replaces. `quiet` shows nothing and leaves the next request to the
+   * caller — a draft's restore (#1247), which falls back to where a fresh
+   * form starts and says why in its own words.
+   *
+   * The answer is what became of the request, for a caller that has more to
+   * do once it lands; every other caller ignores it.
    */
-  const loadListing = useCallback(async (deckId: string, path?: string, focusPath?: string, homeOnFailure = false) => {
+  const loadListing = useCallback(async (deckId: string, path?: string, focusPath?: string, onFailure: "report" | "home" | "quiet" = "report"): Promise<ListingOutcome> => {
     const seq = ++listingSeq.current;
     setListingError(undefined);
     setListingState((current) => (current === "ready" ? current : "loading"));
     try {
       const reply = await runtime.listDirectories(deckId, path);
-      if (seq !== listingSeq.current) return;
+      if (seq !== listingSeq.current) return { kind: "stale" };
       if (reply.kind === "unsupported") {
         setListing(undefined);
         setListingState("unsupported");
-        return;
+        return { kind: "unsupported" };
       }
       for (const entry of reply.entries) projectMarks.current.set(entry.path, entry.isProject);
       setListing(reply);
@@ -450,19 +586,22 @@ export function NewAgentDialog({ runtime, initialDeckId, onClose, onAppeared, on
       const offset = reply.parent === undefined ? 0 : 1;
       const focused = focusPath === undefined ? -1 : reply.entries.findIndex((entry) => entry.path === focusPath);
       setCursor(focused >= 0 ? focused + offset : reply.entries.length > 0 ? offset : 0);
+      return { kind: "listed", listing: reply };
     } catch (cause) {
-      if (seq !== listingSeq.current) return;
+      if (seq !== listingSeq.current) return { kind: "stale" };
       const message = messageOf(cause);
       if (isDeckGoneError(message)) {
         deckGone(message);
-        return;
+        return { kind: "stale" };
       }
-      if (homeOnFailure && path !== undefined) {
+      if (onFailure === "home" && path !== undefined) {
         void loadListing(deckId);
-        return;
+        return { kind: "failed" };
       }
+      if (onFailure === "quiet") return { kind: "failed" };
       setListingError(message);
       setListingState((current) => (current === "ready" ? current : "failed"));
+      return { kind: "failed" };
     }
   }, [deckGone, runtime]);
 
@@ -480,8 +619,12 @@ export function NewAgentDialog({ runtime, initialDeckId, onClose, onAppeared, on
    * `..` still walks above the default; it is a starting point, not a root.
    * An options query that fails for any reason but a lost deck still lists
    * home, so the browser never waits on a setting.
+   *
+   * `resume` is a saved draft's directory and Mode (#1247), replayed through
+   * {@link resumeDraft} once the options have answered, in place of the
+   * default directory.
    */
-  const chooseDeck = (choice: DeckChoice | undefined) => {
+  const chooseDeck = (choice: DeckChoice | undefined, resume?: Resume) => {
     if (!choice || choice.reason !== undefined || phase !== "idle") return;
     setHighlight(choice.deckId);
     setFocusRequest({ to: "browser" });
@@ -492,6 +635,7 @@ export function NewAgentDialog({ runtime, initialDeckId, onClose, onAppeared, on
     setListingState("loading");
     const deckId = choice.deckId;
     const seq = ++optionsSeq.current;
+    resumePending.current = resume;
     void (async () => {
       let startAt: string | undefined;
       try {
@@ -511,8 +655,47 @@ export function NewAgentDialog({ runtime, initialDeckId, onClose, onAppeared, on
         }
         setOptionsError(message);
       }
-      void loadListing(deckId, startAt, undefined, startAt !== undefined);
+      if (resume) void resumeDraft(deckId, resume, startAt);
+      else void loadListing(deckId, startAt, undefined, startAt !== undefined ? "home" : "report");
     })();
+  };
+
+  /**
+   * #1247 — a saved draft's directory, replayed against the deck as it is NOW.
+   *
+   * The chosen directory (or, with none chosen, where the browser was) is
+   * listed afresh: a directory the deck still lists is chosen again exactly as
+   * Use this directory chooses it, by the path the deck returns now, which
+   * re-asks for its orchestrations; one it cannot list is dropped with a note
+   * and the browser opens where a fresh form would. Its saved Mode waits in
+   * {@link pendingMode} for the Mode row to offer it.
+   *
+   * **Anything the user does meanwhile wins.** Choosing another deck, or the
+   * deck leaving, clears {@link resumePending}; browsing makes this listing
+   * stale. Either way nothing here is applied over it.
+   *
+   * No path is built here either: every path sent is one the deck returned
+   * when the draft was made.
+   */
+  const resumeDraft = async (deckId: string, resume: Resume, startAt?: string) => {
+    const wanted = resume.directory?.path ?? resume.browsing;
+    const fresh = () => void loadListing(deckId, startAt, undefined, startAt !== undefined ? "home" : "report");
+    if (wanted === undefined) {
+      resumePending.current = undefined;
+      fresh();
+      return;
+    }
+    const outcome = await loadListing(deckId, wanted, undefined, "quiet");
+    if (resumePending.current !== resume) return;
+    resumePending.current = undefined;
+    if (outcome.kind === "failed") {
+      if (resume.directory) setRestoreNotes((notes) => [...(notes ?? []), DRAFT_DIRECTORY_GONE]);
+      fresh();
+      return;
+    }
+    if (outcome.kind === "listed" && resume.directory) {
+      confirmDirectory(outcome.listing.path, outcome.listing.displayPath, { deckId, mode: resume.mode });
+    }
   };
 
   /**
@@ -520,13 +703,61 @@ export function NewAgentDialog({ runtime, initialDeckId, onClose, onAppeared, on
    * header opened the flow — is CHOSEN on open, so its listing loads at once
    * and there is no Next to press. Otherwise focus starts on the deck field,
    * the first control left unsatisfied.
+   *
+   * # A saved draft (#1247)
+   *
+   * Restoring is REPLAYING, not copying. A typed Name and an edited Command
+   * are put back as they were — they are the user's own text, and no answer
+   * from the deck can invalidate them. Everything else is re-derived: the deck
+   * is chosen again only while it can still take a spawn, which re-asks it for
+   * its options (so an untouched Command is seeded from what the deck says
+   * NOW, and the agent registry is the current one); its directory is
+   * re-listed and re-chosen only if the deck still lists it
+   * ({@link resumeDraft}); and its Mode chip is chosen only once the fresh
+   * answers offer it, which also regenerates an untouched orchestration Name
+   * against the run titles live now. The project markers are not saved at
+   * all: the fresh listing produces them, and an unmarked directory is asked
+   * for its orchestrations anyway.
+   *
+   * A deck the flow was opened FOR — `initialDeckId` — outranks the draft's.
+   * On another deck the draft keeps only its Name and Command, exactly as a
+   * change of deck in the field does, and a note says what was not restored.
    */
   const opened = useRef(false);
   useEffect(() => {
     if (opened.current) return;
     opened.current = true;
     const preselected = choices.find((choice) => choice.deckId === highlight);
-    if (preselected && preselected.reason === undefined) chooseDeck(preselected);
+    const eligible = preselected !== undefined && preselected.reason === undefined;
+    const saved = savedDraft.current;
+    let resume: Resume | undefined;
+    if (saved) {
+      if (saved.nameTouched) {
+        nameTouched.current = true;
+        setName(saved.name);
+      }
+      if (saved.commandTouched) {
+        commandTouched.current = true;
+        setCommand(saved.command);
+      }
+      const notes = draftHasEdits(saved) ? [DRAFT_RESTORED] : [];
+      if (saved.deckId !== undefined) {
+        const savedName = displayText(saved.deckName ?? "The deck", DISPLAY_LIMITS.name);
+        if (eligible && preselected.deckId === saved.deckId) {
+          resume = {
+            ...(saved.browsing !== undefined ? { browsing: saved.browsing } : {}),
+            ...(saved.directory ? { directory: saved.directory } : {}),
+            mode: saved.mode,
+          };
+        } else if (initialDeckId !== undefined && initialDeckId !== saved.deckId) {
+          if (saved.directory) notes.push(draftOtherDeck(savedName));
+        } else {
+          notes.push(draftDeckGone(savedName, saved.directory !== undefined));
+        }
+      }
+      if (notes.length > 0) setRestoreNotes(notes);
+    }
+    if (eligible) chooseDeck(preselected, resume);
     else setFocusRequest({ to: "deck" });
   });
 
@@ -536,12 +767,15 @@ export function NewAgentDialog({ runtime, initialDeckId, onClose, onAppeared, on
    * asked for its orchestrations. Agent and Command stay — they hang off the
    * deck, not the directory.
    */
-  const confirmDirectory = (path: string, displayPath: string) => {
-    if (!deck || phase !== "idle") return;
-    const deckId = deck.deckId;
+  const confirmDirectory = (path: string, displayPath: string, restoring?: { deckId: string; mode: string }) => {
+    // A restore (#1247) runs from the reply to a request this render did not
+    // make, so it names the deck it captured rather than reading `deck`.
+    const deckId = restoring?.deckId ?? deck?.deckId;
+    if (deckId === undefined || phase !== "idle") return;
     setTarget({ path, displayPath });
     if (!nameTouched.current) setName(directoryLabel(path));
     setModeChoice(NO_MODE.id);
+    pendingMode.current = restoring && restoring.mode !== NO_MODE.id ? restoring.mode : undefined;
     setOrchestrations(undefined);
     setOrchestrationsError(undefined);
     setFormError(undefined);
@@ -552,14 +786,18 @@ export function NewAgentDialog({ runtime, initialDeckId, onClose, onAppeared, on
     // for an ordinary directory, so asking about an unmarked one is safe.
     const orchestrationsSeqNow = ++orchestrationsSeq.current;
     const queryOrchestrations = runtime.newAgentOrchestrations;
-    if (queryOrchestrations && projectMarks.current.get(path) !== false) {
+    const asking = queryOrchestrations !== undefined && projectMarks.current.get(path) !== false;
+    setOrchestrationsPending(asking);
+    if (asking) {
       void (async () => {
         try {
           const answer = await queryOrchestrations(deckId, path);
           if (orchestrationsSeqNow !== orchestrationsSeq.current) return;
           setOrchestrations(answer);
+          setOrchestrationsPending(false);
         } catch (cause) {
           if (orchestrationsSeqNow !== orchestrationsSeq.current) return;
+          setOrchestrationsPending(false);
           const message = messageOf(cause);
           if (isDeckGoneError(message)) deckGone(message);
           else setOrchestrationsError(message);
@@ -677,6 +915,33 @@ export function NewAgentDialog({ runtime, initialDeckId, onClose, onAppeared, on
     setName(spoken);
     return undefined;
   };
+  /**
+   * Issue #1263 — the deck field by voice: "deck build box", "use the local
+   * deck". It calls {@link chooseDeck}, the function a click on the deck's row
+   * calls, and nothing else — so a different deck clears the chosen directory,
+   * its listing, the deck's options and its orchestrations and keeps only a
+   * typed Name or Command, exactly as the click does, and the deck already
+   * chosen changes nothing.
+   *
+   * **Callable whenever the dialog is open** (`requires = ["new_agent_dialog"]`),
+   * unlike the fill rows, because choosing a deck is how the form BECOMES live.
+   * The deck arrives as the row's `deck_ref`, resolved Rust-side against the
+   * observed fleet, and is looked up in the field's list as it is NOW: one that
+   * has left it, or can no longer take a spawn, is refused in the dialog's
+   * words rather than chosen. A deck changed by hand during the round trip is
+   * replaced by the one the user named, as a second click would replace it;
+   * the voice surface refuses the answer outright if the dialog's FORM became
+   * or stopped being live meanwhile (`sameNewAgentDeclaration`), which is what
+   * protects a directory chosen during the round trip.
+   */
+  const voiceChooseDeck = (dispatch: VoiceDispatchTarget): string | undefined => {
+    if (phase !== "idle") return DECK_CHANGE_IN_FLIGHT;
+    const choice = choices.find((candidate) => candidate.deckId === dispatch.preselectDeckId);
+    if (!choice) return DECK_NOT_LISTED;
+    if (choice.reason !== undefined) return DECK_CANNOT_TAKE_AGENT;
+    chooseDeck(choice);
+    return undefined;
+  };
   /** Whether the form's fields are live — what a click on one of them needs. */
   const formLive = deck !== undefined && target !== undefined && phase === "idle";
 
@@ -721,10 +986,12 @@ export function NewAgentDialog({ runtime, initialDeckId, onClose, onAppeared, on
           }
           : undefined,
       },
+      chooseNewAgentDeck: voiceChooseDeck,
       chooseNewAgentMode: voiceChooseMode,
       chooseNewAgentType: voiceChooseAgentType,
       nameNewAgent: voiceNameNewAgent,
       startNewAgent: voiceStart,
+      discardNewAgent: requestDiscard,
       instance: instanceId.current,
     };
     return () => { voice.current = undefined; };
@@ -791,11 +1058,33 @@ export function NewAgentDialog({ runtime, initialDeckId, onClose, onAppeared, on
    * untouched.
    */
   const selectMode = (id: ModeId) => {
+    // A chip chosen by the user supersedes a draft's chip still waiting (#1247).
+    pendingMode.current = undefined;
     setModeChoice(id);
     if (nameTouched.current || !target) return;
     const basename = directoryLabel(target.path);
     setName(orchestrationChips.some((chip) => chip.id === id) ? suggestOrchestrationName(basename, liveTitles) : basename);
   };
+
+  /**
+   * #1247 — a draft's Mode chip, chosen as a click chooses it once the Mode row
+   * offers it (so an untouched Name follows it, as the TUI's
+   * `resuggest_name_for_selection` does), or dropped with a note once the
+   * deck's options and the directory's orchestrations have both answered
+   * without it. No dependency array: it reads this render's `modes`.
+   */
+  useEffect(() => {
+    const wanted = pendingMode.current;
+    if (wanted === undefined || !target) return;
+    if (modes.some((candidate) => candidate.id === wanted)) {
+      selectMode(wanted as ModeId);
+      return;
+    }
+    const answered = (options !== undefined || optionsError !== undefined) && !orchestrationsPending;
+    if (!answered) return;
+    pendingMode.current = undefined;
+    setRestoreNotes((notes) => [...(notes ?? []), DRAFT_MODE_GONE]);
+  });
 
   /**
    * Voice's "use claude": OVERWRITE Command with that agent's default command
@@ -1329,14 +1618,16 @@ export function NewAgentDialog({ runtime, initialDeckId, onClose, onAppeared, on
           `role="status"`, because in this one phase there is nothing left to
           read it off. Audit F5 blocks every close route while a start is in
           flight by DISABLING the controls — the header's close button, the
-          deck field, the directory panel, Start and the fields all at once —
+          deck field, the directory panel, Discard, Start and the fields all at once —
           and a disabled button is neither focusable nor announced, so the
           close button's `title` explaining the block is invisible to a screen
           reader. Focus falls back to the dialog itself (see `tabIndex` below,
           and `useInertBackground`, which moves it there when the pressed Start
           is blurred), and this is what tells a listener why nothing answers.
           There is no Cancel button (PRD #1223 U2): it was the same close as the
-          header's X, and no other dialog here has both.
+          header's X, and no other dialog here has both. Discard (#1247) is not
+          one: since every close keeps the form as a draft, it is the one
+          control that throws the form away, which the X does not.
       */}
       {starting && <p className="new-agent-hint" role="status" data-testid="new-agent-starting"><Loader2 className="spin" size={12} /> {STARTING_CLOSE_BLOCKED}</p>}
       {phase === "waiting" && <p className="new-agent-hint" data-testid="new-agent-waiting"><Loader2 className="spin" size={12} /> Started. Waiting for the deck to list it…</p>}
@@ -1369,11 +1660,22 @@ export function NewAgentDialog({ runtime, initialDeckId, onClose, onAppeared, on
         {/* Top to bottom in the tab order the wizard's steps had: deck, the
             directory browser, then Mode, Name, Command and Start. */}
         <div className="new-agent-body">
+          {restoreNotes && (
+            <div className="new-agent-restored" role="status" data-testid="new-agent-restored">
+              {restoreNotes.map((note) => <p key={note} className="new-agent-hint">{note}</p>)}
+            </div>
+          )}
           {deckField}
           {directoryPanel}
           {form}
         </div>
         <footer>
+          {/* #1247 — the one control that throws the form away; every close
+              keeps it. Named for voice's `discard_new_agent`, whose words are
+              this label and its accessible name. */}
+          <button type="button" className="button secondary" data-testid="new-agent-discard" aria-label="Discard new agent" title={starting ? STARTING_CLOSE_BLOCKED : "Close and forget what was entered in this form"} disabled={starting} onClick={requestDiscard}>
+            <Trash2 size={14} /> Discard
+          </button>
           <button type="submit" form={`${titleId}-form`} className="button primary" data-testid="new-agent-start" disabled={formDisabled || titleTaken}>
             {phase === "idle" ? <><Plus size={14} /> {selectedOrchestration ? "Start orchestration" : "Start agent"}</> : phase === "starting" ? "Starting…" : "Opening…"}
           </button>

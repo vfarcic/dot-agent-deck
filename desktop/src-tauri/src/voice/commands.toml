@@ -194,7 +194,8 @@ description = """Go back to the deck — the screen with the terminals on it —
 overview. On the agent overview a bare "go back" or "back" means THIS one, because the deck is
 the screen the overview was opened from. Also use for open deck and deck — the labels of the
 overview's Open deck button and its rail's Deck button — and for return to the deck, take me back,
-show me the deck, show the deck, or show the terminals or panes again."""
+show me the deck, show the deck, or show the terminals or panes again. While the New agent dialog
+is open, a request that names WHICH deck the new agent goes on is `choose_deck`, not this one."""
 invoke      = "openDeck"
 screens     = ["overview"]
 unavailable_hint = "returning to the deck works from the agent overview"
@@ -204,12 +205,20 @@ try_saying  = "go back to the deck"
 heard_as    = ["deck", "back", "return", "terminals", "panes"]
 # Over the New agent dialog this row is `close`'s destructive case by another
 # route (PRD #1223, closing audit H1): leaving the overview unmounts it, and the
-# form goes with it. So there it needs the whole utterance, and only an explicit
-# request for the deck — a bare "back" or "take me back" to a user filling a
-# form is as likely to mean the dialog or the parent directory. The dialog is
-# modal, so no click reaches the deck from behind it either.
+# form goes with it — since #1247 a close keeps the form as a draft, but that
+# draft lives in the overview's state, so leaving the overview still loses it.
+# So there it needs the whole utterance, and only an explicit request for the
+# deck — a bare "back" or "take me back" to a user filling a form is as likely
+# to mean the dialog or the parent directory. The dialog is modal, so no click
+# reaches the deck from behind it either.
+#
+# A bare "deck" and "the deck" left this list with #1263: over the dialog the
+# visible "Deck" is the dialog's own field heading, whose row is `choose_deck`
+# — the rail's Deck button is behind the modal — and the reading that loses
+# nothing is the one to keep. Said alone they name no deck, so they now get
+# `choose_deck`'s "which deck" rather than navigating away.
 heard_as_whole_while.new_agent_dialog = [
-  "go back to the deck", "back to the deck", "return to the deck", "the deck", "deck",
+  "go back to the deck", "back to the deck", "return to the deck",
   "show me the deck", "show the deck", "show the terminals",
 ]
 
@@ -263,17 +272,25 @@ heard_as_whole_while.new_agent_dialog = [
 # widens the row everywhere else too, which costs nothing there: elsewhere this
 # row closes a pane or the command list, and either reopens as it was.
 #
-# Reversible — EXCEPT over the New agent dialog (PRD #1223, closing audit H1).
-# A pane or the command list reopens as it was; the dialog's deck, directory,
-# Mode, Name and hand-edited Command are component-local state that
-# closing discards. So while the dialog is declared, `heard_as_whole_while`
-# replaces `heard_as` with whole-utterance equality: "name it done worker"
-# contains `done`, and a steered `close` must not ground on it and throw the
-# form away. The narrower list leaves out the words a user filling a form says
-# for other reasons — `done`, `leave`, `back`, `stop looking` — so over the
-# dialog only a plain request to close or dismiss it closes it. The parser
-# refuses an entry here that none of `heard_as` grounds, so this can only take
-# phrasings away. Everywhere else the row is token-grounded as before.
+# Over the New agent dialog it used to be DESTRUCTIVE (PRD #1223, closing audit
+# H1): the dialog's deck, directory, Mode, Name and hand-edited Command were
+# component-local state that closing discarded. Since #1247 a close keeps them
+# as a draft the next open replays, and `discard_new_agent` is the one way to
+# throw them away. The whole-utterance list below STAYS, for what a draft does
+# not cover: the replay runs against fresh answers from the deck and drops any
+# choice they no longer offer, and the draft lives only as long as the overview
+# does — so an unwanted close is cheaper than it was, not free. While the dialog
+# is declared, `heard_as_whole_while` replaces `heard_as` with whole-utterance
+# equality: "name it done worker" contains `done`, and a steered `close` must
+# not ground on it. The narrower list leaves out the words a user filling a
+# form says for other reasons — `done`, `leave`, `back`, `stop looking` — so
+# over the dialog only a plain request to close or dismiss it closes it. The
+# parser refuses an entry here that none of `heard_as` grounds, so this can only
+# take phrasings away. Everywhere else the row is token-grounded as before.
+#
+# `cancel` and `never mind` CLOSE, and so keep the draft; they do not discard.
+# Both readings are plausible for "cancel", and the one that loses nothing is
+# the one to take — a user who meant to throw the form away says "discard".
 [[commands]]
 id          = "close"
 description = """Close whatever is open OVER the current screen and go back to what was
@@ -284,8 +301,9 @@ dialog's X button), cancel, cancel this, cancel it, never mind,
 dismiss this, hide this, get rid of this, I'm done with this, stop looking at this, leave this
 agent, or back to the overview. "Close the agent", "close the agent screen", "close the agent
 view" and "close the agent pane" mean THIS one: they close the VIEW of the agent, and the agent
-keeps running. When closing a view and stopping something are both possible readings, closing the
-view is the one meant. A bare "go back" or "back" means THIS one ONLY when `open_deck` is not
+keeps running. Closing the New agent dialog this way keeps what was entered in it for the next
+time it opens; only "discard" throws it away, and that is `discard_new_agent`. When closing a view
+and stopping something are both possible readings, closing the view is the one meant. A bare "go back" or "back" means THIS one ONLY when `open_deck` is not
 callable — a callable `open_deck` means the deck itself is what "back" leads to, and that one
 wins. This only closes what is on top: it does NOT stop any agent, does NOT close an agent's
 terminal pane, and does NOT turn voice off."""
@@ -784,6 +802,63 @@ heard_as    = ["name", "call"]
   name = "prefix"
   kind = "spoken_prefix"
 
+# Issue #1263 — the deck field, once the dialog is open: the `deck_ref` kind
+# `open_new_agent` already resolves, on a row of its own, so a wrong or missing
+# deck costs one utterance rather than a close and a reopen. It matters more
+# since reference grounding went: a deck the model fills in for "spawn an
+# agent" is preselected, and this is how a voice-only user corrects it.
+#
+# **It calls `chooseDeck`, the click's own function**, so a different deck
+# clears the chosen directory, its listing, the deck's options and its
+# orchestrations and keeps a typed Name or Command; the deck already chosen
+# changes nothing. The dialog looks the resolved deck up in its field as it is
+# NOW and refuses one that left it or can no longer take a spawn.
+#
+# **`requires = ["new_agent_dialog"]`, not `new_agent_form`**: choosing a deck
+# is how the form BECOMES live, so gating it on the form would make it useless
+# exactly where it is needed. With the dialog closed, a named deck is
+# `open_new_agent`'s param instead.
+#
+# **`heard_as = ["deck"]` and nothing else, on purpose.** Changing the deck
+# throws away a chosen directory, which takes several utterances to reach
+# again, and observed names — directories, agent labels, orchestration titles —
+# can be written to steer the model. With a verb such as `use` or `pick` in the
+# vocabulary, "use this directory" or "use claude" over a hostile listing could
+# ground a steered switch; requiring the word "deck" means the user has to have
+# talked about a deck. "Switch to the build box" without it is refused with
+# `try_saying`, which teaches the phrasing. The field's visible label is
+# "Deck", so the label rule is met by "deck <name>", as "mode <chip>" meets
+# it for the Mode row. The residual — "deck" said for another reason while a
+# steered pick is in flight — is the one every `heard_as` row carries
+# (`docs/develop/voice-first-design.md`, section 6), and what it reaches is
+# another deck on screen, visibly, with the typed fields kept.
+#
+# The report names the deck by the label the screen shows, which is what makes
+# a guess audible.
+[[commands]]
+id          = "choose_deck"
+description = """In the New agent dialog, choose which deck the new agent starts on — the dialog's
+Deck field. Use for deck build box, use the local deck, switch to the build box deck, change the
+deck to local, pick the remote deck, put it on the local deck, choose deck ci — and for a deck's
+own name said with the word deck, like "Local deck". Set `deck` to the words the user used for the
+deck; it must be one of `decks`. Choosing a different deck clears the chosen directory and the Mode
+and keeps a typed Name or Command. While the New agent dialog is open, a request that names WHICH
+deck the new agent goes on is THIS one — never `open_deck`, which leaves the agent overview for
+the deck screen, and never `open_new_agent`, since the dialog is already open. It starts nothing,
+and never touches the command line, which is typed by hand."""
+invoke      = "chooseNewAgentDeck"
+screens     = ["overview"]
+requires    = ["new_agent_dialog"]
+unavailable_hint = "choosing the deck this way works while the New agent dialog is open; say “new agent on” and the deck to open it on one"
+report      = "Deck: {deck}."
+asks_to     = "choose the new agent's deck"
+try_saying  = "deck {deck}"
+heard_as    = ["deck"]
+
+  [[commands.params]]
+  name = "deck"
+  kind = "deck_ref"
+
 # PRD #1223 x PRD #802 D5 — the row that STARTS something.
 #
 # **It starts at once, and that is D5 REVISITED, not ignored** (2026-09-23). As
@@ -853,6 +928,42 @@ asks_to     = "start the new agent"
 try_saying  = "start it"
 heard_as    = ["start", "launch", "create", "spin", "run", "go ahead"]
 unavailable_redirects = "open_new_agent"
+
+# Issue #1247 — the dialog's Discard button. Since #1247 every close KEEPS the
+# form as a draft the next open replays, so this is the one way to throw it
+# away, and the one row over the dialog that cannot be taken back.
+#
+# **`heard_as_whole`, the second row to use it after `submit_prompt`**, for
+# that row's reason: the action is irreversible and its word is ordinary
+# English. "Name it discard worker" contains `discard`; so could an utterance
+# over a hostile listing written to steer the model here. Only the whole
+# utterance being one of these asks for it. `cancel` and `never mind` stay
+# `close`'s words — and so keep the draft — because the direction to err in is
+# the one that loses nothing: a user who meant to throw the form away says
+# "discard" once more, and one who did not has not lost it.
+#
+# The button's label, "Discard", and its accessible name, "Discard new agent",
+# are both entries (the label rule). Blocked while a start is in flight, as
+# every close is.
+[[commands]]
+id          = "discard_new_agent"
+description = """Discard what is entered in the New agent dialog and close it — the dialog's Discard
+button, whose accessible name is "Discard new agent". Use for discard, discard it, discard this,
+discard the form, discard the draft, discard new agent, discard the new agent, or discard the new
+agent form — said on their own. Every OTHER way of closing the dialog — close, cancel, never mind —
+keeps what was entered for the next time it opens, and that is `close`, not this one. It starts
+nothing and stops nothing."""
+invoke      = "discardNewAgent"
+screens     = ["overview"]
+requires    = ["new_agent_dialog"]
+unavailable_hint = "discarding works while the New agent dialog is open"
+report      = "Discarded the New agent form."
+asks_to     = "discard the New agent form"
+try_saying  = "discard"
+heard_as_whole = [
+  "discard", "discard it", "discard this", "discard the form", "discard the draft",
+  "discard new agent", "discard the new agent", "discard the new agent form",
+]
 
 # PRD #1223 x PRD #802 D5 — the two rows that STOP something, and the one rule
 # they share: **each terminates at a `ConfirmDialog`, never at a direct

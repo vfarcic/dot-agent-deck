@@ -325,7 +325,9 @@ mod tests {
                 "choose_mode".to_string(),
                 "choose_agent_type".to_string(),
                 "name_new_agent".to_string(),
+                "choose_deck".to_string(),
                 "start_new_agent".to_string(),
+                "discard_new_agent".to_string(),
                 "stop_agent".to_string(),
                 "close_orchestration".to_string(),
                 "none".to_string(),
@@ -391,7 +393,9 @@ mod tests {
                 "choose_mode",
                 "choose_agent_type",
                 "name_new_agent",
+                "choose_deck",
                 "start_new_agent",
+                "discard_new_agent",
                 "stop_agent",
                 "close_orchestration",
                 "none"
@@ -554,7 +558,10 @@ mod tests {
                 ("choose_mode".to_string(), false),
                 ("choose_agent_type".to_string(), false),
                 ("name_new_agent".to_string(), false),
+                // `requires` the dialog open, and none is declared here (#1263, #1247).
+                ("choose_deck".to_string(), false),
                 ("start_new_agent".to_string(), false),
+                ("discard_new_agent".to_string(), false),
                 ("stop_agent".to_string(), false),
                 ("close_orchestration".to_string(), false),
             ]
@@ -584,7 +591,10 @@ mod tests {
                 ("choose_mode".to_string(), false),
                 ("choose_agent_type".to_string(), false),
                 ("name_new_agent".to_string(), false),
+                // `requires` the dialog open, and none is declared here (#1263, #1247).
+                ("choose_deck".to_string(), false),
                 ("start_new_agent".to_string(), false),
+                ("discard_new_agent".to_string(), false),
                 // The D5 stops: on the overview, and each only opens a confirmation.
                 ("stop_agent".to_string(), true),
                 ("close_orchestration".to_string(), true),
@@ -611,7 +621,10 @@ mod tests {
                 ("choose_mode".to_string(), false),
                 ("choose_agent_type".to_string(), false),
                 ("name_new_agent".to_string(), false),
+                // `requires` the dialog open, and none is declared here (#1263, #1247).
+                ("choose_deck".to_string(), false),
                 ("start_new_agent".to_string(), false),
+                ("discard_new_agent".to_string(), false),
                 ("stop_agent".to_string(), false),
                 ("close_orchestration".to_string(), false),
             ]
