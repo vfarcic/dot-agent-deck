@@ -2,7 +2,7 @@ import { act, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { createFixtureSnapshot } from "./data/fixture";
 import { LaunchCleanupError } from "./lib/actionError";
-import { DEFAULT_DESKTOP_SETTINGS as DEFAULT_SETTINGS, type DeckBridge } from "./lib/bridge";
+import { DEFAULT_DESKTOP_SETTINGS as DEFAULT_SETTINGS, fixtureDesktopFeatures, type DeckBridge } from "./lib/bridge";
 import type { DeckDirectoryListing, NewAgentOptions } from "./types";
 
 /**
@@ -32,6 +32,7 @@ const OPTIONS: NewAgentOptions = { kind: "deck", agents: [], experimental: false
 const { bridge } = vi.hoisted(() => ({
   bridge: {
     mode: "fixture",
+    desktopFeatures: vi.fn(async () => fixtureDesktopFeatures("?experimental=1")),
     connect: vi.fn(),
     subscribe: vi.fn(async () => () => {}),
     runAction: vi.fn(),

@@ -9,7 +9,7 @@ import { applyTerminalChunk } from "../lib/terminalBuffer";
 import { deckName } from "../lib/displayText";
 const EMPTY_TERMINAL_DATA: Record<string, TerminalBuffer> = {};
 import { isDelivered } from "../types";
-import type { AgentTarget, CleanupWarningEntry, DeckAction, DeckFleet, DeckRuntimeState, DeckSnapshot, RuntimeMode, SendResult, TerminalBuffer } from "../types";
+import type { AgentTarget, CleanupWarningEntry, DeckAction, DeckFleet, DeckRuntimeState, DeckSnapshot, DesktopFeatures, RuntimeMode, SendResult, TerminalBuffer } from "../types";
 
 /**
  * The snapshot a runtime starts with, before any deck has answered. Lifted out
@@ -441,8 +441,22 @@ export function useDeckRuntime(): DeckRuntimeState {
     });
   }, [bridge]);
 
+  // Issue #1198: the app's experimental surfaces, asked ONCE per bridge. The
+  // flag is a presentation switch read at startup — changing it means
+  // restarting the app — so there is no re-query to race a navigation with.
+  // A missing method or a refused call leaves this `undefined`, which every
+  // reader takes as all hidden (`desktopFeaturesOf`).
+  const [desktopFeatures, setDesktopFeatures] = useState<DesktopFeatures>();
+  useEffect(() => {
+    let cancelled = false;
+    const ask = typeof bridge.desktopFeatures === "function" ? bridge.desktopFeatures() : undefined;
+    void ask?.then((features) => { if (!cancelled) setDesktopFeatures(features); }, () => undefined);
+    return () => { cancelled = true; };
+  }, [bridge]);
+
   return {
     appliedGeometry,
+    desktopFeatures,
     mode,
     snapshot,
     fleet,

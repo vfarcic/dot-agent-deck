@@ -1,6 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import {
-  Activity,
   AlertTriangle,
   ArrowRight,
   Blocks,
@@ -16,8 +15,6 @@ import {
   GitBranch,
   HelpCircle,
   History,
-  Keyboard,
-  LayoutList,
   Network,
   PanelRight,
   Pause,
@@ -34,6 +31,7 @@ import {
   Zap,
 } from "lucide-react";
 import { AgentOverview } from "./components/AgentOverview";
+import { NavigationRail, type RailContext } from "./components/NavigationRail";
 import { AgentTile, type AgentTileProps } from "./components/AgentTile";
 import { ConfirmDialog, type ConfirmState } from "./components/ConfirmDialog";
 import { DeckSelector } from "./components/DeckSelector";
@@ -52,6 +50,7 @@ import { useInertBackground } from "./hooks/useInertBackground";
 import { useShownTerminals } from "./hooks/useShownTerminals";
 import { useHeldAgentRecord, type HeldAgentRecord } from "./hooks/useHeldAgentRecord";
 import { useZoom } from "./hooks/useZoom";
+import { useShellOverlays, type RailScreen, type ScreenOverlays } from "./hooks/useShellOverlays";
 import { agentKey } from "./lib/agentKey";
 import { VOICE_ACTIONS, dispatchVoiceAction, type DeckOverlay, type NewAgentVoice, type VoiceContextChannel, type VoiceDispatchContext, type VoiceDispatchTarget, type VoiceOverviewContext, type VoicePanelContext, type VoiceScreenContext } from "./lib/voiceActions";
 import { unreachableDeckTerminalState } from "./lib/terminalInput";
@@ -60,6 +59,7 @@ import { desktopWorkflowPlatformIssue } from "./lib/platform";
 import { LaunchCleanupError } from "./lib/actionError";
 import { CleanupWarning } from "./components/CleanupWarning";
 import type { VoiceDirectoriesDto, VoiceNewAgentDto, VoiceOutcomeDto } from "./lib/bridge";
+import { desktopFeaturesOf } from "./types";
 import type { AgentSession, CleanupWarningEntry, DeckAction, DeckRuntimeState, DeckSnapshot, DeckView, EvidenceItem, PanelTab, WorkflowLaunchConfig } from "./types";
 import { modeScopedKey } from "./lib/bridge";
 
@@ -112,6 +112,23 @@ function evidenceOpenOnFirstLoad(): boolean {
   return window.innerWidth >= 1260;
 }
 
+/**
+ * The registry entry voice's `open_deck` row invokes — typed against the
+ * registry, so renaming the entry breaks this rather than the gate below.
+ */
+const OPEN_DECK_INVOKE: keyof typeof VOICE_ACTIONS = "openDeck";
+
+/**
+ * Issue #1198 — what a view that names the deck is shown as while the deck is
+ * hidden: the overview, and a pane opened over the deck opens over the
+ * overview instead. Views that do not name the deck come back unchanged.
+ */
+function overviewInsteadOfDeck(view: DeckView): DeckView {
+  if (view.kind === "deck") return { kind: "overview" };
+  if (view.kind === "agent" && view.from === "deck") return { ...view, from: "overview" };
+  return view;
+}
+
 export default function App() {
   return <DeckShell runtime={useDeckRuntime()} />;
 }
@@ -124,16 +141,29 @@ export default function App() {
  * deck. `DeckView` is a discriminated union from the start so PRD #745
  * iteration 3's group and single-agent views arrive as added variants.
  *
- * The deck stays the default: launching the app lands exactly where it does
- * today.
+ * The overview is the default (issue #1196): it is the landing screen PRD
+ * #745 built, and the rail lists it first. Nothing persists the last view, so
+ * every launch opens there; a caller that wants the deck passes
+ * `initialView`, as the tests do.
  *
  * PRD #1105 M2 narrowed the first sentence rather than repealing it. The two
  * SCREEN variants still replace one another; the `"agent"` variant does not —
  * it names the screen to keep mounted underneath and renders the pane over it,
  * which is why the switch below reads `base` rather than `view.kind`.
  */
-export function DeckShell({ runtime, workflowPlatformIssue, initialView = { kind: "deck" } }: { runtime: DeckRuntimeState; workflowPlatformIssue?: string; initialView?: DeckView }) {
-  const [view, setView] = useState<DeckView>(initialView);
+export function DeckShell({ runtime, workflowPlatformIssue, initialView = { kind: "overview" } }: { runtime: DeckRuntimeState; workflowPlatformIssue?: string; initialView?: DeckView }) {
+  const [requestedView, setView] = useState<DeckView>(initialView);
+  /**
+   * Issue #1198 — the app's experimental surfaces, read once at startup. The
+   * deck is one of them, so while it is hidden a view that names it — an
+   * `initialView`, a deep link, a pane opened over it — is SHOWN as the
+   * overview instead. Derived rather than written back, so nothing about the
+   * request is lost and no effect races the first render; every navigation
+   * control that could ask for the deck is itself withheld below (the rail,
+   * the overview's Open deck buttons, voice's `open_deck`).
+   */
+  const features = desktopFeaturesOf(runtime);
+  const view = useMemo(() => (features.showDeck ? requestedView : overviewInsteadOfDeck(requestedView)), [features.showDeck, requestedView]);
   /**
    * The settings document and the zoom keys live HERE, not in the deck,
    * because both are the app's and not one screen's — and `DeckShell` is the
@@ -235,6 +265,37 @@ export function DeckShell({ runtime, workflowPlatformIssue, initialView = { kind
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [agentView, closeAgentView]);
   const base = agentView?.from ?? view.kind;
+  /**
+   * Issue #1197 — the one rail, and the overlays it shows as open. Held here
+   * because this is the only component mounted for every screen; the deck's
+   * panels read their half through `DeckSurface`'s `overlays` prop.
+   */
+  const screen: RailScreen = base === "overview" ? "overview" : "deck";
+  const { open: overlaysOpen, setOverlay, closeOverlays, deck: deckOverlays } = useShellOverlays(screen);
+  const railContext = useMemo<RailContext>(() => ({
+    navigate: setView,
+    // Settings opens over whichever screen is up; the deck's own panels exist
+    // only on the deck, so asking for one elsewhere goes there first.
+    openOverlay: (overlay) => {
+      if (overlay === "settings") return setOverlay(screen, overlay, true);
+      if (screen !== "deck") setView({ kind: "deck" });
+      setOverlay("deck", overlay, true);
+    },
+    closeOverlays: () => closeOverlays(screen),
+  }), [closeOverlays, screen, setOverlay]);
+  /**
+   * `Escape` closes Settings over the overview. The deck's own blanket
+   * dismissal covers it there, and the overview has no such handler.
+   */
+  const overviewSettingsOpen = screen === "overview" && Boolean(overlaysOpen.settings);
+  useEffect(() => {
+    if (!overviewSettingsOpen) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setOverlay("overview", "settings", false);
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [overviewSettingsOpen, setOverlay]);
   const selectedDeckId = runtime.snapshot.connection.deckId;
   /** The fleet entry the open pane's agent lives on, if the app is observing it. */
   const paneDeck = agentView ? runtime.fleet.find((entry) => entry.connection.deckId === agentView.deckId) : undefined;
@@ -598,12 +659,23 @@ export function DeckShell({ runtime, workflowPlatformIssue, initialView = { kind
          `VoicePanelContext`, which is a narrow `Pick` precisely so a screen and
          the voice surface can never offer the same member. */
       ...panelVoiceContext.current,
+      /* The shell's, so Settings opens from the overview as from the deck (#1197). */
+      openOverlay: railContext.openOverlay,
+      closeOverlays: railContext.closeOverlays,
+      /* Only while Settings is open, so `close` reads its presence (#1197). */
+      ...(overlaysOpen.settings ? { closeSettings: () => setOverlay(screen, "settings", false) } : {}),
       navigate: (next) => { moved = true; setView(next); },
       closeAgentView: () => { moved = true; closeAgent(); },
     };
+    /* Issue #1198 — the deck is hidden, so voice does not go there even when a
+       resolver names it. The crate already withholds `open_deck` from what the
+       model is offered (`voice::schema::annotate_for`); this is the same gate at
+       the dispatch seam, for an answer that arrives anyway. Refused like any
+       dispatch the host cannot serve, so the report says nothing ran. */
+    if (outcome.invoke === OPEN_DECK_INVOKE && !features.showDeck) return undefined;
     if (!dispatchVoiceAction(outcome.invoke, context, target)) return undefined;
     return moved ? { undo: () => setView(previous) } : {};
-  }, [agentView, base, closeAgent, paneAgent, selectedDeckId, view]);
+  }, [agentView, base, closeAgent, features.showDeck, overlaysOpen.settings, paneAgent, railContext, screen, selectedDeckId, setOverlay, view]);
   /** PRD #1223 — what the directory browser shows, read at declaration time. */
   const readDirectories = useCallback(() => newAgentVoice.current?.directories, []);
   /** PRD #1223 — what the New agent dialog shows besides its browser, while it is open. */
@@ -645,7 +717,7 @@ export function DeckShell({ runtime, workflowPlatformIssue, initialView = { kind
         <Toast message={runtime.error} onDismiss={runtime.clearError} warnings={runtime.cleanupWarnings} onDismissWarning={runtime.dismissCleanupWarning} />
       </>
     )
-    : <DeckSurface runtime={runtime} settings={settings} workflowPlatformIssue={workflowPlatformIssue} onNavigate={setView} openAgent={openAgent} onCloseAgent={closeAgent} voiceChannel={deckVoiceContext} />;
+    : <DeckSurface runtime={runtime} settings={settings} workflowPlatformIssue={workflowPlatformIssue} onNavigate={setView} openAgent={openAgent} onCloseAgent={closeAgent} voiceChannel={deckVoiceContext} overlays={deckOverlays} />;
   /*
     PRD #802 M6 — the voice surface is a SIBLING of the screen switch, and this
     shape is the whole of that decision.
@@ -658,17 +730,23 @@ export function DeckShell({ runtime, workflowPlatformIssue, initialView = { kind
     sentence and the Undo would go with it, and `open_overview` would be the one
     command whose report nobody ever sees.
 
-    The two children are POSITIONAL, which is what makes the panel survive: React
-    reconciles by position, so the screen at index 0 may change type freely while
-    index 1 keeps the same fiber and therefore the same panel state. This
-    deliberately returns one fragment on both paths rather than the screen alone
-    on one of them, because a fragment on one path and a `DeckSurface` on the
-    other is a different root type and would remount everything under it.
+    The children are POSITIONAL, which is what makes the panel survive: React
+    reconciles by position, so the screen at index 1 may change type freely while
+    the panel at index 2 keeps the same fiber and therefore the same panel state.
+    This deliberately returns one fragment on both paths rather than the screen
+    alone on one of them, because a fragment on one path and a `DeckSurface` on
+    the other is a different root type and would remount everything under it.
+
+    The rail (issue #1197) and the Settings sheet sit beside the screen for the
+    same reason: they are the app's, not one screen's, so neither is torn down
+    or re-created by a navigation.
   */
   return (
     <>
+      <NavigationRail screen={screen} overlays={overlaysOpen} context={railContext} connection={runtime.snapshot.connection} features={features} onShowShortcuts={screen === "deck" ? () => setOverlay("deck", "shortcuts", true) : undefined} />
       {screenNode}
       <VoiceControlPanel runtime={runtime} screen={view.kind} onDispatch={dispatchVoice} channel={panelVoiceContext} directories={readDirectories} newAgent={readNewAgent} newAgentInstance={readNewAgentInstance} />
+      <ShellSettings runtime={runtime} settings={settings} open={overlaysOpen.settings ?? false} onClose={() => setOverlay(screen, "settings", false)} />
     </>
   );
 }
@@ -874,11 +952,35 @@ function AgentPaneFrame({ open, onOpen, onClose, ...tile }: Omit<AgentTileProps,
  */
 export function ControlDeck(props: { runtime: DeckRuntimeState; workflowPlatformIssue?: string; onNavigate?: (view: DeckView) => void }) {
   const settings = useDesktopSettings(props.runtime);
-  return <DeckSurface {...props} settings={settings} />;
+  // Issue #1197: the rail and the Settings sheet are the shell's, so a deck
+  // rendered on its own carries the same pair {@link DeckShell} does.
+  const { open, setOverlay, closeOverlays, deck } = useShellOverlays("deck");
+  const context: RailContext = {
+    navigate: (view) => props.onNavigate?.(view),
+    openOverlay: (overlay) => setOverlay("deck", overlay, true),
+    closeOverlays: () => closeOverlays("deck"),
+  };
+  return (
+    <>
+      <NavigationRail screen="deck" overlays={open} context={context} connection={props.runtime.snapshot.connection} features={desktopFeaturesOf(props.runtime)} onShowShortcuts={() => setOverlay("deck", "shortcuts", true)} />
+      <DeckSurface {...props} settings={settings} overlays={deck} />
+      <ShellSettings runtime={props.runtime} settings={settings} open={open.settings ?? false} onClose={() => setOverlay("deck", "settings", false)} />
+    </>
+  );
 }
 
-export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktopWorkflowPlatformIssue(), onNavigate, openAgent, onCloseAgent, voiceChannel }: { runtime: DeckRuntimeState; settings: DesktopSettingsState; workflowPlatformIssue?: string; onNavigate?: (view: DeckView) => void; openAgent?: { deckId: string; agentId: string }; onCloseAgent?: () => void; voiceChannel?: VoiceContextChannel }) {
+export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktopWorkflowPlatformIssue(), onNavigate, openAgent, onCloseAgent, voiceChannel, overlays: shellOverlays }: { runtime: DeckRuntimeState; settings: DesktopSettingsState; workflowPlatformIssue?: string; onNavigate?: (view: DeckView) => void; openAgent?: { deckId: string; agentId: string }; onCloseAgent?: () => void; voiceChannel?: VoiceContextChannel; overlays?: ScreenOverlays }) {
   const { snapshot, mode, setShownTerminals } = runtime;
+  const features = desktopFeaturesOf(runtime);
+  /**
+   * Issue #1197 — the overlay booleans are held by the shell that renders the
+   * one rail, because the rail shows them as active and Settings opens over the
+   * overview as well. A deck rendered bare, as some tests do, keeps a state of
+   * its own so it still renders the same.
+   */
+  const ownOverlays = useShellOverlays("deck").deck;
+  const overlays = shellOverlays ?? ownOverlays;
+  const setOverlay = overlays.set;
   /**
    * Which tile is promoted, decided on the FULL `(deckId, agentId)` identity.
    *
@@ -902,30 +1004,24 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
   const [tabs, setTabs] = useState<Record<string, PanelTab>>({});
   const [selectedEvidenceId, setSelectedEvidenceId] = useState("");
   const [evidenceOpen, setEvidenceOpen] = useState(evidenceOpenOnFirstLoad);
-  const [projectsOpen, setProjectsOpen] = useState(false);
-  const [profilesOpen, setProfilesOpen] = useState(false);
-  const [promptsOpen, setPromptsOpen] = useState(false);
+  const projectsOpen = overlays.open.projects ?? false;
+  const setProjectsOpen = (open: boolean) => setOverlay("projects", open);
+  const profilesOpen = overlays.open.profiles ?? false;
+  const setProfilesOpen = (open: boolean) => setOverlay("profiles", open);
+  const promptsOpen = overlays.open.prompts ?? false;
+  const setPromptsOpen = (open: boolean) => setOverlay("prompts", open);
   const [selectedPromptId, setSelectedPromptId] = useState("");
   const [terminalFocus, setTerminalFocus] = useState<{ agentId: string; token: number }>();
-  const [workflowOpen, setWorkflowOpen] = useState(false);
+  const workflowOpen = overlays.open.workflow ?? false;
+  const setWorkflowOpen = (open: boolean) => setOverlay("workflow", open);
   const [paletteOpen, setPaletteOpen] = useState(false);
-  const [helpOpen, setHelpOpen] = useState(false);
-  const [settingsOpen, setSettingsOpen] = useState(false);
+  const helpOpen = overlays.open.shortcuts ?? false;
+  const setHelpOpen = (open: boolean) => setOverlay("shortcuts", open);
+  const setSettingsOpen = (open: boolean) => setOverlay("settings", open);
   /* Issue #1234: a sentence only. The roles a failed launch could not confirm
      are stopped are the runtime's `cleanupWarnings`, which outlive any notice. */
   const [notice, setNotice] = useState<string>();
   const [confirm, setConfirm] = useState<ConfirmState>();
-  // Memoised so the context value is stable across renders; `runtime.testEndpoint`
-  // is itself stable for the lifetime of the bridge.
-  const settingsBridge = useMemo(
-    () => ({
-      testEndpoint: runtime.testEndpoint,
-      secretStatus: runtime.secretStatus,
-      storeSecret: runtime.storeSecret,
-      forgetSecret: runtime.forgetSecret,
-    }),
-    [runtime.testEndpoint, runtime.secretStatus, runtime.storeSecret, runtime.forgetSecret],
-  );
   const { profiles, updateProfile, resetProfiles } = useAgentProfiles(snapshot.profiles);
   /*
    * PRD #819 M6: the projects come from the daemon and nothing is remembered.
@@ -1207,7 +1303,7 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
       if (event.key === "Escape") {
         // Not a registry dispatch, and the distinction is worth keeping: this
         // is a blanket DISMISSAL — palette, shortcut sheet, confirm dialog and
-        // every overlay at once — rather than the Runs control, which shows the
+        // every overlay at once — rather than the Deck control, which shows the
         // deck. It shares `closeOverlays` so the five setters are written once.
         setPaletteOpen(false); setHelpOpen(false); closeOverlays(); setConfirm(undefined);
         return;
@@ -1470,10 +1566,19 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
    */
   const commandItems = [
     ...(coordinator ? [{ label: "Message coordinator…", hint: `Focus ${coordinator.displayName}'s terminal`, icon: Send, run: () => VOICE_ACTIONS.messageCoordinator.run(voiceContext, { agentId: coordinator.id }) }] : []),
-    { label: "Manage projects", hint: "Choose repositories & workflows", icon: FolderGit2, run: () => VOICE_ACTIONS.openProjects.run(voiceContext) },
-    { label: "Open prompt library", hint: "Reusable workflow launch prompts", icon: BookMarked, run: () => VOICE_ACTIONS.openPromptLibrary.run(voiceContext) },
-    { label: "Open agent profiles", hint: "Configure models & permissions", icon: Bot, run: () => VOICE_ACTIONS.openAgentProfiles.run(voiceContext) },
-    { label: "Edit workflow order", hint: "Enable, skip, or reorder roles", icon: Network, run: () => VOICE_ACTIONS.openWorkflowOrder.run(voiceContext) },
+    /* Issue #1198 — each experimental panel's entry follows its own field, as
+       its rail entry does. The palette itself is the deck's (it is bound here,
+       and the deck is unmounted while `showDeck` is off), so it needs no gate
+       of its own. NOT gated, and named so the residual is known: the panels'
+       in-deck doors — the run graph's Edit loop, the empty deck's Configure
+       agents, and the Projects ↔ Workflows cross-links inside those panels.
+       Each sits inside a surface that is itself hidden with the flag off, and
+       all five fields follow the one flag today; if they ever diverge, those
+       doors need gates of their own. */
+    ...(features.showProjects ? [{ label: "Manage projects", hint: "Choose repositories & workflows", icon: FolderGit2, run: () => VOICE_ACTIONS.openProjects.run(voiceContext) }] : []),
+    ...(features.showPrompts ? [{ label: "Open prompt library", hint: "Reusable workflow launch prompts", icon: BookMarked, run: () => VOICE_ACTIONS.openPromptLibrary.run(voiceContext) }] : []),
+    ...(features.showAgentProfiles ? [{ label: "Open agent profiles", hint: "Configure models & permissions", icon: Bot, run: () => VOICE_ACTIONS.openAgentProfiles.run(voiceContext) }] : []),
+    ...(features.showWorkflows ? [{ label: "Edit workflow order", hint: "Enable, skip, or reorder roles", icon: Network, run: () => VOICE_ACTIONS.openWorkflowOrder.run(voiceContext) }] : []),
     { label: "Open settings", hint: "Appearance and other app preferences", icon: Settings2, run: () => VOICE_ACTIONS.openSettings.run(voiceContext) },
     { label: evidenceOpen ? "Hide evidence drawer" : "Show evidence drawer", hint: "Toggle transition evidence", icon: PanelRight, run: () => VOICE_ACTIONS.toggleEvidenceDrawer.run(voiceContext) },
     ...snapshot.agents.map((agent, index) => ({ label: `Focus ${agent.role}`, hint: `Shortcut ${index + 1}`, icon: SquareTerminal, run: () => VOICE_ACTIONS.focusAgent.run(voiceContext, { agentId: agent.id }) })),
@@ -1482,31 +1587,6 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
 
   return (
     <div className={`control-deck ${evidenceOpen ? "with-evidence" : ""}`}>
-      <aside className="rail" aria-label="Primary navigation">
-        <div className="brand-mark" aria-label="Agent Deck"><span>AD</span><i aria-hidden="true" /></div>
-        <nav>
-          {/* PRD #802 M2: every one of these dispatches through the action registry. */}
-          <RailButton icon={FolderGit2} label="Projects" active={projectsOpen} onClick={() => VOICE_ACTIONS.openProjects.run(voiceContext)} testId="open-projects" />
-          <RailButton icon={Activity} label="Runs" active={!projectsOpen && !workflowOpen && !profilesOpen && !promptsOpen && !settingsOpen} onClick={() => VOICE_ACTIONS.showRuns.run(voiceContext)} />
-          {/* The one rail button that is a real view rather than an overlay toggle. */}
-          <RailButton icon={LayoutList} label="Overview" onClick={() => VOICE_ACTIONS.openOverview.run(voiceContext)} testId="open-overview" />
-          <RailButton icon={BookMarked} label="Prompts" active={promptsOpen} onClick={() => VOICE_ACTIONS.openPromptLibrary.run(voiceContext)} testId="open-prompts" />
-          <RailButton icon={Network} label="Workflows" active={workflowOpen} onClick={() => VOICE_ACTIONS.openWorkflowOrder.run(voiceContext)} />
-          <RailButton icon={Bot} label="Agent Profiles" active={profilesOpen} onClick={() => VOICE_ACTIONS.openAgentProfiles.run(voiceContext)} testId="open-agent-profiles" />
-          <RailButton icon={Settings2} label="Settings" active={settingsOpen} onClick={() => VOICE_ACTIONS.openSettings.run(voiceContext)} testId="open-settings" />
-        </nav>
-        <div className="rail-bottom">
-          <button aria-label="Keyboard shortcuts" title="Keyboard shortcuts" onClick={() => setHelpOpen(true)}><Keyboard size={18} /></button>
-          {/* PRD #741 final audit F5: `connection.message` is daemon-supplied —
-              it embeds the REMOTE daemon's `build_version`, which is an
-              unvalidated string on the wire — and `safe_message` on the Rust
-              side covers category `Cc` only, so the bidi controls reach here
-              intact. Same seam treatment as every other daemon string on this
-              screen. */}
-          <span className={`connection-lamp connection-${snapshot.connection.status}`} title={snapshot.connection.message && displayText(snapshot.connection.message, DISPLAY_LIMITS.message)} />
-        </div>
-      </aside>
-
       <main className="deck-main">
         <header className="topbar">
           <div className="repo-context">
@@ -1686,26 +1766,6 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
       />
       <ProfilesPanel open={profilesOpen} profiles={profiles} onClose={() => setProfilesOpen(false)} onUpdate={updateProfile} onReset={resetProfiles} onSaved={() => setNotice("Agent profile draft saved locally. Project TOML is unchanged.")} />
       <WorkflowPanel key={activeProject?.path ?? "runtime-workflow"} open={workflowOpen} profiles={profiles} order={profileOrder} mode={mode} project={activeProject} onChooseProject={() => { setWorkflowOpen(false); setProjectsOpen(true); }} onClose={() => setWorkflowOpen(false)} onToggle={(id) => { const profile = profiles.find((item) => item.id === id); if (profile) updateProfile(id, { enabled: !profile.enabled }); }} onMove={moveStage} onLaunch={requestLaunch} platformIssue={workflowPlatformIssue} capabilityIssue={snapshot.connection.projectActionsReason} prompts={prompts} />
-      {/*
-        PRD #741 M10. The provider is mounted HERE rather than inside the sheet,
-        because `SettingsSheet` is a #803-owned rendering component and the
-        contract it keeps is that a feature adding a section never opens it. The
-        deck already holds the runtime, so this is where the bridge is; see
-        `lib/settingsBridge.tsx` for why it is a context and not a fifth panel
-        prop.
-      */}
-      <SettingsBridgeProvider value={settingsBridge}>
-        <SettingsSheet
-          open={settingsOpen}
-          onClose={() => setSettingsOpen(false)}
-          settings={settings.settings}
-          onSave={settings.save}
-          saveError={settings.saveError}
-          path={settings.path}
-          loaded={settings.loaded}
-          mode={mode}
-        />
-      </SettingsBridgeProvider>
       {paletteOpen && <CommandPalette commands={commandItems} onClose={() => setPaletteOpen(false)} />}
       {helpOpen && <ShortcutHelp onClose={() => setHelpOpen(false)} />}
       {confirm && <ConfirmDialog state={confirm} onClose={() => setConfirm(undefined)} />}
@@ -1772,8 +1832,43 @@ function Toast({ message, onDismiss, warnings, onDismissWarning }: { message?: s
   );
 }
 
-function RailButton({ icon: Icon, label, active, onClick, testId }: { icon: typeof Activity; label: string; active?: boolean; onClick: () => void; testId?: string }) {
-  return <button className={active ? "is-active" : ""} aria-current={active ? "page" : undefined} title={label} onClick={onClick} data-testid={testId}><Icon size={18} /><span>{label}</span></button>;
+/**
+ * The Settings sheet, mounted by the shell rather than by a screen (issue
+ * #1197), because the one rail offers Settings on the overview as well as on
+ * the deck.
+ *
+ * PRD #741 M10. The provider is mounted HERE rather than inside the sheet,
+ * because `SettingsSheet` is a #803-owned rendering component and the contract
+ * it keeps is that a feature adding a section never opens it. The shell already
+ * holds the runtime, so this is where the bridge is; see
+ * `lib/settingsBridge.tsx` for why it is a context and not a fifth panel prop.
+ */
+function ShellSettings({ runtime, settings, open, onClose }: { runtime: DeckRuntimeState; settings: DesktopSettingsState; open: boolean; onClose: () => void }) {
+  // Memoised so the context value is stable across renders; `runtime.testEndpoint`
+  // is itself stable for the lifetime of the bridge.
+  const settingsBridge = useMemo(
+    () => ({
+      testEndpoint: runtime.testEndpoint,
+      secretStatus: runtime.secretStatus,
+      storeSecret: runtime.storeSecret,
+      forgetSecret: runtime.forgetSecret,
+    }),
+    [runtime.testEndpoint, runtime.secretStatus, runtime.storeSecret, runtime.forgetSecret],
+  );
+  return (
+    <SettingsBridgeProvider value={settingsBridge}>
+      <SettingsSheet
+        open={open}
+        onClose={onClose}
+        settings={settings.settings}
+        onSave={settings.save}
+        saveError={settings.saveError}
+        path={settings.path}
+        loaded={settings.loaded}
+        mode={runtime.mode}
+      />
+    </SettingsBridgeProvider>
+  );
 }
 
 function Instrument({ label, children, testId }: { label: string; children: ReactNode; testId?: string }) {

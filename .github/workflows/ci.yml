@@ -244,9 +244,14 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
+      # An EXACT pnpm, never a major (issue #1262): `version: 12` took every
+      # 12.x the day it shipped, and 12.6.0 hung `desktop-browser` with no
+      # commit here to review or revert. It is the same version devbox.json
+      # pins, and `scripts/check-pin-lockstep.sh` fails if any pnpm/action-setup
+      # site in .github/workflows/ is not an exact version or disagrees with it.
       - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
         with:
-          version: 12
+          version: 11.22.0
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
           node-version: 24
@@ -317,9 +322,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
+      # Exact, and in lockstep with devbox.json — see `desktop-web` above.
       - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
         with:
-          version: 12
+          version: 11.22.0
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
           node-version: 24
@@ -469,6 +475,16 @@ jobs:
       # runs them.
       - run: cargo clippy --workspace --all-targets --features e2e,e2e-live -- -D warnings
       - run: cargo build --release
+      # Issue #324: `release_channel_vars_005` runs the Homebrew/Scoop tasks
+      # through go-task itself, since go-task's built-in shell — not bash — is
+      # what executes them in release.yml's `finalize`. It skips where `task` is
+      # absent, so this installs it with the same pinned action and the same
+      # `3.x` spec as `finalize`, and DAD_REQUIRE_GO_TASK on the nextest step
+      # turns a skip into a failure — without it a missing install would read
+      # as green.
+      - uses: arduino/setup-task@c0bc642852239c2689f73f4ea6459c29405f3c52 # v3.0.0
+        with:
+          version: 3.x
       # `cargo nextest run`, NOT `cargo test` — the same runner as the
       # `cargo test-fast` local gate, and as build-macos/build-windows which
       # already use it. `cargo test` runs the whole tier in ONE process with
@@ -499,6 +515,9 @@ jobs:
       # inert and the gap survived #436. Costs nothing measurable: all 48 are
       # under 40ms and the tier's wall clock is set by its slowest test.
       - run: cargo nextest run --workspace
+        env:
+          # Issue #324: see the go-task step above.
+          DAD_REQUIRE_GO_TASK: "1"
       # Issue #564: keep this attempt's results after a job-level re-run
       # overwrites the conclusion. Full rationale on the identical step in
       # `build-macos` below — the masking is a property of re-running any job,

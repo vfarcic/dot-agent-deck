@@ -181,8 +181,8 @@ description = """Leave the deck and show the agent overview: every agent across 
 deck in one list, with each one's status and activity. Use when the user asks to see everything,
 all the agents, the whole fleet, or asks which agents are running or what needs attention."""
 invoke      = "openOverview"
-screens     = ["deck"]
-unavailable_hint = "the agent overview opens from the deck"
+screens     = ["deck", "overview"]
+unavailable_hint = "the agent overview opens from the rail once the agent's pane is closed"
 report      = "Opening the agent overview."
 asks_to     = "show the agent overview"
 try_saying  = "show everything"
@@ -196,8 +196,8 @@ the screen the overview was opened from. Also use for open deck and deck — the
 overview's Open deck button and its rail's Deck button — and for return to the deck, take me back,
 show me the deck, show the deck, or show the terminals or panes again."""
 invoke      = "openDeck"
-screens     = ["overview"]
-unavailable_hint = "returning to the deck works from the agent overview"
+screens     = ["deck", "overview"]
+unavailable_hint = "the deck opens from the rail once the agent's pane is closed"
 report      = "Back to the deck."
 asks_to     = "go back to the deck"
 try_saying  = "go back to the deck"
@@ -222,9 +222,10 @@ heard_as_whole_while.new_agent_dialog = [
 # *"an overlay is open"* is not expressible in `screens` — the `screens` column
 # draws on `DeckView`, and M1 recorded that limitation. So the PRECEDENCE is
 # decided at DISPATCH, in `closeTopmost` (`desktop/src/lib/voiceActions.ts`):
-# the list of commands if it is showing, otherwise the agent's pane, otherwise
-# nothing — and when there is nothing, the surface says so rather than
-# reporting a close that did not happen.
+# the list of commands if it is showing, then the New agent dialog, then the
+# agent's pane, then Settings (a shell overlay since issue #1197, so it can sit
+# under a pane opened over it), otherwise nothing — and when there is nothing,
+# the surface says so rather than reporting a close that did not happen.
 #
 # **`close_agent_view` folded into this one instead of staying.** Two rows both
 # claiming *"close this"* is exactly the tie `schema::TOOL_INSTRUCTIONS`
@@ -278,7 +279,7 @@ heard_as_whole_while.new_agent_dialog = [
 id          = "close"
 description = """Close whatever is open OVER the current screen and go back to what was
 underneath. That is the list of spoken commands if it is showing, then the New agent dialog if it
-is open, and otherwise one agent's open pane. Use for close, close this, close it, close the
+is open, then one agent's open pane, and otherwise the Settings sheet if it is open. Use for close, close this, close it, close the
 dialog, close this dialog, close the new agent dialog, close new agent (the accessible name of the
 dialog's X button), cancel, cancel this, cancel it, never mind,
 dismiss this, hide this, get rid of this, I'm done with this, stop looking at this, leave this
@@ -310,13 +311,12 @@ heard_as_whole_while.new_agent_dialog = [
 # implementation — the nine tests that pin the shipped row set by value are what
 # the other five are. PRD #802's M8 milestone has the file-by-file accounting.
 #
-# `screens = ["deck"]` rather than `["deck", "overview"]`, and the
-# narrowing is the rule rather than caution: the Settings overlay is reachable
-# only from the DECK rail — the overview's rail holds Deck and Overview and
-# nothing else — so listing `overview` would let voice open a surface no click
-# can reach from that screen, which makes voice a second control surface with
-# capabilities the first lacks. A row does not define behaviour; it exposes
-# behaviour that already exists.
+# `screens = ["deck", "overview"]`, and the list is the rule rather than
+# caution: a row exposes behaviour that already exists rather than defining it,
+# so it lists exactly the screens whose rail carries Settings. That was the deck
+# alone until issue #1197 made the rail one component with the same entries on
+# both screens; it is not the agent screen, whose rail sits inert behind the
+# modal pane, so voice there would open a surface no click can reach.
 [[commands]]
 id          = "open_settings"
 description = """Open the app's Settings sheet: appearance, the decks this app connects to, voice,
@@ -324,8 +324,8 @@ and zoom. Use when the user asks for settings, preferences, options, configurati
 to change how the app looks, where to add or edit a deck, or where to put an API key. This only
 opens the sheet — it changes no setting by itself."""
 invoke      = "openSettings"
-screens     = ["deck"]
-unavailable_hint = "settings open from the deck"
+screens     = ["deck", "overview"]
+unavailable_hint = "settings open from the rail once the agent's pane is closed"
 report      = "Opening settings."
 asks_to     = "open settings"
 try_saying  = "open settings"

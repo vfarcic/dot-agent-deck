@@ -1211,7 +1211,7 @@ mod tests {
         let findings = planted(|sources| {
             sources.commands_toml = sources
                 .commands_toml
-                .replace("screens     = [\"deck\"]", "screens     = [\"dashboard\"]");
+                .replace("screens     = [\"agent\"]", "screens     = [\"dashboard\"]");
         });
         assert_reports(&findings, "names the screen `dashboard`");
     }
