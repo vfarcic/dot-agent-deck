@@ -516,7 +516,7 @@ export interface AgentSession {
    *
    * A DISPLAY COPY, sanitised and clamped to `DISPLAY_LIMITS.prompt` by
    * `agentFromDto`'s `taskLine`, because `AgentTile` prints it straight into a
-   * DOM text node and the deck is the screen the app opens on. Bounding it at
+   * DOM text node on the deck, one of the app's two screens. Bounding it at
    * the projection rather than at that one tile is deliberate: nothing sorts,
    * groups or keys on this field, so making it a display copy costs nothing and
    * makes every consumer of it safe by construction rather than by memory.

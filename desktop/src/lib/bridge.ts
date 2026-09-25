@@ -1715,7 +1715,7 @@ function roleFromAgent(agent: DesktopAgentDto, index: number): string {
  * agent-influenceable text bounded only by the daemon's 64 KiB per-prompt
  * ceiling; before that it carried a hardcoded placeholder or a restatement of
  * the active tool. `AgentTile` renders `agent.task` straight into a DOM text
- * node and the deck is the screen the app opens on, so a `U+202E` in a prompt
+ * node on the deck, one of the app's two screens, so a `U+202E` in a prompt
  * reversed the assignment line — the daemon-side scrub removes category `Cc`
  * and bidi formatting characters are `Cf` — and fifteen agents put about a
  * megabyte of prompt text in the deck's DOM on every refreshed snapshot.

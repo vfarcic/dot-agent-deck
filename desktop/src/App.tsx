@@ -123,15 +123,17 @@ export default function App() {
  * deck. `DeckView` is a discriminated union from the start so PRD #745
  * iteration 3's group and single-agent views arrive as added variants.
  *
- * The deck stays the default: launching the app lands exactly where it does
- * today.
+ * The overview is the default (issue #1196): it is the landing screen PRD
+ * #745 built, and the rail lists it first. Nothing persists the last view, so
+ * every launch opens there; a caller that wants the deck passes
+ * `initialView`, as the tests do.
  *
  * PRD #1105 M2 narrowed the first sentence rather than repealing it. The two
  * SCREEN variants still replace one another; the `"agent"` variant does not —
  * it names the screen to keep mounted underneath and renders the pane over it,
  * which is why the switch below reads `base` rather than `view.kind`.
  */
-export function DeckShell({ runtime, workflowPlatformIssue, initialView = { kind: "deck" } }: { runtime: DeckRuntimeState; workflowPlatformIssue?: string; initialView?: DeckView }) {
+export function DeckShell({ runtime, workflowPlatformIssue, initialView = { kind: "overview" } }: { runtime: DeckRuntimeState; workflowPlatformIssue?: string; initialView?: DeckView }) {
   const [view, setView] = useState<DeckView>(initialView);
   /**
    * The settings document and the zoom keys live HERE, not in the deck,
