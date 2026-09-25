@@ -110,6 +110,12 @@ export function useDesktopSettings(runtime: DeckRuntimeState): DesktopSettingsSt
   // field — is #828, and is not something a hook can fix.
   const queue = useRef<Promise<void>>(Promise.resolve());
   const newest = useRef(0);
+  // Whether any save has come back accepted. A load that resolves after one
+  // describes the file as it was BEFORE that write, so its `problem` is stale:
+  // the backend has since accepted the document, and restoring the sentence
+  // would have the footer call a location unusable that a save just proved
+  // usable (issue #829 review).
+  const saved = useRef(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -122,8 +128,9 @@ export function useDesktopSettings(runtime: DeckRuntimeState): DesktopSettingsSt
         // So is the reason the document could not be read: it describes the file
         // rather than the in-memory document, so an edit made while the read was
         // in flight does not make it stale — that edit is exactly what the Rust
-        // side is about to refuse to save.
-        setDocumentProblem(snapshot.problem);
+        // side is about to refuse to save. A save that was ACCEPTED does make it
+        // stale, which is what `saved` is for.
+        if (!saved.current) setDocumentProblem(snapshot.problem);
         if (!edited.current) setSettings(snapshot.settings);
         setRead(true);
       })
@@ -167,6 +174,7 @@ export function useDesktopSettings(runtime: DeckRuntimeState): DesktopSettingsSt
         // build can read: `save_to` refuses before writing otherwise. True of a
         // superseded response too, so this is cleared before the ticket check —
         // the document's state is not a property of which write won.
+        saved.current = true;
         setDocumentProblem(undefined);
         // A superseded response is dropped rather than applied — it is an
         // older document, and the user has already moved past it.
