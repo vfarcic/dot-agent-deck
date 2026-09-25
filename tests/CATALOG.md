@@ -4604,6 +4604,20 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 - **Does not assert:** the non-force refusal path (`pane/restart/010` owns that); the CLI/socket layer.
 - **Platform coverage:** mac+linux (unix-only).
 
+##### pane/restart/012 — A delegate to a worker that still owes a work-done is refused as busy, and `pane restart --force` cancels that task so the role takes a plain delegate again (issues #580 and #590).
+- **Layer:** L1/fast (in-process — the real `handle_delegate_with_state` and `handle_restart_role_with_state` against a daemon-owned `cat`-orchestrator + `cat` worker; no daemon socket, no LLM).
+- **Agent:** none (a `cat` stand-in, which echoes the task pointer so its delivery is observable).
+- **Asserts:** the first delegate is dispatched and its pointer reaches the worker; a second plain delegate before any work-done comes back with `delivered` empty, the role in `busy` and an `error` naming `--supersede`, and no second pointer reaches the pane; after `pane restart --force` a plain delegate is dispatched with nothing in `busy` or `superseded`, and its pointer reaches the replacement agent.
+- **Does not assert:** the CLI's rendering of the refusal (`delegate_verdict`'s unit tests in `src/main.rs` own that); the commission's age-based expiry (`agent_pty`'s `commission_ledger_*` unit tests own that); a real agent.
+- **Platform coverage:** mac+linux (unix-only).
+
+##### pane/restart/013 — `pane restart --force` cancels the silent-worker notice for the task it cancelled (issue #590; PR #1285 review).
+- **Layer:** L1/fast (in-process — the real `handle_delegate_with_state` and `handle_restart_role_with_state` against a daemon-owned `cat`-orchestrator + `cat` worker, with `DOT_AGENT_DECK_DELEGATE_NO_EVENT_WINDOW_MS=1000` and the idle detector off; no daemon socket, no LLM).
+- **Agent:** none (`cat` stand-ins: the worker never emits an agent event, and the orchestrator echoes whatever the daemon writes into its pane).
+- **Asserts:** after a delegate whose pointer landed is cancelled with `pane restart --force`, three silent-worker windows pass with no "delegated worker went quiet" notice in the orchestrator pane; a second, uncancelled delegate then produces that notice (the control that makes the negative mean something).
+- **Does not assert:** the idle-worker (`worker_response_timeout_minutes`) report, which the same restart cancels by the same call; the case of a dispatch queued behind the pane lock during the restart (`agent_pty`'s `replaced_agent_watches_are_cancelled_unless_a_dispatch_is_in_flight` owns that).
+- **Platform coverage:** mac+linux (unix-only).
+
 #### pane/spawn
 
 ##### pane/spawn/001 — Spawning a configured-but-unspawned role succeeds and it becomes reachable (issue #868).

@@ -179,6 +179,7 @@ async fn run_delegate_work_done_loop(worker_command: &str, seed_claude_trust: bo
                That is the entire task — do not do anything else."
             .to_string(),
         to: vec![WORKER_ROLE.to_string()],
+        supersede: false,
         timestamp: chrono::Utc::now(),
         token: None,
     };
@@ -437,6 +438,7 @@ async fn delegate_020_bare_name_reaches_the_worker_task_file_on_a_real_path_inne
         pane_id: ORCH_PANE.to_string(),
         task: "List the files in the current directory.".to_string(),
         to: vec![WORKER_ROLE.to_string()],
+        supersede: false,
         timestamp: chrono::Utc::now(),
         token: None,
     };

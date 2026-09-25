@@ -1737,6 +1737,48 @@ fn format_idle_elapsed(elapsed: std::time::Duration) -> String {
     }
 }
 
+/// Issue #580: name each worker that still owed a `work-done` when a delegate
+/// reached it, with how many delegations it owed and how old the oldest is — the
+/// clause both refusal messages share (the daemon's `error` when nothing was
+/// dispatched, and the CLI's warning on a partial dispatch).
+///
+/// The role goes through [`quote_untrusted_role`] (Greptile, #1285): it names a
+/// role from the repository's `.dot-agent-deck.toml`, which travels with a
+/// clone, and the message is read by the orchestrator agent, so a role named as
+/// an instruction must read as a label, not as the deck's own sentence.
+pub fn describe_busy_workers(busy: &[crate::event::BusyWorker]) -> String {
+    busy.iter()
+        .map(|worker| {
+            format!(
+                "{} ({} unanswered delegation{}, the oldest issued {} ago)",
+                quote_untrusted_role(&worker.role),
+                worker.outstanding,
+                if worker.outstanding == 1 { "" } else { "s" },
+                format_idle_elapsed(std::time::Duration::from_secs(worker.oldest_age_secs)),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Issue #580: what to do about a busy worker, shared by both refusal messages
+/// so the remedy is worded once.
+///
+/// Names `pane restart` without `--force` on purpose: the orchestrator's composed
+/// context deliberately does not pre-teach `--force` (see `docs/orchestration.md`,
+/// "`pane restart` says has not crashed"), and a refusal an agent reads is not the
+/// place to undo that. A plain restart of a healthy worker is refused with its own
+/// message, which is where `--force` is learned.
+pub fn busy_worker_remedy() -> String {
+    format!(
+        "Wait for its work-done before delegating to it again. If that earlier task is \
+         genuinely abandoned, re-send with --supersede to dispatch anyway. Restarting the worker \
+         with `dot-agent-deck pane restart` also retires what it owed, and an unanswered \
+         delegation stops counting {} days after it was issued.",
+        crate::agent_pty::DELEGATION_COMMISSION_TTL.as_secs() / (24 * 60 * 60)
+    )
+}
+
 /// PRD #126 M1 audit (finding 1): render an untrusted role name as an inert data
 /// label. Role names come from a repository's `.dot-agent-deck.toml`, which
 /// travels with a hostile clone, and the idle prompt is **auto-submitted to the
@@ -2213,23 +2255,71 @@ pub(crate) fn orchestration_still_matches(
 /// broken completion reporting for every such project, trading a confusing report
 /// for a lost one. The ledger asks its own question and answers it for real.
 ///
-/// A refusal (a pane already mid-close) is logged and otherwise ignored: the
-/// consequence is that a completion arriving in that window is *labelled*
-/// unsolicited, never dropped.
+/// A refusal because a pane is already mid-close is logged and otherwise
+/// ignored: the consequence is that a completion arriving in that window is
+/// *labelled* unsolicited, never dropped.
+///
+/// Issue #580: the other refusal — the worker still owes a `work-done` and the
+/// caller did not pass `--supersede` — is NOT ignored. It comes back as
+/// [`crate::agent_pty::CommissionArm::Busy`], and the caller must not dispatch.
+///
+/// `sender_agent_id` is the orchestrator agent the hook provenance gate attested
+/// for this delegate, when there is one. It is preferred over the pane's current
+/// occupant (Qodo, #1285): the pane can change hands between the gate and this
+/// call, and re-resolving then would attribute a predecessor's delegate to its
+/// successor — letting it past the predecessor's own busy refusal. The pane's
+/// occupant is the fallback only for a caller that has no attested identity.
 fn record_delegation_commission(
-    registry: &AgentPtyRegistry,
+    registry: &Arc<AgentPtyRegistry>,
     worker_pane_id: &str,
     role: &str,
     orchestrator_pane_id: &str,
-) {
-    if !registry.arm_delegation_commission(worker_pane_id, orchestrator_pane_id) {
-        tracing::debug!(
-            pane_id = %worker_pane_id,
-            role = %role,
-            "delegation commission not recorded: the worker or orchestrator pane is closing, so \
-             a work-done arriving now will be reported as unsolicited"
-        );
+    sender_agent_id: Option<&str>,
+    supersede: bool,
+) -> crate::agent_pty::CommissionArm {
+    let orchestrator_agent_id = sender_agent_id
+        .map(str::to_string)
+        .or_else(|| registry.pane_current_agent_id(orchestrator_pane_id));
+    let arm = registry.arm_delegation_commission(
+        worker_pane_id,
+        orchestrator_pane_id,
+        orchestrator_agent_id.as_deref(),
+        supersede,
+    );
+    match &arm {
+        crate::agent_pty::CommissionArm::Closing => {
+            tracing::debug!(
+                pane_id = %worker_pane_id,
+                role = %role,
+                "delegation commission not recorded: the worker or orchestrator pane is closing, \
+                 so a work-done arriving now will be reported as unsolicited"
+            );
+        }
+        crate::agent_pty::CommissionArm::Busy {
+            outstanding,
+            oldest_age,
+        } => {
+            tracing::info!(
+                pane_id = %worker_pane_id,
+                role = %role,
+                outstanding,
+                oldest_age_secs = oldest_age.as_secs(),
+                "delegate refused: the worker still owes a work-done for an earlier delegation \
+                 and --supersede was not passed"
+            );
+        }
+        crate::agent_pty::CommissionArm::Armed { superseded, .. } if *superseded > 0 => {
+            tracing::info!(
+                pane_id = %worker_pane_id,
+                role = %role,
+                superseded,
+                "delegate: dispatching to a worker that still owes a work-done (--supersede, or \
+                 owed to an orchestrator agent since replaced in its pane)"
+            );
+        }
+        crate::agent_pty::CommissionArm::Armed { .. } => {}
     }
+    arm
 }
 
 /// Issue #448 review (@prageethw, round 2): the counterpart to
@@ -5121,9 +5211,19 @@ async fn dispatch_one_owned(
     // again. `None` for callers with no daemon state (unit fixtures): the
     // delivery still happens, only the re-registration is skipped.
     state: Option<SharedState>,
+    // Issue #590: `Some` when the caller armed a commission for this dispatch
+    // (`None` when the pane was mid-close and nothing was recorded). Given back
+    // the moment the dispatch lock is held — see
+    // [`crate::agent_pty::CommissionDispatchInFlight`].
+    commission_in_flight: Option<crate::agent_pty::CommissionDispatchInFlight>,
 ) {
     let dispatch_mutex = registry.pane_dispatch_lock(&pane_id);
     let _dispatch_guard = dispatch_mutex.lock().await;
+    // Issue #590: from here on this dispatch's commission is "the caller's own"
+    // rather than "in flight" to `retire_commissions_of_replaced_agent`, which
+    // is why the guard goes now and only whether it existed is kept.
+    let commission_armed = commission_in_flight.is_some();
+    drop(commission_in_flight);
 
     // Look the role config up by `(worker cwd, orchestration name,
     // target role)` so the per-role `prompt_template` wrapping is
@@ -5310,6 +5410,24 @@ async fn dispatch_one_owned(
                 agent_id: new_agent_id,
                 recreated,
             }) => {
+                // Issue #590: the previous occupant is gone, so every commission
+                // only it could have answered goes with it — a `--supersede` to
+                // a busy `clear = true` worker would otherwise leave the replaced
+                // generation's debt standing, and every later delegate to the
+                // role would be refused as busy (#580) until it expired. This
+                // dispatch's own commission and any still queued behind this lock
+                // are kept: their pointers go to the replacement.
+                let retired =
+                    registry.retire_commissions_of_replaced_agent(&pane_id, commission_armed);
+                if retired > 0 {
+                    tracing::info!(
+                        pane_id = %pane_id,
+                        role = %target_role,
+                        retired,
+                        "delegate: clear=true respawn retired the replaced worker's unanswered \
+                         delegation commissions"
+                    );
+                }
                 if recreated {
                     // The pane was re-created rather than replaced, so a
                     // completed close has already taken this role's daemon-side
@@ -7763,6 +7881,24 @@ impl AppState {
         event_tx: &broadcast::Sender<BroadcastMsg>,
         state: Option<&SharedState>,
     ) -> crate::event::DelegateResponse {
+        self.handle_attested_delegate(signal, registry, event_tx, state, None)
+            .await
+    }
+
+    /// [`Self::handle_delegate_with_state`] for a delegate whose sender the hook
+    /// provenance gate attested: `sender_agent_id` is the registry agent id its
+    /// capability token was minted for. The daemon's hook loop calls this; see
+    /// [`record_delegation_commission`] for what the identity decides (issue #580
+    /// review, Qodo, #1285). `None` behaves exactly as
+    /// [`Self::handle_delegate_with_state`].
+    pub async fn handle_attested_delegate(
+        &self,
+        signal: DelegateSignal,
+        registry: &Arc<AgentPtyRegistry>,
+        event_tx: &broadcast::Sender<BroadcastMsg>,
+        state: Option<&SharedState>,
+        sender_agent_id: Option<&str>,
+    ) -> crate::event::DelegateResponse {
         use crate::event::DelegateResponse;
         if let Some(error) = self.refuse_unless_orchestrator_caller(&signal.pane_id, "delegate") {
             return DelegateResponse {
@@ -7798,24 +7934,22 @@ impl AppState {
         // whole delegate and dispatch the coder twice (PR #466 review). Which
         // means the CLI needs `delivered` as much as it needs `unresolved_roles`
         // — see `delegate_verdict` in `main.rs`.
-        let delivered: Vec<String> = {
-            let mut seen: Vec<String> = Vec::new();
-            for (role, _) in &targets {
-                if !seen.iter().any(|r| r == role) {
-                    seen.push(role.clone());
-                }
-            }
-            seen
-        };
+        //
+        // Issue #580: "resolved" is no longer "delivered". A resolved role whose
+        // worker still owes a `work-done` is refused below and reported in `busy`
+        // instead, so `delivered` is filled by the fan-out loop itself.
         let unresolved_roles: Vec<String> = {
             let mut missing: Vec<String> = Vec::new();
             for role in &signal.to {
-                if !delivered.iter().any(|r| r == role) && !missing.iter().any(|r| r == role) {
+                if !targets.iter().any(|(r, _)| r == role) && !missing.iter().any(|r| r == role) {
                     missing.push(role.clone());
                 }
             }
             missing
         };
+        let mut delivered: Vec<String> = Vec::new();
+        let mut busy: Vec<crate::event::BusyWorker> = Vec::new();
+        let mut superseded: Vec<crate::event::BusyWorker> = Vec::new();
 
         // PRD #92 F9 followup-6: async-dispatch. Each per-target future
         // runs in its own `tokio::spawn` so `handle_delegate` (and the
@@ -7846,6 +7980,57 @@ impl AppState {
             let task = signal.task.clone();
             let cwd = self.pane_cwd_map.get(&pane_id).cloned();
 
+            // Issue #448: record that this worker now owes a `work-done`, FIRST —
+            // before either watch is armed, so "the detector is off" and "nobody
+            // delegated" never look the same to `handle_work_done`.
+            //
+            // Issue #580: and refuse here, before anything is armed or spawned,
+            // when the worker still owes one for an earlier delegation and the
+            // caller did not pass `--supersede`. The ledger is the signal, not
+            // the worker's status: a quota-exhausted agent can report `Working`
+            // for hours (#714), and a hook-reported status is not an input this
+            // daemon may authorize on (#601, #696). The check and the arm are one
+            // lock hold, so two concurrent delegates to an idle worker cannot both
+            // pass it.
+            let commission_in_flight = match record_delegation_commission(
+                &registry,
+                &pane_id,
+                &target_role,
+                &orchestrator_pane_id,
+                sender_agent_id,
+                signal.supersede,
+            ) {
+                crate::agent_pty::CommissionArm::Busy {
+                    outstanding,
+                    oldest_age,
+                } => {
+                    busy.push(crate::event::BusyWorker {
+                        role: target_role,
+                        outstanding,
+                        oldest_age_secs: oldest_age.as_secs(),
+                    });
+                    continue;
+                }
+                crate::agent_pty::CommissionArm::Armed {
+                    superseded: owed,
+                    superseded_oldest_age,
+                    in_flight,
+                } => {
+                    if owed > 0 {
+                        superseded.push(crate::event::BusyWorker {
+                            role: target_role.clone(),
+                            outstanding: owed,
+                            oldest_age_secs: superseded_oldest_age.as_secs(),
+                        });
+                    }
+                    Some(in_flight)
+                }
+                crate::agent_pty::CommissionArm::Closing => None,
+            };
+            if !delivered.iter().any(|r| r == &target_role) {
+                delivered.push(target_role.clone());
+            }
+
             // PRD #126: this worker now owes a `work-done`. Arm the record
             // (and its watch task) here, in the synchronous fan-out loop
             // rather than inside `dispatch_one_owned`, for two reasons: the
@@ -7863,10 +8048,9 @@ impl AppState {
             // record and spawns no task at all, and so the orchestrator's
             // registry identity is captured while the delegate is still live.
             //
-            // Issue #448: which is exactly why the commission ledger is armed
-            // separately, immediately below — "the detector is off" and "nobody
-            // delegated" must not look the same to `handle_work_done`.
-            record_delegation_commission(&registry, &pane_id, &target_role, &orchestrator_pane_id);
+            // Issue #448: which is exactly why the commission ledger was armed
+            // separately, above — "the detector is off" and "nobody delegated"
+            // must not look the same to `handle_work_done`.
             let delegation_seq = arm_idle_worker_watch_for_delegation(
                 &registry,
                 &pane_id,
@@ -7876,6 +8060,12 @@ impl AppState {
                 orchestration_cwd.as_deref(),
                 cwd.as_deref(),
             );
+            // Issue #590 review (Qodo, #1285): tell the in-flight guard which idle
+            // record this dispatch owns, so a `pane restart` that lands while it
+            // is queued keeps that record and cancels only the replaced agent's.
+            if let Some(in_flight) = commission_in_flight.as_ref() {
+                in_flight.bind_idle_record(delegation_seq);
+            }
 
             // PRD #249 M3: resolved HERE, next to the idle watch's own
             // resolution and for the same reasons — see [`SilenceWatch`]. The
@@ -7907,10 +8097,33 @@ impl AppState {
                     silence_watch,
                     delegation_seq,
                     state_for_dispatch,
+                    commission_in_flight,
                 )
                 .await;
             });
         }
+
+        // Issue #580: nothing was dispatched and at least one worker was refused
+        // as busy. Said in `error` as well as `busy`, so a CLI that predates
+        // `busy` still fails loudly instead of reading an empty reply as success.
+        // A PARTIAL refusal leaves `error` unset: some role really was dispatched,
+        // and `error` means nothing landed.
+        let error = (delivered.is_empty() && !busy.is_empty()).then(|| {
+            let unresolved = if unresolved_roles.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    " Role(s) {} reached no worker pane at all.",
+                    unresolved_roles.join(", ")
+                )
+            };
+            format!(
+                "this delegate was NOT sent: every worker it reached still owes a work-done for \
+                 an earlier delegation: {}. {}{unresolved}",
+                describe_busy_workers(&busy),
+                busy_worker_remedy()
+            )
+        });
 
         // Reported once the fan-out is QUEUED, not once each worker has answered.
         // The dispatches are deliberately detached (see above), so waiting here
@@ -7921,6 +8134,9 @@ impl AppState {
         crate::event::DelegateResponse {
             delivered,
             unresolved_roles,
+            error,
+            busy,
+            superseded,
             ..Default::default()
         }
     }
@@ -8208,6 +8424,32 @@ pub async fn handle_restart_role_with_state(
         .await
     {
         Ok(crate::agent_pty::PaneRespawn { recreated, .. }) => {
+            // Issue #590: a restart replaces the agent, and the agent that owed
+            // the pane's outstanding commissions never saw its replacement's
+            // context. `pane restart --force` is in practice how an orchestrator
+            // cancels in-flight work, and before this the cancelled task's
+            // commission outlived it: reported as a silent worker hours later,
+            // and (issue #580) refusing every later delegate to the role. Only the
+            // commissions whose dispatch has already been through this lock are
+            // retired; one queued behind it will deliver to the replacement.
+            let retired = registry.retire_commissions_of_replaced_agent(&resolved.pane_id, false);
+            if retired > 0 {
+                tracing::info!(
+                    pane_id = %resolved.pane_id,
+                    role = %signal.role,
+                    retired,
+                    "pane restart: retired the replaced worker's unanswered delegation commissions"
+                );
+            }
+            // The same restart ends the two watches on that task, or either can
+            // later report the cancelled task as a silent worker (Greptile, #1285).
+            if registry.cancel_watches_of_replaced_agent(&resolved.pane_id) {
+                tracing::debug!(
+                    pane_id = %resolved.pane_id,
+                    role = %signal.role,
+                    "pane restart: cancelled the replaced worker's idle and silent-worker watches"
+                );
+            }
             if recreated && let Some(identity) = resolved.orchestration.clone() {
                 // See this function's own locking note: `state` is cloned
                 // and the write lock is taken inside a DETACHED task, only
@@ -11845,6 +12087,7 @@ mod tests {
                     pane_id: pane_id.to_string(),
                     task: "probe".to_string(),
                     to: to.iter().map(|s| s.to_string()).collect(),
+                    supersede: false,
                     timestamp: Utc::now(),
                     token: None,
                 },
@@ -11937,6 +12180,180 @@ mod tests {
             vec!["tester".to_string()],
             "the tester resolved to no pane and must be named as unresolved"
         );
+    }
+
+    /// Issue #580: one delegate against `state` through a registry the caller
+    /// owns, so the commission ledger can be primed before the call and read
+    /// after it. The tests below run on tokio's current-thread runtime and do not
+    /// yield between the delegate and their reads, so the detached per-target
+    /// dispatch tasks — which release an undelivered commission against this
+    /// PTY-less registry — have not run yet when the ledger is read.
+    async fn delegate_through(
+        state: &AppState,
+        registry: &Arc<AgentPtyRegistry>,
+        to: &[&str],
+        supersede: bool,
+    ) -> crate::event::DelegateResponse {
+        let (event_tx, _event_rx) = broadcast::channel(16);
+        state
+            .handle_delegate(
+                DelegateSignal {
+                    pane_id: "A_orch".to_string(),
+                    task: "probe".to_string(),
+                    to: to.iter().map(|s| s.to_string()).collect(),
+                    supersede,
+                    timestamp: Utc::now(),
+                    token: None,
+                },
+                registry,
+                &event_tx,
+            )
+            .await
+    }
+
+    /// Issue #580: record that `worker_pane` owes a `work-done`, as a delivered
+    /// delegate leaves it — the in-flight guard dropped, as the dispatch task
+    /// drops it once it holds the pane lock.
+    fn owe_work_done(registry: &Arc<AgentPtyRegistry>, worker_pane: &str) {
+        match registry.arm_delegation_commission(worker_pane, "A_orch", None, false) {
+            crate::agent_pty::CommissionArm::Armed { .. } => {}
+            other => panic!("priming the ledger must arm a commission, got {other:?}"),
+        }
+    }
+
+    /// Issue #580: a delegate to a worker that still owes a `work-done` is
+    /// REFUSED — not dispatched, and said so — instead of being written into a
+    /// pane that is mid-task. The refusal is an `error` when nothing at all was
+    /// dispatched, so a CLI that predates `busy` fails loudly too, and it records
+    /// nothing: the worker still owes exactly what it owed before.
+    #[tokio::test]
+    async fn handle_delegate_refuses_a_worker_that_still_owes_a_work_done() {
+        let state = two_same_name_cwd_tabs(true);
+        let registry = Arc::new(AgentPtyRegistry::new());
+        owe_work_done(&registry, "A_coder");
+
+        let resp = delegate_through(&state, &registry, &["coder"], false).await;
+        assert!(
+            resp.delivered.is_empty(),
+            "the busy coder must not be dispatched"
+        );
+        assert_eq!(resp.busy.len(), 1, "the busy coder must be named: {resp:?}");
+        assert_eq!(resp.busy[0].role, "coder");
+        assert_eq!(resp.busy[0].outstanding, 1);
+        assert!(resp.superseded.is_empty());
+        let error = resp
+            .error
+            .as_deref()
+            .expect("a delegate that reached only busy workers must be an error");
+        assert!(
+            error.contains("NOT sent")
+                && error.contains("[UNTRUSTED-ROLE-LABEL: coder :END-UNTRUSTED-ROLE-LABEL]")
+                && error.contains("--supersede"),
+            "the error must say it was not sent, name the role and give the remedy: {error}"
+        );
+        assert_eq!(
+            registry.retire_delegation_commission("A_coder"),
+            crate::agent_pty::WorkDoneProvenance::Solicited { remaining: 0 },
+            "the refused delegate armed nothing — one commission, as before it"
+        );
+    }
+
+    /// Issue #580: `--supersede` dispatches anyway, and REPORTS the supersession
+    /// instead of doing it silently. The ledger counts both delegations, so the
+    /// earlier task's completion and the new one's are each credited.
+    #[tokio::test]
+    async fn handle_delegate_supersede_dispatches_and_reports_the_supersession() {
+        let state = two_same_name_cwd_tabs(true);
+        let registry = Arc::new(AgentPtyRegistry::new());
+        owe_work_done(&registry, "A_coder");
+
+        let resp = delegate_through(&state, &registry, &["coder"], true).await;
+        assert_eq!(resp.error, None);
+        assert_eq!(resp.delivered, vec!["coder".to_string()]);
+        assert!(resp.busy.is_empty());
+        assert_eq!(
+            resp.superseded.len(),
+            1,
+            "the supersession must be reported: {resp:?}"
+        );
+        assert_eq!(resp.superseded[0].role, "coder");
+        assert_eq!(resp.superseded[0].outstanding, 1);
+        assert_eq!(
+            registry.retire_delegation_commission("A_coder"),
+            crate::agent_pty::WorkDoneProvenance::Solicited { remaining: 1 },
+            "--supersede adds a commission rather than replacing the earlier one"
+        );
+    }
+
+    /// Issue #580 review (Qodo, #1285): the busy check reads the ATTESTED sender,
+    /// not the orchestrator pane's current occupant. Here the pane has no live
+    /// agent at all, so a re-resolving check would see no identity and refuse;
+    /// the attested successor identity is what makes it a supersession — and the
+    /// attested predecessor identity is what keeps its own refusal.
+    #[tokio::test]
+    async fn handle_attested_delegate_decides_on_the_attested_sender() {
+        let state = two_same_name_cwd_tabs(true);
+        let registry = Arc::new(AgentPtyRegistry::new());
+        match registry.arm_delegation_commission("A_coder", "A_orch", Some("orch-agent-1"), false) {
+            crate::agent_pty::CommissionArm::Armed { .. } => {}
+            other => panic!("priming the ledger must arm a commission, got {other:?}"),
+        }
+        let (event_tx, _event_rx) = broadcast::channel(16);
+        let signal = || DelegateSignal {
+            pane_id: "A_orch".to_string(),
+            task: "probe".to_string(),
+            to: vec!["coder".to_string()],
+            supersede: false,
+            timestamp: Utc::now(),
+            token: None,
+        };
+
+        let predecessor = state
+            .handle_attested_delegate(signal(), &registry, &event_tx, None, Some("orch-agent-1"))
+            .await;
+        assert_eq!(
+            predecessor.busy.len(),
+            1,
+            "the delegating orchestrator is refused: {predecessor:?}"
+        );
+
+        let successor = state
+            .handle_attested_delegate(signal(), &registry, &event_tx, None, Some("orch-agent-2"))
+            .await;
+        assert_eq!(
+            successor.delivered,
+            vec!["coder".to_string()],
+            "{successor:?}"
+        );
+        assert_eq!(successor.superseded.len(), 1, "{successor:?}");
+    }
+
+    /// Issue #580: a busy worker beside an idle one is a PARTIAL outcome, like
+    /// an unresolved role: the idle worker is dispatched, the busy one is named,
+    /// and `error` stays unset because something did land — a failure exit code
+    /// would invite a retry that dispatches the idle worker twice.
+    #[tokio::test]
+    async fn handle_delegate_reports_a_busy_worker_beside_an_idle_one_as_partial() {
+        let mut state = two_same_name_cwd_tabs(true);
+        register_role_pane(
+            &mut state,
+            "A_tester",
+            "tester",
+            false,
+            instance("orch-aaaa-0"),
+        );
+        let registry = Arc::new(AgentPtyRegistry::new());
+        owe_work_done(&registry, "A_coder");
+
+        let resp = delegate_through(&state, &registry, &["coder", "tester"], false).await;
+        assert_eq!(
+            resp.error, None,
+            "the tester was dispatched, so this is not an error"
+        );
+        assert_eq!(resp.delivered, vec!["tester".to_string()]);
+        assert_eq!(resp.busy.len(), 1);
+        assert_eq!(resp.busy[0].role, "coder");
+        assert!(resp.unresolved_roles.is_empty(), "busy is not unresolved");
     }
 
     /// The dispatched spawn path registers its orchestrator by `orch_idx`, not
@@ -13092,6 +13509,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await;
 
@@ -13140,6 +13558,7 @@ mod tests {
                     orchestration: None,
                 },
             }),
+            None,
             None,
             None,
         )
