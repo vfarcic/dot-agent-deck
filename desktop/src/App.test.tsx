@@ -2129,4 +2129,70 @@ describe("ControlDeck", () => {
     expect(screen.getByTestId("workflow-node-build")).toHaveTextContent("att 2");
     expect(container.querySelector(".branch-line")).toHaveTextContent("codex/visual-control-deck");
   });
+
+  /**
+   * Scenario (#1083): the stored selection is All Decks and the deck under it
+   * is the local one, running its fixture agents. The Runs screen shows "Select
+   * a deck to see its runs" — as a note, not an alert — and no tile, terminal
+   * or run instrument of the local deck, and the last shown-terminal
+   * declaration is empty. Choosing the local deck in the Deck selector, which
+   * stays live, brings the tiles back and stores the choice.
+   */
+  it("shows Select a deck on the Runs screen under All Decks, and the selector still switches", async () => {
+    const store = settingsStore({ endpoints: { remote: [], selection: "all" } });
+    const live = runtime({ mode: "live", getSettings: store.getSettings, saveSettings: store.saveSettings });
+    render(<ControlDeck runtime={live} />);
+
+    const note = await screen.findByTestId("deck-select-deck");
+    expect(note).toHaveTextContent("Select a deck to see its runs");
+    expect(note.closest("[role='alert']")).toBeNull();
+    expect(screen.getByTestId("deck-selector-current")).toHaveTextContent("All Decks");
+    expect(screen.queryByTestId("agent-tile-builder")).toBeNull();
+    expect(screen.queryByTestId("terminal-builder")).toBeNull();
+    expect(screen.queryByTestId("run-health")).toBeNull();
+    expect(vi.mocked(live.setShownTerminals).mock.calls.at(-1)?.[0]).toEqual([]);
+
+    fireEvent.click(screen.getByTestId("deck-selector-toggle"));
+    fireEvent.click(screen.getByTestId("deck-selector-option-local"));
+
+    await waitFor(() => expect(screen.getByTestId("agent-tile-builder")).toBeVisible());
+    expect(screen.queryByTestId("deck-select-deck")).toBeNull();
+    expect(store.current.endpoints?.selection).toBe("local");
+  });
+
+  /**
+   * Scenario (#1083): on the local deck, pick the daemon's one project and
+   * write a task, so the Workflows sheet's Launch is enabled (the control).
+   * Then select All Decks and reopen it: the sheet says "Select a deck to
+   * launch a workflow", Launch is disabled and pressing it sends nothing, and
+   * the Projects sheet says "Select a deck to see its projects" without asking
+   * any deck for its projects.
+   */
+  it("never launches a workflow once All Decks is selected, even with a project already chosen", async () => {
+    const live = liveWithProject();
+    render(<ControlDeck runtime={live} />);
+    await chooseTheOnlyProject();
+    fireEvent.change(screen.getByLabelText("Task prompt"), { target: { value: "List the files." } });
+    expect(screen.getByTestId("launch-live-loop")).toBeEnabled();
+    fireEvent.click(screen.getByRole("button", { name: "Close workflow editor" }));
+
+    fireEvent.click(screen.getByTestId("deck-selector-toggle"));
+    fireEvent.click(screen.getByTestId("deck-selector-option-all"));
+    await screen.findByTestId("deck-select-deck");
+    const listings = vi.mocked(live.listProjects).mock.calls.length;
+
+    fireEvent.click(screen.getByRole("button", { name: "Workflows" }));
+    expect(screen.getByTestId("workflow-select-deck")).toHaveTextContent("Select a deck to launch a workflow");
+    expect(screen.queryByLabelText("Task prompt")).toBeNull();
+    expect(screen.getByTestId("launch-live-loop")).toBeDisabled();
+    fireEvent.click(screen.getByTestId("launch-live-loop"));
+    expect(screen.queryByRole("alertdialog")).toBeNull();
+    expect(vi.mocked(live.runAction).mock.calls.some(([action]) => action.type === "start_workflow")).toBe(false);
+    fireEvent.click(screen.getByRole("button", { name: "Close workflow editor" }));
+
+    fireEvent.click(screen.getByTestId("open-projects"));
+    expect(screen.getByTestId("projects-select-deck")).toHaveTextContent("Select a deck to see its projects");
+    expect(screen.queryByTestId("selected-project")).toBeNull();
+    expect(vi.mocked(live.listProjects).mock.calls.length).toBe(listings);
+  });
 });
