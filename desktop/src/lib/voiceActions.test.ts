@@ -3,7 +3,7 @@ import { createElement } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { agentDomKey } from "../components/AgentOverview";
 import { createFixtureSnapshot } from "../data/fixture";
-import { DEFAULT_DESKTOP_SETTINGS, type DesktopSettingsDto } from "./bridge";
+import { DEFAULT_DESKTOP_SETTINGS, fixtureDesktopFeatures, type DesktopSettingsDto } from "./bridge";
 import type { DeckActionResult, DeckRuntimeState } from "../types";
 
 type RegistryEntry = {
@@ -72,6 +72,7 @@ function runtime(overrides: Partial<DeckRuntimeState> = {}): DeckRuntimeState {
   const settings = settingsStore();
   return {
     mode: "fixture",
+    desktopFeatures: fixtureDesktopFeatures("?experimental=1"),
     snapshot,
     fleet: [snapshot],
     terminalData: {},

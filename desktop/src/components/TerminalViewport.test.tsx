@@ -79,7 +79,7 @@ function DeckShell(props: Parameters<typeof AppDeckShell>[0]) {
 }
 import { createFixtureSnapshot, FIXTURE_DAEMON_ID } from "../data/fixture";
 import { agentKey } from "../lib/agentKey";
-import { DEFAULT_DESKTOP_SETTINGS, type DesktopSettingsDto } from "../lib/bridge";
+import { DEFAULT_DESKTOP_SETTINGS, fixtureDesktopFeatures, type DesktopSettingsDto } from "../lib/bridge";
 import type { AgentTarget, DeckActionResult, DeckRuntimeState } from "../types";
 import { TerminalViewport } from "./TerminalViewport";
 
@@ -123,6 +123,7 @@ function overlayRuntime(resizeTerminal: DeckRuntimeState["resizeTerminal"]): Dec
   let document: DesktopSettingsDto = { ...DEFAULT_DESKTOP_SETTINGS };
   return {
     mode: "fixture",
+    desktopFeatures: fixtureDesktopFeatures("?experimental=1"),
     snapshot,
     fleet: [snapshot],
     terminalData: {},

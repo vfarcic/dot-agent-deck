@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createFixtureSnapshot } from "../data/fixture";
 import {
   DEFAULT_DESKTOP_SETTINGS,
+  fixtureDesktopFeatures,
   type DesktopSettingsDto,
   type VoiceResultDto,
   type VoiceStatusDto,
@@ -103,6 +104,7 @@ function runtime(resolveVoice: ResolveVoice, voice: VoiceControls = voiceControl
   const settings = settingsStore();
   return {
     mode: "fixture",
+    desktopFeatures: fixtureDesktopFeatures("?experimental=1"),
     snapshot,
     fleet: [snapshot],
     terminalData: {},
