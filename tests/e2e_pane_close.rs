@@ -55,10 +55,17 @@ fn pane_003_empty_dashboard_never_opens_close_confirmation() {
 
     deck.send_keys(b"\x17");
     deck.send_keys(b"?");
-    deck.wait_for_string("Create new pane");
+    // One predicate over one grid, polled, rather than `wait_for_string` and a
+    // single snapshot: a frame arrives as a byte stream the reader consumes in
+    // chunks, so the help sentinel can land while the tab bar row is still
+    // cleared mid-repaint, and a one-shot "Dashboard" check then fails on a
+    // half-painted frame. Measured on PR #1291's e2e-deterministic run
+    // (36077156836), twice in a row. Same mechanism as #807/#395.
+    deck.wait_until_grid("help painted over a still-rendered Dashboard", |grid| {
+        grid.contains("Create new pane") && grid.contains("Dashboard")
+    });
 
     let grid = deck.snapshot_grid();
-    assert!(grid.contains("Dashboard"), "{grid}");
     assert!(
         !grid.contains("Close selected pane?"),
         "an empty dashboard must not arm a close confirmation\n{grid}"

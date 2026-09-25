@@ -1864,6 +1864,7 @@ function ShellSettings({ runtime, settings, open, onClose }: { runtime: DeckRunt
         onSave={settings.save}
         saveError={settings.saveError}
         path={settings.path}
+        problem={settings.problem}
         loaded={settings.loaded}
         mode={runtime.mode}
       />
