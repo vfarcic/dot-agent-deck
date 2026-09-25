@@ -1,7 +1,7 @@
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { createFixtureSnapshot, FIXTURE_DAEMON_ID } from "./data/fixture";
-import { ALL_ENDPOINT_SELECTION, DEFAULT_DESKTOP_SETTINGS, LOCAL_ENDPOINT_SELECTION, type DesktopSettingsDto } from "./lib/bridge";
+import { ALL_ENDPOINT_SELECTION, DEFAULT_DESKTOP_SETTINGS, fixtureDesktopFeatures, LOCAL_ENDPOINT_SELECTION, type DesktopSettingsDto } from "./lib/bridge";
 import type { AgentSession, DeckRuntimeState, DeckSnapshot } from "./types";
 
 /**
@@ -92,6 +92,7 @@ function harness(
   const sendTerminalInput = vi.fn(async () => undefined);
   const base = {
     mode: "live",
+    desktopFeatures: fixtureDesktopFeatures("?experimental=1"),
     terminalData: {},
     clearError: vi.fn(),
     runAction: vi.fn(async () => ({ ok: true })),
@@ -442,7 +443,13 @@ describe("agent pane identity fence", () => {
     const pane = await screen.findByTestId("agent-pane-overlay");
     const undo = screen.getByRole("button", { name: "Undo" });
 
-    expect(screen.getByTestId("deck-selector-toggle").closest("[inert]")).not.toBeNull();
+    // Waited for, not read straight after `findByTestId`. The pane opens from
+    // the voice-status poll, an update outside `act`, so React defers
+    // `useInertBackground`'s walk to a passive-effect flush — while
+    // `findByTestId` resolves on the mutation that inserted the pane, which can
+    // land first. Under CI load it did: the walk had not run at all (no `[inert]`
+    // anywhere, focus not yet moved), and one flush later it had.
+    await waitFor(() => expect(screen.getByTestId("deck-selector-toggle").closest("[inert]")).not.toBeNull());
     // Voice and its report are peers, not background. Equality to this complete
     // set keeps the containment assertion strict: any other reachable control
     // is a regression, rather than something an allow-list filter could hide.

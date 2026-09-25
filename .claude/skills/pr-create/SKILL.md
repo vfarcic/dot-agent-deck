@@ -25,7 +25,7 @@ This file is **project-local and owned by this repository** — it was forked ou
 
 ## 2. Open it
 
-`gh pr create`, with a body that says what changed and why, how it was verified (name the tests), and `Closes #<n>`.
+`gh pr create`, with a body that says what changed and why, how it was verified (name the tests), and `Closes #<n>` — or `Refs #<n>` for a PR that ships only part of a PRD, which leaves the PRD open (the orchestrator template's step 5 in `.dot-agent-deck.toml` has the rule).
 
 Then `gh pr edit <n> --add-reviewer <the other maintainer>` — but **request review last**, after CI and the automated review have settled and you have pushed the fixes. `dismiss_stale_reviews_on_push` voids an approval on any later push, so asking early buys a guaranteed second round trip.
 

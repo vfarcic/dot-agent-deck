@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 import { createFixtureFleet, createFixtureSnapshot, createFixtureStartedAgent, FIXTURE_DAEMON_ID, FIXTURE_REMOTE_DAEMON_ID } from "../data/fixture";
 import type { DeckActionResult, DeckDirectoryListing, DeckFleet, DeckRuntimeState, NewAgentOptions } from "../types";
 import { AgentOverview } from "./AgentOverview";
+import { DRAFT_RESTORED } from "./NewAgentDialog";
 
 const HOME: DeckDirectoryListing = { kind: "listing", path: "/home/dev", displayPath: "/home/dev", parent: "/home", entries: [], truncated: false };
 const OPTIONS: NewAgentOptions = { kind: "deck", agents: [], experimental: false, authoringKinds: [], lastCommand: "claude" };
@@ -249,5 +250,88 @@ describe("the overview after a New agent start (PRD #1223 M5)", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+describe("the overview keeps a closed New agent form (issue 1247)", () => {
+  /** One healthy local deck, chosen on open, whose home has one child to choose. */
+  function draftRuntime(overrides: Partial<DeckRuntimeState> = {}) {
+    const HOME_WITH_CHILD: DeckDirectoryListing = { kind: "listing", path: "/home/dev", displayPath: "/home/dev", parent: "/home", entries: [{ path: "/home/dev/api", displayName: "api", isProject: false }], truncated: false };
+    const API: DeckDirectoryListing = { kind: "listing", path: "/home/dev/api", displayPath: "/home/dev/api", parent: "/home/dev", entries: [], truncated: false };
+    return runtime({
+      fleet: [createFixtureSnapshot("empty")],
+      listDirectories: vi.fn(async (_deckId: string, path?: string) => structuredClone(path === "/home/dev/api" ? API : HOME_WITH_CHILD)),
+      ...overrides,
+    });
+  }
+
+  /** Open the flow, choose `api`, and type a Name and a Command. */
+  async function fillForm() {
+    fireEvent.click(screen.getByTestId("overview-new-agent"));
+    fireEvent.click(await screen.findByText("api"));
+    fireEvent.click(await screen.findByTestId("new-agent-use-directory"));
+    await waitFor(() => expect(screen.getByTestId("new-agent-name")).toBeEnabled());
+    fireEvent.change(screen.getByTestId("new-agent-name"), { target: { value: "billing worker" } });
+    fireEvent.change(screen.getByTestId("new-agent-command"), { target: { value: "claude --resume" } });
+  }
+
+  /**
+   * Scenario: fill the New agent form, press Esc by accident, and open New
+   * agent again. The form comes back — deck, directory, Name and the
+   * hand-edited Command — with a notice saying it was restored, where it used
+   * to open blank.
+   */
+  it("restores the form after Esc", async () => {
+    const current = draftRuntime();
+    render(<AgentOverview runtime={current} onNavigate={vi.fn()} />);
+    await fillForm();
+
+    fireEvent.keyDown(screen.getByTestId("new-agent-dialog"), { key: "Escape" });
+    expect(dialog()).toBeNull();
+    fireEvent.click(screen.getByTestId("overview-new-agent"));
+
+    await waitFor(() => expect(screen.getByTestId("new-agent-dir")).toHaveTextContent("/home/dev/api"));
+    expect(screen.getByTestId("new-agent-name")).toHaveValue("billing worker");
+    expect(screen.getByTestId("new-agent-command")).toHaveValue("claude --resume");
+    expect(screen.getByTestId("new-agent-restored")).toHaveTextContent(DRAFT_RESTORED);
+  });
+
+  /**
+   * Scenario: fill the form, press Discard, and open New agent again. It is a
+   * fresh form: no directory, the Name and Command back to their defaults,
+   * and no restored notice.
+   */
+  it("forgets the form after Discard", async () => {
+    render(<AgentOverview runtime={draftRuntime()} onNavigate={vi.fn()} />);
+    await fillForm();
+
+    fireEvent.click(screen.getByTestId("new-agent-discard"));
+    expect(dialog()).toBeNull();
+    fireEvent.click(screen.getByTestId("overview-new-agent"));
+
+    await waitFor(() => expect(screen.getByTestId("new-agent-command")).toHaveValue("claude"));
+    expect(screen.getByTestId("new-agent-dir")).toHaveTextContent("No directory chosen yet");
+    expect(screen.getByTestId("new-agent-name")).toHaveValue("");
+    expect(screen.queryByTestId("new-agent-restored")).toBeNull();
+  });
+
+  /**
+   * Scenario: fill the form and start it; the deck accepts the start and
+   * reports no agent to wait for. Opening New agent again gives a fresh form —
+   * a started form is not a draft, and restoring it would invite starting it
+   * twice.
+   */
+  it("forgets the form once the deck has accepted the start", async () => {
+    const current = draftRuntime({ runAction: vi.fn(async (): Promise<DeckActionResult> => ({ ok: true })) });
+    render(<AgentOverview runtime={current} onNavigate={vi.fn()} />);
+    await fillForm();
+
+    fireEvent.click(screen.getByTestId("new-agent-start"));
+    await waitFor(() => expect(dialog()).toBeNull());
+    fireEvent.click(screen.getByTestId("overview-new-agent"));
+
+    await waitFor(() => expect(screen.getByTestId("new-agent-command")).toHaveValue("claude"));
+    expect(screen.getByTestId("new-agent-name")).toHaveValue("");
+    expect(screen.queryByTestId("new-agent-restored")).toBeNull();
   });
 });

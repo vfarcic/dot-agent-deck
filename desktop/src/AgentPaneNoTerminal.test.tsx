@@ -1,7 +1,7 @@
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { createFixtureSnapshot, FIXTURE_DAEMON_ID } from "./data/fixture";
-import { ALL_ENDPOINT_SELECTION, DEFAULT_DESKTOP_SETTINGS, type DesktopSettingsDto } from "./lib/bridge";
+import { ALL_ENDPOINT_SELECTION, DEFAULT_DESKTOP_SETTINGS, fixtureDesktopFeatures, type DesktopSettingsDto } from "./lib/bridge";
 import type { AgentTarget, DeckRuntimeState, DeckSnapshot } from "./types";
 
 /**
@@ -108,6 +108,7 @@ function harness(remoteStatus: "connected" | "disconnected" = "connected", retir
   const saveSettings = vi.fn(async (next: DesktopSettingsDto) => structuredClone(next));
   const base = {
     mode: "live",
+    desktopFeatures: fixtureDesktopFeatures("?experimental=1"),
     terminalData: {},
     clearError: vi.fn(),
     runAction: vi.fn(async () => ({ ok: true })),

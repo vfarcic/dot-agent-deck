@@ -3,7 +3,7 @@ import { createElement } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { agentDomKey } from "../components/AgentOverview";
 import { createFixtureSnapshot } from "../data/fixture";
-import { DEFAULT_DESKTOP_SETTINGS, type DesktopSettingsDto } from "./bridge";
+import { DEFAULT_DESKTOP_SETTINGS, fixtureDesktopFeatures, type DesktopSettingsDto } from "./bridge";
 import type { DeckActionResult, DeckRuntimeState } from "../types";
 
 type RegistryEntry = {
@@ -72,6 +72,7 @@ function runtime(overrides: Partial<DeckRuntimeState> = {}): DeckRuntimeState {
   const settings = settingsStore();
   return {
     mode: "fixture",
+    desktopFeatures: fixtureDesktopFeatures("?experimental=1"),
     snapshot,
     fleet: [snapshot],
     terminalData: {},
@@ -91,7 +92,7 @@ function runtime(overrides: Partial<DeckRuntimeState> = {}): DeckRuntimeState {
 }
 
 function renderDeck(overrides: Partial<DeckRuntimeState> = {}) {
-  return render(createElement(DeckShell, { runtime: runtime(overrides) }));
+  return render(createElement(DeckShell, { runtime: runtime(overrides), initialView: { kind: "deck" } }));
 }
 
 function openPalette() {
@@ -111,6 +112,7 @@ function expectOneRegistryDispatch(actionId?: string) {
 
 describe("VOICE_ACTIONS", () => {
   beforeEach(() => {
+    window.history.replaceState({}, "", "/?fixture=1&experimental=1");
     window.localStorage.clear();
     registryDispatch.mockClear();
     vi.stubGlobal("matchMedia", vi.fn((query: string) => ({
@@ -208,17 +210,17 @@ describe("VOICE_ACTIONS", () => {
   });
 
   /**
-   * Scenario: open a deck overlay and then click Runs in the primary rail. The
+   * Scenario: open a deck overlay and then click Deck in the primary rail. The
    * overlay disappears, the deck remains visible, and the reset action crossed
    * the registry rather than closing the booleans beside it.
    */
-  it("dispatches the Runs deck-rail button through the registry", () => {
+  it("dispatches the Deck deck-rail button through the registry", () => {
     renderDeck();
     fireEvent.click(screen.getByRole("button", { name: "Projects" }));
     expect(screen.getByTestId("projects-panel")).toBeVisible();
     registryDispatch.mockClear();
 
-    fireEvent.click(screen.getByRole("button", { name: "Runs" }));
+    fireEvent.click(screen.getByRole("button", { name: "Deck" }));
 
     expect(screen.queryByTestId("projects-panel")).not.toBeInTheDocument();
     expect(screen.getByTestId("agent-tile-planner")).toBeVisible();

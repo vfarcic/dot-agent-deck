@@ -59,9 +59,27 @@ The startup log line names the file it read (below), so "which `.dot-agent-deck.
 | `DOT_AGENT_DECK_EXPERIMENTAL=1` (or `true`) | env | On — wins over the file |
 | `DOT_AGENT_DECK_EXPERIMENTAL=0` (or `false`/other) | env | Off — wins over the file |
 
-Both the TUI and the background daemon read the flag independently from the same `.dot-agent-deck.toml`, so the two stay consistent — the file is the contract. On startup each process logs a single line — `experimental flag: ON (from /path/to/.dot-agent-deck.toml)` or the same with `OFF` — when file logging is enabled (`DOT_AGENT_DECK_LOG`). The path is the file the value came from, so a flag that resolves off because the wrong file was read is distinguishable from one that is simply set to false.
+Both the TUI and the background daemon read the flag independently from the same `.dot-agent-deck.toml`, so the two stay consistent — the file is the contract. The desktop app is the exception: it reads its own environment and no project file — see [The desktop app](#the-desktop-app). On startup each process logs a single line — `experimental flag: ON (from /path/to/.dot-agent-deck.toml)` or the same with `OFF` — when file logging is enabled (`DOT_AGENT_DECK_LOG`). The path is the file the value came from, so a flag that resolves off because the wrong file was read is distinguishable from one that is simply set to false.
 
 > **One flag for everything.** There is exactly one experimental toggle. If two unrelated experimental surfaces are in flight at once, they are shown or hidden together — there are no per-feature toggles.
+
+## The desktop app
+
+The desktop app reads the flag **from its own process environment only**, and differently from the TUI and the daemon:
+
+- `DOT_AGENT_DECK_EXPERIMENTAL=1` (or `true`) turns it on, and wins, exactly as above.
+- `DOT_AGENT_DECK_FEATURES_CONFIG=/full/path/to/.dot-agent-deck.toml` names one file whose `[features]` table is read, with the same guards as every other features read (a regular file, at most 64 KiB; a file that does not parse leaves the flag off).
+- **There is no walk.** The app does not look for a `.dot-agent-deck.toml` in or above its working directory. That walk is a client-side project guess, which PRD #819 removed from the desktop and linkage-check rule 12 (`xtask/linkage-check/src/desktop_project_boundary.rs`) refuses in `desktop/src-tauri/src`: the project an agent runs in lives on the daemon's filesystem — another machine, for a remote deck — and an app launched from Finder or a desktop launcher has `/` as its working directory anyway. The entry point is `features::init_from_process_env`, which takes no directory.
+- **It is read once, at startup.** The app resolves the flag when it starts and the window asks for its surfaces once, so there is no live reload: set or unset a variable, then restart the app. The startup log line names the file, or says no file variable was set.
+
+With the flag off the desktop shows the agent overview (with its full-window agent pane) and Settings; the rail reads **Overview** and **Settings**. With it on, the rail also carries Deck, Projects, Prompts, Workflows and Agent Profiles, and the overview's **Open deck** buttons come back.
+
+**Getting a variable to a packaged app.** A GUI app does not inherit your shell's environment, so exporting the variable in a terminal and then double-clicking the app does nothing. Two routes; **neither was verified on macOS for this change** — they are the platform's documented mechanisms, not something this repository tests:
+
+- **macOS:** `launchctl setenv DOT_AGENT_DECK_EXPERIMENTAL 1`, then quit and relaunch the app. The setting lasts until you log out or `launchctl unsetenv DOT_AGENT_DECK_EXPERIMENTAL`.
+- **Any platform, from a terminal:** run the app's own executable with the variable set, for example `DOT_AGENT_DECK_EXPERIMENTAL=1 "/Applications/Agent Deck.app/Contents/MacOS/<executable>"` on macOS (the bundle's executable name is whatever `Contents/MacOS/` holds), or the installed binary on Linux. A development build started with `pnpm tauri dev` inherits the shell it was started from, so the variable can simply be exported there.
+
+The fixture preview (`pnpm dev`, and the vitest and Playwright suites) has no process environment to read: it shows the gated surfaces when the URL carries `?experimental=1` (or `true`), for example `http://localhost:1420/?fixture=1&experimental=1`.
 
 ## Why surfaces are gated
 
@@ -74,8 +92,15 @@ This lets work-in-progress code merge to `main` without exposing unfinished UI d
 | `show_experimental_footer()` | The experimental dashboard footer | #139 | — |
 | `show_issue_dispatch_authoring()` | The new-pane `schedule: issues` modal authoring option (PRD #120 creation UX) | #120 | `graduate-issue-dispatch` |
 | `show_command_entry_lock()` | The orchestration command-entry lock: the `Ctrl+E` binding, the keystroke gate on a focused worker pane, and the waiting-pane focus steering | #393 | `graduate-command-entry-lock` |
+| `show_desktop_deck()` | The desktop app's deck — the multi-pane terminal screen: its rail entry, the overview's **Open deck** buttons, a requested deck view (shown as the overview instead), and voice's `open_deck` (offered `callable: false` and refused at dispatch) | #1198 | `graduate-desktop-deck` |
+| `show_desktop_projects()` | The desktop app's Projects panel: its rail entry and command-palette entry | #1198 | `graduate-desktop-projects` |
+| `show_desktop_prompts()` | The desktop app's Prompts library: its rail entry and command-palette entry | #1198 | `graduate-desktop-prompts` |
+| `show_desktop_workflows()` | The desktop app's Workflows editor: its rail entry and command-palette entry | #1198 | `graduate-desktop-workflows` |
+| `show_desktop_agent_profiles()` | The desktop app's Agent Profiles form: its rail entry and command-palette entry | #1198 | `graduate-desktop-agent-profiles` |
 
-> **`show_command_entry_lock()` was added AFTER the feature merged (#404), not before it.** PRD #393 shipped un-gated and locked-by-default; the flag was added while it was still unreleased, so no version ever exposed it on. Three seams in `src/ui.rs` read the wrapper — the `Ctrl+E` binding resolution, the `PaneInput` keystroke gate, and the auto-focus chain. Note the third: the focus steering is part of the same surface rather than a separate feature, because it only ever ran while the lock was engaged, so gating it off is what makes flag-off behaviour identical to v0.35.8. The helpers themselves (`scope_command_entry_lock`, `gate_pane_input_key`) stay flag-free so their unit tests exercise the real logic rather than the gate; `UiState::command_entry_locked` also still starts `true`, since the flag decides whether that value is *consulted*, not what it is.
+> **The five `show_desktop_*` wrappers reach the webview as one DTO field each.** The desktop crate's `desktop_features` command returns them as `DesktopFeatures` (`showDeck`, `showProjects`, `showPrompts`, `showWorkflows`, `showAgentProfiles`); the webview reads it once into `DeckRuntimeState.desktopFeatures`, and every TypeScript gate reads `desktopFeaturesOf(runtime).show<Surface>`, so `grep -rn 'show_desktop_deck\|showDeck' desktop/` finds every site of one surface. A missing or refused answer reads as all hidden. Two things are deliberately not gated: the panels' in-deck doors (the run graph's **Edit loop**, the empty deck's **Configure agents**, and the Projects ↔ Workflows cross-links inside those panels), because each sits inside a surface that is itself hidden and all five fields follow the one flag; and the voice rows' own vocabulary, which stays in `commands.toml` — only whether `open_deck` is offered changes.
+
+> **`show_command_entry_lock()` was added AFTER the feature merged (#404), not before it.** PRD #393 shipped un-gated and locked-by-default; the flag was added while it was still unreleased, so no version ever exposed it on. Three seams in `src/ui.rs` read the wrapper — the `Ctrl+E` binding resolution, the `PaneInput` keystroke gate, and the auto-focus chain. Note the third: the focus steering is part of the same surface rather than a separate feature, because it only ever ran while the lock was engaged, so gating it off is what makes flag-off behaviour identical to v0.35.8. The helpers themselves (`scope_orchestration_chord`, `gate_pane_input_key`) stay flag-free so their unit tests exercise the real logic rather than the gate; `UiState::command_entry_locked` also still starts `true`, since the flag decides whether that value is *consulted*, not what it is.
 
 ## Graduated
 

@@ -1214,6 +1214,44 @@ pub(crate) fn desktop_agent_registry() -> Vec<DesktopAgentOption> {
         .collect()
 }
 
+/// Which of the app's experimental surfaces this desktop process shows (issue
+/// #1198), for the webview to gate its render and navigation seams on.
+///
+/// Each field is ONE wrapper in the root crate's `features` module (CLAUDE.md
+/// #9), called in this process — so the flag is the desktop's own, read from
+/// this process's environment (`DOT_AGENT_DECK_EXPERIMENTAL`, or the file
+/// `DOT_AGENT_DECK_FEATURES_CONFIG` names) with no project walk; see
+/// [`crate::init_features`]. It is deliberately NOT the per-deck
+/// `experimental` a deck reports in [`DesktopNewAgentOptions`]: these surfaces
+/// belong to the app, not to any one deck, and the app observes several.
+///
+/// All `false` is the shipped default. The overview, the agent overlay and
+/// Settings have no field because they are never gated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DesktopFeatures {
+    pub show_deck: bool,
+    pub show_projects: bool,
+    pub show_prompts: bool,
+    pub show_workflows: bool,
+    pub show_agent_profiles: bool,
+}
+
+impl DesktopFeatures {
+    /// The surfaces the process-global flag shows. Read through the wrappers
+    /// on each call; the flag behind them is resolved once at startup.
+    pub(crate) fn current() -> Self {
+        use dot_agent_deck::features;
+        Self {
+            show_deck: features::show_desktop_deck(),
+            show_projects: features::show_desktop_projects(),
+            show_prompts: features::show_desktop_prompts(),
+            show_workflows: features::show_desktop_workflows(),
+            show_agent_profiles: features::show_desktop_agent_profiles(),
+        }
+    }
+}
+
 /// The STRING-SHAPE check the desktop may make on a path the **user** typed,
 /// before spending a daemon round trip on it.
 ///
@@ -3617,5 +3655,82 @@ mod tests {
         });
 
         apply_settings_selection(&crate::settings::DesktopSettings::default());
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #1198 — the app-level experimental surfaces
+    // -----------------------------------------------------------------------
+
+    /// Serialises the tests that write the process-global `Features`. Under
+    /// nextest every test is its own process, so this only matters to a plain
+    /// `cargo test`, where they share one — the same shape as the root crate's
+    /// `tests/features.rs`. Nothing else in this crate's tests reads the flag.
+    static FEATURES_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Puts back whatever `Features` a test found, even when it panics.
+    struct RestoreFeatures(dot_agent_deck::features::Features);
+
+    impl Drop for RestoreFeatures {
+        fn drop(&mut self) {
+            dot_agent_deck::features::set_for_test(self.0);
+        }
+    }
+
+    /// Every gated surface follows the one flag through its own wrapper: all
+    /// hidden while it is off — the shipped default — and all shown once it is
+    /// on, with no surface left behind in either direction.
+    #[test]
+    fn desktop_features_follow_the_experimental_flag() {
+        use dot_agent_deck::features::{self, Features};
+        let _lock = FEATURES_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _restore = RestoreFeatures(features::current());
+
+        features::set_for_test(Features::test_with(false));
+        assert_eq!(
+            DesktopFeatures::current(),
+            DesktopFeatures {
+                show_deck: false,
+                show_projects: false,
+                show_prompts: false,
+                show_workflows: false,
+                show_agent_profiles: false,
+            }
+        );
+
+        features::set_for_test(Features::test_with(true));
+        assert_eq!(
+            DesktopFeatures::current(),
+            DesktopFeatures {
+                show_deck: true,
+                show_projects: true,
+                show_prompts: true,
+                show_workflows: true,
+                show_agent_profiles: true,
+            }
+        );
+    }
+
+    /// The wire shape the webview's `DesktopFeaturesDto` reads: camelCase keys,
+    /// one per gated surface, and nothing else.
+    #[test]
+    fn desktop_features_serialise_in_camel_case() {
+        let value = serde_json::to_value(DesktopFeatures {
+            show_deck: true,
+            show_projects: false,
+            show_prompts: true,
+            show_workflows: false,
+            show_agent_profiles: true,
+        })
+        .expect("serialises");
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "showDeck": true,
+                "showProjects": false,
+                "showPrompts": true,
+                "showWorkflows": false,
+                "showAgentProfiles": true,
+            })
+        );
     }
 }

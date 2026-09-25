@@ -3,11 +3,11 @@
 **Status**: Draft — **blocked on TypeSafe early access.** No Jev key is available yet, so no milestone can start. The design below was settled in discussion on 2026-09-24; M1 is a go/no-go measurement, and nothing after it is built unless M1 passes.
 **Priority**: Low
 **Created**: 2026-09-24
-**Depends on**: [PRD #802](802-desktop-voice-control.md) (desktop voice control, shipped) and a TypeSafe early-access key.
+**Depends on**: [PRD #802](done/802-desktop-voice-control.md) (desktop voice control, shipped) and a TypeSafe early-access key.
 
 ## Problem Statement
 
-Desktop voice control ([PRD #802](802-desktop-voice-control.md)) turns an utterance into an action in two stages: **Speech** transcribes audio to text, and **Commands** resolves that text against the command table (`desktop/src-tauri/src/voice/commands.toml`) and live state. Commands has two backends today, selected by `[voice.intent] backend`: `openai_compatible` (the default, `gpt-5-mini` with reasoning suppressed) and `anthropic` (`claude-haiku-4-5`, strict tool-use). Both are chat models forced into a closed-set answer. #802 measured the Anthropic shape at a **~0.9 s median** per utterance, which is most of what a user waits for after they stop speaking.
+Desktop voice control ([PRD #802](done/802-desktop-voice-control.md)) turns an utterance into an action in two stages: **Speech** transcribes audio to text, and **Commands** resolves that text against the command table (`desktop/src-tauri/src/voice/commands.toml`) and live state. Commands has two backends today, selected by `[voice.intent] backend`: `openai_compatible` (the default, `gpt-5-mini` with reasoning suppressed) and `anthropic` (`claude-haiku-4-5`, strict tool-use). Both are chat models forced into a closed-set answer. #802 measured the Anthropic shape at a **~0.9 s median** per utterance, which is most of what a user waits for after they stop speaking.
 
 [Jev](https://docs.typesafe.ai/), released by TypeSafe AI on 2026-09-15, is a different kind of model: a "System One" decision model that returns no text at all, only typed answers to choice, yes/no and score questions, with probabilities. TypeSafe claims 70–500 ms latency, and pricing is $0.042 per million input tokens with free output. That shape matches #802's own design principle unusually well — **the model returns a situation; the app renders the sentence** — because Jev *cannot* return anything but a situation.
 

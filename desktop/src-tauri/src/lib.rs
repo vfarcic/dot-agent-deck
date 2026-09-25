@@ -2254,6 +2254,32 @@ async fn desktop_terminal_detach(
     terminal::detach(&state, &session_id).await
 }
 
+/// Which of the app's experimental surfaces to show (issue #1198) — the
+/// desktop process's own flag, through one `features::show_desktop_*` wrapper
+/// per surface. The webview asks once at startup; the flag itself is resolved
+/// once, by [`init_features`], so restarting the app is how it changes.
+#[tauri::command]
+async fn desktop_features(webview: Webview) -> Result<dto::DesktopFeatures, String> {
+    ensure_main_webview(&webview)?;
+    Ok(dto::DesktopFeatures::current())
+}
+
+/// Resolve the desktop process's experimental flag (issue #1198). Until this
+/// runs every `show_desktop_*` wrapper reads the default, OFF.
+///
+/// From this process's environment ONLY — `DOT_AGENT_DECK_EXPERIMENTAL`, and
+/// the file `DOT_AGENT_DECK_FEATURES_CONFIG` names outright — through
+/// `features::init_from_process_env`. There is deliberately no walk up from the
+/// working directory for a `.dot-agent-deck.toml`, which is what the TUI and
+/// the daemon do: that is a client-side project guess, exactly what PRD #819
+/// removed from this crate and linkage-check rule 12 refuses here. A remote
+/// deck's project is on another machine, and a Finder-launched app's working
+/// directory is `/`. `docs/develop/experimental-flag.md` says how a packaged
+/// app is given either variable.
+fn init_features() {
+    dot_agent_deck::features::init_from_process_env();
+}
+
 /// Read the desktop app's own settings document, and where it lives (PRD #803).
 ///
 /// A standalone command rather than a `DesktopAction`, for the same reason the
@@ -2889,6 +2915,9 @@ async fn desktop_voice_resolve(
         new_agent.as_ref(),
         voice::Transcript::new(utterance),
         settings.labels,
+        // Issue #1198: the deck is an experimental surface, so voice neither
+        // offers nor dispatches the way there while it is hidden.
+        dot_agent_deck::features::show_desktop_deck(),
     )
     .await)
 }
@@ -2990,6 +3019,9 @@ async fn desktop_voice_commands(
             .voice
             .unwrap_or_default()
             .labels,
+        // Issue #1198: the list marks the deck's row unavailable while the deck
+        // is hidden, for the same reason the resolver refuses it.
+        dot_agent_deck::features::show_desktop_deck(),
     ))
 }
 
@@ -4347,6 +4379,7 @@ pub fn run() {
         // A missing window is not an error. `load_snapshot` never fails, and a
         // default level makes this a no-op rather than a special case.
         .setup(|app| {
+            init_features();
             let stored = settings::load_snapshot().settings;
             // PRD #741 M7: the stored deck selection goes into force before the
             // first snapshot, so the app connects to the deck the user chose
@@ -4447,6 +4480,7 @@ pub fn run() {
             desktop_terminal_write,
             desktop_terminal_resize,
             desktop_terminal_detach,
+            desktop_features,
             desktop_get_settings,
             desktop_set_settings,
             desktop_test_endpoint,

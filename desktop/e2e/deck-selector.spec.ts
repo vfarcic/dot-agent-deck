@@ -1,4 +1,5 @@
 import { expect, test, type Page } from "@playwright/test";
+import { enterDeck } from "./support/overview";
 
 /**
  * The Deck selector, driven the way a person drives it, in both engines
@@ -75,6 +76,7 @@ async function storedSelection(page: Page): Promise<string | undefined> {
 async function openDeck(page: Page, endpoints: unknown = TWO_DECKS, scenario = "crowded") {
   await seed(page, endpoints);
   await page.goto(`/?fixture=1&state=${scenario}`);
+  await enterDeck(page);
   await expect(page.getByTestId("deck-selector-toggle")).toBeVisible();
 }
 

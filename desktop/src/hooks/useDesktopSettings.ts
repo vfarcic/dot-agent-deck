@@ -54,14 +54,25 @@ export interface DesktopSettingsState {
    *   build's schema rejects. The app is then running on defaults and the Rust
    *   side refuses every save rather than publishing those defaults over the
    *   user's file, so this is set from the moment the load resolves, before any
-   *   save has been attempted. Nothing else on screen explains why a user's
-   *   settings look reset — the footer names the file but not what is wrong
-   *   with it.
+   *   save has been attempted. This is what explains why a user's settings
+   *   look reset; the footer carries the same sentence as `problem` below, in
+   *   place of the path it would otherwise name (issue #829).
    *
    * A save failure wins while both are set: it is the newer answer, and the
    * refusal message carries the same locator the load problem does.
    */
   saveError?: string;
+  /**
+   * Why the document at `path` is not in use, when it is not — the load
+   * problem alone, without a save failure folded in. `undefined` once a save
+   * succeeds, because that proves the path usable.
+   *
+   * Separate from `saveError` because the footer answers a different question
+   * from the panel's alert: "where are my settings kept?" A failed save does
+   * not change that answer; a document the app refuses to use does (issue
+   * #829), and the footer must not go on naming that path as the store.
+   */
+  problem?: string;
   save: (next: DesktopSettingsDto) => void;
 }
 
@@ -99,9 +110,17 @@ export function useDesktopSettings(runtime: DeckRuntimeState): DesktopSettingsSt
   // field — is #828, and is not something a hook can fix.
   const queue = useRef<Promise<void>>(Promise.resolve());
   const newest = useRef(0);
+  // How many saves have come back accepted. A load that was already in flight
+  // when one did describes the file as it was BEFORE that write, so its
+  // `problem` is stale: the backend has since accepted the document, and
+  // restoring the sentence would have the footer call a location unusable that
+  // a save just proved usable (issue #829 review). A counter rather than a flag,
+  // so a load that STARTS after the save still reports what it finds.
+  const accepted = useRef(0);
 
   useEffect(() => {
     let cancelled = false;
+    const generation = accepted.current;
     void getSettings()
       .then((snapshot) => {
         if (cancelled) return;
@@ -111,8 +130,9 @@ export function useDesktopSettings(runtime: DeckRuntimeState): DesktopSettingsSt
         // So is the reason the document could not be read: it describes the file
         // rather than the in-memory document, so an edit made while the read was
         // in flight does not make it stale — that edit is exactly what the Rust
-        // side is about to refuse to save.
-        setDocumentProblem(snapshot.problem);
+        // side is about to refuse to save. A save ACCEPTED while it was in
+        // flight does make it stale, which is what `accepted` is for.
+        if (accepted.current === generation) setDocumentProblem(snapshot.problem);
         if (!edited.current) setSettings(snapshot.settings);
         setRead(true);
       })
@@ -156,6 +176,7 @@ export function useDesktopSettings(runtime: DeckRuntimeState): DesktopSettingsSt
         // build can read: `save_to` refuses before writing otherwise. True of a
         // superseded response too, so this is cleared before the ticket check —
         // the document's state is not a property of which write won.
+        accepted.current += 1;
         setDocumentProblem(undefined);
         // A superseded response is dropped rather than applied — it is an
         // older document, and the user has already moved past it.
@@ -182,5 +203,5 @@ export function useDesktopSettings(runtime: DeckRuntimeState): DesktopSettingsSt
   // here, because it is monotonic (false to true, never back) and every write
   // to it is paired with a `setSettings` in the same call, so the render that
   // observes the new value is one React was already going to perform.
-  return { settings, path, loaded, chosen: read || edited.current, saveError: saveFailure ?? documentProblem, save };
+  return { settings, path, loaded, chosen: read || edited.current, saveError: saveFailure ?? documentProblem, problem: documentProblem, save };
 }

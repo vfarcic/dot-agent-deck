@@ -55,7 +55,7 @@ use dot_agent_deck_desktop::voice::{
     NO_MATCH_ACTION, ParamKind, REMOTE_TIMEOUT, Screen, Transcript, VoiceChoice, VoiceDirectories,
     VoiceDirectoryEntry, VoiceNewAgent, VoiceNewAgentForm, VoiceOutcome,
     dictation::normalise,
-    handle_utterance, table,
+    handle_utterance_with, table,
     test_support::{
         api_preset, api_resolver, in_orchestration, in_titled_orchestration, role_agent_in_state,
         with_tool,
@@ -94,6 +94,9 @@ struct PhraseFixture {
     name: String,
     utterance: String,
     screen: String,
+    /// Hide the experimental deck as the shipped desktop does by default.
+    #[serde(default)]
+    deck_hidden: bool,
     action: String,
     outcome: OutcomeKind,
     #[serde(default)]
@@ -320,9 +323,8 @@ fn marked_prefix(outcome: &VoiceOutcome) -> Option<&str> {
 }
 
 /// Scenario: Validate every checked-in phrase and the planted fleet before any
-/// live-model gate. Skip CI unless a real-agent run is explicitly required;
-/// with local opt-in, verify the full outcome through the shipping keyed API
-/// backend on this build's own endpoint and model.
+/// live-model gate. With local opt-in, verify outcomes through the shipping
+/// keyed API backend with the deck shown or hidden as each fixture specifies.
 #[tokio::test]
 async fn voice_phrase_fixtures_match_the_default_backend() {
     let fixtures = manifest();
@@ -481,6 +483,13 @@ async fn voice_phrase_fixtures_match_the_default_backend() {
             fixture.name,
             fixture.screen
         );
+        if fixture.deck_hidden {
+            assert_eq!(
+                fixture.screen, "overview",
+                "{}: deck-hidden phrase fixtures exercise the shipped overview",
+                fixture.name
+            );
+        }
         if fixture.pending_action {
             assert_eq!(
                 fixture.action, PENDING_OPEN_SETTINGS_ACTION,
@@ -599,7 +608,7 @@ async fn voice_phrase_fixtures_match_the_default_backend() {
         };
         let resolved = tokio::time::timeout(
             REMOTE_TIMEOUT + PER_FIXTURE_GRACE,
-            handle_utterance(
+            handle_utterance_with(
                 resolver.as_ref(),
                 table(),
                 screen,
@@ -608,6 +617,8 @@ async fn voice_phrase_fixtures_match_the_default_backend() {
                 fixture_directories,
                 fixture_new_agent,
                 transcript,
+                Default::default(),
+                !fixture.deck_hidden,
             ),
         )
         .await;
@@ -680,6 +691,10 @@ async fn voice_phrase_fixtures_match_the_default_backend() {
                             .sentence()
                             .contains(&format!("Preselected deck: {label}."))
                     });
+                let hidden_deck_explained = !fixture.deck_hidden
+                    || fixture.action != "open_deck"
+                    || matches!(&answer.outcome, VoiceOutcome::Unavailable { hint, .. }
+                        if hint.contains("deck") && hint.contains("experimental"));
                 if action_matches
                     && actual_outcome == fixture.outcome
                     && agent_matches
@@ -692,6 +707,7 @@ async fn voice_phrase_fixtures_match_the_default_backend() {
                     && deck_named
                     && deck_eligible
                     && unavailable_named
+                    && hidden_deck_explained
                 {
                     Ok(())
                 } else {
@@ -709,6 +725,8 @@ async fn voice_phrase_fixtures_match_the_default_backend() {
                             "a deck the dialog disables was preselected; "
                         } else if !unavailable_named {
                             "the report does not say the named deck cannot take a new agent; "
+                        } else if !hidden_deck_explained {
+                            "the refusal does not explain that the deck is experimental; "
                         } else {
                             ""
                         },
