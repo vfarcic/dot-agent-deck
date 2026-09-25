@@ -156,7 +156,7 @@ When the user's request relates to a PRD, read only the PRD file from the prds/ 
 
 There is exactly ONE user gate in this workflow: the merge confirmation (step 7). The test plan (step 1) is deliberately NOT a gate — see step 1 — and must not be turned back into one. The test inventory and the demo-reel link are informational context for the merge gate, not gates of their own.
 
-**Run finished.** When the run ends — merged and closed, or abandoned for any reason — make your last action the **run finished** notification (see **Notifications** below). Send and continue.
+**Run finished.** When the run ends — its PR merged (closing the issue, or leaving it open because step 5 made it a `Refs` PR), or abandoned for any reason — make your last action the **run finished** notification (see **Notifications** below). Send and continue.
 
 ## Notifications (PRD #126)
 
@@ -174,7 +174,7 @@ You notify at exactly these four moments and nowhere else — per-step chatter d
 |---|---|
 | Escalation: a worker's `work-done` returned a question you cannot answer without the user | `dot-agent-deck PRD #<n> — needs input: <one line>` |
 | Merge gate (step 7), immediately before you pause | `dot-agent-deck PRD #<n> — needs go-ahead: merge PR #<pr>` |
-| Run finished — *fully* merged and closed, or abandoned. NEVER for partial progress. | `dot-agent-deck PRD #<n> — DONE: merged & closed` or `dot-agent-deck PRD #<n> — ABANDONED: <one-line reason>` |
+| Run finished — this run's PR merged, or abandoned. NEVER for progress within a run. | `dot-agent-deck PRD #<n> — DONE: merged & closed`, `dot-agent-deck PRD #<n> — DONE: merged PR #<pr>, PRD stays open (Refs)` or `dot-agent-deck PRD #<n> — ABANDONED: <one-line reason>` |
 | The daemon injected an idle-worker prompt (a delegated worker has gone silent) | `dot-agent-deck PRD #<n> — STUCK: <role> silent >N min` |
 
 **Expectation log.** `scripts/notify.sh` appends the line to `.dot-agent-deck/notify-log.md` itself (gitignored; it creates it if missing) — `| <UTC timestamp> | <message> | message_id=<id> |`, or `send=failed: <reason>` / `send=skipped: TELEGRAM_CHAT_ID unset` when there is no id. You do not write it by hand any more, and you do not need to parse the script's output to do so. The returned `message_id` already closes the "sent but never arrived" gap, so the only failure this log exists to expose is *reached a notify moment and never sent* — the expected symptom once a compaction drops these instructions (PRD #82). Appending the line is best-effort too: it must never delay or block the workflow.
@@ -246,9 +246,9 @@ Three things this role must get right, because they are where it has gone wrong 
 
 If any step fails (failing CI, merge conflicts, or a CHANGES_REQUESTED review state), report the exact error and stop — do not diagnose or fix. The orchestrator will re-delegate to coder.
 
-After a successful merge, check the issue's state (`gh issue view <n> --json state`) and signal completion by running the one line that matches it:
+After a successful merge, compare the issue's state (`gh issue view <n> --json state`) with what the PR body said, and signal completion by running the one line that matches. A PR that said `Closes #<n>` whose issue is still open is a failure, not a partial merge: report it as the error above says, instead of sending either line.
   dot-agent-deck work-done --task "PR <url> merged as <sha>. Issue #<n> closed. <one-line summary of what shipped.>"
-  dot-agent-deck work-done --task "PR <url> merged as <sha>. Issue #<n> left open: the PR said Refs, not Closes. <one-line summary of what shipped.>"
+  dot-agent-deck work-done --task "PR <url> merged as <sha>. Issue #<n> left open, as its Refs line intends. <one-line summary of what shipped.>"
 """
 
 # ---------------------------------------------------------------------------
