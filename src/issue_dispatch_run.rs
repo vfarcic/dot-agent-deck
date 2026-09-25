@@ -823,11 +823,16 @@ where
                 discard(staging).await;
                 return Ok(StagedClone::LostRace);
             }
-            Err(format!(
+            // Discarded here too, because every call stages under a new name:
+            // a rename that keeps failing would otherwise leave one complete
+            // copy of the repository per fire (Qodo, PR #1304).
+            let err = format!(
                 "cloned into {} but could not move it to {}: {e}",
                 staging.display(),
                 clone_dir.display()
-            ))
+            );
+            discard(staging).await;
+            Err(err)
         }
     }
 }
@@ -2067,6 +2072,28 @@ mod tests {
             entries(),
             vec!["repo".to_string(), "repo.cloning-concurrent".to_string()],
             "the losing copy's staging directory is discarded"
+        );
+
+        // A destination the clone can never be moved onto — a file — fails the
+        // placement, and the copy it could not place is discarded rather than
+        // left to accumulate one per fire.
+        let blocked = ws.path().join("blocked");
+        std::fs::write(&blocked, "not a directory").expect("occupy the destination");
+        let err = clone_via_staging(&blocked, |staging| async move {
+            std::fs::create_dir_all(staging.join(".git")).expect("clone");
+            Ok(())
+        })
+        .await
+        .expect_err("a clone that cannot be placed must fail");
+        assert!(err.contains("could not move it"), "{err}");
+        assert_eq!(
+            entries(),
+            vec![
+                "blocked".to_string(),
+                "repo".to_string(),
+                "repo.cloning-concurrent".to_string()
+            ],
+            "the unplaceable copy's staging directory is discarded"
         );
     }
 
