@@ -306,7 +306,7 @@ Not built here, recorded so the design's endpoint is not lost: a **group view** 
 
 ## Closing note (2026-09-25)
 
-**This PRD is complete, and iteration 3 closes by delivery and by decision rather than by building all of it.** The PR delivering issues #1196, #1197 and #1198 together (PR #TBD) is where it closes. Its four parts resolve as follows:
+**This PRD is complete, and iteration 3 closes by delivery and by decision rather than by building all of it.** The PR delivering issues #1196, #1197 and #1198 together (PR [#1307](https://github.com/vfarcic/dot-agent-deck/pull/1307)) is where it closes. Its four parts resolve as follows:
 
 - **Promotion to the landing screen** is issue [#1196](https://github.com/vfarcic/dot-agent-deck/issues/1196): `DeckShell`'s `initialView` defaults to the overview and its entry leads the rail. No view is persisted, so every launch opens there.
 - **The single-agent view** already existed: it is the full-window agent pane overlay built by PRD [#1105](https://github.com/vfarcic/dot-agent-deck/issues/1105) (PR [#1126](https://github.com/vfarcic/dot-agent-deck/pull/1126)), opened from an overview row. Issue [#1198](https://github.com/vfarcic/dot-agent-deck/issues/1198) keeps it visible by default, so it is the overview's destination with the `experimental` flag off.
