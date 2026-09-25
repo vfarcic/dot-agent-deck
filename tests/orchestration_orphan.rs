@@ -99,10 +99,17 @@ fn is_marked(event: &AgentEvent) -> bool {
     event.is_orchestration_orphaned()
 }
 
+/// Issue #413: the instant `card` is built against and rendered at. The card
+/// seams take `now` instead of reading the clock, so the card's `Last:` field is
+/// a pure function of the fixture's own timestamps.
+fn render_now() -> chrono::DateTime<chrono::Utc> {
+    chrono::DateTime::from_timestamp(1_767_225_600, 0).expect("a valid fixed instant")
+}
+
 /// A card fixture that differs from the healthy one in exactly one field, so
 /// what the assertions attribute to orphaning cannot come from anything else.
 fn card(orphaned: bool) -> SessionState {
-    let now = Utc::now();
+    let now = render_now();
     SessionState {
         session_id: "sess-orphan".to_string(),
         agent_type: AgentType::ClaudeCode,
@@ -256,6 +263,7 @@ fn orphan_002_card_says_orphaned_and_delegation_unavailable() {
         Some(1),
         density,
         0,
+        render_now(),
         false,
         80,
         height,
@@ -275,6 +283,7 @@ fn orphan_002_card_says_orphaned_and_delegation_unavailable() {
         Some(1),
         density,
         0,
+        render_now(),
         false,
         80,
         height,

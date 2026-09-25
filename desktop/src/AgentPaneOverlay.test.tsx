@@ -3,7 +3,7 @@ import { useEffect } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { AgentTileProps } from "./components/AgentTile";
 import { createFixtureSnapshot, FIXTURE_DAEMON_ID } from "./data/fixture";
-import { DEFAULT_DESKTOP_SETTINGS, type DesktopSettingsDto } from "./lib/bridge";
+import { DEFAULT_DESKTOP_SETTINGS, fixtureDesktopFeatures, type DesktopSettingsDto } from "./lib/bridge";
 import type { DeckActionResult, DeckRuntimeState } from "./types";
 
 /**
@@ -46,7 +46,12 @@ vi.mock("./components/AgentTile", async () => {
   };
 });
 
-import { DeckShell } from "./App";
+import { DeckShell as AppDeckShell } from "./App";
+
+/** Existing deck-specific cases enter the deck explicitly after the app default changes. */
+function DeckShell(props: Parameters<typeof AppDeckShell>[0]) {
+  return <AppDeckShell initialView={{ kind: "deck" }} {...props} />;
+}
 
 function settingsStore() {
   let document: DesktopSettingsDto = { ...DEFAULT_DESKTOP_SETTINGS };
@@ -64,6 +69,7 @@ function runtime(overrides: Partial<DeckRuntimeState> = {}): DeckRuntimeState {
   const settings = settingsStore();
   return {
     mode: "fixture",
+    desktopFeatures: fixtureDesktopFeatures("?experimental=1"),
     snapshot,
     fleet: [snapshot],
     terminalData: {},

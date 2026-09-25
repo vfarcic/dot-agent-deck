@@ -1,22 +1,41 @@
 //! Printing a path the way this repository writes paths.
 //!
-//! One helper, used by the two modules that build a **repo-relative** string
-//! out of a directory walk and then print it beside forward-slashed literals:
-//! `desktop_palette`'s findings and `list_tests`' inventory tables.
+//! [`slash_path`] is used by the two modules that build a **repo-relative**
+//! string out of a directory walk and then print it beside forward-slashed
+//! literals: `desktop_palette`'s findings and `list_tests`' inventory tables.
+//! [`join_repo_relative`] is its mirror image, for a literal joined onto a root.
 //!
 //! The rule it encodes: *a walked path is safe to compare, and unsafe to
 //! stringify* (issue #831). Issue #831's survey found the crate's path
 //! *comparisons* already immune — they go through `Path`/`PathBuf`, which
-//! compares components — and found the crate's other `display()` sites
-//! unaffected, because they print **absolute** paths with no forward-slashed
-//! literal glued on, so their output is self-consistently native. What is left
-//! is the case here: the moment a walked path becomes a repo-relative `String`
-//! it carries the native separator into text that promises `/`.
+//! compares components — and read the crate's other `display()` sites as
+//! unaffected, on the grounds that they print **absolute** paths with no
+//! forward-slashed literal glued on. Issue #1137 found three that did — rule 9's
+//! `SELF_CONTAINED_PATH` and `gather_inputs`' catalog and allowlist paths were
+//! `root.join("a/b")`, which on Windows prints `C:\repo\a/b` — and issue #1137
+//! routed them through [`join_repo_relative`], so their output is native end to
+//! end. The other case is the one [`slash_path`] handles: the moment a walked
+//! path becomes a repo-relative `String` it carries the native separator into
+//! text that promises `/`.
 //!
 //! It arrived in `desktop_palette` (`25b39b5`), which is where the failure was
 //! first observed, and moved here when `list_tests` needed the same thing.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+/// `root` joined with a forward-slashed repo-relative literal one component at
+/// a time, so the result uses the native separator throughout (issue #1137).
+///
+/// `root.join("tests/CATALOG.md")` opens the right file on every platform —
+/// Windows accepts `/` — but its `display()` keeps the literal's `/` beside the
+/// root's `\`, and that mixed string is what a guard prints. Joining by
+/// component makes the printed path the one the platform would itself write.
+pub(crate) fn join_repo_relative(root: &Path, relative: &str) -> PathBuf {
+    relative
+        .split('/')
+        .filter(|component| !component.is_empty())
+        .fold(root.to_path_buf(), |path, component| path.join(component))
+}
 
 /// A path as a report should print it: `/`-separated on every platform.
 ///
@@ -84,6 +103,26 @@ mod tests {
             !slash_path(&Path::new("a").join("b")).contains(std::path::MAIN_SEPARATOR)
                 || std::path::MAIN_SEPARATOR == '/'
         );
+    }
+
+    /// Issue #1137: a repo-relative literal joined onto a root comes out with
+    /// the native separator between every component, so `display()` prints no
+    /// `/` on Windows. On Unix both spellings agree; the component comparison
+    /// and the separator check are what a Windows run would fail on.
+    #[test]
+    fn a_repo_relative_literal_joins_with_the_native_separator() {
+        let root = Path::new("repo");
+        let joined = join_repo_relative(root, "xtask/linkage-check/m2.allowlist");
+        assert_eq!(
+            joined,
+            root.join("xtask")
+                .join("linkage-check")
+                .join("m2.allowlist")
+        );
+        let printed = joined.display().to_string();
+        let expected =
+            ["repo", "xtask", "linkage-check", "m2.allowlist"].join(std::path::MAIN_SEPARATOR_STR);
+        assert_eq!(printed, expected);
     }
 
     /// And it is a component walk rather than a blind `\` → `/` replacement,

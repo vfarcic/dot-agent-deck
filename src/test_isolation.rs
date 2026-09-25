@@ -28,6 +28,17 @@
 //!   nothing — this is what `scheduler/dispatch/016` does since #666), or
 //! * pin `DOT_AGENT_DECK_SOCKET` in the CHILD's environment at a path with no
 //!   listener, so the emit fails closed instead of finding a stranger's daemon.
+//!   [`pin_unreachable_endpoints`] (for a `SpawnOptions::env`) and
+//!   [`unreachable_endpoints`] (for a `Command`'s `.envs(…)`) are that pin.
+//!
+//! **Enforced, narrowly, by linkage-check rule 17** (`unit-test-emitter-pins-endpoints`,
+//! issue #688). A `fn` in `src/` test code that spawns an emitter the rule
+//! recognises — a `SpawnOptions` literal declaring a Wrapper-strategy
+//! `agent_type`, or a command literal naming a registered agent or the deck
+//! binary — has to call one of those two helpers somewhere in its body. The
+//! rule reads literals, so a command or type held in a variable walks past it;
+//! `xtask/linkage-check/src/unit_test_endpoint_pin.rs` lists what else it
+//! cannot see.
 
 use std::sync::OnceLock;
 
@@ -82,6 +93,72 @@ pub fn detach_from_any_live_deck() {
     });
 }
 
+/// The two endpoint variables [`pin_unreachable_endpoints`] pins. Not the
+/// pane/agent ids or the capability token: those are identity, not a route to
+/// a daemon, and `agent_pty::spawn` already strips inherited copies of them.
+const PINNED_ENDPOINT_VARS: [&str; 2] = ["DOT_AGENT_DECK_SOCKET", "DOT_AGENT_DECK_ATTACH_SOCKET"];
+
+/// A per-process endpoint path nothing listens on, one per variable.
+///
+/// Never created: the point is that a `connect(2)` to it fails. The name
+/// carries this process's pid so two concurrent test processes cannot collide
+/// on a path one of them might later bind.
+fn unreachable_endpoint(var: &str) -> String {
+    let role = if var == "DOT_AGENT_DECK_ATTACH_SOCKET" {
+        "attach"
+    } else {
+        "hook"
+    };
+    std::env::temp_dir()
+        .join(format!(
+            "dad-unit-no-listener-{}-{role}.sock",
+            std::process::id()
+        ))
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// The hook and attach endpoints, pinned at paths with no listener, as
+/// `(name, value)` pairs for a child's environment.
+///
+/// Why a pin rather than a scrub: with the variable ABSENT, a child that emits
+/// resolves the endpoint itself — [`crate::platform::paths::socket_path`] falls
+/// back to `$XDG_RUNTIME_DIR/dot-agent-deck.sock` when `XDG_RUNTIME_DIR` is set
+/// — and on a developer's machine that is typically their live daemon. With it
+/// PRESENT the resolver takes the override arm and never reaches the fallback,
+/// so the emit fails closed. Issue #688 measured the difference: the scrub
+/// alone still produced 3 foreign `SessionStart`s in 8 runs of one fixture.
+///
+/// For a `std::process::Command` / `tokio::process::Command`, pass this to
+/// `.envs(…)`. For a `SpawnOptions`, use [`pin_unreachable_endpoints`], which
+/// keeps any pin the caller already chose.
+pub fn unreachable_endpoints() -> Vec<(String, String)> {
+    PINNED_ENDPOINT_VARS
+        .into_iter()
+        .map(|var| (var.to_string(), unreachable_endpoint(var)))
+        .collect()
+}
+
+/// `env` with [`unreachable_endpoints`] added for every endpoint variable it
+/// does not already set. A value the caller supplied wins, so a fixture that
+/// deliberately points its child at its OWN sandbox daemon keeps doing so.
+///
+/// Meant for `SpawnOptions::env`: `agent_pty::spawn` strips the inherited
+/// endpoint variables and then applies `opts.env`, and
+/// `AgentPtyRegistry::spawn_agent` injects the registry's own hook socket only
+/// when `opts.env` names none — so a value placed here reaches the child.
+///
+/// Does not touch this process's environment; call
+/// [`detach_from_any_live_deck`] for that half, before anything is spawned.
+pub fn pin_unreachable_endpoints(mut env: Vec<(String, String)>) -> Vec<(String, String)> {
+    for (var, value) in unreachable_endpoints() {
+        if !env.iter().any(|(k, _)| *k == var) {
+            env.push((var, value));
+        }
+    }
+    env
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -104,6 +181,58 @@ mod tests {
                 std::env::var_os(var).is_none(),
                 "{var} survived the unit-test detach — a spawned child would \
                  inherit it and could post hook events into a live deck"
+            );
+        }
+    }
+
+    /// Scenario: Pin the endpoints onto an env that already names the pane id
+    /// and a caller-chosen hook socket, and assert the pane id and the
+    /// caller's socket survive untouched while the attach socket is added at a
+    /// per-process path with no listener — so a child fails closed instead of
+    /// resolving the developer's live daemon.
+    #[test]
+    fn pin_adds_missing_endpoints_and_keeps_the_callers_own() {
+        let env = pin_unreachable_endpoints(vec![
+            ("DOT_AGENT_DECK_PANE_ID".into(), "pane-1".into()),
+            ("DOT_AGENT_DECK_SOCKET".into(), "/sandbox/own.sock".into()),
+        ]);
+        let get = |k: &str| {
+            env.iter()
+                .filter(|(name, _)| name == k)
+                .map(|(_, v)| v.as_str())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(get("DOT_AGENT_DECK_PANE_ID"), ["pane-1"]);
+        assert_eq!(
+            get("DOT_AGENT_DECK_SOCKET"),
+            ["/sandbox/own.sock"],
+            "a pin the caller chose must win, and must not be duplicated"
+        );
+        let attach = get("DOT_AGENT_DECK_ATTACH_SOCKET");
+        assert_eq!(attach.len(), 1, "the missing attach pin must be added once");
+        assert!(
+            attach[0].contains(&format!("dad-unit-no-listener-{}-", std::process::id())),
+            "the pin must be this process's no-listener path, got {}",
+            attach[0]
+        );
+        assert!(
+            !std::path::Path::new(attach[0]).exists(),
+            "the pinned endpoint must not exist, or a connect could succeed"
+        );
+    }
+
+    /// Scenario: Ask for the bare pins and assert both endpoint variables are
+    /// present, distinct, and not the fallback a child would otherwise resolve.
+    #[test]
+    fn unreachable_endpoints_pin_both_routes_away_from_the_fallback() {
+        let pins = unreachable_endpoints();
+        let names: Vec<&str> = pins.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(names, PINNED_ENDPOINT_VARS);
+        assert_ne!(pins[0].1, pins[1].1, "hook and attach pins must differ");
+        for (_, value) in &pins {
+            assert!(
+                !value.ends_with("/dot-agent-deck.sock"),
+                "a pin must not be the default hook endpoint: {value}"
             );
         }
     }

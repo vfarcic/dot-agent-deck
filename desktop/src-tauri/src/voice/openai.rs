@@ -313,7 +313,9 @@ mod tests {
                 "choose_mode",
                 "choose_agent_type",
                 "name_new_agent",
+                "choose_deck",
                 "start_new_agent",
+                "discard_new_agent",
                 "stop_agent",
                 "close_orchestration",
                 "none"

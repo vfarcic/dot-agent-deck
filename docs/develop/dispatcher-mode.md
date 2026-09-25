@@ -6,7 +6,7 @@
 
 Dispatcher mode is a built-in seeded mode whose seed teaches an agent one extra effector: the `dispatch` CLI subcommand. The seed is deliberately scoped to **Agent Deck mechanics, not work methodology** — what the verb is, what it does, and the constraints that follow from process isolation. It holds no opinion on how the user should split up their work, matching the two schedule-authoring seeds.
 
-An earlier version cast the pane as a *planner* that had to decompose a goal into 2–6 independent units and never do work itself. That was cut: it made the pane refuse ordinary requests, and the "don't do the work" clause forbade it from doing anything else the user asked. See the Design record in [PRD #220](https://github.com/vfarcic/dot-agent-deck/blob/main/prds/220-dispatcher-mode-worktree-dispatch.md). Pinned by `dispatcher_seed_teaches_mechanics_not_work_methodology`.
+An earlier version cast the pane as a *planner* that had to decompose a goal into 2–6 independent units and never do work itself. That was cut: it made the pane refuse ordinary requests, and the "don't do the work" clause forbade it from doing anything else the user asked. See the Design record in [PRD #220](https://github.com/vfarcic/dot-agent-deck/blob/main/prds/done/220-dispatcher-mode-worktree-dispatch.md). Pinned by `dispatcher_seed_teaches_mechanics_not_work_methodology`.
 
 Several dispatches from one pane are normal and are **not** decomposition: working on three PRDs in parallel is three dispatches of three things the user named.
 

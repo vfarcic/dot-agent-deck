@@ -277,7 +277,7 @@ fn orchestration_007_ctrl_l_toggles_pane_column_split() {
 /// Enter. `cat -v` renders the received control byte as the two characters
 /// `^L`, so the pane echoes `<sentinel>^L` only if the raw `0x0c` actually
 /// reached the PTY. `Action::ToggleOrchestrationSplit` must not claim `Ctrl+l`
-/// off an orchestration tab (`scope_orchestration_split`), otherwise the
+/// off an orchestration tab (`scope_orchestration_chord`), otherwise the
 /// keystroke is swallowed — the dispatcher no-ops there — and the pane never
 /// sees the byte. Regression guard for the Greptile P1 on PR #342.
 ///

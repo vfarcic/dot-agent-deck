@@ -218,7 +218,7 @@ const agents: AgentSession[] = [
     diff: [],
     checks: [{ id: "plan-contract", name: "Acceptance contract", status: "passed", duration: "0.2s" }],
     handoffIds: ["ev-plan"],
-    artifacts: [{ id: "prd", name: "Desktop GUI PRD", kind: "file", path: "prds/176-desktop-gui.md" }],
+    artifacts: [{ id: "prd", name: "Desktop GUI PRD", kind: "file", path: "prds/done/176-desktop-gui.md" }],
   },
   {
     id: "builder",
@@ -630,7 +630,7 @@ const crowdedAgents: AgentSession[] = [
   // prompt event yet. Both columns stay blank, which is the case the screen has
   // to look right for.
   crowdedAgent({ id: "13", displayName: "Scratch shell", role: "Codex", cli: "codex", status: "waiting", cwd: DECK_CWD, toolCount: 2, tab: { kind: "dashboard" } }),
-  crowdedAgent({ id: "1", displayName: "orchestrator", role: "Orchestrator", cli: "claude", status: "running", cwd: PRD_CWD, toolCount: 47, upForMinutes: 194, quietForMinutes: 0, activeTool: "read", activeToolDetail: "prds/745-desktop-agent-overview-landing-screen.md", writeLease: "write", lastUserPrompt: "Run PRD 745 to done: delegate each milestone and verify the gates yourself.", tab: orchestrationTab("orc-745", "dot-agent-deck", "PRD 745 · agent overview", "orchestrator", 0, true, PRD_CWD) }),
+  crowdedAgent({ id: "1", displayName: "orchestrator", role: "Orchestrator", cli: "claude", status: "running", cwd: PRD_CWD, toolCount: 47, upForMinutes: 194, quietForMinutes: 0, activeTool: "read", activeToolDetail: "prds/done/745-desktop-agent-overview-landing-screen.md", writeLease: "write", lastUserPrompt: "Run PRD 745 to done: delegate each milestone and verify the gates yourself.", tab: orchestrationTab("orc-745", "dot-agent-deck", "PRD 745 · agent overview", "orchestrator", 0, true, PRD_CWD) }),
   // History-only: a wrapped session the deck can replay but cannot type into.
   crowdedAgent({ id: "11", displayName: "Second opinion", role: "Open code", cli: "opencode", status: "running", cwd: DECK_CWD, toolCount: 33, upForMinutes: 12, quietForMinutes: 1, activeTool: "read", activeToolDetail: "src/state.rs", writeLease: "read", lastUserPrompt: "Read the daemon state module and tell me which fields never reach the desktop.", tab: { kind: "mode", name: "review" } }),
   crowdedAgent({ id: "5", displayName: "docs", role: "Docs", cli: "codex", status: "waiting", cwd: PRD_CWD, toolCount: 0, upForMinutes: 58, quietForMinutes: 34, writeLease: "write", tab: orchestrationTab("orc-745", "dot-agent-deck", "PRD 745 · agent overview", "docs", 4, false, PRD_CWD) }),
@@ -982,17 +982,26 @@ const FIXTURE_VOICE_COMMANDS: ReadonlyArray<{
     phrases: ["show me every agent", "show me all the agents", "show me everything"],
     action: "open_overview",
     invoke: "openOverview",
-    screens: ["deck"],
-    unavailableHint: "the agent overview opens from the deck",
+    screens: ["deck", "overview"],
+    unavailableHint: "the agent overview opens from the rail once the agent's pane is closed",
     report: "Opening the agent overview.",
   },
   {
     phrases: ["go back to the deck", "back to the deck", "show me the terminals"],
     action: "open_deck",
     invoke: "openDeck",
-    screens: ["overview"],
-    unavailableHint: "returning to the deck works from the agent overview",
+    screens: ["deck", "overview"],
+    unavailableHint: "the deck opens from the rail once the agent's pane is closed",
     report: "Back to the deck.",
+  },
+  {
+    // Both screens, because the one rail offers Settings on both (#1197).
+    phrases: ["open settings", "settings", "open the settings"],
+    action: "open_settings",
+    invoke: "openSettings",
+    screens: ["deck", "overview"],
+    unavailableHint: "settings open from the rail once the agent's pane is closed",
+    report: "Opening settings.",
   },
   {
     // The VIEW, never the terminal pane — the same line `commands.toml` draws at

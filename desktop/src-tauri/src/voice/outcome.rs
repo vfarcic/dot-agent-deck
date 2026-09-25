@@ -46,7 +46,9 @@ use super::dictation::{
     DICTATION_OPENERS, SUBMIT_PHRASES, opening_with, strip_opening, whole_utterance_is,
 };
 use super::resolver::{IntentError, IntentRequest, IntentResolver};
-use super::schema::{LABELS_WITHHELD_HINT, annotate_for, needs_labels};
+use super::schema::{
+    DECK_HIDDEN_HINT, LABELS_WITHHELD_HINT, annotate_for, hidden_by_flag, needs_labels,
+};
 use super::table::{
     ActionGrounding, CommandRow, CommandTable, ParamKind, Requirement, Screen, spoken_words,
 };
@@ -300,6 +302,17 @@ impl VoiceOutcome {
     /// The action exists and needs names the voice settings withhold (PRD
     /// #1223, audit finding A1) — [`VoiceOutcome::unavailable`]'s shape with
     /// [`LABELS_WITHHELD_HINT`] in place of the row's own hint.
+    /// Issue #1198 — a pick of the row whose screen the experimental flag
+    /// hides, refused with [`DECK_HIDDEN_HINT`] rather than dispatched.
+    fn hidden_by_flag(transcript: Transcript, row: &CommandRow) -> Self {
+        Self::Unavailable {
+            sentence: format!("Not here — {DECK_HIDDEN_HINT}."),
+            action: row.id.clone(),
+            hint: DECK_HIDDEN_HINT.to_string(),
+            transcript,
+        }
+    }
+
     fn labels_withheld(transcript: Transcript, row: &CommandRow) -> Self {
         Self::Unavailable {
             sentence: format!("Not here — {LABELS_WITHHELD_HINT}."),
@@ -416,6 +429,10 @@ pub async fn handle_utterance(
         new_agent,
         transcript,
         LabelSharing::Shared,
+        // The deck SHOWN — the experimental configuration, and the one the
+        // phrase fixtures and this module's tests resolve against. The shipped
+        // app calls `handle_utterance_with` with the flag's own answer.
+        true,
     )
     .await
 }
@@ -443,6 +460,14 @@ pub async fn handle_utterance(
 /// question about the screen, not about what the model was told. That is also
 /// why the command table still carries a `callable` flag per row, and the
 /// voice panel's disclosure says so.
+///
+/// # `show_deck` (issue #1198)
+///
+/// `false` while the experimental flag hides the deck: the row that goes there
+/// is offered `callable: false` with [`DECK_HIDDEN_HINT`], and picked anyway it
+/// is [`VoiceOutcome::Unavailable`] with that hint. Held to the transcript
+/// first, like every row, so a pick the user did not ask for is still answered
+/// as that. `desktop_voice_resolve` passes `features::show_desktop_deck()`.
 #[allow(clippy::too_many_arguments)]
 pub async fn handle_utterance_with(
     resolver: &dyn IntentResolver,
@@ -454,6 +479,7 @@ pub async fn handle_utterance_with(
     new_agent: Option<&VoiceNewAgent>,
     transcript: Transcript,
     labels: LabelSharing,
+    show_deck: bool,
 ) -> VoiceResult {
     let withheld = labels == LabelSharing::Withheld;
     let backend = resolver.backend_name();
@@ -477,7 +503,7 @@ pub async fn handle_utterance_with(
         return finish(outcome, None);
     }
 
-    let commands = annotate_for(table, screen, directories, new_agent, labels);
+    let commands = annotate_for(table, screen, directories, new_agent, labels, show_deck);
     // Only the decks the New agent dialog could preselect (PRD #1223): a deck
     // it shows disabled is not offered, so the model cannot pick one. The full
     // fleet is still what a supplied deck resolves against, so a deck the user
@@ -542,6 +568,13 @@ pub async fn handle_utterance_with(
             grounding,
             &answer.params,
         ));
+    }
+
+    // Issue #1198: the deck is hidden, so the row that goes there is refused
+    // with that reason — ahead of the screen check, whose own hint ("opens
+    // from the rail") would name a door the rail does not have.
+    if hidden_by_flag(row, show_deck) {
+        return finish(VoiceOutcome::hidden_by_flag(transcript, row));
     }
 
     // The screen AND the row's `requires` (PRD #1223): a directory row picked
@@ -2982,6 +3015,7 @@ mod tests {
             new_agent,
             Transcript::new(said),
             labels,
+            true,
         )
         .await
         .outcome
@@ -6399,9 +6433,12 @@ mod tests {
     /// Scenario: with the New agent dialog open and filled, the user says
     /// "name it back-end worker" or "call it deck-helper" while an observed
     /// name steers the model to `open_deck` — which would leave the overview
-    /// and unmount the dialog with its form. Refused; "go back to the deck"
-    /// said on its own still goes, and a bare "go back" over the dialog does
-    /// not, since a user filling a form may mean the dialog or the parent.
+    /// and unmount the dialog with its form (and, since #1247, with the draft
+    /// the overview keeps). Refused; "go back to the deck" said on its own
+    /// still goes, and a bare "go back" over the dialog does not, since a user
+    /// filling a form may mean the dialog or the parent. Nor does a bare "deck"
+    /// or "the deck" since #1263: over the dialog that is its Deck field's
+    /// label, whose row is `choose_deck`.
     #[tokio::test]
     async fn voice_outcome_a_deck_word_in_passing_does_not_leave_the_new_agent_dialog() {
         let form = new_agent_form();
@@ -6429,6 +6466,8 @@ mod tests {
             "go back",
             "back",
             "take me back",
+            "deck",
+            "the deck please",
         ] {
             let outcome = ask(said).await;
             assert!(
@@ -6441,7 +6480,7 @@ mod tests {
         for said in [
             "go back to the deck",
             "Okay, back to the deck.",
-            "the deck please",
+            "show the deck please",
         ] {
             let outcome = ask(said).await;
             assert!(
@@ -6453,6 +6492,45 @@ mod tests {
         let resolver = StubResolver::new().answering("go back", IntentAnswer::new("open_deck"));
         let outcome = run(&resolver, Screen::Overview, &fleet(), "go back").await;
         assert!(outcome.is_dispatch(), "{outcome:?}");
+    }
+
+    /// Scenario: on the overview with the deck hidden (issue #1198), the user
+    /// says "take me back to the deck" and the model answers `open_deck`
+    /// anyway. It is refused as unavailable, naming the flag, rather than
+    /// dispatched — and a pick the user did not ask for is still refused as
+    /// that first.
+    #[tokio::test]
+    async fn voice_outcome_refuses_the_deck_while_it_is_hidden() {
+        let ask = |said: &'static str| async move {
+            let resolver = StubResolver::new().answering(said, IntentAnswer::new("open_deck"));
+            handle_utterance_with(
+                &resolver,
+                table(),
+                Screen::Overview,
+                &fleet(),
+                &decks(),
+                None,
+                None,
+                Transcript::new(said),
+                LabelSharing::Shared,
+                false,
+            )
+            .await
+            .outcome
+        };
+        let outcome = ask("take me back to the deck").await;
+        assert_eq!(
+            outcome,
+            VoiceOutcome::Unavailable {
+                sentence: format!("Not here — {DECK_HIDDEN_HINT}."),
+                action: "open_deck".to_string(),
+                hint: DECK_HIDDEN_HINT.to_string(),
+                transcript: Transcript::new("take me back to the deck"),
+            }
+        );
+        assert!(
+            matches!(ask("open docs").await, VoiceOutcome::ActionUngrounded { action, .. } if action == "open_deck")
+        );
     }
 
     #[test]
@@ -6556,6 +6634,199 @@ mod tests {
         )
         .await
         .outcome
+    }
+
+    // -- the deck field and Discard (#1263, #1247) ---------------------------
+
+    /// Scenario: the New agent dialog is open — with no directory chosen yet,
+    /// and again over a live form — and the user says "use the build box
+    /// deck". `choose_deck` dispatches the deck resolved against the observed
+    /// fleet, and the report names it the way the screen does. With the dialog
+    /// closed the same pick is not here, and it says where it works.
+    #[tokio::test]
+    async fn voice_outcome_choose_deck_dispatches_the_named_deck_while_the_dialog_is_open() {
+        let said = "use the build box deck";
+        let answer = || IntentAnswer::new("choose_deck").with_param("deck", "build box");
+        for declared in [VoiceNewAgent { form: None }, new_agent_form()] {
+            let outcome =
+                heard_as_user_said(said, answer(), Screen::Overview, &fleet(), Some(&declared))
+                    .await;
+            let VoiceOutcome::Dispatch {
+                invoke,
+                params,
+                sentence,
+                ..
+            } = &outcome
+            else {
+                panic!("expected a dispatch, got {outcome:?}");
+            };
+            assert_eq!(invoke, "chooseNewAgentDeck");
+            assert_eq!(params.len(), 1);
+            assert_eq!(params[0].kind, ParamKind::DeckRef);
+            assert_eq!(params[0].value, "deck-build");
+            assert_eq!(sentence, "Deck: deploy@build-box.example.com:2222.");
+        }
+        let closed = heard_as_user_said(said, answer(), Screen::Overview, &fleet(), None).await;
+        assert!(
+            matches!(&closed, VoiceOutcome::Unavailable { action, .. } if action == "choose_deck"),
+            "{closed:?}"
+        );
+    }
+
+    /// Scenario: over the open dialog the user says something that is not
+    /// about a deck — "use this directory", "use claude", "open docs", "call
+    /// it billing worker" — while an observed name steers the model to
+    /// `choose_deck`, which would throw away the chosen directory. Refused:
+    /// the row is grounded only by the word "deck", so an observed name
+    /// cannot switch the deck on its own. "deck local" still does.
+    #[tokio::test]
+    async fn voice_outcome_a_steered_deck_change_needs_the_word_deck() {
+        let form = new_agent_form();
+        for said in [
+            "use this directory",
+            "use claude",
+            "open docs",
+            "call it billing worker",
+            "switch to local",
+        ] {
+            let outcome = heard_as_user_said(
+                said,
+                IntentAnswer::new("choose_deck").with_param("deck", "local"),
+                Screen::Overview,
+                &fleet(),
+                Some(&form),
+            )
+            .await;
+            assert!(
+                matches!(&outcome, VoiceOutcome::ActionUngrounded { action, .. } if action == "choose_deck"),
+                "{said}: {outcome:?}"
+            );
+        }
+        let outcome = heard_as_user_said(
+            "deck local",
+            IntentAnswer::new("choose_deck").with_param("deck", "local"),
+            Screen::Overview,
+            &fleet(),
+            Some(&form),
+        )
+        .await;
+        assert!(
+            matches!(&outcome, VoiceOutcome::Dispatch { params, .. } if params[0].value == "deck-local"),
+            "{outcome:?}"
+        );
+    }
+
+    /// Scenario: the user names a deck the dialog's field shows disabled. The
+    /// deck is REQUIRED on this row, unlike `open_new_agent`'s, so nothing is
+    /// dispatched and the refusal gives the field's own reason; a deck that
+    /// matches nothing, or two, is refused the same way rather than guessed.
+    #[tokio::test]
+    async fn voice_outcome_choose_deck_refuses_a_deck_it_cannot_choose() {
+        let mut fleet_decks = decks();
+        fleet_decks.push(unavailable_deck(
+            "deck-stale",
+            "ci@stale-box",
+            false,
+            "No deck is listening on the configured socket.",
+        ));
+        let dialog = VoiceNewAgent { form: None };
+        let ask = |said: &'static str, spoken: &'static str| {
+            let fleet_decks = fleet_decks.clone();
+            let dialog = dialog.clone();
+            async move {
+                let resolver = StubResolver::new().answering(
+                    said,
+                    IntentAnswer::new("choose_deck").with_param("deck", spoken),
+                );
+                handle_utterance(
+                    &resolver,
+                    table(),
+                    Screen::Overview,
+                    &fleet(),
+                    &fleet_decks,
+                    None,
+                    Some(&dialog),
+                    Transcript::new(said),
+                )
+                .await
+                .outcome
+            }
+        };
+        let stale = ask("use the stale box deck", "stale box").await;
+        assert!(
+            matches!(&stale, VoiceOutcome::ParamUnresolved { sentence, .. }
+                if sentence.contains("cannot take a new agent") && sentence.contains("No deck is listening")),
+            "{stale:?}"
+        );
+        let ghost = ask("use the ghost deck", "ghost").await;
+        assert!(
+            matches!(&ghost, VoiceOutcome::ParamUnresolved { .. }),
+            "{ghost:?}"
+        );
+        let build = ask("use the build deck", "build").await;
+        assert!(
+            matches!(&build, VoiceOutcome::ParamAmbiguous { .. }),
+            "{build:?}"
+        );
+        // Named by the field's heading alone, it names no deck: asked, not guessed.
+        let bare = heard_as_user_said(
+            "Deck",
+            IntentAnswer::new("choose_deck"),
+            Screen::Overview,
+            &fleet(),
+            Some(&dialog),
+        )
+        .await;
+        assert!(
+            matches!(&bare, VoiceOutcome::ParamMissing { .. }),
+            "{bare:?}"
+        );
+    }
+
+    /// Scenario: over the filled form the user says "discard", or reads the
+    /// button's accessible name; the form is thrown away. Said inside another
+    /// request — "name it discard worker" — with the model steered to discard,
+    /// it is refused, because Discard cannot be taken back. And "cancel" never
+    /// grounds it: that is `close`, which keeps the form as a draft.
+    #[tokio::test]
+    async fn voice_outcome_discard_needs_the_whole_utterance() {
+        let form = new_agent_form();
+        for said in ["discard", "Discard new agent", "okay, discard the form"] {
+            let outcome = heard_as_user_said(
+                said,
+                IntentAnswer::new("discard_new_agent"),
+                Screen::Overview,
+                &fleet(),
+                Some(&form),
+            )
+            .await;
+            assert!(
+                matches!(&outcome, VoiceOutcome::Dispatch { invoke, sentence, .. }
+                    if invoke == "discardNewAgent" && sentence == "Discarded the New agent form."),
+                "{said}: {outcome:?}"
+            );
+        }
+        for said in [
+            "name it discard worker",
+            "cancel",
+            "never mind",
+            "discard it and start over",
+        ] {
+            let outcome = heard_as_user_said(
+                said,
+                IntentAnswer::new("discard_new_agent"),
+                Screen::Overview,
+                &fleet(),
+                Some(&form),
+            )
+            .await;
+            assert!(
+                matches!(&outcome, VoiceOutcome::ActionUngrounded { action, .. } if action == "discard_new_agent"),
+                "{said}: {outcome:?}"
+            );
+        }
+        let close = table().row("close").expect("present");
+        assert!(action_grounded(close, "cancel", None, Some(&form)));
     }
 
     /// Scenario: on the overview, with the `billing` orchestration's planner
@@ -6761,6 +7032,8 @@ mod tests {
     /// rather than silently leaving the old words as the only spoken form.
     const NEW_AGENT_DIALOG_TSX: &str = include_str!("../../../src/components/NewAgentDialog.tsx");
     const AGENT_OVERVIEW_TSX: &str = include_str!("../../../src/components/AgentOverview.tsx");
+    /// The one rail, shown beside the overview as well as the deck (#1197).
+    const NAVIGATION_RAIL_TSX: &str = include_str!("../../../src/components/NavigationRail.tsx");
     const NEW_AGENT_TS: &str = include_str!("../../../src/lib/newAgent.ts");
 
     /// Where a label lives, as the literal the source renders it from.
@@ -6778,11 +7051,11 @@ mod tests {
         over_the_form: bool,
     }
 
-    /// Every visible label on the New agent dialog and the overview whose
-    /// control has a voice row, with that row. `docs/develop/voice-first-design.md`
+    /// Every visible label on the New agent dialog and the overview — its rail
+    /// included — whose control has a voice row, with that row. `docs/develop/voice-first-design.md`
     /// section 5 has the rule; the labels left out on purpose are listed there
     /// with their reasons.
-    const CONTROL_LABELS: [ControlLabel; 16] = [
+    const CONTROL_LABELS: [ControlLabel; 21] = [
         ControlLabel {
             source: "\"Start orchestration\"",
             file: NEW_AGENT_DIALOG_TSX,
@@ -6809,6 +7082,31 @@ mod tests {
             file: NEW_AGENT_DIALOG_TSX,
             said: "Close new agent",
             row: "close",
+            over_the_form: true,
+        },
+        // Issue #1247 — the Discard button: its label and its accessible name.
+        ControlLabel {
+            source: "<Trash2 size={14} /> Discard",
+            file: NEW_AGENT_DIALOG_TSX,
+            said: "Discard",
+            row: "discard_new_agent",
+            over_the_form: true,
+        },
+        ControlLabel {
+            source: "aria-label=\"Discard new agent\"",
+            file: NEW_AGENT_DIALOG_TSX,
+            said: "Discard new agent",
+            row: "discard_new_agent",
+            over_the_form: true,
+        },
+        // Issue #1263 — the deck field's heading. Said alone it names no deck,
+        // so it reaches `choose_deck`'s "which deck"; "deck build box" is the
+        // label with a value, as "mode schedule" is for the Mode row.
+        ControlLabel {
+            source: "<h3 id={`${titleId}-deck`}>Deck</h3>",
+            file: NEW_AGENT_DIALOG_TSX,
+            said: "Deck",
+            row: "choose_deck",
             over_the_form: true,
         },
         ControlLabel {
@@ -6869,9 +7167,23 @@ mod tests {
         },
         ControlLabel {
             source: "label=\"Deck\"",
-            file: AGENT_OVERVIEW_TSX,
+            file: NAVIGATION_RAIL_TSX,
             said: "Deck",
             row: "open_deck",
+            over_the_form: false,
+        },
+        ControlLabel {
+            source: "label=\"Overview\"",
+            file: NAVIGATION_RAIL_TSX,
+            said: "Overview",
+            row: "open_overview",
+            over_the_form: false,
+        },
+        ControlLabel {
+            source: "label=\"Settings\"",
+            file: NAVIGATION_RAIL_TSX,
+            said: "Settings",
+            row: "open_settings",
             over_the_form: false,
         },
         ControlLabel {

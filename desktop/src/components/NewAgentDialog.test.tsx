@@ -3,7 +3,8 @@ import { describe, expect, it, vi } from "vitest";
 import { createFixtureSnapshot, createFixtureStartedAgent } from "../data/fixture";
 import type { AgentSession, ConnectionView, DeckDirectoryListing, DeckSnapshot, NewAgentOptions, NewAgentOrchestrations } from "../types";
 import { LaunchCleanupError } from "../lib/actionError";
-import { NewAgentDialog, type NewAgentRuntime } from "./NewAgentDialog";
+import type { NewAgentDraft } from "../lib/newAgentDraft";
+import { NewAgentDialog, DRAFT_DIRECTORY_GONE, DRAFT_MODE_GONE, DRAFT_RESTORED, draftDeckGone, draftOtherDeck, type NewAgentRuntime } from "./NewAgentDialog";
 
 const LOCAL = "deck-000000000000aaaa";
 const REMOTE = "deck-000000000000bbbb";
@@ -66,7 +67,7 @@ function fakeRuntime(overrides: Partial<NewAgentRuntime> = {}) {
 
 type FakeRuntime = ReturnType<typeof fakeRuntime>;
 
-function renderDialog(runtime: FakeRuntime, props: { initialDeckId?: string; appearTimeoutMs?: number } = {}) {
+function renderDialog(runtime: FakeRuntime, props: { initialDeckId?: string; appearTimeoutMs?: number; draft?: NewAgentDraft } = {}) {
   const onClose = vi.fn();
   const onAppeared = vi.fn();
   const onNotAppeared = vi.fn();
@@ -173,6 +174,7 @@ describe("New agent dialog — one surface (PRD #1223, the voice-first redesign)
       "new-agent-mode-none",
       "new-agent-name",
       "new-agent-command",
+      "new-agent-discard",
       "new-agent-start",
     ]);
   });
@@ -447,8 +449,9 @@ describe("New agent dialog — going up (PRD #1223 U3)", () => {
   /**
    * Scenario: browse into `beta`. The browser offers Use this directory and
    * no Up button; the `..` row is what goes up, and clicking it lists the
-   * reply's parent with the cursor back on `beta`. The footer carries Start
-   * and nothing else — no Back, since there is no step to go back to.
+   * reply's parent with the cursor back on `beta`. The footer carries Discard
+   * (#1247) and Start and nothing else — no Back, since there is no step to go
+   * back to.
    */
   it("goes up by the .. row, with no Up button anywhere", async () => {
     const runtime = fakeRuntime();
@@ -460,7 +463,7 @@ describe("New agent dialog — going up (PRD #1223 U3)", () => {
 
     const flow = screen.getByTestId("new-agent-dialog");
     expect(within(flow).queryByRole("button", { name: /^up$/i })).toBeNull();
-    expect(within(flow.querySelector("footer")!).getAllByRole("button").map((button) => button.textContent?.trim())).toEqual(["Start agent"]);
+    expect(within(flow.querySelector("footer")!).getAllByRole("button").map((button) => button.textContent?.trim())).toEqual(["Discard", "Start agent"]);
     expect(within(screen.getByTestId("new-agent-directory-panel")).getAllByRole("button").map((button) => button.textContent?.trim())).toEqual(["Use this directory"]);
     const up = within(directoryList()).getAllByRole("option")[0];
     expect(up).toHaveTextContent("..");
@@ -1507,3 +1510,285 @@ function cleanupAndRender(runtime: FakeRuntime) {
   cleanup();
   return renderDialog(runtime);
 }
+
+describe("New agent dialog — a draft that survives a close (issue 1247)", () => {
+  const LEAF = { path: "/home/dev/beta/leaf", displayPath: "/home/dev/beta/leaf" };
+  /** A draft on the local deck, with `leaf` chosen and both fields edited. */
+  const saved = (patch: Partial<NewAgentDraft> = {}): NewAgentDraft => ({
+    deckId: LOCAL,
+    deckName: "Local deck",
+    browsing: LEAF.path,
+    directory: LEAF,
+    mode: "none",
+    name: "mine",
+    nameTouched: true,
+    command: "pi --fast",
+    commandTouched: true,
+    ...patch,
+  });
+  const restored = () => screen.queryByTestId("new-agent-restored");
+  const pressedMode = () => screen.getByTestId("new-agent-modes").querySelector("[aria-pressed='true']")?.getAttribute("data-mode");
+
+  const CLOSES: Record<string, () => void> = {
+    Escape: () => fireEvent.keyDown(screen.getByTestId("new-agent-dialog"), { key: "Escape" }),
+    "a backdrop click": () => fireEvent.mouseDown(screen.getByTestId("new-agent-backdrop")),
+    "the close button": () => fireEvent.click(screen.getByRole("button", { name: "Close new agent" })),
+    "the browser's q": () => fireEvent.keyDown(directoryList(), { key: "q" }),
+  };
+
+  /**
+   * Scenario: choose a directory, type a Name, edit the Command, then close
+   * the dialog by each route it has. Every one hands the form back as a draft
+   * — its deck, the directory, and both edits marked as edits — instead of
+   * closing with nothing, which is what threw a filled form away.
+   */
+  it.each(Object.keys(CLOSES))("hands the form back as a draft when closed by %s", async (route) => {
+    const { onClose } = renderDialog(fakeRuntime());
+    await reachForm();
+    fireEvent.change(screen.getByTestId("new-agent-name"), { target: { value: "mine" } });
+    fireEvent.change(screen.getByTestId("new-agent-command"), { target: { value: "pi --fast" } });
+    // `q` is a letter in a text field, so the browser's own key needs focus there.
+    if (route === "the browser's q") directoryList().focus();
+
+    CLOSES[route]();
+
+    expect(onClose).toHaveBeenCalledTimes(1);
+    expect(onClose.mock.calls[0][0]).toEqual(saved());
+  });
+
+  /**
+   * Scenario: fill the form and press Discard. The dialog closes and hands
+   * back nothing, so the next open is a fresh form.
+   */
+  it("hands back nothing on Discard", async () => {
+    const { onClose } = renderDialog(fakeRuntime());
+    await reachForm();
+    fireEvent.change(screen.getByTestId("new-agent-name"), { target: { value: "mine" } });
+
+    fireEvent.click(screen.getByRole("button", { name: "Discard new agent" }));
+
+    expect(onClose).toHaveBeenCalledTimes(1);
+    expect(onClose.mock.calls[0][0]).toBeUndefined();
+  });
+
+  /**
+   * Scenario: close an untouched dialog. There is nothing worth keeping
+   * beyond the one deck a fresh open would choose anyway, so the draft is only
+   * that deck, and reopening it says nothing about a restore.
+   */
+  it("keeps only the deck of an untouched form, and restores it silently", async () => {
+    const { onClose } = renderDialog(fakeRuntime());
+    await currentPath("/home/dev");
+    fireEvent.keyDown(screen.getByTestId("new-agent-dialog"), { key: "Escape" });
+    const draft = onClose.mock.calls[0][0] as NewAgentDraft;
+    expect(draft).toMatchObject({ deckId: LOCAL, nameTouched: false, commandTouched: false, mode: "none" });
+    expect(draft.directory).toBeUndefined();
+
+    cleanup();
+    renderDialog(fakeRuntime(), { draft });
+    await currentPath("/home/dev");
+    expect(restored()).toBeNull();
+  });
+
+  /**
+   * Scenario: open the dialog with a draft. The deck is asked again for its
+   * options and for the saved directory's listing, the directory is chosen
+   * again by the path the deck returns, and the typed Name and Command are put
+   * back as typed. A notice says the form was restored and how to clear it.
+   */
+  it("replays a draft against fresh answers from the deck", async () => {
+    const runtime = fakeRuntime();
+    renderDialog(runtime, { draft: saved() });
+
+    await waitFor(() => expect(screen.getByTestId("new-agent-dir")).toHaveTextContent(LEAF.path));
+    expect(runtime.newAgentOptions).toHaveBeenCalledWith(LOCAL);
+    expect(runtime.listDirectories).toHaveBeenCalledWith(LOCAL, LEAF.path);
+    await currentPath(LEAF.path);
+    expect(screen.getByTestId("new-agent-name")).toHaveValue("mine");
+    expect(screen.getByTestId("new-agent-command")).toHaveValue("pi --fast");
+    expect(screen.getByTestId("new-agent-name")).toBeEnabled();
+    expect(restored()).toHaveTextContent(DRAFT_RESTORED);
+  });
+
+  /**
+   * Scenario: the draft's Command was the deck's seed, untouched, and the
+   * deck's default command has changed since. The reopened form shows what
+   * the deck says NOW, while an untouched Name follows the restored directory.
+   */
+  it("reseeds an untouched Command and Name rather than restoring stale ones", async () => {
+    const runtime = fakeRuntime({ newAgentOptions: vi.fn(async (): Promise<NewAgentOptions> => ({ ...structuredClone(DECK_OPTIONS), defaultCommand: "claude --new" })) });
+    renderDialog(runtime, { draft: saved({ name: "old", nameTouched: false, command: "old", commandTouched: false }) });
+
+    await waitFor(() => expect(screen.getByTestId("new-agent-dir")).toHaveTextContent(LEAF.path));
+    expect(screen.getByTestId("new-agent-command")).toHaveValue("claude --new");
+    expect(screen.getByTestId("new-agent-name")).toHaveValue("leaf");
+  });
+
+  /**
+   * Scenario: the saved directory is gone from the deck. The restore says so,
+   * chooses nothing, and opens the browser where a fresh form would — the
+   * deck's home — keeping the typed Name and Command.
+   */
+  it("drops a directory the deck no longer lists", async () => {
+    renderDialog(fakeRuntime(), { draft: saved({ browsing: "/gone", directory: { path: "/gone", displayPath: "/gone" } }) });
+
+    await currentPath("/home/dev");
+    expect(await screen.findByText(DRAFT_DIRECTORY_GONE)).toBeInTheDocument();
+    expect(screen.getByTestId("new-agent-dir")).toHaveTextContent("No directory chosen yet");
+    expect(screen.getByTestId("new-agent-name")).toHaveValue("mine");
+    expect(screen.getByTestId("new-agent-command")).toHaveValue("pi --fast");
+    expect(screen.queryByTestId("new-agent-directory-error")).toBeNull();
+  });
+
+  /**
+   * Scenario: the saved directory is gone and the draft had chosen a Mode on
+   * it. Both losses are named — the directory and the Mode — and the form is
+   * back on No mode.
+   */
+  it("names a saved Mode dropped along with its directory", async () => {
+    const runtime = fakeRuntime({ newAgentOptions: vi.fn(async (): Promise<NewAgentOptions> => ({ ...structuredClone(DECK_OPTIONS), authoringKinds: ["dispatcher"] })) });
+    renderDialog(runtime, { draft: saved({ browsing: "/gone", directory: { path: "/gone", displayPath: "/gone" }, mode: "dispatcher" }) });
+
+    await currentPath("/home/dev");
+    expect(await screen.findByText(DRAFT_DIRECTORY_GONE)).toBeInTheDocument();
+    expect(screen.getByText(DRAFT_MODE_GONE)).toBeInTheDocument();
+    expect(screen.getByTestId("new-agent-dir")).toHaveTextContent("No directory chosen yet");
+  });
+
+  /**
+   * Scenario: the deck can no longer list directories at all. The restore
+   * names the dropped directory and Mode, and the panel says the deck cannot
+   * list, as it does on a fresh form — rather than the directory vanishing
+   * without a word.
+   */
+  it("names the dropped directory when the deck can no longer list", async () => {
+    const runtime = fakeRuntime({ listDirectories: vi.fn(async (): Promise<DeckDirectoryListing> => ({ kind: "unsupported" })) });
+    renderDialog(runtime, { draft: saved({ mode: "dispatcher" }) });
+
+    expect(await screen.findByText(DRAFT_DIRECTORY_GONE)).toBeInTheDocument();
+    expect(screen.getByText(DRAFT_MODE_GONE)).toBeInTheDocument();
+    expect(screen.getByTestId("new-agent-no-browse")).toBeInTheDocument();
+    expect(screen.getByTestId("new-agent-dir")).toHaveTextContent("No directory chosen yet");
+    expect(screen.getByTestId("new-agent-name")).toHaveValue("mine");
+  });
+
+  /**
+   * Scenario: the draft was on the remote deck, which has since disconnected.
+   * It is not chosen — the field falls back to the only deck that can take a
+   * spawn — its directory is never asked of any deck, and a notice names the
+   * deck that was dropped. The typed Name survives.
+   */
+  it("drops a deck that can no longer take a spawn, keeping typed edits", async () => {
+    const runtime = fakeRuntime();
+    renderDialog(runtime, { draft: saved({ deckId: REMOTE, deckName: "dev@build-box" }) });
+
+    await currentPath("/home/dev");
+    expect(restored()).toHaveTextContent(draftDeckGone("dev@build-box", true));
+    expect(screen.getByTestId("new-agent-chosen-deck")).toBeVisible();
+    expect(runtime.listDirectories).not.toHaveBeenCalledWith(REMOTE, expect.anything());
+    expect(runtime.listDirectories).not.toHaveBeenCalledWith(expect.anything(), LEAF.path);
+    expect(screen.getByTestId("new-agent-name")).toHaveValue("mine");
+  });
+
+  /**
+   * Scenario: a draft on the remote deck, and the dialog opened from the local
+   * deck's header. The deck asked for wins; the draft keeps only its typed
+   * Name and Command, as a change of deck in the field does, and a notice
+   * says its directory was not restored.
+   */
+  it("lets the deck the flow was opened for outrank the draft's", async () => {
+    const runtime = fakeRuntime({ fleet: [deck(LOCAL, { deckKind: "local" }), deck(REMOTE)] });
+    renderDialog(runtime, { initialDeckId: LOCAL, draft: saved({ deckId: REMOTE, deckName: "dev@build-box" }) });
+
+    await currentPath("/home/dev");
+    expect(runtime.listDirectories).toHaveBeenCalledWith(LOCAL, undefined);
+    expect(runtime.newAgentOptions).not.toHaveBeenCalledWith(REMOTE);
+    expect(restored()).toHaveTextContent(draftOtherDeck("dev@build-box"));
+    expect(screen.getByTestId("new-agent-dir")).toHaveTextContent("No directory chosen yet");
+    expect(screen.getByTestId("new-agent-name")).toHaveValue("mine");
+  });
+
+  /**
+   * Scenario: the draft chose the project's `loop` orchestration with the
+   * Name untouched, and a run titled `Alpha-project-orchestrator-1` is now
+   * live on the deck. The chip is chosen again once the fresh orchestrations
+   * offer it, and the Name is regenerated against the live titles — not the
+   * one saved — exactly as a click on the chip would.
+   */
+  it("chooses a saved orchestration chip again once offered, regenerating an untouched Name", async () => {
+    const PROJECT = "/home/dev/Alpha-project";
+    const live: AgentSession = {
+      ...createFixtureStartedAgent({ id: "41", daemonId: LOCAL }),
+      tab: { kind: "orchestration", name: "loop", displayTitle: "Alpha-project-orchestrator-1", roleName: "planner", roleIndex: 0, isStartRole: true, orchestrationId: "run-41" },
+      inOrchestration: true,
+      isStartRole: true,
+    };
+    const runtime = fakeRuntime({
+      fleet: [deck(LOCAL, { deckKind: "local" }, [live]), deck(REMOTE, { status: "disconnected" })],
+      newAgentOrchestrations: vi.fn(async (): Promise<NewAgentOrchestrations> => ({ kind: "project", path: PROJECT, displayPath: PROJECT, displayName: "Alpha-project", orchestrations: [{ name: "loop", displayName: "loop", default: true, roles: [{ name: "planner", displayName: "planner", start: true }] }] })),
+    });
+    renderDialog(runtime, { draft: saved({ browsing: PROJECT, directory: { path: PROJECT, displayPath: PROJECT }, mode: "orch:loop", name: "Alpha-project-orchestrator-1", nameTouched: false }) });
+
+    await waitFor(() => expect(pressedMode()).toBe("orch:loop"));
+    expect(screen.getByTestId("new-agent-name")).toHaveValue("Alpha-project-orchestrator-2");
+    expect(screen.queryByTestId("new-agent-title-taken")).toBeNull();
+  });
+
+  /**
+   * Scenario: the draft chose `dispatcher`, and the deck no longer reports it
+   * can compose that authoring agent. The form comes back on No mode and says
+   * the saved Mode is not offered, rather than holding a chip nobody can see.
+   */
+  it("drops a saved Mode chip the fresh answers do not offer", async () => {
+    renderDialog(fakeRuntime(), { draft: saved({ mode: "dispatcher" }) });
+
+    expect(await screen.findByText(DRAFT_MODE_GONE)).toBeInTheDocument();
+    expect(pressedMode()).toBe("none");
+    expect(screen.queryByTestId("new-agent-mode-dispatcher")).toBeNull();
+  });
+
+  /**
+   * Scenario: the same draft on a deck that still composes `dispatcher`. The
+   * chip is pressed again and nothing is reported missing.
+   */
+  it("chooses a saved authoring chip again while the deck offers it", async () => {
+    const runtime = fakeRuntime({ newAgentOptions: vi.fn(async (): Promise<NewAgentOptions> => ({ ...structuredClone(DECK_OPTIONS), authoringKinds: ["dispatcher"] })) });
+    renderDialog(runtime, { draft: saved({ mode: "dispatcher" }) });
+
+    await waitFor(() => expect(pressedMode()).toBe("dispatcher"));
+    expect(screen.queryByText(DRAFT_MODE_GONE)).toBeNull();
+  });
+
+  /**
+   * Scenario: reopen with a draft whose listing the deck is slow to answer,
+   * and close again before it does. The draft handed back is the one saved —
+   * its directory and Mode included — not a form the restore had not reached.
+   */
+  it("keeps a restore still in flight when closed again", async () => {
+    const runtime = fakeRuntime({ listDirectories: vi.fn(() => new Promise<DeckDirectoryListing>(() => undefined)) });
+    const { onClose } = renderDialog(runtime, { draft: saved({ mode: "dispatcher" }) });
+    await waitFor(() => expect(runtime.listDirectories).toHaveBeenCalledWith(LOCAL, LEAF.path));
+
+    fireEvent.keyDown(screen.getByTestId("new-agent-dialog"), { key: "Escape" });
+
+    expect(onClose.mock.calls[0][0]).toEqual(saved({ mode: "dispatcher" }));
+  });
+
+  /**
+   * Scenario: start the agent; the deck accepts it and has not listed it yet,
+   * so the dialog is waiting. Closing now hands back nothing: that form has
+   * been started, and restoring it would invite a second start.
+   */
+  it("keeps nothing once the deck has accepted the start", async () => {
+    const { onClose } = renderDialog(fakeRuntime());
+    await reachForm();
+    fireEvent.change(screen.getByTestId("new-agent-name"), { target: { value: "mine" } });
+    fireEvent.click(screen.getByTestId("new-agent-start"));
+    await screen.findByTestId("new-agent-waiting");
+
+    fireEvent.keyDown(screen.getByTestId("new-agent-dialog"), { key: "Escape" });
+
+    expect(onClose).toHaveBeenCalledTimes(1);
+    expect(onClose.mock.calls[0][0]).toBeUndefined();
+  });
+});
