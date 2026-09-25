@@ -982,17 +982,26 @@ const FIXTURE_VOICE_COMMANDS: ReadonlyArray<{
     phrases: ["show me every agent", "show me all the agents", "show me everything"],
     action: "open_overview",
     invoke: "openOverview",
-    screens: ["deck"],
-    unavailableHint: "the agent overview opens from the deck",
+    screens: ["deck", "overview"],
+    unavailableHint: "the agent overview opens from the rail once the agent's pane is closed",
     report: "Opening the agent overview.",
   },
   {
     phrases: ["go back to the deck", "back to the deck", "show me the terminals"],
     action: "open_deck",
     invoke: "openDeck",
-    screens: ["overview"],
-    unavailableHint: "returning to the deck works from the agent overview",
+    screens: ["deck", "overview"],
+    unavailableHint: "the deck opens from the rail once the agent's pane is closed",
     report: "Back to the deck.",
+  },
+  {
+    // Both screens, because the one rail offers Settings on both (#1197).
+    phrases: ["open settings", "settings", "open the settings"],
+    action: "open_settings",
+    invoke: "openSettings",
+    screens: ["deck", "overview"],
+    unavailableHint: "settings open from the rail once the agent's pane is closed",
+    report: "Opening settings.",
   },
   {
     // The VIEW, never the terminal pane — the same line `commands.toml` draws at

@@ -67,7 +67,9 @@ outcome = "dispatch"
 [[fixtures]]
 name = "open-overview-unavailable"
 utterance = "show me everything"
-screen = "overview"
+# The agent screen: the one rail offers Overview on the deck and the overview
+# alike (#1197), and it is inert only behind an agent's modal pane.
+screen = "agent"
 action = "open_overview"
 outcome = "unavailable"
 
@@ -95,7 +97,8 @@ outcome = "dispatch"
 [[fixtures]]
 name = "open-deck-unavailable"
 utterance = "take me back to the terminals"
-screen = "deck"
+# The agent screen, for `open-overview-unavailable`'s reason (#1197).
+screen = "agent"
 action = "open_deck"
 outcome = "unavailable"
 
@@ -183,9 +186,10 @@ outcome = "dispatch"
 [[fixtures]]
 name = "open-settings-preferences"
 utterance = "change my preferences"
+# Callable here since #1197 put Settings in the overview's rail.
 screen = "overview"
 action = "open_settings"
-outcome = "unavailable"
+outcome = "dispatch"
 
 [[fixtures]]
 name = "open-settings-api-key"
@@ -197,16 +201,20 @@ outcome = "dispatch"
 [[fixtures]]
 name = "open-settings-overview-collision"
 utterance = "show me all the settings"
+# `open_overview` is callable here too since #1197, so "show me all" no longer
+# has the callability tie-break on its side; the settings word has to win.
 screen = "overview"
 action = "open_settings"
-outcome = "unavailable"
+outcome = "dispatch"
 
 [[fixtures]]
 name = "open-settings-deck-collision"
 utterance = "go back to settings"
+# Both rows are callable here since #1197; "back" is `open_deck`'s word on the
+# overview, and "go back to settings" must still reach Settings.
 screen = "overview"
 action = "open_settings"
-outcome = "unavailable"
+outcome = "dispatch"
 
 [[fixtures]]
 name = "open-settings-unavailable"

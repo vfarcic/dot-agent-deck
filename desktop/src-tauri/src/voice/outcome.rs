@@ -6761,6 +6761,8 @@ mod tests {
     /// rather than silently leaving the old words as the only spoken form.
     const NEW_AGENT_DIALOG_TSX: &str = include_str!("../../../src/components/NewAgentDialog.tsx");
     const AGENT_OVERVIEW_TSX: &str = include_str!("../../../src/components/AgentOverview.tsx");
+    /// The one rail, shown beside the overview as well as the deck (#1197).
+    const NAVIGATION_RAIL_TSX: &str = include_str!("../../../src/components/NavigationRail.tsx");
     const NEW_AGENT_TS: &str = include_str!("../../../src/lib/newAgent.ts");
 
     /// Where a label lives, as the literal the source renders it from.
@@ -6778,11 +6780,11 @@ mod tests {
         over_the_form: bool,
     }
 
-    /// Every visible label on the New agent dialog and the overview whose
-    /// control has a voice row, with that row. `docs/develop/voice-first-design.md`
+    /// Every visible label on the New agent dialog and the overview — its rail
+    /// included — whose control has a voice row, with that row. `docs/develop/voice-first-design.md`
     /// section 5 has the rule; the labels left out on purpose are listed there
     /// with their reasons.
-    const CONTROL_LABELS: [ControlLabel; 16] = [
+    const CONTROL_LABELS: [ControlLabel; 18] = [
         ControlLabel {
             source: "\"Start orchestration\"",
             file: NEW_AGENT_DIALOG_TSX,
@@ -6869,9 +6871,23 @@ mod tests {
         },
         ControlLabel {
             source: "label=\"Deck\"",
-            file: AGENT_OVERVIEW_TSX,
+            file: NAVIGATION_RAIL_TSX,
             said: "Deck",
             row: "open_deck",
+            over_the_form: false,
+        },
+        ControlLabel {
+            source: "label=\"Overview\"",
+            file: NAVIGATION_RAIL_TSX,
+            said: "Overview",
+            row: "open_overview",
+            over_the_form: false,
+        },
+        ControlLabel {
+            source: "label=\"Settings\"",
+            file: NAVIGATION_RAIL_TSX,
+            said: "Settings",
+            row: "open_settings",
             over_the_form: false,
         },
         ControlLabel {

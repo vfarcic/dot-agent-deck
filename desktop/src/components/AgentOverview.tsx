@@ -724,7 +724,7 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
    * harness rather than about the screen.
    */
   /**
-   * The SELECTED deck's connection — the Deck selector's, and the rail lamp's.
+   * The SELECTED deck's connection — the Deck selector's.
    *
    * It is `fleet[0]`'s and deliberately not an aggregate: `selectionFallback`
    * describes THE SELECTION rather than a deck ("the deck you chose is gone"),
@@ -800,7 +800,7 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
   const known = aggregate.decksUp > 0;
   const countOf = (status: AgentStatus) => aggregate.counts.find((entry) => entry.status === status)?.count ?? 0;
   /**
-   * PRD #802 M2 — the overview's two rail buttons, its "Open deck" controls and
+   * PRD #802 M2 — the overview's "Open deck" controls and
    * its row-level open all dispatch through the action registry. The context is
    * one member wide because that is all this screen can serve: the overlays, the
    * selection and the fixture loop belong to `DeckSurface`.
@@ -1047,17 +1047,7 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
   */
   const overviewScreen = (
     <div className="control-deck overview-screen">
-      <aside className="rail" aria-label="Primary navigation">
-        <div className="brand-mark" aria-label="Agent Deck"><span>AD</span><i aria-hidden="true" /></div>
-        <nav>
-          <OverviewRailButton icon={SquareTerminal} label="Deck" onClick={openDeck} testId="open-deck" />
-          <OverviewRailButton icon={LayoutList} label="Overview" active onClick={() => VOICE_ACTIONS.openOverview.run(voiceContext)} testId="open-overview" />
-        </nav>
-        <div className="rail-bottom">
-          <span className={`connection-lamp connection-${connection.status}`} title={connection.message ? displayText(connection.message, DISPLAY_LIMITS.message) : undefined} />
-        </div>
-      </aside>
-
+      {/* The rail is the shell's — one rail, rendered once, beside every screen (#1197). */}
       <main className="deck-main">
         <header className="topbar">
           <div className="repo-context">
@@ -2045,10 +2035,6 @@ function clickFinishedSelection(row: HTMLTableRowElement): boolean {
 
 function OverviewNote({ className, testId, icon, title, children }: { className?: string; testId: string; icon: ReactNode; title: string; children: ReactNode }) {
   return <div className={className ?? "overview-note"} data-testid={testId}>{icon}<h3>{title}</h3>{children}</div>;
-}
-
-function OverviewRailButton({ icon: Icon, label, active, onClick, testId }: { icon: typeof LayoutList; label: string; active?: boolean; onClick: () => void; testId: string }) {
-  return <button className={active ? "is-active" : ""} aria-current={active ? "page" : undefined} title={label} onClick={onClick} data-testid={testId}><Icon size={18} /><span>{label}</span></button>;
 }
 
 function OverviewInstrument({ label, children, testId }: { label: string; children: ReactNode; testId?: string }) {
