@@ -3,7 +3,9 @@ import { enterDeck, selectOverview } from "./support/overview";
 
 /** The navigation rail as a user sees it in the built browser app. */
 function rail(page: Page) {
-  return page.getByRole("complementary", { name: "Primary navigation" });
+  // The background becomes inert while an agent dialog is open, but its rail
+  // remains mounted in the DOM and must keep the same entries.
+  return page.locator('aside.rail[aria-label="Primary navigation"]');
 }
 
 test.describe("desktop navigation rail", () => {
