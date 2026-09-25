@@ -5689,7 +5689,7 @@ pub enum Action {
     /// Toggle the deck-global command-entry lock (Ctrl+E), which decides
     /// whether keystrokes reach a focused non-orchestrator role pane's PTY.
     /// Only ever reaches the handler from an Orchestration tab in command mode
-    /// — [`scope_command_entry_lock`] un-resolves it everywhere else.
+    /// — [`scope_orchestration_chord`] un-resolves it everywhere else.
     ToggleOrchestrationLock,
     /// PRD #336: toggle the orchestration sidebar/pane-column split between
     /// the default 34/66 ratio and the narrower-sidebar 25/75 (Ctrl+L). The
@@ -6366,7 +6366,7 @@ fn handle_pane_input_key(key: KeyEvent) -> Action {
 ///
 /// It names `Ctrl+D` **first**, and that is load-bearing rather than
 /// stylistic: this message is only ever shown from `UiMode::PaneInput`, which
-/// — since [`scope_command_entry_lock`] claims the chord in `UiMode::Normal`
+/// — since [`scope_orchestration_chord`] claims the chord in `UiMode::Normal`
 /// only — is precisely the mode where `Ctrl+E` alone does nothing. Naming just
 /// the unlock chord would instruct the user to press a chord that provably
 /// cannot work from where they are standing.
@@ -9087,7 +9087,7 @@ pub fn global_action(kb: &KeybindingConfig, key: &KeyEvent) -> Option<Action> {
         return Some(Action::ToggleLayout);
     }
     // PRD #336. This stays a pure chord→action mapping with no tab awareness;
-    // the orchestration-tab scoping is applied by `scope_orchestration_split`
+    // the orchestration-tab scoping is applied by `scope_orchestration_chord`
     // at the one dispatch site that has tab context. Resolving here and
     // narrowing there keeps this function a plain keybinding table.
     if kb.matches(KbAction::ToggleOrchestrationSplit, key) {
@@ -9157,35 +9157,61 @@ fn global_action_for_mode(kb: &KeybindingConfig, mode: UiMode, key: &KeyEvent) -
     }
 }
 
-/// Un-resolve `Ctrl+E` (`ToggleOrchestrationLock`) unless the active tab is an
-/// Orchestration tab **and** the deck is in command mode.
+/// Un-resolve an orchestration-scoped chord unless the active tab is an
+/// Orchestration tab **and** the deck is in command mode (issue #438).
 ///
-/// Same conflict class, and the same trade, as [`global_action_for_mode`]'s
-/// `CloseSelected` scoping above: `Ctrl+E` is `0x05`, readline's
-/// `end-of-line`. A globally-bound chord that a pane's occupant also wants is
-/// claimed only in command mode, and the user pays one extra `Ctrl+D` rather
-/// than losing the chord entirely. Without this, an Orchestration tab would
-/// swallow the byte unconditionally and a focused role pane's PTY would never
-/// receive it — so the user could not move to the end of a line they were
-/// typing at the agent.
+/// `chord` names the action being scoped — today
+/// `Action::ToggleOrchestrationLock` (`Ctrl+E`, PRD #393) and
+/// `Action::ToggleOrchestrationSplit` (`Ctrl+L`, PRD #336). If `action`
+/// resolved to that variant outside (Orchestration tab, `UiMode::Normal`) it
+/// becomes `None`; every other action, and `None`, passes through untouched.
+/// The variants are compared with [`std::mem::discriminant`] because
+/// [`Action`] derives no `PartialEq`, so a payload-carrying `chord` would match
+/// that variant whatever its payload — neither current caller passes one.
+///
+/// Both chords collide with a byte a pane's occupant legitimately wants:
+/// `Ctrl+E` is `0x05`, readline's `end-of-line`, and `Ctrl+L` is `0x0c`,
+/// readline's `clear-screen`. The global resolvers are pure chord→action tables
+/// with no tab context, so left alone they claim the chord everywhere — and a
+/// focused role pane's PTY would never receive the byte. Both halves of the
+/// narrowing matter, and for the same reason:
+///
+/// - **Tab type** — only [`Tab::Orchestration`] gives these chords something
+///   to mean (its `role_pane_ids[start_role_index]` for the lock, its
+///   sidebar/pane-column split for the split toggle). On a Dashboard or Mode
+///   tab they reach nothing, so claiming the chord there would cost the byte
+///   for no behaviour. (The split's `dispatch_action` arm also re-checks the
+///   tab; the lock's arm does not, so for the lock this helper is the only tab
+///   guard.)
+/// - **Mode** — the same conflict class, and the same trade, as
+///   [`global_action_for_mode`]'s `CloseSelected` scoping (PRD #241 M1), which
+///   is command-mode only precisely so `Ctrl+w` still reaches the PTY as
+///   word-delete while the user is typing. A globally-bound chord that a pane's
+///   occupant also wants is claimed only in command mode, and the user pays one
+///   extra `Ctrl+D` rather than losing the chord entirely — without this, the
+///   user could not move to the end of, or clear, what they were typing at the
+///   agent.
 ///
 /// It cannot live inside `global_action_for_mode` the way `CloseSelected`'s
 /// mode term does, because it needs one thing that function has no access to:
-/// which KIND of tab is active. `is_orchestration_tab` is true **only** for
-/// [`Tab::Orchestration`], whose `role_pane_ids[start_role_index]` is what
-/// gives the chord something to mean; on a Dashboard or Mode tab the lock
-/// reaches nothing, so claiming the chord there would cost the byte for no
-/// behaviour. Kept a standalone pure function rather than an inline `if` at the
-/// call site because it is then unit-testable without a PTY — an inline
-/// condition is only reachable through the full event loop.
-fn scope_command_entry_lock(
+/// which KIND of tab is active. The tab term is a parameter rather than
+/// computed here so a caller can fold a feature gate into it (the lock's
+/// PRD #393 experimental flag). Returning `None` un-resolves the action so the
+/// key falls through to the normal `PaneInput` forwarding path. Kept a
+/// standalone pure function rather than an inline `if` at the call site
+/// because it is then unit-testable without a PTY (`orchestration/lock/001`,
+/// `orchestration/layout/005`) — an inline condition is only reachable through
+/// the full event loop.
+fn scope_orchestration_chord(
     action: Option<Action>,
+    chord: Action,
     is_orchestration_tab: bool,
     mode: UiMode,
 ) -> Option<Action> {
     match action {
-        Some(Action::ToggleOrchestrationLock)
-            if !is_orchestration_tab || mode != UiMode::Normal =>
+        Some(ref resolved)
+            if std::mem::discriminant(resolved) == std::mem::discriminant(&chord)
+                && (!is_orchestration_tab || mode != UiMode::Normal) =>
         {
             None
         }
@@ -9203,9 +9229,9 @@ fn scope_command_entry_lock(
 /// that mode's own handler.
 ///
 /// The `ToggleOrchestrationLock`, `ToggleOrchestrationSplit` and `ToggleZoom`
-/// passes below apply [`scope_command_entry_lock`]'s,
-/// [`scope_orchestration_split`]'s and [`scope_zoom`]'s MODE term only, with
-/// `is_orchestration_tab: true`, in the order the live call site applies them.
+/// passes below apply [`scope_orchestration_chord`]'s (for the first two) and
+/// [`scope_zoom`]'s MODE term only, with `is_orchestration_tab: true`, in the
+/// order the live call site applies them.
 /// Mode is this helper's whole subject and is knowable here, so leaving any of
 /// them out would make the helper over-report `Ctrl+E`, `Ctrl+L` or `Ctrl+Z` as
 /// claimed in `PaneInput` — the exact thing the scoping exists to stop. Tab kind
@@ -9213,13 +9239,14 @@ fn scope_command_entry_lock(
 /// answers for the most permissive tab.
 pub fn key_action_for_mode(kb: &KeybindingConfig, mode: UiMode, key: &KeyEvent) -> Option<Action> {
     let resolved = global_action_for_mode(kb, mode, key);
-    let resolved = scope_command_entry_lock(resolved, true, mode);
+    let resolved = scope_orchestration_chord(resolved, Action::ToggleOrchestrationLock, true, mode);
     // PRD #336 (issue #439): the same MODE-only pass for the split toggle, in
     // the position the live call site gives it — after the lock, before the
     // zoom. Leaving it out made this helper report `Ctrl+L` as claimed in
     // `PaneInput`, when the live loop un-resolves it there and forwards `0x0c`
     // to the agent as readline's clear-screen.
-    let resolved = scope_orchestration_split(resolved, true, mode);
+    let resolved =
+        scope_orchestration_chord(resolved, Action::ToggleOrchestrationSplit, true, mode);
     // PRD #313: and the same pass for the zoom toggle. Leaving it out would
     // make this helper report `Ctrl+Z` as claimed in `PaneInput`, when the live
     // loop un-resolves it there and forwards `0x1a` to the agent — the tty's
@@ -9237,48 +9264,7 @@ pub fn key_action_for_mode(kb: &KeybindingConfig, mode: UiMode, key: &KeyEvent) 
     None
 }
 
-/// PRD #336: narrow a resolved action to the tab type AND mode it applies to.
-///
-/// `Action::ToggleOrchestrationSplit` resolves only on an orchestration tab, in
-/// command mode. The global resolvers are pure chord→action tables with no tab
-/// context, so left alone they claim the chord everywhere — and because
-/// `dispatch_action`'s handler no-ops off an orchestration tab, the keystroke is
-/// swallowed rather than reaching the focused pane's PTY.
-///
-/// Both halves of the narrowing matter, and for the same reason: the default
-/// `Ctrl+l` is readline's `clear-screen`, so anything running in a pane has a
-/// legitimate claim on it.
-///
-/// - **Tab type** — on a Dashboard or Mode tab the action can do nothing, so
-///   claiming the chord there is pure loss.
-/// - **Mode** — this mirrors `close_pane` (PRD #241 M1), which is command-mode
-///   only precisely so `Ctrl+w` still reaches the PTY as word-delete while the
-///   user is typing. Same conflict class here: without the mode check, `Ctrl+l`
-///   typed into a *role pane* — the most likely place to want a screen clear —
-///   would resize the sidebar instead of clearing. Toggling costs one extra
-///   keystroke (`Ctrl+d` first); silently eating clear-screen costs more.
-///
-/// Returning `None` un-resolves it so the key falls through to the normal
-/// `PaneInput` forwarding path. Every other action passes through untouched.
-/// Kept as a standalone pure function so it is unit-testable without a PTY
-/// (`orchestration/layout/005`) — an inline `if` at the call site would only
-/// be reachable through the full event loop.
-fn scope_orchestration_split(
-    action: Option<Action>,
-    is_orchestration_tab: bool,
-    mode: UiMode,
-) -> Option<Action> {
-    match action {
-        Some(Action::ToggleOrchestrationSplit)
-            if !is_orchestration_tab || mode != UiMode::Normal =>
-        {
-            None
-        }
-        other => other,
-    }
-}
-
-/// PRD #313: the same narrowing as [`scope_orchestration_split`], for the zoom
+/// PRD #313: the same narrowing as [`scope_orchestration_chord`], for the zoom
 /// toggle — `Action::ToggleZoom` resolves only on a tab that HAS a card
 /// sidebar to reclaim (Dashboard or Orchestration), and only in command mode.
 ///
@@ -9849,7 +9835,7 @@ fn dispatch_action(
         }
         // Ctrl+e: toggle the deck-global command-entry lock. The action only
         // ever reaches here from an Orchestration tab in command mode —
-        // `scope_command_entry_lock` un-resolves it everywhere else — so there
+        // `scope_orchestration_chord` un-resolves it everywhere else — so there
         // is no per-tab guard left to apply.
         Action::ToggleOrchestrationLock => {
             ui.command_entry_locked = !ui.command_entry_locked;
@@ -9884,7 +9870,7 @@ fn dispatch_action(
         // from an orchestration tab, so the guard below stays: pressing it on
         // the Dashboard must not silently change orchestration geometry.
         // Unreachable off an orchestration tab anyway —
-        // `scope_orchestration_split` un-resolves the chord there — but the
+        // `scope_orchestration_chord` un-resolves the chord there — but the
         // `matches!` keeps this a no-op rather than a panic if that changes.
         Action::ToggleOrchestrationSplit => {
             if matches!(tab_manager.active_tab(), Tab::Orchestration { .. }) {
@@ -12106,22 +12092,28 @@ fn handle_key_event(
         // `PaneInput` forwarding path (`0x05`) instead.
         let is_orchestration_tab = matches!(tab_manager.active_tab(), Tab::Orchestration { .. });
         // PRD #393 experimental gate (CLAUDE.md #9). Passing `false` for the
-        // tab term when the flag is off makes `scope_command_entry_lock`
+        // tab term when the flag is off makes `scope_orchestration_chord`
         // un-resolve `Ctrl+E` everywhere, exactly as it already does off an
         // Orchestration tab — so the key falls through to the PTY and the lock
         // has no binding at all. Expressed through the existing tab term rather
         // than a second branch so there is only one place that decides whether
         // the chord is claimed.
-        action = scope_command_entry_lock(
+        action = scope_orchestration_chord(
             action,
+            Action::ToggleOrchestrationLock,
             is_orchestration_tab && crate::features::show_command_entry_lock(),
             ui.mode,
         );
         // PRD #336: the split toggle resolves only on an orchestration tab, in
         // command mode. This is the first point in the funnel with tab context,
         // so narrow it here — otherwise `Ctrl+l` is claimed everywhere and
-        // never reaches a pane's PTY. See `scope_orchestration_split`.
-        action = scope_orchestration_split(action, is_orchestration_tab, ui.mode);
+        // never reaches a pane's PTY. See `scope_orchestration_chord`.
+        action = scope_orchestration_chord(
+            action,
+            Action::ToggleOrchestrationSplit,
+            is_orchestration_tab,
+            ui.mode,
+        );
         // PRD #313: and the zoom toggle, on nearly the same terms — but a
         // WIDER tab predicate, because the Dashboard is the same card-sidebar
         // shape as an orchestration tab and zoom is worth the same there. See
@@ -24733,13 +24725,13 @@ mod tests {
         }
     }
 
-    /// Scenario: PRD #336 — `scope_orchestration_split` is the guard that keeps
+    /// Scenario: PRD #336 — `scope_orchestration_chord` is the guard that keeps
     /// `Ctrl+l` from being swallowed anywhere it cannot act. Press `Ctrl+l` in
     /// command mode and the deck must resolve `Action::ToggleOrchestrationSplit`;
     /// press it while typing at a pane and the deck must NOT claim it, so the
     /// byte still reaches the agent as `0x0c`, readline's clear-screen. Resolves
     /// a simulated `Ctrl+l` `KeyEvent` through `key_action_for_mode` in both
-    /// modes, then drives `scope_orchestration_split` across every tab/mode pair
+    /// modes, then drives `scope_orchestration_chord` across every tab/mode pair
     /// and confirms every other action passes through untouched.
     #[spec("orchestration/layout/005")]
     #[test]
@@ -24759,6 +24751,15 @@ mod tests {
         );
 
         let split = || Some(Action::ToggleOrchestrationSplit);
+        // The helper under test, fixed to the chord this test is about.
+        let scope_orchestration_split = |action, is_orchestration_tab, mode| {
+            scope_orchestration_chord(
+                action,
+                Action::ToggleOrchestrationSplit,
+                is_orchestration_tab,
+                mode,
+            )
+        };
 
         // The ONLY combination that resolves: orchestration tab + command mode.
         // (`Action` derives no `PartialEq`, so these assert on the variant.)
@@ -40100,8 +40101,8 @@ mod tests {
         );
     }
 
-    /// Scenario: Table-driven unit test of the pure `scope_command_entry_lock`
-    /// function over the full cross product of `is_orchestration_tab`
+    /// Scenario: Table-driven unit test of the pure `scope_orchestration_chord`
+    /// function, scoping `ToggleOrchestrationLock`, over the full cross product of `is_orchestration_tab`
     /// (true/false) x every `UiMode` variant x the action being
     /// `ToggleOrchestrationLock`, some other action (`Quit`), or `None`.
     /// Confirms `ToggleOrchestrationLock` survives ONLY at
@@ -40115,6 +40116,15 @@ mod tests {
     #[test]
     fn lock_001_scope_command_entry_lock_claims_only_when_orchestration_and_normal_mode() {
         let modes = all_ui_modes();
+        // The helper under test, fixed to the chord this test is about.
+        let scope_command_entry_lock = |action, is_orchestration_tab, mode| {
+            scope_orchestration_chord(
+                action,
+                Action::ToggleOrchestrationLock,
+                is_orchestration_tab,
+                mode,
+            )
+        };
 
         for is_orchestration_tab in [true, false] {
             for &mode in &modes {
