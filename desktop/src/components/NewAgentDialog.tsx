@@ -688,9 +688,14 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
     const outcome = await loadListing(deckId, wanted, undefined, "quiet");
     if (resumePending.current !== resume) return;
     resumePending.current = undefined;
-    if (outcome.kind === "failed") {
-      if (resume.directory) setRestoreNotes((notes) => [...(notes ?? []), DRAFT_DIRECTORY_GONE]);
-      fresh();
+    if (outcome.kind === "failed" || outcome.kind === "unsupported") {
+      // Everything that hung off the directory goes with it, and each loss is
+      // named: its Mode too, since a Mode is chosen for a directory.
+      const dropped = resume.directory ? [DRAFT_DIRECTORY_GONE, ...(resume.mode !== NO_MODE.id ? [DRAFT_MODE_GONE] : [])] : [];
+      if (dropped.length > 0) setRestoreNotes((notes) => [...(notes ?? []), ...dropped]);
+      // A deck that cannot list at all leaves the panel saying so, as a fresh
+      // form on it does; listing its default directory would say the same twice.
+      if (outcome.kind === "failed") fresh();
       return;
     }
     if (outcome.kind === "listed" && resume.directory) {

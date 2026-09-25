@@ -1641,6 +1641,38 @@ describe("New agent dialog — a draft that survives a close (issue 1247)", () =
   });
 
   /**
+   * Scenario: the saved directory is gone and the draft had chosen a Mode on
+   * it. Both losses are named — the directory and the Mode — and the form is
+   * back on No mode.
+   */
+  it("names a saved Mode dropped along with its directory", async () => {
+    const runtime = fakeRuntime({ newAgentOptions: vi.fn(async (): Promise<NewAgentOptions> => ({ ...structuredClone(DECK_OPTIONS), authoringKinds: ["dispatcher"] })) });
+    renderDialog(runtime, { draft: saved({ browsing: "/gone", directory: { path: "/gone", displayPath: "/gone" }, mode: "dispatcher" }) });
+
+    await currentPath("/home/dev");
+    expect(await screen.findByText(DRAFT_DIRECTORY_GONE)).toBeInTheDocument();
+    expect(screen.getByText(DRAFT_MODE_GONE)).toBeInTheDocument();
+    expect(screen.getByTestId("new-agent-dir")).toHaveTextContent("No directory chosen yet");
+  });
+
+  /**
+   * Scenario: the deck can no longer list directories at all. The restore
+   * names the dropped directory and Mode, and the panel says the deck cannot
+   * list, as it does on a fresh form — rather than the directory vanishing
+   * without a word.
+   */
+  it("names the dropped directory when the deck can no longer list", async () => {
+    const runtime = fakeRuntime({ listDirectories: vi.fn(async (): Promise<DeckDirectoryListing> => ({ kind: "unsupported" })) });
+    renderDialog(runtime, { draft: saved({ mode: "dispatcher" }) });
+
+    expect(await screen.findByText(DRAFT_DIRECTORY_GONE)).toBeInTheDocument();
+    expect(screen.getByText(DRAFT_MODE_GONE)).toBeInTheDocument();
+    expect(screen.getByTestId("new-agent-no-browse")).toBeInTheDocument();
+    expect(screen.getByTestId("new-agent-dir")).toHaveTextContent("No directory chosen yet");
+    expect(screen.getByTestId("new-agent-name")).toHaveValue("mine");
+  });
+
+  /**
    * Scenario: the draft was on the remote deck, which has since disconnected.
    * It is not chosen — the field falls back to the only deck that can take a
    * spawn — its directory is never asked of any deck, and a notice names the
