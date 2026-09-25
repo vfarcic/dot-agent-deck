@@ -944,6 +944,57 @@ describe("closing what is on top", () => {
   });
 
   /**
+   * Scenario: on the shipped overview, Settings is open beneath the spoken
+   * command list. Saying "close" dismisses the list first, then Settings,
+   * leaving the overview visible and never reporting that nothing was closed.
+   */
+  it("closes the voice overlay before Settings on the overview", async () => {
+    window.history.replaceState({}, "", "/?fixture=1");
+    const voice = microphone([]);
+    const deck = closingDeck(voice);
+    render(<DeckShell runtime={deck} initialView={{ kind: "overview" }} />);
+
+    await turnVoiceOn();
+    fireEvent.click(screen.getByRole("button", { name: "Settings" }));
+    expect(screen.getByRole("dialog", { name: "Settings" })).toBeVisible();
+
+    voice.deliver("what can I say?");
+    await completeUtterance();
+    expect(screen.getByTestId("voice-help")).toBeInTheDocument();
+
+    voice.deliver("close this");
+    await completeUtterance();
+    expect(screen.queryByTestId("voice-help")).toBeNull();
+    expect(screen.getByRole("dialog", { name: "Settings" })).toBeVisible();
+
+    voice.deliver("close this");
+    await completeUtterance();
+    expect(screen.queryByRole("dialog", { name: "Settings" })).toBeNull();
+    expect(screen.getByTestId("overview-table-region")).toBeVisible();
+    expect(screen.queryByTestId("voice-report")?.textContent ?? "").not.toContain(VOICE_NOTHING_TO_CLOSE);
+  });
+
+  /**
+   * Scenario: with the experimental deck shown, saying "close" while its
+   * Settings sheet is open dismisses the sheet and leaves the deck visible.
+   */
+  it("closes Settings on the deck", async () => {
+    const voice = microphone([]);
+    render(<DeckShell runtime={closingDeck(voice)} />);
+
+    await turnVoiceOn();
+    fireEvent.click(screen.getByRole("button", { name: "Settings" }));
+    expect(screen.getByRole("dialog", { name: "Settings" })).toBeVisible();
+
+    voice.deliver("close this");
+    await completeUtterance();
+
+    expect(screen.queryByRole("dialog", { name: "Settings" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Open Planner agent" })).toBeVisible();
+    expect(screen.queryByTestId("voice-report")?.textContent ?? "").not.toContain(VOICE_NOTHING_TO_CLOSE);
+  });
+
+  /**
    * Scenario: with no overlay up, the same word closes an agent pane opened
    * from the shipped overview. The user returns to that overview without
    * passing through the hidden deck.

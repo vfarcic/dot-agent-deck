@@ -89,6 +89,23 @@ test.describe("Settings from the overview by voice", () => {
     await voiceButton(page).click();
     await expect(page.getByRole("dialog", { name: "Settings" })).toBeVisible();
   });
+
+  /**
+   * Scenario: on the shipped overview, open Settings from the rail and say
+   * "close this" through the scripted microphone. The sheet goes away and
+   * the overview remains visible.
+   */
+  test("closes Settings by voice on the overview", async ({ page }) => {
+    await openSpeaking(page, ["close this"], "connected", true);
+    await selectOverview(page);
+    await page.getByRole("button", { name: "Settings" }).click();
+    await expect(page.getByRole("dialog", { name: "Settings" })).toBeVisible();
+
+    await voiceButton(page).click();
+
+    await expect(page.getByRole("dialog", { name: "Settings" })).toHaveCount(0);
+    await expect(page.getByTestId("overview-table-region")).toBeVisible();
+  });
 });
 
 test.describe("what can I say?", () => {

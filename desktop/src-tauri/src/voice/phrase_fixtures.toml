@@ -73,16 +73,10 @@ screen = "agent"
 action = "open_overview"
 outcome = "unavailable"
 
-# The four `open_deck` fixtures below resolve with the deck SHOWN: the harness
-# calls `handle_utterance`, which passes `show_deck = true` — the `experimental`
-# configuration. With the flag off, the shipped default (issue #1198), the
-# crate offers `open_deck` as `callable: false` and refuses a pick of it, so
-# none of the three `dispatch` cases below is what a default build does. That
-# refusal is pinned with a stub resolver by
-# `voice_outcome_refuses_the_deck_while_it_is_hidden`; no live fixture pins
-# what a real model answers with the deck hidden (for "go back" on the
-# overview, `close`'s description says `close` wins once `open_deck` is not
-# callable).
+# These first four `open_deck` fixtures run with the experimental deck shown.
+# The deck-hidden fixtures following them exercise the shipped overview: a
+# bare "go back" routes to `close`, while explicit deck requests resolve to
+# `open_deck` and are refused with the hidden-deck hint.
 [[fixtures]]
 name = "open-deck-back"
 utterance = "go back"
@@ -109,6 +103,30 @@ name = "open-deck-unavailable"
 utterance = "take me back to the terminals"
 # The agent screen, for `open-overview-unavailable`'s reason (#1197).
 screen = "agent"
+action = "open_deck"
+outcome = "unavailable"
+
+[[fixtures]]
+name = "deck-hidden-go-back"
+utterance = "go back"
+screen = "overview"
+deck_hidden = true
+action = "close"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "deck-hidden-back-to-deck"
+utterance = "back to the deck"
+screen = "overview"
+deck_hidden = true
+action = "open_deck"
+outcome = "unavailable"
+
+[[fixtures]]
+name = "deck-hidden-open-deck"
+utterance = "open the deck"
+screen = "overview"
+deck_hidden = true
 action = "open_deck"
 outcome = "unavailable"
 
