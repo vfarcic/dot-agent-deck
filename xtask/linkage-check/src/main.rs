@@ -477,8 +477,9 @@ const SELF_CONTAINED_RULE: &str = "`crate::` path in a `#[path]`-shared file —
      arrive as an argument instead. Sharing it this way is what costs 12 extra \
      fast-tier executions rather than the ~530 `mod common;` would (issue #474)";
 
-/// The file rule 9 guards. Repo-relative, joined onto the workspace root, so
-/// the platform separator is whatever `Path::join` produces.
+/// The file rule 9 guards. Repo-relative and forward-slashed; joined onto the
+/// workspace root through [`paths::join_repo_relative`], so the path a finding
+/// prints uses the native separator throughout (issue #1137).
 const SELF_CONTAINED_PATH: &str = "src/test_temp.rs";
 
 /// The `crate::` paths rule 9 forbids.
@@ -520,7 +521,7 @@ fn self_contained_violations(display: &str, text: &str) -> Vec<String> {
 /// behind would otherwise turn the rule into a no-op that still prints `ok` —
 /// the same shape of silence the rule exists to end.
 fn check_self_contained(root: &Path) -> Vec<String> {
-    let path = root.join(SELF_CONTAINED_PATH);
+    let path = paths::join_repo_relative(root, SELF_CONTAINED_PATH);
     match std::fs::read_to_string(&path) {
         Ok(text) => self_contained_violations(&path.display().to_string(), &text),
         Err(e) => vec![format!(
@@ -1349,8 +1350,10 @@ fn scan_sources(root: &Path, tests_dir: &Path) -> (Vec<SpecOccurrence>, ScannedF
 /// this tool cannot reason without — a parse failure here would make rules
 /// 1/2/4/6 report garbage, so it is fatal rather than a finding.
 fn gather_inputs(root: PathBuf) -> Result<Inputs, ExitCode> {
-    let catalog_path = root.join(CATALOG_PATH);
-    let allowlist_path = root.join(ALLOWLIST_PATH);
+    // By component, not `root.join("a/b")`, so the paths the two messages
+    // below print are native on Windows rather than mixed (issue #1137).
+    let catalog_path = paths::join_repo_relative(&root, CATALOG_PATH);
+    let allowlist_path = paths::join_repo_relative(&root, ALLOWLIST_PATH);
     let tests_dir = root.join(TESTS_DIR);
 
     let catalog_ids = match parse_catalog_ids(&catalog_path) {

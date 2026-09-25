@@ -1460,19 +1460,43 @@ pub(crate) async fn run_git_status(args: &[&str]) -> Result<(), String> {
     status_of(crate::git_env::git_async(), crate::git_env::GIT, args).await
 }
 
+/// How long one `gh` / `git` subprocess in the dispatch path may run before it
+/// is killed and reported as failed (issue #692).
+///
+/// **A deadlock guard, not a latency budget** — the same reasoning, and the same
+/// value, as [`DEVBOX_WARMUP_TIMEOUT`]. Before this bound the calls awaited
+/// `.output()` with nothing around it, so one hung `gh` wedged the fire for the
+/// rest of the daemon's life while it held the scheduler's `running` flag, and
+/// every later fire of that task was reported as skipped. Expiring early is not
+/// free either: it fails a dispatch that would have worked. The longest
+/// legitimate call here is `gh repo clone` of a large repository, and nothing
+/// has measured how long that takes over a slow link, so the value is set far
+/// enough out that expiry means *stuck* rather than *slow*. The small API calls
+/// (`gh issue list`, `gh pr list`) and the local `git` probes normally return
+/// in well under a second, so for them reaching the bound means something was
+/// already wrong.
+const SUBPROCESS_TIMEOUT: Duration = Duration::from_secs(600);
+
 /// The shared body of [`run_status`] and [`run_git_status`] — one
 /// implementation, two ways of constructing the command, so the neutralized
 /// variant cannot drift from the error text or the exit handling.
 async fn status_of(
-    mut cmd: tokio::process::Command,
+    cmd: tokio::process::Command,
     program: &str,
     args: &[&str],
 ) -> Result<(), String> {
-    let output = cmd
-        .args(args)
-        .output()
-        .await
-        .map_err(|e| format!("failed to run `{program}`: {e}"))?;
+    status_within(cmd, program, args, SUBPROCESS_TIMEOUT).await
+}
+
+/// [`status_of`] with the bound passed in, so the timeout path can be driven
+/// by a unit test without a ten-minute wait.
+async fn status_within(
+    cmd: tokio::process::Command,
+    program: &str,
+    args: &[&str],
+    bound: Duration,
+) -> Result<(), String> {
+    let output = output_within(cmd, program, args, bound).await?;
     if output.status.success() {
         return Ok(());
     }
@@ -1483,6 +1507,38 @@ async fn status_of(
         output.status,
         stderr.trim()
     ))
+}
+
+/// Run `cmd` with `args` to completion, or kill it once `bound` has elapsed
+/// (issue #692).
+///
+/// **Killed rather than left running**, which is the opposite of the choice
+/// [`warm_project_environment_with`] makes, for a reason specific to these
+/// calls. A timed-out fire releases the per-repository worktree lock and the
+/// scheduler's `running` flag, and the next fire then starts the same `gh repo
+/// clone` / `git fetch` / `git worktree add` again — so a survivor would be
+/// racing its own replacement over the same directory. `kill_on_drop` is what
+/// does it: the timeout drops the `output()` future, which drops the child and
+/// SIGKILLs it. That reaches the DIRECT child only. A grandchild — the `git`
+/// that `gh repo clone` runs — is not signalled; what usually ends it is the
+/// closed pipe it inherited from us, at its next write, and one that never
+/// writes again is left behind.
+async fn output_within(
+    mut cmd: tokio::process::Command,
+    program: &str,
+    args: &[&str],
+    bound: Duration,
+) -> Result<std::process::Output, String> {
+    cmd.args(args).kill_on_drop(true);
+    match tokio::time::timeout(bound, cmd.output()).await {
+        Ok(result) => result.map_err(|e| format!("failed to run `{program}`: {e}")),
+        Err(_) => Err(format!(
+            "`{program} {}` did not finish within {}s and was killed; it is \
+             treated as failed so the task's later fires are not blocked behind it",
+            args.join(" "),
+            bound.as_secs_f64()
+        )),
+    }
 }
 
 /// Run a subprocess that must exit zero and return its captured stdout. Accepts
@@ -1511,15 +1567,21 @@ pub(crate) async fn run_git_capture(args: &[&str]) -> Result<String, String> {
 /// The shared body of [`run_capture_args`] and [`run_git_capture`] — see
 /// [`status_of`] for why it is shared.
 async fn capture_of(
-    mut cmd: tokio::process::Command,
+    cmd: tokio::process::Command,
     program: &str,
     args: &[&str],
 ) -> Result<String, String> {
-    let output = cmd
-        .args(args)
-        .output()
-        .await
-        .map_err(|e| format!("failed to run `{program}`: {e}"))?;
+    capture_within(cmd, program, args, SUBPROCESS_TIMEOUT).await
+}
+
+/// [`capture_of`] with the bound passed in — see [`status_within`].
+async fn capture_within(
+    cmd: tokio::process::Command,
+    program: &str,
+    args: &[&str],
+    bound: Duration,
+) -> Result<String, String> {
+    let output = output_within(cmd, program, args, bound).await?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(format!(
@@ -1535,6 +1597,94 @@ async fn capture_of(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Issue #692: a subprocess that outlives its bound is reported as a
+    /// failure naming the command and the bound, and the call returns promptly
+    /// instead of waiting for the child.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_subprocess_that_outlives_its_bound_fails_with_a_clear_error() {
+        let bound = Duration::from_millis(200);
+        let started = std::time::Instant::now();
+        let err = status_within(
+            tokio::process::Command::new("sleep"),
+            "sleep",
+            &["30"],
+            bound,
+        )
+        .await
+        .expect_err("a 30s sleep must not pass a 200ms bound");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the bound must end the wait, took {:?}",
+            started.elapsed()
+        );
+        assert!(
+            err.contains("`sleep 30` did not finish within 0.2s and was killed"),
+            "the error must name the command and the bound: {err}"
+        );
+
+        let err = capture_within(
+            tokio::process::Command::new("sleep"),
+            "sleep",
+            &["30"],
+            bound,
+        )
+        .await
+        .expect_err("the capturing variant must be bounded too");
+        assert!(err.contains("did not finish within"), "{err}");
+    }
+
+    /// Issue #692: the timed-out child is killed, not left running to race the
+    /// next fire's attempt at the same clone or worktree. The child would write
+    /// a marker one second in; the bound expires long before that, so a marker
+    /// that appears means the child survived.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_timed_out_subprocess_is_killed_rather_than_left_running() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let marker = dir.path().join("survived");
+        let script = format!("sleep 1; touch '{}'", marker.display());
+        let err = status_within(
+            tokio::process::Command::new("sh"),
+            "sh",
+            &["-c", &script],
+            Duration::from_millis(100),
+        )
+        .await
+        .expect_err("the bound must expire before the script finishes");
+        assert!(err.contains("was killed"), "{err}");
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert!(
+            !marker.exists(),
+            "the timed-out child ran to completion, so it was left running"
+        );
+    }
+
+    /// The bound changes nothing for a call that finishes inside it: success
+    /// and a non-zero exit read exactly as they did before issue #692.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_subprocess_inside_its_bound_reports_as_before() {
+        let out = capture_within(
+            tokio::process::Command::new("sh"),
+            "sh",
+            &["-c", "printf ok"],
+            Duration::from_secs(30),
+        )
+        .await
+        .expect("a quick success must pass");
+        assert_eq!(out, "ok");
+        let err = status_within(
+            tokio::process::Command::new("sh"),
+            "sh",
+            &["-c", "echo nope >&2; exit 3"],
+            Duration::from_secs(30),
+        )
+        .await
+        .expect_err("a non-zero exit must fail");
+        assert!(err.contains("failed (exit status: 3): nope"), "{err}");
+    }
 
     #[test]
     fn parse_issue_numbers_reads_number_field_in_order() {
