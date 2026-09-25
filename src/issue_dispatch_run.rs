@@ -720,11 +720,65 @@ async fn provision_repo(workspace: &Path, clone_dir: &Path, repo: &str) -> Resul
     }
     std::fs::create_dir_all(workspace)
         .map_err(|e| format!("failed to create workspace {}: {e}", workspace.display()))?;
-    run_status("gh", &["repo", "clone", repo, &clone_dir.to_string_lossy()]).await?;
+    clone_via_staging(clone_dir, |staging| async move {
+        run_status("gh", &["repo", "clone", repo, &staging.to_string_lossy()]).await
+    })
+    .await?;
     // Same hygiene on the fresh clone, so it holds across the first AND every
     // later fire.
     ensure_worktrees_excluded(clone_dir);
     Ok(())
+}
+
+/// Clone into a staging sibling of `clone_dir`, and move it into place only
+/// once the clone has succeeded.
+///
+/// A clone that stops partway — killed at [`SUBPROCESS_TIMEOUT`] (issue #692),
+/// or cut short by the daemon itself dying — would otherwise leave `clone_dir`
+/// on disk, and every later fire takes an existing directory for a finished
+/// clone: it checks the origin, tries a refresh that can only fail, and never
+/// clones again, so the schedule could not recover without someone deleting the
+/// directory by hand. Staged, `clone_dir` exists only as a complete clone, and
+/// whatever a failed attempt left is in the staging directory, which the next
+/// attempt clears before it starts. Raised by Greptile on PR #1304.
+///
+/// The staging directory is a sibling so the final `rename` stays on one
+/// filesystem and is atomic. Moving a fresh clone is safe because it has no
+/// linked worktrees yet (`.worktrees/` is created later), and a linked worktree
+/// is what would record the clone's absolute path.
+async fn clone_via_staging<F, Fut>(clone_dir: &Path, clone: F) -> Result<(), String>
+where
+    F: FnOnce(PathBuf) -> Fut,
+    Fut: std::future::Future<Output = Result<(), String>>,
+{
+    let name = clone_dir
+        .file_name()
+        .ok_or_else(|| format!("clone dir {} has no file name", clone_dir.display()))?;
+    let mut staging_name = name.to_os_string();
+    staging_name.push(".cloning");
+    let staging = clone_dir.with_file_name(staging_name);
+    let clear = |path: &Path| match std::fs::remove_dir_all(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!(
+            "failed to clear the partial clone at {}: {e}",
+            path.display()
+        )),
+    };
+    clear(&staging)?;
+    if let Err(e) = clone(staging.clone()).await {
+        if let Err(cleanup) = clear(&staging) {
+            tracing::warn!(error = %cleanup, "issue-dispatch: partial clone left in place");
+        }
+        return Err(e);
+    }
+    std::fs::rename(&staging, clone_dir).map_err(|e| {
+        format!(
+            "cloned into {} but could not move it to {}: {e}",
+            staging.display(),
+            clone_dir.display()
+        )
+    })
 }
 
 /// Keep the per-issue worktrees dir (`<clone>/.worktrees/`) out of the clone's
@@ -1092,6 +1146,12 @@ pub async fn create_worktree(
     let wt = worktree_dir.to_string_lossy();
     let branch_ref = format!("refs/heads/{branch}");
     let mut attempt: u32 = 1;
+    // Issue #692 / PR #1304: what a timed-out add may be cleaned up against.
+    // Whether the branch was there before the FIRST attempt — later attempts can
+    // only see a branch our own failed attempt made — and whether the worktree
+    // directory was there before the attempt that ended the loop.
+    let mut branch_existed_initially = None;
+    let mut dir_existed_before_add;
     let add = loop {
         // Re-probed on every attempt, not hoisted out of the loop: a `git
         // worktree add` that dies on the scan has already CREATED its `-b`
@@ -1109,6 +1169,7 @@ pub async fn create_worktree(
         ])
         .await
         .is_ok();
+        branch_existed_initially.get_or_insert(branch_exists);
         // Only attempt 1 can report BranchExists. Reaching attempt 2 means the
         // branch was PROVEN absent moments ago, so anything there now was
         // created either by our own failed attempt or by a dispatch racing us —
@@ -1131,6 +1192,7 @@ pub async fn create_worktree(
             }
             return Ok(WorktreeCreation::BranchExists);
         }
+        dir_existed_before_add = worktree_dir.exists();
         let result = if branch_exists {
             run_git_status(&["-C", &clone, "worktree", "add", &wt, branch]).await
         } else {
@@ -1196,6 +1258,20 @@ pub async fn create_worktree(
             warm_project_environment(worktree_dir).await;
             Ok(WorktreeCreation::Created)
         }
+        // Issue #692: an add killed at `SUBPROCESS_TIMEOUT` gets no chance to
+        // undo itself, so the directory it had started is on disk — and the
+        // TOCTOU arm below would read that as somebody else's claim, leaving the
+        // issue skipped on every later fire until someone removed it by hand
+        // (raised by Greptile on PR #1304). It is ours to remove only when BOTH
+        // hold: the directory was absent when this attempt started, and the
+        // per-repository lock is held, which is what keeps another deck
+        // dispatch from having created it in between. Without the lock the
+        // directory is left alone and the timeout is reported as it stands.
+        Err(e) if is_subprocess_timeout(&e) && repo_lock.is_some() && !dir_existed_before_add => {
+            let created_branch = (branch_existed_initially == Some(false)).then_some(branch);
+            discard_timed_out_worktree(clone_dir, worktree_dir, created_branch).await;
+            Err(e)
+        }
         // Concurrent claim (TOCTOU): the dir is present now though we arrived
         // believing it absent — treat as already-claimed. A real failure leaves
         // the dir absent and surfaces as the original error.
@@ -1206,6 +1282,59 @@ pub async fn create_worktree(
                 Err(e)
             }
         }
+    }
+}
+
+/// Undo what a `git worktree add` killed at [`SUBPROCESS_TIMEOUT`] left behind
+/// (issue #692): its half-checked-out directory, its administrative entry, and —
+/// when `created_branch` names one — the branch its `-b` created.
+///
+/// Only [`create_worktree`] calls this, and only once it has established the
+/// worktree is its own (see the arm that calls it). Every step is best-effort
+/// and logged: the caller is already returning the timeout as the dispatch's
+/// error, and a cleanup that fails leaves exactly the state that would have
+/// existed without it. `--force` twice, because a killed add leaves its entry
+/// `locked` ("initializing") and a single `--force` refuses a locked worktree.
+/// The branch is deleted only when it did not exist before the first attempt,
+/// so a reused branch that may hold committed work is never touched.
+async fn discard_timed_out_worktree(
+    clone_dir: &Path,
+    worktree_dir: &Path,
+    created_branch: Option<&str>,
+) {
+    let clone = clone_dir.to_string_lossy();
+    let wt = worktree_dir.to_string_lossy();
+    if let Err(e) = run_git_status(&[
+        "-C", &clone, "worktree", "remove", "--force", "--force", &wt,
+    ])
+    .await
+    {
+        tracing::debug!(
+            worktree = %worktree_dir.display(),
+            error = %e,
+            "issue-dispatch: git could not remove the timed-out worktree; removing its directory"
+        );
+    }
+    match std::fs::remove_dir_all(worktree_dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => tracing::warn!(
+            worktree = %worktree_dir.display(),
+            error = %e,
+            "issue-dispatch: could not remove the timed-out worktree's directory"
+        ),
+    }
+    if let Err(e) = run_git_status(&["-C", &clone, "worktree", "prune"]).await {
+        tracing::warn!(error = %e, "issue-dispatch: git worktree prune after a timed-out add failed");
+    }
+    if let Some(branch) = created_branch
+        && let Err(e) = run_git_status(&["-C", &clone, "branch", "-D", branch]).await
+    {
+        tracing::warn!(
+            branch,
+            error = %e,
+            "issue-dispatch: could not delete the branch a timed-out add created"
+        );
     }
 }
 
@@ -1509,6 +1638,17 @@ async fn status_within(
     ))
 }
 
+/// The prefix every [`output_within`] timeout error starts with, so a caller
+/// that has to undo what a killed command left half-done can recognise one —
+/// see [`is_subprocess_timeout`].
+const SUBPROCESS_TIMEOUT_MARKER: &str = "timed out: ";
+
+/// Whether `err` is the error [`output_within`] returns when it killed a
+/// command at its bound, as opposed to the command failing on its own.
+fn is_subprocess_timeout(err: &str) -> bool {
+    err.starts_with(SUBPROCESS_TIMEOUT_MARKER)
+}
+
 /// Run `cmd` with `args` to completion, or kill it once `bound` has elapsed
 /// (issue #692).
 ///
@@ -1517,27 +1657,95 @@ async fn status_within(
 /// calls. A timed-out fire releases the per-repository worktree lock and the
 /// scheduler's `running` flag, and the next fire then starts the same `gh repo
 /// clone` / `git fetch` / `git worktree add` again — so a survivor would be
-/// racing its own replacement over the same directory. `kill_on_drop` is what
-/// does it: the timeout drops the `output()` future, which drops the child and
-/// SIGKILLs it. That reaches the DIRECT child only. A grandchild — the `git`
-/// that `gh repo clone` runs — is not signalled; what usually ends it is the
-/// closed pipe it inherited from us, at its next write, and one that never
-/// writes again is left behind.
+/// racing its own replacement over the same directory.
+///
+/// **On Unix the whole process group is killed, and the direct child is reaped
+/// before this returns.** Killing only the direct child is not enough: `gh repo
+/// clone` runs `git clone` as a child of its own, and with its stderr not a
+/// terminal that `git` prints no progress, so it would not even die of the
+/// closed pipe — it would go on writing the clone directory the next fire is
+/// about to use. So the command gets a process group of its own
+/// (`process_group(0)`), and the timeout `SIGKILL`s that group. The group
+/// outlives its leader while any member remains, so the signal reaches the
+/// grandchildren even though the leader is gone first. A descendant that moved
+/// itself to another group or session escapes it; nothing `gh` or `git` runs in
+/// this path is known to. A group of its own also means a terminal's `^C` would
+/// not reach the command — which costs nothing here, because every production
+/// caller runs inside the daemon, which is detached from any terminal. Windows
+/// has no process-group kill in this code, so there the direct child alone is
+/// killed.
+///
+/// The `.output()`-equivalent defaults are set explicitly because `spawn` does
+/// not imply them: stdin is `/dev/null`, so nothing can block reading it, and
+/// both output streams are captured. The whole run — the exit AND the two
+/// pipes draining — sits under the bound, so a descendant that keeps a pipe
+/// open after the child exits cannot stretch the wait past it either.
 async fn output_within(
     mut cmd: tokio::process::Command,
     program: &str,
     args: &[&str],
     bound: Duration,
 ) -> Result<std::process::Output, String> {
-    cmd.args(args).kill_on_drop(true);
-    match tokio::time::timeout(bound, cmd.output()).await {
-        Ok(result) => result.map_err(|e| format!("failed to run `{program}`: {e}")),
-        Err(_) => Err(format!(
-            "`{program} {}` did not finish within {}s and was killed; it is \
-             treated as failed so the task's later fires are not blocked behind it",
-            args.join(" "),
-            bound.as_secs_f64()
-        )),
+    use std::process::Stdio;
+    use tokio::io::AsyncReadExt;
+
+    cmd.args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    #[cfg(unix)]
+    cmd.process_group(0);
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("failed to run `{program}`: {e}"))?;
+    let pid = child.id();
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+
+    async fn drain(pipe: Option<impl tokio::io::AsyncRead + Unpin>) -> Vec<u8> {
+        let mut buf = Vec::new();
+        if let Some(mut pipe) = pipe {
+            let _ = pipe.read_to_end(&mut buf).await;
+        }
+        buf
+    }
+
+    let outcome = tokio::time::timeout(bound, async {
+        tokio::join!(child.wait(), drain(stdout), drain(stderr))
+    })
+    .await;
+    match outcome {
+        Ok((status, stdout, stderr)) => Ok(std::process::Output {
+            status: status.map_err(|e| format!("failed to run `{program}`: {e}"))?,
+            stdout,
+            stderr,
+        }),
+        Err(_) => {
+            #[cfg(unix)]
+            if let Some(pid) = pid {
+                // SAFETY: kill(2) with a negative pid signals the process group
+                // `process_group(0)` created above, whose id is the child's pid.
+                // SIGKILL has no failure mode beyond ESRCH/EPERM, both ignored:
+                // ESRCH means everything in it has already exited. The id cannot
+                // name somebody else's group, because the child is not yet reaped
+                // — `wait` below does that — so the pid is still ours.
+                unsafe {
+                    libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
+                }
+            }
+            #[cfg(not(unix))]
+            let _ = pid;
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            Err(format!(
+                "{SUBPROCESS_TIMEOUT_MARKER}`{program} {}` did not finish within {}s and was \
+                 killed; it is treated as failed so the task's later fires are not blocked \
+                 behind it",
+                args.join(" "),
+                bound.as_secs_f64()
+            ))
+        }
     }
 }
 
@@ -1658,6 +1866,148 @@ mod tests {
         assert!(
             !marker.exists(),
             "the timed-out child ran to completion, so it was left running"
+        );
+    }
+
+    /// PR #1304 (Qodo): the kill reaches the command's DESCENDANTS, not only
+    /// the direct child — the shape of `gh repo clone`, whose `git clone` would
+    /// otherwise go on writing the clone directory the next fire uses. The
+    /// marker is written by a backgrounded grandchild one second in; the bound
+    /// expires long before that.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_timed_out_subprocess_takes_its_descendants_with_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let marker = dir.path().join("grandchild-survived");
+        let script = format!("(sleep 1; touch '{}') & wait", marker.display());
+        let err = status_within(
+            tokio::process::Command::new("sh"),
+            "sh",
+            &["-c", &script],
+            Duration::from_millis(100),
+        )
+        .await
+        .expect_err("the bound must expire before the grandchild finishes");
+        assert!(is_subprocess_timeout(&err), "{err}");
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert!(
+            !marker.exists(),
+            "the timed-out command's grandchild ran to completion, so only the \
+             direct child was killed"
+        );
+    }
+
+    /// Only the timeout is recognised as one: a command that fails on its own
+    /// must not trigger the cleanup a killed command needs.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn only_a_timeout_is_classified_as_one() {
+        let err = status_within(
+            tokio::process::Command::new("sh"),
+            "sh",
+            &["-c", "echo 'did not finish within' >&2; exit 1"],
+            Duration::from_secs(30),
+        )
+        .await
+        .expect_err("a non-zero exit must fail");
+        assert!(!is_subprocess_timeout(&err), "{err}");
+    }
+
+    /// PR #1304 (Greptile): a clone that fails partway leaves no `clone_dir`,
+    /// so the next fire clones again instead of taking a half-written directory
+    /// for a finished clone; a stale staging directory from an earlier attempt
+    /// is cleared; and a clone that succeeds lands at `clone_dir`.
+    #[tokio::test]
+    async fn a_failed_clone_leaves_nothing_a_later_fire_would_mistake_for_a_clone() {
+        let ws = tempfile::tempdir().expect("tempdir");
+        let clone_dir = ws.path().join("repo");
+
+        let err = clone_via_staging(&clone_dir, |staging| async move {
+            std::fs::create_dir_all(staging.join(".git")).expect("start a partial clone");
+            Err("timed out: `gh repo clone` did not finish".to_string())
+        })
+        .await
+        .expect_err("a failed clone must fail");
+        assert!(err.contains("did not finish"), "{err}");
+        assert!(
+            !clone_dir.exists(),
+            "a failed clone must not leave clone_dir"
+        );
+        assert!(
+            !ws.path().join("repo.cloning").exists(),
+            "the failed attempt's staging directory must be cleared"
+        );
+
+        std::fs::create_dir_all(ws.path().join("repo.cloning").join("stale"))
+            .expect("plant a leftover from a daemon that died mid-clone");
+        clone_via_staging(&clone_dir, |staging| async move {
+            assert!(
+                !staging.exists(),
+                "a leftover staging directory must be cleared before cloning"
+            );
+            std::fs::create_dir_all(staging.join(".git")).expect("clone");
+            Ok(())
+        })
+        .await
+        .expect("a successful clone must succeed");
+        assert!(
+            clone_dir.join(".git").is_dir(),
+            "the clone lands at clone_dir"
+        );
+        assert!(!ws.path().join("repo.cloning").exists());
+    }
+
+    /// PR #1304 (Greptile): what a killed `git worktree add` leaves — a
+    /// directory, an administrative entry still `locked` as initializing, and
+    /// the branch its `-b` made — is removed, so a later fire sees the issue as
+    /// unclaimed rather than skipping it forever.
+    #[tokio::test]
+    async fn a_timed_out_worktree_add_is_discarded_with_its_branch() {
+        let scratch = crate::test_temp::tempdir().expect("scratch tempdir");
+        let repo = scratch.path().join("repo");
+        init_repo_with_commit(scratch.path(), &repo);
+        let worktree_dir = scratch.path().join("repo-issue-5");
+        let branch = "agent/issue-5";
+        let outcome = create_worktree(
+            &repo,
+            &worktree_dir,
+            branch,
+            false,
+            Creator::issue_dispatch("unit", 5),
+        )
+        .await;
+        assert_eq!(outcome, Ok(WorktreeCreation::Created));
+        // The state an add is in before it finishes: its entry locked.
+        std::fs::write(
+            repo.join(".git")
+                .join("worktrees")
+                .join("repo-issue-5")
+                .join("locked"),
+            "initializing",
+        )
+        .expect("lock the entry the way an unfinished add leaves it");
+
+        discard_timed_out_worktree(&repo, &worktree_dir, Some(branch)).await;
+
+        assert!(
+            !worktree_dir.exists(),
+            "the worktree directory must be gone"
+        );
+        let git = |args: &[&str]| {
+            let out = crate::git_env::fixture_git(&repo, scratch.path())
+                .args(args)
+                .output()
+                .expect("run git");
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+        let listed = git(&["worktree", "list", "--porcelain"]);
+        assert!(
+            !listed.contains("repo-issue-5"),
+            "the administrative entry must be gone: {listed}"
+        );
+        assert!(
+            git(&["branch", "--list", branch]).trim().is_empty(),
+            "the branch the add created must be gone"
         );
     }
 

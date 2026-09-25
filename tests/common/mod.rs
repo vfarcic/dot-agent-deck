@@ -9609,21 +9609,19 @@ fn read_attach_stream_until(
     deadline: Instant,
 ) -> bool {
     use dot_agent_deck::daemon_protocol::{KIND_RESP, KIND_STREAM_OUT};
-    use std::io::Read;
 
     let mut acc: Vec<u8> = Vec::new();
     let needle_bytes = needle.as_bytes();
     while Instant::now() < deadline {
+        // Through `read_exact_with_deadline`, which keeps what it has already
+        // read across a socket read timeout. A bare `read_exact` retried after
+        // `WouldBlock` discards a partially filled header, and the next read
+        // then takes the header's tail for a new one (raised by Qodo on PR
+        // #1304). Its `TimedOut` at the deadline ends the wait like any other
+        // error: the deadline is this loop's own.
         let mut fh = [0u8; 5];
-        match stream.read_exact(&mut fh) {
-            Ok(()) => {}
-            Err(ref e)
-                if e.kind() == std::io::ErrorKind::WouldBlock
-                    || e.kind() == std::io::ErrorKind::TimedOut =>
-            {
-                continue;
-            }
-            Err(_) => return false,
+        if read_exact_with_deadline(stream, &mut fh, deadline).is_err() {
+            return false;
         }
         let kind = fh[0];
         let len = u32::from_be_bytes([fh[1], fh[2], fh[3], fh[4]]) as usize;
