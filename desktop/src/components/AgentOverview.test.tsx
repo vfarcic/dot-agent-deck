@@ -2110,7 +2110,7 @@ describe("DeckShell", () => {
     render(<DeckShell runtime={runtime({ snapshot: createFixtureSnapshot("connected") })} />);
     await waitFor(() => expect(screen.getByTestId("overview-table-region")).toBeVisible());
 
-    fireEvent.click(screen.getByRole("button", { name: "Open Planner agent" }));
+    fireEvent.click(screen.getByRole("button", { name: "Open Plan / architecture agent" }));
     expect(screen.getByTestId("agent-pane-overlay")).toBeVisible();
     fireEvent.keyDown(window, { key: "Escape" });
     expect(screen.queryByTestId("agent-pane-overlay")).not.toBeInTheDocument();
@@ -2243,7 +2243,7 @@ describe("DeckShell", () => {
     expect(rail()).toHaveLength(1);
     expect(entries()).toEqual(deckEntries);
 
-    fireEvent.click(screen.getByRole("button", { name: "Open Planner agent" }));
+    fireEvent.click(screen.getByRole("button", { name: "Open Plan / architecture agent" }));
     expect(screen.getByTestId("agent-pane-overlay")).toBeVisible();
     expect(rail()).toHaveLength(1);
     expect(entries()).toEqual(deckEntries);
@@ -2260,7 +2260,7 @@ describe("DeckShell", () => {
 
     fireEvent.click(screen.getByTestId("open-overview"));
     expect(current()).toBe("Overview");
-    fireEvent.click(screen.getByRole("button", { name: "Open Planner agent" }));
+    fireEvent.click(screen.getByRole("button", { name: "Open Plan / architecture agent" }));
     expect(current()).toBe("Overview");
   });
 

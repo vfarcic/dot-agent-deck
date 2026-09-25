@@ -41,7 +41,7 @@ test.describe("desktop navigation rail", () => {
     await expect(rail(page).locator("nav button")).toHaveText(entries);
     await expect(rail(page).locator("[aria-current='page']")).toHaveText("Overview");
 
-    await page.getByRole("button", { name: "Open Planner agent" }).click();
+    await page.getByRole("button", { name: "Open Plan / architecture agent" }).click();
     await expect(page.getByTestId("agent-pane-overlay")).toBeVisible();
     await expect(rail(page)).toHaveCount(1);
     await expect(rail(page).locator("nav button")).toHaveText(entries);
@@ -68,7 +68,7 @@ test.describe("desktop navigation rail", () => {
   test("returns from an agent pane to the overview with experimental off", async ({ page }) => {
     await page.goto("/?fixture=1&state=connected");
     await expect(page.getByTestId("overview-table-region")).toBeVisible();
-    await page.getByRole("button", { name: "Open Planner agent" }).click();
+    await page.getByRole("button", { name: "Open Plan / architecture agent" }).click();
     await expect(page.getByTestId("agent-pane-overlay")).toBeVisible();
     await page.keyboard.press("Escape");
     await expect(page.getByTestId("agent-pane-overlay")).toHaveCount(0);

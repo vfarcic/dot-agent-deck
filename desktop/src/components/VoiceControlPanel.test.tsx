@@ -618,18 +618,25 @@ describe("voice control panel", () => {
     expect(screen.queryByText(NOTHING_DISPATCHED)).not.toBeInTheDocument();
   });
 
-  /** Scenario: the same overlay command resolves where its host is absent. The report corrects it and nothing opens. */
-  it("reports an unavailable overlay dispatch from the overview without throwing", async () => {
+  /** Scenario: a stale resolver names a deck-only drawer action on the overview. The app reports that it cannot dispatch it without throwing or opening a drawer. */
+  it("reports an unavailable deck-only dispatch from the overview without throwing", async () => {
     vi.useFakeTimers();
-    const voice = automaticVoice(heard("open settings"));
-    const resolveVoice = resolver(result(OPEN_SETTINGS_DISPATCH));
+    const voice = automaticVoice(heard("show evidence drawer"));
+    const resolveVoice = resolver(result({
+      kind: "dispatch",
+      transcript: "show evidence drawer",
+      action: "show_evidence_drawer",
+      invoke: "toggleEvidenceDrawer",
+      params: [],
+      sentence: "Showing evidence drawer.",
+    }));
     render(<DeckShell runtime={runtime(resolveVoice, voice)} initialView={{ kind: "overview" }} />);
 
     await turnVoiceOn(voice);
     await completeAutomaticUtterance(voice);
 
     expect(screen.getByText(NOTHING_DISPATCHED)).toBeVisible();
-    expect(screen.queryByTestId("settings-panel")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("evidence-drawer")).not.toBeInTheDocument();
   });
 
   /** Scenario: a voice command navigates to the overview, then its transient Undo returns to the prior deck view. */
