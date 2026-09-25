@@ -100,6 +100,21 @@ CLIP_IDLE=2
 # (render_cast defaults speed to 1). Pre-rendered gif/mp4 clips bypass agg (and
 # the re-timer) entirely, so neither affects them.
 CLIP_SPEED="${CLIP_SPEED:-1.0}"
+# How long a clip's FINAL state stays on screen. agg holds the last frame for
+# --last-frame-duration (3s by default), on top of whatever time the cast itself
+# already spends on that state after its last visible change (the trailing
+# render-loop ticks, which retime.sh --trailing measures). Left at agg's default,
+# the two stack: issue #365 measured PRD #341's reel ending on 5.27s of one
+# identical frame, ~2.2s of cast tail plus agg's hold. So the hold is sized per
+# clip instead: CLIP_LAST_FRAME seconds (a short closing beat), raised just
+# enough that the final state is visible for at least CLIP_FINAL_DWELL seconds
+# in total. The floor matters for a cast that ENDS on its payoff — a test that
+# stops recording the moment its assertion matches paints the answer at or near
+# its last event, with little or no tail — and adds nothing once the tail is at
+# least CLIP_FINAL_DWELL - CLIP_LAST_FRAME. Both are env-overridable, in seconds
+# of reel time.
+CLIP_LAST_FRAME="${CLIP_LAST_FRAME:-1}"
+CLIP_FINAL_DWELL="${CLIP_FINAL_DWELL:-2}"
 # A card is one static frame. agg only needs a brief span to paint it, so the
 # synthetic card cast holds for CARD_RENDER_SPAN seconds and is rendered with a
 # small idle limit (CARD_IDLE); agg collapses that static span to a single
@@ -497,9 +512,13 @@ make_card_cast() {
 # to FONT_SIZE only when the caller has nothing to fit; `speed` defaults to 1 so
 # cards (static stills) are never slowed — only the clip path passes CLIP_SPEED.
 # The `--` terminates option parsing so an untrusted clip path like "-foo.cast" is
-# taken as the positional input, never mistaken for an agg option.
+# taken as the positional input, never mistaken for an agg option. `last_frame`
+# is agg's --last-frame-duration; cards omit it (only their first frame is ever
+# used, see freeze_still), so agg's default applies to them unchanged.
 render_cast() {
-  local cast="$1" gif="$2" idle="$3" font="${4:-$FONT_SIZE}" speed="${5:-1}"
+  local cast="$1" gif="$2" idle="$3" font="${4:-$FONT_SIZE}" speed="${5:-1}" last_frame="${6:-}"
+  local last_frame_args=()
+  [[ -z "$last_frame" ]] || last_frame_args=(--last-frame-duration "$last_frame")
   # Capture agg's stderr to a temp file (under WORKDIR, so the EXIT trap cleans
   # it up) instead of discarding it. stdout stays /dev/null and the success path
   # stays quiet, but on a NON-ZERO agg exit we surface agg's real error here —
@@ -508,7 +527,7 @@ render_cast() {
   # (the clip path calls this same function).
   local err="$WORKDIR/agg.err"
   if ! agg --theme "$THEME" --font-size "$font" --fps-cap "$FPS" \
-    --idle-time-limit "$idle" --speed "$speed" -- "$cast" "$gif" >/dev/null 2>"$err"; then
+    --idle-time-limit "$idle" --speed "$speed" ${last_frame_args[@]+"${last_frame_args[@]}"} -- "$cast" "$gif" >/dev/null 2>"$err"; then
     cat "$err" >&2
     die "agg failed to render $cast (exit non-zero); see agg error above"
   fi
@@ -644,7 +663,15 @@ for ((i = 0; i < n; i++)); do
       read -r clip_cols clip_rows < <(cast_grid "$clip")
       clip_font="${CLIP_FONT_SIZE:-$(fit_font_size "$clip_cols" "$clip_rows")}"
       note "clip $i: grid ${clip_cols}x${clip_rows} rendered at font $clip_font"
-      render_cast "$WORKDIR/clip_$i.retimed.cast" "$WORKDIR/clip_$i.gif" "$CLIP_IDLE" "$clip_font" "$CLIP_SPEED"
+      # Size the final-frame hold (see CLIP_LAST_FRAME above). The tail is in cast
+      # seconds, so divide by CLIP_SPEED to get the reel seconds agg will show it
+      # for; agg's --last-frame-duration itself is not scaled by --speed.
+      tail_s="$("$RETIME_SCRIPT" --trailing "$WORKDIR/clip_$i.retimed.cast")"
+      last_frame="$(awk -v t="$tail_s" -v sp="$CLIP_SPEED" -v lf="$CLIP_LAST_FRAME" -v fd="$CLIP_FINAL_DWELL" \
+        'BEGIN { need = fd - (sp > 0 ? t / sp : t); printf "%.3f", (need > lf ? need : lf) }')"
+      note "$(awk -v t="$tail_s" -v lf="$last_frame" -v i="$i" \
+        'BEGIN { printf "clip %s: final state has a %.2fs cast tail, held a further %.2fs", i, t, lf }')"
+      render_cast "$WORKDIR/clip_$i.retimed.cast" "$WORKDIR/clip_$i.gif" "$CLIP_IDLE" "$clip_font" "$CLIP_SPEED" "$last_frame"
       warn_aspect "$WORKDIR/clip_$i.gif" "clip $i ($clip)"
       natives+=("$WORKDIR/clip_$i.gif")
       holds+=("") ;;
