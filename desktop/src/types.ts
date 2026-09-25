@@ -343,6 +343,33 @@ export type NewAgentOptions =
   | { kind: "unsupported"; desktopAgents: NewAgentOption[]; lastCommand?: string };
 
 /**
+ * Which of the app's experimental surfaces to show (issue #1198) — the Tauri
+ * `desktop_features` reply, one field per `features::show_desktop_*` wrapper in
+ * the root crate.
+ *
+ * It is the DESKTOP process's flag and belongs to the app, not to a deck — do
+ * not confuse it with {@link NewAgentOptions}' per-deck `experimental`. All
+ * `false` is the shipped default. The agent overview, the agent overlay and
+ * Settings have no field because they are never gated.
+ */
+export interface DesktopFeatures {
+  showDeck: boolean;
+  showProjects: boolean;
+  showPrompts: boolean;
+  showWorkflows: boolean;
+  showAgentProfiles: boolean;
+}
+
+/** Every experimental surface hidden — the shipped default, and what fixture mode answers unless `?experimental=1`. */
+export const DEFAULT_DESKTOP_FEATURES: DesktopFeatures = {
+  showDeck: false,
+  showProjects: false,
+  showPrompts: false,
+  showWorkflows: false,
+  showAgentProfiles: false,
+};
+
+/**
  * The orchestrations the New agent form can offer for one directory on one deck
  * (PRD #1223 M6) — that deck's `ResolveProject` answer.
  *
@@ -489,7 +516,7 @@ export interface AgentSession {
    *
    * A DISPLAY COPY, sanitised and clamped to `DISPLAY_LIMITS.prompt` by
    * `agentFromDto`'s `taskLine`, because `AgentTile` prints it straight into a
-   * DOM text node and the deck is the screen the app opens on. Bounding it at
+   * DOM text node on the deck, one of the app's two screens. Bounding it at
    * the projection rather than at that one tile is deliberate: nothing sorts,
    * groups or keys on this field, so making it a display copy costs nothing and
    * makes every consumer of it safe by construction rather than by memory.
@@ -695,6 +722,12 @@ export interface DeckSnapshot {
    * be compared.
    */
   scheduleRevision?: number;
+  /**
+   * The crate's applied selection is All Decks (#1083), so this snapshot is the
+   * local deck's only because the plumbing needs one. The deck screen reads it
+   * to show "Select a deck" instead. Absent in fixture mode.
+   */
+  allDecks?: boolean;
   stages: WorkflowStage[];
   agents: AgentSession[];
   evidence: EvidenceItem[];
@@ -982,6 +1015,23 @@ export interface AgentTarget {
   agentId: string;
 }
 
+/**
+ * Issue #1234 — one failed action's roles whose stop could not be confirmed.
+ * `id` is minted by the runtime per rejection, so two warnings naming the same
+ * roles are still two warnings, dismissed separately.
+ */
+export interface CleanupWarningEntry {
+  id: number;
+  stops: readonly string[];
+  /**
+   * The deck the failed action was sent to, as a display label (`deckName`),
+   * resolved when it failed. The warning outlives the screen and the selection
+   * it was raised under, so "this deck" would name whichever deck is selected
+   * when it is read. Absent only when that deck was not in the fleet.
+   */
+  deck?: string;
+}
+
 export interface DeckRuntimeState {
   mode: RuntimeMode;
   /**
@@ -1007,13 +1057,23 @@ export interface DeckRuntimeState {
   terminalFeed?: TerminalFeed;
   error?: string;
   /**
-   * PRD #1223 audit V7 — the roles a failed launch could not confirm are
-   * stopped, for the copy of the failure `error` carries. Absent unless the
-   * last action rejected with a `LaunchCleanupError`.
+   * Issue #1234 — every unconfirmed-stop warning not yet dismissed, oldest
+   * first: one per action that rejected with a `LaunchCleanupError`.
+   *
+   * Deliberately NOT part of `error`. That is the single latest failure, and
+   * the next failure, the next action and `reconnect()` all replace or clear
+   * it — so a warning that roles may still be running, carried beside it,
+   * could be replaced in the same React batch it was set in and never reach
+   * a frame. An entry here is removed by {@link dismissCleanupWarning} and by
+   * nothing else. Optional so render-only test runtimes need not carry it; the
+   * real runtime always does.
    */
-  errorCleanup?: readonly string[];
+  cleanupWarnings?: readonly CleanupWarningEntry[];
+  /** Remove one entry of {@link cleanupWarnings} — the user's explicit dismissal. */
+  dismissCleanupWarning?: (id: number) => void;
   /**
-   * Drop the last action's error and the cleanup roles with it (issue #1046).
+   * Drop the last action's error (issue #1046). The cleanup warnings are
+   * untouched — see {@link cleanupWarnings}.
    *
    * Required rather than optional: the toast in `App.tsx` renders on
    * `notice || error`, so a runtime that cannot clear `error` produces a toast
@@ -1214,4 +1274,22 @@ export interface DeckRuntimeState {
    * no webview to scale.
    */
   setZoom: (level: number) => Promise<number>;
+  /**
+   * Issue #1198 — which of the app's experimental surfaces this window shows,
+   * read ONCE when the runtime starts (see {@link desktopFeaturesOf}).
+   *
+   * Optional, and `undefined` reads as every surface hidden: before the answer
+   * arrives, when the bridge has no such method, and when the call is refused.
+   * The flag defaults OFF, and an unanswered question must not show a surface.
+   */
+  desktopFeatures?: DesktopFeatures;
+}
+
+/**
+ * The features a runtime carries, with a missing answer read as the shipped
+ * default (issue #1198). Every gated call site reads through this, so it reads
+ * `features.showDeck` rather than guarding `undefined` itself.
+ */
+export function desktopFeaturesOf(runtime: Pick<DeckRuntimeState, "desktopFeatures">): DesktopFeatures {
+  return runtime.desktopFeatures ?? DEFAULT_DESKTOP_FEATURES;
 }

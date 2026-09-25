@@ -651,6 +651,12 @@ pub struct TuiDeck {
     /// are scrubbed immediately before they are written so an agent or provider
     /// that echoes a credential cannot persist it in `full-stream.cast`.
     recording_redactions: Vec<String>,
+    /// The lazy-spawned daemon's `<state_dir>/daemon.log`, which receives its
+    /// stdout and stderr — including every `StderrNotifier` dispatch outcome
+    /// (issue #692). The state dir sits inside `tempdir`, so without the dump in
+    /// [`TuiDeck::dump_recordings`] a failing test deleted the one line that says
+    /// why. `None` when a test's `with_env` removed the state-dir pin.
+    daemon_log_path: Option<PathBuf>,
 }
 
 /// Observable terminal-cell styling from the outer vt100 screen driven by the
@@ -1180,6 +1186,11 @@ impl TuiDeck {
         for (k, v) in builder.extra_env {
             final_env.insert(k, v);
         }
+        // Read AFTER the `with_env` layer, so a test that moves the state dir
+        // still gets its own daemon's log dumped rather than a missing path.
+        let daemon_log_path = final_env
+            .get("DOT_AGENT_DECK_STATE_DIR")
+            .map(|dir| PathBuf::from(dir).join("daemon.log"));
         for (k, v) in final_env {
             cmd.env(k, v);
         }
@@ -1291,6 +1302,7 @@ impl TuiDeck {
             rows: builder.rows,
             record_on_success,
             recording_redactions,
+            daemon_log_path,
         })
     }
 
@@ -2212,6 +2224,30 @@ impl Drop for TuiDeck {
     }
 }
 
+/// How much of a failed run's `daemon.log` [`eprint_daemon_log_tail`] echoes.
+const DAEMON_LOG_TAIL_LINES: usize = 40;
+
+/// Echo the tail of an already-redacted daemon log to stderr (issue #692).
+///
+/// The dumped file is enough on a developer machine, but CI uploads nextest's
+/// JUnit report and not the recordings directory, and the report carries the
+/// test's captured stderr — so this is what puts a dispatch failure's reason in
+/// front of whoever reads a red `e2e-deterministic` run. Bounded, because a
+/// chatty daemon must not bury the assertion that failed.
+fn eprint_daemon_log_tail(redacted: &[u8], where_the_rest_is: &str) {
+    let text = String::from_utf8_lossy(redacted);
+    let lines: Vec<&str> = text.lines().collect();
+    let start = lines.len().saturating_sub(DAEMON_LOG_TAIL_LINES);
+    eprintln!(
+        "[tui-harness] daemon.log (last {} of {} lines; {where_the_rest_is}):",
+        lines.len() - start,
+        lines.len(),
+    );
+    for line in &lines[start..] {
+        eprintln!("[daemon.log] {line}");
+    }
+}
+
 /// Best-effort: regenerate the paired `.md` for the currently-running
 /// test. Looks up the test by its Rust thread-name (which is the fn
 /// name in cargo test), maps that to a spec id via the discovered
@@ -2322,6 +2358,32 @@ impl TuiDeck {
             let bytes = std::fs::read(&fixture_src)?;
             let redacted = redact_known_credentials_bytes(&bytes, &redactions);
             atomic_write(&dir.join("fixture.toml"), &redacted)?;
+        }
+
+        // daemon.log — issue #692. The detached daemon's stdout+stderr, which is
+        // where every dispatch outcome's reason lands (`StderrNotifier`); the
+        // tracing log carries nothing for the dispatch prologue, so this is the
+        // only record of why a dispatch test saw no agents. It lives in the
+        // per-test tempdir and is deleted with it, so it is copied out here.
+        // Absent when the run never spawned a daemon (or reused an external
+        // one), which is not an error. Redacted like every other artifact,
+        // because the daemon echoes `gh`'s stderr verbatim.
+        if let Some(src) = self.daemon_log_path.as_deref() {
+            match std::fs::read(src) {
+                Ok(bytes) => {
+                    let redacted = redact_known_credentials_bytes(&bytes, &redactions);
+                    atomic_write(&dir.join("daemon.log"), &redacted)?;
+                    if outcome == RecordingOutcome::Failed {
+                        let copy = dir.join("daemon.log");
+                        eprint_daemon_log_tail(
+                            &redacted,
+                            &format!("full copy at {}", copy.display()),
+                        );
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
         }
 
         // provenance.json — issue #808. Written LAST on purpose: the adapter
@@ -4278,12 +4340,13 @@ pub fn current_test_recordings_dir() -> PathBuf {
 /// will publish the cast, so removing it before the cast means a discard that
 /// panics partway has already made whatever survives unpublishable. The dump
 /// writes it LAST for the mirror-image reason.
-const RECORDING_ARTIFACTS: [&str; 5] = [
+const RECORDING_ARTIFACTS: [&str; 6] = [
     "provenance.json",
     "final-grid.txt",
     "final-grid.svg",
     "full-stream.cast",
     "fixture.toml",
+    "daemon.log",
 ];
 
 /// Schema version of the `provenance.json` sidecar (issue #808).
@@ -8764,6 +8827,20 @@ impl Drop for DaemonProc {
         }
         let _ = self.child.kill();
         let _ = self.child.wait();
+        // Issue #692: the captured stderr is where the scheduler reports WHY a
+        // dispatch failed, and it lives in `_tempdir`, which is removed right
+        // after this. On a failing test, echo its tail so the reason survives
+        // into nextest's output (and CI's JUnit report) instead of going with
+        // the tempdir.
+        if std::thread::panicking()
+            && let Ok(bytes) = std::fs::read(&self.stderr_path)
+        {
+            let redacted = redact_credentials_for_output(&String::from_utf8_lossy(&bytes));
+            eprint_daemon_log_tail(
+                redacted.as_bytes(),
+                "the file itself is removed with the test's tempdir",
+            );
+        }
     }
 }
 
@@ -9117,8 +9194,8 @@ impl DaemonProc {
         want: usize,
         timeout: Duration,
     ) -> bool {
-        use dot_agent_deck::daemon_protocol::{KIND_REQ, KIND_RESP, KIND_STREAM_OUT};
-        use std::io::{Read, Write};
+        use dot_agent_deck::daemon_protocol::KIND_REQ;
+        use std::io::Write;
 
         let Ok(mut stream) = std::os::unix::net::UnixStream::connect(&self.attach_socket) else {
             return false;
@@ -9144,37 +9221,7 @@ impl DaemonProc {
         }
         let _ = stream.flush();
 
-        let mut acc: Vec<u8> = Vec::new();
-        let needle_bytes = needle.as_bytes();
-        let deadline = Instant::now() + timeout;
-        while Instant::now() < deadline {
-            let mut fh = [0u8; 5];
-            match stream.read_exact(&mut fh) {
-                Ok(()) => {}
-                Err(ref e)
-                    if e.kind() == std::io::ErrorKind::WouldBlock
-                        || e.kind() == std::io::ErrorKind::TimedOut =>
-                {
-                    continue;
-                }
-                Err(_) => return false,
-            }
-            let kind = fh[0];
-            let len = u32::from_be_bytes([fh[1], fh[2], fh[3], fh[4]]) as usize;
-            let mut body = vec![0u8; len];
-            if len > 0 && read_exact_with_deadline(&mut stream, &mut body, deadline).is_err() {
-                return false;
-            }
-            if kind == KIND_STREAM_OUT {
-                acc.extend_from_slice(&body);
-                if count_occurrences(&acc, needle_bytes) >= want {
-                    return true;
-                }
-            } else if kind == KIND_RESP {
-                continue;
-            }
-        }
-        false
+        read_attach_stream_until(&mut stream, needle, want, Instant::now() + timeout)
     }
 
     /// Simulate a user keystroke into a pane: attach to `agent_id` and send one
@@ -9218,9 +9265,24 @@ impl DaemonProc {
             return false;
         }
         let _ = stream.flush();
-        // Hold the connection open briefly so the daemon drains the STREAM_IN
-        // before the socket closes (defensive; the kernel buffers regardless).
-        std::thread::sleep(Duration::from_millis(50));
+        // Hold the connection until the daemon has provably reached its input
+        // loop, rather than for a fixed 50 ms (issue #1137). The kernel buffers
+        // the inbound STREAM_IN either way, but the daemon writes the
+        // `AttachStream` OK and the scrollback snapshot BEFORE it starts reading
+        // input, and a write to a socket we have already closed fails with
+        // `EPIPE` — which ends the handler with the keystroke still unread. Any
+        // STREAM_OUT carrying the echo proves both writes landed: the snapshot
+        // is written before live output starts, and an echo already in the
+        // replayed scrollback is equally past that point. From there the input
+        // loop reads the buffered frame before it can observe our EOF.
+        if !read_attach_stream_until(
+            &mut stream,
+            input,
+            1,
+            Instant::now() + Duration::from_secs(5),
+        ) {
+            return false;
+        }
         drop(stream);
         // Confirm the keystroke reached the PTY (and was timestamped) by
         // observing its echo on a fresh attach.
@@ -9527,6 +9589,61 @@ fn read_framed(
         }
     }
     Ok(Some((kind, body)))
+}
+
+/// Read an attach stream's frames until `needle` has appeared at least `want`
+/// (non-overlapping) times in its cumulative STREAM_OUT, or `deadline` passes.
+///
+/// The frame loop [`DaemonProc::attach_and_wait_for_occurrences`] and
+/// [`DaemonProc::send_pane_input`] share, the second so that it can hold its
+/// own connection open until the daemon has provably reached the input loop
+/// (issue #1137). A `KIND_RESP` answered `ok: false` returns `false` at once:
+/// the daemon sends no stream after refusing an attach, so waiting out the
+/// deadline could not change the answer.
+#[cfg(unix)]
+#[allow(dead_code)]
+fn read_attach_stream_until(
+    stream: &mut std::os::unix::net::UnixStream,
+    needle: &str,
+    want: usize,
+    deadline: Instant,
+) -> bool {
+    use dot_agent_deck::daemon_protocol::{KIND_RESP, KIND_STREAM_OUT};
+
+    let mut acc: Vec<u8> = Vec::new();
+    let needle_bytes = needle.as_bytes();
+    while Instant::now() < deadline {
+        // Through `read_exact_with_deadline`, which keeps what it has already
+        // read across a socket read timeout. A bare `read_exact` retried after
+        // `WouldBlock` discards a partially filled header, and the next read
+        // then takes the header's tail for a new one (raised by Qodo on PR
+        // #1304). Its `TimedOut` at the deadline ends the wait like any other
+        // error: the deadline is this loop's own.
+        let mut fh = [0u8; 5];
+        if read_exact_with_deadline(stream, &mut fh, deadline).is_err() {
+            return false;
+        }
+        let kind = fh[0];
+        let len = u32::from_be_bytes([fh[1], fh[2], fh[3], fh[4]]) as usize;
+        let mut body = vec![0u8; len];
+        if len > 0 && read_exact_with_deadline(stream, &mut body, deadline).is_err() {
+            return false;
+        }
+        if kind == KIND_STREAM_OUT {
+            acc.extend_from_slice(&body);
+            if count_occurrences(&acc, needle_bytes) >= want {
+                return true;
+            }
+        } else if kind == KIND_RESP {
+            let refused =
+                serde_json::from_slice::<dot_agent_deck::daemon_protocol::AttachResponse>(&body)
+                    .is_ok_and(|resp| !resp.ok);
+            if refused {
+                return false;
+            }
+        }
+    }
+    false
 }
 
 /// Count non-overlapping occurrences of `needle` in `hay`.

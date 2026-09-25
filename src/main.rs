@@ -111,6 +111,12 @@ enum Commands {
         /// Role name(s) to delegate to (repeatable)
         #[arg(long)]
         to: Vec<String>,
+        /// Dispatch even to a worker that still owes a work-done for an
+        /// earlier delegation. Without it the daemon refuses that worker and
+        /// says how many delegations it still owes. Use it when the earlier
+        /// task is abandoned and this one replaces it.
+        #[arg(long)]
+        supersede: bool,
     },
     /// Create a git worktree and start an isolated line of work inside it.
     /// Agent-callable, one step (PRD #220).
@@ -764,6 +770,13 @@ fn send_signal_and_report_ack(json: &str, verb: &str, subject: &str) -> ExitCode
 ///   contract "non-zero ⇒ it did not land" would retry and dispatch those panes
 ///   a second time, arming two records for one pane. The message names both
 ///   sides so a retry can be aimed at just the roles that missed.
+///
+/// Issue #580 adds `busy` — roles refused because their worker still owes a
+/// `work-done` — under the same contract. When NOTHING was dispatched the daemon
+/// also sets `error`, so the first arm above reports it and fails. When some role
+/// WAS dispatched, a busy role is a partial miss exactly like an unresolved one:
+/// a warning, exit 0. And `superseded` — a `--supersede` that did replace an
+/// unanswered delegation — is reported rather than silent, but is not a miss.
 fn delegate_verdict(
     pane_id: &str,
     resp: &dot_agent_deck::event::DelegateResponse,
@@ -776,37 +789,75 @@ fn delegate_verdict(
             )),
         };
     }
+    let mut notes: Vec<String> = Vec::new();
+    if !resp.superseded.is_empty() {
+        notes.push(format!(
+            "Note: dispatched to worker(s) that still owed a work-done for an earlier \
+             delegation: {}. That earlier task is not cancelled — its work-done, if it comes, is \
+             credited like any other.",
+            dot_agent_deck::state::describe_busy_workers(&resp.superseded)
+        ));
+    }
+    if !resp.busy.is_empty() {
+        let delivered = if resp.delivered.is_empty() {
+            String::new()
+        } else {
+            format!(" It WAS delivered to: {}.", resp.delivered.join(", "))
+        };
+        notes.push(format!(
+            "Warning: delegate from pane {pane_id} was NOT sent to worker(s) that still owe a \
+             work-done for an earlier delegation: {}.{delivered} {}",
+            dot_agent_deck::state::describe_busy_workers(&resp.busy),
+            dot_agent_deck::state::busy_worker_remedy()
+        ));
+    }
     if resp.unresolved_roles.is_empty() {
         return DelegateVerdict {
-            failed: false,
-            message: None,
+            // A reply with `busy` and an empty `delivered` but no `error` is not
+            // one this daemon writes; if one arrives, nothing landed.
+            failed: resp.delivered.is_empty() && !resp.busy.is_empty(),
+            message: (!notes.is_empty()).then(|| notes.join("\n")),
         };
     }
     let unresolved = resp.unresolved_roles.join(", ");
-    // The three causes, stated as the three causes rather than as the one that
-    // happens to be most common.
+    // The four causes, stated as the four causes rather than as the one that
+    // happens to be most common. Issue #554 added the fourth: the daemon routes
+    // by the role name a pane was started with, so a role renamed in the toml
+    // after the orchestration started is present in the file and still reaches
+    // nobody — the first cause alone sent the user to a file that looked right.
     let causes = "(A role reaches no worker when it is absent from \
                   .dot-agent-deck.toml, when it is the delegating orchestrator \
-                  itself — an orchestrator cannot delegate to itself — or when \
-                  its worker pane has been closed.)";
+                  itself — an orchestrator cannot delegate to itself — when \
+                  its worker pane has been closed, or when the role was renamed \
+                  or added in .dot-agent-deck.toml after this orchestration \
+                  started — running panes keep the role names they were started \
+                  with until the orchestration is restarted.)";
     if resp.delivered.is_empty() {
-        return DelegateVerdict {
-            failed: true,
-            message: Some(format!(
+        notes.insert(
+            0,
+            format!(
                 "Error: delegate from pane {pane_id} reached no worker for role(s): \
                  {unresolved}. No role in this orchestration received it. {causes}"
-            )),
+            ),
+        );
+        return DelegateVerdict {
+            failed: true,
+            message: Some(notes.join("\n")),
         };
     }
-    DelegateVerdict {
-        failed: false,
-        message: Some(format!(
+    notes.insert(
+        0,
+        format!(
             "Warning: delegate from pane {pane_id} reached no worker for role(s): \
              {unresolved}. It WAS delivered to: {}. Retry only the roles that \
              missed — re-sending the whole delegate would dispatch the delivered \
              roles a second time. {causes}",
             resp.delivered.join(", ")
-        )),
+        ),
+    );
+    DelegateVerdict {
+        failed: false,
+        message: Some(notes.join("\n")),
     }
 }
 
@@ -944,6 +995,7 @@ fn main() -> ExitCode {
             task,
             task_file,
             to,
+            supersede,
         }) => {
             let pane_id = match std::env::var(DOT_AGENT_DECK_PANE_ID) {
                 Ok(id) => id,
@@ -974,6 +1026,7 @@ fn main() -> ExitCode {
                 pane_id,
                 task,
                 to,
+                supersede,
                 timestamp: chrono::Utc::now(),
                 token: dot_agent_deck::hook_provenance::token_from_env(),
             };
@@ -3335,10 +3388,12 @@ mod tests {
                 task,
                 task_file,
                 to,
+                supersede,
             }) => {
                 assert_eq!(task, None);
                 assert_eq!(task_file.as_deref(), Some("/tmp/t.txt"));
                 assert_eq!(to, vec!["coder".to_string()]);
+                assert!(!supersede, "--supersede is opt-in (issue #580)");
             }
             _ => panic!("expected `delegate`"),
         }
@@ -3418,6 +3473,69 @@ mod tests {
         }
     }
 
+    fn busy(role: &str, outstanding: u32) -> dot_agent_deck::event::BusyWorker {
+        dot_agent_deck::event::BusyWorker {
+            role: role.to_string(),
+            outstanding,
+            oldest_age_secs: 12 * 60,
+        }
+    }
+
+    /// Issue #580: a busy worker beside a delivered one is a partial outcome.
+    /// Exit 0 — the delivered role really has the task, and a failure would
+    /// invite a retry that dispatches it twice — with a warning naming the busy
+    /// role, what it owes, and the remedy.
+    #[test]
+    fn delegate_verdict_warns_about_a_busy_worker_on_a_partial_delivery() {
+        let mut resp = reply(&["tester"], &[], None);
+        resp.busy = vec![busy("coder", 1)];
+        let v = delegate_verdict("pane-1", &resp);
+        assert!(!v.failed, "the tester was dispatched: exit 0");
+        let msg = v.message.expect("a busy worker must never be silent");
+        assert!(
+            msg.contains("NOT sent")
+                && msg.contains("[UNTRUSTED-ROLE-LABEL: coder :END-UNTRUSTED-ROLE-LABEL]")
+                && msg.contains("1 unanswered delegation,")
+                && msg.contains("12 minutes ago")
+                && msg.contains("It WAS delivered to: tester")
+                && msg.contains("--supersede"),
+            "the warning must name the busy role, its debt, the delivered roles and the \
+             remedy: {msg}"
+        );
+    }
+
+    /// Issue #580: when every worker was busy the daemon sets `error`, and the
+    /// verdict is the ordinary routing failure — non-zero, because nothing landed.
+    #[test]
+    fn delegate_verdict_fails_when_every_worker_was_busy() {
+        let mut resp = reply(&[], &[], Some("this delegate was NOT sent"));
+        resp.busy = vec![busy("coder", 2)];
+        let v = delegate_verdict("pane-1", &resp);
+        assert!(v.failed, "nothing was dispatched: non-zero");
+        assert!(v.message.expect("reported").contains("NOT sent"));
+
+        // Defense in depth: the same outcome without `error` is still a failure.
+        let mut resp = reply(&[], &[], None);
+        resp.busy = vec![busy("coder", 2)];
+        assert!(delegate_verdict("pane-1", &resp).failed);
+    }
+
+    /// Issue #580: a `--supersede` that replaced an unanswered delegation is
+    /// reported rather than silent — "at minimum reported as superseding" — but
+    /// it is a success: the task was dispatched as asked.
+    #[test]
+    fn delegate_verdict_reports_a_supersession_without_failing() {
+        let mut resp = reply(&["coder"], &[], None);
+        resp.superseded = vec![busy("coder", 1)];
+        let v = delegate_verdict("pane-1", &resp);
+        assert!(!v.failed);
+        let msg = v.message.expect("a supersession must be reported");
+        assert!(
+            msg.contains("still owed a work-done") && msg.contains("UNTRUSTED-ROLE-LABEL: coder"),
+            "the note must name the superseded worker: {msg}"
+        );
+    }
+
     #[test]
     fn delegate_verdict_reports_a_full_delivery_silently() {
         let v = delegate_verdict("pane-1", &reply(&["coder", "tester"], &[], None));
@@ -3445,15 +3563,21 @@ mod tests {
             msg.contains("ghost"),
             "the message must name the role that missed: {msg}"
         );
-        // The three causes, not the one that happens to be most common: the
+        // The four causes, not the one that happens to be most common: the
         // old message told the user to go check role names in the toml even
         // when the role was sitting there correctly and was simply the
-        // orchestrator itself, or had had its worker pane closed.
+        // orchestrator itself, or had had its worker pane closed — or, issue
+        // #554, had been renamed in the toml after the orchestration started,
+        // which leaves the file looking right while the daemon still routes by
+        // the old name.
         assert!(
             msg.contains(".dot-agent-deck.toml")
                 && msg.contains("orchestrator cannot delegate to itself")
-                && msg.contains("worker pane has been closed"),
-            "the message must state all three causes, not assert one: {msg}"
+                && msg.contains("worker pane has been closed")
+                && msg.contains(
+                    "renamed or added in .dot-agent-deck.toml after this orchestration started"
+                ),
+            "the message must state all four causes, not assert one: {msg}"
         );
     }
 

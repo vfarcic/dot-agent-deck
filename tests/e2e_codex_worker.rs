@@ -147,6 +147,7 @@ async fn codex_worker_001_inner() {
             "First create {SENTINEL_NAME} in the current working directory with the exact contents {SENTINEL_CONTENT} and no trailing newline. Then run the dot-agent-deck work-done command from the completion instructions below. Do not stop before both steps are complete."
         ),
         to: vec![WORKER_ROLE.to_string()],
+        supersede: false,
         timestamp: chrono::Utc::now(),
         token: None,
     };

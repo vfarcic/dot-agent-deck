@@ -58,7 +58,7 @@ pub enum Action {
     ToggleLayout,
     /// Toggle the deck-global command-entry lock — whether direct keystrokes
     /// reach a focused non-orchestrator role pane's PTY. Claimed only on an
-    /// Orchestration tab in command mode (see `scope_command_entry_lock`).
+    /// Orchestration tab in command mode (see `scope_orchestration_chord`).
     ToggleOrchestrationLock,
     /// PRD #336: toggle the orchestration sidebar/pane-column split between
     /// the default 34/66 ratio and a narrower-sidebar 25/75. Global across

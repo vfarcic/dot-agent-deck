@@ -683,6 +683,8 @@ fn step_for_free_call(name: &str, args: &[String]) -> Option<String> {
             // are not test actions — skip them so the Steps section
             // stays focused on what the test DID.
             | "now"
+            // Issue #413: the L1 render tests' fixed stand-in for `now`.
+            | "render_now"
             | "from"
             | "from_str"
             | "new"

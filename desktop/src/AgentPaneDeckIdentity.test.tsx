@@ -1,7 +1,7 @@
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { createFixtureSnapshot, FIXTURE_DAEMON_ID } from "./data/fixture";
-import { ALL_ENDPOINT_SELECTION, DEFAULT_DESKTOP_SETTINGS, type DesktopSettingsDto } from "./lib/bridge";
+import { ALL_ENDPOINT_SELECTION, DEFAULT_DESKTOP_SETTINGS, fixtureDesktopFeatures, LOCAL_ENDPOINT_SELECTION, type DesktopSettingsDto } from "./lib/bridge";
 import type { AgentSession, DeckRuntimeState, DeckSnapshot } from "./types";
 
 /**
@@ -41,6 +41,15 @@ const remoteRow = { id: REMOTE_ROW_ID, host: "build-box", user: "dev", port: 22,
 const documentWithFleet = (): DesktopSettingsDto => ({
   ...structuredClone(DEFAULT_DESKTOP_SETTINGS),
   endpoints: { remote: [structuredClone(remoteRow)], selection: ALL_ENDPOINT_SELECTION },
+});
+/**
+ * The same row stored, with ONE deck selected. The deck screen shows "Select a
+ * deck" under All Decks (#1083), so a test of a pane opened FROM the deck
+ * screen has to be on one deck; which deck is shown is still the runtime's.
+ */
+const documentSelectingOneDeck = (): DesktopSettingsDto => ({
+  ...structuredClone(DEFAULT_DESKTOP_SETTINGS),
+  endpoints: { remote: [structuredClone(remoteRow)], selection: LOCAL_ENDPOINT_SELECTION },
 });
 
 /**
@@ -83,6 +92,7 @@ function harness(
   const sendTerminalInput = vi.fn(async () => undefined);
   const base = {
     mode: "live",
+    desktopFeatures: fixtureDesktopFeatures("?experimental=1"),
     terminalData: {},
     clearError: vi.fn(),
     runAction: vi.fn(async () => ({ ok: true })),
@@ -389,7 +399,7 @@ describe("agent pane identity fence", () => {
       available: true,
       backend: "remote" as const,
     });
-    const deck = harness(documentWithFleet(), {
+    const deck = harness(documentSelectingOneDeck(), {
       resolveVoice: vi.fn(async (utterance: string) => ({
         outcome: {
           kind: "dispatch" as const,
@@ -473,7 +483,7 @@ describe("agent pane identity fence", () => {
    * anything on screen; there is nothing left for it to be a pane over.
    */
   it("closes a deck-origin pane when the selected deck moves out from under it", async () => {
-    const deck = harness();
+    const deck = harness(documentSelectingOneDeck());
     const paneView = { kind: "agent" as const, deckId: FIXTURE_DAEMON_ID, agentId: "planner", from: "deck" as const };
     const { rerender } = render(<DeckShell runtime={deck.runtime("local")} initialView={paneView} />);
 

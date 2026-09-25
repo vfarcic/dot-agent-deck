@@ -100,7 +100,28 @@ fn commit_fixture_repo(dir: &Path) {
             .output()
             .expect("git available");
         assert!(out.status.success(), "git {args:?} failed: {out:?}");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
     };
+    // The fixture repo is the harness tempdir, which also holds the per-test
+    // `home/`. An agent CLI the deck probes can be writing there while this
+    // runs — a `codex` on PATH creates `home/.codex/.tmp/plugins-clone-*`
+    // repositories — and `git add -A` then fails on a half-cloned one
+    // ("does not have a commit checked out"). Measured once in a full lane-1
+    // pass on the #692/#1137 branch, green 3/3 alone. HOME is not part of what
+    // any of these tests dispatch, so it is ignored rather than committed;
+    // ignored rather than pathspec-excluded, so it cannot read as untracked
+    // dirt either.
+    let exclude = PathBuf::from(run(&["rev-parse", "--git-path", "info/exclude"]));
+    let exclude = if exclude.is_absolute() {
+        exclude
+    } else {
+        dir.join(exclude)
+    };
+    std::fs::create_dir_all(exclude.parent().expect("info/exclude has a parent"))
+        .expect("create the fixture's info dir");
+    let mut ignored = std::fs::read_to_string(&exclude).unwrap_or_default();
+    ignored.push_str("\n/home/\n");
+    std::fs::write(&exclude, ignored).expect("ignore the per-test HOME");
     run(&["add", "-A"]);
     run(&["commit", "-qm", "fixture baseline"]);
 }

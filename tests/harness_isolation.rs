@@ -87,12 +87,13 @@ fn harness_clears_inherited_deck_endpoints() {
 /// The artifacts the harness dumps — the set the discard has to clear. Mirrors
 /// `RECORDING_ARTIFACTS` in `tests/common/mod.rs`; the guard below proves the two
 /// lists and the dump itself still agree.
-const RECORDING_ARTIFACTS: [&str; 5] = [
+const RECORDING_ARTIFACTS: [&str; 6] = [
     "provenance.json",
     "final-grid.txt",
     "final-grid.svg",
     "full-stream.cast",
     "fixture.toml",
+    "daemon.log",
 ];
 
 fn adapter_build_script() -> String {
@@ -112,8 +113,8 @@ fn harness_source() -> String {
     std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
 }
 
-/// Scenario: Plant a stale `full-stream.cast` — plus the other three recording
-/// artifacts and the paired `test.md` — in this test's own recordings directory,
+/// Scenario: Plant a stale `full-stream.cast` — plus every other recording
+/// artifact and the paired `test.md` — in this test's own recordings directory,
 /// then take the runtime-skip path through `skip_unless!`'s helper, which is one
 /// of the routes that used to leave that cast behind while nextest reported the
 /// test as passed. Afterwards every recording artifact is gone — including the

@@ -164,5 +164,58 @@ describe("useDesktopSettings unreadable document", () => {
     await act(async () => { pending[0].resolve(withMode("dark")); });
 
     expect(result.current.saveError).toBeUndefined();
+    expect(result.current.problem).toBeUndefined();
+  });
+
+  it("exposes the load problem on its own, unchanged by a save that fails", async () => {
+    const { pending, saveSettings } = deferredSaves();
+    const { result } = await loadedHook(saveSettings, UNREADABLE);
+    expect(result.current.problem).toBe(UNREADABLE);
+
+    // A failed save replaces `saveError`, but the footer's `problem` is about
+    // the file and must still say what is wrong with it (issue #829).
+    await act(async () => { result.current.save(withMode("dark")); });
+    await act(async () => { pending[0].reject(new Error("Permission denied")); });
+    expect(result.current.saveError).toContain("Permission denied");
+    expect(result.current.problem).toBe(UNREADABLE);
+  });
+
+  it("does not let a load that resolves after an accepted save restore its stale problem", async () => {
+    // The read is still in flight when the user saves, and the backend accepts
+    // the save — the file was fixed in between. The read's problem describes the
+    // file as it was before that write, so it must not reach the footer.
+    const { pending, saveSettings } = deferredSaves();
+    let finishLoad: (snapshot: { settings: DesktopSettingsDto; path: string; problem?: string }) => void = () => undefined;
+    const value = {
+      getSettings: vi.fn(() => new Promise((resolve) => { finishLoad = resolve; })),
+      saveSettings,
+    } as unknown as DeckRuntimeState;
+    const { result } = renderHook(() => useDesktopSettings(value));
+
+    await act(async () => { result.current.save(withMode("dark")); });
+    await act(async () => { pending[0].resolve(withMode("dark")); });
+    await act(async () => { finishLoad({ settings: structuredClone(DEFAULT_DESKTOP_SETTINGS), path: "/tmp/desktop.toml", problem: UNREADABLE }); });
+
+    expect(result.current.loaded).toBe(true);
+    expect(result.current.path).toBe("/tmp/desktop.toml");
+    expect(result.current.problem).toBeUndefined();
+    expect(result.current.saveError).toBeUndefined();
+  });
+
+  it("still reports the problem a load that starts after an accepted save finds", async () => {
+    // Only a read already in flight when the save landed is stale. A later read
+    // — `getSettings` changes identity when the bridge does — describes the file
+    // as it is now, and a document broken again since must reach the footer.
+    const { pending, saveSettings } = deferredSaves();
+    const first = runtime(saveSettings);
+    const { result, rerender } = renderHook(({ value }) => useDesktopSettings(value), { initialProps: { value: first } });
+    await waitFor(() => expect(result.current.loaded).toBe(true));
+
+    await act(async () => { result.current.save(withMode("dark")); });
+    await act(async () => { pending[0].resolve(withMode("dark")); });
+    expect(result.current.problem).toBeUndefined();
+
+    rerender({ value: runtime(saveSettings, UNREADABLE) });
+    await waitFor(() => expect(result.current.problem).toBe(UNREADABLE));
   });
 });

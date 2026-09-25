@@ -347,6 +347,8 @@ describe("New agent rules — cleanup the launch could not confirm (PRD #1223 au
       overflow: 0,
     });
     expect(cleanupWarning(["plan\u202Ener"]).names).toEqual(["planner"]);
+    // Issue #1234: a warning that outlives its screen names its deck instead.
+    expect(cleanupWarning(["builder"], "Local deck").summary).toBe("1 role may still be running on Local deck: its stop could not be confirmed. Check the deck and stop it there.");
   });
 
   /**
