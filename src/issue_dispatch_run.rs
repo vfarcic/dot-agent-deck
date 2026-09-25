@@ -690,22 +690,7 @@ fn canonical_workspace(working_dir: &str) -> Result<PathBuf, String> {
 async fn provision_repo(workspace: &Path, clone_dir: &Path, repo: &str) -> Result<(), String> {
     if clone_dir.is_dir() {
         let clone = clone_dir.to_string_lossy();
-        let origin = run_git_capture(&["-C", &clone, "remote", "get-url", "origin"])
-            .await
-            .map_err(|e| {
-                format!(
-                    "clone dir {} has no usable git origin; refusing to refresh a foreign dir: {e}",
-                    clone_dir.display()
-                )
-            })?;
-        let origin = origin.trim();
-        if !origin_matches_repo(origin, repo) {
-            return Err(format!(
-                "clone dir {} has origin {origin:?}, which does not match configured repo \
-                 {repo:?}; refusing to fetch/pull (fail-closed)",
-                clone_dir.display()
-            ));
-        }
+        verify_clone_origin(clone_dir, repo).await?;
         if let Err(e) = refresh_clone(&clone).await {
             tracing::warn!(
                 clone = %clone_dir.display(),
@@ -720,14 +705,54 @@ async fn provision_repo(workspace: &Path, clone_dir: &Path, repo: &str) -> Resul
     }
     std::fs::create_dir_all(workspace)
         .map_err(|e| format!("failed to create workspace {}: {e}", workspace.display()))?;
-    clone_via_staging(clone_dir, |staging| async move {
+    let placed = clone_via_staging(clone_dir, |staging| async move {
         run_status("gh", &["repo", "clone", repo, &staging.to_string_lossy()]).await
     })
     .await?;
+    // A clone another attempt put there first is not ours, so it gets the same
+    // L3 check a pre-existing directory does before anything uses it — two
+    // decks sharing a workspace and task name need not share a repo (Qodo,
+    // PR #1304).
+    if placed == StagedClone::LostRace {
+        verify_clone_origin(clone_dir, repo).await?;
+    }
     // Same hygiene on the fresh clone, so it holds across the first AND every
     // later fire.
     ensure_worktrees_excluded(clone_dir);
     Ok(())
+}
+
+/// L3 (fail-closed): the check a clone directory this fire did not create must
+/// pass before it is used — a readable `origin` consistent with `repo`.
+async fn verify_clone_origin(clone_dir: &Path, repo: &str) -> Result<(), String> {
+    let clone = clone_dir.to_string_lossy();
+    let origin = run_git_capture(&["-C", &clone, "remote", "get-url", "origin"])
+        .await
+        .map_err(|e| {
+            format!(
+                "clone dir {} has no usable git origin; refusing to refresh a foreign dir: {e}",
+                clone_dir.display()
+            )
+        })?;
+    let origin = origin.trim();
+    if !origin_matches_repo(origin, repo) {
+        return Err(format!(
+            "clone dir {} has origin {origin:?}, which does not match configured repo \
+             {repo:?}; refusing to fetch/pull (fail-closed)",
+            clone_dir.display()
+        ));
+    }
+    Ok(())
+}
+
+/// How [`clone_via_staging`] ended when it did not fail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StagedClone {
+    /// This call's clone is now at `clone_dir`.
+    Placed,
+    /// Another attempt put a directory at `clone_dir` first; this call's copy
+    /// was discarded, and the caller must vet what is there before using it.
+    LostRace,
 }
 
 /// Clone into a staging sibling of `clone_dir`, and move it into place only
@@ -747,9 +772,9 @@ async fn provision_repo(workspace: &Path, clone_dir: &Path, repo: &str) -> Resul
 /// progress (raised by Qodo on PR #1304). The cost is that a staging directory
 /// orphaned by a daemon that died mid-clone is not reclaimed automatically; it
 /// is inert, because nothing reads a `.cloning-*` sibling as a clone. If
-/// another attempt finished first, `rename` onto its non-empty directory fails,
-/// and that is reported as success once `clone_dir` is present: the clone the
-/// caller wanted exists, and this attempt's copy is discarded.
+/// another attempt finished first, `rename` onto its non-empty directory fails;
+/// this attempt's copy is discarded and [`StagedClone::LostRace`] tells the
+/// caller that what now sits at `clone_dir` was put there by somebody else.
 ///
 /// The staging directory is a sibling so the final `rename` stays on one
 /// filesystem and is atomic. Moving a fresh clone is safe because it has no
@@ -757,7 +782,7 @@ async fn provision_repo(workspace: &Path, clone_dir: &Path, repo: &str) -> Resul
 /// is what would record the clone's absolute path. The filesystem calls go
 /// through `tokio::fs`, which runs them off the async workers, because removing
 /// a partial clone walks every file it has.
-async fn clone_via_staging<F, Fut>(clone_dir: &Path, clone: F) -> Result<(), String>
+async fn clone_via_staging<F, Fut>(clone_dir: &Path, clone: F) -> Result<StagedClone, String>
 where
     F: FnOnce(PathBuf) -> Fut,
     Fut: std::future::Future<Output = Result<(), String>>,
@@ -789,16 +814,21 @@ where
         return Err(e);
     }
     match tokio::fs::rename(&staging, clone_dir).await {
-        Ok(()) => Ok(()),
-        Err(_) if clone_dir.is_dir() => {
-            discard(staging).await;
-            Ok(())
+        Ok(()) => Ok(StagedClone::Placed),
+        Err(e) => {
+            if tokio::fs::metadata(clone_dir)
+                .await
+                .is_ok_and(|meta| meta.is_dir())
+            {
+                discard(staging).await;
+                return Ok(StagedClone::LostRace);
+            }
+            Err(format!(
+                "cloned into {} but could not move it to {}: {e}",
+                staging.display(),
+                clone_dir.display()
+            ))
         }
-        Err(e) => Err(format!(
-            "cloned into {} but could not move it to {}: {e}",
-            staging.display(),
-            clone_dir.display()
-        )),
     }
 }
 
@@ -1971,8 +2001,8 @@ mod tests {
     /// instead of taking a half-written directory for a finished clone; each
     /// call stages under its own name, so a concurrent attempt's work in
     /// progress is untouched; a clone that succeeds lands at `clone_dir`; and
-    /// one that loses the race to an attempt that already finished still
-    /// succeeds, leaving the winner's clone in place.
+    /// one that loses the race to an attempt that already finished leaves the
+    /// winner's clone in place and says so, so the caller vets its origin.
     #[tokio::test]
     async fn a_failed_clone_leaves_nothing_a_later_fire_would_mistake_for_a_clone() {
         let ws = tempfile::tempdir().expect("tempdir");
@@ -2001,12 +2031,12 @@ mod tests {
 
         let concurrent = ws.path().join("repo.cloning-concurrent");
         std::fs::create_dir_all(concurrent.join(".git")).expect("another attempt, mid-clone");
-        clone_via_staging(&clone_dir, |staging| async move {
+        let placed = clone_via_staging(&clone_dir, |staging| async move {
             std::fs::create_dir_all(staging.join(".git")).expect("clone");
             Ok(())
         })
-        .await
-        .expect("a successful clone must succeed");
+        .await;
+        assert_eq!(placed, Ok(StagedClone::Placed));
         assert!(
             clone_dir.join(".git").is_dir(),
             "the clone lands at clone_dir"
@@ -2017,13 +2047,17 @@ mod tests {
         );
 
         std::fs::write(clone_dir.join("winner"), "").expect("mark the finished clone");
-        clone_via_staging(&clone_dir, |staging| async move {
+        let lost = clone_via_staging(&clone_dir, |staging| async move {
             std::fs::create_dir_all(staging.join(".git")).expect("clone");
             std::fs::write(staging.join("loser"), "").expect("mark this copy");
             Ok(())
         })
-        .await
-        .expect("losing the race to a finished clone is still a clone");
+        .await;
+        assert_eq!(
+            lost,
+            Ok(StagedClone::LostRace),
+            "a clone somebody else placed first is reported as theirs, for the caller to vet"
+        );
         assert!(
             clone_dir.join("winner").exists(),
             "the winner's clone is kept"
