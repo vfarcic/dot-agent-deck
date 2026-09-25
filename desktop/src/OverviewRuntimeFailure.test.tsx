@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { createFixtureSnapshot } from "./data/fixture";
 import { LaunchCleanupError } from "./lib/actionError";
@@ -77,10 +77,16 @@ vi.mock("./components/TerminalViewport", () => ({
 
 import { DeckShell } from "./App";
 import { useDeckRuntime } from "./hooks/useDeckRuntime";
+import type { DeckRuntimeState } from "./types";
+
+/** The runtime the last render of {@link App} handed the shell, for tests that drive it directly. */
+let latestRuntime: DeckRuntimeState | undefined;
 
 /** The app as `App` mounts it, opened on the overview. */
 function App() {
-  return <DeckShell runtime={useDeckRuntime()} initialView={{ kind: "overview" }} />;
+  const runtime = useDeckRuntime();
+  latestRuntime = runtime;
+  return <DeckShell runtime={runtime} initialView={{ kind: "overview" }} />;
 }
 
 describe("a launch failure that lands while the overview is up (PRD #1223 audit W2)", () => {
@@ -131,8 +137,8 @@ describe("a launch failure that lands while the overview is up (PRD #1223 audit 
     });
 
     const toast = await screen.findByTestId("toast");
-    const warning = within(toast).getByTestId("toast-cleanup-warning");
-    expect(warning).toHaveTextContent("2 roles may still be running on this deck");
+    const warning = screen.getByTestId("toast-cleanup-warning");
+    expect(warning).toHaveTextContent("2 roles may still be running on Local deck");
     expect(warning).toHaveTextContent("orchestrator");
     expect(warning).toHaveTextContent("planner");
     expect(toast).toHaveTextContent("failed to start orchestration role");
@@ -140,5 +146,60 @@ describe("a launch failure that lands while the overview is up (PRD #1223 audit 
     // erased this is still untouched.
     expect(screen.getByTestId("overview-new-agent")).toBeTruthy();
     expect(bridge.connect).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("an unconfirmed-stop warning outlives the failure slot (issue #1234)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    latestRuntime = undefined;
+    bridge.connect.mockResolvedValue([createFixtureSnapshot("connected")]);
+    bridge.subscribe.mockResolvedValue(() => {});
+    bridge.onTerminalGeometry.mockReturnValue(() => {});
+  });
+
+  /**
+   * Scenario: two actions are in flight on the overview. The first rejects
+   * with roles its rollback could not confirm stopped, and the second rejects
+   * ordinarily straight after it, in the same React batch. The screen must
+   * show the second failure's sentence AND the first one's roles — they used
+   * to share one slot, so the ordinary failure replaced the warning before any
+   * frame drew it. Refresh (`reconnect()`) and dismissing the message must
+   * leave the warning up; its own dismiss ends it.
+   */
+  it("shows a cleanup warning that an ordinary failure landed on top of in the same batch", async () => {
+    let rejectLaunch: ((cause: unknown) => void) | undefined;
+    let rejectOther: ((cause: unknown) => void) | undefined;
+    bridge.runAction
+      .mockImplementationOnce(() => new Promise((_resolve, reject) => { rejectLaunch = reject; }))
+      .mockImplementationOnce(() => new Promise((_resolve, reject) => { rejectOther = reject; }));
+    render(<App />);
+    await waitFor(() => expect(screen.getByTestId("overview-new-agent")).toBeTruthy());
+
+    await act(async () => {
+      const launch = latestRuntime!.runAction({ type: "pause_run" }).catch(() => {});
+      const other = latestRuntime!.runAction({ type: "pause_run" }).catch(() => {});
+      rejectLaunch?.(new LaunchCleanupError(
+        "failed to start orchestration role coder: refused; cleanup could not confirm stop for 1 of 1 already-started role(s): orchestrator (agent-0: stop refused)",
+        ["orchestrator"],
+      ));
+      rejectOther?.(new Error("daemon returned error: publish-failed"));
+      await Promise.all([launch, other]);
+    });
+
+    expect(screen.getByTestId("toast")).toHaveTextContent("publish-failed");
+    const warning = screen.getByTestId("toast-cleanup-warning");
+    expect(warning).toHaveTextContent("1 role may still be running on Local deck");
+    expect(warning).toHaveTextContent("orchestrator");
+
+    // Refresh clears the sentence slot, and a successful one leaves it empty.
+    await act(async () => {
+      await latestRuntime!.reconnect();
+    });
+    expect(screen.queryByTestId("toast")).toBeNull();
+    expect(screen.getByTestId("toast-cleanup-warning")).toHaveTextContent("orchestrator");
+
+    fireEvent.click(screen.getByLabelText("Dismiss cleanup warning"));
+    await waitFor(() => expect(screen.queryByTestId("toast-cleanup-warning")).toBeNull());
   });
 });

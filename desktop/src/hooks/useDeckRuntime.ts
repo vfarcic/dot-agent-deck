@@ -6,9 +6,10 @@ import { voiceDeckStep } from "../lib/newAgent";
 import { agentKey } from "../lib/agentKey";
 import { LaunchCleanupError } from "../lib/actionError";
 import { applyTerminalChunk } from "../lib/terminalBuffer";
+import { deckName } from "../lib/displayText";
 const EMPTY_TERMINAL_DATA: Record<string, TerminalBuffer> = {};
 import { isDelivered } from "../types";
-import type { AgentTarget, DeckAction, DeckFleet, DeckRuntimeState, DeckSnapshot, DesktopFeatures, RuntimeMode, SendResult, TerminalBuffer } from "../types";
+import type { AgentTarget, CleanupWarningEntry, DeckAction, DeckFleet, DeckRuntimeState, DeckSnapshot, DesktopFeatures, RuntimeMode, SendResult, TerminalBuffer } from "../types";
 
 /**
  * The snapshot a runtime starts with, before any deck has answered. Lifted out
@@ -77,9 +78,13 @@ export function useDeckRuntime(): DeckRuntimeState {
    */
   const selectedDeckIdRef = useRef<string | undefined>(snapshot.connection.deckId);
   selectedDeckIdRef.current = snapshot.connection.deckId;
+  /* PRD #1223 — the fleet as of the last render, so a declaration made from a
+     callback describes the deck step the New agent dialog would show NOW, and
+     a cleanup warning (issue #1234) names the deck its action was sent to. */
+  const fleetRef = useRef(fleet);
+  fleetRef.current = fleet;
   /**
-   * The latest reported failure, or nothing — the sentence and the roles a
-   * failed launch could not confirm are stopped, as ONE value.
+   * The latest reported failure's sentence, or nothing.
    *
    * PRD #742 M8 carried a `{ message, id }` here so `App` could suppress one
    * dismissed failure by id rather than by sentence. Issue #1046 landed on
@@ -88,26 +93,31 @@ export function useDeckRuntime(): DeckRuntimeState {
    * cleared error is per-occurrence by construction, so a second failure
    * carrying an identical sentence sets it again and shows.
    *
-   * # Why one state and not two
-   *
-   * PRD #1223 audit V7 put the cleanup roles here beside the sentence, because
-   * the structured rejection (`LaunchCleanupError`) used to survive only inside
-   * the New agent dialog — so a failure that arrived after the overview had
-   * dropped that dialog left the global toast with the prose alone, where the
-   * cleanup clause is the LAST thing said and the first thing a display clamp
-   * cuts.
-   *
-   * It held them in a SECOND `useState`, and the audit round after that one
-   * found the ordering that breaks: with two operations in flight, B clears
-   * both, A rejects with a `LaunchCleanupError` and writes its message and its
-   * roles, then B rejects ordinarily and replaces the message alone — leaving
-   * A's possibly-running roles attached to B's sentence, which the toast then
-   * renders as one alert. `reconnect()` and the bootstrap join the same
-   * ordering. Holding the pair as one value is what makes that unrepresentable:
-   * every writer below replaces the WHOLE failure, so a message and a cleanup
-   * list on screen together always came from one rejection.
+   * One slot, and every writer replaces it: the next failure, the next action
+   * and `reconnect()` all do. That is right for a sentence and wrong for a
+   * safety warning, which is why the roles a failed launch could not confirm
+   * are stopped are NOT held here — see `cleanupWarnings` below.
    */
-  const [failure, setFailure] = useState<{ message: string; cleanup?: readonly string[] }>();
+  const [error, setError] = useState<string>();
+  /**
+   * Issue #1234 — every unconfirmed-stop warning the user has not dismissed.
+   *
+   * PRD #1223 audit V7 put these roles in the failure slot beside the sentence,
+   * first as a second `useState` and then, after audit W1 found a later
+   * rejection could inherit an earlier one's roles, as one atomic value with
+   * it. That made the pairing honest and kept the lifetime wrong: with two
+   * actions in flight, a `LaunchCleanupError` and an ordinary rejection
+   * straight after it land in one React batch, the second replaces the whole
+   * failure, and no frame ever names roles that may still be running. Starting
+   * any action and `reconnect()` cleared them the same way.
+   *
+   * So they get a lifetime of their own. A rejection APPENDS an entry, only
+   * `dismissCleanupWarning` removes one, and the id is minted per rejection so
+   * a dismissal aimed at one entry cannot take a later one naming the same
+   * roles with it.
+   */
+  const [cleanupWarnings, setCleanupWarnings] = useState<readonly CleanupWarningEntry[]>([]);
+  const nextCleanupWarningId = useRef(0);
   // PTY bytes deliberately bypass React state. Routing every output chunk
   // through setState re-rendered the whole deck per chunk per agent — with six
   // streaming agents the main thread spent its time reconciling instead of
@@ -240,14 +250,14 @@ export function useDeckRuntime(): DeckRuntimeState {
   }, []);
 
   const reconnect = useCallback(async () => {
-    setFailure(undefined);
+    setError(undefined);
     updateSelected((current) => ({ ...current, connection: { ...current.connection, status: "loading", message: "Reconnecting…" } }));
     try {
       const connected = await bridge.connect();
       adoptFleet(connected);
     } catch (cause) {
       const message = cause instanceof Error ? cause.message : String(cause);
-      setFailure({ message });
+      setError(message);
       updateSelected((current) => ({
         ...current,
         health: "failed",
@@ -275,7 +285,7 @@ export function useDeckRuntime(): DeckRuntimeState {
       } catch (cause) {
         if (!active) return;
         const message = cause instanceof Error ? cause.message : String(cause);
-        setFailure({ message });
+        setError(message);
         updateSelected((current) => ({ ...current, health: "failed", connection: { status: "error", message } }));
       }
     })();
@@ -288,7 +298,7 @@ export function useDeckRuntime(): DeckRuntimeState {
   }, [adoptFleet, bridge, updateSelected, updateTerminal]);
 
   const runAction = useCallback(async (action: DeckAction) => {
-    setFailure(undefined);
+    setError(undefined);
     const sentToDeckId = selectedDeckIdRef.current;
     try {
       const result = await bridge.runAction(action);
@@ -306,10 +316,18 @@ export function useDeckRuntime(): DeckRuntimeState {
       return result;
     } catch (cause) {
       const message = cause instanceof Error ? cause.message : String(cause);
-      // Audit V7: the roles as data, not only the sentence that names them
-      // last — and in ONE write with the sentence, so no later rejection can
-      // replace the message and inherit these roles.
-      setFailure(cause instanceof LaunchCleanupError ? { message, cleanup: cause.unconfirmedStops } : { message });
+      setError(message);
+      // Issue #1234: the roles as data (audit V7), in a queue of their own, so
+      // a later rejection replacing the sentence above cannot take them too.
+      if (cause instanceof LaunchCleanupError) {
+        nextCleanupWarningId.current += 1;
+        // A deck-scoped action names its deck; every other one went to the
+        // selection as it was when the action was sent.
+        const targetDeckId = "deckId" in action && typeof action.deckId === "string" ? action.deckId : sentToDeckId;
+        const target = fleetRef.current.find((deck) => deck.connection.deckId === targetDeckId);
+        const entry: CleanupWarningEntry = { id: nextCleanupWarningId.current, stops: cause.unconfirmedStops, ...(target ? { deck: deckName(target.connection) } : {}) };
+        setCleanupWarnings((current) => [...current, entry]);
+      }
       throw cause;
     }
   }, [bridge, noteTerminalInputResult]);
@@ -324,7 +342,12 @@ export function useDeckRuntime(): DeckRuntimeState {
    * behind for the banner is `snapshot.connection`, which this does not touch.
    */
   const clearError = useCallback(() => {
-    setFailure(undefined);
+    setError(undefined);
+  }, []);
+
+  /* Issue #1234 — the one writer that removes a cleanup warning. */
+  const dismissCleanupWarning = useCallback((id: number) => {
+    setCleanupWarnings((current) => (current.some((entry) => entry.id === id) ? current.filter((entry) => entry.id !== id) : current));
   }, []);
 
   const getSettings = useCallback(() => bridge.getSettings(), [bridge]);
@@ -365,10 +388,6 @@ export function useDeckRuntime(): DeckRuntimeState {
    * routing "no matching action" into the deck's global error toast would
    * present a voice answer as a fault of the screen behind it.
    */
-  /* PRD #1223 — the fleet as of the last render, so a declaration made from a
-     callback describes the deck step the New agent dialog would show NOW. */
-  const fleetRef = useRef(fleet);
-  fleetRef.current = fleet;
   /* Every declaration carries the New agent dialog's deck step, computed from
      the same `fleet` the dialog reads, so what voice says it preselected and
      what the dialog preselects are judged against one list. */
@@ -443,8 +462,9 @@ export function useDeckRuntime(): DeckRuntimeState {
     fleet,
     terminalData: EMPTY_TERMINAL_DATA,
     terminalFeed,
-    error: failure?.message,
-    errorCleanup: failure?.cleanup,
+    error,
+    cleanupWarnings,
+    dismissCleanupWarning,
     clearError,
     runAction,
     terminalInputResults,

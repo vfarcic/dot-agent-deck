@@ -763,24 +763,76 @@ describe("ControlDeck", () => {
   /**
    * Scenario (PRD #1223 audit V7): a launch failed with roles its rollback
    * could not confirm stopped, and the dialog that would have shown them is
-   * gone — the runtime's global error is the only copy left. The toast must
-   * show those roles as their own alert rather than only the sentence that
-   * names them last, and must render the sentence through `displayText`: a
-   * role name reaches it inside that sentence, so a bidi override in one could
-   * otherwise reorder what the user reads.
+   * gone — the runtime is the only holder left. The toast must show those
+   * roles as their own alert rather than only the sentence that names them
+   * last, and must render both through the sanitised presenters: a role name
+   * reaches the sentence too, so a bidi override in one could otherwise
+   * reorder what the user reads.
    */
   it("shows the runtime's unconfirmed roles on the toast, with the sentence sanitised", () => {
     const hostile = "plan\u202Ener";
     render(<ControlDeck runtime={runtime({
       error: `failed to start orchestration role ${hostile}: refused; cleanup could not confirm stop for 1 of 1 already-started role(s)`,
-      errorCleanup: [hostile],
+      cleanupWarnings: [{ id: 1, stops: [hostile] }],
     })} />);
 
     const toast = screen.getByTestId("toast");
-    expect(within(toast).getByTestId("toast-cleanup-warning")).toHaveTextContent("1 role may still be running on this deck");
-    expect(within(toast).getByTestId("toast-cleanup-warning")).toHaveTextContent("planner");
+    const warning = screen.getByTestId("toast-cleanup-warning");
+    expect(warning).toHaveTextContent("1 role may still be running on this deck");
+    expect(warning).toHaveTextContent("planner");
+    expect(warning.textContent).not.toContain("\u202E");
     expect(toast).toHaveTextContent("failed to start orchestration role");
     expect(toast.textContent).not.toContain("\u202E");
+  });
+
+  /**
+   * Scenario (issue #1234): a cleanup warning is queued and the deck then
+   * raises a notice of its own — here, a local deck the user starts. The
+   * notice takes the message slot, as it always has, and the warning must
+   * STAY on screen beside it: it used to be tied to whichever sentence the
+   * toast showed, so a notice hid it until the notice was dismissed. Dismissing
+   * the notice leaves the warning; only the warning's own dismiss ends it.
+   */
+  it("keeps a cleanup warning on screen while a deck notice holds the toast", async () => {
+    const started = "Local deck started and control channel reconnected.";
+    const dismissCleanupWarning = vi.fn();
+    render(<ControlDeck runtime={runtime({
+      mode: "live",
+      snapshot: disconnectedLive(),
+      cleanupWarnings: [{ id: 7, stops: ["orchestrator"] }],
+      dismissCleanupWarning,
+    })} />);
+
+    fireEvent.click(screen.getByTestId("start-daemon"));
+    fireEvent.click(screen.getAllByRole("button", { name: "Start deck" }).at(-1)!);
+    expect(await screen.findByText(started)).toBeInTheDocument();
+    expect(screen.getByTestId("toast-cleanup-warning")).toHaveTextContent("orchestrator");
+
+    fireEvent.click(screen.getByLabelText("Dismiss message"));
+    await waitFor(() => expect(screen.queryByText(started)).not.toBeInTheDocument());
+    expect(screen.getByTestId("toast-cleanup-warning")).toHaveTextContent("orchestrator");
+    expect(dismissCleanupWarning).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByLabelText("Dismiss cleanup warning"));
+    expect(dismissCleanupWarning).toHaveBeenCalledWith(7);
+  });
+
+  /**
+   * Scenario (issue #1234 review): warnings pile up oldest first, with the
+   * message last, in a stack that scrolls once it is taller than its cap. A
+   * newly queued warning must not land below the visible part of it, so the
+   * stack is scrolled to its bottom when one arrives.
+   */
+  it("scrolls the message stack to the newest cleanup warning", () => {
+    const view = render(<ControlDeck runtime={runtime({ cleanupWarnings: [{ id: 1, stops: ["planner"] }] })} />);
+    const stack = view.container.querySelector(".toast-stack") as HTMLDivElement;
+    let scrolledTo = 0;
+    Object.defineProperty(stack, "scrollHeight", { configurable: true, get: () => 900 });
+    Object.defineProperty(stack, "scrollTop", { configurable: true, get: () => scrolledTo, set: (value: number) => { scrolledTo = value; } });
+
+    view.rerender(<ControlDeck runtime={runtime({ cleanupWarnings: [{ id: 1, stops: ["planner"] }, { id: 2, stops: ["coder"] }] })} />);
+
+    expect(scrolledTo).toBe(900);
   });
 
   /**
@@ -788,8 +840,10 @@ describe("ControlDeck", () => {
    * earlier one had started, whose rollback stop the deck then refused. The
    * sentence carries `stale-preparation:`, which the case above translates
    * into "Nothing was started" — false here, since the first role may still be
-   * running. The structured rejection is checked first, so the toast warns
-   * about that role instead.
+   * running. The structured rejection is checked first, so the toast keeps the
+   * deck's own sentence, which names that role. (The role list itself is the
+   * runtime's queued warning since issue #1234 — this fake runtime queues
+   * nothing; `OverviewRuntimeFailure.test.tsx` drives the real one.)
    */
   it("warns about a role the rollback could not stop before translating a refusal code", async () => {
     const live = liveWithProject({
@@ -807,7 +861,7 @@ describe("ControlDeck", () => {
     fireEvent.click(screen.getAllByRole("button", { name: "Launch live loop" }).at(-1)!);
 
     await waitFor(() => {
-      expect(screen.getByTestId("toast")).toHaveTextContent("1 role may still be running on this deck");
+      expect(screen.getByTestId("toast")).toHaveTextContent("cleanup could not confirm stop");
     });
     expect(screen.getByTestId("toast")).toHaveTextContent("orchestrator");
     expect(screen.getByTestId("toast")).not.toHaveTextContent("Nothing was started");

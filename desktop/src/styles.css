@@ -1053,8 +1053,12 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .daemon-new-agent { flex: 0 0 auto; margin-left: auto; }
 .daemon-pips + .daemon-new-agent { margin-left: 0; }
 /* Lifted clear of the voice row (see `.voice-row`). It is z-index 120 and would
-   otherwise sit on top of the report text, which is the same corner. */
-.toast { max-width: min(470px, calc(100vw - 30px)); min-height: 42px; padding: 8px 9px; position: fixed; z-index: 120; right: 18px; bottom: calc(var(--voice-reserved) + 16px); display: grid; grid-template-columns: 18px minmax(0, 1fr) 24px; align-items: center; gap: 5px; border: 1px solid var(--amber-rim); border-radius: 5px; color: var(--amber-ink); background: var(--amber-bright); box-shadow: 0 8px 22px rgb(var(--scrim-rgb) / .13); font-size: 9px; }
+   otherwise sit on top of the report text, which is the same corner. The STACK
+   is what is positioned (issue #1234): each undismissed cleanup warning is its
+   own box above the message, so a column of them scrolls rather than running
+   off the top of the window. */
+.toast-stack { max-width: min(470px, calc(100vw - 30px)); max-height: calc(100vh - var(--voice-reserved) - 32px); position: fixed; z-index: 120; right: 18px; bottom: calc(var(--voice-reserved) + 16px); display: flex; flex-direction: column; align-items: flex-end; gap: 6px; overflow-y: auto; }
+.toast { max-width: 100%; min-height: 42px; padding: 8px 9px; flex: 0 0 auto; display: grid; grid-template-columns: 18px minmax(0, 1fr) 24px; align-items: center; gap: 5px; border: 1px solid var(--amber-rim); border-radius: 5px; color: var(--amber-ink); background: var(--amber-bright); box-shadow: 0 8px 22px rgb(var(--scrim-rgb) / .13); font-size: 9px; }
 .toast-body { display: grid; gap: 3px; min-width: 0; }
 .toast button { width: 22px; height: 22px; display: grid; place-items: center; border: 0; background: transparent; cursor: pointer; }
 
@@ -1437,7 +1441,7 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
    **A row can, and `--voice-row-height` is the contract.** Every surface below
    that would otherwise reach the bottom edge subtracts it: `.deck-main` (both
    screens), `.agent-pane-overlay`, `.reader-overlay`, `.evidence-drawer` and
-   `.toast`. Each of those edits is marked `voice row` where it sits, so a later
+   `.toast-stack`. Each of those edits is marked `voice row` where it sits, so a later
    full-height surface can be checked against this list.
 
    **Two deliberate exclusions, because the unqualified claim would be false.**
