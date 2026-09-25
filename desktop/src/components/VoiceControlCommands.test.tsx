@@ -913,6 +913,7 @@ describe("closing what is on top", () => {
   function closing(): ResolveVoice {
     return vi.fn(async (utterance: string) => {
       if (utterance === "open the planner") return dispatch("open_agent", "openAgent", "Opening Planner.", utterance, PLANNER);
+      if (utterance === "open settings") return dispatch("open_settings", "openSettings", "Opening settings.", utterance);
       if (utterance === "what can I say?") return dispatch("list_commands", "showVoiceCommands", "Here is what you can say.", utterance);
       return CLOSE;
     });
@@ -945,8 +946,8 @@ describe("closing what is on top", () => {
 
   /**
    * Scenario: on the shipped overview, Settings is open beneath the spoken
-   * command list. Saying "close" dismisses the list first, then Settings,
-   * leaving the overview visible and never reporting that nothing was closed.
+   * command list. Saying "close" dismisses the list first; if an agent pane
+   * then opens over Settings, the pane closes before Settings does.
    */
   it("closes the voice overlay before Settings on the overview", async () => {
     window.history.replaceState({}, "", "/?fixture=1");
@@ -965,6 +966,16 @@ describe("closing what is on top", () => {
     voice.deliver("close this");
     await completeUtterance();
     expect(screen.queryByTestId("voice-help")).toBeNull();
+    expect(screen.getByRole("dialog", { name: "Settings" })).toBeVisible();
+
+    voice.deliver("open the planner");
+    await completeUtterance();
+    expect(screen.getByTestId("agent-pane-overlay")).toBeInTheDocument();
+    expect(screen.getByRole("dialog", { name: "Settings" })).toBeVisible();
+
+    voice.deliver("close this");
+    await completeUtterance();
+    expect(screen.queryByTestId("agent-pane-overlay")).toBeNull();
     expect(screen.getByRole("dialog", { name: "Settings" })).toBeVisible();
 
     voice.deliver("close this");
@@ -1059,10 +1070,9 @@ describe("closing what is on top", () => {
   }
 
   /**
-   * Scenario (PRD #1223 U5): on the overview, open the New agent dialog and
-   * say "close". It closes the dialog — it used to answer "nothing to close"
-   * with the dialog still on screen, because `close` knew only the voice
-   * overlay and the agent pane.
+   * Scenario: open the New agent dialog on the overview, then open Settings by
+   * voice behind it. Saying "close" dismisses the New agent dialog before
+   * Settings, then dismisses Settings on the next utterance.
    */
   it("closes the New agent dialog", async () => {
     const voice = microphone([]);
@@ -1073,10 +1083,20 @@ describe("closing what is on top", () => {
     fireEvent.click(screen.getByTestId("overview-new-agent"));
     expect(screen.getByTestId("new-agent-dialog")).toBeInTheDocument();
 
+    voice.deliver("open settings");
+    await completeUtterance();
+    expect(screen.getByRole("dialog", { name: "Settings" })).toBeVisible();
+    expect(screen.getByTestId("new-agent-dialog")).toBeInTheDocument();
+
     voice.deliver("close this");
     await completeUtterance();
 
     expect(screen.queryByTestId("new-agent-dialog")).toBeNull();
+    expect(screen.getByRole("dialog", { name: "Settings" })).toBeVisible();
+
+    voice.deliver("close this");
+    await completeUtterance();
+    expect(screen.queryByRole("dialog", { name: "Settings" })).toBeNull();
     expect(screen.queryByTestId("voice-report")?.textContent ?? "").not.toContain(VOICE_NOTHING_TO_CLOSE);
   });
 
