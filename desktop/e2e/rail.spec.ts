@@ -17,8 +17,9 @@ test.describe("desktop navigation rail", () => {
     await page.goto("/?fixture=1&state=connected");
     await expect(page.getByTestId("overview-table-region")).toBeVisible();
     await expect(rail(page)).toHaveCount(1);
-    await expect(rail(page).locator("nav button").first()).toHaveText("Overview");
+    await expect(rail(page).locator("nav button")).toHaveText(["Overview", "Settings"]);
     await expect(rail(page).locator("[aria-current='page']")).toHaveText("Overview");
+    await expect(page.getByTestId("overview-open-deck")).toHaveCount(0);
   });
 
   /**
@@ -32,8 +33,7 @@ test.describe("desktop navigation rail", () => {
     await expect(page.getByTestId("agent-tile-planner")).toBeVisible();
     await expect(rail(page)).toHaveCount(1);
     const entries = await rail(page).locator("nav button").allTextContents();
-    expect(entries[0]).toBe("Overview");
-    expect(entries).toContain("Settings");
+    expect(entries).toEqual(["Overview", "Deck", "Projects", "Prompts", "Workflows", "Agent Profiles", "Settings"]);
     await expect(rail(page).locator("[aria-current='page']")).toHaveText("Deck");
 
     await page.getByTestId("open-overview").click();
@@ -59,5 +59,20 @@ test.describe("desktop navigation rail", () => {
     await expect(settings).toHaveCount(1);
     await settings.click();
     await expect(page.getByRole("dialog", { name: "Settings" })).toBeVisible();
+  });
+
+  /**
+   * Scenario: on the shipped overview, open Planner's terminal pane and close
+   * it with Escape. The overview returns without exposing the gated deck.
+   */
+  test("returns from an agent pane to the overview with experimental off", async ({ page }) => {
+    await page.goto("/?fixture=1&state=connected");
+    await expect(page.getByTestId("overview-table-region")).toBeVisible();
+    await page.getByRole("button", { name: "Open Planner agent" }).click();
+    await expect(page.getByTestId("agent-pane-overlay")).toBeVisible();
+    await page.keyboard.press("Escape");
+    await expect(page.getByTestId("agent-pane-overlay")).toHaveCount(0);
+    await expect(page.getByTestId("overview-table-region")).toBeVisible();
+    await expect(rail(page).locator("nav button")).toHaveText(["Overview", "Settings"]);
   });
 });

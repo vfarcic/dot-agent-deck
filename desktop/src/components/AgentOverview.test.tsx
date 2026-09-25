@@ -17,7 +17,7 @@ import "../styles.css";
 import stylesheetSource from "../styles.css?raw";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createFixtureFleet, createFixtureSnapshot, FIXTURE_DAEMON_ID, FIXTURE_PENDING_DAEMON_ID, FIXTURE_REMOTE_DAEMON_ID, FIXTURE_UNREACHABLE_DAEMON_ID } from "../data/fixture";
-import { DEFAULT_DESKTOP_SETTINGS, type DesktopSettingsDto, PENDING_DECK_MESSAGE, pendingDeckSnapshot, unconfiguredDeckSnapshot } from "../lib/bridge";
+import { DEFAULT_DESKTOP_SETTINGS, type DesktopSettingsDto, PENDING_DECK_MESSAGE, fixtureDesktopFeatures, pendingDeckSnapshot, unconfiguredDeckSnapshot } from "../lib/bridge";
 import { DISPLAY_LIMITS } from "../lib/displayText";
 import { UNREPORTED } from "../types";
 import type { AgentSession, DeckRuntimeState, DeckSnapshot, DeckView } from "../types";
@@ -38,6 +38,10 @@ vi.mock("./TerminalViewport", () => ({
 
 import { DeckShell } from "../App";
 import { agentDomKey, agentKey, AgentOverview, ALL_OVERVIEW_COLUMNS, OVERVIEW_CLOCK_TICK_MS, anonymousOrchestrationKey, DEFAULT_OVERVIEW_COLUMNS, gridTemplateFor, groupAgents, groupKey, hoistedCwdOf, orderedColumns, OVERVIEW_COLUMNS_STORAGE_KEY, PERMANENT_COLUMN, readStoredColumns, type OverviewAgent, type OverviewColumnId, type OverviewGroupKind, toOverviewAgent } from "./AgentOverview";
+
+// Existing overview/deck navigation cases exercise the experimental surface.
+// Each shipped-default case below removes this query parameter explicitly.
+beforeEach(() => window.history.replaceState({}, "", "/?fixture=1&experimental=1"));
 
 /**
  * Every codepoint the render seam must strip, enumerated rather than sampled —
@@ -97,6 +101,7 @@ function runtime(overrides: Partial<DeckRuntimeState> = {}): DeckRuntimeState {
     // overview itself reads no setting; these only have to resolve.
     getSettings: vi.fn(async () => ({ settings: structuredClone(DEFAULT_DESKTOP_SETTINGS) })),
     saveSettings: vi.fn(async (settings: DesktopSettingsDto) => structuredClone(settings)),
+    ...{ desktopFeatures: fixtureDesktopFeatures() },
     ...overrides,
     /*
       PRD #742 M4: the fleet, derived from whatever `snapshot` this test asked
@@ -2035,6 +2040,83 @@ describe("DeckShell", () => {
     agentId: "planner",
     from,
   } as unknown as DeckView);
+
+  const railEntries = () => Array.from(document.querySelectorAll('aside.rail[aria-label="Primary navigation"] nav button'))
+    .map((button) => button.textContent?.trim());
+
+  /**
+   * Scenario: launch the shipped desktop with the experimental flag absent.
+   * The overview is the landing screen and the only rail destinations are Overview and Settings.
+   */
+  it("hides every experimental destination from the shipped rail", async () => {
+    window.history.replaceState({}, "", "/?fixture=1");
+    render(<DeckShell runtime={runtime({ snapshot: createFixtureSnapshot("connected") })} />);
+
+    await waitFor(() => expect(railEntries()).toEqual(["Overview", "Settings"]));
+    expect(screen.getByTestId("overview-table-region")).toBeVisible();
+    expect(screen.queryByTestId("open-deck")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("overview-open-deck")).not.toBeInTheDocument();
+  });
+
+  /**
+   * Scenario: an older or incomplete desktop bridge returns no feature answer
+   * at startup. The visible app uses the shipped two-destination rail.
+   */
+  it("keeps the shipped rail when the feature answer is missing", async () => {
+    window.history.replaceState({}, "", "/?fixture=1&experimental=1");
+    const state = runtime({ snapshot: createFixtureSnapshot("connected"), ...{ desktopFeatures: undefined } });
+    render(<DeckShell runtime={state} />);
+
+    await waitFor(() => expect(railEntries()).toEqual(["Overview", "Settings"]));
+    expect(screen.getByTestId("overview-table-region")).toBeVisible();
+  });
+
+  /**
+   * Scenario: launch the same desktop with the experimental preview enabled.
+   * The rail offers every destination in its normal order, including the deck and its configuration screens.
+   */
+  it("restores the full rail when experimental is enabled", async () => {
+    window.history.replaceState({}, "", "/?fixture=1&experimental=1");
+    render(<DeckShell runtime={runtime({ snapshot: createFixtureSnapshot("connected") })} />);
+
+    await waitFor(() => expect(railEntries()).toEqual([
+      "Overview", "Deck", "Projects", "Prompts", "Workflows", "Agent Profiles", "Settings",
+    ]));
+  });
+
+  /**
+   * Scenario: ask to start on the deck while the shipped flag is off, then try
+   * the overview's remaining deck entry points. The app keeps the overview visible throughout.
+   */
+  it("redirects a hidden deck view and leaves no overview shortcut into it", async () => {
+    window.history.replaceState({}, "", "/?fixture=1");
+    render(<DeckShell runtime={runtime({ snapshot: createFixtureSnapshot("connected") })} initialView={{ kind: "deck" }} />);
+
+    await waitFor(() => expect(screen.getByTestId("overview-table-region")).toBeVisible());
+    expect(screen.queryByTestId("agent-tile-planner")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("overview-open-deck")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Open deck" })).not.toBeInTheDocument();
+    fireEvent.keyDown(window, { key: "k", ctrlKey: true });
+    expect(screen.queryByRole("dialog", { name: "Command menu" })).not.toBeInTheDocument();
+    expect(screen.getByTestId("overview-table-region")).toBeVisible();
+  });
+
+  /**
+   * Scenario: open Planner from the shipped overview and close the pane with Escape.
+   * The overview remains visible, so viewing a terminal needs no deck destination.
+   */
+  it("returns from an overview agent pane with Escape while the deck is hidden", async () => {
+    window.history.replaceState({}, "", "/?fixture=1");
+    render(<DeckShell runtime={runtime({ snapshot: createFixtureSnapshot("connected") })} />);
+    await waitFor(() => expect(screen.getByTestId("overview-table-region")).toBeVisible());
+
+    fireEvent.click(screen.getByRole("button", { name: "Open Planner agent" }));
+    expect(screen.getByTestId("agent-pane-overlay")).toBeVisible();
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(screen.queryByTestId("agent-pane-overlay")).not.toBeInTheDocument();
+    expect(screen.getByTestId("overview-table-region")).toBeVisible();
+    expect(screen.queryByTestId("agent-tile-planner")).not.toBeInTheDocument();
+  });
 
   /**
    * Scenario: start directly in a deck-origin agent view, with no navigation
