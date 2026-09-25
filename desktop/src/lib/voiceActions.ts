@@ -214,6 +214,16 @@ export type VoiceActionContext = {
    */
   closeNewAgent: () => string | undefined;
   /**
+   * Close the Settings sheet (issue #1197).
+   *
+   * **Served by the SHELL, and only while Settings is OPEN**, for
+   * {@link dismissVoiceOverlay}'s reason: Settings is a shell-level overlay
+   * boolean (`useShellOverlays`), not a `DeckView`, so {@link closeTopmost}
+   * reads *"Settings is open"* as this member's presence. The shell and not a
+   * screen, because the sheet opens over the overview as well as the deck.
+   */
+  closeSettings: () => void;
+  /**
    * Open the New agent dialog (PRD #1223), with `deckId` preselected when the
    * control that opened it belongs to one deck — a deck group's header.
    *
@@ -415,10 +425,18 @@ export const VOICE_ACTIONS = {
      * open, so its absence IS the answer to "is anything on top?". Declaring it
      * would refuse the whole row whenever the overlay was closed. The same
      * holds for `closeNewAgent`, which the overview publishes only while the
-     * dialog is open.
+     * dialog is open, and for `closeSettings`, which the shell publishes only
+     * while Settings is open.
+     *
+     * **Settings is checked LAST, below the agent's pane** (issue #1197). The
+     * sheet is a shell overlay that stays open across a pane opened over it —
+     * by voice, or from the rail — and that pane is then what the user is
+     * looking at, so `close` takes the pane first and Settings on the next
+     * utterance. Before Settings moved to the shell it was not in this order
+     * at all, and `close` with it open answered "nothing to close".
      */
     run: (
-      context: Pick<VoiceActionContext, "closeAgentView" | "reportNothingToClose" | "reportRefused"> & Partial<Pick<VoiceActionContext, "dismissVoiceOverlay" | "closeNewAgent">>,
+      context: Pick<VoiceActionContext, "closeAgentView" | "reportNothingToClose" | "reportRefused"> & Partial<Pick<VoiceActionContext, "dismissVoiceOverlay" | "closeNewAgent" | "closeSettings">>,
       target: VoiceDispatchTarget,
     ) => {
       if (context.dismissVoiceOverlay) return context.dismissVoiceOverlay();
@@ -428,6 +446,7 @@ export const VOICE_ACTIONS = {
         return;
       }
       if (target.agentViewOpen) return context.closeAgentView();
+      if (context.closeSettings) return context.closeSettings();
       context.reportNothingToClose();
     },
   },
@@ -888,7 +907,15 @@ export type VoicePanelChannel = { current: Partial<VoicePanelContext> | undefine
  * all. Before `stopVoice` existed a screen served the whole context and this
  * was `VoiceActionContext` itself.
  */
-export type VoiceScreenContext = Omit<VoiceActionContext, keyof VoicePanelContext | keyof VoiceOverviewContext>;
+export type VoiceScreenContext = Omit<VoiceActionContext, keyof VoicePanelContext | keyof VoiceOverviewContext | keyof VoiceShellContext>;
+
+/**
+ * The members only the SHELL serves (issue #1197): closing Settings, which is
+ * the shell's overlay rather than a screen's, since it opens over the overview
+ * as well as the deck. Published only while the sheet is open — see
+ * {@link VoiceActionContext.closeSettings}.
+ */
+export type VoiceShellContext = Pick<VoiceActionContext, "closeSettings">;
 
 /**
  * The members only the OVERVIEW serves (PRD #1223): opening the New agent

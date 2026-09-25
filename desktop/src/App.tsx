@@ -662,6 +662,8 @@ export function DeckShell({ runtime, workflowPlatformIssue, initialView = { kind
       /* The shell's, so Settings opens from the overview as from the deck (#1197). */
       openOverlay: railContext.openOverlay,
       closeOverlays: railContext.closeOverlays,
+      /* Only while Settings is open, so `close` reads its presence (#1197). */
+      ...(overlaysOpen.settings ? { closeSettings: () => setOverlay(screen, "settings", false) } : {}),
       navigate: (next) => { moved = true; setView(next); },
       closeAgentView: () => { moved = true; closeAgent(); },
     };
@@ -673,7 +675,7 @@ export function DeckShell({ runtime, workflowPlatformIssue, initialView = { kind
     if (outcome.invoke === OPEN_DECK_INVOKE && !features.showDeck) return undefined;
     if (!dispatchVoiceAction(outcome.invoke, context, target)) return undefined;
     return moved ? { undo: () => setView(previous) } : {};
-  }, [agentView, base, closeAgent, features.showDeck, paneAgent, railContext, selectedDeckId, view]);
+  }, [agentView, base, closeAgent, features.showDeck, overlaysOpen.settings, paneAgent, railContext, screen, selectedDeckId, setOverlay, view]);
   /** PRD #1223 — what the directory browser shows, read at declaration time. */
   const readDirectories = useCallback(() => newAgentVoice.current?.directories, []);
   /** PRD #1223 — what the New agent dialog shows besides its browser, while it is open. */
