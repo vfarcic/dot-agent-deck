@@ -1306,6 +1306,14 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** an LLM response (nothing is submitted, exactly like `prompt/pane-input/022`); that the daemon rather than the user sent the bytes — no fault seam for a partial PTY write exists at the e2e layer, so the write path itself is covered at L1 (`scheduler/idle-worker/019`, `orchestration/delegate/031`); the abstaining conditions (`agent_pty::deliver_payload_refuses_to_erase_what_it_cannot_undo_exactly`); the other agent CLIs, whose editors are unexercised here.
 - **Platform coverage:** mac+linux.
 
+##### prompt/pane-input/040 — The 10-second readiness fallback pays the readiness buffer before it writes, on both spawn-time delivery paths (issue #529).
+- **Layer:** L1, in `src/ui.rs`'s own test module (the production `process_pending_seed_prompts` and `deliver_orchestrator_prompt` driven over a recording pane controller), so it runs under `cargo test-fast` and therefore in the `build` job.
+- **Agent:** none (panes with no session at all, so nothing announces a conversation and `spawn_time_agent_ready` stays false — asserted as a precondition on the seed half).
+- **Asserts:** a seed aged 1 ms past `SPAWN_TIME_READINESS_TIMEOUT` gets NO write and is held rather than dropped; re-aged to `SPAWN_TIME_READINESS_TIMEOUT + SPAWN_TIME_READINESS_BUFFER` it gets exactly one write carrying the seed. The same pair for an orchestration start-role remit, driven with explicit instants against its tab anchor: no write and the remit not consumed at `anchor + 10 s + 1 ms`, exactly one write carrying it at `anchor + 10 s + 500 ms`. The seed fixture carries an already-spent `ready_since`, so a fallback that borrowed that stamp instead of counting from its own 10 s would also go red.
+- **Why it exists:** both paths used to set `buffer_elapsed = true` on the timeout branch, so the one delivery made with no evidence at all that the agent's input handling was up was also the one made with no buffer. Fails on the pre-fix code at each half's first assertion.
+- **Does not assert:** the buffer's size (500 ms, tuned under PRD #128); the fast path's buffer (`should_inject_spawn_time_prompt`'s unit tests); that the fallback still delivers for a producer that announces nothing (`prompt/pane-input/036`); confirmation, retry or deadline behaviour after the write (`prompt/pane-input/023`–`/030`); the daemon-owned delegate path, which pays its own buffer after its timeout in `state.rs`.
+- **Platform coverage:** mac+linux+windows.
+
 #### prompt/quit
 
 ##### prompt/quit/001 — `Ctrl+c` from command mode opens the quit confirmation dialog with three options: **Detach** (default), **Stop**, **Cancel**.
