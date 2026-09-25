@@ -573,7 +573,7 @@ impl<'ast> Visit<'ast> for Scan {
     fn visit_attribute(&mut self, _node: &'ast syn::Attribute) {}
 }
 
-fn item_attrs(item: &syn::Item) -> Option<&[syn::Attribute]> {
+pub(crate) fn item_attrs(item: &syn::Item) -> Option<&[syn::Attribute]> {
     Some(match item {
         syn::Item::Const(i) => &i.attrs,
         syn::Item::Enum(i) => &i.attrs,
@@ -594,7 +594,7 @@ fn item_attrs(item: &syn::Item) -> Option<&[syn::Attribute]> {
     })
 }
 
-fn impl_item_attrs(item: &syn::ImplItem) -> Option<&[syn::Attribute]> {
+pub(crate) fn impl_item_attrs(item: &syn::ImplItem) -> Option<&[syn::Attribute]> {
     Some(match item {
         syn::ImplItem::Const(i) => &i.attrs,
         syn::ImplItem::Fn(i) => &i.attrs,
@@ -618,7 +618,7 @@ fn impl_item_attrs(item: &syn::ImplItem) -> Option<&[syn::Attribute]> {
 /// PRODUCTION block as test-only and silently dropped it from the scan — the
 /// exact fail-open direction this module's docs promise to avoid. Only a bare
 /// `test` **path** counts now; a string literal's contents never do.
-fn cfg_selects_test_only(attrs: &[syn::Attribute]) -> bool {
+pub(crate) fn cfg_selects_test_only(attrs: &[syn::Attribute]) -> bool {
     attrs.iter().any(|attr| {
         if !attr.path().is_ident("cfg") {
             return false;
