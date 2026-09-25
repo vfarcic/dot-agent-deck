@@ -1659,13 +1659,27 @@ const SNAPSHOT_COALESCE_INTERVAL: std::time::Duration = std::time::Duration::fro
 /// to make the failure mode disappear.
 pub const SPAWN_TIME_READINESS_BUFFER: std::time::Duration = std::time::Duration::from_millis(500);
 
+/// How long a spawn-time delivery waits for the agent to announce a
+/// conversation before the `timeout_ready` fallback treats the pane as ready
+/// anyway (opencode's cold boot, Pi's `NoSignal`, a launcher that never
+/// announces). Measured from the delivery's own anchor — the seed's
+/// `created_at`, the orchestration tab's `orchestration_prompt_anchor_at`.
+///
+/// Issue #529: crossing it is a readiness FACT like `SessionStart`, not a
+/// licence to write — the fallback still owes [`SPAWN_TIME_READINESS_BUFFER`]
+/// after it, so its first write lands no earlier than `anchor + TIMEOUT +
+/// BUFFER`. See [`spawn_time_fallback_ready_at`].
+pub(crate) const SPAWN_TIME_READINESS_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(10);
+
 /// PRD #128 Direction B-1 — returns whether the spawn-time orchestrator
 /// role prompt should fire NOW. Returns `false` if `ready_since` is set
 /// but `SPAWN_TIME_READINESS_BUFFER` hasn't elapsed yet; `true` once it
-/// has. `ready_since == None` means the readiness gate isn't engaged yet
-/// (caller drives that — e.g. the timeout-ready fallback path that
-/// ignores SessionStart and fires after 10 s); the helper returns `true`
-/// in that case so the caller's own gating wins.
+/// has. `ready_since == None` means the readiness gate isn't engaged yet;
+/// the helper returns `true` in that case so the caller's own gating wins.
+/// Both callers' 10 s fallback passes `Some` since issue #529 (see
+/// [`spawn_time_fallback_ready_at`]), so it pays the buffer exactly as a
+/// `SessionStart` stamp does.
 ///
 /// Extracted so the policy is unit-testable AND so the integration test
 /// at `tests/spawn_time_role_prompt_submit_after_session_start.rs` can
@@ -1679,6 +1693,24 @@ pub fn should_inject_spawn_time_prompt(
         Some(t) => now.saturating_duration_since(t) >= SPAWN_TIME_READINESS_BUFFER,
         None => true,
     }
+}
+
+/// Issue #529 — the instant the `timeout_ready` fallback treats as the pane's
+/// readiness signal: the delivery's anchor plus [`SPAWN_TIME_READINESS_TIMEOUT`].
+///
+/// Handed to [`should_inject_spawn_time_prompt`] in place of a `SessionStart`
+/// stamp, so the fallback in [`process_pending_seed_prompts`] and
+/// [`deliver_orchestrator_prompt`] writes through the same buffer as their fast
+/// path. It used to skip the buffer outright, and it is the branch that most
+/// needs it: a pane that has not announced anything in 10 s
+/// has given no evidence its input handling is up, which is the same reasoning
+/// the daemon's delegate path documents at its readiness gate in `state.rs`
+/// ("a timeout means readiness was never *confirmed*, which is more reason to
+/// wait, not less"). Derived from the anchor rather than stamped on the first
+/// frame that sees the timeout, so it holds no extra state and does not depend
+/// on how often the render loop happens to run.
+fn spawn_time_fallback_ready_at(anchor: std::time::Instant) -> std::time::Instant {
+    anchor + SPAWN_TIME_READINESS_TIMEOUT
 }
 
 /// Issue #1005 — does this pane hold an agent that can actually READ what a
@@ -3902,15 +3934,15 @@ fn process_pending_seed_prompts(
         // Issue #424 (reviewer finding B3): this still decides WHEN to write,
         // exactly as before, but no longer decides whether the write is
         // confirmable. That question is answered by the producer, below.
-        let timeout_ready =
-            !agent_ready && sp.created_at.elapsed() > std::time::Duration::from_secs(10);
+        let timeout_ready = !agent_ready && sp.created_at.elapsed() > SPAWN_TIME_READINESS_TIMEOUT;
         if agent_ready {
             sp.ready_since.get_or_insert(now);
         }
         // Hold the write until the readiness buffer elapses (mirrors the
-        // orchestrator path). The timeout path bypasses the buffer.
+        // orchestrator path). Issue #529: the timeout path owes the buffer too,
+        // counted from the instant it declared the pane ready.
         let buffer_elapsed = if timeout_ready {
-            true
+            should_inject_spawn_time_prompt(Some(spawn_time_fallback_ready_at(sp.created_at)), now)
         } else {
             should_inject_spawn_time_prompt(sp.ready_since, now)
         };
@@ -5017,16 +5049,16 @@ fn deliver_orchestrator_prompt(
     // below is untouched, so a start role whose producer announces nothing still
     // gets its remit after 10 s.
     let agent_ready = spawn_time_agent_ready(snapshot, &start_pane_id);
+    let anchor = ui.orchestration_prompt_anchor_at.get(&tab_id).copied();
     let timeout_ready = !agent_ready
-        && ui
-            .orchestration_prompt_anchor_at
-            .get(&tab_id)
-            .is_some_and(|t| now.duration_since(*t) > std::time::Duration::from_secs(10));
+        && anchor.is_some_and(|t| now.duration_since(t) > SPAWN_TIME_READINESS_TIMEOUT);
     if agent_ready {
         ui.orchestration_ready_since.entry(tab_id).or_insert(now);
     }
+    // Issue #529: the timeout path owes the readiness buffer too, counted from
+    // the instant it declared the pane ready — see the seed path's twin.
     let buffer_elapsed = if timeout_ready {
-        true
+        should_inject_spawn_time_prompt(anchor.map(spawn_time_fallback_ready_at), now)
     } else {
         should_inject_spawn_time_prompt(ui.orchestration_ready_since.get(&tab_id).copied(), now)
     };
@@ -37398,14 +37430,19 @@ mod tests {
     /// it — since issue #1005 the only route that WRITES into a pane no producer
     /// has announced on, the `devbox run claude …` launcher case issue #424
     /// exists for. (The 60-second hard deadline also reaches such a pane, but it
-    /// abandons rather than delivers.) Mirrors [`ready_seed_prompt`] in every
-    /// other respect.
+    /// abandons rather than delivers.) Aged past the readiness buffer the
+    /// fallback owes after its 10 s as well (issue #529). Mirrors
+    /// [`ready_seed_prompt`] in every other respect.
     fn aged_seed_prompt(pane_id: &str, prompt: &str) -> PendingSeedPrompt {
         seed_prompt_created_at(
             pane_id,
             prompt,
             std::time::Instant::now()
-                .checked_sub(std::time::Duration::from_millis(10_100))
+                .checked_sub(
+                    SPAWN_TIME_READINESS_TIMEOUT
+                        + SPAWN_TIME_READINESS_BUFFER
+                        + std::time::Duration::from_millis(100),
+                )
                 .expect("aged creation timestamp"),
         )
     }
@@ -38418,7 +38455,11 @@ mod tests {
             .insert(
                 tab_id,
                 started
-                    .checked_sub(std::time::Duration::from_millis(10_100))
+                    .checked_sub(
+                        SPAWN_TIME_READINESS_TIMEOUT
+                            + SPAWN_TIME_READINESS_BUFFER
+                            + std::time::Duration::from_millis(100),
+                    )
                     .expect("aged anchor timestamp"),
             );
         held_role_ui.orchestration_ready_since.insert(
@@ -38558,7 +38599,11 @@ mod tests {
             .insert(
                 burst_tab_id,
                 burst_started
-                    .checked_sub(std::time::Duration::from_millis(10_100))
+                    .checked_sub(
+                        SPAWN_TIME_READINESS_TIMEOUT
+                            + SPAWN_TIME_READINESS_BUFFER
+                            + std::time::Duration::from_millis(100),
+                    )
                     .expect("aged anchor timestamp"),
             );
         burst_role_ui.orchestration_ready_since.insert(
@@ -38687,7 +38732,11 @@ mod tests {
             .insert(
                 lost_tab_id,
                 lost_started
-                    .checked_sub(std::time::Duration::from_millis(10_100))
+                    .checked_sub(
+                        SPAWN_TIME_READINESS_TIMEOUT
+                            + SPAWN_TIME_READINESS_BUFFER
+                            + std::time::Duration::from_millis(100),
+                    )
                     .expect("aged anchor timestamp"),
             );
         lost_role_ui.orchestration_ready_since.insert(
@@ -39275,6 +39324,128 @@ mod tests {
             records[0].1.as_deref(),
             Some(ROLE_GENUINE),
             "orchestrator: the write must declare the conversation it is entering"
+        );
+    }
+
+    /// Scenario: Queue a mode seed and an orchestration start-role remit for
+    /// panes that never announce a conversation, and let each cross the
+    /// 10-second readiness fallback. Neither may be written until the readiness
+    /// buffer has also elapsed after that 10 s; once it has, each is written
+    /// exactly once.
+    #[spec("prompt/pane-input/040")]
+    #[test]
+    fn pane_input_040_the_readiness_fallback_pays_the_buffer() {
+        const PROMPT: &str = "Read the fallback remit and begin";
+        let inside_buffer = SPAWN_TIME_READINESS_TIMEOUT + std::time::Duration::from_millis(1);
+        let past_buffer = SPAWN_TIME_READINESS_TIMEOUT + SPAWN_TIME_READINESS_BUFFER;
+
+        // --- `process_pending_seed_prompts` (a mode's seed). -----------------
+        const SEED_PANE: &str = "fallback-buffer-seed-pane";
+        let seed_controller = Arc::new(RecordingPaneController::default());
+        let seed_writes = seed_controller.writes.clone();
+        let seed_pane: Arc<dyn PaneController> = seed_controller;
+        let mut seed_ui = default_ui();
+        seed_ui.pending_seed_prompts.push(seed_prompt_created_at(
+            SEED_PANE,
+            PROMPT,
+            std::time::Instant::now()
+                .checked_sub(inside_buffer)
+                .expect("aged creation timestamp"),
+        ));
+        let mut seed_snapshot = AppState::default();
+        seed_snapshot.register_pane(SEED_PANE.to_string());
+        assert!(
+            !spawn_time_agent_ready(&seed_snapshot, SEED_PANE),
+            "precondition: nothing announced, so only the fallback can open this pane"
+        );
+
+        process_pending_seed_prompts(&mut seed_ui, &seed_pane, &seed_snapshot);
+        let seed_inside = seed_writes.lock().unwrap().clone();
+        assert!(
+            seed_inside.is_empty(),
+            "seed: past 10 s but inside the readiness buffer, the fallback must \
+             hold its write like every other readiness signal; writes={seed_inside:?}"
+        );
+        assert_eq!(
+            seed_ui.pending_seed_prompts.len(),
+            1,
+            "seed: held, not dropped. status={:?}",
+            seed_ui.status_message
+        );
+
+        seed_ui.pending_seed_prompts[0].created_at = std::time::Instant::now()
+            .checked_sub(past_buffer)
+            .expect("aged creation timestamp");
+        process_pending_seed_prompts(&mut seed_ui, &seed_pane, &seed_snapshot);
+        let seed_past = seed_writes.lock().unwrap().clone();
+        assert_eq!(
+            seed_past.len(),
+            1,
+            "seed: once the buffer has elapsed after the 10 s, the fallback writes \
+             exactly once; writes={seed_past:?}"
+        );
+        assert_eq!(seed_past[0].0, PROMPT, "seed: the write carries the seed");
+
+        // --- `deliver_orchestrator_prompt` (the start role's remit). ----------
+        const ROLE_PANE: &str = "fallback-buffer-role-pane";
+        let role_controller = Arc::new(RecordingPaneController::default());
+        let role_writes = role_controller.writes.clone();
+        let role_pane: Arc<dyn PaneController> = role_controller;
+        let anchor = std::time::Instant::now();
+        let tab_id: TabId = 1040;
+        let mut role_ui = default_ui();
+        role_ui
+            .orchestration_prompt_anchor_at
+            .insert(tab_id, anchor);
+        let mut role_snapshot = AppState::default();
+        role_snapshot.register_pane(ROLE_PANE.to_string());
+        let role_panes = [ROLE_PANE.to_string()];
+        let mut role_statuses = vec![OrchestrationRoleStatus::Waiting];
+        let mut role_prompt = Some(PROMPT.to_string());
+
+        deliver_orchestrator_prompt(
+            &mut role_ui,
+            role_pane.as_ref(),
+            &role_snapshot,
+            anchor + inside_buffer,
+            tab_id,
+            &role_panes,
+            0,
+            &mut role_statuses,
+            &mut role_prompt,
+        );
+        let role_inside = role_writes.lock().unwrap().clone();
+        assert!(
+            role_inside.is_empty(),
+            "orchestrator: past 10 s but inside the readiness buffer, the fallback \
+             must hold its write; writes={role_inside:?}"
+        );
+        assert!(
+            role_prompt.is_some(),
+            "orchestrator: the remit is held, not consumed"
+        );
+
+        deliver_orchestrator_prompt(
+            &mut role_ui,
+            role_pane.as_ref(),
+            &role_snapshot,
+            anchor + past_buffer,
+            tab_id,
+            &role_panes,
+            0,
+            &mut role_statuses,
+            &mut role_prompt,
+        );
+        let role_past = role_writes.lock().unwrap().clone();
+        assert_eq!(
+            role_past.len(),
+            1,
+            "orchestrator: once the buffer has elapsed after the 10 s, the fallback \
+             writes exactly once; writes={role_past:?}"
+        );
+        assert_eq!(
+            role_past[0].0, PROMPT,
+            "orchestrator: the write carries the remit"
         );
     }
 

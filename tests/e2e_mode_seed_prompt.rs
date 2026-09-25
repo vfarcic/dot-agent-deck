@@ -134,3 +134,66 @@ fn mode_005_seed_prompt_gated_delivery_to_agent_pane() {
         "a mode without seed_prompt must not auto-deliver any prompt to its agent pane"
     );
 }
+
+/// `crate::ui`'s 10-second readiness fallback plus the 500 ms readiness buffer
+/// it owes after it (issue #529). Restated here because an e2e test links the
+/// binary, not the library's private constants.
+const FALLBACK_WITH_BUFFER: Duration = Duration::from_millis(10_500);
+
+/// Scenario: Launch the deck on the `mode-seed` fixture and spawn its `seeded`
+/// mode with a recorder agent that never posts any readiness signal. The seed
+/// must still arrive in the agent pane through the 10-second readiness
+/// fallback, and no sooner than that fallback's buffer allows, counted from the
+/// moment the spawn was submitted.
+#[spec("tabs/mode/007")]
+#[test]
+fn mode_007_seed_reaches_a_silent_agent_through_the_buffered_fallback() {
+    let deck = TuiDeck::launch_with_fixture("mode-seed");
+    deck.wait_for_string("No active sessions");
+    let work = deck.workdir().to_path_buf();
+
+    // The recorder of `write_agent_script` minus its `SessionStart` line: a
+    // producer that announces nothing, so the only door into this pane is the
+    // readiness fallback.
+    let script = work.join("agent-silent.sh");
+    std::fs::write(
+        &script,
+        "#!/bin/sh\n\
+         echo started >> started-silent.log\n\
+         while IFS= read -r l; do printf '%s\\n' \"$l\" >> record-silent.log; done\n",
+    )
+    .expect("write silent agent script");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod silent agent script");
+    }
+
+    // Taken before the spawn is even typed, so it precedes the seed's
+    // `created_at` anchor and the elapsed time below is a true lower bound.
+    let submitted = std::time::Instant::now();
+    spawn_mode(&deck, 1, "./agent-silent.sh"); // mode index 1 = `seeded`
+
+    assert!(
+        common::wait_for_path(&work.join("started-silent.log"), Duration::from_secs(10)),
+        "the seeded mode's agent pane must spawn and run its command"
+    );
+    assert!(
+        common::wait_for_file_substr_count(
+            &work.join("record-silent.log"),
+            SEED_MARKER,
+            1,
+            Duration::from_secs(30),
+        ),
+        "an agent that never signals readiness must still receive the mode's \
+         seed_prompt through the 10-second fallback"
+    );
+    let elapsed = submitted.elapsed();
+    assert!(
+        elapsed > FALLBACK_WITH_BUFFER,
+        "the fallback wrote {elapsed:?} after the spawn was submitted; it owes \
+         the readiness buffer after its 10 s, so it cannot land before \
+         {FALLBACK_WITH_BUFFER:?} (issue #529)"
+    );
+}

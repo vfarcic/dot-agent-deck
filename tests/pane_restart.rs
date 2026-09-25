@@ -18,7 +18,9 @@ use std::time::Duration;
 use dot_agent_deck::agent_pty::{
     AgentPtyRegistry, DOT_AGENT_DECK_PANE_ID, PaneRecreateIdentity, SpawnOptions, TabMembership,
 };
-use dot_agent_deck::event::{RestartRoleResponse, RestartRoleSignal};
+use dot_agent_deck::event::{
+    DelegateResponse, DelegateSignal, RestartRoleResponse, RestartRoleSignal,
+};
 use dot_agent_deck::state::OrchestrationIdentity;
 use spec::spec;
 
@@ -876,4 +878,259 @@ async fn pane_restart_011_force_bypasses_the_post_dispatch_lock_recheck_too() {
          spawned agent, not leave it in place; occupant = {occupant:?}, \
          replacement = {replacement_agent_id}"
     );
+}
+
+/// The pointer line `dispatch_one_owned` writes into the `coder` worker's PTY.
+const POINTER: &[u8] = b"Read .dot-agent-deck/worker-task-coder.md for your task.";
+
+/// Count `POINTER` in whatever agent currently owns the worker pane.
+fn pointers_in_worker_pane(registry: &AgentPtyRegistry) -> usize {
+    registry
+        .pane_current_agent_id(WORKER_PANE)
+        .and_then(|id| registry.snapshot(&id).ok())
+        .unwrap_or_default()
+        .windows(POINTER.len())
+        .filter(|w| *w == POINTER)
+        .count()
+}
+
+/// Poll until the worker pane's current agent has received at least `count`
+/// pointers, or `timeout` passes. Returns whether it got there.
+async fn wait_for_pointers(registry: &AgentPtyRegistry, count: usize, timeout: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if pointers_in_worker_pane(registry) >= count {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+async fn delegate_to_worker(fx: &Fixture, supersede: bool) -> DelegateResponse {
+    let signal = DelegateSignal {
+        pane_id: ORCH_PANE.to_string(),
+        task: "Probe task for the busy-worker refusal.".to_string(),
+        to: vec![WORKER_ROLE.to_string()],
+        supersede,
+        timestamp: chrono::Utc::now(),
+        token: None,
+    };
+    fx.daemon
+        .state
+        .read()
+        .await
+        .handle_delegate_with_state(
+            signal,
+            &fx.daemon.registry,
+            &fx.daemon.event_tx,
+            Some(&fx.daemon.state),
+        )
+        .await
+}
+
+/// Scenario: the orchestrator delegates to a healthy `cat` worker, waits for the
+/// task pointer to land, and delegates to it again before any work-done — that
+/// second delegate must be refused as busy and never reach the pane (issue
+/// #580). The orchestrator then cancels the task with `pane restart --force`,
+/// and a plain delegate to the restarted role must go through, because the
+/// restart retired the commission only the replaced agent could have answered
+/// (issue #590).
+#[tokio::test(flavor = "multi_thread")]
+#[spec("pane/restart/012")]
+async fn pane_restart_012_force_restart_cancels_the_task_a_busy_refusal_names() {
+    let fx = fixture("cat").await;
+    // `clear = false`, so a delegate writes into the live `cat` rather than
+    // respawning it and waiting out a `SessionStart` a `cat` never sends. The
+    // config is read on every delegate, so rewriting it here is enough.
+    tokio::fs::write(
+        fx._dir.path().join(".dot-agent-deck.toml"),
+        format!("{}clear = false\n", config("cat")),
+    )
+    .await
+    .expect("rewrite the orchestration config with a clear = false worker");
+
+    let first = delegate_to_worker(&fx, false).await;
+    assert_eq!(
+        first.delivered,
+        vec![WORKER_ROLE.to_string()],
+        "the first delegate to an idle worker must be dispatched; response = {first:?}"
+    );
+    assert!(
+        wait_for_pointers(&fx.daemon.registry, 1, Duration::from_secs(20)).await,
+        "precondition: the first task pointer never reached the worker"
+    );
+    // The pty echoes the line and `cat` writes it back, so one delivery can
+    // show the pointer more than once. Let it settle and compare against that.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let delivered_once = pointers_in_worker_pane(&fx.daemon.registry);
+
+    let refused = delegate_to_worker(&fx, false).await;
+    assert!(
+        refused.delivered.is_empty(),
+        "a delegate to a worker that still owes a work-done must not be dispatched; \
+         response = {refused:?}"
+    );
+    assert_eq!(
+        refused
+            .busy
+            .iter()
+            .map(|b| b.role.as_str())
+            .collect::<Vec<_>>(),
+        vec![WORKER_ROLE],
+        "the busy worker must be named; response = {refused:?}"
+    );
+    assert!(
+        refused
+            .error
+            .as_deref()
+            .is_some_and(|e| e.contains("--supersede")),
+        "the refusal must be an error naming the remedy; response = {refused:?}"
+    );
+    // Give a (wrongly) dispatched second pointer the time the first one took
+    // and then some, before asserting it never came.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(
+        pointers_in_worker_pane(&fx.daemon.registry),
+        delivered_once,
+        "the refused delegate must not have written a second pointer into the busy pane"
+    );
+
+    let restarted = restart_role(&fx, ORCH_PANE, WORKER_ROLE, true).await;
+    assert!(
+        restarted.restarted,
+        "precondition: the forced restart must succeed; response = {restarted:?}"
+    );
+
+    let after_restart = delegate_to_worker(&fx, false).await;
+    assert_eq!(
+        after_restart.delivered,
+        vec![WORKER_ROLE.to_string()],
+        "after `pane restart --force` the role takes a plain delegate again — the cancelled \
+         task's commission went with the agent that owed it; response = {after_restart:?}"
+    );
+    assert!(
+        after_restart.busy.is_empty() && after_restart.superseded.is_empty(),
+        "nothing was outstanding to refuse or supersede; response = {after_restart:?}"
+    );
+    assert!(
+        wait_for_pointers(&fx.daemon.registry, 1, Duration::from_secs(20)).await,
+        "the delegate after the restart must reach the replacement agent"
+    );
+}
+
+/// Sets environment variables and puts back what was there before when
+/// dropped, including on a panic. For `pane/restart/013`, which needs a
+/// sub-minute silent-worker window and has only the environment to ask for it.
+struct EnvRestore(Vec<(&'static str, Option<std::ffi::OsString>)>);
+
+impl EnvRestore {
+    fn set(vars: &[(&'static str, &str)]) -> Self {
+        let saved = vars
+            .iter()
+            .map(|(key, _)| (*key, std::env::var_os(key)))
+            .collect();
+        for (key, value) in vars {
+            // SAFETY: called before the test starts its runtime, so this thread
+            // is the only one of the test reading the environment.
+            unsafe { std::env::set_var(key, value) };
+        }
+        Self(saved)
+    }
+}
+
+impl Drop for EnvRestore {
+    fn drop(&mut self) {
+        for (key, value) in &self.0 {
+            // SAFETY: dropped after the test's runtime has shut down.
+            match value {
+                Some(value) => unsafe { std::env::set_var(key, value) },
+                None => unsafe { std::env::remove_var(key) },
+            }
+        }
+    }
+}
+
+/// Whether the orchestrator pane shows the daemon's silent-worker notice.
+fn orchestrator_shows_silence_notice(registry: &AgentPtyRegistry) -> bool {
+    let text = registry
+        .pane_current_agent_id(ORCH_PANE)
+        .and_then(|id| registry.snapshot(&id).ok())
+        .map(|s| String::from_utf8_lossy(&s).into_owned())
+        .unwrap_or_default();
+    text.contains("delegated worker went quiet (dot-agent-deck daemon report)")
+}
+
+/// Scenario: with a short silent-worker window and the idle detector off, the
+/// orchestrator delegates to a `cat` worker (which never emits an agent event),
+/// the pointer lands, and the orchestrator cancels the task at once with
+/// `pane restart --force`. The daemon's "delegated worker went quiet" notice must
+/// never appear in the orchestrator's pane for that cancelled task. A second,
+/// uncancelled delegate afterwards must produce the notice, proving the detector
+/// was on and the notice observable all along (Greptile and Qodo on PR #1285).
+#[test]
+#[spec("pane/restart/013")]
+fn pane_restart_013_force_restart_cancels_the_silent_worker_notice() {
+    // Set before the runtime starts and restored by `_env` after it has shut
+    // down — on a panic too — so no runtime thread of this test is reading the
+    // environment while it changes. Every cargo alias in this repo runs nextest,
+    // which gives each test its own process, so no other test sees these values.
+    // Under plain `cargo test` the other tests of this file may run concurrently
+    // in the same process; for them the values only switch the idle detector off
+    // and shorten the silent-worker window, and none of them asserts on either.
+    let _env = EnvRestore::set(&[
+        ("DOT_AGENT_DECK_DELEGATE_NO_EVENT_WINDOW_MS", "1000"),
+        ("DOT_AGENT_DECK_WORKER_RESPONSE_TIMEOUT_MS", "0"),
+    ]);
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("build the pane/restart/013 runtime")
+        .block_on(async {
+            let fx = fixture("cat").await;
+            tokio::fs::write(
+                fx._dir.path().join(".dot-agent-deck.toml"),
+                format!("{}clear = false\n", config("cat")),
+            )
+            .await
+            .expect("rewrite the orchestration config with a clear = false worker");
+
+            let first = delegate_to_worker(&fx, false).await;
+            assert_eq!(first.delivered, vec![WORKER_ROLE.to_string()], "{first:?}");
+            assert!(
+                wait_for_pointers(&fx.daemon.registry, 1, Duration::from_secs(20)).await,
+                "precondition: the first task pointer never reached the worker"
+            );
+            let restarted = restart_role(&fx, ORCH_PANE, WORKER_ROLE, true).await;
+            assert!(restarted.restarted, "{restarted:?}");
+
+            // Three windows: long enough for an uncancelled watch to have fired.
+            tokio::time::sleep(Duration::from_millis(3000)).await;
+            assert!(
+                !orchestrator_shows_silence_notice(&fx.daemon.registry),
+                "the restart cancelled the task, so its silent-worker notice must not appear"
+            );
+
+            // Control: the same detector reports a task nobody cancelled.
+            let second = delegate_to_worker(&fx, false).await;
+            assert_eq!(
+                second.delivered,
+                vec![WORKER_ROLE.to_string()],
+                "{second:?}"
+            );
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+            while !orchestrator_shows_silence_notice(&fx.daemon.registry)
+                && tokio::time::Instant::now() < deadline
+            {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            assert!(
+                orchestrator_shows_silence_notice(&fx.daemon.registry),
+                "control: an uncancelled delegate to the silent worker must be reported, or the \
+                 negative above proved nothing"
+            );
+        });
 }
