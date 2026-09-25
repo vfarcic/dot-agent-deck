@@ -137,6 +137,28 @@ const ALLOWED_ROOT_MODULES: &[&str] = &[
     "daemon_protocol",
     "daemon_stop",
     "event",
+    // Issue #1198, argued rather than added quietly. The desktop names two
+    // things here: the five `show_desktop_*` wrappers, one per surface the
+    // app hides behind the `experimental` flag (CLAUDE.md rule 9 puts every
+    // gate behind a wrapper in this module, so a desktop-side copy of the
+    // flag read would be the second list the rule exists to prevent), and
+    // `init_from_process_env`, which resolves the flag for this process.
+    //
+    // That entry point is the one the desktop may call, and it crosses none
+    // of this rule's lines: it reads `DOT_AGENT_DECK_EXPERIMENTAL` and the
+    // file `DOT_AGENT_DECK_FEATURES_CONFIG` names outright, takes no project
+    // directory, walks nowhere and never calls `std::env::current_dir`.
+    //
+    // The module ITSELF is not that clean, and saying so is the point of
+    // arguing the entry: `init_and_watch` — the TUI's and the daemon's entry
+    // point — resolves the flag against a project directory its caller walked
+    // to, and a desktop call to it would be the client-side project read PRD
+    // #819 removed. The first commit that wired the desktop did exactly that
+    // (with a `current_dir` walk, which the `cwd-fallback` finding caught).
+    // With this entry allowlisted, a desktop call to `init_and_watch` is the
+    // "root-crate wrapper with an innocuous name" residual this file's header
+    // already admits: nothing here would catch it.
+    "features",
     "platform",
     "prompt_delivery",
     // PRD #741 M6, argued rather than added quietly. The desktop's settings
@@ -573,7 +595,7 @@ impl<'ast> Visit<'ast> for Scan {
     fn visit_attribute(&mut self, _node: &'ast syn::Attribute) {}
 }
 
-fn item_attrs(item: &syn::Item) -> Option<&[syn::Attribute]> {
+pub(crate) fn item_attrs(item: &syn::Item) -> Option<&[syn::Attribute]> {
     Some(match item {
         syn::Item::Const(i) => &i.attrs,
         syn::Item::Enum(i) => &i.attrs,
@@ -594,7 +616,7 @@ fn item_attrs(item: &syn::Item) -> Option<&[syn::Attribute]> {
     })
 }
 
-fn impl_item_attrs(item: &syn::ImplItem) -> Option<&[syn::Attribute]> {
+pub(crate) fn impl_item_attrs(item: &syn::ImplItem) -> Option<&[syn::Attribute]> {
     Some(match item {
         syn::ImplItem::Const(i) => &i.attrs,
         syn::ImplItem::Fn(i) => &i.attrs,
@@ -618,7 +640,7 @@ fn impl_item_attrs(item: &syn::ImplItem) -> Option<&[syn::Attribute]> {
 /// PRODUCTION block as test-only and silently dropped it from the scan — the
 /// exact fail-open direction this module's docs promise to avoid. Only a bare
 /// `test` **path** counts now; a string literal's contents never do.
-fn cfg_selects_test_only(attrs: &[syn::Attribute]) -> bool {
+pub(crate) fn cfg_selects_test_only(attrs: &[syn::Attribute]) -> bool {
     attrs.iter().any(|attr| {
         if !attr.path().is_ident("cfg") {
             return false;

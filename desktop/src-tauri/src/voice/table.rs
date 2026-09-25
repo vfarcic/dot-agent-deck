@@ -1201,6 +1201,8 @@ mod tests {
         assert_eq!(table, *super::table());
     }
 
+    /// Scenario: load the shipped voice table and check each command's screen
+    /// availability, including the navigation and Settings controls in the rail.
     #[test]
     fn voice_table_embedded_table_has_the_rows_the_milestones_build_against() {
         // M2 has to make each `invoke` real and M3's guard has to resolve it,
@@ -1221,14 +1223,14 @@ mod tests {
             rows,
             vec![
                 ("open_agent", "openAgent", vec!["deck", "overview"]),
-                ("open_overview", "openOverview", vec!["deck"]),
-                ("open_deck", "openDeck", vec!["overview"]),
+                ("open_overview", "openOverview", vec!["deck", "overview"]),
+                ("open_deck", "openDeck", vec!["deck", "overview"]),
                 // No screens: callable everywhere. `close` is here because the
                 // voice surface's own overlay can be up on any of the three and
                 // `screens` cannot express "an overlay is open"; the precedence
                 // between that overlay and an agent pane is decided at dispatch.
                 ("close", "closeTopmost", vec![]),
-                ("open_settings", "openSettings", vec!["deck"]),
+                ("open_settings", "openSettings", vec!["deck", "overview"]),
                 // No screens: see the row's own comment — stopping must never
                 // be unavailable.
                 ("voice_off", "stopVoice", vec![]),
@@ -2173,6 +2175,8 @@ mod tests {
         }
     }
 
+    /// Scenario: enumerate callable voice commands on each screen. Both base
+    /// screens expose the shared rail's Overview, Deck, and Settings actions.
     #[test]
     fn voice_table_callable_per_screen_for_the_shipped_rows() {
         let table = super::table();
@@ -2187,14 +2191,14 @@ mod tests {
                 .map(|row| row.id.as_str())
                 .collect::<Vec<_>>()
         };
-        // `open_settings` is on the deck and NOT on the overview: the Settings
-        // overlay is reachable only from the deck rail, and a row exposes
-        // behaviour that already exists rather than adding a route of its own.
+        // The shared rail exposes Overview, Deck, and Settings from either
+        // base screen, so the voice rows are callable from both.
         assert_eq!(
             callable(Screen::Deck),
             vec![
                 "open_agent",
                 "open_overview",
+                "open_deck",
                 "close",
                 "open_settings",
                 "voice_off",
@@ -2205,8 +2209,10 @@ mod tests {
             callable(Screen::Overview),
             vec![
                 "open_agent",
+                "open_overview",
                 "open_deck",
                 "close",
+                "open_settings",
                 "voice_off",
                 "list_commands",
                 "open_new_agent",

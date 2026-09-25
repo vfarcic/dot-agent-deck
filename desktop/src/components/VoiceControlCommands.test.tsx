@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createFixtureFleet, createFixtureSnapshot, FIXTURE_DAEMON_ID, FIXTURE_REMOTE_DAEMON_ID, FIXTURE_UNREACHABLE_DAEMON_ID } from "../data/fixture";
 import {
   DEFAULT_DESKTOP_SETTINGS,
+  fixtureDesktopFeatures,
   type DesktopSettingsDto,
   type VoiceCommandDto,
   type VoiceDirectoriesDto,
@@ -21,7 +22,16 @@ vi.mock("./TerminalViewport", () => ({
   ),
 }));
 
-import { DeckShell } from "../App";
+import { DeckShell as AppDeckShell } from "../App";
+
+// The existing command cases cover the experimental deck. The shipped-default
+// cases below clear this query parameter in their nested beforeEach.
+beforeEach(() => window.history.replaceState({}, "", "/?fixture=1&experimental=1"));
+
+/** Existing deck-specific voice cases enter the deck explicitly. */
+function DeckShell(props: Parameters<typeof AppDeckShell>[0]) {
+  return <AppDeckShell initialView={{ kind: "deck" }} {...props} />;
+}
 import { COMMAND_HIDDEN_BY_ORCHESTRATION, DECK_CANNOT_TAKE_AGENT, DECK_NOT_LISTED, DIRECTORY_MOVED_ON, DRAFT_RESTORED, DIRECTORY_NOT_LISTED, FORM_MOVED_ON, MODE_NOT_OFFERED, NO_DIRECTORY_BROWSER, NO_NEW_AGENT_DIALOG, NO_NEW_AGENT_FORM, NO_PARENT_DIRECTORY, spokenName, START_IN_FLIGHT, START_NEEDS_DIRECTORY, STARTING_CLOSE_BLOCKED } from "./NewAgentDialog";
 import { CONFIRMATION_ALREADY_OPEN, STOP_BEHIND_NEW_AGENT, STOP_TARGET_GONE } from "./AgentOverview";
 import {
@@ -170,6 +180,7 @@ function runtime(resolveVoice: ResolveVoice, voice: VoiceControls, overrides: Pa
     saveSettings: settings.saveSettings,
     resolveVoice,
     ...voice,
+    ...{ desktopFeatures: fixtureDesktopFeatures() },
     ...overrides,
   } as unknown as DeckRuntimeState;
 }
@@ -296,6 +307,31 @@ describe("voice off, as a command", () => {
   });
 });
 
+describe("Settings from the overview by voice", () => {
+  beforeEach(() => {
+    window.localStorage.clear();
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => vi.useRealTimers());
+
+  /**
+   * Scenario: while the overview is open, say "open settings". The voice
+   * action opens the same Settings sheet that the overview rail exposes.
+   */
+  it("opens the Settings sheet from the overview", async () => {
+    const voice = microphone(["open settings"]);
+    const resolveVoice: ResolveVoice = vi.fn(async () => dispatch("open_settings", "openSettings", "Opening settings.", "open settings"));
+    render(<DeckShell runtime={runtime(resolveVoice, voice)} initialView={{ kind: "overview" }} />);
+
+    await turnVoiceOn();
+    await completeUtterance();
+
+    expect(resolveVoice).toHaveBeenCalledWith("open settings");
+    expect(screen.getByRole("dialog", { name: "Settings" })).toBeVisible();
+  });
+});
+
 describe("what can I say?", () => {
   beforeEach(() => {
     window.localStorage.clear();
@@ -309,7 +345,9 @@ describe("what can I say?", () => {
   const VOCABULARY: VoiceCommandDto[] = [
     { id: "open_overview", description: "Show every agent in one list.", callable: true, unavailable_hint: "the agent overview opens from the deck", params: [] },
     { id: "voice_off", description: "Stop listening.", callable: true, unavailable_hint: "turning voice off works anywhere", params: [] },
-    { id: "open_deck", description: "Go back to the terminals.", callable: false, unavailable_hint: "returning to the deck works from the agent overview", params: [] },
+    { id: "open_deck", description: "Go back to the terminals.", callable: true, unavailable_hint: "returning to the deck works from the agent overview", params: [] },
+    { id: "open_settings", description: "Open Settings.", callable: true, unavailable_hint: "settings open from the rail", params: [] },
+    { id: "dictate_to_agent", description: "Type into an agent.", callable: false, unavailable_hint: "open an agent first", params: [] },
   ];
 
   function listing(voice: VoiceControls, commands = VOCABULARY) {
@@ -339,9 +377,9 @@ describe("what can I say?", () => {
     const here = overlay.querySelector('[data-where="here"]');
     const elsewhere = overlay.querySelector('[data-where="elsewhere"]');
     expect(Array.from(here?.querySelectorAll("[data-command]") ?? []).map((row) => row.getAttribute("data-command")))
-      .toEqual(["open_overview", "voice_off"]);
+      .toEqual(["open_overview", "voice_off", "open_deck", "open_settings"]);
     expect(Array.from(elsewhere?.querySelectorAll("[data-command]") ?? []).map((row) => row.getAttribute("data-command")))
-      .toEqual(["open_deck"]);
+      .toEqual(["dictate_to_agent"]);
   });
 
   /**
@@ -807,6 +845,55 @@ describe("typing into the open agent", () => {
   });
 });
 
+describe("experimental deck voice gating", () => {
+  beforeEach(() => {
+    window.history.replaceState({}, "", "/?fixture=1");
+    window.localStorage.clear();
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => vi.useRealTimers());
+
+  /**
+   * Scenario: ask for the voice command list on the shipped overview even if
+   * an older command table includes open_deck. Only commands for visible screens are offered.
+   */
+  it("does not offer open_deck when the deck is hidden", async () => {
+    const voice = microphone(["what can I say?"]);
+    const voiceCommands = vi.fn(async () => [
+      { id: "open_overview", description: "Show every agent.", callable: true, unavailable_hint: "", params: [] },
+      { id: "open_deck", description: "Show the terminals.", callable: true, unavailable_hint: "", params: [] },
+      { id: "open_settings", description: "Open Settings.", callable: true, unavailable_hint: "", params: [] },
+    ] as VoiceCommandDto[]);
+    const resolveVoice = vi.fn(async () => dispatch("list_commands", "showVoiceCommands", "Here is what you can say.", "what can I say?"));
+    render(<DeckShell runtime={runtime(resolveVoice, voice, { voiceCommands })} initialView={{ kind: "overview" }} />);
+
+    await turnVoiceOn();
+    await completeUtterance();
+
+    const help = screen.getByTestId("voice-help");
+    expect(help.querySelector('[data-command="open_deck"]')).toBeNull();
+    expect(help.querySelector('[data-command="open_overview"]')).not.toBeNull();
+    expect(help.querySelector('[data-command="open_settings"]')).not.toBeNull();
+  });
+
+  /**
+   * Scenario: voice resolves a request to open the gated deck while the flag
+   * is off. The overview remains on screen, including after the dispatch completes.
+   */
+  it("refuses a resolved open_deck command while experimental is off", async () => {
+    const voice = microphone(["open the deck"]);
+    const resolveVoice = vi.fn(async () => dispatch("open_deck", "openDeck", "Opening deck.", "open the deck"));
+    render(<DeckShell runtime={runtime(resolveVoice, voice)} initialView={{ kind: "overview" }} />);
+
+    await turnVoiceOn();
+    await completeUtterance();
+
+    expect(screen.getByTestId("overview-table-region")).toBeVisible();
+    expect(screen.queryByTestId("agent-tile-planner")).not.toBeInTheDocument();
+  });
+});
+
 describe("closing what is on top", () => {
   beforeEach(() => {
     window.localStorage.clear();
@@ -826,6 +913,7 @@ describe("closing what is on top", () => {
   function closing(): ResolveVoice {
     return vi.fn(async (utterance: string) => {
       if (utterance === "open the planner") return dispatch("open_agent", "openAgent", "Opening Planner.", utterance, PLANNER);
+      if (utterance === "open settings") return dispatch("open_settings", "openSettings", "Opening settings.", utterance);
       if (utterance === "what can I say?") return dispatch("list_commands", "showVoiceCommands", "Here is what you can say.", utterance);
       return CLOSE;
     });
@@ -857,14 +945,76 @@ describe("closing what is on top", () => {
   });
 
   /**
-   * Scenario: with no overlay up, the same word closes the agent's pane. The
-   * precedence is decided at dispatch because *"an overlay is open"* is not a
-   * screen — and this is the "otherwise" half of it.
+   * Scenario: on the shipped overview, Settings is open beneath the spoken
+   * command list. Saying "close" dismisses the list first; if an agent pane
+   * then opens over Settings, the pane closes before Settings does.
+   */
+  it("closes the voice overlay before Settings on the overview", async () => {
+    window.history.replaceState({}, "", "/?fixture=1");
+    const voice = microphone([]);
+    const deck = closingDeck(voice);
+    render(<DeckShell runtime={deck} initialView={{ kind: "overview" }} />);
+
+    await turnVoiceOn();
+    fireEvent.click(screen.getByRole("button", { name: "Settings" }));
+    expect(screen.getByRole("dialog", { name: "Settings" })).toBeVisible();
+
+    voice.deliver("what can I say?");
+    await completeUtterance();
+    expect(screen.getByTestId("voice-help")).toBeInTheDocument();
+
+    voice.deliver("close this");
+    await completeUtterance();
+    expect(screen.queryByTestId("voice-help")).toBeNull();
+    expect(screen.getByRole("dialog", { name: "Settings" })).toBeVisible();
+
+    voice.deliver("open the planner");
+    await completeUtterance();
+    expect(screen.getByTestId("agent-pane-overlay")).toBeInTheDocument();
+    expect(screen.getByRole("dialog", { name: "Settings" })).toBeVisible();
+
+    voice.deliver("close this");
+    await completeUtterance();
+    expect(screen.queryByTestId("agent-pane-overlay")).toBeNull();
+    expect(screen.getByRole("dialog", { name: "Settings" })).toBeVisible();
+
+    voice.deliver("close this");
+    await completeUtterance();
+    expect(screen.queryByRole("dialog", { name: "Settings" })).toBeNull();
+    expect(screen.getByTestId("overview-table-region")).toBeVisible();
+    expect(screen.queryByTestId("voice-report")?.textContent ?? "").not.toContain(VOICE_NOTHING_TO_CLOSE);
+  });
+
+  /**
+   * Scenario: with the experimental deck shown, saying "close" while its
+   * Settings sheet is open dismisses the sheet and leaves the deck visible.
+   */
+  it("closes Settings on the deck", async () => {
+    const voice = microphone([]);
+    render(<DeckShell runtime={closingDeck(voice)} />);
+
+    await turnVoiceOn();
+    fireEvent.click(screen.getByRole("button", { name: "Settings" }));
+    expect(screen.getByRole("dialog", { name: "Settings" })).toBeVisible();
+
+    voice.deliver("close this");
+    await completeUtterance();
+
+    expect(screen.queryByRole("dialog", { name: "Settings" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Open Planner agent" })).toBeVisible();
+    expect(screen.queryByTestId("voice-report")?.textContent ?? "").not.toContain(VOICE_NOTHING_TO_CLOSE);
+  });
+
+  /**
+   * Scenario: with no overlay up, the same word closes an agent pane opened
+   * from the shipped overview. The user returns to that overview without
+   * passing through the hidden deck.
    */
   it("closes the agent view when no overlay is up", async () => {
+    window.history.replaceState({}, "", "/?fixture=1");
     const voice = microphone(["open the planner"]);
     const deck = closingDeck(voice);
-    render(<DeckShell runtime={deck} />);
+    render(<DeckShell runtime={deck} initialView={{ kind: "overview" }} />);
 
     await turnVoiceOn();
     await completeUtterance();
@@ -874,6 +1024,8 @@ describe("closing what is on top", () => {
     await completeUtterance();
 
     expect(screen.queryByTestId("agent-pane-overlay")).toBeNull();
+    expect(screen.getByTestId("overview-table-region")).toBeVisible();
+    expect(screen.queryByTestId("agent-tile-planner")).not.toBeInTheDocument();
   });
 
   /**
@@ -918,10 +1070,9 @@ describe("closing what is on top", () => {
   }
 
   /**
-   * Scenario (PRD #1223 U5): on the overview, open the New agent dialog and
-   * say "close". It closes the dialog — it used to answer "nothing to close"
-   * with the dialog still on screen, because `close` knew only the voice
-   * overlay and the agent pane.
+   * Scenario: open the New agent dialog on the overview, then open Settings by
+   * voice behind it. Saying "close" dismisses the New agent dialog before
+   * Settings, then dismisses Settings on the next utterance.
    */
   it("closes the New agent dialog", async () => {
     const voice = microphone([]);
@@ -932,10 +1083,20 @@ describe("closing what is on top", () => {
     fireEvent.click(screen.getByTestId("overview-new-agent"));
     expect(screen.getByTestId("new-agent-dialog")).toBeInTheDocument();
 
+    voice.deliver("open settings");
+    await completeUtterance();
+    expect(screen.getByRole("dialog", { name: "Settings" })).toBeVisible();
+    expect(screen.getByTestId("new-agent-dialog")).toBeInTheDocument();
+
     voice.deliver("close this");
     await completeUtterance();
 
     expect(screen.queryByTestId("new-agent-dialog")).toBeNull();
+    expect(screen.getByRole("dialog", { name: "Settings" })).toBeVisible();
+
+    voice.deliver("close this");
+    await completeUtterance();
+    expect(screen.queryByRole("dialog", { name: "Settings" })).toBeNull();
     expect(screen.queryByTestId("voice-report")?.textContent ?? "").not.toContain(VOICE_NOTHING_TO_CLOSE);
   });
 

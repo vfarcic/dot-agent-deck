@@ -783,12 +783,18 @@ fn delegate_verdict(
         };
     }
     let unresolved = resp.unresolved_roles.join(", ");
-    // The three causes, stated as the three causes rather than as the one that
-    // happens to be most common.
+    // The four causes, stated as the four causes rather than as the one that
+    // happens to be most common. Issue #554 added the fourth: the daemon routes
+    // by the role name a pane was started with, so a role renamed in the toml
+    // after the orchestration started is present in the file and still reaches
+    // nobody — the first cause alone sent the user to a file that looked right.
     let causes = "(A role reaches no worker when it is absent from \
                   .dot-agent-deck.toml, when it is the delegating orchestrator \
-                  itself — an orchestrator cannot delegate to itself — or when \
-                  its worker pane has been closed.)";
+                  itself — an orchestrator cannot delegate to itself — when \
+                  its worker pane has been closed, or when the role was renamed \
+                  or added in .dot-agent-deck.toml after this orchestration \
+                  started — running panes keep the role names they were started \
+                  with until the orchestration is restarted.)";
     if resp.delivered.is_empty() {
         return DelegateVerdict {
             failed: true,
@@ -3445,15 +3451,21 @@ mod tests {
             msg.contains("ghost"),
             "the message must name the role that missed: {msg}"
         );
-        // The three causes, not the one that happens to be most common: the
+        // The four causes, not the one that happens to be most common: the
         // old message told the user to go check role names in the toml even
         // when the role was sitting there correctly and was simply the
-        // orchestrator itself, or had had its worker pane closed.
+        // orchestrator itself, or had had its worker pane closed — or, issue
+        // #554, had been renamed in the toml after the orchestration started,
+        // which leaves the file looking right while the daemon still routes by
+        // the old name.
         assert!(
             msg.contains(".dot-agent-deck.toml")
                 && msg.contains("orchestrator cannot delegate to itself")
-                && msg.contains("worker pane has been closed"),
-            "the message must state all three causes, not assert one: {msg}"
+                && msg.contains("worker pane has been closed")
+                && msg.contains(
+                    "renamed or added in .dot-agent-deck.toml after this orchestration started"
+                ),
+            "the message must state all four causes, not assert one: {msg}"
         );
     }
 
