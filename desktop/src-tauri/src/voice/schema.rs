@@ -95,7 +95,7 @@ pub const TOOL_NAME: &str = "run_deck_action";
 /// `open-agent-isolate` or `close-agent-view-unavailable` on OpenAI,
 /// `open-agent-by-state` on Anthropic — and every cell scored below its
 /// baseline on both presets. It is not shipped, and the tie-break stayed. The
-/// per-run numbers are in `prds/802-desktop-voice-control.md`; this is the
+/// per-run numbers are in `prds/done/802-desktop-voice-control.md`; this is the
 /// third prompt intervention on this branch to move a failure rather than
 /// remove one, which is the reason to reach for a fixture or a `description`
 /// before reaching for this paragraph.

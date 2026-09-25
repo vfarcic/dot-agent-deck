@@ -1,6 +1,6 @@
 # PRD #10: Terminal Demo Recording for README
 
-**Status**: Open
+**Status**: Closed — issue #10 was closed on 2026-04-10, and this document was archived under #1297. Last status recorded while it was open: Open
 **Priority**: Low
 **GitHub Issue**: [#10](https://github.com/vfarcic/dot-agent-deck/issues/10)
 **Depends on**: PRD #4 (Documentation)

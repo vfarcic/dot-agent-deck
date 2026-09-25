@@ -1,6 +1,6 @@
 # PRD #176: Desktop GUI app — alternative front-end to the TUI
 
-**Status**: In Progress
+**Status**: Superseded — closed 2026-09-25; see the closing note at the end
 **Priority**: Medium
 **Created**: 2026-06-20
 **GitHub Issue**: [#176](https://github.com/vfarcic/dot-agent-deck/issues/176)
@@ -153,3 +153,22 @@ It does not re-implement the TUI's rendering, does not hold orchestration logic,
 - **JS toolchain pollutes a Rust-centric repo and its gates.** Mitigation: contain all JS build tooling in the GUI subdirectory; keep `cargo fmt`/`clippy`/`nextest` gates authoritative for the Rust crates; add a separate, non-blocking-to-Rust GUI test job.
 - **Scope creep dressed up as "richer."** "We'll find richness later" is how a complementary app becomes an unbounded second product. Mitigation: the graph is the single flagship that justifies the build; everything else (notifications, rich rendering, dashboards) is upside, added only after the graph proves the thesis.
 - **Maturity leakage.** An unproven GUI shipped in default artifacts would set expectations it can't meet. Mitigation: packaging-level opt-in (separate artifact, unadvertised) instead of a runtime flag, since a separate binary has no TUI seam to gate.
+
+## Closing note — superseded (2026-09-25)
+
+Closed as **superseded**, not complete. The desktop app this PRD proposed exists, but it was built by the PRDs that followed it rather than by working down this list, and several of this document's premises were overturned on the way: the app reaches remote decks (PRD #741, PR #1035, after PRD #819 moved project resolution behind the daemon in PR #869) and several decks at once (PRD #742), and it ships on every release as an unsigned alpha (PRD #740) rather than staying out of the default release. Mapped against `origin/main` at `8301c00`:
+
+| Milestone | Where it went |
+| --- | --- |
+| M1.1 — extract a `protocol` crate | **Not done.** The desktop crate still depends on the root package by path (`desktop/src-tauri/Cargo.toml`), and `docs/develop/desktop-gui.md` lists the extraction under "Current milestone limits". |
+| M1.2 — Tauri skeleton, `Hello` negotiation | PR #416 (`daf94f0`), which added `desktop/src-tauri` as a workspace member. Compatibility has since been classified from declared contract breaks rather than build stamps (#801). |
+| M1.3 — embedded terminal, throughput stress test | The xterm.js round trip shipped in PR #416; PTY resize from one agent's enlarged pane in PRD #1105 (PR #1126). The defined stress qualification was never run, and "Current milestone limits" still names it. |
+| M2.1 — decks, tabs, layout, focus | PR #416's deck; several decks at once in PRD #742 (PR #1076); the agent overview in PRD #745 (PR #779 — its iteration 3 stays open under #745); one agent enlarged in PRD #1105 (PR #1126). |
+| M2.2 — pane lifecycle, status from `SubscribeEvents` | PR #416 routed `StartAgent`, `StopAgent`, `SetAgentLabel`, resize, `WriteAndSubmit` and `SubscribeEvents` through the Tauri bridge; starting a single agent from the UI is PRD #1223 (PR #1235). Rename is still not exposed by the frontend. |
+| M3.1 / M3.2 — structured `delegate`/`work-done`/`dispatch` events and the agents-communication graph | **Not built.** |
+| M4.1 — OS-native notifications | **Not built.** |
+| M5.1 — preview packaging | PRD #740 (PR #768). |
+| M5.2 / M5.3 — tests and docs | Delivered per feature by the PRDs above: `desktop/` carries its own Rust and web test suites, and `docs/develop/desktop-gui.md` is the developer doc. The user doc is not written — the published docs under `docs/` have no page of their own for the app. |
+| M5.4 — pre-PR gate | Overtaken by the process: `cargo test-e2e` is no longer a local pre-PR obligation (CLAUDE.md rule 5, issue #502), and each successor PRD went through its own review. |
+
+**The two parts not built are this PRD's flagship and its ambient affordance: the agents-communication graph (M3) and OS-native notifications (M4).** A title search of open issues on 2026-09-25 found no tracker for either (#628's durable work graph is a data model, not this view), so picking one up means writing a new PRD. The protocol-crate extraction and the M1.3 stress qualification are also undone; both are recorded in `docs/develop/desktop-gui.md`'s "Current milestone limits", which is where they live now.

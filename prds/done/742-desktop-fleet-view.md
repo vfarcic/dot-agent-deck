@@ -1,6 +1,6 @@
 # PRD #742: Connect the desktop GUI to several decks at once — the fleet view
 
-**Status**: Delivered and awaiting the user's merge decision. [PR #1076](https://github.com/vfarcic/dot-agent-deck/pull/1076) is green on all 13 required checks, approved, with every review thread resolved. One thing is deliberately still open: nobody has yet looked at two decks in one window, which is the only surface no automated tier can reach (#953).
+**Status**: Closed — issue #742 was closed on 2026-09-15, and this document was archived under #1297. Last status recorded while it was open: Delivered and awaiting the user's merge decision. [PR #1076](https://github.com/vfarcic/dot-agent-deck/pull/1076) is green on all 13 required checks, approved, with every review thread resolved. One thing is deliberately still open: nobody has yet looked at two decks in one window, which is the only surface no automated tier can reach (#953).
 
 **Original status**: Plan drafted 2026-09-13, awaiting the step-1 gate. Four decisions already taken by the user and recorded in Technical Approach; the reconnaissance corrected the issue's own framing of the central retrofit, which is the first thing to read.
 **Priority**: High — [#741](https://github.com/vfarcic/dot-agent-deck/issues/741) built the seam for it and named it as the thing that inherits it, and #742's own body argues this is the strongest case for the desktop app existing at all.
@@ -79,7 +79,7 @@ A follow-up issue is filed at the end of this PRD for the control half, carrying
 
 ### DECISION 4 — no `experimental` flag (CLAUDE.md rule 9)
 
-**DECIDED by the user: no.** This is not a fresh judgement — it is the third time the same mechanical reason has decided it. #803 Open Question 1 and #741 DECISION 2 both said no because **the flag does not reach the desktop app by any route**: nothing under `desktop/` mentions it, it is not on the daemon protocol, and the desktop crate never calls `features::init_and_watch`, so `experimental_enabled()` would read its `false` default forever whatever the TOML or the environment said. Gating this would mean building the flag's Tauri delivery mechanism as part of this PRD, and would raise "against which project directory?" for a packaged build — a question the desktop app has no good answer to. `prds/176-desktop-gui.md` decision 6 holds the prior: a separate GUI binary has no such seam, because the act of building and running it is the opt-in, with maturity handled by packaging (the bundles are unsigned alphas).
+**DECIDED by the user: no.** This is not a fresh judgement — it is the third time the same mechanical reason has decided it. #803 Open Question 1 and #741 DECISION 2 both said no because **the flag does not reach the desktop app by any route**: nothing under `desktop/` mentions it, it is not on the daemon protocol, and the desktop crate never calls `features::init_and_watch`, so `experimental_enabled()` would read its `false` default forever whatever the TOML or the environment said. Gating this would mean building the flag's Tauri delivery mechanism as part of this PRD, and would raise "against which project directory?" for a packaged build — a question the desktop app has no good answer to. `prds/done/176-desktop-gui.md` decision 6 holds the prior: a separate GUI binary has no such seam, because the act of building and running it is the opt-in, with maturity handled by packaging (the bundles are unsigned alphas).
 
 ### The `all` token, and the one collision worth knowing about
 
@@ -238,7 +238,7 @@ Ordering follows the recon's recommendation, which puts the risky correctness wo
 
 ### 2026-09-13 — Written from the placeholder issue plus two read-only reconnaissance passes
 
-Written by the orchestrator from #742's body and all three comments (the third, dated 2026-09-11, is a deliberate hand-off from #741), `prds/741-desktop-connect-any-daemon.md`, and the **Decks** section of `docs/develop/desktop-gui.md` — plus two read-only recon passes, one on client architecture, state shape, the overview's data path and test tiers, and one on trust, lifecycle, resources and cross-version safety. Neither modified a file. Full reports at `.dot-agent-deck/prd742-recon-reviewer-report.md` and `.dot-agent-deck/prd742-audit-half2-report.md`.
+Written by the orchestrator from #742's body and all three comments (the third, dated 2026-09-11, is a deliberate hand-off from #741), `prds/done/741-desktop-connect-any-daemon.md`, and the **Decks** section of `docs/develop/desktop-gui.md` — plus two read-only recon passes, one on client architecture, state shape, the overview's data path and test tiers, and one on trust, lifecycle, resources and cross-version safety. Neither modified a file. Full reports at `.dot-agent-deck/prd742-recon-reviewer-report.md` and `.dot-agent-deck/prd742-audit-half2-report.md`.
 
 ### 2026-09-13 — M1 landed: the selection value, the reservation, and the selector option
 

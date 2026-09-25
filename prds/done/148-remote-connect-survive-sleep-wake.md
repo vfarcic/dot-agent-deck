@@ -1,6 +1,6 @@
 # PRD #148: Remote connect survives laptop sleep/wake
 
-**Status**: In Progress — implementation, tests, and docs complete (M1–M3, M5); pending real-remote sleep/wake verification (M4)
+**Status**: Closed — issue #148 was closed on 2026-06-13, and this document was archived under #1297. Last status recorded while it was open: In Progress — implementation, tests, and docs complete (M1–M3, M5); pending real-remote sleep/wake verification (M4)
 **Priority**: High
 **Created**: 2026-06-12
 **GitHub Issue**: [#148](https://github.com/vfarcic/dot-agent-deck/issues/148)

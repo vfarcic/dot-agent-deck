@@ -1,6 +1,6 @@
 # PRD #162: Restore live session status on daemon reconnect
 
-**Status**: In Progress — implementation, tests, review, and e2e gate complete; changelog + PR/merge pending (M4.2–M4.3)
+**Status**: Closed — issue #162 was closed on 2026-06-22, and this document was archived under #1297. Last status recorded while it was open: In Progress — implementation, tests, review, and e2e gate complete; changelog + PR/merge pending (M4.2–M4.3)
 **Priority**: High
 **Created**: 2026-06-14
 **GitHub Issue**: [#162](https://github.com/vfarcic/dot-agent-deck/issues/162)
