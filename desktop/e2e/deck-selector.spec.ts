@@ -278,8 +278,9 @@ test.describe("the Deck selector's state line", () => {
 /**
  * Scenario (#1083): on the deck screen with the crowded fixture, choose All
  * Decks. The body says "Select a deck to see its runs" and no agent tile is on
- * screen; the Workflows sheet says "Select a deck to launch a workflow". Then
- * choose build-box in the same selector, and the tiles are back.
+ * screen. Then choose build-box in the same selector, and the tiles are back.
+ * (The Workflows sheet's note is live-mode only — the fixture preview has no
+ * launch form — so it is covered in `App.test.tsx`, not here.)
  */
 test("the deck screen asks for a deck under All Decks, and the selector brings it back", async ({ page }) => {
   await openDeck(page);
@@ -289,9 +290,6 @@ test("the deck screen asks for a deck under All Decks, and the selector brings i
 
   await expect(page.getByTestId("deck-select-deck")).toContainText("Select a deck to see its runs");
   await expect(page.locator(".agent-tile")).toHaveCount(0);
-  await page.getByRole("button", { name: "Workflows" }).click();
-  await expect(page.getByTestId("workflow-select-deck")).toContainText("Select a deck to launch a workflow");
-  await page.getByRole("button", { name: "Close workflow editor" }).click();
 
   await (await openMenu(page)).getByTestId(`deck-selector-option-${BUILD_BOX}`).click();
   await expect(page.getByTestId("deck-select-deck")).toHaveCount(0);
