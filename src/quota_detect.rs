@@ -54,9 +54,22 @@ pub const QUOTA_BLOCKED_DETAIL_METADATA_KEY: &str = "quota_blocked_detail";
 /// scrolled further up no longer describes the pane's current state.
 pub const QUOTA_TAIL_ROWS: usize = 10;
 
-/// How many rows after the matched row are read as its continuation (a wrapped
-/// message, or the suffix that decides [`BlockedKind`]).
+/// How many rows after the matched row are read as its continuation when
+/// MATCHING. The longest anchored phrase is 38 characters (`Error: You exceeded
+/// your current quota`), 40 behind a `■ ` prefix, so the matched row plus two
+/// covers it down to a 14-column pane. Not widened for the kind: this is the precision guard.
 const CONTINUATION_ROWS: usize = 2;
+
+/// How many rows after the matched row are read to decide its [`BlockedKind`]
+/// (issue #714 review). The deciding suffix sits at the END of the longest
+/// message — Codex's `… Visit https://chatgpt.com/codex/settings/usage to
+/// purchase more credits`, about 100 characters — so on a 30-column pane it
+/// lands three rows below the match, past [`CONTINUATION_ROWS`], and a
+/// credits-depleted block was labelled a usage limit. Read up to the rest of
+/// the [`QUOTA_TAIL_ROWS`] window instead, still stopping at the first row
+/// that begins a new item (the composer, or the next message cell). Only the
+/// label reads this; whether the row matches at all does not.
+const KIND_CONTINUATION_ROWS: usize = QUOTA_TAIL_ROWS - 1;
 
 /// Longest [`BlockedReason::detail`], in characters, including the `…` marker.
 pub const MAX_DETAIL_CHARS: usize = 160;
@@ -249,13 +262,16 @@ pub fn classify(agent_type: &AgentType, rows: &[String]) -> Option<QuotaMatch> {
         // Two joins, because the screen does not say how a row wrapped: a TUI's
         // word wrap drops the space at the break (join with one), while a hard
         // wrap at the terminal edge splits a word (join with none).
+        let continuation: Vec<&str> = tail
+            .iter()
+            .skip(start + 1)
+            .take(KIND_CONTINUATION_ROWS)
+            .take_while(|row| !starts_new_item(row))
+            .map(|row| strip_chrome(row))
+            .collect();
         let mut joined = head.to_string();
         let mut glued = head.to_string();
-        for row in tail.iter().skip(start + 1).take(CONTINUATION_ROWS) {
-            if starts_new_item(row) {
-                break;
-            }
-            let cont = strip_chrome(row);
+        for cont in continuation.iter().take(CONTINUATION_ROWS) {
             if !cont.is_empty() {
                 joined.push(' ');
                 joined.push_str(cont);
@@ -266,8 +282,13 @@ pub fn classify(agent_type: &AgentType, rows: &[String]) -> Option<QuotaMatch> {
             .iter()
             .any(|re| re.is_match(&joined) || re.is_match(&glued))
         {
+            let mut message = head.to_string();
+            for cont in continuation.iter().filter(|cont| !cont.is_empty()) {
+                message.push(' ');
+                message.push_str(cont);
+            }
             return Some(QuotaMatch {
-                kind: kind_of(&joined),
+                kind: kind_of(&message),
                 detail: scrub_detail(&joined),
             });
         }
@@ -828,7 +849,7 @@ mod tests {
                     Some(want),
                     "{agent:?} {prefix:?}{line:?}"
                 );
-                for cols in [40u16, 80] {
+                for cols in [30u16, 40, 80] {
                     let got = classify(agent, &screen(prefix, line, cols));
                     assert_eq!(
                         got.as_ref().map(|m| m.kind),
@@ -845,11 +866,12 @@ mod tests {
     }
 
     /// Scenario: Feed every real Codex and OpenCode quota sentence, bare and
-    /// behind the `■ ` / `│ ` chrome, and wrapped at 40 and 80 columns through
-    /// the daemon's screen replay, into the classifier. Each must be recognised
-    /// with the right kind: credit-pool and billing-balance wording (including
-    /// OpenAI's `insufficient_quota`) is CreditsDepleted, the rest (including
-    /// `Try again at`) UsageLimit.
+    /// behind the `■ ` / `│ ` chrome, and wrapped at 30, 40 and 80 columns
+    /// through the daemon's screen replay, into the classifier. Each must be
+    /// recognised with the right kind — at 30 columns the credits suffix wraps
+    /// three rows below the matched one: credit-pool and billing-balance
+    /// wording (including OpenAI's `insufficient_quota`) is CreditsDepleted,
+    /// the rest (including `Try again at`) UsageLimit.
     #[spec("status/blocked/001")]
     #[test]
     fn status_blocked_001_classifier_accepts_real_provider_lines() {

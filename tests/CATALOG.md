@@ -535,7 +535,7 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 ##### status/blocked/001 — The quota classifier accepts real Codex and OpenCode provider messages (issue #714).
 - **Layer:** L1 unit (`src/quota_detect.rs`).
 - **Agent:** none.
-- **Asserts:** prefixed, bare, and wrapped provider lines classify to the right usage-limit or credits-depleted kind.
+- **Asserts:** prefixed, bare, and wrapped provider lines (at 30, 40 and 80 columns — at 30 the credits suffix wraps past the rows the match reads) classify to the right usage-limit or credits-depleted kind.
 - **Does not assert:** live terminal output or daemon status.
 - **Platform coverage:** mac+linux+windows.
 
