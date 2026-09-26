@@ -2347,7 +2347,19 @@ async fn desktop_set_settings(
     base: Option<DesktopSettings>,
 ) -> Result<DesktopSettings, String> {
     ensure_main_webview(&webview)?;
-    let written = crate::settings::save(base.as_ref(), &settings).map_err(|error| {
+    // On a blocking worker: the save is synchronous filesystem work — a read,
+    // an `fsync`, a rename — and since #828 it can also wait up to
+    // `SAVE_LOCK_WAIT` for another window's save to let go of the lock. None of
+    // that belongs on an async worker other commands are scheduled on.
+    let saved = tauri::async_runtime::spawn_blocking(move || {
+        crate::settings::save(base.as_ref(), &settings)
+    })
+    .await
+    .map_err(|error| {
+        eprintln!("desktop settings: the save task did not complete: {error}");
+        "Saving the desktop settings did not complete. Try again.".to_string()
+    })?;
+    let written = saved.map_err(|error| {
         // The detail names the path and belongs in the app's own log; the
         // webview gets the sanitized half, the way connection errors already do.
         eprintln!("{}", error.detail());

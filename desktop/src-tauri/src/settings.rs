@@ -3195,40 +3195,42 @@ fn save_lock_path(parent: &Path, path: &Path) -> PathBuf {
 /// mutex on Windows, and an unbounded blocking wait — and a settings save wants
 /// neither.
 ///
-/// # A lock that cannot be taken does not stop the save
+/// # A lock that cannot be taken stops the save — with one exception
 ///
-/// If the sidecar cannot be opened or the filesystem does not support locking,
-/// the save goes ahead unlocked and says so in the log: the merge in
-/// [`merged_document`] is the fix for #828, and the lock only narrows what is
-/// left of it to nothing, so it is not worth making a preference unsavable on a
-/// filesystem without `flock`. What **does** fail the save is the lock being
-/// held by someone else for longer than [`SAVE_LOCK_WAIT`], because going ahead
-/// then is exactly the interleaving the lock is for.
+/// Going ahead unlocked is exactly the interleaving the lock exists to stop, so
+/// every failure to take it is a **visible** save error rather than a log line:
+/// the sidecar cannot be opened, its name is taken by a symlink or anything else
+/// that is not a regular file (the lock would land on whatever it points at),
+/// or the lock is still held by someone else after [`SAVE_LOCK_WAIT`]. None of
+/// these is a state a working install reaches — the sidecar sits in a directory
+/// [`vet_parent_dir`] has just accepted as ours, and a directory the sidecar
+/// cannot be created in is one the temp file could not be created in either.
 ///
-/// A symlink or anything else that is not a regular file at the sidecar's name
-/// is not opened — the lock would land on whatever it points at — and the save
-/// proceeds unlocked, logged, the same way. Only this user can put one there:
-/// [`vet_parent_dir`] has already refused a parent owned by anyone else.
+/// The exception is a filesystem that **cannot lock at all** — the lock call
+/// reports it as unsupported. Refusing there would make every preference
+/// unsavable on that filesystem for as long as the user keeps their config on
+/// it, to close a window one save wide; so the save goes ahead unlocked and says
+/// so in the log. The merge in [`merged_document`] still keeps an edit another
+/// window saved before this save began.
 fn acquire_save_lock(
     parent: &Path,
     path: &Path,
 ) -> Result<Option<std::fs::File>, SettingsWriteError> {
     let lock_path = save_lock_path(parent, path);
-    let unlocked = |why: &dyn std::fmt::Display| {
-        eprintln!(
-            "desktop settings: saving {} without the cross-process lock: {why}",
-            path.display()
-        );
-        Ok(None)
+    let unusable = |cause: &dyn std::fmt::Display| {
+        write_error("could not take the save lock beside", path, cause)
     };
 
     match std::fs::symlink_metadata(&lock_path) {
         Ok(meta) if !meta.file_type().is_file() => {
-            return unlocked(&"the lock file's name is taken by something that is not a file");
+            return Err(unusable(
+                &"the lock file's name is taken by something that is not a regular file. \
+                  Remove it and try again",
+            ));
         }
         Ok(_) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return unlocked(&error),
+        Err(error) => return Err(unusable(&error)),
     }
 
     let mut options = std::fs::OpenOptions::new();
@@ -3240,10 +3242,7 @@ fn acquire_save_lock(
     // with no content has nothing that DACL would protect.
     #[cfg(unix)]
     fsperm::set_create_mode_owner_only(&mut options);
-    let file = match options.open(&lock_path) {
-        Ok(file) => file,
-        Err(error) => return unlocked(&error),
-    };
+    let file = options.open(&lock_path).map_err(|error| unusable(&error))?;
 
     let deadline = std::time::Instant::now() + SAVE_LOCK_WAIT;
     loop {
@@ -3259,7 +3258,17 @@ fn acquire_save_lock(
                     "another window has been saving it for too long. Try again",
                 ));
             }
-            Err(std::fs::TryLockError::Error(error)) => return unlocked(&error),
+            Err(std::fs::TryLockError::Error(error))
+                if error.kind() == std::io::ErrorKind::Unsupported =>
+            {
+                eprintln!(
+                    "desktop settings: saving {} without the cross-process lock, \
+                     which this filesystem does not support: {error}",
+                    path.display()
+                );
+                return Ok(None);
+            }
+            Err(std::fs::TryLockError::Error(error)) => return Err(unusable(&error)),
         }
     }
 }
@@ -3376,7 +3385,15 @@ fn acquire_save_lock(
 ///   both, and a row both windows touched is merged field by field. Rows the
 ///   caller added are appended after the file's own; rows it deleted go, unless
 ///   someone else edited them meanwhile. See [`merge_rows`]. Any other list is
-///   still one value, replaced whole when the caller changed it.
+///   still one value, replaced whole when the caller changed it — and so is
+///   this one if its ids are missing or repeated, which only a hand edit can
+///   produce: there is no key to match rows by, and the list merges the way
+///   every list did before #828.
+/// - **A key another writer removed gains back only the caller's edit.** If
+///   the caller's base holds a section or a deck list the file no longer has,
+///   the caller's change is merged into an empty one instead of its whole copy
+///   being re-inserted — which would also restore every deck and the selection
+///   the other writer deleted. A key the caller did not change stays absent.
 /// - **A genuine conflict — both writers changed the same field — goes to the
 ///   later save.** Nothing can keep both values of one field, and this is
 ///   the only case left where a save discards another's edit.
@@ -3518,8 +3535,17 @@ fn merge_tables(
         // defaults, and filling in `port = 22` there is a change nobody asked
         // for.
         if base.get(key).is_none() {
-            if !was.is_some_and(|was| same_data(was, &item)) {
-                base.insert(key, item);
+            match was {
+                None => {
+                    base.insert(key, item);
+                }
+                Some(was) if same_data(was, &item) => {}
+                // The caller's base had it and the file does not: another
+                // writer removed it. Put back only what the caller changed,
+                // by merging into an empty one — re-inserting the caller's
+                // whole copy would also restore every part of it the other
+                // writer meant to delete (issue #828 review).
+                Some(was) => reinsert_edit(base, key, item, was),
             }
             continue;
         }
@@ -3597,6 +3623,70 @@ fn merge_tables(
     for key in removed {
         base.remove(&key);
     }
+}
+
+/// Merge the caller's edit to `key` into a table that no longer has it — another
+/// writer removed it since the caller's base — so that only the parts the caller
+/// changed come back. A table or an id-keyed list is rebuilt from empty through
+/// the ordinary merge and dropped again if the edit leaves it empty; anything
+/// else is one value, and it changed, so it is written.
+fn reinsert_edit(
+    base: &mut dyn toml_edit::TableLike,
+    key: &str,
+    item: toml_edit::Item,
+    was: &toml_edit::Item,
+) {
+    use toml_edit::{Array, ArrayOfTables, InlineTable, Item, Table, Value};
+    let empty = if item.is_table_like() && was.is_table_like() {
+        if item.is_inline_table() {
+            Item::Value(Value::InlineTable(InlineTable::new()))
+        } else {
+            Item::Table(Table::new())
+        }
+    } else if id_rows(&item).is_some() && id_rows(was).is_some() {
+        if item.is_array_of_tables() {
+            Item::ArrayOfTables(ArrayOfTables::new())
+        } else {
+            Item::Value(Value::Array(Array::new()))
+        }
+    } else {
+        base.insert(key, item);
+        return;
+    };
+
+    base.insert(key, empty);
+    let target = base.get_mut(key).expect("just inserted");
+    let now_empty = if let Some(incoming) = item.as_table_like() {
+        let nested_inline = target.is_inline_table();
+        let table = target
+            .as_table_like_mut()
+            .expect("an empty table was just inserted");
+        merge_tables(table, incoming, was.as_table_like(), nested_inline);
+        table.is_empty()
+    } else {
+        merge_rows(target, &item, was);
+        id_rows(target).is_some_and(|rows| rows.is_empty())
+    };
+    if now_empty {
+        base.remove(key);
+    }
+}
+
+/// Whether a row on disk is still the one the caller's base holds, so deleting
+/// it deletes nothing anyone else wrote: no key **both** of them state differs.
+///
+/// Only the keys both state, because either side may leave one out without
+/// meaning anything by it. The base is this build's canonical rendering, which
+/// spells every default — `port = 22` — that a hand-written row may simply omit;
+/// the file may hold a key this build does not know, which the base can never
+/// state. A strict row comparison read the first as an edit and refused to
+/// delete a hand-written deck (issue #828 review). A key someone else CHANGED is
+/// on disk with a different value, and that is still caught.
+fn row_untouched(on_disk: &dyn toml_edit::TableLike, was: &dyn toml_edit::TableLike) -> bool {
+    on_disk
+        .iter()
+        .filter(|(_, value)| !value.is_none())
+        .all(|(key, value)| was.get(key).is_none_or(|stated| same_data(value, stated)))
 }
 
 /// The rows of a list whose every row is a table carrying a unique string `id`,
@@ -3694,7 +3784,7 @@ fn merge_rows(
         .iter()
         .map(|(id, on_disk)| match (find(&mine, id), find(&was, id)) {
             (Some(mine), was) => RowStep::Merge(mine, was),
-            (None, Some(was)) if same_row(*on_disk, was) => RowStep::Drop,
+            (None, Some(was)) if row_untouched(*on_disk, was) => RowStep::Drop,
             // Deleted by the caller but edited by someone else since, or added
             // by someone else since the caller loaded: either way, not the
             // caller's to remove.
@@ -5905,6 +5995,79 @@ mod tests {
         );
     }
 
+    /// Scenario (issue #828 review): a hand-written deck that omits `port` — the
+    /// load fills in 22 — is deleted in the app. It must be gone after the
+    /// save: the deck on disk is exactly the one the window loaded, and a key
+    /// the file leaves to its default is not someone else's edit.
+    #[test]
+    fn deleting_a_hand_written_deck_that_omits_its_defaults_deletes_it() {
+        let dir = tempdir();
+        let path = dir.path().join(SETTINGS_FILE_NAME);
+        std::fs::write(
+            &path,
+            "version = 1\n\n[endpoints]\nselection = \"local\"\n\n\
+             [[endpoints.remote]]\nhost = \"first.example\"\nid = \"first\"\n\n\
+             [[endpoints.remote]]\nhost = \"second.example\"\nid = \"second\"\n",
+        )
+        .unwrap();
+        let loaded = load_from(&path);
+        let mut edited = loaded.clone();
+        edited
+            .endpoints
+            .as_mut()
+            .unwrap()
+            .remote
+            .retain(|row| row.id.as_str() != "first");
+        save_to(&path, Some(&loaded), &edited).unwrap();
+
+        let reloaded = load_from(&path);
+        assert!(
+            deck(&reloaded, &EndpointId::parse("first").unwrap()).is_none(),
+            "the deleted deck came back: {}",
+            std::fs::read_to_string(&path).unwrap()
+        );
+        assert!(deck(&reloaded, &EndpointId::parse("second").unwrap()).is_some());
+    }
+
+    /// Scenario (issue #828 review): a hand edit deletes the whole
+    /// `[endpoints]` section while a window still holds its older copy, and
+    /// that window then changes one deck's port. Only that edit may come back
+    /// — the deck it edited — and not the decks and selection the hand edit
+    /// removed.
+    #[test]
+    fn a_section_another_writer_removed_gains_back_only_this_windows_edit() {
+        let first = EndpointId::parse("first").unwrap();
+        let second = EndpointId::parse("second").unwrap();
+        let dir = tempdir();
+        let path = dir.path().join(SETTINGS_FILE_NAME);
+        let mut start = two_decks(&first, &second);
+        start.endpoints.as_mut().unwrap().selection = Selection::One(second.clone());
+        let (window, _) = two_windows_on(&path, &start);
+
+        std::fs::write(&path, "version = 1\n\n[appearance]\nmode = \"light\"\n").unwrap();
+        let mut edited = window.clone();
+        deck_mut(&mut edited, &first).port = SshPort::parse(2222).unwrap();
+        save_to(&path, Some(&window), &edited).unwrap();
+
+        let reloaded = load_from(&path);
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            deck(&reloaded, &first).map(|row| row.port),
+            Some(SshPort::parse(2222).unwrap()),
+            "the window's own edit: {raw}"
+        );
+        assert!(
+            deck(&reloaded, &second).is_none(),
+            "an untouched deck came back: {raw}"
+        );
+        assert_eq!(
+            reloaded.endpoints.as_ref().unwrap().selection,
+            Selection::Local,
+            "the removed selection came back: {raw}"
+        );
+        assert_eq!(reloaded.appearance.mode, AppearanceMode::Light);
+    }
+
     /// Scenario (issue #828): both windows change the SAME field. Nothing can
     /// keep two values of one field, so the later save wins — the one case a
     /// save still discards another's edit, pinned so it is read as the design
@@ -6132,6 +6295,36 @@ mod tests {
             .unwrap()
             .expect("the save lands once the lock is free");
         assert_eq!(load_from(&path).appearance.mode, AppearanceMode::Dark);
+    }
+
+    /// Scenario (issue #828): something that is not a regular file sits at the
+    /// lock sidecar's name. The save must be REFUSED, visibly and before the
+    /// document is touched, rather than going ahead without the lock — or
+    /// taking a lock on whatever a symlink there points at.
+    #[cfg(unix)]
+    #[test]
+    fn a_save_whose_lock_cannot_be_taken_is_refused_rather_than_unlocked() {
+        let dir = tempdir();
+        let path = dir.path().join(SETTINGS_FILE_NAME);
+        save_to(&path, None, &DesktopSettings::default()).unwrap();
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        let lock = save_lock_path(dir.path(), &path);
+        std::fs::remove_file(&lock).unwrap();
+        std::os::unix::fs::symlink(dir.path().join("elsewhere"), &lock).unwrap();
+
+        let error = save_to(&path, None, &dark()).expect_err("an unlockable save must be refused");
+        assert!(error.public().contains("save lock"), "{error}");
+        assert!(
+            !error.public().contains(&dir.path().display().to_string()),
+            "the public message leaked the path: {}",
+            error.public()
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        assert!(
+            !dir.path().join("elsewhere").exists(),
+            "the symlink was followed"
+        );
     }
 
     /// Scenario (issue #828): eight windows, all loaded from the same document,

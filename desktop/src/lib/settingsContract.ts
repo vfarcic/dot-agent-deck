@@ -55,9 +55,11 @@ export interface SettingsPanelProps {
    * app windows, or the app and a hand edit — only the fields this call changed
    * are written, so another writer's edit to a field you did not touch survives
    * (issue #828). Compute `next` from the `settings` you were handed: the
-   * difference between the two is what the hook treats as your edit.
+   * difference between the two is what the hook treats as your edit. A write
+   * that builds on some OTHER snapshot — one kept across an `await` — passes it
+   * as `from`, so the difference is measured against what it actually edited.
    */
-  onSave: (next: DesktopSettingsDto) => void;
+  onSave: (next: DesktopSettingsDto, from?: DesktopSettingsDto) => void;
   /**
    * Why the settings document cannot be written right now, as a **complete
    * sentence** — render it verbatim rather than composing around it.

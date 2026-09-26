@@ -165,6 +165,48 @@ describe("useDesktopSettings base", () => {
     expect(saveSettings).toHaveBeenCalledTimes(2);
     expect(bases[1]).toEqual(withMode("dark"));
   });
+
+  it("measures a write-back against the snapshot it names, not the newer screen", async () => {
+    const { sent, bases, pending, saveSettings } = deferredSaves();
+    const { result } = await loadedHook(saveSettings);
+
+    // A probe kept this snapshot across its `await`...
+    const snapshot = result.current.settings;
+    // ...and meanwhile a save's reply brought in another window's zoom.
+    await act(async () => { result.current.save(withMode("dark")); });
+    await act(async () => { pending[0].resolve({ ...withMode("dark"), zoom: { level: 1.5 } }); });
+    expect(result.current.settings.zoom.level).toBe(1.5);
+
+    // The write-back builds on its snapshot and says so. Measured against the
+    // screen instead, its old zoom would read as an edit and overwrite 1.5.
+    const next = { ...snapshot, appearance: { mode: "light" as const } };
+    await act(async () => { result.current.save(next, snapshot); });
+    expect(bases[1]).toEqual(snapshot);
+    expect(sent[1]).toEqual(next);
+  });
+
+  it("carries a failed save's edit into the next save instead of rolling it back", async () => {
+    const { sent, bases, pending, saveSettings } = deferredSaves();
+    const { result } = await loadedHook(saveSettings);
+
+    // The theme, then the zoom while the theme save is still in flight.
+    await act(async () => { result.current.save(withMode("dark")); });
+    act(() => { result.current.save({ ...withMode("dark"), zoom: { level: 1.5 } }); });
+
+    // The theme save fails. The zoom save was made against a document that
+    // already shows dark, so diffing against that would leave the file's old
+    // theme in place — and applying its reply would then flip the screen back.
+    await act(async () => { pending[0].reject(new Error("disk full")); });
+    expect(saveSettings).toHaveBeenCalledTimes(2);
+    expect(bases[1]).toEqual(DEFAULT_DESKTOP_SETTINGS);
+    expect(sent[1]).toEqual({ ...withMode("dark"), zoom: { level: 1.5 } });
+
+    // And once one save lands, the carry is spent: the next edit is measured
+    // from what is on screen again.
+    await act(async () => { pending[1].resolve({ ...withMode("dark"), zoom: { level: 1.5 } }); });
+    await act(async () => { result.current.save({ ...withMode("light"), zoom: { level: 1.5 } }); });
+    expect(bases[2]).toEqual({ ...withMode("dark"), zoom: { level: 1.5 } });
+  });
 });
 
 /**
