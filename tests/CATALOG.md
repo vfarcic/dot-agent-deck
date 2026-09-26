@@ -1319,6 +1319,12 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Asserts:** a seed aged 1 ms past `SPAWN_TIME_READINESS_TIMEOUT` gets NO write and is held rather than dropped; re-aged to `SPAWN_TIME_READINESS_TIMEOUT + SPAWN_TIME_READINESS_BUFFER` it gets exactly one write carrying the seed. The same pair for an orchestration start-role remit, driven with explicit instants against its tab anchor: no write and the remit not consumed at `anchor + 10 s + 1 ms`, exactly one write carrying it at `anchor + 10 s + 500 ms`. The seed fixture carries an already-spent `ready_since`, so a fallback that borrowed that stamp instead of counting from its own 10 s would also go red.
 - **Why it exists:** both paths used to set `buffer_elapsed = true` on the timeout branch, so the one delivery made with no evidence at all that the agent's input handling was up was also the one made with no buffer. Fails on the pre-fix code at each half's first assertion.
 - **Does not assert:** the buffer's size (500 ms, tuned under PRD #128); the fast path's buffer (`should_inject_spawn_time_prompt`'s unit tests); that the fallback still delivers for a producer that announces nothing (`prompt/pane-input/036`); confirmation, retry or deadline behaviour after the write (`prompt/pane-input/023`–`/030`); the daemon-owned delegate path, which pays its own buffer after its timeout in `state.rs`.
+
+##### prompt/pane-input/041 — A TUI-owned retry waits out a genuine Codex confirmation 8.45 s after the write, and a delivery that is never confirmed is still retried (issue #637).
+- **Layer:** L1, in `src/ui.rs`'s own test module (the production `deliver_orchestrator_prompt` driven over an `Applied`-returning pane controller at explicit clock offsets, with a hook-derived `AppState`), so it runs under `cargo test-fast`.
+- **Agent:** none (a synthetic Codex pane — `announced_prompt_snapshot` declares the producer as Codex).
+- **Asserts:** two runs against the same fixture. In the first, a render pass 8.45 s after the write — the genuine Codex confirmation latency #637 reports — makes no second write, and the agent's submission report arriving after it finalizes the prompt and the role (`Working`) on that ONE write. In the second, where no report ever comes, a pass one second past `SLOW_CONFIRMATION_LATENCY` (10 s) DOES re-submit, so the floor delays recovery rather than removing it. Measured RED with the floor taken out of `unconfirmed_retry_delay` (the pre-#637 schedule): the 8.45 s pass wrote a second time.
+- **Does not assert:** the seed path's own call site (it shares `schedule_unconfirmed_retry` with this one); the daemon-owned detached path (`scheduler/dispatch/022`); Claude Code's shorter floor, which is unit-tested in `src/prompt_delivery.rs` (`confirmation_latency_floor_takes_the_slowest_reporting_producer`); any real agent's actual confirmation latency — the 8.45 s figure is the downstream measurement #637 quotes, not one taken here.
 - **Platform coverage:** mac+linux+windows.
 
 #### prompt/quit
@@ -5473,6 +5479,13 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Agent:** none.
 - **Asserts:** paused time deterministically completes the confirmation window while the writer is held, user input is stamped only after the caller's precheck has run and before the writer-held backstop proceeds, and that backstop refusal publishes one durable `DeliveryNotice` instead of becoming a log-only `target went stale` stop.
 - **Does not assert:** the notice sink's daemon-to-TUI rendering (covered by `scheduler/dispatch/017`) or exact log wording.
+- **Platform coverage:** mac+linux+windows.
+
+##### scheduler/dispatch/022 — A detached retry waits out a genuine Codex confirmation 8.45 s after the write (issue #637).
+- **Layer:** L1 (in-process detached confirmation loop on paused time, a real byte-observation PTY stamped with a Codex spawn record, and a thread-scoped `tracing` subscriber reading the delivery log).
+- **Agent:** none — a `/bin/cat` byte target (`more.com` on Windows) whose frozen spawn type is Codex, so `confirmation_floor_for` derives the floor exactly as `deliver` does.
+- **Asserts:** after attempt 1, the genuine submission report arriving 8.45 s later on virtual time is accepted as attempt 1's confirmation, and the delivery log carries no `re-submitting` and no `probing submit` line — i.e. no replacement payload and no submit probe went into the pane first. The log is read rather than the scrollback because the watch logs a re-submission BEFORE writing it, so the assertion is not a race against the PTY echo. Measured RED with the floor taken out of `unconfirmed_retry_delay` (the pre-#637 schedule).
+- **Does not assert:** that a never-confirmed delivery is still retried on this path (the TUI half of that is `prompt/pane-input/041`; the daemon schedule itself is unit-tested beside `unconfirmed_retry_delay`); any real agent's confirmation latency.
 - **Platform coverage:** mac+linux+windows.
 
 #### scheduler/pi
