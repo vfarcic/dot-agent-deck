@@ -392,6 +392,25 @@ struct Fixture {
 }
 
 async fn fixture(worker_command_in_dir: impl FnOnce(&std::path::Path) -> String) -> Fixture {
+    fixture_with_orchestrator("cat", worker_command_in_dir).await
+}
+
+/// Issue #708: the orchestrator stand-in `delegate/023` needs — a `cat` behind
+/// `stty -echo -icanon -icrnl -opost`, so every byte the daemon writes into the
+/// orchestrator's pane appears exactly once and untranslated. Under the cooked
+/// `cat` the other tests use, a submit CR and a notice LF both come back as the
+/// same echoed CRLF, and "was the notice submitted?" cannot be read at all. The
+/// `&&` means the readiness marker is printed only once `stty` has SUCCEEDED.
+const RAW_ORCHESTRATOR_COMMAND: &str =
+    "stty -echo -icanon -icrnl -opost min 1 time 0 && printf RAW-ORCH-READY && exec cat -u";
+
+/// What [`RAW_ORCHESTRATOR_COMMAND`] prints once its termios is in place.
+const RAW_ORCHESTRATOR_READY: &[u8] = b"RAW-ORCH-READY";
+
+async fn fixture_with_orchestrator(
+    orchestrator_command: &str,
+    worker_command_in_dir: impl FnOnce(&std::path::Path) -> String,
+) -> Fixture {
     let daemon = common::spawn_inprocess_daemon().await;
     let dir = common::race_safe_tempdir();
     let worker_command = worker_command_in_dir(dir.path());
@@ -405,10 +424,13 @@ async fn fixture(worker_command_in_dir: impl FnOnce(&std::path::Path) -> String)
     let orchestrator_agent_id = daemon
         .registry
         .spawn_agent(SpawnOptions {
-            command: Some("cat"),
+            command: Some(orchestrator_command),
             cwd: Some(&cwd),
             display_name: Some("orchestrator"),
-            env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), ORCH_PANE.to_string())],
+            env: vec![
+                (DOT_AGENT_DECK_PANE_ID.to_string(), ORCH_PANE.to_string()),
+                ("SHELL".to_string(), "/bin/sh".to_string()),
+            ],
             tab_membership: Some(membership(0, "orchestrator", true, &cwd)),
             ..SpawnOptions::default()
         })
@@ -689,12 +711,57 @@ async fn delegate_022_delegate_during_an_in_flight_close_brings_the_role_back() 
 /// direction, and headroom is the only mitigation available.
 const DEAD_REPLACEMENT_NOTICE_BUDGET: Duration = Duration::from_secs(5);
 
+/// Issue #708: the dead-replacement notice's opening clause and stable FINAL
+/// clause. The final clause ends in `.`, which `encode_pane_payload`'s
+/// `trim_end_matches` cannot eat, so the byte after it is exactly the
+/// terminator the daemon chose.
+const RESPAWN_NOTICE_NEEDLE: &[u8] =
+    b"delegated worker never came up (dot-agent-deck daemon report)";
+const RESPAWN_NOTICE_TAIL: &[u8] = b"daemon log names the role.";
+
+/// Issue #708: the byte the daemon wrote right after the dead-replacement
+/// notice's payload — CR if it SUBMITTED the report, LF if it left it as
+/// deferred scrollback — or `None` while the notice or that byte is still on its
+/// way. Anchored to the notice's own opening and final clauses, never to the
+/// first line break after the notice began, so an unrelated line break cannot be
+/// mistaken for the terminator in either direction.
+fn respawn_notice_terminator(snapshot: &[u8]) -> Option<u8> {
+    respawn_notice_terminators(snapshot)
+        .first()
+        .copied()
+        .flatten()
+}
+
+/// [`respawn_notice_terminator`] for EVERY dead-replacement notice in the pane,
+/// in order: one entry per opening clause, `None` for a notice whose final
+/// clause or terminator has not landed yet.
+fn respawn_notice_terminators(snapshot: &[u8]) -> Vec<Option<u8>> {
+    let starts: Vec<usize> = snapshot
+        .windows(RESPAWN_NOTICE_NEEDLE.len())
+        .enumerate()
+        .filter(|(_, w)| *w == RESPAWN_NOTICE_NEEDLE)
+        .map(|(i, _)| i)
+        .collect();
+    starts
+        .iter()
+        .map(|&start| {
+            let rest = &snapshot[start..];
+            let end = rest
+                .windows(RESPAWN_NOTICE_TAIL.len())
+                .position(|w| w == RESPAWN_NOTICE_TAIL)?
+                + RESPAWN_NOTICE_TAIL.len();
+            rest.get(end).copied()
+        })
+        .collect()
+}
+
 /// Scenario: start an orchestration whose `clear = true` worker refuses to start
 /// while a marker file sits beside it, drop that marker once the first worker is
 /// confirmed up, then delegate. The replacement dies before it can announce
-/// itself, and the orchestrator must be TOLD — in its own pane, and within five
-/// seconds rather than the thirty a readiness wait would cost — instead of being
-/// left to wait for a `work-done` that can never arrive.
+/// itself, and the orchestrator must be TOLD — in its own pane, as a SUBMITTED
+/// turn naming what to do next, and within five seconds rather than the thirty a
+/// readiness wait would cost — instead of being left to wait for a `work-done`
+/// that can never arrive.
 #[tokio::test(flavor = "multi_thread")]
 #[spec("orchestration/delegate/023")]
 async fn delegate_023_a_replacement_that_dies_is_reported_to_the_orchestrator() {
@@ -704,7 +771,7 @@ async fn delegate_023_a_replacement_that_dies_is_reported_to_the_orchestrator() 
     // TEST drops that marker, after confirming the first worker is up — so
     // "the replacement dies before it is ready" is a fact the test establishes,
     // not a race it hopes for.
-    let fx = fixture(|dir| {
+    let fx = fixture_with_orchestrator(RAW_ORCHESTRATOR_COMMAND, |dir| {
         let script = dir.join("one-shot-worker.sh");
         std::fs::write(
             &script,
@@ -726,6 +793,19 @@ async fn delegate_023_a_replacement_that_dies_is_reported_to_the_orchestrator() 
         Some(fx.worker_agent_id.as_str()),
         "precondition: the first worker must be up before we make the next one fail"
     );
+    let orchestrator_ready = wait_for_pane_needle(
+        &fx.daemon.registry,
+        ORCH_PANE,
+        RAW_ORCHESTRATOR_READY,
+        Duration::from_secs(5),
+    )
+    .await;
+    assert!(
+        snapshot_contains(&orchestrator_ready, RAW_ORCHESTRATOR_READY),
+        "precondition: the orchestrator stand-in must have its raw termios in place before \
+         anything is written to it, or the terminator below is not readable; snapshot = {:?}",
+        String::from_utf8_lossy(&orchestrator_ready)
+    );
     std::fs::write(std::path::Path::new(&fx.cwd).join("die"), "")
         .expect("arm the stand-in's refusal to start again");
 
@@ -741,7 +821,13 @@ async fn delegate_023_a_replacement_that_dies_is_reported_to_the_orchestrator() 
             .snapshot(&fx.orchestrator_agent_id)
             .unwrap_or_default();
         let text = String::from_utf8_lossy(&snapshot);
-        if text.contains("delegated worker never came up") && text.contains(WORKER_PANE) {
+        // Issue #708: the terminator byte is part of the wait, so the loop
+        // cannot stop one byte early — the submit CR trails the payload by
+        // `SUBMIT_DELAY` — and report a terminator that had not landed yet.
+        if text.contains("delegated worker never came up")
+            && text.contains(WORKER_PANE)
+            && respawn_notice_terminator(&snapshot).is_some()
+        {
             break;
         }
         assert!(
@@ -766,13 +852,68 @@ async fn delegate_023_a_replacement_that_dies_is_reported_to_the_orchestrator() 
         !snapshot_contains(&worker_snapshot, POINTER),
         "nothing may be written into a pane whose agent is not live"
     );
-    // PRD #249 finding B3's precedent: this notice family interpolates the
-    // worker's scrubbed pane id and nothing else, so the role name — which is
+    // Issue #708: SUBMITTED, not written. The orchestrator's `delegate` already
+    // exited 0, so in an unattended dispatched unit a notice left sitting in its
+    // input box reaches nobody and the orchestrator waits forever for a
+    // `work-done` that cannot arrive. The report must be a turn of its own (CR)
+    // and name what the orchestrator can do about it.
+    let text = String::from_utf8_lossy(&snapshot);
+    let terminator = respawn_notice_terminator(&snapshot);
+    let missing_options: Vec<&str> = ["notify the user", "re-delegate", "reassign"]
+        .into_iter()
+        .filter(|option| !text.contains(option))
+        .collect();
+    assert!(
+        terminator == Some(b'\r') && missing_options.is_empty(),
+        "the dead-replacement notice must be SUBMITTED as a turn (terminated by CR, not left as \
+         an LF-terminated line in the orchestrator's scrollback) and must name the remediation \
+         options (notify the user, re-delegate, reassign); terminator = {terminator:?}, missing \
+         options = {missing_options:?}, orchestrator pane = {text:?}"
+    );
+    // PRD #249 finding B3's precedent: this notice interpolates the worker's
+    // scrubbed pane id and nothing else, so the role name — which is
     // caller-supplied config text — must not appear.
     assert!(
         !String::from_utf8_lossy(&snapshot).contains("'coder'"),
         "the notice must not interpolate the role name; snapshot = {:?}",
         String::from_utf8_lossy(&snapshot)
+    );
+
+    // Issue #708 (Greptile P2 on PR #1338): the SAME failure a second time. The
+    // `die` marker is still there, so the next delegate's replacement dies too and
+    // the daemon composes byte-identical text for the same worker pane. The user
+    // has typed into the orchestrator meanwhile, which is the clock that arms the
+    // repeat-payload refusal — without it the guard abstains and this would pass
+    // for the wrong reason. The first report's payload record therefore has to be
+    // released, or the second failure is refused as a repeat of the user's draft
+    // and the orchestrator is left waiting after all.
+    fx.daemon.registry.note_user_input(ORCH_PANE);
+    delegate(&fx, "list the files in this directory").await;
+    let deadline = tokio::time::Instant::now() + DEAD_REPLACEMENT_NOTICE_BUDGET;
+    let terminators = loop {
+        let snapshot = fx
+            .daemon
+            .registry
+            .snapshot(&fx.orchestrator_agent_id)
+            .unwrap_or_default();
+        let terminators = respawn_notice_terminators(&snapshot);
+        if terminators.len() >= 2 && terminators[1].is_some() {
+            break terminators;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the SECOND dead-replacement report never reached the orchestrator within \
+             {DEAD_REPLACEMENT_NOTICE_BUDGET:?} of the user typing and a second delegate; \
+             terminators so far = {terminators:?}, orchestrator pane = {:?}",
+            String::from_utf8_lossy(&snapshot)
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert_eq!(
+        terminators[1],
+        Some(b'\r'),
+        "the second dead-replacement report must be SUBMITTED like the first; terminators = \
+         {terminators:?}"
     );
 }
 

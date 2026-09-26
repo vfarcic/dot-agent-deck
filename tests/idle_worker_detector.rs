@@ -133,6 +133,34 @@ const WORKER_EXITED_NEEDLE: &str =
 /// retire promptly rather than leaving it to run out its own window.
 const SILENCE_NEEDLE: &str = "delegated worker went quiet (dot-agent-deck daemon report)";
 
+/// Issue #708: the worker-exited notice's stable FINAL clause, and therefore the
+/// last bytes of the payload the daemon writes before its terminator. It ends in
+/// `.`, which `encode_pane_payload`'s `trim_end_matches` cannot eat, so the byte
+/// that follows it in the pane is exactly the terminator the daemon chose.
+const WORKER_EXITED_TAIL: &str = "names the role and how long it had been delegated.";
+
+/// Issue #708: the byte the daemon wrote immediately after the worker-exited
+/// notice's payload — CR if it SUBMITTED the report as a turn, LF if it left it
+/// as deferred scrollback — or `None` while the notice or that byte has not
+/// arrived yet.
+///
+/// Anchored to the notice's opening clause and then to its final clause, the
+/// way `orchestration/delegate/013` anchors the silence notice (#702), rather
+/// than searching for the first line break anywhere after the notice began: an
+/// unrelated line break landing in the pane could otherwise be mistaken for the
+/// terminator. Exact because the orchestrator stub runs under `stty -echo
+/// -icanon -icrnl -opost` chained with `&&` before its readiness marker, so a
+/// visible marker proves no CR/LF translation sits on either side of the pane.
+fn worker_exited_terminator(snapshot: &str) -> Option<u8> {
+    let start = snapshot.find(WORKER_EXITED_NEEDLE)?;
+    let rest = &snapshot.as_bytes()[start..];
+    let end = rest
+        .windows(WORKER_EXITED_TAIL.len())
+        .position(|window| window == WORKER_EXITED_TAIL.as_bytes())?
+        + WORKER_EXITED_TAIL.len();
+    rest.get(end).copied()
+}
+
 /// File the [`OrchestratorStub::ExitsOnFlag`] stub polls for. Its appearance in
 /// the harness cwd is the test's remote control for a NATURAL orchestrator exit.
 const NATURAL_EXIT_FLAG: &str = "orchestrator-exit.flag";
@@ -1159,7 +1187,7 @@ fn idle_worker_014_natural_orchestrator_exit_pane_id_reuse_receives_nothing() {
     });
 }
 
-/// Scenario: Delegate to a worker, let it receive the task pointer and then end its own process on its own — no SIGTERM, no StopAgent, no explicit close of any kind. The daemon's new EOF-triggered notice must appear in the orchestrator's pane well within the (much longer) idle-timeout and silence-window, with neither of the two OLDER timeout-based notices firing instead.
+/// Scenario: Delegate to a worker, let it receive the task pointer and then end its own process on its own — no SIGTERM, no StopAgent, no explicit close of any kind. The daemon's EOF-triggered notice must be SUBMITTED into the orchestrator's pane as a turn naming what to do next, well within the (much longer) idle-timeout and silence-window, with neither of the two OLDER timeout-based notices firing instead.
 #[spec("scheduler/idle-worker/016")]
 #[test]
 fn idle_worker_016_natural_worker_exit_retires_records_and_reports_promptly() {
@@ -1225,9 +1253,13 @@ fn idle_worker_016_natural_worker_exit_retires_records_and_reports_promptly() {
 
         // The notice must land promptly — well before either timeout watch's
         // (60s / 30s) window could have fired it instead.
+        //
+        // Issue #708: the wait includes the terminator byte, so it cannot end one
+        // byte early (the submit CR trails the payload by `SUBMIT_DELAY`) and
+        // read a terminator that simply had not landed yet.
         let snapshot = harness
             .wait_for_snapshot(
-                |snapshot| snapshot.contains(WORKER_EXITED_NEEDLE),
+                |snapshot| worker_exited_terminator(snapshot).is_some(),
                 Duration::from_secs(5),
             )
             .await;
@@ -1235,6 +1267,23 @@ fn idle_worker_016_natural_worker_exit_retires_records_and_reports_promptly() {
             snapshot.contains(WORKER_EXITED_NEEDLE),
             "no EOF-triggered 'worker exited without work-done' notice appeared in the \
              orchestrator's pane within 5s of the worker's natural exit; snapshot = {snapshot:?}"
+        );
+        // Issue #708: SUBMITTED, not written. A notice left unsubmitted in the
+        // orchestrator's input box reaches nobody in an unattended dispatched
+        // unit — there is no human to press Enter — so the orchestrator would
+        // wait forever for a `work-done` the dead process can never send. The
+        // report must be a turn of its own (CR) and say what to do about it.
+        let terminator = worker_exited_terminator(&snapshot);
+        let missing_options: Vec<&str> = ["notify the user", "re-delegate", "reassign"]
+            .into_iter()
+            .filter(|option| !snapshot.contains(option))
+            .collect();
+        assert!(
+            terminator == Some(b'\r') && missing_options.is_empty(),
+            "the worker-exited notice must be SUBMITTED as a turn (terminated by CR, not left as \
+             an LF-terminated line in the orchestrator's scrollback) and must name the \
+             remediation options (notify the user, re-delegate, reassign); terminator = \
+             {terminator:?}, missing options = {missing_options:?}, snapshot = {snapshot:?}"
         );
         assert!(
             snapshot.contains(&worker_pane_id),

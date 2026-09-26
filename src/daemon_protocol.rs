@@ -764,6 +764,15 @@ pub const CONTRACT_BREAKS: &[&str] = &[
     // the hook socket is not what PROTOCOL_VERSION versions anyway. What changed
     // is which delegates are refused, which a version number cannot express.
     "580-delegate-refuses-busy-worker",
+    // Issue #708, at 10 without moving it -- #702's shape, applied to its two
+    // siblings. The daemon's "worker exited without work-done" and "worker never
+    // came up" reports into an orchestrator's pane used to be written with an LF
+    // and left unsubmitted; a newer daemon SUBMITS them as turns. Nothing on the
+    // wire moved: the change is what an existing delivery MEANS -- inert text
+    // becomes model input -- and it takes effect when the daemon starts on the
+    // new build, which is exactly the older-daemon pairing this list exists to
+    // name.
+    "708-worker-failure-reports-submitted",
 ];
 
 /// What comparing this build's [`CONTRACT_BREAKS`] against a peer's found.
