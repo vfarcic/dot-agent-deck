@@ -1703,6 +1703,9 @@ impl AgentBus {
     fn clear_scrollback_after_resize(&self, old_rows: u16, old_cols: u16, rows: u16, cols: u16) {
         let mut state = self.state.lock().unwrap();
         state.ring_geometry = Some((rows, cols));
+        // Issue #714: a snapshot taken before the resize, and a confirmation not
+        // yet published, describe a screen the resize may have changed.
+        state.quota.note_screen_changed();
         if !state.quota.hint_pending() {
             state.quota_prelude = None;
             state.scrollback.clear();
@@ -1767,22 +1770,26 @@ impl AgentBus {
             bytes: bytes.iter().copied().collect(),
             rows,
             cols,
+            revision: state.quota.revision(),
         })
     }
 
-    /// Issue #714: hand the result of a screen probe taken at `now` back to the
-    /// detector. See [`crate::quota_detect::QuotaDetector::record_probe`]. The
+    /// Issue #714: hand the result of a probe of the snapshot taken at screen
+    /// `revision` ([`QuotaProbeScreen::revision`]) back to the detector. See
+    /// [`crate::quota_detect::QuotaDetector::record_snapshot_probe`]: a snapshot
+    /// the pane has written over since is `Stale` and records nothing. The
     /// second value is the latched confirmation's epoch
     /// ([`crate::quota_detect::QuotaDetector::confirmed_epoch`]), read under the
     /// same lock as the outcome, which a publisher must present again to
-    /// [`AgentPtyRegistry::quota_confirmation_current`].
+    /// [`AgentPtyRegistry::quota_claim_publication`].
     pub fn quota_record_probe(
         &self,
+        revision: u64,
         now: Instant,
         found: Option<crate::quota_detect::BlockedKind>,
     ) -> (crate::quota_detect::ProbeOutcome, Option<u64>) {
         let mut state = self.state.lock().unwrap();
-        let outcome = state.quota.record_probe(now, found);
+        let outcome = state.quota.record_snapshot_probe(revision, now, found);
         if !state.quota.hint_pending() {
             state.quota_prelude = None;
         }
@@ -4328,6 +4335,10 @@ pub struct QuotaProbeScreen {
     /// The geometry `bytes` was written at.
     pub rows: u16,
     pub cols: u16,
+    /// The detector's screen revision when `bytes` was copied — handed back
+    /// with the result so a probe of a screen the pane has since written over
+    /// is discarded ([`AgentBus::quota_record_probe`]).
+    pub revision: u64,
 }
 
 impl QuotaProbeScreen {
@@ -9561,6 +9572,7 @@ impl AgentPtyRegistry {
     pub fn quota_record_probe(
         &self,
         agent_id: &str,
+        revision: u64,
         now: Instant,
         found: Option<crate::quota_detect::BlockedKind>,
     ) -> Option<(crate::quota_detect::ProbeOutcome, Option<u64>)> {
@@ -9569,32 +9581,63 @@ impl AgentPtyRegistry {
         if agent.exited.load(Ordering::SeqCst) {
             return None;
         }
-        Some(agent.bus.quota_record_probe(now, found))
+        Some(agent.bus.quota_record_probe(revision, now, found))
     }
 
-    /// Issue #714: whether `agent_id` is still the live owner of `pane_id` AND
-    /// its quota detector still holds the confirmation `epoch` — i.e. no work
-    /// event has lifted the latch since the probe confirmed.
+    /// Issue #714: run `f` on the quota detector of `pane_id`'s live owner, if
+    /// that owner is `agent_id`; `None` otherwise. Takes the registry lock and
+    /// then the bus lock, the order every other path takes them in.
+    fn with_owner_quota<T>(
+        &self,
+        pane_id: &str,
+        agent_id: &str,
+        f: impl FnOnce(&mut crate::quota_detect::QuotaDetector) -> T,
+    ) -> Option<T> {
+        let inner = self.inner.lock().unwrap();
+        let (id, agent) = inner.agents.iter().find(|(_, a)| {
+            a.pane_id_env.as_deref() == Some(pane_id) && !a.exited.load(Ordering::SeqCst)
+        })?;
+        (id == agent_id).then(|| f(&mut agent.bus.state.lock().unwrap().quota))
+    }
+
+    /// Issue #714: claim the publication of confirmation `epoch` — `true` only
+    /// while `agent_id` is still the live owner of `pane_id` AND its detector
+    /// still holds that confirmation unpublished: no work event has lifted the
+    /// latch and no output or resize has retracted it since the probe confirmed
+    /// ([`crate::quota_detect::QuotaDetector::claim_publication`]).
     ///
     /// Race-free only under the daemon's `AppState` WRITE lock, held by the
-    /// caller from this check through applying the block: the hook loop lifts
+    /// caller from this claim through applying the block: the hook loop lifts
     /// the latch ([`Self::quota_note_work_event`]) under that same lock, so a
     /// work event is either seen here (and nothing is applied) or lands after
-    /// the block and clears it. Takes the registry lock and then the bus lock,
-    /// the order every other path takes them in.
-    pub fn quota_confirmation_current(&self, pane_id: &str, agent_id: &str, epoch: u64) -> bool {
+    /// the block and clears it. Output is ordered by the bus lock this takes:
+    /// output before the claim retracts the confirmation, output after it is a
+    /// blocked pane's own later output.
+    pub fn quota_claim_publication(&self, pane_id: &str, agent_id: &str, epoch: u64) -> bool {
+        self.with_owner_quota(pane_id, agent_id, |quota| quota.claim_publication(epoch))
+            .unwrap_or(false)
+    }
+
+    /// Issue #714: whether the block published for confirmation `epoch` still
+    /// stands — `agent_id` still owns `pane_id` and no work event has lifted the
+    /// latch since. The blocked-worker notice is re-checked against this right
+    /// before it is claimed and again right before it is written, so a worker
+    /// whose genuine work hook cleared its block is not reported as blocked.
+    pub fn quota_block_current(&self, pane_id: &str, agent_id: &str, epoch: u64) -> bool {
+        self.with_owner_quota(pane_id, agent_id, |quota| {
+            quota.confirmed_epoch() == Some(epoch)
+        })
+        .unwrap_or(false)
+    }
+
+    /// Issue #714: the screen revision of `agent_id`'s quota detector — the
+    /// value a snapshot taken now would carry. Test seam for probes that do not
+    /// go through [`Self::quota_probe_candidates`].
+    #[cfg(test)]
+    pub fn quota_revision(&self, agent_id: &str) -> Option<u64> {
         let inner = self.inner.lock().unwrap();
-        let owner = inner
-            .agents
-            .iter()
-            .find(|(_, a)| {
-                a.pane_id_env.as_deref() == Some(pane_id) && !a.exited.load(Ordering::SeqCst)
-            })
-            .map(|(id, a)| (id.as_str(), a));
-        let Some((id, agent)) = owner else {
-            return false;
-        };
-        id == agent_id && agent.bus.state.lock().unwrap().quota.confirmed_epoch() == Some(epoch)
+        let agent = inner.agents.get(agent_id)?;
+        Some(agent.bus.state.lock().unwrap().quota.revision())
     }
 
     /// Issue #714: claim the one blocked-worker notice owed for the
@@ -9641,9 +9684,16 @@ impl AgentPtyRegistry {
     /// id captured at arm time, refused for a pane that is mid-close or has been
     /// re-homed into a different orchestration. The role rides the log line,
     /// never the pane, and the pane's matched quota text rides neither.
+    ///
+    /// The writer-held re-validation also re-checks the WORKER: a genuine work
+    /// hook that lifted the block `epoch` after the claim
+    /// ([`Self::quota_block_current`]) refuses the write, so a worker that is
+    /// visibly working again is not reported as blocked.
     pub async fn deliver_worker_blocked_notice(
         self: &Arc<Self>,
         worker_pane_id: &str,
+        worker_agent_id: &str,
+        epoch: u64,
         notice: WorkerBlockedNotice,
     ) {
         let text = crate::state::compose_worker_blocked_notice(worker_pane_id);
@@ -9652,13 +9702,20 @@ impl AgentPtyRegistry {
         let orchestration = notice.orchestration.clone();
         let revalidate_registry = Arc::clone(self);
         let revalidate_pane = orchestrator_pane_id.clone();
+        let (worker_pane, worker_agent) = (worker_pane_id.to_string(), worker_agent_id.to_string());
         let outcome = self
             .write_notice_guarded(
                 &orchestrator_pane_id,
                 &text,
                 &expected_agent_id,
                 || async move {
-                    if revalidate_registry.is_pane_closing(&revalidate_pane) {
+                    if revalidate_registry.is_pane_closing(&revalidate_pane)
+                        || !revalidate_registry.quota_block_current(
+                            &worker_pane,
+                            &worker_agent,
+                            epoch,
+                        )
+                    {
                         return false;
                     }
                     crate::state::orchestration_still_matches(
@@ -9687,7 +9744,8 @@ impl AgentPtyRegistry {
                 role = %notice.role,
                 expected_agent_id = %expected_agent_id,
                 outcome = ?refused,
-                "quota: identity gate refused the blocked-worker notice; nothing written"
+                "quota: re-validation refused the blocked-worker notice (orchestrator changed, \
+                 or the worker is no longer blocked); nothing written"
             ),
             Err(e) => tracing::warn!(
                 pane_id = %orchestrator_pane_id,
@@ -11191,7 +11249,7 @@ mod tests {
             );
             // A hint, even a matching probe, is only a candidate — never a report.
             assert_eq!(
-                bus.quota_record_probe(later, Some(BlockedKind::UsageLimit)),
+                bus.quota_record_probe(snapshot.revision, later, Some(BlockedKind::UsageLimit)),
                 (ProbeOutcome::Candidate, None)
             );
             assert!(
@@ -11293,7 +11351,7 @@ mod tests {
                     found, None,
                     "redraw {redraw:?}: a cleared quota line matched"
                 );
-                let (outcome, epoch) = bus.quota_record_probe(t, found);
+                let (outcome, epoch) = bus.quota_record_probe(screen.revision, t, found);
                 assert_eq!(outcome, ProbeOutcome::NoMatch);
                 assert_eq!(epoch, None);
                 t += timings.confirm + timings.probe_interval;
@@ -11353,6 +11411,7 @@ mod tests {
             bytes: b"You\xe2\x80\x99ve hit your usage limit.\r\n".to_vec(),
             rows: max,
             cols: max,
+            revision: 0,
         };
         assert!(oversized.tail_rows().is_empty());
     }

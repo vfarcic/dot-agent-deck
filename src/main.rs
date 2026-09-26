@@ -887,16 +887,18 @@ fn blocked_workers_note(resp: &dot_agent_deck::event::DelegateResponse) -> Optio
     if !delivered.is_empty() {
         lines.push(format!(
             "Warning: worker(s) {} appear BLOCKED by a provider usage limit. The task WAS \
-             delivered but will likely not be worked on — reassign it to a role backed by a \
-             different provider or account, or restore the quota and re-delegate.",
+             delivered but will likely not be worked on while that lasts — if the worker's card \
+             still shows Blocked, reassign it to a role backed by a different provider or \
+             account, or restore the quota and re-delegate.",
             dot_agent_deck::state::describe_blocked_workers(&delivered)
         ));
     }
     if !busy.is_empty() {
         lines.push(format!(
             "Warning: busy worker(s) {} also appear BLOCKED by a provider usage limit, so \
-             --supersede will not get the task worked on — reassign it to a role backed by a \
-             different provider or account.",
+             --supersede will likely not get the task worked on while that lasts — if the \
+             worker's card still shows Blocked, reassign it to a role backed by a different \
+             provider or account.",
             dot_agent_deck::state::describe_blocked_workers(&busy)
         ));
     }
@@ -3571,7 +3573,7 @@ mod tests {
             msg.contains("NOT sent")
                 && msg.contains("busy worker(s)")
                 && msg.contains("also appear BLOCKED")
-                && msg.contains("--supersede will not get the task worked on")
+                && msg.contains("--supersede will likely not get the task worked on")
                 && !msg.contains("credits do not reset"),
             "{msg}"
         );

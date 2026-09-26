@@ -473,6 +473,11 @@ pub enum ProbeOutcome {
     Pending,
     /// Matched again after the full window with no work in between: report it.
     Confirmed(BlockedKind),
+    /// The pane wrote output (or was resized) after the probed snapshot was
+    /// taken, so the result describes a screen that may no longer be showing.
+    /// Nothing is recorded; the next quiet probe decides — see
+    /// [`QuotaDetector::record_snapshot_probe`].
+    Stale,
 }
 
 /// Per-pane quiet/confirm state machine. Every method takes the current
@@ -498,6 +503,13 @@ pub struct QuotaDetector {
     /// identified by the value current when it latched — see
     /// [`Self::confirmed_epoch`].
     epoch: u64,
+    /// Bumped by every output chunk and every resize, so a probe of a snapshot
+    /// is identified by the screen it copied — see [`Self::revision`].
+    revision: u64,
+    /// A confirmation latched but not yet published
+    /// ([`Self::claim_publication`]). Output in that window retracts it: the
+    /// confirmation was about a screen the pane has since written over.
+    unpublished: bool,
 }
 
 impl QuotaDetector {
@@ -518,6 +530,33 @@ impl QuotaDetector {
     /// The PTY emitted a chunk.
     pub fn note_output(&mut self, now: Instant) {
         self.last_output_at = Some(now);
+        self.note_screen_changed();
+    }
+
+    /// The screen may have changed without the PTY emitting a chunk — the pane
+    /// was resized. Output calls this too ([`Self::note_output`]).
+    ///
+    /// Any snapshot taken before now is stale ([`Self::record_snapshot_probe`]),
+    /// and a confirmation not yet published is retracted: it was about a screen
+    /// the pane may have cleared or redrawn since, and publishing it would paint
+    /// a working agent Blocked. The hint stays pending, so the next quiet probe
+    /// starts a fresh candidate against the screen as it is now. A confirmation
+    /// already published stays latched — a blocked agent's idle redraws must
+    /// not re-publish it — until a work event lifts it.
+    pub fn note_screen_changed(&mut self) {
+        self.revision = self.revision.wrapping_add(1);
+        if self.confirmed && self.unpublished {
+            self.confirmed = false;
+            self.unpublished = false;
+            self.candidate_at = None;
+            self.epoch = self.epoch.wrapping_add(1);
+        }
+    }
+
+    /// The screen revision a snapshot taken now describes — hand it back to
+    /// [`Self::record_snapshot_probe`] with the probe's result.
+    pub fn revision(&self) -> u64 {
+        self.revision
     }
 
     /// A work-proving event arrived (tool start/end, thinking, compacting,
@@ -528,6 +567,7 @@ impl QuotaDetector {
         self.last_work_event_at = Some(now);
         self.candidate_at = None;
         self.confirmed = false;
+        self.unpublished = false;
         self.epoch = self.epoch.wrapping_add(1);
     }
 
@@ -544,6 +584,20 @@ impl QuotaDetector {
     /// makes the two differ, so a stale confirmation is never applied.
     pub fn confirmed_epoch(&self) -> Option<u64> {
         self.confirmed.then_some(self.epoch)
+    }
+
+    /// Mark the confirmation `epoch` published, if it is still the latched,
+    /// unpublished one. `false` when a work event lifted it, output retracted it
+    /// ([`Self::note_screen_changed`]), or it was already published — in each
+    /// case the caller must not apply it. Called once, by the publisher, at the
+    /// moment it applies the block.
+    pub fn claim_publication(&mut self, epoch: u64) -> bool {
+        if self.unpublished && self.confirmed_epoch() == Some(epoch) {
+            self.unpublished = false;
+            true
+        } else {
+            false
+        }
     }
 
     /// Whether a hint newer than the last work event is waiting to be probed
@@ -580,7 +634,25 @@ impl QuotaDetector {
         }
     }
 
-    /// Record the result of a probe taken at `now`.
+    /// Record the result of a probe of a snapshot taken at screen `revision`
+    /// ([`Self::revision`]). A snapshot the pane has written over since — the
+    /// replay runs outside every lock, so output can land while it runs — is
+    /// [`ProbeOutcome::Stale`] and changes nothing: neither its match nor its
+    /// miss describes the screen now, and the output restarted the quiet window,
+    /// so the next probe replays the current screen.
+    pub fn record_snapshot_probe(
+        &mut self,
+        revision: u64,
+        now: Instant,
+        found: Option<BlockedKind>,
+    ) -> ProbeOutcome {
+        if revision != self.revision {
+            return ProbeOutcome::Stale;
+        }
+        self.record_probe(now, found)
+    }
+
+    /// Record the result of a probe taken at `now`, of the current screen.
     pub fn record_probe(&mut self, now: Instant, found: Option<BlockedKind>) -> ProbeOutcome {
         self.last_probe_at = Some(now);
         let Some(kind) = found else {
@@ -601,6 +673,7 @@ impl QuotaDetector {
             Some(candidate) if now.saturating_duration_since(candidate) >= self.timings.confirm => {
                 self.candidate_at = None;
                 self.confirmed = true;
+                self.unpublished = true;
                 self.epoch = self.epoch.wrapping_add(1);
                 ProbeOutcome::Confirmed(kind)
             }
@@ -1023,5 +1096,68 @@ mod tests {
         d.record_probe(t2 + timings.confirm, Some(BlockedKind::UsageLimit));
         let second = d.confirmed_epoch().expect("re-latched");
         assert_ne!(first, second, "a stale confirmation matched a fresh one");
+    }
+
+    /// Issue #714 (audit N1): output after a snapshot makes its probe Stale, and
+    /// output between a confirmation and its publication retracts it — while a
+    /// published confirmation survives a blocked agent's idle redraws.
+    #[test]
+    fn output_after_a_snapshot_or_before_publication_voids_the_probe() {
+        let timings = QuotaTimings::default();
+        let t0 = Instant::now();
+        let usage = Some(BlockedKind::UsageLimit);
+
+        // A snapshot the pane wrote over is Stale, for a candidate and for the
+        // confirming probe alike, and records nothing.
+        let mut d = QuotaDetector::new(timings);
+        d.note_hint(t0);
+        let rev = d.revision();
+        d.note_output(t0);
+        assert_eq!(d.record_snapshot_probe(rev, t0, usage), ProbeOutcome::Stale);
+        let rev = d.revision();
+        assert_eq!(
+            d.record_snapshot_probe(rev, t0, usage),
+            ProbeOutcome::Candidate
+        );
+        let t1 = t0 + timings.confirm;
+        let rev = d.revision();
+        d.note_screen_changed();
+        assert_eq!(d.record_snapshot_probe(rev, t1, usage), ProbeOutcome::Stale);
+        assert!(!d.is_confirmed());
+
+        // Output between confirmation and publication retracts it; the hint
+        // stays pending and a fresh candidate is needed.
+        let rev = d.revision();
+        assert!(matches!(
+            d.record_snapshot_probe(rev, t1, usage),
+            ProbeOutcome::Confirmed(_)
+        ));
+        let epoch = d.confirmed_epoch().expect("latched");
+        d.note_output(t1);
+        assert_eq!(d.confirmed_epoch(), None);
+        assert!(
+            !d.claim_publication(epoch),
+            "a retracted confirmation published"
+        );
+        assert!(d.hint_pending());
+        let t2 = t1 + timings.quiet.max(timings.probe_interval);
+        assert!(d.should_probe(t2));
+        assert_eq!(d.record_probe(t2, usage), ProbeOutcome::Candidate);
+
+        // Published once, then idle redraws keep it latched.
+        let t3 = t2 + timings.confirm;
+        assert!(matches!(
+            d.record_probe(t3, usage),
+            ProbeOutcome::Confirmed(_)
+        ));
+        let epoch = d.confirmed_epoch().expect("latched");
+        assert!(d.claim_publication(epoch));
+        assert!(!d.claim_publication(epoch), "published twice");
+        d.note_output(t3);
+        assert_eq!(d.confirmed_epoch(), Some(epoch));
+        assert!(
+            !d.should_probe(t3 + 10 * timings.quiet),
+            "re-probed a published block"
+        );
     }
 }

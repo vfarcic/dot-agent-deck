@@ -2960,12 +2960,19 @@ pub(crate) fn compose_respawn_no_live_worker_notice(worker_pane_id: &str) -> Str
 /// prompt — and neither is the role, which rides the accompanying
 /// `tracing::info!`. Sent once per outstanding delegation, and the delegation
 /// stays outstanding: the worker still owes its `work-done`.
+///
+/// Worded as an OBSERVATION with a conditional remedy, never as a verdict: the
+/// daemon suppresses the notice when the block has cleared before it is written,
+/// but a genuine work hook can still land while the orchestrator is reading it,
+/// and a categorical "reassign" would then duplicate work a recovered worker is
+/// doing. So the orchestrator is told to check the card first.
 pub(crate) fn compose_worker_blocked_notice(worker_pane_id: &str) -> String {
     compose_delegate_prompt(&format!(
         "⚠ delegated worker blocked by a provider usage limit (dot-agent-deck daemon report): \
-         the agent behind pane {worker_pane_id} is alive but its own output says its quota is \
-         exhausted; its outstanding delegation will not complete. Reassign the task to another \
-         role; the daemon log names the role."
+         the agent behind pane {worker_pane_id} is alive but its own output says its provider \
+         usage limit is exhausted; its outstanding delegation will likely not complete while \
+         that lasts. Check the worker's card: if it still shows Blocked, reassign the task to a \
+         role backed by a different provider or account; the daemon log names the role."
     ))
 }
 
@@ -15934,6 +15941,11 @@ mod tests {
         assert!(notice.contains(
             "delegated worker blocked by a provider usage limit (dot-agent-deck daemon report)"
         ));
+        // Observational and conditional (audit N2): the block may clear while
+        // the orchestrator reads this, so it never orders a reassignment.
+        assert!(notice.contains("will likely not complete while that lasts"));
+        assert!(notice.contains("if it still shows Blocked, reassign"));
+        assert!(!notice.contains("will not complete"));
     }
 
     /// Issue #714: a delegate names its blocked targets from the pane's card.
