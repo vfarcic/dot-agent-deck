@@ -34051,6 +34051,33 @@ mod tests {
         }
     }
 
+    /// Issue #530: the seed must not teach the dispatcher that a clean exit
+    /// means a unit started. `dispatch` exits on the provenance gate's
+    /// acknowledgement, written before the worktree or the spawn is even
+    /// attempted (`daemon::hook_ingestion_tests::
+    /// a_dispatch_its_handler_rejects_is_still_acknowledged_as_accepted`), so
+    /// the seed points the agent at the reply typed into its pane instead —
+    /// and quotes that reply's success opening, which is pinned here against
+    /// the constant the daemon formats it from, for the same reason as the
+    /// completion opening above: a quote nobody checks against the sender
+    /// drifts into teaching a format nothing sends.
+    #[test]
+    fn dispatcher_seed_says_the_exit_status_is_not_the_outcome() {
+        assert!(
+            DISPATCHER_SEED_PROMPT.contains(crate::dispatch::SPAWNED_OPENING),
+            "the seed must quote the opening the daemon's success reply actually uses, {:?}",
+            crate::dispatch::SPAWNED_OPENING
+        );
+        assert!(
+            DISPATCHER_SEED_PROMPT.contains("exit status says only that the daemon ACCEPTED"),
+            "the seed must say what the exit status does and does not assert"
+        );
+        assert!(
+            !DISPATCHER_SEED_PROMPT.contains("Returns immediately and reports what was started"),
+            "the pre-#530 sentence read the return as the report of what started"
+        );
+    }
+
     /// Issue #674: the shape question is asked ONCE PER UNIT, not once per
     /// session. The seed used to say "before the FIRST dispatch of a session"
     /// and to tell the agent to reuse that answer for later dispatches, which
