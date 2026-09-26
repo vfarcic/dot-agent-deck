@@ -870,7 +870,9 @@ const RULES: &[Rule] = &[
     Rule {
         number: 6,
         name: "no-ignored-spec-test",
-        summary: "No `#[ignore]` on `#[spec(...)]`-annotated tests (Decision 26).",
+        summary: "No `#[ignore]` on `#[spec(...)]`-annotated tests (Decision 26), except CLAUDE.md \
+                  rule 6's owned quarantine mark `#[ignore = \"quarantined: <owner>, #<issue>\"]` \
+                  (issue #488).",
         check: rule_no_ignored_spec_test,
     },
     Rule {
@@ -1104,20 +1106,51 @@ fn rule_no_raw_wait_in_e2e(inputs: &Inputs) -> Vec<String> {
 /// The old line scan credited a test with any `#[ignore]` sitting between the
 /// annotation and the next plain `fn`, which could belong to a different
 /// function entirely.
+///
+/// **One exception, and it is CLAUDE.md rule 6's, not a loosening of Decision
+/// 26** (issue #488). Rule 6 (#908) names quarantine as the costly way to clear
+/// a red test — a named owner, an expiry issue, and the test "marked in the
+/// tree, `#[ignore = "quarantined: <owner>, #<issue>"]`, so a run reports it
+/// skipped instead of failed". This check predated that and refused every
+/// `#[ignore]`, so the mark rule 6 prescribes could not land on any `#[spec]`
+/// test — which is every e2e test — and the only escapes left were the ones
+/// rule 6 refuses: fix it now, or leave it red. So exactly that form passes,
+/// and nothing looser: a bare `#[ignore]`, a free-text reason such as
+/// `"flaky"`, or a mark missing its owner or issue number still fails, because
+/// the owner and the issue are what stop a quarantine becoming the graveyard
+/// Decision 26 was written against.
 fn rule_no_ignored_spec_test(inputs: &Inputs) -> Vec<String> {
-    inputs
-        .discovered
+    unquarantined_ignores(&inputs.discovered)
+}
+
+/// The body of [`rule_no_ignored_spec_test`], taking the discovered tests
+/// directly so it is testable without assembling a whole [`Inputs`].
+fn unquarantined_ignores(discovered: &[xtask_docs::DiscoveredTest]) -> Vec<String> {
+    discovered
         .iter()
-        .filter(|ann| ann.ignored)
+        .filter(|ann| ann.ignored && !is_quarantine_mark(ann.ignore_reason.as_deref()))
         .map(|ann| {
             format!(
-                "{}: #[spec({:?})] annotates an #[ignore]-d test `{}` (Decision 26)",
+                "{}: #[spec({:?})] annotates an #[ignore]-d test `{}` (Decision 26) — the only \
+                 accepted form is CLAUDE.md rule 6's quarantine mark \
+                 `#[ignore = \"quarantined: <owner>, #<issue>\"]`",
                 ann.source_path.display(),
                 ann.spec_id,
                 ann.fn_name
             )
         })
         .collect()
+}
+
+/// Whether an `#[ignore = "…"]` reason is CLAUDE.md rule 6's quarantine mark,
+/// `quarantined: <owner>, #<issue>` — a GitHub login and an issue number, and
+/// nothing else. `None` (a bare `#[ignore]`) never is.
+fn is_quarantine_mark(reason: Option<&str>) -> bool {
+    static MARK: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+        Regex::new(r"^quarantined: [A-Za-z0-9][A-Za-z0-9-]*, #[1-9][0-9]*$")
+            .expect("quarantine mark regex compiles")
+    });
+    reason.is_some_and(|reason| MARK.is_match(reason))
 }
 
 /// Rule 7 (PRD #77 Decision 30 / M4.3). The `xtask-docs` library raises `Err`
@@ -3125,7 +3158,53 @@ mod tests {
             scenario: Some("Scenario: synthetic.".to_string()),
             steps: Vec::new(),
             ignored: false,
+            ignore_reason: None,
         }
+    }
+
+    // --- rule 6: the quarantine mark (issue #488) ---
+
+    #[test]
+    fn quarantine_mark_accepts_exactly_the_rule_6_form() {
+        assert!(is_quarantine_mark(Some("quarantined: vfarcic, #488")));
+        assert!(is_quarantine_mark(Some("quarantined: some-user, #1")));
+    }
+
+    #[test]
+    fn quarantine_mark_refuses_anything_looser() {
+        for reason in [
+            None,
+            Some(""),
+            Some("flaky"),
+            Some("quarantined"),
+            Some("quarantined: vfarcic"),
+            Some("quarantined: #488"),
+            Some("quarantined: vfarcic, 488"),
+            Some("quarantined: vfarcic, #0"),
+            Some("quarantined: vfarcic, #488 until fixed"),
+            Some("Quarantined: vfarcic, #488"),
+            Some("quarantined:vfarcic,#488"),
+        ] {
+            assert!(!is_quarantine_mark(reason), "{reason:?} must not pass");
+        }
+    }
+
+    #[test]
+    fn rule_6_passes_a_quarantined_spec_test_and_fails_every_other_ignore() {
+        let mut quarantined = bound("tests/e2e_a.rs", "a/b/001", "b_001_quarantined");
+        quarantined.ignored = true;
+        quarantined.ignore_reason = Some("quarantined: vfarcic, #488".to_string());
+        let mut bare = bound("tests/e2e_a.rs", "a/b/002", "b_002_bare");
+        bare.ignored = true;
+        let mut free_text = bound("tests/e2e_a.rs", "a/b/003", "b_003_free_text");
+        free_text.ignored = true;
+        free_text.ignore_reason = Some("flaky".to_string());
+        let plain = bound("tests/e2e_a.rs", "a/b/004", "b_004_plain");
+
+        let errors = unquarantined_ignores(&[quarantined, bare, free_text, plain]);
+        assert_eq!(errors.len(), 2, "{errors:#?}");
+        assert!(errors[0].contains("b_002_bare"), "{errors:#?}");
+        assert!(errors[1].contains("b_003_free_text"), "{errors:#?}");
     }
 
     fn occurrence(file: &str, id: &str, line: usize) -> SpecOccurrence {

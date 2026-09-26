@@ -4507,6 +4507,7 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 
 ##### devin/live/001 — A real interactive Devin turn drives the dashboard card live through the deck's own installed hooks. [reel]
 - **Layer:** L2 PTY-attached (`TuiDeck`, reel-eligible); runtime-skipped unless `check_devin_available` verifies the binary, persisted credentials, and a logged-in account.
+- **Quarantined:** `#[ignore = "quarantined: vfarcic, #1348"]` (CLAUDE.md rule 6). #488 reported it red and nobody available has a Devin account to re-triage it; #1348 has the command that runs it (`--run-ignored only`) and what lifts the quarantine.
 - **Agent:** real interactive `devin` restored into a pane, using the account's default (cheap SWE-family) model with isolated copied credentials, the setup wizard pre-satisfied, workspace trust waived, and `--permission-mode auto`; launch goes through the normal `NativeHooks` seam with no wrapper.
 - **Asserts:** the deck-written `"hooks"` block in Devin's own config is actually read and executed by the third-party binary — a typed prompt produces a Devin-stamped Thinking event and a visible Thinking card, an `exec` ToolStart carrying a non-empty tool detail, the pane showing `devin_live_sentinel_4c81de.txt`, and a Stop-driven Idle.
 - **Does not assert:** exact model phrasing or token usage; hook payload parsing in isolation (covered by the fast-tier `devin_hook_ingestion` tests) or config-merge safety (covered by the `devin_hooks_manage` unit tests).
