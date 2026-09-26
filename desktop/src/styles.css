@@ -1021,6 +1021,8 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .new-agent-current { display: flex; align-items: center; gap: 9px; }
 .new-agent-current strong { min-width: 0; flex: 1; overflow: hidden; font-family: "JetBrains Mono", monospace; font-size: 10.5px; text-overflow: ellipsis; white-space: nowrap; }
 .new-agent-current input { width: 150px; }
+.new-agent-toggle { display: inline-flex; align-items: center; gap: 5px; color: var(--muted); font-size: 10.5px; white-space: nowrap; cursor: pointer; }
+.new-agent-current .new-agent-toggle input { width: auto; height: auto; margin: 0; }
 .new-agent-hint, .new-agent-keys { margin: 0; display: flex; align-items: center; gap: 5px; color: var(--muted); font-size: 9.5px; line-height: 1.4; }
 .new-agent-keys { color: var(--faint); }
 .new-agent-error { margin: 0; color: var(--red); font-size: 10px; line-height: 1.4; overflow-wrap: anywhere; }

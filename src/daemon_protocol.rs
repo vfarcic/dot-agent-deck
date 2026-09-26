@@ -393,6 +393,18 @@ pub fn parse_geometry_frame(bytes: &[u8]) -> Option<(u16, u16)> {
 /// that residual. No existing field changed meaning, so no
 /// [`CONTRACT_BREAKS`] entry either.
 ///
+/// **Issue #1240 contributes no bump either**: three optional fields on
+/// [`AttachRequest::ListDirectories`] — `include_hidden`, `include_symlinks`
+/// and `filter` — gated on [`CAP_LIST_DIRECTORIES_OPTIONS`], and one optional
+/// field on the reply's entries (`is_symlink`, omitted when `false`, and only
+/// ever `true` when a request asked for symlinks). The fields' residual does
+/// not fail closed — an older daemon drops the keys and answers the PRD #1223
+/// listing — but it degrades to exactly the listing that daemon has always
+/// given, which is why their sender
+/// ([`crate::daemon_client::DaemonClient::list_directories`]) decides from the
+/// cached handshake rather than a fresh one. No existing field changed
+/// meaning: a request that sets none of them is answered as before.
+///
 /// # Where this constant is enforced
 ///
 /// **Exactly one call site refuses on it: the desktop.**
@@ -505,6 +517,53 @@ pub const CAP_FOCUS_GAINED: &str = "focus-gained";
 /// [`CAP_PREPARE_WORKFLOW`].
 pub const CAP_LIST_DIRECTORIES: &str = "list-directories";
 
+/// Capability string for [`AttachRequest::ListDirectories`]'s
+/// `include_hidden`, `include_symlinks` and `filter` fields (issue #1240).
+///
+/// Names FIELDS, like [`CAP_AUTHORING_KIND`], and for the same reason: serde
+/// drops an unknown key on `list-directories`, so an older daemon would answer
+/// a filtered request with an unfiltered listing and report success. Held by
+/// [`crate::daemon_client::DaemonClient::list_directories`], which withholds a
+/// request carrying any of them from a daemon that does not name this.
+/// Advertised on every platform, beside [`CAP_LIST_DIRECTORIES`].
+pub const CAP_LIST_DIRECTORIES_OPTIONS: &str = "list-directories-options";
+
+/// Issue #1240: what a caller may widen or narrow about one
+/// [`AttachRequest::ListDirectories`] — the fields that request carries, as
+/// one value [`crate::directory_listing::list_directories`] and
+/// [`crate::daemon_client::DaemonClient::list_directories`] both take. Lives
+/// here rather than in `directory_listing` because a client names it, and that
+/// module owns a filesystem listing no client may run. The
+/// default — every field off or absent — is the PRD #1223 listing exactly, and
+/// is what a client sends to a daemon that does not advertise
+/// [`CAP_LIST_DIRECTORIES_OPTIONS`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DirectoryListingOptions {
+    /// List children whose name starts with `.` as well.
+    pub include_hidden: bool,
+    /// List a child that is a symlink to a directory, by its canonical target
+    /// and marked [`crate::directory_listing::DirectoryEntry::is_symlink`].
+    pub include_symlinks: bool,
+    /// Keep only children whose name contains this, compared
+    /// case-insensitively — applied **before**
+    /// [`crate::directory_listing::MAX_DIRECTORY_ENTRIES`], so the cap bounds
+    /// the matches rather than the directory. Absent or empty filters nothing.
+    /// Refused with [`PROJECT_ERR_INVALID_PATH`] when longer than
+    /// [`crate::directory_listing::MAX_DIRECTORY_FILTER_LEN`] or carrying a
+    /// control character or a path separator: a path separator is in no file
+    /// name, and a name with a control character is never listed (the
+    /// authoring predicate in [`crate::directory_listing`] drops it).
+    pub filter: Option<String>,
+}
+
+impl DirectoryListingOptions {
+    /// Whether these are the defaults — the request a daemon predating issue
+    /// #1240 answers faithfully.
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
 /// Capability string for [`AttachRequest::NewAgentOptions`] (PRD #1223 M2).
 ///
 /// Held by [`crate::daemon_client::DaemonClient::new_agent_options`] the same
@@ -604,7 +663,8 @@ fn invalid_client_id_message() -> String {
 /// [`AttachRequest::FocusGained`]'s is `#[cfg]`-gated, so both are answered on
 /// every platform this builds for. PRD #1223's [`CAP_LIST_DIRECTORIES`],
 /// [`CAP_NEW_AGENT_OPTIONS`] and [`CAP_AUTHORING_KIND`] are on both lists for the
-/// same reason: none of their dispatch arms is `#[cfg]`-gated.
+/// same reason: none of their dispatch arms is `#[cfg]`-gated — and so is issue
+/// #1240's [`CAP_LIST_DIRECTORIES_OPTIONS`], a field of the first.
 /// [`CAP_PREPARED_ROLE_COMMAND`] is on the Unix list only, beside
 /// [`CAP_START_PREPARED_AGENT`] — it names a field of that verb.
 #[cfg(unix)]
@@ -619,6 +679,7 @@ pub const DAEMON_CAPABILITIES: &[&str] = &[
     CAP_NEW_AGENT_OPTIONS,
     CAP_AUTHORING_KIND,
     CAP_PREPARED_ROLE_COMMAND,
+    CAP_LIST_DIRECTORIES_OPTIONS,
 ];
 #[cfg(not(unix))]
 pub const DAEMON_CAPABILITIES: &[&str] = &[
@@ -629,6 +690,7 @@ pub const DAEMON_CAPABILITIES: &[&str] = &[
     CAP_LIST_DIRECTORIES,
     CAP_NEW_AGENT_OPTIONS,
     CAP_AUTHORING_KIND,
+    CAP_LIST_DIRECTORIES_OPTIONS,
 ];
 
 // ---------------------------------------------------------------------------
@@ -1714,15 +1776,17 @@ pub enum AttachRequest {
         #[serde(default)]
         force: bool,
     },
-    /// PRD #1223 M1: list one directory's immediate, visible subdirectories.
+    /// PRD #1223 M1: list one directory's immediate subdirectories — the
+    /// visible, non-symlink ones unless the issue #1240 fields below widen it.
     /// **Read-only.** The reply rides back on [`AttachResponse::directories`].
     ///
     /// The backing for the desktop's new-agent directory step, which cannot
     /// browse the deck's filesystem any other way — on a remote deck its own
     /// filesystem is not the one the agent will run in. The bounds are
     /// [`crate::directory_listing`]'s: one level, directories only, hidden and
-    /// symlinked entries left out, canonical absolute paths both ways, and a
-    /// result cap and a time budget that set `truncated` instead of failing.
+    /// symlinked entries left out unless asked for, canonical absolute paths
+    /// both ways, and a result cap and a time budget that set `truncated`
+    /// instead of failing.
     ///
     /// **Withheld unless the daemon advertises [`CAP_LIST_DIRECTORIES`]**, which
     /// is why this variant contributes no [`PROTOCOL_VERSION`] bump: an older
@@ -1743,6 +1807,22 @@ pub enum AttachRequest {
         /// access.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         path: Option<String>,
+        /// Issue #1240: list `.`-named children too. **Sent only to a daemon
+        /// advertising [`CAP_LIST_DIRECTORIES_OPTIONS`]**, as are the two
+        /// fields below; omitted when `false`, so a request that sets none of
+        /// them is PRD #1223's frame byte for byte.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        include_hidden: bool,
+        /// Issue #1240: list a symlink to a directory too, by its canonical
+        /// target and marked `is_symlink`.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        include_symlinks: bool,
+        /// Issue #1240: keep only children whose name contains this,
+        /// case-insensitively, applied before the entry cap. Bounded and
+        /// refused as [`crate::directory_listing::DirectoryListingOptions::filter`]
+        /// describes.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        filter: Option<String>,
     },
     /// PRD #1223 M2: what a new-agent form needs to know about this deck — its
     /// configured default command, the agent registry it was built with, its
@@ -4598,9 +4678,19 @@ async fn handle_connection(
         // pool refuses as `busy` rather than queueing, and a listing never holds
         // one of the project verbs' permits, so a burst of slow listings cannot
         // starve `ResolveProject` / `PrepareWorkflow`.
-        AttachRequest::ListDirectories { path } => {
+        AttachRequest::ListDirectories {
+            path,
+            include_hidden,
+            include_symlinks,
+            filter,
+        } => {
+            let options = crate::directory_listing::DirectoryListingOptions {
+                include_hidden,
+                include_symlinks,
+                filter,
+            };
             let resp = match crate::new_agent_options::run_new_agent_query(move || {
-                crate::directory_listing::list_directories(path.as_deref())
+                crate::directory_listing::list_directories(path.as_deref(), &options)
             })
             .await
             {
@@ -8464,7 +8554,7 @@ mod tests {
         assert_eq!(CAP_LIST_DIRECTORIES, "list-directories");
         assert_eq!(CAP_NEW_AGENT_OPTIONS, "new-agent-options");
         assert_eq!(
-            serde_json::to_value(AttachRequest::ListDirectories { path: None }).unwrap()["op"],
+            serde_json::to_value(plain_listing_request(None)).unwrap()["op"],
             CAP_LIST_DIRECTORIES
         );
         assert_eq!(
@@ -8604,20 +8694,65 @@ mod tests {
         }
     }
 
+    /// A `list-directories` request with none of issue #1240's options set.
+    fn plain_listing_request(path: Option<&str>) -> AttachRequest {
+        AttachRequest::ListDirectories {
+            path: path.map(str::to_string),
+            include_hidden: false,
+            include_symlinks: false,
+            filter: None,
+        }
+    }
+
+    /// Issue #1240 — the listing options: each is omitted when unset, so a
+    /// request setting none of them is the PRD #1223 frame byte for byte (the
+    /// test above pins that frame), each round-trips when set, and the
+    /// capability that gates them is advertised on every platform beside the
+    /// verb they ride on.
+    #[test]
+    fn listing_options_travel_only_when_set_and_are_advertised() {
+        let set = AttachRequest::ListDirectories {
+            path: Some("/srv".into()),
+            include_hidden: true,
+            include_symlinks: true,
+            filter: Some("work".into()),
+        };
+        let json = serde_json::to_value(&set).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "op": "list-directories",
+                "path": "/srv",
+                "include_hidden": true,
+                "include_symlinks": true,
+                "filter": "work",
+            })
+        );
+        let decoded: AttachRequest = serde_json::from_value(json).unwrap();
+        assert!(matches!(
+            decoded,
+            AttachRequest::ListDirectories {
+                include_hidden: true,
+                include_symlinks: true,
+                filter: Some(f),
+                ..
+            } if f == "work"
+        ));
+        assert_eq!(CAP_LIST_DIRECTORIES_OPTIONS, "list-directories-options");
+        assert!(DAEMON_CAPABILITIES.contains(&CAP_LIST_DIRECTORIES_OPTIONS));
+    }
+
     /// PRD #1223 — the request shapes: an absent `path` is omitted rather than
     /// sent as `null`, a present one round-trips, and both verbs decode from the
     /// bare `{"op": …}` a client with nothing to add sends.
     #[test]
     fn new_agent_query_requests_round_trip() {
         assert_eq!(
-            serde_json::to_value(AttachRequest::ListDirectories { path: None }).unwrap(),
+            serde_json::to_value(plain_listing_request(None)).unwrap(),
             serde_json::json!({"op": "list-directories"})
         );
         assert_eq!(
-            serde_json::to_value(AttachRequest::ListDirectories {
-                path: Some("/srv/work".into()),
-            })
-            .unwrap(),
+            serde_json::to_value(plain_listing_request(Some("/srv/work"))).unwrap(),
             serde_json::json!({"op": "list-directories", "path": "/srv/work"})
         );
         assert_eq!(
@@ -8629,13 +8764,18 @@ mod tests {
             serde_json::from_str(r#"{"op":"list-directories"}"#).expect("absent path decodes");
         assert!(matches!(
             decoded,
-            AttachRequest::ListDirectories { path: None }
+            AttachRequest::ListDirectories {
+                path: None,
+                include_hidden: false,
+                include_symlinks: false,
+                filter: None,
+            }
         ));
         let decoded: AttachRequest =
             serde_json::from_str(r#"{"op":"list-directories","path":"/srv/work"}"#)
                 .expect("a path decodes");
         assert!(
-            matches!(decoded, AttachRequest::ListDirectories { path: Some(p) } if p == "/srv/work")
+            matches!(decoded, AttachRequest::ListDirectories { path: Some(p), .. } if p == "/srv/work")
         );
         let decoded: AttachRequest =
             serde_json::from_str(r#"{"op":"new-agent-options"}"#).expect("the query decodes");

@@ -2196,8 +2196,9 @@ impl DaemonClient {
         Ok(FocusReport::Recorded)
     }
 
-    /// PRD #1223 M1 — list one directory's immediate, visible subdirectories on
-    /// the daemon's filesystem. **Read-only.**
+    /// PRD #1223 M1 — list one directory's immediate subdirectories on the
+    /// daemon's filesystem, widened or narrowed by `options` (issue #1240).
+    /// **Read-only.**
     ///
     /// **Withholds unless the daemon advertises
     /// [`crate::daemon_protocol::CAP_LIST_DIRECTORIES`]**, answering
@@ -2206,21 +2207,34 @@ impl DaemonClient {
     /// [`Self::capabilities`], which costs one `Hello` per endpoint until that
     /// cache is invalidated.
     ///
+    /// **`options` other than the default are withheld the same way** unless the
+    /// daemon also advertises
+    /// [`crate::daemon_protocol::CAP_LIST_DIRECTORIES_OPTIONS`]: an older daemon
+    /// would drop them and answer as though they were never asked, and a
+    /// filtered request answered unfiltered is a wrong answer, not a degraded
+    /// one. The cached set is enough here, unlike the starts that decide from a
+    /// fresh handshake: the residual — a cache outliving a daemon replaced by
+    /// an older build — gets the PRD #1223 listing that build has always given
+    /// (or, from a build older still, its `malformed request` refusal), and a
+    /// caller re-filters what it shows anyway.
+    ///
     /// `path` must be one this daemon returned — a listing's `path`, `parent`
     /// or an entry's `path` — or one the user typed. `None` lists the daemon
     /// user's home directory. Never join a listed parent and a name on the
     /// client: the daemon's filesystem need not be this one.
     ///
-    /// A refusal (a relative, missing or non-directory path) is
-    /// [`ClientError::Server`] carrying the daemon's generic sentence.
+    /// A refusal (a relative, missing or non-directory path, a malformed
+    /// filter) is [`ClientError::Server`] carrying the daemon's generic
+    /// sentence.
     pub async fn list_directories(
         &self,
         path: Option<&str>,
+        options: &crate::daemon_protocol::DirectoryListingOptions,
     ) -> Result<GatedQuery<crate::directory_listing::DirectoryListing>, ClientError> {
-        if !self
-            .capabilities()
-            .await?
-            .supports(crate::daemon_protocol::CAP_LIST_DIRECTORIES)
+        let capabilities = self.capabilities().await?;
+        if !capabilities.supports(crate::daemon_protocol::CAP_LIST_DIRECTORIES)
+            || (!options.is_default()
+                && !capabilities.supports(crate::daemon_protocol::CAP_LIST_DIRECTORIES_OPTIONS))
         {
             return Ok(GatedQuery::Unsupported);
         }
@@ -2230,6 +2244,9 @@ impl DaemonClient {
             &mut wr,
             &AttachRequest::ListDirectories {
                 path: path.map(str::to_string),
+                include_hidden: options.include_hidden,
+                include_symlinks: options.include_symlinks,
+                filter: options.filter.clone(),
             },
         )
         .await?;
@@ -3783,7 +3800,7 @@ mod tests {
 
         assert_eq!(
             client
-                .list_directories(Some("/"))
+                .list_directories(Some("/"), &Default::default())
                 .await
                 .expect("a withhold is not an error"),
             GatedQuery::Unsupported,
@@ -3791,7 +3808,7 @@ mod tests {
         );
         assert_eq!(
             client
-                .list_directories(None)
+                .list_directories(None, &Default::default())
                 .await
                 .expect("a withhold is not an error"),
             GatedQuery::Unsupported,
@@ -3834,7 +3851,7 @@ mod tests {
         let root_wire = root.to_str().expect("scratch paths are UTF-8");
 
         let GatedQuery::Answered(listing) = client
-            .list_directories(Some(root_wire))
+            .list_directories(Some(root_wire), &Default::default())
             .await
             .expect("an advertised listing is answered")
         else {
@@ -3851,7 +3868,7 @@ mod tests {
         );
 
         let refusal = client
-            .list_directories(Some("relative/path"))
+            .list_directories(Some("relative/path"), &Default::default())
             .await
             .expect_err("a relative path is the daemon's refusal, not a withhold");
         assert!(
@@ -3902,9 +3919,12 @@ mod tests {
             matches!(answer, Err(ClientError::Server(message))
                 if message.starts_with(&format!("{}: ", crate::daemon_protocol::PROJECT_ERR_BUSY)))
         }
-        let listing = tokio::time::timeout(within, client.list_directories(Some(&root_wire)))
-            .await
-            .expect("a full pool answers at once — a listing that waits here was queued");
+        let listing = tokio::time::timeout(
+            within,
+            client.list_directories(Some(&root_wire), &Default::default()),
+        )
+        .await
+        .expect("a full pool answers at once — a listing that waits here was queued");
         assert!(busy(&listing), "{listing:?}");
         let options = tokio::time::timeout(within, client.new_agent_options())
             .await
@@ -3920,10 +3940,203 @@ mod tests {
         drop(held);
         assert!(
             matches!(
-                client.list_directories(Some(&root_wire)).await,
+                client
+                    .list_directories(Some(&root_wire), &Default::default())
+                    .await,
                 Ok(GatedQuery::Answered(_))
             ),
             "the refusal was the pool, not the request"
+        );
+    }
+
+    /// Issue #1240 — the listing options withhold against the daemon a desktop
+    /// will meet most: one at the release before them, advertising
+    /// `list-directories` but not `list-directories-options`. A default listing
+    /// is still sent and answered; one asking for hidden or symlinked entries,
+    /// or carrying a filter, is not sent, because that daemon would drop the
+    /// fields and answer as though they had never been asked.
+    #[cfg(unix)]
+    #[test]
+    fn listing_options_are_withheld_by_a_daemon_that_does_not_advertise_them() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("build older-daemon runtime");
+        runtime.block_on(async {
+            let (dir, path, listener) = {
+                let _g = BIND_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("older-daemon.sock");
+                let listener = bind_attach_listener(&path).expect("bind older daemon");
+                (dir, path, listener)
+            };
+            let listings = Arc::new(AtomicUsize::new(0));
+            let server_listings = listings.clone();
+            let server = tokio::spawn(async move {
+                while let Ok(Ok(mut stream)) =
+                    tokio::time::timeout(std::time::Duration::from_millis(500), listener.accept())
+                        .await
+                {
+                    let Some((KIND_REQ, payload)) = read_frame(&mut stream)
+                        .await
+                        .expect("read older-daemon request frame")
+                    else {
+                        continue;
+                    };
+                    let request: serde_json::Value =
+                        serde_json::from_slice(&payload).expect("decode older-daemon request");
+                    let response = match request.get("op").and_then(|op| op.as_str()) {
+                        Some("hello") => AttachResponse {
+                            capabilities: Some(
+                                [
+                                    CAP_LIST_PROJECTS,
+                                    CAP_RESOLVE_PROJECT,
+                                    CAP_PREPARE_WORKFLOW,
+                                    crate::daemon_protocol::CAP_START_PREPARED_AGENT,
+                                    crate::daemon_protocol::CAP_STOP_DAEMON,
+                                    crate::daemon_protocol::CAP_FOCUS_GAINED,
+                                    crate::daemon_protocol::CAP_LIST_DIRECTORIES,
+                                    crate::daemon_protocol::CAP_NEW_AGENT_OPTIONS,
+                                    crate::daemon_protocol::CAP_AUTHORING_KIND,
+                                    crate::daemon_protocol::CAP_PREPARED_ROLE_COMMAND,
+                                ]
+                                .iter()
+                                .map(|cap| cap.to_string())
+                                .collect(),
+                            ),
+                            ..AttachResponse::hello(PROTOCOL_VERSION)
+                        },
+                        // What that daemon really does with the frame: drop any
+                        // field it does not know and list. Counted.
+                        _ => {
+                            server_listings.fetch_add(1, Ordering::SeqCst);
+                            let mut resp = AttachResponse::ok();
+                            resp.directories = Some(crate::directory_listing::DirectoryListing {
+                                path: "/".into(),
+                                parent: None,
+                                entries: Vec::new(),
+                                truncated: false,
+                            });
+                            resp
+                        }
+                    };
+                    crate::daemon_protocol::write_resp(&mut stream, &response)
+                        .await
+                        .expect("write older-daemon response");
+                }
+            });
+            let client = DaemonClient::new(path);
+
+            assert!(matches!(
+                client
+                    .list_directories(Some("/"), &Default::default())
+                    .await
+                    .expect("a default listing is answered"),
+                GatedQuery::Answered(_)
+            ));
+            for options in [
+                crate::daemon_protocol::DirectoryListingOptions {
+                    include_hidden: true,
+                    ..Default::default()
+                },
+                crate::daemon_protocol::DirectoryListingOptions {
+                    include_symlinks: true,
+                    ..Default::default()
+                },
+                crate::daemon_protocol::DirectoryListingOptions {
+                    filter: Some("needle".into()),
+                    ..Default::default()
+                },
+            ] {
+                assert_eq!(
+                    client
+                        .list_directories(Some("/"), &options)
+                        .await
+                        .expect("a withhold is not an error"),
+                    GatedQuery::Unsupported,
+                    "{options:?} must not reach a daemon that would drop it"
+                );
+            }
+            assert_eq!(
+                listings.load(Ordering::SeqCst),
+                1,
+                "only the default listing reached the socket"
+            );
+
+            drop(client);
+            server.await.unwrap();
+            drop(dir);
+        });
+    }
+
+    /// Issue #1240 — the positive half, against the real dispatch: a daemon at
+    /// this build advertises the listing options and honours each of them, so
+    /// a hidden child, a symlinked child (by its target) and a filtered name
+    /// all come back over the wire.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn listing_options_are_answered_by_a_daemon_at_this_build() {
+        let _serial = crate::new_agent_options::POOL_TEST_GUARD.lock().await;
+        let (_dir, path, _registry) = spawn_test_server().await;
+        let client = DaemonClient::new(path);
+
+        let scratch = crate::test_temp::tempdir().expect("scratch dir");
+        let root = std::fs::canonicalize(scratch.path()).expect("canonical scratch root");
+        let target = root.join("target");
+        let listed = root.join("listed");
+        std::fs::create_dir_all(listed.join(".hidden")).unwrap();
+        std::fs::create_dir(listed.join("visible")).unwrap();
+        std::fs::create_dir(&target).unwrap();
+        std::os::unix::fs::symlink(&target, listed.join("link")).unwrap();
+        let listed_wire = listed.to_str().expect("scratch paths are UTF-8");
+
+        let options = crate::daemon_protocol::DirectoryListingOptions {
+            include_hidden: true,
+            include_symlinks: true,
+            filter: None,
+        };
+        let GatedQuery::Answered(listing) = client
+            .list_directories(Some(listed_wire), &options)
+            .await
+            .expect("an advertised option is answered")
+        else {
+            panic!("a daemon at this build advertises `list-directories-options`");
+        };
+        let entries: Vec<(&str, &str, bool)> = listing
+            .entries
+            .iter()
+            .map(|e| (e.name.as_str(), e.path.as_str(), e.is_symlink))
+            .collect();
+        assert_eq!(
+            entries,
+            vec![
+                (".hidden", listed.join(".hidden").to_str().unwrap(), false),
+                ("link", target.to_str().unwrap(), true),
+                ("visible", listed.join("visible").to_str().unwrap(), false),
+            ]
+        );
+
+        let GatedQuery::Answered(filtered) = client
+            .list_directories(
+                Some(listed_wire),
+                &crate::daemon_protocol::DirectoryListingOptions {
+                    filter: Some("VIS".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("a filtered listing is answered")
+        else {
+            panic!("a daemon at this build advertises `list-directories-options`");
+        };
+        assert_eq!(
+            filtered
+                .entries
+                .iter()
+                .map(|e| e.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["visible"]
         );
     }
 

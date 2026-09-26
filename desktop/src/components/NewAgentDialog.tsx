@@ -10,6 +10,7 @@ import {
   authoringModes,
   deckChoices,
   directoryLabel,
+  directoryListingOptions,
   filterDirectoryEntries,
   fleetLists,
   isDeckGoneError,
@@ -90,6 +91,18 @@ type Resume = Pick<NewAgentDraft, "browsing" | "directory" | "mode">;
  * superseded it — in which case nothing it would have done is done.
  */
 type ListingOutcome = { kind: "listed"; listing: Listing } | { kind: "failed" } | { kind: "unsupported" } | { kind: "stale" };
+
+/**
+ * Issue #1240 — how long the filter waits after the last keystroke before it
+ * asks the deck to search a directory its cap truncated. Short enough to feel
+ * live, long enough that typing a word is one request rather than one per key.
+ */
+export const DECK_SEARCH_DEBOUNCE_MS = 250;
+
+/** Issue #1240 — the truncation hints, in the dialog's own words. */
+export const TRUNCATED_NO_SEARCH = "Not every subdirectory is listed: the deck stopped at its limit, and the ones past it cannot be chosen here.";
+export const TRUNCATED_SEARCHABLE = "Not every subdirectory is listed: the deck stopped at its limit. Filter by name and the deck searches all of them.";
+export const SEARCH_TRUNCATED = "More subdirectories match this filter than the deck lists at once. Narrow the filter to find the one you want.";
 
 /**
  * The Mode row's first chip — a plain agent. Then, in the TUI cycler's order,
@@ -296,6 +309,17 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
   const [filter, setFilter] = useState("");
   /** Drops the reply of any listing request a later one has superseded. */
   const listingSeq = useRef(0);
+  /** Issue #1240: list `.`-named directories too, on a deck that honours listing options. */
+  const [showHidden, setShowHidden] = useState(false);
+  /**
+   * Issue #1240: the deck's answer to the filter, for a listing its cap
+   * truncated — the same directory searched deck-side, before the cap. Shown
+   * only while `path` and `filter` are still the ones on screen.
+   */
+  const [searched, setSearched] = useState<{ path: string; filter: string; listing: Listing }>();
+  const [searchError, setSearchError] = useState<string>();
+  /** Drops a search reply a later keystroke or listing has superseded. */
+  const searchSeq = useRef(0);
 
   // -- form -----------------------------------------------------------------------
   const [target, setTarget] = useState<{ path: string; displayPath: string }>();
@@ -388,6 +412,9 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
     setListingState("idle");
     setListingError(undefined);
     setFilter("");
+    searchSeq.current += 1;
+    setSearched(undefined);
+    setSearchError(undefined);
     setCursor(0);
     setTarget(undefined);
     setOptions(undefined);
@@ -544,11 +571,22 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
     setPhase("idle");
   };
 
+  /** Issue #1240: the deck's search of this directory for this filter, when that is what is on screen. */
+  const searchedHere = searched !== undefined && listing !== undefined && filter !== "" && searched.path === listing.path && searched.filter === filter ? searched.listing : undefined;
   const rows = useMemo<DirectoryRow[]>(() => {
     if (!listing) return [];
     const up: DirectoryRow[] = listing.parent === undefined ? [] : [{ kind: "up", path: listing.parent }];
-    return [...up, ...filterDirectoryEntries(listing.entries, filter).map((entry): DirectoryRow => ({ kind: "entry", entry }))];
-  }, [filter, listing]);
+    return [...up, ...filterDirectoryEntries((searchedHere ?? listing).entries, filter).map((entry): DirectoryRow => ({ kind: "entry", entry }))];
+  }, [filter, listing, searchedHere]);
+
+  /*
+    Issue #1240: what `loadListing` needs to know about the browser at the
+    moment it asks — which decks honour listing options, and whether Show
+    hidden is on — rewritten every render, and by `toggleHidden` directly so a
+    reload it starts sees the new value before the next render does.
+  */
+  const browse = useRef({ showHidden, supports: new Set<string>() });
+  browse.current = { showHidden, supports: new Set(choices.flatMap((choice) => (choice.listingOptions ? [choice.deckId] : []))) };
 
   /**
    * List `path` on the captured deck (its home when absent), then put the
@@ -572,7 +610,8 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
     setListingError(undefined);
     setListingState((current) => (current === "ready" ? current : "loading"));
     try {
-      const reply = await runtime.listDirectories(deckId, path);
+      const options = directoryListingOptions(browse.current.supports.has(deckId), browse.current.showHidden);
+      const reply = await (options ? runtime.listDirectories(deckId, path, options) : runtime.listDirectories(deckId, path));
       if (seq !== listingSeq.current) return { kind: "stale" };
       if (reply.kind === "unsupported") {
         setListing(undefined);
@@ -583,6 +622,9 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
       setListing(reply);
       setListingState("ready");
       setFilter("");
+      searchSeq.current += 1;
+      setSearched(undefined);
+      setSearchError(undefined);
       const offset = reply.parent === undefined ? 0 : 1;
       const focused = focusPath === undefined ? -1 : reply.entries.findIndex((entry) => entry.path === focusPath);
       setCursor(focused >= 0 ? focused + offset : reply.entries.length > 0 ? offset : 0);
@@ -818,6 +860,59 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
   const goUp = () => {
     if (deck && listing?.parent !== undefined) void loadListing(deck.deckId, listing.parent, listing.path);
   };
+
+  /**
+   * Issue #1240 — Show hidden, on a deck that honours listing options: the
+   * directory on screen is listed again with `.`-named directories included
+   * (or left out), keeping the cursor on the row it was on when that row is
+   * still listed.
+   */
+  const toggleHidden = (next: boolean) => {
+    if (!deck?.listingOptions || busy) return;
+    setShowHidden(next);
+    browse.current = { ...browse.current, showHidden: next };
+    const current = rows[cursor];
+    if (listing) void loadListing(deck.deckId, listing.path, current?.kind === "entry" ? current.entry.path : undefined);
+  };
+
+  /*
+    Issue #1240 — past the cap. When the deck's cap truncated the listing on
+    screen, the filter cannot find a directory the listing never received, so
+    once typing pauses the deck is asked to search the same directory for it:
+    the deck applies the filter BEFORE its cap, and its answer replaces the
+    listing's entries while that filter and that directory stay on screen. A
+    listing that was not truncated is complete, so the filter keeps narrowing
+    it here with no round trip. A deck without listing options is never asked.
+  */
+  useEffect(() => {
+    if (!deck?.listingOptions || !listing?.truncated || filter === "") return;
+    if (searched && searched.path === listing.path && searched.filter === filter) return;
+    const seq = ++searchSeq.current;
+    const deckId = deck.deckId;
+    const path = listing.path;
+    const wanted = filter;
+    const timer = setTimeout(() => {
+      void (async () => {
+        try {
+          const options = directoryListingOptions(true, browse.current.showHidden, wanted);
+          const reply = await runtime.listDirectories(deckId, path, options);
+          if (seq !== searchSeq.current || reply.kind !== "listing") return;
+          for (const entry of reply.entries) projectMarks.current.set(entry.path, entry.isProject);
+          setSearchError(undefined);
+          setSearched({ path, filter: wanted, listing: reply });
+          setCursor((current) => Math.min(current, reply.entries.length + (listing.parent === undefined ? 0 : 1)));
+        } catch (cause) {
+          if (seq !== searchSeq.current) return;
+          const message = messageOf(cause);
+          if (isDeckGoneError(message)) deckGone(message);
+          else setSearchError(message);
+        }
+      })();
+    }, DECK_SEARCH_DEBOUNCE_MS);
+    return () => clearTimeout(timer);
+  }, [deck, deckGone, filter, listing, runtime, searched]);
+  /** A search is on its way: the filter is on a truncated listing and the deck has not answered for it yet. */
+  const searching = deck?.listingOptions === true && listing?.truncated === true && filter !== "" && searchedHere === undefined && searchError === undefined;
 
   /**
    * PRD #1223 — the directory browser by voice. Each move calls the function
@@ -1335,6 +1430,13 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
         event.preventDefault();
         filterRef.current?.focus();
         return;
+      case ".":
+        // Issue #1240: Show hidden, from the list, where the TUI picker's
+        // other keys live — only on a deck that can show them.
+        if (!deck?.listingOptions) return;
+        event.preventDefault();
+        toggleHidden(!showHidden);
+        return;
       case "q":
         // Only here, in the browser's list: typed into Name, Command or the
         // filter, `q` is a letter.
@@ -1471,10 +1573,17 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
               autoCorrect="off"
               onChange={(event) => {
                 setFilter(event.target.value);
+                setSearchError(undefined);
                 setCursor(0);
               }}
               onKeyDown={onFilterKeyDown}
             />
+            {deck?.listingOptions && (
+              <label className="new-agent-toggle">
+                <input type="checkbox" data-testid="new-agent-show-hidden" checked={showHidden} disabled={busy} onChange={(event) => toggleHidden(event.target.checked)} />
+                Show hidden
+              </label>
+            )}
           </div>
           <ul
             ref={directoryListRef}
@@ -1509,15 +1618,20 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
                       {row.entry.isProject ? <FolderGit2 size={13} aria-hidden="true" /> : <Folder size={13} aria-hidden="true" />}
                       <span className="new-agent-row-name">{displayText(row.entry.displayName, DISPLAY_LIMITS.name)}</span>
                       {row.entry.isProject && <span className="new-agent-row-tag" data-testid="new-agent-project-mark">project</span>}
+                      {row.entry.isSymlink && <span className="new-agent-row-tag" data-testid="new-agent-link-mark" title="A symbolic link: opening it lists the directory it leads to">link</span>}
                     </>
                   )}
               </li>
             ))}
           </ul>
           {noSubdirectories && <p className="new-agent-hint">No subdirectories. Enter or Space uses this directory.</p>}
-          {listing.truncated && <p className="new-agent-hint" data-testid="new-agent-truncated">Not every subdirectory is listed: the deck stopped at its limit, and the ones past it cannot be chosen here.</p>}
+          {searching && <p className="new-agent-hint" data-testid="new-agent-searching"><Loader2 className="spin" size={12} /> Searching the deck…</p>}
+          {searchError && <p className="new-agent-error" role="alert" data-testid="new-agent-search-error">{displayText(searchError, DISPLAY_LIMITS.message)}</p>}
+          {searchedHere
+            ? searchedHere.truncated && <p className="new-agent-hint" data-testid="new-agent-truncated">{SEARCH_TRUNCATED}</p>
+            : listing.truncated && <p className="new-agent-hint" data-testid="new-agent-truncated">{deck?.listingOptions ? TRUNCATED_SEARCHABLE : TRUNCATED_NO_SEARCH}</p>}
           <div className="new-agent-current">
-            <p className="new-agent-keys">j/k move · l or Enter opens · h or Backspace goes up · Space uses this directory · / filters · q closes</p>
+            <p className="new-agent-keys">j/k move · l or Enter opens · h or Backspace goes up · Space uses this directory · / filters{deck?.listingOptions ? " · . shows hidden" : ""} · q closes</p>
             <button type="button" className="button secondary" data-testid="new-agent-use-directory" disabled={busy} onClick={confirmCurrent}><Check size={14} /> Use this directory</button>
           </div>
         </>

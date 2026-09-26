@@ -54,6 +54,9 @@ pub(crate) struct HandshakeInfo {
     /// Why the New agent flow cannot start anything on this deck, or `None`
     /// when it can (PRD #1223) — see [`new_agent_reason`].
     pub(crate) new_agent_reason: Option<String>,
+    /// Whether the deck honours the directory browser's listing options
+    /// (issue #1240) — see [`listing_options`].
+    pub(crate) listing_options: bool,
 }
 
 /// An established link to one deck: the handshake that classified it, and a
@@ -690,6 +693,20 @@ fn new_agent_reason(response: &AttachResponse) -> Option<String> {
     ))
 }
 
+/// Whether this deck advertises [`CAP_LIST_DIRECTORIES_OPTIONS`] (issue #1240),
+/// so the New agent flow's directory browser may offer its Show hidden control,
+/// list symlinked directories and send its filter to the deck. Read from the
+/// same `Hello` capture as [`new_agent_reason`]. `false` only narrows the
+/// browser to the PRD #1223 listing; the crate's client withholds the options
+/// from such a deck anyway, so this decides what the dialog OFFERS, not what
+/// is safe to send.
+///
+/// [`CAP_LIST_DIRECTORIES_OPTIONS`]: dot_agent_deck::daemon_protocol::CAP_LIST_DIRECTORIES_OPTIONS
+fn listing_options(response: &AttachResponse) -> bool {
+    dot_agent_deck::daemon_client::DaemonCapabilities::from_hello(response)
+        .supports(dot_agent_deck::daemon_protocol::CAP_LIST_DIRECTORIES_OPTIONS)
+}
+
 /// Whether the build-stamp comparison is being relaxed, and by what.
 ///
 /// The handshake refuses a daemon whose git-describe stamp differs from the
@@ -903,6 +920,7 @@ fn classify_handshake(
             .then(|| project_actions_reason(response))
             .flatten(),
         new_agent_reason: response.ok.then(|| new_agent_reason(response)).flatten(),
+        listing_options: response.ok && listing_options(response),
     }
 }
 
@@ -956,6 +974,7 @@ fn connection_from_handshake(endpoint: &Endpoint, handshake: HandshakeInfo) -> D
         build_stamp_mismatch_only: handshake.build_stamp_mismatch_only,
         project_actions_reason: handshake.project_actions_reason,
         new_agent_reason: handshake.new_agent_reason,
+        listing_options: handshake.listing_options,
     }
 }
 
@@ -1942,6 +1961,40 @@ mod tests {
         );
     }
 
+    /// Issue #1240: the connection says whether the deck honours the
+    /// directory browser's listing options, from what its `Hello` advertised —
+    /// so a deck at the release before them is browsed exactly as before, and
+    /// a failed handshake offers nothing.
+    #[test]
+    fn the_connection_says_whether_the_deck_honours_listing_options() {
+        use dot_agent_deck::daemon_protocol::{CAP_LIST_DIRECTORIES, CAP_LIST_DIRECTORIES_OPTIONS};
+        let _guard = AllowanceGuard::acquire();
+        let classify = |capabilities: &[&str]| {
+            let mut hello = AttachResponse::hello(PROTOCOL_VERSION);
+            hello.capabilities = Some(capabilities.iter().map(|cap| cap.to_string()).collect());
+            classify_handshake(
+                &hello,
+                hello.build_version.as_deref().unwrap(),
+                BuildMismatchAllowance::Refuse,
+            )
+            .listing_options
+        };
+        assert!(classify(&[
+            CAP_LIST_DIRECTORIES,
+            CAP_LIST_DIRECTORIES_OPTIONS
+        ]));
+        assert!(!classify(&[CAP_LIST_DIRECTORIES]));
+        let bare = AttachResponse::hello(PROTOCOL_VERSION);
+        assert!(
+            !classify_handshake(
+                &bare,
+                bare.build_version.as_deref().unwrap(),
+                BuildMismatchAllowance::Refuse,
+            )
+            .listing_options
+        );
+    }
+
     /// A PARTIAL set is withheld too, and names only what is absent.
     ///
     /// The four verbs are one flow. A daemon with three of them can get a user
@@ -2848,6 +2901,7 @@ mod tests {
                     build_stamp_mismatch_only: false,
                     project_actions_reason: None,
                     new_agent_reason: None,
+                    listing_options: false,
                 },
             ),
             _transport: tokio::runtime::Runtime::new()
@@ -5252,18 +5306,26 @@ mod tests {
         let local_wire = deck_wire_id(&local.endpoint);
         let tree_text = tree.to_str().expect("a UTF-8 fixture path").to_string();
 
-        let listing =
-            crate::list_directories_on(&state, &remote_wire, Some(tree_text.clone())).await;
+        let listing = crate::list_directories_on(
+            &state,
+            &remote_wire,
+            Some(tree_text.clone()),
+            Default::default(),
+        )
+        .await;
         let options = crate::new_agent_options_on(&state, &remote_wire).await;
         let missing = crate::list_directories_on(
             &state,
             &remote_wire,
             Some(format!("{tree_text}/no-such-directory")),
+            Default::default(),
         )
         .await;
-        let from_local = crate::list_directories_on(&state, &local_wire, None).await;
+        let from_local =
+            crate::list_directories_on(&state, &local_wire, None, Default::default()).await;
         let unknown_listing =
-            crate::list_directories_on(&state, "deck-ffffffffffffffff", None).await;
+            crate::list_directories_on(&state, "deck-ffffffffffffffff", None, Default::default())
+                .await;
         let unknown_options = crate::new_agent_options_on(&state, "deck-ffffffffffffffff").await;
 
         local.shutdown();
@@ -5372,13 +5434,17 @@ mod tests {
         let local_wire = deck_wire_id(&local.endpoint);
 
         let started = crate::start_agent_action(&state, &local_wire, plain_start("m4-last")).await;
-        let listing = crate::list_directories_on(&state, &older_wire, None).await;
-        let typed = crate::list_directories_on(&state, &older_wire, Some("/".into())).await;
+        let listing =
+            crate::list_directories_on(&state, &older_wire, None, Default::default()).await;
+        let typed =
+            crate::list_directories_on(&state, &older_wire, Some("/".into()), Default::default())
+                .await;
         let options = crate::new_agent_options_on(&state, &older_wire).await;
         let local_listing = crate::list_directories_on(
             &state,
             &local_wire,
             Some(tree.to_str().expect("UTF-8").to_string()),
+            Default::default(),
         )
         .await;
         let local_options = crate::new_agent_options_on(&state, &local_wire).await;
@@ -5434,6 +5500,143 @@ mod tests {
             }
             other => panic!("the local deck supports the query, got {other:?}"),
         }
+    }
+
+    /// Scenario: issue #1240's listing options, aimed under **All Decks** at a
+    /// remote row that is a current real daemon. Show hidden plus symlinks
+    /// lists the fixture's hidden directory and its symlink — by the link's
+    /// canonical target, marked — beside the ordinary two, and a filter keeps
+    /// only the names that match it, case-insensitively.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn listing_options_are_honoured_by_a_deck_that_advertises_them() {
+        let _selection = crate::dto::SELECTION_LOCK.lock().await;
+        let local = RealDeck::start("i1240-local");
+        let remote = RealDeck::start("i1240-remote");
+        let tree = listing_tree(&remote.dir);
+        let outside = remote.dir.join("outside");
+        std::fs::create_dir_all(&outside).expect("create the link's target");
+        let outside = std::fs::canonicalize(&outside).expect("canonicalize the link's target");
+        std::os::unix::fs::symlink(&outside, tree.join("link")).expect("create the symlink");
+        let (settings, remote_endpoint) = all_decks_with_one_remote_row("build-box.example.com");
+        apply_all_decks_over(&local, &settings);
+        let state = crate::terminal::DesktopState::default();
+        state
+            .tunnels
+            .insert_route(
+                &remote_endpoint,
+                remote.endpoint.as_local().expect("local socket").path(),
+            )
+            .await;
+        let remote_wire = deck_wire_id(&remote_endpoint);
+        let tree_text = tree.to_str().expect("a UTF-8 fixture path").to_string();
+
+        let widened = crate::list_directories_on(
+            &state,
+            &remote_wire,
+            Some(tree_text.clone()),
+            crate::dto::DesktopListingOptions {
+                include_hidden: true,
+                include_symlinks: true,
+                filter: None,
+            },
+        )
+        .await;
+        let filtered = crate::list_directories_on(
+            &state,
+            &remote_wire,
+            Some(tree_text.clone()),
+            crate::dto::DesktopListingOptions {
+                filter: Some("ALP".into()),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        local.shutdown();
+        remote.shutdown();
+
+        let entries = |listing: Result<crate::dto::DesktopDirectoryListing, String>| match listing
+            .expect("the current deck lists")
+        {
+            crate::dto::DesktopDirectoryListing::Listing { entries, .. } => entries
+                .into_iter()
+                .map(|entry| (entry.display_name, entry.path, entry.is_symlink))
+                .collect::<Vec<_>>(),
+            other => panic!("the current deck supports the verb, got {other:?}"),
+        };
+        assert_eq!(
+            entries(widened),
+            vec![
+                (".hidden".to_string(), format!("{tree_text}/.hidden"), false),
+                ("alpha".to_string(), format!("{tree_text}/alpha"), false),
+                ("beta".to_string(), format!("{tree_text}/beta"), false),
+                (
+                    "link".to_string(),
+                    outside.to_str().expect("UTF-8").to_string(),
+                    true
+                ),
+            ],
+            "hidden and symlinked directories, the link by its target"
+        );
+        assert_eq!(
+            entries(filtered),
+            vec![("alpha".to_string(), format!("{tree_text}/alpha"), false)],
+            "the deck applied the filter"
+        );
+    }
+
+    /// Scenario: under **All Decks**, the remote row is a deck from the release
+    /// before issue #1240 — it lists directories but does not advertise
+    /// `list-directories-options`. Listing options aimed at it are refused in
+    /// the dialog's own sentence, rather than read as a deck that cannot list
+    /// at all, and nothing reaches that deck, which would have dropped them and
+    /// answered an unfiltered listing.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn listing_options_are_not_sent_to_a_deck_that_does_not_advertise_them() {
+        use dot_agent_deck::daemon_protocol::CAP_LIST_DIRECTORIES_OPTIONS;
+        let _selection = crate::dto::SELECTION_LOCK.lock().await;
+        let local = RealDeck::start("i1240-old-local");
+        let older = OlderDeck::withholding("i1240-old-remote", &[CAP_LIST_DIRECTORIES_OPTIONS]);
+        let (settings, remote_endpoint) = all_decks_with_one_remote_row("old-box.example.com");
+        apply_all_decks_over(&local, &settings);
+        let state = crate::terminal::DesktopState::default();
+        state
+            .tunnels
+            .insert_route(&remote_endpoint, &older.socket)
+            .await;
+        let older_wire = deck_wire_id(&remote_endpoint);
+
+        let mut outcomes = Vec::new();
+        for options in [
+            crate::dto::DesktopListingOptions {
+                include_hidden: true,
+                ..Default::default()
+            },
+            crate::dto::DesktopListingOptions {
+                include_symlinks: true,
+                ..Default::default()
+            },
+            crate::dto::DesktopListingOptions {
+                filter: Some("needle".into()),
+                ..Default::default()
+            },
+        ] {
+            outcomes.push(crate::list_directories_on(&state, &older_wire, None, options).await);
+        }
+        let refused = older.refused.load(Ordering::SeqCst);
+
+        local.shutdown();
+        older.shutdown();
+
+        for outcome in outcomes {
+            assert_eq!(
+                outcome.expect_err("options a deck cannot honour are refused"),
+                crate::LISTING_OPTIONS_UNSUPPORTED
+            );
+        }
+        assert_eq!(refused, 0, "nothing was sent to the older deck");
     }
 
     // -----------------------------------------------------------------------

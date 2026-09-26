@@ -536,6 +536,25 @@ describe("TauriDeckBridge", () => {
   });
 
   /**
+   * Scenario (issue #1240): a listing with options reaches the crate with them
+   * under `options`, verbatim; the same listing without options carries no
+   * `options` key at all, which is the PRD #1223 invoke.
+   */
+  it("forwards listing options only when given", async () => {
+    const { TauriDeckBridge } = await import("./bridge");
+    const bridge = new TauriDeckBridge();
+    const listing = { kind: "listing", path: "/srv", displayPath: "/srv", entries: [], truncated: false };
+    invoke.mockResolvedValue(listing);
+
+    await bridge.listDirectories("deck-00000000000b0x01", "/srv", { includeHidden: true, includeSymlinks: true, filter: "work" });
+    await bridge.listDirectories("deck-00000000000b0x01", "/srv");
+
+    expect(invoke).toHaveBeenNthCalledWith(1, "desktop_list_directories", { deckId: "deck-00000000000b0x01", path: "/srv", options: { includeHidden: true, includeSymlinks: true, filter: "work" } });
+    expect(invoke).toHaveBeenNthCalledWith(2, "desktop_list_directories", { deckId: "deck-00000000000b0x01", path: "/srv" });
+    await bridge.dispose();
+  });
+
+  /**
    * Scenario: an action the crate answers with no agent id, and one where a
    * malformed value sits in that field. Neither result carries an `agentId`,
    * so a caller never reads a non-string as the agent to open.
@@ -1131,6 +1150,14 @@ describe("FixtureDeckBridge scenarios", () => {
     const scratch = await bridge.listDirectories(FIXTURE_REMOTE_DAEMON_ID, "/home/build/scratch/");
     expect(scratch).toMatchObject({ kind: "listing", path: "/home/build/scratch", parent: "/home/build" });
     expect(await bridge.listDirectories(FIXTURE_REMOTE_DAEMON_ID, "/home/build/scratch/notes")).toMatchObject({ entries: [] });
+    // Issue #1240: `notes` holds a hidden directory and a symlink, listed only when asked for.
+    const widened = await bridge.listDirectories(FIXTURE_REMOTE_DAEMON_ID, "/home/build/scratch/notes", { includeHidden: true, includeSymlinks: true });
+    expect(widened.kind === "listing" && widened.entries).toEqual([
+      { path: "/home/build/scratch/notes/.drafts", displayName: ".drafts", isProject: false },
+      { path: "/home/build/demo-project", displayName: "latest", isProject: true, isSymlink: true },
+    ]);
+    const filtered = await bridge.listDirectories(FIXTURE_REMOTE_DAEMON_ID, "/home/build/scratch/notes", { includeHidden: true, includeSymlinks: true, filter: "LAT" });
+    expect(filtered.kind === "listing" && filtered.entries.map((entry) => entry.displayName)).toEqual(["latest"]);
     const root = await bridge.listDirectories(FIXTURE_REMOTE_DAEMON_ID, "/");
     expect(root).not.toHaveProperty("parent");
 

@@ -332,11 +332,207 @@ fn newagent_browse_003_omits_children_with_unsafe_authoring_paths() {
     );
 }
 
+/// Scenario: List a fixture holding a visible directory, a hidden directory
+/// with a project marker and a hidden file, first as PRD #1223 does and then
+/// with `include_hidden`. The first reply omits the hidden directory; the
+/// second lists it in sort order with its marker, and never the file.
+#[spec("newagent/browse/004")]
+#[test]
+fn newagent_browse_004_lists_hidden_directories_only_when_asked() {
+    let fixture = common::harness_tempdir().expect("mint hidden-directory fixture");
+    let root = fixture.path().join("browse-hidden");
+    std::fs::create_dir_all(root.join("visible")).expect("create visible child");
+    std::fs::create_dir_all(root.join(".config")).expect("create hidden child");
+    std::fs::write(root.join(".config").join(".dot-agent-deck.toml"), "")
+        .expect("mark the hidden child as a project");
+    std::fs::write(root.join(".hidden-file"), "not a directory").expect("create hidden file");
+    let daemon = common::spawn_daemon_serve_with_env(None, "0", &[]);
+
+    let plain = send_json_request(
+        &daemon,
+        &json!({"op": "list-directories", "path": wire_path(&root)}),
+    );
+    assert_eq!(
+        directory_listing(&plain).get("entries"),
+        Some(&json!([{
+            "name": "visible",
+            "path": wire_path(&canonical(&root.join("visible"))),
+            "is_project": false,
+        }])),
+        "without the option a hidden directory is not listed"
+    );
+
+    let hidden = send_json_request(
+        &daemon,
+        &json!({"op": "list-directories", "path": wire_path(&root), "include_hidden": true}),
+    );
+    assert_eq!(
+        directory_listing(&hidden).get("entries"),
+        Some(&json!([
+            {
+                "name": ".config",
+                "path": wire_path(&canonical(&root.join(".config"))),
+                "is_project": true,
+            },
+            {
+                "name": "visible",
+                "path": wire_path(&canonical(&root.join("visible"))),
+                "is_project": false,
+            },
+        ])),
+        "with the option the hidden directory is listed, and the hidden file still is not"
+    );
+}
+
+/// Scenario: List a fixture holding a real directory, a symlink to a
+/// directory elsewhere, a dangling symlink and a symlink to a file, first as
+/// PRD #1223 does and then with `include_symlinks`. The second reply lists the
+/// directory symlink by its canonical target, marked `is_symlink`, and a
+/// listing of that path lists the target; the other two links never appear.
+#[spec("newagent/browse/005")]
+#[test]
+fn newagent_browse_005_lists_symlinked_directories_by_target_when_asked() {
+    let fixture = common::harness_tempdir().expect("mint symlinked-directory fixture");
+    let root = fixture.path().join("browse-links");
+    let target = fixture.path().join("elsewhere").join("target");
+    std::fs::create_dir_all(root.join("real")).expect("create real child");
+    std::fs::create_dir_all(target.join("inside")).expect("create the link target");
+    std::os::unix::fs::symlink(&target, root.join("linked")).expect("create directory symlink");
+    std::os::unix::fs::symlink(root.join("gone"), root.join("dangling"))
+        .expect("create dangling symlink");
+    std::fs::write(root.join("file.txt"), "a file").expect("create file");
+    std::os::unix::fs::symlink(root.join("file.txt"), root.join("to-a-file"))
+        .expect("create file symlink");
+    let daemon = common::spawn_daemon_serve_with_env(None, "0", &[]);
+
+    let plain = send_json_request(
+        &daemon,
+        &json!({"op": "list-directories", "path": wire_path(&root)}),
+    );
+    assert_eq!(
+        directory_listing(&plain)
+            .get("entries")
+            .and_then(Value::as_array)
+            .map(Vec::len),
+        Some(1),
+        "without the option only the real directory is listed; response: {plain}"
+    );
+
+    let links = send_json_request(
+        &daemon,
+        &json!({"op": "list-directories", "path": wire_path(&root), "include_symlinks": true}),
+    );
+    let target_wire = wire_path(&canonical(&target));
+    assert_eq!(
+        directory_listing(&links).get("entries"),
+        Some(&json!([
+            {
+                "name": "linked",
+                "path": target_wire,
+                "is_project": false,
+                "is_symlink": true,
+            },
+            {
+                "name": "real",
+                "path": wire_path(&canonical(&root.join("real"))),
+                "is_project": false,
+            },
+        ])),
+        "the directory symlink is listed by its canonical target; the dangling and file links are not"
+    );
+
+    let entered = send_json_request(
+        &daemon,
+        &json!({"op": "list-directories", "path": target_wire}),
+    );
+    let entered = directory_listing(&entered);
+    assert_eq!(
+        entered.get("path").and_then(Value::as_str),
+        Some(target_wire.as_str())
+    );
+    assert_eq!(
+        entered
+            .get("entries")
+            .and_then(Value::as_array)
+            .and_then(|entries| entries.first())
+            .and_then(|entry| entry.get("name"))
+            .and_then(Value::as_str),
+        Some("inside"),
+        "the listed path is one the daemon accepts back, listing the target"
+    );
+}
+
+/// Scenario: List a fixture holding more directories than the production cap
+/// plus one whose name sorts after all of them. The plain listing is truncated
+/// and omits it; the same listing with a `filter` naming it — in another case —
+/// returns it, untruncated, and a filter that is too long or carries a path
+/// separator is refused.
+#[spec("newagent/browse/006")]
+#[test]
+fn newagent_browse_006_filters_before_the_cap() {
+    let fixture = common::harness_tempdir().expect("mint crowded fixture");
+    let crowded = fixture.path().join("crowded");
+    std::fs::create_dir_all(&crowded).expect("create crowded root");
+    for index in 0..MAX_DIRECTORY_ENTRIES + 5 {
+        std::fs::create_dir(crowded.join(format!("entry-{index:04}")))
+            .unwrap_or_else(|e| panic!("create cap fixture directory {index}: {e}"));
+    }
+    let wanted = crowded.join("zz-past-the-cap");
+    std::fs::create_dir(&wanted).expect("create the directory past the cap");
+    let daemon = common::spawn_daemon_serve_with_env(None, "0", &[]);
+
+    let plain = send_json_request(
+        &daemon,
+        &json!({"op": "list-directories", "path": wire_path(&crowded)}),
+    );
+    let plain = directory_listing(&plain);
+    assert_eq!(plain.get("truncated").and_then(Value::as_bool), Some(true));
+    assert!(
+        !plain
+            .get("entries")
+            .and_then(Value::as_array)
+            .expect("entries")
+            .iter()
+            .any(|entry| entry.get("name").and_then(Value::as_str) == Some("zz-past-the-cap")),
+        "fixture: the wanted directory sorts past the cap"
+    );
+
+    let filtered = send_json_request(
+        &daemon,
+        &json!({"op": "list-directories", "path": wire_path(&crowded), "filter": "PAST-THE"}),
+    );
+    let filtered = directory_listing(&filtered);
+    assert_eq!(
+        filtered.get("entries"),
+        Some(&json!([{
+            "name": "zz-past-the-cap",
+            "path": wire_path(&canonical(&wanted)),
+            "is_project": false,
+        }])),
+        "the filter is applied before the cap, case-insensitively"
+    );
+    assert_eq!(
+        filtered.get("truncated").and_then(Value::as_bool),
+        Some(false)
+    );
+
+    for (case, filter) in [
+        ("a path separator", "a/b".to_string()),
+        ("an over-long filter", "x".repeat(256)),
+    ] {
+        let refusal = send_json_request(
+            &daemon,
+            &json!({"op": "list-directories", "path": wire_path(&crowded), "filter": filter}),
+        );
+        assert_directory_refusal(&refusal, case);
+    }
+}
+
 /// Scenario: Launch one daemon with the experimental flag absent and one with
 /// it enabled, both pointed at a host-side DashboardConfig carrying a distinct
 /// default command. Each options reply must mirror that daemon and the compiled
 /// registry in order, carry an authoring-kinds string array, and the handshake
-/// must advertise both new query capabilities.
+/// must advertise both new query capabilities and the listing options.
 #[spec("newagent/options/001")]
 #[test]
 fn newagent_options_001_reports_host_config_registry_features_and_capabilities() {
@@ -381,7 +577,11 @@ fn newagent_options_001_reports_host_config_registry_features_and_capabilities()
     let capabilities = successful_payload(&hello, "capabilities", "Hello")
         .as_array()
         .expect("Hello capabilities must be an array");
-    for capability in ["list-directories", "new-agent-options"] {
+    for capability in [
+        "list-directories",
+        "list-directories-options",
+        "new-agent-options",
+    ] {
         assert!(
             capabilities.iter().any(|value| value == capability),
             "the live daemon handshake must advertise {capability:?}; capabilities: {capabilities:?}"
