@@ -5660,9 +5660,12 @@ async fn dispatch_one_owned(
                             pane_id = %pane_id,
                             timeout_secs = SESSION_START_WAIT_TIMEOUT.as_secs(),
                             "delegate: waited the full readiness timeout for a worker whose \
-                             agent the deck cannot identify from its command; declare it with \
+                             agent the deck cannot identify — its command names no agent the \
+                             deck recognizes and the role declares none, or its `agent` \
+                             declaration names an unknown agent; declare or correct \
                              `agent = \"…\"` on the role in .dot-agent-deck.toml so the \
-                             agent's own readiness path applies (issue #1243)"
+                             agent's own readiness path applies (`dot-agent-deck validate` \
+                             names which; issue #1243)"
                         );
                     }
                 }
