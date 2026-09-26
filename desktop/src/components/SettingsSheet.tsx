@@ -36,7 +36,7 @@ interface SettingsSheetProps {
   open: boolean;
   onClose: () => void;
   settings: DesktopSettingsDto;
-  onSave: (next: DesktopSettingsDto) => void;
+  onSave: (next: DesktopSettingsDto, from?: DesktopSettingsDto) => void;
   saveError?: string;
   /** Where the document lives; absent in the browser preview and if the read failed. */
   path?: string;

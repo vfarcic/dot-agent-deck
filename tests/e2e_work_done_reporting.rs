@@ -301,3 +301,144 @@ fn work_done_004_unsolicited_completion_is_visibly_labelled_in_the_attached_tui(
         summary_path.display()
     );
 }
+
+/// The saved full report a cut-report notice names, resolved the way its
+/// recipient would. The daemon spells out the absolute path only when every
+/// character of it is inert; a path with whitespace (a temp root the harness
+/// may be pointed at) is named by its daemon-minted file name plus "in the
+/// .dot-agent-deck directory of …" instead (PR #1341 review), so both forms are
+/// accepted — and an absolute path must lie under `context_dir`.
+fn named_report_path(notice: &str, context_dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    let after = notice.split_once("the full report is saved at ")?.1;
+    let token: String = after.chars().take_while(|c| !c.is_whitespace()).collect();
+    let path = std::path::PathBuf::from(&token);
+    if path.is_absolute() {
+        return path.starts_with(context_dir).then_some(path);
+    }
+    after[token.len()..]
+        .starts_with(" in the .dot-agent-deck directory of")
+        .then(|| context_dir.join(&token))
+}
+
+/// Issue #508: the opening and closing of a report too long to inline. The
+/// head is inlined; the tail sits past the 4000-character bound, so it can only
+/// be recovered from the file the feedback names.
+const LONG_HEAD: &str = "e2e-long-report-head-51a9";
+const LONG_TAIL: &str = "e2e-long-report-tail-past-the-bound-8c2e";
+
+/// The sentence the daemon ends a cut report with when it saved the rest.
+const SAVED_NEEDLE: &str = "the full report is saved at";
+
+/// A multi-line markdown report far past the inline bound.
+fn long_report() -> String {
+    let findings = (0..120)
+        .map(|i| format!("- finding {i}: the quick brown fox jumps over the lazy dog"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("{LONG_HEAD}\n\n## Findings\n\n{findings}\n\n{LONG_TAIL}\n")
+}
+
+/// Scenario: Launch the real TUI and its lazy daemon, open the two-role `orch-deck` fixture, and have the REAL `dot-agent-deck work-done --task-file` binary report, from the undelegated `worker` pane, a multi-line report far past the 4000-character inline bound. The orchestrator's pane must visibly end the cut report by saying where the full report is saved, and that file — a fresh one in the fixture's `.dot-agent-deck/` — must hold the whole report, lines intact, between the untrusted-report marker lines.
+#[spec("orchestration/work-done/009")]
+#[test]
+fn work_done_009_cut_report_names_its_saved_full_copy_in_the_attached_tui() {
+    let deck = TuiDeck::builder()
+        .impersonating_pane_signals()
+        .with_pty_size(120, 40)
+        .with_env("DOT_AGENT_DECK_WORKER_RESPONSE_TIMEOUT_MS", "0")
+        .with_env("DOT_AGENT_DECK_DELEGATE_NO_EVENT_WINDOW_MS", "0")
+        .launch_with_fixture("orch-deck");
+    deck.wait_for_string("No active sessions");
+    // The orchestrator is a RAW, no-echo `cat` here, not the fixture's plain
+    // one. A canonical-mode tty hands `cat` at most 4095 bytes of one line, so
+    // a plain `cat` echoes the whole feedback and then reprints a copy cut
+    // around the 4000-character mark. That copy scrolls the closing notice off
+    // the pane: measured on CI run 36241233852, where the grid ended mid-report,
+    // and absent from the passing runs only by timing. It is an artefact of the
+    // stand-in's line discipline; a real agent reads its input raw, which is
+    // what this stand-in now does (as `tests/work_done_reporting.rs` does).
+    std::fs::write(
+        deck.workdir().join(".dot-agent-deck.toml"),
+        "[[orchestrations]]\nname = \"demo-orch\"\n\n\
+         [[orchestrations.roles]]\nname = \"orchestrator\"\n\
+         command = \"stty -echo -icanon -icrnl -opost min 1 time 0 && exec cat -u\"\n\
+         start = true\n\n\
+         [[orchestrations.roles]]\nname = \"worker\"\ncommand = \"cat\"\n",
+    )
+    .expect("make the orchestrator role a raw, no-echo cat");
+    open_orchestration(&deck);
+    deck.wait_for_string(WORKER_ROLE);
+    let (worker_pane, orchestrator_agent) = orchestration_ids(&deck);
+
+    // The footer's own delivery route: the report goes in a file and the CLI
+    // reads it verbatim, so its line structure reaches the daemon intact.
+    let report = long_report();
+    let report_file = deck.workdir().join("e2e-long-report.md");
+    std::fs::write(&report_file, &report).expect("write the report file");
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"))
+        .arg("work-done")
+        .arg("--task-file")
+        .arg(&report_file)
+        .env("DOT_AGENT_DECK_SOCKET", deck.hook_socket_path())
+        .env("DOT_AGENT_DECK_PANE_ID", &worker_pane)
+        .env("HOME", deck.home_dir())
+        .current_dir(deck.workdir())
+        .output()
+        .expect("run the real `dot-agent-deck work-done` CLI");
+    assert!(
+        output.status.success(),
+        "`work-done` exited {:?}\nstdout: {}\nstderr: {}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Daemon first: the feedback it wrote into the orchestrator's PTY, which is
+    // also where the path is read from — the recipient only knows what it was told.
+    let wrote = common::wait_until(Duration::from_secs(20), || {
+        orchestrator_pty(&deck, &orchestrator_agent).contains(SAVED_NEEDLE)
+    });
+    let pty = orchestrator_pty(&deck, &orchestrator_agent);
+    assert!(
+        wrote,
+        "the daemon never told the orchestrator where the rest of a cut report is — past the \
+         4000-character bound it is unrecoverable\nOrchestrator PTY:\n{pty}"
+    );
+    assert!(
+        pty.contains(LONG_HEAD) && !pty.contains(LONG_TAIL),
+        "control: the report's opening must be inlined and its tail cut\nOrchestrator PTY:\n{pty}"
+    );
+    let dir = deck.workdir().join(".dot-agent-deck");
+    let named = named_report_path(&pty, &dir)
+        .unwrap_or_else(|| panic!("the feedback names no saved report under {dir:?}\nPTY:\n{pty}"));
+    let saved = std::fs::read_to_string(&named)
+        .unwrap_or_else(|error| panic!("read the named report file {named:?}: {error}"));
+    let lines: Vec<&str> = saved.lines().collect();
+    assert_eq!(
+        lines.first().copied(),
+        Some(REPORT_FRAME_NEEDLE),
+        "{saved:?}"
+    );
+    assert_eq!(
+        lines.last().copied(),
+        Some(":END-UNTRUSTED-WORKER-REPORT]"),
+        "{saved:?}"
+    );
+    assert!(
+        saved.contains(&report),
+        "the saved file must hold the whole report verbatim, lines intact: {saved:?}"
+    );
+
+    // Then the screen: the notice closes the message, so it is what a user sees
+    // at the bottom of the orchestrator pane however far the report scrolled.
+    assert!(
+        wait_for_pane_string(
+            &deck,
+            SAVED_NEEDLE,
+            common::load_scaled(Duration::from_secs(20))
+        ),
+        "the saved-report notice reached the orchestrator's PTY but never became visible in the \
+         rendered orchestration surface\nFinal grid:\n{}",
+        deck.snapshot_grid()
+    );
+}

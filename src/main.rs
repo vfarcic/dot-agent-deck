@@ -120,6 +120,29 @@ enum Commands {
     },
     /// Create a git worktree and start an isolated line of work inside it.
     /// Agent-callable, one step (PRD #220).
+    ///
+    /// Exit status when starting a unit: 0 means the daemon admitted the
+    /// request, or gave no answer this build can check (an older daemon, or
+    /// none within 5 seconds). It does not mean the worktree was created, that
+    /// the unit started, or that its task reached the agent: the daemon answers
+    /// before it does any of that work. Non-zero means the request did not get
+    /// that far: no daemon was reachable, the daemon refused it (the reason is
+    /// printed), or the command line itself was unusable.
+    ///
+    /// What happened arrives afterwards, typed into this pane: first the
+    /// daemon's reply to the dispatch, beginning `dispatch:`. A reply beginning
+    /// `dispatch: spawned isolated` names what was started and where; a reply
+    /// with any other opening is a failure and says why. A spawned unit has
+    /// still not been confirmed to have received its task. The report it sends
+    /// later, when it finishes, beginning `dispatch: a unit you dispatched has
+    /// completed`, is the first thing delivered to this pane that indicates it
+    /// did — an indication, not proof, since the deck does not tie that report
+    /// to the task's delivery.
+    ///
+    /// With --list-targets the exit status means something else: 0 means the
+    /// listing was printed, and non-zero means no listing could be trusted —
+    /// the daemon did not answer, or could not read this repo's config or this
+    /// pane's directory. The reason is printed.
     Dispatch {
         /// Short name for the dispatch unit (used for worktree naming).
         /// Omit it only with --list-targets.
@@ -1676,26 +1699,35 @@ fn main() -> ExitCode {
                 // otherwise. It honors `PI_CODING_AGENT_DIR` (else `~/.pi/agent`),
                 // so it lands where pi will look — see `orchestrator_ext`.
                 dot_agent_deck::orchestrator_ext::auto_materialize(&[]);
-                // PRD #20 §4.2.1: same precedent for Codex — install the deck's
-                // `hooks.json` into the active Codex home and record SCOPED,
-                // hash-pinned trust for exactly those entries, ONCE at daemon
-                // startup. Command-agnostic on purpose: the spawn seam can only
-                // detect a `codex` basename, so a launcher (`devbox run codex-big`,
-                // `run_codex.sh`) previously got no hooks at all. With the home
-                // prepared here, its hook events reach the pane through the
-                // inherited `DOT_AGENT_DECK_PANE_ID` regardless of launch method.
-                // Runs AFTER the login-shell PATH is applied so codex-presence is
-                // detected against the daemon's real PATH. Self-guards on codex
-                // being installed and a resolvable home; a no-op otherwise.
-                dot_agent_deck::codex_hooks_manage::auto_install_and_trust_at_startup();
-                // Same precedent for Devin, which is also a native-hooks agent:
-                // merge the deck's hooks into Devin's user config ONCE at daemon
-                // startup, command-agnostically, so a headless daemon and a
-                // launcher whose basename isn't `devin` are covered too. Runs
-                // AFTER the login-shell PATH is applied so devin-presence is
-                // detected against the daemon's real PATH. Self-guards on devin
-                // being on PATH and a resolvable config dir; a no-op otherwise.
-                dot_agent_deck::devin_hooks_manage::auto_install();
+                // Every shipped agent's startup auto-install, from the same
+                // registry loop `run_tui_session` runs — Claude Code's native
+                // hooks, the OpenCode plugin, Codex's `hooks.json` plus its
+                // SCOPED, hash-pinned trust (PRD #20 §4.2.1), and Devin's hooks.
+                // Each self-guards on its agent being present and is a no-op
+                // otherwise, and each runs AFTER the login-shell PATH is applied
+                // so presence is detected against the daemon's real PATH.
+                //
+                // Codex and Devin ran here explicitly because the spawn seam can
+                // only detect an agent by basename, so a launcher (`devbox run
+                // codex-big`) got no hooks unless the daemon installed them
+                // command-agnostically. Issue #1157 found the same gap one level
+                // up for Claude Code and OpenCode, which only the TUI installed:
+                // the packaged desktop app starts THIS subcommand from its
+                // bundled sidecar and never runs a TUI, so a desktop-only user
+                // got no Claude Code hooks and no OpenCode plugin at all, and
+                // therefore no hook-driven agent status. Running the whole
+                // registry here closes that, and keeps the daemon in step with
+                // the TUI when an agent is added. The TUI still runs the same
+                // loop; every installer is idempotent, and Codex and Devin have
+                // run in both processes since they were added here.
+                {
+                    use dot_agent_deck::agent_registry::ALL;
+                    for spec in ALL {
+                        if let Some(install) = spec.startup_auto_install {
+                            install();
+                        }
+                    }
+                }
                 run_daemon_serve_cli()
             }
             DaemonCmd::Hello => run_daemon_hello_cli(),
@@ -3081,6 +3113,54 @@ mod tests {
             // always names `dispatch`.
             _ => panic!("expected the Dispatch subcommand"),
         }
+    }
+
+    /// Issue #530: `dispatch --help` states what the exit status asserts, and
+    /// quotes the two openings the caller is told to read the outcome from.
+    ///
+    /// The exit status is the provenance gate's acknowledgement — pinned by
+    /// `daemon::hook_ingestion_tests::a_dispatch_its_handler_rejects_is_still_acknowledged_as_accepted`
+    /// — so the help is where a caller learns that exit 0 does not mean a unit
+    /// started. Both quotes are checked against the values the daemon builds its
+    /// messages from, so rewording either message fails here rather than leaving
+    /// the help describing a reply nothing sends.
+    #[test]
+    fn dispatch_help_says_what_its_exit_status_asserts() {
+        let cli = Cli::command();
+        let dispatch = cli
+            .find_subcommand("dispatch")
+            .expect("the dispatch subcommand");
+        let help = dispatch
+            .get_long_about()
+            .expect("dispatch carries a long help")
+            .to_string();
+        // clap re-flows doc-comment text, so every quote is matched with its
+        // whitespace collapsed rather than byte for byte.
+        let flat: String = help.split_whitespace().collect::<Vec<_>>().join(" ");
+        let completed_opening = "dispatch: a unit you dispatched has completed";
+        for (quote, why) in [
+            (
+                "Exit status when starting a unit: 0 means the daemon admitted the request",
+                "what exit 0 asserts",
+            ),
+            (
+                "does not mean the worktree was created",
+                "what exit 0 does NOT assert",
+            ),
+            (
+                dot_agent_deck::dispatch::SPAWNED_OPENING,
+                "the success reply's real opening",
+            ),
+            (completed_opening, "the completion report's opening"),
+        ] {
+            assert!(flat.contains(quote), "the help must state {why}:\n{help}");
+        }
+        let completed =
+            dot_agent_deck::dispatch_return::compose_completion_report("probe", "report", None);
+        assert!(
+            completed.starts_with(completed_opening),
+            "the completion report no longer opens the way the help quotes it: {completed}"
+        );
     }
 
     /// `--orchestration` REQUIRES its value, so it can never consume the unit name.

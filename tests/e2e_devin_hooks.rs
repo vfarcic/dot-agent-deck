@@ -36,6 +36,9 @@ const SENTINEL_NAME: &str = "devin_live_sentinel_4c81de.txt";
 #[spec("devin/live/001")]
 #[test]
 #[cfg(unix)]
+// Quarantined (CLAUDE.md rule 6): #488 reported it red and nobody available has
+// a Devin account to re-triage it. #1348 says how to run it and what lifts it.
+#[ignore = "quarantined: vfarcic, #1348"]
 fn devin_live_001_real_interactive_turn_drives_the_card_live() {
     skip_unless!(common::check_devin_available());
 

@@ -167,6 +167,12 @@ export interface ConnectionView {
    * available.
    */
   newAgentReason?: string;
+  /**
+   * Issue #1240 — the deck honours the directory browser's listing options:
+   * Show hidden, symlinked directories and a filter the deck applies before its
+   * entry cap. Absent or false browses the deck exactly as PRD #1223 did.
+   */
+  listingOptions?: boolean;
   /** True when a daemon answered Hello but failed protocol/build compatibility. */
   daemonDetected?: boolean;
   /** Honest count reported by Hello; undefined when the daemon could not report it. */
@@ -289,6 +295,26 @@ export interface DeckDirectoryEntry {
   displayName: string;
   /** It holds a `.dot-agent-deck.toml` the deck's project reader would open. */
   isProject: boolean;
+  /**
+   * Issue #1240 — a symlink the deck listed by its target, so {@link path} is
+   * where it leads (and need not lie under the listing). Absent means a real
+   * directory.
+   */
+  isSymlink?: boolean;
+}
+
+/**
+ * Issue #1240 — what the directory browser asks a deck to widen or narrow
+ * about one listing. Sent only to a deck whose connection has
+ * `listingOptions`; omitted, the listing is PRD #1223's.
+ */
+export interface DeckListingOptions {
+  /** List `.`-named directories too. */
+  includeHidden?: boolean;
+  /** List symlinks to directories too, by their targets. */
+  includeSymlinks?: boolean;
+  /** Keep only directories whose name contains this, case-insensitively — applied by the deck before its entry cap. */
+  filter?: string;
 }
 
 /**
@@ -816,7 +842,14 @@ export type DeckAction =
   | { type: "stop_daemon"; force?: boolean }
   | { type: "restart_daemon" }
   | { type: "allow_build_mismatch" }
-  | { type: "start_workflow"; name: string; cwd: string; taskPrompt: string; roles: WorkflowLaunchRole[]; rows: number; cols: number; configRevision?: string }
+  /**
+   * The Runs screen's launch. `taskPrompt` may be empty (issue #1044): the deck
+   * then composes a coordinator context with no task section and the
+   * coordinator waits for instructions, as under the TUI's `Ctrl+n`.
+   * `displayTitle` is the run's name — absent when the form's Name is empty, so
+   * the run takes the orchestration's name, as `start_orchestration`'s does.
+   */
+  | { type: "start_workflow"; name: string; displayTitle?: string; cwd: string; taskPrompt: string; roles: WorkflowLaunchRole[]; rows: number; cols: number; configRevision?: string }
   /**
    * Start one plain agent on the deck `deckId` names (PRD #1223 M3) — the
    * wire `connection.deckId` of the target, captured once when the user picks
@@ -950,6 +983,14 @@ export interface WorkflowLaunchConfig {
    */
   displayName: string;
   displayPath: string;
+  /**
+   * The run's name (issue #1044), submitted as the daemon's run title. Absent
+   * when the form's Name is empty — the TUI's rule — so the run takes the
+   * orchestration's name. Unlike the two display twins above it DOES reach the
+   * daemon, and is kept off the text nodes the same way any title is.
+   */
+  displayTitle?: string;
+  /** May be empty: the coordinator then waits for instructions (issue #1044). */
   taskPrompt: string;
   roles: WorkflowLaunchRole[];
   rows: number;
@@ -1176,7 +1217,7 @@ export interface DeckRuntimeState {
    * without these two offers no New agent flow rather than a dialog that
    * cannot load.
    */
-  listDirectories?: (deckId: string, path?: string) => Promise<DeckDirectoryListing>;
+  listDirectories?: (deckId: string, path?: string, options?: DeckListingOptions) => Promise<DeckDirectoryListing>;
   /** PRD #1223 M4 — what the New agent form needs to know about the deck `deckId` names. */
   newAgentOptions?: (deckId: string) => Promise<NewAgentOptions>;
   /**
@@ -1187,8 +1228,14 @@ export interface DeckRuntimeState {
   newAgentOrchestrations?: (deckId: string, path: string) => Promise<NewAgentOrchestrations>;
   /** The desktop app's own settings, and where they live (PRD #803). */
   getSettings: () => Promise<import("./lib/bridge").DesktopSettingsSnapshotDto>;
-  /** Persist the whole document; resolves to what was written. */
-  saveSettings: (settings: import("./lib/bridge").DesktopSettingsDto) => Promise<import("./lib/bridge").DesktopSettingsDto>;
+  /**
+   * Persist the whole document; resolves to what was written. `base` is the
+   * document the edit was made against, so only the edit is written (#828).
+   */
+  saveSettings: (
+    settings: import("./lib/bridge").DesktopSettingsDto,
+    base?: import("./lib/bridge").DesktopSettingsDto,
+  ) => Promise<import("./lib/bridge").DesktopSettingsDto>;
   /**
    * Test one deck end to end and resolve with a named state (PRD #741 M10).
    *
