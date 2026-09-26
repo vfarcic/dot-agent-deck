@@ -4407,6 +4407,31 @@ mod hook_ingestion_tests {
         }
     }
 
+    /// Failure bound for an await that runs while a test holds the
+    /// orchestrator's pane writer.
+    const HELD_WRITER_BOUND: Duration = Duration::from_secs(10);
+
+    /// Await `fut` while the test holds the orchestrator's pane writer in
+    /// `held`. A regression that makes `fut` wait on that writer would
+    /// otherwise deadlock the test, so past [`HELD_WRITER_BOUND`] the guard is
+    /// released and the test fails naming `what`.
+    async fn bounded_while_holding<G, T>(
+        held: &mut Option<G>,
+        what: &str,
+        fut: impl std::future::Future<Output = T>,
+    ) -> T {
+        match tokio::time::timeout(HELD_WRITER_BOUND, fut).await {
+            Ok(value) => value,
+            Err(_) => {
+                drop(held.take());
+                panic!(
+                    "{what} did not finish within {HELD_WRITER_BOUND:?} while the \
+                     orchestrator's pane writer was held"
+                );
+            }
+        }
+    }
+
     /// Issue #714 (audit N1): the replay runs outside every lock, so the worker
     /// can redraw while it runs, and it can redraw again between a confirmation
     /// and its publication. Print a Codex quota line, take the confirming
@@ -4790,10 +4815,17 @@ mod hook_ingestion_tests {
             .registry
             .agent_writer(&fx.orch_id)
             .expect("the orchestrator's writer");
-        let held = writer.lock().await;
+        let mut held = Some(writer.lock().await);
 
         let first = fx.confirm(std::time::Instant::now());
-        assert!(apply_quota_blocked(&fx.registry, &fx.state, &fx.event_tx, fx.report(first)).await);
+        assert!(
+            bounded_while_holding(
+                &mut held,
+                "applying block 1",
+                apply_quota_blocked(&fx.registry, &fx.state, &fx.event_tx, fx.report(first)),
+            )
+            .await
+        );
         let notice = fx
             .registry
             .claim_worker_blocked_notice(fx.worker_pane, &fx.worker_id)
@@ -4814,16 +4846,24 @@ mod hook_ingestion_tests {
             "precondition: the write waits on the writer"
         );
 
-        fx.work_hook().await;
+        bounded_while_holding(&mut held, "the work hook", fx.work_hook()).await;
         let second = fx.confirm(std::time::Instant::now() + Duration::from_secs(1));
         assert_ne!(second, first);
         assert!(
-            publish_quota_blocked(&fx.registry, &fx.state, &fx.event_tx, fx.report(second)).await
+            bounded_while_holding(
+                &mut held,
+                "publishing block 2",
+                publish_quota_blocked(&fx.registry, &fx.state, &fx.event_tx, fx.report(second)),
+            )
+            .await
         );
         assert_eq!(fx.blocked_cards().await, 1, "precondition: block 2 applied");
 
-        drop(held);
-        delivery.await.expect("the delivery task");
+        drop(held.take());
+        tokio::time::timeout(Duration::from_secs(30), delivery)
+            .await
+            .expect("block 1's refused write never returned once the writer freed")
+            .expect("the delivery task");
         let delivered = fx.settled_notices().await;
         assert_eq!(delivered, 2, "expected exactly one notice (echo + output)");
         assert!(
@@ -4854,17 +4894,16 @@ mod hook_ingestion_tests {
             .registry
             .agent_writer(&fx.orch_id)
             .expect("the orchestrator's writer");
-        let held = writer.lock().await;
+        let mut held = Some(writer.lock().await);
 
         let epoch = fx.confirm(std::time::Instant::now());
-        // A failure bound only: before the fix this never returned while the
-        // writer was held.
-        let published = tokio::time::timeout(
-            Duration::from_secs(10),
+        // Before the fix this never returned while the writer was held.
+        let published = bounded_while_holding(
+            &mut held,
+            "publishing a block",
             publish_quota_blocked(&fx.registry, &fx.state, &fx.event_tx, fx.report(epoch)),
         )
-        .await
-        .expect("publishing a block waited on the orchestrator's pane writer");
+        .await;
         assert!(published, "precondition: the block applied");
         assert_eq!(fx.blocked_cards().await, 1);
         assert_eq!(
@@ -4879,7 +4918,7 @@ mod hook_ingestion_tests {
             "the notice must be claimed before its write is spawned"
         );
 
-        drop(held);
+        drop(held.take());
         assert_eq!(
             fx.settled_notices().await,
             2,
@@ -4899,11 +4938,16 @@ mod hook_ingestion_tests {
             .registry
             .agent_writer(&fx.orch_id)
             .expect("the orchestrator's writer");
-        let held = writer.lock().await;
+        let mut held = Some(writer.lock().await);
 
         let epoch = fx.confirm(std::time::Instant::now());
         assert!(
-            publish_quota_blocked(&fx.registry, &fx.state, &fx.event_tx, fx.report(epoch)).await,
+            bounded_while_holding(
+                &mut held,
+                "publishing the block",
+                publish_quota_blocked(&fx.registry, &fx.state, &fx.event_tx, fx.report(epoch)),
+            )
+            .await,
             "precondition: the block applied"
         );
 
@@ -4956,7 +5000,7 @@ mod hook_ingestion_tests {
         );
         assert_eq!(fx.notices().await, 0, "precondition: nothing written yet");
 
-        drop(held);
+        drop(held.take());
         tokio::time::timeout(Duration::from_secs(30), last)
             .await
             .expect("the current notice was delivered once the writer freed")
