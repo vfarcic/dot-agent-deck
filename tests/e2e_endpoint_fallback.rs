@@ -593,3 +593,253 @@ fn socket_012_a_legacy_daemon_that_stops_answering_recovers_to_the_primary() {
         failures.join("\n")
     );
 }
+
+/// A directory some other uid owns, to bind over the per-uid fallback name so
+/// the deck under test sees it as squatted, and confirmation that `bwrap` can
+/// do that on this host — or `None`, after printing `SKIP:`.
+///
+/// Issue #1173 is about an entry **another uid** owns, and a test has no second
+/// uid to create one with. A bubblewrap mount namespace supplies the ownership
+/// without one: bind a root-owned directory (read-only) over an empty
+/// directory we made at the per-uid name, and inside the namespace `lstat`
+/// reports the root-owned inode — as `0`, or as the overflow uid when bwrap
+/// runs in a user namespace. Either is not ours, which is all the rule reads.
+/// Where bwrap is absent or cannot make a namespace (a CI runner with
+/// unprivileged user namespaces restricted), nothing here can stand the
+/// scenario up, so the test skips rather than passes on a vacuous run.
+fn bwrap_squat_source(scratch: &Path) -> Option<PathBuf> {
+    let source = PathBuf::from("/usr");
+    let owner = fs::symlink_metadata(&source).map(|m| m.uid()).ok();
+    if owner.is_none() || owner == Some(current_uid()) {
+        eprintln!(
+            "SKIP: no directory another uid owns to squat with (running as the owner of /usr?)"
+        );
+        return None;
+    }
+    let mountpoint = scratch.join("probe");
+    fs::create_dir(&mountpoint).expect("create the bwrap probe mountpoint");
+    let probe = Command::new("bwrap")
+        .args(["--dev-bind", "/", "/", "--ro-bind"])
+        .arg(&source)
+        .arg(&mountpoint)
+        .args(["--", "/bin/sh", "-c", "stat -c %u \"$0\""])
+        .arg(&mountpoint)
+        .env_clear()
+        .env("PATH", std::env::var("PATH").unwrap_or_default())
+        .output();
+    match probe {
+        Ok(output) if output.status.success() => {
+            let seen = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if seen == current_uid().to_string() {
+                eprintln!("SKIP: bwrap's bind did not present a foreign owner (saw uid {seen})");
+                return None;
+            }
+            Some(source)
+        }
+        Ok(output) => {
+            eprintln!(
+                "SKIP: bwrap cannot create the mount namespace this scenario needs: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+            None
+        }
+        Err(error) => {
+            eprintln!("SKIP: bwrap is not available: {error}");
+            None
+        }
+    }
+}
+
+/// What [`socket_014_a_foreign_owned_uid_directory_relocates_instead_of_wedging`]
+/// runs inside the namespace. A headless `daemon serve`, then the clients that
+/// must find it, then a stop by its own pid; then the launcher's lazy-spawn
+/// path, which must land on the same relocated directory, stopped with
+/// `daemon stop`. Each step's output goes to a file under `$OUT` for the test
+/// to read after the namespace — and every process in it — is gone.
+const SQUAT_SCENARIO: &str = r#"
+set -u
+legacy_attach="$DOT_AGENT_DECK_TEST_LEGACY_ENDPOINT_ROOT/dot-agent-deck-attach-$(id -u).sock"
+"$DAD_BIN" daemon serve >"$OUT/serve.out" 2>&1 &
+pid=$!
+i=0
+until "$DAD_BIN" daemon endpoint >"$OUT/endpoint" 2>"$OUT/endpoint.err"; do
+    i=$((i+1)); [ "$i" -ge 150 ] && break
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 0.1
+done
+"$DAD_BIN" daemon status >"$OUT/status" 2>&1; echo $? >"$OUT/status.rc"
+[ -S "$legacy_attach" ] && echo bound >"$OUT/alias"
+kill "$pid"; wait "$pid"
+DOT_AGENT_DECK_EXIT_AFTER_HANDSHAKE=1 "$DAD_BIN" </dev/null >"$OUT/launch" 2>&1; echo $? >"$OUT/launch.rc"
+"$DAD_BIN" daemon endpoint >"$OUT/endpoint2" 2>&1
+"$DAD_BIN" daemon stop >"$OUT/stop" 2>&1; echo $? >"$OUT/stop.rc"
+"#;
+
+/// Scenario: Inside a bubblewrap namespace, bind a root-owned directory over the isolated `TMPDIR`'s `dot-agent-deck-<uid>` name so it reads as another user's, then run the real `daemon serve` with `XDG_RUNTIME_DIR` and both endpoint overrides absent. Instead of refusing to start, the daemon should bind inside one new owner-only `dot-agent-deck-<uid>.<16 hex>` directory that `daemon endpoint` and `daemon status` both find, still holding the redirected legacy alias; a later lazy-spawn through the launcher should reuse that same directory, and the literal production legacy paths should stay unchanged.
+#[spec("error/socket/014")]
+#[test]
+fn socket_014_a_foreign_owned_uid_directory_relocates_instead_of_wedging() {
+    let scratch = common::harness_tempdir().expect("create the scenario's scratch root");
+    let Some(squat_source) = bwrap_squat_source(scratch.path()) else {
+        return;
+    };
+    let literal_legacy = LiteralLegacyEndpoints::capture();
+    let temp = common::harness_tempdir().expect("create fallback TMPDIR");
+    let legacy_temp = common::harness_tempdir().expect("create isolated legacy endpoint root");
+    let legacy = LegacyEndpointPaths::under(legacy_temp.path());
+    let paths = EndpointPaths::under(temp.path());
+    fs::create_dir(&paths.dir).expect("create the mountpoint the squat is bound over");
+    let out = scratch.path().join("out");
+    let log = scratch.path().join("deck.log");
+    for dir in [
+        &out,
+        &scratch.path().join("home"),
+        &scratch.path().join("locks"),
+    ] {
+        fs::create_dir(dir).expect("create a scenario directory");
+    }
+
+    let output = Command::new("bwrap")
+        .args(["--dev-bind", "/", "/", "--ro-bind"])
+        .arg(&squat_source)
+        .arg(&paths.dir)
+        .args([
+            "--unshare-pid",
+            "--die-with-parent",
+            "--",
+            "/bin/sh",
+            "-c",
+            SQUAT_SCENARIO,
+        ])
+        .current_dir(scratch.path())
+        .env_clear()
+        .env("PATH", std::env::var("PATH").unwrap_or_default())
+        .env("TERM", "xterm-256color")
+        .env("HOME", scratch.path().join("home"))
+        .env("TMPDIR", temp.path())
+        .env(TEST_LEGACY_ENDPOINT_ROOT_ENV, &legacy.root)
+        .env("DOT_AGENT_DECK_STATE_DIR", scratch.path().join("state"))
+        .env("DOT_AGENT_DECK_LOCK_DIR", scratch.path().join("locks"))
+        .env("DOT_AGENT_DECK_LOG", &log)
+        .env("DOT_AGENT_DECK_IDLE_SHUTDOWN_SECS", "0")
+        .env("DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS", "60")
+        .env("DOT_AGENT_DECK_EXPERIMENTAL", "0")
+        .env("DAD_BIN", env!("CARGO_BIN_EXE_dot-agent-deck"))
+        .env("OUT", &out)
+        .output()
+        .expect("run the squat scenario under bwrap");
+    let read = |name: &str| fs::read_to_string(out.join(name)).unwrap_or_default();
+    let context = format!(
+        "bwrap exited {:?}\nstderr:\n{}\nserve:\n{}\nlaunch:\n{}\nlog:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr),
+        read("serve.out"),
+        read("launch"),
+        fs::read_to_string(&log).unwrap_or_default()
+    );
+
+    let mut failures = Vec::new();
+    let uid = current_uid();
+    let prefix = format!("dot-agent-deck-{uid}.");
+    let relocated: Vec<PathBuf> = fs::read_dir(temp.path())
+        .expect("list the fallback TMPDIR")
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with(&prefix))
+        .map(|entry| entry.path())
+        .collect();
+    match relocated.as_slice() {
+        [dir] => {
+            let name = dir.file_name().unwrap().to_string_lossy().to_string();
+            let digits = &name[prefix.len()..];
+            if digits.len() != 16 || !digits.bytes().all(|b| b.is_ascii_hexdigit()) {
+                failures.push(format!(
+                    "relocated directory name {name} is not <prefix><16 hex>"
+                ));
+            }
+            let metadata = fs::symlink_metadata(dir).expect("stat the relocated directory");
+            if !metadata.file_type().is_dir()
+                || metadata.uid() != uid
+                || metadata.permissions().mode() & 0o777 != 0o700
+            {
+                failures.push(format!(
+                    "relocated directory {} is not an owner-only directory of ours: {metadata:?}",
+                    dir.display()
+                ));
+            }
+            let expected = dir.join("attach.sock");
+            for (step, file) in [("daemon serve", "endpoint"), ("lazy-spawn", "endpoint2")] {
+                let reported = read(file);
+                if reported.trim() != expected.to_string_lossy() {
+                    failures.push(format!(
+                        "after {step}, `daemon endpoint` answered {reported:?}, not the relocated {} \
+                         (stderr: {})",
+                        expected.display(),
+                        read("endpoint.err")
+                    ));
+                }
+            }
+            let log_contents = fs::read_to_string(&log).unwrap_or_default();
+            let listening: Vec<&str> = log_contents
+                .lines()
+                .filter(|line| line.contains("Attach protocol listening"))
+                .collect();
+            if listening.len() != 2
+                || !listening
+                    .iter()
+                    .all(|line| line.contains(&*expected.to_string_lossy()))
+            {
+                failures.push(format!(
+                    "expected exactly two daemons, both listening on {}, found: {listening:?}",
+                    expected.display()
+                ));
+            }
+            if !log_contents.contains("is owned by another user") {
+                failures.push("the daemon did not log why it relocated".to_string());
+            }
+        }
+        other => failures.push(format!(
+            "expected exactly one relocated directory in {}, found {other:?}",
+            temp.path().display()
+        )),
+    }
+    if read("status.rc").trim() != "0" || !read("status").contains("no managed agents") {
+        failures.push(format!(
+            "`daemon status` did not reach the relocated daemon: rc {:?}, output {:?}",
+            read("status.rc"),
+            read("status")
+        ));
+    }
+    if read("alias").trim() != "bound" {
+        failures.push(format!(
+            "the relocated daemon did not bind the redirected legacy attach alias {}",
+            legacy.attach.display()
+        ));
+    }
+    if read("launch.rc").trim() != "0" {
+        failures.push(format!(
+            "the launcher's lazy-spawn did not complete: rc {:?}",
+            read("launch.rc")
+        ));
+    }
+    if read("stop.rc").trim() != "0" {
+        failures.push(format!(
+            "`daemon stop` did not reach the lazy-spawned relocated daemon: rc {:?}, output {:?}",
+            read("stop.rc"),
+            read("stop")
+        ));
+    }
+    match fs::read_dir(&paths.dir).map(|entries| entries.count()) {
+        Ok(0) => {}
+        other => failures.push(format!(
+            "the per-uid mountpoint {} gained entries or vanished: {other:?}",
+            paths.dir.display()
+        )),
+    }
+
+    literal_legacy.assert_unchanged();
+    assert!(
+        failures.is_empty(),
+        "a foreign-owned per-uid directory still wedged or misrouted startup:\n{}\n\n{context}",
+        failures.join("\n")
+    );
+}

@@ -11,6 +11,9 @@
 //!   (issue #1211): `daemon serve` also binds the pre-#1121 spelling,
 //!   best-effort, so an older build's client still finds a newer build's
 //!   daemon. See [Why the daemon also binds the old spelling](#why-the-daemon-also-binds-the-old-spelling).
+//! - [`prepare_bind_endpoint`] — where a daemon about to start binds, which
+//!   is the resolved endpoint except when another uid holds the per-uid
+//!   directory's name (issue #1173). See [When the per-uid directory is taken](#when-the-per-uid-directory-is-taken).
 //!
 //! # Why the connect side looks in two places
 //!
@@ -96,6 +99,68 @@
 //! **It is a deprecation shim with an end date.** It exists for clients built
 //! before #1121, and issue #1213 removes it no earlier than two minor releases
 //! after the release that first ships it — deleted then, not extended.
+//!
+//! # When the per-uid directory is taken
+//!
+//! Issue #1121 put the fallback endpoints inside `<temp dir>/dot-agent-deck-{uid}`
+//! so no foreign uid could create an entry *beside* them — but that directory's
+//! own name is as predictable as the sockets' were, in the same world-writable
+//! parent. A local user who creates it first (as a directory, a file or a
+//! symlink) owns it, [`crate::platform::fsperm::ensure_owner_only_dir`]
+//! correctly refuses to put our sockets inside, and before this change the deck
+//! simply did not start on its default endpoint.
+//!
+//! So when — and **only** when — the entry at that name belongs to another uid,
+//! [`prepare_bind_endpoint`] binds instead inside a **relocated** directory:
+//! `<temp dir>/dot-agent-deck-{uid}.<16 hex digits>`, the digits drawn from the
+//! OS at creation time and the directory made by one non-recursive
+//! `mkdir(2)` at `0o700`, which fails on any existing entry. Nobody can
+//! pre-create a name they cannot predict, and once it exists it is ours and
+//! the sticky parent stops anyone else renaming or removing it. A relocated
+//! directory that already exists is reused rather than a new one minted per
+//! start, under a lock in the daemon's lock root, so every concurrent starter
+//! converges on the same one.
+//!
+//! Clients find it without any persisted state, which is the property the two
+//! alternatives #1173 weighed lacked: a directory under `$HOME` cannot hold a
+//! Unix socket on an NFS home, and a randomised name recorded in a state file
+//! must first be *found*, from hook clients in a scrubbed environment, before
+//! the endpoint can be resolved at all. Discovery here needs exactly the
+//! inputs the fallback path already needs — the temp dir and the uid — and
+//! works by listing the temp dir for `dot-agent-deck-{uid}.*` entries that
+//! `lstat` as a real directory, **owned by this uid**, at an owner-only mode.
+//! A foreign uid can create entries with that prefix but cannot create one
+//! this uid owns, so every decoy is filtered out before anything connects;
+//! the socket inside then gets the same
+//! [`crate::platform::fsperm::verify_endpoint_trusted`] check as any other.
+//!
+//! **Nothing moves on a host where the name is not taken, and that is most of
+//! the cross-version argument.** Relocation is decided by an `lstat` owner
+//! check, so a host whose per-uid directory is free or ours binds exactly
+//! where it did before, and every pairing of builds that interoperates there
+//! today still does. On a host where the name *is* taken no build started
+//! before this change, so there is no working pairing to break; what remains
+//! is how an older client behaves against a daemon that relocated:
+//!
+//! - it finds it through the pre-#1121 alias above, which a relocated daemon
+//!   still binds — the alias sits at a flat `/tmp` spelling, not inside the
+//!   taken directory — so the build-version handshake runs and prompts;
+//! - failing that, a client from a release that already uses the per-uid
+//!   directory (v0.41.2 onwards) cannot start a second daemon **while the
+//!   directory is still taken**: its lazy-spawn fails closed on the same
+//!   `ensure_owner_only_dir` refusal, loudly, before any daemon exists;
+//! - the one pairing that can still duplicate is narrow and stated rather
+//!   than hidden: the squatter *removes* their entry while a relocated daemon
+//!   runs, the alias is unavailable (squatted too, or gone once #1213 lands),
+//!   and a client from before this change then starts. It finds nothing, the
+//!   per-uid directory is free again, and it lazy-spawns a second daemon
+//!   there — #1211's shape, reached only through a sequence the squatter
+//!   drives. A client of this build in the same state still finds the
+//!   relocated daemon, because an absent per-uid directory is searched.
+//!
+//! The listing runs only on the fallback arm, only when nothing answers at
+//! the primary endpoint, and only when the per-uid directory is not already
+//! ours — so a host with a working deck never pays for it.
 
 use std::path::{Path, PathBuf};
 
@@ -282,10 +347,19 @@ pub fn endpoint_is_answering(endpoint: &Path) -> bool {
 /// `DOT_AGENT_DECK_ATTACH_SOCKET` — or an `$XDG_RUNTIME_DIR` — that happened to
 /// name the same address, which is how an operator who named one daemon could
 /// be handed another.
+///
+/// A relocated endpoint (issue #1173) is tried **before** the legacy spelling.
+/// A daemon that relocated is this build's, and it also holds the legacy
+/// spelling as an alias, so both would reach it; preferring the relocated
+/// address keeps this build's clients off a shim that has an end date (#1213),
+/// and when both answer with *different* daemons it picks the one of ours.
 #[cfg(unix)]
 fn with_legacy_fallback(resolved: ResolvedEndpoint, legacy: PathBuf) -> ResolvedEndpoint {
     if resolved.source() != EndpointSource::Fallback || endpoint_answers(resolved.path()) {
         return resolved;
+    }
+    if let Some(relocated) = answering_relocated_endpoint(resolved.path()) {
+        return ResolvedEndpoint::new(relocated, EndpointSource::Relocated);
     }
     if endpoint_answers(&legacy) {
         return ResolvedEndpoint::new(legacy, EndpointSource::LegacyCompat);
@@ -343,6 +417,232 @@ fn endpoint_answers(endpoint: &Path) -> bool {
 #[cfg(unix)]
 fn connect_failure_still_answers(kind: std::io::ErrorKind) -> bool {
     kind == std::io::ErrorKind::TimedOut
+}
+
+// ---------------------------------------------------------------------------
+// Relocation when the per-uid directory is taken (issue #1173)
+// ---------------------------------------------------------------------------
+
+/// Where a daemon about to start should bind `resolved`, with the directory it
+/// needs created — the bind side of
+/// [When the per-uid directory is taken](#when-the-per-uid-directory-is-taken).
+///
+/// Everything but the fallback arm is [`ensure_endpoint_dir`] and the address
+/// unchanged: an explicit override names the address the operator chose, and
+/// relocating it would hand them a daemon somewhere they did not say — even an
+/// override that points *into* a taken per-uid directory, which keeps failing
+/// closed with the message naming both uids. On the fallback arm the address
+/// is unchanged too **unless** the per-uid directory's name is held by another
+/// uid, in which case it is the same file name inside a relocated directory.
+///
+/// Called by `daemon serve` before it binds, and by the launcher before it
+/// lazy-spawns, so the launcher polls the address the daemon it starts will
+/// actually bind. The two agree because a relocated directory that already
+/// exists is reused, and the find-or-create runs under a lock both take.
+pub async fn prepare_bind_endpoint(resolved: &ResolvedEndpoint) -> std::io::Result<PathBuf> {
+    #[cfg(unix)]
+    {
+        let primary_dir = crate::platform::paths::fallback_endpoint_dir();
+        let taken = resolved.source() == EndpointSource::Fallback
+            && resolved.path().parent() == Some(primary_dir.as_path())
+            && entry_is_foreign(&primary_dir, crate::platform::paths::current_uid());
+        if !taken {
+            ensure_endpoint_dir(resolved.path())?;
+            return Ok(resolved.path().to_path_buf());
+        }
+        let file_name = resolved.path().file_name().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("{} has no file name to relocate", resolved.path().display()),
+            )
+        })?;
+        let lock_root = crate::daemon::lock_root(None);
+        crate::platform::fsperm::ensure_owner_only_dir(&lock_root)?;
+        let _lock =
+            crate::platform::lock::acquire_spawn_lock(&lock_root.join(RELOCATION_LOCK_FILE))
+                .await?;
+        let dir = relocated_bind_dir(&primary_dir, crate::platform::paths::current_uid())?;
+        tracing::warn!(
+            "{} is owned by another user, so this deck's endpoints are in {} instead \
+             (issue #1173); remove the foreign entry to return to the usual location",
+            primary_dir.display(),
+            dir.display()
+        );
+        Ok(dir.join(file_name))
+    }
+    #[cfg(windows)]
+    {
+        // Named pipes: no directory, so nothing to take and nothing to relocate.
+        Ok(resolved.path().to_path_buf())
+    }
+}
+
+/// The lock [`prepare_bind_endpoint`] holds across its find-or-create, in the
+/// daemon's lock root — which is never the temp dir, for the reason the
+/// daemon's own start lock is not (PRD #93 round four).
+#[cfg(unix)]
+const RELOCATION_LOCK_FILE: &str = "endpoint-relocation.lock";
+
+/// The attach endpoint `daemon endpoint` should report: the pure resolution,
+/// or — on the fallback arm, when nothing answers there — a relocated one that
+/// does. No legacy read: the remote probe has its own rung for the pre-#1121
+/// spelling, and this answers for this build's daemon only.
+pub fn served_attach_endpoint() -> ResolvedEndpoint {
+    let resolved = crate::platform::paths::resolve_attach_socket_path();
+    #[cfg(unix)]
+    if resolved.source() == EndpointSource::Fallback
+        && !endpoint_answers(resolved.path())
+        && let Some(relocated) = answering_relocated_endpoint(resolved.path())
+    {
+        return ResolvedEndpoint::new(relocated, EndpointSource::Relocated);
+    }
+    resolved
+}
+
+/// Does an entry exist at `path` whose owner is not `uid`?
+///
+/// `lstat`, so a symlink is judged by who made the link and not by what it
+/// points at. Absent, or unreadable, answers `false`: relocation is for a name
+/// someone else **holds**, and every other failure is left to
+/// [`crate::platform::fsperm::ensure_owner_only_dir`] to report as it always has.
+/// A same-uid entry that is not a usable directory is deliberately not
+/// relocated around either — it is the operator's to fix, and the existing
+/// refusal tells them how.
+#[cfg(unix)]
+fn entry_is_foreign(path: &Path, uid: u32) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    matches!(std::fs::symlink_metadata(path), Ok(metadata) if metadata.uid() != uid)
+}
+
+/// Is `path` a directory — not a symlink to one — owned by `uid` with no group
+/// or other bits set? The test every relocated-directory candidate must pass
+/// before anything is bound in it or connected to inside it.
+#[cfg(unix)]
+fn is_owner_only_dir_of(path: &Path, uid: u32) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::symlink_metadata(path).is_ok_and(|metadata| {
+        metadata.file_type().is_dir() && metadata.uid() == uid && metadata.mode() & 0o077 == 0
+    })
+}
+
+/// The name prefix of `primary_dir`'s relocated siblings: its own file name
+/// and a dot, so `dot-agent-deck-1.` never matches uid 10's `dot-agent-deck-10`.
+#[cfg(unix)]
+fn relocated_dir_prefix(primary_dir: &Path) -> Option<String> {
+    Some(format!("{}.", primary_dir.file_name()?.to_str()?))
+}
+
+/// The relocated directories of `primary_dir` that already exist and pass
+/// [`is_owner_only_dir_of`], sorted by name so every caller sees the same
+/// order. Entries another uid made with the same prefix — the only kind a
+/// squatter *can* make — are dropped here, before anything connects.
+#[cfg(unix)]
+fn relocated_endpoint_dirs(primary_dir: &Path, uid: u32) -> Vec<PathBuf> {
+    let (Some(parent), Some(prefix)) = (primary_dir.parent(), relocated_dir_prefix(primary_dir))
+    else {
+        return Vec::new();
+    };
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return Vec::new();
+    };
+    let mut dirs: Vec<PathBuf> = entries
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.len() > prefix.len() && name.starts_with(&prefix))
+        })
+        .map(|entry| entry.path())
+        .filter(|path| is_owner_only_dir_of(path, uid))
+        .collect();
+    dirs.sort();
+    dirs
+}
+
+/// The directory to bind into once the per-uid one is taken: the first
+/// existing relocated directory, or a freshly created one.
+///
+/// Creation is one non-recursive `mkdir(2)` at `0o700` on a name with 64 bits
+/// from the OS in it, which fails `EEXIST` on anything already there — so it
+/// cannot be steered into a directory someone else prepared — followed by
+/// [`crate::platform::fsperm::ensure_owner_only_dir`], which re-verifies it
+/// through a descriptor. A collision is retried with fresh digits.
+#[cfg(unix)]
+fn relocated_bind_dir(primary_dir: &Path, uid: u32) -> std::io::Result<PathBuf> {
+    if let Some(existing) = relocated_endpoint_dirs(primary_dir, uid).into_iter().next() {
+        return Ok(existing);
+    }
+    use std::os::unix::fs::DirBuilderExt;
+    let invalid = || {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{} cannot have a relocated sibling", primary_dir.display()),
+        )
+    };
+    let parent = primary_dir.parent().ok_or_else(invalid)?;
+    let prefix = relocated_dir_prefix(primary_dir).ok_or_else(invalid)?;
+    for _ in 0..RELOCATION_ATTEMPTS {
+        let mut bytes = [0u8; 8];
+        getrandom::fill(&mut bytes).map_err(|source| {
+            std::io::Error::other(format!("OS randomness is unavailable: {source}"))
+        })?;
+        let suffix: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+        let dir = parent.join(format!("{prefix}{suffix}"));
+        match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
+            Ok(()) => {
+                crate::platform::fsperm::ensure_owner_only_dir(&dir)?;
+                return Ok(dir);
+            }
+            Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(source) => return Err(source),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        format!(
+            "could not create a relocated endpoint directory beside {} after {RELOCATION_ATTEMPTS} attempts",
+            primary_dir.display()
+        ),
+    ))
+}
+
+/// How many fresh names [`relocated_bind_dir`] tries. A collision on 64 random
+/// bits is not a thing that happens by chance; the bound exists so a broken
+/// randomness source cannot turn into a loop.
+#[cfg(unix)]
+const RELOCATION_ATTEMPTS: usize = 8;
+
+/// The connect side of relocation: the first relocated sibling of `primary`'s
+/// directory in which a daemon answers at `primary`'s file name, or `None`.
+///
+/// Skipped outright when the per-uid directory is ours — a daemon of this
+/// build would have bound there, so there is nothing to find and the listing
+/// is not paid. An **absent** per-uid directory is still searched: a daemon
+/// that relocated while the name was taken keeps running after the squatter
+/// removes their entry, and a client that stopped looking then would
+/// lazy-spawn a second daemon beside it.
+#[cfg(unix)]
+fn answering_relocated_endpoint(primary: &Path) -> Option<PathBuf> {
+    relocated_candidates(primary, crate::platform::paths::current_uid())
+        .into_iter()
+        .find(|candidate| endpoint_answers(candidate))
+}
+
+/// [`answering_relocated_endpoint`] without the liveness probe — the pure-ish
+/// half, over an explicit uid so a test can drive it in a temp dir.
+#[cfg(unix)]
+fn relocated_candidates(primary: &Path, uid: u32) -> Vec<PathBuf> {
+    let (Some(primary_dir), Some(file_name)) = (primary.parent(), primary.file_name()) else {
+        return Vec::new();
+    };
+    if is_owner_only_dir_of(primary_dir, uid) {
+        return Vec::new();
+    }
+    relocated_endpoint_dirs(primary_dir, uid)
+        .into_iter()
+        .map(|dir| dir.join(file_name))
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -910,6 +1210,208 @@ mod tests {
             "the replacement daemon's socket must survive our shutdown"
         );
         drop(ours);
+    }
+
+    // -- relocation when the per-uid directory is taken (issue #1173) --------
+
+    /// The uid a test process is *not*, so an entry it made reads as another
+    /// user's. Relocation is decided by ownership, and a test cannot create an
+    /// entry a second account owns without one — so the rule is driven the
+    /// other way round, by asking about our own entries on behalf of a uid
+    /// that does not own them.
+    fn someone_else() -> u32 {
+        crate::platform::paths::current_uid().wrapping_add(1)
+    }
+
+    #[test]
+    fn only_an_entry_another_uid_owns_is_foreign() {
+        let root = sandbox();
+        let uid = crate::platform::paths::current_uid();
+        let dir = root.path().join("dot-agent-deck-1");
+
+        assert!(
+            !entry_is_foreign(&dir, uid),
+            "an absent name is free, not taken — the ordinary first launch"
+        );
+
+        std::fs::create_dir(&dir).unwrap();
+        assert!(
+            !entry_is_foreign(&dir, uid),
+            "our own directory is not foreign"
+        );
+        assert!(entry_is_foreign(&dir, someone_else()));
+
+        // `lstat`: a link is judged by who made it, not by what it points at.
+        // Ours, pointing at the root-owned `/`, is still ours — and so is left
+        // to `ensure_owner_only_dir`'s symlink refusal rather than relocated.
+        let link = root.path().join("dot-agent-deck-2");
+        std::os::unix::fs::symlink("/", &link).unwrap();
+        assert!(!entry_is_foreign(&link, uid));
+        assert!(entry_is_foreign(&link, someone_else()));
+    }
+
+    #[test]
+    fn the_relocated_prefix_never_matches_another_uids_directory() {
+        let prefix = relocated_dir_prefix(Path::new("/tmp/dot-agent-deck-1")).unwrap();
+        assert_eq!(prefix, "dot-agent-deck-1.");
+        assert!(
+            !"dot-agent-deck-10".starts_with(&prefix),
+            "uid 1's relocated prefix must not claim uid 10's per-uid directory"
+        );
+        assert!(!"dot-agent-deck-tunnels-1".starts_with(&prefix));
+    }
+
+    #[test]
+    fn a_relocated_directory_is_created_owner_only_and_then_reused() {
+        use std::os::unix::fs::MetadataExt;
+        let root = sandbox();
+        let uid = crate::platform::paths::current_uid();
+        let primary = root.path().join(format!("dot-agent-deck-{uid}"));
+
+        let first = relocated_bind_dir(&primary, uid).expect("create a relocated directory");
+        let name = first.file_name().unwrap().to_str().unwrap().to_string();
+        let digits = name
+            .strip_prefix(&format!("dot-agent-deck-{uid}."))
+            .expect("the name is the per-uid directory's plus a dot");
+        assert_eq!(digits.len(), 16, "64 bits, hex-encoded: {name}");
+        assert!(digits.bytes().all(|b| b.is_ascii_hexdigit()), "{name}");
+        let metadata = std::fs::symlink_metadata(&first).unwrap();
+        assert!(metadata.file_type().is_dir());
+        assert_eq!(metadata.uid(), uid);
+        assert_eq!(metadata.mode() & 0o777, 0o700);
+        assert!(
+            !primary.exists(),
+            "relocating must not create the taken name itself"
+        );
+
+        assert_eq!(
+            relocated_bind_dir(&primary, uid).unwrap(),
+            first,
+            "a second start must reuse the directory, not mint one per start — \
+             that is what lets the launcher and the daemon it spawns agree"
+        );
+    }
+
+    #[test]
+    fn only_an_owner_only_directory_of_ours_counts_as_relocated() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = sandbox();
+        let uid = crate::platform::paths::current_uid();
+        let primary = root.path().join(format!("dot-agent-deck-{uid}"));
+        let prefix = format!("dot-agent-deck-{uid}.");
+
+        // Every shape a squatter — or an accident — can leave at the prefix.
+        let real_dir_target = root.path().join("elsewhere");
+        std::fs::create_dir(&real_dir_target).unwrap();
+        std::fs::set_permissions(&real_dir_target, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::os::unix::fs::symlink(&real_dir_target, root.path().join(format!("{prefix}aa")))
+            .unwrap();
+        std::fs::write(root.path().join(format!("{prefix}bb")), b"").unwrap();
+        let loose = root.path().join(format!("{prefix}cc"));
+        std::fs::create_dir(&loose).unwrap();
+        std::fs::set_permissions(&loose, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::create_dir(root.path().join(&prefix)).unwrap(); // the bare prefix
+        let good = root.path().join(format!("{prefix}dd"));
+        std::fs::create_dir(&good).unwrap();
+        std::fs::set_permissions(&good, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert_eq!(
+            relocated_endpoint_dirs(&primary, uid),
+            vec![good.clone()],
+            "a symlink, a file, a loose directory and the bare prefix must all be skipped"
+        );
+        assert!(
+            relocated_endpoint_dirs(&primary, someone_else()).is_empty(),
+            "a directory another uid owns is never a candidate — the only kind a \
+             squatter can create"
+        );
+        assert_eq!(
+            relocated_bind_dir(&primary, uid).unwrap(),
+            good,
+            "the bind side reuses the valid one and ignores the rest"
+        );
+    }
+
+    #[test]
+    fn the_connect_side_searches_only_when_the_per_uid_directory_is_not_ours() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = sandbox();
+        let uid = crate::platform::paths::current_uid();
+        let primary_dir = root.path().join(format!("dot-agent-deck-{uid}"));
+        let primary = primary_dir.join("attach.sock");
+        let relocated = root
+            .path()
+            .join(format!("dot-agent-deck-{uid}.0123456789abcdef"));
+        std::fs::create_dir(&relocated).unwrap();
+        std::fs::set_permissions(&relocated, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert_eq!(
+            relocated_candidates(&primary, uid),
+            vec![relocated.join("attach.sock")],
+            "an absent per-uid directory is searched: a relocated daemon outlives \
+             the squatter removing their entry"
+        );
+
+        std::fs::write(&primary_dir, b"").unwrap();
+        assert_eq!(
+            relocated_candidates(&primary, uid),
+            vec![relocated.join("attach.sock")],
+            "a per-uid name that is not a directory of ours is searched"
+        );
+
+        std::fs::remove_file(&primary_dir).unwrap();
+        std::fs::create_dir(&primary_dir).unwrap();
+        std::fs::set_permissions(&primary_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(
+            relocated_candidates(&primary, uid).is_empty(),
+            "with the per-uid directory ours a daemon would have bound there, so \
+             the listing is not paid"
+        );
+    }
+
+    #[test]
+    fn a_daemon_answering_in_a_relocated_directory_is_found_past_a_stale_one() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = sandbox();
+        let uid = crate::platform::paths::current_uid();
+        let primary = root
+            .path()
+            .join(format!("dot-agent-deck-{uid}"))
+            .join("attach.sock");
+
+        // Sorted first, with a dead socket in it — left by an earlier episode.
+        let stale_dir = root
+            .path()
+            .join(format!("dot-agent-deck-{uid}.0000000000000000"));
+        let live_dir = root
+            .path()
+            .join(format!("dot-agent-deck-{uid}.ffffffffffffffff"));
+        for dir in [&stale_dir, &live_dir] {
+            std::fs::create_dir(dir).unwrap();
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        drop(bind_trusted(&stale_dir.join("attach.sock")));
+        let _live = bind_trusted(&live_dir.join("attach.sock"));
+
+        assert_eq!(
+            answering_relocated_endpoint(&primary),
+            Some(live_dir.join("attach.sock"))
+        );
+    }
+
+    #[tokio::test]
+    async fn an_explicit_address_is_never_relocated() {
+        let root = sandbox();
+        let chosen = root.path().join("hook.sock");
+        for source in [EndpointSource::Override, EndpointSource::PlatformDefault] {
+            assert_eq!(
+                prepare_bind_endpoint(&ResolvedEndpoint::new(chosen.clone(), source))
+                    .await
+                    .unwrap(),
+                chosen,
+                "{source:?}: only the fallback arm's address may move"
+            );
+        }
     }
 
     /// A `tempfile::tempdir()` whose mode is restated after creation — see the
