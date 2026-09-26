@@ -5049,6 +5049,70 @@ mod tests {
         );
     }
 
+    /// Scenario: with that same oversized Deck selector, the user says "switch
+    /// decks, avoid the build box" — a row voice does not reach — and the model
+    /// answers with the build box. The switch is refused for the word "avoid",
+    /// as it would be with any selector, and the sentence still says so: it is
+    /// never replaced by advice to choose the build box in the Deck selector,
+    /// which is the deck the user just excluded (Qodo on PR #1340).
+    #[tokio::test]
+    async fn oversized_selector_section_keeps_a_contrast_refusal_its_own_sentence() {
+        let section = oversized_selector_section();
+        let said = "switch decks, avoid the build box";
+        let result = resolve_with_section(
+            &section,
+            said,
+            voice::IntentAnswer::new("switch_deck").with_param("deck", "build box"),
+        )
+        .await
+        .expect("an oversized section does not fail the utterance");
+        let voice::VoiceOutcome::ParamUnresolved {
+            action, sentence, ..
+        } = &result.outcome
+        else {
+            panic!("a refusal: {:?}", result.outcome);
+        };
+        assert_eq!(action, "switch_deck");
+        assert!(
+            sentence.contains("\u{201c}avoid\u{201d}")
+                && sentence.contains("say just the deck you want")
+                && !sentence.contains("Deck selector"),
+            "{sentence}"
+        );
+    }
+
+    /// Scenario: with that same oversized Deck selector, the user says "switch
+    /// deck to the build box" and the model answers with a deck the user never
+    /// said, "staging box", which no deck voice holds either. The refusal says
+    /// it did not catch which deck, as it would with any selector — it does
+    /// not quote the model's "staging box" back inside a sentence pointing at
+    /// the Deck selector (Qodo on PR #1340).
+    #[tokio::test]
+    async fn oversized_selector_section_keeps_a_not_said_refusal_its_own_sentence() {
+        let section = oversized_selector_section();
+        let said = "switch deck to the build box";
+        let result = resolve_with_section(
+            &section,
+            said,
+            voice::IntentAnswer::new("switch_deck").with_param("deck", "staging box"),
+        )
+        .await
+        .expect("an oversized section does not fail the utterance");
+        let voice::VoiceOutcome::ParamUnresolved {
+            action, sentence, ..
+        } = &result.outcome
+        else {
+            panic!("a refusal: {:?}", result.outcome);
+        };
+        assert_eq!(action, "switch_deck");
+        assert!(
+            sentence.contains("I did not catch which deck")
+                && !sentence.contains("staging box")
+                && !sentence.contains("Deck selector"),
+            "{sentence}"
+        );
+    }
+
     /// Scenario: the app shows the local deck (a single-deck selection, so it
     /// observes only that one) and Settings holds a connectable build box,
     /// reached with an SSH key through a jump host, and a new box with no

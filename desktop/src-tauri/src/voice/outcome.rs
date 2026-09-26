@@ -225,6 +225,14 @@ pub enum VoiceOutcome {
         param: String,
         spoken: String,
         sentence: String,
+        /// Whether the refusal's cause is that nothing live matches `spoken` —
+        /// the one cause [`refuse_switch_beyond_selector`] may re-word. Every
+        /// other cause, a safety refusal about what the user said above all
+        /// (`Unmet::Contrast`, `Unmet::NotSaid`, `Unmet::NamedOther`), keeps its
+        /// own sentence. Desktop-internal: never serialized, so the webview's
+        /// shape is unchanged.
+        #[serde(skip)]
+        nothing_matched: bool,
     },
     /// A param was supplied and more than one thing in live state matches it.
     ParamAmbiguous {
@@ -857,12 +865,14 @@ impl Unmet {
         spec: &super::table::ParamSpec,
         spoken: &str,
     ) -> VoiceOutcome {
+        let nothing_matched = matches!(self, Unmet::NoMatch);
         let unresolved = |situation: String| VoiceOutcome::ParamUnresolved {
             sentence: heard(&transcript, &situation),
             action: row.id.clone(),
             param: spec.name.clone(),
             spoken: spoken.to_string(),
             transcript: transcript.clone(),
+            nothing_matched,
         };
         match self {
             Unmet::NoMatch => unresolved(spec.kind.unresolved_phrase(spoken)),
@@ -2272,8 +2282,14 @@ pub fn address_deck_switch(
 /// [`SWITCH_DECK_ROW`] whose spoken name matches none of `decks` gets a sentence
 /// naming the selector's size and the bound instead, and pointing at the
 /// selector. It does not claim the deck exists: past the bound the app has not
-/// looked. Any other outcome, and a refusal whose name DID match a deck (one
-/// absent from the transcript, say), is left exactly as it was.
+/// looked. Any other outcome is left exactly as it was — and so is a switch
+/// refused for any cause but that plain no-match (Qodo on PR #1340): a
+/// contrast word, a deck the user did not say, or one they named that the
+/// model's value missed keeps its own sentence, because "choose it in the Deck
+/// selector" would then advise picking the deck the user excluded, or quote a
+/// name they never spoke. The spoken name is still re-checked against `decks`
+/// so a caller passing a different list cannot re-word a refusal whose name
+/// matches one of them.
 pub fn refuse_switch_beyond_selector(
     outcome: &mut VoiceOutcome,
     decks: &[VoiceDeck],
@@ -2285,12 +2301,14 @@ pub fn refuse_switch_beyond_selector(
         action,
         spoken,
         sentence,
+        nothing_matched,
         ..
     } = outcome
     else {
         return;
     };
     if action != SWITCH_DECK_ROW
+        || !*nothing_matched
         || spoken.trim().is_empty()
         || resolve_deck_ref(spoken, decks) != DeckRefMatch::None
     {
@@ -3488,6 +3506,7 @@ mod tests {
                 param: "dir".to_string(),
                 spoken: "payments".to_string(),
                 sentence: "Heard: \u{201c}open dir payments\u{201d} — no directory on screen matches \u{201c}payments\u{201d}.".to_string(),
+                nothing_matched: true,
             }
         );
     }
@@ -5836,6 +5855,7 @@ mod tests {
                 param: "agent".to_string(),
                 spoken: "ghost".to_string(),
                 sentence: heard(&transcript, &ParamKind::AgentRef.unresolved_phrase("ghost")),
+                nothing_matched: true,
             },
             VoiceOutcome::ParamAmbiguous {
                 transcript: transcript.clone(),
