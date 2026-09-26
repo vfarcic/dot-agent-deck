@@ -9745,6 +9745,61 @@ impl AgentPtyRegistry {
         }
     }
 
+    /// Issue #714 (review): claim the blocked-worker notice owed for the
+    /// delegation on `worker_pane_id` — of generation `seq` when one is given —
+    /// against its block `epoch`, and deliver it on a task of its own.
+    ///
+    /// The claim is taken HERE, synchronously, so a concurrent block or bind of
+    /// the same delegation finds it claimed and the one-claim-at-a-time rule of
+    /// [`Self::deliver_worker_blocked_notice`] holds unchanged. Only the write is
+    /// spawned: it waits on the orchestrator's pane writer, which an in-flight
+    /// write to that pane can hold for as long as its PTY takes, and neither
+    /// caller — the quota monitor, which probes every pane from one loop, nor a
+    /// delegate dispatch — may be held up by another pane's PTY. Returns the
+    /// delivery's handle, `None` when nothing was owed.
+    pub fn spawn_worker_blocked_notice(
+        self: &Arc<Self>,
+        worker_pane_id: &str,
+        worker_agent_id: &str,
+        epoch: u64,
+        seq: Option<u64>,
+    ) -> Option<tokio::task::JoinHandle<()>> {
+        let notice = self.claim_worker_blocked_notice_of(worker_pane_id, worker_agent_id, seq)?;
+        let registry = Arc::clone(self);
+        let (pane, agent) = (worker_pane_id.to_string(), worker_agent_id.to_string());
+        Some(tokio::spawn(async move {
+            registry
+                .deliver_worker_blocked_notice(&pane, &agent, epoch, notice)
+                .await;
+        }))
+    }
+
+    /// Issue #714 (review): report a block that is ALREADY published to a
+    /// delegation that has just been handed to that worker.
+    ///
+    /// The notice is otherwise attempted only when a block is first published,
+    /// and a blocked pane's unchanged screen never publishes again — so a task
+    /// delegated to a worker that already reads `Blocked` would get no notice at
+    /// all, and the design owes one per outstanding delegation. Called once the
+    /// delegation of generation `seq` is bound to `worker_agent_id` and its task
+    /// pointer has been written; a no-op unless that agent still owns the pane
+    /// and its block is published. The claim is restricted to `seq`, so it can
+    /// only ever report THIS delegation, and it shares the per-record flag with
+    /// the publish path, so the two can never both report it.
+    pub fn report_published_block_to_new_delegation(
+        self: &Arc<Self>,
+        worker_pane_id: &str,
+        seq: u64,
+        worker_agent_id: &str,
+    ) -> Option<tokio::task::JoinHandle<()>> {
+        let epoch = self.quota_published_epoch(worker_pane_id, worker_agent_id)?;
+        tracing::debug!(
+            worker_pane_id = %worker_pane_id,
+            "quota: a delegation was handed to a worker whose block is already published"
+        );
+        self.spawn_worker_blocked_notice(worker_pane_id, worker_agent_id, epoch, Some(seq))
+    }
+
     /// Issue #714: deliver the blocked-worker notice claimed by
     /// [`Self::claim_worker_blocked_notice`] into the orchestrator's pane.
     ///

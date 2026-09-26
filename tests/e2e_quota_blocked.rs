@@ -274,7 +274,8 @@ fn status_blocked_009_opencode_standin_and_healthy_mention_are_distinguished() {
 
 /// Scenario: Start an orchestration whose Codex worker prints a quota error
 /// and remains alive. Once its card is Blocked, delegating to that worker must
-/// succeed with an explicit warning and still deliver the task pointer.
+/// succeed with an explicit warning, still deliver the task pointer, and send
+/// the orchestrator exactly one blocked-worker notice for that new delegation.
 #[spec("orchestration/delegate/037")]
 #[test]
 fn orchestration_delegate_037_delegate_to_blocked_worker_warns_and_delivers() {
@@ -322,6 +323,30 @@ fn orchestration_delegate_037_delegate_to_blocked_worker_warns_and_delivers() {
             .contains("worker-task-worker")
         }),
         "accepted delegation did not reach worker PTY"
+    );
+    // Issue #714 (review): the block was published before this delegation
+    // existed, and an unchanged blocked screen never publishes again — the
+    // dispatch that delivered the task is what reports it.
+    let orchestrator = role_agent(&deck, "orchestrator");
+    let notice_text = || {
+        common::strip_ansi(&common::pane_snapshot_on(
+            deck.attach_socket_path(),
+            &orchestrator.id,
+        ))
+    };
+    assert!(
+        common::wait_until(Duration::from_secs(10), || notice_text()
+            .contains(BLOCKED_NOTICE)),
+        "orchestrator was not told the new delegation's worker is blocked: {}",
+        notice_text()
+    );
+    assert!(
+        !common::wait_until(Duration::from_secs(1), || notice_text()
+            .matches(BLOCKED_NOTICE)
+            .count()
+            > 1),
+        "blocked notice repeated: {}",
+        notice_text()
     );
 }
 

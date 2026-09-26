@@ -6507,6 +6507,19 @@ async fn dispatch_one_owned(
             false
         }
     };
+    // Issue #714 (review): a task just handed to a worker whose quota block is
+    // ALREADY published owes the orchestrator its own blocked-worker notice. The
+    // publish path notified only the delegation outstanding when the block was
+    // first confirmed, and an unchanged blocked screen never publishes again, so
+    // without this the new delegation would never be reported. Claimed for this
+    // delegation's generation and written on its own task, so this dispatch
+    // never waits on the orchestrator's pane writer.
+    if delivered
+        && let (Some(seq), Some(worker_agent_id)) =
+            (delegation_seq, expected_worker_agent_id.as_deref())
+    {
+        registry.report_published_block_to_new_delegation(&pane_id, seq, worker_agent_id);
+    }
     // The two releases below settle two DIFFERENT records for two different
     // reasons — issue #424's payload record when the submit drained the input
     // box, issue #448's commission when the pointer may never have reached the
@@ -13747,6 +13760,126 @@ mod tests {
             "dispatch_one_owned must take the else arm and refuse the write itself, rather than \
              ever handing the primitive a bare None; captured log = {log:?}"
         );
+    }
+
+    /// Issue #714 (review): a notice is attempted only when a block is first
+    /// published, and an unchanged blocked screen never publishes again — so a
+    /// task delegated to a worker that ALREADY reads Blocked must be reported by
+    /// the dispatch that delivers it. Publish a block on an idle worker, then
+    /// delegate to it twice: each delegation delivers exactly one notice to the
+    /// orchestrator, a repeat report of the same delegation adds none, and once
+    /// work evidence lifts the block a further delegation reports nothing.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dispatch_one_owned_reports_an_already_published_block_to_the_new_delegation() {
+        use crate::quota_detect::{BlockedKind, ProbeOutcome, QuotaTimings};
+        const ORCH_PANE: &str = "published-block-orch";
+        const WORKER_PANE: &str = "published-block-worker";
+        const NOTICE: &str = "delegated worker blocked by a provider usage limit";
+
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let spawn = |pane: &str, agent_type: crate::event::AgentType| {
+            registry
+                .spawn_agent(crate::agent_pty::SpawnOptions {
+                    command: Some("/bin/cat"),
+                    env: crate::test_isolation::pin_unreachable_endpoints(vec![(
+                        crate::agent_pty::DOT_AGENT_DECK_PANE_ID.to_string(),
+                        pane.to_string(),
+                    )]),
+                    agent_type: Some(agent_type),
+                    ..crate::agent_pty::SpawnOptions::default()
+                })
+                .expect("spawn stand-in")
+        };
+        let worker = spawn(WORKER_PANE, crate::event::AgentType::Codex);
+        let orch = spawn(ORCH_PANE, crate::event::AgentType::ClaudeCode);
+        let (event_tx, _event_rx) = broadcast::channel(16);
+
+        // Confirm and publish a block on the fresh (silent) worker.
+        let rev = registry.quota_revision(&worker).expect("live worker");
+        let t0 = std::time::Instant::now();
+        let usage = Some(BlockedKind::UsageLimit);
+        assert_eq!(
+            registry.quota_record_probe(&worker, rev, t0, usage),
+            Some((ProbeOutcome::Candidate, None))
+        );
+        let epoch = match registry.quota_record_probe(
+            &worker,
+            rev,
+            t0 + QuotaTimings::from_env().confirm,
+            usage,
+        ) {
+            Some((ProbeOutcome::Confirmed(_), Some(epoch))) => epoch,
+            other => panic!("expected a confirmation, got {other:?}"),
+        };
+        assert!(registry.quota_claim_publication(WORKER_PANE, &worker, epoch));
+
+        let notices = || {
+            let snap = registry.snapshot(&orch).expect("orchestrator");
+            snap.windows(NOTICE.len())
+                .filter(|w| *w == NOTICE.as_bytes())
+                .count()
+        };
+        // `cat` shows each notice twice: the tty echo and its output.
+        let settled = |want: usize| async move {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            while notices() < want {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the notice never reached the orchestrator"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            notices()
+        };
+        let delegate = || async {
+            let armed = registry
+                .arm_outstanding_delegation(WORKER_PANE, "coder", ORCH_PANE, &orch, None)
+                .expect("arm the delegation");
+            dispatch_one_owned(
+                registry.clone(),
+                event_tx.clone(),
+                None,
+                ORCH_PANE.to_string(),
+                "coder".to_string(),
+                WORKER_PANE.to_string(),
+                "do the task".to_string(),
+                None,
+                None,
+                Some(armed.seq),
+                None,
+                None,
+            )
+            .await;
+            armed.seq
+        };
+
+        delegate().await;
+        assert_eq!(settled(2).await, 2, "the first delegation was not reported");
+        let second = delegate().await;
+        assert_eq!(
+            settled(4).await,
+            4,
+            "the second delegation was not reported"
+        );
+        assert!(
+            registry
+                .report_published_block_to_new_delegation(WORKER_PANE, second, &worker)
+                .is_none(),
+            "the same delegation was reported twice"
+        );
+
+        // Work evidence lifts the block: a further delegation reports nothing.
+        registry.quota_note_work_event(WORKER_PANE, Some(&worker));
+        delegate().await;
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert_eq!(
+            notices(),
+            4,
+            "a delegation to a working worker was reported"
+        );
+        registry.shutdown_all();
     }
 
     /// When the worker identity cannot be resolved,

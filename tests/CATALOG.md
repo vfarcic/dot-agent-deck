@@ -3275,7 +3275,7 @@ without depending on the config struct API.
 ##### orchestration/delegate/037 — Delegation to a blocked worker warns but still delivers (issue #714).
 - **Layer:** L2, lane 1, PTY-attached.
 - **Agent:** synthetic Codex quota stand-in; no provider credential.
-- **Asserts:** after the worker becomes Blocked, `delegate --to worker` exits 0, warns that it appears BLOCKED, and its task pointer reaches the worker PTY.
+- **Asserts:** after the worker becomes Blocked, `delegate --to worker` exits 0, warns that it appears BLOCKED, its task pointer reaches the worker PTY, and the orchestrator receives exactly one blocked-worker notice for that new delegation (the block was published before the delegation existed).
 - **Does not assert:** whether the quota-bound agent can actually complete the task.
 - **Platform coverage:** mac+linux.
 

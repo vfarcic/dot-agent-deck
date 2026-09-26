@@ -1634,7 +1634,8 @@ const QUOTA_MONITOR_TICK: Duration = Duration::from_secs(1);
 /// When the detector CONFIRMS — a second matching probe a full confirmation
 /// window after the first, with no work in between — the block is published as
 /// ONE synthetic `QuotaBlocked` event ([`publish_quota_blocked`]) and, for a
-/// worker that still owes a `work-done`, one notice to its orchestrator.
+/// worker that still owes a `work-done`, one notice to its orchestrator —
+/// written on a task of its own, so this loop never waits on another pane's PTY.
 ///
 /// A PUBLISHED block is probed again only after the pane writes later output
 /// and goes quiet (the same quiet window and rate limit). A screen that still
@@ -1766,7 +1767,7 @@ async fn publish_quota_blocked(
     if !apply_quota_blocked(registry, state, event_tx, report).await {
         return false;
     }
-    notify_orchestrator_of_quota_block(registry, pane_id, agent_id, epoch).await;
+    notify_orchestrator_of_quota_block(registry, pane_id, agent_id, epoch);
     true
 }
 
@@ -1919,6 +1920,13 @@ async fn publish_quota_cleared(
 /// the orchestrator of a worker whose block `epoch` was just applied, if the
 /// worker still owes a `work-done`.
 ///
+/// The notice is claimed here and WRITTEN on a task of its own
+/// ([`AgentPtyRegistry::spawn_worker_blocked_notice`]): this runs inside
+/// [`run_quota_monitor`]'s one loop over every pane, and a write stalled on the
+/// orchestrator's pane writer must not delay the probing or publishing of any
+/// other pane's block (issue #714 review). Returns the delivery's handle, `None`
+/// when no notice was claimed.
+///
 /// The block is re-checked before the notice is claimed
 /// ([`AgentPtyRegistry::quota_block_current`]) and again, writer-held, right
 /// before it is written (`deliver_worker_blocked_notice`): a genuine work hook
@@ -1926,25 +1934,21 @@ async fn publish_quota_cleared(
 /// working again must not be reported as blocked. A notice suppressed before
 /// the claim stays owed, and so does one refused at the write (the claim is
 /// released), so a later genuine block of the same delegation still reports.
-async fn notify_orchestrator_of_quota_block(
+fn notify_orchestrator_of_quota_block(
     registry: &Arc<AgentPtyRegistry>,
     pane_id: &str,
     agent_id: &str,
     epoch: u64,
-) {
+) -> Option<tokio::task::JoinHandle<()>> {
     if !registry.quota_block_current(pane_id, agent_id, epoch) {
         debug!(
             pane_id = %pane_id,
             agent_id = %agent_id,
             "quota: the block cleared before the orchestrator was told; no blocked-worker notice"
         );
-        return;
+        return None;
     }
-    if let Some(notice) = registry.claim_worker_blocked_notice(pane_id, agent_id) {
-        registry
-            .deliver_worker_blocked_notice(pane_id, agent_id, epoch, notice)
-            .await;
-    }
+    registry.spawn_worker_blocked_notice(pane_id, agent_id, epoch, None)
 }
 
 /// Issue #714: one clear of a published quota block, as
@@ -4493,8 +4497,11 @@ mod hook_ingestion_tests {
             0,
             "precondition: the hook cleared it"
         );
-        notify_orchestrator_of_quota_block(&fx.registry, fx.worker_pane, &fx.worker_id, epoch)
-            .await;
+        assert!(
+            notify_orchestrator_of_quota_block(&fx.registry, fx.worker_pane, &fx.worker_id, epoch)
+                .is_none(),
+            "a cleared block claimed a notice"
+        );
         assert_eq!(fx.notices().await, 0, "a cleared block was reported");
 
         // publish → claim → work hook → write: the writer-held re-check refuses.
@@ -4832,6 +4839,52 @@ mod hook_ingestion_tests {
             publish_quota_blocked(&fx.registry, &fx.state, &fx.event_tx, fx.report(third)).await
         );
         assert_eq!(fx.notices().await, delivered, "the delegation re-notified");
+        fx.registry.shutdown_all();
+    }
+
+    /// Issue #714 (review): the quota monitor publishes every pane's block from
+    /// one loop, so publishing must not wait on the orchestrator's pane writer.
+    /// Hold that writer, confirm and publish a worker's block: the publication
+    /// returns at once with the card Blocked and the notice already claimed, and
+    /// the notice lands — once — only when the writer frees.
+    #[tokio::test]
+    async fn quota_publish_does_not_wait_on_a_busy_orchestrator_writer() {
+        let fx = QuotaNoticeFixture::new("quota-busy-worker", "quota-busy-orch").await;
+        let writer = fx
+            .registry
+            .agent_writer(&fx.orch_id)
+            .expect("the orchestrator's writer");
+        let held = writer.lock().await;
+
+        let epoch = fx.confirm(std::time::Instant::now());
+        // A failure bound only: before the fix this never returned while the
+        // writer was held.
+        let published = tokio::time::timeout(
+            Duration::from_secs(10),
+            publish_quota_blocked(&fx.registry, &fx.state, &fx.event_tx, fx.report(epoch)),
+        )
+        .await
+        .expect("publishing a block waited on the orchestrator's pane writer");
+        assert!(published, "precondition: the block applied");
+        assert_eq!(fx.blocked_cards().await, 1);
+        assert_eq!(
+            fx.notices().await,
+            0,
+            "precondition: the notice waits on the held writer"
+        );
+        assert!(
+            fx.registry
+                .claim_worker_blocked_notice(fx.worker_pane, &fx.worker_id)
+                .is_none(),
+            "the notice must be claimed before its write is spawned"
+        );
+
+        drop(held);
+        assert_eq!(
+            fx.settled_notices().await,
+            2,
+            "expected exactly one notice (echo + output)"
+        );
         fx.registry.shutdown_all();
     }
 
