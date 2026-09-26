@@ -103,6 +103,39 @@ pub struct ResolvedParam {
     /// says. Derived the same way the webview derives it, so the sentence names
     /// the agent the way the screen does.
     pub label: String,
+    /// On [`SWITCH_DECK_ROW`] alone, the endpoint the Deck selector's row
+    /// named when this was resolved ([`address_deck_switch`]), so the webview
+    /// can refuse a row whose address changed under the same id during the
+    /// round trip. `None` everywhere else, including a switch to the local
+    /// deck, which has no remote address to change.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deck_identity: Option<VoiceDeckIdentity>,
+}
+
+/// PRD #1195 — a `[[endpoints.remote]]` row's address as it stood when voice
+/// resolved a switch to it: `host`, `user`, `port` and `socket`, the four
+/// fields that decide which machine and which deck the connection reaches.
+/// Serialized in the webview's `RemoteEndpointDto` spelling, with the two
+/// optional fields absent rather than `null`, so it compares field for field
+/// with the row the selector reads.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VoiceDeckIdentity {
+    pub host: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+    pub port: u16,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub socket: Option<String>,
+}
+
+/// What [`address_deck_switch`] puts on a [`SWITCH_DECK_ROW`] dispatch: the
+/// Deck selector's stored token, and for a remote row its
+/// [`VoiceDeckIdentity`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VoiceDeckSelection {
+    pub token: String,
+    pub identity: Option<VoiceDeckIdentity>,
 }
 
 /// The closed set of situations one utterance can end in.
@@ -788,6 +821,10 @@ enum Unmet {
         local: bool,
         reason: String,
     },
+    /// The user did not say the reference the model supplied — held only for
+    /// [`SWITCH_DECK_ROW`]'s deck (see [`resolve_param`]). Never quoted back:
+    /// the value is the model's, not the user's.
+    NotSaid,
 }
 
 impl Unmet {
@@ -819,6 +856,7 @@ impl Unmet {
                 matches,
             },
             Unmet::LabelsWithheld => VoiceOutcome::labels_withheld(transcript, row),
+            Unmet::NotSaid => unresolved(format!("I did not catch which {}", spec.kind.noun())),
             Unmet::DeckUnavailable {
                 label,
                 local,
@@ -877,6 +915,9 @@ impl Unmet {
                     local,
                     reason,
                 } => deck_unavailable(label, *local, reason),
+                // Produced only when `said` failed, so the branch above has
+                // it; spelled out rather than left to a wildcard.
+                Unmet::NotSaid => (format!("I did not catch which {noun}"), None),
             }
         };
         match (implied, detail) {
@@ -934,6 +975,7 @@ fn implied_param(spec: &super::table::ParamSpec, decks: &[VoiceDeck]) -> Option<
         spoken: String::new(),
         value: only.id.clone(),
         label: only.label.clone(),
+        deck_identity: None,
     })
 }
 
@@ -1002,13 +1044,28 @@ fn capitalised(text: &str) -> String {
 /// - **everything else is undone by one more utterance** — opening a
 ///   directory, preselecting a deck, setting a chip or the Command field.
 ///
+/// **One exception: [`SWITCH_DECK_ROW`]'s deck IS held against the transcript
+/// (PRD #1195).** Switching to a remote deck opens an SSH connection to it, at
+/// once and with no confirmation, so "switch deck to local" answered with
+/// `deck="build box"` would reach a machine the user did not ask for. Its
+/// reference must be words the user [`said`] — the model's `spoken` value,
+/// checked word by word against the transcript before it is resolved through
+/// [`deck_spoken_names`] — or it is refused as [`Unmet::NotSaid`]. That is the
+/// check the model's own copy of the user's words passes whatever the
+/// transcriber did, not the word-for-word title match the 2026-09-24 removal
+/// was about: "the build box" reaches `deploy@build-box.example.com` and
+/// "this machine" the local deck exactly as before. `choose_deck` and
+/// `open_new_agent` stay ungrounded — they preselect in a dialog the user then
+/// confirms, which is the undo-by-one-utterance case above.
+///
 /// The ACTION is still held against the transcript, for every row, before this
 /// runs ([`action_grounded`]) — that is a different question, and it is what
 /// stops a hostile label turning "open docs" into a prompt submission.
 ///
 /// `for_new_agent` is whether a `deck_ref` here is a deck for the New agent
 /// dialog, which refuses one the dialog disables. It is false for
-/// [`SWITCH_DECK_ROW`] alone: the Deck selector switches to any deck it lists.
+/// [`SWITCH_DECK_ROW`] alone: the Deck selector switches to any deck it lists,
+/// and only a deck the user named (above).
 #[allow(clippy::too_many_arguments)]
 fn resolve_param(
     spec: &super::table::ParamSpec,
@@ -1026,6 +1083,7 @@ fn resolve_param(
         spoken: spoken.to_string(),
         value,
         label,
+        deck_identity: None,
     };
     match spec.kind {
         // The fidelity guarantee (PRD #802 D6, rebuilt), and it is checked
@@ -1059,13 +1117,22 @@ fn resolve_param(
         // preselected ([`VoiceDeck::unavailable`]). Only for the dialog: the
         // Deck selector switches to a disabled deck as readily as to any other
         // (PRD #1195, [`SWITCH_DECK_ROW`]).
+        // Checked before resolving, so a deck the model invented is never
+        // quoted back as "no deck matches …" either.
+        ParamKind::DeckRef if !for_new_agent && !said(spoken, transcript.text()) => {
+            Err(Unmet::NotSaid)
+        }
         ParamKind::DeckRef => match resolve_deck_ref(spoken, decks) {
             DeckRefMatch::One { id, label } => {
-                match decks
-                    .iter()
-                    .find(|deck| for_new_agent && deck.id == id)
-                    .and_then(|deck| deck.unavailable.as_ref().map(|reason| (deck, reason)))
-                {
+                let disabled = if for_new_agent {
+                    decks
+                        .iter()
+                        .find(|deck| deck.id == id)
+                        .and_then(|deck| deck.unavailable.as_ref().map(|reason| (deck, reason)))
+                } else {
+                    None
+                };
+                match disabled {
                     Some((deck, reason)) => Err(Unmet::DeckUnavailable {
                         label,
                         local: deck.local,
@@ -1234,6 +1301,7 @@ fn local_intercept(
             spoken: opener.to_string(),
             value: typed.to_string(),
             label: typed.to_string(),
+            deck_identity: None,
         }],
     ))
 }
@@ -1844,9 +1912,15 @@ pub fn resolve_deck_ref(spoken: &str, decks: &[VoiceDeck]) -> DeckRefMatch {
 /// A deck with no token is dispatched with an EMPTY value, which the webview's
 /// `switchDeck` refuses, rather than with its key, which a row id could in
 /// principle spell. Every other outcome is left exactly as it was.
+///
+/// The row's [`VoiceDeckIdentity`] rides along on the param
+/// ([`ResolvedParam::deck_identity`]): the token is a row id, and a row id
+/// survives Settings editing that row's host, user, port or socket — so
+/// without it a switch resolved against one machine would write a selection
+/// that now reaches another.
 pub fn address_deck_switch(
     outcome: &mut VoiceOutcome,
-    selection_of: impl Fn(&str) -> Option<String>,
+    selection_of: impl Fn(&str) -> Option<VoiceDeckSelection>,
 ) {
     let VoiceOutcome::Dispatch { action, params, .. } = outcome else {
         return;
@@ -1858,7 +1932,13 @@ pub fn address_deck_switch(
         .iter_mut()
         .filter(|param| param.kind == ParamKind::DeckRef)
     {
-        param.value = selection_of(&param.value).unwrap_or_default();
+        let selection = selection_of(&param.value);
+        param.deck_identity = selection
+            .as_ref()
+            .and_then(|selection| selection.identity.clone());
+        param.value = selection
+            .map(|selection| selection.token)
+            .unwrap_or_default();
     }
 }
 
@@ -2490,13 +2570,17 @@ mod tests {
 
     // -- deck_ref (PRD #1223) ---------------------------------------------
 
-    /// Scenario: ask to switch to one observed deck, to an ambiguous deck
-    /// name, and to a deck absent from the fleet. The first dispatches the
-    /// resolved id; the others show the existing deck-specific refusal text.
+    /// Scenario: switch to the named remote deck, the local deck called
+    /// "local" or "this machine", an ambiguous name, or a missing deck.
+    /// A model-supplied remote name that the transcript did not say is refused
+    /// as an unresolved required deck reference, even when that deck exists.
     #[tokio::test]
     async fn voice_outcome_switch_deck_resolves_or_reports_the_deck_reference() {
         let cases = [
             ("switch deck to the build box", "build box"),
+            ("switch deck to local", "local"),
+            ("switch deck to this machine", "this machine"),
+            ("switch deck to local", "build box"),
             ("switch deck to build", "build"),
             ("switch deck to the ghost box", "ghost box"),
         ];
@@ -2506,8 +2590,8 @@ mod tests {
                 IntentAnswer::new("switch_deck").with_param("deck", spoken),
             );
             let outcome = run(&resolver, Screen::Deck, &fleet(), said).await;
-            match spoken {
-                "build box" => {
+            match (said, spoken) {
+                ("switch deck to the build box", "build box") => {
                     let VoiceOutcome::Dispatch {
                         invoke,
                         params,
@@ -2525,12 +2609,23 @@ mod tests {
                         "{sentence}"
                     );
                 }
-                "build" => assert!(
+                ("switch deck to local", "local")
+                | ("switch deck to this machine", "this machine") => assert!(
+                    matches!(&outcome, VoiceOutcome::Dispatch { params, .. }
+                        if params[0].value == "deck-local"),
+                    "{outcome:?}"
+                ),
+                ("switch deck to local", "build box") => assert!(
+                    matches!(&outcome, VoiceOutcome::ParamUnresolved { action, param, .. }
+                        if action == "switch_deck" && param == "deck"),
+                    "a deck absent from the transcript must be refused: {outcome:?}"
+                ),
+                (_, "build") => assert!(
                     matches!(&outcome, VoiceOutcome::ParamAmbiguous { action, sentence, .. }
                         if action == "switch_deck" && sentence.contains("matches more than one deck")),
                     "{outcome:?}"
                 ),
-                "ghost box" => assert!(
+                (_, "ghost box") => assert!(
                     matches!(&outcome, VoiceOutcome::ParamUnresolved { action, sentence, .. }
                         if action == "switch_deck" && sentence.contains("no deck matches")),
                     "{outcome:?}"
@@ -2661,6 +2756,7 @@ mod tests {
                     spoken: "Local deck".to_string(),
                     value: "deck-local".to_string(),
                     label: "Local deck".to_string(),
+                    deck_identity: None,
                 }],
                 // Named, because the user did not name it: a wrong guess is
                 // heard rather than found later on a deck they did not choose.
@@ -2708,6 +2804,7 @@ mod tests {
                 spoken: "the build box".to_string(),
                 value: "deck-build".to_string(),
                 label: "deploy@build-box.example.com:2222".to_string(),
+                deck_identity: None,
             }]
         );
     }
@@ -2997,6 +3094,7 @@ mod tests {
                     spoken: "billing api".to_string(),
                     value: "/home/dev/code/billing-api".to_string(),
                     label: "billing-api".to_string(),
+                    deck_identity: None,
                 }],
                 sentence: "Opening billing-api.".to_string(),
             }
@@ -3318,6 +3416,7 @@ mod tests {
                         spoken: answered.to_string(),
                         value: "a-1".to_string(),
                         label: "dot-agent-deck-orchestrator-1".to_string(),
+                        deck_identity: None,
                     }],
                     sentence: "Confirm closing dot-agent-deck-orchestrator-1 \u{2014} nothing has \
                                been stopped yet."
@@ -4175,6 +4274,7 @@ mod tests {
                     spoken: "dispatcher".to_string(),
                     value: "dispatcher".to_string(),
                     label: "dispatcher".to_string(),
+                    deck_identity: None,
                 }],
                 sentence: "Mode: dispatcher.".to_string(),
             }
@@ -5202,6 +5302,7 @@ mod tests {
             spoken: name.to_string(),
             value: name.to_string(),
             label: label.to_string(),
+            deck_identity: None,
         };
 
         // The hostile case: the first label names the second param.
@@ -5267,6 +5368,7 @@ mod tests {
             spoken: "tester".to_string(),
             value: "1".to_string(),
             label: "tester".to_string(),
+            deck_identity: None,
         };
         assert_eq!(report(&row, &[param]), "Opening tester.");
     }
@@ -5344,6 +5446,7 @@ mod tests {
             spoken: "tester".to_string(),
             value: "1".to_string(),
             label: "tester".to_string(),
+            deck_identity: None,
         };
         let variants = vec![
             VoiceOutcome::Dispatch {
@@ -5429,6 +5532,7 @@ mod tests {
                 spoken: "tester".to_string(),
                 value: "1".to_string(),
                 label: "tester".to_string(),
+                deck_identity: None,
             }],
             sentence: "Opening tester.".to_string(),
         };
@@ -6803,8 +6907,9 @@ mod tests {
 
     /// Scenario: a `switch_deck` dispatch leaves the pipeline carrying the
     /// fleet key it resolved; the app swaps in the Deck selector's token, and
-    /// a key with no token becomes empty rather than passing through. Any
-    /// other dispatch, including one with a `deck_ref`, is untouched.
+    /// a key with no token becomes empty rather than passing through. The row's
+    /// address rides along for the webview to compare. Any other dispatch,
+    /// including one with a `deck_ref`, is untouched.
     #[test]
     fn voice_outcome_address_deck_switch_substitutes_the_selector_token() {
         let dispatch = |action: &str| VoiceOutcome::Dispatch {
@@ -6818,17 +6923,38 @@ mod tests {
                 spoken: "build box".to_string(),
                 value: "deck-build".to_string(),
                 label: "deploy@build-box".to_string(),
+                deck_identity: None,
             }],
         };
         let value = |outcome: &VoiceOutcome| match outcome {
             VoiceOutcome::Dispatch { params, .. } => params[0].value.clone(),
             other => panic!("{other:?}"),
         };
-        let token = |key: &str| (key == "deck-build").then(|| "a1b2c3".to_string());
+        let identity = VoiceDeckIdentity {
+            host: "build-box".to_string(),
+            user: Some("deploy".to_string()),
+            port: 22,
+            socket: None,
+        };
+        let token = |key: &str| {
+            (key == "deck-build").then(|| VoiceDeckSelection {
+                token: "a1b2c3".to_string(),
+                identity: Some(identity.clone()),
+            })
+        };
 
         let mut switched = dispatch(SWITCH_DECK_ROW);
         address_deck_switch(&mut switched, token);
         assert_eq!(value(&switched), "a1b2c3");
+        let VoiceOutcome::Dispatch { params, .. } = &switched else {
+            unreachable!()
+        };
+        assert_eq!(params[0].deck_identity.as_ref(), Some(&identity));
+        assert_eq!(
+            serde_json::to_value(&params[0]).expect("serializes")["deckIdentity"],
+            serde_json::json!({ "host": "build-box", "user": "deploy", "port": 22 }),
+            "absent optional fields, in the webview's spelling"
+        );
 
         let mut unknown = dispatch(SWITCH_DECK_ROW);
         address_deck_switch(&mut unknown, |_| None);
@@ -6837,6 +6963,10 @@ mod tests {
         let mut new_agent = dispatch("open_new_agent");
         address_deck_switch(&mut new_agent, token);
         assert_eq!(value(&new_agent), "deck-build");
+        let VoiceOutcome::Dispatch { params, .. } = &new_agent else {
+            unreachable!()
+        };
+        assert_eq!(params[0].deck_identity, None);
     }
 
     // -- the deck field and Discard (#1263, #1247) ---------------------------

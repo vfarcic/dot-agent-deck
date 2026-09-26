@@ -776,6 +776,44 @@ export interface VoiceResolvedParamDto {
   spoken: string;
   value: string;
   label: string;
+  /**
+   * On `switch_deck` alone, and only for a remote deck: the address the Deck
+   * selector's row had when Rust resolved the switch (PRD #1195,
+   * `voice::VoiceDeckIdentity`), which `chooseDeckSelection` compares with the
+   * row before writing. Absent for the local deck, which has no remote address.
+   */
+  deckIdentity?: VoiceDeckIdentityDto;
+}
+
+/**
+ * A `[[endpoints.remote]]` row's address — the four {@link RemoteEndpointDto}
+ * fields that decide which machine and which deck a connection reaches — as
+ * Rust read it when resolving a spoken deck switch (PRD #1195).
+ *
+ * Every key is present, and `user` and `socket` are `undefined` where the row
+ * has none. Rust omits those two keys instead, so {@link withDeckIdentityKeys}
+ * restores them on the way in, which is what makes the declaration true of
+ * what a caller holds.
+ */
+export interface VoiceDeckIdentityDto {
+  host: string;
+  user: string | undefined;
+  port: number;
+  socket: string | undefined;
+}
+
+/**
+ * {@link VoiceResultDto} with every `deckIdentity` given all four
+ * {@link VoiceDeckIdentityDto} keys. Everything else passes through untouched.
+ */
+function withDeckIdentityKeys(result: VoiceResultDto): VoiceResultDto {
+  if (result.outcome.kind !== "dispatch") return result;
+  const params = result.outcome.params.map((param) => {
+    const identity = param.deckIdentity;
+    if (!identity) return param;
+    return { ...param, deckIdentity: { host: identity.host, user: identity.user ?? undefined, port: identity.port, socket: identity.socket ?? undefined } };
+  });
+  return { ...result, outcome: { ...result.outcome, params } };
 }
 
 /**
@@ -3962,7 +4000,7 @@ export class TauriDeckBridge implements DeckBridge {
 
   async resolveVoice(utterance: string): Promise<VoiceResultDto> {
     const invoke = await this.getInvoke();
-    return invoke<VoiceResultDto>("desktop_voice_resolve", { utterance, screen: this.voiceScreen, directories: this.voiceDirectories ?? null, newAgent: this.voiceNewAgent ?? null, deckStep: this.voiceDeckStep ?? null });
+    return withDeckIdentityKeys(await invoke<VoiceResultDto>("desktop_voice_resolve", { utterance, screen: this.voiceScreen, directories: this.voiceDirectories ?? null, newAgent: this.voiceNewAgent ?? null, deckStep: this.voiceDeckStep ?? null }));
   }
 
   /**

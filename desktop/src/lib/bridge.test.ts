@@ -338,6 +338,32 @@ describe("TauriDeckBridge", () => {
   });
 
   /**
+   * Scenario (PRD #1195): Rust resolves "switch deck to the build box" and
+   * omits the row's absent SSH user and socket from the deck identity. The
+   * bridge hands the webview all four keys, the absent two as `undefined`, and
+   * leaves a param with no identity as it came.
+   */
+  it("gives a switch's deck identity all four keys", async () => {
+    const { TauriDeckBridge } = await import("./bridge");
+    const bridge = new TauriDeckBridge();
+    const plain = { name: "agent", kind: "agent_ref", spoken: "coder", value: "a-1", label: "coder" };
+    invoke.mockResolvedValue({
+      outcome: {
+        kind: "dispatch", transcript: "switch deck to the build box", action: "switch_deck", invoke: "switchDeck", sentence: "Showing build-box.",
+        params: [{ name: "deck", kind: "deck_ref", spoken: "build box", value: "buildbox01", label: "build-box", deckIdentity: { host: "build-box", port: 22 } }, plain],
+      },
+      resolveMs: 1,
+      backend: "stub",
+    });
+    const result = await bridge.resolveVoice("switch deck to the build box");
+    if (result.outcome.kind !== "dispatch") throw new Error(result.outcome.kind);
+    const identity = result.outcome.params[0].deckIdentity!;
+    expect(identity).toEqual({ host: "build-box", user: undefined, port: 22, socket: undefined });
+    expect(Object.keys(identity).sort()).toEqual(["host", "port", "socket", "user"]);
+    expect(result.outcome.params[1]).toEqual(plain);
+  });
+
+  /**
    * Scenario (issue #1198): the live bridge asks the crate's `desktop_features`
    * command which experimental surfaces to show and passes its answer through;
    * a field the reply leaves out, or carries as anything but `true`, reads as

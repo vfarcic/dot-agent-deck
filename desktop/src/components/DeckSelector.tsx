@@ -61,7 +61,7 @@
  */
 import { useEffect, useId, useRef, useState } from "react";
 import { AlertTriangle, Check, ChevronsUpDown, Server } from "lucide-react";
-import { LOCAL_ENDPOINT_SELECTION } from "../lib/bridge";
+import { LOCAL_ENDPOINT_SELECTION, type RemoteEndpointDto, type VoiceDeckIdentityDto } from "../lib/bridge";
 import { VOICE_ACTIONS } from "../lib/voiceActions";
 import { DISPLAY_LIMITS, displayText } from "../lib/displayText";
 import {
@@ -114,11 +114,23 @@ function noteIsProblem(connection: ConnectionView): boolean {
  * read before the round trip and a deck can be removed in Settings meanwhile.
  * Storing a token naming no row would put the app on the local deck under an
  * "Unknown deck" label, which is a worse answer than saying so.
+ *
+ * The second refusal is the same race one step narrower (PRD #1195): the row is
+ * still listed, but Settings changed its host, SSH user, port or socket under
+ * the same id. `identity` is the address voice resolved the switch against;
+ * when it no longer matches the row, the switch would reach a machine or deck
+ * the user did not name, so nothing is written and the user is asked to say it
+ * again. The menu passes no `identity` — it writes the row it rendered — and
+ * neither does voice for the local deck, which has no remote address; an
+ * identity arriving with a token that names no remote row is refused too.
  */
-export function chooseDeckSelection(settings: DesktopSettingsState, token: string): string | undefined {
+export function chooseDeckSelection(settings: DesktopSettingsState, token: string, identity?: VoiceDeckIdentityDto): string | undefined {
   const section = settings.settings.endpoints;
   const next = deckChoices(section).find((choice) => choice.token === token);
   if (!next) return "That deck is not in the Deck selector any more.";
+  if (identity && !sameDeckIdentity(section?.remote?.find((row) => row.id === token), identity)) {
+    return "That deck changed in Settings since you asked for it — try again.";
+  }
   /*
     The no-op guard, which is shared with `EndpointsPanel` since PRD #742 M6
     and is a data safety property rather than a tidiness one.
@@ -143,6 +155,15 @@ export function chooseDeckSelection(settings: DesktopSettingsState, token: strin
   });
   if (write) settings.save({ ...settings.settings, endpoints: write });
   return undefined;
+}
+
+/** Whether `row` still has the address voice resolved a switch against. */
+function sameDeckIdentity(row: RemoteEndpointDto | undefined, identity: VoiceDeckIdentityDto): boolean {
+  return row !== undefined
+    && row.host === identity.host
+    && row.port === identity.port
+    && row.user === identity.user
+    && row.socket === identity.socket;
 }
 
 export function DeckSelector({ settings, connection }: { settings: DesktopSettingsState; connection: ConnectionView }) {

@@ -659,7 +659,11 @@ export function DeckShell({ runtime, workflowPlatformIssue, initialView = { kind
       agentLabel: agent?.label ?? paneAgent?.displayName,
       text: dictated?.value,
       agentViewOpen: agentView !== undefined,
-      ...(namedDeck ? outcome.invoke === SWITCH_DECK_INVOKE ? { deckSelection: namedDeck.value } : { preselectDeckId: namedDeck.value } : {}),
+      ...(namedDeck
+        ? (outcome.invoke === SWITCH_DECK_INVOKE
+          ? { deckSelection: namedDeck.value, ...(namedDeck.deckIdentity ? { deckIdentity: namedDeck.deckIdentity } : {}) }
+          : { preselectDeckId: namedDeck.value })
+        : {}),
       ...(namedDirectory ? { directoryPath: namedDirectory.value } : {}),
       /* What the utterance was judged against, so a directory move can refuse
          a browser that has moved on since (see the member's own comment). */
@@ -685,7 +689,7 @@ export function DeckShell({ runtime, workflowPlatformIssue, initialView = { kind
       /* Only while Settings is open, so `close` reads its presence (#1197). */
       ...(overlaysOpen.settings ? { closeSettings: () => setOverlay(screen, "settings", false) } : {}),
       /* The Deck selector's own write, which its menu calls too (PRD #1195). */
-      switchDeck: (selection) => chooseDeckSelection(settings, selection),
+      switchDeck: (selection, identity) => chooseDeckSelection(settings, selection, identity),
       navigate: (next) => { moved = true; setView(next); },
       closeAgentView: () => { moved = true; closeAgent(); },
     };

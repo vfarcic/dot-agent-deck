@@ -23,6 +23,14 @@ outcome = "dispatch"
 resolved_deck = "deck-build-box"
 
 [[fixtures]]
+name = "switch-deck-local"
+utterance = "switch deck to local"
+screen = "deck"
+action = "switch_deck"
+outcome = "dispatch"
+resolved_deck = "deck-local"
+
+[[fixtures]]
 name = "switch-deck-ambiguous-box"
 utterance = "switch deck to the box"
 screen = "overview"
@@ -294,10 +302,19 @@ resolved_deck = "deck-build-box"
 
 [[fixtures]]
 name = "choose-deck-unavailable"
-utterance = "use the build box deck"
+utterance = "set the new agent's deck to the build box"
 screen = "deck"
 action = "choose_deck"
 outcome = "unavailable"
+
+# With the New agent dialog closed, this names the app's Deck selector.
+[[fixtures]]
+name = "switch-deck-use-build-box"
+utterance = "use the build box deck"
+screen = "deck"
+action = "switch_deck"
+outcome = "dispatch"
+resolved_deck = "deck-build-box"
 
 # The steering residual `choose_deck`'s narrow vocabulary is about: "deck"
 # inside a naming request is the naming request.

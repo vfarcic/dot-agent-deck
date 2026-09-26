@@ -33,9 +33,11 @@
 //!    - its own declaration (`const [x, setX] = useState(…)`, `const setX = …`,
 //!      a destructuring on one line),
 //!    - a hook dependency array — the last argument of `useEffect`,
-//!      `useMemo`, `useCallback` and their siblings ([`DEPENDENCY_HOOKS`]) —
-//!      which reads and never writes; a list handed to any other function is
-//!      a setter handed away, and is a finding,
+//!      `useMemo`, `useCallback` and their siblings ([`DEPENDENCY_HOOKS`]),
+//!      called bare or as `React.<hook>` — which reads and never writes; a
+//!      list handed to any other function, including a method that shares a
+//!      hook's name (`registry.useEffect`), is a setter handed away, and is a
+//!      finding,
 //!    - a **dismissal**: a call whose last argument is the literal `false`. A
 //!      close turns a capability off; the registry deliberately holds the
 //!      opening half, and `DeckSurface`'s `Escape` handler already argues that
@@ -656,6 +658,12 @@ fn matching_back(masked: &str, close: usize) -> Option<usize> {
 
 /// The identifier a call's `(` at `open` belongs to — through a `React.`
 /// prefix and a type-argument list (`useMemo<RailContext>(`) — or `None`.
+///
+/// **A member call answers only through `React.`.** `registry.useEffect(h,
+/// [setX])` is a method that happens to share a hook's name, and its list is a
+/// second route to the setter like any other function's; so a callee reached
+/// through any other receiver — `registry.`, `React.hooks.`, `obj?.` — is
+/// `None`, and only a bare name or `React.<name>` is a hook.
 fn callee(masked: &str, open: usize) -> Option<&str> {
     let mut end = masked[..open].trim_end().len();
     if masked[..end].ends_with('>') {
@@ -681,7 +689,24 @@ fn callee(masked: &str, open: usize) -> Option<&str> {
     let start = masked[..end]
         .rfind(|character: char| !(character.is_alphanumeric() || matches!(character, '_' | '$')))
         .map_or(0, |found| found + 1);
-    (start < end).then(|| &masked[start..end])
+    if start >= end {
+        return None;
+    }
+    let before = masked[..start].trim_end();
+    if let Some(receiver_end) = before.strip_suffix('.') {
+        let receiver_end = receiver_end.trim_end();
+        let receiver_start = receiver_end
+            .rfind(|character: char| {
+                !(character.is_alphanumeric() || matches!(character, '_' | '$'))
+            })
+            .map_or(0, |found| found + 1);
+        let qualified = &receiver_end[receiver_start..] == "React"
+            && !receiver_end[..receiver_start].trim_end().ends_with('.');
+        if !qualified {
+            return None;
+        }
+    }
+    Some(&masked[start..end])
 }
 
 /// A call starting at `after_name` whose last argument is the literal `false`.
@@ -1364,8 +1389,9 @@ export function Shell() {
         assert_eq!(findings_for(&clean), Vec::<String>::new());
     }
 
-    /// Review finding: a list of setters handed to a function that is not a
-    /// React hook is a second route to the setter, not a dependency array.
+    /// Scenario: a setter list passed to a regular function, including a
+    /// method named `useEffect` on a non-React object, is reported as escaping.
+    /// Bare and React-qualified hooks keep their dependency arrays exempt.
     #[test]
     fn a_setter_list_passed_to_a_non_hook_fails() {
         let handed = APP.replace(
@@ -1373,7 +1399,17 @@ export function Shell() {
             "  register(handler, [setPanelOpen]);\n  return <Panel",
         );
         assert_one_finding(&findings_for(&handed), "`setPanelOpen` is written outside");
+        let false_hook = APP.replace(
+            "  return <Panel",
+            "  registry.useEffect(handler, [setPanelOpen]);\n  return <Panel",
+        );
+        assert_one_finding(
+            &findings_for(&false_hook),
+            "`setPanelOpen` is written outside",
+        );
         for hook in [
+            "useEffect",
+            "React.useEffect",
             "useMemo<ScreenContext>",
             "useCallback",
             "React.useLayoutEffect",

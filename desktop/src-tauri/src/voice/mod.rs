@@ -260,9 +260,10 @@ pub use capture::{
 };
 pub use hold::VoiceHold;
 pub use outcome::{
-    ChoiceMatch, DeckRefMatch, DirRefMatch, ResolvedParam, SWITCH_DECK_ROW, VoiceOutcome,
-    VoiceResult, address_deck_switch, handle_utterance, handle_utterance_with,
-    resolve_agent_type_ref, resolve_deck_ref, resolve_dir_ref, resolve_mode_ref,
+    ChoiceMatch, DeckRefMatch, DirRefMatch, ResolvedParam, SWITCH_DECK_ROW, VoiceDeckIdentity,
+    VoiceDeckSelection, VoiceOutcome, VoiceResult, address_deck_switch, handle_utterance,
+    handle_utterance_with, resolve_agent_type_ref, resolve_deck_ref, resolve_dir_ref,
+    resolve_mode_ref,
 };
 pub use remote::{Protocol, REMOTE_TIMEOUT, RemoteResolver};
 pub use resolver::{

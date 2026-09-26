@@ -1,4 +1,5 @@
 import type { DeckView } from "../types";
+import type { VoiceDeckIdentityDto } from "./bridge";
 
 /**
  * PRD #802 M2 — the frontend action registry, and the app's one dispatch seam
@@ -230,8 +231,13 @@ export type VoiceActionContext = {
    * the deck and on the overview, and the settings document it writes is the
    * shell's. The menu itself builds the same member over the same function
    * (`chooseDeckSelection` in `DeckSelector.tsx`).
+   *
+   * `identity` is the row's address as voice resolved it
+   * ({@link VoiceDispatchTarget.deckIdentity}); a row whose address no longer
+   * matches is refused rather than switched to. The menu passes none: it reads
+   * the row it writes in the same render.
    */
-  switchDeck: (selection: string) => string | undefined;
+  switchDeck: (selection: string, identity?: VoiceDeckIdentityDto) => string | undefined;
   /**
    * Close the Settings sheet (issue #1197).
    *
@@ -554,8 +560,8 @@ export const VOICE_ACTIONS = {
     label: "Switch which deck the app is showing",
     voice: true,
     needs: ["switchDeck"],
-    run: (context: Pick<VoiceActionContext, "switchDeck"> & Partial<Pick<VoiceActionContext, "reportRefused">>, target: { deckSelection?: string }) => {
-      const refused = context.switchDeck(target.deckSelection ?? "");
+    run: (context: Pick<VoiceActionContext, "switchDeck"> & Partial<Pick<VoiceActionContext, "reportRefused">>, target: Pick<VoiceDispatchTarget, "deckSelection" | "deckIdentity">) => {
+      const refused = context.switchDeck(target.deckSelection ?? "", target.deckIdentity);
       if (refused !== undefined) context.reportRefused?.(refused);
     },
   },
@@ -865,6 +871,14 @@ export type VoiceDispatchTarget = AgentViewTarget & {
    * {@link preselectDeckId}, which is a fleet key.
    */
   deckSelection?: string;
+  /**
+   * The address of the remote row {@link deckSelection} named when Rust
+   * resolved the switch (PRD #1195) — absent for the local deck, which has
+   * none. A row id survives Settings editing the row's host, user, port or
+   * socket, so the switch compares this with the row before writing and
+   * refuses one that now reaches a different machine or deck.
+   */
+  deckIdentity?: VoiceDeckIdentityDto;
   /**
    * The child directory to open — the deck's own path a row's `dir_ref` param
    * resolved to, against the browser's children on screen (PRD #1223).

@@ -2937,7 +2937,9 @@ async fn desktop_voice_resolve(
 /// PRD #1195 M3 — the Deck selector's decks, for `switch_deck`: every deck it
 /// lists that [`voice_decks`] did not already take from the observed fleet is
 /// appended to `decks`, and the answer maps EVERY deck in `decks` that the
-/// selector lists to the token the selector stores for it.
+/// selector lists to the token the selector stores for it — and, for a remote
+/// row, the address it had when read ([`voice::VoiceDeckIdentity`]), which the
+/// webview compares with the row before it writes the switch.
 ///
 /// # Why the observed fleet is not enough
 ///
@@ -2970,7 +2972,7 @@ fn selector_voice_decks(
     endpoints: Option<&crate::settings::EndpointSettings>,
     decks: &mut Vec<voice::VoiceDeck>,
     deck_step: Option<&[voice::VoiceDeckChoice]>,
-) -> HashMap<String, String> {
+) -> HashMap<String, voice::VoiceDeckSelection> {
     use dot_agent_deck::daemon_client::Endpoint;
     let step_reason = |deck_id: &str| {
         deck_step
@@ -2978,7 +2980,9 @@ fn selector_voice_decks(
             .and_then(|choice| choice.reason.clone())
     };
     let local = crate::dto::deck_wire_id(&Endpoint::local());
-    let mut listed: Vec<(voice::VoiceDeck, String)> = vec![(
+    // The local deck carries no identity: it has no remote address that
+    // Settings can change under its token.
+    let mut listed: Vec<(voice::VoiceDeck, voice::VoiceDeckSelection)> = vec![(
         voice::VoiceDeck {
             unavailable: Some(
                 step_reason(&local).unwrap_or_else(|| voice::DECK_NOT_CONNECTED.to_string()),
@@ -2987,7 +2991,10 @@ fn selector_voice_decks(
             label: "Local deck".to_string(),
             local: true,
         },
-        crate::settings::LOCAL_SELECTION_TOKEN.to_string(),
+        voice::VoiceDeckSelection {
+            token: crate::settings::LOCAL_SELECTION_TOKEN.to_string(),
+            identity: None,
+        },
     )];
     for row in endpoints
         .map(|section| section.remote.as_slice())
@@ -3020,15 +3027,26 @@ fn selector_voice_decks(
                 local: false,
                 unavailable,
             },
-            row.id.as_str().to_string(),
+            voice::VoiceDeckSelection {
+                token: row.id.as_str().to_string(),
+                identity: Some(voice::VoiceDeckIdentity {
+                    host: row.host.as_str().to_string(),
+                    user: row.user.as_ref().map(|user| user.as_str().to_string()),
+                    port: row.port.get(),
+                    socket: row
+                        .socket
+                        .as_ref()
+                        .map(|socket| socket.as_str().to_string()),
+                }),
+            },
         ));
     }
     let mut selections = HashMap::new();
-    for (deck, token) in listed {
+    for (deck, selection) in listed {
         if !decks.iter().any(|known| known.id == deck.id) {
             decks.push(deck.clone());
         }
-        selections.entry(deck.id).or_insert(token);
+        selections.entry(deck.id).or_insert(selection);
     }
     selections
 }
@@ -4800,17 +4818,34 @@ mod tests {
             find("unconfigured-newbox01").unavailable.as_deref(),
             Some(crate::dto::UNCONFIGURED_DECK_REASON)
         );
+        let token = |key: &str| {
+            selections
+                .get(key)
+                .map(|selection| selection.token.as_str())
+        };
+        assert_eq!(token(&local_key), Some("local"));
+        assert_eq!(token(&build_key), Some("buildbox01"));
+        assert_eq!(token("unconfigured-newbox01"), Some("newbox01"));
         assert_eq!(
-            selections.get(&local_key).map(String::as_str),
-            Some("local")
+            selections[&local_key].identity, None,
+            "local has no address"
         );
         assert_eq!(
-            selections.get(&build_key).map(String::as_str),
-            Some("buildbox01")
+            selections[&build_key].identity,
+            Some(voice::VoiceDeckIdentity {
+                host: "build-box".to_string(),
+                user: None,
+                port: 22,
+                socket: Some("/run/deck.sock".to_string()),
+            })
         );
         assert_eq!(
-            selections.get("unconfigured-newbox01").map(String::as_str),
-            Some("newbox01")
+            selections["unconfigured-newbox01"]
+                .identity
+                .as_ref()
+                .map(|identity| identity.socket.clone()),
+            Some(None),
+            "a row with no socket still has an address to compare"
         );
 
         let said = "switch deck to the build box";
@@ -4832,7 +4867,9 @@ mod tests {
         voice::address_deck_switch(&mut result.outcome, |id| selections.get(id).cloned());
         assert!(
             matches!(&result.outcome, voice::VoiceOutcome::Dispatch { invoke, params, .. }
-                if invoke == "switchDeck" && params[0].value == "buildbox01"),
+                if invoke == "switchDeck" && params[0].value == "buildbox01"
+                    && params[0].deck_identity.as_ref().map(|identity| identity.host.as_str())
+                        == Some("build-box")),
             "{:?}",
             result.outcome
         );

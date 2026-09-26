@@ -323,6 +323,47 @@ describe("switchDeck", () => {
       expect(refused).toHaveBeenCalledWith("That deck is not in the Deck selector any more.");
     }
   });
+
+  /**
+   * Scenario: voice resolves a configured remote before Settings changes that
+   * row's host, SSH user, port, or socket under the same id. The old switch is
+   * refused with a retry message and leaves the selected deck untouched.
+   */
+  it("refuses a deck whose endpoint identity changed under the same row id", () => {
+    const original = twoDecks("local");
+    const deckIdentity = { host: original.remote![0].host, user: original.remote![0].user,
+      port: original.remote![0].port, socket: original.remote![0].socket };
+    const chooseWithIdentity = chooseDeckSelection as (
+      state: DesktopSettingsState, token: string, identity?: typeof deckIdentity,
+    ) => string | undefined;
+    const unchanged = state(twoDecks("local"));
+    const unchangedRefusal = vi.fn();
+    const unchangedTarget = { deckSelection: BUILD_BOX, deckIdentity };
+    VOICE_ACTIONS.switchDeck.run({
+      switchDeck: (token, identity?: typeof deckIdentity) => chooseWithIdentity(unchanged.settings, token, identity),
+      reportRefused: unchangedRefusal,
+    }, unchangedTarget);
+    expect(unchanged.save).toHaveBeenCalledTimes(1);
+    expect(unchangedRefusal).not.toHaveBeenCalled();
+    for (const changed of [
+      { host: "another-box.example.com" },
+      { user: "other-user" },
+      { port: 2222 },
+      { socket: "/run/other.sock" },
+    ]) {
+      const endpoints = twoDecks("local");
+      endpoints.remote![0] = { ...endpoints.remote![0], ...changed };
+      const { settings, save } = state(endpoints);
+      const reportRefused = vi.fn();
+      const target = { deckSelection: BUILD_BOX, deckIdentity };
+      VOICE_ACTIONS.switchDeck.run({
+        switchDeck: (token, identity?: typeof deckIdentity) => chooseWithIdentity(settings, token, identity),
+        reportRefused,
+      }, target);
+      expect(save, JSON.stringify(changed)).not.toHaveBeenCalled();
+      expect(reportRefused).toHaveBeenCalledWith(expect.stringMatching(/deck changed.*try again/i));
+    }
+  });
 });
 
 describe("deckStateNote", () => {
