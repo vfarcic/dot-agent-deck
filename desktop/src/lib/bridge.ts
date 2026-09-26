@@ -19,6 +19,7 @@ import type { HandoffEdge,
   DeckActionResult,
   DeckDirectoryListing,
   DeckFleet,
+  DeckListingOptions,
   DeckSnapshot,
   DesktopFeatures,
   EvidenceItem,
@@ -65,6 +66,8 @@ export interface DesktopSnapshotDto {
     projectActionsReason?: string;
     /** Why the New agent flow cannot start anything on this deck (PRD #1223); absent when it can. */
     newAgentReason?: string;
+    /** Issue #1240: the deck honours the directory browser's listing options. */
+    listingOptions?: boolean;
     error?: string;
     clientProtocolVersion: number;
     serverProtocolVersion?: number;
@@ -1320,7 +1323,7 @@ export type DesktopRunActionDto =
   | { type: "attach_terminal"; agentId: string; onOutput: import("@tauri-apps/api/core").Channel<ArrayBuffer> }
   | { type: "detach_terminal"; sessionId: string }
   | { type: "submit_text"; agentId: string; text: string }
-  | { type: "start_workflow"; name: string; cwd: string; taskPrompt: string; roles: { role: string; command: string; start: boolean }[]; rows?: number; cols?: number; configRevision?: string }
+  | { type: "start_workflow"; name: string; displayTitle?: string; cwd: string; taskPrompt: string; roles: { role: string; command: string; start: boolean }[]; rows?: number; cols?: number; configRevision?: string }
   | { type: "stop_daemon"; force?: boolean }
   | { type: "restart_daemon" }
   | { type: "allow_build_mismatch" };
@@ -1608,8 +1611,11 @@ export interface DeckBridge {
    * deck's refusal for a path it cannot list, with the crate's
    * `DeckScope::resolve` wording for a deck the app no longer observes, or
    * with a connection error for one that stopped answering.
+   *
+   * `options` (issue #1240) widen or narrow the listing; pass them only to a
+   * deck whose connection has `listingOptions` — any other deck refuses them.
    */
-  listDirectories(deckId: string, path?: string): Promise<DeckDirectoryListing>;
+  listDirectories(deckId: string, path?: string, options?: DeckListingOptions): Promise<DeckDirectoryListing>;
   /**
    * PRD #1223 M4 — what the New agent form needs to know about the deck
    * `deckId` names. Resolves `unsupported` for a deck without the query, and
@@ -2025,6 +2031,7 @@ export function mapDesktopSnapshot(dto: DesktopSnapshotDto, previous?: DeckSnaps
       selectionFallback: dto.connection.selectionFallback,
       projectActionsReason: dto.connection.projectActionsReason,
       newAgentReason: dto.connection.newAgentReason,
+      listingOptions: dto.connection.listingOptions === true,
     },
     health: dto.connection.status === "incompatible" ? "failed" : dto.connection.status === "disconnected" ? "idle" : agents.some((agent) => agent.status === "failed") ? "failed" : "healthy",
     elapsed: previous?.elapsed ?? "—",
@@ -2050,7 +2057,7 @@ export function mapDesktopSnapshot(dto: DesktopSnapshotDto, previous?: DeckSnaps
  * reachable from the URL — the previous inline `||` chain had to be edited in
  * lockstep with the fixture and was not.
  */
-const FIXTURE_STATES: readonly FixtureState[] = ["connected", "crowded", "disconnected", "error", "empty", "fleet"];
+const FIXTURE_STATES: readonly FixtureState[] = ["connected", "crowded", "disconnected", "error", "empty", "fleet", "docs"];
 
 class FixtureDeckBridge implements DeckBridge {
   readonly mode = "fixture" as const;
@@ -2118,10 +2125,17 @@ class FixtureDeckBridge implements DeckBridge {
     return this.isOlderDeck(deckId) || this.nonUnixDecks.has(deckId);
   }
 
-  /** Give a deck this preview plays as older the connection's `newAgentReason`, as the live crate does for a deck without `list-directories`. */
+  /**
+   * Give a deck this preview plays as older the connection's `newAgentReason`,
+   * as the live crate does for a deck without `list-directories` — and every
+   * other connected deck `listingOptions` (issue #1240), as the crate does for
+   * a deck at this build.
+   */
   private markOlderDeck(deck: DeckSnapshot): void {
     const deckId = deck.connection.deckId;
-    if (deckId !== undefined && deck.connection.status === "connected" && this.isOlderDeck(deckId)) deck.connection.newAgentReason = FIXTURE_NO_LISTING_REASON;
+    if (deckId === undefined || deck.connection.status !== "connected") return;
+    if (this.isOlderDeck(deckId)) deck.connection.newAgentReason = FIXTURE_NO_LISTING_REASON;
+    else deck.connection.listingOptions = true;
   }
 
   /**
@@ -2624,10 +2638,11 @@ class FixtureDeckBridge implements DeckBridge {
    * in the deck's own spelling. The one normalisation here — trailing and
    * doubled slashes dropped — is the fixture playing the DECK's canonicaliser.
    */
-  async listDirectories(deckId: string, path?: string): Promise<DeckDirectoryListing> {
+  async listDirectories(deckId: string, path?: string, options?: DeckListingOptions): Promise<DeckDirectoryListing> {
     await Promise.resolve();
     this.connectedDeck(deckId);
     if (this.isOlderDeck(deckId)) return { kind: "unsupported" };
+    const needle = options?.filter?.toLowerCase();
     if (path !== undefined && !fixtureAcceptsPath(path)) throw new Error(FIXTURE_PASTED_PATH_REFUSAL);
     const home = FIXTURE_HOMES[deckId] ?? "/home/dev";
     const wanted = path === undefined ? home : path.replace(/\/+/g, "/").replace(/(.)\/$/, "$1");
@@ -2638,7 +2653,13 @@ class FixtureDeckBridge implements DeckBridge {
       path: directory.path,
       displayPath: directory.path,
       ...(directory.parent === undefined ? {} : { parent: directory.parent }),
-      entries: directory.entries.map((entry) => ({ ...entry })),
+      // Issue #1240: the options, as a deck applies them — hidden and
+      // symlinked entries only when asked for, and the filter on the name.
+      entries: directory.entries
+        .filter((entry) => options?.includeHidden || !entry.displayName.startsWith("."))
+        .filter((entry) => options?.includeSymlinks || !entry.isSymlink)
+        .filter((entry) => !needle || entry.displayName.toLowerCase().includes(needle))
+        .map((entry) => ({ ...entry })),
       truncated: false,
     };
   }
@@ -2736,6 +2757,11 @@ export class TauriDeckBridge implements DeckBridge {
    */
   private attached = new Set<string>();
   private sessions = new Map<string, InstalledTerminalSession>();
+  /**
+   * The tail of each terminal's input queue, by the same composite key as
+   * {@link sessions}. See {@link sendTerminalInput} for why input is queued.
+   */
+  private inputTails = new Map<string, Promise<void>>();
   /**
    * `sessionId` -> the composite key its session is filed under.
    *
@@ -4011,11 +4037,42 @@ export class TauriDeckBridge implements DeckBridge {
    * object would find nothing in production while passing any test that reused
    * one reference.
    */
+  /**
+   * Issue #953 — one write in flight per terminal, in the order typed.
+   *
+   * xterm hands over each keystroke as its own chunk, and each chunk is its own
+   * `desktop_terminal_write` command. Tauri runs every async command as its own
+   * task, so two issued back to back reach the Rust side's writer lock in
+   * whichever order the runtime schedules them — the lock serialises the
+   * writes but cannot know their order. The driver tier measured the result in
+   * the real window: `echo dad-driver-…` typed at WebDriver speed reached bash
+   * as `echo dadd-river-…`. So each chunk is issued only once the previous one
+   * for the same terminal has been written. A failed write rejects its own
+   * caller and does not stall the queue behind it.
+   *
+   * Each chunk is bound to the session installed when it was ACCEPTED, not the
+   * one installed when its turn comes: if that session ends while the chunk
+   * waits and the pane reattaches, the chunk was typed into a terminal that no
+   * longer exists, and it rejects as not attached rather than landing in the
+   * replacement.
+   */
   async sendTerminalInput(target: AgentTarget, data: string): Promise<void> {
-    const invoke = await this.getInvoke();
-    const session = this.sessions.get(agentKey(target.deckId, target.agentId));
-    if (!session) throw new Error(`Terminal for ${target.agentId} is not attached.`);
-    await invoke("desktop_terminal_write", { sessionId: session.result.sessionId, data: Array.from(new TextEncoder().encode(data)) });
+    const key = agentKey(target.deckId, target.agentId);
+    const accepted = this.sessions.get(key);
+    const notAttached = () => new Error(`Terminal for ${target.agentId} is not attached.`);
+    if (!accepted) throw notAttached();
+    const previous = this.inputTails.get(key) ?? Promise.resolve();
+    const write = previous.then(async () => {
+      const invoke = await this.getInvoke();
+      if (this.sessions.get(key) !== accepted) throw notAttached();
+      await invoke("desktop_terminal_write", { sessionId: accepted.result.sessionId, data: Array.from(new TextEncoder().encode(data)) });
+    });
+    const tail = write.catch(() => undefined);
+    this.inputTails.set(key, tail);
+    void tail.then(() => {
+      if (this.inputTails.get(key) === tail) this.inputTails.delete(key);
+    });
+    return write;
   }
 
   onTerminalGeometry(listener: (agentId: string, rows: number, cols: number, deckId?: string) => void): () => void {
@@ -4094,9 +4151,11 @@ export class TauriDeckBridge implements DeckBridge {
    * resolves `deckId` against the decks this app observes, and `path` is the
    * deck's own spelling or the user's typing — nothing here fills either in.
    */
-  async listDirectories(deckId: string, path?: string): Promise<DeckDirectoryListing> {
+  async listDirectories(deckId: string, path?: string, options?: DeckListingOptions): Promise<DeckDirectoryListing> {
     const invoke = await this.getInvoke();
-    return invoke<DeckDirectoryListing>("desktop_list_directories", { deckId, path: path ?? null });
+    // Issue #1240: `options` only when given, so a PRD #1223 listing is the
+    // same invoke it always was.
+    return invoke<DeckDirectoryListing>("desktop_list_directories", { deckId, path: path ?? null, ...(options ? { options } : {}) });
   }
 
   async desktopFeatures(): Promise<DesktopFeatures> {

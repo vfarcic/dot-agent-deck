@@ -1,0 +1,18 @@
+{
+  // The driver tier's own type-check (issue #953). Node runs these files by
+  // stripping their types, not by checking them, so a type error under
+  // `driver/` would run happily; `pnpm test:driver:types` is what makes it an
+  // error. Separate from `tsconfig.e2e.json` for the same reason that one is
+  // separate from `tsconfig.json`, plus one of its own: Node's type stripping
+  // requires the `.ts` extension on every relative import, which only
+  // `allowImportingTsExtensions` lets the compiler accept.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "types": ["node"],
+    "noEmit": true,
+    "allowImportingTsExtensions": true,
+    "erasableSyntaxOnly": true
+  },
+  "include": ["driver", "src/vite-env.d.ts"],
+  "references": []
+}

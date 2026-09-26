@@ -67,19 +67,22 @@
  * The first four are the ones the page shipped with; the issue text was wrong
  * about two of them:
  *
- * 1. The desktop GUI. Issue #1021 calls the artifacts "signed and notarized".
- *    They are neither. `.github/workflows/release.yml` introduces the bundle
- *    job as "an unsigned alpha artifact" and, while no signing credential is
- *    registered, heads the release body's desktop section "Desktop GUI
- *    (alpha, unsigned)". PRD #757 first settled on the free options only --
- *    "the macOS warning stays, because there is no free way to remove it" --
- *    and REVERSED that on 2026-09-24: the paid macOS path is now wired (its
- *    M4, the `desktop-sign` job), but that job ships an unsigned `.dmg` until
- *    the maintainer registers the Apple credentials. So the "Unsigned, so
- *    macOS will stop you" copy below is still true, and has to change the
- *    moment a signed, notarized `.dmg` ships -- PRD #757's M6, the real signed
- *    release verified on a clean Mac. The latest release (v0.41.0) carries exactly
- *    two desktop assets, both named `...-desktop-alpha-...`. There is also no
+ * 1. The desktop GUI. Issue #1021 called the artifacts "signed and notarized"
+ *    when they were neither, and this page said "Unsigned, so macOS will stop
+ *    you" until issue #1324. That stopped being true at v0.42.0: PRD #757's
+ *    `desktop-sign` job published its `.dmg` signed with the project's
+ *    Developer ID and notarized by Apple, the ticket stapled to both the app
+ *    and the disk image, and the maintainer verified it on a Mac (PRD #757's
+ *    M6). The `.deb` is still unsigned (PRD #757 Decision 7), and signing did
+ *    not graduate the GUI out of alpha (Decision 9). The copy below claims
+ *    what v0.42.0 carries and points at each release's notes rather than
+ *    promising every release is signed, because that is not a property the
+ *    workflow guarantees: `desktop-sign` still has a deliberate unsigned mode
+ *    for a run with none of the Apple secrets registered, a failed signing
+ *    run publishes no `.dmg` at all, and the desktop section of each release
+ *    note is composed from what that run actually signed (Decision 10).
+ *    v0.42.0 carries exactly two desktop assets, both named
+ *    `...-desktop-alpha-...`. There is also no
  *    Windows bundle: release.yml says "Windows is deliberately absent", because
  *    a Tauri bundle carries the daemon as a sidecar and no Windows daemon
  *    binary is published. What the binaries and packages DO carry is build
@@ -151,10 +154,12 @@
  *    forms all respond to clicks". The true claim is keyboard-FIRST, not
  *    keyboard-only, and the principle now says that and names the button bar.
  *
- * Ordering, not just wording, is corrected too: the unsigned-macOS caveat now
- * says to verify provenance BEFORE following the release notes past Gatekeeper.
- * The exact OS steps stay centralized in the release notes rather than being
- * duplicated here.
+ * Ordering, not just wording, is corrected too: the macOS caveat says to
+ * verify provenance BEFORE opening the app. That ordering outlived the caveat
+ * it was written for -- it used to come before following the release notes
+ * past Gatekeeper, and since v0.42.0's signed `.dmg` (item 1) it comes before
+ * the one confirmation macOS still asks for. Any exact OS steps stay
+ * centralized in the release notes rather than being duplicated here.
  */
 
 export const product = {
@@ -341,9 +346,10 @@ export const installRoutes = [
 
 /**
  * The desktop GUI. Every claim here is checked -- see the note at the top of
- * this file. "Alpha" and "unsigned" are both load-bearing and neither is
- * softened, because a visitor who downloads the .dmg meets a macOS dialog
- * within the minute.
+ * this file. "Alpha" is load-bearing and is not softened. The signing caveat
+ * says what v0.42.0 carries -- a signed, notarized `.dmg` and an unsigned
+ * `.deb` -- and sends the reader to the release notes for any other release,
+ * because the workflow does not guarantee every release is signed (item 1).
  *
  * `intro` and the Windows caveat used to explain themselves in daemon and
  * sidecar terms. Both now say the same thing in what the reader can see: the
@@ -372,8 +378,8 @@ export const desktop = {
       body: 'It ships outside the support expectations of the CLI. The terminal deck is the product; this is an early preview of a second way in.',
     },
     {
-      title: 'Unsigned, so macOS will stop you',
-      body: 'There is no Developer ID certificate and no notarization, so the first launch hits a security dialog. Verify the download with the provenance command below first, then follow the release notes for the exact route past the dialog — in that order, because getting past the warning is the step you want to take only once you know what you have.',
+      title: 'v0.42.0: signed for macOS, not for Linux',
+      body: 'The .dmg on v0.42.0 is signed with the project’s Apple Developer ID and notarized by Apple, so macOS should ask only to confirm opening an app downloaded from the internet. Each release’s notes say whether its own macOS build is signed; if yours is and macOS calls the app damaged or from an unidentified developer, do not override that — report it. The .deb is unsigned, and dpkg -i verifies no package signature, so on Linux the provenance command below is the only check anybody makes. Run it first on either platform.',
     },
     {
       title: 'No Windows bundle',

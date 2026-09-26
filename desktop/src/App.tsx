@@ -43,6 +43,7 @@ import { SettingsSheet } from "./components/SettingsSheet";
 import { VoiceControlPanel } from "./components/VoiceControlPanel";
 import { SettingsBridgeProvider } from "./lib/settingsBridge";
 import { DISPLAY_LIMITS, deckName, displayActivity, displayText } from "./lib/displayText";
+import { ORCHESTRATION_TITLE_TAKEN, liveOrchestrationDirectories, liveOrchestrationTitles } from "./lib/newAgent";
 import { useAgentProfiles } from "./hooks/useAgentProfiles";
 import { useDeckRuntime } from "./hooks/useDeckRuntime";
 import { useDaemonProjects } from "./hooks/useDaemonProjects";
@@ -1106,6 +1107,16 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
     enabled: mode === "live" && snapshot.connection.status === "connected" && !allDecks,
   });
   const activeProject = allDecks ? undefined : projectState.selected;
+  // Issue #1044 — the selected deck's live orchestrations, which the Runs
+  // launch's Run name is suggested against and checked for collisions in, the
+  // way the New agent dialog reads the deck it targets.
+  const workflowDeckId = snapshot.connection.deckId;
+  const workflowLiveTitles = useMemo(() => (workflowDeckId ? liveOrchestrationTitles(runtime.fleet, workflowDeckId) : []), [runtime.fleet, workflowDeckId]);
+  const workflowLiveDirectories = useMemo(() => (workflowDeckId ? liveOrchestrationDirectories(runtime.fleet, workflowDeckId) : []), [runtime.fleet, workflowDeckId]);
+  // Read at CONFIRM time, not when the dialog was built: the confirmation can
+  // sit open while another run takes the title (PR #1333 review).
+  const workflowLiveTitlesRef = useRef(workflowLiveTitles);
+  workflowLiveTitlesRef.current = workflowLiveTitles;
   const { prompts, addPrompt, updatePrompt, removePrompt } = usePromptLibrary();
   const [profileOrder, setProfileOrder] = useState<string[]>([]);
 
@@ -1457,7 +1468,9 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
       : "";
     setConfirm({
       title: `Launch ${config.displayName}?`,
-      body: `This starts ${config.roles.length} live CLI agents in ${config.displayPath} and sends your task prompt to the coordinator. ${commandCopy}${accessCopy} This launch does not rewrite project TOML.`,
+      // Issue #1044: the task is optional. Without one the coordinator is still
+      // briefed — the deck's context names its role and team — and then waits.
+      body: `This starts ${config.roles.length} live CLI agents in ${config.displayPath} and ${config.taskPrompt ? "sends your task prompt to the coordinator" : "briefs the coordinator with no task, so it waits for you to type one into its pane"}.${config.displayTitle ? ` The run is named ${displayText(config.displayTitle, DISPLAY_LIMITS.name)}.` : ""} ${commandCopy}${accessCopy} This launch does not rewrite project TOML.`,
       label: "Launch live loop",
       busyLabel: "Launching…",
       action: async () => {
@@ -1466,6 +1479,14 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
           // dialog and the notice, and the daemon gets the identities alone
           // (PRD #819 audit fix).
           const { customCommandCount: _customCommandCount, generatedFullAccessCount: _generatedFullAccessCount, displayName: _displayName, displayPath: _displayPath, ...launch } = config;
+          // `displayTitle` is NOT a display twin: it rides along as the run's
+          // title (issue #1044), absent when the Name was left empty. The
+          // sheet's collision check ran when Launch was pressed; it runs again
+          // here, against the titles live now, with the same refusal.
+          if (workflowLiveTitlesRef.current.includes(config.displayTitle ?? config.name)) {
+            setNotice(`Nothing was started: ${ORCHESTRATION_TITLE_TAKEN}`);
+            return;
+          }
           await runtime.runAction({ type: "start_workflow", ...launch });
           setWorkflowOpen(false);
           await runtime.reconnect();
@@ -1789,7 +1810,7 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
         onRemove={(id) => { removePrompt(id); setNotice("Prompt removed from this device's library."); }}
       />
       <ProfilesPanel open={profilesOpen} profiles={profiles} onClose={() => setProfilesOpen(false)} onUpdate={updateProfile} onReset={resetProfiles} onSaved={() => setNotice("Agent profile draft saved locally. Project TOML is unchanged.")} />
-      <WorkflowPanel key={activeProject?.path ?? "runtime-workflow"} open={workflowOpen} profiles={profiles} order={profileOrder} mode={mode} project={activeProject} onChooseProject={() => { setWorkflowOpen(false); setProjectsOpen(true); }} onClose={() => setWorkflowOpen(false)} onToggle={(id) => { const profile = profiles.find((item) => item.id === id); if (profile) updateProfile(id, { enabled: !profile.enabled }); }} onMove={moveStage} onLaunch={requestLaunch} platformIssue={workflowPlatformIssue} capabilityIssue={snapshot.connection.projectActionsReason} prompts={prompts} allDecks={allDecks} />
+      <WorkflowPanel key={activeProject?.path ?? "runtime-workflow"} open={workflowOpen} profiles={profiles} order={profileOrder} mode={mode} project={activeProject} onChooseProject={() => { setWorkflowOpen(false); setProjectsOpen(true); }} onClose={() => setWorkflowOpen(false)} onToggle={(id) => { const profile = profiles.find((item) => item.id === id); if (profile) updateProfile(id, { enabled: !profile.enabled }); }} onMove={moveStage} onLaunch={requestLaunch} platformIssue={workflowPlatformIssue} capabilityIssue={snapshot.connection.projectActionsReason} prompts={prompts} allDecks={allDecks} liveTitles={workflowLiveTitles} liveDirectories={workflowLiveDirectories} deckId={workflowDeckId} />
       {paletteOpen && <CommandPalette commands={commandItems} onClose={() => setPaletteOpen(false)} />}
       {helpOpen && <ShortcutHelp onClose={() => setHelpOpen(false)} />}
       {confirm && <ConfirmDialog state={confirm} onClose={() => setConfirm(undefined)} />}

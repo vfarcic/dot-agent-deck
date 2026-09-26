@@ -1130,9 +1130,12 @@ pub fn prepare_workflow_for_wire(
         .and_then(crate::prep_token::inode_identity);
 
     // --- compose and publish. Last, and the only step with a side effect.
-    // `Attended` (issue #703): every caller of this verb today is the desktop's
-    // live-loop launch panel, which will not launch without a task prompt AND has
-    // the person who typed it watching the panes it opens. A later off-box or
+    // `Attended` (issue #703): every caller of this verb today is a desktop
+    // launch — the Runs panel or the New agent dialog — with the person who
+    // started it watching the panes it opens. Either may send an empty task
+    // (issue #1044, PRD #1223), which the composer treats as no task at all:
+    // no `## Your task` section and the "wait for instructions" pointer, exactly
+    // the TUI `Ctrl+n` output (`project/launch/004`). A later off-box or
     // headless caller (#741) is the point at which this stops being derivable
     // here and the attendance has to travel on
     // `AttachRequest::PrepareWorkflow` — a wire change, with CLAUDE.md rule 12's

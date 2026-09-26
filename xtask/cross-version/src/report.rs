@@ -125,6 +125,10 @@ pub struct Evidence {
     /// merge-base, or which build-time files the branch changes and why the run
     /// went ahead anyway. The outer half sets it; `merge_inner` leaves it.
     pub build_time: String,
+    /// The build phase (`buildns.rs`): the toolchain, the trust domain that
+    /// built the binary, the fetch phase, and what the probe measured inside
+    /// each build namespace. The outer half sets it; `merge_inner` leaves it.
+    pub build: Vec<String>,
     pub started_at: String,
     pub mode: String,
     /// What the run's deck processes executed inside.
@@ -322,8 +326,10 @@ impl Evidence {
                  for a daemon-side change runs the previous release's daemon code and never \
                  executes a changed line; this pairing is the one that does. Stand-in agents, not \
                  real ones: the runtime scenario is given no AGENT credential and invokes no \
-                 agent. The branch build ran on the host, outside the namespace — the \
-                 build-time code row below says whether the branch changed any of it.\n"
+                 agent. The branch was built in a build namespace of its own, not on the host \
+                 (the Build section says what it measured), and the build-time code row says \
+                 whether the branch changed build-time code, which decides the trust domain that \
+                 built it.\n"
             );
             if self.discovery.is_some() {
                 let _ = writeln!(
@@ -346,9 +352,10 @@ impl Evidence {
                  agents under it, then the branch TUI attached to that same daemon over a PTY with \
                  the build-version prompt declined — and asserts the four tells below. Stand-in \
                  agents, not real ones: this check is about the TUI↔daemon wire, so the runtime \
-                 scenario is given no AGENT credential and invokes no agent. The branch build ran \
-                 on the host, outside the namespace — the build-time code row below says whether \
-                 the branch changed any of it.\n"
+                 scenario is given no AGENT credential and invokes no agent. The branch was built \
+                 in a build namespace of its own, not on the host (the Build section says what it \
+                 measured), and the build-time code row says whether the branch changed \
+                 build-time code, which decides the trust domain that built it.\n"
             );
         }
 
@@ -460,6 +467,33 @@ impl Evidence {
                     .join(", ")
             );
         }
+
+        let _ = writeln!(s, "## Build\n");
+        if self.build.is_empty() {
+            let _ = writeln!(s, "No build-phase record: the run stopped before it.\n");
+        } else if self.skip_build.is_some() {
+            let _ = writeln!(
+                s,
+                "`--skip-build`: no `cargo build` ran in this run. The build-time gate's `cargo \
+                 metadata` ran in a bubblewrap build namespace, and each `metadata namespace:` \
+                 line is a check its probe measured from inside, before Cargo started there. \
+                 `docs/develop/cross-version-harness.md` says what this does not cover.\n"
+            );
+        } else {
+            let _ = writeln!(
+                s,
+                "The branch's `cargo build`, and the build-time gate's `cargo metadata`, ran in a \
+                 bubblewrap build namespace separate from the runtime one below, and each \
+                 `build namespace:` line is a check its probe measured from inside, before Cargo \
+                 started there. What still ran on the host is the input acquisition (`git`, \
+                 `gh`), the fetch phase and this harness. \
+                 `docs/develop/cross-version-harness.md` says what this does not cover.\n"
+            );
+        }
+        for line in &self.build {
+            let _ = writeln!(s, "- {line}");
+        }
+        let _ = writeln!(s);
 
         let _ = writeln!(s, "## Isolation\n");
         match (&self.isolation_failure, self.isolation.is_empty()) {

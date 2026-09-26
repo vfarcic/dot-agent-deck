@@ -105,6 +105,12 @@ pub struct DiscoveredTest {
     /// `fn`, which could charge an unrelated function's `#[ignore]` to
     /// this test.
     pub ignored: bool,
+    /// The reason string of `#[ignore = "…"]`, or `None` for a bare
+    /// `#[ignore]` and for a test that is not ignored. Issue #488:
+    /// linkage-check's Decision-26 rule reads it to tell CLAUDE.md
+    /// rule 6's `quarantined: <owner>, #<issue>` mark apart from an
+    /// unowned `#[ignore]`.
+    pub ignore_reason: Option<String>,
 }
 
 /// Generate the `.md` content for every `#[spec]` test under
@@ -376,6 +382,7 @@ fn collect_spec_tests_from_items(items: &[syn::Item], path: &Path, out: &mut Vec
                     let scenario = read_scenario_doc(&item_fn.attrs);
                     let steps = extract_steps_from_body(&item_fn.block);
                     let ignored = has_ignore_attr(&item_fn.attrs);
+                    let ignore_reason = read_ignore_reason(&item_fn.attrs);
                     out.push(DiscoveredTest {
                         spec_id,
                         fn_name,
@@ -383,6 +390,7 @@ fn collect_spec_tests_from_items(items: &[syn::Item], path: &Path, out: &mut Vec
                         scenario,
                         steps,
                         ignored,
+                        ignore_reason,
                     });
                 }
             }
@@ -448,6 +456,27 @@ fn read_spec_attr(attrs: &[syn::Attribute]) -> Option<String> {
 /// unconditional `#[ignore]` on the test.
 fn has_ignore_attr(attrs: &[syn::Attribute]) -> bool {
     attrs.iter().any(|attr| attr.path().is_ident("ignore"))
+}
+
+/// The string literal of an `#[ignore = "reason"]`, if the function
+/// carries one. A bare `#[ignore]` yields `None`, as does a reason that
+/// is not a plain string literal — there is no reason text to read.
+fn read_ignore_reason(attrs: &[syn::Attribute]) -> Option<String> {
+    attrs.iter().find_map(|attr| {
+        if !attr.path().is_ident("ignore") {
+            return None;
+        }
+        let syn::Meta::NameValue(nv) = &attr.meta else {
+            return None;
+        };
+        match &nv.value {
+            syn::Expr::Lit(syn::ExprLit {
+                lit: syn::Lit::Str(lit),
+                ..
+            }) => Some(lit.value()),
+            _ => None,
+        }
+    })
 }
 
 /// Scan the function's doc attributes for the first `/// Scenario:`
@@ -1217,5 +1246,31 @@ mod tests {
         );
         // `#[ignore = "reason"]` counts the same as bare `#[ignore]`.
         assert!(out[1].ignored, "{:?}", out[1]);
+        // …and its reason is kept, for linkage-check's quarantine carve-out.
+        assert_eq!(out[1].ignore_reason.as_deref(), Some("flaky"));
+        assert_eq!(out[0].ignore_reason, None);
+    }
+
+    #[test]
+    fn collect_spec_tests_from_items_bare_ignore_has_no_reason() {
+        // Issue #488: a bare `#[ignore]` is ignored but carries no reason,
+        // so it can never pass as a rule-6 quarantine mark.
+        let src = r#"
+            #[spec("hooks/delivery/002")]
+            #[ignore]
+            #[test]
+            /// Scenario: bare ignore.
+            fn delivery_002_bare() {}
+        "#;
+        let parsed = syn::parse_file(src).expect("test src parses");
+        let mut out: Vec<DiscoveredTest> = Vec::new();
+        collect_spec_tests_from_items(
+            &parsed.items,
+            std::path::Path::new("tests/synthetic.rs"),
+            &mut out,
+        );
+        assert_eq!(out.len(), 1);
+        assert!(out[0].ignored);
+        assert_eq!(out[0].ignore_reason, None);
     }
 }
