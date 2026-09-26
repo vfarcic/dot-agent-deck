@@ -371,6 +371,23 @@ impl CodexRolloutTailers {
 
 type FoundBlock = (BlockedKind, Option<i64>, Option<String>);
 
+/// Whether a read starting at `start` begins part-way through a line, so its
+/// first segment is the tail of a record and must be dropped. False at the
+/// start of the file and when the byte before `start` is a newline — a window
+/// that opens exactly on a record boundary keeps that record, which may be the
+/// very `task_complete` it was opened to catch. A byte that cannot be read
+/// answers true: dropping one line costs less than parsing half of one.
+fn opens_mid_record(file: &File, start: u64) -> bool {
+    if start == 0 {
+        return false;
+    }
+    let mut file = file;
+    let mut byte = [0u8; 1];
+    !(file.seek(SeekFrom::Start(start - 1)).is_ok()
+        && file.read_exact(&mut byte).is_ok()
+        && byte[0] == b'\n')
+}
+
 /// Read what `tailer`'s rollout gained since its last read, feeding each
 /// complete line to its watch. Returns the block the watch found, if any.
 fn read_tailer(tailer: &mut Tailer) -> Option<FoundBlock> {
@@ -388,7 +405,7 @@ fn read_tailer(tailer: &mut Tailer) -> Option<FoundBlock> {
         if len < open.offset || start > open.offset || tailer.rewind {
             open.offset = start;
             open.partial.clear();
-            open.discarding = start > 0;
+            open.discarding = opens_mid_record(&open.file, start);
         }
         tailer.rewind = false;
     }
@@ -688,6 +705,64 @@ mod tests {
             found.extend(t.tick(live));
         }
         assert_eq!(found.len(), 1, "the failure after the filler is found");
+    }
+
+    /// Issue #714 (Qodo on PR #1346): a back window that starts EXACTLY on a
+    /// record boundary keeps the record that starts there. The first segment
+    /// is dropped only when the byte before the window is not a newline, i.e.
+    /// when the window really did open mid-record; here that record is the
+    /// armed turn's quota `task_complete`, and dropping it would leave a
+    /// blocked Codex agent showing as working.
+    #[test]
+    fn a_back_window_starting_on_a_record_boundary_keeps_that_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let rollout = dir.path().join("rollout-2026-09-26T06-00-00-d.jsonl");
+        let record = format!(
+            concat!(
+                r#"{{"type":"event_msg","payload":{{"type":"task_complete","turn_id":"{t}","#,
+                r#""error":{{"message":"out of credits","codex_error_info":"usage_limit_exceeded"}}}}}}"#,
+                "\n"
+            ),
+            t = TURN
+        );
+        // Everything from the record to the end is exactly BACK_WINDOW bytes,
+        // so `len - BACK_WINDOW` is the record's first byte.
+        let window = BACK_WINDOW as usize;
+        let mut tail = record.clone().into_bytes();
+        let filler_line = [&[b'z'; 1023][..], b"\n"].concat();
+        while window - tail.len() > filler_line.len() {
+            tail.extend_from_slice(&filler_line);
+        }
+        let rest = window - tail.len();
+        tail.extend(std::iter::repeat_n(b'z', rest - 1));
+        tail.push(b'\n');
+        assert_eq!(tail.len(), window);
+        append(&rollout, b"{\"type\":\"session_meta\"}\n");
+        append(&rollout, &filler_line.repeat(4));
+        append(&rollout, &tail);
+
+        let mut tailers = CodexRolloutTailers::default();
+        tailers.apply(arm("d", &rollout, Some(TURN)));
+        let blocks = tailers.tick(live);
+        assert_eq!(
+            blocks.len(),
+            1,
+            "the quota record at the back window's first byte was discarded as a partial line"
+        );
+
+        // Control: a window that opens one byte INTO that record still drops
+        // the fragment rather than parsing half a line.
+        let straddled = dir.path().join("rollout-2026-09-26T06-00-01-e.jsonl");
+        append(&straddled, b"{\"type\":\"session_meta\"}\n");
+        append(&straddled, &filler_line.repeat(4));
+        append(&straddled, b"{");
+        append(&straddled, &tail);
+        let mut t = CodexRolloutTailers::default();
+        t.apply(arm("e", &straddled, Some(TURN)));
+        assert!(
+            t.tick(live).is_empty(),
+            "a window opening mid-record must drop that record's fragment"
+        );
     }
 
     /// Issue #714 (audit A3): disarming — by a matching `Stop` or by the turn's
