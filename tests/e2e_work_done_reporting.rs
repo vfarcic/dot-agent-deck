@@ -302,6 +302,24 @@ fn work_done_004_unsolicited_completion_is_visibly_labelled_in_the_attached_tui(
     );
 }
 
+/// The saved full report a cut-report notice names, resolved the way its
+/// recipient would. The daemon spells out the absolute path only when every
+/// character of it is inert; a path with whitespace (a temp root the harness
+/// may be pointed at) is named by its daemon-minted file name plus "in the
+/// .dot-agent-deck directory of …" instead (PR #1341 review), so both forms are
+/// accepted — and an absolute path must lie under `context_dir`.
+fn named_report_path(notice: &str, context_dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    let after = notice.split_once("the full report is saved at ")?.1;
+    let token: String = after.chars().take_while(|c| !c.is_whitespace()).collect();
+    let path = std::path::PathBuf::from(&token);
+    if path.is_absolute() {
+        return path.starts_with(context_dir).then_some(path);
+    }
+    after[token.len()..]
+        .starts_with(" in the .dot-agent-deck directory of")
+        .then(|| context_dir.join(&token))
+}
+
 /// Issue #508: the opening and closing of a report too long to inline. The
 /// head is inlined; the tail sits past the 4000-character bound, so it can only
 /// be recovered from the file the feedback names.
@@ -374,13 +392,8 @@ fn work_done_009_cut_report_names_its_saved_full_copy_in_the_attached_tui() {
         "control: the report's opening must be inlined and its tail cut\nOrchestrator PTY:\n{pty}"
     );
     let dir = deck.workdir().join(".dot-agent-deck");
-    let start = pty
-        .find(dir.to_string_lossy().as_ref())
-        .unwrap_or_else(|| panic!("the feedback names no path under {dir:?}\nPTY:\n{pty}"));
-    let named: String = pty[start..]
-        .chars()
-        .take_while(|c| !c.is_whitespace())
-        .collect();
+    let named = named_report_path(&pty, &dir)
+        .unwrap_or_else(|| panic!("the feedback names no saved report under {dir:?}\nPTY:\n{pty}"));
     let saved = std::fs::read_to_string(&named)
         .unwrap_or_else(|error| panic!("read the named report file {named:?}: {error}"));
     let lines: Vec<&str> = saved.lines().collect();

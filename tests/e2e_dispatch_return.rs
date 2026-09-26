@@ -640,6 +640,24 @@ fn dispatch_return_003_single_completion_routes_while_unknown_pane_stays_inert()
     );
 }
 
+/// The saved full report a cut-report notice names, resolved the way its
+/// recipient would. The daemon spells out the absolute path only when every
+/// character of it is inert; a path with whitespace (a temp root the harness
+/// may be pointed at) is named by its daemon-minted file name plus "in the
+/// .dot-agent-deck directory of …" instead (PR #1341 review), so both forms are
+/// accepted — and an absolute path must lie under `context_dir`.
+fn named_report_path(notice: &str, context_dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    let after = notice.split_once("the full report is saved at ")?.1;
+    let token: String = after.chars().take_while(|c| !c.is_whitespace()).collect();
+    let path = std::path::PathBuf::from(&token);
+    if path.is_absolute() {
+        return path.starts_with(context_dir).then_some(path);
+    }
+    after[token.len()..]
+        .starts_with(" in the .dot-agent-deck directory of")
+        .then(|| context_dir.join(&token))
+}
+
 /// Scenario: Dispatch a token-free single unit from a live caller pane, then complete it through the REAL `work-done --done` CLI with a multi-line report far past the 4000-character inline bound. The caller's pane must receive the completion turn ending with where the full report is saved — a fresh file in the dispatched worktree's `.dot-agent-deck/` — and that file must hold the whole report between the untrusted-report marker lines.
 #[spec("dispatch/return/008")]
 #[test]
@@ -692,15 +710,11 @@ fn dispatch_return_008_cut_report_names_its_saved_full_copy_in_the_unit_worktree
          and its tail cut.\nCaller PTY:\n{text}"
     );
     let dir = worktree.join(".dot-agent-deck");
-    let start = text
-        .find(dir.to_string_lossy().as_ref())
-        .unwrap_or_else(|| {
-            panic!("the completion turn names no path under the unit's worktree {dir:?}\n{text}")
-        });
-    let named: String = text[start..]
-        .chars()
-        .take_while(|c| !c.is_whitespace())
-        .collect();
+    let named = named_report_path(&text, &dir).unwrap_or_else(|| {
+        panic!(
+            "the completion turn names no saved report under the unit's worktree {dir:?}\n{text}"
+        )
+    });
     let saved = std::fs::read_to_string(&named)
         .unwrap_or_else(|error| panic!("read the named report file {named:?}: {error}"));
     let lines: Vec<&str> = saved.lines().collect();

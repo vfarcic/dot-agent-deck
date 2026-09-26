@@ -1010,19 +1010,22 @@ fn long_report(tag: &str) -> String {
     report
 }
 
-/// The path a completion notice names under `dir`, read out of the recipient's
-/// own scrollback rather than guessed from a naming scheme — the recipient is an
-/// agent that only knows what the notice told it.
-fn named_report_path(snapshot: &str, dir: &std::path::Path) -> Option<std::path::PathBuf> {
-    let prefix = dir.join(".dot-agent-deck").to_string_lossy().into_owned();
-    let start = snapshot.find(&prefix)?;
-    let named: String = snapshot[start..]
-        .chars()
-        .take_while(|c| !c.is_whitespace())
-        .collect();
-    Some(std::path::PathBuf::from(
-        named.trim_end_matches(['.', ',', ';', ':']),
-    ))
+/// The saved full report a cut-report notice names, resolved the way its
+/// recipient would. The daemon spells out the absolute path only when every
+/// character of it is inert; a path with whitespace (a temp root the harness
+/// may be pointed at) is named by its daemon-minted file name plus "in the
+/// .dot-agent-deck directory of …" instead (PR #1341 review), so both forms are
+/// accepted — and an absolute path must lie under `context_dir`.
+fn named_report_path(notice: &str, context_dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    let after = notice.split_once("the full report is saved at ")?.1;
+    let token: String = after.chars().take_while(|c| !c.is_whitespace()).collect();
+    let path = std::path::PathBuf::from(&token);
+    if path.is_absolute() {
+        return path.starts_with(context_dir).then_some(path);
+    }
+    after[token.len()..]
+        .starts_with(" in the .dot-agent-deck directory of")
+        .then(|| context_dir.join(&token))
 }
 
 /// Assert that `path` holds `report` in FULL — every line, in order, untruncated
@@ -1083,13 +1086,14 @@ fn work_done_007_unsolicited_report_past_the_inline_bound_is_recoverable_in_full
                 "control: the report must really have been cut at the inline bound, or this \
                  test proves nothing about recovering the rest; delivered = {delivered:?}"
             );
-            let path = named_report_path(delivered, harness.cwd.path()).unwrap_or_else(|| {
-                panic!(
-                    "the report was cut at the inline bound and the feedback names no file \
+            let path = named_report_path(delivered, &harness.cwd.path().join(".dot-agent-deck"))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "the report was cut at the inline bound and the feedback names no file \
                      holding the rest, so everything past the bound is unrecoverable; \
                      delivered = {delivered:?}"
-                )
-            });
+                    )
+                });
             assert_holds_the_full_framed_report(&path, &report);
             saved.push((path, report));
         }
@@ -1202,13 +1206,14 @@ fn dispatch_return_007_report_past_the_inline_bound_is_recoverable_in_full() {
             "control: the report must really have been cut at the inline bound; \
              snapshot = {snapshot:?}"
         );
-        let path = named_report_path(&snapshot, harness.cwd.path()).unwrap_or_else(|| {
-            panic!(
-                "the dispatched unit's report was cut at the inline bound and the completion \
+        let path = named_report_path(&snapshot, &harness.cwd.path().join(".dot-agent-deck"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "the dispatched unit's report was cut at the inline bound and the completion \
                  turn names no file holding the rest, so everything past the bound is \
                  unrecoverable; snapshot = {snapshot:?}"
-            )
-        });
+                )
+            });
         assert_holds_the_full_framed_report(&path, &report);
     });
 }
