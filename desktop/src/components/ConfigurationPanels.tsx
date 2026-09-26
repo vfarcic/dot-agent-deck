@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   AlertTriangle,
   ArrowDown,
@@ -20,6 +20,7 @@ import {
 import { defaultCliForProvider, permissionModeLabel, permissionModeOptions, resolveProfileCommand } from "../lib/profileCommands";
 import type { DaemonProjectsState } from "../hooks/useDaemonProjects";
 import { SelectDeckNote } from "./SelectDeckNote";
+import { ORCHESTRATION_TITLE_TAKEN, SAME_DIRECTORY_ORCHESTRATION, directoryLabel, orchestrationRunTitle, suggestOrchestrationName } from "../lib/newAgent";
 import type { AgentProfile, DaemonResolvedProject, DeckPrompt, Provider, RuntimeMode, WorkflowLaunchConfig } from "../types";
 
 /**
@@ -406,12 +407,42 @@ interface WorkflowPanelProps {
    * editable.
    */
   allDecks?: boolean;
+  /**
+   * The titles of the orchestrations live on the selected deck
+   * (`liveOrchestrationTitles`) — the universe the Run name is suggested
+   * against and checked for a collision in (issue #1044), the TUI's
+   * `live_orchestration_cwds_and_titles`.
+   */
+  liveTitles?: readonly string[];
+  /** The directories those orchestrations run in, for the same-directory warning. */
+  liveDirectories?: readonly string[];
 }
 
-export function WorkflowPanel({ open, profiles, order, mode, project, onChooseProject, onClose, onToggle, onMove, onLaunch, platformIssue, capabilityIssue, prompts = [], allDecks = false }: WorkflowPanelProps) {
+export function WorkflowPanel({ open, profiles, order, mode, project, onChooseProject, onClose, onToggle, onMove, onLaunch, platformIssue, capabilityIssue, prompts = [], allDecks = false, liveTitles = [], liveDirectories = [] }: WorkflowPanelProps) {
   const orchestrations = project?.orchestrations ?? [];
   const [name, setName] = useState("");
   const [taskPrompt, setTaskPrompt] = useState("");
+  /*
+   * Issue #1044 — the run's name, the TUI `Ctrl+n` dialog's Name field. It is
+   * SUGGESTED (`<basename>-orchestrator-N`, the lowest N no live orchestration
+   * on this deck holds) when the sheet opens and whenever the workflow changes,
+   * but only while the user has not typed in it: a generated default may
+   * replace a generated default, never a human edit (the TUI's
+   * `resuggest_name_for_selection`). Emptying it is a choice, not a request for
+   * a new suggestion — the run then takes the workflow's name.
+   */
+  const [runName, setRunName] = useState("");
+  const runNameTouched = useRef(false);
+  const cwdBasename = directoryLabel(project?.path ?? "");
+  const hasSelectedWorkflow = orchestrations.some((orchestration) => orchestration.name === name);
+  useEffect(() => {
+    if (!open || runNameTouched.current) return;
+    setRunName(hasSelectedWorkflow && cwdBasename ? suggestOrchestrationName(cwdBasename, liveTitles) : "");
+    // `liveTitles` is read, not watched: the TUI suggests from ONE snapshot
+    // taken when the dialog opens, and a name that re-numbered itself under the
+    // user's eyes as the fleet ticked would be worse than one that is briefly
+    // stale — the collision check below reads the live list either way.
+  }, [open, name, hasSelectedWorkflow, cwdBasename]);
   // Pre-select the project's default orchestration, or its only one. A
   // selection that no longer names an orchestration this project offers is
   // dropped rather than sent — the config can have changed under it.
@@ -473,7 +504,24 @@ export function WorkflowPanel({ open, profiles, order, mode, project, onChoosePr
     ? `${orchestration.displayName} marks no role as its start role, so there is no coordinator to launch. Mark one of its roles \`start = true\` in the project's .dot-agent-deck.toml.`
     : undefined;
   const allRequiredRolesEnabled = Boolean(orchestration) && !missingRoles.length && !extraRoles.length && !startRoleIssue && roles.some((role) => role.start);
-  const canLaunch = mode === "live" && !allDecks && !platformIssue && !capabilityIssue && Boolean(project) && name.trim().length > 0 && cwd.startsWith("/") && taskPrompt.trim().length > 0 && allRequiredRolesEnabled && invalidCommands.length === 0;
+  /*
+   * Issue #1044 — the TUI's two Name rules, against the selected deck's live
+   * orchestrations. The title a launch would actually take (the Name, or the
+   * workflow's own name when it is empty — `orchestrationRunTitle`) colliding
+   * with a live one REFUSES the launch, as `name_collision` refuses the TUI's
+   * submit; a directory that already runs an orchestration only WARNS. Both
+   * read the app's own view of the deck, so a deck that has not reported reads
+   * as nothing live — the hint degrades to "no warning", never to a block.
+   * Advisory in the sense that matters: the deck itself does not refuse a
+   * duplicate title (#555), so this is the client's check, as it is the TUI's.
+   */
+  const runTitle = orchestration ? orchestrationRunTitle(runName, orchestration.name) : undefined;
+  const titleTaken = runTitle !== undefined && liveTitles.includes(runTitle);
+  const sameDirectory = Boolean(orchestration) && cwd !== "" && liveDirectories.includes(cwd);
+  // The task prompt is NOT required (issue #1044): neither the deck nor the TUI
+  // requires one, and starting the orchestration as-is and typing the task into
+  // the coordinator is the ordinary TUI habit.
+  const canLaunch = mode === "live" && !allDecks && !platformIssue && !capabilityIssue && Boolean(project) && name.trim().length > 0 && cwd.startsWith("/") && !titleTaken && allRequiredRolesEnabled && invalidCommands.length === 0;
   const customCommandCount = resolved.filter(({ resolution }) => resolution.source === "custom").length;
   const generatedFullAccessCount = resolved.filter(({ profile, resolution }) => resolution.source === "generated" && profile.permissionMode === "full-access").length;
   return (
@@ -505,9 +553,17 @@ export function WorkflowPanel({ open, profiles, order, mode, project, onChoosePr
               way to change it is to choose a different project.
             */}
             <label><span>Project directory (from the deck)</span><input aria-label="Absolute project directory" value={cwdDisplay} readOnly placeholder="Choose a project first" spellCheck={false} data-testid="workflow-project-path" /></label>
+            {/*
+              Issue #1044 — the run's name, which labels its tab and card. An
+              empty one is allowed and falls back to the workflow's name, which
+              the placeholder says.
+            */}
+            <label><span>Run name</span><input aria-label="Run name" value={runName} onChange={(event) => { runNameTouched.current = true; setRunName(event.target.value); }} placeholder={orchestration?.displayName ?? ""} spellCheck={false} data-testid="workflow-run-name" /></label>
+            {titleTaken && <small role="alert" data-testid="workflow-title-taken"><AlertTriangle size={12} /> {ORCHESTRATION_TITLE_TAKEN}</small>}
+            {!titleTaken && sameDirectory && <small data-testid="workflow-same-directory"><AlertTriangle size={12} /> {SAME_DIRECTORY_ORCHESTRATION}</small>}
             <label className="workflow-task-prompt">
               <span className="task-prompt-label">
-                Task prompt
+                Task prompt (optional)
                 {prompts.length > 0 && (
                   <select
                     aria-label="Insert saved prompt"
@@ -526,7 +582,7 @@ export function WorkflowPanel({ open, profiles, order, mode, project, onChoosePr
             </label>
             {!project && <small data-testid="workflow-needs-project"><AlertTriangle size={12} /> No project chosen. <button type="button" className="link-button" onClick={onChooseProject}>Choose one</button> — the deck offers the projects it can see, and workflows come from the project.</small>}
             {project && !orchestrations.length && <small data-testid="workflow-no-orchestrations"><AlertTriangle size={12} /> The deck resolved this project but it defines no workflow with roles.</small>}
-            {!taskPrompt.trim() && <small><AlertTriangle size={12} /> Add the task you want the coordinator to run.</small>}
+            {!taskPrompt.trim() && <small data-testid="workflow-no-task">No task: the coordinator starts, reads its role and waits — type the task into its pane.</small>}
             {platformIssue && <small data-testid="workflow-platform-issue"><AlertTriangle size={12} /> {platformIssue}</small>}
             {/* PRD #741 M8: the deck does not advertise the verbs a launch needs. */}
             {capabilityIssue && <small data-testid="workflow-capability-issue"><AlertTriangle size={12} /> {capabilityIssue}</small>}
@@ -551,7 +607,7 @@ export function WorkflowPanel({ open, profiles, order, mode, project, onChoosePr
         </div>
         <footer className="sheet-footer workflow-footer">
           <span>{enabled.length} active roles · {ordered.length - enabled.length} skipped</span>
-          {mode === "live" ? <button className="button primary" data-testid="launch-live-loop" disabled={!canLaunch} onClick={() => onLaunch({ name, cwd, displayName: orchestration?.displayName ?? name, displayPath: cwdDisplay, taskPrompt: taskPrompt.trim(), roles, rows: 32, cols: 120, customCommandCount, generatedFullAccessCount, configRevision: project?.configRevision })}><Bot size={14} /> Launch live loop</button> : <button className="button primary" onClick={onClose}><Check size={14} /> Use preview</button>}
+          {mode === "live" ? <button className="button primary" data-testid="launch-live-loop" disabled={!canLaunch} onClick={() => onLaunch({ name, cwd, displayName: orchestration?.displayName ?? name, displayPath: cwdDisplay, ...(runName !== "" ? { displayTitle: runName } : {}), taskPrompt: taskPrompt.trim(), roles, rows: 32, cols: 120, customCommandCount, generatedFullAccessCount, configRevision: project?.configRevision })}><Bot size={14} /> Launch live loop</button> : <button className="button primary" onClick={onClose}><Check size={14} /> Use preview</button>}
         </footer>
       </section>
     </div>

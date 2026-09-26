@@ -4848,6 +4848,7 @@ mod tests {
     fn runs_launch(cwd: &std::path::Path) -> crate::StartWorkflowRequest {
         crate::StartWorkflowRequest {
             name: "review".into(),
+            display_title: None,
             cwd: cwd.to_string_lossy().into_owned(),
             task_prompt: "list the files".into(),
             roles: vec![crate::dto::WorkflowRoleInput {
@@ -4859,6 +4860,29 @@ mod tests {
             cols: Some(80),
             config_revision: None,
         }
+    }
+
+    /// Issue #1044. Scenario: a Runs launch names its run with a terminal
+    /// escape, or with a bidi override that would reverse the tab's text. It
+    /// is refused with the New agent
+    /// launch's own sentence before any deck is contacted, so the name cannot
+    /// reach a tab it could not be drawn in.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_runs_launch_with_an_unusable_run_name_is_refused_before_any_deck() {
+        let state = crate::terminal::DesktopState::default();
+        for title in ["run\u{1b}[2J", "deploy\u{202e}er"] {
+            let mut request = runs_launch(std::path::Path::new("/nonexistent-1044"));
+            request.display_title = Some(title.into());
+            let Err(refused) = crate::start_workflow_action(&state, request).await else {
+                panic!("a run name of {title:?} must be refused");
+            };
+            assert_eq!(
+                refused.message(),
+                "the run name is invalid, oversized, or contains control characters"
+            );
+        }
+        assert_eq!(state.daemon.handshake_count(), 0, "no deck was contacted");
     }
 
     /// Scenario (#1083): the local deck is a real daemon running one agent,
