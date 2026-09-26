@@ -1418,13 +1418,20 @@ export interface DeckBridge {
   /**
    * Persist the whole document and resolve with what was written.
    *
+   * `base` is the document the edit was made against — what the window showed
+   * when the user changed something. With it, only what differs between `base`
+   * and `settings` is written, and every other field keeps what the file holds
+   * now, so another app window's save or a hand edit since this window loaded is
+   * not overwritten by this window's stale copy (issue #828). The resolved
+   * document is the file as written, so it carries such an edit back.
+   *
    * PRD #742 M4: a write that changed the `[endpoints]` section also
    * **re-establishes the fleet**, because that section is the only thing that
    * decides which decks are observed and the crate emits no membership event a
    * listener could prune from. A theme save changes no deck and takes no such
    * path.
    */
-  saveSettings(settings: DesktopSettingsDto): Promise<DesktopSettingsDto>;
+  saveSettings(settings: DesktopSettingsDto, base?: DesktopSettingsDto): Promise<DesktopSettingsDto>;
   /**
    * Test one deck end to end and resolve with a **named state** (PRD #741 M10).
    *
@@ -2043,7 +2050,7 @@ export function mapDesktopSnapshot(dto: DesktopSnapshotDto, previous?: DeckSnaps
  * reachable from the URL — the previous inline `||` chain had to be edited in
  * lockstep with the fixture and was not.
  */
-const FIXTURE_STATES: readonly FixtureState[] = ["connected", "crowded", "disconnected", "error", "empty", "fleet"];
+const FIXTURE_STATES: readonly FixtureState[] = ["connected", "crowded", "disconnected", "error", "empty", "fleet", "docs"];
 
 class FixtureDeckBridge implements DeckBridge {
   readonly mode = "fixture" as const;
@@ -2729,6 +2736,11 @@ export class TauriDeckBridge implements DeckBridge {
    */
   private attached = new Set<string>();
   private sessions = new Map<string, InstalledTerminalSession>();
+  /**
+   * The tail of each terminal's input queue, by the same composite key as
+   * {@link sessions}. See {@link sendTerminalInput} for why input is queued.
+   */
+  private inputTails = new Map<string, Promise<void>>();
   /**
    * `sessionId` -> the composite key its session is filed under.
    *
@@ -3847,9 +3859,9 @@ export class TauriDeckBridge implements DeckBridge {
     return snapshot;
   }
 
-  async saveSettings(settings: DesktopSettingsDto): Promise<DesktopSettingsDto> {
+  async saveSettings(settings: DesktopSettingsDto, base?: DesktopSettingsDto): Promise<DesktopSettingsDto> {
     const invoke = await this.getInvoke();
-    const written = normalizeDesktopSettings(await invoke<DesktopSettingsDto>("desktop_set_settings", { settings }));
+    const written = normalizeDesktopSettings(await invoke<DesktopSettingsDto>("desktop_set_settings", { settings, base }));
     const fingerprint = endpointsFingerprint(written);
     // An unspecified section is not a change and must not become the baseline
     // either: recording the sentinel would make the NEXT real edit compare
@@ -4004,11 +4016,42 @@ export class TauriDeckBridge implements DeckBridge {
    * object would find nothing in production while passing any test that reused
    * one reference.
    */
+  /**
+   * Issue #953 — one write in flight per terminal, in the order typed.
+   *
+   * xterm hands over each keystroke as its own chunk, and each chunk is its own
+   * `desktop_terminal_write` command. Tauri runs every async command as its own
+   * task, so two issued back to back reach the Rust side's writer lock in
+   * whichever order the runtime schedules them — the lock serialises the
+   * writes but cannot know their order. The driver tier measured the result in
+   * the real window: `echo dad-driver-…` typed at WebDriver speed reached bash
+   * as `echo dadd-river-…`. So each chunk is issued only once the previous one
+   * for the same terminal has been written. A failed write rejects its own
+   * caller and does not stall the queue behind it.
+   *
+   * Each chunk is bound to the session installed when it was ACCEPTED, not the
+   * one installed when its turn comes: if that session ends while the chunk
+   * waits and the pane reattaches, the chunk was typed into a terminal that no
+   * longer exists, and it rejects as not attached rather than landing in the
+   * replacement.
+   */
   async sendTerminalInput(target: AgentTarget, data: string): Promise<void> {
-    const invoke = await this.getInvoke();
-    const session = this.sessions.get(agentKey(target.deckId, target.agentId));
-    if (!session) throw new Error(`Terminal for ${target.agentId} is not attached.`);
-    await invoke("desktop_terminal_write", { sessionId: session.result.sessionId, data: Array.from(new TextEncoder().encode(data)) });
+    const key = agentKey(target.deckId, target.agentId);
+    const accepted = this.sessions.get(key);
+    const notAttached = () => new Error(`Terminal for ${target.agentId} is not attached.`);
+    if (!accepted) throw notAttached();
+    const previous = this.inputTails.get(key) ?? Promise.resolve();
+    const write = previous.then(async () => {
+      const invoke = await this.getInvoke();
+      if (this.sessions.get(key) !== accepted) throw notAttached();
+      await invoke("desktop_terminal_write", { sessionId: accepted.result.sessionId, data: Array.from(new TextEncoder().encode(data)) });
+    });
+    const tail = write.catch(() => undefined);
+    this.inputTails.set(key, tail);
+    void tail.then(() => {
+      if (this.inputTails.get(key) === tail) this.inputTails.delete(key);
+    });
+    return write;
   }
 
   onTerminalGeometry(listener: (agentId: string, rows: number, cols: number, deckId?: string) => void): () => void {

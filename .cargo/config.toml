@@ -66,6 +66,12 @@ xtask = "run --quiet --package xtask-linkage-check --"
 # uses.
 xver = "run --quiet --package xtask-cross-version --"
 
+# Issue #1322: regenerate the docs screenshots of both clients from named
+# scenarios into `docs/img/` (`xtask/screenshots`, maintainer page
+# `docs/develop/docs-screenshots.md`). Its own binary for the same reason as
+# `xver`: it links `vt100`, which `xtask-linkage-check` has no use for.
+docs-screenshots = "run --quiet --package xtask-screenshots --"
+
 # Issue #863 — the machine-wide link gate. Concurrent workspace builds from
 # separate dispatch worktrees saturated the shared dev box: `io full avg300=65.95`
 # (for two-thirds of a five-minute window EVERY runnable task was blocked on

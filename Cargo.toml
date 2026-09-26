@@ -5,6 +5,7 @@ members = [
     "xtask/cross-version",
     "xtask/docs",
     "xtask/linkage-check",
+    "xtask/screenshots",
     "xtask/spec",
 ]
 
@@ -108,6 +109,9 @@ spec = { path = "xtask/spec" }
 # regenerates the paired .md so local DOT_AGENT_DECK_RECORD=1 runs
 # keep the docs in sync without a separate `cargo xtask docs --tests`.
 xtask-docs = { path = "xtask/docs" }
+# Issue #1322: `tests/e2e_docs_screenshots.rs` renders the harness's vt100
+# screen to HTML with this crate's renderer, for `cargo docs-screenshots`.
+xtask-screenshots = { path = "xtask/screenshots" }
 
 # PRD #42 M1: `libc` is Unix-only. Every `libc::` reference lives behind a
 # `#[cfg(unix)]` path (mostly `src/platform/*/unix.rs`), so on Windows the

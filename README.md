@@ -1,3 +1,10 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/brand/lockup-dark.svg">
+    <img alt="Agent Deck" src="assets/brand/lockup-light.svg" width="440">
+  </picture>
+</p>
+
 # dot-agent-deck
 
 A terminal dashboard for monitoring and controlling multiple AI coding agent sessions.

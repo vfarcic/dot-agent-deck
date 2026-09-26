@@ -5498,15 +5498,13 @@ impl AgentPtyRegistry {
     pub fn take_dispatch_return(
         &self,
         unit_pane_id: &str,
-    ) -> Option<crate::dispatch_return::DispatchCaller> {
-        // The unit half of the retained route is the EOF sweep's business only —
-        // a terminal `work-done` carries no agent identity to check it against —
-        // so the delivery path is handed the caller and nothing else.
-        self.dispatch_returns
-            .lock()
-            .unwrap()
-            .take(unit_pane_id)
-            .map(|entry| entry.caller)
+    ) -> Option<crate::dispatch_return::RetainedReturn> {
+        // A terminal `work-done` carries no agent identity, so delivery cannot
+        // CHECK the unit half against anything. It is still handed over (issue
+        // #508, PR #1341 review): the unit's cwd — where an over-long report is
+        // saved — is read from that exact agent's record, never re-resolved by
+        // pane id, which a successor may already hold.
+        self.dispatch_returns.lock().unwrap().take(unit_pane_id)
     }
 
     /// How many dispatched units still owe a report. Observability and tests.
@@ -16236,7 +16234,8 @@ mod spawn_tests {
 
         // And the other caller's unit is untouched, then consumed by delivery.
         assert_eq!(
-            reg.take_dispatch_return("unit-pane-c").map(|c| c.unit_name),
+            reg.take_dispatch_return("unit-pane-c")
+                .map(|r| r.caller.unit_name),
             Some("c".to_string())
         );
         assert_eq!(
@@ -16315,7 +16314,8 @@ mod spawn_tests {
 
         // The unrelated caller's unit is untouched.
         assert_eq!(
-            reg.take_dispatch_return("unit-pane-c").map(|c| c.unit_name),
+            reg.take_dispatch_return("unit-pane-c")
+                .map(|r| r.caller.unit_name),
             Some("c".to_string())
         );
         assert_eq!(reg.outstanding_dispatch_returns(), 0);

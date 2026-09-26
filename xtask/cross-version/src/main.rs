@@ -19,6 +19,8 @@
 #[cfg(target_os = "linux")]
 mod buildgate;
 #[cfg(target_os = "linux")]
+mod buildns;
+#[cfg(target_os = "linux")]
 mod ctl;
 #[cfg(target_os = "linux")]
 mod inner;
