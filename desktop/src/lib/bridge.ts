@@ -19,6 +19,7 @@ import type { HandoffEdge,
   DeckActionResult,
   DeckDirectoryListing,
   DeckFleet,
+  DeckListingOptions,
   DeckSnapshot,
   DesktopFeatures,
   EvidenceItem,
@@ -65,6 +66,8 @@ export interface DesktopSnapshotDto {
     projectActionsReason?: string;
     /** Why the New agent flow cannot start anything on this deck (PRD #1223); absent when it can. */
     newAgentReason?: string;
+    /** Issue #1240: the deck honours the directory browser's listing options. */
+    listingOptions?: boolean;
     error?: string;
     clientProtocolVersion: number;
     serverProtocolVersion?: number;
@@ -1601,8 +1604,11 @@ export interface DeckBridge {
    * deck's refusal for a path it cannot list, with the crate's
    * `DeckScope::resolve` wording for a deck the app no longer observes, or
    * with a connection error for one that stopped answering.
+   *
+   * `options` (issue #1240) widen or narrow the listing; pass them only to a
+   * deck whose connection has `listingOptions` — any other deck refuses them.
    */
-  listDirectories(deckId: string, path?: string): Promise<DeckDirectoryListing>;
+  listDirectories(deckId: string, path?: string, options?: DeckListingOptions): Promise<DeckDirectoryListing>;
   /**
    * PRD #1223 M4 — what the New agent form needs to know about the deck
    * `deckId` names. Resolves `unsupported` for a deck without the query, and
@@ -2018,6 +2024,7 @@ export function mapDesktopSnapshot(dto: DesktopSnapshotDto, previous?: DeckSnaps
       selectionFallback: dto.connection.selectionFallback,
       projectActionsReason: dto.connection.projectActionsReason,
       newAgentReason: dto.connection.newAgentReason,
+      listingOptions: dto.connection.listingOptions === true,
     },
     health: dto.connection.status === "incompatible" ? "failed" : dto.connection.status === "disconnected" ? "idle" : agents.some((agent) => agent.status === "failed") ? "failed" : "healthy",
     elapsed: previous?.elapsed ?? "—",
@@ -2111,10 +2118,17 @@ class FixtureDeckBridge implements DeckBridge {
     return this.isOlderDeck(deckId) || this.nonUnixDecks.has(deckId);
   }
 
-  /** Give a deck this preview plays as older the connection's `newAgentReason`, as the live crate does for a deck without `list-directories`. */
+  /**
+   * Give a deck this preview plays as older the connection's `newAgentReason`,
+   * as the live crate does for a deck without `list-directories` — and every
+   * other connected deck `listingOptions` (issue #1240), as the crate does for
+   * a deck at this build.
+   */
   private markOlderDeck(deck: DeckSnapshot): void {
     const deckId = deck.connection.deckId;
-    if (deckId !== undefined && deck.connection.status === "connected" && this.isOlderDeck(deckId)) deck.connection.newAgentReason = FIXTURE_NO_LISTING_REASON;
+    if (deckId === undefined || deck.connection.status !== "connected") return;
+    if (this.isOlderDeck(deckId)) deck.connection.newAgentReason = FIXTURE_NO_LISTING_REASON;
+    else deck.connection.listingOptions = true;
   }
 
   /**
@@ -2617,10 +2631,11 @@ class FixtureDeckBridge implements DeckBridge {
    * in the deck's own spelling. The one normalisation here — trailing and
    * doubled slashes dropped — is the fixture playing the DECK's canonicaliser.
    */
-  async listDirectories(deckId: string, path?: string): Promise<DeckDirectoryListing> {
+  async listDirectories(deckId: string, path?: string, options?: DeckListingOptions): Promise<DeckDirectoryListing> {
     await Promise.resolve();
     this.connectedDeck(deckId);
     if (this.isOlderDeck(deckId)) return { kind: "unsupported" };
+    const needle = options?.filter?.toLowerCase();
     if (path !== undefined && !fixtureAcceptsPath(path)) throw new Error(FIXTURE_PASTED_PATH_REFUSAL);
     const home = FIXTURE_HOMES[deckId] ?? "/home/dev";
     const wanted = path === undefined ? home : path.replace(/\/+/g, "/").replace(/(.)\/$/, "$1");
@@ -2631,7 +2646,13 @@ class FixtureDeckBridge implements DeckBridge {
       path: directory.path,
       displayPath: directory.path,
       ...(directory.parent === undefined ? {} : { parent: directory.parent }),
-      entries: directory.entries.map((entry) => ({ ...entry })),
+      // Issue #1240: the options, as a deck applies them — hidden and
+      // symlinked entries only when asked for, and the filter on the name.
+      entries: directory.entries
+        .filter((entry) => options?.includeHidden || !entry.displayName.startsWith("."))
+        .filter((entry) => options?.includeSymlinks || !entry.isSymlink)
+        .filter((entry) => !needle || entry.displayName.toLowerCase().includes(needle))
+        .map((entry) => ({ ...entry })),
       truncated: false,
     };
   }
@@ -4087,9 +4108,11 @@ export class TauriDeckBridge implements DeckBridge {
    * resolves `deckId` against the decks this app observes, and `path` is the
    * deck's own spelling or the user's typing — nothing here fills either in.
    */
-  async listDirectories(deckId: string, path?: string): Promise<DeckDirectoryListing> {
+  async listDirectories(deckId: string, path?: string, options?: DeckListingOptions): Promise<DeckDirectoryListing> {
     const invoke = await this.getInvoke();
-    return invoke<DeckDirectoryListing>("desktop_list_directories", { deckId, path: path ?? null });
+    // Issue #1240: `options` only when given, so a PRD #1223 listing is the
+    // same invoke it always was.
+    return invoke<DeckDirectoryListing>("desktop_list_directories", { deckId, path: path ?? null, ...(options ? { options } : {}) });
   }
 
   async desktopFeatures(): Promise<DesktopFeatures> {

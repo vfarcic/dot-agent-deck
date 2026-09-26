@@ -5976,12 +5976,33 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Does not assert:** other C0/C1 controls; U+061C, U+200E, U+200F, U+202A–U+202D, or U+2066–U+2069 bidi formatting characters; non-UTF-8 names (the JSON wire cannot represent them); paths over the predicate's 4096-byte whole-path limit (a single Unix component cannot reach it, and the harness does not construct descriptor-relative over-`PATH_MAX` trees); desktop rendering.
 - **Platform coverage:** mac+linux (`#![cfg(all(feature = "e2e", unix))]` — the fixture requires Unix filenames and `DaemonProc` binds Unix-domain sockets).
 
+##### newagent/browse/004 — `ListDirectories` lists hidden directories only when asked (issue #1240).
+- **Layer:** L2 lane 1 (one headless `daemon serve` driven over its attach socket; raw JSON pins the wire).
+- **Agent:** none. No credential.
+- **Asserts:** a request without `include_hidden` omits a `.`-named child directory; the same request with `include_hidden: true` lists it in sort order with its canonical path and its `.dot-agent-deck.toml` project marker, and still omits a `.`-named regular file. Entries carry no `is_symlink` key.
+- **Does not assert:** the desktop's Show hidden control (vitest, `NewAgentDialog.test.tsx`); symlinked entries (`newagent/browse/005`); the capability gate that withholds the field from an older daemon (`daemon_client` unit tests).
+- **Platform coverage:** mac+linux (`#![cfg(all(feature = "e2e", unix))]`).
+
+##### newagent/browse/005 — `ListDirectories` lists symlinked directories by their canonical target only when asked (issue #1240).
+- **Layer:** L2 lane 1 (one headless `daemon serve` driven over its attach socket against test-owned Unix symlinks).
+- **Agent:** none. No credential.
+- **Asserts:** without `include_symlinks` only the real child directory is listed; with `include_symlinks: true` a symlink to a directory elsewhere is listed under its link name, with its target's canonical path and `is_symlink: true`, beside the real child (which carries no `is_symlink` key), while a dangling symlink and a symlink to a regular file are not listed; listing the reported target path succeeds and lists the target's own child.
+- **Does not assert:** a symlink whose target fails the authoring-path predicate, or one swapped between the scan and the reply (unit tests in `src/directory_listing.rs`); the desktop's `link` row (vitest); a symlink loop — `realpath` refuses one, so the code drops it as it drops the dangling link, but no test builds one.
+- **Platform coverage:** mac+linux (`#![cfg(all(feature = "e2e", unix))]` — the fixture needs Unix symlinks).
+
+##### newagent/browse/006 — `ListDirectories` applies a name filter before the entry cap (issue #1240).
+- **Layer:** L2 lane 1 (one headless `daemon serve` driven over its attach socket against a 1,006-directory fixture).
+- **Agent:** none. No credential.
+- **Asserts:** with 1,005 directories sorting before it, a directory named `zz-past-the-cap` is absent from the plain, `truncated: true` listing; the same listing with `filter: "PAST-THE"` returns exactly that directory, untruncated, so the filter is matched case-insensitively and before the cap; a filter carrying `/` and one of 256 bytes are each refused with the ordinary `{ ok: false, error }` reply.
+- **Does not assert:** a filter cut short by the time budget; the desktop's debounced deck-side search (vitest); a filter carrying a control character (unit test `a_malformed_filter_is_refused_before_the_filesystem`).
+- **Platform coverage:** mac+linux (`#![cfg(all(feature = "e2e", unix))]`).
+
 #### newagent/options
 
 ##### newagent/options/001 — `NewAgentOptions` reports daemon-host configuration, registry order, feature state and capabilities.
 - **Layer:** L2 lane 1 (two headless `daemon serve` processes driven over their attach sockets, one with `DOT_AGENT_DECK_EXPERIMENTAL=1` and one without; no PTY or TUI surface).
 - **Agent:** none. The reply projects the compiled registry as data but starts no agent and spends no credential.
-- **Asserts:** both daemons read a distinctive `DashboardConfig.default_command` from a test-owned file selected through `DOT_AGENT_DECK_CONFIG`; `agents` is non-empty and exactly projects `agent_registry::ALL` in registry order as `{ id, display_name, default_command }`, including `claude` with command `claude`; `experimental` is false when the launch variable is absent and true when it is `1`; `authoring_kinds` is present as an array whose entries are strings; the live `Hello` capability set includes `list-directories` and `new-agent-options`.
+- **Asserts:** both daemons read a distinctive `DashboardConfig.default_command` from a test-owned file selected through `DOT_AGENT_DECK_CONFIG`; `agents` is non-empty and exactly projects `agent_registry::ALL` in registry order as `{ id, display_name, default_command }`, including `claude` with command `claude`; `experimental` is false when the launch variable is absent and true when it is `1`; `authoring_kinds` is present as an array whose entries are strings; the live `Hello` capability set includes `list-directories`, `list-directories-options` (issue #1240) and `new-agent-options`.
 - **Does not assert:** the contents of `authoring_kinds`, which `newagent/authoring/001` pins as the three supported authoring kinds; authoring seed delivery (`newagent/authoring/001`–`002`); desktop fallback behaviour against a daemon missing either capability; any agent binary's availability on PATH; the desktop form's rendering and selection rules.
 - **Platform coverage:** mac+linux (`#![cfg(all(feature = "e2e", unix))]` — `DaemonProc` binds Unix-domain sockets).
 

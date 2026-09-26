@@ -9,7 +9,7 @@ import { applyTerminalChunk } from "../lib/terminalBuffer";
 import { deckName } from "../lib/displayText";
 const EMPTY_TERMINAL_DATA: Record<string, TerminalBuffer> = {};
 import { isDelivered } from "../types";
-import type { AgentTarget, CleanupWarningEntry, DeckAction, DeckFleet, DeckRuntimeState, DeckSnapshot, DesktopFeatures, RuntimeMode, SendResult, TerminalBuffer } from "../types";
+import type { AgentTarget, CleanupWarningEntry, DeckAction, DeckFleet, DeckListingOptions, DeckRuntimeState, DeckSnapshot, DesktopFeatures, RuntimeMode, SendResult, TerminalBuffer } from "../types";
 
 /**
  * The snapshot a runtime starts with, before any deck has answered. Lifted out
@@ -415,7 +415,7 @@ export function useDeckRuntime(): DeckRuntimeState {
   // PRD #1223 M4, and for the same reason: a deck that cannot list, a path it
   // refuses and a deck that left the fleet are all things the New agent dialog
   // says in place, not faults of the screen behind it.
-  const listDirectories = useCallback((deckId: string, path?: string) => bridge.listDirectories(deckId, path), [bridge]);
+  const listDirectories = useCallback((deckId: string, path?: string, options?: DeckListingOptions) => (options ? bridge.listDirectories(deckId, path, options) : bridge.listDirectories(deckId, path)), [bridge]);
   const newAgentOptions = useCallback((deckId: string) => bridge.newAgentOptions(deckId), [bridge]);
   const newAgentOrchestrations = useCallback((deckId: string, path: string) => bridge.newAgentOrchestrations(deckId, path), [bridge]);
 

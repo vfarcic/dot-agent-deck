@@ -2978,14 +2978,21 @@ mod tests {
     /// point: this constant is a *program*, its whole job is to answer with a
     /// path, and a string assertion would pass over a syntax error or an
     /// inverted `-S` test alike.
+    ///
+    /// `env_clear`, for [`run_probe_under`]'s reason: the snippet's first rung
+    /// asks `$HOME/.local/bin/dot-agent-deck` and whatever `dot-agent-deck` is
+    /// on `PATH`, so an ambient `HOME` or `PATH` let a machine with a deck
+    /// installed answer instead of the fallback rungs these tests are about —
+    /// measured: on such a machine four of them printed that deck's endpoint
+    /// (or nothing) and failed, while CI, which installs no deck, stayed green.
     #[cfg(unix)]
     fn run_socket_probe(snippet: &str, env: &[(&str, &str)]) -> String {
+        let (_shim, path) = deckless_path();
         let output = std::process::Command::new("/bin/sh")
             .arg("-c")
             .arg(snippet)
-            .env_remove("DOT_AGENT_DECK_ATTACH_SOCKET")
-            .env_remove("XDG_RUNTIME_DIR")
-            .env_remove("TMPDIR")
+            .env_clear()
+            .env("PATH", &path)
             .envs(env.iter().copied())
             .output()
             .expect("run the discovery probe under /bin/sh");
@@ -2995,6 +3002,36 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    /// A `PATH` holding `id` (a link to the one this process would run) and
+    /// nothing else, and the directory keeping it alive. The fallback rungs call `id -u`, so the probe needs a PATH; a
+    /// system one such as `/usr/bin:/bin` would still let a deck installed
+    /// there answer the resolver rung instead of the rung under test.
+    #[cfg(unix)]
+    pub(super) fn deckless_path() -> (tempfile::TempDir, String) {
+        let shim = tempfile::tempdir().expect("a PATH shim directory");
+        // `id` from this process's own PATH, wherever that layout keeps it
+        // (a Nix profile, say), and the two conventional places otherwise.
+        let id = std::env::var_os("PATH")
+            .map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|dir| dir.join("id"))
+            .chain(["/usr/bin/id", "/bin/id"].map(std::path::PathBuf::from))
+            // Unix `execvp` semantics, near enough: an executable regular
+            // file, resolved to an absolute path so the link is not relative
+            // to wherever a relative PATH entry pointed.
+            .filter_map(|candidate| std::fs::canonicalize(candidate).ok())
+            .find(|candidate| {
+                use std::os::unix::fs::PermissionsExt as _;
+                std::fs::metadata(candidate)
+                    .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+            })
+            .expect("an executable `id` on PATH, at /usr/bin/id or at /bin/id");
+        std::os::unix::fs::symlink(&id, shim.path().join("id")).expect("link `id` into the shim");
+        let path = shim.path().to_str().expect("a UTF-8 temp path").to_string();
+        (shim, path)
     }
 
     #[cfg(unix)]
@@ -5701,8 +5738,10 @@ mod tunnel_tests {
         command.arg("-c").arg(snippet);
         command.env_clear();
         // The fallback rungs call `id -u`, so the child needs a PATH even
-        // when the test is about there being no deck on it.
-        command.env("PATH", "/usr/bin:/bin");
+        // when the test is about there being no deck on it — and one no deck
+        // can be on, which `/usr/bin:/bin` is not ([`deckless_path`]).
+        let (_shim, path) = super::tests::deckless_path();
+        command.env("PATH", &path);
         command.envs(env.iter().copied());
         let output = command.output().expect("run the discovery probe");
         assert!(

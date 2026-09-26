@@ -303,6 +303,13 @@ pub struct DesktopConnection {
     /// the wire when `None`, for [`Self::project_actions_reason`]'s reason.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub new_agent_reason: Option<String>,
+    /// Whether the deck honours the New agent directory browser's listing
+    /// options (issue #1240): it advertises `list-directories-options`, so the
+    /// browser offers Show hidden, lists symlinked directories and sends its
+    /// filter to the deck when the deck's own cap cut a listing short. Always on
+    /// the wire, like [`Self::build_stamp_mismatch_only`]: the dialog branches
+    /// on it to decide whether a control EXISTS.
+    pub listing_options: bool,
 }
 
 /// The three endpoint-shaped fields of [`DesktopConnection`], **for one deck**.
@@ -1071,6 +1078,22 @@ pub struct DesktopDirectoryEntry {
     pub display_name: String,
     /// It holds a `.dot-agent-deck.toml` the daemon's project reader would open.
     pub is_project: bool,
+    /// Issue #1240: the entry is a symlink the daemon listed by its target, so
+    /// [`Self::path`] is where it leads and need not lie under the listing.
+    pub is_symlink: bool,
+}
+
+/// Issue #1240: what the New agent dialog asks a deck to widen or narrow about
+/// one listing. Every field defaults to off, which is the PRD #1223 listing.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct DesktopListingOptions {
+    /// List `.`-named directories too.
+    pub include_hidden: bool,
+    /// List symlinks to directories too, by their targets.
+    pub include_symlinks: bool,
+    /// Keep only directories whose name contains this, before the deck's cap.
+    pub filter: Option<String>,
 }
 
 impl DesktopDirectoryListing {
@@ -1083,7 +1106,7 @@ impl DesktopDirectoryListing {
     pub(crate) fn listing(
         path: String,
         parent: Option<String>,
-        entries: impl IntoIterator<Item = (String, String, bool)>,
+        entries: impl IntoIterator<Item = (String, String, bool, bool)>,
         truncated: bool,
     ) -> Self {
         Self::Listing {
@@ -1092,11 +1115,14 @@ impl DesktopDirectoryListing {
             parent,
             entries: entries
                 .into_iter()
-                .map(|(name, path, is_project)| DesktopDirectoryEntry {
-                    path,
-                    display_name: display_only(&name),
-                    is_project,
-                })
+                .map(
+                    |(name, path, is_project, is_symlink)| DesktopDirectoryEntry {
+                        path,
+                        display_name: display_only(&name),
+                        is_project,
+                        is_symlink,
+                    },
+                )
                 .collect(),
             truncated,
         }
@@ -2155,6 +2181,7 @@ pub(crate) fn disconnected_snapshot(
             // screen is already saying the only thing there is to say.
             project_actions_reason: None,
             new_agent_reason: None,
+            listing_options: false,
         },
         agents: Vec::new(),
         // Issue #887: nothing answered, so this daemon reported no revision.
