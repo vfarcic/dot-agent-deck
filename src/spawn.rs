@@ -489,9 +489,13 @@ pub fn orchestrator_role_index(roles: &[RoleSpawn]) -> usize {
 /// prompt-delivery wait — never WHETHER the agent is registered: every pane is
 /// always spawned and registered synchronously before `spawn` returns, so a
 /// caller that inspects the registry immediately afterwards always sees the
-/// agents. When `false` (the #127 single-spawn path), the prompt-delivery wait
-/// (which can sit out the multi-second `SessionStart` fallback for a
-/// hook-less command) is awaited before returning. When `true` (the PRD #120
+/// agents. When `false` (the #127 single-spawn path, and `dispatch`), the
+/// prompt-delivery wait (which can sit out the multi-second `SessionStart`
+/// fallback for a hook-less command) and the FIRST write are awaited before
+/// returning — but not the confirmation that the agent submitted the prompt,
+/// which [`deliver`] always hands to a detached task, and not the outcome of
+/// that first write either: a refused write still returns `Ok`, because the
+/// pane exists either way. When `true` (the PRD #120
 /// issue-dispatch path), that wait runs in a detached task so the caller — the
 /// scheduler's run-active window — is freed the instant the dispatch WORK is
 /// done; a rapid re-fire after a tab close is then not blocked behind the prior
@@ -908,7 +912,21 @@ pub async fn spawn(
                         false
                     }
                 }) {
-                    state.write().await.register_orchestration_role(
+                    let title_cwd =
+                        crate::state::orchestration_title_cwd_key(&req.working_dir).await;
+                    let mut state = state.write().await;
+                    // Issue #962: the daemon holds the run title itself, beside
+                    // the role maps, so a `clear = true` worker re-created later
+                    // does not have to find a live sibling to read it from.
+                    // Recorded, not claimed: this path is not subject to the
+                    // `StartAgent` uniqueness check (issue #555) — see
+                    // `AppState::claim_orchestration_title`.
+                    state.record_orchestration_title(
+                        &identity,
+                        display_title.as_deref(),
+                        &title_cwd,
+                    );
+                    state.register_orchestration_role(
                         &pane_id,
                         &role.role_name,
                         // `orch_idx`, NOT `role.is_start_role`. `orch_idx` is
@@ -1562,11 +1580,19 @@ async fn deliver(
     }
     match event_rx {
         Some(rx) => {
-            // Detached on purpose: the caller (a `dispatch` CLI round trip, a
+            // Detached on purpose: the caller (a `dispatch` handler, a
             // scheduler fire) is freed the instant the bytes are written, exactly
             // as before this change. Only the CONFIRMATION — which legitimately
             // runs for tens of seconds against a Claude Code pane starting five
             // MCP servers — moves to the background.
+            //
+            // Issue #530: for `dispatch` the caller freed here is the daemon's
+            // hook-loop handler, whose `dispatch: spawned isolated …` reply to the
+            // requesting pane waits on this return. The `dispatch` CLI itself was
+            // answered earlier still, at the provenance gate, before the worktree
+            // existed — so neither its exit status nor that reply carries the
+            // outcome this task reaches. `docs/develop/dispatcher-mode.md` has
+            // the decision not to make either one wait for it.
             let registry = Arc::clone(registry);
             let pane_id = pane_id.to_string();
             let agent_id = agent_id.to_string();
@@ -6192,6 +6218,12 @@ mod tests {
             guard.pane_orchestration_map.is_empty(),
             "…nor a routing identity: {:?}",
             guard.pane_orchestration_map
+        );
+        // Issue #962: the run title recorded beside the role maps goes with them.
+        assert!(
+            guard.orchestration_titles.is_empty(),
+            "…nor a recorded run title: {:?}",
+            guard.orchestration_titles
         );
         drop(guard);
 

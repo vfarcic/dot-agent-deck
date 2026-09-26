@@ -3,6 +3,7 @@ import type { ConnectionView, DesktopFeatures } from "../types";
 import type { RailScreen, ShellOverlayState } from "../hooks/useShellOverlays";
 import { DISPLAY_LIMITS, displayText } from "../lib/displayText";
 import { VOICE_ACTIONS, type VoiceActionContext } from "../lib/voiceActions";
+import logoUrl from "../assets/logo.svg";
 
 /** What the rail's entries dispatch against — the registry members they need, and no more. */
 export type RailContext = Pick<VoiceActionContext, "navigate" | "openOverlay" | "closeOverlays">;
@@ -39,7 +40,9 @@ export function NavigationRail({ screen, overlays, context, connection, features
   const toDeck = () => (screen === "deck" ? VOICE_ACTIONS.showRuns.run(context) : VOICE_ACTIONS.openDeck.run(context));
   return (
     <aside className="rail" aria-label="Primary navigation">
-      <div className="brand-mark" aria-label="Agent Deck"><span>AD</span><i aria-hidden="true" /></div>
+      {/* Issue #746: `assets/logo.svg` is a copy of assets/brand/logo.svg written by
+          scripts/brand-icons.sh — edit the master and rerun that, never this copy. */}
+      <img className="brand-mark" src={logoUrl} alt="Agent Deck" width={36} height={36} />
       <nav>
         <RailButton icon={LayoutList} label="Overview" active={screen === "overview" && !overlayOpen} onClick={() => VOICE_ACTIONS.openOverview.run(context)} testId="open-overview" />
         {features.showDeck && <RailButton icon={SquareTerminal} label="Deck" active={screen === "deck" && !overlayOpen} onClick={toDeck} testId="open-deck" />}
