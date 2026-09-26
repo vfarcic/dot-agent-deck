@@ -639,3 +639,83 @@ fn dispatch_return_003_single_completion_routes_while_unknown_pane_stays_inert()
          the daemon drained both work-done signals."
     );
 }
+
+/// Scenario: Dispatch a token-free single unit from a live caller pane, then complete it through the REAL `work-done --done` CLI with a multi-line report far past the 4000-character inline bound. The caller's pane must receive the completion turn ending with where the full report is saved — a fresh file in the dispatched worktree's `.dot-agent-deck/` — and that file must hold the whole report between the untrusted-report marker lines.
+#[spec("dispatch/return/008")]
+#[test]
+fn dispatch_return_008_cut_report_names_its_saved_full_copy_in_the_unit_worktree() {
+    const UNIT: &str = "long-return-probe";
+    const HEAD: &str = "long-return-head-6d01";
+    const TAIL: &str = "long-return-tail-past-the-bound-e4b7";
+
+    let scratch = common::race_safe_tempdir();
+    let (config, log) = write_submit_probe(scratch.path());
+    let deck = TuiDeck::builder()
+        .impersonating_pane_signals()
+        .with_pty_size(200, 50)
+        .with_env("PATH", path_with_binary_dir())
+        .with_env("DOT_AGENT_DECK_CONFIG", config.to_string_lossy())
+        .with_env("DOT_AGENT_DECK_LOG", log.to_string_lossy())
+        .launch_with_fixture("minimal");
+    deck.wait_for_string("No active sessions");
+    commit_fixture_repo(deck.workdir());
+
+    let caller = open_probe_caller(&deck);
+    let worktree = dispatch_worktree_of(&deck, UNIT);
+    let _guard = SiblingWorktreeGuard(worktree.clone());
+    let dispatched = run_dispatch(&deck, &caller, UNIT, "--single");
+    assert_cli_succeeded("dispatch --single", &dispatched);
+    wait_for_submitted_ack(&deck, UNIT, &caller, &log);
+    let single = wait_for_single_unit(&deck, &worktree, UNIT);
+
+    let findings = (0..120)
+        .map(|i| format!("- finding {i}: the quick brown fox jumps over the lazy dog"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let report = format!("{HEAD}\n\n## Findings\n\n{findings}\n\n{TAIL}\n");
+    let completed = run_work_done(&deck, &single.pane_id, &worktree, &report);
+    assert_cli_succeeded("dispatched single work-done --done", &completed);
+
+    const SAVED: &str = "the full report is saved at";
+    let arrived = common::wait_until(RETURN_WAIT, || pane_text(&deck, &caller).contains(SAVED));
+    let text = pane_text(&deck, &caller);
+    assert!(
+        arrived,
+        "the caller never learned where the rest of the unit's cut report is, so everything \
+         past the 4000-character bound is unrecoverable once the unit deletes its report file.\n\
+         Caller PTY:\n{text}\nDaemon log:\n{}",
+        log_tail(&log)
+    );
+    assert!(
+        text.contains("SUBMITTED:dispatch:") && text.contains(HEAD) && !text.contains(TAIL),
+        "control: the report must arrive as a submitted completion turn, its opening inlined \
+         and its tail cut.\nCaller PTY:\n{text}"
+    );
+    let dir = worktree.join(".dot-agent-deck");
+    let start = text
+        .find(dir.to_string_lossy().as_ref())
+        .unwrap_or_else(|| {
+            panic!("the completion turn names no path under the unit's worktree {dir:?}\n{text}")
+        });
+    let named: String = text[start..]
+        .chars()
+        .take_while(|c| !c.is_whitespace())
+        .collect();
+    let saved = std::fs::read_to_string(&named)
+        .unwrap_or_else(|error| panic!("read the named report file {named:?}: {error}"));
+    let lines: Vec<&str> = saved.lines().collect();
+    assert_eq!(
+        lines.first().copied(),
+        Some("[UNTRUSTED-WORKER-REPORT:"),
+        "{saved:?}"
+    );
+    assert_eq!(
+        lines.last().copied(),
+        Some(":END-UNTRUSTED-WORKER-REPORT]"),
+        "{saved:?}"
+    );
+    assert!(
+        saved.contains(&report),
+        "the saved file must hold the whole report verbatim, lines intact: {saved:?}"
+    );
+}

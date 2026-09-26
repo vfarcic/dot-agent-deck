@@ -3262,6 +3262,14 @@ without depending on the config struct API.
 - **Does not assert:** that framing binds an LLM (it is advisory, defence in depth rather than a parser boundary, as #509 itself says); case-insensitive and bracket-preserving details of the defang (`state::tests::frame_untrusted_report_for_file_keeps_the_report_and_its_frame_intact`); #331's clobber of a worker's own `--task-file` at the role-keyed path, which is a separate issue.
 - **Platform coverage:** mac+linux (unix-only — raw-mode shell observer).
 
+##### orchestration/work-done/009 — On the REAL binary, a cut unsolicited report ends with where its full copy is saved, and that file holds the whole report framed as untrusted (issue #508).
+- **Layer:** L2 PTY-attached, lane 1 (the REAL `dot-agent-deck` binary through the vt100 `TuiDeck` harness with its lazy daemon; the completion is issued by the REAL `dot-agent-deck work-done --task-file` CLI over the deck's own hook socket). Synthetic (`cat` roles, no LLM), so deliberately NOT demo-reel-marked.
+- **Agent:** none (the `orch-deck` fixture's two `cat` roles). Both delegation watches are off via the millisecond seams.
+- **Asserts:** with nothing delegated, the real CLI delivers a ~7 KB multi-line report read verbatim from a file and exits 0; the daemon writes into the orchestrator's PTY the sentence `the full report is saved at`, with the report's opening inlined and its tail sentinel ABSENT (control: it was cut); the path is read out of that PTY text, lies under the fixture's `.dot-agent-deck/`, and names a file whose first and last lines are the untrusted-report markers and which holds the report verbatim; and the saved-report sentence becomes visible in the rendered orchestration surface's pane column. The notice closes the message, so it is what stays on screen however far the report scrolled — which is why this test does not extend `orchestration/work-done/004`, whose label a 7 KB report scrolls off a 40-row pane.
+- **Why it exists:** the fast-tier `orchestration/work-done/007` drives the handler in-process; this covers the CLI → hook socket → daemon → file → screen path end to end (PR #1341 review). Confirmed red with the `save_full_report` call disabled.
+- **Does not assert:** the file-framing edge cases (unit-tested); the Filed path's framing through the real binary (the lane-2 `delegate_work_done_chain_claude` drives that write with a real agent); an orchestrator reading the file.
+- **Platform coverage:** mac+linux (unix-only PTY/UDS).
+
 #### orchestration/provenance
 
 ##### orchestration/provenance/001 — On the REAL binary, under the DEFAULT policy, a `work-done` forged from outside a pane with nothing but that pane's id is refused and the refusal is reported to its sender, while the same verb issued from inside the pane still lands (issues #1077, #1129).
@@ -3738,6 +3746,14 @@ without depending on the config struct API.
 - **Why it exists:** the dispatch return is the path a dispatcher hears every unit through, and a unit's report routinely runs past 4000 characters. The turn used to end "the unit still holds the rest in its own worktree", which the unit's own delivery instructions make false — it deletes its report file after signalling — so the tail was lost. Confirmed red on `main` at `9083c6b` with exactly that sentence, and red again with only the `save_full_report` call removed from `return_dispatch_completion`.
 - **Does not assert:** the file surviving worktree removal (it does not, and the user docs say so); the save failing (unit-tested wording in `state::tests`); orchestration-shaped units (the same code path, keyed by the terminal pane); a real dispatcher reading the file.
 - **Platform coverage:** mac+linux (unix-only fast test — every observer is a POSIX-shell raw `cat`).
+
+##### dispatch/return/008 — On the REAL binary, a dispatched unit's cut report ends with where its full copy is saved in the unit's worktree, and that file holds the whole report (issue #508).
+- **Layer:** L2 synthetic, lane 1 (`TuiDeck` on `minimal`) driving the REAL `dispatch --single` and `work-done --done` CLIs through the hook socket, exactly as `dispatch/return/003` does; the daemon creates the real sibling worktree and PTY.
+- **Agent:** none — the caller and the single unit are `/001`'s raw terminal probe, which labels a submitted turn `SUBMITTED:`.
+- **Asserts:** after the usual caller-readiness, dispatch and acknowledgement preconditions, the unit's real `work-done --done` carries a ~7 KB multi-line report; the caller's PTY text gains `the full report is saved at` inside a `SUBMITTED:dispatch:` turn with the report's opening inlined and its tail ABSENT (control: cut, and delivered as a turn); the named path lies under the DISPATCHED WORKTREE's `.dot-agent-deck/` (not the caller's directory), and the file holds the report verbatim between the untrusted-report marker lines. This is the case the fast-tier `dispatch/return/007` cannot reach: its unit's cwd is read from a real dispatched agent's registry record, bound to the agent id retained at dispatch time.
+- **Why it exists:** PR #1341 review asked for L2 coverage of the changed completion path. Confirmed red with the `save_full_report` call disabled.
+- **Does not assert:** the rendered grid region of the turn (`/001`–`/003` own its wrapping); the file surviving worktree removal (it does not); a real dispatcher reading it.
+- **Platform coverage:** mac+linux (PTY-attached lane 1; POSIX-style PATH and the harness's local socket transport).
 
 #### dispatch/close
 

@@ -306,6 +306,7 @@ pub fn compose_completion_report(
                     full_report,
                     "text written by that unit",
                     "the unit's",
+                    "the unit's worktree",
                 )
             } else {
                 String::new()

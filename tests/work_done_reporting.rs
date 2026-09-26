@@ -1042,7 +1042,7 @@ fn assert_holds_the_full_framed_report(path: &std::path::Path, report: &str) {
         "the saved report must close with the untrusted-report frame marker; file = {body:?}"
     );
     assert!(
-        body.contains(report.trim_end()),
+        body.contains(report),
         "the saved report must carry the worker's text verbatim — neither collapsed nor cut; \
          file = {body:?}"
     );
