@@ -36,7 +36,7 @@ The first two steps do **not** touch `assets/brand/lockup-light.svg` and `lockup
 
 ## Regenerating the lockups
 
-Needed whenever the symbol or the wordmark changes. The wordmark is Inter Bold converted to outlines, so the lockups render the same everywhere without the font installed. Inter is licensed under the SIL Open Font License 1.1, whose FAQ treats a logo made with a font as artwork rather than as Font Software, so the outlined wordmark carries no OFL obligation and no entry in `THIRD_PARTY_NOTICES.md`; no part of the font file itself is committed. The script needs `fontTools` and `uharfbuzz` and the Inter variable font. On a machine with Nix, run this from the repository root and one build gets all three, from the `nixpkgs` revision pinned in this repository's `flake.lock` and for whatever system you are on, so two maintainers get the same font and shaping versions:
+Needed whenever the symbol or the wordmark changes. The wordmark is Inter Bold converted to outlines, so the lockups render the same everywhere without the font installed. Inter is licensed under the SIL Open Font License 1.1, whose FAQ treats a logo made with a font as artwork rather than as Font Software, so the outlined wordmark carries no OFL obligation and no entry in `THIRD_PARTY_NOTICES.md`; no part of the font file itself is committed. The script needs `fontTools` and `uharfbuzz` and the Inter variable font. On a machine with Nix, run this from the repository root and one build gets all three, from the `nixpkgs` revision pinned in this repository's `flake.lock` and for the system you are on, so two maintainers get the same font and shaping versions. That covers the systems `flake.nix` declares — `x86_64-linux`, `aarch64-linux` and `aarch64-darwin` — and **not an Intel Mac**: the pinned `nixpkgs` has dropped `x86_64-darwin` (the comment above `systems` in `flake.nix` has the detail), so on one the expression fails during evaluation; use the non-Nix route below there.
 
 ```bash
 env=$(nix --extra-experimental-features 'nix-command flakes' build --impure --no-link --print-out-paths --expr \
@@ -46,7 +46,7 @@ env=$(nix --extra-experimental-features 'nix-command flakes' build --impure --no
 
 The first run can take several minutes when that `nixpkgs` revision is not in your store yet.
 
-Without Nix, `pip install fonttools uharfbuzz` plus a downloaded `InterVariable.ttf` should do the same; only the Nix route above has been run.
+Without Nix — or on an Intel Mac — `pip install fonttools uharfbuzz` plus a downloaded `InterVariable.ttf` should do the same, though the versions are then whatever pip resolves rather than the pinned ones; only the Nix route above has been run, and only on `x86_64-linux`.
 
 ## Checking a change before committing it
 
