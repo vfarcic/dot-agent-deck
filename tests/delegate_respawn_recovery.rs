@@ -694,11 +694,29 @@ const DEAD_REPLACEMENT_NOTICE_BUDGET: Duration = Duration::from_secs(5);
 /// confirmed up, then delegate. The replacement dies before it can announce
 /// itself, and the orchestrator must be TOLD — in its own pane, and within five
 /// seconds rather than the thirty a readiness wait would cost — instead of being
-/// left to wait for a `work-done` that can never arrive.
+/// left to wait for a `work-done` that can never arrive. The daemon must not log
+/// that death as a readiness timeout either (issue #1243).
 #[tokio::test(flavor = "multi_thread")]
 #[spec("orchestration/delegate/023")]
 async fn delegate_023_a_replacement_that_dies_is_reported_to_the_orchestrator() {
     use std::os::unix::fs::PermissionsExt;
+
+    // Issue #1243 review: the replacement here is a stand-in the deck cannot
+    // identify, which is exactly the worker the unidentified-agent timeout WARN
+    // is about — and it must NOT get that WARN, because it did not wait out any
+    // timeout: it died. Global rather than thread-local because this runtime is
+    // multi-threaded and the dispatch task can run on any worker. Nextest runs
+    // each test in its own process, so the global slot is free; under plain
+    // `cargo test` a sibling may have taken it, and the log half is skipped.
+    let captured = CapturedLog::default();
+    let log_capture_installed = tracing::subscriber::set_global_default(
+        tracing_subscriber::fmt()
+            .with_writer(captured.clone())
+            .with_max_level(tracing_subscriber::filter::LevelFilter::WARN)
+            .with_ansi(false)
+            .finish(),
+    )
+    .is_ok();
 
     // The stand-in refuses to start once a `die` marker exists beside it. The
     // TEST drops that marker, after confirming the first worker is up — so
@@ -774,6 +792,49 @@ async fn delegate_023_a_replacement_that_dies_is_reported_to_the_orchestrator() 
         "the notice must not interpolate the role name; snapshot = {:?}",
         String::from_utf8_lossy(&snapshot)
     );
+    if log_capture_installed {
+        let log = captured.text();
+        assert!(
+            log.contains("replacement worker is no longer the pane's live agent"),
+            "control: the capture must see the dead-replacement WARN, or its silence about the \
+             timeout below proves nothing; captured log = {log:?}"
+        );
+        assert!(
+            !log.contains("waited the full readiness timeout"),
+            "a replacement that DIED was logged as having waited out the readiness timeout, with \
+             advice to declare its agent — the wait ended on its EOF, not on the deadline \
+             (issue #1243 review); captured log = {log:?}"
+        );
+    } else {
+        println!("SKIP: log half — a global tracing subscriber was already installed");
+    }
+}
+
+/// Issue #1243 review: an in-memory `tracing` writer for `delegate/023`.
+#[derive(Clone, Default)]
+struct CapturedLog(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl CapturedLog {
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+    }
+}
+
+impl std::io::Write for CapturedLog {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLog {
+    type Writer = CapturedLog;
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
 }
 
 /// Issue #1114: how long `delegate/032` keeps the worker pane in the window

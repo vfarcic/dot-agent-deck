@@ -5602,10 +5602,20 @@ async fn dispatch_one_owned(
                 // Its `SessionStartWait::default()` is the honest record — nothing
                 // was observed, so every downstream guard treats it as the
                 // fallback path, which is exactly what it is.
+                // Issue #1243 review: whether the wait ended because the
+                // replacement DIED rather than because the window ran out. Both
+                // come back as an unobserved `SessionStartWait`, but only the
+                // second is a timeout — logging the first as one would send the
+                // operator after a readiness declaration for a worker that never
+                // started. The dead-replacement check below reports it instead.
+                let mut replacement_died = false;
                 let wait = if has_readiness_signal {
                     tokio::select! {
                         biased;
-                        _ = replacement_exited => SessionStartWait::default(),
+                        _ = replacement_exited => {
+                            replacement_died = true;
+                            SessionStartWait::default()
+                        }
                         wait = wait_for_session_start(
                             &mut event_rx,
                             &pane_id,
@@ -5623,7 +5633,7 @@ async fn dispatch_one_owned(
                     SessionStartWait::default()
                 };
                 let observed = wait.ready;
-                if has_readiness_signal && !observed {
+                if has_readiness_signal && !observed && !replacement_died {
                     tracing::debug!(
                         role = %target_role,
                         pane_id = %pane_id,
