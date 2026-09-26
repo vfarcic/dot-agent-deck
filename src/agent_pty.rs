@@ -9,7 +9,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Read as _;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
@@ -4299,6 +4299,14 @@ pub struct OutstandingDelegation {
     /// ([`AgentPtyRegistry::release_worker_blocked_notice`]), so the notice
     /// stays owed for a later block of the same delegation.
     blocked_reported: bool,
+    /// Issue #714 (review): the task delivering this record's claimed
+    /// blocked-worker notice, while it may still be waiting on the
+    /// orchestrator's pane writer. Dropping it — the record superseded or
+    /// retired, or a newer notice task of this record taking its place —
+    /// cancels that task if it has not yet begun its write
+    /// ([`BlockedNoticeWaiter`]), so a stalled orchestrator writer holds at most
+    /// one queued notice per worker pane instead of one per delegation.
+    blocked_notice_waiter: Option<BlockedNoticeWaiter>,
     /// PRD #126 M1 review (finding 2) / audit (finding 3): the live end of the
     /// watch task's cancellation channel. Never *sent* on — the watch task
     /// selects on it and exits as soon as it resolves, which happens when this
@@ -4373,6 +4381,72 @@ pub struct QuotaProbe {
     pub screen: QuotaProbeScreen,
 }
 
+/// Issue #714 (review): where a blocked-worker notice task stands, so it is
+/// cancelled only while nothing of it can have reached the orchestrator.
+///
+/// `WAITING` until the task, holding the orchestrator's pane writer, has passed
+/// every re-check and is about to write; it then moves to `WRITING` and can no
+/// longer be cancelled. A cancel wins only from `WAITING`, and a task that finds
+/// itself cancelled at its write-time re-check refuses the write, so the two
+/// can never both proceed: either the write happens in full or none of it does.
+#[derive(Debug, Default)]
+struct BlockedNoticeGate(AtomicU8);
+
+impl BlockedNoticeGate {
+    const WAITING: u8 = 0;
+    const WRITING: u8 = 1;
+    const CANCELLED: u8 = 2;
+
+    /// Called writer-held, as the last re-check before the write: `false` once
+    /// the task has been cancelled.
+    fn begin_write(&self) -> bool {
+        self.0
+            .compare_exchange(
+                Self::WAITING,
+                Self::WRITING,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_ok()
+    }
+
+    /// `true` when the task had not begun its write and now never will.
+    fn cancel(&self) -> bool {
+        self.0
+            .compare_exchange(
+                Self::WAITING,
+                Self::CANCELLED,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_ok()
+    }
+}
+
+/// Issue #714 (review): the handle an [`OutstandingDelegation`] keeps on the
+/// task delivering its blocked-worker notice. Dropping it aborts that task if
+/// it is still waiting — on the orchestrator's writer, or anywhere before its
+/// write-time re-check — and leaves it alone once it may be writing.
+///
+/// Nothing needs releasing on a cancel: the waiter is dropped only when its
+/// record is superseded or retired, taking the claim flag with it, or when a
+/// newer notice task of the SAME record replaces it — which could claim only
+/// because this task had already released its claim. So the cancelled task's
+/// claim is never the one keeping the delegation's notice owed.
+#[derive(Debug)]
+struct BlockedNoticeWaiter {
+    gate: Arc<BlockedNoticeGate>,
+    task: tokio::task::AbortHandle,
+}
+
+impl Drop for BlockedNoticeWaiter {
+    fn drop(&mut self) {
+        if self.gate.cancel() {
+            self.task.abort();
+        }
+    }
+}
+
 /// Issue #714: what [`AgentPtyRegistry::claim_worker_blocked_notice`] hands back
 /// — where the notice goes and how to authorize it, and the role for the log.
 #[derive(Debug, Clone)]
@@ -4410,8 +4484,11 @@ pub enum DelegationRetirement {
     /// pane was re-delegated to before it answered. Issue #1080: those older
     /// generations are dropped rather than carried forward as debt, so this is
     /// the only non-`Nothing` outcome a `work-done` can have.
+    ///
+    /// The record is boxed so this common `Nothing`-returning call does not
+    /// carry the whole record inline (clippy `large_enum_variant`).
     Retired {
-        delegation: OutstandingDelegation,
+        delegation: Box<OutstandingDelegation>,
         superseded_dropped: u32,
     },
 }
@@ -5080,6 +5157,7 @@ impl AgentPtyRegistry {
                 superseded,
                 worker_agent_id: None,
                 blocked_reported: false,
+                blocked_notice_waiter: None,
                 _watch_cancel: cancel_tx,
             },
         );
@@ -5669,7 +5747,7 @@ impl AgentPtyRegistry {
         };
         DelegationRetirement::Retired {
             superseded_dropped: delegation.superseded,
-            delegation,
+            delegation: Box::new(delegation),
         }
     }
 
@@ -9710,6 +9788,17 @@ impl AgentPtyRegistry {
         seq: Option<u64>,
     ) -> Option<WorkerBlockedNotice> {
         let mut tracker = self.delegations.lock().unwrap();
+        Self::claim_worker_blocked_notice_in(&mut tracker, worker_pane_id, worker_agent_id, seq)
+    }
+
+    /// [`Self::claim_worker_blocked_notice_of`], under a delegation lock the
+    /// caller already holds.
+    fn claim_worker_blocked_notice_in(
+        tracker: &mut DelegationTracker,
+        worker_pane_id: &str,
+        worker_agent_id: &str,
+        seq: Option<u64>,
+    ) -> Option<WorkerBlockedNotice> {
         let record = tracker.records.get_mut(worker_pane_id)?;
         if record.blocked_reported
             || seq.is_some_and(|seq| record.seq != seq)
@@ -9757,6 +9846,13 @@ impl AgentPtyRegistry {
     /// caller — the quota monitor, which probes every pane from one loop, nor a
     /// delegate dispatch — may be held up by another pane's PTY. Returns the
     /// delivery's handle, `None` when nothing was owed.
+    ///
+    /// The task is recorded on the claimed delegation record, spawned under the
+    /// same lock hold as the claim ([`BlockedNoticeWaiter`]): superseding or
+    /// retiring that delegation, or a newer notice task of it, cancels this one
+    /// if it has not begun writing. Without that, a stalled orchestrator writer
+    /// would queue one waiter per delegation handed to a blocked worker, each
+    /// ahead of the current delegation's notice (issue #714 review).
     pub fn spawn_worker_blocked_notice(
         self: &Arc<Self>,
         worker_pane_id: &str,
@@ -9764,14 +9860,31 @@ impl AgentPtyRegistry {
         epoch: u64,
         seq: Option<u64>,
     ) -> Option<tokio::task::JoinHandle<()>> {
-        let notice = self.claim_worker_blocked_notice_of(worker_pane_id, worker_agent_id, seq)?;
+        let mut tracker = self.delegations.lock().unwrap();
+        let notice = Self::claim_worker_blocked_notice_in(
+            &mut tracker,
+            worker_pane_id,
+            worker_agent_id,
+            seq,
+        )?;
+        let gate = Arc::new(BlockedNoticeGate::default());
         let registry = Arc::clone(self);
+        let task_gate = Arc::clone(&gate);
         let (pane, agent) = (worker_pane_id.to_string(), worker_agent_id.to_string());
-        Some(tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             registry
-                .deliver_worker_blocked_notice(&pane, &agent, epoch, notice)
+                .deliver_worker_blocked_notice_gated(&pane, &agent, epoch, notice, &task_gate)
                 .await;
-        }))
+        });
+        // The claim just succeeded on this record, so it is still here; a
+        // waiter it replaces is dropped — and cancelled — right now.
+        if let Some(record) = tracker.records.get_mut(worker_pane_id) {
+            record.blocked_notice_waiter = Some(BlockedNoticeWaiter {
+                gate,
+                task: handle.abort_handle(),
+            });
+        }
+        Some(handle)
     }
 
     /// Issue #714 (review): report a block that is ALREADY published to a
@@ -9831,12 +9944,39 @@ impl AgentPtyRegistry {
         self: &Arc<Self>,
         worker_pane_id: &str,
         worker_agent_id: &str,
+        epoch: u64,
+        notice: WorkerBlockedNotice,
+    ) {
+        let gate = Arc::new(BlockedNoticeGate::default());
+        self.deliver_worker_blocked_notice_gated(
+            worker_pane_id,
+            worker_agent_id,
+            epoch,
+            notice,
+            &gate,
+        )
+        .await;
+    }
+
+    /// [`Self::deliver_worker_blocked_notice`], refusing the write once `gate`
+    /// has been cancelled ([`BlockedNoticeWaiter`]).
+    async fn deliver_worker_blocked_notice_gated(
+        self: &Arc<Self>,
+        worker_pane_id: &str,
+        worker_agent_id: &str,
         mut epoch: u64,
         mut notice: WorkerBlockedNotice,
+        gate: &Arc<BlockedNoticeGate>,
     ) {
         loop {
             if !self
-                .deliver_worker_blocked_notice_once(worker_pane_id, worker_agent_id, epoch, &notice)
+                .deliver_worker_blocked_notice_once(
+                    worker_pane_id,
+                    worker_agent_id,
+                    epoch,
+                    &notice,
+                    gate,
+                )
                 .await
             {
                 return;
@@ -9872,8 +10012,10 @@ impl AgentPtyRegistry {
         worker_agent_id: &str,
         epoch: u64,
         notice: &WorkerBlockedNotice,
+        gate: &Arc<BlockedNoticeGate>,
     ) -> bool {
         let text = crate::state::compose_worker_blocked_notice(worker_pane_id);
+        let gate = Arc::clone(gate);
         let orchestrator_pane_id = notice.orchestrator_pane_id.clone();
         let expected_agent_id = notice.orchestrator_agent_id.clone();
         let orchestration = notice.orchestration.clone();
@@ -9895,12 +10037,14 @@ impl AgentPtyRegistry {
                     {
                         return false;
                     }
+                    // Last, so a task that passes it writes: once past this
+                    // point the task can no longer be cancelled.
                     crate::state::orchestration_still_matches(
                         orchestration.as_ref(),
                         revalidate_registry
                             .pane_orchestration(&revalidate_pane)
                             .as_ref(),
-                    )
+                    ) && gate.begin_write()
                 },
             )
             .await;
@@ -11690,6 +11834,21 @@ mod tests {
             "a 4096x4096 pane is never replayed"
         );
         reg.shutdown_all();
+    }
+
+    /// Issue #714 (review): a blocked-worker notice task is cancellable only
+    /// until it begins its write, and one that was cancelled first never
+    /// begins it — so a cancel can never land on a write in progress.
+    #[test]
+    fn blocked_notice_gate_never_cancels_a_write_in_progress() {
+        let writing = BlockedNoticeGate::default();
+        assert!(writing.begin_write());
+        assert!(!writing.cancel(), "a task that is writing was cancelled");
+
+        let cancelled = BlockedNoticeGate::default();
+        assert!(cancelled.cancel());
+        assert!(!cancelled.begin_write(), "a cancelled task began its write");
+        assert!(!cancelled.cancel(), "a task was cancelled twice");
     }
 
     /// Issue #714: the blocked-worker notice is claimed once per outstanding

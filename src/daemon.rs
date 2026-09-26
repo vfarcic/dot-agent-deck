@@ -4888,6 +4888,93 @@ mod hook_ingestion_tests {
         fx.registry.shutdown_all();
     }
 
+    /// Issue #714 (review): a notice task waiting on a stalled orchestrator
+    /// writer is cancelled when its delegation is superseded, so repeated
+    /// delegations to a blocked worker leave at most one notice queued on that
+    /// writer, and releasing it delivers only the current delegation's notice.
+    #[tokio::test]
+    async fn superseded_blocked_notices_do_not_queue_on_a_stalled_orchestrator_writer() {
+        let fx = QuotaNoticeFixture::new("quota-stall-worker", "quota-stall-orch").await;
+        let writer = fx
+            .registry
+            .agent_writer(&fx.orch_id)
+            .expect("the orchestrator's writer");
+        let held = writer.lock().await;
+
+        let epoch = fx.confirm(std::time::Instant::now());
+        assert!(
+            publish_quota_blocked(&fx.registry, &fx.state, &fx.event_tx, fx.report(epoch)).await,
+            "precondition: the block applied"
+        );
+
+        let mut tasks = Vec::new();
+        for _ in 0..8 {
+            let armed = fx
+                .registry
+                .arm_outstanding_delegation(
+                    fx.worker_pane,
+                    "coder",
+                    fx.orch_pane,
+                    &fx.orch_id,
+                    None,
+                )
+                .expect("arm the delegation");
+            fx.registry
+                .bind_delegation_worker_agent_id(fx.worker_pane, armed.seq, &fx.worker_id);
+            tasks.push(
+                fx.registry
+                    .report_published_block_to_new_delegation(
+                        fx.worker_pane,
+                        armed.seq,
+                        &fx.worker_id,
+                    )
+                    .expect("each new delegation is reported"),
+            );
+        }
+
+        // A failure bound only: an abort lands on the task's next poll.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let pending = tasks.iter().filter(|t| !t.is_finished()).count();
+            if pending <= 1 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{pending} notice tasks still queued on the stalled writer"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let last = tasks.pop().expect("the current delegation's task");
+        assert!(
+            tasks.iter().all(|t| t.is_finished()),
+            "a superseded delegation's notice task is still waiting"
+        );
+        assert!(
+            !last.is_finished(),
+            "the current delegation's notice must still be waiting on the writer"
+        );
+        assert_eq!(fx.notices().await, 0, "precondition: nothing written yet");
+
+        drop(held);
+        tokio::time::timeout(Duration::from_secs(30), last)
+            .await
+            .expect("the current notice was delivered once the writer freed")
+            .expect("the notice task");
+        assert_eq!(
+            fx.settled_notices().await,
+            2,
+            "expected exactly one notice, the current delegation's (echo + output)"
+        );
+        assert!(
+            fx.registry
+                .claim_worker_blocked_notice(fx.worker_pane, &fx.worker_id)
+                .is_none(),
+            "the current delegation keeps the claim its delivered notice took"
+        );
+        fx.registry.shutdown_all();
+    }
+
     /// Scenario: Surface a hookless scheduled pane only through the daemon's live broadcast, leaving daemon AppState intentionally empty, then publish the exact delivery notice used when the 256-watch cap rejects the next confirmation. The already-visible attached-TUI card must receive an Error event through the production sink.
     #[spec("scheduler/dispatch/017")]
     #[tokio::test]
