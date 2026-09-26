@@ -1688,7 +1688,10 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let root = sandbox();
         let uid = crate::platform::paths::current_uid();
-        let primary = root.path().join(format!("dot-agent-deck-{uid}"));
+        // A one-letter per-uid name, so the socket X binds fits macOS's
+        // 104-byte `sun_path` under its long per-user `$TMPDIR`; the prefix
+        // rule reads the name, so nothing about the selection changes.
+        let primary = root.path().join("d");
         let make = |name: &str| {
             let dir = root.path().join(name);
             std::fs::create_dir(&dir).unwrap();
@@ -1697,13 +1700,13 @@ mod tests {
         };
 
         // Y makes its directory, then is delayed before it re-lists.
-        let y_created = make(&format!("dot-agent-deck-{uid}.ffffffffffffffff"));
+        let y_created = make("d.ffffffffffffffff");
         // X starts, finds Y's directory as the only one, and selects it.
         let x_selected = relocated_bind_dir(&primary, uid).unwrap();
         assert_eq!(x_selected, y_created);
         // Z starts too, finds nothing yet (it listed before Y's mkdir), and
         // makes a directory that sorts first.
-        let z_created = make(&format!("dot-agent-deck-{uid}.0000000000000000"));
+        let z_created = make("d.0000000000000000");
         assert_eq!(
             converge_on_first(Some(z_created.clone()), &primary, uid).unwrap(),
             Some(z_created.clone())
@@ -1724,9 +1727,7 @@ mod tests {
         // The other half of the race: a directory removed before a start could
         // claim it is reported vanished, so that start re-lists rather than
         // returning a directory that is gone.
-        let gone = root
-            .path()
-            .join(format!("dot-agent-deck-{uid}.1111111111111111"));
+        let gone = root.path().join("d.1111111111111111");
         assert!(!claim_relocated_dir(&gone).unwrap());
     }
 
