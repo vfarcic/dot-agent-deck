@@ -619,8 +619,9 @@ impl RelocationReason {
             }
             Self::AlreadyRelocated => {
                 "an earlier start relocated them there and the usual directory does not exist, \
-                 so they stay put; remove the relocated directory while no deck is running to \
-                 return to the usual location"
+                 so they stay put; to return to the usual location, stop the deck and remove \
+                 every relocated sibling of the usual directory (its name followed by a dot and \
+                 16 hex digits)"
             }
         }
     }
@@ -770,14 +771,7 @@ fn relocated_bind_dir(primary_dir: &Path, uid: u32) -> std::io::Result<PathBuf> 
         match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
             Ok(()) => {
                 crate::platform::fsperm::ensure_owner_only_dir(&dir)?;
-                // Re-list and take the first, as a caller that found existing
-                // directories would: two starters that each created one — only
-                // possible when they do not share a lock root — then converge
-                // on the same directory whenever each sees the other's.
-                return Ok(relocated_endpoint_dirs(primary_dir, uid)
-                    .into_iter()
-                    .next()
-                    .unwrap_or(dir));
+                return Ok(converge_on_first(dir, primary_dir, uid));
             }
             Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(source) => return Err(source),
@@ -790,6 +784,25 @@ fn relocated_bind_dir(primary_dir: &Path, uid: u32) -> std::io::Result<PathBuf> 
             primary_dir.display()
         ),
     ))
+}
+
+/// After creating `created`, re-list and take the first relocated directory,
+/// as a caller that found existing ones would: two starters that each created
+/// one — only possible when they do not share a lock root — then converge on
+/// the same directory whenever each sees the other's. A `created` that loses
+/// is removed, or it would keep relocation sticky ([`needs_relocation`]) after
+/// the operator removes the directory actually in use. `remove_dir` removes
+/// only an empty directory, so a starter that already bound inside it keeps it.
+#[cfg(unix)]
+fn converge_on_first(created: PathBuf, primary_dir: &Path, uid: u32) -> PathBuf {
+    let chosen = relocated_endpoint_dirs(primary_dir, uid)
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| created.clone());
+    if chosen != created {
+        let _ = std::fs::remove_dir(&created);
+    }
+    chosen
 }
 
 /// How many fresh names [`relocated_bind_dir`] tries. A collision on 64 random
@@ -1553,6 +1566,40 @@ mod tests {
             "a second start must reuse the directory, not mint one per start — \
              that is what lets the launcher and the daemon it spawns agree"
         );
+    }
+
+    #[test]
+    fn a_creator_that_converges_on_another_directory_removes_its_own() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = sandbox();
+        let uid = crate::platform::paths::current_uid();
+        let primary = root.path().join(format!("dot-agent-deck-{uid}"));
+        let make = |name: &str| {
+            let dir = root.path().join(name);
+            std::fs::create_dir(&dir).unwrap();
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+            dir
+        };
+        // A concurrent starter's directory sorts first; ours was just made.
+        let theirs = make(&format!("dot-agent-deck-{uid}.0000000000000000"));
+        let ours = make(&format!("dot-agent-deck-{uid}.ffffffffffffffff"));
+
+        assert_eq!(converge_on_first(ours.clone(), &primary, uid), theirs);
+        assert!(
+            !ours.exists(),
+            "the losing directory must not be left behind"
+        );
+
+        // Removing the one in use then leaves nothing to keep relocation sticky.
+        std::fs::remove_dir(&theirs).unwrap();
+        assert_eq!(needs_relocation(&primary, uid), None);
+
+        // And a directory someone already bound inside is not removed.
+        let theirs = make(&format!("dot-agent-deck-{uid}.0000000000000000"));
+        let ours = make(&format!("dot-agent-deck-{uid}.ffffffffffffffff"));
+        std::fs::write(ours.join("attach.sock"), b"").unwrap();
+        assert_eq!(converge_on_first(ours.clone(), &primary, uid), theirs);
+        assert!(ours.join("attach.sock").exists());
     }
 
     #[test]
