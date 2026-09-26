@@ -120,7 +120,7 @@ One answer can cover several units when the user gives one — take it and stop 
 ## What it does
 - Creates a git worktree as a SIBLING of this repo, at ../<repo>-dispatch-<name>, on branch agent/dispatch-<name>. Isolation is automatic — never create or pick a worktree yourself.
 - Starts the shape you selected inside it, delivering the --task text as its opening prompt.
-- Returns immediately and reports what was started and where.
+- Returns immediately. Its exit status says only that the daemon ACCEPTED the request, not that anything started — and an exit 0 with no answer from an older or slow daemon does not confirm even that: the outcome arrives afterwards in THIS pane as the daemon's reply, a turn beginning `dispatch:`. A reply beginning `dispatch: spawned isolated` reports what was started and where; a reply with any other opening is a failure that says why. (The completion report, below, is a separate and later turn, not this reply.) Never tell the user a unit started before that turn says so. Nothing confirms that a spawned unit received its task; its completion report (below) is the first sign that it did.
 
 ## Rules
 - The --task text must be SELF-CONTAINED — independent of THIS CONVERSATION, not of the repo. The dispatched agent is a fresh process and cannot see anything said here, so state the goal and the expected outcome in the task itself.

@@ -6109,6 +6109,65 @@ mod hook_ingestion_tests {
         fx.stop().await;
     }
 
+    /// Scenario: issue #530 — an attested `dispatch` that its handler then
+    /// REJECTS (it names an orchestration the caller's directory does not
+    /// define) is still acknowledged as `accepted`, and that acknowledgement is
+    /// the only line the connection ever carries. The rejection reaches the
+    /// caller as a `dispatch:` line typed into its own pane instead.
+    ///
+    /// This pins what `dot-agent-deck dispatch`'s exit status actually asserts,
+    /// which the CLI's help, the dispatcher seed and both dispatcher-mode pages
+    /// now state: exit 0 is the provenance gate admitting the request, not the
+    /// worktree, the spawn, the prompt's delivery or its confirmation. A change
+    /// that starts answering after the handler makes this fail, and is then a
+    /// change to a documented contract rather than a silent one.
+    #[tokio::test]
+    async fn a_dispatch_its_handler_rejects_is_still_acknowledged_as_accepted() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let fx = ProvenanceFixture::start().await;
+        const MISSING: &str = "no-such-orchestration-530";
+        let msg = crate::event::DaemonMessage::Dispatch(crate::event::DispatchSignal {
+            pane_id: PROV_ORCH_PANE.to_string(),
+            name: "exit-status-probe".to_string(),
+            task: Some("never started".to_string()),
+            shape: Some(crate::event::DispatchShape::Orchestration {
+                name: Some(MISSING.to_string()),
+            }),
+            timestamp: chrono::Utc::now(),
+            token: Some(fx.orchestrator_token.clone()),
+        });
+        let line = format!("{}\n", serde_json::to_string(&msg).unwrap());
+        let mut stream = UnixStream::connect(&fx.sock).await.expect("connect");
+        stream.write_all(line.as_bytes()).await.unwrap();
+        stream.flush().await.unwrap();
+        stream.shutdown().await.unwrap();
+        // Read to EOF: the hook loop awaits the handler inline on this
+        // connection, so EOF arrives only once the dispatch has been decided.
+        // Anything the handler wrote back would therefore be in `buf` too.
+        let mut buf = String::new();
+        stream.read_to_string(&mut buf).await.unwrap();
+        let lines: Vec<&str> = buf.lines().filter(|l| !l.trim().is_empty()).collect();
+        assert_eq!(
+            lines.len(),
+            1,
+            "a dispatch must answer exactly one line, the gate's ack: {buf:?}"
+        );
+        let ack: crate::event::SignalAck = serde_json::from_str(lines[0])
+            .unwrap_or_else(|e| panic!("dispatch reply was not a SignalAck ({e}): {buf:?}"));
+        assert!(ack.is_signal_ack(), "{ack:?}");
+        assert!(
+            ack.accepted,
+            "the ack is written at the gate, before the handler rejects the shape, so it must \
+             read as accepted — which is exactly why exit 0 cannot mean the unit started: {ack:?}"
+        );
+        assert!(
+            fx.orchestrator_saw(MISSING, Duration::from_secs(20)).await,
+            "the handler's rejection must reach the caller's pane, the one place the dispatch's \
+             outcome is reported"
+        );
+        fx.stop().await;
+    }
+
     /// Is `pid` gone? Mirrors `agent_pty::spawn_tests::pid_is_dead`, which is
     /// private to that module. Unix-only, like this whole block.
     fn pid_is_dead(pid: u32) -> bool {
