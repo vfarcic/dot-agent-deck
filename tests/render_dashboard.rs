@@ -1128,8 +1128,8 @@ fn palette_session(status: SessionStatus) -> SessionState {
 }
 
 /// Scenario: Render a dashboard card whose agent is blocked because its credits
-/// are depleted. The card must show a Blocked badge, use the error colour, and
-/// display the credit reason on its own line.
+/// are depleted, then render a stats bar with one blocked agent. The card must
+/// show a Blocked badge and credit reason, and both surfaces must use the error colour.
 #[spec("status/badge/002")]
 #[test]
 fn status_badge_002_blocked_card_snapshot() {
@@ -1162,6 +1162,25 @@ fn status_badge_002_blocked_card_snapshot() {
     );
     assert_eq!(border_style_at_mid(&buffer).0, Color::Red);
     insta::assert_snapshot!(rendered);
+
+    let stats = DashboardStats {
+        blocked: 1,
+        ..DashboardStats::default()
+    };
+    let stats_buffer = render_stats_bar_to_buffer(&stats, None, 80, 1);
+    let stats_text = buffer_to_text(&stats_buffer);
+    let blocked_byte = stats_text
+        .find("1 blocked")
+        .unwrap_or_else(|| panic!("missing blocked stats segment:\n{stats_text}"));
+    let blocked_x = stats_text[..blocked_byte].chars().count() as u16;
+    for x in blocked_x..blocked_x + "1 blocked".len() as u16 {
+        assert_eq!(
+            stats_buffer[(x, 0)].fg,
+            Color::Red,
+            "blocked stats segment must use the error colour:\n{}",
+            buffer_to_color_text(&stats_buffer)
+        );
+    }
 }
 
 /// Read the `(fg, modifier)` of a card/pane's left border at a mid-height row.
