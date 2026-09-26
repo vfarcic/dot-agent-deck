@@ -4398,6 +4398,23 @@ fn orchestration_display_title_from_live_siblings(
     })
 }
 
+/// Issue #447: whether a delegate to `role` will replace the worker's agent
+/// (`clear = true`) — the same decision `dispatch_one_owned` makes, from the
+/// same inputs. `false` when the role config cannot be resolved, as there.
+fn delegate_respawns_worker(
+    cwd: Option<&str>,
+    orchestration: Option<&OrchestrationIdentity>,
+    role: &str,
+) -> bool {
+    match (cwd, orchestration) {
+        (Some(cwd), Some(identity)) => {
+            lookup_orchestration_role_indexed(cwd, identity.name(), role)
+                .is_some_and(|(_, role_config)| role_config.clear)
+        }
+        _ => false,
+    }
+}
+
 /// Look up the role config for `role_name` inside the orchestration
 /// named `orchestration_name`, by parsing the project config file at
 /// `cwd`, together with the role's INDEX within that orchestration.
@@ -8528,7 +8545,18 @@ impl AppState {
             // again, so its waiting episode is opened here, now that it owes a
             // work-done. If the task pointer's delivery moves it on, its next
             // hook event closes the episode before the debounce runs out.
-            if commission_in_flight.is_some() {
+            //
+            // Not for a `clear = true` role (Qodo, #1347): `dispatch_one_owned`
+            // is about to replace the agent that is waiting, so its wait is not
+            // this delegation's business, and a queued dispatch could otherwise
+            // let the outgoing agent's episode fire before the replacement
+            // exists. The replacement's own hook events open its episode.
+            // Decided the way `dispatch_one_owned` decides it, from the same
+            // `cwd` and orchestration, and a missing role config means no
+            // respawn there too.
+            if commission_in_flight.is_some()
+                && !delegate_respawns_worker(cwd.as_deref(), orchestration.as_ref(), &target_role)
+            {
                 self.open_waiting_episode_if_already_waiting(&pane_id, &registry);
             }
             if !delivered.iter().any(|r| r == &target_role) {
@@ -12036,6 +12064,45 @@ mod tests {
                 "attacker text must stay inside the untrusted field ({fragment:?}): {prompt:?}"
             );
         }
+    }
+
+    /// Issue #447 (Qodo, #1347): the delegate-time waiting episode is skipped
+    /// exactly when `dispatch_one_owned` will replace the worker — a
+    /// `clear = true` role — and opened for a `clear = false` role or one whose
+    /// config cannot be resolved (no respawn there either).
+    #[test]
+    fn delegate_respawns_worker_mirrors_the_role_clear_flag() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join(".dot-agent-deck.toml"),
+            "[[orchestrations]]\nname = \"orch\"\n\n\
+             [[orchestrations.roles]]\nname = \"orchestrator\"\ncommand = \"cat\"\nstart = true\n\n\
+             [[orchestrations.roles]]\nname = \"fresh\"\ncommand = \"cat\"\nclear = true\n\n\
+             [[orchestrations.roles]]\nname = \"kept\"\ncommand = \"cat\"\nclear = false\n",
+        )
+        .expect("write project config");
+        let cwd = dir.path().to_str().expect("utf8 cwd");
+        let identity = OrchestrationIdentity::Instance {
+            id: "tab-1".to_string(),
+            name: "orch".to_string(),
+        };
+        assert!(delegate_respawns_worker(
+            Some(cwd),
+            Some(&identity),
+            "fresh"
+        ));
+        assert!(!delegate_respawns_worker(
+            Some(cwd),
+            Some(&identity),
+            "kept"
+        ));
+        assert!(!delegate_respawns_worker(
+            Some(cwd),
+            Some(&identity),
+            "unknown-role"
+        ));
+        assert!(!delegate_respawns_worker(None, Some(&identity), "fresh"));
+        assert!(!delegate_respawns_worker(Some(cwd), None, "fresh"));
     }
 
     /// Issue #447: the waiting-for-input notice is one line, fences both
