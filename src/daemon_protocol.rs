@@ -764,6 +764,14 @@ pub const CONTRACT_BREAKS: &[&str] = &[
     // the hook socket is not what PROTOCOL_VERSION versions anyway. What changed
     // is which delegates are refused, which a version number cannot express.
     "580-delegate-refuses-busy-worker",
+    // Issue #555, at 10 without moving it -- the #580 shape. An orchestration
+    // `StartAgent` whose resolved run title is already held by a different, live
+    // orchestration in the same directory used to be accepted; a newer daemon
+    // refuses it with `START_ERR_ORCHESTRATION_TITLE_IN_USE` before the registry
+    // insert. The request and the refusal channel are both unchanged on the
+    // wire. What changed is which starts are refused, which a version number
+    // cannot express.
+    "555-orchestration-title-uniqueness",
 ];
 
 /// What comparing this build's [`CONTRACT_BREAKS`] against a peer's found.
@@ -980,6 +988,13 @@ pub const PROJECT_ERR_PREPARATION_MISMATCH: &str = "preparation-mismatch";
 /// the prepared verb. The wire tests build the payload deliberately, which is
 /// the point of the code existing.
 pub const PROJECT_ERR_WRONG_START_VERB: &str = "wrong-start-verb";
+
+/// Issue #555: the stable prefix of the [`AttachRequest::StartAgent`] refusal
+/// a start earns when its orchestration run title is already held by a
+/// different, live orchestration in the same directory. The TUI keys on it to
+/// put the new-pane form back with its collision warning rather than reporting
+/// a generic pane-spawn failure; any other client just shows the sentence.
+pub const START_ERR_ORCHESTRATION_TITLE_IN_USE: &str = "orchestration-title-in-use";
 
 /// PRD #819 audit fix: [`AttachRequest::PrepareWorkflow`] is refused on this
 /// platform because the publish cannot deliver the owner-only guarantee it
@@ -2971,6 +2986,55 @@ struct OrchestrationSpawnMeta {
     orchestration_cwd: Option<String>,
     /// PRD #140: the per-tab instance token, when the client stamped one.
     orchestration_id: Option<String>,
+    /// Issue #555: the run title the client stamped, if any — what the
+    /// daemon's uniqueness check resolves and records.
+    display_title: Option<String>,
+}
+
+impl OrchestrationSpawnMeta {
+    /// The routing identity this pane registers under.
+    ///
+    /// Round-11 auditor #C: scope the orchestration identity by
+    /// `(name, orchestration_cwd)` so two unnamed orchestrations in different
+    /// cwds (`~/a/foo` and `~/b/foo`, both resolving `name` to "foo") don't
+    /// collide. The `orchestration_cwd` is shared across every role pane in one
+    /// orchestration tab (round-9 #2: per-pane cwd may diverge, but the
+    /// orchestration's identity does not). Older clients that don't carry the
+    /// field fall back to `StartAgent.cwd` — preserves backwards compat at the
+    /// cost of re-opening the collision; `Some` vs `None` is detectable so this
+    /// is documented behavior, not a silent misroute.
+    ///
+    /// PRD #140 M2.0: prefer the per-tab instance token when the client stamped
+    /// one. Two tabs of the same orchestration in the same directory produce
+    /// identical `(name, cwd)` pairs, so the tuple alone cannot tell their panes
+    /// apart and delegate / work-done cross-deliver between them (issue #140). A
+    /// client predating the token falls back to the round-11 tuple — same
+    /// routing behaviour as before, so old and new clients coexist on one daemon.
+    ///
+    /// Issue #555: computed BEFORE the spawn now (it used to be built after it),
+    /// because the run-title check that scopes by it has to run before the
+    /// registry insert.
+    fn identity(&self, cwd: Option<&str>) -> crate::state::OrchestrationIdentity {
+        match &self.orchestration_id {
+            Some(id) => crate::state::OrchestrationIdentity::Instance {
+                id: id.clone(),
+                name: self.name.clone(),
+            },
+            None => crate::state::OrchestrationIdentity::NameCwd {
+                name: self.name.clone(),
+                cwd: self.orchestration_cwd(cwd),
+            },
+        }
+    }
+
+    /// The tab-wide orchestration cwd, falling back to `StartAgent.cwd` for a
+    /// client that sends none (see [`Self::identity`]).
+    fn orchestration_cwd(&self, cwd: Option<&str>) -> String {
+        self.orchestration_cwd
+            .clone()
+            .or_else(|| cwd.map(str::to_string))
+            .unwrap_or_default()
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3530,6 +3594,7 @@ async fn handle_connection(
                         is_start_role,
                         orchestration_cwd,
                         orchestration_id,
+                        display_title,
                         ..
                     } if !role_name.is_empty() => Some(OrchestrationSpawnMeta {
                         name: name.clone(),
@@ -3537,6 +3602,7 @@ async fn handle_connection(
                         is_start_role: *is_start_role,
                         orchestration_cwd: orchestration_cwd.clone(),
                         orchestration_id: orchestration_id.clone(),
+                        display_title: display_title.clone(),
                     }),
                     _ => None,
                 });
@@ -3571,6 +3637,61 @@ async fn handle_connection(
             // fast-booting agent's `SessionStart` cannot reach the broadcast
             // before this receiver exists.
             let authoring_rx = authoring_seed.as_ref().map(|_| event_tx.subscribe());
+
+            // Issue #555: the orchestration run title is decided HERE, by the
+            // daemon, and not by the form. The `Ctrl+n` form refuses a title a
+            // live orchestration holds, but from one `ListAgents` snapshot taken
+            // when it opened, so two clients whose forms were open at once both
+            // saw the title free and both started — two tabs with
+            // indistinguishable labels. Checked and claimed in one step under
+            // the state write lock, before the registry insert, so a refusal
+            // starts nothing and two concurrent starts cannot both pass. Scoped
+            // by the per-tab identity, so roles 1..N of a tab never collide with
+            // the title its role 0 just took. The same condition gates the claim
+            // as gates the role registration below — a pane with no valid pane
+            // id or no role registers nothing, so it has nothing to hold — and
+            // every claim taken here is released on both arms of the spawn.
+            //
+            // A refusal rather than an auto-suffix, deliberately: `delegate` and
+            // `work-done` routing is by a name, and a silently renamed run is one
+            // the user no longer knows the name of. See
+            // `AppState::claim_orchestration_title` for the key, the liveness
+            // rule and what is not covered.
+            let title_claim: Option<crate::state::OrchestrationIdentity> =
+                match (pane_id_env.as_deref(), orchestration_meta.as_ref()) {
+                    (Some(_), Some(meta)) => {
+                        let identity = meta.identity(cwd_for_state.as_deref());
+                        let orch_cwd = meta.orchestration_cwd(cwd_for_state.as_deref());
+                        let claimed = state.write().await.claim_orchestration_title(
+                            &identity,
+                            meta.display_title.as_deref(),
+                            &orch_cwd,
+                            &registry,
+                        );
+                        if let Err(in_use) = claimed {
+                            info!(
+                                title = %in_use.title,
+                                cwd = %in_use.cwd,
+                                orchestration = %meta.name,
+                                "start-agent refused: the orchestration run title is held by \
+                                 another live orchestration in this directory"
+                            );
+                            write_resp(
+                                &mut stream,
+                                &AttachResponse::err(format!(
+                                    "{START_ERR_ORCHESTRATION_TITLE_IN_USE}: the name `{}` is \
+                                     already in use by a live orchestration in {}; choose \
+                                     another name. Nothing was started.",
+                                    in_use.title, in_use.cwd
+                                )),
+                            )
+                            .await?;
+                            return Ok(());
+                        }
+                        Some(identity)
+                    }
+                    _ => None,
+                };
 
             let opts = SpawnOptions {
                 command: command.as_deref(),
@@ -3711,65 +3832,28 @@ async fn handle_connection(
                     // We do this only for orchestration panes; dashboard
                     // and mode panes don't participate in delegate
                     // dispatch.
-                    if let (
-                        Some(pane_id),
-                        Some(OrchestrationSpawnMeta {
-                            name: orch_name,
-                            role_name,
-                            is_start_role,
-                            orchestration_cwd,
-                            orchestration_id,
-                        }),
-                    ) = (pane_id_env.as_deref(), orchestration_meta)
+                    if let (Some(pane_id), Some(meta), Some(identity)) =
+                        (pane_id_env.as_deref(), orchestration_meta, title_claim)
                     {
-                        // Round-11 auditor #C: scope the orchestration
-                        // identity by `(name, orchestration_cwd)` so
-                        // two unnamed orchestrations in different cwds
-                        // (`~/a/foo` and `~/b/foo`, both resolving
-                        // `name` to "foo") don't collide. The
-                        // `orchestration_cwd` is shared across every
-                        // role pane in one orchestration tab (round-9
-                        // #2: per-pane cwd may diverge, but the
-                        // orchestration's identity does not). Older
-                        // clients that don't carry the field fall back
-                        // to StartAgent.cwd — preserves backwards
-                        // compat at the cost of re-opening the
-                        // collision; `Some` vs `None` is detectable so
-                        // this is documented behavior, not a silent
-                        // misroute.
-                        let orch_cwd = orchestration_cwd
-                            .or_else(|| cwd_for_state.clone())
-                            .unwrap_or_default();
-                        // PRD #140 M2.0: prefer the per-tab instance token
-                        // when the client stamped one. Two tabs of the same
-                        // orchestration in the same directory produce
-                        // identical `(name, cwd)` pairs, so the tuple alone
-                        // cannot tell their panes apart and delegate /
-                        // work-done cross-deliver between them (issue #140).
-                        // A client predating the token falls back to the
-                        // round-11 tuple — same routing behaviour as before,
-                        // so old and new clients coexist on one daemon.
-                        let identity = match orchestration_id {
-                            Some(id) => crate::state::OrchestrationIdentity::Instance {
-                                id,
-                                name: orch_name,
-                            },
-                            None => crate::state::OrchestrationIdentity::NameCwd {
-                                name: orch_name,
-                                cwd: orch_cwd,
-                            },
-                        };
                         // Shared with the daemon-internal spawn path
                         // (`crate::spawn::spawn`) — see
                         // [`crate::state::AppState::register_orchestration_role`]
-                        // for why this must not be inlined again.
-                        state.write().await.register_orchestration_role(
+                        // for why this must not be inlined again. The identity
+                        // is the one the title check above scoped by
+                        // (`OrchestrationSpawnMeta::identity`).
+                        let mut state = state.write().await;
+                        state.register_orchestration_role(
                             pane_id,
-                            &role_name,
-                            is_start_role,
-                            identity,
+                            &meta.role_name,
+                            meta.is_start_role,
+                            identity.clone(),
                             cwd_for_state.as_deref(),
                         );
+                        // Issue #555: the registered pane holds the title from
+                        // here on, so this start's in-flight claim ends — under
+                        // the same guard, so there is no instant in which
+                        // neither holds it.
+                        state.release_orchestration_title_claim(&identity);
                     }
                     // PRD #1223: announce the start to every attached TUI, not
                     // only to the client that sent it — a desktop start was
@@ -3786,7 +3870,16 @@ async fn handle_connection(
                     }
                     write_resp(&mut stream, &AttachResponse::with_id(id)).await?
                 }
-                Err(e) => write_resp(&mut stream, &AttachResponse::err(e.to_string())).await?,
+                Err(e) => {
+                    // Issue #555: a start that spawned nothing holds no title.
+                    if let Some(identity) = title_claim.as_ref() {
+                        state
+                            .write()
+                            .await
+                            .release_orchestration_title_claim(identity);
+                    }
+                    write_resp(&mut stream, &AttachResponse::err(e.to_string())).await?
+                }
             }
         }
         AttachRequest::StopAgent { id } => {

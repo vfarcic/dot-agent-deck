@@ -38,7 +38,6 @@ use dot_agent_deck::agent_pty::{
     AgentPtyRegistry, DOT_AGENT_DECK_PANE_ID, GuardedSend, SpawnOptions, TabMembership,
 };
 use dot_agent_deck::event::{AgentEvent, AgentType, DelegateSignal, EventType};
-use dot_agent_deck::state::OrchestrationIdentity;
 use spec::spec;
 
 mod common;
@@ -58,6 +57,9 @@ const ORCHESTRATION_ID: &str = "recovery-instance-1";
 /// from `ORCHESTRATION` on purpose: a fallback to the canonical name would read
 /// as a pass if the two were equal.
 const DISPLAY_TITLE: &str = "recovery-orchestration · issue-960";
+/// Issue #962: the file whose appearance makes `delegate/022`'s orchestrator
+/// stand-in exit, so the worker is re-created with no live sibling left.
+const ORCHESTRATOR_EXIT_MARKER: &str = "orchestrator-exit";
 const POINTER: &[u8] = b"Read .dot-agent-deck/worker-task-coder.md for your task.";
 
 /// Issue #709: what the SIGTERM-ignoring stand-in prints once — and only once —
@@ -392,8 +394,23 @@ struct Fixture {
 }
 
 async fn fixture(worker_command_in_dir: impl FnOnce(&std::path::Path) -> String) -> Fixture {
+    fixture_with_orchestrator(|_| "cat".to_string(), worker_command_in_dir).await
+}
+
+/// Both roles are started through the daemon's real `StartAgent` handler over
+/// the attach socket — the path a `Ctrl+n` orchestration takes — rather than by
+/// spawning into the registry and registering the roles by hand. Issue #962:
+/// the handler is where the daemon learns the tab's run title, so a fixture that
+/// bypassed it would test a daemon that was never told the title at all.
+async fn fixture_with_orchestrator(
+    orchestrator_command_in_dir: impl FnOnce(&std::path::Path) -> String,
+    worker_command_in_dir: impl FnOnce(&std::path::Path) -> String,
+) -> Fixture {
+    use dot_agent_deck::daemon_client::{DaemonClient, StartAgentOptions};
+
     let daemon = common::spawn_inprocess_daemon().await;
     let dir = common::race_safe_tempdir();
+    let orchestrator_command = orchestrator_command_in_dir(dir.path());
     let worker_command = worker_command_in_dir(dir.path());
     std::fs::write(
         dir.path().join(".dot-agent-deck.toml"),
@@ -402,44 +419,31 @@ async fn fixture(worker_command_in_dir: impl FnOnce(&std::path::Path) -> String)
     .expect("write orchestration config");
     let cwd = dir.path().to_string_lossy().into_owned();
 
-    let orchestrator_agent_id = daemon
-        .registry
-        .spawn_agent(SpawnOptions {
-            command: Some("cat"),
-            cwd: Some(&cwd),
-            display_name: Some("orchestrator"),
-            env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), ORCH_PANE.to_string())],
-            tab_membership: Some(membership(0, "orchestrator", true, &cwd)),
-            ..SpawnOptions::default()
-        })
-        .expect("spawn orchestrator stand-in");
-    let worker_agent_id = daemon
-        .registry
-        .spawn_agent(SpawnOptions {
-            command: Some(&worker_command),
-            cwd: Some(&cwd),
-            display_name: Some(WORKER_ROLE),
-            env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), WORKER_PANE.to_string())],
-            tab_membership: Some(membership(1, WORKER_ROLE, false, &cwd)),
-            ..SpawnOptions::default()
-        })
-        .expect("spawn worker stand-in");
-
-    {
-        let mut state = daemon.state.write().await;
-        let identity = OrchestrationIdentity::Instance {
-            id: ORCHESTRATION_ID.to_string(),
-            name: ORCHESTRATION.to_string(),
-        };
-        state.register_orchestration_role(
+    let client = DaemonClient::new(daemon.attach_path.clone());
+    let start = |command: String, pane_id: &str, role_index: usize, role: &str, start: bool| {
+        StartAgentOptions {
+            command: Some(command),
+            cwd: Some(cwd.clone()),
+            display_name: Some(role.to_string()),
+            env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), pane_id.to_string())],
+            tab_membership: Some(membership(role_index, role, start, &cwd)),
+            ..StartAgentOptions::default()
+        }
+    };
+    let orchestrator_agent_id = client
+        .start_agent(start(
+            orchestrator_command,
             ORCH_PANE,
+            0,
             "orchestrator",
             true,
-            identity.clone(),
-            Some(&cwd),
-        );
-        state.register_orchestration_role(WORKER_PANE, WORKER_ROLE, false, identity, Some(&cwd));
-    }
+        ))
+        .await
+        .expect("start orchestrator stand-in");
+    let worker_agent_id = client
+        .start_agent(start(worker_command, WORKER_PANE, 1, WORKER_ROLE, false))
+        .await
+        .expect("start worker stand-in");
 
     Fixture {
         daemon,
@@ -491,22 +495,34 @@ async fn delegate_022_delegate_during_an_in_flight_close_brings_the_role_back() 
     // reproduce the race at all. `exec` keeps the ignore disposition (it is
     // inherited across `execve`) while still giving the pane something that
     // echoes what the daemon writes into it.
-    let fx = fixture(|dir| {
-        let script = dir.join("stubborn-worker.sh");
-        // Issue #709: the marker is printed AFTER the trap and BEFORE the exec,
-        // so seeing it is proof the disposition is already `SIG_IGN` — the one
-        // fact this scenario cannot proceed without. `exec` carries it across
-        // `execve`, so it still holds for the `cat` that replaces the shell.
-        let marker = String::from_utf8_lossy(STUBBORN_WORKER_ARMED).into_owned();
-        std::fs::write(
-            &script,
-            format!("#!/bin/sh\ntrap '' TERM\nprintf '{marker}'\nexec cat\n"),
-        )
-        .expect("write SIGTERM-ignoring worker stand-in");
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
-            .expect("chmod SIGTERM-ignoring worker stand-in");
-        script.to_string_lossy().into_owned()
-    })
+    // Issue #962: the orchestrator stand-in exits on demand, so the delegate can
+    // land after every OTHER pane of the tab is gone — the reachable shape being
+    // an orchestrator that sends its delegate and exits while the async dispatch
+    // is still running.
+    let fx = fixture_with_orchestrator(
+        |dir| {
+            format!(
+                "while [ ! -e {} ]; do sleep 0.05; done",
+                dir.join(ORCHESTRATOR_EXIT_MARKER).display()
+            )
+        },
+        |dir| {
+            let script = dir.join("stubborn-worker.sh");
+            // Issue #709: the marker is printed AFTER the trap and BEFORE the exec,
+            // so seeing it is proof the disposition is already `SIG_IGN` — the one
+            // fact this scenario cannot proceed without. `exec` carries it across
+            // `execve`, so it still holds for the `cat` that replaces the shell.
+            let marker = String::from_utf8_lossy(STUBBORN_WORKER_ARMED).into_owned();
+            std::fs::write(
+                &script,
+                format!("#!/bin/sh\ntrap '' TERM\nprintf '{marker}'\nexec cat\n"),
+            )
+            .expect("write SIGTERM-ignoring worker stand-in");
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod SIGTERM-ignoring worker stand-in");
+            script.to_string_lossy().into_owned()
+        },
+    )
     .await;
     // Issue #709: this was a flat 400 ms sleep, and it was the load-sensitive
     // seam of the whole test. What the scenario needs is not "400 ms have
@@ -553,6 +569,23 @@ async fn delegate_022_delegate_during_an_in_flight_close_brings_the_role_back() 
         &fx.worker_agent_id,
     )
     .await;
+    // Issue #962: no live sibling may carry the title when the worker is
+    // re-created. The orchestrator was the only other pane of the tab; once it
+    // has exited, `agent_records` (which filters exited agents out) holds no
+    // pane of this orchestration at all, so a title read off a live sibling —
+    // what #960 did — comes back `None`. The daemon has to know the title
+    // itself.
+    std::fs::write(fx._dir.path().join(ORCHESTRATOR_EXIT_MARKER), b"")
+        .expect("tell the orchestrator stand-in to exit");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while fx.daemon.registry.has_live_pane(ORCH_PANE) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "precondition: the orchestrator stand-in never exited, so the delegate below would \
+             find a live sibling to borrow the title from and could not reproduce #962"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     delegate(&fx, "list the files in this directory").await;
 
     let replacement = wait_for_replacement_agent(
@@ -616,10 +649,14 @@ async fn delegate_022_delegate_during_an_in_flight_close_brings_the_role_back() 
     // `PaneRecreateIdentity` — which hardcoded `display_title: None`, silently
     // dropping the tab's run-identifying label from this pane. It is not
     // immediately visible, because `partition_hydrated_panes` keeps the first
-    // non-`None` title it finds and the orchestrator pane still has one; the
-    // label is lost once every title-carrying pane has exited or been re-created
-    // this way. Asserted on the RECREATED pane specifically, since that is the
-    // only one whose membership this path authors.
+    // non-`None` title it finds; the label is lost once every title-carrying
+    // pane has exited or been re-created this way. Asserted on the RECREATED
+    // pane specifically, since that is the only one whose membership this path
+    // authors.
+    //
+    // Issue #962: #960 fixed this by reading the title off a LIVE sibling, and
+    // here there is none — the orchestrator exited above. The title now comes
+    // from the daemon's own record of it, held beside the role maps.
     let recreated_membership = fx
         .daemon
         .registry
@@ -650,8 +687,8 @@ async fn delegate_022_delegate_during_an_in_flight_close_brings_the_role_back() 
         ),
         (Some(DISPLAY_TITLE), 1, Some(ORCHESTRATION_ID)),
         "the re-created worker must rejoin its tab with the tab's own title, index and instance \
-         token — a `None` title here is issue #960's secondary path, and it costs the tab its \
-         label as soon as the last pane that still carries one goes away"
+         token — a `None` title here, with no live sibling left, is issue #962, and it costs \
+         the tab its label as soon as the last pane that still carries one goes away"
     );
 
     let state = fx.daemon.state.read().await;
@@ -1448,6 +1485,38 @@ async fn dispatch_003_the_dispatch_and_startagent_paths_respawn_identically() {
         .registry
         .pane_current_agent_id(&dispatched_worker)
         .expect("the dispatched worker pane has a live agent");
+
+    // Issue #962: the dispatch path tells the daemon its run title too, so a
+    // `clear = true` worker it later re-creates reads it from the daemon rather
+    // than from whichever sibling is still alive. The title the daemon recorded
+    // must be the one stamped on the role panes.
+    let stamped_title = daemon
+        .registry
+        .agent_records()
+        .into_iter()
+        .find(|r| r.pane_id_env.as_deref() == Some(dispatched_orchestrator.as_str()))
+        .and_then(|r| match r.tab_membership {
+            Some(TabMembership::Orchestration { display_title, .. }) => display_title,
+            _ => None,
+        });
+    assert!(
+        stamped_title.is_some(),
+        "precondition: a dispatch into a directory named apart from its orchestration stamps a \
+         run title on its role panes"
+    );
+    {
+        let state = daemon.state.read().await;
+        let identity = state
+            .pane_orchestration_map
+            .get(&dispatched_orchestrator)
+            .expect("the dispatched orchestrator is registered")
+            .clone();
+        assert_eq!(
+            state.orchestration_display_title(&identity),
+            stamped_title,
+            "the daemon must hold the dispatched orchestration's run title beside its role maps"
+        );
+    }
 
     // --- the StartAgent path: the shape `AttachRequest::StartAgent` builds.
     let control = fixture(|dir| {

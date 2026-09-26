@@ -908,7 +908,19 @@ pub async fn spawn(
                         false
                     }
                 }) {
-                    state.write().await.register_orchestration_role(
+                    let mut state = state.write().await;
+                    // Issue #962: the daemon holds the run title itself, beside
+                    // the role maps, so a `clear = true` worker re-created later
+                    // does not have to find a live sibling to read it from.
+                    // Recorded, not claimed: this path is not subject to the
+                    // `StartAgent` uniqueness check (issue #555) — see
+                    // `AppState::claim_orchestration_title`.
+                    state.record_orchestration_title(
+                        &identity,
+                        display_title.as_deref(),
+                        &req.working_dir,
+                    );
+                    state.register_orchestration_role(
                         &pane_id,
                         &role.role_name,
                         // `orch_idx`, NOT `role.is_start_role`. `orch_idx` is
@@ -6192,6 +6204,12 @@ mod tests {
             guard.pane_orchestration_map.is_empty(),
             "…nor a routing identity: {:?}",
             guard.pane_orchestration_map
+        );
+        // Issue #962: the run title recorded beside the role maps goes with them.
+        assert!(
+            guard.orchestration_titles.is_empty(),
+            "…nor a recorded run title: {:?}",
+            guard.orchestration_titles
         );
         drop(guard);
 
