@@ -2047,7 +2047,15 @@ fn classify_and_emit(
     };
     drop(det);
     if let Some(ev) = ev {
-        emitter.emit(ev.event_type());
+        // Issue #714: marked, because this classifier calls every printed line
+        // `Working` — a provider's quota-error line included — so what it emits
+        // proves output, not work. See `WRAPPER_OUTPUT_CLASSIFIED_METADATA_KEY`.
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            crate::event::WRAPPER_OUTPUT_CLASSIFIED_METADATA_KEY.to_string(),
+            crate::event::WRAPPER_OUTPUT_CLASSIFIED_METADATA_VALUE.to_string(),
+        );
+        emitter.emit_with_metadata(ev.event_type(), metadata);
     }
 }
 

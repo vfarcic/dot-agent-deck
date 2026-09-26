@@ -1556,7 +1556,27 @@ pub struct AgentBus {
 
 struct AgentBusState {
     scrollback: VecDeque<u8>,
+    /// Issue #714: the per-chunk byte scan for a provider quota message's
+    /// needle — the cheap first stage of the quota detector. See
+    /// [`crate::quota_detect::HintScanner`].
+    quota_hint: crate::quota_detect::HintScanner,
+    /// Issue #714: this agent's quiet/confirm state machine. Lives beside the
+    /// scrollback, under the same lock `push` already takes, so feeding it costs
+    /// the reader thread no second lock, and it is per AGENT, so a respawn in
+    /// the same pane starts from a clean detector with its fresh bus.
+    quota: crate::quota_detect::QuotaDetector,
+    /// Issue #714: the screen rows a resize's ring clear would otherwise have
+    /// erased while a quota hint was pending — see
+    /// [`AgentBus::clear_scrollback_after_resize`]. Empty whenever no hint is
+    /// pending.
+    quota_prelude: Vec<String>,
 }
+
+/// Issue #714: the quota detector's timings, read from
+/// [`crate::quota_detect::DOT_AGENT_DECK_QUOTA_CONFIRM_MS`] once per process
+/// rather than once per spawned agent, so an out-of-range value warns once.
+static QUOTA_TIMINGS: std::sync::LazyLock<crate::quota_detect::QuotaTimings> =
+    std::sync::LazyLock::new(crate::quota_detect::QuotaTimings::from_env);
 
 impl Default for AgentBus {
     fn default() -> Self {
@@ -1566,11 +1586,19 @@ impl Default for AgentBus {
 
 impl AgentBus {
     pub fn new() -> Self {
+        Self::with_quota_timings(*QUOTA_TIMINGS)
+    }
+
+    /// [`Self::new`] with explicit quota-detector timings — the unit-test seam.
+    pub fn with_quota_timings(timings: crate::quota_detect::QuotaTimings) -> Self {
         let (tx, _rx0) = broadcast::channel(BROADCAST_CAPACITY);
         Self {
             tx,
             state: Mutex::new(AgentBusState {
                 scrollback: VecDeque::new(),
+                quota_hint: crate::quota_detect::HintScanner::default(),
+                quota: crate::quota_detect::QuotaDetector::new(timings),
+                quota_prelude: Vec::new(),
             }),
         }
     }
@@ -1587,6 +1615,14 @@ impl AgentBus {
         }
         while state.scrollback.len() > SCROLLBACK_CAP_BYTES {
             state.scrollback.pop_front();
+        }
+        // Issue #714: one substring scan per chunk. A hit only arms a later
+        // screen probe; nothing is reported from bytes.
+        let now = Instant::now();
+        if state.quota_hint.scan(&arc) {
+            state.quota.note_hint(now);
+        } else {
+            state.quota.note_output(now);
         }
         // Lossy on purpose: we don't block the reader thread on slow
         // subscribers. `send` returns Err only when there are zero
@@ -1629,8 +1665,35 @@ impl AgentBus {
     /// snapshot (and the live receiver picks up post-resize bytes) or
     /// sees an empty snapshot and the receiver picks up everything —
     /// no torn read.
-    fn clear_scrollback(&self) {
+    ///
+    /// Issue #714: `old_rows`/`old_cols` are the geometry the ring was written
+    /// at. The ring is the quota detector's only view of the screen, and a
+    /// program that does not redraw on `SIGWINCH` (a plain `cat`, a stand-in, a
+    /// line-mode CLI) leaves the terminal showing exactly what it showed before
+    /// — which the clear would erase from the daemon's view alone. So when a
+    /// quota hint is pending, the trailing rows the ring rendered to at the OLD
+    /// geometry are kept as a prelude the next probe reads above the new ring,
+    /// as a terminal keeps its content across a resize. The replay runs only in
+    /// that case, which is rare, and is bounded by the ring cap.
+    fn clear_scrollback_after_resize(&self, old_rows: u16, old_cols: u16) {
         let mut state = self.state.lock().unwrap();
+        if state.quota.hint_pending() {
+            let bytes: Vec<u8> = state.scrollback.iter().copied().collect();
+            let mut rows = std::mem::take(&mut state.quota_prelude);
+            rows.extend(crate::pane_screen_text::visible_tail_lines(
+                &bytes,
+                old_rows,
+                old_cols,
+                crate::quota_detect::QUOTA_TAIL_ROWS,
+            ));
+            let keep = rows
+                .len()
+                .saturating_sub(crate::quota_detect::QUOTA_TAIL_ROWS);
+            rows.drain(..keep);
+            state.quota_prelude = rows;
+        } else {
+            state.quota_prelude.clear();
+        }
         state.scrollback.clear();
     }
 
@@ -1640,6 +1703,48 @@ impl AgentBus {
     /// having to read from that client's socket.
     pub fn receiver_count(&self) -> usize {
         self.tx.receiver_count()
+    }
+
+    /// Issue #714: the pane's agent produced work evidence at `now`
+    /// ([`crate::quota_detect::is_work_evidence`]) — any pending quota hint or
+    /// candidate is stale, and a confirmed block is lifted.
+    pub fn quota_note_work_event(&self, now: Instant) {
+        let mut state = self.state.lock().unwrap();
+        state.quota.note_work_event(now);
+        state.quota_prelude.clear();
+    }
+
+    /// Issue #714: when the quota detector wants the screen probed at `now`,
+    /// what to replay — the scrollback, plus any rows a resize carried over
+    /// ([`Self::clear_scrollback_after_resize`]) — taken under the same lock as
+    /// the decision, so the bytes are the ones the decision was made about.
+    /// `None` otherwise, which is every tick for a pane with no pending hint.
+    pub fn quota_probe_snapshot(&self, now: Instant) -> Option<QuotaProbeScreen> {
+        let state = self.state.lock().unwrap();
+        state.quota.should_probe(now).then(|| QuotaProbeScreen {
+            prelude: state.quota_prelude.clone(),
+            bytes: state.scrollback.iter().copied().collect(),
+        })
+    }
+
+    /// Issue #714: hand the result of a screen probe taken at `now` back to the
+    /// detector. See [`crate::quota_detect::QuotaDetector::record_probe`].
+    pub fn quota_record_probe(
+        &self,
+        now: Instant,
+        found: Option<crate::quota_detect::BlockedKind>,
+    ) -> crate::quota_detect::ProbeOutcome {
+        let mut state = self.state.lock().unwrap();
+        let outcome = state.quota.record_probe(now, found);
+        if !state.quota.hint_pending() {
+            state.quota_prelude.clear();
+        }
+        outcome
+    }
+
+    /// Issue #714: whether a confirmed quota block is currently latched.
+    pub fn quota_confirmed(&self) -> bool {
+        self.state.lock().unwrap().quota.is_confirmed()
     }
 }
 
@@ -4131,6 +4236,12 @@ pub struct OutstandingDelegation {
     /// this way, an unbound record simply falls through to its own timer
     /// instead of being drained by a stranger's death.
     worker_agent_id: Option<String>,
+    /// Issue #714: whether this delegation's worker has already been reported
+    /// to the orchestrator as blocked by a provider usage limit
+    /// ([`AgentPtyRegistry::claim_worker_blocked_notice`]). Once per record, so a
+    /// block that is lifted by a work event and confirmed again does not
+    /// re-notify the same delegation; a new delegation is a new record.
+    blocked_reported: bool,
     /// PRD #126 M1 review (finding 2) / audit (finding 3): the live end of the
     /// watch task's cancellation channel. Never *sent* on — the watch task
     /// selects on it and exits as soon as it resolves, which happens when this
@@ -4159,6 +4270,56 @@ pub struct PaneOrchestration {
     pub instance_id: Option<String>,
     /// The shared per-tab orchestration cwd, when the client sent one.
     pub cwd: Option<String>,
+}
+
+/// Issue #714: what a quota probe replays — see
+/// [`AgentBus::quota_probe_snapshot`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuotaProbeScreen {
+    /// Screen rows carried across a resize that cleared the ring while a hint
+    /// was pending, oldest first; they sit ABOVE whatever `bytes` renders to.
+    pub prelude: Vec<String>,
+    /// The scrollback ring, written at the PTY's current geometry.
+    pub bytes: Vec<u8>,
+}
+
+impl QuotaProbeScreen {
+    /// The screen's trailing non-blank rows, oldest first: the carried-over
+    /// prelude, then the ring rendered at `rows`x`cols`.
+    pub fn tail_rows(&self, rows: u16, cols: u16) -> Vec<String> {
+        let mut out = self.prelude.clone();
+        out.extend(crate::pane_screen_text::visible_tail_lines(
+            &self.bytes,
+            rows,
+            cols,
+            crate::quota_detect::QUOTA_TAIL_ROWS,
+        ));
+        out
+    }
+}
+
+/// Issue #714: one pane whose quota detector asked for a screen probe — see
+/// [`AgentPtyRegistry::quota_probe_candidates`].
+#[derive(Debug, Clone)]
+pub struct QuotaProbe {
+    pub agent_id: String,
+    pub pane_id: String,
+    pub agent_type: AgentType,
+    /// What to replay.
+    pub screen: QuotaProbeScreen,
+    /// The PTY's current geometry, which the ring was written at.
+    pub rows: u16,
+    pub cols: u16,
+}
+
+/// Issue #714: what [`AgentPtyRegistry::claim_worker_blocked_notice`] hands back
+/// — where the notice goes and how to authorize it, and the role for the log.
+#[derive(Debug, Clone)]
+pub struct WorkerBlockedNotice {
+    pub role: String,
+    pub orchestrator_pane_id: String,
+    pub orchestrator_agent_id: String,
+    pub orchestration: Option<crate::state::OrchestrationIdentity>,
 }
 
 /// PRD #126: handed back by [`AgentPtyRegistry::arm_outstanding_delegation`] to
@@ -4853,6 +5014,7 @@ impl AgentPtyRegistry {
                 armed_at: Instant::now(),
                 superseded,
                 worker_agent_id: None,
+                blocked_reported: false,
                 _watch_cancel: cancel_tx,
             },
         );
@@ -9181,6 +9343,7 @@ impl AgentPtyRegistry {
                 pixel_height: 0,
             })
             .map_err(|e| AgentPtyError::Resize(e.to_string()))?;
+        let (old_rows, old_cols) = (agent.pty_rows, agent.pty_cols);
         agent.pty_rows = rows;
         agent.pty_cols = cols;
         agent.geometry_changes += 1;
@@ -9188,7 +9351,7 @@ impl AgentPtyRegistry {
         // fresh subscriber covers a single dimension epoch. See the long note
         // in `resize` for the residual best-effort gap and why it is
         // acceptable.
-        agent.bus.clear_scrollback();
+        agent.bus.clear_scrollback_after_resize(old_rows, old_cols);
         // PRD #882: tell every participating viewer what the size is now. The
         // requester learns the same number from its own response, so this is
         // for the OTHER viewers — the ones whose parser would otherwise stay at
@@ -9275,6 +9438,173 @@ impl AgentPtyRegistry {
             .get(id)
             .ok_or_else(|| AgentPtyError::NotFound(id.to_string()))?;
         Ok((agent.bus.snapshot(), agent.pty_rows, agent.pty_cols))
+    }
+
+    /// Issue #714: record work evidence for the live agent on `pane_id` (see
+    /// [`AgentBus::quota_note_work_event`]). When the event named an
+    /// `agent_id`, only that generation is credited — a straggler from a
+    /// replaced agent must not cancel its successor's detector. A pane with no
+    /// live agent is a no-op.
+    pub fn quota_note_work_event(&self, pane_id: &str, agent_id: Option<&str>) {
+        let now = Instant::now();
+        let inner = self.inner.lock().unwrap();
+        for (id, agent) in inner.agents.iter() {
+            if agent.pane_id_env.as_deref() == Some(pane_id)
+                && !agent.exited.load(Ordering::SeqCst)
+                && agent_id.is_none_or(|expected| expected == id)
+            {
+                agent.bus.quota_note_work_event(now);
+            }
+        }
+    }
+
+    /// Issue #714: every live pane whose quota detector wants its screen probed
+    /// at `now`, with the bytes and PTY geometry to replay it at. Only agents of
+    /// a type the classifier has patterns for are asked at all — every other
+    /// pane's hint could never match, so it is never replayed.
+    ///
+    /// The type is the registry's OBSERVED type, which starts as the spawn-time
+    /// identity and is upgraded by the pane's own hook events.
+    pub fn quota_probe_candidates(&self, now: Instant) -> Vec<QuotaProbe> {
+        let inner = self.inner.lock().unwrap();
+        inner
+            .agents
+            .iter()
+            .filter(|(_, agent)| !agent.exited.load(Ordering::SeqCst))
+            .filter_map(|(id, agent)| {
+                let pane_id = agent.pane_id_env.clone()?;
+                let agent_type = agent.agent_type.clone()?;
+                if !crate::quota_detect::has_patterns(&agent_type) {
+                    return None;
+                }
+                let screen = agent.bus.quota_probe_snapshot(now)?;
+                Some(QuotaProbe {
+                    agent_id: id.clone(),
+                    pane_id,
+                    agent_type,
+                    screen,
+                    rows: agent.pty_rows,
+                    cols: agent.pty_cols,
+                })
+            })
+            .collect()
+    }
+
+    /// Issue #714: hand a probe's result back to `agent_id`'s detector. `None`
+    /// when the agent has left the registry since the probe was taken.
+    pub fn quota_record_probe(
+        &self,
+        agent_id: &str,
+        now: Instant,
+        found: Option<crate::quota_detect::BlockedKind>,
+    ) -> Option<crate::quota_detect::ProbeOutcome> {
+        let inner = self.inner.lock().unwrap();
+        let agent = inner.agents.get(agent_id)?;
+        if agent.exited.load(Ordering::SeqCst) {
+            return None;
+        }
+        Some(agent.bus.quota_record_probe(now, found))
+    }
+
+    /// Issue #714: claim the one blocked-worker notice owed for the
+    /// outstanding delegation on `worker_pane_id`, if there is one and it has
+    /// not been reported yet.
+    ///
+    /// Claimed only for a record whose worker identity is BOUND to
+    /// `worker_agent_id` — an unbound record belongs to a delegation whose
+    /// worker has not resolved yet, so the blocked agent may be the previous
+    /// occupant, the same reasoning `pump_reader`'s EOF sweep applies — and never
+    /// for a record this pane only issued as the orchestrator. The record stays
+    /// in the ledger: a `work-done` is still owed, #580's busy guard still
+    /// applies, and the worker-response timeout is untouched.
+    pub fn claim_worker_blocked_notice(
+        &self,
+        worker_pane_id: &str,
+        worker_agent_id: &str,
+    ) -> Option<WorkerBlockedNotice> {
+        let mut tracker = self.delegations.lock().unwrap();
+        let record = tracker.records.get_mut(worker_pane_id)?;
+        if record.blocked_reported
+            || record.orchestrator_pane_id == worker_pane_id
+            || record.worker_agent_id.as_deref() != Some(worker_agent_id)
+        {
+            return None;
+        }
+        record.blocked_reported = true;
+        Some(WorkerBlockedNotice {
+            role: record.role.clone(),
+            orchestrator_pane_id: record.orchestrator_pane_id.clone(),
+            orchestrator_agent_id: record.orchestrator_agent_id.clone(),
+            orchestration: record.orchestration.clone(),
+        })
+    }
+
+    /// Issue #714: deliver the blocked-worker notice claimed by
+    /// [`Self::claim_worker_blocked_notice`] into the orchestrator's pane.
+    ///
+    /// The deferred notice family, exactly as
+    /// [`Self::deliver_worker_exited_notice`]: fixed daemon-authored text with
+    /// the worker's scrubbed pane id as the only interpolation
+    /// ([`crate::state::compose_worker_blocked_notice`]), written through
+    /// [`Self::write_notice_guarded`] bound to the orchestrator's registry agent
+    /// id captured at arm time, refused for a pane that is mid-close or has been
+    /// re-homed into a different orchestration. The role rides the log line,
+    /// never the pane, and the pane's matched quota text rides neither.
+    pub async fn deliver_worker_blocked_notice(
+        self: &Arc<Self>,
+        worker_pane_id: &str,
+        notice: WorkerBlockedNotice,
+    ) {
+        let text = crate::state::compose_worker_blocked_notice(worker_pane_id);
+        let orchestrator_pane_id = notice.orchestrator_pane_id.clone();
+        let expected_agent_id = notice.orchestrator_agent_id.clone();
+        let orchestration = notice.orchestration.clone();
+        let revalidate_registry = Arc::clone(self);
+        let revalidate_pane = orchestrator_pane_id.clone();
+        let outcome = self
+            .write_notice_guarded(
+                &orchestrator_pane_id,
+                &text,
+                &expected_agent_id,
+                || async move {
+                    if revalidate_registry.is_pane_closing(&revalidate_pane) {
+                        return false;
+                    }
+                    crate::state::orchestration_still_matches(
+                        orchestration.as_ref(),
+                        revalidate_registry
+                            .pane_orchestration(&revalidate_pane)
+                            .as_ref(),
+                    )
+                },
+            )
+            .await;
+        match outcome {
+            Ok(GuardedSend::Applied) => tracing::info!(
+                worker_pane_id = %worker_pane_id,
+                role = %notice.role,
+                "quota: reported a delegated worker blocked by a provider usage limit to the \
+                 orchestrator"
+            ),
+            Ok(GuardedSend::Ambiguous) => tracing::warn!(
+                pane_id = %orchestrator_pane_id,
+                role = %notice.role,
+                "quota: blocked-worker notice delivery was ambiguous (partial write); not retried"
+            ),
+            Ok(refused) => tracing::debug!(
+                pane_id = %orchestrator_pane_id,
+                role = %notice.role,
+                expected_agent_id = %expected_agent_id,
+                outcome = ?refused,
+                "quota: identity gate refused the blocked-worker notice; nothing written"
+            ),
+            Err(e) => tracing::warn!(
+                pane_id = %orchestrator_pane_id,
+                role = %notice.role,
+                error = %e,
+                "quota: failed to write the blocked-worker notice into the orchestrator pane"
+            ),
+        }
     }
 
     /// Take just the current scrollback snapshot for an agent.
@@ -10731,9 +11061,144 @@ impl Drop for AgentPtyRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use spec::spec;
 
     // PRD #42 M1: the `pid_to_pgid` boundary-check unit tests moved with the
     // function to `crate::platform::proc` (see `src/platform/proc/unix.rs`).
+
+    /// Scenario: Push a Codex quota line into an agent's output bus split
+    /// across two reads, at every possible split point of the needle. The
+    /// detector must still arm a screen probe once the pane goes quiet, yet the
+    /// hint alone must never report a block; output that merely resembles the
+    /// needle arms nothing.
+    #[spec("status/blocked/004")]
+    #[test]
+    fn status_blocked_004_bus_hint_survives_chunk_split() {
+        use crate::quota_detect::{BlockedKind, ProbeOutcome, QuotaTimings};
+        let timings = QuotaTimings::default();
+        let line =
+            "\u{1b}[31m\u{25a0} You\u{2019}ve hit your usage limit. Try again at 3:00 PM.\r\n";
+        let needle_at = line.find("usage limit").unwrap();
+        for split in needle_at..=needle_at + "usage limit".len() {
+            let bus = AgentBus::with_quota_timings(timings);
+            bus.push(line.as_bytes()[..split].to_vec());
+            bus.push(line.as_bytes()[split..].to_vec());
+            let pushed = Instant::now();
+            assert!(
+                bus.quota_probe_snapshot(pushed).is_none(),
+                "split {split}: probed before the pane went quiet"
+            );
+            let later = pushed + timings.quiet + Duration::from_millis(1);
+            let snapshot = bus.quota_probe_snapshot(later).unwrap_or_else(|| {
+                panic!("split {split}: the hint was lost across the chunk seam")
+            });
+            assert!(snapshot.prelude.is_empty());
+            assert_eq!(
+                snapshot.bytes,
+                line.as_bytes(),
+                "the probe replays the whole ring"
+            );
+            // A hint, even a matching probe, is only a candidate — never a report.
+            assert_eq!(
+                bus.quota_record_probe(later, Some(BlockedKind::UsageLimit)),
+                ProbeOutcome::Candidate
+            );
+            assert!(
+                !bus.quota_confirmed(),
+                "split {split}: a hint alone reported a block"
+            );
+        }
+
+        // Look-alikes across a seam arm nothing.
+        let bus = AgentBus::with_quota_timings(timings);
+        bus.push(b"usage li".to_vec());
+        bus.push(b"sting of the current quo".to_vec());
+        bus.push(b"rum\r\n".to_vec());
+        let later = Instant::now() + timings.quiet * 2;
+        assert!(bus.quota_probe_snapshot(later).is_none());
+
+        // The second needle (OpenAI `insufficient_quota`) is a hint too.
+        let bus = AgentBus::with_quota_timings(timings);
+        bus.push(b"Error: You exceeded your current q".to_vec());
+        bus.push(b"uota\r\n".to_vec());
+        assert!(
+            bus.quota_probe_snapshot(Instant::now() + timings.quiet * 2)
+                .is_some()
+        );
+
+        // A resize clears the ring, but with a hint pending the rows it showed
+        // are carried above the new ring — a stand-in that never redraws keeps
+        // its quota line on screen, as a real terminal would.
+        let bus = AgentBus::with_quota_timings(timings);
+        bus.push(line.as_bytes().to_vec());
+        bus.clear_scrollback_after_resize(24, 80);
+        bus.push(b"later output\r\n".to_vec());
+        let screen = bus
+            .quota_probe_snapshot(Instant::now() + timings.quiet * 2)
+            .expect("the hint survives the resize");
+        assert_eq!(screen.bytes, b"later output\r\n");
+        let rows = screen.tail_rows(30, 100);
+        assert_eq!(
+            crate::quota_detect::classify(&AgentType::Codex, &rows).map(|m| m.kind),
+            Some(BlockedKind::UsageLimit),
+            "{rows:?}"
+        );
+        // Without a pending hint the resize keeps nothing.
+        let bus = AgentBus::with_quota_timings(timings);
+        bus.push(b"plain output\r\n".to_vec());
+        bus.clear_scrollback_after_resize(24, 80);
+        assert!(bus.state.lock().unwrap().quota_prelude.is_empty());
+
+        // Work evidence after the hint stales it.
+        let bus = AgentBus::with_quota_timings(timings);
+        bus.push(line.as_bytes().to_vec());
+        bus.quota_note_work_event(Instant::now() + Duration::from_millis(1));
+        assert!(
+            bus.quota_probe_snapshot(Instant::now() + timings.quiet * 2)
+                .is_none()
+        );
+    }
+
+    /// Issue #714: the blocked-worker notice is claimed once per outstanding
+    /// delegation, only by the worker whose identity the delegation bound, and
+    /// claiming it leaves the delegation outstanding.
+    #[test]
+    fn worker_blocked_notice_is_claimed_once_per_bound_delegation_and_keeps_it_armed() {
+        let reg = AgentPtyRegistry::new();
+        let armed = reg
+            .arm_outstanding_delegation("worker", "coder", "orch", "orch-agent", None)
+            .expect("arm");
+        assert!(
+            reg.claim_worker_blocked_notice("worker", "worker-agent")
+                .is_none(),
+            "an unbound delegation may belong to the previous occupant"
+        );
+        reg.bind_delegation_worker_agent_id("worker", armed.seq, "worker-agent");
+        assert!(
+            reg.claim_worker_blocked_notice("worker", "someone-else")
+                .is_none()
+        );
+        let notice = reg
+            .claim_worker_blocked_notice("worker", "worker-agent")
+            .expect("the bound worker's first block is reported");
+        assert_eq!(notice.orchestrator_pane_id, "orch");
+        assert_eq!(notice.orchestrator_agent_id, "orch-agent");
+        assert_eq!(notice.role, "coder");
+        assert!(
+            reg.claim_worker_blocked_notice("worker", "worker-agent")
+                .is_none(),
+            "once per delegation"
+        );
+        assert!(
+            reg.take_outstanding_delegation_if("worker", armed.seq)
+                .is_some(),
+            "the notice must not retire the delegation"
+        );
+        assert!(
+            reg.claim_worker_blocked_notice("nobody", "worker-agent")
+                .is_none()
+        );
+    }
 
     /// Issue #424 S1: the submit drain and the key forwarder must agree, and
     /// this is the seam that makes them.
@@ -14074,6 +14539,7 @@ mod spawn_tests {
                 last_user_prompt: None,
                 live_target: None,
                 last_activity_ms: None,
+                blocked: None,
             }),
             spawned_at_ms: None,
             cli_name: None,

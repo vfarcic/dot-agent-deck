@@ -89,8 +89,9 @@ pub enum BlockedKind {
     /// A usage limit, possibly windowed (`Try again at …`): it may reset on its
     /// own, which the deck learns only when the agent works again.
     UsageLimit,
-    /// A spent credit pool (`purchase more credits`, `send a request to your
-    /// admin`): it does not reset without someone acting.
+    /// A spent credit pool or billing balance (`purchase more credits`, `send a
+    /// request to your admin`, OpenAI's `You exceeded your current quota`): it
+    /// does not reset without someone acting.
     CreditsDepleted,
     /// Forward-compat catch-all for a kind this build does not know.
     #[serde(other)]
@@ -121,9 +122,9 @@ impl BlockedKind {
     /// Fixed, daemon-authored card label for this kind.
     pub fn label(self) -> &'static str {
         match self {
-            BlockedKind::UsageLimit => "quota: usage limit",
-            BlockedKind::CreditsDepleted => "quota: credits depleted (no reset)",
-            BlockedKind::Unknown => "quota: blocked",
+            BlockedKind::UsageLimit => "Usage limit reached",
+            BlockedKind::CreditsDepleted => "Credits depleted (no reset)",
+            BlockedKind::Unknown => "Provider limit reached",
         }
     }
 }
@@ -164,6 +165,12 @@ static OPENCODE_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
         Regex::new(r"^(?:Error:\s+)?You\s+exceeded\s+your\s+current\s+quota\b").unwrap(),
     ]
 });
+
+/// Whether [`classify`] has any pattern for `agent_type` — the daemon skips the
+/// screen replay entirely for a pane that could never match.
+pub fn has_patterns(agent_type: &AgentType) -> bool {
+    !patterns_for(agent_type).is_empty()
+}
 
 fn patterns_for(agent_type: &AgentType) -> &'static [Regex] {
     match agent_type {
@@ -250,23 +257,31 @@ pub fn classify(agent_type: &AgentType, rows: &[String]) -> Option<QuotaMatch> {
     None
 }
 
-/// `CreditsDepleted` when the message names a spent credit pool, otherwise
-/// `UsageLimit`. Compared with all whitespace removed so a word split by a hard
-/// wrap still counts.
+/// `CreditsDepleted` when the message names a spent credit pool or billing
+/// balance, otherwise `UsageLimit`. OpenAI's `insufficient_quota` (`You exceeded
+/// your current quota`) is a billing balance, not a window: it does not reset on
+/// its own, so it is `CreditsDepleted`. Compared with all whitespace removed so a
+/// word split by a hard wrap still counts.
 fn kind_of(text: &str) -> BlockedKind {
     let squashed: String = text
         .chars()
         .filter(|c| !c.is_whitespace())
         .flat_map(char::to_lowercase)
         .collect();
-    if squashed.contains("purchasemorecredits") || squashed.contains("requesttoyouradmin") {
+    if squashed.contains("purchasemorecredits")
+        || squashed.contains("requesttoyouradmin")
+        || squashed.contains("exceededyourcurrentquota")
+    {
         BlockedKind::CreditsDepleted
     } else {
         BlockedKind::UsageLimit
     }
 }
 
-fn scrub_detail(text: &str) -> String {
+/// Control/bidi-strip `text`, collapse its whitespace and bound it to
+/// [`MAX_DETAIL_CHARS`] — the one scrub every [`BlockedReason::detail`] passes
+/// through, at the classifier and again wherever the value is ingested.
+pub fn scrub_detail(text: &str) -> String {
     let stripped = strip_control_and_bidi(text, false);
     let collapsed = stripped.split_whitespace().collect::<Vec<_>>().join(" ");
     if collapsed.chars().count() <= MAX_DETAIL_CHARS {
@@ -275,6 +290,74 @@ fn scrub_detail(text: &str) -> String {
     let mut out: String = collapsed.chars().take(MAX_DETAIL_CHARS - 1).collect();
     out.push('…');
     out
+}
+
+/// ASCII needles whose presence in a raw PTY chunk makes a screen probe worth
+/// taking. Deliberately loose — the byte stream is not text (ANSI sequences,
+/// cursor addressing) and the precision lives in [`classify`] on the
+/// reconstructed screen; this only decides whether to look. Every pattern
+/// [`classify`] accepts contains one of these.
+pub const HINT_NEEDLES: &[&[u8]] = &[b"usage limit", b"current quota"];
+
+/// Per-pane byte scanner for [`HINT_NEEDLES`], run on every PTY chunk.
+///
+/// Keeps the last `longest needle - 1` bytes of the previous chunk so a needle
+/// split across two reads is still found; a needle can never be counted twice
+/// from the carry alone, because the carry is one byte shorter than it.
+#[derive(Debug, Clone, Default)]
+pub struct HintScanner {
+    carry: Vec<u8>,
+}
+
+impl HintScanner {
+    fn carry_len() -> usize {
+        HINT_NEEDLES.iter().map(|n| n.len()).max().unwrap_or(1) - 1
+    }
+
+    /// Scan one chunk; `true` when a needle ends inside it.
+    pub fn scan(&mut self, chunk: &[u8]) -> bool {
+        let carry_len = Self::carry_len();
+        let mut window = std::mem::take(&mut self.carry);
+        window.extend_from_slice(chunk);
+        let hit = HINT_NEEDLES
+            .iter()
+            .any(|needle| window.windows(needle.len()).any(|w| w == *needle));
+        let keep = window.len().min(carry_len);
+        self.carry = window[window.len() - keep..].to_vec();
+        hit
+    }
+}
+
+/// Whether `event` is evidence that the pane's agent is WORKING — the set that
+/// cancels a quota hint or candidate and clears a `Blocked` card.
+///
+/// A turn is underway or starting: a submitted prompt (`Thinking`), a tool, a
+/// subagent, a compaction, a permission request or input prompt raised by a
+/// tool, or a genuine session start. NOT evidence: `Idle` and `Error` (OpenCode
+/// sends `session.error` and `session.idle` right beside its quota line), the
+/// shell-activity pair, `Unknown`, and anything the daemon or the wrapper
+/// synthesized rather than the agent reporting — a wrapper's fork/interface
+/// `SessionStart`, the card-surfacing start, and the wrapper's stdout line
+/// classifier, which calls every printed line `Working`, the quota line
+/// included.
+pub fn is_work_evidence(event: &crate::event::AgentEvent) -> bool {
+    use crate::event::EventType;
+    let work_type = matches!(
+        event.event_type,
+        EventType::ToolStart
+            | EventType::ToolEnd
+            | EventType::Thinking
+            | EventType::Compacting
+            | EventType::SubagentStart
+            | EventType::SubagentStop
+            | EventType::PermissionRequest
+            | EventType::WaitingForInput
+            | EventType::SessionStart
+    );
+    work_type
+        && !event.is_daemon_synthetic()
+        && !event.is_wrapper_session_start()
+        && !event.is_wrapper_output_classified()
 }
 
 /// Durations driving [`QuotaDetector`].
@@ -399,7 +482,10 @@ impl QuotaDetector {
         self.confirmed
     }
 
-    fn hint_pending(&self) -> bool {
+    /// Whether a hint newer than the last work event is waiting to be probed
+    /// (or confirmed). The daemon keeps screen context across a resize only
+    /// while this holds.
+    pub fn hint_pending(&self) -> bool {
         match (self.hint_at, self.last_work_event_at) {
             (Some(hint), Some(work)) => hint > work,
             (Some(_), None) => true,
@@ -478,7 +564,11 @@ mod tests {
     const OPENCODE_USAGE: &[&str] = &[
         "Error: The usage limit has been reached",
         "The usage limit has been reached",
+    ];
+    /// OpenAI `insufficient_quota`: a billing balance, which does not reset.
+    const OPENCODE_CREDITS: &[&str] = &[
         "Error: You exceeded your current quota, please check your plan and billing details.",
+        "You exceeded your current quota",
     ];
 
     fn rows(lines: &[&str]) -> Vec<String> {
@@ -523,8 +613,9 @@ mod tests {
     /// Scenario: Feed every real Codex and OpenCode quota sentence, bare and
     /// behind the `■ ` / `│ ` chrome, and wrapped at 40 and 80 columns through
     /// the daemon's screen replay, into the classifier. Each must be recognised
-    /// with the right kind: credit-pool wording is CreditsDepleted, the rest
-    /// (including `Try again at`) UsageLimit.
+    /// with the right kind: credit-pool and billing-balance wording (including
+    /// OpenAI's `insufficient_quota`) is CreditsDepleted, the rest (including
+    /// `Try again at`) UsageLimit.
     #[spec("status/blocked/001")]
     #[test]
     fn status_blocked_001_classifier_accepts_real_provider_lines() {
@@ -538,6 +629,11 @@ mod tests {
             &AgentType::OpenCode,
             OPENCODE_USAGE,
             BlockedKind::UsageLimit,
+        );
+        assert_kind(
+            &AgentType::OpenCode,
+            OPENCODE_CREDITS,
+            BlockedKind::CreditsDepleted,
         );
 
         // The detail is the matched message, scrubbed and bounded.
@@ -637,6 +733,7 @@ mod tests {
                 .iter()
                 .chain(CODEX_CREDITS)
                 .chain(OPENCODE_USAGE)
+                .chain(OPENCODE_CREDITS)
             {
                 assert_eq!(classify(&agent, &rows(&[line])), None, "{agent:?} {line:?}");
             }

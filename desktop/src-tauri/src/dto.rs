@@ -460,7 +460,27 @@ pub struct DesktopAgent {
     /// comparison is actually made against is the webview.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub spawned_at_ms: Option<i64>,
+    /// Issue #714: why the agent is `blocked` — present only beside
+    /// `status: "blocked"`, copied from `SessionSnapshot.blocked`. Absent from an
+    /// older daemon, which never reports the status either.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub blocked: Option<DesktopBlocked>,
     pub tab: DesktopTab,
+}
+
+/// Issue #714: the webview's view of a `BlockedReason`.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DesktopBlocked {
+    /// `usage_limit`, `credits_depleted` or `unknown` — the daemon's wire value.
+    pub kind: &'static str,
+    /// When the daemon confirmed the block, epoch milliseconds.
+    pub detected_at_ms: i64,
+    /// The pane's own matched line. Agent-controlled text, so scrubbed of
+    /// control and bidi characters at this seam ([`safe_display_text`]) before
+    /// the webview sees it, and rendered through `displayText` there as well.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1289,6 +1309,7 @@ fn session_status_name(status: &SessionStatus) -> &'static str {
         SessionStatus::WaitingForInput => "waiting_for_input",
         SessionStatus::Idle => "idle",
         SessionStatus::Error => "error",
+        SessionStatus::Blocked => "blocked",
         SessionStatus::Unknown => "unknown",
     }
 }
@@ -1366,6 +1387,19 @@ pub(crate) fn map_agent(record: AgentRecord) -> DesktopAgent {
         .and_then(|snapshot| snapshot.live_target.as_ref())
         .map(|target| write_lease_name(&target.writable));
     let last_activity_ms = live.and_then(|snapshot| snapshot.last_activity_ms);
+    // Issue #714: only beside the status it explains.
+    let blocked = live
+        .filter(|snapshot| snapshot.status == SessionStatus::Blocked)
+        .and_then(|snapshot| snapshot.blocked.as_ref())
+        .map(|reason| DesktopBlocked {
+            kind: reason.kind.as_wire(),
+            detected_at_ms: reason.detected_at_ms,
+            detail: reason
+                .detail
+                .as_deref()
+                .map(safe_display_text)
+                .filter(|detail| !detail.is_empty()),
+        });
     // PRD #745 M11: off the RECORD, not the live snapshot — the daemon knows
     // when it spawned a process whether or not that process has ever emitted an
     // event.
@@ -1393,6 +1427,7 @@ pub(crate) fn map_agent(record: AgentRecord) -> DesktopAgent {
         write_lease,
         last_activity_ms,
         spawned_at_ms,
+        blocked,
         tab,
     }
 }
@@ -2809,6 +2844,7 @@ mod tests {
                 last_user_prompt: None,
                 live_target: None,
                 last_activity_ms: None,
+                blocked: None,
             }),
             spawned_at_ms: None,
             // Issue #856: as the DAEMON reported it. The fixture agent is
@@ -2896,6 +2932,45 @@ mod tests {
         // `agent_mapping_surfaces_the_spawn_instant_unchanged` for the present
         // case, which keeps `live` untouched).
         assert!(mapped.spawned_at_ms.is_none());
+    }
+
+    /// Issue #714: a quota-blocked session maps to its own `"blocked"` status,
+    /// its reason rides beside it with the agent-controlled detail scrubbed of
+    /// control and bidi characters, and the reason never outlives the status.
+    #[test]
+    fn blocked_status_maps_to_blocked_with_reason() {
+        assert_eq!(session_status_name(&SessionStatus::Blocked), "blocked");
+        let mut record = fixture_record();
+        let live = record
+            .live
+            .as_mut()
+            .expect("fixture carries a live snapshot");
+        live.status = SessionStatus::Blocked;
+        live.blocked = Some(dot_agent_deck::state::BlockedReason {
+            kind: dot_agent_deck::state::BlockedKind::CreditsDepleted,
+            detected_at_ms: 1_700_000_000_000,
+            detail: Some("purchase \u{202e}more\u{7} credits".to_string()),
+        });
+        let mapped = map_agent(record.clone());
+        assert_eq!(mapped.status, "blocked");
+        let blocked = mapped.blocked.as_ref().expect("reason carried");
+        assert_eq!(blocked.kind, "credits_depleted");
+        assert_eq!(blocked.detected_at_ms, 1_700_000_000_000);
+        assert_eq!(blocked.detail.as_deref(), Some("purchase more credits"));
+        let value = serde_json::to_value(&mapped).unwrap();
+        assert_eq!(value["blocked"]["kind"], "credits_depleted");
+        assert_eq!(value["blocked"]["detectedAtMs"], 1_700_000_000_000_i64);
+
+        // A reason beside any other status is not reported.
+        record.live.as_mut().unwrap().status = SessionStatus::Thinking;
+        let mapped = map_agent(record);
+        assert!(mapped.blocked.is_none());
+        assert!(
+            serde_json::to_value(&mapped)
+                .unwrap()
+                .get("blocked")
+                .is_none()
+        );
     }
 
     /// PRD #745 M8: the two `SessionSnapshot` fields the desktop's own DTO used

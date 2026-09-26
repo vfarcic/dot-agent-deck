@@ -506,6 +506,7 @@ pub mod test_support {
             write_lease: None,
             last_activity_ms: None,
             spawned_at_ms: None,
+            blocked: None,
             tab: DesktopTab::Dashboard,
         }
     }

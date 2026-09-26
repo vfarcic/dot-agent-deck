@@ -100,7 +100,9 @@ impl BellConfig {
         match status {
             SessionStatus::WaitingForInput => self.on_waiting_for_input,
             SessionStatus::Idle => self.on_idle,
-            SessionStatus::Error => self.on_error,
+            // Issue #714: a quota-blocked agent needs a person just like an
+            // erroring one, so it rings under the same switch.
+            SessionStatus::Error | SessionStatus::Blocked => self.on_error,
             _ => false,
         }
     }
@@ -2209,6 +2211,7 @@ command = "vim"
         assert!(bc.should_bell(&SessionStatus::WaitingForInput));
         assert!(!bc.should_bell(&SessionStatus::Idle));
         assert!(bc.should_bell(&SessionStatus::Error));
+        assert!(bc.should_bell(&SessionStatus::Blocked));
         assert!(!bc.should_bell(&SessionStatus::Thinking));
         assert!(!bc.should_bell(&SessionStatus::Working));
         assert!(!bc.should_bell(&SessionStatus::Compacting));

@@ -1062,6 +1062,17 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
         })
     };
 
+    // Issue #714: unconditional for the same reason — the pane's own screen is
+    // the only place a quota-exhausted agent says so.
+    let quota_monitor_handle = {
+        let registry = pty_registry.clone();
+        let monitor_state = state.clone();
+        let monitor_event_tx = event_tx.clone();
+        tokio::spawn(async move {
+            run_quota_monitor(registry, monitor_state, monitor_event_tx).await;
+        })
+    };
+
     let result = run_hook_loop(
         listener,
         state,
@@ -1090,6 +1101,7 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
         h.abort();
     }
     shell_activity_handle.abort();
+    quota_monitor_handle.abort();
     scheduler_handle.abort();
     if let Some(h) = orphan_handle {
         h.abort();
@@ -1538,6 +1550,16 @@ async fn ingest_event(
         .pane_id
         .as_deref()
         .is_some_and(|pane_id| registry.has_live_pane(pane_id));
+    // Issue #714: work evidence cancels the pane's pending quota hint or
+    // candidate and lifts a confirmed block — the detector's half of the rule
+    // `apply_event` applies to the card. Only the generation the event names is
+    // credited. Asked of the registry BEFORE the `AppState` write lock, for the
+    // lock-order reason `has_live_pane` gives above.
+    if let Some(pane_id) = event.pane_id.as_deref()
+        && crate::quota_detect::is_work_evidence(&event)
+    {
+        registry.quota_note_work_event(pane_id, event.agent_id.as_deref());
+    }
     let mut state = state.write().await;
     // The other half, plus the stamp: is this an orchestration role pane whose
     // role registration a daemon restart destroyed while its agent survived?
@@ -1561,6 +1583,178 @@ async fn ingest_event(
         .remove(crate::event::DAEMON_PANE_CLOSED_METADATA_KEY);
     let _ = event_tx.send(BroadcastMsg::Event(event.clone()));
     state.apply_event(event);
+}
+
+/// Issue #714: what the hook loop does to a PRODUCER's raw event before it is
+/// ingested, so no producer can paint a quota block. `false` means drop the
+/// event outright — a `quota_blocked` event is the daemon's alone to author,
+/// exactly like the orphaned-role and pane-closed markers — and the daemon-owned
+/// `quota_blocked_*` metadata keys are stripped from every other event, so an
+/// older daemon's stripping gap or a hand-rolled hook cannot smuggle a reason
+/// onto a card either. Same model as `stamp_orchestration_orphan`: anything on
+/// the unauthenticated same-uid socket is treated as forgeable.
+fn admit_producer_event(event: &mut AgentEvent) -> bool {
+    if event.event_type == crate::event::EventType::QuotaBlocked {
+        return false;
+    }
+    event
+        .metadata
+        .remove(crate::quota_detect::QUOTA_BLOCKED_KIND_METADATA_KEY);
+    event
+        .metadata
+        .remove(crate::quota_detect::QUOTA_BLOCKED_DETAIL_METADATA_KEY);
+    true
+}
+
+/// Issue #714: how often [`run_quota_monitor`] asks the registry whether any
+/// pane's quota detector wants its screen probed. The asking is lock-only and
+/// allocation-free for every pane with no pending hint — the replay happens
+/// only for a pane that printed a quota needle and then went quiet — so a
+/// one-second tick costs nothing measurable and bounds the added latency on top
+/// of the detector's own quiet and confirmation windows.
+const QUOTA_MONITOR_TICK: Duration = Duration::from_secs(1);
+
+/// Issue #714: the daemon half of the quota detector (`crate::quota_detect`).
+///
+/// Each tick asks the registry for the panes whose detector wants a probe (a
+/// needle seen in the PTY bytes, newer than the pane's last work evidence, the
+/// PTY quiet since, and the probe rate limit or confirmation window elapsed),
+/// replays each one's scrollback through the same `vt100` parser the TUI
+/// renders with ([`crate::pane_screen_text::visible_tail_lines`]), classifies
+/// the bottom rows against the pane's agent type, and hands the result back.
+/// When the detector CONFIRMS — a second matching probe a full confirmation
+/// window after the first, with no work in between — the block is published as
+/// ONE synthetic `QuotaBlocked` event ([`publish_quota_blocked`]) and, for a
+/// worker that still owes a `work-done`, one notice to its orchestrator.
+///
+/// The replay is paid inline: it is bounded by the 1 MiB ring (26–29 ms
+/// measured for #686), happens only for a pane that has gone quiet right after
+/// printing a quota needle, and is rate limited per pane. No internal shutdown
+/// signal — torn down by `.abort()` in `run_daemon_with`'s cleanup, like the
+/// shell-activity monitor.
+async fn run_quota_monitor(
+    pty_registry: Arc<AgentPtyRegistry>,
+    state: SharedState,
+    event_tx: broadcast::Sender<BroadcastMsg>,
+) {
+    loop {
+        tokio::time::sleep(QUOTA_MONITOR_TICK).await;
+        let now = std::time::Instant::now();
+        for probe in pty_registry.quota_probe_candidates(now) {
+            let rows = probe.screen.tail_rows(probe.rows, probe.cols);
+            let found = crate::quota_detect::classify(&probe.agent_type, &rows);
+            let outcome = pty_registry.quota_record_probe(
+                &probe.agent_id,
+                now,
+                found.as_ref().map(|m| m.kind),
+            );
+            debug!(
+                pane_id = %probe.pane_id,
+                agent_id = %probe.agent_id,
+                outcome = ?outcome,
+                "quota: probed a quiet pane after a quota hint"
+            );
+            if let (Some(crate::quota_detect::ProbeOutcome::Confirmed(kind)), Some(found)) =
+                (outcome, found)
+            {
+                publish_quota_blocked(
+                    &pty_registry,
+                    &state,
+                    &event_tx,
+                    &probe.pane_id,
+                    &probe.agent_id,
+                    kind,
+                    &found.detail,
+                )
+                .await;
+            }
+        }
+    }
+}
+
+/// Issue #714: publish one confirmed quota block — the synthetic `QuotaBlocked`
+/// event onto the pane's card, then the blocked-worker notice if the pane is the
+/// worker side of an outstanding delegation.
+///
+/// Addressed and applied exactly like the delivery-notice report
+/// (`install_delivery_notice_sink`), for the same reasons:
+///
+/// * one write lock for re-validate → resolve → broadcast → apply, with the
+///   registry owner re-checked inside it, so a pane that changed hands since
+///   the probe receives nothing;
+/// * applied through [`AppState::apply_daemon_report_event`], so a statement
+///   ABOUT the pane never moves its hook generation;
+/// * addressed to the pane's current generation, else its existing card, else
+///   the placeholder key every client files the pane's first card under — so a
+///   stand-in or plugin agent that has sent no hook event still gets a card, in
+///   the daemon (for `ListAgents` / `daemon status`) and in every client;
+/// * carrying the registry `agent_id`, so admission and the reuse guard land it
+///   on that agent's card.
+///
+/// The event carries the kind and the scrubbed detail in daemon-owned metadata,
+/// which the hook loop strips from every producer frame.
+async fn publish_quota_blocked(
+    registry: &Arc<AgentPtyRegistry>,
+    state: &SharedState,
+    event_tx: &broadcast::Sender<BroadcastMsg>,
+    pane_id: &str,
+    agent_id: &str,
+    kind: crate::quota_detect::BlockedKind,
+    detail: &str,
+) {
+    {
+        let mut guard = state.write().await;
+        if registry.pane_current_agent_id(pane_id).as_deref() != Some(agent_id) {
+            debug!(
+                pane_id = %pane_id,
+                "quota: confirmed block dropped; the pane no longer belongs to the probed agent"
+            );
+            return;
+        }
+        let session_id = guard
+            .pane_hook_session_id(pane_id)
+            .or_else(|| guard.pane_session_id(pane_id))
+            .unwrap_or_else(|| crate::state::placeholder_session_id(pane_id));
+        let mut metadata = std::collections::HashMap::new();
+        metadata.insert(
+            crate::quota_detect::QUOTA_BLOCKED_KIND_METADATA_KEY.to_string(),
+            kind.as_wire().to_string(),
+        );
+        metadata.insert(
+            crate::quota_detect::QUOTA_BLOCKED_DETAIL_METADATA_KEY.to_string(),
+            detail.to_string(),
+        );
+        let event = AgentEvent {
+            session_id,
+            // The daemon is not the agent: `None` never overwrites a known type.
+            agent_type: crate::event::AgentType::None,
+            event_type: crate::event::EventType::QuotaBlocked,
+            tool_name: None,
+            tool_detail: None,
+            cwd: None,
+            timestamp: chrono::Utc::now(),
+            user_prompt: None,
+            metadata,
+            pane_id: Some(pane_id.to_string()),
+            agent_id: Some(agent_id.to_string()),
+            agent_version: None,
+            schema_version: None,
+            live_target: None,
+        };
+        let _ = event_tx.send(BroadcastMsg::Event(event.clone()));
+        guard.apply_daemon_report_event(event);
+    }
+    warn!(
+        pane_id = %pane_id,
+        agent_id = %agent_id,
+        kind = kind.as_wire(),
+        "quota: the pane's own output says its provider usage limit is exhausted; marked Blocked"
+    );
+    if let Some(notice) = registry.claim_worker_blocked_notice(pane_id, agent_id) {
+        registry
+            .deliver_worker_blocked_notice(pane_id, notice)
+            .await;
+    }
 }
 
 /// Issue #424 (reviewer blocker 3): teach the registry how to turn a
@@ -3244,7 +3438,7 @@ async fn run_hook_loop_with_idle_timeout(
                                     }
                                 }
                             }
-                        } else if let Ok(event) = serde_json::from_str::<AgentEvent>(&line) {
+                        } else if let Ok(mut event) = serde_json::from_str::<AgentEvent>(&line) {
                             // `tool_name`/`tool_detail` are logged so a post-mortem can
                             // name the command an agent was running, not just that it ran
                             // one. Four "fleet death" investigations (2026-07-28 23:05,
@@ -3287,6 +3481,17 @@ async fn run_hook_loop_with_idle_timeout(
                                     "Event carries an unrecognized event_type — decoded as \
                                      Unknown and otherwise ignored; check the hook for a typo"
                                 );
+                            }
+                            // Issue #714: a quota block is the daemon's verdict,
+                            // never a producer's claim.
+                            if !admit_producer_event(&mut event) {
+                                warn!(
+                                    session_id = %escape_id_for_log(&event.session_id),
+                                    pane_id = ?event.pane_id,
+                                    "Dropped a producer-sent quota_blocked event; only the \
+                                     daemon's own quota detector may mark a card Blocked"
+                                );
+                                continue;
                             }
                             // Persist the agent type this hook revealed into
                             // the PTY registry (keyed by pane id), so a later
@@ -3440,6 +3645,79 @@ mod hook_ingestion_tests {
     use std::os::unix::fs::PermissionsExt;
     use tokio::io::AsyncWriteExt;
     use tokio::net::{UnixListener, UnixStream};
+
+    /// Scenario: Post a `quota_blocked` event on the hook socket as a producer
+    /// would, and a `thinking` event carrying forged quota-reason keys. The
+    /// first is dropped outright; the second is admitted with the forged keys
+    /// stripped, so no producer can paint a card Blocked.
+    #[spec("status/blocked/006")]
+    #[test]
+    fn status_blocked_006_producer_cannot_paint_quota_blocked() {
+        let base = |event_type| {
+            let mut metadata = std::collections::HashMap::new();
+            metadata.insert(
+                crate::quota_detect::QUOTA_BLOCKED_KIND_METADATA_KEY.to_string(),
+                "credits_depleted".to_string(),
+            );
+            metadata.insert(
+                crate::quota_detect::QUOTA_BLOCKED_DETAIL_METADATA_KEY.to_string(),
+                "forged".to_string(),
+            );
+            metadata.insert("other".to_string(), "kept".to_string());
+            AgentEvent {
+                session_id: "s".to_string(),
+                agent_type: AgentType::Codex,
+                event_type,
+                tool_name: None,
+                tool_detail: None,
+                cwd: None,
+                timestamp: chrono::Utc::now(),
+                user_prompt: None,
+                metadata,
+                pane_id: Some("pane-1".to_string()),
+                agent_id: Some("1".to_string()),
+                agent_version: None,
+                schema_version: None,
+                live_target: None,
+            }
+        };
+        let mut forged = base(crate::event::EventType::QuotaBlocked);
+        assert!(
+            !admit_producer_event(&mut forged),
+            "a producer's quota_blocked must be dropped"
+        );
+        // The wire form a hook would post decodes to the variant, so the drop
+        // is reached rather than bypassed as `Unknown`.
+        let raw = serde_json::to_string(&base(crate::event::EventType::QuotaBlocked)).unwrap();
+        assert!(raw.contains("\"quota_blocked\""), "{raw}");
+
+        let mut smuggled = base(crate::event::EventType::Thinking);
+        assert!(admit_producer_event(&mut smuggled));
+        assert!(
+            !smuggled
+                .metadata
+                .contains_key(crate::quota_detect::QUOTA_BLOCKED_KIND_METADATA_KEY)
+                && !smuggled
+                    .metadata
+                    .contains_key(crate::quota_detect::QUOTA_BLOCKED_DETAIL_METADATA_KEY),
+            "forged quota keys must be stripped: {:?}",
+            smuggled.metadata
+        );
+        assert_eq!(
+            smuggled.metadata.get("other").map(String::as_str),
+            Some("kept")
+        );
+
+        // End to end through the state: the stripped frame paints nothing.
+        let mut state = crate::state::AppState::default();
+        state.register_pane("pane-1".to_string());
+        state.apply_event(smuggled);
+        assert_eq!(
+            state.sessions["s"].status,
+            crate::state::SessionStatus::Thinking
+        );
+        assert!(state.sessions["s"].blocked.is_none());
+    }
 
     /// PRD #1223: the pane-closed marker is daemon-authoritative. A producer
     /// posting it on the hook socket must not reach an attached TUI with it —

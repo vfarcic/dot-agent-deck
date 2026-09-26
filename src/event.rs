@@ -28,6 +28,15 @@ pub enum EventType {
     /// gone, i.e. the previously-running foreground command has finished. See
     /// [`ShellBusy`](Self::ShellBusy).
     ShellIdle,
+    /// Issue #714: synthesized daemon-side (never accepted from a producer —
+    /// the hook loop drops an inbound one) once the daemon's quota detector
+    /// (`crate::quota_detect`) has confirmed, from the pane's own reconstructed
+    /// screen, that its agent's provider refused it for an exhausted usage limit
+    /// or credit pool. Its kind and display detail ride the daemon-owned
+    /// [`crate::quota_detect::QUOTA_BLOCKED_KIND_METADATA_KEY`] /
+    /// [`crate::quota_detect::QUOTA_BLOCKED_DETAIL_METADATA_KEY`]. An older
+    /// reader decodes it as [`EventType::Unknown`], a no-op.
+    QuotaBlocked,
     /// PRD #370 / precedent PRD #201 (`AgentType`'s identical retrofit):
     /// forward-compat catch-all for a future/unknown `event_type` string on
     /// the wire, so a build newer than THIS one can add further variants
@@ -691,6 +700,24 @@ pub const CLEAR_SESSION_START_METADATA_KEY: &str = "session_start_source";
 /// was caused by the user running `/clear`".
 pub const CLEAR_SESSION_START_METADATA_VALUE: &str = "clear";
 
+/// Issue #714: `AgentEvent.metadata` key `dot-agent-deck wrap` stamps on every
+/// event its stdout line classifier emits (value
+/// [`WRAPPER_OUTPUT_CLASSIFIED_METADATA_VALUE`]).
+///
+/// That classifier reads EVERY non-blank line as `Working` (→ `Thinking`),
+/// including a provider's own quota-error line, so an event it emits proves the
+/// child printed something, not that it did any work. The quota detector must
+/// not let such an event cancel the very hint it was caused by, and a `Blocked`
+/// card must not be cleared by it. Marked rather than inferred so nothing else
+/// about those events changes. Forging the key can only make an event count for
+/// LESS as work evidence — it can keep a `Blocked` card blocked, which the
+/// pane's own output could do anyway — so it is not, and must not be treated
+/// as, an authentication marker.
+pub const WRAPPER_OUTPUT_CLASSIFIED_METADATA_KEY: &str = "wrapper_output_classified";
+
+/// The [`WRAPPER_OUTPUT_CLASSIFIED_METADATA_KEY`] value.
+pub const WRAPPER_OUTPUT_CLASSIFIED_METADATA_VALUE: &str = "1";
+
 /// PRD #20 M1: current schema version of the [`AgentEvent`] JSON wire shape.
 ///
 /// This versions the **payload shape of a single `AgentEvent` record** — the
@@ -958,14 +985,24 @@ impl AgentEvent {
         self.is_wrapper_fork_session_start() || self.is_wrapper_interface_session_start()
     }
 
+    /// Issue #714: was this event emitted by `dot-agent-deck wrap`'s stdout line
+    /// classifier (see [`WRAPPER_OUTPUT_CLASSIFIED_METADATA_KEY`])?
+    pub fn is_wrapper_output_classified(&self) -> bool {
+        self.metadata
+            .get(WRAPPER_OUTPUT_CLASSIFIED_METADATA_KEY)
+            .is_some_and(|v| v == WRAPPER_OUTPUT_CLASSIFIED_METADATA_VALUE)
+    }
+
     /// Issue #424 D4: was this event SYNTHESIZED BY THE DAEMON rather than
     /// produced by the pane's agent?
     ///
     /// The daemon emits events of its own through the same pipeline real hook
     /// events take: [`EventType::ShellBusy`]/[`EventType::ShellIdle`] from the
     /// shell-activity monitor (PRD #370/#386), the delivery-notice
-    /// [`EventType::Error`] (issue #424), and the card-surfacing `SessionStart`
-    /// (issue #684, [`CARD_SURFACE_SESSION_START_ORIGIN`]).
+    /// [`EventType::Error`] (issue #424), the card-surfacing `SessionStart`
+    /// (issue #684, [`CARD_SURFACE_SESSION_START_ORIGIN`]), and the quota
+    /// detector's [`EventType::QuotaBlocked`] (issue #714), which a producer
+    /// cannot send at all — the hook loop drops it.
     ///
     /// The first two carry the pane's registry `agent_id` because that is how
     /// they land on the right card — the card-surfacing start is the exception and
@@ -985,8 +1022,10 @@ impl AgentEvent {
     /// authentication marker (auditor) — a forged raw `Error` without it marks a
     /// card exactly as it did before.
     pub fn is_daemon_synthetic(&self) -> bool {
-        matches!(self.event_type, EventType::ShellBusy | EventType::ShellIdle)
-            || self.metadata.contains_key(DELIVERY_NOTICE_METADATA_KEY)
+        matches!(
+            self.event_type,
+            EventType::ShellBusy | EventType::ShellIdle | EventType::QuotaBlocked
+        ) || self.metadata.contains_key(DELIVERY_NOTICE_METADATA_KEY)
             || self.is_card_surface_session_start()
             || self.is_daemon_pane_closed()
     }
@@ -1687,6 +1726,30 @@ pub struct DelegateResponse {
     /// not refused over. A role listed here is also in `delivered`.
     #[serde(default)]
     pub superseded: Vec<BusyWorker>,
+    /// Issue #714: resolved roles whose worker's card reads `Blocked` — its pane
+    /// shows a provider usage-limit or credit error — whether the role was
+    /// delivered or refused as [`Self::busy`]. A warning, never a refusal: the
+    /// status is derived from pane output, which is not an input this daemon may
+    /// authorize on (#601, #696), and a windowed limit may already have reset.
+    ///
+    /// Carries fixed data only — role, kind, age — and never the matched text,
+    /// which is agent-controlled and would land in the orchestrator's tool
+    /// output. Additive on the hook socket like every field of this reply.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blocked: Vec<BlockedWorker>,
+}
+
+/// Issue #714: one delegate target whose worker appears blocked by a provider
+/// usage limit. See [`DelegateResponse::blocked`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlockedWorker {
+    /// The `--to` role the worker pane is registered for.
+    pub role: String,
+    /// Which limit the pane reported.
+    pub kind: crate::quota_detect::BlockedKind,
+    /// Whole seconds since the daemon confirmed the block.
+    #[serde(default)]
+    pub blocked_for_secs: u64,
 }
 
 /// Issue #580: one worker that still owed a `work-done` when a delegate named
@@ -1721,6 +1784,7 @@ impl Default for DelegateResponse {
             error: None,
             busy: Vec::new(),
             superseded: Vec::new(),
+            blocked: Vec::new(),
         }
     }
 }

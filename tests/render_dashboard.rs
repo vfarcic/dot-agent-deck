@@ -84,6 +84,7 @@ fn pane_004_card_title_row() {
         agent_type: AgentType::ClaudeCode,
         cwd: Some("/home/dev/example-project".to_string()),
         status: SessionStatus::Working,
+        blocked: None,
         active_tool: Some(ActiveTool {
             name: "Read".to_string(),
             detail: Some("src/main.rs".to_string()),
@@ -130,6 +131,7 @@ fn card_stats_session(cwd: &str) -> SessionState {
         agent_type: AgentType::ClaudeCode,
         cwd: Some(cwd.to_string()),
         status: SessionStatus::Thinking,
+        blocked: None,
         active_tool: Some(ActiveTool {
             name: "Read".to_string(),
             detail: Some("src/ui.rs".to_string()),
@@ -286,6 +288,7 @@ fn live_016_reconnected_card_reads_how_long_the_agent_has_been_quiet() {
             last_user_prompt: Some("move the stats into the border".to_string()),
             live_target: None,
             last_activity_ms,
+            blocked: None,
         };
         let mut state = AppState::default();
         state.register_pane("pane-reconnect".to_string());
@@ -580,6 +583,7 @@ fn overlay_buffers() -> Vec<(&'static str, ratatui::buffer::Buffer)> {
         thinking: 1,
         waiting: 1,
         errors: 1,
+        blocked: 0,
         idle: 1,
         compacting: 1,
         total_tools: 42,
@@ -609,6 +613,7 @@ fn placeholder_card(selected: bool) -> ratatui::buffer::Buffer {
         agent_type: AgentType::None,
         cwd: None,
         status: SessionStatus::Idle,
+        blocked: None,
         active_tool: None,
         started_at: now,
         last_activity: now,
@@ -797,6 +802,7 @@ fn pane_007_pi_card_shows_pi_identity() {
         agent_type: AgentType::Pi,
         cwd: Some("/home/dev/workspace".to_string()),
         status: SessionStatus::Thinking,
+        blocked: None,
         active_tool: None,
         started_at: now,
         last_activity: now,
@@ -861,6 +867,7 @@ fn pane_008_codex_card_shows_colored_identity_badge() {
         agent_type: AgentType::Codex,
         cwd: Some("/home/dev/workspace".to_string()),
         status: SessionStatus::Thinking,
+        blocked: None,
         active_tool: None,
         started_at: now,
         last_activity: now,
@@ -1827,6 +1834,7 @@ fn pane_005_highlight_follows_selected_session_id() {
         agent_type: AgentType::ClaudeCode,
         cwd: Some(cwd.to_string()),
         status: SessionStatus::Working,
+        blocked: None,
         active_tool: Some(ActiveTool {
             name: "Read".to_string(),
             detail: Some("src/main.rs".to_string()),
@@ -2027,6 +2035,7 @@ fn filled_session() -> SessionState {
         agent_type: AgentType::ClaudeCode,
         cwd: Some("/home/dev/example-project".to_string()),
         status: SessionStatus::Working,
+        blocked: None,
         active_tool: Some(ActiveTool {
             name: "Bash".to_string(),
             detail: Some("cargo test".to_string()),
@@ -2786,6 +2795,7 @@ fn pane_013_declared_agent_fallback_yields_to_observed_agent() {
         agent_type: AgentType::None,
         cwd: Some("/home/dev/workspace".to_string()),
         status: SessionStatus::Idle,
+        blocked: None,
         active_tool: None,
         started_at: now,
         last_activity: now,
@@ -3129,6 +3139,7 @@ fn role_session(index: usize, role: &str) -> SessionState {
         agent_type: AgentType::ClaudeCode,
         cwd: Some("/home/dev/dot-agent-deck".to_string()),
         status: SessionStatus::Idle,
+        blocked: None,
         active_tool: None,
         started_at: now,
         last_activity: now,

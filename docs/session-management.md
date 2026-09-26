@@ -17,6 +17,7 @@ Each session card shows the agent's current state:
 | **WaitingForInput** | Agent needs user approval or input |
 | **Idle** | Agent is between tasks |
 | **Error** | Something went wrong |
+| **Blocked** | The agent's provider refused it because a usage limit or credit pool is exhausted, read from the agent's own screen (Codex and OpenCode). A line under `Dir:` says which limit. It clears when the agent does work again. There is no timer, because a spent credit pool does not reset on its own. |
 
 Cards also display:
 
