@@ -1145,12 +1145,19 @@ fn unquarantined_ignores(discovered: &[xtask_docs::DiscoveredTest]) -> Vec<Strin
 /// Whether an `#[ignore = "…"]` reason is CLAUDE.md rule 6's quarantine mark,
 /// `quarantined: <owner>, #<issue>` — a GitHub login and an issue number, and
 /// nothing else. `None` (a bare `#[ignore]`) never is.
+///
+/// The owner must be shaped like a login GitHub would issue: 1–39 characters,
+/// alphanumerics separated by single hyphens, no leading or trailing hyphen —
+/// otherwise a mark could name an owner nobody can be.
 fn is_quarantine_mark(reason: Option<&str>) -> bool {
     static MARK: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
-        Regex::new(r"^quarantined: [A-Za-z0-9][A-Za-z0-9-]*, #[1-9][0-9]*$")
+        Regex::new(r"^quarantined: ([A-Za-z0-9](?:-?[A-Za-z0-9])*), #[1-9][0-9]*$")
             .expect("quarantine mark regex compiles")
     });
-    reason.is_some_and(|reason| MARK.is_match(reason))
+    const MAX_LOGIN_LEN: usize = 39;
+    reason
+        .and_then(|reason| MARK.captures(reason))
+        .is_some_and(|caps| caps[1].len() <= MAX_LOGIN_LEN)
 }
 
 /// Rule 7 (PRD #77 Decision 30 / M4.3). The `xtask-docs` library raises `Err`
@@ -3168,6 +3175,28 @@ mod tests {
     fn quarantine_mark_accepts_exactly_the_rule_6_form() {
         assert!(is_quarantine_mark(Some("quarantined: vfarcic, #488")));
         assert!(is_quarantine_mark(Some("quarantined: some-user, #1")));
+        assert!(is_quarantine_mark(Some("quarantined: a, #2")));
+        let longest = format!("quarantined: {}, #3", "a".repeat(39));
+        assert!(is_quarantine_mark(Some(&longest)));
+    }
+
+    /// PR #1351 review: an owner no GitHub account could have must not pass.
+    #[test]
+    fn quarantine_mark_refuses_an_impossible_owner() {
+        let too_long = format!("quarantined: {}, #488", "a".repeat(40));
+        for reason in [
+            "quarantined: vfarcic-, #488",
+            "quarantined: -vfarcic, #488",
+            "quarantined: vf--arcic, #488",
+            "quarantined: vf_arcic, #488",
+            "quarantined: @vfarcic, #488",
+            too_long.as_str(),
+        ] {
+            assert!(
+                !is_quarantine_mark(Some(reason)),
+                "{reason:?} must not pass"
+            );
+        }
     }
 
     #[test]
