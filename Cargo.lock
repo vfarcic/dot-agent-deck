@@ -1372,6 +1372,7 @@ dependencies = [
  "vt100",
  "windows-sys 0.61.2",
  "xtask-docs",
+ "xtask-screenshots",
 ]
 
 [[package]]
@@ -7080,6 +7081,15 @@ dependencies = [
  "toml_edit 0.25.15+spec-1.1.0",
  "xtask-docs",
  "yaml-rust2",
+]
+
+[[package]]
+name = "xtask-screenshots"
+version = "0.0.0"
+dependencies = [
+ "serde_json",
+ "tempfile",
+ "vt100",
 ]
 
 [[package]]
