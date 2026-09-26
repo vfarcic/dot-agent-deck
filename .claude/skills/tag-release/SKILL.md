@@ -24,9 +24,12 @@ Run this from a checkout of `main` that is level with `origin/main`, because `an
 git fetch --quiet origin main
 git rev-parse origin/main          # record this — it becomes expected_head in Step 3
 bash .claude/skills/tag-release/analyze.sh
+bash .claude/skills/tag-release/cert-expiry.sh
 ```
 
-Stop and show the user the `MESSAGE` if the script exits non-zero or prints `ERROR=true`. If it prints `NO_FRAGMENTS=true`, there is nothing to release.
+Stop and show the user the `MESSAGE` if `analyze.sh` exits non-zero or prints `ERROR=true`. If it prints `NO_FRAGMENTS=true`, there is nothing to release.
+
+`cert-expiry.sh` is advisory and never blocks a release: it reads what the last release run's `desktop-sign` job logged about the Developer ID Application certificate (issue #1326). That job warns from 30 days before expiry, but only in a log and an annotation on a run that is usually green, so this is the one place the warning reliably reaches a person.
 
 ## Step 2 — Confirm the version with the user
 
@@ -35,6 +38,8 @@ Stop and show the user the `MESSAGE` if the script exits non-zero or prints `ERR
 1. `CURRENT_VERSION` and `PROPOSED_VERSION`, with the `BUMP_TYPE` that produced it.
 2. The `FRAGMENTS` list with their types, so the user can see what the bump was derived from.
 3. `SKIP_CI`, if it is `true` — `main`'s tip carries a skip marker, and a tag pointing at such a commit would stop `release.yml` running at all. Usually this resolves itself, because the pin commit becomes the new tip and carries no marker; the workflow inserts an empty preparation commit only in the case where the pin was already correct and so no commit was made. (`analyze.sh`'s check is advisory and matches only the bracket markers; the workflow's own check is the binding one and also covers GitHub's `skip-checks: true` trailer.)
+
+4. The certificate, from `cert-expiry.sh`: `CERT_NOT_AFTER` whenever it is printed, and every `CERT_MESSAGE` line when `CERT_CHECK=warning`. A warning means the certificate needs renewing, which is a manual task for the maintainer — `docs/develop/desktop-signing.md`, **Certificate expiry** — and from 24 hours before expiry `desktop-sign` fails and the release ships with no macOS `.dmg`. Report `CERT_CHECK=unknown` as "not checked", not as clear. `CERT_CHECK=clear` with no `CERT_NOT_AFTER` means the run it read built the `.dmg` unsigned, so there was no certificate to check. `CERT_PASSED_OVER` lists newer runs whose `desktop-sign` failed before reaching the certificate check; the answer comes from an older run, so mention them.
 
 Ask the user to confirm the version or give you a different one. Ask for a one- or two-sentence summary of the release for the tag message, or offer one drawn from the fragments.
 
