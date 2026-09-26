@@ -575,7 +575,8 @@ async fn delegate_022_delegate_during_an_in_flight_close_brings_the_role_back() 
     // pane of this orchestration at all, so a title read off a live sibling —
     // what #960 did — comes back `None`. The daemon has to know the title
     // itself.
-    std::fs::write(fx._dir.path().join(ORCHESTRATOR_EXIT_MARKER), b"")
+    tokio::fs::write(fx._dir.path().join(ORCHESTRATOR_EXIT_MARKER), b"")
+        .await
         .expect("tell the orchestrator stand-in to exit");
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     while fx.daemon.registry.has_live_pane(ORCH_PANE) {

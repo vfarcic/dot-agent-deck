@@ -980,6 +980,53 @@ pub struct OrchestrationTitleInUse {
     pub cwd: String,
 }
 
+/// Issue #555: the routing identity a registry record's own membership names —
+/// the same derivation the `StartAgent` handler registers the pane under
+/// (`OrchestrationSpawnMeta::identity`): the per-tab token when the client
+/// stamped one, else `(name, orchestration_cwd)` falling back to the pane's own
+/// cwd. `None` for a pane that is not an orchestration role.
+pub fn orchestration_identity_of_record(
+    record: &crate::agent_pty::AgentRecord,
+) -> Option<OrchestrationIdentity> {
+    let crate::agent_pty::TabMembership::Orchestration {
+        name,
+        orchestration_cwd,
+        orchestration_id,
+        ..
+    } = record.tab_membership.as_ref()?
+    else {
+        return None;
+    };
+    Some(match orchestration_id {
+        Some(id) => OrchestrationIdentity::Instance {
+            id: id.clone(),
+            name: name.clone(),
+        },
+        None => OrchestrationIdentity::NameCwd {
+            name: name.clone(),
+            cwd: orchestration_cwd
+                .clone()
+                .or_else(|| record.cwd.clone())
+                .unwrap_or_default(),
+        },
+    })
+}
+
+/// Issue #555: the directory half of an orchestration title's uniqueness key,
+/// resolved so that a symlink, a `..` component or any other alias of a
+/// directory is the SAME key as the directory itself — the same best-effort
+/// canonicalisation the `Ctrl+n` form's same-directory warning applies
+/// (Greptile / Qodo, PR #1336). Fails open to the path as given: a directory
+/// that cannot be resolved (gone, unreadable) still gets a key, only an exact
+/// one. Async because it touches the filesystem and every caller is on the
+/// runtime; it is taken BEFORE the state lock, never under it.
+pub async fn orchestration_title_cwd_key(cwd: &str) -> String {
+    match tokio::fs::canonicalize(cwd).await {
+        Ok(resolved) => resolved.to_string_lossy().into_owned(),
+        Err(_) => cwd.to_string(),
+    }
+}
+
 /// Issue #770: one live orchestration-role registration the daemon is holding
 /// in memory, as reported on the `ListAgents` reply so `daemon stop` can refuse
 /// to destroy it.
@@ -5228,6 +5275,13 @@ async fn dispatch_one_owned(
     // the moment the dispatch lock is held — see
     // [`crate::agent_pty::CommissionDispatchInFlight`].
     commission_in_flight: Option<crate::agent_pty::CommissionDispatchInFlight>,
+    // Issue #962: the orchestration's run title as the daemon held it when the
+    // delegate ARRIVED — read synchronously by the caller, while the sender's
+    // own role registration still pins the title record. Read here instead,
+    // on this detached task, a close of the last registered pane landing in
+    // between would already have pruned it (Greptile, PR #1336). `None` for
+    // callers with no daemon state, and for an orchestration with no title.
+    recorded_display_title: Option<String>,
 ) {
     let dispatch_mutex = registry.pane_dispatch_lock(&pane_id);
     let _dispatch_guard = dispatch_mutex.lock().await;
@@ -5377,13 +5431,10 @@ async fn dispatch_one_owned(
         // computation of the string is introduced here, which is what deriving
         // it from `(name, cwd)` would have been (and impossible for a typed
         // `Ctrl+n` title anyway).
-        let recreated_display_title = match (role_index, orchestration.as_ref(), state.as_ref()) {
-            (Some(_), Some(identity), Some(state)) => {
-                state.read().await.orchestration_display_title(identity)
-            }
+        let recreated_display_title = match (role_index, orchestration.as_ref()) {
+            (Some(_), Some(_)) => recorded_display_title.clone(),
             // No role index means no orchestration membership is built at all
-            // below, so there is nothing to carry a title on; no daemon state
-            // (unit fixtures) means there is nowhere to read one from.
+            // below, so there is nothing to carry a title on.
             _ => None,
         };
         let recreate_identity = crate::agent_pty::PaneRecreateIdentity {
@@ -5457,15 +5508,19 @@ async fn dispatch_one_owned(
                     // rejected with `reached no worker for role(s)` — the
                     // permanent breakage issue #606 reports.
                     if let (Some(state), Some(identity)) = (state.as_ref(), orchestration.clone()) {
+                        let title_cwd = match cwd.as_deref() {
+                            Some(cwd) => Some(orchestration_title_cwd_key(cwd).await),
+                            None => None,
+                        };
                         let mut state = state.write().await;
                         // Issue #962: a close that completed took this pane's
                         // identity with it, and if it was the last pane mapping
                         // to it the title went too. Put back what was read above.
-                        if let Some(cwd) = cwd.as_deref() {
+                        if let Some(title_cwd) = title_cwd.as_deref() {
                             state.record_orchestration_title(
                                 &identity,
                                 recreated_display_title.as_deref(),
-                                cwd,
+                                title_cwd,
                             );
                         }
                         state.register_orchestration_role(
@@ -7576,11 +7631,21 @@ impl AppState {
     /// itself.
     ///
     /// **Liveness** is asked the way `ListAgents` answers it: a holder counts
-    /// only while one of its panes has a live agent in the registry, or while
-    /// one of its own starts is in flight. A holder whose panes have all exited
-    /// keeps its role-map entries until a pane close (nothing else unregisters
-    /// them), so a check that ignored liveness would leave the title
-    /// unclaimable for the rest of the daemon's life after a crash.
+    /// only while a live agent in the registry carries a membership naming its
+    /// identity ([`orchestration_identity_of_record`]), or while one of its own
+    /// starts is in flight. A holder whose panes have all exited keeps its
+    /// role-map entries until a pane close (nothing else unregisters them), so
+    /// a check that ignored liveness would leave the title unclaimable for the
+    /// rest of the daemon's life after a crash. It is asked of the live agent's
+    /// OWN membership rather than of `pane_orchestration_map` joined to the
+    /// registry by pane id, because a pane id is a reusable slot: an exited
+    /// role's stale map entry plus an unrelated live successor on the same pane
+    /// id would otherwise read as the old orchestration still holding its title
+    /// (Qodo, PR #1336).
+    ///
+    /// `cwd` is compared as given; callers pass it through
+    /// [`orchestration_title_cwd_key`] first, so a symlinked or `..`-bearing
+    /// alias of a live orchestration's directory is the same key.
     ///
     /// Called under the state write lock, so the check and the claim are one
     /// step: two concurrent starts of one title cannot both pass. What this does
@@ -7600,11 +7665,16 @@ impl AppState {
     ) -> Result<(), OrchestrationTitleInUse> {
         let display_title = display_title.filter(|t| !t.is_empty());
         let wanted = display_title.unwrap_or(identity.name());
+        let live: HashSet<OrchestrationIdentity> = registry
+            .agent_records()
+            .iter()
+            .filter_map(orchestration_identity_of_record)
+            .collect();
         let taken = self.orchestration_titles.iter().any(|(held_by, held)| {
             held_by != identity
                 && held.resolved(held_by) == wanted
                 && std::path::Path::new(&held.cwd) == std::path::Path::new(cwd)
-                && self.orchestration_title_is_live(held_by, held, registry)
+                && (held.pending_claims > 0 || live.contains(held_by))
         });
         if taken {
             return Err(OrchestrationTitleInUse {
@@ -7615,7 +7685,7 @@ impl AppState {
         let live = self
             .orchestration_titles
             .get(identity)
-            .is_some_and(|held| self.orchestration_title_is_live(identity, held, registry));
+            .is_some_and(|held| held.pending_claims > 0 || live.contains(identity));
         let entry = self
             .orchestration_titles
             .entry(identity.clone())
@@ -7683,19 +7753,6 @@ impl AppState {
         self.orchestration_titles
             .get(identity)
             .and_then(|held| held.display_title.clone())
-    }
-
-    fn orchestration_title_is_live(
-        &self,
-        identity: &OrchestrationIdentity,
-        held: &OrchestrationTitle,
-        registry: &AgentPtyRegistry,
-    ) -> bool {
-        held.pending_claims > 0
-            || self
-                .pane_orchestration_map
-                .iter()
-                .any(|(pane_id, id)| id == identity && registry.has_live_pane(pane_id))
     }
 
     /// Drop `identity`'s title once no pane maps to it and no start is claiming
@@ -8270,6 +8327,11 @@ impl AppState {
                     },
                 );
 
+            // Issue #962: read NOW, under the guard this delegate is being handled
+            // with — see `dispatch_one_owned`'s `recorded_display_title`.
+            let recorded_display_title = orchestration
+                .as_ref()
+                .and_then(|identity| self.orchestration_display_title(identity));
             tokio::spawn(async move {
                 dispatch_one_owned(
                     registry,
@@ -8284,6 +8346,7 @@ impl AppState {
                     delegation_seq,
                     state_for_dispatch,
                     commission_in_flight,
+                    recorded_display_title,
                 )
                 .await;
             });
@@ -8653,8 +8716,24 @@ pub async fn handle_restart_role_with_state(
                 let role = signal.role.clone();
                 let pane_id = resolved.pane_id.clone();
                 let cwd = resolved.cwd.clone();
+                let display_title = resolved.display_title.clone();
                 tokio::spawn(async move {
-                    state.write().await.register_orchestration_role(
+                    let title_cwd = match cwd.as_deref() {
+                        Some(cwd) => Some(orchestration_title_cwd_key(cwd).await),
+                        None => None,
+                    };
+                    let mut state = state.write().await;
+                    // Issue #962: the same restore `dispatch_one_owned`'s re-create
+                    // makes — a close that took the last pane mapping to this
+                    // identity pruned its title too (Qodo, PR #1336).
+                    if let Some(title_cwd) = title_cwd.as_deref() {
+                        state.record_orchestration_title(
+                            &identity,
+                            display_title.as_deref(),
+                            title_cwd,
+                        );
+                    }
+                    state.register_orchestration_role(
                         &pane_id,
                         &role,
                         false,
@@ -13704,6 +13783,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await;
 
@@ -13752,6 +13832,7 @@ mod tests {
                     orchestration: None,
                 },
             }),
+            None,
             None,
             None,
             None,

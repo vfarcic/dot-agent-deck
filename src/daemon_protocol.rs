@@ -3602,7 +3602,13 @@ async fn handle_connection(
                         is_start_role: *is_start_role,
                         orchestration_cwd: orchestration_cwd.clone(),
                         orchestration_id: orchestration_id.clone(),
-                        display_title: display_title.clone(),
+                        // Greptile, PR #1336: the title the registry will
+                        // actually STORE — `validate_tab_membership` nulls a
+                        // title carrying control bytes and the tab then shows
+                        // its canonical name, so that is the name to claim.
+                        display_title: display_title
+                            .clone()
+                            .filter(|t| crate::agent_pty::is_valid_display_name(t)),
                     }),
                     _ => None,
                 });
@@ -3661,7 +3667,10 @@ async fn handle_connection(
                 match (pane_id_env.as_deref(), orchestration_meta.as_ref()) {
                     (Some(_), Some(meta)) => {
                         let identity = meta.identity(cwd_for_state.as_deref());
-                        let orch_cwd = meta.orchestration_cwd(cwd_for_state.as_deref());
+                        let orch_cwd = crate::state::orchestration_title_cwd_key(
+                            &meta.orchestration_cwd(cwd_for_state.as_deref()),
+                        )
+                        .await;
                         let claimed = state.write().await.claim_orchestration_title(
                             &identity,
                             meta.display_title.as_deref(),

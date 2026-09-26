@@ -228,9 +228,11 @@ async fn identity_007_a_concurrent_duplicate_run_title_is_refused_by_the_daemon(
 /// Scenario: the edges of what counts as "taken". A tab that typed no name runs
 /// under its canonical orchestration name, and a second tab typing that name is
 /// refused; the same title in a different directory is a different key and
-/// starts; and once every pane of the title-holding tab has exited, the title
-/// can be claimed again rather than being unclaimable for the rest of the
-/// daemon's life.
+/// starts, while a symlinked alias of the holder's directory does not; a title
+/// carrying control bytes claims the canonical name the tab will actually show;
+/// and once every pane of the title-holding tab has exited, the title can be
+/// claimed again — even with an unrelated agent reusing the holder's pane id —
+/// rather than being unclaimable for the rest of the daemon's life.
 #[tokio::test(flavor = "multi_thread")]
 #[spec("orchestration/identity/008")]
 async fn identity_008_a_title_is_keyed_by_resolved_title_and_cwd_and_freed_on_exit() {
@@ -299,10 +301,53 @@ async fn identity_008_a_title_is_keyed_by_resolved_title_and_cwd_and_freed_on_ex
     .await
     .expect("the same title in a different directory is a different key");
 
+    // ...but an ALIAS of the holder's directory is the same directory: a symlink
+    // to it names the same project, the same `.dot-agent-deck/` files and, to
+    // the user, the same tab label.
+    let alias = other_dir.path().join("alias-of-holder-dir");
+    std::os::unix::fs::symlink(dir.path(), &alias).expect("symlink the holder's directory");
+    let refused = start_role(
+        &client,
+        Role {
+            command: "cat",
+            pane_id: "alias-orchestrator",
+            orchestration_id: "alias-tab",
+            role_index: 0,
+            role_name: "orchestrator",
+            is_start_role: true,
+            display_title: None,
+            orchestration_cwd: &alias.to_string_lossy(),
+        },
+    )
+    .await;
+    assert_title_refusal(refused, ORCHESTRATION);
+
+    // A title carrying control bytes is not what the tab shows — the registry
+    // drops it and the tab falls back to its canonical name — so the canonical
+    // name is what it claims, and it collides with the untitled tab already
+    // running in `other_dir`.
+    let refused = start_role(
+        &client,
+        Role {
+            command: "cat",
+            pane_id: "control-byte-orchestrator",
+            orchestration_id: "control-byte-tab",
+            role_index: 0,
+            role_name: "orchestrator",
+            is_start_role: true,
+            display_title: Some("smuggled\u{1b}[31mtitle"),
+            orchestration_cwd: &other_cwd,
+        },
+    )
+    .await;
+    assert_title_refusal(refused, ORCHESTRATION);
+
     // The holder's only pane exits. Its role-map entry stays — nothing but a
     // pane CLOSE unregisters it — so a check that did not consult liveness
     // would leave the title unclaimable forever.
-    std::fs::write(&release, b"").expect("release the holder's stand-in");
+    tokio::fs::write(&release, b"")
+        .await
+        .expect("release the holder's stand-in");
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
     while daemon.registry.has_live_pane("unnamed-orchestrator") {
         assert!(
@@ -311,6 +356,22 @@ async fn identity_008_a_title_is_keyed_by_resolved_title_and_cwd_and_freed_on_ex
         );
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
+    // A pane id is a reusable slot: an unrelated, non-orchestration agent now
+    // runs on the holder's old pane id, while the holder's stale role-map entry
+    // still maps that id to its orchestration. That is not the holder coming
+    // back, and must not hold its title.
+    client
+        .start_agent(StartAgentOptions {
+            command: Some("cat".to_string()),
+            cwd: Some(cwd.clone()),
+            env: vec![(
+                DOT_AGENT_DECK_PANE_ID.to_string(),
+                "unnamed-orchestrator".to_string(),
+            )],
+            ..StartAgentOptions::default()
+        })
+        .await
+        .expect("a plain pane may reuse an exited pane's id");
 
     start_role(
         &client,

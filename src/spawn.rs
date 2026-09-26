@@ -908,6 +908,8 @@ pub async fn spawn(
                         false
                     }
                 }) {
+                    let title_cwd =
+                        crate::state::orchestration_title_cwd_key(&req.working_dir).await;
                     let mut state = state.write().await;
                     // Issue #962: the daemon holds the run title itself, beside
                     // the role maps, so a `clear = true` worker re-created later
@@ -918,7 +920,7 @@ pub async fn spawn(
                     state.record_orchestration_title(
                         &identity,
                         display_title.as_deref(),
-                        &req.working_dir,
+                        &title_cwd,
                     );
                     state.register_orchestration_role(
                         &pane_id,
