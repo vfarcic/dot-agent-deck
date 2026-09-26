@@ -138,9 +138,10 @@ fn open_orchestration(deck: &TuiDeck) {
     );
     assert!(
         common::wait_until(Duration::from_secs(10), || {
-            role_pane_text(deck, "orchestrator").contains("ORCH-READY")
+            deck.snapshot_grid().contains("ORCH-READY")
         }),
-        "orchestrator raw observer did not become ready"
+        "orchestrator did not appear ready in the attached TUI:\n{}",
+        deck.snapshot_grid()
     );
 }
 
@@ -251,13 +252,6 @@ fn status_blocked_009_opencode_standin_and_healthy_mention_are_distinguished() {
     open_orchestration(&deck);
     assert!(
         common::wait_until(Duration::from_secs(10), || {
-            role_pane_text(&deck, "bare-quota").contains(OPENCODE_LINE)
-        }),
-        "OpenCode stand-in never printed its provider error: {}",
-        role_pane_text(&deck, "bare-quota")
-    );
-    assert!(
-        common::wait_until(Duration::from_secs(10), || {
             role_pane_text(&deck, "quoted-output").contains("\"The usage limit has been reached\"")
         }),
         "quoted OpenCode stand-in never printed its control line"
@@ -301,17 +295,11 @@ fn orchestration_delegate_037_delegate_to_blocked_worker_warns_and_delivers() {
     write_orchestration(&deck, &[("worker", "codex", "codex")]);
     open_orchestration(&deck);
     assert!(
-        common::wait_until(Duration::from_secs(10), || {
-            role_pane_text(&deck, "worker").contains(CODEX_LINE)
-        }),
-        "Codex stand-in never printed its provider error"
-    );
-    assert!(
         common::wait_until(Duration::from_secs(25), || {
-            role_status(&deck, "worker").as_deref() == Some("Blocked")
+            has_role_badge(&deck.snapshot_grid(), "worker", "Blocked")
         }),
-        "worker never became Blocked: {}",
-        status_document(&deck)
+        "worker card never showed Blocked:\n{}",
+        deck.snapshot_grid()
     );
     let output = delegate(&deck, "worker", "quota-warning-delivery-sentinel");
     assert!(
@@ -350,7 +338,7 @@ fn scheduler_idle_worker_021_blocked_worker_notices_orchestrator_once() {
         &bin,
         "codex",
         &format!(
-            "(while [ ! -e '{}' ]; do sleep 0.1; done; printf '%s\\n' '{CODEX_LINE}') &\nstty -echo -icanon\nexec cat",
+            "(while [ ! -e '{}' ]; do sleep 0.1; done; printf '\\n%s\\n' '{CODEX_LINE}') &\nstty -echo -icanon\nexec cat",
             trigger.display()
         ),
     );

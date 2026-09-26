@@ -575,8 +575,8 @@ fn buffer_to_color_text(buffer: &ratatui::buffer::Buffer) -> String {
 /// `theme/contrast/001` and `theme/guard/001` drive these same seams; the
 /// label is only used to point assertion failures at the offending surface.
 fn overlay_buffers() -> Vec<(&'static str, ratatui::buffer::Buffer)> {
-    // Representative mix so every status segment renders, 140 cells wide so the
-    // whole bar fits without truncation (mirrors the prior contrast fixtures).
+    // Representative status mix, 140 cells wide so the bar fits without
+    // truncation (mirrors the prior contrast fixtures).
     let stats = DashboardStats {
         active: 6,
         working: 1,
