@@ -31,7 +31,7 @@ import { DeckShell } from "./App";
 const REMOTE_DECK_ID = "deck-00000000000000b2";
 const REMOTE_DECK_LABEL = "dev@build-box";
 /** The deck's own account of why it is not answering, which the pane repeats. */
-const REMOTE_DECK_FAILURE = "No deck is listening on the configured socket.";
+const REMOTE_DECK_FAILURE = "No daemon is listening on the configured socket.";
 /**
  * The status the fixture's `planner` carries, read from the fixture rather than
  * written out, because issue #1143's assertions are about how the chip is
@@ -71,7 +71,7 @@ const PANE_AGENT_STATUS = createFixtureSnapshot("connected").agents.find((agent)
  * `retired` is the second variable, added for the describe block at the bottom:
  * the id of an agent the REMOTE deck no longer lists **while answering**. It
  * now stands in for one of the two ways a pane's agent stops resolving rather
- * than both, because the other one — a deck that has stopped answering — is
+ * than both, because the other one — a daemon that has stopped answering — is
  * what `remoteStatus` itself produces, and conflating them is what let the two
  * be treated alike.
  */
@@ -85,7 +85,7 @@ function harness(remoteStatus: "connected" | "disconnected" = "connected", retir
       socketPath: REMOTE_DECK_LABEL,
       deckKind: "remote",
       status: remoteStatus,
-      message: remoteStatus === "connected" ? "Deck responding" : REMOTE_DECK_FAILURE,
+      message: remoteStatus === "connected" ? "Daemon responding" : REMOTE_DECK_FAILURE,
     },
     agents: remoteStatus === "connected"
       ? local.agents
@@ -122,7 +122,7 @@ function harness(remoteStatus: "connected" | "disconnected" = "connected", retir
     getSettings: vi.fn(async () => ({ settings: structuredClone(stored), path: "/tmp/desktop.toml" })),
     saveSettings,
   };
-  /** The runtime as it looks while `selected` is the deck in force. */
+  /** The runtime as it looks while `selected` is the daemon in force. */
   const runtime = (selected: "local" | "remote"): DeckRuntimeState => ({
     ...base,
     snapshot: selected === "local" ? local : remote,
@@ -143,17 +143,17 @@ const openControl = (name: string) => screen.getByRole("button", { name: `Open $
  *
  * # The trigger was NARROWED, and the narrowing is the point of this file
  *
- * This state used to fire for every agent on a deck that was not the SELECTED
+ * This state used to fire for every agent on a daemon that was not the SELECTED
  * one, because `terminal::attach` resolved its daemon through the
  * process-global `trusted_daemon()` — declaring an attach for an agent on
  * another deck would have streamed whatever agent of the same per-daemon
- * monotonic id that deck happened to be running. The product owner reversed
+ * monotonic id that daemon happened to be running. The product owner reversed
  * that: the desktop app's reason to exist over the TUI is being a control plane
  * for every deck at once, and an agent it lists but cannot open as a working
  * pane is the feature failing on its own terms. The attach now names its deck.
  *
  * So what is left here is the case the old trigger was also covering and which
- * no amount of plumbing removes: **a deck with no live link**. A disconnected
+ * no amount of plumbing removes: **a daemon with no live link**. A disconnected
  * deck, one still waiting to report, one configured with no address, one this
  * app is not observing. There is nothing to attach over, and a
  * `TerminalViewport` mounted there sits black for as long as the pane is open —
@@ -183,19 +183,19 @@ describe("a pane with no terminal", () => {
    * Scenario: build-box's Planner is open in a pane — a working one, with a
    * live terminal — and build-box then stops answering. The pane does not
    * close and does not go blank: the terminal is replaced by an explicit
-   * no-terminal state naming build-box and repeating that deck's own account of
+   * no-terminal state naming build-box and repeating that daemon's own account of
    * why, and nothing is declared shown any more.
    *
    * Entered through `initialView` rather than the overview's Open control, and
-   * for a reason worth stating: the overview LISTS no agents for a deck that
-   * stopped answering, because such a deck cannot vouch for what it was
+   * for a reason worth stating: the overview LISTS no agents for a daemon that
+   * stopped answering, because such a daemon cannot vouch for what it was
    * running. So a disconnected deck's pane is reached by having been opened
-   * while the deck was healthy — which is exactly the case this state exists
+   * while the daemon was healthy — which is exactly the case this state exists
    * for, and the only one a user meets.
    *
    * # The premise is load-bearing, and issue #1143 is why it is spelled out
    *
-   * The rerender below is to a deck that lists NO agents, which is what the
+   * The rerender below is to a daemon that lists NO agents, which is what the
    * crate reports for one with no live link. So the record every field in this
    * pane is drawn from is one `DeckShell` HELD from the healthy commit — take
    * that hold away and there is no pane here at all, which is precisely the
@@ -206,13 +206,13 @@ describe("a pane with no terminal", () => {
    * three affordances asserted below are that decision: the status says `last
    * seen`, `data-agent-record` says `held`, and the sentence dates the report.
    */
-  it("replaces an unreachable deck's terminal with an explicit state naming that deck", async () => {
+  it("replaces an unreachable deck's terminal with an explicit state naming that daemon", async () => {
     const paneView = { kind: "agent" as const, deckId: REMOTE_DECK_ID, agentId: "planner", from: "overview" as const };
     const answering = harness("connected");
     const { rerender } = render(<DeckShell runtime={answering.runtime("local")} initialView={paneView} />);
     await waitFor(() => expect(answering.setShownTerminals).toHaveBeenCalledTimes(1));
 
-    // The premise: a live terminal on a deck that is not the selected one.
+    // The premise: a live terminal on a daemon that is not the selected one.
     const before = screen.getByTestId("agent-pane-overlay");
     expect(within(before).getByTestId("terminal-planner")).toBeVisible();
     expect(answering.setShownTerminals).toHaveBeenLastCalledWith([{ deckId: REMOTE_DECK_ID, agentId: "planner" }]);
@@ -222,7 +222,7 @@ describe("a pane with no terminal", () => {
     await act(async () => { rerender(<DeckShell runtime={lost.runtime("local")} initialView={paneView} />); });
 
     const pane = screen.getByTestId("agent-pane-overlay");
-    // The same pane, not a replacement: losing a deck is a state, not a close.
+    // The same pane, not a replacement: losing a daemon is a state, not a close.
     expect(pane).toBe(before);
     expect(within(pane).getByRole("heading", { name: "Planner on build-box" })).toBeVisible();
 
@@ -251,7 +251,7 @@ describe("a pane with no terminal", () => {
     //    asserted exactly in `lib/terminalInput.test.ts`, against an injected
     //    age; what this proves is that a REAL instant reached it.
     expect(absent).toHaveTextContent(/last reported (just now|\d+[mhd] ago), and nothing in it is being updated/);
-    expect(absent.getAttribute("title")).toMatch(/^Last reported by the deck at: \d{4}-\d{2}-\d{2}T/);
+    expect(absent.getAttribute("title")).toMatch(/^Last reported by the daemon at: \d{4}-\d{2}-\d{2}T/);
     // 2. The machine-readable seam, sibling of `data-status`.
     expect(pane.querySelector(".agent-tile")).toHaveAttribute("data-agent-record", "held");
     // 3. The status stops asserting. It is the field that lies hardest — a bare
@@ -297,14 +297,14 @@ describe("a pane with no terminal", () => {
    * It used to start cold on a disconnected deck, which the corrected harness
    * makes impossible to render — there is no record to hold, because no deck
    * ever gave one — and which was never a path a user could reach anyway: the
-   * overview lists no agents for a deck that is not answering, so there is no
+   * overview lists no agents for a daemon that is not answering, so there is no
    * control to press. Going healthy -> away -> healthy is the only sequence
    * that reaches this state in the app, and it also proves the half a cold
    * start could not: that the held record is **surrendered** when a live one
    * arrives, rather than pinning the pane to a past reading forever.
    *
    * The selected deck does not move in either test, and that is deliberate: it
-   * is the deck's REACHABILITY that flips, which is now the only thing that
+   * is the daemon's REACHABILITY that flips, which is now the only thing that
    * decides whether a pane has a terminal.
    */
   it("attaches the terminal and clears the notice when the pane's own deck answers again", async () => {
@@ -351,22 +351,22 @@ describe("a pane with no terminal", () => {
    * Scenario: the app comes up already holding a pane view for an agent on a
    * deck that has never answered — a deep link, or `initialView` — so nothing
    * has ever reported the record the pane would be drawn from. No pane renders.
-   * The view survives, so when that deck answers the pane is simply there.
+   * The view survives, so when that daemon answers the pane is simply there.
    *
    * # This is the LIMIT of #1143's fix, asserted rather than left implicit
    *
    * The fix holds the last record a pane's deck gave. Where no deck ever gave
    * one there is nothing to hold, anywhere in the app — the crate reports no
-   * agents for a deck with no live link, and `mapDesktopSnapshot` carries none
+   * agents for a daemon with no live link, and `mapDesktopSnapshot` carries none
    * over — so this is not a hold that failed but a record that does not exist.
    * Rendering a pane here would mean inventing one.
    *
    * It is also not a path a user reaches by pressing anything: the overview
-   * lists no agents for a deck that is not answering, so the Open control this
+   * lists no agents for a daemon that is not answering, so the Open control this
    * pane would come from is not on the screen. What the app owes here is that
    * the view is kept, which the last two steps prove.
    */
-  it("renders no pane for a deck that has never answered, and brings one back when it does", async () => {
+  it("renders no pane for a daemon that has never answered, and brings one back when it does", async () => {
     const paneView = { kind: "agent" as const, deckId: REMOTE_DECK_ID, agentId: "planner", from: "overview" as const };
     const cold = harness("disconnected");
     const { rerender } = render(<DeckShell runtime={cold.runtime("local")} initialView={paneView} />);
@@ -409,7 +409,7 @@ describe("a pane with no terminal", () => {
     expect(pane.querySelector(".agent-terminal-stack")).toHaveAttribute("data-terminal-state", "attached");
     expect(viewportProps.at(-1)).toMatchObject({ agentId: "planner", deckId: REMOTE_DECK_ID });
     expect(deck.setShownTerminals).toHaveBeenLastCalledWith([{ deckId: REMOTE_DECK_ID, agentId: "planner" }]);
-    // And the header ASSERTS, because this record is the deck's current answer.
+    // And the header ASSERTS, because this record is the daemon's current answer.
     // Issue #1143's hedging is for a held record and must not leak to a live
     // one, which is the failure mode opposite to the one it fixed.
     expect(pane.querySelector(".agent-tile")).toHaveAttribute("data-agent-record", "live");
@@ -419,7 +419,7 @@ describe("a pane with no terminal", () => {
   /**
    * Scenario: a DECK-origin pane is open — build-box is the selected deck and
    * its Planner is a promoted tile — and build-box stops answering. No pane is
-   * rendered from the held record, and the deck screen's own disconnected
+   * rendered from the held record, and the daemon screen's own disconnected
    * banner, with the Reconnect control on it, is reachable.
    *
    * # This is a scope decision, and the reason is measured rather than argued
@@ -429,7 +429,7 @@ describe("a pane with no terminal", () => {
    * pane marks everything that is not one of its own ancestors `inert`
    * (`useInertBackground`, whose doc names a connection banner as exactly the
    * background content it re-marks on every commit). So a held deck-origin pane
-   * would explain that the deck is not answering while putting the one control
+   * would explain that the daemon is not answering while putting the one control
    * that fixes it behind an inert barrier — measured on this very fixture: with
    * a pane promoted and a banner showing, the banner carries `inert` and its
    * `Reconnect` button inherits it.
@@ -441,10 +441,10 @@ describe("a pane with no terminal", () => {
    * banner, in its own words, with the remedy attached — and has no tiles at
    * all, so there is nothing for a reader to misread as live.
    *
-   * What the deck path keeps is the guarantee PR #1126 gave it: the view is not
-   * closed, so the pane is back the moment the deck answers.
+   * What the daemon path keeps is the guarantee PR #1126 gave it: the view is not
+   * closed, so the pane is back the moment the daemon answers.
    */
-  it("leaves a deck-origin pane's screen to explain itself, with its remedy reachable", async () => {
+  it("leaves a daemon-origin pane's screen to explain itself, with its remedy reachable", async () => {
     const deckView = { kind: "agent" as const, deckId: REMOTE_DECK_ID, agentId: "planner", from: "deck" as const };
     // build-box selected, not All Decks: the deck screen shows one deck, and
     // under All Decks it shows "Select a deck" instead (#1083).
@@ -463,7 +463,7 @@ describe("a pane with no terminal", () => {
     expect(within(banner as HTMLElement).getByRole("button", { name: /Reconnect/i })).toBeVisible();
     expect(banner).toHaveTextContent(REMOTE_DECK_FAILURE);
 
-    // The view was KEPT, so the pane is back when the deck is — PR #1126's
+    // The view was KEPT, so the pane is back when the daemon is — PR #1126's
     // guarantee, which this path still has and still needs.
     const returned = harness("connected", undefined, BUILD_BOX_ROW);
     await act(async () => { rerender(<DeckShell runtime={returned.runtime("remote")} initialView={deckView} />); });
@@ -481,7 +481,7 @@ describe("a pane with no terminal", () => {
    * either has an agent list at all — see the harness's note on why a
    * disconnected deck's list is empty.
    */
-  it("has the same agent id on both decks, which is what makes the deck in the sentence matter", () => {
+  it("has the same agent id on both decks, which is what makes the daemon in the sentence matter", () => {
     const deck = harness("connected");
 
     expect(deck.local.connection.deckId).toBe(FIXTURE_DAEMON_ID);
@@ -510,10 +510,10 @@ describe("a pane with no terminal", () => {
  * A deck that is **not answering** reports `agents: Vec::new()` — both empty
  * lists in the crate are on that path, `disconnected_snapshot` and
  * `snapshot_with`'s non-connected early return — so the same absence there is
- * the deck saying nothing about its agents rather than saying they are gone.
+ * the daemon saying nothing about its agents rather than saying they are gone.
  * Closing on it would throw a healthy pane away every time a remote deck
  * blinked, which is strictly worse than the defect: the PRD's own decision is
- * that such a deck *"replaces its terminal with a sentence rather than closing
+ * that such a daemon *"replaces its terminal with a sentence rather than closing
  * the pane"*.
  *
  * So the condition is the pane deck being CONNECTED and not listing the agent,
@@ -555,7 +555,7 @@ describe("a pane whose agent has left the fleet", () => {
    * `DeckShell` stayed in `view.kind === "agent"` and went on declaring the
    * agent shown.
    */
-  it("closes the view and stops declaring the agent when a deck that is answering retires it", async () => {
+  it("closes the view and stops declaring the agent when a daemon that is answering retires it", async () => {
     const answering = harness("connected");
     const { rerender } = render(<DeckShell runtime={answering.runtime("local")} initialView={paneView} />);
     await waitFor(() => expect(answering.setShownTerminals).toHaveBeenCalledTimes(1));
@@ -588,7 +588,7 @@ describe("a pane whose agent has left the fleet", () => {
 
   /**
    * Scenario: the same open pane, and build-box stops answering — reporting no
-   * agents at all, which is what a deck with no live link reports. The view is
+   * agents at all, which is what a daemon with no live link reports. The view is
    * NOT closed: when build-box answers again the pane is there with its
    * terminal, having never been navigated away from.
    *
@@ -607,7 +607,7 @@ describe("a pane whose agent has left the fleet", () => {
     await waitFor(() => expect(answering.setShownTerminals).toHaveBeenCalledTimes(1));
     expect(within(screen.getByTestId("agent-pane-overlay")).getByTestId("terminal-planner")).toBeVisible();
 
-    // A deck with no live link, exactly as the crate reports one: the deck is
+    // A deck with no live link, exactly as the crate reports one: the daemon is
     // still in the fleet and it lists no agents. The second argument is gone
     // because it would say nothing — issue #1143 made `disconnected` empty the
     // list on its own, which is what the crate does and what this test always
@@ -615,9 +615,9 @@ describe("a pane whose agent has left the fleet", () => {
     const away = harness("disconnected");
     await act(async () => { rerender(<DeckShell runtime={away.runtime("local")} initialView={paneView} />); });
 
-    // Nothing is declared shown while the deck cannot be attached over — which
+    // Nothing is declared shown while the daemon cannot be attached over — which
     // is `paneDeckAttachable` doing its existing job, and is also why a
-    // standing declaration cannot outlive a deck going away.
+    // standing declaration cannot outlive a daemon going away.
     expect(away.setShownTerminals).toHaveBeenLastCalledWith([]);
     expect(screen.queryByTestId("terminal-planner")).not.toBeInTheDocument();
     // The view is kept AND, since #1143, rendered — from the record held for
@@ -641,18 +641,18 @@ describe("a pane whose agent has left the fleet", () => {
   /**
    * Scenario: the same retirement under a DECK-origin pane — build-box is the
    * selected deck, its Planner is open as a promoted tile, and build-box stops
-   * listing it. The view closes and the deck grid is left with no pane over it.
+   * listing it. The view closes and the daemon grid is left with no pane over it.
    *
    * The deck path's shown declaration was never at risk: `DeckSurface` derives
    * it from `snapshot.agents`, so a retired agent shrinks the set, the joined
-   * key changes and the effect re-fires on its own. What the deck path shared
+   * key changes and the effect re-fires on its own. What the daemon path shared
    * with the overview was the STALE VIEW — `paneAgentId` resolves to
    * `undefined` and promotes no tile, so the screen self-heals while `DeckShell`
    * stays in `view.kind === "agent"` with the `Escape` listener still bound to a
    * pane nothing is rendering. One condition in `DeckShell` closes both, and
-   * this is the half of it the deck surface cannot prove on its own.
+   * this is the half of it the daemon surface cannot prove on its own.
    */
-  it("closes a deck-origin pane when the deck under it retires the agent", async () => {
+  it("closes a daemon-origin pane when the daemon under it retires the agent", async () => {
     const deckView = { ...paneView, from: "deck" as const };
     // build-box selected, for the reason the test above gives.
     const answering = harness("connected", undefined, BUILD_BOX_ROW);
@@ -685,7 +685,7 @@ describe("a pane whose agent has left the fleet", () => {
    * it is a separate case rather than a tidier condition. The close is an
    * EFFECT, so it runs after the commit is painted — but `useShownTerminals`
    * fires on that same first commit, when the shown key goes from nothing to
-   * the pane's agent. Gating the declaration on the deck alone therefore
+   * the pane's agent. Gating the declaration on the daemon alone therefore
    * declares an agent that does not exist and waits to be rescued, which is the
    * same shape as `DeckSurface` refusing to promote a tile on its own rather
    * than trusting the close to arrive (`promotes no tile for an open-pane

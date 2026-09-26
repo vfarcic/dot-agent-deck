@@ -10,7 +10,7 @@ import { expect, test, type Page } from "@playwright/test";
  * runs under jsdom, which computes no boxes at all — the only thing it could
  * assert is that a class name was written.
  *
- * `decks.spec.ts` asserts this for the Decks panel, which is how the WebKit
+ * `decks.spec.ts` asserts this for the Daemons panel, which is how the WebKit
  * divergence in #1032 was found: the Appearance row made its label a grid item
  * by floating a `<legend>`, WebKit forces a rendered legend's `float` to `none`,
  * and the row silently collapsed to one column on the engine the app actually

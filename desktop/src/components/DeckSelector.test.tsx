@@ -24,7 +24,7 @@ const BUILD_BOX = "a1b2c3d4e5f60718";
 const RELAY = "0f1e2d3c4b5a6978";
 
 /** Two configured decks, so "lists the configured decks" has something to list. */
-function twoDecks(selection: string): EndpointSettingsDto {
+function twoDaemons(selection: string): EndpointSettingsDto {
   return {
     remote: [
       { host: "build-box.example.com", id: BUILD_BOX, port: 22, user: "vf", socket: "/run/deck.sock" },
@@ -59,7 +59,7 @@ function runtime(overrides: Partial<DeckRuntimeState> = {}): DeckRuntimeState {
       deck: selection,
       state: "ssh_unavailable" as const,
       ok: false,
-      message: "No deck is reachable from this test runtime.",
+      message: "No daemon is reachable from this test runtime.",
       disclosureKnown: false,
       forwards: [],
       knownHosts: [],
@@ -109,7 +109,7 @@ describe("DeckSelector", () => {
     await mountShell();
     expect(screen.getByTestId("deck-selector-current")).toHaveTextContent("This machine");
     const menu = await openMenu();
-    // The two entries neither of which needs configuration to exist: All Decks
+    // The two entries neither of which needs configuration to exist: All daemons
     // (PRD #742 M1) and the local deck, which `Endpoint::local()` resolves from
     // the platform paths.
     expect(within(menu).getAllByRole("radio")).toHaveLength(2);
@@ -117,14 +117,15 @@ describe("DeckSelector", () => {
     expect(within(menu).getByTestId("deck-selector-option-all")).toHaveAttribute("aria-checked", "false");
   });
 
+  /** Scenario: Lists every configured deck, the fleet and local first, named by its address. */
   it("lists every configured deck, the fleet and local first, named by its address", async () => {
-    await mountShell({ getSettings: vi.fn(async () => ({ settings: settingsWith(twoDecks("local")) })) });
+    await mountShell({ getSettings: vi.fn(async () => ({ settings: settingsWith(twoDaemons("local")) })) });
     const menu = await openMenu();
 
     const options = within(menu).getAllByRole("radio").map((option) => option.textContent);
-    // **All Decks**, not "All Daemons": rendered text says Deck. The testid
+    // **All daemons**, not "All Daemons": rendered text says Deck. The testid
     // keeps the stored token, which is what every other option does too.
-    expect(options).toEqual(["All Decks", "This machine", "vf@build-box.example.com", "relay.example.com:2222"]);
+    expect(options).toEqual(["All daemons", "This machine", "vf@build-box.example.com", "relay.example.com:2222"]);
     // No display name is stored, so every label is derived from the address the
     // same way `RemoteEndpoint::describe()` derives it — including the port,
     // which is shown only when it is not 22.
@@ -132,12 +133,12 @@ describe("DeckSelector", () => {
   });
 
   it("names the stored selection on the trigger, not merely inside the menu", async () => {
-    await mountShell({ getSettings: vi.fn(async () => ({ settings: settingsWith(twoDecks(BUILD_BOX)) })) });
+    await mountShell({ getSettings: vi.fn(async () => ({ settings: settingsWith(twoDaemons(BUILD_BOX)) })) });
     expect(screen.getByTestId("deck-selector-current")).toHaveTextContent("vf@build-box.example.com");
   });
 
   it("switching writes the new selection through the settings document", async () => {
-    const { deck } = await mountShell({ getSettings: vi.fn(async () => ({ settings: settingsWith(twoDecks("local")) })) });
+    const { deck } = await mountShell({ getSettings: vi.fn(async () => ({ settings: settingsWith(twoDaemons("local")) })) });
     const menu = await openMenu();
 
     fireEvent.click(within(menu).getByTestId(`deck-selector-option-${BUILD_BOX}`));
@@ -154,37 +155,39 @@ describe("DeckSelector", () => {
     expect(screen.getByTestId("deck-selector-current")).toHaveTextContent("vf@build-box.example.com");
   });
 
-  it("choosing All Decks stores the reserved fleet token", async () => {
-    const { deck } = await mountShell({ getSettings: vi.fn(async () => ({ settings: settingsWith(twoDecks("local")) })) });
+  /** Scenario: Choosing All daemons stores the reserved fleet token. */
+  it("choosing All daemons stores the reserved fleet token", async () => {
+    const { deck } = await mountShell({ getSettings: vi.fn(async () => ({ settings: settingsWith(twoDaemons("local")) })) });
     const menu = await openMenu();
 
     fireEvent.click(within(menu).getByTestId("deck-selector-option-all"));
 
     // PRD #742 M1 ships the stored VALUE and the option; the merged view is M4.
     // What has to hold now is that the choice reaches the document as `all` —
-    // the word `EndpointId::parse` reserves — rather than as a deck id, and that
+    // the word `EndpointId::parse` reserves — rather than as a daemon id, and that
     // it is the trigger's name afterwards.
     await waitFor(() => expect(deck.saveSettings).toHaveBeenCalled());
     const written = vi.mocked(deck.saveSettings).mock.calls[0][0];
     expect(written.endpoints?.selection).toBe("all");
     // The rows travel unchanged: this control chooses, it does not edit.
     expect(written.endpoints?.remote).toHaveLength(2);
-    expect(screen.getByTestId("deck-selector-current")).toHaveTextContent("All Decks");
+    expect(screen.getByTestId("deck-selector-current")).toHaveTextContent("All daemons");
   });
 
+  /** Scenario: Names a stored fleet selection on the trigger. */
   it("names a stored fleet selection on the trigger", async () => {
-    await mountShell({ getSettings: vi.fn(async () => ({ settings: settingsWith(twoDecks("all")) })) });
+    await mountShell({ getSettings: vi.fn(async () => ({ settings: settingsWith(twoDaemons("all")) })) });
 
     // The round trip a user sees: `all` came back out of the document and found
     // its own choice, rather than falling through to `UNKNOWN_DECK_LABEL` the
     // way it did in every build before #742.
-    expect(screen.getByTestId("deck-selector-current")).toHaveTextContent("All Decks");
+    expect(screen.getByTestId("deck-selector-current")).toHaveTextContent("All daemons");
     const menu = await openMenu();
     expect(within(menu).getByTestId("deck-selector-option-all")).toHaveAttribute("aria-checked", "true");
     expect(within(menu).getByTestId("deck-selector-option-local")).toHaveAttribute("aria-checked", "false");
   });
 
-  it("choosing the deck already selected writes nothing", async () => {
+  it("choosing the daemon already selected writes nothing", async () => {
     const { deck } = await mountShell({ getSettings: vi.fn(async () => ({ settings: settingsWith() })) });
     const menu = await openMenu();
 
@@ -214,12 +217,12 @@ describe("DeckSelector", () => {
 
   it("an unreachable deck shows its state and the screen keeps its content", async () => {
     await mountShell({
-      getSettings: vi.fn(async () => ({ settings: settingsWith(twoDecks(BUILD_BOX)) })),
+      getSettings: vi.fn(async () => ({ settings: settingsWith(twoDaemons(BUILD_BOX)) })),
       snapshot: withConnection({ status: "disconnected", message: "ssh could not reach build-box.example.com." }),
     });
 
     expect(screen.getByTestId("deck-selector-state")).toHaveTextContent("ssh could not reach build-box.example.com.");
-    // Blanking is the failure this is about: the deck is still named, the
+    // Blanking is the failure this is about: the daemon is still named, the
     // selector still works, and the rest of the shell is still on screen.
     expect(screen.getByTestId("deck-selector-current")).toHaveTextContent("vf@build-box.example.com");
     const menu = await openMenu();
@@ -228,11 +231,11 @@ describe("DeckSelector", () => {
 
   it("a substitution that leaves the app CONNECTED is still reported", async () => {
     await mountShell({
-      getSettings: vi.fn(async () => ({ settings: settingsWith(twoDecks(RELAY)) })),
+      getSettings: vi.fn(async () => ({ settings: settingsWith(twoDaemons(RELAY)) })),
       snapshot: withConnection({
         status: "connected",
         message: "Connected.",
-        selectionFallback: "The deck you selected has no socket path yet, so this is the deck on this machine.",
+        selectionFallback: "The deck you selected has no socket path yet, so this is the daemon on this machine.",
       }),
     });
 
@@ -244,7 +247,7 @@ describe("DeckSelector", () => {
 
   it("is the same control on the overview", async () => {
     await mountShell(
-      { getSettings: vi.fn(async () => ({ settings: settingsWith(twoDecks(BUILD_BOX)) })) },
+      { getSettings: vi.fn(async () => ({ settings: settingsWith(twoDaemons(BUILD_BOX)) })) },
       { kind: "overview" },
     );
 
@@ -254,12 +257,13 @@ describe("DeckSelector", () => {
     expect(within(menu).getAllByRole("radio")).toHaveLength(4);
   });
 
+  /** Scenario: Groups its options with a span, never a legend (issue 1032). */
   it("groups its options with a span, never a legend (issue 1032)", async () => {
     await mountShell();
     const menu = await openMenu();
 
     const group = within(menu).getByRole("radiogroup");
-    expect(group).toHaveAccessibleName("Deck");
+    expect(group).toHaveAccessibleName("Daemon");
     // WebKit forces a rendered legend's `float` to `none`, so the fieldset form
     // collapses on the engine the app actually ships on. This is new surface, so
     // it is written in the form that holds in both from the start.
@@ -287,8 +291,9 @@ describe("deckStateNote", () => {
     expect(deckStateNote({ ...base, buildStampMismatchOnly: true, message: "build mismatch: …" })).toBe("build mismatch: …");
   });
 
+  /** Scenario: Reports a failure's own message. */
   it("reports a failure's own message", () => {
     expect(deckStateNote({ status: "error", message: "handshake refused" })).toBe("handshake refused");
-    expect(deckStateNote({ status: "loading" })).toBe("Connecting to this deck…");
+    expect(deckStateNote({ status: "loading" })).toBe("Connecting to this daemon…");
   });
 });

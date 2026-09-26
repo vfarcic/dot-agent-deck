@@ -25,7 +25,7 @@ test.describe("the New agent flow", () => {
    * bar. The unreachable and pending decks are listed disabled; choose the
    * remote deck. Its home lists a project directory and an ordinary one; move
    * to the ordinary one with `j`, enter it with Enter, and use it with Space.
-   * The form names the agent after the directory and prefills the deck's
+   * The form names the agent after the directory and prefills the daemon's
    * configured command; Start opens the new agent's pane over the overview.
    */
   test("starts an agent in a browsed directory and opens its pane", async ({ page }) => {
@@ -33,7 +33,7 @@ test.describe("the New agent flow", () => {
 
     await page.getByTestId("overview-new-agent").click();
     const dialog = page.getByTestId("new-agent-dialog");
-    // One surface: the deck field, the directory panel and the form are all
+    // One surface: the daemon field, the directory panel and the form are all
     // there before anything is chosen, the form waiting for a directory.
     await expect(page.getByTestId("new-agent-deck-list")).toBeFocused();
     await expect(page.getByTestId("new-agent-directory-idle")).toBeVisible();
@@ -67,7 +67,7 @@ test.describe("the New agent flow", () => {
     await expect(dialog).toHaveCount(0);
 
     // The remote deck's group now lists it; closing the pane lands back on
-    // the overview, where it is a row of that deck and of no other.
+    // the overview, where it is a row of that daemon and of no other.
     await page.keyboard.press("Escape");
     await expect(overlay).toHaveCount(0);
     const remoteGroup = page.locator(`[data-testid="daemon-group"][data-daemon-id="${REMOTE_DECK}"]`);
@@ -77,9 +77,10 @@ test.describe("the New agent flow", () => {
   /**
    * Scenario (PRD #1223 U4): start an agent in `scratch` on the remote deck and
    * close its pane. On the overview, press Stop on its row: a confirmation
-   * names the agent and the deck. Confirm it, and the agent leaves that deck's
+   * names the agent and the daemon. Confirm it, and the agent leaves that daemon's
    * group — the fixture deck drops it the way a live deck's agent list does.
    */
+  /** Scenario: Stops an agent it started from the overview, and the agent leaves the fleet. */
   test("stops an agent it started from the overview, and the agent leaves the fleet", async ({ page }) => {
     await openOverview(page, "fleet");
 
@@ -99,11 +100,11 @@ test.describe("the New agent flow", () => {
 
     const remoteGroup = page.locator(`[data-testid="daemon-group"][data-daemon-id="${REMOTE_DECK}"]`);
     await expect(remoteGroup.getByRole("button", { name: "Open scratch agent", exact: true })).toBeVisible();
-    await remoteGroup.getByRole("button", { name: "Stop scratch agent", exact: true }).click();
+    await remoteGroup.getByRole("button", { name: "Close scratch agent", exact: true }).click();
     const confirm = page.getByRole("alertdialog");
-    await expect(confirm).toContainText("Stop scratch?");
+    await expect(confirm).toContainText("Close scratch?");
     await expect(confirm).toContainText(REMOTE_DECK);
-    await confirm.getByRole("button", { name: "Stop agent" }).click();
+    await confirm.getByRole("button", { name: "Close agent" }).click();
 
     await expect(confirm).toHaveCount(0);
     await expect(remoteGroup.getByRole("button", { name: "Open scratch agent", exact: true })).toHaveCount(0);
@@ -113,7 +114,7 @@ test.describe("the New agent flow", () => {
    * Scenario (PRD #1223 U4): launch `demo-loop` in `demo-project` on the remote
    * deck and close the start role's pane. On the overview, press Close on the
    * orchestration's card: the confirmation says it stops every role and names
-   * planner and builder. Confirm it, and both roles leave that deck's group.
+   * planner and builder. Confirm it, and both roles leave that daemon's group.
    */
   test("closes an orchestration it launched, and every role leaves the fleet", async ({ page }) => {
     await openOverview(page, "fleet");
@@ -150,7 +151,7 @@ test.describe("the New agent flow", () => {
    * remote deck, whose own experimental flag is on. Use its home directory
    * with Space. The Mode row offers the three authoring agents; move to
    * `schedule: issues` with the arrow keys, clear the prefilled Command and
-   * Start. The blank Command resolves to `claude` rather than the deck's
+   * Start. The blank Command resolves to `claude` rather than the daemon's
    * default shell, and the new authoring agent's pane opens over the overview.
    */
   test("starts an authoring agent with its blank Command resolved and opens its pane", async ({ page }) => {
@@ -186,7 +187,7 @@ test.describe("the New agent flow", () => {
    * remote deck. Its home marks `demo-project` as a project; enter it and use
    * it. The Mode row offers `Orch: demo-loop` after No mode; select it with the
    * arrow keys and the Name becomes `demo-project-orchestrator-1` while Command
-   * disappears. Start launches the orchestration on that deck: the START
+   * disappears. Start launches the orchestration on that daemon: the START
    * role's pane opens over the overview, and back on the overview both roles
    * are rows of the remote deck.
    */
@@ -271,10 +272,10 @@ test.describe("the New agent flow", () => {
    * `demo-project` and use it. The deck cannot start a role with its configured
    * command, so no orchestration chip is offered and the form says why.
    */
-  test("withholds orchestrations on a deck that cannot start configured roles", async ({ page }) => {
+  test("withholds orchestrations on a daemon that cannot start configured roles", async ({ page }) => {
     await page.goto(`/?fixture=1&state=fleet&nonunix=${encodeURIComponent(REMOTE_DECK)}`);
     await page.getByTestId("open-overview").click();
-    // Opened from the deck's header, the deck is chosen and its home listed
+    // Opened from the daemon's header, the daemon is chosen and its home listed
     // with no key pressed; focus is already in the browser.
     await page.locator(`[data-testid="daemon-group"][data-daemon-id="${REMOTE_DECK}"]`).getByTestId("daemon-new-agent").click();
     const directories = page.getByTestId("new-agent-directory-list");
@@ -289,14 +290,14 @@ test.describe("the New agent flow", () => {
   });
 
   /**
-   * Scenario (PRD #1223 U1): with the remote deck playing a deck from before
+   * Scenario (PRD #1223 U1): with the remote deck playing a daemon from before
    * PRD #1223, it has no directory listing, and browsing is the only way the
    * flow chooses a directory. Its header offers no New agent; opened from the
-   * top bar, the deck field lists it disabled with the deck's reason, and
+   * top bar, the daemon field lists it disabled with the daemon's reason, and
    * clicking it chooses nothing. The local deck — the one eligible deck, so
    * chosen on open — still lists its home.
    */
-  test("disables a deck without the listing verb in the deck field", async ({ page }) => {
+  test("disables a daemon without the listing verb in the daemon field", async ({ page }) => {
     await page.goto(`/?fixture=1&state=fleet&older=${encodeURIComponent(REMOTE_DECK)}`);
     await page.getByTestId("open-overview").click();
     await expect(page.locator(`[data-testid="daemon-group"][data-daemon-id="${REMOTE_DECK}"]`).getByTestId("daemon-new-agent")).toHaveCount(0);
@@ -372,7 +373,7 @@ test.describe("the New agent flow", () => {
    * Scenario: open New agent from the overview's top bar, then press Tab
    * fifteen times and Shift+Tab fifteen times. Focus never lands on a control
    * outside the dialog except that one trigger — not the column picker, not
-   * Refresh, not a deck group's own New agent — the overview behind is inert
+   * Refresh, not a daemon group's own New agent — the overview behind is inert
    * rather than merely unfocused, and Esc gives the screen back and returns
    * focus to the button that opened the dialog.
    */

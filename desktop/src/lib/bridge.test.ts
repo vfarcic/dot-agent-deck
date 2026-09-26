@@ -51,7 +51,7 @@ const snapshot: DesktopSnapshotDto = {
  *
  * Every terminal seam on the bridge takes the composite `(deckId, agentId)`
  * since PRD #1105's cross-deck pane, and every call site below predates it and
- * meant "the deck this fixture is on". This says that once instead of
+ * meant "the daemon this fixture is on". This says that once instead of
  * scattering the fixture's deck id through a hundred calls; the tests that are
  * ABOUT crossing decks build their targets explicitly.
  */
@@ -82,9 +82,9 @@ describe("TauriDeckBridge", () => {
     expect(mappedIncompatible).toMatchObject({
       health: "failed",
       connection: { status: "error", daemonDetected: true, runningAgentCount: 1 },
-      agents: [{ displayName: "Coder", model: "Unavailable", task: "Task metadata unavailable from the deck" }],
+      agents: [{ displayName: "Coder", model: "Unavailable", task: "Task metadata unavailable from the daemon" }],
     });
-    // An unreported cwd is ABSENT on the model, not the deck's stand-in word:
+    // An unreported cwd is ABSENT on the model, not the daemon's stand-in word:
     // that word is a directory name the daemon can legitimately report, so a
     // sentinel spelled in it is one an agent can forge (M8 audit).
     expect(mappedIncompatible.agents[0]?.cwd).toBeUndefined();
@@ -162,7 +162,7 @@ describe("TauriDeckBridge", () => {
     await bridge.subscribe(vi.fn(), terminal);
     expect(terminal).toHaveBeenCalledWith({
       agentId: "agent-1",
-      // PRD #1105's security audit: every chunk carries the deck that produced
+      // PRD #1105's security audit: every chunk carries the daemon that produced
       // it, stamped at the one funnel they all pass through, because the
       // runtime keys its retained buffers by `(deckId, agentId)`.
       deckId: "deck-000000000000dec1",
@@ -327,7 +327,7 @@ describe("TauriDeckBridge", () => {
     const bridge = new TauriDeckBridge();
     invoke.mockResolvedValue({ outcome: { kind: "no_match", sentence: "", transcript: "" } });
 
-    const deckStep = [{ deckId: "deck-local" }, { deckId: "deck-build", reason: "No deck is listening on the configured socket." }];
+    const deckStep = [{ deckId: "deck-local" }, { deckId: "deck-build", reason: "No daemon is listening on the configured socket." }];
     bridge.declareVoiceScreen("overview", undefined, undefined, deckStep);
     await bridge.resolveVoice("new agent on the build box");
     expect(invoke).toHaveBeenLastCalledWith("desktop_voice_resolve", { utterance: "new agent on the build box", screen: "overview", directories: null, newAgent: null, deckStep });
@@ -386,7 +386,7 @@ describe("TauriDeckBridge", () => {
     const { createDeckBridge } = await import("./bridge");
     const bridge = createDeckBridge("fixture");
     expect(await bridge.listProjects()).toEqual({ projects: [] });
-    await expect(bridge.resolveProject("/anything")).rejects.toThrow("no deck");
+    await expect(bridge.resolveProject("/anything")).rejects.toThrow("no daemon");
     await bridge.dispose();
   });
 
@@ -431,7 +431,7 @@ describe("TauriDeckBridge", () => {
   /**
    * Scenario (PRD #1223 M7): start a `schedule` authoring agent through the
    * live bridge. `authoringKind` reaches `desktop_run_action` exactly as sent,
-   * beside the deck, the directory and the resolved command.
+   * beside the daemon, the directory and the resolved command.
    */
   it("forwards an authoring start_agent with its kind untouched", async () => {
     const { TauriDeckBridge } = await import("./bridge");
@@ -447,10 +447,10 @@ describe("TauriDeckBridge", () => {
   });
 
   /**
-   * Scenario (PRD #1223 M6): launch an orchestration and ask a deck for a
+   * Scenario (PRD #1223 M6): launch an orchestration and ask a daemon for a
    * directory's orchestrations through the live bridge. The launch reaches
    * `desktop_run_action` exactly as sent and hands back the start role's id;
-   * the query reaches its own command with the deck and the path verbatim.
+   * the query reaches its own command with the daemon and the path verbatim.
    */
   it("forwards start_orchestration and the orchestrations query untouched", async () => {
     const { TauriDeckBridge } = await import("./bridge");
@@ -500,10 +500,10 @@ describe("TauriDeckBridge", () => {
   it("surfaces a refused start_agent without retrying it elsewhere", async () => {
     const { TauriDeckBridge } = await import("./bridge");
     const bridge = new TauriDeckBridge();
-    invoke.mockRejectedValueOnce(new Error("that deck is not one this app is observing: deck-ffffffffffffffff"));
+    invoke.mockRejectedValueOnce(new Error("that daemon is not one this app is observing: deck-ffffffffffffffff"));
 
     await expect(bridge.runAction({ type: "start_agent", deckId: "deck-ffffffffffffffff" }))
-      .rejects.toThrow("that deck is not one this app is observing");
+      .rejects.toThrow("that daemon is not one this app is observing");
 
     expect(invoke).toHaveBeenCalledTimes(1);
     expect(invoke).toHaveBeenCalledWith("desktop_run_action", { action: { type: "start_agent", deckId: "deck-ffffffffffffffff" } });
@@ -512,9 +512,9 @@ describe("TauriDeckBridge", () => {
 
   /**
    * Scenario (PRD #1223 M4): the New agent dialog's two queries through the
-   * live bridge. Each reaches its own command with the deck it names; a typed
+   * live bridge. Each reaches its own command with the daemon it names; a typed
    * path goes through exactly as given, trailing slash included, and a listing
-   * of the deck's home sends an explicit null path. The crate's answers come
+   * of the daemon's home sends an explicit null path. The crate's answers come
    * back untouched.
    */
   it("forwards the New agent queries with their deck and path verbatim", async () => {
@@ -674,12 +674,13 @@ describe("TauriDeckBridge", () => {
    * advertised, so a screen that read absence as "better disable it" would
    * withhold the launch against every healthy deck.
    */
+  /** Scenario: Carries the project-capability reason through, and reads absence as available. */
   it("carries the project-capability reason through, and reads absence as available", async () => {
     const { mapDesktopSnapshot } = await import("./bridge");
 
     const withheld = structuredClone(snapshot);
-    withheld.connection.projectActionsReason = "This deck does not advertise prepare-workflow, so projects and workflows cannot be started from here. Agents already running on it stay visible and usable.";
-    expect(mapDesktopSnapshot(withheld).connection.projectActionsReason).toContain("prepare-workflow");
+    withheld.connection.projectActionsReason = "This daemon cannot offer projects or activate orchestrations from here. Agents already running on it stay visible and usable.";
+    expect(mapDesktopSnapshot(withheld).connection.projectActionsReason).toContain("activate orchestrations");
 
     expect(mapDesktopSnapshot(structuredClone(snapshot)).connection.projectActionsReason).toBeUndefined();
   });
@@ -691,6 +692,7 @@ describe("TauriDeckBridge", () => {
    * message rather than a mismatch note. Both stamps still ride along so the
    * difference stays discoverable on hover.
    */
+  /** Scenario: Maps a same-release stamp difference as an ordinary healthy connection. */
   it("maps a same-release stamp difference as an ordinary healthy connection", async () => {
     const { mapDesktopSnapshot } = await import("./bridge");
     const sameRelease = structuredClone(snapshot);
@@ -704,7 +706,7 @@ describe("TauriDeckBridge", () => {
 
     expect(mapped.connection).toMatchObject({
       status: "connected",
-      message: "Deck responding",
+      message: "Daemon responding",
       buildStampMismatchOnly: false,
       clientBuildVersion: "0.39.0-49-ga0165f8",
       daemonBuildVersion: "0.39.0-g1ea0fe7",
@@ -717,7 +719,7 @@ describe("TauriDeckBridge", () => {
    * The whole point of the override: connected, and STILL saying so. The crate
    * keeps the mismatch in `error` on the bypass path, and this mapping is what
    * would drop it — a `connected` status used to be enough to reach for the
-   * "Deck responding" fallback, which would have made the caveat invisible
+   * "Daemon responding" fallback, which would have made the caveat invisible
    * the moment it mattered.
    */
   it("keeps the build-mismatch caveat visible after connecting anyway", async () => {
@@ -726,7 +728,7 @@ describe("TauriDeckBridge", () => {
     overridden.connection.status = "connected";
     overridden.connection.daemonBuildVersion = "v0.39.0";
     overridden.connection.buildStampMismatchOnly = true;
-    overridden.connection.error = "build mismatch: desktop is v0.38.0-50-gf118e99, deck is v0.39.0. Connected anyway for this session; protocol 8 matched on both sides.";
+    overridden.connection.error = "build mismatch: desktop is v0.38.0-50-gf118e99, daemon is v0.39.0. Connected anyway for this session; protocol 8 matched on both sides.";
 
     const mapped = mapDesktopSnapshot(overridden);
 
@@ -742,6 +744,7 @@ describe("TauriDeckBridge", () => {
    * make it reachable would have been told to compare protocol versions that
    * matched (issue #801).
    */
+  /** Scenario: Names the check that actually failed when the crate sent no message. */
   it("names the check that actually failed when the crate sent no message", async () => {
     const { mapDesktopSnapshot } = await import("./bridge");
 
@@ -751,13 +754,13 @@ describe("TauriDeckBridge", () => {
     stampOnly.connection.daemonBuildVersion = "v0.39.0";
     stampOnly.connection.buildStampMismatchOnly = true;
     delete stampOnly.connection.error;
-    expect(mapDesktopSnapshot(stampOnly).connection.message).toBe("Build mismatch: desktop is v0.38.0-50-gf118e99, deck is v0.39.0.");
+    expect(mapDesktopSnapshot(stampOnly).connection.message).toBe("Build mismatch: desktop is v0.38.0-50-gf118e99, daemon is v0.39.0.");
 
     const protocolMismatch = structuredClone(snapshot);
     protocolMismatch.connection.status = "incompatible";
     protocolMismatch.connection.serverProtocolVersion = 7;
     delete protocolMismatch.connection.error;
-    expect(mapDesktopSnapshot(protocolMismatch).connection.message).toBe("Protocol mismatch: desktop v6, deck v7");
+    expect(mapDesktopSnapshot(protocolMismatch).connection.message).toBe("Protocol mismatch: desktop v6, daemon v7");
   });
 
   it("carries the daemon identity and the daemon's own tab membership onto the agent model", async () => {
@@ -765,7 +768,7 @@ describe("TauriDeckBridge", () => {
 
     const mapped = mapDesktopSnapshot(structuredClone(snapshot));
 
-    // `deckId` is the deck identity the handshake reports, and agent ids are
+    // `deckId` is the daemon identity the handshake reports, and agent ids are
     // per-daemon integers — so nothing may key on `id` alone. It is NOT
     // `socketPath`: that is the label, and two decks can share one (PRD 742 M5).
     expect(mapped.agents[0]).toMatchObject({
@@ -797,7 +800,7 @@ describe("TauriDeckBridge", () => {
       lastUserPrompt: "Surface the honest fields.",
       writeLease: "read",
       // The prompt is the honest answer to "what was this asked to do", so it
-      // leads the deck's assignment line ahead of the active-tool restatement.
+      // leads the daemon's assignment line ahead of the active-tool restatement.
       task: "Surface the honest fields.",
       tab: { kind: "orchestration", cwd: "/work/deck" },
     });
@@ -861,8 +864,8 @@ describe("TauriDeckBridge", () => {
    * `AgentSpec` in this build holds while `agentType` is a perfectly ordinary
    * `claude_code`, so a local lookup — which is what this used to do — answers
    * `claude` and fails the assertion. And where the daemon named NO binary the
-   * cell is left empty rather than filled with the deck's old generic word: a
-   * word reads as a fact about the agent, absence reads as "the deck did not
+   * cell is left empty rather than filled with the daemon's old generic word: a
+   * word reads as a fact about the agent, absence reads as "the daemon did not
    * say", and absence is what is true.
    */
   it("carries the CLI binary the daemon reported, and never derives one locally", async () => {
@@ -870,7 +873,7 @@ describe("TauriDeckBridge", () => {
     const claude = structuredClone(snapshot);
     claude.agents[0].agentType = "claude_code";
     claude.agents[0].cliName = "claude-next";
-    // Outside an orchestration the deck's role label is derived from the wire
+    // Outside an orchestration the daemon's role label is derived from the wire
     // identity, which this leaves untouched.
     claude.agents[0].tab = { kind: "dashboard" };
 
@@ -906,14 +909,14 @@ describe("TauriDeckBridge", () => {
 
   /**
    * The M8 audit's cwd finding. `src/agent_pty.rs` accepts any non-empty,
-   * bounded, control-free working directory, so `"Unavailable"` — the deck's
+   * bounded, control-free working directory, so `"Unavailable"` — the daemon's
    * own stand-in word — is a directory an agent can genuinely be launched in.
    * While the bridge wrote that word for ABSENCE, such an agent had its real,
    * reported directory erased at the overview's boundary into a blank cell with
    * no hover text. The reported value now survives, and it is a candidate for
    * the snapshot's repo directory like any other.
    */
-  it("does not erase a reported working directory that spells the deck's stand-in word", async () => {
+  it("does not erase a reported working directory that spells the daemon's stand-in word", async () => {
     const { mapDesktopSnapshot } = await import("./bridge");
     const collides = structuredClone(snapshot);
     collides.agents[0].cwd = "Unavailable";
@@ -1033,11 +1036,11 @@ describe("FixtureDeckBridge scenarios", () => {
   /**
    * Scenario (PRD #1223 M3): in the three-deck fleet preview, start a plain
    * agent on the REMOTE deck, which is not the selected one. The result
-   * carries the id that deck minted; the fleet the bridge emits lists the new
-   * agent on that deck and nowhere else, as a running agent with the name and
+   * carries the id that daemon minted; the fleet the bridge emits lists the new
+   * agent on that daemon and nowhere else, as a running agent with the name and
    * directory it was started with; and a fresh `connect()` still shows it.
    */
-  it("starts a fixture agent on the deck it names and lists it in that deck's fleet entry", async () => {
+  it("starts a fixture agent on the daemon it names and lists it in that daemon's fleet entry", async () => {
     window.history.replaceState({}, "", "/?fixture=1&state=fleet");
     const { createDeckBridge } = await import("./bridge");
     const { FIXTURE_DAEMON_ID, FIXTURE_REMOTE_DAEMON_ID } = await import("../data/fixture");
@@ -1067,7 +1070,7 @@ describe("FixtureDeckBridge scenarios", () => {
   /**
    * Scenario: the fixture deck mints ids the way a daemon does — per deck,
    * the next integer none of its agents holds — so two starts on one deck get
-   * two ids, and the first agent on a deck with no numeric ids is `1`.
+   * two ids, and the first agent on a daemon with no numeric ids is `1`.
    */
   it("mints a fresh per-deck id for every fixture start", async () => {
     window.history.replaceState({}, "", "/?fixture=1&state=fleet");
@@ -1085,8 +1088,8 @@ describe("FixtureDeckBridge scenarios", () => {
   });
 
   /**
-   * Scenario: start a fixture agent on a deck id the preview does not show,
-   * and on a deck it shows as unreachable. Both are refused — the first with
+   * Scenario: start a fixture agent on a daemon id the preview does not show,
+   * and on a daemon it shows as unreachable. Both are refused — the first with
    * the crate's own `DeckScope::resolve` wording — and no deck's agent list
    * changes: nothing falls back to the selected deck.
    */
@@ -1098,7 +1101,7 @@ describe("FixtureDeckBridge scenarios", () => {
     const counts = (fleet: DeckFleet) => fleet.map((deck) => deck.agents.length);
     const before = counts(await bridge.connect());
 
-    await expect(bridge.runAction({ type: "start_agent", deckId: "deck-ffffffffffffffff" })).rejects.toThrow("that deck is not one this app is observing");
+    await expect(bridge.runAction({ type: "start_agent", deckId: "deck-ffffffffffffffff" })).rejects.toThrow("that daemon is not one this app is observing");
     await expect(bridge.runAction({ type: "start_agent", deckId: FIXTURE_UNREACHABLE_DAEMON_ID })).rejects.toThrow("not connected");
 
     expect(counts(await bridge.connect())).toEqual(before);
@@ -1108,12 +1111,13 @@ describe("FixtureDeckBridge scenarios", () => {
   /**
    * Scenario (PRD #1223 M4): browse the fleet preview's remote deck. Its home
    * is its own (not the local deck's), holding a project directory and an
-   * ordinary one; a typed path with a trailing slash answers in the deck's
+   * ordinary one; a typed path with a trailing slash answers in the daemon's
    * canonical spelling, one level deeper holds a directory with no
    * subdirectories, and the root has no parent. A relative path, a path the
    * deck does not have, an unreachable deck and an unknown one are each
    * refused in the wording the live app uses.
    */
+  /** Scenario: Lists each fixture deck's own directory tree and refuses what the live app refuses. */
   it("lists each fixture deck's own directory tree and refuses what the live app refuses", async () => {
     window.history.replaceState({}, "", "/?fixture=1&state=fleet");
     const { createDeckBridge } = await import("./bridge");
@@ -1137,7 +1141,7 @@ describe("FixtureDeckBridge scenarios", () => {
     await expect(bridge.listDirectories(FIXTURE_REMOTE_DAEMON_ID, "home/build")).rejects.toThrow("enter an absolute directory path");
     await expect(bridge.listDirectories(FIXTURE_REMOTE_DAEMON_ID, "/home/dev")).rejects.toThrow("unresolved");
     await expect(bridge.listDirectories(FIXTURE_UNREACHABLE_DAEMON_ID)).rejects.toThrow("not connected");
-    await expect(bridge.listDirectories("deck-ffffffffffffffff")).rejects.toThrow("that deck is not one this app is observing");
+    await expect(bridge.listDirectories("deck-ffffffffffffffff")).rejects.toThrow("that daemon is not one this app is observing");
     await bridge.dispose();
   });
 
@@ -1169,10 +1173,10 @@ describe("FixtureDeckBridge scenarios", () => {
    * Scenario: `?older=` plays a named fixture deck as one from before PRD
    * #1223. That deck's connection carries the crate's `newAgentReason` and it
    * answers both queries "unsupported" — the options with a registry to fall
-   * back on — while the deck beside it answers as before; `?older=1` plays
+   * back on — while the daemon beside it answers as before; `?older=1` plays
    * every deck that way.
    */
-  it("plays the decks ?older= names as decks without the new queries", async () => {
+  it("plays the daemons ?older= names as decks without the new queries", async () => {
     const { FIXTURE_DAEMON_ID, FIXTURE_REMOTE_DAEMON_ID } = await import("../data/fixture");
     window.history.replaceState({}, "", `/?fixture=1&state=fleet&older=${encodeURIComponent(FIXTURE_REMOTE_DAEMON_ID)}`);
     const { createDeckBridge, FIXTURE_NO_LISTING_REASON } = await import("./bridge");
@@ -1202,7 +1206,7 @@ describe("FixtureDeckBridge scenarios", () => {
    * query — so the New agent flow can reach its form — but withholds its
    * orchestrations with the crate's reason and refuses a launch.
    */
-  it("plays the decks ?nonunix= names as decks that cannot launch configured roles", async () => {
+  it("plays the daemons ?nonunix= names as decks that cannot launch configured roles", async () => {
     const { FIXTURE_REMOTE_DAEMON_ID } = await import("../data/fixture");
     window.history.replaceState({}, "", `/?fixture=1&state=fleet&nonunix=${encodeURIComponent(FIXTURE_REMOTE_DAEMON_ID)}`);
     const { createDeckBridge } = await import("./bridge");
@@ -1334,14 +1338,14 @@ describe("FixtureDeckBridge scenarios", () => {
  *
  * These tests pin the replacement, whose shape is declarative on purpose:
  * `setShownTerminals(agentIds)` states the whole set of terminals currently on
- * screen, because the two facts the deck and the overview need cannot be
+ * screen, because the two facts the daemon and the overview need cannot be
  * expressed by an imperative `showTerminal` at all — "nine are shown at once"
  * and "now none is".
  *
  * The decided semantics, which every test below pins some corner of:
  *
  * - Shown terminals are always attached, and shown terminals are NOT capped.
- *   Nine visible deck tiles means nine attaches, exactly as today; the deck
+ *   Nine visible deck tiles means nine attaches, exactly as today; the daemon
  *   must not change.
  * - Leaving a terminal does not detach it — it moves into a bounded *warm*
  *   set and stays attached, so coming back costs no scrollback replay.
@@ -1627,11 +1631,11 @@ describe("TauriDeckBridge demand-driven attach (PRD 745 M7)", () => {
   });
 
   /**
-   * Scenario: show all nine agents at once, the way the deck mounts a terminal
+   * Scenario: show all nine agents at once, the way the daemon mounts a terminal
    * on every tile. All nine attach, **nothing** is detached, and every one of
    * them can still be written to — the warm bound governs terminals you have
    * left, never terminals on screen, so a three-deep bound must not kill six
-   * visible panes. The PRD forbids altering the deck, and this is that
+   * visible panes. The PRD forbids altering the daemon, and this is that
    * guarantee in test form.
    */
   it("never evicts a shown terminal, however many are shown at once", async () => {
@@ -1675,7 +1679,7 @@ describe("TauriDeckBridge demand-driven attach (PRD 745 M7)", () => {
     const detachesBeforeOverlay = detachCalls().length;
     const replaysBeforeOverlay = output.mock.calls.filter(([event]) => event.operation === "replace").length;
 
-    // Opening over the deck and closing back to it preserve the deck's whole
+    // Opening over the daemon and closing back to it preserve the daemon's whole
     // declaration. Re-declaring it here is intentionally conservative: even
     // if a render owner invokes the bridge for an unchanged commit, the bridge
     // must make the same no-cost decision as an effect that does not re-fire.
@@ -2666,7 +2670,7 @@ describe("desktop settings (PRD 803)", () => {
 
     // A row missing what makes it a row is dropped rather than repaired: Rust
     // refuses the whole document over a row with no host or no id, and a
-    // fabricated one would be a deck the user never configured.
+    // fabricated one would be a daemon the user never configured.
     const partial = normalizeDesktopSettings({
       endpoints: { remote: [{ host: "build-box" }, { id: "deck0000000000cc" }, { host: "ci-box", id: "deck0000000000dd" }], selection: "local" },
     });
@@ -3045,7 +3049,7 @@ describe("TauriDeckBridge across a fleet (PRD #742 M4/M5)", () => {
    * numerator, not in the denominator, and with no group on screen, so three
    * configured decks read as `2/2`.
    */
-  it("puts a configured deck with no socket path in the fleet, after the decks that answered", async () => {
+  it("puts a configured deck with no socket path in the fleet, after the daemons that answered", async () => {
     const { TauriDeckBridge } = await import("./bridge");
     invoke.mockImplementation(async (command: string) => (command === "desktop_bootstrap" ? withUnconfigured(local) : { ok: true }));
     const bridge = new TauriDeckBridge();
@@ -3074,7 +3078,7 @@ describe("TauriDeckBridge across a fleet (PRD #742 M4/M5)", () => {
    * The whole list is restated on every arrival for exactly this reason, so the
    * bridge replaces rather than merges.
    */
-  it("drops the placeholder group once that deck gains an address", async () => {
+  it("drops the placeholder group once that daemon gains an address", async () => {
     const { TauriDeckBridge } = await import("./bridge");
     invoke.mockImplementation(async (command: string) => (command === "desktop_bootstrap" ? withUnconfigured(local) : { ok: true }));
     const bridge = new TauriDeckBridge();
@@ -3095,7 +3099,7 @@ describe("TauriDeckBridge across a fleet (PRD #742 M4/M5)", () => {
 
   /*
     -------------------------------------------------------------------------
-    PRD #742 M14 — a deck that has not reported yet.
+    PRD #742 M14 — a daemon that has not reported yet.
 
     It HAS a watcher, unlike M12's unaddressed row, and will emit — but not
     until a tunnel, a handshake and a `ListAgents` have happened, and
@@ -3127,7 +3131,7 @@ describe("TauriDeckBridge across a fleet (PRD #742 M4/M5)", () => {
    * `2/2` once the remote deck's watcher emitted — a denominator that changed
    * under the reader, with both readings looking like nothing was wrong.
    */
-  it("renders a deck that has not reported yet, so the fleet's total is right from the first frame", async () => {
+  it("renders a daemon that has not reported yet, so the fleet's total is right from the first frame", async () => {
     const { TauriDeckBridge, PENDING_DECK_MESSAGE } = await import("./bridge");
     invoke.mockImplementation(async (command: string) => (command === "desktop_bootstrap" ? withObserved(local) : { ok: true }));
     const bridge = new TauriDeckBridge();
@@ -3138,7 +3142,7 @@ describe("TauriDeckBridge across a fleet (PRD #742 M4/M5)", () => {
     expect(seeded.map((deck) => deck.connection.deckId)).toEqual([localId, remoteId]);
     const waiting = seeded[1];
     expect(waiting.connection.pending).toBe(true);
-    // `loading`, never `disconnected`: nothing was asked of this deck, so there
+    // `loading`, never `disconnected`: nothing was asked of this daemon, so there
     // is no measurement to report.
     expect(waiting.connection.status).toBe("loading");
     expect(waiting.connection.socketPath).toBe(remoteDeck);
@@ -3150,14 +3154,14 @@ describe("TauriDeckBridge across a fleet (PRD #742 M4/M5)", () => {
 
   /**
    * Scenario: the same fleet, and the remote deck's watcher finally emits. The
-   * pending group is replaced by that deck's own snapshot — connected, with its
+   * pending group is replaced by that daemon's own snapshot — connected, with its
    * agents — and no placeholder lingers beside it.
    *
    * This is the whole reason pending is DERIVED per view rather than stored: a
    * deck stops being pending the instant its snapshot lands in the map, with
    * nothing to remember to delete.
    */
-  it("replaces the pending group with the deck's own snapshot when it reports", async () => {
+  it("replaces the pending group with the daemon's own snapshot when it reports", async () => {
     const { TauriDeckBridge } = await import("./bridge");
     invoke.mockImplementation(async (command: string) => (command === "desktop_bootstrap" ? withObserved(local) : { ok: true }));
     const bridge = new TauriDeckBridge();
@@ -3183,7 +3187,7 @@ describe("TauriDeckBridge across a fleet (PRD #742 M4/M5)", () => {
    * path in `snapshot_with` reaches.
    *
    * That is what bounds the pending state, and it is the half worth pinning:
-   * pending must not be a terminal state a deck can be stuck in. The group is
+   * pending must not be a terminal state a daemon can be stuck in. The group is
    * still degraded afterwards, but for a measured reason and with the
    * disconnected note's remedy rather than the pending one's silence.
    */
@@ -3203,7 +3207,7 @@ describe("TauriDeckBridge across a fleet (PRD #742 M4/M5)", () => {
         deckId: remoteId,
         socketPath: remoteDeck,
         deckKind: "remote",
-        error: "No deck is listening on the configured socket.",
+        error: "No daemon is listening on the configured socket.",
         clientProtocolVersion: 9,
         clientBuildVersion: "0.1.0",
       },
@@ -3215,14 +3219,14 @@ describe("TauriDeckBridge across a fleet (PRD #742 M4/M5)", () => {
     expect(fleet.map((deck) => deck.connection.deckId)).toEqual([localId, remoteId]);
     expect(fleet[1].connection.status).toBe("disconnected");
     expect(fleet[1].connection.pending).toBeUndefined();
-    expect(fleet[1].connection.message).toBe("No deck is listening on the configured socket.");
+    expect(fleet[1].connection.message).toBe("No daemon is listening on the configured socket.");
     await bridge.dispose();
   });
 
   /**
-   * Scenario: a deck leaves the observed set. The crate restates both lists, so
+   * Scenario: a daemon leaves the observed set. The crate restates both lists, so
    * the departed deck is gone from `observed` as well as from `fleet` — and the
-   * bridge must not turn a deck it has just pruned into a pending group, which
+   * bridge must not turn a daemon it has just pruned into a pending group, which
    * would put it straight back on screen under a friendlier name.
    */
   it("does not resurrect a departed deck as a pending one", async () => {
@@ -3357,17 +3361,17 @@ describe("TauriDeckBridge across a fleet (PRD #742 M4/M5)", () => {
   });
 
   /**
-   * The other half of M5: a deck that leaves the observed set leaves the screen
+   * The other half of M5: a daemon that leaves the observed set leaves the screen
    * on the next snapshot from ANY deck, with no reconnect.
    *
    * That is what `DesktopSnapshotDto.fleet` buys over M4's reset. The crate
-   * emits no "this deck left" event — `apply_selection` ends the departed
+   * emits no "this daemon left" event — `apply_selection` ends the departed
    * deck's watcher, and for `All` -> `local` the resolved deck does not move so
-   * it emits nothing at all — so M4 could only forget a deck at `connect()`.
+   * it emits nothing at all — so M4 could only forget a daemon at `connect()`.
    * Here the departure arrives as a shorter `fleet` on the surviving deck's own
    * snapshot, and the bootstrap count proves no handshake was involved.
    */
-  it("drops a deck that left the observed set without a reconnect", async () => {
+  it("drops a daemon that left the observed set without a reconnect", async () => {
     const { TauriDeckBridge } = await import("./bridge");
     const bridge = new TauriDeckBridge();
     const onFleet = vi.fn();
@@ -3391,14 +3395,14 @@ describe("TauriDeckBridge across a fleet (PRD #742 M4/M5)", () => {
   /**
    * A departing deck's own last emit does not reinstate it.
    *
-   * The watcher for a deck being torn down can still land one snapshot after
+   * The watcher for a daemon being torn down can still land one snapshot after
    * the crate has dropped it from the observed set, and that snapshot's `fleet`
    * — read fresh from the applied document — no longer names its own deck. A
    * fold that pruned BEFORE upserting would delete the entry and then put it
    * straight back, which is a departure that never takes effect until some
    * other deck happens to emit.
    */
-  it("does not reinstate a deck whose own last snapshot says it has left", async () => {
+  it("does not reinstate a daemon whose own last snapshot says it has left", async () => {
     const { TauriDeckBridge } = await import("./bridge");
     const bridge = new TauriDeckBridge();
     const onFleet = vi.fn();
@@ -3435,11 +3439,11 @@ describe("TauriDeckBridge across a fleet (PRD #742 M4/M5)", () => {
    * `saveSettings` re-establishes exactly when `[endpoints]` moved, and never
    * for an appearance save that sent the same document.
    *
-   * M4 needed this for correctness: nothing on the wire said a deck had left,
+   * M4 needed this for correctness: nothing on the wire said a daemon had left,
    * so a re-handshake was the only way to learn it. M5 put membership on every
    * snapshot (see the two tests below), which leaves this buying PROMPTNESS —
    * the self-correction is otherwise bounded by the crate's five-second
-   * reconcile timer, and five seconds of a deck the user just removed still
+   * reconcile timer, and five seconds of a daemon the user just removed still
    * sitting on their overview reads as the app ignoring them. The gate is the
    * half that has to keep holding either way: a theme save must cost no
    * handshake.
@@ -3474,7 +3478,7 @@ describe("TauriDeckBridge across a fleet (PRD #742 M4/M5)", () => {
   /**
    * Hook events are the DECK SCREEN's — the evidence drawer and the handoff
    * rail — and that screen is single-deck by DECISION 1. M3 stamped every
-   * `desktop://daemon-event` with the deck it came from precisely so this
+   * `desktop://daemon-event` with the daemon it came from precisely so this
    * reader could tell them apart: agent ids collide across decks, so an
    * unfiltered event would resolve to whichever machine's agent happened to
    * share the id.
@@ -3484,7 +3488,7 @@ describe("TauriDeckBridge across a fleet (PRD #742 M4/M5)", () => {
    * A stamp left on `describe()` would have gone on answering "yes, this is the
    * deck you are on" for a second daemon on the same host.
    */
-  it("drops a daemon event stamped with a deck the screen is not on, and keeps an unstamped one", async () => {
+  it("drops a daemon event stamped with a daemon the screen is not on, and keeps an unstamped one", async () => {
     const { TauriDeckBridge } = await import("./bridge");
     const bridge = new TauriDeckBridge();
     const onFleet = vi.fn();
@@ -3578,7 +3582,7 @@ describe("TauriDeckBridge across a fleet (PRD #742 M4/M5)", () => {
     // And the local deck's own history is still the local deck's.
     expect(fleet.find((deck) => deck.connection.deckId === localId)?.handoffs).toHaveLength(2);
 
-    // A hook event from the deck now on screen belongs to it alone.
+    // A hook event from the daemon now on screen belongs to it alone.
     listeners.get("desktop://daemon-event")?.({ payload: hookEvent(remoteId, "dlg-remote-1") });
     fleet = onFleet.mock.calls.at(-1)?.[0] as DeckFleet;
     expect(fleet.find((deck) => deck.connection.deckId === remoteId)?.handoffs.map((edge) => edge.id))
@@ -3602,8 +3606,8 @@ describe("TauriDeckBridge across a fleet (PRD #742 M4/M5)", () => {
    * the ring, so the bootstrap snapshot — a fresh statement of the whole world —
    * came back carrying the previous deck's hook history.
    *
-   * **What this proves:** that `connect()` points the ring at the deck it is
-   * bootstrapping before it maps that deck's snapshot.
+   * **What this proves:** that `connect()` points the ring at the daemon it is
+   * bootstrapping before it maps that daemon's snapshot.
    */
   it("does not hand a reconnect's deck the previous deck's hook history", async () => {
     const { TauriDeckBridge } = await import("./bridge");

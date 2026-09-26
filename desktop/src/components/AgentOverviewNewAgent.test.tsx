@@ -54,7 +54,7 @@ describe("the overview's New agent entry points (PRD #1223 M4)", () => {
   /**
    * Scenario: open the overview on the four-deck fleet and click the top bar's
    * New agent. The dialog opens with nothing preselected — two decks can take
-   * a spawn — so no deck is chosen and focus is on the deck field. A runtime
+   * a spawn — so no deck is chosen and focus is on the daemon field. A runtime
    * without the flow's queries renders no such control at all.
    */
   it("opens the flow from the top bar, and offers none without the flow's queries", () => {
@@ -109,10 +109,10 @@ describe("the overview's New agent entry points (PRD #1223 M4)", () => {
   /**
    * Scenario: each connected deck's group header carries its own New agent;
    * the unreachable and pending decks' do not. The remote deck's opens the
-   * flow with that deck chosen, and asks that deck — and no other — for its
+   * flow with that daemon chosen, and asks that daemon — and no other — for its
    * home.
    */
-  it("opens the flow from a deck group's header with that deck preselected", async () => {
+  it("opens the flow from a daemon group's header with that daemon preselected", async () => {
     const current = runtime();
     render(<AgentOverview runtime={current} onNavigate={vi.fn()} />);
     const headers = screen.getAllByTestId("daemon-new-agent");
@@ -123,7 +123,7 @@ describe("the overview's New agent entry points (PRD #1223 M4)", () => {
 
     expect(highlightedDeck()).toBe(FIXTURE_REMOTE_DAEMON_ID);
     expect(screen.getByTestId("new-agent-chosen-deck")).toBeVisible();
-    // The first listing follows the deck's options answer (PRD #1223's
+    // The first listing follows the daemon's options answer (PRD #1223's
     // `defaultDir`), so it is awaited rather than read synchronously.
     await waitFor(() => expect(current.listDirectories).toHaveBeenCalledTimes(1));
     expect(current.listDirectories).toHaveBeenCalledWith(FIXTURE_REMOTE_DAEMON_ID, undefined);
@@ -135,7 +135,7 @@ describe("the overview's New agent entry points (PRD #1223 M4)", () => {
    * agent — the flow could not choose it — while the local deck's
    * header still does.
    */
-  it("offers no header entry point on a deck the flow cannot browse", () => {
+  it("offers no header entry point on a daemon the flow cannot browse", () => {
     const fleet = createFixtureFleet("fleet").map((deck) => deck.connection.deckId === FIXTURE_REMOTE_DAEMON_ID ? { ...deck, connection: { ...deck.connection, newAgentReason: "This deck does not advertise list-directories." } } : deck);
     render(<AgentOverview runtime={runtime({ fleet })} onNavigate={vi.fn()} />);
     const group = (deckId: string) => screen.getAllByTestId("daemon-group").find((candidate) => candidate.getAttribute("data-daemon-id") === deckId)!;
@@ -145,7 +145,7 @@ describe("the overview's New agent entry points (PRD #1223 M4)", () => {
 
   /**
    * Scenario: a healthy deck running nothing. Its first-run note offers New
-   * agent instead of pointing at the CLI, and the flow opens on that deck.
+   * agent instead of pointing at the CLI, and the flow opens on that daemon.
    */
   it("offers the flow from the first-run note", () => {
     render(<AgentOverview runtime={runtime({ fleet: [createFixtureSnapshot("empty")] })} onNavigate={vi.fn()} />);
@@ -166,7 +166,7 @@ describe("the overview's New agent entry points (PRD #1223 M4)", () => {
   /**
    * Scenario (Greptile's review of PR #1235): open the flow from the top bar
    * with that button focused. Every control of the overview behind it is inert
-   * — so Tab cannot walk out into the deck groups or the column picker the way
+   * — so Tab cannot walk out into the daemon groups or the column picker the way
    * it could — focus is inside the dialog, and closing with Esc gives the
    * screen back and puts focus on the button that opened it.
    *
@@ -202,7 +202,7 @@ describe("the overview's New agent entry points (PRD #1223 M4)", () => {
 describe("the overview after a New agent start (PRD #1223 M5)", () => {
   /**
    * Scenario: start an agent on the local deck, which answers with agent `9`.
-   * Until the deck's fleet entry lists `9`, nothing navigates; once it does,
+   * Until the daemon's fleet entry lists `9`, nothing navigates; once it does,
    * the dialog closes and the overview opens that agent's pane by its
    * composite identity, from the overview.
    */
@@ -225,9 +225,9 @@ describe("the overview after a New agent start (PRD #1223 M5)", () => {
   });
 
   /**
-   * Scenario: the deck accepts the start and never lists the agent. After the
+   * Scenario: the daemon accepts the start and never lists the agent. After the
    * bound the dialog closes, no pane opens, and the overview says the agent
-   * was started on that deck and has not been listed; the line can be
+   * was started on that daemon and has not been listed; the line can be
    * dismissed.
    */
   it("says so on the overview when the agent has not appeared within the bound", async () => {
@@ -244,7 +244,7 @@ describe("the overview after a New agent start (PRD #1223 M5)", () => {
       expect(dialog()).toBeNull();
       expect(onNavigate).not.toHaveBeenCalled();
       const notice = screen.getByTestId("overview-new-agent-notice");
-      expect(notice).toHaveTextContent("Started dev on Local deck, but the deck has not listed it yet.");
+      expect(notice).toHaveTextContent("Started dev on Local daemon, but the daemon has not listed it yet.");
       fireEvent.click(within(notice).getByRole("button", { name: "Dismiss" }));
       expect(screen.queryByTestId("overview-new-agent-notice")).toBeNull();
     } finally {

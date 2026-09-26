@@ -6,8 +6,8 @@ import { DEFAULT_DESKTOP_SETTINGS as DEFAULT_SETTINGS, fixtureDesktopFeatures, t
 import type { DeckDirectoryListing, NewAgentOptions } from "./types";
 
 /**
- * PRD #1223 audit W2 — the deck's toast was the ONLY surface rendering
- * `runtime.error`, and the overview mounts *instead of* the deck.
+ * PRD #1223 audit W2 — the daemon's toast was the ONLY surface rendering
+ * `runtime.error`, and the overview mounts *instead of* the daemon.
  *
  * The New agent flow lives on the overview, and its dialog deliberately leaves
  * the runtime's error alone once it is unmounted, because by then that error is
@@ -20,7 +20,7 @@ import type { DeckDirectoryListing, NewAgentOptions } from "./types";
  * # Why the REAL runtime, and not a runtime fake with `error` prefilled
  *
  * `App.test.tsx` has that test already (`shows the runtime's unconfirmed roles
- * on the toast`) and it renders `ControlDeck` — the deck — with the state
+ * on the toast`) and it renders `ControlDeck` — the daemon — with the state
  * handed to it. It cannot fail for this defect, because the defect is *which
  * screen is mounted when the failure lands*. This file drives the real hook
  * over a stub bridge so the failure travels the way it does in the app: a start
@@ -102,8 +102,8 @@ describe("a launch failure that lands while the overview is up (PRD #1223 audit 
   });
 
   /**
-   * Scenario: on the overview, open New agent, pick the deck and its home
-   * directory and press Start. While the deck is still thinking, leave for the
+   * Scenario: on the overview, open New agent, pick the daemon and its home
+   * directory and press Start. While the daemon is still thinking, leave for the
    * deck screen and come back — which unmounts the dialog, so the runtime's
    * error becomes the only copy of the failure. The start then fails with roles
    * its rollback could not confirm stopped. Those roles must be on screen,
@@ -138,7 +138,7 @@ describe("a launch failure that lands while the overview is up (PRD #1223 audit 
 
     const toast = await screen.findByTestId("toast");
     const warning = screen.getByTestId("toast-cleanup-warning");
-    expect(warning).toHaveTextContent("2 roles may still be running on Local deck");
+    expect(warning).toHaveTextContent("2 roles may still be running on Local daemon");
     expect(warning).toHaveTextContent("orchestrator");
     expect(warning).toHaveTextContent("planner");
     expect(toast).toHaveTextContent("failed to start orchestration role");

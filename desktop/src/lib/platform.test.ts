@@ -12,7 +12,7 @@ describe("desktop workflow platform guard", () => {
     expect(isWindowsPlatform({ platform: "x86_64", userAgentData: { platform: "Windows" } })).toBe(true);
   });
 
-  it("keeps macOS and Linux workflow launch available", () => {
+  it("keeps macOS and Linux orchestration activation available", () => {
     expect(desktopWorkflowPlatformIssue({ platform: "MacIntel", userAgent: "Mozilla/5.0 (Macintosh)" })).toBeUndefined();
     expect(desktopWorkflowPlatformIssue({ platform: "Linux x86_64", userAgent: "Mozilla/5.0 (X11; Linux x86_64)" })).toBeUndefined();
   });

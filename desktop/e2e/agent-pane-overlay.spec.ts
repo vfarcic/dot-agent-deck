@@ -135,7 +135,7 @@ async function expectToOccupyWindow(page: Page, overlay: Locator): Promise<void>
 
 test.describe("agent pane overlay", () => {
   /**
-   * Scenario: open Planner from the deck in the built browser bundle. Its
+   * Scenario: open Planner from the daemon in the built browser bundle. Its
    * dialog covers the viewport while the grid and another tile remain mounted;
    * its xterm host and independently computed fit proposal grow in both axes.
    * Escape removes the dialog and exposes the same deck again.
@@ -150,7 +150,7 @@ test.describe("agent pane overlay", () => {
     await expect(grid).toBeVisible();
     const tileLayout = await terminalLayout(page.getByTestId("terminal-planner"));
     const originalGrid = await grid.elementHandle();
-    expect(originalGrid, "the deck has no grid node to preserve").not.toBeNull();
+    expect(originalGrid, "the daemon has no grid node to preserve").not.toBeNull();
     await page.getByRole("button", { name: "Open Planner agent" }).click();
 
     const overlay = page.getByTestId("agent-pane-overlay");
@@ -175,8 +175,8 @@ test.describe("agent pane overlay", () => {
   /**
    * Scenario: open Planner from its terminal-free overview card in the built
    * browser bundle. The overview remains mounted below the full-window pane,
-   * whose terminal width and fit proposal grow like the deck-origin pane;
-   * Escape returns to that overview rather than to the deck.
+   * whose terminal width and fit proposal grow like the daemon-origin pane;
+   * Escape returns to that overview rather than to the daemon.
    */
   test("keeps the overview mounted below the pane and returns there on Escape", async ({ page }) => {
     await captureTerminalMetrics(page);
@@ -207,7 +207,7 @@ test.describe("agent pane overlay", () => {
   });
 
   /**
-   * Scenario: choose All Decks, open build-box's same-id agent while the local
+   * Scenario: choose All daemons, open build-box's same-id agent while the local
    * deck remains the selected deck, and inspect the built bundle. The remote
    * pane has a real terminal and input element immediately; it never degrades
    * to an explanation or an empty terminal because its deck is not selected.
@@ -216,7 +216,7 @@ test.describe("agent pane overlay", () => {
     await openOverview(page, "fleet");
     await page.getByTestId("deck-selector-toggle").click();
     await page.getByTestId("deck-selector-option-all").click();
-    await expect(page.getByTestId("deck-selector-current")).toHaveText("All Decks");
+    await expect(page.getByTestId("deck-selector-current")).toHaveText("All daemons");
 
     await page.getByRole("button", { name: "Open Nightly build watch agent" }).click();
 
@@ -227,6 +227,6 @@ test.describe("agent pane overlay", () => {
     await expect(overlay.locator(".terminal-viewport")).toBeVisible();
     await expect(overlay.getByLabel("Builder terminal input")).toBeAttached();
     await expect(overlay.getByTestId("terminal-absent-planner")).toHaveCount(0);
-    await expect(page.getByTestId("deck-selector-current")).toHaveText("All Decks");
+    await expect(page.getByTestId("deck-selector-current")).toHaveText("All daemons");
   });
 });
