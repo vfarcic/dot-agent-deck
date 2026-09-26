@@ -1542,6 +1542,100 @@ jobs:
           # signature instead of trusting the seal.
           codesign --verify --deep --strict --verbose=4 "$APP"
           codesign --display --entitlements - "$APP"
+      # Both notarization steps submit WITHOUT `--wait` and poll through this
+      # one script (issue #1325). `--wait` ends notarytool on its first failed
+      # status request, and v0.42.0's run 36209188544 did exactly that: one
+      # poll timed out (NSURLErrorDomain -1001) about 15 minutes in, the job
+      # recorded status `unknown` and failed, and Apple accepted the submission
+      # a day later. So only the UPLOAD failing is a verdict here; a poll that
+      # fails, or answers without a status, is retried after a delay. Polling
+      # stops on `Accepted` (success) or on `Invalid`/`Rejected` (prints
+      # `notarytool log` and fails), or at a deadline of 75 minutes per
+      # submission -- the budget `--wait --timeout 75m` had -- so the two
+      # submissions stay inside `timeout-minutes: 180`. A poll that hangs
+      # rather than fails is not bounded by that deadline, only by the job's.
+      #
+      # Written to a file by its own step so the two call sites cannot drift
+      # apart. Self-contained on purpose, like the classifier: the poller uses
+      # bash, python3 and `xcrun` alone, and reads the key id and issuer from
+      # the calling step's environment, so this `run:` block can be lifted out
+      # and the poller run on a Linux host against a stubbed `xcrun`.
+      # NOTARY_DEADLINE_SECS and NOTARY_POLL_SECS exist for that harness; this
+      # workflow sets neither.
+      - name: Write the notarization poller
+        if: steps.creds.outputs.mode == 'signed'
+        run: |
+          set -eu
+          cat > "$RUNNER_TEMP/notarize.sh" <<'POLLER'
+          #!/usr/bin/env bash
+          # notarize.sh <file> <what> -- submit <file> for notarization and wait
+          # for Apple's verdict; <what> names it in the log.
+          set -eu
+          file=$1
+          what=$2
+          deadline_secs=${NOTARY_DEADLINE_SECS:-4500}
+          poll_secs=${NOTARY_POLL_SECS:-30}
+          auth=(--key "$RUNNER_TEMP/AuthKey.p8" --key-id "$APPLE_API_KEY" --issuer "$APPLE_API_ISSUER")
+          work=$(mktemp -d "$RUNNER_TEMP/notary.XXXXXX")
+          # One string field of a JSON object file, or empty when the file is
+          # missing, is not JSON, or has no such string field.
+          field() {
+            python3 -c 'import json, sys
+          try:
+              value = json.load(open(sys.argv[1])).get(sys.argv[2])
+          except Exception:
+              value = None
+          print(value if isinstance(value, str) else "")' "$1" "$2"
+          }
+          if ! xcrun notarytool submit "$file" "${auth[@]}" --output-format json > "$work/submit.json"; then
+            cat "$work/submit.json" || true
+            echo "::error::uploading ${what} for notarization failed, so there is no submission to wait for."
+            exit 1
+          fi
+          cat "$work/submit.json"
+          id=$(field "$work/submit.json" id)
+          case "$id" in
+            "" | *[!0-9A-Fa-f-]*)
+              echo "::error::notarytool accepted the upload of ${what} but returned no usable submission id ('${id}')."
+              exit 1
+              ;;
+          esac
+          echo "submitted ${what} as ${id}; polling every ${poll_secs}s for up to ${deadline_secs}s"
+          start=$SECONDS
+          polls=0
+          while :; do
+            polls=$((polls + 1))
+            status=""
+            if xcrun notarytool info "$id" "${auth[@]}" --output-format json > "$work/info.json" 2> "$work/info.err"; then
+              status=$(field "$work/info.json" status)
+            fi
+            case "$status" in
+              Accepted)
+                echo "notarization of ${what} accepted (submission ${id}, poll ${polls})"
+                exit 0
+                ;;
+              Invalid | Rejected)
+                echo "::error::notarization of ${what} returned status '${status}', not Accepted (submission ${id})."
+                xcrun notarytool log "$id" "${auth[@]}" || true
+                exit 1
+                ;;
+              "In Progress")
+                echo "poll ${polls}: ${what} is In Progress"
+                ;;
+              *)
+                # Not a verdict: a failed request, or an answer with no status
+                # this script knows. Log it and ask again.
+                echo "poll ${polls}: no verdict for ${what} (status '${status:-none}'); retrying"
+                cat "$work/info.err" || true
+                ;;
+            esac
+            if [ $((SECONDS - start)) -ge "$deadline_secs" ]; then
+              echo "::error::no notarization verdict for ${what} within ${deadline_secs}s. Apple may still be processing submission ${id}: check it with 'xcrun notarytool info ${id} --key <AuthKey.p8> --key-id <key id> --issuer <issuer id>', then re-run the failed jobs (a re-run signs and submits afresh)."
+              exit 1
+            fi
+            sleep "$poll_secs"
+          done
+          POLLER
       - name: Notarize and staple the app
         if: steps.creds.outputs.mode == 'signed'
         env:
@@ -1562,19 +1656,7 @@ jobs:
           umask 077
           printf '%s\n' "$APPLE_API_KEY_PATH" > "$RUNNER_TEMP/AuthKey.p8"
           ditto -c -k --keepParent "$APP" "$RUNNER_TEMP/app-for-notary.zip"
-          xcrun notarytool submit "$RUNNER_TEMP/app-for-notary.zip" \
-            --key "$RUNNER_TEMP/AuthKey.p8" --key-id "$APPLE_API_KEY" --issuer "$APPLE_API_ISSUER" \
-            --wait --timeout 75m --output-format json > "$RUNNER_TEMP/notary-app.json" || true
-          cat "$RUNNER_TEMP/notary-app.json"
-          status=$(plutil -extract status raw -o - "$RUNNER_TEMP/notary-app.json" 2>/dev/null || echo unknown)
-          if [ "$status" != "Accepted" ]; then
-            id=$(plutil -extract id raw -o - "$RUNNER_TEMP/notary-app.json" 2>/dev/null || true)
-            echo "::error::notarization of the app returned status '${status}', not Accepted."
-            if [ -n "$id" ]; then
-              xcrun notarytool log "$id" --key "$RUNNER_TEMP/AuthKey.p8" --key-id "$APPLE_API_KEY" --issuer "$APPLE_API_ISSUER" || true
-            fi
-            exit 1
-          fi
+          bash "$RUNNER_TEMP/notarize.sh" "$RUNNER_TEMP/app-for-notary.zip" "the app"
           rm -f "$RUNNER_TEMP/app-for-notary.zip"
           xcrun stapler staple "$APP"
           xcrun stapler validate "$APP"
@@ -1626,19 +1708,7 @@ jobs:
           printf '%s\n' "$APPLE_API_KEY_PATH" > "$RUNNER_TEMP/AuthKey.p8"
           codesign --force --timestamp --keychain "$KEYCHAIN" --sign "$IDENTITY" "$DMG"
           codesign --verify --strict --verbose=4 "$DMG"
-          xcrun notarytool submit "$DMG" \
-            --key "$RUNNER_TEMP/AuthKey.p8" --key-id "$APPLE_API_KEY" --issuer "$APPLE_API_ISSUER" \
-            --wait --timeout 75m --output-format json > "$RUNNER_TEMP/notary-dmg.json" || true
-          cat "$RUNNER_TEMP/notary-dmg.json"
-          status=$(plutil -extract status raw -o - "$RUNNER_TEMP/notary-dmg.json" 2>/dev/null || echo unknown)
-          if [ "$status" != "Accepted" ]; then
-            id=$(plutil -extract id raw -o - "$RUNNER_TEMP/notary-dmg.json" 2>/dev/null || true)
-            echo "::error::notarization of the disk image returned status '${status}', not Accepted."
-            if [ -n "$id" ]; then
-              xcrun notarytool log "$id" --key "$RUNNER_TEMP/AuthKey.p8" --key-id "$APPLE_API_KEY" --issuer "$APPLE_API_ISSUER" || true
-            fi
-            exit 1
-          fi
+          bash "$RUNNER_TEMP/notarize.sh" "$DMG" "the disk image"
           xcrun stapler staple "$DMG"
           xcrun stapler validate "$DMG"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7

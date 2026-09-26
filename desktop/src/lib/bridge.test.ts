@@ -2514,6 +2514,11 @@ describe("desktop settings (PRD 803)", () => {
 
     expect(await bridge.saveSettings(stored)).toEqual(stored);
     expect(invoke).toHaveBeenCalledWith("desktop_set_settings", { settings: stored });
+    // The document the edit was made against rides beside it, so the Rust side
+    // writes only the edit (issue #828).
+    const base = { ...stored, appearance: { mode: "light" as const } };
+    await bridge.saveSettings(stored, base);
+    expect(invoke).toHaveBeenLastCalledWith("desktop_set_settings", { settings: stored, base });
     await bridge.dispose();
   });
 

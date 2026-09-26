@@ -2979,21 +2979,20 @@ mod tests {
     /// path, and a string assertion would pass over a syntax error or an
     /// inverted `-S` test alike.
     ///
-    /// `env_clear`, for [`run_probe_under`]'s reason: since issue #1174 the
-    /// snippet's FIRST rung runs whichever `dot-agent-deck` it finds under
-    /// `$HOME/.local/bin` or on `PATH`, so removing only the three variables
-    /// the later rungs read let this machine's own installed deck answer
-    /// instead. A 0.42.0 deck there answers these tests' stand-in sockets with
-    /// a refusal and the snippet prints nothing — four of them went red on any
-    /// host with a current deck installed, and green on CI, which has none.
-    /// Only `PATH` is put back, narrowed to the system directories, because the
-    /// fallback rungs call `id -u`.
+    /// `env_clear` for the same reason as [`run_probe_under`]: the snippet's
+    /// first rung runs whatever `dot-agent-deck` sits at `$HOME/.local/bin` or
+    /// on `PATH`, so an ambient one lets this machine's installed deck answer
+    /// instead of the fallback rungs these tests are about. Measured on a
+    /// developer box with a deck installed at `~/.local/bin`: the probe
+    /// printed nothing where a path was expected and four tests failed, while
+    /// CI, with no deck installed, stayed green.
     #[cfg(unix)]
     fn run_socket_probe(snippet: &str, env: &[(&str, &str)]) -> String {
         let output = std::process::Command::new("/bin/sh")
             .arg("-c")
             .arg(snippet)
             .env_clear()
+            // The fallback rungs call `id -u`.
             .env("PATH", "/usr/bin:/bin")
             .envs(env.iter().copied())
             .output()
