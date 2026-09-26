@@ -25,12 +25,14 @@ function withMode(mode: AppearanceMode): DesktopSettingsDto {
 /** A `saveSettings` whose every call the test settles by hand. */
 function deferredSaves() {
   const sent: DesktopSettingsDto[] = [];
+  const bases: (DesktopSettingsDto | undefined)[] = [];
   const pending: { resolve: (written: DesktopSettingsDto) => void; reject: (cause: unknown) => void }[] = [];
-  const saveSettings = vi.fn((settings: DesktopSettingsDto) => {
+  const saveSettings = vi.fn((settings: DesktopSettingsDto, base?: DesktopSettingsDto) => {
     sent.push(settings);
+    bases.push(base);
     return new Promise<DesktopSettingsDto>((resolve, reject) => { pending.push({ resolve, reject }); });
   });
-  return { sent, pending, saveSettings };
+  return { sent, bases, pending, saveSettings };
 }
 
 /**
@@ -114,6 +116,54 @@ describe("useDesktopSettings save ordering", () => {
     // the same slot also carries an unreadable-document message (issue #1072).
     expect(result.current.saveError).toContain("will not survive a restart");
     expect(result.current.settings.appearance.mode).toBe("light");
+  });
+});
+
+/**
+ * Two writers (issue #828).
+ *
+ * The Rust side writes only what differs between a save's `base` and its
+ * document, so the base must be exactly what the edit was made against: the
+ * document on screen at the click. Diffing against anything newer would read
+ * this window's stale copy of another window's field as an edit and write it
+ * back over the newer value — the lost edit #828 is about.
+ */
+describe("useDesktopSettings base", () => {
+  it("sends the document each edit was made against, and shows the file as written", async () => {
+    const { sent, bases, pending, saveSettings } = deferredSaves();
+    const { result } = await loadedHook(saveSettings);
+
+    await act(async () => { result.current.save(withMode("dark")); });
+    expect(bases[0]).toEqual(DEFAULT_DESKTOP_SETTINGS);
+    expect(sent[0].appearance.mode).toBe("dark");
+
+    // The reply is the file as written, and another window had changed the
+    // zoom meanwhile. The window must show that, not its own stale zoom.
+    const written = { ...withMode("dark"), zoom: { level: 1.5 } };
+    await act(async () => { pending[0].resolve(written); });
+    expect(result.current.settings.zoom.level).toBe(1.5);
+
+    // The next edit is made against what is now on screen.
+    await act(async () => { result.current.save({ ...result.current.settings, appearance: { mode: "light" } }); });
+    expect(bases[1]).toEqual(written);
+    expect(sent[1]).toEqual({ ...written, appearance: { mode: "light" } });
+  });
+
+  it("captures the base at the click, not when a queued save goes out", async () => {
+    const { bases, pending, saveSettings } = deferredSaves();
+    const { result } = await loadedHook(saveSettings);
+
+    await act(async () => { result.current.save(withMode("dark")); });
+    // A second choice while the first is still in flight: it was made against
+    // the dark document on screen, whatever the first reply later says.
+    act(() => { result.current.save(withMode("light")); });
+
+    // The first reply carries another window's zoom. Had the queued save taken
+    // its base from here, its own zoom — still the default — would read as an
+    // edit and be written back over the other window's.
+    await act(async () => { pending[0].resolve({ ...withMode("dark"), zoom: { level: 1.5 } }); });
+    expect(saveSettings).toHaveBeenCalledTimes(2);
+    expect(bases[1]).toEqual(withMode("dark"));
   });
 });
 

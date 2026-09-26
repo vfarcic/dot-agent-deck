@@ -38,12 +38,13 @@
 //! The qualifier is meant. [`save_to`] reads, vets and then renames, so a
 //! document that becomes unreadable *inside that window* is still replaced —
 //! the same shape of residual the path vet accepts a few paragraphs down, and
-//! the same one an anchored `renameat` would be needed to close. It is a
-//! microsecond-wide race between two writers, which is issue #828's subject and
-//! not this one's; what #1072 was about is the ordinary single-writer case,
-//! where the app read the document at launch, could not use it, and overwrote it
-//! anyway. Re-reading at save time rather than trusting the launch read is what
-//! makes the window that narrow.
+//! the same one an anchored `renameat` would be needed to close. Since issue
+//! #828 another copy of this app cannot open that window, because saves hold a
+//! lock from the read to the rename; a text editor saving inside the same
+//! milliseconds still can. What #1072 was about is the ordinary single-writer
+//! case, where the app read the document at launch, could not use it, and
+//! overwrote it anyway. Re-reading at save time rather than trusting the launch
+//! read is what makes the window that narrow.
 //!
 //! **The path is vetted and the read is bounded.** [`read_document`] requires
 //! an absolute path with a file name whose target is absent or a regular file,
@@ -62,6 +63,15 @@
 //! it, so an older build cannot delete a section a newer one wrote. See
 //! [`merged_document`] — this is the one place where `#[serde(default)]`
 //! genuinely does not give what it looks like it gives.
+//!
+//! **And what another writer changed** (issue #828). A save carries the
+//! document its edit was made against, and only the fields that differ from it
+//! are written — so two app windows, or the app and a hand edit, each changing
+//! a different field both keep their change, and a deck added in one window is
+//! not deleted by another window's stale deck list. Saves from two copies of
+//! the app are also serialised by a lock. [`save_to`] has the reasoning and
+//! [`merged_document`] the merge; the one edit still lost is a genuine
+//! conflict, both writers changing the same field, which the later save wins.
 //!
 //! **And it preserves how the user wrote it** (issue #825). The merge runs on a
 //! [`toml_edit::DocumentMut`], a format-preserving DOM, and writes only the keys
@@ -2935,9 +2945,14 @@ fn line_and_column(contents: &str, offset: usize) -> Option<(usize, usize)> {
     Some((line, last_line.chars().count() + 1))
 }
 
-/// Persist the settings document atomically and owner-only.
-pub fn save(settings: &DesktopSettings) -> Result<(), SettingsWriteError> {
-    save_to(&settings_path(), settings)
+/// Persist the settings document atomically and owner-only, applying the edit
+/// from `base` to `settings` onto whatever the document holds now, and return
+/// the document as written. See [`save_to`].
+pub fn save(
+    base: Option<&DesktopSettings>,
+    settings: &DesktopSettings,
+) -> Result<DesktopSettings, SettingsWriteError> {
+    save_to(&settings_path(), base, settings)
 }
 
 /// How many temp names [`save_to`] draws before giving up. A leftover temp file
@@ -3011,9 +3026,54 @@ const TEMP_NAME_ATTEMPTS: usize = 8;
 ///   therefore atomic to every live observer but not fully crash-durable: a
 ///   power loss immediately after a save can leave the previous document in
 ///   place.
-pub fn save_to(path: &Path, settings: &DesktopSettings) -> Result<(), SettingsWriteError> {
+///
+/// # Two writers (issue #828)
+///
+/// `base` is the document the caller's edit was made **against** — what the
+/// window was showing when the user changed something — and `settings` is that
+/// document with the edit applied. Only what differs between the two is written;
+/// every key the caller did not change keeps whatever the document on disk holds
+/// **now**. See [`merged_document`] for the merge, and read this section before
+/// passing `None`.
+///
+/// That is the fix, and a lock alone would not have been. The lost edit #828
+/// describes is not an interleaving: window A loads at launch, window B saves a
+/// new deck a minute later, and window A then saves a theme change carrying the
+/// deck list it loaded. Serialising those two saves changes nothing — they were
+/// already a minute apart — because A's in-memory copy was the authority over
+/// every field it owns, including the ones it never touched. Knowing which
+/// fields A actually changed is what lets B's survive, and only the caller
+/// knows that.
+///
+/// `None` keeps the old authority — the struct wins over the file on every
+/// field it owns — for a caller with no base to offer. The app always offers
+/// one; `None` is what the tests that are about something else use.
+///
+/// **And the saves are serialised as well**, by an exclusive lock on a sidecar
+/// file held from the read to the rename (see [`acquire_save_lock`]). With the
+/// merge in place the window that remains is only the span of one save — read,
+/// merge, write, `fsync`, rename — but the `fsync` puts milliseconds in it, and
+/// two windows saving inside it would each merge onto the document from before
+/// the other's write. The lock closes it between two copies of this app. It
+/// cannot close it against a **text editor** saving inside those same
+/// milliseconds, since an editor takes no lock; the merge still covers a hand
+/// edit made at any time before the save began, which is the case that
+/// actually happens.
+///
+/// Returns the document as written — the merge result, re-read with this
+/// build's schema — so the caller can show what the file now holds, including
+/// what another window changed. The merge result is checked readable before it
+/// is published, so a merge can never write a document this build would refuse
+/// on the next load.
+pub fn save_to(
+    path: &Path,
+    base: Option<&DesktopSettings>,
+    settings: &DesktopSettings,
+) -> Result<DesktopSettings, SettingsWriteError> {
     // Before anything is created: a rejected path must not leave a directory
     // behind, and an unreadable or over-limit document must not be replaced.
+    // This read vets the path and refuses early; the one the merge uses is
+    // taken again below, under the lock.
     let existing = read_document(path, ReadPurpose::Save)?;
 
     // Issue #1072: and neither must a document this build cannot READ. The two
@@ -3049,7 +3109,33 @@ pub fn save_to(path: &Path, settings: &DesktopSettings) -> Result<(), SettingsWr
     fsperm::create_owner_only_dir(parent)
         .map_err(|error| write_error("could not create the directory for", path, error))?;
 
-    let contents = merged_document(path, existing.as_deref(), settings)?;
+    // Held until this function returns, which is after the rename.
+    let _lock = acquire_save_lock(parent, path)?;
+
+    // The authoritative read: another window may have saved between the one
+    // above and the lock, and this is the content the merge must land on.
+    let existing = read_document(path, ReadPurpose::Save)?;
+    if let Some(contents) = existing.as_deref()
+        && let Err(error) = toml_edit::de::from_str::<DesktopSettings>(contents)
+    {
+        return Err(refuse_to_overwrite(path, contents, &error));
+    }
+
+    let contents = merged_document(path, existing.as_deref(), base, settings)?;
+    // A merge of two readable documents should be readable, and this is where
+    // "should" is checked rather than trusted: publishing a document this build
+    // refuses would turn the next launch into issue #1072's refusal.
+    //
+    // The cause is a fixed sentence rather than the parse error, whose own text
+    // quotes the offending line — a value from the document, which must not
+    // reach the webview.
+    let written = toml_edit::de::from_str::<DesktopSettings>(&contents).map_err(|_| {
+        write_error(
+            "could not merge into",
+            path,
+            "the result would not be readable by this build, so nothing was written",
+        )
+    })?;
 
     let (mut file, tmp) = create_temp(parent, path)?;
     let published = (|| {
@@ -3067,7 +3153,115 @@ pub fn save_to(path: &Path, settings: &DesktopSettings) -> Result<(), SettingsWr
         let _ = std::fs::remove_file(&tmp);
         return Err(write_error("could not write", path, error));
     }
-    Ok(())
+    Ok(written)
+}
+
+/// How long a save waits for another process's save of the same document to
+/// finish. A save is a few milliseconds, most of it the `fsync`; a writer still
+/// holding the lock after this long is stuck, and failing the save visibly beats
+/// blocking the command forever.
+const SAVE_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How often a waiting save retries the lock.
+const SAVE_LOCK_POLL: std::time::Duration = std::time::Duration::from_millis(5);
+
+/// The sidecar [`save_to`] locks: `.desktop.toml.lock` beside the document.
+fn save_lock_path(parent: &Path, path: &Path) -> PathBuf {
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| SETTINGS_FILE_NAME.to_string());
+    parent.join(format!(".{name}.lock"))
+}
+
+/// Take the exclusive lock that serialises saves of `path` across processes
+/// (issue #828). The lock is released when the returned file is dropped.
+///
+/// # Why a sidecar, and why it is never deleted
+///
+/// The document itself cannot carry the lock: every save **replaces** it by
+/// rename, so a lock on the old inode would not exclude a process that opened
+/// the new one. The sidecar is never replaced and never removed — deleting a
+/// lock file while others may be waiting on it is how two processes end up each
+/// holding a lock on a different inode. So an empty, owner-only
+/// `.desktop.toml.lock` stays beside the document once the app has saved once.
+/// It holds no data and deleting it by hand is harmless when no save is running.
+///
+/// # `std`'s lock rather than the daemon's `SpawnLock`
+///
+/// `File::try_lock` is `flock(2)` on Unix and `LockFileEx` on Windows, so it is
+/// one call on every platform this crate builds for and needs no dependency.
+/// The daemon's spawn lock is built for a different job — a machine-wide named
+/// mutex on Windows, and an unbounded blocking wait — and a settings save wants
+/// neither.
+///
+/// # A lock that cannot be taken does not stop the save
+///
+/// If the sidecar cannot be opened or the filesystem does not support locking,
+/// the save goes ahead unlocked and says so in the log: the merge in
+/// [`merged_document`] is the fix for #828, and the lock only narrows what is
+/// left of it to nothing, so it is not worth making a preference unsavable on a
+/// filesystem without `flock`. What **does** fail the save is the lock being
+/// held by someone else for longer than [`SAVE_LOCK_WAIT`], because going ahead
+/// then is exactly the interleaving the lock is for.
+///
+/// A symlink or anything else that is not a regular file at the sidecar's name
+/// is not opened — the lock would land on whatever it points at — and the save
+/// proceeds unlocked, logged, the same way. Only this user can put one there:
+/// [`vet_parent_dir`] has already refused a parent owned by anyone else.
+fn acquire_save_lock(
+    parent: &Path,
+    path: &Path,
+) -> Result<Option<std::fs::File>, SettingsWriteError> {
+    let lock_path = save_lock_path(parent, path);
+    let unlocked = |why: &dyn std::fmt::Display| {
+        eprintln!(
+            "desktop settings: saving {} without the cross-process lock: {why}",
+            path.display()
+        );
+        Ok(None)
+    };
+
+    match std::fs::symlink_metadata(&lock_path) {
+        Ok(meta) if !meta.file_type().is_file() => {
+            return unlocked(&"the lock file's name is taken by something that is not a file");
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return unlocked(&error),
+    }
+
+    let mut options = std::fs::OpenOptions::new();
+    // Nothing is ever written to it; `write` is what `create` requires, and on
+    // Windows `LockFileEx` needs a handle opened for reading or writing.
+    options.read(true).write(true).create(true).truncate(false);
+    // Owner-only on Unix for tidiness. Not the Windows helper, which pins the
+    // handle's access mask to write-only for the DACL it applies — and a file
+    // with no content has nothing that DACL would protect.
+    #[cfg(unix)]
+    fsperm::set_create_mode_owner_only(&mut options);
+    let file = match options.open(&lock_path) {
+        Ok(file) => file,
+        Err(error) => return unlocked(&error),
+    };
+
+    let deadline = std::time::Instant::now() + SAVE_LOCK_WAIT;
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(Some(file)),
+            Err(std::fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(SAVE_LOCK_POLL);
+            }
+            Err(std::fs::TryLockError::WouldBlock) => {
+                return Err(write_error(
+                    "gave up waiting to save",
+                    path,
+                    "another window has been saving it for too long. Try again",
+                ));
+            }
+            Err(std::fs::TryLockError::Error(error)) => return unlocked(&error),
+        }
+    }
 }
 
 /// Serialise `settings` over whatever the document at `path` already holds,
@@ -3128,10 +3322,11 @@ pub fn save_to(path: &Path, settings: &DesktopSettings) -> Result<(), SettingsWr
 ///   [`EndpointSettings`]). The same additive walk is what makes an unknown key
 ///   survive at all.
 ///
-/// One consequence worth stating so it is not read as a bug: "leaves every byte
-/// alone" holds for a document that already **has** every key the struct owns.
-/// A partial one — no `[zoom]` section, say — gains that section on the next
-/// save, appended after whatever is already there.
+/// One consequence worth stating so it is not read as a bug: without a `base`,
+/// "leaves every byte alone" holds for a document that already **has** every
+/// key the struct owns. A partial one — no `[zoom]` section, say — gains that
+/// section on the next save, appended after whatever is already there. With a
+/// `base` it gains only what the caller changed (see below).
 ///
 /// # An unparseable document is refused, not replaced (issue #1072)
 ///
@@ -3155,9 +3350,43 @@ pub fn save_to(path: &Path, settings: &DesktopSettings) -> Result<(), SettingsWr
 /// hazard. A document a *newer* build wrote that this one cannot read is exactly
 /// the case where replacing it would take that build's sections with it, so it
 /// lands on the refusal too.
+///
+/// # Only what the caller changed is written (issue #828)
+///
+/// With a `base`, the merge is **three-way**: `base` is the document the
+/// caller's edit was made against, `settings` is that document after the edit,
+/// and the file on disk is the third party. A key whose data is the same in
+/// `base` and `settings` is one the caller did not change, so the file's value
+/// stands — even when it differs from both, because then someone else changed
+/// it since the caller loaded. A key the caller did change is written. So two
+/// windows editing different fields both keep their edit, whatever order they
+/// saved in.
+///
+/// Three refinements, each needed for the rule above to mean what it says:
+///
+/// - **A key the caller removed is removed** — present in `base`, absent from
+///   `settings`, and still what `base` said on disk. That is how an optional
+///   field such as a deck's `identity` is cleared, and it is safe for the
+///   container promise: `base` is this build's own rendering, so a key this
+///   build does not know is never in it and never removed. If another writer
+///   changed the key in the meantime, their value is kept rather than deleted.
+/// - **A list of rows with ids is merged row by row**, which today is
+///   `[[endpoints.remote]]`. Rows are matched by `id` rather than by position,
+///   so one window adding a deck while another edits a different one keeps
+///   both, and a row both windows touched is merged field by field. Rows the
+///   caller added are appended after the file's own; rows it deleted go, unless
+///   someone else edited them meanwhile. See [`merge_rows`]. Any other list is
+///   still one value, replaced whole when the caller changed it.
+/// - **A genuine conflict — both writers changed the same field — goes to the
+///   later save.** Nothing can keep both values of one field, and this is
+///   the only case left where a save discards another's edit.
+///
+/// Without a `base` the merge is the two-way one it always was: every key the
+/// struct owns wins over the file.
 fn merged_document(
     path: &Path,
     existing: Option<&str>,
+    base: Option<&DesktopSettings>,
     settings: &DesktopSettings,
 ) -> Result<String, SettingsWriteError> {
     // The canonical rendering of the struct: byte for byte what a fresh
@@ -3196,7 +3425,26 @@ fn merged_document(
         .parse::<toml_edit::DocumentMut>()
         .map_err(|error| write_error("could not serialize", path, error))?;
 
-    merge_tables(document.as_table_mut(), incoming.as_table(), false);
+    // The base goes through the same canonical rendering as `settings`, so the
+    // two are compared in one spelling and a difference is always a change of
+    // data.
+    let ancestor = base
+        .map(|base| {
+            toml_edit::ser::to_string_pretty(base)
+                .map_err(|error| write_error("could not serialize", path, error))?
+                .parse::<toml_edit::DocumentMut>()
+                .map_err(|error| write_error("could not serialize", path, error))
+        })
+        .transpose()?;
+
+    merge_tables(
+        document.as_table_mut(),
+        incoming.as_table(),
+        ancestor
+            .as_ref()
+            .map(|ancestor| ancestor.as_table() as &dyn toml_edit::TableLike),
+        false,
+    );
     Ok(document.to_string())
 }
 
@@ -3234,9 +3482,16 @@ fn merged_document(
 /// map with no conversion anywhere, which is where the value disappeared.
 /// Converting once, up front, covers both — and it is also the behaviour a
 /// reader wants: a document written inline stays inline.
+///
+/// `ancestor`, when there is one, is what the caller's edit was made against,
+/// at the same depth as `incoming` — see "Only what the caller changed is
+/// written" on [`merged_document`]. A key the two agree on is skipped, so the
+/// file's value stands; a key the ancestor has and `incoming` does not is
+/// removed if the file still holds the ancestor's value.
 fn merge_tables(
     base: &mut dyn toml_edit::TableLike,
     incoming: &dyn toml_edit::TableLike,
+    ancestor: Option<&dyn toml_edit::TableLike>,
     inline: bool,
 ) {
     for (key, item) in incoming.iter() {
@@ -3247,14 +3502,25 @@ fn merge_tables(
         if item.is_none() {
             continue;
         }
+        let was = ancestor
+            .and_then(|ancestor| ancestor.get(key))
+            .filter(|was| !was.is_none());
 
         let mut item = item.clone();
         if inline {
             item.make_value();
         }
 
+        // Absent from the file. Written if the caller changed it, or if there
+        // is no base to say it did not; left absent otherwise, because a key
+        // the caller did not touch is the file's business — a hand edit may
+        // have deleted it, or a row may simply be spelled without its
+        // defaults, and filling in `port = 22` there is a change nobody asked
+        // for.
         if base.get(key).is_none() {
-            base.insert(key, item);
+            if !was.is_some_and(|was| same_data(was, &item)) {
+                base.insert(key, item);
+            }
             continue;
         }
         // `get` and `get_mut` answer the same question on both table
@@ -3272,8 +3538,24 @@ fn merge_tables(
             let existing_table = existing
                 .as_table_like_mut()
                 .expect("`is_table_like` just said so");
-            merge_tables(existing_table, incoming_table, nested_inline);
+            merge_tables(
+                existing_table,
+                incoming_table,
+                was.and_then(toml_edit::Item::as_table_like),
+                nested_inline,
+            );
             continue;
+        }
+
+        // Issue #828: the caller did not change this key, so whatever the file
+        // holds now — possibly another window's edit — stands.
+        if let Some(was) = was {
+            if same_data(was, &item) {
+                continue;
+            }
+            if merge_rows(existing, &item, was) {
+                continue;
+            }
         }
 
         // A key whose SHAPE moves from a value to a `[section]` is re-inserted
@@ -3296,6 +3578,181 @@ fn merge_tables(
         }
         replace_item(existing, item);
     }
+
+    // The keys the caller removed: in what it started from, gone from what it
+    // sent. Removed only while the file still holds the ancestor's value — a
+    // value someone else wrote since is an edit, and it is kept.
+    let Some(ancestor) = ancestor else {
+        return;
+    };
+    let removed: Vec<String> = ancestor
+        .iter()
+        .filter(|(key, was)| {
+            !was.is_none()
+                && incoming.get(key).is_none_or(toml_edit::Item::is_none)
+                && base.get(key).is_some_and(|on_disk| same_data(on_disk, was))
+        })
+        .map(|(key, _)| key.to_string())
+        .collect();
+    for key in removed {
+        base.remove(&key);
+    }
+}
+
+/// The rows of a list whose every row is a table carrying a unique string `id`,
+/// in order — or `None` when `item` is not such a list, which is what makes a
+/// list eligible for [`merge_rows`]. Either spelling counts: an
+/// `[[array of tables]]` or an inline `[{ … }]`.
+fn id_rows(item: &toml_edit::Item) -> Option<Vec<(String, &dyn toml_edit::TableLike)>> {
+    let rows: Vec<&dyn toml_edit::TableLike> = if let Some(rows) = item.as_array_of_tables() {
+        rows.iter()
+            .map(|row| row as &dyn toml_edit::TableLike)
+            .collect()
+    } else {
+        item.as_array()?
+            .iter()
+            .map(|row| {
+                row.as_inline_table()
+                    .map(|row| row as &dyn toml_edit::TableLike)
+            })
+            .collect::<Option<_>>()?
+    };
+    let mut seen = std::collections::BTreeSet::new();
+    rows.into_iter()
+        .map(|row| {
+            let id = row.get("id")?.as_str()?.to_string();
+            seen.insert(id.clone()).then_some((id, row))
+        })
+        .collect()
+}
+
+/// A row as an owned `[table]`, whichever way it was spelled.
+fn owned_row(row: &dyn toml_edit::TableLike) -> toml_edit::Table {
+    let mut table = toml_edit::Table::new();
+    for (key, item) in row.iter() {
+        if !item.is_none() {
+            table.insert(key, item.clone());
+        }
+    }
+    table
+}
+
+/// What [`merge_rows`] does with one row the file holds. The rows it names are
+/// borrowed from the caller's side — `incoming` and `ancestor` — never from the
+/// file, which is what lets the file's list be mutated while they are held.
+enum RowStep<'a> {
+    /// Left exactly as the file has it.
+    Keep,
+    /// The caller deleted it and nobody edited it since.
+    Drop,
+    /// Both sides have it: merge the caller's edit into it field by field,
+    /// against the caller's ancestor row if there was one.
+    Merge(
+        &'a dyn toml_edit::TableLike,
+        Option<&'a dyn toml_edit::TableLike>,
+    ),
+}
+
+/// Merge a list of id-carrying rows — `[[endpoints.remote]]` — three ways, row
+/// by row (issue #828). Returns `false`, touching nothing, when any of the three
+/// sides is not such a list; the caller then treats the list as one value.
+///
+/// Matching by `id` rather than position is the point: a position cannot tell
+/// "window B inserted a deck" from "window B edited the deck that used to be
+/// here", and an id can. The order of the file's rows is kept, and rows only
+/// the caller has are appended after them in the caller's order.
+///
+/// A row the caller deleted is deleted only if the file's copy is still the
+/// one the caller saw; one the caller edited but someone else deleted is put
+/// back, since the caller's edit is the newer intent about that row. A row
+/// present on both sides recurses into [`merge_tables`], which is what lets two
+/// windows edit different fields of the same deck — and what makes clearing an
+/// optional field in a row work, through its removal step.
+fn merge_rows(
+    existing: &mut toml_edit::Item,
+    incoming: &toml_edit::Item,
+    ancestor: &toml_edit::Item,
+) -> bool {
+    let (Some(disk), Some(mine), Some(was)) =
+        (id_rows(existing), id_rows(incoming), id_rows(ancestor))
+    else {
+        return false;
+    };
+    fn find<'r>(
+        rows: &[(String, &'r dyn toml_edit::TableLike)],
+        id: &str,
+    ) -> Option<&'r dyn toml_edit::TableLike> {
+        rows.iter()
+            .find(|(other, _)| other == id)
+            .map(|(_, row)| *row)
+    }
+    let same_row = |left: &dyn toml_edit::TableLike, right: &dyn toml_edit::TableLike| {
+        same_node(&DataNode::Table(left), &DataNode::Table(right))
+    };
+
+    let steps: Vec<RowStep<'_>> = disk
+        .iter()
+        .map(|(id, on_disk)| match (find(&mine, id), find(&was, id)) {
+            (Some(mine), was) => RowStep::Merge(mine, was),
+            (None, Some(was)) if same_row(*on_disk, was) => RowStep::Drop,
+            // Deleted by the caller but edited by someone else since, or added
+            // by someone else since the caller loaded: either way, not the
+            // caller's to remove.
+            (None, _) => RowStep::Keep,
+        })
+        .collect();
+    let appended: Vec<toml_edit::Table> = mine
+        .iter()
+        .filter(|(id, _)| !disk.iter().any(|(other, _)| other == id))
+        .filter(|(id, row)| match find(&was, id) {
+            // Deleted by someone else: back only if the caller edited it.
+            Some(was) => !same_row(*row, was),
+            // Added by the caller.
+            None => true,
+        })
+        .map(|(_, row)| owned_row(*row))
+        .collect();
+    // The file's rows are only read above; everything below writes them.
+    drop(disk);
+
+    if let Some(rows) = existing.as_array_of_tables_mut() {
+        for (index, step) in steps.iter().enumerate() {
+            if let RowStep::Merge(mine, was) = step {
+                let row = rows.get_mut(index).expect("one step per row");
+                merge_tables(row, *mine, *was, false);
+            }
+        }
+        for (index, step) in steps.iter().enumerate().rev() {
+            if matches!(step, RowStep::Drop) {
+                rows.remove(index);
+            }
+        }
+        for row in appended {
+            rows.push(row);
+        }
+    } else {
+        let rows = existing
+            .as_array_mut()
+            .expect("`id_rows` accepted it as an array");
+        for (index, step) in steps.iter().enumerate() {
+            if let RowStep::Merge(mine, was) = step {
+                let row = rows
+                    .get_mut(index)
+                    .and_then(toml_edit::Value::as_inline_table_mut)
+                    .expect("`id_rows` accepted every row as an inline table");
+                merge_tables(row, *mine, *was, true);
+            }
+        }
+        for (index, step) in steps.iter().enumerate().rev() {
+            if matches!(step, RowStep::Drop) {
+                rows.remove(index);
+            }
+        }
+        for row in appended {
+            rows.push(row.into_inline_table());
+        }
+    }
+    true
 }
 
 /// Overwrite `existing` with `incoming`, keeping the **decor** — the whitespace
@@ -3575,7 +4032,7 @@ mod tests {
     fn a_saved_document_round_trips() {
         let dir = tempdir();
         let path = dir.path().join(SETTINGS_FILE_NAME);
-        save_to(&path, &dark()).unwrap();
+        save_to(&path, None, &dark()).unwrap();
         assert_eq!(load_from(&path), dark());
         // And the file a user would open reads the way the PRD promises.
         let raw = std::fs::read_to_string(&path).unwrap();
@@ -3639,7 +4096,7 @@ mod tests {
     fn loading_never_fails_on_an_unreadable_file() {
         let dir = tempdir();
         let path = dir.path().join(SETTINGS_FILE_NAME);
-        save_to(&path, &dark()).unwrap();
+        save_to(&path, None, &dark()).unwrap();
         set_mode(&path, 0o000);
         if std::fs::read_to_string(&path).is_ok() {
             set_mode(&path, 0o600);
@@ -3747,7 +4204,7 @@ mod tests {
         );
 
         // And a save puts back exactly what was read.
-        save_to(&path, &loaded).unwrap();
+        save_to(&path, None, &loaded).unwrap();
         assert_eq!(load_from(&path), loaded);
     }
 
@@ -3939,7 +4396,7 @@ mod tests {
 
         // A save then rewrites `[voice]` in the new shape — the migration
         // completes rather than being re-folded on every load.
-        save_to(&path, &settings).unwrap();
+        save_to(&path, None, &settings).unwrap();
         let raw = std::fs::read_to_string(&path).unwrap();
         assert!(raw.contains("[voice.transcription]"), "{raw}");
         assert_eq!(load_from(&path).voice, settings.voice);
@@ -4273,7 +4730,7 @@ mod tests {
 
         // The cost, pinned rather than left implicit: the next save writes the
         // folded value, so the newer build's choice is gone.
-        save_to(&path, &loaded).unwrap();
+        save_to(&path, None, &loaded).unwrap();
         let reread = std::fs::read_to_string(&path).unwrap();
         assert!(
             reread.contains("backend = \"openai_compatible\""),
@@ -4640,7 +5097,7 @@ mod tests {
             voice: None,
             ..DesktopSettings::default()
         };
-        save_to(&path, &blind).unwrap();
+        save_to(&path, None, &blind).unwrap();
 
         let reloaded = load_from(&path);
         assert_eq!(reloaded.appearance.mode, AppearanceMode::Dark);
@@ -4799,7 +5256,7 @@ mod tests {
         let voice = "[voice]\nbackend = \"whisper\"\n";
         std::fs::write(&path, format!("version = 1\n\n{voice}")).unwrap();
 
-        save_to(&path, &zoomed(1.75)).unwrap();
+        save_to(&path, None, &zoomed(1.75)).unwrap();
         let reloaded = load_from(&path);
         assert_eq!(reloaded.zoom.level.as_f64(), 1.75);
 
@@ -4832,7 +5289,7 @@ mod tests {
         let mut loaded = load_from(&path);
         assert_eq!(loaded.appearance.mode, AppearanceMode::Light);
         loaded.appearance.mode = AppearanceMode::Dark;
-        save_to(&path, &loaded).unwrap();
+        save_to(&path, None, &loaded).unwrap();
 
         let raw = std::fs::read_to_string(&path).unwrap();
         assert!(
@@ -4868,7 +5325,7 @@ mod tests {
              stages = [\"stt\", \"intent\"]\n";
         std::fs::write(&path, hand_written).unwrap();
 
-        save_to(&path, &dark()).unwrap();
+        save_to(&path, None, &dark()).unwrap();
         let raw = std::fs::read_to_string(&path).unwrap();
 
         // The data is all there, with its types intact.
@@ -4939,7 +5396,7 @@ mod tests {
         // toggle would.
         let mut loaded = load_from(&path);
         loaded.appearance.mode = AppearanceMode::Dark;
-        save_to(&path, &loaded).unwrap();
+        save_to(&path, None, &loaded).unwrap();
 
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
@@ -4984,7 +5441,7 @@ mod tests {
             // document says is what the struct holds.
             let loaded = load_from(&path);
             assert_eq!(loaded.appearance.mode, AppearanceMode::Dark);
-            save_to(&path, &loaded).unwrap();
+            save_to(&path, None, &loaded).unwrap();
 
             assert_eq!(
                 std::fs::read_to_string(&path).unwrap(),
@@ -5024,7 +5481,7 @@ mod tests {
         let path = dir.path().join(SETTINGS_FILE_NAME);
         std::fs::write(&path, with_comment).unwrap();
         let loaded = load_from(&path);
-        save_to(&path, &loaded).unwrap();
+        save_to(&path, None, &loaded).unwrap();
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
             with_comment,
@@ -5035,7 +5492,7 @@ mod tests {
         let mut edited = loaded;
         edited.endpoints.as_mut().unwrap().remote[0].host =
             Hostname::parse("other-box.example.com").unwrap();
-        save_to(&path, &edited).unwrap();
+        save_to(&path, None, &edited).unwrap();
         let raw = std::fs::read_to_string(&path).unwrap();
         assert!(
             raw.contains("other-box.example.com"),
@@ -5101,7 +5558,7 @@ mod tests {
                 EndpointId::parse("deck1").unwrap(),
                 Hostname::parse("build-box.example.com").unwrap(),
             )];
-            save_to(&path, &settings).unwrap();
+            save_to(&path, None, &settings).unwrap();
 
             let raw = std::fs::read_to_string(&path).unwrap();
             assert!(
@@ -5153,7 +5610,7 @@ mod tests {
                 EndpointId::parse("deck1").unwrap(),
                 Hostname::parse("build-box.example.com").unwrap(),
             )];
-            save_to(&path, &settings).unwrap();
+            save_to(&path, None, &settings).unwrap();
 
             let raw = std::fs::read_to_string(&path).unwrap();
             assert_eq!(
@@ -5184,7 +5641,7 @@ mod tests {
         )
         .unwrap();
 
-        save_to(&path, &dark()).unwrap();
+        save_to(&path, None, &dark()).unwrap();
 
         let raw = std::fs::read_to_string(&path).unwrap();
         assert!(
@@ -5205,7 +5662,7 @@ mod tests {
         )
         .unwrap();
 
-        save_to(&path, &dark()).unwrap();
+        save_to(&path, None, &dark()).unwrap();
 
         let reloaded = load_from(&path);
         assert_eq!(reloaded.appearance.mode, AppearanceMode::Dark);
@@ -5213,6 +5670,522 @@ mod tests {
         let raw = std::fs::read_to_string(&path).unwrap();
         assert!(!raw.contains("99"), "the stale version survived: {raw}");
         assert!(raw.contains("[voice]"), "the merge lost [voice]: {raw}");
+    }
+
+    // ---------------------------------------------------------------------
+    // Issue #828 — two writers, each holding a copy loaded before the other
+    // saved
+    // ---------------------------------------------------------------------
+
+    /// Two app windows that both loaded the document before either saved, the
+    /// way two processes started a minute apart do.
+    fn two_windows_on(
+        path: &Path,
+        document: &DesktopSettings,
+    ) -> (DesktopSettings, DesktopSettings) {
+        save_to(path, None, document).unwrap();
+        (load_from(path), load_from(path))
+    }
+
+    /// Scenario (issue #828): two app windows are open on the same
+    /// `desktop.toml`. Window B adds a remote deck and saves; window A, whose
+    /// copy was loaded before that, then changes the theme and saves. Reloading
+    /// must show BOTH edits — the deck B added and the theme A chose — because
+    /// each window changed a different thing and neither meant to undo the
+    /// other. The same for a zoom change racing a theme change.
+    #[test]
+    fn a_window_saving_a_stale_copy_keeps_what_another_window_saved_since() {
+        let dir = tempdir();
+        let path = dir.path().join(SETTINGS_FILE_NAME);
+        let existing = EndpointId::parse("homelab").unwrap();
+        let deck = EndpointId::parse("buildbox").unwrap();
+
+        // The #741 case: a lost edit here is a lost endpoint.
+        let (window_a, window_b) = two_windows_on(
+            &path,
+            &DesktopSettings {
+                endpoints: Some(EndpointSettings {
+                    remote: vec![connectable_row(&existing, "homelab.example")],
+                    selection: Selection::Local,
+                }),
+                ..DesktopSettings::default()
+            },
+        );
+        let mut b = window_b.clone();
+        let endpoints = b.endpoints.as_mut().unwrap();
+        endpoints
+            .remote
+            .push(connectable_row(&deck, "build.example"));
+        endpoints.selection = Selection::One(deck.clone());
+        save_to(&path, Some(&window_b), &b).unwrap();
+        let mut a = window_a.clone();
+        a.appearance.mode = AppearanceMode::Dark;
+        save_to(&path, Some(&window_a), &a).unwrap();
+
+        let reloaded = load_from(&path);
+        assert_eq!(
+            reloaded.appearance.mode,
+            AppearanceMode::Dark,
+            "window A's own edit"
+        );
+        let endpoints = reloaded
+            .endpoints
+            .expect("window B's [endpoints] section was lost to window A's stale copy");
+        assert!(
+            endpoints.find(&deck).is_some(),
+            "window B's deck was lost to window A's stale copy: {endpoints:?}"
+        );
+        assert!(endpoints.find(&existing).is_some(), "{endpoints:?}");
+        assert_eq!(endpoints.selection, Selection::One(deck.clone()));
+
+        // Two scalar fields in two different sections.
+        let dir = tempdir();
+        let path = dir.path().join(SETTINGS_FILE_NAME);
+        let (window_a, window_b) = two_windows_on(&path, &DesktopSettings::default());
+        let mut b = window_b.clone();
+        b.zoom.level = ZoomLevel::snap(1.5);
+        save_to(&path, Some(&window_b), &b).unwrap();
+        let mut a = window_a.clone();
+        a.appearance.mode = AppearanceMode::Dark;
+        save_to(&path, Some(&window_a), &a).unwrap();
+
+        let reloaded = load_from(&path);
+        assert_eq!(
+            reloaded.appearance.mode,
+            AppearanceMode::Dark,
+            "window A's own edit"
+        );
+        assert_eq!(
+            reloaded.zoom.level,
+            ZoomLevel::snap(1.5),
+            "window B's zoom was lost to window A's stale copy"
+        );
+    }
+
+    /// A document holding two decks and the local selection, for the row-merge
+    /// cases.
+    fn two_decks(first: &EndpointId, second: &EndpointId) -> DesktopSettings {
+        DesktopSettings {
+            endpoints: Some(EndpointSettings {
+                remote: vec![
+                    connectable_row(first, "first.example"),
+                    connectable_row(second, "second.example"),
+                ],
+                selection: Selection::Local,
+            }),
+            ..DesktopSettings::default()
+        }
+    }
+
+    fn deck<'s>(
+        settings: &'s DesktopSettings,
+        id: &EndpointId,
+    ) -> Option<&'s RemoteEndpointSettings> {
+        settings
+            .endpoints
+            .as_ref()
+            .and_then(|endpoints| endpoints.find(id))
+    }
+
+    fn deck_mut<'s>(
+        settings: &'s mut DesktopSettings,
+        id: &EndpointId,
+    ) -> &'s mut RemoteEndpointSettings {
+        settings
+            .endpoints
+            .as_mut()
+            .and_then(|endpoints| endpoints.remote.iter_mut().find(|row| &row.id == id))
+            .expect("the deck is in the document")
+    }
+
+    /// Scenario (issue #828): both windows edit the deck LIST, which is one
+    /// value to a position-based merge. Each adds a deck of its own; each edits
+    /// a different field of the same deck; one clears an optional field while
+    /// the other changes the theme; one deletes a deck nobody else touched, and
+    /// one deletes a deck the other window edited meanwhile. Every edit must be
+    /// in the reloaded document, and the edited deck must not be deleted from
+    /// under the window that edited it.
+    #[test]
+    fn two_windows_editing_the_deck_list_keep_each_others_rows_and_fields() {
+        let first = EndpointId::parse("first").unwrap();
+        let second = EndpointId::parse("second").unwrap();
+        let dir = tempdir();
+        let path = dir.path().join(SETTINGS_FILE_NAME);
+
+        // Each adds a deck.
+        let (window_a, window_b) = two_windows_on(&path, &two_decks(&first, &second));
+        let from_a = EndpointId::parse("from-a").unwrap();
+        let from_b = EndpointId::parse("from-b").unwrap();
+        let mut b = window_b.clone();
+        b.endpoints
+            .as_mut()
+            .unwrap()
+            .remote
+            .push(connectable_row(&from_b, "b.example"));
+        save_to(&path, Some(&window_b), &b).unwrap();
+        let mut a = window_a.clone();
+        a.endpoints
+            .as_mut()
+            .unwrap()
+            .remote
+            .push(connectable_row(&from_a, "a.example"));
+        save_to(&path, Some(&window_a), &a).unwrap();
+        let reloaded = load_from(&path);
+        let ids: Vec<&str> = reloaded
+            .endpoints
+            .as_ref()
+            .unwrap()
+            .remote
+            .iter()
+            .map(|row| row.id.as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            ["first", "second", "from-b", "from-a"],
+            "both added decks, the file's own order first"
+        );
+
+        // Different fields of the same deck.
+        let (window_a, window_b) = two_windows_on(&path, &two_decks(&first, &second));
+        let mut b = window_b.clone();
+        deck_mut(&mut b, &first).user = Some(SshUser::parse("deploy").unwrap());
+        save_to(&path, Some(&window_b), &b).unwrap();
+        let mut a = window_a.clone();
+        deck_mut(&mut a, &first).port = SshPort::parse(2222).unwrap();
+        save_to(&path, Some(&window_a), &a).unwrap();
+        let reloaded = load_from(&path);
+        let row = deck(&reloaded, &first).unwrap();
+        assert_eq!(
+            row.user,
+            Some(SshUser::parse("deploy").unwrap()),
+            "window B's field"
+        );
+        assert_eq!(row.port, SshPort::parse(2222).unwrap(), "window A's field");
+
+        // Clearing an optional field is an edit too, and must still land.
+        let mut start = two_decks(&first, &second);
+        deck_mut(&mut start, &second).jump = Some(HostAlias::parse("bastion").unwrap());
+        let (window_a, window_b) = two_windows_on(&path, &start);
+        let mut b = window_b.clone();
+        b.appearance.mode = AppearanceMode::Light;
+        save_to(&path, Some(&window_b), &b).unwrap();
+        let mut a = window_a.clone();
+        deck_mut(&mut a, &second).jump = None;
+        save_to(&path, Some(&window_a), &a).unwrap();
+        let reloaded = load_from(&path);
+        assert_eq!(
+            deck(&reloaded, &second).unwrap().jump,
+            None,
+            "window A cleared it"
+        );
+        assert_eq!(
+            reloaded.appearance.mode,
+            AppearanceMode::Light,
+            "window B's theme"
+        );
+
+        // A deck deleted by one window and untouched by the other is gone; one
+        // deleted by one window and edited by the other is kept, with the edit.
+        let (window_a, window_b) = two_windows_on(&path, &two_decks(&first, &second));
+        let mut b = window_b.clone();
+        deck_mut(&mut b, &second).port = SshPort::parse(2200).unwrap();
+        save_to(&path, Some(&window_b), &b).unwrap();
+        let mut a = window_a.clone();
+        a.endpoints.as_mut().unwrap().remote.clear();
+        save_to(&path, Some(&window_a), &a).unwrap();
+        let reloaded = load_from(&path);
+        assert!(
+            deck(&reloaded, &first).is_none(),
+            "window A deleted it and nobody else touched it"
+        );
+        assert_eq!(
+            deck(&reloaded, &second).map(|row| row.port),
+            Some(SshPort::parse(2200).unwrap()),
+            "window B's edit to a deck window A deleted from a stale copy"
+        );
+    }
+
+    /// Scenario (issue #828): both windows change the SAME field. Nothing can
+    /// keep two values of one field, so the later save wins — the one case a
+    /// save still discards another's edit, pinned so it is read as the design
+    /// rather than found as a bug.
+    #[test]
+    fn a_same_field_conflict_goes_to_the_later_save() {
+        let dir = tempdir();
+        let path = dir.path().join(SETTINGS_FILE_NAME);
+        let (window_a, window_b) = two_windows_on(&path, &DesktopSettings::default());
+        let mut b = window_b.clone();
+        b.appearance.mode = AppearanceMode::Light;
+        save_to(&path, Some(&window_b), &b).unwrap();
+        let mut a = window_a.clone();
+        a.appearance.mode = AppearanceMode::Dark;
+        save_to(&path, Some(&window_a), &a).unwrap();
+        assert_eq!(load_from(&path).appearance.mode, AppearanceMode::Dark);
+    }
+
+    /// Scenario: a newer build wrote an appearance value this build does not
+    /// know, which this build reads as `system`. The user changes only the zoom.
+    /// The newer build's value must still be in the file — the save did not
+    /// touch appearance, so it has no business replacing it — and the reply
+    /// must be this build's reading of the result.
+    #[test]
+    fn a_value_this_build_folded_survives_a_save_that_did_not_touch_it() {
+        let dir = tempdir();
+        let path = dir.path().join(SETTINGS_FILE_NAME);
+        std::fs::write(
+            &path,
+            "version = 1\n\n[appearance]\nmode = \"high-contrast\"\n",
+        )
+        .unwrap();
+        let loaded = load_from(&path);
+        assert_eq!(
+            loaded.appearance.mode,
+            AppearanceMode::System,
+            "folded on load"
+        );
+
+        let mut edited = loaded.clone();
+        edited.zoom.level = ZoomLevel::snap(1.25);
+        let written = save_to(&path, Some(&loaded), &edited).unwrap();
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("mode = \"high-contrast\""), "{raw}");
+        assert_eq!(written.appearance.mode, AppearanceMode::System);
+        assert_eq!(written.zoom.level, ZoomLevel::snap(1.25));
+    }
+
+    /// Scenario (issue #828): a hand-written voice stage that names only its
+    /// backend, whose coordinates the load fills in from that backend's preset.
+    /// The user switches the stage to another backend, then changes only its
+    /// model. Each reload must read back exactly what the user saw — a merged
+    /// save leaves a key absent when the caller did not change it, and a stage's
+    /// coordinates are the keys whose absence means something different once
+    /// the backend beside them moves.
+    #[test]
+    fn a_partial_voice_stage_reads_back_what_the_user_saw_after_a_merged_save() {
+        let dir = tempdir();
+        let path = dir.path().join(SETTINGS_FILE_NAME);
+        std::fs::write(
+            &path,
+            "version = 1\n\n[voice.transcription]\nbackend = \"remote\"\n",
+        )
+        .unwrap();
+
+        let loaded = load_from(&path);
+        let mut switched = loaded.clone();
+        switched.voice.as_mut().unwrap().transcription =
+            TranscriptionSettings::for_backend(TranscriptionBackend::Local);
+        save_to(&path, Some(&loaded), &switched).unwrap();
+        assert_eq!(
+            load_from(&path).voice,
+            switched.voice,
+            "after switching the backend"
+        );
+
+        // Back to the partial document, and change only the model this time.
+        std::fs::write(
+            &path,
+            "version = 1\n\n[voice.transcription]\nbackend = \"remote\"\n",
+        )
+        .unwrap();
+        let loaded = load_from(&path);
+        let mut renamed = loaded.clone();
+        renamed.voice.as_mut().unwrap().transcription.model =
+            ModelId::parse("gpt-4o-transcribe").unwrap();
+        save_to(&path, Some(&loaded), &renamed).unwrap();
+        assert_eq!(
+            load_from(&path).voice,
+            renamed.voice,
+            "after changing only the model"
+        );
+    }
+
+    /// Scenario (issue #828, and PRD #803's container promise): a hand-written
+    /// document with comments, an unknown section and an inline-spelled deck
+    /// list. Window B adds a deck; window A changes the theme from a stale copy.
+    /// The unknown section and every comment must come through byte for byte,
+    /// the inline list must stay inline, and a later save that changes nothing
+    /// must rewrite nothing.
+    #[test]
+    fn a_merged_save_keeps_unknown_sections_and_the_users_spelling() {
+        let dir = tempdir();
+        let path = dir.path().join(SETTINGS_FILE_NAME);
+        let future = "[future]\n# a newer build's section\nknob = [1, 2,   3] # spaced by hand\n";
+        let original = format!(
+            "# my settings\nversion = 1\n\n[appearance]\nmode = \"light\" # daytime\n\n\
+             [endpoints]\nselection = \"local\"\nremote = [{{ host = \"first.example\", id = \"first\" }}]\n\n\
+             {future}"
+        );
+        std::fs::write(&path, &original).unwrap();
+        let window_a = load_from(&path);
+        let window_b = load_from(&path);
+
+        let added = EndpointId::parse("added").unwrap();
+        let mut b = window_b.clone();
+        b.endpoints
+            .as_mut()
+            .unwrap()
+            .remote
+            .push(RemoteEndpointSettings::new(
+                added.clone(),
+                Hostname::parse("added.example").unwrap(),
+            ));
+        save_to(&path, Some(&window_b), &b).unwrap();
+        let mut a = window_a.clone();
+        a.appearance.mode = AppearanceMode::Dark;
+        let written = save_to(&path, Some(&window_a), &a).unwrap();
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            raw.ends_with(future),
+            "the unknown section moved or changed: {raw}"
+        );
+        assert!(raw.starts_with("# my settings\n"), "{raw}");
+        assert!(raw.contains("mode = \"dark\" # daytime"), "{raw}");
+        assert!(
+            raw.contains("remote = [{ host = \"first.example\", id = \"first\" }, "),
+            "the inline list must stay inline and keep its first row's bytes: {raw}"
+        );
+        assert!(
+            deck(&written, &added).is_some(),
+            "the reply carries window B's deck"
+        );
+
+        // And a save with nothing new to write leaves every byte alone.
+        let reloaded = load_from(&path);
+        save_to(&path, Some(&reloaded), &reloaded).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), raw);
+    }
+
+    /// Control: a lone window — nobody else wrote since it loaded — gets exactly
+    /// the bytes it got before #828, whether it names its base or not. The
+    /// merge only ever differs from the old one where the file moved underneath.
+    #[test]
+    fn a_lone_window_writes_the_same_bytes_with_or_without_its_base() {
+        let with_base = tempdir();
+        let without_base = tempdir();
+        let start = two_decks(
+            &EndpointId::parse("first").unwrap(),
+            &EndpointId::parse("second").unwrap(),
+        );
+        for dir in [&with_base, &without_base] {
+            save_to(&dir.path().join(SETTINGS_FILE_NAME), None, &start).unwrap();
+        }
+        let loaded = load_from(&with_base.path().join(SETTINGS_FILE_NAME));
+        let mut edited = loaded.clone();
+        edited.appearance.mode = AppearanceMode::Dark;
+        deck_mut(&mut edited, &EndpointId::parse("second").unwrap()).port =
+            SshPort::parse(2022).unwrap();
+
+        save_to(
+            &with_base.path().join(SETTINGS_FILE_NAME),
+            Some(&loaded),
+            &edited,
+        )
+        .unwrap();
+        save_to(&without_base.path().join(SETTINGS_FILE_NAME), None, &edited).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(with_base.path().join(SETTINGS_FILE_NAME)).unwrap(),
+            std::fs::read_to_string(without_base.path().join(SETTINGS_FILE_NAME)).unwrap(),
+        );
+    }
+
+    /// Scenario (issue #828): another process is in the middle of a save — it
+    /// holds the lock — when this window saves. The save must WAIT for it rather
+    /// than read the document while the other write is in flight, and must land
+    /// once the other save lets go.
+    #[test]
+    fn a_save_waits_while_another_process_holds_the_save_lock() {
+        let dir = tempdir();
+        let path = dir.path().join(SETTINGS_FILE_NAME);
+        save_to(&path, None, &DesktopSettings::default()).unwrap();
+
+        // A separate open of the sidecar is a separate lock owner, even inside
+        // one process — which is what lets a thread stand in for a process here.
+        let holder = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(save_lock_path(dir.path(), &path))
+            .unwrap();
+        holder.lock().unwrap();
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let saving = std::thread::spawn({
+            let path = path.clone();
+            move || {
+                let result = save_to(&path, None, &dark());
+                done_tx.send(()).unwrap();
+                result
+            }
+        });
+        assert!(
+            done_rx
+                .recv_timeout(std::time::Duration::from_millis(300))
+                .is_err(),
+            "the save went ahead while another process held the lock"
+        );
+        assert_eq!(load_from(&path).appearance.mode, AppearanceMode::System);
+
+        drop(holder);
+        saving
+            .join()
+            .unwrap()
+            .expect("the save lands once the lock is free");
+        assert_eq!(load_from(&path).appearance.mode, AppearanceMode::Dark);
+    }
+
+    /// Scenario (issue #828): eight windows, all loaded from the same document,
+    /// each add a deck of their own and all save at the same instant. Every
+    /// deck must be in the result. Without the lock, two saves that read the
+    /// document before either renames each merge onto the same old content,
+    /// and the second rename drops the first one's deck.
+    #[test]
+    fn simultaneous_saves_from_one_base_each_keep_their_deck() {
+        const WINDOWS: usize = 8;
+        let dir = tempdir();
+        let path = dir.path().join(SETTINGS_FILE_NAME);
+        let start = DesktopSettings {
+            endpoints: Some(EndpointSettings::default()),
+            ..DesktopSettings::default()
+        };
+        save_to(&path, None, &start).unwrap();
+        let base = load_from(&path);
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(WINDOWS));
+        let windows: Vec<_> = (0..WINDOWS)
+            .map(|window| {
+                let (path, base, barrier) = (path.clone(), base.clone(), barrier.clone());
+                std::thread::spawn(move || {
+                    let id = EndpointId::parse(&format!("window-{window}")).unwrap();
+                    let mut edited = base.clone();
+                    edited
+                        .endpoints
+                        .as_mut()
+                        .unwrap()
+                        .remote
+                        .push(connectable_row(&id, "deck.example"));
+                    barrier.wait();
+                    save_to(&path, Some(&base), &edited)
+                })
+            })
+            .collect();
+        for window in windows {
+            window.join().unwrap().unwrap();
+        }
+
+        let reloaded = load_from(&path);
+        let mut ids: Vec<String> = reloaded
+            .endpoints
+            .unwrap()
+            .remote
+            .into_iter()
+            .map(|row| row.id.as_str().to_string())
+            .collect();
+        ids.sort();
+        let expected: Vec<String> = (0..WINDOWS)
+            .map(|window| format!("window-{window}"))
+            .collect();
+        assert_eq!(ids, expected, "a simultaneous save lost another's deck");
     }
 
     // ---------------------------------------------------------------------
@@ -5250,7 +6223,7 @@ mod tests {
             let path = dir.path().join(SETTINGS_FILE_NAME);
             std::fs::write(&path, original).unwrap();
 
-            let refused = save_to(&path, &dark())
+            let refused = save_to(&path, None, &dark())
                 .expect_err("saving over a document this build cannot read must be refused");
 
             assert_eq!(
@@ -5293,10 +6266,10 @@ mod tests {
 
         // No document at all is the first-run case and merges into an empty
         // table, which is a different thing and must stay allowed.
-        let fresh = merged_document(path, None, &dark()).unwrap();
+        let fresh = merged_document(path, None, None, &dark()).unwrap();
         assert!(fresh.contains("mode = \"dark\""), "{fresh}");
 
-        let refused = merged_document(path, Some("this is not [ valid toml\n"), &dark())
+        let refused = merged_document(path, Some("this is not [ valid toml\n"), None, &dark())
             .expect_err("bytes that are not TOML must not be merged into as if empty");
         assert!(
             refused.public().contains("refusing to overwrite"),
@@ -5318,7 +6291,7 @@ mod tests {
         )
         .unwrap();
 
-        save_to(&path, &dark()).unwrap();
+        save_to(&path, None, &dark()).unwrap();
 
         let after = std::fs::read_to_string(&path).unwrap();
         assert!(after.contains("mode = \"dark\""), "{after}");
@@ -5371,14 +6344,14 @@ mod tests {
         let (settings, problem) = load_document(&absent);
         assert_eq!(settings, DesktopSettings::default());
         assert_eq!(problem, None, "a first run must not report a problem");
-        save_to(&absent, &dark()).expect("a first save must not be refused");
+        save_to(&absent, None, &dark()).expect("a first save must not be refused");
 
         let empty = dir.path().join("empty.toml");
         std::fs::write(&empty, "").unwrap();
         let (settings, problem) = load_document(&empty);
         assert_eq!(settings, DesktopSettings::default());
         assert_eq!(problem, None, "an empty document is a valid empty document");
-        save_to(&empty, &dark()).expect("saving over an empty document must not be refused");
+        save_to(&empty, None, &dark()).expect("saving over an empty document must not be refused");
     }
 
     /// A path-level failure is a document problem too.
@@ -5392,7 +6365,7 @@ mod tests {
     fn an_unreadable_file_reports_a_problem_rather_than_only_logging_one() {
         let dir = tempdir();
         let path = dir.path().join(SETTINGS_FILE_NAME);
-        save_to(&path, &dark()).unwrap();
+        save_to(&path, None, &dark()).unwrap();
         set_mode(&path, 0o000);
         if std::fs::read_to_string(&path).is_ok() {
             set_mode(&path, 0o600);
@@ -5436,7 +6409,7 @@ mod tests {
         unsafe { std::env::set_var(SETTINGS_PATH_ENV, &path) };
         let broken = load_snapshot();
 
-        save_to(&path, &dark()).unwrap_err();
+        save_to(&path, None, &dark()).unwrap_err();
         std::fs::write(&path, "version = 1\n[appearance]\nmode = \"dark\"\n").unwrap();
         let healthy = load_snapshot();
         unsafe { std::env::remove_var(SETTINGS_PATH_ENV) };
@@ -5573,7 +6546,7 @@ mod tests {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let dir = tempdir();
         let path = dir.path().join("elsewhere.toml");
-        save_to(&path, &dark()).unwrap();
+        save_to(&path, None, &dark()).unwrap();
 
         // SAFETY: the lock above serialises every test that touches this var.
         unsafe { std::env::set_var(SETTINGS_PATH_ENV, &path) };
@@ -5598,9 +6571,17 @@ mod tests {
     fn a_successful_save_leaves_no_temp_file_behind() {
         let dir = tempdir();
         let path = dir.path().join(SETTINGS_FILE_NAME);
-        save_to(&path, &dark()).unwrap();
-        save_to(&path, &DesktopSettings::default()).unwrap();
-        assert_eq!(entries(dir.path()), vec![SETTINGS_FILE_NAME.to_string()]);
+        save_to(&path, None, &dark()).unwrap();
+        save_to(&path, None, &DesktopSettings::default()).unwrap();
+        // The lock sidecar stays, by design — see `acquire_save_lock` — and is
+        // the only thing beside the document.
+        assert_eq!(
+            entries(dir.path()),
+            vec![
+                format!(".{SETTINGS_FILE_NAME}.lock"),
+                SETTINGS_FILE_NAME.to_string()
+            ]
+        );
     }
 
     #[cfg(unix)]
@@ -5609,13 +6590,13 @@ mod tests {
         use std::os::unix::fs::MetadataExt as _;
         let dir = tempdir();
         let path = dir.path().join(SETTINGS_FILE_NAME);
-        save_to(&path, &DesktopSettings::default()).unwrap();
+        save_to(&path, None, &DesktopSettings::default()).unwrap();
         let before = std::fs::metadata(&path).unwrap().ino();
 
         // A writer that opened the destination and truncated it would expose a
         // partially written document; one that renames a finished temp file
         // over it cannot. The inode changing is that difference, observably.
-        save_to(&path, &dark()).unwrap();
+        save_to(&path, None, &dark()).unwrap();
         let after = std::fs::metadata(&path).unwrap().ino();
         assert_ne!(
             before, after,
@@ -5635,7 +6616,7 @@ mod tests {
         std::fs::create_dir(&path).unwrap();
         std::fs::write(path.join("occupied"), b"x").unwrap();
 
-        let error = save_to(&path, &dark()).unwrap_err();
+        let error = save_to(&path, None, &dark()).unwrap_err();
         assert!(
             error.detail().contains("a directory"),
             "unexpected error: {error}"
@@ -5654,7 +6635,7 @@ mod tests {
     fn a_failed_save_leaves_the_existing_document_intact() {
         let dir = tempdir();
         let path = dir.path().join(SETTINGS_FILE_NAME);
-        save_to(&path, &dark()).unwrap();
+        save_to(&path, None, &dark()).unwrap();
         let before = std::fs::read_to_string(&path).unwrap();
 
         set_mode(dir.path(), 0o500);
@@ -5669,7 +6650,7 @@ mod tests {
             return;
         }
 
-        let error = save_to(&path, &DesktopSettings::default()).unwrap_err();
+        let error = save_to(&path, None, &DesktopSettings::default()).unwrap_err();
         set_mode(dir.path(), 0o700);
 
         assert!(!error.detail().is_empty());
@@ -5686,7 +6667,7 @@ mod tests {
     fn a_saved_document_is_owner_only() {
         let dir = tempdir();
         let path = dir.path().join(SETTINGS_FILE_NAME);
-        save_to(&path, &dark()).unwrap();
+        save_to(&path, None, &dark()).unwrap();
         assert_eq!(
             mode_of(&path),
             0o600,
@@ -5696,7 +6677,7 @@ mod tests {
         // A rewrite re-asserts it rather than inheriting whatever the previous
         // file happened to carry.
         set_mode(&path, 0o644);
-        save_to(&path, &DesktopSettings::default()).unwrap();
+        save_to(&path, None, &DesktopSettings::default()).unwrap();
         assert_eq!(mode_of(&path), 0o600);
     }
 
@@ -5707,7 +6688,7 @@ mod tests {
         std::fs::create_dir(&path).unwrap();
         std::fs::write(path.join("occupied"), b"x").unwrap();
 
-        let error = save_to(&path, &dark()).unwrap_err();
+        let error = save_to(&path, None, &dark()).unwrap_err();
         let directory = dir.path().to_string_lossy().into_owned();
         assert!(
             error.detail().contains(&directory),
@@ -5776,9 +6757,9 @@ mod tests {
             "loading from {what} must fall back to defaults"
         );
 
-        let error = match save_to(path, &dark()) {
+        let error = match save_to(path, None, &dark()) {
             Err(error) => error,
-            Ok(()) => panic!("saving to {what} must be refused"),
+            Ok(_) => panic!("saving to {what} must be refused"),
         };
         assert!(
             error.detail().contains(expected),
@@ -5805,7 +6786,7 @@ mod tests {
         // document. The target must come back untouched: rejecting a symlink is
         // only meaningful if nothing was written through it.
         let target = dir.path().join("target.toml");
-        save_to(&target, &DesktopSettings::default()).unwrap();
+        save_to(&target, None, &DesktopSettings::default()).unwrap();
         let before = std::fs::read_to_string(&target).unwrap();
         let link = dir.path().join("as-a-symlink.toml");
         std::os::unix::fs::symlink(&target, &link).unwrap();
@@ -6026,7 +7007,7 @@ mod tests {
         // no-op, or this pin would describe a shape the app never writes.
         let dir = tempdir();
         let path = dir.path().join(SETTINGS_FILE_NAME);
-        save_to(&path, &DesktopSettings::default()).unwrap();
+        save_to(&path, None, &DesktopSettings::default()).unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), FRESH);
 
         // The same struct crosses the Tauri IPC, so its JSON shape is the
@@ -6618,7 +7599,7 @@ forms it is.";
 
         let dir = tempdir();
         let fresh = dir.path().join(SETTINGS_FILE_NAME);
-        save_to(&fresh, settings).unwrap();
+        save_to(&fresh, None, settings).unwrap();
         assert_free_of_sentinel(
             &format!("{what}: a freshly written document"),
             &std::fs::read_to_string(&fresh).unwrap(),
@@ -6836,7 +7817,7 @@ forms it is.";
                 // trip #827 names does take the value off disk.
                 None => {
                     dropped += 1;
-                    save_to(&path, &loaded).unwrap();
+                    save_to(&path, None, &loaded).unwrap();
                     assert_free_of_sentinel(
                         &format!("{leaf}: the document after a load-modify-save round trip"),
                         &std::fs::read_to_string(&path).unwrap(),
@@ -6846,7 +7827,7 @@ forms it is.";
                 // refused and the file is left exactly as the user wrote it.
                 Some(problem) => {
                     refused += 1;
-                    let error = save_to(&path, &loaded)
+                    let error = save_to(&path, None, &loaded)
                         .expect_err("a document this build cannot read must not be overwritten");
                     assert_eq!(
                         std::fs::read_to_string(&path).unwrap(),
@@ -6904,7 +7885,7 @@ forms it is.";
         assert_eq!(loaded.appearance.mode, AppearanceMode::System);
         assert_no_sink_carries_the_sentinel("an unowned key", &loaded);
 
-        save_to(&path, &loaded).unwrap();
+        save_to(&path, None, &loaded).unwrap();
         let raw = std::fs::read_to_string(&path).unwrap();
         // Measured, not tolerated in silence: the two unowned keys still hold
         // it and the owned one does not.
@@ -6966,9 +7947,13 @@ forms it is.";
         // SAFETY: the lock above serialises every test that touches this var.
         unsafe { std::env::set_var(SETTINGS_PATH_ENV, &path) };
         let snapshot = load_snapshot();
-        let saved = save(&snapshot.settings);
+        // What the webview sends when the user picks a theme: the document it
+        // was showing as the base, and that document with the one field changed.
+        let mut edited = snapshot.settings.clone();
+        edited.appearance.mode = AppearanceMode::Dark;
+        let saved = save(Some(&snapshot.settings), &edited);
         unsafe { std::env::remove_var(SETTINGS_PATH_ENV) };
-        saved.unwrap();
+        let written = saved.unwrap();
 
         // The reply `desktop_get_settings` would send, as JSON, exactly as the
         // bridge would receive it.
@@ -6982,16 +7967,25 @@ forms it is.";
         assert_eq!(snapshot.path, path.display().to_string());
         assert_eq!(snapshot.settings.appearance.mode, AppearanceMode::System);
 
-        // The reply `desktop_set_settings` would echo.
+        // The reply `desktop_set_settings` sends. Since issue #828 that is the
+        // document as written — re-read from the merge result — rather than an
+        // echo of its input, so it is the merge output this has to hold for.
         assert_free_of_sentinel(
-            "the `desktop_set_settings` echo",
-            &serde_json::to_string(&snapshot.settings).unwrap(),
+            "the `desktop_set_settings` reply",
+            &serde_json::to_string(&written).unwrap(),
         );
+        assert_eq!(written.appearance.mode, AppearanceMode::Dark);
 
-        // And the document the save actually wrote: the owned field is
-        // scrubbed, the unowned one is preserved, exactly as
+        // And the document the save actually wrote: the owned field the user
+        // changed is overwritten, the unowned one is preserved, exactly as
         // `a_key_this_schema_does_not_own_keeps_its_value_and_reaches_nothing_else`
         // establishes for the lower-level path.
+        //
+        // The user CHANGING the mode is what overwrites it. Since #828 a save
+        // that leaves a field alone leaves the file's value alone too, so a
+        // mode this build folded to `system` on load — a newer build's token —
+        // survives a zoom change; that is pinned by
+        // `a_value_this_build_folded_survives_a_save_that_did_not_touch_it`.
         let raw = std::fs::read_to_string(&path).unwrap();
         assert_eq!(
             raw.matches(SENTINEL).count(),
@@ -6999,7 +7993,7 @@ forms it is.";
             "unexpected document: {raw}"
         );
         assert!(
-            raw.contains("mode = \"system\""),
+            raw.contains("mode = \"dark\""),
             "unexpected document: {raw}"
         );
     }
@@ -7108,13 +8102,13 @@ forms it is.";
             );
             return;
         }
-        let unreadable = save_to(&path, &dark()).unwrap_err();
+        let unreadable = save_to(&path, None, &dark()).unwrap_err();
         set_mode(&path, 0o600);
 
         // A read-only parent: the read succeeds, so the sentinel has been in
         // this process's memory, and the failure is in `create_temp`.
         set_mode(dir.path(), 0o500);
-        let unwritable_dir = save_to(&path, &dark());
+        let unwritable_dir = save_to(&path, None, &dark());
         set_mode(dir.path(), 0o700);
 
         // The refusal to overwrite (issue #1072): the one error here whose
@@ -7128,13 +8122,13 @@ forms it is.";
             format!("version = 1\n[voice]\napi_key = \"{SENTINEL}\"\n= = =\n"),
         )
         .unwrap();
-        let refused = save_to(&unreadable_document, &dark())
+        let refused = save_to(&unreadable_document, None, &dark())
             .expect_err("an unreadable document must not be overwritten");
 
         let mut errors = vec![unreadable, refused];
         match unwritable_dir {
             Err(error) => errors.push(error),
-            Ok(()) => eprintln!(
+            Ok(_) => eprintln!(
                 "SKIP: this process can write into a 0o500 directory (running privileged)"
             ),
         }
@@ -7209,7 +8203,7 @@ level = 1.0
 ";
         let dir = tempdir();
         let path = dir.path().join(SETTINGS_FILE_NAME);
-        save_to(&path, &representative_document()).unwrap();
+        save_to(&path, None, &representative_document()).unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), STORED);
         assert_eq!(load_from(&path), representative_document());
     }
@@ -7227,7 +8221,7 @@ level = 1.0
     fn a_client_that_cannot_render_endpoints_cannot_delete_them() {
         let dir = tempdir();
         let path = dir.path().join(SETTINGS_FILE_NAME);
-        save_to(&path, &representative_document()).unwrap();
+        save_to(&path, None, &representative_document()).unwrap();
 
         // Exactly what `normalizeDesktopSettings` produces: version, appearance
         // and zoom, and no endpoints key at all.
@@ -7238,7 +8232,7 @@ level = 1.0
         }))
         .expect("a webview document omitting endpoints must deserialize");
         assert_eq!(from_webview.endpoints, None, "omitted means unspecified");
-        save_to(&path, &from_webview).unwrap();
+        save_to(&path, None, &from_webview).unwrap();
 
         let reloaded = load_from(&path);
         assert_eq!(
@@ -7377,7 +8371,7 @@ level = 1.0
             Some(SelectionFallback::UnknownDeck { .. })
         ));
 
-        save_to(&path, &loaded).unwrap();
+        save_to(&path, None, &loaded).unwrap();
         assert!(
             std::fs::read_to_string(&path)
                 .unwrap()
@@ -7478,7 +8472,7 @@ level = 1.0
             "a selection that IS in force must not print a fallback notice"
         );
 
-        save_to(&path, &loaded).unwrap();
+        save_to(&path, None, &loaded).unwrap();
         assert_eq!(
             load_from(&path)
                 .endpoints
@@ -7833,7 +8827,7 @@ level = 1.0
             loaded.endpoints, None,
             "the unreadable row takes its section"
         );
-        save_to(&path, &dark()).expect_err("the document must not be written over");
+        save_to(&path, None, &dark()).expect_err("the document must not be written over");
 
         // Not "the row survived", which was the old and much weaker claim: the
         // whole file is byte-identical, appearance and version included.
@@ -7862,8 +8856,12 @@ level = 1.0
         let link = dir.path().join("config");
         std::os::unix::fs::symlink(&real, &link).unwrap();
 
-        let error = save_to(&link.join(SETTINGS_FILE_NAME), &DesktopSettings::default())
-            .expect_err("a symlinked parent must be refused");
+        let error = save_to(
+            &link.join(SETTINGS_FILE_NAME),
+            None,
+            &DesktopSettings::default(),
+        )
+        .expect_err("a symlinked parent must be refused");
         assert!(error.detail().contains("symlink"), "{}", error.detail());
         assert!(
             !error.public().contains(link.to_str().unwrap()),
@@ -7893,6 +8891,7 @@ level = 1.0
 
         save_to(
             &parent.join(SETTINGS_FILE_NAME),
+            None,
             &DesktopSettings::default(),
         )
         .expect_err("a non-directory parent must be refused somewhere on the path");
@@ -7912,9 +8911,13 @@ level = 1.0
     #[test]
     fn an_ordinary_or_absent_parent_directory_is_accepted() {
         let dir = tempdir();
-        save_to(&dir.path().join(SETTINGS_FILE_NAME), &dark()).expect("an owned parent");
-        save_to(&dir.path().join("fresh").join(SETTINGS_FILE_NAME), &dark())
-            .expect("an absent parent is created, not refused");
+        save_to(&dir.path().join(SETTINGS_FILE_NAME), None, &dark()).expect("an owned parent");
+        save_to(
+            &dir.path().join("fresh").join(SETTINGS_FILE_NAME),
+            None,
+            &dark(),
+        )
+        .expect("an absent parent is created, not refused");
     }
 
     /// The foreign-uid arm of the parent check, tested as pure data the way
@@ -7951,7 +8954,7 @@ level = 1.0
     fn an_exposed_document_still_loads_and_the_next_save_republishes_it_owner_only() {
         let dir = tempdir();
         let path = dir.path().join(SETTINGS_FILE_NAME);
-        save_to(&path, &dark()).unwrap();
+        save_to(&path, None, &dark()).unwrap();
         set_mode(&path, 0o644);
         assert_eq!(mode_of(&path), 0o644);
 
@@ -7961,7 +8964,7 @@ level = 1.0
             "a world-readable document must still load"
         );
 
-        save_to(&path, &dark()).unwrap();
+        save_to(&path, None, &dark()).unwrap();
         assert_eq!(
             mode_of(&path),
             0o600,

@@ -1171,8 +1171,14 @@ export interface DeckRuntimeState {
   newAgentOrchestrations?: (deckId: string, path: string) => Promise<NewAgentOrchestrations>;
   /** The desktop app's own settings, and where they live (PRD #803). */
   getSettings: () => Promise<import("./lib/bridge").DesktopSettingsSnapshotDto>;
-  /** Persist the whole document; resolves to what was written. */
-  saveSettings: (settings: import("./lib/bridge").DesktopSettingsDto) => Promise<import("./lib/bridge").DesktopSettingsDto>;
+  /**
+   * Persist the whole document; resolves to what was written. `base` is the
+   * document the edit was made against, so only the edit is written (#828).
+   */
+  saveSettings: (
+    settings: import("./lib/bridge").DesktopSettingsDto,
+    base?: import("./lib/bridge").DesktopSettingsDto,
+  ) => Promise<import("./lib/bridge").DesktopSettingsDto>;
   /**
    * Test one deck end to end and resolve with a named state (PRD #741 M10).
    *

@@ -78,7 +78,19 @@ export interface DesktopSettingsState {
 
 export function useDesktopSettings(runtime: DeckRuntimeState): DesktopSettingsState {
   const { getSettings, saveSettings } = runtime;
-  const [settings, setSettings] = useState<DesktopSettingsDto>(DEFAULT_DESKTOP_SETTINGS);
+  const [settings, setShownSettings] = useState<DesktopSettingsDto>(DEFAULT_DESKTOP_SETTINGS);
+  // The document on screen, readable at call time (issue #828). A save sends it
+  // as the `base` its edit was made against, so the Rust side writes only what
+  // this edit changed and leaves every other field as the file holds it — which
+  // may be another app window's newer value. Kept beside the state rather than
+  // derived from it because `save` must read the value as of the click, not as
+  // of the last render its closure saw; every write to the state goes through
+  // `setSettings` below, so the two cannot drift.
+  const shown = useRef<DesktopSettingsDto>(DEFAULT_DESKTOP_SETTINGS);
+  const setSettings = useCallback((next: DesktopSettingsDto) => {
+    shown.current = next;
+    setShownSettings(next);
+  }, []);
   const [path, setPath] = useState<string>();
   const [loaded, setLoaded] = useState(false);
   // Whether a document actually came back, which `loaded` does NOT answer:
@@ -106,8 +118,9 @@ export function useDesktopSettings(runtime: DeckRuntimeState): DesktopSettingsSt
   // state — so a stale document could win twice over. Today the only
   // consequence is a stale appearance choice; it matters more once the document
   // holds a daemon endpoint (#741) or a backend selection (#802). The
-  // cross-process half of the same problem — two app windows racing on one
-  // field — is #828, and is not something a hook can fix.
+  // cross-process half of the same problem — two app windows each saving a copy
+  // loaded before the other's write — is #828, and the hook's part in that fix
+  // is `shown` above: each save names the document its edit was made against.
   const queue = useRef<Promise<void>>(Promise.resolve());
   const newest = useRef(0);
   // How many saves have come back accepted. A load that was already in flight
@@ -154,13 +167,19 @@ export function useDesktopSettings(runtime: DeckRuntimeState): DesktopSettingsSt
       .catch(() => undefined)
       .finally(() => { if (!cancelled) setLoaded(true); });
     return () => { cancelled = true; };
-  }, [getSettings]);
+  }, [getSettings, setSettings]);
 
   const save = useCallback((next: DesktopSettingsDto) => {
     // Applied first, written behind it. PRD #743 requires the appearance change
     // to be visible with no restart, and waiting for a disk write to repaint
     // would put a round trip between the click and the theme.
     edited.current = true;
+    // What this edit was made against, captured before `next` replaces it. The
+    // difference between the two IS the edit, and it is all the Rust side
+    // writes. Captured here rather than when the queued save runs: by then a
+    // response may have brought in another window's value, and diffing `next`
+    // against that would read this window's stale copy of it as a change.
+    const base = shown.current;
     setSettings(next);
     setSaveFailure(undefined);
 
@@ -170,7 +189,7 @@ export function useDesktopSettings(runtime: DeckRuntimeState): DesktopSettingsSt
     // settled, so the last choice made is the last one on disk. The inner
     // handlers never reject, so one failed save cannot break the chain for
     // every save after it.
-    queue.current = queue.current.then(() => saveSettings(next)
+    queue.current = queue.current.then(() => saveSettings(next, base)
       .then((written) => {
         // Any save that came back at all means the document on disk is one this
         // build can read: `save_to` refuses before writing otherwise. True of a
@@ -179,7 +198,9 @@ export function useDesktopSettings(runtime: DeckRuntimeState): DesktopSettingsSt
         accepted.current += 1;
         setDocumentProblem(undefined);
         // A superseded response is dropped rather than applied — it is an
-        // older document, and the user has already moved past it.
+        // older document, and the user has already moved past it. The newest
+        // one is the file as written, so applying it also shows what another
+        // window saved meanwhile (issue #828).
         if (newest.current === ticket) setSettings(written);
       })
       .catch((cause: unknown) => {
@@ -197,7 +218,7 @@ export function useDesktopSettings(runtime: DeckRuntimeState): DesktopSettingsSt
         // must not acquire a "saving it failed" preamble it has not earned.
         setSaveFailure(`This change is applied, but saving it failed, so it will not survive a restart. ${message}`);
       }));
-  }, [saveSettings]);
+  }, [saveSettings, setSettings]);
 
   // `edited` is a ref, and this reads it during render — safe here, and only
   // here, because it is monotonic (false to true, never back) and every write

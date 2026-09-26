@@ -2297,20 +2297,31 @@ async fn desktop_get_settings(
     Ok(settings::load_snapshot())
 }
 
-/// Persist the desktop app's settings document and echo back what was written.
+/// Persist the desktop app's settings document and return what was written.
 ///
 /// The whole document crosses the bridge, so the webview's read-modify-write is
 /// one round trip and the file on disk is always a document this build's schema
 /// produced.
 ///
-/// # The reply is the input, not the disk
+/// # `base` is what the edit was made against (issue #828)
 ///
-/// This echoes the document it was **given**, not the merged-and-reloaded state
-/// on disk — nothing here re-reads the file. So a caller does not observe a
-/// bumped `version`, a normalised value, or the unknown sections the merge
-/// preserved until the next [`desktop_get_settings`]. Harmless for appearance,
-/// where the input *is* the value the user chose; #741 and #802 must not build
-/// on the echo reflecting what was written.
+/// The webview sends the document it was showing when the user changed
+/// something alongside the changed one, and only the difference is written —
+/// so another app window's save, or a hand edit, made since this window loaded
+/// is not overwritten by this window's stale copy of fields it never touched.
+/// [`settings::save_to`] has the reasoning. Absent, the whole document is
+/// authoritative, which is what every save did before.
+///
+/// # The reply is the disk, not the input
+///
+/// It used to echo the document it was **given**. Since #828 it returns the
+/// merge result as written, which differs from the input exactly when another
+/// writer changed something this window had not seen — and that is the case the
+/// window most needs to learn about, so it can show the other window's edit
+/// rather than go on displaying a value the file no longer holds. The selection
+/// applied below is the written one for the same reason. What the reply still
+/// does not carry is an unknown section the merge preserved: `DesktopSettings`
+/// has nowhere to put one.
 ///
 /// # The accepted strings are length-bounded
 ///
@@ -2333,16 +2344,17 @@ async fn desktop_set_settings(
     webview: Webview,
     state: State<'_, DesktopState>,
     settings: DesktopSettings,
+    base: Option<DesktopSettings>,
 ) -> Result<DesktopSettings, String> {
     ensure_main_webview(&webview)?;
-    crate::settings::save(&settings).map_err(|error| {
+    let written = crate::settings::save(base.as_ref(), &settings).map_err(|error| {
         // The detail names the path and belongs in the app's own log; the
         // webview gets the sanitized half, the way connection errors already do.
         eprintln!("{}", error.detail());
         safe_message(error.public())
     })?;
-    apply_selection(&app, &state, &settings).await;
-    Ok(settings)
+    apply_selection(&app, &state, &written).await;
+    Ok(written)
 }
 
 /// The three credential commands (PRD #802 M4), and the one that is missing.

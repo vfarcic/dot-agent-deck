@@ -355,7 +355,10 @@ export function useDeckRuntime(): DeckRuntimeState {
   // capture-phase listener whose effect must not be torn down and re-registered
   // on every render.
   const setZoom = useCallback((level: number) => bridge.setZoom(level), [bridge]);
-  const saveSettings = useCallback((settings: DesktopSettingsDto) => bridge.saveSettings(settings), [bridge]);
+  const saveSettings = useCallback(
+    (settings: DesktopSettingsDto, base?: DesktopSettingsDto) => bridge.saveSettings(settings, base),
+    [bridge],
+  );
   // PRD #741 M10. Not wrapped in the `setError` bookkeeping `runAction` uses,
   // for the same reason `listProjects` is not: every outcome here is a
   // classified report the panel renders in place, and routing an unreachable
