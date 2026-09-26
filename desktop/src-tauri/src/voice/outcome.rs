@@ -1789,32 +1789,50 @@ pub enum DeckRefMatch {
 /// **The label is what a sentence says, never the id.** The id is a
 /// `deck-<16 hex>` hash minted for keying, so it is neither sayable nor shown.
 ///
-/// **The category words are not part of the reference** ([`DECK_CATEGORY_WORDS`],
+/// **The category words are not evidence for a deck** ([`DECK_CATEGORY_WORDS`],
 /// issue #1045). "daemon" is the New agent dialog's field heading and a word
 /// of the local label, "Local daemon", so under the word-subset pass a bare
 /// "daemon" — or "daemon build box" where the model kept only "daemon" —
-/// reached the local deck, although the user named no deck. They are dropped
-/// before either pass, so whatever resolves is distinguished by a word that is
-/// not one of them, and a reference made only of them matches nothing.
+/// reached the local deck, although the user named no deck. A reference made
+/// only of them matches nothing, and the loose pass runs on the reference
+/// without them, so whatever it reaches is distinguished by a word that is not
+/// one of them.
+///
+/// **But a category word can be part of a real name**, so the exact pass tries
+/// the reference WHOLE first and the stripped reference only when that finds
+/// nothing. With `daemon-build-box` and `build-box` both on screen, "daemon
+/// build box" is the first host's alias verbatim; stripped first, it became the
+/// second host's, and the other machine was chosen.
 pub fn resolve_deck_ref(spoken: &str, decks: &[VoiceDeck]) -> DeckRefMatch {
     let reference = deck_reference(spoken);
     if reference.is_empty() {
         return DeckRefMatch::None;
     }
+    let whole = normalize(spoken);
     let reference_words = words(&reference);
 
-    let mut exact: Vec<&VoiceDeck> = Vec::new();
-    let mut loose: Vec<&VoiceDeck> = Vec::new();
-    for deck in decks {
-        let names = deck_spoken_names(deck);
-        if names.iter().any(|name| normalize(name) == reference) {
-            exact.push(deck);
-        } else if names.iter().any(|name| word_subset(&reference_words, name)) {
-            loose.push(deck);
-        }
+    let named = |deck: &&VoiceDeck, reference: &str| {
+        deck_spoken_names(deck)
+            .iter()
+            .any(|name| normalize(name) == reference)
+    };
+    let mut hits: Vec<&VoiceDeck> = decks.iter().filter(|deck| named(deck, &whole)).collect();
+    if hits.is_empty() {
+        hits = decks
+            .iter()
+            .filter(|deck| named(deck, &reference))
+            .collect();
     }
-
-    let hits = if exact.is_empty() { loose } else { exact };
+    if hits.is_empty() {
+        hits = decks
+            .iter()
+            .filter(|deck| {
+                deck_spoken_names(deck)
+                    .iter()
+                    .any(|name| word_subset(&reference_words, name))
+            })
+            .collect();
+    }
     match hits.len() {
         0 => DeckRefMatch::None,
         1 => DeckRefMatch::One {
@@ -6867,6 +6885,43 @@ mod tests {
                 "ci@build-farm".to_string(),
             ])
         );
+    }
+
+    #[test]
+    fn voice_outcome_deck_ref_exact_name_beats_the_stripped_one() {
+        let fleet = vec![
+            deck("deck-local", "Local daemon", true),
+            deck("deck-daemon-box", "ops@daemon-build-box.example.com", false),
+            deck("deck-box", "ops@build-box.example.com", false),
+            deck("deck-bare", "ops@daemon.example.com", false),
+        ];
+        let one = |id: &str, label: &str| DeckRefMatch::One {
+            id: id.to_string(),
+            label: label.to_string(),
+        };
+        // The first host's alias, verbatim — not the second host's once
+        // "daemon" is dropped.
+        for said in ["daemon build box", "Daemon-Build-Box"] {
+            assert_eq!(
+                resolve_deck_ref(said, &fleet),
+                one("deck-daemon-box", "ops@daemon-build-box.example.com"),
+                "{said}"
+            );
+        }
+        // No name is said whole, so the stripped reference decides.
+        assert_eq!(
+            resolve_deck_ref("the build box", &fleet),
+            one("deck-box", "ops@build-box.example.com")
+        );
+        assert_eq!(
+            resolve_deck_ref("local daemon", &fleet),
+            one("deck-local", "Local daemon")
+        );
+        // A host whose name is a category word is not reached by that word
+        // alone: said bare it names no deck, and inside a longer reference the
+        // loose pass sees only the other words.
+        assert_eq!(resolve_deck_ref("daemon", &fleet), DeckRefMatch::None);
+        assert_eq!(resolve_deck_ref("daemon farm", &fleet), DeckRefMatch::None);
     }
 
     /// Scenario: the New agent dialog is open on the build box, and the user
