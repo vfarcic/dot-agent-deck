@@ -1432,7 +1432,8 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
              way `DeckShell` routes its own Close through `closeAgentView`: the
              `voice_off` row names `stopVoice`, and a button that reached the
              same behaviour by a second route would be exactly the residual
-             PRD #802 D10 records for the five unspoken capabilities. */
+             PRD #802 D10 recorded for the unspoken capabilities, which PRD
+             #1195 M1 then closed. */
           if (onRef.current || phaseRef.current === "unreleased") VOICE_ACTIONS.stopVoice.run({ stopVoice });
           else void turnOn();
         }}

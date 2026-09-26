@@ -40,7 +40,10 @@
 //!
 //! The one mechanical approximation to "did you forget a capability" is pinning
 //! a count of interactive controls, which PRD #802's Open Question 3 recommends
-//! against for this PR with its churn cost named. [`VOICE_REGISTRY_RULE`] says
+//! against for this PR with its churn cost named. PRD #1195 chose a narrower
+//! approximation instead and gave it a rule of its own — rule 18,
+//! [`crate::voice_capability_state`], which guards the STATE a capability owns
+//! rather than counting clicks. [`VOICE_REGISTRY_RULE`] says
 //! all of this at the failure itself, because the PRD's own Risks section is
 //! explicit that reading the guard as stronger is the risk.
 //!

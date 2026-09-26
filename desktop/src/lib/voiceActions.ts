@@ -56,7 +56,13 @@ import type { DeckView } from "../types";
  * **What still writes that state directly is a dismissal or an invariant, not
  * a control opening a capability**: a panel's own close, the launch flow
  * closing the editor it launched from, the deck keeping its selection on a
- * live agent.
+ * live agent. That line is drawn by `xtask/linkage-check` rule 18
+ * (`voice_capability_state.rs`, PRD #1195 M2): a setter named in an action
+ * context may be written elsewhere in the app shell only as a dismissal or
+ * under a written `voice-registry-exempt:` reason, and every `useState` there
+ * is registry-owned or carries one. Its own doc comment says what it cannot
+ * see — state outside the files it scans, and a capability reached through
+ * anything other than a `set*` identifier.
  *
  * # What the guard needs from this file, and what it will refuse
  *
