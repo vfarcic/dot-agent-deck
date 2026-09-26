@@ -740,18 +740,40 @@ fn relocated_endpoint_dirs(primary_dir: &Path, uid: u32) -> Vec<PathBuf> {
 }
 
 /// The directory to bind into once the per-uid one is taken: the first
-/// existing relocated directory, or a freshly created one.
+/// existing relocated directory, or a freshly created one — **claimed**
+/// ([`claim_relocated_dir`]) before it is returned.
 ///
 /// Creation is one non-recursive `mkdir(2)` at `0o700` on a name with 64 bits
 /// from the OS in it, which fails `EEXIST` on anything already there — so it
 /// cannot be steered into a directory someone else prepared — followed by
 /// [`crate::platform::fsperm::ensure_owner_only_dir`], which re-verifies it
 /// through a descriptor. A collision is retried with fresh digits.
+///
+/// Retried when the directory chosen vanishes before it can be claimed: its
+/// creator removed it, unclaimed, on converging elsewhere, and the re-list
+/// then finds where it went.
 #[cfg(unix)]
 fn relocated_bind_dir(primary_dir: &Path, uid: u32) -> std::io::Result<PathBuf> {
-    if let Some(existing) = relocated_endpoint_dirs(primary_dir, uid).into_iter().next() {
-        return Ok(existing);
+    for _ in 0..RELOCATION_ATTEMPTS {
+        let created = if relocated_endpoint_dirs(primary_dir, uid).is_empty() {
+            Some(create_relocated_dir(primary_dir)?)
+        } else {
+            None
+        };
+        if let Some(chosen) = converge_on_first(created, primary_dir, uid)? {
+            return Ok(chosen);
+        }
     }
+    Err(std::io::Error::other(format!(
+        "the relocated endpoint directory beside {} kept vanishing before it could be claimed \
+         after {RELOCATION_ATTEMPTS} attempts",
+        primary_dir.display()
+    )))
+}
+
+/// Make a fresh relocated directory beside `primary_dir`, owner-only.
+#[cfg(unix)]
+fn create_relocated_dir(primary_dir: &Path) -> std::io::Result<PathBuf> {
     use std::os::unix::fs::DirBuilderExt;
     let invalid = || {
         std::io::Error::new(
@@ -771,7 +793,7 @@ fn relocated_bind_dir(primary_dir: &Path, uid: u32) -> std::io::Result<PathBuf> 
         match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
             Ok(()) => {
                 crate::platform::fsperm::ensure_owner_only_dir(&dir)?;
-                return Ok(converge_on_first(dir, primary_dir, uid));
+                return Ok(dir);
             }
             Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(source) => return Err(source),
@@ -786,24 +808,74 @@ fn relocated_bind_dir(primary_dir: &Path, uid: u32) -> std::io::Result<PathBuf> 
     ))
 }
 
-/// After creating `created`, re-list and take the first relocated directory,
-/// as a caller that found existing ones would: two starters that each created
-/// one — only possible when they do not share a lock root — then converge on
-/// the same directory whenever each sees the other's. A `created` that loses
-/// is removed, or it would keep relocation sticky ([`needs_relocation`]) after
-/// the operator removes the directory actually in use. `remove_dir` removes
-/// only an empty directory, so a starter that already bound inside it keeps it.
+/// Re-list and claim the first relocated directory — or `created`, if the
+/// listing is somehow empty — as every selecting start does: two starters that
+/// each created one (only possible when they do not share a lock root) then
+/// converge on the same directory whenever each sees the other's. `Ok(None)`
+/// when the one chosen vanished before it could be claimed; the caller
+/// re-lists.
+///
+/// A `created` that loses is removed, or it would keep relocation sticky
+/// ([`needs_relocation`]) after the operator removes the directory actually in
+/// use. That is safe only because every selection claims first: `remove_dir`
+/// removes only an **empty** directory, and the claim is a file inside it, so
+/// a directory another start already selected — found as the first one before
+/// the sibling that now sorts ahead of it existed, and not yet bound in — is
+/// kept, and one removed first cannot then be claimed (issue #1173, PR #1349's
+/// third review).
 #[cfg(unix)]
-fn converge_on_first(created: PathBuf, primary_dir: &Path, uid: u32) -> PathBuf {
-    let chosen = relocated_endpoint_dirs(primary_dir, uid)
+fn converge_on_first(
+    created: Option<PathBuf>,
+    primary_dir: &Path,
+    uid: u32,
+) -> std::io::Result<Option<PathBuf>> {
+    let Some(chosen) = relocated_endpoint_dirs(primary_dir, uid)
         .into_iter()
         .next()
-        .unwrap_or_else(|| created.clone());
-    if chosen != created {
+        .or_else(|| created.clone())
+    else {
+        return Ok(None);
+    };
+    let claimed = claim_relocated_dir(&chosen)?;
+    if let Some(created) = created
+        && created != chosen
+    {
         let _ = std::fs::remove_dir(&created);
     }
-    chosen
+    Ok(claimed.then_some(chosen))
 }
+
+/// Mark `dir` as selected by some start, durably, so no converging creator
+/// removes it before that start binds inside it: create [`RELOCATION_CLAIM_FILE`]
+/// in it. `Ok(false)` when `dir` no longer exists — creating an entry inside a
+/// directory and `rmdir(2)` of it are atomic with respect to each other, so
+/// either the claim lands and the removal fails as not empty, or the removal
+/// lands and the claim fails `ENOENT`.
+///
+/// Durable rather than held for the start's lifetime, because the start that
+/// selects is often not the one that binds: the launcher selects, then spawns
+/// the daemon that binds.
+#[cfg(unix)]
+fn claim_relocated_dir(dir: &Path) -> std::io::Result<bool> {
+    use std::os::unix::fs::OpenOptionsExt;
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(dir.join(RELOCATION_CLAIM_FILE))
+    {
+        Ok(_) => Ok(true),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(source) => Err(source),
+    }
+}
+
+/// The file [`claim_relocated_dir`] creates inside a selected relocated
+/// directory.
+#[cfg(unix)]
+const RELOCATION_CLAIM_FILE: &str = "selected";
 
 /// How many fresh names [`relocated_bind_dir`] tries. A collision on 64 random
 /// bits is not a thing that happens by chance; the bound exists so a broken
@@ -1584,22 +1656,78 @@ mod tests {
         let theirs = make(&format!("dot-agent-deck-{uid}.0000000000000000"));
         let ours = make(&format!("dot-agent-deck-{uid}.ffffffffffffffff"));
 
-        assert_eq!(converge_on_first(ours.clone(), &primary, uid), theirs);
+        assert_eq!(
+            converge_on_first(Some(ours.clone()), &primary, uid).unwrap(),
+            Some(theirs.clone())
+        );
         assert!(
             !ours.exists(),
             "the losing directory must not be left behind"
         );
 
-        // Removing the one in use then leaves nothing to keep relocation sticky.
-        std::fs::remove_dir(&theirs).unwrap();
+        // Removing the one in use (and the claim converging left in it) then
+        // leaves nothing to keep relocation sticky.
+        std::fs::remove_dir_all(&theirs).unwrap();
         assert_eq!(needs_relocation(&primary, uid), None);
 
         // And a directory someone already bound inside is not removed.
         let theirs = make(&format!("dot-agent-deck-{uid}.0000000000000000"));
         let ours = make(&format!("dot-agent-deck-{uid}.ffffffffffffffff"));
         std::fs::write(ours.join("attach.sock"), b"").unwrap();
-        assert_eq!(converge_on_first(ours.clone(), &primary, uid), theirs);
+        assert_eq!(
+            converge_on_first(Some(ours.clone()), &primary, uid).unwrap(),
+            Some(theirs.clone())
+        );
         assert!(ours.join("attach.sock").exists());
+    }
+
+    /// Three starters that do not share a lock root, interleaved so a directory
+    /// another start already selected loses the sort to one made after it.
+    #[test]
+    fn a_directory_another_start_selected_survives_its_creator_converging() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = sandbox();
+        let uid = crate::platform::paths::current_uid();
+        let primary = root.path().join(format!("dot-agent-deck-{uid}"));
+        let make = |name: &str| {
+            let dir = root.path().join(name);
+            std::fs::create_dir(&dir).unwrap();
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+            dir
+        };
+
+        // Y makes its directory, then is delayed before it re-lists.
+        let y_created = make(&format!("dot-agent-deck-{uid}.ffffffffffffffff"));
+        // X starts, finds Y's directory as the only one, and selects it.
+        let x_selected = relocated_bind_dir(&primary, uid).unwrap();
+        assert_eq!(x_selected, y_created);
+        // Z starts too, finds nothing yet (it listed before Y's mkdir), and
+        // makes a directory that sorts first.
+        let z_created = make(&format!("dot-agent-deck-{uid}.0000000000000000"));
+        assert_eq!(
+            converge_on_first(Some(z_created.clone()), &primary, uid).unwrap(),
+            Some(z_created.clone())
+        );
+        // Y resumes and converges on Z's.
+        assert_eq!(
+            converge_on_first(Some(y_created.clone()), &primary, uid).unwrap(),
+            Some(z_created)
+        );
+
+        // X now binds where it prepared to.
+        assert!(
+            x_selected.is_dir(),
+            "the directory X selected was removed under it by its creator converging"
+        );
+        drop(bind_trusted(&x_selected.join("attach.sock")));
+
+        // The other half of the race: a directory removed before a start could
+        // claim it is reported vanished, so that start re-lists rather than
+        // returning a directory that is gone.
+        let gone = root
+            .path()
+            .join(format!("dot-agent-deck-{uid}.1111111111111111"));
+        assert!(!claim_relocated_dir(&gone).unwrap());
     }
 
     #[test]
