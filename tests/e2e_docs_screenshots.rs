@@ -43,11 +43,34 @@ fn html_dir() -> PathBuf {
     PathBuf::from(dir)
 }
 
+/// Launch the deck for a capture. No agent credential reaches it: these
+/// scenes need no real agent, and their frames are written out as HTML and
+/// PNGs, so an ambient `ANTHROPIC_API_KEY` has no business in the process
+/// that draws them. On Linux the launched environment is read back to prove
+/// it, since the harness would otherwise pass that key through by default.
 fn launch() -> TuiDeck {
-    TuiDeck::builder()
+    let deck = TuiDeck::builder()
         .with_pty_size(COLS, ROWS)
         .without_success_recording()
-        .launch_with_fixture("minimal")
+        .without_agent_credentials()
+        .launch_with_fixture("minimal");
+    #[cfg(target_os = "linux")]
+    {
+        let pid = deck
+            .child_pid()
+            .expect("the PTY backend reports the deck's pid");
+        let environ = std::fs::read(format!("/proc/{pid}/environ"))
+            .unwrap_or_else(|e| panic!("read the deck's environment: {e}"));
+        for entry in environ.split(|b| *b == 0) {
+            for key in common::AGENT_CREDENTIAL_ENV {
+                assert!(
+                    !entry.starts_with(format!("{key}=").as_bytes()),
+                    "{key} reached the capture's deck process"
+                );
+            }
+        }
+    }
+    deck
 }
 
 /// Wait until `ready` holds for the frame, render that same frame, and write
@@ -85,9 +108,11 @@ struct Agent {
     quiet_for_minutes: i64,
 }
 
-/// The four agents the `dashboard` scenario shows — the same names the desktop
-/// `connected` fixture carries (`desktop/src/data/fixture.ts`), so the TUI and
-/// desktop images of this scenario show one set of agents.
+/// The four agents the `dashboard` scenario shows. The desktop fixture's `docs`
+/// state (`docsAgents` in `desktop/src/data/fixture.ts`) carries the same
+/// names, agent types, directory, prompts, tools and ages, and the desktop
+/// status each of these hook states maps to, so the TUI and desktop images of
+/// this scenario depict one state. Change the two together.
 const DASHBOARD_AGENTS: &[Agent] = &[
     Agent {
         session: "docs-plan",
@@ -205,9 +230,12 @@ fn docs_screenshot_dashboard() {
         DASHBOARD_AGENTS.iter().all(|a| {
             grid.contains(a.name) && a.tool.is_none_or(|(_, detail)| grid.contains(detail))
         }) && lasts.iter().all(|l| grid.contains(l.as_str()))
-            // Idle and waiting cards blink their status dot; capture a frame
-            // where every one is lit so the image never shows a half-blink.
-            && grid.matches('●').count() >= DASHBOARD_AGENTS.len()
+            // Idle and waiting cards blink their status dot by drawing a space
+            // in its place (`flash_dot` in `src/ui.rs`), and nothing else on
+            // this screen draws a `●`, so exactly one per card means every dot
+            // is lit and the image never shows a half-blink. A future `●`
+            // elsewhere on the dashboard makes this time out, never pass early.
+            && grid.matches('●').count() == DASHBOARD_AGENTS.len()
     });
 }
 

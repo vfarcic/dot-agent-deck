@@ -363,6 +363,7 @@ pub struct TuiDeckBuilder {
     claude_trust_paths: Vec<String>,
     claude_trust_workdir: bool,
     suppress_success_recording: bool,
+    suppress_agent_credentials: bool,
     launch_subdir: Option<PathBuf>,
 }
 
@@ -563,6 +564,19 @@ impl TuiDeckBuilder {
     /// would make the last drop nondeterministically overwrite the primary cast.
     pub fn without_success_recording(mut self) -> Self {
         self.suppress_success_recording = true;
+        self
+    }
+
+    /// Launch with no agent credential in the deck's environment: every
+    /// variable in [`AGENT_CREDENTIAL_ENV`] is removed after every other layer,
+    /// `with_env` included, so the ambient `ANTHROPIC_API_KEY` [`INHERIT_PASS`]
+    /// would otherwise carry across `env_clear` never reaches the deck, the
+    /// daemon it lazy-spawns, or anything that daemon spawns. For a scenario
+    /// that runs no real agent and so has no use for one — issue #1322's docs
+    /// screenshots, whose frames are written out as HTML and PNGs. Opt-in: the
+    /// default launch is unchanged.
+    pub fn without_agent_credentials(mut self) -> Self {
+        self.suppress_agent_credentials = true;
         self
     }
 
@@ -794,6 +808,7 @@ impl TuiDeck {
             claude_trust_paths: Vec::new(),
             claude_trust_workdir: false,
             suppress_success_recording: false,
+            suppress_agent_credentials: false,
             launch_subdir: None,
         }
     }
@@ -1185,6 +1200,11 @@ impl TuiDeck {
         // `with_env` override (which we honour).
         for (k, v) in builder.extra_env {
             final_env.insert(k, v);
+        }
+        if builder.suppress_agent_credentials {
+            for k in AGENT_CREDENTIAL_ENV {
+                final_env.remove(k);
+            }
         }
         // Read AFTER the `with_env` layer, so a test that moves the state dir
         // still gets its own daemon's log dumped rather than a missing path.
@@ -1837,6 +1857,13 @@ impl TuiDeck {
     #[cfg(unix)]
     pub fn subscribe_events(&self) -> EventSub {
         EventSub::open(&self.attach_socket).expect("open SubscribeEvents stream")
+    }
+
+    /// The spawned deck's process id, when the PTY backend reports one. For a
+    /// test that inspects what the process was launched with, such as issue
+    /// #1322's check that a credential-free launch really is one.
+    pub fn child_pid(&self) -> Option<u32> {
+        self.child.process_id()
     }
 
     /// Returns the deck's per-test hook socket path. Synthetic-event
@@ -4784,6 +4811,11 @@ pub const OPENAI_API_KEY_ENV: &str = "OPENAI_API_KEY";
 /// the deck lazy-spawns the daemon that spawns the agent. The reasoning for each
 /// entry is at the use site.
 pub(crate) const INHERIT_PASS: [&str; 2] = ["PATH", ANTHROPIC_API_KEY_ENV];
+
+/// The agent credential variables [`TuiDeckBuilder::without_agent_credentials`]
+/// keeps out of a deck's environment: the one [`INHERIT_PASS`] carries across
+/// `env_clear`, and the OpenAI key a `with_env` could add back.
+pub(crate) const AGENT_CREDENTIAL_ENV: [&str; 2] = [ANTHROPIC_API_KEY_ENV, OPENAI_API_KEY_ENV];
 
 /// The ambient OpenAI API key, or `None` when unset, empty or whitespace-only.
 /// Same trim rule and same secret discipline as [`anthropic_api_key`]: returned

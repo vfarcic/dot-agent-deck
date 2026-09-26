@@ -25,8 +25,8 @@ Each image is named `<scenario>-<client>.png`, so the `dashboard` scenario produ
 
 It runs two stages:
 
-1. **TUI capture.** `cargo nextest run --features e2e --test e2e_docs_screenshots --run-ignored only` with an exact filter for the selected scenarios. Each capture drives the real binary in the L2 PTY harness (`tests/common/mod.rs`), inside the harness's isolated sandbox: its own `HOME`, sockets, state dir and lazily spawned daemon, so it never attaches to your running deck. It puts the scene on screen with synthetic hook events (no real agent and no credential), then writes the vt100 frame, every cell with its character, colours and attributes, as `<scenario>-tui.html` under `target/docs-screenshots/tui-html/`. That directory is emptied at the start of every run, so a stale HTML file is never rasterized.
-2. **Rasterize.** Playwright runs `desktop/playwright.screenshots.config.ts` in Chromium. It screenshots each desktop scenario off the production web build (`vite build`, then `vite preview` on port 4183) and loads each TUI HTML file and screenshots its `#terminal` element. Both clients' PNGs come out of one Chromium with one set of settings.
+1. **TUI capture.** `cargo nextest run --features e2e --test e2e_docs_screenshots --run-ignored only` with an exact filter for the selected scenarios. Each capture drives the real binary in the L2 PTY harness (`tests/common/mod.rs`), inside the harness's isolated sandbox: its own `HOME`, sockets, state dir and lazily spawned daemon, so it never attaches to your running deck. It launches the deck with `without_agent_credentials()`, so no agent credential is in its environment even when one is ambient on your machine (on Linux the capture reads `/proc/<pid>/environ` back to prove it), puts the scene on screen with synthetic hook events (no real agent), then writes the vt100 frame, every cell with its character, colours and attributes, as `<scenario>-tui.html` under `target/docs-screenshots/tui-html/`. That directory is emptied at the start of every run, so a stale HTML file is never rasterized.
+2. **Rasterize.** Playwright runs `desktop/playwright.screenshots.config.ts` in Chromium. It screenshots each desktop scenario off the production web build (`vite build`, then `vite preview` on port 4183) and loads each TUI HTML file and screenshots its `#terminal` element. Both clients' PNGs come out of one Chromium with one set of settings. The web build runs only when the selection includes a desktop scenario: the command sets `DAD_DOCS_SCREENSHOTS_WEB=0` otherwise and the config then starts no web server, so `--client tui` never waits on a `vite build`. Running the config by hand without that variable builds.
 
 ### Why the screenshot code cannot run by accident
 
@@ -42,7 +42,21 @@ It runs two stages:
 
 `cargo test-fast` checks the registry against both capture files: a scenario registered without a capture, or a capture that is not registered, fails `every_tui_scenario_has_exactly_one_capture_and_vice_versa` or its desktop twin.
 
-A feature both clients have should get the **same** scenario name on both, so the docs can show the two images as TUI | Desktop tabs. `dashboard` is the worked example: the TUI's four synthetic agents carry the names of the four agents in the desktop's `connected` fixture.
+A feature both clients have should get the **same** scenario name on both, so the docs can show the two images as TUI | Desktop tabs, and the two images should depict **the same state**. `dashboard` is the worked example: `DASHBOARD_AGENTS` in `tests/e2e_docs_screenshots.rs` and `docsAgents` in `desktop/src/data/fixture.ts` (the fixture's `docs` state, `/?fixture=1&state=docs`) carry the same names, agent types, working directory (`/home/dev/storefront`), prompts, active tools and ages, and every desktop agent has an uptime so that column is not blank. Change the two lists together.
+
+Give a docs scenario its own fixture state rather than reusing or editing a shared one: `connected` is what the desktop unit and snapshot tests are written against, and it carries demo-run paths such as `/dev/active/dot-agent-deck-gui` that do not belong in docs.
+
+Statuses do not have the same vocabulary in both clients, so give each desktop agent the status live mode would show for the TUI's state, from `DAEMON_STATUS` in `desktop/src/lib/bridge.ts`:
+
+| TUI card status (the hook event `dashboard` sends for it) | daemon status | desktop status |
+| --- | --- | --- |
+| Working (`tool_start`) | `working` | `running` (RUNNING) |
+| Needs Input (`waiting_for_input`) | `waiting_for_input` | `waiting` (WAITING) |
+| Idle (`idle`) | `idle` | `waiting` (WAITING) |
+
+The desktop folds Idle and Needs Input into one status, so the two images of `dashboard` read 2 working / 1 waiting / 1 idle in the TUI and 2 running / 2 waiting on the desktop. That is the same state, not a mismatch.
+
+**An agent-backed scenario must redact before it writes anything.** Today's scenes run no agent, so no frame can hold a secret. A scenario added later that runs a real agent in a pane must replace sensitive cells (credentials, tokens, real home paths, anything from the agent's environment) before it writes the HTML and the PNGs, because both are committed and published.
 
 ## How the output is made deterministic
 
@@ -56,7 +70,7 @@ Common to both clients:
 
 Desktop:
 
-- Fixture data only, with fixed names. The fixture's "DEMO DATA" banner is hidden in the image through the screenshot's `style` option, because it tells a developer the screen is not a live deck, which is not something a docs reader needs.
+- Fixture data only, with fixed names. Scenario states the TUI also shows use a docs-only fixture state (see [Adding a scenario](#adding-a-scenario)). The fixture's "DEMO DATA" banner is hidden in the image through the screenshot's `style` option, because it tells a developer the screen is not a live deck, which is not something a docs reader needs.
 - The clock is frozen with `page.clock.setFixedTime` at 2026-09-01T12:00:00Z before the page loads. The fixture computes ages as `Date.now()` minus a fixed number of minutes and the overview prints them relative to `Date.now()`, so every age reads the same on every run.
 - The pointer is parked at the bottom-left corner of the viewport before the shot, so no hover tooltip from the last click is in the picture.
 
@@ -65,7 +79,7 @@ TUI:
 - A fixed 120×32 terminal and a fixed palette (`Palette::default()` in `xtask/screenshots/src/terminal_html.rs`), 14px font, line height 1.2. At that line height DejaVu Sans Mono's box-drawing glyphs join up vertically.
 - Synthetic hook events are sent one at a time, each confirmed on screen before the next, because the daemon handles each hook connection on its own task and would otherwise apply them in no fixed order. Card order and state are then the same every run.
 - The TUI's clock cannot be frozen from outside the binary, so every agent's age is a whole number of hours and minutes: the card prints `1h 5m` from an hour up and `5m 12s` below it, so only hour-scale ages survive the seconds a capture takes. The events are stamped at the start of a minute and the readiness check names the exact `Last:` labels, so a capture that ever outlived the ~59 seconds before a label rolls over times out rather than writing a wrong image.
-- Idle and waiting cards blink their status dot. The readiness check requires every dot to be lit, and because it runs against the frame that is written, the image never shows half a blink.
+- Idle and waiting cards blink their status dot by drawing a space in its place. Nothing else on the dashboard draws a `●`, so the readiness check requires exactly one per agent, which means every dot is lit; because it runs against the frame that is written, the image never shows half a blink.
 - The hardware cursor is not drawn.
 
 ## Known limits

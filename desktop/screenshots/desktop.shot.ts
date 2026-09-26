@@ -9,15 +9,16 @@ import { desktopScenario } from "./support";
  */
 
 /** Load a fixture state and open the agent overview through its rail control. */
-async function overview(page: Page, state: "connected" | "empty"): Promise<void> {
+async function overview(page: Page, state: "docs" | "empty"): Promise<void> {
   await page.goto(`/?fixture=1&state=${state}`);
   await expect(page.getByRole("complementary", { name: "Primary navigation" })).toBeVisible();
   await page.getByTestId("open-overview").click();
 }
 
-// The same four agents the TUI `dashboard` image shows.
+// The same four agents, in the same states, the TUI `dashboard` image shows —
+// the fixture's `docs` state, never the shared `connected` one.
 desktopScenario("dashboard", async (page) => {
-  await overview(page, "connected");
+  await overview(page, "docs");
   await expect(page.locator(".overview-row")).toHaveCount(4);
 });
 

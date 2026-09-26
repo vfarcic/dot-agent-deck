@@ -59,6 +59,11 @@ export async function fontsSettled(page: Page): Promise<void> {
  */
 export function desktopScenario(name: string, prepare: (page: Page) => Promise<void>): void {
   test(`desktop ${name}`, async ({ page }) => {
+    // A run told it needs no web build starts no server, so a desktop scenario
+    // selected anyway would only fail on a refused connection; say why instead.
+    if (process.env.DAD_DOCS_SCREENSHOTS_WEB === "0") {
+      throw new Error("DAD_DOCS_SCREENSHOTS_WEB=0 skips the web build, so no desktop scenario can run");
+    }
     await page.clock.setFixedTime(FROZEN_NOW);
     await prepare(page);
     // Park the pointer where nothing reacts to it, so a hover tooltip from the

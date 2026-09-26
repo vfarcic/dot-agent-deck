@@ -88,6 +88,12 @@ pub struct RenderOptions {
     pub palette: Palette,
     /// CSS font stack. The first family that is installed wins, so the
     /// maintainer doc names the one the committed images were made with.
+    ///
+    /// It is written into the page's `<style>` element, so a value holding
+    /// anything but family names — letters, digits, spaces, commas, quotes,
+    /// `-` and `_` — is replaced by [`DEFAULT_FONT_FAMILY`] rather than
+    /// written: a `<` could close the element and a `;` or `}` could start a
+    /// rule of its own. See [`font_family_or_default`].
     pub font_family: String,
     /// Font size in CSS pixels.
     pub font_size_px: u16,
@@ -99,11 +105,27 @@ pub struct RenderOptions {
     pub padding_px: u16,
 }
 
+/// The font stack the committed TUI images were made with.
+pub const DEFAULT_FONT_FAMILY: &str = "\"DejaVu Sans Mono\", \"Liberation Mono\", monospace";
+
+/// `stack` when it is made only of characters a list of font family names
+/// needs, and [`DEFAULT_FONT_FAMILY`] otherwise. The check is an allowlist,
+/// not an escape: CSS inside `<style>` has no escaping that also stops the
+/// HTML parser closing the element, so the only safe value is one that holds
+/// no markup or CSS punctuation at all.
+pub fn font_family_or_default(stack: &str) -> &str {
+    let safe = !stack.trim().is_empty()
+        && stack
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, ' ' | ',' | '"' | '\'' | '-' | '_'));
+    if safe { stack } else { DEFAULT_FONT_FAMILY }
+}
+
 impl Default for RenderOptions {
     fn default() -> Self {
         Self {
             palette: Palette::default(),
-            font_family: "\"DejaVu Sans Mono\", \"Liberation Mono\", monospace".to_string(),
+            font_family: DEFAULT_FONT_FAMILY.to_string(),
             font_size_px: 14,
             line_height: 1.2,
             padding_px: 12,
@@ -261,7 +283,7 @@ pub fn render_page(screen: &vt100::Screen, title: &str, options: &RenderOptions)
         pad = options.padding_px,
         bg = hex(palette.background),
         fg = hex(palette.foreground),
-        font = options.font_family,
+        font = font_family_or_default(&options.font_family),
         size = options.font_size_px,
         lh = options.line_height,
     );
@@ -415,5 +437,39 @@ mod tests {
             render_page(a.screen(), "t", &options),
             render_page(b.screen(), "t", &options)
         );
+    }
+
+    #[test]
+    fn a_font_family_cannot_close_the_style_element_or_add_a_rule() {
+        let parser = screen(1, 4, b"x");
+        for hostile in [
+            "monospace</style><script>alert(1)</script>",
+            "monospace; } body { display: none",
+            "monospace\n</STYLE>",
+            "",
+        ] {
+            let options = RenderOptions {
+                font_family: hostile.to_string(),
+                ..RenderOptions::default()
+            };
+            let page = render_page(parser.screen(), "t", &options);
+            assert_eq!(page.matches("</style>").count(), 1, "{hostile:?}");
+            assert!(
+                !page.to_ascii_lowercase().contains("<script"),
+                "{hostile:?}"
+            );
+            assert!(!page.contains("display: none"), "{hostile:?}");
+            assert!(
+                page.contains(&format!("font-family: {DEFAULT_FONT_FAMILY};")),
+                "{hostile:?}"
+            );
+        }
+        // A genuine stack is written as given.
+        let options = RenderOptions {
+            font_family: "'Fira Code', monospace".to_string(),
+            ..RenderOptions::default()
+        };
+        let page = render_page(parser.screen(), "t", &options);
+        assert!(page.contains("font-family: 'Fira Code', monospace;"));
     }
 }

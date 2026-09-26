@@ -28,6 +28,12 @@ import { defineConfig, devices } from "@playwright/test";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 
+// `cargo docs-screenshots` sets this to "0" when no desktop scenario is
+// selected (`WEB_BUILD_ENV` in `xtask/screenshots/src/lib.rs`), so a
+// `--client tui` run rasterizes the TUI HTML without a `vite build` nothing
+// would load. Unset — a hand-run of this config — builds.
+const NEEDS_WEB = process.env.DAD_DOCS_SCREENSHOTS_WEB !== "0";
+
 // Its own port, so a screenshot run and a `pnpm test:browser` run on the same
 // machine do not serve each other's bundle.
 const PORT = 4183;
@@ -60,7 +66,7 @@ export default defineConfig({
     video: "off",
   },
   projects: [{ name: "chromium" }],
-  webServer: {
+  webServer: NEEDS_WEB ? {
     // Always a fresh build, never a reused server: an image of a stale bundle
     // would be committed as documentation. See `playwright.config.ts` for why
     // the POSIX form uses the local `vite` bin and `exec`.
@@ -73,5 +79,5 @@ export default defineConfig({
     timeout: 180_000,
     stdout: "pipe",
     stderr: "pipe",
-  },
+  } : undefined,
 });

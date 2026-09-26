@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
 use xtask_screenshots::scenarios::{self, Client, SCENARIOS, Scenario};
-use xtask_screenshots::{OUT_DIR_ENV, TUI_HTML_DIR_ENV};
+use xtask_screenshots::{OUT_DIR_ENV, TUI_HTML_DIR_ENV, WEB_BUILD_ENV};
 
 const USAGE: &str = "\
 usage: cargo docs-screenshots [--list] [--scenario <name>]... [--client tui|desktop]... [--out <dir>]
@@ -241,13 +241,15 @@ fn generate(args: &Args) -> Result<Vec<PathBuf>, String> {
             playwright.display()
         ));
     }
+    let needs_web = pairs.iter().any(|(_, c)| *c == Client::Desktop);
     run(
         Command::new(&playwright)
             .current_dir(&desktop)
             .args(["test", "-c", "playwright.screenshots.config.ts", "--grep"])
             .arg(playwright_grep(&pairs))
             .env(OUT_DIR_ENV, &out)
-            .env(TUI_HTML_DIR_ENV, &html_dir),
+            .env(TUI_HTML_DIR_ENV, &html_dir)
+            .env(WEB_BUILD_ENV, if needs_web { "1" } else { "0" }),
         "rasterize (Playwright Chromium)",
     )?;
 

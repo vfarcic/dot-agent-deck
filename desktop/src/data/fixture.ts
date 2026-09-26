@@ -43,7 +43,7 @@ export const FIXTURE_UNREACHABLE_DAEMON_ID = "ci@runner-7";
 export const FIXTURE_PENDING_DAEMON_ID = "ops@edge-3";
 
 /** Which scenario `createFixtureFleet` builds; selected by `?state=`. */
-export type FixtureState = "connected" | "disconnected" | "error" | "empty" | "crowded" | "fleet";
+export type FixtureState = "connected" | "disconnected" | "error" | "empty" | "crowded" | "fleet" | "docs";
 
 export const DEFAULT_PROFILES: AgentProfile[] = [
   {
@@ -647,6 +647,28 @@ const crowdedAgents: AgentSession[] = [
 ];
 
 /**
+ * The `?fixture=1&state=docs` scenario: the four agents the TUI half of the
+ * docs screenshots drives into the dashboard with synthetic hook events
+ * (`DASHBOARD_AGENTS` in `tests/e2e_docs_screenshots.rs`, issue #1322), so the
+ * TUI and desktop images of the `dashboard` scenario depict ONE state. Names,
+ * agent types, directory, prompts, tools and ages are the TUI's; each status is
+ * what live mode maps the TUI's hook state to (`DAEMON_STATUS` in
+ * `lib/bridge.ts`), which folds the TUI's Idle and Needs Input into `waiting`
+ * and its Working into `running`. Keep the two lists in step when either moves.
+ *
+ * Separate from `agents` on purpose: the `connected` scenario is what the unit
+ * and snapshot tests are written against, and a docs image must not be able to
+ * move them.
+ */
+const DOCS_CWD = "/home/dev/storefront";
+const docsAgents: AgentSession[] = [
+  crowdedAgent({ id: "1", displayName: "Plan / architecture", role: "Claude code", cli: "claude", status: "waiting", cwd: DOCS_CWD, toolCount: 0, upForMinutes: 150, quietForMinutes: 135, lastUserPrompt: "Map the checkout flow and propose a retry design.", tab: { kind: "dashboard" } }),
+  crowdedAgent({ id: "2", displayName: "Desktop implementation", role: "Codex", cli: "codex", status: "running", cwd: DOCS_CWD, toolCount: 0, upForMinutes: 90, quietForMinutes: 65, activeTool: "Edit", activeToolDetail: "src/components/RetryPayment.tsx", lastUserPrompt: "Add the retry action to the checkout view.", tab: { kind: "dashboard" } }),
+  crowdedAgent({ id: "3", displayName: "Contract review", role: "Claude code", cli: "claude", status: "running", cwd: DOCS_CWD, toolCount: 0, upForMinutes: 95, quietForMinutes: 70, activeTool: "Bash", activeToolDetail: "cargo test checkout_retry", lastUserPrompt: "Check the payment API for breaking changes.", tab: { kind: "dashboard" } }),
+  crowdedAgent({ id: "4", displayName: "User-path verification", role: "Open code", cli: "opencode", status: "waiting", cwd: DOCS_CWD, toolCount: 0, upForMinutes: 100, quietForMinutes: 80, lastUserPrompt: "Walk the checkout path and report failures.", tab: { kind: "dashboard" } }),
+];
+
+/**
  * `empty` means CONNECTED WITH ZERO AGENTS — the first-run experience — and
  * not a daemon that is down. It used to fall through to the `disconnected`
  * branch, so `?fixture=1&state=empty` rendered a disconnected banner over an
@@ -863,36 +885,39 @@ export function createFixtureSnapshot(state: FixtureState = "connected"): DeckSn
   // asking for one gets the deck the single-deck screens are on — never the
   // disconnected fall-through an unlisted state would otherwise land in.
   if (state === "fleet") return createFixtureFleet(state)[0];
-  const connected = state === "connected" || state === "crowded" || state === "empty";
+  const connected = state === "connected" || state === "crowded" || state === "empty" || state === "docs";
   const connection = connected
     ? { status: "connected" as const, deckId: FIXTURE_DAEMON_ID, socketPath: FIXTURE_DAEMON_ID, message: state === "empty" ? "Deck responding · no agents running" : "Deck responding" }
     : state === "error"
       ? { status: "error" as const, message: "Protocol handshake failed. Desktop expects v6; deck reported v5." }
       : { status: "disconnected" as const, message: "No deck is listening on the configured socket." };
 
-  const fleet = state === "empty" ? [] : state === "crowded" ? crowdedAgents : agents;
+  const fleet = state === "empty" ? [] : state === "crowded" ? crowdedAgents : state === "docs" ? docsAgents : agents;
+  // The docs scenario carries only what its screenshots show, so nothing from
+  // the demo run (its worktree, stages, handoffs, evidence) leaks into one.
+  const docs = state === "docs";
 
   return {
     runId: "run_7f24a",
     repo: "dot-agent-deck",
     branch: "codex/visual-control-deck",
-    worktree: "/dev/active/dot-agent-deck-gui",
+    worktree: docs ? DOCS_CWD : "/dev/active/dot-agent-deck-gui",
     connection,
-    health: state === "connected" || state === "crowded" ? "healthy" : state === "error" ? "failed" : "idle",
+    health: state === "connected" || state === "crowded" || docs ? "healthy" : state === "error" ? "failed" : "idle",
     elapsed: "16:42",
     spend: 2.57,
     currentNode: 4,
     totalNodes: 6,
     currentAttempt: 1,
     paused: false,
-    stages: state === "empty" ? [] : stages.map((stage) => ({ ...stage })),
+    stages: state === "empty" || docs ? [] : stages.map((stage) => ({ ...stage })),
     agents: fleet.map((agent) => ({ ...agent })),
-    handoffs: [
+    handoffs: docs ? [] : [
       { id: "dlg-demo-3", toRole: "Reviewer", orchestration: "dot-agent-deck", taskPreview: "Review the terminal lifecycle change; report findings only.", status: "dispatched", respawned: true, at: "14:41:22" },
       { id: "dlg-demo-2", toRole: "Builder", orchestration: "dot-agent-deck", taskPreview: "Implement the Tauri client as a second daemon surface.", status: "done", respawned: true, at: "14:40:58" },
       { id: "dlg-demo-1", toRole: "Tester", orchestration: "dot-agent-deck", taskPreview: "Write the failing bridge test for listener disposal.", status: "failed", respawned: false, reason: "worker respawn failed: command not found", at: "14:33:07" },
     ],
-    evidence: state === "empty" ? [] : evidence.map((item) => ({ ...item })),
+    evidence: state === "empty" || docs ? [] : evidence.map((item) => ({ ...item })),
     profiles: DEFAULT_PROFILES.map((profile) => ({ ...profile })),
   };
 }
