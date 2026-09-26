@@ -666,7 +666,7 @@ Two consequences of "untouched" are worth knowing before you go looking for a fi
 
 ### The summary file could not be written
 
-When the daemon cannot write `.dot-agent-deck/work-done-<role>.md` — no working directory recorded for the pane, the `.dot-agent-deck` directory cannot be created, or the write itself fails — it does **not** tell the orchestrator to read that path. It says the file is unavailable and inlines the worker's report into the feedback instead. That matters because the path is keyed by role name and reused for every delegation to that role: pointing at it after a failed write hands the orchestrator the previous delegation's report, which is well-formed, from the right role, and for the wrong task. An inlined report loses its Markdown formatting (the feedback is collapsed to a single line) and is truncated past 4000 characters; the worker still holds the full text.
+When the daemon cannot write `.dot-agent-deck/work-done-<role>.md` — no working directory recorded for the pane, the `.dot-agent-deck` directory cannot be created, or the write itself fails — it does **not** tell the orchestrator to read that path. It says the file is unavailable and inlines the worker's report into the feedback instead. That matters because the path is keyed by role name and reused for every delegation to that role: pointing at it after a failed write hands the orchestrator the previous delegation's report, which is well-formed, from the right role, and for the wrong task. An inlined report loses its Markdown formatting, because the feedback is collapsed to a single line.
 
 ### Prompt template is not being applied
 

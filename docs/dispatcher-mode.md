@@ -78,7 +78,7 @@ Delivery is to a **live pane**, and nothing is stored on the way. If the dispatc
 
 The unit's actual work is untouched by that: it is still committed on the unit's own branch and its directory is still on disk, exactly as it would have been. What is lost is the summary of it.
 
-Closing the deck window is a *detach*, not a close — your panes keep running in the daemon, so a report that lands while you are away is in the dispatcher pane waiting when you come back. Moving around the deck costs nothing either. And a report only ever goes to the agent that asked for the work: if that pane was closed and something else has since taken its place, the report is refused rather than handed to a stranger.
+Closing the deck window is a *detach*, not a close — your panes keep running in the daemon, so a report that lands while you are away is in the dispatcher pane waiting when you come back. Moving around the deck costs nothing either.
 
 ## Pointing a unit at the right thing
 
@@ -96,7 +96,7 @@ Closing a unit's tab removes that unit's copy of the repo. Your own repository i
 
 If a unit still has **uncommitted changes**, closing it leaves its directory on disk instead of deleting it, so the work is recoverable. A leftover directory costs disk space; a deleted one costs work.
 
-The close confirmation tells you when that is about to happen, and where: before you answer it, the dialog names the directory the work would be kept in. That warning is a forecast — the unit is still running while you read it, so it can commit its work between the dialog and the close — so the deck checks again once the unit has actually stopped, and the status line afterwards reports what really happened. A unit whose copy turned out to be clean is simply removed and nothing is said, which is why the message appearing is worth reading. If you dismiss the status line and want the path back, `dot-agent-deck worktree list` reports every worktree the deck knows about.
+The close confirmation tells you when that is about to happen, and names the directory the work would be kept in. After the close, the status line reports what actually happened; a unit whose copy turned out to be clean is simply removed and nothing is said. If you dismiss the status line and want the path back, `dot-agent-deck worktree list` reports every worktree the deck knows about.
 
 The unit's branch (`agent/dispatch-<name>`) always survives, since it may hold committed work. Dispatching the *same name* again is therefore refused, telling you the branch is there — delete it with `git branch -D agent/dispatch-<name>` when you are done, or use a different name.
 
