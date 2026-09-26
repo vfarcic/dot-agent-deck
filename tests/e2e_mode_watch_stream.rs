@@ -29,7 +29,7 @@ use spec::spec;
 #[test]
 fn mode_006_watch_pane_streams_output_before_the_command_exits() {
     let deck = TuiDeck::launch_with_fixture("mode-watch-stream");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     // Ctrl+N → directory picker → current dir → new-pane form → the fixture's
     // single mode → Submit, mirroring the flow the tab-strip L2 tests use.

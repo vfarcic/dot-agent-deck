@@ -93,7 +93,7 @@ fn selection_015_tab_round_trip_clears_highlight_real_binary() {
     let deck = TuiDeck::builder()
         .with_pty_size(120, 40)
         .launch_with_fixture("modes");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
     let work = deck.workdir().to_path_buf();
     let agent = write_card_agent(&work);
 
@@ -108,11 +108,11 @@ fn selection_015_tab_round_trip_clears_highlight_real_binary() {
 
     // Detach to Normal mode on the Mode tab, then switch to the Dashboard
     // (Left → CycleTabPrev → tab 0). The Mode agent pane stays focused. The
-    // dashboard is identified by its stable `session(s)` content header (the
+    // dashboard is identified by its stable `agent(s)` content header (the
     // card title is the random temp-dir basename).
     deck.send_bytes(b"\x04"); // Ctrl+D → Normal mode (still on the Mode tab)
     deck.send_bytes(b"\x1b[D"); // Left → previous tab → Dashboard
-    deck.wait_for_string("session(s)"); // the mode-agent card is on the Dashboard
+    deck.wait_for_string("agent(s)"); // the mode-agent card is on the Dashboard
 
     // Arm the highlight on the Dashboard: `j` activates the selection on the
     // first card, painting the `▸` marker (and mirroring focus to that card's
@@ -124,9 +124,9 @@ fn selection_015_tab_round_trip_clears_highlight_real_binary() {
     // back to the Dashboard (Left → CycleTabPrev). The Mode agent pane remains
     // the focused pane on return (steady state — no focus transition).
     deck.send_bytes(b"\x1b[C"); // Right → next tab → Mode tab
-    deck.wait_for_absence("session(s)"); // left the Dashboard (Mode tab shown)
+    deck.wait_for_absence("agent(s)"); // left the Dashboard (Mode tab shown)
     deck.send_bytes(b"\x1b[D"); // Left → previous tab → Dashboard
-    deck.wait_for_string("session(s)"); // confirm we are back on the Dashboard
+    deck.wait_for_string("agent(s)"); // confirm we are back on the Dashboard
 
     // SC1: no card may carry the `▸` selection highlight after the round-trip.
     // Under the pre-fix behavior the restored steady-state focus re-armed the
@@ -166,7 +166,7 @@ fn selection_019_enter_paints_highlight_on_orchestration_real_binary() {
     let deck = TuiDeck::builder()
         .with_pty_size(120, 40)
         .launch_with_fixture("orch-deck");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     // Open the orchestration tab (Dashboard + Orchestration = the ≥2 tabs the
     // round-trip needs). Its two `cat` role panes render as deck cards.

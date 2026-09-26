@@ -21,8 +21,8 @@ use spec::spec;
 
 /// Open the directory picker (Ctrl+N) from the dashboard and wait for it.
 fn open_picker(deck: &TuiDeck) {
-    deck.wait_for_string("No active sessions");
-    deck.send_bytes(b"\x0e"); // Ctrl+N → New Pane → directory picker
+    deck.wait_for_string("No active agents");
+    deck.send_bytes(b"\x0e"); // Ctrl+N → New Agent → directory picker
     deck.wait_for_string("Select Directory");
     deck.wait_for_string("childdir"); // fixture's known subdir row is listed
 }
@@ -113,7 +113,7 @@ fn picker_001_click_cancel_closes() {
     click_target(&deck, "[Cancel]");
 
     // Picker closed → dashboard returns.
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 }
 
 /// Scenario: Open the picker and click its `[Confirm]` button. It must

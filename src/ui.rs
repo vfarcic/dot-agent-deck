@@ -24071,6 +24071,28 @@ mod tests {
         UiState::default()
     }
 
+    /// Scenario: Open the schedule manager with no configured entries and
+    /// inspect its rendered title. The dialog must call the collection
+    /// "Schedules" even when the list is empty.
+    #[test]
+    fn schedule_manager_title_uses_glossary_word() {
+        let ui = default_ui();
+        let buffer = draw_to_buffer(80, 24, |frame| {
+            render_scheduled_tasks(frame, &ui);
+        });
+        let area = buffer.area();
+        let mut rendered = String::new();
+        for y in 0..area.height {
+            for x in 0..area.width {
+                rendered.push_str(buffer[(x, y)].symbol());
+            }
+        }
+        assert!(
+            rendered.contains(" Schedules "),
+            "schedule manager must render the Schedules title: {rendered}"
+        );
+    }
+
     /// Issue #945 made the star prompt's repo identity a one-line seam a fork
     /// can re-point, so the popup has to fit whatever it is pointed at rather
     /// than clipping the repository it is asking the user to star. Upstream's

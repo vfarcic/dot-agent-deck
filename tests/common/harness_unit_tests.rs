@@ -4790,14 +4790,14 @@ fn the_opencode_env_key_path_is_offered_only_for_an_anthropic_model() {
 /// `MID_REPAINT` is that instant: the title `New Schedule` is on screen and
 /// `[Submit]` is not. `SETTLED` is the same modal one flush later.
 const MID_REPAINT: &str = "\
- dot-agent-deck — 0 session(s)                 \n\
+ dot-agent-deck — 0 agent(s)                   \n\
     ┌─────────── New Schedule ───────────┐     \n\
     │ Command: cat                       │     \n\
     │                                    │     \n\
     └────────────────────────────────────┘     \n";
 
 const SETTLED: &str = "\
- dot-agent-deck — 0 session(s)                 \n\
+ dot-agent-deck — 0 agent(s)                   \n\
     ┌─────────── New Schedule ───────────┐     \n\
     │ Command: cat                       │     \n\
     │      [Submit]      [Cancel]        │     \n\

@@ -186,7 +186,7 @@ fn work_done_004_unsolicited_completion_is_visibly_labelled_in_the_attached_tui(
         .with_env("DOT_AGENT_DECK_WORKER_RESPONSE_TIMEOUT_MS", "0")
         .with_env("DOT_AGENT_DECK_DELEGATE_NO_EVENT_WINDOW_MS", "0")
         .launch_with_fixture("orch-deck");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
     open_orchestration(&deck);
     deck.wait_for_string(WORKER_ROLE);
 

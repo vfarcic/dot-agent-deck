@@ -39,7 +39,7 @@ fn click_button(deck: &TuiDeck, needle: &str) {
 /// Scenario: With a card present, press `/` to enter filter mode and type
 /// `zq`; click inside the filter input field (it must keep input focus), type
 /// `x`, then click `[Apply]`. The filter applies exactly as Enter does — the
-/// app returns to Normal (the global `[New Pane Ctrl+N]` bar is back) with
+/// app returns to Normal (the global `[New Agent Ctrl+N]` bar is back) with
 /// the `zqx` filter still active, so the non-matching `alpha` card stays
 /// hidden. (Click-in-field is asserted as focus-retention/typing-still-
 /// captured; exact cursor column is not read from the vt100 grid.) RED until
@@ -48,12 +48,12 @@ fn click_button(deck: &TuiDeck, needle: &str) {
 #[test]
 fn inline_001_filter_apply_commits() {
     // PRD #127: 200 cols so the Normal-mode bar (reached after Apply) renders
-    // the FULL `[New Pane Ctrl+N]` label; at 120 it collapses to chips once the
-    // always-shown Scheduled Tasks button is included.
+    // the FULL `[New Agent Ctrl+N]` label; at 120 it collapses to chips once the
+    // always-shown Schedules button is included.
     let deck = TuiDeck::builder()
         .with_pty_size(200, 40)
         .launch_with_fixture("minimal");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
     send_session_start(&deck, "alpha", "pane-alpha", "/tmp");
     deck.wait_for_string("alpha");
 
@@ -69,7 +69,7 @@ fn inline_001_filter_apply_commits() {
     click_button(&deck, "[Apply]");
 
     // Applied like Enter: Normal mode (button bar back), filter still active.
-    deck.wait_for_string("[New Pane Ctrl+N]");
+    deck.wait_for_string("[New Agent Ctrl+N]");
     assert!(
         !deck.snapshot_grid().contains("alpha"),
         "applied 'zqx' filter should keep the non-matching alpha card hidden:\n{}",
@@ -86,12 +86,12 @@ fn inline_001_filter_apply_commits() {
 #[test]
 fn inline_001_filter_cancel_abandons() {
     // PRD #127: 200 cols so the Normal-mode bar (reached after Cancel) renders
-    // the FULL `[New Pane Ctrl+N]` label; at 120 it collapses to chips once the
-    // always-shown Scheduled Tasks button is included.
+    // the FULL `[New Agent Ctrl+N]` label; at 120 it collapses to chips once the
+    // always-shown Schedules button is included.
     let deck = TuiDeck::builder()
         .with_pty_size(200, 40)
         .launch_with_fixture("minimal");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
     send_session_start(&deck, "alpha", "pane-alpha", "/tmp");
     deck.wait_for_string("alpha");
 
@@ -102,7 +102,7 @@ fn inline_001_filter_cancel_abandons() {
     click_button(&deck, "[Cancel]");
 
     // Abandoned like Esc: filter cleared, the alpha card returns.
-    deck.wait_for_string("[New Pane Ctrl+N]");
+    deck.wait_for_string("[New Agent Ctrl+N]");
     deck.wait_for_string("alpha");
 }
 
@@ -114,8 +114,8 @@ fn inline_001_filter_cancel_abandons() {
 #[test]
 fn inline_001_rename_save_commits() {
     // PRD #127: 200 cols so the Normal-mode bar (reached after Save) renders
-    // the FULL `[New Pane Ctrl+N]` label; at 120 it collapses to chips once the
-    // always-shown Scheduled Tasks button is included.
+    // the FULL `[New Agent Ctrl+N]` label; at 120 it collapses to chips once the
+    // always-shown Schedules button is included.
     //
     // Issue #818: this drives a REAL pane, and that is load-bearing rather
     // than incidental. A card synthesized by a `session_start` hook line names
@@ -136,7 +136,7 @@ fn inline_001_rename_save_commits() {
     // the dashboard, where a card is selected and `r` is bound.
     deck.wait_for_string("[Command Mode Ctrl+D]");
     deck.send_bytes(b"\x04");
-    deck.wait_for_string("[New Pane Ctrl+N]");
+    deck.wait_for_string("[New Agent Ctrl+N]");
     deck.wait_for_string("realpane");
 
     deck.send_bytes(b"r"); // enter rename mode for the selected card
@@ -152,7 +152,7 @@ fn inline_001_rename_save_commits() {
     // is dismissing, which is exactly how this test passed without the rename
     // ever having happened.
     deck.wait_for_string("· renamed7");
-    deck.wait_for_string("[New Pane Ctrl+N]"); // back to Normal
+    deck.wait_for_string("[New Agent Ctrl+N]"); // back to Normal
 }
 
 /// Scenario: With a selected card backed by a real pane, press `r` to enter
@@ -178,7 +178,7 @@ fn inline_001_rename_cancel_abandons() {
     // the dashboard, where a card is selected and `r` is bound.
     deck.wait_for_string("[Command Mode Ctrl+D]");
     deck.send_bytes(b"\x04");
-    deck.wait_for_string("[New Pane Ctrl+N]");
+    deck.wait_for_string("[New Agent Ctrl+N]");
     deck.wait_for_string("· realpane");
 
     deck.send_bytes(b"r");
@@ -207,8 +207,8 @@ fn inline_001_rename_cancel_abandons() {
 #[test]
 fn inline_001_pane_input_detach_returns_to_dashboard() {
     // PRD #127: 200 cols so the Normal-mode bar (reached after detach) renders
-    // the FULL `[New Pane Ctrl+N]` label; at 120 it collapses to chips once the
-    // always-shown Scheduled Tasks button is included.
+    // the FULL `[New Agent Ctrl+N]` label; at 120 it collapses to chips once the
+    // always-shown Schedules button is included.
     let deck = TuiDeck::builder()
         .with_pty_size(200, 40)
         .with_continue_session("realpane", "sleep 600")
@@ -223,6 +223,6 @@ fn inline_001_pane_input_detach_returns_to_dashboard() {
 
     // Detached to the dashboard: PaneInput's affordance is replaced by the
     // Normal-mode global bar.
-    deck.wait_for_string("[New Pane Ctrl+N]");
+    deck.wait_for_string("[New Agent Ctrl+N]");
     deck.wait_for_absence("[Command Mode Ctrl+D]");
 }

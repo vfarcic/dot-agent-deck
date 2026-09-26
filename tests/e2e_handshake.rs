@@ -153,7 +153,7 @@ fn wait_for_restart_prompt(deck: &TuiDeck) {
 fn handshake_001_match_proceeds_silently_into_dashboard() {
     let deck = TuiDeck::launch_with_fixture("minimal");
     // Empty fresh daemon → the dashboard's empty-state line.
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
     // A matching build must never surface the mismatch prompt.
     let grid = deck.snapshot_grid().to_lowercase();
     assert!(
@@ -177,7 +177,7 @@ fn handshake_002_mismatch_no_agents_restarts_silently() {
     // No key is ever sent. Under Part A the silent restart lands us straight
     // in the empty dashboard. (Today #103 renders the no-agents prompt and
     // blocks on a keypress, so this wait times out — the RED signal.)
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     // The silent restart SIGTERM'd the original daemon; its process must be
     // gone (a fresh one was lazy-spawned at the new build).
@@ -274,7 +274,7 @@ fn handshake_005_agents_running_single_consent_restarts() {
     // never appears — the RED signal.)
     deck.send_keys(b"s");
 
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
     assert!(
         daemon.wait_for_exit(Duration::from_secs(10)),
         "consenting to the restart should have terminated the old daemon, but \
@@ -302,7 +302,7 @@ fn handshake_006_decline_keeps_existing_daemon() {
 
     // We land in a working dashboard showing the live session (not the empty
     // state) against the still-running old daemon.
-    deck.wait_for_string("session(s)");
+    deck.wait_for_string("agent(s)");
 
     // Never-strand: the old daemon is still alive and still serving the agent.
     assert!(
@@ -362,7 +362,7 @@ fn handshake_007_omitted_running_agents_falls_back_no_silent_kill() {
     // handshake_006: a working dashboard appears against the still-running old
     // daemon and the live agent stays reachable on it.
     deck.send_keys(b"\x1b");
-    deck.wait_for_string("session(s)");
+    deck.wait_for_string("agent(s)");
     assert!(
         daemon.is_alive_public(),
         "declining must keep the existing daemon alive (never-strand, D4)"

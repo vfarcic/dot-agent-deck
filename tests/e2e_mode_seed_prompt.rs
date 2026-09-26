@@ -98,7 +98,7 @@ fn spawn_mode(deck: &TuiDeck, mode_index: usize, command: &str) {
 #[test]
 fn mode_005_seed_prompt_gated_delivery_to_agent_pane() {
     let deck = TuiDeck::launch_with_fixture("mode-seed");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
     let work = deck.workdir().to_path_buf();
 
     // --- Seeded mode: the seed_prompt must be delivered to the agent pane. ---

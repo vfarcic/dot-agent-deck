@@ -369,7 +369,7 @@ fn assert_unverified_warning(warnings: Vec<String>, pane_id: &str, reason: &str)
     );
     let warning = &warnings[0];
     assert!(
-        warning.contains(&format!("Closed pane {pane_id}")),
+        warning.contains(&format!("Closed agent {pane_id}")),
         "the warning must say that the requested pane was closed: {warning}"
     );
     assert!(
@@ -394,7 +394,7 @@ fn assert_slot_churn_warning(warnings: Vec<String>, pane_id: &str) {
     );
     let warning = &warnings[0];
     assert!(
-        warning.contains(&format!("Closed pane {pane_id}")),
+        warning.contains(&format!("Closed agent {pane_id}")),
         "the warning must say that the requested pane was closed: {warning}"
     );
     assert!(

@@ -971,7 +971,8 @@ fn pane_008_codex_card_shows_colored_identity_badge() {
 /// draws into the last row of the left dashboard column whenever panes are open.
 /// The bar must spend that width on the status counts and the `tools` total, with
 /// no per-agent-type breakdown: the breakdown used to consume ~30 columns here and
-/// silently clip the `tools` total off the right edge.
+/// silently clip the `tools` total off the right edge. A second render with a
+/// waiting agent must call that status "needs input" in the visible bar.
 #[spec("dashboard/stats/001")]
 #[test]
 fn stats_001_narrow_bar_keeps_tools_total_and_omits_agent_breakdown() {
@@ -1016,6 +1017,17 @@ fn stats_001_narrow_bar_keeps_tools_total_and_omits_agent_breakdown() {
         !rendered.contains("ClaudeCode") && !rendered.contains("Codex"),
         "the stats bar must not spend its width on a per-agent-type breakdown \
          (every card already carries a registry-colored type badge):\n{rendered}"
+    );
+
+    let waiting_stats = DashboardStats {
+        active: 1,
+        waiting: 1,
+        ..DashboardStats::default()
+    };
+    let waiting_bar = buffer_to_text(&render_stats_bar_to_buffer(&waiting_stats, None, 80, 1));
+    assert!(
+        waiting_bar.contains("1 needs input"),
+        "waiting agent must be labeled like its card in the stats bar:\n{waiting_bar}"
     );
 }
 
@@ -3276,7 +3288,7 @@ fn grid_003_unavoidable_overflow_is_signalled() {
         "a sliced grid must count the cards it is not showing in its title:\n{title}"
     );
     assert!(
-        title.contains("7 session(s)"),
+        title.contains("7 agent(s)"),
         "the title must still name the full role count:\n{title}"
     );
     assert_eq!(

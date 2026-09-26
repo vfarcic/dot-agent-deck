@@ -463,7 +463,7 @@ fn dispatch_return_001_orchestration_completion_reaches_the_caller() {
         .with_env("DOT_AGENT_DECK_CONFIG", config.to_string_lossy())
         .with_env("DOT_AGENT_DECK_LOG", log.to_string_lossy())
         .launch_with_fixture("orch-deck");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
     commit_fixture_repo(deck.workdir());
 
     let caller = open_probe_caller(&deck);
@@ -507,7 +507,7 @@ fn dispatch_return_002_callback_survives_caller_detach_and_reattach() {
         .with_env("DOT_AGENT_DECK_CONFIG", config.to_string_lossy())
         .with_env("DOT_AGENT_DECK_LOG", log.to_string_lossy())
         .launch_with_fixture("orch-deck");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
     commit_fixture_repo(deck.workdir());
 
     let caller = open_probe_caller(&deck);
@@ -582,7 +582,7 @@ fn dispatch_return_003_single_completion_routes_while_unknown_pane_stays_inert()
         .with_env("DOT_AGENT_DECK_CONFIG", config.to_string_lossy())
         .with_env("DOT_AGENT_DECK_LOG", log.to_string_lossy())
         .launch_with_fixture("minimal");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
     commit_fixture_repo(deck.workdir());
 
     let caller = open_probe_caller(&deck);

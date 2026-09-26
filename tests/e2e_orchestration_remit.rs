@@ -782,7 +782,7 @@ fn open_and_confirm_initial_delivery(
     std::path::PathBuf,
     usize,
 ) {
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
     write_executable(
         &deck.workdir().join("orchestrator-remit.sh"),
         ORCHESTRATOR_REMIT_SCRIPT,

@@ -132,7 +132,7 @@ fn lock_008_forwarding_gated_by_lock_state() {
         .with_env("DOT_AGENT_DECK_EXPERIMENTAL", "1")
         .with_pty_size(120, 40)
         .launch_with_fixture("orch-deck");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     open_orchestration(&deck);
     deck.wait_for_absence("New Agent"); // form closed -> tab up, orchestrator focused
@@ -191,7 +191,7 @@ fn lock_009_ctrl_e_scoped_to_command_mode_on_real_panes() {
         .with_env("DOT_AGENT_DECK_EXPERIMENTAL", "1")
         .with_pty_size(120, 40)
         .launch_with_fixture("orch-deck");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     open_orchestration(&deck);
     deck.wait_for_absence("New Agent"); // form closed -> tab up, orchestrator focused
@@ -287,7 +287,7 @@ fn lock_010_global_chord_unaffected_by_lock_state() {
         .with_env("DOT_AGENT_DECK_EXPERIMENTAL", "1")
         .with_pty_size(120, 40)
         .launch_with_fixture("orch-deck");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     open_orchestration(&deck);
     deck.wait_for_absence("New Agent");
@@ -426,7 +426,7 @@ fn lock_011_waiting_carve_out_on_real_panes() {
         .with_env("DOT_AGENT_DECK_EXPERIMENTAL", "1")
         .with_pty_size(120, 40)
         .launch_with_fixture("orch-deck");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     open_orchestration(&deck);
     deck.wait_for_absence("New Agent"); // form closed -> tab up, orchestrator focused
@@ -561,7 +561,7 @@ fn lock_012_real_agent_gated_by_lock_state() {
         // directives below aren't swallowed answering them.
         .with_claude_trust_workdir()
         .launch_with_fixture("orch-lock-live");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     let socket = deck.attach_socket_path().to_path_buf();
     let cwd = deck.workdir().to_path_buf();
@@ -646,7 +646,7 @@ fn lock_014_flag_off_leaves_worker_input_ungated() {
     let deck = TuiDeck::builder()
         .with_pty_size(120, 40)
         .launch_with_fixture("orch-deck");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     open_orchestration(&deck);
     deck.wait_for_absence("New Agent");

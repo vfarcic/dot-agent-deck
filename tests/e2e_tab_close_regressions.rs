@@ -337,9 +337,9 @@ fn close_confirm_006_dashboard_card_uses_resolved_tab_blast_radius() {
     deck.send_bytes(b"j");
     deck.wait_for_string("\u{25b8}");
     deck.send_bytes(b"\x17");
-    deck.wait_for_string("Close this tab and all its panes?");
+    deck.wait_for_string("Close this tab and all its agents?");
     let modal = deck.snapshot_grid();
-    assert!(!modal.contains("Close selected pane?"), "{modal}");
+    assert!(!modal.contains("Close selected agent?"), "{modal}");
 
     confirm_close(&deck);
     deck.wait_for_absence("×");
@@ -372,7 +372,7 @@ fn stop_017_partial_tab_close_is_retained_and_retryable() {
     deck.send_bytes(b"j");
     deck.wait_for_string("\u{25b8}");
     deck.send_bytes(b"\x17");
-    deck.wait_for_string("Close this tab and all its panes?");
+    deck.wait_for_string("Close this tab and all its agents?");
     let first_started = Instant::now();
     confirm_close(&deck);
     deck.wait_for_string("tab is kept");
@@ -393,10 +393,10 @@ fn stop_017_partial_tab_close_is_retained_and_retryable() {
     // Move from Dashboard to the retained Mode tab and retry through the same
     // user-visible close flow. The scripted one-shot failure is now cleared.
     deck.send_bytes(b"\x1b[C");
-    deck.wait_for_absence("session(s)");
+    deck.wait_for_absence("agent(s)");
     let retry_started = Instant::now();
     deck.send_bytes(b"\x17");
-    deck.wait_for_string("Close this tab and all its panes?");
+    deck.wait_for_string("Close this tab and all its agents?");
     confirm_close(&deck);
     deck.wait_for_absence("×");
     let retry_elapsed = retry_started.elapsed();
@@ -424,7 +424,7 @@ fn stop_018_already_gone_and_unverified_success_remove_tab() {
         deck.wait_for_string("demo-agent");
         deck.send_bytes(b"j");
         deck.send_bytes(b"\x17");
-        deck.wait_for_string("Close this tab and all its panes?");
+        deck.wait_for_string("Close this tab and all its agents?");
         confirm_close(&deck);
         deck.wait_for_absence("×");
         deck.wait_for_string("Closed tab");
@@ -442,7 +442,7 @@ fn stop_018_already_gone_and_unverified_success_remove_tab() {
         deck.wait_for_string("demo-agent");
         deck.send_bytes(b"j");
         deck.send_bytes(b"\x17");
-        deck.wait_for_string("Close this tab and all its panes?");
+        deck.wait_for_string("Close this tab and all its agents?");
         confirm_close(&deck);
         deck.wait_for_absence("×");
         deck.wait_for_string("may still be running unattended");

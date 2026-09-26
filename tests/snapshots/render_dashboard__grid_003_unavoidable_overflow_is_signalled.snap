@@ -2,7 +2,7 @@
 source: tests/render_dashboard.rs
 expression: rendered
 ---
- dot-agent-deck — 7 session(s)  (↓5)                                                      
+ dot-agent-deck — 7 agent(s)    (↓5)                                                      
 ┏ ▸ 1 ClaudeCode · orchestrator ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ ● Idle ┓
 ┃Dir:  dot-agent-deck                                                                    ┃
 ┃                                                                                        ┃

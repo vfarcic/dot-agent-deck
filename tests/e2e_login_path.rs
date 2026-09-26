@@ -157,7 +157,7 @@ fn login_path_001_new_pane_resolves_login_shell_command() {
         .with_env("SHELL", fx.fake_shell.to_string_lossy())
         .with_env("DOT_AGENT_DECK_CONFIG", fx.config.to_string_lossy())
         .launch_with_fixture("minimal");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     // Open the new-pane form: Ctrl+n → directory picker, Space confirms the
     // current dir → the new-pane form (whose Command field is pre-filled with
@@ -265,7 +265,7 @@ fn login_path_003_schedule_authoring_resolves_login_shell_command() {
         .with_env("DOT_AGENT_DECK_CONFIG", fx.config.to_string_lossy())
         .with_env("DOT_AGENT_DECK_SCHEDULES", sched_path.to_string_lossy())
         .launch_with_fixture("minimal");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     // Open the Scheduled-Tasks manager and edit the auto-selected `digest` row,
     // which reuses the Ctrl+n flow. `NEXT FIRE` is the "dialog is up" signal;

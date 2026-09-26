@@ -184,7 +184,7 @@ fn pane_input_007_orchestrator_prompt_retries_after_non_applied_result() {
     const MARKER: &str = "ORCHESTRATORRESULTMARKER20";
     const DELIVERED_POINTER: &str = "Read .dot-agent-deck/orchestrator-context.md";
     let deck = TuiDeck::launch_with_fixture("send-result-orchestration");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
     let script = deck.workdir().join("orchestrator-send-result.sh");
     write_executable(
         &script,

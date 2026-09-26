@@ -22,7 +22,7 @@ use spec::spec;
 /// Open the new-pane form: Ctrl+N → directory picker → Space confirms the
 /// launch cwd → the form. Synchronizes on the form's ` New Agent ` title.
 fn open_form(deck: &TuiDeck) {
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
     deck.send_bytes(b"\x0e"); // Ctrl+N → directory picker
     deck.wait_for_string("Select Directory");
     deck.send_bytes(b" "); // Space → confirm current dir → new-pane form
@@ -112,7 +112,7 @@ fn form_001_click_cancel_discards() {
     click_target(&deck, "[Cancel]");
 
     // Cancelled like Esc: back to the empty dashboard, no pane created.
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
     assert!(
         !deck.snapshot_grid().contains("canc9"),
         "cancel must not create a pane with the typed name:\n{}",

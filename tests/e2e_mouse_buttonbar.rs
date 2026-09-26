@@ -3,7 +3,7 @@
 //! PRD #80 M2 — L2 synthetic test for the global button bar.
 //!
 //! Spawns the real `dot-agent-deck` binary inside an isolated PTY, finds
-//! the `New Pane` button in the persistent bottom button bar, and clicks
+//! the `New Agent` button in the persistent bottom button bar, and clicks
 //! it via an SGR mouse report. The click must produce the SAME outcome as
 //! pressing Ctrl+N — the directory picker (`Select Directory`) opens —
 //! proving click and keyboard funnel into the one shared `Action`.
@@ -18,7 +18,7 @@ use common::TuiDeck;
 use spec::spec;
 
 /// Scenario: Launch the deck against the `minimal` fixture, wait for the
-/// empty dashboard, locate the `[New Pane Ctrl+N]` button in the bottom
+/// empty dashboard, locate the `[New Agent Ctrl+N]` button in the bottom
 /// button bar, and left-click it. The same directory picker that Ctrl+N
 /// opens (titled `Select Directory`) must appear — demonstrating
 /// click→action parity through the shared dispatch funnel.
@@ -26,8 +26,8 @@ use spec::spec;
 #[test]
 fn buttonbar_003_click_new_pane_opens_picker() {
     // PRD #127: render at a roomy full-screen width so the bottom bar shows the
-    // FULL `[New Pane Ctrl+N]` label. At the default 120 cols the bar correctly
-    // collapses to shortcut-only chips once the always-shown Scheduled Tasks
+    // FULL `[New Agent Ctrl+N]` label. At the default 120 cols the bar correctly
+    // collapses to shortcut-only chips once the always-shown Schedules
     // button is included (~133 cells > 120), so the labeled-button lookup would
     // miss. 200 cols fits the full labeled set (mirrors L1 buttonbar_005).
     let deck = TuiDeck::builder()
@@ -35,10 +35,10 @@ fn buttonbar_003_click_new_pane_opens_picker() {
         .launch_with_fixture("minimal");
 
     // Empty dashboard rendered → the bottom button bar is on screen.
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
-    // Find the New Pane button by its on-screen label and click inside it.
-    let (col, row) = deck.wait_for_in_grid("[New Pane");
+    // Find the New Agent button by its on-screen label and click inside it.
+    let (col, row) = deck.wait_for_in_grid("[New Agent");
     deck.click(col + 1, row);
 
     // Ctrl+N's outcome: the directory picker opens. Same action, via click.
@@ -47,20 +47,20 @@ fn buttonbar_003_click_new_pane_opens_picker() {
 
 /// Scenario: Seed a global `schedules.toml` (one enabled task, `btnopen`) via
 /// `DOT_AGENT_DECK_SCHEDULES`, launch against the `minimal` fixture, wait for
-/// the empty dashboard, locate the `[Scheduled Tasks …]` button in the bottom
-/// button bar, and left-click it. The "Scheduled Tasks" manager dialog must
+/// the empty dashboard, locate the `[Schedules …]` button in the bottom
+/// button bar, and left-click it. The "Schedules" manager dialog must
 /// open — demonstrating click→action parity for the dialog open-shortcut
-/// (PRD #80), just like the `[New Pane Ctrl+N]` button. We confirm the dialog
+/// (PRD #80), just like the `[New Agent Ctrl+N]` button. We confirm the dialog
 /// opened by waiting for the seeded task name `btnopen`, which renders only
 /// inside the dialog's list (not in the button-bar label). RED today: there is
-/// NO Scheduled Tasks button in the bar (the open-shortcut bypasses the action
+/// NO Schedules button in the bar (the open-shortcut bypasses the action
 /// registry entirely), so the lookup fails.
 #[spec("mouse/buttonbar/004")]
 #[test]
 fn buttonbar_004_click_scheduled_tasks_opens_manager() {
     // PRD #127 finding #4 (RED). Pinned for the coder: the new bar button's
-    // label must START WITH `[Scheduled` (e.g. `[Scheduled Tasks s]`, mirroring
-    // the inline-shortcut convention of `[New Pane Ctrl+N]` / `[Help ?]`), so
+    // label must START WITH `[Scheduled` (e.g. `[Schedules s]`, mirroring
+    // the inline-shortcut convention of `[New Agent Ctrl+N]` / `[Help ?]`), so
     // this black-box lookup finds it.
     let dir = common::harness_tempdir().expect("scratch tempdir");
     let sched_path = dir.path().join("schedules.toml");
@@ -81,9 +81,9 @@ fn buttonbar_004_click_scheduled_tasks_opens_manager() {
         .launch_with_fixture("minimal");
 
     // Empty dashboard rendered → the bottom button bar is on screen.
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
-    // Find the Scheduled Tasks button by its on-screen label and click inside it.
+    // Find the Schedules button by its on-screen label and click inside it.
     let (col, row) = deck.wait_for_in_grid("[Scheduled");
     deck.click(col + 1, row);
 
@@ -105,7 +105,7 @@ fn buttonbar_007_dimmed_close_is_inert_outside_command_mode() {
     deck.send_bytes(b"\x04");
     deck.wait_for_string("[Back to Pane Ctrl+D]");
     deck.send_bytes(b"?");
-    deck.wait_for_string("Create new pane");
+    deck.wait_for_string("Create new agent");
 
     // Both lookups poll (`wait_for_in_grid`) rather than reading the grid once:
     // each follows an input event, and a single-shot read landing mid-repaint
@@ -120,13 +120,13 @@ fn buttonbar_007_dimmed_close_is_inert_outside_command_mode() {
     // outcomes fail the assertions below.
     let (help_close_col, help_close_row) = deck.wait_for_in_grid("[Close]");
     deck.click(help_close_col + 1, help_close_row);
-    deck.wait_for_absence("Create new pane");
+    deck.wait_for_absence("Create new agent");
     deck.wait_for_string("[Back to Pane Ctrl+D]");
 
     let grid = deck.snapshot_grid();
-    assert!(!grid.contains("Close selected pane?"), "{grid}");
+    assert!(!grid.contains("Close selected agent?"), "{grid}");
     assert!(
-        !grid.contains("Close this tab and all its panes?"),
+        !grid.contains("Close this tab and all its agents?"),
         "{grid}"
     );
     assert!(

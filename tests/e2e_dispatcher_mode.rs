@@ -595,7 +595,7 @@ fn new_pane_016_dispatcher_opens_dashboard_card_with_real_agent() {
         // the agent cannot see the `dispatch` verb at all.
         .with_env("PATH", path_with_binary_dir())
         .launch_with_fixture("minimal");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     // `git worktree add` needs a real commit to branch from.
     commit_fixture_repo(deck.workdir());
@@ -644,7 +644,7 @@ fn new_pane_016_dispatcher_opens_dashboard_card_with_real_agent() {
     // This is the PRD #127 card shape (`mode_config: None` + `seed_prompt`), and
     // asserting it is the point: a mode tab routes through `render_mode_tab`'s
     // 50/50 split, so the dispatcher — which declares no side panes — rendered at
-    // half width beside an empty column. `1 session(s)` with no tab strip is what
+    // half width beside an empty column. `1 agent(s)` with no tab strip is what
     // distinguishes the fixed shape from the broken one.
     // Asserted on the GRID, not the raw stream: this is redrawn dashboard chrome,
     // so the bytes carrying it are interleaved with cursor-positioning escapes and
@@ -659,9 +659,7 @@ fn new_pane_016_dispatcher_opens_dashboard_card_with_real_agent() {
     // lives in `common` (Decision 21).
     const SURFACE_WAIT: Duration = Duration::from_secs(60);
     assert!(
-        common::wait_until(SURFACE_WAIT, || deck
-            .snapshot_grid()
-            .contains("1 session(s)")),
+        common::wait_until(SURFACE_WAIT, || deck.snapshot_grid().contains("1 agent(s)")),
         "the dispatcher never surfaced a LIVE dashboard card within {}s — expected a \
          single-agent card on the dashboard (NOT a mode tab, which would split the pane \
          50/50 with an empty side column).\n\
@@ -816,7 +814,7 @@ fn new_pane_016_dispatcher_opens_dashboard_card_with_real_agent() {
     assert!(
         common::wait_until(SURFACE_WAIT, || {
             let g = deck.snapshot_grid();
-            g.contains("2 session(s)") && g.matches("ClaudeCode").count() >= 2
+            g.contains("2 agent(s)") && g.matches("ClaudeCode").count() >= 2
         }),
         "the dispatched unit never came up as a real AGENT within {}s — a second live \
          session with an agent type on its card. `SpawnRequest.command: None` reads as \
@@ -848,7 +846,7 @@ fn orchestration_dispatch_001_tab_surfaces_with_role_cards() {
         .impersonating_pane_signals()
         .with_env("PATH", path_with_binary_dir())
         .launch_with_fixture("orch-deck");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     // `git worktree add` needs a commit to branch from.
     commit_fixture_repo(deck.workdir());
@@ -1224,7 +1222,7 @@ fn orchestration_dispatch_002_every_real_agent_role_comes_alive() {
         // leak (the test itself runs ~320s).
         .with_env("DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS", "900")
         .launch_with_fixture("dispatch-orch-real");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     // `git worktree add` needs a commit to branch from — and the worktree is a
     // HEAD checkout, so this is also what puts `.dot-agent-deck.toml` (and its
@@ -1574,7 +1572,7 @@ fn dispatch_return_006_real_single_agent_reports_to_the_dispatcher() {
         // the branch build, not a host-installed binary that predates the verbs.
         .with_env("PATH", path_with_binary_dir())
         .launch_with_fixture("minimal");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     // The unit receives a committed checkout. Its task names only the prefix,
     // so the full sentinel in its returned report can only come from inspecting
@@ -1623,7 +1621,7 @@ fn dispatch_return_006_real_single_agent_reports_to_the_dispatcher() {
     assert!(
         common::wait_until(DISPATCHER_READY_WAIT, || {
             let grid = deck.snapshot_grid();
-            grid.contains("1 session(s)")
+            grid.contains("1 agent(s)")
                 && grid.contains("ClaudeCode")
                 && seed_is_in_a_card_prompt_history(&deck)
         }),
@@ -1795,7 +1793,7 @@ fn install_slow_git(dir: &Path, sleep_secs: u32) -> PathBuf {
 /// at the wrong card would make the assertion meaningless.
 fn confirm_close_selected(deck: &TuiDeck) {
     deck.send_keys(b"\x17"); // Ctrl+W → close confirmation
-    deck.wait_for_string("Close selected pane?");
+    deck.wait_for_string("Close selected agent?");
     deck.send_keys(b"\x1b[B"); // Down → [Close] (arrows DO work inside the modal)
     deck.send_keys(b"\r"); // confirm
 }
@@ -1865,7 +1863,7 @@ fn dispatch_close_001_first_confirm_removes_the_dispatched_card() {
         .with_env("DOT_AGENT_DECK_CONFIG", cfg.to_string_lossy())
         .with_imported_claude_credentials()
         .launch_with_fixture("minimal");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
     commit_fixture_repo(deck.workdir());
 
     let expected_worktree = dispatch_worktree_of(&deck, UNIT);
@@ -2027,7 +2025,7 @@ fn dispatch_close_002_a_kept_dirty_worktree_is_announced_before_and_after_the_cl
         .with_env("PATH", path_with_binary_dir())
         .with_env("DOT_AGENT_DECK_CONFIG", cfg.to_string_lossy())
         .launch_with_fixture("minimal");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
     commit_fixture_repo(deck.workdir());
 
     let expected_worktree = dispatch_worktree_of(&deck, UNIT);
@@ -2073,7 +2071,7 @@ fn dispatch_close_002_a_kept_dirty_worktree_is_announced_before_and_after_the_cl
     // Closing it must read exactly as it always has. Without this, a dialog that
     // warned on every close would pass every assertion below while being useless.
     deck.send_keys(b"\x17");
-    deck.wait_for_string("Close selected pane?");
+    deck.wait_for_string("Close selected agent?");
     let control = deck.snapshot_grid();
     assert!(
         !control.contains("Uncommitted work"),
@@ -2103,7 +2101,7 @@ fn dispatch_close_002_a_kept_dirty_worktree_is_announced_before_and_after_the_cl
         deck.snapshot_grid()
     );
     deck.send_keys(b"\x17");
-    deck.wait_for_string("Close selected pane?");
+    deck.wait_for_string("Close selected agent?");
     let armed = deck.snapshot_grid();
     assert!(
         armed.contains("Uncommitted work here is KEPT, not deleted:"),
@@ -2183,7 +2181,7 @@ fn dispatch_close_003_a_worktree_cleaned_while_the_dialog_is_open_is_not_reporte
         .with_env("PATH", path_with_binary_dir())
         .with_env("DOT_AGENT_DECK_CONFIG", cfg.to_string_lossy())
         .launch_with_fixture("minimal");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
     commit_fixture_repo(deck.workdir());
 
     let expected_worktree = dispatch_worktree_of(&deck, UNIT);
@@ -2238,7 +2236,7 @@ fn dispatch_close_003_a_worktree_cleaned_while_the_dialog_is_open_is_not_reporte
 
     // Arm the confirmation while the tree IS dirty — the dialog is right to warn.
     deck.send_keys(b"\x17");
-    deck.wait_for_string("Close selected pane?");
+    deck.wait_for_string("Close selected agent?");
     let armed = deck.snapshot_grid();
     assert!(
         armed.contains("Uncommitted work here is KEPT, not deleted:"),
@@ -2296,7 +2294,7 @@ fn orchestration_dispatch_004_list_targets_marks_the_declared_default() {
         .impersonating_pane_signals()
         .with_env("PATH", path_with_binary_dir())
         .launch_with_fixture("orch-multi");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
     commit_fixture_repo(deck.workdir());
     let caller_pane = open_cat_caller_pane(&deck);
 

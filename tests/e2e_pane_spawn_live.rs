@@ -210,7 +210,7 @@ fn spawn_005_pane_spawn_joins_the_already_open_orchestration_tab() {
         .impersonating_pane_signals()
         .with_pty_size(120, 40)
         .launch_with_fixture("pane-spawn-live");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     open_orchestration(&deck);
     deck.wait_for_absence("New Agent"); // form closed -> tab up, orchestrator focused
@@ -322,7 +322,7 @@ fn drift_001_role_grown_via_pane_spawn_survives_session_capture() {
             session_file.to_str().expect("session path is UTF-8"),
         )
         .launch_with_fixture("pane-spawn-live");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     open_orchestration(&deck);
     deck.wait_for_absence("New Agent");

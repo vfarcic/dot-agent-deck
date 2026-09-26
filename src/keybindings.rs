@@ -903,6 +903,19 @@ fn keybindings_path() -> PathBuf {
 mod tests {
     use super::*;
 
+    /// Scenario: Read the labels exposed by the configured create, close, and
+    /// schedule shortcuts. Each description must use the same agent and
+    /// schedule terms that the TUI presents for those actions.
+    #[test]
+    fn action_descriptions_use_agent_and_schedule_words() {
+        assert_eq!(Action::NewPane.description(), "New agent");
+        assert_eq!(Action::ClosePane.description(), "Close agent");
+        assert_eq!(
+            Action::OpenScheduledTasks.description(),
+            "Schedules manager"
+        );
+    }
+
     fn ev(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
         KeyEvent::new(code, mods)
     }

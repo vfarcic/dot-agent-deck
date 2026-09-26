@@ -91,7 +91,7 @@ fn orphan_005_the_badge_reaches_a_real_terminal_and_a_forged_one_does_not() {
     // The empty-state line is the evidence the dashboard has painted AND that
     // the attach-side `subscribe_events` connection is live — a hook written
     // before the TUI subscribes is fanned out to nobody.
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     // The hostile case first, while the screen is provably clean, so the
     // "no marker" assertion below cannot pass merely because nothing has

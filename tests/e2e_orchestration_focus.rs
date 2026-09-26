@@ -162,7 +162,7 @@ fn focus_007_lock_governed_focus_contract_on_real_binary() {
         .with_pty_size(160, 45)
         .with_env("DOT_AGENT_DECK_EXPERIMENTAL", "1")
         .launch_with_fixture("orch-focus-lifecycle");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     open_orchestration(&deck);
     deck.wait_for_absence("New Agent"); // form closed -> tab up, orchestrator focused

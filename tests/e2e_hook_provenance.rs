@@ -158,7 +158,7 @@ fn provenance_001_a_forged_work_done_is_refused_while_the_pane_s_own_still_lands
         // Deliberately NOT `impersonating_pane_signals()`. This is the one
         // work-done e2e that runs under the shipped policy.
         .launch_with_fixture("hook-provenance");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
     open_orchestration(&deck);
     deck.wait_for_string("worker");
 

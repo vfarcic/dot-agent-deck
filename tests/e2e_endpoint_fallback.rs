@@ -11,7 +11,7 @@ use common::TuiDeck;
 use dot_agent_deck::platform::paths::TEST_LEGACY_ENDPOINT_ROOT_ENV;
 use spec::spec;
 
-const DASHBOARD_EMPTY_STATE: &str = "No active sessions";
+const DASHBOARD_EMPTY_STATE: &str = "No active agents";
 const LEGACY_SQUATTER_MARKER: &str = "legacy endpoint squatter\n";
 
 struct EndpointPaths {

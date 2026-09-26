@@ -282,7 +282,7 @@ fn dispatch_013_orchestration_surfaces_and_delegates() {
         // it for enumerate/clone against live GitHub.
         .with_env("GITHUB_TOKEN", token)
         .launch_with_fixture("minimal");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
 
     // Fire the dispatch into the SAME daemon this TUI is attached to.
     run_now(&deck, SCHEDULE_NAME);
