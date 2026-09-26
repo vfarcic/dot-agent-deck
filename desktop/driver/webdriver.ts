@@ -31,6 +31,30 @@ export class WebDriverError extends Error {
 }
 
 /**
+ * `DAD_DRIVER_WAIT_MS`, validated once for both this client and the harness.
+ * `Number("abc")` is `NaN`, and a `NaN` deadline never compares as expired —
+ * every wait would then spin forever, which is the one outcome a bound exists
+ * to rule out — so anything but a positive whole number is refused at load.
+ * The ceiling is Node's timer limit: a longer delay is clamped to an
+ * immediate one, which would expire every request and the harness's
+ * `execFile` bound the moment it started.
+ */
+const MAX_TIMER_MS = 2 ** 31 - 1;
+
+function parseWaitMs(raw: string | undefined): number {
+  if (raw === undefined || raw === "") return 120_000;
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value <= 0 || value > MAX_TIMER_MS) {
+    throw new Error(
+      `DAD_DRIVER_WAIT_MS must be a whole number of milliseconds from 1 to ${MAX_TIMER_MS}, got ${JSON.stringify(raw)}`,
+    );
+  }
+  return value;
+}
+
+export const WAIT_MS = parseWaitMs(process.env.DAD_DRIVER_WAIT_MS);
+
+/**
  * The deadline on any one request. A native driver that stops answering would
  * otherwise hold a `fetch` open forever — and with it the harness's state
  * waits, which only check their own deadline between requests, and its
@@ -39,23 +63,7 @@ export class WebDriverError extends Error {
  * because a session request includes launching the app, the slowest single
  * thing this client asks for.
  */
-export const WAIT_MS = parseWaitMs(process.env.DAD_DRIVER_WAIT_MS);
 const REQUEST_MS = WAIT_MS;
-
-/**
- * `DAD_DRIVER_WAIT_MS`, validated once for both this client and the harness.
- * `Number("abc")` is `NaN`, and a `NaN` deadline never compares as expired —
- * every wait would then spin forever, which is the one outcome a bound exists
- * to rule out — so anything but a positive safe integer is refused at load.
- */
-function parseWaitMs(raw: string | undefined): number {
-  if (raw === undefined || raw === "") return 120_000;
-  const value = Number(raw);
-  if (!Number.isSafeInteger(value) || value <= 0) {
-    throw new Error(`DAD_DRIVER_WAIT_MS must be a positive whole number of milliseconds, got ${JSON.stringify(raw)}`);
-  }
-  return value;
-}
 
 async function call(base: string, method: string, path: string, body?: unknown): Promise<unknown> {
   const response = await fetch(`${base}${path}`, {
