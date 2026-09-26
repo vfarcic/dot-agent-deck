@@ -20,12 +20,15 @@ The icon set is exactly what `bundle.icon` in `desktop/src-tauri/tauri.conf.json
 
 ## Regenerating after a change to the symbol
 
-Two steps — only the second if the change is to a derived copy's pipeline rather than to the shape:
+Three steps. A change to the shape needs all three; a change to one derived file's pipeline needs only the step that produces it.
 
 ```bash
 python3 scripts/brand-logo.py      # rewrites assets/brand/logo.svg (standard library only)
-./scripts/brand-icons.sh           # rewrites every copy and the Tauri icon set from it
+./scripts/brand-icons.sh           # rewrites the navbar logo, the rail badge, the Tauri icon set and the favicon
+# ...then rebuild the two README lockups, which embed the symbol -- see "Regenerating the lockups" below
 ```
+
+The first two steps do **not** touch `assets/brand/lockup-light.svg` and `lockup-dark.svg`: each lockup carries its own copy of the symbol, so skipping the third step leaves the README showing the old mark while everything else shows the new one. It is a separate step only because it needs a font toolchain the other two do not.
 
 `scripts/brand-icons.sh` needs the desktop's node dependencies (`pnpm --dir desktop install`), because it runs the `tauri` CLI from there. It calls `pnpm exec tauri icon` rather than `pnpm tauri icon` because the latter runs the `pretauri` hook, which builds and syncs the daemon binary — irrelevant to icons and slow. `tauri icon` also writes Android and iOS sets and the Windows Store tiles (`Square*Logo.png`, `StoreLogo.png`); the script deletes them, because this app ships none of those packages.
 
@@ -33,13 +36,15 @@ python3 scripts/brand-logo.py      # rewrites assets/brand/logo.svg (standard li
 
 ## Regenerating the lockups
 
-Only needed when the symbol or the wordmark changes. The wordmark is Inter Bold converted to outlines, so the lockups render the same everywhere without the font installed. Inter is licensed under the SIL Open Font License 1.1, whose FAQ treats a logo made with a font as artwork rather than as Font Software, so the outlined wordmark carries no OFL obligation and no entry in `THIRD_PARTY_NOTICES.md`; no part of the font file itself is committed. The script needs `fontTools` and `uharfbuzz` and the Inter variable font; on a machine with Nix, one build gets all three:
+Needed whenever the symbol or the wordmark changes. The wordmark is Inter Bold converted to outlines, so the lockups render the same everywhere without the font installed. Inter is licensed under the SIL Open Font License 1.1, whose FAQ treats a logo made with a font as artwork rather than as Font Software, so the outlined wordmark carries no OFL obligation and no entry in `THIRD_PARTY_NOTICES.md`; no part of the font file itself is committed. The script needs `fontTools` and `uharfbuzz` and the Inter variable font. On a machine with Nix, run this from the repository root and one build gets all three, from the `nixpkgs` revision pinned in this repository's `flake.lock` and for whatever system you are on, so two maintainers get the same font and shaping versions:
 
 ```bash
 env=$(nix --extra-experimental-features 'nix-command flakes' build --impure --no-link --print-out-paths --expr \
-  'let p = (builtins.getFlake "nixpkgs").legacyPackages.x86_64-linux; in p.buildEnv { name = "brandtools"; paths = [ (p.python3.withPackages (ps: [ ps.fonttools ps.uharfbuzz ])) p.inter ]; }')
+  'let p = (builtins.getFlake (toString ./.)).inputs.nixpkgs.legacyPackages.${builtins.currentSystem}; in p.buildEnv { name = "brandtools"; paths = [ (p.python3.withPackages (ps: [ ps.fonttools ps.uharfbuzz ])) p.inter ]; }')
 "$env/bin/python3" scripts/brand-lockups.py "$env/share/fonts/truetype/InterVariable.ttf"
 ```
+
+The first run can take several minutes when that `nixpkgs` revision is not in your store yet.
 
 Without Nix, `pip install fonttools uharfbuzz` plus a downloaded `InterVariable.ttf` should do the same; only the Nix route above has been run.
 

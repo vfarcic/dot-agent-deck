@@ -1,5 +1,5 @@
 #!/bin/sh
-# Regenerate every derived copy of the Agent Deck mark from its one master,
+# Regenerate the derived copies of the Agent Deck mark from its one master,
 # assets/brand/logo.svg: the docs navbar logo, the desktop rail badge, the
 # full Tauri icon set, and the docs favicon. Run from anywhere; needs the
 # desktop's node dependencies (`pnpm --dir desktop install`). The lockups are
