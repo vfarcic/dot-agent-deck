@@ -2497,14 +2497,14 @@ describe("the New agent deck field and Discard, by voice (issues 1263 and 1247)"
      `deckId` and the label the overview shows. */
   const DECKS: Record<string, { value: string; label: string }> = {
     "deck build box": { value: FIXTURE_REMOTE_DAEMON_ID, label: "dev@build-box" },
-    "deck local": { value: FIXTURE_DAEMON_ID, label: "Local deck" },
+    "deck local": { value: FIXTURE_DAEMON_ID, label: "Local daemon" },
     "deck runner": { value: FIXTURE_UNREACHABLE_DAEMON_ID, label: "ci@runner-7" },
     "deck gone": { value: "deck-that-left", label: "gone@nowhere" },
   };
 
   function answer(utterance: string): VoiceResultDto {
     const named = DECKS[utterance];
-    if (named) return dispatch("choose_deck", "chooseNewAgentDeck", `Deck: ${named.label}.`, utterance, [{ name: "deck", kind: "deck_ref", spoken: utterance.slice("deck ".length), value: named.value, label: named.label }]);
+    if (named) return dispatch("choose_deck", "chooseNewAgentDeck", `Daemon: ${named.label}.`, utterance, [{ name: "deck", kind: "deck_ref", spoken: utterance.slice("deck ".length), value: named.value, label: named.label }]);
     if (utterance === "discard") return dispatch("discard_new_agent", "discardNewAgent", "Discarded the New agent form.", utterance);
     if (utterance === "close") return dispatch("close", "closeTopmost", "Closed.", utterance);
     if (utterance === "mode dispatcher") return dispatch("choose_mode", "chooseNewAgentMode", "Mode: dispatcher.", utterance, [{ name: "mode", kind: "mode_ref", spoken: "dispatcher", value: "dispatcher", label: "dispatcher" }]);
@@ -2574,7 +2574,7 @@ describe("the New agent deck field and Discard, by voice (issues 1263 and 1247)"
     expect(chosenDeck()).toBe(FIXTURE_REMOTE_DAEMON_ID);
     expect(deck.newAgentOptions).toHaveBeenLastCalledWith(FIXTURE_REMOTE_DAEMON_ID);
     expect(deck.listDirectories).toHaveBeenLastCalledWith(FIXTURE_REMOTE_DAEMON_ID, undefined);
-    expect(screen.getByTestId("voice-report")).toHaveTextContent("Deck: dev@build-box.");
+    expect(screen.getByTestId("voice-report")).toHaveTextContent("Daemon: dev@build-box.");
 
     await chooseBilling();
     fireEvent.change(screen.getByTestId("new-agent-name"), { target: { value: "mine" } });

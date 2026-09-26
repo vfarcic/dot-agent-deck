@@ -4865,12 +4865,12 @@ mod tests {
     /// A Runs-screen launch request that passes every shape check, so the
     /// first thing it can fail on is reaching a deck.
     #[cfg(unix)]
-    fn runs_launch(cwd: &std::path::Path) -> crate::StartWorkflowRequest {
-        crate::StartWorkflowRequest {
+    fn runs_launch(cwd: &std::path::Path) -> crate::ActivateOrchestrationRequest {
+        crate::ActivateOrchestrationRequest {
             name: "review".into(),
             cwd: cwd.to_string_lossy().into_owned(),
             task_prompt: "list the files".into(),
-            roles: vec![crate::dto::WorkflowRoleInput {
+            roles: vec![crate::dto::OrchestrationRoleInput {
                 role: "orchestrator".into(),
                 command: "cat".into(),
                 start: true,
@@ -4905,7 +4905,7 @@ mod tests {
         apply_all_decks_over(&local, &settings);
         let state = crate::terminal::DesktopState::default();
 
-        let launched = crate::start_workflow_action(&state, runs_launch(&local.dir)).await;
+        let launched = crate::activate_orchestration_action(&state, runs_launch(&local.dir)).await;
         let linked = trusted_daemon(&state.daemon).await.map(|_| ());
         let handshakes_under_all = state.daemon.handshake_count();
         let held_under_all = state.daemon.held().await;
@@ -4920,7 +4920,7 @@ mod tests {
             .expect("built with an [endpoints] section")
             .selection = crate::settings::Selection::Local;
         crate::dto::apply_settings_selection(&only_local);
-        let control = crate::start_workflow_action(&state, runs_launch(&local.dir)).await;
+        let control = crate::activate_orchestration_action(&state, runs_launch(&local.dir)).await;
         let handshakes_under_local = state.daemon.handshake_count();
         let snapshot_under_local = get_snapshot(&state.daemon).await;
         local.shutdown();

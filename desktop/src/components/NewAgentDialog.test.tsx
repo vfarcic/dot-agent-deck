@@ -1519,7 +1519,7 @@ describe("New agent dialog — a draft that survives a close (issue 1247)", () =
   /** A draft on the local deck, with `leaf` chosen and both fields edited. */
   const saved = (patch: Partial<NewAgentDraft> = {}): NewAgentDraft => ({
     deckId: LOCAL,
-    deckName: "Local deck",
+    deckName: "Local daemon",
     browsing: LEAF.path,
     directory: LEAF,
     mode: "none",

@@ -1233,7 +1233,7 @@ pub struct DesktopFeatures {
     pub show_deck: bool,
     pub show_projects: bool,
     pub show_prompts: bool,
-    pub show_workflows: bool,
+    pub show_orchestrations: bool,
     pub show_agent_profiles: bool,
 }
 
@@ -1246,7 +1246,7 @@ impl DesktopFeatures {
             show_deck: features::show_desktop_deck(),
             show_projects: features::show_desktop_projects(),
             show_prompts: features::show_desktop_prompts(),
-            show_workflows: features::show_desktop_workflows(),
+            show_orchestrations: features::show_desktop_orchestrations(),
             show_agent_profiles: features::show_desktop_agent_profiles(),
         }
     }
@@ -1468,7 +1468,7 @@ impl Default for SelectedDeck {
 /// state first, so this is the backstop a user should not normally see — and
 /// it says what to do rather than what went wrong, like that state does.
 pub(crate) const ALL_DECKS_NEEDS_ONE_DECK: &str =
-    "All Decks is selected, which is every deck at once. Select a deck to act on one.";
+    "All daemons is selected, which is every daemon at once. Select a daemon to act on one.";
 
 /// The applied selection — the deck in force AND the set the fleet observes, as
 /// **one value under one lock** (PRD #742 M8).
@@ -3697,7 +3697,7 @@ mod tests {
                 show_deck: false,
                 show_projects: false,
                 show_prompts: false,
-                show_workflows: false,
+                show_orchestrations: false,
                 show_agent_profiles: false,
             }
         );
@@ -3709,7 +3709,7 @@ mod tests {
                 show_deck: true,
                 show_projects: true,
                 show_prompts: true,
-                show_workflows: true,
+                show_orchestrations: true,
                 show_agent_profiles: true,
             }
         );
@@ -3723,7 +3723,7 @@ mod tests {
             show_deck: true,
             show_projects: false,
             show_prompts: true,
-            show_workflows: false,
+            show_orchestrations: false,
             show_agent_profiles: true,
         })
         .expect("serialises");
@@ -3733,7 +3733,7 @@ mod tests {
                 "showDeck": true,
                 "showProjects": false,
                 "showPrompts": true,
-                "showWorkflows": false,
+                "showOrchestrations": false,
                 "showAgentProfiles": true,
             })
         );

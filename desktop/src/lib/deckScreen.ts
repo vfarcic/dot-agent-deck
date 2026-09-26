@@ -23,7 +23,7 @@ export function deckScreenSnapshot(snapshot: DeckSnapshot, allDecks: boolean): D
   return {
     ...snapshot,
     runId: "—",
-    repo: "All Decks",
+    repo: "All daemons",
     worktree: "",
     branch: undefined,
     stages: [],

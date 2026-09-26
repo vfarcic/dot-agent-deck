@@ -149,7 +149,7 @@ const FALLBACK_WITH_BUFFER: Duration = Duration::from_millis(10_500);
 #[test]
 fn mode_007_seed_reaches_a_silent_agent_through_the_buffered_fallback() {
     let deck = TuiDeck::launch_with_fixture("mode-seed");
-    deck.wait_for_string("No active sessions");
+    deck.wait_for_string("No active agents");
     let work = deck.workdir().to_path_buf();
 
     // The recorder of `write_agent_script` minus its `SessionStart` line: a

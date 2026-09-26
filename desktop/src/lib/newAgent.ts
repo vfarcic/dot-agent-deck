@@ -348,7 +348,7 @@ export function cleanupWarning(unconfirmedStops: readonly string[], deck?: strin
   const stops = count === 1 ? "its stop" : "their stops";
   // Issue #1234: a warning that outlives its screen names the deck it is about,
   // because "this deck" then reads as whichever deck is selected when it is seen.
-  const where = deck === undefined ? "this deck" : deck;
+  const where = deck === undefined ? "this daemon" : deck;
   return {
     summary: displayText(`${subject} may still be running on ${where}: ${stops} could not be confirmed. Check the daemon and stop ${it} there.`, DISPLAY_LIMITS.message),
     names: unconfirmedStops.slice(0, CLEANUP_WARNING_MAX_NAMES).map((role) => displayIdentity(role, DISPLAY_LIMITS.name, UNNAMED_CLEANUP_ROLE)),

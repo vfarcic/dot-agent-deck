@@ -130,7 +130,7 @@
 #                    true` lets the row dispatch when the model supplies no
 #                    value; a value that fails is dropped with a note saying
 #                    why, one that resolves gets a note naming it
-#                    ("Preselected deck: Local deck."), and a report may not
+#                    ("Preselected daemon: Local daemon."), and a report may not
 #                    interpolate an optional param.
 #
 # **This table was NAVIGATION ONLY and is not any more**, which is worth saying
@@ -557,7 +557,7 @@ heard_as_whole = [
 # which is what a deck group's own header button does. A deck that matches
 # nothing, or several, is dropped and the report says so ("No deck matches …, so
 # none is preselected."); one that resolves is preselected — whether or not the
-# user said it — and the report names it ("Preselected deck: Local deck."), so
+# user said it — and the report names it ("Preselected daemon: Local daemon."), so
 # a deck the model guessed is heard before anything starts on it. Only a deck
 # the dialog can preselect: one its deck step disables is never offered to the
 # model, and one the user names is answered with the step's reason instead
@@ -827,16 +827,18 @@ heard_as    = ["name", "call"]
 # exactly where it is needed. With the dialog closed, a named deck is
 # `open_new_agent`'s param instead.
 #
-# **`heard_as = ["deck"]` and nothing else, on purpose.** Changing the deck
-# throws away a chosen directory, which takes several utterances to reach
-# again, and observed names — directories, agent labels, orchestration titles —
-# can be written to steer the model. With a verb such as `use` or `pick` in the
-# vocabulary, "use this directory" or "use claude" over a hostile listing could
-# ground a steered switch; requiring the word "deck" means the user has to have
-# talked about a deck. "Switch to the build box" without it is refused with
+# **`heard_as = ["daemon", "deck"]` and nothing else, on purpose.** Changing
+# the daemon throws away a chosen directory, which takes several utterances to
+# reach again, and observed names — directories, agent labels, orchestration
+# titles — can be written to steer the model. With a verb such as `use` or
+# `pick` in the vocabulary, "use this directory" or "use claude" over a hostile
+# listing could ground a steered switch; requiring the word "daemon" (or
+# "deck", the field's name before issue #1045) means the user has to have
+# talked about a daemon. "Switch to the build box" without it is refused with
 # `try_saying`, which teaches the phrasing. The field's visible label is
-# "Deck", so the label rule is met by "deck <name>", as "mode <chip>" meets
-# it for the Mode row. The residual — "deck" said for another reason while a
+# "Daemon", so the label rule is met by "daemon <name>", as "mode <chip>"
+# meets it for the Mode row; "deck" stays because people keep saying the old
+# name, the same reason `open_deck` keeps it. The residual — "deck" said for another reason while a
 # steered pick is in flight — is the one every `heard_as` row carries
 # (`docs/develop/voice-first-design.md`, section 6), and what it reaches is
 # another deck on screen, visibly, with the typed fields kept.
@@ -845,23 +847,25 @@ heard_as    = ["name", "call"]
 # a guess audible.
 [[commands]]
 id          = "choose_deck"
-description = """In the New agent dialog, choose which deck the new agent starts on — the dialog's
-Deck field. Use for deck build box, use the local deck, switch to the build box deck, change the
-deck to local, pick the remote deck, put it on the local deck, choose deck ci — and for a deck's
-own name said with the word deck, like "Local deck". Set `deck` to the words the user used for the
-deck; it must be one of `decks`. Choosing a different deck clears the chosen directory and the Mode
-and keeps a typed Name or Command. While the New agent dialog is open, a request that names WHICH
-deck the new agent goes on is THIS one — never `open_deck`, which leaves the agent overview for
-the deck screen, and never `open_new_agent`, since the dialog is already open. It starts nothing,
-and never touches the command line, which is typed by hand."""
+description = """In the New agent dialog, choose which daemon the new agent starts on — the dialog's
+Daemon field. Use for daemon build box, use the local daemon, switch to the build box daemon, change
+the daemon to local, pick the remote daemon, put it on the local daemon, choose daemon ci — and for a
+daemon's own name said with the word daemon, like "Local daemon". Users who knew the field by its
+older name say deck in the same places — deck build box, use the local deck, pick the remote deck —
+and those mean THIS one too. Set `deck` to the words the user used for the daemon; it must be one of
+`decks`. Choosing a different daemon clears the chosen directory and the Mode and keeps a typed Name
+or Command. While the New agent dialog is open, a request that names WHICH daemon the new agent goes
+on is THIS one — never `open_deck`, which leaves the agent dashboard for the Daemons screen, and
+never `open_new_agent`, since the dialog is already open. It starts nothing, and never touches the
+command line, which is typed by hand."""
 invoke      = "chooseNewAgentDeck"
 screens     = ["overview"]
 requires    = ["new_agent_dialog"]
-unavailable_hint = "choosing the deck this way works while the New agent dialog is open; say “new agent on” and the deck to open it on one"
-report      = "Deck: {deck}."
-asks_to     = "choose the new agent's deck"
-try_saying  = "deck {deck}"
-heard_as    = ["deck"]
+unavailable_hint = "choosing the daemon this way works while the New agent dialog is open; say “new agent on” and the daemon to open it on one"
+report      = "Daemon: {deck}."
+asks_to     = "choose the new agent's daemon"
+try_saying  = "daemon {deck}"
+heard_as    = ["daemon", "deck"]
 
   [[commands.params]]
   name = "deck"

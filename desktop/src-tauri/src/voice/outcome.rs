@@ -644,7 +644,7 @@ pub async fn handle_utterance_with(
             // **Dispatched, and still not named.** The implied deck is the
             // only one that can take a new agent, nobody referred to any deck,
             // and no note precedes it: there was no choice and no guess, so
-            // "Preselected deck: …" would tell the user nothing they do not
+            // "Preselected daemon: …" would tell the user nothing they do not
             // already know, on every "new agent". It is named where it carries
             // information — a deck someone referred to (`Ok` below), or after
             // a dropped one, whose note it answers ([`Unmet::dropped_note`]).
@@ -831,7 +831,7 @@ impl Unmet {
     /// **`implied` decides how it ends**: "…, so none is preselected." when
     /// nothing will be, or the implied deck's own note when the dialog will
     /// preselect the only deck that can take an agent regardless — "No deck
-    /// matches “ghost”. Preselected deck: Local deck." ([`implied_param`]).
+    /// matches “ghost”. Preselected daemon: Local daemon." ([`implied_param`]).
     fn dropped_note(
         &self,
         kind: ParamKind,
@@ -6666,7 +6666,7 @@ mod tests {
             assert_eq!(params.len(), 1);
             assert_eq!(params[0].kind, ParamKind::DeckRef);
             assert_eq!(params[0].value, "deck-build");
-            assert_eq!(sentence, "Deck: deploy@build-box.example.com:2222.");
+            assert_eq!(sentence, "Daemon: deploy@build-box.example.com:2222.");
         }
         let closed = heard_as_user_said(said, answer(), Screen::Overview, &fleet(), None).await;
         assert!(
@@ -7106,13 +7106,14 @@ mod tests {
             row: "discard_new_agent",
             over_the_form: true,
         },
-        // Issue #1263 — the deck field's heading. Said alone it names no deck,
-        // so it reaches `choose_deck`'s "which deck"; "deck build box" is the
-        // label with a value, as "mode schedule" is for the Mode row.
+        // Issue #1263 — the daemon field's heading ("Deck" until #1045). Said
+        // alone it names no daemon, so it reaches `choose_deck`'s "which
+        // daemon"; "daemon build box" is the label with a value, as "mode
+        // schedule" is for the Mode row.
         ControlLabel {
-            source: "<h3 id={`${titleId}-deck`}>Deck</h3>",
+            source: "<h3 id={`${titleId}-deck`}>Daemon</h3>",
             file: NEW_AGENT_DIALOG_TSX,
-            said: "Deck",
+            said: "Daemon",
             row: "choose_deck",
             over_the_form: true,
         },
@@ -7180,9 +7181,9 @@ mod tests {
             over_the_form: false,
         },
         ControlLabel {
-            source: "label=\"Overview\"",
+            source: "label=\"Dashboard\"",
             file: NAVIGATION_RAIL_TSX,
-            said: "Overview",
+            said: "Dashboard",
             row: "open_overview",
             over_the_form: false,
         },

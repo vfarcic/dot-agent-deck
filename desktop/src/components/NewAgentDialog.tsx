@@ -114,13 +114,13 @@ export const STARTING_CLOSE_BLOCKED = "Waiting for the daemon to answer the star
 /** Something the user chose or typed was put back. */
 export const DRAFT_RESTORED = "Restored what was entered when this form was last closed. Discard clears it.";
 /** The saved directory could not be listed again on its deck. */
-export const DRAFT_DIRECTORY_GONE = "The directory chosen last time could not be listed on this deck any more, so it was not chosen again.";
+export const DRAFT_DIRECTORY_GONE = "The directory chosen last time could not be listed on this daemon any more, so it was not chosen again.";
 /** The saved Mode chip is not offered on the restored form. */
 export const DRAFT_MODE_GONE = "The Mode chosen last time is not offered on this form any more, so the form is back to No mode.";
 /** The form was opened for a deck other than the saved one, which wins. */
-export const draftOtherDeck = (savedDeck: string) => `This form was opened for another deck, so the directory chosen on ${savedDeck} last time was not restored.`;
+export const draftOtherDeck = (savedDeck: string) => `This form was opened for another daemon, so the directory chosen on ${savedDeck} last time was not restored.`;
 /** The saved deck cannot take a new agent now, or has left the fleet. */
-export const draftDeckGone = (savedDeck: string, hadDirectory: boolean) => `${savedDeck}, the deck chosen last time, cannot take a new agent now, so ${hadDirectory ? "it and its directory were" : "it was"} not restored.`;
+export const draftDeckGone = (savedDeck: string, hadDirectory: boolean) => `${savedDeck}, the daemon chosen last time, cannot take a new agent now, so ${hadDirectory ? "it and its directory were" : "it was"} not restored.`;
 
 /*
   Issue #1263 — the deck field by voice, in the dialog's own words. Rust
@@ -129,13 +129,13 @@ export const draftDeckGone = (savedDeck: string, hadDirectory: boolean) => `${sa
   dialog that changed during the round trip.
 */
 /** A start is in flight, when the deck field is disabled. */
-export const DECK_CHANGE_IN_FLIGHT = "A start is under way, so the deck was not changed.";
+export const DECK_CHANGE_IN_FLIGHT = "A start is under way, so the daemon was not changed.";
 /** The deck is not in the field's list any more. */
-export const DECK_NOT_LISTED = "That deck is not in the New agent dialog's deck list any more, so the deck was not changed.";
+export const DECK_NOT_LISTED = "That daemon is not in the New agent dialog's daemon list any more, so the daemon was not changed.";
 /** The deck is listed, disabled. */
-export const DECK_CANNOT_TAKE_AGENT = "That deck cannot take a new agent now, so the deck was not changed.";
+export const DECK_CANNOT_TAKE_AGENT = "That daemon cannot take a new agent now, so the daemon was not changed.";
 /** The dialog closed during the round trip (served by the overview). */
-export const NO_DIALOG_FOR_DECK = "The New agent dialog is not open, so no deck was chosen.";
+export const NO_DIALOG_FOR_DECK = "The New agent dialog is not open, so no daemon was chosen.";
 /** The dialog closed during the round trip, so there was nothing to discard. */
 export const NO_DIALOG_TO_DISCARD = "The New agent dialog is not open, so nothing was discarded.";
 
@@ -747,7 +747,7 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
       }
       const notes = draftHasEdits(saved) ? [DRAFT_RESTORED] : [];
       if (saved.deckId !== undefined) {
-        const savedName = displayText(saved.deckName ?? "The deck", DISPLAY_LIMITS.name);
+        const savedName = displayText(saved.deckName ?? "The daemon", DISPLAY_LIMITS.name);
         if (eligible && preselected.deckId === saved.deckId) {
           resume = {
             ...(saved.browsing !== undefined ? { browsing: saved.browsing } : {}),

@@ -16,9 +16,9 @@ export type RailContext = Pick<VoiceActionContext, "navigate" | "openOverlay" | 
  * shell owns the screens, with the same entries on every screen; only which one
  * is current changes.
  *
- * `aria-current="page"` names the screen underneath — Overview or Deck — while
+ * `aria-current="page"` names the screen underneath — Dashboard or Daemons — while
  * no overlay is open, and the overlay's own entry while one is. An agent pane
- * opened from the overview keeps Overview current, because the overview is what
+ * opened from the overview keeps Dashboard current, because the overview is what
  * stays mounted beneath it.
  *
  * Every entry still dispatches through the action registry (PRD #802 M2). An
@@ -28,24 +28,24 @@ export type RailContext = Pick<VoiceActionContext, "navigate" | "openOverlay" | 
  *
  * Issue #1198 — the deck and its four panels are experimental surfaces, so
  * each entry renders only while its own `features` field says so. With the
- * flag off — the shipped default — the rail is Overview and Settings. Nothing
+ * flag off — the shipped default — the rail is Dashboard and Settings. Nothing
  * else here reads the flag: the entries that remain dispatch exactly as they
  * did.
  */
 export function NavigationRail({ screen, overlays, context, connection, features, onShowShortcuts }: { screen: RailScreen; overlays: ShellOverlayState; context: RailContext; connection: ConnectionView; features: DesktopFeatures; onShowShortcuts?: () => void }) {
-  const overlayOpen = Boolean(overlays.projects || overlays.prompts || overlays.profiles || overlays.workflow || overlays.settings);
-  /* Deck is what the deck's rail used to call Runs: on the deck it clears the
+  const overlayOpen = Boolean(overlays.projects || overlays.prompts || overlays.profiles || overlays.orchestration || overlays.settings);
+  /* Daemons is what the deck's rail used to call Runs: on the deck it clears the
      overlays, as Runs always did, and from the overview it goes to the deck. */
   const toDeck = () => (screen === "deck" ? VOICE_ACTIONS.showRuns.run(context) : VOICE_ACTIONS.openDeck.run(context));
   return (
     <aside className="rail" aria-label="Primary navigation">
       <div className="brand-mark" aria-label="Agent Deck"><span>AD</span><i aria-hidden="true" /></div>
       <nav>
-        <RailButton icon={LayoutList} label="Overview" active={screen === "overview" && !overlayOpen} onClick={() => VOICE_ACTIONS.openOverview.run(context)} testId="open-overview" />
-        {features.showDeck && <RailButton icon={SquareTerminal} label="Deck" active={screen === "deck" && !overlayOpen} onClick={toDeck} testId="open-deck" />}
+        <RailButton icon={LayoutList} label="Dashboard" active={screen === "overview" && !overlayOpen} onClick={() => VOICE_ACTIONS.openOverview.run(context)} testId="open-overview" />
+        {features.showDeck && <RailButton icon={SquareTerminal} label="Daemons" active={screen === "deck" && !overlayOpen} onClick={toDeck} testId="open-deck" />}
         {features.showProjects && <RailButton icon={FolderGit2} label="Projects" active={overlays.projects} onClick={() => VOICE_ACTIONS.openProjects.run(context)} testId="open-projects" />}
         {features.showPrompts && <RailButton icon={BookMarked} label="Prompts" active={overlays.prompts} onClick={() => VOICE_ACTIONS.openPromptLibrary.run(context)} testId="open-prompts" />}
-        {features.showWorkflows && <RailButton icon={Network} label="Workflows" active={overlays.workflow} onClick={() => VOICE_ACTIONS.openWorkflowOrder.run(context)} />}
+        {features.showOrchestrations && <RailButton icon={Network} label="Orchestrations" active={overlays.orchestration} onClick={() => VOICE_ACTIONS.openOrchestrationOrder.run(context)} />}
         {features.showAgentProfiles && <RailButton icon={Bot} label="Agent Profiles" active={overlays.profiles} onClick={() => VOICE_ACTIONS.openAgentProfiles.run(context)} testId="open-agent-profiles" />}
         <RailButton icon={Settings2} label="Settings" active={overlays.settings} onClick={() => VOICE_ACTIONS.openSettings.run(context)} testId="open-settings" />
       </nav>

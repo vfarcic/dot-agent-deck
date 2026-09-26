@@ -210,17 +210,18 @@ describe("VOICE_ACTIONS", () => {
   });
 
   /**
-   * Scenario: open a daemon overlay and then click Deck in the primary rail. The
-   * overlay disappears, the daemon remains visible, and the reset action crossed
-   * the registry rather than closing the booleans beside it.
+   * Scenario: open a panel over the Daemons screen and then click Daemons in
+   * the primary rail. The panel disappears, the Daemons screen remains visible,
+   * and the reset action crossed the registry rather than closing the booleans
+   * beside it.
    */
-  it("dispatches the Deck deck-rail button through the registry", () => {
+  it("dispatches the Daemons rail button through the registry", () => {
     renderDeck();
     fireEvent.click(screen.getByRole("button", { name: "Projects" }));
     expect(screen.getByTestId("projects-panel")).toBeVisible();
     registryDispatch.mockClear();
 
-    fireEvent.click(screen.getByRole("button", { name: "Deck" }));
+    fireEvent.click(screen.getByRole("button", { name: "Daemons" }));
 
     expect(screen.queryByTestId("projects-panel")).not.toBeInTheDocument();
     expect(screen.getByTestId("agent-tile-planner")).toBeVisible();

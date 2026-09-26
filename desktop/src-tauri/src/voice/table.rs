@@ -1864,13 +1864,12 @@ mod tests {
                     "open daemons",
                     "go back to the daemons",
                     "back to the daemons",
-                    "the daemons",
-                    "daemons",
                     "go back to the deck",
                     "back to the deck",
                     "return to the deck",
-                    // No bare "deck" or "the deck" since #1263: over the dialog
-                    // that is its Deck field's label (`choose_deck`).
+                    // No bare "deck"/"the deck" (#1263) nor "daemons"/"the
+                    // daemons": over the dialog those name its Daemon field
+                    // (`choose_deck`).
                     "show me the deck",
                     "show the deck",
                     "show the terminals",
@@ -2755,11 +2754,12 @@ mod tests {
                 "{id}"
             );
         }
-        // Grounded by the word "deck" alone — no shared verb — so a steered
-        // pick needs the user to have talked about a deck (see commands.toml).
+        // Grounded by the word "daemon" (or "deck", its name before #1045)
+        // alone — no shared verb — so a steered pick needs the user to have
+        // talked about a daemon (see commands.toml).
         assert_eq!(
             table.row("choose_deck").expect("present").grounding,
-            ActionGrounding::HeardAs(vec!["deck".to_string()])
+            ActionGrounding::HeardAs(vec!["daemon".to_string(), "deck".to_string()])
         );
     }
 

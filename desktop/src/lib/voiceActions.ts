@@ -691,7 +691,7 @@ export const VOICE_ACTIONS = {
      #802 D5's set; the manual path (a click, or Enter on a highlighted row)
      calls the same `chooseDeck`. */
   chooseNewAgentDeck: {
-    label: "Choose the deck in the New agent dialog",
+    label: "Choose the daemon in the New agent dialog",
     voice: true,
     needs: ["chooseNewAgentDeck", "reportRefused"],
     run: (context: Pick<VoiceActionContext, "chooseNewAgentDeck" | "reportRefused">, target: VoiceDispatchTarget) => {

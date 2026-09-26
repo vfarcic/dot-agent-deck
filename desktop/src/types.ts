@@ -356,7 +356,7 @@ export interface DesktopFeatures {
   showDeck: boolean;
   showProjects: boolean;
   showPrompts: boolean;
-  showWorkflows: boolean;
+  showOrchestrations: boolean;
   showAgentProfiles: boolean;
 }
 
@@ -365,7 +365,7 @@ export const DEFAULT_DESKTOP_FEATURES: DesktopFeatures = {
   showDeck: false,
   showProjects: false,
   showPrompts: false,
-  showWorkflows: false,
+  showOrchestrations: false,
   showAgentProfiles: false,
 };
 

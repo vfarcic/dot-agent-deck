@@ -2055,13 +2055,13 @@ describe("DeckShell", () => {
 
   /**
    * Scenario: launch the shipped desktop with the experimental flag absent.
-   * The overview is the landing screen and the only rail destinations are Overview and Settings.
+   * The dashboard is the landing screen and the only rail destinations are Dashboard and Settings.
    */
   it("hides every experimental destination from the shipped rail", async () => {
     window.history.replaceState({}, "", "/?fixture=1");
     render(<DeckShell runtime={runtime({ snapshot: createFixtureSnapshot("connected") })} />);
 
-    await waitFor(() => expect(railEntries()).toEqual(["Overview", "Settings"]));
+    await waitFor(() => expect(railEntries()).toEqual(["Dashboard", "Settings"]));
     expect(screen.getByTestId("overview-table-region")).toBeVisible();
     expect(screen.queryByTestId("open-deck")).not.toBeInTheDocument();
     expect(screen.queryByTestId("overview-open-deck")).not.toBeInTheDocument();
@@ -2076,7 +2076,7 @@ describe("DeckShell", () => {
     const state = runtime({ snapshot: createFixtureSnapshot("connected"), ...{ desktopFeatures: undefined } });
     render(<DeckShell runtime={state} />);
 
-    await waitFor(() => expect(railEntries()).toEqual(["Overview", "Settings"]));
+    await waitFor(() => expect(railEntries()).toEqual(["Dashboard", "Settings"]));
     expect(screen.getByTestId("overview-table-region")).toBeVisible();
   });
 
@@ -2089,7 +2089,7 @@ describe("DeckShell", () => {
     render(<DeckShell runtime={runtime({ snapshot: createFixtureSnapshot("connected") })} />);
 
     await waitFor(() => expect(railEntries()).toEqual([
-      "Overview", "Deck", "Projects", "Prompts", "Workflows", "Agent Profiles", "Settings",
+      "Dashboard", "Daemons", "Projects", "Prompts", "Orchestrations", "Agent Profiles", "Settings",
     ]));
   });
 
@@ -2104,7 +2104,7 @@ describe("DeckShell", () => {
     await waitFor(() => expect(screen.getByTestId("overview-table-region")).toBeVisible());
     expect(screen.queryByTestId("agent-tile-planner")).not.toBeInTheDocument();
     expect(screen.queryByTestId("overview-open-deck")).not.toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Open deck" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Open daemons" })).not.toBeInTheDocument();
     fireEvent.keyDown(window, { key: "k", ctrlKey: true });
     expect(screen.queryByRole("dialog", { name: "Command menu" })).not.toBeInTheDocument();
     expect(screen.getByTestId("overview-table-region")).toBeVisible();
@@ -2246,7 +2246,7 @@ describe("DeckShell", () => {
 
     expect(rail()).toHaveLength(1);
     const deckEntries = entries();
-    expect(deckEntries[0]).toBe("Overview");
+    expect(deckEntries[0]).toBe("Dashboard");
     expect(deckEntries).toContain("Settings");
     fireEvent.click(screen.getByTestId("open-overview"));
     expect(rail()).toHaveLength(1);
@@ -2265,12 +2265,12 @@ describe("DeckShell", () => {
   it("marks the deck or overview as current, preserving overview under an agent pane", () => {
     render(<DeckShell runtime={runtime({ snapshot: createFixtureSnapshot("connected") })} initialView={{ kind: "deck" }} />);
     const current = () => document.querySelector("aside.rail nav [aria-current='page']")?.textContent?.trim();
-    expect(current()).toBe("Deck");
+    expect(current()).toBe("Daemons");
 
     fireEvent.click(screen.getByTestId("open-overview"));
-    expect(current()).toBe("Overview");
+    expect(current()).toBe("Dashboard");
     fireEvent.click(screen.getByRole("button", { name: "Open Plan / architecture agent" }));
-    expect(current()).toBe("Overview");
+    expect(current()).toBe("Dashboard");
   });
 
   /**

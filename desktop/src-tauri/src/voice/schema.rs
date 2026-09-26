@@ -192,7 +192,7 @@ pub fn needs_labels(row: &super::table::CommandRow) -> bool {
 /// Why `open_deck` is unavailable while the deck is hidden (issue #1198) —
 /// the hint the model is shown and the refusal a user reads
 /// (`Not here — <hint>.`).
-pub const DECK_HIDDEN_HINT: &str = "the deck is an experimental screen, and this app shows it \
+pub const DECK_HIDDEN_HINT: &str = "the Daemons screen is an experimental screen, and this app shows it \
     only while the experimental flag is on";
 
 /// The registry entry the deck's row invokes (`desktop/src/lib/voiceActions.ts`).

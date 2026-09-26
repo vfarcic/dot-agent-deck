@@ -1035,8 +1035,8 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
   const setPromptsOpen = (open: boolean) => setOverlay("prompts", open);
   const [selectedPromptId, setSelectedPromptId] = useState("");
   const [terminalFocus, setTerminalFocus] = useState<{ agentId: string; token: number }>();
-  const orchestrationOpen = overlays.open.workflow ?? false;
-  const setOrchestrationOpen = (open: boolean) => setOverlay("workflow", open);
+  const orchestrationOpen = overlays.open.orchestration ?? false;
+  const setOrchestrationOpen = (open: boolean) => setOverlay("orchestration", open);
   const [paletteOpen, setPaletteOpen] = useState(false);
   const helpOpen = overlays.open.shortcuts ?? false;
   const setHelpOpen = (open: boolean) => setOverlay("shortcuts", open);
@@ -1604,7 +1604,7 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
     ...(features.showProjects ? [{ label: "Manage projects", hint: "Choose projects & orchestrations", icon: FolderGit2, run: () => VOICE_ACTIONS.openProjects.run(voiceContext) }] : []),
     ...(features.showPrompts ? [{ label: "Open prompt library", hint: "Reusable orchestration task prompts", icon: BookMarked, run: () => VOICE_ACTIONS.openPromptLibrary.run(voiceContext) }] : []),
     ...(features.showAgentProfiles ? [{ label: "Open agent profiles", hint: "Configure models & permissions", icon: Bot, run: () => VOICE_ACTIONS.openAgentProfiles.run(voiceContext) }] : []),
-    ...(features.showWorkflows ? [{ label: "Edit orchestration order", hint: "Enable, skip, or reorder roles", icon: Network, run: () => VOICE_ACTIONS.openOrchestrationOrder.run(voiceContext) }] : []),
+    ...(features.showOrchestrations ? [{ label: "Edit orchestration order", hint: "Enable, skip, or reorder roles", icon: Network, run: () => VOICE_ACTIONS.openOrchestrationOrder.run(voiceContext) }] : []),
     { label: "Open settings", hint: "Appearance and other app preferences", icon: Settings2, run: () => VOICE_ACTIONS.openSettings.run(voiceContext) },
     { label: evidenceOpen ? "Hide events drawer" : "Show events drawer", hint: "Toggle transition events", icon: PanelRight, run: () => VOICE_ACTIONS.toggleEvidenceDrawer.run(voiceContext) },
     ...snapshot.agents.map((agent, index) => ({ label: `Focus ${agent.role}`, hint: `Shortcut ${index + 1}`, icon: SquareTerminal, run: () => VOICE_ACTIONS.focusAgent.run(voiceContext, { agentId: agent.id }) })),

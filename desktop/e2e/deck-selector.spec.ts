@@ -280,19 +280,19 @@ test.describe("the Deck selector's state line", () => {
 });
 
 /**
- * Scenario (#1083): on the deck screen with the crowded fixture, choose All
- * Decks. The body says "Select a deck to see its runs" and no agent tile is on
- * screen. Then choose build-box in the same selector, and the tiles are back.
- * (The Workflows sheet's note is live-mode only — the fixture preview has no
+ * Scenario (#1083): on the Daemons screen with the crowded fixture, choose All
+ * daemons. The body says "Select a daemon to see its runs" and no agent tile
+ * is on screen. Then choose build-box in the same selector, and the tiles are
+ * back. (The Orchestrations sheet's note is live-mode only — the fixture preview has no
  * launch form — so it is covered in `App.test.tsx`, not here.)
  */
-test("the deck screen asks for a deck under All Decks, and the selector brings it back", async ({ page }) => {
+test("the Daemons screen asks for a daemon under All daemons, and the selector brings it back", async ({ page }) => {
   await openDeck(page);
   await expect(page.locator(".agent-tile").first()).toBeVisible();
 
   await (await openMenu(page)).getByTestId("deck-selector-option-all").click();
 
-  await expect(page.getByTestId("deck-select-deck")).toContainText("Select a deck to see its runs");
+  await expect(page.getByTestId("deck-select-deck")).toContainText("Select a daemon to see its runs");
   await expect(page.locator(".agent-tile")).toHaveCount(0);
 
   await (await openMenu(page)).getByTestId(`deck-selector-option-${BUILD_BOX}`).click();

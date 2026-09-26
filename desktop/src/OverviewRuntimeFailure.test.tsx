@@ -189,7 +189,7 @@ describe("an unconfirmed-stop warning outlives the failure slot (issue #1234)", 
 
     expect(screen.getByTestId("toast")).toHaveTextContent("publish-failed");
     const warning = screen.getByTestId("toast-cleanup-warning");
-    expect(warning).toHaveTextContent("1 role may still be running on Local deck");
+    expect(warning).toHaveTextContent("1 role may still be running on Local daemon");
     expect(warning).toHaveTextContent("orchestrator");
 
     // Refresh clears the sentence slot, and a successful one leaves it empty.

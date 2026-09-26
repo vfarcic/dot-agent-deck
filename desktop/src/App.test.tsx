@@ -829,7 +829,7 @@ describe("ControlDeck", () => {
    * the notice leaves the warning; only the warning's own dismiss ends it.
    */
   it("keeps a cleanup warning on screen while a deck notice holds the toast", async () => {
-    const started = "Local deck started and control channel reconnected.";
+    const started = "Local daemon started and control channel reconnected.";
     const dismissCleanupWarning = vi.fn();
     render(<ControlDeck runtime={runtime({
       mode: "live",
@@ -839,7 +839,7 @@ describe("ControlDeck", () => {
     })} />);
 
     fireEvent.click(screen.getByTestId("start-daemon"));
-    fireEvent.click(screen.getAllByRole("button", { name: "Start deck" }).at(-1)!);
+    fireEvent.click(screen.getAllByRole("button", { name: "Start daemon" }).at(-1)!);
     expect(await screen.findByText(started)).toBeInTheDocument();
     expect(screen.getByTestId("toast-cleanup-warning")).toHaveTextContent("orchestrator");
 
@@ -2265,22 +2265,22 @@ describe("ControlDeck", () => {
   });
 
   /**
-   * Scenario (#1083): the stored selection is All Decks and the deck under it
+   * Scenario (#1083): the stored selection is All daemons and the deck under it
    * is the local one, running its fixture agents. The Runs screen shows "Select
-   * a deck to see its runs" — as a note, not an alert — and no tile, terminal
+   * a daemon to see its runs" — as a note, not an alert — and no tile, terminal
    * or run instrument of the local deck, and the last shown-terminal
-   * declaration is empty. Choosing the local deck in the Deck selector, which
+   * declaration is empty. Choosing the local deck in the Daemon selector, which
    * stays live, brings the tiles back and stores the choice.
    */
-  it("shows Select a deck on the Runs screen under All Decks, and the selector still switches", async () => {
+  it("shows Select a daemon on the Runs screen under All daemons, and the selector still switches", async () => {
     const store = settingsStore({ endpoints: { remote: [], selection: "all" } });
     const live = runtime({ mode: "live", getSettings: store.getSettings, saveSettings: store.saveSettings });
     render(<ControlDeck runtime={live} />);
 
     const note = await screen.findByTestId("deck-select-deck");
-    expect(note).toHaveTextContent("Select a deck to see its runs");
+    expect(note).toHaveTextContent("Select a daemon to see its runs");
     expect(note.closest("[role='alert']")).toBeNull();
-    expect(screen.getByTestId("deck-selector-current")).toHaveTextContent("All Decks");
+    expect(screen.getByTestId("deck-selector-current")).toHaveTextContent("All daemons");
     expect(screen.queryByTestId("agent-tile-builder")).toBeNull();
     expect(screen.queryByTestId("terminal-builder")).toBeNull();
     expect(screen.queryByTestId("run-health")).toBeNull();
@@ -2296,13 +2296,13 @@ describe("ControlDeck", () => {
   });
 
   /**
-   * Scenario (#1083): All Decks is stored and the settings read has not come
+   * Scenario (#1083): All daemons is stored and the settings read has not come
    * back, so the webview still holds the defaults, which select the local
    * deck. The crate's snapshot of the local deck arrives marked `allDecks`.
-   * The Runs screen shows "Select a deck" from the first render, and no local
+   * The Runs screen shows "Select a daemon" from the first render, and no local
    * tile or terminal is ever declared shown — there is no startup flash.
    */
-  it("shows Select a deck from the first render when the snapshot says All Decks before settings load", () => {
+  it("shows Select a daemon from the first render when the snapshot says All daemons before settings load", () => {
     const live = runtime({
       mode: "live",
       snapshot: { ...createFixtureSnapshot("connected"), allDecks: true },
@@ -2310,7 +2310,7 @@ describe("ControlDeck", () => {
     });
     render(<ControlDeck runtime={live} />);
 
-    expect(screen.getByTestId("deck-select-deck")).toHaveTextContent("Select a deck to see its runs");
+    expect(screen.getByTestId("deck-select-deck")).toHaveTextContent("Select a daemon to see its runs");
     expect(screen.queryByTestId("agent-tile-builder")).toBeNull();
     expect(screen.queryByTestId("evidence-drawer")).toBeNull();
     expect(vi.mocked(live.setShownTerminals).mock.calls.every(([targets]) => targets.length === 0)).toBe(true);
@@ -2318,36 +2318,36 @@ describe("ControlDeck", () => {
 
   /**
    * Scenario (#1083): on the local deck, pick the daemon's one project and
-   * write a task, so the Workflows sheet's Launch is enabled (the control).
-   * Then select All Decks and reopen it: the sheet says "Select a deck to
-   * launch a workflow", Launch is disabled and pressing it sends nothing, and
-   * the Projects sheet says "Select a deck to see its projects" without asking
+   * write a task, so the Orchestrations sheet's Activate is enabled (the control).
+   * Then select All daemons and reopen it: the sheet says "Select a daemon to
+   * activate an orchestration", Activate is disabled and pressing it sends
+   * nothing, and the Projects sheet says "Select a daemon to see its projects" without asking
    * any deck for its projects.
    */
-  it("never launches a workflow once All Decks is selected, even with a project already chosen", async () => {
+  it("never activates an orchestration once All daemons is selected, even with a project already chosen", async () => {
     const live = liveWithProject();
     render(<ControlDeck runtime={live} />);
     await chooseTheOnlyProject();
     fireEvent.change(screen.getByLabelText("Task prompt"), { target: { value: "List the files." } });
-    expect(screen.getByTestId("launch-live-loop")).toBeEnabled();
-    fireEvent.click(screen.getByRole("button", { name: "Close workflow editor" }));
+    expect(screen.getByTestId("activate-orchestration")).toBeEnabled();
+    fireEvent.click(screen.getByRole("button", { name: "Close orchestration editor" }));
 
     fireEvent.click(screen.getByTestId("deck-selector-toggle"));
     fireEvent.click(screen.getByTestId("deck-selector-option-all"));
     await screen.findByTestId("deck-select-deck");
     const listings = vi.mocked(live.listProjects).mock.calls.length;
 
-    fireEvent.click(screen.getByRole("button", { name: "Workflows" }));
-    expect(screen.getByTestId("workflow-select-deck")).toHaveTextContent("Select a deck to launch a workflow");
+    fireEvent.click(screen.getByRole("button", { name: "Orchestrations" }));
+    expect(screen.getByTestId("orchestration-select-deck")).toHaveTextContent("Select a daemon to activate an orchestration");
     expect(screen.queryByLabelText("Task prompt")).toBeNull();
-    expect(screen.getByTestId("launch-live-loop")).toBeDisabled();
-    fireEvent.click(screen.getByTestId("launch-live-loop"));
+    expect(screen.getByTestId("activate-orchestration")).toBeDisabled();
+    fireEvent.click(screen.getByTestId("activate-orchestration"));
     expect(screen.queryByRole("alertdialog")).toBeNull();
-    expect(vi.mocked(live.runAction).mock.calls.some(([action]) => action.type === "start_workflow")).toBe(false);
-    fireEvent.click(screen.getByRole("button", { name: "Close workflow editor" }));
+    expect(vi.mocked(live.runAction).mock.calls.some(([action]) => action.type === "activate_orchestration")).toBe(false);
+    fireEvent.click(screen.getByRole("button", { name: "Close orchestration editor" }));
 
     fireEvent.click(screen.getByTestId("open-projects"));
-    expect(screen.getByTestId("projects-select-deck")).toHaveTextContent("Select a deck to see its projects");
+    expect(screen.getByTestId("projects-select-deck")).toHaveTextContent("Select a daemon to see its projects");
     expect(screen.queryByTestId("selected-project")).toBeNull();
     expect(vi.mocked(live.listProjects).mock.calls.length).toBe(listings);
   });

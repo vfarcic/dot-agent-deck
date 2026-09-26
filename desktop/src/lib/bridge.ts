@@ -1650,7 +1650,7 @@ export function normalizeDesktopFeatures(value: unknown): DesktopFeatures {
 export function fixtureDesktopFeatures(search = window.location.search): DesktopFeatures {
   const requested = new URLSearchParams(search).get("experimental")?.trim().toLowerCase();
   if (requested !== "1" && requested !== "true") return { ...DEFAULT_DESKTOP_FEATURES };
-  return { showDeck: true, showProjects: true, showPrompts: true, showWorkflows: true, showAgentProfiles: true };
+  return { showDeck: true, showProjects: true, showPrompts: true, showOrchestrations: true, showAgentProfiles: true };
 }
 
 
