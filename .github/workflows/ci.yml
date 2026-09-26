@@ -424,13 +424,13 @@ jobs:
     needs: changes
     if: needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.flake_only != 'true'
     runs-on: ubuntu-latest
-    # Derived, not measured on a runner yet: a cold debug build of the daemon
-    # and of the desktop crate dominates (4m13s for the app alone on a warm
-    # 16-core dev box, so several times that on four vCPUs), plus a
-    # `cargo install tauri-driver`, and the suite itself is well under a
-    # minute. 45 minutes caps a wedged window at a fraction of the 6-hour
-    # default. Re-tune from real runs; do not raise it to paper over a hang.
-    timeout-minutes: 45
+    # Measured once, on run 36231844544 (a workflow_dispatch of this job's own
+    # branch, cold rust-cache): 6m55s end to end — the app's `tauri build`
+    # 2m52s, the daemon's build 1m17s, `cargo install tauri-driver` 17s, the
+    # suite 86s. 30 minutes is four times that, and still caps a wedged window
+    # at a fraction of the 6-hour default. Re-tune from more runs; do not raise
+    # it to paper over a hang.
+    timeout-minutes: 30
     env:
       # The ONE place tauri-driver's version is written. renovate.json's
       # tauri-driver customManager bumps this line, and

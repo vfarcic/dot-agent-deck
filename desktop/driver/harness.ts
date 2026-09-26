@@ -22,8 +22,11 @@ const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..");
 /**
  * The bound on any one wait. Generous on purpose: a passing run never reaches
  * it, so raising it costs nothing but the time a genuine hang takes to report.
+ * 120s because the first GitHub runner measurement ran each scenario in
+ * ~37-38s end to end against 6-10s on a 16-core dev box: a bound sized from
+ * the dev box would leave a slow runner a fraction of that margin.
  */
-export const WAIT_MS = Number(process.env.DAD_DRIVER_WAIT_MS ?? 60_000);
+export const WAIT_MS = Number(process.env.DAD_DRIVER_WAIT_MS ?? 120_000);
 
 /** Polling cadence inside `waitFor`. Not a wait in its own right. */
 const POLL_MS = 100;
@@ -191,7 +194,7 @@ export class Deck {
   }
 
   /** Build the sandbox, start what `options` asks for, and open the real window on it. */
-  static async open(options: DeckOptions): Promise<Deck> {
+  static async open(options: DeckOptions, name: string): Promise<Deck> {
     if (!process.env.DISPLAY && !process.env.WAYLAND_DISPLAY) {
       throw new Error("no display: run the driver tier under `xvfb-run -a` (see docs/develop/desktop-gui.md)");
     }
@@ -200,7 +203,7 @@ export class Deck {
       if (options.daemonFirst) await deck.startDaemon();
       await deck.startWindow();
     } catch (error) {
-      await deck.close(error);
+      await deck.close(error, name);
       throw error;
     }
     return deck;
@@ -235,11 +238,39 @@ export class Deck {
       return serverReady(base);
     });
     this.session = await Session.open(base, paths.app);
+    // Past `about:blank` first: the webview's initial empty document is
+    // complete, and already carries the Tauri internals, before the app's own
+    // URL has loaded — so a wait on those alone can pass on a page about to
+    // be replaced.
+    // A window that never leaves `about:blank` is almost always the binary
+    // below: its failed dev-server load leaves WebKit's own error page
+    // ("Could not connect to localhost") over a still-blank location, which
+    // is what this was measured showing — hence the hint in the description.
+    const href = await waitFor(
+      "the window to navigate to the app (stuck on about:blank? the binary is probably a plain-cargo build " +
+        "that loads the dev server — `cargo test-fast` rebuilds it; rerun driver-test.sh without --no-build)",
+      () =>
+      this.session.execute<string | null>(
+        "return location.href !== 'about:blank' && document.readyState === 'complete' ? location.href : null",
+      ),
+    );
+    // A plain `cargo build` of the desktop crate — which `cargo test-fast`
+    // does, since the crate is a workspace member — writes a binary WITHOUT
+    // Tauri's custom protocol over the same path, and that binary loads the
+    // dev server's URL instead of the embedded bundle. Measured: every wait
+    // then timed out on a "Could not connect to localhost" page. The
+    // navigation wait above names the usual shape; this names the other.
+    if (!href.startsWith("tauri://")) {
+      throw new Error(
+        `the window loaded ${href}, not the embedded bundle: ${paths.app} was built by plain cargo ` +
+          "(cargo test-fast rebuilds it). Rebuild with `sh ./scripts/driver-test.sh` (no --no-build)",
+      );
+    }
     // The live bridge, not the fixture: a plain browser would fall back to
     // fixture transport, and every assertion after this would be about data
     // the fixture invented.
-    await waitFor("the window to load the app under Tauri", () =>
-      this.session.execute<boolean>("return document.readyState === 'complete' && !!window.__TAURI_INTERNALS__"),
+    await waitFor("the Tauri bridge in the loaded page", () =>
+      this.session.execute<boolean>("return !!window.__TAURI_INTERNALS__"),
     );
     // WebKitWebDriver places a pointer in CSS pixels without applying the
     // scale WebKitGTK derives from the screen's DPI, so on a scaled display
@@ -310,7 +341,7 @@ export class Deck {
    * Tear everything down. On failure, first keep what explains it: a
    * screenshot, the page's text and every log, under `driver-results/`.
    */
-  async close(failure?: unknown, name = "setup"): Promise<void> {
+  async close(failure?: unknown, name = "unnamed"): Promise<void> {
     if (failure !== undefined) await this.preserve(name, failure);
     try {
       await this.session?.close();
@@ -351,7 +382,7 @@ export class Deck {
 
 /** Run `body` against a fresh deck, keeping evidence if it throws. */
 export async function withDeck(name: string, options: DeckOptions, body: (deck: Deck) => Promise<void>): Promise<void> {
-  const deck = await Deck.open(options);
+  const deck = await Deck.open(options, name);
   try {
     await body(deck);
   } catch (error) {
