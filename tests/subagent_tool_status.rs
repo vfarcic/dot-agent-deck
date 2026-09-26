@@ -444,14 +444,13 @@ fn subagent_004_foreground_subagent_keeps_the_turn_working_and_its_prompt_answer
     }
 }
 
-/// Scenario: The card's turn is over (Idle) when the daemon's shell-activity
-/// scan sees a detached shell command and sets a synthetic Working
-/// (`ShellBusy`). A background subagent's tool call arrives while that stands,
-/// and then the shell command finishes (`ShellIdle`). The card must return to
-/// Idle: the subagent's call says nothing about the main thread, so it must
-/// not take the synthetic Working over as its own and strand it. The control —
-/// a main-thread call in the same spot — is a real turn taking over, and the
-/// card stays Working through the `ShellIdle`.
+/// Scenario: With the card's turn over (Idle), the daemon's shell-activity scan
+/// sets a synthetic Working (`ShellBusy`) for a detached shell command, a
+/// background subagent's tool call arrives, and the command then finishes
+/// (`ShellIdle`). The card must return to Idle, because the subagent's call says
+/// nothing about the main thread and must not take the synthetic Working over
+/// as its own and strand it. The control — a main-thread call in the same spot —
+/// is a real turn taking over, so the card stays Working through the `ShellIdle`.
 #[spec("status/subagent/005")]
 #[test]
 fn subagent_005_subagent_call_does_not_strand_a_synthetic_shell_working() {
