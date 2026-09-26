@@ -1999,20 +1999,6 @@ impl DaemonClient {
         })
     }
 
-    /// The pre-#1045 name of [`Self::prepare_orchestration`], which it calls
-    /// unchanged. Kept so callers under `tests/` that still spell it compile
-    /// while they migrate; delete it once nothing names it.
-    pub async fn prepare_workflow(
-        &self,
-        path: &str,
-        orchestration: &str,
-        task: &str,
-        config_revision: Option<&str>,
-    ) -> Result<crate::event::PreparedOrchestration, ClientError> {
-        self.prepare_orchestration(path, orchestration, task, config_revision)
-            .await
-    }
-
     /// PRD #819 M4/M6: start one role of an orchestration this daemon prepared.
     ///
     /// `prep_token: None` is byte-for-byte [`Self::start_agent`] and sends the
@@ -4234,7 +4220,7 @@ start = true
         .expect("write the project config");
         let project_wire = project.to_str().expect("utf-8 scratch path");
         let prepared = client
-            .prepare_workflow(project_wire, "loop", "", None)
+            .prepare_orchestration(project_wire, "loop", "", None)
             .await
             .expect("the preparation succeeds");
         let opts = |command: Option<&str>| StartAgentOptions {

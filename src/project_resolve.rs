@@ -1197,11 +1197,6 @@ pub fn prepare_orchestration_for_wire(
     })
 }
 
-/// The pre-#1045 name of [`prepare_orchestration_for_wire`], kept so callers
-/// under `tests/` that still spell it compile while they migrate. Rust-only —
-/// no function name reaches the wire. Delete it once nothing names it.
-pub use self::prepare_orchestration_for_wire as prepare_workflow_for_wire;
-
 /// Re-validate a preparation at spawn time: is the artifact this token was
 /// issued for still the artifact a launch would run against?
 ///

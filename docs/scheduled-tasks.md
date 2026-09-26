@@ -1,9 +1,9 @@
 ---
 sidebar_position: 5.7
-title: Scheduled Tasks
+title: Schedules
 ---
 
-# Scheduled Tasks
+# Schedules
 
 Scheduled tasks let you say *"every weekday at 09:00, run this prompt in this directory"* and have the result land in the deck where you can read it after a notification — no opening a terminal at the right time, `cd`-ing to the right place, and pasting the prompt by hand.
 
@@ -15,13 +15,13 @@ Each task pairs a **schedule** (when it runs) with a **working directory and a p
 
 ## Creating and managing schedules
 
-**Do this in the deck.** Open the **Scheduled Tasks** dialog, and an authoring agent writes the entry for you — you describe the job in plain English instead of getting cron syntax, TOML quoting and flag names right by hand.
+**Do this in the deck.** Open the **Schedules** dialog, and an authoring agent writes the entry for you — you describe the job in plain English instead of getting cron syntax, TOML quoting and flag names right by hand.
 
 The [reference section](#reference) below documents the on-disk file the agent writes. You do not need it to use this feature — it is there so you can read back what was written, and know the vocabulary (`cron`, `working_dir`, `shape`, …) to ask for what you want.
 
-### The Scheduled Tasks dialog
+### The Schedules dialog
 
-Press **`s`** on the dashboard (lowercase; the legacy uppercase **`S`** also works) to open the **Scheduled Tasks** manager — your one place to see and manage every schedule. Its **`[Scheduled Tasks s]`** button is **always present on the dashboard**: it doesn't wait for a schedule to exist, because the manager's **`[Add]`** action is itself how you create the first one. You never type field values into the dialog itself — **`[Add]`** and **`[Edit]`** hand you to the authoring agent described below, which does the writing for you.
+Press **`s`** on the dashboard (lowercase; the legacy uppercase **`S`** also works) to open the **Schedules** manager — your one place to see and manage every schedule. Its **`[Schedules s]`** button is **always present on the dashboard**: it doesn't wait for a schedule to exist, because the manager's **`[Add]`** action is itself how you create the first one. You never type field values into the dialog itself — **`[Add]`** and **`[Edit]`** hand you to the authoring agent described below, which does the writing for you.
 
 Rows are **click-selectable**. Each row shows the task **name**, a **status** indicator, and its **next-fire** time:
 
@@ -53,7 +53,7 @@ Actions — the footer buttons mirror the keys, shown as `[Add a]` `[Edit e]` `[
 
 Both doors below open the same guided session:
 
-- **From the Scheduled Tasks dialog** — press **`s`** on the dashboard, then **`a`** / **`[Add]`** to author a new one (or **`e`** / **`[Edit]`** to start from an existing row's values). First a **directory picker** (the dir you choose becomes the authoring session's working directory, and is pre-seeded as the schedule's own working directory), then a small **New Schedule** / **Edit Schedule** form with a **Dir** and a free-text **Command** field (pre-filled from your `default_command`). Confirm to start the authoring session in that directory running that command; **`Esc`** / **`[Cancel]`** returns you to the dialog.
+- **From the Schedules dialog** — press **`s`** on the dashboard, then **`a`** / **`[Add]`** to author a new one (or **`e`** / **`[Edit]`** to start from an existing row's values). First a **directory picker** (the dir you choose becomes the authoring session's working directory, and is pre-seeded as the schedule's own working directory), then a small **New Schedule** / **Edit Schedule** form with a **Dir** and a free-text **Command** field (pre-filled from your `default_command`). Confirm to start the authoring session in that directory running that command; **`Esc`** / **`[Cancel]`** returns you to the dialog.
 - **From the new-deck / new-pane dialog** — open it (`Ctrl+n`), confirm a directory, and cycle the **Mode** field to the end — past your project's workload modes — to the built-in **`schedule`** option (marked as an *authoring session*).
 
 Either way a throwaway authoring session opens — running your chosen agent command, which defaults to your configured [`default_command`](configuration.md#default-command) and falls back to `claude` when that is unset — and walks you through it. It:

@@ -307,7 +307,7 @@ The agent's own output fills the history back in as it keeps working.
 
 ## The deck is missing cards — a role or session I know is running has no card
 
-Check the deck's title row first. If it reads something like `dot-agent-deck — 7 session(s)  (↓2)`, nothing is wrong with the agents: the count is right, and the `(↓2)` says two cards are below the bottom of the window. `(↑2)` means two are above it, and both appear together when you are scrolled into the middle. Move the selection with `j` / `k` (or the arrow keys) to bring them into view, or give the terminal a few more rows and they all fit again.
+Check the deck's title row first. If it reads something like `dot-agent-deck — 7 agent(s)  (↓2)`, nothing is wrong with the agents: the count is right, and the `(↓2)` says two cards are below the bottom of the window. `(↑2)` means two are above it, and both appear together when you are scrolled into the middle. Move the selection with `j` / `k` (or the arrow keys) to bring them into view, or give the terminal a few more rows and they all fit again.
 
 The deck fits as many cards as it can before it resorts to this. It picks the number of card columns and the card size together, widening the grid to a second or third column when that is what it takes to show every card, so the marker only appears on a window genuinely too small for the cards at any layout — a very short terminal, or a very large number of sessions.
 

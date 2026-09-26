@@ -1606,12 +1606,6 @@ pub struct PreparedOrchestration {
     pub prompt: String,
 }
 
-/// The pre-#1045 name of [`PreparedOrchestration`]. A Rust-only alias — the
-/// type name never reaches the wire — kept so callers under `tests/` that still
-/// spell the old name compile while they migrate; delete it once nothing names
-/// it (`grep -rn PreparedWorkflow`).
-pub type PreparedWorkflow = PreparedOrchestration;
-
 /// The daemon's reply to a [`DaemonMessage::Delegate`], one JSON line back on
 /// the hook-socket connection (the [`GetSeedResponse`] / [`ListTargetsResponse`]
 /// pattern).

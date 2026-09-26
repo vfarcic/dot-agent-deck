@@ -231,7 +231,7 @@ fn project_launch_003_a_real_coordinator_reads_the_daemon_published_context() {
     );
     let prepared = resp
         .workflow_prepared
-        .expect("a successful PrepareWorkflow must carry a PreparedWorkflow");
+        .expect("a successful PrepareWorkflow must carry a PreparedOrchestration");
 
     // Preconditions, not the claim — `project/launch/001` owns the publish
     // contract. They are here so a red run says WHICH half broke: the daemon

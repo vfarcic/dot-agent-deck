@@ -271,4 +271,4 @@ So the part of this page that is a real feature degrades gracefully, and the par
 
 - [Orchestration](orchestration.md) — how delegation, `work-done`, and role configuration work
 - [Configuration](configuration.md) — the rest of `.dot-agent-deck.toml` and the global settings
-- [Scheduled Tasks](scheduled-tasks.md) — the other long-running, daemon-owned surface where a run finishes while you are not watching
+- [Schedules](scheduled-tasks.md) — the other long-running, daemon-owned surface where a run finishes while you are not watching

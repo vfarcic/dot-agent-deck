@@ -3613,7 +3613,7 @@ async fn start_orchestration_action(
     // says anything useful, so it is waited out instead.
     let prepared = daemon
         .client
-        .prepare_workflow(&path, &orchestration, "", config_revision.as_deref())
+        .prepare_orchestration(&path, &orchestration, "", config_revision.as_deref())
         .await
         .map_err(|error| safe_message(error.to_string()))?;
     // Both are `#[serde(default)]` on the reply, and neither may be invented

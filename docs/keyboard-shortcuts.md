@@ -9,7 +9,7 @@ title: Keyboard Shortcuts
 
 Every keyboard action below is also reachable with the mouse. Every clickable control shows its keyboard shortcut inline, so the on-screen controls double as a legend. On a dashboard card, a single click selects it and a double click focuses its pane.
 
-**The wheel goes to whatever the pointer is over.** It scrolls the focused pane while the pointer is inside that pane — or a mode tab's side pane when the pointer is over one. Elsewhere on the deck the wheel does nothing: over the card list, the stats bar, the tab bar, the bottom button bar, a pane's border, or a pane that is not the focused one, it is dropped — the same way a click that lands on nothing is. Point at the pane you want to scroll. (The card grid has no scroll of its own — it moves only as a consequence of moving the selection.) An open dialog is its own case: while the Scheduled Tasks manager is up it takes the wheel for its own list, and the other modals swallow it rather than let it reach the pane behind them.
+**The wheel goes to whatever the pointer is over.** It scrolls the focused pane while the pointer is inside that pane — or a mode tab's side pane when the pointer is over one. Elsewhere on the deck the wheel does nothing: over the card list, the stats bar, the tab bar, the bottom button bar, a pane's border, or a pane that is not the focused one, it is dropped — the same way a click that lands on nothing is. Point at the pane you want to scroll. (The card grid has no scroll of its own — it moves only as a consequence of moving the selection.) An open dialog is its own case: while the Schedules manager is up it takes the wheel for its own list, and the other modals swallow it rather than let it reach the pane behind them.
 
 In command mode the wheel always drives Agent Deck's own scrollback and is never forwarded to the agent, so a full-screen TUI cannot move under you while you read. While you are typing in a pane, the wheel goes to the agent if the agent has mouse reporting enabled — and it carries the cell the pointer is actually on, which is why a wheel from outside the pane is dropped rather than delivered at the nearest edge.
 
@@ -20,7 +20,7 @@ In command mode the wheel always drives Agent Deck's own scrollback and is never
 | Key | Action | Works from |
 |---|---|---|
 | `Ctrl+D` | Toggle between command mode and the pane — press it in a pane to reach the dashboard, press it again to go back to the pane you came from | Any mode |
-| `Ctrl+N` | New pane (directory picker, then name + command form) | Any mode |
+| `Ctrl+N` | New agent (directory picker, then name + command form) | Any mode |
 | `Ctrl+T` | Toggle stacked / tiled layout — stacked shows only the focused pane at full height, tiled shows every pane at once | Any mode |
 | `Ctrl+L` | Toggle the orchestration sidebar/pane-column split ratio between 34/66 and 25/75 (applies to every orchestration tab) | **Orchestration tabs, command mode only** |
 | `Ctrl+Z` | Zoom the focused agent pane — it takes the whole frame. Press again to restore. See [`Ctrl+Z` zooms the focused agent pane](#ctrlz-zooms-the-focused-agent-pane). | **Dashboard and orchestration tabs, command mode only** |
@@ -108,10 +108,10 @@ Command mode. If you're typing in a pane, press `Ctrl+D` first — otherwise the
 | `Enter` | Focus the selected card's pane |
 | `PageUp` | Scroll the focused pane back (see [Scrolling back through a pane](#scrolling-back-through-a-pane)) |
 | `PageDown` | Scroll the focused pane forward |
-| `/` | Filter sessions (see [Dialogs](#dialogs)) |
-| `r` | Rename selected session (see [Dialogs](#dialogs)) |
+| `/` | Filter agents (see [Dialogs](#dialogs)) |
+| `r` | Rename selected agent (see [Dialogs](#dialogs)) |
 | `g` | Generate `.dot-agent-deck.toml` (see [Dialogs](#dialogs)) |
-| `s` | Open the **Scheduled Tasks** manager (`S` also works) (see [Scheduled Tasks](./scheduled-tasks.md)) |
+| `s` | Open the **Schedules** manager (`S` also works) (see [Schedules](./scheduled-tasks.md)) |
 | `?` | Toggle help overlay |
 | `y` / `n` | Approve / deny a pending permission request (only when an agent is waiting) |
 | `Esc` | Clear active filter |
@@ -148,7 +148,7 @@ It can look like "scrolling works fine outside Agent Deck": scrolling up during 
 
 Directory lists loop end-to-end, and the `..` parent entry stays visible even when a filter is active.
 
-## New Pane / Mode Form
+## New Agent / Mode Form
 
 | Key | Action |
 |---|---|
@@ -212,8 +212,8 @@ help = "F1"                      # open help with F1 instead of ?
 | Action | Default | Description |
 |---|---|---|
 | `dashboard` | `Ctrl+d` | Toggle between command mode and the pane — any mode |
-| `new_pane` | `Ctrl+n` | New pane (directory picker → name + command) — any mode |
-| `close_pane` | `Ctrl+w` | Close selected pane / tear down mode tab, with confirmation — **command mode only** |
+| `new_pane` | `Ctrl+n` | New agent (directory picker → name + command) — any mode |
+| `close_pane` | `Ctrl+w` | Close selected agent / tear down mode tab, with confirmation — **command mode only** |
 | `toggle_layout` | `Ctrl+t` | Toggle stacked / tiled layout — any mode |
 | `toggle_orchestration_lock` | `Ctrl+e` | **Experimental — requires the `experimental` flag.** Toggle the orchestration command-entry lock — **command mode only, on an orchestration tab** |
 | `toggle_orchestration_split` | `Ctrl+l` | Toggle the orchestration split between 34/66 and 25/75, for every orchestration tab — **orchestration tabs, command mode only** |
@@ -230,8 +230,8 @@ The section name is the TOML table a binding is read from, not the modes it appl
 | `move_up` | `k` | Select previous card |
 | `move_left` | `h` | Previous tab |
 | `move_right` | `l` | Next tab |
-| `filter` | `/` | Filter sessions |
-| `rename` | `r` | Rename selected session |
+| `filter` | `/` | Filter agents |
+| `rename` | `r` | Rename selected agent |
 | `help` | `?` | Toggle help overlay |
 | `focus_pane` | `Enter` | Focus selected pane |
 | `clear_filter` | `Esc` | Clear active filter |
