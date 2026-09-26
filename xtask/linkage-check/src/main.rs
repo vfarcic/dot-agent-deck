@@ -1186,13 +1186,19 @@ fn rule_git_program_literal(inputs: &Inputs) -> Vec<String> {
     git_program_literal::run(&inputs.root)
 }
 
-/// Rule 14 (PRD #802 M3). Read straight off its own four files for rule 12's
-/// reason — a different tree, and an input going missing must be reported
-/// rather than quietly emptying the rule.
+/// Rule 18 (PRD #1195 M2). Its own walk of `desktop/src/` — the context types
+/// and construction sites are derived from the whole production tree, the
+/// owned setters are then checked in the app shell's files — with a TSX lexer
+/// of its own, for rule 12's reason as well: a different tree, and an input
+/// going missing (the shell files, `VoiceActionContext`, a construction site)
+/// must be reported rather than quietly emptying the rule.
 fn rule_voice_capability_state(inputs: &Inputs) -> Vec<String> {
     voice_capability_state::run(&inputs.root)
 }
 
+/// Rule 14 (PRD #802 M3). Read straight off its own four files for rule 12's
+/// reason — a different tree, and an input going missing must be reported
+/// rather than quietly emptying the rule.
 fn rule_voice_command_registry(inputs: &Inputs) -> Vec<String> {
     voice_command_registry::run(&inputs.root)
 }

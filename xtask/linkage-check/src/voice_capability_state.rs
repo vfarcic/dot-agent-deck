@@ -32,7 +32,10 @@
 //!    - inside another construction site,
 //!    - its own declaration (`const [x, setX] = useState(…)`, `const setX = …`,
 //!      a destructuring on one line),
-//!    - a hook dependency array (`[…, setX])`), which reads and never writes,
+//!    - a hook dependency array — the last argument of `useEffect`,
+//!      `useMemo`, `useCallback` and their siblings ([`DEPENDENCY_HOOKS`]) —
+//!      which reads and never writes; a list handed to any other function is
+//!      a setter handed away, and is a finding,
 //!    - a **dismissal**: a call whose last argument is the literal `false`. A
 //!      close turns a capability off; the registry deliberately holds the
 //!      opening half, and `DeckSurface`'s `Escape` handler already argues that
@@ -85,8 +88,18 @@
 //!   but an alias (`const open = setOverlay`) is a reference like any other and
 //!   is flagged, so the gap is only in what the alias is then used for.
 //! - **A construction site written another way** (`{ … } satisfies T`, an
-//!   `interface`). It owns nothing, so its setters' `useState` then fails
-//!   assertion 2 — the backstop is deliberate, but it is a backstop.
+//!   `interface`, a context returned by a helper). It owns nothing, so its
+//!   setters' `useState` then fails assertion 2 — the backstop is deliberate,
+//!   but it is a backstop. The recognised forms are an annotated `const`/`let`
+//!   literal, `useMemo<T>(() => ({ … }))`, and `useMemo<T>(() => { …; return
+//!   { … }; })`, whose literal is a `return` at the callback body's top level.
+//! - **Two unpaired quotes on one line of JSX text.** A quote that reaches the
+//!   end of its line opened no string and is read back as text (a TS string
+//!   cannot hold a raw newline), but two on one line — `Don't … won't` — look
+//!   like a string between them, and a setter written between the two is
+//!   blanked with it. A single apostrophe no longer hides anything.
+//! - **A symlinked directory under `desktop/src`** is not followed: it is
+//!   reported as an unsupported layout rather than skipped.
 //!
 //! # Budget
 //!
@@ -124,8 +137,8 @@ pub const CAPABILITY_STATE_RULE: &str = "PRD #1195 rule 18: a `set*` state sette
      comment, and every `useState` in those files is registry-owned or carries that comment. A new control \
      opens a capability through `VOICE_ACTIONS[id].run(...)`, not through the setter. WHAT THIS RULE DOES NOT \
      SEE: state held outside those two files (`AgentOverview.tsx` is the known one), and a capability reached \
-     through a callback prop or helper rather than a `set*` identifier — a green rule 18 is NOT evidence that \
-     every capability is registered";
+     through a callback prop or helper rather than a `set*` identifier, or written between two unpaired quotes \
+     on one line of JSX text — a green rule 18 is NOT evidence that every capability is registered";
 
 /// The texts the rule reads: every production `.ts`/`.tsx` under
 /// [`DESKTOP_SRC`], keyed by repo-relative path with `/` separators.
@@ -184,6 +197,33 @@ fn walk(root: &Path, dir: &Path, out: &mut BTreeMap<String, String>, findings: &
         if file_type.is_dir() {
             walk(root, &path, out, findings);
             continue;
+        }
+        // `file_type` does not follow a symlink, so a linked directory is
+        // neither a directory nor a source file above — and skipping it would
+        // shrink the scan without a word. The walk does not follow links (a
+        // cycle, or a target outside `desktop/src`, would need containment
+        // and cycle checks this rule has no use for), so a linked directory is
+        // an unsupported layout and says so. A linked FILE is read below like
+        // any other, through the link.
+        if file_type.is_symlink() {
+            match std::fs::metadata(&path) {
+                Ok(target) if target.is_dir() => {
+                    findings.push(format!(
+                        "{} is a symlink to a directory — rule 18 does not follow directory links, so the \
+                         sources behind it would go unscanned. Replace it with a real directory",
+                        path.display()
+                    ));
+                    continue;
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    findings.push(format!(
+                        "{} is a symlink rule 18 cannot resolve: {error}",
+                        path.display()
+                    ));
+                    continue;
+                }
+            }
         }
         let name = entry.file_name().to_string_lossy().into_owned();
         if !is_production_source(&name) {
@@ -464,6 +504,14 @@ fn construction_sites(masked: &str, context_types: &BTreeSet<String>) -> Vec<Ran
         r"useMemo\s*<\s*(?:Partial\s*<\s*)?(?:{names})\b\s*>?\s*>\s*\(\s*\(\s*\)\s*=>\s*\(\s*\{{"
     ))
     .expect("derived regex");
+    // `useMemo<T>(() => { …; return { … }; })`: the literal is whatever the
+    // callback's own body returns — at the body's top level, so a `return`
+    // inside a nested function there is not mistaken for it.
+    let memo_block = Regex::new(&format!(
+        r"useMemo\s*<\s*(?:Partial\s*<\s*)?(?:{names})\b\s*>?\s*>\s*\(\s*\(\s*\)\s*=>\s*\{{"
+    ))
+    .expect("derived regex");
+    let returned = Regex::new(r"\breturn\s*\(?\s*\{").expect("static regex");
     let mut sites = Vec::new();
     for found in annotated.find_iter(masked).chain(memo.find_iter(masked)) {
         let open = found.end() - 1;
@@ -471,8 +519,37 @@ fn construction_sites(masked: &str, context_types: &BTreeSet<String>) -> Vec<Ran
             sites.push(open..close + 1);
         }
     }
+    for found in memo_block.find_iter(masked) {
+        let body = found.end() - 1;
+        let Some(body_end) = matching(masked, body) else {
+            continue;
+        };
+        for literal in returned.find_iter(&masked[body + 1..body_end]) {
+            let at = body + 1 + literal.start();
+            if depth_within(masked, body + 1, at) != 0 {
+                continue;
+            }
+            let open = body + 1 + literal.end() - 1;
+            if let Some(close) = matching(masked, open) {
+                sites.push(open..close + 1);
+            }
+        }
+    }
     sites.sort_by_key(|site| site.start);
     sites
+}
+
+/// How many brackets are open between `from` and `to`, over masked text.
+fn depth_within(masked: &str, from: usize, to: usize) -> usize {
+    let mut depth = 0usize;
+    for byte in &masked.as_bytes()[from..to] {
+        match byte {
+            b'{' | b'(' | b'[' => depth += 1,
+            b'}' | b')' | b']' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    depth
 }
 
 /// The `set*` identifiers named inside the construction sites.
@@ -506,8 +583,24 @@ fn is_declaration(masked: &str, at: usize) -> bool {
         .is_match(&masked[line_start..at])
 }
 
+/// The React hooks whose last argument is a dependency array. A list passed to
+/// anything else is an ordinary argument, and a setter in it is a setter
+/// handed away.
+const DEPENDENCY_HOOKS: &[&str] = &[
+    "useEffect",
+    "useLayoutEffect",
+    "useInsertionEffect",
+    "useMemo",
+    "useCallback",
+    "useImperativeHandle",
+];
+
 /// Inside a hook's dependency array: a `[` after a `,`, holding only
-/// identifiers and member accesses, closed by a `]` that a `)` follows.
+/// identifiers and member accesses, closed by a `]` that the `)` of a call to
+/// one of [`DEPENDENCY_HOOKS`] follows — so it is that call's LAST argument.
+/// `register(handler, [setOverlay])` is not one: a list handed to any other
+/// function is a second route to the setter, which is what this rule exists to
+/// see.
 fn in_dependency_array(masked: &str, at: usize) -> bool {
     let bytes = masked.as_bytes();
     let mut depth = 0usize;
@@ -533,7 +626,62 @@ fn in_dependency_array(masked: &str, at: usize) -> bool {
         .all(|character| character.is_alphanumeric() || " \t\r\n_$.,?!".contains(character));
     let before = masked[..open].trim_end();
     let after = masked[close + 1..].trim_start();
-    inside_is_a_list && before.ends_with(',') && after.starts_with(')')
+    if !(inside_is_a_list && before.ends_with(',') && after.starts_with(')')) {
+        return false;
+    }
+    let call_close = masked.len() - after.len();
+    matching_back(masked, call_close).is_some_and(|call_open| {
+        callee(masked, call_open).is_some_and(|name| DEPENDENCY_HOOKS.contains(&name))
+    })
+}
+
+/// The bracket opening the one at `close`, over masked text.
+fn matching_back(masked: &str, close: usize) -> Option<usize> {
+    let bytes = masked.as_bytes();
+    let mut depth = 0usize;
+    for index in (0..=close).rev() {
+        match bytes[index] {
+            b'}' | b')' | b']' => depth += 1,
+            b'{' | b'(' | b'[' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(index);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// The identifier a call's `(` at `open` belongs to — through a `React.`
+/// prefix and a type-argument list (`useMemo<RailContext>(`) — or `None`.
+fn callee(masked: &str, open: usize) -> Option<&str> {
+    let mut end = masked[..open].trim_end().len();
+    if masked[..end].ends_with('>') {
+        // Walk back over `<…>`, not counting the `>` of an arrow `=>`.
+        let bytes = masked.as_bytes();
+        let mut depth = 0usize;
+        let mut index = end;
+        loop {
+            index = index.checked_sub(1)?;
+            match bytes[index] {
+                b'>' if index == 0 || bytes[index - 1] != b'=' => depth += 1,
+                b'<' => {
+                    depth = depth.checked_sub(1)?;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        end = masked[..index].trim_end().len();
+    }
+    let start = masked[..end]
+        .rfind(|character: char| !(character.is_alphanumeric() || matches!(character, '_' | '$')))
+        .map_or(0, |found| found + 1);
+    (start < end).then(|| &masked[start..end])
 }
 
 /// A call starting at `after_name` whose last argument is the literal `false`.
@@ -615,9 +763,11 @@ struct Lexed {
 ///
 /// **TSX, not TypeScript**: a `${ … }` inside a template literal is code (a
 /// setter can be called there), a regex literal is not, and JSX's `/>` and
-/// `</` are not the start of one. A `'` string ends at the line's end, the way
-/// rule 14's scanner treats it, so an apostrophe in JSX text blanks at most the
-/// rest of its line.
+/// `</` are not the start of one. A quote that meets the end of its line
+/// before its partner opened no string — a TS string cannot hold a raw newline
+/// — so it is taken back as JSX text and the rest of the line is read as code.
+/// Two unpaired quotes on ONE line of JSX text still pair up, and what lies
+/// between them is blanked; the module comment lists that residual.
 ///
 /// It refuses rather than guesses: ending inside a comment, string or
 /// template, or with unbalanced brackets, is reported, because every assertion
@@ -645,6 +795,9 @@ fn mask_tsx(text: &str) -> Lexed {
     // One entry per open `${`: how many `{` deep the expression is.
     let mut templates: Vec<usize> = Vec::new();
     let mut escaped = false;
+    // Where the open quote string began: its char index and `out`'s length
+    // then, so a "string" that meets its line's end can be taken back.
+    let mut string_start = (0usize, 0usize);
     let mut at = 0usize;
     while at < chars.len() {
         let character = chars[at];
@@ -674,6 +827,7 @@ fn mask_tsx(text: &str) -> Lexed {
                     '"' | '\'' => {
                         state = State::Str(character);
                         escaped = false;
+                        string_start = (at, out.len());
                         out.push(' ');
                     }
                     '`' => {
@@ -722,7 +876,19 @@ fn mask_tsx(text: &str) -> Lexed {
                     escaped = false;
                 } else if character == '\\' {
                     escaped = true;
-                } else if character == quote || character == '\n' {
+                } else if character == '\n' {
+                    // A TS string cannot hold a raw newline, so a quote that
+                    // reaches one opened no string: it is JSX text — "Don't",
+                    // "5' tall". Take it back and read the rest of its line as
+                    // code, where a same-line setter write would otherwise
+                    // have been blanked with it.
+                    let (quote_at, out_len) = string_start;
+                    out.truncate(out_len);
+                    out.push(' ');
+                    state = State::Code;
+                    at = quote_at + 1;
+                    continue;
+                } else if character == quote {
                     state = State::Code;
                 }
                 blank(&mut out, character);
@@ -1145,6 +1311,102 @@ export function Shell() {
             "  const s = `${setPanelOpen(true)}`;\n  return <Panel",
         );
         assert_one_finding(&findings_for(&loud), "`setPanelOpen` is written outside");
+    }
+
+    /// Review finding (PRD #1195 M2): an apostrophe in JSX text used to open a
+    /// "string" that ran to the end of its line and blanked a same-line setter
+    /// write. It no longer hides one — and a real string on that line is
+    /// still not code.
+    #[test]
+    fn an_apostrophe_in_jsx_text_hides_no_setter_after_it() {
+        let loud = APP.replace(
+            "  return <Panel",
+            "  const hint = <p>Don't {ready && setPanelOpen(true)}</p>;\n  return <Panel",
+        );
+        assert_one_finding(&findings_for(&loud), "`setPanelOpen` is written outside");
+        let quiet = APP.replace(
+            "  return <Panel",
+            "  const hint = <p>Don't press {\"setPanelOpen(true)\"}</p>;\n  return <Panel",
+        );
+        assert_eq!(findings_for(&quiet), Vec::<String>::new());
+    }
+
+    /// Review finding: the block-bodied `useMemo<T>(() => { return { … }; })`
+    /// is a construction site too — its setters are owned, and a `return`
+    /// inside a nested function in that body is not mistaken for the literal.
+    #[test]
+    fn a_block_bodied_memoised_context_is_a_construction_site() {
+        let app = APP
+            .replace(
+                "  const context: ScreenContext = {",
+                "  const [drawer, setDrawer] = useState(false);\n  const context = useMemo<ScreenContext>(() => {\n    const inner = () => { return { navigate: setDrawer }; };\n    return {",
+            )
+            .replace(
+                "    openOverlay: () => setPanelOpen(true),\n  };",
+                "    openOverlay: () => setPanelOpen(true),\n    };\n  }, []);",
+            );
+        // `setDrawer` is named only in the NESTED function's `return`, so it
+        // is not owned and its `useState` is unclassified — the one finding —
+        // while the real literal's `setView` and `setPanelOpen` are owned.
+        assert_one_finding(
+            &findings_for(&app),
+            "`drawer` (setter `setDrawer`) is not registry-owned",
+        );
+        let clean = APP
+            .replace(
+                "  const context: ScreenContext = {",
+                "  const context = useMemo<ScreenContext>(() => {\n    return {",
+            )
+            .replace(
+                "    openOverlay: () => setPanelOpen(true),\n  };",
+                "    openOverlay: () => setPanelOpen(true),\n    };\n  }, []);",
+            );
+        assert_eq!(findings_for(&clean), Vec::<String>::new());
+    }
+
+    /// Review finding: a list of setters handed to a function that is not a
+    /// React hook is a second route to the setter, not a dependency array.
+    #[test]
+    fn a_setter_list_passed_to_a_non_hook_fails() {
+        let handed = APP.replace(
+            "  return <Panel",
+            "  register(handler, [setPanelOpen]);\n  return <Panel",
+        );
+        assert_one_finding(&findings_for(&handed), "`setPanelOpen` is written outside");
+        for hook in [
+            "useMemo<ScreenContext>",
+            "useCallback",
+            "React.useLayoutEffect",
+        ] {
+            let deps = APP.replace(
+                "  return <Panel",
+                &format!("  const x = {hook}(() => 1, [setPanelOpen]);\n  return <Panel"),
+            );
+            assert_eq!(findings_for(&deps), Vec::<String>::new(), "{hook}");
+        }
+    }
+
+    /// Review finding: a symlinked directory under `desktop/src` used to be
+    /// skipped without a word. It is reported as an unsupported layout.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_directory_is_reported_rather_than_skipped() {
+        let tree = tempfile::tempdir().expect("a temp dir");
+        let src = tree.path().join(DESKTOP_SRC);
+        let elsewhere = tree.path().join("elsewhere");
+        std::fs::create_dir_all(&src).expect("src");
+        std::fs::create_dir_all(&elsewhere).expect("elsewhere");
+        std::fs::write(elsewhere.join("Hidden.tsx"), "export const x = 1;\n").expect("write");
+        std::os::unix::fs::symlink(&elsewhere, src.join("linked")).expect("symlink");
+        let mut out = BTreeMap::new();
+        let mut findings = Vec::new();
+        walk(tree.path(), &src, &mut out, &mut findings);
+        assert_eq!(findings.len(), 1, "{findings:#?}");
+        assert!(
+            findings[0].contains("symlink to a directory"),
+            "{findings:#?}"
+        );
+        assert!(out.is_empty(), "the linked sources were not read: {out:?}");
     }
 
     #[test]
