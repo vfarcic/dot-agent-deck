@@ -25,3 +25,19 @@ pub const OUT_DIR_ENV: &str = "DAD_DOCS_SCREENSHOTS_OUT";
 /// pay for a `vite build` whose output nothing loads. Any other value, or
 /// none, builds, which keeps a hand-run of the config correct by default.
 pub const WEB_BUILD_ENV: &str = "DAD_DOCS_SCREENSHOTS_WEB";
+
+/// The environment variable carrying the localhost port the desktop leg's
+/// `vite preview` binds and Playwright's `baseURL` points at.
+/// `cargo docs-screenshots` picks a free one per invocation, so two concurrent
+/// runs on one machine never share a server; the config keeps `--strictPort`,
+/// so a run that loses the race for its port fails rather than screenshotting
+/// somebody else's bundle. Unset — a hand-run of the config — uses 4183.
+pub const PORT_ENV: &str = "DAD_DOCS_SCREENSHOTS_PORT";
+
+/// The environment variable naming this invocation's private scratch directory
+/// (`target/docs-screenshots/run-<pid>`). The config puts the web build it
+/// serves and Playwright's own output there, so a concurrent run's `vite build`
+/// cannot empty the bundle this run is serving. Unset — a hand-run of the
+/// config — keeps vite's default `dist/` and a `test-results/` under
+/// `desktop/`.
+pub const RUN_DIR_ENV: &str = "DAD_DOCS_SCREENSHOTS_RUN_DIR";

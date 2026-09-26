@@ -104,7 +104,9 @@ struct Agent {
     /// How long ago its last event was. At least an hour on purpose: the card
     /// prints elapsed time as `1h 5m` from an hour up and as `5m 12s` below
     /// it, so only hour-scale ages read the same across the seconds a capture
-    /// takes.
+    /// takes. It is also the agent's uptime: `session_start` carries the same
+    /// timestamp, and the desktop fixture's `DOCS_AGE_MINUTES` feeds both its
+    /// Uptime and Last activity columns from this value.
     quiet_for_minutes: i64,
 }
 

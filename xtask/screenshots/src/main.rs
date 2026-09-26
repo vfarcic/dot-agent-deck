@@ -19,11 +19,13 @@
 //! rest.
 
 use std::collections::BTreeSet;
+use std::ffi::OsString;
+use std::net::{Ipv4Addr, TcpListener};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
 use xtask_screenshots::scenarios::{self, Client, SCENARIOS, Scenario};
-use xtask_screenshots::{OUT_DIR_ENV, TUI_HTML_DIR_ENV, WEB_BUILD_ENV};
+use xtask_screenshots::{OUT_DIR_ENV, PORT_ENV, RUN_DIR_ENV, TUI_HTML_DIR_ENV, WEB_BUILD_ENV};
 
 const USAGE: &str = "\
 usage: cargo docs-screenshots [--list] [--scenario <name>]... [--client tui|desktop]... [--out <dir>]
@@ -145,11 +147,59 @@ fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
 
-fn target_dir(root: &Path) -> PathBuf {
-    match std::env::var_os("CARGO_TARGET_DIR") {
-        Some(dir) => PathBuf::from(dir),
+/// The cargo target directory, always absolute. A relative `CARGO_TARGET_DIR`
+/// is joined to `cwd`, which is how cargo itself resolves the variable, so it
+/// names the directory the `cargo docs-screenshots` that started this process
+/// built into. Absolute matters because the two stages run from different
+/// directories — the TUI capture from the repo root, Playwright from
+/// `desktop/` — and a relative path handed to both would name two places.
+fn target_dir(root: &Path, cwd: &Path, env: Option<OsString>) -> PathBuf {
+    match env.filter(|dir| !dir.is_empty()) {
+        Some(dir) => cwd.join(dir),
         None => root.join("target"),
     }
+}
+
+/// This invocation's private scratch directory under the target dir: disk
+/// backed, never the agent scratchpad or a tmpfs (CLAUDE.md rule 14), and
+/// named by pid so two concurrent runs on one machine never share one. Created
+/// empty — a leftover from a dead run that had this pid is cleared first, so a
+/// stale HTML file can never be rasterized as this run's image — and removed
+/// when dropped, whether the run succeeded or failed.
+struct RunDir(PathBuf);
+
+impl RunDir {
+    fn create(target: &Path) -> Result<Self, String> {
+        let dir = target
+            .join("docs-screenshots")
+            .join(format!("run-{}", std::process::id()));
+        if dir.exists() {
+            std::fs::remove_dir_all(&dir).map_err(|e| format!("clear {}: {e}", dir.display()))?;
+        }
+        std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+        Ok(Self(dir))
+    }
+}
+
+impl Drop for RunDir {
+    fn drop(&mut self) {
+        if let Err(e) = std::fs::remove_dir_all(&self.0) {
+            eprintln!("warning: could not remove {}: {e}", self.0.display());
+        }
+    }
+}
+
+/// A localhost port nothing is listening on right now, for this run's
+/// `vite preview`. It is released before vite binds it, so another process can
+/// take it in between; the config's `--strictPort` turns that race into a
+/// failed run rather than a screenshot of somebody else's server.
+fn free_port() -> Result<u16, String> {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .map_err(|e| format!("find a free localhost port: {e}"))?;
+    listener
+        .local_addr()
+        .map(|addr| addr.port())
+        .map_err(|e| format!("find a free localhost port: {e}"))
 }
 
 fn run(command: &mut Command, what: &str) -> Result<(), String> {
@@ -168,10 +218,9 @@ fn generate(args: &Args) -> Result<Vec<PathBuf>, String> {
     let root = repo_root()
         .canonicalize()
         .map_err(|e| format!("resolve repo root: {e}"))?;
+    let cwd = std::env::current_dir().map_err(|e| format!("resolve the current dir: {e}"))?;
     let out = match &args.out {
-        Some(dir) => std::env::current_dir()
-            .map_err(|e| e.to_string())?
-            .join(dir),
+        Some(dir) => cwd.join(dir),
         None => root.join("docs").join("img"),
     };
     std::fs::create_dir_all(&out).map_err(|e| format!("create {}: {e}", out.display()))?;
@@ -186,14 +235,9 @@ fn generate(args: &Args) -> Result<Vec<PathBuf>, String> {
         .map(|(s, _)| *s)
         .collect();
 
-    // Under `target/`, which is disk-backed, and never the agent scratchpad or
-    // a tmpfs (CLAUDE.md rule 14). Emptied first so a stale HTML file from an
-    // earlier run can never be rasterized as this run's image.
-    let html_dir = target_dir(&root).join("docs-screenshots").join("tui-html");
-    if html_dir.exists() {
-        std::fs::remove_dir_all(&html_dir)
-            .map_err(|e| format!("clear {}: {e}", html_dir.display()))?;
-    }
+    let target = target_dir(&root, &cwd, std::env::var_os("CARGO_TARGET_DIR"));
+    let run_dir = RunDir::create(&target)?;
+    let html_dir = run_dir.0.join("tui-html");
     std::fs::create_dir_all(&html_dir)
         .map_err(|e| format!("create {}: {e}", html_dir.display()))?;
 
@@ -215,6 +259,9 @@ fn generate(args: &Args) -> Result<Vec<PathBuf>, String> {
                     "-E",
                 ])
                 .arg(tui_filter(&tui))
+                // Absolute, so the nested cargo builds where this one did
+                // rather than resolving a relative value against the repo root.
+                .env("CARGO_TARGET_DIR", &target)
                 .env(TUI_HTML_DIR_ENV, &html_dir),
             "TUI capture (real binary, L2 PTY harness)",
         )?;
@@ -249,6 +296,8 @@ fn generate(args: &Args) -> Result<Vec<PathBuf>, String> {
             .arg(playwright_grep(&pairs))
             .env(OUT_DIR_ENV, &out)
             .env(TUI_HTML_DIR_ENV, &html_dir)
+            .env(RUN_DIR_ENV, &run_dir.0)
+            .env(PORT_ENV, free_port()?.to_string())
             .env(WEB_BUILD_ENV, if needs_web { "1" } else { "0" }),
         "rasterize (Playwright Chromium)",
     )?;
@@ -340,6 +389,26 @@ mod tests {
         assert!(args(&["--bogus"]).is_err());
         assert_eq!(args(&["--help"]).unwrap_err(), "");
         assert!(args(&["--", "--list"]).unwrap().list);
+    }
+
+    #[test]
+    fn a_relative_cargo_target_dir_is_resolved_against_the_cwd_like_cargo_does() {
+        // Real absolute paths rather than `/repo`, which is not absolute on
+        // Windows, where `build-windows` runs this.
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let cwd = root.join("sub");
+        let relative = target_dir(root, &cwd, Some("build".into()));
+        assert!(relative.is_absolute());
+        assert_eq!(relative, cwd.join("build"));
+        let elsewhere = root.join("elsewhere").join("target");
+        assert_eq!(
+            target_dir(root, &cwd, Some(elsewhere.clone().into())),
+            elsewhere
+        );
+        assert_eq!(target_dir(root, &cwd, None), root.join("target"));
+        // cargo rejects an empty value; this treats it as unset rather than
+        // resolving it to the cwd itself.
+        assert_eq!(target_dir(root, &cwd, Some("".into())), root.join("target"));
     }
 
     #[test]
