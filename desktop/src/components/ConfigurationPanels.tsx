@@ -20,7 +20,7 @@ import {
 import { defaultCliForProvider, permissionModeLabel, permissionModeOptions, resolveProfileCommand } from "../lib/profileCommands";
 import type { DaemonProjectsState } from "../hooks/useDaemonProjects";
 import { SelectDeckNote } from "./SelectDeckNote";
-import { ORCHESTRATION_TITLE_TAKEN, SAME_DIRECTORY_ORCHESTRATION, directoryLabel, orchestrationRunTitle, suggestOrchestrationName } from "../lib/newAgent";
+import { ORCHESTRATION_TITLE_TAKEN, RUN_NAME_UNUSABLE, SAME_DIRECTORY_ORCHESTRATION, directoryLabel, isUsableRunName, orchestrationRunTitle, suggestOrchestrationName } from "../lib/newAgent";
 import type { AgentProfile, DaemonResolvedProject, DeckPrompt, Provider, RuntimeMode, WorkflowLaunchConfig } from "../types";
 
 /**
@@ -416,9 +416,14 @@ interface WorkflowPanelProps {
   liveTitles?: readonly string[];
   /** The directories those orchestrations run in, for the same-directory warning. */
   liveDirectories?: readonly string[];
+  /**
+   * The selected deck's id. A different deck is a different set of live
+   * titles, so an untouched suggestion is recomputed when it changes.
+   */
+  deckId?: string;
 }
 
-export function WorkflowPanel({ open, profiles, order, mode, project, onChooseProject, onClose, onToggle, onMove, onLaunch, platformIssue, capabilityIssue, prompts = [], allDecks = false, liveTitles = [], liveDirectories = [] }: WorkflowPanelProps) {
+export function WorkflowPanel({ open, profiles, order, mode, project, onChooseProject, onClose, onToggle, onMove, onLaunch, platformIssue, capabilityIssue, prompts = [], allDecks = false, liveTitles = [], liveDirectories = [], deckId }: WorkflowPanelProps) {
   const orchestrations = project?.orchestrations ?? [];
   const [name, setName] = useState("");
   const [taskPrompt, setTaskPrompt] = useState("");
@@ -430,19 +435,34 @@ export function WorkflowPanel({ open, profiles, order, mode, project, onChoosePr
    * replace a generated default, never a human edit (the TUI's
    * `resuggest_name_for_selection`). Emptying it is a choice, not a request for
    * a new suggestion — the run then takes the workflow's name.
+   *
+   * The sheet stays MOUNTED while closed, so "opens" has to be detected: each
+   * closed-to-open transition clears the edit, as the TUI builds a fresh form
+   * on every `Ctrl+n`. Without that a name typed for one launch outlived it and
+   * came back as a collision with the run it had just named (PR #1333 review).
+   * A suggestion drawn for one deck is likewise recomputed on another.
    */
   const [runName, setRunName] = useState("");
   const runNameTouched = useRef(false);
+  const wasOpen = useRef(false);
   const cwdBasename = directoryLabel(project?.path ?? "");
   const hasSelectedWorkflow = orchestrations.some((orchestration) => orchestration.name === name);
   useEffect(() => {
-    if (!open || runNameTouched.current) return;
-    setRunName(hasSelectedWorkflow && cwdBasename ? suggestOrchestrationName(cwdBasename, liveTitles) : "");
+    const opening = open && !wasOpen.current;
+    wasOpen.current = open;
+    if (!open) return;
+    if (opening) runNameTouched.current = false;
+    if (runNameTouched.current) return;
+    const suggestion = hasSelectedWorkflow && cwdBasename ? suggestOrchestrationName(cwdBasename, liveTitles) : "";
+    // A basename the crate would refuse as a title (a control byte in the
+    // directory name, an over-long one) is not offered: an empty Name, which
+    // takes the workflow's name, launches where that suggestion could not.
+    setRunName(isUsableRunName(suggestion) ? suggestion : "");
     // `liveTitles` is read, not watched: the TUI suggests from ONE snapshot
     // taken when the dialog opens, and a name that re-numbered itself under the
     // user's eyes as the fleet ticked would be worse than one that is briefly
     // stale — the collision check below reads the live list either way.
-  }, [open, name, hasSelectedWorkflow, cwdBasename]);
+  }, [open, name, hasSelectedWorkflow, cwdBasename, deckId]);
   // Pre-select the project's default orchestration, or its only one. A
   // selection that no longer names an orchestration this project offers is
   // dropped rather than sent — the config can have changed under it.
@@ -518,10 +538,13 @@ export function WorkflowPanel({ open, profiles, order, mode, project, onChoosePr
   const runTitle = orchestration ? orchestrationRunTitle(runName, orchestration.name) : undefined;
   const titleTaken = runTitle !== undefined && liveTitles.includes(runTitle);
   const sameDirectory = Boolean(orchestration) && cwd !== "" && liveDirectories.includes(cwd);
+  // Refused here, where it is typed, rather than by the crate after the
+  // confirmation dialog (PR #1333 review). Empty is not unusable: it is "no title".
+  const runNameUnusable = runName !== "" && !isUsableRunName(runName);
   // The task prompt is NOT required (issue #1044): neither the deck nor the TUI
   // requires one, and starting the orchestration as-is and typing the task into
   // the coordinator is the ordinary TUI habit.
-  const canLaunch = mode === "live" && !allDecks && !platformIssue && !capabilityIssue && Boolean(project) && name.trim().length > 0 && cwd.startsWith("/") && !titleTaken && allRequiredRolesEnabled && invalidCommands.length === 0;
+  const canLaunch = mode === "live" && !allDecks && !platformIssue && !capabilityIssue && Boolean(project) && name.trim().length > 0 && cwd.startsWith("/") && !titleTaken && !runNameUnusable && allRequiredRolesEnabled && invalidCommands.length === 0;
   const customCommandCount = resolved.filter(({ resolution }) => resolution.source === "custom").length;
   const generatedFullAccessCount = resolved.filter(({ profile, resolution }) => resolution.source === "generated" && profile.permissionMode === "full-access").length;
   return (
@@ -559,6 +582,7 @@ export function WorkflowPanel({ open, profiles, order, mode, project, onChoosePr
               the placeholder says.
             */}
             <label><span>Run name</span><input aria-label="Run name" value={runName} onChange={(event) => { runNameTouched.current = true; setRunName(event.target.value); }} placeholder={orchestration?.displayName ?? ""} spellCheck={false} data-testid="workflow-run-name" /></label>
+            {runNameUnusable && <small role="alert" data-testid="workflow-run-name-unusable"><AlertTriangle size={12} /> {RUN_NAME_UNUSABLE}</small>}
             {titleTaken && <small role="alert" data-testid="workflow-title-taken"><AlertTriangle size={12} /> {ORCHESTRATION_TITLE_TAKEN}</small>}
             {!titleTaken && sameDirectory && <small data-testid="workflow-same-directory"><AlertTriangle size={12} /> {SAME_DIRECTORY_ORCHESTRATION}</small>}
             <label className="workflow-task-prompt">

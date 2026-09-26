@@ -15,6 +15,7 @@ import {
   fleetLists,
   isDeckGoneError,
   isNewAgentShortcut,
+  isUsableRunName,
   liveOrchestrationDirectories,
   liveOrchestrationTitles,
   NEW_AGENT_APPEAR_TIMEOUT_MS,
@@ -293,6 +294,25 @@ describe("New agent orchestration rules (PRD #1223 M6)", () => {
     expect(orchestrationRunTitle("", "loop")).toBe("loop");
     expect(orchestrationRunTitle("my-run", "loop")).toBe("my-run");
     expect(orchestrationRunTitle(" ", "loop")).toBe(" ");
+  });
+
+  /**
+   * Issue #1044 / PR #1333 review — the run-name check matches the crate's
+   * `is_valid_display_name`, byte for byte where the two could disagree: the
+   * limit is 128 UTF-8 BYTES (so 64 two-byte characters fit and 65 do not), a
+   * C0 control or DEL is refused, every bidi formatting mark is refused, and a
+   * space-only name is accepted, as the crate and the TUI accept it.
+   */
+  it("accepts exactly the run names the desktop crate will pass on", () => {
+    expect(isUsableRunName("deck-orchestrator-1")).toBe(true);
+    expect(isUsableRunName("   ")).toBe(true);
+    expect(isUsableRunName("a".repeat(128))).toBe(true);
+    expect(isUsableRunName("é".repeat(64))).toBe(true);
+    expect(isUsableRunName("")).toBe(false);
+    expect(isUsableRunName("a".repeat(129))).toBe(false);
+    expect(isUsableRunName("é".repeat(65))).toBe(false);
+    for (const bad of ["\u0000", "\u0009", "\u001b[2J", "\u007f"]) expect(isUsableRunName(`run${bad}`)).toBe(false);
+    for (const mark of ["\u202a", "\u202e", "\u2066", "\u2069", "\u200e", "\u200f", "\u061c"]) expect(isUsableRunName(`deploy${mark}er`)).toBe(false);
   });
 
   /** Scenario: what each deck answer offers — chips for a project, nothing for an ordinary directory or a pending answer, the deck's reason for one that cannot launch. */

@@ -273,6 +273,25 @@ export function suggestOrchestrationName(basename: string, liveTitles: readonly 
 }
 
 /**
+ * Whether `name` is a run title the desktop crate will pass on — the same test
+ * as the daemon's `is_valid_display_name` (`src/agent_pty.rs`), which
+ * `start_workflow_action` applies before any deck is contacted: not empty, at
+ * most 128 UTF-8 BYTES, no C0 control byte or DEL, and no bidi formatting mark
+ * (`is_bidi_format_char`). A sheet that checks this can refuse a name where it
+ * is typed rather than after a confirmation dialog (issue #1044).
+ */
+export function isUsableRunName(name: string): boolean {
+  if (name === "" || new TextEncoder().encode(name).length > RUN_NAME_MAX_BYTES) return false;
+  return !/[\u0000-\u001F\u007F\u061C\u200E\u200F\u202A-\u202E\u2066-\u2069]/.test(name);
+}
+
+/** The daemon's `DISPLAY_NAME_MAX_LEN`, in bytes. */
+const RUN_NAME_MAX_BYTES = 128;
+
+/** Why {@link isUsableRunName} refused a name, for the field that holds it. */
+export const RUN_NAME_UNUSABLE = "A run name must be at most 128 bytes and contain no control or text-direction characters.";
+
+/**
  * The title a launch will actually take — the TUI's `resolved_title`: the Name
  * when it is not empty, otherwise the orchestration's own name, which is what
  * the tab falls back to. The collision check compares THIS, never the raw
