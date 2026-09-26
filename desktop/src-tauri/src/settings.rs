@@ -3454,12 +3454,35 @@ fn merged_document(
         })
         .transpose()?;
 
+    // And so does the file, for the one question the merge asks of it that its
+    // own spelling cannot answer: has another writer edited a deck the caller
+    // deleted? A hand-written row may omit `port`, which reads as 22 and is
+    // not an edit; another window may have REMOVED `jump`, which reads as no
+    // jump host and is one. Only this build's reading of the file tells the two
+    // apart — see [`merge_rows`]. It already parsed at save time, so a failure
+    // here is not reachable through [`save_to`].
+    let current = if ancestor.is_some() {
+        let read = toml_edit::de::from_str::<DesktopSettings>(contents)
+            .map_err(|error| refuse_to_overwrite(path, contents, &error))?;
+        Some(
+            toml_edit::ser::to_string_pretty(&read)
+                .map_err(|error| write_error("could not serialize", path, error))?
+                .parse::<toml_edit::DocumentMut>()
+                .map_err(|error| write_error("could not serialize", path, error))?,
+        )
+    } else {
+        None
+    };
+
     merge_tables(
         document.as_table_mut(),
         incoming.as_table(),
         ancestor
             .as_ref()
             .map(|ancestor| ancestor.as_table() as &dyn toml_edit::TableLike),
+        current
+            .as_ref()
+            .map(|current| current.as_table() as &dyn toml_edit::TableLike),
         false,
     );
     Ok(document.to_string())
@@ -3505,10 +3528,14 @@ fn merged_document(
 /// written" on [`merged_document`]. A key the two agree on is skipped, so the
 /// file's value stands; a key the ancestor has and `incoming` does not is
 /// removed if the file still holds the ancestor's value.
+///
+/// `current` is this build's canonical reading of the file at the same depth,
+/// which [`merge_rows`] needs and nothing else does.
 fn merge_tables(
     base: &mut dyn toml_edit::TableLike,
     incoming: &dyn toml_edit::TableLike,
     ancestor: Option<&dyn toml_edit::TableLike>,
+    current: Option<&dyn toml_edit::TableLike>,
     inline: bool,
 ) {
     for (key, item) in incoming.iter() {
@@ -3568,6 +3595,9 @@ fn merge_tables(
                 existing_table,
                 incoming_table,
                 was.and_then(toml_edit::Item::as_table_like),
+                current
+                    .and_then(|current| current.get(key))
+                    .and_then(toml_edit::Item::as_table_like),
                 nested_inline,
             );
             continue;
@@ -3579,7 +3609,12 @@ fn merge_tables(
             if same_data(was, &item) {
                 continue;
             }
-            if merge_rows(existing, &item, was) {
+            if merge_rows(
+                existing,
+                &item,
+                was,
+                current.and_then(|current| current.get(key)),
+            ) {
                 continue;
             }
         }
@@ -3661,32 +3696,16 @@ fn reinsert_edit(
         let table = target
             .as_table_like_mut()
             .expect("an empty table was just inserted");
-        merge_tables(table, incoming, was.as_table_like(), nested_inline);
+        // No `current`: the file has nothing at this key to read.
+        merge_tables(table, incoming, was.as_table_like(), None, nested_inline);
         table.is_empty()
     } else {
-        merge_rows(target, &item, was);
+        merge_rows(target, &item, was, None);
         id_rows(target).is_some_and(|rows| rows.is_empty())
     };
     if now_empty {
         base.remove(key);
     }
-}
-
-/// Whether a row on disk is still the one the caller's base holds, so deleting
-/// it deletes nothing anyone else wrote: no key **both** of them state differs.
-///
-/// Only the keys both state, because either side may leave one out without
-/// meaning anything by it. The base is this build's canonical rendering, which
-/// spells every default — `port = 22` — that a hand-written row may simply omit;
-/// the file may hold a key this build does not know, which the base can never
-/// state. A strict row comparison read the first as an edit and refused to
-/// delete a hand-written deck (issue #828 review). A key someone else CHANGED is
-/// on disk with a different value, and that is still caught.
-fn row_untouched(on_disk: &dyn toml_edit::TableLike, was: &dyn toml_edit::TableLike) -> bool {
-    on_disk
-        .iter()
-        .filter(|(_, value)| !value.is_none())
-        .all(|(key, value)| was.get(key).is_none_or(|stated| same_data(value, stated)))
 }
 
 /// The rows of a list whose every row is a table carrying a unique string `id`,
@@ -3754,7 +3773,18 @@ enum RowStep<'a> {
 ///
 /// A row the caller deleted is deleted only if the file's copy is still the
 /// one the caller saw; one the caller edited but someone else deleted is put
-/// back, since the caller's edit is the newer intent about that row. A row
+/// back, since the caller's edit is the newer intent about that row.
+///
+/// "Still the one the caller saw" is asked of `current` — this build's
+/// canonical reading of the file — and not of the file's own spelling, because
+/// the spelling cannot answer it in either direction (issue #828 review). A
+/// hand-written row that omits `port` reads as 22, so against the caller's
+/// canonical row it is unchanged and deletes; a row another window cleared
+/// `jump` on reads as having no jump host, so it differs and is kept. Comparing
+/// the file's bytes got the first wrong, and comparing only the keys the file
+/// states got the second wrong. A key this build does not know is not in
+/// either reading, and does not hold a deletion back. With no `current` to ask,
+/// nothing is deleted. A row
 /// present on both sides recurses into [`merge_tables`], which is what lets two
 /// windows edit different fields of the same deck — and what makes clearing an
 /// optional field in a row work, through its removal step.
@@ -3762,12 +3792,14 @@ fn merge_rows(
     existing: &mut toml_edit::Item,
     incoming: &toml_edit::Item,
     ancestor: &toml_edit::Item,
+    current: Option<&toml_edit::Item>,
 ) -> bool {
     let (Some(disk), Some(mine), Some(was)) =
         (id_rows(existing), id_rows(incoming), id_rows(ancestor))
     else {
         return false;
     };
+    let current = current.and_then(id_rows).unwrap_or_default();
     fn find<'r>(
         rows: &[(String, &'r dyn toml_edit::TableLike)],
         id: &str,
@@ -3782,9 +3814,11 @@ fn merge_rows(
 
     let steps: Vec<RowStep<'_>> = disk
         .iter()
-        .map(|(id, on_disk)| match (find(&mine, id), find(&was, id)) {
+        .map(|(id, _)| match (find(&mine, id), find(&was, id)) {
             (Some(mine), was) => RowStep::Merge(mine, was),
-            (None, Some(was)) if row_untouched(*on_disk, was) => RowStep::Drop,
+            (None, Some(was)) if find(&current, id).is_some_and(|read| same_row(read, was)) => {
+                RowStep::Drop
+            }
             // Deleted by the caller but edited by someone else since, or added
             // by someone else since the caller loaded: either way, not the
             // caller's to remove.
@@ -3809,7 +3843,7 @@ fn merge_rows(
         for (index, step) in steps.iter().enumerate() {
             if let RowStep::Merge(mine, was) = step {
                 let row = rows.get_mut(index).expect("one step per row");
-                merge_tables(row, *mine, *was, false);
+                merge_tables(row, *mine, *was, None, false);
             }
         }
         for (index, step) in steps.iter().enumerate().rev() {
@@ -3830,7 +3864,7 @@ fn merge_rows(
                     .get_mut(index)
                     .and_then(toml_edit::Value::as_inline_table_mut)
                     .expect("`id_rows` accepted every row as an inline table");
-                merge_tables(row, *mine, *was, true);
+                merge_tables(row, *mine, *was, None, true);
             }
         }
         for (index, step) in steps.iter().enumerate().rev() {
@@ -6027,6 +6061,39 @@ mod tests {
             std::fs::read_to_string(&path).unwrap()
         );
         assert!(deck(&reloaded, &EndpointId::parse("second").unwrap()).is_some());
+    }
+
+    /// Scenario (issue #828 review): window B clears a deck's jump host — an
+    /// edit that REMOVES a key — and window A, from its older copy, deletes that
+    /// deck. The deck must be kept with B's edit, the same way a deck another
+    /// window edited in any other way is kept: a key gone from the file is an
+    /// edit whenever its absence reads differently from what the stale window
+    /// loaded.
+    #[test]
+    fn deleting_a_deck_another_window_cleared_a_field_on_keeps_it() {
+        let first = EndpointId::parse("first").unwrap();
+        let second = EndpointId::parse("second").unwrap();
+        let dir = tempdir();
+        let path = dir.path().join(SETTINGS_FILE_NAME);
+        let mut start = two_decks(&first, &second);
+        deck_mut(&mut start, &second).jump = Some(HostAlias::parse("bastion").unwrap());
+        let (window_a, window_b) = two_windows_on(&path, &start);
+
+        let mut b = window_b.clone();
+        deck_mut(&mut b, &second).jump = None;
+        save_to(&path, Some(&window_b), &b).unwrap();
+        let mut a = window_a.clone();
+        a.endpoints
+            .as_mut()
+            .unwrap()
+            .remote
+            .retain(|row| row.id != second);
+        save_to(&path, Some(&window_a), &a).unwrap();
+
+        let reloaded = load_from(&path);
+        let row =
+            deck(&reloaded, &second).expect("window B's edited deck was deleted from a stale copy");
+        assert_eq!(row.jump, None, "with window B's edit");
     }
 
     /// Scenario (issue #828 review): a hand edit deletes the whole
