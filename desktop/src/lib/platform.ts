@@ -1,4 +1,4 @@
-export const WINDOWS_WORKFLOW_BLOCK_REASON = "Live orchestration activation is unavailable in this Windows preview because profile commands use POSIX shell quoting. Use the TUI or run commands manually until native Windows command construction is implemented.";
+export const WINDOWS_ORCHESTRATION_BLOCK_REASON = "Live orchestration activation is unavailable in this Windows preview because profile commands use POSIX shell quoting. Use the TUI or run commands manually until native Windows command construction is implemented.";
 
 export interface BrowserPlatformHints {
   platform?: string;
@@ -13,8 +13,8 @@ export function isWindowsPlatform(hints?: BrowserPlatformHints): boolean {
     .some((value) => /windows|^win(?:32|64|ce)/i.test(value));
 }
 
-export function desktopWorkflowPlatformIssue(
+export function desktopOrchestrationPlatformIssue(
   hints: BrowserPlatformHints | undefined = typeof navigator === "undefined" ? undefined : navigator,
 ): string | undefined {
-  return isWindowsPlatform(hints) ? WINDOWS_WORKFLOW_BLOCK_REASON : undefined;
+  return isWindowsPlatform(hints) ? WINDOWS_ORCHESTRATION_BLOCK_REASON : undefined;
 }

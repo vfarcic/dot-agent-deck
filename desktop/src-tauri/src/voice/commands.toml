@@ -306,7 +306,8 @@ is open, then one agent's open pane, and otherwise the Settings sheet if it is o
 dialog, close this dialog, close the new agent dialog, close new agent (the accessible name of the
 dialog's X button), cancel, cancel this, cancel it, never mind,
 dismiss this, hide this, get rid of this, I'm done with this, stop looking at this, leave this
-agent, or back to the dashboard or overview. "Close the agent", "close the agent screen", "close the agent
+agent, back to dashboard (the label of an open agent pane's button), or back to the dashboard or
+overview. "Close the agent", "close the agent screen", "close the agent
 view" and "close the agent pane" mean THIS one: they close the VIEW of the agent, and the agent
 keeps running. Closing the New agent dialog this way keeps what was entered in it for the next
 time it opens; only "discard" throws it away, and that is `discard_new_agent`. When closing a view
@@ -997,15 +998,25 @@ heard_as_whole = [
 # `close` at all, and `close_orchestration` needs the orchestration or the run
 # named beside its verb (`heard_as_also`).
 #
+# **`stop_agent` is the one control whose label is not its voice phrase.**
+# Issue #1045 renamed the dashboard row's button to "Close <name> agent",
+# because Close is the glossary's word for ending one agent. Reading that label
+# aloud does NOT ground this row: with reference grounding gone (2026-09-24),
+# `close` in `heard_as` would let a model's pick of this row for "Close the
+# agent" open a stop confirmation for whichever agent it guessed, which is the
+# D1 misreading this rule exists to prevent. Its spoken form stays "stop
+# <name> agent"; `voice_outcome_the_row_close_label_is_not_a_stop_phrase` pins
+# the exception.
+#
 # Each `report` says that nothing has happened yet, because nothing has: the
 # report describes the dispatch, and the dispatch only asked.
 [[commands]]
 id          = "stop_agent"
-description = """Stop one running agent on the agent dashboard — the voice form of its row's Stop
-button, whose accessible name is "Stop <name> agent". Use for stop tester agent, stop the tester,
+description = """Stop one running agent on the agent dashboard — the voice form of its row's close
+button, whose accessible name is "Close <name> agent". Use for stop tester agent, stop the tester,
 stop the agent, kill the reviewer, kill it, shut down the coder,
 shut it down, end that agent, terminate the one that is stuck. Set `agent` the way `open_agent`
-does. It never stops anything by itself: the app shows the same confirmation the Stop button shows
+does. It never stops anything by itself: the app shows the same confirmation the row's button shows
 and the user confirms by hand, so pick it whenever the user asks to stop an agent, however
 urgently. It needs a word that can only mean stopping: "close" is NOT one — "close the agent" and
 "close the tester" close the VIEW (`close`) and stop nothing. Ending a whole orchestration is

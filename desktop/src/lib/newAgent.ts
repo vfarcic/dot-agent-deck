@@ -219,7 +219,7 @@ export function orchestrationModes(answer: NewAgentOrchestrations | undefined): 
 
 /** Why a namesake orchestration's chip is disabled (PRD #1223 audit F2). */
 export function ambiguousOrchestrationReason(displayName: string): string {
-  return `This project defines more than one orchestration named ${displayText(displayName, DISPLAY_LIMITS.name)}; rename one to launch it here.`;
+  return `This project defines more than one orchestration named ${displayText(displayName, DISPLAY_LIMITS.name)}; rename one to activate it here.`;
 }
 
 /** The Mode chip id of an orchestration — distinct from every authoring kind and from `none`. */

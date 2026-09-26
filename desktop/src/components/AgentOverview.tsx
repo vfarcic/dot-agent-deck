@@ -1023,7 +1023,7 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
         setConfirm({
           title: `Close ${title}?`,
           body: `This stops every role of this orchestration on ${deckName(deck.connection)} — ${count}: ${roles.map((role) => role.name).join(", ")}. Unsaved terminal work in any of them may be interrupted.`,
-          label: roles.length === 1 ? "Stop 1 role" : `Stop all ${roles.length} roles`,
+          label: roles.length === 1 ? "Close 1 role" : `Close all ${roles.length} roles`,
           busyLabel: "Stopping…",
           action: () => run({ type: "stop_orchestration", deckId, roles }),
         });
@@ -1188,7 +1188,7 @@ interface FleetDeck {
 }
 
 /**
- * How many of the fleet's decks are answering, as a sentence (PRD #742 M4).
+ * How many of the fleet's daemons are answering, as a sentence (PRD #742 M4).
  *
  * The instrument prints `2/3`, which is the compact reading; this is the hover,
  * and it is where the thing a ratio cannot say gets said — that the counts
@@ -1196,9 +1196,9 @@ interface FleetDeck {
  */
 function decksUpTitle(up: number, total: number): string {
   if (total === 1) return up === 1 ? "The deck is answering." : "The deck is not answering, so nothing can be counted.";
-  if (up === total) return `All ${total} decks are answering.`;
+  if (up === total) return `All ${total} daemons are answering.`;
   if (up === 0) return `No deck is answering, so nothing can be counted. ${total} are configured.`;
-  return `${up} of ${total} decks are answering. Every count beside this one is over those ${up}; the decks that are not answering say so in their own group.`;
+  return `${up} of ${total} daemons are answering. Every count beside this one is over those ${up}; the daemons that are not answering say so in their own group.`;
 }
 
 /**
@@ -1255,7 +1255,7 @@ function DeckGroup({ deck, now, columns, fleetSize, overrideError, onOpenDeck, o
    */
   const buildStampsCaveat = connection.clientBuildVersion && connection.daemonBuildVersion
     && connection.clientBuildVersion !== connection.daemonBuildVersion
-    ? `Built from different commits — desktop ${connection.clientBuildVersion}, deck ${connection.daemonBuildVersion}.`
+    ? `Built from different commits — desktop ${connection.clientBuildVersion}, daemon ${connection.daemonBuildVersion}.`
     : undefined;
   /**
    * Everything hover can say about WHICH deck this is: its socket path, and
@@ -1887,8 +1887,8 @@ function OverviewRow({ agent, hoistedCwd, now, columns }: { agent: OverviewAgent
               <button
                 className="overview-stop-agent"
                 data-testid="overview-stop-agent"
-                aria-label={`Stop ${name} agent`}
-                title={`Stop ${name}`}
+                aria-label={`Close ${name} agent`}
+                title={`Close ${name}`}
                 onClick={() => stopControls.stopAgent(agent)}
               ><CircleStop size={12} /></button>
             )}

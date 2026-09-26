@@ -57,7 +57,7 @@ import { agentKey } from "./lib/agentKey";
 import { VOICE_ACTIONS, dispatchVoiceAction, type DeckOverlay, type NewAgentVoice, type VoiceContextChannel, type VoiceDispatchContext, type VoiceDispatchTarget, type VoiceOverviewContext, type VoicePanelContext, type VoiceScreenContext } from "./lib/voiceActions";
 import { unreachableDeckTerminalState } from "./lib/terminalInput";
 import { applyAppearance } from "./lib/appearance";
-import { desktopWorkflowPlatformIssue } from "./lib/platform";
+import { desktopOrchestrationPlatformIssue } from "./lib/platform";
 import { selectsAllDecks } from "./lib/endpoints";
 import { deckScreenSnapshot } from "./lib/deckScreen";
 import { LaunchCleanupError } from "./lib/actionError";
@@ -66,27 +66,18 @@ import type { VoiceDirectoriesDto, VoiceNewAgentDto, VoiceOutcomeDto } from "./l
 import { desktopFeaturesOf } from "./types";
 import type { AgentSession, CleanupWarningEntry, DeckAction, DeckRuntimeState, DeckSnapshot, DeckView, EvidenceItem, PanelTab, OrchestrationLaunchConfig } from "./types";
 import { modeScopedKey } from "./lib/bridge";
+import { planStoredRoleOrder, roleOrderFor } from "./lib/roleOrder";
 
 const ORCHESTRATION_STORAGE_KEY = modeScopedKey("dot-agent-deck.desktop.orchestration-preview.v1");
 /**
  * Where the saved role order lived before issue #1045 renamed the desktop's
  * "workflow" to the TUI's "orchestration". Read once, when the new key holds
- * nothing, so an order saved by an older build survives the rename; the value
- * is copied to {@link ORCHESTRATION_STORAGE_KEY} and the legacy key removed.
+ * nothing, so an order saved by an older build survives the rename; a value
+ * that validates is written to {@link ORCHESTRATION_STORAGE_KEY} in normalized
+ * form and the legacy key removed (`planStoredRoleOrder`).
  */
 const LEGACY_WORKFLOW_STORAGE_KEY = modeScopedKey("dot-agent-deck.desktop.workflow-preview.v1");
 
-/** The saved role order, migrating it from the pre-#1045 key when that is the only one holding it. */
-function readStoredOrchestrationOrder(): { order?: string[] } | null {
-  const current = window.localStorage.getItem(ORCHESTRATION_STORAGE_KEY);
-  if (current !== null) return JSON.parse(current) as { order?: string[] } | null;
-  const legacy = window.localStorage.getItem(LEGACY_WORKFLOW_STORAGE_KEY);
-  if (legacy === null) return null;
-  const stored = JSON.parse(legacy) as { order?: string[] } | null;
-  window.localStorage.setItem(ORCHESTRATION_STORAGE_KEY, legacy);
-  window.localStorage.removeItem(LEGACY_WORKFLOW_STORAGE_KEY);
-  return stored;
-}
 /**
  * The daemon's stable refusal codes this screen recognises, matched as CODES
  * rather than as prose. Each is the first token of `AttachResponse.error`,
@@ -174,7 +165,7 @@ export default function App() {
  * it names the screen to keep mounted underneath and renders the pane over it,
  * which is why the switch below reads `base` rather than `view.kind`.
  */
-export function DeckShell({ runtime, workflowPlatformIssue, initialView = { kind: "overview" } }: { runtime: DeckRuntimeState; workflowPlatformIssue?: string; initialView?: DeckView }) {
+export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = { kind: "overview" } }: { runtime: DeckRuntimeState; orchestrationPlatformIssue?: string; initialView?: DeckView }) {
   const [requestedView, setView] = useState<DeckView>(initialView);
   /**
    * Issue #1198 — the app's experimental surfaces, read once at startup. The
@@ -740,7 +731,7 @@ export function DeckShell({ runtime, workflowPlatformIssue, initialView = { kind
         <Toast message={runtime.error} onDismiss={runtime.clearError} warnings={runtime.cleanupWarnings} onDismissWarning={runtime.dismissCleanupWarning} />
       </>
     )
-    : <DeckSurface runtime={runtime} settings={settings} workflowPlatformIssue={workflowPlatformIssue} onNavigate={setView} openAgent={openAgent} onCloseAgent={closeAgent} voiceChannel={deckVoiceContext} overlays={deckOverlays} />;
+    : <DeckSurface runtime={runtime} settings={settings} orchestrationPlatformIssue={orchestrationPlatformIssue} onNavigate={setView} openAgent={openAgent} onCloseAgent={closeAgent} voiceChannel={deckVoiceContext} overlays={deckOverlays} />;
   /*
     PRD #802 M6 — the voice surface is a SIBLING of the screen switch, and this
     shape is the whole of that decision.
@@ -973,7 +964,7 @@ function AgentPaneFrame({ open, onOpen, onClose, ...tile }: Omit<AgentTileProps,
  * so a later `save` against the wrong one would write state no screen reads.
  * Here there is exactly one instance per tree.
  */
-export function ControlDeck(props: { runtime: DeckRuntimeState; workflowPlatformIssue?: string; onNavigate?: (view: DeckView) => void }) {
+export function ControlDeck(props: { runtime: DeckRuntimeState; orchestrationPlatformIssue?: string; onNavigate?: (view: DeckView) => void }) {
   const settings = useDesktopSettings(props.runtime);
   // Issue #1197: the rail and the Settings sheet are the shell's, so a deck
   // rendered on its own carries the same pair {@link DeckShell} does.
@@ -992,7 +983,7 @@ export function ControlDeck(props: { runtime: DeckRuntimeState; workflowPlatform
   );
 }
 
-export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktopWorkflowPlatformIssue(), onNavigate, openAgent, onCloseAgent, voiceChannel, overlays: shellOverlays }: { runtime: DeckRuntimeState; settings: DesktopSettingsState; workflowPlatformIssue?: string; onNavigate?: (view: DeckView) => void; openAgent?: { deckId: string; agentId: string }; onCloseAgent?: () => void; voiceChannel?: VoiceContextChannel; overlays?: ScreenOverlays }) {
+export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = desktopOrchestrationPlatformIssue(), onNavigate, openAgent, onCloseAgent, voiceChannel, overlays: shellOverlays }: { runtime: DeckRuntimeState; settings: DesktopSettingsState; orchestrationPlatformIssue?: string; onNavigate?: (view: DeckView) => void; openAgent?: { deckId: string; agentId: string }; onCloseAgent?: () => void; voiceChannel?: VoiceContextChannel; overlays?: ScreenOverlays }) {
   const { mode, setShownTerminals } = runtime;
   // #1083: this screen cannot merge across decks, so under All Decks it shows
   // "Select a deck" and renders nothing of the local deck the selection
@@ -1166,8 +1157,11 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
   useEffect(() => {
     if (!profiles.length || profileOrder.length) return;
     try {
-      const stored = readStoredOrchestrationOrder();
-      setProfileOrder(stored?.order?.length ? stored.order : profiles.map((profile) => profile.id));
+      const current = window.localStorage.getItem(ORCHESTRATION_STORAGE_KEY);
+      const plan = planStoredRoleOrder(current, current === null ? window.localStorage.getItem(LEGACY_WORKFLOW_STORAGE_KEY) : null);
+      if (plan.write !== undefined) window.localStorage.setItem(ORCHESTRATION_STORAGE_KEY, plan.write);
+      if (plan.removeLegacy) window.localStorage.removeItem(LEGACY_WORKFLOW_STORAGE_KEY);
+      setProfileOrder(roleOrderFor(plan.order, profiles.map((profile) => profile.id)));
     } catch {
       setProfileOrder(profiles.map((profile) => profile.id));
     }
@@ -1547,8 +1541,8 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
           if ((message.includes(PROJECT_STALE_PREPARATION_CODE) || message.includes(PROJECT_STALE_TOKEN_CODE)) && activeProject) {
             void projectState.select(activeProject.path);
             setNotice(message.includes(PROJECT_STALE_PREPARATION_CODE)
-              ? "This launch's prepared orchestrator context no longer matches what the daemon approved — another launch in this project replaced it, or the project moved. Nothing was started. The project has been re-read; launch again to prepare a fresh one."
-              : "The daemon no longer holds this launch's preparation — it expired, or the daemon was replaced. Nothing was started. The project has been re-read; launch again to prepare a fresh one.");
+              ? "This launch's prepared orchestrator context no longer matches what the daemon approved — another launch in this project replaced it, or the project moved. Nothing was started. The project has been re-read; activate again to prepare a fresh one."
+              : "The daemon no longer holds this launch's preparation — it expired, or the daemon was replaced. Nothing was started. The project has been re-read; activate again to prepare a fresh one.");
             return;
           }
           /*
@@ -1808,7 +1802,7 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
         onRemove={(id) => { removePrompt(id); setNotice("Prompt removed from this device's library."); }}
       />
       <ProfilesPanel open={profilesOpen} profiles={profiles} onClose={() => setProfilesOpen(false)} onUpdate={updateProfile} onReset={resetProfiles} onSaved={() => setNotice("Agent profile draft saved locally. Project TOML is unchanged.")} />
-      <OrchestrationPanel key={activeProject?.path ?? "runtime-orchestration"} open={orchestrationOpen} profiles={profiles} order={profileOrder} mode={mode} project={activeProject} onChooseProject={() => { setOrchestrationOpen(false); setProjectsOpen(true); }} onClose={() => setOrchestrationOpen(false)} onToggle={(id) => { const profile = profiles.find((item) => item.id === id); if (profile) updateProfile(id, { enabled: !profile.enabled }); }} onMove={moveStage} onLaunch={requestLaunch} platformIssue={workflowPlatformIssue} capabilityIssue={snapshot.connection.projectActionsReason} prompts={prompts} allDecks={allDecks} />
+      <OrchestrationPanel key={activeProject?.path ?? "runtime-orchestration"} open={orchestrationOpen} profiles={profiles} order={profileOrder} mode={mode} project={activeProject} onChooseProject={() => { setOrchestrationOpen(false); setProjectsOpen(true); }} onClose={() => setOrchestrationOpen(false)} onToggle={(id) => { const profile = profiles.find((item) => item.id === id); if (profile) updateProfile(id, { enabled: !profile.enabled }); }} onMove={moveStage} onLaunch={requestLaunch} platformIssue={orchestrationPlatformIssue} capabilityIssue={snapshot.connection.projectActionsReason} prompts={prompts} allDecks={allDecks} />
       {paletteOpen && <CommandPalette commands={commandItems} onClose={() => setPaletteOpen(false)} />}
       {helpOpen && <ShortcutHelp onClose={() => setHelpOpen(false)} />}
       {confirm && <ConfirmDialog state={confirm} onClose={() => setConfirm(undefined)} />}

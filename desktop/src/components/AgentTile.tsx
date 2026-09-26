@@ -377,8 +377,8 @@ export function AgentTile({
           {onClose && (
             <button
               className="agent-pane-control"
-              aria-label={`Close ${agent.role} agent`}
-              title={`Close ${agent.displayName} and go back`}
+              aria-label="Back to dashboard"
+              title="Back to dashboard"
               onMouseDown={(event) => event.stopPropagation()}
               onClick={onClose}
             ><X size={14} /></button>

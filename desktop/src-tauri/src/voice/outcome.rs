@@ -7041,6 +7041,7 @@ mod tests {
     /// The one rail, shown beside the overview as well as the deck (#1197).
     const NAVIGATION_RAIL_TSX: &str = include_str!("../../../src/components/NavigationRail.tsx");
     const NEW_AGENT_TS: &str = include_str!("../../../src/lib/newAgent.ts");
+    const AGENT_TILE_TSX: &str = include_str!("../../../src/components/AgentTile.tsx");
 
     /// Where a label lives, as the literal the source renders it from.
     struct ControlLabel {
@@ -7200,10 +7201,10 @@ mod tests {
             over_the_form: false,
         },
         ControlLabel {
-            source: "aria-label={`Stop ${name} agent`}",
-            file: AGENT_OVERVIEW_TSX,
-            said: "Stop tester agent",
-            row: "stop_agent",
+            source: "aria-label=\"Back to dashboard\"",
+            file: AGENT_TILE_TSX,
+            said: "Back to dashboard",
+            row: "close",
             over_the_form: false,
         },
         ControlLabel {
@@ -7242,6 +7243,21 @@ mod tests {
         assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 
+    /// Scenario: the user reads the dashboard row's stop control aloud as it
+    /// is labelled since issue #1045, "Close tester agent". It does not ground
+    /// `stop_agent` — "close" stays a view word (D1) — so the one control left
+    /// out of [`CONTROL_LABELS`] is left out on purpose, and its spoken form
+    /// "stop tester agent" still reaches the stop confirmation.
+    #[test]
+    fn voice_outcome_the_row_close_label_is_not_a_stop_phrase() {
+        assert!(AGENT_OVERVIEW_TSX.contains("aria-label={`Close ${name} agent`}"));
+        let stop = table().row("stop_agent").expect("present");
+        assert!(!action_grounded(stop, "Close tester agent", None, None));
+        assert!(action_grounded(stop, "Stop tester agent", None, None));
+        let close = table().row("close").expect("present");
+        assert!(action_grounded(close, "Close tester agent", None, None));
+    }
+
     /// The labels the user hit, and the ones this sweep found missing from the
     /// row's prompt: each is written into its row's description, so the model
     /// reads the button's own words as that row.
@@ -7255,6 +7271,7 @@ mod tests {
             ("start_new_agent", "start the orchestration"),
             ("start_new_agent", "start the run"),
             ("close", "close new agent"),
+            ("close", "back to dashboard"),
             ("open_deck", "open daemons"),
             ("open_deck", "open deck"),
             ("open_agent", "open tester agent"),
