@@ -349,6 +349,23 @@ fn work_done_009_cut_report_names_its_saved_full_copy_in_the_attached_tui() {
         .with_env("DOT_AGENT_DECK_DELEGATE_NO_EVENT_WINDOW_MS", "0")
         .launch_with_fixture("orch-deck");
     deck.wait_for_string("No active sessions");
+    // The orchestrator is a RAW, no-echo `cat` here, not the fixture's plain
+    // one. A canonical-mode tty hands `cat` at most 4095 bytes of one line, so
+    // a plain `cat` echoes the whole feedback and then reprints a copy cut
+    // around the 4000-character mark. That copy scrolls the closing notice off
+    // the pane: measured on CI run 36241233852, where the grid ended mid-report,
+    // and absent from the passing runs only by timing. It is an artefact of the
+    // stand-in's line discipline; a real agent reads its input raw, which is
+    // what this stand-in now does (as `tests/work_done_reporting.rs` does).
+    std::fs::write(
+        deck.workdir().join(".dot-agent-deck.toml"),
+        "[[orchestrations]]\nname = \"demo-orch\"\n\n\
+         [[orchestrations.roles]]\nname = \"orchestrator\"\n\
+         command = \"stty -echo -icanon -icrnl -opost min 1 time 0 && exec cat -u\"\n\
+         start = true\n\n\
+         [[orchestrations.roles]]\nname = \"worker\"\ncommand = \"cat\"\n",
+    )
+    .expect("make the orchestrator role a raw, no-echo cat");
     open_orchestration(&deck);
     deck.wait_for_string(WORKER_ROLE);
     let (worker_pane, orchestrator_agent) = orchestration_ids(&deck);
