@@ -96,7 +96,7 @@ permissions:
 # `.git/config` for the life of the job, readable by anything the job runs.
 # `e2e-deterministic` is the sharp case and has its own note below — it executes
 # the PTY e2e tier, which is contributor-authored code — but the flag is on all
-# eleven checkouts rather than that one, because no job here needs the credential
+# twelve checkouts rather than that one, because no job here needs the credential
 # after the fetch:
 #
 #   * none of them pushes, and the `permissions:` block above grants no write
@@ -112,10 +112,11 @@ permissions:
 #     subject. That survey is what picked the SET; the CI run on the PR that set
 #     the flag is what checked it. The COUNT in this note is maintained by hand
 #     and has drifted before — it read "nine" while there were already ten, and
-#     issue #1088's `notify-main-red` made it eleven — so recount with
+#     issue #1088's `notify-main-red` made it eleven and issue #953's
+#     `desktop-driver` twelve — so recount with
 #     `grep -cE '^ +- uses: actions/checkout@' .github/workflows/ci.yml` rather
 #     than trusting the number. The pattern is anchored to a step line on
-#     purpose: an unanchored one matches this comment too and reports twelve.
+#     purpose: an unanchored one matches this comment too and reports more.
 #
 # `security`'s `cargo audit` does clone the RustSec advisory DB over the
 # network, but into `~/.cargo/advisory-db` — a separate repository, which a
@@ -262,6 +263,11 @@ jobs:
       # `pnpm build` is tsc --noEmit + vite build: the type gate and the
       # bundle gate in one step, no Rust or Tauri required.
       - run: pnpm build
+      # Issue #953 — the driver tier's `window.__dadDriver` seam is compiled in
+      # only when `VITE_DAD_DRIVER_SEAM=1` is set at build time. This build does
+      # not set it, so its output must not contain it; a seam that leaked into
+      # every bundle would ship to users with nothing saying so.
+      - run: "! grep -rl __dadDriver dist/"
 
   # Issues #823 and #836 — the browser-level tier. `desktop-web` above runs ~296
   # vitest tests under `environment: "jsdom"`, and jsdom is a DOM implementation
@@ -391,6 +397,114 @@ jobs:
           # nobody opens a failure trace from a PR that closed two months ago.
           retention-days: 7
 
+  # Issue #953 — the driver rung, the one above `desktop-browser` on the ladder.
+  # That job drives the built web bundle with fixture data; this one drives the
+  # REAL Tauri window: `tauri-driver` launches the app binary through
+  # `WebKitWebDriver`, the distribution's WebKitGTK renders it under xvfb, and
+  # every scenario runs against a real `daemon serve` in its own sandbox — so it
+  # exercises IPC, the `desktop://` event stream, the daemon handshake and xterm
+  # over a real PTY, none of which any other job reaches. Narrow on purpose: two
+  # smoke scenarios, `desktop/driver/smoke.test.ts`, and `docs/develop/
+  # desktop-gui.md` ("The driver tier") has what they cover and what they do not.
+  #
+  # ADVISORY, and the reason is the one `desktop-browser` records, one rung
+  # higher: a native window under xvfb is the flake-prone end of the ladder
+  # (issue #807's load-sensitive race lived in a tier with LESS exposure than
+  # this one), and nothing about its behaviour on a GitHub runner has been
+  # measured beyond the runs on the PR that added it. Every wait in the suite is
+  # on state rather than on time, which is the design answer to that; a run
+  # history is the evidence one. Making it required is then a deliberate
+  # `REQUIRED_CHECKS` change applied with `scripts/apply-branch-protection.sh` —
+  # a repository-administration act, not something a PR does.
+  #
+  # Same `changes` gate as the other desktop jobs. Unlike them it also builds
+  # the root package, so a daemon-only change reaches it too — which is the
+  # point: the handshake it checks has two ends.
+  desktop-driver:
+    needs: changes
+    if: needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.flake_only != 'true'
+    runs-on: ubuntu-latest
+    # Derived, not measured on a runner yet: a cold debug build of the daemon
+    # and of the desktop crate dominates (4m13s for the app alone on a warm
+    # 16-core dev box, so several times that on four vCPUs), plus a
+    # `cargo install tauri-driver`, and the suite itself is well under a
+    # minute. 45 minutes caps a wedged window at a fraction of the 6-hour
+    # default. Re-tune from real runs; do not raise it to paper over a hang.
+    timeout-minutes: 45
+    env:
+      # The ONE place tauri-driver's version is written. renovate.json's
+      # tauri-driver customManager bumps this line, and
+      # `desktop/scripts/driver-test.sh` reads it from here for a local run
+      # instead of restating it.
+      TAURI_DRIVER_VERSION: 2.0.6
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+        with:
+          toolchain: 1.97.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      # Exact, and in lockstep with devbox.json — see `desktop-web` above.
+      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
+        with:
+          version: 11.22.0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: desktop/pnpm-lock.yaml
+      # The desktop crate's build set — the same six packages as `build`, whose
+      # comment names the other places that declare it — plus the two this job
+      # alone needs at run time: `webkit2gtk-driver` is WebKitWebDriver for the
+      # SAME WebKitGTK the app links against, and `xvfb` is the display.
+      - run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev \
+            libayatana-appindicator3-dev librsvg2-dev libxdo-dev libasound2-dev \
+            webkit2gtk-driver xvfb
+      # From crates.io source with its own lockfile, not a prebuilt binary:
+      # tauri-driver publishes none, and a third-party build cache would be a
+      # binary this job then executes on trust alone. rust-cache keeps
+      # ~/.cargo/bin, so a warm run finds it installed and this is a no-op.
+      - run: cargo install tauri-driver --locked --version "$TAURI_DRIVER_VERSION"
+      - run: cargo build --locked --bin dot-agent-deck
+      - working-directory: desktop
+        run: pnpm install --frozen-lockfile
+      # Node runs the suite by stripping types, not checking them.
+      - working-directory: desktop
+        run: pnpm test:driver:types
+      # `VITE_DAD_DRIVER_SEAM=1` compiles the one read the suite needs into
+      # this bundle — xterm's buffer text, since the WebGL renderer leaves none
+      # in the DOM — and into no other: `desktop-web` checks that an ordinary
+      # build carries none of it. `--no-bundle` because tauri-driver launches
+      # the binary, not a package.
+      - working-directory: desktop
+        env:
+          VITE_DAD_DRIVER_SEAM: "1"
+        run: pnpm tauri build --debug --no-bundle
+      # 96 DPI rather than xvfb's default 100: WebKitWebDriver places clicks
+      # without the scale WebKitGTK derives from DPI, so on a scaled display
+      # every click lands short. `driver/harness.ts` refuses such a window by
+      # name rather than letting it fail as a missing dialog.
+      - working-directory: desktop
+        env:
+          DAD_DRIVER_NATIVE_DRIVER: /usr/bin/WebKitWebDriver
+        run: xvfb-run -a -s "-screen 0 1920x1080x24 -dpi 96" pnpm test:driver
+      # The harness writes a failing scenario's screenshot, page text,
+      # terminal text and every sandbox log under `desktop/driver-results/`.
+      # Attempt-named for the reason spelled out on `build-macos`.
+      - name: Preserve this attempt's driver results
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: desktop-driver-attempt-${{ github.run_attempt }}
+          path: desktop/driver-results/
+          if-no-files-found: warn
+          # Synthetic content — a sandbox daemon and a bash shell — so this is
+          # tidiness rather than a leak.
+          retention-days: 7
+
   build:
     needs: changes
     if: needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.flake_only != 'true'
@@ -417,8 +531,8 @@ jobs:
       # build script resolves `alsa` through pkg-config. macOS needs nothing for
       # CoreAudio and Windows nothing for WASAPI, so this line is Linux-shaped.
       # The same set is declared in `tauri-deps/flake.nix` for a devbox shell,
-      # in the `e2e-deterministic` job below, and in release.yml's bundle job —
-      # keep the four in step.
+      # in the `e2e-deterministic` and `desktop-driver` jobs, and in
+      # release.yml's bundle job — keep the five in step.
       - run: |
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev \
@@ -583,7 +697,7 @@ jobs:
   # sitting in the tree for the life of the job while this lane drives the PTY
   # e2e tier — dozens of contributor-authored test binaries spawning the real
   # deck. The note above `jobs:` has the survey behind that flag and why it went
-  # on all eleven checkouts rather than only this one.
+  # on all twelve checkouts rather than only this one.
   #
   # SCOPE is still the outer bound and still does the heavier lifting: this
   # workflow's top-level `permissions:` block grants `contents: read` and
