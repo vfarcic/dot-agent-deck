@@ -378,7 +378,7 @@ export const desktop = {
       body: 'It ships outside the support expectations of the CLI. The terminal deck is the product; this is an early preview of a second way in.',
     },
     {
-      title: 'Signed for macOS, not for Linux',
+      title: 'v0.42.0: signed for macOS, not for Linux',
       body: 'The .dmg on v0.42.0 is signed with the project’s Apple Developer ID and notarized by Apple, so macOS should ask only to confirm opening an app downloaded from the internet. Each release’s notes say whether its own macOS build is signed; if yours is and macOS calls the app damaged or from an unidentified developer, do not override that — report it. The .deb is unsigned, and dpkg -i verifies no package signature, so on Linux the provenance command below is the only check anybody makes. Run it first on either platform.',
     },
     {
