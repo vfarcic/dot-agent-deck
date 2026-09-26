@@ -2834,22 +2834,24 @@ fn compose_delegate_silence_notice(window: std::time::Duration, pane_text: Optio
 ///   pane or pass `--supersede`, rather than letting the orchestrator find that
 ///   out from a refusal.
 /// * **A false report now costs a turn, not a line.** `deliver_worker_exited_notice`
-///   documents the accepted race against a `work-done` sent immediately before
-///   the process exits. Submitted, that race can make the orchestrator act on a
-///   delegation that did in fact finish; the late `work-done` still arrives
-///   (as unsolicited, since this sweep retired its record), so the orchestrator
-///   sees both and the window is as small as it was.
+///   documents the race against a `work-done` sent immediately before the
+///   process exits. Submitted, losing it could make the orchestrator act on a
+///   delegation that did in fact finish, so #708 narrows it (the delivery
+///   refuses once a `work-done` has credited the commission) and the wording
+///   covers what remains: a `work-done` arriving after this report is to be
+///   trusted over it.
 pub(crate) fn compose_worker_exited_notice(worker_pane_id: &str) -> String {
     compose_delegate_prompt(&format!(
         "⚠ delegated worker exited without work-done (dot-agent-deck daemon report) - a report \
          from the dot-agent-deck daemon, not a message from a person or an agent: the process \
          behind pane {worker_pane_id} ended and no work-done was ever received for its \
-         outstanding delegation, so none will arrive. Check that pane's scrollback for what \
-         happened and decide how to proceed - if this needs the user, notify the user; \
-         otherwise re-delegate or reassign the task. That worker still counts as owing it, so \
-         re-delegating to the same role needs `dot-agent-deck pane restart <role>` first, or \
-         `delegate --supersede`. The daemon log names the role and how long it had been \
-         delegated."
+         outstanding delegation. If a work-done from that worker does arrive after this report, \
+         it was sent just before the process ended: trust it over this report. Otherwise check \
+         that pane's scrollback for what happened and decide how to proceed - if this needs the \
+         user, notify the user; otherwise re-delegate or reassign the task. That worker still \
+         counts as owing it, so re-delegating to the same role needs `dot-agent-deck pane \
+         restart <role>` first, or `delegate --supersede`. The daemon log names the role and how \
+         long it had been delegated."
     ))
 }
 

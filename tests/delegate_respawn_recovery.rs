@@ -726,15 +726,33 @@ const RESPAWN_NOTICE_TAIL: &[u8] = b"daemon log names the role.";
 /// first line break after the notice began, so an unrelated line break cannot be
 /// mistaken for the terminator in either direction.
 fn respawn_notice_terminator(snapshot: &[u8]) -> Option<u8> {
-    let start = snapshot
+    respawn_notice_terminators(snapshot)
+        .first()
+        .copied()
+        .flatten()
+}
+
+/// [`respawn_notice_terminator`] for EVERY dead-replacement notice in the pane,
+/// in order: one entry per opening clause, `None` for a notice whose final
+/// clause or terminator has not landed yet.
+fn respawn_notice_terminators(snapshot: &[u8]) -> Vec<Option<u8>> {
+    let starts: Vec<usize> = snapshot
         .windows(RESPAWN_NOTICE_NEEDLE.len())
-        .position(|w| w == RESPAWN_NOTICE_NEEDLE)?;
-    let rest = &snapshot[start..];
-    let end = rest
-        .windows(RESPAWN_NOTICE_TAIL.len())
-        .position(|w| w == RESPAWN_NOTICE_TAIL)?
-        + RESPAWN_NOTICE_TAIL.len();
-    rest.get(end).copied()
+        .enumerate()
+        .filter(|(_, w)| *w == RESPAWN_NOTICE_NEEDLE)
+        .map(|(i, _)| i)
+        .collect();
+    starts
+        .iter()
+        .map(|&start| {
+            let rest = &snapshot[start..];
+            let end = rest
+                .windows(RESPAWN_NOTICE_TAIL.len())
+                .position(|w| w == RESPAWN_NOTICE_TAIL)?
+                + RESPAWN_NOTICE_TAIL.len();
+            rest.get(end).copied()
+        })
+        .collect()
 }
 
 /// Scenario: start an orchestration whose `clear = true` worker refuses to start
@@ -859,6 +877,43 @@ async fn delegate_023_a_replacement_that_dies_is_reported_to_the_orchestrator() 
         !String::from_utf8_lossy(&snapshot).contains("'coder'"),
         "the notice must not interpolate the role name; snapshot = {:?}",
         String::from_utf8_lossy(&snapshot)
+    );
+
+    // Issue #708 (Greptile P2 on PR #1338): the SAME failure a second time. The
+    // `die` marker is still there, so the next delegate's replacement dies too and
+    // the daemon composes byte-identical text for the same worker pane. The user
+    // has typed into the orchestrator meanwhile, which is the clock that arms the
+    // repeat-payload refusal — without it the guard abstains and this would pass
+    // for the wrong reason. The first report's payload record therefore has to be
+    // released, or the second failure is refused as a repeat of the user's draft
+    // and the orchestrator is left waiting after all.
+    fx.daemon.registry.note_user_input(ORCH_PANE);
+    delegate(&fx, "list the files in this directory").await;
+    let deadline = tokio::time::Instant::now() + DEAD_REPLACEMENT_NOTICE_BUDGET;
+    let terminators = loop {
+        let snapshot = fx
+            .daemon
+            .registry
+            .snapshot(&fx.orchestrator_agent_id)
+            .unwrap_or_default();
+        let terminators = respawn_notice_terminators(&snapshot);
+        if terminators.len() >= 2 && terminators[1].is_some() {
+            break terminators;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the SECOND dead-replacement report never reached the orchestrator within \
+             {DEAD_REPLACEMENT_NOTICE_BUDGET:?} of the user typing and a second delegate; \
+             terminators so far = {terminators:?}, orchestrator pane = {:?}",
+            String::from_utf8_lossy(&snapshot)
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert_eq!(
+        terminators[1],
+        Some(b'\r'),
+        "the second dead-replacement report must be SUBMITTED like the first; terminators = \
+         {terminators:?}"
     );
 }
 

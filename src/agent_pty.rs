@@ -5101,6 +5101,24 @@ impl AgentPtyRegistry {
         );
     }
 
+    /// Issue #708: does `worker_pane_id` still owe at least one commission —
+    /// i.e. has no `work-done` credited everything it was delegated? Expired
+    /// commissions are dropped first, exactly as
+    /// [`Self::retire_delegation_commission`] drops them, so a week-old debt
+    /// does not count. Read-only apart from that expiry.
+    ///
+    /// Used by `deliver_worker_exited_notice`'s revalidation to refuse a
+    /// "worker exited without work-done" report that a racing `work-done` has
+    /// already contradicted.
+    pub fn owes_delegation_commission(&self, worker_pane_id: &str) -> bool {
+        let mut tracker = self.delegations.lock().unwrap();
+        Self::expire_commissions(&mut tracker, worker_pane_id, Instant::now());
+        tracker
+            .commissions
+            .get(worker_pane_id)
+            .is_some_and(|entry| entry.outstanding() > 0)
+    }
+
     /// Issue #448: credit a `work-done` from `worker_pane_id` against the
     /// commission ledger, and report whether the orchestrator had actually asked
     /// for anything — see [`WorkDoneProvenance`].
@@ -6039,21 +6057,35 @@ impl AgentPtyRegistry {
     /// arrives and finds no record left to retire. The window is small — the
     /// socket write completes before the process exits in the normal case —
     /// so this is accepted as low-probability rather than fixed with an
-    /// added delivery delay. Issue #708 raised what losing that race costs —
-    /// a submitted report is a turn the orchestrator may act on, where an
-    /// unsubmitted one was a line in its scrollback — without widening the
-    /// window; the late `work-done` still reaches the orchestrator after it.
+    /// added delivery delay.
+    ///
+    /// Issue #708 raised what losing that race costs — a submitted report is a
+    /// turn the orchestrator may act on, where an unsubmitted one was a line in
+    /// its scrollback — so it now narrows the race rather than only naming it.
+    /// A racing `work-done` finds no `OutstandingDelegation` (this sweep took
+    /// it) and goes on to retire the worker's COMMISSION
+    /// (`AppState::handle_work_done`'s order: silence watch, delegation,
+    /// commission), so the revalidation below also refuses once
+    /// [`Self::owes_delegation_commission`] says nothing is owed any more. That
+    /// closes everything up to the moment the writer is taken; a `work-done`
+    /// processed after it still arrives as a turn of its own, credited as
+    /// solicited because the commission was standing, and the report's wording
+    /// tells the orchestrator to trust that completion over this report.
+    ///
+    /// Returns the guarded send's outcome (`None` for a writer error) so a test
+    /// can drive this exact call site; the one production caller ignores it.
     async fn deliver_worker_exited_notice(
         self: &Arc<Self>,
         worker_pane_id: &str,
         delegation: OutstandingDelegation,
-    ) {
+    ) -> Option<GuardedSend> {
         let notice = crate::state::compose_worker_exited_notice(worker_pane_id);
         let orchestrator_pane_id = delegation.orchestrator_pane_id.clone();
         let expected_agent_id = delegation.orchestrator_agent_id.clone();
         let orchestration = delegation.orchestration.clone();
         let revalidate_registry = Arc::clone(self);
         let revalidate_pane = orchestrator_pane_id.clone();
+        let revalidate_worker = worker_pane_id.to_string();
         let outcome = self
             .write_and_submit_guarded(
                 &orchestrator_pane_id,
@@ -6061,6 +6093,11 @@ impl AgentPtyRegistry {
                 &expected_agent_id,
                 || async move {
                     if revalidate_registry.is_pane_closing(&revalidate_pane) {
+                        return false;
+                    }
+                    // Issue #708: a `work-done` credited since the sweep means
+                    // the delegation did NOT fail — see this function's doc.
+                    if !revalidate_registry.owes_delegation_commission(&revalidate_worker) {
                         return false;
                     }
                     crate::state::orchestration_still_matches(
@@ -6076,12 +6113,8 @@ impl AgentPtyRegistry {
         // `Applied`, like the silence report — otherwise the same worker pane
         // exiting again after a restart produces byte-identical text that the
         // user-input guard would refuse as a repeat.
-        crate::state::settle_one_shot_payload_record(
-            self,
-            &orchestrator_pane_id,
-            &notice,
-            outcome.as_ref().ok().copied(),
-        );
+        let settled = outcome.as_ref().ok().copied();
+        crate::state::settle_one_shot_payload_record(self, &orchestrator_pane_id, &notice, settled);
         match outcome {
             Ok(GuardedSend::Applied) => tracing::info!(
                 worker_pane_id = %worker_pane_id,
@@ -6103,7 +6136,8 @@ impl AgentPtyRegistry {
                 role = %delegation.role,
                 expected_agent_id = %expected_agent_id,
                 outcome = ?refused,
-                "pane EOF: identity gate refused the worker-exited report; nothing submitted"
+                "pane EOF: the worker-exited report was refused (identity gate, or a work-done \
+                 already credited the delegation); nothing submitted"
             ),
             Err(e) => tracing::warn!(
                 pane_id = %orchestrator_pane_id,
@@ -6112,6 +6146,7 @@ impl AgentPtyRegistry {
                 "pane EOF: failed to submit the worker-exited report into the orchestrator pane"
             ),
         }
+        settled
     }
 
     /// PRD #126 M1 audit (finding 2): the orchestration membership of the live
@@ -16726,6 +16761,99 @@ mod spawn_tests {
             CommissionArm::Closing => false,
             CommissionArm::Busy { .. } => panic!("a superseding arm is never refused as busy"),
         }
+    }
+
+    /// An [`OutstandingDelegation`] as `pump_reader`'s EOF sweep hands one to
+    /// `deliver_worker_exited_notice`, owed to `orchestrator_agent_id` on
+    /// `orchestrator_pane_id` and carrying no orchestration membership.
+    fn swept_delegation(
+        orchestrator_pane_id: &str,
+        orchestrator_agent_id: &str,
+    ) -> OutstandingDelegation {
+        OutstandingDelegation {
+            seq: 1,
+            role: "coder".to_string(),
+            orchestrator_pane_id: orchestrator_pane_id.to_string(),
+            orchestrator_agent_id: orchestrator_agent_id.to_string(),
+            orchestration: None,
+            armed_at: Instant::now(),
+            superseded: 0,
+            worker_agent_id: None,
+            _watch_cancel: oneshot::channel().0,
+        }
+    }
+
+    /// Issue #708 (Greptile P1 and P2 on PR #1338): the worker-exited report is
+    /// now a submitted turn, so two properties of its ONE production call site
+    /// matter that did not while it was a scrollback line — driven here through
+    /// `deliver_worker_exited_notice` itself rather than through the primitives
+    /// it calls.
+    ///
+    /// 1. **A `work-done` already credited means the delegation did not fail.**
+    ///    The EOF sweep takes the `OutstandingDelegation` first, and a racing
+    ///    `work-done` then finds none and retires the COMMISSION instead, so a
+    ///    report whose worker no longer owes one is refused rather than handed
+    ///    to the orchestrator as a failure to act on. The control is the same
+    ///    delivery with the commission standing, which IS submitted.
+    /// 2. **A repeat is still submitted after the user has typed.** The same
+    ///    worker pane exiting again composes byte-identical text, and without
+    ///    `settle_one_shot_payload_record`'s release the user-input guard refuses
+    ///    it as a repeat of the user's own draft — the orchestrator would never
+    ///    hear about the second failure.
+    #[tokio::test]
+    async fn worker_exited_report_refuses_a_credited_commission_and_resubmits_after_user_input() {
+        const ORCH: &str = "exit-report-orchestrator";
+        const WORKER: &str = "exit-report-worker";
+        let reg = Arc::new(AgentPtyRegistry::new());
+        let orchestrator = reg
+            .spawn_agent(SpawnOptions {
+                command: Some("/bin/cat"),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), ORCH.to_string())],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn orchestrator stand-in");
+
+        // 1. Nothing owed: a work-done credited the delegation after the sweep.
+        assert!(!reg.owes_delegation_commission(WORKER));
+        let credited = reg
+            .deliver_worker_exited_notice(WORKER, swept_delegation(ORCH, &orchestrator))
+            .await;
+
+        // Control, and the first delivery of part 2: the commission is standing.
+        assert!(arm_commission(&reg, WORKER, ORCH));
+        assert!(reg.owes_delegation_commission(WORKER));
+        let first = reg
+            .deliver_worker_exited_notice(WORKER, swept_delegation(ORCH, &orchestrator))
+            .await;
+
+        // 2. The user types, arming the repeat-payload refusal — without this
+        //    clock the guard abstains and the repeat would pass for the wrong
+        //    reason — and the same worker pane is reported again.
+        reg.note_user_input(ORCH);
+        let repeat = reg
+            .deliver_worker_exited_notice(WORKER, swept_delegation(ORCH, &orchestrator))
+            .await;
+        reg.shutdown_all();
+
+        assert_ne!(
+            credited,
+            Some(GuardedSend::Applied),
+            "a worker-exited report must not be submitted once a work-done has credited the \
+             worker's commission: the delegation finished, and the orchestrator would be told \
+             it failed"
+        );
+        assert_eq!(
+            first,
+            Some(GuardedSend::Applied),
+            "control: the same report with the commission still owed must be submitted, or the \
+             refusal above proves nothing about the commission check"
+        );
+        assert_eq!(
+            repeat,
+            Some(GuardedSend::Applied),
+            "a byte-identical second worker-exited report must still be submitted after the user \
+             has typed — the first one's payload record has to be released"
+        );
     }
 
     /// Issue #448: the commission ledger answers "did the orchestrator ask for
