@@ -1137,8 +1137,27 @@ fn said(spoken: &str, transcript: &str) -> bool {
 /// - rule 2 is a closed list of words, not a grammar: a contrast phrased
 ///   without one of them ("switch to the build box, staging is broken") is
 ///   not seen as one, and then only rule 1 guards it;
-/// - a contrast word that is itself a word of a configured deck's name does
-///   not count, so a deck called `no-backup` stays reachable by voice.
+/// - a contrast word is excused only where it is part of the one named deck's
+///   name as said ([`contrast_marker`]), so a deck called `no-backup` stays
+///   reachable by voice while the "no" of "no build box" still refuses beside
+///   it.
+///
+/// # The bound
+///
+/// What this guarantees: a voice switch goes only to a deck that the user's
+/// own words, read with the resolver's matching, named and named alone — and
+/// only when the model's value is words the user said that resolve to that
+/// same deck. So neither the model nor text injected into what it reads can
+/// choose a deck the user did not name.
+///
+/// What remains, deliberately: the user names one deck while EXCLUDING it in
+/// words outside [`CONTRAST_MARKERS`] ("switch to the build box, it's broken,
+/// go elsewhere"), and the model misreads that as a request for it. The
+/// consequence is a switch to one of the user's own configured decks — the one
+/// they named — which one more utterance or a click on the Deck selector
+/// switches back from. Further exclusion vocabulary is not chased: exclusion
+/// in natural language is unbounded, and the uniquely-named rule, not the
+/// marker list, is the security property.
 fn switch_target(
     spoken: &str,
     transcript: &Transcript,
@@ -1150,7 +1169,7 @@ fn switch_target(
             named.iter().map(|deck| deck.label.clone()).collect(),
         ));
     }
-    if let Some(marker) = contrast_marker(transcript.text(), decks) {
+    if let Some(marker) = contrast_marker(transcript.text(), decks, &named) {
         return Err(Unmet::Contrast(marker));
     }
     if !said(spoken, transcript.text()) {
@@ -1200,31 +1219,97 @@ fn decks_named<'a>(transcript: &str, decks: &'a [VoiceDeck]) -> Vec<&'a VoiceDec
 
 /// Words and phrases that turn a mention of a deck into an EXCLUSION of one —
 /// "not staging", "instead of the build box", "rather than local", "away from
-/// staging", "from local to the build box", "the build box or staging" — for
+/// staging", "from local to the build box", "the build box or staging", "skip
+/// the build box", "anything without staging", "the other one" — for
 /// [`switch_target`]'s rule 2. A closed list, deliberately small, matched as
 /// whole [`spoken_words`] runs — so "don't" is heard as the two words `don t`
 /// a transcriber's apostrophe splits it into, and is quoted back as written
 /// here.
-const CONTRAST_MARKERS: [&str; 15] = [
-    "not", "no", "nor", "never", "don't", "dont", "doesn't", "isn't", "except", "but", "or",
-    "instead", "rather", "than", "from",
+///
+/// **Closed on purpose, and not chased further.** Natural-language exclusion
+/// is unbounded, so no list catches every way to say it; what this list buys
+/// is refusing the common phrasings outright. The security property does not
+/// rest on it — it rests on rule 1 and rule 4, which keep a switch to a deck
+/// the user's own words named on their own (see [`switch_target`]'s bound).
+const CONTRAST_MARKERS: [&str; 27] = [
+    "not",
+    "no",
+    "nor",
+    "never",
+    "don't",
+    "dont",
+    "doesn't",
+    "isn't",
+    "except",
+    "but",
+    "or",
+    "instead",
+    "rather",
+    "than",
+    "from",
+    "skip",
+    "skipping",
+    "avoid",
+    "avoiding",
+    "leave",
+    "leaving",
+    "without",
+    "exclude",
+    "excluding",
+    "besides",
+    "other",
+    "away",
 ];
 
-/// The first [`CONTRAST_MARKERS`] entry, in the list's order, heard in
-/// `transcript` — skipping an entry every word of which is a word of some
-/// configured deck's name, so `no-backup.example.com` does not refuse itself.
-fn contrast_marker(transcript: &str, decks: &[VoiceDeck]) -> Option<String> {
+/// The first [`CONTRAST_MARKERS`] entry, in the list's order, with an
+/// occurrence in `transcript` that is not part of a deck's name.
+///
+/// An occurrence is part of a name — and so excused — only when it lies
+/// inside a run of the transcript's words that resolves on its own to one of
+/// `named` (the decks [`decks_named`] counted) AND every word of which is a
+/// word of one of that deck's names. So `no-backup.example.com` does not
+/// refuse "switch to no backup", while the "no" of "switch deck, no build
+/// box" still refuses beside `no-backup` and `no-cache`: no run holding that
+/// "no" is a name of the one deck named. The excuse is per occurrence, never
+/// per word: a marker that is a word of some configured deck's name counts
+/// wherever it is not inside that deck's name as said.
+fn contrast_marker(transcript: &str, decks: &[VoiceDeck], named: &[&VoiceDeck]) -> Option<String> {
     let words = spoken_words(transcript);
-    let name_words: BTreeSet<String> = decks
-        .iter()
-        .flat_map(deck_spoken_names)
-        .flat_map(|name| spoken_words(&name))
-        .collect();
     CONTRAST_MARKERS.iter().find_map(|marker| {
         let wanted = spoken_words(marker);
-        let heard = words.windows(wanted.len()).any(|window| window == wanted);
-        let a_name = wanted.iter().all(|word| name_words.contains(word));
-        (heard && !a_name).then(|| marker.to_string())
+        let unexcused = (0..words.len())
+            .filter(|&at| words[at..].starts_with(&wanted))
+            .any(|at| !inside_a_named_deck(&words, at, at + wanted.len(), decks, named));
+        unexcused.then(|| marker.to_string())
+    })
+}
+
+/// Whether `words[from..to]` lies inside a run of `words` that is one of
+/// `named`'s names as said: the run resolves to that deck alone under
+/// [`resolve_deck_ref`], and every word of it is a word of one name the deck
+/// answers to ([`deck_spoken_names`]). The second half is what keeps a run
+/// that merely CONTAINS a name — "from build box", which the resolver's loose
+/// pass reaches `build-box` by — from excusing the word in front of it.
+fn inside_a_named_deck(
+    words: &[String],
+    from: usize,
+    to: usize,
+    decks: &[VoiceDeck],
+    named: &[&VoiceDeck],
+) -> bool {
+    (0..=from).any(|start| {
+        (to..=words.len()).any(|end| {
+            let run = &words[start..end];
+            let DeckRefMatch::One { id, .. } = resolve_deck_ref(&run.join(" "), decks) else {
+                return false;
+            };
+            named.iter().filter(|deck| deck.id == id).any(|deck| {
+                deck_spoken_names(deck).iter().any(|name| {
+                    let name_words = spoken_words(name);
+                    run.iter().all(|word| name_words.contains(word))
+                })
+            })
+        })
     })
 }
 
@@ -7467,6 +7552,125 @@ mod tests {
                 "switch deck to no backup",
                 "no backup",
                 "deck-no-backup",
+            ),
+            (
+                &single[..],
+                "switch deck to this machine",
+                "this machine",
+                "deck-local",
+            ),
+        ] {
+            let outcome = switched_over(decks, said, spoken).await;
+            assert!(
+                matches!(&outcome, VoiceOutcome::Dispatch { params, .. }
+                    if params[0].value == expected),
+                "{said}: {outcome:?}"
+            );
+        }
+    }
+
+    /// Scenario: the audit of `a465eac` — a contrast word used to be excused
+    /// everywhere once ANY configured deck's name held it. With `no-backup`
+    /// and `no-cache` configured, "switch deck, no build box" answered with
+    /// `build box` switched to the excluded deck, and with `from-prod`
+    /// configured "switch from the build box" switched to the deck being
+    /// left. Each is refused now, as are the exclusion verbs the closed list
+    /// gained ("skip", "avoid", "leave", "without"). A contrast word inside
+    /// the one deck the user named — "no backup", "from prod" — is that
+    /// deck's name and still switches, as do the plain controls.
+    #[tokio::test]
+    async fn voice_outcome_switch_deck_excuses_a_contrast_word_only_inside_the_deck_named() {
+        let local = deck("deck-local", "Local deck", true);
+        let build = deck("deck-build-box", "deploy@build-box.example.com", false);
+        let no_backups = [
+            local.clone(),
+            build.clone(),
+            deck("deck-no-backup", "ops@no-backup.example.com", false),
+            deck("deck-no-cache", "ops@no-cache.example.com", false),
+        ];
+        let from_prod = [
+            local.clone(),
+            build.clone(),
+            deck("deck-from-prod", "ops@from-prod.example.com", false),
+        ];
+        let single = [local.clone(), build.clone()];
+
+        for (decks, said, spoken, marker) in [
+            (
+                &no_backups[..],
+                "switch deck, no build box",
+                "build box",
+                "no",
+            ),
+            (
+                &from_prod[..],
+                "switch from the build box",
+                "build box",
+                "from",
+            ),
+            (
+                &single[..],
+                "switch decks, skip the build box",
+                "build box",
+                "skip",
+            ),
+            (
+                &single[..],
+                "switch deck, avoid the build box",
+                "build box",
+                "avoid",
+            ),
+            (
+                &single[..],
+                "switch decks and leave the build box",
+                "build box",
+                "leave",
+            ),
+            (
+                &single[..],
+                "switch to anything without the build box",
+                "build box",
+                "without",
+            ),
+        ] {
+            let outcome = switched_over(decks, said, spoken).await;
+            let VoiceOutcome::ParamUnresolved {
+                action, sentence, ..
+            } = &outcome
+            else {
+                panic!("{said}: a contrast must refuse, got {outcome:?}");
+            };
+            assert_eq!(action, "switch_deck");
+            assert!(
+                sentence.contains(&format!("\u{201c}{marker}\u{201d}")),
+                "{said}: {sentence}"
+            );
+        }
+
+        for (decks, said, spoken, expected) in [
+            (
+                &no_backups[..],
+                "switch to no backup",
+                "no backup",
+                "deck-no-backup",
+            ),
+            (
+                &from_prod[..],
+                "switch to from prod",
+                "from prod",
+                "deck-from-prod",
+            ),
+            (
+                &no_backups[..],
+                "switch deck to the build box",
+                "build box",
+                "deck-build-box",
+            ),
+            (
+                &from_prod[..],
+                "switch deck to local",
+                "local",
+                "deck-local",
             ),
             (
                 &single[..],
