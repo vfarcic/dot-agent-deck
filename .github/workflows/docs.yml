@@ -53,3 +53,28 @@ jobs:
           file: site/Dockerfile
           load: true
           tags: ghcr.io/vfarcic/dot-agent-deck-docs:test
+
+      # Netlify preview at pr-<N>--agent-deck-devopstoolkit-ai.netlify.app.
+      # Secrets are not passed to pull requests from forks, so those (and the
+      # manual `workflow_dispatch` run, which has no PR number) get no preview.
+      # netlify-cli is pinned in devbox.json.
+      - uses: jetify-com/devbox-install-action@8c6a66ed6273138b1915457069de78cb52fe3bd7 # v0.15.0
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+        with:
+          enable-cache: true
+
+      # `--cwd site` and the space-free arguments are load-bearing for the same
+      # reasons given on the production deploy in docs-publish.yml: without the
+      # former site/netlify.toml's headers are silently dropped.
+      - name: Deploy preview to Netlify
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+        env:
+          NETLIFY_AUTH_TOKEN: ${{ secrets.NETLIFY_AUTH_TOKEN }}
+          NETLIFY_SITE_ID: ${{ secrets.NETLIFY_SITE_ID }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          URL=$(devbox run -- netlify deploy --cwd site --no-build --dir=build \
+            --alias "pr-${PR_NUMBER}" --message "pr-${PR_NUMBER}" --json | jq -r '.deploy_url')
+          echo "Preview: ${URL}"
+          echo "### Netlify preview: ${URL}" >> "$GITHUB_STEP_SUMMARY"

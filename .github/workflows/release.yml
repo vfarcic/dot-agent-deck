@@ -2187,7 +2187,9 @@ jobs:
     # not done inline, because the callee is also `workflow_dispatch`-able and
     # that path has to be canaried first (governance.md step 5). Keep the
     # forwarding until then; do not read this line as an endorsement of
-    # `inherit` over a narrow map.
+    # `inherit` over a narrow map. The narrow map must also carry
+    # NETLIFY_AUTH_TOKEN and NETLIFY_SITE_ID, which the callee's Netlify
+    # deploy reads.
     secrets: inherit
     with:
       image_tag: v${{ needs.prepare.outputs.version }}

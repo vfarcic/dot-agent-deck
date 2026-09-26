@@ -90,8 +90,14 @@ jobs:
             TAG="main-${SHORT_SHA}"
             ORIGIN="manual"
           fi
-          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
-          echo "origin=${ORIGIN}" >> "$GITHUB_OUTPUT"
+          # `sha` is the commit the image is built from. "Commit chart changes"
+          # pulls `main` forward, so the Netlify build at the end checks this
+          # out again to publish exactly what the image holds.
+          {
+            echo "tag=${TAG}"
+            echo "origin=${ORIGIN}"
+            echo "sha=$(git rev-parse HEAD)"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Compose tag list
         id: tags
@@ -244,3 +250,56 @@ jobs:
             fi
             echo "- **Trigger**: ${ORIGIN}"
           } >> "$GITHUB_STEP_SUMMARY"
+
+      # Netlify production deploy, running ALONGSIDE the image + chart path
+      # above while agent-deck.devopstoolkit.ai still points at the cluster.
+      # Every Netlify step comes after "Commit chart changes" and "Summary", so
+      # a Netlify failure cannot stop the cluster from rolling forward.
+      #
+      # `--force --detach` returns to the commit the image was built from: the
+      # chart commit above pulled `main` forward, and anything merged under
+      # docs/ or site/ in the meantime belongs in the NEXT publish, not a copy
+      # of the site that differs from the image. The chart bump itself is
+      # already pushed, so nothing is lost by leaving the branch.
+      - name: Check out the image's source commit for the Netlify build
+        env:
+          SOURCE_SHA: ${{ steps.tag.outputs.sha }}
+        run: git -c advice.detachedHead=false checkout --force --detach "${SOURCE_SHA}"
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: '24'
+          cache: 'npm'
+          cache-dependency-path: site/package-lock.json
+
+      - name: Build site for Netlify
+        working-directory: site
+        run: |
+          npm ci
+          npm run build
+
+      # netlify-cli is pinned in devbox.json.
+      - uses: jetify-com/devbox-install-action@8c6a66ed6273138b1915457069de78cb52fe3bd7 # v0.15.0
+        with:
+          enable-cache: true
+
+      # `--cwd site` is load-bearing. `devbox run` always executes from the repo
+      # root, and from there netlify-cli never finds site/netlify.toml: the
+      # deploy still succeeds, just without its headers (measured: /assets/*
+      # came back max-age=0 instead of immutable). `--dir` is then relative to
+      # site/. `--no-build` because the CLI otherwise runs a build of its own.
+      #
+      # No spaces or `#` in any argument: some devbox versions flatten
+      # `devbox run`'s args into one string and re-parse it through a shell
+      # (see the `devbox` job in ci.yml), which would split a spaced --message.
+      - name: Deploy to Netlify
+        env:
+          NETLIFY_AUTH_TOKEN: ${{ secrets.NETLIFY_AUTH_TOKEN }}
+          NETLIFY_SITE_ID: ${{ secrets.NETLIFY_SITE_ID }}
+          IMAGE_TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          URL=$(devbox run -- netlify deploy --cwd site --prod --no-build --dir=build \
+            --message "docs-${IMAGE_TAG}" --json | jq -r '.url // .deploy_url')
+          echo "Netlify production: ${URL}"
+          echo "- **Netlify**: ${URL} (\`docs-${IMAGE_TAG}\`)" >> "$GITHUB_STEP_SUMMARY"
