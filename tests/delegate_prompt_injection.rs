@@ -2598,7 +2598,14 @@ const NO_SIGNAL_BUFFER_FLOOR: Duration = Duration::from_secs(7);
 #[cfg(unix)]
 const NO_SIGNAL_POINTER_CEILING: Duration = Duration::from_secs(12);
 
-/// Scenario: Delegate with `clear = true` to a worker whose agent emits no readiness event of any kind before its first prompt (OpenCode's measured behaviour), with no operator buffer configured, then walk a paused Tokio clock forward a second at a time. The task pointer must reach the pane inside twelve virtual seconds rather than after the 30 s dead wait, and no sooner than seven — the shipped 8000 ms no-signal buffer, which is how the run proves the skip resolved THAT buffer rather than the ordinary 1000 ms one (issue #243).
+/// Issue #1243: the floor `orchestration/delegate/030`'s undeclared-launcher
+/// control is held to — the test's pinned 30 s `SESSION_START_WAIT_TIMEOUT`. A
+/// delivery before it would mean the deck had claimed a readiness shortcut for a
+/// process it cannot identify.
+#[cfg(unix)]
+const UNDECLARED_LAUNCHER_WAIT_FLOOR: Duration = Duration::from_secs(30);
+
+/// Scenario: Delegate with `clear = true` to a worker whose agent emits no readiness event of any kind before its first prompt (OpenCode's measured behaviour), with no operator buffer configured, then walk a paused Tokio clock forward a second at a time. The task pointer must reach the pane inside twelve virtual seconds rather than after the 30 s dead wait, and no sooner than seven — the shipped 8000 ms no-signal buffer, which is how the run proves the skip resolved THAT buffer rather than the ordinary 1000 ms one (issue #243). The same worker is then run behind a launcher script the deck cannot see through: undeclared it still waits the 30 s out, and declared `agent = "opencode"` it gets the same prompt delivery as the bare binary (issue #1243).
 #[spec("orchestration/delegate/030")]
 #[test]
 #[cfg(unix)]
@@ -2621,11 +2628,75 @@ fn delegate_030_agent_with_no_pre_prompt_signal_skips_the_dead_wait() {
         .enable_all()
         .build()
         .expect("build no-signal readiness runtime")
-        .block_on(delegate_030_agent_with_no_pre_prompt_signal_skips_the_dead_wait_inner());
+        .block_on(async {
+            // Issue #1243: the three configurations, in the order a reader needs
+            // them. The bare binary is the original #243 case. The other two are
+            // the configuration that was actually measured paying the 30 s
+            // fallback on every delegation — the agent behind a launcher
+            // (`devbox run oc-big`) — first undeclared, where the deck cannot
+            // know what it launched and the conservative wait is CORRECT
+            // (`orchestration/delegate/011`), then with the `agent = "opencode"`
+            // declaration that tells it. The middle arm is the control: it is
+            // what proves the declaration, not the launcher, decides the path.
+            for case in [
+                NoSignalCase::Bare,
+                NoSignalCase::UndeclaredLauncher,
+                NoSignalCase::DeclaredLauncher,
+            ] {
+                delegate_030_agent_with_no_pre_prompt_signal_skips_the_dead_wait_inner(case).await;
+            }
+        });
+}
+
+/// Issue #1243: an in-memory `tracing` writer, so `orchestration/delegate/030`
+/// can read back what the daemon logged for one arm.
+#[cfg(unix)]
+#[derive(Clone, Default)]
+struct CapturedLog(Arc<Mutex<Vec<u8>>>);
+
+#[cfg(unix)]
+impl CapturedLog {
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+    }
 }
 
 #[cfg(unix)]
-async fn delegate_030_agent_with_no_pre_prompt_signal_skips_the_dead_wait_inner() {
+impl std::io::Write for CapturedLog {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLog {
+    type Writer = CapturedLog;
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+/// Issue #1243: how `orchestration/delegate/030`'s no-signal worker is launched.
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NoSignalCase {
+    /// The role command IS the `opencode`-named binary, so the deck infers it.
+    Bare,
+    /// The role command is a launcher script that `exec`s it, with no `agent`
+    /// key — `devbox run oc-big` as this repo's own config wrote it.
+    UndeclaredLauncher,
+    /// The same launcher, declared `agent = "opencode"`.
+    DeclaredLauncher,
+}
+
+#[cfg(unix)]
+async fn delegate_030_agent_with_no_pre_prompt_signal_skips_the_dead_wait_inner(
+    case: NoSignalCase,
+) {
     common::init_test_env();
     let cwd = common::race_safe_tempdir();
     let bin_dir = cwd.path().join("bin");
@@ -2638,18 +2709,53 @@ async fn delegate_030_agent_with_no_pre_prompt_signal_skips_the_dead_wait_inner(
     // ever emits an event, which is precisely that agent's cold-boot stream.
     let agent = bin_dir.join("opencode");
     write_executable(&agent, "#!/bin/sh\nexec cat\n");
-    let command = agent.to_string_lossy().into_owned();
+    let agent_command = agent.to_string_lossy().into_owned();
     assert_eq!(
-        AgentType::from_command(Some(&command)),
+        AgentType::from_command(Some(&agent_command)),
         Some(AgentType::OpenCode),
         "control: the fixture must resolve to the OpenCode agent, or this measures nothing about \
          an agent with no pre-prompt readiness signal"
     );
-    std::fs::write(
-        cwd.path().join(".dot-agent-deck.toml"),
-        clear_true_config(&command),
-    )
-    .expect("write no-signal orchestration config");
+    let (command, declared) = match case {
+        NoSignalCase::Bare => (agent_command, None),
+        launcher_case => {
+            // A launcher whose basename names no agent, exactly like `devbox`.
+            let launcher = bin_dir.join("run-oc-big.sh");
+            write_executable(
+                &launcher,
+                &format!("#!/bin/sh\nexec '{}'\n", agent.to_string_lossy()),
+            );
+            let launcher_command = launcher.to_string_lossy().into_owned();
+            assert_eq!(
+                AgentType::from_command(Some(&launcher_command)),
+                None,
+                "control: the launcher must hide the agent from command inference, or the \
+                 launcher arms are the bare arm again"
+            );
+            let declared = (launcher_case == NoSignalCase::DeclaredLauncher).then_some("opencode");
+            (launcher_command, declared)
+        }
+    };
+    let config = match declared {
+        Some(agent) => clear_true_config(&command).replace(
+            "clear = true\n",
+            &format!("clear = true\nagent = \"{agent}\"\n"),
+        ),
+        None => clear_true_config(&command),
+    };
+    std::fs::write(cwd.path().join(".dot-agent-deck.toml"), config)
+        .expect("write no-signal orchestration config");
+    // Issue #1243: capture the daemon's log for this arm. The runtime is
+    // current-thread, so the dispatch task `handle_delegate` spawns runs on this
+    // thread and a thread-local default subscriber sees what it logs.
+    let captured = CapturedLog::default();
+    let _log_guard = tracing::subscriber::set_default(
+        tracing_subscriber::fmt()
+            .with_writer(captured.clone())
+            .with_max_level(tracing_subscriber::filter::LevelFilter::WARN)
+            .with_ansi(false)
+            .finish(),
+    );
     let cwd_str = cwd.path().to_string_lossy().into_owned();
     let registry = Arc::new(AgentPtyRegistry::new());
     let old_agent_id = registry
@@ -2709,20 +2815,52 @@ async fn delegate_030_agent_with_no_pre_prompt_signal_skips_the_dead_wait_inner(
     };
     let snapshot = registry.snapshot(&new_agent_id).unwrap_or_default();
     registry.shutdown_all();
+    // Each arm pauses the clock for itself; hand it back so the next arm's
+    // real-time setup (`wait_for_replacement_agent`) is not auto-advanced.
+    tokio::time::resume();
 
     assert!(
         delivered,
-        "a worker whose agent emits no readiness event ever received its delegated task pointer \
-         at all, within {MEASURED_LATENCY_CEILING:?} of virtual time; snapshot = {:?}",
+        "[{case:?}] a worker whose agent emits no readiness event ever received its delegated \
+         task pointer at all, within {MEASURED_LATENCY_CEILING:?} of virtual time; snapshot = {:?}",
         String::from_utf8_lossy(&snapshot)
     );
+    // The WARN that names the remedy (issue #1243): the measured symptom sat
+    // behind a DEBUG line only, so nothing in an ordinary log said why every
+    // delegation cost 30 s.
+    let log = captured.text();
+    let warned = log.contains("agent the deck cannot identify");
+    assert_eq!(
+        warned,
+        case == NoSignalCase::UndeclaredLauncher,
+        "[{case:?}] the unidentified-agent timeout WARN must fire for, and only for, the \
+         undeclared launcher; captured log = {log:?}"
+    );
+    if case == NoSignalCase::UndeclaredLauncher {
+        // The control. Nothing tells the deck what the launcher started, so it
+        // cannot claim OpenCode's no-signal skip on the agent's behalf and waits
+        // the timeout out, exactly as `orchestration/delegate/011` pins for an
+        // unidentified agent. This is the 30 s the issue measured on every
+        // delegation — reproduced here so the declared arm below is seen to be
+        // what removes it.
+        assert!(
+            virtual_elapsed >= UNDECLARED_LAUNCHER_WAIT_FLOOR,
+            "[{case:?}] an OpenCode behind an undeclared launcher got the declared-no-signal \
+             skip after only {virtual_elapsed:?} — the deck cannot know what the launcher runs, \
+             so it must keep the conservative wait (orchestration/delegate/011). snapshot = {:?}",
+            String::from_utf8_lossy(&snapshot)
+        );
+        return;
+    }
     assert!(
         virtual_elapsed <= NO_SIGNAL_POINTER_CEILING,
-        "a worker whose agent has NO pre-prompt readiness signal still sat through the dead wait: \
-         the task pointer arrived after {virtual_elapsed:?} of virtual time, against a budget of \
-         {NO_SIGNAL_POINTER_CEILING:?}. There is no signal for the gate to fast-path on, so \
-         `hook_install.is_some()` sends it into the full SESSION_START_WAIT_TIMEOUT and only the \
-         fallback delivers (issue #243). snapshot = {:?}",
+        "[{case:?}] a worker whose agent has NO pre-prompt readiness signal still sat through the \
+         dead wait: the task pointer arrived after {virtual_elapsed:?} of virtual time, against a \
+         budget of {NO_SIGNAL_POINTER_CEILING:?}. There is no signal for the gate to fast-path \
+         on, so `hook_install.is_some()` sends it into the full SESSION_START_WAIT_TIMEOUT and \
+         only the fallback delivers (issue #243) — or, for the declared launcher, the role's \
+         `agent = \"opencode\"` did not reach the respawn's readiness decision (issue #1243). \
+         snapshot = {:?}",
         String::from_utf8_lossy(&snapshot)
     );
     // Round 4's addition, and the only assertion anywhere that reads WHICH
@@ -2732,8 +2870,8 @@ async fn delegate_030_agent_with_no_pre_prompt_signal_skips_the_dead_wait_inner(
     // against a real OpenCode. See `NO_SIGNAL_BUFFER_FLOOR`.
     assert!(
         virtual_elapsed >= NO_SIGNAL_BUFFER_FLOOR,
-        "the declared-no-signal skip delivered the task pointer after only {virtual_elapsed:?} of \
-         virtual time, under the {NO_SIGNAL_BUFFER_FLOOR:?} floor. With no operator buffer \
+        "[{case:?}] the declared-no-signal skip delivered the task pointer after only \
+         {virtual_elapsed:?} of virtual time, under the {NO_SIGNAL_BUFFER_FLOOR:?} floor. With no operator buffer \
          configured this path must resolve `no_signal_readiness_buffer()` \
          (`NO_SIGNAL_READINESS_BUFFER`, 8000 ms, sized in issue #243 round 4 against a real \
          OpenCode's composer paint across 176 runs); a figure at or near 1 s means the call site \

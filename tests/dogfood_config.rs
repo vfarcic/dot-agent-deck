@@ -90,7 +90,9 @@ fn the_repo_config_declares_mixed_as_its_default_orchestration() {
 }
 
 /// **The sync guarantee.** `anthropic` and `GPT` must differ from `mixed` in
-/// nothing but each role's `command`.
+/// nothing but each role's `command` — and the `agent` that command launches,
+/// which has to move with it (issue #1243, see
+/// `every_role_declares_the_agent_its_launcher_runs`).
 ///
 /// This is the mechanical form of the promise #705 makes to a contributor: pick
 /// whichever provider you have credentials for and get *the same process*, not a
@@ -222,6 +224,66 @@ fn each_single_provider_variant_launches_only_that_provider() {
             );
         }
     }
+}
+
+/// **The readiness guarantee (issue #1243).** Every role resolves to the agent
+/// its `devbox run <script>` actually launches — which, because the command is a
+/// launcher, means every role DECLARES it with `agent = "…"`.
+///
+/// `AgentType::from_command` sees `devbox` and nothing behind it, so an
+/// undeclared role is an agent the deck cannot identify, and `delegate` then
+/// keeps its conservative wait for a `SessionStart` (`orchestration/delegate/011`).
+/// Claude posts one of its own regardless, which is why the Claude roles looked
+/// fine. Codex, Pi and OpenCode never do before their first task — they are
+/// covered instead by the wrapper's interface observation, Pi's native seed
+/// hand-off and OpenCode's declared no-signal skip, and every one of those keys
+/// on the RESOLVED type. Measured on one day of this very file: 0 of 17
+/// delegations to the Codex tester, 0 of 6 to the Pi reviewer and 0 of 6 to the
+/// OpenCode auditor saw readiness, each paying the full 30 s fallback.
+///
+/// Compared against what the script launches rather than against a hard-coded
+/// list so that swapping a role's commented-out alternative launcher in — the
+/// thing this file invites — fails here until `agent` is swapped with it. A
+/// variant that `extends` another INHERITS the parent's `agent` when its patch
+/// restates only `command`, so the variants must restate it too, and this is
+/// what notices when one does not.
+#[test]
+fn every_role_declares_the_agent_its_launcher_runs() {
+    use dot_agent_deck::event::AgentType;
+
+    let scripts = devbox_script_bodies();
+    let mut wrong = Vec::new();
+    for orch in &dogfood_config().orchestrations {
+        for role in &orch.roles {
+            let launched =
+                launched_program(&scripts, &role.command).unwrap_or_else(|| role.command.clone());
+            let launched_type = AgentType::from_command(Some(&launched));
+            assert!(
+                launched_type.is_some(),
+                "'{}' role '{}' runs `{}` -> `{launched}`, which is not an agent the deck knows",
+                orch.name,
+                role.name,
+                role.command
+            );
+            if role.resolved_agent_type() != launched_type {
+                wrong.push(format!(
+                    "'{}' role '{}': `{}` launches {:?}, but the role resolves to {:?}",
+                    orch.name,
+                    role.name,
+                    role.command,
+                    launched_type,
+                    role.resolved_agent_type()
+                ));
+            }
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "these roles do not resolve to the agent they launch, so every `delegate` to a Codex, Pi \
+         or OpenCode one waits the full 30 s readiness timeout (issue #1243) — declare \
+         `agent = \"…\"` beside the command:\n{}",
+        wrong.join("\n")
+    );
 }
 
 /// And `mixed` earns its name: it is not silently one provider.

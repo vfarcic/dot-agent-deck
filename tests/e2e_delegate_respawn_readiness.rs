@@ -28,6 +28,9 @@ const DELEGATE_TRIGGER: &str = "delegate-now";
 const DELEGATE_TASK_FILE: &str = "delegate-task.md";
 const ORCHESTRATOR_SCRIPT: &str = "orchestrator-delegate.sh";
 const ORCHESTRATOR_LOG: &str = "orchestrator-delegate.log";
+/// Issue #1243: the launcher a [`RealDelegateCase::declared_launcher`] case puts
+/// in front of its worker. Its basename names no agent, exactly like `devbox`.
+const WORKER_LAUNCHER: &str = "run-worker.sh";
 
 const CLAUDE_MODEL: &str = "claude-haiku-4-5-20251001";
 const CLAUDE_SENTINEL: &str = "prd249-claude-respawn-4d37c1.txt";
@@ -102,6 +105,13 @@ struct RealDelegateCase<'a> {
     /// the 3.80 / 3.85 / 3.96 / 4.39 s end-to-end delegates its budgets are
     /// derived from — not one of its victims.
     delegate_to_submit_budget: Option<Duration>,
+    /// Issue #1243: `Some(agent)` runs the worker through [`WORKER_LAUNCHER`], a
+    /// script that `exec`s the real command, and declares `agent = "<agent>"` on
+    /// the role — the `devbox run oc-big` shape this repository's own config was
+    /// measured paying the full 30 s readiness timeout under on every delegation,
+    /// because the deck could not see the agent behind the launcher. `None`
+    /// runs the command directly.
+    declared_launcher: Option<&'a str>,
 }
 
 /// Issue #243: `/015`'s bound, derived from both ends the same way
@@ -195,7 +205,10 @@ fn write_executable(path: &Path, contents: &str) {
         .expect("chmod orchestrator role script");
 }
 
-fn orchestration_toml(worker_command: &str) -> String {
+fn orchestration_toml(worker_command: &str, declared_agent: Option<&str>) -> String {
+    let agent_line = declared_agent
+        .map(|agent| format!("agent = {agent:?}\n"))
+        .unwrap_or_default();
     format!(
         "[[orchestrations]]\n\
          name = \"{ORCH_NAME}\"\n\n\
@@ -206,6 +219,7 @@ fn orchestration_toml(worker_command: &str) -> String {
          [[orchestrations.roles]]\n\
          name = \"{WORKER_ROLE}\"\n\
          command = {worker_command:?}\n\
+         {agent_line}\
          clear = true\n"
     )
 }
@@ -242,9 +256,26 @@ fn run_real_clear_true_delegate(deck: TuiDeck, worker_command: &str, case: RealD
     deck.wait_for_string("No active sessions");
 
     let work = deck.workdir().to_path_buf();
+    let role_command = match case.declared_launcher {
+        Some(_) => {
+            write_executable(
+                &work.join(WORKER_LAUNCHER),
+                &format!("#!/bin/sh\nexec {worker_command}\n"),
+            );
+            let launcher = format!("./{WORKER_LAUNCHER}");
+            assert_eq!(
+                AgentType::from_command(Some(&launcher)),
+                None,
+                "control: the launcher must hide the agent from command inference, or this is \
+                 not the configuration issue #1243 measured"
+            );
+            launcher
+        }
+        None => worker_command.to_string(),
+    };
     std::fs::write(
         work.join(".dot-agent-deck.toml"),
-        orchestration_toml(worker_command),
+        orchestration_toml(&role_command, case.declared_launcher),
     )
     .expect("write delegate orchestration config");
     std::fs::write(work.join(DELEGATE_TASK_FILE), delegate_task(&case))
@@ -358,7 +389,9 @@ fn run_real_clear_true_delegate(deck: TuiDeck, worker_command: &str, case: RealD
              NO pre-prompt readiness signal, so the gate should skip straight to the bounded \
              readiness buffer — a delay in this range means it is waiting out the 30 s \
              SESSION_START_WAIT_TIMEOUT for an event that cannot arrive, and only the fallback is \
-             delivering (issue #243). released={delegate_released_at:?} submitted={:?}",
+             delivering (issue #243) — or, behind a declared launcher, that the role's `agent` \
+             declaration did not reach the delegate's readiness decision (issue #1243). \
+             released={delegate_released_at:?} submitted={:?}",
             case.agent_name,
             submitted.timestamp
         );
@@ -421,11 +454,12 @@ fn delegate_014_real_claude_worker_acts_on_clear_true_delegate() {
             // readiness path is untouched by #243 and is its healthy baseline,
             // not one of its victims.
             delegate_to_submit_budget: None,
+            declared_launcher: None,
         },
     );
 }
 
-/// Scenario: Open an orchestration through the real PTY-attached deck with a `clear = true` worker running interactive OpenCode on a cheap mini model, visibly wait for its TUI, and release a script that invokes the real delegate CLI. The replacement worker must submit its task pointer, visibly traverse Thinking and Working with its shell tool, and create the uniquely named sentinel requested by the delegated task; the run pins the shipped 8000 ms no-signal readiness buffer, and a test-only env seam can repoint that buffer to any other value so the same scenario can be re-bracketed on a slower or busier box. The submission must also land within twenty seconds of the delegate being released (issue #243), which is the one assertion that separates the fixed path from the dead wait an agent declaring no pre-prompt readiness signal used to pay: every other assertion here held under that 30 s `SessionStart` timeout too.
+/// Scenario: Open an orchestration through the real PTY-attached deck with a `clear = true` worker running interactive OpenCode on a cheap mini model through a launcher script the deck cannot see through, declared `agent = "opencode"` on the role (issue #1243), visibly wait for its TUI, and release a script that invokes the real delegate CLI. The replacement worker must submit its task pointer, visibly traverse Thinking and Working with its shell tool, and create the uniquely named sentinel requested by the delegated task; the run pins the shipped 8000 ms no-signal readiness buffer, and a test-only env seam can repoint that buffer to any other value so the same scenario can be re-bracketed on a slower or busier box. The submission must also land within twenty seconds of the delegate being released (issue #243), which is the one assertion that separates the fixed path from the dead wait an agent declaring no pre-prompt readiness signal used to pay: every other assertion here held under that 30 s `SessionStart` timeout too.
 #[spec("orchestration/delegate/015")]
 #[test]
 #[cfg(unix)]
@@ -466,6 +500,14 @@ fn delegate_015_real_opencode_worker_acts_on_clear_true_delegate() {
             sentinel_name: OPENCODE_SENTINEL,
             sentinel_content: OPENCODE_SENTINEL_CONTENT,
             delegate_to_submit_budget: Some(OPENCODE_DELEGATE_TO_SUBMIT_BUDGET),
+            // Issue #1243: behind a launcher, declared — the configuration that
+            // was measured paying the 30 s fallback on every delegation. The
+            // bare-binary form's type inference is pinned at L1 by
+            // `orchestration/delegate/030`'s bare arm, so this spends the one
+            // real OpenCode turn on the shape that actually broke. Undeclared,
+            // this run would be ~38 s (the 30 s wait plus the pinned 8000 ms
+            // buffer) against the 20 s budget above.
+            declared_launcher: Some("opencode"),
         },
     );
 }
