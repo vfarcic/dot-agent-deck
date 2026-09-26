@@ -52,7 +52,7 @@ Pinned by `daemon::hook_ingestion_tests::a_dispatch_its_handler_rejects_is_still
 - `handle_dispatch`'s reply, delivered by `deliver_dispatch_result` once `spawn` returns. `dispatch` passes `detach_delivery = false`, so that is after the readiness wait and the first write — but `deliver` hands confirmation to a detached `spawn_confirmation_task` whatever the flag says, and a refused first write still returns `Ok`. So a reply opening `dispatch::SPAWNED_OPENING` means "a unit was spawned", not "its task arrived". Every other reply opening is a failure.
 - The completion report, when the unit runs `work-done --done`. It is the first message to the caller that implies the unit received its task.
 
-What confirmation finds goes nowhere near the caller. Abandonment publishes a `DeliveryNotice` on the **unit's** card; an unconfirmable producer and a `lagged-event-stream` / `event-stream-closed` stop are log lines only (`crate::prompt_delivery`'s `log_prompt_*`).
+What confirmation finds goes nowhere near the caller. Abandonment publishes a `DeliveryNotice` on the **unit's** card; an unconfirmable producer and a `lagged-event-stream` / `event-stream-closed` stop are log lines only (`crate::prompt_delivery`'s `log_prompt_*`). The same holds before confirmation starts: a first write refused by `guarded_submit` (`Refused`, `Failed`) or stopped by the pre-write drain is logged and nothing more, and only `RefusedUserInput` publishes a notice (`report_user_input_stop`). All of these still return `Ok` from `spawn`, so the caller gets `SPAWNED_OPENING` regardless.
 
 **Why not the opt-in `--await-confirmation` the issue proposed.**
 

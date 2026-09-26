@@ -121,21 +121,27 @@ enum Commands {
     /// Create a git worktree and start an isolated line of work inside it.
     /// Agent-callable, one step (PRD #220).
     ///
-    /// Exit status: 0 means the daemon admitted the request, or gave no answer
-    /// this build can check (an older daemon, or none within 5 seconds). It
-    /// does not mean the worktree was created, that the unit started, or that
-    /// its task reached the agent: the daemon answers before it does any of
-    /// that work. Non-zero means the request did not get that far: no daemon
-    /// was reachable, the daemon refused it (the reason is printed), or the
-    /// command line itself was unusable.
+    /// Exit status when starting a unit: 0 means the daemon admitted the
+    /// request, or gave no answer this build can check (an older daemon, or
+    /// none within 5 seconds). It does not mean the worktree was created, that
+    /// the unit started, or that its task reached the agent: the daemon answers
+    /// before it does any of that work. Non-zero means the request did not get
+    /// that far: no daemon was reachable, the daemon refused it (the reason is
+    /// printed), or the command line itself was unusable.
     ///
-    /// What happened arrives afterwards, typed into this pane as a message
-    /// beginning `dispatch:`. One beginning `dispatch: spawned isolated` names
-    /// what was started and where; any other opening is a failure and says
-    /// why. A spawned unit has still not been confirmed to have received its
-    /// task. The report it sends when it finishes, beginning `dispatch: a unit
-    /// you dispatched has completed`, is the only thing delivered to this pane
-    /// that confirms it did.
+    /// What happened arrives afterwards, typed into this pane: first the
+    /// daemon's reply to the dispatch, beginning `dispatch:`. A reply beginning
+    /// `dispatch: spawned isolated` names what was started and where; a reply
+    /// with any other opening is a failure and says why. A spawned unit has
+    /// still not been confirmed to have received its task. The report it sends
+    /// later, when it finishes, beginning `dispatch: a unit you dispatched has
+    /// completed`, is the only thing delivered to this pane that confirms it
+    /// did.
+    ///
+    /// With --list-targets the exit status means something else: 0 means the
+    /// listing was printed, and non-zero means no listing could be trusted —
+    /// the daemon did not answer, or could not read this repo's config or this
+    /// pane's directory. The reason is printed.
     Dispatch {
         /// Short name for the dispatch unit (used for worktree naming).
         /// Omit it only with --list-targets.
@@ -3080,7 +3086,7 @@ mod tests {
         let completed_opening = "dispatch: a unit you dispatched has completed";
         for (quote, why) in [
             (
-                "Exit status: 0 means the daemon admitted the request",
+                "Exit status when starting a unit: 0 means the daemon admitted the request",
                 "what exit 0 asserts",
             ),
             (
