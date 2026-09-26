@@ -199,6 +199,22 @@ export function DeckShell({ runtime, workflowPlatformIssue, initialView = { kind
   const settings = useDesktopSettings(runtime);
   useZoom(runtime, settings);
   /**
+   * PRD #1195 — the settings as of the LATEST render, for a voice dispatch
+   * that writes them. `VoiceControlPanel` captures `dispatchVoice` when an
+   * utterance BEGINS and calls it when the answer lands, so a `settings` closed
+   * over by that callback is the document from before the round trip: a
+   * `switch_deck` judged against it accepts an address Settings has since
+   * changed, and writing from it undoes every edit made meanwhile. Read here
+   * instead, as `useZoom` reads its own copy.
+   *
+   * No separate wait on an in-flight save is needed: `useDesktopSettings.save`
+   * applies each document to its state at once and queues the disk writes in
+   * order, dropping a superseded response, so the latest render already holds
+   * the document the queue will end on, and a write from here queues behind it.
+   */
+  const latestSettings = useRef(settings);
+  latestSettings.current = settings;
+  /**
    * PRD #802 M7 — where the mounted deck publishes the context it can serve.
    *
    * A `useRef` and not state: nothing renders from it, and the only reader is
@@ -689,7 +705,7 @@ export function DeckShell({ runtime, workflowPlatformIssue, initialView = { kind
       /* Only while Settings is open, so `close` reads its presence (#1197). */
       ...(overlaysOpen.settings ? { closeSettings: () => setOverlay(screen, "settings", false) } : {}),
       /* The Deck selector's own write, which its menu calls too (PRD #1195). */
-      switchDeck: (selection, identity) => chooseDeckSelection(settings, selection, identity),
+      switchDeck: (selection, identity) => chooseDeckSelection(latestSettings.current, selection, identity),
       navigate: (next) => { moved = true; setView(next); },
       closeAgentView: () => { moved = true; closeAgent(); },
     };
@@ -702,7 +718,7 @@ export function DeckShell({ runtime, workflowPlatformIssue, initialView = { kind
     if (!dispatchVoiceAction(outcome.invoke, context, target)) return undefined;
     // voice-registry-exempt: the Undo beside a voice report, restoring exactly the view that dispatch replaced
     return moved ? { undo: () => setView(previous) } : {};
-  }, [agentView, base, closeAgent, features.showDeck, overlaysOpen.settings, paneAgent, railContext, screen, selectedDeckId, setOverlay, settings, view]);
+  }, [agentView, base, closeAgent, features.showDeck, overlaysOpen.settings, paneAgent, railContext, screen, selectedDeckId, setOverlay, view]);
   /** PRD #1223 — what the directory browser shows, read at declaration time. */
   const readDirectories = useCallback(() => newAgentVoice.current?.directories, []);
   /** PRD #1223 — what the New agent dialog shows besides its browser, while it is open. */

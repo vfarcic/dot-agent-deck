@@ -825,6 +825,14 @@ enum Unmet {
     /// [`SWITCH_DECK_ROW`]'s deck (see [`resolve_param`]). Never quoted back:
     /// the value is the model's, not the user's.
     NotSaid,
+    /// The transcript names more than one deck — "the build box, not the
+    /// staging box", "X or Y", or two decks whose names overlap — so which one
+    /// the user meant is not something the model's pick can settle
+    /// ([`switch_target`]). The labels of each, as the screen shows them.
+    NamedSeveral(Vec<String>),
+    /// The transcript names exactly one deck, by this label, and the model's
+    /// value resolves to a different one ([`switch_target`]).
+    NamedOther(String),
 }
 
 impl Unmet {
@@ -857,6 +865,32 @@ impl Unmet {
             },
             Unmet::LabelsWithheld => VoiceOutcome::labels_withheld(transcript, row),
             Unmet::NotSaid => unresolved(format!("I did not catch which {}", spec.kind.noun())),
+            // `ParamAmbiguous` rather than `ParamUnresolved`: it is the outcome
+            // that carries the candidates and renders them as a list to choose
+            // from, which is the question to put back. The sentence says the
+            // USER named them, and never quotes the model's value, which here
+            // is only one of them — `"staging box" matches more than one deck`
+            // would be false.
+            Unmet::NamedSeveral(matches) => VoiceOutcome::ParamAmbiguous {
+                sentence: heard(
+                    &transcript,
+                    &format!(
+                        "you named more than one {}: {}",
+                        spec.kind.noun(),
+                        listed(&matches)
+                    ),
+                ),
+                transcript,
+                action: row.id.clone(),
+                param: spec.name.clone(),
+                spoken: spoken.to_string(),
+                matches,
+            },
+            Unmet::NamedOther(label) => unresolved(format!(
+                "you named {}, but I resolved a different {}",
+                safe_message(&label),
+                spec.kind.noun()
+            )),
             Unmet::DeckUnavailable {
                 label,
                 local,
@@ -918,6 +952,19 @@ impl Unmet {
                 // Produced only when `said` failed, so the branch above has
                 // it; spelled out rather than left to a wildcard.
                 Unmet::NotSaid => (format!("I did not catch which {noun}"), None),
+                // Produced only for SWITCH_DECK_ROW's deck, which is required
+                // and so never dropped; spelled out for the same reason.
+                Unmet::NamedSeveral(matches) => (
+                    format!("You named more than one {noun}"),
+                    Some(listed(matches)),
+                ),
+                Unmet::NamedOther(label) => (
+                    format!(
+                        "You named {}, but I resolved a different {noun}",
+                        safe_message(label)
+                    ),
+                    None,
+                ),
             }
         };
         match (implied, detail) {
@@ -1000,6 +1047,82 @@ fn said(spoken: &str, transcript: &str) -> bool {
     !words.is_empty() && words.iter().all(|word| heard.word(word))
 }
 
+/// [`SWITCH_DECK_ROW`]'s deck, grounded from BOTH sides (PRD #1195): the key
+/// and label to dispatch, or why nothing switches.
+///
+/// # Why the model's value alone is not enough
+///
+/// [`said`] asks only whether each content word of the model's value occurs
+/// somewhere in the transcript — a bag of words. That lets through the two
+/// shapes the audit of `d57cf7d` named, both of which reach a machine the user
+/// did not ask for, at once and with no confirmation:
+///
+/// - **negation and alternatives**: "switch to the build box, not the staging
+///   box" answered with `deck="staging box"` — every word of it was said;
+/// - **overlapping names**: with `build.example.com` and
+///   `build-box.example.com` both configured, "switch deck to build box"
+///   answered with `deck="build"` resolves EXACTLY to the first, and an exact
+///   hit outranks the loose one the user meant.
+///
+/// # The rule
+///
+/// The transcript's own side is read first: the decks it NAMES are those one
+/// of whose [`deck_spoken_names`] — label, host, the host's first component,
+/// "local" and "this machine" — is [`Heard`] as a phrase in it, its words
+/// adjacent and in order (the matcher [`action_grounded`] uses). Then:
+///
+/// 1. **more than one deck named** → [`Unmet::NamedSeveral`], whatever the
+///    model picked. Negation, "X or Y" and "switch from X to Y" all land here,
+///    as does an overlap where the user's words match two decks' names.
+///    **Conservative by design**: "switch deck to build box" beside both
+///    `build` and `build-box` refuses and lists them rather than guessing that
+///    the longer name was meant — reading intent out of word order is exactly
+///    the judgement this check exists not to make.
+/// 2. **the model's value is not [`said`]** → [`Unmet::NotSaid`], as before.
+/// 3. **the model's value resolves to one deck** → dispatched only when the
+///    transcript named exactly that deck; [`Unmet::NamedOther`] when it named
+///    a different one; [`Unmet::NotSaid`] when it named none — so a partial
+///    name ("switch to the build" beside one `build-box`) that the loose
+///    resolver would reach no longer switches.
+/// 4. **it resolves to none or several** → the resolver's own
+///    [`Unmet::NoMatch`] / [`Unmet::Ambiguous`], which quote a value the user
+///    did say.
+///
+/// So a switch dispatches only when the transcript names exactly one deck AND
+/// it is the deck the model's value resolves to.
+fn switch_target(
+    spoken: &str,
+    transcript: &Transcript,
+    decks: &[VoiceDeck],
+) -> Result<(String, String), Unmet> {
+    let heard = Heard::new(transcript.text());
+    let named: Vec<&VoiceDeck> = decks
+        .iter()
+        .filter(|deck| {
+            deck_spoken_names(deck)
+                .iter()
+                .any(|name| heard.phrase(name))
+        })
+        .collect();
+    if named.len() > 1 {
+        return Err(Unmet::NamedSeveral(
+            named.iter().map(|deck| deck.label.clone()).collect(),
+        ));
+    }
+    if !said(spoken, transcript.text()) {
+        return Err(Unmet::NotSaid);
+    }
+    match resolve_deck_ref(spoken, decks) {
+        DeckRefMatch::One { id, label } => match named.first() {
+            Some(deck) if deck.id == id => Ok((id, label)),
+            Some(deck) => Err(Unmet::NamedOther(deck.label.clone())),
+            None => Err(Unmet::NotSaid),
+        },
+        DeckRefMatch::None => Err(Unmet::NoMatch),
+        DeckRefMatch::Ambiguous(labels) => Err(Unmet::Ambiguous(labels)),
+    }
+}
+
 /// `text` with its first character upper-cased, for a refusal's situation
 /// phrase reused as a sentence of its own.
 fn capitalised(text: &str) -> String {
@@ -1048,13 +1171,15 @@ fn capitalised(text: &str) -> String {
 /// (PRD #1195).** Switching to a remote deck opens an SSH connection to it, at
 /// once and with no confirmation, so "switch deck to local" answered with
 /// `deck="build box"` would reach a machine the user did not ask for. Its
-/// reference must be words the user [`said`] — the model's `spoken` value,
-/// checked word by word against the transcript before it is resolved through
-/// [`deck_spoken_names`] — or it is refused as [`Unmet::NotSaid`]. That is the
-/// check the model's own copy of the user's words passes whatever the
-/// transcriber did, not the word-for-word title match the 2026-09-24 removal
-/// was about: "the build box" reaches `deploy@build-box.example.com` and
-/// "this machine" the local deck exactly as before. `choose_deck` and
+/// reference is grounded from both sides ([`switch_target`]): the transcript
+/// must name exactly one deck by one of its [`deck_spoken_names`], and the
+/// model's value — itself words the user [`said`] — must resolve to that deck.
+/// Naming several (negation, "X or Y", overlapping names) is refused with the
+/// decks named; naming none is [`Unmet::NotSaid`]. That is a name the
+/// user says the way the screen shows it, not the word-for-word title match
+/// the 2026-09-24 removal was about: "the build box" reaches
+/// `deploy@build-box.example.com` and "this machine" the local deck exactly
+/// as before. `choose_deck` and
 /// `open_new_agent` stay ungrounded — they preselect in a dialog the user then
 /// confirms, which is the undo-by-one-utterance case above.
 ///
@@ -1119,8 +1244,8 @@ fn resolve_param(
         // (PRD #1195, [`SWITCH_DECK_ROW`]).
         // Checked before resolving, so a deck the model invented is never
         // quoted back as "no deck matches …" either.
-        ParamKind::DeckRef if !for_new_agent && !said(spoken, transcript.text()) => {
-            Err(Unmet::NotSaid)
+        ParamKind::DeckRef if !for_new_agent => {
+            switch_target(spoken, transcript, decks).map(|(id, label)| param(id, label))
         }
         ParamKind::DeckRef => match resolve_deck_ref(spoken, decks) {
             DeckRefMatch::One { id, label } => {
@@ -6967,6 +7092,165 @@ mod tests {
             unreachable!()
         };
         assert_eq!(params[0].deck_identity, None);
+    }
+
+    /// `switch_deck` answered with `deck = spoken` for `said`, over `decks`,
+    /// through the whole pipeline the shipped app calls.
+    async fn switched_over(decks: &[VoiceDeck], said: &str, spoken: &str) -> VoiceOutcome {
+        let resolver = StubResolver::new().answering(
+            said,
+            IntentAnswer::new("switch_deck").with_param("deck", spoken),
+        );
+        handle_utterance_with(
+            &resolver,
+            table(),
+            Screen::Overview,
+            &fleet(),
+            decks,
+            None,
+            None,
+            Transcript::new(said),
+            LabelSharing::Shared,
+            true,
+        )
+        .await
+        .outcome
+    }
+
+    /// Scenario: the switch target is grounded from the transcript's side too
+    /// (PRD #1195, audit of `d57cf7d`). "Switch to the build box, not the
+    /// staging box" answered with the staging box, "the build box or the
+    /// staging box", and — with both `build` and `build-box` configured —
+    /// "switch deck to build box" answered with `build` all name more than one
+    /// deck, so each is refused with the decks named and nothing switches.
+    /// Naming exactly one deck while the model picked another is refused too.
+    /// The positive controls — the build box, "local", "this machine" — still
+    /// switch.
+    #[tokio::test]
+    async fn voice_outcome_switch_deck_dispatches_only_the_one_deck_the_transcript_names() {
+        let staged = [
+            deck("deck-local", "Local deck", true),
+            deck("deck-build", "deploy@build-box.example.com:2222", false),
+            deck("deck-staging", "deploy@staging-box.example.com", false),
+        ];
+        let overlapping = [
+            deck("deck-local", "Local deck", true),
+            deck("deck-bare", "ops@build.example.com", false),
+            deck("deck-box", "ops@build-box.example.com", false),
+        ];
+        // Two hosts whose first components hold the same words in the other
+        // order: the model's words are all in the transcript, in the wrong
+        // order, and resolve exactly to the deck the user did NOT name.
+        let reordered = [
+            deck("deck-staging-box", "ops@staging-box.example.com", false),
+            deck("deck-box-staging", "ops@box-staging.example.com", false),
+        ];
+
+        let refused_as_several = |outcome: &VoiceOutcome, labels: &[&str]| {
+            let VoiceOutcome::ParamAmbiguous {
+                action,
+                param,
+                matches,
+                sentence,
+                ..
+            } = outcome
+            else {
+                panic!("expected a refusal naming the decks, got {outcome:?}");
+            };
+            assert_eq!(action, "switch_deck");
+            assert_eq!(param, "deck");
+            assert_eq!(matches, &labels.to_vec(), "{sentence}");
+            assert!(
+                sentence.contains("you named more than one deck"),
+                "{sentence}"
+            );
+        };
+
+        let negated = switched_over(
+            &staged,
+            "switch to the build box, not the staging box",
+            "staging box",
+        )
+        .await;
+        refused_as_several(
+            &negated,
+            &[
+                "deploy@build-box.example.com:2222",
+                "deploy@staging-box.example.com",
+            ],
+        );
+
+        let either = switched_over(
+            &staged,
+            "switch deck to the build box or the staging box",
+            "build box",
+        )
+        .await;
+        refused_as_several(
+            &either,
+            &[
+                "deploy@build-box.example.com:2222",
+                "deploy@staging-box.example.com",
+            ],
+        );
+
+        for spoken in ["build", "build box"] {
+            let overlap = switched_over(&overlapping, "switch deck to build box", spoken).await;
+            refused_as_several(
+                &overlap,
+                &["ops@build.example.com", "ops@build-box.example.com"],
+            );
+        }
+
+        let other =
+            switched_over(&reordered, "switch deck to the staging box", "box staging").await;
+        let VoiceOutcome::ParamUnresolved {
+            action, sentence, ..
+        } = &other
+        else {
+            panic!("the model's pick is not the deck the user named: {other:?}");
+        };
+        assert_eq!(action, "switch_deck");
+        assert!(
+            sentence.contains("you named ops@staging-box.example.com"),
+            "{sentence}"
+        );
+        assert!(!sentence.contains("box staging"), "{sentence}");
+
+        for (decks, said, spoken, expected) in [
+            (
+                &staged[..],
+                "switch deck to the build box",
+                "build box",
+                "deck-build",
+            ),
+            (&staged[..], "switch deck to local", "local", "deck-local"),
+            (
+                &staged[..],
+                "switch deck to this machine",
+                "this machine",
+                "deck-local",
+            ),
+            (
+                &overlapping[..],
+                "switch deck to local",
+                "local",
+                "deck-local",
+            ),
+            (
+                &reordered[..],
+                "switch deck to the staging box",
+                "staging box",
+                "deck-staging-box",
+            ),
+        ] {
+            let outcome = switched_over(decks, said, spoken).await;
+            assert!(
+                matches!(&outcome, VoiceOutcome::Dispatch { params, .. }
+                    if params[0].value == expected),
+                "{said}: {outcome:?}"
+            );
+        }
     }
 
     // -- the deck field and Discard (#1263, #1247) ---------------------------
