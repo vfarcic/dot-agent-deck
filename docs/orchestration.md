@@ -640,7 +640,7 @@ The role's `command` launches the agent through something the deck cannot see pa
 
 ### A delegated worker never came up
 
-A `clear = true` delegation terminates the worker before it has a replacement, so if the replacement never starts, the pane is left with no agent and the task has nowhere to go. When that happens the deck writes `⚠ delegated worker never came up (dot-agent-deck daemon report)` into your orchestrator's pane and stops: nothing was delivered, and no `work-done` can arrive for that delegation. The notice names the worker's pane; the daemon log names the role and carries the underlying error.
+A `clear = true` delegation terminates the worker before it has a replacement, so if the replacement never starts, the pane is left with no agent and the task has nowhere to go. When that happens the deck submits `⚠ delegated worker never came up (dot-agent-deck daemon report)` into your orchestrator's pane as a turn of its own and stops: nothing was delivered, and no `work-done` can arrive for that delegation. Because it is submitted rather than just written, an orchestrator running unattended receives it and can act on it — the report asks it to re-delegate, reassign the task, or notify you. The report names the worker's pane; the daemon log names the role and carries the underlying error.
 
 The usual cause is the role's `command` — a launcher that fails in that directory, a binary that is not on the daemon's `PATH`, or an agent that exits immediately on start. Jump into the worker's pane and look at its scrollback: whatever the replacement printed before it died is still there. Running the role's `command` by hand in the worker's directory reproduces most of these in one step.
 
