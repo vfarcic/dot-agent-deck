@@ -471,6 +471,14 @@ impl Evidence {
         let _ = writeln!(s, "## Build\n");
         if self.build.is_empty() {
             let _ = writeln!(s, "No build-phase record: the run stopped before it.\n");
+        } else if self.skip_build.is_some() {
+            let _ = writeln!(
+                s,
+                "`--skip-build`: no `cargo build` ran in this run. The build-time gate's `cargo \
+                 metadata` ran in a bubblewrap build namespace, and each `metadata namespace:` \
+                 line is a check its probe measured from inside, before Cargo started there. \
+                 `docs/develop/cross-version-harness.md` says what this does not cover.\n"
+            );
         } else {
             let _ = writeln!(
                 s,

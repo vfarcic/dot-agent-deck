@@ -152,7 +152,7 @@ struct Opts {
     /// `CARGO_TARGET_DIR` for branches whose build-time code is identical to
     /// their merge-base (the mainline trust domain), reused across them so the
     /// cargo cache survives. A branch built with `--allow-build-changes` builds
-    /// into `<this>-opted-in-<branch slug>` instead. Defaults to
+    /// into `<this>-opted-in-<branch slug>-<digest>` instead. Defaults to
     /// `<repo parent>/dot-agent-deck-xver-target`.
     #[arg(long)]
     target_dir: Option<PathBuf>,
@@ -215,7 +215,7 @@ struct Opts {
     /// Without it such a branch is refused before `cargo build` runs, naming
     /// the changed build-time files. With it, the branch's build scripts, proc
     /// macros and cargo configuration execute in the build namespace, into a
-    /// target dir of the branch's own (`<--target-dir>-opted-in-<slug>`), and
+    /// target dir of the branch's own (`<--target-dir>-opted-in-<slug>-<digest>`), and
     /// the binary they produce runs in the runtime namespace. Review those
     /// files first; the evidence file records that you opted in, which files
     /// changed and which target dir built the binary.
@@ -697,23 +697,45 @@ impl Domain {
         }
     }
 
-    fn dir(self, base: &Path, slug: &str) -> PathBuf {
+    /// The target dir this domain builds in. An opted-in one is named for the
+    /// repository and branch together: a readable slug of the branch, plus a
+    /// digest of both, since the slug alone collides (`feature/x` and
+    /// `feature-x`) and a branch of another `--repo` is another trust domain.
+    fn dir(self, base: &Path, repo: &str, branch: &str) -> PathBuf {
         match self {
             Domain::Mainline => base.to_path_buf(),
             Domain::OptedIn => {
                 let mut s = base.as_os_str().to_owned();
-                s.push(format!("-opted-in-{slug}"));
+                s.push(format!(
+                    "-opted-in-{}-{:016x}",
+                    branch_slug(branch),
+                    fnv1a64(format!("{repo}\0{branch}").as_bytes())
+                ));
                 PathBuf::from(s)
             }
         }
     }
 
-    fn label(self, branch: &str) -> String {
+    /// What the target dir's marker must say: the domain and the repository,
+    /// and for an opted-in dir the branch.
+    fn label(self, repo: &str, branch: &str) -> String {
         match self {
-            Domain::Mainline => "mainline".to_string(),
-            Domain::OptedIn => format!("opted-in {branch}"),
+            Domain::Mainline => format!("mainline {repo}"),
+            Domain::OptedIn => format!("opted-in {repo} {branch}"),
         }
     }
+}
+
+/// FNV-1a, 64-bit: a stable, dependency-free digest for naming directories.
+/// Not a security boundary — the marker, compared in full, is what refuses a
+/// directory that serves another domain.
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in bytes {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
 }
 
 /// Make `dir` ready to serve the domain `label`: adopt it when it is absent or
@@ -982,8 +1004,17 @@ fn new_binary(
     ev.preflight.push(gate);
 
     let domain = Domain::of(&changes);
-    let target = domain.dir(target_base, &branch_slug(&opts.branch));
-    prepare_domain_dir(&target, &domain.label(&opts.branch))?;
+    let mut target = domain.dir(target_base, &opts.repo, &opts.branch);
+    if opts.skip_build {
+        // Nothing is built, so no trust domain is prepared or marked: the
+        // binary is whatever an earlier build left. The domain's own dir when
+        // it holds one, else `--target-dir`, and the evidence says which.
+        if !target.join("debug").join("dot-agent-deck").exists() {
+            target = target_base.to_path_buf();
+        }
+    } else {
+        prepare_domain_dir(&target, &domain.label(&opts.repo, &opts.branch))?;
+    }
     let target = std::fs::canonicalize(&target)
         .map_err(|e| format!("canonicalize {}: {e}", target.display()))?;
     let domain_line = match domain {
@@ -999,6 +1030,22 @@ fn new_binary(
              other target dir is bound into this one",
             target.display()
         ),
+    };
+    let domain_line = if opts.skip_build {
+        format!(
+            "`--skip-build`: nothing was built, so no trust domain was prepared; the binary is \
+             taken from `{}` ({})",
+            target.display(),
+            match domain {
+                Domain::Mainline => "the mainline target dir",
+                Domain::OptedIn if target.as_path() == target_base => {
+                    "`--target-dir`, because this opted-in branch's own target dir holds no binary"
+                }
+                Domain::OptedIn => "this opted-in branch's own target dir",
+            }
+        )
+    } else {
+        domain_line
     };
     println!("xver: {domain_line}");
     ev.build.push(domain_line);
@@ -2436,17 +2483,46 @@ mod domain_tests {
         let changed = vec![("build.rs".to_string(), "a build script".to_string())];
         assert_eq!(Domain::of(&[]), Domain::Mainline);
         assert_eq!(Domain::of(&changed), Domain::OptedIn);
-        assert_eq!(Domain::Mainline.dir(base, "x"), base);
-        let own = Domain::OptedIn.dir(base, &branch_slug("renovate/lock-file"));
-        assert_eq!(
-            own,
-            PathBuf::from("/w/dot-agent-deck-xver-target-opted-in-renovate-lock-file")
+        let repo = "vfarcic/dot-agent-deck";
+        assert_eq!(Domain::Mainline.dir(base, repo, "x"), base);
+        let own = Domain::OptedIn.dir(base, repo, "renovate/lock-file");
+        assert!(
+            own.to_string_lossy()
+                .starts_with("/w/dot-agent-deck-xver-target-opted-in-renovate-lock-file-"),
+            "{own:?}"
         );
         assert!(
             !own.starts_with(base) && !base.starts_with(&own),
             "the two domains' dirs must not nest, or one build's bind would reach the other"
         );
-        assert_ne!(Domain::Mainline.label("b"), Domain::OptedIn.label("b"));
+        assert_ne!(
+            Domain::Mainline.label(repo, "b"),
+            Domain::OptedIn.label(repo, "b")
+        );
+    }
+
+    #[test]
+    fn branches_whose_slugs_collide_and_other_repositories_get_their_own_opted_in_dirs() {
+        let base = Path::new("/w/t");
+        let dirs = [
+            Domain::OptedIn.dir(base, "o/r", "feature/x"),
+            Domain::OptedIn.dir(base, "o/r", "feature-x"),
+            Domain::OptedIn.dir(base, "o/r", "feature/ä"),
+            Domain::OptedIn.dir(base, "o/r", "feature/ö"),
+            Domain::OptedIn.dir(base, "fork/r", "feature/x"),
+        ];
+        let unique: std::collections::BTreeSet<_> = dirs.iter().collect();
+        assert_eq!(unique.len(), dirs.len(), "{dirs:?}");
+        assert_eq!(
+            Domain::OptedIn.dir(base, "o/r", "feature/x"),
+            dirs[0],
+            "the same repository and branch keep their warm dir"
+        );
+        assert_ne!(
+            Domain::Mainline.label("o/r", "b"),
+            Domain::Mainline.label("fork/r", "b"),
+            "another repository's mainline is another domain"
+        );
     }
 
     #[test]

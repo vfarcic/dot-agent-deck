@@ -62,7 +62,8 @@
 //! operator supplies is read: from `/` with `--manifest-path` (Cargo reads
 //! configuration from its working directory's hierarchy, not the manifest's —
 //! measured on Cargo 1.98.1), with a Cargo home the harness owns and an
-//! environment of exactly `PATH` and `CARGO_HOME`.
+//! environment of `PATH`, that Cargo home, and git switched off from the
+//! operator's global and system configuration.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
@@ -486,10 +487,11 @@ fn probe_plan(
 
 /// The namespace the branch build runs in.
 ///
-/// The clone and the target dir must not nest: a read-write target dir inside
-/// the clone would make that part of the clone writable, and a clone inside
-/// the target dir would be bound read-only on top of a writable tree the build
-/// could reach anyway.
+/// The clone, the target dir and the fetch-phase Cargo home must not nest: a
+/// read-write target dir inside either of the others would make that part of
+/// it writable — the Cargo home's `registry` is bound read-only only at its
+/// remapped path — and either of them inside the target dir would be reachable
+/// read-write through the target dir's bind.
 pub fn build_plan(
     host: &Host,
     tc: &Toolchain,
@@ -498,13 +500,22 @@ pub fn build_plan(
     fetch_home: &Path,
     sockets: Vec<PathBuf>,
 ) -> Result<ProbePlan, String> {
-    if clone.starts_with(target) || target.starts_with(clone) {
-        return Err(format!(
-            "the target dir {} and the build clone {} overlap; the build namespace binds one \
-             read-only and the other read-write, so they must be disjoint",
-            target.display(),
-            clone.display()
-        ));
+    let paths = [
+        ("the build clone", clone),
+        ("the target dir", target),
+        ("the fetch-phase Cargo home", fetch_home),
+    ];
+    for (i, (a, pa)) in paths.iter().enumerate() {
+        for (b, pb) in &paths[i + 1..] {
+            if pa.starts_with(pb) || pb.starts_with(pa) {
+                return Err(format!(
+                    "{a} {} and {b} {} overlap; the build namespace binds the target dir \
+                     read-write and the other two read-only, so all three must be disjoint",
+                    pa.display(),
+                    pb.display()
+                ));
+            }
+        }
     }
     let mut shape = base_shape(host, tc, clone, Some(target));
     shape.ro.push(clone.to_path_buf());
@@ -924,7 +935,10 @@ pub fn probe(plan: &ProbePlan) -> ProbeReport {
         Err(e) => fail(&mut r, format!("cannot list /proc: {e}")),
     }
 
-    // What is writable.
+    // What is writable. A residual `rw` submount the read-only root did not
+    // remount is a FAILURE here, not the exposure note the runtime namespace
+    // records: it would let build code write a host filesystem outside the
+    // target dir. So is mountinfo that cannot be read, since then no one knows.
     match std::fs::read_to_string("/proc/self/mountinfo") {
         Ok(info) => {
             let own = |mp: &Path| {
@@ -934,43 +948,48 @@ pub fn probe(plan: &ProbePlan) -> ProbeReport {
                     || mp.starts_with("/dev")
             };
             let residual = isolation::residual_rw_mounts_where(&info, own);
-            r.notes.push(format!(
-                "writable inside: {}; the private tmpfs mounts {}{}",
-                if plan.shape.rw.is_empty() {
-                    "no host path".to_string()
-                } else {
+            if residual.is_empty() {
+                r.notes.push(format!(
+                    "writable inside: {}; the private tmpfs mounts {}; no residual `rw` submount",
+                    if plan.shape.rw.is_empty() {
+                        "no host path".to_string()
+                    } else {
+                        plan.shape
+                            .rw
+                            .iter()
+                            .map(|p| format!("`{}` (read-write bind)", p.display()))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    },
                     plan.shape
-                        .rw
+                        .home
                         .iter()
-                        .map(|p| format!("`{}` (read-write bind)", p.display()))
+                        .chain(plan.shape.tmpfs.iter().map(|(p, _)| p))
+                        .map(|p| format!("`{}`", p.display()))
                         .collect::<Vec<_>>()
                         .join(", ")
-                },
-                plan.shape
-                    .home
-                    .iter()
-                    .chain(plan.shape.tmpfs.iter().map(|(p, _)| p))
-                    .map(|p| format!("`{}`", p.display()))
-                    .collect::<Vec<_>>()
-                    .join(", "),
-                if residual.is_empty() {
-                    "; no residual `rw` submount".to_string()
-                } else {
+                ));
+            } else {
+                fail(
+                    &mut r,
                     format!(
-                        "; **exposure, not a failure**: residual `rw` submounts the read-only root \
-                         did not remount: {}",
+                        "residual `rw` submounts the read-only root did not remount, writable by \
+                         build code outside the target dir: {}",
                         residual
                             .iter()
                             .map(|m| format!("`{m}`"))
                             .collect::<Vec<_>>()
                             .join(", ")
-                    )
-                }
-            ));
+                    ),
+                );
+            }
         }
-        Err(e) => r.notes.push(format!(
-            "**residual `rw` submounts unknown**: /proc/self/mountinfo could not be read ({e})"
-        )),
+        Err(e) => fail(
+            &mut r,
+            format!(
+                "cannot read /proc/self/mountinfo, so residual `rw` submounts are unknown: {e}"
+            ),
+        ),
     }
     r
 }
@@ -1144,8 +1163,11 @@ pub fn survivors(ns: &str) -> Result<Vec<String>, String> {
 /// * `CARGO_HOME` is `fetch_home`, which must hold no `config*` or
 ///   `credentials*`: the harness writes none, so one there was put there by
 ///   something else.
-/// * The environment is exactly `PATH` and `CARGO_HOME`: no `CARGO_*`
-///   configuration variable, no `RUSTC*`, no proxy, no credential.
+/// * The environment is exactly `PATH`, `CARGO_HOME` (and `HOME` and
+///   `XDG_CONFIG_HOME` set to it), `GIT_CONFIG_GLOBAL=/dev/null` and
+///   `GIT_CONFIG_NOSYSTEM=1`: no `CARGO_*` configuration variable, no
+///   `RUSTC*`, no proxy, no credential, and none of the operator's git
+///   configuration for a git dependency.
 ///
 /// `cargo fetch` downloads and checksum-verifies crates against `Cargo.lock`
 /// and unpacks them; it runs no build script and no proc macro.
@@ -1160,7 +1182,14 @@ pub fn fetch(tc: &Toolchain, fetch_home: &Path, manifest: &Path) -> Result<Vec<S
             ));
         }
     }
-    for n in ["config", "config.toml", "credentials", "credentials.toml"] {
+    for n in [
+        "config",
+        "config.toml",
+        "credentials",
+        "credentials.toml",
+        ".gitconfig",
+        "git/config",
+    ] {
         let p = fetch_home.join(n);
         if std::fs::symlink_metadata(&p).is_ok() {
             return Err(format!(
@@ -1179,6 +1208,14 @@ pub fn fetch(tc: &Toolchain, fetch_home: &Path, manifest: &Path) -> Result<Vec<S
         .env_clear()
         .env("PATH", &path)
         .env("CARGO_HOME", fetch_home)
+        // Git configuration, for a git dependency: none of the operator's.
+        // `HOME` and `XDG_CONFIG_HOME` point at the harness's Cargo home (no
+        // `.gitconfig` or `git/config`, checked above), and git's own
+        // switches for the global and system files are set too.
+        .env("HOME", fetch_home)
+        .env("XDG_CONFIG_HOME", fetch_home)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
         .stdin(Stdio::null())
         .output()
         .map_err(|e| format!("cargo fetch: {e}"))?;
@@ -1191,10 +1228,11 @@ pub fn fetch(tc: &Toolchain, fetch_home: &Path, manifest: &Path) -> Result<Vec<S
     }
     Ok(vec![format!(
         "fetch phase: `cargo fetch --locked --manifest-path {}` on the host, from the working \
-         directory `/` (no `/.cargo/config*`), with an environment of exactly `PATH={path}` and \
-         `CARGO_HOME={}` (the harness's own Cargo home, holding no `config*` or `credentials*`), \
-         in {:.1}s. It downloads, checksum-verifies and unpacks crates and runs no build script \
-         or proc macro",
+         directory `/` (no `/.cargo/config*`), with an environment of exactly `PATH={path}`, \
+         `CARGO_HOME`, `HOME` and `XDG_CONFIG_HOME` all `{}` (the harness's own Cargo home, \
+         holding no `config*`, `credentials*`, `.gitconfig` or `git/config`), \
+         `GIT_CONFIG_GLOBAL=/dev/null` and `GIT_CONFIG_NOSYSTEM=1`, in {:.1}s. It downloads, \
+         checksum-verifies and unpacks crates and runs no build script or proc macro",
         manifest.display(),
         fetch_home.display(),
         started.elapsed().as_secs_f64()
@@ -1511,6 +1549,23 @@ mod tests {
             )
             .unwrap_err();
             assert!(e.contains("overlap"), "{e}");
+        }
+        for cache in [
+            "/home/op/code/xver-target",
+            "/home/op/code/xver-target/cargo",
+            "/home/op/code",
+            "/home/op/code/xver-src/.cache",
+        ] {
+            let e = build_plan(
+                &host(),
+                &tc(),
+                Path::new("/home/op/code/xver-src"),
+                Path::new("/home/op/code/xver-target"),
+                Path::new(cache),
+                vec![],
+            )
+            .unwrap_err();
+            assert!(e.contains("fetch-phase Cargo home"), "{cache}: {e}");
         }
     }
 
