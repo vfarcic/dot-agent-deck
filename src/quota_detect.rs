@@ -82,6 +82,22 @@ pub const MIN_QUOTA_CONFIRM_MS: u64 = 100;
 /// Largest accepted [`DOT_AGENT_DECK_QUOTA_CONFIRM_MS`] (one hour).
 pub const MAX_QUOTA_CONFIRM_MS: u64 = 60 * 60 * 1000;
 
+/// Largest PTY area, in cells, whose screen the quota detector will replay.
+///
+/// A replay builds a full `vt100` grid at the pane's geometry, and the PTY
+/// accepts up to `PTY_RESIZE_DIM_MAX` (4096) in each dimension — 16.8M cells
+/// for one probe. 512x512 is several times any real terminal (a 4K display at a
+/// small font is ~400x120), so detection simply does not run on a pane larger
+/// than this: a missed detection is the pre-#714 behaviour, an unbounded
+/// allocation on a same-uid socket's say-so is not.
+pub const MAX_QUOTA_REPLAY_CELLS: u32 = 512 * 512;
+
+/// Whether a screen of `rows`x`cols` is small enough to replay for a quota
+/// probe — see [`MAX_QUOTA_REPLAY_CELLS`].
+pub fn replay_fits(rows: u16, cols: u16) -> bool {
+    u32::from(rows) * u32::from(cols) <= MAX_QUOTA_REPLAY_CELLS
+}
+
 /// Which provider limit the pane reported.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -299,31 +315,64 @@ pub fn scrub_detail(text: &str) -> String {
 /// [`classify`] accepts contains one of these.
 pub const HINT_NEEDLES: &[&[u8]] = &[b"usage limit", b"current quota"];
 
+/// Substring finders for [`HINT_NEEDLES`], built once.
+static HINT_FINDERS: LazyLock<Vec<memchr::memmem::Finder<'static>>> = LazyLock::new(|| {
+    HINT_NEEDLES
+        .iter()
+        .map(|needle| memchr::memmem::Finder::new(*needle))
+        .collect()
+});
+
+/// Longest needle in [`HINT_NEEDLES`]; bounds the seam buffer.
+const MAX_NEEDLE_LEN: usize = {
+    let mut max = 0;
+    let mut i = 0;
+    while i < HINT_NEEDLES.len() {
+        if HINT_NEEDLES[i].len() > max {
+            max = HINT_NEEDLES[i].len();
+        }
+        i += 1;
+    }
+    max
+};
+
 /// Per-pane byte scanner for [`HINT_NEEDLES`], run on every PTY chunk.
 ///
-/// Keeps the last `longest needle - 1` bytes of the previous chunk so a needle
-/// split across two reads is still found; a needle can never be counted twice
-/// from the carry alone, because the carry is one byte shorter than it.
+/// The chunk itself is scanned in place, with no copy. A needle split across
+/// two reads is found at the seam: for each needle, the last `len - 1` bytes of
+/// the previous chunk are joined to the first `len - 1` bytes of this one in a
+/// small stack buffer. A match there necessarily includes a byte of each side,
+/// so a needle wholly inside the previous chunk — already reported — is never
+/// counted again.
 #[derive(Debug, Clone, Default)]
 pub struct HintScanner {
     carry: Vec<u8>,
 }
 
 impl HintScanner {
-    fn carry_len() -> usize {
-        HINT_NEEDLES.iter().map(|n| n.len()).max().unwrap_or(1) - 1
-    }
-
     /// Scan one chunk; `true` when a needle ends inside it.
     pub fn scan(&mut self, chunk: &[u8]) -> bool {
-        let carry_len = Self::carry_len();
-        let mut window = std::mem::take(&mut self.carry);
-        window.extend_from_slice(chunk);
-        let hit = HINT_NEEDLES
-            .iter()
-            .any(|needle| window.windows(needle.len()).any(|w| w == *needle));
-        let keep = window.len().min(carry_len);
-        self.carry = window[window.len() - keep..].to_vec();
+        let mut hit = HINT_FINDERS.iter().any(|f| f.find(chunk).is_some());
+        if !hit && !self.carry.is_empty() {
+            let mut seam = [0u8; 2 * (MAX_NEEDLE_LEN - 1)];
+            hit = HINT_FINDERS.iter().any(|finder| {
+                let k = finder.needle().len() - 1;
+                let tail = &self.carry[self.carry.len().saturating_sub(k)..];
+                let head = &chunk[..chunk.len().min(k)];
+                seam[..tail.len()].copy_from_slice(tail);
+                seam[tail.len()..tail.len() + head.len()].copy_from_slice(head);
+                finder.find(&seam[..tail.len() + head.len()]).is_some()
+            });
+        }
+        let keep = MAX_NEEDLE_LEN - 1;
+        if chunk.len() >= keep {
+            self.carry.clear();
+            self.carry.extend_from_slice(&chunk[chunk.len() - keep..]);
+        } else {
+            self.carry.extend_from_slice(chunk);
+            let excess = self.carry.len().saturating_sub(keep);
+            self.carry.drain(..excess);
+        }
         hit
     }
 }
@@ -445,6 +494,10 @@ pub struct QuotaDetector {
     last_probe_at: Option<Instant>,
     candidate_at: Option<Instant>,
     confirmed: bool,
+    /// Bumped by every confirmation and every work event, so a confirmation is
+    /// identified by the value current when it latched — see
+    /// [`Self::confirmed_epoch`].
+    epoch: u64,
 }
 
 impl QuotaDetector {
@@ -475,11 +528,22 @@ impl QuotaDetector {
         self.last_work_event_at = Some(now);
         self.candidate_at = None;
         self.confirmed = false;
+        self.epoch = self.epoch.wrapping_add(1);
     }
 
     /// Whether a confirmed block is currently latched.
     pub fn is_confirmed(&self) -> bool {
         self.confirmed
+    }
+
+    /// The identity of the latched confirmation, `None` when none is latched.
+    ///
+    /// A publisher captures it with the `Confirmed` outcome and compares it
+    /// again at the moment it applies the block: any work event since — which
+    /// lifts the latch and bumps the epoch, even if a later probe re-confirms —
+    /// makes the two differ, so a stale confirmation is never applied.
+    pub fn confirmed_epoch(&self) -> Option<u64> {
+        self.confirmed.then_some(self.epoch)
     }
 
     /// Whether a hint newer than the last work event is waiting to be probed
@@ -537,6 +601,7 @@ impl QuotaDetector {
             Some(candidate) if now.saturating_duration_since(candidate) >= self.timings.confirm => {
                 self.candidate_at = None;
                 self.confirmed = true;
+                self.epoch = self.epoch.wrapping_add(1);
                 ProbeOutcome::Confirmed(kind)
             }
             Some(_) => ProbeOutcome::Pending,
@@ -896,5 +961,67 @@ mod tests {
             QuotaTimings::from_confirm_ms_value(None),
             QuotaTimings::default()
         );
+    }
+
+    /// Issue #714 (review S1): the scanner finds a needle inside a chunk, and
+    /// across a seam at every split point, and never re-reports a needle that
+    /// lay wholly inside the previous chunk — which would re-arm a hint that a
+    /// work event had already staled.
+    #[test]
+    fn hint_scanner_finds_seams_without_re_reporting_the_carry() {
+        for needle in HINT_NEEDLES {
+            let mut s = HintScanner::default();
+            let mut chunk = b"xx ".to_vec();
+            chunk.extend_from_slice(needle);
+            assert!(s.scan(&chunk), "{needle:?} inside one chunk");
+            assert!(!s.scan(b"."), "{needle:?} counted again from the carry");
+            assert!(!s.scan(b""), "an empty chunk reports nothing");
+            for split in 1..needle.len() {
+                let mut s = HintScanner::default();
+                let mut first = b"some output ".to_vec();
+                first.extend_from_slice(&needle[..split]);
+                assert!(!s.scan(&first));
+                assert!(s.scan(&needle[split..]), "{needle:?} split at {split}");
+                assert!(!s.scan(b"\r\n"));
+            }
+            // Split across three chunks, the middle one shorter than the carry.
+            let mut s = HintScanner::default();
+            assert!(!s.scan(&needle[..2]));
+            assert!(!s.scan(&needle[2..4]));
+            assert!(s.scan(&needle[4..]));
+        }
+        let mut s = HintScanner::default();
+        assert!(!s.scan(&vec![b'a'; 64 * 1024]));
+        assert!(s.carry.len() < MAX_NEEDLE_LEN);
+    }
+
+    /// Issue #714 (audit A1): a work event bumps the confirmation epoch, so a
+    /// confirmation captured before it never matches the detector again — even
+    /// after a later probe re-confirms.
+    #[test]
+    fn confirmed_epoch_changes_with_every_work_event() {
+        let timings = QuotaTimings::default();
+        let mut d = QuotaDetector::new(timings);
+        let t0 = Instant::now();
+        assert_eq!(d.confirmed_epoch(), None);
+        d.note_hint(t0);
+        assert_eq!(
+            d.record_probe(t0, Some(BlockedKind::UsageLimit)),
+            ProbeOutcome::Candidate
+        );
+        let t1 = t0 + timings.confirm;
+        assert!(matches!(
+            d.record_probe(t1, Some(BlockedKind::UsageLimit)),
+            ProbeOutcome::Confirmed(_)
+        ));
+        let first = d.confirmed_epoch().expect("latched");
+        d.note_work_event(t1 + Duration::from_millis(1));
+        assert_eq!(d.confirmed_epoch(), None);
+        let t2 = t1 + Duration::from_secs(1);
+        d.note_hint(t2);
+        d.record_probe(t2, Some(BlockedKind::UsageLimit));
+        d.record_probe(t2 + timings.confirm, Some(BlockedKind::UsageLimit));
+        let second = d.confirmed_epoch().expect("re-latched");
+        assert_ne!(first, second, "a stale confirmation matched a fresh one");
     }
 }

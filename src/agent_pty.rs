@@ -1565,11 +1565,24 @@ struct AgentBusState {
     /// the reader thread no second lock, and it is per AGENT, so a respawn in
     /// the same pane starts from a clean detector with its fresh bus.
     quota: crate::quota_detect::QuotaDetector,
-    /// Issue #714: the screen rows a resize's ring clear would otherwise have
-    /// erased while a quota hint was pending — see
-    /// [`AgentBus::clear_scrollback_after_resize`]. Empty whenever no hint is
-    /// pending.
-    quota_prelude: Vec<String>,
+    /// Issue #714: the ring a resize would otherwise have discarded while a
+    /// quota hint was pending, with the geometry it was written at — see
+    /// [`AgentBus::clear_scrollback_after_resize`]. `None` whenever no hint is
+    /// pending, and whenever the pane has written anything since that resize.
+    quota_prelude: Option<QuotaPrelude>,
+    /// Issue #714: the geometry `scrollback` is written at, once a resize has
+    /// set it. `None` until the first resize, when the spawn geometry the
+    /// registry holds still applies. Kept beside the ring so a probe reads the
+    /// bytes and their geometry under one lock.
+    ring_geometry: Option<(u16, u16)>,
+}
+
+/// Issue #714: the pre-resize ring kept for the quota detector — see
+/// [`AgentBus::clear_scrollback_after_resize`].
+struct QuotaPrelude {
+    bytes: VecDeque<u8>,
+    rows: u16,
+    cols: u16,
 }
 
 /// Issue #714: the quota detector's timings, read from
@@ -1598,7 +1611,8 @@ impl AgentBus {
                 scrollback: VecDeque::new(),
                 quota_hint: crate::quota_detect::HintScanner::default(),
                 quota: crate::quota_detect::QuotaDetector::new(timings),
-                quota_prelude: Vec::new(),
+                quota_prelude: None,
+                ring_geometry: None,
             }),
         }
     }
@@ -1610,6 +1624,13 @@ impl AgentBus {
     fn push(&self, data: Vec<u8>) {
         let arc = Arc::new(data);
         let mut state = self.state.lock().unwrap();
+        // Issue #714: any output after a resize may clear or overwrite what the
+        // pre-resize screen showed (`ESC[2J`, cursor addressing), and the
+        // retained rows cannot be replayed together with it at a different
+        // geometry — so the prelude stops being evidence of the CURRENT screen
+        // the moment the pane writes anything. A miss is the pre-#714
+        // behaviour; a quota sentence that is no longer on screen is not.
+        state.quota_prelude = None;
         for &b in arc.iter() {
             state.scrollback.push_back(b);
         }
@@ -1667,34 +1688,33 @@ impl AgentBus {
     /// no torn read.
     ///
     /// Issue #714: `old_rows`/`old_cols` are the geometry the ring was written
-    /// at. The ring is the quota detector's only view of the screen, and a
-    /// program that does not redraw on `SIGWINCH` (a plain `cat`, a stand-in, a
-    /// line-mode CLI) leaves the terminal showing exactly what it showed before
-    /// — which the clear would erase from the daemon's view alone. So when a
-    /// quota hint is pending, the trailing rows the ring rendered to at the OLD
-    /// geometry are kept as a prelude the next probe reads above the new ring,
-    /// as a terminal keeps its content across a resize. The replay runs only in
-    /// that case, which is rare, and is bounded by the ring cap.
-    fn clear_scrollback_after_resize(&self, old_rows: u16, old_cols: u16) {
+    /// at, `rows`/`cols` the one it is written at from now on. The ring is the
+    /// quota detector's only view of the screen, and a program that does not
+    /// redraw on `SIGWINCH` (a plain `cat`, a stand-in, a line-mode CLI) leaves
+    /// the terminal showing exactly what it showed before — which the clear
+    /// would erase from the daemon's view alone. So when a quota hint is
+    /// pending, the ring is MOVED (not copied, not replayed — O(1) under the
+    /// lock) into a prelude with its geometry, and the next probe replays that
+    /// instead, outside every lock. The prelude is only ever evidence while the
+    /// pane has written nothing since: [`Self::push`] drops it, so it and a
+    /// non-empty ring never coexist. A resize with an empty ring (no output
+    /// since the previous resize) keeps the prelude it already has, which is
+    /// what the screen still shows.
+    fn clear_scrollback_after_resize(&self, old_rows: u16, old_cols: u16, rows: u16, cols: u16) {
         let mut state = self.state.lock().unwrap();
-        if state.quota.hint_pending() {
-            let bytes: Vec<u8> = state.scrollback.iter().copied().collect();
-            let mut rows = std::mem::take(&mut state.quota_prelude);
-            rows.extend(crate::pane_screen_text::visible_tail_lines(
-                &bytes,
-                old_rows,
-                old_cols,
-                crate::quota_detect::QUOTA_TAIL_ROWS,
-            ));
-            let keep = rows
-                .len()
-                .saturating_sub(crate::quota_detect::QUOTA_TAIL_ROWS);
-            rows.drain(..keep);
-            state.quota_prelude = rows;
-        } else {
-            state.quota_prelude.clear();
+        state.ring_geometry = Some((rows, cols));
+        if !state.quota.hint_pending() {
+            state.quota_prelude = None;
+            state.scrollback.clear();
+        } else if !state.scrollback.is_empty() {
+            let bytes = std::mem::take(&mut state.scrollback);
+            state.quota_prelude =
+                crate::quota_detect::replay_fits(old_rows, old_cols).then_some(QuotaPrelude {
+                    bytes,
+                    rows: old_rows,
+                    cols: old_cols,
+                });
         }
-        state.scrollback.clear();
     }
 
     /// Current number of live broadcast subscribers. Lets diagnostics and
@@ -1711,35 +1731,62 @@ impl AgentBus {
     pub fn quota_note_work_event(&self, now: Instant) {
         let mut state = self.state.lock().unwrap();
         state.quota.note_work_event(now);
-        state.quota_prelude.clear();
+        state.quota_prelude = None;
     }
 
     /// Issue #714: when the quota detector wants the screen probed at `now`,
-    /// what to replay — the scrollback, plus any rows a resize carried over
-    /// ([`Self::clear_scrollback_after_resize`]) — taken under the same lock as
-    /// the decision, so the bytes are the ones the decision was made about.
-    /// `None` otherwise, which is every tick for a pane with no pending hint.
-    pub fn quota_probe_snapshot(&self, now: Instant) -> Option<QuotaProbeScreen> {
+    /// what to replay — the retained pre-resize ring
+    /// ([`Self::clear_scrollback_after_resize`]) if there is one, else the ring
+    /// — with the geometry those bytes were written at, taken under the same
+    /// lock as the decision so the bytes are the ones the decision was made
+    /// about. `spawn_rows`/`spawn_cols` is the registry's geometry, which the
+    /// ring is written at until the first resize records its own.
+    ///
+    /// `None` when no probe is due, which is every tick for a pane with no
+    /// pending hint, and for a screen larger than
+    /// [`crate::quota_detect::MAX_QUOTA_REPLAY_CELLS`] — checked BEFORE the
+    /// bytes are copied, so an oversized pane costs nothing.
+    pub fn quota_probe_snapshot(
+        &self,
+        now: Instant,
+        spawn_rows: u16,
+        spawn_cols: u16,
+    ) -> Option<QuotaProbeScreen> {
         let state = self.state.lock().unwrap();
-        state.quota.should_probe(now).then(|| QuotaProbeScreen {
-            prelude: state.quota_prelude.clone(),
-            bytes: state.scrollback.iter().copied().collect(),
+        if !state.quota.should_probe(now) {
+            return None;
+        }
+        let (bytes, rows, cols) = match &state.quota_prelude {
+            Some(prelude) => (&prelude.bytes, prelude.rows, prelude.cols),
+            None => {
+                let (rows, cols) = state.ring_geometry.unwrap_or((spawn_rows, spawn_cols));
+                (&state.scrollback, rows, cols)
+            }
+        };
+        crate::quota_detect::replay_fits(rows, cols).then(|| QuotaProbeScreen {
+            bytes: bytes.iter().copied().collect(),
+            rows,
+            cols,
         })
     }
 
     /// Issue #714: hand the result of a screen probe taken at `now` back to the
-    /// detector. See [`crate::quota_detect::QuotaDetector::record_probe`].
+    /// detector. See [`crate::quota_detect::QuotaDetector::record_probe`]. The
+    /// second value is the latched confirmation's epoch
+    /// ([`crate::quota_detect::QuotaDetector::confirmed_epoch`]), read under the
+    /// same lock as the outcome, which a publisher must present again to
+    /// [`AgentPtyRegistry::quota_confirmation_current`].
     pub fn quota_record_probe(
         &self,
         now: Instant,
         found: Option<crate::quota_detect::BlockedKind>,
-    ) -> crate::quota_detect::ProbeOutcome {
+    ) -> (crate::quota_detect::ProbeOutcome, Option<u64>) {
         let mut state = self.state.lock().unwrap();
         let outcome = state.quota.record_probe(now, found);
         if !state.quota.hint_pending() {
-            state.quota_prelude.clear();
+            state.quota_prelude = None;
         }
-        outcome
+        (outcome, state.quota.confirmed_epoch())
     }
 
     /// Issue #714: whether a confirmed quota block is currently latched.
@@ -4276,25 +4323,28 @@ pub struct PaneOrchestration {
 /// [`AgentBus::quota_probe_snapshot`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QuotaProbeScreen {
-    /// Screen rows carried across a resize that cleared the ring while a hint
-    /// was pending, oldest first; they sit ABOVE whatever `bytes` renders to.
-    pub prelude: Vec<String>,
-    /// The scrollback ring, written at the PTY's current geometry.
+    /// The bytes to replay: the retained pre-resize ring, or the ring.
     pub bytes: Vec<u8>,
+    /// The geometry `bytes` was written at.
+    pub rows: u16,
+    pub cols: u16,
 }
 
 impl QuotaProbeScreen {
-    /// The screen's trailing non-blank rows, oldest first: the carried-over
-    /// prelude, then the ring rendered at `rows`x`cols`.
-    pub fn tail_rows(&self, rows: u16, cols: u16) -> Vec<String> {
-        let mut out = self.prelude.clone();
-        out.extend(crate::pane_screen_text::visible_tail_lines(
+    /// The screen's trailing non-blank rows, oldest first. Paid by the caller,
+    /// outside every registry and bus lock; a geometry over
+    /// [`crate::quota_detect::MAX_QUOTA_REPLAY_CELLS`] renders nothing rather
+    /// than building the grid.
+    pub fn tail_rows(&self) -> Vec<String> {
+        if !crate::quota_detect::replay_fits(self.rows, self.cols) {
+            return Vec::new();
+        }
+        crate::pane_screen_text::visible_tail_lines(
             &self.bytes,
-            rows,
-            cols,
+            self.rows,
+            self.cols,
             crate::quota_detect::QUOTA_TAIL_ROWS,
-        ));
-        out
+        )
     }
 }
 
@@ -4305,11 +4355,8 @@ pub struct QuotaProbe {
     pub agent_id: String,
     pub pane_id: String,
     pub agent_type: AgentType,
-    /// What to replay.
+    /// What to replay, and at which geometry.
     pub screen: QuotaProbeScreen,
-    /// The PTY's current geometry, which the ring was written at.
-    pub rows: u16,
-    pub cols: u16,
 }
 
 /// Issue #714: what [`AgentPtyRegistry::claim_worker_blocked_notice`] hands back
@@ -9351,7 +9398,9 @@ impl AgentPtyRegistry {
         // fresh subscriber covers a single dimension epoch. See the long note
         // in `resize` for the residual best-effort gap and why it is
         // acceptable.
-        agent.bus.clear_scrollback_after_resize(old_rows, old_cols);
+        agent
+            .bus
+            .clear_scrollback_after_resize(old_rows, old_cols, rows, cols);
         // PRD #882: tell every participating viewer what the size is now. The
         // requester learns the same number from its own response, so this is
         // for the OTHER viewers — the ones whose parser would otherwise stay at
@@ -9463,47 +9512,89 @@ impl AgentPtyRegistry {
     /// a type the classifier has patterns for are asked at all — every other
     /// pane's hint could never match, so it is never replayed.
     ///
+    /// The registry lock is held only to list the candidate buses; each bus's
+    /// snapshot (up to the 1 MiB ring) is copied under that bus's lock alone,
+    /// so a probe never stalls spawn, resize or input on every other pane.
+    ///
     /// The type is the registry's OBSERVED type, which starts as the spawn-time
     /// identity and is upgraded by the pane's own hook events.
     pub fn quota_probe_candidates(&self, now: Instant) -> Vec<QuotaProbe> {
-        let inner = self.inner.lock().unwrap();
-        inner
-            .agents
-            .iter()
-            .filter(|(_, agent)| !agent.exited.load(Ordering::SeqCst))
-            .filter_map(|(id, agent)| {
-                let pane_id = agent.pane_id_env.clone()?;
-                let agent_type = agent.agent_type.clone()?;
-                if !crate::quota_detect::has_patterns(&agent_type) {
-                    return None;
-                }
-                let screen = agent.bus.quota_probe_snapshot(now)?;
+        let buses: Vec<_> = {
+            let inner = self.inner.lock().unwrap();
+            inner
+                .agents
+                .iter()
+                .filter(|(_, agent)| !agent.exited.load(Ordering::SeqCst))
+                .filter_map(|(id, agent)| {
+                    let pane_id = agent.pane_id_env.clone()?;
+                    let agent_type = agent.agent_type.clone()?;
+                    crate::quota_detect::has_patterns(&agent_type).then(|| {
+                        (
+                            id.clone(),
+                            pane_id,
+                            agent_type,
+                            Arc::clone(&agent.bus),
+                            agent.pty_rows,
+                            agent.pty_cols,
+                        )
+                    })
+                })
+                .collect()
+        };
+        buses
+            .into_iter()
+            .filter_map(|(agent_id, pane_id, agent_type, bus, rows, cols)| {
+                let screen = bus.quota_probe_snapshot(now, rows, cols)?;
                 Some(QuotaProbe {
-                    agent_id: id.clone(),
+                    agent_id,
                     pane_id,
                     agent_type,
                     screen,
-                    rows: agent.pty_rows,
-                    cols: agent.pty_cols,
                 })
             })
             .collect()
     }
 
-    /// Issue #714: hand a probe's result back to `agent_id`'s detector. `None`
-    /// when the agent has left the registry since the probe was taken.
+    /// Issue #714: hand a probe's result back to `agent_id`'s detector, with the
+    /// latched confirmation's epoch (see [`AgentBus::quota_record_probe`]).
+    /// `None` when the agent has left the registry since the probe was taken.
     pub fn quota_record_probe(
         &self,
         agent_id: &str,
         now: Instant,
         found: Option<crate::quota_detect::BlockedKind>,
-    ) -> Option<crate::quota_detect::ProbeOutcome> {
+    ) -> Option<(crate::quota_detect::ProbeOutcome, Option<u64>)> {
         let inner = self.inner.lock().unwrap();
         let agent = inner.agents.get(agent_id)?;
         if agent.exited.load(Ordering::SeqCst) {
             return None;
         }
         Some(agent.bus.quota_record_probe(now, found))
+    }
+
+    /// Issue #714: whether `agent_id` is still the live owner of `pane_id` AND
+    /// its quota detector still holds the confirmation `epoch` — i.e. no work
+    /// event has lifted the latch since the probe confirmed.
+    ///
+    /// Race-free only under the daemon's `AppState` WRITE lock, held by the
+    /// caller from this check through applying the block: the hook loop lifts
+    /// the latch ([`Self::quota_note_work_event`]) under that same lock, so a
+    /// work event is either seen here (and nothing is applied) or lands after
+    /// the block and clears it. Takes the registry lock and then the bus lock,
+    /// the order every other path takes them in.
+    pub fn quota_confirmation_current(&self, pane_id: &str, agent_id: &str, epoch: u64) -> bool {
+        let inner = self.inner.lock().unwrap();
+        let owner = inner
+            .agents
+            .iter()
+            .find(|(_, a)| {
+                a.pane_id_env.as_deref() == Some(pane_id) && !a.exited.load(Ordering::SeqCst)
+            })
+            .map(|(id, a)| (id.as_str(), a));
+        let Some((id, agent)) = owner else {
+            return false;
+        };
+        id == agent_id && agent.bus.state.lock().unwrap().quota.confirmed_epoch() == Some(epoch)
     }
 
     /// Issue #714: claim the one blocked-worker notice owed for the
@@ -11085,14 +11176,14 @@ mod tests {
             bus.push(line.as_bytes()[split..].to_vec());
             let pushed = Instant::now();
             assert!(
-                bus.quota_probe_snapshot(pushed).is_none(),
+                bus.quota_probe_snapshot(pushed, 24, 80).is_none(),
                 "split {split}: probed before the pane went quiet"
             );
             let later = pushed + timings.quiet + Duration::from_millis(1);
-            let snapshot = bus.quota_probe_snapshot(later).unwrap_or_else(|| {
+            let snapshot = bus.quota_probe_snapshot(later, 24, 80).unwrap_or_else(|| {
                 panic!("split {split}: the hint was lost across the chunk seam")
             });
-            assert!(snapshot.prelude.is_empty());
+            assert_eq!((snapshot.rows, snapshot.cols), (24, 80));
             assert_eq!(
                 snapshot.bytes,
                 line.as_bytes(),
@@ -11101,7 +11192,7 @@ mod tests {
             // A hint, even a matching probe, is only a candidate — never a report.
             assert_eq!(
                 bus.quota_record_probe(later, Some(BlockedKind::UsageLimit)),
-                ProbeOutcome::Candidate
+                (ProbeOutcome::Candidate, None)
             );
             assert!(
                 !bus.quota_confirmed(),
@@ -11115,29 +11206,35 @@ mod tests {
         bus.push(b"sting of the current quo".to_vec());
         bus.push(b"rum\r\n".to_vec());
         let later = Instant::now() + timings.quiet * 2;
-        assert!(bus.quota_probe_snapshot(later).is_none());
+        assert!(bus.quota_probe_snapshot(later, 24, 80).is_none());
 
         // The second needle (OpenAI `insufficient_quota`) is a hint too.
         let bus = AgentBus::with_quota_timings(timings);
         bus.push(b"Error: You exceeded your current q".to_vec());
         bus.push(b"uota\r\n".to_vec());
         assert!(
-            bus.quota_probe_snapshot(Instant::now() + timings.quiet * 2)
+            bus.quota_probe_snapshot(Instant::now() + timings.quiet * 2, 24, 80)
                 .is_some()
         );
 
-        // A resize clears the ring, but with a hint pending the rows it showed
-        // are carried above the new ring — a stand-in that never redraws keeps
-        // its quota line on screen, as a real terminal would.
+        // A resize clears the ring, but with a hint pending and nothing written
+        // since, the pre-resize ring is replayed at the geometry it was written
+        // at — a stand-in that never redraws keeps its quota line on screen, as
+        // a real terminal would.
         let bus = AgentBus::with_quota_timings(timings);
         bus.push(line.as_bytes().to_vec());
-        bus.clear_scrollback_after_resize(24, 80);
-        bus.push(b"later output\r\n".to_vec());
+        bus.clear_scrollback_after_resize(24, 80, 30, 100);
+        bus.clear_scrollback_after_resize(30, 100, 40, 120);
         let screen = bus
-            .quota_probe_snapshot(Instant::now() + timings.quiet * 2)
+            .quota_probe_snapshot(Instant::now() + timings.quiet * 2, 24, 80)
             .expect("the hint survives the resize");
-        assert_eq!(screen.bytes, b"later output\r\n");
-        let rows = screen.tail_rows(30, 100);
+        assert_eq!(screen.bytes, line.as_bytes());
+        assert_eq!(
+            (screen.rows, screen.cols),
+            (24, 80),
+            "replayed at the geometry the bytes were written at, across both resizes"
+        );
+        let rows = screen.tail_rows();
         assert_eq!(
             crate::quota_detect::classify(&AgentType::Codex, &rows).map(|m| m.kind),
             Some(BlockedKind::UsageLimit),
@@ -11146,17 +11243,154 @@ mod tests {
         // Without a pending hint the resize keeps nothing.
         let bus = AgentBus::with_quota_timings(timings);
         bus.push(b"plain output\r\n".to_vec());
-        bus.clear_scrollback_after_resize(24, 80);
-        assert!(bus.state.lock().unwrap().quota_prelude.is_empty());
+        bus.clear_scrollback_after_resize(24, 80, 30, 100);
+        assert!(bus.state.lock().unwrap().quota_prelude.is_none());
 
         // Work evidence after the hint stales it.
         let bus = AgentBus::with_quota_timings(timings);
         bus.push(line.as_bytes().to_vec());
         bus.quota_note_work_event(Instant::now() + Duration::from_millis(1));
         assert!(
-            bus.quota_probe_snapshot(Instant::now() + timings.quiet * 2)
+            bus.quota_probe_snapshot(Instant::now() + timings.quiet * 2, 24, 80)
                 .is_none()
         );
+    }
+
+    /// Issue #714 (audit A2): the rows a resize retained must never outlive a
+    /// redraw. Print a Codex quota line, resize, then clear the screen and draw
+    /// one ordinary row; after the quiet window, with no work event, every
+    /// probe must read the redrawn screen, and nothing may confirm a block.
+    #[test]
+    fn quota_prelude_is_discarded_by_output_after_resize() {
+        use crate::quota_detect::{ProbeOutcome, QuotaTimings};
+        let timings = QuotaTimings::default();
+        let line =
+            "\u{1b}[31m\u{25a0} You\u{2019}ve hit your usage limit. Try again at 3:00 PM.\r\n";
+        for redraw in [
+            &b"\x1b[2J\x1b[Hordinary row\r\n"[..],
+            // A cursor overwrite with no clear at all.
+            &b"\x1b[H\x1b[Kordinary row"[..],
+            // Even a lone byte: it could be the start of either.
+            &b"\x1b"[..],
+        ] {
+            let bus = AgentBus::with_quota_timings(timings);
+            bus.push(line.as_bytes().to_vec());
+            bus.clear_scrollback_after_resize(24, 80, 30, 100);
+            bus.push(redraw.to_vec());
+            let mut t = Instant::now() + timings.quiet * 2;
+            for _ in 0..3 {
+                let Some(screen) = bus.quota_probe_snapshot(t, 24, 80) else {
+                    break;
+                };
+                assert_eq!(
+                    screen.bytes, redraw,
+                    "only the post-resize ring is replayed"
+                );
+                assert_eq!((screen.rows, screen.cols), (30, 100));
+                let found = crate::quota_detect::classify(&AgentType::Codex, &screen.tail_rows())
+                    .map(|m| m.kind);
+                assert_eq!(
+                    found, None,
+                    "redraw {redraw:?}: a cleared quota line matched"
+                );
+                let (outcome, epoch) = bus.quota_record_probe(t, found);
+                assert_eq!(outcome, ProbeOutcome::NoMatch);
+                assert_eq!(epoch, None);
+                t += timings.confirm + timings.probe_interval;
+            }
+            assert!(
+                !bus.quota_confirmed(),
+                "redraw {redraw:?}: confirmed a block"
+            );
+        }
+    }
+
+    /// Issue #714 (audit A3): a pending quota hint on a pane at the maximum PTY
+    /// size, resized over and over, must cost no screen replay at all — resizes
+    /// only move the ring, and a probe of a screen over
+    /// `MAX_QUOTA_REPLAY_CELLS` is skipped before a byte is copied — and the
+    /// retained bytes stay within the ring cap however many resizes land.
+    #[test]
+    fn quota_probe_is_bounded_for_max_size_and_repeated_resizes() {
+        use crate::quota_detect::{MAX_QUOTA_REPLAY_CELLS, QuotaTimings, replay_fits};
+        let max = PTY_RESIZE_DIM_MAX;
+        assert!(!replay_fits(max, max));
+        assert!(replay_fits(512, 512) && replay_fits(120, 400) && replay_fits(0, 0));
+        assert!(u32::from(max) * u32::from(max) > MAX_QUOTA_REPLAY_CELLS);
+
+        let timings = QuotaTimings::default();
+        let bus = AgentBus::with_quota_timings(timings);
+        let filler = vec![b'x'; SCROLLBACK_CAP_BYTES];
+        bus.push(filler);
+        bus.push(b"\r\nYou\xe2\x80\x99ve hit your usage limit.\r\n".to_vec());
+        for i in 0..10_000u16 {
+            let (from, to) = if i % 2 == 0 {
+                ((max, max), (max - 1, max))
+            } else {
+                ((max - 1, max), (max, max))
+            };
+            bus.clear_scrollback_after_resize(from.0, from.1, to.0, to.1);
+            bus.push(b"y".to_vec());
+        }
+        {
+            let state = bus.state.lock().unwrap();
+            let retained =
+                state.scrollback.len() + state.quota_prelude.as_ref().map_or(0, |p| p.bytes.len());
+            assert!(
+                retained <= SCROLLBACK_CAP_BYTES,
+                "retained {retained} bytes across repeated resizes"
+            );
+            assert!(
+                state.quota_prelude.is_none(),
+                "an oversized pre-resize ring is never retained"
+            );
+        }
+        // A probe is due, but the screen is 4096x4096: skipped, not replayed.
+        let later = Instant::now() + timings.quiet * 2;
+        assert!(bus.quota_probe_snapshot(later, max, max).is_none());
+        // And the replay itself refuses an oversized geometry outright.
+        let oversized = QuotaProbeScreen {
+            bytes: b"You\xe2\x80\x99ve hit your usage limit.\r\n".to_vec(),
+            rows: max,
+            cols: max,
+        };
+        assert!(oversized.tail_rows().is_empty());
+    }
+
+    /// Issue #714 (audit A3, S2): the registry skips a max-size pane with a
+    /// pending hint when collecting quota probes.
+    #[test]
+    fn quota_probe_candidates_skip_a_max_size_pane() {
+        let reg = Arc::new(AgentPtyRegistry::new());
+        let id = reg
+            .spawn_agent(SpawnOptions {
+                command: Some("/bin/cat"),
+                env: crate::test_isolation::pin_unreachable_endpoints(vec![(
+                    DOT_AGENT_DECK_PANE_ID.to_string(),
+                    "quota-max".to_string(),
+                )]),
+                agent_type: Some(AgentType::Codex),
+                ..SpawnOptions::default()
+            })
+            .expect("spawn");
+        let bus = Arc::clone(&reg.inner.lock().unwrap().agents.get(&id).unwrap().bus);
+        bus.push(b"You\xe2\x80\x99ve hit your usage limit.\r\n".to_vec());
+        let later = Instant::now() + crate::quota_detect::DEFAULT_QUOTA_QUIET * 2;
+        let probes = reg.quota_probe_candidates(later);
+        assert_eq!(
+            probes.len(),
+            1,
+            "precondition: the hint makes the pane a candidate"
+        );
+        reg.resize(&id, PTY_RESIZE_DIM_MAX, PTY_RESIZE_DIM_MAX)
+            .expect("resize");
+        bus.push(b"You\xe2\x80\x99ve hit your usage limit.\r\n".to_vec());
+        let later = Instant::now() + crate::quota_detect::DEFAULT_QUOTA_QUIET * 2;
+        assert!(
+            reg.quota_probe_candidates(later).is_empty(),
+            "a 4096x4096 pane is never replayed"
+        );
+        reg.shutdown_all();
     }
 
     /// Issue #714: the blocked-worker notice is claimed once per outstanding
