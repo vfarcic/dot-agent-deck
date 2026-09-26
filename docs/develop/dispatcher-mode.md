@@ -56,6 +56,8 @@ Cleanup is keyed to the dispatched unit's own tab. Three defects lived here, eac
 2. The daemon **awaited worktree cleanup before answering** the close. On a worktree an agent has worked in, `git status --porcelain` is seconds, which blew the TUI's 5s `CTRL_W_STOP_TIMEOUT`. Cleanup now runs detached, after the response.
 3. A pane can carry **more than one session** — a placeholder plus the agent's own — and the close removed only the one its card was built from, leaving a ghost card badged `No agent`. Only reproduces when the command is **not inferable** as an agent (a `devbox run agent-<role>` launcher), because such a command is not wrapped and the agent's hooks arrive under an identity the reuse guard does not match. Fixed by `AppState::remove_sessions_for_pane`.
 
+The close dialog's "uncommitted changes, kept at <dir>" warning is a **forecast**: the unit is still running while the user reads it and can commit between the dialog and the close. So the status line reports the daemon's own post-cleanup verdict, measured with the agent reaped and delivered as `BroadcastMsg::WorktreeKept`, never the dialog's preview (issue #717; `Action::ConfirmCloseSelected` in `src/ui.rs`). Moved here from the user guide, which now states only what the user sees.
+
 `RemovalPolicy::KeepIfDirty` is why a dirty worktree survives: this sibling's name was chosen by an LLM, so closing must not destroy uncommitted work. Issue-dispatch uses `Force` instead, because its slot-reclaim model depends on the name actually being freed.
 
 ## Deferred, and why
