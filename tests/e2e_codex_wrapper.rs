@@ -187,8 +187,12 @@ fn codex_live_001_real_interactive_new_pane_runs_and_reports_status() {
     deck.send_keys(b"\r");
     deck.send_keys(b"\r");
     deck.wait_for_string("[Command Mode Ctrl+D]");
+    // Case-insensitive: Codex paints the model's display name (`GPT-5.6-Luna`
+    // for `--model gpt-5.6-luna`), not the id it was launched with.
     assert!(
-        deck.wait_for_grid_string_within(common::codex_test_model(), Duration::from_secs(30)),
+        deck.wait_for_grid_predicate_within(Duration::from_secs(30), |grid| grid
+            .to_ascii_lowercase()
+            .contains(&common::codex_test_model().to_ascii_lowercase())),
         "the bare interactive Codex UI never became ready in the new pane:\n{}",
         deck.snapshot_grid()
     );
