@@ -158,6 +158,7 @@ test.describe("agent pane overlay", () => {
     await expect(overlay).toHaveAttribute("aria-label", "Planner agent");
     await expect(overlay).toHaveAttribute("aria-modal", "true");
     await expect(overlay.getByRole("heading", { name: "Planner" })).toBeVisible();
+    await expect(overlay.getByRole("button", { name: "Back to dashboard" })).toBeVisible();
     await expect(grid).toBeAttached();
     await expect(otherTile).toBeAttached();
     expect(await originalGrid!.evaluate((node) => node.isConnected)).toBe(true);
@@ -193,6 +194,7 @@ test.describe("agent pane overlay", () => {
 
     const overlay = page.getByTestId("agent-pane-overlay");
     await expect(overlay).toBeVisible();
+    await expect(overlay.getByRole("button", { name: "Back to dashboard" })).toBeVisible();
     await expect(overview).toBeAttached();
     expect(await originalOverview!.evaluate((node) => node.isConnected)).toBe(true);
     expect(await page.evaluate((node) => document.querySelector('[data-testid="overview-table-region"]') === node, originalOverview)).toBe(true);
@@ -228,5 +230,7 @@ test.describe("agent pane overlay", () => {
     await expect(overlay.getByLabel("Builder terminal input")).toBeAttached();
     await expect(overlay.getByTestId("terminal-absent-planner")).toHaveCount(0);
     await expect(page.getByTestId("deck-selector-current")).toHaveText("All daemons");
+    await overlay.getByRole("button", { name: "Back to dashboard" }).click();
+    await expect(overlay).toHaveCount(0);
   });
 });

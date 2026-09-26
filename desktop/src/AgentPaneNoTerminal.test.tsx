@@ -273,7 +273,7 @@ describe("a pane with no terminal", () => {
 
     // The rest of the pane is a working pane rather than a placeholder: the
     // agent's own identity, all five tabs, and the way out.
-    expect(within(pane).getByRole("button", { name: "Close Planner on build-box agent" })).toBeVisible();
+    expect(within(pane).getByRole("button", { name: "Back to dashboard" })).toBeVisible();
     expect(within(pane).getAllByRole("tab")).toHaveLength(5);
     // Nothing here writes the settings document, which is the line the descope
     // draws: opening a pane is navigation.
@@ -570,7 +570,7 @@ describe("a pane whose agent has left the fleet", () => {
     // No pane, and no frame where one was: the view is back on the screen it
     // was opened from, which is the one that can say the agent is gone.
     expect(screen.queryByTestId("agent-pane-overlay")).not.toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: /^Close .* agent$/ })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Back to dashboard" })).not.toBeInTheDocument();
     expect(screen.getByTestId("overview-open-deck")).toBeVisible();
     // And nothing is declared shown for it any more, which is the half no
     // amount of looking at the screen would have caught.

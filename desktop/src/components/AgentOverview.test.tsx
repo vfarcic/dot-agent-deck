@@ -1842,7 +1842,7 @@ describe("AgentOverview", () => {
     // reader can actually find because it is a thing they can see.
     expect(screen.queryByTestId("daemon-state")).not.toBeInTheDocument();
     expect(screen.getByTestId("daemon-identity"))
-      .toHaveAttribute("title", `${FIXTURE_DAEMON_ID} · Built from different commits — desktop 0.39.0-49-ga0165f8, deck 0.39.0-g1ea0fe7.`);
+      .toHaveAttribute("title", `${FIXTURE_DAEMON_ID} · Built from different commits — desktop 0.39.0-49-ga0165f8, daemon 0.39.0-g1ea0fe7.`);
   });
 
   /** Matching stamps have nothing to disclose, so only the socket path is on hover. */
@@ -2144,7 +2144,7 @@ describe("DeckShell", () => {
     expect(screen.getByTestId("agent-tile-builder")).toBeInTheDocument();
     expect(screen.queryByTestId("overview-table-region")).not.toBeInTheDocument();
 
-    fireEvent.click(within(overlay).getByRole("button", { name: "Close Planner agent" }));
+    fireEvent.click(within(overlay).getByRole("button", { name: "Back to dashboard" }));
     expect(screen.queryByTestId("agent-pane-overlay")).not.toBeInTheDocument();
     expect(document.querySelector(".agent-grid")).toBeVisible();
     expect(screen.getByTestId("agent-tile-planner")).toBeVisible();
@@ -2168,7 +2168,7 @@ describe("DeckShell", () => {
     expect(terminalMounted).toHaveBeenCalledWith("planner");
     expect(screen.queryByTestId("agent-tile-builder")).not.toBeInTheDocument();
 
-    fireEvent.click(within(overlay).getByRole("button", { name: "Close Planner agent" }));
+    fireEvent.click(within(overlay).getByRole("button", { name: "Back to dashboard" }));
     expect(screen.queryByTestId("agent-pane-overlay")).not.toBeInTheDocument();
     expect(screen.getByTestId("overview-table-region")).toBeVisible();
     expect(screen.getByTestId(`overview-agent-${agentKey({ daemonId: FIXTURE_DAEMON_ID, id: "planner" })}`)).toBeVisible();
@@ -2568,7 +2568,7 @@ describe("AgentOverview across a fleet (PRD #742 M4)", () => {
 
     expect(screen.getByTestId("overview-count-decks").querySelector("strong")).toHaveTextContent("2/3");
     expect(screen.getByTestId("overview-count-decks").querySelector("strong"))
-      .toHaveAttribute("title", expect.stringContaining("2 of 3 decks are answering") as unknown as string);
+      .toHaveAttribute("title", expect.stringContaining("2 of 3 daemons are answering") as unknown as string);
   });
 
   /**
@@ -2656,7 +2656,7 @@ describe("AgentOverview across a fleet (PRD #742 M4)", () => {
     const decks = screen.getByTestId("overview-count-decks").querySelector("strong");
     expect(decks).toHaveTextContent("1/2");
     expect(decks).not.toHaveTextContent("1/1");
-    expect(decks).toHaveAttribute("title", expect.stringContaining("1 of 2 decks are answering") as unknown as string);
+    expect(decks).toHaveAttribute("title", expect.stringContaining("1 of 2 daemons are answering") as unknown as string);
   });
 
   /**

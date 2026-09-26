@@ -3,7 +3,7 @@ import { useMemo, useState } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createFixtureSnapshot, FIXTURE_DAEMON_ID } from "./data/fixture";
 import { agentKey } from "./lib/agentKey";
-import { WINDOWS_WORKFLOW_BLOCK_REASON } from "./lib/platform";
+import { WINDOWS_ORCHESTRATION_BLOCK_REASON } from "./lib/platform";
 import { DEFAULT_DESKTOP_SETTINGS, fixtureDesktopFeatures, type DesktopSettingsDto } from "./lib/bridge";
 import { LaunchCleanupError } from "./lib/actionError";
 import type { AgentSession, DaemonOrchestration, DaemonProject, DaemonResolvedProject, DeckRuntimeState, SendResult } from "./types";
@@ -788,7 +788,7 @@ describe("ControlDeck", () => {
       expect(screen.getByTestId("toast")).toHaveTextContent("no longer matches what the daemon approved");
     });
     expect(screen.getByTestId("toast")).toHaveTextContent("Nothing was started");
-    expect(screen.getByTestId("toast")).toHaveTextContent("launch again");
+    expect(screen.getByTestId("toast")).toHaveTextContent("activate again");
     expect(screen.getByTestId("toast")).toHaveAttribute("role", "status");
     // Re-read, so the next attempt carries the project's current revision.
     expect(vi.mocked(live.resolveProject).mock.calls.length).toBeGreaterThan(resolvesAfterPick);
@@ -1158,7 +1158,7 @@ describe("ControlDeck", () => {
   /** Scenario: Explains and disables live orchestration activation on Windows before confirmation. */
   it("explains and disables live orchestration activation on Windows before confirmation", () => {
     const live = runtime({ mode: "live" });
-    render(<ControlDeck runtime={live} workflowPlatformIssue={WINDOWS_WORKFLOW_BLOCK_REASON} />);
+    render(<ControlDeck runtime={live} orchestrationPlatformIssue={WINDOWS_ORCHESTRATION_BLOCK_REASON} />);
     fireEvent.click(screen.getByRole("button", { name: "Orchestrations" }));
     fireEvent.change(screen.getByLabelText("Task prompt"), { target: { value: "Try to launch on Windows." } });
 

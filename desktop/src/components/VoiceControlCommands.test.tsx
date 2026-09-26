@@ -1019,6 +1019,7 @@ describe("closing what is on top", () => {
     await turnVoiceOn();
     await completeUtterance();
     expect(screen.getByTestId("agent-pane-overlay")).toBeInTheDocument();
+    expect(within(screen.getByTestId("agent-pane-overlay")).getByRole("button", { name: "Back to dashboard" })).toBeVisible();
 
     voice.deliver("close this");
     await completeUtterance();
@@ -2238,7 +2239,7 @@ describe("PRD #802 D5 — a spoken stop opens a confirmation; a spoken start sta
     expect(runAction).not.toHaveBeenCalled();
 
     await act(async () => {
-      fireEvent.click(screen.getByRole("button", { name: "Stop all 2 roles" }));
+      fireEvent.click(screen.getByRole("button", { name: "Close all 2 roles" }));
       await Promise.resolve();
     });
     await flush();

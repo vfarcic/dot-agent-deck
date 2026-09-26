@@ -180,7 +180,7 @@ describe("agent pane deck identity", () => {
 
     fireEvent.click(openControl("Plan / architecture"));
     expect(screen.getByTestId("agent-pane-overlay")).toBeVisible();
-    fireEvent.click(within(screen.getByTestId("agent-pane-overlay")).getByRole("button", { name: "Close Planner agent" }));
+    fireEvent.click(within(screen.getByTestId("agent-pane-overlay")).getByRole("button", { name: "Back to dashboard" }));
 
     await waitFor(() => expect(screen.queryByTestId("agent-pane-overlay")).not.toBeInTheDocument());
     expect(deck.saveSettings).not.toHaveBeenCalled();
@@ -456,10 +456,10 @@ describe("agent pane identity fence", () => {
     expect(reachableOutside(pane)).toEqual([screen.getByTestId("voice-trigger"), undo]);
     // And the pane itself is genuinely live, so this is containment rather than
     // a screen that has simply been switched off.
-    expect(within(pane).getByRole("button", { name: "Close Planner agent" })).toBeVisible();
+    expect(within(pane).getByRole("button", { name: "Back to dashboard" })).toBeVisible();
     expect(pane.contains(document.activeElement)).toBe(true);
 
-    fireEvent.click(within(pane).getByRole("button", { name: "Close Planner agent" }));
+    fireEvent.click(within(pane).getByRole("button", { name: "Back to dashboard" }));
     expect(screen.queryByTestId("agent-pane-overlay")).not.toBeInTheDocument();
     expect(document.querySelectorAll("[inert]")).toHaveLength(0);
     expect(screen.getByTestId("deck-selector-toggle").closest("[inert]")).toBeNull();
@@ -497,7 +497,7 @@ describe("agent pane identity fence", () => {
     // a tile among tiles, offering Open rather than wearing the pane the user
     // opened for the other machine's agent.
     expect(screen.getByTestId("agent-tile-planner-on-build-box")).toHaveAttribute("data-presentation", "tile");
-    expect(screen.queryByRole("button", { name: /^Close .* agent$/ })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Back to dashboard" })).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Open Planner on build-box agent" })).toBeVisible();
 
     await act(async () => { rerender(<DeckShell runtime={deck.runtime("local")} initialView={paneView} />); });

@@ -1376,11 +1376,11 @@ describe("New agent dialog — orchestrations (PRD #1223 M6)", () => {
     for (const namesake of namesakes) {
       expect(namesake).toBeDisabled();
       expect(namesake).toHaveTextContent("Orch: loop");
-      expect(namesake).toHaveAttribute("title", "This project defines more than one orchestration named loop; rename one to launch it here.");
+      expect(namesake).toHaveAttribute("title", "This project defines more than one orchestration named loop; rename one to activate it here.");
       fireEvent.click(namesake);
     }
     expect(screen.getAllByTestId("new-agent-orchestration-ambiguous")).toHaveLength(1);
-    expect(screen.getByTestId("new-agent-orchestration-ambiguous")).toHaveTextContent("rename one to launch it here");
+    expect(screen.getByTestId("new-agent-orchestration-ambiguous")).toHaveTextContent("rename one to activate it here");
     expect(screen.queryByTestId("new-agent-mode-orch:loop")).toBeNull();
     expect(screen.getByTestId("new-agent-mode-none")).toHaveAttribute("aria-pressed", "true");
 

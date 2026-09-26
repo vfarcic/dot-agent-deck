@@ -320,7 +320,7 @@ describe("New agent orchestration rules (PRD #1223 M6)", () => {
     const cased = orchestration("Loop", ["other"]);
 
     expect(orchestrationModes({ kind: "project", path: "/p", displayPath: "/p", displayName: "p", orchestrations: [first, solo, second, cased] })).toEqual({ offered: [solo, cased], ambiguous: [first, second] });
-    expect(ambiguousOrchestrationReason("loop")).toBe("This project defines more than one orchestration named loop; rename one to launch it here.");
+    expect(ambiguousOrchestrationReason("loop")).toBe("This project defines more than one orchestration named loop; rename one to activate it here.");
     expect(ambiguousOrchestrationReason("lo\u202Eop")).toContain("named loop;");
   });
 });

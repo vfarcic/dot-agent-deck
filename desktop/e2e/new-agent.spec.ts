@@ -139,7 +139,7 @@ test.describe("the New agent flow", () => {
     const confirm = page.getByRole("alertdialog");
     await expect(confirm).toContainText("This stops every role of this orchestration");
     await expect(confirm).toContainText("planner, builder");
-    await confirm.getByRole("button", { name: "Stop all 2 roles" }).click();
+    await confirm.getByRole("button", { name: "Close all 2 roles" }).click();
 
     await expect(confirm).toHaveCount(0);
     await expect(remoteGroup.getByRole("button", { name: "Open planner agent", exact: true })).toHaveCount(0);
@@ -258,7 +258,7 @@ test.describe("the New agent flow", () => {
     await expect(modes).toHaveText(["No mode", "Orch: solo-loop", "Orch: twin-loop", "Orch: twin-loop", "schedule", "schedule: issues", "dispatcher"]);
     await expect(page.getByTestId("new-agent-mode-ambiguous-0")).toBeDisabled();
     await expect(page.getByTestId("new-agent-mode-ambiguous-1")).toBeDisabled();
-    await expect(page.getByTestId("new-agent-orchestration-ambiguous")).toHaveText("This project defines more than one orchestration named twin-loop; rename one to launch it here.");
+    await expect(page.getByTestId("new-agent-orchestration-ambiguous")).toHaveText("This project defines more than one orchestration named twin-loop; rename one to activate it here.");
     await page.getByTestId("new-agent-mode-none").focus();
     await page.keyboard.press("ArrowRight");
     await expect(page.getByTestId("new-agent-mode-orch:solo-loop")).toHaveAttribute("aria-pressed", "true");

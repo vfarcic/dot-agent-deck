@@ -363,7 +363,7 @@ describe("VOICE_ACTIONS", () => {
     expectOneRegistryDispatch("openAgent");
     registryDispatch.mockClear();
 
-    fireEvent.click(screen.getByRole("button", { name: "Close Planner agent" }));
+    fireEvent.click(screen.getByRole("button", { name: "Back to dashboard" }));
     expect(screen.queryByTestId("agent-pane-overlay")).not.toBeInTheDocument();
     expect(screen.getByTestId("agent-tile-planner")).toBeVisible();
     expectOneRegistryDispatch("closeAgentView");
