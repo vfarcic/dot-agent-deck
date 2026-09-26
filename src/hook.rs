@@ -76,8 +76,6 @@ struct OpenCodeHookInput {
     // today's behaviour, instead of dropping the whole event.
     #[serde(default, deserialize_with = "lenient_string")]
     error_name: Option<String>,
-    #[serde(default, deserialize_with = "lenient_i64")]
-    status_code: Option<i64>,
     #[serde(default, deserialize_with = "lenient_string")]
     error_message: Option<String>,
     #[serde(default, deserialize_with = "lenient_string")]
@@ -86,11 +84,6 @@ struct OpenCodeHookInput {
     response_headers: HashMap<String, String>,
     #[serde(flatten)]
     _extra: HashMap<String, Value>,
-}
-
-/// [`lenient_string`] for an integer: anything but a JSON integer is `None`.
-fn lenient_i64<'de, D: Deserializer<'de>>(d: D) -> Result<Option<i64>, D::Error> {
-    Ok(Option::<Value>::deserialize(d)?.and_then(|v| v.as_i64()))
 }
 
 /// [`lenient_string`] for a string map: anything but a JSON object is empty,
@@ -592,16 +585,15 @@ fn build_event_typed(input: ClaudeCodeHookInput, agent_type: AgentType) -> Optio
             "SessionStart" | "UserPromptSubmit" | "Stop"
         )
     {
-        let bounded = |v: Option<String>| {
-            v.filter(|v| !v.is_empty() && v.len() <= crate::codex_rollout_tail::MAX_METADATA_BYTES)
-        };
-        if let Some(path) = bounded(transcript_path) {
+        if let Some(path) =
+            transcript_path.filter(|p| crate::codex_rollout_tail::admissible_path(p))
+        {
             metadata.insert(
                 crate::codex_rollout_tail::CODEX_TRANSCRIPT_PATH_METADATA_KEY.to_string(),
                 path,
             );
         }
-        if let Some(turn) = bounded(turn_id) {
+        if let Some(turn) = turn_id.filter(|t| crate::codex_rollout_tail::admissible_turn_id(t)) {
             metadata.insert(
                 crate::codex_rollout_tail::CODEX_TURN_ID_METADATA_KEY.to_string(),
                 turn,
@@ -756,7 +748,6 @@ fn build_opencode_event(input: OpenCodeHookInput) -> Option<AgentEvent> {
     if input.event == "session.error" {
         let fields = crate::quota_signals::OpenCodeErrorFields {
             error_name: input.error_name,
-            status_code: input.status_code,
             response_body: input.response_body,
             response_headers: input.response_headers,
         };
@@ -3513,7 +3504,7 @@ mod tests {
 
         let opencode: OpenCodeHookInput = serde_json::from_str(
             r#"{"session_id":"oc","event":"session.error","error_name":"APIError",
-                "status_code":429,"is_retryable":true,"error_message":"The usage limit has been reached",
+                "error_message":"The usage limit has been reached",
                 "response_body":"{\"error\":{\"type\":\"usage_limit_reached\",\"resets_at\":1790001000}}",
                 "response_headers":{"Retry-After":"60"}}"#,
         )
@@ -3526,7 +3517,7 @@ mod tests {
         );
         let bare: OpenCodeHookInput = serde_json::from_str(
             r#"{"session_id":"oc","event":"session.error","error_name":"APIError",
-                "status_code":429,"response_body":"{\"error\":{\"type\":\"rate_limit_error\"}}",
+                "response_body":"{\"error\":{\"type\":\"rate_limit_error\"}}",
                 "response_headers":"not an object"}"#,
         )
         .unwrap();

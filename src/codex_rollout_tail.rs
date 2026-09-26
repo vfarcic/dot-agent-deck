@@ -21,18 +21,20 @@
 //!   Codex writes the failure before the daemon handles the hook. The pure
 //!   record classifier is [`crate::quota_signals::CodexTurnWatch`].
 //! * **Disarming.** On the watched turn's `task_complete` (with or without an
-//!   error), a Codex `Stop` naming that turn, or a newer arm. A tailer is dropped when its agent
-//!   is no longer the live owner of its pane, and the whole set when the
-//!   daemon's monitor task is aborted.
-//! * **Path safety**, checked once whenever a path is (re)opened
+//!   error), a Codex `Stop` naming that turn, or a newer arm. Disarming closes
+//!   the file and keeps only its path, so an idle Codex pane holds no file
+//!   descriptor; the next arm re-opens it, validating it again. A tailer is
+//!   dropped when its agent is no longer the live owner of its pane, and the
+//!   whole set when the daemon's monitor task is aborted.
+//! * **Path safety**, checked every time a path is (re)opened
 //!   ([`open_rollout`]): absolute, no `..`, canonicalizes, the canonical file
 //!   name is `rollout-*.jsonl`, opened read-only (Unix: non-blocking and without
 //!   following a final symlink), and the opened file is a regular file (Unix:
-//!   owned by the daemon's uid). The file handle is then held and reused, so a
-//!   later swap of the path has nothing to race. A refused path is logged at
-//!   `debug` and never retried.
+//!   owned by the daemon's uid). The file handle is then held and reused for
+//!   the armed turn, so a swap of the path during it has nothing to race. A
+//!   refused path is logged at `debug` and never retried.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::File;
 use std::io::{Read as _, Seek as _, SeekFrom};
 use std::path::{Component, Path};
@@ -49,8 +51,28 @@ pub const CODEX_TRANSCRIPT_PATH_METADATA_KEY: &str = "codex_transcript_path";
 /// hook payload's `turn_id` — the turn to watch.
 pub const CODEX_TURN_ID_METADATA_KEY: &str = "codex_turn_id";
 
-/// The longest value either key may carry; a longer one is not forwarded.
+/// The longest rollout path [`CODEX_TRANSCRIPT_PATH_METADATA_KEY`] may carry;
+/// a longer one is neither forwarded by the hook CLI nor admitted by the daemon.
 pub const MAX_METADATA_BYTES: usize = 4096;
+
+/// The longest turn id [`CODEX_TURN_ID_METADATA_KEY`] may carry. Codex's turn
+/// ids are UUIDs; this leaves room for any other shape without letting a raw
+/// hook frame park megabytes in the arm queue.
+pub const MAX_TURN_ID_BYTES: usize = 256;
+
+/// Whether `path` may be carried as [`CODEX_TRANSCRIPT_PATH_METADATA_KEY`]:
+/// non-empty and at most [`MAX_METADATA_BYTES`]. Checked by the hook CLI before
+/// forwarding and again by the daemon's admission of every raw frame, since the
+/// hook socket accepts events from any same-uid producer, not only the CLI.
+pub fn admissible_path(path: &str) -> bool {
+    !path.is_empty() && path.len() <= MAX_METADATA_BYTES
+}
+
+/// Whether `turn_id` may be carried as [`CODEX_TURN_ID_METADATA_KEY`]:
+/// non-empty and at most [`MAX_TURN_ID_BYTES`]. See [`admissible_path`].
+pub fn admissible_turn_id(turn_id: &str) -> bool {
+    !turn_id.is_empty() && turn_id.len() <= MAX_TURN_ID_BYTES
+}
 
 /// How often the daemon polls its armed tailers.
 pub const POLL_INTERVAL: Duration = Duration::from_secs(2);
@@ -66,9 +88,20 @@ pub const BACK_WINDOW: u64 = 256 * 1024;
 /// `response_item` lines with large tool output get this long.
 pub const MAX_LINE_BYTES: usize = 256 * 1024;
 
-/// Bound on queued, not-yet-applied arm commands and on remembered refused
-/// paths — both are fed from hook events, so neither may grow without limit.
+/// Bound on the NUMBER of queued, not-yet-applied arm commands — fed from hook
+/// events, so the queue may not grow without limit.
 const MAX_PENDING: usize = 4096;
+
+/// Bound on the total BYTES of queued arm commands ([`ArmCommand::byte_len`]).
+/// Admission already bounds the path and turn id, but the count bound alone
+/// would still let a burst of maximal commands hold tens of megabytes until the
+/// next poll; this caps it regardless of what the strings carry.
+const MAX_PENDING_BYTES: usize = 1024 * 1024;
+
+/// Bounds on the remembered refused paths, by count and by total bytes. Past
+/// either the set is cleared, which costs at most one re-validation per path.
+const MAX_REFUSED: usize = 1024;
+const MAX_REFUSED_BYTES: usize = 1024 * 1024;
 
 /// What the hook loop asks of the tailers. Queued by the hook loop
 /// ([`CodexRolloutArms::push`]) and applied by the monitor task at its next
@@ -80,6 +113,23 @@ pub enum ArmCommand {
     /// A Codex `Stop` for `turn_id`: that turn ended normally. A watch for any
     /// other turn is left armed.
     Disarm { agent_id: String, turn_id: String },
+}
+
+impl ArmCommand {
+    /// The bytes this command's strings hold — what the queue's byte bound
+    /// counts.
+    pub fn byte_len(&self) -> usize {
+        match self {
+            ArmCommand::Disarm { agent_id, turn_id } => agent_id.len() + turn_id.len(),
+            ArmCommand::Arm(req) => {
+                req.pane_id.len()
+                    + req.agent_id.len()
+                    + req.session_id.len()
+                    + req.path.as_ref().map_or(0, String::len)
+                    + req.turn_id.as_ref().map_or(0, String::len)
+            }
+        }
+    }
 }
 
 /// One arm, from a Codex `SessionStart` (path only) or `UserPromptSubmit`
@@ -111,23 +161,51 @@ pub struct CodexBlock {
 /// The queue between the hook loop and the monitor task.
 #[derive(Debug, Default)]
 pub struct CodexRolloutArms {
-    pending: std::sync::Mutex<Vec<ArmCommand>>,
+    pending: std::sync::Mutex<PendingArms>,
+}
+
+#[derive(Debug, Default)]
+struct PendingArms {
+    commands: VecDeque<ArmCommand>,
+    /// The sum of [`ArmCommand::byte_len`] over `commands`.
+    bytes: usize,
 }
 
 impl CodexRolloutArms {
-    /// Queue `command`. Past [`MAX_PENDING`] the oldest queued command is
-    /// dropped — a newer arm for the same agent supersedes it anyway.
+    /// Queue `command`. Past [`MAX_PENDING`] commands or [`MAX_PENDING_BYTES`]
+    /// the oldest queued commands are dropped — a newer arm for the same agent
+    /// supersedes them anyway. A command larger than the byte bound on its own
+    /// is dropped instead of queued.
     pub fn push(&self, command: ArmCommand) {
-        let mut pending = self.pending.lock().unwrap_or_else(|p| p.into_inner());
-        if pending.len() >= MAX_PENDING {
-            pending.remove(0);
+        let size = command.byte_len();
+        if size > MAX_PENDING_BYTES {
+            tracing::debug!(
+                bytes = size,
+                "codex rollout: dropped an arm command larger than the queue's byte bound"
+            );
+            return;
         }
-        pending.push(command);
+        let mut pending = self.pending.lock().unwrap_or_else(|p| p.into_inner());
+        while pending.commands.len() >= MAX_PENDING || pending.bytes + size > MAX_PENDING_BYTES {
+            let Some(oldest) = pending.commands.pop_front() else {
+                break;
+            };
+            pending.bytes -= oldest.byte_len();
+        }
+        pending.bytes += size;
+        pending.commands.push_back(command);
     }
 
     /// Take every queued command, oldest first.
     pub fn drain(&self) -> Vec<ArmCommand> {
-        std::mem::take(&mut *self.pending.lock().unwrap_or_else(|p| p.into_inner()))
+        let mut pending = self.pending.lock().unwrap_or_else(|p| p.into_inner());
+        pending.bytes = 0;
+        pending.commands.drain(..).collect()
+    }
+
+    /// The total bytes currently queued. For tests and diagnostics.
+    pub fn queued_bytes(&self) -> usize {
+        self.pending.lock().unwrap_or_else(|p| p.into_inner()).bytes
     }
 }
 
@@ -148,6 +226,8 @@ struct Tailer {
     pane_id: String,
     session_id: String,
     path: String,
+    /// The open rollout — `Some` only while a turn is armed and the path has
+    /// been validated for it; disarming closes it.
     open: Option<OpenRollout>,
     /// The watched turn; `None` when no turn is armed, and then the file is
     /// not read at all.
@@ -162,6 +242,8 @@ struct Tailer {
 pub struct CodexRolloutTailers {
     tailers: HashMap<String, Tailer>,
     refused: HashSet<String>,
+    /// The sum of the lengths of `refused`.
+    refused_bytes: usize,
 }
 
 impl CodexRolloutTailers {
@@ -176,6 +258,7 @@ impl CodexRolloutTailers {
                         .is_some_and(|w| w.turn_id() == turn_id)
                 {
                     tailer.watch = None;
+                    tailer.open = None;
                 }
             }
             ArmCommand::Arm(req) => {
@@ -255,10 +338,17 @@ impl CodexRolloutTailers {
                             reason = why,
                             "codex rollout: refused a transcript path; not retried"
                         );
-                        if self.refused.len() >= MAX_PENDING {
+                        if self.refused.len() >= MAX_REFUSED
+                            || self.refused_bytes + tailer.path.len() > MAX_REFUSED_BYTES
+                        {
                             self.refused.clear();
+                            self.refused_bytes = 0;
                         }
-                        self.refused.insert(tailer.path.clone());
+                        if tailer.path.len() <= MAX_REFUSED_BYTES
+                            && self.refused.insert(tailer.path.clone())
+                        {
+                            self.refused_bytes += tailer.path.len();
+                        }
                         tailer.watch = None;
                         continue;
                     }
@@ -365,6 +455,7 @@ fn read_tailer(tailer: &mut Tailer) -> Option<FoundBlock> {
     }
     if ended {
         tailer.watch = None;
+        tailer.open = None;
     }
     found
 }
@@ -597,5 +688,142 @@ mod tests {
             found.extend(t.tick(live));
         }
         assert_eq!(found.len(), 1, "the failure after the filler is found");
+    }
+
+    /// Issue #714 (audit A3): disarming — by a matching `Stop` or by the turn's
+    /// own `task_complete` — closes the rollout, keeping only its path, and the
+    /// next arm re-opens it through the full path validation.
+    #[test]
+    fn a_disarmed_tailer_closes_its_file_and_revalidates_on_the_next_arm() {
+        let dir = tempfile::tempdir().unwrap();
+        let rollout = dir.path().join("rollout-2026-09-26T05-00-00-c.jsonl");
+        append(&rollout, b"{\"type\":\"session_meta\"}\n");
+        let is_open = |t: &CodexRolloutTailers| t.tailers["c"].open.is_some();
+
+        let mut tailers = CodexRolloutTailers::default();
+        tailers.apply(arm("c", &rollout, Some(TURN)));
+        assert!(tailers.tick(live).is_empty());
+        assert!(is_open(&tailers), "an armed turn holds the rollout open");
+
+        // A matching Stop closes it; the path is kept.
+        tailers.apply(ArmCommand::Disarm {
+            agent_id: "c".into(),
+            turn_id: TURN.into(),
+        });
+        assert!(
+            !is_open(&tailers),
+            "a Stop for the watched turn closes the file"
+        );
+        assert!(tailers.has_tailer("c"));
+        assert!(tailers.tick(live).is_empty());
+        assert!(!is_open(&tailers), "a tick with no watch opens nothing");
+
+        // An arm with no path reuses the kept one and re-opens it.
+        tailers.apply(ArmCommand::Arm(ArmRequest {
+            pane_id: "pane-c".into(),
+            agent_id: "c".into(),
+            session_id: "session-c".into(),
+            path: None,
+            turn_id: Some("turn-2".into()),
+        }));
+        assert!(tailers.tick(live).is_empty());
+        assert!(is_open(&tailers), "the next arm re-opens the kept path");
+
+        // The turn's own task_complete closes it too.
+        append(&rollout, failure_lines("turn-2").as_bytes());
+        assert_eq!(tailers.tick(live).len(), 1);
+        assert!(!tailers.is_armed("c"));
+        assert!(!is_open(&tailers), "a completed turn closes the file");
+
+        // The re-open validates again: the same path now resolves to a file
+        // that is not a rollout, so the next arm is refused, not read.
+        #[cfg(unix)]
+        {
+            let notes = dir.path().join("notes.jsonl");
+            append(&notes, failure_lines("turn-3").as_bytes());
+            std::fs::remove_file(&rollout).unwrap();
+            std::os::unix::fs::symlink(&notes, &rollout).unwrap();
+            tailers.apply(arm("c", &rollout, Some("turn-3")));
+            assert!(
+                tailers.tick(live).is_empty(),
+                "the swapped path is not read"
+            );
+            assert!(!tailers.is_armed("c"));
+            assert!(!is_open(&tailers));
+            assert!(
+                tailers
+                    .refused
+                    .contains(&rollout.to_string_lossy().into_owned())
+            );
+        }
+    }
+
+    /// Issue #714 (audit A1): the arm queue is bounded by total bytes as well
+    /// as by count, and the refused-path set by count and by bytes.
+    #[test]
+    fn the_arm_queue_and_the_refused_set_are_bounded() {
+        let big = |i: usize| {
+            ArmCommand::Arm(ArmRequest {
+                pane_id: "p".into(),
+                agent_id: format!("a{i}"),
+                session_id: "s".repeat(64 * 1024),
+                path: Some("/x/rollout-a.jsonl".into()),
+                turn_id: Some("t".into()),
+            })
+        };
+        let arms = CodexRolloutArms::default();
+        for i in 0..64 {
+            arms.push(big(i));
+            assert!(arms.queued_bytes() <= MAX_PENDING_BYTES);
+        }
+        let queued = arms.drain();
+        assert!(!queued.is_empty());
+        assert!(queued.len() < 64, "the byte bound dropped the oldest");
+        assert_eq!(queued.last(), Some(&big(63)), "the newest is kept");
+        assert_eq!(arms.queued_bytes(), 0);
+
+        // One command larger than the whole bound is not queued at all.
+        arms.push(ArmCommand::Disarm {
+            agent_id: "a".into(),
+            turn_id: "t".repeat(MAX_PENDING_BYTES + 1),
+        });
+        assert!(arms.drain().is_empty());
+
+        // The count bound still holds for small commands.
+        for i in 0..MAX_PENDING + 10 {
+            arms.push(ArmCommand::Disarm {
+                agent_id: format!("a{i}"),
+                turn_id: "t".into(),
+            });
+        }
+        assert_eq!(arms.drain().len(), MAX_PENDING);
+
+        // The refused set: each missing path is refused and remembered, and
+        // the set never passes either bound.
+        let dir = tempfile::tempdir().unwrap();
+        let mut tailers = CodexRolloutTailers::default();
+        for i in 0..MAX_REFUSED + 5 {
+            let path = dir.path().join(format!("rollout-missing-{i}.jsonl"));
+            tailers.apply(arm(&format!("r{i}"), &path, Some(TURN)));
+            tailers.tick(live);
+            assert!(tailers.refused.len() <= MAX_REFUSED);
+            assert!(tailers.refused_bytes <= MAX_REFUSED_BYTES);
+            assert_eq!(
+                tailers.refused_bytes,
+                tailers.refused.iter().map(String::len).sum::<usize>()
+            );
+        }
+        let long_dir = dir.path().join("d".repeat(200));
+        let mut tailers = CodexRolloutTailers::default();
+        for i in 0..MAX_REFUSED {
+            let path = format!(
+                "{}/{}/rollout-{i}.jsonl",
+                long_dir.display(),
+                "e".repeat(3000)
+            );
+            tailers.apply(arm(&format!("l{i}"), Path::new(&path), Some(TURN)));
+            tailers.tick(live);
+            assert!(tailers.refused_bytes <= MAX_REFUSED_BYTES);
+        }
     }
 }

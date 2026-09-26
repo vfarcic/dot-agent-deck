@@ -73,18 +73,71 @@ pub fn claude_version_accepts_stop_failure(output: &str) -> bool {
 /// switch off every deck hook, while leaving it out only means a quota-blocked
 /// Claude Code agent is not shown as Blocked.
 pub fn installed_claude_accepts_stop_failure() -> (bool, Option<String>) {
+    probe_claude_version(std::ffi::OsStr::new("claude"), CLAUDE_VERSION_PROBE_TIMEOUT)
+}
+
+/// [`installed_claude_accepts_stop_failure`] with the program and the bound
+/// injected.
+///
+/// **The whole probe sits under `timeout`, the pipe included** — not only the
+/// child's exit. Waiting for the exit and then reading stdout to EOF would hang
+/// for as long as anything else holds the pipe's write end: a launcher script
+/// that backgrounds a helper, or a descendant of the version command, exits
+/// the direct child while keeping stdout open, and this runs at TUI start with
+/// [`SETTINGS_LOCK`] held. So stdout is drained on a thread, which stops at the
+/// first newline, at EOF or after 4 KiB, and hands back what it read; the
+/// probe waits for that hand-off until the deadline. Past the deadline the
+/// probe answers unknown, kills the child — on Unix its whole process group,
+/// which it was given at spawn, so a helper holding the pipe dies with it —
+/// reaps it, and abandons the reader thread, which ends when the pipe closes.
+/// A descendant that moved itself to another group keeps the pipe, and with it
+/// that one detached thread; the probe still returns on time.
+fn probe_claude_version(
+    program: &std::ffi::OsStr,
+    timeout: std::time::Duration,
+) -> (bool, Option<String>) {
     use std::io::Read as _;
-    let mut child = match std::process::Command::new("claude")
+    let mut command = std::process::Command::new(program);
+    command
         .arg("--version")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
+        .stderr(std::process::Stdio::null());
+    #[cfg(unix)]
     {
+        use std::os::unix::process::CommandExt as _;
+        command.process_group(0);
+    }
+    let mut child = match command.spawn() {
         Ok(child) => child,
         Err(_) => return (false, None),
     };
-    let deadline = std::time::Instant::now() + CLAUDE_VERSION_PROBE_TIMEOUT;
+    let deadline = std::time::Instant::now() + timeout;
+    let (tx, rx) = std::sync::mpsc::channel();
+    if let Some(mut stdout) = child.stdout.take() {
+        std::thread::spawn(move || {
+            let mut output = Vec::new();
+            let mut chunk = [0u8; 512];
+            while output.len() < 4096 && !output.contains(&b'\n') {
+                match stdout.read(&mut chunk) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => output.extend_from_slice(&chunk[..n]),
+                }
+            }
+            output.truncate(4096);
+            let _ = tx.send(output);
+        });
+    } else {
+        drop(tx);
+    }
+    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+    let Ok(output) = rx.recv_timeout(remaining) else {
+        // Deadline passed with no line. The child is not reaped yet (a zombie
+        // at worst), so its pid still names its group.
+        kill_probe(&mut child);
+        return (false, None);
+    };
+    // The line is in; reap the child within what is left of the deadline.
     loop {
         match child.try_wait() {
             Ok(Some(_)) => break,
@@ -92,22 +145,33 @@ pub fn installed_claude_accepts_stop_failure() -> (bool, Option<String>) {
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
             _ => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return (false, None);
+                kill_probe(&mut child);
+                break;
             }
         }
     }
-    let mut output = String::new();
-    if let Some(mut stdout) = child.stdout.take() {
-        let _ = stdout.by_ref().take(4096).read_to_string(&mut output);
-    }
+    let output = String::from_utf8_lossy(&output);
     let line = output.lines().next().map(|l| l.trim().to_string());
     (
         line.as_deref()
             .is_some_and(claude_version_accepts_stop_failure),
         line,
     )
+}
+
+/// Kill a version probe that outlived its deadline — on Unix its whole process
+/// group first — and reap it. Must run before the child is reaped, while its
+/// pid still names its group.
+fn kill_probe(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    // SAFETY: `kill(2)` with a negative pid signals the process group that
+    // `process_group(0)` gave the child, whose id is the child's pid. The
+    // child is not reaped yet, so that id cannot have been reused.
+    unsafe {
+        libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL);
+    }
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 /// Every hook type the deck may have installed, gated or not — what uninstall
@@ -1482,5 +1546,89 @@ mod tests {
         let removed = uninstall_impl(&mut settings);
         assert!(removed.hook_types.contains(&STOP_FAILURE_HOOK));
         assert!(settings["hooks"].get(STOP_FAILURE_HOOK).is_none());
+    }
+
+    /// Write `body` as an executable stand-in `claude` in `dir`.
+    #[cfg(unix)]
+    fn stand_in_claude(dir: &Path, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
+        let path = dir.join("claude");
+        std::fs::write(&path, body).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    /// Issue #714 (audit A2): a stand-in `claude` that exits at once but leaves
+    /// a background child holding its stdout open, having printed no complete
+    /// line. The probe answers unknown within its bound instead of waiting for
+    /// EOF, and the helper holding the pipe is killed with the probe's group.
+    #[cfg(unix)]
+    #[test]
+    fn the_version_probe_is_bounded_when_a_descendant_holds_stdout_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("helper.pid");
+        let claude = stand_in_claude(
+            dir.path(),
+            &format!(
+                "#!/bin/sh\nsleep 30 &\necho $! > '{}'\nprintf '2.1.300'\nexit 0\n",
+                pid_file.display()
+            ),
+        );
+        let bound = std::time::Duration::from_millis(500);
+        let started = std::time::Instant::now();
+        let outcome = probe_claude_version(claude.as_os_str(), bound);
+        let elapsed = started.elapsed();
+        assert_eq!(outcome, (false, None), "an unfinished line is unknown");
+        assert!(
+            elapsed < bound + std::time::Duration::from_millis(1500),
+            "the probe waited {elapsed:?} against a {bound:?} bound"
+        );
+
+        let helper: i32 = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let gone = |pid: i32| {
+            std::fs::read_to_string(format!("/proc/{pid}/stat")).map_or(true, |stat| {
+                stat.rsplit_once(") ")
+                    .is_some_and(|(_, rest)| rest.starts_with('Z'))
+            })
+        };
+        if Path::new("/proc/self/stat").exists() {
+            let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !gone(helper) && std::time::Instant::now() < until {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            assert!(gone(helper), "the helper holding stdout outlived the probe");
+        }
+    }
+
+    /// Issue #714 (audit A2): the probe needs the version LINE, not EOF — a
+    /// stand-in that prints a full line and leaves a helper holding stdout is
+    /// read as soon as the line arrives.
+    #[cfg(unix)]
+    #[test]
+    fn the_version_probe_reads_the_line_without_waiting_for_eof() {
+        let dir = tempfile::tempdir().unwrap();
+        let claude = stand_in_claude(
+            dir.path(),
+            "#!/bin/sh\nsleep 3 &\necho '2.1.300 (Claude Code)'\nexit 0\n",
+        );
+        let started = std::time::Instant::now();
+        let outcome = probe_claude_version(claude.as_os_str(), std::time::Duration::from_secs(10));
+        assert_eq!(outcome, (true, Some("2.1.300 (Claude Code)".to_string())));
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "the probe waited {:?} for a pipe it did not need",
+            started.elapsed()
+        );
+        assert_eq!(
+            probe_claude_version(
+                dir.path().join("missing").as_os_str(),
+                std::time::Duration::from_secs(1)
+            ),
+            (false, None)
+        );
     }
 }

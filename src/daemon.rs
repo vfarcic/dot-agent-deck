@@ -1654,7 +1654,13 @@ fn notify_orchestrator_of_quota_block(
 ///   markers (its Codex-rollout block, and the lift after a pane restart), are
 ///   stripped from every producer frame;
 /// * the Codex rollout keys survive only on the Codex events that carry them
-///   (`SessionStart`, `UserPromptSubmit` → `Thinking`, `Stop` → `Idle`).
+///   (`SessionStart`, `UserPromptSubmit` → `Thinking`, `Stop` → `Idle`), and
+///   only within their bounds ([`crate::codex_rollout_tail::admissible_path`],
+///   [`crate::codex_rollout_tail::admissible_turn_id`]) — an empty or oversized
+///   value loses its key, the event stays. The hook CLI applies the same
+///   bounds, but a raw frame on the socket need not have come through it, and
+///   these values are copied into the arm queue before anything else looks at
+///   them.
 fn admit_producer_event(event: &mut AgentEvent) {
     use crate::quota_block::{
         QUOTA_BLOCKED_LIFTED_METADATA_KEY, QUOTA_BLOCKED_METADATA_KEYS,
@@ -1679,13 +1685,25 @@ fn admit_producer_event(event: &mut AgentEvent) {
                 | crate::event::EventType::Thinking
                 | crate::event::EventType::Idle
         );
-    if !codex_rollout_event {
-        event
+    use crate::codex_rollout_tail::{
+        CODEX_TRANSCRIPT_PATH_METADATA_KEY, CODEX_TURN_ID_METADATA_KEY, admissible_path,
+        admissible_turn_id,
+    };
+    let drop_path = !codex_rollout_event
+        || event
             .metadata
-            .remove(crate::codex_rollout_tail::CODEX_TRANSCRIPT_PATH_METADATA_KEY);
-        event
+            .get(CODEX_TRANSCRIPT_PATH_METADATA_KEY)
+            .is_some_and(|p| !admissible_path(p));
+    if drop_path {
+        event.metadata.remove(CODEX_TRANSCRIPT_PATH_METADATA_KEY);
+    }
+    let drop_turn = !codex_rollout_event
+        || event
             .metadata
-            .remove(crate::codex_rollout_tail::CODEX_TURN_ID_METADATA_KEY);
+            .get(CODEX_TURN_ID_METADATA_KEY)
+            .is_some_and(|t| !admissible_turn_id(t));
+    if drop_turn {
+        event.metadata.remove(CODEX_TURN_ID_METADATA_KEY);
     }
 }
 
@@ -4032,6 +4050,154 @@ mod hook_ingestion_tests {
                 if req.turn_id.as_deref() == Some("t1") && turn_id == "t1"),
             "{queued:?}"
         );
+        registry.shutdown_all();
+    }
+
+    /// Issue #714 (audit A1): raw frames written straight to the hook socket —
+    /// not built by the hook CLI, so none of its bounds applied — carrying a
+    /// megabyte `codex_transcript_path` or `codex_turn_id` for a live Codex
+    /// owner. Admission drops each oversized or empty key, keeps the event and
+    /// any in-bounds key, and nothing oversized reaches the arm queue.
+    #[tokio::test]
+    async fn raw_oversized_codex_rollout_frames_are_bounded_at_admission() {
+        use crate::codex_rollout_tail::{
+            ArmCommand, CODEX_TRANSCRIPT_PATH_METADATA_KEY, CODEX_TURN_ID_METADATA_KEY,
+            MAX_METADATA_BYTES, MAX_TURN_ID_BYTES,
+        };
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let owner = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("/bin/cat"),
+                env: crate::test_isolation::pin_unreachable_endpoints(vec![(
+                    DOT_AGENT_DECK_PANE_ID.to_string(),
+                    "codex-raw".to_string(),
+                )]),
+                agent_type: Some(AgentType::Codex),
+                ..SpawnOptions::default()
+            })
+            .expect("spawn stand-in");
+
+        let dir = tempfile::tempdir().unwrap();
+        // Plain bind, for the umask reason given in
+        // `run_hook_loop_persists_agent_type_into_registry`.
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("chmod tempdir");
+        let sock = dir.path().join("hook.sock");
+        let listener =
+            IpcListener::from_tokio_listener(UnixListener::bind(&sock).expect("bind hook socket"));
+        let state: SharedState =
+            Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
+        // The registry ownership oracle, installed as `run_daemon_with` does,
+        // so the owner's frames are admitted to the state at all.
+        let ownership: Arc<dyn crate::state::AgentOwnership> = registry.clone();
+        {
+            let mut st = state.write().await;
+            st.set_agent_ownership(Arc::downgrade(&ownership));
+            st.register_pane("codex-raw".to_string());
+        }
+        let (event_tx, mut rx) = broadcast::channel(EVENT_BROADCAST_CAPACITY);
+        let handle = tokio::spawn({
+            let (registry, state) = (registry.clone(), state.clone());
+            let shutdown = Arc::new(Notify::new());
+            let wtr = crate::issue_dispatch_run::new_worktree_registry();
+            async move { run_hook_loop(listener, state, event_tx, registry, shutdown, wtr).await }
+        });
+
+        let huge_path = format!("/x/{}/rollout-a.jsonl", "p".repeat(1024 * 1024));
+        let huge_turn = "t".repeat(1024 * 1024);
+        let valid_path = "/x/rollout-a.jsonl";
+        let frame = |session: &str, path: &str, turn: &str| {
+            serde_json::json!({
+                "session_id": session,
+                "agent_type": "codex",
+                "event_type": "thinking",
+                "timestamp": "2026-09-26T12:00:00Z",
+                "pane_id": "codex-raw",
+                "agent_id": owner,
+                "metadata": {
+                    CODEX_TRANSCRIPT_PATH_METADATA_KEY: path,
+                    CODEX_TURN_ID_METADATA_KEY: turn,
+                },
+            })
+        };
+        let frames = [
+            frame("raw-both-huge", &huge_path, &huge_turn),
+            frame("raw-huge-path", &huge_path, "t-ok"),
+            frame(
+                "raw-just-over",
+                &"q".repeat(MAX_METADATA_BYTES + 1),
+                &"u".repeat(MAX_TURN_ID_BYTES + 1),
+            ),
+            frame("raw-empty", "", ""),
+            frame("raw-valid", valid_path, "t-valid"),
+        ];
+        let mut stream = UnixStream::connect(&sock)
+            .await
+            .expect("connect hook socket");
+        for f in &frames {
+            stream
+                .write_all(format!("{f}\n").as_bytes())
+                .await
+                .expect("write hook line");
+        }
+        stream.flush().await.unwrap();
+
+        // Every frame is relayed — an invalid key costs the key, not the event —
+        // and each carries only the keys that were in bounds.
+        let mut relayed = std::collections::HashMap::new();
+        while relayed.len() < frames.len() {
+            let msg = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+                .await
+                .expect("every frame is relayed")
+                .expect("broadcast open");
+            if let BroadcastMsg::Event(event) = msg {
+                relayed.insert(event.session_id.clone(), event);
+            }
+        }
+        // A value too long to print is summarised, so a regression reports
+        // its size instead of dumping a megabyte into the failure.
+        let keys = |session: &str| {
+            let meta = &relayed[session].metadata;
+            let shown = |key: &str| {
+                meta.get(key).map(|v| {
+                    if v.len() > 64 {
+                        format!("<{} bytes>", v.len())
+                    } else {
+                        v.clone()
+                    }
+                })
+            };
+            (
+                shown(CODEX_TRANSCRIPT_PATH_METADATA_KEY),
+                shown(CODEX_TURN_ID_METADATA_KEY),
+            )
+        };
+        assert_eq!(keys("raw-both-huge"), (None, None));
+        assert_eq!(keys("raw-huge-path"), (None, Some("t-ok".to_string())));
+        assert_eq!(keys("raw-just-over"), (None, None));
+        assert_eq!(keys("raw-empty"), (None, None));
+        assert_eq!(
+            keys("raw-valid"),
+            (Some(valid_path.to_string()), Some("t-valid".to_string()))
+        );
+
+        let queued = registry.codex_rollout_arms().drain();
+        let arms: Vec<(Option<&str>, Option<&str>)> = queued
+            .iter()
+            .map(|c| match c {
+                ArmCommand::Arm(req) => (req.path.as_deref(), req.turn_id.as_deref()),
+                ArmCommand::Disarm { .. } => panic!("no Stop was sent: {c:?}"),
+            })
+            .collect();
+        assert_eq!(
+            arms,
+            vec![(None, Some("t-ok")), (Some(valid_path), Some("t-valid"))],
+            "only in-bounds values are queued"
+        );
+        assert!(queued.iter().all(|c| c.byte_len() < 4 * MAX_METADATA_BYTES));
+
+        handle.abort();
+        let _ = handle.await;
         registry.shutdown_all();
     }
 

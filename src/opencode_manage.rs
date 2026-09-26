@@ -225,12 +225,6 @@ const errorFields = (error) => {{
     out.error_name = error.name.slice(0, 100);
   }}
   const data = error.data && typeof error.data === "object" ? error.data : {{}};
-  if (Number.isInteger(data.statusCode)) {{
-    out.status_code = data.statusCode;
-  }}
-  if (typeof data.isRetryable === "boolean") {{
-    out.is_retryable = data.isRetryable;
-  }}
   if (typeof data.message === "string") {{
     out.error_message = data.message.slice(0, 500);
   }}
@@ -1496,8 +1490,12 @@ await hooks.event({{ event: {{ type: "session.error", properties: {{ sessionID: 
         assert_eq!(errors.len(), 2, "{payloads:?}");
         let structured = errors[0];
         assert_eq!(structured["error_name"], "APIError");
-        assert_eq!(structured["status_code"], 429);
-        assert_eq!(structured["is_retryable"], true);
+        for unread in ["status_code", "is_retryable"] {
+            assert!(
+                structured.get(unread).is_none(),
+                "{unread} is forwarded but nothing reads it: {structured}"
+            );
+        }
         assert_eq!(
             structured["error_message"],
             "The usage limit has been reached"
@@ -1523,7 +1521,7 @@ await hooks.event({{ event: {{ type: "session.error", properties: {{ sessionID: 
         let bare = errors[1];
         for key in [
             "error_name",
-            "status_code",
+            "error_message",
             "response_body",
             "response_headers",
         ] {

@@ -186,8 +186,6 @@ pub fn read_claude_transcript_tail(path: &str) -> Option<Vec<u8>> {
 pub struct OpenCodeErrorFields {
     /// `error.name`, e.g. `APIError`.
     pub error_name: Option<String>,
-    /// `error.data.statusCode`.
-    pub status_code: Option<i64>,
     /// `error.data.responseBody`, truncated by the plugin.
     pub response_body: Option<String>,
     /// The allow-listed response headers, names lowercased.
@@ -748,7 +746,6 @@ mod tests {
     fn opencode(body: Option<&str>, headers: &[(&str, &str)]) -> OpenCodeErrorFields {
         OpenCodeErrorFields {
             error_name: Some("APIError".to_string()),
-            status_code: Some(429),
             response_body: body.map(str::to_owned),
             response_headers: headers
                 .iter()
@@ -849,15 +846,12 @@ mod tests {
                 FailureOutcome::Error,
             ),
             (
-                OpenCodeErrorFields {
-                    status_code: Some(400),
-                    ..opencode(
-                        Some(
-                            r#"{"error":{"message":"The requested model is not supported.","type":"invalid_request_error","param":"model","code":"model_not_supported"}}"#,
-                        ),
-                        &[],
-                    )
-                },
+                opencode(
+                    Some(
+                        r#"{"error":{"message":"The requested model is not supported.","type":"invalid_request_error","param":"model","code":"model_not_supported"}}"#,
+                    ),
+                    &[],
+                ),
                 FailureOutcome::Error,
             ),
             (
