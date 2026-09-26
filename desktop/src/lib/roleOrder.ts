@@ -78,3 +78,16 @@ export function roleOrderFor(stored: string[] | undefined, profileIds: string[])
   const order = (stored ?? []).filter((id) => known.has(id));
   return order.length ? order : [...profileIds];
 }
+
+/**
+ * {@link roleOrderFor}, then every profile id it left out, appended in the
+ * profiles' own order, so the result names each existing profile exactly
+ * once. The orchestration editor reorders by position in this list, so a
+ * profile missing from it — one a reset restored after the order was seeded —
+ * renders but cannot move (PR #1342 review).
+ */
+export function reconcileRoleOrder(stored: string[] | undefined, profileIds: string[]): string[] {
+  const order = [...new Set(roleOrderFor(stored, profileIds))];
+  const placed = new Set(order);
+  return [...order, ...profileIds.filter((id) => !placed.has(id))];
+}

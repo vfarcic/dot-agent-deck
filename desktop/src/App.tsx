@@ -66,7 +66,7 @@ import type { VoiceDirectoriesDto, VoiceNewAgentDto, VoiceOutcomeDto } from "./l
 import { desktopFeaturesOf } from "./types";
 import type { AgentSession, CleanupWarningEntry, DeckAction, DeckRuntimeState, DeckSnapshot, DeckView, EvidenceItem, PanelTab, OrchestrationLaunchConfig } from "./types";
 import { modeScopedKey } from "./lib/bridge";
-import { planStoredRoleOrder, roleOrderFor } from "./lib/roleOrder";
+import { planStoredRoleOrder, reconcileRoleOrder } from "./lib/roleOrder";
 
 const ORCHESTRATION_STORAGE_KEY = modeScopedKey("dot-agent-deck.desktop.orchestration-preview.v1");
 /**
@@ -1161,11 +1161,25 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
       const plan = planStoredRoleOrder(current, current === null ? window.localStorage.getItem(LEGACY_WORKFLOW_STORAGE_KEY) : null);
       if (plan.write !== undefined) window.localStorage.setItem(ORCHESTRATION_STORAGE_KEY, plan.write);
       if (plan.removeLegacy) window.localStorage.removeItem(LEGACY_WORKFLOW_STORAGE_KEY);
-      setProfileOrder(roleOrderFor(plan.order, profiles.map((profile) => profile.id)));
+      setProfileOrder(reconcileRoleOrder(plan.order, profiles.map((profile) => profile.id)));
     } catch {
       setProfileOrder(profiles.map((profile) => profile.id));
     }
   }, [profileOrder.length, profiles]);
+
+  // The seed above runs once, so a profile that joins later — `resetProfiles`
+  // restoring a default the stored draft lacked — would render at the end of
+  // the editor without being in the order `moveStage` indexes, and its Move
+  // buttons would do nothing. Keep the order naming exactly the profiles that
+  // exist whenever they change (PR #1342 review).
+  useEffect(() => {
+    const ids = profiles.map((profile) => profile.id);
+    setProfileOrder((current) => {
+      if (!current.length) return current;
+      const next = reconcileRoleOrder(current, ids);
+      return next.length === current.length && next.every((id, index) => id === current[index]) ? current : next;
+    });
+  }, [profiles]);
 
   useEffect(() => {
     if (!profileOrder.length) return;

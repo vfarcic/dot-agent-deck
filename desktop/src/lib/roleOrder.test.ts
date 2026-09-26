@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { MAX_STORED_ROLE_ORDER, parseStoredRoleOrder, planStoredRoleOrder, roleOrderFor } from "./roleOrder";
+import { MAX_STORED_ROLE_ORDER, parseStoredRoleOrder, planStoredRoleOrder, reconcileRoleOrder, roleOrderFor } from "./roleOrder";
 
 describe("saved role order (issue #1045 audit finding 1)", () => {
   /** Scenario: a legacy value whose order is a string is not migrated, the legacy key is cleared, and the default order is used. */
@@ -60,5 +60,13 @@ describe("saved role order (issue #1045 audit finding 1)", () => {
     expect(roleOrderFor(["ghost", "builder", "phantom", "planner"], ["planner", "builder", "reviewer"])).toEqual(["builder", "planner"]);
     expect(roleOrderFor(["ghost"], ["planner", "builder"])).toEqual(["planner", "builder"]);
     expect(roleOrderFor([], [])).toEqual([]);
+  });
+
+  /** Scenario: reconciling keeps the stored order of existing profiles, drops removed ones, and appends a profile that joined later, so every profile appears exactly once. */
+  it("appends a profile that joined after the order was saved", () => {
+    expect(reconcileRoleOrder(["builder", "ghost", "planner"], ["planner", "builder", "reviewer"])).toEqual(["builder", "planner", "reviewer"]);
+    expect(reconcileRoleOrder(["builder", "builder"], ["planner", "builder"])).toEqual(["builder", "planner"]);
+    expect(reconcileRoleOrder(["ghost"], ["planner", "builder"])).toEqual(["planner", "builder"]);
+    expect(reconcileRoleOrder(undefined, [])).toEqual([]);
   });
 });

@@ -1,7 +1,7 @@
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { useMemo, useState } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { createFixtureSnapshot, FIXTURE_DAEMON_ID } from "./data/fixture";
+import { createFixtureSnapshot, DEFAULT_PROFILES, FIXTURE_DAEMON_ID } from "./data/fixture";
 import { agentKey } from "./lib/agentKey";
 import { WINDOWS_ORCHESTRATION_BLOCK_REASON } from "./lib/platform";
 import { DEFAULT_DESKTOP_SETTINGS, fixtureDesktopFeatures, type DesktopSettingsDto } from "./lib/bridge";
@@ -238,6 +238,31 @@ describe("ControlDeck", () => {
     const editor = await screen.findByTestId("orchestration-editor");
     const visibleOrder = Array.from(editor.querySelectorAll(".orchestration-editor-row strong"), (role) => role.firstChild?.textContent?.toLowerCase());
     expect(visibleOrder).toEqual(order);
+  });
+
+  /**
+   * Scenario: start from a saved profile draft that lacks the Release profile, reset the profiles to their defaults, and open the orchestration editor.
+   * The restored Release row joins the saved order, and its Move up and Move down buttons reorder it.
+   */
+  it("lets a profile restored by a reset move in the orchestration order", async () => {
+    window.localStorage.setItem("dot-agent-deck.desktop.agent-profiles.v1.fixture", JSON.stringify(DEFAULT_PROFILES.filter((profile) => profile.id !== "release")));
+    render(<ControlDeck runtime={runtime()} />);
+    fireEvent.click(screen.getByTestId("open-agent-profiles"));
+    fireEvent.click(screen.getByRole("button", { name: /Coder/ }));
+    fireEvent.click(screen.getByRole("button", { name: /Reset defaults/ }));
+    fireEvent.click(screen.getByRole("button", { name: "Close agent profiles" }));
+
+    fireEvent.click(screen.getByRole("button", { name: "Orchestrations" }));
+    const editor = await screen.findByTestId("orchestration-editor");
+    const visibleOrder = () => Array.from(editor.querySelectorAll(".orchestration-editor-row strong"), (role) => role.firstChild?.textContent?.toLowerCase());
+    expect(visibleOrder()).toEqual(["orchestrator", "coder", "reviewer", "auditor", "tester", "release"]);
+
+    fireEvent.click(within(editor).getByRole("button", { name: "Move Release up" }));
+    fireEvent.click(within(editor).getByRole("button", { name: "Move Release up" }));
+    expect(visibleOrder()).toEqual(["orchestrator", "coder", "reviewer", "release", "auditor", "tester"]);
+    fireEvent.click(within(editor).getByRole("button", { name: "Move Release down" }));
+    expect(visibleOrder()).toEqual(["orchestrator", "coder", "reviewer", "auditor", "release", "tester"]);
+    await waitFor(() => expect(JSON.parse(window.localStorage.getItem("dot-agent-deck.desktop.orchestration-preview.v1.fixture") ?? "null")).toEqual({ order: ["orchestrator", "coder", "reviewer", "auditor", "release", "tester"] }));
   });
 
   /** Scenario: the command palette describes the Projects screen with the canonical project and orchestration names. */
