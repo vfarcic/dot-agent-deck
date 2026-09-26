@@ -2816,6 +2816,24 @@ fn validate_voice_deck_step(deck_step: &[voice::VoiceDeckChoice]) -> Result<(), 
     Ok(())
 }
 
+/// The bound on the Deck selector section a webview may send with an utterance
+/// (PRD #1195), checked by [`validate_voice_endpoints`] for
+/// [`validate_voice_directories`]' reason. Each row's fields are already
+/// bounded by the settings schema's own types as they deserialize; this bounds
+/// how many there are. A selector lists a handful of decks.
+const MAX_VOICE_SELECTOR_ROWS: usize = 256;
+
+/// Refuse a Deck selector section no real selector could have rendered.
+fn validate_voice_endpoints(endpoints: &crate::settings::EndpointSettings) -> Result<(), String> {
+    if endpoints.remote.len() > MAX_VOICE_SELECTOR_ROWS {
+        return Err(
+            "the deck list sent with that command is larger than any Deck selector shows"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 /// PRD #802 M6: take one utterance to an outcome carrying the sentence to show.
 ///
 /// # What it does NOT do
@@ -2856,6 +2874,22 @@ fn validate_voice_deck_step(deck_step: &[voice::VoiceDeckChoice]) -> Result<(), 
 /// only annotates the decks read here ([`voice_decks`]), bounded by
 /// [`validate_voice_deck_step`], and never reaches the daemon either.
 ///
+/// **`endpoints` is the fifth** (PRD #1195): the `[endpoints]` section the Deck
+/// selector is rendering, which is `useDesktopSettings`' React state. That
+/// state is applied the moment the user edits it and written to disk behind
+/// it, so reading `desktop.toml` here instead would refuse "switch deck to"
+/// a deck the selector already shows (Qodo on PR #1340) — and would keep
+/// refusing it if that write failed, since the edit stays applied on screen.
+/// It crosses as the settings schema's own [`crate::settings::EndpointSettings`],
+/// so every row is held to the same field types a saved document is, and
+/// [`validate_voice_endpoints`] bounds the row count. It is trusted no further
+/// than that: it only decides which decks a spoken name can resolve to and
+/// which selector token each maps to, and the webview's
+/// `chooseDeckSelection` re-checks the token and the row's address against
+/// its current settings before writing any switch. Like the other four it is
+/// an IPC argument between this app's own webview and its own Rust half, in
+/// one binary, and never reaches the daemon.
+///
 /// # One `ListAgents` per utterance
 ///
 /// [`get_snapshot`] fetches rather than reading a cache, which is one daemon
@@ -2871,6 +2905,9 @@ fn validate_voice_deck_step(deck_step: &[voice::VoiceDeckChoice]) -> Result<(), 
 /// selected deck's, and a fleet-wide list would let a spoken name resolve to an
 /// agent on a machine the user is not looking at.
 #[tauri::command]
+// Eight, for `desktop_terminal_attach`'s reason: Tauri deserialises each wire
+// field by NAME, so each declaration piece has to be a parameter.
+#[allow(clippy::too_many_arguments)]
 async fn desktop_voice_resolve(
     webview: Webview,
     state: State<'_, DesktopState>,
@@ -2879,6 +2916,7 @@ async fn desktop_voice_resolve(
     directories: Option<voice::VoiceDirectories>,
     new_agent: Option<voice::VoiceNewAgent>,
     deck_step: Option<Vec<voice::VoiceDeckChoice>>,
+    endpoints: Option<crate::settings::EndpointSettings>,
 ) -> Result<voice::VoiceResult, String> {
     ensure_main_webview(&webview)?;
     if utterance.len() > MAX_UTTERANCE_BYTES {
@@ -2895,6 +2933,9 @@ async fn desktop_voice_resolve(
     if let Some(deck_step) = &deck_step {
         validate_voice_deck_step(deck_step)?;
     }
+    if let Some(endpoints) = &endpoints {
+        validate_voice_endpoints(endpoints)?;
+    }
     // Read per call rather than cached, for `voice_speech_settings`'s reason: a
     // user who changes the backend, the endpoint or the model uses it on the
     // next utterance instead of after a restart.
@@ -2905,14 +2946,11 @@ async fn desktop_voice_resolve(
     let resolver = voice::resolver_for(&settings.intent, Arc::new(KeychainSecretStore::new()));
     let snapshot = get_snapshot(&state.daemon).await;
     let mut decks = voice_decks(&snapshot.observed, deck_step.as_deref());
-    // PRD #1195 M3: the decks the Deck selector lists, read from the same
-    // document the selector renders — not only the ones the app observes,
+    // PRD #1195 M3: the decks the Deck selector lists, as the webview sent
+    // them — the section the selector is rendering, not `desktop.toml`, which
+    // lags it by a queued write — rather than only the ones the app observes,
     // which under a single-deck selection is the one deck already shown.
-    let selections = selector_voice_decks(
-        crate::settings::load_snapshot().settings.endpoints.as_ref(),
-        &mut decks,
-        deck_step.as_deref(),
-    );
+    let selections = selector_voice_decks(endpoints.as_ref(), &mut decks, deck_step.as_deref());
     let mut result = voice::handle_utterance_with(
         resolver.as_ref(),
         voice::table(),
@@ -2950,7 +2988,9 @@ async fn desktop_voice_resolve(
 /// matches", for every deck but the current one. The selector lists `local`
 /// and every `[[endpoints.remote]]` row (`deckChoices` in
 /// `desktop/src/lib/endpoints.ts`), so that is the list read here, from the
-/// same settings document the webview's selector renders.
+/// section the webview's selector is rendering, sent with the utterance (see
+/// [`desktop_voice_resolve`]'s `endpoints`). `None` — a webview that sent none —
+/// lists the local deck alone.
 ///
 /// # Keys and labels
 ///
@@ -4760,6 +4800,56 @@ mod tests {
         long_path.form.as_mut().expect("a form").path =
             "/".repeat(MAX_VOICE_DIRECTORY_PATH_BYTES + 1);
         assert!(validate_voice_new_agent(&long_path).is_err());
+    }
+
+    /// Scenario: the user adds a deck `new-box` in Settings → Decks and says
+    /// "switch deck to the new box" before the write reaches disk. The Deck
+    /// selector's section arrives with the utterance in the webview's own
+    /// shape, and the switch resolves against THAT list — the new row is a
+    /// deck voice can name and maps to its selector token — rather than
+    /// against `desktop.toml`, which does not have it yet (Qodo on PR #1340).
+    /// A section larger than any selector lists, or a row the settings schema
+    /// refuses, is refused at the boundary.
+    #[test]
+    fn selector_voice_decks_come_from_the_section_the_webview_sends() {
+        use crate::settings::EndpointSettings;
+
+        let sent: EndpointSettings = serde_json::from_value(serde_json::json!({
+            "remote": [{ "id": "newbox01", "host": "new-box", "port": 22, "socket": "/run/deck.sock" }],
+            "selection": "local",
+        }))
+        .expect("the webview's EndpointSettingsDto parses");
+        validate_voice_endpoints(&sent).expect("an ordinary selector section");
+
+        let mut decks = voice_decks(&[], None);
+        let selections = selector_voice_decks(Some(&sent), &mut decks, None);
+        let new_box = decks
+            .iter()
+            .find(|deck| deck.label == "new-box")
+            .expect("the unflushed deck is one voice can name");
+        assert_eq!(
+            selections
+                .get(&new_box.id)
+                .map(|selection| selection.token.as_str()),
+            Some("newbox01")
+        );
+
+        let row = |index: usize| serde_json::json!({ "id": format!("row{index:08}"), "host": "box", "port": 22 });
+        let oversized: EndpointSettings = serde_json::from_value(serde_json::json!({
+            "remote": (0..=MAX_VOICE_SELECTOR_ROWS).map(row).collect::<Vec<_>>(),
+            "selection": "local",
+        }))
+        .expect("parses; the bound is the validator's");
+        assert!(validate_voice_endpoints(&oversized).is_err());
+
+        assert!(
+            serde_json::from_value::<EndpointSettings>(serde_json::json!({
+                "remote": [{ "id": "evil01", "host": "-oProxyCommand=x", "port": 22 }],
+                "selection": "local",
+            }))
+            .is_err(),
+            "a row the settings schema refuses never reaches the resolver"
+        );
     }
 
     /// Scenario: the app shows the local deck (a single-deck selection, so it

@@ -919,8 +919,14 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
       nameNewAgent: (target: VoiceDispatchTarget) => fill((slot) => slot.nameNewAgent(target)),
       /* #1263 and #1247 — callable whenever the dialog is open, so a slot that
          has gone during the round trip means the dialog closed, not that the
-         form has no deck. */
-      chooseNewAgentDeck: (target: VoiceDispatchTarget) => newAgentVoice?.current?.chooseNewAgentDeck(target) ?? NO_DIALOG_FOR_DECK,
+         form has no deck. The slot is tested, not the call's answer: a
+         choice that WORKED answers `undefined`, and `?? NO_DIALOG_FOR_DECK`
+         on it reported every successful choice as "not open" (found on
+         PR #1340, once a refusal stopped rendering beside a success). */
+      chooseNewAgentDeck: (target: VoiceDispatchTarget) => {
+        const slot = newAgentVoice?.current;
+        return slot ? slot.chooseNewAgentDeck(target) : NO_DIALOG_FOR_DECK;
+      },
       discardNewAgent: (target: VoiceDispatchTarget) => {
         const slot = newAgentVoice?.current;
         return slot ? slot.discardNewAgent(target) : NO_DIALOG_TO_DISCARD;

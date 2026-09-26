@@ -330,11 +330,28 @@ describe("TauriDeckBridge", () => {
     const deckStep = [{ deckId: "deck-local" }, { deckId: "deck-build", reason: "No deck is listening on the configured socket." }];
     bridge.declareVoiceScreen("overview", undefined, undefined, deckStep);
     await bridge.resolveVoice("new agent on the build box");
-    expect(invoke).toHaveBeenLastCalledWith("desktop_voice_resolve", { utterance: "new agent on the build box", screen: "overview", directories: null, newAgent: null, deckStep });
+    expect(invoke).toHaveBeenLastCalledWith("desktop_voice_resolve", { utterance: "new agent on the build box", screen: "overview", directories: null, newAgent: null, deckStep, endpoints: null });
 
     bridge.declareVoiceScreen("overview");
     await bridge.resolveVoice("new agent");
-    expect(invoke).toHaveBeenLastCalledWith("desktop_voice_resolve", { utterance: "new agent", screen: "overview", directories: null, newAgent: null, deckStep: null });
+    expect(invoke).toHaveBeenLastCalledWith("desktop_voice_resolve", { utterance: "new agent", screen: "overview", directories: null, newAgent: null, deckStep: null, endpoints: null });
+  });
+
+  /**
+   * Scenario (PRD #1195): the Deck selector's section declared with an
+   * utterance travels to `desktop_voice_resolve` as `endpoints`, which is what
+   * Rust resolves "switch deck to …" against instead of reading `desktop.toml`,
+   * so a deck added and not yet written is still one voice can name.
+   */
+  it("sends the declared Deck selector section with the utterance it was declared for", async () => {
+    const { TauriDeckBridge } = await import("./bridge");
+    const bridge = new TauriDeckBridge();
+    invoke.mockResolvedValue({ outcome: { kind: "no_match", sentence: "", transcript: "" } });
+
+    const endpoints = { remote: [{ id: "newbox01", host: "new-box", port: 22 }], selection: "local" };
+    bridge.declareVoiceScreen("deck", undefined, undefined, undefined, endpoints);
+    await bridge.resolveVoice("switch deck to the new box");
+    expect(invoke).toHaveBeenLastCalledWith("desktop_voice_resolve", { utterance: "switch deck to the new box", screen: "deck", directories: null, newAgent: null, deckStep: null, endpoints });
   });
 
   /**

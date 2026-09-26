@@ -726,6 +726,9 @@ export function DeckShell({ runtime, workflowPlatformIssue, initialView = { kind
   /* Which mount of the dialog that declaration came from — never sent to Rust,
      read only to refuse an answer whose dialog has been replaced (PRD #1223). */
   const readNewAgentInstance = useCallback(() => newAgentVoice.current?.instance, []);
+  /* PRD #1195 — the Deck selector's section as it renders, not as it is on
+     disk: `save` applies an edit at once and writes it behind. */
+  const readEndpoints = useCallback(() => latestSettings.current.settings.endpoints, []);
   /* The COMPOSITE identity, never the bare id. See `deckPaneRetargeted` above
      and `DeckSurface`'s own promotion condition. */
   const openAgent = agentView ? { deckId: agentView.deckId, agentId: agentView.agentId } : undefined;
@@ -791,7 +794,7 @@ export function DeckShell({ runtime, workflowPlatformIssue, initialView = { kind
       {/* voice-registry-exempt: the rail's shortcut-sheet button — the sheet is a `ShellOverlay`, not a `DeckOverlay`, and no registry entry opens it */}
       <NavigationRail screen={screen} overlays={overlaysOpen} context={railContext} connection={runtime.snapshot.connection} features={features} onShowShortcuts={screen === "deck" ? () => setOverlay("deck", "shortcuts", true) : undefined} />
       {screenNode}
-      <VoiceControlPanel runtime={runtime} screen={view.kind} onDispatch={dispatchVoice} channel={panelVoiceContext} directories={readDirectories} newAgent={readNewAgent} newAgentInstance={readNewAgentInstance} />
+      <VoiceControlPanel runtime={runtime} screen={view.kind} onDispatch={dispatchVoice} channel={panelVoiceContext} directories={readDirectories} newAgent={readNewAgent} newAgentInstance={readNewAgentInstance} endpoints={readEndpoints} />
       <ShellSettings runtime={runtime} settings={settings} open={overlaysOpen.settings ?? false} onClose={() => setOverlay(screen, "settings", false)} />
     </>
   );
