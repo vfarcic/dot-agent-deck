@@ -194,7 +194,11 @@ export function EndpointsPanel({ settings, onSave, saveError, mode }: SettingsPa
   const saveSectionOf = (document: DesktopSettingsDto, next: EndpointSettingsDto) => {
     const write = endpointSectionToSave(document.endpoints, next);
     if (!write) return;
-    onSave({ ...document, endpoints: write });
+    // `document` is named as what this edit was made against (issue #828): for
+    // `runTest`'s write-back it is `latest.current`, which can trail the
+    // document on screen by a render, and measuring the edit against the newer
+    // one would write this snapshot's stale fields over it.
+    onSave({ ...document, endpoints: write }, document);
   };
 
   /** {@link saveSectionOf} against the document this render was given. */
