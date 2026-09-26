@@ -293,7 +293,7 @@ What the probe measures is the namespace as a process bubblewrap started sees it
 
 ### The proof: a probing build script
 
-For issue #1212 a scratch branch whose `build.rs` probes its surroundings before doing its normal work was built with `--allow-build-changes` (after the gate had refused it without the flag, naming `build.rs`). The probe only read and asked — `connect` and disconnect, `access(2)` via `test -w`, signal 0, read-only CLI calls — and wrote its findings to the one host path the build may write, its target dir. From inside the build script:
+For issue #1212 a scratch branch whose `build.rs` probes its surroundings before doing its normal work was built with `--allow-build-changes` (after the gate had refused it without the flag, naming `build.rs`), cold and then warm, and the second run passed all four tells. The probe only read and asked — `connect` and disconnect, `access(2)` via `test -w`, signal 0, read-only CLI calls — and wrote its findings to the one host path the build may write, its target dir. From inside the build script:
 
 | attempt | measured |
 | --- | --- |
@@ -302,7 +302,7 @@ For issue #1212 a scratch branch whose `build.rs` probes its surroundings before
 | reach the production deck | its sockets under `/run/user/1000` and the flat and per-uid `/tmp` candidates: absent; `/run/docker.sock`, `/var/run/docker.sock`, the system D-Bus and the session bus: absent; the nix daemon socket: the `/dev/null` cover, `ECONNREFUSED` |
 | read the operator's home | everything under the home to depth 4, not descending into the binds: six entries — `code/`, the clone, the opted-in target dir, `.rustup/`, `.rustup/toolchains/` and the sysroot; `~/.local/bin/dot-agent-deck`, `~/.claude` and the operator's own checkout: absent |
 | write the clone | `access(W_OK)` false on the clone, its `.git` and `.git/hooks`, whose mount is `ro`; true on the opted-in target dir (`rw`) and on the home, `/tmp`, `/var/tmp` and `/run` (private tmpfs); false on `/usr` and `/etc` |
-| signal the operator's processes | 17 processes visible: bubblewrap's init, Cargo, and Cargo's `rustc`, build-script and `cc` descendants, plus one with an empty command line (exiting as it was read); `kill -0 1205290`, the production daemon's host pid at the time: `No such process` |
+| signal the operator's processes | 17 processes visible on the cold build and 3 on a warm rerun: bubblewrap's init, Cargo, and Cargo's `rustc`, build-script and `cc` descendants — on the cold build also one with an empty command line, exiting as it was read; `kill -0 1205290`, the production daemon's host pid at the time: `No such process` |
 | inherit the caller's environment | the seven allowlisted variables plus Cargo's own for a build script, and nothing of the caller's |
 | read Cargo configuration | the private Cargo home held `.package-cache`, `.package-cache-mutate`, `.global-cache` and the read-only `registry`; no `config.toml` or `credentials.toml` in it or in the operator's |
 
