@@ -800,7 +800,14 @@ export type DeckAction =
   | { type: "stop_daemon"; force?: boolean }
   | { type: "restart_daemon" }
   | { type: "allow_build_mismatch" }
-  | { type: "start_workflow"; name: string; cwd: string; taskPrompt: string; roles: WorkflowLaunchRole[]; rows: number; cols: number; configRevision?: string }
+  /**
+   * The Runs screen's launch. `taskPrompt` may be empty (issue #1044): the deck
+   * then composes a coordinator context with no task section and the
+   * coordinator waits for instructions, as under the TUI's `Ctrl+n`.
+   * `displayTitle` is the run's name — absent when the form's Name is empty, so
+   * the run takes the orchestration's name, as `start_orchestration`'s does.
+   */
+  | { type: "start_workflow"; name: string; displayTitle?: string; cwd: string; taskPrompt: string; roles: WorkflowLaunchRole[]; rows: number; cols: number; configRevision?: string }
   /**
    * Start one plain agent on the deck `deckId` names (PRD #1223 M3) — the
    * wire `connection.deckId` of the target, captured once when the user picks
@@ -934,6 +941,14 @@ export interface WorkflowLaunchConfig {
    */
   displayName: string;
   displayPath: string;
+  /**
+   * The run's name (issue #1044), submitted as the daemon's run title. Absent
+   * when the form's Name is empty — the TUI's rule — so the run takes the
+   * orchestration's name. Unlike the two display twins above it DOES reach the
+   * daemon, and is kept off the text nodes the same way any title is.
+   */
+  displayTitle?: string;
+  /** May be empty: the coordinator then waits for instructions (issue #1044). */
   taskPrompt: string;
   roles: WorkflowLaunchRole[];
   rows: number;

@@ -556,8 +556,8 @@ pub enum DesktopAction {
     /// project config gives it — on the deck, which reads the config there.
     ///
     /// Not [`Self::StartWorkflow`], which is the Runs screen's launch and keeps
-    /// its own form rules (a required task, desktop profile commands, no Pi
-    /// coordinator). The two share the daemon verbs and the bridge's rollback
+    /// its own form rules (desktop profile commands, no Pi coordinator). The
+    /// two share the daemon verbs and the bridge's rollback
     /// and coordinator-delivery machinery, and none of those form rules.
     StartOrchestration {
         /// The target deck's wire id, required for [`Self::StartAgent`]'s
@@ -583,6 +583,13 @@ pub enum DesktopAction {
         /// The orchestration name, as offered by the daemon's
         /// `resolve-project` reply for `cwd`.
         name: String,
+        /// The run's title — the form's Name (issue #1044). Absent when the
+        /// Name is empty, which is the TUI's rule and
+        /// [`Self::StartOrchestration`]'s: the tab then takes the
+        /// orchestration's name. `#[serde(default)]`, so a webview built before
+        /// the field existed still launches, untitled.
+        #[serde(default)]
+        display_title: Option<String>,
         /// The daemon-**canonical** project path, exactly as
         /// `resolve-project` or `list-projects` spelled it. PRD #819 M6: the
         /// webview never derives this from its own environment and never
@@ -590,6 +597,9 @@ pub enum DesktopAction {
         /// basename and an empty orchestration name is derived from that
         /// basename (PRD #220).
         cwd: String,
+        /// The coordinator's task, which may be empty (issue #1044): the
+        /// daemon then composes the context without a task section and the
+        /// coordinator waits for the user's instructions, as under the TUI.
         task_prompt: String,
         roles: Vec<WorkflowRoleInput>,
         rows: Option<u16>,

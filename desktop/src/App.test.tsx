@@ -629,8 +629,6 @@ describe("ControlDeck", () => {
     const live = liveWithProject();
     render(<ControlDeck runtime={live} />);
     await chooseTheOnlyProject();
-    expect(screen.getByTestId("launch-live-loop")).toBeDisabled();
-    expect(screen.getByText("Add the task you want the coordinator to run.")).toBeVisible();
     fireEvent.change(screen.getByLabelText("Task prompt"), { target: { value: "Wire the launch prompt into the workflow." } });
     fireEvent.click(screen.getByTestId("launch-live-loop"));
     expect(live.runAction).not.toHaveBeenCalled();
@@ -647,6 +645,171 @@ describe("ControlDeck", () => {
       taskPrompt: "Wire the launch prompt into the workflow.",
       roles: expect.arrayContaining([expect.objectContaining({ role: "orchestrator", start: true }), expect.objectContaining({ role: "coder", start: false })]),
     })));
+  });
+
+  /**
+   * Issue #1044. Scenario: choose the project and press Launch without typing
+   * a task. The button is enabled — neither the deck nor the TUI requires a
+   * task — the sheet says the coordinator will wait, the confirmation says so
+   * too instead of promising to send a prompt, and the launch goes out with an
+   * empty task for the deck to compose around.
+   */
+  it("launches with no task, saying the coordinator will wait for one", async () => {
+    const live = liveWithProject();
+    render(<ControlDeck runtime={live} />);
+    await chooseTheOnlyProject();
+
+    expect(screen.getByTestId("workflow-no-task")).toHaveTextContent("type the task into its pane");
+    expect(screen.getByTestId("launch-live-loop")).toBeEnabled();
+    fireEvent.click(screen.getByTestId("launch-live-loop"));
+    const dialog = screen.getByRole("alertdialog");
+    expect(dialog).toHaveTextContent("briefs the coordinator with no task, so it waits for you to type one into its pane");
+    expect(dialog).not.toHaveTextContent("sends your task prompt");
+    fireEvent.click(screen.getAllByRole("button", { name: "Launch live loop" }).at(-1)!);
+
+    await waitFor(() => {
+      const launch = vi.mocked(live.runAction).mock.calls[0]?.[0];
+      if (launch?.type !== "start_workflow") throw new Error("expected workflow launch");
+      expect(launch.taskPrompt).toBe("");
+    });
+  });
+
+  /**
+   * Issue #1044. Scenario: the selected deck already runs this project's
+   * workflow as `deck-orchestrator-1`, in another directory. Opening the sheet
+   * suggests `deck-orchestrator-2` in Run name — the TUI's
+   * `<basename>-orchestrator-N` past the live titles — and the confirmation
+   * names it; the launch sends it as the run's title. Typing a different name
+   * sends that one, and a Name emptied by the user sends no title at all, so
+   * the run takes the workflow's own name as a TUI run with an empty Name does.
+   */
+  it("suggests a run name past the deck's live orchestrations and sends what the user leaves there", async () => {
+    const running = { ...agentIn("running", "/srv/other"), tab: { kind: "orchestration" as const, orchestrationId: "o-1", name: "dot-agent-deck", displayTitle: "deck-orchestrator-1", roleName: "orchestrator", roleIndex: 0, isStartRole: true, cwd: "/srv/other" } };
+    const launched = async (live: DeckRuntimeState, index: number) => {
+      fireEvent.click(screen.getByTestId("launch-live-loop"));
+      fireEvent.click(screen.getAllByRole("button", { name: "Launch live loop" }).at(-1)!);
+      let launch: import("./types").DeckAction | undefined;
+      await waitFor(() => {
+        launch = vi.mocked(live.runAction).mock.calls.filter(([action]) => action.type === "start_workflow")[index]?.[0];
+        expect(launch).toBeDefined();
+      });
+      if (launch?.type !== "start_workflow") throw new Error("expected workflow launch");
+      return launch;
+    };
+
+    const live = liveWithProject({ snapshot: liveSnapshot([running]) });
+    const { unmount } = render(<ControlDeck runtime={live} />);
+    await chooseTheOnlyProject();
+    expect(screen.getByLabelText("Run name")).toHaveValue("deck-orchestrator-2");
+    expect(screen.queryByTestId("workflow-same-directory")).toBeNull();
+    fireEvent.click(screen.getByTestId("launch-live-loop"));
+    expect(screen.getByRole("alertdialog")).toHaveTextContent("The run is named deck-orchestrator-2.");
+    fireEvent.click(screen.getAllByRole("button", { name: "Cancel" }).at(-1)!);
+    expect((await launched(live, 0)).displayTitle).toBe("deck-orchestrator-2");
+    unmount();
+
+    const typed = liveWithProject({ snapshot: liveSnapshot([running]) });
+    const second = render(<ControlDeck runtime={typed} />);
+    await chooseTheOnlyProject();
+    fireEvent.change(screen.getByLabelText("Run name"), { target: { value: "release-review" } });
+    expect((await launched(typed, 0)).displayTitle).toBe("release-review");
+    second.unmount();
+
+    const cleared = liveWithProject({ snapshot: liveSnapshot([running]) });
+    render(<ControlDeck runtime={cleared} />);
+    await chooseTheOnlyProject();
+    fireEvent.change(screen.getByLabelText("Run name"), { target: { value: "" } });
+    expect(screen.getByLabelText("Run name")).toHaveAttribute("placeholder", "dot-agent-deck");
+    expect(await launched(cleared, 0)).not.toHaveProperty("displayTitle");
+  });
+
+  /**
+   * PR #1333 review. Scenario: type a Run name, close the Workflows sheet and
+   * open it again. The sheet is a fresh launch, as a TUI `Ctrl+n` form is, so
+   * the typed name is gone and the suggestion is back — otherwise a name typed
+   * for one launch comes back as a collision with the run it named.
+   */
+  it("offers a fresh suggestion each time the sheet opens, not the last typed name", async () => {
+    const live = liveWithProject();
+    render(<ControlDeck runtime={live} />);
+    await chooseTheOnlyProject();
+    expect(screen.getByLabelText("Run name")).toHaveValue("deck-orchestrator-1");
+    fireEvent.change(screen.getByLabelText("Run name"), { target: { value: "my-run" } });
+    fireEvent.click(screen.getByRole("button", { name: "Close workflow editor" }));
+    fireEvent.click(screen.getByRole("button", { name: "Workflows" }));
+    expect(screen.getByLabelText("Run name")).toHaveValue("deck-orchestrator-1");
+  });
+
+  /**
+   * PR #1333 review. Scenario: type a Run name the desktop crate would refuse
+   * — a terminal escape, or more than 128 bytes. The sheet says why and keeps
+   * Launch disabled, instead of offering a confirmation for a launch the crate
+   * then refuses; a usable name brings Launch back.
+   */
+  it("refuses an unusable run name in the sheet, before any confirmation", async () => {
+    const live = liveWithProject();
+    render(<ControlDeck runtime={live} />);
+    await chooseTheOnlyProject();
+    for (const bad of ["run\u001b[2J", "x".repeat(129)]) {
+      fireEvent.change(screen.getByLabelText("Run name"), { target: { value: bad } });
+      expect(screen.getByTestId("workflow-run-name-unusable")).toHaveTextContent("at most 128 bytes and contain no control or text-direction characters");
+      expect(screen.getByTestId("launch-live-loop")).toBeDisabled();
+    }
+    fireEvent.change(screen.getByLabelText("Run name"), { target: { value: "fine" } });
+    expect(screen.queryByTestId("workflow-run-name-unusable")).toBeNull();
+    expect(screen.getByTestId("launch-live-loop")).toBeEnabled();
+  });
+
+  /**
+   * PR #1333 review. Scenario: press Launch with the suggested name, and while
+   * the confirmation is open another orchestration on the deck takes that very
+   * title. Confirming re-checks against the titles live NOW: nothing is sent,
+   * and the notice gives the collision refusal.
+   */
+  it("re-checks the run name for a collision when the launch is confirmed", async () => {
+    const live = liveWithProject();
+    const { rerender } = render(<ControlDeck runtime={live} />);
+    await chooseTheOnlyProject();
+    expect(screen.getByLabelText("Run name")).toHaveValue("deck-orchestrator-1");
+    fireEvent.click(screen.getByTestId("launch-live-loop"));
+    expect(screen.getByRole("alertdialog")).toBeVisible();
+
+    const rival = { ...agentIn("rival", "/srv/elsewhere"), tab: { kind: "orchestration" as const, orchestrationId: "o-rival", name: "dot-agent-deck", displayTitle: "deck-orchestrator-1", roleName: "orchestrator", roleIndex: 0, isStartRole: true, cwd: "/srv/elsewhere" } };
+    const snapshot = { ...live.snapshot, agents: [...live.snapshot.agents, rival] };
+    rerender(<ControlDeck runtime={{ ...live, snapshot, fleet: [snapshot] }} />);
+    fireEvent.click(screen.getAllByRole("button", { name: "Launch live loop" }).at(-1)!);
+
+    await waitFor(() => expect(screen.getByTestId("toast")).toHaveTextContent("Nothing was started: This name is already in use by a live orchestration on this deck."));
+    expect(vi.mocked(live.runAction).mock.calls.some(([action]) => action.type === "start_workflow")).toBe(false);
+  });
+
+  /**
+   * Issue #1044. Scenario: the selected deck already runs an orchestration
+   * titled `busy` in this very project directory. The sheet warns that the
+   * two would share the directory and still lets Launch through — the TUI's
+   * same-directory warning never blocks. Typing `busy` as the Run name
+   * replaces the warning with the TUI's collision refusal and disables Launch;
+   * clearing the name makes the run's title the workflow's name, which is not
+   * taken, so Launch comes back.
+   */
+  it("warns about a shared directory without blocking, and refuses a run name a live orchestration holds", async () => {
+    const busy = { ...agentIn("busy", "/home/dev/code/deck"), tab: { kind: "orchestration" as const, orchestrationId: "o-busy", name: "other-workflow", displayTitle: "busy", roleName: "orchestrator", roleIndex: 0, isStartRole: true, cwd: "/home/dev/code/deck" } };
+    const live = liveWithProject({ snapshot: liveSnapshot([busy]) });
+    render(<ControlDeck runtime={live} />);
+    await chooseTheOnlyProject();
+
+    expect(screen.getByTestId("workflow-same-directory")).toHaveTextContent("This directory already runs an orchestration on this deck.");
+    expect(screen.getByTestId("launch-live-loop")).toBeEnabled();
+
+    fireEvent.change(screen.getByLabelText("Run name"), { target: { value: "busy" } });
+    expect(screen.getByTestId("workflow-title-taken")).toHaveTextContent("This name is already in use by a live orchestration on this deck.");
+    expect(screen.queryByTestId("workflow-same-directory")).toBeNull();
+    expect(screen.getByTestId("launch-live-loop")).toBeDisabled();
+
+    fireEvent.change(screen.getByLabelText("Run name"), { target: { value: "" } });
+    expect(screen.queryByTestId("workflow-title-taken")).toBeNull();
+    expect(screen.getByTestId("launch-live-loop")).toBeEnabled();
+    expect(live.runAction).not.toHaveBeenCalled();
   });
 
   /**
