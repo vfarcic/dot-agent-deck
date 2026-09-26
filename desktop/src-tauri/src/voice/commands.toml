@@ -843,6 +843,12 @@ heard_as    = ["name", "call"]
 # (`docs/develop/voice-first-design.md`, section 6), and what it reaches is
 # another deck on screen, visibly, with the typed fields kept.
 #
+# **The grounding word is not a deck name.** "daemon" is also a word of the
+# local deck's label, "Local daemon", so `resolve_deck_ref` drops "daemon",
+# "deck" and articles from the reference before matching: a bare "daemon" —
+# the field's heading said alone, or all the model kept of "daemon build box" —
+# names no daemon and is asked about, never resolved to the local one.
+#
 # The report names the deck by the label the screen shows, which is what makes
 # a guess audible.
 [[commands]]

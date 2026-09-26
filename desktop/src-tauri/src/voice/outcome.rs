@@ -634,6 +634,16 @@ pub async fn handle_utterance_with(
             .get(&spec.name)
             .map(|value| value.trim())
             .filter(|value| !value.is_empty())
+            // A REQUIRED deck made only of category words — "daemon", the
+            // dialog's field heading, or "the deck" — names no deck, so it is
+            // asked for exactly as an absent one is (issue #1045). An optional
+            // one goes on to the resolver, which matches nothing for it, so
+            // the report says the daemon was not caught.
+            .filter(|value| {
+                spec.optional
+                    || spec.kind != ParamKind::DeckRef
+                    || !deck_reference(value).is_empty()
+            })
         else {
             // An optional param the model left out is simply not dispatched
             // (PRD #1223's "new agent" with no deck named), and says nothing:
@@ -1778,8 +1788,16 @@ pub enum DeckRefMatch {
 ///
 /// **The label is what a sentence says, never the id.** The id is a
 /// `deck-<16 hex>` hash minted for keying, so it is neither sayable nor shown.
+///
+/// **The category words are not part of the reference** ([`DECK_CATEGORY_WORDS`],
+/// issue #1045). "daemon" is the New agent dialog's field heading and a word
+/// of the local label, "Local daemon", so under the word-subset pass a bare
+/// "daemon" — or "daemon build box" where the model kept only "daemon" —
+/// reached the local deck, although the user named no deck. They are dropped
+/// before either pass, so whatever resolves is distinguished by a word that is
+/// not one of them, and a reference made only of them matches nothing.
 pub fn resolve_deck_ref(spoken: &str, decks: &[VoiceDeck]) -> DeckRefMatch {
-    let reference = normalize(spoken);
+    let reference = deck_reference(spoken);
     if reference.is_empty() {
         return DeckRefMatch::None;
     }
@@ -2224,6 +2242,20 @@ fn choice_subset(reference_words: &BTreeSet<String>, name: &str) -> bool {
             && reference_words
                 .difference(&name_words)
                 .all(|word| CHOICE_FILLER.contains(&word.as_str())))
+}
+
+/// The words that say a reference IS to a deck without saying which one: the
+/// field's name, before and since issue #1045, and the articles around it.
+const DECK_CATEGORY_WORDS: [&str; 7] = ["daemon", "daemons", "deck", "decks", "the", "a", "an"];
+
+/// `spoken`, normalised, less [`DECK_CATEGORY_WORDS`] — empty for a reference
+/// that names no deck.
+fn deck_reference(spoken: &str) -> String {
+    normalize(spoken)
+        .split(' ')
+        .filter(|word| !word.is_empty() && !DECK_CATEGORY_WORDS.contains(word))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Every name this deck answers to. See [`resolve_deck_ref`] for the rule.
@@ -6782,6 +6814,160 @@ mod tests {
         assert!(
             matches!(&bare, VoiceOutcome::ParamMissing { .. }),
             "{bare:?}"
+        );
+    }
+
+    /// The fleet as the dialog labels it since issue #1045: the local deck is
+    /// "Local daemon", so the field's heading is one of its label's words.
+    fn daemon_labelled_decks() -> Vec<VoiceDeck> {
+        vec![
+            deck("deck-local", "Local daemon", true),
+            deck("deck-build", "deploy@build-box.example.com:2222", false),
+            deck("deck-build-two", "ci@build-farm", false),
+        ]
+    }
+
+    #[test]
+    fn voice_outcome_deck_ref_needs_more_than_a_category_word() {
+        let fleet = daemon_labelled_decks();
+        for said in [
+            "daemon",
+            "Daemon",
+            "the daemon",
+            "deck",
+            "the deck",
+            "daemons",
+            "a deck",
+        ] {
+            assert_eq!(resolve_deck_ref(said, &fleet), DeckRefMatch::None, "{said}");
+        }
+        for said in ["local daemon", "Local daemon", "the local deck", "local"] {
+            assert_eq!(
+                resolve_deck_ref(said, &fleet),
+                DeckRefMatch::One {
+                    id: "deck-local".to_string(),
+                    label: "Local daemon".to_string(),
+                },
+                "{said}"
+            );
+        }
+        assert_eq!(
+            resolve_deck_ref("daemon build box", &fleet),
+            DeckRefMatch::One {
+                id: "deck-build".to_string(),
+                label: "deploy@build-box.example.com:2222".to_string(),
+            }
+        );
+        // "daemon" is no evidence for any deck, so "daemon build" is the
+        // two build hosts, not the local daemon.
+        assert_eq!(
+            resolve_deck_ref("daemon build", &fleet),
+            DeckRefMatch::Ambiguous(vec![
+                "deploy@build-box.example.com:2222".to_string(),
+                "ci@build-farm".to_string(),
+            ])
+        );
+    }
+
+    /// Scenario: the New agent dialog is open on the build box, and the user
+    /// says "daemon" — the field's heading — or "deck" or "the daemon", and the
+    /// model hands `choose_deck` that same word. It names no daemon, so the
+    /// form is not switched to the local one: the user is asked which daemon.
+    /// "daemon build box" switches to the build box when the model keeps
+    /// "build box", and is asked about when it keeps only "daemon"; "local
+    /// daemon" still switches to the local one.
+    #[tokio::test]
+    async fn voice_outcome_a_bare_daemon_word_chooses_no_deck() {
+        let mut dialog = new_agent_form();
+        if let Some(form) = dialog.form.as_mut() {
+            form.deck_id = "deck-build".to_string();
+        }
+        let fleet_decks = daemon_labelled_decks();
+        let ask = |said: &'static str, spoken: &'static str| {
+            let fleet_decks = fleet_decks.clone();
+            let dialog = dialog.clone();
+            async move {
+                let resolver = StubResolver::new().answering(
+                    said,
+                    IntentAnswer::new("choose_deck").with_param("deck", spoken),
+                );
+                handle_utterance(
+                    &resolver,
+                    table(),
+                    Screen::Overview,
+                    &fleet(),
+                    &fleet_decks,
+                    None,
+                    Some(&dialog),
+                    Transcript::new(said),
+                )
+                .await
+                .outcome
+            }
+        };
+        for (said, spoken) in [
+            ("daemon", "daemon"),
+            ("Daemon", "Daemon"),
+            ("deck", "deck"),
+            ("the daemon", "the daemon"),
+            ("daemon build box", "daemon"),
+        ] {
+            let outcome = ask(said, spoken).await;
+            assert!(
+                matches!(&outcome, VoiceOutcome::ParamMissing { action, param, sentence, .. }
+                    if action == "choose_deck"
+                        && param == "deck"
+                        && sentence.contains("which daemon")),
+                "{said} / {spoken}: {outcome:?}"
+            );
+        }
+        for (said, spoken, id) in [
+            ("daemon build box", "build box", "deck-build"),
+            ("local daemon", "local daemon", "deck-local"),
+            ("use the local daemon", "Local daemon", "deck-local"),
+        ] {
+            let outcome = ask(said, spoken).await;
+            assert!(
+                matches!(&outcome, VoiceOutcome::Dispatch { invoke, params, .. }
+                    if invoke == "chooseNewAgentDeck" && params[0].value == id),
+                "{said} / {spoken}: {outcome:?}"
+            );
+        }
+    }
+
+    /// Scenario: with the dialog closed and several daemons that can take an
+    /// agent, the user says "new agent on the daemon" and the model supplies
+    /// `deck = "daemon"`. The dialog opens with nothing preselected — not the
+    /// local daemon — and the report says which daemon was not caught.
+    #[tokio::test]
+    async fn voice_outcome_new_agent_on_a_bare_daemon_preselects_none() {
+        let said = "new agent on the daemon";
+        let resolver = StubResolver::new().answering(
+            said,
+            IntentAnswer::new("open_new_agent").with_param("deck", "daemon"),
+        );
+        let outcome = handle_utterance(
+            &resolver,
+            table(),
+            Screen::Overview,
+            &fleet(),
+            &daemon_labelled_decks(),
+            None,
+            None,
+            Transcript::new(said),
+        )
+        .await
+        .outcome;
+        let VoiceOutcome::Dispatch {
+            params, sentence, ..
+        } = &outcome
+        else {
+            panic!("expected a dispatch, got {outcome:?}");
+        };
+        assert!(params.is_empty(), "{params:?}");
+        assert_eq!(
+            sentence,
+            &format!("Opening the New agent dialog. {NOT_CAUGHT_DECK}")
         );
     }
 

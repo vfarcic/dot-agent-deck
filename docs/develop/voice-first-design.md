@@ -25,7 +25,7 @@ A command row's param has a `kind`, and the kind decides what a spoken value is 
 | kind | resolves against | owner of that state |
 | --- | --- | --- |
 | `agent_ref` | the selected deck's live agents, by display name, role, CLI name or id | the daemon snapshot, read Rust-side |
-| `deck_ref` | every observed deck, by label, host, the host's first component, or "local" | the fleet the desktop observes, read Rust-side |
+| `deck_ref` | every observed deck, by label, host, the host's first component, or "local" — never by the category words "daemon" or "deck" (or an article) alone: those are dropped before matching, so a bare "daemon", the dialog's field heading, names no daemon and `choose_deck` asks which one rather than resolving it to "Local daemon" (issue #1045) | the fleet the desktop observes, read Rust-side |
 | `dir_ref` | the directory browser's children **on screen**, after the filter | the dialog, declared by the webview per utterance |
 | `mode_ref` | the Mode chips the form **offers** on this deck and directory | the dialog, declared per utterance |
 | `agent_type_ref` | the agent entries as shown | the dialog, declared per utterance |
