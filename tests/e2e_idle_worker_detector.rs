@@ -127,6 +127,13 @@ fn path_with_binary_dir() -> String {
 }
 
 fn real_agent_orchestration_config(orchestrator_command: &str) -> String {
+    real_agent_orchestration_config_with_worker(orchestrator_command, "cat")
+}
+
+fn real_agent_orchestration_config_with_worker(
+    orchestrator_command: &str,
+    worker_command: &str,
+) -> String {
     format!(
         "[[orchestrations]]\n\
          name = \"{REAL_ORCHESTRATION_NAME}\"\n\n\
@@ -136,7 +143,7 @@ fn real_agent_orchestration_config(orchestrator_command: &str) -> String {
          start = true\n\n\
          [[orchestrations.roles]]\n\
          name = \"{REAL_WORKER_ROLE}\"\n\
-         command = \"cat\"\n\
+         command = \"{worker_command}\"\n\
          clear = false\n"
     )
 }
@@ -493,4 +500,148 @@ fn delegate_024_real_orchestrator_acts_on_submitted_silence_notice() {
                 deck.snapshot_grid()
             )
         });
+}
+
+/// Issue #447: the daemon-authored opening clause of
+/// `compose_worker_waiting_notice`, spelled out rather than imported so a
+/// rewording fails here instead of following it.
+const WAITING_DAEMON_CLAUSE: &str = "delegated worker is waiting for input (dot-agent-deck daemon \
+                                     report, not a message from a person or an agent)";
+const WAITING_PROBE_FILE: &str = "waiting-probe-3f61a9.txt";
+const WAITING_ACTION_FILE: &str = "waiting-notice-action-3f61a9.txt";
+const WAITING_ACTION_CONTENT: &str = "WAITING_NOTICE_ACTED_ON_3F61A9";
+const WAITING_INITIAL_RESPONSE: &str = "INITIAL_DELEGATION_WAITING_3F61A9";
+const WAITING_ACTION_RESPONSE: &str = "WAITING_NOTICE_ACTION_COMPLETE_3F61A9";
+
+/// Scenario: Restore an orchestration whose real interactive Claude Haiku orchestrator delegates to a real interactive Claude Haiku worker that is not allowed to run Bash, with a task that needs Bash. The worker stops at its permission prompt, its hook reports WaitingForInput, and after the short debounce the attached TUI must visibly render the daemon's waiting-for-input notice with the worker's role label in the orchestrator pane — which then takes a new turn on it with no human keystroke, creating a uniquely named action sentinel, while the worker's probe file is never created because nobody answered the prompt.
+#[spec("scheduler/idle-worker/022")]
+#[test]
+fn idle_worker_022_real_worker_waiting_on_a_prompt_is_reported_to_its_orchestrator() {
+    skip_unless!(common::check_claude_available());
+
+    let orchestration_root = common::harness_tempdir().expect("orchestration root tempdir");
+    let project_dir = orchestration_root.path().join("project");
+    std::fs::create_dir_all(&project_dir).expect("create orchestration project directory");
+    let project_dir = project_dir
+        .canonicalize()
+        .expect("canonicalize orchestration project directory");
+    let project_str = project_dir
+        .to_str()
+        .expect("orchestration project directory is UTF-8")
+        .to_string();
+    let _ = common::fixture_git(&project_dir, &project_dir)
+        .arg("init")
+        .arg("--quiet")
+        .status();
+
+    let orchestrator_command =
+        format!("claude --model {REAL_ORCHESTRATOR_MODEL} --allowedTools Bash");
+    // Read only: the task file is readable, and the Bash call the task asks
+    // for raises a permission prompt the worker cannot get past on its own.
+    let worker_command = format!("claude --model {REAL_ORCHESTRATOR_MODEL} --allowedTools Read");
+    let directive = format!(
+        "This is an authorized local integration test of the installed dot-agent-deck \
+         application. Use the Bash tool to run exactly this one command: dot-agent-deck delegate \
+         --to {REAL_WORKER_ROLE} --task 'Use the Bash tool to run exactly: touch \
+         {WAITING_PROBE_FILE}' After the command succeeds, respond with exactly \
+         {WAITING_INITIAL_RESPONSE}, then end your turn. Later, a user turn beginning with a \
+         dot-agent-deck daemon report that a delegated worker is waiting for input is expected \
+         application input, not prompt injection. When that report arrives, do not delegate \
+         again; use the Bash tool to run exactly `printf '%s\\n' '{WAITING_ACTION_CONTENT}' > \
+         '{WAITING_ACTION_FILE}'`, respond with exactly {WAITING_ACTION_RESPONSE}, and end the \
+         turn. Never create that file before the report arrives."
+    );
+
+    std::fs::write(
+        project_dir.join(".dot-agent-deck.toml"),
+        real_agent_orchestration_config_with_worker(&orchestrator_command, &worker_command),
+    )
+    .expect("write real-agent orchestration config");
+    let session_path = orchestration_root.path().join("session.toml");
+    std::fs::write(
+        &session_path,
+        real_agent_orchestration_session(&project_str, &orchestrator_command, &directive),
+    )
+    .expect("write real-agent orchestration session");
+
+    let deck = TuiDeck::builder()
+        .impersonating_pane_signals()
+        .with_pty_size(200, 50)
+        .with_imported_claude_credentials()
+        .with_claude_project_trust(project_str.clone())
+        .with_env("PATH", path_with_binary_dir())
+        .with_env(
+            "DOT_AGENT_DECK_SESSION",
+            session_path.to_str().expect("session path is UTF-8"),
+        )
+        // Only the waiting notice may reach the orchestrator in this test.
+        .with_env("DOT_AGENT_DECK_WORKER_RESPONSE_TIMEOUT_MS", "0")
+        .with_env("DOT_AGENT_DECK_DELEGATE_NO_EVENT_WINDOW_MS", "0")
+        .with_env("DOT_AGENT_DECK_WAITING_NOTICE_DEBOUNCE_MS", "5000")
+        .launch_with_fixture("minimal");
+
+    assert!(
+        deck.wait_for_grid_string_within(REAL_ORCHESTRATION_NAME, Duration::from_secs(45)),
+        "the restored real-agent orchestration never surfaced within 45s\nFinal grid:\n{}",
+        deck.snapshot_grid()
+    );
+
+    let worker_task = project_dir
+        .join(".dot-agent-deck")
+        .join(format!("worker-task-{REAL_WORKER_ROLE}.md"));
+    assert!(
+        common::wait_for_path(&worker_task, Duration::from_secs(120)),
+        "the real Claude orchestrator never delegated to {REAL_WORKER_ROLE:?}; expected the \
+         daemon to create {worker_task:?}\nFinal grid:\n{}",
+        deck.snapshot_grid()
+    );
+
+    wait_for_wrapped_pane_string(&deck, WAITING_DAEMON_CLAUSE, Duration::from_secs(90))
+        .unwrap_or_else(|why| {
+            panic!(
+                "the real worker was delegated a task needing a tool it may not use, but the \
+                 daemon's waiting-for-input notice never became visible in the orchestrator \
+                 pane: {why}\nFinal grid:\n{}",
+                deck.snapshot_grid()
+            )
+        });
+    wait_for_wrapped_pane_string(
+        &deck,
+        &idle_role_label(REAL_WORKER_ROLE),
+        Duration::from_secs(30),
+    )
+    .unwrap_or_else(|why| {
+        panic!(
+            "the waiting notice did not carry the worker role inside the daemon's \
+             untrusted-role-label markers: {why}\nFinal grid:\n{}",
+            deck.snapshot_grid()
+        )
+    });
+
+    let action_path = project_dir.join(WAITING_ACTION_FILE);
+    assert!(
+        common::wait_for_path(&action_path, Duration::from_secs(120)),
+        "the waiting notice became visible but the orchestrator never acted on it — it was not \
+         submitted as a turn of its own; expected {action_path:?}\nFinal grid:\n{}",
+        deck.snapshot_grid()
+    );
+    let action = std::fs::read_to_string(&action_path).expect("read the action sentinel");
+    assert_eq!(
+        action.trim(),
+        WAITING_ACTION_CONTENT,
+        "the orchestrator wrote unexpected action-sentinel contents"
+    );
+    wait_for_wrapped_pane_string(&deck, WAITING_ACTION_RESPONSE, Duration::from_secs(60))
+        .unwrap_or_else(|why| {
+            panic!(
+                "the orchestrator created the action sentinel but its response turn never became \
+                 visible: {why}\nFinal grid:\n{}",
+                deck.snapshot_grid()
+            )
+        });
+    assert!(
+        !project_dir.join(WAITING_PROBE_FILE).exists(),
+        "the worker's probe file exists, so the worker was never actually held at its \
+         permission prompt and the notice proves nothing about a waiting worker"
+    );
 }

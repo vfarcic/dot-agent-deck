@@ -135,7 +135,7 @@ The orchestrator delegates a task to one or more workers. The deck delivers the 
 
 ![Coder pane active and working after receiving a delegation from the orchestrator](./img/orchestration-coder.png)
 
-A worker that never signals completion would otherwise stall the pipeline silently, since the orchestrator is parked waiting for it and gets no turn in which to notice. The daemon covers that case on a timeout — see [Idle Workers & Notifications](idle-workers-and-notifications.md), which also shows how to turn the moments a run stops and waits for you into messages that reach you away from the terminal.
+A worker that never signals completion would otherwise stall the pipeline silently, since the orchestrator is parked waiting for it and gets no turn in which to notice. The daemon covers that case on a timeout, and reports sooner a worker whose own hook says it has stopped to wait for input (for Claude Code, a permission prompt), so the orchestrator can act on it instead of waiting out the timeout — see [Idle Workers & Notifications](idle-workers-and-notifications.md), which also shows how to turn the moments a run stops and waits for you into messages that reach you away from the terminal.
 
 ### One task per worker at a time
 

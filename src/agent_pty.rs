@@ -3761,6 +3761,67 @@ struct DelegationTracker {
     /// marks. Lets an in-flight wait (the M1 readiness gate) abandon promptly
     /// instead of sleeping out its remainder against a target that is gone.
     close_waiters: HashMap<String, Vec<oneshot::Sender<()>>>,
+    /// Issue #447: the pending waiting-for-input notices, keyed by the
+    /// *worker's* `pane_id_env`; at most one per worker pane — one per waiting
+    /// episode, armed when the worker's hook moves it INTO `WaitingForInput`
+    /// and dropped (cancelling its task) when it leaves, when the notice is
+    /// settled, or when the pane closes. See [`WaitingNoticeRecord`].
+    waiting_notices: HashMap<String, WaitingNoticeRecord>,
+    /// Issue #447: when each worker pane last had a waiting-for-input notice
+    /// SUBMITTED to its orchestrator, so the next one waits out
+    /// [`AgentPtyRegistry::arm_waiting_notice`]'s cooldown. Removed on pane
+    /// close, so it is bounded by the panes alive.
+    waiting_notice_sent_at: HashMap<String, Instant>,
+}
+
+/// Issue #447: one worker pane's pending "this delegated worker is waiting for
+/// input" notice — the debounce between a worker's hook reporting
+/// `WaitingForInput` and the daemon telling the orchestrator that delegated to
+/// it.
+///
+/// It carries no orchestrator identity on purpose. Where the notice may go is
+/// decided when it fires, from the commission ledger
+/// ([`AgentPtyRegistry::commission_owed_to`]) — the record of what the
+/// orchestrator actually delegated — never from the hook event that armed it.
+/// A hook-reported status is not an input the daemon may authorize on (#601,
+/// #696): this record decides only WHEN to look, and the notice it leads to is
+/// information that grants, retires and reroutes nothing.
+struct WaitingNoticeRecord {
+    /// Generation — see [`AgentPtyRegistry::delegation_seq`], whose counter is
+    /// shared. Proof of ownership for [`AgentPtyRegistry::settle_waiting_notice`]
+    /// and [`AgentPtyRegistry::waiting_notice_is_current`], so a stale task can
+    /// never act on a newer episode.
+    seq: u64,
+    /// The registry agent id whose hook reported the wait. An episode belongs
+    /// to one generation of the pane: a different agent reporting a wait
+    /// replaces the record rather than riding its clock.
+    worker_agent_id: String,
+    /// The live end of the task's cancellation channel. Never sent on: the task
+    /// selects on it and exits as soon as this record leaves the map.
+    _cancel: oneshot::Sender<()>,
+}
+
+/// Issue #447: handed back by [`AgentPtyRegistry::arm_waiting_notice`] to the
+/// caller that spawns the notice's task.
+#[derive(Debug)]
+pub struct ArmedWaitingNotice {
+    pub seq: u64,
+    pub cancel: oneshot::Receiver<()>,
+    /// The earliest moment the notice may be sent, when that is later than the
+    /// debounce alone would allow — the previous notice for this pane plus the
+    /// cooldown. `None` when this pane has never been reported.
+    pub not_before: Option<Instant>,
+}
+
+/// Issue #447: who a worker pane's outstanding commission is owed to — see
+/// [`AgentPtyRegistry::commission_owed_to`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommissionOwner {
+    /// The orchestrator pane that armed the newest outstanding commission.
+    pub orchestrator_pane_id: String,
+    /// That orchestrator's registry agent id, when it was known at delegate
+    /// time. `None` leaves nothing to bind a delivery to.
+    pub orchestrator_agent_id: Option<String>,
 }
 
 /// PRD #249 M3 review (finding B4/S4): one armed silent-worker watch — the
@@ -5098,6 +5159,124 @@ impl AgentPtyRegistry {
         );
     }
 
+    /// Issue #447: who `worker_pane_id`'s outstanding commission is owed to, or
+    /// `None` when it owes nothing — the only question the waiting-for-input
+    /// notice asks of the ledger, and the only place it learns where it may go.
+    ///
+    /// Read, never spent: the notice changes no delegation. Expired commissions
+    /// ([`DELEGATION_COMMISSION_TTL`]) are dropped first, like every other
+    /// ledger read. The orchestrator fields are last-delegate-wins, exactly as
+    /// the busy check reads them.
+    pub fn commission_owed_to(&self, worker_pane_id: &str) -> Option<CommissionOwner> {
+        let mut tracker = self.delegations.lock().unwrap();
+        Self::expire_commissions(&mut tracker, worker_pane_id, Instant::now());
+        tracker
+            .commissions
+            .get(worker_pane_id)
+            .filter(|entry| entry.outstanding() > 0)
+            .map(|entry| CommissionOwner {
+                orchestrator_pane_id: entry.orchestrator_pane_id.clone(),
+                orchestrator_agent_id: entry.orchestrator_agent_id.clone(),
+            })
+    }
+
+    /// Issue #447: open a waiting episode for `worker_pane_id` — its hook has
+    /// just moved it into `WaitingForInput` — and hand back what the notice's
+    /// task needs: the generation, the cancellation channel, and the cooldown
+    /// floor.
+    ///
+    /// `None` — nothing armed, no task to spawn — when the pane is mid-close
+    /// (the arm-after-cancel guard every other arm here has), or when an episode
+    /// for the same agent is already open: a repeated `WaitingForInput` report
+    /// keeps the first one's clock rather than restarting it, which is what
+    /// stops a worker re-reporting the state from postponing its notice for
+    /// ever. An open episode for a DIFFERENT agent is replaced.
+    ///
+    /// `cooldown` bounds the rate per worker pane: the returned `not_before` is
+    /// the previous submitted notice plus `cooldown`. It delays a notice; it
+    /// never drops one.
+    pub fn arm_waiting_notice(
+        &self,
+        worker_pane_id: &str,
+        worker_agent_id: &str,
+        cooldown: Duration,
+    ) -> Option<ArmedWaitingNotice> {
+        let mut tracker = self.delegations.lock().unwrap();
+        if tracker.closing_panes.contains(worker_pane_id) {
+            return None;
+        }
+        if tracker
+            .waiting_notices
+            .get(worker_pane_id)
+            .is_some_and(|open| open.worker_agent_id == worker_agent_id)
+        {
+            return None;
+        }
+        let seq = self.delegation_seq.fetch_add(1, Ordering::SeqCst);
+        let (cancel_tx, cancel_rx) = oneshot::channel();
+        tracker.waiting_notices.insert(
+            worker_pane_id.to_string(),
+            WaitingNoticeRecord {
+                seq,
+                worker_agent_id: worker_agent_id.to_string(),
+                _cancel: cancel_tx,
+            },
+        );
+        let not_before = tracker
+            .waiting_notice_sent_at
+            .get(worker_pane_id)
+            .map(|sent| *sent + cooldown);
+        Some(ArmedWaitingNotice {
+            seq,
+            cancel: cancel_rx,
+            not_before,
+        })
+    }
+
+    /// Issue #447: close `worker_pane_id`'s waiting episode, if one is open —
+    /// the worker left `WaitingForInput`. Dropping the record cancels its task.
+    pub fn cancel_waiting_notice(&self, worker_pane_id: &str) -> bool {
+        self.delegations
+            .lock()
+            .unwrap()
+            .waiting_notices
+            .remove(worker_pane_id)
+            .is_some()
+    }
+
+    /// Issue #447: whether the waiting episode `seq` is still the open one for
+    /// `worker_pane_id` — i.e. the worker has not left `WaitingForInput`, been
+    /// replaced by a newer episode, or had its pane closed since. Re-checked
+    /// immediately before the notice is written.
+    pub fn waiting_notice_is_current(&self, worker_pane_id: &str, seq: u64) -> bool {
+        self.delegations
+            .lock()
+            .unwrap()
+            .waiting_notices
+            .get(worker_pane_id)
+            .is_some_and(|open| open.seq == seq)
+    }
+
+    /// Issue #447: end the waiting episode `seq` — one notice per episode —
+    /// and, when a notice was `submitted`, start the pane's cooldown. A no-op
+    /// on the record when a newer episode has replaced it; the cooldown is
+    /// still recorded, because a notice really was sent.
+    pub fn settle_waiting_notice(&self, worker_pane_id: &str, seq: u64, submitted: bool) {
+        let mut tracker = self.delegations.lock().unwrap();
+        if tracker
+            .waiting_notices
+            .get(worker_pane_id)
+            .is_some_and(|open| open.seq == seq)
+        {
+            tracker.waiting_notices.remove(worker_pane_id);
+        }
+        if submitted && !tracker.closing_panes.contains(worker_pane_id) {
+            tracker
+                .waiting_notice_sent_at
+                .insert(worker_pane_id.to_string(), Instant::now());
+        }
+    }
+
     /// Issue #448: credit a `work-done` from `worker_pane_id` against the
     /// commission ledger, and report whether the orchestrator had actually asked
     /// for anything — see [`WorkDoneProvenance`].
@@ -5597,6 +5776,11 @@ impl AgentPtyRegistry {
                 "pane close: cancelled silent-worker watches touching this pane"
             );
         }
+        // Issue #447: a closing worker is not waiting on anybody any more.
+        // (A closing ORCHESTRATOR needs no sweep here: its commissions go just
+        // below, and a notice finds its recipient in that ledger.)
+        tracker.waiting_notices.remove(pane_id);
+        tracker.waiting_notice_sent_at.remove(pane_id);
         let dropped_commissions = Self::drain_commissions_touching(&mut tracker, pane_id);
         if dropped_commissions > 0 {
             tracing::debug!(
@@ -5622,6 +5806,8 @@ impl AgentPtyRegistry {
         let mut tracker = self.delegations.lock().unwrap();
         drop(tracker.close_waiters.remove(pane_id));
         Self::drain_silence_watches_touching(&mut tracker, pane_id);
+        tracker.waiting_notices.remove(pane_id);
+        tracker.waiting_notice_sent_at.remove(pane_id);
         Self::drain_commissions_touching(&mut tracker, pane_id);
         let swept = Self::drain_delegations_touching(&mut tracker, pane_id);
         if !closed {
@@ -16820,6 +17006,134 @@ mod spawn_tests {
             reg.retire_delegation_commission("worker-a"),
             WorkDoneProvenance::Unsolicited,
             "the worker's own close swept its ledger entry too"
+        );
+    }
+
+    /// Issue #447: the waiting-for-input notice finds its recipient in the
+    /// commission ledger — read, never spent — and loses it the moment the
+    /// ledger does.
+    #[test]
+    fn commission_owed_to_reads_the_ledger_without_spending_it() {
+        let reg = Arc::new(AgentPtyRegistry::new());
+        assert_eq!(reg.commission_owed_to("worker"), None, "nothing delegated");
+        assert!(matches!(
+            reg.arm_delegation_commission("worker", "orch", Some("orch-agent"), false),
+            CommissionArm::Armed { .. }
+        ));
+        let owner = CommissionOwner {
+            orchestrator_pane_id: "orch".to_string(),
+            orchestrator_agent_id: Some("orch-agent".to_string()),
+        };
+        assert_eq!(reg.commission_owed_to("worker"), Some(owner.clone()));
+        assert_eq!(
+            reg.commission_owed_to("worker"),
+            Some(owner),
+            "reading the owner must not credit the commission"
+        );
+        assert_eq!(
+            reg.retire_delegation_commission("worker"),
+            WorkDoneProvenance::Solicited { remaining: 0 }
+        );
+        assert_eq!(
+            reg.commission_owed_to("worker"),
+            None,
+            "a credited work-done leaves nobody to report a wait to"
+        );
+    }
+
+    /// Issue #447: one waiting episode per pane and generation. A repeated
+    /// report keeps the first clock, a different agent replaces the episode, a
+    /// closed episode cancels its task, and a stale generation can neither
+    /// settle nor pass for the current one.
+    #[test]
+    fn waiting_notice_episode_is_one_per_generation_and_cancellable() {
+        let reg = Arc::new(AgentPtyRegistry::new());
+        let cooldown = Duration::from_secs(60);
+        let mut first = reg
+            .arm_waiting_notice("worker", "agent-1", cooldown)
+            .expect("a fresh episode arms");
+        assert_eq!(
+            first.not_before, None,
+            "a pane never reported has no cooldown"
+        );
+        assert!(
+            reg.arm_waiting_notice("worker", "agent-1", cooldown)
+                .is_none(),
+            "a repeated report for the same agent must not restart the debounce"
+        );
+        assert!(reg.waiting_notice_is_current("worker", first.seq));
+
+        let second = reg
+            .arm_waiting_notice("worker", "agent-2", cooldown)
+            .expect("a different agent replaces the episode");
+        assert!(
+            matches!(
+                first.cancel.try_recv(),
+                Err(oneshot::error::TryRecvError::Closed)
+            ) && !reg.waiting_notice_is_current("worker", first.seq),
+            "the replaced episode's task is cancelled and it is no longer current"
+        );
+        reg.settle_waiting_notice("worker", first.seq, false);
+        assert!(
+            reg.waiting_notice_is_current("worker", second.seq),
+            "settling a stale generation must not close the newer episode"
+        );
+
+        let mut cancel = second.cancel;
+        assert!(reg.cancel_waiting_notice("worker"));
+        assert!(
+            matches!(cancel.try_recv(), Err(oneshot::error::TryRecvError::Closed)),
+            "leaving the state drops the record, which resolves the task's cancel"
+        );
+        assert!(
+            !reg.cancel_waiting_notice("worker"),
+            "nothing left to cancel"
+        );
+    }
+
+    /// Issue #447: a submitted notice starts the pane's cooldown, which the
+    /// next episode reads as its floor; an unsent one does not; and a pane
+    /// close clears both the episode and the cooldown and refuses re-arming
+    /// while it runs.
+    #[test]
+    fn waiting_notice_cooldown_follows_a_submitted_notice_and_close_sweeps_it() {
+        let reg = Arc::new(AgentPtyRegistry::new());
+        let cooldown = Duration::from_secs(120);
+
+        let unsent = reg.arm_waiting_notice("worker", "agent", cooldown).unwrap();
+        reg.settle_waiting_notice("worker", unsent.seq, false);
+        let after_unsent = reg.arm_waiting_notice("worker", "agent", cooldown).unwrap();
+        assert_eq!(
+            after_unsent.not_before, None,
+            "an episode that sent nothing must not delay the next one"
+        );
+
+        let before = Instant::now();
+        reg.settle_waiting_notice("worker", after_unsent.seq, true);
+        let next = reg.arm_waiting_notice("worker", "agent", cooldown).unwrap();
+        let floor = next
+            .not_before
+            .expect("a submitted notice starts the cooldown");
+        assert!(
+            floor >= before + cooldown && floor <= Instant::now() + cooldown,
+            "the floor is the last notice plus the cooldown"
+        );
+
+        drop(reg.begin_pane_close("worker"));
+        assert!(
+            !reg.waiting_notice_is_current("worker", next.seq),
+            "close sweeps the episode"
+        );
+        assert!(
+            reg.arm_waiting_notice("worker", "agent", cooldown)
+                .is_none(),
+            "a closing pane must not open an episode"
+        );
+        drop(reg.finish_pane_close("worker", true));
+        let reopened = reg.arm_waiting_notice("worker", "agent", cooldown).unwrap();
+        assert_eq!(
+            reopened.not_before, None,
+            "a closed pane's cooldown must not outlive it onto a pane id reused later"
         );
     }
 

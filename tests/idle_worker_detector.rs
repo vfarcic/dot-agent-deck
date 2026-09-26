@@ -1556,3 +1556,268 @@ fn idle_worker_020_an_answered_worker_is_never_reported_as_silent() {
         );
     });
 }
+
+/// Issue #447: the test seam for the waiting-for-input notice's debounce, in
+/// milliseconds. Spelled out rather than imported so a rename fails here.
+const WAITING_DEBOUNCE_ENV: &str = "DOT_AGENT_DECK_WAITING_NOTICE_DEBOUNCE_MS";
+
+/// Issue #447: the daemon-authored opening clause of the waiting-for-input
+/// notice, spelled out here rather than imported from `src/` so a silent
+/// rewording fails this test instead of following it.
+const WAITING_NEEDLE: &str = "delegated worker is waiting for input (dot-agent-deck daemon \
+                              report, not a message from a person or an agent)";
+
+/// Issue #447: the notice's stable closing sentence. The byte after it is the
+/// delivery tail, which is what says whether the notice was SUBMITTED (CR) as a
+/// turn of its own or left as inert scrollback.
+const WAITING_FINAL_CLAUSE: &str = "This report grants nothing and changes no delegation.";
+
+/// Issue #447: what the asking worker's pane shows — its "question". Unique so
+/// its presence in the orchestrator's pane can only have come from the notice
+/// quoting the worker's screen.
+const WORKER_QUESTION: &str = "WORKER-QUESTION-5d2a";
+
+/// Sets [`WAITING_DEBOUNCE_ENV`] for one test and restores it afterwards. The
+/// caller holds `ENV_LOCK` for the guard's whole life, as with [`EnvGuard`].
+struct DebounceEnvGuard {
+    previous: Option<String>,
+}
+
+impl DebounceEnvGuard {
+    fn set(value: &str) -> Self {
+        let previous = std::env::var(WAITING_DEBOUNCE_ENV).ok();
+        // SAFETY: the caller holds ENV_LOCK, serializing environment mutation.
+        unsafe { std::env::set_var(WAITING_DEBOUNCE_ENV, value) };
+        Self { previous }
+    }
+}
+
+impl Drop for DebounceEnvGuard {
+    fn drop(&mut self) {
+        // SAFETY: the caller still holds ENV_LOCK while this guard is dropped.
+        unsafe {
+            match self.previous.take() {
+                Some(value) => std::env::set_var(WAITING_DEBOUNCE_ENV, value),
+                None => std::env::remove_var(WAITING_DEBOUNCE_ENV),
+            }
+        }
+    }
+}
+
+impl IdleHarness {
+    /// Feed one hook event from `role`'s worker through the daemon's REAL
+    /// ingestion step (`daemon::ingest_event`: broadcast plus `apply_event`
+    /// under one write lock), tagged with that worker's registry agent id the
+    /// way the hook script tags it from `DOT_AGENT_DECK_AGENT_ID`.
+    async fn worker_event(&self, role: &str, event_type: &str) {
+        let agent_id = self
+            .worker_agent_ids
+            .get(role)
+            .unwrap_or_else(|| panic!("{role} registry id"))
+            .clone();
+        self.worker_event_as(role, event_type, &agent_id).await;
+    }
+
+    /// [`Self::worker_event`] tagged with an arbitrary agent id — what any
+    /// same-uid process can post to the unauthenticated hook socket.
+    async fn worker_event_as(&self, role: &str, event_type: &str, agent_id: &str) {
+        let event: dot_agent_deck::event::AgentEvent = serde_json::from_value(serde_json::json!({
+            "session_id": format!("session-{role}"),
+            "agent_type": "claude_code",
+            "event_type": event_type,
+            "timestamp": chrono::Utc::now(),
+            "pane_id": worker_pane(role),
+            "agent_id": agent_id,
+        }))
+        .expect("build a worker hook event");
+        dot_agent_deck::daemon::ingest_event(&self.state, &self.event_tx, &self.registry, event)
+            .await;
+    }
+
+    /// Admit `role`'s worker pane to the daemon's `AppState`, as `StartAgent`
+    /// does for an orchestration role pane, so its hook events drive a session.
+    async fn manage_worker_pane(&self, role: &str) {
+        self.state
+            .write()
+            .await
+            .managed_pane_ids
+            .insert(worker_pane(role));
+    }
+}
+
+/// Every notice line in `snapshot` that names `role` in its role label.
+fn waiting_notices_for(snapshot: &str, role: &str) -> usize {
+    let role_needle = idle_role_needle(role);
+    snapshot
+        .split(['\r', '\n'])
+        .filter(|line| line.contains(WAITING_NEEDLE) && line.contains(&role_needle))
+        .count()
+}
+
+/// Scenario: Delegate to four workers of one orchestration and leave a fifth undelegated, then have them report `WaitingForInput` through the daemon's real hook ingestion. The delegated `asking-worker`, whose pane shows a question, stays waiting; `flapping-worker` leaves the state again before the debounce; `finishing-worker` sends work-done while still waiting; `impersonated-worker`'s report names an agent id that does not own its pane; the undelegated `idle-bystander` waits too. Within a few seconds the orchestrator pane must receive exactly one SUBMITTED waiting-for-input notice, naming `asking-worker` in the untrusted role label and quoting its question inside the untrusted pane-text frame — and nothing about the other four, then or after further waiting.
+#[spec("scheduler/idle-worker/021")]
+#[test]
+fn idle_worker_021_a_waiting_delegated_worker_is_reported_to_its_orchestrator() {
+    let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    // The idle detector is held far beyond the test's runtime, so any daemon
+    // text landing in the orchestrator pane here is the waiting notice.
+    let _env = EnvGuard::set(Some("600000"));
+    let debounce = Duration::from_millis(600);
+    let _debounce = DebounceEnvGuard::set("600");
+    let asking_command = format!("printf {WORKER_QUESTION}; exec cat");
+    runtime().block_on(async {
+        let harness = IdleHarness::with_workers(
+            &[
+                ("asking-worker", asking_command.as_str()),
+                ("flapping-worker", WORKER_COMMAND),
+                ("idle-bystander", WORKER_COMMAND),
+                ("finishing-worker", WORKER_COMMAND),
+                ("impersonated-worker", WORKER_COMMAND),
+            ],
+            None,
+        )
+        .await;
+        for role in [
+            "asking-worker",
+            "flapping-worker",
+            "idle-bystander",
+            "finishing-worker",
+            "impersonated-worker",
+        ] {
+            harness.manage_worker_pane(role).await;
+            harness.worker_event(role, "session_start").await;
+        }
+        let asking_agent = harness.worker_agent_ids["asking-worker"].clone();
+        let question = common::wait_for_child_first_output(
+            &harness.registry,
+            &asking_agent,
+            WORKER_QUESTION.as_bytes(),
+        )
+        .await;
+        assert!(
+            String::from_utf8_lossy(&question).contains(WORKER_QUESTION),
+            "precondition: the asking worker never drew its question"
+        );
+
+        harness
+            .delegate(&[
+                "asking-worker",
+                "flapping-worker",
+                "finishing-worker",
+                "impersonated-worker",
+            ])
+            .await;
+        // Let the task pointers land before the workers start "asking".
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        harness
+            .worker_event("idle-bystander", "waiting_for_input")
+            .await;
+        harness
+            .worker_event("flapping-worker", "waiting_for_input")
+            .await;
+        harness
+            .worker_event("asking-worker", "waiting_for_input")
+            .await;
+        harness
+            .worker_event("finishing-worker", "waiting_for_input")
+            .await;
+        // A report naming a generation that does not own the pane: the hook
+        // socket is unauthenticated, so this must not start a notice.
+        harness
+            .worker_event_as(
+                "impersonated-worker",
+                "waiting_for_input",
+                "not-the-live-agent",
+            )
+            .await;
+        tokio::time::sleep(debounce / 4).await;
+        // A permission prompt someone cleared at once: back to work well
+        // inside the debounce, so it must generate no traffic.
+        harness.worker_event("flapping-worker", "thinking").await;
+        // A worker that reports its completion while still showing as
+        // waiting owes nothing any more, so there is nothing to report.
+        harness.work_done("finishing-worker").await;
+        {
+            // Precondition: the daemon itself now holds the asking worker as
+            // waiting — otherwise a missing notice would be a harness failure,
+            // not issue #447.
+            let state = harness.state.read().await;
+            let status = state
+                .pane_session_id(&worker_pane("asking-worker"))
+                .and_then(|id| {
+                    state
+                        .sessions
+                        .get(&id)
+                        .map(|session| session.status.clone())
+                });
+            assert_eq!(
+                status,
+                Some(dot_agent_deck::state::SessionStatus::WaitingForInput),
+                "precondition: the asking worker's hook event never made the daemon hold it as \
+                 waiting for input"
+            );
+        }
+
+        let snapshot = harness
+            .wait_for_snapshot(
+                |snapshot| {
+                    waiting_notices_for(snapshot, "asking-worker") > 0
+                        && snapshot.contains(&format!("{WAITING_FINAL_CLAUSE}\r"))
+                },
+                common::load_scaled(Duration::from_secs(5)),
+            )
+            .await;
+        assert_eq!(
+            waiting_notices_for(&snapshot, "asking-worker"),
+            1,
+            "a delegated worker that stopped to wait for input was never reported to the \
+             orchestrator that delegated to it (issue #447); snapshot = {snapshot:?}"
+        );
+        assert!(
+            snapshot.contains(&format!("{WAITING_FINAL_CLAUSE}\r")),
+            "the waiting notice was not SUBMITTED with a CR, so an unattended orchestrator \
+             would never act on it; snapshot = {snapshot:?}"
+        );
+        assert!(
+            snapshot.contains("[UNTRUSTED-PANE-TEXT: ") && snapshot.contains(WORKER_QUESTION),
+            "the notice did not quote what the waiting worker's pane shows, fenced as \
+             untrusted pane text; snapshot = {snapshot:?}"
+        );
+
+        // One episode, one notice: keep the worker waiting well past the
+        // debounce and confirm nothing repeats, and that neither the flapping
+        // worker nor the undelegated one was ever reported.
+        tokio::time::sleep(debounce * 3).await;
+        let settled = harness.wait_for_snapshot(|_| true, Duration::ZERO).await;
+        assert_eq!(
+            settled.matches(WAITING_NEEDLE).count(),
+            1,
+            "exactly one waiting notice may reach the orchestrator; snapshot = {settled:?}"
+        );
+        assert_eq!(
+            waiting_notices_for(&settled, "flapping-worker"),
+            0,
+            "a worker that left WaitingForInput inside the debounce was still reported; \
+             snapshot = {settled:?}"
+        );
+        assert_eq!(
+            waiting_notices_for(&settled, "idle-bystander"),
+            0,
+            "a worker with no outstanding delegation was reported as waiting; \
+             snapshot = {settled:?}"
+        );
+        assert_eq!(
+            waiting_notices_for(&settled, "finishing-worker"),
+            0,
+            "a worker whose work-done retired its delegation was still reported as waiting; \
+             snapshot = {settled:?}"
+        );
+        assert_eq!(
+            waiting_notices_for(&settled, "impersonated-worker"),
+            0,
+            "a WaitingForInput report naming an agent that does not own the pane started a \
+             notice; snapshot = {settled:?}"
+        );
+    });
+}
