@@ -2978,14 +2978,36 @@ mod tests {
     /// point: this constant is a *program*, its whole job is to answer with a
     /// path, and a string assertion would pass over a syntax error or an
     /// inverted `-S` test alike.
+    ///
+    /// `env_clear` rather than removing only the three variables the fallback
+    /// rungs read, for the reason `tunnel_tests::run_probe_under` gives: the
+    /// snippet's first rung asks `$HOME/.local/bin/dot-agent-deck` and the one
+    /// on `PATH`, so an ambient `HOME` let this machine's installed deck answer
+    /// before the rungs under test ran. Measured with 0.42.0 installed: it
+    /// refused the test's 0o775 socket with exit 1, the probe printed nothing,
+    /// and four of these tests failed on that host while passing in CI, which
+    /// has no deck installed.
+    ///
+    /// `PATH` is a private directory holding only `id`, the one external
+    /// command the fallback rungs run, linked from wherever the ambient `PATH`
+    /// keeps it. A fixed `/usr/bin:/bin` would still let a deck installed
+    /// there answer, and would miss an `id` that lives elsewhere.
     #[cfg(unix)]
     fn run_socket_probe(snippet: &str, env: &[(&str, &str)]) -> String {
+        let bin = tempfile::tempdir().expect("a private PATH directory");
+        let id = std::env::var_os("PATH")
+            .and_then(|path| {
+                std::env::split_paths(&path)
+                    .map(|dir| dir.join("id"))
+                    .find(|candidate| candidate.is_file())
+            })
+            .expect("`id` on the ambient PATH, which the fallback rungs call");
+        std::os::unix::fs::symlink(&id, bin.path().join("id")).expect("link `id`");
         let output = std::process::Command::new("/bin/sh")
             .arg("-c")
             .arg(snippet)
-            .env_remove("DOT_AGENT_DECK_ATTACH_SOCKET")
-            .env_remove("XDG_RUNTIME_DIR")
-            .env_remove("TMPDIR")
+            .env_clear()
+            .env("PATH", bin.path())
             .envs(env.iter().copied())
             .output()
             .expect("run the discovery probe under /bin/sh");
