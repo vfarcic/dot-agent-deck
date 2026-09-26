@@ -505,6 +505,10 @@ export interface FixtureDirectory {
  * level deeper inside the ordinary one — enough to browse into, confirm a
  * directory with no subdirectories, and go back up through every parent.
  *
+ * Issue #1240: `scratch/notes` also holds a hidden directory (`.drafts`) and a
+ * symlink (`latest`, leading to `demo-project`), which a deck lists only when
+ * asked — so by default `notes` still has no subdirectories.
+ *
  * Every path here is the fixture DECK's answer, the way a daemon answers with
  * its own canonical spelling. The dialog never builds one of these itself.
  */
@@ -517,7 +521,8 @@ export function fixtureDirectoryTree(home: string): Map<string, FixtureDirectory
     { path: home, parent: "/home", entries: [entry(`${home}/demo-project`, true), entry(`${home}/scratch`)] },
     { path: `${home}/demo-project`, parent: home, entries: [] },
     { path: `${home}/scratch`, parent: home, entries: [entry(`${home}/scratch/notes`), entry(`${home}/scratch/twin-project`, true)] },
-    { path: `${home}/scratch/notes`, parent: `${home}/scratch`, entries: [] },
+    { path: `${home}/scratch/notes`, parent: `${home}/scratch`, entries: [entry(`${home}/scratch/notes/.drafts`), { path: `${home}/demo-project`, displayName: "latest", isProject: true, isSymlink: true }] },
+    { path: `${home}/scratch/notes/.drafts`, parent: `${home}/scratch/notes`, entries: [] },
     { path: `${home}/scratch/twin-project`, parent: `${home}/scratch`, entries: [] },
   ];
   return new Map(tree.map((directory) => [directory.path, directory]));

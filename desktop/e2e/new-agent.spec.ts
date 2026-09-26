@@ -228,6 +228,40 @@ test.describe("the New agent flow", () => {
   });
 
   /**
+   * Scenario (issue #1240): on the fleet, open New agent on the remote deck and
+   * browse into `scratch/notes`. Its symlink `latest` is listed with a `link`
+   * mark and its hidden `.drafts` is not; `.` in the list shows hidden
+   * directories, keeping the cursor on `latest`, and Enter on the link lists
+   * the directory it leads to.
+   */
+  test("lists a symlinked directory, shows hidden ones on demand and opens a link's target", async ({ page }) => {
+    await openOverview(page, "fleet");
+
+    await page.getByTestId("overview-new-agent").click();
+    await page.getByTestId("new-agent-deck-list").locator(`[data-deck-id="${REMOTE_DECK}"]`).click();
+    await expect(page.getByTestId("new-agent-current-path")).toHaveText("/home/build");
+    const directories = page.getByTestId("new-agent-directory-list");
+    await expect(directories).toBeFocused();
+    await page.keyboard.press("j");
+    await page.keyboard.press("Enter");
+    await expect(page.getByTestId("new-agent-current-path")).toHaveText("/home/build/scratch");
+    await expect(directories.locator("[aria-selected='true']")).toHaveAttribute("data-path", "/home/build/scratch/notes");
+    await page.keyboard.press("Enter");
+    await expect(page.getByTestId("new-agent-current-path")).toHaveText("/home/build/scratch/notes");
+
+    await expect(directories.getByTestId("new-agent-link-mark")).toHaveCount(1);
+    await expect(directories.locator("[data-path='/home/build/scratch/notes/.drafts']")).toHaveCount(0);
+    await expect(page.getByTestId("new-agent-show-hidden")).not.toBeChecked();
+    await page.keyboard.press(".");
+    await expect(page.getByTestId("new-agent-show-hidden")).toBeChecked();
+    await expect(directories.locator("[data-path='/home/build/scratch/notes/.drafts']")).toHaveCount(1);
+    await expect(directories.locator("[aria-selected='true']")).toHaveAttribute("data-path", "/home/build/demo-project");
+
+    await page.keyboard.press("Enter");
+    await expect(page.getByTestId("new-agent-current-path")).toHaveText("/home/build/demo-project");
+  });
+
+  /**
    * Scenario (PRD #1223 audit F2): on the fleet, open New agent on the remote
    * deck and browse into `scratch/twin-project`, whose config defines
    * `twin-loop` twice and `solo-loop` once. The Mode row shows both

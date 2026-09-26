@@ -71,12 +71,13 @@ use crate::daemon_bridge::{
 };
 use crate::dto::{
     BootstrapOptions, COMMAND_MAX_BYTES, ConnectionStatus, DesktopAction, DesktopActionError,
-    DesktopActionResult, DesktopAgentOption, DesktopDirectoryListing, DesktopNewAgentOptions,
-    DesktopNewAgentOrchestrations, DesktopProjectListing, DesktopResolvedProject, DesktopSnapshot,
-    TerminalAttachResult, WorkflowRoleInput, desktop_agent_registry,
-    ensure_desktop_workflow_platform_supported, map_project_listing, map_resolved_project,
-    mint_desktop_pane_id, safe_message, selected_endpoint, validate_agent_id, validate_dimensions,
-    validate_pasted_project_path, validate_start_fields, validate_workflow_shape,
+    DesktopActionResult, DesktopAgentOption, DesktopDirectoryListing, DesktopListingOptions,
+    DesktopNewAgentOptions, DesktopNewAgentOrchestrations, DesktopProjectListing,
+    DesktopResolvedProject, DesktopSnapshot, TerminalAttachResult, WorkflowRoleInput,
+    desktop_agent_registry, ensure_desktop_workflow_platform_supported, map_project_listing,
+    map_resolved_project, mint_desktop_pane_id, safe_message, selected_endpoint, validate_agent_id,
+    validate_dimensions, validate_pasted_project_path, validate_start_fields,
+    validate_workflow_shape,
 };
 use crate::secrets::{
     KeychainSecretStore, Secret, SecretError, SecretId, SecretStatus, SecretStore,
@@ -1967,16 +1968,27 @@ async fn desktop_resolve_project(
 /// A deck that predates the verb answers [`DesktopDirectoryListing::Unsupported`]
 /// rather than an error. The dialog does not ask one: the connection's
 /// `new_agent_reason` disables it at the deck step (PRD #1223 U1).
+///
+/// `options` (issue #1240) are sent only to a deck that honours them; the
+/// dialog asks only such a deck (the connection's `listing_options`), and a
+/// deck that does not is refused here in a sentence rather than answered as
+/// though it could not list at all.
 #[tauri::command]
 async fn desktop_list_directories(
     webview: Webview,
     state: State<'_, DesktopState>,
     deck_id: String,
     path: Option<String>,
+    options: Option<DesktopListingOptions>,
 ) -> Result<DesktopDirectoryListing, String> {
     ensure_main_webview(&webview)?;
-    list_directories_on(&state, &deck_id, path).await
+    list_directories_on(&state, &deck_id, path, options.unwrap_or_default()).await
 }
+
+/// Issue #1240: the refusal for listing options sent to a deck that does not
+/// advertise them. Unreachable from the dialog, which offers the options only
+/// where the connection says the deck honours them.
+const LISTING_OPTIONS_UNSUPPORTED: &str = "This deck cannot show hidden or symlinked directories, or filter a listing past its limit. Upgrade the deck to use them.";
 
 /// PRD #1223 M4: what the New agent form needs to know about the deck
 /// `deck_id` names — its default command, its agent registry, its experimental
@@ -2014,6 +2026,7 @@ async fn list_directories_on(
     state: &DesktopState,
     deck_id: &str,
     path: Option<String>,
+    options: DesktopListingOptions,
 ) -> Result<DesktopDirectoryListing, String> {
     if let Some(path) = path.as_deref() {
         validate_pasted_project_path(path)?;
@@ -2021,23 +2034,45 @@ async fn list_directories_on(
     let scope = crate::dto::DeckScope::resolve(Some(deck_id))?;
     let daemon = state.daemon.trusted(scope.endpoint()).await?;
     daemon.require_compatible()?;
+    let options = dot_agent_deck::daemon_protocol::DirectoryListingOptions {
+        include_hidden: options.include_hidden,
+        include_symlinks: options.include_symlinks,
+        // An empty filter filters nothing, so it is not sent: it would ask a
+        // deck without the options for something it could answer anyway.
+        filter: options.filter.filter(|filter| !filter.is_empty()),
+    };
     let answer = daemon
         .client
-        .list_directories(path.as_deref())
+        .list_directories(path.as_deref(), &options)
         .await
         .map_err(|error| safe_message(error.to_string()))?;
-    Ok(match answer {
-        GatedQuery::Answered(listing) => DesktopDirectoryListing::listing(
-            listing.path,
-            listing.parent,
-            listing
-                .entries
-                .into_iter()
-                .map(|entry| (entry.name, entry.path, entry.is_project)),
-            listing.truncated,
-        ),
-        GatedQuery::Unsupported => DesktopDirectoryListing::Unsupported,
-    })
+    let listing = match answer {
+        GatedQuery::Answered(listing) => listing,
+        GatedQuery::Unsupported => {
+            // The verb is there and the options are not: say so, rather than
+            // reporting a deck that lists as one that cannot.
+            let lists = daemon
+                .client
+                .capabilities()
+                .await
+                .is_ok_and(|capabilities| {
+                    capabilities.supports(dot_agent_deck::daemon_protocol::CAP_LIST_DIRECTORIES)
+                });
+            if lists && !options.is_default() {
+                return Err(LISTING_OPTIONS_UNSUPPORTED.to_string());
+            }
+            return Ok(DesktopDirectoryListing::Unsupported);
+        }
+    };
+    Ok(DesktopDirectoryListing::listing(
+        listing.path,
+        listing.parent,
+        listing
+            .entries
+            .into_iter()
+            .map(|entry| (entry.name, entry.path, entry.is_project, entry.is_symlink)),
+        listing.truncated,
+    ))
 }
 
 /// [`desktop_new_agent_options`] minus the webview. Resolves its deck exactly

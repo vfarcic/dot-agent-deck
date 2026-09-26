@@ -1,4 +1,4 @@
-import type { AuthoringKind, ConnectionView, DaemonOrchestration, DeckDirectoryEntry, DeckFleet, NewAgentOption, NewAgentOptions, NewAgentOrchestrations } from "../types";
+import type { AuthoringKind, ConnectionView, DaemonOrchestration, DeckDirectoryEntry, DeckFleet, DeckListingOptions, NewAgentOption, NewAgentOptions, NewAgentOrchestrations } from "../types";
 import type { VoiceDeckChoiceDto } from "./bridge";
 import { DISPLAY_LIMITS, deckName, displayIdentity, displayText } from "./displayText";
 
@@ -77,6 +77,11 @@ export interface DeckChoice {
   deckKind: "local" | "remote";
   /** Why it cannot take a spawn; absent when it can. */
   reason?: string;
+  /**
+   * Issue #1240 — the deck honours the directory browser's listing options
+   * (its connection's `listingOptions`); absent when it does not.
+   */
+  listingOptions?: true;
 }
 
 /**
@@ -89,7 +94,7 @@ export function deckChoices(fleet: DeckFleet): DeckChoice[] {
     const deckId = deck.connection.deckId;
     if (deckId === undefined) return [];
     const reason = deckUnavailableReason(deck.connection);
-    return [{ deckId, name: deckName(deck.connection), deckKind: deck.connection.deckKind ?? "local", ...(reason === undefined ? {} : { reason }) }];
+    return [{ deckId, name: deckName(deck.connection), deckKind: deck.connection.deckKind ?? "local", ...(reason === undefined ? {} : { reason }), ...(deck.connection.listingOptions ? { listingOptions: true as const } : {}) }];
   });
 }
 
@@ -382,6 +387,16 @@ export function isDeckGoneError(message: string): boolean {
 /** Whether `deckId`'s fleet entry lists `agentId` — the composite identity, never the bare id. */
 export function fleetLists(fleet: DeckFleet, deckId: string, agentId: string): boolean {
   return fleet.some((deck) => deck.connection.deckId === deckId && deck.agents.some((agent) => agent.id === agentId));
+}
+
+/**
+ * Issue #1240 — the listing options the directory step sends a deck: none to a
+ * deck that does not honour them, and otherwise symlinked directories always,
+ * hidden ones when Show hidden is on, and `filter` when one is given.
+ */
+export function directoryListingOptions(supported: boolean, showHidden: boolean, filter?: string): DeckListingOptions | undefined {
+  if (!supported) return undefined;
+  return { includeSymlinks: true, ...(showHidden ? { includeHidden: true } : {}), ...(filter ? { filter } : {}) };
 }
 
 /** The directory step's filter: a case-insensitive substring of the entry's name, as the TUI picker's `refilter`. */
