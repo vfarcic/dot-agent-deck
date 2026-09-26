@@ -2232,7 +2232,7 @@ describe("ControlDeck", () => {
     expect(screen.queryByTestId("terminal-builder")).toBeNull();
     expect(screen.queryByTestId("run-health")).toBeNull();
     expect(screen.queryByTestId("evidence-drawer")).toBeNull();
-    expect(vi.mocked(live.setShownTerminals).mock.calls.at(-1)?.[0]).toEqual([]);
+    await waitFor(() => expect(vi.mocked(live.setShownTerminals).mock.calls.at(-1)?.[0]).toEqual([]));
 
     fireEvent.click(screen.getByTestId("deck-selector-toggle"));
     fireEvent.click(screen.getByTestId("deck-selector-option-local"));
