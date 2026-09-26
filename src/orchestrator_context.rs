@@ -1412,6 +1412,43 @@ pub fn write_coordination_file(
     name: &str,
     content: &str,
 ) -> std::io::Result<std::path::PathBuf> {
+    write_coordination_file_as(cwd, name, content, Overwrite::Replace)
+}
+
+/// [`write_coordination_file`], but the file must not exist yet: an existing
+/// entry at `name` — a file, a symlink, anything — fails with
+/// [`std::io::ErrorKind::AlreadyExists`] and is left exactly as it was.
+///
+/// Issue #508: this is the writer for files the daemon mints a fresh name for,
+/// such as a full worker report too long to inline. Those names are unique by
+/// construction, but "unique by construction" is a claim about the daemon's
+/// own naming, and the directory is shared with agents that write whatever
+/// they like into it — so the guarantee that one report never lands on top of
+/// another, or on top of a file an agent parked there (#331's hazard), is
+/// enforced by the open itself (`O_CREAT | O_EXCL`), not inferred from the name.
+pub fn write_new_coordination_file(
+    cwd: &std::path::Path,
+    name: &str,
+    content: &str,
+) -> std::io::Result<std::path::PathBuf> {
+    write_coordination_file_as(cwd, name, content, Overwrite::Refuse)
+}
+
+/// Whether [`write_coordination_file_as`] may replace an existing file.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Overwrite {
+    /// Truncate and rewrite — the role-keyed files the deck reuses per role.
+    Replace,
+    /// Fail with `AlreadyExists` rather than touch what is there.
+    Refuse,
+}
+
+fn write_coordination_file_as(
+    cwd: &std::path::Path,
+    name: &str,
+    content: &str,
+    overwrite: Overwrite,
+) -> std::io::Result<std::path::PathBuf> {
     let dir = context_dir_of(cwd);
     let refuse = |what: &str| {
         Err(std::io::Error::new(
@@ -1433,7 +1470,10 @@ pub fn write_coordination_file(
     let path = dir.join(name);
 
     let mut options = std::fs::OpenOptions::new();
-    options.create(true).write(true).truncate(true);
+    match overwrite {
+        Overwrite::Replace => options.create(true).write(true).truncate(true),
+        Overwrite::Refuse => options.create_new(true).write(true),
+    };
     crate::platform::fsperm::set_create_mode_owner_only(&mut options);
     #[cfg(unix)]
     {
