@@ -7087,6 +7087,8 @@ dependencies = [
 name = "xtask-screenshots"
 version = "0.0.0"
 dependencies = [
+ "serde_json",
+ "tempfile",
  "vt100",
 ]
 

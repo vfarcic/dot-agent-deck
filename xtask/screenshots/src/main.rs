@@ -19,7 +19,7 @@
 //! rest.
 
 use std::collections::BTreeSet;
-use std::ffi::OsString;
+use std::ffi::OsStr;
 use std::net::{Ipv4Addr, TcpListener};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
@@ -147,17 +147,67 @@ fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
 
-/// The cargo target directory, always absolute. A relative `CARGO_TARGET_DIR`
-/// is joined to `cwd`, which is how cargo itself resolves the variable, so it
-/// names the directory the `cargo docs-screenshots` that started this process
-/// built into. Absolute matters because the two stages run from different
-/// directories — the TUI capture from the repo root, Playwright from
-/// `desktop/` — and a relative path handed to both would name two places.
-fn target_dir(root: &Path, cwd: &Path, env: Option<OsString>) -> PathBuf {
-    match env.filter(|dir| !dir.is_empty()) {
-        Some(dir) => cwd.join(dir),
-        None => root.join("target"),
+/// The `cargo metadata` invocation that reports cargo's effective target
+/// directory. It runs from `cwd` — where the `cargo docs-screenshots` that
+/// started this process ran — because that is where cargo discovers its config
+/// from, so a `[build] target-dir` in a project or user `.cargo/config.toml`,
+/// `CARGO_BUILD_TARGET_DIR` and `CARGO_TARGET_DIR` all resolve exactly as they
+/// did for the outer build, relative values included. `--manifest-path` pins
+/// the workspace; `--no-deps` keeps it from resolving the dependency graph.
+fn metadata_command(cargo: &OsStr, root: &Path, cwd: &Path) -> Command {
+    let mut command = Command::new(cargo);
+    command
+        .current_dir(cwd)
+        .args([
+            "metadata",
+            "--format-version",
+            "1",
+            "--no-deps",
+            "--manifest-path",
+        ])
+        .arg(root.join("Cargo.toml"));
+    command
+}
+
+/// The `target_directory` field of `cargo metadata`'s output. Refused unless
+/// absolute: the two stages run from different directories — the TUI capture
+/// from the repo root, Playwright from `desktop/` — and a relative path handed
+/// to both would name two places.
+fn parse_target_dir(stdout: &[u8]) -> Result<PathBuf, String> {
+    let metadata: serde_json::Value = serde_json::from_slice(stdout)
+        .map_err(|e| format!("cargo metadata printed something that is not JSON: {e}"))?;
+    let dir = metadata
+        .get("target_directory")
+        .and_then(|v| v.as_str())
+        .ok_or("cargo metadata's output has no target_directory string")?;
+    let dir = PathBuf::from(dir);
+    if !dir.is_absolute() {
+        return Err(format!(
+            "cargo metadata reported a relative target_directory {}",
+            dir.display()
+        ));
     }
+    Ok(dir)
+}
+
+/// Cargo's effective target directory, as cargo itself reports it. A failure
+/// is an error rather than a fallback to `<repo>/target`: guessing is what
+/// put the scratch files somewhere a configured build never looked.
+fn target_dir(mut command: Command) -> Result<PathBuf, String> {
+    let output = command.output().map_err(|e| {
+        format!(
+            "could not start {:?} to find the target dir: {e}",
+            command.get_program()
+        )
+    })?;
+    if !output.status.success() {
+        return Err(format!(
+            "`cargo metadata` failed ({}) while finding the target dir:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim_end()
+        ));
+    }
+    parse_target_dir(&output.stdout)
 }
 
 /// This invocation's private scratch directory under the target dir: disk
@@ -235,16 +285,16 @@ fn generate(args: &Args) -> Result<Vec<PathBuf>, String> {
         .map(|(s, _)| *s)
         .collect();
 
-    let target = target_dir(&root, &cwd, std::env::var_os("CARGO_TARGET_DIR"));
+    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    let target = target_dir(metadata_command(&cargo, &root, &cwd))?;
     let run_dir = RunDir::create(&target)?;
     let html_dir = run_dir.0.join("tui-html");
     std::fs::create_dir_all(&html_dir)
         .map_err(|e| format!("create {}: {e}", html_dir.display()))?;
 
     if !tui.is_empty() {
-        let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
         run(
-            Command::new(cargo)
+            Command::new(&cargo)
                 .current_dir(&root)
                 .args([
                     "nextest",
@@ -289,18 +339,25 @@ fn generate(args: &Args) -> Result<Vec<PathBuf>, String> {
         ));
     }
     let needs_web = pairs.iter().any(|(_, c)| *c == Client::Desktop);
-    run(
-        Command::new(&playwright)
-            .current_dir(&desktop)
-            .args(["test", "-c", "playwright.screenshots.config.ts", "--grep"])
-            .arg(playwright_grep(&pairs))
-            .env(OUT_DIR_ENV, &out)
-            .env(TUI_HTML_DIR_ENV, &html_dir)
-            .env(RUN_DIR_ENV, &run_dir.0)
-            .env(PORT_ENV, free_port()?.to_string())
-            .env(WEB_BUILD_ENV, if needs_web { "1" } else { "0" }),
-        "rasterize (Playwright Chromium)",
-    )?;
+    let mut playwright = Command::new(&playwright);
+    playwright
+        .current_dir(&desktop)
+        .args(["test", "-c", "playwright.screenshots.config.ts", "--grep"])
+        .arg(playwright_grep(&pairs))
+        .env(OUT_DIR_ENV, &out)
+        .env(TUI_HTML_DIR_ENV, &html_dir)
+        .env(RUN_DIR_ENV, &run_dir.0)
+        .env(WEB_BUILD_ENV, if needs_web { "1" } else { "0" });
+    // Only the web server needs a port: a terminal-only run loads the TUI HTML
+    // from `file://`, so it neither binds one nor fails for want of one. An
+    // ambient value is removed too, so the config's fallback is what an unused
+    // `baseURL` reads rather than whatever the caller's environment held.
+    if needs_web {
+        playwright.env(PORT_ENV, free_port()?.to_string());
+    } else {
+        playwright.env_remove(PORT_ENV);
+    }
+    run(&mut playwright, "rasterize (Playwright Chromium)")?;
 
     let mut written = Vec::new();
     for (s, c) in &pairs {
@@ -392,23 +449,68 @@ mod tests {
     }
 
     #[test]
-    fn a_relative_cargo_target_dir_is_resolved_against_the_cwd_like_cargo_does() {
-        // Real absolute paths rather than `/repo`, which is not absolute on
+    fn the_target_dir_is_read_from_cargo_metadata_and_must_be_absolute() {
+        // A real absolute path rather than `/repo`, which is not absolute on
         // Windows, where `build-windows` runs this.
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let cwd = root.join("sub");
-        let relative = target_dir(root, &cwd, Some("build".into()));
-        assert!(relative.is_absolute());
-        assert_eq!(relative, cwd.join("build"));
-        let elsewhere = root.join("elsewhere").join("target");
-        assert_eq!(
-            target_dir(root, &cwd, Some(elsewhere.clone().into())),
-            elsewhere
+        let abs = Path::new(env!("CARGO_MANIFEST_DIR")).join("target");
+        let json = serde_json::json!({ "packages": [], "target_directory": abs });
+        assert_eq!(parse_target_dir(json.to_string().as_bytes()).unwrap(), abs);
+        let relative = serde_json::json!({ "target_directory": "target" });
+        assert!(
+            parse_target_dir(relative.to_string().as_bytes())
+                .unwrap_err()
+                .contains("relative")
         );
-        assert_eq!(target_dir(root, &cwd, None), root.join("target"));
-        // cargo rejects an empty value; this treats it as unset rather than
-        // resolving it to the cwd itself.
-        assert_eq!(target_dir(root, &cwd, Some("".into())), root.join("target"));
+        assert!(
+            parse_target_dir(b"{}")
+                .unwrap_err()
+                .contains("no target_directory")
+        );
+        assert!(parse_target_dir(b"not json").is_err());
+    }
+
+    /// The finding this replaced: a `[build] target-dir` in `.cargo/config.toml`
+    /// was ignored. Cargo resolves a relative one against the directory holding
+    /// the `.cargo/` it came from, so the expected value is that directory's
+    /// child — which only cargo itself would report.
+    #[test]
+    fn a_configured_target_dir_is_the_one_cargo_reports() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .unwrap();
+        let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir(project.path().join(".cargo")).unwrap();
+        std::fs::write(
+            project.path().join(".cargo").join("config.toml"),
+            "[build]\ntarget-dir = \"configured-target\"\n",
+        )
+        .unwrap();
+        let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+        let mut command = metadata_command(&cargo, &root, project.path());
+        command
+            .env_remove("CARGO_TARGET_DIR")
+            .env_remove("CARGO_BUILD_TARGET_DIR");
+        let dir = target_dir(command).unwrap();
+        assert!(dir.is_absolute(), "{}", dir.display());
+        assert!(
+            dir.ends_with("configured-target"),
+            "cargo reported {}",
+            dir.display()
+        );
+        assert_eq!(
+            dir.parent().unwrap().canonicalize().unwrap(),
+            project.path().canonicalize().unwrap()
+        );
+    }
+
+    #[test]
+    fn a_failing_cargo_metadata_is_an_error_not_a_fallback() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+        let missing = root.join("no-such-workspace");
+        let err = target_dir(metadata_command(&cargo, &missing, root)).unwrap_err();
+        assert!(err.contains("cargo metadata"), "{err}");
     }
 
     #[test]

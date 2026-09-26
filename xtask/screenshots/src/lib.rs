@@ -28,10 +28,12 @@ pub const WEB_BUILD_ENV: &str = "DAD_DOCS_SCREENSHOTS_WEB";
 
 /// The environment variable carrying the localhost port the desktop leg's
 /// `vite preview` binds and Playwright's `baseURL` points at.
-/// `cargo docs-screenshots` picks a free one per invocation, so two concurrent
-/// runs on one machine never share a server; the config keeps `--strictPort`,
-/// so a run that loses the race for its port fails rather than screenshotting
-/// somebody else's bundle. Unset — a hand-run of the config — uses 4183.
+/// `cargo docs-screenshots` picks a free one per invocation that serves the web
+/// build (and sets none for a terminal-only run, which starts no server), so
+/// two concurrent runs on one machine never share a server; the config keeps
+/// `--strictPort`, so a run that loses the race for its port fails rather than
+/// screenshotting somebody else's bundle. Unset — a hand-run of the config —
+/// uses 4183.
 pub const PORT_ENV: &str = "DAD_DOCS_SCREENSHOTS_PORT";
 
 /// The environment variable naming this invocation's private scratch directory

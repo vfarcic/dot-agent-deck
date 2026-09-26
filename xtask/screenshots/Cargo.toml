@@ -27,4 +27,10 @@ name = "xtask-screenshots"
 path = "src/main.rs"
 
 [dependencies]
+# Parses `cargo metadata`, which is how the binary learns cargo's effective
+# target directory rather than guessing it.
+serde_json = "1"
 vt100 = "0.16"
+
+[dev-dependencies]
+tempfile = "3"

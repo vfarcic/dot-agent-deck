@@ -34,9 +34,10 @@ const HERE = path.dirname(fileURLToPath(import.meta.url));
 // would load. Unset — a hand-run of this config — builds.
 const NEEDS_WEB = process.env.DAD_DOCS_SCREENSHOTS_WEB !== "0";
 
-// `cargo docs-screenshots` picks a free localhost port per invocation
-// (`PORT_ENV` in `xtask/screenshots/src/lib.rs`), so two concurrent runs never
-// share a server; `--strictPort` below makes a run that lost the race for it
+// `cargo docs-screenshots` picks a free localhost port per invocation that
+// serves the web build (`PORT_ENV` in `xtask/screenshots/src/lib.rs`; none for a
+// terminal-only run, whose `baseURL` is never loaded), so two concurrent runs
+// never share a server; `--strictPort` below makes a run that lost the race for it
 // fail instead of screenshotting another run's bundle. Unset — a hand-run of
 // this config — falls back to 4183, which is not the browser test tier's port,
 // so the two do not serve each other's bundle either.
