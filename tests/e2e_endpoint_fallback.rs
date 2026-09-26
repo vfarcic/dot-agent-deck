@@ -793,7 +793,7 @@ fn socket_014_a_foreign_owned_uid_directory_relocates_instead_of_wedging() {
                     expected.display()
                 ));
             }
-            if !log_contents.contains("is owned by another user") {
+            if !log_contents.contains("another user owns the usual directory") {
                 failures.push("the daemon did not log why it relocated".to_string());
             }
         }

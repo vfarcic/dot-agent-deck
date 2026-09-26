@@ -1936,7 +1936,7 @@ fn init_logging_from_env() {
 ///
 /// Issue #1173 then closed the wedge that preflight could only report: when
 /// another uid holds the per-uid directory's name,
-/// `endpoint_resolve::prepare_bind_endpoint` hands back the same socket name
+/// `endpoint_resolve::prepare_bind_endpoints` hands back the same socket name
 /// inside a relocated owner-only directory, and `endpoint` is **rewritten to
 /// it** — so the poll below waits where the daemon about to be spawned will
 /// bind, which runs the same call and reuses that directory. Every other
@@ -1946,7 +1946,11 @@ async fn bootstrap_primary_daemon(endpoint: &mut LocalEndpoint) -> Result<(), St
         endpoint.path().to_path_buf(),
         endpoint.source(),
     );
-    match dot_agent_deck::endpoint_resolve::prepare_bind_endpoint(&resolved).await {
+    let prepared =
+        dot_agent_deck::endpoint_resolve::prepare_bind_endpoints(std::slice::from_ref(&resolved))
+            .await
+            .map(|mut paths| paths.pop().unwrap_or_else(|| endpoint.path().to_path_buf()));
+    match prepared {
         Ok(bind_at) if bind_at != endpoint.path() => {
             *endpoint = LocalEndpoint::from_resolved(
                 dot_agent_deck::platform::paths::ResolvedEndpoint::new(bind_at, endpoint.source()),
@@ -2843,27 +2847,23 @@ async fn run_daemon_serve_cli() -> ExitCode {
     // Issue #1173: …except that when another uid holds the per-uid fallback
     // directory's name, both sockets go into a relocated owner-only sibling
     // instead of the daemon refusing to start. On every other host this hands
-    // back the resolved address unchanged. The launcher runs the same call
+    // back the resolved addresses unchanged. Both in ONE call, so the two
+    // sockets can never be split across directories by a squatter removing
+    // their entry between two decisions. The launcher runs the same rule
     // before it spawns us, so it polls where we are about to bind.
-    let path = match dot_agent_deck::endpoint_resolve::prepare_bind_endpoint(
-        &dot_agent_deck::platform::paths::resolve_socket_path(),
-    )
-    .await
-    {
-        Ok(path) => path,
-        Err(e) => {
-            eprintln!("Daemon error: cannot prepare the hook endpoint: {e}");
+    let prepared = dot_agent_deck::endpoint_resolve::prepare_bind_endpoints(&[
+        dot_agent_deck::platform::paths::resolve_socket_path(),
+        dot_agent_deck::platform::paths::resolve_attach_socket_path(),
+    ])
+    .await;
+    let (path, attach_path) = match prepared.as_deref() {
+        Ok([path, attach_path]) => (path.clone(), attach_path.clone()),
+        Ok(other) => {
+            eprintln!("Daemon error: expected two prepared endpoints, got {other:?}");
             return ExitCode::FAILURE;
         }
-    };
-    let attach_path = match dot_agent_deck::endpoint_resolve::prepare_bind_endpoint(
-        &dot_agent_deck::platform::paths::resolve_attach_socket_path(),
-    )
-    .await
-    {
-        Ok(path) => path,
         Err(e) => {
-            eprintln!("Daemon error: cannot prepare the attach endpoint: {e}");
+            eprintln!("Daemon error: cannot prepare the endpoints: {e}");
             return ExitCode::FAILURE;
         }
     };
