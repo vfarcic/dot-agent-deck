@@ -663,7 +663,7 @@ legacy_attach="$DOT_AGENT_DECK_TEST_LEGACY_ENDPOINT_ROOT/dot-agent-deck-attach-$
 pid=$!
 i=0
 until "$DAD_BIN" daemon endpoint >"$OUT/endpoint" 2>"$OUT/endpoint.err"; do
-    i=$((i+1)); [ "$i" -ge 150 ] && break
+    i=$((i+1)); [ "$i" -ge "$READY_POLLS" ] && break
     kill -0 "$pid" 2>/dev/null || break
     sleep 0.1
 done
@@ -726,6 +726,14 @@ fn socket_014_a_foreign_owned_uid_directory_relocates_instead_of_wedging() {
         .env("DOT_AGENT_DECK_EXPERIMENTAL", "0")
         .env("DAD_BIN", env!("CARGO_BIN_EXE_dot-agent-deck"))
         .env("OUT", &out)
+        // The scenario's readiness wait is the launcher's own start budget, in
+        // 100 ms polls, so a daemon slowed by its pre-bind login-shell capture
+        // under load is waited for exactly as long as a real launcher would.
+        .env(
+            "READY_POLLS",
+            (dot_agent_deck::daemon_attach::DAEMON_START_POLL_TIMEOUT.as_millis() / 100)
+                .to_string(),
+        )
         .output()
         .expect("run the squat scenario under bwrap");
     let read = |name: &str| fs::read_to_string(out.join(name)).unwrap_or_default();
