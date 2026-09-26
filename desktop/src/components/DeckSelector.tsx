@@ -61,7 +61,7 @@
  */
 import { useEffect, useId, useRef, useState } from "react";
 import { AlertTriangle, Check, ChevronsUpDown, Server } from "lucide-react";
-import { LOCAL_ENDPOINT_SELECTION, type RemoteEndpointDto, type VoiceDeckIdentityDto } from "../lib/bridge";
+import { LOCAL_ENDPOINT_SELECTION, REMOTE_ADDRESS_FIELDS, type RemoteEndpointDto, type VoiceDeckIdentityDto } from "../lib/bridge";
 import { VOICE_ACTIONS } from "../lib/voiceActions";
 import { DISPLAY_LIMITS, displayText } from "../lib/displayText";
 import {
@@ -116,8 +116,9 @@ function noteIsProblem(connection: ConnectionView): boolean {
  * "Unknown deck" label, which is a worse answer than saying so.
  *
  * The second refusal is the same race one step narrower (PRD #1195): the row is
- * still listed, but Settings changed its host, SSH user, port or socket under
- * the same id. `identity` is the address voice resolved the switch against;
+ * still listed, but Settings changed one of its address fields
+ * (`REMOTE_ADDRESS_FIELDS`: host, SSH user, port, socket, SSH key or jump host)
+ * under the same id. `identity` is the address voice resolved the switch against;
  * when it no longer matches the row, the switch would reach a machine or deck
  * the user did not name, so nothing is written and the user is asked to say it
  * again. The menu passes no `identity` — it writes the row it rendered — and
@@ -159,11 +160,7 @@ export function chooseDeckSelection(settings: DesktopSettingsState, token: strin
 
 /** Whether `row` still has the address voice resolved a switch against. */
 function sameDeckIdentity(row: RemoteEndpointDto | undefined, identity: VoiceDeckIdentityDto): boolean {
-  return row !== undefined
-    && row.host === identity.host
-    && row.port === identity.port
-    && row.user === identity.user
-    && row.socket === identity.socket;
+  return row !== undefined && REMOTE_ADDRESS_FIELDS.every((field) => row[field] === identity[field]);
 }
 
 export function DeckSelector({ settings, connection }: { settings: DesktopSettingsState; connection: ConnectionView }) {

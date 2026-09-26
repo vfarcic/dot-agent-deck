@@ -474,6 +474,24 @@ export interface RemoteEndpointDto {
   user?: string;
 }
 
+/**
+ * The {@link RemoteEndpointDto} fields that make up a row's ADDRESS — every one
+ * but its `id` — in the order {@link endpointsFingerprint} reads them. A change
+ * to any of them names a different deck or a different route to it: `host`,
+ * `user` and `port` pick the machine, `socket` the deck on it, and `identity`
+ * and `jump` how SSH gets there. One list, so the fingerprint, a spoken
+ * switch's {@link VoiceDeckIdentityDto} and the Deck selector's comparison of
+ * that identity with its row (`sameDeckIdentity`) cannot disagree about what an
+ * address is. Rust's `voice::VoiceDeckIdentity` carries the same set by hand:
+ * `selector_voice_decks_add_the_decks_the_selector_lists` holds it to the
+ * settings row's fields less `id`, and `bridge.test.ts` holds the keys a
+ * switch's identity reaches the webview with to this list.
+ */
+export const REMOTE_ADDRESS_FIELDS = ["host", "user", "port", "socket", "identity", "jump"] as const satisfies readonly (keyof RemoteEndpointDto)[];
+
+/** One of {@link REMOTE_ADDRESS_FIELDS}. */
+export type RemoteAddressField = (typeof REMOTE_ADDRESS_FIELDS)[number];
+
 /** How the app picks its light/dark palette. What it does is PRD #743's. */
 export type AppearanceMode = "system" | "light" | "dark";
 
@@ -786,32 +804,39 @@ export interface VoiceResolvedParamDto {
 }
 
 /**
- * A `[[endpoints.remote]]` row's address — the four {@link RemoteEndpointDto}
- * fields that decide which machine and which deck a connection reaches — as
- * Rust read it when resolving a spoken deck switch (PRD #1195).
+ * A `[[endpoints.remote]]` row's address — its {@link REMOTE_ADDRESS_FIELDS} —
+ * as Rust read it when resolving a spoken deck switch (PRD #1195). Rust omits
+ * an optional field the row does not set, and {@link withDeckIdentityKeys}
+ * gives every key back, as `undefined`, on the way in.
  *
- * Every key is present, and `user` and `socket` are `undefined` where the row
- * has none. Rust omits those two keys instead, so {@link withDeckIdentityKeys}
- * restores them on the way in, which is what makes the declaration true of
- * what a caller holds.
+ * `identity` and `jump` stay optional, as the row declares them, although that
+ * function always sets them: they joined the address after a test typed its
+ * identity against the other four, and optional keeps it compiling. The
+ * guard it is carried to, `sameDeckIdentity`, compares an absent key and an
+ * `undefined` one alike.
  */
-export interface VoiceDeckIdentityDto {
-  host: string;
+export interface VoiceDeckIdentityDto extends Pick<RemoteEndpointDto, RemoteAddressField> {
   user: string | undefined;
-  port: number;
   socket: string | undefined;
 }
 
 /**
- * {@link VoiceResultDto} with every `deckIdentity` given all four
- * {@link VoiceDeckIdentityDto} keys. Everything else passes through untouched.
+ * {@link VoiceResultDto} with every `deckIdentity` given every
+ * {@link VoiceDeckIdentityDto} key, an absent or `null` one as `undefined`.
+ * Everything else passes through untouched.
+ *
+ * The guard that reads it (`sameDeckIdentity`) compares with `===`, so the one
+ * spelling of "unset" matters: a `null` would never equal the row's absent
+ * field and would refuse every switch to that row.
  */
 function withDeckIdentityKeys(result: VoiceResultDto): VoiceResultDto {
   if (result.outcome.kind !== "dispatch") return result;
   const params = result.outcome.params.map((param) => {
     const identity = param.deckIdentity;
     if (!identity) return param;
-    return { ...param, deckIdentity: { host: identity.host, user: identity.user ?? undefined, port: identity.port, socket: identity.socket ?? undefined } };
+    const sent = identity as Partial<Record<RemoteAddressField, unknown>>;
+    const deckIdentity = Object.fromEntries(REMOTE_ADDRESS_FIELDS.map((field) => [field, sent[field] ?? undefined])) as unknown as VoiceDeckIdentityDto;
+    return { ...param, deckIdentity };
   });
   return { ...result, outcome: { ...result.outcome, params } };
 }
@@ -1038,7 +1063,7 @@ function endpointsFingerprint(settings: DesktopSettingsDto): string {
   if (!endpoints) return UNSPECIFIED_ENDPOINTS;
   return JSON.stringify([
     endpoints.selection,
-    endpoints.remote.map((row) => [row.id, row.host, row.user, row.port, row.socket, row.identity, row.jump]),
+    endpoints.remote.map((row) => [row.id, ...REMOTE_ADDRESS_FIELDS.map((field) => row[field])]),
   ]);
 }
 

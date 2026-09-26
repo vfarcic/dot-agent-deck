@@ -11,7 +11,7 @@ import { act, fireEvent, render, screen, waitFor, within } from "@testing-librar
 import "../styles.css";
 import { describe, expect, it, vi } from "vitest";
 import { createFixtureSnapshot } from "../data/fixture";
-import { DEFAULT_DESKTOP_SETTINGS, fixtureDesktopFeatures, type DesktopSettingsDto, type EndpointSettingsDto } from "../lib/bridge";
+import { DEFAULT_DESKTOP_SETTINGS, fixtureDesktopFeatures, type DesktopSettingsDto, type EndpointSettingsDto, type VoiceDeckIdentityDto } from "../lib/bridge";
 import type { DeckRuntimeState, DeckSnapshot } from "../types";
 import { DeckShell } from "../App";
 import { chooseDeckSelection, deckStateNote } from "./DeckSelector";
@@ -362,6 +362,40 @@ describe("switchDeck", () => {
       }, target);
       expect(save, JSON.stringify(changed)).not.toHaveBeenCalled();
       expect(reportRefused).toHaveBeenCalledWith(expect.stringMatching(/deck changed.*try again/i));
+    }
+  });
+
+  /**
+   * Scenario: voice resolved "switch deck to the build box" against a row that
+   * reaches it with an SSH key through a jump host, and Settings then changed
+   * only that key, or only that jump host, under the same row id. Either is a
+   * different route to the deck, so the switch is refused rather than written;
+   * with both unchanged it is written.
+   */
+  it("refuses a deck whose SSH key or jump host changed under the same row id", () => {
+    const routed = (): EndpointSettingsDto => {
+      const endpoints = twoDecks("local");
+      endpoints.remote![0] = { ...endpoints.remote![0], identity: "~/.ssh/id_ed25519", jump: "bastion" };
+      return endpoints;
+    };
+    const row = routed().remote![0];
+    const deckIdentity: VoiceDeckIdentityDto = {
+      host: row.host, user: row.user, port: row.port, socket: row.socket, identity: row.identity, jump: row.jump,
+    };
+    const unchanged = state(routed());
+    expect(chooseDeckSelection(unchanged.settings, BUILD_BOX, deckIdentity)).toBeUndefined();
+    expect(unchanged.save).toHaveBeenCalledTimes(1);
+    for (const changed of [
+      { identity: "~/.ssh/other_key" },
+      { identity: undefined },
+      { jump: "other-bastion" },
+      { jump: undefined },
+    ]) {
+      const endpoints = routed();
+      endpoints.remote![0] = { ...endpoints.remote![0], ...changed };
+      const { settings, save } = state(endpoints);
+      expect(chooseDeckSelection(settings, BUILD_BOX, deckIdentity), JSON.stringify(changed)).toMatch(/deck changed.*try again/i);
+      expect(save, JSON.stringify(changed)).not.toHaveBeenCalled();
     }
   });
 });

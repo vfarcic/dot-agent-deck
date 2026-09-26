@@ -3037,6 +3037,11 @@ fn selector_voice_decks(
                         .socket
                         .as_ref()
                         .map(|socket| socket.as_str().to_string()),
+                    identity: row
+                        .identity
+                        .as_ref()
+                        .map(|identity| identity.as_str().to_string()),
+                    jump: row.jump.as_ref().map(|jump| jump.as_str().to_string()),
                 }),
             },
         ));
@@ -4758,8 +4763,9 @@ mod tests {
     }
 
     /// Scenario: the app shows the local deck (a single-deck selection, so it
-    /// observes only that one) and Settings holds a connectable build box and
-    /// a new box with no socket path yet. Voice's decks gain both — keyed the
+    /// observes only that one) and Settings holds a connectable build box,
+    /// reached with an SSH key through a jump host, and a new box with no
+    /// socket path yet. Voice's decks gain both — keyed the
     /// way the fleet keys them and unable to take a new agent, for the reason
     /// that fits each — and every deck maps to the token the Deck selector
     /// stores for it. "Switch deck to the build box" then dispatches that
@@ -4768,7 +4774,7 @@ mod tests {
     async fn selector_voice_decks_add_the_decks_the_selector_lists() {
         use crate::settings::{EndpointId, EndpointSettings, RemoteEndpointSettings, Selection};
         use dot_agent_deck::daemon_client::Endpoint;
-        use dot_agent_deck::remote_tunnel::{Hostname, RemoteSocketPath};
+        use dot_agent_deck::remote_tunnel::{HostAlias, Hostname, KeyPath, RemoteSocketPath};
 
         let row = |id: &str, host: &str, socket: bool| {
             let mut row = RemoteEndpointSettings::new(
@@ -4780,11 +4786,11 @@ mod tests {
             }
             row
         };
+        let mut build_box = row("buildbox01", "build-box", true);
+        build_box.identity = Some(KeyPath::parse("~/.ssh/id_ed25519").expect("a key path"));
+        build_box.jump = Some(HostAlias::parse("bastion").expect("a jump alias"));
         let endpoints = EndpointSettings {
-            remote: vec![
-                row("buildbox01", "build-box", true),
-                row("newbox01", "new-box", false),
-            ],
+            remote: vec![build_box, row("newbox01", "new-box", false)],
             selection: Selection::Local,
         };
         let build_key = crate::dto::deck_wire_id(&Endpoint::Remote(
@@ -4837,7 +4843,37 @@ mod tests {
                 user: None,
                 port: 22,
                 socket: Some("/run/deck.sock".to_string()),
-            })
+                identity: Some("~/.ssh/id_ed25519".to_string()),
+                jump: Some("bastion".to_string()),
+            }),
+            "the key and the jump host are part of the address"
+        );
+        // The address is the row less its id — the set the webview's
+        // `REMOTE_ADDRESS_FIELDS` names — so a field added to the row without
+        // one here reddens this rather than slipping past the rebind guard.
+        let keys = |value: serde_json::Value| {
+            let mut keys: Vec<String> = value
+                .as_object()
+                .expect("an object")
+                .keys()
+                .cloned()
+                .collect();
+            keys.sort();
+            keys
+        };
+        let every_field = voice::VoiceDeckIdentity {
+            host: "h".to_string(),
+            user: Some("u".to_string()),
+            port: 22,
+            socket: Some("/s".to_string()),
+            identity: Some("~/k".to_string()),
+            jump: Some("j".to_string()),
+        };
+        let mut row_fields = keys(serde_json::to_value(&endpoints.remote[0]).expect("serializes"));
+        row_fields.retain(|field| field != "id");
+        assert_eq!(
+            keys(serde_json::to_value(&every_field).expect("serializes")),
+            row_fields
         );
         assert_eq!(
             selections["unconfigured-newbox01"]

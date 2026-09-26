@@ -113,11 +113,13 @@ pub struct ResolvedParam {
 }
 
 /// PRD #1195 — a `[[endpoints.remote]]` row's address as it stood when voice
-/// resolved a switch to it: `host`, `user`, `port` and `socket`, the four
-/// fields that decide which machine and which deck the connection reaches.
-/// Serialized in the webview's `RemoteEndpointDto` spelling, with the two
-/// optional fields absent rather than `null`, so it compares field for field
-/// with the row the selector reads.
+/// resolved a switch to it: every field of the row except its `id`, which is
+/// the set the webview's `REMOTE_ADDRESS_FIELDS` names — the same fields its
+/// `endpointsFingerprint` reads to decide whether a row now names a different
+/// deck or a different route to it (a changed `identity` file or `jump` host is
+/// the second). Serialized in the webview's `RemoteEndpointDto` spelling, with
+/// the optional fields absent rather than `null`, so it compares field for
+/// field with the row the selector reads.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VoiceDeckIdentity {
@@ -127,6 +129,12 @@ pub struct VoiceDeckIdentity {
     pub port: u16,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub socket: Option<String>,
+    /// The SSH identity file's path — a path, never key material.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub identity: Option<String>,
+    /// The `~/.ssh/config` `Host` name the connection jumps through.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub jump: Option<String>,
 }
 
 /// What [`address_deck_switch`] puts on a [`SWITCH_DECK_ROW`] dispatch: the
@@ -1349,14 +1357,12 @@ fn resolve_param(
         }
         ParamKind::DeckRef => match resolve_deck_ref(spoken, decks) {
             DeckRefMatch::One { id, label } => {
-                let disabled = if for_new_agent {
-                    decks
-                        .iter()
-                        .find(|deck| deck.id == id)
-                        .and_then(|deck| deck.unavailable.as_ref().map(|reason| (deck, reason)))
-                } else {
-                    None
-                };
+                // Reached only for the New agent dialog: the guard above
+                // took every other `deck_ref`.
+                let disabled = decks
+                    .iter()
+                    .find(|deck| deck.id == id)
+                    .and_then(|deck| deck.unavailable.as_ref().map(|reason| (deck, reason)));
                 match disabled {
                     Some((deck, reason)) => Err(Unmet::DeckUnavailable {
                         label,
@@ -2143,9 +2149,9 @@ pub fn resolve_deck_ref(spoken: &str, decks: &[VoiceDeck]) -> DeckRefMatch {
 ///
 /// The row's [`VoiceDeckIdentity`] rides along on the param
 /// ([`ResolvedParam::deck_identity`]): the token is a row id, and a row id
-/// survives Settings editing that row's host, user, port or socket — so
-/// without it a switch resolved against one machine would write a selection
-/// that now reaches another.
+/// survives Settings editing any of that row's address fields — so without it
+/// a switch resolved against one machine, or one route to it, would write a
+/// selection that now reaches another.
 pub fn address_deck_switch(
     outcome: &mut VoiceOutcome,
     selection_of: impl Fn(&str) -> Option<VoiceDeckSelection>,
@@ -7163,6 +7169,8 @@ mod tests {
             user: Some("deploy".to_string()),
             port: 22,
             socket: None,
+            identity: None,
+            jump: Some("bastion".to_string()),
         };
         let token = |key: &str| {
             (key == "deck-build").then(|| VoiceDeckSelection {
@@ -7180,7 +7188,7 @@ mod tests {
         assert_eq!(params[0].deck_identity.as_ref(), Some(&identity));
         assert_eq!(
             serde_json::to_value(&params[0]).expect("serializes")["deckIdentity"],
-            serde_json::json!({ "host": "build-box", "user": "deploy", "port": 22 }),
+            serde_json::json!({ "host": "build-box", "user": "deploy", "port": 22, "jump": "bastion" }),
             "absent optional fields, in the webview's spelling"
         );
 

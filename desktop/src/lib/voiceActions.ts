@@ -874,9 +874,10 @@ export type VoiceDispatchTarget = AgentViewTarget & {
   /**
    * The address of the remote row {@link deckSelection} named when Rust
    * resolved the switch (PRD #1195) — absent for the local deck, which has
-   * none. A row id survives Settings editing the row's host, user, port or
-   * socket, so the switch compares this with the row before writing and
-   * refuses one that now reaches a different machine or deck.
+   * none. A row id survives Settings editing any of the row's address fields
+   * (`REMOTE_ADDRESS_FIELDS`), so the switch compares this with the row before
+   * writing and refuses one that now reaches a different machine or deck, or
+   * the same deck by a different route.
    */
   deckIdentity?: VoiceDeckIdentityDto;
   /**
