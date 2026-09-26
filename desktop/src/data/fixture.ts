@@ -648,8 +648,8 @@ const crowdedAgents: AgentSession[] = [
 
 /**
  * The `?fixture=1&state=docs` scenario: the four agents the TUI half of the
- * docs screenshots drives into the dashboard with synthetic hook events
- * (`DASHBOARD_AGENTS` in `tests/e2e_docs_screenshots.rs`, issue #1322), so the
+ * docs screenshots opens in dashboard panes and describes with synthetic hook
+ * events (`DASHBOARD_AGENTS` in `tests/e2e_docs_screenshots.rs`, issue #1322), so the
  * TUI and desktop images of the `dashboard` scenario depict ONE state. Names,
  * agent types, directory, prompts, tools and ages are the TUI's; each status is
  * what live mode maps the TUI's hook state to (`DAEMON_STATUS` in
@@ -662,27 +662,28 @@ const crowdedAgents: AgentSession[] = [
  */
 const DOCS_CWD = "/home/dev/storefront";
 /*
- * Each docs agent's age in minutes: `quiet_for_minutes` of the same-named
- * agent in `DASHBOARD_AGENTS` (`tests/e2e_docs_screenshots.rs`). The TUI
- * capture stamps that agent's `session_start` and its status event with the
- * same instant, `quiet_for_minutes` before the capture, and the daemon takes a
- * session's start from its `session_start` timestamp (`SessionState::started_at`
- * in `src/state.rs`), so in the TUI's timeline each agent started exactly as
- * long ago as it last acted. Uptime and last activity both read from that one
- * number here, so the two images describe one timeline rather than two sets of
- * ages that merely look plausible. Change a value here and in the test together.
+ * Each docs agent's uptime in minutes: `up_for_minutes` of the same-named agent
+ * in `DASHBOARD_AGENTS` (`tests/e2e_docs_screenshots.rs`), which stamps that
+ * agent's `session_start` this far back. The TUI capture's status events are
+ * stamped seconds before the capture (`quiet_for_secs`, the cards' `Last:`
+ * labels: a TUI card's last activity cannot read older than its pane, and the
+ * capture opens the panes), so every docs agent's last activity here is
+ * `DOCS_QUIET_MINUTES` — under a minute, which the overview reads as `just now`.
+ * The depicted state is one fleet: agents up for hours, each active seconds
+ * ago. Change a value here and in the test together.
  */
-const DOCS_AGE_MINUTES = {
+const DOCS_UP_MINUTES = {
   plan: 135,
   impl: 65,
   review: 70,
   verify: 80,
 } as const;
+const DOCS_QUIET_MINUTES = 0;
 const docsAgents: AgentSession[] = [
-  crowdedAgent({ id: "1", displayName: "Plan / architecture", role: "Claude code", cli: "claude", status: "waiting", cwd: DOCS_CWD, toolCount: 0, upForMinutes: DOCS_AGE_MINUTES.plan, quietForMinutes: DOCS_AGE_MINUTES.plan, lastUserPrompt: "Map the checkout flow and propose a retry design.", tab: { kind: "dashboard" } }),
-  crowdedAgent({ id: "2", displayName: "Desktop implementation", role: "Codex", cli: "codex", status: "running", cwd: DOCS_CWD, toolCount: 0, upForMinutes: DOCS_AGE_MINUTES.impl, quietForMinutes: DOCS_AGE_MINUTES.impl, activeTool: "Edit", activeToolDetail: "src/components/RetryPayment.tsx", lastUserPrompt: "Add the retry action to the checkout view.", tab: { kind: "dashboard" } }),
-  crowdedAgent({ id: "3", displayName: "Contract review", role: "Claude code", cli: "claude", status: "running", cwd: DOCS_CWD, toolCount: 0, upForMinutes: DOCS_AGE_MINUTES.review, quietForMinutes: DOCS_AGE_MINUTES.review, activeTool: "Bash", activeToolDetail: "cargo test checkout_retry", lastUserPrompt: "Check the payment API for breaking changes.", tab: { kind: "dashboard" } }),
-  crowdedAgent({ id: "4", displayName: "User-path verification", role: "Open code", cli: "opencode", status: "waiting", cwd: DOCS_CWD, toolCount: 0, upForMinutes: DOCS_AGE_MINUTES.verify, quietForMinutes: DOCS_AGE_MINUTES.verify, lastUserPrompt: "Walk the checkout path and report failures.", tab: { kind: "dashboard" } }),
+  crowdedAgent({ id: "1", displayName: "Plan / architecture", role: "Claude code", cli: "claude", status: "waiting", cwd: DOCS_CWD, toolCount: 0, upForMinutes: DOCS_UP_MINUTES.plan, quietForMinutes: DOCS_QUIET_MINUTES, lastUserPrompt: "Map the checkout flow and propose a retry design.", tab: { kind: "dashboard" } }),
+  crowdedAgent({ id: "2", displayName: "Desktop implementation", role: "Codex", cli: "codex", status: "running", cwd: DOCS_CWD, toolCount: 0, upForMinutes: DOCS_UP_MINUTES.impl, quietForMinutes: DOCS_QUIET_MINUTES, activeTool: "Edit", activeToolDetail: "src/components/RetryPayment.tsx", lastUserPrompt: "Add the retry action to the checkout view.", tab: { kind: "dashboard" } }),
+  crowdedAgent({ id: "3", displayName: "Contract review", role: "Claude code", cli: "claude", status: "running", cwd: DOCS_CWD, toolCount: 0, upForMinutes: DOCS_UP_MINUTES.review, quietForMinutes: DOCS_QUIET_MINUTES, activeTool: "Bash", activeToolDetail: "cargo test checkout_retry", lastUserPrompt: "Check the payment API for breaking changes.", tab: { kind: "dashboard" } }),
+  crowdedAgent({ id: "4", displayName: "User-path verification", role: "Open code", cli: "opencode", status: "waiting", cwd: DOCS_CWD, toolCount: 0, upForMinutes: DOCS_UP_MINUTES.verify, quietForMinutes: DOCS_QUIET_MINUTES, lastUserPrompt: "Walk the checkout path and report failures.", tab: { kind: "dashboard" } }),
 ];
 
 /**
