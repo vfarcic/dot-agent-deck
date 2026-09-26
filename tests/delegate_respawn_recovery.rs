@@ -705,18 +705,23 @@ async fn delegate_023_a_replacement_that_dies_is_reported_to_the_orchestrator() 
     // identify, which is exactly the worker the unidentified-agent timeout WARN
     // is about — and it must NOT get that WARN, because it did not wait out any
     // timeout: it died. Global rather than thread-local because this runtime is
-    // multi-threaded and the dispatch task can run on any worker. Nextest runs
-    // each test in its own process, so the global slot is free; under plain
-    // `cargo test` a sibling may have taken it, and the log half is skipped.
+    // multi-threaded and the dispatch task can run on any worker — and a global
+    // subscriber is only this test's when the process is, so it is installed
+    // only under nextest's process-per-test mode (what `cargo test-fast` runs).
+    // Under plain `cargo test` siblings share the process: installing it there
+    // would capture THEIR warnings too, and could not be removed afterwards, so
+    // the log half is skipped instead (Qodo on PR #1331).
     let captured = CapturedLog::default();
-    let log_capture_installed = tracing::subscriber::set_global_default(
-        tracing_subscriber::fmt()
-            .with_writer(captured.clone())
-            .with_max_level(tracing_subscriber::filter::LevelFilter::WARN)
-            .with_ansi(false)
-            .finish(),
-    )
-    .is_ok();
+    let log_capture_installed = std::env::var("NEXTEST_EXECUTION_MODE").as_deref()
+        == Ok("process-per-test")
+        && tracing::subscriber::set_global_default(
+            tracing_subscriber::fmt()
+                .with_writer(captured.clone())
+                .with_max_level(tracing_subscriber::filter::LevelFilter::WARN)
+                .with_ansi(false)
+                .finish(),
+        )
+        .is_ok();
 
     // The stand-in refuses to start once a `die` marker exists beside it. The
     // TEST drops that marker, after confirming the first worker is up — so
@@ -806,7 +811,10 @@ async fn delegate_023_a_replacement_that_dies_is_reported_to_the_orchestrator() 
              (issue #1243 review); captured log = {log:?}"
         );
     } else {
-        println!("SKIP: log half — a global tracing subscriber was already installed");
+        println!(
+            "SKIP: log half — not a nextest process-per-test run, so a global subscriber here \
+             would not be this test's alone"
+        );
     }
 }
 
