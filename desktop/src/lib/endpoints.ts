@@ -482,21 +482,22 @@ export interface DeckChoice {
  * paths — so this list is never empty and the selector is useful before
  * anything is stored.
  *
- * **Rendered text says Deck, never "daemon".** M15 swept the rest of the app
- * into the same vocabulary, so this is no longer the only surface written in it:
- * rendered text says Deck everywhere, while code, protocol, CLI, docs, CSS class
- * names and `data-testid`s deliberately keep `daemon`.
+ * **Rendered text says daemon, never "Deck"** (issue #1045, which reversed PRD
+ * #741 M15's "the UI says Deck"; `docs/develop/glossary.md` has the canonical
+ * words). Identifiers keep the `deck` spelling M15 left them in — `deckId`,
+ * `DeckChoice`, the `deck-*` testids — because renaming them changes nothing a
+ * user sees.
  */
 export function deckChoices(section: EndpointSettingsDto | undefined): DeckChoice[] {
   const choices: DeckChoice[] = [
-    { token: ALL_ENDPOINT_SELECTION, selection: ALL_DECKS_SELECTION, label: "All Decks" },
+    { token: ALL_ENDPOINT_SELECTION, selection: ALL_DECKS_SELECTION, label: "All daemons" },
     { token: LOCAL_ENDPOINT_SELECTION, selection: LOCAL_DECK_SELECTION, label: "This machine" },
   ];
   for (const row of section?.remote ?? []) {
     choices.push({
       token: row.id,
       selection: { kind: "one", id: row.id },
-      label: describeEndpoint(row) || "New deck",
+      label: describeEndpoint(row) || "New daemon",
     });
   }
   return choices;
@@ -510,7 +511,7 @@ export function deckChoices(section: EndpointSettingsDto | undefined): DeckChoic
  * the local deck and says so through `connection.selectionFallback`; this is
  * only the label on the trigger while that sentence is on screen.
  */
-export const UNKNOWN_DECK_LABEL = "Unknown deck";
+export const UNKNOWN_DECK_LABEL = "Unknown daemon";
 
 /** Whether two stored rows are the same deck described the same way. */
 function sameEndpointRow(left: RemoteEndpointDto, right: RemoteEndpointDto): boolean {

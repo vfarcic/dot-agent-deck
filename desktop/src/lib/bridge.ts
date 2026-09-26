@@ -54,7 +54,7 @@ export interface DesktopSnapshotDto {
     /** Why the app is on the local deck when the stored selection named another. */
     selectionFallback?: string;
     /**
-     * Why projects and workflows cannot be started against this deck (PRD #741
+     * Why projects and orchestrations cannot be activated against this daemon (PRD #741
      * M8), or absent when they can.
      *
      * Derived daemon-side from the `Hello` reply's ADVERTISED capability set,
@@ -1320,7 +1320,7 @@ export type DesktopRunActionDto =
   | { type: "attach_terminal"; agentId: string; onOutput: import("@tauri-apps/api/core").Channel<ArrayBuffer> }
   | { type: "detach_terminal"; sessionId: string }
   | { type: "submit_text"; agentId: string; text: string }
-  | { type: "start_workflow"; name: string; cwd: string; taskPrompt: string; roles: { role: string; command: string; start: boolean }[]; rows?: number; cols?: number; configRevision?: string }
+  | { type: "activate_orchestration"; name: string; cwd: string; taskPrompt: string; roles: { role: string; command: string; start: boolean }[]; rows?: number; cols?: number; configRevision?: string }
   | { type: "stop_daemon"; force?: boolean }
   | { type: "restart_daemon" }
   | { type: "allow_build_mismatch" };
@@ -1661,7 +1661,7 @@ export function fixtureDesktopFeatures(search = window.location.search): Desktop
  * so neither is reachable from it; the fixture keeps the refusal so it answers
  * a malformed request the way the crate does.
  */
-export const FIXTURE_PASTED_PATH_REFUSAL = "enter an absolute directory path, without control characters, that the deck can see";
+export const FIXTURE_PASTED_PATH_REFUSAL = "enter an absolute directory path, without control characters, that the daemon can see";
 
 /** Whether the crate's `validate_pasted_project_path` would accept `path` on a Unix deck — absolute, and free of ASCII controls. */
 function fixtureAcceptsPath(path: string): boolean {
@@ -1669,11 +1669,11 @@ function fixtureAcceptsPath(path: string): boolean {
 }
 
 /** The sentence the live crate's `newAgentReason` carries for a deck without `list-directories` (PRD #1223 U1), repeated by the fixture's older decks. */
-export const FIXTURE_NO_LISTING_REASON = "This deck does not advertise list-directories, so it cannot be browsed for a directory to start in. Start agents on it from the TUI on its host, or upgrade the deck.";
+export const FIXTURE_NO_LISTING_REASON = "This daemon does not advertise list-directories, so it cannot be browsed for a directory to start in. Create agents on it from the TUI on its host, or upgrade the daemon.";
 
 /** What a fixture deck says about a path that names no directory it has, in the daemon's own `unresolved` wording. */
 /** The live crate's `CONFIGURED_ROLE_COMMAND_UNSUPPORTED`, repeated by the fixture's older and non-Unix decks (PRD #1223 M6). */
-const FIXTURE_CONFIGURED_ROLES_UNSUPPORTED = "This deck cannot start orchestration roles with their configured commands, so its orchestrations are not offered here. Nothing was started. Launch them from the TUI on that deck's host, or upgrade the deck.";
+const FIXTURE_CONFIGURED_ROLES_UNSUPPORTED = "This daemon cannot start orchestration roles with their configured commands, so its orchestrations are not offered here. Nothing was started. Activate them from the TUI on that daemon's host, or upgrade the daemon.";
 
 const FIXTURE_UNRESOLVED_REFUSAL = "daemon returned error: unresolved: that path did not resolve to a readable directory on this daemon";
 
@@ -1748,7 +1748,7 @@ function taskLine(agent: DesktopAgentDto): string {
   // neither (PRD #745 M8).
   const reported = agent.lastUserPrompt
     ?? (agent.activeTool ? `Active tool: ${agent.activeTool.name}${agent.activeTool.detail ? ` · ${agent.activeTool.detail}` : ""}` : undefined);
-  return reported === undefined ? "Task metadata unavailable from the deck" : displayText(reported, DISPLAY_LIMITS.prompt);
+  return reported === undefined ? "Task metadata unavailable from the daemon" : displayText(reported, DISPLAY_LIMITS.prompt);
 }
 
 function agentFromDto(agent: DesktopAgentDto, index: number, daemonId: string): AgentSession {
@@ -1820,7 +1820,7 @@ function agentFromDto(agent: DesktopAgentDto, index: number, daemonId: string): 
  * PR #416 review M1: every persisted-preferences key is scoped by runtime
  * mode. Fixture sessions used to write projects/profiles/prompts under the
  * SAME keys live mode read back — so one fixture visit could hand a real
- * workflow launch a working directory that never existed.
+ * orchestration activation a working directory that never existed.
  */
 export function modeScopedKey(base: string): string {
   return `${base}.${selectRuntimeMode()}`;
@@ -1835,12 +1835,12 @@ export function modeScopedKey(base: string): string {
  * the same flag the Connect anyway affordance is gated on.
  */
 function fallbackConnectionMessage(connection: DesktopSnapshotDto["connection"]): string {
-  if (connection.status === "connected") return "Deck responding";
-  if (connection.status !== "incompatible") return "Deck unavailable";
+  if (connection.status === "connected") return "Daemon responding";
+  if (connection.status !== "incompatible") return "Daemon unavailable";
   if (connection.buildStampMismatchOnly) {
-    return `Build mismatch: desktop is ${connection.clientBuildVersion}, deck is ${connection.daemonBuildVersion ?? "unreported"}.`;
+    return `Build mismatch: desktop is ${connection.clientBuildVersion}, daemon is ${connection.daemonBuildVersion ?? "unreported"}.`;
   }
-  return `Protocol mismatch: desktop v${connection.clientProtocolVersion}, deck v${connection.serverProtocolVersion ?? "unknown"}`;
+  return `Protocol mismatch: desktop v${connection.clientProtocolVersion}, daemon v${connection.serverProtocolVersion ?? "unknown"}`;
 }
 
 /**
@@ -1992,7 +1992,7 @@ export function mapDesktopSnapshot(dto: DesktopSnapshotDto, previous?: DeckSnaps
   }));
 
   return {
-    runId: previous?.runId ?? "live-deck",
+    runId: previous?.runId ?? "live-daemon",
     repo,
     // No branch: nothing daemon-side tracks one, and the literal "Unavailable"
     // this used to carry was a placeholder the topbar printed as if it were the
@@ -2127,10 +2127,10 @@ class FixtureDeckBridge implements DeckBridge {
   private connectedDeck(deckId: string): DeckSnapshot {
     const deck = this.fleet.find((candidate) => candidate.connection.deckId === deckId);
     if (!deck) {
-      throw new Error(`that deck is not one this app is observing: ${deckId}`);
+      throw new Error(`that daemon is not one this app is observing: ${deckId}`);
     }
     if (deck.connection.status !== "connected") {
-      throw new Error(`that deck is not connected: ${deckId}`);
+      throw new Error(`that daemon is not connected: ${deckId}`);
     }
     return deck;
   }
@@ -2216,7 +2216,7 @@ class FixtureDeckBridge implements DeckBridge {
     // and refuses an authoring start the way the live crate does — before
     // anything is started, in the crate's own sentence.
     if (action.authoringKind && this.isOlderDeck(action.deckId)) {
-      throw new Error(`This deck cannot start a \`${action.authoringKind}\` agent: it predates daemon-composed authoring seeds, and would start a plain agent with no seed. Nothing was started. Start it from the TUI on that deck's host, or upgrade the deck.`);
+      throw new Error(`This daemon cannot start a \`${action.authoringKind}\` agent: it predates daemon-composed authoring seeds, and would start a plain agent with no seed. Nothing was started. Create it from the TUI on that daemon's host, or upgrade the daemon.`);
     }
     const agentId = nextFixtureAgentId(deck.agents);
     deck.agents = [
@@ -2399,8 +2399,8 @@ class FixtureDeckBridge implements DeckBridge {
       state: row || selection === LOCAL_ENDPOINT_SELECTION ? "ssh_unavailable" : "unknown_deck",
       ok: false,
       message: row || selection === LOCAL_ENDPOINT_SELECTION
-        ? "Browser preview — it has no way to reach a deck, so nothing was tested."
-        : "That deck is no longer in this settings document.",
+        ? "Browser preview — it has no way to reach a daemon, so nothing was tested."
+        : "That daemon is no longer in this settings document.",
       disclosureKnown: false,
       forwards: [],
       knownHosts: [],
@@ -2608,7 +2608,7 @@ class FixtureDeckBridge implements DeckBridge {
    */
   async resolveProject(): Promise<DaemonResolvedProject> {
     await Promise.resolve();
-    throw new Error("The deterministic preview has no deck, so it can resolve no project. Run against a live deck to choose one.");
+    throw new Error("The deterministic preview has no daemon, so it can resolve no project. Run against a live daemon to choose one.");
   }
 
   /**
@@ -3769,7 +3769,7 @@ export class TauriDeckBridge implements DeckBridge {
 
   async runAction(action: DeckAction): Promise<DeckActionResult> {
     const invoke = await this.getInvoke();
-    if (action.type === "start_agent" || action.type === "start_orchestration" || action.type === "stop_agent" || action.type === "stop_orchestration" || action.type === "rename_agent" || action.type === "submit_text" || action.type === "start_workflow" || action.type === "stop_daemon" || action.type === "restart_daemon" || action.type === "allow_build_mismatch") {
+    if (action.type === "start_agent" || action.type === "start_orchestration" || action.type === "stop_agent" || action.type === "stop_orchestration" || action.type === "rename_agent" || action.type === "submit_text" || action.type === "activate_orchestration" || action.type === "stop_daemon" || action.type === "restart_daemon" || action.type === "allow_build_mismatch") {
       // `desktop_run_action` resolves with `ok: false` for a non-delivered
       // send rather than raising, so the result must be returned, not dropped.
       //
@@ -3809,14 +3809,14 @@ export class TauriDeckBridge implements DeckBridge {
     if (action.type === "start_daemon") {
       const dto = await invoke<DesktopSnapshotDto>("desktop_bootstrap", { options: { startIfMissing: true } });
       if (dto.connection.status !== "connected") {
-        throw new Error(dto.connection.error ?? "The local deck did not become connected.");
+        throw new Error(dto.connection.error ?? "The local daemon did not become connected.");
       }
       // PRD #745 M7: starting the daemon no longer attaches its whole fleet
       // either — this was the third eager call site, and the one reachable
       // without a snapshot event at all.
       return { ok: true };
     }
-    throw new Error("This orchestration control is available in the fixture preview but is not yet exposed by the live deck.");
+    throw new Error("This orchestration control is available in the fixture preview but is not yet exposed by the live daemon.");
   }
 
   /**

@@ -161,11 +161,11 @@ id          = "open_agent"
 description = """Open one agent's pane over the current screen, so the user can watch that one
 agent's terminal. Use when the user asks to focus on, enlarge, zoom, open, show, see or look at ONE
 named agent, or to see only that one ("everything except the tester") — including "open tester
-agent", the accessible name of an overview row's open control. The agent is named the way the deck shows it — a role like "tester" or
+agent", the accessible name of a dashboard row's open control. The agent is named the way the screen shows it — a role like "tester" or
 "orchestrator", or a name the user gave it."""
 invoke      = "openAgent"
 screens     = ["deck", "overview"]
-unavailable_hint = "opening an agent works from the deck or the agent overview"
+unavailable_hint = "opening an agent works from the Daemons screen or the agent dashboard"
 report      = "Opening {agent}."
 asks_to     = "open an agent's pane"
 try_saying  = "open {agent}"
@@ -177,47 +177,53 @@ heard_as    = ["open", "show", "see", "focus", "enlarge", "zoom", "look", "watch
 
 [[commands]]
 id          = "open_overview"
-description = """Leave the deck and show the agent overview: every agent across every connected
-deck in one list, with each one's status and activity. Use when the user asks to see everything,
-all the agents, the whole fleet, or asks which agents are running or what needs attention."""
+description = """Leave the Daemons screen and show the agent dashboard: every agent across every
+connected daemon in one list, with each one's status and activity. Use when the user asks to see
+everything, all the agents, the whole fleet, the dashboard (the label of the rail's Dashboard
+button) or the overview, or asks which agents are running or what needs attention."""
 invoke      = "openOverview"
 screens     = ["deck", "overview"]
-unavailable_hint = "the agent overview opens from the rail once the agent's pane is closed"
-report      = "Opening the agent overview."
-asks_to     = "show the agent overview"
+unavailable_hint = "the agent dashboard opens from the rail once the agent's pane is closed"
+report      = "Opening the agent dashboard."
+asks_to     = "show the agent dashboard"
 try_saying  = "show everything"
-heard_as    = ["overview", "everything", "all", "fleet", "running", "attention"]
+heard_as    = ["dashboard", "overview", "everything", "all", "fleet", "running", "attention"]
 
 [[commands]]
 id          = "open_deck"
-description = """Go back to the deck — the screen with the terminals on it — leaving the agent
-overview. On the agent overview a bare "go back" or "back" means THIS one, because the deck is
-the screen the overview was opened from. Also use for open deck and deck — the labels of the
-overview's Open deck button and its rail's Deck button — and for return to the deck, take me back,
-show me the deck, show the deck, or show the terminals or panes again. While the New agent dialog
-is open, a request that names WHICH deck the new agent goes on is `choose_deck`, not this one."""
+description = """Go back to the Daemons screen — the screen with the terminals on it — leaving the
+agent dashboard. On the agent dashboard a bare "go back" or "back" means THIS one, because the
+Daemons screen is the one the dashboard was opened from. Also use for open daemons and daemons —
+the labels of the dashboard's Open daemons button and its rail's Daemons button — and for return
+to the daemons, take me back, show me the terminals, or show the terminals or panes again. Users
+who knew the screen by its older name say deck, open deck, go back to the deck, back to the deck,
+return to the deck, the deck, show me the deck or show the deck, and those mean THIS one too.
+While the New agent dialog is open, a request that names WHICH daemon the new agent goes on is
+`choose_deck`, not this one."""
 invoke      = "openDeck"
 screens     = ["deck", "overview"]
-unavailable_hint = "the deck opens from the rail once the agent's pane is closed"
-report      = "Back to the deck."
-asks_to     = "go back to the deck"
-try_saying  = "go back to the deck"
-heard_as    = ["deck", "back", "return", "terminals", "panes"]
+unavailable_hint = "the Daemons screen opens from the rail once the agent's pane is closed"
+report      = "Back to the Daemons screen."
+asks_to     = "go back to the Daemons screen"
+try_saying  = "open daemons"
+heard_as    = ["daemons", "deck", "back", "return", "terminals", "panes"]
 # Over the New agent dialog this row is `close`'s destructive case by another
 # route (PRD #1223, closing audit H1): leaving the overview unmounts it, and the
 # form goes with it — since #1247 a close keeps the form as a draft, but that
-# draft lives in the overview's state, so leaving the overview still loses it.
+# draft lives in the dashboard's state, so leaving the dashboard still loses it.
 # So there it needs the whole utterance, and only an explicit request for the
-# deck — a bare "back" or "take me back" to a user filling a form is as likely
-# to mean the dialog or the parent directory. The dialog is modal, so no click
-# reaches the deck from behind it either.
+# Daemons screen — a bare "back" or "take me back" to a user filling a form is
+# as likely to mean the dialog or the parent directory. The dialog is modal, so
+# no click reaches the screen from behind it either.
 #
-# A bare "deck" and "the deck" left this list with #1263: over the dialog the
-# visible "Deck" is the dialog's own field heading, whose row is `choose_deck`
-# — the rail's Deck button is behind the modal — and the reading that loses
-# nothing is the one to keep. Said alone they name no deck, so they now get
-# `choose_deck`'s "which deck" rather than navigating away.
+# A bare "daemons"/"the daemons" and "deck"/"the deck" are not on this list
+# (#1263): over the dialog the visible "Daemon" is the dialog's own field
+# heading, whose row is `choose_deck` — the rail's Daemons button is behind the
+# modal — and the reading that loses nothing is the one to keep. Said alone they
+# name no daemon, so they get `choose_deck`'s "which daemon" rather than
+# navigating away.
 heard_as_whole_while.new_agent_dialog = [
+  "open daemons", "go back to the daemons", "back to the daemons",
   "go back to the deck", "back to the deck", "return to the deck",
   "show me the deck", "show the deck", "show the terminals",
 ]
@@ -300,12 +306,12 @@ is open, then one agent's open pane, and otherwise the Settings sheet if it is o
 dialog, close this dialog, close the new agent dialog, close new agent (the accessible name of the
 dialog's X button), cancel, cancel this, cancel it, never mind,
 dismiss this, hide this, get rid of this, I'm done with this, stop looking at this, leave this
-agent, or back to the overview. "Close the agent", "close the agent screen", "close the agent
+agent, or back to the dashboard or overview. "Close the agent", "close the agent screen", "close the agent
 view" and "close the agent pane" mean THIS one: they close the VIEW of the agent, and the agent
 keeps running. Closing the New agent dialog this way keeps what was entered in it for the next
 time it opens; only "discard" throws it away, and that is `discard_new_agent`. When closing a view
 and stopping something are both possible readings, closing the view is the one meant. A bare "go back" or "back" means THIS one ONLY when `open_deck` is not
-callable — a callable `open_deck` means the deck itself is what "back" leads to, and that one
+callable — a callable `open_deck` means the Daemons screen itself is what "back" leads to, and that one
 wins. This only closes what is on top: it does NOT stop any agent, does NOT close an agent's
 terminal pane, and does NOT turn voice off."""
 invoke      = "closeTopmost"
@@ -337,9 +343,9 @@ heard_as_whole_while.new_agent_dialog = [
 # modal pane, so voice there would open a surface no click can reach.
 [[commands]]
 id          = "open_settings"
-description = """Open the app's Settings sheet: appearance, the decks this app connects to, voice,
+description = """Open the app's Settings sheet: appearance, the daemons this app connects to, voice,
 and zoom. Use when the user asks for settings, preferences, options, configuration, or asks where
-to change how the app looks, where to add or edit a deck, or where to put an API key. This only
+to change how the app looks, where to add or edit a daemon (or deck), or where to put an API key. This only
 opens the sheet — it changes no setting by itself."""
 invoke      = "openSettings"
 screens     = ["deck", "overview"]
@@ -565,23 +571,23 @@ heard_as_whole = [
 # exposes behaviour that already exists rather than adding a route of its own.
 [[commands]]
 id          = "open_new_agent"
-description = """Open the New agent dialog, where the user picks a deck, a directory and an agent to
-start. Use for new agent, start a new agent, create an agent, launch an agent, add an agent, spawn
-an agent, spin one up, or I want another agent. While the New agent dialog is NOT open, any
-request to start an agent — "start the new agent", "start it", "launch the agent", "start
-orchestration" — means THIS one, because the dialog has to be open before anything can start.
-When the user names the deck it
+description = """Open the New agent dialog, where the user picks a daemon, a directory and an agent
+to start. Use for new agent, start a new agent, create an agent, launch an agent, add an agent,
+spawn an agent, spin one up, or I want another agent. While the New agent dialog is NOT open, any
+request to start an agent — "start the new agent", "start it", "launch the agent", "create
+agent", "activate orchestration" — means THIS one, because the dialog has to be open before
+anything can start. When the user names the daemon (which a user may also call a deck) it
 should go on — "new agent on the build box", "start an agent on local" — set `deck` to the words
 they used for it; otherwise leave `deck` out. This only OPENS the dialog: it starts nothing. It is
 not `open_agent`, which shows an agent that already exists."""
 invoke      = "openNewAgent"
 screens     = ["overview"]
 requires    = ["new_agent_dialog_closed"]
-unavailable_hint = "the New agent dialog opens from the agent overview, when it is not already open"
+unavailable_hint = "the New agent dialog opens from the agent dashboard, when it is not already open"
 report      = "Opening the New agent dialog."
 asks_to     = "open the New agent dialog"
 try_saying  = "new agent"
-heard_as    = ["new", "create", "launch", "add", "spin", "spawn", "another", "start"]
+heard_as    = ["new", "create", "activate", "launch", "add", "spin", "spawn", "another", "start"]
 unavailable_redirects = "start_new_agent"
 
   [[commands.params]]
@@ -628,11 +634,11 @@ starts nothing and does not choose the directory for the agent (that is `use_thi
 A request to open a directory is THIS one even when `directories` is absent — the dialog is closed
 or has no listing yet — and the action is then `callable: false`: pick it anyway rather than
 `none`, and the app says how to get to a listing. Not for going up (`go_to_parent`), and never for
-an agent or a deck."""
+an agent or a daemon."""
 invoke      = "openDirectory"
 screens     = ["overview"]
 requires    = ["directory_listing"]
-unavailable_hint = "opening a directory needs the New agent dialog's directory listing; say “new agent” and choose a deck first"
+unavailable_hint = "opening a directory needs the New agent dialog's directory listing; say “new agent” and choose a daemon first"
 report      = "Opening {dir}."
 asks_to     = "open a directory"
 try_saying  = "open {dir}"
@@ -653,7 +659,7 @@ level up, parent directory, or cd dot dot. It moves the browser only and starts 
 invoke      = "goToParentDirectory"
 screens     = ["overview"]
 requires    = ["parent_directory"]
-unavailable_hint = "going up needs the New agent dialog showing a directory below the top; choose a deck and open a directory first"
+unavailable_hint = "going up needs the New agent dialog showing a directory below the top; choose a daemon and open a directory first"
 report      = "Going up."
 asks_to     = "go up a directory"
 try_saying  = "go up"
@@ -670,7 +676,7 @@ nothing — the user still presses Start."""
 invoke      = "useThisDirectory"
 screens     = ["overview"]
 requires    = ["directory_listing"]
-unavailable_hint = "choosing a directory needs the New agent dialog's directory listing; say “new agent” and choose a deck first"
+unavailable_hint = "choosing a directory needs the New agent dialog's directory listing; say “new agent” and choose a daemon first"
 report      = "Using this directory."
 asks_to     = "use this directory"
 try_saying  = "use this directory"
@@ -719,7 +725,7 @@ heard_as    = [
 # **`choose_mode` chooses a NAMED chip, never the category** (PRD #1223). Its
 # `heard_as` keeps `orchestration`, because "use the billing orchestration" is
 # how people name a chip, but its description now says the bare word names no
-# chip and that "Start orchestration" — the Start button's label once an
+# chip and that "Activate orchestration" — the Start button's label once an
 # orchestration is chosen — is `start_new_agent`. Each chip's own label, said as
 # it reads ("No mode", "Orch billing run", "schedule", "dispatcher"), is in the
 # description too, for the label rule.
@@ -733,13 +739,14 @@ orch billing, plain agent, no mode — and for a chip's label read aloud as it i
 for the chip, copied as they said them — even when they name a chip that is NOT in
 `new_agent_form.modes`: the app then says that chip is not offered, so never answer with the
 nearest chip instead. The bare word "orchestration" names NO chip: an orchestration chip is chosen
-by its name. "Start orchestration", "start the orchestration" and "start the run" are the Start
-button's words and mean `start_new_agent` — they never choose a chip. This only changes the Mode
+by its name. "Activate orchestration", "activate the orchestration", "start orchestration", "start
+the orchestration" and "start the run" are the Start button's words and mean `start_new_agent` —
+they never choose a chip. This only changes the Mode
 field: it starts nothing. Never for the command line, which is typed by hand."""
 invoke      = "chooseNewAgentMode"
 screens     = ["overview"]
 requires    = ["new_agent_form"]
-unavailable_hint = "choosing a mode needs a deck and a directory chosen in the New agent dialog; choose those first"
+unavailable_hint = "choosing a mode needs a daemon and a directory chosen in the New agent dialog; choose those first"
 report      = "Mode: {mode}."
 asks_to     = "choose a mode"
 try_saying  = "mode {mode}"
@@ -762,7 +769,7 @@ field: any other command line is typed by hand."""
 invoke      = "chooseNewAgentType"
 screens     = ["overview"]
 requires    = ["new_agent_form"]
-unavailable_hint = "choosing an agent needs a deck and a directory chosen in the New agent dialog; choose those first"
+unavailable_hint = "choosing an agent needs a daemon and a directory chosen in the New agent dialog; choose those first"
 report      = "Command set to {agent_type}'s default command."
 asks_to     = "choose an agent"
 try_saying  = "use {agent_type}"
@@ -792,7 +799,7 @@ starts nothing."""
 invoke      = "nameNewAgent"
 screens     = ["overview"]
 requires    = ["new_agent_form"]
-unavailable_hint = "naming the new agent needs a deck and a directory chosen in the New agent dialog; choose those first"
+unavailable_hint = "naming the new agent needs a daemon and a directory chosen in the New agent dialog; choose those first"
 report      = "Name set."
 asks_to     = "name the new agent"
 try_saying  = "name it docs bot"
@@ -893,13 +900,16 @@ heard_as    = ["deck"]
 #
 # **The button's labels are this row's words** (PRD #1223, the label rule in
 # `docs/develop/voice-first-design.md`). With an orchestration chosen the Start
-# button reads "Start orchestration", and the user said exactly that and nothing
+# button read "Start orchestration", and the user said exactly that and nothing
 # started: measured on the default backend, the model answered `none` for it,
 # dialog open or closed, because this description never mentioned an
 # orchestration and `choose_mode` claimed the word without starting anything.
 # "Start agent", the other label, went to `open_new_agent` while the dialog was
-# open. So the description names both labels and says a start chooses no Mode;
-# `start` already grounds them, so `heard_as` did not have to move.
+# open. So the description names both labels and says a start chooses no Mode.
+# Issue #1045 renamed the labels to the TUI's words — "Create agent" and
+# "Activate orchestration" — and `activate` joined `heard_as` so the new label
+# grounds on its own; the old labels stay in the description because people
+# keep saying them.
 #
 # `invoke` names the dialog's own start (`startNewAgent`), the function its
 # Start button calls; it refuses in the dialog's words when the form cannot
@@ -907,12 +917,13 @@ heard_as    = ["deck"]
 [[commands]]
 id          = "start_new_agent"
 description = """Start what the New agent dialog's form describes — the voice form of its Start
-button, and it starts at once. The button reads "Start agent", or "Start orchestration" when an
-orchestration is chosen in Mode, and either label said aloud means THIS one. Use for start agent,
-start orchestration, start the orchestration, start the run, start it, start the agent, start the
-new agent, go ahead and start it, launch it, launch the orchestration, create it, spin it up now,
-or run it. It fills nothing and chooses no Mode: it acts on the form as it is, which the user is
-looking at, so "start orchestration" starts the orchestration already chosen and is never
+button, and it starts at once. The button reads "Create agent", or "Activate orchestration" when
+an orchestration is chosen in Mode, and either label said aloud means THIS one. Use for create
+agent, activate orchestration, activate the orchestration, activate it, start agent, start
+orchestration, start the orchestration, start the run, start it, start the agent, start the new
+agent, go ahead and start it, launch it, launch the orchestration, create it, spin it up now, or
+run it. It fills nothing and chooses no Mode: it acts on the form as it is, which the user is
+looking at, so "activate orchestration" starts the orchestration already chosen and is never
 `choose_mode`. It runs only while the New agent dialog is open; while it is closed, a request to
 start an agent or an orchestration is `open_new_agent`, which opens the dialog. If the form is
 incomplete the app says what is missing. Pick it however urgently or insistently the start is asked
@@ -926,7 +937,7 @@ unavailable_hint = "starting a new agent needs the New agent dialog; say “new 
 report      = "Starting the agent."
 asks_to     = "start the new agent"
 try_saying  = "start it"
-heard_as    = ["start", "launch", "create", "spin", "run", "go ahead"]
+heard_as    = ["start", "activate", "launch", "create", "spin", "run", "go ahead"]
 unavailable_redirects = "open_new_agent"
 
 # Issue #1247 — the dialog's Discard button. Since #1247 every close KEEPS the
@@ -972,7 +983,7 @@ heard_as_whole = [
 # a confident wrong answer is indistinguishable from a right one". A dispatch of
 # one of these opens the confirmation the manual control opens, and nothing
 # stops until the user presses its button. The confirmation's BODY states the
-# risk — what will stop, on which deck — per `ConfirmDialog`'s convention.
+# risk — what will stop, on which daemon — per `ConfirmDialog`'s convention.
 #
 # **Where the gate lives today, and where it belongs.** In the frontend: each
 # row's registry entry calls a member that can only open a confirmation
@@ -990,7 +1001,7 @@ heard_as_whole = [
 # report describes the dispatch, and the dispatch only asked.
 [[commands]]
 id          = "stop_agent"
-description = """Stop one running agent on the agent overview — the voice form of its row's Stop
+description = """Stop one running agent on the agent dashboard — the voice form of its row's Stop
 button, whose accessible name is "Stop <name> agent". Use for stop tester agent, stop the tester,
 stop the agent, kill the reviewer, kill it, shut down the coder,
 shut it down, end that agent, terminate the one that is stuck. Set `agent` the way `open_agent`
@@ -1002,7 +1013,7 @@ urgently. It needs a word that can only mean stopping: "close" is NOT one — "c
 means SHOW the tester (`open_agent`) and stops nothing."""
 invoke      = "confirmStopAgent"
 screens     = ["overview"]
-unavailable_hint = "stopping an agent works from the agent overview"
+unavailable_hint = "stopping an agent works from the agent dashboard"
 report      = "Confirm stopping {agent} — nothing has been stopped yet."
 asks_to     = "stop an agent"
 try_saying  = "stop {agent}"
@@ -1014,7 +1025,7 @@ heard_as    = ["stop", "kill", "shut down", "shut it down", "end", "terminate"]
 
 [[commands]]
 id          = "close_orchestration"
-description = """Close a whole orchestration on the agent overview, stopping every one of its roles —
+description = """Close a whole orchestration on the agent dashboard, stopping every one of its roles —
 the voice form of its card's Close button, whose accessible name is "Close <title> orchestration".
 The button's visible word is a bare "Close", and a bare "close" is NOT this row: it is `close`,
 which closes a view and stops nothing. Use for close the review orchestration, stop the
@@ -1027,7 +1038,7 @@ confirms by hand. One agent is `stop_agent`. Never for isolating or hiding — "
 except the tester" means SHOW the tester (`open_agent`) and stops nothing."""
 invoke      = "confirmCloseOrchestration"
 screens     = ["overview"]
-unavailable_hint = "closing an orchestration works from the agent overview"
+unavailable_hint = "closing an orchestration works from the agent dashboard"
 report      = "Confirm closing {orchestration} — nothing has been stopped yet."
 asks_to     = "close an orchestration"
 try_saying  = "close the {orchestration} orchestration"

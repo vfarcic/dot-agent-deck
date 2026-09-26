@@ -280,7 +280,7 @@ pub struct DesktopConnection {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub selection_fallback: Option<String>,
     /// Why the project-aware surfaces — choosing a project, preparing and
-    /// launching a workflow — are unavailable against this daemon (PRD #741 M8).
+    /// activating an orchestration — are unavailable against this daemon (PRD #741 M8).
     ///
     /// **The field that replaces the build stamp as the thing a screen acts
     /// on.** It is derived from what the daemon ADVERTISED in its `Hello` reply,
@@ -339,7 +339,7 @@ pub(crate) fn selection_fields(
         Endpoint::Remote(_) => "remote",
     };
     let local_only = endpoint
-        .require_local("Stop deck")
+        .require_local("Stop daemon")
         .err()
         .map(|error| safe_display_text(error.to_string()));
     (kind, local_only, selected_deck().fallback)
@@ -555,7 +555,7 @@ pub enum DesktopAction {
     /// form's Name as the run's title, and every role run with the command its
     /// project config gives it — on the deck, which reads the config there.
     ///
-    /// Not [`Self::StartWorkflow`], which is the Runs screen's launch and keeps
+    /// Not [`Self::ActivateOrchestration`], which is the Runs screen's launch and keeps
     /// its own form rules (a required task, desktop profile commands, no Pi
     /// coordinator). The two share the daemon verbs and the bridge's rollback
     /// and coordinator-delivery machinery, and none of those form rules.
@@ -573,13 +573,13 @@ pub enum DesktopAction {
         #[serde(default)]
         display_title: Option<String>,
         /// The `configRevision` the dialog resolved against, echoed to
-        /// `prepare-workflow` as the Runs launch echoes it.
+        /// `prepare-orchestration` as the Runs launch echoes it.
         #[serde(default)]
         config_revision: Option<String>,
         rows: Option<u16>,
         cols: Option<u16>,
     },
-    StartWorkflow {
+    ActivateOrchestration {
         /// The orchestration name, as offered by the daemon's
         /// `resolve-project` reply for `cwd`.
         name: String,
@@ -591,11 +591,11 @@ pub enum DesktopAction {
         /// basename (PRD #220).
         cwd: String,
         task_prompt: String,
-        roles: Vec<WorkflowRoleInput>,
+        roles: Vec<OrchestrationRoleInput>,
         rows: Option<u16>,
         cols: Option<u16>,
         /// The `configRevision` the webview last resolved against, echoed
-        /// through to `prepare-workflow`. `#[serde(default)]` and absent means
+        /// through to `prepare-orchestration`. `#[serde(default)]` and absent means
         /// "no expectation": a launch assembled without a resolve still works,
         /// it just does not get the staleness check.
         #[serde(default)]
@@ -664,7 +664,7 @@ pub struct StopOrchestrationRole {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct WorkflowRoleInput {
+pub struct OrchestrationRoleInput {
     pub role: String,
     pub command: String,
     #[serde(default)]
@@ -826,7 +826,7 @@ pub enum TerminalState {
 // exists to establish — the daemon owns canonical identity — because the
 // desktop stores these values and later sends them back: `path` becomes
 // `PrepareOrchestration.cwd` and every `StartAgent.cwd`, an orchestration `name`
-// becomes `StartWorkflow.name`, a role `name` becomes the requested role and
+// becomes `ActivateOrchestration.name`, a role `name` becomes the requested role and
 // the pane's `display_name`, and `config_revision` is echoed back so a config
 // edited under the picker is refused. Two concrete failures followed:
 //
@@ -892,7 +892,7 @@ pub struct DesktopProjectListing {
 pub struct DesktopProject {
     /// The daemon-canonical absolute path, **byte for byte**. This is the
     /// identity, and the exact string that goes back on `resolve-project`,
-    /// `prepare-workflow` and every `StartAgent.cwd`. The webview must never
+    /// `prepare-orchestration` and every `StartAgent.cwd`. The webview must never
     /// re-spell it — and, since the audit fix, neither does this seam.
     pub path: String,
     /// [`Self::path`] made safe to render. Never sent anywhere.
@@ -939,7 +939,7 @@ pub struct DesktopOrchestration {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DesktopOrchestrationRole {
-    /// **Verbatim** — `order_workflow_roles` matches the requested roles against
+    /// **Verbatim** — `order_orchestration_roles` matches the requested roles against
     /// these by exact name, and the name becomes the pane's `display_name` and
     /// its `TabMembership.role_name`.
     pub name: String,
@@ -1263,7 +1263,7 @@ impl DesktopFeatures {
 pub(crate) fn validate_pasted_project_path(path: &str) -> Result<(), String> {
     if !is_valid_orchestration_cwd(path) {
         return Err(
-            "enter an absolute directory path, without control characters, that the deck can see"
+            "enter an absolute directory path, without control characters, that the daemon can see"
                 .into(),
         );
     }
@@ -1807,7 +1807,7 @@ impl DeckScope {
             .find(|endpoint| deck_wire_id(endpoint) == deck_id)
             .ok_or_else(|| {
                 format!(
-                    "that deck is not one this app is observing: {}",
+                    "that daemon is not one this app is observing: {}",
                     safe_message(deck_id)
                 )
             })?;
@@ -1872,7 +1872,7 @@ impl DeckScope {
                 "the fleet changed while this operation was in flight, so nothing was published for {deck}"
             )
         } else {
-            format!("that deck left the fleet while this operation was in flight: {deck}")
+            format!("that daemon left the fleet while this operation was in flight: {deck}")
         })
     }
 
@@ -2256,25 +2256,28 @@ pub(crate) fn mint_desktop_pane_id() -> String {
     pane_id
 }
 
-pub(crate) fn validate_workflow_shape(
+pub(crate) fn validate_orchestration_shape(
     name: &str,
     cwd: &str,
-    roles: &[WorkflowRoleInput],
+    roles: &[OrchestrationRoleInput],
     rows: u16,
     cols: u16,
 ) -> Result<(u16, u16), String> {
-    const MAX_WORKFLOW_ROLES: usize = 16;
+    const MAX_ORCHESTRATION_ROLES: usize = 16;
     if !is_valid_display_name(name) {
         return Err(
-            "workflow name is invalid, oversized, empty, or contains control characters".into(),
+            "orchestration name is invalid, oversized, empty, or contains control characters"
+                .into(),
         );
     }
     if !is_valid_orchestration_cwd(cwd) {
-        return Err("workflow cwd must be a valid absolute path without control characters".into());
+        return Err(
+            "orchestration cwd must be a valid absolute path without control characters".into(),
+        );
     }
-    if roles.is_empty() || roles.len() > MAX_WORKFLOW_ROLES {
+    if roles.is_empty() || roles.len() > MAX_ORCHESTRATION_ROLES {
         return Err(format!(
-            "workflow roles must contain 1..={MAX_WORKFLOW_ROLES} entries"
+            "orchestration roles must contain 1..={MAX_ORCHESTRATION_ROLES} entries"
         ));
     }
     let mut names = HashSet::with_capacity(roles.len());
@@ -2282,13 +2285,13 @@ pub(crate) fn validate_workflow_shape(
     for role in roles {
         if !is_valid_display_name(&role.role) {
             return Err(format!(
-                "invalid workflow role name: {}",
+                "invalid orchestration role name: {}",
                 safe_message(&role.role)
             ));
         }
         if !names.insert(role.role.as_str()) {
             return Err(format!(
-                "duplicate workflow role: {}",
+                "duplicate orchestration role: {}",
                 safe_message(&role.role)
             ));
         }
@@ -2297,16 +2300,18 @@ pub(crate) fn validate_workflow_shape(
     }
     if start_count != 1 {
         return Err(format!(
-            "workflow must define exactly one start role (found {start_count})"
+            "orchestration must define exactly one start role (found {start_count})"
         ));
     }
     validate_dimensions(rows, cols)
 }
 
-pub(crate) fn ensure_desktop_workflow_platform_supported(target_os: &str) -> Result<(), String> {
+pub(crate) fn ensure_desktop_orchestration_platform_supported(
+    target_os: &str,
+) -> Result<(), String> {
     if target_os == "windows" {
         return Err(
-            "desktop workflow launch is unavailable on Windows in this preview because profile commands are POSIX-shell quoted; use the TUI or launch commands manually until native Windows command construction is implemented"
+            "desktop orchestration activation is unavailable on Windows in this preview because profile commands are POSIX-shell quoted; use the TUI or run commands manually until native Windows command construction is implemented"
                 .into(),
         );
     }
@@ -2538,11 +2543,11 @@ mod tests {
         );
         let reason = local_only.expect("a remote deck must say why Stop and Replace are off");
         assert!(
-            reason.contains("Stop deck") && reason.contains("deploy@build-box"),
+            reason.contains("Stop daemon") && reason.contains("deploy@build-box"),
             "the explanation must name the operation and the deck: {reason}"
         );
         assert!(
-            reason.contains("not the machine that deck runs on"),
+            reason.contains("not the machine that daemon runs on"),
             "the explanation is `Endpoint::require_local`'s, not a second one written here: \
              {reason}"
         );
@@ -3247,36 +3252,36 @@ mod tests {
     }
 
     #[test]
-    fn workflow_shape_requires_unique_roles_and_one_start() {
+    fn orchestration_shape_requires_unique_roles_and_one_start() {
         let roles = vec![
-            WorkflowRoleInput {
+            OrchestrationRoleInput {
                 role: "planner".into(),
                 command: "codex --model gpt-5.6-sol".into(),
                 start: true,
             },
-            WorkflowRoleInput {
+            OrchestrationRoleInput {
                 role: "builder".into(),
                 command: "codex --model gpt-5.6-sol".into(),
                 start: false,
             },
         ];
         assert_eq!(
-            validate_workflow_shape("loop", "/tmp/project", &roles, 50, 200).unwrap(),
+            validate_orchestration_shape("loop", "/tmp/project", &roles, 50, 200).unwrap(),
             (50, 200)
         );
         let mut duplicate = roles.clone();
         duplicate[1].role = "planner".into();
-        assert!(validate_workflow_shape("loop", "/tmp/project", &duplicate, 50, 200).is_err());
+        assert!(validate_orchestration_shape("loop", "/tmp/project", &duplicate, 50, 200).is_err());
         let mut no_start = roles;
         no_start[0].start = false;
-        assert!(validate_workflow_shape("loop", "/tmp/project", &no_start, 50, 200).is_err());
+        assert!(validate_orchestration_shape("loop", "/tmp/project", &no_start, 50, 200).is_err());
     }
 
     #[test]
-    fn desktop_workflow_platform_guard_blocks_windows_only() {
-        assert!(ensure_desktop_workflow_platform_supported("macos").is_ok());
-        assert!(ensure_desktop_workflow_platform_supported("linux").is_ok());
-        let error = ensure_desktop_workflow_platform_supported("windows").unwrap_err();
+    fn desktop_orchestration_platform_guard_blocks_windows_only() {
+        assert!(ensure_desktop_orchestration_platform_supported("macos").is_ok());
+        assert!(ensure_desktop_orchestration_platform_supported("linux").is_ok());
+        let error = ensure_desktop_orchestration_platform_supported("windows").unwrap_err();
         assert!(error.contains("unavailable on Windows"));
         assert!(error.contains("POSIX-shell quoted"));
     }
@@ -3302,7 +3307,7 @@ mod tests {
     /// Scenario: the daemon lists a project whose canonical path carries a
     /// strippable control character. The DTO must carry that path byte for
     /// byte — it is the string that goes back on `resolve-project`,
-    /// `prepare-workflow` and every `StartAgent.cwd` — while the display twin
+    /// `prepare-orchestration` and every `StartAgent.cwd` — while the display twin
     /// is scrubbed. `primary` is checked in the same test because the webview
     /// compares it against `path` to mark the active row: scrubbing one and not
     /// the other silently breaks that marker.
@@ -3463,7 +3468,7 @@ mod tests {
     /// Scenario: an orchestration and one of its roles carry control
     /// characters. Both names are protocol identities — the orchestration's
     /// goes back as `PrepareOrchestration.orchestration`, the role's is matched by
-    /// `order_workflow_roles` and becomes the pane's `display_name` — so both
+    /// `order_orchestration_roles` and becomes the pane's `display_name` — so both
     /// cross verbatim, with escaped twins for the picker.
     #[test]
     fn orchestration_and_role_names_reach_the_daemon_unmodified() {
@@ -3527,21 +3532,21 @@ mod tests {
     /// own launch validation accepts. This is the consumer half of the limit
     /// reconciliation — the daemon's `MAX_PROJECTED_LAUNCH_NAME_BYTES` is now
     /// `agent_pty::DISPLAY_NAME_MAX_LEN`, so the offered set is the launchable
-    /// set and `validate_workflow_shape` cannot refuse a name the picker
+    /// set and `validate_orchestration_shape` cannot refuse a name the picker
     /// offered on length alone.
     #[test]
     fn the_longest_projected_name_passes_desktop_launch_validation() {
         use dot_agent_deck::project_resolve::MAX_PROJECTED_LAUNCH_NAME_BYTES;
 
         let at_ceiling = "n".repeat(MAX_PROJECTED_LAUNCH_NAME_BYTES);
-        let roles = vec![WorkflowRoleInput {
+        let roles = vec![OrchestrationRoleInput {
             role: at_ceiling.clone(),
             command: "claude".into(),
             start: true,
         }];
         assert!(
-            validate_workflow_shape(&at_ceiling, "/tmp/project", &roles, 32, 120).is_ok(),
-            "a workflow and role name at the daemon's projection ceiling must be launchable"
+            validate_orchestration_shape(&at_ceiling, "/tmp/project", &roles, 32, 120).is_ok(),
+            "an orchestration and role name at the daemon's projection ceiling must be launchable"
         );
     }
 

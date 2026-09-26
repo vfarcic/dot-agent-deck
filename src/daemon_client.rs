@@ -666,7 +666,7 @@ pub enum EndpointError {
     /// and it hands back a bare `&Path` for the same reason
     /// [`Endpoint::connect_address`] does.
     #[error(
-        "the remote deck {deck} is reached through its own ssh tunnel, so it has no address until \
+        "the remote daemon {deck} is reached through its own ssh tunnel, so it has no address until \
          one is open: establish an EndpointConnection and ask that for the address"
     )]
     RemoteAddressIsTheTunnels { deck: String },
@@ -674,8 +674,8 @@ pub enum EndpointError {
     /// meaning against a daemon on another machine. PRD #741 M7 renders this as
     /// a disabled control rather than a failed action.
     #[error(
-        "{operation} is not available for the remote deck {deck}: it acts on a process on this \
-         machine, which is not the machine that deck runs on"
+        "{operation} is not available for the remote daemon {deck}: it acts on a process on this \
+         machine, which is not the machine that daemon runs on"
     )]
     LocalOnly {
         operation: &'static str,

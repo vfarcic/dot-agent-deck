@@ -1861,6 +1861,11 @@ mod tests {
             open_deck.grounding_while[0].grounding,
             ActionGrounding::HeardAsWhole(
                 [
+                    "open daemons",
+                    "go back to the daemons",
+                    "back to the daemons",
+                    "the daemons",
+                    "daemons",
                     "go back to the deck",
                     "back to the deck",
                     "return to the deck",

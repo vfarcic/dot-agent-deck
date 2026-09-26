@@ -31,11 +31,11 @@ export const NEW_AGENT_APPEAR_TIMEOUT_MS = 12_000;
  * overview's loading note, which carries more than one sentence.
  */
 export const DECK_STATE_FALLBACK = {
-  pending: "This deck has not reported yet.",
-  loading: "Reading the deck's agent list.",
-  unconfigured: "This deck has no address yet.",
-  disconnected: "No deck is listening on the configured socket.",
-  incompatible: "A deck answered but this build cannot speak to it.",
+  pending: "This daemon has not reported yet.",
+  loading: "Reading the daemon's agent list.",
+  unconfigured: "This daemon has no address yet.",
+  disconnected: "No daemon is listening on the configured socket.",
+  incompatible: "A daemon answered but this build cannot speak to it.",
 } as const;
 
 /**
@@ -149,8 +149,8 @@ export const AUTHORING_MODES: readonly { kind: AuthoringKind; label: string }[] 
 
 /** Why no authoring chip is offered, for a deck that cannot say which ones it can start. */
 export const AUTHORING_WITHHELD = {
-  unsupported: "This deck does not report which authoring agents it can start, so schedule and dispatcher are not offered.",
-  none: "This deck cannot compose authoring seeds, so schedule and dispatcher are not offered.",
+  unsupported: "This daemon does not report which authoring agents it can start, so schedule and dispatcher are not offered.",
+  none: "This daemon cannot compose authoring seeds, so schedule and dispatcher are not offered.",
 } as const;
 
 /**
@@ -199,7 +199,7 @@ export function resolveAuthoringCommand(command: string, defaultCommand: string 
  *
  * A project may define two orchestrations with one name — config validation
  * only warns — and `ResolveProject` lists both. But the launch identifies an
- * orchestration by its name alone, and the deck's `PrepareWorkflow` takes the
+ * orchestration by its name alone, and the daemon's `PrepareOrchestration` takes the
  * FIRST definition with that name: choosing the second would run the first's
  * roles and commands. So every orchestration whose name another one in the
  * project shares is returned under `ambiguous`, in the project's order, for the
@@ -283,10 +283,10 @@ export function orchestrationRunTitle(name: string, orchestration: string): stri
 }
 
 /** The TUI's `NAME_COLLISION_WARNING`, for the deck the run would start on. */
-export const ORCHESTRATION_TITLE_TAKEN = "This name is already in use by a live orchestration on this deck.";
+export const ORCHESTRATION_TITLE_TAKEN = "This name is already in use by a live orchestration on this daemon.";
 
 /** The TUI's `SAME_CWD_ORCHESTRATION_WARNING` — a warning, not a refusal. */
-export const SAME_DIRECTORY_ORCHESTRATION = "This directory already runs an orchestration on this deck. Both share its .dot-agent-deck role files and one working tree.";
+export const SAME_DIRECTORY_ORCHESTRATION = "This directory already runs an orchestration on this daemon. Both share its .dot-agent-deck role files and one working tree.";
 
 /**
  * How many unconfirmed roles a cleanup warning names before it counts the rest
@@ -350,7 +350,7 @@ export function cleanupWarning(unconfirmedStops: readonly string[], deck?: strin
   // because "this deck" then reads as whichever deck is selected when it is seen.
   const where = deck === undefined ? "this deck" : deck;
   return {
-    summary: displayText(`${subject} may still be running on ${where}: ${stops} could not be confirmed. Check the deck and stop ${it} there.`, DISPLAY_LIMITS.message),
+    summary: displayText(`${subject} may still be running on ${where}: ${stops} could not be confirmed. Check the daemon and stop ${it} there.`, DISPLAY_LIMITS.message),
     names: unconfirmedStops.slice(0, CLEANUP_WARNING_MAX_NAMES).map((role) => displayIdentity(role, DISPLAY_LIMITS.name, UNNAMED_CLEANUP_ROLE)),
     overflow: Math.max(0, count - CLEANUP_WARNING_MAX_NAMES),
   };
@@ -363,7 +363,7 @@ export function cleanupWarning(unconfirmedStops: readonly string[], deck?: strin
  * before anything else and nothing wraps its error — so it is matched at the
  * start of the message and nowhere else.
  */
-const DECK_GONE_PREFIX = "that deck is not one this app is observing:";
+const DECK_GONE_PREFIX = "that daemon is not one this app is observing:";
 
 /**
  * Whether a refusal means the chosen deck has left the fleet. The flow returns

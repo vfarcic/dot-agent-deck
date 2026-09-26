@@ -136,7 +136,7 @@ export interface ConnectionView {
   selectionFallback?: string;
   /**
    * Why the project-aware surfaces — choosing a project, preparing and launching
-   * a workflow — are unavailable against this deck (PRD #741 M8).
+   * an orchestration — are unavailable against this deck (PRD #741 M8).
    *
    * The daemon's own sentence, derived from what it ADVERTISED in its `Hello`
    * reply rather than from a version number or a build stamp. Absent means
@@ -184,7 +184,7 @@ export interface ConnectionView {
  * One project the DAEMON knows about (PRD #819 M6).
  *
  * It replaced `DeckProject`, which was a locally-invented record — a minted id,
- * a free-typed `cwd`, a workflow name, notes — persisted under
+ * a free-typed `cwd`, an orchestration name, notes — persisted under
  * `dot-agent-deck.desktop.projects.v1` and used as the source of truth for the
  * launch working directory. Nothing validated it against the daemon's world, so
  * against a remote daemon it named a directory on the wrong machine.
@@ -230,7 +230,7 @@ export interface DaemonOrchestrationRole {
 }
 
 export interface DaemonOrchestration {
-  /** Identity: this exact string goes back as the launch's workflow name. */
+  /** Identity: this exact string goes back as the launch's orchestration name. */
   name: string;
   /** `name`, escaped for rendering. */
   displayName: string;
@@ -239,9 +239,9 @@ export interface DaemonOrchestration {
 }
 
 /**
- * One resolved project: the canonical path, and the workflows that project
- * offers. The order is `daemon → project → workflow` and it is not
- * rearrangeable — the workflow list comes out of the project's own config, so
+ * One resolved project: the canonical path, and the orchestrations that project
+ * offers. The order is `daemon → project → orchestration` and it is not
+ * rearrangeable — the orchestration list comes out of the project's own config, so
  * there is nothing to offer before a project is chosen.
  */
 export interface DaemonResolvedProject {
@@ -780,11 +780,11 @@ export interface HandoffEdge {
   orchestration?: string;
   taskPreview?: string;
   /**
-   * dispatched → delivered → done is the healthy path; failed is terminal and
+   * delegated → delivered → done is the healthy path; failed is terminal and
    * carries `reason`. `respawned` marks that the worker was restarted for this
    * delegation (expected for clear=true roles).
    */
-  status: "dispatched" | "delivered" | "failed" | "done";
+  status: "delegated" | "delivered" | "failed" | "done";
   respawned: boolean;
   reason?: string;
   /** Wall-clock of the newest event applied to this edge (HH:MM:SS). */
@@ -800,7 +800,7 @@ export type DeckAction =
   | { type: "stop_daemon"; force?: boolean }
   | { type: "restart_daemon" }
   | { type: "allow_build_mismatch" }
-  | { type: "start_workflow"; name: string; cwd: string; taskPrompt: string; roles: WorkflowLaunchRole[]; rows: number; cols: number; configRevision?: string }
+  | { type: "activate_orchestration"; name: string; cwd: string; taskPrompt: string; roles: OrchestrationLaunchRole[]; rows: number; cols: number; configRevision?: string }
   /**
    * Start one plain agent on the deck `deckId` names (PRD #1223 M3) — the
    * wire `connection.deckId` of the target, captured once when the user picks
@@ -826,7 +826,7 @@ export type DeckAction =
    * spellings from `newAgentOrchestrations`. The START role's id comes back as
    * `DeckActionResult.agentId`.
    *
-   * Not `start_workflow`, which is the Runs screen's launch and keeps its own
+   * Not `activate_orchestration`, which is the Runs screen's launch and keeps its own
    * form rules.
    */
   | { type: "start_orchestration"; deckId: string; path: string; orchestration: string; displayTitle?: string; configRevision?: string; rows?: number; cols?: number }
@@ -893,23 +893,23 @@ export function isDelivered(result: DeckActionResult): boolean {
 /** Operator-facing explanation of a non-delivered outcome. */
 export function sendResultReason(result: SendResult | undefined): string {
   switch (result) {
-    case "stale": return "the deck's view of that pane had already moved on";
+    case "stale": return "the daemon's view of that pane had already moved on";
     case "wrong-session": return "the pane handle no longer maps to that agent's session";
     case "history-only": return "the agent has no live pane — only its history remains";
     case "no-live-target": return "there is nothing live to write to";
     case "ambiguous": return "the write started but did not complete; some of it may already have landed, so it was not retried";
-    case "unknown": return "the deck reported an outcome this build does not recognise";
-    default: return "the deck did not confirm delivery";
+    case "unknown": return "the daemon reported an outcome this build does not recognise";
+    default: return "the daemon did not confirm delivery";
   }
 }
 
-export interface WorkflowLaunchRole {
+export interface OrchestrationLaunchRole {
   role: string;
   command: string;
   start: boolean;
 }
 
-export interface WorkflowLaunchConfig {
+export interface OrchestrationLaunchConfig {
   /** The daemon's own spelling of the orchestration name, submitted verbatim. */
   name: string;
   /**
@@ -935,7 +935,7 @@ export interface WorkflowLaunchConfig {
   displayName: string;
   displayPath: string;
   taskPrompt: string;
-  roles: WorkflowLaunchRole[];
+  roles: OrchestrationLaunchRole[];
   rows: number;
   cols: number;
   customCommandCount: number;

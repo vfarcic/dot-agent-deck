@@ -38,7 +38,7 @@ import { ConfirmDialog, type ConfirmState } from "./components/ConfirmDialog";
 import { DeckSelector } from "./components/DeckSelector";
 import { HandoffRail } from "./components/HandoffRail";
 import { SelectDeckNote } from "./components/SelectDeckNote";
-import { ProfilesPanel, ProjectsPanel, PromptLibraryPanel, WorkflowPanel } from "./components/ConfigurationPanels";
+import { ProfilesPanel, ProjectsPanel, PromptLibraryPanel, OrchestrationPanel } from "./components/ConfigurationPanels";
 import { SettingsSheet } from "./components/SettingsSheet";
 import { VoiceControlPanel } from "./components/VoiceControlPanel";
 import { SettingsBridgeProvider } from "./lib/settingsBridge";
@@ -64,10 +64,29 @@ import { LaunchCleanupError } from "./lib/actionError";
 import { CleanupWarning } from "./components/CleanupWarning";
 import type { VoiceDirectoriesDto, VoiceNewAgentDto, VoiceOutcomeDto } from "./lib/bridge";
 import { desktopFeaturesOf } from "./types";
-import type { AgentSession, CleanupWarningEntry, DeckAction, DeckRuntimeState, DeckSnapshot, DeckView, EvidenceItem, PanelTab, WorkflowLaunchConfig } from "./types";
+import type { AgentSession, CleanupWarningEntry, DeckAction, DeckRuntimeState, DeckSnapshot, DeckView, EvidenceItem, PanelTab, OrchestrationLaunchConfig } from "./types";
 import { modeScopedKey } from "./lib/bridge";
 
-const WORKFLOW_STORAGE_KEY = modeScopedKey("dot-agent-deck.desktop.workflow-preview.v1");
+const ORCHESTRATION_STORAGE_KEY = modeScopedKey("dot-agent-deck.desktop.orchestration-preview.v1");
+/**
+ * Where the saved role order lived before issue #1045 renamed the desktop's
+ * "workflow" to the TUI's "orchestration". Read once, when the new key holds
+ * nothing, so an order saved by an older build survives the rename; the value
+ * is copied to {@link ORCHESTRATION_STORAGE_KEY} and the legacy key removed.
+ */
+const LEGACY_WORKFLOW_STORAGE_KEY = modeScopedKey("dot-agent-deck.desktop.workflow-preview.v1");
+
+/** The saved role order, migrating it from the pre-#1045 key when that is the only one holding it. */
+function readStoredOrchestrationOrder(): { order?: string[] } | null {
+  const current = window.localStorage.getItem(ORCHESTRATION_STORAGE_KEY);
+  if (current !== null) return JSON.parse(current) as { order?: string[] } | null;
+  const legacy = window.localStorage.getItem(LEGACY_WORKFLOW_STORAGE_KEY);
+  if (legacy === null) return null;
+  const stored = JSON.parse(legacy) as { order?: string[] } | null;
+  window.localStorage.setItem(ORCHESTRATION_STORAGE_KEY, legacy);
+  window.localStorage.removeItem(LEGACY_WORKFLOW_STORAGE_KEY);
+  return stored;
+}
 /**
  * The daemon's stable refusal codes this screen recognises, matched as CODES
  * rather than as prose. Each is the first token of `AttachResponse.error`,
@@ -98,7 +117,7 @@ const WORKFLOW_STORAGE_KEY = modeScopedKey("dot-agent-deck.desktop.workflow-prev
  * `preparation-mismatch` (`PROJECT_ERR_PREPARATION_MISMATCH`, PRD #819 Greptile
  * P1(a)) is deliberately NOT in that list and falls through to the generic
  * notice carrying the daemon's own sentence. It means this app submitted a
- * project, workflow or role other than the one the daemon prepared, which is a
+ * project, orchestration or role other than the one the daemon prepared, which is a
  * defect in this client rather than a state the user can be walked out of —
  * re-preparing and sending the same thing again earns the same refusal, so
  * offering that as a remedy would be a lie. Nothing was started either way.
@@ -1025,8 +1044,8 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
   const setPromptsOpen = (open: boolean) => setOverlay("prompts", open);
   const [selectedPromptId, setSelectedPromptId] = useState("");
   const [terminalFocus, setTerminalFocus] = useState<{ agentId: string; token: number }>();
-  const workflowOpen = overlays.open.workflow ?? false;
-  const setWorkflowOpen = (open: boolean) => setOverlay("workflow", open);
+  const orchestrationOpen = overlays.open.workflow ?? false;
+  const setOrchestrationOpen = (open: boolean) => setOverlay("workflow", open);
   const [paletteOpen, setPaletteOpen] = useState(false);
   const helpOpen = overlays.open.shortcuts ?? false;
   const setHelpOpen = (open: boolean) => setOverlay("shortcuts", open);
@@ -1147,7 +1166,7 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
   useEffect(() => {
     if (!profiles.length || profileOrder.length) return;
     try {
-      const stored = JSON.parse(window.localStorage.getItem(WORKFLOW_STORAGE_KEY) ?? "null") as { order?: string[] } | null;
+      const stored = readStoredOrchestrationOrder();
       setProfileOrder(stored?.order?.length ? stored.order : profiles.map((profile) => profile.id));
     } catch {
       setProfileOrder(profiles.map((profile) => profile.id));
@@ -1157,9 +1176,9 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
   useEffect(() => {
     if (!profileOrder.length) return;
     try {
-      window.localStorage.setItem(WORKFLOW_STORAGE_KEY, JSON.stringify({ order: profileOrder }));
+      window.localStorage.setItem(ORCHESTRATION_STORAGE_KEY, JSON.stringify({ order: profileOrder }));
     } catch {
-      // Keep the workflow preview usable when storage is unavailable.
+      // Keep the orchestration preview usable when storage is unavailable.
     }
   }, [profileOrder]);
 
@@ -1253,7 +1272,7 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
     projects: setProjectsOpen,
     prompts: setPromptsOpen,
     profiles: setProfilesOpen,
-    workflow: setWorkflowOpen,
+    orchestration: setOrchestrationOpen,
     settings: setSettingsOpen,
   };
   const closeOverlays = () => Object.values(overlaySetters).forEach((setOpen) => setOpen(false));
@@ -1367,33 +1386,33 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
       if (!canControlDaemon) return;
       const liveAgents = snapshot.connection.runningAgentCount;
       setConfirm({
-        title: "Stop the local deck?",
+        title: "Stop the local daemon?",
         body: liveAgents && liveAgents > 0
-          ? `The deck reports ${liveAgents} live agent${liveAgents === 1 ? "" : "s"}. This safe stop will be refused until those agents are stopped individually.`
-          : "This stops the deck running on this machine. No live agents are reported, so this only shuts down the control service.",
-        label: "Stop deck",
+          ? `The daemon reports ${liveAgents} live agent${liveAgents === 1 ? "" : "s"}. This safe stop will be refused until those agents are closed individually.`
+          : "This stops the daemon running on this machine. No live agents are reported, so this only shuts down the daemon.",
+        label: "Stop daemon",
         busyLabel: "Stopping…",
-        action: async () => { await perform({ type: "stop_daemon" }, "Local deck stopped."); },
+        action: async () => { await perform({ type: "stop_daemon" }, "Local daemon stopped."); },
       });
       return;
     }
     setConfirm({
-      title: `Stop ${selectedAgent.role}?`,
+      title: `Close ${selectedAgent.role}?`,
       body: `This sends a stop request to ${selectedAgent.displayName}. Unsaved terminal work may be interrupted.`,
-      label: "Stop agent",
+      label: "Close agent",
       busyLabel: "Stopping…",
-      action: async () => { await perform({ type: "stop_agent", deckId: snapshot.connection.deckId ?? "", agentId: selectedAgent.id }, `${selectedAgent.role} stop requested.`); },
+      action: async () => { await perform({ type: "stop_agent", deckId: snapshot.connection.deckId ?? "", agentId: selectedAgent.id }, `${selectedAgent.role} close requested.`); },
     });
   };
 
   const requestRestartDaemon = () => {
     if (!snapshot.connection.daemonDetected || snapshot.connection.runningAgentCount !== 0) return;
     setConfirm({
-      title: "Replace the incompatible deck?",
-      body: "The deck now running reports no live agents. Agent Deck will stop it and start the exact build bundled with this desktop app.",
-      label: "Replace deck",
+      title: "Replace the incompatible daemon?",
+      body: "The daemon now running reports no live agents. Agent Deck will stop it and start the exact build bundled with this desktop app.",
+      label: "Replace daemon",
       busyLabel: "Replacing…",
-      action: async () => { await perform({ type: "restart_daemon" }, "Matching deck started and reconnected."); },
+      action: async () => { await perform({ type: "restart_daemon" }, "Matching daemon started and reconnected."); },
     });
   };
 
@@ -1412,8 +1431,8 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
   const requestConnectAnyway = () => {
     if (!snapshot.connection.buildStampMismatchOnly) return;
     setConfirm({
-      title: "Connect to a differently-built deck?",
-      body: "The wire protocol matched on both sides, so this deck and this app agree on the shape of everything they exchange. They were built from different commits, and a stamp difference can still mean divergent behaviour behind an identical wire — a field whose meaning changed while its shape did not. Agent Deck will connect and keep the mismatch on screen for the rest of this session; nothing is remembered after you quit the app.",
+      title: "Connect to a differently-built daemon?",
+      body: "The wire protocol matched on both sides, so this daemon and this app agree on the shape of everything they exchange. They were built from different commits, and a stamp difference can still mean divergent behaviour behind an identical wire — a field whose meaning changed while its shape did not. Agent Deck will connect and keep the mismatch on screen for the rest of this session; nothing is remembered after you quit the app.",
       label: "Connect anyway",
       busyLabel: "Connecting…",
       action: async () => {
@@ -1422,7 +1441,7 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
           // The allowance is read by the NEXT handshake, so the reconnect is
           // what actually connects; the crate caches no verdict.
           await runtime.reconnect();
-          setNotice("Connected to the differently-built deck. The mismatch stays in the connection banner for this session.");
+          setNotice("Connected to the differently-built daemon. The mismatch stays in the connection banner for this session.");
         } catch (cause) {
           setNotice(cause instanceof Error ? cause.message : String(cause));
         }
@@ -1432,14 +1451,14 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
 
   const requestStartDaemon = () => {
     setConfirm({
-      title: "Start the local deck?",
-      body: "Agent Deck will start the deck on this machine and reconnect this control room. No agent is launched until you explicitly launch a workflow.",
-      label: "Start deck",
+      title: "Start the local daemon?",
+      body: "Agent Deck will start the daemon on this machine and reconnect this control room. No agent is started until you explicitly activate an orchestration.",
+      label: "Start daemon",
       busyLabel: "Starting…",
       action: async () => {
         try {
           await runtime.runAction({ type: "start_daemon" });
-          setNotice("Local deck started and control channel reconnected.");
+          setNotice("Local daemon started and control channel reconnected.");
         } catch (cause) {
           setNotice(cause instanceof Error ? cause.message : String(cause));
         }
@@ -1447,7 +1466,7 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
     });
   };
 
-  const requestLaunch = (config: WorkflowLaunchConfig) => {
+  const requestLaunch = (config: OrchestrationLaunchConfig) => {
     const generatedCount = config.roles.length - config.customCommandCount;
     const commandCopy = config.customCommandCount > 0
       ? `${generatedCount} commands are generated from their current profile fields; ${config.customCommandCount} explicit custom command override${config.customCommandCount === 1 ? " bypasses" : "s bypass"} those fields. Custom commands may carry arbitrary permissions and are not covered by structured permission claims.`
@@ -1456,20 +1475,20 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
       ? ` Among generated commands, ${config.generatedFullAccessCount} role${config.generatedFullAccessCount === 1 ? " runs" : "s run"} unrestricted — Claude Code with bypassPermissions, or Codex with no sandbox — so ${config.generatedFullAccessCount === 1 ? "it acts" : "they act"} without asking.`
       : "";
     setConfirm({
-      title: `Launch ${config.displayName}?`,
-      body: `This starts ${config.roles.length} live CLI agents in ${config.displayPath} and sends your task prompt to the coordinator. ${commandCopy}${accessCopy} This launch does not rewrite project TOML.`,
-      label: "Launch live loop",
-      busyLabel: "Launching…",
+      title: `Activate ${config.displayName}?`,
+      body: `This starts ${config.roles.length} live CLI agents in ${config.displayPath} and sends your task prompt to the orchestrator. ${commandCopy}${accessCopy} Activating does not rewrite project TOML.`,
+      label: "Activate orchestration",
+      busyLabel: "Activating…",
       action: async () => {
         try {
           // The display twins come off with the two counts: they exist for the
           // dialog and the notice, and the daemon gets the identities alone
           // (PRD #819 audit fix).
           const { customCommandCount: _customCommandCount, generatedFullAccessCount: _generatedFullAccessCount, displayName: _displayName, displayPath: _displayPath, ...launch } = config;
-          await runtime.runAction({ type: "start_workflow", ...launch });
-          setWorkflowOpen(false);
+          await runtime.runAction({ type: "activate_orchestration", ...launch });
+          setOrchestrationOpen(false);
           await runtime.reconnect();
-          setNotice(`${config.displayName} launched with ${config.roles.length} configured roles.`);
+          setNotice(`${config.displayName} activated with ${config.roles.length} configured roles.`);
         } catch (cause) {
           /*
            * PRD #1223 audit V2 — FIRST, ahead of every refusal-code translation
@@ -1500,9 +1519,9 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
           if (message.includes(PROJECT_UNRESOLVED_CODE)) {
             projectState.clearSelection();
             void projectState.refresh();
-            setWorkflowOpen(false);
+            setOrchestrationOpen(false);
             setProjectsOpen(true);
-            setNotice("That project is no longer one this deck knows — nothing is running there any more. Choose another, or paste its path again.");
+            setNotice("That project is no longer one this daemon knows — nothing is running there any more. Choose another, or paste its path again.");
             return;
           }
           /*
@@ -1513,7 +1532,7 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
            */
           if (message.includes(PROJECT_STALE_REVISION_CODE) && activeProject) {
             void projectState.select(activeProject.path);
-            setNotice("This project's .dot-agent-deck.toml changed since the workflows were listed, so nothing was started. It has been re-read — check the workflow and launch again.");
+            setNotice("This project's .dot-agent-deck.toml changed since the orchestrations were listed, so nothing was started. It has been re-read — check the orchestration and activate it again.");
             return;
           }
           /*
@@ -1528,8 +1547,8 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
           if ((message.includes(PROJECT_STALE_PREPARATION_CODE) || message.includes(PROJECT_STALE_TOKEN_CODE)) && activeProject) {
             void projectState.select(activeProject.path);
             setNotice(message.includes(PROJECT_STALE_PREPARATION_CODE)
-              ? "This launch's prepared coordinator context no longer matches what the deck approved — another launch in this project replaced it, or the project moved. Nothing was started. The project has been re-read; launch again to prepare a fresh one."
-              : "The deck no longer holds this launch's preparation — it expired, or the deck was replaced. Nothing was started. The project has been re-read; launch again to prepare a fresh one.");
+              ? "This launch's prepared orchestrator context no longer matches what the daemon approved — another launch in this project replaced it, or the project moved. Nothing was started. The project has been re-read; launch again to prepare a fresh one."
+              : "The daemon no longer holds this launch's preparation — it expired, or the daemon was replaced. Nothing was started. The project has been re-read; launch again to prepare a fresh one.");
             return;
           }
           /*
@@ -1539,7 +1558,7 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
            * sentence already names what to do instead, so pass it through.
            */
           if (message.includes(PROJECT_UNSUPPORTED_PLATFORM_CODE)) {
-            setWorkflowOpen(false);
+            setOrchestrationOpen(false);
             setNotice(message);
             return;
           }
@@ -1578,22 +1597,22 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
    * registry key per live agent.
    */
   const commandItems = [
-    ...(coordinator ? [{ label: "Message coordinator…", hint: `Focus ${coordinator.displayName}'s terminal`, icon: Send, run: () => VOICE_ACTIONS.messageCoordinator.run(voiceContext, { agentId: coordinator.id }) }] : []),
+    ...(coordinator ? [{ label: "Message orchestrator…", hint: `Focus ${coordinator.displayName}'s terminal`, icon: Send, run: () => VOICE_ACTIONS.messageCoordinator.run(voiceContext, { agentId: coordinator.id }) }] : []),
     /* Issue #1198 — each experimental panel's entry follows its own field, as
        its rail entry does. The palette itself is the deck's (it is bound here,
        and the deck is unmounted while `showDeck` is off), so it needs no gate
        of its own. NOT gated, and named so the residual is known: the panels'
        in-deck doors — the run graph's Edit loop, the empty deck's Configure
-       agents, and the Projects ↔ Workflows cross-links inside those panels.
+       agents, and the Projects ↔ Orchestrations cross-links inside those panels.
        Each sits inside a surface that is itself hidden with the flag off, and
        all five fields follow the one flag today; if they ever diverge, those
        doors need gates of their own. */
-    ...(features.showProjects ? [{ label: "Manage projects", hint: "Choose repositories & workflows", icon: FolderGit2, run: () => VOICE_ACTIONS.openProjects.run(voiceContext) }] : []),
-    ...(features.showPrompts ? [{ label: "Open prompt library", hint: "Reusable workflow launch prompts", icon: BookMarked, run: () => VOICE_ACTIONS.openPromptLibrary.run(voiceContext) }] : []),
+    ...(features.showProjects ? [{ label: "Manage projects", hint: "Choose projects & orchestrations", icon: FolderGit2, run: () => VOICE_ACTIONS.openProjects.run(voiceContext) }] : []),
+    ...(features.showPrompts ? [{ label: "Open prompt library", hint: "Reusable orchestration task prompts", icon: BookMarked, run: () => VOICE_ACTIONS.openPromptLibrary.run(voiceContext) }] : []),
     ...(features.showAgentProfiles ? [{ label: "Open agent profiles", hint: "Configure models & permissions", icon: Bot, run: () => VOICE_ACTIONS.openAgentProfiles.run(voiceContext) }] : []),
-    ...(features.showWorkflows ? [{ label: "Edit workflow order", hint: "Enable, skip, or reorder roles", icon: Network, run: () => VOICE_ACTIONS.openWorkflowOrder.run(voiceContext) }] : []),
+    ...(features.showWorkflows ? [{ label: "Edit orchestration order", hint: "Enable, skip, or reorder roles", icon: Network, run: () => VOICE_ACTIONS.openOrchestrationOrder.run(voiceContext) }] : []),
     { label: "Open settings", hint: "Appearance and other app preferences", icon: Settings2, run: () => VOICE_ACTIONS.openSettings.run(voiceContext) },
-    { label: evidenceOpen ? "Hide evidence drawer" : "Show evidence drawer", hint: "Toggle transition evidence", icon: PanelRight, run: () => VOICE_ACTIONS.toggleEvidenceDrawer.run(voiceContext) },
+    { label: evidenceOpen ? "Hide events drawer" : "Show events drawer", hint: "Toggle transition events", icon: PanelRight, run: () => VOICE_ACTIONS.toggleEvidenceDrawer.run(voiceContext) },
     ...snapshot.agents.map((agent, index) => ({ label: `Focus ${agent.role}`, hint: `Shortcut ${index + 1}`, icon: SquareTerminal, run: () => VOICE_ACTIONS.focusAgent.run(voiceContext, { agentId: agent.id }) })),
     ...(mode === "fixture" ? [{ label: "Advance fixture", hint: "Move the deterministic loop one node", icon: Zap, run: () => VOICE_ACTIONS.advanceFixture.run(voiceContext) }] : []),
   ];
@@ -1644,17 +1663,17 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
               className="button secondary compact"
               data-testid="pause-run"
               disabled={mode === "live" || snapshot.connection.status !== "connected"}
-              title={mode === "live" ? "Whole-run pause is not yet exposed by the deck" : snapshot.paused ? "Resume fixture run" : "Pause fixture run"}
+              title={mode === "live" ? "Whole-run pause is not yet exposed by the daemon" : snapshot.paused ? "Resume fixture run" : "Pause fixture run"}
               onClick={() => void perform({ type: snapshot.paused ? "resume_run" : "pause_run" }, snapshot.paused ? "Fixture resumed." : "Fixture paused.")}
             >{snapshot.paused ? <Play size={14} /> : <Pause size={14} />}<span>{snapshot.paused ? "Resume" : "Pause"}</span></button>
             <button
               className="button danger compact"
               data-testid="stop-run"
-              aria-label={selectedAgent ? `Stop ${selectedAgent.role}` : "Stop deck"}
-              title={selectedAgent ? `Stop ${selectedAgent.role}` : canControlDaemon ? "Stop the local deck" : snapshot.connection.localOnlyReason ?? "Deck is not connected"}
+              aria-label={selectedAgent ? `Close ${selectedAgent.role}` : "Stop daemon"}
+              title={selectedAgent ? `Close ${selectedAgent.role}` : canControlDaemon ? "Stop the local daemon" : snapshot.connection.localOnlyReason ?? "Daemon is not connected"}
               disabled={!selectedAgent && !canControlDaemon}
               onClick={requestStop}
-            ><CircleStop size={14} /><span>Stop</span></button>
+            ><CircleStop size={14} /><span>{selectedAgent ? "Close" : "Stop"}</span></button>
           </div>
         </header>
 
@@ -1677,7 +1696,7 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
         {(snapshot.connection.status !== "connected" || snapshot.connection.buildStampMismatchOnly || snapshot.connection.selectionFallback) && (
           <div className={`connection-banner connection-${snapshot.connection.status}`} role="alert">
             {snapshot.connection.status === "loading" ? <RefreshCw className="spin" size={16} /> : <ShieldAlert size={16} />}
-            <div><strong>{snapshot.connection.status === "loading" ? "Establishing control channel" : snapshot.connection.status === "connected" ? (snapshot.connection.selectionFallback ? "Using the deck on this machine" : "Connected to a differently-built deck") : snapshot.connection.status === "error" ? "Desktop bridge error" : "Deck disconnected"}</strong><span data-testid="connection-banner-message">{snapshot.connection.message && displayText(snapshot.connection.message, DISPLAY_LIMITS.message)}</span>{/*
+            <div><strong>{snapshot.connection.status === "loading" ? "Establishing control channel" : snapshot.connection.status === "connected" ? (snapshot.connection.selectionFallback ? "Using the daemon on this machine" : "Connected to a differently-built daemon") : snapshot.connection.status === "error" ? "Desktop bridge error" : "Daemon disconnected"}</strong><span data-testid="connection-banner-message">{snapshot.connection.message && displayText(snapshot.connection.message, DISPLAY_LIMITS.message)}</span>{/*
               PRD #741 M7. The stored selection could not be honoured, so the
               app is on the local deck — and it says which of the two reasons it
               was. This is why the banner's condition now includes it: a
@@ -1685,22 +1704,22 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
               the substitution would be silent, and acting on the wrong machine's
               agents is the outcome that makes it worth a row.
             */}{snapshot.connection.selectionFallback && <span data-testid="selection-fallback">{displayText(snapshot.connection.selectionFallback, DISPLAY_LIMITS.message)}</span>}{/* PRD #741 M7: why Start and Replace are absent, said once, where they would have been. */}{remoteDeck && snapshot.connection.localOnlyReason && <span data-testid="remote-deck-notice">{displayText(snapshot.connection.localOnlyReason, DISPLAY_LIMITS.message)}</span>}</div>
-            {snapshot.connection.status !== "loading" && <div className="connection-actions">{mode === "live" && !remoteDeck && snapshot.connection.status === "disconnected" && <button className="button primary compact" data-testid="start-daemon" onClick={requestStartDaemon}><Play size={13} /> Start deck</button>}{mode === "live" && !remoteDeck && snapshot.connection.daemonDetected && snapshot.connection.status === "error" && snapshot.connection.runningAgentCount === 0 && <button className="button primary compact" data-testid="replace-daemon" onClick={requestRestartDaemon}><RefreshCw size={13} /> Replace deck</button>}{mode === "live" && snapshot.connection.status === "error" && snapshot.connection.buildStampMismatchOnly && <button className="button primary compact" data-testid="connect-anyway" onClick={requestConnectAnyway}><ShieldAlert size={13} /> Connect anyway</button>}<button className="button secondary compact" onClick={() => void runtime.reconnect()}><RefreshCw size={13} /> Reconnect</button></div>}
+            {snapshot.connection.status !== "loading" && <div className="connection-actions">{mode === "live" && !remoteDeck && snapshot.connection.status === "disconnected" && <button className="button primary compact" data-testid="start-daemon" onClick={requestStartDaemon}><Play size={13} /> Start daemon</button>}{mode === "live" && !remoteDeck && snapshot.connection.daemonDetected && snapshot.connection.status === "error" && snapshot.connection.runningAgentCount === 0 && <button className="button primary compact" data-testid="replace-daemon" onClick={requestRestartDaemon}><RefreshCw size={13} /> Replace daemon</button>}{mode === "live" && snapshot.connection.status === "error" && snapshot.connection.buildStampMismatchOnly && <button className="button primary compact" data-testid="connect-anyway" onClick={requestConnectAnyway}><ShieldAlert size={13} /> Connect anyway</button>}<button className="button secondary compact" onClick={() => void runtime.reconnect()}><RefreshCw size={13} /> Reconnect</button></div>}
           </div>
         )}
 
         {allDecks && (
-          <section className="workspace-section" aria-label="Select a deck">
-            <SelectDeckNote testId="deck-select-deck" title="Select a deck to see its runs">
-              <p>All Decks is every deck at once, and this screen works on one: each tile here is a live terminal into that deck&apos;s agents.</p>
-              <p className="overview-note-hint">Choose a deck in the Deck selector above. The overview shows every deck together.</p>
-              <div><button className="button secondary" data-testid="deck-select-deck-overview" onClick={() => VOICE_ACTIONS.openOverview.run(voiceContext)}><LayoutList size={14} /> Open overview</button></div>
+          <section className="workspace-section" aria-label="Select a daemon">
+            <SelectDeckNote testId="deck-select-deck" title="Select a daemon to see its runs">
+              <p>All daemons is every daemon at once, and this screen works on one: each tile here is a live terminal into that daemon&apos;s agents.</p>
+              <p className="overview-note-hint">Choose a daemon in the Daemon selector above. The dashboard shows every daemon together.</p>
+              <div><button className="button secondary" data-testid="deck-select-deck-overview" onClick={() => VOICE_ACTIONS.openOverview.run(voiceContext)}><LayoutList size={14} /> Open dashboard</button></div>
             </SelectDeckNote>
           </section>
         )}
 
         {!allDecks && <section className="workflow-strip" aria-labelledby="workflow-title">
-          <header><div><span className="section-kicker">RUN GRAPH</span><h1 id="workflow-title">Visible deterministic loop</h1></div><button onClick={() => setWorkflowOpen(true)}><SlidersHorizontal size={13} /> Edit loop</button></header>
+          <header><div><span className="section-kicker">RUN GRAPH</span><h1 id="workflow-title">Visible deterministic loop</h1></div><button onClick={() => setOrchestrationOpen(true)}><SlidersHorizontal size={13} /> Edit loop</button></header>
           <div className="workflow-track">
             {orderedStages.length ? orderedStages.map((stage, index) => (
               <div className={`workflow-node node-${stage.status} ${stage.enabled ? "" : "is-disabled"}`} key={stage.id} data-testid={`workflow-node-${stage.id}`}>
@@ -1708,7 +1727,7 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
                 <div><strong>{stage.label}</strong><small>{stage.enabled ? (stage.attempt === undefined ? stage.status : `${stage.status} · att ${stage.attempt}`) : "skipped"}</small></div>
                 {index < orderedStages.length - 1 && <i className="workflow-link" aria-hidden="true" />}
               </div>
-            )) : <div className="workflow-empty">No workflow nodes reported. Open <button onClick={() => setWorkflowOpen(true)}>Edit loop</button> to inspect configuration.</div>}
+            )) : <div className="workflow-empty">No workflow nodes reported. Open <button onClick={() => setOrchestrationOpen(true)}>Edit loop</button> to inspect configuration.</div>}
           </div>
         </section>}
 
@@ -1717,7 +1736,7 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
         {!allDecks && <section className="workspace-section" aria-label="Agent terminals">
           <header className="workspace-header">
             <div><span className="section-kicker">AGENT DECK</span><h2>Live work surfaces</h2></div>
-            <div className="workspace-tools"><span>{snapshot.agents.length} agents</span><span>{snapshot.agents.filter((agent) => agent.status === "running").length} active</span><button className={evidenceOpen ? "is-active" : ""} onClick={() => setEvidenceOpen((open) => !open)}><PanelRight size={14} /> Evidence</button></div>
+            <div className="workspace-tools"><span>{snapshot.agents.length} agents</span><span>{snapshot.agents.filter((agent) => agent.status === "running").length} active</span><button className={evidenceOpen ? "is-active" : ""} onClick={() => setEvidenceOpen((open) => !open)}><PanelRight size={14} /> Events</button></div>
           </header>
           {snapshot.connection.status === "loading" && !snapshot.agents.length ? <LoadingDeck /> : snapshot.agents.length ? (
             <div className="agent-grid">
@@ -1775,7 +1794,7 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
         open={projectsOpen}
         state={projectState}
         onClose={() => setProjectsOpen(false)}
-        onConfigureWorkflow={() => { setProjectsOpen(false); setWorkflowOpen(true); }}
+        onConfigureOrchestration={() => { setProjectsOpen(false); setOrchestrationOpen(true); }}
         allDecks={allDecks}
       />
       <PromptLibraryPanel
@@ -1789,7 +1808,7 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
         onRemove={(id) => { removePrompt(id); setNotice("Prompt removed from this device's library."); }}
       />
       <ProfilesPanel open={profilesOpen} profiles={profiles} onClose={() => setProfilesOpen(false)} onUpdate={updateProfile} onReset={resetProfiles} onSaved={() => setNotice("Agent profile draft saved locally. Project TOML is unchanged.")} />
-      <WorkflowPanel key={activeProject?.path ?? "runtime-workflow"} open={workflowOpen} profiles={profiles} order={profileOrder} mode={mode} project={activeProject} onChooseProject={() => { setWorkflowOpen(false); setProjectsOpen(true); }} onClose={() => setWorkflowOpen(false)} onToggle={(id) => { const profile = profiles.find((item) => item.id === id); if (profile) updateProfile(id, { enabled: !profile.enabled }); }} onMove={moveStage} onLaunch={requestLaunch} platformIssue={workflowPlatformIssue} capabilityIssue={snapshot.connection.projectActionsReason} prompts={prompts} allDecks={allDecks} />
+      <OrchestrationPanel key={activeProject?.path ?? "runtime-orchestration"} open={orchestrationOpen} profiles={profiles} order={profileOrder} mode={mode} project={activeProject} onChooseProject={() => { setOrchestrationOpen(false); setProjectsOpen(true); }} onClose={() => setOrchestrationOpen(false)} onToggle={(id) => { const profile = profiles.find((item) => item.id === id); if (profile) updateProfile(id, { enabled: !profile.enabled }); }} onMove={moveStage} onLaunch={requestLaunch} platformIssue={workflowPlatformIssue} capabilityIssue={snapshot.connection.projectActionsReason} prompts={prompts} allDecks={allDecks} />
       {paletteOpen && <CommandPalette commands={commandItems} onClose={() => setPaletteOpen(false)} />}
       {helpOpen && <ShortcutHelp onClose={() => setHelpOpen(false)} />}
       {confirm && <ConfirmDialog state={confirm} onClose={() => setConfirm(undefined)} />}
@@ -1902,17 +1921,17 @@ function Instrument({ label, children, testId }: { label: string; children: Reac
 
 function EvidenceDrawer({ evidence, selected, onSelect, onClose }: { evidence: EvidenceItem[]; selected?: EvidenceItem; onSelect: (id: string) => void; onClose: () => void }) {
   return (
-    <aside className="evidence-drawer" data-testid="evidence-drawer" aria-label="Transition evidence">
-      <header><div><span className="section-kicker">EVENT LEDGER</span><h2>Transition evidence</h2></div><button aria-label="Close evidence drawer" onClick={onClose}><X size={16} /></button></header>
+    <aside className="evidence-drawer" data-testid="evidence-drawer" aria-label="Transition events">
+      <header><div><span className="section-kicker">EVENTS</span><h2>Transition events</h2></div><button aria-label="Close events drawer" onClick={onClose}><X size={16} /></button></header>
       <div className="evidence-filter"><button className="is-active">All <span>{evidence.length}</span></button><button>Failures <span>{evidence.filter((item) => item.verdict === "FIX" || item.verdict === "ERROR").length}</span></button></div>
-      <div className="evidence-list" role="listbox" aria-label="Run evidence">
+      <div className="evidence-list" role="listbox" aria-label="Events">
         {evidence.length ? evidence.map((item) => (
           <button key={item.id} role="option" aria-selected={item.id === selected?.id} className={item.id === selected?.id ? "is-active" : ""} onClick={() => onSelect(item.id)}>
             <span className={`verdict verdict-${item.verdict.toLowerCase()}`}>{item.verdict}</span>
             <div><strong>{item.title}</strong><small>{item.to ? <>{item.from} <ArrowRight size={10} /> {item.to}</> : item.from}</small></div>
             <time>{item.at}</time>
           </button>
-        )) : <div className="evidence-empty"><History size={20} /><strong>No events yet</strong><span>Live hook and handoff events appear here as agents work — delegations, deliveries, failures, and work-done reports included.</span></div>}
+        )) : <div className="evidence-empty"><History size={20} /><strong>No events yet</strong><span>Live hook and delegation events appear here as agents work — delegations, deliveries, failures, and work-done reports included.</span></div>}
       </div>
       {selected && (
         <div className="evidence-detail">
@@ -1933,7 +1952,7 @@ function LoadingDeck() {
 }
 
 function EmptyDeck({ onReconnect, onProfiles }: { onReconnect: () => void; onProfiles: () => void }) {
-  return <div className="empty-deck"><Blocks size={28} /><h3>No active agent surfaces</h3><p>Connect to a running deck or prepare agent profiles before starting the loop.</p><div><button className="button secondary" onClick={onProfiles}><Bot size={14} /> Configure agents</button><button className="button primary" onClick={onReconnect}><RefreshCw size={14} /> Reconnect</button></div></div>;
+  return <div className="empty-deck"><Blocks size={28} /><h3>No active agent surfaces</h3><p>Connect to a running daemon or prepare agent profiles before activating an orchestration.</p><div><button className="button secondary" onClick={onProfiles}><Bot size={14} /> Configure agents</button><button className="button primary" onClick={onReconnect}><RefreshCw size={14} /> Reconnect</button></div></div>;
 }
 
 function CommandPalette({ commands, onClose }: { commands: { label: string; hint: string; icon: typeof Bot; run: () => void }[]; onClose: () => void }) {
@@ -1943,6 +1962,6 @@ function CommandPalette({ commands, onClose }: { commands: { label: string; hint
 }
 
 function ShortcutHelp({ onClose }: { onClose: () => void }) {
-  const shortcuts = [["⌘ K", "Command menu"], ["⌘/Ctrl + / − / 0", "Zoom in, out, reset"], ["1 — 4", "Focus agent"], ["J / K", "Move through evidence"], ["?", "Shortcut guide"], ["ESC", "Close overlay"]];
+  const shortcuts = [["⌘ K", "Command menu"], ["⌘/Ctrl + / − / 0", "Zoom in, out, reset"], ["1 — 4", "Focus agent"], ["J / K", "Move through events"], ["?", "Shortcut guide"], ["ESC", "Close overlay"]];
   return <div className="dialog-backdrop" role="presentation" onMouseDown={onClose}><section className="shortcut-dialog" role="dialog" aria-modal="true" aria-labelledby="shortcut-title" onMouseDown={(event) => event.stopPropagation()}><header><div><HelpCircle size={18} /><h2 id="shortcut-title">Control keys</h2></div><button aria-label="Close shortcut guide" onClick={onClose}><X size={16} /></button></header>{shortcuts.map(([keys, label]) => <div key={keys}><span>{label}</span><kbd>{keys}</kbd></div>)}</section></div>;
 }

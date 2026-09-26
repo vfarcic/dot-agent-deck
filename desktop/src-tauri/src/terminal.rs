@@ -623,7 +623,7 @@ impl DesktopState {
         let deck = session.endpoint.identity();
         if deck != scope.identity() {
             return Err(Box::new(RejectedSession {
-                reason: "a terminal session may only be published under a scope for its own deck"
+                reason: "a terminal session may only be published under a scope for its own daemon"
                     .to_string(),
                 session,
             }));
@@ -703,7 +703,7 @@ fn rejection_notice(reason: &[u8]) -> Vec<u8> {
         })
         .collect::<String>();
     let reason = if reason.trim().is_empty() {
-        "the deck refused terminal input"
+        "the daemon refused terminal input"
     } else {
         reason.trim()
     };
@@ -1165,7 +1165,7 @@ pub(crate) async fn attach(
                             generation,
                             state: TerminalState::Error,
                             message: Some(format!(
-                                "unexpected terminal frame kind 0x{kind:02x} from the deck"
+                                "unexpected terminal frame kind 0x{kind:02x} from the daemon"
                             )),
                         },
                     );

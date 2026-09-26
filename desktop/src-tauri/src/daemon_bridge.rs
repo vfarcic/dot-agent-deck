@@ -99,7 +99,7 @@ impl TrustedDaemon {
                 .connection
                 .error
                 .clone()
-                .unwrap_or_else(|| "the deck is not protocol-compatible".into()))
+                .unwrap_or_else(|| "the daemon is not protocol-compatible".into()))
         }
     }
 
@@ -604,13 +604,13 @@ fn contract_refusal(response: &AttachResponse) -> Option<String> {
     let mut sides = Vec::new();
     if !peer_lacks.is_empty() {
         sides.push(format!(
-            "the deck is behind this app across {}",
+            "the daemon is behind this app across {}",
             named_breaks(&peer_lacks)
         ));
     }
     if !this_build_lacks.is_empty() {
         sides.push(format!(
-            "this app is behind the deck across {}",
+            "this app is behind the daemon across {}",
             named_breaks(&this_build_lacks)
         ));
     }
@@ -631,9 +631,9 @@ fn contract_refusal(response: &AttachResponse) -> Option<String> {
 ///
 /// The prepare verb is listed by its current spelling, but it is checked
 /// through `DaemonCapabilities::supports_prepare_orchestration`, which also
-/// accepts the legacy `prepare-workflow` a daemon built before #1045 advertises
-/// — and the current spelling is also the one the sentence names when it is
-/// missing, so no user is shown the legacy string.
+/// accepts the legacy `prepare-workflow` a daemon built before #1045 advertises.
+/// No capability string reaches the sentence [`project_actions_reason`]
+/// composes, so no user is shown either spelling.
 const DESKTOP_PROJECT_CAPABILITIES: [&str; 4] = [
     dot_agent_deck::daemon_protocol::CAP_LIST_PROJECTS,
     dot_agent_deck::daemon_protocol::CAP_RESOLVE_PROJECT,
@@ -661,23 +661,23 @@ const DESKTOP_PROJECT_CAPABILITIES: [&str; 4] = [
 /// project verbs are missing is not a broken deck.
 fn project_actions_reason(response: &AttachResponse) -> Option<String> {
     let capabilities = dot_agent_deck::daemon_client::DaemonCapabilities::from_hello(response);
-    let missing: Vec<&str> = DESKTOP_PROJECT_CAPABILITIES
-        .into_iter()
-        .filter(|capability| {
-            if *capability == dot_agent_deck::daemon_protocol::CAP_PREPARE_ORCHESTRATION {
-                !capabilities.supports_prepare_orchestration()
-            } else {
-                !capabilities.supports(capability)
-            }
-        })
-        .collect();
-    if missing.is_empty() {
+    let all_advertised = DESKTOP_PROJECT_CAPABILITIES.into_iter().all(|capability| {
+        if capability == dot_agent_deck::daemon_protocol::CAP_PREPARE_ORCHESTRATION {
+            capabilities.supports_prepare_orchestration()
+        } else {
+            capabilities.supports(capability)
+        }
+    });
+    if all_advertised {
         return None;
     }
-    Some(format!(
-        "This deck does not advertise {}, so projects and orchestrations cannot be started from here. Agents already running on it stay visible and usable.",
-        missing.join(", ")
-    ))
+    // The capability strings stay out of the sentence (issue #1045): a user is
+    // told what they cannot do and what still works, not which wire verbs are
+    // missing, which also keeps the legacy `prepare-workflow` off screen.
+    Some(
+        "This daemon cannot offer projects or activate orchestrations from here. Agents already running on it stay visible and usable."
+            .to_string(),
+    )
 }
 
 /// Why the desktop's New agent flow cannot start anything on this deck, or
@@ -697,7 +697,7 @@ fn new_agent_reason(response: &AttachResponse) -> Option<String> {
         return None;
     }
     Some(format!(
-        "This deck does not advertise {}, so it cannot be browsed for a directory to start in. Start agents on it from the TUI on its host, or upgrade the deck.",
+        "This daemon does not advertise {}, so it cannot be browsed for a directory to start in. Create agents on it from the TUI on its host, or upgrade the daemon.",
         dot_agent_deck::daemon_protocol::CAP_LIST_DIRECTORIES
     ))
 }
@@ -844,11 +844,11 @@ fn classify_handshake(
             response
                 .error
                 .clone()
-                .unwrap_or_else(|| "the deck rejected Hello".into()),
+                .unwrap_or_else(|| "the daemon rejected Hello".into()),
         )
     } else if server_protocol_version != Some(PROTOCOL_VERSION) {
         Some(format!(
-            "protocol mismatch: desktop expects {PROTOCOL_VERSION}, deck reports {}",
+            "protocol mismatch: desktop expects {PROTOCOL_VERSION}, daemon reports {}",
             server_protocol_version
                 .map(|version| version.to_string())
                 .unwrap_or_else(|| "no version".into())
@@ -862,7 +862,7 @@ fn classify_handshake(
         // rather than with a tag.
         build_stamp_mismatch_only = true;
         let builds = format!(
-            "Builds: desktop is {client_build}, deck is {}",
+            "Builds: desktop is {client_build}, daemon is {}",
             daemon_build_version.as_deref().unwrap_or("unreported")
         );
         // Whichever switch is armed, the mismatch is kept in `error` (not
@@ -878,12 +878,12 @@ fn classify_handshake(
             )),
             BuildMismatchAllowance::Refuse => {
                 let recovery = match running_agent_count {
-                    Some(0) => "No live agents are reported; use Replace deck to start the matching bundled build, or Connect anyway to keep this one.".into(),
+                    Some(0) => "No live agents are reported; use Replace daemon to start the matching bundled build, or Connect anyway to keep this one.".into(),
                     Some(count) => format!(
-                        "The deck reports {count} live agent{}; stop them individually before replacing the deck, or Connect anyway to keep this one.",
+                        "The daemon reports {count} live agent{}; stop them individually before replacing the daemon, or Connect anyway to keep this one.",
                         if count == 1 { "" } else { "s" }
                     ),
-                    None => "The deck could not report its live-agent count, so automatic replacement is disabled; Connect anyway keeps this one.".into(),
+                    None => "The daemon could not report its live-agent count, so automatic replacement is disabled; Connect anyway keeps this one.".into(),
                 };
                 Some(format!("{contract}. {builds}. {recovery}"))
             }
@@ -1044,7 +1044,7 @@ pub(crate) async fn bounded_reply<T, E: std::fmt::Display>(
         Ok(Ok(value)) => Ok(value),
         Ok(Err(error)) => Err(safe_message(error.to_string())),
         Err(_) => Err(safe_message(format!(
-            "the deck took the connection but did not answer {what} within {}s",
+            "the daemon took the connection but did not answer {what} within {}s",
             DECK_REPLY_TIMEOUT.as_secs()
         ))),
     }
@@ -1111,7 +1111,7 @@ async fn establish(
         dot_agent_deck::platform::fsperm::verify_endpoint_trusted(local.path()).map_err(
             |reason| {
                 safe_message(format!(
-                    "refusing to connect to the deck at {}: {reason}",
+                    "refusing to connect to the daemon at {}: {reason}",
                     local.path().to_string_lossy()
                 ))
             },
@@ -1638,7 +1638,7 @@ mod tests {
             .error
             .expect("a refusal says why");
         assert!(
-            error.contains("this app is behind the deck"),
+            error.contains("this app is behind the daemon"),
             "a deck ahead of the app must say so: {error}"
         );
 
@@ -1650,7 +1650,7 @@ mod tests {
         .error
         .expect("a refusal says why");
         assert!(
-            error.contains("the deck is behind this app"),
+            error.contains("the daemon is behind this app"),
             "a deck behind the app must say so: {error}"
         );
     }
@@ -1873,7 +1873,7 @@ mod tests {
         // rather than from `AttachResponse::with_capabilities()`, which
         // advertises whatever the LOCAL platform's daemon can do.
         // `DAEMON_CAPABILITIES` is deliberately shorter on Windows (PRD #819
-        // strikes `prepare-workflow` and `start-prepared-agent` there, for want
+        // strikes `prepare-orchestration` and `start-prepared-agent` there, for want
         // of a DACL implementation), so "the full set" and "everything the
         // desktop needs" are the same list on Unix and different lists on
         // Windows — and this test is about the second one. It failed on
@@ -1906,8 +1906,12 @@ mod tests {
         .project_actions_reason
         .expect("an unadvertised daemon withholds every verb");
         assert!(
-            reason.contains(dot_agent_deck::daemon_protocol::CAP_LIST_PROJECTS),
-            "the reason names what is missing: {reason}"
+            reason.contains("cannot offer projects or activate orchestrations"),
+            "the reason says what cannot be done: {reason}"
+        );
+        assert!(
+            !reason.contains(dot_agent_deck::daemon_protocol::CAP_LIST_PROJECTS),
+            "no wire verb is named to the user (issue #1045): {reason}"
         );
         assert!(
             reason.contains("stay visible and usable"),
@@ -1976,8 +1980,8 @@ mod tests {
         .expect("three of four is not four");
 
         assert!(
-            reason.contains(dot_agent_deck::daemon_protocol::CAP_PREPARE_ORCHESTRATION),
-            "{reason}"
+            !reason.contains(dot_agent_deck::daemon_protocol::CAP_PREPARE_ORCHESTRATION),
+            "no capability string is shown (issue #1045): {reason}"
         );
         assert!(
             !reason.contains(dot_agent_deck::daemon_protocol::CAP_PREPARE_WORKFLOW),
@@ -2025,7 +2029,7 @@ mod tests {
         assert_eq!(info.status, ConnectionStatus::Incompatible);
         let error = info.error.unwrap();
         assert!(error.contains("contract mismatch"));
-        assert!(error.contains("use Replace deck"));
+        assert!(error.contains("use Replace daemon"));
     }
 
     #[test]
@@ -4844,7 +4848,7 @@ mod tests {
                 Err(error) => error,
             };
             assert!(
-                error.contains("that deck is not one this app is observing"),
+                error.contains("that daemon is not one this app is observing"),
                 "{case}: refused with DeckScope::resolve's error, got: {error}"
             );
         }
@@ -5021,7 +5025,7 @@ mod tests {
 
         let error = unknown.expect_err("an unobserved deck id is refused");
         assert!(
-            error.contains("that deck is not one this app is observing"),
+            error.contains("that daemon is not one this app is observing"),
             "refused with DeckScope::resolve's error, got: {error}"
         );
         assert_eq!(
@@ -5095,7 +5099,7 @@ mod tests {
         assert!(
             failure
                 .message
-                .contains("that deck is not one this app is observing"),
+                .contains("that daemon is not one this app is observing"),
             "{}",
             failure.message
         );
@@ -5352,7 +5356,7 @@ mod tests {
         ] {
             let error = outcome.expect_err("an unobserved deck is refused");
             assert!(
-                error.contains("that deck is not one this app is observing"),
+                error.contains("that daemon is not one this app is observing"),
                 "{query}: refused with DeckScope::resolve's error, got: {error}"
             );
         }
@@ -5642,7 +5646,7 @@ mod tests {
             (
                 "an unobserved deck",
                 unobserved,
-                "that deck is not one this app is observing",
+                "that daemon is not one this app is observing",
             ),
         ] {
             match outcome {
@@ -6087,7 +6091,7 @@ start = true
 
     /// Scenario: under **All Decks**, one remote row is a deck that offers the
     /// project verbs but predates `prepared-role-command`, and a second offers
-    /// no `prepare-workflow` at all; the local deck is a current real daemon.
+    /// no prepare verb at all; the local deck is a current real daemon.
     /// The orchestrations query answers each older deck `unsupported` with its
     /// reason — the missing configured-command start, and the connection's own
     /// `projectActionsReason` — and a launch aimed at the first is refused with
@@ -6166,8 +6170,8 @@ start = true
         match oldest_query.expect("an older deck answers, it does not fail") {
             crate::dto::DesktopNewAgentOrchestrations::Unsupported { reason } => {
                 assert!(
-                    reason.contains("does not advertise")
-                        && reason.contains(CAP_PREPARE_ORCHESTRATION),
+                    reason.contains("cannot offer projects or activate orchestrations")
+                        && !reason.contains(CAP_PREPARE_ORCHESTRATION),
                     "the connection's projectActionsReason: {reason}"
                 );
             }
@@ -6195,7 +6199,7 @@ start = true
         ] {
             assert!(
                 error.as_deref().is_some_and(
-                    |error| error.contains("that deck is not one this app is observing")
+                    |error| error.contains("that daemon is not one this app is observing")
                 ),
                 "{case}: an unobserved deck is refused with the resolve error: {error:?}"
             );

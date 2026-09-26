@@ -136,7 +136,7 @@ pub struct VoiceDeckChoice {
 /// itself: `DECK_STATE_FALLBACK.pending` in `desktop/src/lib/newAgent.ts`,
 /// because a deck the webview's fleet has no entry for is one that has not
 /// reported to it yet.
-pub const DECK_NOT_REPORTED: &str = "This deck has not reported yet.";
+pub const DECK_NOT_REPORTED: &str = "This daemon has not reported yet.";
 
 /// What the New agent dialog's directory browser is showing, as the webview
 /// DECLARED it for one utterance (PRD #1223) — the set a spoken

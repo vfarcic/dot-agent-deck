@@ -41,12 +41,12 @@ import type { DeckView } from "../types";
  * - `focusAgent` — the agent tile's own `onSelect` calls `setSelectedAgentId`;
  * - `toggleEvidenceDrawer` — the workspace header's Evidence button, and the
  *   evidence row's select-and-open;
- * - `openWorkflowOrder` — the run-graph "Edit loop" button (twice) and
- *   `ProjectsPanel`'s `onConfigureWorkflow`;
- * - `openProjects` — `WorkflowPanel`'s `onChooseProject`;
+ * - `openOrchestrationOrder` — the run-graph "Edit loop" button (twice) and
+ *   `ProjectsPanel`'s `onConfigureOrchestration`;
+ * - `openProjects` — `OrchestrationPanel`'s `onChooseProject`;
  * - `openAgentProfiles` — `EmptyDeck`'s `onProfiles`.
  *
- * (`grep -n 'setSelectedAgentId\|setEvidenceOpen\|setWorkflowOpen\|setProjectsOpen\|setProfilesOpen' desktop/src/App.tsx`
+ * (`grep -n 'setSelectedAgentId\|setEvidenceOpen\|setOrchestrationOpen\|setProjectsOpen\|setProfilesOpen' desktop/src/App.tsx`
  * finds them; line numbers are deliberately not quoted, since they rot.)
  *
  * **The load-bearing property survives the narrowing, which is why the code was
@@ -99,7 +99,7 @@ import type { DeckView } from "../types";
  * that needed it would be a change to where the state lives rather than a
  * change to the table.
  */
-export type DeckOverlay = "projects" | "prompts" | "profiles" | "workflow" | "settings";
+export type DeckOverlay = "projects" | "prompts" | "profiles" | "orchestration" | "settings";
 
 /** Which agent's pane to open, and which screen it is opened over. */
 export type AgentViewTarget = {
@@ -468,7 +468,7 @@ export const VOICE_ACTIONS = {
   },
 
   openOverview: {
-    label: "Show the agent overview",
+    label: "Show the agent dashboard",
     voice: true,
     needs: ["navigate"],
     run: (context: Pick<VoiceActionContext, "navigate">) => context.navigate({ kind: "overview" }),
@@ -481,7 +481,7 @@ export const VOICE_ACTIONS = {
    * so the row stays in the table and the door stays shut.
    */
   openDeck: {
-    label: "Go back to the deck",
+    label: "Go back to the Daemons screen",
     voice: true,
     needs: ["navigate"],
     run: (context: Pick<VoiceActionContext, "navigate">) => context.navigate({ kind: "deck" }),
@@ -543,11 +543,11 @@ export const VOICE_ACTIONS = {
     run: (context: Pick<VoiceActionContext, "openOverlay">) => context.openOverlay("profiles"),
   },
 
-  openWorkflowOrder: {
-    label: "Edit workflow order",
+  openOrchestrationOrder: {
+    label: "Edit orchestration order",
     no_voice: "hidden unless the experimental flag is on (issue #1198), so by default a row would be a spoken door to a panel the app does not show; and with the flag on, the editor it opens enables, skips, reorders and LAUNCHES roles; launching an orchestration starts agents, and nothing in this slice starts anything",
     needs: ["openOverlay"],
-    run: (context: Pick<VoiceActionContext, "openOverlay">) => context.openOverlay("workflow"),
+    run: (context: Pick<VoiceActionContext, "openOverlay">) => context.openOverlay("orchestration"),
   },
 
   openSettings: {
@@ -559,14 +559,14 @@ export const VOICE_ACTIONS = {
 
   showRuns: {
     label: "Show the running agents",
-    no_voice: "clears whichever overlays happen to be open and reveals the deck underneath, so with nothing open it does nothing at all and no honest report sentence can be written for it; `open_deck` is the row that means \"show me the terminals\"",
+    no_voice: "clears whichever overlays happen to be open and reveals the Daemons screen underneath, so with nothing open it does nothing at all and no honest report sentence can be written for it; `open_deck` is the row that means \"show me the terminals\"",
     needs: ["closeOverlays"],
     run: (context: Pick<VoiceActionContext, "closeOverlays">) => context.closeOverlays(),
   },
 
   toggleEvidenceDrawer: {
-    label: "Show or hide the evidence drawer",
-    no_voice: "a toggle, and the table cannot see which way it is pointing — the drawer is a `ControlDeck` boolean rather than a screen — so \"show the evidence\" and \"hide the evidence\" would both flip it and one of the two would be wrong every time",
+    label: "Show or hide the events drawer",
+    no_voice: "a toggle, and the table cannot see which way it is pointing — the drawer is a `ControlDeck` boolean rather than a screen — so \"show the events\" and \"hide the events\" would both flip it and one of the two would be wrong every time",
     needs: ["toggleEvidence"],
     run: (context: Pick<VoiceActionContext, "toggleEvidence">) => context.toggleEvidence(),
   },
@@ -585,7 +585,7 @@ export const VOICE_ACTIONS = {
   },
 
   messageCoordinator: {
-    label: "Put the caret in the coordinator's terminal",
+    label: "Put the caret in the orchestrator's terminal",
     no_voice: "moves the caret so the operator can type to the orchestration's start role; dictating INTO an agent is PRD #802 D6, and a command that only moved the caret would promise an input path voice cannot finish",
     needs: ["focusTerminal"],
     run: (context: Pick<VoiceActionContext, "focusTerminal">, target: AgentTarget) => context.focusTerminal(target.agentId),
@@ -601,7 +601,7 @@ export const VOICE_ACTIONS = {
   // -- the overview's own -------------------------------------------------
 
   openNewAgent: {
-    label: "Start a new agent on a chosen deck",
+    label: "Create a new agent on a chosen daemon",
     /* The `open_new_agent` row (PRD #1223). It OPENS the dialog and starts
        nothing — the dialog's own Start is still the only thing that does — so
        it is outside PRD #802 D5's confirmation set. A spoken deck arrives as
@@ -734,7 +734,7 @@ export const VOICE_ACTIONS = {
      not route through these. */
 
   confirmStopAgent: {
-    label: "Ask to stop one agent on the overview",
+    label: "Ask to close one agent on the dashboard",
     voice: true,
     needs: ["confirmStopAgent", "reportRefused"],
     run: (context: Pick<VoiceActionContext, "confirmStopAgent" | "reportRefused">, target: VoiceDispatchTarget) => {
@@ -744,7 +744,7 @@ export const VOICE_ACTIONS = {
   },
 
   confirmCloseOrchestration: {
-    label: "Ask to close an orchestration on the overview",
+    label: "Ask to close an orchestration on the dashboard",
     voice: true,
     needs: ["confirmCloseOrchestration", "reportRefused"],
     run: (context: Pick<VoiceActionContext, "confirmCloseOrchestration" | "reportRefused">, target: VoiceDispatchTarget) => {

@@ -1,4 +1,4 @@
-export const WINDOWS_WORKFLOW_BLOCK_REASON = "Live workflow launch is unavailable in this Windows preview because profile commands use POSIX shell quoting. Use the TUI or launch commands manually until native Windows command construction is implemented.";
+export const WINDOWS_WORKFLOW_BLOCK_REASON = "Live orchestration activation is unavailable in this Windows preview because profile commands use POSIX shell quoting. Use the TUI or run commands manually until native Windows command construction is implemented.";
 
 export interface BrowserPlatformHints {
   platform?: string;

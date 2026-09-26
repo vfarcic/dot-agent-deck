@@ -709,7 +709,7 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 
 .sheet-backdrop, .dialog-backdrop { position: fixed; z-index: 80; inset: 0; display: flex; justify-content: flex-end; background: rgb(var(--scrim-rgb) / .42); }
 .config-sheet { width: min(780px, calc(100vw - 74px)); height: 100%; display: flex; flex-direction: column; border-left: 1px solid var(--line-strong); background: var(--paper); box-shadow: -12px 0 32px rgb(var(--scrim-rgb) / .12); }
-.workflow-sheet { width: min(610px, calc(100vw - 74px)); }
+.orchestration-sheet { width: min(610px, calc(100vw - 74px)); }
 .projects-sheet { width: min(850px, calc(100vw - 74px)); }
 .sheet-header { min-height: 92px; padding: 18px 20px; display: flex; align-items: flex-start; justify-content: space-between; border-bottom: 1px solid var(--line); }
 .sheet-header h2 { margin: 3px 0 5px; font-size: 20px; letter-spacing: -.02em; }
@@ -768,24 +768,24 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .sheet-footer > div { display: flex; align-items: center; gap: 9px; }
 .sheet-footer > div > span, .sheet-footer > span { color: var(--faint); font-size: 8px; }
 .configuration-empty { display: grid; place-items: center; color: var(--muted); }
-.workflow-editor-list { padding: 12px 16px; display: grid; gap: 7px; overflow: auto; }
-.workflow-launch-form { padding: 13px 16px; display: grid; grid-template-columns: minmax(130px, .55fr) minmax(220px, 1.45fr); gap: 10px; border-bottom: 1px solid var(--line); background: var(--paper-sunken); }
-.workflow-launch-form label { display: flex; flex-direction: column; gap: 5px; }
-.workflow-launch-form .workflow-task-prompt { grid-column: 1 / -1; }
-.workflow-launch-form label span { color: var(--faint); font-size: 7px; font-weight: 800; letter-spacing: .1em; text-transform: uppercase; }
-.workflow-launch-form input, .workflow-launch-form textarea { padding: 0 8px; border: 1px solid var(--line-strong); border-radius: 4px; color: var(--ink); background: var(--paper-strong); font-family: "JetBrains Mono", monospace; font-size: 9px; }
-.workflow-launch-form input { height: 33px; }
-.workflow-launch-form textarea { min-height: 104px; padding-top: 8px; resize: vertical; line-height: 1.45; }
-.workflow-launch-form > small { grid-column: 1 / -1; display: flex; align-items: center; gap: 5px; color: var(--red); font-size: 8px; }
-.workflow-editor-row { min-height: 57px; padding: 7px 8px; display: grid; grid-template-columns: 17px 28px minmax(0, 1fr) auto 55px; align-items: center; gap: 8px; border: 1px solid var(--line); border-radius: 4px; background: var(--paper-strong); }
-.workflow-editor-row.is-disabled { opacity: .58; }
-.workflow-editor-row > svg { color: var(--faint); }
-.workflow-order { color: var(--teal); font-family: "JetBrains Mono", monospace; font-size: 9px; }
-.workflow-editor-row > div:nth-child(3) { display: flex; flex-direction: column; gap: 3px; }
-.workflow-editor-row strong { font-size: 10px; }
-.workflow-editor-row strong .start-role { margin-left: 6px; padding: 2px 4px; border-radius: 2px; color: var(--teal); background: var(--teal-soft); font-size: 6px; font-style: normal; letter-spacing: .08em; vertical-align: 1px; }
-.workflow-editor-row strong .custom-command-badge { margin-left: 5px; padding: 2px 4px; border-radius: 2px; color: var(--amber); background: var(--amber-soft); font-size: 6px; font-style: normal; letter-spacing: .06em; vertical-align: 1px; }
-.workflow-editor-row small { color: var(--faint); font-size: 8px; }
+.orchestration-editor-list { padding: 12px 16px; display: grid; gap: 7px; overflow: auto; }
+.orchestration-launch-form { padding: 13px 16px; display: grid; grid-template-columns: minmax(130px, .55fr) minmax(220px, 1.45fr); gap: 10px; border-bottom: 1px solid var(--line); background: var(--paper-sunken); }
+.orchestration-launch-form label { display: flex; flex-direction: column; gap: 5px; }
+.orchestration-launch-form .orchestration-task-prompt { grid-column: 1 / -1; }
+.orchestration-launch-form label span { color: var(--faint); font-size: 7px; font-weight: 800; letter-spacing: .1em; text-transform: uppercase; }
+.orchestration-launch-form input, .orchestration-launch-form textarea { padding: 0 8px; border: 1px solid var(--line-strong); border-radius: 4px; color: var(--ink); background: var(--paper-strong); font-family: "JetBrains Mono", monospace; font-size: 9px; }
+.orchestration-launch-form input { height: 33px; }
+.orchestration-launch-form textarea { min-height: 104px; padding-top: 8px; resize: vertical; line-height: 1.45; }
+.orchestration-launch-form > small { grid-column: 1 / -1; display: flex; align-items: center; gap: 5px; color: var(--red); font-size: 8px; }
+.orchestration-editor-row { min-height: 57px; padding: 7px 8px; display: grid; grid-template-columns: 17px 28px minmax(0, 1fr) auto 55px; align-items: center; gap: 8px; border: 1px solid var(--line); border-radius: 4px; background: var(--paper-strong); }
+.orchestration-editor-row.is-disabled { opacity: .58; }
+.orchestration-editor-row > svg { color: var(--faint); }
+.orchestration-order { color: var(--teal); font-family: "JetBrains Mono", monospace; font-size: 9px; }
+.orchestration-editor-row > div:nth-child(3) { display: flex; flex-direction: column; gap: 3px; }
+.orchestration-editor-row strong { font-size: 10px; }
+.orchestration-editor-row strong .start-role { margin-left: 6px; padding: 2px 4px; border-radius: 2px; color: var(--teal); background: var(--teal-soft); font-size: 6px; font-style: normal; letter-spacing: .08em; vertical-align: 1px; }
+.orchestration-editor-row strong .custom-command-badge { margin-left: 5px; padding: 2px 4px; border-radius: 2px; color: var(--amber); background: var(--amber-soft); font-size: 6px; font-style: normal; letter-spacing: .06em; vertical-align: 1px; }
+.orchestration-editor-row small { color: var(--faint); font-size: 8px; }
 .compact-check { display: flex; flex-direction: row !important; align-items: center; gap: 4px !important; cursor: pointer; }
 .compact-check input { position: absolute; opacity: 0; pointer-events: none; }
 .compact-check > span { width: 17px; height: 17px; display: grid; place-items: center; border: 1px solid var(--line-strong); border-radius: 3px; color: var(--on-accent); }
@@ -793,7 +793,7 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .compact-check em { color: var(--muted); font-size: 8px; font-style: normal; }
 .order-buttons { display: flex; gap: 3px; }
 .order-buttons button { width: 25px; height: 25px; display: grid; place-items: center; border: 1px solid var(--line); border-radius: 3px; background: transparent; cursor: pointer; }
-.workflow-footer { margin-top: auto; }
+.orchestration-footer { margin-top: auto; }
 
 .project-notice { border-bottom-color: var(--teal-rim); color: var(--teal-wash-ink); background: var(--teal-wash); }
 /* Settings sheet (PRD #803 M3). Section list beside the active panel, in the
@@ -1120,7 +1120,7 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
   .agent-instruments { min-height: 46px; }
   .agent-assignment { min-height: 58px; }
   .evidence-drawer { width: 100%; inset: 0 0 var(--voice-reserved); grid-template-rows: 64px 38px 1fr auto 30px; }
-  .config-sheet, .workflow-sheet, .projects-sheet { width: 100%; }
+  .config-sheet, .orchestration-sheet, .projects-sheet { width: 100%; }
   .projects-layout { display: flex; flex-direction: column; }
   .project-library { max-height: 185px; border-right: 0; border-bottom: 1px solid var(--line); }
   .project-library nav { display: flex; }
@@ -1131,13 +1131,13 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
   .form-grid { grid-template-columns: 1fr; }
   .form-wide { grid-column: auto; }
   .sheet-footer > div > span { display: none; }
-  .workflow-editor-row { grid-template-columns: 20px 25px minmax(0, 1fr) 50px; }
-  .workflow-launch-form { grid-template-columns: 1fr; }
-  .workflow-launch-form > small { grid-column: auto; }
-  .workflow-editor-row .compact-check em { display: none; }
-  .workflow-editor-row .order-buttons { grid-column: 4; }
-  .workflow-editor-row .compact-check { grid-column: 1; grid-row: 1; }
-  .workflow-editor-row > svg { display: none; }
+  .orchestration-editor-row { grid-template-columns: 20px 25px minmax(0, 1fr) 50px; }
+  .orchestration-launch-form { grid-template-columns: 1fr; }
+  .orchestration-launch-form > small { grid-column: auto; }
+  .orchestration-editor-row .compact-check em { display: none; }
+  .orchestration-editor-row .order-buttons { grid-column: 4; }
+  .orchestration-editor-row .compact-check { grid-column: 1; grid-row: 1; }
+  .orchestration-editor-row > svg { display: none; }
   .loading-grid { grid-template-columns: 1fr; }
   .loading-grid > div:not(:first-child) { display: none; }
 }
@@ -1175,7 +1175,7 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .handoff-endpoint { font-family: "JetBrains Mono", monospace; font-size: 10.5px; }
 .handoff-respawn { display: inline-flex; color: var(--amber); }
 .handoff-status { display: inline-flex; align-items: center; gap: 4px; margin-left: 2px; font-style: normal; font-size: 9.5px; font-weight: 750; letter-spacing: .05em; text-transform: uppercase; }
-.handoff-status.is-dispatched { color: var(--muted); }
+.handoff-status.is-delegated { color: var(--muted); }
 .handoff-status.is-delivered { color: var(--teal); }
 .handoff-status.is-done { color: var(--green); }
 .handoff-status.is-failed { color: var(--red); }

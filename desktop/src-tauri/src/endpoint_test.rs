@@ -348,7 +348,7 @@ fn message_for(state: EndpointTestState, deck: &str, info: Option<&HandshakeInfo
             .and_then(|info| info.error.clone())
             .unwrap_or_else(|| format!("{deck} refused the connection.")),
         EndpointTestState::DeckNotAnswering => format!(
-            "The ssh connection to {deck} works, but nothing is listening on its deck socket over there. Start Agent Deck on that machine, then test again."
+            "The ssh connection to {deck} works, but nothing is listening on its daemon socket over there. Start Agent Deck on that machine, then test again."
         ),
         EndpointTestState::HostUnreachable => {
             format!("ssh could not reach {deck}.")
@@ -361,13 +361,13 @@ fn message_for(state: EndpointTestState, deck: &str, info: Option<&HandshakeInfo
         }
         EndpointTestState::TransportFailed => format!("The ssh tunnel to {deck} could not be established."),
         EndpointTestState::SshUnavailable => {
-            "No ssh program was found on this machine, so no remote deck can be reached. Install an OpenSSH client.".to_string()
+            "No ssh program was found on this machine, so no remote daemon can be reached. Install an OpenSSH client.".to_string()
         }
         EndpointTestState::NoRemoteSocket => format!(
-            "{deck} has no deck socket path yet, and this test could not discover one."
+            "{deck} has no daemon socket path yet, and this test could not discover one."
         ),
         EndpointTestState::UnknownDeck => {
-            "That deck is no longer in this settings document.".to_string()
+            "That daemon is no longer in this settings document.".to_string()
         }
     }
 }
@@ -481,7 +481,7 @@ async fn unsealed(
 /// every table that enumerates them, to distinguish two reports that differ
 /// only in one sentence.
 const FLEET_IS_NOT_A_DECK: &str =
-    "All Decks is every deck at once, not a deck to test. Choose one deck, then test it.";
+    "All daemons is every daemon at once, not a daemon to test. Choose one daemon, then test it.";
 
 /// The local deck: no ssh, no tunnel, no forwards — just the handshake.
 ///
@@ -508,7 +508,7 @@ async fn test_local(tunnels: &EndpointTunnels) -> EndpointTestReport {
                 report.state = EndpointTestState::DeckNotAnswering;
                 report.detail = Some(safe_display_text(error));
                 report.message = format!(
-                    "No deck answered at {deck}. Start Agent Deck on this machine, then test again."
+                    "No daemon answered at {deck}. Start Agent Deck on this machine, then test again."
                 );
             }
         },
@@ -516,7 +516,7 @@ async fn test_local(tunnels: &EndpointTunnels) -> EndpointTestReport {
             report.state = EndpointTestState::DeckNotAnswering;
             report.detail = Some(safe_display_text(error.to_string()));
             report.message = format!(
-                "No deck answered at {deck}. Start Agent Deck on this machine, then test again."
+                "No daemon answered at {deck}. Start Agent Deck on this machine, then test again."
             );
         }
     }
@@ -861,7 +861,7 @@ async fn test_remote(
         id.as_str(),
         deck,
         EndpointTestState::SshUnavailable,
-        "Remote decks are not supported on this platform yet.".to_string(),
+        "Remote daemons are not supported on this platform yet.".to_string(),
     );
     report.disclosure_known = false;
     report

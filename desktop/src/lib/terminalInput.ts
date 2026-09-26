@@ -259,7 +259,7 @@ export function unreachableDeckTerminalState(deckLabel: string, reason?: string,
   const held = heldAge ? ` The rest of this pane is what ${deckLabel} last reported ${heldAge.label}, and nothing in it is being updated.` : "";
   return {
     reason: "unreachable-deck",
-    notice: `No terminal here: the desktop has no live connection to ${deckLabel}, so there is nothing to attach to.${detail} The terminal appears on its own once that deck answers again.${held}`,
+    notice: `No terminal here: the desktop has no live connection to ${deckLabel}, so there is nothing to attach to.${detail} The terminal appears on its own once that daemon answers again.${held}`,
     noticeTitle: heldAge?.title,
   };
 }

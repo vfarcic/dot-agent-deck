@@ -36,7 +36,7 @@ export const SETTINGS_SECTIONS: SettingsSection[] = [
   { id: "appearance", label: "Appearance", icon: Palette, component: AppearancePanel },
   // PRD #741 M7. One row and one component, which is the whole of the contract
   // this registry exists to keep true — `SettingsSheet.tsx` was not opened.
-  { id: "decks", label: "Decks", icon: Server, component: EndpointsPanel },
+  { id: "decks", label: "Daemons", icon: Server, component: EndpointsPanel },
   // PRD #802 M4, and the tenant this registry's own doc comment named while it
   // was still hypothetical. One row and one component again, and `SettingsSheet.tsx`
   // was not opened.

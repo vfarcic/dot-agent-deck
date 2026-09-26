@@ -7,7 +7,7 @@ import type { DaemonProject, DaemonResolvedProject } from "../types";
  * # What this replaced, and why nothing takes its place
  *
  * `useProjects` kept a `dot-agent-deck.desktop.projects.v1` `localStorage`
- * list: locally minted ids, a free-typed `cwd`, a workflow name and notes,
+ * list: locally minted ids, a free-typed `cwd`, an orchestration name and notes,
  * seeded from the desktop crate's own `desktop_project_cwd()` guess. That list
  * was the SOURCE OF TRUTH for the launch working directory, and nothing
  * validated it against the daemon's world — so against a remote daemon a launch
