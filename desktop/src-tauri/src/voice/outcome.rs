@@ -2261,6 +2261,52 @@ pub fn address_deck_switch(
     }
 }
 
+/// PRD #1195: say why a switch found no deck when the Deck selector lists more
+/// decks than voice took from it.
+///
+/// The app adds the selector's remote decks to the ones a switch resolves
+/// against only while the selector lists at most `bound` of them (see
+/// `selector_voice_decks` in `lib.rs`), so past it a deck the selector shows and
+/// the app does not observe is one voice cannot name — and "no deck matches" would then
+/// read as "there is no such deck". A [`VoiceOutcome::ParamUnresolved`] on
+/// [`SWITCH_DECK_ROW`] whose spoken name matches none of `decks` gets a sentence
+/// naming the selector's size and the bound instead, and pointing at the
+/// selector. It does not claim the deck exists: past the bound the app has not
+/// looked. Any other outcome, and a refusal whose name DID match a deck (one
+/// absent from the transcript, say), is left exactly as it was.
+pub fn refuse_switch_beyond_selector(
+    outcome: &mut VoiceOutcome,
+    decks: &[VoiceDeck],
+    listed: usize,
+    bound: usize,
+) {
+    let VoiceOutcome::ParamUnresolved {
+        transcript,
+        action,
+        spoken,
+        sentence,
+        ..
+    } = outcome
+    else {
+        return;
+    };
+    if action != SWITCH_DECK_ROW
+        || spoken.trim().is_empty()
+        || resolve_deck_ref(spoken, decks) != DeckRefMatch::None
+    {
+        return;
+    }
+    let spoken = safe_message(&*spoken);
+    *sentence = heard(
+        transcript,
+        &format!(
+            "no deck voice can switch to matches \u{201c}{spoken}\u{201d}: the Deck selector \
+             lists {listed} remote decks, more than the {bound} voice takes, so choose it in \
+             the Deck selector"
+        ),
+    );
+}
+
 /// What a spoken directory reference resolved to — [`DeckRefMatch`]'s shape
 /// over the browser's children on screen.
 #[derive(Debug, Clone, PartialEq, Eq)]
