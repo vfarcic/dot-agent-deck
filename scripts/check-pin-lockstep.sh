@@ -22,6 +22,11 @@
 # `desktop-browser` job. Its scanner differs from the other two in how it finds
 # a site and in what it accepts as readable — see `scan_workflow_pnpm`.
 #
+# `--pnpm-sites` prints that scanner's raw findings and exits 0 whatever they
+# are: one `<file>:<line> <version>` per site and one `!ERR <message>` per
+# unreadable one. It exists for `pin_lockstep.rs`, which compares those sites
+# against what renovate.json's pnpm regex extracts from the same files.
+#
 # WHERE IT RUNS
 #
 #   * `cargo test-fast` — via `xtask/linkage-check/src/pin_lockstep.rs`, which
@@ -59,7 +64,7 @@
 # this script never needs touching when a pin moves — only when a new pin class
 # starts being duplicated across the two.
 #
-# Usage: scripts/check-pin-lockstep.sh [REPO_ROOT]
+# Usage: scripts/check-pin-lockstep.sh [--pnpm-sites] [REPO_ROOT]
 # Exit:  0 = the pins agree, 1 = they do not (details on stderr).
 
 set -euo pipefail
@@ -68,6 +73,10 @@ case "${1:-}" in
   -h | --help)
     sed -n '2,/^# Exit:/p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
     exit 0
+    ;;
+  --pnpm-sites)
+    pnpm_sites_only=1
+    shift
     ;;
 esac
 
@@ -264,14 +273,33 @@ scan_workflow_nextest() {
 # (`version: 11.22.0`) or flow (`with: { version: 11.22.0 }`) style. A
 # `version:` elsewhere in the step (under `env:`, say) is not the input.
 #
-# Renovate reads this pin DIFFERENTLY from the two above, and that decides what
-# counts as unreadable here. It is not a customManager regex: `pnpm/action-setup`
-# is in Renovate's github-actions known-actions registry (`known-actions/npm.ts`),
-# which YAML-parses the step and emits the `version` input as depName `pnpm`,
-# depType `uses-with` — the lane PR #911 arrived by. A YAML parser gives
-# `"11.22.0"` and `11.22.0` the same value, so for THIS pin a quoted version is
-# tracked, and one matching layer of quotes is stripped before the SEMVER test.
-# Rejecting it would report a pin Renovate bumps as one it cannot read.
+# Renovate reads this pin with a REGEX, and that decides what counts as
+# unreadable here. Until issue #1319 it was read by the github-actions
+# known-actions registry (`known-actions/npm.ts`) as depType `uses-with` — a
+# YAML parser, so every valid spelling of the step was tracked and this walk
+# accepted them all. That lane is now disabled for pnpm, because it sourced
+# versions from npm that devbox could not follow yet. The pin is read instead by
+# renovate.json's pnpm customManager, from the devbox datasource, and its regex
+# matches ONE layout, on consecutive lines, with the version bare:
+#
+#   - uses: pnpm/action-setup@<ref>
+#     with:
+#       version: X.Y.Z
+#
+# So the walk still FINDS a pin in any layout — that is what turns a reformat
+# into an error instead of an absence — but it reports every site outside that
+# layout: a quoted version, a flow-style `with: { … }`, another input ahead of
+# `version:`, keys ahead of `uses:`, a comment on the `with:` line. Each is valid
+# YAML that Renovate would silently stop bumping, so its next grouped pnpm PR
+# would carry devbox.json's half alone and fail this very check. The one place
+# the guard is stricter than the regex is a blank line between those lines,
+# which the regex's `\s*` tolerates; stricter only ever fails early.
+# `renovate_reads_exactly_the_pnpm_sites_the_guard_finds` in
+# `xtask/linkage-check/src/pin_lockstep.rs` runs that regex over the real
+# workflows and requires the sites and versions this walk finds, so the two
+# cannot drift apart silently. One matching layer of quotes is still stripped
+# before the SEMVER test, so a quoted major is reported as inexact rather than
+# only as misformatted.
 #
 # What stays an error is anything that is not an exact X.Y.Z. That is the whole
 # of issue #1262: `version: 12` was accepted by the action and floated to every
@@ -316,12 +344,15 @@ scan_workflow_pnpm() {
         }
         return d
       }
-      { l = $0; sub(/[[:space:]]#.*$/, "", l); line[NR] = l }
+      # `raw` keeps the line as written, for the layout test against
+      # the regex in renovate.json, which sees trailing comments too.
+      { raw[NR] = $0; l = $0; sub(/[[:space:]]#.*$/, "", l); line[NR] = l }
       END {
         for (i = 1; i <= NR; i++) {
           if (is_comment(line[i])) continue
-          # An optional quote before the action: Renovate YAML-parses `uses:`
-          # too, so `uses: "pnpm/action-setup@…"` is the same tracked step.
+          # An optional quote before the action: the regex in renovate.json matches
+          # `pnpm/action-setup@` anywhere on the line, so
+          # `uses: "pnpm/action-setup@…"` is the same tracked step.
           if (line[i] !~ /uses:[[:space:]]*["\047]?pnpm\/action-setup@/) continue
 
           # The `- ` that opens this step: this line, or the nearest one above
@@ -383,6 +414,13 @@ scan_workflow_pnpm() {
             # and match any character.
             if (v !~ /^[0-9]+\.[0-9]+\.[0-9]+$/) {
               printf "%s%s:%d has a pnpm/action-setup version that is not an exact X.Y.Z: %s%s%s. A major or a range floats to whatever pnpm ships next, with no commit here to review or revert (issue #1262).\n", scanerr, file, j, q, v, q
+              continue
+            }
+            # The layout the pnpm customManager in renovate.json can read (see the
+            # comment above this function): `with:` alone on the line after
+            # `uses:`, and a bare `version: X.Y.Z` on the line after that.
+            if (!(j == i + 2 && raw[i + 1] ~ /^[[:space:]]*with:[[:space:]]*$/ && raw[j] ~ /^[[:space:]]*version:[[:space:]]*[0-9]+\.[0-9]+\.[0-9]+/)) {
+              printf "%s%s:%d has a pnpm/action-setup version renovate.json cannot read. Its pnpm customManager is a regex that wants exactly this layout, on consecutive lines: the `uses: pnpm/action-setup@...` line, then `with:` alone, then a bare `version: X.Y.Z`. Any other spelling (a quoted version, a flow-style `with: { ... }`, another input before `version:`, keys ahead of `uses:`, a comment on the `with:` line) is valid YAML that Renovate silently stops bumping, so its next pnpm PR would carry only the devbox.json half (issue #1319).\n", scanerr, file, j
               continue
             }
             printf "%s:%d %s\n", file, j, v
@@ -604,6 +642,11 @@ compare() {
   printf 'ok: %s pinned at %s on both sides (%s workflow site(s))\n' \
     "$class" "$devbox_versions" "$(printf '%s\n' "$workflow_sites" | wc -l | tr -d ' ')"
 }
+
+if [ "${pnpm_sites_only:-0}" -eq 1 ]; then
+  scan_workflow_pnpm
+  exit 0
+fi
 
 # `rustc`/`cargo`/`clippy`/`rustfmt` are four devbox packages carrying ONE
 # toolchain version, and the workflows express the same thing as a single
