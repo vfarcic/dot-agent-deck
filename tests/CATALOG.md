@@ -747,6 +747,36 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** how much wall time either sample takes, or that any particular `/proc` file was or was not opened — the timing and `strace` evidence for why this matters lives in `prds/386-descendant-scan-shell-activity-signal.md` (M5) and in the doc comment on `PS_TABLE_ARGS`, not in an assertion, because a threshold here would be a flake generator on a loaded machine (PRD #386's Test Plan says so about M5 explicitly). Also does not assert anything about the daemon's poll task or a real agent.
 - **Platform coverage:** mac+linux (real-process assertion; not run on Windows, where `process_table()` is unconditionally `None`).
 
+#### status/subagent
+
+##### status/subagent/001 — A background subagent's tool call after the turn went Idle leaves the card Idle, even when it never gets a `PostToolUse` (issue #1354).
+- **Layer:** L1 (fast tier; each payload goes through the real `hook --agent <agent>` CLI, then `AppState::apply_event`).
+- **Agent:** none (Claude Code- and Codex-shaped hook payloads, modelled on the schemas those agents declare: `agent_id` present only on a hook fired inside a subagent, the parent's `session_id` throughout).
+- **Asserts:** for both `claude-code` and `codex`, replaying issue #1354's sequence — main `PreToolUse`/`PostToolUse` on `Bash`, `Stop`, then a subagent `PreToolUse` carrying `agent_id` with no `PostToolUse`, then `SubagentStop` — leaves the card's status Idle and no active tool.
+- **Does not assert:** that a real Claude Code or Codex emits this sequence — the payloads are built from their declared hook-input schemas and the reported `deck.log`, not captured from a live agent; the rendered badge (`hooks/delivery/008`).
+- **Platform coverage:** mac+linux.
+
+##### status/subagent/002 — A main-thread tool call after the turn went Idle still reads Working (the control for `/001`).
+- **Layer:** L1.
+- **Agent:** none.
+- **Asserts:** the same sequence with the trailing call from the main thread — once plain, once from an `--agent` session whose payload carries `agent_type` but no `agent_id` — leaves the card Working with `Bash` as its active tool, so what keeps `/001` Idle is the subagent attribution rather than a `ToolStart` that stopped counting.
+- **Does not assert:** anything about Codex or Devin payloads.
+- **Platform coverage:** mac+linux.
+
+##### status/subagent/003 — A background subagent's FAILED tool call after the turn went Idle leaves the card Idle rather than Error.
+- **Layer:** L1.
+- **Agent:** none.
+- **Asserts:** a subagent `PostToolUse` whose `tool_response` reports a non-zero exit reaches the daemon as `ToolEnd`, not `Error`, and the card reads Idle with the call counted; the same response on a main-thread call still becomes `Error` and the card reads Error.
+- **Does not assert:** which `tool_response` shapes count as failures (`hook.rs`'s own unit tests).
+- **Platform coverage:** mac+linux.
+
+##### status/subagent/004 — A foreground subagent inside a live turn keeps the card Working on the main thread's call, and its permission prompt is still answerable.
+- **Layer:** L1.
+- **Agent:** none.
+- **Asserts:** step by step through the main thread's `Agent` call, the subagent's `Bash` call, the subagent's `PermissionRequest` and its answered `PostToolUse`, `SubagentStop`, the `Agent` call's end and `Stop`: the card reads Working with `Agent` as active tool through the subagent's own calls, Needs Input on the subagent's prompt and Thinking once that call ends, and Idle at the end.
+- **Does not assert:** a subagent prompt answered after the main turn already stopped — that still leaves Thinking until the next event, as it did before issue #1354.
+- **Platform coverage:** mac+linux.
+
 ### Agent protocol
 
 #### agent/readiness
@@ -1935,6 +1965,13 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Agent:** none (synthetic — `StartAgent` over the daemon protocol with a shell command whose `from_command` type is `None`, then a JSON `SessionStart` written directly to the per-test hook socket).
 - **Asserts:** an agent started with no inferable type registers with `agent_type == None`; after a `SessionStart` hook carrying `agent_type = claude_code` for that pane's id, a subsequent `ListAgents` (the same call `hydrate_from_daemon` issues on reconnect) reports `agent_type == ClaudeCode`.
 - **Does not assert:** the rendered card label (the `AgentRecord`→placeholder→render mapping is covered by `rehydration` + L1 dashboard tests); the live-stream upgrade path while a TUI is already attached.
+- **Platform coverage:** mac+linux.
+
+##### hooks/delivery/008 — A background subagent's unfinished tool call after the turn went Idle does not flip the rendered card back to Working (issue #1354).
+- **Layer:** L2.
+- **Agent:** none (Claude Code-shaped payloads piped through the real `dot-agent-deck hook --agent claude-code` CLI at the per-test hook socket).
+- **Asserts:** the card's badge reads Working on the main turn's `Bash` (proving the needle can appear), then Idle after `Stop`; after a subagent `PreToolUse` carrying `agent_id` with no `PostToolUse`, and `SubagentStop`, the background call is visible in the card's tool history and the badge still reads Idle — held for 2 seconds with no `Working` anywhere on screen.
+- **Does not assert:** a real Claude Code producing the sequence; the Codex half (`status/subagent/001`); anything but the one card.
 - **Platform coverage:** mac+linux.
 
 #### hooks/ingest

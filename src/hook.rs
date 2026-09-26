@@ -33,6 +33,13 @@ struct ClaudeCodeHookInput {
     // unexpected `source` shape, not just lose the field.
     #[serde(default, deserialize_with = "lenient_string")]
     source: Option<String>,
+    // Issue #1354: the payload's own `agent_id`, which Claude Code (and Codex)
+    // set ONLY on a hook that fires inside a subagent. Renamed on the Rust side
+    // because `AgentEvent::agent_id` is the deck's id for the spawned process,
+    // an unrelated thing. Lenient for the same reason as `source`: a strange
+    // shape must cost this field, not the whole event.
+    #[serde(default, rename = "agent_id", deserialize_with = "lenient_string")]
+    subagent_id: Option<String>,
     #[serde(flatten)]
     _extra: HashMap<String, Value>,
 }
@@ -370,8 +377,18 @@ fn build_event_typed(input: ClaudeCodeHookInput, agent_type: AgentType) -> Optio
         tool_use_id,
         prompt,
         source,
+        subagent_id,
         _extra: extra,
     } = input;
+
+    // Issue #1354: only the two agents whose `agent_id` is verified to mean
+    // "this hook fired inside a subagent" — Claude Code (its hook-input schema
+    // says so, and that it is absent on the main thread) and Codex
+    // (`thread_spawn_subagent_hook_context` sets it for a thread-spawned
+    // subagent and nothing else). Devin's hook input carries no such field.
+    let subagent_id = subagent_id
+        .filter(|id| !id.is_empty())
+        .filter(|_| matches!(agent_type, AgentType::ClaudeCode | AgentType::Codex));
 
     let mut event_type = map_event_type(&hook_event_name)?;
     // PRD #20 W3-Pass-2 (finding #9): a FAILED tool call arrives as an ordinary
@@ -381,7 +398,14 @@ fn build_event_typed(input: ClaudeCodeHookInput, agent_type: AgentType) -> Optio
     // discarding `tool_response` and showing a benign `ToolEnd`. `tool_response`
     // rides the flattened `_extra` (it is not a first-class field), keeping the
     // existing input/struct shape unchanged.
+    //
+    // Not for a subagent's call (issue #1354): its failure is the subagent's to
+    // handle and reaches the main thread as that subagent's result, and an
+    // `Error` asserts the card's status unconditionally — so a background
+    // agent's failed call after the turn ended would leave the card on Error
+    // exactly the way its unfinished call left it on Working.
     if event_type == EventType::ToolEnd
+        && subagent_id.is_none()
         && extra
             .get("tool_response")
             .is_some_and(tool_response_is_failure)
@@ -402,6 +426,12 @@ fn build_event_typed(input: ClaudeCodeHookInput, agent_type: AgentType) -> Optio
     let mut metadata = HashMap::new();
     if let Some(tool_use_id) = tool_use_id {
         metadata.insert("tool_use_id".to_string(), tool_use_id);
+    }
+    if let Some(subagent_id) = subagent_id {
+        metadata.insert(
+            crate::event::SUBAGENT_ID_METADATA_KEY.to_string(),
+            subagent_id,
+        );
     }
 
     // Issue #424 (reviewer option 3): forward EXPLICIT BOOT PROVENANCE.
@@ -1583,6 +1613,7 @@ mod tests {
             tool_use_id: None,
             prompt: None,
             source: None,
+            subagent_id: None,
             _extra: HashMap::new(),
         };
         let event = build_event(input).unwrap();
@@ -1604,6 +1635,7 @@ mod tests {
             tool_use_id: None,
             prompt: None,
             source: None,
+            subagent_id: None,
             _extra: HashMap::new(),
         };
         let event = build_event(input).unwrap();
@@ -1623,6 +1655,7 @@ mod tests {
             tool_use_id: None,
             prompt: None,
             source: None,
+            subagent_id: None,
             _extra: HashMap::new(),
         };
         assert!(build_event(input).is_none());
@@ -1639,6 +1672,7 @@ mod tests {
             tool_use_id: None,
             prompt: Some("fix the login bug".into()),
             source: None,
+            subagent_id: None,
             _extra: HashMap::new(),
         };
         let event = build_event(input).unwrap();
@@ -1658,6 +1692,7 @@ mod tests {
             tool_use_id: None,
             prompt: Some(long_prompt),
             source: None,
+            subagent_id: None,
             _extra: HashMap::new(),
         };
         let event = build_event(input).unwrap();
@@ -2820,6 +2855,7 @@ mod tests {
                 tool_use_id: None,
                 prompt: None,
                 source: None,
+                subagent_id: None,
                 _extra: extra,
             }
         };
@@ -2861,6 +2897,7 @@ mod tests {
             tool_use_id: None,
             prompt: None,
             source: None,
+            subagent_id: None,
             _extra: HashMap::new(),
         })
         .expect("SessionStart maps to an event");
@@ -2886,6 +2923,7 @@ mod tests {
             tool_use_id: None,
             prompt: None,
             source: source.map(str::to_string),
+            subagent_id: None,
             _extra: HashMap::new(),
         };
 
@@ -2975,6 +3013,7 @@ mod tests {
             tool_use_id: None,
             prompt: None,
             source: None,
+            subagent_id: None,
             _extra: HashMap::new(),
         };
         let event = build_event(input).unwrap();
@@ -3028,6 +3067,7 @@ mod tests {
             tool_use_id: None,
             prompt: None,
             source: None,
+            subagent_id: None,
             _extra: HashMap::new(),
         };
         let event = build_event(input).unwrap();
@@ -3053,6 +3093,7 @@ mod tests {
             tool_use_id: None,
             prompt: None,
             source: None,
+            subagent_id: None,
             _extra: HashMap::new(),
         };
         let event = build_event(input).unwrap();
@@ -3070,6 +3111,7 @@ mod tests {
             tool_use_id: None,
             prompt: None,
             source: None,
+            subagent_id: None,
             _extra: HashMap::new(),
         };
         let event = build_event(input).unwrap();
@@ -3094,5 +3136,57 @@ mod tests {
             event.metadata.get("bash_command").map(String::as_str),
             Some(full_cmd),
         );
+    }
+
+    /// Issue #1354: the payload's `agent_id` — set by Claude Code and Codex
+    /// only on a hook fired inside a subagent — is forwarded as
+    /// `SUBAGENT_ID_METADATA_KEY` for exactly those two agents, and never
+    /// mistaken for the deck's own `AgentEvent::agent_id`.
+    #[test]
+    fn subagent_agent_id_forwards_for_claude_and_codex_only() {
+        let payload = |agent_id: Value| {
+            serde_json::from_value::<ClaudeCodeHookInput>(serde_json::json!({
+                "session_id": "sub-1",
+                "hook_event_name": "PreToolUse",
+                "tool_name": "Bash",
+                "tool_input": {"command": "ls"},
+                "agent_id": agent_id,
+                "agent_type": "general-purpose",
+            }))
+            .expect("a Claude-shaped payload decodes whatever `agent_id` holds")
+        };
+        let key = crate::event::SUBAGENT_ID_METADATA_KEY;
+
+        for agent_type in [AgentType::ClaudeCode, AgentType::Codex] {
+            let event = build_event_typed(payload("a7c1".into()), agent_type.clone()).unwrap();
+            assert_eq!(
+                event.metadata.get(key).map(String::as_str),
+                Some("a7c1"),
+                "{agent_type:?} must forward the subagent id"
+            );
+            assert!(event.is_from_subagent());
+            assert_ne!(
+                event.agent_id.as_deref(),
+                Some("a7c1"),
+                "the payload's agent_id is not the deck's agent id"
+            );
+        }
+
+        // Devin's hook input has no such field; a future one of unknown meaning
+        // must not start suppressing its card's status.
+        let devin = build_event_typed(payload("a7c1".into()), AgentType::Devin).unwrap();
+        assert!(!devin.is_from_subagent());
+
+        // An empty id, a non-string shape, and an absent key are all "main thread".
+        for odd in [
+            Value::from(""),
+            Value::from(7),
+            serde_json::json!({"id": "x"}),
+            Value::Null,
+        ] {
+            let event = build_event(payload(odd.clone())).unwrap();
+            assert!(!event.is_from_subagent(), "agent_id = {odd}");
+            assert_eq!(event.event_type, EventType::ToolStart, "agent_id = {odd}");
+        }
     }
 }
