@@ -770,7 +770,14 @@ fn relocated_bind_dir(primary_dir: &Path, uid: u32) -> std::io::Result<PathBuf> 
         match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
             Ok(()) => {
                 crate::platform::fsperm::ensure_owner_only_dir(&dir)?;
-                return Ok(dir);
+                // Re-list and take the first, as a caller that found existing
+                // directories would: two starters that each created one — only
+                // possible when they do not share a lock root — then converge
+                // on the same directory whenever each sees the other's.
+                return Ok(relocated_endpoint_dirs(primary_dir, uid)
+                    .into_iter()
+                    .next()
+                    .unwrap_or(dir));
             }
             Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(source) => return Err(source),
