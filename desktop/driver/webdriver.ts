@@ -30,11 +30,23 @@ export class WebDriverError extends Error {
   }
 }
 
+/**
+ * The deadline on any one request. A native driver that stops answering would
+ * otherwise hold a `fetch` open forever — and with it the harness's state
+ * waits, which only check their own deadline between requests, and its
+ * teardown, which closes the session before it stops the child processes.
+ * Same default and variable as the harness's wait bound (`DAD_DRIVER_WAIT_MS`),
+ * because a session request includes launching the app, the slowest single
+ * thing this client asks for.
+ */
+const REQUEST_MS = Number(process.env.DAD_DRIVER_WAIT_MS ?? 120_000);
+
 async function call(base: string, method: string, path: string, body?: unknown): Promise<unknown> {
   const response = await fetch(`${base}${path}`, {
     method,
     headers: body === undefined ? undefined : { "content-type": "application/json" },
     body: body === undefined ? undefined : JSON.stringify(body),
+    signal: AbortSignal.timeout(REQUEST_MS),
   });
   const parsed = (await response.json()) as { value?: unknown };
   const value = parsed.value;

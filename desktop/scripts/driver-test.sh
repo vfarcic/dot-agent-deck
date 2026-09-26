@@ -57,10 +57,19 @@ fi
 # tauri-driver has no `--version`, so the version is read from the install
 # record of the cargo root it lives under — which is where `cargo install`
 # puts it, and the only way it is installed here or in CI.
-have=$(cargo install --list --root "$(dirname "$(dirname "$tauri_driver")")" 2>/dev/null |
+# `|| true`: cargo exits non-zero for a root with no install record at all,
+# and under `set -e` plus `pipefail` that would end the script here silently
+# instead of reaching the refusal below that says why.
+have=$( (cargo install --list --root "$(dirname "$(dirname "$tauri_driver")")" 2>/dev/null || true) |
   sed -nE 's/^tauri-driver v([0-9.]+):$/\1/p')
 if [ -z "$have" ]; then
-  echo "driver-test: cannot tell which tauri-driver $tauri_driver is (not installed by cargo); CI pins $pin" >&2
+  if [ -z "${DAD_DRIVER_SKIP_PIN_CHECK:-}" ]; then
+    echo "driver-test: cannot tell which tauri-driver $tauri_driver is (no cargo install record); CI pins $pin." >&2
+    echo "  cargo install tauri-driver --locked --version $pin" >&2
+    echo "  or set DAD_DRIVER_SKIP_PIN_CHECK=1 to run an unverified driver deliberately" >&2
+    exit 1
+  fi
+  echo "driver-test: DAD_DRIVER_SKIP_PIN_CHECK set; running an unverified tauri-driver ($tauri_driver), CI pins $pin" >&2
 elif [ "$have" != "$pin" ]; then
   echo "driver-test: $tauri_driver is $have, CI pins $pin:" >&2
   echo "  cargo install tauri-driver --locked --version $pin" >&2

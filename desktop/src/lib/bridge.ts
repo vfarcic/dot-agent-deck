@@ -4021,15 +4021,23 @@ export class TauriDeckBridge implements DeckBridge {
    * as `echo dadd-river-…`. So each chunk is issued only once the previous one
    * for the same terminal has been written. A failed write rejects its own
    * caller and does not stall the queue behind it.
+   *
+   * Each chunk is bound to the session installed when it was ACCEPTED, not the
+   * one installed when its turn comes: if that session ends while the chunk
+   * waits and the pane reattaches, the chunk was typed into a terminal that no
+   * longer exists, and it rejects as not attached rather than landing in the
+   * replacement.
    */
   async sendTerminalInput(target: AgentTarget, data: string): Promise<void> {
     const key = agentKey(target.deckId, target.agentId);
+    const accepted = this.sessions.get(key);
+    const notAttached = () => new Error(`Terminal for ${target.agentId} is not attached.`);
+    if (!accepted) throw notAttached();
     const previous = this.inputTails.get(key) ?? Promise.resolve();
     const write = previous.then(async () => {
       const invoke = await this.getInvoke();
-      const session = this.sessions.get(key);
-      if (!session) throw new Error(`Terminal for ${target.agentId} is not attached.`);
-      await invoke("desktop_terminal_write", { sessionId: session.result.sessionId, data: Array.from(new TextEncoder().encode(data)) });
+      if (this.sessions.get(key) !== accepted) throw notAttached();
+      await invoke("desktop_terminal_write", { sessionId: accepted.result.sessionId, data: Array.from(new TextEncoder().encode(data)) });
     });
     const tail = write.catch(() => undefined);
     this.inputTails.set(key, tail);

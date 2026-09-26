@@ -2189,6 +2189,57 @@ describe("TauriDeckBridge demand-driven attach (PRD 745 M7)", () => {
   });
 
   /**
+   * Scenario: a keystroke is still queued behind a slow write when the daemon
+   * ends that terminal's session, and the pane reattaches before the queue
+   * reaches it. The queued keystroke was typed into the OLD attachment and must
+   * never be written through the new one — it rejects as not attached, and the
+   * replacement session only ever receives what was typed after it existed.
+   * (Review finding on #953's input queue: it used to look the session up when
+   * the write ran rather than when the keystroke was accepted.)
+   */
+  it("never writes a keystroke queued for an ended session through the session that replaced it", async () => {
+    const { TauriDeckBridge } = await import("./bridge");
+    let release: (() => void) | undefined;
+    const base = invoke.getMockImplementation()!;
+    invoke.mockImplementation(async (command: string, args?: { sessionId?: string; data?: number[] }) => {
+      if (command === "desktop_terminal_write" && !release) {
+        return new Promise<void>((resolve) => {
+          release = resolve;
+        });
+      }
+      return base(command, args);
+    });
+    const bridge = new TauriDeckBridge();
+    await bridge.subscribe(vi.fn(), vi.fn());
+    await bridge.connect();
+    await bridge.setShownTerminals([on("agent-1")]);
+    await settle();
+    const firstGeneration = attachCalls().length;
+
+    const slow = bridge.sendTerminalInput(on("agent-1"), "a");
+    const queued = bridge.sendTerminalInput(on("agent-1"), "b");
+    queued.catch(() => undefined);
+    await vi.waitFor(() => expect(release).toBeDefined());
+
+    listeners.get("desktop://terminal-state")?.({
+      payload: { agentId: "agent-1", sessionId: `session-agent-1-${firstGeneration}`, generation: firstGeneration, state: "end" },
+    });
+    listeners.get("desktop://snapshot")?.({ payload: fleetSnapshot() });
+    await vi.waitFor(() => expect(attachedAgentIds().filter((agentId) => agentId === "agent-1")).toHaveLength(2));
+    await settle();
+    const reattachGeneration = attachCalls().length;
+
+    release?.();
+    await slow;
+    await expect(queued).rejects.toThrow(/not attached/);
+    const writesToReplacement = invoke.mock.calls.filter(
+      ([command, args]) => command === "desktop_terminal_write" && args.sessionId === `session-agent-1-${reattachGeneration}`,
+    );
+    expect(writesToReplacement).toEqual([]);
+    await bridge.dispose();
+  });
+
+  /**
    * Scenario: with one of nine agents shown and its session perfectly healthy,
    * fire a `desktop://snapshot` event. Re-asserting the invariant re-declares
    * the SHOWN set and nothing else, so a healthy snapshot costs no attach at
