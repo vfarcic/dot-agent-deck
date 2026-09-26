@@ -1006,7 +1006,7 @@ impl LoadedSchedules {
 
 /// Validate a freshly-parsed task and apply load-time path expansion. A
 /// hand-edited entry with no (or blank) `command` is REJECTED here (PRD #127
-/// follow-up, USER DECISION): a scheduled task needs an agent command to act on
+/// follow-up, USER DECISION): a schedule needs an agent command to act on
 /// its prompt, and there is no silent `$SHELL` fallback. Rejection mirrors the
 /// malformed-entry path — the error is surfaced via the daemon's notification
 /// seam (PRD #126) and the entry is skipped, without blocking valid siblings or
@@ -1023,7 +1023,7 @@ fn validate_task(task: ScheduledTask, index: usize) -> Result<ScheduledTask, Sch
     {
         return Err(ScheduleLoadError {
             entry: Some(index),
-            message: format!("scheduled task {:?}: {message}", task.name),
+            message: format!("schedule {:?}: {message}", task.name),
         });
     }
     // PRD #120: an issue-dispatch task has no top-level `command` — the per-issue
@@ -1043,7 +1043,7 @@ fn validate_task(task: ScheduledTask, index: usize) -> Result<ScheduledTask, Sch
         ) {
             return Err(ScheduleLoadError {
                 entry: Some(index),
-                message: format!("scheduled task {:?}: {message}", task.name),
+                message: format!("schedule {:?}: {message}", task.name),
             });
         }
         // Issue #835: `shape` has nothing to apply to on an issue-dispatch task —
@@ -1055,7 +1055,7 @@ fn validate_task(task: ScheduledTask, index: usize) -> Result<ScheduledTask, Sch
             return Err(ScheduleLoadError {
                 entry: Some(index),
                 message: format!(
-                    "scheduled task {:?}: `shape` cannot be combined with \
+                    "schedule {:?}: `shape` cannot be combined with \
                      `issue_dispatch` (an issue-dispatch task resolves a shape per \
                      cloned repo, from that repo's own config); remove one of them",
                     task.name
@@ -1069,8 +1069,8 @@ fn validate_task(task: ScheduledTask, index: usize) -> Result<ScheduledTask, Sch
         _ => Err(ScheduleLoadError {
             entry: Some(index),
             message: format!(
-                "scheduled task {:?} has no `command`; a command is required \
-                 (a scheduled task needs an agent command to act on its prompt — \
+                "schedule {:?} has no `command`; a command is required \
+                 (a schedule needs an agent command to act on its prompt — \
                  there is no $SHELL fallback)",
                 task.name
             ),

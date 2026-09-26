@@ -75,7 +75,7 @@ fn cli_002_add_writes_global_and_daemon_reloads() {
 /// of flags (--name, --cron, --working-dir, --prompt, --enabled) but
 /// deliberately NO --command. Assert the writer REJECTS it: the process exits
 /// non-zero and prints a clear error to stderr indicating that --command is
-/// required (a scheduled task needs an agent command to act on its prompt — a
+/// required (a schedule needs an agent command to act on its prompt — a
 /// silent fallback to a bare $SHELL cannot). This is the exact invocation
 /// `cli_002` proves succeeds today, so asserting failure pins the new
 /// required-command contract.

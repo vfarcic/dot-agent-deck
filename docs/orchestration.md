@@ -557,7 +557,7 @@ When the choice is left implicit, the deck says so rather than quietly picking. 
 
 ```
 $ dot-agent-deck validate
-[warning] 'prd': 2 orchestrations are defined and none declares `default = true`, so a dispatch or scheduled task that names none opens this one purely because it comes first in the file — reordering the file would silently change that. Add `default = true` to the one you want.
+[warning] 'prd': 2 orchestrations are defined and none declares `default = true`, so a dispatch or schedule that names none opens this one purely because it comes first in the file — reordering the file would silently change that. Add `default = true` to the one you want.
 ```
 
 A **dispatcher agent** is told the same thing in its own words, and its listing marks the default so it can act on *"just use the usual one"* rather than asking twice:
