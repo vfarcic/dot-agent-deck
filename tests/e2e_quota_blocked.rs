@@ -5,6 +5,7 @@
 
 mod common;
 
+use serde_json::{Value, json};
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::{Command, Output};
@@ -14,11 +15,8 @@ use common::TuiDeck;
 use dot_agent_deck::agent_pty::TabMembership;
 use spec::spec;
 
-const CODEX_LINE: &str = "■ You’ve hit your usage limit. Visit https://chatgpt.com/codex/settings/usage to purchase more credits";
-const OPENCODE_LINE: &str = "Error: The usage limit has been reached";
 const BLOCKED_NOTICE: &str =
     "delegated worker blocked by a provider usage limit (dot-agent-deck daemon report)";
-const CONFIRM_MS: &str = "200";
 
 fn write_agent(bin: &Path, name: &str, body: &str) {
     std::fs::create_dir_all(bin).expect("create stand-in binary directory");
@@ -178,130 +176,321 @@ fn delegate(deck: &TuiDeck, role: &str, task: &str) -> Output {
         .expect("run delegate CLI")
 }
 
-/// Scenario: Restore a Codex pane whose local stand-in prints the shipped
-/// U+2019 quota message and stays alive. After confirmation, its attached TUI
-/// card and daemon status JSON must both report Blocked.
-#[spec("status/blocked/008")]
-#[test]
-fn status_blocked_008_codex_standin_printing_quota_line_shows_blocked_card() {
-    let fixture = common::race_safe_tempdir();
-    let bin = fixture.path().join("bin");
-    write_agent(
-        &bin,
-        "codex",
-        &format!("printf '%s\\n' '{CODEX_LINE}'\nexec cat"),
-    );
-    let deck = TuiDeck::builder()
-        .with_pty_size(160, 42)
-        .with_env("PATH", path_with_standins(&bin))
-        .with_env("DOT_AGENT_DECK_QUOTA_CONFIRM_MS", CONFIRM_MS)
-        .with_continue_session("quota-codex", "codex")
-        .launch_with_fixture("minimal");
-    deck.wait_for_string("[Command Mode Ctrl+D]");
-    deck.send_bytes(b"\x04");
+fn trigger_fifo(path: &Path) {
+    let output = Command::new("mkfifo")
+        .arg(path)
+        .output()
+        .expect("run mkfifo");
     assert!(
-        common::wait_until(Duration::from_secs(25), || {
-            has_role_badge(&deck.snapshot_grid(), "quota-codex", "Blocked")
-                || deck
-                    .snapshot_grid()
-                    .lines()
-                    .any(|line| line.contains("quota-codex") && line.contains("Blocked"))
-        }),
-        "Codex quota card never showed Blocked:\n{}",
-        deck.snapshot_grid()
-    );
-    let status = status_document(&deck);
-    assert!(
-        status["agents"]
-            .as_array()
-            .expect("agents")
-            .iter()
-            .any(|agent| agent["status"] == "Blocked"),
-        "daemon status did not publish Blocked: {status}"
+        output.status.success(),
+        "mkfifo failed: {}",
+        String::from_utf8_lossy(&output.stderr)
     );
 }
 
-/// Scenario: Open two OpenCode stand-ins in one attached orchestration: one
-/// prints a bare provider error and goes quiet, while the other repeatedly
-/// prints the same sentence in quotes. Only the bare-error card may be Blocked.
-#[spec("status/blocked/009")]
-#[test]
-fn status_blocked_009_opencode_standin_and_healthy_mention_are_distinguished() {
-    let fixture = common::race_safe_tempdir();
-    let bin = fixture.path().join("bin");
-    write_agent(
-        &bin,
-        "opencode",
-        &format!(
-            "if [ \"$1\" = quoted ]; then\n  while :; do printf '%s\\n' '\"The usage limit has been reached\"'; sleep 0.2; done\nfi\nprintf '%s\\n' '{OPENCODE_LINE}'\nexec cat"
-        ),
-    );
-    let deck = TuiDeck::builder()
-        .with_pty_size(160, 45)
-        .with_env("PATH", path_with_standins(&bin))
-        .with_env("DOT_AGENT_DECK_QUOTA_CONFIRM_MS", CONFIRM_MS)
-        .launch_with_fixture("minimal");
-    deck.wait_for_string("No active sessions");
-    write_orchestration(
-        &deck,
-        &[
-            ("bare-quota", "opencode bare", "opencode"),
-            ("quoted-output", "opencode quoted", "opencode"),
-        ],
-    );
-    open_orchestration(&deck);
+fn release_standin(path: &Path, deck: &TuiDeck, role: &str) {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
     assert!(
         common::wait_until(Duration::from_secs(10), || {
-            role_pane_text(&deck, "quoted-output").contains("\"The usage limit has been reached\"")
+            let opened = std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(path);
+            match opened {
+                Ok(mut fifo) => fifo.write_all(b"go\n").is_ok(),
+                Err(error) if error.raw_os_error() == Some(libc::ENXIO) => false,
+                Err(error) => panic!("open stand-in FIFO {}: {error}", path.display()),
+            }
         }),
-        "quoted OpenCode stand-in never printed its control line"
-    );
-    assert!(
-        common::wait_until(Duration::from_secs(25), || {
-            role_status(&deck, "bare-quota").as_deref() == Some("Blocked")
-        }),
-        "bare OpenCode error was not Blocked: {}",
-        status_document(&deck)
-    );
-    let hold = Duration::from_millis(CONFIRM_MS.parse::<u64>().unwrap() * 2);
-    assert!(
-        !common::wait_until(hold, || {
-            role_status(&deck, "quoted-output").as_deref() == Some("Blocked")
-        }),
-        "quoted, continuously active pane was falsely Blocked"
+        "stand-in never opened trigger FIFO {}; pane: {}; agents: {:?}",
+        path.display(),
+        if role_agent_exists(deck, role) {
+            role_pane_text(deck, role)
+        } else {
+            "<role no longer registered>".to_string()
+        },
+        common::agent_records_on(deck.attach_socket_path())
     );
 }
 
-/// Scenario: Start an orchestration whose Codex worker prints a quota error
-/// and remains alive. Once its card is Blocked, delegating to that worker must
-/// succeed with an explicit warning, still deliver the task pointer, and send
-/// the orchestrator exactly one blocked-worker notice for that new delegation.
+fn wait_for_role(deck: &TuiDeck, role: &str) {
+    assert!(
+        common::wait_until(Duration::from_secs(15), || role_agent_exists(deck, role)),
+        "{role} never registered"
+    );
+}
+
+fn assert_blocked(deck: &TuiDeck, role: &str, kind: &str) {
+    assert!(
+        common::wait_until(Duration::from_secs(20), || {
+            role_status(deck, role).as_deref() == Some("Blocked")
+                && has_role_badge(&deck.snapshot_grid(), role, "Blocked")
+        }),
+        "{role} never showed Blocked in daemon status and attached card: {}\n{}",
+        status_document(deck),
+        deck.snapshot_grid()
+    );
+    let label = match kind {
+        "credits_depleted" => "Credits",
+        "usage_limit" => "Usage",
+        other => panic!("unexpected blocked kind: {other}"),
+    };
+    assert!(
+        deck.snapshot_grid().contains(label),
+        "{role} card omitted its {kind} reason:\n{}",
+        deck.snapshot_grid()
+    );
+}
+
+fn quota_deck(bin: &Path, fifo: &Path, transcript: &Path) -> TuiDeck {
+    let deck = TuiDeck::builder()
+        .with_pty_size(160, 45)
+        .impersonating_pane_signals()
+        .with_env("PATH", path_with_standins(bin))
+        .with_env("QUOTA_TRIGGER_FIFO", fifo.to_string_lossy())
+        .with_env("QUOTA_TRANSCRIPT_PATH", transcript.to_string_lossy())
+        .launch_with_fixture("minimal");
+    // The isolated HOME deliberately has no installed agent directories.
+    // Exercise the same deck installers explicitly before spawning stand-ins.
+    for agent in ["claude-code", "opencode"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"))
+            .args(["hooks", "install", "--agent", agent])
+            .env("HOME", deck.home_dir())
+            .env("XDG_CONFIG_HOME", deck.home_dir().join(".config"))
+            .env("PATH", path_with_standins(bin))
+            .current_dir(deck.workdir())
+            .output()
+            .expect("install synthetic agent hook");
+        assert!(
+            output.status.success(),
+            "{agent} hook install failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    deck
+}
+
+fn write_claude_record(path: &Path, transient: bool) {
+    let record = if transient {
+        json!({"type":"assistant","message":{"role":"assistant","content":[]},
+            "error":"rate_limit","isApiErrorMessage":true,"apiErrorStatus":429,
+            "apiErrorIsTransient":true})
+    } else {
+        json!({"type":"assistant","message":{"role":"assistant","content":[]},
+            "error":"rate_limit","isApiErrorMessage":true,"apiErrorStatus":429,
+            "quotaLimits":{"status":"rejected",
+                "resetsAt":chrono::Utc::now().timestamp() + 3600,
+                "rateLimitType":"five_hour"}})
+    };
+    std::fs::write(path, format!("{record}\n")).expect("write structured Claude transcript");
+}
+
+fn install_structured_standin(bin: &Path, name: &str) {
+    std::fs::create_dir_all(bin).expect("create bin");
+    let script = r#"import json, os, subprocess, sys
+agent = sys.argv[1]
+if agent == 'codex' and len(sys.argv) > 2:
+    sys.exit(0)  # Startup's app-server trust probe is not the agent pane.
+home = os.environ['HOME']
+if agent == 'claude':
+    settings = os.path.join(home, '.claude', 'settings.json')
+    hooks = json.load(open(settings))['hooks']
+    suffix = 'hook --agent claude-code'
+else:
+    codex_home = os.environ.get('CODEX_HOME') or os.path.join(home, '.codex')
+    hooks = json.load(open(os.path.join(codex_home, 'hooks.json')))['hooks']
+    suffix = 'hook --agent codex'
+def send(event, **fields):
+    commands = [h['command'] for rule in hooks[event] for h in rule['hooks']
+                if h['command'].endswith(suffix)]
+    assert len(commands) == 1, (event, commands)
+    payload = {'hook_event_name':event,'session_id':'quota-' + agent,**fields}
+    subprocess.run(commands[0], shell=True, input=json.dumps(payload), text=True,
+                   check=True, stdout=subprocess.DEVNULL)
+with open(os.environ['QUOTA_TRIGGER_FIFO']) as trigger:
+    trigger.readline()
+path = os.environ['QUOTA_TRANSCRIPT_PATH']
+if agent == 'claude':
+    send('SessionStart')
+    send('StopFailure', error='rate_limit', transcript_path=path,
+         last_assistant_message='structured-provider-detail-sentinel')
+else:
+    send('SessionStart', transcript_path=path)
+    send('UserPromptSubmit', transcript_path=path, turn_id='turn-714', prompt='work')
+    records = [
+        {'type':'event_msg','payload':{'type':'task_started','turn_id':'turn-714'}},
+        {'type':'event_msg','payload':{'type':'token_count','turn_id':'turn-714',
+            'rate_limits':{'rate_limit_reached_type':'workspace_member_credits_depleted'}}},
+        {'type':'event_msg','payload':{'type':'task_complete','turn_id':'turn-714',
+            'error':{'codex_error_info':'usage_limit_exceeded',
+                     'message':'structured-provider-detail-sentinel'}}}
+    ]
+    with open(path, 'a') as rollout:
+        for record in records:
+            rollout.write(json.dumps(record) + '\n')
+        rollout.flush()
+sys.stdin.buffer.read()
+"#;
+    std::fs::write(bin.join("quota-standin.py"), script).expect("write structured stand-in");
+    let version = if name == "claude" {
+        r#"if [ "$1" = --version ]; then printf '2.1.283 (Claude Code)\n'; exit 0; fi
+"#
+    } else {
+        ""
+    };
+    write_agent(
+        bin,
+        name,
+        &format!(
+            "{version}exec python3 '{}/quota-standin.py' {name}",
+            bin.display()
+        ),
+    );
+}
+
+fn claude_hook(deck: &TuiDeck, role: &str, event: &str) {
+    use std::io::Write as _;
+    use std::process::Stdio;
+    let settings: Value = serde_json::from_slice(
+        &std::fs::read(deck.home_dir().join(".claude/settings.json")).expect("Claude settings"),
+    )
+    .expect("settings JSON");
+    let command = settings["hooks"][event][0]["hooks"][0]["command"]
+        .as_str()
+        .expect("installed Claude command");
+    let agent = role_agent(deck, role);
+    let mut child = Command::new("sh")
+        .args(["-c", command])
+        .env("HOME", deck.home_dir())
+        .env("DOT_AGENT_DECK_SOCKET", deck.hook_socket_path())
+        .env(
+            "DOT_AGENT_DECK_PANE_ID",
+            agent.pane_id_env.expect("pane id"),
+        )
+        .env("DOT_AGENT_DECK_AGENT_ID", &agent.id)
+        .stdin(Stdio::piped())
+        .spawn()
+        .expect("run installed hook");
+    writeln!(
+        child.stdin.take().expect("stdin"),
+        "{}",
+        json!({
+            "hook_event_name":event,"session_id":"quota-claude"
+        })
+    )
+    .expect("send hook payload");
+    assert!(child.wait().expect("wait hook").success());
+}
+
+/// Scenario: A Claude stand-in uses the installed StopFailure hook and a rejected
+/// quota transcript to block its attached card and daemon status. A later
+/// UserPromptSubmit hook resumes it, clearing Blocked to Thinking.
+#[spec("status/blocked/017")]
+#[test]
+fn status_blocked_017_claude_stop_failure_hook_shows_blocked_card() {
+    let fixture = common::race_safe_tempdir();
+    let bin = fixture.path().join("bin");
+    let fifo = fixture.path().join("claude-trigger");
+    let transcript = fixture.path().join("claude-quota.jsonl");
+    trigger_fifo(&fifo);
+    write_claude_record(&transcript, false);
+    install_structured_standin(&bin, "claude");
+    let deck = quota_deck(&bin, &fifo, &transcript);
+    deck.wait_for_string("No active sessions");
+    write_orchestration(&deck, &[("worker", "claude", "claude")]);
+    open_orchestration(&deck);
+    wait_for_role(&deck, "worker");
+    release_standin(&fifo, &deck, "worker");
+    assert_blocked(&deck, "worker", "usage_limit");
+    assert!(
+        deck.snapshot_grid().contains("resets"),
+        "Claude card omitted provider reset: \n{}",
+        deck.snapshot_grid()
+    );
+    claude_hook(&deck, "worker", "UserPromptSubmit");
+    assert!(
+        common::wait_until(Duration::from_secs(10), || {
+            role_status(&deck, "worker").as_deref() == Some("Thinking")
+                && has_role_badge(&deck.snapshot_grid(), "worker", "Thinking")
+        }),
+        "new Claude prompt did not clear Blocked: {}\n{}",
+        status_document(&deck),
+        deck.snapshot_grid()
+    );
+    assert_transient_claude_429_is_error();
+}
+
+/// Scenario: A transient Claude 429 reaches StopFailure without quotaLimits.
+/// Its card ends in Error, never Blocked, even though the HTTP status is 429.
+fn assert_transient_claude_429_is_error() {
+    let fixture = common::race_safe_tempdir();
+    let bin = fixture.path().join("bin");
+    let fifo = fixture.path().join("claude-trigger");
+    let transcript = fixture.path().join("claude-transient.jsonl");
+    trigger_fifo(&fifo);
+    write_claude_record(&transcript, true);
+    install_structured_standin(&bin, "claude");
+    let deck = quota_deck(&bin, &fifo, &transcript);
+    deck.wait_for_string("No active sessions");
+    write_orchestration(&deck, &[("worker", "claude", "claude")]);
+    open_orchestration(&deck);
+    wait_for_role(&deck, "worker");
+    release_standin(&fifo, &deck, "worker");
+    assert!(
+        common::wait_until(Duration::from_secs(10), || {
+            role_status(&deck, "worker").as_deref() == Some("Error")
+                && has_role_badge(&deck.snapshot_grid(), "worker", "Error")
+        }),
+        "transient 429 did not end in Error: {}\n{}",
+        status_document(&deck),
+        deck.snapshot_grid()
+    );
+}
+
+/// Scenario: A launcher starts a Codex stand-in that announces its rollout
+/// path through the deck-installed hooks, then appends a quota task_complete.
+/// The attached card and daemon status show depleted credits.
+#[spec("status/blocked/018")]
+#[test]
+fn status_blocked_018_codex_rollout_blocks_a_launcher_started_codex() {
+    let fixture = common::race_safe_tempdir();
+    let bin = fixture.path().join("bin");
+    let fifo = fixture.path().join("codex-trigger");
+    let transcript = fixture.path().join("rollout-714.jsonl");
+    trigger_fifo(&fifo);
+    std::fs::write(&transcript, "").expect("create rollout");
+    install_structured_standin(&bin, "codex");
+    write_agent(&bin, "launch-codex", "exec codex");
+    let deck = quota_deck(&bin, &fifo, &transcript);
+    deck.wait_for_string("No active sessions");
+    write_orchestration(&deck, &[("worker", "launch-codex", "codex")]);
+    open_orchestration(&deck);
+    wait_for_role(&deck, "worker");
+    release_standin(&fifo, &deck, "worker");
+    assert_blocked(&deck, "worker", "credits_depleted");
+}
+
+/// Scenario: A Claude worker reports a blocked provider through its installed
+/// StopFailure hook before delegation. Delegate still delivers the task, warns
+/// about Blocked, and sends exactly one fixed notice to the orchestrator.
 #[spec("orchestration/delegate/037")]
 #[test]
 fn orchestration_delegate_037_delegate_to_blocked_worker_warns_and_delivers() {
     let fixture = common::race_safe_tempdir();
     let bin = fixture.path().join("bin");
-    write_agent(
-        &bin,
-        "codex",
-        &format!("printf '%s\\n' '{CODEX_LINE}'\nstty -echo -icanon\nexec cat"),
-    );
-    let deck = TuiDeck::builder()
-        .with_pty_size(160, 45)
-        .impersonating_pane_signals()
-        .with_env("PATH", path_with_standins(&bin))
-        .with_env("DOT_AGENT_DECK_QUOTA_CONFIRM_MS", CONFIRM_MS)
-        .launch_with_fixture("minimal");
+    let fifo = fixture.path().join("claude-trigger");
+    let transcript = fixture.path().join("claude-quota.jsonl");
+    trigger_fifo(&fifo);
+    write_claude_record(&transcript, false);
+    install_structured_standin(&bin, "claude");
+    let deck = quota_deck(&bin, &fifo, &transcript);
     deck.wait_for_string("No active sessions");
-    write_orchestration(&deck, &[("worker", "codex", "codex")]);
+    write_orchestration(&deck, &[("worker", "claude", "claude")]);
     open_orchestration(&deck);
-    assert!(
-        common::wait_until(Duration::from_secs(25), || {
-            has_role_badge(&deck.snapshot_grid(), "worker", "Blocked")
-        }),
-        "worker card never showed Blocked:\n{}",
-        deck.snapshot_grid()
-    );
+    wait_for_role(&deck, "worker");
+    release_standin(&fifo, &deck, "worker");
+    assert_blocked(&deck, "worker", "usage_limit");
     let output = delegate(&deck, "worker", "quota-warning-delivery-sentinel");
     assert!(
         output.status.success(),
@@ -324,9 +513,6 @@ fn orchestration_delegate_037_delegate_to_blocked_worker_warns_and_delivers() {
         }),
         "accepted delegation did not reach worker PTY"
     );
-    // Issue #714 (review): the block was published before this delegation
-    // existed, and an unchanged blocked screen never publishes again — the
-    // dispatch that delivered the task is what reports it.
     let orchestrator = role_agent(&deck, "orchestrator");
     let notice_text = || {
         common::strip_ansi(&common::pane_snapshot_on(
@@ -337,77 +523,49 @@ fn orchestration_delegate_037_delegate_to_blocked_worker_warns_and_delivers() {
     assert!(
         common::wait_until(Duration::from_secs(10), || notice_text()
             .contains(BLOCKED_NOTICE)),
-        "orchestrator was not told the new delegation's worker is blocked: {}",
+        "orchestrator did not receive blocked notice: {}",
         notice_text()
     );
-    assert!(
-        !common::wait_until(Duration::from_secs(1), || notice_text()
-            .matches(BLOCKED_NOTICE)
-            .count()
-            > 1),
-        "blocked notice repeated: {}",
-        notice_text()
+    assert_eq!(
+        notice_text().matches(BLOCKED_NOTICE).count(),
+        1,
+        "blocked notice repeated"
     );
 }
 
-/// Scenario: Delegate to a live worker, then make its Codex stand-in print a
-/// quota error while the task remains owed. The orchestrator must receive one
-/// fixed daemon notice, and a second delegation must still see the busy ledger.
+/// Scenario: A delegated Codex worker announces its rollout path through the
+/// installed hook and appends a structured quota failure while work is owed.
+/// The orchestrator receives one fixed notice and the ledger stays busy.
 #[spec("scheduler/idle-worker/021")]
 #[test]
 fn scheduler_idle_worker_021_blocked_worker_notices_orchestrator_once() {
     let fixture = common::race_safe_tempdir();
     let bin = fixture.path().join("bin");
-    let trigger = fixture.path().join("print-quota-now");
-    write_agent(
-        &bin,
-        "codex",
-        &format!(
-            "(while [ ! -e '{}' ]; do sleep 0.1; done; printf '\\n%s\\n' '{CODEX_LINE}') &\nstty -echo -icanon\nexec cat",
-            trigger.display()
-        ),
-    );
-    let deck = TuiDeck::builder()
-        .with_pty_size(160, 45)
-        .impersonating_pane_signals()
-        .with_env("PATH", path_with_standins(&bin))
-        .with_env("DOT_AGENT_DECK_QUOTA_CONFIRM_MS", CONFIRM_MS)
-        .launch_with_fixture("minimal");
+    let fifo = fixture.path().join("codex-trigger");
+    let transcript = fixture.path().join("rollout-714.jsonl");
+    trigger_fifo(&fifo);
+    std::fs::write(&transcript, "").expect("create rollout");
+    install_structured_standin(&bin, "codex");
+    write_agent(&bin, "launch-codex", "exec codex");
+    let deck = quota_deck(&bin, &fifo, &transcript);
     deck.wait_for_string("No active sessions");
-    write_orchestration(&deck, &[("worker", "codex", "codex")]);
+    write_orchestration(&deck, &[("worker", "launch-codex", "codex")]);
     open_orchestration(&deck);
-    assert!(
-        common::wait_until(Duration::from_secs(10), || {
-            role_agent_exists(&deck, "worker")
-        }),
-        "worker pane did not start before the first delegation"
-    );
+    wait_for_role(&deck, "worker");
     let first = delegate(&deck, "worker", "remain-owed-after-quota");
     assert!(
         first.status.success(),
-        "initial delegate failed: {}",
+        "delegate failed: {}",
         String::from_utf8_lossy(&first.stderr)
     );
     assert!(
         common::wait_until(Duration::from_secs(15), || {
             role_pane_text(&deck, "worker").contains("worker-task-worker")
         }),
-        "first task pointer did not reach the worker PTY"
+        "task pointer did not reach worker PTY"
     );
-    std::fs::write(&trigger, b"go").expect("trigger worker quota line");
-    assert!(
-        common::wait_until(Duration::from_secs(10), || {
-            role_pane_text(&deck, "worker").contains(CODEX_LINE)
-        }),
-        "triggered Codex stand-in never printed its provider error"
-    );
-    assert!(
-        common::wait_until(Duration::from_secs(25), || {
-            role_status(&deck, "worker").as_deref() == Some("Blocked")
-        }),
-        "worker did not become Blocked: {}",
-        status_document(&deck)
-    );
+    release_standin(&fifo, &deck, "worker");
+    assert_blocked(&deck, "worker", "credits_depleted");
     let orchestrator = role_agent(&deck, "orchestrator");
     let notice_text = || {
         common::strip_ansi(&common::pane_snapshot_on(
@@ -435,13 +593,137 @@ fn scheduler_idle_worker_021_blocked_worker_notices_orchestrator_once() {
         "notice omitted worker pane id: {text}"
     );
     assert!(
-        !text.contains(CODEX_LINE),
-        "agent-controlled quota detail leaked into notice: {text}"
+        !text.contains("structured-provider-detail-sentinel"),
+        "detail leaked: {text}"
     );
     let second = delegate(&deck, "worker", "busy-ledger-still-owed");
     assert!(
         !second.status.success(),
-        "blocked notice incorrectly retired the outstanding delegation"
+        "blocked notice retired outstanding delegation"
     );
     assert_eq!(notice_text().matches(BLOCKED_NOTICE).count(), 1);
+}
+
+fn install_opencode_standin(bin: &Path) {
+    std::fs::create_dir_all(bin).expect("create bin");
+    let script = r#"import fs from 'node:fs';
+import path from 'node:path';
+const home = process.env.HOME;
+const candidates = [path.join(home, '.config/opencode/plugin/dot-agent-deck.js'),
+                    path.join(home, '.opencode/plugin/dot-agent-deck.js')];
+const variant = process.argv[2];
+fs.readFileSync(process.env.QUOTA_TRIGGER_FIFO, 'utf8');
+const pluginPath = candidates.find(p => fs.existsSync(p));
+if (!pluginPath) throw new Error('deck-installed OpenCode plugin missing');
+const source = fs.readFileSync(pluginPath, 'utf8');
+const module = await import('data:text/javascript;base64,' + Buffer.from(source).toString('base64'));
+const plugin = await module.DotAgentDeckPlugin({directory: process.cwd()});
+const sessionID = 'quota-opencode-' + variant;
+await plugin.event({event:{type:'session.created',properties:{info:{id:sessionID}}}});
+const body = variant === 'marker'
+    ? JSON.stringify({error:{type:'usage_limit_reached',
+        resets_at:Math.floor(Date.now()/1000)+3600}})
+    : JSON.stringify({error:{type:'rate_limit_error'}});
+await plugin.event({event:{type:'session.error',properties:{sessionID,
+    error:{name:'APIError',data:{statusCode:429,responseBody:body,
+        message:'structured-provider-detail-sentinel'}}}}});
+process.stdin.resume();
+"#;
+    std::fs::write(bin.join("quota-opencode.mjs"), script).expect("write OpenCode stand-in");
+    write_agent(
+        bin,
+        "opencode",
+        &format!("exec node '{}/quota-opencode.mjs' \"$@\"", bin.display()),
+    );
+}
+
+/// Scenario: Two OpenCode stand-ins load the deck-installed plugin and send
+/// session.error events. A structured usage marker blocks the first card;
+/// a bare 429 leaves the other in Error.
+#[spec("status/blocked/019")]
+#[test]
+fn status_blocked_019_opencode_plugin_error_blocks_and_bare_429_does_not() {
+    if Command::new("node").arg("--version").output().is_err() {
+        eprintln!("SKIP: node is unavailable");
+        return;
+    }
+    let fixture = common::race_safe_tempdir();
+    let bin = fixture.path().join("bin");
+    let fifo = fixture.path().join("opencode-trigger");
+    let transcript = fixture.path().join("unused.jsonl");
+    trigger_fifo(&fifo);
+    install_opencode_standin(&bin);
+    let deck = quota_deck(&bin, &fifo, &transcript);
+    deck.wait_for_string("No active sessions");
+    write_orchestration(
+        &deck,
+        &[
+            ("marker", "opencode marker", "opencode"),
+            ("bare", "opencode bare", "opencode"),
+        ],
+    );
+    open_orchestration(&deck);
+    wait_for_role(&deck, "marker");
+    wait_for_role(&deck, "bare");
+    release_standin(&fifo, &deck, "marker");
+    release_standin(&fifo, &deck, "bare");
+    assert_blocked(&deck, "marker", "usage_limit");
+    assert!(
+        common::wait_until(Duration::from_secs(10), || {
+            role_status(&deck, "bare").as_deref() == Some("Error")
+                && has_role_badge(&deck.snapshot_grid(), "bare", "Error")
+        }),
+        "bare OpenCode 429 did not end in Error: {}\n{}",
+        status_document(&deck),
+        deck.snapshot_grid()
+    );
+}
+
+/// Scenario: A Claude stand-in blocks through StopFailure, then its role pane
+/// restarts. The new card does not retain the old Blocked state.
+#[spec("status/blocked/021")]
+#[test]
+fn status_blocked_021_pane_restart_clears_a_blocked_card() {
+    let fixture = common::race_safe_tempdir();
+    let bin = fixture.path().join("bin");
+    let fifo = fixture.path().join("claude-trigger");
+    let transcript = fixture.path().join("claude-quota.jsonl");
+    trigger_fifo(&fifo);
+    write_claude_record(&transcript, false);
+    install_structured_standin(&bin, "claude");
+    let deck = quota_deck(&bin, &fifo, &transcript);
+    deck.wait_for_string("No active sessions");
+    write_orchestration(&deck, &[("worker", "claude", "claude")]);
+    open_orchestration(&deck);
+    wait_for_role(&deck, "worker");
+    release_standin(&fifo, &deck, "worker");
+    assert_blocked(&deck, "worker", "usage_limit");
+    let old_id = role_agent(&deck, "worker").id;
+    let orchestrator_pane = role_agent(&deck, "orchestrator")
+        .pane_id_env
+        .expect("orchestrator pane id");
+    let output = Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"))
+        .args(["pane", "restart", "worker", "--force"])
+        .env("DOT_AGENT_DECK_SOCKET", deck.hook_socket_path())
+        .env("DOT_AGENT_DECK_PANE_ID", orchestrator_pane)
+        .env("HOME", deck.home_dir())
+        .current_dir(deck.workdir())
+        .output()
+        .expect("restart blocked worker");
+    assert!(
+        output.status.success(),
+        "restart refused: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        common::wait_until(Duration::from_secs(15), || {
+            role_agent_exists(&deck, "worker")
+                && role_agent(&deck, "worker").id != old_id
+                && role_status(&deck, "worker").as_deref() != Some("Blocked")
+                && !has_role_badge(&deck.snapshot_grid(), "worker", "Blocked")
+        }),
+        "restarted worker retained Blocked: {}\n{}",
+        status_document(&deck),
+        deck.snapshot_grid()
+    );
 }

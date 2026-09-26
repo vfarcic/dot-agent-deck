@@ -4,7 +4,7 @@ expression: rendered
 ---
 ┌ 1 ClaudeCode · quota-worker ────────────────────────────────────── ● Blocked ┐
 │Dir:  example-project                                                         │
-│⚠ Credits depleted (no reset) — purchase more credits                         │
+│⚠ Credits depleted (no reset) — structured provider error: credits depleted   │
 │Prmt: do the thing                                                            │
 │                                                                              │
 │                                                                              │

@@ -1137,7 +1137,8 @@ fn status_badge_002_blocked_card_snapshot() {
     session.blocked = Some(BlockedReason {
         kind: BlockedKind::CreditsDepleted,
         detected_at_ms: render_now().timestamp_millis(),
-        detail: Some("purchase more credits".to_string()),
+        detail: Some("structured provider error: credits depleted".to_string()),
+        resets_at_ms: None,
     });
     let density = CardDensityKind::Normal;
     let buffer = render_card_to_buffer(
@@ -1181,6 +1182,41 @@ fn status_badge_002_blocked_card_snapshot() {
             buffer_to_color_text(&stats_buffer)
         );
     }
+}
+
+/// Scenario: Render a Blocked card whose provider supplies a reset two hours
+/// and ten minutes after the fixed render clock. The card tells the user when
+/// the usage limit resets.
+#[spec("status/badge/003")]
+#[test]
+fn status_badge_003_blocked_card_shows_reset() {
+    let mut session = palette_session(SessionStatus::Blocked);
+    session.blocked = Some(BlockedReason {
+        kind: BlockedKind::UsageLimit,
+        detected_at_ms: render_now().timestamp_millis(),
+        detail: None,
+        resets_at_ms: Some(
+            (render_now() + chrono::Duration::hours(2) + chrono::Duration::minutes(10))
+                .timestamp_millis(),
+        ),
+    });
+    let density = CardDensityKind::Normal;
+    let buffer = render_card_to_buffer(
+        &session,
+        Some("quota-worker"),
+        Some(1),
+        density,
+        0,
+        render_now(),
+        false,
+        80,
+        density.rendered_height(),
+    );
+    let rendered = buffer_to_text(&buffer);
+    assert!(
+        rendered.contains("resets in 2h 10m"),
+        "the blocked card omitted its provider reset:\n{rendered}"
+    );
 }
 
 /// Read the `(fg, modifier)` of a card/pane's left border at a mid-height row.
