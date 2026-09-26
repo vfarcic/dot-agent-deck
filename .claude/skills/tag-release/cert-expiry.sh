@@ -17,6 +17,7 @@ set -uo pipefail
 # Output:
 #   CERT_CHECK=warning|clear|unknown
 #   CERT_RUN=<url of the release run it read>
+#   CERT_PASSED_OVER=<newer runs whose desktop-sign failed before the check>
 #   CERT_NOT_AFTER=<the certificate's notAfter, when the log carries it>
 #   CERT_MESSAGE=<level: message>   (one line per certificate annotation)
 
@@ -29,33 +30,44 @@ unknown() {
 command -v gh > /dev/null 2>&1 || unknown "gh is not on PATH, so the last release run could not be read."
 repo=$(gh repo view --json nameWithOwner --jq .nameWithOwner 2> /dev/null) || unknown "gh could not resolve this repository."
 
-# The newest completed release run whose desktop-sign job actually ran. A run
-# dispatched with skip_desktop, or one that failed before the desktop chain,
-# has none, so a few are searched.
+# The newest completed release run whose desktop-sign job says something about
+# the certificate. A run dispatched with skip_desktop, or one that failed before
+# the desktop chain, has no such job; a job that FAILED before the certificate
+# check (no app artifact, half-registered credentials) says nothing about the
+# certificate either, so the search goes on past it rather than reporting it
+# as clear and hiding what an older run said. A job that SUCCEEDED with no
+# certificate line built the .dmg unsigned, which is a real answer.
 runs=$(gh run list --repo "$repo" --workflow=release.yml --status completed --limit 10 \
   --json databaseId --jq '.[].databaseId' 2> /dev/null) || unknown "gh could not list release.yml runs."
-job=""
+passed_over=""
 for run in $runs; do
-  job=$(gh api "repos/$repo/actions/runs/$run/jobs?per_page=100" \
-    --jq '.jobs[] | select(.name == "desktop-sign" and (.conclusion == "success" or .conclusion == "failure")) | .id' 2> /dev/null | head -n 1)
-  [ -n "$job" ] && break
+  job="" conclusion=""
+  read -r job conclusion < <(gh api "repos/$repo/actions/runs/$run/jobs?per_page=100" \
+    --jq '.jobs[] | select(.name == "desktop-sign" and (.conclusion == "success" or .conclusion == "failure")) | "\(.id) \(.conclusion)"' 2> /dev/null | head -n 1)
+  [ -n "${job:-}" ] || continue
+  url="https://github.com/$repo/actions/runs/$run"
+  # The job logs the date on every signed run that reached the check.
+  log=$(gh run view "$run" --repo "$repo" --job "$job" --log 2> /dev/null) \
+    || unknown "gh could not read the desktop-sign log of $url."
+  not_after=$(printf '%s\n' "$log" | grep -oE 'notAfter=[A-Z][a-z]{2} +[0-9]+ [0-9:]+ [0-9]{4} GMT' | head -n 1)
+  annotations=$(gh api "repos/$repo/check-runs/$job/annotations" \
+    --jq '.[] | select(.message | contains("Developer ID Application certificate")) | "\(.annotation_level): \(.message)"' 2> /dev/null) \
+    || unknown "gh could not read the desktop-sign annotations of $url."
+  if [ -z "$not_after" ] && [ -z "$annotations" ] && [ "$conclusion" != "success" ]; then
+    passed_over="$passed_over $url"
+    continue
+  fi
+  echo "CERT_RUN=$url"
+  [ -n "$passed_over" ] && echo "CERT_PASSED_OVER=${passed_over# }"
+  [ -n "$not_after" ] && echo "CERT_NOT_AFTER=${not_after#notAfter=}"
+  if [ -n "$annotations" ]; then
+    echo "CERT_CHECK=warning"
+    while IFS= read -r line; do
+      echo "CERT_MESSAGE=$line"
+    done <<< "$annotations"
+  else
+    echo "CERT_CHECK=clear"
+  fi
+  exit 0
 done
-[ -n "$job" ] || unknown "none of the last 10 completed release.yml runs has a desktop-sign job that ran."
-echo "CERT_RUN=https://github.com/$repo/actions/runs/$run"
-
-# The job logs the date on every signed run; an unsigned run has no line.
-not_after=$(gh run view "$run" --repo "$repo" --job "$job" --log 2> /dev/null \
-  | grep -oE 'notAfter=[A-Z][a-z]{2} +[0-9]+ [0-9:]+ [0-9]{4} GMT' | head -n 1)
-[ -n "$not_after" ] && echo "CERT_NOT_AFTER=${not_after#notAfter=}"
-
-annotations=$(gh api "repos/$repo/check-runs/$job/annotations" \
-  --jq '.[] | select(.message | contains("Developer ID Application certificate")) | "\(.annotation_level): \(.message)"' 2> /dev/null) \
-  || unknown "gh could not read the desktop-sign job's annotations."
-if [ -n "$annotations" ]; then
-  echo "CERT_CHECK=warning"
-  while IFS= read -r line; do
-    echo "CERT_MESSAGE=$line"
-  done <<< "$annotations"
-else
-  echo "CERT_CHECK=clear"
-fi
+unknown "none of the last 10 completed release.yml runs has a desktop-sign job that reached the certificate check or built unsigned.${passed_over:+ Failed before the check:$passed_over}"
