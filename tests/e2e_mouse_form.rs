@@ -26,7 +26,9 @@ fn open_form(deck: &TuiDeck) {
     deck.send_bytes(b"\x0e"); // Ctrl+N → directory picker
     deck.wait_for_string("Select Directory");
     deck.send_bytes(b" "); // Space → confirm current dir → new-pane form
-    deck.wait_for_string("New Agent");
+    // The dashboard button bar also says "New Agent". Wait for the form's
+    // bordered title so a following click cannot target the picker instead.
+    deck.wait_for_string("┌ New Agent");
 }
 
 /// Click the button/affordance whose label text is `needle`.
