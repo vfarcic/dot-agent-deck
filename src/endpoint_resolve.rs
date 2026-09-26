@@ -247,6 +247,14 @@ fn ensure_endpoint_dir_in(endpoint: &Path, dir: &Path) -> std::io::Result<()> {
     if endpoint.parent() != Some(dir) {
         return Ok(());
     }
+    ensure_fallback_dir(dir)
+}
+
+/// Create the fallback endpoint directory owner-only, with the refusal worded
+/// for this directory — [`ensure_endpoint_dir_in`]'s body, shared with
+/// [`choose_fallback_dir`].
+#[cfg(unix)]
+fn ensure_fallback_dir(dir: &Path) -> std::io::Result<()> {
     crate::platform::fsperm::ensure_owner_only_dir(dir).map_err(|source| {
         std::io::Error::new(
             source.kind(),
@@ -455,8 +463,8 @@ fn connect_failure_still_answers(kind: std::io::ErrorKind) -> bool {
 /// the squatter's entry is gone by the time the daemon asks; when it does not,
 /// it creates the per-uid directory itself, which no one else can then take.
 ///
-/// The filesystem work runs on the blocking pool; the find-or-create runs under
-/// a lock both callers take.
+/// The decision and the directory it chooses are made as one operation on the
+/// blocking pool, under a lock both callers take ([`choose_fallback_dir`]).
 pub async fn prepare_bind_endpoints(
     resolved: &[ResolvedEndpoint],
 ) -> std::io::Result<Vec<PathBuf>> {
@@ -468,33 +476,22 @@ pub async fn prepare_bind_endpoints(
             endpoint.source() == EndpointSource::Fallback
                 && endpoint.path().parent() == Some(primary_dir.as_path())
         };
-        let reason = if resolved.iter().any(on_fallback) {
+        let relocated = if resolved.iter().any(on_fallback) {
             let dir = primary_dir.clone();
-            on_blocking_pool(move || Ok(needs_relocation(&dir, uid))).await?
+            let lock_root = crate::daemon::lock_root(None);
+            on_blocking_pool(move || choose_fallback_dir(&dir, uid, &lock_root)).await?
         } else {
             None
         };
-        let relocated = match reason {
-            Some(reason) => {
-                let lock_root = crate::daemon::lock_root(None);
-                let lock_path = lock_root.join(RELOCATION_LOCK_FILE);
-                on_blocking_pool(move || {
-                    crate::platform::fsperm::ensure_owner_only_dir(&lock_root)
-                })
-                .await?;
-                let _lock = crate::platform::lock::acquire_spawn_lock(&lock_path).await?;
-                let dir = primary_dir.clone();
-                let relocated = on_blocking_pool(move || relocated_bind_dir(&dir, uid)).await?;
-                tracing::warn!(
-                    "this deck's endpoints are in {} instead of {}: {} (issue #1173)",
-                    relocated.display(),
-                    primary_dir.display(),
-                    reason.describe()
-                );
-                Some(relocated)
-            }
-            None => None,
-        };
+        if let Some((dir, reason)) = &relocated {
+            tracing::warn!(
+                "this deck's endpoints are in {} instead of {}: {} (issue #1173)",
+                dir.display(),
+                primary_dir.display(),
+                reason.describe()
+            );
+        }
+        let relocated = relocated.map(|(dir, _)| dir);
         let mut paths = Vec::with_capacity(resolved.len());
         for endpoint in resolved {
             match &relocated {
@@ -506,6 +503,11 @@ pub async fn prepare_bind_endpoints(
                         )
                     })?;
                     paths.push(dir.join(file_name));
+                }
+                _ if on_fallback(endpoint) => {
+                    // `choose_fallback_dir` already made the per-uid
+                    // directory, under the lock.
+                    paths.push(endpoint.path().to_path_buf());
                 }
                 _ => {
                     let path = endpoint.path().to_path_buf();
@@ -525,6 +527,65 @@ pub async fn prepare_bind_endpoints(
             .map(|endpoint| endpoint.path().to_path_buf())
             .collect())
     }
+}
+
+/// Decide where the fallback arm binds and make that directory, as **one**
+/// operation under the relocation lock: `Some((relocated, why))`, or `None`
+/// once the per-uid directory itself is ready.
+///
+/// One blocking operation rather than a decision followed by a creation, for
+/// two reasons a review of #1349 found. A decision made first can be
+/// overtaken: another uid can take the per-uid name between "no need to
+/// relocate" and the `mkdir`, and the start would then fail closed instead of
+/// relocating — so a failed preparation that finds the entry has become
+/// foreign relocates after all. And the lock is a synchronous `flock` taken
+/// and released on the same blocking thread, rather than an async guard held
+/// across an `.await` on blocking work, which a cancelled caller would drop
+/// while the find-or-create was still running.
+#[cfg(unix)]
+fn choose_fallback_dir(
+    primary_dir: &Path,
+    uid: u32,
+    lock_root: &Path,
+) -> std::io::Result<Option<(PathBuf, RelocationReason)>> {
+    crate::platform::fsperm::ensure_owner_only_dir(lock_root)?;
+    let _lock = lock_exclusive(&lock_root.join(RELOCATION_LOCK_FILE))?;
+    if let Some(reason) = needs_relocation(primary_dir, uid) {
+        return Ok(Some((relocated_bind_dir(primary_dir, uid)?, reason)));
+    }
+    match ensure_fallback_dir(primary_dir) {
+        Ok(()) => Ok(None),
+        Err(_) if entry_is_foreign(primary_dir, uid) => Ok(Some((
+            relocated_bind_dir(primary_dir, uid)?,
+            RelocationReason::Taken,
+        ))),
+        Err(source) => Err(source),
+    }
+}
+
+/// An exclusive `flock(2)` on `path`, released when the returned file is
+/// dropped. The synchronous sibling of
+/// [`crate::platform::lock::acquire_spawn_lock`], for a caller that is already
+/// on a blocking thread and must hold the lock for exactly as long as that
+/// thread's work runs.
+#[cfg(unix)]
+fn lock_exclusive(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::io::AsRawFd;
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)?;
+    // SAFETY: a valid descriptor and a valid operation; `flock(2)` retains no
+    // reference to our memory.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(file)
 }
 
 /// Run blocking filesystem work off the async worker threads.
@@ -1419,6 +1480,41 @@ mod tests {
         std::fs::set_permissions(&primary, std::fs::Permissions::from_mode(0o700)).unwrap();
         assert_eq!(needs_relocation(&primary, uid), None);
         assert!(relocated.exists());
+    }
+
+    #[test]
+    fn the_fallback_directory_is_chosen_and_made_in_one_locked_step() {
+        use std::os::unix::fs::MetadataExt;
+        let root = sandbox();
+        let locks = root.path().join("locks");
+        let uid = crate::platform::paths::current_uid();
+        let primary = root.path().join(format!("dot-agent-deck-{uid}"));
+
+        assert_eq!(
+            choose_fallback_dir(&primary, uid, &locks).unwrap(),
+            None,
+            "a free name is used, not relocated around"
+        );
+        let metadata = std::fs::symlink_metadata(&primary).unwrap();
+        assert!(metadata.file_type().is_dir() && metadata.mode() & 0o777 == 0o700);
+        assert!(
+            locks.join(RELOCATION_LOCK_FILE).exists(),
+            "the per-uid directory is made under the relocation lock too"
+        );
+
+        // Asked on behalf of a uid that does not own it, the same directory is
+        // someone else's: relocate, and say why.
+        let (relocated, reason) = choose_fallback_dir(&primary, someone_else(), &locks)
+            .unwrap()
+            .expect("a foreign per-uid directory is relocated around");
+        assert_eq!(reason, RelocationReason::Taken);
+        assert!(
+            relocated
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with(&format!("dot-agent-deck-{uid}."))
+        );
     }
 
     #[test]
