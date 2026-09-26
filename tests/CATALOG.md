@@ -6019,7 +6019,7 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 ##### scheduler/idle-worker/021 — A blocked worker with an outstanding delegation notifies the orchestrator once without retiring the ledger (issue #714).
 - **Layer:** L2, lane 1, PTY-attached; the notice and ledger require the running daemon path.
 - **Agent:** synthetic Codex stand-in that announces its rollout through installed hooks and appends a structured task failure; no provider credential.
-- **Asserts:** one fixed blocked notice reaches the orchestrator pane with the worker pane id, no agent-controlled detail, and a second delegate remains busy because work-done is still owed.
+- **Asserts:** one fixed blocked-worker report reaches the orchestrator pane with the worker pane id, no agent-controlled detail, and a second delegate remains busy because work-done is still owed. The report is SUBMITTED, as #708 made its worker-exited sibling: the single byte after its stable final clause (`daemon log names the role.`) is CR, not LF — exact because the orchestrator stand-in runs `cat` under `stty -echo -icanon -icrnl -opost` before its readiness marker. Verified red with the delivery on `write_notice_guarded` (`Some(10)`). The release of its payload record on `Applied`, so a byte-identical report for a later delegation is still submitted after user input, is pinned by the `agent_pty` unit test `worker_blocked_report_is_submitted_and_resubmits_after_user_input`, verified red with that settle call removed.
 - **Does not assert:** eventual worker completion or provider quota reset.
 - **Platform coverage:** mac+linux.
 

@@ -9686,17 +9686,20 @@ impl AgentPtyRegistry {
         self.spawn_worker_blocked_notice(worker_pane_id, worker_agent_id, epoch, Some(seq))
     }
 
-    /// Issue #714: deliver the blocked-worker notice claimed by
+    /// Issue #714: deliver the blocked-worker report claimed by
     /// [`Self::claim_worker_blocked_notice`] into the orchestrator's pane.
     ///
-    /// The deferred notice family, exactly as
-    /// [`Self::deliver_worker_exited_notice`]: fixed daemon-authored text with
-    /// the worker's scrubbed pane id as the only interpolation
-    /// ([`crate::state::compose_worker_blocked_notice`]), written through
-    /// [`Self::write_notice_guarded`] bound to the orchestrator's registry agent
-    /// id captured at arm time, refused for a pane that is mid-close or has been
-    /// re-homed into a different orchestration. The role rides the log line,
-    /// never the pane, and the agent's own error text rides neither.
+    /// SUBMITTED, exactly as [`Self::deliver_worker_exited_notice`] is since
+    /// issue #708: fixed daemon-authored text with the worker's scrubbed pane id
+    /// as the only interpolation ([`crate::state::compose_worker_blocked_notice`]),
+    /// sent through [`Self::write_and_submit_guarded`] bound to the
+    /// orchestrator's registry agent id captured at arm time, refused for a pane
+    /// that is mid-close or has been re-homed into a different orchestration.
+    /// The role rides the log line, never the pane, and the agent's own error
+    /// text rides neither. Its payload record is released on `Applied`
+    /// ([`crate::state::settle_one_shot_payload_record`]), so the byte-identical
+    /// report owed to a LATER delegation to the same worker is not refused as a
+    /// repeat of whatever the user typed in between.
     ///
     /// The writer-held re-validation also re-checks the WORKER: a genuine work
     /// hook that lifted the block `epoch` after the claim
@@ -9796,7 +9799,7 @@ impl AgentPtyRegistry {
         let revalidate_pane = orchestrator_pane_id.clone();
         let (worker_pane, worker_agent) = (worker_pane_id.to_string(), worker_agent_id.to_string());
         let outcome = self
-            .write_notice_guarded(
+            .write_and_submit_guarded(
                 &orchestrator_pane_id,
                 &text,
                 &expected_agent_id,
@@ -9821,13 +9824,22 @@ impl AgentPtyRegistry {
                 },
             )
             .await;
+        // A one-shot submitted report: its payload record goes on `Applied` and
+        // stays on `Ambiguous`, so leftover bytes cannot ride a later identical
+        // report together with a user draft.
+        crate::state::settle_one_shot_payload_record(
+            self,
+            &orchestrator_pane_id,
+            &text,
+            outcome.as_ref().ok().copied(),
+        );
         match outcome {
             Ok(GuardedSend::Applied) => {
                 tracing::info!(
                     worker_pane_id = %worker_pane_id,
                     role = %notice.role,
-                    "quota: reported a delegated worker blocked by a provider usage limit to the \
-                     orchestrator"
+                    "quota: submitted a report of a delegated worker blocked by a provider usage \
+                     limit to the orchestrator"
                 );
                 false
             }
@@ -9835,8 +9847,8 @@ impl AgentPtyRegistry {
                 tracing::warn!(
                     pane_id = %orchestrator_pane_id,
                     role = %notice.role,
-                    "quota: blocked-worker notice delivery was ambiguous (partial write); not \
-                     retried"
+                    "quota: the blocked-worker report's submission was ambiguous (partial \
+                     write); not retried, and its payload record is kept"
                 );
                 false
             }
@@ -17445,6 +17457,114 @@ mod spawn_tests {
             Some(GuardedSend::Applied),
             "a byte-identical second worker-exited report must still be submitted after the user \
              has typed — the first one's payload record has to be released"
+        );
+    }
+
+    /// Issue #714, after #708: the blocked-worker report is SUBMITTED into the
+    /// orchestrator's pane, like its worker-exited sibling, and a byte-identical
+    /// report for a LATER delegation is still submitted after the user has typed
+    /// there. Driven through `spawn_worker_blocked_notice`, the one production
+    /// entry point, against a raw-mode `cat` so the byte after the report's
+    /// final clause is exactly the terminator the daemon wrote.
+    ///
+    /// 1. **Submitted.** An LF-terminated line reaches nobody in a dispatched
+    ///    unit — no human presses Enter — so an orchestrator would never learn
+    ///    to reassign a task its quota-blocked worker cannot finish.
+    /// 2. **Released on `Applied`.** A second delegation to the same blocked
+    ///    worker produces the same text. Without the payload record's release,
+    ///    the user-input guard would refuse it as a repeat of the user's draft.
+    #[tokio::test]
+    async fn worker_blocked_report_is_submitted_and_resubmits_after_user_input() {
+        const ORCH: &str = "blocked-report-orchestrator";
+        const WORKER: &str = "blocked-report-worker";
+        const OPENING: &[u8] = b"delegated worker blocked by a provider usage limit";
+        const TAIL: &[u8] = b"daemon log names the role.";
+        let reg = Arc::new(AgentPtyRegistry::new());
+        let orchestrator = reg
+            .spawn_agent(SpawnOptions {
+                command: Some(
+                    "stty -echo -icanon -icrnl -opost min 1 time 0 && \
+                     printf RAW-READY && exec cat -u",
+                ),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), ORCH.to_string())],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn raw orchestrator stand-in");
+        let worker = reg
+            .spawn_agent(SpawnOptions {
+                command: Some("/bin/cat"),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), WORKER.to_string())],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn worker stand-in");
+        let ready_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !reg
+            .snapshot(&orchestrator)
+            .unwrap_or_default()
+            .windows(b"RAW-READY".len())
+            .any(|w| w == b"RAW-READY")
+        {
+            assert!(
+                tokio::time::Instant::now() < ready_deadline,
+                "the orchestrator stand-in never applied stty"
+            );
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+        // The byte following each report's final clause, in scrollback order.
+        let terminators = || {
+            let snapshot = reg.snapshot(&orchestrator).unwrap_or_default();
+            let mut found = Vec::new();
+            let mut rest = &snapshot[..];
+            while let Some(start) = rest.windows(OPENING.len()).position(|w| w == OPENING) {
+                rest = &rest[start..];
+                let Some(end) = rest.windows(TAIL.len()).position(|w| w == TAIL) else {
+                    break;
+                };
+                let end = end + TAIL.len();
+                found.push(rest.get(end).copied());
+                rest = &rest[end..];
+            }
+            found
+        };
+        let report = |expected: usize| {
+            let (reg, orchestrator, worker) =
+                (Arc::clone(&reg), orchestrator.clone(), worker.clone());
+            let terminators = &terminators;
+            async move {
+                let armed = reg
+                    .arm_outstanding_delegation(WORKER, "coder", ORCH, &orchestrator, None)
+                    .expect("arm the delegation");
+                reg.bind_delegation_worker_agent_id(WORKER, armed.seq, &worker);
+                let epoch = reg
+                    .note_quota_block(WORKER, &worker)
+                    .expect("the worker owns its pane");
+                reg.spawn_worker_blocked_notice(WORKER, &worker, epoch, Some(armed.seq))
+                    .expect("a notice is owed for the new delegation")
+                    .await
+                    .expect("the delivery task");
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+                while terminators().iter().flatten().count() < expected
+                    && tokio::time::Instant::now() < deadline
+                {
+                    tokio::time::sleep(Duration::from_millis(30)).await;
+                }
+            }
+        };
+
+        report(1).await;
+        // The user types, arming the repeat-payload refusal: without this clock
+        // the guard abstains and the repeat would pass for the wrong reason.
+        reg.note_user_input(ORCH);
+        report(2).await;
+        let observed = terminators();
+        reg.shutdown_all();
+
+        assert_eq!(
+            observed,
+            vec![Some(b'\r'), Some(b'\r')],
+            "both blocked-worker reports must be SUBMITTED (terminated by CR, not left as an \
+             LF-terminated line), and the second, byte-identical one must still be submitted \
+             after the user typed; terminators observed = {observed:?}"
         );
     }
 

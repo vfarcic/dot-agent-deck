@@ -18,6 +18,31 @@ use spec::spec;
 const BLOCKED_NOTICE: &str =
     "delegated worker blocked by a provider usage limit (dot-agent-deck daemon report)";
 
+/// Issue #714, after #708: the blocked-worker report's stable FINAL clause. It
+/// ends in `.`, which the payload encoder's trailing-whitespace trim cannot
+/// eat, so the byte that follows it in the pane is the terminator the daemon
+/// wrote.
+const BLOCKED_NOTICE_TAIL: &str = "daemon log names the role.";
+
+/// The byte the daemon wrote right after the blocked-worker report — CR when it
+/// SUBMITTED the report as a turn, LF when it left it as a line — or `None`
+/// while the report or that byte has not arrived. Anchored to the report's
+/// opening clause and then its final clause, so an unrelated line break in the
+/// pane cannot pass for it. Exact because `quota-orchestrator.sh` runs `cat`
+/// under `stty -echo -icanon -icrnl -opost` before printing its readiness
+/// marker, so no CR/LF translation sits on either side of the pane.
+fn blocked_notice_terminator(snapshot: &[u8]) -> Option<u8> {
+    let start = snapshot
+        .windows(BLOCKED_NOTICE.len())
+        .position(|window| window == BLOCKED_NOTICE.as_bytes())?;
+    let rest = &snapshot[start..];
+    let end = rest
+        .windows(BLOCKED_NOTICE_TAIL.len())
+        .position(|window| window == BLOCKED_NOTICE_TAIL.as_bytes())?
+        + BLOCKED_NOTICE_TAIL.len();
+    rest.get(end).copied()
+}
+
 fn write_agent(bin: &Path, name: &str, body: &str) {
     std::fs::create_dir_all(bin).expect("create stand-in binary directory");
     let path = bin.join(name);
@@ -595,6 +620,20 @@ fn scheduler_idle_worker_021_blocked_worker_notices_orchestrator_once() {
     assert!(
         !text.contains("structured-provider-detail-sentinel"),
         "detail leaked: {text}"
+    );
+    // Issue #714, after #708: SUBMITTED, not written. An unsubmitted line
+    // reaches nobody in an unattended dispatched unit, so the orchestrator
+    // would never learn to reassign work its blocked worker cannot finish.
+    let raw_snapshot = || common::pane_snapshot_on(deck.attach_socket_path(), &orchestrator.id);
+    common::wait_until(Duration::from_secs(5), || {
+        blocked_notice_terminator(&raw_snapshot()).is_some()
+    });
+    let terminator = blocked_notice_terminator(&raw_snapshot());
+    assert_eq!(
+        terminator,
+        Some(b'\r'),
+        "the blocked-worker report must be SUBMITTED (CR), not left as an LF-terminated \
+         line in the orchestrator's pane: {text}"
     );
     let second = delegate(&deck, "worker", "busy-ledger-still-owed");
     assert!(

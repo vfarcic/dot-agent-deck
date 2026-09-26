@@ -47,8 +47,11 @@ const STOP_FAILURE_HOOK: &str = "StopFailure";
 pub const STOP_FAILURE_MIN_CLAUDE_VERSION: (u64, u64, u64) = (2, 1, 78);
 
 /// How long [`installed_claude_accepts_stop_failure`] waits for
-/// `claude --version` before treating the version as unknown.
-const CLAUDE_VERSION_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+/// `claude --version` before treating the version as unknown. Since issue
+/// #1157 this also runs in `daemon serve` BEFORE it binds, so it is part of the
+/// daemon's pre-bind budget ([`crate::daemon_attach::DAEMON_START_POLL_TIMEOUT`]).
+pub(crate) const CLAUDE_VERSION_PROBE_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(2);
 
 /// Issue #714: parse the leading `MAJOR.MINOR.PATCH` of `claude --version`'s
 /// output (`2.1.283 (Claude Code)`). `None` for anything else.

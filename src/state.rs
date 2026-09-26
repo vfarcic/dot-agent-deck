@@ -3166,8 +3166,9 @@ fn delegate_no_event_window(
 /// DELIVERY MECHANISM, and it is stated once — here for the submitted family, on
 /// [`compose_respawn_failed_notice`] for the deferred one. Issue #708 moved this
 /// notice's two siblings, [`compose_worker_exited_notice`] and
-/// [`compose_respawn_no_live_worker_notice`], into this family as well; their
-/// own docs record only where they differ from what follows.
+/// [`compose_respawn_no_live_worker_notice`], into this family as well, and
+/// issue #714's [`compose_worker_blocked_notice`] joined it on the same
+/// argument; their own docs record only where they differ from what follows.
 ///
 /// * **Submitted**, with [`AgentPtyRegistry::write_and_submit_guarded`] — the
 ///   same call, the same identity gate and the same revalidation closure PRD
@@ -3380,33 +3381,47 @@ pub(crate) fn spawn_lift_replaced_quota_blocks(
     });
 }
 
-/// Issue #714: the single-line notice written into the ORCHESTRATOR's pane when
-/// a worker which still owes a `work-done` reports that it is blocked by its
-/// provider's usage limit or credit pool.
+/// Issue #714: the single-line report the daemon SUBMITS into the
+/// ORCHESTRATOR's pane when a worker which still owes a `work-done` reports that
+/// it is blocked by its provider's usage limit or credit pool.
 ///
-/// The deferred family's third member, delivered with the same
-/// `write_notice_guarded` and bound by the same contract as
-/// [`compose_worker_exited_notice`]: fixed daemon-authored text, a single line,
-/// and the worker's scrubbed `pane_id_env` as the ONLY interpolation. In
-/// particular the agent's own error message is NOT interpolated — it is
-/// agent-controlled text and these bytes can later be submitted fused to a real
-/// prompt — and neither is the role, which rides the accompanying
-/// `tracing::info!`. Sent once per outstanding delegation, and the delegation
-/// stays outstanding: the worker still owes its `work-done`.
+/// **SUBMITTED, in [`compose_delegate_silence_notice`]'s family, whose doc
+/// carries the contract** — the same move issue #708 made for
+/// [`compose_worker_exited_notice`], for the same reason. The report exists so
+/// the orchestrator can act (reassign the task to a role on another provider or
+/// account, or notify the user); an unsubmitted line reaches nobody in a
+/// dispatched unit, where there is no human to press Enter and dispatch has no
+/// return edge. Where it differs from the silence notice:
 ///
-/// Worded as an OBSERVATION with a conditional remedy, never as a verdict: the
-/// daemon suppresses the notice when the block has cleared before it is written,
-/// but a genuine work hook can still land while the orchestrator is reading it,
-/// and a categorical "reassign" would then duplicate work a recovered worker is
-/// doing. So the orchestrator is told to check the card first.
+/// * **It interpolates nothing untrusted at all**, like the worker-exited
+///   report: the one interpolated value is the worker's `pane_id_env`, already
+///   through [`crate::agent_pty::is_valid_pane_id_env`]'s `[A-Za-z0-9_-]`
+///   scrub. The agent's own error message is NOT interpolated — it is
+///   agent-controlled text — and neither is the role (PRD #249 finding B3),
+///   which rides the accompanying `tracing::info!`.
+/// * **Sent once per outstanding delegation, and the delegation stays
+///   outstanding**: the worker still owes its `work-done`, so a plain delegate
+///   back to the same role is refused as busy, and the wording names
+///   `pane restart` and `--supersede` the way the worker-exited report does.
+/// * **An OBSERVATION with a conditional remedy, never a verdict.** A block is
+///   not permanent the way an exited process is: the daemon refuses the write
+///   when the block has cleared before it lands, but a genuine work hook can
+///   still arrive while the orchestrator is reading it, and a categorical
+///   "reassign" would then duplicate work a recovered worker is doing. So the
+///   orchestrator is told to check the card first, and to keep waiting if the
+///   worker is working again.
 pub(crate) fn compose_worker_blocked_notice(worker_pane_id: &str) -> String {
     compose_delegate_prompt(&format!(
-        "⚠ delegated worker blocked by a provider usage limit (dot-agent-deck daemon report): \
-         the agent behind pane {worker_pane_id} is alive but it reports that its provider \
-         usage limit or credit pool is exhausted; its outstanding delegation will likely not \
-         complete while \
-         that lasts. Check the worker's card: if it still shows Blocked, reassign the task to a \
-         role backed by a different provider or account; the daemon log names the role."
+        "⚠ delegated worker blocked by a provider usage limit (dot-agent-deck daemon report) - a \
+         report from the dot-agent-deck daemon, not a message from a person or an agent: the \
+         agent behind pane {worker_pane_id} is alive but it reports that its provider usage \
+         limit or credit pool is exhausted; its outstanding delegation will likely not complete \
+         while that lasts. Check the worker's card and decide how to proceed: if it still shows \
+         Blocked, reassign the task to a role backed by a different provider or account, or \
+         notify the user if this needs them; if it is working again, keep waiting. That worker \
+         still counts as owing the task, so re-delegating to the same role needs \
+         `dot-agent-deck pane restart <role>` first, or `delegate --supersede`. The daemon log \
+         names the role."
     ))
 }
 
@@ -3422,7 +3437,9 @@ pub(crate) fn compose_worker_blocked_notice(worker_pane_id: &str) -> String {
 /// rules below. Since issue #708 this notice is the family's only production
 /// member: #702 moved [`compose_delegate_silence_notice`] out, and #708 moved
 /// [`compose_worker_exited_notice`] and [`compose_respawn_no_live_worker_notice`]
-/// after it, onto the submitted path.
+/// after it, onto the submitted path. Issue #714's
+/// [`compose_worker_blocked_notice`] was written for this family and moved to
+/// the submitted one before it shipped.
 ///
 /// * **Not submitted, which means DEFERRED rather than inert.** Delivered with
 ///   `write_notice_guarded`, whose LF terminator leaves a visible line in
@@ -17198,8 +17215,8 @@ mod tests {
         assert!(legacy.blocked.is_none());
     }
 
-    /// Issue #714: the blocked-worker notice follows the deferred family's
-    /// contract — one line, fixed text, the pane id as its only interpolation.
+    /// Issue #714: the blocked-worker report is one line of fixed text with the
+    /// pane id as its only interpolation.
     #[test]
     fn compose_worker_blocked_notice_is_fixed_single_line_text() {
         let notice = compose_worker_blocked_notice("pane-worker-7");
@@ -17213,6 +17230,12 @@ mod tests {
         assert!(notice.contains("will likely not complete while that lasts"));
         assert!(notice.contains("if it still shows Blocked, reassign"));
         assert!(!notice.contains("will not complete"));
+        // Issue #714, after #708: submitted as a turn, so it says who is
+        // speaking and names every way out, like its worker-exited sibling.
+        assert!(notice.contains("not a message from a person or an agent"));
+        assert!(notice.contains("notify the user"));
+        assert!(notice.contains("keep waiting"));
+        assert!(notice.contains("--supersede"));
     }
 
     /// Issue #714: a pane restart lifts the REPLACED agent's Blocked card, in
