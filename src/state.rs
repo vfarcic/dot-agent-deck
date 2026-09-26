@@ -1021,6 +1021,18 @@ pub fn orchestration_identity_of_record(
 /// one. Async because it touches the filesystem and every caller is on the
 /// runtime; it is taken BEFORE the state lock, never under it.
 pub async fn orchestration_title_cwd_key(cwd: &str) -> String {
+    // A start that names no directory at all runs in the daemon's own working
+    // directory, so that is the directory it is keyed under — an empty key
+    // would miss a start that spelled the same directory out (Qodo, PR #1336).
+    let cwd = if cwd.is_empty() {
+        match std::env::current_dir() {
+            Ok(dir) => dir.to_string_lossy().into_owned(),
+            Err(_) => return String::new(),
+        }
+    } else {
+        cwd.to_string()
+    };
+    let cwd = cwd.as_str();
     match tokio::fs::canonicalize(cwd).await {
         Ok(resolved) => resolved.to_string_lossy().into_owned(),
         Err(_) => cwd.to_string(),
@@ -5277,11 +5289,13 @@ async fn dispatch_one_owned(
     commission_in_flight: Option<crate::agent_pty::CommissionDispatchInFlight>,
     // Issue #962: the orchestration's run title as the daemon held it when the
     // delegate ARRIVED — read synchronously by the caller, while the sender's
-    // own role registration still pins the title record. Read here instead,
+    // own role registration still pins the title record — the whole record,
+    // so a restore below keys it under the orchestration's directory rather
+    // than the target pane's own cwd. Read here instead,
     // on this detached task, a close of the last registered pane landing in
     // between would already have pruned it (Greptile, PR #1336). `None` for
     // callers with no daemon state, and for an orchestration with no title.
-    recorded_display_title: Option<String>,
+    recorded_title: Option<OrchestrationTitle>,
 ) {
     let dispatch_mutex = registry.pane_dispatch_lock(&pane_id);
     let _dispatch_guard = dispatch_mutex.lock().await;
@@ -5432,7 +5446,9 @@ async fn dispatch_one_owned(
         // it from `(name, cwd)` would have been (and impossible for a typed
         // `Ctrl+n` title anyway).
         let recreated_display_title = match (role_index, orchestration.as_ref()) {
-            (Some(_), Some(_)) => recorded_display_title.clone(),
+            (Some(_), Some(_)) => recorded_title
+                .as_ref()
+                .and_then(|held| held.display_title.clone()),
             // No role index means no orchestration membership is built at all
             // below, so there is nothing to carry a title on.
             _ => None,
@@ -5508,19 +5524,16 @@ async fn dispatch_one_owned(
                     // rejected with `reached no worker for role(s)` — the
                     // permanent breakage issue #606 reports.
                     if let (Some(state), Some(identity)) = (state.as_ref(), orchestration.clone()) {
-                        let title_cwd = match cwd.as_deref() {
-                            Some(cwd) => Some(orchestration_title_cwd_key(cwd).await),
-                            None => None,
-                        };
                         let mut state = state.write().await;
                         // Issue #962: a close that completed took this pane's
                         // identity with it, and if it was the last pane mapping
-                        // to it the title went too. Put back what was read above.
-                        if let Some(title_cwd) = title_cwd.as_deref() {
+                        // to it the title went too. Put back the record read
+                        // when the delegate arrived, under ITS cwd.
+                        if let Some(held) = recorded_title.as_ref() {
                             state.record_orchestration_title(
                                 &identity,
-                                recreated_display_title.as_deref(),
-                                title_cwd,
+                                held.display_title.as_deref(),
+                                &held.cwd,
                             );
                         }
                         state.register_orchestration_role(
@@ -7757,6 +7770,19 @@ impl AppState {
 
     /// Drop `identity`'s title once no pane maps to it and no start is claiming
     /// it, so the map is bounded by the orchestrations the role maps still hold.
+    /// Issue #962: the whole title record `identity` holds — title AND the
+    /// orchestration cwd it is keyed under — for a path that must put it back
+    /// later exactly as it was. The cwd matters: a re-create path knows only
+    /// the target pane's own cwd, which for an issue-dispatch clone is not the
+    /// orchestration's directory, and restoring under it would miskey the
+    /// uniqueness check (Qodo, PR #1336).
+    pub fn orchestration_title_record(
+        &self,
+        identity: &OrchestrationIdentity,
+    ) -> Option<OrchestrationTitle> {
+        self.orchestration_titles.get(identity).cloned()
+    }
+
     fn prune_orchestration_title(&mut self, identity: &OrchestrationIdentity) {
         let held = self
             .orchestration_titles
@@ -8328,10 +8354,10 @@ impl AppState {
                 );
 
             // Issue #962: read NOW, under the guard this delegate is being handled
-            // with — see `dispatch_one_owned`'s `recorded_display_title`.
-            let recorded_display_title = orchestration
+            // with — see `dispatch_one_owned`'s `recorded_title`.
+            let recorded_title = orchestration
                 .as_ref()
-                .and_then(|identity| self.orchestration_display_title(identity));
+                .and_then(|identity| self.orchestration_title_record(identity));
             tokio::spawn(async move {
                 dispatch_one_owned(
                     registry,
@@ -8346,7 +8372,7 @@ impl AppState {
                     delegation_seq,
                     state_for_dispatch,
                     commission_in_flight,
-                    recorded_display_title,
+                    recorded_title,
                 )
                 .await;
             });
@@ -8526,9 +8552,11 @@ pub async fn handle_restart_role_with_state(
         cwd: Option<String>,
         role_index: usize,
         role_config: OrchestrationRoleConfig,
-        /// Issue #962: the orchestration's run title as the daemon recorded
-        /// it, for a pane this restart has to re-create from nothing.
-        display_title: Option<String>,
+        /// Issue #962: the orchestration's title record as the daemon held
+        /// it, for a pane this restart has to re-create from nothing — the
+        /// whole record, so a restore keys it under the orchestration's
+        /// directory rather than the pane's own cwd.
+        title: Option<OrchestrationTitle>,
     }
 
     let resolved = {
@@ -8607,9 +8635,9 @@ pub async fn handle_restart_role_with_state(
         };
 
         ResolvedRestart {
-            display_title: orchestration
+            title: orchestration
                 .as_ref()
-                .and_then(|identity| guard.orchestration_display_title(identity)),
+                .and_then(|identity| guard.orchestration_title_record(identity)),
             pane_id,
             orchestration,
             cwd,
@@ -8659,7 +8687,10 @@ pub async fn handle_restart_role_with_state(
             orchestration_cwd: resolved.cwd.clone(),
             // Issue #962: the recorded title, not `None` — the same loss the
             // `clear = true` re-create path had.
-            display_title: resolved.display_title.clone(),
+            display_title: resolved
+                .title
+                .as_ref()
+                .and_then(|held| held.display_title.clone()),
             orchestration_id: match resolved.orchestration.as_ref() {
                 Some(OrchestrationIdentity::Instance { id, .. }) => Some(id.clone()),
                 _ => None,
@@ -8716,21 +8747,17 @@ pub async fn handle_restart_role_with_state(
                 let role = signal.role.clone();
                 let pane_id = resolved.pane_id.clone();
                 let cwd = resolved.cwd.clone();
-                let display_title = resolved.display_title.clone();
+                let title = resolved.title.clone();
                 tokio::spawn(async move {
-                    let title_cwd = match cwd.as_deref() {
-                        Some(cwd) => Some(orchestration_title_cwd_key(cwd).await),
-                        None => None,
-                    };
                     let mut state = state.write().await;
                     // Issue #962: the same restore `dispatch_one_owned`'s re-create
                     // makes — a close that took the last pane mapping to this
                     // identity pruned its title too (Qodo, PR #1336).
-                    if let Some(title_cwd) = title_cwd.as_deref() {
+                    if let Some(held) = title.as_ref() {
                         state.record_orchestration_title(
                             &identity,
-                            display_title.as_deref(),
-                            title_cwd,
+                            held.display_title.as_deref(),
+                            &held.cwd,
                         );
                     }
                     state.register_orchestration_role(
@@ -10970,6 +10997,38 @@ mod tests {
         assert_eq!(
             state.orchestration_display_title(&instance("dispatched")),
             Some("team · issue-1".to_string())
+        );
+    }
+
+    /// Issue #555 (PR #1336 review): the directory half of the title key is
+    /// the directory the start will actually run in. An alias resolves to its
+    /// target, a start that names no directory is keyed under the daemon's own
+    /// working directory (where it runs), and an unresolvable path keeps its
+    /// spelling rather than collapsing to an empty key every such start shares.
+    #[tokio::test]
+    async fn the_title_cwd_key_is_the_directory_the_start_runs_in() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let real = std::fs::canonicalize(dir.path()).expect("canonicalize the tempdir");
+        #[cfg(unix)]
+        {
+            let alias = dir.path().join("alias");
+            std::os::unix::fs::symlink(&real, &alias).expect("symlink");
+            assert_eq!(
+                orchestration_title_cwd_key(&alias.to_string_lossy()).await,
+                real.to_string_lossy()
+            );
+        }
+        let here = std::fs::canonicalize(std::env::current_dir().expect("cwd")).expect("cwd");
+        assert_eq!(
+            orchestration_title_cwd_key("").await,
+            here.to_string_lossy(),
+            "no directory means the daemon's own, where the start runs"
+        );
+        let gone = real.join("does-not-exist");
+        assert_eq!(
+            orchestration_title_cwd_key(&gone.to_string_lossy()).await,
+            gone.to_string_lossy(),
+            "an unresolvable directory keeps its spelling"
         );
     }
 

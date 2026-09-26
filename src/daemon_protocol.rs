@@ -3663,9 +3663,21 @@ async fn handle_connection(
             // the user no longer knows the name of. See
             // `AppState::claim_orchestration_title` for the key, the liveness
             // rule and what is not covered.
+            //
+            // Only a membership the registry will actually KEEP is claimed:
+            // `spawn_agent` stores `validate_tab_membership`'s verdict, and a
+            // membership it rejects (a relative orchestration cwd, a control
+            // byte in the name or token) leaves the pane with no orchestration
+            // membership at all — no tab, no title, and nothing the liveness
+            // check could ever see holding one (Qodo, PR #1336). Role
+            // registration below is unaffected either way.
+            let membership_is_kept = tab_membership
+                .clone()
+                .and_then(crate::agent_pty::validate_tab_membership)
+                .is_some();
             let title_claim: Option<crate::state::OrchestrationIdentity> =
                 match (pane_id_env.as_deref(), orchestration_meta.as_ref()) {
-                    (Some(_), Some(meta)) => {
+                    (Some(_), Some(meta)) if membership_is_kept => {
                         let identity = meta.identity(cwd_for_state.as_deref());
                         let orch_cwd = crate::state::orchestration_title_cwd_key(
                             &meta.orchestration_cwd(cwd_for_state.as_deref()),
@@ -3841,8 +3853,8 @@ async fn handle_connection(
                     // We do this only for orchestration panes; dashboard
                     // and mode panes don't participate in delegate
                     // dispatch.
-                    if let (Some(pane_id), Some(meta), Some(identity)) =
-                        (pane_id_env.as_deref(), orchestration_meta, title_claim)
+                    if let (Some(pane_id), Some(meta)) =
+                        (pane_id_env.as_deref(), orchestration_meta)
                     {
                         // Shared with the daemon-internal spawn path
                         // (`crate::spawn::spawn`) — see
@@ -3850,6 +3862,7 @@ async fn handle_connection(
                         // for why this must not be inlined again. The identity
                         // is the one the title check above scoped by
                         // (`OrchestrationSpawnMeta::identity`).
+                        let identity = meta.identity(cwd_for_state.as_deref());
                         let mut state = state.write().await;
                         state.register_orchestration_role(
                             pane_id,
@@ -3862,7 +3875,9 @@ async fn handle_connection(
                         // here on, so this start's in-flight claim ends — under
                         // the same guard, so there is no instant in which
                         // neither holds it.
-                        state.release_orchestration_title_claim(&identity);
+                        if title_claim.is_some() {
+                            state.release_orchestration_title_claim(&identity);
+                        }
                     }
                     // PRD #1223: announce the start to every attached TUI, not
                     // only to the client that sent it — a desktop start was
