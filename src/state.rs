@@ -5489,6 +5489,29 @@ async fn dispatch_one_owned(
                 pane_id.clone(),
             )],
         };
+        // Issue #962 (Qodo, PR #1336): from the moment the respawn terminates the
+        // current worker until the replacement is registered, this orchestration
+        // may have no live pane at all — the reachable shape is exactly #962's,
+        // an orchestrator that has already exited — and a title with no live
+        // pane is free to claim. Hold it for the respawn, the way a `StartAgent`
+        // holds a title across its own spawn, and give it back on both arms
+        // below. Not a uniqueness check: a run another client started while this
+        // orchestration was already dead was admitted legitimately, and the
+        // re-created worker still belongs to its own tab.
+        let title_reservation = match (
+            state.as_ref(),
+            orchestration.as_ref(),
+            recorded_title.as_ref(),
+        ) {
+            (Some(state), Some(identity), Some(held)) => {
+                state
+                    .write()
+                    .await
+                    .reserve_orchestration_title(identity, held);
+                Some(identity.clone())
+            }
+            _ => None,
+        };
         match registry
             .respawn_or_recreate_agent_for_pane(&pane_id, &role.command, &recreate_identity)
             .await
@@ -5544,6 +5567,16 @@ async fn dispatch_one_owned(
                             cwd.as_deref(),
                         );
                     }
+                }
+                // Issue #962: the replacement holds the title from here on (a
+                // replaced pane never lost its registration; a re-created one got
+                // it back just above), so the respawn's reservation ends.
+                if let (Some(state), Some(identity)) = (state.as_ref(), title_reservation.as_ref())
+                {
+                    state
+                        .write()
+                        .await
+                        .release_orchestration_title_claim(identity);
                 }
                 // Issue #687: THIS is where the previous generation stops being
                 // the pane's delegated worker, so this is where its silent-worker
@@ -6153,6 +6186,15 @@ async fn dispatch_one_owned(
                 expected_worker_agent_id = Some(new_agent_id);
             }
             Err(e) => {
+                // Issue #962: nothing replaced the worker, so nothing holds the
+                // title on the respawn's behalf any more.
+                if let (Some(state), Some(identity)) = (state.as_ref(), title_reservation.as_ref())
+                {
+                    state
+                        .write()
+                        .await
+                        .release_orchestration_title_claim(identity);
+                }
                 // The respawn failed AFTER the terminate phase
                 // already disposed of the previous child.
                 // Without surfacing the error to the operator,
@@ -7770,6 +7812,21 @@ impl AppState {
 
     /// Drop `identity`'s title once no pane maps to it and no start is claiming
     /// it, so the map is bounded by the orchestrations the role maps still hold.
+    /// Issue #962: hold `identity`'s title across an internal re-create, as a
+    /// `StartAgent` claim holds one across its spawn — restoring `held` first
+    /// if a close already pruned it. Deliberately NOT a uniqueness check (see
+    /// the call site); ended by [`Self::release_orchestration_title_claim`].
+    pub fn reserve_orchestration_title(
+        &mut self,
+        identity: &OrchestrationIdentity,
+        held: &OrchestrationTitle,
+    ) {
+        self.record_orchestration_title(identity, held.display_title.as_deref(), &held.cwd);
+        if let Some(entry) = self.orchestration_titles.get_mut(identity) {
+            entry.pending_claims += 1;
+        }
+    }
+
     /// Issue #962: the whole title record `identity` holds — title AND the
     /// orchestration cwd it is keyed under — for a path that must put it back
     /// later exactly as it was. The cwd matters: a re-create path knows only
@@ -10998,6 +11055,25 @@ mod tests {
             state.orchestration_display_title(&instance("dispatched")),
             Some("team · issue-1".to_string())
         );
+
+        // A re-create's reservation restores a pruned record and holds the
+        // title while its orchestration has no live pane, then lets it go.
+        let pruned = OrchestrationTitle {
+            display_title: Some("respawning".into()),
+            cwd: "/r".into(),
+            pending_claims: 0,
+        };
+        state.reserve_orchestration_title(&instance("respawning-tab"), &pruned);
+        assert!(
+            state
+                .claim_orchestration_title(&instance("rival"), Some("respawning"), "/r", &registry)
+                .is_err(),
+            "a title held across a re-create is not free to claim"
+        );
+        state.release_orchestration_title_claim(&instance("respawning-tab"));
+        state
+            .claim_orchestration_title(&instance("rival"), Some("respawning"), "/r", &registry)
+            .expect("released once the re-create is done, with no live pane left");
     }
 
     /// Issue #555 (PR #1336 review): the directory half of the title key is
@@ -11008,17 +11084,19 @@ mod tests {
     #[tokio::test]
     async fn the_title_cwd_key_is_the_directory_the_start_runs_in() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let real = std::fs::canonicalize(dir.path()).expect("canonicalize the tempdir");
+        let real = tokio::fs::canonicalize(dir.path())
+            .await
+            .expect("canonicalize the tempdir");
         #[cfg(unix)]
         {
             let alias = dir.path().join("alias");
-            std::os::unix::fs::symlink(&real, &alias).expect("symlink");
+            tokio::fs::symlink(&real, &alias).await.expect("symlink");
             assert_eq!(
                 orchestration_title_cwd_key(&alias.to_string_lossy()).await,
                 real.to_string_lossy()
             );
         }
-        let here = std::fs::canonicalize(std::env::current_dir().expect("cwd")).expect("cwd");
+        let here = tokio::fs::canonicalize(".").await.expect("cwd");
         assert_eq!(
             orchestration_title_cwd_key("").await,
             here.to_string_lossy(),
