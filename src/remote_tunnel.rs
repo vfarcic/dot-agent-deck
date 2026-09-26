@@ -2978,14 +2978,22 @@ mod tests {
     /// point: this constant is a *program*, its whole job is to answer with a
     /// path, and a string assertion would pass over a syntax error or an
     /// inverted `-S` test alike.
+    ///
+    /// `env_clear`, for [`run_probe_under`]'s reason: since issue #1174 the
+    /// snippet's first rung runs `${HOME}/.local/bin/dot-agent-deck` or whatever
+    /// `dot-agent-deck` is on `PATH`, so an ambient `HOME`/`PATH` lets this
+    /// machine's own installed deck answer. Removing only the three variables
+    /// the fallback rungs read left that open, and on any machine with a deck
+    /// installed the fallback tests failed with the host's answer (an empty
+    /// line from its `daemon endpoint`) instead of the rung under test.
     #[cfg(unix)]
     fn run_socket_probe(snippet: &str, env: &[(&str, &str)]) -> String {
         let output = std::process::Command::new("/bin/sh")
             .arg("-c")
             .arg(snippet)
-            .env_remove("DOT_AGENT_DECK_ATTACH_SOCKET")
-            .env_remove("XDG_RUNTIME_DIR")
-            .env_remove("TMPDIR")
+            .env_clear()
+            // The fallback rungs call `id -u`.
+            .env("PATH", "/usr/bin:/bin")
             .envs(env.iter().copied())
             .output()
             .expect("run the discovery probe under /bin/sh");

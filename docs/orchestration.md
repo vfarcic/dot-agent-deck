@@ -168,8 +168,9 @@ The deck therefore holds a `clear = true` task for a short **readiness buffer** 
 | it announced that its session is up | 1 second |
 | the deck watched it take over its terminal | 5 seconds |
 | it announces nothing before its first task | 8 seconds |
+| the deck cannot tell which agent it is, and it announced nothing | the 30-second wait, then 1 second |
 
-Which row a worker falls into depends on how its agent integrates with the deck, not on anything you configure.
+Which row a worker falls into depends on how its agent integrates with the deck — and on the deck being able to tell which agent the role runs. For a plain `claude`, `codex`, `opencode` or `pi` command it can. For a role launched through something else, such as `devbox run codex-big`, it cannot unless you [declare the agent](#declaring-the-agent-behind-a-launcher-command), and a Codex, Pi or OpenCode worker then lands in the last row on every delegation.
 
 Be clear about what that buys you: a fixed delay makes the race much less likely, but it cannot *prove* that the replacement is listening. The regression test behind it measures a deterministic test fixture — deliberately built to ignore input for 650 ms — and confirms the task is lost with the buffer at `0` and delivered and submitted at `1000`, which pins the mechanism. It does not measure how long any real agent version takes to boot on your machine.
 
@@ -254,7 +255,9 @@ The release flow is stateful: open branch → push → create PR → wait for CI
 
 The deck works out which agent a role runs by looking at the first word of its `command`. `claude --model opus`, `/usr/local/bin/codex`, `env FOO=1 codex` and `sh -c 'codex …'` all resolve fine. What cannot resolve is a command whose first word is a **launcher**: `devbox run -- codex`, `mise exec -- codex`, `nix develop -c codex`, `make codex`, or a project script like `./run-codex.sh`. The deck sees `devbox`, or `make`, or `run-codex.sh` — and there is no way to tell from the outside what any of those will end up starting, so it does not guess.
 
-Two things follow from that, and one of them is easy to miss. The obvious one: the role card reads **No agent** and shows no status. The subtler one: identifying the agent is also what lets the deck monitor it, and for **Codex** that monitoring is the only thing that can identify the pane before you give it work — Codex does not announce itself until its first turn begins. So a Codex role behind a launcher stays blank from launch until the moment you delegate the first task to it, and then quietly starts working. Claude, by comparison, announces itself as soon as it starts, which is why the same `devbox run` wrapper looks fine for a Claude role and broken for a Codex one.
+Three things follow from that, and two of them are easy to miss. The obvious one: the role card reads **No agent** and shows no status. The subtler one: identifying the agent is also what lets the deck monitor it, and for **Codex** that monitoring is the only thing that can identify the pane before you give it work — Codex does not announce itself until its first turn begins. So a Codex role behind a launcher stays blank from launch until the moment you delegate the first task to it, and then quietly starts working. Claude, by comparison, announces itself as soon as it starts, which is why the same `devbox run` wrapper looks fine for a Claude role and broken for a Codex one.
+
+The costliest one is delivery. The quick ways the deck has of knowing that a Codex, Pi or OpenCode `clear = true` replacement is ready for its task each depend on knowing it is that agent: it watches a Codex terminal, hands a Pi worker its task natively, and gives an OpenCode worker a fixed wait sized for OpenCode's start-up. An agent it cannot identify gets none of them, so the deck waits up to 30 seconds for the agent to announce itself before writing the task anyway. Claude announces itself, so a Claude role behind a launcher delivers promptly; a Codex, Pi or OpenCode role behind one pays the full 30 seconds on every delegation. `dot-agent-deck validate` warns about each role in this state, and the daemon log records a warning each time a delegation pays that wait.
 
 `agent` is how you answer the question the command cannot:
 

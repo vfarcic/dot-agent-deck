@@ -442,6 +442,13 @@ pub fn validate_config(config: &ProjectConfig) -> Vec<ValidationIssue> {
             }
         }
 
+        // Issue #1243: a role whose agent the deck cannot identify at all.
+        for role in &orch.roles {
+            if let Some(issue) = unidentified_role_agent_issue(&orch.name, role) {
+                issues.push(issue);
+            }
+        }
+
         // Warn about worker roles without descriptions (helps orchestrator know capabilities).
         for role in &orch.roles {
             if !role.start && role.description.is_none() {
@@ -487,6 +494,48 @@ fn unknown_agent_issue(scope: &str, declared: Option<&str>) -> Option<Validation
         scope: scope.to_string(),
         message: format!(
             "unknown agent '{quoted}' — this pane will have no agent and no wrapper; known agents: {}",
+            crate::agent_registry::declarable_agent_names().join(", ")
+        ),
+    })
+}
+
+/// Issue #1243: the warning for a role whose `command` resolves to no agent and
+/// which declares none, or `None` when the deck can identify it (or when the
+/// command is empty, which is an error of its own).
+///
+/// This is `devbox run codex-big`, `mise exec -- opencode`, `./run-pi.sh`: a
+/// launcher [`crate::event::AgentType::from_command`] cannot see through. The
+/// role still opens and still receives work, which is why this is a warning —
+/// but every readiness shortcut `delegate` has keys on the role's RESOLVED
+/// type: the wrapper that observes Codex's interface, Pi's native seed hand-off
+/// and OpenCode's declared no-signal skip. An unidentified role gets none of
+/// them and waits for the agent to announce its own session. Claude does, which
+/// is why a Claude role behind a launcher looks fine; Codex, Pi and OpenCode do
+/// not before their first task, and one day of this repository's own
+/// orchestration measured 29 of 29 delegations to them paying the full timeout.
+///
+/// Resolved through [`crate::project_config::OrchestrationRoleConfig::resolved_agent_type`],
+/// the accessor the delegate's respawn reads, so this warns for exactly the
+/// roles that take the conservative path. A declared-but-unknown name resolves
+/// to `Some(AgentType::None)` and is [`unknown_agent_issue`]'s to report, not
+/// this function's.
+fn unidentified_role_agent_issue(
+    scope: &str,
+    role: &crate::project_config::OrchestrationRoleConfig,
+) -> Option<ValidationIssue> {
+    if role.command.trim().is_empty() || role.resolved_agent_type().is_some() {
+        return None;
+    }
+    let command = bound_chars(role.command.trim(), MAX_QUOTED_VALUE_CHARS);
+    Some(ValidationIssue {
+        severity: Severity::Warning,
+        scope: scope.to_string(),
+        message: format!(
+            "role '{}': the deck cannot tell which agent `{command}` launches and the role \
+             declares no `agent` — the card gets no agent from the config, and a Codex, Pi or \
+             OpenCode worker behind it waits the full 30 s readiness timeout on every \
+             delegation. Declare it, e.g. `agent = \"codex\"`; known agents: {}",
+            bound_chars(&role.name, MAX_QUOTED_VALUE_CHARS),
             crate::agent_registry::declarable_agent_names().join(", ")
         ),
     })
@@ -935,6 +984,68 @@ mod tests {
         assert!(
             !has_errors(&validate_config(&config)),
             "an unknown agent name is advisory — the config still loads"
+        );
+    }
+
+    /// Issue #1243: a role whose command names no agent the deck recognizes,
+    /// and which declares none, is warned about — it is the configuration that
+    /// was measured paying the full 30 s readiness timeout on every delegation
+    /// to a Codex, Pi or OpenCode worker, and nothing said so. A declared role,
+    /// an inferable command and an empty command (already an error of its own)
+    /// are all silent here.
+    #[test]
+    fn role_whose_agent_cannot_be_identified_warns() {
+        let mut launcher = make_role("tester", false);
+        launcher.command = "devbox run codex-big".to_string();
+        let mut declared = make_role("reviewer", false);
+        declared.command = "devbox run pi-big".to_string();
+        declared.agent = Some("pi".to_string());
+        let inferable = make_role("orchestrator", true);
+        let mut empty = make_role("auditor", false);
+        empty.command = "  ".to_string();
+
+        let undeclared = launcher.clone();
+        let config = make_orch_config(vec![make_orchestration(
+            "orch",
+            vec![inferable, launcher, declared, empty],
+        )]);
+        let warned: Vec<String> = validate_config(&config)
+            .into_iter()
+            .filter(|i| {
+                i.severity == Severity::Warning && i.message.contains("declares no `agent`")
+            })
+            .map(|i| format!("{}|{}", i.scope, i.message))
+            .collect();
+
+        assert_eq!(
+            warned.len(),
+            1,
+            "exactly the undeclared launcher role warns; got {warned:?}"
+        );
+        let warning = &warned[0];
+        assert!(
+            warning.starts_with("orch|role 'tester':"),
+            "the warning is scoped to the orchestration and names the role; got {warning}"
+        );
+        assert!(
+            warning.contains("devbox run codex-big"),
+            "the warning quotes the command it could not see through; got {warning}"
+        );
+        assert!(
+            warning.contains("30 s") && warning.contains("agent = "),
+            "the warning names the cost and the remedy; got {warning}"
+        );
+        assert!(
+            warning.contains("codex, "),
+            "the warning lists the names the user could declare; got {warning}"
+        );
+        let advisory = make_orch_config(vec![make_orchestration(
+            "orch",
+            vec![make_role("orchestrator", true), undeclared],
+        )]);
+        assert!(
+            !has_errors(&validate_config(&advisory)),
+            "an undeclared launcher is advisory — the role still opens and still receives work"
         );
     }
 
