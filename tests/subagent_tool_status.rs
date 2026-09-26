@@ -443,3 +443,56 @@ fn subagent_004_foreground_subagent_keeps_the_turn_working_and_its_prompt_answer
         assert_eq!(active(&state).as_deref(), want_tool, "after {payload}");
     }
 }
+
+/// Scenario: The card's turn is over (Idle) when the daemon's shell-activity
+/// scan sees a detached shell command and sets a synthetic Working
+/// (`ShellBusy`). A background subagent's tool call arrives while that stands,
+/// and then the shell command finishes (`ShellIdle`). The card must return to
+/// Idle: the subagent's call says nothing about the main thread, so it must
+/// not take the synthetic Working over as its own and strand it. The control —
+/// a main-thread call in the same spot — is a real turn taking over, and the
+/// card stays Working through the `ShellIdle`.
+#[spec("status/subagent/005")]
+#[test]
+fn subagent_005_subagent_call_does_not_strand_a_synthetic_shell_working() {
+    for (trailing, from_subagent) in [
+        (subagent_pre_tool_use("toolu_bg_1", BACKGROUND_LS), true),
+        (main_pre_tool_use("toolu_main_2", BACKGROUND_LS), false),
+    ] {
+        let mut state = apply_all(
+            "claude-code",
+            &[
+                (session_start(), EventType::SessionStart),
+                (stop(), EventType::Idle),
+            ],
+        );
+        let shell = |event_type: EventType| {
+            let mut event = invoke_hook("claude-code", &stop());
+            event.event_type = event_type;
+            event
+        };
+        state.apply_event(shell(EventType::ShellBusy));
+        assert_eq!(status_of(&state), SessionStatus::Working);
+
+        let call = invoke_hook("claude-code", &trailing);
+        assert_eq!(call.is_from_subagent(), from_subagent);
+        state.apply_event(call);
+        state.apply_event(shell(EventType::ShellIdle));
+
+        let want = if from_subagent {
+            SessionStatus::Idle
+        } else {
+            SessionStatus::Working
+        };
+        assert_eq!(
+            status_of(&state),
+            want,
+            "after ShellBusy, {} ToolStart, ShellIdle",
+            if from_subagent {
+                "a subagent"
+            } else {
+                "a main-thread"
+            }
+        );
+    }
+}

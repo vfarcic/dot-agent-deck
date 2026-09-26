@@ -777,6 +777,13 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** a subagent prompt answered after the main turn already stopped — that still leaves Thinking until the next event, as it did before issue #1354.
 - **Platform coverage:** mac+linux.
 
+##### status/subagent/005 — A subagent's tool call between `ShellBusy` and `ShellIdle` does not strand the synthetic Working.
+- **Layer:** L1.
+- **Agent:** none (the `ShellBusy`/`ShellIdle` frames are daemon-synthesized in production and built directly here).
+- **Asserts:** from an Idle card, `ShellBusy` sets Working; a subagent `ToolStart` (through the real hook CLI) followed by `ShellIdle` returns the card to Idle. The control, a main-thread `ToolStart` in the same spot, takes the status over as real and the card stays Working through the `ShellIdle`.
+- **Does not assert:** the descendant scan that produces `ShellBusy` (`status/shell-activity/*`).
+- **Platform coverage:** mac+linux.
+
 ### Agent protocol
 
 #### agent/readiness

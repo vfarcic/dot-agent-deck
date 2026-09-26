@@ -10448,7 +10448,19 @@ impl AppState {
         // and permanently strand the session at `Working` (the `ShellIdle`
         // would see the marker already false and become a no-op) — exactly
         // the silent-break `#[serde(other)]` exists to prevent.
-        if !matches!(event.event_type, EventType::ShellBusy | EventType::Unknown) {
+        //
+        // Issue #1354 (Qodo on PR #1357): a SUBAGENT event that asserted no
+        // status is excluded for the same reason. It is deliberately not
+        // evidence about the main thread, so it must not adopt a synthetic
+        // Working as real: a background agent's `ToolStart` landing between a
+        // `ShellBusy` and its `ShellIdle` would otherwise turn that `ShellIdle`
+        // into a no-op and strand the card on Working — the #1354 symptom by
+        // another route. A subagent event that DID assert (its `ToolEnd`
+        // answering a `WaitingForInput`) wrote the current status, so it clears.
+        let subagent_left_status = event.is_from_subagent() && !asserted_status;
+        if !matches!(event.event_type, EventType::ShellBusy | EventType::Unknown)
+            && !subagent_left_status
+        {
             session.shell_synthetic_working = false;
         }
 
