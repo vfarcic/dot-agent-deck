@@ -35,7 +35,7 @@ export type AgentBlocked = {
   detectedAtMs: number;
   detail?: string;
 };
-export type StageStatus = "queued" | "active" | "passed" | "failed" | "waiting";
+export type StageStatus = "queued" | "active" | "passed" | "failed" | "waiting" | "blocked";
 export type PanelTab = "terminal" | "diff" | "checks" | "handoffs" | "artifacts";
 
 /**

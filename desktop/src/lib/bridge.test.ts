@@ -663,6 +663,25 @@ describe("TauriDeckBridge", () => {
     expect(mapDesktopSnapshot(cleared).agents[0]?.blocked).toBeUndefined();
   });
 
+  /**
+   * Issue #714 (review). The run graph built from the same snapshot must agree
+   * with the tile: a blocked agent is a `blocked` node, never `queued`, and it
+   * stops being one once the daemon reports it working again.
+   */
+  it("a blocked agent is a blocked run-graph node, not a queued one", async () => {
+    const { mapDesktopSnapshot } = await import("./bridge");
+    const dto = structuredClone(snapshot);
+    dto.agents[0].status = "blocked";
+    dto.agents[0].blocked = { kind: "usage_limit", detectedAtMs: 1 };
+    const mapped = mapDesktopSnapshot(dto);
+    expect(mapped.agents[0]?.status).toBe("blocked");
+    expect(mapped.stages[0]?.status).toBe("blocked");
+
+    const working = structuredClone(dto);
+    working.agents[0].status = "thinking";
+    expect(mapDesktopSnapshot(working).stages[0]?.status).toBe("active");
+  });
+
   it("sends allow_build_mismatch through the live bridge", async () => {
     const { TauriDeckBridge } = await import("./bridge");
     const bridge = new TauriDeckBridge();

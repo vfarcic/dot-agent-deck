@@ -2009,7 +2009,10 @@ export function mapDesktopSnapshot(dto: DesktopSnapshotDto, previous?: DeckSnaps
     id: `agent-${agent.id}`,
     label: agent.role,
     agentId: agent.id,
-    status: agent.status === "running" ? "active" : agent.status === "passed" ? "passed" : agent.status === "failed" ? "failed" : "queued",
+    // Issue #714: a quota-blocked agent keeps its own node state, as it does on
+    // its tile, rather than falling through to `queued` — it is alive, it is
+    // not waiting its turn, and a person has to act on it.
+    status: agent.status === "running" ? "active" : agent.status === "passed" ? "passed" : agent.status === "failed" ? "failed" : agent.status === "blocked" ? "blocked" : "queued",
     // No attempt: it was read straight off the hardcoded per-agent one, so
     // every live node claimed a retry count no daemon tracks (PRD #745 M8).
     enabled: true,

@@ -529,6 +529,7 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .node-active .node-glyph { color: var(--teal); border-color: var(--teal); background: var(--teal-soft); box-shadow: 0 0 0 3px rgb(var(--teal-rgb) / .1); }
 .node-failed .node-glyph { color: var(--red); border-color: var(--red-rim-strong); background: var(--red-soft); }
 .node-waiting .node-glyph { color: var(--amber); border-color: var(--amber-rim); background: var(--amber-soft); }
+.node-blocked .node-glyph { color: var(--red); border-color: var(--red-rim-strong); border-style: dashed; background: var(--red-soft); }
 .workflow-node.is-disabled { opacity: .42; }
 .workflow-node.is-disabled .node-glyph { border-style: dashed; }
 .workflow-empty { grid-column: 1 / -1; display: grid; place-items: center; color: var(--muted); font-size: 11px; }
