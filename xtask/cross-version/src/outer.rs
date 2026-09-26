@@ -45,12 +45,16 @@
 //! release against the release's published `checksums.txt`, and the inner half
 //! runs its `--version`. `isolation.rs` says what the namespace masks and why.
 //!
-//! **What this half does run is outside the namespace, on the host, as the
-//! operator**: `git` and `gh` to acquire the inputs, and `cargo build` — with
-//! whatever build scripts, proc macros and cargo-config linker that executes.
-//! The namespace contains the runtime scenario, not the command. `buildgate.rs`
-//! refuses, before anything is built, a branch that changes build-time code
-//! relative to its merge-base with `main`, unless `--allow-build-changes`.
+//! **The branch build runs in a second namespace, the build namespace**
+//! (`buildns.rs`, issue #1212): the gate's `cargo metadata` and the
+//! `cargo build`, each behind a probe that measures the namespace before Cargo
+//! starts. **What this half still runs on the host, as the operator**, is the
+//! input acquisition (`git`, `gh`), the toolchain lookup (`rustc --print
+//! sysroot`), the fetch phase (`cargo fetch --locked`, which runs no build
+//! code), `sha256sum`, `tar`, `date` and `bwrap`. `buildgate.rs` refuses,
+//! before anything is built, a branch that changes build-time code relative to
+//! its merge-base with `main`, unless `--allow-build-changes` — and such a
+//! branch then builds into a target dir of its own.
 //!
 //! `docs/develop/cross-version-harness.md` is the operational page: how to run
 //! it, what it isolates, and what it does not cover.
@@ -66,7 +70,7 @@ use crate::probe::Probe;
 use crate::report::{Evidence, RunVerdict};
 use crate::sandbox::{Direction, EndpointMatrix, EndpointMode, EnvSpec, Sandbox};
 use crate::{
-    buildgate, ctl, inner, isolation, previous, probe, probes, proc, report, sandbox, stub,
+    buildgate, buildns, ctl, inner, isolation, previous, probe, probes, proc, report, sandbox, stub,
 };
 
 /// The hidden flag the outer half passes to the copy of this binary it starts
@@ -91,18 +95,19 @@ const GIT_LOCATION_VARS: &[&str] = &[
 /// whoever never opens the harness doc.
 const TRUST_BOUNDARY: &str = "\
 TRUST BOUNDARY - read this before running it on code you have not reviewed.
-`cargo xver` contains its daemon/TUI/CLI runtime scenario in a private
-bubblewrap namespace and masks the current resolver's standard endpoint roots.
-It is NOT an untrusted-code sandbox: the branch build (`cargo build`, with the
-build scripts, proc macros and cargo-config linker it executes) and input
-acquisition (`git`, `gh`) run on this host, as you, with your files,
-processes, sockets and network; and the runtime namespace can still read most
-host files and connect to pathname sockets outside the masks. A branch that
-changes build-time code relative to its merge-base with `main` is refused
-before anything is built unless you pass --allow-build-changes after
-reviewing those changes; the merge-base's own build-time code runs on every
-build. Run unreviewed or external code only in a disposable VM or as a
-dedicated user holding no credentials. See docs/develop/cross-version-harness.md.";
+`cargo xver` builds the branch in a bubblewrap build namespace - no network,
+your home, /tmp, /var/tmp and /run masked, the build clone read-only, an
+allowlisted environment - and runs its daemon/TUI/CLI scenario in a second
+private namespace. It is still NOT an untrusted-code sandbox: the binary the
+branch builds runs in the runtime namespace, which masks /run/user/<uid> but
+not the rest of /run, so it can connect to host pathname sockets there (the
+Docker socket and the system D-Bus, where they exist) and elsewhere; both
+namespaces can read the rest of / ; and `git`, `gh` and the crate fetch run
+on this host. A branch that changes build-time code relative to its
+merge-base with `main` is refused unless you pass --allow-build-changes
+after reviewing those changes, and then builds into a target dir of its own.
+Run unreviewed or external code only in a disposable VM or as a dedicated
+user holding no credentials. See docs/develop/cross-version-harness.md.";
 
 /// CLAUDE.md rule 12's cross-version contract check, as a scripted PTY driver.
 #[derive(Parser, Debug)]
@@ -144,10 +149,22 @@ struct Opts {
     #[arg(long)]
     source_clone: Option<PathBuf>,
 
-    /// `CARGO_TARGET_DIR` for that clone, reused across branches so the cargo
-    /// cache survives. Defaults to `<repo parent>/dot-agent-deck-xver-target`.
+    /// `CARGO_TARGET_DIR` for branches whose build-time code is identical to
+    /// their merge-base (the mainline trust domain), reused across them so the
+    /// cargo cache survives. A branch built with `--allow-build-changes` builds
+    /// into `<this>-opted-in-<branch slug>` instead. Defaults to
+    /// `<repo parent>/dot-agent-deck-xver-target`.
     #[arg(long)]
     target_dir: Option<PathBuf>,
+
+    /// The fetch phase's Cargo home: `cargo fetch --locked` downloads the
+    /// branch's crates into it on the host, and its `registry` is bound
+    /// read-only into the build namespace, which has no network. The harness's
+    /// own — never the operator's Cargo home, and never given a configuration
+    /// or credential. Shared safely by concurrent runs (Cargo locks it).
+    /// Defaults to `<repo parent>/dot-agent-deck-xver-cargo`.
+    #[arg(long)]
+    cargo_cache: Option<PathBuf>,
 
     /// Where per-run sandboxes are created. Defaults to
     /// `<repo parent>/dot-agent-deck-xver-runs`.
@@ -196,10 +213,12 @@ struct Opts {
     /// with `main` of `--repo`.
     ///
     /// Without it such a branch is refused before `cargo build` runs, naming
-    /// the changed build-time files. `cargo build` runs on the host, outside
-    /// the namespace, so the branch's build scripts, proc macros and cargo
-    /// configuration would execute as you. Review those files first; the
-    /// evidence file records that you opted in and which files changed.
+    /// the changed build-time files. With it, the branch's build scripts, proc
+    /// macros and cargo configuration execute in the build namespace, into a
+    /// target dir of the branch's own (`<--target-dir>-opted-in-<slug>`), and
+    /// the binary they produce runs in the runtime namespace. Review those
+    /// files first; the evidence file records that you opted in, which files
+    /// changed and which target dir built the binary.
     #[arg(long)]
     allow_build_changes: bool,
 
@@ -390,6 +409,11 @@ pub fn main() -> ExitCode {
             return ExitCode::FAILURE;
         };
         return inner::main(Path::new(plan));
+    }
+    // Started by bubblewrap inside a build namespace: measure it, then exec
+    // the Cargo command that follows (`buildns.rs`).
+    if args.get(1).is_some_and(|a| a == buildns::PROBE_FLAG) {
+        return buildns::probe_main(&args[2..]);
     }
     // The `xver` alias already ends in `--`, so `cargo xver -- --branch x`
     // arrives here as `-- --branch x`, and clap reads everything after a `--`
@@ -634,24 +658,109 @@ fn old_binary(
     Ok(bin)
 }
 
-/// `cargo`, run in `dir` on the host with the caller's toolchain environment —
-/// the devbox/nix compiler wrappers need dozens of variables — minus anything
-/// credential-shaped, the deck's own pane variables and the git location
-/// variables. A denylist, so narrower than the run's own allowlist, and not a
-/// security boundary: whatever cargo executes runs as the operator.
-fn host_cargo(dir: &Path) -> Command {
-    let mut cmd = Command::new("cargo");
-    cmd.current_dir(dir);
-    for (k, _) in std::env::vars_os() {
-        let name = k.to_string_lossy();
-        if sandbox::credential_like(&name)
-            || name.starts_with("DOT_AGENT_DECK_")
-            || GIT_LOCATION_VARS.contains(&name.as_ref())
-        {
-            cmd.env_remove(&k);
+/// The file a build clone this harness created carries in its `.git`. Its
+/// absence means the clone predates the build namespace (issue #1212), when an
+/// opted-in branch's build ran on the host with write access to the clone —
+/// including its hooks and git configuration, which the harness's own `git`
+/// commands then honour — so the harness no longer builds in it.
+const CLONE_MARKER: &str = "xver-namespaced-build-clone";
+
+/// The file a target dir this harness prepared carries: the trust domain it
+/// serves ([`Domain`]). A target dir with no marker predates the build
+/// namespace, when an opted-in build could write into the one shared target dir
+/// and leave artifacts — build-script binaries included — that later builds
+/// reuse.
+const DOMAIN_MARKER: &str = ".xver-trust-domain";
+
+/// Which target dir builds the branch, decided by the build-time gate.
+///
+/// Build code can write only into the target dir it is given, so giving an
+/// opted-in branch a target dir of its own is what stops its build from
+/// poisoning a later one: nothing it wrote is ever bound into another domain's
+/// build, while each domain keeps its warm fingerprints.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Domain {
+    /// The branch's build-time code is identical to its merge-base with `main`:
+    /// the shared `--target-dir`, reused across every such branch.
+    Mainline,
+    /// The branch changes build-time code and the caller opted in: a target dir
+    /// of this branch's own, beside the shared one.
+    OptedIn,
+}
+
+impl Domain {
+    fn of(changes: &[(String, String)]) -> Self {
+        if changes.is_empty() {
+            Domain::Mainline
+        } else {
+            Domain::OptedIn
         }
     }
-    cmd
+
+    fn dir(self, base: &Path, slug: &str) -> PathBuf {
+        match self {
+            Domain::Mainline => base.to_path_buf(),
+            Domain::OptedIn => {
+                let mut s = base.as_os_str().to_owned();
+                s.push(format!("-opted-in-{slug}"));
+                PathBuf::from(s)
+            }
+        }
+    }
+
+    fn label(self, branch: &str) -> String {
+        match self {
+            Domain::Mainline => "mainline".to_string(),
+            Domain::OptedIn => format!("opted-in {branch}"),
+        }
+    }
+}
+
+/// Make `dir` ready to serve the domain `label`: adopt it when it is absent or
+/// empty, keep it when its marker names `label`, and refuse anything else.
+fn prepare_domain_dir(dir: &Path, label: &str) -> Result<(), String> {
+    let marker = dir.join(DOMAIN_MARKER);
+    match std::fs::read_to_string(&marker) {
+        Ok(got) if got.trim_end() == label => return Ok(()),
+        Ok(got) => {
+            return Err(format!(
+                "the target dir {} serves the trust domain `{}`, not `{label}`; a target dir \
+                 serves one domain only",
+                dir.display(),
+                got.trim_end()
+            ));
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("read {}: {e}", marker.display())),
+    }
+    match std::fs::read_dir(dir) {
+        Ok(mut entries) => {
+            if entries.next().is_some() {
+                return Err(format!(
+                    "the target dir {} carries no `{DOMAIN_MARKER}`: it predates the build \
+                     namespace (issue #1212), when an opted-in branch's build ran on the host \
+                     and could leave artifacts in it that later builds reuse. Remove it and let \
+                     the harness recreate it (its first build is cold), or pass --target-dir at \
+                     a path that does not exist",
+                    dir.display()
+                ));
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+        }
+        Err(e) => return Err(format!("read {}: {e}", dir.display())),
+    }
+    std::fs::write(&marker, format!("{label}\n"))
+        .map_err(|e| format!("write {}: {e}", marker.display()))
+}
+
+/// The branch name with everything but ASCII alphanumerics replaced by `-`.
+fn branch_slug(branch: &str) -> String {
+    branch
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect()
 }
 
 /// Point the standalone build clone at `origin/<branch>` and build it.
@@ -675,10 +784,17 @@ fn host_cargo(dir: &Path) -> Command {
 /// `cargo build` runs, unless `--allow-build-changes`. A gate that could not be
 /// evaluated refuses too. `scratch` is where the merge-base's tree is extracted
 /// for `cargo metadata`, and removed again.
+///
+/// Every Cargo command that reads the branch's or the merge-base's tree runs in
+/// a build namespace (`buildns.rs`): the gate's `cargo metadata` and the
+/// `cargo build`. The fetch phase in between runs on the host, from `/`, with
+/// the harness's own Cargo home at `cargo_cache`. The gate's answer picks the
+/// trust domain, and so the target dir, the build writes into.
 fn new_binary(
     opts: &Opts,
     clone: &Path,
-    target_dir: &Path,
+    target_base: &Path,
+    cargo_cache: &Path,
     scratch: &Path,
     ev: &mut Evidence,
 ) -> Result<(PathBuf, String), String> {
@@ -718,6 +834,23 @@ fn new_binary(
     }
     if !md.file_type().is_dir() {
         return Err(format!("{} is not a directory", dotgit.display()));
+    }
+    let marker = dotgit.join(CLONE_MARKER);
+    if fresh {
+        std::fs::write(
+            &marker,
+            "created by `cargo xver`, whose builds run with this clone bound read-only (#1212)\n",
+        )
+        .map_err(|e| format!("write {}: {e}", marker.display()))?;
+    } else if std::fs::symlink_metadata(&marker).is_err() {
+        return Err(format!(
+            "the build clone {} carries no `.git/{CLONE_MARKER}`: it predates the build namespace \
+             (issue #1212), when an opted-in branch's build ran on the host with write access to \
+             the clone — its hooks and git configuration among it, which the harness's own `git` \
+             commands honour. Remove it and let the harness re-create it, or pass --source-clone \
+             at a path that does not exist",
+            clone.display()
+        ));
     }
     let canon_dotgit = std::fs::canonicalize(&dotgit).map_err(|e| format!("{e}"))?;
     for (flag, what) in [
@@ -791,21 +924,52 @@ fn new_binary(
          {sha}",
         clone.display()
     ));
+    let clone = std::fs::canonicalize(clone)
+        .map_err(|e| format!("canonicalize {}: {e}", clone.display()))?;
+
+    let host = buildns::Host::capture(sandbox::current_uid())?;
+    let tc = buildns::resolve_toolchain()?;
+    println!("xver: {}", tc.describe());
+    ev.build.push(tc.describe());
 
     println!(
         "xver: build-time gate — comparing `{}` with its merge-base with `origin/{}`",
         opts.branch,
         buildgate::BASE_BRANCH
     );
-    let (cmp, changes) = buildgate::evaluate(
-        clone,
-        &opts.repo,
-        &base_sha,
-        &sha,
-        scratch,
-        &git,
-        &host_cargo,
-    )?;
+    let (cmp, changes) = {
+        let notes = std::cell::RefCell::new(Vec::new());
+        let metadata = |dir: &Path, args: &[String]| -> Result<Vec<u8>, String> {
+            let plan = buildns::metadata_plan(&host, &tc, dir, buildns::host_sockets()?);
+            let mut cmd = vec![tc.cargo.display().to_string()];
+            cmd.extend(args.iter().cloned());
+            let run = buildns::run(&plan, &host.harness, &cmd)?;
+            let mut notes = notes.borrow_mut();
+            if notes.is_empty() {
+                notes.push(format!(
+                    "the build-time gate's `cargo metadata --no-deps` ran in a build namespace, \
+                     not on the host — {}",
+                    buildns::describe(&plan.shape)
+                ));
+                notes.extend(
+                    run.report
+                        .notes
+                        .iter()
+                        .map(|n| format!("metadata namespace: {n}")),
+                );
+                notes.push(format!(
+                    "metadata namespace: no process outlived its PID namespace {}",
+                    run.report.pid_ns
+                ));
+            }
+            Ok(run.stdout)
+        };
+        let out = buildgate::evaluate(
+            &clone, &opts.repo, &base_sha, &sha, scratch, &git, &metadata,
+        )?;
+        ev.build.extend(notes.into_inner());
+        out
+    };
     let gate = buildgate::decide(
         &opts.branch,
         &changes,
@@ -817,21 +981,83 @@ fn new_binary(
     ev.build_time = gate.clone();
     ev.preflight.push(gate);
 
+    let domain = Domain::of(&changes);
+    let target = domain.dir(target_base, &branch_slug(&opts.branch));
+    prepare_domain_dir(&target, &domain.label(&opts.branch))?;
+    let target = std::fs::canonicalize(&target)
+        .map_err(|e| format!("canonicalize {}: {e}", target.display()))?;
+    let domain_line = match domain {
+        Domain::Mainline => format!(
+            "trust domain: **mainline** — the branch's build-time code is identical to its \
+             merge-base, so it builds in the shared target dir `{}`, which only such builds are \
+             given",
+            target.display()
+        ),
+        Domain::OptedIn => format!(
+            "trust domain: **opted-in** — the branch changes build-time code, so it builds in a \
+             target dir of its own, `{}`, which is never bound into another branch's build; no \
+             other target dir is bound into this one",
+            target.display()
+        ),
+    };
+    println!("xver: {domain_line}");
+    ev.build.push(domain_line);
+
     if !opts.skip_build {
-        // The branch's build scripts, proc macros and cargo-config linker run
-        // here, outside the namespace, as the operator (`host_cargo`). The gate
-        // above is what stands between a branch's own build-time code and this
-        // line; mainline's runs regardless.
-        let mut cmd = host_cargo(clone);
-        cmd.env("CARGO_TARGET_DIR", target_dir).args([
-            "build",
-            "--locked",
-            "--bin",
-            "dot-agent-deck",
-        ]);
-        must_run(&mut cmd, "cargo build --locked --bin dot-agent-deck")?;
+        std::fs::create_dir_all(cargo_cache)
+            .map_err(|e| format!("create {}: {e}", cargo_cache.display()))?;
+        let cargo_cache = std::fs::canonicalize(cargo_cache)
+            .map_err(|e| format!("canonicalize {}: {e}", cargo_cache.display()))?;
+        println!(
+            "xver: fetch phase — cargo fetch --locked into {}",
+            cargo_cache.display()
+        );
+        ev.build.extend(buildns::fetch(
+            &tc,
+            &cargo_cache,
+            &clone.join("Cargo.toml"),
+        )?);
+        let plan = buildns::build_plan(
+            &host,
+            &tc,
+            &clone,
+            &target,
+            &cargo_cache,
+            buildns::host_sockets()?,
+        )?;
+        ev.build.push(format!(
+            "the branch build ran in a build namespace, not on the host — {}",
+            buildns::describe(&plan.shape)
+        ));
+        println!("xver: building in the build namespace (no network, clone read-only)");
+        let started = Instant::now();
+        let run = buildns::run(
+            &plan,
+            &host.harness,
+            &[
+                tc.cargo.display().to_string(),
+                "build".into(),
+                "--locked".into(),
+                "--offline".into(),
+                "--bin".into(),
+                "dot-agent-deck".into(),
+            ],
+        )?;
+        ev.build.extend(
+            run.report
+                .notes
+                .iter()
+                .map(|n| format!("build namespace: {n}")),
+        );
+        ev.build.push(format!(
+            "`cargo build --locked --offline --bin dot-agent-deck` succeeded in {:.1}s; no \
+             process outlived the build's PID namespace {}",
+            started.elapsed().as_secs_f64(),
+            run.report.pid_ns
+        ));
+        ev.build.push(buildns::LINK_POOL_NOTE.to_string());
     }
-    let bin = target_dir.join("debug").join("dot-agent-deck");
+    let bin = target.join("debug").join("dot-agent-deck");
     if !bin.exists() {
         return Err(format!("no branch binary at {}", bin.display()));
     }
@@ -1002,6 +1228,10 @@ fn run_one(
         .releases_dir
         .clone()
         .unwrap_or_else(|| parent.join("dot-agent-deck-xver-releases"));
+    let cargo_cache = opts
+        .cargo_cache
+        .clone()
+        .unwrap_or_else(|| parent.join("dot-agent-deck-xver-cargo"));
     let uid = sandbox::current_uid();
     let (user, _) = sandbox::passwd_entry().ok_or("this uid has no password-database entry")?;
     let mode = match opts.endpoint_mode {
@@ -1034,7 +1264,8 @@ fn run_one(
             }
         },
         namespace: "one private bubblewrap namespace for every deck process of the runtime \
-                    scenario (the build and input acquisition ran on the host) — \
+                    scenario (the build ran in a build namespace of its own — see Build — and \
+                    input acquisition on the host) — \
                     private mount, PID, network, IPC, UTS and user namespaces; BOTH endpoint \
                     roots masked (`/tmp` and `/run/user/<uid>` are sandbox directories), \
                     `/var/tmp` masked, the operator's home an empty tmpfs, the rest of `/` \
@@ -1059,6 +1290,10 @@ fn run_one(
     ev.preflight.push(format!(
         "cargo target dir: {}",
         sandbox::require_disk_backed("cargo target dir", &target_dir, opts.min_free_gib)?
+    ));
+    ev.preflight.push(format!(
+        "fetch-phase Cargo home: {}",
+        sandbox::require_disk_backed("fetch-phase Cargo home", &cargo_cache, opts.min_free_gib)?
     ));
     let smoke = isolation::bwrap_smoke()?;
     let outer_mnt = proc::namespace("self", "mnt").ok_or("cannot read /proc/self/ns/mnt")?;
@@ -1095,14 +1330,11 @@ fn run_one(
 
     println!("xver ({}): inputs", direction.name());
     let old_src = old_binary(opts, &previous.tag, &releases, &mut ev)?;
-    let (new_src, head_sha) = new_binary(opts, &clone, &target_dir, &runs_root, &mut ev)?;
+    let (new_src, head_sha) =
+        new_binary(opts, &clone, &target_dir, &cargo_cache, &runs_root, &mut ev)?;
     ev.head_sha = head_sha;
 
-    let slug: String = opts
-        .branch
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-        .collect();
+    let slug = branch_slug(&opts.branch);
     let sb_name = match direction {
         Direction::Forward => format!("{slug}-{}", epoch_secs()),
         Direction::Reverse => format!("{slug}-rev-{}", epoch_secs()),
@@ -2183,6 +2415,66 @@ mod skip_build_tests {
         for raw in ["", "not json", r#"{"ok":true}"#] {
             let note = skip_build_note(HEAD, raw);
             assert!(note.contains("NOT knowable"), "{raw:?}: {note}");
+        }
+    }
+}
+
+/// The trust domains (issue #1212): which target dir a build is given.
+#[cfg(test)]
+mod domain_tests {
+    use super::*;
+
+    fn scratch_dir(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("xver-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        d
+    }
+
+    #[test]
+    fn an_opted_in_branch_gets_a_target_dir_of_its_own_beside_the_shared_one() {
+        let base = Path::new("/w/dot-agent-deck-xver-target");
+        let changed = vec![("build.rs".to_string(), "a build script".to_string())];
+        assert_eq!(Domain::of(&[]), Domain::Mainline);
+        assert_eq!(Domain::of(&changed), Domain::OptedIn);
+        assert_eq!(Domain::Mainline.dir(base, "x"), base);
+        let own = Domain::OptedIn.dir(base, &branch_slug("renovate/lock-file"));
+        assert_eq!(
+            own,
+            PathBuf::from("/w/dot-agent-deck-xver-target-opted-in-renovate-lock-file")
+        );
+        assert!(
+            !own.starts_with(base) && !base.starts_with(&own),
+            "the two domains' dirs must not nest, or one build's bind would reach the other"
+        );
+        assert_ne!(Domain::Mainline.label("b"), Domain::OptedIn.label("b"));
+    }
+
+    #[test]
+    fn a_target_dir_is_adopted_only_when_absent_or_empty_and_then_serves_one_domain() {
+        let absent = scratch_dir("domain-absent");
+        prepare_domain_dir(&absent, "mainline").expect("an absent dir is created");
+        prepare_domain_dir(&absent, "mainline").expect("its own domain again");
+        let e = prepare_domain_dir(&absent, "opted-in x").unwrap_err();
+        assert!(e.contains("serves the trust domain `mainline`"), "{e}");
+
+        let empty = scratch_dir("domain-empty");
+        std::fs::create_dir_all(&empty).expect("dir");
+        prepare_domain_dir(&empty, "opted-in x").expect("an empty dir is adopted");
+        assert_eq!(
+            std::fs::read_to_string(empty.join(DOMAIN_MARKER)).expect("marker"),
+            "opted-in x\n"
+        );
+
+        let legacy = scratch_dir("domain-legacy");
+        std::fs::create_dir_all(legacy.join("debug")).expect("dir");
+        let e = prepare_domain_dir(&legacy, "mainline").unwrap_err();
+        assert!(e.contains("predates the build namespace"), "{e}");
+        assert!(
+            !legacy.join(DOMAIN_MARKER).exists(),
+            "a refused dir is left untouched"
+        );
+        for d in [absent, empty, legacy] {
+            let _ = std::fs::remove_dir_all(d);
         }
     }
 }

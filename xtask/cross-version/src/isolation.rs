@@ -94,7 +94,8 @@ pub struct Plan {
     /// exact value (see `sandbox::check_env`).
     pub extra_env: Vec<(String, String)>,
     /// The exact environment every process of the runtime scenario gets — not
-    /// the outer half's `git`, `gh` and `cargo`, which run on the host.
+    /// the outer half's `git`, `gh` and `cargo fetch`, which run on the host,
+    /// nor the build namespace's, which `buildns::env_for` builds.
     pub env: Vec<(String, String)>,
     /// Every endpoint matrix the daemon may legitimately bind; the inner half
     /// selects one from the kernel's table once the daemon is up (see
@@ -392,13 +393,19 @@ fn unescape_mount_path(field: &str) -> String {
 /// private `/proc` and the `/dev` bwrap builds. What remains is what the
 /// read-only `/` did not reach — reported, not proven unwritable.
 pub fn residual_rw_mounts(mountinfo: &str, plan: &Plan) -> Vec<String> {
-    let own = |mp: &Path| {
+    residual_rw_mounts_where(mountinfo, |mp: &Path| {
         mp.starts_with(&plan.root)
             || plan.masks.iter().any(|m| mp == m.target)
             || plan.masked_home.as_deref() == Some(mp)
             || mp == Path::new("/proc")
             || mp.starts_with("/dev")
-    };
+    })
+}
+
+/// The mount points in `mountinfo` still mounted `rw` for which `own` is false.
+/// Shared by the runtime namespace ([`residual_rw_mounts`]) and the build
+/// namespace (`buildns.rs`), each with its own idea of which mounts are its own.
+pub fn residual_rw_mounts_where(mountinfo: &str, own: impl Fn(&Path) -> bool) -> Vec<String> {
     let mut out = Vec::new();
     for line in mountinfo.lines() {
         let fields: Vec<&str> = line.split_whitespace().collect();
