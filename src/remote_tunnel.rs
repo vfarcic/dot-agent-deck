@@ -3004,18 +3004,24 @@ mod tests {
         String::from_utf8_lossy(&output.stdout).trim().to_string()
     }
 
-    /// A `PATH` holding `id` and nothing else, and the directory keeping it
-    /// alive. The fallback rungs call `id -u`, so the probe needs a PATH; a
+    /// A `PATH` holding `id` (a link to the one this process would run) and
+    /// nothing else, and the directory keeping it alive. The fallback rungs call `id -u`, so the probe needs a PATH; a
     /// system one such as `/usr/bin:/bin` would still let a deck installed
     /// there answer the resolver rung instead of the rung under test.
     #[cfg(unix)]
     pub(super) fn deckless_path() -> (tempfile::TempDir, String) {
         let shim = tempfile::tempdir().expect("a PATH shim directory");
-        let id = ["/usr/bin/id", "/bin/id"]
+        // `id` from this process's own PATH, wherever that layout keeps it
+        // (a Nix profile, say), and the two conventional places otherwise.
+        let id = std::env::var_os("PATH")
+            .map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
+            .unwrap_or_default()
             .into_iter()
-            .find(|candidate| std::path::Path::new(candidate).exists())
-            .expect("an `id` binary at /usr/bin/id or /bin/id");
-        std::os::unix::fs::symlink(id, shim.path().join("id")).expect("link `id` into the shim");
+            .map(|dir| dir.join("id"))
+            .chain(["/usr/bin/id", "/bin/id"].map(std::path::PathBuf::from))
+            .find(|candidate| candidate.is_file())
+            .expect("an `id` binary on PATH, at /usr/bin/id or at /bin/id");
+        std::os::unix::fs::symlink(&id, shim.path().join("id")).expect("link `id` into the shim");
         let path = shim.path().to_str().expect("a UTF-8 temp path").to_string();
         (shim, path)
     }

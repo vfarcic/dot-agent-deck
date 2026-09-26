@@ -607,8 +607,12 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
   */
   const browse = useRef({ showHidden, filter, supports: new Set<string>() });
   browse.current = { showHidden, filter, supports: new Set(choices.flatMap((choice) => (choice.listingOptions ? [choice.deckId] : []))) };
-  /** Issue #1240: where a search that lands after a Show hidden reload should put the cursor. */
-  const searchFocus = useRef<Focus | undefined>(undefined);
+  /**
+   * Issue #1240: where a search that lands after a Show hidden reload should
+   * put the cursor — and the cursor that reload left, so a user who has moved
+   * since is not moved back.
+   */
+  const searchFocus = useRef<{ focus: Focus; cursor: number } | undefined>(undefined);
 
   /**
    * List `path` on the captured deck (its home when absent), then put the
@@ -652,11 +656,12 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
       setSearched(undefined);
       setSearchError(undefined);
       const focus = typeof focusPath === "string" ? { path: focusPath } : focusPath;
-      searchFocus.current = keepFilter ? focus : undefined;
       const shown = filterDirectoryEntries(reply.entries, kept);
       const offset = reply.parent === undefined ? 0 : 1;
       const focused = focusIndex(shown, focus);
-      setCursor(focused >= 0 ? focused + offset : shown.length > 0 ? offset : 0);
+      const landed = focused >= 0 ? focused + offset : shown.length > 0 ? offset : 0;
+      searchFocus.current = keepFilter && focus ? { focus, cursor: landed } : undefined;
+      setCursor(landed);
       return { kind: "listed", listing: reply };
     } catch (cause) {
       if (seq !== listingSeq.current) return { kind: "stale" };
@@ -946,11 +951,13 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
           setSearched({ path, filter: wanted, listing: reply });
           const offset = listing.parent === undefined ? 0 : 1;
           const shown = filterDirectoryEntries(reply.entries, wanted);
-          const focused = focusIndex(shown, searchFocus.current);
+          const pending = searchFocus.current;
           searchFocus.current = undefined;
-          // On the row a Show hidden reload was on, or else where the cursor
-          // was, kept inside the rows this answer leaves.
-          setCursor((current) => (focused >= 0 ? focused + offset : Math.max(0, Math.min(current, shown.length + offset - 1))));
+          const focused = focusIndex(shown, pending?.focus);
+          // On the row a Show hidden reload was on — unless the user has
+          // moved since that reload — or else where the cursor is, kept inside
+          // the rows this answer leaves.
+          setCursor((current) => (focused >= 0 && pending?.cursor === current ? focused + offset : Math.max(0, Math.min(current, shown.length + offset - 1))));
         } catch (cause) {
           if (seq !== searchSeq.current) return;
           const message = messageOf(cause);

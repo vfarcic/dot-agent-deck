@@ -655,6 +655,38 @@ describe("New agent dialog — hidden, symlinked and past-the-cap directories (i
   });
 
   /**
+   * Scenario (review of #1332): Show hidden re-runs a deck search that is slow
+   * to answer, and the user moves the cursor while it is out. When it lands
+   * the cursor stays where the user put it, rather than going back to the row
+   * the toggle was on.
+   */
+  it("does not undo a cursor move made while a Show hidden search was out", async () => {
+    let release: () => void = () => undefined;
+    const found = { path: "/zulu", displayName: "zulu-target", isProject: false };
+    const hidden = { path: "/home/dev/.zeta", displayName: ".zeta", isProject: false };
+    const answer = (entries: typeof found[]): DeckDirectoryListing => ({ kind: "listing", path: "/home/dev", displayPath: "/home/dev", parent: "/canonical-parent-of-home", entries, truncated: false });
+    const search = truncatedHome({
+      onSearch: (options) => (options.includeHidden ? new Promise((resolve) => { release = () => resolve(answer([hidden, found])); }) : Promise.resolve(answer([found]))),
+    });
+    renderDialog(fakeRuntime({ fleet: [deck(LOCAL, { deckKind: "local", listingOptions: true })], listDirectories: search }));
+    await currentPath("/home/dev");
+    // `e` also matches both of HOME's own entries, so the reload leaves rows to move among.
+    fireEvent.change(screen.getByTestId("new-agent-filter"), { target: { value: "e" } });
+    await waitFor(() => expect(rowPaths()).toEqual(["/canonical-parent-of-home", "/zulu"]));
+    fireEvent.keyDown(directoryList(), { key: "j" });
+    expect(activeRow()).toBe("/zulu");
+
+    fireEvent.click(screen.getByTestId("new-agent-show-hidden"));
+    await waitFor(() => expect(search).toHaveBeenLastCalledWith(LOCAL, "/home/dev", { includeSymlinks: true, includeHidden: true, filter: "e" }));
+    fireEvent.keyDown(directoryList(), { key: "k" });
+    const moved = activeRow();
+    expect(moved).toBe("/canonical-parent-of-home");
+    await act(async () => release());
+    await waitFor(() => expect(rowPaths()).toContain("/home/dev/.zeta"));
+    expect(activeRow()).toBe(moved);
+  });
+
+  /**
    * Scenario (review of #1332): the cursor is on the third row of the
    * truncated listing when a one-match search lands. The cursor stays on a
    * row that exists, so Enter still opens something.
