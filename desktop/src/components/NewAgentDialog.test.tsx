@@ -1,10 +1,10 @@
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import { createFixtureSnapshot, createFixtureStartedAgent } from "../data/fixture";
-import type { AgentSession, ConnectionView, DeckDirectoryListing, DeckSnapshot, NewAgentOptions, NewAgentOrchestrations } from "../types";
+import type { AgentSession, ConnectionView, DeckDirectoryListing, DeckListingOptions, DeckSnapshot, NewAgentOptions, NewAgentOrchestrations } from "../types";
 import { LaunchCleanupError } from "../lib/actionError";
 import type { NewAgentDraft } from "../lib/newAgentDraft";
-import { NewAgentDialog, DRAFT_DIRECTORY_GONE, DRAFT_MODE_GONE, DRAFT_RESTORED, draftDeckGone, draftOtherDeck, type NewAgentRuntime } from "./NewAgentDialog";
+import { NewAgentDialog, DECK_SEARCH_DEBOUNCE_MS, SEARCH_TRUNCATED, TRUNCATED_NO_SEARCH, TRUNCATED_SEARCHABLE, DRAFT_DIRECTORY_GONE, DRAFT_MODE_GONE, DRAFT_RESTORED, draftDeckGone, draftOtherDeck, type NewAgentRuntime } from "./NewAgentDialog";
 
 const LOCAL = "deck-000000000000aaaa";
 const REMOTE = "deck-000000000000bbbb";
@@ -442,6 +442,331 @@ describe("New agent dialog — directory browser (PRD #1223 M4)", () => {
     expect(hint.textContent ?? "").not.toMatch(/type/i);
     expect(screen.queryByTestId("new-agent-path")).toBeNull();
     expect(screen.queryByRole("textbox", { name: "Path" })).toBeNull();
+  });
+});
+
+describe("New agent dialog — hidden, symlinked and past-the-cap directories (issue #1240)", () => {
+  /** HOME as a deck at this build answers it: a symlinked entry among the real ones, a hidden one only when asked for. */
+  const widenedHome = (options?: DeckListingOptions): DeckDirectoryListing => {
+    const home = structuredClone(TREE[""]);
+    if (home.kind !== "listing") throw new Error("fixture");
+    const entries = [...home.entries];
+    if (options?.includeHidden) entries.unshift({ path: "/home/dev/.config", displayName: ".config", isProject: false });
+    if (options?.includeSymlinks) entries.push({ path: "/elsewhere/work", displayName: "linked-work", isProject: false, isSymlink: true });
+    return { ...home, entries };
+  };
+  const optionsRuntime = () => fakeRuntime({
+    fleet: [deck(LOCAL, { deckKind: "local", listingOptions: true }), deck(REMOTE, { status: "disconnected" })],
+    listDirectories: vi.fn(async (_deckId: string, path?: string, options?: DeckListingOptions): Promise<DeckDirectoryListing> => {
+      if (path === undefined || path === "/home/dev") return widenedHome(options);
+      if (path === "/elsewhere/work") return { kind: "listing", path, displayPath: path, parent: "/elsewhere", entries: [], truncated: false };
+      const listing = TREE[path];
+      if (!listing) throw new Error("daemon returned error: unresolved: that path did not resolve to a readable directory on this daemon");
+      return structuredClone(listing);
+    }),
+  });
+  const rowPaths = () => within(directoryList()).getAllByRole("option").map((row) => row.getAttribute("data-path"));
+
+  /**
+   * Scenario: on a deck that honours listing options, the browser asks for
+   * symlinked directories from the first listing, and a symlink shows as a
+   * `link` row whose path is where it leads; opening it lists that target.
+   */
+  it("lists a symlinked directory as a link row that opens its target", async () => {
+    const runtime = optionsRuntime();
+    renderDialog(runtime);
+    await currentPath("/home/dev");
+
+    expect(runtime.listDirectories).toHaveBeenCalledWith(LOCAL, undefined, { includeSymlinks: true });
+    const link = within(directoryList()).getByText("linked-work").closest("[role='option']") as HTMLElement;
+    expect(link).toHaveAttribute("data-path", "/elsewhere/work");
+    expect(within(link).getByTestId("new-agent-link-mark")).toHaveTextContent("link");
+    expect(screen.getAllByTestId("new-agent-link-mark")).toHaveLength(1);
+
+    fireEvent.click(link);
+    await currentPath("/elsewhere/work");
+    expect(runtime.listDirectories).toHaveBeenLastCalledWith(LOCAL, "/elsewhere/work", { includeSymlinks: true });
+  });
+
+  /**
+   * Scenario: Show hidden lists the directory again with `.`-named
+   * directories, and turning it off (here with the list's `.` key) lists it
+   * without them again.
+   */
+  it("shows hidden directories when Show hidden is on, by click or by the . key", async () => {
+    const runtime = optionsRuntime();
+    renderDialog(runtime);
+    await currentPath("/home/dev");
+    expect(rowPaths()).not.toContain("/home/dev/.config");
+
+    fireEvent.click(screen.getByTestId("new-agent-show-hidden"));
+    await waitFor(() => expect(rowPaths()).toContain("/home/dev/.config"));
+    expect(screen.getByTestId("new-agent-show-hidden")).toBeChecked();
+    expect(runtime.listDirectories).toHaveBeenLastCalledWith(LOCAL, "/home/dev", { includeSymlinks: true, includeHidden: true });
+
+    fireEvent.keyDown(directoryList(), { key: "." });
+    await waitFor(() => expect(rowPaths()).not.toContain("/home/dev/.config"));
+    expect(screen.getByTestId("new-agent-show-hidden")).not.toBeChecked();
+    expect(runtime.listDirectories).toHaveBeenLastCalledWith(LOCAL, "/home/dev", { includeSymlinks: true });
+  });
+
+  /**
+   * Scenario: a deck without listing options is browsed as PRD #1223 did —
+   * no Show hidden control, no options sent, `.` does nothing, and a
+   * truncated listing's filter stays on this side with the old hint.
+   */
+  it("offers none of it on a deck that does not honour listing options", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const runtime = fakeRuntime({
+        listDirectories: vi.fn(async (): Promise<DeckDirectoryListing> => ({ ...structuredClone(TREE[""]), truncated: true })),
+      });
+      renderDialog(runtime);
+      await currentPath("/home/dev");
+
+      expect(screen.queryByTestId("new-agent-show-hidden")).toBeNull();
+      expect(runtime.listDirectories).toHaveBeenCalledWith(LOCAL, undefined);
+      expect(screen.getByTestId("new-agent-truncated")).toHaveTextContent(TRUNCATED_NO_SEARCH);
+      fireEvent.keyDown(directoryList(), { key: "." });
+      fireEvent.change(screen.getByTestId("new-agent-filter"), { target: { value: "zulu" } });
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(DECK_SEARCH_DEBOUNCE_MS * 4);
+      });
+      expect(runtime.listDirectories).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  /**
+   * Scenario: the deck's cap truncated HOME, and the directory wanted sorts
+   * past it. The hint says a filter searches the deck; typing one asks the
+   * deck — once typing pauses — to search HOME with that filter before its
+   * cap, and the directory it finds can be opened. A search the deck's cap
+   * truncates again says to narrow the filter.
+   */
+  it("searches the deck with the filter when its cap truncated the listing", async () => {
+    const search = vi.fn(async (_deckId: string, path?: string, options?: DeckListingOptions): Promise<DeckDirectoryListing> => {
+      const home = { ...structuredClone(TREE[""]), truncated: true } as DeckDirectoryListing;
+      if (path === "/zulu") return { kind: "listing", path, displayPath: path, parent: "/", entries: [], truncated: false };
+      if (!options?.filter) return home;
+      if (options.filter === "zu") {
+        return { kind: "listing", path: "/home/dev", displayPath: "/home/dev", parent: "/canonical-parent-of-home", entries: [{ path: "/home/dev/zulu-a", displayName: "zulu-a", isProject: false }], truncated: true };
+      }
+      return { kind: "listing", path: "/home/dev", displayPath: "/home/dev", parent: "/canonical-parent-of-home", entries: [{ path: "/zulu", displayName: "zulu-target", isProject: false }], truncated: false };
+    });
+    const runtime = fakeRuntime({ fleet: [deck(LOCAL, { deckKind: "local", listingOptions: true })], listDirectories: search });
+    renderDialog(runtime);
+    await currentPath("/home/dev");
+    expect(screen.getByTestId("new-agent-truncated")).toHaveTextContent(TRUNCATED_SEARCHABLE);
+
+    fireEvent.change(screen.getByTestId("new-agent-filter"), { target: { value: "zu" } });
+    expect(await screen.findByTestId("new-agent-searching")).toBeVisible();
+    await waitFor(() => expect(rowPaths()).toContain("/home/dev/zulu-a"));
+    expect(search).toHaveBeenLastCalledWith(LOCAL, "/home/dev", { includeSymlinks: true, filter: "zu" });
+    expect(screen.getByTestId("new-agent-truncated")).toHaveTextContent(SEARCH_TRUNCATED);
+
+    fireEvent.change(screen.getByTestId("new-agent-filter"), { target: { value: "zulu-t" } });
+    await waitFor(() => expect(rowPaths()).toEqual(["/canonical-parent-of-home", "/zulu"]));
+    expect(search).toHaveBeenLastCalledWith(LOCAL, "/home/dev", { includeSymlinks: true, filter: "zulu-t" });
+    expect(screen.queryByTestId("new-agent-truncated")).toBeNull();
+    expect(screen.queryByTestId("new-agent-searching")).toBeNull();
+
+    fireEvent.click(within(directoryList()).getByText("zulu-target"));
+    await currentPath("/zulu");
+  });
+
+  /** A truncated HOME whose deck-side search finds `zulu-target` for any filter, honouring Show hidden. */
+  const truncatedHome = (overrides: { onSearch?: (options: DeckListingOptions) => Promise<DeckDirectoryListing> } = {}) =>
+    vi.fn(async (_deckId: string, _path?: string, options?: DeckListingOptions): Promise<DeckDirectoryListing> => {
+      if (!options?.filter) return { ...structuredClone(TREE[""]), truncated: true } as DeckDirectoryListing;
+      if (overrides.onSearch) return overrides.onSearch(options);
+      const entries = [{ path: "/zulu", displayName: "zulu-target", isProject: false }];
+      if (options.includeHidden) entries.unshift({ path: "/home/dev/.zulu", displayName: ".zulu", isProject: false });
+      return { kind: "listing", path: "/home/dev", displayPath: "/home/dev", parent: "/canonical-parent-of-home", entries, truncated: false };
+    });
+
+  /**
+   * Scenario (review of #1332): a deck search is in flight when the user
+   * clears the filter with Escape, and it then fails. The unfiltered listing
+   * is back on screen and shows no error for a search nobody is waiting for.
+   */
+  it("drops a search the filter was cleared under, failure included", async () => {
+    let fail: (reason: Error) => void = () => undefined;
+    const search = truncatedHome({ onSearch: () => new Promise((_resolve, reject) => { fail = reject; }) });
+    renderDialog(fakeRuntime({ fleet: [deck(LOCAL, { deckKind: "local", listingOptions: true })], listDirectories: search }));
+    await currentPath("/home/dev");
+
+    const filter = screen.getByTestId("new-agent-filter");
+    fireEvent.change(filter, { target: { value: "zu" } });
+    await waitFor(() => expect(search).toHaveBeenCalledTimes(2));
+    fireEvent.keyDown(filter, { key: "Escape" });
+    await act(async () => fail(new Error("daemon returned error: busy: try again")));
+
+    expect(screen.queryByTestId("new-agent-search-error")).toBeNull();
+    expect(screen.queryByTestId("new-agent-searching")).toBeNull();
+    expect(rowPaths()).toContain("/home/dev/beta");
+  });
+
+  /**
+   * Scenario (review of #1332): fleet snapshots keep arriving — a new runtime
+   * object every 100 ms — while the user's filter waits out its debounce. The
+   * search is still sent once the debounce has passed.
+   */
+  it("sends the search even while fleet snapshots keep re-rendering the dialog", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const search = truncatedHome();
+      const fleet = [deck(LOCAL, { deckKind: "local", listingOptions: true })];
+      const { rerenderWith } = renderDialog(fakeRuntime({ fleet, listDirectories: search }));
+      await currentPath("/home/dev");
+      fireEvent.change(screen.getByTestId("new-agent-filter"), { target: { value: "zu" } });
+      for (let tick = 0; tick < 6; tick += 1) {
+        rerenderWith(fakeRuntime({ fleet: [deck(LOCAL, { deckKind: "local", listingOptions: true })], listDirectories: search }));
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(100);
+        });
+      }
+      expect(search).toHaveBeenCalledWith(LOCAL, "/home/dev", { includeSymlinks: true, filter: "zu" });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  /**
+   * Scenario (review of #1332): a filter has found a directory past the cap;
+   * turning Show hidden on keeps the filter, searches the deck again with
+   * hidden directories included, and keeps the cursor on the found row.
+   */
+  it("keeps the filter and its deck search across a Show hidden toggle", async () => {
+    const search = truncatedHome();
+    renderDialog(fakeRuntime({ fleet: [deck(LOCAL, { deckKind: "local", listingOptions: true })], listDirectories: search }));
+    await currentPath("/home/dev");
+    fireEvent.change(screen.getByTestId("new-agent-filter"), { target: { value: "zu" } });
+    await waitFor(() => expect(rowPaths()).toContain("/zulu"));
+    fireEvent.keyDown(directoryList(), { key: "j" });
+    expect(activeRow()).toBe("/zulu");
+
+    fireEvent.click(screen.getByTestId("new-agent-show-hidden"));
+    await waitFor(() => expect(rowPaths()).toEqual(["/canonical-parent-of-home", "/home/dev/.zulu", "/zulu"]));
+    expect(screen.getByTestId("new-agent-filter")).toHaveValue("zu");
+    expect(search).toHaveBeenLastCalledWith(LOCAL, "/home/dev", { includeSymlinks: true, includeHidden: true, filter: "zu" });
+    expect(activeRow()).toBe("/zulu");
+  });
+
+  /**
+   * Scenario (review of #1332): Show hidden re-runs a deck search that is slow
+   * to answer, and the user moves the cursor while it is out. When it lands
+   * the cursor stays where the user put it, rather than going back to the row
+   * the toggle was on.
+   */
+  it("does not undo a cursor move made while a Show hidden search was out", async () => {
+    let release: () => void = () => undefined;
+    const found = { path: "/zulu", displayName: "zulu-target", isProject: false };
+    const hidden = { path: "/home/dev/.zeta", displayName: ".zeta", isProject: false };
+    const answer = (entries: typeof found[]): DeckDirectoryListing => ({ kind: "listing", path: "/home/dev", displayPath: "/home/dev", parent: "/canonical-parent-of-home", entries, truncated: false });
+    const search = truncatedHome({
+      onSearch: (options) => (options.includeHidden ? new Promise((resolve) => { release = () => resolve(answer([hidden, found])); }) : Promise.resolve(answer([found]))),
+    });
+    renderDialog(fakeRuntime({ fleet: [deck(LOCAL, { deckKind: "local", listingOptions: true })], listDirectories: search }));
+    await currentPath("/home/dev");
+    // `e` also matches both of HOME's own entries, so the reload leaves rows to move among.
+    fireEvent.change(screen.getByTestId("new-agent-filter"), { target: { value: "e" } });
+    await waitFor(() => expect(rowPaths()).toEqual(["/canonical-parent-of-home", "/zulu"]));
+    fireEvent.keyDown(directoryList(), { key: "j" });
+    expect(activeRow()).toBe("/zulu");
+
+    fireEvent.click(screen.getByTestId("new-agent-show-hidden"));
+    await waitFor(() => expect(search).toHaveBeenLastCalledWith(LOCAL, "/home/dev", { includeSymlinks: true, includeHidden: true, filter: "e" }));
+    fireEvent.keyDown(directoryList(), { key: "k" });
+    const moved = activeRow();
+    expect(moved).toBe("/canonical-parent-of-home");
+    await act(async () => release());
+    await waitFor(() => expect(rowPaths()).toContain("/home/dev/.zeta"));
+    expect(activeRow()).toBe(moved);
+  });
+
+  /**
+   * Scenario (review of #1332): the Show hidden reload itself is slow, and the
+   * user moves from `Alpha-project` to `beta` while it is out. When it lands —
+   * with `.config` now first, so every index has shifted — the cursor is on
+   * `beta`, the row the user moved to, not back on `Alpha-project`.
+   */
+  it("keeps the row a user moved to while a Show hidden reload was out", async () => {
+    let release: () => void = () => undefined;
+    const listDirectories = vi.fn(async (_deckId: string, _path?: string, options?: DeckListingOptions): Promise<DeckDirectoryListing> => {
+      const home = structuredClone(TREE[""]);
+      if (!options?.includeHidden || home.kind !== "listing") return home;
+      const widened = { ...home, entries: [{ path: "/home/dev/.config", displayName: ".config", isProject: false }, ...home.entries] };
+      return new Promise((resolve) => { release = () => resolve(widened); });
+    });
+    renderDialog(fakeRuntime({ fleet: [deck(LOCAL, { deckKind: "local", listingOptions: true })], listDirectories }));
+    await currentPath("/home/dev");
+    expect(activeRow()).toBe("/home/dev/Alpha-project");
+
+    fireEvent.keyDown(directoryList(), { key: "." });
+    await waitFor(() => expect(listDirectories).toHaveBeenLastCalledWith(LOCAL, "/home/dev", { includeSymlinks: true, includeHidden: true }));
+    fireEvent.keyDown(directoryList(), { key: "j" });
+    expect(activeRow()).toBe("/home/dev/beta");
+    await act(async () => release());
+    await waitFor(() => expect(rowPaths()).toContain("/home/dev/.config"));
+    expect(activeRow()).toBe("/home/dev/beta");
+  });
+
+  /**
+   * Scenario (review of #1332): the cursor is on the third row of the
+   * truncated listing when a one-match search lands. The cursor stays on a
+   * row that exists, so Enter still opens something.
+   */
+  it("keeps the cursor on a real row when a search leaves fewer rows", async () => {
+    const search = truncatedHome();
+    renderDialog(fakeRuntime({ fleet: [deck(LOCAL, { deckKind: "local", listingOptions: true })], listDirectories: search }));
+    await currentPath("/home/dev");
+    fireEvent.keyDown(directoryList(), { key: "j" });
+    fireEvent.change(screen.getByTestId("new-agent-filter"), { target: { value: "e" } });
+    fireEvent.keyDown(screen.getByTestId("new-agent-filter"), { key: "ArrowDown" });
+    fireEvent.keyDown(screen.getByTestId("new-agent-filter"), { key: "ArrowDown" });
+    await waitFor(() => expect(rowPaths()).toEqual(["/canonical-parent-of-home", "/zulu"]));
+    expect(activeRow()).not.toBeUndefined();
+  });
+
+  /**
+   * Scenario (review of #1332): a symlink leads to a sibling directory, so two
+   * rows share one path. Each is its own row — no duplicate React key — and a
+   * Show hidden reload keeps the cursor on the row the user was on, not on
+   * the first row with that path.
+   */
+  it("keeps a link and the directory it leads to apart", async () => {
+    const errors = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      const listDirectories = vi.fn(async (_deckId: string, _path?: string, options?: DeckListingOptions): Promise<DeckDirectoryListing> => ({
+        kind: "listing",
+        path: "/home/dev",
+        displayPath: "/home/dev",
+        entries: [
+          ...(options?.includeHidden ? [{ path: "/home/dev/.hidden", displayName: ".hidden", isProject: false }] : []),
+          { path: "/home/dev/work", displayName: "alias", isProject: false, isSymlink: true },
+          { path: "/home/dev/work", displayName: "work", isProject: false },
+        ],
+        truncated: false,
+      }));
+      renderDialog(fakeRuntime({ fleet: [deck(LOCAL, { deckKind: "local", listingOptions: true })], listDirectories }));
+      await currentPath("/home/dev");
+      expect(within(directoryList()).getAllByRole("option")).toHaveLength(2);
+      const selectedName = () => directoryList().querySelector("[aria-selected='true'] .new-agent-row-name")?.textContent;
+      expect(selectedName()).toBe("alias");
+      fireEvent.keyDown(directoryList(), { key: "j" });
+      expect(selectedName()).toBe("work");
+
+      // On `work`, the SECOND row with that path: a path-only match would
+      // land on `alias`.
+      fireEvent.keyDown(directoryList(), { key: "." });
+      await waitFor(() => expect(within(directoryList()).getAllByRole("option")).toHaveLength(3));
+      expect(selectedName()).toBe("work");
+      expect(errors.mock.calls.some((call) => String(call[0]).includes("same key"))).toBe(false);
+    } finally {
+      errors.mockRestore();
+    }
   });
 });
 
