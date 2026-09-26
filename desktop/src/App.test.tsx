@@ -962,7 +962,7 @@ describe("ControlDeck", () => {
    * This screen assumed the role named `orchestrator` always starts, so an
    * orchestration that marks any other role as its start role was offered as a
    * ready-to-launch button and then refused three layers down —
-   * `order_workflow_roles` compares every submitted start marker against the
+   * `order_orchestration_roles` compares every submitted start marker against the
    * daemon's projection, and since the P1(a) fix the daemon refuses the spawn
    * itself with `preparation-mismatch`.
    *

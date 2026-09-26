@@ -156,7 +156,7 @@ pub const MAX_PROJECTED_NAME_BYTES: usize = 512;
 ///   launchable set, which is the property the picker's whole existence rests
 ///   on.
 /// * **Loosening the consumer** was the alternative and does not work: the
-///   desktop's own `validate_workflow_shape` is not the binding limit — the
+///   desktop's own `validate_orchestration_shape` is not the binding limit — the
 ///   daemon's is. Raising the desktop's check to 512 would have moved the same
 ///   refusal one hop later, into the spawn, where it arrives as a failed launch
 ///   with roles already started instead of as a project that cannot be offered.

@@ -1581,7 +1581,7 @@ enum PreVerbAttachRequest {
 /// role, and whether that role is the orchestration's start role.
 ///
 /// A real launch always sends one (`desktop/src-tauri/src/lib.rs`'s
-/// `workflow_start_options`), and since PRD #819's Greptile P1(a) fix the daemon
+/// `orchestration_start_options`), and since PRD #819's Greptile P1(a) fix the daemon
 /// compares it against the token's binding — so a payload carrying `None` here
 /// can no longer produce a spawn. The cases below that pass `None` are the ones
 /// refused before the identity check is reached: an unknown token, and a payload

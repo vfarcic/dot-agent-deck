@@ -1528,7 +1528,7 @@ pub struct ProjectOrchestration {
 /// One role of a [`ProjectOrchestration`].
 ///
 /// `name` and `start` are the complete set the desktop reads
-/// (`order_workflow_roles` in `desktop/src-tauri/src/lib.rs`). The rest of
+/// (`order_orchestration_roles` in `desktop/src-tauri/src/lib.rs`). The rest of
 /// `OrchestrationRoleConfig` — `command`, `description`, `prompt_template`,
 /// `agent`, `clear` — is consumed only inside
 /// [`crate::orchestrator_context::prepare_orchestrator_prompt`], which moves
