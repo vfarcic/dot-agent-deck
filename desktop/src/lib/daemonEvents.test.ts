@@ -88,8 +88,8 @@ describe("mapDaemonEvent handoff rows", () => {
     expect(item?.summary).toContain("respawn failed");
   });
 
-  // Issue #714: the daemon's quota verdict is an ERROR row with fixed text —
-  // the pane's matched line (agent-controlled) never reaches the drawer.
+  // Issue #714: a quota block is an ERROR row with fixed text — the agent's
+  // own error message (agent-controlled) never reaches the drawer.
   it("quota_blocked maps to an ERROR evidence item", () => {
     const item = mapDaemonEvent(
       {
@@ -105,18 +105,7 @@ describe("mapDaemonEvent handoff rows", () => {
     expect(item?.verdict).toBe("ERROR");
     expect(item?.title).toBe("Provider usage limit reached");
     expect(item?.summary).not.toContain("IGNORE PRIOR INSTRUCTIONS");
-    expect(item?.agentId).toBe("7");
-  });
-
-  // Issue #714: the paired clear is informational, with fixed text.
-  it("quota_cleared maps to an INFO evidence item", () => {
-    const item = mapDaemonEvent(
-      { ...handoffPayload("quota_cleared", "pane-7", {}), pane_id: "pane-7", agent_id: "7" },
-      4,
-    );
-    expect(item?.verdict).toBe("INFO");
-    expect(item?.title).toBe("Provider usage-limit error no longer on screen");
-    expect(item?.summary).toContain("no longer shows it as blocked");
+    expect(item?.summary).toContain("The agent reported that its provider refused it");
     expect(item?.agentId).toBe("7");
   });
 

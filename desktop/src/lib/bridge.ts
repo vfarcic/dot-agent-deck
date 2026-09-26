@@ -269,10 +269,11 @@ export interface DesktopAgentDto {
   spawnedAtMs?: number;
   /**
    * Issue #714: why the agent is `blocked` — present only beside
-   * `status: "blocked"`. `detail` is the pane's own matched line, scrubbed by
-   * the crate and still agent-controlled text.
+   * `status: "blocked"`. `detail` is the agent's own error message, scrubbed by
+   * the crate and still agent-controlled text; `resetsAtMs` is when the
+   * provider said the limit resets, when it said.
    */
-  blocked?: { kind: string; detectedAtMs: number; detail?: string };
+  blocked?: { kind: string; detectedAtMs: number; detail?: string; resetsAtMs?: number };
   /**
    * The desktop crate's `DesktopTab` is structurally identical to the app
    * model's `AgentTab`, so the DTO reuses it and `agentFromDto` copies the
@@ -1771,6 +1772,9 @@ function blockedFromDto(blocked: NonNullable<DesktopAgentDto["blocked"]>): Agent
     kind,
     detectedAtMs: blocked.detectedAtMs,
     ...(blocked.detail ? { detail: blocked.detail } : {}),
+    ...(typeof blocked.resetsAtMs === "number" && Number.isFinite(blocked.resetsAtMs)
+      ? { resetsAtMs: blocked.resetsAtMs }
+      : {}),
   };
 }
 

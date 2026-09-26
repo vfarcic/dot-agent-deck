@@ -17,7 +17,9 @@ Each session card shows the agent's current state:
 | **WaitingForInput** | Agent needs user approval or input |
 | **Idle** | Agent is between tasks |
 | **Error** | Something went wrong |
-| **Blocked** | The agent's provider refused it because a usage limit or credit pool is exhausted, read from the agent's own screen (Codex and OpenCode). A line under `Dir:` says which limit. It clears when the agent does work again, or once later output has pushed the error off the bottom of the agent's screen and the pane has gone quiet. There is no timer, because a spent credit pool does not reset on its own. |
+| **Blocked** | The agent reported that its provider refused it because a usage limit or credit pool is exhausted. A line under `Dir:` says which limit and, when the provider says, when it resets. It clears only when the agent works again (a new prompt, a tool, a permission prompt) or when its pane restarts. There is no timer, because a spent credit pool does not reset on its own. Covered: **Claude Code** 2.1.78 or newer (its `StopFailure` hook), **Codex** (its session log, read while a turn is running) and **OpenCode** (the structured fields of its `session.error` event). While OpenCode is still retrying a refused request, its card shows `Thinking`; it turns Blocked once OpenCode gives up and reports the error. **Not covered:** Pi and Devin report no structured quota signal, so their cards never show Blocked; neither does an Anthropic "credit balance is too low" error reached through OpenCode, which carries no machine-readable marker. |
+
+The Claude Code hook and the OpenCode plugin that report Blocked are installed when the TUI starts; an agent that was already running may need a restart to pick them up. The Claude Code hook is installed only when `claude --version` reports 2.1.78 or newer, because the older Claude Code releases we tested ignore every hook in the settings file when this one is present. If you use only the desktop app, or run agents on a remote host, run `dot-agent-deck hooks install` there once (and `dot-agent-deck hooks install --agent opencode` for OpenCode).
 
 Cards also display:
 

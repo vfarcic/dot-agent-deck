@@ -657,6 +657,11 @@ describe("TauriDeckBridge", () => {
     future.agents[0].blocked = { kind: "future_kind", detectedAtMs: 1 };
     expect(mapDesktopSnapshot(future).agents[0]?.blocked).toEqual({ kind: "unknown", detectedAtMs: 1 });
 
+    // The provider's reset rides along when it gave one.
+    const resetting = structuredClone(dto);
+    resetting.agents[0].blocked = { kind: "usage_limit", detectedAtMs: 1, resetsAtMs: 7_200_000 };
+    expect(mapDesktopSnapshot(resetting).agents[0]?.blocked).toEqual({ kind: "usage_limit", detectedAtMs: 1, resetsAtMs: 7_200_000 });
+
     // The reason never outlives the status it explains.
     const cleared = structuredClone(dto);
     cleared.agents[0].status = "thinking";

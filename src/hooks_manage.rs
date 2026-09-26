@@ -26,6 +26,106 @@ const HOOK_TYPES: &[&str] = &[
     "SubagentStop",
 ];
 
+/// Issue #714: the hook Claude Code fires INSTEAD of `Stop` when an API error
+/// ends the turn — how a provider quota block reaches the deck. Installed with
+/// no matcher, so every `error` kind arrives (a non-quota one maps to `Error`),
+/// and only for a Claude Code that accepts it ([`STOP_FAILURE_MIN_CLAUDE_VERSION`]).
+const STOP_FAILURE_HOOK: &str = "StopFailure";
+
+/// Issue #714: the first Claude Code release that accepts a `StopFailure` key
+/// under `hooks` in `settings.json`.
+///
+/// **An older release does not ignore the key: it drops EVERY hook in the
+/// file.** Measured on 2026-09-26 with a sandboxed `HOME`, a `settings.json`
+/// holding `SessionStart`, `UserPromptSubmit`, `Stop` and `StopFailure` command
+/// hooks, and `claude -p`: 2.0.0, 2.1.50, 2.1.74, 2.1.76 and 2.1.77 ran none of
+/// them, and each ran `SessionStart` and `UserPromptSubmit` once the
+/// `StopFailure` key was removed; 2.1.78, 2.1.79, 2.1.85, 2.1.100, 2.1.200 and
+/// 2.1.283 ran them with the key present. So the key is written only when the
+/// installed Claude Code is known to be at least this version, and an unknown
+/// version is treated as older.
+pub const STOP_FAILURE_MIN_CLAUDE_VERSION: (u64, u64, u64) = (2, 1, 78);
+
+/// How long [`installed_claude_accepts_stop_failure`] waits for
+/// `claude --version` before treating the version as unknown.
+const CLAUDE_VERSION_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Issue #714: parse the leading `MAJOR.MINOR.PATCH` of `claude --version`'s
+/// output (`2.1.283 (Claude Code)`). `None` for anything else.
+pub fn parse_claude_version(output: &str) -> Option<(u64, u64, u64)> {
+    let word = output.split_whitespace().next()?;
+    let mut parts = word.split('.');
+    let mut next = || parts.next()?.parse::<u64>().ok();
+    let version = (next()?, next()?, next()?);
+    Some(version)
+}
+
+/// Issue #714: whether a Claude Code reporting `output` for `--version`
+/// accepts the `StopFailure` hook key ([`STOP_FAILURE_MIN_CLAUDE_VERSION`]).
+pub fn claude_version_accepts_stop_failure(output: &str) -> bool {
+    parse_claude_version(output).is_some_and(|v| v >= STOP_FAILURE_MIN_CLAUDE_VERSION)
+}
+
+/// Issue #714: run `claude --version` (the `claude` on `PATH`, the one the deck
+/// launches) and report whether it accepts the `StopFailure` hook key, with the
+/// raw first line for a message. Not found, failed, timed out or unparseable
+/// all answer `false`: writing the key for a Claude Code that rejects it would
+/// switch off every deck hook, while leaving it out only means a quota-blocked
+/// Claude Code agent is not shown as Blocked.
+pub fn installed_claude_accepts_stop_failure() -> (bool, Option<String>) {
+    use std::io::Read as _;
+    let mut child = match std::process::Command::new("claude")
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(_) => return (false, None),
+    };
+    let deadline = std::time::Instant::now() + CLAUDE_VERSION_PROBE_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return (false, None);
+            }
+        }
+    }
+    let mut output = String::new();
+    if let Some(mut stdout) = child.stdout.take() {
+        let _ = stdout.by_ref().take(4096).read_to_string(&mut output);
+    }
+    let line = output.lines().next().map(|l| l.trim().to_string());
+    (
+        line.as_deref()
+            .is_some_and(claude_version_accepts_stop_failure),
+        line,
+    )
+}
+
+/// Every hook type the deck may have installed, gated or not — what uninstall
+/// sweeps.
+fn hook_types_all() -> Vec<&'static str> {
+    hook_types(true)
+}
+
+/// The hook types to install: [`HOOK_TYPES`], plus [`STOP_FAILURE_HOOK`] when
+/// the installed Claude Code accepts it.
+fn hook_types(with_stop_failure: bool) -> Vec<&'static str> {
+    let mut types = HOOK_TYPES.to_vec();
+    if with_stop_failure {
+        types.push(STOP_FAILURE_HOOK);
+    }
+    types
+}
+
 /// Claude Code's user settings file, in the location Claude itself uses:
 /// `~/.claude/settings.json`.
 ///
@@ -403,17 +503,25 @@ struct InstallOutcome {
     coexisting: std::collections::BTreeSet<String>,
 }
 
-fn install_impl(settings: &mut Value, binary_path: &str) -> InstallOutcome {
+fn install_impl(
+    settings: &mut Value,
+    binary_path: &str,
+    with_stop_failure: bool,
+) -> InstallOutcome {
+    let hook_types = hook_types(with_stop_failure);
     let hooks_obj = ensure_hooks_object(settings);
 
-    // Clean up deck entries for hook types no longer in HOOK_TYPES. These are
-    // gone from HOOK_TYPES entirely, so any deck rule there is stale regardless
+    // Clean up deck entries for hook types no longer installed. These are
+    // gone from the list entirely, so any deck rule there is stale regardless
     // of which binary wrote it — use the generic, binary-agnostic predicate.
+    // Issue #714: that includes a deck `StopFailure` rule left behind for a
+    // Claude Code that no longer accepts it (a downgrade), which would
+    // otherwise switch off every hook in the file.
     let mut repaired = 0usize;
     let mut coexisting = std::collections::BTreeSet::new();
     let all_keys: Vec<String> = hooks_obj.keys().cloned().collect();
     for key in all_keys {
-        if !HOOK_TYPES.contains(&key.as_str()) {
+        if !hook_types.contains(&key.as_str()) {
             if let Some(arr) = hooks_obj.get_mut(&key).and_then(|v| v.as_array_mut()) {
                 repaired += strip_deck_commands(arr, command_is_ours);
             }
@@ -431,7 +539,7 @@ fn install_impl(settings: &mut Value, binary_path: &str) -> InstallOutcome {
     let mut installed = Vec::new();
     let mut skipped = Vec::new();
 
-    for &hook_type in HOOK_TYPES {
+    for &hook_type in &hook_types {
         let rules = ensure_hook_array(hooks_obj, hook_type);
 
         // Prune STALE deck-owned rules sharing the installing binary's own
@@ -522,7 +630,7 @@ fn uninstall_impl(settings: &mut Value) -> UninstallOutcome {
     let mut hook_types = Vec::new();
     let mut commands_removed = 0;
 
-    for &hook_type in HOOK_TYPES {
+    for hook_type in hook_types_all() {
         if let Some(arr) = hooks.get_mut(hook_type).and_then(|v| v.as_array_mut()) {
             let removed = strip_deck_commands(arr, command_is_ours);
             if removed > 0 {
@@ -530,6 +638,15 @@ fn uninstall_impl(settings: &mut Value) -> UninstallOutcome {
                 commands_removed += removed;
             }
         }
+    }
+    // Issue #714: an emptied `StopFailure` key goes too — an older Claude Code
+    // rejects the key itself, empty or not.
+    if hooks
+        .get(STOP_FAILURE_HOOK)
+        .and_then(|v| v.as_array())
+        .is_some_and(|a| a.is_empty())
+    {
+        hooks.remove(STOP_FAILURE_HOOK);
     }
 
     UninstallOutcome {
@@ -727,9 +844,10 @@ fn owned_command_executable(command: &str) -> Option<String> {
 /// the PRD #381 refusal path: the dashboard is already painting by the time
 /// this can fail, so a refusal goes to `tracing::warn!` and nowhere else.
 pub fn auto_install() {
-    auto_install_to(
+    auto_install_to_gated(
         &settings_path(),
         crate::platform::paths::durable_binary_path,
+        || installed_claude_accepts_stop_failure().0,
     );
 }
 
@@ -749,7 +867,24 @@ pub fn auto_install() {
 /// The resolver is called only after the settings *directory* check, so the
 /// common "Claude Code not installed" case still costs one `exists()` and no
 /// filesystem walk.
+///
+/// Issue #714: this seam installs the base hook set, which every Claude Code
+/// accepts, and never the version-gated `StopFailure`; [`auto_install_to_gated`]
+/// is the same seam with the gate injected, and what [`auto_install`] calls.
 pub fn auto_install_to(path: &Path, resolve: impl FnOnce() -> Result<String, String>) {
+    auto_install_to_gated(path, resolve, || false);
+}
+
+/// [`auto_install_to`] with the `StopFailure` gate injected (issue #714):
+/// `stop_failure` answers whether the installed Claude Code accepts that hook
+/// key ([`installed_claude_accepts_stop_failure`] in production). Asked only
+/// after the directory check and the binary resolution, so a machine without
+/// Claude Code never runs the probe.
+pub fn auto_install_to_gated(
+    path: &Path,
+    resolve: impl FnOnce() -> Result<String, String>,
+    stop_failure: impl FnOnce() -> bool,
+) {
     if path.parent().is_none_or(|p| !p.exists()) {
         return;
     }
@@ -772,7 +907,7 @@ pub fn auto_install_to(path: &Path, resolve: impl FnOnce() -> Result<String, Str
             return;
         }
     };
-    let outcome = install_impl(&mut settings, &binary_path);
+    let outcome = install_impl(&mut settings, &binary_path, stop_failure());
 
     // A pass that only PRUNED (a dead deck rule sitting beside the current one)
     // installs nothing, and returning here on `installed.is_empty()` alone
@@ -827,6 +962,7 @@ pub fn install() -> Result<(), String> {
 /// durable deck on it.
 pub fn install_with(resolve: impl FnOnce() -> Result<String, String>) -> Result<(), String> {
     let binary_path = resolve()?;
+    let (stop_failure, claude_version) = installed_claude_accepts_stop_failure();
 
     let path = settings_path();
     let _guard = lock_settings();
@@ -837,7 +973,7 @@ pub fn install_with(resolve: impl FnOnce() -> Result<String, String>) -> Result<
         skipped,
         coexisting,
         ..
-    } = install_impl(&mut settings, &binary_path);
+    } = install_impl(&mut settings, &binary_path, stop_failure);
 
     write_settings(&path, &settings).map_err(|e| format!("writing {}: {e}", path.display()))?;
 
@@ -865,6 +1001,17 @@ pub fn install_with(resolve: impl FnOnce() -> Result<String, String>) -> Result<
              daemon, so the extra deliveries are redundant. To collapse them, run \
              `dot-agent-deck hooks uninstall` and then `hooks install` from whichever \
              install you want to keep."
+        );
+    }
+    if !stop_failure {
+        let (major, minor, patch) = STOP_FAILURE_MIN_CLAUDE_VERSION;
+        println!(
+            "Note: the {STOP_FAILURE_HOOK} hook was not installed: `claude --version` reported \
+             {}, and only Claude Code {major}.{minor}.{patch} or newer accepts it (an older \
+             release ignores every hook in the file when it is present). Without it, a Claude \
+             Code agent whose provider quota runs out is not shown as Blocked. Run this again \
+             after updating Claude Code.",
+            claude_version.as_deref().unwrap_or("nothing usable")
         );
     }
     println!("Settings file: {}", path.display());
@@ -913,10 +1060,19 @@ pub fn uninstall() -> Result<(), String> {
 /// CLI path reports rather than swallowing them, so a test that expects a write
 /// to be refused has to say so — a seam that quietly discarded the refusal is
 /// how #522's uninstall defect stayed invisible under a green suite.
+///
+/// Issue #714: installs the base hook set, like [`auto_install_to`];
+/// [`install_to_gated`] injects the `StopFailure` gate.
 pub fn install_to(path: &Path, binary_path: &str) -> io::Result<()> {
+    install_to_gated(path, binary_path, false)
+}
+
+/// [`install_to`], writing the version-gated `StopFailure` hook too when
+/// `stop_failure` is set (issue #714).
+pub fn install_to_gated(path: &Path, binary_path: &str, stop_failure: bool) -> io::Result<()> {
     let _guard = lock_settings();
     let mut settings = load_settings_or_refuse(path)?;
-    install_impl(&mut settings, binary_path);
+    install_impl(&mut settings, binary_path, stop_failure);
     write_settings(path, &settings)
 }
 
@@ -1167,14 +1323,14 @@ mod tests {
         );
 
         let mut settings = serde_json::json!({});
-        let first = install_impl(&mut settings, &a);
+        let first = install_impl(&mut settings, &a, false);
         assert!(
             first.coexisting.is_empty(),
             "the first install has nothing to coexist with: {:?}",
             first.coexisting
         );
 
-        let second = install_impl(&mut settings, &b);
+        let second = install_impl(&mut settings, &b, false);
         assert_eq!(
             second.coexisting.iter().cloned().collect::<Vec<_>>(),
             vec![a.clone()],
@@ -1261,5 +1417,70 @@ mod tests {
         assert!(binary_names_match(DEFAULT_BINARY_NAME, &installed));
         assert!(binary_names_match(&installed, DEFAULT_BINARY_NAME));
         assert!(!binary_names_match("some-other-name", &installed));
+    }
+
+    /// Issue #714: the `StopFailure` gate — written for a Claude Code that
+    /// accepts it, withheld (and a stale one removed) for one that does not,
+    /// and swept by uninstall. The end-to-end half is `status/blocked/011` in
+    /// `crate::hook`.
+    #[test]
+    fn stop_failure_hook_is_installed_only_for_a_claude_code_that_accepts_it() {
+        assert_eq!(
+            parse_claude_version("2.1.283 (Claude Code)"),
+            Some((2, 1, 283))
+        );
+        assert!(claude_version_accepts_stop_failure("2.1.78 (Claude Code)"));
+        assert!(claude_version_accepts_stop_failure("3.0.0"));
+        assert!(!claude_version_accepts_stop_failure("2.1.77 (Claude Code)"));
+        assert!(!claude_version_accepts_stop_failure(
+            "1.0.128 (Claude Code)"
+        ));
+        assert!(!claude_version_accepts_stop_failure("Claude Code"));
+        assert!(!claude_version_accepts_stop_failure(""));
+
+        let binary = "/opt/deck/dot-agent-deck";
+        let deck_rules = |settings: &Value, key: &str| {
+            settings["hooks"][key]
+                .as_array()
+                .map(|rules| {
+                    rule_command_strs(rules)
+                        .into_iter()
+                        .filter(|c| command_is_ours(c))
+                        .count()
+                })
+                .unwrap_or(0)
+        };
+        let mut settings = serde_json::json!({
+            "model": "opus",
+            "hooks": {"Stop": [{"hooks": [{"type": "command", "command": "notify-send done"}]}]}
+        });
+        let outcome = install_impl(&mut settings, binary, true);
+        assert!(outcome.installed.contains(&STOP_FAILURE_HOOK));
+        assert_eq!(deck_rules(&settings, STOP_FAILURE_HOOK), 1);
+        assert_eq!(
+            settings["hooks"][STOP_FAILURE_HOOK][0].get("matcher"),
+            None,
+            "no matcher: every error kind must reach the deck"
+        );
+        for hook_type in HOOK_TYPES {
+            assert_eq!(deck_rules(&settings, hook_type), 1, "{hook_type}");
+        }
+        assert_eq!(settings["model"], "opus", "unrelated settings survive");
+
+        // A Claude Code that predates the key: none written, the stale one gone.
+        let outcome = install_impl(&mut settings, binary, false);
+        assert!(!outcome.installed.contains(&STOP_FAILURE_HOOK));
+        assert!(outcome.repaired >= 1);
+        assert!(settings["hooks"].get(STOP_FAILURE_HOOK).is_none());
+
+        let mut fresh = serde_json::json!({});
+        install_impl(&mut fresh, binary, false);
+        assert!(fresh["hooks"].get(STOP_FAILURE_HOOK).is_none());
+
+        // Uninstall sweeps the gated key as well, and drops it once empty.
+        install_impl(&mut settings, binary, true);
+        let removed = uninstall_impl(&mut settings);
+        assert!(removed.hook_types.contains(&STOP_FAILURE_HOOK));
+        assert!(settings["hooks"].get(STOP_FAILURE_HOOK).is_none());
     }
 }

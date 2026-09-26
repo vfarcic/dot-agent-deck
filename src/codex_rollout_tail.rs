@@ -1,0 +1,601 @@
+//! Read a Codex session log for the outcome of a running turn (issue #714).
+//!
+//! Codex reports a provider usage-limit failure through no hook at all: an
+//! errored turn runs no `Stop` hook, and there is no failure hook. What it does
+//! do is write the failure into its rollout JSONL — a `task_complete` record
+//! whose `error.codex_error_info` is `usage_limit_exceeded`. So the daemon reads
+//! that file, and only while a turn is running.
+//!
+//! * **Arming.** Codex's own `SessionStart` and `UserPromptSubmit` hooks carry
+//!   the rollout's `transcript_path`, and `UserPromptSubmit` the `turn_id`. The
+//!   hook CLI forwards them as [`CODEX_TRANSCRIPT_PATH_METADATA_KEY`] /
+//!   [`CODEX_TURN_ID_METADATA_KEY`], and the daemon arms a watch for that turn —
+//!   only for an event whose pane and agent name the pane's LIVE owner, so a
+//!   payload can never make the daemon read a file on another pane's behalf.
+//! * **Reading.** [`CodexRolloutTailers::tick`] polls every armed tailer every
+//!   [`POLL_INTERVAL`] rather than subscribing to file events: the daemon runs
+//!   on Linux, macOS and Windows, the file is append-only, and two seconds is
+//!   noise against a block that lasts hours. Each tick reads at most
+//!   [`MAX_READ_PER_TICK`] per tailer, and a watch starts
+//!   [`BACK_WINDOW`] before the end of the file, which covers the race where
+//!   Codex writes the failure before the daemon handles the hook. The pure
+//!   record classifier is [`crate::quota_signals::CodexTurnWatch`].
+//! * **Disarming.** On the watched turn's `task_complete` (with or without an
+//!   error), a Codex `Stop` naming that turn, or a newer arm. A tailer is dropped when its agent
+//!   is no longer the live owner of its pane, and the whole set when the
+//!   daemon's monitor task is aborted.
+//! * **Path safety**, checked once whenever a path is (re)opened
+//!   ([`open_rollout`]): absolute, no `..`, canonicalizes, the canonical file
+//!   name is `rollout-*.jsonl`, opened read-only (Unix: non-blocking and without
+//!   following a final symlink), and the opened file is a regular file (Unix:
+//!   owned by the daemon's uid). The file handle is then held and reused, so a
+//!   later swap of the path has nothing to race. A refused path is logged at
+//!   `debug` and never retried.
+
+use std::collections::{HashMap, HashSet};
+use std::fs::File;
+use std::io::{Read as _, Seek as _, SeekFrom};
+use std::path::{Component, Path};
+use std::time::Duration;
+
+use crate::quota_block::BlockedKind;
+use crate::quota_signals::{CodexLineOutcome, CodexTurnWatch};
+
+/// `AgentEvent.metadata` key on a Codex `SessionStart` / `UserPromptSubmit`
+/// event carrying the hook payload's `transcript_path` — the rollout to read.
+pub const CODEX_TRANSCRIPT_PATH_METADATA_KEY: &str = "codex_transcript_path";
+
+/// `AgentEvent.metadata` key on a Codex `UserPromptSubmit` event carrying the
+/// hook payload's `turn_id` — the turn to watch.
+pub const CODEX_TURN_ID_METADATA_KEY: &str = "codex_turn_id";
+
+/// The longest value either key may carry; a longer one is not forwarded.
+pub const MAX_METADATA_BYTES: usize = 4096;
+
+/// How often the daemon polls its armed tailers.
+pub const POLL_INTERVAL: Duration = Duration::from_secs(2);
+
+/// The most one tailer reads in one tick.
+pub const MAX_READ_PER_TICK: u64 = 1024 * 1024;
+
+/// How far before the end of the file a newly armed watch starts reading.
+pub const BACK_WINDOW: u64 = 256 * 1024;
+
+/// The longest line buffered across reads; a longer one is skipped through its
+/// newline without being parsed. The records that matter are small; only
+/// `response_item` lines with large tool output get this long.
+pub const MAX_LINE_BYTES: usize = 256 * 1024;
+
+/// Bound on queued, not-yet-applied arm commands and on remembered refused
+/// paths — both are fed from hook events, so neither may grow without limit.
+const MAX_PENDING: usize = 4096;
+
+/// What the hook loop asks of the tailers. Queued by the hook loop
+/// ([`CodexRolloutArms::push`]) and applied by the monitor task at its next
+/// tick, so the hook loop never touches a file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ArmCommand {
+    /// A Codex event that named a rollout and/or a turn.
+    Arm(ArmRequest),
+    /// A Codex `Stop` for `turn_id`: that turn ended normally. A watch for any
+    /// other turn is left armed.
+    Disarm { agent_id: String, turn_id: String },
+}
+
+/// One arm, from a Codex `SessionStart` (path only) or `UserPromptSubmit`
+/// (path and turn).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArmRequest {
+    pub pane_id: String,
+    pub agent_id: String,
+    /// The arming hook's session id, which the block event is filed under.
+    pub session_id: String,
+    /// The rollout path, when this event carried one.
+    pub path: Option<String>,
+    /// The turn to watch, when this event carried one.
+    pub turn_id: Option<String>,
+}
+
+/// A quota block read from a rollout, for the daemon to report.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodexBlock {
+    pub pane_id: String,
+    pub agent_id: String,
+    pub session_id: String,
+    pub kind: BlockedKind,
+    pub resets_at_ms: Option<i64>,
+    /// The `task_complete` error message, unscrubbed.
+    pub message: Option<String>,
+}
+
+/// The queue between the hook loop and the monitor task.
+#[derive(Debug, Default)]
+pub struct CodexRolloutArms {
+    pending: std::sync::Mutex<Vec<ArmCommand>>,
+}
+
+impl CodexRolloutArms {
+    /// Queue `command`. Past [`MAX_PENDING`] the oldest queued command is
+    /// dropped — a newer arm for the same agent supersedes it anyway.
+    pub fn push(&self, command: ArmCommand) {
+        let mut pending = self.pending.lock().unwrap_or_else(|p| p.into_inner());
+        if pending.len() >= MAX_PENDING {
+            pending.remove(0);
+        }
+        pending.push(command);
+    }
+
+    /// Take every queued command, oldest first.
+    pub fn drain(&self) -> Vec<ArmCommand> {
+        std::mem::take(&mut *self.pending.lock().unwrap_or_else(|p| p.into_inner()))
+    }
+}
+
+/// The rollout file a tailer holds open, and where it has read to.
+#[derive(Debug)]
+struct OpenRollout {
+    file: File,
+    offset: u64,
+    /// The start of a line whose newline has not been read yet.
+    partial: Vec<u8>,
+    /// Skipping to the next newline: the read started mid-line, or a line
+    /// outgrew [`MAX_LINE_BYTES`].
+    discarding: bool,
+}
+
+#[derive(Debug)]
+struct Tailer {
+    pane_id: String,
+    session_id: String,
+    path: String,
+    open: Option<OpenRollout>,
+    /// The watched turn; `None` when no turn is armed, and then the file is
+    /// not read at all.
+    watch: Option<CodexTurnWatch>,
+    /// Start the next read [`BACK_WINDOW`] before the end of the file.
+    rewind: bool,
+}
+
+/// Every Codex agent's tailer, keyed by the registry `agent_id` (so a respawn
+/// in the same pane is a new key). Owned by the daemon's monitor task.
+#[derive(Debug, Default)]
+pub struct CodexRolloutTailers {
+    tailers: HashMap<String, Tailer>,
+    refused: HashSet<String>,
+}
+
+impl CodexRolloutTailers {
+    /// Apply one command from the hook loop.
+    pub fn apply(&mut self, command: ArmCommand) {
+        match command {
+            ArmCommand::Disarm { agent_id, turn_id } => {
+                if let Some(tailer) = self.tailers.get_mut(&agent_id)
+                    && tailer
+                        .watch
+                        .as_ref()
+                        .is_some_and(|w| w.turn_id() == turn_id)
+                {
+                    tailer.watch = None;
+                }
+            }
+            ArmCommand::Arm(req) => {
+                let existing = self
+                    .tailers
+                    .get(&req.agent_id)
+                    .filter(|t| t.pane_id == req.pane_id);
+                let path = match (&req.path, existing) {
+                    (Some(path), _) => path.clone(),
+                    (None, Some(t)) => t.path.clone(),
+                    (None, None) => return,
+                };
+                let tailer = match self.tailers.remove(&req.agent_id) {
+                    Some(t) if t.pane_id == req.pane_id && t.path == path => t,
+                    _ => Tailer {
+                        pane_id: req.pane_id.clone(),
+                        session_id: req.session_id.clone(),
+                        path,
+                        open: None,
+                        watch: None,
+                        rewind: false,
+                    },
+                };
+                let mut tailer = tailer;
+                tailer.session_id = req.session_id;
+                if let Some(turn) = req.turn_id {
+                    tailer.watch = Some(CodexTurnWatch::new(turn));
+                    tailer.rewind = true;
+                }
+                self.tailers.insert(req.agent_id, tailer);
+            }
+        }
+    }
+
+    /// Whether `agent_id` has a turn armed. For tests and diagnostics.
+    pub fn is_armed(&self, agent_id: &str) -> bool {
+        self.tailers
+            .get(agent_id)
+            .is_some_and(|t| t.watch.is_some())
+    }
+
+    /// Whether any tailer exists for `agent_id`. For tests and diagnostics.
+    pub fn has_tailer(&self, agent_id: &str) -> bool {
+        self.tailers.contains_key(agent_id)
+    }
+
+    /// One poll: drop every tailer whose `(pane_id, agent_id)` is no longer a
+    /// live owner, then read what each armed tailer's rollout has gained since
+    /// the last tick and return the blocks found. Does file I/O; the daemon
+    /// runs it on a blocking thread, outside every lock of its own.
+    pub fn tick(&mut self, is_live_owner: impl Fn(&str, &str) -> bool) -> Vec<CodexBlock> {
+        self.tailers
+            .retain(|agent_id, tailer| is_live_owner(&tailer.pane_id, agent_id));
+        let mut blocks = Vec::new();
+        for (agent_id, tailer) in self.tailers.iter_mut() {
+            if tailer.watch.is_none() {
+                continue;
+            }
+            if tailer.open.is_none() {
+                if self.refused.contains(&tailer.path) {
+                    tailer.watch = None;
+                    continue;
+                }
+                match open_rollout(&tailer.path) {
+                    Ok(file) => {
+                        tailer.open = Some(OpenRollout {
+                            file,
+                            offset: 0,
+                            partial: Vec::new(),
+                            discarding: false,
+                        });
+                    }
+                    Err(why) => {
+                        tracing::debug!(
+                            agent_id = %agent_id,
+                            path = %tailer.path.escape_debug(),
+                            reason = why,
+                            "codex rollout: refused a transcript path; not retried"
+                        );
+                        if self.refused.len() >= MAX_PENDING {
+                            self.refused.clear();
+                        }
+                        self.refused.insert(tailer.path.clone());
+                        tailer.watch = None;
+                        continue;
+                    }
+                }
+            }
+            if let Some(block) = read_tailer(tailer) {
+                blocks.push(CodexBlock {
+                    pane_id: tailer.pane_id.clone(),
+                    agent_id: agent_id.clone(),
+                    session_id: tailer.session_id.clone(),
+                    kind: block.0,
+                    resets_at_ms: block.1,
+                    message: block.2,
+                });
+            }
+        }
+        blocks
+    }
+}
+
+type FoundBlock = (BlockedKind, Option<i64>, Option<String>);
+
+/// Read what `tailer`'s rollout gained since its last read, feeding each
+/// complete line to its watch. Returns the block the watch found, if any.
+fn read_tailer(tailer: &mut Tailer) -> Option<FoundBlock> {
+    let open = tailer.open.as_mut()?;
+    let len = match open.file.metadata() {
+        Ok(meta) => meta.len(),
+        Err(_) => {
+            tailer.open = None;
+            return None;
+        }
+    };
+    if len < open.offset || tailer.rewind {
+        // Truncated (or a fresh watch): start one window back from the end.
+        let start = len.saturating_sub(BACK_WINDOW);
+        if len < open.offset || start > open.offset || tailer.rewind {
+            open.offset = start;
+            open.partial.clear();
+            open.discarding = start > 0;
+        }
+        tailer.rewind = false;
+    }
+    let want = (len - open.offset).min(MAX_READ_PER_TICK);
+    if want == 0 {
+        return None;
+    }
+    let mut buf = Vec::with_capacity(want as usize);
+    if open.file.seek(SeekFrom::Start(open.offset)).is_err()
+        || (&open.file).take(want).read_to_end(&mut buf).is_err()
+    {
+        tailer.open = None;
+        return None;
+    }
+    open.offset += buf.len() as u64;
+
+    let watch = tailer.watch.as_mut()?;
+    let mut found = None;
+    let mut ended = false;
+    let mut start = 0;
+    for (i, _) in buf.iter().enumerate().filter(|(_, b)| **b == b'\n') {
+        let segment = &buf[start..i];
+        start = i + 1;
+        if open.discarding {
+            open.discarding = false;
+            open.partial.clear();
+            continue;
+        }
+        if ended {
+            continue;
+        }
+        if open.partial.len() + segment.len() > MAX_LINE_BYTES {
+            open.partial.clear();
+            continue;
+        }
+        let outcome = if open.partial.is_empty() {
+            watch.observe_line(segment)
+        } else {
+            open.partial.extend_from_slice(segment);
+            let line = std::mem::take(&mut open.partial);
+            watch.observe_line(&line)
+        };
+        match outcome {
+            CodexLineOutcome::Nothing => {}
+            CodexLineOutcome::TurnEnded => ended = true,
+            CodexLineOutcome::Blocked {
+                kind,
+                resets_at_ms,
+                message,
+            } => {
+                found = Some((kind, resets_at_ms, message));
+                ended = true;
+            }
+        }
+    }
+    let rest = &buf[start..];
+    if !open.discarding {
+        if open.partial.len() + rest.len() > MAX_LINE_BYTES {
+            open.partial.clear();
+            open.discarding = true;
+        } else {
+            open.partial.extend_from_slice(rest);
+        }
+    }
+    if ended {
+        tailer.watch = None;
+    }
+    found
+}
+
+/// Validate and open the rollout at `path` — see the module doc's path-safety
+/// list. `Err` names the check that refused it.
+pub fn open_rollout(path: &str) -> Result<File, &'static str> {
+    let given = Path::new(path);
+    if !given.is_absolute() {
+        return Err("not absolute");
+    }
+    if given.components().any(|c| c == Component::ParentDir) {
+        return Err("contains ..");
+    }
+    let canonical = std::fs::canonicalize(given).map_err(|_| "does not resolve")?;
+    let name = canonical
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or("no file name")?;
+    if !(name.starts_with("rollout-") && name.ends_with(".jsonl")) {
+        return Err("not a rollout-*.jsonl file");
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
+    }
+    let file = options.open(&canonical).map_err(|_| "cannot open")?;
+    let meta = file.metadata().map_err(|_| "cannot stat")?;
+    if !meta.is_file() {
+        return Err("not a regular file");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        // SAFETY: `getuid` has no preconditions and cannot fail.
+        if meta.uid() != unsafe { libc::getuid() } {
+            return Err("not owned by the daemon's user");
+        }
+    }
+    Ok(file)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use spec::spec;
+    use std::io::Write as _;
+
+    const TURN: &str = "turn-714";
+
+    fn arm(agent: &str, path: &Path, turn: Option<&str>) -> ArmCommand {
+        ArmCommand::Arm(ArmRequest {
+            pane_id: format!("pane-{agent}"),
+            agent_id: agent.to_string(),
+            session_id: format!("session-{agent}"),
+            path: Some(path.to_string_lossy().into_owned()),
+            turn_id: turn.map(str::to_owned),
+        })
+    }
+
+    fn failure_lines(turn: &str) -> String {
+        format!(
+            concat!(
+                r#"{{"type":"event_msg","payload":{{"type":"task_started","turn_id":"{t}"}}}}"#,
+                "\n",
+                r#"{{"type":"event_msg","payload":{{"type":"token_count","turn_id":"{t}","rate_limits":{{"credits":{{"has_credits":false}},"rate_limit_reached_type":"workspace_member_credits_depleted"}}}}}}"#,
+                "\n",
+                r#"{{"type":"event_msg","payload":{{"type":"task_complete","turn_id":"{t}","error":{{"message":"out of credits","codex_error_info":"usage_limit_exceeded"}}}}}}"#,
+                "\n"
+            ),
+            t = turn
+        )
+    }
+
+    fn append(path: &Path, text: &[u8]) {
+        std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(path)
+            .unwrap()
+            .write_all(text)
+            .unwrap();
+    }
+
+    fn live(_: &str, _: &str) -> bool {
+        true
+    }
+
+    /// Scenario: Arm Codex rollout tailers against files in a temp dir and
+    /// poll them. A usage-limit failure for the armed turn is reported once and
+    /// disarms; a dead owner's tailer is dropped; a FIFO, a wrong file name and
+    /// a `..` path are refused; a tick reads at most 1 MiB, a 300 KiB line is
+    /// skipped, and a new arm starts 256 KiB before the end.
+    #[spec("status/blocked/013")]
+    #[test]
+    fn status_blocked_013_codex_rollout_tailer_is_bounded_and_path_safe() {
+        let dir = tempfile::tempdir().unwrap();
+        let rollout = dir.path().join("rollout-2026-09-26T04-19-10-a.jsonl");
+        append(&rollout, b"{\"type\":\"session_meta\"}\n");
+
+        // Armed turn, then the failure: one block, then the watch is gone.
+        let mut tailers = CodexRolloutTailers::default();
+        tailers.apply(arm("a", &rollout, Some(TURN)));
+        assert!(tailers.tick(live).is_empty());
+        append(&rollout, failure_lines(TURN).as_bytes());
+        let blocks = tailers.tick(live);
+        assert_eq!(
+            blocks,
+            vec![CodexBlock {
+                pane_id: "pane-a".into(),
+                agent_id: "a".into(),
+                session_id: "session-a".into(),
+                kind: BlockedKind::CreditsDepleted,
+                resets_at_ms: None,
+                message: Some("out of credits".into()),
+            }]
+        );
+        assert!(!tailers.is_armed("a"), "a completed turn disarms");
+        append(&rollout, failure_lines(TURN).as_bytes());
+        assert!(tailers.tick(live).is_empty(), "reported once");
+
+        // Another turn's failure is not ours; a Stop for the watched turn
+        // disarms, and a late Stop for an earlier turn does not.
+        tailers.apply(arm("a", &rollout, Some("turn-2")));
+        append(&rollout, failure_lines("turn-other").as_bytes());
+        assert!(tailers.tick(live).is_empty());
+        tailers.apply(ArmCommand::Disarm {
+            agent_id: "a".into(),
+            turn_id: TURN.into(),
+        });
+        assert!(tailers.is_armed("a"), "a Stop for another turn");
+        tailers.apply(ArmCommand::Disarm {
+            agent_id: "a".into(),
+            turn_id: "turn-2".into(),
+        });
+        assert!(!tailers.is_armed("a"));
+
+        // The failure may be written before the arm is handled: the back
+        // window covers it.
+        tailers.apply(arm("a", &rollout, Some("turn-3")));
+        append(&rollout, failure_lines("turn-3").as_bytes());
+        tailers.apply(arm("a", &rollout, Some("turn-3")));
+        assert_eq!(tailers.tick(live).len(), 1);
+
+        // Arming without a path is a no-op for an unknown agent; a dead owner's
+        // tailer is dropped.
+        tailers.apply(ArmCommand::Arm(ArmRequest {
+            pane_id: "pane-x".into(),
+            agent_id: "x".into(),
+            session_id: "s".into(),
+            path: None,
+            turn_id: Some(TURN.into()),
+        }));
+        assert!(!tailers.has_tailer("x"));
+        tailers.apply(arm("a", &rollout, Some("turn-4")));
+        tailers.tick(|_, _| false);
+        assert!(!tailers.has_tailer("a"), "a dead owner's tailer is dropped");
+
+        // Refusals.
+        let wrong_name = dir.path().join("notes.jsonl");
+        append(&wrong_name, failure_lines(TURN).as_bytes());
+        assert_eq!(
+            open_rollout(&wrong_name.to_string_lossy()).unwrap_err(),
+            "not a rollout-*.jsonl file"
+        );
+        let dotdot = format!("{}/sub/../{}", dir.path().display(), "rollout-x.jsonl");
+        assert_eq!(open_rollout(&dotdot).unwrap_err(), "contains ..");
+        assert_eq!(
+            open_rollout("rollout-rel.jsonl").unwrap_err(),
+            "not absolute"
+        );
+        #[cfg(unix)]
+        {
+            let fifo = dir.path().join("rollout-fifo.jsonl");
+            let c = std::ffi::CString::new(fifo.to_string_lossy().as_bytes()).unwrap();
+            // SAFETY: a valid NUL-terminated path.
+            assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+            let link = dir.path().join("rollout-link.jsonl");
+            std::os::unix::fs::symlink(&fifo, &link).unwrap();
+            assert_eq!(
+                open_rollout(&link.to_string_lossy()).unwrap_err(),
+                "not a regular file",
+                "a symlink to a FIFO is refused without blocking"
+            );
+            // Through the tailer: refused, disarmed, and never retried.
+            let mut t = CodexRolloutTailers::default();
+            t.apply(arm("f", &link, Some(TURN)));
+            assert!(t.tick(live).is_empty());
+            assert!(!t.is_armed("f"));
+            t.apply(arm("f", &link, Some(TURN)));
+            assert!(t.tick(live).is_empty());
+            assert!(t.refused.contains(&link.to_string_lossy().into_owned()));
+        }
+
+        // Bounds: 1 MiB per tick, a 300 KiB line skipped, the back window.
+        let big = dir.path().join("rollout-big.jsonl");
+        let mut body = Vec::new();
+        body.extend(std::iter::repeat_n(b'x', 300 * 1024));
+        body.push(b'\n');
+        append(&big, &body);
+        let mut t = CodexRolloutTailers::default();
+        t.apply(arm("b", &big, Some(TURN)));
+        assert!(t.tick(live).is_empty());
+        let offset = |t: &CodexRolloutTailers| t.tailers["b"].open.as_ref().unwrap().offset;
+        assert_eq!(
+            offset(&t),
+            (300 * 1024 + 1) as u64,
+            "the first arm starts at len - 256 KiB and reads to the end"
+        );
+        // A 300 KiB line straddling the watch, then the real failure after it.
+        let mut long = br#"{"type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-714","error":{"codex_error_info":"usage_limit_exceeded"},"pad":""#.to_vec();
+        long.extend(std::iter::repeat_n(b'y', 300 * 1024));
+        long.extend_from_slice(b"\"}}\n");
+        append(&big, &long);
+        assert!(t.tick(live).is_empty(), "an overlong line is never parsed");
+        assert!(t.is_armed("b"));
+        // 3 MiB of filler: read in 1 MiB steps.
+        let filler_line = [&[b'z'; 1023][..], b"\n"].concat();
+        let filler: Vec<u8> = filler_line.repeat(3 * 1024);
+        append(&big, &filler);
+        let before = offset(&t);
+        t.tick(live);
+        assert_eq!(offset(&t) - before, MAX_READ_PER_TICK);
+        append(&big, failure_lines(TURN).as_bytes());
+        let mut found = Vec::new();
+        for _ in 0..4 {
+            found.extend(t.tick(live));
+        }
+        assert_eq!(found.len(), 1, "the failure after the filler is found");
+    }
+}

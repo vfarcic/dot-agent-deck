@@ -44,9 +44,8 @@ const EVENT_TITLES: Record<string, string> = {
   permission_request: "Permission requested",
   idle: "Idle",
   error: "Agent reported an error",
-  // Issue #714: synthesized by the daemon from the pane's own screen.
+  // Issue #714: the agent reported its provider refusing it for a quota.
   quota_blocked: "Provider usage limit reached",
-  quota_cleared: "Provider usage-limit error no longer on screen",
   delegation_dispatched: "Delegation dispatched",
   delegation_delivered: "Task delivered to worker",
   delegation_failed: "Delegation FAILED",
@@ -95,14 +94,10 @@ function clockFor(timestamp: unknown): string {
 }
 
 function summaryFor(event: DaemonHookEvent, eventType: string): string {
-  // Issue #714: the daemon's own verdict, not the agent's report, so it is
-  // worded as such — fixed text, and the matched pane line is left out: the
-  // tile carries it, sanitised, beside the status it explains.
+  // Issue #714: fixed text, and the agent's own error message is left out:
+  // the tile carries it, sanitised, beside the status it explains.
   if (eventType === "quota_blocked") {
-    return "The deck read a provider usage-limit or credit error on this agent's screen; its work will not progress until the quota is restored or the task is reassigned.";
-  }
-  if (eventType === "quota_cleared") {
-    return "The provider usage-limit or credit error has scrolled off this agent's screen after later output, so the deck no longer shows it as blocked.";
+    return "The agent reported that its provider refused it for a usage limit or credit pool; its work will not progress until the quota is restored or the task is reassigned.";
   }
   const tool = text(event.tool_name);
   const detail = text(event.tool_detail);

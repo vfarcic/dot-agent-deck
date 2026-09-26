@@ -21309,17 +21309,31 @@ fn render_session_card(
     // Issue #714: say WHY a card is Blocked, directly under `Dir:` for the same
     // reason as the orphaned line — it is the fact that explains everything
     // else on the card. The label is fixed daemon-authored text keyed on the
-    // kind; the detail is the pane's own matched line, already scrubbed at
-    // every point it was stored (`apply_event`, `overlay_snapshot_fields`).
+    // kind, followed by when the provider said the limit resets (measured
+    // against the same `now` as `Last:`, and placed before the detail so a
+    // narrow card truncates the detail first); the detail is the agent's own
+    // error message, already scrubbed at every point it was stored
+    // (`apply_event`, `overlay_snapshot_fields`).
     if !is_placeholder && session.status == SessionStatus::Blocked {
         let reason = session.blocked.as_ref();
         let label = reason
             .map(|r| r.kind)
-            .unwrap_or(crate::quota_detect::BlockedKind::Unknown)
+            .unwrap_or(crate::state::BlockedKind::Unknown)
             .label();
+        let resets = reason
+            .and_then(|r| r.resets_at_ms)
+            .and_then(|at| u64::try_from(at - now.timestamp_millis()).ok())
+            .filter(|&ms| ms > 0)
+            .map(|ms| {
+                format!(
+                    " · resets in {}",
+                    crate::state::format_idle_elapsed(std::time::Duration::from_millis(ms))
+                )
+            })
+            .unwrap_or_default();
         let text = match reason.and_then(|r| r.detail.as_deref()) {
-            Some(detail) => format!("⚠ {label} — {detail}"),
-            None => format!("⚠ {label}"),
+            Some(detail) => format!("⚠ {label}{resets} — {detail}"),
+            None => format!("⚠ {label}{resets}"),
         };
         lines.push(Line::from(Span::styled(
             truncate_with_ellipsis(&text, w),

@@ -872,8 +872,8 @@ fn delegate_verdict(
 /// [`dot_agent_deck::event::DelegateResponse::blocked`], split by what happened
 /// to each blocked role. Never a failure on its own: a blocked worker that was
 /// delivered to really has the task (a windowed limit may even have reset), so
-/// the exit code stays governed by the rules above. Fixed text plus role labels
-/// and ages only — no pane text, which is agent-controlled.
+/// the exit code stays governed by the rules above. Fixed text plus role labels,
+/// ages and resets only — no error text, which is agent-controlled.
 fn blocked_workers_note(resp: &dot_agent_deck::event::DelegateResponse) -> Option<String> {
     if resp.blocked.is_empty() {
         return None;
@@ -886,7 +886,7 @@ fn blocked_workers_note(resp: &dot_agent_deck::event::DelegateResponse) -> Optio
     let mut lines = Vec::new();
     if !delivered.is_empty() {
         lines.push(format!(
-            "Warning: worker(s) {} appear BLOCKED by a provider usage limit. The task WAS \
+            "Warning: worker(s) {} appear BLOCKED by a provider usage limit or credit pool. The task WAS \
              delivered but will likely not be worked on while that lasts — if the worker's card \
              still shows Blocked, reassign it to a role backed by a different provider or \
              account, or restore the quota and re-delegate.",
@@ -895,7 +895,7 @@ fn blocked_workers_note(resp: &dot_agent_deck::event::DelegateResponse) -> Optio
     }
     if !busy.is_empty() {
         lines.push(format!(
-            "Warning: busy worker(s) {} also appear BLOCKED by a provider usage limit, so \
+            "Warning: busy worker(s) {} also appear BLOCKED by a provider usage limit or credit pool, so \
              --supersede will likely not get the task worked on while that lasts — if the \
              worker's card still shows Blocked, reassign it to a role backed by a different \
              provider or account.",
@@ -3535,6 +3535,7 @@ mod tests {
             role: role.to_string(),
             kind,
             blocked_for_secs: 5 * 60,
+            resets_in_secs: None,
         }
     }
 
@@ -3542,8 +3543,8 @@ mod tests {
     /// worker that was delivered to, then one naming a blocked worker that was
     /// refused as busy. The first warns that the task was delivered but will
     /// likely not be worked on and still exits 0; the second names the busy
-    /// role as blocked so `--supersede` is not mistaken for a fix. Neither
-    /// carries any pane text.
+    /// role as blocked so `--supersede` is not mistaken for a fix, with the
+    /// reset the provider gave. Neither carries any agent text.
     #[spec("orchestration/delegate/038")]
     #[test]
     fn orchestration_delegate_038_verdict_reports_blocked_for_delivered_and_busy() {
@@ -3554,9 +3555,9 @@ mod tests {
         assert!(!v.failed, "the task WAS delivered: exit 0");
         let msg = v.message.expect("a blocked worker must never be silent");
         assert!(
-            msg.contains("appear BLOCKED by a provider usage limit")
+            msg.contains("appear BLOCKED by a provider usage limit or credit pool")
                 && msg.contains("[UNTRUSTED-ROLE-LABEL: coder :END-UNTRUSTED-ROLE-LABEL]")
-                && msg.contains("detected 5 minutes ago")
+                && msg.contains("reported 5 minutes ago by the agent")
                 && msg.contains("credits do not reset on their own")
                 && msg.contains("The task WAS delivered"),
             "{msg}"
@@ -3565,7 +3566,10 @@ mod tests {
         // Busy AND blocked, nothing delivered: the routing failure, annotated.
         let mut resp = reply(&[], &[], Some("this delegate was NOT sent"));
         resp.busy = vec![busy("coder", 1)];
-        resp.blocked = vec![blocked("coder", BlockedKind::UsageLimit)];
+        resp.blocked = vec![dot_agent_deck::event::BlockedWorker {
+            resets_in_secs: Some(90 * 60),
+            ..blocked("coder", BlockedKind::UsageLimit)
+        }];
         let v = delegate_verdict("pane-1", &resp);
         assert!(v.failed, "nothing was dispatched: non-zero");
         let msg = v.message.expect("reported");
@@ -3574,6 +3578,7 @@ mod tests {
                 && msg.contains("busy worker(s)")
                 && msg.contains("also appear BLOCKED")
                 && msg.contains("--supersede will likely not get the task worked on")
+                && msg.contains("; resets in 1h 30m")
                 && !msg.contains("credits do not reset"),
             "{msg}"
         );

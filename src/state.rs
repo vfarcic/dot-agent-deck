@@ -15,9 +15,9 @@ use crate::event::{
 use crate::project_config::{
     DEFAULT_WORKER_RESPONSE_TIMEOUT_MINUTES, OrchestrationRoleConfig, load_project_config,
 };
-/// Issue #714: the quota-block reason types live beside their classifier, and
+/// Issue #714: the quota-block reason types live in [`crate::quota_block`], and
 /// are re-exported here beside the [`SessionStatus::Blocked`] they explain.
-pub use crate::quota_detect::{BlockedKind, BlockedReason};
+pub use crate::quota_block::{BlockedKind, BlockedReason};
 
 const MAX_RECENT_EVENTS: usize = 50;
 /// The session key a pane's PLACEHOLDER card is filed under — the one
@@ -652,10 +652,11 @@ pub enum SessionStatus {
     WaitingForInput,
     Idle,
     Error,
-    /// Issue #714: the pane's own screen shows its provider refusing the agent
-    /// for an exhausted usage limit or credit pool, confirmed by the daemon's
-    /// quota detector (`crate::quota_detect`). Why, and since when, rides the
-    /// separate [`SessionState::blocked`] / [`SessionSnapshot::blocked`].
+    /// Issue #714: the agent reported that its provider refused it for an
+    /// exhausted usage limit or credit pool (an [`EventType::QuotaBlocked`] —
+    /// see [`crate::quota_block`] for who sends it). Why, since when and until
+    /// when rides the separate [`SessionState::blocked`] /
+    /// [`SessionSnapshot::blocked`].
     ///
     /// **A UNIT variant, and it must stay one.** An older reader's
     /// `#[serde(other)] Unknown` rescues an unrecognised unit tag
@@ -665,9 +666,9 @@ pub enum SessionStatus {
     /// Pinned by `status_blocked_007_older_reader_decodes_blocked_as_unknown`.
     ///
     /// Sticky: `Idle`, `Error` and the shell-activity pair leave it in place.
-    /// Evidence of work ([`crate::quota_detect::is_work_evidence`]) clears it,
-    /// and so does the daemon's `QuotaCleared` once later output has pushed the
-    /// quota line out of the pane's bottom rows. See [`AppState::apply_event`].
+    /// Evidence of work ([`crate::quota_block::is_work_evidence`]) clears it,
+    /// and so does a pane restart, which starts a new card. There is no timer.
+    /// See [`AppState::apply_event`].
     Blocked,
     /// PRD #162 forward-compat catch-all: a future/unknown `status` string on
     /// the wire deserializes here instead of failing the whole `AgentRecord`
@@ -783,7 +784,8 @@ pub struct SessionSnapshot {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_activity_ms: Option<i64>,
     /// Issue #714: why the session is [`SessionStatus::Blocked`] — which limit,
-    /// since when, and the scrubbed matched text for display. `Some` only while
+    /// since when, until when (if the provider said), and the agent's own
+    /// scrubbed message for display. `Some` only while
     /// the status is `Blocked`. Additive optional
     /// (`#[serde(default)]` + `skip_serializing_if`), the `last_activity_ms`
     /// precedent: an older reader ignores the key and a newer one tolerates its
@@ -799,7 +801,7 @@ pub struct SessionState {
     pub cwd: Option<String>,
     pub status: SessionStatus,
     /// Issue #714: the reason behind a [`SessionStatus::Blocked`] status — set
-    /// by the daemon's `QuotaBlocked` event and cleared together with the
+    /// by a `QuotaBlocked` event and cleared together with the
     /// status. `None` whenever the status is anything else.
     pub blocked: Option<BlockedReason>,
     pub active_tool: Option<ActiveTool>,
@@ -1752,7 +1754,7 @@ pub fn worker_response_timeout(
 /// prompt's "was delegated N ago" clause. Deliberately coarse — the point is
 /// "this has been a while", not stopwatch precision — and always ASCII so the
 /// wording never depends on terminal font coverage.
-fn format_idle_elapsed(elapsed: std::time::Duration) -> String {
+pub(crate) fn format_idle_elapsed(elapsed: std::time::Duration) -> String {
     fn plural(n: u64, unit: &str) -> String {
         format!("{n} {unit}{}", if n == 1 { "" } else { "s" })
     }
@@ -1798,20 +1800,29 @@ pub fn describe_busy_workers(busy: &[crate::event::BusyWorker]) -> String {
 
 /// Issue #714: render [`crate::event::DelegateResponse::blocked`] for the
 /// delegate CLI — role labels (quoted as untrusted, like
-/// [`describe_busy_workers`]) with fixed daemon wording for the kind and age.
-/// Carries no pane text: the matched quota line is agent-controlled and this
+/// [`describe_busy_workers`]) with fixed daemon wording for the kind, age and
+/// reset. Carries no agent text: the error message is agent-controlled and this
 /// lands in the orchestrator's tool output.
 pub fn describe_blocked_workers(blocked: &[crate::event::BlockedWorker]) -> String {
     blocked
         .iter()
         .map(|worker| {
+            let resets = worker
+                .resets_in_secs
+                .map(|secs| {
+                    format!(
+                        "; resets in {}",
+                        format_idle_elapsed(std::time::Duration::from_secs(secs))
+                    )
+                })
+                .unwrap_or_default();
             let no_reset = if worker.kind == BlockedKind::CreditsDepleted {
                 "; credits do not reset on their own"
             } else {
                 ""
             };
             format!(
-                "{} (detected {} ago from the pane's own output{no_reset})",
+                "{} (reported {} ago by the agent{resets}{no_reset})",
                 quote_untrusted_role(&worker.role),
                 format_idle_elapsed(std::time::Duration::from_secs(worker.blocked_for_secs)),
             )
@@ -2948,15 +2959,44 @@ pub(crate) fn compose_respawn_no_live_worker_notice(worker_pane_id: &str) -> Str
     ))
 }
 
+/// Issue #714: after a respawn replaced the agent on `pane_id` with
+/// `new_agent_id`, lift the replaced agent's quota block
+/// ([`AppState::lift_replaced_quota_blocks`]) and broadcast the lift to attached
+/// clients. The `AppState` write lock is taken on a DETACHED task: both callers
+/// may be running under a read guard their own caller still holds (the
+/// re-registration of a recreated role defers its write for the same reason).
+pub(crate) fn spawn_lift_replaced_quota_blocks(
+    state: SharedState,
+    event_tx: broadcast::Sender<BroadcastMsg>,
+    pane_id: String,
+    new_agent_id: String,
+) {
+    tokio::spawn(async move {
+        let events = state
+            .write()
+            .await
+            .lift_replaced_quota_blocks(&pane_id, &new_agent_id);
+        if !events.is_empty() {
+            tracing::info!(
+                pane_id = %pane_id,
+                "quota: a pane restart replaced a blocked agent; its Blocked card is lifted"
+            );
+        }
+        for event in events {
+            let _ = event_tx.send(BroadcastMsg::Event(event));
+        }
+    });
+}
+
 /// Issue #714: the single-line notice written into the ORCHESTRATOR's pane when
-/// the daemon's quota detector confirms that a worker which still owes a
-/// `work-done` is blocked by its provider's usage limit or credit pool.
+/// a worker which still owes a `work-done` reports that it is blocked by its
+/// provider's usage limit or credit pool.
 ///
 /// The deferred family's third member, delivered with the same
 /// `write_notice_guarded` and bound by the same contract as
 /// [`compose_worker_exited_notice`]: fixed daemon-authored text, a single line,
 /// and the worker's scrubbed `pane_id_env` as the ONLY interpolation. In
-/// particular the pane's matched quota line is NOT interpolated — it is
+/// particular the agent's own error message is NOT interpolated — it is
 /// agent-controlled text and these bytes can later be submitted fused to a real
 /// prompt — and neither is the role, which rides the accompanying
 /// `tracing::info!`. Sent once per outstanding delegation, and the delegation
@@ -2970,8 +3010,9 @@ pub(crate) fn compose_respawn_no_live_worker_notice(worker_pane_id: &str) -> Str
 pub(crate) fn compose_worker_blocked_notice(worker_pane_id: &str) -> String {
     compose_delegate_prompt(&format!(
         "⚠ delegated worker blocked by a provider usage limit (dot-agent-deck daemon report): \
-         the agent behind pane {worker_pane_id} is alive but its own output says its provider \
-         usage limit is exhausted; its outstanding delegation will likely not complete while \
+         the agent behind pane {worker_pane_id} is alive but it reports that its provider \
+         usage limit or credit pool is exhausted; its outstanding delegation will likely not \
+         complete while \
          that lasts. Check the worker's card: if it still shows Blocked, reassign the task to a \
          role backed by a different provider or account; the daemon log names the role."
     ))
@@ -3015,13 +3056,11 @@ fn worker_event_proves_delivery(event: &AgentEvent) -> bool {
         // that the LLM ever saw a prompt (a human could type it by hand).
         // `Unknown` is the forward-compat catch-all — never proof by
         // construction, matching `SessionStatus::Unknown`'s neutral rendering.
-        // Issue #714: `QuotaBlocked` is daemon-synthesized from pane output — it
-        // says the provider refused the agent, which is the opposite of a turn —
-        // and `QuotaCleared` says only that the refusal left the screen.
+        // Issue #714: `QuotaBlocked` says the provider refused the agent, which
+        // is the opposite of a turn.
         EventType::ShellBusy
         | EventType::ShellIdle
         | EventType::QuotaBlocked
-        | EventType::QuotaCleared
         | EventType::Unknown => false,
         // A turn is underway: a submitted prompt, a tool, a subagent, a
         // compaction, or a permission request raised by a tool the agent chose.
@@ -5514,6 +5553,15 @@ async fn dispatch_one_owned(
                 // role would be refused as busy (#580) until it expired. This
                 // dispatch's own commission and any still queued behind this lock
                 // are kept: their pointers go to the replacement.
+                // Issue #714: the replaced agent's quota block goes with it.
+                if let Some(state) = state.as_ref() {
+                    spawn_lift_replaced_quota_blocks(
+                        state.clone(),
+                        event_tx.clone(),
+                        pane_id.clone(),
+                        new_agent_id.clone(),
+                    );
+                }
                 let retired =
                     registry.retire_commissions_of_replaced_agent(&pane_id, commission_armed);
                 if retired > 0 {
@@ -6508,9 +6556,9 @@ async fn dispatch_one_owned(
         }
     };
     // Issue #714 (review): a task just handed to a worker whose quota block is
-    // ALREADY published owes the orchestrator its own blocked-worker notice. The
-    // publish path notified only the delegation outstanding when the block was
-    // first confirmed, and an unchanged blocked screen never publishes again, so
+    // ALREADY reported owes the orchestrator its own blocked-worker notice. The
+    // report notified only the delegation outstanding when the block arrived,
+    // and a blocked agent reports nothing more until its next attempt, so
     // without this the new delegation would never be reported. Claimed for this
     // delegation's generation and written on its own task, so this dispatch
     // never waits on the orchestrator's pane writer.
@@ -6711,7 +6759,7 @@ fn overlay_snapshot_fields(session: &mut SessionState, snap: &SessionSnapshot) {
         snap.blocked.clone().map(|mut reason| {
             reason.detail = reason
                 .detail
-                .map(|d| crate::quota_detect::scrub_detail(&d))
+                .map(|d| crate::quota_block::scrub_detail(&d))
                 .filter(|d| !d.is_empty());
             reason
         })
@@ -8101,10 +8149,10 @@ impl AppState {
         for (target_role, pane_id) in targets {
             // Issue #714: note a worker whose card reads `Blocked`, whether it is
             // delivered to or refused as busy below. A warning and never a
-            // refusal: the status is derived from the pane's own output, which —
-            // like a hook-reported status — is not an input this daemon may
-            // authorize on (#601, #696), and a windowed limit may have reset:
-            // delivering the task is how the agent retries.
+            // refusal: the status is reported by the agent's own hooks or session
+            // log, which — like every hook-reported status — is not an input this
+            // daemon may authorize on (#601, #696), and a windowed limit may have
+            // reset: delivering the task is how the agent retries.
             if let Some(reason) = self.pane_blocked_reason(&pane_id)
                 && !blocked.iter().any(|b| b.role == target_role)
             {
@@ -8115,6 +8163,11 @@ impl AppState {
                     blocked_for_secs: u64::try_from(now_ms.saturating_sub(reason.detected_at_ms))
                         .unwrap_or(0)
                         / 1000,
+                    resets_in_secs: reason
+                        .resets_at_ms
+                        .and_then(|at| u64::try_from(at.saturating_sub(now_ms)).ok())
+                        .filter(|&ms| ms > 0)
+                        .map(|ms| ms.div_ceil(1000)),
                 });
             }
             let registry = Arc::clone(registry);
@@ -8300,7 +8353,63 @@ impl AppState {
             kind: BlockedKind::Unknown,
             detected_at_ms: session.last_activity.timestamp_millis(),
             detail: None,
+            resets_at_ms: None,
         }))
+    }
+
+    /// Issue #714: a pane restart replaced the agent on `pane_id` with
+    /// `new_agent_id`, so every `Blocked` card on that pane that names a
+    /// DIFFERENT agent describes an agent that is gone: lift each to `Idle`, in
+    /// place, and return the `Idle` events that carry the same lift to attached
+    /// clients ([`crate::event::AgentEvent::is_quota_block_lift`]).
+    ///
+    /// Mutated directly rather than through [`Self::apply_event`], whose
+    /// admission would refuse an event naming the replaced agent. Each returned
+    /// event names the card's own session and agent and carries the card's own
+    /// last-activity instant as its timestamp, so on a client whose card has
+    /// already changed hands it is older than the successor and can neither
+    /// retire it nor move the pane's generation — and `apply_event` refuses it
+    /// those powers regardless (`claims_generation`). A card the new agent has
+    /// already blocked again names the new agent and is left alone.
+    pub fn lift_replaced_quota_blocks(
+        &mut self,
+        pane_id: &str,
+        new_agent_id: &str,
+    ) -> Vec<AgentEvent> {
+        let mut events = Vec::new();
+        for (session_id, session) in self.sessions.iter_mut() {
+            if session.pane_id.as_deref() != Some(pane_id)
+                || session.status != SessionStatus::Blocked
+                || session.agent_id.as_deref() == Some(new_agent_id)
+            {
+                continue;
+            }
+            session.status = SessionStatus::Idle;
+            session.blocked = None;
+            session.active_tool = None;
+            let mut metadata = std::collections::HashMap::new();
+            metadata.insert(
+                crate::quota_block::QUOTA_BLOCKED_LIFTED_METADATA_KEY.to_string(),
+                crate::quota_block::QUOTA_BLOCKED_LIFTED_BY_PANE_RESTART.to_string(),
+            );
+            events.push(AgentEvent {
+                session_id: session_id.clone(),
+                agent_type: session.agent_type.clone(),
+                event_type: EventType::Idle,
+                tool_name: None,
+                tool_detail: None,
+                cwd: None,
+                timestamp: session.last_activity,
+                user_prompt: None,
+                metadata,
+                pane_id: Some(pane_id.to_string()),
+                agent_id: session.agent_id.clone(),
+                agent_version: None,
+                schema_version: None,
+                live_target: None,
+            });
+        }
+        events
     }
 
     /// Caller validation shared by [`Self::handle_delegate_with_state`] and
@@ -8425,13 +8534,10 @@ pub async fn handle_restart_role_with_state(
     event_tx: &broadcast::Sender<BroadcastMsg>,
 ) -> crate::event::RestartRoleResponse {
     use crate::event::RestartRoleResponse;
-    // Accepted but unused: kept for signature symmetry with
-    // `handle_spawn_role_with_state`, which genuinely needs `event_tx` to
-    // broadcast an `OrchestrationSurface` when a spawn grows a tab. A restart
-    // never grows a tab — the pane already exists — so there is nothing to
-    // broadcast here, but both handlers are dispatched from the same call
-    // site with the same argument tuple.
-    let _ = event_tx;
+    // A restart never grows a tab — the pane already exists — so, unlike
+    // `handle_spawn_role_with_state`, it broadcasts no `OrchestrationSurface`.
+    // Issue #714: it does broadcast the lift of a quota block the replaced agent
+    // left on the pane's card (`spawn_lift_replaced_quota_blocks`).
 
     struct ResolvedRestart {
         pane_id: String,
@@ -8585,7 +8691,10 @@ pub async fn handle_restart_role_with_state(
         )
         .await
     {
-        Ok(crate::agent_pty::PaneRespawn { recreated, .. }) => {
+        Ok(crate::agent_pty::PaneRespawn {
+            agent_id: new_agent_id,
+            recreated,
+        }) => {
             // Issue #590: a restart replaces the agent, and the agent that owed
             // the pane's outstanding commissions never saw its replacement's
             // context. `pane restart --force` is in practice how an orchestrator
@@ -8612,6 +8721,13 @@ pub async fn handle_restart_role_with_state(
                     "pane restart: cancelled the replaced worker's idle and silent-worker watches"
                 );
             }
+            // Issue #714: the replaced agent's quota block goes with it.
+            spawn_lift_replaced_quota_blocks(
+                state.clone(),
+                event_tx.clone(),
+                resolved.pane_id.clone(),
+                new_agent_id.clone(),
+            );
             if recreated && let Some(identity) = resolved.orchestration.clone() {
                 // See this function's own locking note: `state` is cloned
                 // and the write lock is taken inside a DETACHED task, only
@@ -9371,6 +9487,23 @@ impl AppState {
             }
             return;
         }
+        // Issue #714: the daemon's lift of a replaced agent's block is a
+        // statement about ONE existing card — the replaced agent's. A client
+        // may file that card under another key (a card hydrated before the
+        // agent's first hook keeps its placeholder key, and the reuse guard
+        // below maps this event onto it by pane and agent), but a client whose
+        // card is already gone (the successor's first event retired it) must
+        // not rebuild it from this.
+        if event.is_quota_block_lift()
+            && !self.sessions.iter().any(|(id, session)| {
+                *id == event.session_id
+                    || (session.pane_id.is_some()
+                        && session.pane_id == event.pane_id
+                        && session.agent_id == event.agent_id)
+            })
+        {
+            return;
+        }
         // Issue #833: `tool_name` / `tool_detail` are PRODUCER-supplied — every
         // agent on the deck can post to the hook socket — and both are drawn
         // into a card's tool line (`ui::recent_tool_lines` reads them off the
@@ -9526,7 +9659,10 @@ impl AppState {
         // is not evidence of a takeover and may retire nothing. Hoisted above
         // the reuse guard for issue #398 — the adoption fallback below needs the
         // same predicate, for a related reason spelled out at its use.
-        let claims_generation = event.event_type != EventType::SessionEnd;
+        // Issue #714: the daemon's lift of a replaced agent's block speaks for
+        // the REPLACED generation, so it may retire and adopt nothing.
+        let claims_generation =
+            event.event_type != EventType::SessionEnd && !event.is_quota_block_lift();
 
         // Issue #925: a producer's session key says nothing about WHICH PANE a
         // frame came from, and this is the last point before the key is spent.
@@ -10490,71 +10626,73 @@ impl AppState {
         // because "does this event type write a status" is a property of the
         // arm's own conditional and drifts the moment one is edited.
         // Issue #714: a `Blocked` card is STICKY. The provider has refused the
-        // agent, and the frames that typically trail that refusal — Codex's
-        // `Stop` (`Idle`), OpenCode's `session.error` then `session.idle`, the
-        // shell-activity pair — must not repaint it `Idle`, which is exactly what
-        // hid the blocked worker in #714. Evidence of WORK
-        // ([`crate::quota_detect::is_work_evidence`]) lifts it, because a limit
+        // agent, and the frames that typically trail that refusal — OpenCode's
+        // `session.idle` after its `session.error`, Claude Code's `idle_prompt`
+        // notification, the shell-activity pair — must not repaint it `Idle`,
+        // which is exactly what hid the blocked worker in #714. Evidence of WORK
+        // ([`crate::quota_block::is_work_evidence`]) lifts it, because a limit
         // that resets is discovered the only honest way: the agent works again.
-        // So does the daemon's own `QuotaCleared`, for an agent that sends no
-        // native work hooks: the pane wrote later output and the quota line is
-        // no longer among its bottom rows (arm below). There is deliberately no
-        // timer — a spent credit pool has no reset.
+        // A pane restart starts a new card. There is deliberately no timer — a
+        // spent credit pool has no reset.
         //
         // Lifted to `Thinking` first, a turn being underway, so an arm that
         // asserts nothing of its own (`ToolEnd`, `Subagent*`) does not leave a
         // stale `Blocked` behind; an arm that does assert overwrites it below.
         let quota_blocked = event.event_type == EventType::QuotaBlocked;
-        let quota_cleared = event.event_type == EventType::QuotaCleared;
+        let quota_lift = event.is_quota_block_lift();
         if session.status == SessionStatus::Blocked
             && !quota_blocked
-            && crate::quota_detect::is_work_evidence(&event)
+            && !quota_lift
+            && crate::quota_block::is_work_evidence(&event)
         {
             session.status = SessionStatus::Thinking;
             session.blocked = None;
         }
         let blocked_hold =
-            session.status == SessionStatus::Blocked && !quota_blocked && !quota_cleared;
+            session.status == SessionStatus::Blocked && !quota_blocked && !quota_lift;
 
         let asserted_status = match event.event_type {
             // Issue #714: still blocked and this frame proves no work — it is
             // journalled below like any other, but asserts no status.
             _ if blocked_hold => false,
-            EventType::QuotaBlocked => {
-                // Daemon-authored: the hook loop drops a producer's
-                // `quota_blocked` and strips these keys from every inbound
-                // frame. The detail is scrubbed again here anyway, because it is
-                // STORED and read by every consumer of the card and the snapshot.
-                let kind = event
-                    .metadata
-                    .get(crate::quota_detect::QUOTA_BLOCKED_KIND_METADATA_KEY)
-                    .map_or(BlockedKind::Unknown, |k| BlockedKind::from_wire(k));
-                let detail = event
-                    .metadata
-                    .get(crate::quota_detect::QUOTA_BLOCKED_DETAIL_METADATA_KEY)
-                    .map(|d| crate::quota_detect::scrub_detail(d))
-                    .filter(|d| !d.is_empty());
-                session.status = SessionStatus::Blocked;
-                session.blocked = Some(BlockedReason {
-                    kind,
-                    detected_at_ms: event.timestamp.timestamp_millis(),
-                    detail,
-                });
-                session.active_tool = None;
-                true
-            }
-            EventType::QuotaCleared => {
-                // Daemon-authored, like `QuotaBlocked`. Lifts only a Blocked
-                // card, and to `Idle`: the daemon re-probes only a pane that has
-                // gone quiet again, so nothing on it says a turn is underway —
-                // and `Idle` is what such a card showed before #714. The pane's
-                // own next hook overwrites it. Anywhere else it is a no-op.
+            // Issue #714: the daemon lifting a block whose agent a pane restart
+            // replaced (`AppState::lift_replaced_quota_blocks`). Only a Blocked
+            // card moves, to `Idle`; anywhere else it asserts nothing.
+            _ if quota_lift => {
                 let asserted = session.status == SessionStatus::Blocked;
                 if asserted {
                     session.status = SessionStatus::Idle;
                     session.active_tool = None;
                 }
                 asserted
+            }
+            EventType::QuotaBlocked => {
+                // The daemon normalised the keys on arrival
+                // (`admit_producer_event`); the detail is scrubbed again here
+                // anyway, because it is STORED and read by every consumer of the
+                // card and the snapshot. A repeat report refreshes the reason.
+                let kind = event
+                    .metadata
+                    .get(crate::quota_block::QUOTA_BLOCKED_KIND_METADATA_KEY)
+                    .map_or(BlockedKind::Unknown, |k| BlockedKind::from_wire(k));
+                let detail = event
+                    .metadata
+                    .get(crate::quota_block::QUOTA_BLOCKED_DETAIL_METADATA_KEY)
+                    .map(|d| crate::quota_block::scrub_detail(d))
+                    .filter(|d| !d.is_empty());
+                let resets_at_ms = event
+                    .metadata
+                    .get(crate::quota_block::QUOTA_BLOCKED_RESETS_AT_MS_METADATA_KEY)
+                    .and_then(|v| v.parse::<i64>().ok());
+                session.status = SessionStatus::Blocked;
+                session.blocked = Some(BlockedReason {
+                    kind,
+                    detected_at_ms: event.timestamp.timestamp_millis(),
+                    detail,
+                    resets_at_ms,
+                });
+                session.active_tool = None;
+                true
             }
             EventType::SessionStart => {
                 session.status = SessionStatus::Idle;
@@ -10661,13 +10799,7 @@ impl AppState {
         // and permanently strand the session at `Working` (the `ShellIdle`
         // would see the marker already false and become a no-op) — exactly
         // the silent-break `#[serde(other)]` exists to prevent.
-        // Issue #714: `QuotaCleared` is excluded for the same reason — on a card
-        // that is not Blocked it asserts nothing, so it must not strand a
-        // `ShellBusy` either.
-        if !matches!(
-            event.event_type,
-            EventType::ShellBusy | EventType::Unknown | EventType::QuotaCleared
-        ) {
+        if !matches!(event.event_type, EventType::ShellBusy | EventType::Unknown) {
             session.shell_synthetic_working = false;
         }
 
@@ -13762,17 +13894,16 @@ mod tests {
         );
     }
 
-    /// Issue #714 (review): a notice is attempted only when a block is first
-    /// published, and an unchanged blocked screen never publishes again — so a
-    /// task delegated to a worker that ALREADY reads Blocked must be reported by
-    /// the dispatch that delivers it. Publish a block on an idle worker, then
+    /// Issue #714 (review): a notice is attempted only when a block is
+    /// reported, and a blocked agent reports nothing more until its next attempt
+    /// — so a task delegated to a worker that ALREADY reads Blocked must be
+    /// reported by the dispatch that delivers it. Latch a block on a worker, then
     /// delegate to it twice: each delegation delivers exactly one notice to the
     /// orchestrator, a repeat report of the same delegation adds none, and once
     /// work evidence lifts the block a further delegation reports nothing.
     #[cfg(unix)]
     #[tokio::test]
     async fn dispatch_one_owned_reports_an_already_published_block_to_the_new_delegation() {
-        use crate::quota_detect::{BlockedKind, ProbeOutcome, QuotaTimings};
         const ORCH_PANE: &str = "published-block-orch";
         const WORKER_PANE: &str = "published-block-worker";
         const NOTICE: &str = "delegated worker blocked by a provider usage limit";
@@ -13795,24 +13926,15 @@ mod tests {
         let orch = spawn(ORCH_PANE, crate::event::AgentType::ClaudeCode);
         let (event_tx, _event_rx) = broadcast::channel(16);
 
-        // Confirm and publish a block on the fresh (silent) worker.
-        let rev = registry.quota_revision(&worker).expect("live worker");
-        let t0 = std::time::Instant::now();
-        let usage = Some(BlockedKind::UsageLimit);
-        assert_eq!(
-            registry.quota_record_probe(&worker, rev, t0, usage),
-            Some((ProbeOutcome::Candidate, None))
+        // The worker reports a block, as `ingest_event` latches it.
+        let epoch = registry
+            .note_quota_block(WORKER_PANE, &worker)
+            .expect("the worker is the pane's live owner");
+        assert!(registry.quota_block_current(WORKER_PANE, &worker, epoch));
+        assert!(
+            registry.note_quota_block(WORKER_PANE, &orch).is_none(),
+            "only the pane's live owner can latch a block"
         );
-        let epoch = match registry.quota_record_probe(
-            &worker,
-            rev,
-            t0 + QuotaTimings::from_env().confirm,
-            usage,
-        ) {
-            Some((ProbeOutcome::Confirmed(_), Some(epoch))) => epoch,
-            other => panic!("expected a confirmation, got {other:?}"),
-        };
-        assert!(registry.quota_claim_publication(WORKER_PANE, &worker, epoch));
 
         let notices = || {
             let snap = registry.snapshot(&orch).expect("orchestrator");
@@ -15927,66 +16049,48 @@ mod tests {
         }
     }
 
-    /// Issue #714 (audit R1): the daemon's `QuotaCleared` lifts a Blocked card
-    /// to Idle and drops its reason; on a card that is not Blocked it asserts
-    /// nothing, and in particular does not strand a `ShellBusy` Working (its
-    /// `ShellIdle` still reverts it).
-    #[test]
-    fn quota_cleared_lifts_only_a_blocked_card() {
-        let session = |state: &AppState| state.sessions.values().next().unwrap().clone();
-        let mut state = AppState::default();
-        state.register_pane("pane-q".to_string());
-        state.apply_event(quota_event(EventType::Thinking, 1));
-        state.apply_event(quota_blocked_event(BlockedKind::UsageLimit, "x", 2));
-        assert_eq!(session(&state).status, SessionStatus::Blocked);
-        state.apply_event(quota_event(EventType::QuotaCleared, 3));
-        assert_eq!(session(&state).status, SessionStatus::Idle);
-        assert!(session(&state).blocked.is_none());
-
-        // Not Blocked: a no-op, and a shell-synthetic Working survives it.
-        state.apply_event(quota_event(EventType::ShellBusy, 4));
-        assert_eq!(session(&state).status, SessionStatus::Working);
-        state.apply_event(quota_event(EventType::QuotaCleared, 5));
-        assert_eq!(session(&state).status, SessionStatus::Working);
-        state.apply_event(quota_event(EventType::ShellIdle, 6));
-        assert_eq!(session(&state).status, SessionStatus::Idle);
-    }
-
     fn quota_blocked_event(kind: BlockedKind, detail: &str, secs: i64) -> AgentEvent {
         let mut event = quota_event(EventType::QuotaBlocked, secs);
         event.tool_name = None;
         event.metadata.insert(
-            crate::quota_detect::QUOTA_BLOCKED_KIND_METADATA_KEY.to_string(),
+            crate::quota_block::QUOTA_BLOCKED_KIND_METADATA_KEY.to_string(),
             kind.as_wire().to_string(),
         );
         event.metadata.insert(
-            crate::quota_detect::QUOTA_BLOCKED_DETAIL_METADATA_KEY.to_string(),
+            crate::quota_block::QUOTA_BLOCKED_DETAIL_METADATA_KEY.to_string(),
             detail.to_string(),
         );
         event
     }
 
-    /// Scenario: Mark a Codex session blocked with a daemon quota event, then
-    /// send it the frames that trail a real quota refusal — idle, error and the
-    /// shell-activity pair. It must stay Blocked with its reason. A tool start
-    /// or a new prompt clears it and sets their own status, and the reconnect
-    /// snapshot carries the reason only while the status is Blocked.
+    /// Scenario: Mark a session blocked with a quota event carrying a reset
+    /// time, then send it the frames that trail a real quota refusal — idle,
+    /// error, the shell-activity pair and Claude's `idle_prompt` notification.
+    /// It must stay Blocked with its reason; a permission prompt, a tool start
+    /// or a new prompt clears it, and the snapshot carries the reason only
+    /// while the status is Blocked.
     #[spec("status/blocked/005")]
     #[test]
     fn status_blocked_005_apply_event_blocked_is_sticky_against_idle_and_error() {
         let mut state = AppState::default();
         state.register_pane("pane-q".to_string());
         state.apply_event(quota_event(EventType::Thinking, 1));
-        state.apply_event(quota_blocked_event(
+        let mut first = quota_blocked_event(
             BlockedKind::CreditsDepleted,
             "You\u{2019}ve hit your usage limit.\u{202e} purchase more credits",
             2,
-        ));
+        );
+        first.metadata.insert(
+            crate::quota_block::QUOTA_BLOCKED_RESETS_AT_MS_METADATA_KEY.to_string(),
+            "7200000".to_string(),
+        );
+        state.apply_event(first);
         let session = |state: &AppState| state.sessions["gen-q"].clone();
         assert_eq!(session(&state).status, SessionStatus::Blocked);
         let reason = session(&state).blocked.expect("reason recorded");
         assert_eq!(reason.kind, BlockedKind::CreditsDepleted);
         assert_eq!(reason.detected_at_ms, 2_000);
+        assert_eq!(reason.resets_at_ms, Some(7_200_000));
         assert_eq!(
             reason.detail.as_deref(),
             Some("You\u{2019}ve hit your usage limit. purchase more credits"),
@@ -16025,6 +16129,28 @@ mod tests {
             crate::event::WRAPPER_OUTPUT_CLASSIFIED_METADATA_VALUE.to_string(),
         );
         state.apply_event(classified);
+        assert_eq!(session(&state).status, SessionStatus::Blocked);
+        // Claude Code's `idle_prompt` fires after every ended turn, a blocked
+        // one included: it is not work.
+        let notification = |kind: &str, secs| {
+            let mut event = quota_event(EventType::WaitingForInput, secs);
+            event.metadata.insert(
+                crate::quota_block::NOTIFICATION_TYPE_METADATA_KEY.to_string(),
+                kind.to_string(),
+            );
+            event
+        };
+        state.apply_event(notification("idle_prompt", 9));
+        assert_eq!(
+            session(&state).status,
+            SessionStatus::Blocked,
+            "idle_prompt must not clear a blocked card"
+        );
+        // A permission prompt is raised inside a turn: it is.
+        state.apply_event(notification("permission_prompt", 9));
+        assert_eq!(session(&state).status, SessionStatus::WaitingForInput);
+        assert!(session(&state).blocked.is_none());
+        state.apply_event(quota_blocked_event(BlockedKind::CreditsDepleted, "x", 9));
         assert_eq!(session(&state).status, SessionStatus::Blocked);
 
         // A tool start is work: it clears the block and asserts Working.
@@ -16074,6 +16200,7 @@ mod tests {
                 kind: BlockedKind::UsageLimit,
                 detected_at_ms: 1_000,
                 detail: Some("You\u{2019}ve hit your usage limit.".to_string()),
+                resets_at_ms: Some(9_000),
             }),
         };
         let wire = serde_json::to_value(&snap).unwrap();
@@ -16133,6 +16260,68 @@ mod tests {
         assert!(!notice.contains("will not complete"));
     }
 
+    /// Issue #714: a pane restart lifts the REPLACED agent's Blocked card, in
+    /// the daemon's state and, through the returned event, in a client's. The
+    /// event rebuilds nothing on a client whose card already changed hands, and
+    /// never touches a card the new agent blocked itself.
+    #[test]
+    fn a_pane_restart_lifts_the_replaced_agents_block() {
+        let mut daemon = AppState::default();
+        daemon.register_pane("pane-q".to_string());
+        daemon.apply_event(quota_event(EventType::Thinking, 1));
+        daemon.apply_event(quota_blocked_event(BlockedKind::UsageLimit, "x", 2));
+        let mut client = daemon.clone();
+        assert!(
+            daemon
+                .lift_replaced_quota_blocks("pane-q", "agent-q")
+                .is_empty()
+        );
+        assert_eq!(daemon.sessions["gen-q"].status, SessionStatus::Blocked);
+
+        let events = daemon.lift_replaced_quota_blocks("pane-q", "agent-new");
+        assert_eq!(events.len(), 1);
+        assert_eq!(daemon.sessions["gen-q"].status, SessionStatus::Idle);
+        assert!(daemon.sessions["gen-q"].blocked.is_none());
+        let lift = events[0].clone();
+        assert!(lift.is_quota_block_lift() && lift.is_daemon_synthetic());
+        assert!(!crate::quota_block::is_work_evidence(&lift));
+
+        client.apply_event(lift.clone());
+        assert_eq!(client.sessions["gen-q"].status, SessionStatus::Idle);
+        assert!(client.sessions["gen-q"].blocked.is_none());
+
+        // A client that files the same card under another key (a hydrated
+        // placeholder the agent's hooks were mapped onto) is lifted too.
+        let mut rekeyed = AppState::default();
+        rekeyed.register_pane("pane-q".to_string());
+        let mut hydrated = quota_event(EventType::Thinking, 1);
+        hydrated.session_id = "pane-q-card".to_string();
+        rekeyed.apply_event(hydrated);
+        let mut blocked = quota_blocked_event(BlockedKind::UsageLimit, "x", 2);
+        blocked.session_id = "pane-q-card".to_string();
+        rekeyed.apply_event(blocked);
+        rekeyed.apply_event(lift.clone());
+        let card = rekeyed
+            .sessions
+            .values()
+            .find(|s| s.pane_id.as_deref() == Some("pane-q"))
+            .expect("the card");
+        assert_eq!(card.status, SessionStatus::Idle);
+        assert_eq!(rekeyed.sessions.len(), 1, "no second card was minted");
+
+        // A client that already holds the successor's card: nothing rebuilt,
+        // nothing retired.
+        let mut moved_on = AppState::default();
+        moved_on.register_pane("pane-q".to_string());
+        let mut successor = quota_event(EventType::SessionStart, 10);
+        successor.session_id = "gen-new".to_string();
+        successor.agent_id = Some("agent-new".to_string());
+        moved_on.apply_event(successor);
+        moved_on.apply_event(lift);
+        assert!(!moved_on.sessions.contains_key("gen-q"));
+        assert!(moved_on.sessions.contains_key("gen-new"));
+    }
+
     /// Issue #714: a delegate names its blocked targets from the pane's card.
     #[test]
     fn pane_blocked_reason_reads_the_panes_current_card() {
@@ -16148,11 +16337,23 @@ mod tests {
             role: "coder".to_string(),
             kind: BlockedKind::CreditsDepleted,
             blocked_for_secs: 180,
+            resets_in_secs: None,
         }]);
         assert!(
             described.contains("credits do not reset on their own"),
             "{described}"
         );
-        assert!(described.contains("detected 3 minutes ago"), "{described}");
+        assert!(
+            described.contains("reported 3 minutes ago by the agent"),
+            "{described}"
+        );
+        let windowed = describe_blocked_workers(&[crate::event::BlockedWorker {
+            role: "coder".to_string(),
+            kind: BlockedKind::UsageLimit,
+            blocked_for_secs: 60,
+            resets_in_secs: Some(2 * 3600),
+        }]);
+        assert!(windowed.contains("; resets in 2 hours"), "{windowed}");
+        assert!(!windowed.contains("credits do not reset"), "{windowed}");
     }
 }

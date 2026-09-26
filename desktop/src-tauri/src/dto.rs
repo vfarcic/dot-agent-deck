@@ -474,13 +474,17 @@ pub struct DesktopAgent {
 pub struct DesktopBlocked {
     /// `usage_limit`, `credits_depleted` or `unknown` — the daemon's wire value.
     pub kind: &'static str,
-    /// When the daemon confirmed the block, epoch milliseconds.
+    /// When the agent reported the block, epoch milliseconds.
     pub detected_at_ms: i64,
-    /// The pane's own matched line. Agent-controlled text, so scrubbed of
+    /// The agent's own error message. Agent-controlled text, so scrubbed of
     /// control and bidi characters at this seam ([`safe_display_text`]) before
     /// the webview sees it, and rendered through `displayText` there as well.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    /// When the provider said the limit resets, epoch milliseconds — absent
+    /// when it did not say.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resets_at_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1399,6 +1403,7 @@ pub(crate) fn map_agent(record: AgentRecord) -> DesktopAgent {
                 .as_deref()
                 .map(safe_display_text)
                 .filter(|detail| !detail.is_empty()),
+            resets_at_ms: reason.resets_at_ms,
         });
     // PRD #745 M11: off the RECORD, not the live snapshot — the daemon knows
     // when it spawned a process whether or not that process has ever emitted an
@@ -2950,6 +2955,7 @@ mod tests {
             kind: dot_agent_deck::state::BlockedKind::CreditsDepleted,
             detected_at_ms: 1_700_000_000_000,
             detail: Some("purchase \u{202e}more\u{7} credits".to_string()),
+            resets_at_ms: Some(1_700_000_360_000),
         });
         let mapped = map_agent(record.clone());
         assert_eq!(mapped.status, "blocked");
@@ -2960,6 +2966,7 @@ mod tests {
         let value = serde_json::to_value(&mapped).unwrap();
         assert_eq!(value["blocked"]["kind"], "credits_depleted");
         assert_eq!(value["blocked"]["detectedAtMs"], 1_700_000_000_000_i64);
+        assert_eq!(value["blocked"]["resetsAtMs"], 1_700_000_360_000_i64);
 
         // A reason beside any other status is not reported.
         record.live.as_mut().unwrap().status = SessionStatus::Thinking;

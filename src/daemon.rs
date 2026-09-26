@@ -1062,14 +1062,15 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
         })
     };
 
-    // Issue #714: unconditional for the same reason — the pane's own screen is
-    // the only place a quota-exhausted agent says so.
-    let quota_monitor_handle = {
+    // Issue #714: unconditional for the same reason — a Codex turn that its
+    // provider's usage limit ended says so only in its rollout, which no hook
+    // reports. Idle unless a Codex turn is armed.
+    let codex_rollout_handle = {
         let registry = pty_registry.clone();
         let monitor_state = state.clone();
         let monitor_event_tx = event_tx.clone();
         tokio::spawn(async move {
-            run_quota_monitor(registry, monitor_state, monitor_event_tx).await;
+            run_codex_rollout_monitor(registry, monitor_state, monitor_event_tx).await;
         })
     };
 
@@ -1101,7 +1102,7 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
         h.abort();
     }
     shell_activity_handle.abort();
-    quota_monitor_handle.abort();
+    codex_rollout_handle.abort();
     scheduler_handle.abort();
     if let Some(h) = orphan_handle {
         h.abort();
@@ -1537,7 +1538,7 @@ async fn run_idle_monitor(
 async fn ingest_event(
     state: &SharedState,
     event_tx: &broadcast::Sender<BroadcastMsg>,
-    registry: &AgentPtyRegistry,
+    registry: &Arc<AgentPtyRegistry>,
     mut event: AgentEvent,
 ) {
     // Issue #770: half of the orphan verdict, asked of the registry BEFORE the
@@ -1551,20 +1552,28 @@ async fn ingest_event(
         .as_deref()
         .is_some_and(|pane_id| registry.has_live_pane(pane_id));
     let mut state = state.write().await;
-    // Issue #714: work evidence cancels the pane's pending quota hint or
-    // candidate and lifts a confirmed block — the detector's half of the rule
+    // Issue #714: keep the registry's per-agent quota-block latch in step with
+    // the card. A `QuotaBlocked` latches a fresh epoch for the pane's live
+    // owner — the key the orchestrator notice below is claimed and re-checked
+    // against — and work evidence lifts it, the latch's half of the rule
     // `apply_event` applies to the card. Only the generation the event names is
-    // credited. Done UNDER the `AppState` write lock on purpose (audit A1):
-    // `publish_quota_blocked` re-validates the confirmation and applies the
-    // block under this same lock, so a work event that overtakes a
-    // confirmation is either seen by that check or applied after the block,
-    // clearing it — there is no window between the two. Taking the registry
-    // inside this lock is the nesting `apply_event`'s own ownership oracle
-    // already takes on every event, so it adds no new lock order.
-    if let Some(pane_id) = event.pane_id.as_deref()
-        && crate::quota_detect::is_work_evidence(&event)
-    {
-        registry.quota_note_work_event(pane_id, event.agent_id.as_deref());
+    // credited. Done UNDER the `AppState` write lock on purpose: a block and a
+    // work event are applied to the latch in the same order as to the card, so
+    // the notice's write-time re-check can never see a latch the card
+    // contradicts. Taking the registry inside this lock is the nesting
+    // `apply_event`'s own ownership oracle already takes on every event, so it
+    // adds no new lock order.
+    let mut reported_block = None;
+    if let Some(pane_id) = event.pane_id.as_deref() {
+        if event.event_type == crate::event::EventType::QuotaBlocked {
+            if let Some(agent_id) = event.agent_id.as_deref()
+                && let Some(epoch) = registry.note_quota_block(pane_id, agent_id)
+            {
+                reported_block = Some((pane_id.to_string(), agent_id.to_string(), epoch));
+            }
+        } else if crate::quota_block::is_work_evidence(&event) {
+            registry.quota_note_work_event(pane_id, event.agent_id.as_deref());
+        }
     }
     // The other half, plus the stamp: is this an orchestration role pane whose
     // role registration a daemon restart destroyed while its agent survived?
@@ -1588,352 +1597,28 @@ async fn ingest_event(
         .remove(crate::event::DAEMON_PANE_CLOSED_METADATA_KEY);
     let _ = event_tx.send(BroadcastMsg::Event(event.clone()));
     state.apply_event(event);
-}
-
-/// Issue #714: what the hook loop does to a PRODUCER's raw event before it is
-/// ingested, so no producer can paint (or lift) a quota block. `false` means
-/// drop the event outright — a `quota_blocked` or `quota_cleared` event is the
-/// daemon's alone to author,
-/// exactly like the orphaned-role and pane-closed markers — and the daemon-owned
-/// `quota_blocked_*` metadata keys are stripped from every other event, so an
-/// older daemon's stripping gap or a hand-rolled hook cannot smuggle a reason
-/// onto a card either. Same model as `stamp_orchestration_orphan`: anything on
-/// the unauthenticated same-uid socket is treated as forgeable.
-fn admit_producer_event(event: &mut AgentEvent) -> bool {
-    if matches!(
-        event.event_type,
-        crate::event::EventType::QuotaBlocked | crate::event::EventType::QuotaCleared
-    ) {
-        return false;
-    }
-    event
-        .metadata
-        .remove(crate::quota_detect::QUOTA_BLOCKED_KIND_METADATA_KEY);
-    event
-        .metadata
-        .remove(crate::quota_detect::QUOTA_BLOCKED_DETAIL_METADATA_KEY);
-    true
-}
-
-/// Issue #714: how often [`run_quota_monitor`] asks the registry whether any
-/// pane's quota detector wants its screen probed. The asking is lock-only and
-/// allocation-free for every pane with no pending hint — the replay happens
-/// only for a pane that printed a quota needle and then went quiet — so a
-/// one-second tick costs nothing measurable and bounds the added latency on top
-/// of the detector's own quiet and confirmation windows.
-const QUOTA_MONITOR_TICK: Duration = Duration::from_secs(1);
-
-/// Issue #714: the daemon half of the quota detector (`crate::quota_detect`).
-///
-/// Each tick asks the registry for the panes whose detector wants a probe (a
-/// needle seen in the PTY bytes, newer than the pane's last work evidence, the
-/// PTY quiet since, and the probe rate limit or confirmation window elapsed),
-/// replays each one's scrollback through the same `vt100` parser the TUI
-/// renders with ([`crate::pane_screen_text::visible_tail_lines`]), classifies
-/// the bottom rows against the pane's agent type, and hands the result back.
-/// When the detector CONFIRMS — a second matching probe a full confirmation
-/// window after the first, with no work in between — the block is published as
-/// ONE synthetic `QuotaBlocked` event ([`publish_quota_blocked`]) and, for a
-/// worker that still owes a `work-done`, one notice to its orchestrator —
-/// written on a task of its own, so this loop never waits on another pane's PTY.
-///
-/// A PUBLISHED block is probed again only after the pane writes later output
-/// and goes quiet (the same quiet window and rate limit). A screen that still
-/// shows the quota line — a blocked agent's idle redraw — changes nothing; one
-/// that no longer shows it among the bottom rows lifts the block through ONE
-/// synthetic `QuotaCleared` event ([`publish_quota_cleared`]). That is how an
-/// agent that sends no native work hooks leaves `Blocked` after it recovers.
-/// A pane too large to replay is never probed, so its block is never cleared
-/// this way.
-///
-/// The replay is paid inline on this task but outside every registry and bus
-/// lock: it is bounded by the 1 MiB ring (26–29 ms measured for #686) and by
-/// [`crate::quota_detect::MAX_QUOTA_REPLAY_CELLS`] (a larger pane is not probed
-/// at all), happens only for a pane that has gone quiet right after printing a
-/// quota needle, and is rate limited per pane. No internal shutdown
-/// signal — torn down by `.abort()` in `run_daemon_with`'s cleanup, like the
-/// shell-activity monitor.
-async fn run_quota_monitor(
-    pty_registry: Arc<AgentPtyRegistry>,
-    state: SharedState,
-    event_tx: broadcast::Sender<BroadcastMsg>,
-) {
-    loop {
-        tokio::time::sleep(QUOTA_MONITOR_TICK).await;
-        let now = std::time::Instant::now();
-        for probe in pty_registry.quota_probe_candidates(now) {
-            handle_quota_probe(&pty_registry, &state, &event_tx, probe, now).await;
-        }
+    drop(state);
+    if let Some((pane_id, agent_id, epoch)) = reported_block {
+        notify_orchestrator_of_quota_block(registry, &pane_id, &agent_id, epoch);
     }
 }
 
-/// Issue #714: classify one probe [`run_quota_monitor`] took, record the result
-/// with the pane's detector, and publish what it decided — a confirmed block
-/// ([`publish_quota_blocked`]) or the clear of a published one
-/// ([`publish_quota_cleared`]). Every other outcome publishes nothing.
-async fn handle_quota_probe(
-    pty_registry: &Arc<AgentPtyRegistry>,
-    state: &SharedState,
-    event_tx: &broadcast::Sender<BroadcastMsg>,
-    probe: crate::agent_pty::QuotaProbe,
-    now: std::time::Instant,
-) -> Option<crate::quota_detect::ProbeOutcome> {
-    let rows = probe.screen.tail_rows();
-    let found = crate::quota_detect::classify(&probe.agent_type, &rows);
-    let recorded = pty_registry.quota_record_probe(
-        &probe.agent_id,
-        probe.screen.revision,
-        now,
-        found.as_ref().map(|m| m.kind),
-    );
-    debug!(
-        pane_id = %probe.pane_id,
-        agent_id = %probe.agent_id,
-        outcome = ?recorded.map(|(outcome, _)| outcome),
-        "quota: probed a quiet pane after a quota hint"
-    );
-    match (recorded, found) {
-        (Some((crate::quota_detect::ProbeOutcome::Cleared(epoch), _)), _) => {
-            publish_quota_cleared(
-                pty_registry,
-                state,
-                event_tx,
-                QuotaClearedReport {
-                    pane_id: &probe.pane_id,
-                    agent_id: &probe.agent_id,
-                    epoch,
-                    revision: probe.screen.revision,
-                },
-            )
-            .await;
-        }
-        (Some((crate::quota_detect::ProbeOutcome::Confirmed(kind), Some(epoch))), Some(found)) => {
-            publish_quota_blocked(
-                pty_registry,
-                state,
-                event_tx,
-                QuotaBlockedReport {
-                    pane_id: &probe.pane_id,
-                    agent_id: &probe.agent_id,
-                    epoch,
-                    kind,
-                    detail: &found.detail,
-                },
-            )
-            .await;
-        }
-        _ => {}
-    }
-    recorded.map(|(outcome, _)| outcome)
-}
-
-/// Issue #714: publish one confirmed quota block — the synthetic `QuotaBlocked`
-/// event onto the pane's card, then the blocked-worker notice if the pane is the
-/// worker side of an outstanding delegation.
+/// Issue #714: the one notice to the orchestrator of a worker whose block
+/// `epoch` was just reported, if the worker still owes a `work-done`.
 ///
-/// Addressed and applied exactly like the delivery-notice report
-/// (`install_delivery_notice_sink`), for the same reasons:
+/// Claimed here and WRITTEN on a task of its own
+/// ([`AgentPtyRegistry::spawn_worker_blocked_notice`]): every pane's hooks pass
+/// through [`ingest_event`], and a write stalled on another pane's writer must
+/// not hold any of them up. Returns the delivery's handle, `None` when no notice
+/// was claimed.
 ///
-/// * one write lock for re-validate → resolve → broadcast → apply, the
-///   re-validation being [`AgentPtyRegistry::quota_claim_publication`]: the
-///   registry owner AND the detector still holding this confirmation's epoch,
-///   unpublished. The hook loop lifts that latch under this same write lock
-///   (`ingest_event`), so there is no window between the check and the apply.
-///   A pane that changed hands since the probe receives nothing, and neither
-///   does an agent whose work event (a slow but healthy turn's `Thinking` or
-///   tool hook) arrived after the confirmation but before this publication, nor
-///   one whose PTY wrote output or was resized in that window (a clear or
-///   redraw retracts the confirmation, and the next quiet probe decides afresh)
-///   — nor its orchestrator a notice;
-/// * applied through [`AppState::apply_daemon_report_event`], so a statement
-///   ABOUT the pane never moves its hook generation;
-/// * addressed to the pane's current generation, else its existing card, else
-///   the placeholder key every client files the pane's first card under — so a
-///   stand-in or plugin agent that has sent no hook event still gets a card, in
-///   the daemon (for `ListAgents` / `daemon status`) and in every client;
-/// * carrying the registry `agent_id`, so admission and the reuse guard land it
-///   on that agent's card.
-///
-/// The event carries the kind and the scrubbed detail in daemon-owned metadata,
-/// which the hook loop strips from every producer frame. Returns whether the
-/// block was applied.
-async fn publish_quota_blocked(
-    registry: &Arc<AgentPtyRegistry>,
-    state: &SharedState,
-    event_tx: &broadcast::Sender<BroadcastMsg>,
-    report: QuotaBlockedReport<'_>,
-) -> bool {
-    let (pane_id, agent_id, epoch) = (report.pane_id, report.agent_id, report.epoch);
-    if !apply_quota_blocked(registry, state, event_tx, report).await {
-        return false;
-    }
-    notify_orchestrator_of_quota_block(registry, pane_id, agent_id, epoch);
-    true
-}
-
-/// Issue #714: the first half of [`publish_quota_blocked`] — re-validate and
-/// apply the block onto the card. Returns whether it was applied.
-async fn apply_quota_blocked(
-    registry: &Arc<AgentPtyRegistry>,
-    state: &SharedState,
-    event_tx: &broadcast::Sender<BroadcastMsg>,
-    report: QuotaBlockedReport<'_>,
-) -> bool {
-    let QuotaBlockedReport {
-        pane_id,
-        agent_id,
-        epoch,
-        kind,
-        detail,
-    } = report;
-    let applied = {
-        let mut guard = state.write().await;
-        let session_id = guard
-            .pane_hook_session_id(pane_id)
-            .or_else(|| guard.pane_session_id(pane_id))
-            .unwrap_or_else(|| crate::state::placeholder_session_id(pane_id));
-        let mut metadata = std::collections::HashMap::new();
-        metadata.insert(
-            crate::quota_detect::QUOTA_BLOCKED_KIND_METADATA_KEY.to_string(),
-            kind.as_wire().to_string(),
-        );
-        metadata.insert(
-            crate::quota_detect::QUOTA_BLOCKED_DETAIL_METADATA_KEY.to_string(),
-            detail.to_string(),
-        );
-        let event = AgentEvent {
-            session_id,
-            // The daemon is not the agent: `None` never overwrites a known type.
-            agent_type: crate::event::AgentType::None,
-            event_type: crate::event::EventType::QuotaBlocked,
-            tool_name: None,
-            tool_detail: None,
-            cwd: None,
-            timestamp: chrono::Utc::now(),
-            user_prompt: None,
-            metadata,
-            pane_id: Some(pane_id.to_string()),
-            agent_id: Some(agent_id.to_string()),
-            agent_version: None,
-            schema_version: None,
-            live_target: None,
-        };
-        let current = registry.quota_claim_publication(pane_id, agent_id, epoch);
-        if current {
-            let _ = event_tx.send(BroadcastMsg::Event(event.clone()));
-            guard.apply_daemon_report_event(event);
-        }
-        current
-    };
-    if !applied {
-        debug!(
-            pane_id = %pane_id,
-            agent_id = %agent_id,
-            "quota: confirmed block dropped; the pane changed hands or its agent reported work since the confirmation"
-        );
-        return false;
-    }
-    warn!(
-        pane_id = %pane_id,
-        agent_id = %agent_id,
-        kind = kind.as_wire(),
-        "quota: the pane's own output says its provider usage limit is exhausted; marked Blocked"
-    );
-    true
-}
-
-/// Issue #714: lift a published quota block whose line a quiet re-probe no
-/// longer finds among the pane's bottom rows — the synthetic `QuotaCleared`
-/// event, addressed and applied exactly like [`apply_quota_blocked`]'s event,
-/// under one `AppState` write lock for re-validate → broadcast → apply.
-///
-/// The re-validation, which also lifts the detector's latch, is
-/// [`AgentPtyRegistry::quota_claim_clear`]: `agent_id` still owns `pane_id`,
-/// its detector still holds the published block `epoch`, and the pane has
-/// written nothing and not been resized since the probe that found the line
-/// gone. A work event since has moved both the epoch and the card (to a working
-/// status) under this same lock, so an overtaken clear is dropped rather than
-/// painting a working card `Idle`. Output since the probe — possibly a fresh
-/// quota line — drops it too, and the card stays `Blocked` under the same
-/// published block until the next quiet probe decides. Returns whether it was
-/// applied.
-async fn publish_quota_cleared(
-    registry: &Arc<AgentPtyRegistry>,
-    state: &SharedState,
-    event_tx: &broadcast::Sender<BroadcastMsg>,
-    report: QuotaClearedReport<'_>,
-) -> bool {
-    let QuotaClearedReport {
-        pane_id,
-        agent_id,
-        epoch,
-        revision,
-    } = report;
-    let applied = {
-        let mut guard = state.write().await;
-        let current = registry.quota_claim_clear(pane_id, agent_id, epoch, revision);
-        if current {
-            let session_id = guard
-                .pane_hook_session_id(pane_id)
-                .or_else(|| guard.pane_session_id(pane_id))
-                .unwrap_or_else(|| crate::state::placeholder_session_id(pane_id));
-            let event = AgentEvent {
-                session_id,
-                // The daemon is not the agent: `None` never overwrites a known type.
-                agent_type: crate::event::AgentType::None,
-                event_type: crate::event::EventType::QuotaCleared,
-                tool_name: None,
-                tool_detail: None,
-                cwd: None,
-                timestamp: chrono::Utc::now(),
-                user_prompt: None,
-                metadata: std::collections::HashMap::new(),
-                pane_id: Some(pane_id.to_string()),
-                agent_id: Some(agent_id.to_string()),
-                agent_version: None,
-                schema_version: None,
-                live_target: None,
-            };
-            let _ = event_tx.send(BroadcastMsg::Event(event.clone()));
-            guard.apply_daemon_report_event(event);
-        }
-        current
-    };
-    if applied {
-        info!(
-            pane_id = %pane_id,
-            agent_id = %agent_id,
-            "quota: the quota line is no longer on the pane's screen after later output; block lifted"
-        );
-    } else {
-        debug!(
-            pane_id = %pane_id,
-            agent_id = %agent_id,
-            "quota: block clear dropped; the pane changed hands, its agent reported work, or it \
-             wrote output since the probe"
-        );
-    }
-    applied
-}
-
-/// Issue #714: the second half of [`publish_quota_blocked`] — the one notice to
-/// the orchestrator of a worker whose block `epoch` was just applied, if the
-/// worker still owes a `work-done`.
-///
-/// The notice is claimed here and WRITTEN on a task of its own
-/// ([`AgentPtyRegistry::spawn_worker_blocked_notice`]): this runs inside
-/// [`run_quota_monitor`]'s one loop over every pane, and a write stalled on the
-/// orchestrator's pane writer must not delay the probing or publishing of any
-/// other pane's block (issue #714 review). Returns the delivery's handle, `None`
-/// when no notice was claimed.
-///
-/// The block is re-checked before the notice is claimed
+/// The block is re-checked against the latch before the notice is claimed
 /// ([`AgentPtyRegistry::quota_block_current`]) and again, writer-held, right
-/// before it is written (`deliver_worker_blocked_notice`): a genuine work hook
-/// can clear the card between the apply and the claim, and a worker that is
-/// working again must not be reported as blocked. A notice suppressed before
-/// the claim stays owed, and so does one refused at the write (the claim is
-/// released), so a later genuine block of the same delegation still reports.
+/// before it is written: a genuine work hook can clear the card between the
+/// apply and the claim, and a worker that is working again must not be reported
+/// as blocked. A notice suppressed before the claim stays owed, and so does one
+/// refused at the write (the claim is released), so a later block of the same
+/// delegation still reports.
 fn notify_orchestrator_of_quota_block(
     registry: &Arc<AgentPtyRegistry>,
     pane_id: &str,
@@ -1951,25 +1636,280 @@ fn notify_orchestrator_of_quota_block(
     registry.spawn_worker_blocked_notice(pane_id, agent_id, epoch, None)
 }
 
-/// Issue #714: one clear of a published quota block, as
-/// [`publish_quota_cleared`] takes it.
-struct QuotaClearedReport<'a> {
-    pane_id: &'a str,
-    agent_id: &'a str,
-    /// The published block's epoch, from [`crate::quota_detect::ProbeOutcome::Cleared`].
-    epoch: u64,
-    /// The screen revision of the probe that found the line gone.
-    revision: u64,
+/// Issue #714: normalise a PRODUCER's raw event before it is ingested.
+///
+/// A producer's `quota_blocked` is admitted: it is status reporting from the
+/// same producers, over the same same-uid socket, as every other status, so it
+/// adds no trust boundary (`crate::hook_provenance` leaves raw events out of
+/// scope). What is guarded is where the privilege is used — the orchestrator
+/// notice is fixed text claimed only for a delegation bound to the event's
+/// agent — and the shape of what is stored, normalised here:
+///
+/// * on a `quota_blocked`, the kind is mapped onto a known value, the reset is
+///   kept only when it parses and lies in a sane window, and the detail is
+///   scrubbed ([`normalize_quota_blocked_metadata`]);
+/// * every other event type loses every `quota_blocked_*` key, so a reason can
+///   only ever travel with the status it explains;
+/// * `quota_blocked_source` and `quota_blocked_lifted`, the daemon's own
+///   markers (its Codex-rollout block, and the lift after a pane restart), are
+///   stripped from every producer frame;
+/// * the Codex rollout keys survive only on the Codex events that carry them
+///   (`SessionStart`, `UserPromptSubmit` → `Thinking`, `Stop` → `Idle`).
+fn admit_producer_event(event: &mut AgentEvent) {
+    use crate::quota_block::{
+        QUOTA_BLOCKED_LIFTED_METADATA_KEY, QUOTA_BLOCKED_METADATA_KEYS,
+        QUOTA_BLOCKED_SOURCE_METADATA_KEY,
+    };
+    event.metadata.remove(QUOTA_BLOCKED_SOURCE_METADATA_KEY);
+    event.metadata.remove(QUOTA_BLOCKED_LIFTED_METADATA_KEY);
+    if event.event_type == crate::event::EventType::QuotaBlocked {
+        normalize_quota_blocked_metadata(
+            &mut event.metadata,
+            chrono::Utc::now().timestamp_millis(),
+        );
+    } else {
+        for key in QUOTA_BLOCKED_METADATA_KEYS {
+            event.metadata.remove(key);
+        }
+    }
+    let codex_rollout_event = event.agent_type == crate::event::AgentType::Codex
+        && matches!(
+            event.event_type,
+            crate::event::EventType::SessionStart
+                | crate::event::EventType::Thinking
+                | crate::event::EventType::Idle
+        );
+    if !codex_rollout_event {
+        event
+            .metadata
+            .remove(crate::codex_rollout_tail::CODEX_TRANSCRIPT_PATH_METADATA_KEY);
+        event
+            .metadata
+            .remove(crate::codex_rollout_tail::CODEX_TURN_ID_METADATA_KEY);
+    }
 }
 
-/// Issue #714: one confirmed quota block, as [`publish_quota_blocked`] takes it.
-struct QuotaBlockedReport<'a> {
-    pane_id: &'a str,
-    agent_id: &'a str,
-    /// The confirmation's epoch, from [`AgentPtyRegistry::quota_record_probe`].
-    epoch: u64,
-    kind: crate::quota_detect::BlockedKind,
-    detail: &'a str,
+/// Issue #714: how far in the past a reported reset may lie and still be kept.
+const QUOTA_RESET_MAX_PAST_MS: i64 = 60 * 60 * 1000;
+
+/// Issue #714: how far in the future a reported reset may lie and still be
+/// kept — past a year, no provider's window is plausible.
+const QUOTA_RESET_MAX_FUTURE_MS: i64 = 400 * 24 * 60 * 60 * 1000;
+
+/// Issue #714: normalise the `quota_blocked_*` keys of a `quota_blocked` event
+/// at time `now_ms` — an unknown or missing kind becomes `unknown`, a reset that
+/// does not parse as epoch milliseconds within
+/// [`QUOTA_RESET_MAX_PAST_MS`]/[`QUOTA_RESET_MAX_FUTURE_MS`] of now is removed
+/// (the event stays), and the detail is scrubbed and bounded.
+fn normalize_quota_blocked_metadata(
+    metadata: &mut std::collections::HashMap<String, String>,
+    now_ms: i64,
+) {
+    use crate::quota_block::{
+        BlockedKind, QUOTA_BLOCKED_DETAIL_METADATA_KEY, QUOTA_BLOCKED_KIND_METADATA_KEY,
+        QUOTA_BLOCKED_RESETS_AT_MS_METADATA_KEY, scrub_detail,
+    };
+    let kind = metadata
+        .get(QUOTA_BLOCKED_KIND_METADATA_KEY)
+        .map_or(BlockedKind::Unknown, |k| BlockedKind::from_wire(k));
+    metadata.insert(
+        QUOTA_BLOCKED_KIND_METADATA_KEY.to_string(),
+        kind.as_wire().to_string(),
+    );
+    let in_window = |at: i64| {
+        at >= now_ms.saturating_sub(QUOTA_RESET_MAX_PAST_MS)
+            && at <= now_ms.saturating_add(QUOTA_RESET_MAX_FUTURE_MS)
+    };
+    if !metadata
+        .get(QUOTA_BLOCKED_RESETS_AT_MS_METADATA_KEY)
+        .and_then(|v| v.parse::<i64>().ok())
+        .is_some_and(in_window)
+    {
+        metadata.remove(QUOTA_BLOCKED_RESETS_AT_MS_METADATA_KEY);
+    }
+    match metadata
+        .get(QUOTA_BLOCKED_DETAIL_METADATA_KEY)
+        .map(|d| scrub_detail(d))
+    {
+        Some(detail) if !detail.is_empty() => {
+            metadata.insert(QUOTA_BLOCKED_DETAIL_METADATA_KEY.to_string(), detail);
+        }
+        _ => {
+            metadata.remove(QUOTA_BLOCKED_DETAIL_METADATA_KEY);
+        }
+    }
+}
+
+/// Issue #714: queue the Codex rollout tailer's side of a Codex hook event
+/// (`crate::codex_rollout_tail`). `SessionStart` / `UserPromptSubmit` name the
+/// rollout and the turn to watch; a native `Stop` for the watched turn disarms
+/// it. Only for an event whose pane and agent name the pane's LIVE owner, so a
+/// payload can never make the daemon read a file on another pane's behalf. The
+/// file itself is opened and read by [`run_codex_rollout_monitor`], never here.
+fn queue_codex_rollout_arm(registry: &AgentPtyRegistry, event: &AgentEvent) {
+    use crate::codex_rollout_tail::{
+        ArmCommand, ArmRequest, CODEX_TRANSCRIPT_PATH_METADATA_KEY, CODEX_TURN_ID_METADATA_KEY,
+    };
+    if event.agent_type != crate::event::AgentType::Codex
+        || event.is_daemon_synthetic()
+        || event.is_wrapper_output_classified()
+    {
+        return;
+    }
+    let (Some(pane_id), Some(agent_id)) = (event.pane_id.as_deref(), event.agent_id.as_deref())
+    else {
+        return;
+    };
+    let path = event
+        .metadata
+        .get(CODEX_TRANSCRIPT_PATH_METADATA_KEY)
+        .cloned();
+    let turn_id = event.metadata.get(CODEX_TURN_ID_METADATA_KEY).cloned();
+    let command = match event.event_type {
+        crate::event::EventType::Idle => {
+            let Some(turn_id) = turn_id else {
+                return;
+            };
+            ArmCommand::Disarm {
+                agent_id: agent_id.to_string(),
+                turn_id,
+            }
+        }
+        crate::event::EventType::SessionStart | crate::event::EventType::Thinking
+            if path.is_some() || turn_id.is_some() =>
+        {
+            ArmCommand::Arm(ArmRequest {
+                pane_id: pane_id.to_string(),
+                agent_id: agent_id.to_string(),
+                session_id: event.session_id.clone(),
+                path,
+                turn_id,
+            })
+        }
+        _ => return,
+    };
+    if !registry.is_live_owner(pane_id, agent_id) {
+        debug!(
+            pane_id = %escape_id_for_log(pane_id),
+            "codex rollout: ignored an arm from an agent that is not the pane's live owner"
+        );
+        return;
+    }
+    registry.codex_rollout_arms().push(command);
+}
+
+/// Issue #714: the daemon half of Codex quota detection
+/// (`crate::codex_rollout_tail`).
+///
+/// Every [`crate::codex_rollout_tail::POLL_INTERVAL`] it applies the arm
+/// commands the hook loop queued, then polls every armed tailer on a blocking
+/// thread — the file I/O happens there, outside every lock the daemon holds —
+/// and reports each block it finds as ONE `QuotaBlocked` event through
+/// [`ingest_event`], the same path, lock order and orchestrator notice a
+/// producer's report takes. The event is filed under the arming hook's session
+/// id, carries the registry agent, and is marked with
+/// [`crate::quota_block::QUOTA_BLOCKED_SOURCE_METADATA_KEY`] as the daemon's own.
+///
+/// A poll with no armed tailer does no I/O at all. No internal shutdown signal —
+/// torn down by `.abort()` in `run_daemon_with`'s cleanup, like the
+/// shell-activity monitor.
+async fn run_codex_rollout_monitor(
+    registry: Arc<AgentPtyRegistry>,
+    state: SharedState,
+    event_tx: broadcast::Sender<BroadcastMsg>,
+) {
+    let mut tailers = crate::codex_rollout_tail::CodexRolloutTailers::default();
+    loop {
+        tokio::time::sleep(crate::codex_rollout_tail::POLL_INTERVAL).await;
+        for command in registry.codex_rollout_arms().drain() {
+            tailers.apply(command);
+        }
+        let blocks;
+        (tailers, blocks) = poll_codex_rollouts(&registry, tailers).await;
+        for block in blocks {
+            ingest_event(
+                &state,
+                &event_tx,
+                &registry,
+                codex_rollout_block_event(block),
+            )
+            .await;
+        }
+    }
+}
+
+/// Issue #714: one poll of `tailers` on a blocking thread, handing the set back
+/// with the blocks found. A poll that panicked loses the set rather than the
+/// monitor: every agent's next Codex prompt arms afresh.
+async fn poll_codex_rollouts(
+    registry: &Arc<AgentPtyRegistry>,
+    mut tailers: crate::codex_rollout_tail::CodexRolloutTailers,
+) -> (
+    crate::codex_rollout_tail::CodexRolloutTailers,
+    Vec<crate::codex_rollout_tail::CodexBlock>,
+) {
+    let registry = Arc::clone(registry);
+    tokio::task::spawn_blocking(move || {
+        let blocks = tailers.tick(|pane_id, agent_id| registry.is_live_owner(pane_id, agent_id));
+        (tailers, blocks)
+    })
+    .await
+    .unwrap_or_else(|e| {
+        warn!(error = %e, "codex rollout: a poll failed; every tailer was reset");
+        Default::default()
+    })
+}
+
+/// Issue #714: the `QuotaBlocked` event the daemon reports for a block read
+/// from a Codex rollout.
+fn codex_rollout_block_event(block: crate::codex_rollout_tail::CodexBlock) -> AgentEvent {
+    use crate::quota_block::{
+        QUOTA_BLOCKED_DETAIL_METADATA_KEY, QUOTA_BLOCKED_KIND_METADATA_KEY,
+        QUOTA_BLOCKED_RESETS_AT_MS_METADATA_KEY, QUOTA_BLOCKED_SOURCE_CODEX_ROLLOUT,
+        QUOTA_BLOCKED_SOURCE_METADATA_KEY,
+    };
+    let now = chrono::Utc::now();
+    let mut metadata = std::collections::HashMap::new();
+    metadata.insert(
+        QUOTA_BLOCKED_KIND_METADATA_KEY.to_string(),
+        block.kind.as_wire().to_string(),
+    );
+    if let Some(at) = block.resets_at_ms {
+        metadata.insert(
+            QUOTA_BLOCKED_RESETS_AT_MS_METADATA_KEY.to_string(),
+            at.to_string(),
+        );
+    }
+    if let Some(message) = block.message {
+        metadata.insert(QUOTA_BLOCKED_DETAIL_METADATA_KEY.to_string(), message);
+    }
+    normalize_quota_blocked_metadata(&mut metadata, now.timestamp_millis());
+    metadata.insert(
+        QUOTA_BLOCKED_SOURCE_METADATA_KEY.to_string(),
+        QUOTA_BLOCKED_SOURCE_CODEX_ROLLOUT.to_string(),
+    );
+    warn!(
+        pane_id = %escape_id_for_log(&block.pane_id),
+        agent_id = %escape_id_for_log(&block.agent_id),
+        kind = block.kind.as_wire(),
+        "quota: the Codex session log records a usage-limit failure; marked Blocked"
+    );
+    AgentEvent {
+        session_id: block.session_id,
+        agent_type: crate::event::AgentType::Codex,
+        event_type: crate::event::EventType::QuotaBlocked,
+        tool_name: None,
+        tool_detail: None,
+        cwd: None,
+        timestamp: now,
+        user_prompt: None,
+        metadata,
+        pane_id: Some(block.pane_id),
+        agent_id: Some(block.agent_id),
+        agent_version: None,
+        schema_version: None,
+        live_target: None,
+    }
 }
 
 /// Issue #424 (reviewer blocker 3): teach the registry how to turn a
@@ -3697,18 +3637,10 @@ async fn run_hook_loop_with_idle_timeout(
                                      Unknown and otherwise ignored; check the hook for a typo"
                                 );
                             }
-                            // Issue #714: a quota block is the daemon's verdict,
-                            // never a producer's claim.
-                            if !admit_producer_event(&mut event) {
-                                warn!(
-                                    session_id = %escape_id_for_log(&event.session_id),
-                                    pane_id = ?event.pane_id,
-                                    event_type = ?event.event_type,
-                                    "Dropped a producer-sent quota event; only the daemon's \
-                                     own quota detector may mark a card Blocked or lift it"
-                                );
-                                continue;
-                            }
+                            // Issue #714: normalise the quota-block keys, and hand
+                            // a Codex event's rollout and turn to the tailer.
+                            admit_producer_event(&mut event);
+                            queue_codex_rollout_arm(&pty_registry, &event);
                             // Persist the agent type this hook revealed into
                             // the PTY registry (keyed by pane id), so a later
                             // `list_agents` — e.g. a fresh `dot-agent-deck
@@ -3848,6 +3780,190 @@ mod orphan_watchdog_tests {
     }
 }
 
+/// Issue #714: producer admission of the quota-block contract. Platform
+/// independent — it touches no socket and spawns nothing.
+#[cfg(test)]
+mod quota_admission_tests {
+    use super::*;
+    use crate::event::AgentType;
+    use spec::spec;
+
+    pub(super) fn quota_frame(event_type: crate::event::EventType) -> AgentEvent {
+        AgentEvent {
+            session_id: "s".to_string(),
+            agent_type: AgentType::ClaudeCode,
+            event_type,
+            tool_name: None,
+            tool_detail: None,
+            cwd: None,
+            timestamp: chrono::Utc::now(),
+            user_prompt: None,
+            metadata: std::collections::HashMap::new(),
+            pane_id: Some("pane-1".to_string()),
+            agent_id: Some("1".to_string()),
+            agent_version: None,
+            schema_version: None,
+            live_target: None,
+        }
+    }
+
+    /// Scenario: Post a `quota_blocked` event on the hook socket as a producer
+    /// would, with a forged daemon source marker, an unknown kind and an
+    /// out-of-range reset, and a `thinking` event carrying quota-reason keys.
+    /// The block is admitted with its kind normalised and the marker and bad
+    /// reset stripped; the thinking frame loses every quota key and paints no
+    /// reason.
+    #[spec("status/blocked/006")]
+    #[test]
+    fn status_blocked_006_producer_quota_blocked_is_admitted_and_normalised() {
+        use crate::quota_block::{
+            QUOTA_BLOCKED_DETAIL_METADATA_KEY, QUOTA_BLOCKED_KIND_METADATA_KEY,
+            QUOTA_BLOCKED_RESETS_AT_MS_METADATA_KEY, QUOTA_BLOCKED_SOURCE_METADATA_KEY,
+        };
+        let now = chrono::Utc::now().timestamp_millis();
+        let with = |event_type, pairs: &[(&str, String)]| {
+            let mut event = quota_frame(event_type);
+            for (k, v) in pairs {
+                event.metadata.insert(k.to_string(), v.clone());
+            }
+            event
+                .metadata
+                .insert("other".to_string(), "kept".to_string());
+            event
+        };
+
+        // A producer's block is admitted and normalised.
+        let mut block = with(
+            crate::event::EventType::QuotaBlocked,
+            &[
+                (QUOTA_BLOCKED_KIND_METADATA_KEY, "made_up_kind".to_string()),
+                (
+                    QUOTA_BLOCKED_SOURCE_METADATA_KEY,
+                    "codex_rollout".to_string(),
+                ),
+                (
+                    QUOTA_BLOCKED_RESETS_AT_MS_METADATA_KEY,
+                    (now + 3_600_000).to_string(),
+                ),
+                (
+                    QUOTA_BLOCKED_DETAIL_METADATA_KEY,
+                    "limit\u{202e} hit\n".to_string(),
+                ),
+            ],
+        );
+        let raw = serde_json::to_string(&block).unwrap();
+        assert!(raw.contains("\"quota_blocked\""), "{raw}");
+        admit_producer_event(&mut block);
+        assert!(
+            !block.is_daemon_synthetic(),
+            "a producer cannot claim the daemon's source"
+        );
+        assert!(
+            !block
+                .metadata
+                .contains_key(QUOTA_BLOCKED_SOURCE_METADATA_KEY)
+        );
+        assert_eq!(block.metadata[QUOTA_BLOCKED_KIND_METADATA_KEY], "unknown");
+        assert_eq!(
+            block.metadata[QUOTA_BLOCKED_RESETS_AT_MS_METADATA_KEY],
+            (now + 3_600_000).to_string()
+        );
+        assert_eq!(
+            block.metadata[QUOTA_BLOCKED_DETAIL_METADATA_KEY],
+            "limit hit"
+        );
+        assert_eq!(block.metadata["other"], "kept");
+
+        // Resets outside the window, or not a number, are dropped — not the event.
+        for bad in [
+            (now - 2 * 3_600_000).to_string(),
+            (now + 500 * 86_400_000).to_string(),
+            "soon".to_string(),
+        ] {
+            let mut event = with(
+                crate::event::EventType::QuotaBlocked,
+                &[
+                    (QUOTA_BLOCKED_KIND_METADATA_KEY, "usage_limit".to_string()),
+                    (QUOTA_BLOCKED_RESETS_AT_MS_METADATA_KEY, bad.clone()),
+                ],
+            );
+            admit_producer_event(&mut event);
+            assert_eq!(
+                event.metadata[QUOTA_BLOCKED_KIND_METADATA_KEY],
+                "usage_limit"
+            );
+            assert!(
+                !event
+                    .metadata
+                    .contains_key(QUOTA_BLOCKED_RESETS_AT_MS_METADATA_KEY),
+                "{bad} kept"
+            );
+        }
+
+        // Every other event type loses every quota key.
+        let mut smuggled = with(
+            crate::event::EventType::Thinking,
+            &[
+                (
+                    QUOTA_BLOCKED_KIND_METADATA_KEY,
+                    "credits_depleted".to_string(),
+                ),
+                (QUOTA_BLOCKED_DETAIL_METADATA_KEY, "forged".to_string()),
+                (QUOTA_BLOCKED_RESETS_AT_MS_METADATA_KEY, now.to_string()),
+                (
+                    QUOTA_BLOCKED_SOURCE_METADATA_KEY,
+                    "codex_rollout".to_string(),
+                ),
+            ],
+        );
+        admit_producer_event(&mut smuggled);
+        assert_eq!(
+            smuggled.metadata.keys().collect::<Vec<_>>(),
+            vec!["other"],
+            "{:?}",
+            smuggled.metadata
+        );
+
+        // End to end through the state: the admitted block paints the card; the
+        // stripped frame would not have.
+        let mut state = crate::state::AppState::default();
+        state.register_pane("pane-1".to_string());
+        state.apply_event(smuggled);
+        assert_eq!(
+            state.sessions["s"].status,
+            crate::state::SessionStatus::Thinking
+        );
+        assert!(state.sessions["s"].blocked.is_none());
+        state.apply_event(block);
+        assert_eq!(
+            state.sessions["s"].status,
+            crate::state::SessionStatus::Blocked
+        );
+        let reason = state.sessions["s"].blocked.clone().expect("a reason");
+        assert_eq!(reason.kind, crate::state::BlockedKind::Unknown);
+        assert_eq!(reason.resets_at_ms, Some(now + 3_600_000));
+
+        // The Codex rollout keys survive only on the Codex events that carry them.
+        let codex_keys = [
+            (
+                crate::codex_rollout_tail::CODEX_TRANSCRIPT_PATH_METADATA_KEY,
+                "/x/rollout-a.jsonl".to_string(),
+            ),
+            (
+                crate::codex_rollout_tail::CODEX_TURN_ID_METADATA_KEY,
+                "t".to_string(),
+            ),
+        ];
+        let mut claude = with(crate::event::EventType::Thinking, &codex_keys);
+        admit_producer_event(&mut claude);
+        assert_eq!(claude.metadata.len(), 1, "{:?}", claude.metadata);
+        let mut codex = with(crate::event::EventType::Thinking, &codex_keys);
+        codex.agent_type = AgentType::Codex;
+        admit_producer_event(&mut codex);
+        assert_eq!(codex.metadata.len(), 3, "{:?}", codex.metadata);
+    }
+}
+
 // PRD #42 M2/review: these tests bind a real Unix socket, chmod it via
 // `PermissionsExt`, and spawn `/bin/sh` agents — none of which exist on
 // Windows. Gate the whole block to Unix so the Windows `cargo nextest run`
@@ -3862,86 +3978,61 @@ mod hook_ingestion_tests {
     use tokio::io::AsyncWriteExt;
     use tokio::net::{UnixListener, UnixStream};
 
-    /// Scenario: Post a `quota_blocked` event on the hook socket as a producer
-    /// would, a `quota_cleared` one, and a `thinking` event carrying forged
-    /// quota-reason keys. The first two are dropped outright; the third is
-    /// admitted with the forged keys stripped, so no producer can paint a card
-    /// Blocked or lift the daemon's block.
-    #[spec("status/blocked/006")]
+    /// Issue #714: the Codex rollout tailer is armed only for an event whose
+    /// pane and agent name the pane's live owner, and only by a genuine Codex
+    /// hook — not by the wrapper's output classifier.
     #[test]
-    fn status_blocked_006_producer_cannot_paint_quota_blocked() {
-        let base = |event_type| {
-            let mut metadata = std::collections::HashMap::new();
-            metadata.insert(
-                crate::quota_detect::QUOTA_BLOCKED_KIND_METADATA_KEY.to_string(),
-                "credits_depleted".to_string(),
-            );
-            metadata.insert(
-                crate::quota_detect::QUOTA_BLOCKED_DETAIL_METADATA_KEY.to_string(),
-                "forged".to_string(),
-            );
-            metadata.insert("other".to_string(), "kept".to_string());
-            AgentEvent {
-                session_id: "s".to_string(),
-                agent_type: AgentType::Codex,
-                event_type,
-                tool_name: None,
-                tool_detail: None,
-                cwd: None,
-                timestamp: chrono::Utc::now(),
-                user_prompt: None,
-                metadata,
-                pane_id: Some("pane-1".to_string()),
-                agent_id: Some("1".to_string()),
-                agent_version: None,
-                schema_version: None,
-                live_target: None,
-            }
+    fn codex_rollout_arm_needs_the_live_owner() {
+        use crate::codex_rollout_tail::{
+            ArmCommand, CODEX_TRANSCRIPT_PATH_METADATA_KEY, CODEX_TURN_ID_METADATA_KEY,
         };
-        let mut forged = base(crate::event::EventType::QuotaBlocked);
-        assert!(
-            !admit_producer_event(&mut forged),
-            "a producer's quota_blocked must be dropped"
-        );
-        // The wire form a hook would post decodes to the variant, so the drop
-        // is reached rather than bypassed as `Unknown`.
-        let raw = serde_json::to_string(&base(crate::event::EventType::QuotaBlocked)).unwrap();
-        assert!(raw.contains("\"quota_blocked\""), "{raw}");
-        // Its pair is the daemon's alone too: no producer can lift a block.
-        let mut forged_clear = base(crate::event::EventType::QuotaCleared);
-        assert!(
-            !admit_producer_event(&mut forged_clear),
-            "a producer's quota_cleared must be dropped"
-        );
-        let raw = serde_json::to_string(&base(crate::event::EventType::QuotaCleared)).unwrap();
-        assert!(raw.contains("\"quota_cleared\""), "{raw}");
-
-        let mut smuggled = base(crate::event::EventType::Thinking);
-        assert!(admit_producer_event(&mut smuggled));
-        assert!(
-            !smuggled
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let owner = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("/bin/cat"),
+                env: crate::test_isolation::pin_unreachable_endpoints(vec![(
+                    DOT_AGENT_DECK_PANE_ID.to_string(),
+                    "codex-arm".to_string(),
+                )]),
+                agent_type: Some(AgentType::Codex),
+                ..SpawnOptions::default()
+            })
+            .expect("spawn stand-in");
+        let prompt = |agent: &str| {
+            let mut event =
+                super::quota_admission_tests::quota_frame(crate::event::EventType::Thinking);
+            event.agent_type = AgentType::Codex;
+            event.pane_id = Some("codex-arm".to_string());
+            event.agent_id = Some(agent.to_string());
+            event.metadata.insert(
+                CODEX_TRANSCRIPT_PATH_METADATA_KEY.to_string(),
+                "/x/rollout-a.jsonl".to_string(),
+            );
+            event
                 .metadata
-                .contains_key(crate::quota_detect::QUOTA_BLOCKED_KIND_METADATA_KEY)
-                && !smuggled
-                    .metadata
-                    .contains_key(crate::quota_detect::QUOTA_BLOCKED_DETAIL_METADATA_KEY),
-            "forged quota keys must be stripped: {:?}",
-            smuggled.metadata
+                .insert(CODEX_TURN_ID_METADATA_KEY.to_string(), "t1".to_string());
+            event
+        };
+        queue_codex_rollout_arm(&registry, &prompt("someone-else"));
+        let mut classified = prompt(&owner);
+        classified.metadata.insert(
+            crate::event::WRAPPER_OUTPUT_CLASSIFIED_METADATA_KEY.to_string(),
+            crate::event::WRAPPER_OUTPUT_CLASSIFIED_METADATA_VALUE.to_string(),
         );
-        assert_eq!(
-            smuggled.metadata.get("other").map(String::as_str),
-            Some("kept")
-        );
+        queue_codex_rollout_arm(&registry, &classified);
+        assert!(registry.codex_rollout_arms().drain().is_empty());
 
-        // End to end through the state: the stripped frame paints nothing.
-        let mut state = crate::state::AppState::default();
-        state.register_pane("pane-1".to_string());
-        state.apply_event(smuggled);
-        assert_eq!(
-            state.sessions["s"].status,
-            crate::state::SessionStatus::Thinking
+        queue_codex_rollout_arm(&registry, &prompt(&owner));
+        let mut stop = prompt(&owner);
+        stop.event_type = crate::event::EventType::Idle;
+        queue_codex_rollout_arm(&registry, &stop);
+        let queued = registry.codex_rollout_arms().drain();
+        assert!(
+            matches!(&queued[..], [ArmCommand::Arm(req), ArmCommand::Disarm { turn_id, .. }]
+                if req.turn_id.as_deref() == Some("t1") && turn_id == "t1"),
+            "{queued:?}"
         );
-        assert!(state.sessions["s"].blocked.is_none());
+        registry.shutdown_all();
     }
 
     /// PRD #1223: the pane-closed marker is daemon-authoritative. A producer
@@ -3949,7 +4040,7 @@ mod hook_ingestion_tests {
     /// that would let any same-uid process make a TUI drop a live pane.
     #[tokio::test]
     async fn ingest_strips_a_producer_supplied_pane_closed_marker() {
-        let registry = AgentPtyRegistry::new();
+        let registry = Arc::new(AgentPtyRegistry::new());
         let state: SharedState =
             Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
         let (event_tx, mut rx) = broadcast::channel(8);
@@ -3984,159 +4075,6 @@ mod hook_ingestion_tests {
             "the relayed copy must not carry the marker: {:?}",
             relayed.metadata
         );
-    }
-
-    /// Issue #714 (audit A1): a quota confirmation that a genuine work event
-    /// overtakes must never paint the card. The probe confirms; then, with the
-    /// `AppState` write lock busy, the agent's own `Thinking` hook arrives
-    /// through `ingest_event` and takes the lock ahead of the publisher. The stale
-    /// confirmation is dropped — no `QuotaBlocked` broadcast, no Blocked card,
-    /// no orchestrator notice — while a fresh confirmation with no work since
-    /// still publishes.
-    #[tokio::test]
-    async fn quota_block_overtaken_by_a_work_event_is_not_applied() {
-        use crate::quota_detect::{BlockedKind, ProbeOutcome, QuotaTimings};
-        const PANE_ID: &str = "quota-race-worker";
-        let registry = Arc::new(AgentPtyRegistry::new());
-        let agent_id = registry
-            .spawn_agent(SpawnOptions {
-                command: Some("/bin/cat"),
-                env: crate::test_isolation::pin_unreachable_endpoints(vec![(
-                    DOT_AGENT_DECK_PANE_ID.to_string(),
-                    PANE_ID.to_string(),
-                )]),
-                agent_type: Some(AgentType::Codex),
-                ..SpawnOptions::default()
-            })
-            .expect("spawn worker stand-in");
-        let state: SharedState =
-            Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
-        // The daemon's own `AppState`: the registry-backed ownership oracle
-        // installed exactly as `run_daemon_with` installs it — so every apply
-        // below nests the registry lock inside the write lock, as in
-        // production — and the pane managed, as spawn leaves it.
-        {
-            let ownership: Arc<dyn crate::state::AgentOwnership> = registry.clone();
-            let mut st = state.write().await;
-            st.set_agent_ownership(Arc::downgrade(&ownership));
-            st.register_pane(PANE_ID.to_string());
-        }
-        let (event_tx, mut rx) = broadcast::channel(EVENT_BROADCAST_CAPACITY);
-        let confirm = QuotaTimings::default().confirm;
-        let confirm_at = |t0: std::time::Instant| {
-            let rev = registry.quota_revision(&agent_id).expect("live agent");
-            assert_eq!(
-                registry.quota_record_probe(&agent_id, rev, t0, Some(BlockedKind::UsageLimit)),
-                Some((ProbeOutcome::Candidate, None))
-            );
-            match registry.quota_record_probe(
-                &agent_id,
-                rev,
-                t0 + confirm,
-                Some(BlockedKind::UsageLimit),
-            ) {
-                Some((ProbeOutcome::Confirmed(_), Some(epoch))) => epoch,
-                other => panic!("expected a confirmation, got {other:?}"),
-            }
-        };
-        let publish = |epoch: u64| {
-            let (registry, state, event_tx, agent_id) = (
-                registry.clone(),
-                state.clone(),
-                event_tx.clone(),
-                agent_id.clone(),
-            );
-            tokio::spawn(async move {
-                publish_quota_blocked(
-                    &registry,
-                    &state,
-                    &event_tx,
-                    QuotaBlockedReport {
-                        pane_id: PANE_ID,
-                        agent_id: &agent_id,
-                        epoch,
-                        kind: BlockedKind::UsageLimit,
-                        detail: "You\u{2019}ve hit your usage limit.",
-                    },
-                )
-                .await
-            })
-        };
-        let blocked_cards = |st: &crate::state::AppState| {
-            st.sessions
-                .values()
-                .filter(|s| s.status == crate::state::SessionStatus::Blocked)
-                .count()
-        };
-
-        let stale = confirm_at(std::time::Instant::now());
-        // A busy `AppState`: the agent's own `Thinking` hook queues for the
-        // write lock first, then the publisher of the now-stale confirmation.
-        // Tokio's RwLock is fair (FIFO), so the hook wins, as in the audit.
-        let busy = state.write().await;
-        let thinking = AgentEvent {
-            session_id: "quota-race-session".to_string(),
-            agent_type: AgentType::Codex,
-            event_type: crate::event::EventType::Thinking,
-            tool_name: None,
-            tool_detail: None,
-            cwd: None,
-            timestamp: chrono::Utc::now(),
-            user_prompt: None,
-            metadata: std::collections::HashMap::new(),
-            pane_id: Some(PANE_ID.to_string()),
-            agent_id: Some(agent_id.clone()),
-            agent_version: None,
-            schema_version: None,
-            live_target: None,
-        };
-        let ingest = {
-            let (state, event_tx, registry) = (state.clone(), event_tx.clone(), registry.clone());
-            tokio::spawn(async move { ingest_event(&state, &event_tx, &registry, thinking).await })
-        };
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        assert!(
-            !ingest.is_finished(),
-            "precondition: the hook event waits on the lock"
-        );
-        let publisher = publish(stale);
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        assert!(
-            !publisher.is_finished(),
-            "precondition: the publisher waits on the lock"
-        );
-        drop(busy);
-        assert!(
-            !publisher.await.expect("publisher task"),
-            "a confirmation overtaken by a work event was applied"
-        );
-        ingest.await.expect("ingest task");
-        while let Ok(msg) = rx.try_recv() {
-            if let BroadcastMsg::Event(event) = msg {
-                assert_ne!(
-                    event.event_type,
-                    crate::event::EventType::QuotaBlocked,
-                    "a stale QuotaBlocked reached the clients"
-                );
-            }
-        }
-        {
-            let st = state.read().await;
-            assert!(
-                st.sessions
-                    .values()
-                    .any(|s| s.pane_id.as_deref() == Some(PANE_ID)),
-                "precondition: the Thinking hook reached the card"
-            );
-            assert_eq!(blocked_cards(&st), 0, "a working agent shows Blocked");
-        }
-
-        // Control: a fresh confirmation with no work since publishes.
-        let fresh = confirm_at(std::time::Instant::now() + Duration::from_secs(1));
-        assert_ne!(fresh, stale);
-        assert!(publish(fresh).await.expect("publisher task"));
-        assert_eq!(blocked_cards(&*state.read().await), 1);
-        registry.shutdown_all();
     }
 
     /// Issue #714 (audit N1/N2): a Codex worker stand-in and an orchestrator
@@ -4215,103 +4153,11 @@ mod hook_ingestion_tests {
             );
         }
 
-        /// Write one line into the worker and wait until `cat` has echoed it
-        /// back and printed it, so the pane is quiet again afterwards.
-        async fn worker_prints(&self, line: &str) {
-            let before = self
-                .registry
-                .snapshot(&self.worker_id)
-                .expect("worker")
-                .windows(line.len())
-                .filter(|w| *w == line.as_bytes())
-                .count();
-            self.registry
-                .write_to_pane_notice(self.worker_pane, line)
-                .await
-                .expect("write into the worker");
-            // A failure bound only: generous, so a loaded box (the whole fast
-            // tier in parallel) cannot fail it on a slow echo.
-            let deadline = std::time::Instant::now() + Duration::from_secs(30);
-            loop {
-                let seen = self
-                    .registry
-                    .snapshot(&self.worker_id)
-                    .expect("worker")
-                    .windows(line.len())
-                    .filter(|w| *w == line.as_bytes())
-                    .count();
-                if seen >= before + 2 {
-                    break;
-                }
-                assert!(
-                    std::time::Instant::now() < deadline,
-                    "the worker never printed {line:?}"
-                );
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-            // Let any trailing CR/LF land too, so the revision a probe copies
-            // is the one the next record sees.
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-
-        fn probe(&self, at: std::time::Instant) -> crate::agent_pty::QuotaProbe {
-            self.registry
-                .quota_probe_candidates(at)
-                .into_iter()
-                .find(|p| p.agent_id == self.worker_id)
-                .expect("a quiet worker after a quota hint is probed")
-        }
-
-        fn record(
-            &self,
-            probe: &crate::agent_pty::QuotaProbe,
-            at: std::time::Instant,
-        ) -> Option<(crate::quota_detect::ProbeOutcome, Option<u64>)> {
-            let found = crate::quota_detect::classify(&AgentType::Codex, &probe.screen.tail_rows());
-            self.registry.quota_record_probe(
-                &self.worker_id,
-                probe.screen.revision,
-                at,
-                found.map(|m| m.kind),
-            )
-        }
-
-        /// Confirm directly, bypassing the screen (the revision is current).
-        fn confirm(&self, t0: std::time::Instant) -> u64 {
-            use crate::quota_detect::{BlockedKind, ProbeOutcome, QuotaTimings};
-            let rev = self.registry.quota_revision(&self.worker_id).expect("live");
-            let usage = Some(BlockedKind::UsageLimit);
-            assert_eq!(
-                self.registry
-                    .quota_record_probe(&self.worker_id, rev, t0, usage),
-                Some((ProbeOutcome::Candidate, None))
-            );
-            match self.registry.quota_record_probe(
-                &self.worker_id,
-                rev,
-                t0 + QuotaTimings::from_env().confirm,
-                usage,
-            ) {
-                Some((ProbeOutcome::Confirmed(_), Some(epoch))) => epoch,
-                other => panic!("expected a confirmation, got {other:?}"),
-            }
-        }
-
-        fn report(&self, epoch: u64) -> QuotaBlockedReport<'_> {
-            QuotaBlockedReport {
-                pane_id: self.worker_pane,
-                agent_id: &self.worker_id,
-                epoch,
-                kind: crate::quota_detect::BlockedKind::UsageLimit,
-                detail: "You\u{2019}ve hit your usage limit.",
-            }
-        }
-
-        async fn work_hook(&self) {
-            let thinking = AgentEvent {
+        fn worker_event(&self, event_type: crate::event::EventType) -> AgentEvent {
+            AgentEvent {
                 session_id: format!("{}-session", self.worker_pane),
                 agent_type: AgentType::Codex,
-                event_type: crate::event::EventType::Thinking,
+                event_type,
                 tool_name: None,
                 tool_detail: None,
                 cwd: None,
@@ -4323,7 +4169,49 @@ mod hook_ingestion_tests {
                 agent_version: None,
                 schema_version: None,
                 live_target: None,
-            };
+            }
+        }
+
+        /// The worker's own `quota_blocked` report.
+        fn quota_blocked(&self) -> AgentEvent {
+            let mut event = self.worker_event(crate::event::EventType::QuotaBlocked);
+            event.metadata.insert(
+                crate::quota_block::QUOTA_BLOCKED_KIND_METADATA_KEY.to_string(),
+                "usage_limit".to_string(),
+            );
+            event
+        }
+
+        /// The worker reports a block through [`ingest_event`] — latch, card and
+        /// orchestrator notice, the production path. Returns the latched epoch.
+        async fn report_block(&self) -> u64 {
+            ingest_event(
+                &self.state,
+                &self.event_tx,
+                &self.registry,
+                self.quota_blocked(),
+            )
+            .await;
+            self.registry
+                .quota_published_epoch(self.worker_pane, &self.worker_id)
+                .expect("the report latched a block")
+        }
+
+        /// Only the first half of [`ingest_event`] for a block — the latch and
+        /// the card, under the `AppState` write lock — so a test can interleave
+        /// a work hook before the notice is attempted.
+        async fn latch_block(&self) -> u64 {
+            let mut state = self.state.write().await;
+            let epoch = self
+                .registry
+                .note_quota_block(self.worker_pane, &self.worker_id)
+                .expect("the worker owns its pane");
+            state.apply_event(self.quota_blocked());
+            epoch
+        }
+
+        async fn work_hook(&self) {
+            let thinking = self.worker_event(crate::event::EventType::Thinking);
             ingest_event(&self.state, &self.event_tx, &self.registry, thinking).await;
         }
 
@@ -4335,48 +4223,6 @@ mod hook_ingestion_tests {
                 .values()
                 .filter(|s| s.status == crate::state::SessionStatus::Blocked)
                 .count()
-        }
-
-        /// Print a Codex quota line into the worker, confirm it from the
-        /// screen through [`handle_quota_probe`] (which also publishes it and
-        /// notifies the orchestrator), and return the confirming instant.
-        async fn publish_from_screen(&self) -> std::time::Instant {
-            use crate::quota_detect::{ProbeOutcome, QuotaTimings};
-            self.worker_prints("You\u{2019}ve hit your usage limit. Try again at 3:00 PM.")
-                .await;
-            let timings = QuotaTimings::from_env();
-            let t0 = std::time::Instant::now() + timings.quiet * 2;
-            assert_eq!(
-                handle_quota_probe(
-                    &self.registry,
-                    &self.state,
-                    &self.event_tx,
-                    self.probe(t0),
-                    t0
-                )
-                .await,
-                Some(ProbeOutcome::Candidate)
-            );
-            let t1 = t0 + timings.confirm;
-            let outcome = handle_quota_probe(
-                &self.registry,
-                &self.state,
-                &self.event_tx,
-                self.probe(t1),
-                t1,
-            )
-            .await;
-            assert!(
-                matches!(outcome, Some(ProbeOutcome::Confirmed(_))),
-                "expected a confirmation, got {outcome:?}"
-            );
-            t1
-        }
-
-        /// How long after a probe the next one is due, once the pane is quiet.
-        fn reprobe_gap(&self) -> Duration {
-            let timings = crate::quota_detect::QuotaTimings::from_env();
-            timings.quiet.max(timings.probe_interval) * 2
         }
 
         /// [`Self::notices`], polled until at least one has landed and the
@@ -4432,85 +4278,18 @@ mod hook_ingestion_tests {
         }
     }
 
-    /// Issue #714 (audit N1): the replay runs outside every lock, so the worker
-    /// can redraw while it runs, and it can redraw again between a confirmation
-    /// and its publication. Print a Codex quota line, take the confirming
-    /// snapshot, redraw with an ordinary line, then record the old snapshot: it
-    /// is Stale and nothing latches. Then confirm the current screen, redraw
-    /// before publishing, and publish the old confirmation: no Blocked card, no
-    /// `QuotaBlocked` broadcast, no orchestrator notice, and the notice is still
-    /// owed.
-    #[tokio::test]
-    async fn quota_confirmation_of_a_redrawn_screen_is_not_published() {
-        use crate::quota_detect::{ProbeOutcome, QuotaTimings};
-        const QUOTA_LINE: &str = "You\u{2019}ve hit your usage limit. Try again at 3:00 PM.";
-        let fx = QuotaNoticeFixture::new("quota-redraw-worker", "quota-redraw-orch").await;
-        let mut rx = fx.event_tx.subscribe();
-        let timings = QuotaTimings::from_env();
-        fx.worker_prints(QUOTA_LINE).await;
-
-        let t0 = std::time::Instant::now() + timings.quiet * 2;
-        let first = fx.probe(t0);
-        assert_eq!(fx.record(&first, t0), Some((ProbeOutcome::Candidate, None)));
-
-        // A redraw lands while the confirming snapshot is being replayed.
-        let t1 = t0 + timings.confirm;
-        let confirming = fx.probe(t1);
-        assert!(
-            crate::quota_detect::classify(&AgentType::Codex, &confirming.screen.tail_rows())
-                .is_some(),
-            "precondition: the confirming snapshot shows the quota line"
-        );
-        fx.worker_prints("working on the task again").await;
-        assert_eq!(
-            fx.record(&confirming, t1),
-            Some((ProbeOutcome::Stale, None)),
-            "a snapshot the worker has written over was recorded"
-        );
-
-        // The quota line comes back and confirms; a redraw then lands before
-        // the publisher takes the lock.
-        fx.worker_prints(QUOTA_LINE).await;
-        let t2 = t1 + timings.quiet * 2;
-        let current = fx.probe(t2);
-        let epoch = match fx.record(&current, t2) {
-            Some((ProbeOutcome::Confirmed(_), Some(epoch))) => epoch,
-            other => panic!("expected a confirmation of the current screen, got {other:?}"),
-        };
-        fx.worker_prints("working on the task again").await;
-        assert!(
-            !publish_quota_blocked(&fx.registry, &fx.state, &fx.event_tx, fx.report(epoch)).await,
-            "a confirmation of a redrawn screen was published"
-        );
-        assert_eq!(fx.blocked_cards().await, 0, "a redrawn pane shows Blocked");
-        while let Ok(msg) = rx.try_recv() {
-            if let BroadcastMsg::Event(event) = msg {
-                assert_ne!(event.event_type, crate::event::EventType::QuotaBlocked);
-            }
-        }
-        assert_eq!(fx.notices().await, 0, "the orchestrator was told");
-        assert!(
-            fx.registry
-                .claim_worker_blocked_notice(fx.worker_pane, &fx.worker_id)
-                .is_some(),
-            "the suppressed notice must stay owed"
-        );
-        fx.registry.shutdown_all();
-    }
-
     /// Issue #714 (audit N2, R2): a genuine work hook that clears the block
     /// after it was applied, but before the orchestrator is told, suppresses the
     /// notice — whether it lands before the notice is claimed or between the
-    /// claim and the write. Either way the notice stays owed: a second genuine
-    /// block of the SAME delegation then delivers exactly one notice, and a
-    /// third block of it delivers none.
+    /// claim and the write. Either way the notice stays owed: a second block of
+    /// the SAME delegation, reported by the worker, then delivers exactly one
+    /// notice, and a third block of it delivers none.
     #[tokio::test]
     async fn quota_block_cleared_before_the_notice_is_not_reported() {
         let fx = QuotaNoticeFixture::new("quota-cleared-worker", "quota-cleared-orch").await;
 
-        // publish → work hook → claim: nothing is claimed or written.
-        let epoch = fx.confirm(std::time::Instant::now());
-        assert!(apply_quota_blocked(&fx.registry, &fx.state, &fx.event_tx, fx.report(epoch)).await);
+        // latch → work hook → claim: nothing is claimed or written.
+        let epoch = fx.latch_block().await;
         assert_eq!(
             fx.blocked_cards().await,
             1,
@@ -4529,9 +4308,8 @@ mod hook_ingestion_tests {
         );
         assert_eq!(fx.notices().await, 0, "a cleared block was reported");
 
-        // publish → claim → work hook → write: the writer-held re-check refuses.
-        let epoch = fx.confirm(std::time::Instant::now() + Duration::from_secs(1));
-        assert!(apply_quota_blocked(&fx.registry, &fx.state, &fx.event_tx, fx.report(epoch)).await);
+        // latch → claim → work hook → write: the writer-held re-check refuses.
+        let epoch = fx.latch_block().await;
         let notice = fx
             .registry
             .claim_worker_blocked_notice(fx.worker_pane, &fx.worker_id)
@@ -4546,13 +4324,10 @@ mod hook_ingestion_tests {
             "a block cleared after the claim was reported"
         );
 
-        // A second genuine block of the SAME delegation (not re-armed): the
-        // refused claim was released, so the notice is delivered — once (`cat`
-        // shows it twice: the tty echo and its output) — and claimed.
-        let epoch = fx.confirm(std::time::Instant::now() + Duration::from_secs(2));
-        assert!(
-            publish_quota_blocked(&fx.registry, &fx.state, &fx.event_tx, fx.report(epoch)).await
-        );
+        // A second block of the SAME delegation (not re-armed): the refused
+        // claim was released, so the notice is delivered — once (`cat` shows it
+        // twice: the tty echo and its output) — and claimed.
+        fx.report_block().await;
         let delivered = fx.settled_notices().await;
         assert_eq!(delivered, 2, "expected exactly one notice (echo + output)");
         assert!(
@@ -4564,249 +4339,17 @@ mod hook_ingestion_tests {
 
         // A third block of the same delegation reports nothing more.
         fx.work_hook().await;
-        let epoch = fx.confirm(std::time::Instant::now() + Duration::from_secs(3));
-        assert!(
-            publish_quota_blocked(&fx.registry, &fx.state, &fx.event_tx, fx.report(epoch)).await
-        );
+        fx.report_block().await;
         assert_eq!(fx.notices().await, delivered, "the delegation re-notified");
         fx.registry.shutdown_all();
     }
 
-    /// Issue #714 (audit R1): a stand-in worker that sends no work hooks at all
-    /// prints a Codex quota line, is confirmed and published Blocked, and the
-    /// orchestrator is told once. It then resumes and prints enough ordinary
-    /// output to push the quota line out of the bottom rows; once it is quiet a
-    /// probe lifts the block through one daemon `QuotaCleared` — the card reads
-    /// Idle, carries no reason, and a delegate would no longer see it Blocked.
-    #[tokio::test]
-    async fn quota_block_clears_once_output_scrolls_the_line_away() {
-        use crate::quota_detect::ProbeOutcome;
-        let fx = QuotaNoticeFixture::new("quota-scroll-worker", "quota-scroll-orch").await;
-        let t1 = fx.publish_from_screen().await;
-        assert_eq!(fx.blocked_cards().await, 1, "precondition: Blocked");
-        let notices = fx.settled_notices().await;
-        assert_eq!(notices, 2, "precondition: one notice (echo + output)");
-        let mut rx = fx.event_tx.subscribe();
-
-        for i in 0..8 {
-            fx.worker_prints(&format!("resumed, ordinary output line {i}"))
-                .await;
-        }
-        let t2 = t1 + fx.reprobe_gap();
-        assert!(
-            crate::quota_detect::classify(&AgentType::Codex, &fx.probe(t2).screen.tail_rows())
-                .is_none(),
-            "precondition: the quota line has left the bottom rows"
-        );
-        let outcome =
-            handle_quota_probe(&fx.registry, &fx.state, &fx.event_tx, fx.probe(t2), t2).await;
-        assert!(
-            matches!(outcome, Some(ProbeOutcome::Cleared(_))),
-            "expected a clear, got {outcome:?}"
-        );
-        assert_eq!(
-            fx.blocked_cards().await,
-            0,
-            "a recovered pane shows Blocked"
-        );
-        {
-            let st = fx.state.read().await;
-            assert!(st.pane_blocked_reason(fx.worker_pane).is_none());
-            let card = st
-                .sessions
-                .values()
-                .find(|s| s.pane_id.as_deref() == Some(fx.worker_pane))
-                .expect("the worker's card");
-            assert_eq!(card.status, crate::state::SessionStatus::Idle);
-            assert!(card.blocked.is_none());
-        }
-        let mut cleared = 0;
-        while let Ok(msg) = rx.try_recv() {
-            if let BroadcastMsg::Event(event) = msg {
-                assert_ne!(event.event_type, crate::event::EventType::QuotaBlocked);
-                if event.event_type == crate::event::EventType::QuotaCleared {
-                    cleared += 1;
-                }
-            }
-        }
-        assert_eq!(cleared, 1, "the clear reaches the clients exactly once");
-        assert!(
-            fx.registry
-                .quota_probe_candidates(t2 + fx.reprobe_gap() * 10)
-                .into_iter()
-                .all(|p| p.agent_id != fx.worker_id),
-            "a cleared pane with no new hint is still probed"
-        );
-        assert_eq!(fx.notices().await, notices, "the clear sent a notice");
-        fx.registry.shutdown_all();
-    }
-
-    /// Issue #714 (audit R1): a published block whose worker keeps redrawing
-    /// with the quota line still among the bottom rows — a blocked agent's idle
-    /// redraw — is re-probed after each burst of output and stays Blocked, with
-    /// no second `QuotaBlocked`, no `QuotaCleared` and no second notice.
-    #[tokio::test]
-    async fn quota_block_survives_idle_redraws_that_keep_the_line() {
-        use crate::quota_detect::ProbeOutcome;
-        let fx = QuotaNoticeFixture::new("quota-idle-worker", "quota-idle-orch").await;
-        let mut at = fx.publish_from_screen().await;
-        let notices = fx.settled_notices().await;
-        assert_eq!(notices, 2, "precondition: one notice (echo + output)");
-        let mut rx = fx.event_tx.subscribe();
-
-        for i in 0..2 {
-            fx.worker_prints(&format!("redraw {i}")).await;
-            at += fx.reprobe_gap();
-            let outcome =
-                handle_quota_probe(&fx.registry, &fx.state, &fx.event_tx, fx.probe(at), at).await;
-            assert_eq!(outcome, Some(ProbeOutcome::StillBlocked), "redraw {i}");
-            assert_eq!(fx.blocked_cards().await, 1, "redraw {i} cleared the block");
-        }
-        assert!(
-            fx.registry
-                .quota_probe_candidates(at + fx.reprobe_gap() * 10)
-                .into_iter()
-                .all(|p| p.agent_id != fx.worker_id),
-            "re-probed with no output since the last re-probe"
-        );
-        while let Ok(msg) = rx.try_recv() {
-            if let BroadcastMsg::Event(event) = msg {
-                assert!(
-                    !matches!(
-                        event.event_type,
-                        crate::event::EventType::QuotaBlocked
-                            | crate::event::EventType::QuotaCleared
-                    ),
-                    "an idle redraw published {:?}",
-                    event.event_type
-                );
-            }
-        }
-        assert_eq!(fx.notices().await, notices, "an idle redraw re-notified");
-        fx.registry.shutdown_all();
-    }
-
-    /// Issue #714 (audit F-A1): a quiet probe finds a published block's quota
-    /// line gone, but before the clear is published the worker prints again —
-    /// a fresh quota line in one run, ordinary output in the other. The clear is
-    /// refused: no `QuotaCleared` reaches the clients, the card stays Blocked,
-    /// nothing is re-published and no second notice goes out. The next quiet
-    /// probe then decides from the screen as it is: the fresh quota line keeps
-    /// the block, ordinary output lifts it through one `QuotaCleared`.
-    #[tokio::test]
-    async fn quota_clear_overtaken_by_later_output_is_not_published() {
-        use crate::quota_detect::ProbeOutcome;
-        const QUOTA_LINE: &str = "You\u{2019}ve hit your usage limit. Try again at 3:00 PM.";
-        for fresh_quota_line in [true, false] {
-            let label = if fresh_quota_line {
-                "fresh quota line"
-            } else {
-                "ordinary output"
-            };
-            let fx =
-                QuotaNoticeFixture::new("quota-overtaken-worker", "quota-overtaken-orch").await;
-            let t1 = fx.publish_from_screen().await;
-            let notices = fx.settled_notices().await;
-            assert_eq!(
-                notices, 2,
-                "{label}: precondition: one notice (echo + output)"
-            );
-            let mut rx = fx.event_tx.subscribe();
-
-            for i in 0..8 {
-                fx.worker_prints(&format!("resumed, ordinary output line {i}"))
-                    .await;
-            }
-            let t2 = t1 + fx.reprobe_gap();
-            let probe = fx.probe(t2);
-            let epoch = match fx.record(&probe, t2) {
-                Some((ProbeOutcome::Cleared(epoch), _)) => epoch,
-                other => panic!("{label}: expected a clear, got {other:?}"),
-            };
-
-            // The pane writes before the publisher takes the lock.
-            if fresh_quota_line {
-                fx.worker_prints(QUOTA_LINE).await;
-            } else {
-                fx.worker_prints("still working on the task").await;
-            }
-            assert!(
-                !publish_quota_cleared(
-                    &fx.registry,
-                    &fx.state,
-                    &fx.event_tx,
-                    QuotaClearedReport {
-                        pane_id: fx.worker_pane,
-                        agent_id: &fx.worker_id,
-                        epoch,
-                        revision: probe.screen.revision,
-                    },
-                )
-                .await,
-                "{label}: a clear of a screen written over since was applied"
-            );
-            assert_eq!(
-                fx.blocked_cards().await,
-                1,
-                "{label}: the card left Blocked"
-            );
-            while let Ok(msg) = rx.try_recv() {
-                if let BroadcastMsg::Event(event) = msg {
-                    assert!(
-                        !matches!(
-                            event.event_type,
-                            crate::event::EventType::QuotaBlocked
-                                | crate::event::EventType::QuotaCleared
-                        ),
-                        "{label}: a stale clear published {:?}",
-                        event.event_type
-                    );
-                }
-            }
-
-            // The next quiet probe resolves it from the current screen.
-            let t3 = t2 + fx.reprobe_gap();
-            let outcome =
-                handle_quota_probe(&fx.registry, &fx.state, &fx.event_tx, fx.probe(t3), t3).await;
-            let mut cleared = 0;
-            while let Ok(msg) = rx.try_recv() {
-                if let BroadcastMsg::Event(event) = msg {
-                    assert_ne!(event.event_type, crate::event::EventType::QuotaBlocked);
-                    if event.event_type == crate::event::EventType::QuotaCleared {
-                        cleared += 1;
-                    }
-                }
-            }
-            if fresh_quota_line {
-                assert_eq!(outcome, Some(ProbeOutcome::StillBlocked), "{label}");
-                assert_eq!(
-                    fx.blocked_cards().await,
-                    1,
-                    "{label}: the fresh block was lifted"
-                );
-                assert_eq!(cleared, 0, "{label}");
-            } else {
-                assert!(
-                    matches!(outcome, Some(ProbeOutcome::Cleared(e)) if e == epoch),
-                    "{label}: expected the same block cleared, got {outcome:?}"
-                );
-                assert_eq!(fx.blocked_cards().await, 0, "{label}: still Blocked");
-                assert_eq!(
-                    cleared, 1,
-                    "{label}: the clear reaches the clients exactly once"
-                );
-            }
-            assert_eq!(fx.notices().await, notices, "{label}: re-notified");
-            fx.registry.shutdown_all();
-        }
-    }
-
     /// Issue #714 (audit F-A2): block 1 claims the blocked-worker notice and
     /// waits on the orchestrator's writer, which is held busy. A work hook lifts
-    /// block 1 and block 2 of the SAME delegation is published while the writer
-    /// is still busy, so block 2 finds the notice claimed and skips it. When the
-    /// writer frees, block 1's write is refused and released — and the notice is
-    /// then delivered for block 2, exactly once. A third block of the
+    /// block 1 and the worker reports block 2 of the SAME delegation while the
+    /// writer is still busy, so block 2 finds the notice claimed and skips it.
+    /// When the writer frees, block 1's write is refused and released — and the
+    /// notice is then delivered for block 2, exactly once. A third block of the
     /// delegation reports nothing more.
     #[tokio::test]
     async fn quota_refused_notice_hands_the_claim_to_a_newer_block() {
@@ -4817,15 +4360,7 @@ mod hook_ingestion_tests {
             .expect("the orchestrator's writer");
         let mut held = Some(writer.lock().await);
 
-        let first = fx.confirm(std::time::Instant::now());
-        assert!(
-            bounded_while_holding(
-                &mut held,
-                "applying block 1",
-                apply_quota_blocked(&fx.registry, &fx.state, &fx.event_tx, fx.report(first)),
-            )
-            .await
-        );
+        let first = bounded_while_holding(&mut held, "latching block 1", fx.latch_block()).await;
         let notice = fx
             .registry
             .claim_worker_blocked_notice(fx.worker_pane, &fx.worker_id)
@@ -4847,16 +4382,8 @@ mod hook_ingestion_tests {
         );
 
         bounded_while_holding(&mut held, "the work hook", fx.work_hook()).await;
-        let second = fx.confirm(std::time::Instant::now() + Duration::from_secs(1));
+        let second = bounded_while_holding(&mut held, "reporting block 2", fx.report_block()).await;
         assert_ne!(second, first);
-        assert!(
-            bounded_while_holding(
-                &mut held,
-                "publishing block 2",
-                publish_quota_blocked(&fx.registry, &fx.state, &fx.event_tx, fx.report(second)),
-            )
-            .await
-        );
         assert_eq!(fx.blocked_cards().await, 1, "precondition: block 2 applied");
 
         drop(held.take());
@@ -4874,19 +4401,16 @@ mod hook_ingestion_tests {
         );
 
         fx.work_hook().await;
-        let third = fx.confirm(std::time::Instant::now() + Duration::from_secs(2));
-        assert!(
-            publish_quota_blocked(&fx.registry, &fx.state, &fx.event_tx, fx.report(third)).await
-        );
+        fx.report_block().await;
         assert_eq!(fx.notices().await, delivered, "the delegation re-notified");
         fx.registry.shutdown_all();
     }
 
-    /// Issue #714 (review): the quota monitor publishes every pane's block from
-    /// one loop, so publishing must not wait on the orchestrator's pane writer.
-    /// Hold that writer, confirm and publish a worker's block: the publication
-    /// returns at once with the card Blocked and the notice already claimed, and
-    /// the notice lands — once — only when the writer frees.
+    /// Issue #714 (review): every pane's hooks pass through `ingest_event`, so
+    /// ingesting a worker's block must not wait on the orchestrator's pane
+    /// writer. Hold that writer and ingest the worker's `quota_blocked`: it
+    /// returns at once with the card Blocked and the notice already claimed,
+    /// and the notice lands — once — only when the writer frees.
     #[tokio::test]
     async fn quota_publish_does_not_wait_on_a_busy_orchestrator_writer() {
         let fx = QuotaNoticeFixture::new("quota-busy-worker", "quota-busy-orch").await;
@@ -4896,15 +4420,7 @@ mod hook_ingestion_tests {
             .expect("the orchestrator's writer");
         let mut held = Some(writer.lock().await);
 
-        let epoch = fx.confirm(std::time::Instant::now());
-        // Before the fix this never returned while the writer was held.
-        let published = bounded_while_holding(
-            &mut held,
-            "publishing a block",
-            publish_quota_blocked(&fx.registry, &fx.state, &fx.event_tx, fx.report(epoch)),
-        )
-        .await;
-        assert!(published, "precondition: the block applied");
+        bounded_while_holding(&mut held, "ingesting a block", fx.report_block()).await;
         assert_eq!(fx.blocked_cards().await, 1);
         assert_eq!(
             fx.notices().await,
@@ -4940,14 +4456,10 @@ mod hook_ingestion_tests {
             .expect("the orchestrator's writer");
         let mut held = Some(writer.lock().await);
 
-        let epoch = fx.confirm(std::time::Instant::now());
-        assert!(
-            bounded_while_holding(
-                &mut held,
-                "publishing the block",
-                publish_quota_blocked(&fx.registry, &fx.state, &fx.event_tx, fx.report(epoch)),
-            )
-            .await,
+        bounded_while_holding(&mut held, "ingesting the block", fx.report_block()).await;
+        assert_eq!(
+            fx.blocked_cards().await,
+            1,
             "precondition: the block applied"
         );
 

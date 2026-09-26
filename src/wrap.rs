@@ -2049,7 +2049,8 @@ fn classify_and_emit(
     if let Some(ev) = ev {
         // Issue #714: marked, because this classifier calls every printed line
         // `Working` — a provider's quota-error line included — so what it emits
-        // proves output, not work. See `WRAPPER_OUTPUT_CLASSIFIED_METADATA_KEY`.
+        // proves output, not work, and must not clear a Blocked card. See
+        // `WRAPPER_OUTPUT_CLASSIFIED_METADATA_KEY`.
         let mut metadata = HashMap::new();
         metadata.insert(
             crate::event::WRAPPER_OUTPUT_CLASSIFIED_METADATA_KEY.to_string(),
