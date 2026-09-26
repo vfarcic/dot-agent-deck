@@ -5,7 +5,7 @@ title: Schedules
 
 # Schedules
 
-Scheduled tasks let you say *"every weekday at 09:00, run this prompt in this directory"* and have the result land in the deck where you can read it after a notification — no opening a terminal at the right time, `cd`-ing to the right place, and pasting the prompt by hand.
+Schedules let you say *"every weekday at 09:00, run this prompt in this directory"* and have the result land in the deck where you can read it after a notification — no opening a terminal at the right time, `cd`-ing to the right place, and pasting the prompt by hand.
 
 Each task pairs a **schedule** (when it runs) with a **working directory and a prompt** (what runs). When the schedule comes due, the deck opens a tab in that directory and hands the prompt to a fresh agent — or to an orchestration, if that directory defines one — exactly as if you had started it yourself from the new-deck dialog.
 
@@ -51,16 +51,16 @@ Actions — the footer buttons mirror the keys, shown as `[Add a]` `[Edit e]` `[
 
 ### What the authoring agent does
 
-Both doors below open the same guided session:
+Both doors below open the same guided authoring agent:
 
-- **From the Schedules dialog** — press **`s`** on the dashboard, then **`a`** / **`[Add]`** to author a new one (or **`e`** / **`[Edit]`** to start from an existing row's values). First a **directory picker** (the dir you choose becomes the authoring session's working directory, and is pre-seeded as the schedule's own working directory), then a small **New Schedule** / **Edit Schedule** form with a **Dir** and a free-text **Command** field (pre-filled from your `default_command`). Confirm to start the authoring session in that directory running that command; **`Esc`** / **`[Cancel]`** returns you to the dialog.
-- **From the new-deck / new-pane dialog** — open it (`Ctrl+n`), confirm a directory, and cycle the **Mode** field to the end — past your project's workload modes — to the built-in **`schedule`** option (marked as an *authoring session*).
+- **From the Schedules dialog** — press **`s`** on the dashboard, then **`a`** / **`[Add]`** to author a new one (or **`e`** / **`[Edit]`** to start from an existing row's values). First a **directory picker** (the dir you choose becomes the authoring agent's working directory, and is pre-seeded as the schedule's own working directory), then a small **New Schedule** / **Edit Schedule** form with a **Dir** and a free-text **Command** field (pre-filled from your `default_command`). Confirm to start the authoring agent in that directory running that command; **`Esc`** / **`[Cancel]`** returns you to the dialog.
+- **From the New Agent form** — open it (`Ctrl+n`), confirm a directory, and cycle the **Mode** field to the end — past your project's workload modes — to the built-in **`schedule`** option (marked `authoring (one-off)`).
 
-Either way a throwaway authoring session opens — running your chosen agent command, which defaults to your configured [`default_command`](configuration.md#default-command) and falls back to `claude` when that is unset — and walks you through it. It:
+Either way a throwaway authoring agent opens — running your chosen agent command, which defaults to your configured [`default_command`](configuration.md#default-command) and falls back to `claude` when that is unset — and walks you through it. It:
 
 - asks you for the fields (name, cron, working dir, command, prompt, …);
 - asks for the **command that launches your agent** — it must result in a `claude`, `opencode`, `pi`, `codex`, or `devin` process, either directly (`claude`, `claude --model opus`, `opencode --model gpt-4o`, `pi`, `codex`, `devin`) or via a project wrapper that ends up launching one (`devbox run agent-new`, `npm run agent`). Those are the CLIs the deck integrates with for **live status tracking**; a command that doesn't result in one still runs but gets no status tracking, so the agent won't suggest unrelated CLIs (e.g. `gemini`). The command is **required** (there is no `$SHELL` fallback);
-- lets you **test the prompt in the same session** ("run it now, show me") before committing;
+- lets you **test the prompt with the same agent** ("run it now, show me") before committing;
 - **confirms the full entry** with you, then calls `schedule add` (or `schedule update` on the edit path).
 
 The agent writes the entry for you, so you don't have to get the cron syntax or prompt formatting right by hand. When it's done it tells you that **this authoring pane existed only to create the schedule and can be closed** — when the schedule later fires, a single-agent run **appears live in its own pane** on the deck, while an orchestration-targeted run opens in its tab when the deck is (re)opened.
@@ -84,7 +84,7 @@ A single malformed `[[scheduled_tasks]]` entry never crashes the daemon or block
 
 ## Tab reuse
 
-Most scheduled tasks should **reuse** one tab, because you primarily learn about fires through notifications and open the deck to dig into a result only when you choose to.
+Most schedules should **reuse** one tab, because you primarily learn about fires through notifications and open the deck to dig into a result only when you choose to.
 
 - **Default (`new_tab_per_fire = false`)** — a task reuses the same tab/card each fire. Yesterday's weather output is replaced by today's. One weather tab, ever.
 - **Opt-in (`new_tab_per_fire = true`)** — each fire opens a fresh tab, for audit-style tasks where you want per-fire history.
@@ -110,11 +110,11 @@ The daemon also auto-exits after a short idle window when there are no clients a
 
 > **The task type itself is always available; only the guided creation UI is experimental.**
 >
-> A configured `issue_dispatch` task **always runs** — once the `[scheduled_tasks.issue_dispatch]` sub-table below is present (whether you hand-write it or author it with the CLI), the daemon fires it on schedule with no flag required. What *is* gated behind the `experimental` feature flag is the in-deck **guided `schedule: issues` authoring option** in the new-pane dialog (a convenience for building one of these tasks conversationally). To enable that option, set `experimental = true` under a `[features]` table in your `.dot-agent-deck.toml`, or launch with `DOT_AGENT_DECK_EXPERIMENTAL=1` (the environment variable wins over the file). Everything below describes the task type, which works regardless of the flag.
+> A configured `issue_dispatch` task **always runs** — once the `[scheduled_tasks.issue_dispatch]` sub-table below is present (whether you hand-write it or author it with the CLI), the daemon fires it on schedule with no flag required. What *is* gated behind the `experimental` feature flag is the in-deck **guided `schedule: issues` authoring option** in the New Agent form (a convenience for building one of these tasks conversationally). To enable that option, set `experimental = true` under a `[features]` table in your `.dot-agent-deck.toml`, or launch with `DOT_AGENT_DECK_EXPERIMENTAL=1` (the environment variable wins over the file). Everything below describes the task type, which works regardless of the flag.
 
 The examples so far run **one** prompt in **one** directory per fire. An **`issue_dispatch`** task is a specialized variant that, on each fire, looks at the **open GitHub issues of one repo** and spins up an agent **per issue** — so *"every weekday at 09:00, pull up to five open issues from `vfarcic/dot-ai` and start an agent on each"* becomes a single schedule instead of a morning of manual cloning, worktree-making, and prompt-pasting.
 
-You turn an ordinary scheduled task into an issue-dispatch task by adding a `[scheduled_tasks.issue_dispatch]` sub-table to it. The shared fields (`name`, `cron`, `working_dir`, `prompt`, `enabled`) keep their meaning; the sub-table adds the GitHub-specific knobs:
+You turn an ordinary schedule into an issue-dispatch schedule by adding a `[scheduled_tasks.issue_dispatch]` sub-table to it. The shared fields (`name`, `cron`, `working_dir`, `prompt`, `enabled`) keep their meaning; the sub-table adds the GitHub-specific knobs:
 
 ```toml
 [[scheduled_tasks]]
@@ -133,9 +133,9 @@ max_per_run = 5                       # hard cap on how many issues a single fir
 
 > **`command` is not used here**
 >
-> Unlike a plain scheduled task, an `issue_dispatch` task does **not** need a `command`. The per-issue agent command is resolved at fire time: if the cloned repo defines an `[[orchestrations]]` block the dispatch opens an **orchestration tab** (the orchestration's role commands win); otherwise it opens a **single-agent card** running your [`default_command`](configuration.md#default-command) (which falls back to `claude` when unset).
+> Unlike a plain schedule, an `issue_dispatch` schedule does **not** need a `command`. The per-issue agent command is resolved at fire time: if the cloned repo defines an `[[orchestrations]]` block the dispatch opens an **orchestration tab** (the orchestration's role commands win); otherwise it opens a **single-agent card** running your [`default_command`](configuration.md#default-command) (which falls back to `claude` when unset).
 
-**This is the one place on this page where you may have to run a command yourself.** The guided authoring option for issue-dispatch tasks (the `schedule: issues` entry in the new-pane cycler) sits behind the `experimental` flag, so with the flag off there is no agent-driven door for this task type — only the sub-table above, hand-written, or the CLI below. It takes `--repo` plus the optional `--max-per-run` / `--label` / `--query`, and needs no `--command`:
+**This is the one place on this page where you may have to run a command yourself.** The guided authoring option for issue-dispatch tasks (the `schedule: issues` entry in the New Agent form's Mode field) sits behind the `experimental` flag, so with the flag off there is no agent-driven door for this task type — only the sub-table above, hand-written, or the CLI below. It takes `--repo` plus the optional `--max-per-run` / `--label` / `--query`, and needs no `--command`:
 
 ```bash
 dot-agent-deck schedule add \
@@ -188,7 +188,7 @@ Dispatched tabs/cards persist until **you** close them — you stay in control o
 >
 > - The **GitHub CLI (`gh`) must be installed and authenticated** — all GitHub access (issue enumeration, the PR idempotency check, and the initial clone) goes through it.
 > - **GitHub only, for now.** Issue dispatch is built on the GitHub CLI, so other forges (GitLab, Gitea, Bitbucket, …) aren't supported yet. If you'd like dispatch for another provider, please [open an issue](https://github.com/vfarcic/dot-agent-deck/issues) — it helps us gauge demand.
-> - Like every scheduled task, this runs in the **daemon**: fires that come due while the daemon is down are **not** replayed (see [Daemon must be running](#daemon-must-be-running)).
+> - Like every schedule, this runs in the **daemon**: fires that come due while the daemon is down are **not** replayed (see [Daemon must be running](#daemon-must-be-running)).
 > - **Detaching vs. stopping.** *Detaching* (closing the deck/TUI window) leaves the dispatched agents and their tabs **running in the daemon** — reconnect and they're still there. Only **stopping the daemon** (`daemon stop`, a restart, an upgrade, or a crash) terminates them. After a stop, the per-issue worktrees **remain on disk** (so they keep claiming their issues and the scheduler won't re-dispatch them), but the tabs themselves are **not** auto-restored on the next launch. Run `git worktree remove` (or reopen and close the tab) to release a slot manually.
 
 ## Worked examples
@@ -214,7 +214,7 @@ enabled = true
 
 `~/scheduled/morning-digest` has no `.dot-agent-deck.toml`, so the fire opens a single `claude` card there and delivers the prompt.
 
-### A scheduled task that targets an orchestration
+### A schedule that targets an orchestration
 
 If the target directory defines an orchestration, the fire opens an orchestration tab and delivers the prompt to the `orchestrator` role. The schedule's `command` is **still required** (every schedule needs one to load) but is **ignored at fire** — the orchestration's role commands win.
 

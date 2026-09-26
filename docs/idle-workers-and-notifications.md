@@ -12,7 +12,7 @@ The second is an **example recipe**: how one project (this one) wires its orches
 
 If you take one thing from this page, take the split: **the deck produces the signal an agent structurally cannot produce about itself; your agent decides what the signal means.**
 
-**Both parts require an [orchestration](orchestration.md).** Idle-worker detection watches *delegations*, and a delegation only exists inside an orchestration tab — so a plain agent pane, a workspace mode, and a single-agent scheduled task never produce an idle prompt, however long they run. Part 2 is orchestration-scoped for the same reason: the recipe is text in an orchestrator's `prompt_template`, and only an orchestration has an orchestrator. If you do not run orchestrations, nothing here applies to your setup yet.
+**Both parts require an [orchestration](orchestration.md).** Idle-worker detection watches *delegations*, and a delegation only exists inside an orchestration tab — so a plain agent pane, a workspace mode, and a single-agent schedule never produce an idle prompt, however long they run. Part 2 is orchestration-scoped for the same reason: the recipe is text in an orchestrator's `prompt_template`, and only an orchestration has an orchestrator. If you do not run orchestrations, nothing here applies to your setup yet.
 
 ## Part 1 — Idle-worker detection
 

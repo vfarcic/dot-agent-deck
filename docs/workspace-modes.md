@@ -7,7 +7,7 @@ title: Workspace Modes
 
 Modes are config-driven workspaces that pair an AI agent with live command output in side panes. Each mode activation creates a new tab — a self-contained workspace with the agent pane on the left (50%) and side panes stacked on the right (50%). Modes are defined per-project in a `.dot-agent-deck.toml` file at the project root.
 
-Besides the modes you define here, the **Mode** field also offers built-in options: `schedule` for authoring a [scheduled task](scheduled-tasks.md), and `dispatcher` for starting work in an isolated copy of the repo — see [Dispatcher Mode](dispatcher-mode.md).
+Besides the modes you define here, the **Mode** field also offers built-in options: `schedule` for authoring a [schedule](scheduled-tasks.md), and `dispatcher` for starting work in an isolated copy of the repo — see [Dispatcher Mode](dispatcher-mode.md).
 
 ![A mode tab in action — agent pane on the left, with live Git status, kubectl pods, and kubectl events stacked on the right](/img/modes.png)
 
@@ -60,7 +60,7 @@ agent = "codex"
 reactive_panes = 2
 ```
 
-The key belongs on `[[modes]]` and not on `[[modes.panes]]`: the side panes run tools, not agents. The command still comes from the new-pane form — `agent` only says what that command ends up launching.
+The key belongs on `[[modes]]` and not on `[[modes.panes]]`: the side panes run tools, not agents. The command still comes from the New Agent form — `agent` only says what that command ends up launching.
 
 The rules are the same as for an orchestration role, including that an unrecognised name gives you **no agent rather than a guess**, and that omitting the key leaves behaviour exactly as it was. See [Declaring the agent behind a launcher command](orchestration.md#declaring-the-agent-behind-a-launcher-command) for the full list.
 
@@ -140,7 +140,7 @@ watch = false
 
 ### Creating a Mode Tab
 
-1. Press `Ctrl+n` to start the new-pane flow.
+1. Press `Ctrl+n` to open the New Agent form.
 2. Select a directory that contains a `.dot-agent-deck.toml`.
 3. In the unified form, use `Left`/`Right` (or `h`/`l`) to cycle the **Mode** field to your desired mode.
 4. Fill in the agent name and command, then press `Enter`.
@@ -202,7 +202,7 @@ The generated file contains a commented example you can edit. It will not overwr
 
 ### Agent-Assisted Config Generation
 
-When opening the new-pane form (`Ctrl+n`) for a directory without a `.dot-agent-deck.toml`, a yellow tip appears: **Tip: press g on dashboard to create modes**.
+When opening the New Agent form (`Ctrl+n`) for a directory without a `.dot-agent-deck.toml`, a yellow tip appears: **Tip: press g on dashboard to create modes**.
 
 From the dashboard, press `g` on an agent's card to open a dialog with three options (navigate with arrow keys, confirm with Enter):
 

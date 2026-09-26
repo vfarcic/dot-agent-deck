@@ -71,7 +71,7 @@ To write the config by hand, use the [configuration reference](#configuration-re
 
 Opening an orchestration tab uses the same `Ctrl+n` flow as a regular pane, but the **Mode** field selects an orchestration instead of a workspace mode.
 
-1. Press `Ctrl+n` to open the new-pane form.
+1. Press `Ctrl+n` to open the New Agent form.
 2. Use `Enter` to step into directories and `Space` to select the project directory that contains your `.dot-agent-deck.toml` with an `[[orchestrations]]` block.
 3. In the unified form, use `Left`/`Right` (or `h`/`l`) to cycle the **Mode** field past any workspace modes until the orchestration name appears.
 4. Press `Enter`. The command field is not used for orchestration tabs — each role pane is launched with its own [`command`](#configuration-reference) from the config.
@@ -119,7 +119,7 @@ The 34/66 split is right while you are supervising — the sidebar is how you se
 
 You talk to the orchestrator; the orchestrator talks to the workers. With the flag on, an orchestration tab makes that the default rather than a convention you have to remember: keystrokes aimed at a worker role are dropped instead of delivered until you deliberately unlock with `Ctrl+d`, `Ctrl+e`. See [`Ctrl+E` locks command entry to the orchestrator pane](keyboard-shortcuts.md#ctrle-locks-command-entry-to-the-orchestrator-pane) for the chord, its scope, and the exemption for a worker that is waiting on you.
 
-The reason is that an orchestration is one workflow with a single coordinator. Type into a worker and you become a second, uncoordinated actor inside it: you change state the orchestrator believes it owns, and there is no path for it to learn that you did. What you usually get is not an obviously broken deck but a quietly diverged one — commonly the orchestrator and a worker contradicting each other into a deadlock. And most of the time it is not even deliberate: you open a worker pane to see how it is doing, get distracted, and type your next instruction into the pane that happens to be in front of you rather than the one you meant.
+The reason is that an orchestration has a single orchestrator. Type into a worker and you become a second, uncoordinated actor inside it: you change state the orchestrator believes it owns, and there is no path for it to learn that you did. What you usually get is not an obviously broken deck but a quietly diverged one — commonly the orchestrator and a worker contradicting each other into a deadlock. And most of the time it is not even deliberate: you open a worker pane to see how it is doing, get distracted, and type your next instruction into the pane that happens to be in front of you rather than the one you meant.
 
 **Nothing is read-only, and nothing is taken away.** When you do want to reach into a worker — a provider hiccup parked an agent, a weaker model never called `work-done`, an agent is waiting somewhere you did not expect — it costs one deliberate `Ctrl+d`, `Ctrl+e`. That pause is the whole feature: it converts a reflex into a decision, which is why the default has to be locked for it to mean anything.
 
@@ -179,7 +179,7 @@ So if tasks still go missing on your machine — a heavily loaded host, or an ag
 DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS=2000 dot-agent-deck
 ```
 
-Values above `30000` are capped, and `0` disables the wait entirely (the pre-fix behaviour — useful only for reproducing the problem). It covers a scheduled task's first prompt as well as a delegation, and **the value you set replaces every row of the table above** rather than being added to it — so raising it slows every case down equally, and setting it below one of the longer waits shortens that case to your value. That is deliberate: you know something about your machine that watching one worker start does not refute. Please report it as well — a machine that needs more than a second is exactly the evidence needed to size this per agent.
+Values above `30000` are capped, and `0` disables the wait entirely (the pre-fix behaviour — useful only for reproducing the problem). It covers a schedule's first prompt as well as a delegation, and **the value you set replaces every row of the table above** rather than being added to it — so raising it slows every case down equally, and setting it below one of the longer waits shortens that case to your value. That is deliberate: you know something about your machine that watching one worker start does not refute. Please report it as well — a machine that needs more than a second is exactly the evidence needed to size this per agent.
 
 #### If you are on an older release: `clear = false` is the workaround
 
@@ -234,7 +234,7 @@ The release flow is stateful: open branch → push → create PR → wait for CI
 | Field | Type | Required | Default | Description |
 |---|---|---|---|---|
 | `name` | string | no | cwd basename | Display name shown in the tab bar. Defaults to the project directory name when empty. |
-| `default` | bool | no | `false` | Marks this as the orchestration to open when nothing named one — in practice a [scheduled task](scheduled-tasks.md) rooted here, since the new-pane form and a dispatcher agent both ask. Exactly one orchestration may declare it, and it must have roles; with a single orchestration it does nothing. Without any declaration the first orchestration with roles wins, which is what happened before this key existed. See [Which orchestration a scheduled task opens](#which-orchestration-a-scheduled-task-opens). |
+| `default` | bool | no | `false` | Marks this as the orchestration to open when nothing named one — in practice a [schedule](scheduled-tasks.md) rooted here, since the New Agent form and a dispatcher agent both ask. Exactly one orchestration may declare it, and it must have roles; with a single orchestration it does nothing. Without any declaration the first orchestration with roles wins, which is what happened before this key existed. See [Which orchestration a schedule opens](#which-orchestration-a-schedule-opens). |
 | `extends` | string | no | — | Inherit another orchestration's roles by its `name`, then override them with this block's own `[[orchestrations.roles]]` entries, matched by role name. Written for the case where several orchestrations run the same team on different providers. See [Sharing a workflow with `extends`](#sharing-a-workflow-with-extends). |
 | `roles` | array | yes¹ | — | Role definitions. Must contain at least one role with `start = true`. ¹Optional in a block that `extends` another, which may restate only the roles it changes. |
 
@@ -532,11 +532,11 @@ The rules:
 
 An `extends` naming an orchestration that does not exist, or forming a cycle, fails the whole config to load with a message naming both sides. That is deliberate: the alternative leaves the variant with only the roles it restated, and the symptom is then "orchestration must have at least 2 roles" about a file that plainly has six.
 
-### Which orchestration a scheduled task opens
+### Which orchestration a schedule opens
 
-**Most of the time nothing needs a default.** Both ways of starting an orchestration by hand ask you which one: the new-pane form (`Ctrl+n`) lists every orchestration as a Mode chip to cycle through, and a [dispatcher pane](dispatcher-mode.md) lists them and asks before it starts anything.
+**Most of the time nothing needs a default.** Both ways of starting an orchestration by hand ask you which one: the New Agent form (`Ctrl+n`) lists every orchestration as a Mode chip to cycle through, and a [dispatcher pane](dispatcher-mode.md) lists them and asks before it starts anything.
 
-`default = true` is for the case where **there is nobody to ask** — a [scheduled task](scheduled-tasks.md) whose working directory defines orchestrations. It fires on a cron tick, and something has to decide which team it opens:
+`default = true` is for the case where **there is nobody to ask** — a [schedule](scheduled-tasks.md) whose working directory defines orchestrations. It fires on a cron tick, and something has to decide which team it opens:
 
 ```toml
 [[orchestrations]]
@@ -571,7 +571,7 @@ Available dispatch targets:
 Ask the user which they want before dispatching, then pass the matching flag.
 ```
 
-A **scheduled task** has nobody to tell, so its copy goes only to the daemon log. That is the whole reason to declare the default: it is the one path where the deck cannot ask you and cannot show you that it did not.
+A **schedule** has nobody to tell, so its copy goes only to the daemon log. That is the whole reason to declare the default: it is the one path where the deck cannot ask you and cannot show you that it did not.
 
 ### Running several at the same time
 
@@ -594,7 +594,7 @@ Opening a second orchestration in a directory that already runs one is allowed, 
 - **The coordination files.** `.dot-agent-deck/worker-task-<role>.md` and `.dot-agent-deck/work-done-<role>.md` are keyed by role name within the directory. Two orchestrations that both have a `coder` role write the same two files, so the second brief overwrites the first before the first worker has necessarily read it.
 - **The working tree.** Both sets of workers edit the same files, stage into the same git index, and build into the same target directory. This is the same hazard as two people working in one checkout, and no amount of file namespacing fixes it.
 
-So when you select an orchestration whose directory already hosts a live one, the new-pane form shows a warning:
+So when you select an orchestration whose directory already hosts a live one, the New Agent form shows a warning:
 
 ```
   ! This directory already runs an orchestration.

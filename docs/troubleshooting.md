@@ -305,13 +305,13 @@ Switching between the desktop app and a TUI that show the same agent changes its
 
 The agent's own output fills the history back in as it keeps working.
 
-## The deck is missing cards — a role or session I know is running has no card
+## The deck is missing cards — a role or agent I know is running has no card
 
 Check the deck's title row first. If it reads something like `dot-agent-deck — 7 agent(s)  (↓2)`, nothing is wrong with the agents: the count is right, and the `(↓2)` says two cards are below the bottom of the window. `(↑2)` means two are above it, and both appear together when you are scrolled into the middle. Move the selection with `j` / `k` (or the arrow keys) to bring them into view, or give the terminal a few more rows and they all fit again.
 
-The deck fits as many cards as it can before it resorts to this. It picks the number of card columns and the card size together, widening the grid to a second or third column when that is what it takes to show every card, so the marker only appears on a window genuinely too small for the cards at any layout — a very short terminal, or a very large number of sessions.
+The deck fits as many cards as it can before it resorts to this. It picks the number of card columns and the card size together, widening the grid to a second or third column when that is what it takes to show every card, so the marker only appears on a window genuinely too small for the cards at any layout — a very short terminal, or a very large number of agents.
 
-If there is **no** marker and a card you expect is still absent, the count in the title is the thing to read next: it is the number of sessions the deck actually knows about, and `dot-agent-deck daemon status` lists what the daemon has. A role present in your `.dot-agent-deck.toml` but missing from both is one that never started — check its `command` (see [a bare command fails to spawn](#a-bare-command-like-claude-opencode-pi-codex-or-devin-fails-to-spawn)).
+If there is **no** marker and a card you expect is still absent, the count in the title is the thing to read next: it is the number of agents the deck actually knows about, and `dot-agent-deck daemon status` lists what the daemon has. A role present in your `.dot-agent-deck.toml` but missing from both is one that never started — check its `command` (see [a bare command fails to spawn](#a-bare-command-like-claude-opencode-pi-codex-or-devin-fails-to-spawn)).
 
 ## Enabling Debug Logs
 

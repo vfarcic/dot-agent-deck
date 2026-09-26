@@ -8,28 +8,28 @@ title: Configuration
 ## Default Command
 
 ```bash
-# Set the default command pre-filled in the new-pane form
+# Set the default command pre-filled in the New Agent form
 dot-agent-deck config set default_command "claude"
 
 # Read the current value
 dot-agent-deck config get default_command
 ```
 
-`default_command` is the agent command pre-filled in the **new-pane form**'s Command field and the value that seeds the **schedule-authoring** agent. Both the new-pane form and the Schedules **Add/Edit** flow use the same form — you type the command directly into the **Command** field (it accepts `claude`, `opencode`, `pi`, `codex`, `devin`, a path, or any command), pre-filled from `default_command`. If `default_command` is unset, the schedule-authoring agent falls back to `claude`.
+`default_command` is the agent command pre-filled in the **New Agent** form's Command field and the value that seeds the **schedule-authoring** agent. Both the New Agent form and the Schedules **Add/Edit** flow use the same form — you type the command directly into the **Command** field (it accepts `claude`, `opencode`, `pi`, `codex`, `devin`, a path, or any command), pre-filled from `default_command`. If `default_command` is unset, the schedule-authoring agent falls back to `claude`.
 
-When `default_command` is **unset or empty**, the new-pane form's Command field is instead pre-filled with your **last command** — the most recent command you launched from the new-agent form, in any mode (schedule / issue-dispatch authoring included). This value is global, persists across deck restarts, and is only ever pre-filled into the editable field (never auto-run), so you can edit or clear it before you submit. On a fresh install — where you have never launched a command from the form — the field starts blank. An explicit `default_command` always takes precedence over this last-command fallback.
+When `default_command` is **unset or empty**, the New Agent form's Command field is instead pre-filled with your **last command** — the most recent command you launched from the New Agent form, in any mode (schedule / issue-dispatch authoring included). This value is global, persists across deck restarts, and is only ever pre-filled into the editable field (never auto-run), so you can edit or clear it before you submit. On a fresh install — where you have never launched a command from the form — the field starts blank. An explicit `default_command` always takes precedence over this last-command fallback.
 
 ## Default Directory
 
 ```bash
-# The directory agent creation starts browsing in on this deck
+# The directory agent creation starts browsing in on this machine
 dot-agent-deck config set default_dir "/home/me/reports"
 
 # Unset it (browsing starts where it did before)
 dot-agent-deck config set default_dir ""
 ```
 
-`default_dir` is a setting of the deck: the directory that creating an agent on this deck starts browsing in — useful when most of your agents here are started in the same place. Both clients honour it. The TUI's `Ctrl+n` directory picker, and its **Add** in the Schedules manager, open there; so does the desktop app's **New agent** dialog. Editing a scheduled task still opens at that task's own directory. It is a starting point, not a limit: `..` still walks above it. It must be an absolute path; `config set` refuses anything else. It lives in the deck's own config file, beside `default_command`, so a remote deck uses the value in *its* config file, not yours — the TUI runs on the deck's host even when you `connect` to it, and the desktop asks the deck for it. If the value is unset, or the directory is missing, is not a directory, or cannot be opened, nothing fails: the TUI's picker opens in the directory you launched the TUI from, and the desktop's dialog in your home directory on that deck, as they do without the setting.
+`default_dir` is a setting of the machine the daemon runs on: the directory that creating an agent on that daemon starts browsing in — useful when most of your agents there are started in the same place. Both clients honour it. The TUI's `Ctrl+n` directory picker, and its **Add** in the Schedules manager, open there; so does the desktop app's **New agent** dialog. Editing a schedule still opens at that schedule's own directory. It is a starting point, not a limit: `..` still walks above it. It must be an absolute path; `config set` refuses anything else. It lives in the config file on the daemon's host, beside `default_command`, so a remote daemon uses the value in *its* host's config file, not yours — the TUI runs on the remote host even when you `connect` to it, and the desktop asks the daemon for it. If the value is unset, or the directory is missing, is not a directory, or cannot be opened, nothing fails: the TUI's picker opens in the directory you launched the TUI from, and the desktop's dialog in your home directory on that daemon's host, as they do without the setting.
 
 ## Environment Variables
 
@@ -44,7 +44,7 @@ dot-agent-deck config set default_dir ""
 
 ## Project Configuration
 
-Per-project workspace modes are defined in `.dot-agent-deck.toml` at the project root. This file is loaded automatically when you select a directory in the new-pane flow.
+Per-project workspace modes are defined in `.dot-agent-deck.toml` at the project root. This file is loaded automatically when you select a directory in the New Agent form.
 
 ### Quick Example
 

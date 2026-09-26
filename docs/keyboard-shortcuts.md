@@ -199,7 +199,7 @@ Notation is case-insensitive for modifier and named keys (`ctrl+enter` == `Ctrl+
 toggle_layout = "Alt+Shift+l"   # move it off Ctrl+t
 toggle_orchestration_split = "Alt+Shift+s"   # move it off Ctrl+l
 toggle_zoom = "Ctrl+Alt+z"       # move zoom off Ctrl+Z
-new_pane = ""                    # disable the new-pane shortcut
+new_pane = ""                    # disable the New Agent shortcut
 
 [dashboard]
 help = "F1"                      # open help with F1 instead of ?
