@@ -2854,12 +2854,55 @@ describe("switch deck by voice, against settings edited mid-flight", () => {
    * "Showing deploy@build-box." with no refusal beside it.
    */
   /**
-   * Scenario: add a deck `new-box` in Settings → Decks while the settings
-   * write never reaches disk, then say "switch deck to the new box". The
-   * utterance is declared with the Deck selector's section as it is on screen —
-   * `new-box` in it — so the switch resolves and runs, and the report says
-   * "Showing new-box." rather than refusing a deck the selector shows (Qodo on
-   * PR #1340).
+   * The settings bridge as issue #828 left it, with every write HELD until the
+   * test releases it: `saveSettings(next, base)` writes only what `base` →
+   * `next` changed onto the document on disk (a key-wise three-way merge, which
+   * is what `settings::merged_document` does to the TOML) and answers with the
+   * document as written rather than an echo of `next`.
+   */
+  function heldSettingsStore() {
+    const same = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);
+    const isTable = (value: unknown): value is Record<string, unknown> =>
+      typeof value === "object" && value !== null && !Array.isArray(value);
+    function merged(disk: unknown, base: unknown, next: unknown): unknown {
+      if (!isTable(disk) || !isTable(base) || !isTable(next)) return next;
+      const out: Record<string, unknown> = { ...disk };
+      for (const key of new Set([...Object.keys(base), ...Object.keys(next)])) {
+        if (same(base[key], next[key])) continue;
+        if (!(key in next)) delete out[key];
+        else out[key] = merged(disk[key], base[key], next[key]);
+      }
+      return out;
+    }
+    let document: DesktopSettingsDto = structuredClone(DEFAULT_DESKTOP_SETTINGS);
+    const held: Array<() => void> = [];
+    return {
+      get current() { return document; },
+      getSettings: vi.fn(async () => ({ settings: structuredClone(document), path: undefined })),
+      saveSettings: vi.fn((next: DesktopSettingsDto, base?: DesktopSettingsDto) => new Promise<DesktopSettingsDto>((resolve) => {
+        held.push(() => {
+          document = merged(document, base ?? next, next) as DesktopSettingsDto;
+          resolve(structuredClone(document));
+        });
+      })),
+      /** Let every held write reach disk, in order — including the ones queued behind them. */
+      async settle() {
+        while (held.length > 0) {
+          held.shift()!();
+          await flush();
+        }
+      },
+    };
+  }
+
+  /**
+   * Scenario: add a deck `new-box` in Settings → Decks and choose the local
+   * deck again, with every settings write held short of disk, then say "switch
+   * deck to the new box". The utterance is declared with the Deck selector's
+   * section as it is on screen — `new-box` in it — so the switch resolves and
+   * runs, and the report says "Showing new-box." rather than refusing a deck
+   * the selector shows (Qodo on PR #1340); once the writes land, `new-box` is
+   * the deck on disk.
    */
   it("resolves a switch to a deck added in Settings whose save has not reached disk", async () => {
     const said = "switch deck to the new box";
@@ -2881,10 +2924,8 @@ describe("switch deck by voice, against settings edited mid-flight", () => {
         deckIdentity: { host: "new-box", port: row.port, user: undefined, socket: undefined },
       }]);
     });
-    // The pending-save seam: every write is queued and none ever settles.
-    const saveSettings = vi.fn(() => new Promise<DesktopSettingsDto>(() => undefined));
-    const getSettings = vi.fn(async () => ({ settings: structuredClone(DEFAULT_DESKTOP_SETTINGS), path: undefined }));
-    render(<DeckShell runtime={runtime(resolveVoice, microphone([said]), { getSettings, saveSettings, declareVoiceScreen })} />);
+    const store = heldSettingsStore();
+    render(<DeckShell runtime={runtime(resolveVoice, microphone([said]), { getSettings: store.getSettings, saveSettings: store.saveSettings, declareVoiceScreen })} />);
     await flush();
 
     fireEvent.click(screen.getByTestId("open-settings"));
@@ -2893,17 +2934,34 @@ describe("switch deck by voice, against settings edited mid-flight", () => {
     await flush();
     fireEvent.change(screen.getByLabelText("Host"), { target: { value: "new-box" } });
     await flush();
-    expect(saveSettings).toHaveBeenCalled();
+    // Adding a deck selects it; choosing the local deck again means the switch
+    // below moves the selection rather than landing on the no-op guard.
+    fireEvent.click(screen.getByTestId("deck-choice-local").querySelector("input")!);
+    await flush();
+    expect(store.saveSettings).toHaveBeenCalled();
+    expect(store.current.endpoints).toBeUndefined();
 
     await turnVoiceOn();
     await completeUtterance();
 
     expect(declared?.remote.map((row) => row.host)).toContain("new-box");
     expect(screen.getByTestId("voice-report")).toHaveTextContent("Showing new-box.");
+    expect(screen.getByTestId("deck-selector-current")).toHaveTextContent("new-box");
+    // Still nothing on disk: the deck the switch named exists only on screen.
+    expect(store.current.endpoints).toBeUndefined();
+
+    await store.settle();
+
     const added = declared!.remote.find((row) => row.host === "new-box")!;
-    expect(saveSettings).toHaveBeenLastCalledWith(expect.objectContaining({
-      endpoints: expect.objectContaining({ selection: added.id }),
-    }));
+    expect(store.current.endpoints?.remote.map((row) => row.host)).toEqual(["new-box"]);
+    expect(store.current.endpoints?.selection).toBe(added.id);
+    // The last write is the switch's, made against the document on screen —
+    // the added deck in it, the local deck selected — not the one on disk.
+    expect(store.saveSettings).toHaveBeenLastCalledWith(
+      expect.objectContaining({ endpoints: expect.objectContaining({ selection: added.id }) }),
+      expect.objectContaining({ endpoints: expect.objectContaining({ selection: "local", remote: [expect.objectContaining({ host: "new-box" })] }) }),
+    );
+    expect(screen.getByTestId("deck-selector-current")).toHaveTextContent("new-box");
   });
 
   it("still shows the success sentence when a switch runs", async () => {
