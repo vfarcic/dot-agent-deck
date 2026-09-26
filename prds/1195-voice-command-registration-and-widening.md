@@ -89,7 +89,7 @@ Per #802's "what rule 4 means here": the blocking desktop tier is Rust unit test
 
 ## Milestones
 
-- [ ] **M1 — Route the five second dispatch paths through `VOICE_ACTIONS`.** Tile `onSelect`, both evidence entry points, all three workflow-order entry points, `WorkflowPanel`'s `onChooseProject`, `EmptyDeck`'s `onProfiles`. No behaviour change; vitest proves each control dispatches through the registry. `voiceActions.ts`'s header comment rewritten to say the residual is closed.
+- [x] **M1 — Route the five second dispatch paths through `VOICE_ACTIONS`.** Tile `onSelect`, both evidence entry points, all three workflow-order entry points, `WorkflowPanel`'s `onChooseProject`, `EmptyDeck`'s `onProfiles`. No behaviour change; vitest proves each control dispatches through the registry. `voiceActions.ts`'s header comment rewritten to say the residual is closed.
 - [ ] **M2 — The registration guard.** Setter ownership plus shell-state classification (see Technical Approach), in `xtask/linkage-check`, with planted-bad-input tests for each assertion. Docs for "adding a control" updated in `docs/develop/desktop-gui.md`.
 - [ ] **M3 — `switch_deck` and the `deck_ref` kind.** Registry entry, drop-down re-routed through it, table row, `deck_ref` across every place the closed set lives, live state, resolution and its outcomes, pinned-by-value test updates, phrase fixtures.
 - [ ] **M4 — Revisit the `no_voice` overlays individually.** Projects, prompts, agent profiles, workflow order: row or restated reason, each recorded.
@@ -115,3 +115,11 @@ Per #802's "what rule 4 means here": the blocking desktop tier is Rust unit test
 ### 2026-09-26 — Created
 
 Written from issue #1195's body by the orchestrator of the dispatched unit, with milestones in the issue's stated order (guard first, then widening). The guard mechanism ("guard the state, not the clicks") is this document's choice, made because #802's Open Question 3 rejected the `onClick` census for churn; implementation may replace it with a recorded reason.
+
+### 2026-09-26 — M1: the five second dispatch paths route through `VOICE_ACTIONS`
+
+Every call site the old header comment listed now dispatches through the registry: the agent tile's `onSelect` (`focusAgent`), the workspace header's Evidence button and the evidence row's select-and-open (`toggleEvidenceDrawer`), the run graph's header Edit loop, its empty-state Edit loop and `ProjectsPanel`'s `onConfigureWorkflow` (`openWorkflowOrder`), `WorkflowPanel`'s `onChooseProject` (`openProjects`), and `EmptyDeck`'s `onProfiles` (`openAgentProfiles`). One more site that opened a capability through its setter was found while doing it and routed the same way: the launch flow reopening Projects when the daemon no longer knows the project (`openProjects`).
+
+**One entry was widened rather than a call site narrowed.** The evidence row is not a flip — it shows the drawer on the item it selects whichever way the drawer was pointing — so `VoiceActionContext.toggleEvidence` takes an optional `open` and `toggleEvidenceDrawer.run` an optional `{ open }`. No target still flips, which is what the header button and the palette entry do. No entry's `voice`/`no_voice` classification changed.
+
+Tested in `desktop/src/lib/voiceActions.test.ts`, which already wraps the real registry to record dispatches: nine new cases, one per re-routed control (the evidence row's case clicks a row with the drawer closed and again with it open, so a row that became a flip fails it). Measured: with the `App.tsx`/`voiceActions.ts` change reverted and the tests kept, the eight cases for the five listed paths fail and the existing 24 pass; with it applied the file passes 33/33, and the full `pnpm test` passes 975/975 across 35 files. `voiceActions.ts`'s header comment now says the residual is closed and why.

@@ -32,35 +32,31 @@ import type { DeckView } from "../types";
  * this PR added more. The heading no longer counts them for the reason the
  * paragraph above gives about numbers in comments.)
  *
- * **Not "one capability, one dispatch path", which is what M2's commit body and
- * an earlier draft of this comment said and is not true.** Five `no_voice`
- * capabilities also have a second, in-panel `setState` path in `App.tsx`, and
- * naming them here is the point — a rediscovered list is a finding, a written
- * one is a known residual:
+ * **It used to say "one capability, one dispatch path" while that was false**,
+ * and then carried a list of the `no_voice` capabilities with a second,
+ * in-panel `setState` path in `App.tsx` (PRD #802's deferred D10): the agent
+ * tile's own selection (`focusAgent`), the workspace header's Evidence button
+ * and an evidence row's select-and-open (`toggleEvidenceDrawer`), the run
+ * graph's Edit loop controls and Projects' Configure workflow
+ * (`openWorkflowOrder`), the workflow editor's Choose one (`openProjects`), and
+ * the empty deck's Configure agents (`openAgentProfiles`).
  *
- * - `focusAgent` — the agent tile's own `onSelect` calls `setSelectedAgentId`;
- * - `toggleEvidenceDrawer` — the workspace header's Evidence button, and the
- *   evidence row's select-and-open;
- * - `openWorkflowOrder` — the run-graph "Edit loop" button (twice) and
- *   `ProjectsPanel`'s `onConfigureWorkflow`;
- * - `openProjects` — `WorkflowPanel`'s `onChooseProject`;
- * - `openAgentProfiles` — `EmptyDeck`'s `onProfiles`.
+ * **PRD #1195 M1 closed that residual**: every one of those controls now
+ * dispatches through `VOICE_ACTIONS[id].run(...)`, and `voiceActions.test.ts`
+ * proves each one crosses the registry and still has its visible effect. It
+ * was done not to make any of them voice-reachable — each keeps its `no_voice`
+ * reason — but because "a user-facing control dispatches through the registry"
+ * is only a rule a build can check once it has no sanctioned exceptions.
  *
- * (`grep -n 'setSelectedAgentId\|setEvidenceOpen\|setWorkflowOpen\|setProjectsOpen\|setProfilesOpen' desktop/src/App.tsx`
- * finds them; line numbers are deliberately not quoted, since they rot.)
+ * Where a call site needed more than an entry offered, the entry was widened
+ * rather than the control narrowed: an evidence row SHOWS the drawer on the
+ * item it selects and never hides it, so `toggleEvidenceDrawer` takes an
+ * optional direction instead of the row becoming a flip.
  *
- * **The load-bearing property survives the narrowing, which is why the code was
- * not re-routed to make the wider claim true.** None of those five is
- * voice-reachable — each carries a `no_voice` reason — so voice has exactly one
- * execution path, {@link dispatchVoiceAction}, and acquires no second one. What
- * is false is only the stronger claim that every capability in this file has a
- * single dispatch site. Re-routing eight call sites to recover it would be
- * regression risk for no functional gain.
- *
- * **If a later PRD gives any of those five a table row, closing its second path
- * is that PRD's work** — and it has to be, because the moment a capability is
- * voice-reachable, a second path is a behaviour voice cannot see. That is the
- * cost of leaving them, stated rather than discovered.
+ * **What still writes that state directly is a dismissal or an invariant, not
+ * a control opening a capability**: a panel's own close, the launch flow
+ * closing the editor it launched from, the deck keeping its selection on a
+ * live agent.
  *
  * # What the guard needs from this file, and what it will refuse
  *
@@ -135,8 +131,12 @@ export type VoiceActionContext = {
   openOverlay: (overlay: DeckOverlay) => void;
   /** Close every overlay, leaving the deck itself. */
   closeOverlays: () => void;
-  /** Flip the evidence drawer. */
-  toggleEvidence: () => void;
+  /**
+   * Flip the evidence drawer — or, given `open`, put it that way round. The
+   * direction is what an evidence row's select-and-open needs: it shows the
+   * drawer whichever way it was pointing, which a bare flip cannot promise.
+   */
+  toggleEvidence: (open?: boolean) => void;
   /** Make one agent the deck's selected tile. */
   selectAgent: (agentId: string) => void;
   /** Select an agent, show its terminal, and ask that terminal for the caret. */
@@ -568,7 +568,10 @@ export const VOICE_ACTIONS = {
     label: "Show or hide the evidence drawer",
     no_voice: "a toggle, and the table cannot see which way it is pointing — the drawer is a `ControlDeck` boolean rather than a screen — so \"show the evidence\" and \"hide the evidence\" would both flip it and one of the two would be wrong every time",
     needs: ["toggleEvidence"],
-    run: (context: Pick<VoiceActionContext, "toggleEvidence">) => context.toggleEvidence(),
+    /** No target flips it: the header's Evidence button and the palette entry.
+        `{ open: true }` is an evidence row, which shows the drawer on the item
+        it has just selected and never hides it. */
+    run: (context: Pick<VoiceActionContext, "toggleEvidence">, target?: { open?: boolean }) => context.toggleEvidence(target?.open),
   },
 
   focusAgent: {

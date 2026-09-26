@@ -1263,16 +1263,16 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
    * mounted without them renders and its Overview button does nothing — the
    * behaviour this move must not change. Deciding what an absent prop means is
    * the host's job; the registry's job is to be the dispatch seam for the rail,
-   * the palette and every voice-reachable capability. Five of its `no_voice`
-   * entries also have a second `setState` path in this file — `voiceActions.ts`
-   * names them, and the narrower claim is the true one.
+   * the palette and every voice-reachable capability — and, since PRD #1195
+   * M1, of the in-panel controls that used to reach the same state through
+   * their setters (`voiceActions.ts`'s header names them).
    */
   const voiceContext: VoiceScreenContext = {
     navigate: (view) => onNavigate?.(view),
     closeAgentView: () => onCloseAgent?.(),
     openOverlay: (overlay) => overlaySetters[overlay](true),
     closeOverlays,
-    toggleEvidence: () => setEvidenceOpen((open) => !open),
+    toggleEvidence: (open) => setEvidenceOpen((current) => open ?? !current),
     selectAgent: setSelectedAgentId,
     focusTerminal,
     advanceFixture: () => { void perform({ type: "advance_fixture" }); },
@@ -1501,7 +1501,7 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
             projectState.clearSelection();
             void projectState.refresh();
             setWorkflowOpen(false);
-            setProjectsOpen(true);
+            VOICE_ACTIONS.openProjects.run(voiceContext);
             setNotice("That project is no longer one this deck knows — nothing is running there any more. Choose another, or paste its path again.");
             return;
           }
@@ -1700,7 +1700,7 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
         )}
 
         {!allDecks && <section className="workflow-strip" aria-labelledby="workflow-title">
-          <header><div><span className="section-kicker">RUN GRAPH</span><h1 id="workflow-title">Visible deterministic loop</h1></div><button onClick={() => setWorkflowOpen(true)}><SlidersHorizontal size={13} /> Edit loop</button></header>
+          <header><div><span className="section-kicker">RUN GRAPH</span><h1 id="workflow-title">Visible deterministic loop</h1></div><button onClick={() => VOICE_ACTIONS.openWorkflowOrder.run(voiceContext)}><SlidersHorizontal size={13} /> Edit loop</button></header>
           <div className="workflow-track">
             {orderedStages.length ? orderedStages.map((stage, index) => (
               <div className={`workflow-node node-${stage.status} ${stage.enabled ? "" : "is-disabled"}`} key={stage.id} data-testid={`workflow-node-${stage.id}`}>
@@ -1708,7 +1708,7 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
                 <div><strong>{stage.label}</strong><small>{stage.enabled ? (stage.attempt === undefined ? stage.status : `${stage.status} · att ${stage.attempt}`) : "skipped"}</small></div>
                 {index < orderedStages.length - 1 && <i className="workflow-link" aria-hidden="true" />}
               </div>
-            )) : <div className="workflow-empty">No workflow nodes reported. Open <button onClick={() => setWorkflowOpen(true)}>Edit loop</button> to inspect configuration.</div>}
+            )) : <div className="workflow-empty">No workflow nodes reported. Open <button onClick={() => VOICE_ACTIONS.openWorkflowOrder.run(voiceContext)}>Edit loop</button> to inspect configuration.</div>}
           </div>
         </section>}
 
@@ -1717,7 +1717,7 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
         {!allDecks && <section className="workspace-section" aria-label="Agent terminals">
           <header className="workspace-header">
             <div><span className="section-kicker">AGENT DECK</span><h2>Live work surfaces</h2></div>
-            <div className="workspace-tools"><span>{snapshot.agents.length} agents</span><span>{snapshot.agents.filter((agent) => agent.status === "running").length} active</span><button className={evidenceOpen ? "is-active" : ""} onClick={() => setEvidenceOpen((open) => !open)}><PanelRight size={14} /> Evidence</button></div>
+            <div className="workspace-tools"><span>{snapshot.agents.length} agents</span><span>{snapshot.agents.filter((agent) => agent.status === "running").length} active</span><button className={evidenceOpen ? "is-active" : ""} onClick={() => VOICE_ACTIONS.toggleEvidenceDrawer.run(voiceContext)}><PanelRight size={14} /> Evidence</button></div>
           </header>
           {snapshot.connection.status === "loading" && !snapshot.agents.length ? <LoadingDeck /> : snapshot.agents.length ? (
             <div className="agent-grid">
@@ -1745,12 +1745,12 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
                   evidence={snapshot.evidence}
                   inputResult={runtime.terminalInputResults?.[agentKey(agent.daemonId, agent.id)]}
                   terminalFocusToken={terminalFocus?.agentId === agent.id ? terminalFocus.token : 0}
-                  onSelect={() => setSelectedAgentId(agent.id)}
+                  onSelect={() => VOICE_ACTIONS.focusAgent.run(voiceContext, { agentId: agent.id })}
                   onTabChange={(tab) => setTabs((current) => ({ ...current, [agent.id]: tab }))}
                   onTerminalInput={runtime.sendTerminalInput}
                   onTerminalResize={runtime.resizeTerminal}
                   appliedGeometry={runtime.appliedGeometry?.[agentKey(agent.daemonId, agent.id)]}
-                  onEvidenceSelect={(id) => { setSelectedEvidenceId(id); setEvidenceOpen(true); }}
+                  onEvidenceSelect={(id) => { setSelectedEvidenceId(id); VOICE_ACTIONS.toggleEvidenceDrawer.run(voiceContext, { open: true }); }}
                   onRename={mode === "live" ? renameAgent : undefined}
                   /*
                     Opening SELECTS as well, which is the difference between the
@@ -1765,7 +1765,7 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
                 />
               ))}
             </div>
-          ) : <EmptyDeck onReconnect={() => void runtime.reconnect()} onProfiles={() => setProfilesOpen(true)} />}
+          ) : <EmptyDeck onReconnect={() => void runtime.reconnect()} onProfiles={() => VOICE_ACTIONS.openAgentProfiles.run(voiceContext)} />}
         </section>}
       </main>
 
@@ -1775,7 +1775,7 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
         open={projectsOpen}
         state={projectState}
         onClose={() => setProjectsOpen(false)}
-        onConfigureWorkflow={() => { setProjectsOpen(false); setWorkflowOpen(true); }}
+        onConfigureWorkflow={() => { setProjectsOpen(false); VOICE_ACTIONS.openWorkflowOrder.run(voiceContext); }}
         allDecks={allDecks}
       />
       <PromptLibraryPanel
@@ -1789,7 +1789,7 @@ export function DeckSurface({ runtime, settings, workflowPlatformIssue = desktop
         onRemove={(id) => { removePrompt(id); setNotice("Prompt removed from this device's library."); }}
       />
       <ProfilesPanel open={profilesOpen} profiles={profiles} onClose={() => setProfilesOpen(false)} onUpdate={updateProfile} onReset={resetProfiles} onSaved={() => setNotice("Agent profile draft saved locally. Project TOML is unchanged.")} />
-      <WorkflowPanel key={activeProject?.path ?? "runtime-workflow"} open={workflowOpen} profiles={profiles} order={profileOrder} mode={mode} project={activeProject} onChooseProject={() => { setWorkflowOpen(false); setProjectsOpen(true); }} onClose={() => setWorkflowOpen(false)} onToggle={(id) => { const profile = profiles.find((item) => item.id === id); if (profile) updateProfile(id, { enabled: !profile.enabled }); }} onMove={moveStage} onLaunch={requestLaunch} platformIssue={workflowPlatformIssue} capabilityIssue={snapshot.connection.projectActionsReason} prompts={prompts} allDecks={allDecks} />
+      <WorkflowPanel key={activeProject?.path ?? "runtime-workflow"} open={workflowOpen} profiles={profiles} order={profileOrder} mode={mode} project={activeProject} onChooseProject={() => { setWorkflowOpen(false); VOICE_ACTIONS.openProjects.run(voiceContext); }} onClose={() => setWorkflowOpen(false)} onToggle={(id) => { const profile = profiles.find((item) => item.id === id); if (profile) updateProfile(id, { enabled: !profile.enabled }); }} onMove={moveStage} onLaunch={requestLaunch} platformIssue={workflowPlatformIssue} capabilityIssue={snapshot.connection.projectActionsReason} prompts={prompts} allDecks={allDecks} />
       {paletteOpen && <CommandPalette commands={commandItems} onClose={() => setPaletteOpen(false)} />}
       {helpOpen && <ShortcutHelp onClose={() => setHelpOpen(false)} />}
       {confirm && <ConfirmDialog state={confirm} onClose={() => setConfirm(undefined)} />}
