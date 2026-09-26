@@ -37,6 +37,16 @@ pub enum EventType {
     /// [`crate::quota_detect::QUOTA_BLOCKED_DETAIL_METADATA_KEY`]. An older
     /// reader decodes it as [`EventType::Unknown`], a no-op.
     QuotaBlocked,
+    /// Issue #714: the paired daemon-synthesized event — a card the daemon
+    /// marked [`EventType::QuotaBlocked`] no longer shows the quota line among
+    /// the pane's bottom rows after the pane wrote later output and went quiet
+    /// again, so the block is lifted (to `Idle`). It exists for an agent that
+    /// sends no native work hooks (a wrapper-only Codex, a stand-in), whose
+    /// card would otherwise stay Blocked after it recovered. Never accepted
+    /// from a producer — the hook loop drops an inbound one — and a no-op on a
+    /// card that is not Blocked. An older reader decodes it as
+    /// [`EventType::Unknown`], a no-op.
+    QuotaCleared,
     /// PRD #370 / precedent PRD #201 (`AgentType`'s identical retrofit):
     /// forward-compat catch-all for a future/unknown `event_type` string on
     /// the wire, so a build newer than THIS one can add further variants
@@ -1001,8 +1011,9 @@ impl AgentEvent {
     /// shell-activity monitor (PRD #370/#386), the delivery-notice
     /// [`EventType::Error`] (issue #424), the card-surfacing `SessionStart`
     /// (issue #684, [`CARD_SURFACE_SESSION_START_ORIGIN`]), and the quota
-    /// detector's [`EventType::QuotaBlocked`] (issue #714), which a producer
-    /// cannot send at all — the hook loop drops it.
+    /// detector's [`EventType::QuotaBlocked`] and [`EventType::QuotaCleared`]
+    /// (issue #714), which a producer cannot send at all — the hook loop drops
+    /// them.
     ///
     /// The first two carry the pane's registry `agent_id` because that is how
     /// they land on the right card — the card-surfacing start is the exception and
@@ -1024,7 +1035,10 @@ impl AgentEvent {
     pub fn is_daemon_synthetic(&self) -> bool {
         matches!(
             self.event_type,
-            EventType::ShellBusy | EventType::ShellIdle | EventType::QuotaBlocked
+            EventType::ShellBusy
+                | EventType::ShellIdle
+                | EventType::QuotaBlocked
+                | EventType::QuotaCleared
         ) || self.metadata.contains_key(DELIVERY_NOTICE_METADATA_KEY)
             || self.is_card_surface_session_start()
             || self.is_daemon_pane_closed()

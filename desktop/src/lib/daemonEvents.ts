@@ -46,6 +46,7 @@ const EVENT_TITLES: Record<string, string> = {
   error: "Agent reported an error",
   // Issue #714: synthesized by the daemon from the pane's own screen.
   quota_blocked: "Provider usage limit reached",
+  quota_cleared: "Provider usage-limit error no longer on screen",
   delegation_dispatched: "Delegation dispatched",
   delegation_delivered: "Task delivered to worker",
   delegation_failed: "Delegation FAILED",
@@ -99,6 +100,9 @@ function summaryFor(event: DaemonHookEvent, eventType: string): string {
   // tile carries it, sanitised, beside the status it explains.
   if (eventType === "quota_blocked") {
     return "The deck read a provider usage-limit or credit error on this agent's screen; its work will not progress until the quota is restored or the task is reassigned.";
+  }
+  if (eventType === "quota_cleared") {
+    return "The provider usage-limit or credit error has scrolled off this agent's screen after later output, so the deck no longer shows it as blocked.";
   }
   const tool = text(event.tool_name);
   const detail = text(event.tool_detail);

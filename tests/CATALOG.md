@@ -570,8 +570,8 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 ##### status/blocked/006 — A producer cannot forge a quota-blocked status (issue #714).
 - **Layer:** L1 unit (`src/daemon.rs`).
 - **Agent:** none.
-- **Asserts:** the daemon drops an inbound `quota_blocked` event and strips forged `quota_blocked_*` metadata from producer events.
-- **Does not assert:** the daemon's own synthetic blocked event.
+- **Asserts:** the daemon drops an inbound `quota_blocked` or `quota_cleared` event and strips forged `quota_blocked_*` metadata from producer events.
+- **Does not assert:** the daemon's own synthetic blocked and cleared events.
 - **Platform coverage:** mac+linux+windows.
 
 ##### status/blocked/007 — Older readers decode Blocked safely and its wire form stays a unit variant (issue #714).

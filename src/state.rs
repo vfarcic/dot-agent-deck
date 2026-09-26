@@ -664,9 +664,10 @@ pub enum SessionStatus {
     /// on every older TUI and desktop, which takes down their `ListAgents`.
     /// Pinned by `status_blocked_007_older_reader_decodes_blocked_as_unknown`.
     ///
-    /// Sticky: `Idle`, `Error` and the shell-activity pair leave it in place;
-    /// only evidence of work ([`crate::quota_detect::is_work_evidence`]) clears
-    /// it. See [`AppState::apply_event`].
+    /// Sticky: `Idle`, `Error` and the shell-activity pair leave it in place.
+    /// Evidence of work ([`crate::quota_detect::is_work_evidence`]) clears it,
+    /// and so does the daemon's `QuotaCleared` once later output has pushed the
+    /// quota line out of the pane's bottom rows. See [`AppState::apply_event`].
     Blocked,
     /// PRD #162 forward-compat catch-all: a future/unknown `status` string on
     /// the wire deserializes here instead of failing the whole `AgentRecord`
@@ -3015,10 +3016,12 @@ fn worker_event_proves_delivery(event: &AgentEvent) -> bool {
         // `Unknown` is the forward-compat catch-all — never proof by
         // construction, matching `SessionStatus::Unknown`'s neutral rendering.
         // Issue #714: `QuotaBlocked` is daemon-synthesized from pane output — it
-        // says the provider refused the agent, which is the opposite of a turn.
+        // says the provider refused the agent, which is the opposite of a turn —
+        // and `QuotaCleared` says only that the refusal left the screen.
         EventType::ShellBusy
         | EventType::ShellIdle
         | EventType::QuotaBlocked
+        | EventType::QuotaCleared
         | EventType::Unknown => false,
         // A turn is underway: a submitted prompt, a tool, a subagent, a
         // compaction, or a permission request raised by a tool the agent chose.
@@ -10477,15 +10480,19 @@ impl AppState {
         // agent, and the frames that typically trail that refusal — Codex's
         // `Stop` (`Idle`), OpenCode's `session.error` then `session.idle`, the
         // shell-activity pair — must not repaint it `Idle`, which is exactly what
-        // hid the blocked worker in #714. Only evidence of WORK
+        // hid the blocked worker in #714. Evidence of WORK
         // ([`crate::quota_detect::is_work_evidence`]) lifts it, because a limit
         // that resets is discovered the only honest way: the agent works again.
-        // There is deliberately no timer — a spent credit pool has no reset.
+        // So does the daemon's own `QuotaCleared`, for an agent that sends no
+        // native work hooks: the pane wrote later output and the quota line is
+        // no longer among its bottom rows (arm below). There is deliberately no
+        // timer — a spent credit pool has no reset.
         //
         // Lifted to `Thinking` first, a turn being underway, so an arm that
         // asserts nothing of its own (`ToolEnd`, `Subagent*`) does not leave a
         // stale `Blocked` behind; an arm that does assert overwrites it below.
         let quota_blocked = event.event_type == EventType::QuotaBlocked;
+        let quota_cleared = event.event_type == EventType::QuotaCleared;
         if session.status == SessionStatus::Blocked
             && !quota_blocked
             && crate::quota_detect::is_work_evidence(&event)
@@ -10493,7 +10500,8 @@ impl AppState {
             session.status = SessionStatus::Thinking;
             session.blocked = None;
         }
-        let blocked_hold = session.status == SessionStatus::Blocked && !quota_blocked;
+        let blocked_hold =
+            session.status == SessionStatus::Blocked && !quota_blocked && !quota_cleared;
 
         let asserted_status = match event.event_type {
             // Issue #714: still blocked and this frame proves no work — it is
@@ -10521,6 +10529,19 @@ impl AppState {
                 });
                 session.active_tool = None;
                 true
+            }
+            EventType::QuotaCleared => {
+                // Daemon-authored, like `QuotaBlocked`. Lifts only a Blocked
+                // card, and to `Idle`: the daemon re-probes only a pane that has
+                // gone quiet again, so nothing on it says a turn is underway —
+                // and `Idle` is what such a card showed before #714. The pane's
+                // own next hook overwrites it. Anywhere else it is a no-op.
+                let asserted = session.status == SessionStatus::Blocked;
+                if asserted {
+                    session.status = SessionStatus::Idle;
+                    session.active_tool = None;
+                }
+                asserted
             }
             EventType::SessionStart => {
                 session.status = SessionStatus::Idle;
@@ -10627,7 +10648,13 @@ impl AppState {
         // and permanently strand the session at `Working` (the `ShellIdle`
         // would see the marker already false and become a no-op) — exactly
         // the silent-break `#[serde(other)]` exists to prevent.
-        if !matches!(event.event_type, EventType::ShellBusy | EventType::Unknown) {
+        // Issue #714: `QuotaCleared` is excluded for the same reason — on a card
+        // that is not Blocked it asserts nothing, so it must not strand a
+        // `ShellBusy` either.
+        if !matches!(
+            event.event_type,
+            EventType::ShellBusy | EventType::Unknown | EventType::QuotaCleared
+        ) {
             session.shell_synthetic_working = false;
         }
 
@@ -15765,6 +15792,31 @@ mod tests {
             schema_version: None,
             live_target: None,
         }
+    }
+
+    /// Issue #714 (audit R1): the daemon's `QuotaCleared` lifts a Blocked card
+    /// to Idle and drops its reason; on a card that is not Blocked it asserts
+    /// nothing, and in particular does not strand a `ShellBusy` Working (its
+    /// `ShellIdle` still reverts it).
+    #[test]
+    fn quota_cleared_lifts_only_a_blocked_card() {
+        let session = |state: &AppState| state.sessions.values().next().unwrap().clone();
+        let mut state = AppState::default();
+        state.register_pane("pane-q".to_string());
+        state.apply_event(quota_event(EventType::Thinking, 1));
+        state.apply_event(quota_blocked_event(BlockedKind::UsageLimit, "x", 2));
+        assert_eq!(session(&state).status, SessionStatus::Blocked);
+        state.apply_event(quota_event(EventType::QuotaCleared, 3));
+        assert_eq!(session(&state).status, SessionStatus::Idle);
+        assert!(session(&state).blocked.is_none());
+
+        // Not Blocked: a no-op, and a shell-synthetic Working survives it.
+        state.apply_event(quota_event(EventType::ShellBusy, 4));
+        assert_eq!(session(&state).status, SessionStatus::Working);
+        state.apply_event(quota_event(EventType::QuotaCleared, 5));
+        assert_eq!(session(&state).status, SessionStatus::Working);
+        state.apply_event(quota_event(EventType::ShellIdle, 6));
+        assert_eq!(session(&state).status, SessionStatus::Idle);
     }
 
     fn quota_blocked_event(kind: BlockedKind, detail: &str, secs: i64) -> AgentEvent {

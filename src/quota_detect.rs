@@ -28,7 +28,9 @@
 //! the bare provider sentence as one of its last visible rows (for example a
 //! Codex agent `cat`ing a fixture for this very feature), then emits no work
 //! event and stays quiet through the confirmation window, is reported
-//! `Blocked`. It clears on that agent's next work event.
+//! `Blocked`. It clears on that agent's next work event, or once later output
+//! has pushed the sentence out of the bottom rows (see
+//! [`QuotaDetector::record_probe`]).
 
 use std::sync::LazyLock;
 use std::time::{Duration, Instant};
@@ -473,6 +475,15 @@ pub enum ProbeOutcome {
     Pending,
     /// Matched again after the full window with no work in between: report it.
     Confirmed(BlockedKind),
+    /// A published block was re-probed after later output and the screen still
+    /// shows the quota line: the block stands, nothing is re-published.
+    StillBlocked,
+    /// A published block was re-probed after later output and the quota line is
+    /// no longer among the bottom [`QUOTA_TAIL_ROWS`] rows: the latch is lifted.
+    /// Carries the detector epoch the clear left behind, which a publisher
+    /// compares again when it applies the clear
+    /// ([`QuotaDetector::clear_is_current`]).
+    Cleared(u64),
     /// The pane wrote output (or was resized) after the probed snapshot was
     /// taken, so the result describes a screen that may no longer be showing.
     /// Nothing is recorded; the next quiet probe decides — see
@@ -489,7 +500,10 @@ pub enum ProbeOutcome {
 /// work-proving event; a periodic task asks [`should_probe`](Self::should_probe)
 /// and, when it says yes, replays the screen, runs [`classify`] and hands the
 /// result to [`record_probe`](Self::record_probe). After a `Confirmed` the
-/// detector stays silent until a work event re-arms it.
+/// detector stays silent until a work event re-arms it or, once the block is
+/// published, until the pane writes output and goes quiet again: then it
+/// re-probes, rate limited like any other probe, to learn whether the quota line
+/// has left the bottom rows ([`ProbeOutcome::Cleared`]).
 #[derive(Debug, Clone, Default)]
 pub struct QuotaDetector {
     timings: QuotaTimings,
@@ -510,6 +524,10 @@ pub struct QuotaDetector {
     /// ([`Self::claim_publication`]). Output in that window retracts it: the
     /// confirmation was about a screen the pane has since written over.
     unpublished: bool,
+    /// The pane has written output since its block was published, so the next
+    /// quiet probe asks whether the quota line is still on screen — see
+    /// [`Self::should_probe`].
+    output_since_publication: bool,
 }
 
 impl QuotaDetector {
@@ -531,6 +549,9 @@ impl QuotaDetector {
     pub fn note_output(&mut self, now: Instant) {
         self.last_output_at = Some(now);
         self.note_screen_changed();
+        if self.confirmed && !self.unpublished {
+            self.output_since_publication = true;
+        }
     }
 
     /// The screen may have changed without the PTY emitting a chunk — the pane
@@ -542,7 +563,9 @@ impl QuotaDetector {
     /// a working agent Blocked. The hint stays pending, so the next quiet probe
     /// starts a fresh candidate against the screen as it is now. A confirmation
     /// already published stays latched — a blocked agent's idle redraws must
-    /// not re-publish it — until a work event lifts it.
+    /// not re-publish it — until a work event lifts it or a quiet re-probe finds
+    /// the quota line gone ([`Self::record_probe`]). A resize alone does not ask
+    /// for that re-probe; output does ([`Self::note_output`]).
     pub fn note_screen_changed(&mut self) {
         self.revision = self.revision.wrapping_add(1);
         if self.confirmed && self.unpublished {
@@ -568,7 +591,17 @@ impl QuotaDetector {
         self.candidate_at = None;
         self.confirmed = false;
         self.unpublished = false;
+        self.output_since_publication = false;
         self.epoch = self.epoch.wrapping_add(1);
+    }
+
+    /// Whether the clear a [`ProbeOutcome::Cleared`] reported with `epoch` still
+    /// describes the detector: nothing is latched and no work event or new
+    /// confirmation has moved the epoch since. A publisher checks it at the
+    /// moment it applies the clear, so a clear overtaken by a work event (which
+    /// has already moved the card on) is not applied over it.
+    pub fn clear_is_current(&self, epoch: u64) -> bool {
+        !self.confirmed && self.epoch == epoch
     }
 
     /// Whether a confirmed block is currently latched.
@@ -594,6 +627,7 @@ impl QuotaDetector {
     pub fn claim_publication(&mut self, epoch: u64) -> bool {
         if self.unpublished && self.confirmed_epoch() == Some(epoch) {
             self.unpublished = false;
+            self.output_since_publication = false;
             true
         } else {
             false
@@ -614,13 +648,24 @@ impl QuotaDetector {
     /// Whether the screen should be probed now: a live hint newer than the last
     /// work event, the PTY quiet for the quiet window, and the probe rate limit
     /// (or, with a candidate pending, the confirmation window) elapsed.
+    ///
+    /// A PUBLISHED block is probed again only after the pane has written output
+    /// since its publication (or since its last re-probe), under the same quiet
+    /// window and rate limit — the probe that can clear it. An unpublished
+    /// confirmation is never probed: the publisher is about to claim it.
     pub fn should_probe(&self, now: Instant) -> bool {
-        if self.confirmed || !self.hint_pending() {
-            return false;
+        let quiet = self
+            .last_output_at
+            .is_none_or(|out| now.saturating_duration_since(out) >= self.timings.quiet);
+        if self.confirmed {
+            return !self.unpublished
+                && self.output_since_publication
+                && quiet
+                && self.last_probe_at.is_none_or(|probe| {
+                    now.saturating_duration_since(probe) >= self.timings.probe_interval
+                });
         }
-        if let Some(out) = self.last_output_at
-            && now.saturating_duration_since(out) < self.timings.quiet
-        {
+        if !self.hint_pending() || !quiet {
             return false;
         }
         match (self.candidate_at, self.last_probe_at) {
@@ -653,8 +698,27 @@ impl QuotaDetector {
     }
 
     /// Record the result of a probe taken at `now`, of the current screen.
+    ///
+    /// For a PUBLISHED block ([`Self::should_probe`]'s re-probe after later
+    /// output) a match is [`ProbeOutcome::StillBlocked`] and changes nothing —
+    /// a blocked agent's idle redraws keep its line on screen — while a miss is
+    /// [`ProbeOutcome::Cleared`]: the latch, hint and candidate are dropped, so
+    /// a later block needs a fresh hint and a fresh confirmation. Clearing on one
+    /// miss is safe in the only direction that matters: at worst it is a missed
+    /// block, which is the pre-#714 behaviour, never a false `Blocked`.
     pub fn record_probe(&mut self, now: Instant, found: Option<BlockedKind>) -> ProbeOutcome {
         self.last_probe_at = Some(now);
+        if self.confirmed && !self.unpublished {
+            self.output_since_publication = false;
+            if found.is_some() {
+                return ProbeOutcome::StillBlocked;
+            }
+            self.confirmed = false;
+            self.hint_at = None;
+            self.candidate_at = None;
+            self.epoch = self.epoch.wrapping_add(1);
+            return ProbeOutcome::Cleared(self.epoch);
+        }
         let Some(kind) = found else {
             self.hint_at = None;
             self.candidate_at = None;
@@ -1155,9 +1219,86 @@ mod tests {
         assert!(!d.claim_publication(epoch), "published twice");
         d.note_output(t3);
         assert_eq!(d.confirmed_epoch(), Some(epoch));
+        // The redraw asks for one re-probe; a screen that still shows the line
+        // leaves the same confirmation latched and asks for nothing more.
+        let t4 = t3 + timings.quiet.max(timings.probe_interval);
+        assert!(d.should_probe(t4));
+        assert_eq!(d.record_probe(t4, usage), ProbeOutcome::StillBlocked);
+        assert_eq!(d.confirmed_epoch(), Some(epoch));
+        assert!(!d.claim_publication(epoch), "a re-probe re-published");
         assert!(
-            !d.should_probe(t3 + 10 * timings.quiet),
-            "re-probed a published block"
+            !d.should_probe(t4 + 10 * timings.probe_interval),
+            "re-probed a published block with no output since"
         );
+    }
+
+    /// Issue #714 (audit R1): a published block is re-probed only after later
+    /// output, once the pane is quiet again and the rate limit has elapsed. A
+    /// match keeps it; a miss lifts it with a clear that stays current until a
+    /// work event or a new confirmation moves the epoch. A resize alone asks
+    /// for nothing, and an unpublished confirmation is never re-probed.
+    #[test]
+    fn a_published_block_clears_once_later_output_hides_the_line() {
+        let timings = QuotaTimings::default();
+        let usage = Some(BlockedKind::UsageLimit);
+        let t0 = Instant::now();
+        let published = |d: &mut QuotaDetector| {
+            d.note_hint(t0);
+            assert_eq!(d.record_probe(t0, usage), ProbeOutcome::Candidate);
+            assert!(matches!(
+                d.record_probe(t0 + timings.confirm, usage),
+                ProbeOutcome::Confirmed(_)
+            ));
+            let epoch = d.confirmed_epoch().expect("latched");
+            assert!(
+                !d.should_probe(t0 + 10 * timings.confirm),
+                "an unpublished confirmation was re-probed"
+            );
+            assert!(d.claim_publication(epoch));
+            t0 + timings.confirm
+        };
+
+        let mut d = QuotaDetector::new(timings);
+        let t1 = published(&mut d);
+        d.note_screen_changed();
+        assert!(
+            !d.should_probe(t1 + 10 * timings.probe_interval),
+            "a resize alone asked for a re-probe"
+        );
+        let out = t1 + Duration::from_secs(1);
+        d.note_output(out);
+        assert!(!d.should_probe(out + timings.quiet - Duration::from_millis(1)));
+        let t2 = out + timings.quiet.max(timings.probe_interval);
+        assert!(d.should_probe(t2));
+        let rev = d.revision();
+        let cleared = match d.record_snapshot_probe(rev, t2, None) {
+            ProbeOutcome::Cleared(epoch) => epoch,
+            other => panic!("expected a clear, got {other:?}"),
+        };
+        assert!(!d.is_confirmed());
+        assert!(d.clear_is_current(cleared));
+        assert!(!d.hint_pending(), "a cleared block kept its hint");
+        assert!(!d.should_probe(t2 + 10 * timings.probe_interval));
+
+        // A stale snapshot of a published block records nothing.
+        let mut d = QuotaDetector::new(timings);
+        let t1 = published(&mut d);
+        d.note_output(t1);
+        let rev = d.revision();
+        d.note_output(t1);
+        let t2 = t1 + timings.quiet.max(timings.probe_interval);
+        assert_eq!(d.record_snapshot_probe(rev, t2, None), ProbeOutcome::Stale);
+        assert!(d.is_confirmed());
+
+        // A work event after the clear makes it no longer current.
+        let mut d = QuotaDetector::new(timings);
+        let t1 = published(&mut d);
+        d.note_output(t1);
+        let t2 = t1 + timings.quiet.max(timings.probe_interval);
+        let ProbeOutcome::Cleared(cleared) = d.record_probe(t2, None) else {
+            panic!("expected a clear");
+        };
+        d.note_work_event(t2);
+        assert!(!d.clear_is_current(cleared));
     }
 }

@@ -4294,7 +4294,10 @@ pub struct OutstandingDelegation {
     /// to the orchestrator as blocked by a provider usage limit
     /// ([`AgentPtyRegistry::claim_worker_blocked_notice`]). Once per record, so a
     /// block that is lifted by a work event and confirmed again does not
-    /// re-notify the same delegation; a new delegation is a new record.
+    /// re-notify the same delegation; a new delegation is a new record. A claim
+    /// whose write was refused, with nothing written, is released
+    /// ([`AgentPtyRegistry::release_worker_blocked_notice`]), so the notice
+    /// stays owed for a later block of the same delegation.
     blocked_reported: bool,
     /// PRD #126 M1 review (finding 2) / audit (finding 3): the live end of the
     /// watch task's cancellation channel. Never *sent* on — the watch task
@@ -4374,6 +4377,10 @@ pub struct QuotaProbe {
 /// — where the notice goes and how to authorize it, and the role for the log.
 #[derive(Debug, Clone)]
 pub struct WorkerBlockedNotice {
+    /// The claimed delegation record's generation, so a refused write releases
+    /// the claim on that record and never on a successor
+    /// ([`AgentPtyRegistry::release_worker_blocked_notice`]).
+    pub seq: u64,
     pub role: String,
     pub orchestrator_pane_id: String,
     pub orchestrator_agent_id: String,
@@ -9630,6 +9637,17 @@ impl AgentPtyRegistry {
         .unwrap_or(false)
     }
 
+    /// Issue #714: whether the clear a [`crate::quota_detect::ProbeOutcome::Cleared`]
+    /// reported with `epoch` may still be applied — `agent_id` still owns
+    /// `pane_id` and no work event or new confirmation has moved its detector
+    /// since ([`crate::quota_detect::QuotaDetector::clear_is_current`]). Checked
+    /// under the daemon's `AppState` write lock, which work events are
+    /// credited under too.
+    pub fn quota_clear_current(&self, pane_id: &str, agent_id: &str, epoch: u64) -> bool {
+        self.with_owner_quota(pane_id, agent_id, |quota| quota.clear_is_current(epoch))
+            .unwrap_or(false)
+    }
+
     /// Issue #714: the screen revision of `agent_id`'s quota detector — the
     /// value a snapshot taken now would carry. Test seam for probes that do not
     /// go through [`Self::quota_probe_candidates`].
@@ -9666,11 +9684,26 @@ impl AgentPtyRegistry {
         }
         record.blocked_reported = true;
         Some(WorkerBlockedNotice {
+            seq: record.seq,
             role: record.role.clone(),
             orchestrator_pane_id: record.orchestrator_pane_id.clone(),
             orchestrator_agent_id: record.orchestrator_agent_id.clone(),
             orchestration: record.orchestration.clone(),
         })
+    }
+
+    /// Issue #714: release a blocked-worker notice claimed by
+    /// [`Self::claim_worker_blocked_notice`] whose write was refused with
+    /// nothing written, so a later confirmed block of the SAME delegation can
+    /// still report. Only the record of generation `seq` is touched: a record
+    /// that was retired or superseded since keeps its own flag.
+    pub fn release_worker_blocked_notice(&self, worker_pane_id: &str, seq: u64) {
+        let mut tracker = self.delegations.lock().unwrap();
+        if let Some(record) = tracker.records.get_mut(worker_pane_id)
+            && record.seq == seq
+        {
+            record.blocked_reported = false;
+        }
     }
 
     /// Issue #714: deliver the blocked-worker notice claimed by
@@ -9688,7 +9721,10 @@ impl AgentPtyRegistry {
     /// The writer-held re-validation also re-checks the WORKER: a genuine work
     /// hook that lifted the block `epoch` after the claim
     /// ([`Self::quota_block_current`]) refuses the write, so a worker that is
-    /// visibly working again is not reported as blocked.
+    /// visibly working again is not reported as blocked. Any refusal that wrote
+    /// nothing (`WrongSession`, `Stale`, `NoLiveTarget`) releases the claim
+    /// ([`Self::release_worker_blocked_notice`]); an ambiguous or failed write
+    /// does not, since bytes may have reached the orchestrator.
     pub async fn deliver_worker_blocked_notice(
         self: &Arc<Self>,
         worker_pane_id: &str,
@@ -9739,14 +9775,17 @@ impl AgentPtyRegistry {
                 role = %notice.role,
                 "quota: blocked-worker notice delivery was ambiguous (partial write); not retried"
             ),
-            Ok(refused) => tracing::debug!(
-                pane_id = %orchestrator_pane_id,
-                role = %notice.role,
-                expected_agent_id = %expected_agent_id,
-                outcome = ?refused,
-                "quota: re-validation refused the blocked-worker notice (orchestrator changed, \
-                 or the worker is no longer blocked); nothing written"
-            ),
+            Ok(refused) => {
+                self.release_worker_blocked_notice(worker_pane_id, notice.seq);
+                tracing::debug!(
+                    pane_id = %orchestrator_pane_id,
+                    role = %notice.role,
+                    expected_agent_id = %expected_agent_id,
+                    outcome = ?refused,
+                    "quota: re-validation refused the blocked-worker notice (orchestrator changed, \
+                     or the worker is no longer blocked); nothing written, notice still owed"
+                )
+            }
             Err(e) => tracing::warn!(
                 pane_id = %orchestrator_pane_id,
                 role = %notice.role,
@@ -11414,6 +11453,55 @@ mod tests {
             revision: 0,
         };
         assert!(oversized.tail_rows().is_empty());
+    }
+
+    /// Issue #714 (audit R1): a published block on a pane too large to replay is
+    /// never cleared by a re-probe. Confirm and publish a Codex quota line at a
+    /// normal size, grow the pane past `MAX_QUOTA_REPLAY_CELLS`, print ordinary
+    /// output that would scroll the line away, and go quiet: no snapshot is
+    /// taken, so the block stays latched. Back at a normal size the same pane is
+    /// re-probed, which is the control.
+    #[test]
+    fn a_published_block_on_an_oversized_pane_is_not_cleared() {
+        use crate::quota_detect::{BlockedKind, ProbeOutcome, QuotaTimings};
+        let timings = QuotaTimings::default();
+        let max = PTY_RESIZE_DIM_MAX;
+        let bus = AgentBus::with_quota_timings(timings);
+        bus.push(b"You\xe2\x80\x99ve hit your usage limit.\r\n".to_vec());
+        let t0 = Instant::now() + timings.quiet * 2;
+        let rev = bus.state.lock().unwrap().quota.revision();
+        let usage = Some(BlockedKind::UsageLimit);
+        assert_eq!(
+            bus.quota_record_probe(rev, t0, usage).0,
+            ProbeOutcome::Candidate
+        );
+        let t1 = t0 + timings.confirm;
+        let (outcome, epoch) = bus.quota_record_probe(rev, t1, usage);
+        assert!(matches!(outcome, ProbeOutcome::Confirmed(_)));
+        assert!(
+            bus.state
+                .lock()
+                .unwrap()
+                .quota
+                .claim_publication(epoch.expect("latched"))
+        );
+
+        bus.clear_scrollback_after_resize(24, 80, max, max);
+        for i in 0..40 {
+            bus.push(format!("ordinary output {i}\r\n").into_bytes());
+        }
+        let later = t1 + timings.quiet.max(timings.probe_interval) * 2;
+        assert!(
+            bus.quota_probe_snapshot(later, max, max).is_none(),
+            "an oversized pane was replayed"
+        );
+        assert!(bus.quota_confirmed(), "an oversized pane's block cleared");
+        bus.clear_scrollback_after_resize(max, max, 24, 80);
+        bus.push(b"ordinary output at a normal size\r\n".to_vec());
+        assert!(
+            bus.quota_probe_snapshot(later, 24, 80).is_some(),
+            "control: a replayable pane is re-probed after later output"
+        );
     }
 
     /// Issue #714 (audit A3, S2): the registry skips a max-size pane with a
