@@ -28,7 +28,7 @@ Hooks are **auto-installed on every startup** — most users never need to think
 
 Auto-install is idempotent and best-effort — if an agent directory is missing the step is silently skipped, and errors are logged without blocking startup.
 
-The daemon half is what covers the desktop app: it starts only the daemon bundled inside it, never a dashboard, so a machine with the desktop app and no CLI installed gets the same hooks as one running the dashboard. Where there is no CLI install to point at, those hooks name the daemon bundled in the app, so moving or deleting the app leaves them pointing at nothing until the deck next starts and repairs them (below).
+The daemon half is what covers the desktop app: it starts only the daemon bundled inside it, never a dashboard, so a machine with the desktop app and no CLI installed gets the same hooks as one running the dashboard. Where there is no CLI install to point at, those hooks name the daemon bundled in the app, so moving or deleting the app leaves them pointing at nothing until the deck next starts and repairs them (below). The install runs when the daemon **starts**, so after upgrading the desktop app from a version that did not install these hooks, a daemon still running from before the upgrade keeps serving the app without them; they appear the next time the daemon starts.
 
 ### A hook fails with `not found` and names a path you never typed
 

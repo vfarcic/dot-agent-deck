@@ -638,7 +638,7 @@ fn install_to_roots(
 pub fn auto_install() {
     auto_install_resolved(
         &candidate_roots(),
-        crate::platform::paths::durable_binary_path(),
+        crate::platform::paths::durable_binary_path,
     );
 }
 
@@ -649,8 +649,18 @@ pub fn auto_install() {
 /// is never opened, so there is no truncated or abandoned JavaScript left for
 /// OpenCode to load — and the complaint goes to `tracing::warn!` and nowhere
 /// else, because this is the dashboard-startup path.
-fn auto_install_resolved(roots: &[PathBuf], binary_path: Result<String, String>) {
-    match binary_path {
+///
+/// The resolver runs only once some root exists, matching
+/// `hooks_manage::auto_install_to`'s directory check. Issue #1157 made this run
+/// at every daemon start, including the packaged desktop's, where OpenCode is
+/// often absent; resolving first logged `durable_binary_path`'s "pinning … as a
+/// last resort" warning for a plugin that was then never written (Qodo on PR
+/// #1344).
+fn auto_install_resolved(roots: &[PathBuf], resolve: impl FnOnce() -> Result<String, String>) {
+    if !roots.iter().any(|root| root.exists()) {
+        return;
+    }
+    match resolve() {
         Ok(binary_path) => auto_install_to(roots, &binary_path),
         Err(e) => tracing::warn!("auto-install: {e}"),
     }
@@ -1171,10 +1181,9 @@ mod tests {
         let root = tmp.path().join("opencode-root");
         std::fs::create_dir_all(&root).expect("create root");
 
-        auto_install_resolved(
-            std::slice::from_ref(&root),
-            Err("no durable dot-agent-deck".to_string()),
-        );
+        auto_install_resolved(std::slice::from_ref(&root), || {
+            Err("no durable dot-agent-deck".to_string())
+        });
 
         assert!(
             !plugin_file(&root).exists(),
@@ -1185,6 +1194,27 @@ mod tests {
             !root.join("plugin").exists(),
             "a refused auto-install created the plugin directory"
         );
+    }
+
+    /// Issue #1157: with no OpenCode root on disk the resolver is never asked,
+    /// so a machine without OpenCode logs no "pinning … as a last resort"
+    /// warning for a plugin nobody will write — and nothing is created.
+    #[test]
+    fn auto_install_does_not_resolve_a_binary_when_no_root_exists() {
+        let tmp = crate::test_temp::tempdir().expect("plugin tempdir");
+        let absent = tmp.path().join("no-opencode-here");
+        let asked = std::cell::Cell::new(false);
+
+        auto_install_resolved(std::slice::from_ref(&absent), || {
+            asked.set(true);
+            Ok("/opt/dot-agent-deck".to_string())
+        });
+
+        assert!(
+            !asked.get(),
+            "the binary path was resolved although no OpenCode root exists"
+        );
+        assert!(!absent.exists(), "a skipped auto-install created its root");
     }
 
     /// The JS parse is the one that has to survive a hand-edited or truncated
