@@ -1673,9 +1673,9 @@ impl AgentBus {
 /// **worker** side — i.e. `record.orchestrator_pane_id != pane_id`, which rules
 /// out records this pane only touched as the *orchestrator* that issued them —
 /// gets [`AgentPtyRegistry::deliver_worker_exited_notice`]'s "exited without
-/// work-done" notice delivered to its orchestrator pane. That delivery is
+/// work-done" report submitted to its orchestrator pane. That delivery is
 /// `async` (it goes through the identity-guarded
-/// [`AgentPtyRegistry::write_notice_guarded`]), but this function runs on a
+/// [`AgentPtyRegistry::write_and_submit_guarded`]), but this function runs on a
 /// bare `std::thread` with no `tokio` runtime context of its own, so it cannot
 /// simply `.await` it. `runtime_handle` is a [`tokio::runtime::Handle`]
 /// captured with `try_current()` (never `current()`, which panics outside a
@@ -2272,7 +2272,7 @@ async fn deliver_payload_and_submit(
 ///
 /// Issue #876: and no DRAIN either, which is a decision rather than an omission.
 /// A notice's bytes are MEANT to stay in the input box — that is the whole
-/// deferral contract ([`crate::state::compose_worker_exited_notice`]) — so
+/// deferral contract ([`crate::state::compose_respawn_failed_notice`]) — so
 /// erasing a partial one would delete the feature rather than a hazard. It also
 /// leaves no payload record to lapse: `note_automatic_write` ignores
 /// [`SubmitMode::Notice`] entirely, so issue #876's "the guard expires while the
@@ -2933,9 +2933,11 @@ struct AutomaticWrite {
     /// any-write clock therefore let an ordinary orchestrator notice landing
     /// between the user's draft and a later blind probe make that draft look
     /// older than our last write, and the probe then submitted draft + notice as
-    /// one turn. The silent-worker notice is a production `Notice` caller that
-    /// fires inside the 60 s confirmation window, so that interleaving is
-    /// ordinary, not hypothetical.
+    /// one turn. The silent-worker notice was a production `Notice` caller that
+    /// fires inside the 60 s confirmation window, so that interleaving was
+    /// ordinary, not hypothetical. (Issues #702 and #708 moved it and both its
+    /// siblings onto the submitted path; the respawn-failure notice is the
+    /// `Notice` caller left, and the guard stays for it.)
     submitted_at: Option<Instant>,
     /// ONE ENTRY PER GUARDED PAYLOAD WRITE that no delivery has released yet,
     /// oldest first — a multiset, not a set.
@@ -4546,10 +4548,11 @@ impl Drop for PaneCleanupHold {
 /// that an automatic prompt delivery FAILED on `pane_id`.
 ///
 /// This is the replacement for writing a diagnostic line into the agent's own
-/// input buffer. That mechanism (`write_notice_guarded`) is retained for the two
-/// orchestrator-pane notices that still take it — `compose_worker_exited_notice`
-/// and `compose_respawn_no_live_worker_notice`; issue #702 moved PRD #249's
-/// silence notice off it onto the submitted path — but its own contract says LF may be
+/// input buffer. That mechanism (`write_notice_guarded`) is retained for the
+/// one orchestrator-pane notice that still takes it — `compose_respawn_failed_notice`;
+/// issue #702 moved PRD #249's silence notice off it onto the submitted path, and
+/// issue #708 moved `compose_worker_exited_notice` and
+/// `compose_respawn_no_live_worker_notice` after it — but its own contract says LF may be
 /// interpreted as Enter and that a later ordinary submit sends
 /// `notice + newline + user prompt` as ONE turn — pinned by the passing
 /// regression `write_to_pane_notice_bytes_precede_next_submit_with_only_lf_between`.
@@ -5881,7 +5884,8 @@ impl AgentPtyRegistry {
     /// consequence of pane-id reuse landing here is accepted as narrower than
     /// the delegation case — worst case is a live successor orchestrator
     /// losing its silence-watch safety net, not a misdelivery, because
-    /// [`Self::write_notice_guarded`]'s own identity check is what actually
+    /// [`Self::write_and_submit_guarded`]'s own identity check (the path the
+    /// silence report has taken since issue #702) is what actually
     /// prevents the notice from reaching the wrong recipient. Caller holds
     /// the tracker lock.
     fn drain_silence_watches_touching_for_exit(
@@ -6008,11 +6012,13 @@ impl AgentPtyRegistry {
         }
     }
 
-    /// Deliver the "worker exited without work-done" notice for
+    /// Deliver the "worker exited without work-done" report for
     /// one [`OutstandingDelegation`] [`Self::sweep_delegations_on_exit`] just
     /// swept off `worker_pane_id`. Follows exactly the guarded-write path PRD
-    /// #249's silence watch already uses: compose the fixed-text notice, write
-    /// it through [`Self::write_notice_guarded`] bound to the orchestrator's
+    /// #249's silence watch already uses: compose the fixed-text report, submit
+    /// it through [`Self::write_and_submit_guarded`] (issue #708 — it used to be
+    /// written, unsubmitted, with [`Self::write_notice_guarded`], and so reached
+    /// nobody in an unattended dispatched unit) bound to the orchestrator's
     /// registry agent id captured when the delegation was armed, with a
     /// revalidation closure that refuses a pane that is mid-close or has since
     /// been re-homed into a different orchestration
@@ -6033,7 +6039,10 @@ impl AgentPtyRegistry {
     /// arrives and finds no record left to retire. The window is small — the
     /// socket write completes before the process exits in the normal case —
     /// so this is accepted as low-probability rather than fixed with an
-    /// added delivery delay.
+    /// added delivery delay. Issue #708 raised what losing that race costs —
+    /// a submitted report is a turn the orchestrator may act on, where an
+    /// unsubmitted one was a line in its scrollback — without widening the
+    /// window; the late `work-done` still reaches the orchestrator after it.
     async fn deliver_worker_exited_notice(
         self: &Arc<Self>,
         worker_pane_id: &str,
@@ -6046,7 +6055,7 @@ impl AgentPtyRegistry {
         let revalidate_registry = Arc::clone(self);
         let revalidate_pane = orchestrator_pane_id.clone();
         let outcome = self
-            .write_notice_guarded(
+            .write_and_submit_guarded(
                 &orchestrator_pane_id,
                 &notice,
                 &expected_agent_id,
@@ -6063,32 +6072,44 @@ impl AgentPtyRegistry {
                 },
             )
             .await;
+        // Issue #708: a one-shot submitted report releases its payload record on
+        // `Applied`, like the silence report — otherwise the same worker pane
+        // exiting again after a restart produces byte-identical text that the
+        // user-input guard would refuse as a repeat.
+        crate::state::settle_one_shot_payload_record(
+            self,
+            &orchestrator_pane_id,
+            &notice,
+            outcome.as_ref().ok().copied(),
+        );
         match outcome {
             Ok(GuardedSend::Applied) => tracing::info!(
                 worker_pane_id = %worker_pane_id,
                 role = %delegation.role,
-                "pane EOF: reported a worker that exited without work-done to the orchestrator"
+                "pane EOF: submitted a report of a worker that exited without work-done to the \
+                 orchestrator"
             ),
             // Some bytes reached the authorized target; a retry would
-            // duplicate a half-written line rather than repair it.
+            // duplicate a half-written report rather than repair it, and the
+            // payload record is kept (see the settle call above).
             Ok(GuardedSend::Ambiguous) => tracing::warn!(
                 pane_id = %orchestrator_pane_id,
                 role = %delegation.role,
-                "pane EOF: worker-exited notice delivery was ambiguous (partial write); not \
-                 retried"
+                "pane EOF: the worker-exited report's submission was ambiguous (partial write); \
+                 not retried, and its payload record is kept"
             ),
             Ok(refused) => tracing::debug!(
                 pane_id = %orchestrator_pane_id,
                 role = %delegation.role,
                 expected_agent_id = %expected_agent_id,
                 outcome = ?refused,
-                "pane EOF: identity gate refused the worker-exited notice; nothing written"
+                "pane EOF: identity gate refused the worker-exited report; nothing submitted"
             ),
             Err(e) => tracing::warn!(
                 pane_id = %orchestrator_pane_id,
                 role = %delegation.role,
                 error = %e,
-                "pane EOF: failed to write the worker-exited notice into the orchestrator pane"
+                "pane EOF: failed to submit the worker-exited report into the orchestrator pane"
             ),
         }
     }
@@ -7461,8 +7482,9 @@ impl AgentPtyRegistry {
     /// so callers classify a refused notice the way they classify a refused prompt.
     ///
     /// Issue #702: what this path guarantees is DEFERRAL, not inertness — see
-    /// [`crate::state::compose_worker_exited_notice`], which carries the whole
-    /// contract for the two notices that still take this call. A caller that
+    /// [`crate::state::compose_respawn_failed_notice`], which carries the whole
+    /// contract for the one production notice that still takes this call (issue
+    /// #708 moved the other two onto [`Self::write_and_submit_guarded`]). A caller that
     /// wants an untrusted value in its text belongs on
     /// [`Self::write_and_submit_guarded`] instead, where the text is a turn of
     /// its own rather than a prefix glued to the next one.
