@@ -833,6 +833,10 @@ enum Unmet {
     /// The transcript names exactly one deck, by this label, and the model's
     /// value resolves to a different one ([`switch_target`]).
     NamedOther(String),
+    /// The transcript carries this [`CONTRAST_MARKERS`] entry — "not",
+    /// "instead", "from" — so it may exclude a deck as well as name one, and
+    /// the model is not trusted to have honoured which ([`switch_target`]).
+    Contrast(String),
 }
 
 impl Unmet {
@@ -890,6 +894,13 @@ impl Unmet {
                 "you named {}, but I resolved a different {}",
                 safe_message(&label),
                 spec.kind.noun()
+            )),
+            // The marker is the user's own word from a closed list, so it is
+            // quoted back: it is what they have to leave out.
+            Unmet::Contrast(marker) => unresolved(format!(
+                "\u{201c}{marker}\u{201d} could mean a {noun} you do not want, so I \
+                 did not switch; say just the {noun} you want",
+                noun = spec.kind.noun()
             )),
             Unmet::DeckUnavailable {
                 label,
@@ -963,6 +974,10 @@ impl Unmet {
                         "You named {}, but I resolved a different {noun}",
                         safe_message(label)
                     ),
+                    None,
+                ),
+                Unmet::Contrast(marker) => (
+                    format!("\u{201c}{marker}\u{201d} could mean a {noun} you do not want"),
                     None,
                 ),
             }
@@ -1053,61 +1068,82 @@ fn said(spoken: &str, transcript: &str) -> bool {
 /// # Why the model's value alone is not enough
 ///
 /// [`said`] asks only whether each content word of the model's value occurs
-/// somewhere in the transcript — a bag of words. That lets through the two
-/// shapes the audit of `d57cf7d` named, both of which reach a machine the user
-/// did not ask for, at once and with no confirmation:
+/// somewhere in the transcript — a bag of words. That lets through every shape
+/// in which the user mentions a deck they do NOT want, and a switch reaches
+/// that machine at once, with no confirmation:
 ///
 /// - **negation and alternatives**: "switch to the build box, not the staging
 ///   box" answered with `deck="staging box"` — every word of it was said;
 /// - **overlapping names**: with `build.example.com` and
 ///   `build-box.example.com` both configured, "switch deck to build box"
-///   answered with `deck="build"` resolves EXACTLY to the first, and an exact
-///   hit outranks the loose one the user meant.
+///   answered with `deck="build"` resolves EXACTLY to the first;
+/// - **a partial name beside a complete one** (the audit of `fabb83d`): with
+///   `build-box` and `staging` configured, "switch deck to build, not staging"
+///   answered with `deck="staging"`. Reading the transcript by complete names
+///   only, "build" named nothing and "staging" named the excluded deck — so
+///   the one deck "named" was the wrong one.
+///
+/// The third was the third patch on one class, which is why the transcript is
+/// now read with the resolver's OWN matching rather than a stricter one of its
+/// own: a run of the user's words that would reach a deck if the model
+/// returned it as the value names that deck.
 ///
 /// # The rule
 ///
-/// The transcript's own side is read first: the decks it NAMES are those one
-/// of whose [`deck_spoken_names`] — label, host, the host's first component,
-/// "local" and "this machine" — is [`Heard`] as a phrase in it, its words
-/// adjacent and in order (the matcher [`action_grounded`] uses). Then:
-///
-/// 1. **more than one deck named** → [`Unmet::NamedSeveral`], whatever the
-///    model picked. Negation, "X or Y" and "switch from X to Y" all land here,
-///    as does an overlap where the user's words match two decks' names.
-///    **Conservative by design**: "switch deck to build box" beside both
-///    `build` and `build-box` refuses and lists them rather than guessing that
-///    the longer name was meant — reading intent out of word order is exactly
-///    the judgement this check exists not to make.
-/// 2. **the model's value is not [`said`]** → [`Unmet::NotSaid`], as before.
-/// 3. **the model's value resolves to one deck** → dispatched only when the
+/// 1. **The decks the transcript names** ([`decks_named`]): every deck that
+///    some contiguous run of the transcript's content words — its
+///    [`spoken_words`] less [`NAMELESS_WORDS`] — resolves to on its own under
+///    [`resolve_deck_ref`], exact or loose. More than one →
+///    [`Unmet::NamedSeveral`], whatever the model picked; negation, "X or Y",
+///    "from X to Y" and overlapping names all land here.
+/// 2. **A contrast word** ([`contrast_marker`]) anywhere in the transcript →
+///    [`Unmet::Contrast`], asking for just the deck wanted. Defence in depth
+///    for a transcript that excludes something rule 1 cannot see as a deck:
+///    "switch to the build box, not staging" with no staging deck configured,
+///    or "switch away from the build box".
+/// 3. **The model's value is not [`said`]** → [`Unmet::NotSaid`].
+/// 4. **The model's value resolves to one deck** → dispatched only when the
 ///    transcript named exactly that deck; [`Unmet::NamedOther`] when it named
-///    a different one; [`Unmet::NotSaid`] when it named none — so a partial
-///    name ("switch to the build" beside one `build-box`) that the loose
-///    resolver would reach no longer switches.
-/// 4. **it resolves to none or several** → the resolver's own
+///    a different one; [`Unmet::NotSaid`] when it named none.
+/// 5. **It resolves to none or several** → the resolver's own
 ///    [`Unmet::NoMatch`] / [`Unmet::Ambiguous`], which quote a value the user
 ///    did say.
 ///
-/// So a switch dispatches only when the transcript names exactly one deck AND
-/// it is the deck the model's value resolves to.
+/// So a switch dispatches only when the transcript carries no contrast word,
+/// names exactly one deck, AND that is the deck the model's value resolves to.
+/// A partial name ("switch to build" beside `build-box` and `staging`) names
+/// one deck and switches to it.
+///
+/// # What it is not
+///
+/// **It refuses conservatively; it does not understand language.** It never
+/// works out which of two named decks was meant, or what a negation applies
+/// to — it refuses, because a false refusal costs one more utterance and a
+/// false switch opens a connection to a machine the user excluded. Its bounds,
+/// stated rather than implied:
+///
+/// - a run of words that resolves to SEVERAL decks names none of them —
+///   otherwise "the build box" would name every deck whose host holds "box",
+///   and the positive case could never switch. A deck mentioned only that
+///   way is invisible to rule 1, and rule 2 is what stands behind it;
+/// - rule 2 is a closed list of words, not a grammar: a contrast phrased
+///   without one of them ("switch to the build box, staging is broken") is
+///   not seen as one, and then only rule 1 guards it;
+/// - a contrast word that is itself a word of a configured deck's name does
+///   not count, so a deck called `no-backup` stays reachable by voice.
 fn switch_target(
     spoken: &str,
     transcript: &Transcript,
     decks: &[VoiceDeck],
 ) -> Result<(String, String), Unmet> {
-    let heard = Heard::new(transcript.text());
-    let named: Vec<&VoiceDeck> = decks
-        .iter()
-        .filter(|deck| {
-            deck_spoken_names(deck)
-                .iter()
-                .any(|name| heard.phrase(name))
-        })
-        .collect();
+    let named = decks_named(transcript.text(), decks);
     if named.len() > 1 {
         return Err(Unmet::NamedSeveral(
             named.iter().map(|deck| deck.label.clone()).collect(),
         ));
+    }
+    if let Some(marker) = contrast_marker(transcript.text(), decks) {
+        return Err(Unmet::Contrast(marker));
     }
     if !said(spoken, transcript.text()) {
         return Err(Unmet::NotSaid);
@@ -1121,6 +1157,67 @@ fn switch_target(
         DeckRefMatch::None => Err(Unmet::NoMatch),
         DeckRefMatch::Ambiguous(labels) => Err(Unmet::Ambiguous(labels)),
     }
+}
+
+/// The decks `transcript` names, in `decks` order: each one that some
+/// contiguous run of its content words resolves to on its own under
+/// [`resolve_deck_ref`] — the same exact-then-loose rule a model value is
+/// resolved by, so words of the user's that would reach one deck as the
+/// model's value name that deck. A run that resolves to several decks names
+/// none (see [`switch_target`] for why, and what that costs).
+///
+/// Every run, not only single words: "build box" can resolve to one deck while
+/// "build" and "box" are each ambiguous. A voice utterance is a few seconds of
+/// speech, so the quadratic count of runs is small.
+fn decks_named<'a>(transcript: &str, decks: &'a [VoiceDeck]) -> Vec<&'a VoiceDeck> {
+    let content: Vec<String> = spoken_words(transcript)
+        .into_iter()
+        .filter(|word| !NAMELESS_WORDS.contains(&word.as_str()))
+        .collect();
+    let mut named: BTreeSet<String> = BTreeSet::new();
+    for start in 0..content.len() {
+        for end in start + 1..=content.len() {
+            if let DeckRefMatch::One { id, .. } =
+                resolve_deck_ref(&content[start..end].join(" "), decks)
+            {
+                named.insert(id);
+            }
+        }
+    }
+    decks
+        .iter()
+        .filter(|deck| named.contains(&deck.id))
+        .collect()
+}
+
+/// Words and phrases that turn a mention of a deck into an EXCLUSION of one —
+/// "not staging", "instead of the build box", "rather than local", "away from
+/// staging", "from local to the build box", "the build box or staging" — for
+/// [`switch_target`]'s rule 2. A closed list, deliberately small, matched as
+/// whole [`spoken_words`] runs — so "don't" is heard as the two words `don t`
+/// a transcriber's apostrophe splits it into, and is quoted back as written
+/// here.
+const CONTRAST_MARKERS: [&str; 15] = [
+    "not", "no", "nor", "never", "don't", "dont", "doesn't", "isn't", "except", "but", "or",
+    "instead", "rather", "than", "from",
+];
+
+/// The first [`CONTRAST_MARKERS`] entry, in the list's order, heard in
+/// `transcript` — skipping an entry every word of which is a word of some
+/// configured deck's name, so `no-backup.example.com` does not refuse itself.
+fn contrast_marker(transcript: &str, decks: &[VoiceDeck]) -> Option<String> {
+    let words = spoken_words(transcript);
+    let name_words: BTreeSet<String> = decks
+        .iter()
+        .flat_map(deck_spoken_names)
+        .flat_map(|name| spoken_words(&name))
+        .collect();
+    CONTRAST_MARKERS.iter().find_map(|marker| {
+        let wanted = spoken_words(marker);
+        let heard = words.windows(wanted.len()).any(|window| window == wanted);
+        let a_name = wanted.iter().all(|word| name_words.contains(word));
+        (heard && !a_name).then(|| marker.to_string())
+    })
 }
 
 /// `text` with its first character upper-cased, for a refusal's situation
@@ -1171,11 +1268,14 @@ fn capitalised(text: &str) -> String {
 /// (PRD #1195).** Switching to a remote deck opens an SSH connection to it, at
 /// once and with no confirmation, so "switch deck to local" answered with
 /// `deck="build box"` would reach a machine the user did not ask for. Its
-/// reference is grounded from both sides ([`switch_target`]): the transcript
-/// must name exactly one deck by one of its [`deck_spoken_names`], and the
-/// model's value — itself words the user [`said`] — must resolve to that deck.
-/// Naming several (negation, "X or Y", overlapping names) is refused with the
-/// decks named; naming none is [`Unmet::NotSaid`]. That is a name the
+/// reference is grounded from both sides ([`switch_target`]): the transcript,
+/// read with [`resolve_deck_ref`]'s own matching, must name exactly one deck
+/// and carry no contrast word ("not", "instead", "from" — [`CONTRAST_MARKERS`]),
+/// and the model's value — itself words the user [`said`] — must resolve to
+/// that deck. Naming several (negation, "X or Y", overlapping names, a partial
+/// name beside a complete one) is refused with the decks named; a contrast
+/// word asks for just the deck wanted; naming none is [`Unmet::NotSaid`].
+/// That is a name the
 /// user says the way the screen shows it, not the word-for-word title match
 /// the 2026-09-24 removal was about: "the build box" reaches
 /// `deploy@build-box.example.com` and "this machine" the local deck exactly
@@ -1446,10 +1546,13 @@ fn millis(elapsed: std::time::Duration) -> u32 {
 /// dispatcher mode") and the verbs a command is made of ("open", "use") — and
 /// so are no evidence, on their own, that the user SAID a particular value.
 ///
-/// Only [`said`] reads it now, to decide whether a dropped optional value is
-/// quoted back or reported as not caught. It used to be the filler list of
-/// reference grounding, removed on 2026-09-24 (see [`resolve_param`]); it
-/// gates no dispatch.
+/// Read in two places: [`said`] (through [`content_words`]), which decides
+/// whether a dropped optional value is quoted back or reported as not caught,
+/// and — with [`decks_named`] — grounds [`SWITCH_DECK_ROW`]'s deck, the one
+/// reference still held against the transcript ([`switch_target`]). It used
+/// to be the filler list of reference grounding for every row, removed on
+/// 2026-09-24 (see [`resolve_param`]); `switch_deck` is the only dispatch it
+/// gates now.
 const NAMELESS_WORDS: [&str; 52] = [
     "a",
     "an",
@@ -7242,6 +7345,126 @@ mod tests {
                 "switch deck to the staging box",
                 "staging box",
                 "deck-staging-box",
+            ),
+        ] {
+            let outcome = switched_over(decks, said, spoken).await;
+            assert!(
+                matches!(&outcome, VoiceOutcome::Dispatch { params, .. }
+                    if params[0].value == expected),
+                "{said}: {outcome:?}"
+            );
+        }
+    }
+
+    /// Scenario: the audit of `fabb83d` — with `build-box` and `staging`
+    /// configured, "switch deck to build, not staging" answered with
+    /// `staging`. "build" is only part of the build box's names, so a
+    /// complete-phrase reading of the transcript saw one deck named, the
+    /// excluded one, and switched to it. Read with the resolver's own loose
+    /// matching the transcript names both, and every contrast-shaped request
+    /// is refused; one naming a single deck beside a contrast word ("not",
+    /// "rather than", "away from") is refused too, asking for just the deck.
+    /// A partial name with no contrast ("switch to build") still switches,
+    /// as do the plain controls and a deck whose own name holds "no".
+    #[tokio::test]
+    async fn voice_outcome_switch_deck_refuses_a_contrast_or_a_loosely_named_second_deck() {
+        let pair = [
+            deck("deck-local", "Local deck", true),
+            deck("deck-build-box", "deploy@build-box.example.com", false),
+            deck("deck-staging", "deploy@staging.example.com", false),
+        ];
+        let single = [
+            deck("deck-local", "Local deck", true),
+            deck("deck-build-box", "deploy@build-box.example.com", false),
+        ];
+        // A contrast word inside a configured deck's own name is that name.
+        let named_no = [
+            deck("deck-local", "Local deck", true),
+            deck("deck-no-backup", "ops@no-backup.example.com", false),
+        ];
+        let both = [
+            "deploy@build-box.example.com".to_string(),
+            "deploy@staging.example.com".to_string(),
+        ];
+
+        for (said, spoken) in [
+            ("switch deck to build, not staging", "staging"),
+            ("switch to build not staging", "build"),
+            ("switch to staging instead of build", "staging"),
+            ("switch to staging instead of build", "build"),
+        ] {
+            let outcome = switched_over(&pair, said, spoken).await;
+            let VoiceOutcome::ParamAmbiguous {
+                action,
+                matches,
+                sentence,
+                ..
+            } = &outcome
+            else {
+                panic!("{said} / {spoken}: expected the decks named, got {outcome:?}");
+            };
+            assert_eq!(action, "switch_deck");
+            assert_eq!(matches, &both.to_vec(), "{said}: {sentence}");
+            assert!(
+                sentence.contains("you named more than one deck"),
+                "{sentence}"
+            );
+        }
+
+        for (said, spoken, marker) in [
+            ("switch to build, not staging", "build", "not"),
+            (
+                "switch deck to the build box rather than this one",
+                "build box",
+                "rather",
+            ),
+            ("switch away from the build box", "build box", "from"),
+            ("don't switch to the build box", "build box", "don't"),
+        ] {
+            let outcome = switched_over(&single, said, spoken).await;
+            let VoiceOutcome::ParamUnresolved {
+                action, sentence, ..
+            } = &outcome
+            else {
+                panic!("{said}: a contrast must refuse, got {outcome:?}");
+            };
+            assert_eq!(action, "switch_deck");
+            assert!(
+                sentence.contains("say just the deck you want"),
+                "{said}: {sentence}"
+            );
+            assert!(
+                sentence.contains(&format!("\u{201c}{marker}\u{201d}")),
+                "{said}: {sentence}"
+            );
+        }
+
+        for (decks, said, spoken, expected) in [
+            (&pair[..], "switch to build", "build", "deck-build-box"),
+            (
+                &pair[..],
+                "switch deck to staging",
+                "staging",
+                "deck-staging",
+            ),
+            (
+                &pair[..],
+                "switch deck to the build box",
+                "build box",
+                "deck-build-box",
+            ),
+            (&pair[..], "switch deck to local", "local", "deck-local"),
+            (
+                &named_no[..],
+                "switch deck to no backup",
+                "no backup",
+                "deck-no-backup",
+            ),
+            (
+                &single[..],
+                "switch deck to this machine",
+                "this machine",
+                "deck-local",
             ),
         ] {
             let outcome = switched_over(decks, said, spoken).await;
