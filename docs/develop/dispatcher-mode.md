@@ -33,6 +33,38 @@ Naming an orchestration the repo does not define is an **error** listing what is
 
 With neither flag, the shape falls back to whatever the repo's config implies (its DEFAULT `[[orchestrations]]` — the block carrying `default = true`, else the first one with roles — and a single agent when it defines none) — the pre-selector behaviour, kept so an older CLI keeps working against a newer daemon. When that choice is implicit, the dispatch's reply carries a note naming what was opened and what else was defined; see [Orchestration](../orchestration.md#which-orchestration-a-scheduled-task-opens).
 
+## What `dispatch`'s exit status asserts
+
+Issue [#530](https://github.com/vfarcic/dot-agent-deck/issues/530), settled by documenting the exit status rather than changing it. The issue was filed against a path that no longer exists: it described the CLI returning once `spawn::deliver` had written the prompt, with confirmation detached. Since [#1129](https://github.com/vfarcic/dot-agent-deck/issues/1129) the CLI does not wait for the spawn at all, so the exit status asserts even less than the issue said.
+
+**The exit status is the provenance gate's acknowledgement.** `dispatch` is a fire-and-forget hook-socket verb. The hook loop writes a `SignalAck` from `DaemonMessage::provenance_ack_reply` when the gate admits the message, **before** `handle_dispatch` runs, and the CLI (`send_signal_and_report_ack`) exits on that line. So, on the current tree:
+
+| CLI outcome | What it asserts |
+| --- | --- |
+| exit 0, `accepted: true` | the daemon admitted the request past the provenance gate. Nothing about shape resolution, the worktree, the spawn, the prompt's write, or its confirmation |
+| exit 0, no checkable reply — `SocketReply::NoReply`, or a `SocketReply::Line` that `parse_signal_ack` does not recognise as a `SignalAck` | nothing checkable — a daemon older than #1129, no reply within `SIGNAL_ACK_TIMEOUT`, a write that broke partway, or a line that is not an ack. Reported as success so a mixed-version pair does not fail every dispatch |
+| non-zero | the request never reached the handler: `SocketReply::Unreachable`, a gate refusal (reason printed), or a local error (no `DOT_AGENT_DECK_PANE_ID`, an unusable `--task-file`) |
+
+Pinned by `daemon::hook_ingestion_tests::a_dispatch_its_handler_rejects_is_still_acknowledged_as_accepted`: an attested dispatch naming an orchestration the directory does not define is acknowledged `accepted`, the ack is the only line on the connection, and the rejection reaches the caller's PTY instead.
+
+**The outcome is two later messages into the caller's pane, and neither is the confirmation #424 tracks either.**
+
+- `handle_dispatch`'s reply, delivered by `deliver_dispatch_result` once `spawn` returns. `dispatch` passes `detach_delivery = false`, so that is after the readiness wait and the first write — but `deliver` hands confirmation to a detached `spawn_confirmation_task` whatever the flag says, and a refused first write still returns `Ok`. So a reply opening `dispatch::SPAWNED_OPENING` means "a unit was spawned", not "its task arrived". Every other reply opening is a failure.
+- The completion report, when the unit runs `work-done --done`. It is the first message to the caller that implies the unit received its task — implies, not proves: `return_dispatch_completion` checks for a terminal `work-done` and a retained route, and ties neither to the prompt's delivery, so any authorised process in that pane can send it.
+
+What confirmation finds goes nowhere near the caller. Abandonment publishes a `DeliveryNotice` on the **unit's** card; an unconfirmable producer and a `lagged-event-stream` / `event-stream-closed` stop are log lines only (`crate::prompt_delivery`'s `log_prompt_*`). The same holds before confirmation starts: a first write refused by `guarded_submit` (`Refused`, `Failed`) or stopped by the pre-write drain is logged and nothing more, and only `RefusedUserInput` publishes a notice (`report_user_input_stop`). All of these still return `Ok` from `spawn`, so the caller gets `SPAWNED_OPENING` regardless.
+
+**Why not the opt-in `--await-confirmation` the issue proposed.**
+
+1. **The consumer is an agent in a managed pane, not a script.** The CLI refuses to run without `DOT_AGENT_DECK_PANE_ID`, and the deck's own automated producers — the scheduler (`spawn_or_reuse`) and issue-dispatch (`issue_dispatch_run`, `detach_delivery = true`) — call `spawn` inside the daemon and never pass through it. So the issue's "what a script or a scheduler branches on" describes a population this verb barely has: a script can call it only from inside a managed pane, and the deck's schedulers never do. The caller it was built for, the dispatcher agent, already receives a richer verdict in its pane than an exit code can carry.
+2. **Waiting reverses #1129's deliberate choice**, not an oversight. The ack is written at the gate so the calling agent is not parked for a worktree create and a spawn. An opt-in wait adds the readiness wait (up to `SESSION_START_WAIT_TIMEOUT`) and the confirmation deadline (`AUTOMATIC_PROMPT_DEADLINE`, 60s, which bounds both together) to every dispatch that uses it. The dispatcher seed's whole use case is starting several units from one conversation, and it would serialise them.
+3. **It needs a wire change for a three-way answer.** Confirmation ends confirmed, abandoned, unconfirmable (a producer that cannot report a submitted prompt, so the write is final) or stopped. "Unconfirmable" has no honest exit code: 0 recreates the ambiguity the flag exists to remove, and non-zero fails every dispatch to a hookless agent. Building it means an optional field on `DispatchSignal`, a new reply shape, a result channel out of the detached confirmation task, and a way for the CLI to tell an older daemon that silently ignored the field from a real answer. `DAEMON_CAPABILITIES` is advertised on the attach socket and no hook-socket reply carries one, so rule 18's gated-verb rung would need one built or borrowed first.
+4. **"Submitted" is still not "landed".** A confirmed submission proves the agent took the prompt, not that it started the work. The completion report is the answer the caller actually needs, and it already reaches the caller's pane.
+
+**What this leaves open.** An abandoned delivery is invisible to the caller: the unit sits idle with a notice on its own card, never reports, and the dispatcher waits for a completion that will not come. The fix that fits this design is a push, not a wait — route abandonment to the retained caller through `DispatchReturns` the way completion is routed. That is a separate change to the return edge, with its own fencing and wording questions.
+
+**Where the contract is stated**, each pinned against the value the daemon formats its message from so a reword cannot drift silently: `dispatch --help` (`dispatch_help_says_what_its_exit_status_asserts` in `src/main.rs`), the dispatcher seed (`dispatcher_seed_says_the_exit_status_is_not_the_outcome` in `src/ui.rs`), and the user page's *What "dispatched" actually tells you*.
+
 ## What the unit actually gets
 
 - **`--single`** runs a real agent — the deck's configured `default_command`, or the Claude default when unset. It must never be `None`: the spawn path reads an absent command as `$SHELL`, which started a bare shell and typed the task into a bash prompt. A worktree appeared, a pane appeared, and the test was green — see `resolve_single_agent_command`.
