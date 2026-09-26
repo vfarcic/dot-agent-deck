@@ -1286,6 +1286,13 @@ impl NewPaneFormState {
     /// mode/card/authoring option carries no identity uniqueness constraint.
     /// Drives the blocking refusal at submit and the `[Submit]`-button-gone
     /// render on the guard seam.
+    ///
+    /// ADVISORY: [`Self::live_orchestration_names`] is one snapshot taken at
+    /// form-open, so a title another client took since reads as free here. The
+    /// daemon's `StartAgent` handler is the authority (issue #555); this check
+    /// is the fast path that spares the round trip in the common case, and a
+    /// daemon refusal comes back through [`restore_form_after_title_refusal`],
+    /// which makes this return `true` for the refused title.
     fn name_collision(&self) -> bool {
         self.resolved_title()
             .is_some_and(|t| self.live_orchestration_names.iter().any(|l| l == &t))
@@ -2134,6 +2141,14 @@ struct UiState {
     /// Set at every picker-open site; reset to `NewPane` once consumed.
     dir_picker_intent: DirPickerIntent,
     new_pane_form: Option<NewPaneFormState>,
+    /// Issue #555: the new-pane form an ORCHESTRATION submit came from, kept
+    /// across the `Action::SpawnPane` it produced so a daemon refusal of the
+    /// run title can put the same form back — selection, typed name and all —
+    /// with its collision warning showing, instead of a generic spawn failure
+    /// the user can only answer by retyping the whole form. Set by both submit
+    /// doors, taken (and so cleared) at the top of every `SpawnPane`, and
+    /// restored only on the title-in-use refusal.
+    submitted_orchestration_form: Option<NewPaneFormState>,
     pane_names: HashMap<String, String>,
     /// Maps pane_id → display name; survives session restarts (e.g. /clear).
     pane_display_names: HashMap<String, String>,
@@ -2599,6 +2614,7 @@ impl UiState {
             dir_picker: None,
             dir_picker_intent: DirPickerIntent::NewPane,
             new_pane_form: None,
+            submitted_orchestration_form: None,
             pane_names: HashMap::new(),
             pane_display_names: HashMap::new(),
             pane_declared_agent: HashMap::new(),
@@ -9355,6 +9371,33 @@ fn build_new_pane_request(form: &NewPaneFormState, default_command: &str) -> New
     }
 }
 
+/// Issue #555: the daemon refused an orchestration start because its run
+/// title is already held by another live orchestration in the same directory
+/// — the case the form's own check could not see, since its snapshot of live
+/// titles was taken when it opened and another client started one since.
+///
+/// Put the submitted form back exactly as it was, with the refused title added
+/// to its live-title list, so it renders the same [`NAME_COLLISION_WARNING`]
+/// and drops `[Submit]` exactly as a collision it had known about at open
+/// would. Focus lands on the Name field, the one thing the user has to change.
+/// Nothing was started: the daemon refused role 0 before its registry insert,
+/// and `open_orchestration_tab` created no other pane.
+fn restore_form_after_title_refusal(ui: &mut UiState, mut form: NewPaneFormState) {
+    if let Some(title) = form.resolved_title()
+        && !form.live_orchestration_names.contains(&title)
+    {
+        form.live_orchestration_names.push(title);
+    }
+    form.focused = FormField::Name;
+    ui.new_pane_form = Some(form);
+    ui.mode = UiMode::NewPaneForm;
+    ui.status_message = Some((
+        "Orchestration not started: that name was just taken by another live orchestration."
+            .to_string(),
+        std::time::Instant::now(),
+    ));
+}
+
 fn handle_new_pane_form_key(key: KeyEvent, ui: &mut UiState) -> Action {
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
         ui.quit_confirm_selected = 0;
@@ -9417,7 +9460,11 @@ fn handle_new_pane_form_key(key: KeyEvent, ui: &mut UiState) -> Action {
                 // form. Any non-empty form-submitted command records (authoring
                 // included); committed into `last_command` only on a successful spawn.
                 let candidate = record_candidate(&req.command);
-                ui.new_pane_form = None;
+                // Issue #555: kept, not dropped, while the start is in flight.
+                ui.submitted_orchestration_form = ui
+                    .new_pane_form
+                    .take()
+                    .filter(|f| f.selected_orchestration().is_some());
                 ui.mode = UiMode::Normal;
                 ui.pending_last_command = candidate;
                 return Action::SpawnPane(Box::new(req));
@@ -10932,6 +10979,9 @@ fn dispatch_action(
             }
         }
         Action::SpawnPane(req) => {
+            // Issue #555: whatever this spawn does, the form it came from is
+            // restored at most once, and only from the orchestration arm below.
+            let submitted_orchestration_form = ui.submitted_orchestration_form.take();
             if pane.is_available() {
                 let dir_str = req.dir.display().to_string();
 
@@ -11182,10 +11232,19 @@ fn dispatch_action(
                             ));
                         }
                         Err(e) => {
-                            ui.status_message = Some((
-                                format!("Orchestration failed: {e}"),
-                                std::time::Instant::now(),
-                            ));
+                            let message = e.to_string();
+                            if let Some(form) = submitted_orchestration_form.filter(|_| {
+                                message.contains(
+                                    crate::daemon_protocol::START_ERR_ORCHESTRATION_TITLE_IN_USE,
+                                )
+                            }) {
+                                restore_form_after_title_refusal(ui, form);
+                            } else {
+                                ui.status_message = Some((
+                                    format!("Orchestration failed: {message}"),
+                                    std::time::Instant::now(),
+                                ));
+                            }
                         }
                     }
                 } else {
@@ -11735,6 +11794,9 @@ fn dispatch_action(
                 // PRD #196: capture the last-command candidate (None only for an
                 // empty command); committed on a successful spawn below.
                 ui.pending_last_command = record_candidate(&req.command);
+                // Issue #555: kept, not dropped, while the start is in flight.
+                ui.submitted_orchestration_form =
+                    Some(form).filter(|f| f.selected_orchestration().is_some());
                 return dispatch_action(
                     Action::SpawnPane(Box::new(req)),
                     ui,
@@ -36113,6 +36175,193 @@ mod tests {
             free.contains("[Submit]") && free.contains("Enter: submit"),
             "a free name must restore both the [Submit] button and the \
              `Enter: submit` footer promise, got:\n{free}"
+        );
+    }
+
+    /// Issue #555: a [`PaneController`] whose every pane creation fails with
+    /// `error` — standing in for a daemon that refuses the orchestration's
+    /// role-0 `StartAgent`. Everything else delegates to a
+    /// [`CapturingPaneController`].
+    struct RefusingPaneController {
+        error: String,
+        inner: CapturingPaneController,
+    }
+
+    impl PaneController for RefusingPaneController {
+        fn create_pane_with_options(
+            &self,
+            _command: Option<&str>,
+            _cwd: Option<&str>,
+            _opts: AgentSpawnOptions<'_>,
+        ) -> Result<(String, String), PaneError> {
+            Err(PaneError::CommandFailed(self.error.clone()))
+        }
+        fn focus_pane(&self, pane_id: &str) -> Result<(), PaneError> {
+            self.inner.focus_pane(pane_id)
+        }
+        fn pane_agent_id(&self, pane_id: &str) -> Option<String> {
+            self.inner.pane_agent_id(pane_id)
+        }
+        fn close_pane(&self, pane_id: &str) -> Result<(), PaneError> {
+            self.inner.close_pane(pane_id)
+        }
+        fn list_panes(&self) -> Result<Vec<crate::pane::PaneInfo>, PaneError> {
+            self.inner.list_panes()
+        }
+        fn resize_pane(
+            &self,
+            pane_id: &str,
+            direction: crate::pane::PaneDirection,
+            amount: u16,
+        ) -> Result<(), PaneError> {
+            self.inner.resize_pane(pane_id, direction, amount)
+        }
+        fn rename_pane(&self, pane_id: &str, name: &str) -> Result<RenameOutcome, PaneError> {
+            self.inner.rename_pane(pane_id, name)
+        }
+        fn toggle_layout(&self) -> Result<(), PaneError> {
+            self.inner.toggle_layout()
+        }
+        fn write_to_pane(&self, pane_id: &str, text: &str) -> Result<(), PaneError> {
+            self.inner.write_to_pane(pane_id, text)
+        }
+        fn name(&self) -> &str {
+            "refusing"
+        }
+        fn is_available(&self) -> bool {
+            true
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    /// Open the new-pane form on a fresh orchestration project with NOTHING
+    /// known live, accept the suggested name, submit through the real key
+    /// handler, and dispatch the `SpawnPane` it yields against `pane` — which
+    /// also backs the `TabManager`, since that is what creates role panes.
+    fn submit_orchestration_form_against(pane: Arc<RefusingPaneController>) -> UiState {
+        let tmp = tempdir().expect("tempdir");
+        let dir = tmp.path().join("myproj");
+        std::fs::create_dir_all(&dir).expect("project dir");
+        let mut ui = default_ui();
+        ui.mode = UiMode::NewPaneForm;
+        ui.new_pane_form = Some(NewPaneFormState::new(
+            dir,
+            "myproj".to_string(),
+            String::new(),
+            vec![],
+            vec![make_orchestration("review")],
+        ));
+        let right = KeyEvent::new(KeyCode::Right, KeyModifiers::NONE);
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        handle_new_pane_form_key(right, &mut ui); // select the orchestration
+        handle_new_pane_form_key(enter, &mut ui); // Mode -> Name
+        let action = handle_new_pane_form_key(enter, &mut ui); // submit
+        assert!(
+            matches!(action, Action::SpawnPane(_)),
+            "precondition: nothing is known live, so the form's own check admits the submit"
+        );
+        let mut tm = TabManager::new(pane.clone());
+        let state: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
+        let snapshot = AppState::default();
+        let _ = dispatch_action(
+            action,
+            &mut ui,
+            pane.as_ref(),
+            &state,
+            &mut tm,
+            &snapshot,
+            &[],
+            None,
+            Rect::new(0, 0, 200, 50),
+        );
+        ui
+    }
+
+    /// Scenario: Open the new-pane form with no orchestration known live, so the
+    /// form suggests and admits `myproj-orchestrator-1`; meanwhile another
+    /// client has started an orchestration under that name, so the daemon
+    /// refuses the start. The form must come BACK — same selection, same name,
+    /// focus on Name — showing the existing "already in use by a live
+    /// orchestration" warning with `[Submit]` gone, rather than closing and
+    /// leaving a generic spawn failure on the status line. Any other spawn
+    /// failure still closes the form and reports itself as before.
+    #[spec("orchestration/identity/009")]
+    #[test]
+    fn identity_009_a_daemon_title_refusal_reopens_the_form_with_the_collision_warning() {
+        let refusal = format!(
+            "daemon returned error: {}: the name `myproj-orchestrator-1` is already in use by a \
+             live orchestration in /tmp/myproj; choose another name. Nothing was started.",
+            crate::daemon_protocol::START_ERR_ORCHESTRATION_TITLE_IN_USE
+        );
+        let refusing = Arc::new(RefusingPaneController {
+            error: refusal,
+            inner: CapturingPaneController::new(),
+        });
+        let ui = submit_orchestration_form_against(refusing);
+
+        assert_eq!(
+            ui.mode,
+            UiMode::NewPaneForm,
+            "a daemon title refusal must put the form back, not drop to the dashboard"
+        );
+        let form = ui
+            .new_pane_form
+            .as_ref()
+            .expect("the submitted form must be restored after a title refusal");
+        assert_eq!(form.name, "myproj-orchestrator-1", "the typed name is kept");
+        assert!(
+            form.selected_orchestration().is_some(),
+            "the orchestration selection is kept"
+        );
+        assert_eq!(
+            form.focused,
+            FormField::Name,
+            "focus lands on the field to change"
+        );
+        assert!(
+            form.name_collision(),
+            "the refused title now counts as live, so the form's own guard holds it"
+        );
+        let rendered = buffer_to_string(&render_overlay_to_buffer(100, 28, |frame| {
+            render_new_pane_form(frame, form);
+        }));
+        assert!(
+            rendered.contains(NAME_COLLISION_WARNING[0].trim()),
+            "the restored form must show the existing collision warning, got:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("[Submit]"),
+            "the restored form must drop [Submit] exactly as a known collision does, \
+             got:\n{rendered}"
+        );
+        assert!(
+            ui.submitted_orchestration_form.is_none(),
+            "the kept form is restored once and not held any longer"
+        );
+
+        // Control: a failure that is NOT a title refusal keeps today's
+        // behaviour — the form stays closed and the failure is reported — so
+        // the reopen above is attributable to the refusal and not to every
+        // failed orchestration start.
+        let failing = Arc::new(RefusingPaneController {
+            error: "daemon returned error: spawn failed: No such file or directory".to_string(),
+            inner: CapturingPaneController::new(),
+        });
+        let ui = submit_orchestration_form_against(failing);
+        assert!(
+            ui.new_pane_form.is_none(),
+            "any other failure must not reopen the form"
+        );
+        assert!(
+            ui.submitted_orchestration_form.is_none(),
+            "nor keep the submitted form around for a later spawn to restore"
+        );
+        let status = ui.status_message.as_ref().map(|(m, _)| m.as_str());
+        assert!(
+            status.is_some_and(|m| m.starts_with("Orchestration failed:")),
+            "any other failure is reported as before, got {status:?}"
         );
     }
 
