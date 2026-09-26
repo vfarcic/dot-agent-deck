@@ -3112,7 +3112,7 @@ mod tests {
             assert!(flat.contains(quote), "the help must state {why}:\n{help}");
         }
         let completed =
-            dot_agent_deck::dispatch_return::compose_completion_report("probe", "report");
+            dot_agent_deck::dispatch_return::compose_completion_report("probe", "report", None);
         assert!(
             completed.starts_with(completed_opening),
             "the completion report no longer opens the way the help quotes it: {completed}"
