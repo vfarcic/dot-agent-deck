@@ -2730,6 +2730,11 @@ export class TauriDeckBridge implements DeckBridge {
   private attached = new Set<string>();
   private sessions = new Map<string, InstalledTerminalSession>();
   /**
+   * The tail of each terminal's input queue, by the same composite key as
+   * {@link sessions}. See {@link sendTerminalInput} for why input is queued.
+   */
+  private inputTails = new Map<string, Promise<void>>();
+  /**
    * `sessionId` -> the composite key its session is filed under.
    *
    * The daemon's own events (`desktop://terminal-state`,
@@ -4004,11 +4009,42 @@ export class TauriDeckBridge implements DeckBridge {
    * object would find nothing in production while passing any test that reused
    * one reference.
    */
+  /**
+   * Issue #953 — one write in flight per terminal, in the order typed.
+   *
+   * xterm hands over each keystroke as its own chunk, and each chunk is its own
+   * `desktop_terminal_write` command. Tauri runs every async command as its own
+   * task, so two issued back to back reach the Rust side's writer lock in
+   * whichever order the runtime schedules them — the lock serialises the
+   * writes but cannot know their order. The driver tier measured the result in
+   * the real window: `echo dad-driver-…` typed at WebDriver speed reached bash
+   * as `echo dadd-river-…`. So each chunk is issued only once the previous one
+   * for the same terminal has been written. A failed write rejects its own
+   * caller and does not stall the queue behind it.
+   *
+   * Each chunk is bound to the session installed when it was ACCEPTED, not the
+   * one installed when its turn comes: if that session ends while the chunk
+   * waits and the pane reattaches, the chunk was typed into a terminal that no
+   * longer exists, and it rejects as not attached rather than landing in the
+   * replacement.
+   */
   async sendTerminalInput(target: AgentTarget, data: string): Promise<void> {
-    const invoke = await this.getInvoke();
-    const session = this.sessions.get(agentKey(target.deckId, target.agentId));
-    if (!session) throw new Error(`Terminal for ${target.agentId} is not attached.`);
-    await invoke("desktop_terminal_write", { sessionId: session.result.sessionId, data: Array.from(new TextEncoder().encode(data)) });
+    const key = agentKey(target.deckId, target.agentId);
+    const accepted = this.sessions.get(key);
+    const notAttached = () => new Error(`Terminal for ${target.agentId} is not attached.`);
+    if (!accepted) throw notAttached();
+    const previous = this.inputTails.get(key) ?? Promise.resolve();
+    const write = previous.then(async () => {
+      const invoke = await this.getInvoke();
+      if (this.sessions.get(key) !== accepted) throw notAttached();
+      await invoke("desktop_terminal_write", { sessionId: accepted.result.sessionId, data: Array.from(new TextEncoder().encode(data)) });
+    });
+    const tail = write.catch(() => undefined);
+    this.inputTails.set(key, tail);
+    void tail.then(() => {
+      if (this.inputTails.get(key) === tail) this.inputTails.delete(key);
+    });
+    return write;
   }
 
   onTerminalGeometry(listener: (agentId: string, rows: number, cols: number, deckId?: string) => void): () => void {

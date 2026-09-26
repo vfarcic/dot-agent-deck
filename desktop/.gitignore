@@ -11,3 +11,7 @@ src-tauri/target/
 playwright-report/
 test-results/
 blob-report/
+
+# Driver tier (`pnpm test:driver`, issue #953): a failing scenario's screenshot,
+# page text, terminal text and logs. CI uploads it on failure.
+driver-results/

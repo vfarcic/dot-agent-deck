@@ -16,9 +16,10 @@ import { expect, test, type Page } from "@playwright/test";
  * cannot, because which `theme-color` an engine resolved is not observable from
  * inside the page in either engine (measured -- the comment on that test has
  * the sweep). Whether an engine honours `media` on `theme-color` therefore
- * remains answered by NOTHING automated, and `docs/develop/desktop-gui.md` says
- * plainly that no step of the manual walk names it either -- closing it needs
- * the real-window rung, issue #953.
+ * remains answered by NOTHING automated. Issue #953's real-window rung settled
+ * why that is not a gap: nothing in this app's Tauri stack reads the page's
+ * theme colour, so the packaged app has no such behaviour to test --
+ * `docs/develop/desktop-gui.md` ("The driver tier") has the evidence.
  *
  * It is deliberately NOT a re-implementation of the palette comparison. The 399
  * declarations are still checked where they were, and the two static guards in

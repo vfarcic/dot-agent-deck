@@ -26,9 +26,9 @@ That block is not a sketch: it was run end to end against this repository on 202
 
 ## What a dispatch actually runs
 
-Eleven of `ci.yml`'s twelve jobs: `changes`, `desktop-web`, `desktop-browser`, `build`, `e2e-deterministic`, `windows-cross-check`, `build-windows`, `build-macos`, `security`, `nix` and `devbox`. The twelfth, `notify-main-red`, is gated on `github.event_name == 'push' && github.ref == 'refs/heads/main'` and is silent here by design.
+Twelve of `ci.yml`'s thirteen jobs: `changes`, `desktop-web`, `desktop-browser`, `desktop-driver`, `build`, `e2e-deterministic`, `windows-cross-check`, `build-windows`, `build-macos`, `security`, `nix` and `devbox`. The thirteenth, `notify-main-red`, is gated on `github.event_name == 'push' && github.ref == 'refs/heads/main'` and is silent here by design.
 
-That list is read off a real dispatch rather than off the file: run [`35025264144`](https://github.com/vfarcic/dot-agent-deck/actions/runs/35025264144), a `workflow_dispatch` on this repository on 2026-09-15, ran exactly those eleven and reported `notify-main-red` as `skipped`, finishing green in 8.8 minutes. Note the shape of that last part before reading a job list yourself — a completed run reports **twelve** jobs, the twelfth `skipped`, while a run still in progress lists only the eleven, because a skipped job appears only once its condition has resolved. So filter rather than counting:
+That list is read off a real dispatch rather than off the file: run [`35025264144`](https://github.com/vfarcic/dot-agent-deck/actions/runs/35025264144), a `workflow_dispatch` on this repository on 2026-09-15, ran exactly the eleven that existed then and reported `notify-main-red` as `skipped`, finishing green in 8.8 minutes; issue #953 added `desktop-driver`, and run [`36231844544`](https://github.com/vfarcic/dot-agent-deck/actions/runs/36231844544), a dispatch of that issue's branch on 2026-09-26, ran the twelve above and skipped `notify-main-red`, green in 14.1 minutes. Note the shape of that last part before reading a job list yourself — a completed run reports **thirteen** jobs, the thirteenth `skipped`, while a run still in progress lists only the twelve, because a skipped job appears only once its condition has resolved. So filter rather than counting:
 
 ```bash
 gh run view <run-id> --json jobs --jq '[.jobs[] | select(.conclusion != "skipped") | .name]'
@@ -38,7 +38,7 @@ A job added to `ci.yml` later joins that output without anyone editing this para
 
 The full matrix, not a subset. The `changes` job skips the Rust jobs for a Renovate PR that touched only `devbox.*` or only the flake, and it reads `github.event.pull_request.user.login` to decide — which a `workflow_dispatch` payload does not carry, so the author check fails, the job exits early with `devbox_only=false` / `flake_only=false`, and every downstream `if:` passes. That is the same fail-safe the `push`-to-`main` runs rely on, and its own comment in `ci.yml` says so.
 
-Five of the eleven are the contexts the `main-protected` ruleset requires: `build`, `build-macos`, `build-windows`, `security`, `e2e-deterministic`. Read from the ruleset on 2026-09-15 and matching `scripts/apply-branch-protection.sh`'s `REQUIRED_CHECKS` default; re-read them with `gh api repos/{owner}/{repo}/rulesets/<id> --jq '.rules[] | select(.type=="required_status_checks") | .parameters.required_status_checks[].context'` rather than trusting this sentence.
+Five of the twelve are the contexts the `main-protected` ruleset requires: `build`, `build-macos`, `build-windows`, `security`, `e2e-deterministic`. Read from the ruleset on 2026-09-15 and matching `scripts/apply-branch-protection.sh`'s `REQUIRED_CHECKS` default; re-read them with `gh api repos/{owner}/{repo}/rulesets/<id> --jq '.rules[] | select(.type=="required_status_checks") | .parameters.required_status_checks[].context'` rather than trusting this sentence.
 
 ## What it will not cancel
 
