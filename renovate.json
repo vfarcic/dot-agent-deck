@@ -44,6 +44,14 @@
       "matchStrings": ["pnpm/action-setup@[^\\n]*\\n\\s*with:\\s*\\n\\s*version:\\s*(?<currentValue>\\d+\\.\\d+\\.\\d+)"],
       "datasourceTemplate": "devbox",
       "depNameTemplate": "pnpm"
+    },
+    {
+      "customType": "regex",
+      "description": "The tauri-driver version the desktop-driver job installs (issue #953), written once as `TAURI_DRIVER_VERSION: <X.Y.Z>` in that job's `env:`. It is not duplicated in devbox.json — CI installs it with `cargo install --locked` from crates.io and devbox carries no copy — so scripts/check-pin-lockstep.sh has no second site to compare it with; `desktop/scripts/driver-test.sh` reads this same line for a local run rather than restating the number, which is what keeps local and CI on one driver. No automerge rule matches it, so a bump waits for a human, which is right for the component that decides whether the flake-prone tier can even start a session.",
+      "managerFilePatterns": ["/^\\.github/workflows/[^/]+\\.ya?ml$/"],
+      "matchStrings": ["TAURI_DRIVER_VERSION:\\s*(?<currentValue>\\d+\\.\\d+\\.\\d+)"],
+      "datasourceTemplate": "crate",
+      "depNameTemplate": "tauri-driver"
     }
   ],
   "packageRules": [
